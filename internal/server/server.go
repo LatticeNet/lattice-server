@@ -108,6 +108,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/ddns", s.withAuth("ddns:admin", s.handleDDNS))
 	mux.HandleFunc("/api/ddns/delete", s.withAuth("ddns:admin", s.handleDeleteDDNS))
 	mux.HandleFunc("/api/ddns/run", s.withAuth("ddns:admin", s.handleRunDDNS))
+	mux.HandleFunc("/api/monitors", s.withAuth("monitor:read", s.handleMonitors))
+	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
+	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
 	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
@@ -117,6 +120,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
 	mux.HandleFunc("/api/agent/tasks", s.withAgentLimit(s.handleAgentTasks))
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
+	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
+	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -681,6 +686,113 @@ func buildChannel(kind string, cfg map[string]string) (notify.Channel, error) {
 	default:
 		return nil, fmt.Errorf("unknown notify channel %q", kind)
 	}
+}
+
+func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.Monitors())
+	case http.MethodPost:
+		if !rbac.Allows(p.Principal, "monitor:admin", "") {
+			writeError(w, http.StatusForbidden, errors.New("missing monitor:admin"))
+			return
+		}
+		var req model.Monitor
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Target) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("name and target are required"))
+			return
+		}
+		if req.Type != model.MonitorTypeTCP && req.Type != model.MonitorTypeHTTP {
+			writeError(w, http.StatusBadRequest, errors.New("only tcp and http monitors are supported (icmp pending)"))
+			return
+		}
+		if !req.AssignAll && len(req.NodeIDs) == 0 {
+			writeError(w, http.StatusBadRequest, errors.New("set assign_all or provide node_ids"))
+			return
+		}
+		if req.IntervalSec <= 0 {
+			req.IntervalSec = 30
+		}
+		if req.TimeoutSec <= 0 {
+			req.TimeoutSec = 5
+		}
+		req.ID = id.New("mon")
+		req.Enabled = true
+		if err := s.store.UpsertMonitor(req); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "monitor.create", Scope: "monitor:admin", Metadata: map[string]string{"monitor_id": req.ID, "type": req.Type}})
+		writeJSON(w, http.StatusOK, req)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func (s *Server) handleDeleteMonitor(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := s.store.DeleteMonitor(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "monitor.delete", Scope: "monitor:admin", Metadata: map[string]string{"monitor_id": req.ID}})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleMonitorResults(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	monitorID := r.URL.Query().Get("monitor_id")
+	if monitorID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("monitor_id is required"))
+		return
+	}
+	writeJSON(w, http.StatusOK, s.store.MonitorResults(monitorID))
+}
+
+// handleAgentMonitors returns the monitors an authenticated agent should run.
+func (s *Server) handleAgentMonitors(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.URL.Query().Get("node_id")
+	if _, ok := s.authenticateNode(nodeID, bearerToken(r)); !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+		return
+	}
+	writeJSON(w, http.StatusOK, s.store.MonitorsForNode(nodeID))
+}
+
+// handleAgentMonitorResult ingests a probe outcome from an authenticated agent.
+func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		agentAuthRequest
+		Result model.MonitorResult `json:"result"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if _, ok := s.authenticateNode(req.NodeID, req.Token); !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+		return
+	}
+	req.Result.NodeID = req.NodeID
+	if err := s.store.AddMonitorResult(req.Result); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // ddnsView is the secret-free projection of a DDNS profile returned to clients.

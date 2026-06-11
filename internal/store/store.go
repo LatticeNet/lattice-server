@@ -19,19 +19,24 @@ import (
 // sessions are evicted.
 const maxSessions = 4096
 
+// maxMonitorResults caps the retained history per monitor to bound state growth.
+const maxMonitorResults = 500
+
 type State struct {
-	Users     map[string]model.User         `json:"users"`
-	Tokens    map[string]model.Token        `json:"tokens"`
-	Nodes     map[string]model.Node         `json:"nodes"`
-	Tasks     map[string]model.Task         `json:"tasks"`
-	Results   []model.TaskResult            `json:"results"`
-	Audit     []model.AuditEvent            `json:"audit"`
-	KV        map[string]model.KVEntry      `json:"kv"`
-	Static    map[string]model.StaticObject `json:"static"`
-	Workers   map[string]model.WorkerScript `json:"workers"`
-	Approvals map[string]model.Approval     `json:"approvals"`
-	Sessions  map[string]auth.Session       `json:"sessions"`
-	DDNS      map[string]model.DDNSProfile  `json:"ddns"`
+	Users      map[string]model.User            `json:"users"`
+	Tokens     map[string]model.Token           `json:"tokens"`
+	Nodes      map[string]model.Node            `json:"nodes"`
+	Tasks      map[string]model.Task            `json:"tasks"`
+	Results    []model.TaskResult               `json:"results"`
+	Audit      []model.AuditEvent               `json:"audit"`
+	KV         map[string]model.KVEntry         `json:"kv"`
+	Static     map[string]model.StaticObject    `json:"static"`
+	Workers    map[string]model.WorkerScript    `json:"workers"`
+	Approvals  map[string]model.Approval        `json:"approvals"`
+	Sessions   map[string]auth.Session          `json:"sessions"`
+	DDNS       map[string]model.DDNSProfile     `json:"ddns"`
+	Monitors   map[string]model.Monitor         `json:"monitors"`
+	MonResults map[string][]model.MonitorResult `json:"monitor_results"`
 }
 
 type Store struct {
@@ -64,16 +69,18 @@ func Open(path string) (*Store, error) {
 
 func emptyState() State {
 	return State{
-		Users:     map[string]model.User{},
-		Tokens:    map[string]model.Token{},
-		Nodes:     map[string]model.Node{},
-		Tasks:     map[string]model.Task{},
-		KV:        map[string]model.KVEntry{},
-		Static:    map[string]model.StaticObject{},
-		Workers:   map[string]model.WorkerScript{},
-		Approvals: map[string]model.Approval{},
-		Sessions:  map[string]auth.Session{},
-		DDNS:      map[string]model.DDNSProfile{},
+		Users:      map[string]model.User{},
+		Tokens:     map[string]model.Token{},
+		Nodes:      map[string]model.Node{},
+		Tasks:      map[string]model.Task{},
+		KV:         map[string]model.KVEntry{},
+		Static:     map[string]model.StaticObject{},
+		Workers:    map[string]model.WorkerScript{},
+		Approvals:  map[string]model.Approval{},
+		Sessions:   map[string]auth.Session{},
+		DDNS:       map[string]model.DDNSProfile{},
+		Monitors:   map[string]model.Monitor{},
+		MonResults: map[string][]model.MonitorResult{},
 	}
 }
 
@@ -107,6 +114,12 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.DDNS == nil {
 		s.state.DDNS = map[string]model.DDNSProfile{}
+	}
+	if s.state.Monitors == nil {
+		s.state.Monitors = map[string]model.Monitor{}
+	}
+	if s.state.MonResults == nil {
+		s.state.MonResults = map[string][]model.MonitorResult{}
 	}
 }
 
@@ -505,6 +518,90 @@ func (s *Store) DeleteDDNSProfile(id string) error {
 	}
 	delete(s.state.DDNS, id)
 	return s.Save()
+}
+
+// UpsertMonitor creates or updates a monitor.
+func (s *Store) UpsertMonitor(m model.Monitor) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m.UpdatedAt = time.Now().UTC()
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = m.UpdatedAt
+	}
+	s.state.Monitors[m.ID] = m
+	return s.Save()
+}
+
+// Monitor returns a monitor by id.
+func (s *Store) Monitor(id string) (model.Monitor, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.state.Monitors[id]
+	return m, ok
+}
+
+// Monitors returns all monitors sorted by creation time.
+func (s *Store) Monitors() []model.Monitor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Monitor, 0, len(s.state.Monitors))
+	for _, m := range s.state.Monitors {
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// MonitorsForNode returns the enabled monitors a node should run.
+func (s *Store) MonitorsForNode(nodeID string) []model.Monitor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.Monitor{}
+	for _, m := range s.state.Monitors {
+		if !m.Enabled {
+			continue
+		}
+		if m.AssignAll || contains(m.NodeIDs, nodeID) {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// DeleteMonitor removes a monitor and its result history.
+func (s *Store) DeleteMonitor(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Monitors[id]; !ok {
+		return nil
+	}
+	delete(s.state.Monitors, id)
+	delete(s.state.MonResults, id)
+	return s.Save()
+}
+
+// AddMonitorResult appends a probe result, keeping only the most recent
+// maxMonitorResults entries per monitor.
+func (s *Store) AddMonitorResult(r model.MonitorResult) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.At.IsZero() {
+		r.At = time.Now().UTC()
+	}
+	series := append(s.state.MonResults[r.MonitorID], r)
+	if len(series) > maxMonitorResults {
+		series = series[len(series)-maxMonitorResults:]
+	}
+	s.state.MonResults[r.MonitorID] = series
+	return s.Save()
+}
+
+// MonitorResults returns the result history for a monitor (oldest first).
+func (s *Store) MonitorResults(monitorID string) []model.MonitorResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]model.MonitorResult(nil), s.state.MonResults[monitorID]...)
 }
 
 func (s *Store) evictOldestSessionLocked() {

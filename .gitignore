@@ -1,0 +1,4 @@
+.cache/
+/lattice-server
+*.test
+coverage.out

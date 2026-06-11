@@ -25,7 +25,23 @@ func TestWorkerRuntimeUsesExplicitCapabilities(t *testing.T) {
 	}
 }
 
-func TestWorkerRuntimeRendersTemplate(t *testing.T) {
+func TestWorkerRuntimeRendersTemplateWithKVRead(t *testing.T) {
+	rt := Runtime{KV: fakeKV{{Bucket: "default", Key: "message", Value: "world"}}}
+	resp, err := rt.Run(model.WorkerScript{
+		Source:       "hello {{kv:default/message}} at {{path}}",
+		Capabilities: []string{"worker:route", "kv:read"},
+	}, Request{Path: "/edge"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Body != "hello world at /edge" {
+		t.Fatalf("unexpected body %q", resp.Body)
+	}
+}
+
+// A worker without kv:read must not be able to read KV values, even though it
+// can route. The reference resolves to empty instead of leaking the value.
+func TestWorkerRuntimeDeniesKVWithoutCapability(t *testing.T) {
 	rt := Runtime{KV: fakeKV{{Bucket: "default", Key: "message", Value: "world"}}}
 	resp, err := rt.Run(model.WorkerScript{
 		Source:       "hello {{kv:default/message}} at {{path}}",
@@ -34,8 +50,8 @@ func TestWorkerRuntimeRendersTemplate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Body != "hello world at /edge" {
-		t.Fatalf("unexpected body %q", resp.Body)
+	if resp.Body != "hello  at /edge" {
+		t.Fatalf("expected KV value withheld, got %q", resp.Body)
 	}
 }
 

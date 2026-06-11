@@ -1,0 +1,44 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout lattice-server
+        uses: actions/checkout@v4
+        with:
+          path: lattice-server
+      - name: checkout lattice-sdk
+        uses: actions/checkout@v4
+        with:
+          repository: LatticeNet/lattice-sdk
+          path: lattice-sdk
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      - name: create workspace
+        run: go work init ./lattice-sdk ./lattice-server
+      - name: gofmt
+        working-directory: lattice-server
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        working-directory: lattice-server
+        run: go vet ./...
+      - name: test
+        working-directory: lattice-server
+        run: go test -race -cover ./...
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec ./lattice-server/...
+      - name: govulncheck
+        working-directory: lattice-server
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

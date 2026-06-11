@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -77,6 +78,47 @@ func VerifySecret(encoded, secret string) bool {
 		return false
 	}
 	return hmac.Equal(actual, expected)
+}
+
+// FormatToken renders the credential a caller presents for a personal access
+// token: the public record id, a separator, and the secret. Embedding the id
+// lets the server look the record up in O(1) and run a single verification,
+// instead of trying every stored token.
+func FormatToken(id, secret string) string {
+	return id + "." + secret
+}
+
+// SplitToken parses a presented credential of the form "<id>.<secret>".
+// Record ids never contain a dot and secrets are URL-safe base64 (also
+// dot-free), so splitting on the first dot is unambiguous.
+func SplitToken(presented string) (id, secret string, ok bool) {
+	idx := strings.IndexByte(presented, '.')
+	if idx <= 0 || idx == len(presented)-1 {
+		return "", "", false
+	}
+	return presented[:idx], presented[idx+1:], true
+}
+
+var (
+	dummyOnce sync.Once
+	dummyHash string
+)
+
+// DummyVerify performs a verification against a throwaway hash so that code
+// paths handling an unknown user or token spend roughly the same CPU time as a
+// successful lookup. This blunts timing side channels that would otherwise leak
+// account/token existence. The boolean result is meaningless and ignored.
+func DummyVerify(secret string) {
+	dummyOnce.Do(func() {
+		// A fixed but realistic hash; salt/iterations match production output.
+		h, err := HashSecret("dummy-verify-padding-secret")
+		if err == nil {
+			dummyHash = h
+		}
+	})
+	if dummyHash != "" {
+		_ = VerifySecret(dummyHash, secret)
+	}
 }
 
 func NewSession(actorID string, ttl time.Duration) (Session, error) {

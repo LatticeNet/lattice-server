@@ -31,14 +31,21 @@ func (r Runtime) Run(script model.WorkerScript, req Request) (Response, error) {
 	}
 	body := script.Source
 	body = strings.ReplaceAll(body, "{{path}}", req.Path)
-	body = replaceKV(body, r.KV)
+	// KV interpolation is a privileged capability: a worker may only read the
+	// KV store when it explicitly declares kv:read. Otherwise references resolve
+	// to empty so a route worker cannot exfiltrate KV it was not granted.
+	if hasCapability(script.Capabilities, "kv:read") {
+		body = replaceKV(body, r.KV)
+	} else {
+		body = replaceKV(body, nil)
+	}
 	return Response{Status: 200, Body: body}, nil
 }
 
+// replaceKV resolves {{kv:bucket/key}} references. A nil reader resolves every
+// reference to empty, which is how an unauthorized worker is denied KV access
+// without leaking the reference text.
 func replaceKV(body string, kv KVReader) string {
-	if kv == nil {
-		return body
-	}
 	for {
 		start := strings.Index(body, "{{kv:")
 		if start < 0 {
@@ -52,7 +59,7 @@ func replaceKV(body string, kv KVReader) string {
 		ref := strings.TrimPrefix(body[start:end], "{{kv:")
 		parts := strings.SplitN(ref, "/", 2)
 		value := ""
-		if len(parts) == 2 {
+		if kv != nil && len(parts) == 2 {
 			for _, entry := range kv.KV(parts[0]) {
 				if entry.Key == parts[1] {
 					value = entry.Value

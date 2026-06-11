@@ -11,7 +11,13 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
 )
+
+// maxSessions bounds how many sessions are retained to keep both memory and the
+// on-disk state file from growing without limit. When exceeded, the oldest
+// sessions are evicted.
+const maxSessions = 4096
 
 type State struct {
 	Users     map[string]model.User         `json:"users"`
@@ -24,6 +30,7 @@ type State struct {
 	Static    map[string]model.StaticObject `json:"static"`
 	Workers   map[string]model.WorkerScript `json:"workers"`
 	Approvals map[string]model.Approval     `json:"approvals"`
+	Sessions  map[string]auth.Session       `json:"sessions"`
 }
 
 type Store struct {
@@ -64,6 +71,7 @@ func emptyState() State {
 		Static:    map[string]model.StaticObject{},
 		Workers:   map[string]model.WorkerScript{},
 		Approvals: map[string]model.Approval{},
+		Sessions:  map[string]auth.Session{},
 	}
 }
 
@@ -91,6 +99,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.Approvals == nil {
 		s.state.Approvals = map[string]model.Approval{}
+	}
+	if s.state.Sessions == nil {
+		s.state.Sessions = map[string]auth.Session{}
 	}
 }
 
@@ -142,6 +153,13 @@ func (s *Store) UpsertToken(t model.Token) error {
 	defer s.mu.Unlock()
 	s.state.Tokens[t.ID] = t
 	return s.Save()
+}
+
+func (s *Store) Token(id string) (model.Token, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.Tokens[id]
+	return t, ok
 }
 
 func (s *Store) Tokens() []model.Token {
@@ -381,6 +399,64 @@ func (s *Store) Approvals() []model.Approval {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out
+}
+
+// PutSession persists a session, pruning expired entries and enforcing the
+// session cap on every write so neither memory nor the state file grows
+// unbounded under credential-stuffing or churn.
+func (s *Store) PutSession(sess auth.Session) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	for id, existing := range s.state.Sessions {
+		if !existing.Active(now) {
+			delete(s.state.Sessions, id)
+		}
+	}
+	s.state.Sessions[sess.ID] = sess
+	if len(s.state.Sessions) > maxSessions {
+		s.evictOldestSessionLocked()
+	}
+	return s.Save()
+}
+
+// Session returns an active session by id. Expired or revoked sessions report
+// not-found without a write.
+func (s *Store) Session(id string) (auth.Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.state.Sessions[id]
+	if !ok || !sess.Active(time.Now().UTC()) {
+		return auth.Session{}, false
+	}
+	return sess, true
+}
+
+// DeleteSession removes a session (logout / revocation).
+func (s *Store) DeleteSession(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Sessions[id]; !ok {
+		return nil
+	}
+	delete(s.state.Sessions, id)
+	return s.Save()
+}
+
+func (s *Store) evictOldestSessionLocked() {
+	var oldestID string
+	var oldest time.Time
+	first := true
+	for id, sess := range s.state.Sessions {
+		if first || sess.CreatedAt.Before(oldest) {
+			oldestID = id
+			oldest = sess.CreatedAt
+			first = false
+		}
+	}
+	if !first {
+		delete(s.state.Sessions, oldestID)
+	}
 }
 
 func contains(values []string, value string) bool {

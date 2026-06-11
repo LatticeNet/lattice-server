@@ -1,16 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"path"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -18,6 +19,8 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/network"
+	"github.com/LatticeNet/lattice-server/internal/notify"
+	"github.com/LatticeNet/lattice-server/internal/ratelimit"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 	"github.com/LatticeNet/lattice-server/internal/worker"
@@ -28,16 +31,23 @@ type Options struct {
 	WebFS         fs.FS
 	AdminPassword string
 	SecureCookies bool
-	Logger        *log.Logger
+	// TrustProxy enables reading the client address from proxy headers
+	// (CF-Connecting-IP, then X-Forwarded-For). Only enable when the server
+	// sits behind a trusted reverse proxy / Cloudflare; otherwise clients can
+	// spoof the header and evade per-IP rate limiting.
+	TrustProxy bool
+	Logger     *log.Logger
 }
 
 type Server struct {
 	store         *store.Store
 	webFS         fs.FS
 	secureCookies bool
+	trustProxy    bool
 	logger        *log.Logger
-	sessionsMu    sync.Mutex
-	sessions      map[string]auth.Session
+	loginLimiter  *ratelimit.Limiter
+	agentLimiter  *ratelimit.Limiter
+	apiLimiter    *ratelimit.Limiter
 }
 
 type principal struct {
@@ -58,8 +68,15 @@ func New(opts Options) (*Server, error) {
 		store:         opts.Store,
 		webFS:         opts.WebFS,
 		secureCookies: opts.SecureCookies,
+		trustProxy:    opts.TrustProxy,
 		logger:        opts.Logger,
-		sessions:      map[string]auth.Session{},
+		// Login is intentionally strict: 5/min sustained, small burst, to slow
+		// password guessing without locking out legitimate retries.
+		loginLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
+		// Agents poll on an interval; allow generous but bounded throughput.
+		agentLimiter: ratelimit.New(ratelimit.Config{Rate: 10, Burst: 40}),
+		// General authenticated API surface.
+		apiLimiter: ratelimit.New(ratelimit.Config{Rate: 30, Burst: 60}),
 	}
 	if err := s.ensureAdmin(opts.AdminPassword); err != nil {
 		return nil, err
@@ -81,18 +98,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
 	mux.HandleFunc("/api/workers", s.withAuth("worker:deploy", s.handleWorkers))
 	mux.HandleFunc("/api/workers/run", s.withAuth("worker:deploy", s.handleWorkerRun))
+	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
+	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
+	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
 	mux.HandleFunc("/api/network/approvals", s.withAuth("network:plan", s.handleApprovals))
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
-	mux.HandleFunc("/api/agent/hello", s.handleAgentHello)
-	mux.HandleFunc("/api/agent/metrics", s.handleAgentMetrics)
-	mux.HandleFunc("/api/agent/tasks", s.handleAgentTasks)
-	mux.HandleFunc("/api/agent/task-result", s.handleAgentTaskResult)
+	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
+	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
+	mux.HandleFunc("/api/agent/tasks", s.withAgentLimit(s.handleAgentTasks))
+	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.Handle("/", s.staticHandler())
-	return securityHeaders(mux)
+	return s.securityHeaders(mux)
 }
 
 func (s *Server) ensureAdmin(password string) error {
@@ -143,15 +163,31 @@ func (s *Server) staticHandler() http.Handler {
 	})
 }
 
+// withAgentLimit applies per-source rate limiting to the unauthenticated-facing
+// agent endpoints so a flood cannot exhaust CPU on token verification.
+func (s *Server) withAgentLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.agentLimiter.Allow(s.clientIP(r)) {
+			writeError(w, http.StatusTooManyRequests, errors.New("rate limited"))
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Request, principal)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.apiLimiter.Allow(s.clientIP(r)) {
+			writeError(w, http.StatusTooManyRequests, errors.New("rate limited"))
+			return
+		}
 		p, err := s.principalFromRequest(r)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, err)
 			return
 		}
 		if scope != "" && !rbac.Allows(p.Principal, scope, r.URL.Query().Get("node_id")) {
-			_ = audit.Record(s.store, model.AuditEvent{
+			s.recordAudit(model.AuditEvent{
 				ID:       id.New("audit"),
 				ActorID:  p.ActorID,
 				TokenID:  p.TokenID,
@@ -175,32 +211,35 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 
 func (s *Server) principalFromRequest(r *http.Request) (principal, error) {
 	if bearer := bearerToken(r); bearer != "" {
-		for _, token := range s.store.Tokens() {
-			if !token.RevokedAt.IsZero() {
-				continue
-			}
-			if auth.VerifySecret(token.TokenHash, bearer) {
-				return principal{
-					Principal: rbac.Principal{
-						ActorID:         token.ActorID,
-						TokenID:         token.ID,
-						Scopes:          token.Scopes,
-						ServerAllowlist: token.ServerAllowlist,
-					},
-					viaBearer: true,
-				}, nil
-			}
+		tokenID, secret, ok := auth.SplitToken(bearer)
+		if !ok {
+			auth.DummyVerify(bearer)
+			return principal{}, errors.New("invalid bearer token")
 		}
-		return principal{}, errors.New("invalid bearer token")
+		token, found := s.store.Token(tokenID)
+		if !found || !token.RevokedAt.IsZero() {
+			auth.DummyVerify(secret)
+			return principal{}, errors.New("invalid bearer token")
+		}
+		if !auth.VerifySecret(token.TokenHash, secret) {
+			return principal{}, errors.New("invalid bearer token")
+		}
+		return principal{
+			Principal: rbac.Principal{
+				ActorID:         token.ActorID,
+				TokenID:         token.ID,
+				Scopes:          token.Scopes,
+				ServerAllowlist: token.ServerAllowlist,
+			},
+			viaBearer: true,
+		}, nil
 	}
 	cookie, err := r.Cookie("lattice_session")
 	if err != nil {
 		return principal{}, errors.New("missing session")
 	}
-	s.sessionsMu.Lock()
-	session, ok := s.sessions[cookie.Value]
-	s.sessionsMu.Unlock()
-	if !ok || !session.Active(time.Now().UTC()) {
+	session, ok := s.store.Session(cookie.Value)
+	if !ok {
 		return principal{}, errors.New("session expired")
 	}
 	user, ok := s.store.User(session.ActorID)
@@ -222,6 +261,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
+	if !s.loginLimiter.Allow(s.clientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts; slow down"))
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -230,7 +273,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user, ok := s.store.UserByUsername(req.Username)
-	if !ok || !auth.VerifySecret(user.PasswordHash, req.Password) {
+	if !ok {
+		// Spend comparable CPU so response time does not reveal whether the
+		// username exists.
+		auth.DummyVerify(req.Password)
+		writeError(w, http.StatusUnauthorized, errors.New("invalid credentials"))
+		return
+	}
+	if !auth.VerifySecret(user.PasswordHash, req.Password) {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid credentials"))
 		return
 	}
@@ -239,9 +289,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.sessionsMu.Lock()
-	s.sessions[session.ID] = session
-	s.sessionsMu.Unlock()
+	if err := s.store.PutSession(session); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "lattice_session",
 		Value:    session.ID,
@@ -251,18 +302,26 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   s.secureCookies,
 		Expires:  session.ExpiresAt,
 	})
-	_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "allow"})
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "allow"})
 	writeJSON(w, http.StatusOK, map[string]string{"csrf_token": session.CSRFToken, "actor_id": user.ID})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principal) {
-	s.sessionsMu.Lock()
-	if session, ok := s.sessions[p.sessionID]; ok {
-		session.Revoked = true
-		s.sessions[p.sessionID] = session
+	if p.sessionID != "" {
+		if err := s.store.DeleteSession(p.sessionID); err != nil {
+			s.logger.Printf("logout: delete session: %v", err)
+		}
 	}
-	s.sessionsMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "lattice_session", Value: "", Path: "/", MaxAge: -1})
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "logout", Decision: "allow"})
+	http.SetCookie(w, &http.Cookie{
+		Name:     "lattice_session",
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+		Secure:   s.secureCookies,
+		MaxAge:   -1,
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -327,7 +386,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "node.enroll", Scope: "node:admin", NodeID: req.NodeID})
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "node.enroll", Scope: "node:admin", NodeID: req.NodeID})
 	writeJSON(w, http.StatusOK, map[string]string{
 		"node_id": req.NodeID,
 		"token":   token,
@@ -340,10 +399,6 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.store.Tasks())
 	case http.MethodPost:
-		if !rbac.Allows(p.Principal, "static:write", "") {
-			writeError(w, http.StatusForbidden, errors.New("missing static:write"))
-			return
-		}
 		var req struct {
 			Targets     []string `json:"targets"`
 			Interpreter string   `json:"interpreter"`
@@ -383,7 +438,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, TokenID: p.TokenID, Action: "task.create", Scope: "task:run", Metadata: map[string]string{"task_id": task.ID}})
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, TokenID: p.TokenID, Action: "task.create", Scope: "task:run", Metadata: map[string]string{"task_id": task.ID}})
 		writeJSON(w, http.StatusOK, task)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -434,12 +489,20 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 			writeError(w, http.StatusBadRequest, errors.New("key is required"))
 			return
 		}
+		if err := validateStorageName(req.Bucket); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("bucket: %w", err))
+			return
+		}
+		if err := validateStorageName(req.Key); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("key: %w", err))
+			return
+		}
 		entry := model.KVEntry{Bucket: req.Bucket, Key: req.Key, Value: req.Value}
 		if err := s.store.PutKV(entry); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "kv.put", Scope: "kv:write", Metadata: map[string]string{"bucket": req.Bucket, "key": req.Key}})
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "kv.put", Scope: "kv:write", Metadata: map[string]string{"bucket": req.Bucket, "key": req.Key}})
 		writeJSON(w, http.StatusOK, entry)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -455,6 +518,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.store.Static(bucket))
 	case http.MethodPost:
+		if !rbac.Allows(p.Principal, "static:write", "") {
+			writeError(w, http.StatusForbidden, errors.New("missing static:write"))
+			return
+		}
 		var req struct {
 			Bucket      string `json:"bucket"`
 			Path        string `json:"path"`
@@ -467,6 +534,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 		if req.Bucket == "" {
 			req.Bucket = bucket
 		}
+		if err := validateStorageName(req.Bucket); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("bucket: %w", err))
+			return
+		}
 		clean, err := cleanObjectPath(req.Path)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -477,7 +548,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "static.put", Scope: "static:write", Metadata: map[string]string{"bucket": req.Bucket, "path": clean}})
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "static.put", Scope: "static:write", Metadata: map[string]string{"bucket": req.Bucket, "path": clean}})
 		writeJSON(w, http.StatusOK, obj)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -511,7 +582,7 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request, p princip
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "worker.upsert", Scope: "worker:deploy", Metadata: map[string]string{"worker_id": wk.ID}})
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "worker.upsert", Scope: "worker:deploy", Metadata: map[string]string{"worker_id": wk.ID}})
 		writeJSON(w, http.StatusOK, wk)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -543,6 +614,180 @@ func (s *Server) handleWorkerRun(w http.ResponseWriter, r *http.Request, p princ
 		return
 	}
 	writeError(w, http.StatusNotFound, errors.New("worker not found"))
+}
+
+// handleNotifyTest delivers a one-off test notification through a channel whose
+// config is supplied inline. Gated by notify:send (admin in practice) because it
+// makes an outbound request to a caller-specified destination.
+func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		Channel string            `json:"channel"`
+		Config  map[string]string `json:"config"`
+		Title   string            `json:"title"`
+		Body    string            `json:"body"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	ch, err := buildChannel(req.Channel, req.Config)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Title == "" {
+		req.Title = "Lattice test"
+	}
+	if req.Body == "" {
+		req.Body = "Notification channel verified."
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	sendErr := ch.Send(ctx, notify.Message{Title: req.Title, Body: req.Body})
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "notify.test", Scope: "notify:send", Metadata: map[string]string{"channel": req.Channel, "ok": fmt.Sprintf("%t", sendErr == nil)}})
+	if sendErr != nil {
+		writeError(w, http.StatusBadGateway, sendErr)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "channel": ch.Kind()})
+}
+
+// buildChannel constructs a notify.Channel from a kind and a flat config map.
+func buildChannel(kind string, cfg map[string]string) (notify.Channel, error) {
+	if cfg == nil {
+		cfg = map[string]string{}
+	}
+	switch kind {
+	case "telegram":
+		return notify.Telegram{Token: cfg["token"], ChatID: cfg["chat_id"], BaseURL: cfg["base_url"]}, nil
+	case "bark":
+		return notify.Bark{BaseURL: cfg["base_url"], Key: cfg["key"]}, nil
+	case "discord":
+		return notify.Discord{WebhookURL: cfg["webhook_url"]}, nil
+	case "webhook":
+		return notify.Webhook{URL: cfg["url"]}, nil
+	default:
+		return nil, fmt.Errorf("unknown notify channel %q", kind)
+	}
+}
+
+// tokenView is the safe projection of a token returned to clients: it never
+// includes the hash or the secret.
+type tokenView struct {
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	ActorID         string    `json:"actor_id"`
+	Scopes          []string  `json:"scopes"`
+	ServerAllowlist []string  `json:"server_allowlist"`
+	CreatedAt       time.Time `json:"created_at"`
+	RevokedAt       time.Time `json:"revoked_at,omitempty"`
+}
+
+func toTokenView(t model.Token) tokenView {
+	return tokenView{
+		ID:              t.ID,
+		Name:            t.Name,
+		ActorID:         t.ActorID,
+		Scopes:          t.Scopes,
+		ServerAllowlist: t.ServerAllowlist,
+		CreatedAt:       t.CreatedAt,
+		RevokedAt:       t.RevokedAt,
+	}
+}
+
+func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		tokens := s.store.Tokens()
+		views := make([]tokenView, 0, len(tokens))
+		for _, t := range tokens {
+			views = append(views, toTokenView(t))
+		}
+		writeJSON(w, http.StatusOK, views)
+	case http.MethodPost:
+		var req struct {
+			Name            string   `json:"name"`
+			Scopes          []string `json:"scopes"`
+			ServerAllowlist []string `json:"server_allowlist"`
+		}
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" || len(req.Scopes) == 0 {
+			writeError(w, http.StatusBadRequest, errors.New("name and at least one scope are required"))
+			return
+		}
+		// Privilege containment: a caller may only mint a token whose scopes are
+		// a subset of its own, so token creation cannot be used to escalate.
+		for _, scope := range req.Scopes {
+			if !rbac.Allows(p.Principal, scope, "") {
+				writeError(w, http.StatusForbidden, fmt.Errorf("cannot grant scope %q beyond your own", scope))
+				return
+			}
+		}
+		secret, err := auth.NewRandomToken(32)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		hash, err := auth.HashSecret(secret)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		tok := model.Token{
+			ID:              id.New("token"),
+			Name:            req.Name,
+			TokenHash:       hash,
+			ActorID:         p.ActorID,
+			Scopes:          req.Scopes,
+			ServerAllowlist: req.ServerAllowlist,
+			CreatedAt:       time.Now().UTC(),
+		}
+		if err := s.store.UpsertToken(tok); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "token.create", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
+		// The credential is returned exactly once, in "<id>.<secret>" form.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"id":    tok.ID,
+			"token": auth.FormatToken(tok.ID, secret),
+			"view":  toTokenView(tok),
+		})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		TokenID string `json:"token_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	tok, ok := s.store.Token(req.TokenID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("token not found"))
+		return
+	}
+	if tok.RevokedAt.IsZero() {
+		tok.RevokedAt = time.Now().UTC()
+		if err := s.store.UpsertToken(tok); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "token.revoke", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
+	writeJSON(w, http.StatusOK, toTokenView(tok))
 }
 
 func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p principal) {
@@ -580,7 +825,7 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID}})
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID}})
 	writeJSON(w, http.StatusOK, approval)
 }
 
@@ -633,7 +878,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 	}
-	_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: approval.NodeID, Action: "network.nft.approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: approval.NodeID, Action: "network.nft.approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
 	writeJSON(w, http.StatusOK, approval)
 }
 
@@ -680,10 +925,9 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("node_id")
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		token = bearerToken(r)
-	}
+	// Token must arrive in the Authorization header only. Accepting it from the
+	// query string would leak the credential into access logs and proxy caches.
+	token := bearerToken(r)
 	if _, ok := s.authenticateNode(nodeID, token); !ok {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
 		return
@@ -716,7 +960,7 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	_ = audit.Record(s.store, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -739,14 +983,51 @@ func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {
 	return n, auth.VerifySecret(n.TokenHash, token)
 }
 
-func securityHeaders(next http.Handler) http.Handler {
+func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'")
+		// HSTS is only meaningful (and only safe) over HTTPS, which we proxy
+		// for via secure cookies being enabled.
+		if s.secureCookies {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// recordAudit writes an audit event and, unlike a bare best-effort call, logs
+// when the sink fails so audit gaps are visible instead of silent.
+func (s *Server) recordAudit(ev model.AuditEvent) {
+	if err := audit.Record(s.store, ev); err != nil {
+		s.logger.Printf("audit: failed to record %q: %v", ev.Action, err)
+	}
+}
+
+// clientIP resolves the address used as a rate-limit key. Proxy headers are
+// only honored when TrustProxy is set, preventing key spoofing in the direct
+// exposure case.
+func (s *Server) clientIP(r *http.Request) string {
+	if s.trustProxy {
+		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
+			return cf
+		}
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if comma := strings.IndexByte(xff, ','); comma >= 0 {
+				xff = xff[:comma]
+			}
+			if xff = strings.TrimSpace(xff); xff != "" {
+				return xff
+			}
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func unsafeMethod(method string) bool {
@@ -779,6 +1060,28 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+// validateStorageName rejects names that would collide or corrupt the composite
+// "bucket/key" keys used by the KV and static stores. A slash in either half
+// would let one record masquerade as another; control characters are refused
+// defensively.
+func validateStorageName(value string) error {
+	if value == "" {
+		return errors.New("must not be empty")
+	}
+	if len(value) > 256 {
+		return errors.New("must be at most 256 characters")
+	}
+	if strings.ContainsAny(value, "/\\") {
+		return errors.New("must not contain slashes")
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("must not contain control characters")
+		}
+	}
+	return nil
 }
 
 func cleanObjectPath(value string) (string, error) {

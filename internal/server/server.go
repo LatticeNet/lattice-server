@@ -17,6 +17,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/audit"
 	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/ddns"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/notify"
@@ -48,6 +49,8 @@ type Server struct {
 	loginLimiter  *ratelimit.Limiter
 	agentLimiter  *ratelimit.Limiter
 	apiLimiter    *ratelimit.Limiter
+	// ddnsProvider builds a DNS provider from a profile; overridable in tests.
+	ddnsProvider func(model.DDNSProfile) (ddns.Provider, error)
 }
 
 type principal struct {
@@ -77,6 +80,9 @@ func New(opts Options) (*Server, error) {
 		agentLimiter: ratelimit.New(ratelimit.Config{Rate: 10, Burst: 40}),
 		// General authenticated API surface.
 		apiLimiter: ratelimit.New(ratelimit.Config{Rate: 30, Burst: 60}),
+		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
+			return ddns.NewProvider(p, nil)
+		},
 	}
 	if err := s.ensureAdmin(opts.AdminPassword); err != nil {
 		return nil, err
@@ -99,6 +105,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/workers", s.withAuth("worker:deploy", s.handleWorkers))
 	mux.HandleFunc("/api/workers/run", s.withAuth("worker:deploy", s.handleWorkerRun))
 	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
+	mux.HandleFunc("/api/ddns", s.withAuth("ddns:admin", s.handleDDNS))
+	mux.HandleFunc("/api/ddns/delete", s.withAuth("ddns:admin", s.handleDeleteDDNS))
+	mux.HandleFunc("/api/ddns/run", s.withAuth("ddns:admin", s.handleRunDDNS))
 	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
@@ -674,6 +683,185 @@ func buildChannel(kind string, cfg map[string]string) (notify.Channel, error) {
 	}
 }
 
+// ddnsView is the secret-free projection of a DDNS profile returned to clients.
+// Credentials (Cloudflare token, webhook headers) are never serialized.
+type ddnsView struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	NodeID        string    `json:"node_id"`
+	Provider      string    `json:"provider"`
+	Domains       []string  `json:"domains"`
+	EnableIPv4    bool      `json:"enable_ipv4"`
+	EnableIPv6    bool      `json:"enable_ipv6"`
+	MaxRetries    int       `json:"max_retries"`
+	TTL           int       `json:"ttl"`
+	HasCredential bool      `json:"has_credential"`
+	WebhookURL    string    `json:"webhook_url,omitempty"`
+	WebhookMethod string    `json:"webhook_method,omitempty"`
+	LastIPv4      string    `json:"last_ipv4,omitempty"`
+	LastIPv6      string    `json:"last_ipv6,omitempty"`
+	LastRunAt     time.Time `json:"last_run_at,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func toDDNSView(p model.DDNSProfile) ddnsView {
+	return ddnsView{
+		ID: p.ID, Name: p.Name, NodeID: p.NodeID, Provider: p.Provider, Domains: p.Domains,
+		EnableIPv4: p.EnableIPv4, EnableIPv6: p.EnableIPv6, MaxRetries: p.MaxRetries, TTL: p.TTL,
+		HasCredential: p.CFAPIToken != "" || p.WebhookHeaders != "",
+		WebhookURL:    p.WebhookURL, WebhookMethod: p.WebhookMethod,
+		LastIPv4: p.LastIPv4, LastIPv6: p.LastIPv6, LastRunAt: p.LastRunAt, LastError: p.LastError,
+		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
+	}
+}
+
+func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		profiles := s.store.DDNSProfiles()
+		views := make([]ddnsView, 0, len(profiles))
+		for _, pr := range profiles {
+			views = append(views, toDDNSView(pr))
+		}
+		writeJSON(w, http.StatusOK, views)
+	case http.MethodPost:
+		var req model.DDNSProfile
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" || req.NodeID == "" || len(req.Domains) == 0 {
+			writeError(w, http.StatusBadRequest, errors.New("name, node_id and at least one domain are required"))
+			return
+		}
+		if !req.EnableIPv4 && !req.EnableIPv6 {
+			req.EnableIPv4 = true
+		}
+		req.ID = id.New("ddns")
+		// Validate the provider configuration eagerly by constructing it.
+		if _, err := s.ddnsProvider(req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertDDNSProfile(req); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "ddns.create", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider}})
+		writeJSON(w, http.StatusOK, toDDNSView(req))
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func (s *Server) handleDeleteDDNS(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := s.store.DeleteDDNSProfile(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "ddns.delete", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID}})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleRunDDNS manually triggers a profile using its bound node's current
+// public IP, synchronously, so an operator (or a test) gets the outcome inline.
+func (s *Server) handleRunDDNS(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	profile, ok := s.store.DDNSProfile(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("ddns profile not found"))
+		return
+	}
+	node, _ := s.store.Node(profile.NodeID)
+	if err := s.runDDNS(profile, node.PublicIP, node.PublicIPv6); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	updated, _ := s.store.DDNSProfile(req.ID)
+	writeJSON(w, http.StatusOK, toDDNSView(updated))
+}
+
+// resolvePublicIPs picks the public IPs to record for an agent request. Values
+// the agent reports win; otherwise the observed source address fills the
+// matching family, giving zero-config DDNS for dial-out agents.
+func (s *Server) resolvePublicIPs(r *http.Request, reportedV4, reportedV6 string) (v4, v6 string) {
+	v4, v6 = reportedV4, reportedV6
+	if ip := net.ParseIP(s.clientIP(r)); ip != nil {
+		if ip.To4() != nil {
+			if v4 == "" {
+				v4 = ip.String()
+			}
+		} else if v6 == "" {
+			v6 = ip.String()
+		}
+	}
+	return v4, v6
+}
+
+// maybeTriggerDDNS runs every profile bound to a node when its public IP changed.
+func (s *Server) maybeTriggerDDNS(nodeID, oldV4, oldV6, newV4, newV6 string) {
+	changed := (newV4 != "" && newV4 != oldV4) || (newV6 != "" && newV6 != oldV6)
+	if !changed {
+		return
+	}
+	for _, profile := range s.store.DDNSProfilesForNode(nodeID) {
+		profile := profile
+		go func() {
+			if err := s.runDDNS(profile, newV4, newV6); err != nil {
+				s.logger.Printf("ddns: profile %s update failed: %v", profile.ID, err)
+			}
+		}()
+	}
+}
+
+// runDDNS applies a profile and records the run outcome on the profile.
+func (s *Server) runDDNS(profile model.DDNSProfile, v4, v6 string) error {
+	prov, err := s.ddnsProvider(profile)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	applyErr := ddns.Apply(ctx, prov, profile, v4, v6)
+	profile.LastRunAt = time.Now().UTC()
+	if v4 != "" {
+		profile.LastIPv4 = v4
+	}
+	if v6 != "" {
+		profile.LastIPv6 = v6
+	}
+	if applyErr != nil {
+		profile.LastError = applyErr.Error()
+	} else {
+		profile.LastError = ""
+	}
+	if err := s.store.UpsertDDNSProfile(profile); err != nil {
+		s.logger.Printf("ddns: persist profile %s: %v", profile.ID, err)
+	}
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), NodeID: profile.NodeID, Action: "ddns.run", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": profile.ID, "ok": fmt.Sprintf("%t", applyErr == nil)}})
+	return applyErr
+}
+
 // tokenView is the safe projection of a token returned to clients: it never
 // includes the hash or the secret.
 type tokenView struct {
@@ -892,8 +1080,11 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
 		return
 	}
+	oldV4, oldV6 := n.PublicIP, n.PublicIPv6
+	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6)
 	n.AgentVersion = req.Version
-	n.PublicIP = req.PublicIP
+	n.PublicIP = v4
+	n.PublicIPv6 = v6
 	n.WireGuardIP = req.WireGuardIP
 	n.LastSeen = time.Now().UTC()
 	n.Online = true
@@ -901,6 +1092,7 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.maybeTriggerDDNS(req.NodeID, oldV4, oldV6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -912,14 +1104,17 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if _, ok := s.authenticateNode(req.NodeID, req.Token); !ok {
+	old, ok := s.authenticateNode(req.NodeID, req.Token)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
 		return
 	}
-	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, req.PublicIP, req.WireGuardIP); err != nil {
+	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6)
+	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, req.WireGuardIP); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.maybeTriggerDDNS(req.NodeID, old.PublicIP, old.PublicIPv6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -969,6 +1164,7 @@ type agentAuthRequest struct {
 	Token       string `json:"token"`
 	Version     string `json:"version"`
 	PublicIP    string `json:"public_ip"`
+	PublicIPv6  string `json:"public_ipv6"`
 	WireGuardIP string `json:"wireguard_ip"`
 }
 

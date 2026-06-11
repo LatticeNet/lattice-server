@@ -31,6 +31,7 @@ type State struct {
 	Workers   map[string]model.WorkerScript `json:"workers"`
 	Approvals map[string]model.Approval     `json:"approvals"`
 	Sessions  map[string]auth.Session       `json:"sessions"`
+	DDNS      map[string]model.DDNSProfile  `json:"ddns"`
 }
 
 type Store struct {
@@ -72,6 +73,7 @@ func emptyState() State {
 		Workers:   map[string]model.WorkerScript{},
 		Approvals: map[string]model.Approval{},
 		Sessions:  map[string]auth.Session{},
+		DDNS:      map[string]model.DDNSProfile{},
 	}
 }
 
@@ -102,6 +104,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.Sessions == nil {
 		s.state.Sessions = map[string]auth.Session{}
+	}
+	if s.state.DDNS == nil {
+		s.state.DDNS = map[string]model.DDNSProfile{}
 	}
 }
 
@@ -200,7 +205,7 @@ func (s *Store) Nodes() []model.Node {
 	return out
 }
 
-func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, wgIP string) error {
+func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, publicIPv6, wgIP string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, ok := s.state.Nodes[nodeID]
@@ -215,6 +220,9 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	}
 	if publicIP != "" {
 		n.PublicIP = publicIP
+	}
+	if publicIPv6 != "" {
+		n.PublicIPv6 = publicIPv6
 	}
 	if wgIP != "" {
 		n.WireGuardIP = wgIP
@@ -440,6 +448,62 @@ func (s *Store) DeleteSession(id string) error {
 		return nil
 	}
 	delete(s.state.Sessions, id)
+	return s.Save()
+}
+
+// UpsertDDNSProfile creates or updates a DDNS profile.
+func (s *Store) UpsertDDNSProfile(p model.DDNSProfile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p.UpdatedAt = time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	s.state.DDNS[p.ID] = p
+	return s.Save()
+}
+
+// DDNSProfile returns a profile by id.
+func (s *Store) DDNSProfile(id string) (model.DDNSProfile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.state.DDNS[id]
+	return p, ok
+}
+
+// DDNSProfiles returns all profiles sorted by creation time.
+func (s *Store) DDNSProfiles() []model.DDNSProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.DDNSProfile, 0, len(s.state.DDNS))
+	for _, p := range s.state.DDNS {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// DDNSProfilesForNode returns the profiles bound to a node.
+func (s *Store) DDNSProfilesForNode(nodeID string) []model.DDNSProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.DDNSProfile{}
+	for _, p := range s.state.DDNS {
+		if p.NodeID == nodeID {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// DeleteDDNSProfile removes a profile.
+func (s *Store) DeleteDDNSProfile(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.DDNS[id]; !ok {
+		return nil
+	}
+	delete(s.state.DDNS, id)
 	return s.Save()
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/audit"
 	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/cftunnel"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/network"
@@ -122,6 +123,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
 	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("network:plan", s.handleWireGuardPlan))
+	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
+	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))
+	mux.HandleFunc("/api/tunnels/plan", s.withAuth("tunnel:admin", s.handleTunnelPlan))
 	mux.HandleFunc("/api/network/approvals", s.withAuth("network:plan", s.handleApprovals))
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
@@ -1326,6 +1330,96 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 	writeJSON(w, http.StatusOK, s.store.Approvals())
 }
 
+func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.Tunnels())
+	case http.MethodPost:
+		var req model.TunnelProfile
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" || req.NodeID == "" || req.TunnelID == "" || len(req.Ingress) == 0 {
+			writeError(w, http.StatusBadRequest, errors.New("name, node_id, tunnel_id and at least one ingress rule are required"))
+			return
+		}
+		req.ID = id.New("tunnel")
+		// Validate the ingress by generating the config eagerly.
+		if _, err := cftunnel.GenerateConfig(req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertTunnel(req); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "tunnel.create", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
+		writeJSON(w, http.StatusOK, req)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func (s *Server) handleDeleteTunnel(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := s.store.DeleteTunnel(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "tunnel.delete", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleTunnelPlan renders a tunnel profile to a cloudflared config.yml and
+// records it as a pending approval for the bound node.
+func (s *Server) handleTunnelPlan(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	profile, ok := s.store.Tunnel(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("tunnel profile not found"))
+		return
+	}
+	config, err := cftunnel.GenerateConfig(profile)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	approval := model.Approval{
+		ID:        id.New("approval"),
+		NodeID:    profile.NodeID,
+		Plugin:    "cftunnel",
+		Action:    "apply-config",
+		Plan:      config,
+		Status:    model.ApprovalPending,
+		ActorID:   p.ActorID,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.store.UpsertApproval(approval); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: profile.NodeID, Action: "tunnel.plan", Scope: "tunnel:admin", Metadata: map[string]string{"approval_id": approval.ID, "tunnel_id": profile.ID}})
+	writeJSON(w, http.StatusOK, approval)
+}
+
 // handleWireGuardPlan computes a node's WireGuard mesh config from the current
 // cluster state and records it as a pending approval. The node's private key is
 // never involved; the plan carries a placeholder substituted at apply time.
@@ -1379,6 +1473,14 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 // wireguard substitutes the node-local private key and brings the interface up.
 func applyScriptFor(approval model.Approval) string {
 	switch approval.Plugin {
+	case "cftunnel":
+		return "set -e\n" +
+			"mkdir -p /etc/cloudflared\n" +
+			"cat > /etc/cloudflared/config.yml <<'LATTICE_CF_EOF'\n" +
+			approval.Plan +
+			"LATTICE_CF_EOF\n" +
+			"cloudflared --config /etc/cloudflared/config.yml ingress validate\n" +
+			"systemctl reload cloudflared 2>/dev/null || systemctl restart cloudflared 2>/dev/null || echo 'config written; start cloudflared manually'\n"
 	case "wireguard":
 		return "set -e\n" +
 			"umask 077\n" +

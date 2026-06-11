@@ -38,6 +38,7 @@ type State struct {
 	Monitors       map[string]model.Monitor         `json:"monitors"`
 	MonResults     map[string][]model.MonitorResult `json:"monitor_results"`
 	NotifyChannels map[string]model.NotifyChannel   `json:"notify_channels"`
+	Tunnels        map[string]model.TunnelProfile   `json:"tunnels"`
 }
 
 type Store struct {
@@ -83,6 +84,7 @@ func emptyState() State {
 		Monitors:       map[string]model.Monitor{},
 		MonResults:     map[string][]model.MonitorResult{},
 		NotifyChannels: map[string]model.NotifyChannel{},
+		Tunnels:        map[string]model.TunnelProfile{},
 	}
 }
 
@@ -125,6 +127,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.NotifyChannels == nil {
 		s.state.NotifyChannels = map[string]model.NotifyChannel{}
+	}
+	if s.state.Tunnels == nil {
+		s.state.Tunnels = map[string]model.TunnelProfile{}
 	}
 }
 
@@ -668,6 +673,49 @@ func (s *Store) LastMonitorResultForNode(monitorID, nodeID string) (model.Monito
 		}
 	}
 	return model.MonitorResult{}, false
+}
+
+// UpsertTunnel creates or updates a tunnel profile.
+func (s *Store) UpsertTunnel(t model.TunnelProfile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t.UpdatedAt = time.Now().UTC()
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = t.UpdatedAt
+	}
+	s.state.Tunnels[t.ID] = t
+	return s.Save()
+}
+
+// Tunnel returns a tunnel profile by id.
+func (s *Store) Tunnel(id string) (model.TunnelProfile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.Tunnels[id]
+	return t, ok
+}
+
+// Tunnels returns all tunnel profiles sorted by creation time.
+func (s *Store) Tunnels() []model.TunnelProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.TunnelProfile, 0, len(s.state.Tunnels))
+	for _, t := range s.state.Tunnels {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// DeleteTunnel removes a tunnel profile.
+func (s *Store) DeleteTunnel(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Tunnels[id]; !ok {
+		return nil
+	}
+	delete(s.state.Tunnels, id)
+	return s.Save()
 }
 
 func (s *Store) evictOldestSessionLocked() {

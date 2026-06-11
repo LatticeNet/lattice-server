@@ -25,6 +25,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/ratelimit"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
+	"github.com/LatticeNet/lattice-server/internal/wireguard"
 	"github.com/LatticeNet/lattice-server/internal/worker"
 )
 
@@ -120,6 +121,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
+	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("network:plan", s.handleWireGuardPlan))
 	mux.HandleFunc("/api/network/approvals", s.withAuth("network:plan", s.handleApprovals))
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
@@ -1324,6 +1326,78 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 	writeJSON(w, http.StatusOK, s.store.Approvals())
 }
 
+// handleWireGuardPlan computes a node's WireGuard mesh config from the current
+// cluster state and records it as a pending approval. The node's private key is
+// never involved; the plan carries a placeholder substituted at apply time.
+func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID     string `json:"node_id"`
+		ListenPort int    `json:"listen_port"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	target, ok := s.store.Node(req.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	iface, peers, err := wireguard.BuildMesh(s.store.Nodes(), target, req.ListenPort)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	config, err := wireguard.GenerateConfig(iface, peers)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	approval := model.Approval{
+		ID:        id.New("approval"),
+		NodeID:    req.NodeID,
+		Plugin:    "wireguard",
+		Action:    "apply-config",
+		Plan:      config,
+		Status:    model.ApprovalPending,
+		ActorID:   p.ActorID,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.store.UpsertApproval(approval); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "network.wireguard.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID, "peers": fmt.Sprintf("%d", len(peers))}})
+	writeJSON(w, http.StatusOK, approval)
+}
+
+// applyScriptFor builds the bounded shell that applies an approved plan on the
+// agent, branching by plugin. nft is validated (nft -c) rather than committed;
+// wireguard substitutes the node-local private key and brings the interface up.
+func applyScriptFor(approval model.Approval) string {
+	switch approval.Plugin {
+	case "wireguard":
+		return "set -e\n" +
+			"umask 077\n" +
+			"mkdir -p /etc/wireguard\n" +
+			"KEY_FILE=${LATTICE_WG_KEY:-/etc/wireguard/lattice.key}\n" +
+			"if [ ! -f \"$KEY_FILE\" ]; then echo \"missing wireguard private key at $KEY_FILE\" >&2; exit 1; fi\n" +
+			"PRIV=$(cat \"$KEY_FILE\")\n" +
+			"cat > /etc/wireguard/wg0.conf.new <<'LATTICE_WG_EOF'\n" +
+			approval.Plan +
+			"LATTICE_WG_EOF\n" +
+			"sed -i \"s|" + wireguard.PrivateKeyPlaceholder + "|$PRIV|\" /etc/wireguard/wg0.conf.new\n" +
+			"mv /etc/wireguard/wg0.conf.new /etc/wireguard/wg0.conf\n" +
+			"wg-quick down wg0 2>/dev/null || true\n" +
+			"wg-quick up wg0\n"
+	default:
+		return "cat > /tmp/lattice-nft-plan.nft <<'EOF'\n" + approval.Plan + "EOF\nnft -c -f /tmp/lattice-nft-plan.nft\n"
+	}
+}
+
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -1354,7 +1428,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			TokenID:     p.TokenID,
 			Targets:     []string{approval.NodeID},
 			Interpreter: "sh",
-			Script:      "cat > /tmp/lattice-nft-plan.nft <<'EOF'\n" + approval.Plan + "EOF\nnft -c -f /tmp/lattice-nft-plan.nft\n",
+			Script:      applyScriptFor(approval),
 			TimeoutSec:  30,
 			OutputLimit: 65536,
 			Status:      model.TaskQueued,
@@ -1385,6 +1459,15 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	n.PublicIP = v4
 	n.PublicIPv6 = v6
 	n.WireGuardIP = req.WireGuardIP
+	if req.WGPublicKey != "" {
+		n.WireGuardPublicKey = req.WGPublicKey
+	}
+	if req.WGEndpoint != "" {
+		n.WireGuardEndpoint = req.WGEndpoint
+	}
+	if req.WGPort != 0 {
+		n.WireGuardPort = req.WGPort
+	}
 	n.LastSeen = time.Now().UTC()
 	n.Online = true
 	if err := s.store.UpsertNode(n); err != nil {
@@ -1465,6 +1548,9 @@ type agentAuthRequest struct {
 	PublicIP    string `json:"public_ip"`
 	PublicIPv6  string `json:"public_ipv6"`
 	WireGuardIP string `json:"wireguard_ip"`
+	WGPublicKey string `json:"wireguard_public_key"`
+	WGEndpoint  string `json:"wireguard_endpoint"`
+	WGPort      int    `json:"wireguard_port"`
 }
 
 func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {

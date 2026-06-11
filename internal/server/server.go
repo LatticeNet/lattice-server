@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -51,6 +52,8 @@ type Server struct {
 	apiLimiter    *ratelimit.Limiter
 	// ddnsProvider builds a DNS provider from a profile; overridable in tests.
 	ddnsProvider func(model.DDNSProfile) (ddns.Provider, error)
+	// emitNotify dispatches an event notification; overridable in tests.
+	emitNotify func(title, body string)
 }
 
 type principal struct {
@@ -84,6 +87,7 @@ func New(opts Options) (*Server, error) {
 			return ddns.NewProvider(p, nil)
 		},
 	}
+	s.emitNotify = s.notifyEvent
 	if err := s.ensureAdmin(opts.AdminPassword); err != nil {
 		return nil, err
 	}
@@ -105,6 +109,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/workers", s.withAuth("worker:deploy", s.handleWorkers))
 	mux.HandleFunc("/api/workers/run", s.withAuth("worker:deploy", s.handleWorkerRun))
 	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
+	mux.HandleFunc("/api/notify/channels", s.withAuth("notify:send", s.handleNotifyChannels))
+	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:send", s.handleDeleteNotifyChannel))
 	mux.HandleFunc("/api/ddns", s.withAuth("ddns:admin", s.handleDDNS))
 	mux.HandleFunc("/api/ddns/delete", s.withAuth("ddns:admin", s.handleDeleteDDNS))
 	mux.HandleFunc("/api/ddns/run", s.withAuth("ddns:admin", s.handleRunDDNS))
@@ -122,6 +128,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
+	mux.HandleFunc("/api/agent/event", s.withAgentLimit(s.handleAgentEvent))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -676,12 +683,24 @@ func buildChannel(kind string, cfg map[string]string) (notify.Channel, error) {
 	}
 	switch kind {
 	case "telegram":
+		if cfg["token"] == "" || cfg["chat_id"] == "" {
+			return nil, errors.New("telegram requires config.token and config.chat_id")
+		}
 		return notify.Telegram{Token: cfg["token"], ChatID: cfg["chat_id"], BaseURL: cfg["base_url"]}, nil
 	case "bark":
+		if cfg["base_url"] == "" || cfg["key"] == "" {
+			return nil, errors.New("bark requires config.base_url and config.key")
+		}
 		return notify.Bark{BaseURL: cfg["base_url"], Key: cfg["key"]}, nil
 	case "discord":
+		if cfg["webhook_url"] == "" {
+			return nil, errors.New("discord requires config.webhook_url")
+		}
 		return notify.Discord{WebhookURL: cfg["webhook_url"]}, nil
 	case "webhook":
+		if cfg["url"] == "" {
+			return nil, errors.New("webhook requires config.url")
+		}
 		return notify.Webhook{URL: cfg["url"]}, nil
 	default:
 		return nil, fmt.Errorf("unknown notify channel %q", kind)
@@ -788,9 +807,177 @@ func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request
 		return
 	}
 	req.Result.NodeID = req.NodeID
+	prior, hadPrior := s.store.LastMonitorResultForNode(req.Result.MonitorID, req.NodeID)
 	if err := s.store.AddMonitorResult(req.Result); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	s.notifyMonitorTransition(req.NodeID, req.Result, prior, hadPrior)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// notifyChannelView is the secret-free projection of a notification channel.
+// Config values (tokens, webhook URLs) are never returned; only the set of
+// configured keys is exposed so an operator can see what is configured.
+type notifyChannelView struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Kind       string    `json:"kind"`
+	ConfigKeys []string  `json:"config_keys"`
+	Enabled    bool      `json:"enabled"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+func toNotifyChannelView(c model.NotifyChannel) notifyChannelView {
+	keys := make([]string, 0, len(c.Config))
+	for k := range c.Config {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt}
+}
+
+func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		channels := s.store.NotifyChannels()
+		views := make([]notifyChannelView, 0, len(channels))
+		for _, c := range channels {
+			views = append(views, toNotifyChannelView(c))
+		}
+		writeJSON(w, http.StatusOK, views)
+	case http.MethodPost:
+		var req struct {
+			Name    string            `json:"name"`
+			Kind    string            `json:"kind"`
+			Config  map[string]string `json:"config"`
+			Enabled *bool             `json:"enabled"`
+		}
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("name is required"))
+			return
+		}
+		// Validate the channel config eagerly by constructing it.
+		if _, err := buildChannel(req.Kind, req.Config); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		channel := model.NotifyChannel{
+			ID:      id.New("notify"),
+			Name:    req.Name,
+			Kind:    req.Kind,
+			Config:  req.Config,
+			Enabled: req.Enabled == nil || *req.Enabled,
+		}
+		if err := s.store.UpsertNotifyChannel(channel); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "notify.channel.create", Scope: "notify:send", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
+		writeJSON(w, http.StatusOK, toNotifyChannelView(channel))
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if err := s.store.DeleteNotifyChannel(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "notify.channel.delete", Scope: "notify:send", Metadata: map[string]string{"channel_id": req.ID}})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// notifyEvent fans a message out to every enabled notification channel,
+// asynchronously so it never blocks the triggering request.
+func (s *Server) notifyEvent(title, body string) {
+	channels := s.store.EnabledNotifyChannels()
+	built := make([]notify.Channel, 0, len(channels))
+	for _, c := range channels {
+		ch, err := buildChannel(c.Kind, c.Config)
+		if err != nil {
+			s.logger.Printf("notify: channel %s misconfigured: %v", c.ID, err)
+			continue
+		}
+		built = append(built, ch)
+	}
+	if len(built) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for _, res := range notify.NewDispatcher(built...).Send(ctx, notify.Message{Title: title, Body: body}) {
+			if res.Err != nil {
+				s.logger.Printf("notify: %s delivery failed: %v", res.Kind, res.Err)
+			}
+		}
+	}()
+}
+
+// notifyMonitorTransition emits an alert when a monitor's success state flips
+// (or on the first observed failure), so flapping does not spam every result.
+func (s *Server) notifyMonitorTransition(nodeID string, current, prior model.MonitorResult, hadPrior bool) {
+	transitioned := (!hadPrior && !current.Success) || (hadPrior && prior.Success != current.Success)
+	if !transitioned {
+		return
+	}
+	mon, _ := s.store.Monitor(current.MonitorID)
+	name := mon.Name
+	if name == "" {
+		name = current.MonitorID
+	}
+	if current.Success {
+		s.emitNotify("✅ Monitor recovered", fmt.Sprintf("%s on node %s is back up (%.1fms)", name, nodeID, current.LatencyMs))
+	} else {
+		detail := current.Error
+		if detail == "" {
+			detail = "probe failed"
+		}
+		s.emitNotify("🔴 Monitor down", fmt.Sprintf("%s on node %s failed: %s", name, nodeID, detail))
+	}
+}
+
+// handleAgentEvent ingests an out-of-band event from an authenticated agent
+// (currently SSH login notifications) and turns it into an audit record plus a
+// notification.
+func (s *Server) handleAgentEvent(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		agentAuthRequest
+		Kind    string `json:"kind"`
+		User    string `json:"user"`
+		Address string `json:"address"`
+		Method  string `json:"method"`
+		Message string `json:"message"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if _, ok := s.authenticateNode(req.NodeID, req.Token); !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+		return
+	}
+	switch req.Kind {
+	case "ssh_login":
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "ssh.login", Decision: "observe", Metadata: map[string]string{"user": req.User, "address": req.Address, "method": req.Method}})
+		s.emitNotify("🔐 SSH login", fmt.Sprintf("node %s: %s logged in from %s (%s)", req.NodeID, req.User, req.Address, req.Method))
+	default:
+		s.recordAudit(model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "agent.event", Decision: "observe", Metadata: map[string]string{"kind": req.Kind, "message": req.Message}})
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

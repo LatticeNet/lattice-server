@@ -23,20 +23,21 @@ const maxSessions = 4096
 const maxMonitorResults = 500
 
 type State struct {
-	Users      map[string]model.User            `json:"users"`
-	Tokens     map[string]model.Token           `json:"tokens"`
-	Nodes      map[string]model.Node            `json:"nodes"`
-	Tasks      map[string]model.Task            `json:"tasks"`
-	Results    []model.TaskResult               `json:"results"`
-	Audit      []model.AuditEvent               `json:"audit"`
-	KV         map[string]model.KVEntry         `json:"kv"`
-	Static     map[string]model.StaticObject    `json:"static"`
-	Workers    map[string]model.WorkerScript    `json:"workers"`
-	Approvals  map[string]model.Approval        `json:"approvals"`
-	Sessions   map[string]auth.Session          `json:"sessions"`
-	DDNS       map[string]model.DDNSProfile     `json:"ddns"`
-	Monitors   map[string]model.Monitor         `json:"monitors"`
-	MonResults map[string][]model.MonitorResult `json:"monitor_results"`
+	Users          map[string]model.User            `json:"users"`
+	Tokens         map[string]model.Token           `json:"tokens"`
+	Nodes          map[string]model.Node            `json:"nodes"`
+	Tasks          map[string]model.Task            `json:"tasks"`
+	Results        []model.TaskResult               `json:"results"`
+	Audit          []model.AuditEvent               `json:"audit"`
+	KV             map[string]model.KVEntry         `json:"kv"`
+	Static         map[string]model.StaticObject    `json:"static"`
+	Workers        map[string]model.WorkerScript    `json:"workers"`
+	Approvals      map[string]model.Approval        `json:"approvals"`
+	Sessions       map[string]auth.Session          `json:"sessions"`
+	DDNS           map[string]model.DDNSProfile     `json:"ddns"`
+	Monitors       map[string]model.Monitor         `json:"monitors"`
+	MonResults     map[string][]model.MonitorResult `json:"monitor_results"`
+	NotifyChannels map[string]model.NotifyChannel   `json:"notify_channels"`
 }
 
 type Store struct {
@@ -69,18 +70,19 @@ func Open(path string) (*Store, error) {
 
 func emptyState() State {
 	return State{
-		Users:      map[string]model.User{},
-		Tokens:     map[string]model.Token{},
-		Nodes:      map[string]model.Node{},
-		Tasks:      map[string]model.Task{},
-		KV:         map[string]model.KVEntry{},
-		Static:     map[string]model.StaticObject{},
-		Workers:    map[string]model.WorkerScript{},
-		Approvals:  map[string]model.Approval{},
-		Sessions:   map[string]auth.Session{},
-		DDNS:       map[string]model.DDNSProfile{},
-		Monitors:   map[string]model.Monitor{},
-		MonResults: map[string][]model.MonitorResult{},
+		Users:          map[string]model.User{},
+		Tokens:         map[string]model.Token{},
+		Nodes:          map[string]model.Node{},
+		Tasks:          map[string]model.Task{},
+		KV:             map[string]model.KVEntry{},
+		Static:         map[string]model.StaticObject{},
+		Workers:        map[string]model.WorkerScript{},
+		Approvals:      map[string]model.Approval{},
+		Sessions:       map[string]auth.Session{},
+		DDNS:           map[string]model.DDNSProfile{},
+		Monitors:       map[string]model.Monitor{},
+		MonResults:     map[string][]model.MonitorResult{},
+		NotifyChannels: map[string]model.NotifyChannel{},
 	}
 }
 
@@ -120,6 +122,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.MonResults == nil {
 		s.state.MonResults = map[string][]model.MonitorResult{}
+	}
+	if s.state.NotifyChannels == nil {
+		s.state.NotifyChannels = map[string]model.NotifyChannel{}
 	}
 }
 
@@ -602,6 +607,67 @@ func (s *Store) MonitorResults(monitorID string) []model.MonitorResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]model.MonitorResult(nil), s.state.MonResults[monitorID]...)
+}
+
+// UpsertNotifyChannel creates or updates a notification channel.
+func (s *Store) UpsertNotifyChannel(c model.NotifyChannel) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c.UpdatedAt = time.Now().UTC()
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = c.UpdatedAt
+	}
+	s.state.NotifyChannels[c.ID] = c
+	return s.Save()
+}
+
+// NotifyChannels returns all channels sorted by creation time.
+func (s *Store) NotifyChannels() []model.NotifyChannel {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.NotifyChannel, 0, len(s.state.NotifyChannels))
+	for _, c := range s.state.NotifyChannels {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// EnabledNotifyChannels returns only channels that are enabled.
+func (s *Store) EnabledNotifyChannels() []model.NotifyChannel {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.NotifyChannel{}
+	for _, c := range s.state.NotifyChannels {
+		if c.Enabled {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// DeleteNotifyChannel removes a channel.
+func (s *Store) DeleteNotifyChannel(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.NotifyChannels[id]; !ok {
+		return nil
+	}
+	delete(s.state.NotifyChannels, id)
+	return s.Save()
+}
+
+// LastMonitorResultForNode returns a node's most recent result for a monitor.
+func (s *Store) LastMonitorResultForNode(monitorID, nodeID string) (model.MonitorResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	series := s.state.MonResults[monitorID]
+	for i := len(series) - 1; i >= 0; i-- {
+		if series[i].NodeID == nodeID {
+			return series[i], true
+		}
+	}
+	return model.MonitorResult{}, false
 }
 
 func (s *Store) evictOldestSessionLocked() {

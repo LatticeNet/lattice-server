@@ -204,6 +204,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/audit", s.withAuth("audit:read", s.handleAudit))
+	mux.HandleFunc("/api/audit/verify", s.withAuth("audit:read", s.handleAuditVerify))
 	mux.HandleFunc("/api/plugins", s.withAuth("audit:read", s.handlePlugins))
 	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
@@ -1165,6 +1166,26 @@ func auditEventMatches(ev model.AuditEvent, action, decision, nodeID, actorID, t
 func auditFieldMatches(value, want string) bool {
 	want = strings.TrimSpace(want)
 	return want == "" || value == want
+}
+
+// handleAuditVerify validates the tamper-evident audit WAL chain and reports the
+// result. A broken chain returns ok=false (200) so an operator can SEE the
+// tampering rather than receive a generic error.
+func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	res, enabled, err := s.store.AuditWALVerify()
+	if !enabled {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+	out := map[string]any{"enabled": true, "ok": err == nil, "count": res.Count, "head": res.Head}
+	if err != nil {
+		out["error"] = err.Error()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {

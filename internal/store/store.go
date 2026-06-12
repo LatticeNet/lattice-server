@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/audit"
 	"github.com/LatticeNet/lattice-server/internal/auth"
 )
 
@@ -45,9 +46,11 @@ type State struct {
 }
 
 type Store struct {
-	mu    sync.Mutex
-	path  string
-	state State
+	mu      sync.Mutex
+	path    string
+	state   State
+	wal     *audit.WAL // append-only tamper-evident audit log; nil for in-memory stores
+	walPath string
 }
 
 func Open(path string) (*Store, error) {
@@ -55,6 +58,13 @@ func Open(path string) (*Store, error) {
 	if path == "" {
 		return s, nil
 	}
+	walPath := path + ".audit-wal"
+	wal, err := audit.OpenWAL(walPath)
+	if err != nil {
+		return nil, err
+	}
+	s.wal = wal
+	s.walPath = walPath
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -351,7 +361,51 @@ func (s *Store) AppendAudit(ev model.AuditEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.Audit = append(s.state.Audit, ev)
+	if s.wal != nil {
+		if err := s.wal.Append(ev); err != nil {
+			return err
+		}
+	}
 	return s.Save()
+}
+
+// AuditWALVerify re-reads the append-only audit WAL and validates its hash chain.
+// The second return is false when no WAL is configured (in-memory store).
+func (s *Store) AuditWALVerify() (audit.Result, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.walPath == "" {
+		return audit.Result{}, false, nil
+	}
+	f, err := os.Open(s.walPath)
+	if err != nil {
+		return audit.Result{}, true, err
+	}
+	defer f.Close()
+	res, err := audit.Verify(f)
+	return res, true, err
+}
+
+// AuditWALHead returns the current chain head hash and record count, and whether
+// a WAL is configured. The head can be shipped off-box to detect end-truncation.
+func (s *Store) AuditWALHead() (string, int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wal == nil {
+		return "", 0, false
+	}
+	h, n := s.wal.Head()
+	return h, n, true
+}
+
+// Close releases the audit WAL file handle.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.wal != nil {
+		return s.wal.Close()
+	}
+	return nil
 }
 
 func (s *Store) AuditEvents() []model.AuditEvent {

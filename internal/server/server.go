@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/netip"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/notify"
+	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/ratelimit"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
@@ -44,7 +46,14 @@ type Options struct {
 	// sits behind a trusted reverse proxy / Cloudflare; otherwise clients can
 	// spoof the header and evade per-IP rate limiting.
 	TrustProxy bool
-	Logger     *log.Logger
+	// PluginDir is the root directory of installed plugin bundles. Empty disables
+	// plugin loading entirely.
+	PluginDir string
+	// PluginTrust is the operator policy used to verify plugin signatures at load
+	// time. The zero value is fail-closed: host-risk plugins require a trusted
+	// publisher signature.
+	PluginTrust plugin.TrustPolicy
+	Logger      *log.Logger
 }
 
 type Server struct {
@@ -61,6 +70,8 @@ type Server struct {
 	ddnsProvider func(model.DDNSProfile) (ddns.Provider, error)
 	// emitNotify dispatches an event notification; overridable in tests.
 	emitNotify func(title, body string)
+	// plugins is the verified, registered plugin set established at startup.
+	plugins []plugin.Loaded
 }
 
 const (
@@ -122,7 +133,61 @@ func New(opts Options) (*Server, error) {
 	if err := s.ensureAdmin(opts.AdminPassword); err != nil {
 		return nil, err
 	}
+	s.loadPlugins(opts.PluginDir, opts.PluginTrust)
 	return s, nil
+}
+
+// loadPlugins verifies and registers plugin bundles at startup. This is the point
+// at which the signature/digest/capability trust model becomes load-bearing.
+// Verification failures are audited and skipped — one bad or untrusted bundle
+// never blocks boot. Execution (host-API binding) is a later milestone.
+func (s *Server) loadPlugins(dir string, policy plugin.TrustPolicy) {
+	loaded, outcomes, err := plugin.Loader{Dir: dir, Policy: policy}.Load()
+	if err != nil {
+		s.logger.Printf("plugin loader: %v", err)
+		return
+	}
+	s.plugins = loaded
+	for _, o := range outcomes {
+		if o.Loaded {
+			s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.loaded", Decision: "allow", Metadata: map[string]string{"plugin_id": o.PluginID, "bundle": filepath.Base(o.BundlePath)}})
+		} else {
+			s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.rejected", Decision: "deny", Reason: o.Reason, Metadata: map[string]string{"bundle": filepath.Base(o.BundlePath)}})
+		}
+	}
+	if len(outcomes) > 0 {
+		s.logger.Printf("plugin loader: %d loaded, %d rejected (dir=%s)", len(loaded), len(outcomes)-len(loaded), dir)
+	}
+}
+
+type pluginView struct {
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Type         string   `json:"type"`
+	Version      string   `json:"version,omitempty"`
+	Publisher    string   `json:"publisher,omitempty"`
+	Capabilities []string `json:"capabilities"`
+}
+
+// handlePlugins lists the verified, registered plugins (operator visibility into
+// the trust-sensitive registry). No signatures/digests are returned.
+func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	views := make([]pluginView, 0, len(s.plugins))
+	for _, pl := range s.plugins {
+		views = append(views, pluginView{
+			ID:           pl.Manifest.ID,
+			Name:         pl.Manifest.Name,
+			Type:         pl.Manifest.Type,
+			Version:      pl.Manifest.Version,
+			Publisher:    pl.Manifest.Publisher,
+			Capabilities: pl.Capabilities,
+		})
+	}
+	writeJSON(w, http.StatusOK, views)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -139,6 +204,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/audit", s.withAuth("audit:read", s.handleAudit))
+	mux.HandleFunc("/api/plugins", s.withAuth("audit:read", s.handlePlugins))
 	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
 	mux.HandleFunc("/api/workers", s.withAuth("worker:deploy", s.handleWorkers))

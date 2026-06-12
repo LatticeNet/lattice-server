@@ -2,12 +2,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/server"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -20,6 +22,8 @@ func main() {
 	var trustProxy bool
 	var tlsCert string
 	var tlsKey string
+	var pluginDir string
+	var pluginTrust string
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
 	flag.StringVar(&webRoot, "web", env("LATTICE_WEB_ROOT", "../lattice-dashboard"), "static dashboard root")
@@ -27,7 +31,17 @@ func main() {
 	flag.BoolVar(&trustProxy, "trust-proxy", env("LATTICE_TRUST_PROXY", "") == "1", "trust CF-Connecting-IP / X-Forwarded-For for client IP (only behind a trusted proxy)")
 	flag.StringVar(&tlsCert, "tls-cert", os.Getenv("LATTICE_TLS_CERT"), "TLS certificate file; enables HTTPS when set with -tls-key")
 	flag.StringVar(&tlsKey, "tls-key", os.Getenv("LATTICE_TLS_KEY"), "TLS private key file")
+	flag.StringVar(&pluginDir, "plugin-dir", env("LATTICE_PLUGIN_DIR", ""), "directory of installed plugin bundles (empty disables plugins)")
+	flag.StringVar(&pluginTrust, "plugin-trust", env("LATTICE_PLUGIN_TRUST", ""), "path to the operator plugin trust policy JSON")
 	flag.Parse()
+
+	trustPolicy, err := loadPluginTrust(pluginTrust)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if trustPolicy.AllowUnsignedHostRisk {
+		log.Printf("WARNING: plugin trust policy sets allow_unsigned_host_risk=true; UNSIGNED host-risk plugins will load. Do not use in production.")
+	}
 
 	st, err := store.Open(dataPath)
 	if err != nil {
@@ -39,6 +53,8 @@ func main() {
 		AdminPassword: os.Getenv("LATTICE_ADMIN_PASSWORD"),
 		SecureCookies: secureCookies,
 		TrustProxy:    trustProxy,
+		PluginDir:     pluginDir,
+		PluginTrust:   trustPolicy,
 		Logger:        log.Default(),
 	})
 	if err != nil {
@@ -81,4 +97,17 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// loadPluginTrust reads the operator plugin trust policy. An empty path yields
+// the fail-closed zero policy (host-risk plugins require a trusted signature).
+func loadPluginTrust(path string) (plugin.TrustPolicy, error) {
+	if path == "" {
+		return plugin.TrustPolicy{}, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return plugin.TrustPolicy{}, fmt.Errorf("read plugin trust policy: %w", err)
+	}
+	return plugin.ParseTrustPolicyJSON(data)
 }

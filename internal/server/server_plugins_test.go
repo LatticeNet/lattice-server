@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -84,6 +86,16 @@ func TestPluginLoaderWiredIntoServer(t *testing.T) {
 	if len(plugins) != 1 || plugins[0].ID != "ops.bundle" {
 		t.Fatalf("expected only ops.bundle to load, got %+v", plugins)
 	}
+	installed, ok := st.PluginInstallation("ops.bundle")
+	if !ok {
+		t.Fatal("expected loaded plugin to be recorded in plugin lifecycle store")
+	}
+	if installed.Status != model.PluginStatusVerified || installed.Name != "Ops" || installed.Version != "1.0.0" || installed.ArtifactSHA256 != good.DigestSHA256 {
+		t.Fatalf("unexpected lifecycle entry for loaded plugin: %+v", installed)
+	}
+	if _, ok := st.PluginInstallation("rogue.bundle"); ok {
+		t.Fatal("rejected plugin must not be recorded as a lifecycle installation")
+	}
 
 	res = doJSON(t, handler, http.MethodGet, "/api/audit?action=plugin.rejected", "", cookies, csrf)
 	if res.StatusCode != http.StatusOK {
@@ -97,5 +109,117 @@ func TestPluginLoaderWiredIntoServer(t *testing.T) {
 	res.Body.Close()
 	if audit.Total < 1 {
 		t.Fatalf("expected a plugin.rejected audit event for the unsigned bundle, got %+v", audit)
+	}
+}
+
+func TestPluginLifecycleAPIListsAndTransitionsWithoutExecution(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	artifact := []byte("lifecycle-artifact")
+	m := plugin.Manifest{
+		ID: "ops.bundle", Name: "Ops", Type: "system", Version: "1.0.0", Publisher: "latticenet",
+		Capabilities: []string{"node:read"},
+	}
+	m.DigestSHA256 = plugin.DigestSHA256(artifact)
+	m.SignatureEd25519 = base64.RawStdEncoding.EncodeToString(ed25519.Sign(priv, plugin.SigningPayload(m)))
+	writeServerBundle(t, dir, "ops", m, artifact)
+
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{
+		Store:         st,
+		AdminPassword: testAdminPass,
+		PluginDir:     dir,
+		PluginTrust:   plugin.TrustPolicy{TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": pub}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+
+	list := doJSON(t, handler, http.MethodGet, "/api/plugins/lifecycle", "", cookies, "")
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("lifecycle list failed: %d", list.StatusCode)
+	}
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(list.Body)
+	if bytes.Contains(buf.Bytes(), []byte("bundle_path")) || bytes.Contains(buf.Bytes(), []byte("/private/plugins")) {
+		t.Fatalf("lifecycle API leaked local bundle path: %s", buf.String())
+	}
+	if bytes.Contains(buf.Bytes(), []byte(dir)) {
+		t.Fatalf("lifecycle API leaked plugin directory: %s", buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte(`"status":"verified"`)) {
+		t.Fatalf("expected verified status in lifecycle list: %s", buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte(`"available":true`)) {
+		t.Fatalf("expected loaded plugin to be marked available: %s", buf.String())
+	}
+
+	bad := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle", `{"id":"ops.bundle","status":"active"}`, cookies, csrf)
+	bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("verified->active must be rejected, got %d", bad.StatusCode)
+	}
+	for _, status := range []string{model.PluginStatusInstalled, model.PluginStatusActive, model.PluginStatusDisabled} {
+		res := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle", `{"id":"ops.bundle","status":"`+status+`"}`, cookies, csrf)
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("transition to %s failed: %d", status, res.StatusCode)
+		}
+	}
+	got, _ := st.PluginInstallation("ops.bundle")
+	if got.Status != model.PluginStatusDisabled {
+		t.Fatalf("expected disabled lifecycle state, got %+v", got)
+	}
+	audit := auditByActionAndScope(t, st, "plugin.status", "plugin:admin")
+	if audit.Metadata["plugin_id"] != "ops.bundle" || audit.Metadata["status"] == "" {
+		t.Fatalf("unexpected plugin.status audit: %+v", audit)
+	}
+}
+
+func TestPluginLifecycleCannotActivateUnavailableBundle(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID:         "missing.bundle",
+		Name:       "Missing",
+		Type:       "system",
+		BundlePath: "/private/plugins/missing",
+		Status:     model.PluginStatusVerified,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle", `{"id":"missing.bundle","status":"installed"}`, cookies, csrf)
+	res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing bundle must not install, got %d", res.StatusCode)
+	}
+	list := doJSON(t, handler, http.MethodGet, "/api/plugins/lifecycle", "", cookies, "")
+	defer list.Body.Close()
+	body := new(bytes.Buffer)
+	body.ReadFrom(list.Body)
+	if !bytes.Contains(body.Bytes(), []byte(`"available":false`)) {
+		t.Fatalf("missing bundle should be marked unavailable: %s", body.String())
+	}
+	got, _ := st.PluginInstallation("missing.bundle")
+	if got.Status != model.PluginStatusVerified {
+		t.Fatalf("failed install must not mutate lifecycle state: %+v", got)
 	}
 }

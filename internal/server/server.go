@@ -164,6 +164,15 @@ func (s *Server) loadPlugins(dir string, policy plugin.TrustPolicy) {
 		return
 	}
 	s.plugins = loaded
+	for _, pl := range loaded {
+		status := model.PluginStatusVerified
+		if existing, ok := s.store.PluginInstallation(pl.Manifest.ID); ok {
+			status = existing.Status
+		}
+		if err := s.store.UpsertPluginInstallation(pluginInstallationFromLoaded(pl, status)); err != nil {
+			s.logger.Printf("plugin lifecycle: failed to record %s: %v", pl.Manifest.ID, err)
+		}
+	}
 	for _, o := range outcomes {
 		if o.Loaded {
 			s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.loaded", Decision: "allow", Metadata: map[string]string{"plugin_id": o.PluginID, "bundle": filepath.Base(o.BundlePath)}})
@@ -173,6 +182,21 @@ func (s *Server) loadPlugins(dir string, policy plugin.TrustPolicy) {
 	}
 	if len(outcomes) > 0 {
 		s.logger.Printf("plugin loader: %d loaded, %d rejected (dir=%s)", len(loaded), len(outcomes)-len(loaded), dir)
+	}
+}
+
+func pluginInstallationFromLoaded(pl plugin.Loaded, status string) model.PluginInstallation {
+	return model.PluginInstallation{
+		ID:             pl.Manifest.ID,
+		Name:           pl.Manifest.Name,
+		Type:           pl.Manifest.Type,
+		Version:        pl.Manifest.Version,
+		Entrypoint:     pl.Manifest.Entrypoint,
+		Publisher:      pl.Manifest.Publisher,
+		Capabilities:   append([]string(nil), pl.Capabilities...),
+		ArtifactSHA256: pl.Manifest.DigestSHA256,
+		BundlePath:     pl.BundlePath,
+		Status:         status,
 	}
 }
 
@@ -197,6 +221,25 @@ type pluginVerifyResponse struct {
 	Capabilities []pluginCapabilityView `json:"capabilities"`
 }
 
+type pluginInstallationView struct {
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Type           string    `json:"type"`
+	Version        string    `json:"version,omitempty"`
+	Entrypoint     string    `json:"entrypoint,omitempty"`
+	Publisher      string    `json:"publisher,omitempty"`
+	Capabilities   []string  `json:"capabilities"`
+	ArtifactSHA256 string    `json:"artifact_sha256,omitempty"`
+	Available      bool      `json:"available"`
+	Status         string    `json:"status"`
+	VerifiedAt     time.Time `json:"verified_at,omitempty"`
+	InstalledAt    time.Time `json:"installed_at,omitempty"`
+	ActivatedAt    time.Time `json:"activated_at,omitempty"`
+	DisabledAt     time.Time `json:"disabled_at,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 // handlePlugins lists the verified, registered plugins (operator visibility into
 // the trust-sensitive registry). No signatures/digests are returned.
 func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, p principal) {
@@ -216,6 +259,79 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, p princip
 		})
 	}
 	writeJSON(w, http.StatusOK, views)
+}
+
+func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		installations := s.store.PluginInstallations()
+		views := make([]pluginInstallationView, 0, len(installations))
+		for _, inst := range installations {
+			views = append(views, s.pluginInstallationPublicView(inst))
+		}
+		writeJSON(w, http.StatusOK, views)
+	case http.MethodPost:
+		var req struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		}
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		req.ID = strings.TrimSpace(req.ID)
+		req.Status = strings.TrimSpace(req.Status)
+		if req.ID == "" || req.Status == "" {
+			writeError(w, http.StatusBadRequest, errors.New("id and status are required"))
+			return
+		}
+		if pluginStatusRequiresLoadedBundle(req.Status) && !s.pluginLoaded(req.ID) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("plugin bundle is not currently verified and loaded: %s", req.ID))
+			return
+		}
+		if err := s.store.SetPluginStatus(req.ID, req.Status); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		inst, _ := s.store.PluginInstallation(req.ID)
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.status", Scope: "plugin:admin", Metadata: map[string]string{"plugin_id": req.ID, "status": req.Status}})
+		writeJSON(w, http.StatusOK, s.pluginInstallationPublicView(inst))
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func pluginStatusRequiresLoadedBundle(status string) bool {
+	return status == model.PluginStatusInstalled || status == model.PluginStatusActive
+}
+
+func (s *Server) pluginLoaded(id string) bool {
+	for _, pl := range s.plugins {
+		if pl.Manifest.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) pluginInstallationPublicView(p model.PluginInstallation) pluginInstallationView {
+	return pluginInstallationView{
+		ID:             p.ID,
+		Name:           p.Name,
+		Type:           p.Type,
+		Version:        p.Version,
+		Entrypoint:     p.Entrypoint,
+		Publisher:      p.Publisher,
+		Capabilities:   append([]string(nil), p.Capabilities...),
+		ArtifactSHA256: p.ArtifactSHA256,
+		Available:      s.pluginLoaded(p.ID),
+		Status:         p.Status,
+		VerifiedAt:     p.VerifiedAt,
+		InstalledAt:    p.InstalledAt,
+		ActivatedAt:    p.ActivatedAt,
+		DisabledAt:     p.DisabledAt,
+		CreatedAt:      p.CreatedAt,
+		UpdatedAt:      p.UpdatedAt,
+	}
 }
 
 // handlePluginVerify validates a candidate manifest+artifact against the
@@ -315,6 +431,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/audit", s.withAuth("audit:read", s.handleAudit))
 	mux.HandleFunc("/api/audit/verify", s.withAuth("audit:read", s.handleAuditVerify))
 	mux.HandleFunc("/api/plugins", s.withAuth("audit:read", s.handlePlugins))
+	mux.HandleFunc("/api/plugins/lifecycle", s.withAuth("plugin:admin", s.handlePluginLifecycle))
 	mux.HandleFunc("/api/plugins/verify", s.withAuth("plugin:verify", s.handlePluginVerify))
 	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))

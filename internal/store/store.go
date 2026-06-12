@@ -27,26 +27,27 @@ const maxSessions = 4096
 const maxMonitorResults = 500
 
 type State struct {
-	Users          map[string]model.User            `json:"users"`
-	Tokens         map[string]model.Token           `json:"tokens"`
-	Nodes          map[string]model.Node            `json:"nodes"`
-	Tasks          map[string]model.Task            `json:"tasks"`
-	Results        []model.TaskResult               `json:"results"`
-	Audit          []model.AuditEvent               `json:"audit"`
-	KV             map[string]model.KVEntry         `json:"kv"`
-	Static         map[string]model.StaticObject    `json:"static"`
-	Workers        map[string]model.WorkerScript    `json:"workers"`
-	Approvals      map[string]model.Approval        `json:"approvals"`
-	Sessions       map[string]auth.Session          `json:"sessions"`
-	DDNS           map[string]model.DDNSProfile     `json:"ddns"`
-	Monitors       map[string]model.Monitor         `json:"monitors"`
-	MonResults     map[string][]model.MonitorResult `json:"monitor_results"`
-	NotifyChannels map[string]model.NotifyChannel   `json:"notify_channels"`
-	Tunnels        map[string]model.TunnelProfile   `json:"tunnels"`
-	TOTPChallenges map[string]auth.TOTPChallenge    `json:"totp_challenges"`
-	OIDCProviders  map[string]model.OIDCProvider    `json:"oidc_providers"`
-	OIDCIdentities map[string]model.OIDCIdentity    `json:"oidc_identities"`
-	OIDCAuthStates map[string]auth.OIDCAuthState    `json:"oidc_auth_states"`
+	Users          map[string]model.User               `json:"users"`
+	Tokens         map[string]model.Token              `json:"tokens"`
+	Nodes          map[string]model.Node               `json:"nodes"`
+	Tasks          map[string]model.Task               `json:"tasks"`
+	Results        []model.TaskResult                  `json:"results"`
+	Audit          []model.AuditEvent                  `json:"audit"`
+	KV             map[string]model.KVEntry            `json:"kv"`
+	Static         map[string]model.StaticObject       `json:"static"`
+	Workers        map[string]model.WorkerScript       `json:"workers"`
+	Plugins        map[string]model.PluginInstallation `json:"plugins"`
+	Approvals      map[string]model.Approval           `json:"approvals"`
+	Sessions       map[string]auth.Session             `json:"sessions"`
+	DDNS           map[string]model.DDNSProfile        `json:"ddns"`
+	Monitors       map[string]model.Monitor            `json:"monitors"`
+	MonResults     map[string][]model.MonitorResult    `json:"monitor_results"`
+	NotifyChannels map[string]model.NotifyChannel      `json:"notify_channels"`
+	Tunnels        map[string]model.TunnelProfile      `json:"tunnels"`
+	TOTPChallenges map[string]auth.TOTPChallenge       `json:"totp_challenges"`
+	OIDCProviders  map[string]model.OIDCProvider       `json:"oidc_providers"`
+	OIDCIdentities map[string]model.OIDCIdentity       `json:"oidc_identities"`
+	OIDCAuthStates map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
 }
 
 type Store struct {
@@ -123,6 +124,7 @@ func emptyState() State {
 		KV:             map[string]model.KVEntry{},
 		Static:         map[string]model.StaticObject{},
 		Workers:        map[string]model.WorkerScript{},
+		Plugins:        map[string]model.PluginInstallation{},
 		Approvals:      map[string]model.Approval{},
 		Sessions:       map[string]auth.Session{},
 		DDNS:           map[string]model.DDNSProfile{},
@@ -158,6 +160,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.Workers == nil {
 		s.state.Workers = map[string]model.WorkerScript{}
+	}
+	if s.state.Plugins == nil {
+		s.state.Plugins = map[string]model.PluginInstallation{}
 	}
 	if s.state.Approvals == nil {
 		s.state.Approvals = map[string]model.Approval{}
@@ -559,6 +564,156 @@ func (s *Store) Workers() []model.WorkerScript {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+func (s *Store) UpsertPluginInstallation(p model.PluginInstallation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if p.ID == "" {
+		return errors.New("plugin id is required")
+	}
+	if p.Status == "" {
+		p.Status = model.PluginStatusVerified
+	}
+	if !validPluginStatus(p.Status) {
+		return fmt.Errorf("invalid plugin status %q", p.Status)
+	}
+	now := time.Now().UTC()
+	existing, hadExisting := s.state.Plugins[p.ID]
+	if hadExisting && !validPluginTransition(existing.Status, p.Status) && existing.Status != p.Status {
+		return fmt.Errorf("invalid plugin status transition %s -> %s", existing.Status, p.Status)
+	}
+	if hadExisting {
+		if p.CreatedAt.IsZero() {
+			p.CreatedAt = existing.CreatedAt
+		}
+		if p.VerifiedAt.IsZero() {
+			p.VerifiedAt = existing.VerifiedAt
+		}
+		if p.InstalledAt.IsZero() {
+			p.InstalledAt = existing.InstalledAt
+		}
+		if p.ActivatedAt.IsZero() {
+			p.ActivatedAt = existing.ActivatedAt
+		}
+		if p.DisabledAt.IsZero() {
+			p.DisabledAt = existing.DisabledAt
+		}
+	}
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+	p = stampPluginStatusTime(p, now)
+	p.Capabilities = append([]string(nil), p.Capabilities...)
+	s.state.Plugins[p.ID] = p
+	return s.Save()
+}
+
+func (s *Store) PluginInstallation(id string) (model.PluginInstallation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.state.Plugins[id]
+	return clonePluginInstallation(p), ok
+}
+
+func (s *Store) PluginInstallations() []model.PluginInstallation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.PluginInstallation, 0, len(s.state.Plugins))
+	for _, p := range s.state.Plugins {
+		out = append(out, clonePluginInstallation(p))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (s *Store) SetPluginStatus(id, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !validPluginStatus(status) {
+		return fmt.Errorf("invalid plugin status %q", status)
+	}
+	p, ok := s.state.Plugins[id]
+	if !ok {
+		return fmt.Errorf("plugin installation not found: %s", id)
+	}
+	if p.Status == status {
+		return nil
+	}
+	if !validPluginTransition(p.Status, status) {
+		return fmt.Errorf("invalid plugin status transition %s -> %s", p.Status, status)
+	}
+	now := time.Now().UTC()
+	p.Status = status
+	p.UpdatedAt = now
+	p = stampPluginStatusTime(p, now)
+	s.state.Plugins[id] = p
+	return s.Save()
+}
+
+func validPluginStatus(status string) bool {
+	switch status {
+	case model.PluginStatusVerified, model.PluginStatusInstalled, model.PluginStatusActive, model.PluginStatusDisabled:
+		return true
+	default:
+		return false
+	}
+}
+
+func validPluginTransition(from, to string) bool {
+	switch from {
+	case "":
+		return to == model.PluginStatusVerified
+	case model.PluginStatusVerified:
+		return to == model.PluginStatusInstalled
+	case model.PluginStatusInstalled:
+		return to == model.PluginStatusActive || to == model.PluginStatusDisabled
+	case model.PluginStatusActive:
+		return to == model.PluginStatusDisabled
+	case model.PluginStatusDisabled:
+		return to == model.PluginStatusActive
+	default:
+		return false
+	}
+}
+
+func stampPluginStatusTime(p model.PluginInstallation, now time.Time) model.PluginInstallation {
+	switch p.Status {
+	case model.PluginStatusVerified:
+		if p.VerifiedAt.IsZero() {
+			p.VerifiedAt = now
+		}
+	case model.PluginStatusInstalled:
+		if p.VerifiedAt.IsZero() {
+			p.VerifiedAt = now
+		}
+		if p.InstalledAt.IsZero() {
+			p.InstalledAt = now
+		}
+	case model.PluginStatusActive:
+		if p.VerifiedAt.IsZero() {
+			p.VerifiedAt = now
+		}
+		if p.InstalledAt.IsZero() {
+			p.InstalledAt = now
+		}
+		p.ActivatedAt = now
+	case model.PluginStatusDisabled:
+		if p.VerifiedAt.IsZero() {
+			p.VerifiedAt = now
+		}
+		if p.InstalledAt.IsZero() {
+			p.InstalledAt = now
+		}
+		p.DisabledAt = now
+	}
+	return p
+}
+
+func clonePluginInstallation(p model.PluginInstallation) model.PluginInstallation {
+	p.Capabilities = append([]string(nil), p.Capabilities...)
+	return p
 }
 
 func (s *Store) UpsertApproval(a model.Approval) error {

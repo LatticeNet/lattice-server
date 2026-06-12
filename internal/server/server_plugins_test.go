@@ -170,9 +170,30 @@ func TestPluginLifecycleAPIListsAndTransitionsWithoutExecution(t *testing.T) {
 	}
 	for _, status := range []string{model.PluginStatusInstalled, model.PluginStatusActive, model.PluginStatusDisabled} {
 		res := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle", `{"id":"ops.bundle","status":"`+status+`"}`, cookies, csrf)
+		var out struct {
+			Status  string `json:"status"`
+			Runtime struct {
+				PluginID string `json:"plugin_id"`
+				State    string `json:"state"`
+				Message  string `json:"message"`
+			} `json:"runtime"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
 		res.Body.Close()
 		if res.StatusCode != http.StatusOK {
 			t.Fatalf("transition to %s failed: %d", status, res.StatusCode)
+		}
+		if status == model.PluginStatusActive {
+			if out.Runtime.PluginID != "ops.bundle" || out.Runtime.State != plugin.RuntimeStateArmed || out.Runtime.Message == "" {
+				t.Fatalf("active plugin should arm runtime broker, got %+v", out)
+			}
+		}
+		if status == model.PluginStatusDisabled {
+			if out.Runtime.PluginID != "ops.bundle" || out.Runtime.State != plugin.RuntimeStateStopped {
+				t.Fatalf("disabled plugin should stop runtime broker, got %+v", out)
+			}
 		}
 	}
 	got, _ := st.PluginInstallation("ops.bundle")
@@ -182,6 +203,23 @@ func TestPluginLifecycleAPIListsAndTransitionsWithoutExecution(t *testing.T) {
 	audit := auditByActionAndScope(t, st, "plugin.status", "plugin:admin")
 	if audit.Metadata["plugin_id"] != "ops.bundle" || audit.Metadata["status"] == "" {
 		t.Fatalf("unexpected plugin.status audit: %+v", audit)
+	}
+	var runtimeAudits int
+	var sawArmed, sawStopped bool
+	for _, ev := range st.AuditEvents() {
+		if ev.Action != "plugin.runtime" || ev.Scope != "plugin:admin" || ev.Metadata["plugin_id"] != "ops.bundle" {
+			continue
+		}
+		runtimeAudits++
+		if ev.Metadata["state"] == plugin.RuntimeStateArmed && ev.Decision == "allow" {
+			sawArmed = true
+		}
+		if ev.Metadata["state"] == plugin.RuntimeStateStopped && ev.Decision == "allow" {
+			sawStopped = true
+		}
+	}
+	if runtimeAudits < 2 || !sawArmed || !sawStopped {
+		t.Fatalf("expected plugin.runtime audit events for armed and stopped states, got %+v", st.AuditEvents())
 	}
 }
 
@@ -221,5 +259,70 @@ func TestPluginLifecycleCannotActivateUnavailableBundle(t *testing.T) {
 	got, _ := st.PluginInstallation("missing.bundle")
 	if got.Status != model.PluginStatusVerified {
 		t.Fatalf("failed install must not mutate lifecycle state: %+v", got)
+	}
+}
+
+func TestPluginRuntimeArmsExistingActivePluginOnStartup(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	artifact := []byte("startup-runtime-artifact")
+	m := plugin.Manifest{
+		ID: "startup.bundle", Name: "Startup", Type: "system", Version: "1.0.0", Publisher: "latticenet",
+		Capabilities: []string{"node:read"},
+	}
+	m.DigestSHA256 = plugin.DigestSHA256(artifact)
+	m.SignatureEd25519 = base64.RawStdEncoding.EncodeToString(ed25519.Sign(priv, plugin.SigningPayload(m)))
+	writeServerBundle(t, dir, "startup", m, artifact)
+
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID:           "startup.bundle",
+		Name:         "Startup",
+		Type:         "system",
+		Capabilities: []string{"node:read"},
+		Status:       model.PluginStatusVerified,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetPluginStatus("startup.bundle", model.PluginStatusInstalled); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetPluginStatus("startup.bundle", model.PluginStatusActive); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(Options{
+		Store:         st,
+		AdminPassword: testAdminPass,
+		PluginDir:     dir,
+		PluginTrust:   plugin.TrustPolicy{TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": pub}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, _ := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodGet, "/api/plugins/lifecycle", "", cookies, "")
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("lifecycle list failed: %d", res.StatusCode)
+	}
+	var out []struct {
+		ID      string `json:"id"`
+		Runtime struct {
+			State string `json:"state"`
+		} `json:"runtime"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 || out[0].ID != "startup.bundle" || out[0].Runtime.State != plugin.RuntimeStateArmed {
+		t.Fatalf("expected active plugin to be armed on startup, got %+v", out)
 	}
 }

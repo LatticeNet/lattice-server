@@ -78,6 +78,8 @@ type Server struct {
 	emitNotify func(title, body string)
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
+	// pluginRuntime tracks the in-memory runtime health for active plugins.
+	pluginRuntime *plugin.RuntimeManager
 	// pluginTrust is the operator policy used by both startup loading and
 	// pre-install verification endpoints. It is intentionally not client supplied.
 	pluginTrust plugin.TrustPolicy
@@ -146,6 +148,7 @@ func New(opts Options) (*Server, error) {
 		pluginTrust: opts.PluginTrust,
 	}
 	s.emitNotify = s.notifyEvent
+	s.pluginRuntime = plugin.NewRuntimeManager(s.pluginHostServices())
 	if err := s.ensureAdmin(opts.AdminPassword); err != nil {
 		return nil, err
 	}
@@ -171,6 +174,15 @@ func (s *Server) loadPlugins(dir string, policy plugin.TrustPolicy) {
 		}
 		if err := s.store.UpsertPluginInstallation(pluginInstallationFromLoaded(pl, status)); err != nil {
 			s.logger.Printf("plugin lifecycle: failed to record %s: %v", pl.Manifest.ID, err)
+		}
+		if status == model.PluginStatusActive {
+			rt, err := s.pluginRuntime.Start(context.Background(), pl)
+			if err != nil {
+				s.logger.Printf("plugin runtime: failed to arm %s: %v", pl.Manifest.ID, err)
+				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
+			} else {
+				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "allow", Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": rt.State, "reason": "startup"}})
+			}
 		}
 	}
 	for _, o := range outcomes {
@@ -222,22 +234,23 @@ type pluginVerifyResponse struct {
 }
 
 type pluginInstallationView struct {
-	ID             string    `json:"id"`
-	Name           string    `json:"name"`
-	Type           string    `json:"type"`
-	Version        string    `json:"version,omitempty"`
-	Entrypoint     string    `json:"entrypoint,omitempty"`
-	Publisher      string    `json:"publisher,omitempty"`
-	Capabilities   []string  `json:"capabilities"`
-	ArtifactSHA256 string    `json:"artifact_sha256,omitempty"`
-	Available      bool      `json:"available"`
-	Status         string    `json:"status"`
-	VerifiedAt     time.Time `json:"verified_at,omitempty"`
-	InstalledAt    time.Time `json:"installed_at,omitempty"`
-	ActivatedAt    time.Time `json:"activated_at,omitempty"`
-	DisabledAt     time.Time `json:"disabled_at,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             string                `json:"id"`
+	Name           string                `json:"name"`
+	Type           string                `json:"type"`
+	Version        string                `json:"version,omitempty"`
+	Entrypoint     string                `json:"entrypoint,omitempty"`
+	Publisher      string                `json:"publisher,omitempty"`
+	Capabilities   []string              `json:"capabilities"`
+	ArtifactSHA256 string                `json:"artifact_sha256,omitempty"`
+	Available      bool                  `json:"available"`
+	Status         string                `json:"status"`
+	Runtime        *plugin.RuntimeStatus `json:"runtime,omitempty"`
+	VerifiedAt     time.Time             `json:"verified_at,omitempty"`
+	InstalledAt    time.Time             `json:"installed_at,omitempty"`
+	ActivatedAt    time.Time             `json:"activated_at,omitempty"`
+	DisabledAt     time.Time             `json:"disabled_at,omitempty"`
+	CreatedAt      time.Time             `json:"created_at"`
+	UpdatedAt      time.Time             `json:"updated_at"`
 }
 
 // handlePlugins lists the verified, registered plugins (operator visibility into
@@ -292,6 +305,26 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if req.Status == model.PluginStatusActive {
+			loaded, _ := s.loadedPlugin(req.ID)
+			rt, err := s.pluginRuntime.Start(r.Context(), loaded)
+			if err != nil {
+				_, _ = s.pluginRuntime.Stop(req.ID, "activation failed")
+				_ = s.store.SetPluginStatus(req.ID, model.PluginStatusDisabled)
+				s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": req.ID, "state": plugin.RuntimeStateFailed}})
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "allow", Metadata: map[string]string{"plugin_id": req.ID, "state": rt.State}})
+		}
+		if req.Status == model.PluginStatusDisabled {
+			rt, err := s.pluginRuntime.Stop(req.ID, "operator disabled plugin")
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "allow", Metadata: map[string]string{"plugin_id": req.ID, "state": rt.State}})
+		}
 		inst, _ := s.store.PluginInstallation(req.ID)
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.status", Scope: "plugin:admin", Metadata: map[string]string{"plugin_id": req.ID, "status": req.Status}})
 		writeJSON(w, http.StatusOK, s.pluginInstallationPublicView(inst))
@@ -305,15 +338,26 @@ func pluginStatusRequiresLoadedBundle(status string) bool {
 }
 
 func (s *Server) pluginLoaded(id string) bool {
+	_, ok := s.loadedPlugin(id)
+	return ok
+}
+
+func (s *Server) loadedPlugin(id string) (plugin.Loaded, bool) {
 	for _, pl := range s.plugins {
 		if pl.Manifest.ID == id {
-			return true
+			return pl, true
 		}
 	}
-	return false
+	return plugin.Loaded{}, false
 }
 
 func (s *Server) pluginInstallationPublicView(p model.PluginInstallation) pluginInstallationView {
+	var runtimeStatus *plugin.RuntimeStatus
+	if s.pluginRuntime != nil {
+		if rt, ok := s.pluginRuntime.Status(p.ID); ok {
+			runtimeStatus = &rt
+		}
+	}
 	return pluginInstallationView{
 		ID:             p.ID,
 		Name:           p.Name,
@@ -325,6 +369,7 @@ func (s *Server) pluginInstallationPublicView(p model.PluginInstallation) plugin
 		ArtifactSHA256: p.ArtifactSHA256,
 		Available:      s.pluginLoaded(p.ID),
 		Status:         p.Status,
+		Runtime:        runtimeStatus,
 		VerifiedAt:     p.VerifiedAt,
 		InstalledAt:    p.InstalledAt,
 		ActivatedAt:    p.ActivatedAt,

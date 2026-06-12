@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -77,6 +78,9 @@ type Server struct {
 	emitNotify func(title, body string)
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
+	// pluginTrust is the operator policy used by both startup loading and
+	// pre-install verification endpoints. It is intentionally not client supplied.
+	pluginTrust plugin.TrustPolicy
 	// oidc performs SSO flows (discovery cache + auth-code/PKCE + ID-token verify).
 	oidc *oidc.Manager
 	// publicURL is the external base URL used to build the OIDC redirect URI.
@@ -137,8 +141,9 @@ func New(opts Options) (*Server, error) {
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
-		oidc:      oidc.NewManager(),
-		publicURL: strings.TrimRight(opts.PublicURL, "/"),
+		oidc:        oidc.NewManager(),
+		publicURL:   strings.TrimRight(opts.PublicURL, "/"),
+		pluginTrust: opts.PluginTrust,
 	}
 	s.emitNotify = s.notifyEvent
 	if err := s.ensureAdmin(opts.AdminPassword); err != nil {
@@ -180,6 +185,18 @@ type pluginView struct {
 	Capabilities []string `json:"capabilities"`
 }
 
+type pluginCapabilityView struct {
+	Name string `json:"name"`
+	Risk string `json:"risk"`
+}
+
+type pluginVerifyResponse struct {
+	Trusted      bool                   `json:"trusted"`
+	Manifest     plugin.Manifest        `json:"manifest"`
+	ArtifactHash string                 `json:"artifact_sha256"`
+	Capabilities []pluginCapabilityView `json:"capabilities"`
+}
+
 // handlePlugins lists the verified, registered plugins (operator visibility into
 // the trust-sensitive registry). No signatures/digests are returned.
 func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, p principal) {
@@ -199,6 +216,80 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, p princip
 		})
 	}
 	writeJSON(w, http.StatusOK, views)
+}
+
+// handlePluginVerify validates a candidate manifest+artifact against the
+// operator trust policy without installing, registering, or executing anything.
+// It is the safe preflight entrypoint for dashboards and future plugin stores.
+func (s *Server) handlePluginVerify(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		Manifest       json.RawMessage `json:"manifest"`
+		ArtifactBase64 string          `json:"artifact_base64"`
+	}
+	if !decodeLimitedJSON(w, r, &req, 4<<20) {
+		return
+	}
+	if len(req.Manifest) == 0 {
+		err := errors.New("manifest is required")
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.verify", Scope: "plugin:verify", Decision: "deny", Reason: err.Error()})
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	artifact, err := decodePluginArtifact(req.ArtifactBase64)
+	if err != nil {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.verify", Scope: "plugin:verify", Decision: "deny", Reason: err.Error()})
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	manifest, err := plugin.VerifyInstallManifest(req.Manifest, artifact, s.pluginTrust)
+	if err != nil {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.verify", Scope: "plugin:verify", Decision: "deny", Reason: err.Error()})
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	resp := pluginVerifyResponse{
+		Trusted:      true,
+		Manifest:     pluginManifestPublicView(manifest),
+		ArtifactHash: plugin.DigestSHA256(artifact),
+		Capabilities: pluginCapabilitySummary(manifest),
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.verify", Scope: "plugin:verify", Decision: "allow", Metadata: map[string]string{"plugin_id": manifest.ID, "digest_sha256": resp.ArtifactHash}})
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func pluginManifestPublicView(m plugin.Manifest) plugin.Manifest {
+	m.SignatureEd25519 = ""
+	return m
+}
+
+func pluginCapabilitySummary(m plugin.Manifest) []pluginCapabilityView {
+	caps := append([]string(nil), m.Capabilities...)
+	sort.Strings(caps)
+	out := make([]pluginCapabilityView, 0, len(caps))
+	for _, cap := range caps {
+		risk, _ := plugin.CapabilityRisk(cap)
+		out = append(out, pluginCapabilityView{Name: cap, Risk: risk})
+	}
+	return out
+}
+
+func decodePluginArtifact(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, errors.New("artifact_base64 is required")
+	}
+	if out, err := base64.RawStdEncoding.DecodeString(value); err == nil {
+		return out, nil
+	}
+	out, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid artifact_base64: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -224,6 +315,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/audit", s.withAuth("audit:read", s.handleAudit))
 	mux.HandleFunc("/api/audit/verify", s.withAuth("audit:read", s.handleAuditVerify))
 	mux.HandleFunc("/api/plugins", s.withAuth("audit:read", s.handlePlugins))
+	mux.HandleFunc("/api/plugins/verify", s.withAuth("plugin:verify", s.handlePluginVerify))
 	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
 	mux.HandleFunc("/api/workers", s.withAuth("worker:deploy", s.handleWorkers))
@@ -2915,6 +3007,26 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 		return false
 	}
 	return true
+}
+
+func decodeLimitedJSON(w http.ResponseWriter, r *http.Request, dest any, limit int64) bool {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dest); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return false
+	}
+	var extra any
+	if err := dec.Decode(&extra); err == io.EOF {
+		return true
+	} else if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return false
+	}
+	writeError(w, http.StatusBadRequest, errors.New("unexpected trailing json value"))
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

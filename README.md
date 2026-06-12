@@ -93,6 +93,12 @@ the version in `go.mod`; during local multi-repo development, use the
   Plugin installation/loading code should use the strict verifier path:
   decode manifest JSON with unknown fields rejected, verify artifact digest, then
   verify publisher signature when host-risk capabilities are present.
+  Operators and dashboards can preflight a candidate plugin without installing
+  it through `POST /api/plugins/verify` with scope `plugin:verify`. The endpoint
+  accepts a manifest object and `artifact_base64`, applies the server-side trust
+  policy, returns the manifest with `signature_ed25519` stripped plus capability
+  risk labels, and never writes the artifact to disk or registers it in
+  `/api/plugins`.
 
 Example plugin trust policy JSON:
 
@@ -108,3 +114,48 @@ Example plugin trust policy JSON:
 > Fail-closed by default: omitting `allow_unsigned_host_risk` (or setting it
 > `false`) requires a trusted-publisher Ed25519 signature for **every** host-risk
 > plugin. Set it `true` only for local development on a host you fully control.
+
+Example plugin preflight request:
+
+```http
+POST /api/plugins/verify
+Authorization: Bearer <token with plugin:verify>
+Content-Type: application/json
+
+{
+  "manifest": {
+    "id": "latticenet.nft",
+    "name": "nft Guard",
+    "type": "system",
+    "version": "0.1.0",
+    "entrypoint": "system-go/latticenet-nft",
+    "capabilities": ["network:plan"],
+    "publisher": "latticenet",
+    "digest_sha256": "hex-sha256-of-artifact",
+    "signature_ed25519": "base64-raw-ed25519-signature"
+  },
+  "artifact_base64": "base64-raw-artifact-bytes"
+}
+```
+
+Successful response:
+
+```json
+{
+  "trusted": true,
+  "artifact_sha256": "hex-sha256-of-artifact",
+  "manifest": {
+    "id": "latticenet.nft",
+    "name": "nft Guard",
+    "type": "system",
+    "version": "0.1.0",
+    "entrypoint": "system-go/latticenet-nft",
+    "capabilities": ["network:plan"],
+    "publisher": "latticenet",
+    "digest_sha256": "hex-sha256-of-artifact"
+  },
+  "capabilities": [
+    {"name": "network:plan", "risk": "host"}
+  ]
+}
+```

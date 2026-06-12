@@ -22,6 +22,7 @@ import (
 //   - model.DDNSProfile.CFAPIToken     Cloudflare API token
 //   - model.DDNSProfile.WebhookHeaders may carry Authorization headers
 //   - model.NotifyChannel.Config[*]    bot tokens, SMTP passwords, webhook secrets
+//   - model.OIDCProvider.ClientSecret  OAuth2 client secret for SSO
 //
 // When adding a new persisted credential, encrypt it here AND extend
 // stateHasEnvelope so the lost-key guard stays accurate.
@@ -80,6 +81,17 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.NotifyChannels = notify
 
+	providers := make(map[string]model.OIDCProvider, len(st.OIDCProviders))
+	for id, p := range st.OIDCProviders {
+		sec, err := c.Encrypt(p.ClientSecret)
+		if err != nil {
+			return State{}, fmt.Errorf("encrypt oidc provider %s client secret: %w", id, err)
+		}
+		p.ClientSecret = sec
+		providers[id] = p
+	}
+	out.OIDCProviders = providers
+
 	return out, nil
 }
 
@@ -132,6 +144,15 @@ func decryptState(st *State, c secret.Cipher) error {
 		}
 	}
 
+	for id, p := range st.OIDCProviders {
+		sec, err := c.Decrypt(p.ClientSecret)
+		if err != nil {
+			return fmt.Errorf("decrypt oidc provider %s client secret: %w", id, err)
+		}
+		p.ClientSecret = sec
+		st.OIDCProviders[id] = p
+	}
+
 	return nil
 }
 
@@ -154,6 +175,11 @@ func stateHasEnvelope(st *State) bool {
 			if secret.IsEnvelope(v) {
 				return true
 			}
+		}
+	}
+	for _, p := range st.OIDCProviders {
+		if secret.IsEnvelope(p.ClientSecret) {
+			return true
 		}
 	}
 	return false

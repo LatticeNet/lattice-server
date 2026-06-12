@@ -26,6 +26,7 @@ func main() {
 	var pluginDir string
 	var pluginTrust string
 	var masterKeyFile string
+	var publicURL string
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
 	flag.StringVar(&webRoot, "web", env("LATTICE_WEB_ROOT", "../lattice-dashboard"), "static dashboard root")
@@ -36,6 +37,7 @@ func main() {
 	flag.StringVar(&pluginDir, "plugin-dir", env("LATTICE_PLUGIN_DIR", ""), "directory of installed plugin bundles (empty disables plugins)")
 	flag.StringVar(&pluginTrust, "plugin-trust", env("LATTICE_PLUGIN_TRUST", ""), "path to the operator plugin trust policy JSON")
 	flag.StringVar(&masterKeyFile, "master-key-file", env("LATTICE_MASTER_KEY_FILE", ""), "path to the at-rest encryption master key file (auto-generated under the data dir if unset)")
+	flag.StringVar(&publicURL, "public-url", env("LATTICE_PUBLIC_URL", ""), "externally-reachable base URL (scheme+host), required for OIDC/SSO redirect")
 	flag.Parse()
 
 	trustPolicy, err := loadPluginTrust(pluginTrust)
@@ -75,6 +77,7 @@ func main() {
 		TrustProxy:    trustProxy,
 		PluginDir:     pluginDir,
 		PluginTrust:   trustPolicy,
+		PublicURL:     publicURL,
 		Logger:        log.Default(),
 	})
 	if err != nil {

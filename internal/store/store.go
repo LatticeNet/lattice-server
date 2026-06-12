@@ -44,6 +44,9 @@ type State struct {
 	NotifyChannels map[string]model.NotifyChannel   `json:"notify_channels"`
 	Tunnels        map[string]model.TunnelProfile   `json:"tunnels"`
 	TOTPChallenges map[string]auth.TOTPChallenge    `json:"totp_challenges"`
+	OIDCProviders  map[string]model.OIDCProvider    `json:"oidc_providers"`
+	OIDCIdentities map[string]model.OIDCIdentity    `json:"oidc_identities"`
+	OIDCAuthStates map[string]auth.OIDCAuthState    `json:"oidc_auth_states"`
 }
 
 type Store struct {
@@ -128,6 +131,9 @@ func emptyState() State {
 		NotifyChannels: map[string]model.NotifyChannel{},
 		Tunnels:        map[string]model.TunnelProfile{},
 		TOTPChallenges: map[string]auth.TOTPChallenge{},
+		OIDCProviders:  map[string]model.OIDCProvider{},
+		OIDCIdentities: map[string]model.OIDCIdentity{},
+		OIDCAuthStates: map[string]auth.OIDCAuthState{},
 	}
 }
 
@@ -177,6 +183,15 @@ func (s *Store) ensureMaps() {
 	if s.state.TOTPChallenges == nil {
 		s.state.TOTPChallenges = map[string]auth.TOTPChallenge{}
 	}
+	if s.state.OIDCProviders == nil {
+		s.state.OIDCProviders = map[string]model.OIDCProvider{}
+	}
+	if s.state.OIDCIdentities == nil {
+		s.state.OIDCIdentities = map[string]model.OIDCIdentity{}
+	}
+	if s.state.OIDCAuthStates == nil {
+		s.state.OIDCAuthStates = map[string]auth.OIDCAuthState{}
+	}
 }
 
 func (s *Store) Save() error {
@@ -212,11 +227,15 @@ func (s *Store) UpsertUser(u model.User) error {
 	return s.Save()
 }
 
+// UserByUsername looks up a user by username, case-insensitively. Usernames are
+// effectively case-insensitive identifiers (and OIDC binds on a lowercased
+// email), so password login and SSO resolve the same account regardless of the
+// case used to provision it.
 func (s *Store) UserByUsername(username string) (model.User, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, u := range s.state.Users {
-		if u.Username == username {
+		if strings.EqualFold(u.Username, username) {
 			return u, true
 		}
 	}

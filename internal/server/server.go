@@ -28,6 +28,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/notify"
+	"github.com/LatticeNet/lattice-server/internal/oidc"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/ratelimit"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
@@ -53,7 +54,11 @@ type Options struct {
 	// time. The zero value is fail-closed: host-risk plugins require a trusted
 	// publisher signature.
 	PluginTrust plugin.TrustPolicy
-	Logger      *log.Logger
+	// PublicURL is the externally-reachable base URL of this server (scheme +
+	// host, no trailing slash), used to build the OIDC redirect URL. Required
+	// for SSO login; empty disables the OIDC start/callback flow.
+	PublicURL string
+	Logger    *log.Logger
 }
 
 type Server struct {
@@ -72,6 +77,10 @@ type Server struct {
 	emitNotify func(title, body string)
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
+	// oidc performs SSO flows (discovery cache + auth-code/PKCE + ID-token verify).
+	oidc *oidc.Manager
+	// publicURL is the external base URL used to build the OIDC redirect URI.
+	publicURL string
 }
 
 const (
@@ -128,6 +137,8 @@ func New(opts Options) (*Server, error) {
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
+		oidc:      oidc.NewManager(),
+		publicURL: strings.TrimRight(opts.PublicURL, "/"),
 	}
 	s.emitNotify = s.notifyEvent
 	if err := s.ensureAdmin(opts.AdminPassword); err != nil {
@@ -194,6 +205,11 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/login/totp", s.handleLoginTOTP)
+	mux.HandleFunc("/api/auth/oidc", s.handleOIDCList)
+	mux.HandleFunc("/api/auth/oidc/start", s.handleOIDCStart)
+	mux.HandleFunc("/api/auth/oidc/callback", s.handleOIDCCallback)
+	mux.HandleFunc("/api/auth/oidc/providers", s.withAuth("oidc:admin", s.handleOIDCProviders))
+	mux.HandleFunc("/api/auth/oidc/providers/delete", s.withAuth("oidc:admin", s.handleDeleteOIDCProvider))
 	mux.HandleFunc("/api/logout", s.withAuth("", s.handleLogout))
 	mux.HandleFunc("/api/me", s.withAuth("", s.handleMe))
 	mux.HandleFunc("/api/2fa/totp/enroll", s.withAuth("", s.handle2FAEnroll))
@@ -525,17 +541,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 const totpIssuer = "Lattice"
 
-// issueSession creates a session, sets the cookie, audits the login, and returns
-// the CSRF token. Shared by password login and post-2FA login.
-func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, user model.User) {
+// startSession creates a session, persists it, sets the session cookie, and
+// audits the login under the given action. Shared by password/2FA login (which
+// then returns JSON) and OIDC login (which then redirects).
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request, user model.User, action string) (auth.Session, error) {
 	session, err := auth.NewSession(user.ID, 12*time.Hour)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return auth.Session{}, err
 	}
 	if err := s.store.PutSession(session); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return auth.Session{}, err
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     "lattice_session",
@@ -546,7 +561,18 @@ func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, user model
 		Secure:   s.secureCookies,
 		Expires:  session.ExpiresAt,
 	})
-	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "allow"})
+	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: action, Decision: "allow"})
+	return session, nil
+}
+
+// issueSession completes an API login: starts a session and returns the CSRF
+// token. Shared by password login and post-2FA login.
+func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, user model.User) {
+	session, err := s.startSession(w, r, user, "login")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"csrf_token": session.CSRFToken, "actor_id": user.ID})
 }
 

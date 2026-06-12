@@ -106,6 +106,12 @@ the version in `go.mod`; during local multi-repo development, use the
   (`http:egress`), plugin logs (`log:write`), and host-call audit events. It is a
   contract and enforcement point only; plugin execution/installation lifecycle is
   intentionally separate.
+  The server-owned adapter (`plugin_host.go`) wires those facades to the real
+  store, notification dispatcher, guarded outbound HTTP client, logger, and audit
+  sink. Broker capability allow/deny decisions are written as `plugin.host.*`
+  audit events with the plugin id, capability, decision, and correlation id.
+  Plugin HTTP request and response bodies are capped at 256 KiB, and outbound
+  HTTP uses the same SSRF/egress guard as webhooks.
 
 Example plugin trust policy JSON:
 

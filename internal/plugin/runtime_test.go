@@ -3,8 +3,10 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRuntimeManagerArmsLoadedPluginWithoutExecutingArtifact(t *testing.T) {
@@ -26,6 +28,9 @@ func TestRuntimeManagerArmsLoadedPluginWithoutExecutingArtifact(t *testing.T) {
 	}
 	if rt.PluginID != "ops.bundle" || rt.State != RuntimeStateArmed || rt.StartedAt.IsZero() || rt.UpdatedAt.IsZero() {
 		t.Fatalf("unexpected runtime state: %+v", rt)
+	}
+	if rt.Runner != "noop" {
+		t.Fatalf("expected default noop runner, got %+v", rt)
 	}
 	encoded, err := json.Marshal(rt)
 	if err != nil {
@@ -55,6 +60,123 @@ func TestRuntimeManagerRejectsInvalidLoadedPlugin(t *testing.T) {
 	}
 	if m.IsArmed("bad.bundle") {
 		t.Fatal("invalid plugin must not be armed")
+	}
+}
+
+func TestRuntimeManagerUsesRegisteredRunnerWithBrokerAndTimeout(t *testing.T) {
+	runner := &recordingRunner{name: "system-safe"}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{
+		Services:     HostServices{},
+		StartTimeout: 50 * time.Millisecond,
+		Runners:      map[string]Runner{TypeSystem: runner},
+	})
+	loaded := Loaded{
+		Manifest: Manifest{
+			ID:           "ops.bundle",
+			Name:         "Ops",
+			Type:         TypeSystem,
+			Capabilities: []string{"log:write", "node:read"},
+		},
+		Capabilities: []string{"log:write", "node:read"},
+	}
+
+	rt, err := m.Start(context.Background(), loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt.Runner != "system-safe" || rt.Message != "system runner armed" {
+		t.Fatalf("unexpected runtime status: %+v", rt)
+	}
+	if runner.startCalls != 1 || runner.startReq.PluginID != "ops.bundle" {
+		t.Fatalf("runner did not receive start request: calls=%d req=%+v", runner.startCalls, runner.startReq)
+	}
+	if runner.startReq.Broker == nil || !runner.startReq.Broker.HasCapability("log:write") || runner.startReq.Broker.HasCapability("kv:write") {
+		t.Fatalf("runner did not receive a capability-scoped broker: %+v", runner.startReq.Broker)
+	}
+	if _, ok := runner.startDeadline.Deadline(); !ok {
+		t.Fatal("runner start context must carry a deadline")
+	}
+
+	if _, err := m.Stop("ops.bundle", "operator disabled"); err != nil {
+		t.Fatal(err)
+	}
+	if runner.stopCalls != 1 || runner.stopReq.PluginID != "ops.bundle" || runner.stopReq.Reason != "operator disabled" {
+		t.Fatalf("runner did not receive stop request: calls=%d req=%+v", runner.stopCalls, runner.stopReq)
+	}
+	if _, err := m.Stop("ops.bundle", "operator disabled again"); err != nil {
+		t.Fatal(err)
+	}
+	if runner.stopCalls != 1 {
+		t.Fatalf("stopped runtime should not retain the runner handle, calls=%d", runner.stopCalls)
+	}
+}
+
+func TestRuntimeManagerRecordsFailedHealthWhenRunnerStartFails(t *testing.T) {
+	runner := &recordingRunner{name: "broken", startErr: errors.New("runner refused")}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{
+		Runners: map[string]Runner{TypeSystem: runner},
+	})
+	loaded := Loaded{
+		Manifest: Manifest{
+			ID:           "broken.bundle",
+			Name:         "Broken",
+			Type:         TypeSystem,
+			Capabilities: []string{"node:read"},
+		},
+		Capabilities: []string{"node:read"},
+	}
+	rt, err := m.Start(context.Background(), loaded)
+	if err == nil {
+		t.Fatal("expected runner start failure")
+	}
+	if rt.State != RuntimeStateFailed || rt.Runner != "broken" || !strings.Contains(rt.Message, "runner refused") {
+		t.Fatalf("unexpected failed runtime status: %+v err=%v", rt, err)
+	}
+	got, ok := m.Status("broken.bundle")
+	if !ok || got.State != RuntimeStateFailed || m.IsArmed("broken.bundle") {
+		t.Fatalf("failed status should be retained but not armed: ok=%v status=%+v", ok, got)
+	}
+}
+
+func TestRuntimeManagerStopDoesNotClobberNewStart(t *testing.T) {
+	runner := &blockingStopRunner{
+		stopEntered: make(chan struct{}),
+		releaseStop: make(chan struct{}),
+	}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{
+		Runners: map[string]Runner{TypeSystem: runner},
+	})
+	loaded := Loaded{
+		Manifest: Manifest{
+			ID:           "ops.bundle",
+			Name:         "Ops",
+			Type:         TypeSystem,
+			Capabilities: []string{"node:read"},
+		},
+		Capabilities: []string{"node:read"},
+	}
+	if _, err := m.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+
+	stopDone := make(chan error, 1)
+	go func() {
+		_, err := m.Stop("ops.bundle", "old stop")
+		stopDone <- err
+	}()
+	<-runner.stopEntered
+
+	if _, err := m.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+	close(runner.releaseStop)
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok := m.Status("ops.bundle")
+	if !ok || got.State != RuntimeStateArmed {
+		t.Fatalf("stale stop must not clobber a newer start: ok=%v status=%+v", ok, got)
 	}
 }
 
@@ -90,5 +212,58 @@ func TestRuntimeManagerStopAndSnapshotAreSafe(t *testing.T) {
 	}
 	if m.IsArmed("log.bundle") {
 		t.Fatal("stopped plugin must not remain armed")
+	}
+}
+
+type recordingRunner struct {
+	name          string
+	startErr      error
+	startCalls    int
+	stopCalls     int
+	startReq      RunnerStartRequest
+	stopReq       RunnerStopRequest
+	startDeadline context.Context
+}
+
+func (r *recordingRunner) Name() string {
+	return r.name
+}
+
+func (r *recordingRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
+	r.startCalls++
+	r.startReq = req
+	r.startDeadline = ctx
+	if r.startErr != nil {
+		return RunnerStartResult{}, r.startErr
+	}
+	return RunnerStartResult{Message: "system runner armed"}, nil
+}
+
+func (r *recordingRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
+	r.stopCalls++
+	r.stopReq = req
+	return nil
+}
+
+type blockingStopRunner struct {
+	stopEntered chan struct{}
+	releaseStop chan struct{}
+}
+
+func (r *blockingStopRunner) Name() string {
+	return "blocking"
+}
+
+func (r *blockingStopRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
+	return RunnerStartResult{Message: "blocking runner armed"}, ctx.Err()
+}
+
+func (r *blockingStopRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
+	close(r.stopEntered)
+	select {
+	case <-r.releaseStop:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }

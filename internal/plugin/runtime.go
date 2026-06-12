@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -18,15 +19,48 @@ const (
 type RuntimeStatus struct {
 	PluginID  string    `json:"plugin_id"`
 	State     string    `json:"state"`
+	Runner    string    `json:"runner,omitempty"`
 	Message   string    `json:"message,omitempty"`
 	StartedAt time.Time `json:"started_at,omitempty"`
 	StoppedAt time.Time `json:"stopped_at,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type RunnerStartRequest struct {
+	PluginID string
+	Loaded   Loaded
+	Broker   *Broker
+}
+
+type RunnerStartResult struct {
+	Message string
+}
+
+type RunnerStopRequest struct {
+	PluginID string
+	Reason   string
+}
+
+// Runner is the narrow runtime contract concrete plugin runtimes must satisfy.
+// It receives a verified plugin and a capability-scoped broker, never raw server
+// handles. Implementations must honor ctx cancellation and deadlines.
+type Runner interface {
+	Name() string
+	Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error)
+	Stop(ctx context.Context, req RunnerStopRequest) error
+}
+
 type runtimeInstance struct {
-	status RuntimeStatus
-	broker *Broker
+	status     RuntimeStatus
+	broker     *Broker
+	runner     Runner
+	generation uint64
+}
+
+type RuntimeManagerOptions struct {
+	Services     HostServices
+	Runners      map[string]Runner
+	StartTimeout time.Duration
 }
 
 // RuntimeManager binds verified plugins to capability-scoped brokers and tracks
@@ -36,12 +70,33 @@ type runtimeInstance struct {
 type RuntimeManager struct {
 	mu        sync.Mutex
 	services  HostServices
+	runners   map[string]Runner
+	fallback  Runner
+	timeout   time.Duration
+	nextGen   uint64
 	instances map[string]runtimeInstance
 }
 
 func NewRuntimeManager(services HostServices) *RuntimeManager {
+	return NewRuntimeManagerWithOptions(RuntimeManagerOptions{Services: services})
+}
+
+func NewRuntimeManagerWithOptions(opts RuntimeManagerOptions) *RuntimeManager {
+	timeout := opts.StartTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	runners := map[string]Runner{}
+	for typ, runner := range opts.Runners {
+		if runner != nil {
+			runners[typ] = runner
+		}
+	}
 	return &RuntimeManager{
-		services:  services,
+		services:  opts.Services,
+		runners:   runners,
+		fallback:  noopRunner{},
+		timeout:   timeout,
 		instances: map[string]runtimeInstance{},
 	}
 }
@@ -60,17 +115,37 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 	if err != nil {
 		return RuntimeStatus{}, err
 	}
+	runner := m.runnerFor(loaded.Manifest.Type)
+	startCtx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+	result, err := runner.Start(startCtx, RunnerStartRequest{
+		PluginID: loaded.Manifest.ID,
+		Loaded:   loaded,
+		Broker:   broker,
+	})
 	now := time.Now().UTC()
 	status := RuntimeStatus{
 		PluginID:  loaded.Manifest.ID,
-		State:     RuntimeStateArmed,
-		Message:   "runtime broker armed; artifact execution is not enabled in this build",
+		Runner:    runner.Name(),
 		StartedAt: now,
 		UpdatedAt: now,
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.instances[loaded.Manifest.ID] = runtimeInstance{status: status, broker: broker}
+	m.nextGen++
+	generation := m.nextGen
+	if err != nil {
+		status.State = RuntimeStateFailed
+		status.Message = err.Error()
+		m.instances[loaded.Manifest.ID] = runtimeInstance{status: status, generation: generation}
+		return status, err
+	}
+	status.State = RuntimeStateArmed
+	status.Message = result.Message
+	if status.Message == "" {
+		status.Message = fmt.Sprintf("%s runner armed", runner.Name())
+	}
+	m.instances[loaded.Manifest.ID] = runtimeInstance{status: status, broker: broker, runner: runner, generation: generation}
 	return status, nil
 }
 
@@ -80,10 +155,43 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 	}
 	now := time.Now().UTC()
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	inst, ok := m.instances[pluginID]
+	runner := inst.runner
+	generation := inst.generation
+	m.mu.Unlock()
+
+	if ok && runner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
+		err := runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message})
+		cancel()
+		if err != nil {
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				inst, ok = m.instances[pluginID]
+				if ok && generation != 0 && inst.generation != generation {
+					return inst.status, nil
+				}
+				if !ok {
+					m.nextGen++
+					inst = runtimeInstance{generation: m.nextGen, status: RuntimeStatus{PluginID: pluginID, StartedAt: now}}
+				}
+				inst.status.PluginID = pluginID
+				inst.status.State = RuntimeStateFailed
+			inst.status.Message = err.Error()
+			inst.status.UpdatedAt = now
+			m.instances[pluginID] = inst
+			return inst.status, err
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	inst, ok = m.instances[pluginID]
+	if ok && generation != 0 && inst.generation != generation {
+		return inst.status, nil
+	}
 	if !ok {
-		inst.status = RuntimeStatus{PluginID: pluginID, StartedAt: now}
+		m.nextGen++
+		inst = runtimeInstance{generation: m.nextGen, status: RuntimeStatus{PluginID: pluginID, StartedAt: now}}
 	}
 	inst.status.PluginID = pluginID
 	inst.status.State = RuntimeStateStopped
@@ -91,6 +199,7 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 	inst.status.StoppedAt = now
 	inst.status.UpdatedAt = now
 	inst.broker = nil
+	inst.runner = nil
 	m.instances[pluginID] = inst
 	return inst.status, nil
 }
@@ -115,4 +224,28 @@ func (m *RuntimeManager) Snapshot() map[string]RuntimeStatus {
 func (m *RuntimeManager) IsArmed(pluginID string) bool {
 	status, ok := m.Status(pluginID)
 	return ok && status.State == RuntimeStateArmed
+}
+
+func (m *RuntimeManager) runnerFor(pluginType string) Runner {
+	if runner, ok := m.runners[pluginType]; ok && runner != nil {
+		return runner
+	}
+	return m.fallback
+}
+
+type noopRunner struct{}
+
+func (noopRunner) Name() string {
+	return "noop"
+}
+
+func (noopRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
+	if err := ctx.Err(); err != nil {
+		return RunnerStartResult{}, err
+	}
+	return RunnerStartResult{Message: "runtime broker armed; artifact execution is not enabled in this build"}, nil
+}
+
+func (noopRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
+	return ctx.Err()
 }

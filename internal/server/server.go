@@ -54,6 +54,7 @@ type Server struct {
 	trustProxy    bool
 	logger        *log.Logger
 	loginLimiter  *ratelimit.Limiter
+	totpLimiter   *ratelimit.Limiter
 	agentLimiter  *ratelimit.Limiter
 	apiLimiter    *ratelimit.Limiter
 	// ddnsProvider builds a DNS provider from a profile; overridable in tests.
@@ -69,6 +70,8 @@ const (
 	maxTaskOutputLimit     = 256 * 1024
 	maxTaskScriptBytes     = 64 * 1024
 	requestIDHeader        = "X-Lattice-Request-ID"
+	// maxTOTPChallengeAttempts burns a 2FA challenge after this many failed codes.
+	maxTOTPChallengeAttempts = 5
 )
 
 var allowedTaskInterpreters = map[string]bool{
@@ -104,6 +107,9 @@ func New(opts Options) (*Server, error) {
 		// Login is intentionally strict: 5/min sustained, small burst, to slow
 		// password guessing without locking out legitimate retries.
 		loginLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
+		// Second-factor guesses are throttled PER USER (keyed on user id, not IP)
+		// so the guess budget cannot be widened by rotating source addresses.
+		totpLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 3600.0, Burst: 5}),
 		// Agents poll on an interval; allow generous but bounded throughput.
 		agentLimiter: ratelimit.New(ratelimit.Config{Rate: 10, Burst: 40}),
 		// General authenticated API surface.
@@ -122,8 +128,12 @@ func New(opts Options) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/login/totp", s.handleLoginTOTP)
 	mux.HandleFunc("/api/logout", s.withAuth("", s.handleLogout))
 	mux.HandleFunc("/api/me", s.withAuth("", s.handleMe))
+	mux.HandleFunc("/api/2fa/totp/enroll", s.withAuth("", s.handle2FAEnroll))
+	mux.HandleFunc("/api/2fa/totp/activate", s.withAuth("", s.handle2FAActivate))
+	mux.HandleFunc("/api/2fa/totp/disable", s.withAuth("", s.handle2FADisable))
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
@@ -437,6 +447,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid credentials"))
 		return
 	}
+	if user.TOTPEnabled {
+		s.issueTOTPChallenge(w, r, user)
+		return
+	}
+	s.issueSession(w, r, user)
+}
+
+const totpIssuer = "Lattice"
+
+// issueSession creates a session, sets the cookie, audits the login, and returns
+// the CSRF token. Shared by password login and post-2FA login.
+func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, user model.User) {
 	session, err := auth.NewSession(user.ID, 12*time.Hour)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -457,6 +479,233 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "allow"})
 	writeJSON(w, http.StatusOK, map[string]string{"csrf_token": session.CSRFToken, "actor_id": user.ID})
+}
+
+// issueTOTPChallenge gates a 2FA-enabled user: it stores a short-lived, IP-bound,
+// single-use challenge and asks the client to complete the second factor instead
+// of issuing a session.
+func (s *Server) issueTOTPChallenge(w http.ResponseWriter, r *http.Request, user model.User) {
+	challenge, err := auth.NewTOTPChallenge(user.ID, s.clientIP(r), 5*time.Minute)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.store.PutTOTPChallenge(challenge); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.totp_required", Decision: "observe"})
+	writeJSON(w, http.StatusOK, map[string]any{"totp_required": true, "challenge_id": challenge.ID})
+}
+
+// handleLoginTOTP completes a login for a 2FA user by validating a TOTP code or a
+// single-use recovery code against the pending challenge, then issuing a session.
+func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if !s.loginLimiter.Allow(s.clientIP(r)) {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts; slow down"))
+		return
+	}
+	var req struct {
+		ChallengeID  string `json:"challenge_id"`
+		Code         string `json:"code"`
+		RecoveryCode string `json:"recovery_code"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	challenge, ok := s.store.TOTPChallenge(req.ChallengeID)
+	if !ok || challenge.ClientIP != s.clientIP(r) {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid or expired challenge"))
+		return
+	}
+	user, ok := s.store.User(challenge.UserID)
+	if !ok || !user.TOTPEnabled {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid or expired challenge"))
+		return
+	}
+	if challenge.Attempts >= maxTOTPChallengeAttempts {
+		_ = s.store.ConsumeTOTPChallenge(challenge.ID)
+		writeError(w, http.StatusTooManyRequests, errors.New("too many attempts; restart login"))
+		return
+	}
+	authed, usedRecovery := false, false
+	if req.Code != "" && auth.ValidateTOTP(user.TOTPSecret, req.Code, time.Now().UTC()) {
+		authed = true
+	} else if req.RecoveryCode != "" {
+		consumed, err := s.store.ConsumeRecoveryCode(user.ID, req.RecoveryCode)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		authed, usedRecovery = consumed, consumed
+	}
+	if !authed {
+		// Throttle failed second factors PER USER (keyed on the user id, not the
+		// source IP) so an attacker who already holds the password cannot widen the
+		// guess budget by rotating IPs. The failed attempt also counts against the
+		// challenge, which is burned at the per-challenge cap.
+		_ = s.store.FailTOTPChallenge(challenge.ID, maxTOTPChallengeAttempts)
+		if !s.totpLimiter.Allow("totp:" + user.ID) {
+			_ = s.store.ConsumeTOTPChallenge(challenge.ID)
+			s.emitNotify("🔐 2FA attempt limit", fmt.Sprintf("user %s hit the 2FA attempt limit (last attempt from %s)", user.Username, s.clientIP(r)))
+			s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.totp", Decision: "deny", Reason: "2fa attempt limit exceeded"})
+			writeError(w, http.StatusTooManyRequests, errors.New("too many 2fa attempts; restart login"))
+			return
+		}
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.totp", Decision: "deny", Reason: "invalid second factor"})
+		writeError(w, http.StatusUnauthorized, errors.New("invalid second factor"))
+		return
+	}
+	if err := s.store.ConsumeTOTPChallenge(challenge.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if usedRecovery {
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.totp.recovery_used", Decision: "allow"})
+	}
+	s.issueSession(w, r, user)
+}
+
+// handle2FAEnroll begins TOTP enrollment for the current operator: it mints a
+// secret and recovery codes (shown once) but leaves 2FA inactive until a code is
+// verified via activate. Restricted to interactive sessions (not PAT bearers).
+func (s *Server) handle2FAEnroll(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if p.viaBearer {
+		writeError(w, http.StatusForbidden, errors.New("2fa management requires an interactive session"))
+		return
+	}
+	user, ok := s.store.User(p.ActorID)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("unknown user"))
+		return
+	}
+	if user.TOTPEnabled {
+		writeError(w, http.StatusConflict, errors.New("2fa already enabled; disable it first"))
+		return
+	}
+	secret, err := auth.GenerateTOTPSecret()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	recovery, err := auth.GenerateRecoveryCodes(10)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	hashes := make([]string, 0, len(recovery))
+	for _, c := range recovery {
+		hashes = append(hashes, auth.HashRecoveryCode(c))
+	}
+	user.TOTPSecret = secret
+	user.RecoveryCodeHashes = hashes
+	user.TOTPEnabled = false
+	if err := s.store.UpsertUser(user); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "2fa.enroll", Decision: "observe"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"secret":         secret,
+		"otpauth_uri":    auth.OTPAuthURI(totpIssuer, user.Username, secret),
+		"recovery_codes": recovery,
+	})
+}
+
+// handle2FAActivate verifies the first TOTP code and turns 2FA on.
+func (s *Server) handle2FAActivate(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if p.viaBearer {
+		writeError(w, http.StatusForbidden, errors.New("2fa management requires an interactive session"))
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	user, ok := s.store.User(p.ActorID)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("unknown user"))
+		return
+	}
+	if user.TOTPSecret == "" {
+		writeError(w, http.StatusBadRequest, errors.New("no pending enrollment; call enroll first"))
+		return
+	}
+	if !auth.ValidateTOTP(user.TOTPSecret, req.Code, time.Now().UTC()) {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid code"))
+		return
+	}
+	user.TOTPEnabled = true
+	if err := s.store.UpsertUser(user); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "2fa.activate", Decision: "allow"})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handle2FADisable turns 2FA off after verifying a current code or recovery code,
+// wiping the secret and recovery hashes.
+func (s *Server) handle2FADisable(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if p.viaBearer {
+		writeError(w, http.StatusForbidden, errors.New("2fa management requires an interactive session"))
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	user, ok := s.store.User(p.ActorID)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("unknown user"))
+		return
+	}
+	if !user.TOTPEnabled {
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	verified := auth.ValidateTOTP(user.TOTPSecret, req.Code, time.Now().UTC())
+	if !verified {
+		consumed, err := s.store.ConsumeRecoveryCode(user.ID, req.Code)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		verified = consumed
+	}
+	if !verified {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid code"))
+		return
+	}
+	user.TOTPEnabled = false
+	user.TOTPSecret = ""
+	user.RecoveryCodeHashes = nil
+	if err := s.store.UpsertUser(user); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "2fa.disable", Decision: "allow"})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principal) {

@@ -1,12 +1,14 @@
 package store
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,6 +41,7 @@ type State struct {
 	MonResults     map[string][]model.MonitorResult `json:"monitor_results"`
 	NotifyChannels map[string]model.NotifyChannel   `json:"notify_channels"`
 	Tunnels        map[string]model.TunnelProfile   `json:"tunnels"`
+	TOTPChallenges map[string]auth.TOTPChallenge    `json:"totp_challenges"`
 }
 
 type Store struct {
@@ -85,6 +88,7 @@ func emptyState() State {
 		MonResults:     map[string][]model.MonitorResult{},
 		NotifyChannels: map[string]model.NotifyChannel{},
 		Tunnels:        map[string]model.TunnelProfile{},
+		TOTPChallenges: map[string]auth.TOTPChallenge{},
 	}
 }
 
@@ -130,6 +134,9 @@ func (s *Store) ensureMaps() {
 	}
 	if s.state.Tunnels == nil {
 		s.state.Tunnels = map[string]model.TunnelProfile{}
+	}
+	if s.state.TOTPChallenges == nil {
+		s.state.TOTPChallenges = map[string]auth.TOTPChallenge{}
 	}
 }
 
@@ -486,6 +493,103 @@ func (s *Store) DeleteSession(id string) error {
 	}
 	delete(s.state.Sessions, id)
 	return s.Save()
+}
+
+// maxTOTPChallenges bounds the number of pending 2FA challenges retained.
+const maxTOTPChallenges = 4096
+
+// PutTOTPChallenge stores a pending second-factor challenge, sweeping expired or
+// used ones first so the set stays bounded (challenges have a short TTL).
+func (s *Store) PutTOTPChallenge(c auth.TOTPChallenge) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	for id, existing := range s.state.TOTPChallenges {
+		if !existing.Active(now) {
+			delete(s.state.TOTPChallenges, id)
+		}
+	}
+	if len(s.state.TOTPChallenges) >= maxTOTPChallenges {
+		// Refuse to grow without bound; the caller surfaces this as a transient
+		// error and the client may retry after challenges expire.
+		return errors.New("too many pending 2fa challenges")
+	}
+	s.state.TOTPChallenges[c.ID] = c
+	return s.Save()
+}
+
+// TOTPChallenge returns an active (unused, unexpired) challenge by id.
+func (s *Store) TOTPChallenge(id string) (auth.TOTPChallenge, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.state.TOTPChallenges[id]
+	if !ok || !c.Active(time.Now().UTC()) {
+		return auth.TOTPChallenge{}, false
+	}
+	return c, true
+}
+
+// ConsumeTOTPChallenge marks a challenge spent by deleting it (single-use).
+func (s *Store) ConsumeTOTPChallenge(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.TOTPChallenges[id]; !ok {
+		return nil
+	}
+	delete(s.state.TOTPChallenges, id)
+	return s.Save()
+}
+
+// FailTOTPChallenge records a failed second-factor attempt against a challenge,
+// burning it once it reaches maxAttempts so a single challenge cannot serve as an
+// unlimited guessing oracle for its whole TTL.
+func (s *Store) FailTOTPChallenge(id string, maxAttempts int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.state.TOTPChallenges[id]
+	if !ok {
+		return nil
+	}
+	c.Attempts++
+	if maxAttempts > 0 && c.Attempts >= maxAttempts {
+		delete(s.state.TOTPChallenges, id)
+	} else {
+		s.state.TOTPChallenges[id] = c
+	}
+	return s.Save()
+}
+
+// ConsumeRecoveryCode atomically verifies and removes a single-use recovery code
+// for a user, returning true only if a code matched. The read-modify-write runs
+// entirely under the store lock so concurrent requests cannot double-spend one
+// code or clobber each other's removal.
+func (s *Store) ConsumeRecoveryCode(userID, code string) (bool, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return false, nil
+	}
+	want := auth.HashRecoveryCode(code)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.state.Users[userID]
+	if !ok {
+		return false, nil
+	}
+	idx := -1
+	for i, h := range u.RecoveryCodeHashes {
+		if subtle.ConstantTimeCompare([]byte(h), []byte(want)) == 1 {
+			idx = i
+		}
+	}
+	if idx < 0 {
+		return false, nil
+	}
+	u.RecoveryCodeHashes = append(u.RecoveryCodeHashes[:idx], u.RecoveryCodeHashes[idx+1:]...)
+	s.state.Users[userID] = u
+	if err := s.Save(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // UpsertDDNSProfile creates or updates a DDNS profile.

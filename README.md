@@ -120,9 +120,27 @@ the version in `go.mod`; during local multi-repo development, use the
 - `internal/store.BoltStateStore` is the Phase C bbolt foundation. It can import
   and export the full `State`, stores each top-level collection in its own
   bucket, and reuses the existing AES-256-GCM secret encryption boundary.
-- bbolt is not the default runtime store yet. The next storage slices need a
-  tested JSON→bbolt migration path, export/rollback tooling, and record-level
-  hot-path writes before the server startup path switches over.
+- The local ops CLI can migrate the encrypted JSON file to bbolt and export
+  bbolt back to encrypted JSON:
+
+  ```sh
+  lattice-server migrate json-to-bolt \
+    -json /var/lib/lattice/state.json \
+    -bolt /var/lib/lattice/state.db
+
+  lattice-server migrate bolt-to-json \
+    -bolt /var/lib/lattice/state.db \
+    -json /var/lib/lattice/state.rollback.json
+  ```
+
+  The CLI requires explicit `-json` and `-bolt` paths, refuses to overwrite
+  targets unless `-overwrite` is set, reuses the normal master key source, and
+  will not generate a new key during migration. If the key is not under the JSON
+  state directory as `master.key`, pass `-master-key-file` or set
+  `LATTICE_MASTER_KEY_FILE`.
+- bbolt is not the default runtime store yet. The next storage slices need
+  record-level hot-path writes, backup/restore workflow depth, and an explicit
+  startup switch before the server path moves off JSON.
 
 Example plugin trust policy JSON:
 

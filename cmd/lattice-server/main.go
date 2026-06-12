@@ -16,6 +16,14 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "migrate" {
+		if err := runMigrationCLI(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "migrate: %v\n", err)
+			os.Exit(2)
+		}
+		return
+	}
+
 	var listen string
 	var dataPath string
 	var webRoot string

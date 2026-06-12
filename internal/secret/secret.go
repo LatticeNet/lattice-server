@@ -179,6 +179,11 @@ const EnvMasterKeyFile = "LATTICE_MASTER_KEY_FILE"
 // key is supplied via env or flag.
 const defaultKeyFile = "master.key"
 
+// DefaultKeyFile is the basename auto-managed under the data directory when no
+// key is supplied via env or flag. It is exported for internal ops tooling that
+// must refuse accidental key generation but still follow the server convention.
+const DefaultKeyFile = defaultKeyFile
+
 var disableSentinels = map[string]bool{
 	"off": true, "0": true, "no": true, "none": true, "disable": true, "disabled": true,
 }

@@ -99,6 +99,13 @@ the version in `go.mod`; during local multi-repo development, use the
   policy, returns the manifest with `signature_ed25519` stripped plus capability
   risk labels, and never writes the artifact to disk or registers it in
   `/api/plugins`.
+- Plugin host APIs are brokered through `internal/plugin.Broker`, which is built
+  from a verified `plugin.Loaded` entry and checks the manifest's declared
+  capabilities on every host call. The broker currently defines guarded facades
+  for KV (`kv:read`/`kv:write`), notifications (`notify:send`), outbound HTTP
+  (`http:egress`), plugin logs (`log:write`), and host-call audit events. It is a
+  contract and enforcement point only; plugin execution/installation lifecycle is
+  intentionally separate.
 
 Example plugin trust policy JSON:
 

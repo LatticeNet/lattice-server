@@ -51,12 +51,14 @@ type trustPolicyJSON struct {
 
 var capabilityRisk = map[string]string{
 	"audit:read":    RiskRead,
+	"http:egress":   RiskWrite,
 	"kv:read":       RiskRead,
 	"monitor:read":  RiskRead,
 	"node:read":     RiskRead,
 	"static:read":   RiskRead,
 	"task:read":     RiskRead,
 	"kv:write":      RiskWrite,
+	"log:write":     RiskWrite,
 	"notify:send":   RiskWrite,
 	"worker:route":  RiskWrite,
 	"ddns:admin":    RiskHost,

@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/LatticeNet/lattice-server/internal/outbound"
 )
 
 // Message is a channel-agnostic notification.
@@ -54,7 +56,7 @@ func (d *Dispatcher) Send(ctx context.Context, m Message) []Result {
 	return results
 }
 
-func defaultClient() *http.Client { return &http.Client{Timeout: 10 * time.Second} }
+func defaultClient() *http.Client { return outbound.NewClient(10 * time.Second) }
 
 // postForm/postJSON helpers share consistent timeout and status handling.
 func doRequest(ctx context.Context, client *http.Client, req *http.Request) error {

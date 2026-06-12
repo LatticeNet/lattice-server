@@ -8,11 +8,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
-	"net/url"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/outbound"
 )
 
 // Record is a single DNS record to set.
@@ -107,43 +106,5 @@ func withRetry(maxRetries int, fn func() error) error {
 // admin-configured webhook URL. It performs a real DNS lookup; callers that
 // must reach loopback (tests) construct the provider without this guard.
 func GuardOutbound(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return fmt.Errorf("invalid url: %w", err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %q", u.Scheme)
-	}
-	host := u.Hostname()
-	if host == "" {
-		return errors.New("missing host")
-	}
-	var ips []net.IP
-	if ip := net.ParseIP(host); ip != nil {
-		ips = []net.IP{ip}
-	} else {
-		resolved, err := net.LookupIP(host)
-		if err != nil {
-			return fmt.Errorf("resolve %q: %w", host, err)
-		}
-		ips = resolved
-	}
-	for _, ip := range ips {
-		if isBlockedIP(ip) {
-			return fmt.Errorf("host %q resolves to blocked address %s", host, ip)
-		}
-	}
-	return nil
-}
-
-func isBlockedIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsPrivate() {
-		return true
-	}
-	// Cloud metadata endpoint.
-	if ip.Equal(net.ParseIP("169.254.169.254")) {
-		return true
-	}
-	return false
+	return outbound.GuardURL(raw)
 }

@@ -278,6 +278,13 @@ func (s *Store) Tasks() []model.Task {
 	return out
 }
 
+func (s *Store) Task(id string) (model.Task, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.Tasks[id]
+	return t, ok
+}
+
 func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -292,6 +299,13 @@ func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 		}
 		t.Status = model.TaskLeased
 		t.LeasedBy = nodeID
+		if t.LeaseID == "" {
+			leaseSecret, err := auth.NewRandomToken(24)
+			if err != nil {
+				return nil, err
+			}
+			t.LeaseID = "lease_" + leaseSecret
+		}
 		t.StartedAt = now
 		s.state.Tasks[id] = t
 		out = append(out, t)

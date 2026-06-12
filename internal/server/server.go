@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,8 +12,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,12 +62,31 @@ type Server struct {
 	emitNotify func(title, body string)
 }
 
+const (
+	defaultTaskTimeoutSec  = 30
+	maxTaskTimeoutSec      = 10 * 60
+	defaultTaskOutputLimit = 64 * 1024
+	maxTaskOutputLimit     = 256 * 1024
+	maxTaskScriptBytes     = 64 * 1024
+	requestIDHeader        = "X-Lattice-Request-ID"
+)
+
+var allowedTaskInterpreters = map[string]bool{
+	"sh":      true,
+	"bash":    true,
+	"python3": true,
+	"node":    true,
+}
+
 type principal struct {
 	rbac.Principal
-	CSRFToken string
-	sessionID string
-	viaBearer bool
+	CSRFToken     string
+	CorrelationID string
+	sessionID     string
+	viaBearer     bool
 }
+
+type requestIDContextKey struct{}
 
 func New(opts Options) (*Server, error) {
 	if opts.Store == nil {
@@ -103,8 +126,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/me", s.withAuth("", s.handleMe))
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
-	mux.HandleFunc("/api/tasks", s.withAuth("task:run", s.handleTasks))
-	mux.HandleFunc("/api/task-results", s.withAuth("task:run", s.handleTaskResults))
+	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
+	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/audit", s.withAuth("audit:read", s.handleAudit))
 	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
@@ -139,7 +162,7 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.Handle("/", s.staticHandler())
-	return s.securityHeaders(mux)
+	return s.withRequestID(s.securityHeaders(mux))
 }
 
 func (s *Server) ensureAdmin(password string) error {
@@ -215,15 +238,16 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 		}
 		if scope != "" && !rbac.Allows(p.Principal, scope, r.URL.Query().Get("node_id")) {
 			s.recordAudit(model.AuditEvent{
-				ID:       id.New("audit"),
-				ActorID:  p.ActorID,
-				TokenID:  p.TokenID,
-				Action:   r.Method + " " + r.URL.Path,
-				Scope:    scope,
-				Decision: "deny",
-				Reason:   "missing scope or server allowlist denied",
+				ID:            id.New("audit"),
+				ActorID:       p.ActorID,
+				TokenID:       p.TokenID,
+				Action:        r.Method + " " + r.URL.Path,
+				Scope:         scope,
+				Decision:      "deny",
+				Reason:        "missing scope or server allowlist denied",
+				CorrelationID: p.CorrelationID,
 			})
-			writeError(w, http.StatusForbidden, errors.New("forbidden"))
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 			return
 		}
 		if !p.viaBearer && unsafeMethod(r.Method) {
@@ -234,6 +258,106 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 		}
 		next(w, r, p)
 	}
+}
+
+func (s *Server) requireNodeScope(w http.ResponseWriter, p principal, scope, nodeID string) bool {
+	if rbac.Allows(p.Principal, scope, nodeID) {
+		return true
+	}
+	s.recordAudit(model.AuditEvent{
+		ID:            id.New("audit"),
+		ActorID:       p.ActorID,
+		TokenID:       p.TokenID,
+		NodeID:        nodeID,
+		Action:        "authorize.node",
+		Scope:         scope,
+		Decision:      "deny",
+		Reason:        "missing scope or server allowlist denied",
+		CorrelationID: p.CorrelationID,
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+	return false
+}
+
+func (s *Server) requireScope(w http.ResponseWriter, p principal, scope string) bool {
+	if rbac.Allows(p.Principal, scope, "") {
+		return true
+	}
+	s.recordAudit(model.AuditEvent{
+		ID:            id.New("audit"),
+		ActorID:       p.ActorID,
+		TokenID:       p.TokenID,
+		Action:        "authorize.scope",
+		Scope:         scope,
+		Decision:      "deny",
+		Reason:        "missing scope",
+		CorrelationID: p.CorrelationID,
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+	return false
+}
+
+func (s *Server) requireAllNodeScopes(w http.ResponseWriter, p principal, scope string, nodeIDs []string) bool {
+	if len(nodeIDs) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("at least one node target is required"))
+		return false
+	}
+	for _, nodeID := range nodeIDs {
+		if strings.TrimSpace(nodeID) == "" {
+			writeError(w, http.StatusBadRequest, errors.New("node target cannot be empty"))
+			return false
+		}
+		if !s.requireNodeScope(w, p, scope, nodeID) {
+			return false
+		}
+	}
+	return true
+}
+
+func principalHasNodeRestriction(p principal) bool {
+	if len(p.ServerAllowlist) == 0 {
+		return false
+	}
+	for _, nodeID := range p.ServerAllowlist {
+		if nodeID == "*" {
+			return false
+		}
+	}
+	return true
+}
+
+func serverAllowlistSubset(parent, requested []string) bool {
+	if len(parent) == 0 {
+		return true
+	}
+	parentSet := map[string]bool{}
+	for _, nodeID := range parent {
+		if nodeID == "*" {
+			return true
+		}
+		parentSet[nodeID] = true
+	}
+	if len(requested) == 0 {
+		return false
+	}
+	for _, nodeID := range requested {
+		if nodeID == "*" || !parentSet[nodeID] {
+			return false
+		}
+	}
+	return true
+}
+
+func taskTargetsAllowed(p principal, scope string, nodeIDs []string) bool {
+	if len(nodeIDs) == 0 {
+		return false
+	}
+	for _, nodeID := range nodeIDs {
+		if !rbac.Allows(p.Principal, scope, nodeID) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) principalFromRequest(r *http.Request) (principal, error) {
@@ -258,7 +382,8 @@ func (s *Server) principalFromRequest(r *http.Request) (principal, error) {
 				Scopes:          token.Scopes,
 				ServerAllowlist: token.ServerAllowlist,
 			},
-			viaBearer: true,
+			CorrelationID: requestIDFromRequest(r),
+			viaBearer:     true,
 		}, nil
 	}
 	cookie, err := r.Cookie("lattice_session")
@@ -278,8 +403,9 @@ func (s *Server) principalFromRequest(r *http.Request) (principal, error) {
 			ActorID: user.ID,
 			Scopes:  user.Scopes,
 		},
-		CSRFToken: session.CSRFToken,
-		sessionID: session.ID,
+		CSRFToken:     session.CSRFToken,
+		CorrelationID: requestIDFromRequest(r),
+		sessionID:     session.ID,
 	}, nil
 }
 
@@ -329,7 +455,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   s.secureCookies,
 		Expires:  session.ExpiresAt,
 	})
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "allow"})
+	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "allow"})
 	writeJSON(w, http.StatusOK, map[string]string{"csrf_token": session.CSRFToken, "actor_id": user.ID})
 }
 
@@ -339,7 +465,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principa
 			s.logger.Printf("logout: delete session: %v", err)
 		}
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "logout", Decision: "allow"})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "logout", Decision: "allow"})
 	http.SetCookie(w, &http.Cookie{
 		Name:     "lattice_session",
 		Value:    "",
@@ -361,12 +487,47 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 	})
 }
 
+type nodeView struct {
+	ID                 string        `json:"id"`
+	Name               string        `json:"name"`
+	Tags               []string      `json:"tags"`
+	Role               string        `json:"role"`
+	WireGuardIP        string        `json:"wireguard_ip"`
+	WireGuardPublicKey string        `json:"wireguard_public_key,omitempty"`
+	WireGuardEndpoint  string        `json:"wireguard_endpoint,omitempty"`
+	WireGuardPort      int           `json:"wireguard_port,omitempty"`
+	PublicIP           string        `json:"public_ip"`
+	PublicIPv6         string        `json:"public_ipv6,omitempty"`
+	AgentVersion       string        `json:"agent_version"`
+	Online             bool          `json:"online"`
+	LastSeen           time.Time     `json:"last_seen"`
+	Metrics            model.Metrics `json:"metrics"`
+	CreatedAt          time.Time     `json:"created_at"`
+}
+
+func toNodeView(n model.Node) nodeView {
+	return nodeView{
+		ID: n.ID, Name: n.Name, Tags: n.Tags, Role: n.Role,
+		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
+		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
+		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, AgentVersion: n.AgentVersion,
+		Online: n.Online, LastSeen: n.LastSeen, Metrics: n.Metrics, CreatedAt: n.CreatedAt,
+	}
+}
+
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.Nodes())
+	nodes := s.store.Nodes()
+	views := make([]nodeView, 0, len(nodes))
+	for _, n := range nodes {
+		if rbac.Allows(p.Principal, "node:read", n.ID) {
+			views = append(views, toNodeView(n))
+		}
+	}
+	writeJSON(w, http.StatusOK, views)
 }
 
 func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p principal) {
@@ -413,7 +574,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "node.enroll", Scope: "node:admin", NodeID: req.NodeID})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "node.enroll", Scope: "node:admin", NodeID: req.NodeID})
 	writeJSON(w, http.StatusOK, map[string]string{
 		"node_id": req.NodeID,
 		"token":   token,
@@ -424,7 +585,17 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.store.Tasks())
+		if !s.requireScope(w, p, "task:read") {
+			return
+		}
+		tasks := s.store.Tasks()
+		visible := make([]taskView, 0, len(tasks))
+		for _, task := range tasks {
+			if taskTargetsAllowed(p, "task:read", task.Targets) {
+				visible = append(visible, toTaskView(task))
+			}
+		}
+		writeJSON(w, http.StatusOK, visible)
 	case http.MethodPost:
 		var req struct {
 			Targets     []string `json:"targets"`
@@ -440,14 +611,21 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			writeError(w, http.StatusBadRequest, errors.New("targets and script are required"))
 			return
 		}
+		if !s.requireAllNodeScopes(w, p, "task:run", req.Targets) {
+			return
+		}
 		if req.Interpreter == "" {
 			req.Interpreter = "sh"
 		}
 		if req.TimeoutSec == 0 {
-			req.TimeoutSec = 30
+			req.TimeoutSec = defaultTaskTimeoutSec
 		}
 		if req.OutputLimit == 0 {
-			req.OutputLimit = 65536
+			req.OutputLimit = defaultTaskOutputLimit
+		}
+		if err := validateTaskCreate(req.Interpreter, req.Script, req.TimeoutSec, req.OutputLimit); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 		task := model.Task{
 			ID:          id.New("task"),
@@ -465,11 +643,68 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, TokenID: p.TokenID, Action: "task.create", Scope: "task:run", Metadata: map[string]string{"task_id": task.ID}})
-		writeJSON(w, http.StatusOK, task)
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.create", Scope: "task:run", Metadata: map[string]string{"task_id": task.ID}})
+		writeJSON(w, http.StatusOK, toTaskView(task))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+func validateTaskCreate(interpreter, script string, timeoutSec, outputLimit int) error {
+	if !allowedTaskInterpreters[interpreter] {
+		return fmt.Errorf("interpreter %q is not allowlisted", interpreter)
+	}
+	if timeoutSec <= 0 || timeoutSec > maxTaskTimeoutSec {
+		return fmt.Errorf("timeout_sec must be between 1 and %d", maxTaskTimeoutSec)
+	}
+	if outputLimit <= 0 || outputLimit > maxTaskOutputLimit {
+		return fmt.Errorf("output_limit must be between 1 and %d", maxTaskOutputLimit)
+	}
+	if len([]byte(script)) > maxTaskScriptBytes {
+		return fmt.Errorf("script exceeds %d bytes", maxTaskScriptBytes)
+	}
+	return nil
+}
+
+type taskView struct {
+	ID              string    `json:"id"`
+	ActorID         string    `json:"actor_id"`
+	TokenID         string    `json:"token_id"`
+	Targets         []string  `json:"targets"`
+	Interpreter     string    `json:"interpreter"`
+	ScriptSHA256    string    `json:"script_sha256"`
+	ScriptSizeBytes int       `json:"script_size_bytes"`
+	TimeoutSec      int       `json:"timeout_sec"`
+	OutputLimit     int       `json:"output_limit"`
+	Status          string    `json:"status"`
+	LeasedBy        string    `json:"leased_by,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	StartedAt       time.Time `json:"started_at,omitempty"`
+	FinishedAt      time.Time `json:"finished_at,omitempty"`
+}
+
+func toTaskView(t model.Task) taskView {
+	return taskView{
+		ID:              t.ID,
+		ActorID:         t.ActorID,
+		TokenID:         t.TokenID,
+		Targets:         t.Targets,
+		Interpreter:     t.Interpreter,
+		ScriptSHA256:    scriptSHA256(t.Script),
+		ScriptSizeBytes: len([]byte(t.Script)),
+		TimeoutSec:      t.TimeoutSec,
+		OutputLimit:     t.OutputLimit,
+		Status:          t.Status,
+		LeasedBy:        t.LeasedBy,
+		CreatedAt:       t.CreatedAt,
+		StartedAt:       t.StartedAt,
+		FinishedAt:      t.FinishedAt,
+	}
+}
+
+func scriptSHA256(script string) string {
+	sum := sha256.Sum256([]byte(script))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p principal) {
@@ -477,7 +712,38 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.Results())
+	results := s.store.Results()
+	visible := make([]taskResultView, 0, len(results))
+	for _, result := range results {
+		if rbac.Allows(p.Principal, "task:read", result.NodeID) {
+			visible = append(visible, toTaskResultView(result))
+		}
+	}
+	writeJSON(w, http.StatusOK, visible)
+}
+
+type taskResultView struct {
+	TaskID     string    `json:"task_id"`
+	NodeID     string    `json:"node_id"`
+	ExitCode   int       `json:"exit_code"`
+	Stdout     string    `json:"stdout"`
+	Stderr     string    `json:"stderr"`
+	Error      string    `json:"error"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+}
+
+func toTaskResultView(r model.TaskResult) taskResultView {
+	return taskResultView{
+		TaskID:     r.TaskID,
+		NodeID:     r.NodeID,
+		ExitCode:   r.ExitCode,
+		Stdout:     r.Stdout,
+		Stderr:     r.Stderr,
+		Error:      r.Error,
+		StartedAt:  r.StartedAt,
+		FinishedAt: r.FinishedAt,
+	}
 }
 
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal) {
@@ -485,7 +751,100 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.AuditEvents())
+	events := s.store.AuditEvents()
+	if !auditQueryRequested(r) {
+		writeJSON(w, http.StatusOK, events)
+		return
+	}
+	out, err := queryAuditEvents(r, events)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+const (
+	defaultAuditLimit = 100
+	maxAuditLimit     = 500
+)
+
+type auditQueryResponse struct {
+	Events []model.AuditEvent `json:"events"`
+	Total  int                `json:"total"`
+	Limit  int                `json:"limit"`
+	Offset int                `json:"offset"`
+}
+
+func auditQueryRequested(r *http.Request) bool {
+	q := r.URL.Query()
+	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset"} {
+		if _, ok := q[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func queryAuditEvents(r *http.Request, events []model.AuditEvent) (auditQueryResponse, error) {
+	q := r.URL.Query()
+	limit, err := boundedIntQuery(q.Get("limit"), defaultAuditLimit, maxAuditLimit, "limit")
+	if err != nil {
+		return auditQueryResponse{}, err
+	}
+	offset, err := boundedIntQuery(q.Get("offset"), 0, 0, "offset")
+	if err != nil {
+		return auditQueryResponse{}, err
+	}
+	filtered := make([]model.AuditEvent, 0, len(events))
+	for _, ev := range events {
+		if !auditEventMatches(ev, q.Get("action"), q.Get("decision"), q.Get("node_id"), q.Get("actor_id"), q.Get("token_id"), q.Get("scope"), q.Get("correlation_id")) {
+			continue
+		}
+		filtered = append(filtered, ev)
+	}
+	total := len(filtered)
+	if offset > total {
+		filtered = nil
+	} else {
+		filtered = filtered[offset:]
+	}
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+	return auditQueryResponse{Events: filtered, Total: total, Limit: limit, Offset: offset}, nil
+}
+
+func boundedIntQuery(raw string, fallback, max int, name string) (int, error) {
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer", name)
+	}
+	if value < 0 || (name == "limit" && value == 0) {
+		return 0, fmt.Errorf("%s is out of range", name)
+	}
+	if max > 0 && value > max {
+		return 0, fmt.Errorf("%s must be <= %d", name, max)
+	}
+	return value, nil
+}
+
+func auditEventMatches(ev model.AuditEvent, action, decision, nodeID, actorID, tokenID, scope, correlationID string) bool {
+	return auditFieldMatches(ev.Action, action) &&
+		auditFieldMatches(ev.Decision, decision) &&
+		auditFieldMatches(ev.NodeID, nodeID) &&
+		auditFieldMatches(ev.ActorID, actorID) &&
+		auditFieldMatches(ev.TokenID, tokenID) &&
+		auditFieldMatches(ev.Scope, scope) &&
+		auditFieldMatches(ev.CorrelationID, correlationID)
+}
+
+func auditFieldMatches(value, want string) bool {
+	want = strings.TrimSpace(want)
+	return want == "" || value == want
 }
 
 func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
@@ -498,7 +857,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 		writeJSON(w, http.StatusOK, s.store.KV(bucket))
 	case http.MethodPost:
 		if !rbac.Allows(p.Principal, "kv:write", "") {
-			writeError(w, http.StatusForbidden, errors.New("missing kv:write"))
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "missing kv:write"))
 			return
 		}
 		var req struct {
@@ -529,7 +888,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "kv.put", Scope: "kv:write", Metadata: map[string]string{"bucket": req.Bucket, "key": req.Key}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "kv.put", Scope: "kv:write", Metadata: map[string]string{"bucket": req.Bucket, "key": req.Key}})
 		writeJSON(w, http.StatusOK, entry)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -546,7 +905,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 		writeJSON(w, http.StatusOK, s.store.Static(bucket))
 	case http.MethodPost:
 		if !rbac.Allows(p.Principal, "static:write", "") {
-			writeError(w, http.StatusForbidden, errors.New("missing static:write"))
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "missing static:write"))
 			return
 		}
 		var req struct {
@@ -575,7 +934,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "static.put", Scope: "static:write", Metadata: map[string]string{"bucket": req.Bucket, "path": clean}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "static.put", Scope: "static:write", Metadata: map[string]string{"bucket": req.Bucket, "path": clean}})
 		writeJSON(w, http.StatusOK, obj)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -609,7 +968,7 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request, p princip
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "worker.upsert", Scope: "worker:deploy", Metadata: map[string]string{"worker_id": wk.ID}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "worker.upsert", Scope: "worker:deploy", Metadata: map[string]string{"worker_id": wk.ID}})
 		writeJSON(w, http.StatusOK, wk)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -674,7 +1033,7 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request, p prin
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
 	sendErr := ch.Send(ctx, notify.Message{Title: req.Title, Body: req.Body})
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "notify.test", Scope: "notify:send", Metadata: map[string]string{"channel": req.Channel, "ok": fmt.Sprintf("%t", sendErr == nil)}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.test", Scope: "notify:send", Metadata: map[string]string{"channel": req.Channel, "ok": fmt.Sprintf("%t", sendErr == nil)}})
 	if sendErr != nil {
 		writeError(w, http.StatusBadGateway, sendErr)
 		return
@@ -716,10 +1075,17 @@ func buildChannel(kind string, cfg map[string]string) (notify.Channel, error) {
 func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.store.Monitors())
+		monitors := s.store.Monitors()
+		visible := make([]model.Monitor, 0, len(monitors))
+		for _, mon := range monitors {
+			if monitorVisibleToPrincipal(p, "monitor:read", mon) {
+				visible = append(visible, mon)
+			}
+		}
+		writeJSON(w, http.StatusOK, visible)
 	case http.MethodPost:
 		if !rbac.Allows(p.Principal, "monitor:admin", "") {
-			writeError(w, http.StatusForbidden, errors.New("missing monitor:admin"))
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "missing monitor:admin"))
 			return
 		}
 		var req model.Monitor
@@ -738,6 +1104,13 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusBadRequest, errors.New("set assign_all or provide node_ids"))
 			return
 		}
+		if req.AssignAll && principalHasNodeRestriction(p) {
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "restricted token cannot assign monitor to all nodes"))
+			return
+		}
+		if !req.AssignAll && !s.requireAllNodeScopes(w, p, "monitor:admin", req.NodeIDs) {
+			return
+		}
 		if req.IntervalSec <= 0 {
 			req.IntervalSec = 30
 		}
@@ -750,7 +1123,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "monitor.create", Scope: "monitor:admin", Metadata: map[string]string{"monitor_id": req.ID, "type": req.Type}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "monitor.create", Scope: "monitor:admin", Metadata: map[string]string{"monitor_id": req.ID, "type": req.Type}})
 		writeJSON(w, http.StatusOK, req)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -768,11 +1141,15 @@ func (s *Server) handleDeleteMonitor(w http.ResponseWriter, r *http.Request, p p
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if mon, ok := s.store.Monitor(req.ID); ok && !monitorManageableByPrincipal(p, mon) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+		return
+	}
 	if err := s.store.DeleteMonitor(req.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "monitor.delete", Scope: "monitor:admin", Metadata: map[string]string{"monitor_id": req.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "monitor.delete", Scope: "monitor:admin", Metadata: map[string]string{"monitor_id": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -786,14 +1163,48 @@ func (s *Server) handleMonitorResults(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusBadRequest, errors.New("monitor_id is required"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.MonitorResults(monitorID))
+	mon, ok := s.store.Monitor(monitorID)
+	if ok && !monitorVisibleToPrincipal(p, "monitor:read", mon) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+		return
+	}
+	results := s.store.MonitorResults(monitorID)
+	visible := make([]model.MonitorResult, 0, len(results))
+	for _, result := range results {
+		if rbac.Allows(p.Principal, "monitor:read", result.NodeID) {
+			visible = append(visible, result)
+		}
+	}
+	writeJSON(w, http.StatusOK, visible)
+}
+
+func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {
+	if mon.AssignAll {
+		return rbac.Allows(p.Principal, scope, "")
+	}
+	if len(mon.NodeIDs) == 0 {
+		return !principalHasNodeRestriction(p) && rbac.Allows(p.Principal, scope, "")
+	}
+	for _, nodeID := range mon.NodeIDs {
+		if rbac.Allows(p.Principal, scope, nodeID) {
+			return true
+		}
+	}
+	return false
+}
+
+func monitorManageableByPrincipal(p principal, mon model.Monitor) bool {
+	if mon.AssignAll {
+		return !principalHasNodeRestriction(p) && rbac.Allows(p.Principal, "monitor:admin", "")
+	}
+	return taskTargetsAllowed(p, "monitor:admin", mon.NodeIDs)
 }
 
 // handleAgentMonitors returns the monitors an authenticated agent should run.
 func (s *Server) handleAgentMonitors(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("node_id")
 	if _, ok := s.authenticateNode(nodeID, bearerToken(r)); !ok {
-		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
 	writeJSON(w, http.StatusOK, s.store.MonitorsForNode(nodeID))
@@ -808,8 +1219,8 @@ func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if _, ok := s.authenticateNode(req.NodeID, req.Token); !ok {
-		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
 	req.Result.NodeID = req.NodeID
@@ -883,7 +1294,7 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "notify.channel.create", Scope: "notify:send", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.channel.create", Scope: "notify:send", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
 		writeJSON(w, http.StatusOK, toNotifyChannelView(channel))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -905,7 +1316,7 @@ func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "notify.channel.delete", Scope: "notify:send", Metadata: map[string]string{"channel_id": req.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.channel.delete", Scope: "notify:send", Metadata: map[string]string{"channel_id": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -974,16 +1385,16 @@ func (s *Server) handleAgentEvent(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if _, ok := s.authenticateNode(req.NodeID, req.Token); !ok {
-		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
 	switch req.Kind {
 	case "ssh_login":
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "ssh.login", Decision: "observe", Metadata: map[string]string{"user": req.User, "address": req.Address, "method": req.Method}})
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "ssh.login", Decision: "observe", Metadata: map[string]string{"user": req.User, "address": req.Address, "method": req.Method}})
 		s.emitNotify("🔐 SSH login", fmt.Sprintf("node %s: %s logged in from %s (%s)", req.NodeID, req.User, req.Address, req.Method))
 	default:
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "agent.event", Decision: "observe", Metadata: map[string]string{"kind": req.Kind, "message": req.Message}})
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "agent.event", Decision: "observe", Metadata: map[string]string{"kind": req.Kind, "message": req.Message}})
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -1028,7 +1439,9 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 		profiles := s.store.DDNSProfiles()
 		views := make([]ddnsView, 0, len(profiles))
 		for _, pr := range profiles {
-			views = append(views, toDDNSView(pr))
+			if rbac.Allows(p.Principal, "ddns:admin", pr.NodeID) {
+				views = append(views, toDDNSView(pr))
+			}
 		}
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
@@ -1038,6 +1451,9 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 		}
 		if strings.TrimSpace(req.Name) == "" || req.NodeID == "" || len(req.Domains) == 0 {
 			writeError(w, http.StatusBadRequest, errors.New("name, node_id and at least one domain are required"))
+			return
+		}
+		if !s.requireNodeScope(w, p, "ddns:admin", req.NodeID) {
 			return
 		}
 		if !req.EnableIPv4 && !req.EnableIPv6 {
@@ -1053,7 +1469,7 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "ddns.create", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "ddns.create", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider}})
 		writeJSON(w, http.StatusOK, toDDNSView(req))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -1071,11 +1487,18 @@ func (s *Server) handleDeleteDDNS(w http.ResponseWriter, r *http.Request, p prin
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	nodeID := ""
+	if profile, ok := s.store.DDNSProfile(req.ID); ok {
+		nodeID = profile.NodeID
+		if !s.requireNodeScope(w, p, "ddns:admin", profile.NodeID) {
+			return
+		}
+	}
 	if err := s.store.DeleteDDNSProfile(req.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "ddns.delete", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: nodeID, Action: "ddns.delete", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1097,8 +1520,15 @@ func (s *Server) handleRunDDNS(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusNotFound, errors.New("ddns profile not found"))
 		return
 	}
-	node, _ := s.store.Node(profile.NodeID)
-	if err := s.runDDNS(profile, node.PublicIP, node.PublicIPv6); err != nil {
+	if !s.requireNodeScope(w, p, "ddns:admin", profile.NodeID) {
+		return
+	}
+	node, ok := s.store.Node(profile.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	if err := s.runDDNSForPrincipal(p, profile, node.PublicIP, node.PublicIPv6); err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
@@ -1141,6 +1571,16 @@ func (s *Server) maybeTriggerDDNS(nodeID, oldV4, oldV6, newV4, newV6 string) {
 
 // runDDNS applies a profile and records the run outcome on the profile.
 func (s *Server) runDDNS(profile model.DDNSProfile, v4, v6 string) error {
+	return s.runDDNSWithAudit(profile, v4, v6, s.recordAudit)
+}
+
+func (s *Server) runDDNSForPrincipal(p principal, profile model.DDNSProfile, v4, v6 string) error {
+	return s.runDDNSWithAudit(profile, v4, v6, func(ev model.AuditEvent) {
+		s.recordPrincipalAudit(p, ev)
+	})
+}
+
+func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, record func(model.AuditEvent)) error {
 	prov, err := s.ddnsProvider(profile)
 	if err != nil {
 		return err
@@ -1163,7 +1603,7 @@ func (s *Server) runDDNS(profile model.DDNSProfile, v4, v6 string) error {
 	if err := s.store.UpsertDDNSProfile(profile); err != nil {
 		s.logger.Printf("ddns: persist profile %s: %v", profile.ID, err)
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), NodeID: profile.NodeID, Action: "ddns.run", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": profile.ID, "ok": fmt.Sprintf("%t", applyErr == nil)}})
+	record(model.AuditEvent{ID: id.New("audit"), NodeID: profile.NodeID, Action: "ddns.run", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": profile.ID, "ok": fmt.Sprintf("%t", applyErr == nil)}})
 	return applyErr
 }
 
@@ -1221,6 +1661,10 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 				return
 			}
 		}
+		if !serverAllowlistSubset(p.ServerAllowlist, req.ServerAllowlist) {
+			writeError(w, http.StatusForbidden, errors.New("cannot grant server allowlist beyond your own"))
+			return
+		}
 		secret, err := auth.NewRandomToken(32)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -1244,7 +1688,7 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "token.create", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.create", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
 		// The credential is returned exactly once, in "<id>.<secret>" form.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":    tok.ID,
@@ -1279,7 +1723,7 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request, p pri
 			return
 		}
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "token.revoke", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.revoke", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
 	writeJSON(w, http.StatusOK, toTokenView(tok))
 }
 
@@ -1297,6 +1741,9 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	}
 	if req.NodeID == "" {
 		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
 	plan, err := network.GenerateNFTPlan(req.NFTPlan)
@@ -1318,7 +1765,7 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID}})
 	writeJSON(w, http.StatusOK, approval)
 }
 
@@ -1327,13 +1774,27 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.Approvals())
+	approvals := s.store.Approvals()
+	visible := make([]model.Approval, 0, len(approvals))
+	for _, approval := range approvals {
+		if rbac.Allows(p.Principal, "network:plan", approval.NodeID) {
+			visible = append(visible, approval)
+		}
+	}
+	writeJSON(w, http.StatusOK, visible)
 }
 
 func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.store.Tunnels())
+		tunnels := s.store.Tunnels()
+		visible := make([]model.TunnelProfile, 0, len(tunnels))
+		for _, tun := range tunnels {
+			if rbac.Allows(p.Principal, "tunnel:admin", tun.NodeID) {
+				visible = append(visible, tun)
+			}
+		}
+		writeJSON(w, http.StatusOK, visible)
 	case http.MethodPost:
 		var req model.TunnelProfile
 		if !decodeJSON(w, r, &req) {
@@ -1341,6 +1802,9 @@ func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p princip
 		}
 		if strings.TrimSpace(req.Name) == "" || req.NodeID == "" || req.TunnelID == "" || len(req.Ingress) == 0 {
 			writeError(w, http.StatusBadRequest, errors.New("name, node_id, tunnel_id and at least one ingress rule are required"))
+			return
+		}
+		if !s.requireNodeScope(w, p, "tunnel:admin", req.NodeID) {
 			return
 		}
 		req.ID = id.New("tunnel")
@@ -1353,7 +1817,7 @@ func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p princip
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "tunnel.create", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "tunnel.create", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
 		writeJSON(w, http.StatusOK, req)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -1371,11 +1835,18 @@ func (s *Server) handleDeleteTunnel(w http.ResponseWriter, r *http.Request, p pr
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	nodeID := ""
+	if profile, ok := s.store.Tunnel(req.ID); ok {
+		nodeID = profile.NodeID
+		if !s.requireNodeScope(w, p, "tunnel:admin", profile.NodeID) {
+			return
+		}
+	}
 	if err := s.store.DeleteTunnel(req.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, Action: "tunnel.delete", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: nodeID, Action: "tunnel.delete", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -1397,6 +1868,9 @@ func (s *Server) handleTunnelPlan(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusNotFound, errors.New("tunnel profile not found"))
 		return
 	}
+	if !s.requireNodeScope(w, p, "tunnel:admin", profile.NodeID) {
+		return
+	}
 	config, err := cftunnel.GenerateConfig(profile)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -1416,7 +1890,7 @@ func (s *Server) handleTunnelPlan(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: profile.NodeID, Action: "tunnel.plan", Scope: "tunnel:admin", Metadata: map[string]string{"approval_id": approval.ID, "tunnel_id": profile.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: profile.NodeID, Action: "tunnel.plan", Scope: "tunnel:admin", Metadata: map[string]string{"approval_id": approval.ID, "tunnel_id": profile.ID}})
 	writeJSON(w, http.StatusOK, approval)
 }
 
@@ -1438,6 +1912,9 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 	target, ok := s.store.Node(req.NodeID)
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
 	iface, peers, err := wireguard.BuildMesh(s.store.Nodes(), target, req.ListenPort)
@@ -1464,7 +1941,7 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: req.NodeID, Action: "network.wireguard.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID, "peers": fmt.Sprintf("%d", len(peers))}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.wireguard.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID, "peers": fmt.Sprintf("%d", len(peers))}})
 	writeJSON(w, http.StatusOK, approval)
 }
 
@@ -1476,9 +1953,7 @@ func applyScriptFor(approval model.Approval) string {
 	case "cftunnel":
 		return "set -e\n" +
 			"mkdir -p /etc/cloudflared\n" +
-			"cat > /etc/cloudflared/config.yml <<'LATTICE_CF_EOF'\n" +
-			approval.Plan +
-			"LATTICE_CF_EOF\n" +
+			heredocWrite("/etc/cloudflared/config.yml", "LATTICE_CF_EOF", approval.Plan) +
 			"cloudflared --config /etc/cloudflared/config.yml ingress validate\n" +
 			"systemctl reload cloudflared 2>/dev/null || systemctl restart cloudflared 2>/dev/null || echo 'config written; start cloudflared manually'\n"
 	case "wireguard":
@@ -1488,16 +1963,43 @@ func applyScriptFor(approval model.Approval) string {
 			"KEY_FILE=${LATTICE_WG_KEY:-/etc/wireguard/lattice.key}\n" +
 			"if [ ! -f \"$KEY_FILE\" ]; then echo \"missing wireguard private key at $KEY_FILE\" >&2; exit 1; fi\n" +
 			"PRIV=$(cat \"$KEY_FILE\")\n" +
-			"cat > /etc/wireguard/wg0.conf.new <<'LATTICE_WG_EOF'\n" +
-			approval.Plan +
-			"LATTICE_WG_EOF\n" +
+			heredocWrite("/etc/wireguard/wg0.conf.new", "LATTICE_WG_EOF", approval.Plan) +
 			"sed -i \"s|" + wireguard.PrivateKeyPlaceholder + "|$PRIV|\" /etc/wireguard/wg0.conf.new\n" +
 			"mv /etc/wireguard/wg0.conf.new /etc/wireguard/wg0.conf\n" +
 			"wg-quick down wg0 2>/dev/null || true\n" +
 			"wg-quick up wg0\n"
 	default:
-		return "cat > /tmp/lattice-nft-plan.nft <<'EOF'\n" + approval.Plan + "EOF\nnft -c -f /tmp/lattice-nft-plan.nft\n"
+		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
+			"nft -c -f /tmp/lattice-nft-plan.nft\n"
 	}
+}
+
+func heredocWrite(dst, prefix, content string) string {
+	delimiter := heredocDelimiter(prefix, content)
+	if !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	return fmt.Sprintf("cat > %s <<'%s'\n%s%s\n", dst, delimiter, content, delimiter)
+}
+
+func heredocDelimiter(prefix, content string) string {
+	sum := sha256.Sum256([]byte(prefix + "\x00" + content))
+	base := prefix + "_" + hex.EncodeToString(sum[:])[:24]
+	delimiter := base
+	for i := 0; containsHeredocLine(content, delimiter); i++ {
+		delimiter = fmt.Sprintf("%s_%d", base, i)
+	}
+	return delimiter
+}
+
+func containsHeredocLine(content, delimiter string) bool {
+	normalized := strings.ReplaceAll(content, "\r\n", "\n")
+	for _, line := range strings.Split(normalized, "\n") {
+		if line == delimiter {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p principal) {
@@ -1515,6 +2017,13 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	approval, ok := s.store.Approval(req.ApprovalID)
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("approval not found"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "network:apply", approval.NodeID) {
+		return
+	}
+	if approval.Status != model.ApprovalPending {
+		writeJSON(w, http.StatusOK, approval)
 		return
 	}
 	approval.Status = model.ApprovalApproved
@@ -1541,7 +2050,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), ActorID: p.ActorID, NodeID: approval.NodeID, Action: "network.nft.approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
 	writeJSON(w, http.StatusOK, approval)
 }
 
@@ -1550,9 +2059,13 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	n, ok := s.authenticateNode(req.NodeID, req.Token)
+	n, ok := s.authenticateAgentRequest(r, req.NodeID)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
+		return
+	}
+	if err := validateAgentNetworkMetadata(req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	oldV4, oldV6 := n.PublicIP, n.PublicIPv6
@@ -1588,9 +2101,13 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	old, ok := s.authenticateNode(req.NodeID, req.Token)
+	old, ok := s.authenticateAgentRequest(r, req.NodeID)
 	if !ok {
-		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
+		return
+	}
+	if err := validateAgentNetworkMetadata(req.agentAuthRequest); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6)
@@ -1608,7 +2125,7 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	// query string would leak the credential into access logs and proxy caches.
 	token := bearerToken(r)
 	if _, ok := s.authenticateNode(nodeID, token); !ok {
-		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
 	tasks, err := s.store.LeaseTasks(nodeID, 3)
@@ -1616,7 +2133,31 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, tasks)
+	views := make([]agentTaskView, 0, len(tasks))
+	for _, task := range tasks {
+		views = append(views, toAgentTaskView(task))
+	}
+	writeJSON(w, http.StatusOK, views)
+}
+
+type agentTaskView struct {
+	ID          string `json:"id"`
+	LeaseID     string `json:"lease_id"`
+	Interpreter string `json:"interpreter"`
+	Script      string `json:"script"`
+	TimeoutSec  int    `json:"timeout_sec"`
+	OutputLimit int    `json:"output_limit"`
+}
+
+func toAgentTaskView(t model.Task) agentTaskView {
+	return agentTaskView{
+		ID:          t.ID,
+		LeaseID:     t.LeaseID,
+		Interpreter: t.Interpreter,
+		Script:      t.Script,
+		TimeoutSec:  t.TimeoutSec,
+		OutputLimit: t.OutputLimit,
+	}
 }
 
 func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
@@ -1627,25 +2168,94 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	if _, ok := s.authenticateNode(req.NodeID, req.Token); !ok {
-		writeError(w, http.StatusUnauthorized, errors.New("invalid node token"))
+	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
 	req.Result.NodeID = req.NodeID
+	if !s.requireTaskLease(w, r, req.NodeID, req.Result) {
+		return
+	}
+	if err := s.validateTaskResultOutput(req.Result); err != nil {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   req.NodeID,
+			Action:   "task.result",
+			Decision: "deny",
+			Reason:   "task output limit exceeded",
+			Metadata: map[string]string{"task_id": req.Result.TaskID},
+		})
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	if req.Result.FinishedAt.IsZero() {
 		req.Result.FinishedAt = time.Now().UTC()
 	}
+	req.Result.LeaseID = ""
 	if err := s.store.AddTaskResult(req.Result); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordAudit(model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
+	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) requireTaskLease(w http.ResponseWriter, r *http.Request, nodeID string, result model.TaskResult) bool {
+	task, ok := s.store.Task(result.TaskID)
+	if !ok {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   nodeID,
+			Action:   "task.result",
+			Decision: "deny",
+			Reason:   "invalid task lease",
+			Metadata: map[string]string{"task_id": result.TaskID},
+		})
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorInvalidTaskLease, "invalid task lease"))
+		return false
+	}
+	if task.Status != model.TaskLeased || task.LeasedBy != nodeID ||
+		task.LeaseID == "" || result.LeaseID == "" || task.LeaseID != result.LeaseID {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   nodeID,
+			Action:   "task.result",
+			Decision: "deny",
+			Reason:   "invalid task lease",
+			Metadata: map[string]string{"task_id": result.TaskID},
+		})
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorInvalidTaskLease, "invalid task lease"))
+		return false
+	}
+	return true
+}
+
+func (s *Server) validateTaskResultOutput(result model.TaskResult) error {
+	task, ok := s.store.Task(result.TaskID)
+	if !ok {
+		return errors.New("task not found")
+	}
+	limit := task.OutputLimit
+	if limit <= 0 {
+		limit = defaultTaskOutputLimit
+	}
+	if limit > maxTaskOutputLimit {
+		limit = maxTaskOutputLimit
+	}
+	for field, value := range map[string]string{
+		"stdout": result.Stdout,
+		"stderr": result.Stderr,
+		"error":  result.Error,
+	} {
+		if len([]byte(value)) > limit {
+			return apiErrorf(model.APIErrorTaskOutputLimitExceeded, "%s exceeds task output limit", field)
+		}
+	}
+	return nil
 }
 
 type agentAuthRequest struct {
 	NodeID      string `json:"node_id"`
-	Token       string `json:"token"`
 	Version     string `json:"version"`
 	PublicIP    string `json:"public_ip"`
 	PublicIPv6  string `json:"public_ipv6"`
@@ -1653,6 +2263,82 @@ type agentAuthRequest struct {
 	WGPublicKey string `json:"wireguard_public_key"`
 	WGEndpoint  string `json:"wireguard_endpoint"`
 	WGPort      int    `json:"wireguard_port"`
+}
+
+var blockedReportedPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+func validateAgentNetworkMetadata(req agentAuthRequest) error {
+	if err := validateReportedPublicIP(req.PublicIP, true, "public_ip"); err != nil {
+		return err
+	}
+	if err := validateReportedPublicIP(req.PublicIPv6, false, "public_ipv6"); err != nil {
+		return err
+	}
+	if err := validateWireGuardIP(req.WireGuardIP); err != nil {
+		return err
+	}
+	if req.WGPublicKey != "" && !wireguard.ValidatePublicKey(req.WGPublicKey) {
+		return errors.New("invalid wireguard_public_key")
+	}
+	if err := wireguard.ValidateEndpoint(req.WGEndpoint); err != nil {
+		return err
+	}
+	if req.WGPort < 0 || req.WGPort > 65535 {
+		return fmt.Errorf("invalid wireguard_port %d", req.WGPort)
+	}
+	return nil
+}
+
+func validateReportedPublicIP(value string, wantIPv4 bool, field string) error {
+	if value == "" {
+		return nil
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return fmt.Errorf("invalid %s: %w", field, err)
+	}
+	if wantIPv4 && !addr.Is4() {
+		return fmt.Errorf("%s must be IPv4", field)
+	}
+	if !wantIPv4 && !addr.Is6() {
+		return fmt.Errorf("%s must be IPv6", field)
+	}
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() ||
+		addr.IsLinkLocalUnicast() || addr.IsMulticast() || addr.IsUnspecified() {
+		return fmt.Errorf("%s is not a routable public address", field)
+	}
+	for _, prefix := range blockedReportedPublicPrefixes {
+		if prefix.Contains(addr) {
+			return fmt.Errorf("%s is reserved for special use", field)
+		}
+	}
+	return nil
+}
+
+func validateWireGuardIP(value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.ContainsAny(value, " \t\n\r") {
+		return errors.New("invalid wireguard_ip")
+	}
+	if strings.Contains(value, "/") {
+		if _, _, err := net.ParseCIDR(value); err != nil {
+			return fmt.Errorf("invalid wireguard_ip: %w", err)
+		}
+		return nil
+	}
+	if net.ParseIP(value) == nil {
+		return errors.New("invalid wireguard_ip")
+	}
+	return nil
 }
 
 func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {
@@ -1664,6 +2350,12 @@ func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {
 		return model.Node{}, false
 	}
 	return n, auth.VerifySecret(n.TokenHash, token)
+}
+
+func (s *Server) authenticateAgentRequest(r *http.Request, nodeID string) (model.Node, bool) {
+	// Agent credentials are accepted only from Authorization. JSON body tokens
+	// are easy to leak through logs, traces, and failed request captures.
+	return s.authenticateNode(nodeID, bearerToken(r))
 }
 
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
@@ -1681,12 +2373,49 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+func (s *Server) withRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestID := w.Header().Get(requestIDHeader)
+		if requestID == "" {
+			requestID = id.New("req")
+			w.Header().Set(requestIDHeader, requestID)
+		}
+		r = r.WithContext(context.WithValue(r.Context(), requestIDContextKey{}, requestID))
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requestIDFromRequest(r *http.Request) string {
+	requestID, _ := r.Context().Value(requestIDContextKey{}).(string)
+	return requestID
+}
+
 // recordAudit writes an audit event and, unlike a bare best-effort call, logs
 // when the sink fails so audit gaps are visible instead of silent.
 func (s *Server) recordAudit(ev model.AuditEvent) {
 	if err := audit.Record(s.store, ev); err != nil {
 		s.logger.Printf("audit: failed to record %q: %v", ev.Action, err)
 	}
+}
+
+func (s *Server) recordPrincipalAudit(p principal, ev model.AuditEvent) {
+	if ev.ActorID == "" {
+		ev.ActorID = p.ActorID
+	}
+	if ev.TokenID == "" {
+		ev.TokenID = p.TokenID
+	}
+	if ev.CorrelationID == "" {
+		ev.CorrelationID = p.CorrelationID
+	}
+	s.recordAudit(ev)
+}
+
+func (s *Server) recordRequestAudit(r *http.Request, ev model.AuditEvent) {
+	if ev.CorrelationID == "" {
+		ev.CorrelationID = requestIDFromRequest(r)
+	}
+	s.recordAudit(ev)
 }
 
 // clientIP resolves the address used as a rate-limit key. Proxy headers are
@@ -1742,7 +2471,91 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]string{"error": err.Error()})
+	requestID := w.Header().Get(requestIDHeader)
+	if requestID == "" {
+		requestID = id.New("req")
+		w.Header().Set(requestIDHeader, requestID)
+	}
+	writeJSON(w, status, model.APIErrorResponse{
+		Error: model.APIError{
+			Code:      publicAPIErrorCode(status, err),
+			Message:   apiErrorMessage(status, err),
+			RequestID: requestID,
+		},
+	})
+}
+
+type codedAPIError struct {
+	code string
+	err  error
+}
+
+func (e codedAPIError) Error() string {
+	return e.err.Error()
+}
+
+func (e codedAPIError) Unwrap() error {
+	return e.err
+}
+
+func (e codedAPIError) APIErrorCode() string {
+	return e.code
+}
+
+func apiError(code, message string) error {
+	return codedAPIError{code: code, err: errors.New(message)}
+}
+
+func apiErrorf(code, format string, args ...any) error {
+	return codedAPIError{code: code, err: fmt.Errorf(format, args...)}
+}
+
+func publicAPIErrorCode(status int, err error) string {
+	var coded interface{ APIErrorCode() string }
+	if errors.As(err, &coded) && coded.APIErrorCode() != "" {
+		return coded.APIErrorCode()
+	}
+	return apiErrorCode(status)
+}
+
+func apiErrorCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return model.APIErrorBadRequest
+	case http.StatusUnauthorized:
+		return model.APIErrorUnauthorized
+	case http.StatusForbidden:
+		return model.APIErrorForbidden
+	case http.StatusNotFound:
+		return model.APIErrorNotFound
+	case http.StatusMethodNotAllowed:
+		return model.APIErrorMethodNotAllowed
+	case http.StatusTooManyRequests:
+		return model.APIErrorRateLimited
+	case http.StatusBadGateway:
+		return model.APIErrorBadGateway
+	case http.StatusInternalServerError:
+		return model.APIErrorInternal
+	default:
+		if status >= 500 {
+			return model.APIErrorInternal
+		}
+		return model.APIErrorRequestFailed
+	}
+}
+
+func apiErrorMessage(status int, err error) string {
+	switch status {
+	case http.StatusBadGateway:
+		return "upstream service error"
+	case http.StatusInternalServerError:
+		return "internal server error"
+	default:
+		if status >= 500 {
+			return "internal server error"
+		}
+		return err.Error()
+	}
 }
 
 // validateStorageName rejects names that would collide or corrupt the composite

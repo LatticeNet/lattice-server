@@ -59,6 +59,20 @@ func TestUpstreamErrorPropagates(t *testing.T) {
 	}
 }
 
+func TestWebhookBlocksInternalByPolicy(t *testing.T) {
+	err := (Webhook{URL: "http://127.0.0.1:1/never"}).Send(context.Background(), Message{Body: "x"})
+	if err == nil || !strings.Contains(err.Error(), "blocked address") {
+		t.Fatalf("expected policy block for loopback webhook, got %v", err)
+	}
+}
+
+func TestDiscordBlocksInternalByPolicy(t *testing.T) {
+	err := (Discord{WebhookURL: "http://169.254.169.254/latest"}).Send(context.Background(), Message{Body: "x"})
+	if err == nil || !strings.Contains(err.Error(), "blocked address") {
+		t.Fatalf("expected policy block for metadata webhook, got %v", err)
+	}
+}
+
 func TestDispatcherIsolatesFailures(t *testing.T) {
 	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	defer ok.Close()

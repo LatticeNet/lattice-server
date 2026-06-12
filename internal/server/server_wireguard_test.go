@@ -43,15 +43,13 @@ func TestWireGuardPlanApproveApply(t *testing.T) {
 		`{"approval_id":"`+approval.ID+`","queue_apply":true}`, cookies, csrf)
 	appr.Body.Close()
 
-	// the queued task should carry a wireguard apply script, not an nft one
-	tasks := doJSON(t, handler, http.MethodGet, "/api/tasks", "", cookies, "")
-	defer tasks.Body.Close()
-	tbuf := new(bytes.Buffer)
-	tbuf.ReadFrom(tasks.Body)
-	if !bytes.Contains(tbuf.Bytes(), []byte("wg-quick up wg0")) {
-		t.Fatalf("expected wireguard apply task:\n%s", tbuf.String())
+	// The queued internal task should carry a wireguard apply script, while the
+	// control-plane task view only exposes script metadata.
+	tasks := st.Tasks()
+	if len(tasks) != 1 || !bytes.Contains([]byte(tasks[0].Script), []byte("wg-quick up wg0")) {
+		t.Fatalf("expected wireguard apply task: %+v", tasks)
 	}
-	if !bytes.Contains(tbuf.Bytes(), []byte("LATTICE_WG_PRIVATE_KEY")) {
+	if !bytes.Contains([]byte(tasks[0].Script), []byte("LATTICE_WG_PRIVATE_KEY")) {
 		t.Fatalf("expected private-key placeholder substitution in apply task")
 	}
 }

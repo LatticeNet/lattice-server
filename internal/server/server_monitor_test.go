@@ -57,8 +57,8 @@ func TestMonitorLifecycleAndAgentRoundTrip(t *testing.T) {
 	}
 
 	// agent reports a result
-	body := `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","result":{"monitor_id":"` + mon.ID + `","success":true,"latency_ms":12.5}}`
-	rres := doRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body)
+	body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + mon.ID + `","success":true,"latency_ms":12.5}}`
+	rres := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body, nodeToken)
 	if rres.Code != http.StatusOK {
 		t.Fatalf("monitor result ingest failed: %d (%s)", rres.Code, rres.Body.String())
 	}
@@ -104,5 +104,13 @@ func doRaw(t *testing.T, handler http.Handler, method, path, body string) *httpt
 	t.Helper()
 	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	return serveReq(handler, req)
+}
+
+func doAgentRaw(t *testing.T, handler http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
 	return serveReq(handler, req)
 }

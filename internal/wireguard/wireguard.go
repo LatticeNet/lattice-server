@@ -13,6 +13,7 @@ import (
 	"net"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -29,6 +30,14 @@ var wgKeyRe = regexp.MustCompile(`^[A-Za-z0-9+/]{42,43}=$`)
 
 // ifaceNameRe bounds the interface name to a safe charset.
 var ifaceNameRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,15}$`)
+
+func ValidatePublicKey(key string) bool {
+	return wgKeyRe.MatchString(key)
+}
+
+func ValidateEndpoint(endpoint string) error {
+	return validateEndpoint(endpoint)
+}
 
 // Interface is the [Interface] section for the target node.
 type Interface struct {
@@ -103,7 +112,7 @@ func GenerateConfig(iface Interface, peers []Peer) (string, error) {
 	fmt.Fprintf(&b, "ListenPort = %d\n", iface.ListenPort)
 	fmt.Fprintf(&b, "PrivateKey = %s\n", PrivateKeyPlaceholder)
 	for _, p := range peers {
-		if !wgKeyRe.MatchString(p.PublicKey) {
+		if !ValidatePublicKey(p.PublicKey) {
 			return "", fmt.Errorf("invalid public key for peer %q", p.Name)
 		}
 		if _, _, err := net.ParseCIDR(p.AllowedIPs); err != nil {
@@ -146,6 +155,10 @@ func validateEndpoint(ep string) error {
 		if r < '0' || r > '9' {
 			return fmt.Errorf("invalid endpoint port in %q", ep)
 		}
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("invalid endpoint port in %q", ep)
 	}
 	return nil
 }

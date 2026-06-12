@@ -8,7 +8,7 @@ import (
 )
 
 func TestTunnelLifecycleAndApply(t *testing.T) {
-	handler, _ := newTestServer(t)
+	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 
 	create := doJSON(t, handler, http.MethodPost, "/api/tunnels",
@@ -45,11 +45,10 @@ func TestTunnelLifecycleAndApply(t *testing.T) {
 		`{"approval_id":"`+approval.ID+`","queue_apply":true}`, cookies, csrf)
 	appr.Body.Close()
 
-	tasks := doJSON(t, handler, http.MethodGet, "/api/tasks", "", cookies, "")
-	defer tasks.Body.Close()
-	tbuf := new(bytes.Buffer)
-	tbuf.ReadFrom(tasks.Body)
-	if !bytes.Contains(tbuf.Bytes(), []byte("/etc/cloudflared/config.yml")) || !bytes.Contains(tbuf.Bytes(), []byte("cloudflared")) {
-		t.Fatalf("expected cloudflared apply task:\n%s", tbuf.String())
+	tasks := st.Tasks()
+	if len(tasks) != 1 ||
+		!bytes.Contains([]byte(tasks[0].Script), []byte("/etc/cloudflared/config.yml")) ||
+		!bytes.Contains([]byte(tasks[0].Script), []byte("cloudflared")) {
+		t.Fatalf("expected cloudflared apply task: %+v", tasks)
 	}
 }

@@ -71,8 +71,8 @@ func TestMonitorDownAndRecoveryAlerts(t *testing.T) {
 	create.Body.Close()
 
 	report := func(success bool, errMsg string) {
-		body := `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","result":{"monitor_id":"` + mon.ID + `","success":` + boolStr(success) + `,"error":"` + errMsg + `"}}`
-		doRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body)
+		body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + mon.ID + `","success":` + boolStr(success) + `,"error":"` + errMsg + `"}}`
+		doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body, nodeToken)
 	}
 	report(true, "")              // first success: no transition
 	report(false, "conn refused") // down alert
@@ -89,16 +89,17 @@ func TestMonitorDownAndRecoveryAlerts(t *testing.T) {
 }
 
 func TestAgentEventSSHLogin(t *testing.T) {
-	srv, handler, _ := newDDNSServer(t)
+	srv, handler, st := newDDNSServer(t)
 	cap := &captureNotify{}
 	srv.emitNotify = cap.hook()
 	cookies, csrf := loginSession(t, handler)
 	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
-	body := `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","kind":"ssh_login","user":"alice","address":"203.0.113.5","method":"publickey"}`
-	rec := doRaw(t, handler, http.MethodPost, "/api/agent/event", body)
+	body := `{"node_id":"` + nodeID + `","kind":"ssh_login","user":"alice","address":"203.0.113.5","method":"publickey"}`
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/event", body, nodeToken)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("event ingest failed: %d", rec.Code)
 	}
+	assertRecorderAuditCorrelation(t, st, rec, "ssh.login", "")
 	cap.mu.Lock()
 	defer cap.mu.Unlock()
 	if len(cap.titles) != 1 || cap.titles[0] != "🔐 SSH login" {

@@ -87,6 +87,7 @@ func TestDDNSRunUsesProviderAndRecordsIP(t *testing.T) {
 	if run.StatusCode != http.StatusOK {
 		t.Fatalf("run failed: %d", run.StatusCode)
 	}
+	assertResponseAuditCorrelation(t, st, run, "ddns.run", "ddns:admin")
 	if len(fp.records) != 1 || fp.records[0].IP != "203.0.113.7" || fp.records[0].Type != "A" {
 		t.Fatalf("provider not called correctly: %+v", fp.records)
 	}

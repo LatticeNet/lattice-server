@@ -227,6 +227,33 @@ func (s *Store) UpsertNode(n model.Node) error {
 	return s.Save()
 }
 
+func (s *Store) RotateNodeToken(nodeID, tokenHash string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return false, nil
+	}
+	n.TokenHash = tokenHash
+	s.state.Nodes[nodeID] = n
+	return true, s.Save()
+}
+
+// SetNodeDisabled flips a node's revocation flag. A disabled node's token is
+// refused by authentication, so this is an immediate revocation without deleting
+// history or config.
+func (s *Store) SetNodeDisabled(nodeID string, disabled bool) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return false, nil
+	}
+	n.Disabled = disabled
+	s.state.Nodes[nodeID] = n
+	return true, s.Save()
+}
+
 func (s *Store) Node(id string) (model.Node, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

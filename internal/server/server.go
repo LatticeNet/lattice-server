@@ -201,6 +201,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/2fa/totp/disable", s.withAuth("", s.handle2FADisable))
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
+	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
+	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/audit", s.withAuth("audit:read", s.handleAudit))
@@ -821,6 +823,7 @@ type nodeView struct {
 	PublicIPv6         string        `json:"public_ipv6,omitempty"`
 	AgentVersion       string        `json:"agent_version"`
 	Online             bool          `json:"online"`
+	Disabled           bool          `json:"disabled,omitempty"`
 	LastSeen           time.Time     `json:"last_seen"`
 	Metrics            model.Metrics `json:"metrics"`
 	CreatedAt          time.Time     `json:"created_at"`
@@ -832,7 +835,7 @@ func toNodeView(n model.Node) nodeView {
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, AgentVersion: n.AgentVersion,
-		Online: n.Online, LastSeen: n.LastSeen, Metrics: n.Metrics, CreatedAt: n.CreatedAt,
+		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics, CreatedAt: n.CreatedAt,
 	}
 }
 
@@ -901,6 +904,86 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		"token":   token,
 		"command": fmt.Sprintf("lattice-agent -server http://127.0.0.1:8088 -node-id %s -token %s", req.NodeID, token),
 	})
+}
+
+// handleRotateNodeToken issues a fresh token for an existing node, invalidating
+// the old one. The new token is returned exactly once.
+func (s *Server) handleRotateNodeToken(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID string `json:"node_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
+		return
+	}
+	token, err := auth.NewRandomToken(32)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	hash, err := auth.HashSecret(token)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	ok, err := s.store.RotateNodeToken(req.NodeID, hash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.token.rotate", Scope: "node:admin"})
+	writeJSON(w, http.StatusOK, map[string]string{"node_id": req.NodeID, "token": token})
+}
+
+// handleNodeDisable revokes (or restores) a node's ability to authenticate.
+func (s *Server) handleNodeDisable(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID   string `json:"node_id"`
+		Disabled bool   `json:"disabled"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
+		return
+	}
+	ok, err := s.store.SetNodeDisabled(req.NodeID, req.Disabled)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	action := "node.enable"
+	if req.Disabled {
+		action = "node.disable"
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "node:admin"})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "disabled": req.Disabled})
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal) {
@@ -2688,6 +2771,9 @@ func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {
 	}
 	n, ok := s.store.Node(nodeID)
 	if !ok {
+		return model.Node{}, false
+	}
+	if n.Disabled {
 		return model.Node{}, false
 	}
 	return n, auth.VerifySecret(n.TokenHash, token)

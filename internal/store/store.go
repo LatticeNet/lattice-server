@@ -15,6 +15,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/audit"
 	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/secret"
 )
 
 // maxSessions bounds how many sessions are retained to keep both memory and the
@@ -49,12 +50,37 @@ type Store struct {
 	mu      sync.Mutex
 	path    string
 	state   State
-	wal     *audit.WAL // append-only tamper-evident audit log; nil for in-memory stores
+	cipher  secret.Cipher // at-rest encryptor for persisted credentials
+	wal     *audit.WAL    // append-only tamper-evident audit log; nil for in-memory stores
 	walPath string
 }
 
+// Open loads (or initializes) the store at path, resolving the at-rest
+// encryption cipher from the environment or a key file under the data
+// directory (see secret.Resolve). An empty path yields an in-memory store with
+// encryption disabled (nothing is persisted).
 func Open(path string) (*Store, error) {
-	s := &Store{path: path, state: emptyState()}
+	var cph secret.Cipher
+	if path == "" {
+		cph = secret.Disabled()
+	} else {
+		res, err := secret.Resolve(filepath.Dir(path), "")
+		if err != nil {
+			return nil, fmt.Errorf("store: resolve master key: %w", err)
+		}
+		cph = res.Cipher
+	}
+	return OpenWithCipher(path, cph)
+}
+
+// OpenWithCipher is Open with an explicitly supplied at-rest cipher. main uses
+// it after logging the resolved key source; tests use it to inject a known
+// cipher. A nil cipher disables encryption.
+func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
+	if cph == nil {
+		cph = secret.Disabled()
+	}
+	s := &Store{path: path, state: emptyState(), cipher: cph}
 	if path == "" {
 		return s, nil
 	}
@@ -77,6 +103,9 @@ func Open(path string) (*Store, error) {
 	}
 	if err := json.Unmarshal(data, &s.state); err != nil {
 		return nil, err
+	}
+	if err := decryptState(&s.state, s.cipher); err != nil {
+		return nil, fmt.Errorf("store: %w", err)
 	}
 	s.ensureMaps()
 	return s, nil
@@ -154,10 +183,18 @@ func (s *Store) Save() error {
 	if s.path == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+	// 0o700: this directory holds only the server's private state file and,
+	// in the auto-generate case, the master key. It must match the 0o700 used
+	// by secret.generateKeyFile so neither path can widen the other (MkdirAll
+	// is a no-op once the directory exists, so the first creator's mode wins).
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(s.state, "", "  ")
+	persist, err := encryptedState(s.state, s.cipher)
+	if err != nil {
+		return fmt.Errorf("encrypt state: %w", err)
+	}
+	data, err := json.MarshalIndent(persist, "", "  ")
 	if err != nil {
 		return err
 	}

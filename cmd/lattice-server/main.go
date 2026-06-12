@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-server/internal/plugin"
+	"github.com/LatticeNet/lattice-server/internal/secret"
 	"github.com/LatticeNet/lattice-server/internal/server"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -24,6 +25,7 @@ func main() {
 	var tlsKey string
 	var pluginDir string
 	var pluginTrust string
+	var masterKeyFile string
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
 	flag.StringVar(&webRoot, "web", env("LATTICE_WEB_ROOT", "../lattice-dashboard"), "static dashboard root")
@@ -33,6 +35,7 @@ func main() {
 	flag.StringVar(&tlsKey, "tls-key", os.Getenv("LATTICE_TLS_KEY"), "TLS private key file")
 	flag.StringVar(&pluginDir, "plugin-dir", env("LATTICE_PLUGIN_DIR", ""), "directory of installed plugin bundles (empty disables plugins)")
 	flag.StringVar(&pluginTrust, "plugin-trust", env("LATTICE_PLUGIN_TRUST", ""), "path to the operator plugin trust policy JSON")
+	flag.StringVar(&masterKeyFile, "master-key-file", env("LATTICE_MASTER_KEY_FILE", ""), "path to the at-rest encryption master key file (auto-generated under the data dir if unset)")
 	flag.Parse()
 
 	trustPolicy, err := loadPluginTrust(pluginTrust)
@@ -43,7 +46,24 @@ func main() {
 		log.Printf("WARNING: plugin trust policy sets allow_unsigned_host_risk=true; UNSIGNED host-risk plugins will load. Do not use in production.")
 	}
 
-	st, err := store.Open(dataPath)
+	dataDir := ""
+	if dataPath != "" {
+		dataDir = filepath.Dir(dataPath)
+	}
+	keyRes, err := secret.Resolve(dataDir, masterKeyFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	switch {
+	case keyRes.Generated:
+		log.Printf("at-rest encryption: generated a new master key at %s (0600) — back this up; losing it makes stored credentials unrecoverable", keyRes.KeyFilePath)
+	case !keyRes.Cipher.Enabled():
+		log.Printf("WARNING: at-rest encryption is DISABLED; stored credentials (TOTP secrets, API tokens, notify configs) are written in plaintext")
+	default:
+		log.Printf("at-rest encryption: enabled (key source: %s)", keyRes.Source)
+	}
+
+	st, err := store.OpenWithCipher(dataPath, keyRes.Cipher)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -794,11 +794,16 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principa
 }
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
+	totpEnabled := false
+	if u, ok := s.store.User(p.ActorID); ok {
+		totpEnabled = u.TOTPEnabled
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"actor_id":   p.ActorID,
-		"token_id":   p.TokenID,
-		"scopes":     p.Scopes,
-		"csrf_token": p.CSRFToken,
+		"actor_id":     p.ActorID,
+		"token_id":     p.TokenID,
+		"scopes":       p.Scopes,
+		"csrf_token":   p.CSRFToken,
+		"totp_enabled": totpEnabled,
 	})
 }
 

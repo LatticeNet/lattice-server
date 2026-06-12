@@ -113,6 +113,17 @@ the version in `go.mod`; during local multi-repo development, use the
   Plugin HTTP request and response bodies are capped at 256 KiB, and outbound
   HTTP uses the same SSRF/egress guard as webhooks.
 
+## Storage
+
+- The default server store is still the encrypted JSON state file plus the
+  append-only hash-chained audit WAL (`<state>.audit-wal`).
+- `internal/store.BoltStateStore` is the Phase C bbolt foundation. It can import
+  and export the full `State`, stores each top-level collection in its own
+  bucket, and reuses the existing AES-256-GCM secret encryption boundary.
+- bbolt is not the default runtime store yet. The next storage slices need a
+  tested JSON→bbolt migration path, export/rollback tooling, and record-level
+  hot-path writes before the server startup path switches over.
+
 Example plugin trust policy JSON:
 
 ```json

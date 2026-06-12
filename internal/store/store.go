@@ -139,64 +139,68 @@ func emptyState() State {
 	}
 }
 
+func (st *State) ensureMaps() {
+	if st.Users == nil {
+		st.Users = map[string]model.User{}
+	}
+	if st.Tokens == nil {
+		st.Tokens = map[string]model.Token{}
+	}
+	if st.Nodes == nil {
+		st.Nodes = map[string]model.Node{}
+	}
+	if st.Tasks == nil {
+		st.Tasks = map[string]model.Task{}
+	}
+	if st.KV == nil {
+		st.KV = map[string]model.KVEntry{}
+	}
+	if st.Static == nil {
+		st.Static = map[string]model.StaticObject{}
+	}
+	if st.Workers == nil {
+		st.Workers = map[string]model.WorkerScript{}
+	}
+	if st.Plugins == nil {
+		st.Plugins = map[string]model.PluginInstallation{}
+	}
+	if st.Approvals == nil {
+		st.Approvals = map[string]model.Approval{}
+	}
+	if st.Sessions == nil {
+		st.Sessions = map[string]auth.Session{}
+	}
+	if st.DDNS == nil {
+		st.DDNS = map[string]model.DDNSProfile{}
+	}
+	if st.Monitors == nil {
+		st.Monitors = map[string]model.Monitor{}
+	}
+	if st.MonResults == nil {
+		st.MonResults = map[string][]model.MonitorResult{}
+	}
+	if st.NotifyChannels == nil {
+		st.NotifyChannels = map[string]model.NotifyChannel{}
+	}
+	if st.Tunnels == nil {
+		st.Tunnels = map[string]model.TunnelProfile{}
+	}
+	if st.TOTPChallenges == nil {
+		st.TOTPChallenges = map[string]auth.TOTPChallenge{}
+	}
+	if st.OIDCProviders == nil {
+		st.OIDCProviders = map[string]model.OIDCProvider{}
+	}
+	if st.OIDCIdentities == nil {
+		st.OIDCIdentities = map[string]model.OIDCIdentity{}
+	}
+	if st.OIDCAuthStates == nil {
+		st.OIDCAuthStates = map[string]auth.OIDCAuthState{}
+	}
+}
+
 func (s *Store) ensureMaps() {
-	if s.state.Users == nil {
-		s.state.Users = map[string]model.User{}
-	}
-	if s.state.Tokens == nil {
-		s.state.Tokens = map[string]model.Token{}
-	}
-	if s.state.Nodes == nil {
-		s.state.Nodes = map[string]model.Node{}
-	}
-	if s.state.Tasks == nil {
-		s.state.Tasks = map[string]model.Task{}
-	}
-	if s.state.KV == nil {
-		s.state.KV = map[string]model.KVEntry{}
-	}
-	if s.state.Static == nil {
-		s.state.Static = map[string]model.StaticObject{}
-	}
-	if s.state.Workers == nil {
-		s.state.Workers = map[string]model.WorkerScript{}
-	}
-	if s.state.Plugins == nil {
-		s.state.Plugins = map[string]model.PluginInstallation{}
-	}
-	if s.state.Approvals == nil {
-		s.state.Approvals = map[string]model.Approval{}
-	}
-	if s.state.Sessions == nil {
-		s.state.Sessions = map[string]auth.Session{}
-	}
-	if s.state.DDNS == nil {
-		s.state.DDNS = map[string]model.DDNSProfile{}
-	}
-	if s.state.Monitors == nil {
-		s.state.Monitors = map[string]model.Monitor{}
-	}
-	if s.state.MonResults == nil {
-		s.state.MonResults = map[string][]model.MonitorResult{}
-	}
-	if s.state.NotifyChannels == nil {
-		s.state.NotifyChannels = map[string]model.NotifyChannel{}
-	}
-	if s.state.Tunnels == nil {
-		s.state.Tunnels = map[string]model.TunnelProfile{}
-	}
-	if s.state.TOTPChallenges == nil {
-		s.state.TOTPChallenges = map[string]auth.TOTPChallenge{}
-	}
-	if s.state.OIDCProviders == nil {
-		s.state.OIDCProviders = map[string]model.OIDCProvider{}
-	}
-	if s.state.OIDCIdentities == nil {
-		s.state.OIDCIdentities = map[string]model.OIDCIdentity{}
-	}
-	if s.state.OIDCAuthStates == nil {
-		s.state.OIDCAuthStates = map[string]auth.OIDCAuthState{}
-	}
+	s.state.ensureMaps()
 }
 
 func (s *Store) Save() error {

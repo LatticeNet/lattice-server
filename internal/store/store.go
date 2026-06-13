@@ -45,6 +45,7 @@ type State struct {
 	NotifyChannels  map[string]model.NotifyChannel      `json:"notify_channels"`
 	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
 	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
+	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
 	TOTPChallenges  map[string]auth.TOTPChallenge       `json:"totp_challenges"`
 	OIDCProviders   map[string]model.OIDCProvider       `json:"oidc_providers"`
 	OIDCIdentities  map[string]model.OIDCIdentity       `json:"oidc_identities"`
@@ -134,6 +135,7 @@ func emptyState() State {
 		NotifyChannels:  map[string]model.NotifyChannel{},
 		Tunnels:         map[string]model.TunnelProfile{},
 		MachineProfiles: map[string]model.MachineProfile{},
+		NFTInputs:       map[string]model.NFTInputs{},
 		TOTPChallenges:  map[string]auth.TOTPChallenge{},
 		OIDCProviders:   map[string]model.OIDCProvider{},
 		OIDCIdentities:  map[string]model.OIDCIdentity{},
@@ -189,6 +191,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.MachineProfiles == nil {
 		st.MachineProfiles = map[string]model.MachineProfile{}
+	}
+	if st.NFTInputs == nil {
+		st.NFTInputs = map[string]model.NFTInputs{}
 	}
 	if st.TOTPChallenges == nil {
 		st.TOTPChallenges = map[string]auth.TOTPChallenge{}
@@ -1097,6 +1102,52 @@ func (s *Store) DeleteMachineProfile(id string) error {
 		return nil
 	}
 	delete(s.state.MachineProfiles, id)
+	return s.Save()
+}
+
+// UpsertNFTInputs stores the authoritative baseline nft input set for a node.
+// The key is NodeID so DNS/ACL/proxy providers can compose into one per-node
+// lattice_guard render without coordinating a separate id namespace.
+func (s *Store) UpsertNFTInputs(inputs model.NFTInputs) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	inputs.UpdatedAt = time.Now().UTC()
+	if inputs.CreatedAt.IsZero() {
+		inputs.CreatedAt = inputs.UpdatedAt
+	}
+	inputs.ID = inputs.NodeID
+	s.state.NFTInputs[inputs.NodeID] = inputs
+	return s.Save()
+}
+
+// NFTInputs returns the persisted inputs for a node.
+func (s *Store) NFTInputs(nodeID string) (model.NFTInputs, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	inputs, ok := s.state.NFTInputs[nodeID]
+	return inputs, ok
+}
+
+// AllNFTInputs returns all persisted nft inputs sorted by node id.
+func (s *Store) AllNFTInputs() []model.NFTInputs {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.NFTInputs, 0, len(s.state.NFTInputs))
+	for _, inputs := range s.state.NFTInputs {
+		out = append(out, inputs)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// DeleteNFTInputs removes a node's stored baseline nft input set.
+func (s *Store) DeleteNFTInputs(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.NFTInputs[nodeID]; !ok {
+		return nil
+	}
+	delete(s.state.NFTInputs, nodeID)
 	return s.Save()
 }
 

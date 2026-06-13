@@ -530,6 +530,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
+	mux.HandleFunc("/api/network/nft/inputs", s.withAuth("network:plan", s.handleNFTInputs))
+	mux.HandleFunc("/api/network/nft/inputs/delete", s.withAuth("network:plan", s.handleDeleteNFTInputs))
 	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("network:plan", s.handleWireGuardPlan))
 	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
 	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))
@@ -2636,7 +2638,16 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
-	plan, err := network.GenerateNFTPlan(req.NFTPlan)
+	planInput := req.NFTPlan
+	source := "request"
+	if !nftPlanRequestHasInputs(planInput) {
+		source = "default"
+		if stored, ok := s.store.NFTInputs(req.NodeID); ok {
+			planInput = nftPlanFromStoredInputs(stored)
+			source = "stored"
+		}
+	}
+	plan, err := network.GenerateNFTPlan(planInput)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -2655,7 +2666,7 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID, "source": source}})
 	writeJSON(w, http.StatusOK, approval)
 }
 

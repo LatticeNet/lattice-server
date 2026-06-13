@@ -12,6 +12,7 @@ type NFTPlan struct {
 	InterfaceName string `json:"interface_name"`
 	WireGuardCIDR string `json:"wireguard_cidr"`
 	PublicTCP     []int  `json:"public_tcp"`
+	PublicUDP     []int  `json:"public_udp"`
 	WireGuardTCP  []int  `json:"wireguard_tcp"`
 	WireGuardUDP  []int  `json:"wireguard_udp"`
 }
@@ -22,47 +23,22 @@ type NFTPlan struct {
 var ifaceNameRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,15}$`)
 
 func GenerateNFTPlan(p NFTPlan) (string, error) {
-	if p.InterfaceName == "" {
-		p.InterfaceName = "eth0"
-	}
-	if !ifaceNameRe.MatchString(p.InterfaceName) {
-		return "", fmt.Errorf("invalid interface name %q", p.InterfaceName)
-	}
-	if p.WireGuardCIDR == "" {
-		p.WireGuardCIDR = "10.66.0.0/24"
-	}
-	// Parse and re-emit the CIDR in canonical form. This rejects malformed input
-	// and guarantees the value interpolated into the ruleset is a plain network
-	// address with no injected nftables syntax.
-	_, ipNet, err := net.ParseCIDR(p.WireGuardCIDR)
+	p, err := NormalizeNFTPlan(p)
 	if err != nil {
-		return "", fmt.Errorf("invalid wireguard cidr %q: %w", p.WireGuardCIDR, err)
+		return "", err
 	}
-	if ipNet.IP.To4() == nil {
-		return "", fmt.Errorf("wireguard cidr %q must be IPv4", p.WireGuardCIDR)
-	}
-	canonicalCIDR := ipNet.String()
-	if err := validatePorts(p.PublicTCP); err != nil {
-		return "", fmt.Errorf("public tcp: %w", err)
-	}
-	if err := validatePorts(p.WireGuardTCP); err != nil {
-		return "", fmt.Errorf("wireguard tcp: %w", err)
-	}
-	if err := validatePorts(p.WireGuardUDP); err != nil {
-		return "", fmt.Errorf("wireguard udp: %w", err)
-	}
-	sort.Ints(p.PublicTCP)
-	sort.Ints(p.WireGuardTCP)
-	sort.Ints(p.WireGuardUDP)
 	var b strings.Builder
 	fmt.Fprintf(&b, "table inet lattice_guard {\n")
-	fmt.Fprintf(&b, "  set wg_peers4 {\n    type ipv4_addr\n    flags interval\n    elements = { %s }\n  }\n\n", canonicalCIDR)
+	fmt.Fprintf(&b, "  set wg_peers4 {\n    type ipv4_addr\n    flags interval\n    elements = { %s }\n  }\n\n", p.WireGuardCIDR)
 	fmt.Fprintf(&b, "  chain input {\n")
 	fmt.Fprintf(&b, "    type filter hook input priority 0; policy drop;\n")
 	fmt.Fprintf(&b, "    ct state established,related accept\n")
 	fmt.Fprintf(&b, "    iif lo accept\n")
 	if len(p.PublicTCP) > 0 {
-		fmt.Fprintf(&b, "    iifname \"%s\" tcp dport { %s } accept comment \"public lattice ports\"\n", p.InterfaceName, joinPorts(p.PublicTCP))
+		fmt.Fprintf(&b, "    iifname \"%s\" tcp dport { %s } accept comment \"public lattice tcp ports\"\n", p.InterfaceName, joinPorts(p.PublicTCP))
+	}
+	if len(p.PublicUDP) > 0 {
+		fmt.Fprintf(&b, "    iifname \"%s\" udp dport { %s } accept comment \"public lattice udp ports\"\n", p.InterfaceName, joinPorts(p.PublicUDP))
 	}
 	if len(p.WireGuardTCP) > 0 {
 		fmt.Fprintf(&b, "    ip saddr @wg_peers4 tcp dport { %s } accept comment \"wg tcp services\"\n", joinPorts(p.WireGuardTCP))
@@ -75,13 +51,59 @@ func GenerateNFTPlan(p NFTPlan) (string, error) {
 	return b.String(), nil
 }
 
-func validatePorts(ports []int) error {
+// NormalizeNFTPlan applies defaults, validates every operator-controlled value,
+// canonicalizes the WG CIDR, and returns sorted/deduplicated port lists.
+func NormalizeNFTPlan(p NFTPlan) (NFTPlan, error) {
+	if p.InterfaceName == "" {
+		p.InterfaceName = "eth0"
+	}
+	if !ifaceNameRe.MatchString(p.InterfaceName) {
+		return NFTPlan{}, fmt.Errorf("invalid interface name %q", p.InterfaceName)
+	}
+	if p.WireGuardCIDR == "" {
+		p.WireGuardCIDR = "10.66.0.0/24"
+	}
+	// Parse and re-emit the CIDR in canonical form. This rejects malformed input
+	// and guarantees the value interpolated into the ruleset is a plain network
+	// address with no injected nftables syntax.
+	_, ipNet, err := net.ParseCIDR(p.WireGuardCIDR)
+	if err != nil {
+		return NFTPlan{}, fmt.Errorf("invalid wireguard cidr %q: %w", p.WireGuardCIDR, err)
+	}
+	if ipNet.IP.To4() == nil {
+		return NFTPlan{}, fmt.Errorf("wireguard cidr %q must be IPv4", p.WireGuardCIDR)
+	}
+	p.WireGuardCIDR = ipNet.String()
+	if p.PublicTCP, err = normalizePorts(p.PublicTCP); err != nil {
+		return NFTPlan{}, fmt.Errorf("public tcp: %w", err)
+	}
+	if p.PublicUDP, err = normalizePorts(p.PublicUDP); err != nil {
+		return NFTPlan{}, fmt.Errorf("public udp: %w", err)
+	}
+	if p.WireGuardTCP, err = normalizePorts(p.WireGuardTCP); err != nil {
+		return NFTPlan{}, fmt.Errorf("wireguard tcp: %w", err)
+	}
+	if p.WireGuardUDP, err = normalizePorts(p.WireGuardUDP); err != nil {
+		return NFTPlan{}, fmt.Errorf("wireguard udp: %w", err)
+	}
+	return p, nil
+}
+
+func normalizePorts(ports []int) ([]int, error) {
+	seen := map[int]struct{}{}
+	out := make([]int, 0, len(ports))
 	for _, p := range ports {
 		if p < 1 || p > 65535 {
-			return fmt.Errorf("invalid port %d", p)
+			return nil, fmt.Errorf("invalid port %d", p)
 		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
 	}
-	return nil
+	sort.Ints(out)
+	return out, nil
 }
 
 func joinPorts(ports []int) string {

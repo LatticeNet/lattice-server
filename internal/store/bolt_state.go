@@ -41,6 +41,7 @@ var (
 	boltBucketNotifyChannels  = []byte("notify_channels")
 	boltBucketTunnels         = []byte("tunnels")
 	boltBucketMachineProfiles = []byte("machine_profiles")
+	boltBucketNFTInputs       = []byte("nft_inputs")
 	boltBucketTOTPChallenges  = []byte("totp_challenges")
 	boltBucketOIDCProviders   = []byte("oidc_providers")
 	boltBucketOIDCIdentities  = []byte("oidc_identities")
@@ -66,6 +67,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketNotifyChannels,
 	boltBucketTunnels,
 	boltBucketMachineProfiles,
+	boltBucketNFTInputs,
 	boltBucketTOTPChallenges,
 	boltBucketOIDCProviders,
 	boltBucketOIDCIdentities,
@@ -208,6 +210,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketMachineProfiles, persist.MachineProfiles); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketNFTInputs, persist.NFTInputs); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketTOTPChallenges, persist.TOTPChallenges); err != nil {
 			return err
 		}
@@ -300,6 +305,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketMachineProfiles, st.MachineProfiles); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketNFTInputs, st.NFTInputs); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketTOTPChallenges, st.TOTPChallenges); err != nil {
@@ -1515,6 +1523,60 @@ func (bs *BoltStateStore) DeleteMachineProfile(id string) error {
 			return err
 		}
 		return deleteRecord(tx, boltBucketMachineProfiles, id)
+	})
+}
+
+func (bs *BoltStateStore) UpsertNFTInputs(inputs model.NFTInputs) error {
+	inputs.UpdatedAt = time.Now().UTC()
+	if inputs.CreatedAt.IsZero() {
+		inputs.CreatedAt = inputs.UpdatedAt
+	}
+	inputs.ID = inputs.NodeID
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketNFTInputs, inputs.NodeID, inputs)
+	})
+}
+
+func (bs *BoltStateStore) NFTInputs(nodeID string) (model.NFTInputs, bool, error) {
+	var out model.NFTInputs
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketNFTInputs, nodeID, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) AllNFTInputs() ([]model.NFTInputs, error) {
+	inputs := []model.NFTInputs{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		inputs, err = listMapValues[model.NFTInputs](tx, boltBucketNFTInputs)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(inputs, func(i, j int) bool { return inputs[i].NodeID < inputs[j].NodeID })
+	return inputs, nil
+}
+
+func (bs *BoltStateStore) DeleteNFTInputs(nodeID string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketNFTInputs, nodeID)
 	})
 }
 

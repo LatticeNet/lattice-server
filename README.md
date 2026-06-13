@@ -12,7 +12,8 @@ Responsibilities:
   cost, renewal cycles, and renewal reminders.
 - Batch task scheduling and result collection.
 - KV/static/Worker control APIs.
-- nftables plan and approval workflow.
+- nftables plan and approval workflow with persisted per-node baseline inputs
+  (public TCP/UDP, WireGuard TCP/UDP, interface, WireGuard CIDR).
 - Append-only audit events.
 
 ## Run Locally
@@ -72,7 +73,9 @@ the version in `go.mod`; during local multi-repo development, use the
   Security-sensitive denials use stable business codes such as
   `capability_denied`, `invalid_node_token`, `invalid_task_lease`, and
   `task_output_limit_exceeded`.
-- nft operations are generated as approvals before agent-side validation.
+- nft baseline inputs are persisted per node and normalized before plan
+  generation. The plan still becomes an approval before agent-side validation;
+  actual firewall mutation remains behind `network:apply`.
 - PAT server allowlists are enforced against the actual node resources in request
   bodies, not only URL query parameters.
 - Node/task/monitor/DDNS/tunnel list APIs return only resources visible to the

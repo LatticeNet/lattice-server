@@ -25,6 +25,7 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	st.DDNS["d1"] = model.DDNSProfile{ID: "d1", Name: "dns", Provider: "cloudflare", CFAPIToken: cfTokenPlain, WebhookHeaders: webhookHdrPlain}
 	st.NotifyChannels["ch1"] = model.NotifyChannel{ID: "ch1", Name: "tg", Kind: "telegram", Config: map[string]string{"bot_token": botTokenPlain, "chat_id": chatIDPlain}}
 	st.MachineProfiles["mp1"] = model.MachineProfile{ID: "mp1", NodeID: "n1", Vendor: "DMIT", ConsoleURL: consoleURLPlain, DetailURL: detailURLPlain}
+	st.NFTInputs["n1"] = model.NFTInputs{ID: "n1", NodeID: "n1", InterfaceName: "ens3", WireGuardCIDR: "10.66.0.0/24", PublicTCP: []int{80, 443}, PublicUDP: []int{53}}
 	st.MonResults["m1"] = []model.MonitorResult{{MonitorID: "m1", NodeID: "n1", Success: true, At: now}}
 	st.TOTPChallenges["tc1"] = auth.TOTPChallenge{ID: "tc1", UserID: "u1", ClientIP: "198.51.100.1", ExpiresAt: now.Add(time.Minute)}
 	st.OIDCProviders["google"] = model.OIDCProvider{ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com", ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now}
@@ -72,6 +73,9 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	}
 	if got.MachineProfiles["mp1"].ConsoleURL != consoleURLPlain || got.MachineProfiles["mp1"].DetailURL != detailURLPlain {
 		t.Fatalf("machine profile links did not decrypt: %+v", got.MachineProfiles["mp1"])
+	}
+	if got.NFTInputs["n1"].InterfaceName != "ens3" || got.NFTInputs["n1"].PublicUDP[0] != 53 {
+		t.Fatalf("nft inputs not recovered: %+v", got.NFTInputs["n1"])
 	}
 	if got.OIDCProviders["google"].ClientSecret != "oidc-client-secret" {
 		t.Fatalf("oidc secret did not decrypt: %+v", got.OIDCProviders["google"])
@@ -684,6 +688,11 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := bs.UpsertNFTInputs(model.NFTInputs{
+		NodeID: "n1", InterfaceName: "ens3", WireGuardCIDR: "10.66.0.0/24", PublicTCP: []int{80, 443}, PublicUDP: []int{53}, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := bs.UpsertOIDCProvider(model.OIDCProvider{
 		ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com",
 		ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now,
@@ -840,6 +849,17 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 	if !ok || !okByNode || len(machines) != 1 || machine.ConsoleURL != consoleURLPlain || machineByNode.DetailURL != detailURLPlain {
 		t.Fatalf("machine profile not decrypted: ok=%v byNode=%v machine=%+v machines=%+v", ok, okByNode, machine, machines)
 	}
+	nftInputs, ok, err := bs.NFTInputs("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allNFTInputs, err := bs.AllNFTInputs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || nftInputs.ID != "n1" || nftInputs.InterfaceName != "ens3" || len(allNFTInputs) != 1 || allNFTInputs[0].PublicUDP[0] != 53 {
+		t.Fatalf("nft inputs not recovered: ok=%v inputs=%+v all=%+v", ok, nftInputs, allNFTInputs)
+	}
 	provider, ok, err := bs.OIDCProvider("google")
 	if err != nil {
 		t.Fatal(err)
@@ -875,6 +895,9 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := bs.DeleteMachineProfile("mp1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteNFTInputs("n1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := bs.DeleteOIDCProvider("google"); err != nil {

@@ -156,6 +156,48 @@ func assertAuditCorrelation(t *testing.T, st *store.Store, requestID, action, sc
 	t.Fatalf("missing audit event action=%q scope=%q in %+v", action, scope, st.AuditEvents())
 }
 
+func errorBodyFromResponse(t *testing.T, res *http.Response) model.APIErrorResponse {
+	t.Helper()
+	defer res.Body.Close()
+	var out model.APIErrorResponse
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatalf("decode api error: %v", err)
+	}
+	return out
+}
+
+func TestClientJSONDecoderRejectsUnknownAndTrailingFields(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "unknown field",
+			body: `{"username":"admin","password":"` + testAdminPass + `","forward_compat":true}`,
+		},
+		{
+			name: "trailing value",
+			body: `{"username":"admin","password":"` + testAdminPass + `"} {}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := doJSON(t, handler, http.MethodPost, "/api/login", tc.body, nil, "")
+			if res.StatusCode != http.StatusBadRequest {
+				t.Fatalf("expected strict client body rejection, got %d", res.StatusCode)
+			}
+			errBody := errorBodyFromResponse(t, res)
+			if errBody.Error.Code != model.APIErrorBadRequest {
+				t.Fatalf("expected bad_request code, got %+v", errBody.Error)
+			}
+			if errBody.Error.Message != "invalid request body" {
+				t.Fatalf("decoder details must not leak, got %q", errBody.Error.Message)
+			}
+		})
+	}
+}
+
 func TestSuccessfulResponsesIncludeRequestID(t *testing.T) {
 	handler, st := newTestServer(t)
 

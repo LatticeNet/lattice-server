@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -120,6 +121,116 @@ func TestAgentPostEndpointsRejectBodyTokenWithoutBearer(t *testing.T) {
 				t.Fatalf("expected invalid_node_token, got %q", code)
 			}
 		})
+	}
+}
+
+func TestAgentJSONDecoderAllowsUnknownFieldsButRejectsTrailingValues(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
+
+	unknown := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello",
+		`{"node_id":"`+nodeID+`","version":"test","future_agent_field":{"ok":true}}`, nodeToken)
+	if unknown.Code != http.StatusOK {
+		t.Fatalf("agent endpoints must tolerate unknown forward-compatible fields, got %d (%s)", unknown.Code, unknown.Body.String())
+	}
+
+	trailing := doAgentRaw(t, handler, http.MethodPost, "/api/agent/event",
+		`{"node_id":"`+nodeID+`","kind":"agent.test","message":"ok"} {}`, nodeToken)
+	if trailing.Code != http.StatusBadRequest {
+		t.Fatalf("agent decoder must reject trailing JSON values, got %d (%s)", trailing.Code, trailing.Body.String())
+	}
+	if code := errorCodeFromRecorder(t, trailing); code != model.APIErrorBadRequest {
+		t.Fatalf("expected bad_request for trailing JSON, got %q", code)
+	}
+}
+
+func TestAgentHostFactsAreStoredAsSanitizedTelemetry(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
+
+	body := `{
+		"node_id":"` + nodeID + `",
+		"version":"test",
+		"host_facts":{
+			"hostname":"node-a\ncontrol",
+			"os":"linux",
+			"platform":"debian",
+			"platform_version":"12",
+			"kernel_version":"6.8.0-test",
+			"arch":"amd64",
+			"cpu_cores":4,
+			"cpu_model":"Example CPU",
+			"memory_total":8589934592,
+			"swap_total":1099511627776,
+			"virtualization":"kvm"
+		}
+	}`
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello", body, nodeToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hello with host facts failed: %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/nodes", "", cookies, "")
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list nodes failed: %d", list.StatusCode)
+	}
+	var nodes []struct {
+		ID        string          `json:"id"`
+		HostFacts model.HostFacts `json:"host_facts"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&nodes); err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].ID != nodeID {
+		t.Fatalf("unexpected nodes: %+v", nodes)
+	}
+	facts := nodes[0].HostFacts
+	if facts.Hostname != "node-acontrol" {
+		t.Fatalf("hostname should be control-char sanitized, got %q", facts.Hostname)
+	}
+	if facts.OS != "linux" || facts.Arch != "amd64" || facts.CPUCores != 4 || facts.MemoryTotal != 8589934592 {
+		t.Fatalf("host facts not stored: %+v", facts)
+	}
+	if facts.ReportedAt.IsZero() {
+		t.Fatal("server must stamp reported_at")
+	}
+}
+
+func TestNormalizeHostFactsDropsAbsurdValues(t *testing.T) {
+	now := time.Date(2026, 6, 13, 10, 0, 0, 0, time.UTC)
+	tooLongCPU := strings.Repeat("x", maxHostFactLong+32)
+
+	got, ok := normalizeHostFacts(model.HostFacts{
+		Hostname:    "node-a\ncontrol",
+		OS:          "linux",
+		Arch:        "amd64",
+		CPUCores:    maxHostCPUCores + 1,
+		CPUModel:    tooLongCPU,
+		MemoryTotal: maxHostMemory + 1,
+		SwapTotal:   maxHostMemory + 1,
+		BootTime:    now.Add(10 * time.Minute),
+		ReportedAt:  now.Add(-time.Hour),
+	}, now)
+	if !ok {
+		t.Fatal("non-empty host facts should normalize")
+	}
+	if got.Hostname != "node-acontrol" {
+		t.Fatalf("control characters should be stripped, got %q", got.Hostname)
+	}
+	if len(got.CPUModel) != maxHostFactLong {
+		t.Fatalf("CPU model should be clamped to %d bytes, got %d", maxHostFactLong, len(got.CPUModel))
+	}
+	if got.CPUCores != 0 || got.MemoryTotal != 0 || got.SwapTotal != 0 {
+		t.Fatalf("absurd numeric values should be dropped, got cores=%d mem=%d swap=%d", got.CPUCores, got.MemoryTotal, got.SwapTotal)
+	}
+	if !got.BootTime.IsZero() {
+		t.Fatalf("future boot time should be dropped, got %s", got.BootTime)
+	}
+	if !got.ReportedAt.Equal(now) {
+		t.Fatalf("reported_at must be server-stamped, got %s", got.ReportedAt)
 	}
 }
 

@@ -7,7 +7,7 @@ Responsibilities:
 - Admin login, sessions, CSRF checks, and secure cookie defaults.
 - Scope and server allowlist authorization.
 - Node enrollment and outbound-agent APIs.
-- Fleet metrics ingestion.
+- Fleet metrics and HostFacts inventory telemetry ingestion.
 - Batch task scheduling and result collection.
 - KV/static/Worker control APIs.
 - nftables plan and approval workflow.
@@ -43,6 +43,9 @@ the version in `go.mod`; during local multi-repo development, use the
 - Agent APIs authenticate node tokens only through the `Authorization: Bearer`
   header; JSON body tokens are rejected so credentials do not enter request
   logs, traces, or failure captures.
+- Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
+  advisory telemetry only. They are sanitized and clamped server-side and must
+  not be used for authorization or policy decisions.
 - API failures use a structured JSON envelope:
   `{"error":{"code":"unauthorized","message":"invalid credentials","request_id":"req_..."}}`.
   Every HTTP response includes `X-Lattice-Request-ID`; error envelopes carry the

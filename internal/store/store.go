@@ -383,7 +383,7 @@ func (s *Store) Nodes() []model.Node {
 	return out
 }
 
-func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, publicIPv6, wgIP string) error {
+func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, publicIPv6, wgIP string, hostFacts model.HostFacts) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, ok := s.state.Nodes[nodeID]
@@ -404,6 +404,9 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	}
 	if wgIP != "" {
 		n.WireGuardIP = wgIP
+	}
+	if !hostFacts.ReportedAt.IsZero() {
+		n.HostFacts = hostFacts
 	}
 	s.state.Nodes[nodeID] = n
 	return s.Save()

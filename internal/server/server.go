@@ -305,7 +305,7 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 			ID     string `json:"id"`
 			Status string `json:"status"`
 		}
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		req.ID = strings.TrimSpace(req.ID)
@@ -797,7 +797,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	user, ok := s.store.UserByUsername(req.Username)
@@ -985,7 +985,7 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		Code         string `json:"code"`
 		RecoveryCode string `json:"recovery_code"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	challenge, ok := s.store.TOTPChallenge(req.ChallengeID)
@@ -1128,7 +1128,7 @@ func (s *Server) handle2FAActivate(w http.ResponseWriter, r *http.Request, p pri
 	var req struct {
 		Code string `json:"code"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	user, ok := s.store.User(p.ActorID)
@@ -1167,7 +1167,7 @@ func (s *Server) handle2FADisable(w http.ResponseWriter, r *http.Request, p prin
 	var req struct {
 		Code string `json:"code"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	user, ok := s.store.User(p.ActorID)
@@ -1237,22 +1237,23 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 }
 
 type nodeView struct {
-	ID                 string        `json:"id"`
-	Name               string        `json:"name"`
-	Tags               []string      `json:"tags"`
-	Role               string        `json:"role"`
-	WireGuardIP        string        `json:"wireguard_ip"`
-	WireGuardPublicKey string        `json:"wireguard_public_key,omitempty"`
-	WireGuardEndpoint  string        `json:"wireguard_endpoint,omitempty"`
-	WireGuardPort      int           `json:"wireguard_port,omitempty"`
-	PublicIP           string        `json:"public_ip"`
-	PublicIPv6         string        `json:"public_ipv6,omitempty"`
-	AgentVersion       string        `json:"agent_version"`
-	Online             bool          `json:"online"`
-	Disabled           bool          `json:"disabled,omitempty"`
-	LastSeen           time.Time     `json:"last_seen"`
-	Metrics            model.Metrics `json:"metrics"`
-	CreatedAt          time.Time     `json:"created_at"`
+	ID                 string          `json:"id"`
+	Name               string          `json:"name"`
+	Tags               []string        `json:"tags"`
+	Role               string          `json:"role"`
+	WireGuardIP        string          `json:"wireguard_ip"`
+	WireGuardPublicKey string          `json:"wireguard_public_key,omitempty"`
+	WireGuardEndpoint  string          `json:"wireguard_endpoint,omitempty"`
+	WireGuardPort      int             `json:"wireguard_port,omitempty"`
+	PublicIP           string          `json:"public_ip"`
+	PublicIPv6         string          `json:"public_ipv6,omitempty"`
+	AgentVersion       string          `json:"agent_version"`
+	Online             bool            `json:"online"`
+	Disabled           bool            `json:"disabled,omitempty"`
+	LastSeen           time.Time       `json:"last_seen"`
+	Metrics            model.Metrics   `json:"metrics"`
+	HostFacts          model.HostFacts `json:"host_facts"`
+	CreatedAt          time.Time       `json:"created_at"`
 }
 
 func toNodeView(n model.Node) nodeView {
@@ -1261,7 +1262,8 @@ func toNodeView(n model.Node) nodeView {
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, AgentVersion: n.AgentVersion,
-		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics, CreatedAt: n.CreatedAt,
+		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
+		HostFacts: n.HostFacts, CreatedAt: n.CreatedAt,
 	}
 }
 
@@ -1292,7 +1294,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		Role        string   `json:"role"`
 		WireGuardIP string   `json:"wireguard_ip"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	if req.NodeID == "" {
@@ -1361,7 +1363,7 @@ func (s *Server) handleRotateNodeToken(w http.ResponseWriter, r *http.Request, p
 	var req struct {
 		NodeID string `json:"node_id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	if req.NodeID == "" {
@@ -1404,7 +1406,7 @@ func (s *Server) handleNodeDisable(w http.ResponseWriter, r *http.Request, p pri
 		NodeID   string `json:"node_id"`
 		Disabled bool   `json:"disabled"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	if req.NodeID == "" {
@@ -1453,7 +1455,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			TimeoutSec  int      `json:"timeout_sec"`
 			OutputLimit int      `json:"output_limit"`
 		}
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if len(req.Targets) == 0 || strings.TrimSpace(req.Script) == "" {
@@ -1734,7 +1736,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 			Key    string `json:"key"`
 			Value  string `json:"value"`
 		}
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if req.Bucket == "" {
@@ -1783,7 +1785,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 			Content     string `json:"content"`
 			ContentType string `json:"content_type"`
 		}
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if req.Bucket == "" {
@@ -1821,7 +1823,7 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request, p princip
 			Capabilities []string `json:"capabilities"`
 			Public       bool     `json:"public"`
 		}
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if req.Name == "" || req.Source == "" {
@@ -1853,7 +1855,7 @@ func (s *Server) handleWorkerRun(w http.ResponseWriter, r *http.Request, p princ
 		WorkerID string `json:"worker_id"`
 		Path     string `json:"path"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	for _, wk := range s.store.Workers() {
@@ -1885,7 +1887,7 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request, p prin
 		Title   string            `json:"title"`
 		Body    string            `json:"body"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	ch, err := buildChannel(req.Channel, req.Config)
@@ -1958,7 +1960,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			return
 		}
 		var req model.Monitor
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Target) == "" {
@@ -2007,7 +2009,7 @@ func (s *Server) handleDeleteMonitor(w http.ResponseWriter, r *http.Request, p p
 	var req struct {
 		ID string `json:"id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	if mon, ok := s.store.Monitor(req.ID); ok && !monitorManageableByPrincipal(p, mon) {
@@ -2085,7 +2087,7 @@ func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request
 		agentAuthRequest
 		Result model.MonitorResult `json:"result"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeAgentJSON(w, r, &req) {
 		return
 	}
 	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
@@ -2140,7 +2142,7 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			Config  map[string]string `json:"config"`
 			Enabled *bool             `json:"enabled"`
 		}
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if strings.TrimSpace(req.Name) == "" {
@@ -2178,7 +2180,7 @@ func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Reques
 	var req struct {
 		ID string `json:"id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	if err := s.store.DeleteNotifyChannel(req.ID); err != nil {
@@ -2251,7 +2253,7 @@ func (s *Server) handleAgentEvent(w http.ResponseWriter, r *http.Request) {
 		Method  string `json:"method"`
 		Message string `json:"message"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeAgentJSON(w, r, &req) {
 		return
 	}
 	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
@@ -2315,7 +2317,7 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
 		var req model.DDNSProfile
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if strings.TrimSpace(req.Name) == "" || req.NodeID == "" || len(req.Domains) == 0 {
@@ -2353,7 +2355,7 @@ func (s *Server) handleDeleteDDNS(w http.ResponseWriter, r *http.Request, p prin
 	var req struct {
 		ID string `json:"id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	nodeID := ""
@@ -2381,7 +2383,7 @@ func (s *Server) handleRunDDNS(w http.ResponseWriter, r *http.Request, p princip
 	var req struct {
 		ID string `json:"id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	profile, ok := s.store.DDNSProfile(req.ID)
@@ -2515,7 +2517,7 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 			Scopes          []string `json:"scopes"`
 			ServerAllowlist []string `json:"server_allowlist"`
 		}
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if strings.TrimSpace(req.Name) == "" || len(req.Scopes) == 0 {
@@ -2577,7 +2579,7 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request, p pri
 	var req struct {
 		TokenID string `json:"token_id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	tok, ok := s.store.Token(req.TokenID)
@@ -2605,7 +2607,7 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		NodeID string `json:"node_id"`
 		network.NFTPlan
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	if req.NodeID == "" {
@@ -2666,7 +2668,7 @@ func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p princip
 		writeJSON(w, http.StatusOK, toTunnelViews(visible))
 	case http.MethodPost:
 		var req model.TunnelProfile
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		if strings.TrimSpace(req.Name) == "" || req.NodeID == "" || req.TunnelID == "" || len(req.Ingress) == 0 {
@@ -2701,7 +2703,7 @@ func (s *Server) handleDeleteTunnel(w http.ResponseWriter, r *http.Request, p pr
 	var req struct {
 		ID string `json:"id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	nodeID := ""
@@ -2729,7 +2731,7 @@ func (s *Server) handleTunnelPlan(w http.ResponseWriter, r *http.Request, p prin
 	var req struct {
 		ID string `json:"id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	profile, ok := s.store.Tunnel(req.ID)
@@ -2775,7 +2777,7 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 		NodeID     string `json:"node_id"`
 		ListenPort int    `json:"listen_port"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	target, ok := s.store.Node(req.NodeID)
@@ -2886,7 +2888,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		// received from /api/network/approvals.
 		PlanSHA256 string `json:"plan_sha256,omitempty"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	approval, ok := s.store.Approval(req.ApprovalID)
@@ -2938,7 +2940,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 
 func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	var req agentAuthRequest
-	if !decodeJSON(w, r, &req) {
+	if !decodeAgentJSON(w, r, &req) {
 		return
 	}
 	n, ok := s.authenticateAgentRequest(r, req.NodeID)
@@ -2965,6 +2967,9 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	if req.WGPort != 0 {
 		n.WireGuardPort = req.WGPort
 	}
+	if hostFacts, ok := normalizeHostFacts(req.HostFacts, s.now()); ok {
+		n.HostFacts = hostFacts
+	}
 	n.LastSeen = time.Now().UTC()
 	n.Online = true
 	if err := s.store.UpsertNode(n); err != nil {
@@ -2980,7 +2985,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		agentAuthRequest
 		Metrics model.Metrics `json:"metrics"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeAgentJSON(w, r, &req) {
 		return
 	}
 	old, ok := s.authenticateAgentRequest(r, req.NodeID)
@@ -2993,7 +2998,8 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6)
-	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, req.WireGuardIP); err != nil {
+	hostFacts, _ := normalizeHostFacts(req.HostFacts, s.now())
+	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, req.WireGuardIP, hostFacts); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -3047,7 +3053,7 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		agentAuthRequest
 		Result model.TaskResult `json:"result"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeAgentJSON(w, r, &req) {
 		return
 	}
 	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
@@ -3137,14 +3143,15 @@ func (s *Server) validateTaskResultOutput(result model.TaskResult) error {
 }
 
 type agentAuthRequest struct {
-	NodeID      string `json:"node_id"`
-	Version     string `json:"version"`
-	PublicIP    string `json:"public_ip"`
-	PublicIPv6  string `json:"public_ipv6"`
-	WireGuardIP string `json:"wireguard_ip"`
-	WGPublicKey string `json:"wireguard_public_key"`
-	WGEndpoint  string `json:"wireguard_endpoint"`
-	WGPort      int    `json:"wireguard_port"`
+	NodeID      string          `json:"node_id"`
+	Version     string          `json:"version"`
+	PublicIP    string          `json:"public_ip"`
+	PublicIPv6  string          `json:"public_ipv6"`
+	WireGuardIP string          `json:"wireguard_ip"`
+	WGPublicKey string          `json:"wireguard_public_key"`
+	WGEndpoint  string          `json:"wireguard_endpoint"`
+	WGPort      int             `json:"wireguard_port"`
+	HostFacts   model.HostFacts `json:"host_facts"`
 }
 
 var blockedReportedPublicPrefixes = []netip.Prefix{
@@ -3176,6 +3183,70 @@ func validateAgentNetworkMetadata(req agentAuthRequest) error {
 		return fmt.Errorf("invalid wireguard_port %d", req.WGPort)
 	}
 	return nil
+}
+
+const (
+	maxHostFactShort = 96
+	maxHostFactLong  = 192
+	maxHostCPUCores  = 4096
+	maxHostMemory    = uint64(16) << 50 // 16 PiB: reject obviously corrupt node-reported facts.
+)
+
+func normalizeHostFacts(in model.HostFacts, now time.Time) (model.HostFacts, bool) {
+	if hostFactsEmpty(in) {
+		return model.HostFacts{}, false
+	}
+	out := model.HostFacts{
+		Hostname:        clampPrintable(in.Hostname, maxHostFactShort),
+		OS:              clampPrintable(in.OS, maxHostFactShort),
+		Platform:        clampPrintable(in.Platform, maxHostFactShort),
+		PlatformVersion: clampPrintable(in.PlatformVersion, maxHostFactShort),
+		KernelVersion:   clampPrintable(in.KernelVersion, maxHostFactShort),
+		Arch:            clampPrintable(in.Arch, maxHostFactShort),
+		CPUModel:        clampPrintable(in.CPUModel, maxHostFactLong),
+		Virtualization:  clampPrintable(in.Virtualization, maxHostFactShort),
+	}
+	if in.CPUCores > 0 && in.CPUCores <= maxHostCPUCores {
+		out.CPUCores = in.CPUCores
+	}
+	if in.MemoryTotal <= maxHostMemory {
+		out.MemoryTotal = in.MemoryTotal
+	}
+	if in.SwapTotal <= maxHostMemory {
+		out.SwapTotal = in.SwapTotal
+	}
+	if !in.BootTime.IsZero() && !in.BootTime.After(now.Add(5*time.Minute)) {
+		out.BootTime = in.BootTime.UTC()
+	}
+	// Server receipt time wins over the node clock for freshness display.
+	out.ReportedAt = now.UTC()
+	return out, true
+}
+
+func hostFactsEmpty(f model.HostFacts) bool {
+	return f.Hostname == "" && f.OS == "" && f.Platform == "" &&
+		f.PlatformVersion == "" && f.KernelVersion == "" && f.Arch == "" &&
+		f.CPUCores == 0 && f.CPUModel == "" && f.MemoryTotal == 0 &&
+		f.SwapTotal == 0 && f.Virtualization == "" && f.BootTime.IsZero() &&
+		f.ReportedAt.IsZero()
+}
+
+func clampPrintable(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		if b.Len()+len(string(r)) > max {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func validateReportedPublicIP(value string, wantIPv4 bool, field string) error {
@@ -3347,29 +3418,35 @@ func errInvalidBody() error {
 	return apiError(model.APIErrorBadRequest, "invalid request body")
 }
 
-// decodeJSON decodes a request body (1 MiB cap) leniently: unknown fields are
-// tolerated. This is deliberate for forward compatibility — agent endpoints in
-// particular must accept a body from a newer agent that carries a field an
-// older server does not yet know (proven by
-// TestAgentPostEndpointsRejectBodyTokenWithoutBearer, which would otherwise turn
-// a 401 into a 400). Operator handlers that want strict rejection of unknown /
-// trailing fields opt in via decodeLimitedJSON. Malformed bodies return a
-// generic message (no raw decoder internals). [C9; C10 deliberately scoped]
-func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
-	defer r.Body.Close()
-	body := io.LimitReader(r.Body, 1<<20)
-	if err := json.NewDecoder(body).Decode(dest); err != nil {
-		writeError(w, http.StatusBadRequest, errInvalidBody())
-		return false
-	}
-	return true
+const defaultJSONBodyLimit = 1 << 20
+
+// decodeClientJSON is the default for dashboard/operator/public API request
+// bodies. It rejects unknown fields and trailing JSON values, uses a fixed body
+// cap, and returns only a generic error to callers. Agent ingestion uses
+// decodeAgentJSON instead because agents must remain forward-compatible with a
+// newer agent sending fields an older server does not yet understand. [C9/C10]
+func decodeClientJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
+	return decodeJSONBody(w, r, dest, defaultJSONBodyLimit, true)
+}
+
+// decodeAgentJSON is deliberately forward-compatible: unknown fields are
+// tolerated so a new agent can talk to an older server. It still enforces the
+// same body cap and rejects malformed/trailing values.
+func decodeAgentJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
+	return decodeJSONBody(w, r, dest, defaultJSONBodyLimit, false)
 }
 
 func decodeLimitedJSON(w http.ResponseWriter, r *http.Request, dest any, limit int64) bool {
+	return decodeJSONBody(w, r, dest, limit, true)
+}
+
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dest any, limit int64, strict bool) bool {
 	defer r.Body.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
+	if strict {
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(dest); err != nil {
 		writeError(w, http.StatusBadRequest, errInvalidBody())
 		return false

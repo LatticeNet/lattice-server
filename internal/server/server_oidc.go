@@ -327,7 +327,7 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 		writeJSON(w, http.StatusOK, map[string]any{"providers": out})
 	case http.MethodPost:
 		var req model.OIDCProvider
-		if !decodeJSON(w, r, &req) {
+		if !decodeClientJSON(w, r, &req) {
 			return
 		}
 		req.Issuer = strings.TrimRight(strings.TrimSpace(req.Issuer), "/")
@@ -386,7 +386,7 @@ func (s *Server) handleDeleteOIDCProvider(w http.ResponseWriter, r *http.Request
 	var req struct {
 		ID string `json:"id"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	if err := s.store.DeleteOIDCProvider(req.ID); err != nil {

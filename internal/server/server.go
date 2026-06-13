@@ -2868,6 +2868,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	var req struct {
 		ApprovalID string `json:"approval_id"`
 		QueueApply bool   `json:"queue_apply"`
+		// PlanSHA256 (optional) binds this approval to the exact plan the
+		// reviewer saw. When present it must match the stored plan's hash, so a
+		// plan that changed between review and approval is rejected (TOCTOU /
+		// plan-swap defense). The client computes it over the Plan text it
+		// received from /api/network/approvals.
+		PlanSHA256 string `json:"plan_sha256,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -2879,6 +2885,13 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	}
 	if !s.requireNodeScope(w, p, "network:apply", approval.NodeID) {
 		return
+	}
+	if req.PlanSHA256 != "" {
+		sum := sha256.Sum256([]byte(approval.Plan))
+		if !strings.EqualFold(req.PlanSHA256, hex.EncodeToString(sum[:])) {
+			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "plan changed since review; re-review before approving"))
+			return
+		}
 	}
 	if approval.Status != model.ApprovalPending {
 		writeJSON(w, http.StatusOK, approval)
@@ -3315,11 +3328,19 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
+// errInvalidBody is the generic client-facing 400 for malformed request bodies.
+// Raw encoding/json decoder strings are not echoed to the caller (they leak
+// internal type/field detail); the request id still allows server-side
+// correlation.
+func errInvalidBody() error {
+	return apiError(model.APIErrorBadRequest, "invalid request body")
+}
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 	defer r.Body.Close()
 	body := io.LimitReader(r.Body, 1<<20)
 	if err := json.NewDecoder(body).Decode(dest); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, errInvalidBody())
 		return false
 	}
 	return true
@@ -3331,17 +3352,17 @@ func decodeLimitedJSON(w http.ResponseWriter, r *http.Request, dest any, limit i
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dest); err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, errInvalidBody())
 		return false
 	}
 	var extra any
 	if err := dec.Decode(&extra); err == io.EOF {
 		return true
 	} else if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		writeError(w, http.StatusBadRequest, errInvalidBody())
 		return false
 	}
-	writeError(w, http.StatusBadRequest, errors.New("unexpected trailing json value"))
+	writeError(w, http.StatusBadRequest, errInvalidBody())
 	return false
 }
 

@@ -46,6 +46,7 @@ type State struct {
 	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
 	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
 	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
+	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
 	TOTPChallenges  map[string]auth.TOTPChallenge       `json:"totp_challenges"`
 	OIDCProviders   map[string]model.OIDCProvider       `json:"oidc_providers"`
 	OIDCIdentities  map[string]model.OIDCIdentity       `json:"oidc_identities"`
@@ -136,6 +137,7 @@ func emptyState() State {
 		Tunnels:         map[string]model.TunnelProfile{},
 		MachineProfiles: map[string]model.MachineProfile{},
 		NFTInputs:       map[string]model.NFTInputs{},
+		NetPolicies:     map[string]model.NetPolicy{},
 		TOTPChallenges:  map[string]auth.TOTPChallenge{},
 		OIDCProviders:   map[string]model.OIDCProvider{},
 		OIDCIdentities:  map[string]model.OIDCIdentity{},
@@ -194,6 +196,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NFTInputs == nil {
 		st.NFTInputs = map[string]model.NFTInputs{}
+	}
+	if st.NetPolicies == nil {
+		st.NetPolicies = map[string]model.NetPolicy{}
 	}
 	if st.TOTPChallenges == nil {
 		st.TOTPChallenges = map[string]auth.TOTPChallenge{}
@@ -1148,6 +1153,50 @@ func (s *Store) DeleteNFTInputs(nodeID string) error {
 		return nil
 	}
 	delete(s.state.NFTInputs, nodeID)
+	return s.Save()
+}
+
+// UpsertNetPolicy stores the operator-authored network policy for a node.
+func (s *Store) UpsertNetPolicy(policy model.NetPolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	policy.UpdatedAt = time.Now().UTC()
+	if policy.CreatedAt.IsZero() {
+		policy.CreatedAt = policy.UpdatedAt
+	}
+	policy.ID = policy.TargetNodeID
+	s.state.NetPolicies[policy.TargetNodeID] = policy
+	return s.Save()
+}
+
+// NetPolicy returns the policy for a target node.
+func (s *Store) NetPolicy(nodeID string) (model.NetPolicy, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	policy, ok := s.state.NetPolicies[nodeID]
+	return policy, ok
+}
+
+// NetPolicies returns all network policies sorted by target node id.
+func (s *Store) NetPolicies() []model.NetPolicy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.NetPolicy, 0, len(s.state.NetPolicies))
+	for _, policy := range s.state.NetPolicies {
+		out = append(out, policy)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TargetNodeID < out[j].TargetNodeID })
+	return out
+}
+
+// DeleteNetPolicy removes the network policy for a target node.
+func (s *Store) DeleteNetPolicy(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.NetPolicies[nodeID]; !ok {
+		return nil
+	}
+	delete(s.state.NetPolicies, nodeID)
 	return s.Save()
 }
 

@@ -42,6 +42,7 @@ var (
 	boltBucketTunnels         = []byte("tunnels")
 	boltBucketMachineProfiles = []byte("machine_profiles")
 	boltBucketNFTInputs       = []byte("nft_inputs")
+	boltBucketNetPolicies     = []byte("net_policies")
 	boltBucketTOTPChallenges  = []byte("totp_challenges")
 	boltBucketOIDCProviders   = []byte("oidc_providers")
 	boltBucketOIDCIdentities  = []byte("oidc_identities")
@@ -68,6 +69,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketTunnels,
 	boltBucketMachineProfiles,
 	boltBucketNFTInputs,
+	boltBucketNetPolicies,
 	boltBucketTOTPChallenges,
 	boltBucketOIDCProviders,
 	boltBucketOIDCIdentities,
@@ -213,6 +215,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketNFTInputs, persist.NFTInputs); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketNetPolicies, persist.NetPolicies); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketTOTPChallenges, persist.TOTPChallenges); err != nil {
 			return err
 		}
@@ -308,6 +313,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketNFTInputs, st.NFTInputs); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketNetPolicies, st.NetPolicies); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketTOTPChallenges, st.TOTPChallenges); err != nil {
@@ -1577,6 +1585,60 @@ func (bs *BoltStateStore) DeleteNFTInputs(nodeID string) error {
 			return err
 		}
 		return deleteRecord(tx, boltBucketNFTInputs, nodeID)
+	})
+}
+
+func (bs *BoltStateStore) UpsertNetPolicy(policy model.NetPolicy) error {
+	policy.UpdatedAt = time.Now().UTC()
+	if policy.CreatedAt.IsZero() {
+		policy.CreatedAt = policy.UpdatedAt
+	}
+	policy.ID = policy.TargetNodeID
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketNetPolicies, policy.TargetNodeID, policy)
+	})
+}
+
+func (bs *BoltStateStore) NetPolicy(nodeID string) (model.NetPolicy, bool, error) {
+	var out model.NetPolicy
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketNetPolicies, nodeID, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) NetPolicies() ([]model.NetPolicy, error) {
+	policies := []model.NetPolicy{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		policies, err = listMapValues[model.NetPolicy](tx, boltBucketNetPolicies)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(policies, func(i, j int) bool { return policies[i].TargetNodeID < policies[j].TargetNodeID })
+	return policies, nil
+}
+
+func (bs *BoltStateStore) DeleteNetPolicy(nodeID string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketNetPolicies, nodeID)
 	})
 }
 

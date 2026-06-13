@@ -14,6 +14,9 @@ Responsibilities:
 - KV/static/Worker control APIs.
 - nftables plan and approval workflow with persisted per-node baseline inputs
   (public TCP/UDP, WireGuard TCP/UDP, interface, WireGuard CIDR).
+- NetPolicy intent APIs and reachability graph for per-node network ACL design.
+  Current state is stored and visualized only; host nft commits wait for the
+  dedicated plan/apply path with rollback.
 - Append-only audit events.
 
 ## Run Locally
@@ -76,6 +79,12 @@ the version in `go.mod`; during local multi-repo development, use the
 - nft baseline inputs are persisted per node and normalized before plan
   generation. The plan still becomes an approval before agent-side validation;
   actual firewall mutation remains behind `network:apply`.
+- NetPolicy state (`/api/netpolicy`, `/api/netpolicy/graph`) is server-validated
+  operator intent only. Writes require `netpolicy:admin`; list/graph require
+  `netpolicy:read`; per-node PAT allowlists filter target nodes. The current
+  implementation intentionally does not commit nft rules on hosts until the
+  `nftpolicy` plan/apply path includes control-plane selfcheck and dead-man
+  rollback.
 - PAT server allowlists are enforced against the actual node resources in request
   bodies, not only URL query parameters.
 - Node/task/monitor/DDNS/tunnel list APIs return only resources visible to the
@@ -134,8 +143,8 @@ the version in `go.mod`; during local multi-repo development, use the
   has record-level APIs for nodes, KV entries, audit events, static objects,
   Worker scripts, plugin lifecycle records, approvals, tasks, task results,
   monitors, monitor results, tunnels, users, PAT tokens, sessions, TOTP
-  challenges, DDNS profiles, notification channels, OIDC providers, OIDC
-  identities, and OIDC auth states.
+  challenges, DDNS profiles, notification channels, machine profiles, nft
+  inputs, net policies, OIDC providers, OIDC identities, and OIDC auth states.
 - The local ops CLI can migrate the encrypted JSON file to bbolt and export
   bbolt back to encrypted JSON:
 

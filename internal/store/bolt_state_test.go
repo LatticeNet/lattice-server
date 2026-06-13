@@ -26,6 +26,7 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	st.NotifyChannels["ch1"] = model.NotifyChannel{ID: "ch1", Name: "tg", Kind: "telegram", Config: map[string]string{"bot_token": botTokenPlain, "chat_id": chatIDPlain}}
 	st.MachineProfiles["mp1"] = model.MachineProfile{ID: "mp1", NodeID: "n1", Vendor: "DMIT", ConsoleURL: consoleURLPlain, DetailURL: detailURLPlain}
 	st.NFTInputs["n1"] = model.NFTInputs{ID: "n1", NodeID: "n1", InterfaceName: "ens3", WireGuardCIDR: "10.66.0.0/24", PublicTCP: []int{80, 443}, PublicUDP: []int{53}}
+	st.NetPolicies["n1"] = model.NetPolicy{ID: "n1", TargetNodeID: "n1", Enabled: true, Rules: []model.NetRule{{ID: "r1", Action: model.NetRuleDeny, Direction: model.NetDirEgress, Protocol: model.NetProtoTCP, Ports: []int{1234}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}}
 	st.MonResults["m1"] = []model.MonitorResult{{MonitorID: "m1", NodeID: "n1", Success: true, At: now}}
 	st.TOTPChallenges["tc1"] = auth.TOTPChallenge{ID: "tc1", UserID: "u1", ClientIP: "198.51.100.1", ExpiresAt: now.Add(time.Minute)}
 	st.OIDCProviders["google"] = model.OIDCProvider{ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com", ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now}
@@ -76,6 +77,9 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	}
 	if got.NFTInputs["n1"].InterfaceName != "ens3" || got.NFTInputs["n1"].PublicUDP[0] != 53 {
 		t.Fatalf("nft inputs not recovered: %+v", got.NFTInputs["n1"])
+	}
+	if got.NetPolicies["n1"].Rules[0].Ports[0] != 1234 {
+		t.Fatalf("net policy not recovered: %+v", got.NetPolicies["n1"])
 	}
 	if got.OIDCProviders["google"].ClientSecret != "oidc-client-secret" {
 		t.Fatalf("oidc secret did not decrypt: %+v", got.OIDCProviders["google"])
@@ -693,6 +697,17 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := bs.UpsertNetPolicy(model.NetPolicy{
+		TargetNodeID: "n1",
+		Enabled:      true,
+		Rules: []model.NetRule{{
+			ID: "r1", Action: model.NetRuleDeny, Direction: model.NetDirEgress,
+			Protocol: model.NetProtoTCP, Ports: []int{1234}, Remote: model.NetEndpoint{Kind: model.NetRefAny},
+		}},
+		CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := bs.UpsertOIDCProvider(model.OIDCProvider{
 		ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com",
 		ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now,
@@ -860,6 +875,17 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 	if !ok || nftInputs.ID != "n1" || nftInputs.InterfaceName != "ens3" || len(allNFTInputs) != 1 || allNFTInputs[0].PublicUDP[0] != 53 {
 		t.Fatalf("nft inputs not recovered: ok=%v inputs=%+v all=%+v", ok, nftInputs, allNFTInputs)
 	}
+	netPolicy, ok, err := bs.NetPolicy("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allNetPolicies, err := bs.NetPolicies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || netPolicy.ID != "n1" || len(allNetPolicies) != 1 || allNetPolicies[0].Rules[0].Ports[0] != 1234 {
+		t.Fatalf("net policy not recovered: ok=%v policy=%+v all=%+v", ok, netPolicy, allNetPolicies)
+	}
 	provider, ok, err := bs.OIDCProvider("google")
 	if err != nil {
 		t.Fatal(err)
@@ -898,6 +924,9 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := bs.DeleteNFTInputs("n1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteNetPolicy("n1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := bs.DeleteOIDCProvider("google"); err != nil {

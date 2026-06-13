@@ -29,6 +29,7 @@ import (
 //   - model.NotifyChannel.Config[*]    bot tokens, SMTP passwords, webhook secrets
 //   - model.OIDCProvider.ClientSecret  OAuth2 client secret for SSO
 //   - auth.OIDCAuthState.State/CodeVerifier short-lived OAuth2 state + PKCE verifier
+//   - model.MachineProfile.ConsoleURL/DetailURL operator console/detail links
 //
 // When adding a new persisted credential, encrypt it here AND extend
 // stateHasEnvelope so the lost-key guard stays accurate.
@@ -110,6 +111,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 		providers[id] = enc
 	}
 	out.OIDCProviders = providers
+
+	machines := make(map[string]model.MachineProfile, len(st.MachineProfiles))
+	for id, p := range st.MachineProfiles {
+		enc, err := encryptMachineProfileRecord(id, p, c)
+		if err != nil {
+			return State{}, err
+		}
+		machines[id] = enc
+	}
+	out.MachineProfiles = machines
 
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
@@ -209,6 +220,16 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.OIDCProviders = providers
 
+	machines := make(map[string]model.MachineProfile, len(st.MachineProfiles))
+	for id, p := range st.MachineProfiles {
+		dec, err := decryptMachineProfileRecord(id, p, c)
+		if err != nil {
+			return err
+		}
+		machines[id] = dec
+	}
+	st.MachineProfiles = machines
+
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
 		dec, err := decryptOIDCAuthStateRecord(id, authState, c)
@@ -255,6 +276,11 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, p := range st.OIDCProviders {
 		if secret.IsEnvelope(p.ClientSecret) {
+			return true
+		}
+	}
+	for _, p := range st.MachineProfiles {
+		if secret.IsEnvelope(p.ConsoleURL) || secret.IsEnvelope(p.DetailURL) {
 			return true
 		}
 	}
@@ -451,6 +477,37 @@ func decryptOIDCProviderRecord(id string, p model.OIDCProvider, c secret.Cipher)
 		return model.OIDCProvider{}, fmt.Errorf("decrypt oidc provider %s client secret: %w", id, err)
 	}
 	p.ClientSecret = sec
+	return p, nil
+}
+
+func encryptMachineProfileRecord(id string, p model.MachineProfile, c secret.Cipher) (model.MachineProfile, error) {
+	console, err := c.Encrypt(p.ConsoleURL)
+	if err != nil {
+		return model.MachineProfile{}, fmt.Errorf("encrypt machine profile %s console url: %w", id, err)
+	}
+	detail, err := c.Encrypt(p.DetailURL)
+	if err != nil {
+		return model.MachineProfile{}, fmt.Errorf("encrypt machine profile %s detail url: %w", id, err)
+	}
+	p.ConsoleURL = console
+	p.DetailURL = detail
+	return p, nil
+}
+
+func decryptMachineProfileRecord(id string, p model.MachineProfile, c secret.Cipher) (model.MachineProfile, error) {
+	if !c.Enabled() && (secret.IsEnvelope(p.ConsoleURL) || secret.IsEnvelope(p.DetailURL)) {
+		return model.MachineProfile{}, lostMasterKeyError()
+	}
+	console, err := c.Decrypt(p.ConsoleURL)
+	if err != nil {
+		return model.MachineProfile{}, fmt.Errorf("decrypt machine profile %s console url: %w", id, err)
+	}
+	detail, err := c.Decrypt(p.DetailURL)
+	if err != nil {
+		return model.MachineProfile{}, fmt.Errorf("decrypt machine profile %s detail url: %w", id, err)
+	}
+	p.ConsoleURL = console
+	p.DetailURL = detail
 	return p, nil
 }
 

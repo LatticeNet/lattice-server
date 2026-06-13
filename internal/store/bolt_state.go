@@ -21,29 +21,30 @@ import (
 const boltStateVersion = "1"
 
 var (
-	boltBucketMeta           = []byte("_meta")
-	boltKeyVersion           = []byte("version")
-	boltBucketUsers          = []byte("users")
-	boltBucketTokens         = []byte("tokens")
-	boltBucketNodes          = []byte("nodes")
-	boltBucketTasks          = []byte("tasks")
-	boltBucketResults        = []byte("results")
-	boltBucketAudit          = []byte("audit")
-	boltBucketKV             = []byte("kv")
-	boltBucketStatic         = []byte("static")
-	boltBucketWorkers        = []byte("workers")
-	boltBucketPlugins        = []byte("plugins")
-	boltBucketApprovals      = []byte("approvals")
-	boltBucketSessions       = []byte("sessions")
-	boltBucketDDNS           = []byte("ddns")
-	boltBucketMonitors       = []byte("monitors")
-	boltBucketMonResults     = []byte("monitor_results")
-	boltBucketNotifyChannels = []byte("notify_channels")
-	boltBucketTunnels        = []byte("tunnels")
-	boltBucketTOTPChallenges = []byte("totp_challenges")
-	boltBucketOIDCProviders  = []byte("oidc_providers")
-	boltBucketOIDCIdentities = []byte("oidc_identities")
-	boltBucketOIDCAuthStates = []byte("oidc_auth_states")
+	boltBucketMeta            = []byte("_meta")
+	boltKeyVersion            = []byte("version")
+	boltBucketUsers           = []byte("users")
+	boltBucketTokens          = []byte("tokens")
+	boltBucketNodes           = []byte("nodes")
+	boltBucketTasks           = []byte("tasks")
+	boltBucketResults         = []byte("results")
+	boltBucketAudit           = []byte("audit")
+	boltBucketKV              = []byte("kv")
+	boltBucketStatic          = []byte("static")
+	boltBucketWorkers         = []byte("workers")
+	boltBucketPlugins         = []byte("plugins")
+	boltBucketApprovals       = []byte("approvals")
+	boltBucketSessions        = []byte("sessions")
+	boltBucketDDNS            = []byte("ddns")
+	boltBucketMonitors        = []byte("monitors")
+	boltBucketMonResults      = []byte("monitor_results")
+	boltBucketNotifyChannels  = []byte("notify_channels")
+	boltBucketTunnels         = []byte("tunnels")
+	boltBucketMachineProfiles = []byte("machine_profiles")
+	boltBucketTOTPChallenges  = []byte("totp_challenges")
+	boltBucketOIDCProviders   = []byte("oidc_providers")
+	boltBucketOIDCIdentities  = []byte("oidc_identities")
+	boltBucketOIDCAuthStates  = []byte("oidc_auth_states")
 )
 
 var boltStateBuckets = [][]byte{
@@ -64,6 +65,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketMonResults,
 	boltBucketNotifyChannels,
 	boltBucketTunnels,
+	boltBucketMachineProfiles,
 	boltBucketTOTPChallenges,
 	boltBucketOIDCProviders,
 	boltBucketOIDCIdentities,
@@ -203,6 +205,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketTunnels, persist.Tunnels); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketMachineProfiles, persist.MachineProfiles); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketTOTPChallenges, persist.TOTPChallenges); err != nil {
 			return err
 		}
@@ -292,6 +297,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketTunnels, st.Tunnels); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketMachineProfiles, st.MachineProfiles); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketTOTPChallenges, st.TOTPChallenges); err != nil {
@@ -1424,6 +1432,89 @@ func (bs *BoltStateStore) DeleteDDNSProfile(id string) error {
 			return err
 		}
 		return deleteRecord(tx, boltBucketDDNS, id)
+	})
+}
+
+func (bs *BoltStateStore) UpsertMachineProfile(p model.MachineProfile) error {
+	p.UpdatedAt = time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptMachineProfileRecord(p.ID, p, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketMachineProfiles, p.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) MachineProfile(id string) (model.MachineProfile, bool, error) {
+	var out model.MachineProfile
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketMachineProfiles, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptMachineProfileRecord(id, out, bs.cipher)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) MachineProfileForNode(nodeID string) (model.MachineProfile, bool, error) {
+	profiles, err := bs.MachineProfiles()
+	if err != nil {
+		return model.MachineProfile{}, false, err
+	}
+	for _, p := range profiles {
+		if p.NodeID == nodeID {
+			return p, true, nil
+		}
+	}
+	return model.MachineProfile{}, false, nil
+}
+
+func (bs *BoltStateStore) MachineProfiles() ([]model.MachineProfile, error) {
+	profiles := []model.MachineProfile{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.MachineProfile](tx, boltBucketMachineProfiles)
+		if err != nil {
+			return err
+		}
+		for _, p := range all {
+			dec, err := decryptMachineProfileRecord(p.ID, p, bs.cipher)
+			if err != nil {
+				return err
+			}
+			profiles = append(profiles, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(profiles, func(i, j int) bool { return profiles[i].CreatedAt.Before(profiles[j].CreatedAt) })
+	return profiles, nil
+}
+
+func (bs *BoltStateStore) DeleteMachineProfile(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketMachineProfiles, id)
 	})
 }
 

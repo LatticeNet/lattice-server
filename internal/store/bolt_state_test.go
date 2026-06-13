@@ -24,6 +24,7 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	st.Audit = []model.AuditEvent{{ID: "audit-1", At: now, Action: "test.audit", Decision: "allow"}}
 	st.DDNS["d1"] = model.DDNSProfile{ID: "d1", Name: "dns", Provider: "cloudflare", CFAPIToken: cfTokenPlain, WebhookHeaders: webhookHdrPlain}
 	st.NotifyChannels["ch1"] = model.NotifyChannel{ID: "ch1", Name: "tg", Kind: "telegram", Config: map[string]string{"bot_token": botTokenPlain, "chat_id": chatIDPlain}}
+	st.MachineProfiles["mp1"] = model.MachineProfile{ID: "mp1", NodeID: "n1", Vendor: "DMIT", ConsoleURL: consoleURLPlain, DetailURL: detailURLPlain}
 	st.MonResults["m1"] = []model.MonitorResult{{MonitorID: "m1", NodeID: "n1", Success: true, At: now}}
 	st.TOTPChallenges["tc1"] = auth.TOTPChallenge{ID: "tc1", UserID: "u1", ClientIP: "198.51.100.1", ExpiresAt: now.Add(time.Minute)}
 	st.OIDCProviders["google"] = model.OIDCProvider{ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com", ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now}
@@ -42,12 +43,12 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 		t.Fatal(err)
 	}
 	disk := string(raw)
-	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, botTokenPlain, chatIDPlain, "oidc-client-secret"} {
+	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, "oidc-client-secret"} {
 		if strings.Contains(disk, leak) {
 			t.Fatalf("plaintext secret leaked into bbolt file: %q", leak)
 		}
 	}
-	for _, plain := range []string{"admin", "node one", "cloudflare", "Google"} {
+	for _, plain := range []string{"admin", "node one", "cloudflare", "Google", "DMIT"} {
 		if !strings.Contains(disk, plain) {
 			t.Fatalf("expected non-secret field %q to remain inspectable in bucketized storage", plain)
 		}
@@ -68,6 +69,9 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	}
 	if got.NotifyChannels["ch1"].Config["bot_token"] != botTokenPlain {
 		t.Fatalf("notify secret did not decrypt: %+v", got.NotifyChannels["ch1"])
+	}
+	if got.MachineProfiles["mp1"].ConsoleURL != consoleURLPlain || got.MachineProfiles["mp1"].DetailURL != detailURLPlain {
+		t.Fatalf("machine profile links did not decrypt: %+v", got.MachineProfiles["mp1"])
 	}
 	if got.OIDCProviders["google"].ClientSecret != "oidc-client-secret" {
 		t.Fatalf("oidc secret did not decrypt: %+v", got.OIDCProviders["google"])
@@ -675,6 +679,11 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := bs.UpsertMachineProfile(model.MachineProfile{
+		ID: "mp1", NodeID: "n1", Vendor: "DMIT", ConsoleURL: consoleURLPlain, DetailURL: detailURLPlain, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := bs.UpsertOIDCProvider(model.OIDCProvider{
 		ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com",
 		ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now,
@@ -707,6 +716,8 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 		webhookHdrPlain,
 		botTokenPlain,
 		chatIDPlain,
+		consoleURLPlain,
+		detailURLPlain,
 		"oidc-client-secret",
 		oidcState.State,
 		oidcState.CodeVerifier,
@@ -715,7 +726,7 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 			t.Fatalf("secret leaked into bbolt file: %q", leak)
 		}
 	}
-	for _, plain := range []string{"Admin@Example.com", "automation", "cloudflare", "Google"} {
+	for _, plain := range []string{"Admin@Example.com", "automation", "cloudflare", "Google", "DMIT"} {
 		if !strings.Contains(disk, plain) {
 			t.Fatalf("expected non-secret field %q to remain readable", plain)
 		}
@@ -814,6 +825,21 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 	if len(notify) != 1 || notify[0].Config["bot_token"] != botTokenPlain || len(enabledNotify) != 1 || enabledNotify[0].Config["chat_id"] != chatIDPlain {
 		t.Fatalf("notify channel not decrypted: all=%+v enabled=%+v", notify, enabledNotify)
 	}
+	machine, ok, err := bs.MachineProfile("mp1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	machines, err := bs.MachineProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	machineByNode, okByNode, err := bs.MachineProfileForNode("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || !okByNode || len(machines) != 1 || machine.ConsoleURL != consoleURLPlain || machineByNode.DetailURL != detailURLPlain {
+		t.Fatalf("machine profile not decrypted: ok=%v byNode=%v machine=%+v machines=%+v", ok, okByNode, machine, machines)
+	}
 	provider, ok, err := bs.OIDCProvider("google")
 	if err != nil {
 		t.Fatal(err)
@@ -846,6 +872,9 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := bs.DeleteNotifyChannel("ch1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteMachineProfile("mp1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := bs.DeleteOIDCProvider("google"); err != nil {

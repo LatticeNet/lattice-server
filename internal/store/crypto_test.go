@@ -45,6 +45,12 @@ func seedSecrets(t *testing.T, s *Store) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpsertMachineProfile(model.MachineProfile{
+		ID: "m1", NodeID: "node-a", Vendor: "DMIT",
+		ConsoleURL: consoleURLPlain, DetailURL: detailURLPlain,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func findNotify(s *Store, id string) *model.NotifyChannel {
@@ -63,6 +69,8 @@ const (
 	webhookHdrPlain = `{"Authorization":"Bearer xyz123"}`
 	botTokenPlain   = "123456:AAtertoken-bot-secret"
 	chatIDPlain     = "-1001234567890"
+	consoleURLPlain = "https://console.example.com/session/signed-secret"
+	detailURLPlain  = "https://billing.example.com/machine/private-link"
 )
 
 func TestEncryptedAtRest(t *testing.T) {
@@ -83,7 +91,7 @@ func TestEncryptedAtRest(t *testing.T) {
 	disk := string(raw)
 
 	// No plaintext secret may appear on disk.
-	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, botTokenPlain, chatIDPlain} {
+	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain} {
 		if strings.Contains(disk, leak) {
 			t.Fatalf("plaintext secret leaked to disk: %q", leak)
 		}
@@ -93,7 +101,7 @@ func TestEncryptedAtRest(t *testing.T) {
 		t.Fatal("expected encrypted envelopes on disk, found none")
 	}
 	// Non-secret fields stay readable (we did not over-encrypt).
-	for _, plain := range []string{"admin", "home", "cloudflare", "telegram"} {
+	for _, plain := range []string{"admin", "home", "cloudflare", "telegram", "DMIT"} {
 		if !strings.Contains(disk, plain) {
 			t.Fatalf("expected non-secret field %q to remain readable on disk", plain)
 		}
@@ -126,6 +134,10 @@ func TestReopenDecryptsRoundTrip(t *testing.T) {
 	n := findNotify(s2, "n1")
 	if n == nil || n.Config["bot_token"] != botTokenPlain || n.Config["chat_id"] != chatIDPlain {
 		t.Fatalf("notify config not recovered: %+v", n)
+	}
+	m, ok := s2.MachineProfile("m1")
+	if !ok || m.ConsoleURL != consoleURLPlain || m.DetailURL != detailURLPlain {
+		t.Fatalf("machine profile links not recovered: %+v ok=%v", m, ok)
 	}
 }
 
@@ -222,6 +234,11 @@ func TestPrefixCollidingSecretRoundTrips(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpsertMachineProfile(model.MachineProfile{
+		ID: "m1", NodeID: "node-a", ConsoleURL: colliding, DetailURL: colliding,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	raw, _ := os.ReadFile(path)
 	if strings.Contains(string(raw), colliding) {
@@ -238,6 +255,10 @@ func TestPrefixCollidingSecretRoundTrips(t *testing.T) {
 	}
 	if n := findNotify(s2, "n1"); n == nil || n.Config["token"] != colliding {
 		t.Fatalf("colliding notify token not recovered: %+v", n)
+	}
+	m, _ := s2.MachineProfile("m1")
+	if m.ConsoleURL != colliding || m.DetailURL != colliding {
+		t.Fatalf("colliding machine links not recovered: %+v", m)
 	}
 }
 

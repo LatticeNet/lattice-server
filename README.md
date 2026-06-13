@@ -8,6 +8,8 @@ Responsibilities:
 - Scope and server allowlist authorization.
 - Node enrollment and outbound-agent APIs.
 - Fleet metrics and HostFacts inventory telemetry ingestion.
+- Server-only machine inventory profiles: vendor, region, encrypted console/detail links,
+  cost, renewal cycles, and renewal reminders.
 - Batch task scheduling and result collection.
 - KV/static/Worker control APIs.
 - nftables plan and approval workflow.
@@ -46,6 +48,9 @@ the version in `go.mod`; during local multi-repo development, use the
 - Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
   advisory telemetry only. They are sanitized and clamped server-side and must
   not be used for authorization or policy decisions.
+- MachineProfile cost/vendor/renewal data is server-only and is never sent to
+  agents. Console/detail links are encrypted at rest and list APIs return only
+  `has_console_url` / `has_detail_url` booleans.
 - API failures use a structured JSON envelope:
   `{"error":{"code":"unauthorized","message":"invalid credentials","request_id":"req_..."}}`.
   Every HTTP response includes `X-Lattice-Request-ID`; error envelopes carry the

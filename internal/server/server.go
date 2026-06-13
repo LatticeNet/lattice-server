@@ -61,7 +61,12 @@ type Options struct {
 	// host, no trailing slash), used to build the OIDC redirect URL. Required
 	// for SSO login; empty disables the OIDC start/callback flow.
 	PublicURL string
-	Logger    *log.Logger
+	// RenewalReminderInterval controls the machine-renewal reminder scheduler.
+	// Zero uses the production default. DisableRenewalScheduler is intended for
+	// tests that need full control over reminder evaluation.
+	RenewalReminderInterval time.Duration
+	DisableRenewalScheduler bool
+	Logger                  *log.Logger
 }
 
 type Server struct {
@@ -102,6 +107,8 @@ type Server struct {
 	oidc *oidc.Manager
 	// publicURL is the external base URL used to build the OIDC redirect URI.
 	publicURL string
+	// reminderInterval is the coarse scheduler tick for machine renewal checks.
+	reminderInterval time.Duration
 }
 
 const (
@@ -158,11 +165,15 @@ func New(opts Options) (*Server, error) {
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
-		oidc:          oidc.NewManager(),
-		publicURL:     strings.TrimRight(opts.PublicURL, "/"),
-		pluginTrust:   opts.PluginTrust,
-		now:           func() time.Time { return time.Now().UTC() },
-		userLoginFail: make(map[string]*loginFailBucket),
+		oidc:             oidc.NewManager(),
+		publicURL:        strings.TrimRight(opts.PublicURL, "/"),
+		pluginTrust:      opts.PluginTrust,
+		reminderInterval: opts.RenewalReminderInterval,
+		now:              func() time.Time { return time.Now().UTC() },
+		userLoginFail:    make(map[string]*loginFailBucket),
+	}
+	if s.reminderInterval <= 0 {
+		s.reminderInterval = time.Hour
 	}
 	s.emitNotify = s.notifyEvent
 	s.pluginRuntime = plugin.NewRuntimeManager(s.pluginHostServices())
@@ -170,6 +181,9 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s.loadPlugins(opts.PluginDir, opts.PluginTrust)
+	if !opts.DisableRenewalScheduler {
+		s.startRenewalScheduler()
+	}
 	return s, nil
 }
 
@@ -505,6 +519,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/ddns", s.withAuth("ddns:admin", s.handleDDNS))
 	mux.HandleFunc("/api/ddns/delete", s.withAuth("ddns:admin", s.handleDeleteDDNS))
 	mux.HandleFunc("/api/ddns/run", s.withAuth("ddns:admin", s.handleRunDDNS))
+	mux.HandleFunc("/api/machines", s.withAuth("", s.handleMachines))
+	mux.HandleFunc("/api/machines/update", s.withAuth("inventory:admin", s.handleMachineUpdate))
+	mux.HandleFunc("/api/machines/delete", s.withAuth("inventory:admin", s.handleDeleteMachine))
+	mux.HandleFunc("/api/machines/renew", s.withAuth("inventory:admin", s.handleMachineRenew))
+	mux.HandleFunc("/api/machines/reminders/run", s.withAuth("inventory:admin", s.handleMachineRemindersRun))
 	mux.HandleFunc("/api/monitors", s.withAuth("monitor:read", s.handleMonitors))
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))

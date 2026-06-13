@@ -27,27 +27,28 @@ const maxSessions = 4096
 const maxMonitorResults = 500
 
 type State struct {
-	Users          map[string]model.User               `json:"users"`
-	Tokens         map[string]model.Token              `json:"tokens"`
-	Nodes          map[string]model.Node               `json:"nodes"`
-	Tasks          map[string]model.Task               `json:"tasks"`
-	Results        []model.TaskResult                  `json:"results"`
-	Audit          []model.AuditEvent                  `json:"audit"`
-	KV             map[string]model.KVEntry            `json:"kv"`
-	Static         map[string]model.StaticObject       `json:"static"`
-	Workers        map[string]model.WorkerScript       `json:"workers"`
-	Plugins        map[string]model.PluginInstallation `json:"plugins"`
-	Approvals      map[string]model.Approval           `json:"approvals"`
-	Sessions       map[string]auth.Session             `json:"sessions"`
-	DDNS           map[string]model.DDNSProfile        `json:"ddns"`
-	Monitors       map[string]model.Monitor            `json:"monitors"`
-	MonResults     map[string][]model.MonitorResult    `json:"monitor_results"`
-	NotifyChannels map[string]model.NotifyChannel      `json:"notify_channels"`
-	Tunnels        map[string]model.TunnelProfile      `json:"tunnels"`
-	TOTPChallenges map[string]auth.TOTPChallenge       `json:"totp_challenges"`
-	OIDCProviders  map[string]model.OIDCProvider       `json:"oidc_providers"`
-	OIDCIdentities map[string]model.OIDCIdentity       `json:"oidc_identities"`
-	OIDCAuthStates map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
+	Users           map[string]model.User               `json:"users"`
+	Tokens          map[string]model.Token              `json:"tokens"`
+	Nodes           map[string]model.Node               `json:"nodes"`
+	Tasks           map[string]model.Task               `json:"tasks"`
+	Results         []model.TaskResult                  `json:"results"`
+	Audit           []model.AuditEvent                  `json:"audit"`
+	KV              map[string]model.KVEntry            `json:"kv"`
+	Static          map[string]model.StaticObject       `json:"static"`
+	Workers         map[string]model.WorkerScript       `json:"workers"`
+	Plugins         map[string]model.PluginInstallation `json:"plugins"`
+	Approvals       map[string]model.Approval           `json:"approvals"`
+	Sessions        map[string]auth.Session             `json:"sessions"`
+	DDNS            map[string]model.DDNSProfile        `json:"ddns"`
+	Monitors        map[string]model.Monitor            `json:"monitors"`
+	MonResults      map[string][]model.MonitorResult    `json:"monitor_results"`
+	NotifyChannels  map[string]model.NotifyChannel      `json:"notify_channels"`
+	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
+	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
+	TOTPChallenges  map[string]auth.TOTPChallenge       `json:"totp_challenges"`
+	OIDCProviders   map[string]model.OIDCProvider       `json:"oidc_providers"`
+	OIDCIdentities  map[string]model.OIDCIdentity       `json:"oidc_identities"`
+	OIDCAuthStates  map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
 }
 
 type Store struct {
@@ -117,25 +118,26 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 
 func emptyState() State {
 	return State{
-		Users:          map[string]model.User{},
-		Tokens:         map[string]model.Token{},
-		Nodes:          map[string]model.Node{},
-		Tasks:          map[string]model.Task{},
-		KV:             map[string]model.KVEntry{},
-		Static:         map[string]model.StaticObject{},
-		Workers:        map[string]model.WorkerScript{},
-		Plugins:        map[string]model.PluginInstallation{},
-		Approvals:      map[string]model.Approval{},
-		Sessions:       map[string]auth.Session{},
-		DDNS:           map[string]model.DDNSProfile{},
-		Monitors:       map[string]model.Monitor{},
-		MonResults:     map[string][]model.MonitorResult{},
-		NotifyChannels: map[string]model.NotifyChannel{},
-		Tunnels:        map[string]model.TunnelProfile{},
-		TOTPChallenges: map[string]auth.TOTPChallenge{},
-		OIDCProviders:  map[string]model.OIDCProvider{},
-		OIDCIdentities: map[string]model.OIDCIdentity{},
-		OIDCAuthStates: map[string]auth.OIDCAuthState{},
+		Users:           map[string]model.User{},
+		Tokens:          map[string]model.Token{},
+		Nodes:           map[string]model.Node{},
+		Tasks:           map[string]model.Task{},
+		KV:              map[string]model.KVEntry{},
+		Static:          map[string]model.StaticObject{},
+		Workers:         map[string]model.WorkerScript{},
+		Plugins:         map[string]model.PluginInstallation{},
+		Approvals:       map[string]model.Approval{},
+		Sessions:        map[string]auth.Session{},
+		DDNS:            map[string]model.DDNSProfile{},
+		Monitors:        map[string]model.Monitor{},
+		MonResults:      map[string][]model.MonitorResult{},
+		NotifyChannels:  map[string]model.NotifyChannel{},
+		Tunnels:         map[string]model.TunnelProfile{},
+		MachineProfiles: map[string]model.MachineProfile{},
+		TOTPChallenges:  map[string]auth.TOTPChallenge{},
+		OIDCProviders:   map[string]model.OIDCProvider{},
+		OIDCIdentities:  map[string]model.OIDCIdentity{},
+		OIDCAuthStates:  map[string]auth.OIDCAuthState{},
 	}
 }
 
@@ -184,6 +186,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.Tunnels == nil {
 		st.Tunnels = map[string]model.TunnelProfile{}
+	}
+	if st.MachineProfiles == nil {
+		st.MachineProfiles = map[string]model.MachineProfile{}
 	}
 	if st.TOTPChallenges == nil {
 		st.TOTPChallenges = map[string]auth.TOTPChallenge{}
@@ -1036,6 +1041,62 @@ func (s *Store) DeleteDDNSProfile(id string) error {
 		return nil
 	}
 	delete(s.state.DDNS, id)
+	return s.Save()
+}
+
+// UpsertMachineProfile creates or updates operator-authored machine metadata.
+func (s *Store) UpsertMachineProfile(p model.MachineProfile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p.UpdatedAt = time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	s.state.MachineProfiles[p.ID] = p
+	return s.Save()
+}
+
+// MachineProfile returns a profile by id.
+func (s *Store) MachineProfile(id string) (model.MachineProfile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.state.MachineProfiles[id]
+	return p, ok
+}
+
+// MachineProfileForNode returns the profile bound to a node, enforcing the v1
+// one-profile-per-node invariant at the API layer.
+func (s *Store) MachineProfileForNode(nodeID string) (model.MachineProfile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.state.MachineProfiles {
+		if p.NodeID == nodeID {
+			return p, true
+		}
+	}
+	return model.MachineProfile{}, false
+}
+
+// MachineProfiles returns all profiles sorted by creation time.
+func (s *Store) MachineProfiles() []model.MachineProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.MachineProfile, 0, len(s.state.MachineProfiles))
+	for _, p := range s.state.MachineProfiles {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// DeleteMachineProfile removes a machine profile.
+func (s *Store) DeleteMachineProfile(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.MachineProfiles[id]; !ok {
+		return nil
+	}
+	delete(s.state.MachineProfiles, id)
 	return s.Save()
 }
 

@@ -993,6 +993,16 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid or expired challenge"))
 		return
 	}
+	// If this challenge was issued by the SSO→2FA continuation it carries a
+	// browser-binding cookie; require it to match the submitted challenge id so
+	// only the browser that completed SSO can finish the second factor. Absent
+	// cookie = the password→2FA path, which is unaffected. [C14]
+	if c, err := r.Cookie(totpChallengeCookie); err == nil && c.Value != "" {
+		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(req.ChallengeID)) != 1 {
+			writeError(w, http.StatusUnauthorized, errors.New("invalid or expired challenge"))
+			return
+		}
+	}
 	user, ok := s.store.User(challenge.UserID)
 	if !ok || !user.TOTPEnabled {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid or expired challenge"))
@@ -1051,6 +1061,7 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 	if usedRecovery {
 		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.totp.recovery_used", Decision: "allow"})
 	}
+	s.clearTOTPChallengeCookie(w)
 	s.issueSession(w, r, user)
 }
 
@@ -1940,7 +1951,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 				visible = append(visible, mon)
 			}
 		}
-		writeJSON(w, http.StatusOK, visible)
+		writeJSON(w, http.StatusOK, toMonitorViews(visible))
 	case http.MethodPost:
 		if !rbac.Allows(p.Principal, "monitor:admin", "") {
 			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "missing monitor:admin"))
@@ -2639,7 +2650,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 			visible = append(visible, approval)
 		}
 	}
-	writeJSON(w, http.StatusOK, visible)
+	writeJSON(w, http.StatusOK, toApprovalViews(visible))
 }
 
 func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p principal) {
@@ -2652,7 +2663,7 @@ func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p princip
 				visible = append(visible, tun)
 			}
 		}
-		writeJSON(w, http.StatusOK, visible)
+		writeJSON(w, http.StatusOK, toTunnelViews(visible))
 	case http.MethodPost:
 		var req model.TunnelProfile
 		if !decodeJSON(w, r, &req) {
@@ -2894,7 +2905,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		}
 	}
 	if approval.Status != model.ApprovalPending {
-		writeJSON(w, http.StatusOK, approval)
+		writeJSON(w, http.StatusOK, toApprovalView(approval))
 		return
 	}
 	approval.Status = model.ApprovalApproved
@@ -2922,7 +2933,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		}
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
-	writeJSON(w, http.StatusOK, approval)
+	writeJSON(w, http.StatusOK, toApprovalView(approval))
 }
 
 func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
@@ -3336,6 +3347,14 @@ func errInvalidBody() error {
 	return apiError(model.APIErrorBadRequest, "invalid request body")
 }
 
+// decodeJSON decodes a request body (1 MiB cap) leniently: unknown fields are
+// tolerated. This is deliberate for forward compatibility — agent endpoints in
+// particular must accept a body from a newer agent that carries a field an
+// older server does not yet know (proven by
+// TestAgentPostEndpointsRejectBodyTokenWithoutBearer, which would otherwise turn
+// a 401 into a 400). Operator handlers that want strict rejection of unknown /
+// trailing fields opt in via decodeLimitedJSON. Malformed bodies return a
+// generic message (no raw decoder internals). [C9; C10 deliberately scoped]
 func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 	defer r.Body.Close()
 	body := io.LimitReader(r.Body, 1<<20)

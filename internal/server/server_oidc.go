@@ -123,6 +123,34 @@ func (s *Server) clearOIDCBindingCookie(w http.ResponseWriter) {
 	})
 }
 
+// totpChallengeCookie binds a post-SSO TOTP challenge to the initiating browser.
+// handleLoginTOTP requires it to match the submitted challenge id when present.
+const totpChallengeCookie = "lattice_totp_challenge"
+
+func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, challengeID string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     totpChallengeCookie,
+		Value:    challengeID,
+		Path:     "/api/login/totp",
+		HttpOnly: true,
+		Secure:   s.secureCookies,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   300,
+	})
+}
+
+func (s *Server) clearTOTPChallengeCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     totpChallengeCookie,
+		Value:    "",
+		Path:     "/api/login/totp",
+		HttpOnly: true,
+		Secure:   s.secureCookies,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
 // handleOIDCCallback completes the login: validates and consumes the state,
 // exchanges the code (PKCE), verifies the ID token, maps the identity to a local
 // user, and starts a session. All failures redirect back to the login page with
@@ -224,6 +252,12 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.oidc.totp_required", Decision: "observe"})
+		// Bind the post-SSO TOTP challenge to THIS browser: the challenge id also
+		// travels in the front-channel redirect (?totp_challenge=), which an
+		// attacker who only sees the URL could replay. The cookie is the secret
+		// the attacker does not have; handleLoginTOTP requires it to match when
+		// present, so only the browser that completed SSO can finish 2FA. [C14]
+		s.setTOTPChallengeCookie(w, challenge.ID)
 		s.oidcRedirect(w, r, st.RedirectAfter, "totp_challenge", challenge.ID)
 		return
 	}

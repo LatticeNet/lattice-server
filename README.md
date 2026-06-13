@@ -121,7 +121,8 @@ the version in `go.mod`; during local multi-repo development, use the
   and export the full `State`, stores each top-level collection in its own
   bucket, reuses the existing AES-256-GCM secret encryption boundary, and now
   has record-level APIs for nodes, KV entries, audit events, static objects,
-  Worker scripts, plugin lifecycle records, and approvals.
+  Worker scripts, plugin lifecycle records, approvals, tasks, task results,
+  monitors, monitor results, and tunnels.
 - The local ops CLI can migrate the encrypted JSON file to bbolt and export
   bbolt back to encrypted JSON:
 
@@ -140,9 +141,9 @@ the version in `go.mod`; during local multi-repo development, use the
   will not generate a new key during migration. If the key is not under the JSON
   state directory as `master.key`, pass `-master-key-file` or set
   `LATTICE_MASTER_KEY_FILE`.
-- bbolt is not the default runtime store yet. The next storage slices need more
-  record-level coverage, backup/restore workflow depth, and an explicit startup
-  switch before the server path moves off JSON.
+- bbolt is not the default runtime store yet. The next storage slices need
+  secret-bearing bucket coverage, backup/restore workflow depth, and an explicit
+  startup switch before the server path moves off JSON.
 
 Example plugin trust policy JSON:
 

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/secret"
 	bolt "go.etcd.io/bbolt"
 )
@@ -655,6 +656,369 @@ func (bs *BoltStateStore) Approvals() ([]model.Approval, error) {
 	return approvals, nil
 }
 
+func (bs *BoltStateStore) CreateTask(t model.Task) error {
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now().UTC()
+	}
+	if t.Status == "" {
+		t.Status = model.TaskQueued
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketTasks, t.ID, t)
+	})
+}
+
+func (bs *BoltStateStore) Task(id string) (model.Task, bool, error) {
+	var out model.Task
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketTasks, id, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) Tasks() ([]model.Task, error) {
+	tasks := []model.Task{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		tasks, err = listMapValues[model.Task](tx, boltBucketTasks)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].CreatedAt.After(tasks[j].CreatedAt) })
+	return tasks, nil
+}
+
+func (bs *BoltStateStore) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
+	if limit <= 0 {
+		return []model.Task{}, nil
+	}
+	out := []model.Task{}
+	err := bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		tasks, err := listMapValues[model.Task](tx, boltBucketTasks)
+		if err != nil {
+			return err
+		}
+		sort.Slice(tasks, func(i, j int) bool {
+			if tasks[i].CreatedAt.Equal(tasks[j].CreatedAt) {
+				return tasks[i].ID < tasks[j].ID
+			}
+			return tasks[i].CreatedAt.Before(tasks[j].CreatedAt)
+		})
+		now := time.Now().UTC()
+		for _, t := range tasks {
+			if len(out) >= limit {
+				break
+			}
+			if t.Status != model.TaskQueued || !contains(t.Targets, nodeID) {
+				continue
+			}
+			t.Status = model.TaskLeased
+			t.LeasedBy = nodeID
+			if t.LeaseID == "" {
+				leaseSecret, err := auth.NewRandomToken(24)
+				if err != nil {
+					return err
+				}
+				t.LeaseID = "lease_" + leaseSecret
+			}
+			t.StartedAt = now
+			if err := putRecord(tx, boltBucketTasks, t.ID, t); err != nil {
+				return err
+			}
+			out = append(out, t)
+		}
+		return nil
+	})
+	return out, err
+}
+
+func (bs *BoltStateStore) AddTaskResult(r model.TaskResult) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		b := tx.Bucket(boltBucketResults)
+		if b == nil {
+			return fmt.Errorf("missing bucket %q", string(boltBucketResults))
+		}
+		next, err := nextSequenceIndex(boltBucketResults, b)
+		if err != nil {
+			return err
+		}
+		data, err := json.Marshal(r)
+		if err != nil {
+			return fmt.Errorf("marshal %s[%d]: %w", boltBucketResults, next, err)
+		}
+		if err := b.Put(sequenceKey(next), data); err != nil {
+			return fmt.Errorf("put %s[%d]: %w", boltBucketResults, next, err)
+		}
+		var t model.Task
+		ok, err := getRecord(tx, boltBucketTasks, r.TaskID, &t)
+		if err != nil {
+			return err
+		}
+		if ok {
+			if r.Error != "" || r.ExitCode != 0 {
+				t.Status = model.TaskFailed
+			} else {
+				t.Status = model.TaskFinished
+			}
+			t.FinishedAt = r.FinishedAt
+			if err := putRecord(tx, boltBucketTasks, t.ID, t); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (bs *BoltStateStore) Results() ([]model.TaskResult, error) {
+	results := []model.TaskResult{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return readSlice(tx, boltBucketResults, &results)
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].FinishedAt.After(results[j].FinishedAt) })
+	return results, nil
+}
+
+func (bs *BoltStateStore) UpsertMonitor(m model.Monitor) error {
+	m.UpdatedAt = time.Now().UTC()
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = m.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketMonitors, m.ID, m)
+	})
+}
+
+func (bs *BoltStateStore) Monitor(id string) (model.Monitor, bool, error) {
+	var out model.Monitor
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketMonitors, id, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) Monitors() ([]model.Monitor, error) {
+	monitors := []model.Monitor{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		monitors, err = listMapValues[model.Monitor](tx, boltBucketMonitors)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(monitors, func(i, j int) bool { return monitors[i].CreatedAt.Before(monitors[j].CreatedAt) })
+	return monitors, nil
+}
+
+func (bs *BoltStateStore) MonitorsForNode(nodeID string) ([]model.Monitor, error) {
+	monitors := []model.Monitor{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.Monitor](tx, boltBucketMonitors)
+		if err != nil {
+			return err
+		}
+		for _, m := range all {
+			if !m.Enabled {
+				continue
+			}
+			if m.AssignAll || contains(m.NodeIDs, nodeID) {
+				monitors = append(monitors, m)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(monitors, func(i, j int) bool { return monitors[i].ID < monitors[j].ID })
+	return monitors, nil
+}
+
+func (bs *BoltStateStore) DeleteMonitor(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var m model.Monitor
+		ok, err := getRecord(tx, boltBucketMonitors, id, &m)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return nil
+		}
+		if err := deleteRecord(tx, boltBucketMonitors, id); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketMonResults, id)
+	})
+}
+
+func (bs *BoltStateStore) AddMonitorResult(r model.MonitorResult) error {
+	if r.At.IsZero() {
+		r.At = time.Now().UTC()
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		series := []model.MonitorResult{}
+		ok, err := getRecord(tx, boltBucketMonResults, r.MonitorID, &series)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			series = []model.MonitorResult{}
+		}
+		series = append(series, r)
+		if len(series) > maxMonitorResults {
+			series = series[len(series)-maxMonitorResults:]
+		}
+		return putRecord(tx, boltBucketMonResults, r.MonitorID, series)
+	})
+}
+
+func (bs *BoltStateStore) MonitorResults(monitorID string) ([]model.MonitorResult, error) {
+	series := []model.MonitorResult{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		ok, err := getRecord(tx, boltBucketMonResults, monitorID, &series)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			series = []model.MonitorResult{}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return append([]model.MonitorResult(nil), series...), nil
+}
+
+func (bs *BoltStateStore) LastMonitorResultForNode(monitorID, nodeID string) (model.MonitorResult, bool, error) {
+	var series []model.MonitorResult
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		ok, err := getRecord(tx, boltBucketMonResults, monitorID, &series)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			series = nil
+		}
+		return nil
+	})
+	if err != nil {
+		return model.MonitorResult{}, false, err
+	}
+	for i := len(series) - 1; i >= 0; i-- {
+		if series[i].NodeID == nodeID {
+			return series[i], true, nil
+		}
+	}
+	return model.MonitorResult{}, false, nil
+}
+
+func (bs *BoltStateStore) UpsertTunnel(t model.TunnelProfile) error {
+	t.UpdatedAt = time.Now().UTC()
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = t.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketTunnels, t.ID, t)
+	})
+}
+
+func (bs *BoltStateStore) Tunnel(id string) (model.TunnelProfile, bool, error) {
+	var out model.TunnelProfile
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketTunnels, id, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) Tunnels() ([]model.TunnelProfile, error) {
+	tunnels := []model.TunnelProfile{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		tunnels, err = listMapValues[model.TunnelProfile](tx, boltBucketTunnels)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(tunnels, func(i, j int) bool { return tunnels[i].CreatedAt.Before(tunnels[j].CreatedAt) })
+	return tunnels, nil
+}
+
+func (bs *BoltStateStore) DeleteTunnel(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketTunnels, id)
+	})
+}
+
 func putRecord[T any](tx *bolt.Tx, bucket []byte, key string, value T) error {
 	b := tx.Bucket(bucket)
 	if b == nil {
@@ -691,6 +1055,18 @@ func getRecord[T any](tx *bolt.Tx, bucket []byte, key string, out *T) (bool, err
 		return false, fmt.Errorf("decode %s[%q]: %w", bucket, key, err)
 	}
 	return true, nil
+}
+
+func deleteRecord(tx *bolt.Tx, bucket []byte, key string) error {
+	b := tx.Bucket(bucket)
+	if b == nil {
+		return nil
+	}
+	k, err := boltStringKey(key)
+	if err != nil {
+		return err
+	}
+	return b.Delete(k)
 }
 
 func listMapValues[T any](tx *bolt.Tx, bucket []byte) ([]T, error) {

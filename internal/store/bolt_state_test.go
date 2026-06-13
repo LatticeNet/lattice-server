@@ -359,3 +359,267 @@ func TestBoltStateRecordLevelStaticWorkerPluginAndApproval(t *testing.T) {
 		t.Fatalf("record-level static/plugin/approval writes did not persist: static=%+v plugins=%+v approvals=%+v", static, plugins, approvals)
 	}
 }
+
+func TestBoltStateRecordLevelTaskLifecycleAndResults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	c := testCipher(t)
+	now := time.Unix(1_700_000_400, 0).UTC()
+	st := emptyState()
+	st.KV["cfg/keep"] = model.KVEntry{Bucket: "cfg", Key: "keep", Value: "me", UpdatedAt: now}
+
+	bs, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.ImportState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bs.CreateTask(model.Task{ID: "task-old", Targets: []string{"n1"}, Interpreter: "sh", Script: "echo old", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.CreateTask(model.Task{ID: "task-new", Targets: []string{"n1"}, Interpreter: "sh", Script: "echo new", CreatedAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.CreateTask(model.Task{ID: "task-other", Targets: []string{"n2"}, Interpreter: "sh", Script: "echo other", CreatedAt: now.Add(2 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.CreateTask(model.Task{ID: "task-auto", Targets: []string{"n3"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	auto, ok, err := bs.Task("task-auto")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || auto.Status != model.TaskQueued || auto.CreatedAt.IsZero() {
+		t.Fatalf("task defaults not applied: ok=%v task=%+v", ok, auto)
+	}
+
+	tasks, err := bs.Tasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 4 || tasks[len(tasks)-1].ID != "task-old" || tasks[len(tasks)-2].ID != "task-new" {
+		t.Fatalf("tasks not sorted newest-first: %+v", tasks)
+	}
+
+	leased, err := bs.LeaseTasks("n1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leased) != 1 || leased[0].ID != "task-old" || leased[0].Status != model.TaskLeased || leased[0].LeasedBy != "n1" || !strings.HasPrefix(leased[0].LeaseID, "lease_") || leased[0].StartedAt.IsZero() {
+		t.Fatalf("oldest matching task was not leased correctly: %+v", leased)
+	}
+	again, err := bs.LeaseTasks("n1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].ID != "task-new" {
+		t.Fatalf("leased task should not be leased again, next queued task should lease: %+v", again)
+	}
+	none, err := bs.LeaseTasks("missing-node", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("unexpected leases for missing node: %+v", none)
+	}
+
+	if err := bs.AddTaskResult(model.TaskResult{TaskID: "task-old", LeaseID: leased[0].LeaseID, NodeID: "n1", ExitCode: 0, Stdout: "ok", FinishedAt: now.Add(3 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.AddTaskResult(model.TaskResult{TaskID: "task-new", LeaseID: again[0].LeaseID, NodeID: "n1", ExitCode: 2, Stderr: "bad", FinishedAt: now.Add(4 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	oldTask, ok, err := bs.Task("task-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || oldTask.Status != model.TaskFinished || !oldTask.FinishedAt.Equal(now.Add(3*time.Minute)) {
+		t.Fatalf("successful result did not finish task: ok=%v task=%+v", ok, oldTask)
+	}
+	newTask, ok, err := bs.Task("task-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || newTask.Status != model.TaskFailed || !newTask.FinishedAt.Equal(now.Add(4*time.Minute)) {
+		t.Fatalf("failed result did not fail task: ok=%v task=%+v", ok, newTask)
+	}
+	results, err := bs.Results()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 || results[0].TaskID != "task-new" || results[1].TaskID != "task-old" {
+		t.Fatalf("task results not appended/sorted newest-first: %+v", results)
+	}
+	exported, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exported.KV["cfg/keep"].Value != "me" {
+		t.Fatalf("task record-level writes reset unrelated KV bucket: %+v", exported.KV)
+	}
+	if err := bs.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	persistedTask, ok, err := reopened.Task("task-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedResults, err := reopened.Results()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || persistedTask.Status != model.TaskFailed || len(persistedResults) != 2 || persistedResults[0].TaskID != "task-new" {
+		t.Fatalf("task lifecycle did not persist across reopen: ok=%v task=%+v results=%+v", ok, persistedTask, persistedResults)
+	}
+}
+
+func TestBoltStateRecordLevelMonitorResultsAndTunnels(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	c := testCipher(t)
+	now := time.Unix(1_700_000_500, 0).UTC()
+	st := emptyState()
+	st.Nodes["n1"] = model.Node{ID: "n1", Name: "keep me", CreatedAt: now}
+
+	bs, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.ImportState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bs.UpsertMonitor(model.Monitor{ID: "m-z", Name: "node tcp", Type: model.MonitorTypeTCP, Target: "10.0.0.1:443", NodeIDs: []string{"n1"}, Enabled: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertMonitor(model.Monitor{ID: "m-a", Name: "all http", Type: model.MonitorTypeHTTP, Target: "https://example.com", AssignAll: true, Enabled: true, CreatedAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertMonitor(model.Monitor{ID: "m-b", Name: "disabled", Type: model.MonitorTypeTCP, Target: "10.0.0.2:22", NodeIDs: []string{"n1"}, Enabled: false, CreatedAt: now.Add(2 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+
+	monitor, ok, err := bs.Monitor("m-z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || monitor.Name != "node tcp" || monitor.UpdatedAt.IsZero() {
+		t.Fatalf("monitor not recovered/timestamped: ok=%v monitor=%+v", ok, monitor)
+	}
+	monitors, err := bs.Monitors()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(monitors) != 3 || monitors[0].ID != "m-z" || monitors[1].ID != "m-a" || monitors[2].ID != "m-b" {
+		t.Fatalf("monitors not sorted oldest-first: %+v", monitors)
+	}
+	assigned, err := bs.MonitorsForNode("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assigned) != 2 || assigned[0].ID != "m-a" || assigned[1].ID != "m-z" {
+		t.Fatalf("assigned monitors not filtered/sorted by id: %+v", assigned)
+	}
+
+	for i := 0; i < maxMonitorResults+3; i++ {
+		nodeID := "n1"
+		if i == maxMonitorResults+2 {
+			nodeID = "n2"
+		}
+		if err := bs.AddMonitorResult(model.MonitorResult{MonitorID: "m-z", NodeID: nodeID, At: now.Add(time.Duration(i) * time.Second), Success: i%2 == 0, LatencyMs: float64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	series, err := bs.MonitorResults("m-z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != maxMonitorResults || series[0].LatencyMs != 3 || series[len(series)-1].LatencyMs != float64(maxMonitorResults+2) {
+		t.Fatalf("monitor result cap/order not preserved: len=%d first=%+v last=%+v", len(series), series[0], series[len(series)-1])
+	}
+	lastN1, ok, err := bs.LastMonitorResultForNode("m-z", "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || lastN1.LatencyMs != float64(maxMonitorResults+1) {
+		t.Fatalf("latest monitor result for node not found: ok=%v result=%+v", ok, lastN1)
+	}
+
+	if err := bs.UpsertTunnel(model.TunnelProfile{ID: "tun-old", Name: "old", NodeID: "n1", TunnelID: "cf-old", CredentialsFile: "/etc/cloudflared/old.json", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertTunnel(model.TunnelProfile{ID: "tun-new", Name: "new", NodeID: "n1", TunnelID: "cf-new", Ingress: []model.TunnelIngress{{Hostname: "app.example.com", Service: "http://localhost:8080"}}, CreatedAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	tunnel, ok, err := bs.Tunnel("tun-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || tunnel.CredentialsFile != "/etc/cloudflared/old.json" || tunnel.UpdatedAt.IsZero() {
+		t.Fatalf("tunnel not recovered/timestamped: ok=%v tunnel=%+v", ok, tunnel)
+	}
+	tunnels, err := bs.Tunnels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tunnels) != 2 || tunnels[0].ID != "tun-old" || tunnels[1].ID != "tun-new" {
+		t.Fatalf("tunnels not sorted oldest-first: %+v", tunnels)
+	}
+	if err := bs.DeleteTunnel("tun-old"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := bs.Tunnel("tun-old"); err != nil || ok {
+		t.Fatalf("tunnel delete failed: ok=%v err=%v", ok, err)
+	}
+
+	if err := bs.DeleteMonitor("m-z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := bs.Monitor("m-z"); err != nil || ok {
+		t.Fatalf("monitor delete failed: ok=%v err=%v", ok, err)
+	}
+	series, err = bs.MonitorResults("m-z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 0 {
+		t.Fatalf("monitor delete should remove result history: %+v", series)
+	}
+	exported, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exported.Nodes["n1"].Name != "keep me" {
+		t.Fatalf("monitor/tunnel writes reset unrelated node bucket: %+v", exported.Nodes)
+	}
+	if err := bs.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	tunnels, err = reopened.Tunnels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	monitors, err = reopened.Monitors()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tunnels) != 1 || tunnels[0].ID != "tun-new" || len(monitors) != 2 {
+		t.Fatalf("monitor/tunnel lifecycle did not persist across reopen: tunnels=%+v monitors=%+v", tunnels, monitors)
+	}
+}

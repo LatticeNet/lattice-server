@@ -165,20 +165,26 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 		err := runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message})
 		cancel()
 		if err != nil {
-				m.mu.Lock()
-				defer m.mu.Unlock()
-				inst, ok = m.instances[pluginID]
-				if ok && generation != 0 && inst.generation != generation {
-					return inst.status, nil
-				}
-				if !ok {
-					m.nextGen++
-					inst = runtimeInstance{generation: m.nextGen, status: RuntimeStatus{PluginID: pluginID, StartedAt: now}}
-				}
-				inst.status.PluginID = pluginID
-				inst.status.State = RuntimeStateFailed
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			inst, ok = m.instances[pluginID]
+			if ok && generation != 0 && inst.generation != generation {
+				return inst.status, nil
+			}
+			if !ok {
+				m.nextGen++
+				inst = runtimeInstance{generation: m.nextGen, status: RuntimeStatus{PluginID: pluginID, StartedAt: now}}
+			}
+			inst.status.PluginID = pluginID
+			inst.status.State = RuntimeStateFailed
 			inst.status.Message = err.Error()
 			inst.status.UpdatedAt = now
+			// A plugin being disabled is no longer trusted with host access,
+			// regardless of whether its Stop hook succeeded. Detach the broker and
+			// runner here just as the success path does, so a failed Stop cannot
+			// leave host-API access armed for a plugin we have decided to stop.
+			inst.broker = nil
+			inst.runner = nil
 			m.instances[pluginID] = inst
 			return inst.status, err
 		}

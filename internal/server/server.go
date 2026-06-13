@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -72,6 +74,19 @@ type Server struct {
 	totpLimiter   *ratelimit.Limiter
 	agentLimiter  *ratelimit.Limiter
 	apiLimiter    *ratelimit.Limiter
+	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
+	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
+	// who already targets a known account cannot widen the password-guess budget by
+	// rotating source IPs. Only failures consume budget; once exhausted the account
+	// is locked out (even a correct password is rejected) until it refills. It is a
+	// leaky token bucket guarded by its own mutex so it never charges successful
+	// logins (which would erode a legitimate operator's budget).
+	userLoginFailMu sync.Mutex
+	userLoginFail   map[string]*loginFailBucket
+	// now is an injectable clock (defaults to time.Now). Used for TOTP
+	// verification and the per-user login brake so tests can advance time and
+	// exercise replay/lockout protection deterministically.
+	now func() time.Time
 	// ddnsProvider builds a DNS provider from a profile; overridable in tests.
 	ddnsProvider func(model.DDNSProfile) (ddns.Provider, error)
 	// emitNotify dispatches an event notification; overridable in tests.
@@ -143,9 +158,11 @@ func New(opts Options) (*Server, error) {
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
-		oidc:        oidc.NewManager(),
-		publicURL:   strings.TrimRight(opts.PublicURL, "/"),
-		pluginTrust: opts.PluginTrust,
+		oidc:          oidc.NewManager(),
+		publicURL:     strings.TrimRight(opts.PublicURL, "/"),
+		pluginTrust:   opts.PluginTrust,
+		now:           func() time.Time { return time.Now().UTC() },
+		userLoginFail: make(map[string]*loginFailBucket),
 	}
 	s.emitNotify = s.notifyEvent
 	s.pluginRuntime = plugin.NewRuntimeManager(s.pluginHostServices())
@@ -600,7 +617,10 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 			return
 		}
 		if !p.viaBearer && unsafeMethod(r.Method) {
-			if r.Header.Get("X-Lattice-CSRF") != p.CSRFToken {
+			// Constant-time compare so a network attacker cannot recover the CSRF
+			// token byte-by-byte via response timing. ConstantTimeCompare returns 0
+			// on any length mismatch, so an empty or wrong-length header is rejected.
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Lattice-CSRF")), []byte(p.CSRFToken)) != 1 {
 				writeError(w, http.StatusForbidden, errors.New("invalid csrf token"))
 				return
 			}
@@ -747,6 +767,12 @@ func (s *Server) principalFromRequest(r *http.Request) (principal, error) {
 	if !ok {
 		return principal{}, errors.New("user not found")
 	}
+	// Fail closed on a stale session: if the user's security epoch advanced after
+	// this session was minted (2FA disable, password change, admin revoke), the
+	// session is no longer trustworthy. Treat it as unauthenticated.
+	if session.Epoch < user.SecurityEpoch {
+		return principal{}, errors.New("session expired")
+	}
 	return principal{
 		Principal: rbac.Principal{
 			ActorID: user.ID,
@@ -777,12 +803,33 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	user, ok := s.store.UserByUsername(req.Username)
 	if !ok {
 		// Spend comparable CPU so response time does not reveal whether the
-		// username exists.
+		// username exists. The per-user brake below is deliberately NOT consulted
+		// here: doing so would leak account existence (a known account could be
+		// locked out, an unknown one never could) and defeat the timing
+		// equalization.
 		auth.DummyVerify(req.Password)
 		writeError(w, http.StatusUnauthorized, errors.New("invalid credentials"))
 		return
 	}
-	if !auth.VerifySecret(user.PasswordHash, req.Password) {
+	// Always perform the verification work (timing parity with the unknown-user
+	// path) before consulting the per-account brake.
+	passwordOK := auth.VerifySecret(user.PasswordHash, req.Password)
+	// Per-account failure brake (keyed on the resolved user id), mirroring the
+	// per-user 2FA limiter in intent: an attacker who already targets a known
+	// account cannot widen the password-guess budget by rotating source IPs. Only
+	// FAILED attempts consume budget, so a legitimate operator's repeated correct
+	// logins never erode it. Once the per-account budget is exhausted, the account
+	// is locked out and even a correct password is rejected with 429 until the
+	// window refills — a wrong-guess flood cannot be rescued by slipping in the
+	// right password.
+	if s.userLoginLocked(user.ID) {
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "deny", Reason: "per-user login attempt limit exceeded"})
+		writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts; slow down"))
+		return
+	}
+	if !passwordOK {
+		s.recordUserLoginFailure(user.ID)
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "deny", Reason: "invalid credentials"})
 		writeError(w, http.StatusUnauthorized, errors.New("invalid credentials"))
 		return
 	}
@@ -791,6 +838,76 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.issueSession(w, r, user)
+}
+
+const (
+	// userLoginFailBurst is the per-account failed-password budget before lockout.
+	userLoginFailBurst = 5.0
+	// userLoginFailRefill is the sustained refill rate (failures forgiven per
+	// second) — 5 per minute, matching the per-IP login limiter, so a brief flurry
+	// of typos clears quickly while a sustained guessing flood stays locked.
+	userLoginFailRefill = 5.0 / 60.0
+)
+
+// loginFailBucket is a leaky token bucket counting recent FAILED password
+// attempts for one account. failures rises by 1 per failure and leaks back
+// toward zero at userLoginFailRefill; the account is locked while failures would
+// exceed userLoginFailBurst.
+type loginFailBucket struct {
+	failures float64
+	last     time.Time
+}
+
+// userLoginLocked reports whether the account is currently locked out due to too
+// many recent failed password attempts. It is non-consuming: a successful login
+// never erodes the budget, so a legitimate operator is unaffected.
+func (s *Server) userLoginLocked(userID string) bool {
+	now := s.now()
+	s.userLoginFailMu.Lock()
+	defer s.userLoginFailMu.Unlock()
+	b := s.userLoginFail[userID]
+	if b == nil {
+		return false
+	}
+	leakBucketLocked(b, now)
+	if b.failures <= 0 {
+		delete(s.userLoginFail, userID)
+		return false
+	}
+	// Locked once the accumulated failures have reached the burst budget. A
+	// further failure would push strictly past it.
+	return b.failures >= userLoginFailBurst
+}
+
+// recordUserLoginFailure charges one failed password attempt against the account.
+func (s *Server) recordUserLoginFailure(userID string) {
+	now := s.now()
+	s.userLoginFailMu.Lock()
+	defer s.userLoginFailMu.Unlock()
+	b := s.userLoginFail[userID]
+	if b == nil {
+		b = &loginFailBucket{last: now}
+		s.userLoginFail[userID] = b
+	}
+	leakBucketLocked(b, now)
+	b.failures++
+	// Cap so a long flood cannot build an unboundedly long lockout tail.
+	if b.failures > userLoginFailBurst {
+		b.failures = userLoginFailBurst
+	}
+}
+
+// leakBucketLocked drains a bucket toward zero based on elapsed time. Caller holds
+// the mutex.
+func leakBucketLocked(b *loginFailBucket, now time.Time) {
+	elapsed := now.Sub(b.last).Seconds()
+	if elapsed > 0 {
+		b.failures -= elapsed * userLoginFailRefill
+		if b.failures < 0 {
+			b.failures = 0
+		}
+		b.last = now
+	}
 }
 
 const totpIssuer = "Lattice"
@@ -803,6 +920,11 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, user model
 	if err != nil {
 		return auth.Session{}, err
 	}
+	// Stamp the session with the user's current security epoch. A later
+	// privilege-reducing event (2FA disable, password change, admin revoke) bumps
+	// the user's epoch, and principalFromRequest then rejects this now-stale
+	// session, invalidating it without enumerating session ids.
+	session.Epoch = user.SecurityEpoch
 	if err := s.store.PutSession(session); err != nil {
 		return auth.Session{}, err
 	}
@@ -882,8 +1004,21 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	authed, usedRecovery := false, false
-	if req.Code != "" && auth.ValidateTOTP(user.TOTPSecret, req.Code, time.Now().UTC()) {
-		authed = true
+	if req.Code != "" {
+		if step, ok := auth.ValidateTOTPStep(user.TOTPSecret, req.Code, s.now()); ok {
+			// Single-use: the matched step must be strictly newer than the highest
+			// step already accepted for this user. AdvanceTOTPStep performs the
+			// compare-and-set atomically under the store lock, so a replay of the
+			// same code (or a concurrent duplicate submission) is rejected as an
+			// invalid second factor. Recovery codes are handled separately below and
+			// are unaffected.
+			advanced, err := s.store.AdvanceTOTPStep(user.ID, step)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			authed = advanced
+		}
 	} else if req.RecoveryCode != "" {
 		consumed, err := s.store.ConsumeRecoveryCode(user.ID, req.RecoveryCode)
 		if err != nil {
@@ -1151,6 +1286,25 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	}
 	if req.NodeID == "" {
 		req.NodeID = id.New("node")
+	}
+	// withAuth's allowlist check keys on the ?node_id query param, which this POST
+	// does not carry, so a RESTRICTED node:admin token (one with a non-empty
+	// ServerAllowlist) would otherwise short-circuit past confinement and mint an
+	// enroll token for ANY node id. Bind the enrolled node id to the principal's
+	// allowlist explicitly. An unrestricted admin (no allowlist, or "*") is
+	// unaffected. The check covers both an empty (server-generated) id and an
+	// out-of-allowlist client-supplied id.
+	if principalHasNodeRestriction(p) && !rbac.Allows(p.Principal, "node:admin", req.NodeID) {
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "node.enroll",
+			Scope:    "node:admin",
+			NodeID:   req.NodeID,
+			Decision: "deny",
+			Reason:   "node id outside token server allowlist",
+		})
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "node id outside token allowlist"))
+		return
 	}
 	if req.Name == "" {
 		req.Name = req.NodeID

@@ -27,15 +27,27 @@ func TestPluginHostServicesBrokeredKVAndAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := broker.KVPut(ctx, "default/message", []byte("hello")); err != nil {
+	if err := broker.KVPut(ctx, "message", []byte("hello")); err != nil {
 		t.Fatal(err)
 	}
-	got, ok, err := broker.KVGet(ctx, "default/message")
+	got, ok, err := broker.KVGet(ctx, "message")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !ok || string(got) != "hello" {
 		t.Fatalf("unexpected broker KV read: ok=%v got=%q", ok, string(got))
+	}
+
+	// C2: the broker pins the bucket to the plugin's own namespace; the value must
+	// physically live under "plugin:<pluginID>" in the shared operator KV store.
+	foundNamespaced := false
+	for _, entry := range st.KV("plugin:kv-plugin") {
+		if entry.Key == "message" && entry.Value == "hello" {
+			foundNamespaced = true
+		}
+	}
+	if !foundNamespaced {
+		t.Fatalf("plugin value must be stored under its namespaced bucket, got %+v", st.KV("plugin:kv-plugin"))
 	}
 
 	deniedBroker, err := plugin.NewBroker(plugin.Loaded{
@@ -50,10 +62,10 @@ func TestPluginHostServicesBrokeredKVAndAudit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := deniedBroker.KVPut(ctx, "default/message", []byte("denied")); err == nil {
+	if err := deniedBroker.KVPut(ctx, "message", []byte("denied")); err == nil {
 		t.Fatal("expected kv:write denial")
 	}
-	got, ok, err = broker.KVGet(ctx, "default/message")
+	got, ok, err = broker.KVGet(ctx, "message")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +76,60 @@ func TestPluginHostServicesBrokeredKVAndAudit(t *testing.T) {
 	requirePluginHostAudit(t, st, "plugin.host.kv.put", "kv:write", "kv-plugin", "allow", "req-plugin-host")
 	requirePluginHostAudit(t, st, "plugin.host.kv.get", "kv:read", "kv-plugin", "allow", "req-plugin-host")
 	requirePluginHostAudit(t, st, "plugin.host.kv.put", "kv:write", "read-only-plugin", "deny", "req-plugin-host")
+}
+
+func TestPluginHostKVIsolatesPluginsAndRejectsForeignBucket(t *testing.T) {
+	// C2: a plugin must only touch its OWN namespaced keys. Plugin "a" cannot read
+	// a value written by plugin "b" under the same logical key, and the host
+	// rejects any composite key whose bucket is not the plugin namespace.
+	srv, _ := newServerForPluginHost(t)
+	ctx := context.Background()
+
+	newKVBroker := func(id string) *plugin.Broker {
+		b, err := plugin.NewBroker(plugin.Loaded{
+			Manifest: plugin.Manifest{
+				ID:           id,
+				Name:         id,
+				Type:         plugin.TypeSystem,
+				Capabilities: []string{"kv:read", "kv:write"},
+			},
+			Capabilities: []string{"kv:read", "kv:write"},
+		}, srv.pluginHostServices())
+		if err != nil {
+			t.Fatalf("new broker %q: %v", id, err)
+		}
+		return b
+	}
+
+	a := newKVBroker("plugin-a")
+	b := newKVBroker("plugin-b")
+
+	if err := a.KVPut(ctx, "secret", []byte("a-only")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.KVPut(ctx, "secret", []byte("b-only")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each plugin reads back only its own value.
+	got, ok, err := a.KVGet(ctx, "secret")
+	if err != nil || !ok || string(got) != "a-only" {
+		t.Fatalf("plugin-a own round-trip failed: ok=%v got=%q err=%v", ok, string(got), err)
+	}
+	got, ok, err = b.KVGet(ctx, "secret")
+	if err != nil || !ok || string(got) != "b-only" {
+		t.Fatalf("plugin-b own round-trip failed: ok=%v got=%q err=%v", ok, string(got), err)
+	}
+
+	// The host directly rejects a composite key that escapes the plugin namespace,
+	// proving the server-side enforcement is independent of the broker.
+	host := srv.pluginHostServices()
+	if _, _, err := host.KV.Get(ctx, "operator-secrets/admin"); err == nil {
+		t.Fatal("host must reject a non-plugin bucket on Get")
+	}
+	if err := host.KV.Put(ctx, "operator-secrets/admin", []byte("x")); err == nil {
+		t.Fatal("host must reject a non-plugin bucket on Put")
+	}
 }
 
 func TestPluginHostServicesHTTPUsesOutboundGuard(t *testing.T) {
@@ -91,26 +157,18 @@ func TestPluginHostServicesHTTPUsesOutboundGuard(t *testing.T) {
 
 func TestPluginHostServicesHTTPRejectsOversizedRequestBodyBeforeDial(t *testing.T) {
 	srv, _ := newServerForPluginHost(t)
-	broker, err := plugin.NewBroker(plugin.Loaded{
-		Manifest: plugin.Manifest{
-			ID:           "http-plugin",
-			Name:         "HTTP Plugin",
-			Type:         plugin.TypeWasm,
-			Capabilities: []string{"http:egress"},
-		},
-		Capabilities: []string{"http:egress"},
-	}, srv.pluginHostServices())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = broker.HTTPDo(context.Background(), plugin.HostHTTPRequest{
+	// Exercise the host's Do directly: the broker now runs the egress guard before
+	// delegating, so a loopback URL would be blocked there first. This test targets
+	// the host's own ordering — the request-body size limit must be enforced before
+	// the host attempts to construct/dial the request.
+	host := srv.pluginHostServices()
+	_, err := host.HTTP.Do(context.Background(), plugin.HostHTTPRequest{
 		Method: "POST",
 		URL:    "http://127.0.0.1/",
 		Body:   bytes.Repeat([]byte("x"), 256*1024+1),
 	})
 	if err == nil || !strings.Contains(err.Error(), "request body exceeds size limit") {
-		t.Fatalf("expected request body size rejection before outbound guard, got %v", err)
+		t.Fatalf("expected request body size rejection before dial, got %v", err)
 	}
 }
 

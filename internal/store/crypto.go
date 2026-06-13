@@ -55,21 +55,29 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 
 	sessions := make(map[string]auth.Session, len(st.Sessions))
 	for id, sess := range st.Sessions {
+		rid := recordID(id, sess.ID)
+		if rid == "" {
+			return State{}, fmt.Errorf("session %q has empty id; refusing to write a colliding opaque key", id)
+		}
 		enc, err := encryptSessionRecord(id, sess, c)
 		if err != nil {
 			return State{}, err
 		}
-		sessions[sessionStorageKey(recordID(id, sess.ID))] = enc
+		sessions[sessionStorageKey(rid)] = enc
 	}
 	out.Sessions = sessions
 
 	totpChallenges := make(map[string]auth.TOTPChallenge, len(st.TOTPChallenges))
 	for id, challenge := range st.TOTPChallenges {
+		rid := recordID(id, challenge.ID)
+		if rid == "" {
+			return State{}, fmt.Errorf("totp challenge %q has empty id; refusing to write a colliding opaque key", id)
+		}
 		enc, err := encryptTOTPChallengeRecord(id, challenge, c)
 		if err != nil {
 			return State{}, err
 		}
-		totpChallenges[totpChallengeStorageKey(recordID(id, challenge.ID))] = enc
+		totpChallenges[totpChallengeStorageKey(rid)] = enc
 	}
 	out.TOTPChallenges = totpChallenges
 
@@ -105,11 +113,15 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
+		rid := recordID(id, authState.State)
+		if rid == "" {
+			return State{}, fmt.Errorf("oidc auth state %q has empty state; refusing to write a colliding opaque key", id)
+		}
 		enc, err := encryptOIDCAuthStateRecord(id, authState, c)
 		if err != nil {
 			return State{}, err
 		}
-		oidcAuthStates[oidcAuthStateStorageKey(recordID(id, authState.State))] = enc
+		oidcAuthStates[oidcAuthStateStorageKey(rid)] = enc
 	}
 	out.OIDCAuthStates = oidcAuthStates
 
@@ -133,13 +145,19 @@ func decryptState(st *State, c secret.Cipher) error {
 		return nil
 	}
 
+	// Build fresh maps rather than mutating in place while ranging. The keys are
+	// unchanged here so in-place writes are technically safe, but the re-keyed
+	// auth maps below already use the fresh-map form; doing it uniformly removes
+	// a fragile pattern that would silently break if a key were ever derived.
+	users := make(map[string]model.User, len(st.Users))
 	for id, u := range st.Users {
 		dec, err := decryptUserRecord(id, u, c)
 		if err != nil {
 			return err
 		}
-		st.Users[id] = dec
+		users[id] = dec
 	}
+	st.Users = users
 
 	sessions := make(map[string]auth.Session, len(st.Sessions))
 	for id, sess := range st.Sessions {
@@ -161,29 +179,35 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.TOTPChallenges = totpChallenges
 
+	ddns := make(map[string]model.DDNSProfile, len(st.DDNS))
 	for id, d := range st.DDNS {
 		dec, err := decryptDDNSRecord(id, d, c)
 		if err != nil {
 			return err
 		}
-		st.DDNS[id] = dec
+		ddns[id] = dec
 	}
+	st.DDNS = ddns
 
+	notify := make(map[string]model.NotifyChannel, len(st.NotifyChannels))
 	for id, n := range st.NotifyChannels {
 		dec, err := decryptNotifyRecord(id, n, c)
 		if err != nil {
 			return err
 		}
-		st.NotifyChannels[id] = dec
+		notify[id] = dec
 	}
+	st.NotifyChannels = notify
 
+	providers := make(map[string]model.OIDCProvider, len(st.OIDCProviders))
 	for id, p := range st.OIDCProviders {
 		dec, err := decryptOIDCProviderRecord(id, p, c)
 		if err != nil {
 			return err
 		}
-		st.OIDCProviders[id] = dec
+		providers[id] = dec
 	}
+	st.OIDCProviders = providers
 
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
@@ -261,6 +285,15 @@ func normalizeAuthMapKeys(st *State) {
 	}
 	st.OIDCAuthStates = oidcAuthStates
 }
+
+// The encrypt*Record / decrypt*Record helpers below are the per-record crypto
+// boundary. They are used by BOTH backends:
+//   - the JSON store, via encryptedState/decryptState (which short-circuit the
+//     disabled-cipher case in decryptState before reaching these), and
+//   - the bbolt store, which calls them directly per record.
+// The `if !c.Enabled() && IsEnvelope(...)` guard in each decrypt*Record is
+// therefore the authoritative fail-closed point for the bbolt path (it is
+// unreachable from the JSON path, which guards earlier) — do not remove it.
 
 func encryptUserRecord(id string, u model.User, c secret.Cipher) (model.User, error) {
 	enc, err := c.Encrypt(u.TOTPSecret)

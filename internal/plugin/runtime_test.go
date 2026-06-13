@@ -138,6 +138,53 @@ func TestRuntimeManagerRecordsFailedHealthWhenRunnerStartFails(t *testing.T) {
 	}
 }
 
+func TestRuntimeManagerFailedStopDetachesHostAccess(t *testing.T) {
+	// S4: when a plugin's Stop hook fails, the manager must still detach the
+	// broker and runner — a plugin we have decided to disable is no longer trusted
+	// with host access regardless of whether its Stop hook succeeded. We observe
+	// the detach behaviorally: a second Stop must NOT re-invoke the runner, because
+	// the runner handle was cleared on the failed first Stop.
+	runner := &failStopRunner{name: "fails-stop", stopErr: errors.New("stop hook refused")}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{
+		Runners: map[string]Runner{TypeSystem: runner},
+	})
+	loaded := Loaded{
+		Manifest: Manifest{
+			ID:           "stuck.bundle",
+			Name:         "Stuck",
+			Type:         TypeSystem,
+			Capabilities: []string{"node:read"},
+		},
+		Capabilities: []string{"node:read"},
+	}
+	if _, err := m.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+
+	rt, err := m.Stop("stuck.bundle", "operator disabled")
+	if err == nil {
+		t.Fatal("expected the failing stop hook to surface an error")
+	}
+	if rt.State != RuntimeStateFailed {
+		t.Fatalf("failed stop should mark state failed, got %+v", rt)
+	}
+	if runner.stopCalls != 1 {
+		t.Fatalf("first stop should call the runner once, got %d", runner.stopCalls)
+	}
+
+	// Second stop must be a no-op on the runner: a failed stop already detached the
+	// runner handle, proving host access is no longer armed for this plugin.
+	if _, err := m.Stop("stuck.bundle", "operator disabled again"); err != nil {
+		t.Fatalf("second stop after a failed stop should succeed cleanly, got %v", err)
+	}
+	if runner.stopCalls != 1 {
+		t.Fatalf("failed stop must detach the runner; runner re-invoked, stopCalls=%d", runner.stopCalls)
+	}
+	if m.IsArmed("stuck.bundle") {
+		t.Fatal("plugin must not be armed after a failed stop")
+	}
+}
+
 func TestRuntimeManagerStopDoesNotClobberNewStart(t *testing.T) {
 	runner := &blockingStopRunner{
 		stopEntered: make(chan struct{}),
@@ -243,6 +290,25 @@ func (r *recordingRunner) Stop(ctx context.Context, req RunnerStopRequest) error
 	r.stopCalls++
 	r.stopReq = req
 	return nil
+}
+
+type failStopRunner struct {
+	name      string
+	stopErr   error
+	stopCalls int
+}
+
+func (r *failStopRunner) Name() string {
+	return r.name
+}
+
+func (r *failStopRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
+	return RunnerStartResult{Message: "armed"}, ctx.Err()
+}
+
+func (r *failStopRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
+	r.stopCalls++
+	return r.stopErr
 }
 
 type blockingStopRunner struct {

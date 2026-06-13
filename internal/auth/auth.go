@@ -23,6 +23,11 @@ type Session struct {
 	ID        string
 	ActorID   string
 	CSRFToken string
+	// Epoch records the user's SecurityEpoch at the instant this session was
+	// minted. principalFromRequest rejects a session whose Epoch is older than
+	// the user's current SecurityEpoch, so a privilege-reducing event (2FA
+	// disable, password change, admin revoke) invalidates all prior sessions.
+	Epoch     uint64
 	CreatedAt time.Time
 	ExpiresAt time.Time
 	Revoked   bool

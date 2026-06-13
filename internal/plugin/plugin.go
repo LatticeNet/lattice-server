@@ -50,8 +50,14 @@ type trustPolicyJSON struct {
 }
 
 var capabilityRisk = map[string]string{
-	"audit:read":    RiskRead,
-	"http:egress":   RiskWrite,
+	"audit:read": RiskRead,
+	// http:egress is host-risk: arbitrary outbound HTTP is a powerful primitive
+	// (data exfiltration, SSRF surface), so a plugin carrying it must be signed by
+	// a trusted publisher (enforced via manifestHasRisk(RiskHost) in
+	// VerifyManifest). It is intentionally exempt from the system-only restriction
+	// (see hostRiskExemptForNonSystem) so a SIGNED third-party wasm plugin may
+	// still request guarded egress through the broker.
+	"http:egress":   RiskHost,
 	"kv:read":       RiskRead,
 	"monitor:read":  RiskRead,
 	"node:read":     RiskRead,
@@ -69,6 +75,16 @@ var capabilityRisk = map[string]string{
 	"static:write":  RiskHost,
 	"task:run":      RiskHost,
 	"tunnel:admin":  RiskHost,
+}
+
+// hostRiskExemptForNonSystem lists host-risk capabilities that non-system plugins
+// (wasm/worker) may still DECLARE — they only get past the loader if the plugin
+// is signed by a trusted publisher. Egress is the one host-risk primitive that a
+// sandboxed third-party plugin can use safely because the broker guards every
+// request (capability check + structural SSRF guard); the host-risk classification
+// is solely to force a signature, not to confine it to system plugins.
+var hostRiskExemptForNonSystem = map[string]bool{
+	"http:egress": true,
 }
 
 var workerCapabilities = map[string]bool{
@@ -106,7 +122,11 @@ func ValidateManifest(m Manifest) error {
 		if !ok {
 			return fmt.Errorf("capability %q is not recognized", cap)
 		}
-		if m.Type != TypeSystem && risk == RiskHost {
+		// Host-risk capabilities are confined to system plugins, EXCEPT for the
+		// explicitly exempted ones (e.g. http:egress) that a signed third-party
+		// plugin may also declare. The host-risk classification still forces a
+		// trusted-publisher signature for those at verify/load time.
+		if m.Type != TypeSystem && risk == RiskHost && !hostRiskExemptForNonSystem[cap] {
 			return fmt.Errorf("capability %q requires a system plugin", cap)
 		}
 		if m.Type == TypeWorker && !workerCapabilities[cap] {

@@ -58,6 +58,12 @@ func (h *pluginHost) Put(ctx context.Context, key string, value []byte) error {
 	return h.server.store.PutKV(model.KVEntry{Bucket: bucket, Key: entryKey, Value: string(value)})
 }
 
+// pluginKVBucketPrefix is the namespace every plugin KV access must live under.
+// The broker pins each plugin to "plugin:<pluginID>"; the host enforces the
+// prefix as defense-in-depth so a plugin-supplied composite key can never resolve
+// to a non-plugin bucket in the shared operator KV store.
+const pluginKVBucketPrefix = "plugin:"
+
 func (h *pluginHost) Send(ctx context.Context, title, body string) error {
 	channels := h.server.store.EnabledNotifyChannels()
 	if len(channels) == 0 {
@@ -141,6 +147,17 @@ func splitPluginKVKey(key string) (string, string, error) {
 	bucket, entryKey, ok := strings.Cut(key, "/")
 	if !ok {
 		return "", "", errors.New("plugin kv key must be bucket/key")
+	}
+	// Enforce the plugin namespace server-side. The broker always pins the bucket
+	// to "plugin:<pluginID>"; rejecting any other bucket here means even a
+	// hand-crafted composite key cannot reach a non-plugin bucket (confused-deputy
+	// defense). The pluginID segment itself must be a non-empty storage name.
+	pluginID, ok := strings.CutPrefix(bucket, pluginKVBucketPrefix)
+	if !ok {
+		return "", "", errors.New("plugin kv bucket must be namespaced to the plugin")
+	}
+	if err := validateStorageName(pluginID); err != nil {
+		return "", "", fmt.Errorf("plugin id: %w", err)
 	}
 	if err := validateStorageName(bucket); err != nil {
 		return "", "", fmt.Errorf("bucket: %w", err)

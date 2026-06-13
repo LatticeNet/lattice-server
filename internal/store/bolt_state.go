@@ -76,6 +76,14 @@ var boltStateBuckets = [][]byte{
 //
 // This type is intentionally not wired into server startup yet: it is the tested
 // import/export foundation for the Phase C migration.
+//
+// EXPERIMENTAL — do not enable as the runtime backend until the Phase C entry
+// gates are met (security-audit iter-016 D12/D3): (1) a backup/restore command +
+// drill exist; (2) record-level pruning no longer decrypts every record to read
+// non-secret timestamps (D3); (3) this store is round-trip/fuzz-validated for
+// semantic parity against the JSON store. Until then its method set can silently
+// drift from the JSON store, so changes here MUST be mirrored and tested against
+// internal/store/store.go.
 type BoltStateStore struct {
 	db     *bolt.DB
 	cipher secret.Cipher

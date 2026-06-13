@@ -51,27 +51,41 @@ func TOTPCodeAt(secret string, t time.Time) (string, error) {
 // ValidateTOTP reports whether code matches secret at time t, tolerating one
 // step of clock skew on either side. The comparison is constant-time.
 func ValidateTOTP(secret, code string, t time.Time) bool {
+	_, ok := ValidateTOTPStep(secret, code, t)
+	return ok
+}
+
+// ValidateTOTPStep reports whether code matches secret at time t (tolerating one
+// step of clock skew on either side) and, on a match, returns the RFC-6238
+// counter (step) that matched. The returned step lets a caller enforce
+// single-use of each code by persisting the highest accepted step and rejecting
+// any submission whose step is not strictly greater. The comparison is
+// constant-time; every candidate step is compared without an early return so the
+// timing does not reveal which window matched.
+func ValidateTOTPStep(secret, code string, t time.Time) (uint64, bool) {
 	code = strings.TrimSpace(code)
 	if len(code) != totpDigits {
-		return false
+		return 0, false
 	}
 	key, err := decodeTOTPSecret(secret)
 	if err != nil || len(key) == 0 {
-		return false
+		return 0, false
 	}
 	counter := uint64(t.Unix()) / totpPeriodSecs
 	steps := []uint64{counter, counter + 1}
 	if counter > 0 {
 		steps = append(steps, counter-1)
 	}
+	var matched uint64
 	ok := false
 	for _, c := range steps {
 		// Compare every candidate (no early return) to keep timing uniform.
 		if subtle.ConstantTimeCompare([]byte(hotp(key, c)), []byte(code)) == 1 {
+			matched = c
 			ok = true
 		}
 	}
-	return ok
+	return matched, ok
 }
 
 // OTPAuthURI builds the otpauth:// URI an authenticator app consumes. The issuer

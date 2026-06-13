@@ -327,6 +327,63 @@ func TestParseTrustPolicyJSONRejectsInvalidPublisherKey(t *testing.T) {
 	}
 }
 
+func TestHTTPEgressIsHostRiskRequiringSignature(t *testing.T) {
+	// C6: http:egress is host-risk, so an UNSIGNED plugin carrying it must be
+	// rejected (a signature is forced), while a signed-by-trusted-publisher plugin
+	// is accepted. ValidateManifest still admits http:egress on a wasm plugin
+	// (it is exempt from the system-only confinement) so the gate is the signature.
+	if risk, _ := CapabilityRisk("http:egress"); risk != RiskHost {
+		t.Fatalf("http:egress must be classified host-risk, got %q", risk)
+	}
+
+	// A wasm plugin may DECLARE http:egress (exempt from system-only rule).
+	if err := ValidateManifest(Manifest{
+		ID:           "egress-wasm",
+		Name:         "Egress Wasm",
+		Type:         TypeWasm,
+		Capabilities: []string{"http:egress"},
+	}); err != nil {
+		t.Fatalf("wasm plugin must be allowed to declare http:egress: %v", err)
+	}
+
+	artifact := []byte("egress artifact bytes")
+
+	// Unsigned http:egress plugin is rejected by the secure-by-default policy.
+	unsigned := Manifest{
+		ID:           "egress-unsigned",
+		Name:         "Egress Unsigned",
+		Type:         TypeWasm,
+		Version:      "0.1.0",
+		Entrypoint:   "wasm/egress-unsigned",
+		Capabilities: []string{"http:egress"},
+	}
+	if err := VerifyManifest(unsigned, artifact, TrustPolicy{}); err == nil {
+		t.Fatal("unsigned http:egress plugin must be rejected (signature required)")
+	}
+
+	// Signed by a trusted publisher: accepted.
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := Manifest{
+		ID:           "egress-signed",
+		Name:         "Egress Signed",
+		Type:         TypeWasm,
+		Version:      "0.1.0",
+		Entrypoint:   "wasm/egress-signed",
+		Capabilities: []string{"http:egress"},
+		Publisher:    "latticenet",
+		DigestSHA256: DigestSHA256(artifact),
+	}
+	signed.SignatureEd25519 = base64.RawStdEncoding.EncodeToString(ed25519.Sign(priv, SigningPayload(signed)))
+	if err := VerifyManifest(signed, artifact, TrustPolicy{
+		TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": pub},
+	}); err != nil {
+		t.Fatalf("signed http:egress plugin must be accepted: %v", err)
+	}
+}
+
 func TestVerifyManifestSecureByDefaultRejectsUnsignedHostRisk(t *testing.T) {
 	// A zero-value TrustPolicy must be fail-closed: an unsigned host-risk
 	// manifest is rejected even though no policy flag was set.

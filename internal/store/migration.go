@@ -150,11 +150,12 @@ func migrationTempPath(path string) (string, func(), error) {
 		return "", nil, err
 	}
 	tmp := f.Name()
+	// Keep the reserved unique name on disk (do NOT remove it): a concurrent
+	// migration cannot then grab the same path. The writer overwrites this
+	// placeholder in place — os.WriteFile/writeSyncedFile truncates it, and
+	// bbolt initializes an empty file as a fresh database.
 	if err := f.Close(); err != nil {
 		os.Remove(tmp)
-		return "", nil, err
-	}
-	if err := os.Remove(tmp); err != nil {
 		return "", nil, err
 	}
 	return tmp, func() { _ = os.Remove(tmp) }, nil
@@ -219,8 +220,11 @@ func writeFileAtomically(path string, data []byte, perm os.FileMode, opts Migrat
 		return err
 	}
 	defer cleanup()
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	if err := writeSyncedFile(tmp, data, perm); err != nil {
 		return err
 	}
-	return replaceFile(tmp, path, opts)
+	if err := replaceFile(tmp, path, opts); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
 }

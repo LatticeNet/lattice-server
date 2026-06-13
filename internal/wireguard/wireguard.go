@@ -79,10 +79,19 @@ func BuildMesh(nodes []model.Node, target model.Node, listenPort int) (Interface
 		if n.ID == target.ID || n.WireGuardPublicKey == "" || n.WireGuardIP == "" {
 			continue
 		}
+		// Pin AllowedIPs to the peer's single host route. A node-reported
+		// WireGuardIP is attacker-influenced metadata; if it carries a wide
+		// prefix (e.g. "10.66.0.0/16") routing that whole range to one peer
+		// would let it intercept/impersonate other nodes' mesh traffic. An
+		// unparseable address means we cannot bound the peer safely, so skip it.
+		allowed := hostCIDR(n.WireGuardIP)
+		if allowed == "" {
+			continue
+		}
 		peers = append(peers, Peer{
 			Name:       n.Name,
 			PublicKey:  n.WireGuardPublicKey,
-			AllowedIPs: hostCIDR(n.WireGuardIP),
+			AllowedIPs: allowed,
 			Endpoint:   n.WireGuardEndpoint,
 			Keepalive:  defaultKeepalive,
 		})
@@ -167,15 +176,31 @@ func sanitizeComment(s string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " ")
 }
 
-// hostCIDR turns a bare mesh IP into a /32 (or /128) host route.
-func hostCIDR(ip string) string {
-	if strings.Contains(ip, "/") {
-		return ip
+// hostCIDR normalizes a node-reported mesh address into a single-host route:
+// /32 for IPv4, /128 for IPv6. Any prefix on the input is discarded — only the
+// host IP is kept — so a node cannot widen its own AllowedIPs (e.g. report
+// "10.66.0.5/16" to get a /16 routed to it). The address may be a bare IP or a
+// CIDR; an unparseable value returns "" so the caller skips that peer.
+func hostCIDR(addr string) string {
+	host := addr
+	// Strip any prefix and keep only the host IP. ParseCIDR returns the masked
+	// network in the *IPNet, so we use the first (IP) return value, which is the
+	// original host address with the prefix removed.
+	if strings.Contains(addr, "/") {
+		ip, _, err := net.ParseCIDR(addr)
+		if err != nil {
+			return ""
+		}
+		host = ip.String()
 	}
-	if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() == nil {
-		return ip + "/128"
+	parsed := net.ParseIP(host)
+	if parsed == nil {
+		return ""
 	}
-	return ip + "/32"
+	if parsed.To4() == nil {
+		return parsed.String() + "/128"
+	}
+	return parsed.String() + "/32"
 }
 
 func ensureCIDR(ip string, bits int) string {

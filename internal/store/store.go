@@ -222,11 +222,57 @@ func (s *Store) Save() error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	return syncedAtomicWrite(s.path, data, 0o600)
+}
+
+// syncedAtomicWrite writes data to a temp file, fsyncs the file, atomically
+// renames it into place, then fsyncs the parent directory so the rename is
+// durable. Plain WriteFile+Rename makes the *name* atomic but leaves a crash
+// window where the file's data blocks or the rename's directory entry may not
+// have reached disk (the classic ext4/xfs "renamed-but-zero-length" failure).
+// For the primary state file that holds all credentials/secrets, that window is
+// total data loss, so we close it the same way the audit WAL already does.
+func syncedAtomicWrite(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := writeSyncedFile(tmp, data, perm); err != nil {
+		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
+
+// writeSyncedFile writes data to path (creating/truncating) and fsyncs the file
+// before closing, so its contents are durable on disk.
+func writeSyncedFile(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir fsyncs a directory so a rename within it is durable. A directory that
+// cannot be opened/synced (rare; some platforms) is reported but non-fatal at
+// the call sites that can tolerate it.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (s *Store) UpsertUser(u model.User) error {
@@ -886,6 +932,52 @@ func (s *Store) ConsumeRecoveryCode(userID, code string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// AdvanceTOTPStep atomically enforces single-use of a TOTP code: it accepts the
+// matched RFC-6238 step only if it is strictly greater than the highest step
+// previously accepted for the user, then persists the new high-water mark. The
+// compare-and-set runs entirely under the store lock so two concurrent logins
+// presenting the same code cannot both succeed (one wins, the other observes a
+// non-increasing step and is rejected). Returns true when the step was accepted
+// and recorded; false when it was a replay (step <= LastTOTPStep) or the user is
+// unknown.
+func (s *Store) AdvanceTOTPStep(userID string, step uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.state.Users[userID]
+	if !ok {
+		return false, nil
+	}
+	if step <= u.LastTOTPStep {
+		return false, nil
+	}
+	u.LastTOTPStep = step
+	s.state.Users[userID] = u
+	if err := s.Save(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// BumpSecurityEpoch increments the user's SecurityEpoch under the store lock and
+// returns the new value. Sessions carry the epoch at which they were minted, so
+// bumping it invalidates every previously-issued session for the user (used on
+// 2FA disable, password change, and admin revoke). Returns (0, nil) when the
+// user is unknown.
+func (s *Store) BumpSecurityEpoch(userID string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.state.Users[userID]
+	if !ok {
+		return 0, nil
+	}
+	u.SecurityEpoch++
+	s.state.Users[userID] = u
+	if err := s.Save(); err != nil {
+		return 0, err
+	}
+	return u.SecurityEpoch, nil
 }
 
 // UpsertDDNSProfile creates or updates a DDNS profile.

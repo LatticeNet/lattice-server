@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -1019,6 +1021,671 @@ func (bs *BoltStateStore) DeleteTunnel(id string) error {
 	})
 }
 
+func (bs *BoltStateStore) UpsertUser(u model.User) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptUserRecord(u.ID, u, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketUsers, u.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) User(id string) (model.User, bool, error) {
+	var out model.User
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketUsers, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptUserRecord(id, out, bs.cipher)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) UserByUsername(username string) (model.User, bool, error) {
+	var out model.User
+	var found bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		users, err := listMapValues[model.User](tx, boltBucketUsers)
+		if err != nil {
+			return err
+		}
+		for _, u := range users {
+			du, err := decryptUserRecord(u.ID, u, bs.cipher)
+			if err != nil {
+				return err
+			}
+			if strings.EqualFold(du.Username, username) {
+				out = du
+				found = true
+				return nil
+			}
+		}
+		return nil
+	})
+	return out, found, err
+}
+
+func (bs *BoltStateStore) ConsumeRecoveryCode(userID, code string) (bool, error) {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return false, nil
+	}
+	want := auth.HashRecoveryCode(code)
+	consumed := false
+	err := bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var u model.User
+		ok, err := getRecord(tx, boltBucketUsers, userID, &u)
+		if err != nil || !ok {
+			return err
+		}
+		u, err = decryptUserRecord(userID, u, bs.cipher)
+		if err != nil {
+			return err
+		}
+		idx := -1
+		for i, h := range u.RecoveryCodeHashes {
+			if subtle.ConstantTimeCompare([]byte(h), []byte(want)) == 1 {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			return nil
+		}
+		u.RecoveryCodeHashes = append(u.RecoveryCodeHashes[:idx], u.RecoveryCodeHashes[idx+1:]...)
+		enc, err := encryptUserRecord(userID, u, bs.cipher)
+		if err != nil {
+			return err
+		}
+		if err := putRecord(tx, boltBucketUsers, userID, enc); err != nil {
+			return err
+		}
+		consumed = true
+		return nil
+	})
+	return consumed, err
+}
+
+func (bs *BoltStateStore) UpsertToken(t model.Token) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketTokens, t.ID, t)
+	})
+}
+
+func (bs *BoltStateStore) Token(id string) (model.Token, bool, error) {
+	var out model.Token
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketTokens, id, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) Tokens() ([]model.Token, error) {
+	tokens := []model.Token{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		tokens, err = listMapValues[model.Token](tx, boltBucketTokens)
+		return err
+	})
+	return tokens, err
+}
+
+func (bs *BoltStateStore) PutSession(sess auth.Session) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		sessions, err := listMapValues[auth.Session](tx, boltBucketSessions)
+		if err != nil {
+			return err
+		}
+		for _, existing := range sessions {
+			dec, err := decryptSessionRecord(existing.ID, existing, bs.cipher)
+			if err != nil {
+				return err
+			}
+			if !dec.Active(now) {
+				if err := deleteAuthRecord(tx, boltBucketSessions, sessionStorageKey(dec.ID), dec.ID); err != nil {
+					return err
+				}
+			}
+		}
+		enc, err := encryptSessionRecord(sess.ID, sess, bs.cipher)
+		if err != nil {
+			return err
+		}
+		if err := putRecord(tx, boltBucketSessions, sessionStorageKey(sess.ID), enc); err != nil {
+			return err
+		}
+		if count, err := countBucketRecords(tx, boltBucketSessions); err != nil {
+			return err
+		} else if count > maxSessions {
+			return evictOldestSessionRecord(tx, bs.cipher)
+		}
+		return nil
+	})
+}
+
+func (bs *BoltStateStore) Session(id string) (auth.Session, bool, error) {
+	var out auth.Session
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getAuthRecord(tx, boltBucketSessions, sessionStorageKey(id), id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptSessionRecord(id, out, bs.cipher)
+		if err != nil {
+			return err
+		}
+		if !out.Active(time.Now().UTC()) {
+			ok = false
+			out = auth.Session{}
+		}
+		return nil
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) DeleteSession(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteAuthRecord(tx, boltBucketSessions, sessionStorageKey(id), id)
+	})
+}
+
+func (bs *BoltStateStore) PutTOTPChallenge(c auth.TOTPChallenge) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		challenges, err := listMapValues[auth.TOTPChallenge](tx, boltBucketTOTPChallenges)
+		if err != nil {
+			return err
+		}
+		active := 0
+		for _, existing := range challenges {
+			dec, err := decryptTOTPChallengeRecord(existing.ID, existing, bs.cipher)
+			if err != nil {
+				return err
+			}
+			if !dec.Active(now) {
+				if err := deleteAuthRecord(tx, boltBucketTOTPChallenges, totpChallengeStorageKey(dec.ID), dec.ID); err != nil {
+					return err
+				}
+				continue
+			}
+			active++
+		}
+		if active >= maxTOTPChallenges {
+			return errors.New("too many pending 2fa challenges")
+		}
+		enc, err := encryptTOTPChallengeRecord(c.ID, c, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketTOTPChallenges, totpChallengeStorageKey(c.ID), enc)
+	})
+}
+
+func (bs *BoltStateStore) TOTPChallenge(id string) (auth.TOTPChallenge, bool, error) {
+	var out auth.TOTPChallenge
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getAuthRecord(tx, boltBucketTOTPChallenges, totpChallengeStorageKey(id), id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptTOTPChallengeRecord(id, out, bs.cipher)
+		if err != nil {
+			return err
+		}
+		if !out.Active(time.Now().UTC()) {
+			ok = false
+			out = auth.TOTPChallenge{}
+		}
+		return nil
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) ConsumeTOTPChallenge(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteAuthRecord(tx, boltBucketTOTPChallenges, totpChallengeStorageKey(id), id)
+	})
+}
+
+func (bs *BoltStateStore) FailTOTPChallenge(id string, maxAttempts int) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var c auth.TOTPChallenge
+		ok, err := getAuthRecord(tx, boltBucketTOTPChallenges, totpChallengeStorageKey(id), id, &c)
+		if err != nil || !ok {
+			return err
+		}
+		c, err = decryptTOTPChallengeRecord(id, c, bs.cipher)
+		if err != nil {
+			return err
+		}
+		c.Attempts++
+		if maxAttempts > 0 && c.Attempts >= maxAttempts {
+			return deleteAuthRecord(tx, boltBucketTOTPChallenges, totpChallengeStorageKey(id), id)
+		}
+		enc, err := encryptTOTPChallengeRecord(id, c, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketTOTPChallenges, totpChallengeStorageKey(id), enc)
+	})
+}
+
+func (bs *BoltStateStore) UpsertDDNSProfile(p model.DDNSProfile) error {
+	p.UpdatedAt = time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptDDNSRecord(p.ID, p, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketDDNS, p.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) DDNSProfile(id string) (model.DDNSProfile, bool, error) {
+	var out model.DDNSProfile
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketDDNS, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptDDNSRecord(id, out, bs.cipher)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) DDNSProfiles() ([]model.DDNSProfile, error) {
+	profiles := []model.DDNSProfile{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.DDNSProfile](tx, boltBucketDDNS)
+		if err != nil {
+			return err
+		}
+		for _, p := range all {
+			dec, err := decryptDDNSRecord(p.ID, p, bs.cipher)
+			if err != nil {
+				return err
+			}
+			profiles = append(profiles, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(profiles, func(i, j int) bool { return profiles[i].CreatedAt.Before(profiles[j].CreatedAt) })
+	return profiles, nil
+}
+
+func (bs *BoltStateStore) DDNSProfilesForNode(nodeID string) ([]model.DDNSProfile, error) {
+	profiles := []model.DDNSProfile{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.DDNSProfile](tx, boltBucketDDNS)
+		if err != nil {
+			return err
+		}
+		for _, p := range all {
+			if p.NodeID != nodeID {
+				continue
+			}
+			dec, err := decryptDDNSRecord(p.ID, p, bs.cipher)
+			if err != nil {
+				return err
+			}
+			profiles = append(profiles, dec)
+		}
+		return nil
+	})
+	return profiles, err
+}
+
+func (bs *BoltStateStore) DeleteDDNSProfile(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketDDNS, id)
+	})
+}
+
+func (bs *BoltStateStore) UpsertNotifyChannel(c model.NotifyChannel) error {
+	c.UpdatedAt = time.Now().UTC()
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = c.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptNotifyRecord(c.ID, c, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketNotifyChannels, c.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) NotifyChannels() ([]model.NotifyChannel, error) {
+	channels := []model.NotifyChannel{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.NotifyChannel](tx, boltBucketNotifyChannels)
+		if err != nil {
+			return err
+		}
+		for _, c := range all {
+			dec, err := decryptNotifyRecord(c.ID, c, bs.cipher)
+			if err != nil {
+				return err
+			}
+			channels = append(channels, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(channels, func(i, j int) bool { return channels[i].CreatedAt.Before(channels[j].CreatedAt) })
+	return channels, nil
+}
+
+func (bs *BoltStateStore) EnabledNotifyChannels() ([]model.NotifyChannel, error) {
+	channels := []model.NotifyChannel{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.NotifyChannel](tx, boltBucketNotifyChannels)
+		if err != nil {
+			return err
+		}
+		for _, c := range all {
+			if !c.Enabled {
+				continue
+			}
+			dec, err := decryptNotifyRecord(c.ID, c, bs.cipher)
+			if err != nil {
+				return err
+			}
+			channels = append(channels, dec)
+		}
+		return nil
+	})
+	return channels, err
+}
+
+func (bs *BoltStateStore) DeleteNotifyChannel(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketNotifyChannels, id)
+	})
+}
+
+func (bs *BoltStateStore) UpsertOIDCProvider(p model.OIDCProvider) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptOIDCProviderRecord(p.ID, p, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketOIDCProviders, p.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) OIDCProvider(id string) (model.OIDCProvider, bool, error) {
+	var out model.OIDCProvider
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketOIDCProviders, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptOIDCProviderRecord(id, out, bs.cipher)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) OIDCProviders() ([]model.OIDCProvider, error) {
+	providers := []model.OIDCProvider{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.OIDCProvider](tx, boltBucketOIDCProviders)
+		if err != nil {
+			return err
+		}
+		for _, p := range all {
+			dec, err := decryptOIDCProviderRecord(p.ID, p, bs.cipher)
+			if err != nil {
+				return err
+			}
+			providers = append(providers, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(providers, func(i, j int) bool { return providers[i].CreatedAt.Before(providers[j].CreatedAt) })
+	return providers, nil
+}
+
+func (bs *BoltStateStore) EnabledOIDCProviders() ([]model.OIDCProvider, error) {
+	providers := []model.OIDCProvider{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.OIDCProvider](tx, boltBucketOIDCProviders)
+		if err != nil {
+			return err
+		}
+		for _, p := range all {
+			if !p.Enabled {
+				continue
+			}
+			dec, err := decryptOIDCProviderRecord(p.ID, p, bs.cipher)
+			if err != nil {
+				return err
+			}
+			providers = append(providers, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(providers, func(i, j int) bool { return providers[i].CreatedAt.Before(providers[j].CreatedAt) })
+	return providers, nil
+}
+
+func (bs *BoltStateStore) DeleteOIDCProvider(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var p model.OIDCProvider
+		ok, err := getRecord(tx, boltBucketOIDCProviders, id, &p)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("oidc provider not found")
+		}
+		return deleteRecord(tx, boltBucketOIDCProviders, id)
+	})
+}
+
+func (bs *BoltStateStore) OIDCIdentity(providerID, subject string) (model.OIDCIdentity, bool, error) {
+	var out model.OIDCIdentity
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketOIDCIdentities, oidcIdentityKey(providerID, subject), &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) PutOIDCIdentity(idn model.OIDCIdentity) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketOIDCIdentities, oidcIdentityKey(idn.ProviderID, idn.Subject), idn)
+	})
+}
+
+func (bs *BoltStateStore) PutOIDCAuthState(st auth.OIDCAuthState) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		states, err := listMapValues[auth.OIDCAuthState](tx, boltBucketOIDCAuthStates)
+		if err != nil {
+			return err
+		}
+		active := 0
+		for _, existing := range states {
+			dec, err := decryptOIDCAuthStateRecord(existing.State, existing, bs.cipher)
+			if err != nil {
+				return err
+			}
+			if now.After(dec.ExpiresAt) {
+				if err := deleteAuthRecord(tx, boltBucketOIDCAuthStates, oidcAuthStateStorageKey(dec.State), dec.State); err != nil {
+					return err
+				}
+				continue
+			}
+			active++
+		}
+		if active >= maxOIDCAuthStates {
+			return errors.New("too many pending oidc logins")
+		}
+		enc, err := encryptOIDCAuthStateRecord(st.State, st, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketOIDCAuthStates, oidcAuthStateStorageKey(st.State), enc)
+	})
+}
+
+func (bs *BoltStateStore) ConsumeOIDCAuthState(state string) (auth.OIDCAuthState, bool, error) {
+	var out auth.OIDCAuthState
+	var ok bool
+	err := bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var raw auth.OIDCAuthState
+		var err error
+		ok, err = getAuthRecord(tx, boltBucketOIDCAuthStates, oidcAuthStateStorageKey(state), state, &raw)
+		if err != nil || !ok {
+			return err
+		}
+		if err := deleteAuthRecord(tx, boltBucketOIDCAuthStates, oidcAuthStateStorageKey(state), state); err != nil {
+			return err
+		}
+		out, err = decryptOIDCAuthStateRecord(state, raw, bs.cipher)
+		if err != nil {
+			return err
+		}
+		if time.Now().UTC().After(out.ExpiresAt) {
+			ok = false
+			out = auth.OIDCAuthState{}
+		}
+		return nil
+	})
+	return out, ok, err
+}
+
 func putRecord[T any](tx *bolt.Tx, bucket []byte, key string, value T) error {
 	b := tx.Bucket(bucket)
 	if b == nil {
@@ -1067,6 +1734,60 @@ func deleteRecord(tx *bolt.Tx, bucket []byte, key string) error {
 		return err
 	}
 	return b.Delete(k)
+}
+
+func getAuthRecord[T any](tx *bolt.Tx, bucket []byte, primaryKey, legacyKey string, out *T) (bool, error) {
+	ok, err := getRecord(tx, bucket, primaryKey, out)
+	if err != nil || ok || primaryKey == legacyKey {
+		return ok, err
+	}
+	return getRecord(tx, bucket, legacyKey, out)
+}
+
+func deleteAuthRecord(tx *bolt.Tx, bucket []byte, primaryKey, legacyKey string) error {
+	if err := deleteRecord(tx, bucket, primaryKey); err != nil {
+		return err
+	}
+	if primaryKey != legacyKey {
+		return deleteRecord(tx, bucket, legacyKey)
+	}
+	return nil
+}
+
+func countBucketRecords(tx *bolt.Tx, bucket []byte) (int, error) {
+	b := tx.Bucket(bucket)
+	if b == nil {
+		return 0, nil
+	}
+	count := 0
+	err := b.ForEach(func(_, _ []byte) error {
+		count++
+		return nil
+	})
+	return count, err
+}
+
+func evictOldestSessionRecord(tx *bolt.Tx, c secret.Cipher) error {
+	sessions, err := listMapValues[auth.Session](tx, boltBucketSessions)
+	if err != nil {
+		return err
+	}
+	var oldest auth.Session
+	found := false
+	for _, sess := range sessions {
+		dec, err := decryptSessionRecord(sess.ID, sess, c)
+		if err != nil {
+			return err
+		}
+		if !found || dec.CreatedAt.Before(oldest.CreatedAt) {
+			oldest = dec
+			found = true
+		}
+	}
+	if found {
+		return deleteAuthRecord(tx, boltBucketSessions, sessionStorageKey(oldest.ID), oldest.ID)
+	}
+	return nil
 }
 
 func listMapValues[T any](tx *bolt.Tx, bucket []byte) ([]T, error) {

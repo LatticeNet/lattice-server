@@ -623,3 +623,311 @@ func TestBoltStateRecordLevelMonitorResultsAndTunnels(t *testing.T) {
 		t.Fatalf("monitor/tunnel lifecycle did not persist across reopen: tunnels=%+v monitors=%+v", tunnels, monitors)
 	}
 }
+
+func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	c := testCipher(t)
+	now := time.Unix(1_700_000_600, 0).UTC()
+
+	bs, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recoveryCode := "rescue-code-1"
+	recoveryHash := auth.HashRecoveryCode(recoveryCode)
+	if err := bs.UpsertUser(model.User{
+		ID:                 "u1",
+		Username:           "Admin@Example.com",
+		TOTPSecret:         totpPlain,
+		RecoveryCodeHashes: []string{recoveryHash},
+		CreatedAt:          now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertToken(model.Token{ID: "tok1", Name: "automation", TokenHash: "hash-only", ActorID: "u1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := auth.NewSession("u1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutSession(session); err != nil {
+		t.Fatal(err)
+	}
+	challenge, err := auth.NewTOTPChallenge("u1", "198.51.100.2", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutTOTPChallenge(challenge); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertDDNSProfile(model.DDNSProfile{
+		ID: "d1", Name: "dns", NodeID: "n1", Provider: model.DDNSProviderCloudflare,
+		CFAPIToken: cfTokenPlain, WebhookHeaders: webhookHdrPlain, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertNotifyChannel(model.NotifyChannel{
+		ID: "ch1", Name: "telegram", Kind: "telegram", Enabled: true, CreatedAt: now,
+		Config: map[string]string{"bot_token": botTokenPlain, "chat_id": chatIDPlain},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertOIDCProvider(model.OIDCProvider{
+		ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com",
+		ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	idn := model.OIDCIdentity{ProviderID: "google", Issuer: "https://accounts.google.com", Subject: "sub-1", UserID: "u1", Email: "admin@example.com", CreatedAt: now}
+	if err := bs.PutOIDCIdentity(idn); err != nil {
+		t.Fatal(err)
+	}
+	oidcState, err := auth.NewOIDCAuthState("google", "198.51.100.2", "/", "pkce-verifier-secret", "browser-binding-secret", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutOIDCAuthState(oidcState); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := string(raw)
+	for _, leak := range []string{
+		totpPlain,
+		session.ID,
+		session.CSRFToken,
+		challenge.ID,
+		cfTokenPlain,
+		webhookHdrPlain,
+		botTokenPlain,
+		chatIDPlain,
+		"oidc-client-secret",
+		oidcState.State,
+		oidcState.CodeVerifier,
+	} {
+		if strings.Contains(disk, leak) {
+			t.Fatalf("secret leaked into bbolt file: %q", leak)
+		}
+	}
+	for _, plain := range []string{"Admin@Example.com", "automation", "cloudflare", "Google"} {
+		if !strings.Contains(disk, plain) {
+			t.Fatalf("expected non-secret field %q to remain readable", plain)
+		}
+	}
+
+	user, ok, err := bs.User("u1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || user.TOTPSecret != totpPlain {
+		t.Fatalf("user secret not decrypted: ok=%v user=%+v", ok, user)
+	}
+	userByName, ok, err := bs.UserByUsername("admin@example.COM")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || userByName.ID != "u1" {
+		t.Fatalf("case-insensitive username lookup failed: ok=%v user=%+v", ok, userByName)
+	}
+	consumed, err := bs.ConsumeRecoveryCode("u1", recoveryCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !consumed {
+		t.Fatal("expected recovery code to be consumed")
+	}
+	consumedAgain, err := bs.ConsumeRecoveryCode("u1", recoveryCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumedAgain {
+		t.Fatal("recovery code should be single-use")
+	}
+
+	token, ok, err := bs.Token("tok1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := bs.Tokens()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || token.TokenHash != "hash-only" || len(tokens) != 1 {
+		t.Fatalf("token record not recovered: ok=%v token=%+v tokens=%+v", ok, token, tokens)
+	}
+	gotSession, ok, err := bs.Session(session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotSession.CSRFToken != session.CSRFToken {
+		t.Fatalf("session not decrypted: ok=%v session=%+v", ok, gotSession)
+	}
+	gotChallenge, ok, err := bs.TOTPChallenge(challenge.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotChallenge.UserID != "u1" {
+		t.Fatalf("totp challenge not recovered: ok=%v challenge=%+v", ok, gotChallenge)
+	}
+	if err := bs.FailTOTPChallenge(challenge.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	gotChallenge, ok, err = bs.TOTPChallenge(challenge.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotChallenge.Attempts != 1 {
+		t.Fatalf("totp challenge failure was not recorded: ok=%v challenge=%+v", ok, gotChallenge)
+	}
+	if err := bs.FailTOTPChallenge(challenge.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := bs.TOTPChallenge(challenge.ID); err != nil || ok {
+		t.Fatalf("totp challenge should be burned at attempt cap: ok=%v err=%v", ok, err)
+	}
+
+	ddns, ok, err := bs.DDNSProfile("d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddnsForNode, err := bs.DDNSProfilesForNode("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || ddns.CFAPIToken != cfTokenPlain || len(ddnsForNode) != 1 || ddnsForNode[0].WebhookHeaders != webhookHdrPlain {
+		t.Fatalf("ddns profile not decrypted: ok=%v profile=%+v node=%+v", ok, ddns, ddnsForNode)
+	}
+	notify, err := bs.NotifyChannels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabledNotify, err := bs.EnabledNotifyChannels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(notify) != 1 || notify[0].Config["bot_token"] != botTokenPlain || len(enabledNotify) != 1 || enabledNotify[0].Config["chat_id"] != chatIDPlain {
+		t.Fatalf("notify channel not decrypted: all=%+v enabled=%+v", notify, enabledNotify)
+	}
+	provider, ok, err := bs.OIDCProvider("google")
+	if err != nil {
+		t.Fatal(err)
+	}
+	enabledProviders, err := bs.EnabledOIDCProviders()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || provider.ClientSecret != "oidc-client-secret" || len(enabledProviders) != 1 {
+		t.Fatalf("oidc provider not decrypted: ok=%v provider=%+v enabled=%+v", ok, provider, enabledProviders)
+	}
+	gotIDN, ok, err := bs.OIDCIdentity("google", "sub-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotIDN.UserID != "u1" {
+		t.Fatalf("oidc identity not recovered: ok=%v identity=%+v", ok, gotIDN)
+	}
+	gotOIDCState, ok, err := bs.ConsumeOIDCAuthState(oidcState.State)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotOIDCState.CodeVerifier != oidcState.CodeVerifier {
+		t.Fatalf("oidc auth state not decrypted/consumed: ok=%v state=%+v", ok, gotOIDCState)
+	}
+	if _, ok, err := bs.ConsumeOIDCAuthState(oidcState.State); err != nil || ok {
+		t.Fatalf("oidc auth state should be single-use: ok=%v err=%v", ok, err)
+	}
+	if err := bs.DeleteDDNSProfile("d1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteNotifyChannel("ch1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteOIDCProvider("google"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteSession(session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := bs.Session(session.ID); err != nil || ok {
+		t.Fatalf("session should be deleted: ok=%v err=%v", ok, err)
+	}
+	if err := bs.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := reopened.User("u1"); err != nil || !ok {
+		t.Fatalf("user did not persist across reopen: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := reopened.OIDCProvider("google"); err != nil || ok {
+		t.Fatalf("deleted provider should stay deleted across reopen: ok=%v err=%v", ok, err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wrongKey, err := OpenBoltState(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer wrongKey.Close()
+	if _, _, err := wrongKey.User("u1"); err == nil {
+		t.Fatal("expected wrong key to fail record-level user decrypt")
+	}
+	if _, err := wrongKey.ExportState(); err == nil {
+		t.Fatal("expected wrong key to fail full bbolt export")
+	}
+}
+
+func TestBoltStateDisabledCipherExportNormalizesOpaqueAuthKeys(t *testing.T) {
+	bs, err := OpenBoltState(filepath.Join(t.TempDir(), "state.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+
+	session, err := auth.NewSession("u1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutSession(session); err != nil {
+		t.Fatal(err)
+	}
+	challenge, err := auth.NewTOTPChallenge("u1", "198.51.100.3", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutTOTPChallenge(challenge); err != nil {
+		t.Fatal(err)
+	}
+	oidcState, err := auth.NewOIDCAuthState("google", "198.51.100.3", "/", "verifier", "binding", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutOIDCAuthState(oidcState); err != nil {
+		t.Fatal(err)
+	}
+
+	exported, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := exported.Sessions[session.ID]; !ok {
+		t.Fatalf("session export should be keyed by plaintext id, got keys: %+v", exported.Sessions)
+	}
+	if _, ok := exported.TOTPChallenges[challenge.ID]; !ok {
+		t.Fatalf("totp challenge export should be keyed by plaintext id, got keys: %+v", exported.TOTPChallenges)
+	}
+	if _, ok := exported.OIDCAuthStates[oidcState.State]; !ok {
+		t.Fatalf("oidc auth state export should be keyed by plaintext state, got keys: %+v", exported.OIDCAuthStates)
+	}
+}

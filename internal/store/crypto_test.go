@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/secret"
 )
 
@@ -294,5 +296,72 @@ func TestOpenAutoResolvesAndPersistsEncrypted(t *testing.T) {
 	d, ok := s2.DDNSProfile("d1")
 	if !ok || d.CFAPIToken != cfTokenPlain {
 		t.Fatalf("auto-resolve round trip failed: %+v", d)
+	}
+}
+
+func TestAuthFlowSecretsEncryptedAtRest(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	c := testCipher(t)
+
+	s, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess, err := auth.NewSession("u1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSession(sess); err != nil {
+		t.Fatal(err)
+	}
+	challenge, err := auth.NewTOTPChallenge("u1", "198.51.100.1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutTOTPChallenge(challenge); err != nil {
+		t.Fatal(err)
+	}
+	oidcState, err := auth.NewOIDCAuthState("google", "198.51.100.1", "/", "pkce-verifier-secret", "browser-binding-secret", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOIDCAuthState(oidcState); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := string(raw)
+	for _, leak := range []string{sess.ID, sess.CSRFToken, challenge.ID, oidcState.State, oidcState.CodeVerifier} {
+		if strings.Contains(disk, leak) {
+			t.Fatalf("auth-flow secret leaked to disk: %q", leak)
+		}
+	}
+	if !strings.Contains(disk, "lat$1$") {
+		t.Fatal("expected auth-flow encrypted envelopes on disk")
+	}
+
+	reopened, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSession, ok := reopened.Session(sess.ID)
+	if !ok || gotSession.CSRFToken != sess.CSRFToken {
+		t.Fatalf("session did not decrypt: ok=%v session=%+v", ok, gotSession)
+	}
+	gotChallenge, ok := reopened.TOTPChallenge(challenge.ID)
+	if !ok || gotChallenge.UserID != "u1" {
+		t.Fatalf("totp challenge did not decrypt: ok=%v challenge=%+v", ok, gotChallenge)
+	}
+	gotOIDCState, ok := reopened.ConsumeOIDCAuthState(oidcState.State)
+	if !ok || gotOIDCState.CodeVerifier != oidcState.CodeVerifier {
+		t.Fatalf("oidc auth state did not decrypt/consume: ok=%v state=%+v", ok, gotOIDCState)
+	}
+
+	if _, err := OpenWithCipher(path, testCipher(t)); err == nil {
+		t.Fatal("expected wrong key to reject auth-flow encrypted state")
 	}
 }

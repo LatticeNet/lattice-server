@@ -222,3 +222,140 @@ func TestBoltStateRecordLevelOpsPersistAcrossReopen(t *testing.T) {
 		t.Fatalf("audit did not persist across reopen: %+v", events)
 	}
 }
+
+func TestBoltStateRecordLevelStaticWorkerPluginAndApproval(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	c := testCipher(t)
+	now := time.Unix(1_700_000_300, 0).UTC()
+	st := emptyState()
+	st.Nodes["n1"] = model.Node{ID: "n1", Name: "keep me", CreatedAt: now}
+
+	bs, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.ImportState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := bs.PutStatic(model.StaticObject{Bucket: "site", Path: "z.html", Content: "last", ContentType: "text/html"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutStatic(model.StaticObject{Bucket: "site", Path: "a.html", Content: "first", ContentType: "text/html"}); err != nil {
+		t.Fatal(err)
+	}
+	static, err := bs.Static("site")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(static) != 2 || static[0].Path != "a.html" || static[0].Size != len("first") || static[0].UpdatedAt.IsZero() || static[1].Path != "z.html" {
+		t.Fatalf("static entries not sorted/sized/timestamped: %+v", static)
+	}
+
+	if err := bs.UpsertWorker(model.WorkerScript{ID: "w2", Name: "Zulu", Source: "return 2"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertWorker(model.WorkerScript{ID: "w1", Name: "Alpha", Source: "return 1"}); err != nil {
+		t.Fatal(err)
+	}
+	workers, err := bs.Workers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workers) != 2 || workers[0].Name != "Alpha" || workers[0].UpdatedAt.IsZero() || workers[1].Name != "Zulu" {
+		t.Fatalf("workers not sorted/timestamped: %+v", workers)
+	}
+
+	plugin := model.PluginInstallation{ID: "plug.b", Name: "Plugin B", Capabilities: []string{"kv:read"}}
+	if err := bs.UpsertPluginInstallation(plugin); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertPluginInstallation(model.PluginInstallation{ID: "plug.a", Name: "Plugin A", Capabilities: []string{"log:write"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.SetPluginStatus("plug.b", model.PluginStatusInstalled); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.SetPluginStatus("plug.b", model.PluginStatusActive); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.SetPluginStatus("plug.b", model.PluginStatusInstalled); err == nil {
+		t.Fatal("expected invalid active -> installed plugin transition to fail")
+	}
+	gotPlugin, ok, err := bs.PluginInstallation("plug.b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotPlugin.Status != model.PluginStatusActive || gotPlugin.CreatedAt.IsZero() || gotPlugin.ActivatedAt.IsZero() {
+		t.Fatalf("plugin lifecycle state not stamped correctly: ok=%v plugin=%+v", ok, gotPlugin)
+	}
+	gotPlugin.Capabilities[0] = "mutated"
+	gotPluginAgain, ok, err := bs.PluginInstallation("plug.b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || gotPluginAgain.Capabilities[0] != "kv:read" {
+		t.Fatalf("plugin capabilities should be cloned on read: ok=%v plugin=%+v", ok, gotPluginAgain)
+	}
+	plugins, err := bs.PluginInstallations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plugins) != 2 || plugins[0].ID != "plug.a" || plugins[1].ID != "plug.b" {
+		t.Fatalf("plugin installations not sorted by id: %+v", plugins)
+	}
+
+	if err := bs.UpsertApproval(model.Approval{ID: "ap-old", NodeID: "n1", Plugin: "nft", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertApproval(model.Approval{ID: "ap-new", NodeID: "n1", Plugin: "wireguard", CreatedAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	approval, ok, err := bs.Approval("ap-new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || approval.Plugin != "wireguard" || approval.UpdatedAt.IsZero() {
+		t.Fatalf("approval not recovered/timestamped: ok=%v approval=%+v", ok, approval)
+	}
+	approvals, err := bs.Approvals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(approvals) != 2 || approvals[0].ID != "ap-new" || approvals[1].ID != "ap-old" {
+		t.Fatalf("approvals not sorted newest-first: %+v", approvals)
+	}
+
+	exported, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exported.Nodes["n1"].Name != "keep me" {
+		t.Fatalf("record-level writes reset unrelated node bucket: %+v", exported.Nodes)
+	}
+	if err := bs.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	static, err = reopened.Static("site")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plugins, err = reopened.PluginInstallations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvals, err = reopened.Approvals()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(static) != 2 || len(plugins) != 2 || len(approvals) != 2 {
+		t.Fatalf("record-level static/plugin/approval writes did not persist: static=%+v plugins=%+v approvals=%+v", static, plugins, approvals)
+	}
+}

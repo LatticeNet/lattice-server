@@ -431,6 +431,230 @@ func (bs *BoltStateStore) AuditEvents() ([]model.AuditEvent, error) {
 	return events, nil
 }
 
+func (bs *BoltStateStore) PutStatic(obj model.StaticObject) error {
+	obj.UpdatedAt = time.Now().UTC()
+	obj.Size = len(obj.Content)
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketStatic, obj.Bucket+"/"+obj.Path, obj)
+	})
+}
+
+func (bs *BoltStateStore) Static(bucket string) ([]model.StaticObject, error) {
+	objects := []model.StaticObject{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.StaticObject](tx, boltBucketStatic)
+		if err != nil {
+			return err
+		}
+		for _, obj := range all {
+			if obj.Bucket == bucket {
+				objects = append(objects, obj)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(objects, func(i, j int) bool { return objects[i].Path < objects[j].Path })
+	return objects, nil
+}
+
+func (bs *BoltStateStore) UpsertWorker(w model.WorkerScript) error {
+	w.UpdatedAt = time.Now().UTC()
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketWorkers, w.ID, w)
+	})
+}
+
+func (bs *BoltStateStore) Workers() ([]model.WorkerScript, error) {
+	workers := []model.WorkerScript{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		workers, err = listMapValues[model.WorkerScript](tx, boltBucketWorkers)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
+	return workers, nil
+}
+
+func (bs *BoltStateStore) UpsertPluginInstallation(p model.PluginInstallation) error {
+	if p.ID == "" {
+		return errors.New("plugin id is required")
+	}
+	if p.Status == "" {
+		p.Status = model.PluginStatusVerified
+	}
+	if !validPluginStatus(p.Status) {
+		return fmt.Errorf("invalid plugin status %q", p.Status)
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		existing, hadExisting, err := getPluginInstallationRecord(tx, p.ID)
+		if err != nil {
+			return err
+		}
+		if hadExisting && !validPluginTransition(existing.Status, p.Status) && existing.Status != p.Status {
+			return fmt.Errorf("invalid plugin status transition %s -> %s", existing.Status, p.Status)
+		}
+		if hadExisting {
+			if p.CreatedAt.IsZero() {
+				p.CreatedAt = existing.CreatedAt
+			}
+			if p.VerifiedAt.IsZero() {
+				p.VerifiedAt = existing.VerifiedAt
+			}
+			if p.InstalledAt.IsZero() {
+				p.InstalledAt = existing.InstalledAt
+			}
+			if p.ActivatedAt.IsZero() {
+				p.ActivatedAt = existing.ActivatedAt
+			}
+			if p.DisabledAt.IsZero() {
+				p.DisabledAt = existing.DisabledAt
+			}
+		}
+		if p.CreatedAt.IsZero() {
+			p.CreatedAt = now
+		}
+		p.UpdatedAt = now
+		p = stampPluginStatusTime(p, now)
+		p.Capabilities = append([]string(nil), p.Capabilities...)
+		return putRecord(tx, boltBucketPlugins, p.ID, p)
+	})
+}
+
+func (bs *BoltStateStore) PluginInstallation(id string) (model.PluginInstallation, bool, error) {
+	var out model.PluginInstallation
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketPlugins, id, &out)
+		return err
+	})
+	return clonePluginInstallation(out), ok, err
+}
+
+func (bs *BoltStateStore) PluginInstallations() ([]model.PluginInstallation, error) {
+	plugins := []model.PluginInstallation{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		plugins, err = listMapValues[model.PluginInstallation](tx, boltBucketPlugins)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	for i := range plugins {
+		plugins[i] = clonePluginInstallation(plugins[i])
+	}
+	sort.Slice(plugins, func(i, j int) bool { return plugins[i].ID < plugins[j].ID })
+	return plugins, nil
+}
+
+func (bs *BoltStateStore) SetPluginStatus(id, status string) error {
+	if !validPluginStatus(status) {
+		return fmt.Errorf("invalid plugin status %q", status)
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		p, ok, err := getPluginInstallationRecord(tx, id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("plugin installation not found: %s", id)
+		}
+		if p.Status == status {
+			return nil
+		}
+		if !validPluginTransition(p.Status, status) {
+			return fmt.Errorf("invalid plugin status transition %s -> %s", p.Status, status)
+		}
+		now := time.Now().UTC()
+		p.Status = status
+		p.UpdatedAt = now
+		p = stampPluginStatusTime(p, now)
+		return putRecord(tx, boltBucketPlugins, p.ID, p)
+	})
+}
+
+func getPluginInstallationRecord(tx *bolt.Tx, id string) (model.PluginInstallation, bool, error) {
+	var out model.PluginInstallation
+	ok, err := getRecord(tx, boltBucketPlugins, id, &out)
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) UpsertApproval(a model.Approval) error {
+	a.UpdatedAt = time.Now().UTC()
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = a.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketApprovals, a.ID, a)
+	})
+}
+
+func (bs *BoltStateStore) Approval(id string) (model.Approval, bool, error) {
+	var out model.Approval
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketApprovals, id, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) Approvals() ([]model.Approval, error) {
+	approvals := []model.Approval{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		approvals, err = listMapValues[model.Approval](tx, boltBucketApprovals)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(approvals, func(i, j int) bool { return approvals[i].CreatedAt.After(approvals[j].CreatedAt) })
+	return approvals, nil
+}
+
 func putRecord[T any](tx *bolt.Tx, bucket []byte, key string, value T) error {
 	b := tx.Bucket(bucket)
 	if b == nil {

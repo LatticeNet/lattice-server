@@ -120,7 +120,8 @@ the version in `go.mod`; during local multi-repo development, use the
 - `internal/store.BoltStateStore` is the Phase C bbolt foundation. It can import
   and export the full `State`, stores each top-level collection in its own
   bucket, reuses the existing AES-256-GCM secret encryption boundary, and now
-  has first record-level APIs for nodes, KV entries, and audit events.
+  has record-level APIs for nodes, KV entries, audit events, static objects,
+  Worker scripts, plugin lifecycle records, and approvals.
 - The local ops CLI can migrate the encrypted JSON file to bbolt and export
   bbolt back to encrypted JSON:
 

@@ -97,3 +97,128 @@ func TestBoltStateExportEmptyDatabaseReturnsInitializedState(t *testing.T) {
 		t.Fatalf("exported state maps must be initialized: %+v", got)
 	}
 }
+
+func TestBoltStateRecordLevelNodeKVAndAudit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	c := testCipher(t)
+	now := time.Unix(1_700_000_100, 0).UTC()
+	st := emptyState()
+	st.Users["u1"] = model.User{ID: "u1", Username: "admin", CreatedAt: now}
+	st.Nodes["n0"] = model.Node{ID: "n0", Name: "imported", CreatedAt: now}
+	st.Audit = []model.AuditEvent{{ID: "audit-0", At: now.Add(-time.Minute), Action: "imported"}}
+
+	bs, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.ImportState(st); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertNode(model.Node{ID: "n2", Name: "node two"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertNode(model.Node{ID: "n1", Name: "node one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutKV(model.KVEntry{Bucket: "cfg", Key: "z", Value: "last"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutKV(model.KVEntry{Bucket: "cfg", Key: "a", Value: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.AppendAudit(model.AuditEvent{ID: "audit-1", At: now, Action: "record.write"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.AppendAudit(model.AuditEvent{ID: "audit-2", At: now.Add(time.Minute), Action: "record.write"}); err != nil {
+		t.Fatal(err)
+	}
+
+	n, ok, err := bs.Node("n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || n.Name != "node two" || n.CreatedAt.IsZero() {
+		t.Fatalf("record-level node not recovered or timestamped: ok=%v node=%+v", ok, n)
+	}
+	nodes, err := bs.Nodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := []string{nodes[0].ID, nodes[1].ID, nodes[2].ID}; strings.Join(got, ",") != "n0,n1,n2" {
+		t.Fatalf("nodes not sorted by id: %+v", nodes)
+	}
+	kv, err := bs.KV("cfg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kv) != 2 || kv[0].Key != "a" || kv[0].UpdatedAt.IsZero() || kv[1].Key != "z" {
+		t.Fatalf("kv entries not sorted/timestamped: %+v", kv)
+	}
+	events, err := bs.AuditEvents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 || events[0].ID != "audit-2" || events[1].ID != "audit-1" || events[2].ID != "audit-0" {
+		t.Fatalf("audit events not appended/sorted newest-first: %+v", events)
+	}
+	exported, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exported.Users["u1"].Username != "admin" {
+		t.Fatalf("record-level writes reset unrelated buckets: %+v", exported.Users)
+	}
+	if err := bs.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBoltStateRecordLevelOpsPersistAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	c := testCipher(t)
+	bs, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertNode(model.Node{ID: "n1", Name: "node one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.PutKV(model.KVEntry{Bucket: "cfg", Key: "hello", Value: "world"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.AppendAudit(model.AuditEvent{ID: "audit-1", At: time.Unix(1_700_000_200, 0).UTC(), Action: "persist"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	node, ok, err := reopened.Node("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || node.Name != "node one" {
+		t.Fatalf("node did not persist across reopen: ok=%v node=%+v", ok, node)
+	}
+	kv, err := reopened.KV("cfg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kv) != 1 || kv[0].Value != "world" {
+		t.Fatalf("kv did not persist across reopen: %+v", kv)
+	}
+	events, err := reopened.AuditEvents()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].ID != "audit-1" {
+		t.Fatalf("audit did not persist across reopen: %+v", events)
+	}
+}

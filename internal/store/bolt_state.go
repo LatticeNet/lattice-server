@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"time"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/secret"
 	bolt "go.etcd.io/bbolt"
 )
@@ -312,6 +315,181 @@ func checkBoltVersion(tx *bolt.Tx) error {
 	return nil
 }
 
+func (bs *BoltStateStore) UpsertNode(n model.Node) error {
+	if n.CreatedAt.IsZero() {
+		n.CreatedAt = time.Now().UTC()
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketNodes, n.ID, n)
+	})
+}
+
+func (bs *BoltStateStore) Node(id string) (model.Node, bool, error) {
+	var out model.Node
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketNodes, id, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) Nodes() ([]model.Node, error) {
+	nodes := []model.Node{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		nodes, err = listMapValues[model.Node](tx, boltBucketNodes)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].ID < nodes[j].ID })
+	return nodes, nil
+}
+
+func (bs *BoltStateStore) PutKV(entry model.KVEntry) error {
+	entry.UpdatedAt = time.Now().UTC()
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketKV, entry.Bucket+"/"+entry.Key, entry)
+	})
+}
+
+func (bs *BoltStateStore) KV(bucket string) ([]model.KVEntry, error) {
+	entries := []model.KVEntry{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.KVEntry](tx, boltBucketKV)
+		if err != nil {
+			return err
+		}
+		for _, entry := range all {
+			if entry.Bucket == bucket {
+				entries = append(entries, entry)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
+	return entries, nil
+}
+
+func (bs *BoltStateStore) AppendAudit(ev model.AuditEvent) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		b := tx.Bucket(boltBucketAudit)
+		if b == nil {
+			return fmt.Errorf("missing bucket %q", string(boltBucketAudit))
+		}
+		next, err := nextSequenceIndex(boltBucketAudit, b)
+		if err != nil {
+			return err
+		}
+		data, err := json.Marshal(ev)
+		if err != nil {
+			return fmt.Errorf("marshal %s[%d]: %w", boltBucketAudit, next, err)
+		}
+		if err := b.Put(sequenceKey(next), data); err != nil {
+			return fmt.Errorf("put %s[%d]: %w", boltBucketAudit, next, err)
+		}
+		return nil
+	})
+}
+
+func (bs *BoltStateStore) AuditEvents() ([]model.AuditEvent, error) {
+	events := []model.AuditEvent{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return readSlice(tx, boltBucketAudit, &events)
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].At.After(events[j].At) })
+	return events, nil
+}
+
+func putRecord[T any](tx *bolt.Tx, bucket []byte, key string, value T) error {
+	b := tx.Bucket(bucket)
+	if b == nil {
+		return fmt.Errorf("missing bucket %q", string(bucket))
+	}
+	k, err := boltStringKey(key)
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("marshal %s[%q]: %w", bucket, key, err)
+	}
+	if err := b.Put(k, data); err != nil {
+		return fmt.Errorf("put %s[%q]: %w", bucket, key, err)
+	}
+	return nil
+}
+
+func getRecord[T any](tx *bolt.Tx, bucket []byte, key string, out *T) (bool, error) {
+	b := tx.Bucket(bucket)
+	if b == nil {
+		return false, nil
+	}
+	k, err := boltStringKey(key)
+	if err != nil {
+		return false, err
+	}
+	data := b.Get(k)
+	if data == nil {
+		return false, nil
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return false, fmt.Errorf("decode %s[%q]: %w", bucket, key, err)
+	}
+	return true, nil
+}
+
+func listMapValues[T any](tx *bolt.Tx, bucket []byte) ([]T, error) {
+	out := []T{}
+	b := tx.Bucket(bucket)
+	if b == nil {
+		return out, nil
+	}
+	err := b.ForEach(func(k, v []byte) error {
+		var value T
+		if err := json.Unmarshal(v, &value); err != nil {
+			key, keyErr := stringFromBoltKey(k)
+			if keyErr != nil {
+				key = string(k)
+			}
+			return fmt.Errorf("decode %s[%q]: %w", bucket, key, err)
+		}
+		out = append(out, value)
+		return nil
+	})
+	return out, err
+}
+
 func putMap[T any](tx *bolt.Tx, bucket []byte, values map[string]T) error {
 	b := tx.Bucket(bucket)
 	if b == nil {
@@ -387,6 +565,18 @@ func readSlice[T any](tx *bolt.Tx, bucket []byte, out *[]T) error {
 	}
 	*out = values
 	return nil
+}
+
+func nextSequenceIndex(bucketName []byte, b *bolt.Bucket) (int, error) {
+	k, _ := b.Cursor().Last()
+	if k == nil {
+		return 0, nil
+	}
+	last, err := strconv.Atoi(string(k))
+	if err != nil {
+		return 0, fmt.Errorf("decode %s sequence key %q: %w", bucketName, string(k), err)
+	}
+	return last + 1, nil
 }
 
 func boltStringKey(key string) ([]byte, error) {

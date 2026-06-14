@@ -25,8 +25,12 @@ type approvalView struct {
 }
 
 func toApprovalView(a model.Approval) approvalView {
+	action := a.Action
+	if a.Plugin == "nftpolicy" {
+		action = nftPolicyApprovalDisplayAction(a.Action)
+	}
 	return approvalView{
-		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: a.Action,
+		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
 		Plan: a.Plan, Status: a.Status, ActorID: a.ActorID,
 		ApprovedBy: a.ApprovedBy, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 	}

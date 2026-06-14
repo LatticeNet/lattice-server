@@ -9,7 +9,9 @@ import (
 	"net/netip"
 	"net/url"
 	"reflect"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -17,6 +19,8 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/netpolicy"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
+
+var controlPlaneHostRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
 
 type netPolicyView struct {
 	ID             string          `json:"id"`
@@ -137,7 +141,7 @@ func (s *Server) handleNetPolicyPlan(w http.ResponseWriter, r *http.Request, p p
 		ID:        id.New("approval"),
 		NodeID:    policy.TargetNodeID,
 		Plugin:    "nftpolicy",
-		Action:    "apply-ruleset",
+		Action:    nftPolicyApprovalAction(s.publicURL),
 		Plan:      plan,
 		Status:    model.ApprovalPending,
 		ActorID:   p.ActorID,
@@ -176,11 +180,32 @@ func (s *Server) netPolicyCompileOptions() (netpolicy.CompileOptions, error) {
 	}
 	host := u.Hostname()
 	addr, err := netip.ParseAddr(host)
-	if err != nil || !addr.Is4() {
-		return netpolicy.CompileOptions{}, fmt.Errorf("public_url host %q must be an IPv4 literal for netpolicy apply; DNS-driven allowlists are a later design slice", host)
+	if err == nil {
+		if !addr.Is4() {
+			return netpolicy.CompileOptions{}, fmt.Errorf("public_url host %q must be IPv4 or an HTTPS hostname for netpolicy apply; IPv6 is a later design slice", host)
+		}
+		if u.Scheme == "http" && !addr.IsLoopback() {
+			return netpolicy.CompileOptions{}, errors.New("public_url must use https for non-loopback netpolicy apply")
+		}
+		port := 0
+		if rawPort := u.Port(); rawPort != "" {
+			port, err = strconv.Atoi(rawPort)
+			if err != nil || port < 1 || port > 65535 {
+				return netpolicy.CompileOptions{}, fmt.Errorf("invalid public_url port %q", rawPort)
+			}
+		} else if u.Scheme == "https" {
+			port = 443
+		} else {
+			port = 80
+		}
+		return netpolicy.CompileOptions{ControlPlaneIPv4: addr, ControlPlanePort: port}, nil
 	}
-	if u.Scheme == "http" && !addr.IsLoopback() {
-		return netpolicy.CompileOptions{}, errors.New("public_url must use https for non-loopback netpolicy apply")
+	if u.Scheme != "https" {
+		return netpolicy.CompileOptions{}, errors.New("public_url must use https when host is not an IPv4 literal")
+	}
+	host, err = normalizeControlPlaneHost(host)
+	if err != nil {
+		return netpolicy.CompileOptions{}, err
 	}
 	port := 0
 	if rawPort := u.Port(); rawPort != "" {
@@ -190,10 +215,24 @@ func (s *Server) netPolicyCompileOptions() (netpolicy.CompileOptions, error) {
 		}
 	} else if u.Scheme == "https" {
 		port = 443
-	} else {
-		port = 80
 	}
-	return netpolicy.CompileOptions{ControlPlaneIPv4: addr, ControlPlanePort: port}, nil
+	return netpolicy.CompileOptions{ControlPlaneHost: host, ControlPlanePort: port}, nil
+}
+
+func normalizeControlPlaneHost(host string) (string, error) {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if host == "" || len(host) > 253 {
+		return "", fmt.Errorf("invalid public_url hostname %q", host)
+	}
+	if !controlPlaneHostRe.MatchString(host) {
+		return "", fmt.Errorf("invalid public_url hostname %q", host)
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) > 63 {
+			return "", fmt.Errorf("invalid public_url hostname %q: label too long", host)
+		}
+	}
+	return host, nil
 }
 
 func sameNetPolicyIntent(a, b model.NetPolicy) bool {

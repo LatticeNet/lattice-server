@@ -64,6 +64,54 @@ func TestCompileEgressRulesetRendersDeterministicPolicy(t *testing.T) {
 	}
 }
 
+func TestCompileEgressRulesetRendersDomainControlPlaneSet(t *testing.T) {
+	got, err := CompileEgressRuleset(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{{
+			ID:        "deny-all",
+			Action:    model.NetRuleDeny,
+			Direction: model.NetDirEgress,
+			Protocol:  model.NetProtoTCP,
+			Ports:     []int{22},
+			Remote:    model.NetEndpoint{Kind: model.NetRefAny},
+		}},
+	}, func(id string) (model.Node, bool) {
+		return model.Node{ID: id, WireGuardIP: "10.66.0.1"}, true
+	}, CompileOptions{ControlPlaneHost: "lattice.example.com", ControlPlanePort: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{
+		"set lattice_control4",
+		"type ipv4_addr",
+		"flags interval",
+		"ip daddr @lattice_control4 tcp dport 443 accept comment \"lattice control-plane domain\"",
+		"udp dport 53 accept comment \"lattice dns udp\"",
+		"tcp dport 53 accept comment \"lattice dns tcp\"",
+		"tcp dport 22 drop comment \"lattice rule deny-all\"",
+	} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("compiled domain ruleset missing %q:\n%s", needle, got)
+		}
+	}
+	if strings.Index(got, "lattice control-plane domain") > strings.Index(got, "deny-all") {
+		t.Fatalf("domain control-plane allow must be emitted before operator rules:\n%s", got)
+	}
+}
+
+func TestCompileEgressRulesetRejectsAmbiguousControlPlane(t *testing.T) {
+	_, err := CompileEgressRuleset(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+	}, func(id string) (model.Node, bool) {
+		return model.Node{ID: id, WireGuardIP: "10.66.0.1"}, true
+	}, CompileOptions{ControlPlaneIPv4: netip.MustParseAddr("203.0.113.99"), ControlPlaneHost: "lattice.example.com", ControlPlanePort: 443})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("expected mutually exclusive control-plane error, got %v", err)
+	}
+}
+
 func TestCompileEgressRulesetRejectsIngress(t *testing.T) {
 	_, err := CompileEgressRuleset(model.NetPolicy{
 		TargetNodeID: "node-a",

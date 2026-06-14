@@ -14,6 +14,7 @@ import (
 
 type CompileOptions struct {
 	ControlPlaneIPv4 netip.Addr
+	ControlPlaneHost string
 	ControlPlanePort int
 }
 
@@ -28,11 +29,8 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 	if !policy.Enabled {
 		return "", errors.New("netpolicy is disabled")
 	}
-	if !opts.ControlPlaneIPv4.IsValid() || !opts.ControlPlaneIPv4.Is4() {
-		return "", errors.New("control-plane IPv4 is required")
-	}
-	if opts.ControlPlanePort < 1 || opts.ControlPlanePort > 65535 {
-		return "", fmt.Errorf("invalid control-plane port %d", opts.ControlPlanePort)
+	if err := validateCompileOptions(opts); err != nil {
+		return "", err
 	}
 	normalized, err := NormalizePolicy(policy, resolve)
 	if err != nil {
@@ -46,11 +44,17 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 	var b strings.Builder
 	b.WriteString("destroy table inet lattice_policy\n")
 	b.WriteString("table inet lattice_policy {\n")
+	if opts.ControlPlaneHost != "" {
+		b.WriteString("\tset lattice_control4 {\n")
+		b.WriteString("\t\ttype ipv4_addr\n")
+		b.WriteString("\t\tflags interval\n")
+		b.WriteString("\t}\n\n")
+	}
 	b.WriteString("\tchain output {\n")
 	b.WriteString("\t\ttype filter hook output priority 0; policy drop;\n")
 	b.WriteString("\t\tct state established,related accept comment \"lattice established\"\n")
 	b.WriteString("\t\toifname \"lo\" accept comment \"lattice loopback\"\n")
-	fmt.Fprintf(&b, "\t\tip daddr %s tcp dport %d accept comment \"lattice control-plane\"\n", opts.ControlPlaneIPv4.String(), opts.ControlPlanePort)
+	b.WriteString(controlPlaneAllowLine(opts))
 	b.WriteString("\t\tudp dport 53 accept comment \"lattice dns udp\"\n")
 	b.WriteString("\t\ttcp dport 53 accept comment \"lattice dns tcp\"\n")
 
@@ -74,6 +78,36 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")
 	return b.String(), nil
+}
+
+func validateCompileOptions(opts CompileOptions) error {
+	if opts.ControlPlanePort < 1 || opts.ControlPlanePort > 65535 {
+		return fmt.Errorf("invalid control-plane port %d", opts.ControlPlanePort)
+	}
+	hasIPv4 := opts.ControlPlaneIPv4.IsValid()
+	hasHost := strings.TrimSpace(opts.ControlPlaneHost) != ""
+	switch {
+	case hasIPv4 && hasHost:
+		return errors.New("control-plane IPv4 and host are mutually exclusive")
+	case hasIPv4:
+		if !opts.ControlPlaneIPv4.Is4() {
+			return errors.New("control-plane IPv4 must be IPv4")
+		}
+	case hasHost:
+		if strings.TrimSpace(opts.ControlPlaneHost) != opts.ControlPlaneHost {
+			return errors.New("control-plane host must be normalized")
+		}
+	default:
+		return errors.New("control-plane IPv4 or host is required")
+	}
+	return nil
+}
+
+func controlPlaneAllowLine(opts CompileOptions) string {
+	if opts.ControlPlaneHost != "" {
+		return fmt.Sprintf("\t\tip daddr @lattice_control4 tcp dport %d accept comment \"lattice control-plane domain\"\n", opts.ControlPlanePort)
+	}
+	return fmt.Sprintf("\t\tip daddr %s tcp dport %d accept comment \"lattice control-plane\"\n", opts.ControlPlaneIPv4.String(), opts.ControlPlanePort)
 }
 
 // CompileIngressInputRules extracts the ingress side of a per-node NetPolicy

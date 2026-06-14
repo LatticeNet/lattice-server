@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"path"
 	"path/filepath"
 	"sort"
@@ -2898,13 +2899,61 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 			"wg-quick down wg0 2>/dev/null || true\n" +
 			"wg-quick up wg0\n"
 	case "nftpolicy":
-		return nftPolicyApplyScript(approval.Plan, serverURL)
+		planServerURL, err := nftPolicyApprovalServerURL(approval, serverURL)
+		if err != nil {
+			return "set -e\n" +
+				"echo " + shellQuote("lattice nftpolicy: invalid approval action: "+err.Error()) + " >&2\n" +
+				"exit 1\n"
+		}
+		return nftPolicyApplyScript(approval.Plan, planServerURL)
 	case "nft":
 		return nftGuardApplyScript(approval.Plan, serverURL)
 	default:
 		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
 			"nft -c -f /tmp/lattice-nft-plan.nft\n"
 	}
+}
+
+const (
+	nftPolicyApplyAction       = "apply-ruleset"
+	nftPolicyApplyActionPrefix = nftPolicyApplyAction + ":"
+)
+
+func nftPolicyApprovalAction(serverURL string) string {
+	serverURL = strings.TrimRight(serverURL, "/")
+	if serverURL == "" {
+		return nftPolicyApplyAction
+	}
+	return nftPolicyApplyActionPrefix + base64.RawURLEncoding.EncodeToString([]byte(serverURL))
+}
+
+func nftPolicyApprovalDisplayAction(action string) string {
+	if action == nftPolicyApplyAction || strings.HasPrefix(action, nftPolicyApplyActionPrefix) {
+		return nftPolicyApplyAction
+	}
+	return action
+}
+
+func nftPolicyApprovalServerURL(approval model.Approval, fallback string) (string, error) {
+	if approval.Plugin != "nftpolicy" {
+		return fallback, nil
+	}
+	if approval.Action == nftPolicyApplyAction {
+		return fallback, nil
+	}
+	if !strings.HasPrefix(approval.Action, nftPolicyApplyActionPrefix) {
+		return "", fmt.Errorf("unexpected action %q", approval.Action)
+	}
+	encoded := strings.TrimPrefix(approval.Action, nftPolicyApplyActionPrefix)
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	serverURL := strings.TrimRight(string(decoded), "/")
+	if serverURL == "" {
+		return "", errors.New("empty bound server url")
+	}
+	return serverURL, nil
 }
 
 func nftGuardApplyScript(plan, serverURL string) string {
@@ -2949,6 +2998,10 @@ func nftGuardApplyScript(plan, serverURL string) string {
 
 func nftPolicyApplyScript(plan, serverURL string) string {
 	serverURL = strings.TrimRight(serverURL, "/")
+	domainSetUpdate := ""
+	if host, ok := controlPlaneDomainSetHost(serverURL); ok {
+		domainSetUpdate = nftPolicyDomainSetUpdateScript(host)
+	}
 	return "set -e\n" +
 		"umask 077\n" +
 		"mkdir -p /etc/lattice\n" +
@@ -2973,12 +3026,38 @@ func nftPolicyApplyScript(plan, serverURL string) string {
 		"( sleep 60; echo 'lattice nftpolicy: watchdog rollback fired' >&2; rollback ) &\n" +
 		"WATCHDOG=$!\n" +
 		"nft -f \"$CANDIDATE\"\n" +
+		domainSetUpdate +
 		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
 		"\"$AGENT_BIN\" --selfcheck-controlplane -server " + shellQuote(serverURL) + "\n" +
 		"trap - ERR\n" +
 		"cleanup_watchdog\n" +
 		"mv \"$CANDIDATE\" \"$ACTIVE\"\n" +
 		"echo 'lattice nftpolicy: applied and verified'\n"
+}
+
+func controlPlaneDomainSetHost(serverURL string) (string, bool) {
+	u, err := url.Parse(strings.TrimRight(serverURL, "/"))
+	if err != nil || u.Hostname() == "" {
+		return "", false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	if addr, err := netip.ParseAddr(host); err == nil && addr.Is4() {
+		return "", false
+	}
+	host, err = normalizeControlPlaneHost(host)
+	if err != nil {
+		return "", false
+	}
+	return host, true
+}
+
+func nftPolicyDomainSetUpdateScript(host string) string {
+	return "CONTROL_HOST=" + shellQuote(host) + "\n" +
+		"CONTROL4=$(getent ahostsv4 \"$CONTROL_HOST\" 2>/dev/null | awk '$1 ~ /^[0-9]+([.][0-9]+){3}$/ { if (!seen[$1]++) { out = out (out ? \", \" : \"\") $1 } } END { print out }')\n" +
+		"if [ -z \"$CONTROL4\" ]; then echo \"lattice nftpolicy: no IPv4 A records resolved for $CONTROL_HOST\" >&2; exit 1; fi\n" +
+		"nft flush set inet lattice_policy lattice_control4\n" +
+		"nft add element inet lattice_policy lattice_control4 \"{ $CONTROL4 }\"\n" +
+		"echo \"lattice nftpolicy: control-plane IPv4 set updated for $CONTROL_HOST\"\n"
 }
 
 func shellQuote(value string) string {

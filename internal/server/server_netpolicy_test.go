@@ -319,7 +319,7 @@ func TestNetPolicyStalePlanCannotApproveOrMarkCurrentPolicyApplied(t *testing.T)
 	}
 }
 
-func TestNetPolicyPlanRejectsIngressAndDomainPublicURL(t *testing.T) {
+func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T) {
 	handler, _ := newTestServerWithPublicURL(t, "https://203.0.113.99")
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
@@ -338,7 +338,7 @@ func TestNetPolicyPlanRejectsIngressAndDomainPublicURL(t *testing.T) {
 		t.Fatalf("ingress policy should be rejected at plan time, got %d", plan.StatusCode)
 	}
 
-	domainHandler, _ := newTestServerWithPublicURL(t, "https://lattice.example.com")
+	domainHandler, domainStore := newTestServerWithPublicURL(t, "https://lattice.example.com")
 	domainCookies, domainCSRF := loginSession(t, domainHandler)
 	enrollNamedNodeToken(t, domainHandler, domainCookies, domainCSRF, "node-a", "Node A")
 	domainCreate := doJSON(t, domainHandler, http.MethodPost, "/api/netpolicy", `{
@@ -351,9 +351,66 @@ func TestNetPolicyPlanRejectsIngressAndDomainPublicURL(t *testing.T) {
 		t.Fatalf("create domain policy failed: %d", domainCreate.StatusCode)
 	}
 	domainPlan := doJSON(t, domainHandler, http.MethodPost, "/api/netpolicy/plan", `{"node_id":"node-a"}`, domainCookies, domainCSRF)
-	domainPlan.Body.Close()
-	if domainPlan.StatusCode != http.StatusBadRequest {
-		t.Fatalf("domain public_url should be rejected for MVP, got %d", domainPlan.StatusCode)
+	defer domainPlan.Body.Close()
+	if domainPlan.StatusCode != http.StatusOK {
+		t.Fatalf("HTTPS domain public_url should be accepted, got %d", domainPlan.StatusCode)
+	}
+	var domainApproval approvalView
+	if err := json.NewDecoder(domainPlan.Body).Decode(&domainApproval); err != nil {
+		t.Fatal(err)
+	}
+	if domainApproval.Plugin != "nftpolicy" || domainApproval.Action != "apply-ruleset" {
+		t.Fatalf("bad domain approval: %+v", domainApproval)
+	}
+	storedBeforeApprove, ok := domainStore.Approval(domainApproval.ID)
+	if !ok {
+		t.Fatalf("stored domain approval missing")
+	}
+	if storedBeforeApprove.Action == domainApproval.Action || !strings.HasPrefix(storedBeforeApprove.Action, nftPolicyApplyActionPrefix) {
+		t.Fatalf("stored approval action should bind public_url while view stays stable: stored=%q view=%q", storedBeforeApprove.Action, domainApproval.Action)
+	}
+	for _, needle := range []string{
+		"set lattice_control4",
+		"ip daddr @lattice_control4 tcp dport 443 accept comment \"lattice control-plane domain\"",
+		"udp dport 53 accept comment \"lattice dns udp\"",
+		"tcp dport 53 accept comment \"lattice dns tcp\"",
+	} {
+		if !strings.Contains(domainApproval.Plan, needle) {
+			t.Fatalf("domain plan missing %q:\n%s", needle, domainApproval.Plan)
+		}
+	}
+	if strings.Contains(domainApproval.Plan, "ip daddr lattice.example.com") {
+		t.Fatalf("domain plan must not render hostname as an nft address literal:\n%s", domainApproval.Plan)
+	}
+	approveDomain := doJSON(t, domainHandler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{
+			"approval_id": domainApproval.ID,
+			"queue_apply": true,
+			"plan_sha256": planSHA256(domainApproval.Plan),
+		})), domainCookies, domainCSRF)
+	approveDomain.Body.Close()
+	if approveDomain.StatusCode != http.StatusOK {
+		t.Fatalf("approve domain plan failed: %d", approveDomain.StatusCode)
+	}
+	scriptFromChangedServerURL := applyScriptForWithServer(storedBeforeApprove, "https://203.0.113.99")
+	if !strings.Contains(scriptFromChangedServerURL, "CONTROL_HOST='lattice.example.com'") ||
+		!strings.Contains(scriptFromChangedServerURL, "--selfcheck-controlplane -server 'https://lattice.example.com'") {
+		t.Fatalf("nftpolicy apply script must use the plan-bound public_url, not the current server setting:\n%s", scriptFromChangedServerURL)
+	}
+	domainTasks := domainStore.Tasks()
+	if len(domainTasks) != 1 {
+		t.Fatalf("expected one queued domain apply task, got %+v", domainTasks)
+	}
+	for _, needle := range []string{
+		"CONTROL_HOST='lattice.example.com'",
+		"getent ahostsv4 \"$CONTROL_HOST\"",
+		"nft flush set inet lattice_policy lattice_control4",
+		"nft add element inet lattice_policy lattice_control4",
+		"--selfcheck-controlplane -server 'https://lattice.example.com'",
+	} {
+		if !strings.Contains(domainTasks[0].Script, needle) {
+			t.Fatalf("domain apply script missing %q:\n%s", needle, domainTasks[0].Script)
+		}
 	}
 
 	httpHandler, _ := newTestServerWithPublicURL(t, "http://203.0.113.99")
@@ -364,6 +421,16 @@ func TestNetPolicyPlanRejectsIngressAndDomainPublicURL(t *testing.T) {
 	httpPlan.Body.Close()
 	if httpPlan.StatusCode != http.StatusBadRequest {
 		t.Fatalf("remote cleartext public_url should be rejected for MVP, got %d", httpPlan.StatusCode)
+	}
+
+	httpDomainHandler, _ := newTestServerWithPublicURL(t, "http://lattice.example.com")
+	httpDomainCookies, httpDomainCSRF := loginSession(t, httpDomainHandler)
+	enrollNamedNodeToken(t, httpDomainHandler, httpDomainCookies, httpDomainCSRF, "node-a", "Node A")
+	createNetPolicy(t, httpDomainHandler, httpDomainCookies, httpDomainCSRF, 22)
+	httpDomainPlan := doJSON(t, httpDomainHandler, http.MethodPost, "/api/netpolicy/plan", `{"node_id":"node-a"}`, httpDomainCookies, httpDomainCSRF)
+	httpDomainPlan.Body.Close()
+	if httpDomainPlan.StatusCode != http.StatusBadRequest {
+		t.Fatalf("HTTP domain public_url should be rejected, got %d", httpDomainPlan.StatusCode)
 	}
 }
 

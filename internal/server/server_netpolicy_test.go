@@ -208,6 +208,17 @@ func TestNetPolicyPlanApproveAndResultUpdatesPolicy(t *testing.T) {
 			t.Fatalf("apply script missing %q:\n%s", needle, task.Script)
 		}
 	}
+	for _, needle := range []string{
+		"systemctl disable --now lattice-nftpolicy-domain-refresh.timer",
+		"rm -f /etc/lattice/nftpolicy-domain-refresh.sh",
+	} {
+		if !strings.Contains(task.Script, needle) {
+			t.Fatalf("IPv4 apply script should clean stale domain refresher, missing %q:\n%s", needle, task.Script)
+		}
+	}
+	if strings.Contains(task.Script, "--update-nft-domain-set") {
+		t.Fatalf("IPv4 apply script must not install domain set updater:\n%s", task.Script)
+	}
 	if strings.Contains(strings.ToLower(task.Script), "bearer") {
 		t.Fatalf("apply script must not embed bearer-token logic:\n%s", task.Script)
 	}
@@ -405,6 +416,15 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}",
 		"--update-nft-domain-set -host 'lattice.example.com' -family inet -table lattice_policy -set lattice_control4",
 		"--selfcheck-controlplane -server 'https://lattice.example.com'",
+		"/etc/lattice/nftpolicy-domain-refresh.sh",
+		"lattice-nftpolicy-domain-refresh.service",
+		"lattice-nftpolicy-domain-refresh.timer",
+		"/run/systemd/system",
+		"OnUnitActiveSec=60s",
+		"chmod 0700 '/etc/lattice/nftpolicy-domain-refresh.sh'",
+		"chmod 0644 '/etc/systemd/system/lattice-nftpolicy-domain-refresh.service' '/etc/systemd/system/lattice-nftpolicy-domain-refresh.timer'",
+		"systemd runtime not available; periodic domain refresh timer skipped",
+		"systemctl enable --now lattice-nftpolicy-domain-refresh.timer",
 	} {
 		if !strings.Contains(domainTasks[0].Script, needle) {
 			t.Fatalf("domain apply script missing %q:\n%s", needle, domainTasks[0].Script)

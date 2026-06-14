@@ -2999,8 +2999,10 @@ func nftGuardApplyScript(plan, serverURL string) string {
 func nftPolicyApplyScript(plan, serverURL string) string {
 	serverURL = strings.TrimRight(serverURL, "/")
 	domainSetUpdate := ""
+	domainRefresh := nftPolicyDomainRefreshCleanupScript()
 	if host, ok := controlPlaneDomainSetHost(serverURL); ok {
 		domainSetUpdate = nftPolicyDomainSetUpdateScript(host)
+		domainRefresh = nftPolicyDomainRefreshInstallScript(host)
 	}
 	return "set -e\n" +
 		"umask 077\n" +
@@ -3029,6 +3031,7 @@ func nftPolicyApplyScript(plan, serverURL string) string {
 		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
 		domainSetUpdate +
 		"\"$AGENT_BIN\" --selfcheck-controlplane -server " + shellQuote(serverURL) + "\n" +
+		domainRefresh +
 		"trap - ERR\n" +
 		"cleanup_watchdog\n" +
 		"mv \"$CANDIDATE\" \"$ACTIVE\"\n" +
@@ -3053,6 +3056,63 @@ func controlPlaneDomainSetHost(serverURL string) (string, bool) {
 
 func nftPolicyDomainSetUpdateScript(host string) string {
 	return "\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4\n"
+}
+
+func nftPolicyDomainRefreshInstallScript(host string) string {
+	const (
+		refreshScript = "/etc/lattice/nftpolicy-domain-refresh.sh"
+		servicePath   = "/etc/systemd/system/lattice-nftpolicy-domain-refresh.service"
+		timerPath     = "/etc/systemd/system/lattice-nftpolicy-domain-refresh.timer"
+		systemdCheck  = "command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]"
+	)
+	script := "#!/bin/sh\n" +
+		"set -e\n" +
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
+		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
+		"\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4\n"
+	service := "[Unit]\n" +
+		"Description=Lattice nftpolicy domain set refresh\n" +
+		"Documentation=https://github.com/LatticeNet/lattice\n\n" +
+		"[Service]\n" +
+		"Type=oneshot\n" +
+		"ExecStart=" + refreshScript + "\n"
+	timer := "[Unit]\n" +
+		"Description=Run Lattice nftpolicy domain set refresh\n\n" +
+		"[Timer]\n" +
+		"OnBootSec=30s\n" +
+		"OnUnitActiveSec=60s\n" +
+		"AccuracySec=10s\n" +
+		"Persistent=true\n" +
+		"Unit=lattice-nftpolicy-domain-refresh.service\n\n" +
+		"[Install]\n" +
+		"WantedBy=timers.target\n"
+	return "if " + systemdCheck + "; then\n" +
+		"  systemctl disable --now lattice-nftpolicy-domain-refresh.timer 2>/dev/null || true\n" +
+		"fi\n" +
+		heredocWrite(refreshScript, "LATTICE_NFT_DOMAIN_REFRESH_EOF", script) +
+		"chmod 0700 " + shellQuote(refreshScript) + "\n" +
+		"if " + systemdCheck + "; then\n" +
+		heredocWrite(servicePath, "LATTICE_NFT_DOMAIN_REFRESH_SERVICE_EOF", service) +
+		heredocWrite(timerPath, "LATTICE_NFT_DOMAIN_REFRESH_TIMER_EOF", timer) +
+		"  chmod 0644 " + shellQuote(servicePath) + " " + shellQuote(timerPath) + "\n" +
+		"  systemctl daemon-reload\n" +
+		"  systemctl enable --now lattice-nftpolicy-domain-refresh.timer\n" +
+		"  echo 'lattice nftpolicy: periodic domain refresh timer installed'\n" +
+		"else\n" +
+		"  echo 'lattice nftpolicy: systemd runtime not available; periodic domain refresh timer skipped' >&2\n" +
+		"fi\n"
+}
+
+func nftPolicyDomainRefreshCleanupScript() string {
+	const systemdCheck = "command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]"
+	return "if " + systemdCheck + "; then\n" +
+		"  systemctl disable --now lattice-nftpolicy-domain-refresh.timer 2>/dev/null || true\n" +
+		"  rm -f /etc/systemd/system/lattice-nftpolicy-domain-refresh.service /etc/systemd/system/lattice-nftpolicy-domain-refresh.timer\n" +
+		"  systemctl daemon-reload 2>/dev/null || true\n" +
+		"else\n" +
+		"  rm -f /etc/systemd/system/lattice-nftpolicy-domain-refresh.service /etc/systemd/system/lattice-nftpolicy-domain-refresh.timer\n" +
+		"fi\n" +
+		"rm -f /etc/lattice/nftpolicy-domain-refresh.sh\n"
 }
 
 func shellQuote(value string) string {

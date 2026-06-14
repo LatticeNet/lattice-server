@@ -533,6 +533,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/network/nft/inputs", s.withAuth("network:plan", s.handleNFTInputs))
 	mux.HandleFunc("/api/network/nft/inputs/delete", s.withAuth("network:plan", s.handleDeleteNFTInputs))
 	mux.HandleFunc("/api/netpolicy", s.withAuth("", s.handleNetPolicy))
+	mux.HandleFunc("/api/netpolicy/plan", s.withAuth("", s.handleNetPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/delete", s.withAuth("", s.handleDeleteNetPolicy))
 	mux.HandleFunc("/api/netpolicy/graph", s.withAuth("", s.handleNetPolicyGraph))
 	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("network:plan", s.handleWireGuardPlan))
@@ -2850,9 +2851,18 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 }
 
 // applyScriptFor builds the bounded shell that applies an approved plan on the
-// agent, branching by plugin. nft is validated (nft -c) rather than committed;
-// wireguard substitutes the node-local private key and brings the interface up.
+// agent, branching by plugin. The free function is kept for tests and legacy
+// callers; production approval queues call the Server method so plugin scripts
+// can use server configuration such as PublicURL.
 func applyScriptFor(approval model.Approval) string {
+	return applyScriptForWithServer(approval, "")
+}
+
+func (s *Server) applyScriptFor(approval model.Approval) string {
+	return applyScriptForWithServer(approval, s.publicURL)
+}
+
+func applyScriptForWithServer(approval model.Approval, serverURL string) string {
 	switch approval.Plugin {
 	case "cftunnel":
 		return "set -e\n" +
@@ -2872,10 +2882,50 @@ func applyScriptFor(approval model.Approval) string {
 			"mv /etc/wireguard/wg0.conf.new /etc/wireguard/wg0.conf\n" +
 			"wg-quick down wg0 2>/dev/null || true\n" +
 			"wg-quick up wg0\n"
+	case "nftpolicy":
+		return nftPolicyApplyScript(approval.Plan, serverURL)
 	default:
 		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
 			"nft -c -f /tmp/lattice-nft-plan.nft\n"
 	}
+}
+
+func nftPolicyApplyScript(plan, serverURL string) string {
+	serverURL = strings.TrimRight(serverURL, "/")
+	return "set -e\n" +
+		"umask 077\n" +
+		"mkdir -p /etc/lattice\n" +
+		"CANDIDATE=/etc/lattice/policy.nft.new\n" +
+		"ACTIVE=/etc/lattice/policy.nft\n" +
+		"ROLLBACK=/etc/lattice/policy.rollback.nft\n" +
+		"WATCHDOG=\n" +
+		heredocWrite("$CANDIDATE", "LATTICE_NFT_POLICY_EOF", plan) +
+		"nft -c -f \"$CANDIDATE\"\n" +
+		"nft list ruleset > \"$ROLLBACK\"\n" +
+		"cleanup_watchdog() {\n" +
+		"  if [ -n \"$WATCHDOG\" ]; then\n" +
+		"    kill \"$WATCHDOG\" 2>/dev/null || true\n" +
+		"    wait \"$WATCHDOG\" 2>/dev/null || true\n" +
+		"  fi\n" +
+		"}\n" +
+		"rollback() {\n" +
+		"  echo 'lattice nftpolicy: rolling back ruleset' >&2\n" +
+		"  nft -f \"$ROLLBACK\" 2>/dev/null || true\n" +
+		"}\n" +
+		"trap 'rollback; cleanup_watchdog' ERR\n" +
+		"( sleep 60; echo 'lattice nftpolicy: watchdog rollback fired' >&2; rollback ) &\n" +
+		"WATCHDOG=$!\n" +
+		"nft -f \"$CANDIDATE\"\n" +
+		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
+		"\"$AGENT_BIN\" --selfcheck-controlplane -server " + shellQuote(serverURL) + "\n" +
+		"trap - ERR\n" +
+		"cleanup_watchdog\n" +
+		"mv \"$CANDIDATE\" \"$ACTIVE\"\n" +
+		"echo 'lattice nftpolicy: applied and verified'\n"
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func heredocWrite(dst, prefix, content string) string {
@@ -2943,6 +2993,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		writeJSON(w, http.StatusOK, toApprovalView(approval))
 		return
 	}
+	if approval.Plugin == "nftpolicy" {
+		if err := s.requireCurrentNetPolicyApproval(approval); err != nil {
+			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+			return
+		}
+	}
 	approval.Status = model.ApprovalApproved
 	approval.ApprovedBy = p.ActorID
 	if err := s.store.UpsertApproval(approval); err != nil {
@@ -2952,11 +3008,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	if req.QueueApply {
 		task := model.Task{
 			ID:          id.New("task"),
+			ApprovalID:  approval.ID,
 			ActorID:     p.ActorID,
 			TokenID:     p.TokenID,
 			Targets:     []string{approval.NodeID},
 			Interpreter: "sh",
-			Script:      applyScriptFor(approval),
+			Script:      s.applyScriptFor(approval),
 			TimeoutSec:  30,
 			OutputLimit: 65536,
 			Status:      model.TaskQueued,
@@ -2969,6 +3026,23 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
+}
+
+func (s *Server) requireCurrentNetPolicyApproval(approval model.Approval) error {
+	policy, ok := s.store.NetPolicy(approval.NodeID)
+	if !ok {
+		return fmt.Errorf("netpolicy %q not found; re-plan before approving", approval.NodeID)
+	}
+	planSHA := approvalPlanSHA(approval)
+	if policy.LastPlanSHA == "" || !strings.EqualFold(policy.LastPlanSHA, planSHA) {
+		return errors.New("netpolicy changed since this plan was created; re-plan before approving")
+	}
+	return nil
+}
+
+func approvalPlanSHA(approval model.Approval) string {
+	sum := sha256.Sum256([]byte(approval.Plan))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
@@ -3109,6 +3183,11 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	task, ok := s.store.Task(req.Result.TaskID)
+	if !ok {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorInvalidTaskLease, "invalid task lease"))
+		return
+	}
 	if req.Result.FinishedAt.IsZero() {
 		req.Result.FinishedAt = time.Now().UTC()
 	}
@@ -3117,8 +3196,109 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.handleApprovalTaskResult(r, task, req.Result); err != nil {
+		s.logger.Printf("approval task result update failed: %v", err)
+	}
 	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, result model.TaskResult) error {
+	if task.ApprovalID == "" {
+		return nil
+	}
+	approval, ok := s.store.Approval(task.ApprovalID)
+	if !ok || approval.Plugin != "nftpolicy" {
+		return nil
+	}
+	policy, ok := s.store.NetPolicy(approval.NodeID)
+	if !ok {
+		return fmt.Errorf("netpolicy %q not found for approval %s", approval.NodeID, approval.ID)
+	}
+	planSHA := approvalPlanSHA(approval)
+	metadata := map[string]string{
+		"approval_id": approval.ID,
+		"task_id":     task.ID,
+		"plan_sha":    planSHA,
+	}
+	if policy.LastPlanSHA == "" || !strings.EqualFold(policy.LastPlanSHA, planSHA) {
+		reason := "task result belongs to a stale netpolicy plan; re-plan before applying current policy"
+		policy.LastError = reason
+		if err := s.store.UpsertNetPolicy(policy); err != nil {
+			return fmt.Errorf("mark stale netpolicy result: %w", err)
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   approval.NodeID,
+			Action:   "network.policy.failed",
+			Decision: "deny",
+			Reason:   reason,
+			Metadata: metadata,
+		})
+		return nil
+	}
+	if result.Error == "" && result.ExitCode == 0 {
+		if result.FinishedAt.IsZero() {
+			result.FinishedAt = time.Now().UTC()
+		}
+		policy.LastAppliedAt = result.FinishedAt
+		policy.LastError = ""
+		approval.Status = model.ApprovalApplied
+		approval.UpdatedAt = time.Now().UTC()
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return fmt.Errorf("mark approval applied: %w", err)
+		}
+		if err := s.store.UpsertNetPolicy(policy); err != nil {
+			return fmt.Errorf("mark netpolicy applied: %w", err)
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   approval.NodeID,
+			Action:   "network.policy.applied",
+			Decision: "allow",
+			Metadata: metadata,
+		})
+		return nil
+	}
+	reason := taskFailureSummary(result)
+	policy.LastError = reason
+	if err := s.store.UpsertNetPolicy(policy); err != nil {
+		return fmt.Errorf("mark netpolicy failed: %w", err)
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   "network.policy.failed",
+		Decision: "deny",
+		Reason:   reason,
+		Metadata: metadata,
+	})
+	return nil
+}
+
+func taskFailureSummary(result model.TaskResult) string {
+	switch {
+	case strings.TrimSpace(result.Error) != "":
+		return truncateMetadataValue(result.Error, 240)
+	case strings.TrimSpace(result.Stderr) != "":
+		return truncateMetadataValue(result.Stderr, 240)
+	case result.ExitCode != 0:
+		return fmt.Sprintf("task exited with code %d", result.ExitCode)
+	default:
+		return "task failed"
+	}
+}
+
+func truncateMetadataValue(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return string(runes[:max]) + "..."
 }
 
 func (s *Server) requireTaskLease(w http.ResponseWriter, r *http.Request, nodeID string, result model.TaskResult) bool {

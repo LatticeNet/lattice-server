@@ -14,9 +14,8 @@ Responsibilities:
 - KV/static/Worker control APIs.
 - nftables plan and approval workflow with persisted per-node baseline inputs
   (public TCP/UDP, WireGuard TCP/UDP, interface, WireGuard CIDR).
-- NetPolicy intent APIs and reachability graph for per-node network ACL design.
-  Current state is stored and visualized only; host nft commits wait for the
-  dedicated plan/apply path with rollback.
+- NetPolicy APIs, reachability graph, and egress-only rollback-protected nft
+  apply path for per-node network ACLs.
 - Append-only audit events.
 
 ## Run Locally
@@ -80,11 +79,14 @@ the version in `go.mod`; during local multi-repo development, use the
   generation. The plan still becomes an approval before agent-side validation;
   actual firewall mutation remains behind `network:apply`.
 - NetPolicy state (`/api/netpolicy`, `/api/netpolicy/graph`) is server-validated
-  operator intent only. Writes require `netpolicy:admin`; list/graph require
-  `netpolicy:read`; per-node PAT allowlists filter target nodes. The current
-  implementation intentionally does not commit nft rules on hosts until the
-  `nftpolicy` plan/apply path includes control-plane selfcheck and dead-man
-  rollback.
+  operator intent. Writes and `/api/netpolicy/plan` require `netpolicy:admin`;
+  list/graph require `netpolicy:read`; per-node PAT allowlists filter target
+  nodes. The current `nftpolicy` apply path is egress-only: it compiles a
+  dedicated `inet lattice_policy` output table, validates with `nft -c`, arms a
+  60s rollback watchdog, commits with `nft -f`, then requires node-agent
+  `--selfcheck-controlplane` to reach `/api/health` before disarming rollback.
+  It requires an IPv4-literal `-public-url` / `LATTICE_PUBLIC_URL`; ingress,
+  domain-backed nft sets, and IPv6 are later slices.
 - PAT server allowlists are enforced against the actual node resources in request
   bodies, not only URL query parameters.
 - Node/task/monitor/DDNS/tunnel list APIs return only resources visible to the

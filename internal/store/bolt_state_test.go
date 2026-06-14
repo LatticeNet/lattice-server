@@ -258,8 +258,10 @@ func TestBoltStateRecordLevelDNSDeployment(t *testing.T) {
 	dep := model.DNSDeployment{
 		ID: "dns1", Name: "private dns", NodeID: "n1", Engine: model.DNSEngineCoreDNS,
 		ListenPort: 53, EnableUDP: true, Exposure: model.DNSExposureMesh,
-		Zones:      []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}},
-		CFAPIToken: dnsCFTokenPlain,
+		Zones:            []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}},
+		CFAPIToken:       dnsCFTokenPlain,
+		LastPublishedAt:  time.Unix(1_700_000_300, 0).UTC(),
+		LastPublishError: "cloudflare throttled",
 	}
 	if err := bs.UpsertDNSDeployment(dep); err != nil {
 		t.Fatal(err)
@@ -268,7 +270,8 @@ func TestBoltStateRecordLevelDNSDeployment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || got.CFAPIToken != dnsCFTokenPlain || got.UpdatedAt.IsZero() {
+	if !ok || got.CFAPIToken != dnsCFTokenPlain || got.UpdatedAt.IsZero() ||
+		got.LastPublishedAt.IsZero() || got.LastPublishError != "cloudflare throttled" {
 		t.Fatalf("dns deployment not recovered: ok=%v dep=%+v", ok, got)
 	}
 	list, err := bs.DNSDeploymentsForNode("n1")

@@ -439,8 +439,11 @@ func TestDNSPublishUsesDDNSProviderAndRecordsStatus(t *testing.T) {
 	if !ok {
 		t.Fatal("stored deployment missing")
 	}
-	if dep.LastIPv4 != "203.0.113.77" || dep.LastIPv6 != "2001:db8::77" || dep.LastError != "" || dep.LastAppliedAt.IsZero() {
+	if dep.LastIPv4 != "203.0.113.77" || dep.LastIPv6 != "2001:db8::77" || dep.LastPublishError != "" || dep.LastPublishedAt.IsZero() {
 		t.Fatalf("publish status not recorded: %+v", dep)
+	}
+	if !dep.LastAppliedAt.IsZero() || dep.LastError != "" {
+		t.Fatalf("publish must not mutate service apply status: %+v", dep)
 	}
 	assertResponseAuditCorrelation(t, st, publish, "dns.publish", "dns:admin")
 }
@@ -549,8 +552,11 @@ func TestDNSPublishFailureIsAuditedAndRecorded(t *testing.T) {
 		t.Fatalf("publish without node IPv4 should fail as upstream error, got %d", publish.StatusCode)
 	}
 	dep, ok := st.DNSDeployment(created.ID)
-	if !ok || dep.LastError == "" || dep.LastAppliedAt.IsZero() {
+	if !ok || dep.LastPublishError == "" || dep.LastPublishedAt.IsZero() {
 		t.Fatalf("publish failure should be recorded: ok=%v dep=%+v", ok, dep)
+	}
+	if dep.LastError != "" || !dep.LastAppliedAt.IsZero() {
+		t.Fatalf("publish failure must not mutate service apply status: %+v", dep)
 	}
 	if !auditMetadataSeen(st, "dns.publish", "ok", "false") {
 		t.Fatalf("publish failure should be audited: %+v", st.AuditEvents())
@@ -593,7 +599,7 @@ func TestDNSPublishRunsOnNodeIPChange(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		dep, ok := st.DNSDeployment("dns_auto")
-		if ok && dep.LastIPv4 == "203.0.113.99" && dep.LastError == "" {
+		if ok && dep.LastIPv4 == "203.0.113.99" && dep.LastPublishError == "" && !dep.LastPublishedAt.IsZero() {
 			break
 		}
 		if time.Now().After(deadline) {

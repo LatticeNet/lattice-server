@@ -28,31 +28,33 @@ const (
 )
 
 type dnsDeploymentView struct {
-	ID            string          `json:"id"`
-	Name          string          `json:"name"`
-	NodeID        string          `json:"node_id"`
-	NodeName      string          `json:"node_name,omitempty"`
-	Engine        string          `json:"engine"`
-	ListenPort    int             `json:"listen_port"`
-	EnableUDP     bool            `json:"enable_udp"`
-	EnableTCP     bool            `json:"enable_tcp"`
-	Exposure      string          `json:"exposure"`
-	Zones         []model.DNSZone `json:"zones"`
-	Hostname      string          `json:"hostname,omitempty"`
-	PublishIPv4   bool            `json:"publish_ipv4"`
-	PublishIPv6   bool            `json:"publish_ipv6"`
-	RecordTTL     int             `json:"record_ttl,omitempty"`
-	DDNSProfileID string          `json:"ddns_profile_id,omitempty"`
-	HasCredential bool            `json:"has_credential"`
-	Status        string          `json:"status"`
-	EngineVersion string          `json:"engine_version,omitempty"`
-	LastIPv4      string          `json:"last_ipv4,omitempty"`
-	LastIPv6      string          `json:"last_ipv6,omitempty"`
-	LastAppliedAt time.Time       `json:"last_applied_at,omitempty"`
-	LastError     string          `json:"last_error,omitempty"`
-	Disabled      bool            `json:"disabled,omitempty"`
-	CreatedAt     time.Time       `json:"created_at"`
-	UpdatedAt     time.Time       `json:"updated_at"`
+	ID               string          `json:"id"`
+	Name             string          `json:"name"`
+	NodeID           string          `json:"node_id"`
+	NodeName         string          `json:"node_name,omitempty"`
+	Engine           string          `json:"engine"`
+	ListenPort       int             `json:"listen_port"`
+	EnableUDP        bool            `json:"enable_udp"`
+	EnableTCP        bool            `json:"enable_tcp"`
+	Exposure         string          `json:"exposure"`
+	Zones            []model.DNSZone `json:"zones"`
+	Hostname         string          `json:"hostname,omitempty"`
+	PublishIPv4      bool            `json:"publish_ipv4"`
+	PublishIPv6      bool            `json:"publish_ipv6"`
+	RecordTTL        int             `json:"record_ttl,omitempty"`
+	DDNSProfileID    string          `json:"ddns_profile_id,omitempty"`
+	HasCredential    bool            `json:"has_credential"`
+	Status           string          `json:"status"`
+	EngineVersion    string          `json:"engine_version,omitempty"`
+	LastIPv4         string          `json:"last_ipv4,omitempty"`
+	LastIPv6         string          `json:"last_ipv6,omitempty"`
+	LastAppliedAt    time.Time       `json:"last_applied_at,omitempty"`
+	LastError        string          `json:"last_error,omitempty"`
+	LastPublishedAt  time.Time       `json:"last_published_at,omitempty"`
+	LastPublishError string          `json:"last_publish_error,omitempty"`
+	Disabled         bool            `json:"disabled,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
 }
 
 func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p principal) {
@@ -550,11 +552,11 @@ func (s *Server) markDNSPublishResult(dep model.DNSDeployment, v4, v6 string, er
 	if v6 != "" {
 		dep.LastIPv6 = v6
 	}
-	dep.LastAppliedAt = s.now()
+	dep.LastPublishedAt = s.now()
 	if err != nil {
-		dep.LastError = err.Error()
+		dep.LastPublishError = err.Error()
 	} else {
-		dep.LastError = ""
+		dep.LastPublishError = ""
 	}
 	return s.store.UpsertDNSDeployment(dep)
 }
@@ -648,6 +650,8 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		req.LastIPv6 = existing.LastIPv6
 		req.LastAppliedAt = existing.LastAppliedAt
 		req.LastError = existing.LastError
+		req.LastPublishedAt = existing.LastPublishedAt
+		req.LastPublishError = existing.LastPublishError
 	}
 	if req.Disabled {
 		req.Status = model.DNSStatusDisabled
@@ -827,7 +831,8 @@ func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView 
 		Zones: dep.Zones, Hostname: dep.Hostname, PublishIPv4: dep.PublishIPv4, PublishIPv6: dep.PublishIPv6,
 		RecordTTL: dep.RecordTTL, DDNSProfileID: dep.DDNSProfileID, HasCredential: dep.CFAPIToken != "" || dep.DDNSProfileID != "",
 		Status: dep.Status, EngineVersion: dep.EngineVersion, LastIPv4: dep.LastIPv4, LastIPv6: dep.LastIPv6,
-		LastAppliedAt: dep.LastAppliedAt, LastError: dep.LastError, Disabled: dep.Disabled,
+		LastAppliedAt: dep.LastAppliedAt, LastError: dep.LastError,
+		LastPublishedAt: dep.LastPublishedAt, LastPublishError: dep.LastPublishError, Disabled: dep.Disabled,
 		CreatedAt: dep.CreatedAt, UpdatedAt: dep.UpdatedAt,
 	}
 }

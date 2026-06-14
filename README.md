@@ -104,7 +104,10 @@ the version in `go.mod`; during local multi-repo development, use the
   from task results. `/api/dns/publish` reuses the existing Cloudflare DDNS
   provider server-side, never sends CF tokens to agents, records the last
   published A/AAAA values on the DNSDeployment, and is also triggered when the
-  bound node's observed public IP changes.
+  bound node's observed public IP changes. Service apply status
+  (`last_applied_at` / `last_error`) is separate from hostname publication
+  status (`last_published_at` / `last_publish_error`) so failures stay
+  attributable to the right layer.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/

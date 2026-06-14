@@ -544,6 +544,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/users/delete", s.withAuth("", s.handleDeleteProxyUser))
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))
+	mux.HandleFunc("/api/proxy/nodes/", s.withAuth("", s.handleProxyNodePlan))
 	mux.HandleFunc("/api/machines", s.withAuth("", s.handleMachines))
 	mux.HandleFunc("/api/machines/update", s.withAuth("inventory:admin", s.handleMachineUpdate))
 	mux.HandleFunc("/api/machines/delete", s.withAuth("inventory:admin", s.handleDeleteMachine))
@@ -2950,6 +2951,10 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 				"exit 1\n"
 		}
 		return script
+	case proxyCorePlugin:
+		return "set -e\n" +
+			"echo " + shellQuote("lattice proxycore: apply support is not implemented yet; re-plan after upgrade") + " >&2\n" +
+			"exit 1\n"
 	default:
 		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
 			"nft -c -f /tmp/lattice-nft-plan.nft\n"
@@ -3357,6 +3362,16 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	if approval.Plugin == "nftpolicy" {
 		if err := s.requireCurrentNetPolicyApproval(approval); err != nil {
 			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+			return
+		}
+	}
+	if approval.Plugin == proxyCorePlugin {
+		if err := s.requireCurrentProxyCoreApproval(approval); err != nil {
+			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+			return
+		}
+		if req.QueueApply {
+			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "proxycore apply is not implemented yet; re-plan after apply support lands"))
 			return
 		}
 	}

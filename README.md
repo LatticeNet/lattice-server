@@ -24,7 +24,8 @@ Responsibilities:
   keys, user UUID/password credentials, subscription tokens, redacted proto view
   contracts, JSON/bbolt store parity, and the first fail-closed sing-box
   `vless`+TCP+REALITY renderer, plus scoped CRUD/read APIs with secret-free
-  views for future reviewed plan/apply orchestration.
+  views and a redacted reviewed plan endpoint for future secret-safe
+  plan/apply orchestration.
 - Operator-owned NodeGeo API for the dashboard Fleet Map.
 - Append-only audit events.
 
@@ -131,7 +132,8 @@ the version in `go.mod`; during local multi-repo development, use the
   and plan-bound: the approval text contains the HTTPS URL and SHA-256, and the
   agent applies exactly that reviewed artifact metadata.
 - Proxy-core state currently exists as a persistence/model foundation plus a
-  narrow server-side sing-box renderer and scoped CRUD/read APIs.
+  narrow server-side sing-box renderer, scoped CRUD/read APIs, and a redacted
+  reviewed plan endpoint.
   `ProxyInbound.RealityPrivateKey` and `ProxyUser.UUID`/`Password`/`SubToken`
   are encrypted at rest, and proto/read contracts expose only `has_*` presence
   booleans. `internal/proxycore` renders a canonical SHA-256-addressed
@@ -140,10 +142,14 @@ the version in `go.mod`; during local multi-repo development, use the
   and must be treated as node-scoped secret material. The current JSON APIs
   return `ProxyInboundView`, `ProxyUserView`, and `ProxyNodeProfileView` shapes:
   global inbounds/users require unrestricted `proxy:read`/`proxy:admin`, while
-  profiles are node-allowlist filtered. Future proxy APIs must not serialize
-  the secret-bearing model structs or render artifacts directly. The public
-  `/sub/{token}` route must add an opaque token-lookup design before it is
-  exposed; the raw subscription token must not become a persisted map key.
+  profiles are node-allowlist filtered. `POST /api/proxy/nodes/{node_id}/plan`
+  stores a redacted review plan and binds the real rendered config SHA in the
+  approval action; `queue_apply:true` currently fails closed until the
+  secret-bearing queued artifact has a reviewed at-rest boundary. Future proxy
+  APIs must not serialize the secret-bearing model structs or render artifacts
+  directly. The public `/sub/{token}` route must add an opaque token-lookup
+  design before it is exposed; the raw subscription token must not become a
+  persisted map key.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/

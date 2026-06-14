@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -239,6 +240,128 @@ func TestProxyInboundDeleteRejectsReferencedInbound(t *testing.T) {
 	}
 }
 
+func TestProxyPlanCreatesSecretFreeApproval(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+	plan := doJSON(t, handler, http.MethodPost, "/api/proxy/nodes/node-a/plan", `{}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("proxy plan failed: %d", plan.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	if approval.Plugin != proxyCorePlugin || approval.Action != proxyCoreApplyAction || approval.NodeID != "node-a" {
+		t.Fatalf("bad proxy approval view: %+v", approval)
+	}
+	for _, leak := range []string{
+		"super-secret-reality-private-key",
+		"11111111-1111-4111-8111-111111111111",
+		"proxy-password-secret",
+		"sub-token-secret-abcdefghijklmnopqrstuvwxyz",
+		`"private_key": "super-secret-reality-private-key"`,
+		`"uuid": "11111111-1111-4111-8111-111111111111"`,
+	} {
+		if strings.Contains(approval.Plan, leak) {
+			t.Fatalf("proxy plan leaked secret %q:\n%s", leak, approval.Plan)
+		}
+	}
+	for _, want := range []string{
+		"artifact_sha256:",
+		"secret_handling:",
+		`"private_key": "<redacted>"`,
+		`"uuid": "<redacted>"`,
+		`"type": "vless"`,
+	} {
+		if !strings.Contains(approval.Plan, want) {
+			t.Fatalf("proxy plan missing %q:\n%s", want, approval.Plan)
+		}
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok {
+		t.Fatalf("stored approval not found")
+	}
+	configSHA, err := proxyCoreApprovalConfigSHA(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configSHA == "" || !strings.Contains(approval.Plan, configSHA) {
+		t.Fatalf("approval did not bind config sha: action=%q plan=\n%s", stored.Action, approval.Plan)
+	}
+
+	approveQueue := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
+	defer approveQueue.Body.Close()
+	if approveQueue.StatusCode != http.StatusConflict {
+		t.Fatalf("proxycore queue_apply should fail closed until apply support lands, got %d", approveQueue.StatusCode)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("proxycore queue_apply must not create a task before apply support lands: %+v", st.Tasks())
+	}
+}
+
+func TestProxyPlanRequiresGlobalProxyRead(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+
+	tokenA := createPAT(t, handler, cookies, csrf, []string{"network:plan", "proxy:read"}, []string{"node-a"})
+	denied := doBearerJSON(t, handler, http.MethodPost, "/api/proxy/nodes/node-a/plan", `{}`, tokenA)
+	defer denied.Body.Close()
+	if denied.StatusCode != http.StatusForbidden {
+		t.Fatalf("node-allowlisted PAT must not plan proxycore without global proxy read, got %d", denied.StatusCode)
+	}
+}
+
+func TestProxyApproveRejectsStalePlan(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/proxy/nodes/node-a/plan", `{}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("proxy plan failed: %d", plan.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+
+	updateInbound := doJSON(t, handler, http.MethodPost, "/api/proxy/inbounds", `{
+		"id":"in-reality-443",
+		"name":"VLESS Reality 8443",
+		"core":"sing-box",
+		"protocol":"vless",
+		"port":8443,
+		"transport":"tcp",
+		"security":"reality",
+		"sni":"cdn.example.com",
+		"alpn":["h2","http/1.1"],
+		"reality_public_key":"public-reality-key-123456",
+		"reality_short_ids":["aa"],
+		"reality_dest":"www.microsoft.com:443",
+		"enabled":true
+	}`, cookies, csrf)
+	updateInbound.Body.Close()
+	if updateInbound.StatusCode != http.StatusOK {
+		t.Fatalf("update inbound failed: %d", updateInbound.StatusCode)
+	}
+
+	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
+	defer approve.Body.Close()
+	if approve.StatusCode != http.StatusConflict {
+		t.Fatalf("stale proxycore plan should be rejected, got %d", approve.StatusCode)
+	}
+}
+
 func TestProxyRejectsInvalidMVPInput(t *testing.T) {
 	handler, _ := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
@@ -277,6 +400,40 @@ func TestProxyRejectsInvalidMVPInput(t *testing.T) {
 	defer servicePort.Body.Close()
 	if servicePort.StatusCode != http.StatusBadRequest {
 		t.Fatalf("service-name ports must be rejected for deterministic rendering, got %d", servicePort.StatusCode)
+	}
+}
+
+func createProxyPlanFixtures(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf, nodeID string) {
+	t.Helper()
+	createInbound := doJSON(t, handler, http.MethodPost, "/api/proxy/inbounds", proxyInboundBody("in-reality-443", "Inbound A"), cookies, csrf)
+	createInbound.Body.Close()
+	if createInbound.StatusCode != http.StatusOK {
+		t.Fatalf("create inbound failed: %d", createInbound.StatusCode)
+	}
+	createUser := doJSON(t, handler, http.MethodPost, "/api/proxy/users", `{
+		"id":"alice",
+		"name":"Alice",
+		"enabled":true,
+		"uuid":"11111111-1111-4111-8111-111111111111",
+		"password":"proxy-password-secret",
+		"sub_token":"sub-token-secret-abcdefghijklmnopqrstuvwxyz",
+		"inbound_ids":["in-reality-443"]
+	}`, cookies, csrf)
+	createUser.Body.Close()
+	if createUser.StatusCode != http.StatusOK {
+		t.Fatalf("create user failed: %d", createUser.StatusCode)
+	}
+	createProfile := doJSON(t, handler, http.MethodPost, "/api/proxy/profiles", `{
+		"node_id":"`+nodeID+`",
+		"core":"sing-box",
+		"inbound_ids":["in-reality-443"],
+		"hostname":"node-a.dns.example.com",
+		"config_path":"/etc/sing-box/config.json",
+		"stats_api":"127.0.0.1:9090"
+	}`, cookies, csrf)
+	createProfile.Body.Close()
+	if createProfile.StatusCode != http.StatusOK {
+		t.Fatalf("create profile failed: %d", createProfile.StatusCode)
 	}
 }
 

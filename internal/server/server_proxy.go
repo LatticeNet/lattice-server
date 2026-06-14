@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +19,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/proxycore"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
@@ -27,6 +30,13 @@ var (
 	proxyKeyRe      = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
 	proxySubTokenRe = regexp.MustCompile(`^[A-Za-z0-9_-]{32,256}$`)
 	proxyUUIDRe     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	proxySHA256Re   = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+)
+
+const (
+	proxyCorePlugin            = "proxycore"
+	proxyCoreApplyAction       = "apply-config"
+	proxyCoreApplyActionPrefix = proxyCoreApplyAction + ":"
 )
 
 type proxyInboundView struct {
@@ -355,6 +365,67 @@ func (s *Server) handleDeleteProxyProfile(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) handleProxyNodePlan(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	nodeID, ok := proxyNodeIDFromPlanPath(r.URL.Path)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("proxy plan route not found"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "network:plan", nodeID) {
+		return
+	}
+	if !s.requireGlobalProxyScope(w, p, "proxy:read") {
+		return
+	}
+	var req struct{}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	node, profile, artifact, err := s.renderProxyCoreArtifact(nodeID)
+	if err != nil {
+		writeError(w, statusForProxyPlanError(err), err)
+		return
+	}
+	redactedConfig, err := redactProxyConfigJSON(artifact.ConfigJSON)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	plan := renderProxyCoreApprovalPlan(node, profile, artifact, redactedConfig)
+	approval := model.Approval{
+		ID:        id.New("approval"),
+		NodeID:    nodeID,
+		Plugin:    proxyCorePlugin,
+		Action:    proxyCoreApprovalAction(artifact.ConfigSHA256),
+		Plan:      plan,
+		Status:    model.ApprovalPending,
+		ActorID:   p.ActorID,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.store.UpsertApproval(approval); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:     id.New("audit"),
+		NodeID: nodeID,
+		Action: "proxy.plan",
+		Scope:  "network:plan",
+		Metadata: map[string]string{
+			"approval_id":   approval.ID,
+			"profile_id":    profile.ID,
+			"config_sha256": artifact.ConfigSHA256,
+			"inbounds":      strconv.Itoa(len(profile.InboundIDs)),
+			"warnings":      strconv.Itoa(len(artifact.Warnings)),
+		},
+	})
+	writeJSON(w, http.StatusOK, toApprovalView(approval))
+}
+
 func toProxyInboundView(in model.ProxyInbound) proxyInboundView {
 	return proxyInboundView{
 		ID:                   in.ID,
@@ -380,6 +451,158 @@ func toProxyInboundView(in model.ProxyInbound) proxyInboundView {
 		Enabled:              in.Enabled,
 		CreatedAt:            in.CreatedAt,
 		UpdatedAt:            in.UpdatedAt,
+	}
+}
+
+func proxyNodeIDFromPlanPath(path string) (string, bool) {
+	const prefix = "/api/proxy/nodes/"
+	const suffix = "/plan"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	nodeID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if nodeID == "" || strings.Contains(nodeID, "/") {
+		return "", false
+	}
+	return nodeID, true
+}
+
+func (s *Server) renderProxyCoreArtifact(nodeID string) (model.Node, model.ProxyNodeProfile, proxycore.SingBoxArtifact, error) {
+	node, ok := s.store.Node(nodeID)
+	if !ok {
+		return model.Node{}, model.ProxyNodeProfile{}, proxycore.SingBoxArtifact{}, errProxyPlanNodeNotFound
+	}
+	profile, ok := s.store.ProxyNodeProfile(nodeID)
+	if !ok {
+		return model.Node{}, model.ProxyNodeProfile{}, proxycore.SingBoxArtifact{}, errProxyPlanProfileNotFound
+	}
+	artifact, err := proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), s.store.ProxyUsers(), proxycore.RenderOptions{})
+	if err != nil {
+		return model.Node{}, model.ProxyNodeProfile{}, proxycore.SingBoxArtifact{}, err
+	}
+	return node, profile, artifact, nil
+}
+
+var (
+	errProxyPlanNodeNotFound    = errors.New("node not found")
+	errProxyPlanProfileNotFound = errors.New("proxy node profile not found")
+)
+
+func statusForProxyPlanError(err error) int {
+	switch {
+	case errors.Is(err, errProxyPlanNodeNotFound), errors.Is(err, errProxyPlanProfileNotFound):
+		return http.StatusNotFound
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+func proxyCoreApprovalAction(configSHA256 string) string {
+	return proxyCoreApplyActionPrefix + strings.ToLower(strings.TrimSpace(configSHA256))
+}
+
+func proxyCoreApprovalDisplayAction(action string) string {
+	if strings.HasPrefix(action, proxyCoreApplyActionPrefix) {
+		return proxyCoreApplyAction
+	}
+	return action
+}
+
+func proxyCoreApprovalConfigSHA(approval model.Approval) (string, error) {
+	if approval.Plugin != proxyCorePlugin {
+		return "", nil
+	}
+	if !strings.HasPrefix(approval.Action, proxyCoreApplyActionPrefix) {
+		return "", fmt.Errorf("unexpected proxycore approval action %q", approval.Action)
+	}
+	sha := strings.TrimSpace(strings.TrimPrefix(approval.Action, proxyCoreApplyActionPrefix))
+	if !proxySHA256Re.MatchString(sha) {
+		return "", fmt.Errorf("invalid proxycore config sha %q", sha)
+	}
+	return strings.ToLower(sha), nil
+}
+
+func (s *Server) requireCurrentProxyCoreApproval(approval model.Approval) error {
+	want, err := proxyCoreApprovalConfigSHA(approval)
+	if err != nil {
+		return err
+	}
+	_, _, artifact, err := s.renderProxyCoreArtifact(approval.NodeID)
+	if err != nil {
+		return fmt.Errorf("proxycore plan is no longer renderable: %w", err)
+	}
+	if !strings.EqualFold(want, artifact.ConfigSHA256) {
+		return errors.New("proxycore config changed since this plan was created; re-plan before approving")
+	}
+	return nil
+}
+
+func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile, artifact proxycore.SingBoxArtifact, redactedConfig string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Lattice proxycore review plan\n\n")
+	fmt.Fprintf(&b, "node_id: %s\n", profile.NodeID)
+	if node.Name != "" {
+		fmt.Fprintf(&b, "node_name: %s\n", node.Name)
+	}
+	fmt.Fprintf(&b, "profile_id: %s\n", profile.ID)
+	fmt.Fprintf(&b, "core: %s\n", profile.Core)
+	fmt.Fprintf(&b, "config_path: %s\n", artifact.ConfigPath)
+	fmt.Fprintf(&b, "artifact_sha256: %s\n", artifact.ConfigSHA256)
+	fmt.Fprintf(&b, "inbound_count: %d\n", len(profile.InboundIDs))
+	if profile.Hostname != "" {
+		fmt.Fprintf(&b, "hostname: %s\n", profile.Hostname)
+	}
+	if profile.ListenIP != "" {
+		fmt.Fprintf(&b, "listen_ip: %s\n", profile.ListenIP)
+	}
+	if len(artifact.Warnings) > 0 {
+		b.WriteString("\nwarnings:\n")
+		for _, warning := range artifact.Warnings {
+			fmt.Fprintf(&b, "- %s\n", warning)
+		}
+	}
+	b.WriteString("\nsecret_handling: redacted_config hides UUID/password/token/private_key fields; artifact_sha256 binds the real rendered config.\n")
+	b.WriteString("\n## redacted sing-box config\n")
+	b.WriteString(redactedConfig)
+	if !strings.HasSuffix(redactedConfig, "\n") {
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+func redactProxyConfigJSON(configJSON string) (string, error) {
+	var value any
+	if err := json.Unmarshal([]byte(configJSON), &value); err != nil {
+		return "", fmt.Errorf("decode rendered proxy config for redaction: %w", err)
+	}
+	redactProxyConfigValue(value)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(value); err != nil {
+		return "", fmt.Errorf("encode redacted proxy config: %w", err)
+	}
+	return buf.String(), nil
+}
+
+func redactProxyConfigValue(value any) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			switch strings.ToLower(key) {
+			case "private_key", "uuid", "password":
+				if s, ok := child.(string); ok && s != "" {
+					v[key] = "<redacted>"
+					continue
+				}
+			}
+			redactProxyConfigValue(child)
+		}
+	case []any:
+		for _, child := range v {
+			redactProxyConfigValue(child)
+		}
 	}
 }
 

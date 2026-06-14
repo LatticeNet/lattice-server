@@ -28,6 +28,10 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	st.NFTInputs["n1"] = model.NFTInputs{ID: "n1", NodeID: "n1", InterfaceName: "ens3", WireGuardCIDR: "10.66.0.0/24", PublicTCP: []int{80, 443}, PublicUDP: []int{53}}
 	st.DNSDeployments["dns1"] = model.DNSDeployment{ID: "dns1", Name: "private dns", NodeID: "n1", Engine: model.DNSEngineCoreDNS, ListenPort: 53, EnableUDP: true, Exposure: model.DNSExposureMesh, Zones: []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}}, Hostname: "n1.dns.example.com", CFAPIToken: dnsCFTokenPlain, Status: model.DNSStatusPending, CreatedAt: now}
 	st.NetPolicies["n1"] = model.NetPolicy{ID: "n1", TargetNodeID: "n1", Enabled: true, Rules: []model.NetRule{{ID: "r1", Action: model.NetRuleDeny, Direction: model.NetDirEgress, Protocol: model.NetProtoTCP, Ports: []int{1234}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}}
+	st.ProxyInbounds["pin1"] = model.ProxyInbound{ID: "pin1", Name: "vless reality", Core: model.ProxyCoreSingbox, Protocol: model.ProxyProtocolVLESS, Transport: model.ProxyTransportTCP, Security: model.ProxySecurityReality, Port: 443, RealityPrivateKey: proxyRealityPrivateKeyPlain, RealityPublicKey: "pub", Enabled: true, CreatedAt: now}
+	st.ProxyUsers["pu1"] = model.ProxyUser{ID: "pu1", Name: "alice", Enabled: true, UUID: proxyUUIDPlain, Password: proxyPasswordPlain, SubToken: proxySubTokenPlain, InboundIDs: []string{"pin1"}, Status: model.ProxyUserStatusActive, CreatedAt: now}
+	st.ProxyProfiles["n1"] = model.ProxyNodeProfile{ID: "n1", NodeID: "n1", Core: model.ProxyCoreSingbox, InboundIDs: []string{"pin1"}, Hostname: "n1.dns.example.com", CreatedAt: now}
+	st.ProxyUsage["n1"] = model.ProxyUsageSnapshot{NodeID: "n1", At: now, CoreUptimeSec: 9, UserBytes: map[string]int64{"pu1": 4096}}
 	st.MonResults["m1"] = []model.MonitorResult{{MonitorID: "m1", NodeID: "n1", Success: true, At: now}}
 	st.TOTPChallenges["tc1"] = auth.TOTPChallenge{ID: "tc1", UserID: "u1", ClientIP: "198.51.100.1", ExpiresAt: now.Add(time.Minute)}
 	st.OIDCProviders["google"] = model.OIDCProvider{ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com", ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now}
@@ -46,12 +50,12 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 		t.Fatal(err)
 	}
 	disk := string(raw)
-	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, "oidc-client-secret"} {
+	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain, "oidc-client-secret"} {
 		if strings.Contains(disk, leak) {
 			t.Fatalf("plaintext secret leaked into bbolt file: %q", leak)
 		}
 	}
-	for _, plain := range []string{"admin", "node one", "cloudflare", "Google", "DMIT"} {
+	for _, plain := range []string{"admin", "node one", "cloudflare", "Google", "DMIT", "vless reality", "alice"} {
 		if !strings.Contains(disk, plain) {
 			t.Fatalf("expected non-secret field %q to remain inspectable in bucketized storage", plain)
 		}
@@ -84,6 +88,18 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	}
 	if got.NetPolicies["n1"].Rules[0].Ports[0] != 1234 {
 		t.Fatalf("net policy not recovered: %+v", got.NetPolicies["n1"])
+	}
+	if got.ProxyInbounds["pin1"].RealityPrivateKey != proxyRealityPrivateKeyPlain || got.ProxyInbounds["pin1"].Port != 443 {
+		t.Fatalf("proxy inbound not recovered/decrypted: %+v", got.ProxyInbounds["pin1"])
+	}
+	if got.ProxyUsers["pu1"].UUID != proxyUUIDPlain || got.ProxyUsers["pu1"].Password != proxyPasswordPlain || got.ProxyUsers["pu1"].SubToken != proxySubTokenPlain {
+		t.Fatalf("proxy user not recovered/decrypted: %+v", got.ProxyUsers["pu1"])
+	}
+	if got.ProxyProfiles["n1"].Hostname != "n1.dns.example.com" {
+		t.Fatalf("proxy profile not recovered: %+v", got.ProxyProfiles["n1"])
+	}
+	if got.ProxyUsage["n1"].UserBytes["pu1"] != 4096 {
+		t.Fatalf("proxy usage not recovered: %+v", got.ProxyUsage["n1"])
 	}
 	if got.OIDCProviders["google"].ClientSecret != "oidc-client-secret" {
 		t.Fatalf("oidc secret did not decrypt: %+v", got.OIDCProviders["google"])

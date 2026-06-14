@@ -1,0 +1,250 @@
+package store
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+)
+
+func TestProxyCollectionsJSONStoreCRUDAndEncryption(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	c := testCipher(t)
+	s, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_700_001_000, 0).UTC()
+
+	if err := s.UpsertProxyInbound(model.ProxyInbound{
+		ID: "in-b", Name: "beta", Core: model.ProxyCoreSingbox,
+		Protocol: model.ProxyProtocolTrojan, Transport: model.ProxyTransportTCP,
+		Security: model.ProxySecurityTLS, Port: 8443, CreatedAt: now.Add(time.Second),
+		Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertProxyInbound(model.ProxyInbound{
+		ID: "in-a", Name: "alpha", Core: model.ProxyCoreSingbox,
+		Protocol: model.ProxyProtocolVLESS, Transport: model.ProxyTransportTCP,
+		Security: model.ProxySecurityReality, Port: 443, CreatedAt: now,
+		RealityPrivateKey: proxyRealityPrivateKeyPlain, RealityPublicKey: "pub", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertProxyUser(model.ProxyUser{
+		ID: "u-a", Name: "alice", Enabled: true, UUID: proxyUUIDPlain,
+		Password: proxyPasswordPlain, SubToken: proxySubTokenPlain,
+		InboundIDs: []string{"in-a"}, Status: model.ProxyUserStatusActive, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertProxyUser(model.ProxyUser{
+		ID: "u-all", Name: "all", Enabled: true, Status: model.ProxyUserStatusActive, CreatedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertProxyNodeProfile(model.ProxyNodeProfile{
+		NodeID: "node-b", Core: model.ProxyCoreSingbox, InboundIDs: []string{"in-a"},
+		Hostname: "node-b.dns.example.com", ConfigPath: "/etc/sing-box/config.json",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertProxyUsageSnapshot(model.ProxyUsageSnapshot{
+		NodeID: "node-b", At: now, CoreUptimeSec: 12, UserBytes: map[string]int64{"u-a": 1024},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	inbounds := s.ProxyInbounds()
+	if len(inbounds) != 2 || inbounds[0].ID != "in-a" || inbounds[1].ID != "in-b" {
+		t.Fatalf("inbounds not sorted by creation time: %+v", inbounds)
+	}
+	usersForB := s.ProxyUsersForInbound("in-b")
+	if len(usersForB) != 1 || usersForB[0].ID != "u-all" {
+		t.Fatalf("empty inbound membership should mean all inbounds: %+v", usersForB)
+	}
+	profile, ok := s.ProxyNodeProfile("node-b")
+	if !ok || profile.ID != "node-b" || profile.Hostname == "" {
+		t.Fatalf("proxy node profile not recovered: ok=%v profile=%+v", ok, profile)
+	}
+	usage, ok := s.ProxyUsageSnapshot("node-b")
+	if !ok || usage.UserBytes["u-a"] != 1024 {
+		t.Fatalf("proxy usage snapshot not recovered: ok=%v usage=%+v", ok, usage)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := string(raw)
+	for _, leak := range []string{proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain} {
+		if strings.Contains(disk, leak) {
+			t.Fatalf("proxy secret leaked to JSON store: %q", leak)
+		}
+	}
+
+	reopened, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in, ok := reopened.ProxyInbound("in-a")
+	if !ok || in.RealityPrivateKey != proxyRealityPrivateKeyPlain {
+		t.Fatalf("proxy inbound secret did not decrypt: ok=%v inbound=%+v", ok, in)
+	}
+	user, ok := reopened.ProxyUser("u-a")
+	if !ok || user.UUID != proxyUUIDPlain || user.Password != proxyPasswordPlain || user.SubToken != proxySubTokenPlain {
+		t.Fatalf("proxy user secrets did not decrypt: ok=%v user=%+v", ok, user)
+	}
+
+	if err := reopened.DeleteProxyInbound("in-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.DeleteProxyUser("u-all"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.DeleteProxyNodeProfile("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.DeleteProxyUsageSnapshot("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reopened.ProxyInbound("in-b"); ok {
+		t.Fatal("proxy inbound should be deleted")
+	}
+	if _, ok := reopened.ProxyUser("u-all"); ok {
+		t.Fatal("proxy user should be deleted")
+	}
+	if _, ok := reopened.ProxyNodeProfile("node-b"); ok {
+		t.Fatal("proxy node profile should be deleted")
+	}
+	if _, ok := reopened.ProxyUsageSnapshot("node-b"); ok {
+		t.Fatal("proxy usage snapshot should be deleted")
+	}
+}
+
+func TestBoltStateRecordLevelProxyCollections(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	c := testCipher(t)
+	bs, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+	now := time.Unix(1_700_001_200, 0).UTC()
+
+	if err := bs.UpsertProxyInbound(model.ProxyInbound{
+		ID: "in-a", Name: "alpha", Core: model.ProxyCoreSingbox,
+		Protocol: model.ProxyProtocolVLESS, Transport: model.ProxyTransportTCP,
+		Security: model.ProxySecurityReality, Port: 443, CreatedAt: now,
+		RealityPrivateKey: proxyRealityPrivateKeyPlain, RealityPublicKey: "pub", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertProxyUser(model.ProxyUser{
+		ID: "u-a", Name: "alice", Enabled: true, UUID: proxyUUIDPlain,
+		Password: proxyPasswordPlain, SubToken: proxySubTokenPlain,
+		InboundIDs: []string{"in-a"}, Status: model.ProxyUserStatusActive, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertProxyUser(model.ProxyUser{
+		ID: "u-all", Name: "all", Enabled: true, Status: model.ProxyUserStatusActive, CreatedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertProxyNodeProfile(model.ProxyNodeProfile{
+		NodeID: "node-a", Core: model.ProxyCoreSingbox, InboundIDs: []string{"in-a"},
+		Hostname: "node-a.dns.example.com", StatsAPI: "127.0.0.1:9090",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertProxyUsageSnapshot(model.ProxyUsageSnapshot{
+		NodeID: "node-a", At: now, CoreUptimeSec: 99, UserBytes: map[string]int64{"u-a": 2048},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain} {
+		if strings.Contains(string(raw), leak) {
+			t.Fatalf("proxy secret leaked to bbolt store: %q", leak)
+		}
+	}
+
+	in, ok, err := bs.ProxyInbound("in-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || in.RealityPrivateKey != proxyRealityPrivateKeyPlain || in.Port != 443 {
+		t.Fatalf("proxy inbound not recovered: ok=%v inbound=%+v", ok, in)
+	}
+	user, ok, err := bs.ProxyUser("u-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || user.UUID != proxyUUIDPlain || user.Password != proxyPasswordPlain || user.SubToken != proxySubTokenPlain {
+		t.Fatalf("proxy user secrets not recovered: ok=%v user=%+v", ok, user)
+	}
+	usersForB, err := bs.ProxyUsersForInbound("in-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usersForB) != 1 || usersForB[0].ID != "u-all" {
+		t.Fatalf("empty inbound membership should mean all inbounds: %+v", usersForB)
+	}
+	profile, ok, err := bs.ProxyNodeProfile("node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || profile.ID != "node-a" || profile.Hostname == "" {
+		t.Fatalf("proxy node profile not recovered: ok=%v profile=%+v", ok, profile)
+	}
+	usage, ok, err := bs.ProxyUsageSnapshot("node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || usage.UserBytes["u-a"] != 2048 {
+		t.Fatalf("proxy usage snapshot not recovered: ok=%v usage=%+v", ok, usage)
+	}
+	exported, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exported.ProxyUsers["u-a"].SubToken != proxySubTokenPlain || exported.ProxyInbounds["in-a"].RealityPrivateKey != proxyRealityPrivateKeyPlain {
+		t.Fatalf("proxy records did not export/decrypt: %+v %+v", exported.ProxyUsers["u-a"], exported.ProxyInbounds["in-a"])
+	}
+
+	if err := bs.DeleteProxyInbound("in-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteProxyUser("u-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteProxyNodeProfile("node-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteProxyUsageSnapshot("node-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := bs.ProxyInbound("in-a"); err != nil || ok {
+		t.Fatalf("proxy inbound should be deleted: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := bs.ProxyUser("u-a"); err != nil || ok {
+		t.Fatalf("proxy user should be deleted: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := bs.ProxyNodeProfile("node-a"); err != nil || ok {
+		t.Fatalf("proxy profile should be deleted: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := bs.ProxyUsageSnapshot("node-a"); err != nil || ok {
+		t.Fatalf("proxy usage should be deleted: ok=%v err=%v", ok, err)
+	}
+}

@@ -44,6 +44,10 @@ var (
 	boltBucketNFTInputs       = []byte("nft_inputs")
 	boltBucketDNSDeployments  = []byte("dns_deployments")
 	boltBucketNetPolicies     = []byte("net_policies")
+	boltBucketProxyInbounds   = []byte("proxy_inbounds")
+	boltBucketProxyUsers      = []byte("proxy_users")
+	boltBucketProxyProfiles   = []byte("proxy_profiles")
+	boltBucketProxyUsage      = []byte("proxy_usage")
 	boltBucketTOTPChallenges  = []byte("totp_challenges")
 	boltBucketOIDCProviders   = []byte("oidc_providers")
 	boltBucketOIDCIdentities  = []byte("oidc_identities")
@@ -72,6 +76,10 @@ var boltStateBuckets = [][]byte{
 	boltBucketNFTInputs,
 	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
+	boltBucketProxyInbounds,
+	boltBucketProxyUsers,
+	boltBucketProxyProfiles,
+	boltBucketProxyUsage,
 	boltBucketTOTPChallenges,
 	boltBucketOIDCProviders,
 	boltBucketOIDCIdentities,
@@ -223,6 +231,18 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketNetPolicies, persist.NetPolicies); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketProxyInbounds, persist.ProxyInbounds); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketProxyUsers, persist.ProxyUsers); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketProxyProfiles, persist.ProxyProfiles); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketProxyUsage, persist.ProxyUsage); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketTOTPChallenges, persist.TOTPChallenges); err != nil {
 			return err
 		}
@@ -324,6 +344,18 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketNetPolicies, st.NetPolicies); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketProxyInbounds, st.ProxyInbounds); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketProxyUsers, st.ProxyUsers); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketProxyProfiles, st.ProxyProfiles); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketProxyUsage, st.ProxyUsage); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketTOTPChallenges, st.TOTPChallenges); err != nil {
@@ -1769,6 +1801,298 @@ func (bs *BoltStateStore) DeleteNetPolicy(nodeID string) error {
 			return err
 		}
 		return deleteRecord(tx, boltBucketNetPolicies, nodeID)
+	})
+}
+
+func (bs *BoltStateStore) UpsertProxyInbound(in model.ProxyInbound) error {
+	in.UpdatedAt = time.Now().UTC()
+	if in.CreatedAt.IsZero() {
+		in.CreatedAt = in.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptProxyInboundRecord(in.ID, in, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketProxyInbounds, in.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) ProxyInbound(id string) (model.ProxyInbound, bool, error) {
+	var out model.ProxyInbound
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketProxyInbounds, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptProxyInboundRecord(id, out, bs.cipher)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) ProxyInbounds() ([]model.ProxyInbound, error) {
+	inbounds := []model.ProxyInbound{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.ProxyInbound](tx, boltBucketProxyInbounds)
+		if err != nil {
+			return err
+		}
+		for _, in := range all {
+			dec, err := decryptProxyInboundRecord(in.ID, in, bs.cipher)
+			if err != nil {
+				return err
+			}
+			inbounds = append(inbounds, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(inbounds, func(i, j int) bool {
+		if inbounds[i].CreatedAt.Equal(inbounds[j].CreatedAt) {
+			return inbounds[i].ID < inbounds[j].ID
+		}
+		return inbounds[i].CreatedAt.Before(inbounds[j].CreatedAt)
+	})
+	return inbounds, nil
+}
+
+func (bs *BoltStateStore) DeleteProxyInbound(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketProxyInbounds, id)
+	})
+}
+
+func (bs *BoltStateStore) UpsertProxyUser(u model.ProxyUser) error {
+	u.UpdatedAt = time.Now().UTC()
+	if u.CreatedAt.IsZero() {
+		u.CreatedAt = u.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptProxyUserRecord(u.ID, u, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketProxyUsers, u.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) ProxyUser(id string) (model.ProxyUser, bool, error) {
+	var out model.ProxyUser
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketProxyUsers, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptProxyUserRecord(id, out, bs.cipher)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) ProxyUsers() ([]model.ProxyUser, error) {
+	users := []model.ProxyUser{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.ProxyUser](tx, boltBucketProxyUsers)
+		if err != nil {
+			return err
+		}
+		for _, u := range all {
+			dec, err := decryptProxyUserRecord(u.ID, u, bs.cipher)
+			if err != nil {
+				return err
+			}
+			users = append(users, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(users, func(i, j int) bool {
+		if users[i].CreatedAt.Equal(users[j].CreatedAt) {
+			return users[i].ID < users[j].ID
+		}
+		return users[i].CreatedAt.Before(users[j].CreatedAt)
+	})
+	return users, nil
+}
+
+func (bs *BoltStateStore) ProxyUsersForInbound(inboundID string) ([]model.ProxyUser, error) {
+	users := []model.ProxyUser{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.ProxyUser](tx, boltBucketProxyUsers)
+		if err != nil {
+			return err
+		}
+		for _, u := range all {
+			if len(u.InboundIDs) != 0 && !contains(u.InboundIDs, inboundID) {
+				continue
+			}
+			dec, err := decryptProxyUserRecord(u.ID, u, bs.cipher)
+			if err != nil {
+				return err
+			}
+			users = append(users, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(users, func(i, j int) bool {
+		if users[i].CreatedAt.Equal(users[j].CreatedAt) {
+			return users[i].ID < users[j].ID
+		}
+		return users[i].CreatedAt.Before(users[j].CreatedAt)
+	})
+	return users, nil
+}
+
+func (bs *BoltStateStore) DeleteProxyUser(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketProxyUsers, id)
+	})
+}
+
+func (bs *BoltStateStore) UpsertProxyNodeProfile(profile model.ProxyNodeProfile) error {
+	profile.UpdatedAt = time.Now().UTC()
+	if profile.CreatedAt.IsZero() {
+		profile.CreatedAt = profile.UpdatedAt
+	}
+	if profile.ID == "" {
+		profile.ID = profile.NodeID
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketProxyProfiles, profile.NodeID, profile)
+	})
+}
+
+func (bs *BoltStateStore) ProxyNodeProfile(nodeID string) (model.ProxyNodeProfile, bool, error) {
+	var out model.ProxyNodeProfile
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketProxyProfiles, nodeID, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) ProxyNodeProfiles() ([]model.ProxyNodeProfile, error) {
+	profiles := []model.ProxyNodeProfile{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		profiles, err = listMapValues[model.ProxyNodeProfile](tx, boltBucketProxyProfiles)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(profiles, func(i, j int) bool { return profiles[i].NodeID < profiles[j].NodeID })
+	return profiles, nil
+}
+
+func (bs *BoltStateStore) DeleteProxyNodeProfile(nodeID string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketProxyProfiles, nodeID)
+	})
+}
+
+func (bs *BoltStateStore) UpsertProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) error {
+	if snapshot.At.IsZero() {
+		snapshot.At = time.Now().UTC()
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketProxyUsage, snapshot.NodeID, snapshot)
+	})
+}
+
+func (bs *BoltStateStore) ProxyUsageSnapshot(nodeID string) (model.ProxyUsageSnapshot, bool, error) {
+	var out model.ProxyUsageSnapshot
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketProxyUsage, nodeID, &out)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) ProxyUsageSnapshots() ([]model.ProxyUsageSnapshot, error) {
+	snapshots := []model.ProxyUsageSnapshot{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		snapshots, err = listMapValues[model.ProxyUsageSnapshot](tx, boltBucketProxyUsage)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].NodeID < snapshots[j].NodeID })
+	return snapshots, nil
+}
+
+func (bs *BoltStateStore) DeleteProxyUsageSnapshot(nodeID string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketProxyUsage, nodeID)
 	})
 }
 

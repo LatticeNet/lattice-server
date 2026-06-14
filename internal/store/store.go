@@ -48,6 +48,10 @@ type State struct {
 	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
 	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
+	ProxyInbounds   map[string]model.ProxyInbound       `json:"proxy_inbounds"`
+	ProxyUsers      map[string]model.ProxyUser          `json:"proxy_users"`
+	ProxyProfiles   map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
+	ProxyUsage      map[string]model.ProxyUsageSnapshot `json:"proxy_usage"`
 	TOTPChallenges  map[string]auth.TOTPChallenge       `json:"totp_challenges"`
 	OIDCProviders   map[string]model.OIDCProvider       `json:"oidc_providers"`
 	OIDCIdentities  map[string]model.OIDCIdentity       `json:"oidc_identities"`
@@ -140,6 +144,10 @@ func emptyState() State {
 		NFTInputs:       map[string]model.NFTInputs{},
 		DNSDeployments:  map[string]model.DNSDeployment{},
 		NetPolicies:     map[string]model.NetPolicy{},
+		ProxyInbounds:   map[string]model.ProxyInbound{},
+		ProxyUsers:      map[string]model.ProxyUser{},
+		ProxyProfiles:   map[string]model.ProxyNodeProfile{},
+		ProxyUsage:      map[string]model.ProxyUsageSnapshot{},
 		TOTPChallenges:  map[string]auth.TOTPChallenge{},
 		OIDCProviders:   map[string]model.OIDCProvider{},
 		OIDCIdentities:  map[string]model.OIDCIdentity{},
@@ -204,6 +212,18 @@ func (st *State) ensureMaps() {
 	}
 	if st.NetPolicies == nil {
 		st.NetPolicies = map[string]model.NetPolicy{}
+	}
+	if st.ProxyInbounds == nil {
+		st.ProxyInbounds = map[string]model.ProxyInbound{}
+	}
+	if st.ProxyUsers == nil {
+		st.ProxyUsers = map[string]model.ProxyUser{}
+	}
+	if st.ProxyProfiles == nil {
+		st.ProxyProfiles = map[string]model.ProxyNodeProfile{}
+	}
+	if st.ProxyUsage == nil {
+		st.ProxyUsage = map[string]model.ProxyUsageSnapshot{}
 	}
 	if st.TOTPChallenges == nil {
 		st.TOTPChallenges = map[string]auth.TOTPChallenge{}
@@ -1284,6 +1304,210 @@ func (s *Store) DeleteNetPolicy(nodeID string) error {
 		return nil
 	}
 	delete(s.state.NetPolicies, nodeID)
+	return s.Save()
+}
+
+// UpsertProxyInbound stores a central proxy inbound template.
+func (s *Store) UpsertProxyInbound(in model.ProxyInbound) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	in.UpdatedAt = time.Now().UTC()
+	if in.CreatedAt.IsZero() {
+		in.CreatedAt = in.UpdatedAt
+	}
+	s.state.ProxyInbounds[in.ID] = in
+	return s.Save()
+}
+
+// ProxyInbound returns a proxy inbound template by id.
+func (s *Store) ProxyInbound(id string) (model.ProxyInbound, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	in, ok := s.state.ProxyInbounds[id]
+	return in, ok
+}
+
+// ProxyInbounds returns all proxy inbound templates sorted by creation time.
+func (s *Store) ProxyInbounds() []model.ProxyInbound {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.ProxyInbound, 0, len(s.state.ProxyInbounds))
+	for _, in := range s.state.ProxyInbounds {
+		out = append(out, in)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+// DeleteProxyInbound removes a central proxy inbound template.
+func (s *Store) DeleteProxyInbound(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.ProxyInbounds[id]; !ok {
+		return nil
+	}
+	delete(s.state.ProxyInbounds, id)
+	return s.Save()
+}
+
+// UpsertProxyUser stores a central proxy subscriber identity.
+func (s *Store) UpsertProxyUser(u model.ProxyUser) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u.UpdatedAt = time.Now().UTC()
+	if u.CreatedAt.IsZero() {
+		u.CreatedAt = u.UpdatedAt
+	}
+	s.state.ProxyUsers[u.ID] = u
+	return s.Save()
+}
+
+// ProxyUser returns a proxy user by id.
+func (s *Store) ProxyUser(id string) (model.ProxyUser, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u, ok := s.state.ProxyUsers[id]
+	return u, ok
+}
+
+// ProxyUsers returns all proxy users sorted by creation time.
+func (s *Store) ProxyUsers() []model.ProxyUser {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.ProxyUser, 0, len(s.state.ProxyUsers))
+	for _, u := range s.state.ProxyUsers {
+		out = append(out, u)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+// ProxyUsersForInbound returns users provisioned on an inbound. Empty
+// InboundIDs means the user is eligible for every enabled inbound.
+func (s *Store) ProxyUsersForInbound(inboundID string) []model.ProxyUser {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.ProxyUser{}
+	for _, u := range s.state.ProxyUsers {
+		if len(u.InboundIDs) == 0 || contains(u.InboundIDs, inboundID) {
+			out = append(out, u)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+// DeleteProxyUser removes a proxy subscriber identity.
+func (s *Store) DeleteProxyUser(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.ProxyUsers[id]; !ok {
+		return nil
+	}
+	delete(s.state.ProxyUsers, id)
+	return s.Save()
+}
+
+// UpsertProxyNodeProfile stores the per-node proxy render profile.
+func (s *Store) UpsertProxyNodeProfile(profile model.ProxyNodeProfile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	profile.UpdatedAt = time.Now().UTC()
+	if profile.CreatedAt.IsZero() {
+		profile.CreatedAt = profile.UpdatedAt
+	}
+	if profile.ID == "" {
+		profile.ID = profile.NodeID
+	}
+	s.state.ProxyProfiles[profile.NodeID] = profile
+	return s.Save()
+}
+
+// ProxyNodeProfile returns a proxy node profile by node id.
+func (s *Store) ProxyNodeProfile(nodeID string) (model.ProxyNodeProfile, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	profile, ok := s.state.ProxyProfiles[nodeID]
+	return profile, ok
+}
+
+// ProxyNodeProfiles returns all proxy node profiles sorted by node id.
+func (s *Store) ProxyNodeProfiles() []model.ProxyNodeProfile {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.ProxyNodeProfile, 0, len(s.state.ProxyProfiles))
+	for _, profile := range s.state.ProxyProfiles {
+		out = append(out, profile)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// DeleteProxyNodeProfile removes a per-node proxy render profile.
+func (s *Store) DeleteProxyNodeProfile(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.ProxyProfiles[nodeID]; !ok {
+		return nil
+	}
+	delete(s.state.ProxyProfiles, nodeID)
+	return s.Save()
+}
+
+// UpsertProxyUsageSnapshot stores the last accounting snapshot for a node.
+func (s *Store) UpsertProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if snapshot.At.IsZero() {
+		snapshot.At = time.Now().UTC()
+	}
+	s.state.ProxyUsage[snapshot.NodeID] = snapshot
+	return s.Save()
+}
+
+// ProxyUsageSnapshot returns the last accounting snapshot for a node.
+func (s *Store) ProxyUsageSnapshot(nodeID string) (model.ProxyUsageSnapshot, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot, ok := s.state.ProxyUsage[nodeID]
+	return snapshot, ok
+}
+
+// ProxyUsageSnapshots returns all proxy accounting snapshots sorted by node id.
+func (s *Store) ProxyUsageSnapshots() []model.ProxyUsageSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.ProxyUsageSnapshot, 0, len(s.state.ProxyUsage))
+	for _, snapshot := range s.state.ProxyUsage {
+		out = append(out, snapshot)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// DeleteProxyUsageSnapshot removes a node's last accounting snapshot.
+func (s *Store) DeleteProxyUsageSnapshot(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.ProxyUsage[nodeID]; !ok {
+		return nil
+	}
+	delete(s.state.ProxyUsage, nodeID)
 	return s.Save()
 }
 

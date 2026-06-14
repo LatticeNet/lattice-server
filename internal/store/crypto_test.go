@@ -59,6 +59,23 @@ func seedSecrets(t *testing.T, s *Store) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpsertProxyInbound(model.ProxyInbound{
+		ID: "pin1", Name: "vless reality", Core: model.ProxyCoreSingbox,
+		Protocol: model.ProxyProtocolVLESS, Transport: model.ProxyTransportTCP,
+		Security: model.ProxySecurityReality, Port: 443,
+		RealityPrivateKey: proxyRealityPrivateKeyPlain,
+		RealityPublicKey:  "pub",
+		Enabled:           true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertProxyUser(model.ProxyUser{
+		ID: "pu1", Name: "alice", Enabled: true,
+		UUID: proxyUUIDPlain, Password: proxyPasswordPlain, SubToken: proxySubTokenPlain,
+		InboundIDs: []string{"pin1"}, Status: model.ProxyUserStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func findNotify(s *Store, id string) *model.NotifyChannel {
@@ -72,14 +89,18 @@ func findNotify(s *Store, id string) *model.NotifyChannel {
 }
 
 const (
-	totpPlain       = "JBSWY3DPEHPK3PXP"
-	cfTokenPlain    = "cf-secret-token-9f8e7d6c5b4a"
-	webhookHdrPlain = `{"Authorization":"Bearer xyz123"}`
-	botTokenPlain   = "123456:AAtertoken-bot-secret"
-	chatIDPlain     = "-1001234567890"
-	consoleURLPlain = "https://console.example.com/session/signed-secret"
-	detailURLPlain  = "https://billing.example.com/machine/private-link"
-	dnsCFTokenPlain = "cf-secret-token-for-selfdns"
+	totpPlain                   = "JBSWY3DPEHPK3PXP"
+	cfTokenPlain                = "cf-secret-token-9f8e7d6c5b4a"
+	webhookHdrPlain             = `{"Authorization":"Bearer xyz123"}`
+	botTokenPlain               = "123456:AAtertoken-bot-secret"
+	chatIDPlain                 = "-1001234567890"
+	consoleURLPlain             = "https://console.example.com/session/signed-secret"
+	detailURLPlain              = "https://billing.example.com/machine/private-link"
+	dnsCFTokenPlain             = "cf-secret-token-for-selfdns"
+	proxyRealityPrivateKeyPlain = "reality-private-key-secret"
+	proxyUUIDPlain              = "018cfcfb-9b78-7d81-b7ee-93f3f4d4e2b1"
+	proxyPasswordPlain          = "proxy-password-secret"
+	proxySubTokenPlain          = "proxy-sub-token-secret"
 )
 
 func TestEncryptedAtRest(t *testing.T) {
@@ -100,7 +121,7 @@ func TestEncryptedAtRest(t *testing.T) {
 	disk := string(raw)
 
 	// No plaintext secret may appear on disk.
-	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain} {
+	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain} {
 		if strings.Contains(disk, leak) {
 			t.Fatalf("plaintext secret leaked to disk: %q", leak)
 		}
@@ -110,7 +131,7 @@ func TestEncryptedAtRest(t *testing.T) {
 		t.Fatal("expected encrypted envelopes on disk, found none")
 	}
 	// Non-secret fields stay readable (we did not over-encrypt).
-	for _, plain := range []string{"admin", "home", "cloudflare", "telegram", "DMIT"} {
+	for _, plain := range []string{"admin", "home", "cloudflare", "telegram", "DMIT", "vless reality", "alice"} {
 		if !strings.Contains(disk, plain) {
 			t.Fatalf("expected non-secret field %q to remain readable on disk", plain)
 		}
@@ -151,6 +172,14 @@ func TestReopenDecryptsRoundTrip(t *testing.T) {
 	m, ok := s2.MachineProfile("m1")
 	if !ok || m.ConsoleURL != consoleURLPlain || m.DetailURL != detailURLPlain {
 		t.Fatalf("machine profile links not recovered: %+v ok=%v", m, ok)
+	}
+	in, ok := s2.ProxyInbound("pin1")
+	if !ok || in.RealityPrivateKey != proxyRealityPrivateKeyPlain {
+		t.Fatalf("proxy inbound secret not recovered: %+v ok=%v", in, ok)
+	}
+	pu, ok := s2.ProxyUser("pu1")
+	if !ok || pu.UUID != proxyUUIDPlain || pu.Password != proxyPasswordPlain || pu.SubToken != proxySubTokenPlain {
+		t.Fatalf("proxy user secrets not recovered: %+v ok=%v", pu, ok)
 	}
 }
 
@@ -205,8 +234,10 @@ func TestLegacyPlaintextMigratesOnSave(t *testing.T) {
 		t.Fatal(err)
 	}
 	rawAfter, _ := os.ReadFile(path)
-	if strings.Contains(string(rawAfter), cfTokenPlain) || strings.Contains(string(rawAfter), dnsCFTokenPlain) {
-		t.Fatal("legacy plaintext was not encrypted after save")
+	for _, leak := range []string{cfTokenPlain, dnsCFTokenPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain} {
+		if strings.Contains(string(rawAfter), leak) {
+			t.Fatalf("legacy plaintext was not encrypted after save: %q", leak)
+		}
 	}
 	if !strings.Contains(string(rawAfter), "lat$1$") {
 		t.Fatal("expected envelopes after migration save")
@@ -264,6 +295,17 @@ func TestPrefixCollidingSecretRoundTrips(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpsertProxyInbound(model.ProxyInbound{
+		ID: "pin1", Name: "vless reality", Core: model.ProxyCoreSingbox,
+		Protocol: model.ProxyProtocolVLESS, Port: 443, RealityPrivateKey: colliding,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertProxyUser(model.ProxyUser{
+		ID: "pu1", Name: "alice", UUID: colliding, Password: colliding, SubToken: colliding,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	raw, _ := os.ReadFile(path)
 	if strings.Contains(string(raw), colliding) {
@@ -288,6 +330,14 @@ func TestPrefixCollidingSecretRoundTrips(t *testing.T) {
 	m, _ := s2.MachineProfile("m1")
 	if m.ConsoleURL != colliding || m.DetailURL != colliding {
 		t.Fatalf("colliding machine links not recovered: %+v", m)
+	}
+	in, _ := s2.ProxyInbound("pin1")
+	if in.RealityPrivateKey != colliding {
+		t.Fatalf("colliding proxy inbound key not recovered: %+v", in)
+	}
+	pu, _ := s2.ProxyUser("pu1")
+	if pu.UUID != colliding || pu.Password != colliding || pu.SubToken != colliding {
+		t.Fatalf("colliding proxy user secrets not recovered: %+v", pu)
 	}
 }
 

@@ -31,6 +31,8 @@ import (
 //   - model.OIDCProvider.ClientSecret  OAuth2 client secret for SSO
 //   - auth.OIDCAuthState.State/CodeVerifier short-lived OAuth2 state + PKCE verifier
 //   - model.MachineProfile.ConsoleURL/DetailURL operator console/detail links
+//   - model.ProxyInbound.RealityPrivateKey REALITY server private key
+//   - model.ProxyUser.UUID/Password/SubToken subscriber credentials and subscription bearer token
 //
 // When adding a new persisted credential, encrypt it here AND extend
 // stateHasEnvelope so the lost-key guard stays accurate.
@@ -132,6 +134,26 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 		machines[id] = enc
 	}
 	out.MachineProfiles = machines
+
+	proxyInbounds := make(map[string]model.ProxyInbound, len(st.ProxyInbounds))
+	for id, in := range st.ProxyInbounds {
+		enc, err := encryptProxyInboundRecord(id, in, c)
+		if err != nil {
+			return State{}, err
+		}
+		proxyInbounds[id] = enc
+	}
+	out.ProxyInbounds = proxyInbounds
+
+	proxyUsers := make(map[string]model.ProxyUser, len(st.ProxyUsers))
+	for id, u := range st.ProxyUsers {
+		enc, err := encryptProxyUserRecord(id, u, c)
+		if err != nil {
+			return State{}, err
+		}
+		proxyUsers[id] = enc
+	}
+	out.ProxyUsers = proxyUsers
 
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
@@ -251,6 +273,26 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.MachineProfiles = machines
 
+	proxyInbounds := make(map[string]model.ProxyInbound, len(st.ProxyInbounds))
+	for id, in := range st.ProxyInbounds {
+		dec, err := decryptProxyInboundRecord(id, in, c)
+		if err != nil {
+			return err
+		}
+		proxyInbounds[id] = dec
+	}
+	st.ProxyInbounds = proxyInbounds
+
+	proxyUsers := make(map[string]model.ProxyUser, len(st.ProxyUsers))
+	for id, u := range st.ProxyUsers {
+		dec, err := decryptProxyUserRecord(id, u, c)
+		if err != nil {
+			return err
+		}
+		proxyUsers[id] = dec
+	}
+	st.ProxyUsers = proxyUsers
+
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
 		dec, err := decryptOIDCAuthStateRecord(id, authState, c)
@@ -307,6 +349,16 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, p := range st.MachineProfiles {
 		if secret.IsEnvelope(p.ConsoleURL) || secret.IsEnvelope(p.DetailURL) {
+			return true
+		}
+	}
+	for _, in := range st.ProxyInbounds {
+		if secret.IsEnvelope(in.RealityPrivateKey) {
+			return true
+		}
+	}
+	for _, u := range st.ProxyUsers {
+		if secret.IsEnvelope(u.UUID) || secret.IsEnvelope(u.Password) || secret.IsEnvelope(u.SubToken) {
 			return true
 		}
 	}
@@ -556,6 +608,68 @@ func decryptMachineProfileRecord(id string, p model.MachineProfile, c secret.Cip
 	p.ConsoleURL = console
 	p.DetailURL = detail
 	return p, nil
+}
+
+func encryptProxyInboundRecord(id string, in model.ProxyInbound, c secret.Cipher) (model.ProxyInbound, error) {
+	key, err := c.Encrypt(in.RealityPrivateKey)
+	if err != nil {
+		return model.ProxyInbound{}, fmt.Errorf("encrypt proxy inbound %s reality private key: %w", id, err)
+	}
+	in.RealityPrivateKey = key
+	return in, nil
+}
+
+func decryptProxyInboundRecord(id string, in model.ProxyInbound, c secret.Cipher) (model.ProxyInbound, error) {
+	if !c.Enabled() && secret.IsEnvelope(in.RealityPrivateKey) {
+		return model.ProxyInbound{}, lostMasterKeyError()
+	}
+	key, err := c.Decrypt(in.RealityPrivateKey)
+	if err != nil {
+		return model.ProxyInbound{}, fmt.Errorf("decrypt proxy inbound %s reality private key: %w", id, err)
+	}
+	in.RealityPrivateKey = key
+	return in, nil
+}
+
+func encryptProxyUserRecord(id string, u model.ProxyUser, c secret.Cipher) (model.ProxyUser, error) {
+	uuid, err := c.Encrypt(u.UUID)
+	if err != nil {
+		return model.ProxyUser{}, fmt.Errorf("encrypt proxy user %s uuid: %w", id, err)
+	}
+	password, err := c.Encrypt(u.Password)
+	if err != nil {
+		return model.ProxyUser{}, fmt.Errorf("encrypt proxy user %s password: %w", id, err)
+	}
+	subToken, err := c.Encrypt(u.SubToken)
+	if err != nil {
+		return model.ProxyUser{}, fmt.Errorf("encrypt proxy user %s subscription token: %w", id, err)
+	}
+	u.UUID = uuid
+	u.Password = password
+	u.SubToken = subToken
+	return u, nil
+}
+
+func decryptProxyUserRecord(id string, u model.ProxyUser, c secret.Cipher) (model.ProxyUser, error) {
+	if !c.Enabled() && (secret.IsEnvelope(u.UUID) || secret.IsEnvelope(u.Password) || secret.IsEnvelope(u.SubToken)) {
+		return model.ProxyUser{}, lostMasterKeyError()
+	}
+	uuid, err := c.Decrypt(u.UUID)
+	if err != nil {
+		return model.ProxyUser{}, fmt.Errorf("decrypt proxy user %s uuid: %w", id, err)
+	}
+	password, err := c.Decrypt(u.Password)
+	if err != nil {
+		return model.ProxyUser{}, fmt.Errorf("decrypt proxy user %s password: %w", id, err)
+	}
+	subToken, err := c.Decrypt(u.SubToken)
+	if err != nil {
+		return model.ProxyUser{}, fmt.Errorf("decrypt proxy user %s subscription token: %w", id, err)
+	}
+	u.UUID = uuid
+	u.Password = password
+	u.SubToken = subToken
+	return u, nil
 }
 
 func encryptOIDCAuthStateRecord(id string, authState auth.OIDCAuthState, c secret.Cipher) (auth.OIDCAuthState, error) {

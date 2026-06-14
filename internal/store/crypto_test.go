@@ -76,6 +76,15 @@ func seedSecrets(t *testing.T, s *Store) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.CreateTask(model.Task{
+		ID:          "task-secret",
+		Targets:     []string{"node-a"},
+		Interpreter: "sh",
+		Script:      taskScriptPlain,
+		Status:      model.TaskQueued,
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func findNotify(s *Store, id string) *model.NotifyChannel {
@@ -101,6 +110,7 @@ const (
 	proxyUUIDPlain              = "018cfcfb-9b78-7d81-b7ee-93f3f4d4e2b1"
 	proxyPasswordPlain          = "proxy-password-secret"
 	proxySubTokenPlain          = "proxy-sub-token-secret"
+	taskScriptPlain             = "echo proxy-apply-secret-script"
 )
 
 func TestEncryptedAtRest(t *testing.T) {
@@ -121,7 +131,7 @@ func TestEncryptedAtRest(t *testing.T) {
 	disk := string(raw)
 
 	// No plaintext secret may appear on disk.
-	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain} {
+	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain, taskScriptPlain} {
 		if strings.Contains(disk, leak) {
 			t.Fatalf("plaintext secret leaked to disk: %q", leak)
 		}
@@ -181,6 +191,10 @@ func TestReopenDecryptsRoundTrip(t *testing.T) {
 	if !ok || pu.UUID != proxyUUIDPlain || pu.Password != proxyPasswordPlain || pu.SubToken != proxySubTokenPlain {
 		t.Fatalf("proxy user secrets not recovered: %+v ok=%v", pu, ok)
 	}
+	task, ok := s2.Task("task-secret")
+	if !ok || task.Script != taskScriptPlain {
+		t.Fatalf("task script not recovered: %+v ok=%v", task, ok)
+	}
 }
 
 func TestWrongKeyFailsToOpen(t *testing.T) {
@@ -234,7 +248,7 @@ func TestLegacyPlaintextMigratesOnSave(t *testing.T) {
 		t.Fatal(err)
 	}
 	rawAfter, _ := os.ReadFile(path)
-	for _, leak := range []string{cfTokenPlain, dnsCFTokenPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain} {
+	for _, leak := range []string{cfTokenPlain, dnsCFTokenPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain, taskScriptPlain} {
 		if strings.Contains(string(rawAfter), leak) {
 			t.Fatalf("legacy plaintext was not encrypted after save: %q", leak)
 		}

@@ -2910,6 +2910,15 @@ func applyScriptFor(approval model.Approval) string {
 }
 
 func (s *Server) applyScriptFor(approval model.Approval) string {
+	if approval.Plugin == proxyCorePlugin {
+		script, err := s.proxyCoreApplyScript(approval)
+		if err != nil {
+			return "set -e\n" +
+				"echo " + shellQuote("lattice proxycore: invalid approval: "+err.Error()) + " >&2\n" +
+				"exit 1\n"
+		}
+		return script
+	}
 	return applyScriptForWithServer(approval, s.publicURL)
 }
 
@@ -2953,7 +2962,7 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 		return script
 	case proxyCorePlugin:
 		return "set -e\n" +
-			"echo " + shellQuote("lattice proxycore: apply support is not implemented yet; re-plan after upgrade") + " >&2\n" +
+			"echo " + shellQuote("lattice proxycore: server-backed apply context required; re-approve through /api/network/approvals/approve") + " >&2\n" +
 			"exit 1\n"
 	default:
 		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
@@ -3370,15 +3379,11 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
 			return
 		}
-		if req.QueueApply {
-			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "proxycore apply is not implemented yet; re-plan after apply support lands"))
-			return
-		}
 	}
 	applyScript := ""
 	if req.QueueApply {
-		applyScript = s.applyScriptFor(approval)
-		if approval.Plugin == "selfdns" {
+		switch approval.Plugin {
+		case "selfdns":
 			var err error
 			applyScript, err = selfdns.ApplyScriptFromPlan(approval.Plan)
 			if err != nil {
@@ -3389,6 +3394,15 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
 				return
 			}
+		case proxyCorePlugin:
+			var err error
+			applyScript, err = s.proxyCoreApplyScript(approval)
+			if err != nil {
+				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+				return
+			}
+		default:
+			applyScript = s.applyScriptFor(approval)
 		}
 	}
 	approval.Status = model.ApprovalApproved
@@ -3622,6 +3636,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == "selfdns" {
 		return s.handleSelfDNSTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin == proxyCorePlugin {
+		return s.handleProxyCoreTaskResult(r, approval, task, result)
 	}
 	if approval.Plugin != "nftpolicy" {
 		return nil

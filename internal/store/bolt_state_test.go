@@ -19,6 +19,7 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	st := emptyState()
 	st.Users["u1"] = model.User{ID: "u1", Username: "admin", TOTPSecret: totpPlain, CreatedAt: now}
 	st.Nodes["n1"] = model.Node{ID: "n1", Name: "node one", TokenHash: "node-token-hash", CreatedAt: now}
+	st.Tasks["task-secret"] = model.Task{ID: "task-secret", Targets: []string{"n1"}, Interpreter: "sh", Script: taskScriptPlain, Status: model.TaskQueued, CreatedAt: now}
 	st.KV["cfg/hello"] = model.KVEntry{Bucket: "cfg", Key: "hello", Value: "world", UpdatedAt: now}
 	st.Results = []model.TaskResult{{TaskID: "task-1", NodeID: "n1", Stdout: "ok", StartedAt: now, FinishedAt: now}}
 	st.Audit = []model.AuditEvent{{ID: "audit-1", At: now, Action: "test.audit", Decision: "allow"}}
@@ -50,7 +51,7 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 		t.Fatal(err)
 	}
 	disk := string(raw)
-	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain, "oidc-client-secret"} {
+	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, proxyRealityPrivateKeyPlain, proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain, taskScriptPlain, "oidc-client-secret"} {
 		if strings.Contains(disk, leak) {
 			t.Fatalf("plaintext secret leaked into bbolt file: %q", leak)
 		}
@@ -106,6 +107,9 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	}
 	if len(got.Results) != 1 || got.Results[0].TaskID != "task-1" {
 		t.Fatalf("results not recovered: %+v", got.Results)
+	}
+	if got.Tasks["task-secret"].Script != taskScriptPlain {
+		t.Fatalf("task script did not decrypt: %+v", got.Tasks["task-secret"])
 	}
 	if len(got.Audit) != 1 || got.Audit[0].ID != "audit-1" {
 		t.Fatalf("audit events not recovered: %+v", got.Audit)
@@ -465,13 +469,13 @@ func TestBoltStateRecordLevelTaskLifecycleAndResults(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := bs.CreateTask(model.Task{ID: "task-old", Targets: []string{"n1"}, Interpreter: "sh", Script: "echo old", CreatedAt: now}); err != nil {
+	if err := bs.CreateTask(model.Task{ID: "task-old", Targets: []string{"n1"}, Interpreter: "sh", Script: "echo old secret", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if err := bs.CreateTask(model.Task{ID: "task-new", Targets: []string{"n1"}, Interpreter: "sh", Script: "echo new", CreatedAt: now.Add(time.Minute)}); err != nil {
+	if err := bs.CreateTask(model.Task{ID: "task-new", Targets: []string{"n1"}, Interpreter: "sh", Script: "echo new secret", CreatedAt: now.Add(time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := bs.CreateTask(model.Task{ID: "task-other", Targets: []string{"n2"}, Interpreter: "sh", Script: "echo other", CreatedAt: now.Add(2 * time.Minute)}); err != nil {
+	if err := bs.CreateTask(model.Task{ID: "task-other", Targets: []string{"n2"}, Interpreter: "sh", Script: "echo other secret", CreatedAt: now.Add(2 * time.Minute)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := bs.CreateTask(model.Task{ID: "task-auto", Targets: []string{"n3"}}); err != nil {
@@ -493,6 +497,18 @@ func TestBoltStateRecordLevelTaskLifecycleAndResults(t *testing.T) {
 	if len(tasks) != 4 || tasks[len(tasks)-1].ID != "task-old" || tasks[len(tasks)-2].ID != "task-new" {
 		t.Fatalf("tasks not sorted newest-first: %+v", tasks)
 	}
+	if tasks[len(tasks)-1].Script != "echo old secret" {
+		t.Fatalf("task script was not decrypted in list: %+v", tasks[len(tasks)-1])
+	}
+	rawTasks, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"echo old secret", "echo new secret", "echo other secret"} {
+		if strings.Contains(string(rawTasks), leak) {
+			t.Fatalf("task script leaked into bbolt file: %q", leak)
+		}
+	}
 
 	leased, err := bs.LeaseTasks("n1", 1)
 	if err != nil {
@@ -500,6 +516,9 @@ func TestBoltStateRecordLevelTaskLifecycleAndResults(t *testing.T) {
 	}
 	if len(leased) != 1 || leased[0].ID != "task-old" || leased[0].Status != model.TaskLeased || leased[0].LeasedBy != "n1" || !strings.HasPrefix(leased[0].LeaseID, "lease_") || leased[0].StartedAt.IsZero() {
 		t.Fatalf("oldest matching task was not leased correctly: %+v", leased)
+	}
+	if leased[0].Script != "echo old secret" {
+		t.Fatalf("leased task script was not decrypted: %+v", leased[0])
 	}
 	again, err := bs.LeaseTasks("n1", 10)
 	if err != nil {
@@ -567,7 +586,7 @@ func TestBoltStateRecordLevelTaskLifecycleAndResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || persistedTask.Status != model.TaskFailed || len(persistedResults) != 2 || persistedResults[0].TaskID != "task-new" {
+	if !ok || persistedTask.Status != model.TaskFailed || persistedTask.Script != "echo new secret" || len(persistedResults) != 2 || persistedResults[0].TaskID != "task-new" {
 		t.Fatalf("task lifecycle did not persist across reopen: ok=%v task=%+v results=%+v", ok, persistedTask, persistedResults)
 	}
 }

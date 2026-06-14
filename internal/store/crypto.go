@@ -33,6 +33,7 @@ import (
 //   - model.MachineProfile.ConsoleURL/DetailURL operator console/detail links
 //   - model.ProxyInbound.RealityPrivateKey REALITY server private key
 //   - model.ProxyUser.UUID/Password/SubToken subscriber credentials and subscription bearer token
+//   - model.Task.Script                 node-executed script body; may carry generated deployment secrets
 //
 // When adding a new persisted credential, encrypt it here AND extend
 // stateHasEnvelope so the lost-key guard stays accurate.
@@ -169,6 +170,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.OIDCAuthStates = oidcAuthStates
 
+	tasks := make(map[string]model.Task, len(st.Tasks))
+	for id, task := range st.Tasks {
+		enc, err := encryptTaskRecord(id, task, c)
+		if err != nil {
+			return State{}, err
+		}
+		tasks[id] = enc
+	}
+	out.Tasks = tasks
+
 	return out, nil
 }
 
@@ -303,6 +314,16 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.OIDCAuthStates = oidcAuthStates
 
+	tasks := make(map[string]model.Task, len(st.Tasks))
+	for id, task := range st.Tasks {
+		dec, err := decryptTaskRecord(id, task, c)
+		if err != nil {
+			return err
+		}
+		tasks[id] = dec
+	}
+	st.Tasks = tasks
+
 	return nil
 }
 
@@ -364,6 +385,11 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, authState := range st.OIDCAuthStates {
 		if secret.IsEnvelope(authState.State) || secret.IsEnvelope(authState.CodeVerifier) {
+			return true
+		}
+	}
+	for _, task := range st.Tasks {
+		if secret.IsEnvelope(task.Script) {
 			return true
 		}
 	}
@@ -701,6 +727,27 @@ func decryptOIDCAuthStateRecord(id string, authState auth.OIDCAuthState, c secre
 	authState.State = decState
 	authState.CodeVerifier = decVerifier
 	return authState, nil
+}
+
+func encryptTaskRecord(id string, task model.Task, c secret.Cipher) (model.Task, error) {
+	script, err := c.Encrypt(task.Script)
+	if err != nil {
+		return model.Task{}, fmt.Errorf("encrypt task %s script: %w", id, err)
+	}
+	task.Script = script
+	return task, nil
+}
+
+func decryptTaskRecord(id string, task model.Task, c secret.Cipher) (model.Task, error) {
+	if !c.Enabled() && secret.IsEnvelope(task.Script) {
+		return model.Task{}, lostMasterKeyError()
+	}
+	script, err := c.Decrypt(task.Script)
+	if err != nil {
+		return model.Task{}, fmt.Errorf("decrypt task %s script: %w", id, err)
+	}
+	task.Script = script
+	return task, nil
 }
 
 func sessionStorageKey(id string) string {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -523,17 +524,146 @@ func proxyCoreApprovalConfigSHA(approval model.Approval) (string, error) {
 }
 
 func (s *Server) requireCurrentProxyCoreApproval(approval model.Approval) error {
+	_, err := s.currentProxyCoreArtifactForApproval(approval)
+	return err
+}
+
+func (s *Server) currentProxyCoreArtifactForApproval(approval model.Approval) (proxycore.SingBoxArtifact, error) {
 	want, err := proxyCoreApprovalConfigSHA(approval)
 	if err != nil {
-		return err
+		return proxycore.SingBoxArtifact{}, err
 	}
 	_, _, artifact, err := s.renderProxyCoreArtifact(approval.NodeID)
 	if err != nil {
-		return fmt.Errorf("proxycore plan is no longer renderable: %w", err)
+		return proxycore.SingBoxArtifact{}, fmt.Errorf("proxycore plan is no longer renderable: %w", err)
 	}
 	if !strings.EqualFold(want, artifact.ConfigSHA256) {
-		return errors.New("proxycore config changed since this plan was created; re-plan before approving")
+		return proxycore.SingBoxArtifact{}, errors.New("proxycore config changed since this plan was created; re-plan before approving")
 	}
+	return artifact, nil
+}
+
+func (s *Server) proxyCoreApplyScript(approval model.Approval) (string, error) {
+	artifact, err := s.currentProxyCoreArtifactForApproval(approval)
+	if err != nil {
+		return "", err
+	}
+	return proxyCoreApplyScript(artifact), nil
+}
+
+func proxyCoreApplyScript(artifact proxycore.SingBoxArtifact) string {
+	target := artifact.ConfigPath
+	candidate := target + ".lattice-new"
+	backup := target + ".lattice-prev"
+	dir := path.Dir(target)
+	return "set -e\n" +
+		"umask 077\n" +
+		"if ! command -v sing-box >/dev/null 2>&1; then\n" +
+		"  echo 'lattice proxycore: sing-box binary not found on node' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"TARGET=" + shellQuote(target) + "\n" +
+		"CANDIDATE=" + shellQuote(candidate) + "\n" +
+		"BACKUP=" + shellQuote(backup) + "\n" +
+		"DIR=" + shellQuote(dir) + "\n" +
+		"RESTORE_TARGET=none\n" +
+		"mkdir -p \"$DIR\"\n" +
+		"cleanup_candidate() {\n" +
+		"  rm -f \"$CANDIDATE\"\n" +
+		"}\n" +
+		"restore_target() {\n" +
+		"  case \"$RESTORE_TARGET\" in\n" +
+		"    backup)\n" +
+		"      if [ -f \"$BACKUP\" ]; then mv -f \"$BACKUP\" \"$TARGET\"; fi\n" +
+		"      ;;\n" +
+		"    remove)\n" +
+		"      rm -f \"$TARGET\"\n" +
+		"      ;;\n" +
+		"  esac\n" +
+		"  rm -f \"$BACKUP\"\n" +
+		"}\n" +
+		"restart_after_restore() {\n" +
+		"  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
+		"    systemctl restart sing-box 2>/dev/null || true\n" +
+		"  elif command -v service >/dev/null 2>&1; then\n" +
+		"    service sing-box restart 2>/dev/null || true\n" +
+		"  fi\n" +
+		"}\n" +
+		"trap 'cleanup_candidate; restore_target; restart_after_restore' ERR\n" +
+		heredocWrite(shellQuote(candidate), "LATTICE_PROXYCORE_SINGBOX_EOF", artifact.ConfigJSON) +
+		"chmod 0600 \"$CANDIDATE\"\n" +
+		"sing-box check -c \"$CANDIDATE\"\n" +
+		"if [ -e \"$TARGET\" ]; then\n" +
+		"  cp -p \"$TARGET\" \"$BACKUP\"\n" +
+		"  RESTORE_TARGET=backup\n" +
+		"else\n" +
+		"  RESTORE_TARGET=remove\n" +
+		"fi\n" +
+		"mv -f \"$CANDIDATE\" \"$TARGET\"\n" +
+		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
+		"  systemctl reload sing-box 2>/dev/null || systemctl restart sing-box\n" +
+		"elif command -v service >/dev/null 2>&1; then\n" +
+		"  service sing-box reload 2>/dev/null || service sing-box restart\n" +
+		"else\n" +
+		"  echo 'lattice proxycore: no supported service manager found for sing-box reload/restart' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"trap - ERR\n" +
+		"rm -f \"$BACKUP\"\n" +
+		"echo 'lattice proxycore: sing-box config applied and verified'\n"
+}
+
+func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {
+	profile, ok := s.store.ProxyNodeProfile(approval.NodeID)
+	if !ok {
+		return fmt.Errorf("proxy profile %q not found for approval %s", approval.NodeID, approval.ID)
+	}
+	configSHA, err := proxyCoreApprovalConfigSHA(approval)
+	if err != nil {
+		return err
+	}
+	metadata := map[string]string{
+		"approval_id": approval.ID,
+		"task_id":     task.ID,
+		"config_sha":  configSHA,
+	}
+	if result.Error == "" && result.ExitCode == 0 {
+		if result.FinishedAt.IsZero() {
+			result.FinishedAt = time.Now().UTC()
+		}
+		profile.AppliedSHA256 = configSHA
+		profile.LastApplyAt = result.FinishedAt
+		profile.LastError = ""
+		approval.Status = model.ApprovalApplied
+		approval.UpdatedAt = time.Now().UTC()
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return fmt.Errorf("mark proxycore approval applied: %w", err)
+		}
+		if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
+			return fmt.Errorf("mark proxycore profile applied: %w", err)
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   approval.NodeID,
+			Action:   "proxy.apply.applied",
+			Decision: "allow",
+			Metadata: metadata,
+		})
+		return nil
+	}
+	reason := taskFailureSummary(result)
+	profile.LastError = reason
+	if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
+		return fmt.Errorf("mark proxycore apply failed: %w", err)
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   "proxy.apply.failed",
+		Decision: "deny",
+		Reason:   reason,
+		Metadata: metadata,
+	})
 	return nil
 }
 

@@ -760,11 +760,15 @@ func (bs *BoltStateStore) CreateTask(t model.Task) error {
 	if t.Status == "" {
 		t.Status = model.TaskQueued
 	}
+	enc, err := encryptTaskRecord(t.ID, t, bs.cipher)
+	if err != nil {
+		return err
+	}
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
 			return err
 		}
-		return putRecord(tx, boltBucketTasks, t.ID, t)
+		return putRecord(tx, boltBucketTasks, t.ID, enc)
 	})
 }
 
@@ -779,6 +783,10 @@ func (bs *BoltStateStore) Task(id string) (model.Task, bool, error) {
 		ok, err = getRecord(tx, boltBucketTasks, id, &out)
 		return err
 	})
+	if err != nil || !ok {
+		return out, ok, err
+	}
+	out, err = decryptTaskRecord(id, out, bs.cipher)
 	return out, ok, err
 }
 
@@ -795,6 +803,13 @@ func (bs *BoltStateStore) Tasks() ([]model.Task, error) {
 	if err != nil {
 		return nil, err
 	}
+	for i := range tasks {
+		dec, err := decryptTaskRecord(tasks[i].ID, tasks[i], bs.cipher)
+		if err != nil {
+			return nil, err
+		}
+		tasks[i] = dec
+	}
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].CreatedAt.After(tasks[j].CreatedAt) })
 	return tasks, nil
 }
@@ -808,9 +823,17 @@ func (bs *BoltStateStore) LeaseTasks(nodeID string, limit int) ([]model.Task, er
 		if err := checkBoltVersion(tx); err != nil {
 			return err
 		}
-		tasks, err := listMapValues[model.Task](tx, boltBucketTasks)
+		rawTasks, err := listMapValues[model.Task](tx, boltBucketTasks)
 		if err != nil {
 			return err
+		}
+		tasks := make([]model.Task, 0, len(rawTasks))
+		for _, task := range rawTasks {
+			dec, err := decryptTaskRecord(task.ID, task, bs.cipher)
+			if err != nil {
+				return err
+			}
+			tasks = append(tasks, dec)
 		}
 		sort.Slice(tasks, func(i, j int) bool {
 			if tasks[i].CreatedAt.Equal(tasks[j].CreatedAt) {
@@ -836,7 +859,11 @@ func (bs *BoltStateStore) LeaseTasks(nodeID string, limit int) ([]model.Task, er
 				t.LeaseID = "lease_" + leaseSecret
 			}
 			t.StartedAt = now
-			if err := putRecord(tx, boltBucketTasks, t.ID, t); err != nil {
+			enc, err := encryptTaskRecord(t.ID, t, bs.cipher)
+			if err != nil {
+				return err
+			}
+			if err := putRecord(tx, boltBucketTasks, t.ID, enc); err != nil {
 				return err
 			}
 			out = append(out, t)
@@ -872,13 +899,21 @@ func (bs *BoltStateStore) AddTaskResult(r model.TaskResult) error {
 			return err
 		}
 		if ok {
+			t, err = decryptTaskRecord(r.TaskID, t, bs.cipher)
+			if err != nil {
+				return err
+			}
 			if r.Error != "" || r.ExitCode != 0 {
 				t.Status = model.TaskFailed
 			} else {
 				t.Status = model.TaskFinished
 			}
 			t.FinishedAt = r.FinishedAt
-			if err := putRecord(tx, boltBucketTasks, t.ID, t); err != nil {
+			enc, err := encryptTaskRecord(t.ID, t, bs.cipher)
+			if err != nil {
+				return err
+			}
+			if err := putRecord(tx, boltBucketTasks, t.ID, enc); err != nil {
 				return err
 			}
 		}

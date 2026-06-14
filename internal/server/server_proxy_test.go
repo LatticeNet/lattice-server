@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 func TestProxyInboundAndUserViewsHideSecrets(t *testing.T) {
@@ -243,7 +245,7 @@ func TestProxyInboundDeleteRejectsReferencedInbound(t *testing.T) {
 func TestProxyPlanCreatesSecretFreeApproval(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
-	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 
 	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
 	plan := doJSON(t, handler, http.MethodPost, "/api/proxy/nodes/node-a/plan", `{}`, cookies, csrf)
@@ -296,11 +298,89 @@ func TestProxyPlanCreatesSecretFreeApproval(t *testing.T) {
 	approveQueue := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
 		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
 	defer approveQueue.Body.Close()
-	if approveQueue.StatusCode != http.StatusConflict {
-		t.Fatalf("proxycore queue_apply should fail closed until apply support lands, got %d", approveQueue.StatusCode)
+	if approveQueue.StatusCode != http.StatusOK {
+		t.Fatalf("proxycore queue_apply failed: %d", approveQueue.StatusCode)
 	}
-	if len(st.Tasks()) != 0 {
-		t.Fatalf("proxycore queue_apply must not create a task before apply support lands: %+v", st.Tasks())
+	tasks := st.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("proxycore queue_apply should create one task: %+v", tasks)
+	}
+	task := tasks[0]
+	if task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != "node-a" {
+		t.Fatalf("bad proxycore task: %+v", task)
+	}
+	for _, want := range []string{
+		"cat > '/etc/sing-box/config.json.lattice-new'",
+		"BACKUP='/etc/sing-box/config.json.lattice-prev'",
+		"restore_target()",
+		"restart_after_restore()",
+		"trap 'cleanup_candidate; restore_target; restart_after_restore' ERR",
+		"sing-box check -c \"$CANDIDATE\"",
+		"cp -p \"$TARGET\" \"$BACKUP\"",
+		"mv -f \"$CANDIDATE\" \"$TARGET\"",
+		"systemctl reload sing-box",
+		"service sing-box reload",
+		"no supported service manager found",
+		"super-secret-reality-private-key",
+		"11111111-1111-4111-8111-111111111111",
+	} {
+		if !strings.Contains(task.Script, want) {
+			t.Fatalf("proxycore task script missing %q:\n%s", want, task.Script)
+		}
+	}
+	for _, bad := range []string{"apply support is not implemented", "restart sing-box manually", "cat > $CANDIDATE"} {
+		if strings.Contains(task.Script, bad) {
+			t.Fatalf("proxycore task script contains unsafe/stale fragment %q:\n%s", bad, task.Script)
+		}
+	}
+
+	listTasks := doJSON(t, handler, http.MethodGet, "/api/tasks", "", cookies, "")
+	defer listTasks.Body.Close()
+	if listTasks.StatusCode != http.StatusOK {
+		t.Fatalf("task list failed: %d", listTasks.StatusCode)
+	}
+	var visible []map[string]any
+	if err := json.NewDecoder(listTasks.Body).Decode(&visible); err != nil {
+		t.Fatal(err)
+	}
+	if len(visible) != 1 {
+		t.Fatalf("expected one visible task, got %+v", visible)
+	}
+	if _, leaked := visible[0]["script"]; leaked {
+		t.Fatalf("control-plane task view leaked script: %+v", visible[0])
+	}
+
+	tasksRec := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-a", "", nodeToken)
+	if tasksRec.Code != http.StatusOK {
+		t.Fatalf("lease failed: %d (%s)", tasksRec.Code, tasksRec.Body.String())
+	}
+	var leased []map[string]any
+	if err := json.NewDecoder(tasksRec.Body).Decode(&leased); err != nil {
+		t.Fatal(err)
+	}
+	if len(leased) != 1 {
+		t.Fatalf("expected one leased task, got %+v", leased)
+	}
+	taskID, _ := leased[0]["id"].(string)
+	leaseID, _ := leased[0]["lease_id"].(string)
+	if taskID == "" || leaseID == "" {
+		t.Fatalf("leased task missing id/lease: %+v", leased[0])
+	}
+	result := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result",
+		`{"node_id":"node-a","result":{"task_id":"`+taskID+`","lease_id":"`+leaseID+`","exit_code":0,"stdout":"ok"}}`, nodeToken)
+	if result.Code != http.StatusOK {
+		t.Fatalf("task result failed: %d (%s)", result.Code, result.Body.String())
+	}
+	profile, ok := st.ProxyNodeProfile("node-a")
+	if !ok || profile.AppliedSHA256 != configSHA || profile.LastApplyAt.IsZero() || profile.LastError != "" {
+		t.Fatalf("proxy profile not marked applied: ok=%v profile=%+v want_sha=%s", ok, profile, configSHA)
+	}
+	appliedApproval, ok := st.Approval(approval.ID)
+	if !ok || appliedApproval.Status != model.ApprovalApplied {
+		t.Fatalf("approval not marked applied: ok=%v approval=%+v", ok, appliedApproval)
+	}
+	if !auditMetadataSeen(st, "proxy.apply.applied", "config_sha", configSHA) {
+		t.Fatalf("missing proxy.apply.applied audit: %+v", st.AuditEvents())
 	}
 }
 

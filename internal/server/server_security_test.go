@@ -422,7 +422,8 @@ func TestRemainingPrivilegedAllowAuditsUseRequestID(t *testing.T) {
 		t.Fatalf("nft plan failed: %d", nftPlan.StatusCode)
 	}
 	var approvalOut struct {
-		ID string `json:"id"`
+		ID   string `json:"id"`
+		Plan string `json:"plan"`
 	}
 	if err := json.NewDecoder(nftPlan.Body).Decode(&approvalOut); err != nil {
 		nftPlan.Body.Close()
@@ -431,7 +432,11 @@ func TestRemainingPrivilegedAllowAuditsUseRequestID(t *testing.T) {
 	nftPlan.Body.Close()
 
 	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
-		string(mustJSON(t, map[string]any{"approval_id": approvalOut.ID, "queue_apply": false})), cookies, csrf)
+		string(mustJSON(t, map[string]any{
+			"approval_id": approvalOut.ID,
+			"queue_apply": false,
+			"plan_sha256": planSHA256(approvalOut.Plan),
+		})), cookies, csrf)
 	approve.Body.Close()
 	if approve.StatusCode != http.StatusOK {
 		t.Fatalf("network approval failed: %d", approve.StatusCode)

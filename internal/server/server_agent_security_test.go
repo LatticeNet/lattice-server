@@ -309,13 +309,17 @@ func TestApproveIsIdempotentWhenQueueingApply(t *testing.T) {
 		t.Fatalf("plan failed: %d", plan.StatusCode)
 	}
 	var approval struct {
-		ID string `json:"id"`
+		ID   string `json:"id"`
+		Plan string `json:"plan"`
 	}
 	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
 		t.Fatal(err)
 	}
-	body := `{"approval_id":"` + approval.ID + `","queue_apply":true}`
-	for i := 0; i < 2; i++ {
+	bodies := []string{
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})),
+		`{"approval_id":"` + approval.ID + `","queue_apply":true}`,
+	}
+	for i, body := range bodies {
 		res := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve", body, cookies, csrf)
 		res.Body.Close()
 		if res.StatusCode != http.StatusOK {

@@ -3021,16 +3021,17 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	var req struct {
 		ApprovalID string `json:"approval_id"`
 		QueueApply bool   `json:"queue_apply"`
-		// PlanSHA256 (optional) binds this approval to the exact plan the
-		// reviewer saw. When present it must match the stored plan's hash, so a
-		// plan that changed between review and approval is rejected (TOCTOU /
-		// plan-swap defense). The client computes it over the Plan text it
-		// received from /api/network/approvals.
+		// PlanSHA256 binds high-risk pending approvals to the exact plan the
+		// reviewer saw. It must match the stored plan's hash, so a plan that
+		// changed between review and approval is rejected (TOCTOU / plan-swap
+		// defense). The client computes it over the Plan text it received from
+		// /api/network/approvals.
 		PlanSHA256 string `json:"plan_sha256,omitempty"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
+	req.PlanSHA256 = strings.TrimSpace(req.PlanSHA256)
 	approval, ok := s.store.Approval(req.ApprovalID)
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("approval not found"))
@@ -3039,16 +3040,20 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	if !s.requireNodeScope(w, p, "network:apply", approval.NodeID) {
 		return
 	}
+	if approval.Status != model.ApprovalPending {
+		writeJSON(w, http.StatusOK, toApprovalView(approval))
+		return
+	}
+	if approvalRequiresPlanHash(approval) && req.PlanSHA256 == "" {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "plan_sha256 is required for this approval"))
+		return
+	}
 	if req.PlanSHA256 != "" {
 		sum := sha256.Sum256([]byte(approval.Plan))
 		if !strings.EqualFold(req.PlanSHA256, hex.EncodeToString(sum[:])) {
 			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "plan changed since review; re-review before approving"))
 			return
 		}
-	}
-	if approval.Status != model.ApprovalPending {
-		writeJSON(w, http.StatusOK, toApprovalView(approval))
-		return
 	}
 	if approval.Plugin == "nftpolicy" {
 		if err := s.requireCurrentNetPolicyApproval(approval); err != nil {
@@ -3083,6 +3088,17 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
+}
+
+func approvalRequiresPlanHash(approval model.Approval) bool {
+	switch approval.Plugin {
+	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore":
+		return true
+	default:
+		// Approvals are the host-mutation gate. Unknown future plugins carrying a
+		// reviewable plan should fail closed until they make an explicit choice.
+		return strings.TrimSpace(approval.Plan) != ""
+	}
 }
 
 func (s *Server) requireCurrentNetPolicyApproval(approval model.Approval) error {

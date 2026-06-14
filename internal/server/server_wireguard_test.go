@@ -40,8 +40,11 @@ func TestWireGuardPlanApproveApply(t *testing.T) {
 
 	// approve + queue apply
 	appr := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
-		`{"approval_id":"`+approval.ID+`","queue_apply":true}`, cookies, csrf)
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
 	appr.Body.Close()
+	if appr.StatusCode != http.StatusOK {
+		t.Fatalf("approve failed: %d", appr.StatusCode)
+	}
 
 	// The queued internal task should carry a wireguard apply script, while the
 	// control-plane task view only exposes script metadata.

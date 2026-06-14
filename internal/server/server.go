@@ -546,6 +546,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/inbounds", s.withAuth("", s.handleProxyInbounds))
 	mux.HandleFunc("/api/proxy/inbounds/delete", s.withAuth("", s.handleDeleteProxyInbound))
 	mux.HandleFunc("/api/proxy/users", s.withAuth("", s.handleProxyUsers))
+	mux.HandleFunc("/api/proxy/users/rotate-sub-token", s.withAuth("", s.handleRotateProxyUserSubToken))
 	mux.HandleFunc("/api/proxy/users/delete", s.withAuth("", s.handleDeleteProxyUser))
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))

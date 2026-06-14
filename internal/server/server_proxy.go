@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"path"
 	"regexp"
 	"strconv"
@@ -251,6 +252,14 @@ func proxySubTokenAuditHash(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func (s *Server) proxySubscriptionURL(_ *http.Request, token string) string {
+	base := strings.TrimRight(s.publicURL, "/")
+	if base == "" {
+		return "/sub/" + url.PathEscape(token)
+	}
+	return base + "/sub/" + url.PathEscape(token)
+}
+
 func (s *Server) handleProxyInbounds(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
@@ -423,6 +432,64 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 		Metadata: map[string]string{"user_id": req.ID},
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleRotateProxyUserSubToken(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if !s.requireGlobalProxyScope(w, p, "proxy:admin") {
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+	user, ok := s.store.ProxyUser(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("proxy user not found"))
+		return
+	}
+	oldHash := proxySubTokenAuditHash(user.SubToken)
+	token, err := s.newUniqueProxySubToken(user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	user.SubToken = token
+	user.UpdatedAt = s.now()
+	if err := s.store.UpsertProxyUser(user); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if stored, ok := s.store.ProxyUser(user.ID); ok {
+		user = stored
+	}
+	newHash := proxySubTokenAuditHash(token)
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:       id.New("audit"),
+		Action:   "proxy.user.rotate_sub_token",
+		Scope:    "proxy:admin",
+		Decision: "allow",
+		Metadata: map[string]string{
+			"user_id":          user.ID,
+			"old_token_sha256": oldHash,
+			"new_token_sha256": newHash,
+		},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user":             toProxyUserView(user),
+		"subscription_url": s.proxySubscriptionURL(r, token),
+		"token_sha256":     newHash,
+	})
 }
 
 func (s *Server) handleProxyProfiles(w http.ResponseWriter, r *http.Request, p principal) {

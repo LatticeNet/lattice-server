@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -585,6 +586,126 @@ func TestProxySubscriptionOmitsInactiveUsersAndUnappliedProfiles(t *testing.T) {
 	body.ReadFrom(disabled.Body)
 	if body.Len() != 0 {
 		t.Fatalf("disabled user should return an empty body, got %q", body.String())
+	}
+}
+
+func TestProxyRotateSubscriptionTokenReturnsURLAndInvalidatesOldToken(t *testing.T) {
+	const publicURL = "https://lattice.example.test"
+	handler, st := newTestServerWithPublicURL(t, publicURL)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+	profile, ok := st.ProxyNodeProfile("node-a")
+	if !ok {
+		t.Fatal("proxy node profile not found")
+	}
+	profile.AppliedSHA256 = strings.Repeat("a", 64)
+	if err := st.UpsertProxyNodeProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	const oldToken = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
+	oldSub := doJSON(t, handler, http.MethodGet, "/sub/"+oldToken+"?format=plain", "", nil, "")
+	oldSub.Body.Close()
+	if oldSub.StatusCode != http.StatusOK {
+		t.Fatalf("old token should be valid before rotation, got %d", oldSub.StatusCode)
+	}
+
+	rotate := doJSON(t, handler, http.MethodPost, "/api/proxy/users/rotate-sub-token", `{"id":"alice"}`, cookies, csrf)
+	defer rotate.Body.Close()
+	if rotate.StatusCode != http.StatusOK {
+		t.Fatalf("rotate failed: %d", rotate.StatusCode)
+	}
+	var out struct {
+		User            proxyUserView `json:"user"`
+		SubscriptionURL string        `json:"subscription_url"`
+		TokenSHA256     string        `json:"token_sha256"`
+	}
+	if err := json.NewDecoder(rotate.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.User.ID != "alice" || !out.User.HasSubToken {
+		t.Fatalf("bad rotated user view: %+v", out.User)
+	}
+	if out.SubscriptionURL == "" || !strings.HasPrefix(out.SubscriptionURL, publicURL+"/sub/") {
+		t.Fatalf("bad subscription url: %q", out.SubscriptionURL)
+	}
+	if strings.Contains(out.SubscriptionURL, oldToken) {
+		t.Fatalf("rotated subscription url reused old token: %q", out.SubscriptionURL)
+	}
+	newToken := strings.TrimPrefix(out.SubscriptionURL, publicURL+"/sub/")
+	if !proxySubTokenRe.MatchString(newToken) {
+		t.Fatalf("new token has unexpected shape: %q", newToken)
+	}
+	if out.TokenSHA256 != proxySubTokenAuditHash(newToken) {
+		t.Fatalf("token hash mismatch: got %s want %s", out.TokenSHA256, proxySubTokenAuditHash(newToken))
+	}
+	if stored, ok := st.ProxyUser("alice"); !ok || stored.SubToken != newToken || stored.SubToken == oldToken {
+		t.Fatalf("stored token did not rotate: ok=%v user=%+v", ok, stored)
+	}
+
+	oldAgain := doJSON(t, handler, http.MethodGet, "/sub/"+oldToken+"?format=plain", "", nil, "")
+	oldAgain.Body.Close()
+	if oldAgain.StatusCode != http.StatusNotFound {
+		t.Fatalf("old token should be invalid after rotation, got %d", oldAgain.StatusCode)
+	}
+	newSub := doJSON(t, handler, http.MethodGet, "/sub/"+newToken+"?format=plain", "", nil, "")
+	newSub.Body.Close()
+	if newSub.StatusCode != http.StatusOK {
+		t.Fatalf("new token should fetch subscription, got %d", newSub.StatusCode)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/proxy/users", "", cookies, "")
+	defer list.Body.Close()
+	listBody := new(bytes.Buffer)
+	listBody.ReadFrom(list.Body)
+	if strings.Contains(listBody.String(), oldToken) || strings.Contains(listBody.String(), newToken) {
+		t.Fatalf("proxy user list leaked subscription token: %s", listBody.String())
+	}
+	if !auditMetadataSeen(st, "proxy.user.rotate_sub_token", "new_token_sha256", proxySubTokenAuditHash(newToken)) {
+		t.Fatalf("missing token rotate audit: %+v", st.AuditEvents())
+	}
+	for _, ev := range st.AuditEvents() {
+		if ev.Action != "proxy.user.rotate_sub_token" {
+			continue
+		}
+		for key, value := range ev.Metadata {
+			if strings.Contains(key, oldToken) || strings.Contains(key, newToken) || strings.Contains(value, oldToken) || strings.Contains(value, newToken) {
+				t.Fatalf("raw token leaked into rotate audit metadata: %+v", ev.Metadata)
+			}
+		}
+	}
+}
+
+func TestProxyRotateSubscriptionTokenWithoutPublicURLReturnsRelativePath(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/proxy/users/rotate-sub-token", strings.NewReader(`{"id":"alice"}`))
+	req.Host = "attacker.example"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Lattice-CSRF", csrf)
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rotate failed: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		SubscriptionURL string `json:"subscription_url"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(out.SubscriptionURL, "/sub/") {
+		t.Fatalf("expected relative subscription path without public URL, got %q", out.SubscriptionURL)
+	}
+	if strings.Contains(out.SubscriptionURL, "attacker.example") {
+		t.Fatalf("subscription URL reflected request host: %q", out.SubscriptionURL)
 	}
 }
 

@@ -108,3 +108,87 @@ func TestCompileEgressRulesetRejectsNodeWithoutIPv4(t *testing.T) {
 		t.Fatalf("expected no IPv4 error, got %v", err)
 	}
 }
+
+func TestCompileIngressInputRulesForGuard(t *testing.T) {
+	nodes := map[string]model.Node{
+		"node-a": {ID: "node-a", Name: "A", WireGuardIP: "10.66.0.1/32", PublicIP: "203.0.113.10"},
+		"node-b": {ID: "node-b", Name: "B", WireGuardIP: "10.66.0.2/32", PublicIP: "198.51.100.2"},
+	}
+	policy := model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{
+			{
+				ID:        "deny-db",
+				Comment:   `db "quoted"`,
+				Action:    model.NetRuleDeny,
+				Direction: model.NetDirIngress,
+				Protocol:  model.NetProtoTCP,
+				Ports:     []int{1234, 22},
+				Remote:    model.NetEndpoint{Kind: model.NetRefNode, NodeID: "node-b"},
+			},
+			{
+				ID:        "skip-egress",
+				Action:    model.NetRuleDeny,
+				Direction: model.NetDirEgress,
+				Protocol:  model.NetProtoTCP,
+				Ports:     []int{443},
+				Remote:    model.NetEndpoint{Kind: model.NetRefAny},
+			},
+			{
+				ID:        "disabled",
+				Action:    model.NetRuleAllow,
+				Direction: model.NetDirIngress,
+				Protocol:  model.NetProtoUDP,
+				Ports:     []int{53},
+				Remote:    model.NetEndpoint{Kind: model.NetRefAny},
+				Disabled:  true,
+			},
+		},
+	}
+	rules, err := CompileIngressInputRules(policy, func(id string) (model.Node, bool) {
+		n, ok := nodes[id]
+		return n, ok
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("expected one ingress rule, got %+v", rules)
+	}
+	rule := rules[0]
+	if rule.Action != "drop" || rule.Protocol != "tcp" || len(rule.Ports) != 2 || rule.Ports[0] != 22 || rule.Ports[1] != 1234 {
+		t.Fatalf("bad rendered input rule: %+v", rule)
+	}
+	if got := strings.Join(rule.SourceCIDRs, ","); got != "10.66.0.2,198.51.100.2" {
+		t.Fatalf("bad source expansion: %q", got)
+	}
+	if !strings.Contains(rule.Comment, `db "quoted"`) {
+		t.Fatalf("comment not carried for nft quoting: %+v", rule)
+	}
+}
+
+func TestCompileIngressInputRulesRejectsNodeWithoutIPv4(t *testing.T) {
+	nodes := map[string]model.Node{
+		"node-a": {ID: "node-a", WireGuardIP: "10.66.0.1"},
+		"node-b": {ID: "node-b", PublicIPv6: "2001:db8::2"},
+	}
+	_, err := CompileIngressInputRules(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{{
+			ID:        "deny-node-b",
+			Action:    model.NetRuleDeny,
+			Direction: model.NetDirIngress,
+			Protocol:  model.NetProtoTCP,
+			Ports:     []int{443},
+			Remote:    model.NetEndpoint{Kind: model.NetRefNode, NodeID: "node-b"},
+		}},
+	}, func(id string) (model.Node, bool) {
+		n, ok := nodes[id]
+		return n, ok
+	})
+	if err == nil || !strings.Contains(err.Error(), "no IPv4 address") {
+		t.Fatalf("expected no IPv4 error, got %v", err)
+	}
+}

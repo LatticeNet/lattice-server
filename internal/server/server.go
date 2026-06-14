@@ -2653,6 +2653,15 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 			source = "stored"
 		}
 	}
+	ingressRules, err := s.composeNFTIngressPolicy(req.NodeID, &planInput, p)
+	if err != nil {
+		if errors.Is(err, errNFTIngressPolicyReadRequired) {
+			writeError(w, http.StatusForbidden, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	plan, err := network.GenerateNFTPlan(planInput)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -2672,7 +2681,11 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID, "source": source}})
+	metadata := map[string]string{"approval_id": approval.ID, "source": source}
+	if ingressRules > 0 {
+		metadata["ingress_rules"] = strconv.Itoa(ingressRules)
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: metadata})
 	writeJSON(w, http.StatusOK, approval)
 }
 
@@ -2886,10 +2899,52 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 			"wg-quick up wg0\n"
 	case "nftpolicy":
 		return nftPolicyApplyScript(approval.Plan, serverURL)
+	case "nft":
+		return nftGuardApplyScript(approval.Plan, serverURL)
 	default:
 		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
 			"nft -c -f /tmp/lattice-nft-plan.nft\n"
 	}
+}
+
+func nftGuardApplyScript(plan, serverURL string) string {
+	serverURL = strings.TrimRight(serverURL, "/")
+	selfcheck := "echo 'lattice nft: control-plane selfcheck skipped because public_url is unset' >&2\n"
+	done := "echo 'lattice nft: applied; control-plane selfcheck skipped'\n"
+	if serverURL != "" {
+		selfcheck = "AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
+			"\"$AGENT_BIN\" --selfcheck-controlplane -server " + shellQuote(serverURL) + "\n"
+		done = "echo 'lattice nft: applied and verified'\n"
+	}
+	return "set -e\n" +
+		"umask 077\n" +
+		"mkdir -p /etc/lattice\n" +
+		"CANDIDATE=/etc/lattice/guard.nft.new\n" +
+		"ACTIVE=/etc/lattice/guard.nft\n" +
+		"ROLLBACK=/etc/lattice/guard.rollback.nft\n" +
+		"WATCHDOG=\n" +
+		heredocWrite("$CANDIDATE", "LATTICE_NFT_GUARD_EOF", plan) +
+		"nft -c -f \"$CANDIDATE\"\n" +
+		"nft list ruleset > \"$ROLLBACK\"\n" +
+		"cleanup_watchdog() {\n" +
+		"  if [ -n \"$WATCHDOG\" ]; then\n" +
+		"    kill \"$WATCHDOG\" 2>/dev/null || true\n" +
+		"    wait \"$WATCHDOG\" 2>/dev/null || true\n" +
+		"  fi\n" +
+		"}\n" +
+		"rollback() {\n" +
+		"  echo 'lattice nft: rolling back guard ruleset' >&2\n" +
+		"  nft -f \"$ROLLBACK\" 2>/dev/null || true\n" +
+		"}\n" +
+		"trap 'rollback; cleanup_watchdog' ERR\n" +
+		"( sleep 60; echo 'lattice nft: watchdog rollback fired' >&2; rollback ) &\n" +
+		"WATCHDOG=$!\n" +
+		"nft -f \"$CANDIDATE\"\n" +
+		selfcheck +
+		"trap - ERR\n" +
+		"cleanup_watchdog\n" +
+		"mv \"$CANDIDATE\" \"$ACTIVE\"\n" +
+		done
 }
 
 func nftPolicyApplyScript(plan, serverURL string) string {

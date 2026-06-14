@@ -7,9 +7,12 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/netpolicy"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
+
+var errNFTIngressPolicyReadRequired = errors.New("netpolicy:read is required to compose ingress policy into nft guard")
 
 type nftInputsView struct {
 	ID            string    `json:"id"`
@@ -149,6 +152,25 @@ func nftPlanRequestHasInputs(plan network.NFTPlan) bool {
 		len(plan.PublicUDP) > 0 ||
 		len(plan.WireGuardTCP) > 0 ||
 		len(plan.WireGuardUDP) > 0
+}
+
+func (s *Server) composeNFTIngressPolicy(nodeID string, plan *network.NFTPlan, p principal) (int, error) {
+	policy, ok := s.store.NetPolicy(nodeID)
+	if !ok || !policy.Enabled {
+		return 0, nil
+	}
+	rules, err := netpolicy.CompileIngressInputRules(policy, s.resolveNode)
+	if err != nil {
+		return 0, err
+	}
+	if len(rules) == 0 {
+		return 0, nil
+	}
+	if !rbac.Allows(p.Principal, "netpolicy:read", nodeID) {
+		return 0, errNFTIngressPolicyReadRequired
+	}
+	plan.InputRules = append(plan.InputRules, rules...)
+	return len(rules), nil
 }
 
 func (s *Server) toNFTInputsView(inputs model.NFTInputs) nftInputsView {

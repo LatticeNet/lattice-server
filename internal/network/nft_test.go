@@ -54,3 +54,44 @@ func TestGenerateNFTPlanRejectsBadPort(t *testing.T) {
 		t.Fatal("expected invalid port rejection")
 	}
 }
+
+func TestGenerateNFTPlanComposesInputRulesBeforeBroadAllows(t *testing.T) {
+	plan, err := GenerateNFTPlan(NFTPlan{
+		WireGuardTCP: []int{1234},
+		InputRules: []NFTInputRule{{
+			SourceCIDRs: []string{"198.51.100.2", "10.66.0.2/32", "10.66.0.2"},
+			Protocol:    NFTProtoTCP,
+			Ports:       []int{1234},
+			Action:      NFTActionDrop,
+			Comment:     `lattice rule deny-db "quoted"`,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deny := `ip saddr { 10.66.0.2, 198.51.100.2 } tcp dport { 1234 } drop comment "lattice rule deny-db \"quoted\""`
+	allow := `ip saddr @wg_peers4 tcp dport { 1234 } accept comment "wg tcp services"`
+	if !strings.Contains(plan, deny) {
+		t.Fatalf("plan missing composed deny:\n%s", plan)
+	}
+	if !strings.Contains(plan, allow) {
+		t.Fatalf("plan missing broad allow:\n%s", plan)
+	}
+	if strings.Index(plan, deny) > strings.Index(plan, allow) {
+		t.Fatalf("composed deny must render before broad allow:\n%s", plan)
+	}
+}
+
+func TestGenerateNFTPlanRejectsBadInputRule(t *testing.T) {
+	cases := []NFTInputRule{
+		{SourceCIDRs: []string{"}; evil"}, Protocol: NFTProtoTCP, Action: NFTActionDrop},
+		{Protocol: "icmp", Action: NFTActionDrop},
+		{Protocol: NFTProtoTCP, Action: "reject"},
+		{Protocol: NFTProtoAny, Ports: []int{22}, Action: NFTActionDrop},
+	}
+	for _, rule := range cases {
+		if _, err := GenerateNFTPlan(NFTPlan{InputRules: []NFTInputRule{rule}}); err == nil {
+			t.Fatalf("expected bad input rule to be rejected: %+v", rule)
+		}
+	}
+}

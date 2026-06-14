@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/network"
 )
 
 type CompileOptions struct {
@@ -73,6 +74,87 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")
 	return b.String(), nil
+}
+
+// CompileIngressInputRules extracts the ingress side of a per-node NetPolicy
+// into typed lattice_guard input rules. It intentionally does not render nft
+// syntax directly: the Network Guard renderer owns the single input chain so
+// DNS/proxy/ACL providers cannot create competing default-drop hooks.
+func CompileIngressInputRules(policy model.NetPolicy, resolve NodeResolver) ([]network.NFTInputRule, error) {
+	if resolve == nil {
+		return nil, errors.New("node resolver is required")
+	}
+	if !policy.Enabled {
+		return nil, nil
+	}
+	normalized, err := NormalizePolicy(policy, resolve)
+	if err != nil {
+		return nil, err
+	}
+	target, ok := resolve(normalized.TargetNodeID)
+	if !ok {
+		return nil, fmt.Errorf("target node %q not found", normalized.TargetNodeID)
+	}
+	out := make([]network.NFTInputRule, 0, len(normalized.Rules))
+	for _, rule := range normalized.Rules {
+		if rule.Direction != model.NetDirIngress || rule.Disabled {
+			continue
+		}
+		sources, err := ingressSourceCIDRs(rule, target, resolve)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, network.NFTInputRule{
+			SourceCIDRs: sources,
+			Protocol:    nftInputProtocol(rule.Protocol),
+			Ports:       append([]int(nil), rule.Ports...),
+			Action:      nftInputAction(rule.Action),
+			Comment:     ruleComment(rule),
+		})
+	}
+	return out, nil
+}
+
+func ingressSourceCIDRs(rule model.NetRule, target model.Node, resolve NodeResolver) ([]string, error) {
+	switch rule.Remote.Kind {
+	case model.NetRefAny:
+		return nil, nil
+	case model.NetRefCIDR:
+		return []string{rule.Remote.CIDR}, nil
+	case model.NetRefNode:
+		if rule.Remote.NodeID == target.ID {
+			return nil, fmt.Errorf("rule %s remote node cannot be the target node", rule.ID)
+		}
+		remote, ok := resolve(rule.Remote.NodeID)
+		if !ok {
+			return nil, fmt.Errorf("rule %s remote node %q not found", rule.ID, rule.Remote.NodeID)
+		}
+		addrs := nodeIPv4s(remote)
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("rule %s remote node %q has no IPv4 address to compile", rule.ID, rule.Remote.NodeID)
+		}
+		return addrs, nil
+	default:
+		return nil, fmt.Errorf("rule %s has invalid remote kind %q", rule.ID, rule.Remote.Kind)
+	}
+}
+
+func nftInputProtocol(proto string) string {
+	switch proto {
+	case model.NetProtoTCP:
+		return network.NFTProtoTCP
+	case model.NetProtoUDP:
+		return network.NFTProtoUDP
+	default:
+		return network.NFTProtoAny
+	}
+}
+
+func nftInputAction(action string) string {
+	if action == model.NetRuleAllow {
+		return network.NFTActionAccept
+	}
+	return network.NFTActionDrop
 }
 
 func compileEgressRule(rule model.NetRule, target model.Node, resolve NodeResolver) (string, error) {

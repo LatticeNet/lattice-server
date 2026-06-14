@@ -26,6 +26,7 @@ import (
 //   - auth.TOTPChallenge.ID            pending 2FA challenge bearer material
 //   - model.DDNSProfile.CFAPIToken     Cloudflare API token
 //   - model.DDNSProfile.WebhookHeaders may carry Authorization headers
+//   - model.DNSDeployment.CFAPIToken   Cloudflare API token for self-hosted DNS
 //   - model.NotifyChannel.Config[*]    bot tokens, SMTP passwords, webhook secrets
 //   - model.OIDCProvider.ClientSecret  OAuth2 client secret for SSO
 //   - auth.OIDCAuthState.State/CodeVerifier short-lived OAuth2 state + PKCE verifier
@@ -91,6 +92,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 		ddns[id] = enc
 	}
 	out.DDNS = ddns
+
+	dnsDeployments := make(map[string]model.DNSDeployment, len(st.DNSDeployments))
+	for id, d := range st.DNSDeployments {
+		enc, err := encryptDNSDeploymentRecord(id, d, c)
+		if err != nil {
+			return State{}, err
+		}
+		dnsDeployments[id] = enc
+	}
+	out.DNSDeployments = dnsDeployments
 
 	notify := make(map[string]model.NotifyChannel, len(st.NotifyChannels))
 	for id, n := range st.NotifyChannels {
@@ -200,6 +211,16 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.DDNS = ddns
 
+	dnsDeployments := make(map[string]model.DNSDeployment, len(st.DNSDeployments))
+	for id, d := range st.DNSDeployments {
+		dec, err := decryptDNSDeploymentRecord(id, d, c)
+		if err != nil {
+			return err
+		}
+		dnsDeployments[id] = dec
+	}
+	st.DNSDeployments = dnsDeployments
+
 	notify := make(map[string]model.NotifyChannel, len(st.NotifyChannels))
 	for id, n := range st.NotifyChannels {
 		dec, err := decryptNotifyRecord(id, n, c)
@@ -264,6 +285,11 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, d := range st.DDNS {
 		if secret.IsEnvelope(d.CFAPIToken) || secret.IsEnvelope(d.WebhookHeaders) {
+			return true
+		}
+	}
+	for _, d := range st.DNSDeployments {
+		if secret.IsEnvelope(d.CFAPIToken) {
 			return true
 		}
 	}
@@ -422,6 +448,27 @@ func decryptDDNSRecord(id string, d model.DDNSProfile, c secret.Cipher) (model.D
 	}
 	d.CFAPIToken = tok
 	d.WebhookHeaders = hdr
+	return d, nil
+}
+
+func encryptDNSDeploymentRecord(id string, d model.DNSDeployment, c secret.Cipher) (model.DNSDeployment, error) {
+	tok, err := c.Encrypt(d.CFAPIToken)
+	if err != nil {
+		return model.DNSDeployment{}, fmt.Errorf("encrypt dns deployment %s cf token: %w", id, err)
+	}
+	d.CFAPIToken = tok
+	return d, nil
+}
+
+func decryptDNSDeploymentRecord(id string, d model.DNSDeployment, c secret.Cipher) (model.DNSDeployment, error) {
+	if !c.Enabled() && secret.IsEnvelope(d.CFAPIToken) {
+		return model.DNSDeployment{}, lostMasterKeyError()
+	}
+	tok, err := c.Decrypt(d.CFAPIToken)
+	if err != nil {
+		return model.DNSDeployment{}, fmt.Errorf("decrypt dns deployment %s cf token: %w", id, err)
+	}
+	d.CFAPIToken = tok
 	return d, nil
 }
 

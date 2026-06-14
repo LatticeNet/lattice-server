@@ -42,6 +42,7 @@ var (
 	boltBucketTunnels         = []byte("tunnels")
 	boltBucketMachineProfiles = []byte("machine_profiles")
 	boltBucketNFTInputs       = []byte("nft_inputs")
+	boltBucketDNSDeployments  = []byte("dns_deployments")
 	boltBucketNetPolicies     = []byte("net_policies")
 	boltBucketTOTPChallenges  = []byte("totp_challenges")
 	boltBucketOIDCProviders   = []byte("oidc_providers")
@@ -69,6 +70,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketTunnels,
 	boltBucketMachineProfiles,
 	boltBucketNFTInputs,
+	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
 	boltBucketTOTPChallenges,
 	boltBucketOIDCProviders,
@@ -215,6 +217,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketNFTInputs, persist.NFTInputs); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketDNSDeployments, persist.DNSDeployments); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketNetPolicies, persist.NetPolicies); err != nil {
 			return err
 		}
@@ -313,6 +318,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketNFTInputs, st.NFTInputs); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketDNSDeployments, st.DNSDeployments); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketNetPolicies, st.NetPolicies); err != nil {
@@ -1608,6 +1616,105 @@ func (bs *BoltStateStore) DeleteNFTInputs(nodeID string) error {
 			return err
 		}
 		return deleteRecord(tx, boltBucketNFTInputs, nodeID)
+	})
+}
+
+func (bs *BoltStateStore) UpsertDNSDeployment(dep model.DNSDeployment) error {
+	dep.UpdatedAt = time.Now().UTC()
+	if dep.CreatedAt.IsZero() {
+		dep.CreatedAt = dep.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptDNSDeploymentRecord(dep.ID, dep, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketDNSDeployments, dep.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) DNSDeployment(id string) (model.DNSDeployment, bool, error) {
+	var out model.DNSDeployment
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketDNSDeployments, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out, err = decryptDNSDeploymentRecord(id, out, bs.cipher)
+		return err
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) DNSDeployments() ([]model.DNSDeployment, error) {
+	deployments := []model.DNSDeployment{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.DNSDeployment](tx, boltBucketDNSDeployments)
+		if err != nil {
+			return err
+		}
+		for _, dep := range all {
+			dec, err := decryptDNSDeploymentRecord(dep.ID, dep, bs.cipher)
+			if err != nil {
+				return err
+			}
+			deployments = append(deployments, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(deployments, func(i, j int) bool { return deployments[i].CreatedAt.Before(deployments[j].CreatedAt) })
+	return deployments, nil
+}
+
+func (bs *BoltStateStore) DNSDeploymentsForNode(nodeID string) ([]model.DNSDeployment, error) {
+	deployments := []model.DNSDeployment{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.DNSDeployment](tx, boltBucketDNSDeployments)
+		if err != nil {
+			return err
+		}
+		for _, dep := range all {
+			if dep.NodeID != nodeID {
+				continue
+			}
+			dec, err := decryptDNSDeploymentRecord(dep.ID, dep, bs.cipher)
+			if err != nil {
+				return err
+			}
+			deployments = append(deployments, dec)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(deployments, func(i, j int) bool { return deployments[i].CreatedAt.Before(deployments[j].CreatedAt) })
+	return deployments, nil
+}
+
+func (bs *BoltStateStore) DeleteDNSDeployment(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketDNSDeployments, id)
 	})
 }
 

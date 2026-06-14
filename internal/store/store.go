@@ -46,6 +46,7 @@ type State struct {
 	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
 	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
 	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
+	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
 	TOTPChallenges  map[string]auth.TOTPChallenge       `json:"totp_challenges"`
 	OIDCProviders   map[string]model.OIDCProvider       `json:"oidc_providers"`
@@ -137,6 +138,7 @@ func emptyState() State {
 		Tunnels:         map[string]model.TunnelProfile{},
 		MachineProfiles: map[string]model.MachineProfile{},
 		NFTInputs:       map[string]model.NFTInputs{},
+		DNSDeployments:  map[string]model.DNSDeployment{},
 		NetPolicies:     map[string]model.NetPolicy{},
 		TOTPChallenges:  map[string]auth.TOTPChallenge{},
 		OIDCProviders:   map[string]model.OIDCProvider{},
@@ -196,6 +198,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NFTInputs == nil {
 		st.NFTInputs = map[string]model.NFTInputs{}
+	}
+	if st.DNSDeployments == nil {
+		st.DNSDeployments = map[string]model.DNSDeployment{}
 	}
 	if st.NetPolicies == nil {
 		st.NetPolicies = map[string]model.NetPolicy{}
@@ -1178,6 +1183,63 @@ func (s *Store) DeleteNFTInputs(nodeID string) error {
 		return nil
 	}
 	delete(s.state.NFTInputs, nodeID)
+	return s.Save()
+}
+
+// UpsertDNSDeployment stores a self-hosted DNS deployment intent record.
+func (s *Store) UpsertDNSDeployment(dep model.DNSDeployment) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dep.UpdatedAt = time.Now().UTC()
+	if dep.CreatedAt.IsZero() {
+		dep.CreatedAt = dep.UpdatedAt
+	}
+	s.state.DNSDeployments[dep.ID] = dep
+	return s.Save()
+}
+
+// DNSDeployment returns a self-hosted DNS deployment by id.
+func (s *Store) DNSDeployment(id string) (model.DNSDeployment, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dep, ok := s.state.DNSDeployments[id]
+	return dep, ok
+}
+
+// DNSDeployments returns all self-hosted DNS deployments sorted by creation time.
+func (s *Store) DNSDeployments() []model.DNSDeployment {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.DNSDeployment, 0, len(s.state.DNSDeployments))
+	for _, dep := range s.state.DNSDeployments {
+		out = append(out, dep)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// DNSDeploymentsForNode returns all DNS deployments bound to a node.
+func (s *Store) DNSDeploymentsForNode(nodeID string) []model.DNSDeployment {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.DNSDeployment{}
+	for _, dep := range s.state.DNSDeployments {
+		if dep.NodeID == nodeID {
+			out = append(out, dep)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// DeleteDNSDeployment removes a self-hosted DNS deployment.
+func (s *Store) DeleteDNSDeployment(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.DNSDeployments[id]; !ok {
+		return nil
+	}
+	delete(s.state.DNSDeployments, id)
 	return s.Save()
 }
 

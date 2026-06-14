@@ -26,6 +26,7 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	st.NotifyChannels["ch1"] = model.NotifyChannel{ID: "ch1", Name: "tg", Kind: "telegram", Config: map[string]string{"bot_token": botTokenPlain, "chat_id": chatIDPlain}}
 	st.MachineProfiles["mp1"] = model.MachineProfile{ID: "mp1", NodeID: "n1", Vendor: "DMIT", ConsoleURL: consoleURLPlain, DetailURL: detailURLPlain}
 	st.NFTInputs["n1"] = model.NFTInputs{ID: "n1", NodeID: "n1", InterfaceName: "ens3", WireGuardCIDR: "10.66.0.0/24", PublicTCP: []int{80, 443}, PublicUDP: []int{53}}
+	st.DNSDeployments["dns1"] = model.DNSDeployment{ID: "dns1", Name: "private dns", NodeID: "n1", Engine: model.DNSEngineCoreDNS, ListenPort: 53, EnableUDP: true, Exposure: model.DNSExposureMesh, Zones: []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}}, Hostname: "n1.dns.example.com", CFAPIToken: dnsCFTokenPlain, Status: model.DNSStatusPending, CreatedAt: now}
 	st.NetPolicies["n1"] = model.NetPolicy{ID: "n1", TargetNodeID: "n1", Enabled: true, Rules: []model.NetRule{{ID: "r1", Action: model.NetRuleDeny, Direction: model.NetDirEgress, Protocol: model.NetProtoTCP, Ports: []int{1234}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}}
 	st.MonResults["m1"] = []model.MonitorResult{{MonitorID: "m1", NodeID: "n1", Success: true, At: now}}
 	st.TOTPChallenges["tc1"] = auth.TOTPChallenge{ID: "tc1", UserID: "u1", ClientIP: "198.51.100.1", ExpiresAt: now.Add(time.Minute)}
@@ -45,7 +46,7 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 		t.Fatal(err)
 	}
 	disk := string(raw)
-	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, "oidc-client-secret"} {
+	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain, "oidc-client-secret"} {
 		if strings.Contains(disk, leak) {
 			t.Fatalf("plaintext secret leaked into bbolt file: %q", leak)
 		}
@@ -77,6 +78,9 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	}
 	if got.NFTInputs["n1"].InterfaceName != "ens3" || got.NFTInputs["n1"].PublicUDP[0] != 53 {
 		t.Fatalf("nft inputs not recovered: %+v", got.NFTInputs["n1"])
+	}
+	if got.DNSDeployments["dns1"].CFAPIToken != dnsCFTokenPlain || got.DNSDeployments["dns1"].ListenPort != 53 {
+		t.Fatalf("dns deployment not recovered/decrypted: %+v", got.DNSDeployments["dns1"])
 	}
 	if got.NetPolicies["n1"].Rules[0].Ports[0] != 1234 {
 		t.Fatalf("net policy not recovered: %+v", got.NetPolicies["n1"])
@@ -240,6 +244,52 @@ func TestBoltStateRecordLevelOpsPersistAcrossReopen(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].ID != "audit-1" {
 		t.Fatalf("audit did not persist across reopen: %+v", events)
+	}
+}
+
+func TestBoltStateRecordLevelDNSDeployment(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	c := testCipher(t)
+	bs, err := OpenBoltState(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dep := model.DNSDeployment{
+		ID: "dns1", Name: "private dns", NodeID: "n1", Engine: model.DNSEngineCoreDNS,
+		ListenPort: 53, EnableUDP: true, Exposure: model.DNSExposureMesh,
+		Zones:      []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}},
+		CFAPIToken: dnsCFTokenPlain,
+	}
+	if err := bs.UpsertDNSDeployment(dep); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := bs.DNSDeployment("dns1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got.CFAPIToken != dnsCFTokenPlain || got.UpdatedAt.IsZero() {
+		t.Fatalf("dns deployment not recovered: ok=%v dep=%+v", ok, got)
+	}
+	list, err := bs.DNSDeploymentsForNode("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].ID != "dns1" {
+		t.Fatalf("dns deployments for node not recovered: %+v", list)
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), dnsCFTokenPlain) {
+		t.Fatal("dns deployment cf token leaked into bbolt file")
+	}
+	if err := bs.DeleteDNSDeployment("dns1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := bs.DNSDeployment("dns1"); err != nil || ok {
+		t.Fatalf("dns deployment should be deleted: ok=%v err=%v", ok, err)
+	}
+	if err := bs.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

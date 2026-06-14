@@ -39,6 +39,14 @@ func seedSecrets(t *testing.T, s *Store) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpsertDNSDeployment(model.DNSDeployment{
+		ID: "dns1", Name: "private dns", NodeID: "node-a", Engine: model.DNSEngineCoreDNS,
+		ListenPort: 53, EnableUDP: true, Exposure: model.DNSExposureMesh,
+		Zones:    []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}},
+		Hostname: "node-a.dns.example.com", CFAPIToken: dnsCFTokenPlain,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.UpsertNotifyChannel(model.NotifyChannel{
 		ID: "n1", Name: "tg", Kind: "telegram",
 		Config: map[string]string{"bot_token": botTokenPlain, "chat_id": chatIDPlain},
@@ -71,6 +79,7 @@ const (
 	chatIDPlain     = "-1001234567890"
 	consoleURLPlain = "https://console.example.com/session/signed-secret"
 	detailURLPlain  = "https://billing.example.com/machine/private-link"
+	dnsCFTokenPlain = "cf-secret-token-for-selfdns"
 )
 
 func TestEncryptedAtRest(t *testing.T) {
@@ -91,7 +100,7 @@ func TestEncryptedAtRest(t *testing.T) {
 	disk := string(raw)
 
 	// No plaintext secret may appear on disk.
-	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain} {
+	for _, leak := range []string{totpPlain, cfTokenPlain, webhookHdrPlain, dnsCFTokenPlain, botTokenPlain, chatIDPlain, consoleURLPlain, detailURLPlain} {
 		if strings.Contains(disk, leak) {
 			t.Fatalf("plaintext secret leaked to disk: %q", leak)
 		}
@@ -130,6 +139,10 @@ func TestReopenDecryptsRoundTrip(t *testing.T) {
 	d, ok := s2.DDNSProfile("d1")
 	if !ok || d.CFAPIToken != cfTokenPlain || d.WebhookHeaders != webhookHdrPlain {
 		t.Fatalf("ddns secrets not recovered: %+v ok=%v", d, ok)
+	}
+	dns, ok := s2.DNSDeployment("dns1")
+	if !ok || dns.CFAPIToken != dnsCFTokenPlain {
+		t.Fatalf("dns deployment secret not recovered: %+v ok=%v", dns, ok)
 	}
 	n := findNotify(s2, "n1")
 	if n == nil || n.Config["bot_token"] != botTokenPlain || n.Config["chat_id"] != chatIDPlain {
@@ -182,13 +195,17 @@ func TestLegacyPlaintextMigratesOnSave(t *testing.T) {
 	if !ok || d.CFAPIToken != cfTokenPlain {
 		t.Fatalf("legacy secret not loaded: %+v", d)
 	}
+	dns, ok := s.DNSDeployment("dns1")
+	if !ok || dns.CFAPIToken != dnsCFTokenPlain {
+		t.Fatalf("legacy dns secret not loaded: %+v", dns)
+	}
 
 	// Any mutation triggers Save, which must now encrypt the file.
 	if err := s.UpsertUser(model.User{ID: "u2", Username: "bob"}); err != nil {
 		t.Fatal(err)
 	}
 	rawAfter, _ := os.ReadFile(path)
-	if strings.Contains(string(rawAfter), cfTokenPlain) {
+	if strings.Contains(string(rawAfter), cfTokenPlain) || strings.Contains(string(rawAfter), dnsCFTokenPlain) {
 		t.Fatal("legacy plaintext was not encrypted after save")
 	}
 	if !strings.Contains(string(rawAfter), "lat$1$") {
@@ -229,6 +246,14 @@ func TestPrefixCollidingSecretRoundTrips(t *testing.T) {
 	if err := s.UpsertDDNSProfile(model.DDNSProfile{ID: "d1", CFAPIToken: colliding}); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.UpsertDNSDeployment(model.DNSDeployment{
+		ID: "dns1", Name: "private dns", NodeID: "node-a", Engine: model.DNSEngineCoreDNS,
+		ListenPort: 53, EnableUDP: true, Exposure: model.DNSExposureMesh,
+		Zones:      []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}},
+		CFAPIToken: colliding,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.UpsertNotifyChannel(model.NotifyChannel{
 		ID: "n1", Config: map[string]string{"token": colliding},
 	}); err != nil {
@@ -252,6 +277,10 @@ func TestPrefixCollidingSecretRoundTrips(t *testing.T) {
 	d, _ := s2.DDNSProfile("d1")
 	if d.CFAPIToken != colliding {
 		t.Fatalf("colliding cf token not recovered: %q", d.CFAPIToken)
+	}
+	dns, _ := s2.DNSDeployment("dns1")
+	if dns.CFAPIToken != colliding {
+		t.Fatalf("colliding dns cf token not recovered: %q", dns.CFAPIToken)
 	}
 	if n := findNotify(s2, "n1"); n == nil || n.Config["token"] != colliding {
 		t.Fatalf("colliding notify token not recovered: %+v", n)

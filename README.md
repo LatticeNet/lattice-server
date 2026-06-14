@@ -14,8 +14,10 @@ Responsibilities:
 - KV/static/Worker control APIs.
 - nftables plan and approval workflow with persisted per-node baseline inputs
   (public TCP/UDP, WireGuard TCP/UDP, interface, WireGuard CIDR).
-- NetPolicy APIs, reachability graph, and egress-only rollback-protected nft
-  apply path for per-node network ACLs.
+- NetPolicy APIs, reachability graph, rollback-protected egress nft apply, and
+  ingress policy composition into the Network Guard input table.
+- Self-host DNS deployment intent CRUD with encrypted Cloudflare token storage
+  and secret-free read views. CoreDNS apply/publish is a later slice.
 - Operator-owned NodeGeo API for the dashboard Fleet Map.
 - Append-only audit events.
 
@@ -82,12 +84,18 @@ the version in `go.mod`; during local multi-repo development, use the
 - NetPolicy state (`/api/netpolicy`, `/api/netpolicy/graph`) is server-validated
   operator intent. Writes and `/api/netpolicy/plan` require `netpolicy:admin`;
   list/graph require `netpolicy:read`; per-node PAT allowlists filter target
-  nodes. The current `nftpolicy` apply path is egress-only: it compiles a
-  dedicated `inet lattice_policy` output table, validates with `nft -c`, arms a
-  60s rollback watchdog, commits with `nft -f`, then requires node-agent
-  `--selfcheck-controlplane` to reach `/api/health` before disarming rollback.
-  It requires an IPv4-literal `-public-url` / `LATTICE_PUBLIC_URL`; ingress,
-  domain-backed nft sets, and IPv6 are later slices.
+  nodes. The current `nftpolicy` apply path commits a dedicated
+  `inet lattice_policy` output table for egress policy with a 60s rollback
+  watchdog, control-plane selfcheck, IPv4/IPv6 control-plane domain named sets,
+  operator-authored IPv4/IPv6 CIDR/node remotes, and egress domain remotes
+  backed by node-filled nft sets refreshed through systemd or cron.d. Ingress
+  deny/allow rules compose into Network Guard's single `lattice_guard` input
+  render rather than a competing input table.
+- DNS deployment state (`/api/dns/deployments`) is server-owned intent for
+  future CoreDNS deployment. Writes require `dns:admin` on the target node,
+  node existence is checked, Cloudflare tokens are write-only and encrypted at
+  rest, and read views expose only `has_credential`. Stored DNS intent does not
+  yet mutate nftables, publish Cloudflare records, or deploy CoreDNS.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/
@@ -152,7 +160,8 @@ the version in `go.mod`; during local multi-repo development, use the
   Worker scripts, plugin lifecycle records, approvals, tasks, task results,
   monitors, monitor results, tunnels, users, PAT tokens, sessions, TOTP
   challenges, DDNS profiles, notification channels, machine profiles, nft
-  inputs, net policies, OIDC providers, OIDC identities, and OIDC auth states.
+  inputs, DNS deployments, net policies, OIDC providers, OIDC identities, and
+  OIDC auth states.
 - The local ops CLI can migrate the encrypted JSON file to bbolt and export
   bbolt back to encrypted JSON:
 

@@ -521,6 +521,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/ddns", s.withAuth("ddns:admin", s.handleDDNS))
 	mux.HandleFunc("/api/ddns/delete", s.withAuth("ddns:admin", s.handleDeleteDDNS))
 	mux.HandleFunc("/api/ddns/run", s.withAuth("ddns:admin", s.handleRunDDNS))
+	mux.HandleFunc("/api/dns/deployments", s.withAuth("dns:admin", s.handleDNSDeployments))
+	mux.HandleFunc("/api/dns/deployments/delete", s.withAuth("dns:admin", s.handleDeleteDNSDeployment))
 	mux.HandleFunc("/api/machines", s.withAuth("", s.handleMachines))
 	mux.HandleFunc("/api/machines/update", s.withAuth("inventory:admin", s.handleMachineUpdate))
 	mux.HandleFunc("/api/machines/delete", s.withAuth("inventory:admin", s.handleDeleteMachine))

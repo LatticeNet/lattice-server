@@ -1,0 +1,414 @@
+package server
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"net/netip"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
+)
+
+var dnsLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+type dnsDeploymentView struct {
+	ID            string          `json:"id"`
+	Name          string          `json:"name"`
+	NodeID        string          `json:"node_id"`
+	NodeName      string          `json:"node_name,omitempty"`
+	Engine        string          `json:"engine"`
+	ListenPort    int             `json:"listen_port"`
+	EnableUDP     bool            `json:"enable_udp"`
+	EnableTCP     bool            `json:"enable_tcp"`
+	Exposure      string          `json:"exposure"`
+	Zones         []model.DNSZone `json:"zones"`
+	Hostname      string          `json:"hostname,omitempty"`
+	PublishIPv4   bool            `json:"publish_ipv4"`
+	PublishIPv6   bool            `json:"publish_ipv6"`
+	RecordTTL     int             `json:"record_ttl,omitempty"`
+	DDNSProfileID string          `json:"ddns_profile_id,omitempty"`
+	HasCredential bool            `json:"has_credential"`
+	Status        string          `json:"status"`
+	EngineVersion string          `json:"engine_version,omitempty"`
+	LastIPv4      string          `json:"last_ipv4,omitempty"`
+	LastIPv6      string          `json:"last_ipv6,omitempty"`
+	LastAppliedAt time.Time       `json:"last_applied_at,omitempty"`
+	LastError     string          `json:"last_error,omitempty"`
+	Disabled      bool            `json:"disabled,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+}
+
+func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		deployments := s.store.DNSDeployments()
+		views := make([]dnsDeploymentView, 0, len(deployments))
+		for _, dep := range deployments {
+			if rbac.Allows(p.Principal, "dns:admin", dep.NodeID) {
+				views = append(views, s.toDNSDeploymentView(dep))
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deployments": views})
+	case http.MethodPost:
+		var req model.DNSDeployment
+		if !decodeClientJSON(w, r, &req) {
+			return
+		}
+		req.ID = strings.TrimSpace(req.ID)
+		req.NodeID = strings.TrimSpace(req.NodeID)
+		existing, hadExisting := model.DNSDeployment{}, false
+		if req.ID != "" {
+			existing, hadExisting = s.store.DNSDeployment(req.ID)
+			if !hadExisting {
+				writeError(w, http.StatusNotFound, errors.New("dns deployment not found"))
+				return
+			}
+			if !s.requireNodeScope(w, p, "dns:admin", existing.NodeID) {
+				return
+			}
+		}
+		if !s.requireNodeScope(w, p, "dns:admin", req.NodeID) {
+			return
+		}
+		if _, ok := s.store.Node(req.NodeID); !ok {
+			writeError(w, http.StatusNotFound, errors.New("node not found"))
+			return
+		}
+		dep, err := s.normalizeDNSDeployment(req, existing, hadExisting)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertDNSDeployment(dep); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if stored, ok := s.store.DNSDeployment(dep.ID); ok {
+			dep = stored
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID:     id.New("audit"),
+			NodeID: dep.NodeID,
+			Action: "dns.deployment.upsert",
+			Scope:  "dns:admin",
+			Metadata: map[string]string{
+				"dns_id":   dep.ID,
+				"engine":   dep.Engine,
+				"exposure": dep.Exposure,
+			},
+		})
+		writeJSON(w, http.StatusOK, s.toDNSDeploymentView(dep))
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func (s *Server) handleDeleteDNSDeployment(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+	nodeID := ""
+	if dep, ok := s.store.DNSDeployment(req.ID); ok {
+		nodeID = dep.NodeID
+		if !s.requireNodeScope(w, p, "dns:admin", dep.NodeID) {
+			return
+		}
+	}
+	if err := s.store.DeleteDNSDeployment(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   nodeID,
+		Action:   "dns.deployment.delete",
+		Scope:    "dns:admin",
+		Metadata: map[string]string{"dns_id": req.ID},
+	})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadExisting bool) (model.DNSDeployment, error) {
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		req.ID = id.New("dns")
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	if req.Name == "" || req.NodeID == "" {
+		return model.DNSDeployment{}, errors.New("name and node_id are required")
+	}
+	req.Engine = strings.TrimSpace(strings.ToLower(req.Engine))
+	if req.Engine == "" {
+		req.Engine = model.DNSEngineCoreDNS
+	}
+	if req.Engine != model.DNSEngineCoreDNS {
+		return model.DNSDeployment{}, fmt.Errorf("unsupported dns engine %q", req.Engine)
+	}
+	if req.ListenPort == 0 {
+		req.ListenPort = 53
+	}
+	if req.ListenPort < 1 || req.ListenPort > 65535 {
+		return model.DNSDeployment{}, errors.New("listen_port must be between 1 and 65535")
+	}
+	if !req.EnableUDP && !req.EnableTCP {
+		req.EnableUDP = true
+		req.EnableTCP = true
+	}
+	req.Exposure = strings.TrimSpace(strings.ToLower(req.Exposure))
+	if req.Exposure == "" {
+		req.Exposure = model.DNSExposureMesh
+	}
+	if req.Exposure != model.DNSExposureMesh && req.Exposure != model.DNSExposurePublic {
+		return model.DNSDeployment{}, fmt.Errorf("unsupported dns exposure %q", req.Exposure)
+	}
+	zones, err := normalizeDNSZones(req.Zones)
+	if err != nil {
+		return model.DNSDeployment{}, err
+	}
+	req.Zones = zones
+
+	if req.Hostname != "" {
+		host, err := normalizeDNSName(req.Hostname, false, false)
+		if err != nil {
+			return model.DNSDeployment{}, fmt.Errorf("invalid hostname: %w", err)
+		}
+		if !strings.Contains(host, ".") {
+			return model.DNSDeployment{}, errors.New("hostname must be a fully qualified domain")
+		}
+		req.Hostname = host
+		if !req.PublishIPv4 && !req.PublishIPv6 {
+			req.PublishIPv4 = true
+		}
+	}
+	if req.RecordTTL == 0 {
+		req.RecordTTL = 60
+	}
+	if req.RecordTTL < 1 || req.RecordTTL > 86400 {
+		return model.DNSDeployment{}, errors.New("record_ttl must be between 1 and 86400")
+	}
+	req.DDNSProfileID = strings.TrimSpace(req.DDNSProfileID)
+	if req.DDNSProfileID != "" {
+		profile, ok := s.store.DDNSProfile(req.DDNSProfileID)
+		if !ok {
+			return model.DNSDeployment{}, errors.New("ddns_profile_id does not exist")
+		}
+		if profile.NodeID != "" && profile.NodeID != req.NodeID {
+			return model.DNSDeployment{}, errors.New("ddns_profile_id must belong to the same node")
+		}
+		req.CFAPIToken = ""
+	} else if req.CFAPIToken == "" && hadExisting {
+		req.CFAPIToken = existing.CFAPIToken
+	}
+	if req.Hostname != "" && req.DDNSProfileID == "" && req.CFAPIToken == "" {
+		return model.DNSDeployment{}, errors.New("hostname publishing requires cf_api_token or ddns_profile_id")
+	}
+	if hadExisting {
+		req.CreatedAt = existing.CreatedAt
+		req.Status = existing.Status
+		req.EngineVersion = existing.EngineVersion
+		req.LastIPv4 = existing.LastIPv4
+		req.LastIPv6 = existing.LastIPv6
+		req.LastAppliedAt = existing.LastAppliedAt
+		req.LastError = existing.LastError
+	}
+	if req.Disabled {
+		req.Status = model.DNSStatusDisabled
+	} else if req.Status == "" || req.Status == model.DNSStatusDisabled {
+		req.Status = model.DNSStatusPending
+	}
+	return req, nil
+}
+
+func normalizeDNSZones(input []model.DNSZone) ([]model.DNSZone, error) {
+	if len(input) == 0 {
+		return nil, errors.New("at least one dns zone is required")
+	}
+	out := make([]model.DNSZone, 0, len(input))
+	for i, z := range input {
+		suffix, err := normalizeDNSName(z.Suffix, true, true)
+		if err != nil {
+			return nil, fmt.Errorf("zone %d suffix: %w", i+1, err)
+		}
+		z.Suffix = suffix
+		z.Mode = strings.TrimSpace(strings.ToLower(z.Mode))
+		if z.Mode == "" {
+			z.Mode = model.DNSZoneForward
+		}
+		switch z.Mode {
+		case model.DNSZoneForward:
+			if len(z.Upstreams) == 0 {
+				return nil, fmt.Errorf("zone %d forward mode requires at least one upstream", i+1)
+			}
+			z.Upstreams = normalizeDNSUpstreams(z.Upstreams)
+			if len(z.Upstreams) == 0 {
+				return nil, fmt.Errorf("zone %d forward mode requires at least one upstream", i+1)
+			}
+			for _, upstream := range z.Upstreams {
+				if err := validateDNSUpstream(upstream); err != nil {
+					return nil, fmt.Errorf("zone %d upstream %q: %w", i+1, upstream, err)
+				}
+			}
+			z.Records = nil
+		case model.DNSZoneStatic:
+			if len(z.Records) == 0 {
+				return nil, fmt.Errorf("zone %d static mode requires at least one record", i+1)
+			}
+			records, err := normalizeDNSRecords(z.Records)
+			if err != nil {
+				return nil, fmt.Errorf("zone %d: %w", i+1, err)
+			}
+			z.Records = records
+			z.Upstreams = nil
+		case model.DNSZoneBlock:
+			z.Upstreams = nil
+			z.Records = nil
+		default:
+			return nil, fmt.Errorf("zone %d unsupported mode %q", i+1, z.Mode)
+		}
+		out = append(out, z)
+	}
+	return out, nil
+}
+
+func normalizeDNSRecords(input []model.DNSRecord) ([]model.DNSRecord, error) {
+	out := make([]model.DNSRecord, 0, len(input))
+	for i, rec := range input {
+		name, err := normalizeDNSName(rec.Name, true, false)
+		if err != nil {
+			return nil, fmt.Errorf("record %d name: %w", i+1, err)
+		}
+		rec.Name = name
+		rec.Type = strings.ToUpper(strings.TrimSpace(rec.Type))
+		rec.Value = strings.TrimSpace(rec.Value)
+		if rec.TTL == 0 {
+			rec.TTL = 300
+		}
+		if rec.TTL < 1 || rec.TTL > 86400 {
+			return nil, fmt.Errorf("record %d ttl must be between 1 and 86400", i+1)
+		}
+		switch rec.Type {
+		case "A":
+			addr, err := netip.ParseAddr(rec.Value)
+			if err != nil || !addr.Is4() {
+				return nil, fmt.Errorf("record %d A value must be an IPv4 address", i+1)
+			}
+		case "AAAA":
+			addr, err := netip.ParseAddr(rec.Value)
+			if err != nil || !addr.Is6() {
+				return nil, fmt.Errorf("record %d AAAA value must be an IPv6 address", i+1)
+			}
+		case "CNAME":
+			value, err := normalizeDNSName(rec.Value, true, false)
+			if err != nil {
+				return nil, fmt.Errorf("record %d CNAME value: %w", i+1, err)
+			}
+			rec.Value = value
+		default:
+			return nil, fmt.Errorf("record %d unsupported type %q", i+1, rec.Type)
+		}
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+func normalizeDNSUpstreams(input []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, raw := range input {
+		v := strings.TrimSpace(raw)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+func validateDNSUpstream(value string) error {
+	if value == "" {
+		return errors.New("empty upstream")
+	}
+	if strings.ContainsAny(value, "\r\n{};") {
+		return errors.New("contains unsafe characters")
+	}
+	addr := strings.TrimPrefix(value, "tls://")
+	if strings.HasPrefix(value, "tls://") && addr == value {
+		return errors.New("invalid tls upstream")
+	}
+	if parsed, err := netip.ParseAddr(addr); err == nil {
+		if parsed.IsUnspecified() {
+			return errors.New("upstream cannot be unspecified")
+		}
+		return nil
+	}
+	if ap, err := netip.ParseAddrPort(addr); err == nil {
+		if ap.Addr().IsUnspecified() || ap.Port() == 0 {
+			return errors.New("upstream address or port is invalid")
+		}
+		return nil
+	}
+	return errors.New("must be an IP, IP:port, or tls://IP[:port]")
+}
+
+func normalizeDNSName(value string, trailingDot bool, allowRoot bool) (string, error) {
+	v := strings.ToLower(strings.TrimSpace(value))
+	if strings.ContainsAny(v, "\r\n\t {};/\\") {
+		return "", errors.New("contains unsafe characters")
+	}
+	if allowRoot && v == "." {
+		return ".", nil
+	}
+	v = strings.TrimSuffix(v, ".")
+	if v == "" {
+		return "", errors.New("empty name")
+	}
+	if len(v) > 253 {
+		return "", errors.New("name is too long")
+	}
+	labels := strings.Split(v, ".")
+	for _, label := range labels {
+		if !dnsLabelRe.MatchString(label) {
+			return "", fmt.Errorf("invalid label %q", label)
+		}
+	}
+	if trailingDot {
+		return v + ".", nil
+	}
+	return v, nil
+}
+
+func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView {
+	nodeName := ""
+	if n, ok := s.store.Node(dep.NodeID); ok {
+		nodeName = n.Name
+	}
+	return dnsDeploymentView{
+		ID: dep.ID, Name: dep.Name, NodeID: dep.NodeID, NodeName: nodeName, Engine: dep.Engine,
+		ListenPort: dep.ListenPort, EnableUDP: dep.EnableUDP, EnableTCP: dep.EnableTCP, Exposure: dep.Exposure,
+		Zones: dep.Zones, Hostname: dep.Hostname, PublishIPv4: dep.PublishIPv4, PublishIPv6: dep.PublishIPv6,
+		RecordTTL: dep.RecordTTL, DDNSProfileID: dep.DDNSProfileID, HasCredential: dep.CFAPIToken != "" || dep.DDNSProfileID != "",
+		Status: dep.Status, EngineVersion: dep.EngineVersion, LastIPv4: dep.LastIPv4, LastIPv6: dep.LastIPv6,
+		LastAppliedAt: dep.LastAppliedAt, LastError: dep.LastError, Disabled: dep.Disabled,
+		CreatedAt: dep.CreatedAt, UpdatedAt: dep.UpdatedAt,
+	}
+}

@@ -499,6 +499,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/2fa/totp/activate", s.withAuth("", s.handle2FAActivate))
 	mux.HandleFunc("/api/2fa/totp/disable", s.withAuth("", s.handle2FADisable))
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
+	mux.HandleFunc("/api/nodes/geo", s.withAuth("", s.handleNodesGeo))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
@@ -1278,6 +1279,7 @@ type nodeView struct {
 	LastSeen           time.Time       `json:"last_seen"`
 	Metrics            model.Metrics   `json:"metrics"`
 	HostFacts          model.HostFacts `json:"host_facts"`
+	Geo                *model.NodeGeo  `json:"geo,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
 }
 
@@ -1288,7 +1290,7 @@ func toNodeView(n model.Node) nodeView {
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, CreatedAt: n.CreatedAt,
 	}
 }
 

@@ -349,7 +349,7 @@ func (s *Store) UpsertNode(n model.Node) error {
 	if n.CreatedAt.IsZero() {
 		n.CreatedAt = time.Now().UTC()
 	}
-	s.state.Nodes[n.ID] = n
+	s.state.Nodes[n.ID] = cloneNode(n)
 	return s.Save()
 }
 
@@ -380,11 +380,28 @@ func (s *Store) SetNodeDisabled(nodeID string, disabled bool) (bool, error) {
 	return true, s.Save()
 }
 
+func (s *Store) UpdateNodeGeo(nodeID string, geo *model.NodeGeo) (model.Node, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return model.Node{}, false, nil
+	}
+	if geo != nil {
+		copyGeo := *geo
+		n.Geo = &copyGeo
+	} else {
+		n.Geo = nil
+	}
+	s.state.Nodes[nodeID] = n
+	return cloneNode(n), true, s.Save()
+}
+
 func (s *Store) Node(id string) (model.Node, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, ok := s.state.Nodes[id]
-	return n, ok
+	return cloneNode(n), ok
 }
 
 func (s *Store) Nodes() []model.Node {
@@ -392,7 +409,7 @@ func (s *Store) Nodes() []model.Node {
 	defer s.mu.Unlock()
 	out := make([]model.Node, 0, len(s.state.Nodes))
 	for _, n := range s.state.Nodes {
-		out = append(out, n)
+		out = append(out, cloneNode(n))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -777,6 +794,14 @@ func stampPluginStatusTime(p model.PluginInstallation, now time.Time) model.Plug
 		p.DisabledAt = now
 	}
 	return p
+}
+
+func cloneNode(n model.Node) model.Node {
+	if n.Geo != nil {
+		geo := *n.Geo
+		n.Geo = &geo
+	}
+	return n
 }
 
 func clonePluginInstallation(p model.PluginInstallation) model.PluginInstallation {

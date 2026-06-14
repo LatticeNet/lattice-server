@@ -153,6 +153,14 @@ func TestBoltStateRecordLevelNodeKVAndAudit(t *testing.T) {
 	if !ok || n.Name != "node two" || n.CreatedAt.IsZero() {
 		t.Fatalf("record-level node not recovered or timestamped: ok=%v node=%+v", ok, n)
 	}
+	geo := &model.NodeGeo{Country: "JP", City: "Tokyo", Lat: 35.6762, Lon: 139.6503, ASN: 2516, UpdatedAt: now}
+	n, ok, err = bs.UpdateNodeGeo("n2", geo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || n.Geo == nil || n.Geo.Country != "JP" || n.Geo.City != "Tokyo" {
+		t.Fatalf("node geo not updated: ok=%v node=%+v", ok, n)
+	}
 	nodes, err := bs.Nodes()
 	if err != nil {
 		t.Fatal(err)

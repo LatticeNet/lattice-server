@@ -16,6 +16,7 @@ Responsibilities:
   (public TCP/UDP, WireGuard TCP/UDP, interface, WireGuard CIDR).
 - NetPolicy APIs, reachability graph, and egress-only rollback-protected nft
   apply path for per-node network ACLs.
+- Operator-owned NodeGeo API for the dashboard Fleet Map.
 - Append-only audit events.
 
 ## Run Locally
@@ -87,6 +88,11 @@ the version in `go.mod`; during local multi-repo development, use the
   `--selfcheck-controlplane` to reach `/api/health` before disarming rollback.
   It requires an IPv4-literal `-public-url` / `LATTICE_PUBLIC_URL`; ingress,
   domain-backed nft sets, and IPv6 are later slices.
+- NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
+  for the Fleet Map. Writes require `node:admin` on the target node, reads
+  require `node:read` and are per-node allowlist-filtered, coordinates/country/
+  ASN are validated server-side, and update/clear actions are audited. Geo must
+  not be used as node identity, authorization input, or nft compiler input.
 - PAT server allowlists are enforced against the actual node resources in request
   bodies, not only URL query parameters.
 - Node/task/monitor/DDNS/tunnel list APIs return only resources visible to the

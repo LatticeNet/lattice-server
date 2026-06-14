@@ -362,6 +362,29 @@ func (bs *BoltStateStore) UpsertNode(n model.Node) error {
 	})
 }
 
+func (bs *BoltStateStore) UpdateNodeGeo(nodeID string, geo *model.NodeGeo) (model.Node, bool, error) {
+	var out model.Node
+	var ok bool
+	err := bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketNodes, nodeID, &out)
+		if err != nil || !ok {
+			return err
+		}
+		if geo != nil {
+			copyGeo := *geo
+			out.Geo = &copyGeo
+		} else {
+			out.Geo = nil
+		}
+		return putRecord(tx, boltBucketNodes, out.ID, out)
+	})
+	return out, ok, err
+}
+
 func (bs *BoltStateStore) Node(id string) (model.Node, bool, error) {
 	var out model.Node
 	var ok bool

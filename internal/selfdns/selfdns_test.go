@@ -155,6 +155,75 @@ func TestRenderApprovalPlanIsSecretFree(t *testing.T) {
 	}
 }
 
+func TestParseApprovalPlanAndApplyScript(t *testing.T) {
+	dep := baseDeployment()
+	dep.Zones = []model.DNSZone{{
+		Suffix:  "mesh.local.",
+		Mode:    model.DNSZoneStatic,
+		Records: []model.DNSRecord{{Name: "gw.mesh.local.", Type: "A", Value: "10.66.0.1"}},
+	}}
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, summary, err := ComposeFirewallPlan(dep, network.NFTPlan{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nft, err := network.GenerateNFTPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := RenderApprovalPlan(dep, "tokyo-1", cfg, nft, summary)
+	artifacts, err := ParseApprovalPlan(review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(artifacts.Corefile, "file /etc/lattice/selfdns/zones/01_mesh_local.zone mesh.local.") {
+		t.Fatalf("missing corefile artifact:\n%s", artifacts.Corefile)
+	}
+	if len(artifacts.ZoneFiles) != 1 || !strings.Contains(artifacts.ZoneFiles[0].Content, "gw.mesh.local.") {
+		t.Fatalf("bad zone artifacts: %+v", artifacts.ZoneFiles)
+	}
+	if !strings.Contains(artifacts.NFTRuleset, "table inet lattice_guard") {
+		t.Fatalf("missing nft artifact:\n%s", artifacts.NFTRuleset)
+	}
+	script, err := ApplyScriptFromPlan(review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"command -v coredns",
+		"command -v nft",
+		"CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$",
+		"trap rollback ERR INT TERM HUP",
+		"nft -c -f \"$NFT_CANDIDATE\"",
+		"nft list ruleset > \"$NFT_ROLLBACK\"",
+		"nft -f \"$NFT_CANDIDATE\"",
+		"lattice-selfdns.service",
+		"systemctl is-active --quiet lattice-selfdns.service",
+		"lattice selfdns: applied and verified",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("apply script missing %q:\n%s", want, script)
+		}
+	}
+}
+
+func TestParseApprovalPlanRejectsUnsafeZonePath(t *testing.T) {
+	review := `# Lattice Self-host DNS plan
+
+## CoreDNS Corefile
+` + "```coredns\n.:53 {\n  forward . 1.1.1.1\n}\n```\n" + `
+## Zone file: /etc/lattice/selfdns/../evil.zone
+` + "```dns-zone\n$ORIGIN evil.\n```\n" + `
+## nftables lattice_guard candidate
+` + "```nft\ntable inet lattice_guard {\n}\n```\n"
+	if _, err := ParseApprovalPlan(review); err == nil {
+		t.Fatal("unsafe zone path should be rejected")
+	}
+}
+
 func baseDeployment() model.DNSDeployment {
 	return model.DNSDeployment{
 		ID:         "dns1",

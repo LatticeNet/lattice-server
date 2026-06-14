@@ -247,7 +247,7 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 	if err := json.NewDecoder(planRes.Body).Decode(&approval); err != nil {
 		t.Fatal(err)
 	}
-	if approval.Plugin != "selfdns" || approval.Action != "apply-config" || approval.NodeID != "n1" {
+	if approval.Plugin != "selfdns" || selfDNSApprovalDisplayAction(approval.Action) != selfDNSApplyAction || approval.NodeID != "n1" {
 		t.Fatalf("bad approval: %+v", approval)
 	}
 	for _, want := range []string{
@@ -276,11 +276,32 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
 		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
 	defer approve.Body.Close()
-	if approve.StatusCode != http.StatusBadRequest {
-		t.Fatalf("selfdns queue_apply should be blocked until apply exists, got %d", approve.StatusCode)
+	if approve.StatusCode != http.StatusOK {
+		t.Fatalf("selfdns queue_apply failed: %d", approve.StatusCode)
 	}
-	if tasks := st.Tasks(); len(tasks) != 0 {
-		t.Fatalf("review-only selfdns plan must not queue a task: %+v", tasks)
+	tasks := st.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("selfdns approval should queue one task: %+v", tasks)
+	}
+	task := tasks[0]
+	if task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != "n1" {
+		t.Fatalf("bad queued task: %+v", task)
+	}
+	queuedDep, ok := st.DNSDeployment(created.ID)
+	if !ok || queuedDep.Status != model.DNSStatusApplying {
+		t.Fatalf("deployment should be marked applying after queue: ok=%v dep=%+v", ok, queuedDep)
+	}
+	for _, want := range []string{
+		"command -v coredns",
+		"nft -c -f \"$NFT_CANDIDATE\"",
+		"nft -f \"$NFT_CANDIDATE\"",
+		"CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$",
+		"lattice-selfdns.service",
+		"systemctl is-active --quiet lattice-selfdns.service",
+	} {
+		if !strings.Contains(task.Script, want) {
+			t.Fatalf("queued selfdns script missing %q:\n%s", want, task.Script)
+		}
 	}
 }
 
@@ -310,5 +331,83 @@ func TestDNSPlanRequiresNetworkPlanScope(t *testing.T) {
 	allowed.Body.Close()
 	if allowed.StatusCode != http.StatusOK {
 		t.Fatalf("dns+network token should create plan, got %d", allowed.StatusCode)
+	}
+}
+
+func TestDNSApplyResultUpdatesDeploymentStatus(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
+	node, ok := st.Node(nodeID)
+	if !ok {
+		t.Fatal("missing enrolled node")
+	}
+	node.Name = "tokyo-apply"
+	node.WireGuardIP = "10.66.0.9/32"
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"`+nodeID+`",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	create.Body.Close()
+	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	var approval model.Approval
+	if err := json.NewDecoder(planRes.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	planRes.Body.Close()
+	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
+	approve.Body.Close()
+	if approve.StatusCode != http.StatusOK {
+		t.Fatalf("approve failed: %d", approve.StatusCode)
+	}
+	applyingDep, ok := st.DNSDeployment(created.ID)
+	if !ok || applyingDep.Status != model.DNSStatusApplying {
+		t.Fatalf("deployment should be applying after queued approval: ok=%v dep=%+v", ok, applyingDep)
+	}
+
+	tasksReq := httptest.NewRequest(http.MethodGet, "/api/agent/tasks?node_id="+nodeID, nil)
+	tasksReq.Header.Set("Authorization", "Bearer "+nodeToken)
+	tasksRec := serveReq(handler, tasksReq)
+	if tasksRec.Code != http.StatusOK {
+		t.Fatalf("lease failed: %d", tasksRec.Code)
+	}
+	var leased []map[string]any
+	if err := json.NewDecoder(tasksRec.Body).Decode(&leased); err != nil {
+		t.Fatal(err)
+	}
+	if len(leased) != 1 {
+		t.Fatalf("expected one leased task, got %+v", leased)
+	}
+	taskID, _ := leased[0]["id"].(string)
+	leaseID, _ := leased[0]["lease_id"].(string)
+	result := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result",
+		`{"node_id":"`+nodeID+`","result":{"task_id":"`+taskID+`","lease_id":"`+leaseID+`","exit_code":0,"stdout":"ok"}}`, nodeToken)
+	if result.Code != http.StatusOK {
+		t.Fatalf("task result failed: %d (%s)", result.Code, result.Body.String())
+	}
+	dep, ok := st.DNSDeployment(created.ID)
+	if !ok {
+		t.Fatal("dns deployment missing after apply")
+	}
+	if dep.Status != model.DNSStatusRunning || dep.LastAppliedAt.IsZero() || dep.LastError != "" {
+		t.Fatalf("deployment not marked running: %+v", dep)
+	}
+	appliedApproval, ok := st.Approval(approval.ID)
+	if !ok || appliedApproval.Status != model.ApprovalApplied {
+		t.Fatalf("approval not marked applied: ok=%v approval=%+v", ok, appliedApproval)
+	}
+	if !auditMetadataSeen(st, "dns.apply.applied", "dns_id", created.ID) {
+		t.Fatalf("missing dns.apply.applied audit: %+v", st.AuditEvents())
 	}
 }

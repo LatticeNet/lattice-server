@@ -29,6 +29,9 @@ func toApprovalView(a model.Approval) approvalView {
 	if a.Plugin == "nftpolicy" {
 		action = nftPolicyApprovalDisplayAction(a.Action)
 	}
+	if a.Plugin == "selfdns" {
+		action = selfDNSApprovalDisplayAction(a.Action)
+	}
 	return approvalView{
 		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
 		Plan: a.Plan, Status: a.Status, ActorID: a.ActorID,

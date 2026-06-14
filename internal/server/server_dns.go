@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,6 +19,11 @@ import (
 )
 
 var dnsLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+
+const (
+	selfDNSApplyAction       = "apply-config"
+	selfDNSApplyActionPrefix = selfDNSApplyAction + ":"
+)
 
 type dnsDeploymentView struct {
 	ID            string          `json:"id"`
@@ -222,7 +228,7 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 		ID:        id.New("approval"),
 		NodeID:    dep.NodeID,
 		Plugin:    "selfdns",
-		Action:    "apply-config",
+		Action:    selfDNSApprovalAction(dep.ID),
 		Plan:      selfdns.RenderApprovalPlan(dep, node.Name, cfg, nftRuleset, firewallSummary),
 		Status:    model.ApprovalPending,
 		ActorID:   p.ActorID,
@@ -244,6 +250,121 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: dep.NodeID, Action: "dns.plan", Scope: "dns:admin", Metadata: metadata})
 	writeJSON(w, http.StatusOK, approval)
+}
+
+func selfDNSApprovalAction(deploymentID string) string {
+	return selfDNSApplyActionPrefix + base64.RawURLEncoding.EncodeToString([]byte(deploymentID))
+}
+
+func selfDNSApprovalDisplayAction(action string) string {
+	if action == selfDNSApplyAction || strings.HasPrefix(action, selfDNSApplyActionPrefix) {
+		return selfDNSApplyAction
+	}
+	return action
+}
+
+func selfDNSApprovalDeploymentID(action string) (string, error) {
+	if action == selfDNSApplyAction {
+		return "", errors.New("legacy selfdns approval does not carry deployment id; re-plan before applying")
+	}
+	if !strings.HasPrefix(action, selfDNSApplyActionPrefix) {
+		return "", fmt.Errorf("unexpected selfdns action %q", action)
+	}
+	encoded := strings.TrimPrefix(action, selfDNSApplyActionPrefix)
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+	id := strings.TrimSpace(string(data))
+	if id == "" {
+		return "", errors.New("empty selfdns deployment id")
+	}
+	return id, nil
+}
+
+func (s *Server) requireSelfDNSDeploymentForApproval(approval model.Approval) error {
+	deploymentID, err := selfDNSApprovalDeploymentID(approval.Action)
+	if err != nil {
+		return err
+	}
+	dep, ok := s.store.DNSDeployment(deploymentID)
+	if !ok {
+		return fmt.Errorf("dns deployment %q not found; re-plan before applying", deploymentID)
+	}
+	if dep.NodeID != approval.NodeID {
+		return fmt.Errorf("dns deployment %q no longer belongs to node %s; re-plan before applying", deploymentID, approval.NodeID)
+	}
+	return nil
+}
+
+func (s *Server) markSelfDNSApplying(approval model.Approval) error {
+	deploymentID, err := selfDNSApprovalDeploymentID(approval.Action)
+	if err != nil {
+		return err
+	}
+	dep, ok := s.store.DNSDeployment(deploymentID)
+	if !ok {
+		return fmt.Errorf("dns deployment %q not found for approval %s", deploymentID, approval.ID)
+	}
+	dep.Status = model.DNSStatusApplying
+	dep.LastError = ""
+	return s.store.UpsertDNSDeployment(dep)
+}
+
+func (s *Server) handleSelfDNSTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {
+	deploymentID, err := selfDNSApprovalDeploymentID(approval.Action)
+	if err != nil {
+		return err
+	}
+	dep, ok := s.store.DNSDeployment(deploymentID)
+	if !ok {
+		return fmt.Errorf("dns deployment %q not found for approval %s", deploymentID, approval.ID)
+	}
+	if result.FinishedAt.IsZero() {
+		result.FinishedAt = time.Now().UTC()
+	}
+	metadata := map[string]string{
+		"approval_id": approval.ID,
+		"task_id":     task.ID,
+		"dns_id":      dep.ID,
+		"plan_sha":    approvalPlanSHA(approval),
+	}
+	if result.Error == "" && result.ExitCode == 0 {
+		dep.Status = model.DNSStatusRunning
+		dep.LastAppliedAt = result.FinishedAt
+		dep.LastError = ""
+		approval.Status = model.ApprovalApplied
+		approval.UpdatedAt = time.Now().UTC()
+		if err := s.store.UpsertDNSDeployment(dep); err != nil {
+			return fmt.Errorf("mark dns deployment running: %w", err)
+		}
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return fmt.Errorf("mark selfdns approval applied: %w", err)
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   approval.NodeID,
+			Action:   "dns.apply.applied",
+			Decision: "allow",
+			Metadata: metadata,
+		})
+		return nil
+	}
+	reason := taskFailureSummary(result)
+	dep.Status = model.DNSStatusFailed
+	dep.LastError = reason
+	if err := s.store.UpsertDNSDeployment(dep); err != nil {
+		return fmt.Errorf("mark dns deployment failed: %w", err)
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   "dns.apply.failed",
+		Decision: "deny",
+		Reason:   reason,
+		Metadata: metadata,
+	})
+	return nil
 }
 
 func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadExisting bool) (model.DNSDeployment, error) {

@@ -17,8 +17,8 @@ Responsibilities:
 - NetPolicy APIs, reachability graph, rollback-protected egress nft apply, and
   ingress policy composition into the Network Guard input table.
 - Self-host DNS deployment intent CRUD with encrypted Cloudflare token storage,
-  secret-free read views, and review-only CoreDNS/nft plan generation.
-  CoreDNS apply/publish is a later slice.
+  secret-free read views, CoreDNS/nft plan generation, rollback-protected apply,
+  and task-result status reconciliation. Cloudflare publish is a later slice.
 - Operator-owned NodeGeo API for the dashboard Fleet Map.
 - Append-only audit events.
 
@@ -98,9 +98,9 @@ the version in `go.mod`; during local multi-repo development, use the
   rest, and read views expose only `has_credential`. `/api/dns/plan` requires
   both `dns:admin` and same-node `network:plan`, renders a secret-free CoreDNS
   Corefile plus composed `lattice_guard` nft candidate into a pending `selfdns`
-  approval, and refuses `queue_apply` until the dedicated apply slice lands.
-  Stored DNS intent does not yet mutate nftables, publish Cloudflare records, or
-  deploy CoreDNS.
+  approval, and queueing apply writes the reviewed artifacts, commits nft with
+  rollback, manages `lattice-selfdns.service`, and updates deployment status
+  from task results. Cloudflare record publication is not implemented yet.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/

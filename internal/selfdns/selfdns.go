@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/netip"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -20,6 +21,8 @@ import (
 const (
 	CorefilePath = "/etc/lattice/selfdns/Corefile"
 	ZoneDir      = "/etc/lattice/selfdns/zones"
+	ServiceName  = "lattice-selfdns.service"
+	NFTGuardPath = "/etc/lattice/guard.nft"
 )
 
 var dnsLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -39,6 +42,12 @@ type ZoneFile struct {
 type ConfigBundle struct {
 	Corefile  string
 	ZoneFiles []ZoneFile
+}
+
+type ApplyArtifacts struct {
+	Corefile   string
+	ZoneFiles  []ZoneFile
+	NFTRuleset string
 }
 
 // GenerateConfig renders a CoreDNS Corefile plus any static-zone files.
@@ -198,6 +207,85 @@ func RenderApprovalPlan(dep model.DNSDeployment, nodeName string, cfg ConfigBund
 	return b.String()
 }
 
+// ParseApprovalPlan extracts the exact artifacts from the reviewed plan text.
+// The apply path intentionally uses the reviewed plan as source of truth instead
+// of re-rendering current mutable store state.
+func ParseApprovalPlan(plan string) (ApplyArtifacts, error) {
+	core, err := fencedSection(plan, "## CoreDNS Corefile", "coredns")
+	if err != nil {
+		return ApplyArtifacts{}, err
+	}
+	nft, err := fencedSection(plan, "## nftables lattice_guard candidate", "nft")
+	if err != nil {
+		return ApplyArtifacts{}, err
+	}
+	zones, err := zoneSections(plan)
+	if err != nil {
+		return ApplyArtifacts{}, err
+	}
+	return ApplyArtifacts{Corefile: core, ZoneFiles: zones, NFTRuleset: nft}, nil
+}
+
+// ApplyScriptFromPlan builds a bounded shell script that applies the reviewed
+// CoreDNS artifacts and committed lattice_guard ruleset. Cloudflare publication
+// remains server-side and is intentionally not part of this script.
+func ApplyScriptFromPlan(plan string) (string, error) {
+	artifacts, err := ParseApprovalPlan(plan)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	b.WriteString("umask 077\n")
+	b.WriteString("SELF_DNS_DIR=/etc/lattice/selfdns\n")
+	b.WriteString("ZONE_DIR=/etc/lattice/selfdns/zones\n")
+	b.WriteString("CORE_CANDIDATE=/etc/lattice/selfdns/Corefile.new\n")
+	b.WriteString("NFT_CANDIDATE=/etc/lattice/guard.nft.new\n")
+	b.WriteString("NFT_ROLLBACK=/etc/lattice/guard.rollback.nft\n")
+	b.WriteString("CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$\n")
+	b.WriteString("UNIT=/etc/systemd/system/lattice-selfdns.service\n")
+	b.WriteString("command -v coredns >/dev/null || { echo 'lattice selfdns: coredns binary not found in PATH' >&2; exit 1; }\n")
+	b.WriteString("command -v nft >/dev/null || { echo 'lattice selfdns: nft binary not found in PATH' >&2; exit 1; }\n")
+	b.WriteString("command -v systemctl >/dev/null || { echo 'lattice selfdns: systemd is required for this apply slice' >&2; exit 1; }\n")
+	b.WriteString("mkdir -p \"$SELF_DNS_DIR\" \"$ZONE_DIR\" /etc/lattice\n")
+	b.WriteString("rm -rf \"$CONFIG_BACKUP\"\n")
+	b.WriteString("if [ -d \"$SELF_DNS_DIR\" ]; then cp -a \"$SELF_DNS_DIR\" \"$CONFIG_BACKUP\"; else mkdir -p \"$CONFIG_BACKUP\"; fi\n")
+	b.WriteString("rollback() {\n")
+	b.WriteString("  set +e\n")
+	b.WriteString("  echo 'lattice selfdns: rolling back config and firewall' >&2\n")
+	b.WriteString("  nft -f \"$NFT_ROLLBACK\" 2>/dev/null || true\n")
+	b.WriteString("  if [ -d \"$CONFIG_BACKUP\" ]; then rm -rf \"$SELF_DNS_DIR\"; mv \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\"; fi\n")
+	b.WriteString("  systemctl restart lattice-selfdns.service 2>/dev/null || true\n")
+	b.WriteString("}\n")
+	b.WriteString("trap rollback ERR INT TERM HUP\n")
+	for _, zf := range artifacts.ZoneFiles {
+		b.WriteString(heredocWrite(zf.Path+".new", "LATTICE_SELF_DNS_ZONE_EOF", zf.Content))
+		b.WriteString("mv " + shellQuote(zf.Path+".new") + " " + shellQuote(zf.Path) + "\n")
+	}
+	b.WriteString(heredocWrite(CorefilePath+".new", "LATTICE_SELF_DNS_CORE_EOF", artifacts.Corefile))
+	b.WriteString("mv \"$CORE_CANDIDATE\" " + shellQuote(CorefilePath) + "\n")
+	b.WriteString("coredns -conf " + shellQuote(CorefilePath) + " -plugins >/dev/null\n")
+	b.WriteString(heredocWrite(NFTGuardPath+".new", "LATTICE_SELF_DNS_NFT_EOF", artifacts.NFTRuleset))
+	b.WriteString("nft -c -f \"$NFT_CANDIDATE\"\n")
+	b.WriteString("nft list ruleset > \"$NFT_ROLLBACK\"\n")
+	b.WriteString("( sleep 60; echo 'lattice selfdns: watchdog rollback fired' >&2; rollback ) &\n")
+	b.WriteString("WATCHDOG=$!\n")
+	b.WriteString("nft -f \"$NFT_CANDIDATE\"\n")
+	b.WriteString("mv \"$NFT_CANDIDATE\" " + shellQuote(NFTGuardPath) + "\n")
+	b.WriteString(heredocWrite("/etc/systemd/system/lattice-selfdns.service", "LATTICE_SELF_DNS_UNIT_EOF", serviceUnit()))
+	b.WriteString("chmod 0644 \"$UNIT\"\n")
+	b.WriteString("systemctl daemon-reload\n")
+	b.WriteString("systemctl enable --now lattice-selfdns.service\n")
+	b.WriteString("systemctl restart lattice-selfdns.service\n")
+	b.WriteString("systemctl is-active --quiet lattice-selfdns.service\n")
+	b.WriteString("kill \"$WATCHDOG\" 2>/dev/null || true\n")
+	b.WriteString("wait \"$WATCHDOG\" 2>/dev/null || true\n")
+	b.WriteString("trap - ERR INT TERM HUP\n")
+	b.WriteString("rm -rf \"$CONFIG_BACKUP\"\n")
+	b.WriteString("echo 'lattice selfdns: applied and verified'\n")
+	return b.String(), nil
+}
+
 func renderStaticZoneFile(dep model.DNSDeployment, zone model.DNSZone, index int, bindIP string) (ZoneFile, error) {
 	origin, err := normalizeDNSName(zone.Suffix, true, true)
 	if err != nil {
@@ -248,6 +336,121 @@ func renderStaticZoneFile(dep model.DNSDeployment, zone model.DNSZone, index int
 		fmt.Fprintf(&b, "%s %d IN %s %s\n", name, recTTL, recType, value)
 	}
 	return ZoneFile{Path: filePath, Content: b.String()}, nil
+}
+
+func fencedSection(plan, heading, language string) (string, error) {
+	start := strings.Index(plan, heading)
+	if start < 0 {
+		return "", fmt.Errorf("missing section %q", heading)
+	}
+	rest := plan[start+len(heading):]
+	fence := "```" + language + "\n"
+	fenceStart := strings.Index(rest, fence)
+	if fenceStart < 0 {
+		return "", fmt.Errorf("section %q missing %s fence", heading, language)
+	}
+	contentStart := fenceStart + len(fence)
+	fenceEnd := strings.Index(rest[contentStart:], "\n```")
+	if fenceEnd < 0 {
+		return "", fmt.Errorf("section %q missing closing fence", heading)
+	}
+	content := rest[contentStart : contentStart+fenceEnd]
+	if strings.TrimSpace(content) == "" {
+		return "", fmt.Errorf("section %q is empty", heading)
+	}
+	return content + "\n", nil
+}
+
+func zoneSections(plan string) ([]ZoneFile, error) {
+	zones := []ZoneFile{}
+	rest := plan
+	for {
+		idx := strings.Index(rest, "## Zone file: ")
+		if idx < 0 {
+			break
+		}
+		rest = rest[idx+len("## Zone file: "):]
+		lineEnd := strings.IndexByte(rest, '\n')
+		if lineEnd < 0 {
+			return nil, errors.New("zone file heading missing newline")
+		}
+		zonePath, err := validateZonePath(strings.TrimSpace(rest[:lineEnd]))
+		if err != nil {
+			return nil, err
+		}
+		content, err := zoneFence(rest[lineEnd:])
+		if err != nil {
+			return nil, err
+		}
+		zones = append(zones, ZoneFile{Path: zonePath, Content: content})
+		rest = rest[lineEnd:]
+	}
+	sort.Slice(zones, func(i, j int) bool { return zones[i].Path < zones[j].Path })
+	return zones, nil
+}
+
+func zoneFence(input string) (string, error) {
+	fence := "```dns-zone\n"
+	start := strings.Index(input, fence)
+	if start < 0 {
+		return "", errors.New("zone file section missing dns-zone fence")
+	}
+	contentStart := start + len(fence)
+	end := strings.Index(input[contentStart:], "\n```")
+	if end < 0 {
+		return "", errors.New("zone file section missing closing fence")
+	}
+	content := input[contentStart : contentStart+end]
+	if strings.TrimSpace(content) == "" {
+		return "", errors.New("zone file section is empty")
+	}
+	return content + "\n", nil
+}
+
+func validateZonePath(value string) (string, error) {
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+		return "", errors.New("invalid zone file path")
+	}
+	clean := filepath.Clean(value)
+	if !strings.HasPrefix(clean, ZoneDir+"/") || strings.Contains(clean, "/../") {
+		return "", fmt.Errorf("zone file path %q must stay under %s", value, ZoneDir)
+	}
+	if strings.HasSuffix(clean, "/") || !strings.HasSuffix(clean, ".zone") {
+		return "", fmt.Errorf("zone file path %q must be a .zone file", value)
+	}
+	return clean, nil
+}
+
+func heredocWrite(target, marker, content string) string {
+	delimiter := marker
+	for strings.Contains(content, delimiter) {
+		delimiter += "_X"
+	}
+	return "cat > " + shellQuote(target) + " <<'" + delimiter + "'\n" + content + "\n" + delimiter + "\n"
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func serviceUnit() string {
+	return `[Unit]
+Description=Lattice Self-host DNS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env coredns -conf /etc/lattice/selfdns/Corefile
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+`
 }
 
 func validateDeployment(dep model.DNSDeployment, opts RenderOptions) error {

@@ -36,6 +36,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/ratelimit"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/store"
 	"github.com/LatticeNet/lattice-server/internal/wireguard"
 	"github.com/LatticeNet/lattice-server/internal/worker"
@@ -2912,9 +2913,13 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 	case "nft":
 		return nftGuardApplyScript(approval.Plan, serverURL)
 	case "selfdns":
-		return "set -e\n" +
-			"echo 'lattice selfdns: apply is not implemented yet; regenerate this plan after the selfdns apply slice lands' >&2\n" +
-			"exit 1\n"
+		script, err := selfdns.ApplyScriptFromPlan(approval.Plan)
+		if err != nil {
+			return "set -e\n" +
+				"echo " + shellQuote("lattice selfdns: invalid approval plan: "+err.Error()) + " >&2\n" +
+				"exit 1\n"
+		}
+		return script
 	default:
 		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
 			"nft -c -f /tmp/lattice-nft-plan.nft\n"
@@ -3325,9 +3330,21 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 	}
-	if req.QueueApply && approval.Plugin == "selfdns" {
-		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "self-host dns apply is not implemented yet; review-only plans cannot be queued"))
-		return
+	applyScript := ""
+	if req.QueueApply {
+		applyScript = s.applyScriptFor(approval)
+		if approval.Plugin == "selfdns" {
+			var err error
+			applyScript, err = selfdns.ApplyScriptFromPlan(approval.Plan)
+			if err != nil {
+				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "selfdns plan is no longer applyable; re-plan before approving"))
+				return
+			}
+			if err := s.requireSelfDNSDeploymentForApproval(approval); err != nil {
+				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+				return
+			}
+		}
 	}
 	approval.Status = model.ApprovalApproved
 	approval.ApprovedBy = p.ActorID
@@ -3343,7 +3360,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			TokenID:     p.TokenID,
 			Targets:     []string{approval.NodeID},
 			Interpreter: "sh",
-			Script:      s.applyScriptFor(approval),
+			Script:      applyScript,
 			TimeoutSec:  30,
 			OutputLimit: 65536,
 			Status:      model.TaskQueued,
@@ -3352,6 +3369,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		if err := s.store.CreateTask(task); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if approval.Plugin == "selfdns" {
+			if err := s.markSelfDNSApplying(approval); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
 		}
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
@@ -3549,7 +3572,13 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 		return nil
 	}
 	approval, ok := s.store.Approval(task.ApprovalID)
-	if !ok || approval.Plugin != "nftpolicy" {
+	if !ok {
+		return nil
+	}
+	if approval.Plugin == "selfdns" {
+		return s.handleSelfDNSTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin != "nftpolicy" {
 		return nil
 	}
 	policy, ok := s.store.NetPolicy(approval.NodeID)

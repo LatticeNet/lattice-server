@@ -86,6 +86,7 @@ type Server struct {
 	agentLimiter  *ratelimit.Limiter
 	apiLimiter    *ratelimit.Limiter
 	subLimiter    *ratelimit.Limiter
+	proxyUsageMu  sync.Mutex
 	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
 	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
 	// who already targets a known account cannot widen the password-guess budget by
@@ -548,6 +549,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/users", s.withAuth("", s.handleProxyUsers))
 	mux.HandleFunc("/api/proxy/users/rotate-sub-token", s.withAuth("", s.handleRotateProxyUserSubToken))
 	mux.HandleFunc("/api/proxy/users/delete", s.withAuth("", s.handleDeleteProxyUser))
+	mux.HandleFunc("/api/proxy/usage", s.withAuth("", s.handleProxyUsage))
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))
 	mux.HandleFunc("/api/proxy/nodes/", s.withAuth("", s.handleProxyNodePlan))
@@ -577,6 +579,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleProxySubscription))
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
 	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
+	mux.HandleFunc("/api/agent/proxy-usage", s.withAgentLimit(s.handleAgentProxyUsage))
 	mux.HandleFunc("/api/agent/tasks", s.withAgentLimit(s.handleAgentTasks))
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))

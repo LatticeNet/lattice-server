@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,7 +12,7 @@ import (
 
 func TestTelegramSend(t *testing.T) {
 	var gotPath, gotBody string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
@@ -32,7 +33,7 @@ func TestTelegramSend(t *testing.T) {
 
 func TestWebhookAndDiscordSend(t *testing.T) {
 	hits := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -49,7 +50,7 @@ func TestWebhookAndDiscordSend(t *testing.T) {
 }
 
 func TestUpstreamErrorPropagates(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
@@ -74,7 +75,7 @@ func TestDiscordBlocksInternalByPolicy(t *testing.T) {
 }
 
 func TestDispatcherIsolatesFailures(t *testing.T) {
-	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	ok := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	defer ok.Close()
 	d := NewDispatcher(
 		Webhook{URL: ok.URL, Client: ok.Client()},
@@ -90,6 +91,18 @@ func TestDispatcherIsolatesFailures(t *testing.T) {
 	if results[1].Err == nil {
 		t.Fatal("second channel should fail independently")
 	}
+}
+
+func newLocalHTTPTestServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local listener unavailable in this environment: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.Listener = ln
+	srv.Start()
+	return srv
 }
 
 func TestMissingConfigErrors(t *testing.T) {

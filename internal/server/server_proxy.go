@@ -103,6 +103,30 @@ type proxyNodeProfileView struct {
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
+type proxyUsageSnapshotView struct {
+	NodeID        string           `json:"node_id"`
+	NodeName      string           `json:"node_name,omitempty"`
+	At            time.Time        `json:"at"`
+	CoreUptimeSec uint64           `json:"core_uptime_sec"`
+	UserBytes     map[string]int64 `json:"user_bytes"`
+}
+
+type proxyUsageUserView struct {
+	ID                string    `json:"id"`
+	Name              string    `json:"name"`
+	Enabled           bool      `json:"enabled"`
+	UsedBytes         int64     `json:"used_bytes"`
+	TrafficLimitBytes int64     `json:"traffic_limit_bytes,omitempty"`
+	LastSeenAt        time.Time `json:"last_seen_at,omitempty"`
+	Status            string    `json:"status"`
+}
+
+type proxyUsageApplyResult struct {
+	BytesDelta   int64 `json:"bytes_delta"`
+	UsersUpdated int   `json:"users_updated"`
+	UsersIgnored int   `json:"users_ignored"`
+}
+
 func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -490,6 +514,66 @@ func (s *Server) handleRotateProxyUserSubToken(w http.ResponseWriter, r *http.Re
 		"subscription_url": s.proxySubscriptionURL(r, token),
 		"token_sha256":     newHash,
 	})
+}
+
+func (s *Server) handleProxyUsage(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if !s.requireGlobalProxyScope(w, p, "proxy:read") {
+		return
+	}
+	snapshots := s.store.ProxyUsageSnapshots()
+	snapshotViews := make([]proxyUsageSnapshotView, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		snapshotViews = append(snapshotViews, s.toProxyUsageSnapshotView(snapshot))
+	}
+	users := s.store.ProxyUsers()
+	userViews := make([]proxyUsageUserView, 0, len(users))
+	for _, user := range users {
+		userViews = append(userViews, toProxyUsageUserView(user))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"snapshots": snapshotViews,
+		"users":     userViews,
+	})
+}
+
+func (s *Server) handleAgentProxyUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		agentAuthRequest
+		Snapshot model.ProxyUsageSnapshot `json:"snapshot"`
+	}
+	if !decodeAgentJSON(w, r, &req) {
+		return
+	}
+	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
+		return
+	}
+	req.Snapshot.NodeID = req.NodeID
+	result, err := s.applyProxyUsageSnapshot(req.Snapshot)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		Action:   "proxy.usage.report",
+		Decision: "allow",
+		NodeID:   req.NodeID,
+		Metadata: map[string]string{
+			"bytes_delta":   strconv.FormatInt(result.BytesDelta, 10),
+			"users_updated": strconv.Itoa(result.UsersUpdated),
+			"users_ignored": strconv.Itoa(result.UsersIgnored),
+		},
+	})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleProxyProfiles(w http.ResponseWriter, r *http.Request, p principal) {
@@ -994,6 +1078,146 @@ func (s *Server) toProxyNodeProfileView(profile model.ProxyNodeProfile) proxyNod
 		CreatedAt:     profile.CreatedAt,
 		UpdatedAt:     profile.UpdatedAt,
 	}
+}
+
+func (s *Server) toProxyUsageSnapshotView(snapshot model.ProxyUsageSnapshot) proxyUsageSnapshotView {
+	nodeName := ""
+	if node, ok := s.store.Node(snapshot.NodeID); ok {
+		nodeName = node.Name
+	}
+	return proxyUsageSnapshotView{
+		NodeID:        snapshot.NodeID,
+		NodeName:      nodeName,
+		At:            snapshot.At,
+		CoreUptimeSec: snapshot.CoreUptimeSec,
+		UserBytes:     cloneProxyUserBytes(snapshot.UserBytes),
+	}
+}
+
+func toProxyUsageUserView(user model.ProxyUser) proxyUsageUserView {
+	return proxyUsageUserView{
+		ID:                user.ID,
+		Name:              user.Name,
+		Enabled:           user.Enabled,
+		UsedBytes:         user.UsedBytes,
+		TrafficLimitBytes: user.TrafficLimitBytes,
+		LastSeenAt:        user.LastSeenAt,
+		Status:            user.Status,
+	}
+}
+
+func cloneProxyUserBytes(in map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(in))
+	for userID, value := range in {
+		out[userID] = value
+	}
+	return out
+}
+
+func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (proxyUsageApplyResult, error) {
+	s.proxyUsageMu.Lock()
+	defer s.proxyUsageMu.Unlock()
+
+	snapshot.NodeID = strings.TrimSpace(snapshot.NodeID)
+	if snapshot.NodeID == "" {
+		return proxyUsageApplyResult{}, errors.New("node_id is required")
+	}
+	profile, ok := s.store.ProxyNodeProfile(snapshot.NodeID)
+	if !ok {
+		return proxyUsageApplyResult{}, fmt.Errorf("proxy node profile %s not found", snapshot.NodeID)
+	}
+	if snapshot.At.IsZero() {
+		snapshot.At = s.now()
+	}
+	if len(snapshot.UserBytes) > 4096 {
+		return proxyUsageApplyResult{}, errors.New("user_bytes has too many entries")
+	}
+	eligible := s.proxyUsageEligibleUsers(profile)
+	sanitized := map[string]int64{}
+	ignored := 0
+	for userID, value := range snapshot.UserBytes {
+		userID = strings.TrimSpace(userID)
+		if !proxyIDRe.MatchString(userID) {
+			return proxyUsageApplyResult{}, fmt.Errorf("invalid proxy user id %q", userID)
+		}
+		if value < 0 {
+			return proxyUsageApplyResult{}, fmt.Errorf("proxy usage for %s cannot be negative", userID)
+		}
+		if _, ok := eligible[userID]; !ok {
+			ignored++
+			continue
+		}
+		sanitized[userID] = value
+	}
+	snapshot.UserBytes = sanitized
+
+	previous, hadPrevious := s.store.ProxyUsageSnapshot(snapshot.NodeID)
+	result := proxyUsageApplyResult{UsersIgnored: ignored}
+	if hadPrevious {
+		reset := snapshot.CoreUptimeSec < previous.CoreUptimeSec
+		for userID, current := range snapshot.UserBytes {
+			prior := previous.UserBytes[userID]
+			delta := int64(0)
+			switch {
+			case reset:
+				delta = current
+			case current >= prior:
+				delta = current - prior
+			default:
+				// Counter decreased without an uptime reset. Treat this report as
+				// a new baseline for that user, but don't advance billing/limits.
+				delta = 0
+			}
+			if delta <= 0 {
+				continue
+			}
+			user := eligible[userID]
+			user.UsedBytes += delta
+			user.LastSeenAt = snapshot.At
+			user.Status = derivedProxyUserStatus(user)
+			if err := s.store.UpsertProxyUser(user); err != nil {
+				return proxyUsageApplyResult{}, err
+			}
+			result.BytesDelta += delta
+			result.UsersUpdated++
+		}
+	} else {
+		for userID := range snapshot.UserBytes {
+			user := eligible[userID]
+			user.LastSeenAt = snapshot.At
+			user.Status = derivedProxyUserStatus(user)
+			if err := s.store.UpsertProxyUser(user); err != nil {
+				return proxyUsageApplyResult{}, err
+			}
+			result.UsersUpdated++
+		}
+	}
+	if err := s.store.UpsertProxyUsageSnapshot(snapshot); err != nil {
+		return proxyUsageApplyResult{}, err
+	}
+	return result, nil
+}
+
+func (s *Server) proxyUsageEligibleUsers(profile model.ProxyNodeProfile) map[string]model.ProxyUser {
+	out := map[string]model.ProxyUser{}
+	for _, user := range s.store.ProxyUsers() {
+		if proxyUserAppliesToProfile(user, profile) {
+			out[user.ID] = user
+		}
+	}
+	return out
+}
+
+func proxyUserAppliesToProfile(user model.ProxyUser, profile model.ProxyNodeProfile) bool {
+	if len(user.InboundIDs) == 0 {
+		return true
+	}
+	for _, inboundID := range profile.InboundIDs {
+		if proxyStringSliceContains(user.InboundIDs, inboundID) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) normalizeProxyInbound(req, existing model.ProxyInbound, hadExisting bool) (model.ProxyInbound, error) {

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -81,9 +82,21 @@ func newMockIDP(t *testing.T) *mockIDP {
 			"id_token":     idp.signJWT(claims),
 		})
 	})
-	idp.server = httptest.NewServer(mux)
+	idp.server = newLocalOIDCTestServer(t, mux)
 	t.Cleanup(idp.server.Close)
 	return idp
+}
+
+func newLocalOIDCTestServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local listener unavailable in this environment: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.Listener = ln
+	srv.Start()
+	return srv
 }
 
 func (m *mockIDP) signJWT(claims map[string]any) string {

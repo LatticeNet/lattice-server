@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -51,9 +52,21 @@ func cfMock(t *testing.T) (*httptest.Server, *struct {
 		state.updated = &rec
 		writeCF(w, rec)
 	})
-	srv := httptest.NewServer(mux)
+	srv := newLocalHTTPTestServer(t, mux)
 	t.Cleanup(srv.Close)
 	return srv, state
+}
+
+func newLocalHTTPTestServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("local listener unavailable in this environment: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(h)
+	srv.Listener = ln
+	srv.Start()
+	return srv
 }
 
 func writeCF(w http.ResponseWriter, result any) {
@@ -87,7 +100,7 @@ func TestCloudflareZoneNotFound(t *testing.T) {
 
 func TestWebhookTemplating(t *testing.T) {
 	var gotURL, gotBody, gotAuth string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotURL = r.URL.String()
 		gotAuth = r.Header.Get("Authorization")
 		buf := new(strings.Builder)

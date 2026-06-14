@@ -709,6 +709,110 @@ func TestProxyRotateSubscriptionTokenWithoutPublicURLReturnsRelativePath(t *test
 	}
 }
 
+func TestProxyUsageReportBaselinesAndRollsForward(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+	alice, ok := st.ProxyUser("alice")
+	if !ok {
+		t.Fatal("proxy user alice not found")
+	}
+	alice.TrafficLimitBytes = 170
+	if err := st.UpsertProxyUser(alice); err != nil {
+		t.Fatal(err)
+	}
+
+	first := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":100,"user_bytes":{"alice":100,"unknown":999}}
+	}`, nodeToken)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first usage report failed: %d %s", first.Code, first.Body.String())
+	}
+	var firstOut proxyUsageApplyResult
+	if err := json.NewDecoder(first.Body).Decode(&firstOut); err != nil {
+		t.Fatal(err)
+	}
+	if firstOut.BytesDelta != 0 || firstOut.UsersUpdated != 1 || firstOut.UsersIgnored != 1 {
+		t.Fatalf("first snapshot should baseline only and ignore unknown user: %+v", firstOut)
+	}
+	if user, _ := st.ProxyUser("alice"); user.UsedBytes != 0 || user.LastSeenAt.IsZero() {
+		t.Fatalf("baseline should not import historical bytes but should mark seen: %+v", user)
+	}
+
+	second := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":120,"user_bytes":{"alice":250}}
+	}`, nodeToken)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second usage report failed: %d %s", second.Code, second.Body.String())
+	}
+	var secondOut proxyUsageApplyResult
+	if err := json.NewDecoder(second.Body).Decode(&secondOut); err != nil {
+		t.Fatal(err)
+	}
+	if secondOut.BytesDelta != 150 || secondOut.UsersUpdated != 1 {
+		t.Fatalf("second snapshot should advance by monotonic delta: %+v", secondOut)
+	}
+	if user, _ := st.ProxyUser("alice"); user.UsedBytes != 150 || user.Status != model.ProxyUserStatusActive {
+		t.Fatalf("unexpected user after monotonic delta: %+v", user)
+	}
+
+	reset := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":5,"user_bytes":{"alice":25}}
+	}`, nodeToken)
+	if reset.Code != http.StatusOK {
+		t.Fatalf("reset usage report failed: %d %s", reset.Code, reset.Body.String())
+	}
+	var resetOut proxyUsageApplyResult
+	if err := json.NewDecoder(reset.Body).Decode(&resetOut); err != nil {
+		t.Fatal(err)
+	}
+	if resetOut.BytesDelta != 25 {
+		t.Fatalf("counter reset should add current post-reset bytes, got %+v", resetOut)
+	}
+	if user, _ := st.ProxyUser("alice"); user.UsedBytes != 175 || user.Status != model.ProxyUserStatusOverQuota {
+		t.Fatalf("usage should roll up and derive over-quota status: %+v", user)
+	}
+
+	decrease := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":6,"user_bytes":{"alice":10}}
+	}`, nodeToken)
+	if decrease.Code != http.StatusOK {
+		t.Fatalf("decreased counter report should reset baseline without adding bytes: %d %s", decrease.Code, decrease.Body.String())
+	}
+	if user, _ := st.ProxyUser("alice"); user.UsedBytes != 175 {
+		t.Fatalf("decreased counter without uptime reset should not advance usage: %+v", user)
+	}
+
+	usage := doJSON(t, handler, http.MethodGet, "/api/proxy/usage", "", cookies, "")
+	defer usage.Body.Close()
+	if usage.StatusCode != http.StatusOK {
+		t.Fatalf("usage query failed: %d", usage.StatusCode)
+	}
+	body := new(bytes.Buffer)
+	body.ReadFrom(usage.Body)
+	for _, want := range []string{`"node_id":"node-a"`, `"id":"alice"`, `"used_bytes":175`, `"status":"over_quota"`} {
+		if !strings.Contains(body.String(), want) {
+			t.Fatalf("usage response missing %s: %s", want, body.String())
+		}
+	}
+	if strings.Contains(body.String(), "unknown") {
+		t.Fatalf("usage response should not persist unknown reported users: %s", body.String())
+	}
+
+	negative := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":7,"user_bytes":{"alice":-1}}
+	}`, nodeToken)
+	if negative.Code != http.StatusBadRequest {
+		t.Fatalf("negative usage should be rejected, got %d", negative.Code)
+	}
+}
+
 func TestProxyPlanRequiresGlobalProxyRead(t *testing.T) {
 	handler, _ := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)

@@ -107,6 +107,7 @@ func TestAgentPostEndpointsRejectBodyTokenWithoutBearer(t *testing.T) {
 	}{
 		{name: "hello", path: "/api/agent/hello", body: `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","version":"test"}`},
 		{name: "metrics", path: "/api/agent/metrics", body: `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","metrics":{}}`},
+		{name: "proxy usage", path: "/api/agent/proxy-usage", body: `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","snapshot":{"core_uptime_sec":1,"user_bytes":{}}}`},
 		{name: "monitor result", path: "/api/agent/monitor-result", body: `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","result":{"monitor_id":"mon-a","success":true}}`},
 		{name: "event", path: "/api/agent/event", body: `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","kind":"agent.test","message":"ok"}`},
 		{name: "task result", path: "/api/agent/task-result", body: `{"node_id":"` + nodeID + `","token":"` + nodeToken + `","result":{"task_id":"task-a","lease_id":"lease-a","exit_code":0}}`},

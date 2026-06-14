@@ -3,7 +3,6 @@ package ddns
 import (
 	"context"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -14,7 +13,7 @@ import (
 // it). Hop-by-hop headers are also dropped. Ordinary headers still pass through.
 func TestWebhookHeaderSemantics(t *testing.T) {
 	var gotHost, gotCL, gotConn, gotXTest string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// r.Host reflects the wire Host line, i.e. the client's req.Host.
 		gotHost = r.Host
 		// A manually-set Content-Length would surface in r.ContentLength /

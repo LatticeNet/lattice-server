@@ -2,6 +2,7 @@ package proxycore
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/netip"
@@ -15,8 +16,11 @@ import (
 )
 
 const (
-	SubscriptionFormatBase64 = "base64"
-	SubscriptionFormatPlain  = "plain"
+	SubscriptionFormatBase64    = "base64"
+	SubscriptionFormatPlain     = "plain"
+	SubscriptionFormatSingBox   = "sing-box"
+	SubscriptionFormatClash     = "clash"
+	SubscriptionFormatClashMeta = "clash-meta"
 )
 
 // SubscriptionProfile is the small server-provided view needed to render links.
@@ -30,17 +34,53 @@ type SubscriptionOptions struct {
 	Now time.Time
 }
 
+// VLESSRealityEndpoint is a validated, secret-free client subscription endpoint
+// for the currently supported VLESS+REALITY+TCP shape.
+type VLESSRealityEndpoint struct {
+	Label       string
+	Tag         string
+	NodeID      string
+	InboundID   string
+	Server      string
+	ServerPort  int
+	UUID        string
+	Flow        string
+	Network     string
+	SNI         string
+	Fingerprint string
+	ALPN        []string
+	PublicKey   string
+	ShortID     string
+}
+
 // VLESSRealityLinks renders MVP VLESS+REALITY links for one subscriber across
 // applied node profiles. It returns an empty slice for inactive users instead
 // of an error so the public subscription endpoint can stay token-stable while
 // enforcing expiry/quota server-side.
 func VLESSRealityLinks(user model.ProxyUser, profiles []SubscriptionProfile, inbounds []model.ProxyInbound, opts SubscriptionOptions) ([]string, []string, error) {
+	endpoints, warnings, err := VLESSRealityEndpoints(user, profiles, inbounds, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	links := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		links = append(links, endpoint.Link())
+	}
+	sort.Strings(links)
+	return links, warnings, nil
+}
+
+// VLESSRealityEndpoints renders structured subscription endpoints for the
+// currently supported VLESS+REALITY+TCP shape. All public subscription formats
+// are derived from these endpoints so validation and secret stripping stay in
+// one place.
+func VLESSRealityEndpoints(user model.ProxyUser, profiles []SubscriptionProfile, inbounds []model.ProxyInbound, opts SubscriptionOptions) ([]VLESSRealityEndpoint, []string, error) {
 	now := opts.Now
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
 	if reason := skipProxyUserReason(user, now); reason != "" {
-		return []string{}, []string{"user " + user.ID + " has no active subscription links: " + reason}, nil
+		return []VLESSRealityEndpoint{}, []string{"user " + user.ID + " has no active subscription links: " + reason}, nil
 	}
 	if !safeTagRe.MatchString(user.ID) {
 		return nil, nil, fmt.Errorf("invalid proxy user id %q", user.ID)
@@ -58,7 +98,7 @@ func VLESSRealityLinks(user model.ProxyUser, profiles []SubscriptionProfile, inb
 		return sortedProfiles[i].Profile.NodeID < sortedProfiles[j].Profile.NodeID
 	})
 
-	links := []string{}
+	endpoints := []VLESSRealityEndpoint{}
 	warnings := []string{}
 	for _, sp := range sortedProfiles {
 		profile := sp.Profile
@@ -90,57 +130,111 @@ func VLESSRealityLinks(user model.ProxyUser, profiles []SubscriptionProfile, inb
 			if !userAppliesToInbound(user, inboundID) {
 				continue
 			}
-			link, err := vlessRealityLink(user, sp, inbound, host)
+			endpoint, err := vlessRealityEndpointFor(user, sp, inbound, host)
 			if err != nil {
 				return nil, nil, err
 			}
-			links = append(links, link)
+			endpoints = append(endpoints, endpoint)
 		}
 	}
-	sort.Strings(links)
-	return links, warnings, nil
+	sort.Slice(endpoints, func(i, j int) bool {
+		if endpoints[i].Label == endpoints[j].Label {
+			if endpoints[i].NodeID == endpoints[j].NodeID {
+				return endpoints[i].InboundID < endpoints[j].InboundID
+			}
+			return endpoints[i].NodeID < endpoints[j].NodeID
+		}
+		return endpoints[i].Label < endpoints[j].Label
+	})
+	assignUniqueEndpointTags(endpoints)
+	return endpoints, warnings, nil
 }
 
-func vlessRealityLink(user model.ProxyUser, sp SubscriptionProfile, inbound model.ProxyInbound, host string) (string, error) {
+func vlessRealityEndpointFor(user model.ProxyUser, sp SubscriptionProfile, inbound model.ProxyInbound, host string) (VLESSRealityEndpoint, error) {
 	if err := validateVLESSRealityInbound(inbound); err != nil {
-		return "", err
+		return VLESSRealityEndpoint{}, err
 	}
 	if inbound.RealityPublicKey == "" || !realityKeyRe.MatchString(inbound.RealityPublicKey) {
-		return "", fmt.Errorf("inbound %s has invalid reality public key", inbound.ID)
+		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s has invalid reality public key", inbound.ID)
 	}
 	if len(inbound.RealityShortIDs) == 0 {
-		return "", fmt.Errorf("inbound %s requires at least one reality short id", inbound.ID)
+		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s requires at least one reality short id", inbound.ID)
 	}
 	shortID := strings.ToLower(strings.TrimSpace(inbound.RealityShortIDs[0]))
 	if shortID == "" || !realityShortIDRe.MatchString(shortID) || len(shortID)%2 != 0 {
-		return "", fmt.Errorf("inbound %s has invalid reality short id %q", inbound.ID, inbound.RealityShortIDs[0])
+		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s has invalid reality short id %q", inbound.ID, inbound.RealityShortIDs[0])
 	}
-	values := url.Values{}
-	values.Set("type", model.ProxyTransportTCP)
-	values.Set("encryption", "none")
-	values.Set("security", model.ProxySecurityReality)
-	values.Set("flow", "xtls-rprx-vision")
-	values.Set("pbk", inbound.RealityPublicKey)
-	values.Set("sid", shortID)
+	sni := strings.TrimSpace(inbound.SNI)
 	if inbound.SNI != "" {
-		if err := validateHostToken(inbound.SNI); err != nil {
-			return "", fmt.Errorf("inbound %s sni: %w", inbound.ID, err)
+		if err := validateHostToken(sni); err != nil {
+			return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s sni: %w", inbound.ID, err)
 		}
-		values.Set("sni", inbound.SNI)
 	}
 	fingerprint := strings.TrimSpace(inbound.Fingerprint)
 	if fingerprint == "" {
 		fingerprint = "chrome"
 	}
 	if strings.ContainsFunc(fingerprint, isUnsafeControl) {
-		return "", fmt.Errorf("inbound %s fingerprint contains control characters", inbound.ID)
-	}
-	values.Set("fp", fingerprint)
-	if len(inbound.ALPN) > 0 {
-		values.Set("alpn", strings.Join(cleanStringList(inbound.ALPN), ","))
+		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s fingerprint contains control characters", inbound.ID)
 	}
 	label := subscriptionLabel(sp, inbound)
-	return "vless://" + strings.ToLower(user.UUID) + "@" + net.JoinHostPort(host, strconv.Itoa(inbound.Port)) + "?" + values.Encode() + "#" + url.PathEscape(label), nil
+	return VLESSRealityEndpoint{
+		Label:       label,
+		Tag:         label,
+		NodeID:      strings.TrimSpace(sp.Profile.NodeID),
+		InboundID:   inbound.ID,
+		Server:      host,
+		ServerPort:  inbound.Port,
+		UUID:        strings.ToLower(user.UUID),
+		Flow:        "xtls-rprx-vision",
+		Network:     model.ProxyTransportTCP,
+		SNI:         sni,
+		Fingerprint: fingerprint,
+		ALPN:        cleanStringList(inbound.ALPN),
+		PublicKey:   inbound.RealityPublicKey,
+		ShortID:     shortID,
+	}, nil
+}
+
+func (e VLESSRealityEndpoint) Link() string {
+	values := url.Values{}
+	values.Set("type", e.Network)
+	values.Set("encryption", "none")
+	values.Set("security", model.ProxySecurityReality)
+	values.Set("flow", e.Flow)
+	values.Set("pbk", e.PublicKey)
+	values.Set("sid", e.ShortID)
+	if e.SNI != "" {
+		values.Set("sni", e.SNI)
+	}
+	if e.Fingerprint != "" {
+		values.Set("fp", e.Fingerprint)
+	}
+	if len(e.ALPN) > 0 {
+		values.Set("alpn", strings.Join(e.ALPN, ","))
+	}
+	return "vless://" + e.UUID + "@" + net.JoinHostPort(e.Server, strconv.Itoa(e.ServerPort)) + "?" + values.Encode() + "#" + url.PathEscape(e.Label)
+}
+
+func assignUniqueEndpointTags(endpoints []VLESSRealityEndpoint) {
+	counts := map[string]int{}
+	for _, endpoint := range endpoints {
+		counts[endpoint.Label]++
+	}
+	seen := map[string]int{}
+	for i := range endpoints {
+		label := endpoints[i].Label
+		if counts[label] == 1 {
+			endpoints[i].Tag = label
+			continue
+		}
+		seen[label]++
+		suffix := strings.Trim(endpoints[i].NodeID+" "+endpoints[i].InboundID, " ")
+		if suffix == "" {
+			suffix = strconv.Itoa(seen[label])
+		}
+		endpoints[i].Tag = label + " (" + suffix + ")"
+	}
 }
 
 func subscriptionLabel(sp SubscriptionProfile, inbound model.ProxyInbound) string {
@@ -208,6 +302,136 @@ func Base64Subscription(links []string) []byte {
 		return []byte{}
 	}
 	return []byte(base64.StdEncoding.EncodeToString(plain))
+}
+
+type singBoxClientConfig struct {
+	Outbounds []singBoxClientVLESSOutbound `json:"outbounds"`
+}
+
+type singBoxClientVLESSOutbound struct {
+	Type       string           `json:"type"`
+	Tag        string           `json:"tag"`
+	Server     string           `json:"server"`
+	ServerPort int              `json:"server_port"`
+	UUID       string           `json:"uuid"`
+	Flow       string           `json:"flow,omitempty"`
+	Network    string           `json:"network,omitempty"`
+	TLS        singBoxClientTLS `json:"tls"`
+}
+
+type singBoxClientTLS struct {
+	Enabled    bool                 `json:"enabled"`
+	ServerName string               `json:"server_name,omitempty"`
+	ALPN       []string             `json:"alpn,omitempty"`
+	UTLS       *singBoxClientUTLS   `json:"utls,omitempty"`
+	Reality    singBoxClientReality `json:"reality"`
+}
+
+type singBoxClientUTLS struct {
+	Enabled     bool   `json:"enabled"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+type singBoxClientReality struct {
+	Enabled   bool   `json:"enabled"`
+	PublicKey string `json:"public_key"`
+	ShortID   string `json:"short_id"`
+}
+
+// SingBoxClientSubscription renders a minimal sing-box client outbound config
+// for the supported VLESS+REALITY+TCP endpoints.
+func SingBoxClientSubscription(endpoints []VLESSRealityEndpoint) ([]byte, error) {
+	cfg := singBoxClientConfig{Outbounds: make([]singBoxClientVLESSOutbound, 0, len(endpoints))}
+	for _, endpoint := range endpoints {
+		tls := singBoxClientTLS{
+			Enabled:    true,
+			ServerName: endpoint.SNI,
+			ALPN:       append([]string(nil), endpoint.ALPN...),
+			Reality: singBoxClientReality{
+				Enabled:   true,
+				PublicKey: endpoint.PublicKey,
+				ShortID:   endpoint.ShortID,
+			},
+		}
+		if endpoint.Fingerprint != "" {
+			tls.UTLS = &singBoxClientUTLS{Enabled: true, Fingerprint: endpoint.Fingerprint}
+		}
+		cfg.Outbounds = append(cfg.Outbounds, singBoxClientVLESSOutbound{
+			Type:       model.ProxyProtocolVLESS,
+			Tag:        endpoint.Tag,
+			Server:     endpoint.Server,
+			ServerPort: endpoint.ServerPort,
+			UUID:       endpoint.UUID,
+			Flow:       endpoint.Flow,
+			Network:    endpoint.Network,
+			TLS:        tls,
+		})
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal sing-box subscription: %w", err)
+	}
+	return append(data, '\n'), nil
+}
+
+// ClashMetaSubscription renders a dependency-free Clash.Meta-compatible YAML
+// proxy list for the supported VLESS+REALITY+TCP endpoints.
+func ClashMetaSubscription(endpoints []VLESSRealityEndpoint) []byte {
+	var b strings.Builder
+	b.WriteString("proxies:\n")
+	for _, endpoint := range endpoints {
+		b.WriteString("  - name: ")
+		b.WriteString(yamlQuote(endpoint.Tag))
+		b.WriteString("\n")
+		b.WriteString("    type: vless\n")
+		b.WriteString("    server: ")
+		b.WriteString(yamlQuote(endpoint.Server))
+		b.WriteString("\n")
+		b.WriteString("    port: ")
+		b.WriteString(strconv.Itoa(endpoint.ServerPort))
+		b.WriteString("\n")
+		b.WriteString("    uuid: ")
+		b.WriteString(yamlQuote(endpoint.UUID))
+		b.WriteString("\n")
+		b.WriteString("    network: tcp\n")
+		b.WriteString("    tls: true\n")
+		b.WriteString("    udp: true\n")
+		b.WriteString("    flow: ")
+		b.WriteString(yamlQuote(endpoint.Flow))
+		b.WriteString("\n")
+		b.WriteString("    packet-encoding: xudp\n")
+		b.WriteString("    encryption: \"\"\n")
+		if endpoint.SNI != "" {
+			b.WriteString("    servername: ")
+			b.WriteString(yamlQuote(endpoint.SNI))
+			b.WriteString("\n")
+		}
+		if endpoint.Fingerprint != "" {
+			b.WriteString("    client-fingerprint: ")
+			b.WriteString(yamlQuote(endpoint.Fingerprint))
+			b.WriteString("\n")
+		}
+		if len(endpoint.ALPN) > 0 {
+			b.WriteString("    alpn:\n")
+			for _, alpn := range endpoint.ALPN {
+				b.WriteString("      - ")
+				b.WriteString(yamlQuote(alpn))
+				b.WriteString("\n")
+			}
+		}
+		b.WriteString("    reality-opts:\n")
+		b.WriteString("      public-key: ")
+		b.WriteString(yamlQuote(endpoint.PublicKey))
+		b.WriteString("\n")
+		b.WriteString("      short-id: ")
+		b.WriteString(yamlQuote(endpoint.ShortID))
+		b.WriteString("\n")
+	}
+	return []byte(b.String())
+}
+
+func yamlQuote(value string) string {
+	return strconv.Quote(value)
 }
 
 func SubscriptionUserinfo(user model.ProxyUser) string {

@@ -27,7 +27,8 @@ Responsibilities:
   views, a redacted reviewed plan endpoint, and secret-safe queue/apply through
   encrypted task scripts, `sing-box check`, atomic config swap, reload/restart,
   task-result status reconciliation, public subscription serving, audited
-  subscription-token rotation, and baseline proxy usage rollup.
+  subscription-token rotation, sing-box JSON plus Clash/Mihomo YAML subscription
+  output, and baseline proxy usage rollup.
 - Operator-owned NodeGeo API for the dashboard Fleet Map.
 - Append-only audit events.
 
@@ -159,7 +160,15 @@ the version in `go.mod`; during local multi-repo development, use the
   constant-time full scan over decrypted subscription tokens, rate-limits before
   credential lookup, fails closed on duplicate tokens, records only token
   SHA-256 hashes in audit metadata, and deliberately does not persist raw
-  subscription tokens as map keys. `POST /api/proxy/users/rotate-sub-token`
+  subscription tokens as map keys. It currently supports `format=base64`
+  (default), `format=plain`, `format=sing-box` (`application/json` client
+  outbounds), and `format=clash` / `format=clash-meta` (`text/yaml` Mihomo
+  `proxies:` list) for the supported VLESS+REALITY+TCP path. These bodies are
+  derived from a secret-free `VLESSRealityEndpoint` projection; Clash/Mihomo YAML
+  is emitted by a fixed-shape writer with quoted scalars, so no YAML dependency
+  is introduced. `ProxyInbound.Fingerprint` is accepted only as a constrained
+  safe token and is subscription metadata, not a secret. `POST
+  /api/proxy/users/rotate-sub-token`
   returns the new subscription URL/path only in the explicit rotate response and
   uses `LATTICE_PUBLIC_URL` when configured instead of reflecting request
   `Host`. `POST /api/agent/proxy-usage` accepts low-trust node usage snapshots

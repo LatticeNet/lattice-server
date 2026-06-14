@@ -26,6 +26,7 @@ func TestProxyInboundAndUserViewsHideSecrets(t *testing.T) {
 		"transport":"tcp",
 		"security":"reality",
 		"sni":"Cdn.Example.COM",
+		"fingerprint":"firefox",
 		"alpn":["h2","http/1.1","h2"],
 		"reality_private_key":"super-secret-reality-private-key",
 		"reality_public_key":"public-reality-key-123456",
@@ -48,7 +49,10 @@ func TestProxyInboundAndUserViewsHideSecrets(t *testing.T) {
 	if !bytes.Contains(inBody.Bytes(), []byte(`"sni":"cdn.example.com"`)) {
 		t.Fatalf("sni should be normalized: %s", inBody.String())
 	}
-	if stored, ok := st.ProxyInbound("in-reality-443"); !ok || stored.RealityPrivateKey != "super-secret-reality-private-key" || len(stored.ALPN) != 2 || stored.RealityShortIDs[0] != "aa" {
+	if !bytes.Contains(inBody.Bytes(), []byte(`"fingerprint":"firefox"`)) {
+		t.Fatalf("fingerprint should be preserved in the non-secret view: %s", inBody.String())
+	}
+	if stored, ok := st.ProxyInbound("in-reality-443"); !ok || stored.RealityPrivateKey != "super-secret-reality-private-key" || stored.Fingerprint != "firefox" || len(stored.ALPN) != 2 || stored.RealityShortIDs[0] != "aa" {
 		t.Fatalf("secret should persist server-side only and lists should normalize: ok=%v inbound=%+v", ok, stored)
 	}
 
@@ -122,6 +126,26 @@ func TestProxyUpdatePreservesWriteOnlySecrets(t *testing.T) {
 	}
 	if stored, ok := st.ProxyInbound("in-a"); !ok || stored.RealityPrivateKey != "super-secret-reality-private-key" || stored.Name != "Renamed" || stored.Port != 8443 {
 		t.Fatalf("update should preserve write-only private key: ok=%v inbound=%+v", ok, stored)
+	}
+
+	badFingerprint := doJSON(t, handler, http.MethodPost, "/api/proxy/inbounds", `{
+		"id":"in-bad-fp",
+		"name":"Bad Fingerprint",
+		"core":"sing-box",
+		"protocol":"vless",
+		"port":443,
+		"transport":"tcp",
+		"security":"reality",
+		"fingerprint":"chrome beta",
+		"reality_private_key":"super-secret-reality-private-key",
+		"reality_public_key":"public-reality-key-123456",
+		"reality_short_ids":["aa"],
+		"reality_dest":"www.microsoft.com:443",
+		"enabled":true
+	}`, cookies, csrf)
+	defer badFingerprint.Body.Close()
+	if badFingerprint.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unsafe fingerprint should be rejected, got %d", badFingerprint.StatusCode)
 	}
 
 	bad := doJSON(t, handler, http.MethodPost, "/api/proxy/profiles", `{
@@ -450,6 +474,71 @@ func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 		t.Fatalf("base64 decoded body mismatch:\ngot  %q\nwant %q", decoded, body)
 	}
 
+	singBox := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=sing-box", "", nil, "")
+	defer singBox.Body.Close()
+	if singBox.StatusCode != http.StatusOK {
+		t.Fatalf("sing-box subscription failed: %d", singBox.StatusCode)
+	}
+	if got := singBox.Header.Get("Content-Type"); !strings.Contains(got, "application/json") {
+		t.Fatalf("sing-box Content-Type = %q", got)
+	}
+	var singBoxOut struct {
+		Outbounds []struct {
+			Type       string `json:"type"`
+			Tag        string `json:"tag"`
+			Server     string `json:"server"`
+			ServerPort int    `json:"server_port"`
+			UUID       string `json:"uuid"`
+			TLS        struct {
+				Reality struct {
+					PublicKey string `json:"public_key"`
+					ShortID   string `json:"short_id"`
+				} `json:"reality"`
+			} `json:"tls"`
+		} `json:"outbounds"`
+	}
+	if err := json.NewDecoder(singBox.Body).Decode(&singBoxOut); err != nil {
+		t.Fatalf("sing-box subscription JSON decode failed: %v", err)
+	}
+	if len(singBoxOut.Outbounds) != 1 || singBoxOut.Outbounds[0].Type != "vless" || singBoxOut.Outbounds[0].Server != "node-a.dns.example.com" || singBoxOut.Outbounds[0].ServerPort != 443 {
+		t.Fatalf("unexpected sing-box subscription: %+v", singBoxOut)
+	}
+	if singBoxOut.Outbounds[0].UUID != "11111111-1111-4111-8111-111111111111" || singBoxOut.Outbounds[0].TLS.Reality.PublicKey != "public-reality-key-123456" || singBoxOut.Outbounds[0].TLS.Reality.ShortID != "aa" {
+		t.Fatalf("unexpected sing-box credentials: %+v", singBoxOut.Outbounds[0])
+	}
+
+	clash := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=clash-meta", "", nil, "")
+	defer clash.Body.Close()
+	if clash.StatusCode != http.StatusOK {
+		t.Fatalf("clash subscription failed: %d", clash.StatusCode)
+	}
+	if got := clash.Header.Get("Content-Type"); !strings.Contains(got, "text/yaml") {
+		t.Fatalf("clash Content-Type = %q", got)
+	}
+	clashBody := new(bytes.Buffer)
+	clashBody.ReadFrom(clash.Body)
+	for _, want := range []string{
+		`proxies:`,
+		`type: vless`,
+		`server: "node-a.dns.example.com"`,
+		`port: 443`,
+		`uuid: "11111111-1111-4111-8111-111111111111"`,
+		`packet-encoding: xudp`,
+		`encryption: ""`,
+		`reality-opts:`,
+		`public-key: "public-reality-key-123456"`,
+		`short-id: "aa"`,
+	} {
+		if !strings.Contains(clashBody.String(), want) {
+			t.Fatalf("clash subscription missing %q:\n%s", want, clashBody.String())
+		}
+	}
+	for _, leak := range []string{"super-secret-reality-private-key", "proxy-password-secret", token, `"sub_token"`} {
+		if strings.Contains(clashBody.String(), leak) {
+			t.Fatalf("clash subscription leaked %q:\n%s", leak, clashBody.String())
+		}
+	}
+
 	hash := proxySubTokenAuditHash(token)
 	if !auditMetadataSeen(st, "proxy.subscription.fetch", "token_sha256", hash) {
 		t.Fatalf("subscription fetch audit missing token hash: %+v", st.AuditEvents())
@@ -494,7 +583,7 @@ func TestProxySubscriptionRejectsUnknownMethodsFormatsAndDuplicateTokens(t *test
 	if post.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("subscription POST should 405, got %d", post.StatusCode)
 	}
-	badFormat := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=clash", "", nil, "")
+	badFormat := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=xml", "", nil, "")
 	badFormat.Body.Close()
 	if badFormat.StatusCode != http.StatusBadRequest {
 		t.Fatalf("bad subscription format should 400, got %d", badFormat.StatusCode)

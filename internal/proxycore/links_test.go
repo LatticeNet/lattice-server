@@ -2,6 +2,7 @@ package proxycore
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/url"
 	"strconv"
 	"strings"
@@ -81,6 +82,103 @@ func TestVLESSRealityLinksRenderPlainAndBase64Subscriptions(t *testing.T) {
 	wantUserinfo := "upload=0; download=40; total=100; expire=" + strconv.FormatInt(user.ExpiresAt.Unix(), 10)
 	if got := SubscriptionUserinfo(user); got != wantUserinfo {
 		t.Fatalf("userinfo = %q, want %q", got, wantUserinfo)
+	}
+}
+
+func TestVLESSRealitySubscriptionFormatsRenderSingBoxAndClash(t *testing.T) {
+	now := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
+	profile := baseProfile()
+	profile.AppliedSHA256 = strings.Repeat("a", 64)
+	user := baseUser("alice", "Alice", "11111111-1111-4111-8111-111111111111", now.Add(-time.Hour))
+
+	endpoints, warnings, err := VLESSRealityEndpoints(user, []SubscriptionProfile{{Profile: profile, NodeName: "Node A"}}, []model.ProxyInbound{baseInbound()}, SubscriptionOptions{Now: now})
+	if err != nil {
+		t.Fatalf("VLESSRealityEndpoints returned error: %v", err)
+	}
+	if len(warnings) != 0 || len(endpoints) != 1 {
+		t.Fatalf("unexpected endpoint render: endpoints=%+v warnings=%v", endpoints, warnings)
+	}
+
+	singBoxBody, err := SingBoxClientSubscription(endpoints)
+	if err != nil {
+		t.Fatalf("SingBoxClientSubscription returned error: %v", err)
+	}
+	var singBox struct {
+		Outbounds []struct {
+			Type       string `json:"type"`
+			Tag        string `json:"tag"`
+			Server     string `json:"server"`
+			ServerPort int    `json:"server_port"`
+			UUID       string `json:"uuid"`
+			Flow       string `json:"flow"`
+			Network    string `json:"network"`
+			TLS        struct {
+				Enabled    bool     `json:"enabled"`
+				ServerName string   `json:"server_name"`
+				ALPN       []string `json:"alpn"`
+				UTLS       struct {
+					Enabled     bool   `json:"enabled"`
+					Fingerprint string `json:"fingerprint"`
+				} `json:"utls"`
+				Reality struct {
+					Enabled   bool   `json:"enabled"`
+					PublicKey string `json:"public_key"`
+					ShortID   string `json:"short_id"`
+				} `json:"reality"`
+			} `json:"tls"`
+		} `json:"outbounds"`
+	}
+	if err := json.Unmarshal(singBoxBody, &singBox); err != nil {
+		t.Fatalf("sing-box subscription did not unmarshal: %v\n%s", err, singBoxBody)
+	}
+	if len(singBox.Outbounds) != 1 {
+		t.Fatalf("outbounds len = %d, want 1", len(singBox.Outbounds))
+	}
+	out := singBox.Outbounds[0]
+	if out.Type != model.ProxyProtocolVLESS || out.Tag != "Node A - VLESS Reality 443" || out.Server != "jp1.dns.roobli.org" || out.ServerPort != 443 {
+		t.Fatalf("unexpected sing-box outbound: %+v", out)
+	}
+	if out.UUID != "11111111-1111-4111-8111-111111111111" || out.Flow != "xtls-rprx-vision" || out.Network != "tcp" {
+		t.Fatalf("unexpected VLESS fields: %+v", out)
+	}
+	if !out.TLS.Enabled || out.TLS.ServerName != "cdn.example.com" || strings.Join(out.TLS.ALPN, ",") != "h2,http/1.1" {
+		t.Fatalf("unexpected TLS fields: %+v", out.TLS)
+	}
+	if !out.TLS.UTLS.Enabled || out.TLS.UTLS.Fingerprint != "chrome" {
+		t.Fatalf("unexpected uTLS fields: %+v", out.TLS.UTLS)
+	}
+	if !out.TLS.Reality.Enabled || out.TLS.Reality.PublicKey != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || out.TLS.Reality.ShortID != "0123456789abcdef" {
+		t.Fatalf("unexpected REALITY fields: %+v", out.TLS.Reality)
+	}
+
+	clashBody := string(ClashMetaSubscription(endpoints))
+	for _, want := range []string{
+		`proxies:`,
+		`name: "Node A - VLESS Reality 443"`,
+		`type: vless`,
+		`server: "jp1.dns.roobli.org"`,
+		`port: 443`,
+		`uuid: "11111111-1111-4111-8111-111111111111"`,
+		`network: tcp`,
+		`tls: true`,
+		`flow: "xtls-rprx-vision"`,
+		`packet-encoding: xudp`,
+		`encryption: ""`,
+		`servername: "cdn.example.com"`,
+		`client-fingerprint: "chrome"`,
+		`reality-opts:`,
+		`public-key: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"`,
+		`short-id: "0123456789abcdef"`,
+	} {
+		if !strings.Contains(clashBody, want) {
+			t.Fatalf("clash subscription missing %q:\n%s", want, clashBody)
+		}
+	}
+
+	for _, leak := range []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "sub-token-secret", "proxy-password-secret", `"sub_token"`} {
+		if strings.Contains(string(singBoxBody), leak) || strings.Contains(clashBody, leak) {
+			t.Fatalf("subscription format leaked %q:\nsing-box=%s\nclash=%s", leak, singBoxBody, clashBody)
+		}
 	}
 }
 

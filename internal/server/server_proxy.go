@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -28,13 +29,14 @@ import (
 )
 
 var (
-	proxyIDRe       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
-	proxyALPNRe     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9./+-]{0,31}$`)
-	proxyShortIDRe  = regexp.MustCompile(`^[0-9a-fA-F]{2,16}$`)
-	proxyKeyRe      = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
-	proxySubTokenRe = regexp.MustCompile(`^[A-Za-z0-9_-]{32,256}$`)
-	proxyUUIDRe     = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	proxySHA256Re   = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+	proxyIDRe          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`)
+	proxyALPNRe        = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9./+-]{0,31}$`)
+	proxyShortIDRe     = regexp.MustCompile(`^[0-9a-fA-F]{2,16}$`)
+	proxyKeyRe         = regexp.MustCompile(`^[A-Za-z0-9_-]{16,128}$`)
+	proxySubTokenRe    = regexp.MustCompile(`^[A-Za-z0-9_-]{32,256}$`)
+	proxyFingerprintRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+	proxyUUIDRe        = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	proxySHA256Re      = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
 )
 
 const (
@@ -182,7 +184,7 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	links, warnings, err := proxycore.VLESSRealityLinks(user, s.proxySubscriptionProfiles(), s.store.ProxyInbounds(), proxycore.SubscriptionOptions{Now: s.now()})
+	endpoints, warnings, err := proxycore.VLESSRealityEndpoints(user, s.proxySubscriptionProfiles(), s.store.ProxyInbounds(), proxycore.SubscriptionOptions{Now: s.now()})
 	if err != nil {
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
@@ -196,12 +198,24 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	body := proxycore.Base64Subscription(links)
-	if format == proxycore.SubscriptionFormatPlain {
-		body = proxycore.PlainSubscription(links)
+	body, contentType, err := proxySubscriptionBody(format, endpoints)
+	if err != nil {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			ActorID:  user.ID,
+			Action:   "proxy.subscription.fetch",
+			Decision: "deny",
+			Reason:   "subscription encode failed",
+			Metadata: map[string]string{"token_sha256": tokenHash, "user_id": user.ID},
+		})
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if contentType == "" {
+		contentType = "text/plain; charset=utf-8"
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Subscription-Userinfo", proxycore.SubscriptionUserinfo(user))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
@@ -214,10 +228,31 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 			"token_sha256":  tokenHash,
 			"user_id":       user.ID,
 			"format":        format,
-			"link_count":    strconv.Itoa(len(links)),
+			"link_count":    strconv.Itoa(len(endpoints)),
 			"warning_count": strconv.Itoa(len(warnings)),
 		},
 	})
+}
+
+func proxySubscriptionBody(format string, endpoints []proxycore.VLESSRealityEndpoint) ([]byte, string, error) {
+	links := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		links = append(links, endpoint.Link())
+	}
+	sort.Strings(links)
+	switch format {
+	case proxycore.SubscriptionFormatPlain:
+		return proxycore.PlainSubscription(links), "text/plain; charset=utf-8", nil
+	case proxycore.SubscriptionFormatBase64:
+		return proxycore.Base64Subscription(links), "text/plain; charset=utf-8", nil
+	case proxycore.SubscriptionFormatSingBox:
+		body, err := proxycore.SingBoxClientSubscription(endpoints)
+		return body, "application/json; charset=utf-8", err
+	case proxycore.SubscriptionFormatClash, proxycore.SubscriptionFormatClashMeta:
+		return proxycore.ClashMetaSubscription(endpoints), "text/yaml; charset=utf-8", nil
+	default:
+		return nil, "", errors.New("unsupported subscription format")
+	}
 }
 
 func subscriptionTokenFromPath(value string) (string, bool) {
@@ -237,6 +272,12 @@ func normalizeProxySubscriptionFormat(value string) (string, error) {
 		return proxycore.SubscriptionFormatBase64, nil
 	case proxycore.SubscriptionFormatPlain:
 		return proxycore.SubscriptionFormatPlain, nil
+	case proxycore.SubscriptionFormatSingBox:
+		return proxycore.SubscriptionFormatSingBox, nil
+	case proxycore.SubscriptionFormatClash:
+		return proxycore.SubscriptionFormatClash, nil
+	case proxycore.SubscriptionFormatClashMeta, "clash.meta", "clashmeta":
+		return proxycore.SubscriptionFormatClashMeta, nil
 	default:
 		return "", errors.New("unsupported subscription format")
 	}
@@ -1292,8 +1333,8 @@ func (s *Server) normalizeProxyInbound(req, existing model.ProxyInbound, hadExis
 	}
 	out.ALPN = alpn
 	out.Fingerprint = strings.TrimSpace(req.Fingerprint)
-	if out.Fingerprint != "" {
-		return model.ProxyInbound{}, errors.New("fingerprint is subscription metadata and is not supported until the subscription slice")
+	if out.Fingerprint != "" && !proxyFingerprintRe.MatchString(out.Fingerprint) {
+		return model.ProxyInbound{}, errors.New("invalid fingerprint")
 	}
 	out.CertPath = strings.TrimSpace(req.CertPath)
 	out.KeyPath = strings.TrimSpace(req.KeyPath)

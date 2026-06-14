@@ -3170,6 +3170,7 @@ func nftPolicyDomainRefreshInstallScript(updateCommands string) string {
 		refreshScript = "/etc/lattice/nftpolicy-domain-refresh.sh"
 		servicePath   = "/etc/systemd/system/lattice-nftpolicy-domain-refresh.service"
 		timerPath     = "/etc/systemd/system/lattice-nftpolicy-domain-refresh.timer"
+		cronPath      = "/etc/cron.d/lattice-nftpolicy-domain-refresh"
 		systemdCheck  = "command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]"
 	)
 	script := "#!/bin/sh\n" +
@@ -3193,8 +3194,12 @@ func nftPolicyDomainRefreshInstallScript(updateCommands string) string {
 		"Unit=lattice-nftpolicy-domain-refresh.service\n\n" +
 		"[Install]\n" +
 		"WantedBy=timers.target\n"
+	cron := "SHELL=/bin/sh\n" +
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
+		"* * * * * root " + refreshScript + " >/dev/null 2>&1\n"
 	return "if " + systemdCheck + "; then\n" +
 		"  systemctl disable --now lattice-nftpolicy-domain-refresh.timer 2>/dev/null || true\n" +
+		"  rm -f " + shellQuote(cronPath) + "\n" +
 		"fi\n" +
 		heredocWrite(refreshScript, "LATTICE_NFT_DOMAIN_REFRESH_EOF", script) +
 		"chmod 0700 " + shellQuote(refreshScript) + "\n" +
@@ -3206,18 +3211,29 @@ func nftPolicyDomainRefreshInstallScript(updateCommands string) string {
 		"  systemctl enable --now lattice-nftpolicy-domain-refresh.timer\n" +
 		"  echo 'lattice nftpolicy: periodic domain refresh timer installed'\n" +
 		"else\n" +
-		"  echo 'lattice nftpolicy: systemd runtime not available; periodic domain refresh timer skipped' >&2\n" +
+		"  rm -f " + shellQuote(servicePath) + " " + shellQuote(timerPath) + "\n" +
+		"  if [ -d /etc/cron.d ]; then\n" +
+		heredocWrite(cronPath, "LATTICE_NFT_DOMAIN_REFRESH_CRON_EOF", cron) +
+		"    chmod 0644 " + shellQuote(cronPath) + "\n" +
+		"    echo 'lattice nftpolicy: periodic domain refresh cron installed'\n" +
+		"  else\n" +
+		"    rm -f " + shellQuote(cronPath) + "\n" +
+		"    echo 'lattice nftpolicy: no systemd runtime or /etc/cron.d; periodic domain refresh scheduler skipped' >&2\n" +
+		"  fi\n" +
 		"fi\n"
 }
 
 func nftPolicyDomainRefreshCleanupScript() string {
-	const systemdCheck = "command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]"
+	const (
+		cronPath     = "/etc/cron.d/lattice-nftpolicy-domain-refresh"
+		systemdCheck = "command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]"
+	)
 	return "if " + systemdCheck + "; then\n" +
 		"  systemctl disable --now lattice-nftpolicy-domain-refresh.timer 2>/dev/null || true\n" +
-		"  rm -f /etc/systemd/system/lattice-nftpolicy-domain-refresh.service /etc/systemd/system/lattice-nftpolicy-domain-refresh.timer\n" +
+		"fi\n" +
+		"rm -f /etc/systemd/system/lattice-nftpolicy-domain-refresh.service /etc/systemd/system/lattice-nftpolicy-domain-refresh.timer " + shellQuote(cronPath) + "\n" +
+		"if " + systemdCheck + "; then\n" +
 		"  systemctl daemon-reload 2>/dev/null || true\n" +
-		"else\n" +
-		"  rm -f /etc/systemd/system/lattice-nftpolicy-domain-refresh.service /etc/systemd/system/lattice-nftpolicy-domain-refresh.timer\n" +
 		"fi\n" +
 		"rm -f /etc/lattice/nftpolicy-domain-refresh.sh\n"
 }

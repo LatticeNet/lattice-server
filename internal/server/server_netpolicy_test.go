@@ -210,6 +210,7 @@ func TestNetPolicyPlanApproveAndResultUpdatesPolicy(t *testing.T) {
 	}
 	for _, needle := range []string{
 		"systemctl disable --now lattice-nftpolicy-domain-refresh.timer",
+		"/etc/cron.d/lattice-nftpolicy-domain-refresh",
 		"rm -f /etc/lattice/nftpolicy-domain-refresh.sh",
 	} {
 		if !strings.Contains(task.Script, needle) {
@@ -425,8 +426,12 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 		"OnUnitActiveSec=60s",
 		"chmod 0700 '/etc/lattice/nftpolicy-domain-refresh.sh'",
 		"chmod 0644 '/etc/systemd/system/lattice-nftpolicy-domain-refresh.service' '/etc/systemd/system/lattice-nftpolicy-domain-refresh.timer'",
-		"systemd runtime not available; periodic domain refresh timer skipped",
 		"systemctl enable --now lattice-nftpolicy-domain-refresh.timer",
+		"/etc/cron.d/lattice-nftpolicy-domain-refresh",
+		"* * * * * root /etc/lattice/nftpolicy-domain-refresh.sh >/dev/null 2>&1",
+		"chmod 0644 '/etc/cron.d/lattice-nftpolicy-domain-refresh'",
+		"periodic domain refresh cron installed",
+		"no systemd runtime or /etc/cron.d; periodic domain refresh scheduler skipped",
 	} {
 		if !strings.Contains(domainTasks[0].Script, needle) {
 			t.Fatalf("domain apply script missing %q:\n%s", needle, domainTasks[0].Script)
@@ -564,6 +569,8 @@ func TestNetPolicyPlanBindsOperatorDomainRemoteSets(t *testing.T) {
 		"--selfcheck-controlplane -server 'https://203.0.113.99'",
 		"/etc/lattice/nftpolicy-domain-refresh.sh",
 		"lattice-nftpolicy-domain-refresh.timer",
+		"/etc/cron.d/lattice-nftpolicy-domain-refresh",
+		"periodic domain refresh cron installed",
 	} {
 		if !strings.Contains(script, needle) {
 			t.Fatalf("domain remote apply script missing %q:\n%s", needle, script)

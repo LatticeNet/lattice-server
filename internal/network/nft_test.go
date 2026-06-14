@@ -82,6 +82,29 @@ func TestGenerateNFTPlanComposesInputRulesBeforeBroadAllows(t *testing.T) {
 	}
 }
 
+func TestGenerateNFTPlanRendersIPv6InputRules(t *testing.T) {
+	plan, err := GenerateNFTPlan(NFTPlan{
+		InputRules: []NFTInputRule{{
+			SourceCIDRs: []string{"2001:db8::2", "198.51.100.2"},
+			Protocol:    NFTProtoUDP,
+			Ports:       []int{51820},
+			Action:      NFTActionAccept,
+			Comment:     "dual stack peer",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`ip saddr 198.51.100.2 udp dport { 51820 } accept comment "dual stack peer"`,
+		`ip6 saddr 2001:db8::2 udp dport { 51820 } accept comment "dual stack peer"`,
+	} {
+		if !strings.Contains(plan, want) {
+			t.Fatalf("plan missing %q:\n%s", want, plan)
+		}
+	}
+}
+
 func TestGenerateNFTPlanRejectsBadInputRule(t *testing.T) {
 	cases := []NFTInputRule{
 		{SourceCIDRs: []string{"}; evil"}, Protocol: NFTProtoTCP, Action: NFTActionDrop},

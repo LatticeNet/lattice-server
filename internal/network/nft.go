@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strconv"
@@ -61,7 +62,9 @@ func GenerateNFTPlan(p NFTPlan) (string, error) {
 	fmt.Fprintf(&b, "    ct state established,related accept\n")
 	fmt.Fprintf(&b, "    iif lo accept\n")
 	for _, rule := range p.InputRules {
-		fmt.Fprintf(&b, "    %s\n", renderInputRule(rule))
+		for _, line := range renderInputRule(rule) {
+			fmt.Fprintf(&b, "    %s\n", line)
+		}
 	}
 	if len(p.PublicTCP) > 0 {
 		fmt.Fprintf(&b, "    iifname \"%s\" tcp dport { %s } accept comment \"public lattice tcp ports\"\n", p.InterfaceName, joinPorts(p.PublicTCP))
@@ -186,50 +189,113 @@ func normalizeSourceCIDRs(values []string) ([]string, error) {
 func normalizeSourceCIDR(value string) (string, error) {
 	if ip := net.ParseIP(value); ip != nil {
 		v4 := ip.To4()
-		if v4 == nil {
-			return "", fmt.Errorf("source %q must be IPv4", value)
+		if v4 != nil {
+			return v4.String(), nil
 		}
-		return v4.String(), nil
+		if ip.To16() != nil {
+			return ip.String(), nil
+		}
 	}
 	ip, ipNet, err := net.ParseCIDR(value)
 	if err != nil {
 		return "", fmt.Errorf("invalid source %q", value)
 	}
-	if ip.To4() == nil || ipNet.IP.To4() == nil {
-		return "", fmt.Errorf("source %q must be IPv4", value)
+	if ip.To4() != nil && ipNet.IP.To4() != nil {
+		if ones, bits := ipNet.Mask.Size(); bits == 32 && ones == 32 {
+			return ipNet.IP.To4().String(), nil
+		}
+		return ipNet.String(), nil
 	}
-	if ones, bits := ipNet.Mask.Size(); bits == 32 && ones == 32 {
-		return ipNet.IP.To4().String(), nil
+	if ip.To16() != nil && ip.To4() == nil && ipNet.IP.To16() != nil {
+		if ones, bits := ipNet.Mask.Size(); bits == 128 && ones == 128 {
+			return ipNet.IP.String(), nil
+		}
+		return ipNet.String(), nil
 	}
-	return ipNet.String(), nil
+	return "", fmt.Errorf("invalid source %q", value)
 }
 
 func sourceCIDRSortKey(value string) string {
-	if ip := net.ParseIP(value); ip != nil {
-		return ip.To4().String() + "/32"
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		family := "4:"
+		if prefix.Addr().Is6() && !prefix.Addr().Is4In6() {
+			family = "6:"
+		}
+		return family + prefix.String()
+	}
+	if addr, err := netip.ParseAddr(value); err == nil {
+		family := "4:"
+		if addr.Is6() && !addr.Is4In6() {
+			family = "6:"
+		}
+		return family + addr.String()
 	}
 	return value
 }
 
-func renderInputRule(rule NFTInputRule) string {
-	parts := []string{}
-	if len(rule.SourceCIDRs) == 1 {
-		parts = append(parts, "ip saddr "+rule.SourceCIDRs[0])
-	} else if len(rule.SourceCIDRs) > 1 {
-		parts = append(parts, "ip saddr { "+strings.Join(rule.SourceCIDRs, ", ")+" }")
+func renderInputRule(rule NFTInputRule) []string {
+	sourceExprs := inputSourceExprs(rule.SourceCIDRs)
+	if len(sourceExprs) == 0 {
+		sourceExprs = []string{""}
 	}
-	if rule.Protocol != NFTProtoAny {
-		if len(rule.Ports) == 0 {
-			parts = append(parts, "meta l4proto "+rule.Protocol)
-		} else {
-			parts = append(parts, rule.Protocol+" dport { "+joinPorts(rule.Ports)+" }")
+	lines := make([]string, 0, len(sourceExprs))
+	for _, sourceExpr := range sourceExprs {
+		parts := []string{}
+		if sourceExpr != "" {
+			parts = append(parts, sourceExpr)
+		}
+		if rule.Protocol != NFTProtoAny {
+			if len(rule.Ports) == 0 {
+				parts = append(parts, "meta l4proto "+rule.Protocol)
+			} else {
+				parts = append(parts, rule.Protocol+" dport { "+joinPorts(rule.Ports)+" }")
+			}
+		}
+		parts = append(parts, rule.Action)
+		if rule.Comment != "" {
+			parts = append(parts, "comment", strconv.Quote(rule.Comment))
+		}
+		lines = append(lines, strings.Join(parts, " "))
+	}
+	return lines
+}
+
+func inputSourceExprs(values []string) []string {
+	var v4, v6 []string
+	for _, value := range values {
+		if addr, ok := sourceAddr(value); ok {
+			if addr.Is4() {
+				v4 = append(v4, value)
+			} else if addr.Is6() && !addr.Is4In6() {
+				v6 = append(v6, value)
+			}
 		}
 	}
-	parts = append(parts, rule.Action)
-	if rule.Comment != "" {
-		parts = append(parts, "comment", strconv.Quote(rule.Comment))
+	out := make([]string, 0, 2)
+	if len(v4) > 0 {
+		out = append(out, sourceExpr("ip", v4))
 	}
-	return strings.Join(parts, " ")
+	if len(v6) > 0 {
+		out = append(out, sourceExpr("ip6", v6))
+	}
+	return out
+}
+
+func sourceAddr(value string) (netip.Addr, bool) {
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		return prefix.Addr(), true
+	}
+	if addr, err := netip.ParseAddr(value); err == nil {
+		return addr, true
+	}
+	return netip.Addr{}, false
+}
+
+func sourceExpr(family string, values []string) string {
+	if len(values) == 1 {
+		return family + " saddr " + values[0]
+	}
+	return family + " saddr { " + strings.Join(values, ", ") + " }"
 }
 
 func normalizePorts(ports []int) ([]int, error) {

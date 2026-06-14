@@ -44,7 +44,7 @@ func TestNormalizePolicyRejectsUnsafeInputs(t *testing.T) {
 		{name: "missing target", policy: model.NetPolicy{}},
 		{name: "unknown target", policy: model.NetPolicy{TargetNodeID: "missing"}},
 		{name: "unknown remote node", policy: basePolicy(model.NetEndpoint{Kind: model.NetRefNode, NodeID: "missing"}, model.NetProtoTCP, []int{22})},
-		{name: "ipv6 cidr", policy: basePolicy(model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "2001:db8::/32"}, model.NetProtoTCP, []int{22})},
+		{name: "bad cidr", policy: basePolicy(model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "not-a-cidr"}, model.NetProtoTCP, []int{22})},
 		{name: "bad port", policy: basePolicy(model.NetEndpoint{Kind: model.NetRefAny}, model.NetProtoTCP, []int{70000})},
 		{name: "any with ports", policy: basePolicy(model.NetEndpoint{Kind: model.NetRefAny}, model.NetProtoAny, []int{53})},
 		{name: "duplicate rule id", policy: model.NetPolicy{
@@ -62,6 +62,27 @@ func TestNormalizePolicyRejectsUnsafeInputs(t *testing.T) {
 				t.Fatal("expected rejection")
 			}
 		})
+	}
+}
+
+func TestNormalizePolicyCanonicalizesIPv6CIDR(t *testing.T) {
+	policy, err := NormalizePolicy(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{{
+			ID:        "deny-v6",
+			Action:    model.NetRuleDeny,
+			Direction: model.NetDirEgress,
+			Protocol:  model.NetProtoTCP,
+			Ports:     []int{443},
+			Remote:    model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "2001:db8::1/32"},
+		}},
+	}, testResolver("node-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Rules[0].Remote.CIDR; got != "2001:db8::/32" {
+		t.Fatalf("ipv6 cidr = %q", got)
 	}
 }
 

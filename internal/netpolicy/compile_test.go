@@ -134,6 +134,49 @@ func TestCompileEgressRulesetRendersIPv6ControlPlane(t *testing.T) {
 	}
 }
 
+func TestCompileEgressRulesetRendersIPv6Remotes(t *testing.T) {
+	nodes := map[string]model.Node{
+		"node-a": {ID: "node-a", WireGuardIP: "10.66.0.1/32", PublicIP: "203.0.113.10"},
+		"node-b": {ID: "node-b", PublicIPv6: "2001:db8::2"},
+	}
+	got, err := CompileEgressRuleset(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{
+			{
+				ID:        "deny-v6-cidr",
+				Action:    model.NetRuleDeny,
+				Direction: model.NetDirEgress,
+				Protocol:  model.NetProtoTCP,
+				Ports:     []int{443},
+				Remote:    model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "2001:db8::/32"},
+			},
+			{
+				ID:        "allow-node-v6",
+				Action:    model.NetRuleAllow,
+				Direction: model.NetDirEgress,
+				Protocol:  model.NetProtoUDP,
+				Ports:     []int{51820},
+				Remote:    model.NetEndpoint{Kind: model.NetRefNode, NodeID: "node-b"},
+			},
+		},
+	}, func(id string) (model.Node, bool) {
+		n, ok := nodes[id]
+		return n, ok
+	}, CompileOptions{ControlPlaneIPv4: netip.MustParseAddr("203.0.113.99"), ControlPlanePort: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{
+		"ip6 daddr 2001:db8::/32 tcp dport 443 drop comment \"lattice rule deny-v6-cidr\"",
+		"ip6 daddr 2001:db8::2 udp dport 51820 accept comment \"lattice rule allow-node-v6\"",
+	} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("compiled IPv6 remote ruleset missing %q:\n%s", needle, got)
+		}
+	}
+}
+
 func TestCompileEgressRulesetRejectsAmbiguousControlPlane(t *testing.T) {
 	_, err := CompileEgressRuleset(model.NetPolicy{
 		TargetNodeID: "node-a",
@@ -166,12 +209,12 @@ func TestCompileEgressRulesetRejectsIngress(t *testing.T) {
 	}
 }
 
-func TestCompileEgressRulesetRejectsNodeWithoutIPv4(t *testing.T) {
+func TestCompileEgressRulesetRendersIPv6OnlyNodeRemote(t *testing.T) {
 	nodes := map[string]model.Node{
 		"node-a": {ID: "node-a", WireGuardIP: "10.66.0.1"},
 		"node-b": {ID: "node-b", PublicIPv6: "2001:db8::2"},
 	}
-	_, err := CompileEgressRuleset(model.NetPolicy{
+	got, err := CompileEgressRuleset(model.NetPolicy{
 		TargetNodeID: "node-a",
 		Enabled:      true,
 		Rules: []model.NetRule{{
@@ -186,8 +229,11 @@ func TestCompileEgressRulesetRejectsNodeWithoutIPv4(t *testing.T) {
 		n, ok := nodes[id]
 		return n, ok
 	}, CompileOptions{ControlPlaneIPv4: netip.MustParseAddr("203.0.113.99"), ControlPlanePort: 443})
-	if err == nil || !strings.Contains(err.Error(), "no IPv4 address") {
-		t.Fatalf("expected no IPv4 error, got %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "ip6 daddr 2001:db8::2 tcp dport 443 drop comment \"lattice rule deny-node-b\"") {
+		t.Fatalf("IPv6-only node remote did not compile:\n%s", got)
 	}
 }
 
@@ -250,12 +296,12 @@ func TestCompileIngressInputRulesForGuard(t *testing.T) {
 	}
 }
 
-func TestCompileIngressInputRulesRejectsNodeWithoutIPv4(t *testing.T) {
+func TestCompileIngressInputRulesRendersIPv6OnlyNodeRemote(t *testing.T) {
 	nodes := map[string]model.Node{
 		"node-a": {ID: "node-a", WireGuardIP: "10.66.0.1"},
 		"node-b": {ID: "node-b", PublicIPv6: "2001:db8::2"},
 	}
-	_, err := CompileIngressInputRules(model.NetPolicy{
+	rules, err := CompileIngressInputRules(model.NetPolicy{
 		TargetNodeID: "node-a",
 		Enabled:      true,
 		Rules: []model.NetRule{{
@@ -270,7 +316,10 @@ func TestCompileIngressInputRulesRejectsNodeWithoutIPv4(t *testing.T) {
 		n, ok := nodes[id]
 		return n, ok
 	})
-	if err == nil || !strings.Contains(err.Error(), "no IPv4 address") {
-		t.Fatalf("expected no IPv4 error, got %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 || strings.Join(rules[0].SourceCIDRs, ",") != "2001:db8::2" {
+		t.Fatalf("IPv6-only ingress node remote did not compile: %+v", rules)
 	}
 }

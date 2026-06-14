@@ -70,13 +70,15 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 		if rule.Disabled {
 			continue
 		}
-		line, err := compileEgressRule(rule, target, resolve)
+		lines, err := compileEgressRule(rule, target, resolve)
 		if err != nil {
 			return "", err
 		}
-		b.WriteString("\t\t")
-		b.WriteString(line)
-		b.WriteByte('\n')
+		for _, line := range lines {
+			b.WriteString("\t\t")
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
 	}
 
 	b.WriteString("\t\tcounter drop comment \"lattice default drop\"\n")
@@ -186,10 +188,11 @@ func ingressSourceCIDRs(rule model.NetRule, target model.Node, resolve NodeResol
 		if !ok {
 			return nil, fmt.Errorf("rule %s remote node %q not found", rule.ID, rule.Remote.NodeID)
 		}
-		addrs := nodeIPv4s(remote)
-		if len(addrs) == 0 {
-			return nil, fmt.Errorf("rule %s remote node %q has no IPv4 address to compile", rule.ID, rule.Remote.NodeID)
+		v4, v6 := nodeIPAddrs(remote)
+		if len(v4)+len(v6) == 0 {
+			return nil, fmt.Errorf("rule %s remote node %q has no IP address to compile", rule.ID, rule.Remote.NodeID)
 		}
+		addrs := append(v4, v6...)
 		return addrs, nil
 	default:
 		return nil, fmt.Errorf("rule %s has invalid remote kind %q", rule.ID, rule.Remote.Kind)
@@ -214,54 +217,65 @@ func nftInputAction(action string) string {
 	return network.NFTActionDrop
 }
 
-func compileEgressRule(rule model.NetRule, target model.Node, resolve NodeResolver) (string, error) {
-	parts := []string{}
-	remoteExpr, err := egressRemoteExpr(rule, target, resolve)
+func compileEgressRule(rule model.NetRule, target model.Node, resolve NodeResolver) ([]string, error) {
+	remoteExprs, err := egressRemoteExprs(rule, target, resolve)
 	if err != nil {
-		return "", err
-	}
-	if remoteExpr != "" {
-		parts = append(parts, remoteExpr)
+		return nil, err
 	}
 	protoExpr, err := egressProtoExpr(rule)
 	if err != nil {
-		return "", err
-	}
-	if protoExpr != "" {
-		parts = append(parts, protoExpr)
+		return nil, err
 	}
 	action := "drop"
 	if rule.Action == model.NetRuleAllow {
 		action = "accept"
 	}
-	parts = append(parts, action, "comment", strconv.Quote(ruleComment(rule)))
-	return strings.Join(parts, " "), nil
+	if len(remoteExprs) == 0 {
+		remoteExprs = []string{""}
+	}
+	lines := make([]string, 0, len(remoteExprs))
+	for _, remoteExpr := range remoteExprs {
+		parts := []string{}
+		if remoteExpr != "" {
+			parts = append(parts, remoteExpr)
+		}
+		if protoExpr != "" {
+			parts = append(parts, protoExpr)
+		}
+		parts = append(parts, action, "comment", strconv.Quote(ruleComment(rule)))
+		lines = append(lines, strings.Join(parts, " "))
+	}
+	return lines, nil
 }
 
-func egressRemoteExpr(rule model.NetRule, target model.Node, resolve NodeResolver) (string, error) {
+func egressRemoteExprs(rule model.NetRule, target model.Node, resolve NodeResolver) ([]string, error) {
 	switch rule.Remote.Kind {
 	case model.NetRefAny:
-		return "", nil
+		return nil, nil
 	case model.NetRefCIDR:
-		return "ip daddr " + rule.Remote.CIDR, nil
+		return []string{nftAddrExpr("daddr", []string{rule.Remote.CIDR})}, nil
 	case model.NetRefNode:
 		if rule.Remote.NodeID == target.ID {
-			return "", fmt.Errorf("rule %s remote node cannot be the target node", rule.ID)
+			return nil, fmt.Errorf("rule %s remote node cannot be the target node", rule.ID)
 		}
 		remote, ok := resolve(rule.Remote.NodeID)
 		if !ok {
-			return "", fmt.Errorf("rule %s remote node %q not found", rule.ID, rule.Remote.NodeID)
+			return nil, fmt.Errorf("rule %s remote node %q not found", rule.ID, rule.Remote.NodeID)
 		}
-		addrs := nodeIPv4s(remote)
-		if len(addrs) == 0 {
-			return "", fmt.Errorf("rule %s remote node %q has no IPv4 address to compile", rule.ID, rule.Remote.NodeID)
+		v4, v6 := nodeIPAddrs(remote)
+		if len(v4)+len(v6) == 0 {
+			return nil, fmt.Errorf("rule %s remote node %q has no IP address to compile", rule.ID, rule.Remote.NodeID)
 		}
-		if len(addrs) == 1 {
-			return "ip daddr " + addrs[0], nil
+		exprs := make([]string, 0, 2)
+		if len(v4) > 0 {
+			exprs = append(exprs, nftAddrExpr("daddr", v4))
 		}
-		return "ip daddr { " + strings.Join(addrs, ", ") + " }", nil
+		if len(v6) > 0 {
+			exprs = append(exprs, nftAddrExpr("daddr", v6))
+		}
+		return exprs, nil
 	default:
-		return "", fmt.Errorf("rule %s has invalid remote kind %q", rule.ID, rule.Remote.Kind)
+		return nil, fmt.Errorf("rule %s has invalid remote kind %q", rule.ID, rule.Remote.Kind)
 	}
 }
 
@@ -293,13 +307,37 @@ func nftPortSet(ports []int) string {
 	return "{ " + strings.Join(out, ", ") + " }"
 }
 
-func nodeIPv4s(node model.Node) []string {
-	seen := map[string]struct{}{}
-	for _, raw := range []string{node.WireGuardIP, node.PublicIP} {
-		if addr, ok := parseNodeIPv4(raw); ok {
-			seen[addr.String()] = struct{}{}
+func nftAddrExpr(field string, addrs []string) string {
+	family := "ip"
+	if len(addrs) > 0 {
+		if addr, ok := parseNodeAddr(addrs[0]); ok && addr.Is6() && !addr.Is4In6() {
+			family = "ip6"
 		}
 	}
+	if len(addrs) == 1 {
+		return family + " " + field + " " + addrs[0]
+	}
+	return family + " " + field + " { " + strings.Join(addrs, ", ") + " }"
+}
+
+func nodeIPAddrs(node model.Node) ([]string, []string) {
+	v4Seen := map[string]struct{}{}
+	v6Seen := map[string]struct{}{}
+	for _, raw := range []string{node.WireGuardIP, node.PublicIP, node.PublicIPv6} {
+		if addr, ok := parseNodeAddr(raw); ok {
+			if addr.Is4() {
+				v4Seen[addr.String()] = struct{}{}
+			} else if addr.Is6() && !addr.Is4In6() {
+				v6Seen[addr.String()] = struct{}{}
+			}
+		}
+	}
+	v4 := sortedAddrs(v4Seen)
+	v6 := sortedAddrs(v6Seen)
+	return v4, v6
+}
+
+func sortedAddrs(seen map[string]struct{}) []string {
 	out := make([]string, 0, len(seen))
 	for addr := range seen {
 		out = append(out, addr)
@@ -310,17 +348,17 @@ func nodeIPv4s(node model.Node) []string {
 	return out
 }
 
-func parseNodeIPv4(raw string) (netip.Addr, bool) {
+func parseNodeAddr(raw string) (netip.Addr, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return netip.Addr{}, false
 	}
 	if prefix, err := netip.ParsePrefix(raw); err == nil {
 		addr := prefix.Addr()
-		return addr, addr.Is4()
+		return addr, addr.Is4() || (addr.Is6() && !addr.Is4In6())
 	}
 	addr, err := netip.ParseAddr(raw)
-	if err != nil || !addr.Is4() {
+	if err != nil || !(addr.Is4() || (addr.Is6() && !addr.Is4In6())) {
 		return netip.Addr{}, false
 	}
 	return addr, true

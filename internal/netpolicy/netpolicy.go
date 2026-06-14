@@ -188,7 +188,7 @@ func normalizeEndpoint(endpoint model.NetEndpoint, resolve NodeResolver) (model.
 		}
 		endpoint.CIDR = ""
 	case model.NetRefCIDR:
-		cidr, err := normalizeIPv4CIDR(endpoint.CIDR)
+		cidr, err := normalizeIPCIDR(endpoint.CIDR)
 		if err != nil {
 			return model.NetEndpoint{}, err
 		}
@@ -203,26 +203,31 @@ func normalizeEndpoint(endpoint model.NetEndpoint, resolve NodeResolver) (model.
 	return endpoint, nil
 }
 
-func normalizeIPv4CIDR(value string) (string, error) {
+func normalizeIPCIDR(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return "", errors.New("cidr is required")
 	}
 	if ip := net.ParseIP(value); ip != nil {
 		v4 := ip.To4()
-		if v4 == nil {
-			return "", errors.New("ipv6 is not supported in netpolicy MVP")
+		if v4 != nil {
+			return v4.String(), nil
 		}
-		return v4.String(), nil
+		if ip.To16() != nil {
+			return ip.String(), nil
+		}
 	}
 	ip, ipNet, err := net.ParseCIDR(value)
 	if err != nil {
 		return "", fmt.Errorf("invalid cidr %q", value)
 	}
-	if ip.To4() == nil || ipNet.IP.To4() == nil {
-		return "", errors.New("ipv6 is not supported in netpolicy MVP")
+	if ip.To4() != nil && ipNet.IP.To4() != nil {
+		return ipNet.String(), nil
 	}
-	return ipNet.String(), nil
+	if ip.To16() != nil && ip.To4() == nil && ipNet.IP.To16() != nil {
+		return ipNet.String(), nil
+	}
+	return "", fmt.Errorf("invalid cidr %q", value)
 }
 
 func normalizePorts(values []int) ([]int, error) {

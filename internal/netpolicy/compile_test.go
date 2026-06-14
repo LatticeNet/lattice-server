@@ -85,8 +85,11 @@ func TestCompileEgressRulesetRendersDomainControlPlaneSet(t *testing.T) {
 	for _, needle := range []string{
 		"set lattice_control4",
 		"type ipv4_addr",
+		"set lattice_control6",
+		"type ipv6_addr",
 		"flags interval",
 		"ip daddr @lattice_control4 tcp dport 443 accept comment \"lattice control-plane domain\"",
+		"ip6 daddr @lattice_control6 tcp dport 443 accept comment \"lattice control-plane domain6\"",
 		"udp dport 53 accept comment \"lattice dns udp\"",
 		"tcp dport 53 accept comment \"lattice dns tcp\"",
 		"tcp dport 22 drop comment \"lattice rule deny-all\"",
@@ -100,6 +103,37 @@ func TestCompileEgressRulesetRendersDomainControlPlaneSet(t *testing.T) {
 	}
 }
 
+func TestCompileEgressRulesetRendersIPv6ControlPlane(t *testing.T) {
+	got, err := CompileEgressRuleset(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{{
+			ID:        "allow-web",
+			Action:    model.NetRuleAllow,
+			Direction: model.NetDirEgress,
+			Protocol:  model.NetProtoTCP,
+			Ports:     []int{443},
+			Remote:    model.NetEndpoint{Kind: model.NetRefAny},
+		}},
+	}, func(id string) (model.Node, bool) {
+		return model.Node{ID: id, WireGuardIP: "10.66.0.1"}, true
+	}, CompileOptions{ControlPlaneIPv6: netip.MustParseAddr("2001:db8::99"), ControlPlanePort: 8443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{
+		"ip6 daddr 2001:db8::99 tcp dport 8443 accept comment \"lattice control-plane\"",
+		"tcp dport 443 accept comment \"lattice rule allow-web\"",
+	} {
+		if !strings.Contains(got, needle) {
+			t.Fatalf("compiled IPv6 ruleset missing %q:\n%s", needle, got)
+		}
+	}
+	if strings.Contains(got, "lattice_control4") || strings.Contains(got, "lattice_control6") {
+		t.Fatalf("IPv6 literal control-plane should not render domain sets:\n%s", got)
+	}
+}
+
 func TestCompileEgressRulesetRejectsAmbiguousControlPlane(t *testing.T) {
 	_, err := CompileEgressRuleset(model.NetPolicy{
 		TargetNodeID: "node-a",
@@ -107,8 +141,8 @@ func TestCompileEgressRulesetRejectsAmbiguousControlPlane(t *testing.T) {
 	}, func(id string) (model.Node, bool) {
 		return model.Node{ID: id, WireGuardIP: "10.66.0.1"}, true
 	}, CompileOptions{ControlPlaneIPv4: netip.MustParseAddr("203.0.113.99"), ControlPlaneHost: "lattice.example.com", ControlPlanePort: 443})
-	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Fatalf("expected mutually exclusive control-plane error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "exactly one control-plane") {
+		t.Fatalf("expected exactly-one control-plane error, got %v", err)
 	}
 }
 

@@ -181,9 +181,6 @@ func (s *Server) netPolicyCompileOptions() (netpolicy.CompileOptions, error) {
 	host := u.Hostname()
 	addr, err := netip.ParseAddr(host)
 	if err == nil {
-		if !addr.Is4() {
-			return netpolicy.CompileOptions{}, fmt.Errorf("public_url host %q must be IPv4 or an HTTPS hostname for netpolicy apply; IPv6 is a later design slice", host)
-		}
 		if u.Scheme == "http" && !addr.IsLoopback() {
 			return netpolicy.CompileOptions{}, errors.New("public_url must use https for non-loopback netpolicy apply")
 		}
@@ -198,7 +195,13 @@ func (s *Server) netPolicyCompileOptions() (netpolicy.CompileOptions, error) {
 		} else {
 			port = 80
 		}
-		return netpolicy.CompileOptions{ControlPlaneIPv4: addr, ControlPlanePort: port}, nil
+		if addr.Is4() {
+			return netpolicy.CompileOptions{ControlPlaneIPv4: addr, ControlPlanePort: port}, nil
+		}
+		if addr.Is6() && !addr.Is4In6() {
+			return netpolicy.CompileOptions{ControlPlaneIPv6: addr, ControlPlanePort: port}, nil
+		}
+		return netpolicy.CompileOptions{}, fmt.Errorf("public_url host %q must be IPv4, IPv6, or an HTTPS hostname for netpolicy apply", host)
 	}
 	if u.Scheme != "https" {
 		return netpolicy.CompileOptions{}, errors.New("public_url must use https when host is not an IPv4 literal")

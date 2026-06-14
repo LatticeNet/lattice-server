@@ -3055,7 +3055,7 @@ func controlPlaneDomainSetHost(serverURL string) (string, bool) {
 }
 
 func nftPolicyDomainSetUpdateScript(host string) string {
-	return "\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4\n"
+	return "\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4 -set6 lattice_control6\n"
 }
 
 func nftPolicyDomainRefreshInstallScript(host string) string {
@@ -3069,7 +3069,7 @@ func nftPolicyDomainRefreshInstallScript(host string) string {
 		"set -e\n" +
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
 		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
-		"\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4\n"
+		"\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4 -set6 lattice_control6\n"
 	service := "[Unit]\n" +
 		"Description=Lattice nftpolicy domain set refresh\n" +
 		"Documentation=https://github.com/LatticeNet/lattice\n\n" +

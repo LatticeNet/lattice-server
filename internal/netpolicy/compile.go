@@ -14,6 +14,7 @@ import (
 
 type CompileOptions struct {
 	ControlPlaneIPv4 netip.Addr
+	ControlPlaneIPv6 netip.Addr
 	ControlPlaneHost string
 	ControlPlanePort int
 }
@@ -47,6 +48,10 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 	if opts.ControlPlaneHost != "" {
 		b.WriteString("\tset lattice_control4 {\n")
 		b.WriteString("\t\ttype ipv4_addr\n")
+		b.WriteString("\t\tflags interval\n")
+		b.WriteString("\t}\n\n")
+		b.WriteString("\tset lattice_control6 {\n")
+		b.WriteString("\t\ttype ipv6_addr\n")
 		b.WriteString("\t\tflags interval\n")
 		b.WriteString("\t}\n\n")
 	}
@@ -85,29 +90,47 @@ func validateCompileOptions(opts CompileOptions) error {
 		return fmt.Errorf("invalid control-plane port %d", opts.ControlPlanePort)
 	}
 	hasIPv4 := opts.ControlPlaneIPv4.IsValid()
+	hasIPv6 := opts.ControlPlaneIPv6.IsValid()
 	hasHost := strings.TrimSpace(opts.ControlPlaneHost) != ""
+	if countTrue(hasIPv4, hasIPv6, hasHost) != 1 {
+		return errors.New("exactly one control-plane IPv4, IPv6, or host is required")
+	}
 	switch {
-	case hasIPv4 && hasHost:
-		return errors.New("control-plane IPv4 and host are mutually exclusive")
 	case hasIPv4:
 		if !opts.ControlPlaneIPv4.Is4() {
 			return errors.New("control-plane IPv4 must be IPv4")
+		}
+	case hasIPv6:
+		if !opts.ControlPlaneIPv6.Is6() || opts.ControlPlaneIPv6.Is4In6() {
+			return errors.New("control-plane IPv6 must be IPv6")
 		}
 	case hasHost:
 		if strings.TrimSpace(opts.ControlPlaneHost) != opts.ControlPlaneHost {
 			return errors.New("control-plane host must be normalized")
 		}
-	default:
-		return errors.New("control-plane IPv4 or host is required")
 	}
 	return nil
 }
 
 func controlPlaneAllowLine(opts CompileOptions) string {
 	if opts.ControlPlaneHost != "" {
-		return fmt.Sprintf("\t\tip daddr @lattice_control4 tcp dport %d accept comment \"lattice control-plane domain\"\n", opts.ControlPlanePort)
+		return fmt.Sprintf("\t\tip daddr @lattice_control4 tcp dport %d accept comment \"lattice control-plane domain\"\n", opts.ControlPlanePort) +
+			fmt.Sprintf("\t\tip6 daddr @lattice_control6 tcp dport %d accept comment \"lattice control-plane domain6\"\n", opts.ControlPlanePort)
+	}
+	if opts.ControlPlaneIPv6.IsValid() {
+		return fmt.Sprintf("\t\tip6 daddr %s tcp dport %d accept comment \"lattice control-plane\"\n", opts.ControlPlaneIPv6.String(), opts.ControlPlanePort)
 	}
 	return fmt.Sprintf("\t\tip daddr %s tcp dport %d accept comment \"lattice control-plane\"\n", opts.ControlPlaneIPv4.String(), opts.ControlPlanePort)
+}
+
+func countTrue(values ...bool) int {
+	n := 0
+	for _, value := range values {
+		if value {
+			n++
+		}
+	}
+	return n
 }
 
 // CompileIngressInputRules extracts the ingress side of a per-node NetPolicy

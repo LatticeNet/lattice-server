@@ -382,7 +382,9 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 	}
 	for _, needle := range []string{
 		"set lattice_control4",
+		"set lattice_control6",
 		"ip daddr @lattice_control4 tcp dport 443 accept comment \"lattice control-plane domain\"",
+		"ip6 daddr @lattice_control6 tcp dport 443 accept comment \"lattice control-plane domain6\"",
 		"udp dport 53 accept comment \"lattice dns udp\"",
 		"tcp dport 53 accept comment \"lattice dns tcp\"",
 	} {
@@ -404,7 +406,7 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 		t.Fatalf("approve domain plan failed: %d", approveDomain.StatusCode)
 	}
 	scriptFromChangedServerURL := applyScriptForWithServer(storedBeforeApprove, "https://203.0.113.99")
-	if !strings.Contains(scriptFromChangedServerURL, "--update-nft-domain-set -host 'lattice.example.com' -family inet -table lattice_policy -set lattice_control4") ||
+	if !strings.Contains(scriptFromChangedServerURL, "--update-nft-domain-set -host 'lattice.example.com' -family inet -table lattice_policy -set lattice_control4 -set6 lattice_control6") ||
 		!strings.Contains(scriptFromChangedServerURL, "--selfcheck-controlplane -server 'https://lattice.example.com'") {
 		t.Fatalf("nftpolicy apply script must use the plan-bound public_url, not the current server setting:\n%s", scriptFromChangedServerURL)
 	}
@@ -414,7 +416,7 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 	}
 	for _, needle := range []string{
 		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}",
-		"--update-nft-domain-set -host 'lattice.example.com' -family inet -table lattice_policy -set lattice_control4",
+		"--update-nft-domain-set -host 'lattice.example.com' -family inet -table lattice_policy -set lattice_control4 -set6 lattice_control6",
 		"--selfcheck-controlplane -server 'https://lattice.example.com'",
 		"/etc/lattice/nftpolicy-domain-refresh.sh",
 		"lattice-nftpolicy-domain-refresh.service",
@@ -454,6 +456,44 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 	httpDomainPlan.Body.Close()
 	if httpDomainPlan.StatusCode != http.StatusBadRequest {
 		t.Fatalf("HTTP domain public_url should be rejected, got %d", httpDomainPlan.StatusCode)
+	}
+
+	ipv6Handler, ipv6Store := newTestServerWithPublicURL(t, "https://[2001:db8::99]:8443")
+	ipv6Cookies, ipv6CSRF := loginSession(t, ipv6Handler)
+	enrollNamedNodeToken(t, ipv6Handler, ipv6Cookies, ipv6CSRF, "node-a", "Node A")
+	createNetPolicy(t, ipv6Handler, ipv6Cookies, ipv6CSRF, 22)
+	ipv6Plan := doJSON(t, ipv6Handler, http.MethodPost, "/api/netpolicy/plan", `{"node_id":"node-a"}`, ipv6Cookies, ipv6CSRF)
+	defer ipv6Plan.Body.Close()
+	if ipv6Plan.StatusCode != http.StatusOK {
+		t.Fatalf("IPv6 literal public_url should be accepted, got %d", ipv6Plan.StatusCode)
+	}
+	var ipv6Approval approvalView
+	if err := json.NewDecoder(ipv6Plan.Body).Decode(&ipv6Approval); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ipv6Approval.Plan, "ip6 daddr 2001:db8::99 tcp dport 8443 accept comment \"lattice control-plane\"") {
+		t.Fatalf("IPv6 literal plan missing ip6 control-plane allow:\n%s", ipv6Approval.Plan)
+	}
+	storedIPv6Approval, ok := ipv6Store.Approval(ipv6Approval.ID)
+	if !ok {
+		t.Fatalf("stored IPv6 approval missing")
+	}
+	ipv6Script := applyScriptForWithServer(storedIPv6Approval, "https://203.0.113.99")
+	if !strings.Contains(ipv6Script, "--selfcheck-controlplane -server 'https://[2001:db8::99]:8443'") {
+		t.Fatalf("IPv6 apply script must use plan-bound public_url:\n%s", ipv6Script)
+	}
+	if strings.Contains(ipv6Script, "--update-nft-domain-set") {
+		t.Fatalf("IPv6 literal apply script must not install domain updater:\n%s", ipv6Script)
+	}
+
+	httpIPv6Handler, _ := newTestServerWithPublicURL(t, "http://[2001:db8::99]")
+	httpIPv6Cookies, httpIPv6CSRF := loginSession(t, httpIPv6Handler)
+	enrollNamedNodeToken(t, httpIPv6Handler, httpIPv6Cookies, httpIPv6CSRF, "node-a", "Node A")
+	createNetPolicy(t, httpIPv6Handler, httpIPv6Cookies, httpIPv6CSRF, 22)
+	httpIPv6Plan := doJSON(t, httpIPv6Handler, http.MethodPost, "/api/netpolicy/plan", `{"node_id":"node-a"}`, httpIPv6Cookies, httpIPv6CSRF)
+	httpIPv6Plan.Body.Close()
+	if httpIPv6Plan.StatusCode != http.StatusBadRequest {
+		t.Fatalf("remote cleartext IPv6 public_url should be rejected, got %d", httpIPv6Plan.StatusCode)
 	}
 }
 

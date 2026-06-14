@@ -903,6 +903,107 @@ func TestProxyUsageReportBaselinesAndRollsForward(t *testing.T) {
 	}
 }
 
+func TestProxyUsageCollectorHealthDoesNotOverwriteAccountingBaseline(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+
+	failed := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{
+			"collector_source":"http",
+			"collector_status":"error",
+			"collector_error":"dial tcp 127.0.0.1:9090: connection refused",
+			"collector_checked_at":"2026-06-14T10:00:00Z"
+		}
+	}`, nodeToken)
+	if failed.Code != http.StatusOK {
+		t.Fatalf("collector error health report failed: %d %s", failed.Code, failed.Body.String())
+	}
+	var failedOut proxyUsageApplyResult
+	if err := json.NewDecoder(failed.Body).Decode(&failedOut); err != nil {
+		t.Fatal(err)
+	}
+	if failedOut.CollectorStatus != model.ProxyUsageCollectorStatusError || failedOut.UsersUpdated != 0 || failedOut.BytesDelta != 0 {
+		t.Fatalf("collector error should update health only: %+v", failedOut)
+	}
+	profile, ok := st.ProxyNodeProfile("node-a")
+	if !ok {
+		t.Fatal("proxy profile missing")
+	}
+	if profile.UsageCollectorStatus != model.ProxyUsageCollectorStatusError ||
+		profile.UsageCollectorSource != "http" ||
+		!strings.Contains(profile.UsageCollectorLastError, "connection refused") ||
+		profile.UsageCollectorLastErrorAt.IsZero() {
+		t.Fatalf("collector error not persisted on profile: %+v", profile)
+	}
+	if _, ok := st.ProxyUsageSnapshot("node-a"); ok {
+		t.Fatalf("collector error must not create an accounting baseline")
+	}
+	profilesAfterError := doJSON(t, handler, http.MethodGet, "/api/proxy/profiles", "", cookies, "")
+	defer profilesAfterError.Body.Close()
+	errorBody := new(bytes.Buffer)
+	errorBody.ReadFrom(profilesAfterError.Body)
+	if !strings.Contains(errorBody.String(), `"usage_collector_status":"error"`) ||
+		!strings.Contains(errorBody.String(), `"usage_collector_last_error":"dial tcp 127.0.0.1:9090: connection refused"`) {
+		t.Fatalf("profile view missing collector error health: %s", errorBody.String())
+	}
+
+	badOK := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{
+			"user_bytes":{"bad id":1},
+			"collector_source":"http",
+			"collector_status":"ok",
+			"collector_checked_at":"2026-06-14T10:00:30Z"
+		}
+	}`, nodeToken)
+	if badOK.Code != http.StatusBadRequest {
+		t.Fatalf("malformed ok usage report should be rejected, got %d", badOK.Code)
+	}
+	profile, _ = st.ProxyNodeProfile("node-a")
+	if profile.UsageCollectorStatus != model.ProxyUsageCollectorStatusError {
+		t.Fatalf("rejected ok report must not overwrite collector health: %+v", profile)
+	}
+
+	success := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{
+			"core_uptime_sec":100,
+			"user_bytes":{"alice":100},
+			"collector_source":"http",
+			"collector_status":"ok",
+			"collector_checked_at":"2026-06-14T10:01:00Z"
+		}
+	}`, nodeToken)
+	if success.Code != http.StatusOK {
+		t.Fatalf("collector success report failed: %d %s", success.Code, success.Body.String())
+	}
+	var successOut proxyUsageApplyResult
+	if err := json.NewDecoder(success.Body).Decode(&successOut); err != nil {
+		t.Fatal(err)
+	}
+	if successOut.CollectorStatus != model.ProxyUsageCollectorStatusOK || successOut.BytesDelta != 0 || successOut.UsersUpdated != 1 {
+		t.Fatalf("first success after error should baseline only: %+v", successOut)
+	}
+	profile, _ = st.ProxyNodeProfile("node-a")
+	if profile.UsageCollectorStatus != model.ProxyUsageCollectorStatusOK || profile.UsageCollectorLastOKAt.IsZero() {
+		t.Fatalf("collector ok not persisted on profile: %+v", profile)
+	}
+	if usage, ok := st.ProxyUsageSnapshot("node-a"); !ok || usage.UserBytes["alice"] != 100 {
+		t.Fatalf("success report should create accounting baseline: ok=%v usage=%+v", ok, usage)
+	}
+	profilesAfterOK := doJSON(t, handler, http.MethodGet, "/api/proxy/profiles", "", cookies, "")
+	defer profilesAfterOK.Body.Close()
+	okBody := new(bytes.Buffer)
+	okBody.ReadFrom(profilesAfterOK.Body)
+	if !strings.Contains(okBody.String(), `"usage_collector_status":"ok"`) ||
+		!strings.Contains(okBody.String(), `"usage_collector_last_ok_at":"2026-06-14T10:01:00Z"`) {
+		t.Fatalf("profile view missing collector ok health: %s", okBody.String())
+	}
+}
+
 func TestProxyUsageNotificationsFireOncePerQuotaThreshold(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	cap := &captureNotify{}

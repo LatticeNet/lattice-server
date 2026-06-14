@@ -101,8 +101,16 @@ type proxyNodeProfileView struct {
 	AppliedSHA256 string    `json:"applied_sha256,omitempty"`
 	LastApplyAt   time.Time `json:"last_apply_at,omitempty"`
 	LastError     string    `json:"last_error,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+
+	UsageCollectorSource      string    `json:"usage_collector_source,omitempty"`
+	UsageCollectorStatus      string    `json:"usage_collector_status,omitempty"`
+	UsageCollectorCheckedAt   time.Time `json:"usage_collector_checked_at,omitempty"`
+	UsageCollectorLastOKAt    time.Time `json:"usage_collector_last_ok_at,omitempty"`
+	UsageCollectorLastError   string    `json:"usage_collector_last_error,omitempty"`
+	UsageCollectorLastErrorAt time.Time `json:"usage_collector_last_error_at,omitempty"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type proxyUsageSnapshotView struct {
@@ -124,10 +132,12 @@ type proxyUsageUserView struct {
 }
 
 type proxyUsageApplyResult struct {
-	BytesDelta   int64 `json:"bytes_delta"`
-	UsersUpdated int   `json:"users_updated"`
-	UsersIgnored int   `json:"users_ignored"`
-	AlertsFired  int   `json:"alerts_fired"`
+	BytesDelta      int64  `json:"bytes_delta"`
+	UsersUpdated    int    `json:"users_updated"`
+	UsersIgnored    int    `json:"users_ignored"`
+	AlertsFired     int    `json:"alerts_fired"`
+	CollectorSource string `json:"collector_source,omitempty"`
+	CollectorStatus string `json:"collector_status,omitempty"`
 }
 
 func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request) {
@@ -604,16 +614,23 @@ func (s *Server) handleAgentProxyUsage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	auditMeta := map[string]string{
+		"bytes_delta":   strconv.FormatInt(result.BytesDelta, 10),
+		"users_updated": strconv.Itoa(result.UsersUpdated),
+		"users_ignored": strconv.Itoa(result.UsersIgnored),
+	}
+	if result.CollectorSource != "" {
+		auditMeta["collector_source"] = result.CollectorSource
+	}
+	if result.CollectorStatus != "" {
+		auditMeta["collector_status"] = result.CollectorStatus
+	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "proxy.usage.report",
 		Decision: "allow",
 		NodeID:   req.NodeID,
-		Metadata: map[string]string{
-			"bytes_delta":   strconv.FormatInt(result.BytesDelta, 10),
-			"users_updated": strconv.Itoa(result.UsersUpdated),
-			"users_ignored": strconv.Itoa(result.UsersIgnored),
-		},
+		Metadata: auditMeta,
 	})
 	writeJSON(w, http.StatusOK, result)
 }
@@ -1117,8 +1134,16 @@ func (s *Server) toProxyNodeProfileView(profile model.ProxyNodeProfile) proxyNod
 		AppliedSHA256: profile.AppliedSHA256,
 		LastApplyAt:   profile.LastApplyAt,
 		LastError:     profile.LastError,
-		CreatedAt:     profile.CreatedAt,
-		UpdatedAt:     profile.UpdatedAt,
+
+		UsageCollectorSource:      profile.UsageCollectorSource,
+		UsageCollectorStatus:      profile.UsageCollectorStatus,
+		UsageCollectorCheckedAt:   profile.UsageCollectorCheckedAt,
+		UsageCollectorLastOKAt:    profile.UsageCollectorLastOKAt,
+		UsageCollectorLastError:   profile.UsageCollectorLastError,
+		UsageCollectorLastErrorAt: profile.UsageCollectorLastErrorAt,
+
+		CreatedAt: profile.CreatedAt,
+		UpdatedAt: profile.UpdatedAt,
 	}
 }
 
@@ -1156,6 +1181,64 @@ func cloneProxyUserBytes(in map[string]int64) map[string]int64 {
 	return out
 }
 
+func applyProxyUsageCollectorHealth(profile model.ProxyNodeProfile, snapshot model.ProxyUsageSnapshot, now time.Time) (model.ProxyNodeProfile, bool, error) {
+	source := strings.TrimSpace(snapshot.CollectorSource)
+	status := strings.TrimSpace(snapshot.CollectorStatus)
+	errText := sanitizeProxyUsageCollectorError(snapshot.CollectorError)
+	hasReport := source != "" || status != "" || errText != "" || !snapshot.CollectorCheckedAt.IsZero()
+	if !hasReport {
+		return profile, false, nil
+	}
+	if source != "" && !proxyIDRe.MatchString(source) {
+		return model.ProxyNodeProfile{}, false, fmt.Errorf("invalid collector_source %q", source)
+	}
+	if status == "" {
+		if errText != "" {
+			status = model.ProxyUsageCollectorStatusError
+		} else {
+			status = model.ProxyUsageCollectorStatusOK
+		}
+	}
+	if status != model.ProxyUsageCollectorStatusOK && status != model.ProxyUsageCollectorStatusError {
+		return model.ProxyNodeProfile{}, false, fmt.Errorf("invalid collector_status %q", status)
+	}
+	checkedAt := snapshot.CollectorCheckedAt
+	if checkedAt.IsZero() {
+		checkedAt = snapshot.At
+	}
+	if checkedAt.IsZero() {
+		checkedAt = now
+	}
+	checkedAt = checkedAt.UTC()
+	profile.UsageCollectorSource = source
+	profile.UsageCollectorStatus = status
+	profile.UsageCollectorCheckedAt = checkedAt
+	switch status {
+	case model.ProxyUsageCollectorStatusOK:
+		profile.UsageCollectorLastOKAt = checkedAt
+	case model.ProxyUsageCollectorStatusError:
+		if len(snapshot.UserBytes) > 0 {
+			return model.ProxyNodeProfile{}, false, errors.New("collector error reports must not include user_bytes")
+		}
+		if errText == "" {
+			errText = "collector reported an error"
+		}
+		profile.UsageCollectorLastError = errText
+		profile.UsageCollectorLastErrorAt = checkedAt
+	}
+	return profile, true, nil
+}
+
+func sanitizeProxyUsageCollectorError(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if proxyUnsafeControl(r) && r != '\t' {
+			return -1
+		}
+		return r
+	}, value)
+	return truncateMetadataValue(value, 512)
+}
+
 func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (proxyUsageApplyResult, error) {
 	s.proxyUsageMu.Lock()
 	defer s.proxyUsageMu.Unlock()
@@ -1170,6 +1253,22 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	}
 	if snapshot.At.IsZero() {
 		snapshot.At = s.now()
+	}
+	result := proxyUsageApplyResult{}
+	collectorUpdated := false
+	if updatedProfile, updated, err := applyProxyUsageCollectorHealth(profile, snapshot, s.now()); err != nil {
+		return proxyUsageApplyResult{}, err
+	} else if updated {
+		profile = updatedProfile
+		collectorUpdated = true
+		result.CollectorSource = profile.UsageCollectorSource
+		result.CollectorStatus = profile.UsageCollectorStatus
+		if profile.UsageCollectorStatus == model.ProxyUsageCollectorStatusError {
+			if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
+				return proxyUsageApplyResult{}, err
+			}
+			return result, nil
+		}
 	}
 	if len(snapshot.UserBytes) > 4096 {
 		return proxyUsageApplyResult{}, errors.New("user_bytes has too many entries")
@@ -1192,9 +1291,14 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		sanitized[userID] = value
 	}
 	snapshot.UserBytes = sanitized
+	if collectorUpdated {
+		if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
+			return proxyUsageApplyResult{}, err
+		}
+	}
 
 	previous, hadPrevious := s.store.ProxyUsageSnapshot(snapshot.NodeID)
-	result := proxyUsageApplyResult{UsersIgnored: ignored}
+	result.UsersIgnored = ignored
 	now := s.now()
 	if hadPrevious {
 		reset := snapshot.CoreUptimeSec < previous.CoreUptimeSec

@@ -20,7 +20,10 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
-var controlPlaneHostRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
+var (
+	controlPlaneHostRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
+	nftPolicySetNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+)
 
 type netPolicyView struct {
 	ID             string          `json:"id"`
@@ -125,11 +128,12 @@ func (s *Server) handleNetPolicyPlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, err := netpolicy.CompileEgressRuleset(policy, s.resolveNode, opts)
+	egressPlan, err := netpolicy.CompileEgressPlan(policy, s.resolveNode, opts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	plan := egressPlan.Ruleset
 	sum := sha256.Sum256([]byte(plan))
 	policy.LastPlanSHA = hex.EncodeToString(sum[:])
 	policy.LastError = ""
@@ -141,7 +145,7 @@ func (s *Server) handleNetPolicyPlan(w http.ResponseWriter, r *http.Request, p p
 		ID:        id.New("approval"),
 		NodeID:    policy.TargetNodeID,
 		Plugin:    "nftpolicy",
-		Action:    nftPolicyApprovalAction(s.publicURL),
+		Action:    nftPolicyApprovalAction(s.publicURL, nftPolicyDomainSetBindings(egressPlan.DomainSets)...),
 		Plan:      plan,
 		Status:    model.ApprovalPending,
 		ActorID:   p.ActorID,
@@ -162,6 +166,14 @@ func (s *Server) handleNetPolicyPlan(w http.ResponseWriter, r *http.Request, p p
 		},
 	})
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
+}
+
+func nftPolicyDomainSetBindings(sets []netpolicy.DomainSet) []nftPolicyDomainSetBinding {
+	out := make([]nftPolicyDomainSetBinding, 0, len(sets))
+	for _, set := range sets {
+		out = append(out, nftPolicyDomainSetBinding{Host: set.Host, Set4: set.Set4, Set6: set.Set6})
+	}
+	return out
 }
 
 func (s *Server) netPolicyCompileOptions() (netpolicy.CompileOptions, error) {

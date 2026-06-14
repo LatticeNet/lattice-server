@@ -86,6 +86,45 @@ func TestNormalizePolicyCanonicalizesIPv6CIDR(t *testing.T) {
 	}
 }
 
+func TestNormalizePolicyCanonicalizesDomainRemote(t *testing.T) {
+	policy, err := NormalizePolicy(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{{
+			ID:        "allow-api",
+			Action:    model.NetRuleAllow,
+			Direction: model.NetDirEgress,
+			Protocol:  model.NetProtoTCP,
+			Ports:     []int{443},
+			Remote:    model.NetEndpoint{Kind: model.NetRefDomain, Domain: "API.Example.COM."},
+		}},
+	}, testResolver("node-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.Rules[0].Remote.Domain; got != "api.example.com" {
+		t.Fatalf("domain = %q", got)
+	}
+}
+
+func TestNormalizePolicyRejectsDomainIngress(t *testing.T) {
+	_, err := NormalizePolicy(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{{
+			ID:        "bad-ingress-domain",
+			Action:    model.NetRuleAllow,
+			Direction: model.NetDirIngress,
+			Protocol:  model.NetProtoTCP,
+			Ports:     []int{443},
+			Remote:    model.NetEndpoint{Kind: model.NetRefDomain, Domain: "api.example.com"},
+		}},
+	}, testResolver("node-a"))
+	if err == nil {
+		t.Fatal("expected domain ingress rejection")
+	}
+}
+
 func TestBuildGraphDerivesEdgesAndExternals(t *testing.T) {
 	policy, err := NormalizePolicy(model.NetPolicy{
 		TargetNodeID: "node-a",
@@ -93,6 +132,7 @@ func TestBuildGraphDerivesEdgesAndExternals(t *testing.T) {
 		Rules: []model.NetRule{
 			{ID: "deny-db", Action: model.NetRuleDeny, Direction: model.NetDirEgress, Protocol: model.NetProtoTCP, Ports: []int{1234}, Remote: model.NetEndpoint{Kind: model.NetRefNode, NodeID: "node-b"}},
 			{ID: "allow-dns", Action: model.NetRuleAllow, Direction: model.NetDirEgress, Protocol: model.NetProtoUDP, Ports: []int{53}, Remote: model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "1.1.1.1"}},
+			{ID: "allow-api", Action: model.NetRuleAllow, Direction: model.NetDirEgress, Protocol: model.NetProtoTCP, Ports: []int{443}, Remote: model.NetEndpoint{Kind: model.NetRefDomain, Domain: "api.example.com"}},
 		},
 	}, testResolver("node-a", "node-b"))
 	if err != nil {
@@ -105,7 +145,7 @@ func TestBuildGraphDerivesEdgesAndExternals(t *testing.T) {
 	if len(graph.Edges) != 1 || graph.Edges[0].From != "node-a" || graph.Edges[0].To != "node-b" || graph.Edges[0].Action != model.NetRuleDeny {
 		t.Fatalf("bad edges: %+v", graph.Edges)
 	}
-	if len(graph.Externals) != 1 || graph.Externals[0].Remote != "1.1.1.1" || graph.Externals[0].Ports[0] != 53 {
+	if len(graph.Externals) != 2 || graph.Externals[0].Remote != "1.1.1.1" || graph.Externals[0].Ports[0] != 53 || graph.Externals[1].Remote != "api.example.com" {
 		t.Fatalf("bad externals: %+v", graph.Externals)
 	}
 }

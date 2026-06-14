@@ -2899,13 +2899,13 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 			"wg-quick down wg0 2>/dev/null || true\n" +
 			"wg-quick up wg0\n"
 	case "nftpolicy":
-		planServerURL, err := nftPolicyApprovalServerURL(approval, serverURL)
+		payload, err := nftPolicyApprovalPayload(approval, serverURL)
 		if err != nil {
 			return "set -e\n" +
 				"echo " + shellQuote("lattice nftpolicy: invalid approval action: "+err.Error()) + " >&2\n" +
 				"exit 1\n"
 		}
-		return nftPolicyApplyScript(approval.Plan, planServerURL)
+		return nftPolicyApplyScript(approval.Plan, payload.PublicURL, payload.DomainSets)
 	case "nft":
 		return nftGuardApplyScript(approval.Plan, serverURL)
 	default:
@@ -2919,12 +2919,53 @@ const (
 	nftPolicyApplyActionPrefix = nftPolicyApplyAction + ":"
 )
 
-func nftPolicyApprovalAction(serverURL string) string {
+type nftPolicyDomainSetBinding struct {
+	Host string `json:"host"`
+	Set4 string `json:"set4"`
+	Set6 string `json:"set6"`
+}
+
+type nftPolicyApplyPayload struct {
+	PublicURL  string                      `json:"public_url"`
+	DomainSets []nftPolicyDomainSetBinding `json:"domain_sets,omitempty"`
+}
+
+func nftPolicyApprovalAction(serverURL string, domainSets ...nftPolicyDomainSetBinding) string {
 	serverURL = strings.TrimRight(serverURL, "/")
-	if serverURL == "" {
+	if serverURL == "" && len(domainSets) == 0 {
 		return nftPolicyApplyAction
 	}
-	return nftPolicyApplyActionPrefix + base64.RawURLEncoding.EncodeToString([]byte(serverURL))
+	if len(domainSets) == 0 {
+		return nftPolicyApplyActionPrefix + base64.RawURLEncoding.EncodeToString([]byte(serverURL))
+	}
+	payload := nftPolicyApplyPayload{PublicURL: serverURL, DomainSets: normalizeNftPolicyDomainSetBindings(domainSets)}
+	data, _ := json.Marshal(payload)
+	return nftPolicyApplyActionPrefix + base64.RawURLEncoding.EncodeToString(data)
+}
+
+func normalizeNftPolicyDomainSetBindings(domainSets []nftPolicyDomainSetBinding) []nftPolicyDomainSetBinding {
+	seen := map[string]nftPolicyDomainSetBinding{}
+	for _, set := range domainSets {
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(set.Host), "."))
+		set4 := strings.TrimSpace(set.Set4)
+		set6 := strings.TrimSpace(set.Set6)
+		if host == "" || (set4 == "" && set6 == "") {
+			continue
+		}
+		key := host + "\x00" + set4 + "\x00" + set6
+		seen[key] = nftPolicyDomainSetBinding{Host: host, Set4: set4, Set6: set6}
+	}
+	out := make([]nftPolicyDomainSetBinding, 0, len(seen))
+	for _, set := range seen {
+		out = append(out, set)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Host == out[j].Host {
+			return out[i].Set4 < out[j].Set4
+		}
+		return out[i].Host < out[j].Host
+	})
+	return out
 }
 
 func nftPolicyApprovalDisplayAction(action string) string {
@@ -2935,25 +2976,74 @@ func nftPolicyApprovalDisplayAction(action string) string {
 }
 
 func nftPolicyApprovalServerURL(approval model.Approval, fallback string) (string, error) {
+	payload, err := nftPolicyApprovalPayload(approval, fallback)
+	if err != nil {
+		return "", err
+	}
+	return payload.PublicURL, nil
+}
+
+func nftPolicyApprovalPayload(approval model.Approval, fallback string) (nftPolicyApplyPayload, error) {
+	fallback = strings.TrimRight(fallback, "/")
 	if approval.Plugin != "nftpolicy" {
-		return fallback, nil
+		return nftPolicyApplyPayload{PublicURL: fallback}, nil
 	}
 	if approval.Action == nftPolicyApplyAction {
-		return fallback, nil
+		return nftPolicyApplyPayload{PublicURL: fallback}, nil
 	}
 	if !strings.HasPrefix(approval.Action, nftPolicyApplyActionPrefix) {
-		return "", fmt.Errorf("unexpected action %q", approval.Action)
+		return nftPolicyApplyPayload{}, fmt.Errorf("unexpected action %q", approval.Action)
 	}
 	encoded := strings.TrimPrefix(approval.Action, nftPolicyApplyActionPrefix)
 	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
 	if err != nil {
-		return "", err
+		return nftPolicyApplyPayload{}, err
 	}
-	serverURL := strings.TrimRight(string(decoded), "/")
-	if serverURL == "" {
-		return "", errors.New("empty bound server url")
+	payload := nftPolicyApplyPayload{}
+	if len(decoded) > 0 && decoded[0] == '{' {
+		if err := json.Unmarshal(decoded, &payload); err != nil {
+			return nftPolicyApplyPayload{}, err
+		}
+		payload.PublicURL = strings.TrimRight(payload.PublicURL, "/")
+	} else {
+		payload.PublicURL = strings.TrimRight(string(decoded), "/")
 	}
-	return serverURL, nil
+	if payload.PublicURL == "" {
+		payload.PublicURL = fallback
+	}
+	if payload.PublicURL == "" {
+		return nftPolicyApplyPayload{}, errors.New("empty bound server url")
+	}
+	domainSets, err := validateNftPolicyDomainSetBindings(payload.DomainSets)
+	if err != nil {
+		return nftPolicyApplyPayload{}, err
+	}
+	payload.DomainSets = domainSets
+	return payload, nil
+}
+
+func validateNftPolicyDomainSetBindings(domainSets []nftPolicyDomainSetBinding) ([]nftPolicyDomainSetBinding, error) {
+	out := make([]nftPolicyDomainSetBinding, 0, len(domainSets))
+	for _, set := range normalizeNftPolicyDomainSetBindings(domainSets) {
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(set.Host), "."))
+		if host == "" || len(host) > 253 || net.ParseIP(host) != nil || !strings.Contains(host, ".") {
+			return nil, fmt.Errorf("invalid domain set host %q", set.Host)
+		}
+		if _, err := normalizeControlPlaneHost(host); err != nil {
+			return nil, err
+		}
+		if set.Set4 == "" && set.Set6 == "" {
+			return nil, fmt.Errorf("domain set %q has no nft set", host)
+		}
+		if set.Set4 != "" && !nftPolicySetNameRe.MatchString(set.Set4) {
+			return nil, fmt.Errorf("invalid nft set %q", set.Set4)
+		}
+		if set.Set6 != "" && !nftPolicySetNameRe.MatchString(set.Set6) {
+			return nil, fmt.Errorf("invalid nft set %q", set.Set6)
+		}
+		out = append(out, nftPolicyDomainSetBinding{Host: host, Set4: set.Set4, Set6: set.Set6})
+	}
+	return out, nil
 }
 
 func nftGuardApplyScript(plan, serverURL string) string {
@@ -2996,13 +3086,15 @@ func nftGuardApplyScript(plan, serverURL string) string {
 		done
 }
 
-func nftPolicyApplyScript(plan, serverURL string) string {
+func nftPolicyApplyScript(plan, serverURL string, domainSets []nftPolicyDomainSetBinding) string {
 	serverURL = strings.TrimRight(serverURL, "/")
-	domainSetUpdate := ""
 	domainRefresh := nftPolicyDomainRefreshCleanupScript()
+	domainSetUpdate := nftPolicyDomainSetUpdateScripts(domainSets)
 	if host, ok := controlPlaneDomainSetHost(serverURL); ok {
-		domainSetUpdate = nftPolicyDomainSetUpdateScript(host)
-		domainRefresh = nftPolicyDomainRefreshInstallScript(host)
+		domainSetUpdate = nftPolicyDomainSetUpdateScript(nftPolicyDomainSetBinding{Host: host, Set4: "lattice_control4", Set6: "lattice_control6"}) + domainSetUpdate
+	}
+	if domainSetUpdate != "" {
+		domainRefresh = nftPolicyDomainRefreshInstallScript(domainSetUpdate)
 	}
 	return "set -e\n" +
 		"umask 077\n" +
@@ -3054,11 +3146,26 @@ func controlPlaneDomainSetHost(serverURL string) (string, bool) {
 	return host, true
 }
 
-func nftPolicyDomainSetUpdateScript(host string) string {
-	return "\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4 -set6 lattice_control6\n"
+func nftPolicyDomainSetUpdateScripts(domainSets []nftPolicyDomainSetBinding) string {
+	var b strings.Builder
+	for _, set := range domainSets {
+		b.WriteString(nftPolicyDomainSetUpdateScript(set))
+	}
+	return b.String()
 }
 
-func nftPolicyDomainRefreshInstallScript(host string) string {
+func nftPolicyDomainSetUpdateScript(set nftPolicyDomainSetBinding) string {
+	cmd := "\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(set.Host) + " -family inet -table lattice_policy"
+	if set.Set4 != "" {
+		cmd += " -set " + set.Set4
+	}
+	if set.Set6 != "" {
+		cmd += " -set6 " + set.Set6
+	}
+	return cmd + "\n"
+}
+
+func nftPolicyDomainRefreshInstallScript(updateCommands string) string {
 	const (
 		refreshScript = "/etc/lattice/nftpolicy-domain-refresh.sh"
 		servicePath   = "/etc/systemd/system/lattice-nftpolicy-domain-refresh.service"
@@ -3069,7 +3176,7 @@ func nftPolicyDomainRefreshInstallScript(host string) string {
 		"set -e\n" +
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
 		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
-		"\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4 -set6 lattice_control6\n"
+		updateCommands
 	service := "[Unit]\n" +
 		"Description=Lattice nftpolicy domain set refresh\n" +
 		"Documentation=https://github.com/LatticeNet/lattice\n\n" +

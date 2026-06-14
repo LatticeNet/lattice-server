@@ -1,6 +1,8 @@
 package netpolicy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -19,27 +21,53 @@ type CompileOptions struct {
 	ControlPlanePort int
 }
 
+type DomainSet struct {
+	Host string `json:"host"`
+	Set4 string `json:"set4"`
+	Set6 string `json:"set6"`
+}
+
+type EgressPlan struct {
+	Ruleset    string      `json:"ruleset"`
+	DomainSets []DomainSet `json:"domain_sets,omitempty"`
+}
+
 // CompileEgressRuleset renders a per-node egress policy into a deterministic
 // nftables batch. It intentionally owns a separate lattice_policy table so this
 // first committed path cannot conflict with the existing lattice_guard input
 // table used by baseline node firewall inputs.
 func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts CompileOptions) (string, error) {
-	if resolve == nil {
-		return "", errors.New("node resolver is required")
-	}
-	if !policy.Enabled {
-		return "", errors.New("netpolicy is disabled")
-	}
-	if err := validateCompileOptions(opts); err != nil {
-		return "", err
-	}
-	normalized, err := NormalizePolicy(policy, resolve)
+	plan, err := CompileEgressPlan(policy, resolve, opts)
 	if err != nil {
 		return "", err
 	}
+	return plan.Ruleset, nil
+}
+
+// CompileEgressPlan returns the nftables batch plus the domain-backed named sets
+// that must be populated on the node before the selfcheck runs.
+func CompileEgressPlan(policy model.NetPolicy, resolve NodeResolver, opts CompileOptions) (EgressPlan, error) {
+	if resolve == nil {
+		return EgressPlan{}, errors.New("node resolver is required")
+	}
+	if !policy.Enabled {
+		return EgressPlan{}, errors.New("netpolicy is disabled")
+	}
+	if err := validateCompileOptions(opts); err != nil {
+		return EgressPlan{}, err
+	}
+	normalized, err := NormalizePolicy(policy, resolve)
+	if err != nil {
+		return EgressPlan{}, err
+	}
 	target, ok := resolve(normalized.TargetNodeID)
 	if !ok {
-		return "", fmt.Errorf("target node %q not found", normalized.TargetNodeID)
+		return EgressPlan{}, fmt.Errorf("target node %q not found", normalized.TargetNodeID)
+	}
+	domainSets := collectEgressDomainSets(normalized.Rules)
+	domainSetByHost := make(map[string]DomainSet, len(domainSets))
+	for _, set := range domainSets {
+		domainSetByHost[set.Host] = set
 	}
 
 	var b strings.Builder
@@ -55,6 +83,20 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 		b.WriteString("\t\tflags interval\n")
 		b.WriteString("\t}\n\n")
 	}
+	for _, set := range domainSets {
+		b.WriteString("\tset ")
+		b.WriteString(set.Set4)
+		b.WriteString(" {\n")
+		b.WriteString("\t\ttype ipv4_addr\n")
+		b.WriteString("\t\tflags interval\n")
+		b.WriteString("\t}\n\n")
+		b.WriteString("\tset ")
+		b.WriteString(set.Set6)
+		b.WriteString(" {\n")
+		b.WriteString("\t\ttype ipv6_addr\n")
+		b.WriteString("\t\tflags interval\n")
+		b.WriteString("\t}\n\n")
+	}
 	b.WriteString("\tchain output {\n")
 	b.WriteString("\t\ttype filter hook output priority 0; policy drop;\n")
 	b.WriteString("\t\tct state established,related accept comment \"lattice established\"\n")
@@ -65,14 +107,14 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 
 	for _, rule := range normalized.Rules {
 		if rule.Direction != model.NetDirEgress {
-			return "", fmt.Errorf("rule %s uses unsupported direction %q; egress-only MVP", rule.ID, rule.Direction)
+			return EgressPlan{}, fmt.Errorf("rule %s uses unsupported direction %q; egress-only MVP", rule.ID, rule.Direction)
 		}
 		if rule.Disabled {
 			continue
 		}
-		lines, err := compileEgressRule(rule, target, resolve)
+		lines, err := compileEgressRule(rule, target, resolve, domainSetByHost)
 		if err != nil {
-			return "", err
+			return EgressPlan{}, err
 		}
 		for _, line := range lines {
 			b.WriteString("\t\t")
@@ -84,7 +126,32 @@ func CompileEgressRuleset(policy model.NetPolicy, resolve NodeResolver, opts Com
 	b.WriteString("\t\tcounter drop comment \"lattice default drop\"\n")
 	b.WriteString("\t}\n")
 	b.WriteString("}\n")
-	return b.String(), nil
+	return EgressPlan{Ruleset: b.String(), DomainSets: domainSets}, nil
+}
+
+func collectEgressDomainSets(rules []model.NetRule) []DomainSet {
+	seen := map[string]DomainSet{}
+	for _, rule := range rules {
+		if rule.Disabled || rule.Direction != model.NetDirEgress || rule.Remote.Kind != model.NetRefDomain {
+			continue
+		}
+		if _, ok := seen[rule.Remote.Domain]; !ok {
+			seen[rule.Remote.Domain] = domainSetForHost(rule.Remote.Domain)
+		}
+	}
+	out := make([]DomainSet, 0, len(seen))
+	for _, set := range seen {
+		out = append(out, set)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Host < out[j].Host })
+	return out
+}
+
+func domainSetForHost(host string) DomainSet {
+	sum := sha256.Sum256([]byte("lattice-netpolicy-domain\x00" + host))
+	suffix := hex.EncodeToString(sum[:])[:16]
+	base := "lattice_dom_" + suffix
+	return DomainSet{Host: host, Set4: base + "4", Set6: base + "6"}
 }
 
 func validateCompileOptions(opts CompileOptions) error {
@@ -217,8 +284,8 @@ func nftInputAction(action string) string {
 	return network.NFTActionDrop
 }
 
-func compileEgressRule(rule model.NetRule, target model.Node, resolve NodeResolver) ([]string, error) {
-	remoteExprs, err := egressRemoteExprs(rule, target, resolve)
+func compileEgressRule(rule model.NetRule, target model.Node, resolve NodeResolver, domainSets map[string]DomainSet) ([]string, error) {
+	remoteExprs, err := egressRemoteExprs(rule, target, resolve, domainSets)
 	if err != nil {
 		return nil, err
 	}
@@ -248,12 +315,18 @@ func compileEgressRule(rule model.NetRule, target model.Node, resolve NodeResolv
 	return lines, nil
 }
 
-func egressRemoteExprs(rule model.NetRule, target model.Node, resolve NodeResolver) ([]string, error) {
+func egressRemoteExprs(rule model.NetRule, target model.Node, resolve NodeResolver, domainSets map[string]DomainSet) ([]string, error) {
 	switch rule.Remote.Kind {
 	case model.NetRefAny:
 		return nil, nil
 	case model.NetRefCIDR:
 		return []string{nftAddrExpr("daddr", []string{rule.Remote.CIDR})}, nil
+	case model.NetRefDomain:
+		set, ok := domainSets[rule.Remote.Domain]
+		if !ok {
+			return nil, fmt.Errorf("rule %s domain %q has no compiled nft set", rule.ID, rule.Remote.Domain)
+		}
+		return []string{"ip daddr @" + set.Set4, "ip6 daddr @" + set.Set6}, nil
 	case model.NetRefNode:
 		if rule.Remote.NodeID == target.ID {
 			return nil, fmt.Errorf("rule %s remote node cannot be the target node", rule.ID)

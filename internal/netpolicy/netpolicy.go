@@ -111,6 +111,8 @@ func BuildGraph(nodes []model.Node, policies []model.NetPolicy) Graph {
 				})
 			case model.NetRefCIDR:
 				graph.Externals = append(graph.Externals, externalForRule(policy.TargetNodeID, rule, rule.Remote.CIDR))
+			case model.NetRefDomain:
+				graph.Externals = append(graph.Externals, externalForRule(policy.TargetNodeID, rule, rule.Remote.Domain))
 			case model.NetRefAny:
 				graph.Externals = append(graph.Externals, externalForRule(policy.TargetNodeID, rule, "any"))
 			}
@@ -171,6 +173,9 @@ func normalizeRule(index int, rule model.NetRule, resolve NodeResolver) (model.N
 	if err != nil {
 		return model.NetRule{}, fmt.Errorf("rule %s remote: %w", rule.ID, err)
 	}
+	if remote.Kind == model.NetRefDomain && rule.Direction != model.NetDirEgress {
+		return model.NetRule{}, fmt.Errorf("rule %s remote: domain remotes are egress-only", rule.ID)
+	}
 	rule.Remote = remote
 	return rule, nil
 }
@@ -187,6 +192,7 @@ func normalizeEndpoint(endpoint model.NetEndpoint, resolve NodeResolver) (model.
 			return model.NetEndpoint{}, fmt.Errorf("node %q not found", endpoint.NodeID)
 		}
 		endpoint.CIDR = ""
+		endpoint.Domain = ""
 	case model.NetRefCIDR:
 		cidr, err := normalizeIPCIDR(endpoint.CIDR)
 		if err != nil {
@@ -194,13 +200,54 @@ func normalizeEndpoint(endpoint model.NetEndpoint, resolve NodeResolver) (model.
 		}
 		endpoint.CIDR = cidr
 		endpoint.NodeID = ""
+		endpoint.Domain = ""
+	case model.NetRefDomain:
+		domain, err := normalizeDomainName(endpoint.Domain)
+		if err != nil {
+			return model.NetEndpoint{}, err
+		}
+		endpoint.Domain = domain
+		endpoint.NodeID = ""
+		endpoint.CIDR = ""
 	case model.NetRefAny:
 		endpoint.NodeID = ""
 		endpoint.CIDR = ""
+		endpoint.Domain = ""
 	default:
 		return model.NetEndpoint{}, fmt.Errorf("invalid kind %q", endpoint.Kind)
 	}
 	return endpoint, nil
+}
+
+func normalizeDomainName(value string) (string, error) {
+	domain := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(value), "."))
+	if domain == "" {
+		return "", errors.New("domain is required")
+	}
+	if len(domain) > 253 {
+		return "", fmt.Errorf("invalid domain %q: too long", domain)
+	}
+	if !strings.Contains(domain, ".") {
+		return "", fmt.Errorf("invalid domain %q: use a fully-qualified hostname", domain)
+	}
+	if net.ParseIP(domain) != nil {
+		return "", fmt.Errorf("invalid domain %q: use cidr for IP remotes", domain)
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" || len(label) > 63 {
+			return "", fmt.Errorf("invalid domain %q", domain)
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return "", fmt.Errorf("invalid domain %q", domain)
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return "", fmt.Errorf("invalid domain %q", domain)
+		}
+	}
+	return domain, nil
 }
 
 func normalizeIPCIDR(value string) (string, error) {

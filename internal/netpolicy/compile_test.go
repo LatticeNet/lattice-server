@@ -177,6 +177,58 @@ func TestCompileEgressRulesetRendersIPv6Remotes(t *testing.T) {
 	}
 }
 
+func TestCompileEgressPlanRendersDomainRemoteSets(t *testing.T) {
+	plan, err := CompileEgressPlan(model.NetPolicy{
+		TargetNodeID: "node-a",
+		Enabled:      true,
+		Rules: []model.NetRule{
+			{
+				ID:        "allow-api",
+				Action:    model.NetRuleAllow,
+				Direction: model.NetDirEgress,
+				Protocol:  model.NetProtoTCP,
+				Ports:     []int{443},
+				Remote:    model.NetEndpoint{Kind: model.NetRefDomain, Domain: "API.Example.COM."},
+			},
+			{
+				ID:        "allow-api-alt",
+				Action:    model.NetRuleAllow,
+				Direction: model.NetDirEgress,
+				Protocol:  model.NetProtoUDP,
+				Ports:     []int{8443},
+				Remote:    model.NetEndpoint{Kind: model.NetRefDomain, Domain: "api.example.com"},
+			},
+		},
+	}, func(id string) (model.Node, bool) {
+		return model.Node{ID: id, WireGuardIP: "10.66.0.1"}, true
+	}, CompileOptions{ControlPlaneIPv4: netip.MustParseAddr("203.0.113.99"), ControlPlanePort: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := domainSetForHost("api.example.com")
+	if len(plan.DomainSets) != 1 || plan.DomainSets[0] != set {
+		t.Fatalf("bad domain set metadata: %+v want %+v", plan.DomainSets, set)
+	}
+	for _, needle := range []string{
+		"set " + set.Set4,
+		"type ipv4_addr",
+		"set " + set.Set6,
+		"type ipv6_addr",
+		"ip daddr @" + set.Set4 + " tcp dport 443 accept comment \"lattice rule allow-api\"",
+		"ip6 daddr @" + set.Set6 + " tcp dport 443 accept comment \"lattice rule allow-api\"",
+		"ip daddr @" + set.Set4 + " udp dport 8443 accept comment \"lattice rule allow-api-alt\"",
+		"ip6 daddr @" + set.Set6 + " udp dport 8443 accept comment \"lattice rule allow-api-alt\"",
+	} {
+		if !strings.Contains(plan.Ruleset, needle) {
+			t.Fatalf("compiled domain remote ruleset missing %q:\n%s", needle, plan.Ruleset)
+		}
+	}
+	if strings.Contains(plan.Ruleset, "api.example.com tcp dport") ||
+		strings.Contains(plan.Ruleset, "API.Example.COM") {
+		t.Fatalf("domain names must not be rendered as nft address literals:\n%s", plan.Ruleset)
+	}
+}
+
 func TestCompileEgressRulesetRejectsAmbiguousControlPlane(t *testing.T) {
 	_, err := CompileEgressRuleset(model.NetPolicy{
 		TargetNodeID: "node-a",

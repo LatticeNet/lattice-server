@@ -497,6 +497,83 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 	}
 }
 
+func TestNetPolicyPlanBindsOperatorDomainRemoteSets(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	create := doJSON(t, handler, http.MethodPost, "/api/netpolicy", `{
+		"target_node_id":"node-a",
+		"enabled":true,
+		"rules":[{
+			"id":"allow-api",
+			"action":"allow",
+			"direction":"egress",
+			"protocol":"tcp",
+			"ports":[443],
+			"remote":{"kind":"domain","domain":"API.Example.COM."}
+		}]
+	}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create domain remote policy failed: %d", create.StatusCode)
+	}
+	var policyView netPolicyView
+	if err := json.NewDecoder(create.Body).Decode(&policyView); err != nil {
+		t.Fatal(err)
+	}
+	if got := policyView.Rules[0].Remote.Domain; got != "api.example.com" {
+		t.Fatalf("domain remote not normalized: %q", got)
+	}
+	planRes := doJSON(t, handler, http.MethodPost, "/api/netpolicy/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer planRes.Body.Close()
+	if planRes.StatusCode != http.StatusOK {
+		t.Fatalf("plan domain remote policy failed: %d", planRes.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(planRes.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok {
+		t.Fatal("stored approval missing")
+	}
+	payload, err := nftPolicyApprovalPayload(stored, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.PublicURL != "https://203.0.113.99" || len(payload.DomainSets) != 1 || payload.DomainSets[0].Host != "api.example.com" {
+		t.Fatalf("bad action payload: %+v", payload)
+	}
+	set := payload.DomainSets[0]
+	for _, needle := range []string{
+		"set " + set.Set4,
+		"set " + set.Set6,
+		"ip daddr @" + set.Set4 + " tcp dport 443 accept comment \"lattice rule allow-api\"",
+		"ip6 daddr @" + set.Set6 + " tcp dport 443 accept comment \"lattice rule allow-api\"",
+	} {
+		if !strings.Contains(approval.Plan, needle) {
+			t.Fatalf("domain remote plan missing %q:\n%s", needle, approval.Plan)
+		}
+	}
+	if strings.Contains(approval.Plan, "API.Example.COM") || strings.Contains(approval.Plan, "api.example.com tcp dport") {
+		t.Fatalf("domain remote plan must not render hostname as an nft address literal:\n%s", approval.Plan)
+	}
+	script := applyScriptForWithServer(stored, "https://198.51.100.1")
+	for _, needle := range []string{
+		"--update-nft-domain-set -host 'api.example.com' -family inet -table lattice_policy -set " + set.Set4 + " -set6 " + set.Set6,
+		"--selfcheck-controlplane -server 'https://203.0.113.99'",
+		"/etc/lattice/nftpolicy-domain-refresh.sh",
+		"lattice-nftpolicy-domain-refresh.timer",
+	} {
+		if !strings.Contains(script, needle) {
+			t.Fatalf("domain remote apply script missing %q:\n%s", needle, script)
+		}
+	}
+	if strings.Contains(script, "lattice_control4") || strings.Contains(script, "lattice_control6") {
+		t.Fatalf("IPv4 control-plane plus operator domain remote should not install control-plane domain sets:\n%s", script)
+	}
+}
+
 func newTestServerWithPublicURL(t *testing.T, publicURL string) (http.Handler, *store.Store) {
 	t.Helper()
 	st, err := store.Open("")

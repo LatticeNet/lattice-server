@@ -393,7 +393,7 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 		t.Fatalf("approve domain plan failed: %d", approveDomain.StatusCode)
 	}
 	scriptFromChangedServerURL := applyScriptForWithServer(storedBeforeApprove, "https://203.0.113.99")
-	if !strings.Contains(scriptFromChangedServerURL, "CONTROL_HOST='lattice.example.com'") ||
+	if !strings.Contains(scriptFromChangedServerURL, "--update-nft-domain-set -host 'lattice.example.com' -family inet -table lattice_policy -set lattice_control4") ||
 		!strings.Contains(scriptFromChangedServerURL, "--selfcheck-controlplane -server 'https://lattice.example.com'") {
 		t.Fatalf("nftpolicy apply script must use the plan-bound public_url, not the current server setting:\n%s", scriptFromChangedServerURL)
 	}
@@ -402,14 +402,17 @@ func TestNetPolicyPlanRejectsIngressAndAcceptsHTTPSDomainPublicURL(t *testing.T)
 		t.Fatalf("expected one queued domain apply task, got %+v", domainTasks)
 	}
 	for _, needle := range []string{
-		"CONTROL_HOST='lattice.example.com'",
-		"getent ahostsv4 \"$CONTROL_HOST\"",
-		"nft flush set inet lattice_policy lattice_control4",
-		"nft add element inet lattice_policy lattice_control4",
+		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}",
+		"--update-nft-domain-set -host 'lattice.example.com' -family inet -table lattice_policy -set lattice_control4",
 		"--selfcheck-controlplane -server 'https://lattice.example.com'",
 	} {
 		if !strings.Contains(domainTasks[0].Script, needle) {
 			t.Fatalf("domain apply script missing %q:\n%s", needle, domainTasks[0].Script)
+		}
+	}
+	for _, forbidden := range []string{"getent", "awk", "CONTROL4="} {
+		if strings.Contains(domainTasks[0].Script, forbidden) {
+			t.Fatalf("domain apply script must not use shell DNS pipeline %q:\n%s", forbidden, domainTasks[0].Script)
 		}
 	}
 

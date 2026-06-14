@@ -3026,8 +3026,8 @@ func nftPolicyApplyScript(plan, serverURL string) string {
 		"( sleep 60; echo 'lattice nftpolicy: watchdog rollback fired' >&2; rollback ) &\n" +
 		"WATCHDOG=$!\n" +
 		"nft -f \"$CANDIDATE\"\n" +
-		domainSetUpdate +
 		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
+		domainSetUpdate +
 		"\"$AGENT_BIN\" --selfcheck-controlplane -server " + shellQuote(serverURL) + "\n" +
 		"trap - ERR\n" +
 		"cleanup_watchdog\n" +
@@ -3052,12 +3052,7 @@ func controlPlaneDomainSetHost(serverURL string) (string, bool) {
 }
 
 func nftPolicyDomainSetUpdateScript(host string) string {
-	return "CONTROL_HOST=" + shellQuote(host) + "\n" +
-		"CONTROL4=$(getent ahostsv4 \"$CONTROL_HOST\" 2>/dev/null | awk '$1 ~ /^[0-9]+([.][0-9]+){3}$/ { if (!seen[$1]++) { out = out (out ? \", \" : \"\") $1 } } END { print out }')\n" +
-		"if [ -z \"$CONTROL4\" ]; then echo \"lattice nftpolicy: no IPv4 A records resolved for $CONTROL_HOST\" >&2; exit 1; fi\n" +
-		"nft flush set inet lattice_policy lattice_control4\n" +
-		"nft add element inet lattice_policy lattice_control4 \"{ $CONTROL4 }\"\n" +
-		"echo \"lattice nftpolicy: control-plane IPv4 set updated for $CONTROL_HOST\"\n"
+	return "\"$AGENT_BIN\" --update-nft-domain-set -host " + shellQuote(host) + " -family inet -table lattice_policy -set lattice_control4\n"
 }
 
 func shellQuote(value string) string {

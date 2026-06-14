@@ -228,12 +228,17 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	planText, err := selfdns.RenderApprovalPlanWithOptions(dep, node.Name, cfg, nftRuleset, firewallSummary, selfdns.ApprovalPlanOptions{CoreDNSBinary: s.coreDNSBinary})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	approval := model.Approval{
 		ID:        id.New("approval"),
 		NodeID:    dep.NodeID,
 		Plugin:    "selfdns",
 		Action:    selfDNSApprovalAction(dep.ID),
-		Plan:      selfdns.RenderApprovalPlan(dep, node.Name, cfg, nftRuleset, firewallSummary),
+		Plan:      planText,
 		Status:    model.ApprovalPending,
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),

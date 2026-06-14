@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -23,15 +24,70 @@ const (
 	ZoneDir      = "/etc/lattice/selfdns/zones"
 	ServiceName  = "lattice-selfdns.service"
 	NFTGuardPath = "/etc/lattice/guard.nft"
+	CoreDNSPath  = "/usr/local/bin/coredns"
 )
 
 var dnsLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+var (
+	coreDNSVersionRe = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,64}$`)
+	sha256HexRe      = regexp.MustCompile(`^[A-Fa-f0-9]{64}$`)
+)
 
 type RenderOptions struct {
 	// MeshBindIP is required for mesh exposure. It is normally the node's
 	// WireGuard IP with any /32 suffix removed. Binding CoreDNS to the mesh IP is
 	// defense in depth on top of the nft rule.
 	MeshBindIP string
+}
+
+// CoreDNSBinarySource is an optional, operator-provided pinned artifact used by
+// the apply script to install CoreDNS when the node does not already have the
+// expected executable. The URL must point directly to an executable binary, not
+// an archive. The binary is accepted only after SHA-256 verification.
+type CoreDNSBinarySource struct {
+	Version string
+	URL     string
+	SHA256  string
+}
+
+func (src CoreDNSBinarySource) Enabled() bool {
+	return strings.TrimSpace(src.Version) != "" || strings.TrimSpace(src.URL) != "" || strings.TrimSpace(src.SHA256) != ""
+}
+
+func (src CoreDNSBinarySource) Normalize() (CoreDNSBinarySource, error) {
+	src.Version = strings.TrimSpace(src.Version)
+	src.URL = strings.TrimSpace(src.URL)
+	src.SHA256 = strings.ToLower(strings.TrimSpace(src.SHA256))
+	if !src.Enabled() {
+		return CoreDNSBinarySource{}, nil
+	}
+	if src.Version == "" || src.URL == "" || src.SHA256 == "" {
+		return CoreDNSBinarySource{}, errors.New("coredns binary source requires version, url, and sha256")
+	}
+	if !coreDNSVersionRe.MatchString(src.Version) {
+		return CoreDNSBinarySource{}, errors.New("coredns binary version contains unsafe characters")
+	}
+	if strings.ContainsAny(src.URL, "\x00\r\n\t ") {
+		return CoreDNSBinarySource{}, errors.New("coredns binary url contains unsafe characters")
+	}
+	parsed, err := url.Parse(src.URL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil {
+		return CoreDNSBinarySource{}, errors.New("coredns binary url must be https with no userinfo")
+	}
+	if parsed.Fragment != "" {
+		return CoreDNSBinarySource{}, errors.New("coredns binary url must not contain a fragment")
+	}
+	if len(src.URL) > 2048 {
+		return CoreDNSBinarySource{}, errors.New("coredns binary url is too long")
+	}
+	if !sha256HexRe.MatchString(src.SHA256) {
+		return CoreDNSBinarySource{}, errors.New("coredns binary sha256 must be 64 hex characters")
+	}
+	return src, nil
+}
+
+type ApprovalPlanOptions struct {
+	CoreDNSBinary CoreDNSBinarySource
 }
 
 type ZoneFile struct {
@@ -45,9 +101,10 @@ type ConfigBundle struct {
 }
 
 type ApplyArtifacts struct {
-	Corefile   string
-	ZoneFiles  []ZoneFile
-	NFTRuleset string
+	Corefile      string
+	ZoneFiles     []ZoneFile
+	NFTRuleset    string
+	CoreDNSBinary *CoreDNSBinarySource
 }
 
 // GenerateConfig renders a CoreDNS Corefile plus any static-zone files.
@@ -156,6 +213,17 @@ func ComposeFirewallPlan(dep model.DNSDeployment, base network.NFTPlan) (network
 // RenderApprovalPlan renders the exact text an operator reviews and hashes
 // before approval. It must contain no bearer secrets.
 func RenderApprovalPlan(dep model.DNSDeployment, nodeName string, cfg ConfigBundle, nftRuleset string, firewallSummary []string) string {
+	plan, _ := RenderApprovalPlanWithOptions(dep, nodeName, cfg, nftRuleset, firewallSummary, ApprovalPlanOptions{})
+	return plan
+}
+
+// RenderApprovalPlanWithOptions is the checked variant used by server paths that
+// need to include optional install/provenance metadata in the reviewed plan.
+func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg ConfigBundle, nftRuleset string, firewallSummary []string, opts ApprovalPlanOptions) (string, error) {
+	binary, err := opts.CoreDNSBinary.Normalize()
+	if err != nil {
+		return "", err
+	}
 	var b strings.Builder
 	b.WriteString("# Lattice Self-host DNS plan\n\n")
 	fmt.Fprintf(&b, "deployment_id: %s\n", dep.ID)
@@ -176,6 +244,15 @@ func RenderApprovalPlan(dep model.DNSDeployment, nodeName string, cfg ConfigBund
 	b.WriteString("\n## Firewall delta\n")
 	for _, line := range firewallSummary {
 		fmt.Fprintf(&b, "- %s\n", line)
+	}
+	if binary.Enabled() {
+		b.WriteString("\n## CoreDNS binary\n")
+		b.WriteString("```lattice-coredns-binary\n")
+		fmt.Fprintf(&b, "version: %s\n", binary.Version)
+		fmt.Fprintf(&b, "url: %s\n", binary.URL)
+		fmt.Fprintf(&b, "sha256: %s\n", binary.SHA256)
+		fmt.Fprintf(&b, "install_path: %s\n", CoreDNSPath)
+		b.WriteString("```\n")
 	}
 	b.WriteString("\n## CoreDNS Corefile\n")
 	b.WriteString("```coredns\n")
@@ -204,7 +281,7 @@ func RenderApprovalPlan(dep model.DNSDeployment, nodeName string, cfg ConfigBund
 		b.WriteString("\n## Cloudflare action\n")
 		fmt.Fprintf(&b, "- publish %s A=%t AAAA=%t via server-side DDNS/Cloudflare credential; token is not included in this plan\n", dep.Hostname, dep.PublishIPv4, dep.PublishIPv6)
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 // ParseApprovalPlan extracts the exact artifacts from the reviewed plan text.
@@ -223,7 +300,11 @@ func ParseApprovalPlan(plan string) (ApplyArtifacts, error) {
 	if err != nil {
 		return ApplyArtifacts{}, err
 	}
-	return ApplyArtifacts{Corefile: core, ZoneFiles: zones, NFTRuleset: nft}, nil
+	binary, err := coreDNSBinarySection(plan)
+	if err != nil {
+		return ApplyArtifacts{}, err
+	}
+	return ApplyArtifacts{Corefile: core, ZoneFiles: zones, NFTRuleset: nft, CoreDNSBinary: binary}, nil
 }
 
 // ApplyScriptFromPlan builds a bounded shell script that applies the reviewed
@@ -244,7 +325,7 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString("NFT_ROLLBACK=/etc/lattice/guard.rollback.nft\n")
 	b.WriteString("CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$\n")
 	b.WriteString("UNIT=/etc/systemd/system/lattice-selfdns.service\n")
-	b.WriteString("command -v coredns >/dev/null || { echo 'lattice selfdns: coredns binary not found in PATH' >&2; exit 1; }\n")
+	writeCoreDNSBootstrap(&b, artifacts.CoreDNSBinary)
 	b.WriteString("command -v nft >/dev/null || { echo 'lattice selfdns: nft binary not found in PATH' >&2; exit 1; }\n")
 	b.WriteString("command -v systemctl >/dev/null || { echo 'lattice selfdns: systemd is required for this apply slice' >&2; exit 1; }\n")
 	b.WriteString("mkdir -p \"$SELF_DNS_DIR\" \"$ZONE_DIR\" /etc/lattice\n")
@@ -264,7 +345,7 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	}
 	b.WriteString(heredocWrite(CorefilePath+".new", "LATTICE_SELF_DNS_CORE_EOF", artifacts.Corefile))
 	b.WriteString("mv \"$CORE_CANDIDATE\" " + shellQuote(CorefilePath) + "\n")
-	b.WriteString("coredns -conf " + shellQuote(CorefilePath) + " -plugins >/dev/null\n")
+	b.WriteString("\"$COREDNS_BIN\" -conf " + shellQuote(CorefilePath) + " -plugins >/dev/null\n")
 	b.WriteString(heredocWrite(NFTGuardPath+".new", "LATTICE_SELF_DNS_NFT_EOF", artifacts.NFTRuleset))
 	b.WriteString("nft -c -f \"$NFT_CANDIDATE\"\n")
 	b.WriteString("nft list ruleset > \"$NFT_ROLLBACK\"\n")
@@ -272,7 +353,11 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString("WATCHDOG=$!\n")
 	b.WriteString("nft -f \"$NFT_CANDIDATE\"\n")
 	b.WriteString("mv \"$NFT_CANDIDATE\" " + shellQuote(NFTGuardPath) + "\n")
-	b.WriteString(heredocWrite("/etc/systemd/system/lattice-selfdns.service", "LATTICE_SELF_DNS_UNIT_EOF", serviceUnit()))
+	serviceExec := "/usr/bin/env coredns"
+	if artifacts.CoreDNSBinary != nil && artifacts.CoreDNSBinary.Enabled() {
+		serviceExec = CoreDNSPath
+	}
+	b.WriteString(heredocWrite("/etc/systemd/system/lattice-selfdns.service", "LATTICE_SELF_DNS_UNIT_EOF", serviceUnit(serviceExec)))
 	b.WriteString("chmod 0644 \"$UNIT\"\n")
 	b.WriteString("systemctl daemon-reload\n")
 	b.WriteString("systemctl enable --now lattice-selfdns.service\n")
@@ -389,6 +474,49 @@ func zoneSections(plan string) ([]ZoneFile, error) {
 	return zones, nil
 }
 
+func coreDNSBinarySection(plan string) (*CoreDNSBinarySource, error) {
+	content, ok, err := optionalFencedSection(plan, "## CoreDNS binary", "lattice-coredns-binary")
+	if err != nil || !ok {
+		return nil, err
+	}
+	fields := map[string]string{}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil, fmt.Errorf("invalid coredns binary metadata line %q", line)
+		}
+		fields[strings.TrimSpace(key)] = strings.TrimSpace(value)
+	}
+	if fields["install_path"] != CoreDNSPath {
+		return nil, fmt.Errorf("coredns binary install_path must be %s", CoreDNSPath)
+	}
+	src, err := (CoreDNSBinarySource{
+		Version: fields["version"],
+		URL:     fields["url"],
+		SHA256:  fields["sha256"],
+	}).Normalize()
+	if err != nil {
+		return nil, err
+	}
+	return &src, nil
+}
+
+func optionalFencedSection(plan, heading, language string) (string, bool, error) {
+	start := strings.Index(plan, heading)
+	if start < 0 {
+		return "", false, nil
+	}
+	section, err := fencedSection(plan, heading, language)
+	if err != nil {
+		return "", true, err
+	}
+	return section, true, nil
+}
+
 func zoneFence(input string) (string, error) {
 	fence := "```dns-zone\n"
 	start := strings.Index(input, fence)
@@ -429,11 +557,38 @@ func heredocWrite(target, marker, content string) string {
 	return "cat > " + shellQuote(target) + " <<'" + delimiter + "'\n" + content + "\n" + delimiter + "\n"
 }
 
+func writeCoreDNSBootstrap(b *strings.Builder, binary *CoreDNSBinarySource) {
+	if binary == nil || !binary.Enabled() {
+		b.WriteString("command -v coredns >/dev/null || { echo 'lattice selfdns: coredns binary not found in PATH' >&2; exit 1; }\n")
+		b.WriteString("COREDNS_BIN=$(command -v coredns)\n")
+		return
+	}
+	b.WriteString("COREDNS_BIN=" + shellQuote(CoreDNSPath) + "\n")
+	b.WriteString("COREDNS_URL=" + shellQuote(binary.URL) + "\n")
+	b.WriteString("COREDNS_SHA256=" + shellQuote(binary.SHA256) + "\n")
+	b.WriteString("verify_coredns_sha256() {\n")
+	b.WriteString("  if command -v sha256sum >/dev/null; then printf '%s  %s\\n' \"$COREDNS_SHA256\" \"$1\" | sha256sum -c - >/dev/null; return $?; fi\n")
+	b.WriteString("  if command -v shasum >/dev/null; then printf '%s  %s\\n' \"$COREDNS_SHA256\" \"$1\" | shasum -a 256 -c - >/dev/null; return $?; fi\n")
+	b.WriteString("  echo 'lattice selfdns: sha256sum or shasum is required for pinned CoreDNS install' >&2\n")
+	b.WriteString("  return 127\n")
+	b.WriteString("}\n")
+	b.WriteString("install_pinned_coredns() {\n")
+	b.WriteString("  command -v install >/dev/null || { echo 'lattice selfdns: install command not found' >&2; return 1; }\n")
+	b.WriteString("  tmpdir=$(mktemp -d /tmp/lattice-coredns.XXXXXX)\n")
+	b.WriteString("  tmpbin=\"$tmpdir/coredns\"\n")
+	b.WriteString("  if command -v curl >/dev/null; then curl -fsSL --proto '=https' --tlsv1.2 \"$COREDNS_URL\" -o \"$tmpbin\"; elif command -v wget >/dev/null; then wget -qO \"$tmpbin\" \"$COREDNS_URL\"; else echo 'lattice selfdns: curl or wget is required for pinned CoreDNS install' >&2; return 1; fi\n")
+	b.WriteString("  verify_coredns_sha256 \"$tmpbin\"\n")
+	b.WriteString("  install -m 0755 \"$tmpbin\" \"$COREDNS_BIN\"\n")
+	b.WriteString("  rm -rf \"$tmpdir\"\n")
+	b.WriteString("}\n")
+	b.WriteString("if [ -x \"$COREDNS_BIN\" ] && verify_coredns_sha256 \"$COREDNS_BIN\"; then echo 'lattice selfdns: pinned CoreDNS already installed'; else install_pinned_coredns; fi\n")
+}
+
 func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-func serviceUnit() string {
+func serviceUnit(execStart string) string {
 	return `[Unit]
 Description=Lattice Self-host DNS
 After=network-online.target
@@ -441,7 +596,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/env coredns -conf /etc/lattice/selfdns/Corefile
+ExecStart=` + execStart + ` -conf /etc/lattice/selfdns/Corefile
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true

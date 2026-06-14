@@ -12,6 +12,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
+	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -31,6 +32,10 @@ func (p *captureDNSProvider) SetRecord(ctx context.Context, r ddns.Record) error
 }
 
 func newDNSServer(t *testing.T) (*Server, http.Handler, *store.Store) {
+	return newDNSServerWithOptions(t, Options{})
+}
+
+func newDNSServerWithOptions(t *testing.T, opts Options) (*Server, http.Handler, *store.Store) {
 	t.Helper()
 	st, err := store.Open("")
 	if err != nil {
@@ -42,7 +47,9 @@ func newDNSServer(t *testing.T) (*Server, http.Handler, *store.Store) {
 	if err := st.UpsertNode(model.Node{ID: "n2", Name: "la-1", WireGuardIP: "10.66.0.2/32", PublicIP: "198.51.100.9"}); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	opts.Store = st
+	opts.AdminPassword = testAdminPass
+	srv, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,6 +353,68 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 	} {
 		if !strings.Contains(task.Script, want) {
 			t.Fatalf("queued selfdns script missing %q:\n%s", want, task.Script)
+		}
+	}
+}
+
+func TestDNSPlanBindsPinnedCoreDNSBinaryIntoReviewedPlan(t *testing.T) {
+	_, handler, st := newDNSServerWithOptions(t, Options{CoreDNSBinary: selfdns.CoreDNSBinarySource{
+		Version: "1.12.4",
+		URL:     "https://downloads.example.com/coredns-1.12.4-linux-amd64",
+		SHA256:  strings.Repeat("b", 64),
+	}})
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create failed: %d", create.StatusCode)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	plan := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("plan failed: %d", plan.StatusCode)
+	}
+	var approval model.Approval
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"## CoreDNS binary",
+		"version: 1.12.4",
+		"url: https://downloads.example.com/coredns-1.12.4-linux-amd64",
+		"sha256: " + strings.Repeat("b", 64),
+	} {
+		if !strings.Contains(approval.Plan, want) {
+			t.Fatalf("approval plan missing pinned coredns metadata %q:\n%s", want, approval.Plan)
+		}
+	}
+	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
+	defer approve.Body.Close()
+	if approve.StatusCode != http.StatusOK {
+		t.Fatalf("selfdns queue_apply failed: %d", approve.StatusCode)
+	}
+	tasks := st.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("expected one selfdns task, got %+v", tasks)
+	}
+	for _, want := range []string{
+		"COREDNS_URL='https://downloads.example.com/coredns-1.12.4-linux-amd64'",
+		"COREDNS_SHA256='" + strings.Repeat("b", 64) + "'",
+		"ExecStart=/usr/local/bin/coredns -conf /etc/lattice/selfdns/Corefile",
+	} {
+		if !strings.Contains(tasks[0].Script, want) {
+			t.Fatalf("queued selfdns script missing pinned coredns install %q:\n%s", want, tasks[0].Script)
 		}
 	}
 }

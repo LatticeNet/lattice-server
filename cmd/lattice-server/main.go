@@ -11,6 +11,7 @@ import (
 
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/secret"
+	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/server"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -35,6 +36,9 @@ func main() {
 	var pluginTrust string
 	var masterKeyFile string
 	var publicURL string
+	var coreDNSVersion string
+	var coreDNSURL string
+	var coreDNSSHA256 string
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
 	flag.StringVar(&webRoot, "web", env("LATTICE_WEB_ROOT", "../lattice-dashboard"), "static dashboard root")
@@ -46,6 +50,9 @@ func main() {
 	flag.StringVar(&pluginTrust, "plugin-trust", env("LATTICE_PLUGIN_TRUST", ""), "path to the operator plugin trust policy JSON")
 	flag.StringVar(&masterKeyFile, "master-key-file", env("LATTICE_MASTER_KEY_FILE", ""), "path to the at-rest encryption master key file (auto-generated under the data dir if unset)")
 	flag.StringVar(&publicURL, "public-url", env("LATTICE_PUBLIC_URL", ""), "externally-reachable base URL (scheme+host), required for OIDC/SSO redirect")
+	flag.StringVar(&coreDNSVersion, "coredns-binary-version", env("LATTICE_COREDNS_BINARY_VERSION", ""), "pinned CoreDNS binary version for self-host DNS apply (requires -coredns-binary-url and -coredns-binary-sha256)")
+	flag.StringVar(&coreDNSURL, "coredns-binary-url", env("LATTICE_COREDNS_BINARY_URL", ""), "HTTPS URL to a direct CoreDNS executable binary for self-host DNS apply")
+	flag.StringVar(&coreDNSSHA256, "coredns-binary-sha256", env("LATTICE_COREDNS_BINARY_SHA256", ""), "SHA-256 hex digest of the CoreDNS executable binary")
 	flag.Parse()
 
 	trustPolicy, err := loadPluginTrust(pluginTrust)
@@ -86,6 +93,7 @@ func main() {
 		PluginDir:     pluginDir,
 		PluginTrust:   trustPolicy,
 		PublicURL:     publicURL,
+		CoreDNSBinary: selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
 		Logger:        log.Default(),
 	})
 	if err != nil {

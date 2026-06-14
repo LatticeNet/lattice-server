@@ -63,6 +63,10 @@ type Options struct {
 	// host, no trailing slash), used to build the OIDC redirect URL. Required
 	// for SSO login; empty disables the OIDC start/callback flow.
 	PublicURL string
+	// CoreDNSBinary optionally pins the CoreDNS executable that self-host DNS
+	// apply scripts may install. Empty preserves the fail-closed precondition
+	// that coredns already exists on the node.
+	CoreDNSBinary selfdns.CoreDNSBinarySource
 	// RenewalReminderInterval controls the machine-renewal reminder scheduler.
 	// Zero uses the production default. DisableRenewalScheduler is intended for
 	// tests that need full control over reminder evaluation.
@@ -109,6 +113,9 @@ type Server struct {
 	oidc *oidc.Manager
 	// publicURL is the external base URL used to build the OIDC redirect URI.
 	publicURL string
+	// coreDNSBinary is copied into selfdns approval plans when configured. The
+	// apply path parses the reviewed plan, not this mutable server field.
+	coreDNSBinary selfdns.CoreDNSBinarySource
 	// reminderInterval is the coarse scheduler tick for machine renewal checks.
 	reminderInterval time.Duration
 }
@@ -148,6 +155,10 @@ func New(opts Options) (*Server, error) {
 	if opts.Logger == nil {
 		opts.Logger = log.Default()
 	}
+	coreDNSBinary, err := opts.CoreDNSBinary.Normalize()
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		store:         opts.Store,
 		webFS:         opts.WebFS,
@@ -169,6 +180,7 @@ func New(opts Options) (*Server, error) {
 		},
 		oidc:             oidc.NewManager(),
 		publicURL:        strings.TrimRight(opts.PublicURL, "/"),
+		coreDNSBinary:    coreDNSBinary,
 		pluginTrust:      opts.PluginTrust,
 		reminderInterval: opts.RenewalReminderInterval,
 		now:              func() time.Time { return time.Now().UTC() },

@@ -33,6 +33,21 @@ go run ./cmd/lattice-server
 
 Open `http://127.0.0.1:8088`.
 
+Self-host DNS can optionally install a pinned CoreDNS executable during an
+approved `selfdns` apply. Leave these unset to keep the stricter precondition
+that `coredns` must already exist on the node:
+
+```sh
+LATTICE_COREDNS_BINARY_VERSION='1.12.4' \
+LATTICE_COREDNS_BINARY_URL='https://example.com/releases/coredns-1.12.4-linux-amd64' \
+LATTICE_COREDNS_BINARY_SHA256='<64 hex chars>' \
+go run ./cmd/lattice-server
+```
+
+The URL must be HTTPS and point directly to an executable binary. The reviewed
+approval plan includes the version, URL, SHA-256, and fixed install path
+(`/usr/local/bin/coredns`); the node installs only after digest verification.
+
 ## Build
 
 From the organization workspace:
@@ -107,7 +122,9 @@ the version in `go.mod`; during local multi-repo development, use the
   bound node's observed public IP changes. Service apply status
   (`last_applied_at` / `last_error`) is separate from hostname publication
   status (`last_published_at` / `last_publish_error`) so failures stay
-  attributable to the right layer.
+  attributable to the right layer. Optional CoreDNS install is server-configured
+  and plan-bound: the approval text contains the HTTPS URL and SHA-256, and the
+  agent applies exactly that reviewed artifact metadata.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/

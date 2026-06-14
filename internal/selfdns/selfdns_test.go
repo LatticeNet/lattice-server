@@ -210,6 +210,99 @@ func TestParseApprovalPlanAndApplyScript(t *testing.T) {
 	}
 }
 
+func TestPinnedCoreDNSBinaryIsPlanBoundAndInstalledByDigest(t *testing.T) {
+	dep := baseDeployment()
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, summary, err := ComposeFirewallPlan(dep, network.NFTPlan{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nft, err := network.GenerateNFTPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := CoreDNSBinarySource{
+		Version: "1.12.4",
+		URL:     "https://downloads.example.com/coredns-1.12.4-linux-amd64",
+		SHA256:  strings.Repeat("a", 64),
+	}
+	review, err := RenderApprovalPlanWithOptions(dep, "tokyo-1", cfg, nft, summary, ApprovalPlanOptions{CoreDNSBinary: binary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"## CoreDNS binary",
+		"version: 1.12.4",
+		"url: https://downloads.example.com/coredns-1.12.4-linux-amd64",
+		"sha256: " + strings.Repeat("a", 64),
+		"install_path: /usr/local/bin/coredns",
+	} {
+		if !strings.Contains(review, want) {
+			t.Fatalf("review plan missing %q:\n%s", want, review)
+		}
+	}
+	artifacts, err := ParseApprovalPlan(review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifacts.CoreDNSBinary == nil || artifacts.CoreDNSBinary.URL != binary.URL || artifacts.CoreDNSBinary.SHA256 != binary.SHA256 {
+		t.Fatalf("binary metadata not parsed: %+v", artifacts.CoreDNSBinary)
+	}
+	script, err := ApplyScriptFromPlan(review)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"COREDNS_BIN='/usr/local/bin/coredns'",
+		"COREDNS_URL='https://downloads.example.com/coredns-1.12.4-linux-amd64'",
+		"COREDNS_SHA256='" + strings.Repeat("a", 64) + "'",
+		"verify_coredns_sha256",
+		"curl -fsSL --proto '=https' --tlsv1.2",
+		"install -m 0755 \"$tmpbin\" \"$COREDNS_BIN\"",
+		"\"$COREDNS_BIN\" -conf '/etc/lattice/selfdns/Corefile' -plugins",
+		"ExecStart=/usr/local/bin/coredns -conf /etc/lattice/selfdns/Corefile",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("pinned install script missing %q:\n%s", want, script)
+		}
+	}
+	if strings.Contains(script, "command -v coredns >/dev/null ||") {
+		t.Fatalf("pinned install script should not fail just because PATH lacks coredns:\n%s", script)
+	}
+}
+
+func TestPinnedCoreDNSBinaryRejectsUnsafeMetadata(t *testing.T) {
+	cases := []CoreDNSBinarySource{
+		{Version: "1.12.4", URL: "http://downloads.example.com/coredns", SHA256: strings.Repeat("a", 64)},
+		{Version: "1.12.4", URL: "https://user:pass@downloads.example.com/coredns", SHA256: strings.Repeat("a", 64)},
+		{Version: "1.12.4\nbad", URL: "https://downloads.example.com/coredns", SHA256: strings.Repeat("a", 64)},
+		{Version: "1.12.4", URL: "https://downloads.example.com/coredns", SHA256: "not-a-sha"},
+		{Version: "1.12.4", URL: "", SHA256: strings.Repeat("a", 64)},
+	}
+	for i, src := range cases {
+		if _, err := src.Normalize(); err == nil {
+			t.Fatalf("case %d should reject unsafe binary metadata: %+v", i, src)
+		}
+	}
+}
+
+func TestParseApprovalPlanRejectsUnsafeCoreDNSBinarySection(t *testing.T) {
+	review := `# Lattice Self-host DNS plan
+
+## CoreDNS binary
+` + "```lattice-coredns-binary\nversion: 1.12.4\nurl: http://downloads.example.com/coredns\nsha256: " + strings.Repeat("a", 64) + "\ninstall_path: /usr/local/bin/coredns\n```\n" + `
+## CoreDNS Corefile
+` + "```coredns\n.:53 {\n  forward . 1.1.1.1\n}\n```\n" + `
+## nftables lattice_guard candidate
+` + "```nft\ntable inet lattice_guard {\n}\n```\n"
+	if _, err := ParseApprovalPlan(review); err == nil {
+		t.Fatal("unsafe coredns binary section should be rejected")
+	}
+}
+
 func TestParseApprovalPlanRejectsUnsafeZonePath(t *testing.T) {
 	review := `# Lattice Self-host DNS plan
 

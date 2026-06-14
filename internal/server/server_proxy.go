@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -98,6 +100,155 @@ type proxyNodeProfileView struct {
 	LastError     string    `json:"last_error,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	token, ok := subscriptionTokenFromPath(r.URL.Path)
+	tokenHash := proxySubTokenAuditHash(token)
+	if !ok {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "proxy.subscription.fetch",
+			Decision: "deny",
+			Reason:   "invalid subscription token path",
+			Metadata: map[string]string{"token_sha256": tokenHash},
+		})
+		writeError(w, http.StatusNotFound, errors.New("subscription not found"))
+		return
+	}
+	format, err := normalizeProxySubscriptionFormat(r.URL.Query().Get("format"))
+	if err != nil {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "proxy.subscription.fetch",
+			Decision: "deny",
+			Reason:   "invalid subscription format",
+			Metadata: map[string]string{"token_sha256": tokenHash},
+		})
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	user, found, duplicate := s.proxyUserBySubToken(token)
+	if duplicate {
+		s.logger.Printf("proxy subscription: duplicate sub_token hash %s; refusing public subscription", tokenHash)
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "proxy.subscription.fetch",
+			Decision: "deny",
+			Reason:   "duplicate subscription token",
+			Metadata: map[string]string{"token_sha256": tokenHash},
+		})
+		writeError(w, http.StatusNotFound, errors.New("subscription not found"))
+		return
+	}
+	if !found {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "proxy.subscription.fetch",
+			Decision: "deny",
+			Reason:   "subscription token not found",
+			Metadata: map[string]string{"token_sha256": tokenHash},
+		})
+		writeError(w, http.StatusNotFound, errors.New("subscription not found"))
+		return
+	}
+
+	links, warnings, err := proxycore.VLESSRealityLinks(user, s.proxySubscriptionProfiles(), s.store.ProxyInbounds(), proxycore.SubscriptionOptions{Now: s.now()})
+	if err != nil {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			ActorID:  user.ID,
+			Action:   "proxy.subscription.fetch",
+			Decision: "deny",
+			Reason:   "subscription render failed",
+			Metadata: map[string]string{"token_sha256": tokenHash, "user_id": user.ID},
+		})
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	body := proxycore.Base64Subscription(links)
+	if format == proxycore.SubscriptionFormatPlain {
+		body = proxycore.PlainSubscription(links)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Subscription-Userinfo", proxycore.SubscriptionUserinfo(user))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		ActorID:  user.ID,
+		Action:   "proxy.subscription.fetch",
+		Decision: "allow",
+		Metadata: map[string]string{
+			"token_sha256":  tokenHash,
+			"user_id":       user.ID,
+			"format":        format,
+			"link_count":    strconv.Itoa(len(links)),
+			"warning_count": strconv.Itoa(len(warnings)),
+		},
+	})
+}
+
+func subscriptionTokenFromPath(value string) (string, bool) {
+	if !strings.HasPrefix(value, "/sub/") {
+		return "", false
+	}
+	token := strings.TrimPrefix(value, "/sub/")
+	if token == "" || strings.Contains(token, "/") || !proxySubTokenRe.MatchString(token) {
+		return token, false
+	}
+	return token, true
+}
+
+func normalizeProxySubscriptionFormat(value string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", proxycore.SubscriptionFormatBase64:
+		return proxycore.SubscriptionFormatBase64, nil
+	case proxycore.SubscriptionFormatPlain:
+		return proxycore.SubscriptionFormatPlain, nil
+	default:
+		return "", errors.New("unsupported subscription format")
+	}
+}
+
+func (s *Server) proxyUserBySubToken(token string) (model.ProxyUser, bool, bool) {
+	want := sha256.Sum256([]byte(token))
+	var found model.ProxyUser
+	matches := 0
+	for _, user := range s.store.ProxyUsers() {
+		got := sha256.Sum256([]byte(user.SubToken))
+		if user.SubToken != "" && subtle.ConstantTimeCompare(want[:], got[:]) == 1 {
+			matches++
+			if matches == 1 {
+				found = user
+			}
+		}
+	}
+	return found, matches == 1, matches > 1
+}
+
+func (s *Server) proxySubscriptionProfiles() []proxycore.SubscriptionProfile {
+	profiles := s.store.ProxyNodeProfiles()
+	out := make([]proxycore.SubscriptionProfile, 0, len(profiles))
+	for _, profile := range profiles {
+		name := ""
+		if node, ok := s.store.Node(profile.NodeID); ok {
+			name = node.Name
+		}
+		out = append(out, proxycore.SubscriptionProfile{Profile: profile, NodeName: name})
+	}
+	return out
+}
+
+func proxySubTokenAuditHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) handleProxyInbounds(w http.ResponseWriter, r *http.Request, p principal) {
@@ -966,11 +1117,14 @@ func (s *Server) normalizeProxyUser(req, existing model.ProxyUser, hadExisting b
 		}
 		out.SubToken = token
 	} else if out.SubToken == "" {
-		token, err := auth.NewRandomToken(32)
+		token, err := s.newUniqueProxySubToken(out.ID)
 		if err != nil {
 			return model.ProxyUser{}, err
 		}
 		out.SubToken = token
+	}
+	if out.SubToken != "" && s.proxySubTokenInUse(out.SubToken, out.ID) {
+		return model.ProxyUser{}, errors.New("sub_token already exists")
 	}
 	if req.TrafficLimitBytes < 0 {
 		return model.ProxyUser{}, errors.New("traffic_limit_bytes cannot be negative")
@@ -983,6 +1137,33 @@ func (s *Server) normalizeProxyUser(req, existing model.ProxyUser, hadExisting b
 	}
 	out.Status = derivedProxyUserStatus(out)
 	return out, nil
+}
+
+func (s *Server) newUniqueProxySubToken(excludeID string) (string, error) {
+	for i := 0; i < 8; i++ {
+		token, err := auth.NewRandomToken(32)
+		if err != nil {
+			return "", err
+		}
+		if !s.proxySubTokenInUse(token, excludeID) {
+			return token, nil
+		}
+	}
+	return "", errors.New("could not generate unique sub_token")
+}
+
+func (s *Server) proxySubTokenInUse(token, excludeID string) bool {
+	want := sha256.Sum256([]byte(token))
+	for _, user := range s.store.ProxyUsers() {
+		if user.ID == excludeID || user.SubToken == "" {
+			continue
+		}
+		got := sha256.Sum256([]byte(user.SubToken))
+		if subtle.ConstantTimeCompare(want[:], got[:]) == 1 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) normalizeProxyNodeProfile(req, existing model.ProxyNodeProfile, hadExisting bool) (model.ProxyNodeProfile, error) {

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -381,6 +382,209 @@ func TestProxyPlanCreatesSecretFreeApproval(t *testing.T) {
 	}
 	if !auditMetadataSeen(st, "proxy.apply.applied", "config_sha", configSHA) {
 		t.Fatalf("missing proxy.apply.applied audit: %+v", st.AuditEvents())
+	}
+}
+
+func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+	profile, ok := st.ProxyNodeProfile("node-a")
+	if !ok {
+		t.Fatal("proxy node profile not found")
+	}
+	profile.AppliedSHA256 = strings.Repeat("a", 64)
+	profile.LastError = ""
+	if err := st.UpsertProxyNodeProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	const token = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
+	plain := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=plain", "", nil, "")
+	defer plain.Body.Close()
+	if plain.StatusCode != http.StatusOK {
+		t.Fatalf("plain subscription failed: %d", plain.StatusCode)
+	}
+	if got := plain.Header.Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := plain.Header.Get("Subscription-Userinfo"); !strings.Contains(got, "upload=0; download=0; total=0; expire=0") {
+		t.Fatalf("Subscription-Userinfo = %q", got)
+	}
+	plainBody := new(bytes.Buffer)
+	plainBody.ReadFrom(plain.Body)
+	body := plainBody.String()
+	for _, want := range []string{
+		"vless://11111111-1111-4111-8111-111111111111@node-a.dns.example.com:443?",
+		"pbk=public-reality-key-123456",
+		"sid=aa",
+		"sni=cdn.example.com",
+		"security=reality",
+		"type=tcp",
+		"#Node%20A%20-%20Inbound%20A",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("plain subscription missing %q:\n%s", want, body)
+		}
+	}
+	for _, leak := range []string{"super-secret-reality-private-key", "proxy-password-secret", token, `"sub_token"`} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("subscription leaked %q:\n%s", leak, body)
+		}
+	}
+
+	encoded := doJSON(t, handler, http.MethodGet, "/sub/"+token, "", nil, "")
+	defer encoded.Body.Close()
+	if encoded.StatusCode != http.StatusOK {
+		t.Fatalf("base64 subscription failed: %d", encoded.StatusCode)
+	}
+	encodedBody := new(bytes.Buffer)
+	encodedBody.ReadFrom(encoded.Body)
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encodedBody.String()))
+	if err != nil {
+		t.Fatalf("base64 subscription did not decode: %v; body=%q", err, encodedBody.String())
+	}
+	if string(decoded) != body {
+		t.Fatalf("base64 decoded body mismatch:\ngot  %q\nwant %q", decoded, body)
+	}
+
+	hash := proxySubTokenAuditHash(token)
+	if !auditMetadataSeen(st, "proxy.subscription.fetch", "token_sha256", hash) {
+		t.Fatalf("subscription fetch audit missing token hash: %+v", st.AuditEvents())
+	}
+	for _, ev := range st.AuditEvents() {
+		if ev.Action != "proxy.subscription.fetch" {
+			continue
+		}
+		if ev.Reason == token {
+			t.Fatalf("raw token leaked into audit reason: %+v", ev)
+		}
+		for key, value := range ev.Metadata {
+			if strings.Contains(key, token) || strings.Contains(value, token) {
+				t.Fatalf("raw token leaked into audit metadata: %+v", ev.Metadata)
+			}
+		}
+	}
+}
+
+func TestProxySubscriptionRejectsUnknownMethodsFormatsAndDuplicateTokens(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+	profile, ok := st.ProxyNodeProfile("node-a")
+	if !ok {
+		t.Fatal("proxy node profile not found")
+	}
+	profile.AppliedSHA256 = strings.Repeat("a", 64)
+	if err := st.UpsertProxyNodeProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+
+	const token = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
+	unknown := doJSON(t, handler, http.MethodGet, "/sub/unknown-token-secret-abcdefghijklmnopqrstuvwxyz", "", nil, "")
+	unknown.Body.Close()
+	if unknown.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown token should 404, got %d", unknown.StatusCode)
+	}
+	post := doJSON(t, handler, http.MethodPost, "/sub/"+token, "", nil, "")
+	post.Body.Close()
+	if post.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("subscription POST should 405, got %d", post.StatusCode)
+	}
+	badFormat := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=clash", "", nil, "")
+	badFormat.Body.Close()
+	if badFormat.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad subscription format should 400, got %d", badFormat.StatusCode)
+	}
+
+	sameUserUpdate := doJSON(t, handler, http.MethodPost, "/api/proxy/users", `{
+		"id":"alice",
+		"name":"Alice",
+		"enabled":true,
+		"uuid":"11111111-1111-4111-8111-111111111111",
+		"sub_token":"sub-token-secret-abcdefghijklmnopqrstuvwxyz",
+		"inbound_ids":["in-reality-443"]
+	}`, cookies, csrf)
+	sameUserUpdate.Body.Close()
+	if sameUserUpdate.StatusCode != http.StatusOK {
+		t.Fatalf("same user should be able to keep existing sub_token, got %d", sameUserUpdate.StatusCode)
+	}
+	duplicate := doJSON(t, handler, http.MethodPost, "/api/proxy/users", `{
+		"id":"bob",
+		"name":"Bob",
+		"enabled":true,
+		"uuid":"22222222-2222-4222-8222-222222222222",
+		"sub_token":"sub-token-secret-abcdefghijklmnopqrstuvwxyz",
+		"inbound_ids":["in-reality-443"]
+	}`, cookies, csrf)
+	duplicate.Body.Close()
+	if duplicate.StatusCode != http.StatusBadRequest {
+		t.Fatalf("duplicate sub_token should 400, got %d", duplicate.StatusCode)
+	}
+
+	alice, ok := st.ProxyUser("alice")
+	if !ok {
+		t.Fatal("alice not found")
+	}
+	dirtyDuplicate := alice
+	dirtyDuplicate.ID = "bob"
+	dirtyDuplicate.UUID = "22222222-2222-4222-8222-222222222222"
+	if err := st.UpsertProxyUser(dirtyDuplicate); err != nil {
+		t.Fatal(err)
+	}
+	failClosed := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=plain", "", nil, "")
+	failClosed.Body.Close()
+	if failClosed.StatusCode != http.StatusNotFound {
+		t.Fatalf("dirty duplicate token should fail closed with 404, got %d", failClosed.StatusCode)
+	}
+}
+
+func TestProxySubscriptionOmitsInactiveUsersAndUnappliedProfiles(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+
+	const token = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
+	inactive := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=plain", "", nil, "")
+	defer inactive.Body.Close()
+	if inactive.StatusCode != http.StatusOK {
+		t.Fatalf("unapplied profile should still return an empty subscription, got %d", inactive.StatusCode)
+	}
+	body := new(bytes.Buffer)
+	body.ReadFrom(inactive.Body)
+	if body.Len() != 0 {
+		t.Fatalf("unapplied profile should return an empty body, got %q", body.String())
+	}
+
+	profile, ok := st.ProxyNodeProfile("node-a")
+	if !ok {
+		t.Fatal("proxy node profile not found")
+	}
+	profile.AppliedSHA256 = strings.Repeat("a", 64)
+	if err := st.UpsertProxyNodeProfile(profile); err != nil {
+		t.Fatal(err)
+	}
+	alice, ok := st.ProxyUser("alice")
+	if !ok {
+		t.Fatal("alice not found")
+	}
+	alice.Enabled = false
+	alice.Status = model.ProxyUserStatusDisabled
+	if err := st.UpsertProxyUser(alice); err != nil {
+		t.Fatal(err)
+	}
+	disabled := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=plain", "", nil, "")
+	defer disabled.Body.Close()
+	if disabled.StatusCode != http.StatusOK {
+		t.Fatalf("disabled user should still return an empty subscription, got %d", disabled.StatusCode)
+	}
+	body.Reset()
+	body.ReadFrom(disabled.Body)
+	if body.Len() != 0 {
+		t.Fatalf("disabled user should return an empty body, got %q", body.String())
 	}
 }
 

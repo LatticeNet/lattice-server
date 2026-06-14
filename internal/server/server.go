@@ -85,6 +85,7 @@ type Server struct {
 	totpLimiter   *ratelimit.Limiter
 	agentLimiter  *ratelimit.Limiter
 	apiLimiter    *ratelimit.Limiter
+	subLimiter    *ratelimit.Limiter
 	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
 	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
 	// who already targets a known account cannot widen the password-guess budget by
@@ -175,6 +176,10 @@ func New(opts Options) (*Server, error) {
 		agentLimiter: ratelimit.New(ratelimit.Config{Rate: 10, Burst: 40}),
 		// General authenticated API surface.
 		apiLimiter: ratelimit.New(ratelimit.Config{Rate: 30, Burst: 60}),
+		// Public subscription URLs are token-authenticated, unauthenticated HTTP
+		// endpoints. Keep a separate low-rate bucket so subscription probing cannot
+		// consume the operator/API limiter or widen token-search throughput.
+		subLimiter: ratelimit.New(ratelimit.Config{Rate: 2, Burst: 20}),
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
@@ -568,6 +573,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tunnels/plan", s.withAuth("tunnel:admin", s.handleTunnelPlan))
 	mux.HandleFunc("/api/network/approvals", s.withAuth("network:plan", s.handleApprovals))
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
+	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleProxySubscription))
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
 	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
 	mux.HandleFunc("/api/agent/tasks", s.withAgentLimit(s.handleAgentTasks))
@@ -635,6 +641,19 @@ func (s *Server) staticHandler() http.Handler {
 func (s *Server) withAgentLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.agentLimiter.Allow(s.clientIP(r)) {
+			writeError(w, http.StatusTooManyRequests, errors.New("rate limited"))
+			return
+		}
+		next(w, r)
+	}
+}
+
+// withSubscriptionLimit applies a dedicated limiter to public subscription URLs.
+// They intentionally bypass sessions/CSRF, so rate limiting must happen before
+// any credential scan.
+func (s *Server) withSubscriptionLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.subLimiter.Allow(s.clientIP(r)) {
 			writeError(w, http.StatusTooManyRequests, errors.New("rate limited"))
 			return
 		}

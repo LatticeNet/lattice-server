@@ -2,15 +2,33 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/ddns"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
+
+type captureDNSProvider struct {
+	ch chan ddns.Record
+}
+
+func (p *captureDNSProvider) Kind() string { return "capture" }
+
+func (p *captureDNSProvider) SetRecord(ctx context.Context, r ddns.Record) error {
+	select {
+	case p.ch <- r:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 func newDNSServer(t *testing.T) (*Server, http.Handler, *store.Store) {
 	t.Helper()
@@ -112,6 +130,33 @@ func TestDNSDeploymentValidatesConfig(t *testing.T) {
 				t.Fatalf("expected 400, got %d", res.StatusCode)
 			}
 		})
+	}
+}
+
+func TestDNSDeploymentRequiresCloudflareDDNSProfile(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	if err := st.UpsertDDNSProfile(model.DDNSProfile{
+		ID:         "ddns_webhook",
+		Name:       "webhook",
+		NodeID:     "n1",
+		Provider:   model.DDNSProviderWebhook,
+		Domains:    []string{"old.example.com"},
+		WebhookURL: "https://example.com/hook",
+		EnableIPv4: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"hostname":"n1.dns.example.com",
+		"ddns_profile_id":"ddns_webhook",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("non-cloudflare profile must be rejected for dns publish, got %d", res.StatusCode)
 	}
 }
 
@@ -331,6 +376,230 @@ func TestDNSPlanRequiresNetworkPlanScope(t *testing.T) {
 	allowed.Body.Close()
 	if allowed.StatusCode != http.StatusOK {
 		t.Fatalf("dns+network token should create plan, got %d", allowed.StatusCode)
+	}
+}
+
+func TestDNSPublishUsesDDNSProviderAndRecordsStatus(t *testing.T) {
+	srv, handler, st := newDNSServer(t)
+	fp := &fakeProvider{}
+	var seen model.DDNSProfile
+	srv.ddnsProvider = func(p model.DDNSProfile) (ddns.Provider, error) {
+		seen = p
+		return fp, nil
+	}
+	node, ok := st.Node("n1")
+	if !ok {
+		t.Fatal("missing node")
+	}
+	node.PublicIP = "203.0.113.77"
+	node.PublicIPv6 = "2001:db8::77"
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"hostname":"gmami-jp1.dns.roobli.org",
+		"cf_api_token":"super-secret-dns-token",
+		"publish_ipv4":true,
+		"publish_ipv6":true,
+		"record_ttl":120,
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	create.Body.Close()
+
+	publish := doJSON(t, handler, http.MethodPost, "/api/dns/publish", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	defer publish.Body.Close()
+	body := new(bytes.Buffer)
+	body.ReadFrom(publish.Body)
+	if publish.StatusCode != http.StatusOK {
+		t.Fatalf("publish failed: %d %s", publish.StatusCode, body.String())
+	}
+	if strings.Contains(body.String(), "super-secret-dns-token") || strings.Contains(body.String(), "cf_api_token") {
+		t.Fatalf("publish response leaked secret: %s", body.String())
+	}
+	if seen.Provider != model.DDNSProviderCloudflare || seen.CFAPIToken != "super-secret-dns-token" ||
+		len(seen.Domains) != 1 || seen.Domains[0] != "gmami-jp1.dns.roobli.org" || seen.TTL != 120 {
+		t.Fatalf("bad publish profile: %+v", seen)
+	}
+	if len(fp.records) != 2 {
+		t.Fatalf("expected A+AAAA publish records, got %+v", fp.records)
+	}
+	if fp.records[0].Name != "gmami-jp1.dns.roobli.org" || fp.records[0].TTL != 120 {
+		t.Fatalf("bad record metadata: %+v", fp.records)
+	}
+	dep, ok := st.DNSDeployment(created.ID)
+	if !ok {
+		t.Fatal("stored deployment missing")
+	}
+	if dep.LastIPv4 != "203.0.113.77" || dep.LastIPv6 != "2001:db8::77" || dep.LastError != "" || dep.LastAppliedAt.IsZero() {
+		t.Fatalf("publish status not recorded: %+v", dep)
+	}
+	assertResponseAuditCorrelation(t, st, publish, "dns.publish", "dns:admin")
+}
+
+func TestDNSPublishReusesCloudflareDDNSProfileCredential(t *testing.T) {
+	srv, handler, st := newDNSServer(t)
+	fp := &fakeProvider{}
+	var seen model.DDNSProfile
+	srv.ddnsProvider = func(p model.DDNSProfile) (ddns.Provider, error) {
+		seen = p
+		return fp, nil
+	}
+	if err := st.UpsertDDNSProfile(model.DDNSProfile{
+		ID:         "ddns_cf",
+		Name:       "shared cf",
+		NodeID:     "n1",
+		Provider:   model.DDNSProviderCloudflare,
+		Domains:    []string{"old.example.com"},
+		CFAPIToken: "shared-token",
+		EnableIPv4: true,
+		EnableIPv6: true,
+		MaxRetries: 3,
+		TTL:        300,
+		LastRunAt:  time.Now().UTC(),
+		LastIPv4:   "198.51.100.1",
+		LastIPv6:   "2001:db8::1",
+		LastError:  "old",
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, _ := st.Node("n1")
+	node.PublicIP = "203.0.113.88"
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"hostname":"profile.dns.roobli.org",
+		"ddns_profile_id":"ddns_cf",
+		"publish_ipv4":true,
+		"publish_ipv6":false,
+		"record_ttl":60,
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	create.Body.Close()
+
+	publish := doJSON(t, handler, http.MethodPost, "/api/dns/publish", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	publish.Body.Close()
+	if publish.StatusCode != http.StatusOK {
+		t.Fatalf("publish with profile failed: %d", publish.StatusCode)
+	}
+	if seen.CFAPIToken != "shared-token" || seen.Domains[0] != "profile.dns.roobli.org" || seen.TTL != 60 || seen.MaxRetries != 3 {
+		t.Fatalf("dns publish did not build the expected profile: %+v", seen)
+	}
+	if len(fp.records) != 1 || fp.records[0].Type != "A" || fp.records[0].IP != "203.0.113.88" {
+		t.Fatalf("bad publish records: %+v", fp.records)
+	}
+	shared, ok := st.DDNSProfile("ddns_cf")
+	if !ok || shared.LastError != "old" || shared.LastIPv4 != "198.51.100.1" {
+		t.Fatalf("dns publish must not mutate reusable ddns profile status: ok=%v profile=%+v", ok, shared)
+	}
+}
+
+func TestDNSPublishFailureIsAuditedAndRecorded(t *testing.T) {
+	srv, handler, st := newDNSServer(t)
+	srv.ddnsProvider = func(p model.DDNSProfile) (ddns.Provider, error) {
+		t.Fatal("provider must not be constructed when no publishable IP exists")
+		return nil, nil
+	}
+	node, _ := st.Node("n1")
+	node.PublicIP = ""
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"hostname":"missing-ip.dns.roobli.org",
+		"cf_api_token":"super-secret-dns-token",
+		"publish_ipv4":true,
+		"publish_ipv6":false,
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	create.Body.Close()
+
+	publish := doJSON(t, handler, http.MethodPost, "/api/dns/publish", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	publish.Body.Close()
+	if publish.StatusCode != http.StatusBadGateway {
+		t.Fatalf("publish without node IPv4 should fail as upstream error, got %d", publish.StatusCode)
+	}
+	dep, ok := st.DNSDeployment(created.ID)
+	if !ok || dep.LastError == "" || dep.LastAppliedAt.IsZero() {
+		t.Fatalf("publish failure should be recorded: ok=%v dep=%+v", ok, dep)
+	}
+	if !auditMetadataSeen(st, "dns.publish", "ok", "false") {
+		t.Fatalf("publish failure should be audited: %+v", st.AuditEvents())
+	}
+}
+
+func TestDNSPublishRunsOnNodeIPChange(t *testing.T) {
+	srv, _, st := newDNSServer(t)
+	cap := &captureDNSProvider{ch: make(chan ddns.Record, 1)}
+	srv.ddnsProvider = func(p model.DDNSProfile) (ddns.Provider, error) {
+		return cap, nil
+	}
+	if err := st.UpsertDNSDeployment(model.DNSDeployment{
+		ID:          "dns_auto",
+		Name:        "auto dns",
+		NodeID:      "n1",
+		Engine:      model.DNSEngineCoreDNS,
+		ListenPort:  53,
+		EnableUDP:   true,
+		EnableTCP:   true,
+		Exposure:    model.DNSExposureMesh,
+		Zones:       []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}},
+		Hostname:    "auto.dns.roobli.org",
+		PublishIPv4: true,
+		CFAPIToken:  "auto-token",
+		Status:      model.DNSStatusRunning,
+		CreatedAt:   time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv.maybeTriggerDDNS("n1", "203.0.113.1", "", "203.0.113.99", "")
+	select {
+	case rec := <-cap.ch:
+		if rec.Type != "A" || rec.Name != "auto.dns.roobli.org" || rec.IP != "203.0.113.99" {
+			t.Fatalf("unexpected auto publish record: %+v", rec)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for automatic dns publish")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		dep, ok := st.DNSDeployment("dns_auto")
+		if ok && dep.LastIPv4 == "203.0.113.99" && dep.LastError == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("auto publish status not persisted: ok=%v dep=%+v", ok, dep)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

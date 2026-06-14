@@ -525,6 +525,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/dns/deployments", s.withAuth("dns:admin", s.handleDNSDeployments))
 	mux.HandleFunc("/api/dns/deployments/delete", s.withAuth("dns:admin", s.handleDeleteDNSDeployment))
 	mux.HandleFunc("/api/dns/plan", s.withAuth("dns:admin", s.handleDNSPlan))
+	mux.HandleFunc("/api/dns/publish", s.withAuth("dns:admin", s.handleDNSPublish))
 	mux.HandleFunc("/api/machines", s.withAuth("", s.handleMachines))
 	mux.HandleFunc("/api/machines/update", s.withAuth("inventory:admin", s.handleMachineUpdate))
 	mux.HandleFunc("/api/machines/delete", s.withAuth("inventory:admin", s.handleDeleteMachine))
@@ -2467,6 +2468,17 @@ func (s *Server) maybeTriggerDDNS(nodeID, oldV4, oldV6, newV4, newV6 string) {
 		go func() {
 			if err := s.runDDNS(profile, newV4, newV6); err != nil {
 				s.logger.Printf("ddns: profile %s update failed: %v", profile.ID, err)
+			}
+		}()
+	}
+	for _, dep := range s.store.DNSDeploymentsForNode(nodeID) {
+		dep := dep
+		if dep.Hostname == "" || dep.Disabled {
+			continue
+		}
+		go func() {
+			if err := s.publishDNSDeployment(dep, newV4, newV6); err != nil {
+				s.logger.Printf("dns publish: deployment %s update failed: %v", dep.ID, err)
 			}
 		}()
 	}

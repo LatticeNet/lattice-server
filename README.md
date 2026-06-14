@@ -18,7 +18,8 @@ Responsibilities:
   ingress policy composition into the Network Guard input table.
 - Self-host DNS deployment intent CRUD with encrypted Cloudflare token storage,
   secret-free read views, CoreDNS/nft plan generation, rollback-protected apply,
-  and task-result status reconciliation. Cloudflare publish is a later slice.
+  task-result status reconciliation, and Cloudflare hostname publication through
+  the existing DDNS provider.
 - Operator-owned NodeGeo API for the dashboard Fleet Map.
 - Append-only audit events.
 
@@ -93,14 +94,17 @@ the version in `go.mod`; during local multi-repo development, use the
   deny/allow rules compose into Network Guard's single `lattice_guard` input
   render rather than a competing input table.
 - DNS deployment state (`/api/dns/deployments`) is server-owned intent for
-  future CoreDNS deployment. Writes require `dns:admin` on the target node,
-  node existence is checked, Cloudflare tokens are write-only and encrypted at
-  rest, and read views expose only `has_credential`. `/api/dns/plan` requires
-  both `dns:admin` and same-node `network:plan`, renders a secret-free CoreDNS
+  CoreDNS deployment. Writes require `dns:admin` on the target node, node
+  existence is checked, Cloudflare tokens are write-only and encrypted at rest,
+  and read views expose only `has_credential`. `/api/dns/plan` requires both
+  `dns:admin` and same-node `network:plan`, renders a secret-free CoreDNS
   Corefile plus composed `lattice_guard` nft candidate into a pending `selfdns`
   approval, and queueing apply writes the reviewed artifacts, commits nft with
   rollback, manages `lattice-selfdns.service`, and updates deployment status
-  from task results. Cloudflare record publication is not implemented yet.
+  from task results. `/api/dns/publish` reuses the existing Cloudflare DDNS
+  provider server-side, never sends CF tokens to agents, records the last
+  published A/AAAA values on the DNSDeployment, and is also triggered when the
+  bound node's observed public IP changes.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/

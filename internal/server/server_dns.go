@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/ddns"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
@@ -252,6 +254,52 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	writeJSON(w, http.StatusOK, approval)
 }
 
+func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+	dep, ok := s.store.DNSDeployment(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("dns deployment not found"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "dns:admin", dep.NodeID) {
+		return
+	}
+	if dep.Disabled {
+		writeError(w, http.StatusBadRequest, errors.New("dns deployment is disabled"))
+		return
+	}
+	node, ok := s.store.Node(dep.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	if err := s.publishDNSDeploymentForPrincipal(r.Context(), p, dep, node.PublicIP, node.PublicIPv6); err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	updated, _ := s.store.DNSDeployment(dep.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"ipv4":       updated.LastIPv4,
+		"ipv6":       updated.LastIPv6,
+		"deployment": s.toDNSDeploymentView(updated),
+	})
+}
+
 func selfDNSApprovalAction(deploymentID string) string {
 	return selfDNSApplyActionPrefix + base64.RawURLEncoding.EncodeToString([]byte(deploymentID))
 }
@@ -367,6 +415,150 @@ func (s *Server) handleSelfDNSTaskResult(r *http.Request, approval model.Approva
 	return nil
 }
 
+func (s *Server) publishDNSDeployment(dep model.DNSDeployment, v4, v6 string) error {
+	return s.publishDNSDeploymentWithAudit(context.Background(), dep, v4, v6, s.recordAudit)
+}
+
+func (s *Server) publishDNSDeploymentForPrincipal(ctx context.Context, p principal, dep model.DNSDeployment, v4, v6 string) error {
+	return s.publishDNSDeploymentWithAudit(ctx, dep, v4, v6, func(ev model.AuditEvent) {
+		s.recordPrincipalAudit(p, ev)
+	})
+}
+
+func (s *Server) publishDNSDeploymentWithAudit(parent context.Context, dep model.DNSDeployment, v4, v6 string, record func(model.AuditEvent)) error {
+	recordPublishAudit := func(ok bool) {
+		record(model.AuditEvent{
+			ID:     id.New("audit"),
+			NodeID: dep.NodeID,
+			Action: "dns.publish",
+			Scope:  "dns:admin",
+			Metadata: map[string]string{
+				"dns_id":   dep.ID,
+				"hostname": dep.Hostname,
+				"ok":       fmt.Sprintf("%t", ok),
+			},
+		})
+	}
+	profile, err := s.dnsPublishProfile(dep)
+	if err != nil {
+		s.markDNSPublishResult(dep, "", "", err)
+		recordPublishAudit(false)
+		return err
+	}
+	publishV4, publishV6, err := publishableDNSIPs(profile, v4, v6)
+	if err != nil {
+		s.markDNSPublishResult(dep, "", "", err)
+		recordPublishAudit(false)
+		return err
+	}
+	prov, err := s.ddnsProvider(profile)
+	if err != nil {
+		s.markDNSPublishResult(dep, publishV4, publishV6, err)
+		recordPublishAudit(false)
+		return err
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	applyErr := ddns.Apply(ctx, prov, profile, publishV4, publishV6)
+	if err := s.markDNSPublishResult(dep, publishV4, publishV6, applyErr); err != nil {
+		s.logger.Printf("dns publish: persist deployment %s: %v", dep.ID, err)
+	}
+	recordPublishAudit(applyErr == nil)
+	return applyErr
+}
+
+func (s *Server) dnsPublishProfile(dep model.DNSDeployment) (model.DDNSProfile, error) {
+	if strings.TrimSpace(dep.Hostname) == "" {
+		return model.DDNSProfile{}, errors.New("dns deployment has no hostname to publish")
+	}
+	if dep.Disabled {
+		return model.DDNSProfile{}, errors.New("dns deployment is disabled")
+	}
+	profile := model.DDNSProfile{
+		ID:         "dns:" + dep.ID,
+		Name:       "dns:" + dep.Name,
+		NodeID:     dep.NodeID,
+		Provider:   model.DDNSProviderCloudflare,
+		Domains:    []string{dep.Hostname},
+		EnableIPv4: dep.PublishIPv4,
+		EnableIPv6: dep.PublishIPv6,
+		TTL:        dep.RecordTTL,
+	}
+	if !profile.EnableIPv4 && !profile.EnableIPv6 {
+		profile.EnableIPv4 = true
+	}
+	if profile.TTL == 0 {
+		profile.TTL = 60
+	}
+	if dep.DDNSProfileID != "" {
+		reusable, ok := s.store.DDNSProfile(dep.DDNSProfileID)
+		if !ok {
+			return model.DDNSProfile{}, errors.New("ddns_profile_id does not exist")
+		}
+		if reusable.NodeID != "" && reusable.NodeID != dep.NodeID {
+			return model.DDNSProfile{}, errors.New("ddns_profile_id must belong to the same node")
+		}
+		if reusable.Provider != model.DDNSProviderCloudflare {
+			return model.DDNSProfile{}, errors.New("ddns_profile_id must reference a cloudflare profile")
+		}
+		if reusable.CFAPIToken == "" {
+			return model.DDNSProfile{}, errors.New("ddns_profile_id has no cloudflare credential")
+		}
+		profile.CFAPIToken = reusable.CFAPIToken
+		profile.MaxRetries = reusable.MaxRetries
+	} else {
+		profile.CFAPIToken = dep.CFAPIToken
+	}
+	if profile.CFAPIToken == "" {
+		return model.DDNSProfile{}, errors.New("hostname publishing requires cf_api_token or ddns_profile_id")
+	}
+	return profile, nil
+}
+
+func publishableDNSIPs(profile model.DDNSProfile, v4, v6 string) (string, string, error) {
+	outV4, outV6 := "", ""
+	if profile.EnableIPv4 {
+		if strings.TrimSpace(v4) == "" {
+			return "", "", errors.New("publish_ipv4 is enabled but the node has no public IPv4")
+		}
+		ip, err := netip.ParseAddr(strings.TrimSpace(v4))
+		if err != nil || !ip.Is4() || ip.IsUnspecified() {
+			return "", "", errors.New("node public IPv4 is invalid")
+		}
+		outV4 = ip.String()
+	}
+	if profile.EnableIPv6 {
+		if strings.TrimSpace(v6) == "" {
+			return "", "", errors.New("publish_ipv6 is enabled but the node has no public IPv6")
+		}
+		ip, err := netip.ParseAddr(strings.TrimSpace(v6))
+		if err != nil || !ip.Is6() || ip.IsUnspecified() {
+			return "", "", errors.New("node public IPv6 is invalid")
+		}
+		outV6 = ip.String()
+	}
+	if outV4 == "" && outV6 == "" {
+		return "", "", errors.New("no enabled public IP family is available for publishing")
+	}
+	return outV4, outV6, nil
+}
+
+func (s *Server) markDNSPublishResult(dep model.DNSDeployment, v4, v6 string, err error) error {
+	if v4 != "" {
+		dep.LastIPv4 = v4
+	}
+	if v6 != "" {
+		dep.LastIPv6 = v6
+	}
+	dep.LastAppliedAt = s.now()
+	if err != nil {
+		dep.LastError = err.Error()
+	} else {
+		dep.LastError = ""
+	}
+	return s.store.UpsertDNSDeployment(dep)
+}
+
 func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadExisting bool) (model.DNSDeployment, error) {
 	req.ID = strings.TrimSpace(req.ID)
 	if req.ID == "" {
@@ -434,6 +626,12 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		}
 		if profile.NodeID != "" && profile.NodeID != req.NodeID {
 			return model.DNSDeployment{}, errors.New("ddns_profile_id must belong to the same node")
+		}
+		if profile.Provider != model.DDNSProviderCloudflare {
+			return model.DNSDeployment{}, errors.New("ddns_profile_id must reference a cloudflare profile")
+		}
+		if profile.CFAPIToken == "" {
+			return model.DNSDeployment{}, errors.New("ddns_profile_id has no cloudflare credential")
 		}
 		req.CFAPIToken = ""
 	} else if req.CFAPIToken == "" && hadExisting {

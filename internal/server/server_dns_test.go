@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -17,10 +18,10 @@ func newDNSServer(t *testing.T) (*Server, http.Handler, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertNode(model.Node{ID: "n1", Name: "tokyo-1", PublicIP: "203.0.113.7"}); err != nil {
+	if err := st.UpsertNode(model.Node{ID: "n1", Name: "tokyo-1", WireGuardIP: "10.66.0.1/32", PublicIP: "203.0.113.7"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertNode(model.Node{ID: "n2", Name: "la-1", PublicIP: "198.51.100.9"}); err != nil {
+	if err := st.UpsertNode(model.Node{ID: "n2", Name: "la-1", WireGuardIP: "10.66.0.2/32", PublicIP: "198.51.100.9"}); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
@@ -206,5 +207,108 @@ func TestDNSDeploymentDelete(t *testing.T) {
 	}
 	if len(out.Deployments) != 0 {
 		t.Fatalf("expected no deployments after delete: %+v", out)
+	}
+}
+
+func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	saveInputs := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs", `{
+		"node_id":"n1",
+		"interface_name":"ens3",
+		"wireguard_cidr":"10.66.0.0/24",
+		"public_tcp":[443]
+	}`, cookies, csrf)
+	saveInputs.Body.Close()
+	if saveInputs.StatusCode != http.StatusOK {
+		t.Fatalf("save nft inputs failed: %d", saveInputs.StatusCode)
+	}
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"hostname":"n1.dns.example.com",
+		"cf_api_token":"super-secret-dns-token",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1","9.9.9.9"]}]
+	}`, cookies, csrf)
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	create.Body.Close()
+
+	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	defer planRes.Body.Close()
+	if planRes.StatusCode != http.StatusOK {
+		t.Fatalf("dns plan failed: %d", planRes.StatusCode)
+	}
+	var approval model.Approval
+	if err := json.NewDecoder(planRes.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	if approval.Plugin != "selfdns" || approval.Action != "apply-config" || approval.NodeID != "n1" {
+		t.Fatalf("bad approval: %+v", approval)
+	}
+	for _, want := range []string{
+		"# Lattice Self-host DNS plan",
+		"node_name: tokyo-1",
+		"credential=true",
+		"bind 10.66.0.1",
+		"forward . 1.1.1.1 9.9.9.9",
+		"nft inputs source: stored",
+		`iifname "ens3" tcp dport { 443 }`,
+		`ip saddr @wg_peers4 udp dport { 53 }`,
+		`ip saddr @wg_peers4 tcp dport { 53 }`,
+		"publish n1.dns.example.com",
+	} {
+		if !strings.Contains(approval.Plan, want) {
+			t.Fatalf("approval plan missing %q:\n%s", want, approval.Plan)
+		}
+	}
+	if strings.Contains(approval.Plan, "super-secret-dns-token") || strings.Contains(approval.Plan, "cf_api_token") {
+		t.Fatalf("approval plan leaked secret material:\n%s", approval.Plan)
+	}
+	if !auditMetadataSeen(st, "dns.plan", "approval_id", approval.ID) {
+		t.Fatalf("missing dns.plan audit metadata: %+v", st.AuditEvents())
+	}
+
+	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
+	defer approve.Body.Close()
+	if approve.StatusCode != http.StatusBadRequest {
+		t.Fatalf("selfdns queue_apply should be blocked until apply exists, got %d", approve.StatusCode)
+	}
+	if tasks := st.Tasks(); len(tasks) != 0 {
+		t.Fatalf("review-only selfdns plan must not queue a task: %+v", tasks)
+	}
+}
+
+func TestDNSPlanRequiresNetworkPlanScope(t *testing.T) {
+	_, handler, _ := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	var created struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(create.Body).Decode(&created)
+	create.Body.Close()
+
+	dnsOnly := createPAT(t, handler, cookies, csrf, []string{"dns:admin"}, []string{"n1"})
+	denied := doBearerJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, dnsOnly)
+	denied.Body.Close()
+	if denied.StatusCode != http.StatusForbidden {
+		t.Fatalf("dns-only token must not view firewall-bearing plan, got %d", denied.StatusCode)
+	}
+
+	withNetwork := createPAT(t, handler, cookies, csrf, []string{"dns:admin", "network:plan"}, []string{"n1"})
+	allowed := doBearerJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, withNetwork)
+	allowed.Body.Close()
+	if allowed.StatusCode != http.StatusOK {
+		t.Fatalf("dns+network token should create plan, got %d", allowed.StatusCode)
 	}
 }

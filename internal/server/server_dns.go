@@ -6,12 +6,15 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/selfdns"
 )
 
 var dnsLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -144,6 +147,103 @@ func (s *Server) handleDeleteDNSDeployment(w http.ResponseWriter, r *http.Reques
 		Metadata: map[string]string{"dns_id": req.ID},
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+	dep, ok := s.store.DNSDeployment(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("dns deployment not found"))
+		return
+	}
+	node, ok := s.store.Node(dep.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "dns:admin", dep.NodeID) {
+		return
+	}
+	// DNS plans include the composed lattice_guard ruleset, so callers must also
+	// be allowed to view network plans for the same node.
+	if !s.requireNodeScope(w, p, "network:plan", dep.NodeID) {
+		return
+	}
+
+	cfg, err := selfdns.GenerateConfig(dep, selfdns.RenderOptions{MeshBindIP: node.WireGuardIP})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	planInput := network.NFTPlan{}
+	inputSource := "default"
+	if stored, ok := s.store.NFTInputs(dep.NodeID); ok {
+		planInput = nftPlanFromStoredInputs(stored)
+		inputSource = "stored"
+	}
+	ingressRules, err := s.composeNFTIngressPolicy(dep.NodeID, &planInput, p)
+	if err != nil {
+		if errors.Is(err, errNFTIngressPolicyReadRequired) {
+			writeError(w, http.StatusForbidden, err)
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	composed, firewallSummary, err := selfdns.ComposeFirewallPlan(dep, planInput)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	firewallSummary = append([]string{"nft inputs source: " + inputSource}, firewallSummary...)
+	if ingressRules > 0 {
+		firewallSummary = append(firewallSummary, "ingress netpolicy rules composed: "+strconv.Itoa(ingressRules))
+	}
+	nftRuleset, err := network.GenerateNFTPlan(composed)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	approval := model.Approval{
+		ID:        id.New("approval"),
+		NodeID:    dep.NodeID,
+		Plugin:    "selfdns",
+		Action:    "apply-config",
+		Plan:      selfdns.RenderApprovalPlan(dep, node.Name, cfg, nftRuleset, firewallSummary),
+		Status:    model.ApprovalPending,
+		ActorID:   p.ActorID,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.store.UpsertApproval(approval); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	metadata := map[string]string{
+		"approval_id": approval.ID,
+		"dns_id":      dep.ID,
+		"engine":      dep.Engine,
+		"exposure":    dep.Exposure,
+		"nft_source":  inputSource,
+	}
+	if ingressRules > 0 {
+		metadata["ingress_rules"] = strconv.Itoa(ingressRules)
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: dep.NodeID, Action: "dns.plan", Scope: "dns:admin", Metadata: metadata})
+	writeJSON(w, http.StatusOK, approval)
 }
 
 func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadExisting bool) (model.DNSDeployment, error) {

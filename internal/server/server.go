@@ -523,6 +523,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/ddns/run", s.withAuth("ddns:admin", s.handleRunDDNS))
 	mux.HandleFunc("/api/dns/deployments", s.withAuth("dns:admin", s.handleDNSDeployments))
 	mux.HandleFunc("/api/dns/deployments/delete", s.withAuth("dns:admin", s.handleDeleteDNSDeployment))
+	mux.HandleFunc("/api/dns/plan", s.withAuth("dns:admin", s.handleDNSPlan))
 	mux.HandleFunc("/api/machines", s.withAuth("", s.handleMachines))
 	mux.HandleFunc("/api/machines/update", s.withAuth("inventory:admin", s.handleMachineUpdate))
 	mux.HandleFunc("/api/machines/delete", s.withAuth("inventory:admin", s.handleDeleteMachine))
@@ -2910,6 +2911,10 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 		return nftPolicyApplyScript(approval.Plan, payload.PublicURL, payload.DomainSets)
 	case "nft":
 		return nftGuardApplyScript(approval.Plan, serverURL)
+	case "selfdns":
+		return "set -e\n" +
+			"echo 'lattice selfdns: apply is not implemented yet; regenerate this plan after the selfdns apply slice lands' >&2\n" +
+			"exit 1\n"
 	default:
 		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
 			"nft -c -f /tmp/lattice-nft-plan.nft\n"
@@ -3319,6 +3324,10 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
 			return
 		}
+	}
+	if req.QueueApply && approval.Plugin == "selfdns" {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "self-host dns apply is not implemented yet; review-only plans cannot be queued"))
+		return
 	}
 	approval.Status = model.ApprovalApproved
 	approval.ApprovedBy = p.ActorID

@@ -22,7 +22,8 @@ Responsibilities:
   the existing DDNS provider.
 - Proxy-core/subscription persistence foundation: encrypted Reality private
   keys, user UUID/password credentials, subscription tokens, redacted proto view
-  contracts, and JSON/bbolt store parity for future sing-box/xray orchestration.
+  contracts, JSON/bbolt store parity, and the first fail-closed sing-box
+  `vless`+TCP+REALITY renderer for future reviewed plan/apply orchestration.
 - Operator-owned NodeGeo API for the dashboard Fleet Map.
 - Append-only audit events.
 
@@ -128,13 +129,17 @@ the version in `go.mod`; during local multi-repo development, use the
   attributable to the right layer. Optional CoreDNS install is server-configured
   and plan-bound: the approval text contains the HTTPS URL and SHA-256, and the
   agent applies exactly that reviewed artifact metadata.
-- Proxy-core state currently exists as a persistence/model foundation only.
+- Proxy-core state currently exists as a persistence/model foundation plus a
+  narrow server-side sing-box renderer.
   `ProxyInbound.RealityPrivateKey` and `ProxyUser.UUID`/`Password`/`SubToken`
   are encrypted at rest, and proto/read contracts expose only `has_*` presence
-  booleans. Future proxy APIs must not serialize the secret-bearing model
-  structs directly. The public `/sub/{token}` route must add an opaque
-  token-lookup design before it is exposed; the raw subscription token must not
-  become a persisted map key.
+  booleans. `internal/proxycore` renders a canonical SHA-256-addressed
+  sing-box `vless`+TCP+REALITY config from server-owned inbounds, profiles, and
+  users; the artifact contains the REALITY private key and eligible VLESS UUIDs
+  and must be treated as node-scoped secret material. Future proxy APIs must
+  not serialize the secret-bearing model structs or render artifacts directly.
+  The public `/sub/{token}` route must add an opaque token-lookup design before
+  it is exposed; the raw subscription token must not become a persisted map key.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/

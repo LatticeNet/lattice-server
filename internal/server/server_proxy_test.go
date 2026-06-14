@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -899,6 +900,156 @@ func TestProxyUsageReportBaselinesAndRollsForward(t *testing.T) {
 	}`, nodeToken)
 	if negative.Code != http.StatusBadRequest {
 		t.Fatalf("negative usage should be rejected, got %d", negative.Code)
+	}
+}
+
+func TestProxyUsageNotificationsFireOncePerQuotaThreshold(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	cap := &captureNotify{}
+	srv.emitNotify = cap.hook()
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
+	alice, ok := st.ProxyUser("alice")
+	if !ok {
+		t.Fatal("proxy user alice not found")
+	}
+	alice.TrafficLimitBytes = 200
+	if err := st.UpsertProxyUser(alice); err != nil {
+		t.Fatal(err)
+	}
+
+	first := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":100,"user_bytes":{"alice":100}}
+	}`, nodeToken)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first usage report failed: %d %s", first.Code, first.Body.String())
+	}
+	var firstOut proxyUsageApplyResult
+	if err := json.NewDecoder(first.Body).Decode(&firstOut); err != nil {
+		t.Fatal(err)
+	}
+	if firstOut.AlertsFired != 0 {
+		t.Fatalf("baseline must not fire quota alerts: %+v", firstOut)
+	}
+
+	second := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":120,"user_bytes":{"alice":260}}
+	}`, nodeToken)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second usage report failed: %d %s", second.Code, second.Body.String())
+	}
+	var secondOut proxyUsageApplyResult
+	if err := json.NewDecoder(second.Body).Decode(&secondOut); err != nil {
+		t.Fatal(err)
+	}
+	if secondOut.BytesDelta != 160 || secondOut.AlertsFired != 1 {
+		t.Fatalf("80%% threshold should fire once: %+v", secondOut)
+	}
+
+	repeat := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":121,"user_bytes":{"alice":260}}
+	}`, nodeToken)
+	if repeat.Code != http.StatusOK {
+		t.Fatalf("repeat usage report failed: %d %s", repeat.Code, repeat.Body.String())
+	}
+	var repeatOut proxyUsageApplyResult
+	if err := json.NewDecoder(repeat.Body).Decode(&repeatOut); err != nil {
+		t.Fatal(err)
+	}
+	if repeatOut.AlertsFired != 0 {
+		t.Fatalf("same threshold must not repeat: %+v", repeatOut)
+	}
+
+	third := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{
+		"node_id":"node-a",
+		"snapshot":{"core_uptime_sec":122,"user_bytes":{"alice":300}}
+	}`, nodeToken)
+	if third.Code != http.StatusOK {
+		t.Fatalf("third usage report failed: %d %s", third.Code, third.Body.String())
+	}
+	var thirdOut proxyUsageApplyResult
+	if err := json.NewDecoder(third.Body).Decode(&thirdOut); err != nil {
+		t.Fatal(err)
+	}
+	if thirdOut.BytesDelta != 40 || thirdOut.AlertsFired != 1 {
+		t.Fatalf("100%% threshold should fire once after 80%%: %+v", thirdOut)
+	}
+
+	if len(cap.titles) != 2 || !strings.Contains(cap.titles[0], "80%") || !strings.Contains(cap.titles[1], "100%") {
+		t.Fatalf("unexpected quota notifications: %+v", cap.titles)
+	}
+	stored, _ := st.ProxyUser("alice")
+	if stored.LastQuotaNotifiedKey != "quota:200:100" {
+		t.Fatalf("quota cursor not persisted: %+v", stored)
+	}
+	if !auditMetadataSeen(st, "proxy.user.notify", "kind", proxyUserAlertQuota) {
+		t.Fatalf("proxy quota notification audit missing: %+v", st.AuditEvents())
+	}
+}
+
+func TestProxyExpiryNotificationsAdvanceAndDoNotRepeat(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	cap := &captureNotify{}
+	srv.emitNotify = cap.hook()
+	expires := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if err := st.UpsertProxyUser(model.ProxyUser{
+		ID: "alice", Name: "Alice", Enabled: true, ExpiresAt: expires, Status: model.ProxyUserStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fired, err := srv.evaluateProxyUserNotifications(time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fired) != 1 || fired[0].Kind != proxyUserAlertExpiry || fired[0].ExpiryOffsetDays != 7 {
+		t.Fatalf("expected 7-day expiry warning: %+v", fired)
+	}
+	again, err := srv.evaluateProxyUserNotifications(time.Date(2026, 6, 24, 13, 0, 0, 0, time.UTC), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("same expiry warning should not repeat: %+v", again)
+	}
+	oneDay, err := srv.evaluateProxyUserNotifications(time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(oneDay) != 1 || oneDay[0].ExpiryOffsetDays != 1 {
+		t.Fatalf("expected 1-day expiry warning: %+v", oneDay)
+	}
+	expired, err := srv.evaluateProxyUserNotifications(time.Date(2026, 7, 2, 0, 0, 0, 0, time.UTC), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expired) != 1 || expired[0].ExpiryOffsetDays != -1 {
+		t.Fatalf("expected expired warning: %+v", expired)
+	}
+	if len(cap.titles) != 3 || !strings.Contains(cap.titles[0], "7d") || !strings.Contains(cap.titles[1], "1d") || !strings.Contains(cap.titles[2], "expired") {
+		t.Fatalf("unexpected expiry notifications: %+v", cap.titles)
+	}
+	stored, _ := st.ProxyUser("alice")
+	if stored.LastExpiryNotifiedKey != "expiry:2026-07-01:expired" || stored.Status != model.ProxyUserStatusExpired {
+		t.Fatalf("expiry cursor/status not persisted: %+v", stored)
+	}
+}
+
+func TestProxyUserRejectsClientManagedNotificationCursors(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodPost, "/api/proxy/users", `{
+		"id":"alice",
+		"name":"Alice",
+		"last_quota_notified_key":"quota:100:80"
+	}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("client-managed proxy notification cursor should be rejected, got %d", res.StatusCode)
 	}
 }
 

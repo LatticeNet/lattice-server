@@ -127,6 +127,7 @@ type proxyUsageApplyResult struct {
 	BytesDelta   int64 `json:"bytes_delta"`
 	UsersUpdated int   `json:"users_updated"`
 	UsersIgnored int   `json:"users_ignored"`
+	AlertsFired  int   `json:"alerts_fired"`
 }
 
 func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request) {
@@ -1194,6 +1195,7 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 
 	previous, hadPrevious := s.store.ProxyUsageSnapshot(snapshot.NodeID)
 	result := proxyUsageApplyResult{UsersIgnored: ignored}
+	now := s.now()
 	if hadPrevious {
 		reset := snapshot.CoreUptimeSec < previous.CoreUptimeSec
 		for userID, current := range snapshot.UserBytes {
@@ -1215,22 +1217,28 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 			user := eligible[userID]
 			user.UsedBytes += delta
 			user.LastSeenAt = snapshot.At
-			user.Status = derivedProxyUserStatus(user)
+			user.Status = derivedProxyUserStatusAt(user, now)
+			user, alerts := nextProxyUserNotifications(user, now)
 			if err := s.store.UpsertProxyUser(user); err != nil {
 				return proxyUsageApplyResult{}, err
 			}
+			s.emitProxyUserNotifications(alerts)
 			result.BytesDelta += delta
 			result.UsersUpdated++
+			result.AlertsFired += len(alerts)
 		}
 	} else {
 		for userID := range snapshot.UserBytes {
 			user := eligible[userID]
 			user.LastSeenAt = snapshot.At
-			user.Status = derivedProxyUserStatus(user)
+			user.Status = derivedProxyUserStatusAt(user, now)
+			user, alerts := nextProxyUserNotifications(user, now)
 			if err := s.store.UpsertProxyUser(user); err != nil {
 				return proxyUsageApplyResult{}, err
 			}
+			s.emitProxyUserNotifications(alerts)
 			result.UsersUpdated++
+			result.AlertsFired += len(alerts)
 		}
 	}
 	if err := s.store.UpsertProxyUsageSnapshot(snapshot); err != nil {
@@ -1467,7 +1475,10 @@ func (s *Server) normalizeProxyUser(req, existing model.ProxyUser, hadExisting b
 		out.UsedBytes = existing.UsedBytes
 		out.LastSeenAt = existing.LastSeenAt
 	}
-	out.Status = derivedProxyUserStatus(out)
+	if strings.TrimSpace(req.LastQuotaNotifiedKey) != "" || strings.TrimSpace(req.LastExpiryNotifiedKey) != "" {
+		return model.ProxyUser{}, errors.New("proxy notification cursors are server-managed")
+	}
+	out.Status = derivedProxyUserStatusAt(out, s.now())
 	return out, nil
 }
 
@@ -1689,10 +1700,13 @@ func validateProxyConfigPath(value string) error {
 }
 
 func derivedProxyUserStatus(user model.ProxyUser) string {
+	return derivedProxyUserStatusAt(user, time.Now().UTC())
+}
+
+func derivedProxyUserStatusAt(user model.ProxyUser, now time.Time) string {
 	if !user.Enabled {
 		return model.ProxyUserStatusDisabled
 	}
-	now := time.Now().UTC()
 	if !user.ExpiresAt.IsZero() && !user.ExpiresAt.After(now) {
 		return model.ProxyUserStatusExpired
 	}

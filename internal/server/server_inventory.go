@@ -485,20 +485,23 @@ func (s *Server) evaluateReminders(now time.Time) {
 	fired, err := s.evaluateMachineReminders(now, "", nil)
 	if err != nil {
 		s.logger.Printf("inventory reminders: %v", err)
-		return
+	} else {
+		for _, fire := range fired {
+			s.recordAudit(model.AuditEvent{
+				ID:     id.New("audit"),
+				NodeID: fire.NodeID,
+				Action: "inventory.reminder",
+				Scope:  "inventory:admin",
+				Metadata: map[string]string{
+					"machine_id":   fire.MachineID,
+					"offset_days":  strconv.Itoa(fire.OffsetDays),
+					"next_renewal": fire.NextRenewal,
+				},
+			})
+		}
 	}
-	for _, fire := range fired {
-		s.recordAudit(model.AuditEvent{
-			ID:     id.New("audit"),
-			NodeID: fire.NodeID,
-			Action: "inventory.reminder",
-			Scope:  "inventory:admin",
-			Metadata: map[string]string{
-				"machine_id":   fire.MachineID,
-				"offset_days":  strconv.Itoa(fire.OffsetDays),
-				"next_renewal": fire.NextRenewal,
-			},
-		})
+	if _, err := s.evaluateProxyUserNotifications(now, ""); err != nil {
+		s.logger.Printf("proxy user notifications: %v", err)
 	}
 }
 

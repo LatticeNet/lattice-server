@@ -208,6 +208,28 @@ func TestVLESSRealityLinksSkipInactiveUsersAndUnappliedProfiles(t *testing.T) {
 	}
 }
 
+func TestVLESSRealityLinksIncludeAppliedXrayProfiles(t *testing.T) {
+	now := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
+	profile := baseProfile()
+	profile.Core = model.ProxyCoreXray
+	profile.AppliedSHA256 = strings.Repeat("b", 64)
+	inbound := baseInbound()
+	inbound.Core = model.ProxyCoreXray
+	user := baseUser("alice", "Alice", "11111111-1111-4111-8111-111111111111", now.Add(-time.Hour))
+
+	links, warnings, err := VLESSRealityLinks(user, []SubscriptionProfile{{Profile: profile, NodeName: "Xray JP"}}, []model.ProxyInbound{inbound}, SubscriptionOptions{Now: now})
+	if err != nil {
+		t.Fatalf("VLESSRealityLinks returned error: %v", err)
+	}
+	if len(warnings) != 0 || len(links) != 1 {
+		t.Fatalf("unexpected xray link render: links=%v warnings=%v", links, warnings)
+	}
+	if !strings.Contains(links[0], "vless://11111111-1111-4111-8111-111111111111@jp1.dns.roobli.org:443?") ||
+		!strings.Contains(links[0], "#Xray%20JP%20-%20VLESS%20Reality%20443") {
+		t.Fatalf("xray profile did not produce normal VLESS REALITY link: %s", links[0])
+	}
+}
+
 func TestVLESSRealityLinksRejectUnsafePublicSubscriptionInputs(t *testing.T) {
 	now := time.Date(2026, 6, 14, 12, 0, 0, 0, time.UTC)
 	profile := baseProfile()

@@ -23,6 +23,7 @@ import (
 
 const (
 	DefaultSingBoxConfigPath = "/etc/sing-box/config.json"
+	DefaultXrayConfigPath    = "/usr/local/etc/xray/config.json"
 	DefaultListenAddress     = "::"
 	defaultOutboundTag       = "direct"
 )
@@ -40,15 +41,20 @@ type RenderOptions struct {
 	Now time.Time
 }
 
-// SingBoxArtifact is the canonical renderer output for the future plan/apply
-// path. ConfigJSON contains user UUIDs and REALITY private keys and must be
-// treated as a node-scoped secret-bearing artifact.
-type SingBoxArtifact struct {
+// Artifact is the canonical renderer output for the plan/apply path. ConfigJSON
+// contains user UUIDs and REALITY private keys and must be treated as a
+// node-scoped secret-bearing artifact.
+type Artifact struct {
+	Core         string
 	ConfigJSON   string
 	ConfigSHA256 string
 	ConfigPath   string
 	Warnings     []string
 }
+
+// SingBoxArtifact is kept as a compatibility alias for older call sites while
+// xray support shares the same secret-bearing artifact contract.
+type SingBoxArtifact = Artifact
 
 type singBoxConfig struct {
 	Log       singBoxLog        `json:"log"`
@@ -73,6 +79,7 @@ type singBoxInbound struct {
 
 type singBoxVLESSUser struct {
 	Name string `json:"name,omitempty"`
+	ID   string `json:"-"`
 	UUID string `json:"uuid"`
 	Flow string `json:"flow,omitempty"`
 }
@@ -125,6 +132,7 @@ func RenderSingBoxConfigJSON(profile model.ProxyNodeProfile, inbounds []model.Pr
 		path = DefaultSingBoxConfigPath
 	}
 	return SingBoxArtifact{
+		Core:         model.ProxyCoreSingbox,
 		ConfigJSON:   string(data),
 		ConfigSHA256: hex.EncodeToString(sum[:]),
 		ConfigPath:   path,
@@ -140,7 +148,7 @@ func RenderSingBoxConfig(profile model.ProxyNodeProfile, inbounds []model.ProxyI
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	if err := validateProfile(profile); err != nil {
+	if err := validateProfileForCore(profile, model.ProxyCoreSingbox); err != nil {
 		return singBoxConfig{}, nil, err
 	}
 	byID, err := inboundMap(inbounds)
@@ -187,12 +195,12 @@ func RenderSingBoxConfig(profile model.ProxyNodeProfile, inbounds []model.ProxyI
 	}, warnings, nil
 }
 
-func validateProfile(profile model.ProxyNodeProfile) error {
+func validateProfileForCore(profile model.ProxyNodeProfile, core string) error {
 	if strings.TrimSpace(profile.NodeID) == "" {
 		return errors.New("proxy node profile requires node_id")
 	}
-	if profile.Core != model.ProxyCoreSingbox {
-		return fmt.Errorf("unsupported proxy core %q (only %s is available)", profile.Core, model.ProxyCoreSingbox)
+	if profile.Core != core {
+		return fmt.Errorf("proxy profile uses core %q, renderer requires %s", profile.Core, core)
 	}
 	if len(profile.InboundIDs) == 0 {
 		return errors.New("proxy node profile requires at least one inbound")
@@ -245,7 +253,7 @@ func selectedInbounds(ids []string, byID map[string]model.ProxyInbound) ([]model
 }
 
 func renderVLESSRealityInbound(inbound model.ProxyInbound, listen string, users []model.ProxyUser, now time.Time) (singBoxInbound, []string, error) {
-	if err := validateVLESSRealityInbound(inbound); err != nil {
+	if err := validateVLESSRealityInboundForCore(inbound, model.ProxyCoreSingbox); err != nil {
 		return singBoxInbound{}, nil, err
 	}
 	eligible, warnings, err := eligibleVLESSUsers(inbound.ID, users, now)
@@ -287,9 +295,20 @@ func renderVLESSRealityInbound(inbound model.ProxyInbound, listen string, users 
 }
 
 func validateVLESSRealityInbound(inbound model.ProxyInbound) error {
-	if inbound.Core != model.ProxyCoreSingbox {
+	if inbound.Core != model.ProxyCoreSingbox && inbound.Core != model.ProxyCoreXray {
 		return fmt.Errorf("inbound %s uses unsupported core %q", inbound.ID, inbound.Core)
 	}
+	return validateVLESSRealityInboundShape(inbound)
+}
+
+func validateVLESSRealityInboundForCore(inbound model.ProxyInbound, core string) error {
+	if inbound.Core != core {
+		return fmt.Errorf("inbound %s uses core %q, renderer requires %s", inbound.ID, inbound.Core, core)
+	}
+	return validateVLESSRealityInboundShape(inbound)
+}
+
+func validateVLESSRealityInboundShape(inbound model.ProxyInbound) error {
 	if inbound.Protocol != model.ProxyProtocolVLESS {
 		return fmt.Errorf("inbound %s uses unsupported protocol %q", inbound.ID, inbound.Protocol)
 	}
@@ -366,7 +385,7 @@ func eligibleVLESSUsers(inboundID string, users []model.ProxyUser, now time.Time
 			return nil, nil, fmt.Errorf("proxy user %s duplicates uuid with %s", user.ID, previous)
 		}
 		seenUUID[strings.ToLower(user.UUID)] = user.ID
-		out = append(out, singBoxVLESSUser{Name: user.Name, UUID: strings.ToLower(user.UUID), Flow: "xtls-rprx-vision"})
+		out = append(out, singBoxVLESSUser{ID: user.ID, Name: user.Name, UUID: strings.ToLower(user.UUID), Flow: "xtls-rprx-vision"})
 	}
 	return out, warnings, nil
 }

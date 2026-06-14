@@ -102,7 +102,7 @@ func VLESSRealityEndpoints(user model.ProxyUser, profiles []SubscriptionProfile,
 	warnings := []string{}
 	for _, sp := range sortedProfiles {
 		profile := sp.Profile
-		if profile.Core != model.ProxyCoreSingbox {
+		if profile.Core != model.ProxyCoreSingbox && profile.Core != model.ProxyCoreXray {
 			warnings = append(warnings, fmt.Sprintf("profile %s omitted: unsupported core %s", profile.NodeID, profile.Core))
 			continue
 		}

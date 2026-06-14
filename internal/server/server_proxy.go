@@ -829,18 +829,29 @@ func proxyNodeIDFromPlanPath(path string) (string, bool) {
 	return nodeID, true
 }
 
-func (s *Server) renderProxyCoreArtifact(nodeID string) (model.Node, model.ProxyNodeProfile, proxycore.SingBoxArtifact, error) {
+func (s *Server) renderProxyCoreArtifact(nodeID string) (model.Node, model.ProxyNodeProfile, proxycore.Artifact, error) {
 	node, ok := s.store.Node(nodeID)
 	if !ok {
-		return model.Node{}, model.ProxyNodeProfile{}, proxycore.SingBoxArtifact{}, errProxyPlanNodeNotFound
+		return model.Node{}, model.ProxyNodeProfile{}, proxycore.Artifact{}, errProxyPlanNodeNotFound
 	}
 	profile, ok := s.store.ProxyNodeProfile(nodeID)
 	if !ok {
-		return model.Node{}, model.ProxyNodeProfile{}, proxycore.SingBoxArtifact{}, errProxyPlanProfileNotFound
+		return model.Node{}, model.ProxyNodeProfile{}, proxycore.Artifact{}, errProxyPlanProfileNotFound
 	}
-	artifact, err := proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), s.store.ProxyUsers(), proxycore.RenderOptions{})
+	var (
+		artifact proxycore.Artifact
+		err      error
+	)
+	switch profile.Core {
+	case model.ProxyCoreSingbox:
+		artifact, err = proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), s.store.ProxyUsers(), proxycore.RenderOptions{})
+	case model.ProxyCoreXray:
+		artifact, err = proxycore.RenderXrayConfigJSON(profile, s.store.ProxyInbounds(), s.store.ProxyUsers(), proxycore.RenderOptions{})
+	default:
+		err = fmt.Errorf("unsupported proxy core %q", profile.Core)
+	}
 	if err != nil {
-		return model.Node{}, model.ProxyNodeProfile{}, proxycore.SingBoxArtifact{}, err
+		return model.Node{}, model.ProxyNodeProfile{}, proxycore.Artifact{}, err
 	}
 	return node, profile, artifact, nil
 }
@@ -889,17 +900,17 @@ func (s *Server) requireCurrentProxyCoreApproval(approval model.Approval) error 
 	return err
 }
 
-func (s *Server) currentProxyCoreArtifactForApproval(approval model.Approval) (proxycore.SingBoxArtifact, error) {
+func (s *Server) currentProxyCoreArtifactForApproval(approval model.Approval) (proxycore.Artifact, error) {
 	want, err := proxyCoreApprovalConfigSHA(approval)
 	if err != nil {
-		return proxycore.SingBoxArtifact{}, err
+		return proxycore.Artifact{}, err
 	}
 	_, _, artifact, err := s.renderProxyCoreArtifact(approval.NodeID)
 	if err != nil {
-		return proxycore.SingBoxArtifact{}, fmt.Errorf("proxycore plan is no longer renderable: %w", err)
+		return proxycore.Artifact{}, fmt.Errorf("proxycore plan is no longer renderable: %w", err)
 	}
 	if !strings.EqualFold(want, artifact.ConfigSHA256) {
-		return proxycore.SingBoxArtifact{}, errors.New("proxycore config changed since this plan was created; re-plan before approving")
+		return proxycore.Artifact{}, errors.New("proxycore config changed since this plan was created; re-plan before approving")
 	}
 	return artifact, nil
 }
@@ -912,15 +923,21 @@ func (s *Server) proxyCoreApplyScript(approval model.Approval) (string, error) {
 	return proxyCoreApplyScript(artifact), nil
 }
 
-func proxyCoreApplyScript(artifact proxycore.SingBoxArtifact) string {
+func proxyCoreApplyScript(artifact proxycore.Artifact) string {
 	target := artifact.ConfigPath
 	candidate := target + ".lattice-new"
 	backup := target + ".lattice-prev"
 	dir := path.Dir(target)
+	binary, service, checkCmd, marker, err := proxyCoreApplyFacts(artifact.Core)
+	if err != nil {
+		return "set -e\n" +
+			"echo " + shellQuote("lattice proxycore: "+err.Error()) + " >&2\n" +
+			"exit 1\n"
+	}
 	return "set -e\n" +
 		"umask 077\n" +
-		"if ! command -v sing-box >/dev/null 2>&1; then\n" +
-		"  echo 'lattice proxycore: sing-box binary not found on node' >&2\n" +
+		"if ! command -v " + binary + " >/dev/null 2>&1; then\n" +
+		"  echo " + shellQuote("lattice proxycore: "+binary+" binary not found on node") + " >&2\n" +
 		"  exit 1\n" +
 		"fi\n" +
 		"TARGET=" + shellQuote(target) + "\n" +
@@ -945,15 +962,15 @@ func proxyCoreApplyScript(artifact proxycore.SingBoxArtifact) string {
 		"}\n" +
 		"restart_after_restore() {\n" +
 		"  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
-		"    systemctl restart sing-box 2>/dev/null || true\n" +
+		"    systemctl restart " + service + " 2>/dev/null || true\n" +
 		"  elif command -v service >/dev/null 2>&1; then\n" +
-		"    service sing-box restart 2>/dev/null || true\n" +
+		"    service " + service + " restart 2>/dev/null || true\n" +
 		"  fi\n" +
 		"}\n" +
 		"trap 'cleanup_candidate; restore_target; restart_after_restore' ERR\n" +
-		heredocWrite(shellQuote(candidate), "LATTICE_PROXYCORE_SINGBOX_EOF", artifact.ConfigJSON) +
+		heredocWrite(shellQuote(candidate), marker, artifact.ConfigJSON) +
 		"chmod 0600 \"$CANDIDATE\"\n" +
-		"sing-box check -c \"$CANDIDATE\"\n" +
+		checkCmd + "\n" +
 		"if [ -e \"$TARGET\" ]; then\n" +
 		"  cp -p \"$TARGET\" \"$BACKUP\"\n" +
 		"  RESTORE_TARGET=backup\n" +
@@ -962,16 +979,27 @@ func proxyCoreApplyScript(artifact proxycore.SingBoxArtifact) string {
 		"fi\n" +
 		"mv -f \"$CANDIDATE\" \"$TARGET\"\n" +
 		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
-		"  systemctl reload sing-box 2>/dev/null || systemctl restart sing-box\n" +
+		"  systemctl reload " + service + " 2>/dev/null || systemctl restart " + service + "\n" +
 		"elif command -v service >/dev/null 2>&1; then\n" +
-		"  service sing-box reload 2>/dev/null || service sing-box restart\n" +
+		"  service " + service + " reload 2>/dev/null || service " + service + " restart\n" +
 		"else\n" +
-		"  echo 'lattice proxycore: no supported service manager found for sing-box reload/restart' >&2\n" +
+		"  echo " + shellQuote("lattice proxycore: no supported service manager found for "+service+" reload/restart") + " >&2\n" +
 		"  exit 1\n" +
 		"fi\n" +
 		"trap - ERR\n" +
 		"rm -f \"$BACKUP\"\n" +
-		"echo 'lattice proxycore: sing-box config applied and verified'\n"
+		"echo " + shellQuote("lattice proxycore: "+service+" config applied and verified") + "\n"
+}
+
+func proxyCoreApplyFacts(core string) (binary, service, checkCmd, marker string, err error) {
+	switch core {
+	case model.ProxyCoreSingbox:
+		return "sing-box", "sing-box", "sing-box check -c \"$CANDIDATE\"", "LATTICE_PROXYCORE_SINGBOX_EOF", nil
+	case model.ProxyCoreXray:
+		return "xray", "xray", "xray test -c \"$CANDIDATE\"", "LATTICE_PROXYCORE_XRAY_EOF", nil
+	default:
+		return "", "", "", "", fmt.Errorf("unsupported proxy core %q", core)
+	}
 }
 
 func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {
@@ -1028,7 +1056,7 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 	return nil
 }
 
-func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile, artifact proxycore.SingBoxArtifact, redactedConfig string) string {
+func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile, artifact proxycore.Artifact, redactedConfig string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Lattice proxycore review plan\n\n")
 	fmt.Fprintf(&b, "node_id: %s\n", profile.NodeID)
@@ -1053,7 +1081,7 @@ func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile
 		}
 	}
 	b.WriteString("\nsecret_handling: redacted_config hides UUID/password/token/private_key fields; artifact_sha256 binds the real rendered config.\n")
-	b.WriteString("\n## redacted sing-box config\n")
+	fmt.Fprintf(&b, "\n## redacted %s config\n", artifact.Core)
 	b.WriteString(redactedConfig)
 	if !strings.HasSuffix(redactedConfig, "\n") {
 		b.WriteByte('\n')
@@ -1082,7 +1110,7 @@ func redactProxyConfigValue(value any) {
 	case map[string]any:
 		for key, child := range v {
 			switch strings.ToLower(key) {
-			case "private_key", "uuid", "password":
+			case "private_key", "privatekey", "uuid", "password", "id":
 				if s, ok := child.(string); ok && s != "" {
 					v[key] = "<redacted>"
 					continue
@@ -1392,7 +1420,7 @@ func (s *Server) normalizeProxyInbound(req, existing model.ProxyInbound, hadExis
 	if out.Core == "" {
 		out.Core = model.ProxyCoreSingbox
 	}
-	if out.Core != model.ProxyCoreSingbox {
+	if !isSupportedProxyCore(out.Core) {
 		return model.ProxyInbound{}, fmt.Errorf("unsupported proxy core %q", out.Core)
 	}
 	out.Protocol = strings.TrimSpace(req.Protocol)
@@ -1633,7 +1661,7 @@ func (s *Server) normalizeProxyNodeProfile(req, existing model.ProxyNodeProfile,
 	if out.Core == "" {
 		out.Core = model.ProxyCoreSingbox
 	}
-	if out.Core != model.ProxyCoreSingbox {
+	if !isSupportedProxyCore(out.Core) {
 		return model.ProxyNodeProfile{}, fmt.Errorf("unsupported proxy core %q", out.Core)
 	}
 	inboundIDs, err := s.normalizeProxyInboundIDs(req.InboundIDs)
@@ -1650,6 +1678,9 @@ func (s *Server) normalizeProxyNodeProfile(req, existing model.ProxyNodeProfile,
 		}
 		if !inbound.Enabled {
 			return model.ProxyNodeProfile{}, fmt.Errorf("proxy inbound %s is disabled", inboundID)
+		}
+		if inbound.Core != out.Core {
+			return model.ProxyNodeProfile{}, fmt.Errorf("proxy inbound %s uses core %s, profile uses %s", inboundID, inbound.Core, out.Core)
 		}
 	}
 	out.InboundIDs = inboundIDs
@@ -1685,6 +1716,10 @@ func (s *Server) normalizeProxyNodeProfile(req, existing model.ProxyNodeProfile,
 		out.LastError = "profile changed since last apply; create a new plan before applying"
 	}
 	return out, nil
+}
+
+func isSupportedProxyCore(core string) bool {
+	return core == model.ProxyCoreSingbox || core == model.ProxyCoreXray
 }
 
 func (s *Server) normalizeProxyInboundIDs(values []string) ([]string, error) {

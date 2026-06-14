@@ -411,6 +411,92 @@ func TestProxyPlanCreatesSecretFreeApproval(t *testing.T) {
 	}
 }
 
+func TestProxyPlanSupportsXrayApplyScript(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-x", "Xray Node")
+
+	createProxyPlanFixturesForCore(t, handler, cookies, csrf, "node-x", model.ProxyCoreXray, "/usr/local/etc/xray/config.json")
+	plan := doJSON(t, handler, http.MethodPost, "/api/proxy/nodes/node-x/plan", `{}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("xray proxy plan failed: %d", plan.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	if approval.Plugin != proxyCorePlugin || approval.Action != proxyCoreApplyAction || approval.NodeID != "node-x" {
+		t.Fatalf("bad xray proxy approval view: %+v", approval)
+	}
+	for _, leak := range []string{
+		"super-secret-reality-private-key",
+		"11111111-1111-4111-8111-111111111111",
+		`"privateKey": "super-secret-reality-private-key"`,
+		`"id": "11111111-1111-4111-8111-111111111111"`,
+	} {
+		if strings.Contains(approval.Plan, leak) {
+			t.Fatalf("xray proxy plan leaked secret %q:\n%s", leak, approval.Plan)
+		}
+	}
+	for _, want := range []string{
+		"core: xray",
+		"config_path: /usr/local/etc/xray/config.json",
+		"## redacted xray config",
+		`"privateKey": "<redacted>"`,
+		`"id": "<redacted>"`,
+		`"protocol": "vless"`,
+		`"streamSettings": {`,
+		`"realitySettings": {`,
+	} {
+		if !strings.Contains(approval.Plan, want) {
+			t.Fatalf("xray proxy plan missing %q:\n%s", want, approval.Plan)
+		}
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok {
+		t.Fatalf("stored xray approval not found")
+	}
+	configSHA, err := proxyCoreApprovalConfigSHA(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configSHA == "" || !strings.Contains(approval.Plan, configSHA) {
+		t.Fatalf("xray approval did not bind config sha: action=%q plan=\n%s", stored.Action, approval.Plan)
+	}
+
+	approveQueue := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
+	defer approveQueue.Body.Close()
+	if approveQueue.StatusCode != http.StatusOK {
+		t.Fatalf("xray proxycore queue_apply failed: %d", approveQueue.StatusCode)
+	}
+	tasks := st.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("xray proxycore queue_apply should create one task: %+v", tasks)
+	}
+	task := tasks[0]
+	for _, want := range []string{
+		"cat > '/usr/local/etc/xray/config.json.lattice-new'",
+		"BACKUP='/usr/local/etc/xray/config.json.lattice-prev'",
+		"xray test -c \"$CANDIDATE\"",
+		"systemctl reload xray",
+		"service xray reload",
+		"no supported service manager found for xray reload/restart",
+		"super-secret-reality-private-key",
+		"11111111-1111-4111-8111-111111111111",
+	} {
+		if !strings.Contains(task.Script, want) {
+			t.Fatalf("xray proxycore task script missing %q:\n%s", want, task.Script)
+		}
+	}
+	for _, bad := range []string{"sing-box check", "systemctl reload sing-box", "service sing-box reload", "cat > $CANDIDATE"} {
+		if strings.Contains(task.Script, bad) {
+			t.Fatalf("xray proxycore task script contains wrong fragment %q:\n%s", bad, task.Script)
+		}
+	}
+}
+
 func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
@@ -1255,7 +1341,12 @@ func TestProxyRejectsInvalidMVPInput(t *testing.T) {
 
 func createProxyPlanFixtures(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf, nodeID string) {
 	t.Helper()
-	createInbound := doJSON(t, handler, http.MethodPost, "/api/proxy/inbounds", proxyInboundBody("in-reality-443", "Inbound A"), cookies, csrf)
+	createProxyPlanFixturesForCore(t, handler, cookies, csrf, nodeID, model.ProxyCoreSingbox, "/etc/sing-box/config.json")
+}
+
+func createProxyPlanFixturesForCore(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf, nodeID, core, configPath string) {
+	t.Helper()
+	createInbound := doJSON(t, handler, http.MethodPost, "/api/proxy/inbounds", proxyInboundBodyForCore("in-reality-443", "Inbound A", core), cookies, csrf)
 	createInbound.Body.Close()
 	if createInbound.StatusCode != http.StatusOK {
 		t.Fatalf("create inbound failed: %d", createInbound.StatusCode)
@@ -1275,10 +1366,10 @@ func createProxyPlanFixtures(t *testing.T, handler http.Handler, cookies []*http
 	}
 	createProfile := doJSON(t, handler, http.MethodPost, "/api/proxy/profiles", `{
 		"node_id":"`+nodeID+`",
-		"core":"sing-box",
+		"core":"`+core+`",
 		"inbound_ids":["in-reality-443"],
 		"hostname":"node-a.dns.example.com",
-		"config_path":"/etc/sing-box/config.json",
+		"config_path":"`+configPath+`",
 		"stats_api":"127.0.0.1:9090"
 	}`, cookies, csrf)
 	createProfile.Body.Close()
@@ -1288,10 +1379,14 @@ func createProxyPlanFixtures(t *testing.T, handler http.Handler, cookies []*http
 }
 
 func proxyInboundBody(id, name string) string {
+	return proxyInboundBodyForCore(id, name, model.ProxyCoreSingbox)
+}
+
+func proxyInboundBodyForCore(id, name, core string) string {
 	return `{
 		"id":"` + id + `",
 		"name":"` + name + `",
-		"core":"sing-box",
+		"core":"` + core + `",
 		"protocol":"vless",
 		"port":443,
 		"transport":"tcp",

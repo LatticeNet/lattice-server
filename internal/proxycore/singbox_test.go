@@ -192,7 +192,7 @@ func TestRenderSingBoxRejectsUnsupportedOrUnsafeInputs(t *testing.T) {
 			}(),
 			inbound: baseInbound(),
 			users:   []model.ProxyUser{user},
-			want:    "unsupported proxy core",
+			want:    "renderer requires sing-box",
 		},
 		{
 			name:    "unsupported protocol",

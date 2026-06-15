@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/georouting"
@@ -266,12 +265,18 @@ func (s *Server) normalizeGeoNodeList(values []string) ([]string, error) {
 	return out, nil
 }
 
-// reRenderGeoRoutingsForNode is a hook for the IP/geo/health-change trigger to
-// mark dependent geo-routings stale (a full re-apply is operator-initiated).
-func (s *Server) touchGeoRoutingsForNode(nodeID string, now time.Time) {
+// touchGeoRoutingsForNode marks dependent geo-routings stale when a node they
+// target or serve changes (its IP is embedded in the rendered zone). A full
+// re-apply stays operator-initiated; this is the dashboard signal to re-plan.
+// Idempotent: already-flagged records are not re-written.
+func (s *Server) touchGeoRoutingsForNode(nodeID string) {
 	for _, gr := range s.store.GeoRoutingsForNode(nodeID) {
-		gr.Status = "node-changed"
-		gr.UpdatedAt = now
+		if gr.Status == geoRoutingStatusNodeChanged {
+			continue
+		}
+		gr.Status = geoRoutingStatusNodeChanged
 		_ = s.store.UpsertGeoRouting(gr)
 	}
 }
+
+const geoRoutingStatusNodeChanged = "node-changed"

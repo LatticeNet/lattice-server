@@ -17,6 +17,12 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
+var (
+	version = "dev"
+	commit  = "unknown"
+	date    = "unknown"
+)
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
 		if err := runMigrationCLI(os.Args[2:], os.Stdout, os.Stderr); err != nil {
@@ -40,6 +46,7 @@ func main() {
 	var coreDNSVersion string
 	var coreDNSURL string
 	var coreDNSSHA256 string
+	var printVersion bool
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
 	flag.StringVar(&webRoot, "web", env("LATTICE_WEB_ROOT", "../lattice-dashboard"), "static dashboard root")
@@ -54,7 +61,12 @@ func main() {
 	flag.StringVar(&coreDNSVersion, "coredns-binary-version", env("LATTICE_COREDNS_BINARY_VERSION", ""), "pinned CoreDNS binary version for self-host DNS apply (requires -coredns-binary-url and -coredns-binary-sha256)")
 	flag.StringVar(&coreDNSURL, "coredns-binary-url", env("LATTICE_COREDNS_BINARY_URL", ""), "HTTPS URL to a direct CoreDNS executable binary for self-host DNS apply")
 	flag.StringVar(&coreDNSSHA256, "coredns-binary-sha256", env("LATTICE_COREDNS_BINARY_SHA256", ""), "SHA-256 hex digest of the CoreDNS executable binary")
+	flag.BoolVar(&printVersion, "version", false, "print lattice-server version and exit")
 	flag.Parse()
+	if printVersion {
+		fmt.Printf("lattice-server %s (%s, %s)\n", version, commit, date)
+		return
+	}
 
 	trustPolicy, err := loadPluginTrust(pluginTrust)
 	if err != nil {

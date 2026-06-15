@@ -1,0 +1,12 @@
+.git
+.github
+.cache
+.omc
+.omx
+bin
+dist
+tmp
+*.db
+*.log
+state.json
+master.key

@@ -2559,6 +2559,10 @@ func (s *Server) maybeTriggerDDNS(nodeID, oldV4, oldV6, newV4, newV6 string) {
 			}
 		}()
 	}
+	// A changed node IP makes any geo-routing that targets or serves this node
+	// stale: the rendered zone embeds node IPs. Flag dependents so the operator
+	// re-plans and re-applies (the apply path is operator-initiated).
+	s.touchGeoRoutingsForNode(nodeID)
 }
 
 // runDDNS applies a profile and records the run outcome on the profile.

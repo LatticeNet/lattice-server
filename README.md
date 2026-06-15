@@ -70,6 +70,32 @@ Standalone builds require `github.com/LatticeNet/lattice-sdk` to be available at
 the version in `go.mod`; during local multi-repo development, use the
 `lattice/go.work` workspace.
 
+## Docker
+
+The server image embeds `lattice-dashboard` and keeps runtime state under
+`/var/lib/lattice`.
+
+Local multi-repo build:
+
+```sh
+cd ..
+DOCKER_BUILDKIT=1 docker build \
+  -f lattice-server/Dockerfile \
+  --build-context lattice-sdk=./lattice-sdk \
+  --build-context lattice-dashboard=./lattice-dashboard \
+  -t lattice-server:local \
+  ./lattice-server
+```
+
+Published image:
+
+```txt
+ghcr.io/latticenet/lattice-server
+```
+
+Use the compose file and deployment guide in the umbrella repository:
+`lattice/compose/docker-compose.yml` and `lattice/docs/tutorials/docker-server.md`.
+
 ## Security Defaults
 
 - First-run password is random unless `LATTICE_ADMIN_PASSWORD` is set.

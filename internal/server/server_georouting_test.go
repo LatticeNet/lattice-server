@@ -110,3 +110,27 @@ func TestGeoRoutingValidation(t *testing.T) {
 		res.Body.Close()
 	}
 }
+
+func TestTouchGeoRoutingsForNodeFlagsDependents(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	if err := st.UpsertGeoRouting(model.GeoRouting{ID: "gr1", Name: "x", Hostname: "dns.roobli.org", NodeIDs: []string{"eu1"}, DNSNodeIDs: []string{"eu1"}, Status: "configured"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertGeoRouting(model.GeoRouting{ID: "gr2", Name: "y", Hostname: "x.roobli.org", NodeIDs: []string{"as1"}, DNSNodeIDs: []string{"as1"}, Status: "configured"}); err != nil {
+		t.Fatal(err)
+	}
+	srv.touchGeoRoutingsForNode("eu1")
+	if gr, _ := st.GeoRouting("gr1"); gr.Status != geoRoutingStatusNodeChanged {
+		t.Fatalf("gr1 should be flagged, got %q", gr.Status)
+	}
+	if gr, _ := st.GeoRouting("gr2"); gr.Status != "configured" {
+		t.Fatalf("gr2 (unrelated node) must not be flagged, got %q", gr.Status)
+	}
+	// Idempotent: a second touch does not bump UpdatedAt.
+	before, _ := st.GeoRouting("gr1")
+	srv.touchGeoRoutingsForNode("eu1")
+	after, _ := st.GeoRouting("gr1")
+	if !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatal("already-flagged record must not be re-written")
+	}
+}

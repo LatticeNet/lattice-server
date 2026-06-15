@@ -38,6 +38,7 @@ var (
 	boltBucketDDNS            = []byte("ddns")
 	boltBucketMonitors        = []byte("monitors")
 	boltBucketMonResults      = []byte("monitor_results")
+	boltBucketLogSources      = []byte("log_sources")
 	boltBucketNotifyChannels  = []byte("notify_channels")
 	boltBucketTunnels         = []byte("tunnels")
 	boltBucketMachineProfiles = []byte("machine_profiles")
@@ -70,6 +71,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketDDNS,
 	boltBucketMonitors,
 	boltBucketMonResults,
+	boltBucketLogSources,
 	boltBucketNotifyChannels,
 	boltBucketTunnels,
 	boltBucketMachineProfiles,
@@ -213,6 +215,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketMonResults, persist.MonResults); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketLogSources, persist.LogSources); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketNotifyChannels, persist.NotifyChannels); err != nil {
 			return err
 		}
@@ -326,6 +331,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketMonResults, st.MonResults); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketLogSources, st.LogSources); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketNotifyChannels, st.NotifyChannels); err != nil {

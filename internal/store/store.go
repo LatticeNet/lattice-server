@@ -42,6 +42,7 @@ type State struct {
 	DDNS            map[string]model.DDNSProfile        `json:"ddns"`
 	Monitors        map[string]model.Monitor            `json:"monitors"`
 	MonResults      map[string][]model.MonitorResult    `json:"monitor_results"`
+	LogSources      map[string]model.LogSource          `json:"log_sources"`
 	NotifyChannels  map[string]model.NotifyChannel      `json:"notify_channels"`
 	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
 	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
@@ -138,6 +139,7 @@ func emptyState() State {
 		DDNS:            map[string]model.DDNSProfile{},
 		Monitors:        map[string]model.Monitor{},
 		MonResults:      map[string][]model.MonitorResult{},
+		LogSources:      map[string]model.LogSource{},
 		NotifyChannels:  map[string]model.NotifyChannel{},
 		Tunnels:         map[string]model.TunnelProfile{},
 		MachineProfiles: map[string]model.MachineProfile{},
@@ -194,6 +196,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.MonResults == nil {
 		st.MonResults = map[string][]model.MonitorResult{}
+	}
+	if st.LogSources == nil {
+		st.LogSources = map[string]model.LogSource{}
 	}
 	if st.NotifyChannels == nil {
 		st.NotifyChannels = map[string]model.NotifyChannel{}
@@ -1593,6 +1598,64 @@ func (s *Store) MonitorResults(monitorID string) []model.MonitorResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]model.MonitorResult(nil), s.state.MonResults[monitorID]...)
+}
+
+// UpsertLogSource creates or updates a log source definition.
+func (s *Store) UpsertLogSource(ls model.LogSource) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ls.UpdatedAt = time.Now().UTC()
+	if ls.CreatedAt.IsZero() {
+		ls.CreatedAt = ls.UpdatedAt
+	}
+	s.state.LogSources[ls.ID] = ls
+	return s.Save()
+}
+
+// LogSource returns a log source by id.
+func (s *Store) LogSource(id string) (model.LogSource, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ls, ok := s.state.LogSources[id]
+	return ls, ok
+}
+
+// LogSources returns all log sources sorted by creation time.
+func (s *Store) LogSources() []model.LogSource {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.LogSource, 0, len(s.state.LogSources))
+	for _, ls := range s.state.LogSources {
+		out = append(out, ls)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// LogSourcesForNode returns the enabled log sources a node should tail.
+func (s *Store) LogSourcesForNode(nodeID string) []model.LogSource {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.LogSource{}
+	for _, ls := range s.state.LogSources {
+		if ls.Enabled && ls.NodeID == nodeID {
+			out = append(out, ls)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// DeleteLogSource removes a log source definition. The line store is purged
+// separately by the caller via logstore.PurgeSource.
+func (s *Store) DeleteLogSource(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.LogSources[id]; !ok {
+		return nil
+	}
+	delete(s.state.LogSources, id)
+	return s.Save()
 }
 
 // UpsertNotifyChannel creates or updates a notification channel.

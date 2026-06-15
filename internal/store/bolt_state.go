@@ -46,6 +46,7 @@ var (
 	boltBucketDNSDeployments  = []byte("dns_deployments")
 	boltBucketNetPolicies     = []byte("net_policies")
 	boltBucketGeoRouting      = []byte("geo_routing")
+	boltBucketAgentUpdates    = []byte("agent_updates")
 	boltBucketProxyInbounds   = []byte("proxy_inbounds")
 	boltBucketProxyUsers      = []byte("proxy_users")
 	boltBucketProxyProfiles   = []byte("proxy_profiles")
@@ -80,6 +81,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
 	boltBucketGeoRouting,
+	boltBucketAgentUpdates,
 	boltBucketProxyInbounds,
 	boltBucketProxyUsers,
 	boltBucketProxyProfiles,
@@ -241,6 +243,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketGeoRouting, persist.GeoRouting); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketAgentUpdates, persist.AgentUpdates); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketProxyInbounds, persist.ProxyInbounds); err != nil {
 			return err
 		}
@@ -360,6 +365,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketGeoRouting, st.GeoRouting); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketAgentUpdates, st.AgentUpdates); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketProxyInbounds, st.ProxyInbounds); err != nil {

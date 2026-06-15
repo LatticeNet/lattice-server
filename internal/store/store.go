@@ -50,6 +50,7 @@ type State struct {
 	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
 	GeoRouting      map[string]model.GeoRouting         `json:"geo_routing"`
+	AgentUpdates    map[string]model.AgentUpdatePolicy  `json:"agent_updates"`
 	ProxyInbounds   map[string]model.ProxyInbound       `json:"proxy_inbounds"`
 	ProxyUsers      map[string]model.ProxyUser          `json:"proxy_users"`
 	ProxyProfiles   map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
@@ -148,6 +149,7 @@ func emptyState() State {
 		DNSDeployments:  map[string]model.DNSDeployment{},
 		NetPolicies:     map[string]model.NetPolicy{},
 		GeoRouting:      map[string]model.GeoRouting{},
+		AgentUpdates:    map[string]model.AgentUpdatePolicy{},
 		ProxyInbounds:   map[string]model.ProxyInbound{},
 		ProxyUsers:      map[string]model.ProxyUser{},
 		ProxyProfiles:   map[string]model.ProxyNodeProfile{},
@@ -222,6 +224,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.GeoRouting == nil {
 		st.GeoRouting = map[string]model.GeoRouting{}
+	}
+	if st.AgentUpdates == nil {
+		st.AgentUpdates = map[string]model.AgentUpdatePolicy{}
 	}
 	if st.ProxyInbounds == nil {
 		st.ProxyInbounds = map[string]model.ProxyInbound{}
@@ -1372,6 +1377,50 @@ func (s *Store) DeleteGeoRouting(id string) error {
 		return nil
 	}
 	delete(s.state.GeoRouting, id)
+	return s.Save()
+}
+
+// UpsertAgentUpdatePolicy creates or updates the server-owned update intent for
+// one node. NodeID is the stable key; policies carry no secrets.
+func (s *Store) UpsertAgentUpdatePolicy(policy model.AgentUpdatePolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	policy.UpdatedAt = time.Now().UTC()
+	if policy.CreatedAt.IsZero() {
+		policy.CreatedAt = policy.UpdatedAt
+	}
+	s.state.AgentUpdates[policy.NodeID] = policy
+	return s.Save()
+}
+
+// AgentUpdatePolicy returns the update policy for one node.
+func (s *Store) AgentUpdatePolicy(nodeID string) (model.AgentUpdatePolicy, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	policy, ok := s.state.AgentUpdates[nodeID]
+	return policy, ok
+}
+
+// AgentUpdatePolicies returns all update policies sorted by node id.
+func (s *Store) AgentUpdatePolicies() []model.AgentUpdatePolicy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.AgentUpdatePolicy, 0, len(s.state.AgentUpdates))
+	for _, policy := range s.state.AgentUpdates {
+		out = append(out, policy)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// DeleteAgentUpdatePolicy removes the update policy for one node.
+func (s *Store) DeleteAgentUpdatePolicy(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.AgentUpdates[nodeID]; !ok {
+		return nil
+	}
+	delete(s.state.AgentUpdates, nodeID)
 	return s.Save()
 }
 

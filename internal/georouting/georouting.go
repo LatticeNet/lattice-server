@@ -117,6 +117,9 @@ func Render(in Input) (Result, error) {
 			if dbPath == "" {
 				dbPath = defaultGeoIPDBPath
 			}
+			if err := validateGeoIPDBPath(dbPath); err != nil {
+				return Result{}, err
+			}
 			// Per continent, pick the nearest geo-capable healthy node.
 			byNode := map[string][]string{} // nodeID -> continents
 			for _, code := range continentOrder {
@@ -291,6 +294,29 @@ func validateHostname(host string) error {
 		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
 			return fmt.Errorf("georouting: hostname label has invalid hyphen placement")
 		}
+	}
+	return nil
+}
+
+func validateGeoIPDBPath(path string) error {
+	if strings.TrimSpace(path) != path {
+		return fmt.Errorf("georouting: geoip db path has leading or trailing whitespace")
+	}
+	if !strings.HasPrefix(path, "/") {
+		return fmt.Errorf("georouting: geoip db path must be absolute")
+	}
+	for _, segment := range strings.Split(path, "/") {
+		if segment == ".." {
+			return fmt.Errorf("georouting: geoip db path must not contain a .. segment")
+		}
+	}
+	for _, r := range path {
+		if r < 32 || r == 127 {
+			return fmt.Errorf("georouting: geoip db path contains control characters")
+		}
+	}
+	if strings.ContainsAny(path, "\"'`$;&|<>") || strings.ContainsAny(path, " \t") {
+		return fmt.Errorf("georouting: geoip db path contains unsafe characters")
 	}
 	return nil
 }

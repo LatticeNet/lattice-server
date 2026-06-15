@@ -543,6 +543,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/2fa/totp/disable", s.withAuth("", s.handle2FADisable))
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
 	mux.HandleFunc("/api/nodes/geo", s.withAuth("", s.handleNodesGeo))
+	mux.HandleFunc("/api/nodes/agent-updates", s.withAuth("", s.handleAgentUpdatePolicies))
+	mux.HandleFunc("/api/nodes/agent-updates/delete", s.withAuth("node:admin", s.handleDeleteAgentUpdatePolicy))
+	mux.HandleFunc("/api/nodes/agent-updates/plan", s.withAuth("", s.handleAgentUpdatePlan))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
@@ -3019,6 +3022,14 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 		return "set -e\n" +
 			"echo " + shellQuote("lattice proxycore: server-backed apply context required; re-approve through /api/network/approvals/approve") + " >&2\n" +
 			"exit 1\n"
+	case agentUpdatePlugin:
+		script, err := agentUpdateApplyScript(approval)
+		if err != nil {
+			return "set -e\n" +
+				"echo " + shellQuote("lattice agentupdate: invalid approval payload: "+err.Error()) + " >&2\n" +
+				"exit 1\n"
+		}
+		return script
 	default:
 		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
 			"nft -c -f /tmp/lattice-nft-plan.nft\n"
@@ -3435,6 +3446,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 	}
+	if approval.Plugin == agentUpdatePlugin {
+		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
+			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+			return
+		}
+	}
 	applyScript := ""
 	if req.QueueApply {
 		switch approval.Plugin {
@@ -3456,6 +3473,13 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
 				return
 			}
+		case agentUpdatePlugin:
+			var err error
+			applyScript, err = agentUpdateApplyScript(approval)
+			if err != nil {
+				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+				return
+			}
 		default:
 			applyScript = s.applyScriptFor(approval)
 		}
@@ -3467,6 +3491,10 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		return
 	}
 	if req.QueueApply {
+		timeoutSec := 30
+		if approval.Plugin == agentUpdatePlugin {
+			timeoutSec = 300
+		}
 		task := model.Task{
 			ID:          id.New("task"),
 			ApprovalID:  approval.ID,
@@ -3475,7 +3503,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			Targets:     []string{approval.NodeID},
 			Interpreter: "sh",
 			Script:      applyScript,
-			TimeoutSec:  30,
+			TimeoutSec:  timeoutSec,
 			OutputLimit: 65536,
 			Status:      model.TaskQueued,
 			CreatedAt:   time.Now().UTC(),
@@ -3497,7 +3525,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 
 func approvalRequiresPlanHash(approval model.Approval) bool {
 	switch approval.Plugin {
-	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore":
+	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore", "agentupdate":
 		return true
 	default:
 		// Approvals are the host-mutation gate. Unknown future plugins carrying a
@@ -3694,6 +3722,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == proxyCorePlugin {
 		return s.handleProxyCoreTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin == agentUpdatePlugin {
+		return s.handleAgentUpdateTaskResult(r, approval, result)
 	}
 	if approval.Plugin != "nftpolicy" {
 		return nil

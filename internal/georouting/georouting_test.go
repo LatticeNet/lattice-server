@@ -137,6 +137,9 @@ func TestRenderRejectsBadInput(t *testing.T) {
 		{Hostname: "dns.roobli.org", Nodes: nil},                                               // no nodes
 		{Hostname: "dns.roobli.org", Nodes: []GeoNode{{ID: "x", Healthy: true}}},               // no IP
 		{Hostname: "dns.roobli.org", Nodes: []GeoNode{{ID: "x", IPv4: "nope", Healthy: true}}}, // invalid IP -> omitted -> none
+		{Hostname: "dns.roobli.org", GeoIPDBPath: "/etc/coredns/GeoLite2.mmdb\nreload", Nodes: sampleNodes()},
+		{Hostname: "dns.roobli.org", GeoIPDBPath: "/etc/coredns/../secret.mmdb", Nodes: sampleNodes()},
+		{Hostname: "dns.roobli.org", GeoIPDBPath: "/etc/coredns/Geo Lite.mmdb", Nodes: sampleNodes()},
 	}
 	for i, in := range cases {
 		if _, err := Render(in); err == nil {

@@ -504,6 +504,7 @@ func (s *Server) evaluateReminders(now time.Time) {
 		s.logger.Printf("proxy user notifications: %v", err)
 	}
 	s.evaluateProxyConfigDrift(now)
+	s.evaluateAgentUpdatePolicies(now)
 }
 
 func (s *Server) evaluateMachineReminders(now time.Time, onlyID string, allow func(model.MachineProfile) bool) ([]renewalReminderFire, error) {

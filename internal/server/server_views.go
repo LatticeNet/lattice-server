@@ -35,6 +35,9 @@ func toApprovalView(a model.Approval) approvalView {
 	if a.Plugin == proxyCorePlugin {
 		action = proxyCoreApprovalDisplayAction(a.Action)
 	}
+	if a.Plugin == agentUpdatePlugin {
+		action = agentUpdateApprovalDisplayAction(a.Action)
+	}
 	return approvalView{
 		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
 		Plan: a.Plan, Status: a.Status, ActorID: a.ActorID,

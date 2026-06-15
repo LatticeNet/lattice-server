@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/LatticeNet/lattice-server/internal/logstore"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/secret"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
@@ -84,8 +85,25 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Open the dedicated bounded log store (logs.db) beside the state file, with
+	// the same at-rest cipher. In-memory mode (no dataPath) disables ingestion.
+	var logStore *logstore.Store
+	if dataPath != "" {
+		logsPath := filepath.Join(dataDir, "logs.db")
+		logStore, err = logstore.Open(logsPath, keyRes.Cipher, logstore.EnvMaxSourceBytes(os.Getenv("LATTICE_LOG_MAX_SOURCE_BYTES")))
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer logStore.Close()
+		if keyRes.Cipher.Enabled() {
+			log.Printf("log store: %s (encrypted at rest)", logsPath)
+		} else {
+			log.Printf("log store: %s (PLAINTEXT — logs may contain secrets; set a master key to encrypt)", logsPath)
+		}
+	}
 	app, err := server.New(server.Options{
 		Store:         st,
+		LogStore:      logStore,
 		WebFS:         os.DirFS(webRoot),
 		AdminPassword: os.Getenv("LATTICE_ADMIN_PASSWORD"),
 		SecureCookies: secureCookies,

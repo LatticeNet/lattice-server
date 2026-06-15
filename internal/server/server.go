@@ -30,6 +30,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/cftunnel"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/logstore"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/notify"
 	"github.com/LatticeNet/lattice-server/internal/oidc"
@@ -43,8 +44,13 @@ import (
 )
 
 type Options struct {
-	Store         *store.Store
-	WebFS         fs.FS
+	Store *store.Store
+	WebFS fs.FS
+	// LogStore is the dedicated bounded log-line database (logs.db). Nil disables
+	// the log-ingestion feature: its endpoints return 503 and agents are told to
+	// tail nothing. Injected by main (opened beside the state file with the same
+	// cipher), mirroring Store.
+	LogStore      *logstore.Store
 	AdminPassword string
 	SecureCookies bool
 	// TrustProxy enables reading the client address from proxy headers
@@ -77,6 +83,7 @@ type Options struct {
 
 type Server struct {
 	store         *store.Store
+	logStore      *logstore.Store // bounded log-line db (logs.db); nil disables log ingestion
 	webFS         fs.FS
 	secureCookies bool
 	trustProxy    bool
@@ -86,7 +93,11 @@ type Server struct {
 	agentLimiter  *ratelimit.Limiter
 	apiLimiter    *ratelimit.Limiter
 	subLimiter    *ratelimit.Limiter
-	proxyUsageMu  sync.Mutex
+	// logIngestLimiter brakes per-source log ingest (keyed by source id) in
+	// lines/sec so a chatty or hostile node cannot flood the store; over budget
+	// returns 429 + Retry-After. Disk is independently bounded by the store caps.
+	logIngestLimiter *ratelimit.Limiter
+	proxyUsageMu     sync.Mutex
 	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
 	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
 	// who already targets a known account cannot widen the password-guess budget by
@@ -172,6 +183,7 @@ func New(opts Options) (*Server, error) {
 	}
 	s := &Server{
 		store:         opts.Store,
+		logStore:      opts.LogStore,
 		webFS:         opts.WebFS,
 		secureCookies: opts.SecureCookies,
 		trustProxy:    opts.TrustProxy,
@@ -189,7 +201,8 @@ func New(opts Options) (*Server, error) {
 		// Public subscription URLs are token-authenticated, unauthenticated HTTP
 		// endpoints. Keep a separate low-rate bucket so subscription probing cannot
 		// consume the operator/API limiter or widen token-search throughput.
-		subLimiter: ratelimit.New(ratelimit.Config{Rate: 2, Burst: 20}),
+		subLimiter:       ratelimit.New(ratelimit.Config{Rate: 2, Burst: 20}),
+		logIngestLimiter: ratelimit.New(ratelimit.Config{Rate: 5000, Burst: 10000}),
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
@@ -571,6 +584,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors", s.withAuth("monitor:read", s.handleMonitors))
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
+	mux.HandleFunc("/api/logs/sources", s.withAuth("log:read", s.handleLogSources))
+	mux.HandleFunc("/api/logs/sources/delete", s.withAuth("log:admin", s.handleDeleteLogSource))
+	mux.HandleFunc("/api/logs/query", s.withAuth("log:read", s.handleLogQuery))
+	mux.HandleFunc("/api/logs/stats", s.withAuth("log:read", s.handleLogStats))
 	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
@@ -594,6 +611,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
+	mux.HandleFunc("/api/agent/log-sources", s.withAgentLimit(s.handleAgentLogSources))
+	mux.HandleFunc("/api/agent/logs", s.withAgentLimit(s.handleAgentLogs))
 	mux.HandleFunc("/api/agent/event", s.withAgentLimit(s.handleAgentEvent))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

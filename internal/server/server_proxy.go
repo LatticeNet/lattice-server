@@ -1829,6 +1829,11 @@ func validateProxyConfigPath(value string) error {
 	if !strings.HasPrefix(value, "/") {
 		return errors.New("config_path must be absolute")
 	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == ".." {
+			return errors.New("config_path must not contain a .. path segment")
+		}
+	}
 	if strings.ContainsFunc(value, proxyUnsafeControl) {
 		return errors.New("config_path contains control characters")
 	}

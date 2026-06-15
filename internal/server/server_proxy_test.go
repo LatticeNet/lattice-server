@@ -1400,3 +1400,29 @@ func proxyInboundBodyForCore(id, name, core string) string {
 		"enabled":true
 	}`
 }
+
+func TestValidateProxyConfigPath(t *testing.T) {
+	valid := []string{
+		"/etc/sing-box/config.json",
+		"/usr/local/etc/xray/config.json",
+		"/var/lib/lattice/proxy/a..b.json", // ".." inside a label is fine
+	}
+	for _, p := range valid {
+		if err := validateProxyConfigPath(p); err != nil {
+			t.Fatalf("validateProxyConfigPath(%q) unexpected error: %v", p, err)
+		}
+	}
+	invalid := []string{
+		"etc/sing-box/config.json",                      // not absolute
+		"/etc/sing-box/../../root/.ssh/authorized_keys", // .. traversal segment
+		"/etc/..",                     // trailing .. segment
+		"/etc/sing-box/config.json\n", // control character
+		"/etc/$(reboot)/config.json",  // shell metacharacters
+		" /etc/sing-box/config.json",  // leading whitespace
+	}
+	for _, p := range invalid {
+		if err := validateProxyConfigPath(p); err == nil {
+			t.Fatalf("validateProxyConfigPath(%q) expected error", p)
+		}
+	}
+}

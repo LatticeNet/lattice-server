@@ -120,6 +120,15 @@ type Server struct {
 	coreDNSBinary selfdns.CoreDNSBinarySource
 	// reminderInterval is the coarse scheduler tick for machine renewal checks.
 	reminderInterval time.Duration
+	// proxyDrift tracks, per proxy node, whether the applied proxy config still
+	// matches what the server would render now. Drift means server-owned
+	// eligibility (expiry/quota/disable) or intent changed since the last apply,
+	// so the live node config still serves users who should no longer have
+	// access. It is recomputed on the scheduler tick and after each apply, held
+	// in memory only (re-derived on restart within one tick). It is an operator
+	// signal toward a reviewed apply, not authoritative security state.
+	proxyDriftMu sync.RWMutex
+	proxyDrift   map[string]proxyDriftState
 }
 
 const (
@@ -191,6 +200,7 @@ func New(opts Options) (*Server, error) {
 		reminderInterval: opts.RenewalReminderInterval,
 		now:              func() time.Time { return time.Now().UTC() },
 		userLoginFail:    make(map[string]*loginFailBucket),
+		proxyDrift:       make(map[string]proxyDriftState),
 	}
 	if s.reminderInterval <= 0 {
 		s.reminderInterval = time.Hour

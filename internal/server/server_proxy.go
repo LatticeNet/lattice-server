@@ -109,6 +109,15 @@ type proxyNodeProfileView struct {
 	UsageCollectorLastError   string    `json:"usage_collector_last_error,omitempty"`
 	UsageCollectorLastErrorAt time.Time `json:"usage_collector_last_error_at,omitempty"`
 
+	// ConfigStale and friends report whether the applied config still matches the
+	// current policy render. They are an operator signal toward a reviewed apply;
+	// node mutation always stays behind plan->approve->apply.
+	ConfigStale         bool      `json:"config_stale,omitempty"`
+	PendingConfigSHA256 string    `json:"pending_config_sha256,omitempty"`
+	IneligibleUsers     int       `json:"ineligible_users,omitempty"`
+	DriftReason         string    `json:"drift_reason,omitempty"`
+	DriftCheckedAt      time.Time `json:"drift_checked_at,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -1038,6 +1047,9 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 			Decision: "allow",
 			Metadata: metadata,
 		})
+		// Recompute drift now so the dashboard "config out of date" banner clears
+		// immediately after the enforcing apply, rather than at the next tick.
+		s.refreshProxyDriftFor(approval.NodeID, time.Now().UTC())
 		return nil
 	}
 	reason := taskFailureSummary(result)
@@ -1149,7 +1161,7 @@ func (s *Server) toProxyNodeProfileView(profile model.ProxyNodeProfile) proxyNod
 	if node, ok := s.store.Node(profile.NodeID); ok {
 		nodeName = node.Name
 	}
-	return proxyNodeProfileView{
+	view := proxyNodeProfileView{
 		ID:            profile.ID,
 		NodeID:        profile.NodeID,
 		NodeName:      nodeName,
@@ -1173,6 +1185,14 @@ func (s *Server) toProxyNodeProfileView(profile model.ProxyNodeProfile) proxyNod
 		CreatedAt: profile.CreatedAt,
 		UpdatedAt: profile.UpdatedAt,
 	}
+	if drift, ok := s.proxyDriftFor(profile.NodeID); ok {
+		view.ConfigStale = drift.Stale
+		view.PendingConfigSHA256 = drift.PendingSHA256
+		view.IneligibleUsers = drift.IneligibleUsers
+		view.DriftReason = drift.Reason
+		view.DriftCheckedAt = drift.CheckedAt
+	}
+	return view
 }
 
 func (s *Server) toProxyUsageSnapshotView(snapshot model.ProxyUsageSnapshot) proxyUsageSnapshotView {

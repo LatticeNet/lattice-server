@@ -92,10 +92,14 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 		"EXPECT_SHA='" + agentUpdateTestSHA + "'",
 		"\"$CANDIDATE\" -version",
 		"lattice-agent-delayed-restart",
+		"systemctl restart \"$SERVICE\"",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("update script missing %q:\n%s", want, script)
 		}
+	}
+	if strings.Contains(script, "sh -c") {
+		t.Fatalf("update script must not use nested shell command strings:\n%s", script)
 	}
 }
 

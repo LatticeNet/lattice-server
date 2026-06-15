@@ -23,7 +23,9 @@ jobs:
           go-version: '1.26.x'
           check-latest: true
       - name: create workspace
-        run: go work init ./lattice-sdk ./lattice-server
+        run: |
+          go work init ./lattice-sdk ./lattice-server
+          go work edit -replace=github.com/LatticeNet/lattice-sdk@v0.2.0=./lattice-sdk
       - name: gofmt
         working-directory: lattice-server
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)

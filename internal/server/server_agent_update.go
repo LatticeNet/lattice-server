@@ -492,7 +492,7 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"  if command -v systemd-run >/dev/null 2>&1; then\n" +
 		"    systemd-run --unit=lattice-agent-delayed-restart --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n" +
 		"  else\n" +
-		"    nohup sh -c \"sleep 3; systemctl restart '$SERVICE'\" >/dev/null 2>&1 &\n" +
+		"    ( sleep 3; systemctl restart \"$SERVICE\" ) >/dev/null 2>&1 &\n" +
 		"  fi\n" +
 		"  echo \"lattice agent update: installed $TARGET_VERSION and scheduled $SERVICE restart\"\n" +
 		"else\n" +

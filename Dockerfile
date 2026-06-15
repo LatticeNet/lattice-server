@@ -33,7 +33,8 @@ RUN apk add --no-cache ca-certificates tzdata \
     && chown -R lattice:lattice /var/lib/lattice /plugins
 
 COPY --from=build /out/lattice-server /usr/local/bin/lattice-server
-COPY --from=lattice-dashboard . /app/dashboard
+COPY --from=lattice-dashboard index.html /app/dashboard/index.html
+COPY --from=lattice-dashboard assets /app/dashboard/assets
 
 USER lattice
 

@@ -45,6 +45,7 @@ var (
 	boltBucketNFTInputs       = []byte("nft_inputs")
 	boltBucketDNSDeployments  = []byte("dns_deployments")
 	boltBucketNetPolicies     = []byte("net_policies")
+	boltBucketGeoRouting      = []byte("geo_routing")
 	boltBucketProxyInbounds   = []byte("proxy_inbounds")
 	boltBucketProxyUsers      = []byte("proxy_users")
 	boltBucketProxyProfiles   = []byte("proxy_profiles")
@@ -78,6 +79,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketNFTInputs,
 	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
+	boltBucketGeoRouting,
 	boltBucketProxyInbounds,
 	boltBucketProxyUsers,
 	boltBucketProxyProfiles,
@@ -236,6 +238,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketNetPolicies, persist.NetPolicies); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketGeoRouting, persist.GeoRouting); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketProxyInbounds, persist.ProxyInbounds); err != nil {
 			return err
 		}
@@ -352,6 +357,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketNetPolicies, st.NetPolicies); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketGeoRouting, st.GeoRouting); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketProxyInbounds, st.ProxyInbounds); err != nil {

@@ -49,6 +49,7 @@ type State struct {
 	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
 	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
+	GeoRouting      map[string]model.GeoRouting         `json:"geo_routing"`
 	ProxyInbounds   map[string]model.ProxyInbound       `json:"proxy_inbounds"`
 	ProxyUsers      map[string]model.ProxyUser          `json:"proxy_users"`
 	ProxyProfiles   map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
@@ -146,6 +147,7 @@ func emptyState() State {
 		NFTInputs:       map[string]model.NFTInputs{},
 		DNSDeployments:  map[string]model.DNSDeployment{},
 		NetPolicies:     map[string]model.NetPolicy{},
+		GeoRouting:      map[string]model.GeoRouting{},
 		ProxyInbounds:   map[string]model.ProxyInbound{},
 		ProxyUsers:      map[string]model.ProxyUser{},
 		ProxyProfiles:   map[string]model.ProxyNodeProfile{},
@@ -217,6 +219,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NetPolicies == nil {
 		st.NetPolicies = map[string]model.NetPolicy{}
+	}
+	if st.GeoRouting == nil {
+		st.GeoRouting = map[string]model.GeoRouting{}
 	}
 	if st.ProxyInbounds == nil {
 		st.ProxyInbounds = map[string]model.ProxyInbound{}
@@ -1309,6 +1314,64 @@ func (s *Store) DeleteNetPolicy(nodeID string) error {
 		return nil
 	}
 	delete(s.state.NetPolicies, nodeID)
+	return s.Save()
+}
+
+// UpsertGeoRouting creates or updates a geo-routing record.
+func (s *Store) UpsertGeoRouting(gr model.GeoRouting) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gr.UpdatedAt = time.Now().UTC()
+	if gr.CreatedAt.IsZero() {
+		gr.CreatedAt = gr.UpdatedAt
+	}
+	s.state.GeoRouting[gr.ID] = gr
+	return s.Save()
+}
+
+// GeoRouting returns a geo-routing record by id.
+func (s *Store) GeoRouting(id string) (model.GeoRouting, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gr, ok := s.state.GeoRouting[id]
+	return gr, ok
+}
+
+// GeoRoutings returns all geo-routing records sorted by creation time.
+func (s *Store) GeoRoutings() []model.GeoRouting {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.GeoRouting, 0, len(s.state.GeoRouting))
+	for _, gr := range s.state.GeoRouting {
+		out = append(out, gr)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// GeoRoutingsForNode returns geo-routing records that reference nodeID as a
+// participating target or an authoritative DNS node (for re-render on change).
+func (s *Store) GeoRoutingsForNode(nodeID string) []model.GeoRouting {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.GeoRouting{}
+	for _, gr := range s.state.GeoRouting {
+		if contains(gr.NodeIDs, nodeID) || contains(gr.DNSNodeIDs, nodeID) {
+			out = append(out, gr)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// DeleteGeoRouting removes a geo-routing record.
+func (s *Store) DeleteGeoRouting(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.GeoRouting[id]; !ok {
+		return nil
+	}
+	delete(s.state.GeoRouting, id)
 	return s.Save()
 }
 

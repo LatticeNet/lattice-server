@@ -95,7 +95,8 @@ ghcr.io/latticenet/lattice-server
 
 The container leaves `LATTICE_MASTER_KEY_FILE` unset by default so first boot can
 generate `/var/lib/lattice/master.key` automatically. Set it only when restoring
-or mounting a pre-existing key.
+or mounting a pre-existing key. The entrypoint fixes ownership of the mounted
+data directory before dropping privileges to the `lattice` user.
 
 Use the compose file and deployment guide in the umbrella repository:
 `lattice/compose/docker-compose.yml` and `lattice/docs/tutorials/docker-server.md`.

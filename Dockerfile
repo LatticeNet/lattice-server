@@ -27,7 +27,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
 
 FROM alpine:3.22
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates su-exec tzdata \
     && addgroup -S lattice \
     && adduser -S -G lattice -h /var/lib/lattice lattice \
     && mkdir -p /app/dashboard /var/lib/lattice /plugins \
@@ -36,8 +36,8 @@ RUN apk add --no-cache ca-certificates tzdata \
 COPY --from=build /out/lattice-server /usr/local/bin/lattice-server
 COPY --from=lattice-dashboard index.html /app/dashboard/index.html
 COPY --from=lattice-dashboard assets /app/dashboard/assets
-
-USER lattice
+COPY docker-entrypoint.sh /usr/local/bin/lattice-entrypoint
+RUN chmod 0755 /usr/local/bin/lattice-entrypoint
 
 ENV LATTICE_LISTEN=0.0.0.0:8088 \
     LATTICE_DATA=/var/lib/lattice/state.json \
@@ -47,4 +47,5 @@ ENV LATTICE_LISTEN=0.0.0.0:8088 \
 EXPOSE 8088
 VOLUME ["/var/lib/lattice", "/plugins"]
 
-ENTRYPOINT ["/usr/local/bin/lattice-server"]
+ENTRYPOINT ["/usr/local/bin/lattice-entrypoint"]
+CMD ["/usr/local/bin/lattice-server"]

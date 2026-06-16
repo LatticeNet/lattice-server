@@ -35,6 +35,7 @@ RUN corepack enable \
     && pnpm build
 
 FROM alpine:3.22
+ARG DASHBOARD_COMMIT=unknown
 
 RUN apk add --no-cache ca-certificates su-exec tzdata \
     && addgroup -S lattice \
@@ -46,6 +47,8 @@ COPY --from=build /out/lattice-server /usr/local/bin/lattice-server
 COPY --from=dashboard /src/dashboard/dist /app/dashboard
 COPY docker-entrypoint.sh /usr/local/bin/lattice-entrypoint
 RUN chmod 0755 /usr/local/bin/lattice-entrypoint
+
+LABEL org.opencontainers.image.latticenet.dashboard-next-revision="${DASHBOARD_COMMIT}"
 
 ENV LATTICE_LISTEN=0.0.0.0:8088 \
     LATTICE_DATA=/var/lib/lattice/state.json \

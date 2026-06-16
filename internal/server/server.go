@@ -538,6 +538,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth/oidc/providers/delete", s.withAuth("oidc:admin", s.handleDeleteOIDCProvider))
 	mux.HandleFunc("/api/logout", s.withAuth("", s.handleLogout))
 	mux.HandleFunc("/api/me", s.withAuth("", s.handleMe))
+	mux.HandleFunc("/api/auth/password", s.withAuth("", s.handlePasswordChange))
 	mux.HandleFunc("/api/2fa/totp/enroll", s.withAuth("", s.handle2FAEnroll))
 	mux.HandleFunc("/api/2fa/totp/activate", s.withAuth("", s.handle2FAActivate))
 	mux.HandleFunc("/api/2fa/totp/disable", s.withAuth("", s.handle2FADisable))
@@ -1061,6 +1062,61 @@ func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, user model
 	writeJSON(w, http.StatusOK, map[string]string{"csrf_token": session.CSRFToken, "actor_id": user.ID})
 }
 
+func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if p.viaBearer {
+		writeError(w, http.StatusForbidden, errors.New("password changes require an interactive session"))
+		return
+	}
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if req.CurrentPassword == "" || req.NewPassword == "" {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "current_password and new_password are required"))
+		return
+	}
+	user, ok := s.store.User(p.ActorID)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, errors.New("unknown user"))
+		return
+	}
+	if s.userLoginLocked(user.ID) {
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "auth.password.change", Decision: "deny", Reason: "per-user password attempt limit exceeded"})
+		writeError(w, http.StatusTooManyRequests, errors.New("too many password attempts; slow down"))
+		return
+	}
+	if !auth.VerifySecret(user.PasswordHash, req.CurrentPassword) {
+		s.recordUserLoginFailure(user.ID)
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "auth.password.change", Decision: "deny", Reason: "invalid current password"})
+		writeError(w, http.StatusUnauthorized, errors.New("invalid current password"))
+		return
+	}
+	if auth.VerifySecret(user.PasswordHash, req.NewPassword) {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "new password must differ from the current password"))
+		return
+	}
+	hash, err := auth.HashSecret(req.NewPassword)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, err.Error()))
+		return
+	}
+	user.PasswordHash = hash
+	user.SecurityEpoch++
+	if err := s.store.UpsertUser(user); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "auth.password.change", Decision: "allow"})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // issueTOTPChallenge gates a 2FA-enabled user: it stores a short-lived, IP-bound,
 // single-use challenge and asks the client to complete the second factor instead
 // of issuing a session.
@@ -1304,6 +1360,7 @@ func (s *Server) handle2FADisable(w http.ResponseWriter, r *http.Request, p prin
 	user.TOTPEnabled = false
 	user.TOTPSecret = ""
 	user.RecoveryCodeHashes = nil
+	user.SecurityEpoch++
 	if err := s.store.UpsertUser(user); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

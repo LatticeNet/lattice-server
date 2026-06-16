@@ -103,7 +103,9 @@ Use the compose file and deployment guide in the umbrella repository:
 
 ## Security Defaults
 
-- First-run password is random unless `LATTICE_ADMIN_PASSWORD` is set.
+- First-run password is random unless `LATTICE_ADMIN_PASSWORD` is set. After
+  state exists, that environment variable remains bootstrap-only; rotate the
+  current operator password with authenticated `POST /api/auth/password`.
 - Management APIs are intended for localhost, WireGuard, or a hardened reverse proxy.
 - Agent APIs authenticate node tokens only through the `Authorization: Bearer`
   header; JSON body tokens are rejected so credentials do not enter request

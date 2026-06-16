@@ -35,6 +35,22 @@ func loginSession(t *testing.T, handler http.Handler) ([]*http.Cookie, string) {
 	return res.Cookies(), out.CSRF
 }
 
+func loginSessionWithPassword(t *testing.T, handler http.Handler, password string) ([]*http.Cookie, string, int) {
+	t.Helper()
+	body := bytes.NewBufferString(`{"username":"admin","password":"` + password + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+	var out struct {
+		CSRF string `json:"csrf_token"`
+	}
+	_ = json.NewDecoder(res.Body).Decode(&out)
+	return res.Cookies(), out.CSRF, res.StatusCode
+}
+
 func newTestServer(t *testing.T) (http.Handler, *store.Store) {
 	t.Helper()
 	st, err := store.Open("")
@@ -107,6 +123,62 @@ func mustJSON(t *testing.T, value any) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func TestPasswordChangeRotatesHashAndInvalidatesSessions(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+
+	body := `{"current_password":"` + testAdminPass + `","new_password":"new correct horse battery staple"}`
+	res := doJSON(t, handler, http.MethodPost, "/api/auth/password", body, cookies, csrf)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("password change status = %d", res.StatusCode)
+	}
+
+	stale := doJSON(t, handler, http.MethodGet, "/api/me", "", cookies, "")
+	stale.Body.Close()
+	if stale.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("old session should be invalidated, got %d", stale.StatusCode)
+	}
+
+	_, _, oldStatus := loginSessionWithPassword(t, handler, testAdminPass)
+	if oldStatus != http.StatusUnauthorized {
+		t.Fatalf("old password should fail, got %d", oldStatus)
+	}
+	_, newCSRF, newStatus := loginSessionWithPassword(t, handler, "new correct horse battery staple")
+	if newStatus != http.StatusOK || newCSRF == "" {
+		t.Fatalf("new password login failed: status=%d csrf=%q", newStatus, newCSRF)
+	}
+
+	ev := auditByActionAndScope(t, st, "auth.password.change", "")
+	if ev.Decision != "allow" || ev.ActorID != "user_admin" {
+		t.Fatalf("unexpected password change audit event: %+v", ev)
+	}
+}
+
+func TestPasswordChangeRejectsBearerAndWrongCurrentPassword(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"*"}, nil)
+
+	body := `{"current_password":"` + testAdminPass + `","new_password":"new correct horse battery staple"}`
+	bearer := doBearerJSON(t, handler, http.MethodPost, "/api/auth/password", body, token)
+	bearer.Body.Close()
+	if bearer.StatusCode != http.StatusForbidden {
+		t.Fatalf("bearer password change should be forbidden, got %d", bearer.StatusCode)
+	}
+
+	wrong := doJSON(t, handler, http.MethodPost, "/api/auth/password", `{"current_password":"wrong current password","new_password":"new correct horse battery staple"}`, cookies, csrf)
+	wrong.Body.Close()
+	if wrong.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong current password should be unauthorized, got %d", wrong.StatusCode)
+	}
+
+	_, _, oldStatus := loginSessionWithPassword(t, handler, testAdminPass)
+	if oldStatus != http.StatusOK {
+		t.Fatalf("old password should still work after rejected change, got %d", oldStatus)
+	}
 }
 
 func auditByActionAndScope(t *testing.T, st *store.Store, action, scope string) model.AuditEvent {

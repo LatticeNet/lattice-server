@@ -24,11 +24,11 @@ jobs:
         with:
           repository: LatticeNet/lattice-sdk
           path: lattice-sdk
-      - name: checkout lattice-dashboard
+      - name: checkout lattice-dashboard-next
         uses: actions/checkout@v4
         with:
-          repository: LatticeNet/lattice-dashboard
-          path: lattice-dashboard
+          repository: LatticeNet/lattice-dashboard-next
+          path: lattice-dashboard-next
       - name: set up docker buildx
         uses: docker/setup-buildx-action@v3
       - name: log in to ghcr
@@ -57,7 +57,7 @@ jobs:
           file: lattice-server/Dockerfile
           build-contexts: |
             lattice-sdk=./lattice-sdk
-            lattice-dashboard=./lattice-dashboard
+            lattice-dashboard=./lattice-dashboard-next
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

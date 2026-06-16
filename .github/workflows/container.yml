@@ -24,15 +24,15 @@ jobs:
         with:
           repository: LatticeNet/lattice-sdk
           path: lattice-sdk
-      - name: read dashboard-next ref
+      - name: read dashboard ref
         id: dashboard
-        run: echo "ref=$(cat lattice-server/dashboard-next.ref)" >> "$GITHUB_OUTPUT"
-      - name: checkout lattice-dashboard-next
+        run: echo "ref=$(cat lattice-server/dashboard.ref)" >> "$GITHUB_OUTPUT"
+      - name: checkout lattice-dashboard
         uses: actions/checkout@v4
         with:
-          repository: LatticeNet/lattice-dashboard-next
+          repository: LatticeNet/lattice-dashboard
           ref: ${{ steps.dashboard.outputs.ref }}
-          path: lattice-dashboard-next
+          path: lattice-dashboard
       - name: set up docker buildx
         uses: docker/setup-buildx-action@v3
       - name: log in to ghcr
@@ -61,7 +61,7 @@ jobs:
           file: lattice-server/Dockerfile
           build-contexts: |
             lattice-sdk=./lattice-sdk
-            lattice-dashboard=./lattice-dashboard-next
+            lattice-dashboard=./lattice-dashboard
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

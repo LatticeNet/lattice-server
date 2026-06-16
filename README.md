@@ -106,7 +106,7 @@ Use the compose file and deployment guide in the umbrella repository:
 - First-run password is random unless `LATTICE_ADMIN_PASSWORD` is set. After
   state exists, that environment variable remains bootstrap-only; rotate the
   current operator password with authenticated `POST /api/auth/password`.
-- Container images embed the dashboard commit pinned in `dashboard-next.ref`;
+- Container images embed the dashboard commit pinned in `dashboard.ref`;
   update that file when intentionally rolling a new dashboard into the server
   image.
 - Management APIs are intended for localhost, WireGuard, or a hardened reverse proxy.

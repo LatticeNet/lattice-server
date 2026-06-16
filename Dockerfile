@@ -4,7 +4,7 @@ FROM golang:1.26-bookworm AS build
 
 WORKDIR /src
 
-# lattice-server, lattice-sdk, and lattice-dashboard-next live in separate
+# lattice-server, lattice-sdk, and lattice-dashboard live in separate
 # repositories. BuildKit named contexts keep that split intact while still
 # producing a single server image with the dashboard embedded.
 COPY . /src/lattice-server
@@ -48,7 +48,7 @@ COPY --from=dashboard /src/dashboard/dist /app/dashboard
 COPY docker-entrypoint.sh /usr/local/bin/lattice-entrypoint
 RUN chmod 0755 /usr/local/bin/lattice-entrypoint
 
-LABEL org.opencontainers.image.latticenet.dashboard-next-revision="${DASHBOARD_COMMIT}"
+LABEL org.opencontainers.image.latticenet.dashboard-revision="${DASHBOARD_COMMIT}"
 
 ENV LATTICE_LISTEN=0.0.0.0:8088 \
     LATTICE_DATA=/var/lib/lattice/state.json \

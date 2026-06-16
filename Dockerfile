@@ -42,7 +42,6 @@ USER lattice
 ENV LATTICE_LISTEN=0.0.0.0:8088 \
     LATTICE_DATA=/var/lib/lattice/state.json \
     LATTICE_WEB_ROOT=/app/dashboard \
-    LATTICE_MASTER_KEY_FILE=/var/lib/lattice/master.key \
     LATTICE_PLUGIN_DIR=/plugins
 
 EXPOSE 8088

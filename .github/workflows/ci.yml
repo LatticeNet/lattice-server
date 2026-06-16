@@ -29,6 +29,9 @@ jobs:
       - name: gofmt
         working-directory: lattice-server
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: docker defaults contract
+        working-directory: lattice-server
+        run: sh scripts/check-docker-defaults.sh
       - name: vet
         working-directory: lattice-server
         run: go vet ./...

@@ -93,6 +93,10 @@ Published image:
 ghcr.io/latticenet/lattice-server
 ```
 
+Image publication is tag-driven. Stable `v*` tags publish the matching version
+tag and `latest`; the moving `alpha` git tag publishes `alpha`. Source pushes to
+`main` run CI but do not publish a `main` image channel.
+
 The container leaves `LATTICE_MASTER_KEY_FILE` unset by default so first boot can
 generate `/var/lib/lattice/master.key` automatically. Set it only when restoring
 or mounting a pre-existing key. The entrypoint fixes ownership of the mounted

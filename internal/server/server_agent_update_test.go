@@ -90,7 +90,8 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	for _, want := range []string{
 		"curl -fsSL --proto '=https' --tlsv1.2",
 		"EXPECT_SHA='" + agentUpdateTestSHA + "'",
-		"\"$CANDIDATE\" -version",
+		"CANDIDATE_VERSION=$(\"$CANDIDATE\" -version)",
+		"version mismatch expected=$TARGET_VERSION actual=$CANDIDATE_VERSION",
 		"lattice-agent-delayed-restart",
 		"systemctl restart \"$SERVICE\"",
 	} {

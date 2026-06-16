@@ -480,7 +480,11 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"  exit 1\n" +
 		"fi\n" +
 		"chmod 0755 \"$CANDIDATE\"\n" +
-		"\"$CANDIDATE\" -version >/dev/null\n" +
+		"CANDIDATE_VERSION=$(\"$CANDIDATE\" -version)\n" +
+		"if [ \"$CANDIDATE_VERSION\" != \"$TARGET_VERSION\" ]; then\n" +
+		"  echo \"lattice agent update: version mismatch expected=$TARGET_VERSION actual=$CANDIDATE_VERSION\" >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
 		"mkdir -p \"$(dirname \"$TARGET\")\"\n" +
 		"if [ -e \"$TARGET\" ]; then\n" +
 		"  cp -p \"$TARGET\" \"$TARGET.bak.$(date +%Y%m%d%H%M%S)\"\n" +

@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -54,5 +55,37 @@ func TestNodeTokenRotationAndRevocation(t *testing.T) {
 	res.Body.Close()
 	if !nodeTokenAuthOK(t, handler, nodeID, rot.Token) {
 		t.Fatal("re-enabled node's token must authenticate again")
+	}
+}
+
+func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
+	handler, _ := newTestServerWithPublicURL(t, "https://lattice.example.com/")
+	cookies, csrf := loginSession(t, handler)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/nodes/enroll-token", `{"node_id":"node-a","name":"Node A"}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("enroll: %d", res.StatusCode)
+	}
+	var out struct {
+		NodeID    string `json:"node_id"`
+		Token     string `json:"token"`
+		ServerURL string `json:"server_url"`
+		Command   string `json:"command"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ServerURL != "https://lattice.example.com" {
+		t.Fatalf("server_url = %q", out.ServerURL)
+	}
+	for _, want := range []string{
+		"lattice-agent -server 'https://lattice.example.com'",
+		"-node-id 'node-a'",
+		"-token '" + out.Token + "'",
+	} {
+		if !strings.Contains(out.Command, want) {
+			t.Fatalf("command missing %q:\n%s", want, out.Command)
+		}
 	}
 }

@@ -1456,11 +1456,28 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "node.enroll", Scope: "node:admin", NodeID: req.NodeID})
+	serverURL := s.agentEnrollServerURL()
 	writeJSON(w, http.StatusOK, map[string]string{
-		"node_id": req.NodeID,
-		"token":   token,
-		"command": fmt.Sprintf("lattice-agent -server http://127.0.0.1:8088 -node-id %s -token %s", req.NodeID, token),
+		"node_id":    req.NodeID,
+		"token":      token,
+		"server_url": serverURL,
+		"command":    s.agentEnrollCommand(serverURL, req.NodeID, token),
 	})
+}
+
+func (s *Server) agentEnrollServerURL() string {
+	if s.publicURL != "" {
+		return s.publicURL
+	}
+	return "http://127.0.0.1:8088"
+}
+
+func (s *Server) agentEnrollCommand(serverURL, nodeID, token string) string {
+	return fmt.Sprintf("lattice-agent -server %s -node-id %s -token %s",
+		shellQuote(serverURL),
+		shellQuote(nodeID),
+		shellQuote(token),
+	)
 }
 
 // handleRotateNodeToken issues a fresh token for an existing node, invalidating

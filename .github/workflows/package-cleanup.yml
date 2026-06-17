@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       keep:
-        description: "Most recent untagged versions to keep"
+        description: "Extra stale untagged versions to keep after protecting active tag children"
         required: true
-        default: "4"
+        default: "0"
       dry_run:
         description: "List deletions without deleting"
         required: true
@@ -25,7 +25,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ORG: LatticeNet
       PACKAGE_NAME: lattice-server
-      KEEP_UNTAGGED: ${{ github.event.inputs.keep || '4' }}
+      ACTIVE_TAGS: latest alpha
+      KEEP_UNTAGGED: ${{ github.event.inputs.keep || '0' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
     steps:
       - name: delete old untagged container versions
@@ -37,20 +38,44 @@ jobs:
             exit 2
           fi
 
+          org_image="$(tr '[:upper:]' '[:lower:]' <<< "$ORG")"
+          protected="$(mktemp)"
+          for tag in $ACTIVE_TAGS; do
+            image="ghcr.io/${org_image}/${PACKAGE_NAME}:${tag}"
+            echo "protecting child manifests for ${image}"
+            if ! manifest="$(docker manifest inspect "$image" 2>/dev/null)"; then
+              echo "warning: could not inspect ${image}; no child manifests protected for this tag" >&2
+              continue
+            fi
+            jq -r '.manifests[]?.digest // empty' <<< "$manifest" >> "$protected"
+          done
+          sort -u "$protected" -o "$protected"
+
           mapfile -t rows < <(
             gh api --paginate "/orgs/${ORG}/packages/container/${PACKAGE_NAME}/versions?per_page=100" \
               --jq '.[] | select(((.metadata.container.tags // []) | length) == 0) | [.id, .name, .created_at] | @tsv'
           )
 
+          stale=()
+          for row in "${rows[@]}"; do
+            digest="$(cut -f2 <<< "$row")"
+            if grep -Fxq "$digest" "$protected"; then
+              echo "protect active child digest=${digest}"
+              continue
+            fi
+            stale+=("$row")
+          done
+
           total=${#rows[@]}
-          echo "found ${total} untagged package versions"
-          if (( total <= KEEP_UNTAGGED )); then
-            echo "nothing to delete; keeping ${KEEP_UNTAGGED}"
+          stale_total=${#stale[@]}
+          echo "found ${total} untagged package versions; ${stale_total} are stale"
+          if (( stale_total <= KEEP_UNTAGGED )); then
+            echo "nothing to delete; keeping ${KEEP_UNTAGGED} stale versions"
             exit 0
           fi
 
-          for ((i = KEEP_UNTAGGED; i < total; i++)); do
-            row="${rows[$i]}"
+          for ((i = KEEP_UNTAGGED; i < stale_total; i++)); do
+            row="${stale[$i]}"
             id="$(cut -f1 <<< "$row")"
             name="$(cut -f2 <<< "$row")"
             created="$(cut -f3 <<< "$row")"

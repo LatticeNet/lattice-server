@@ -99,9 +99,9 @@ Image publication is tag-driven. The moving `latest` git tag publishes
 publish immutable version tags. Source pushes to `main` run CI but do not
 publish a `main` image channel. Build provenance/SBOM attestations are disabled
 for the image workflow, and the `package cleanup` workflow prunes old untagged
-container package versions while keeping the most recent four child manifests by
-default so the `latest` and `alpha` multi-arch channels keep their amd64/arm64
-children.
+container package versions. The cleanup job protects child manifests referenced
+by the active `latest` and `alpha` manifest lists, then deletes stale untagged
+digests by default.
 
 The container leaves `LATTICE_MASTER_KEY_FILE` unset by default so first boot can
 generate `/var/lib/lattice/master.key` automatically. Set it only when restoring

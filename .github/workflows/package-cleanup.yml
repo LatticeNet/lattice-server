@@ -6,7 +6,7 @@ on:
       keep:
         description: "Most recent untagged versions to keep"
         required: true
-        default: "2"
+        default: "4"
       dry_run:
         description: "List deletions without deleting"
         required: true
@@ -25,7 +25,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ORG: LatticeNet
       PACKAGE_NAME: lattice-server
-      KEEP_UNTAGGED: ${{ github.event.inputs.keep || '2' }}
+      KEEP_UNTAGGED: ${{ github.event.inputs.keep || '4' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
     steps:
       - name: delete old untagged container versions

@@ -29,7 +29,8 @@ Responsibilities:
   task-result status reconciliation, public subscription serving, audited
   subscription-token rotation, sing-box JSON plus Clash/Mihomo YAML subscription
   output, and baseline proxy usage rollup.
-- Operator-owned NodeGeo API for the dashboard Fleet Map.
+- Operator-owned NodeGeo API and optional server-side GeoIP lookup for the
+  dashboard Fleet Map.
 - Append-only audit events.
 
 ## Run Locally
@@ -57,6 +58,18 @@ go run ./cmd/lattice-server
 The URL must be HTTPS and point directly to an executable binary. The reviewed
 approval plan includes the version, URL, SHA-256, and fixed install path
 (`/usr/local/bin/coredns`); the node installs only after digest verification.
+
+Fleet Map automatic node placement is disabled unless you configure an explicit
+GeoIP endpoint. The URL must contain `{ip}` and return JSON with coordinates
+using common IPInfo/ip-api/ipapi-style fields:
+
+```sh
+LATTICE_GEOIP_LOOKUP_URL='https://ipinfo.io/{ip}/json?token=replace-with-token' \
+go run ./cmd/lattice-server
+```
+
+Use an internal GeoIP service if you do not want node public IPs sent to a
+third-party provider. Manual map coordinates work without this setting.
 
 ## Build
 
@@ -137,6 +150,10 @@ Use the compose file and deployment guide in the umbrella repository:
 - Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
   advisory telemetry only. They are sanitized and clamped server-side and must
   not be used for authorization or policy decisions.
+- Fleet Map GeoIP lookup is opt-in. When `LATTICE_GEOIP_LOOKUP_URL` is unset,
+  the server does not send node public IPs to any external service; dashboard
+  auto-location reports that the resolver is disabled. Automatically resolved
+  NodeGeo is marked `source=auto` and manual saves are marked `source=operator`.
 - MachineProfile cost/vendor/renewal data is server-only and is never sent to
   agents. Console/detail links are encrypted at rest and list APIs return only
   `has_console_url` / `has_detail_url` booleans.

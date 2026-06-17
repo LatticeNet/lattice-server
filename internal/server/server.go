@@ -29,6 +29,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/cftunnel"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
+	"github.com/LatticeNet/lattice-server/internal/geoip"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/logstore"
 	"github.com/LatticeNet/lattice-server/internal/network"
@@ -75,6 +76,10 @@ type Options struct {
 	// apply scripts may install. Empty preserves the fail-closed precondition
 	// that coredns already exists on the node.
 	CoreDNSBinary selfdns.CoreDNSBinarySource
+	// GeoResolver optionally maps node public IPs to advisory coordinates for the
+	// Fleet Map. Nil keeps automatic lookup disabled; manual NodeGeo remains
+	// available.
+	GeoResolver geoip.Resolver
 	// RenewalReminderInterval controls the machine-renewal reminder scheduler.
 	// Zero uses the production default. DisableRenewalScheduler is intended for
 	// tests that need full control over reminder evaluation.
@@ -139,6 +144,9 @@ type Server struct {
 	// coreDNSBinary is copied into selfdns approval plans when configured. The
 	// apply path parses the reviewed plan, not this mutable server field.
 	coreDNSBinary selfdns.CoreDNSBinarySource
+	// geoResolver is nil unless the operator configured an explicit GeoIP data
+	// source. The server never sends node IPs to third parties by default.
+	geoResolver geoip.Resolver
 	// build is immutable process metadata exposed by /api/version and dashboard
 	// About. It contains no secrets and is intentionally safe for unauthenticated
 	// health/version probes.
@@ -223,6 +231,7 @@ func New(opts Options) (*Server, error) {
 		oidc:             oidc.NewManager(),
 		publicURL:        strings.TrimRight(opts.PublicURL, "/"),
 		coreDNSBinary:    coreDNSBinary,
+		geoResolver:      opts.GeoResolver,
 		build:            normalizeBuildInfo(opts.Build),
 		pluginTrust:      opts.PluginTrust,
 		reminderInterval: opts.RenewalReminderInterval,
@@ -559,6 +568,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/2fa/totp/disable", s.withAuth("", s.handle2FADisable))
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
 	mux.HandleFunc("/api/nodes/geo", s.withAuth("", s.handleNodesGeo))
+	mux.HandleFunc("/api/nodes/geo/resolve", s.withAuth("", s.handleNodesGeoResolve))
 	mux.HandleFunc("/api/nodes/agent-updates", s.withAuth("", s.handleAgentUpdatePolicies))
 	mux.HandleFunc("/api/nodes/agent-updates/delete", s.withAuth("node:admin", s.handleDeleteAgentUpdatePolicy))
 	mux.HandleFunc("/api/nodes/agent-updates/plan", s.withAuth("", s.handleAgentUpdatePlan))

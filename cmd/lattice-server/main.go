@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/LatticeNet/lattice-server/internal/geoip"
 	"github.com/LatticeNet/lattice-server/internal/logstore"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/secret"
@@ -46,6 +47,7 @@ func main() {
 	var coreDNSVersion string
 	var coreDNSURL string
 	var coreDNSSHA256 string
+	var geoIPLookupURL string
 	var printVersion bool
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
@@ -61,6 +63,7 @@ func main() {
 	flag.StringVar(&coreDNSVersion, "coredns-binary-version", env("LATTICE_COREDNS_BINARY_VERSION", ""), "pinned CoreDNS binary version for self-host DNS apply (requires -coredns-binary-url and -coredns-binary-sha256)")
 	flag.StringVar(&coreDNSURL, "coredns-binary-url", env("LATTICE_COREDNS_BINARY_URL", ""), "HTTPS URL to a direct CoreDNS executable binary for self-host DNS apply")
 	flag.StringVar(&coreDNSSHA256, "coredns-binary-sha256", env("LATTICE_COREDNS_BINARY_SHA256", ""), "SHA-256 hex digest of the CoreDNS executable binary")
+	flag.StringVar(&geoIPLookupURL, "geoip-lookup-url", env("LATTICE_GEOIP_LOOKUP_URL", ""), "HTTPS GeoIP lookup URL template containing {ip}; empty disables automatic node geolocation")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-server version and exit")
 	flag.Parse()
 	if printVersion {
@@ -113,6 +116,13 @@ func main() {
 			log.Printf("log store: %s (PLAINTEXT — logs may contain secrets; set a master key to encrypt)", logsPath)
 		}
 	}
+	geoResolver, err := geoip.NewHTTPResolver(geoIPLookupURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if geoResolver != nil {
+		log.Printf("geoip lookup: enabled via configured HTTPS template")
+	}
 	app, err := server.New(server.Options{
 		Store:         st,
 		LogStore:      logStore,
@@ -132,6 +142,7 @@ func main() {
 		PluginTrust:   trustPolicy,
 		PublicURL:     publicURL,
 		CoreDNSBinary: selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
+		GeoResolver:   geoResolver,
 		Logger:        log.Default(),
 	})
 	if err != nil {

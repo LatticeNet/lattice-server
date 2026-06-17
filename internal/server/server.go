@@ -565,6 +565,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
+	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/audit", s.withAuth("audit:read", s.handleAudit))
@@ -638,10 +639,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/proxy-usage", s.withAgentLimit(s.handleAgentProxyUsage))
 	mux.HandleFunc("/api/agent/tasks", s.withAgentLimit(s.handleAgentTasks))
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
+	mux.HandleFunc("/api/agent/config", s.withAgentLimit(s.handleAgentConfig))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
 	mux.HandleFunc("/api/agent/log-sources", s.withAgentLimit(s.handleAgentLogSources))
 	mux.HandleFunc("/api/agent/logs", s.withAgentLimit(s.handleAgentLogs))
+	mux.HandleFunc("/api/agent/debug-events", s.withAgentLimit(s.handleAgentDebugEvents))
 	mux.HandleFunc("/api/agent/event", s.withAgentLimit(s.handleAgentEvent))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -1498,24 +1501,25 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 }
 
 type nodeView struct {
-	ID                 string          `json:"id"`
-	Name               string          `json:"name"`
-	Tags               []string        `json:"tags"`
-	Role               string          `json:"role"`
-	WireGuardIP        string          `json:"wireguard_ip"`
-	WireGuardPublicKey string          `json:"wireguard_public_key,omitempty"`
-	WireGuardEndpoint  string          `json:"wireguard_endpoint,omitempty"`
-	WireGuardPort      int             `json:"wireguard_port,omitempty"`
-	PublicIP           string          `json:"public_ip"`
-	PublicIPv6         string          `json:"public_ipv6,omitempty"`
-	AgentVersion       string          `json:"agent_version"`
-	Online             bool            `json:"online"`
-	Disabled           bool            `json:"disabled,omitempty"`
-	LastSeen           time.Time       `json:"last_seen"`
-	Metrics            model.Metrics   `json:"metrics"`
-	HostFacts          model.HostFacts `json:"host_facts"`
-	Geo                *model.NodeGeo  `json:"geo,omitempty"`
-	CreatedAt          time.Time       `json:"created_at"`
+	ID                 string                 `json:"id"`
+	Name               string                 `json:"name"`
+	Tags               []string               `json:"tags"`
+	Role               string                 `json:"role"`
+	WireGuardIP        string                 `json:"wireguard_ip"`
+	WireGuardPublicKey string                 `json:"wireguard_public_key,omitempty"`
+	WireGuardEndpoint  string                 `json:"wireguard_endpoint,omitempty"`
+	WireGuardPort      int                    `json:"wireguard_port,omitempty"`
+	PublicIP           string                 `json:"public_ip"`
+	PublicIPv6         string                 `json:"public_ipv6,omitempty"`
+	AgentVersion       string                 `json:"agent_version"`
+	Online             bool                   `json:"online"`
+	Disabled           bool                   `json:"disabled,omitempty"`
+	LastSeen           time.Time              `json:"last_seen"`
+	Metrics            model.Metrics          `json:"metrics"`
+	HostFacts          model.HostFacts        `json:"host_facts"`
+	Geo                *model.NodeGeo         `json:"geo,omitempty"`
+	AgentDebug         model.AgentDebugPolicy `json:"agent_debug"`
+	CreatedAt          time.Time              `json:"created_at"`
 }
 
 func toNodeView(n model.Node) nodeView {
@@ -1525,7 +1529,7 @@ func toNodeView(n model.Node) nodeView {
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, Geo: n.Geo, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, CreatedAt: n.CreatedAt,
 	}
 }
 

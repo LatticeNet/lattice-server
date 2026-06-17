@@ -167,6 +167,10 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p prin
 				writeError(w, http.StatusBadRequest, errors.New("node_id cannot change for an existing source"))
 				return
 			}
+			if had && isAgentDebugLogSource(existing) {
+				writeError(w, http.StatusBadRequest, errors.New("agent debug sources are managed by node debug policy"))
+				return
+			}
 		}
 		ls := existing
 		if !had {

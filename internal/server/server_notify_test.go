@@ -7,7 +7,91 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
+
+func TestNotifyRuleCRUD(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/notify/channels",
+		`{"name":"web","kind":"webhook","config":{"url":"https://example.com/hook"}}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create channel failed: %d", create.StatusCode)
+	}
+	var channel struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&channel); err != nil {
+		t.Fatal(err)
+	}
+	createRule := doJSON(t, handler, http.MethodPost, "/api/notify/rules",
+		`{"name":"monitor-down","event_types":["monitor.down"],"channel_ids":["`+channel.ID+`"],"title_template":"[{{event_type}}] {{title}}","body_template":"{{body}}"}`, cookies, csrf)
+	defer createRule.Body.Close()
+	if createRule.StatusCode != http.StatusOK {
+		t.Fatalf("create rule failed: %d", createRule.StatusCode)
+	}
+	list := doJSON(t, handler, http.MethodGet, "/api/notify/rules", "", cookies, "")
+	defer list.Body.Close()
+	buf := new(bytes.Buffer)
+	buf.ReadFrom(list.Body)
+	if !bytes.Contains(buf.Bytes(), []byte("monitor.down")) || !bytes.Contains(buf.Bytes(), []byte(channel.ID)) {
+		t.Fatalf("rule list missing event/channel: %s", buf.String())
+	}
+}
+
+func TestNotifyRulesRouteMatchingEvents(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNotifyChannel(model.NotifyChannel{ID: "ch-monitor", Name: "Monitor", Kind: "webhook", Config: map[string]string{"url": "https://example.com/monitor"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNotifyChannel(model.NotifyChannel{ID: "ch-ssh", Name: "SSH", Kind: "webhook", Config: map[string]string{"url": "https://example.com/ssh"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNotifyRule(model.NotifyRule{ID: "rule-monitor", Name: "Monitor", EventTypes: []string{"monitor.down"}, ChannelIDs: []string{"ch-monitor"}, TitleTemplate: "[{{event_type}}] {{title}}", BodyTemplate: "Body: {{body}}", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNotifyRule(model.NotifyRule{ID: "rule-ssh", Name: "SSH", EventTypes: []string{"ssh.login"}, ChannelIDs: []string{"ch-ssh"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	deliveries := srv.planNotifyDeliveries("monitor.down", "Monitor down", "failed", st.EnabledNotifyChannels(), st.EnabledNotifyRules())
+	if len(deliveries) != 1 || len(deliveries[0].Channels) != 1 {
+		t.Fatalf("expected one routed monitor delivery, got %+v", deliveries)
+	}
+	if deliveries[0].Message.Title != "[monitor.down] Monitor down" || deliveries[0].Message.Body != "Body: failed" {
+		t.Fatalf("template not applied: %+v", deliveries[0].Message)
+	}
+}
+
+func TestNotifyRulesFallbackBroadcastWhenNoRules(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNotifyChannel(model.NotifyChannel{ID: "ch-a", Name: "A", Kind: "webhook", Config: map[string]string{"url": "https://example.com/a"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNotifyChannel(model.NotifyChannel{ID: "ch-b", Name: "B", Kind: "webhook", Config: map[string]string{"url": "https://example.com/b"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	deliveries := srv.planNotifyDeliveries("generic", "title", "body", st.EnabledNotifyChannels(), st.EnabledNotifyRules())
+	if len(deliveries) != 1 || len(deliveries[0].Channels) != 2 {
+		t.Fatalf("expected broadcast delivery to two channels, got %+v", deliveries)
+	}
+}
 
 func TestNotifyChannelCRUDHidesSecret(t *testing.T) {
 	handler, _ := newTestServer(t)
@@ -27,6 +111,38 @@ func TestNotifyChannelCRUDHidesSecret(t *testing.T) {
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("config_keys")) || !bytes.Contains(buf.Bytes(), []byte("chat_id")) {
 		t.Fatalf("expected config_keys with key names: %s", buf.String())
+	}
+}
+
+func TestNotifyChannelUpdateKeepsID(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/notify/channels",
+		`{"name":"web","kind":"webhook","config":{"url":"https://example.com/one"}}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create failed: %d", create.StatusCode)
+	}
+	var channel struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&channel); err != nil {
+		t.Fatal(err)
+	}
+	update := doJSON(t, handler, http.MethodPost, "/api/notify/channels",
+		`{"id":"`+channel.ID+`","name":"web-updated","kind":"webhook","config":{"url":"https://example.com/two"}}`, cookies, csrf)
+	defer update.Body.Close()
+	if update.StatusCode != http.StatusOK {
+		t.Fatalf("update failed: %d", update.StatusCode)
+	}
+	list := doJSON(t, handler, http.MethodGet, "/api/notify/channels", "", cookies, "")
+	defer list.Body.Close()
+	var channels []notifyChannelView
+	if err := json.NewDecoder(list.Body).Decode(&channels); err != nil {
+		t.Fatal(err)
+	}
+	if len(channels) != 1 || channels[0].ID != channel.ID || channels[0].Name != "web-updated" {
+		t.Fatalf("channel update created duplicate or lost id: %+v", channels)
 	}
 }
 

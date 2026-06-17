@@ -26,6 +26,10 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     ./cmd/lattice-server
 
 FROM node:22-bookworm AS dashboard
+ARG VERSION=dev
+ARG DASHBOARD_COMMIT=unknown
+ENV VITE_APP_VERSION=${VERSION} \
+    VITE_GIT_COMMIT=${DASHBOARD_COMMIT}
 
 WORKDIR /src/dashboard
 COPY --from=lattice-dashboard . .
@@ -36,6 +40,7 @@ RUN corepack enable \
 
 FROM alpine:3.22
 ARG DASHBOARD_COMMIT=unknown
+ARG DATE=unknown
 
 RUN apk add --no-cache ca-certificates su-exec tzdata \
     && addgroup -S lattice \
@@ -53,7 +58,9 @@ LABEL org.opencontainers.image.latticenet.dashboard-revision="${DASHBOARD_COMMIT
 ENV LATTICE_LISTEN=0.0.0.0:8088 \
     LATTICE_DATA=/var/lib/lattice/state.json \
     LATTICE_WEB_ROOT=/app/dashboard \
-    LATTICE_PLUGIN_DIR=/plugins
+    LATTICE_PLUGIN_DIR=/plugins \
+    LATTICE_DASHBOARD_COMMIT=${DASHBOARD_COMMIT} \
+    LATTICE_DASHBOARD_BUILT_AT=${DATE}
 
 EXPOSE 8088
 VOLUME ["/var/lib/lattice", "/plugins"]

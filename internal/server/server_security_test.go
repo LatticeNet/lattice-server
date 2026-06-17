@@ -64,6 +64,84 @@ func newTestServer(t *testing.T) (http.Handler, *store.Store) {
 	return srv.Handler(), st
 }
 
+func TestBootstrapAdminUsernameIsConfigurable(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminUsername: "root@example.com", AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+
+	body := bytes.NewBufferString(`{"username":"root@example.com","password":"` + testAdminPass + `"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	res := rec.Result()
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("custom admin login failed: %d", res.StatusCode)
+	}
+	if _, ok := st.UserByUsername("admin"); ok {
+		t.Fatal("default admin username should not be created when custom username is configured")
+	}
+}
+
+func TestBootstrapAdminUsernameIsOnlyUsedOnEmptyState(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Options{Store: st, AdminUsername: "first", AdminPassword: testAdminPass}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(Options{Store: st, AdminUsername: "second", AdminPassword: "another passphrase"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.UserByUsername("first"); !ok {
+		t.Fatal("first bootstrap user missing")
+	}
+	if _, ok := st.UserByUsername("second"); ok {
+		t.Fatal("second bootstrap username should not create another user after state exists")
+	}
+}
+
+func TestVersionEndpointExposesBuildInfo(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{
+		Store:         st,
+		AdminPassword: testAdminPass,
+		Build: BuildInfo{
+			ServerVersion:  "v1.2.3",
+			ServerCommit:   "abc123",
+			ServerDate:     "2026-06-17T00:00:00Z",
+			DashboardRef:   "dash123",
+			DashboardBuilt: "2026-06-17T00:01:00Z",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := doJSON(t, srv.Handler(), http.MethodGet, "/api/version", "", nil, "")
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("version endpoint failed: %d", res.StatusCode)
+	}
+	var out BuildInfo
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.ServerVersion != "v1.2.3" || out.ServerCommit != "abc123" || out.DashboardRef != "dash123" {
+		t.Fatalf("unexpected build info: %+v", out)
+	}
+}
+
 func createPAT(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf string, scopes []string, allowlist []string) string {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{

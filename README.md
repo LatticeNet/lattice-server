@@ -36,6 +36,7 @@ Responsibilities:
 
 ```sh
 LATTICE_ADMIN_PASSWORD='change-this-passphrase' \
+LATTICE_ADMIN_USERNAME='admin' \
 LATTICE_WEB_ROOT=../lattice-dashboard \
 go run ./cmd/lattice-server
 ```
@@ -95,7 +96,10 @@ ghcr.io/latticenet/lattice-server
 
 Image publication is tag-driven. Stable `v*` tags publish the matching version
 tag and `latest`; the moving `alpha` git tag publishes `alpha`. Source pushes to
-`main` run CI but do not publish a `main` image channel.
+`main` run CI but do not publish a `main` image channel. Build provenance/SBOM
+attestations are disabled for the image workflow so GHCR does not accumulate
+extra untagged attestation manifests; the `package cleanup` workflow prunes old
+untagged container package versions and keeps the most recent two by default.
 
 The container leaves `LATTICE_MASTER_KEY_FILE` unset by default so first boot can
 generate `/var/lib/lattice/master.key` automatically. Set it only when restoring
@@ -112,9 +116,12 @@ Use the compose file and deployment guide in the umbrella repository:
 
 ## Security Defaults
 
-- First-run password is random unless `LATTICE_ADMIN_PASSWORD` is set. After
-  state exists, that environment variable remains bootstrap-only; rotate the
+- First-run username defaults to `admin` unless `LATTICE_ADMIN_USERNAME` is set.
+  First-run password is random unless `LATTICE_ADMIN_PASSWORD` is set. After
+  state contains any user, both variables remain bootstrap-only; rotate the
   current operator password with authenticated `POST /api/auth/password`.
+- `GET /api/version` returns the server build version, server commit/date, and
+  the embedded dashboard ref exposed in the dashboard About page.
 - Password login sends username/password as JSON over HTTPS. Do not expose the
   dashboard over remote cleartext `http://`; use TLS, secure cookies, and HSTS in
   production.

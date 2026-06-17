@@ -35,6 +35,9 @@ type State struct {
 	Audit           []model.AuditEvent                  `json:"audit"`
 	KV              map[string]model.KVEntry            `json:"kv"`
 	Static          map[string]model.StaticObject       `json:"static"`
+	StorageBuckets  map[string]model.StorageBucket      `json:"storage_buckets"`
+	StorageBindings map[string]model.StorageBinding     `json:"storage_bindings"`
+	StorageTokens   map[string]model.StorageAccessToken `json:"storage_tokens"`
 	Workers         map[string]model.WorkerScript       `json:"workers"`
 	Plugins         map[string]model.PluginInstallation `json:"plugins"`
 	Approvals       map[string]model.Approval           `json:"approvals"`
@@ -44,6 +47,7 @@ type State struct {
 	MonResults      map[string][]model.MonitorResult    `json:"monitor_results"`
 	LogSources      map[string]model.LogSource          `json:"log_sources"`
 	NotifyChannels  map[string]model.NotifyChannel      `json:"notify_channels"`
+	NotifyRules     map[string]model.NotifyRule         `json:"notify_rules"`
 	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
 	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
 	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
@@ -134,6 +138,9 @@ func emptyState() State {
 		Tasks:           map[string]model.Task{},
 		KV:              map[string]model.KVEntry{},
 		Static:          map[string]model.StaticObject{},
+		StorageBuckets:  map[string]model.StorageBucket{},
+		StorageBindings: map[string]model.StorageBinding{},
+		StorageTokens:   map[string]model.StorageAccessToken{},
 		Workers:         map[string]model.WorkerScript{},
 		Plugins:         map[string]model.PluginInstallation{},
 		Approvals:       map[string]model.Approval{},
@@ -143,6 +150,7 @@ func emptyState() State {
 		MonResults:      map[string][]model.MonitorResult{},
 		LogSources:      map[string]model.LogSource{},
 		NotifyChannels:  map[string]model.NotifyChannel{},
+		NotifyRules:     map[string]model.NotifyRule{},
 		Tunnels:         map[string]model.TunnelProfile{},
 		MachineProfiles: map[string]model.MachineProfile{},
 		NFTInputs:       map[string]model.NFTInputs{},
@@ -180,6 +188,15 @@ func (st *State) ensureMaps() {
 	if st.Static == nil {
 		st.Static = map[string]model.StaticObject{}
 	}
+	if st.StorageBuckets == nil {
+		st.StorageBuckets = map[string]model.StorageBucket{}
+	}
+	if st.StorageBindings == nil {
+		st.StorageBindings = map[string]model.StorageBinding{}
+	}
+	if st.StorageTokens == nil {
+		st.StorageTokens = map[string]model.StorageAccessToken{}
+	}
 	if st.Workers == nil {
 		st.Workers = map[string]model.WorkerScript{}
 	}
@@ -206,6 +223,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NotifyChannels == nil {
 		st.NotifyChannels = map[string]model.NotifyChannel{}
+	}
+	if st.NotifyRules == nil {
+		st.NotifyRules = map[string]model.NotifyRule{}
 	}
 	if st.Tunnels == nil {
 		st.Tunnels = map[string]model.TunnelProfile{}
@@ -335,6 +355,12 @@ func (s *Store) UpsertUser(u model.User) error {
 	defer s.mu.Unlock()
 	s.state.Users[u.ID] = u
 	return s.Save()
+}
+
+func (s *Store) UserCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.state.Users)
 }
 
 // UserByUsername looks up a user by username, case-insensitively. Usernames are
@@ -650,6 +676,13 @@ func (s *Store) KV(bucket string) []model.KVEntry {
 	return out
 }
 
+func (s *Store) KVEntry(bucket, key string) (model.KVEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.state.KV[bucket+"/"+key]
+	return e, ok
+}
+
 func (s *Store) PutStatic(obj model.StaticObject) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -670,6 +703,169 @@ func (s *Store) Static(bucket string) []model.StaticObject {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
+}
+
+func (s *Store) StaticObject(bucket, objectPath string) (model.StaticObject, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, ok := s.state.Static[bucket+"/"+objectPath]
+	return o, ok
+}
+
+func storageKey(kind, name string) string {
+	return kind + "/" + name
+}
+
+func (s *Store) UpsertStorageBucket(b model.StorageBucket) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if b.CreatedAt.IsZero() {
+		b.CreatedAt = now
+	}
+	b.UpdatedAt = now
+	s.state.StorageBuckets[storageKey(b.Kind, b.Name)] = b
+	return s.Save()
+}
+
+func (s *Store) StorageBucket(kind, name string) (model.StorageBucket, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.state.StorageBuckets[storageKey(kind, name)]
+	return b, ok
+}
+
+func (s *Store) StorageBuckets(kind string) []model.StorageBucket {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.StorageBucket{}
+	for _, b := range s.state.StorageBuckets {
+		if kind == "" || b.Kind == kind {
+			out = append(out, b)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Kind == out[j].Kind {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Kind < out[j].Kind
+	})
+	return out
+}
+
+func (s *Store) UpsertStorageBinding(b model.StorageBinding) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if b.CreatedAt.IsZero() {
+		b.CreatedAt = now
+	}
+	b.UpdatedAt = now
+	s.state.StorageBindings[b.ID] = b
+	return s.Save()
+}
+
+func (s *Store) StorageBindings(kind string) []model.StorageBinding {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.StorageBinding{}
+	for _, b := range s.state.StorageBindings {
+		if kind == "" || b.Kind == kind {
+			out = append(out, b)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Hostname == out[j].Hostname {
+			return out[i].PathPrefix < out[j].PathPrefix
+		}
+		return out[i].Hostname < out[j].Hostname
+	})
+	return out
+}
+
+func (s *Store) StorageBindingForHost(kind, hostname string) (model.StorageBinding, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, b := range s.state.StorageBindings {
+		if b.Enabled && b.Kind == kind && strings.EqualFold(b.Hostname, hostname) {
+			return b, true
+		}
+	}
+	return model.StorageBinding{}, false
+}
+
+func (s *Store) DeleteStorageBinding(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.StorageBindings[id]; !ok {
+		return nil
+	}
+	delete(s.state.StorageBindings, id)
+	return s.Save()
+}
+
+func (s *Store) UpsertStorageAccessToken(t model.StorageAccessToken) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = now
+	}
+	t.UpdatedAt = now
+	s.state.StorageTokens[t.ID] = t
+	return s.Save()
+}
+
+func (s *Store) StorageAccessToken(id string) (model.StorageAccessToken, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.StorageTokens[id]
+	return t, ok
+}
+
+func (s *Store) StorageAccessTokens(kind string) []model.StorageAccessToken {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.StorageAccessToken{}
+	for _, t := range s.state.StorageTokens {
+		if kind == "" || t.Kind == kind {
+			t.TokenHash = ""
+			out = append(out, t)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out
+}
+
+func (s *Store) RevokeStorageAccessToken(id string) (model.StorageAccessToken, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.StorageTokens[id]
+	if !ok {
+		return model.StorageAccessToken{}, false, nil
+	}
+	if t.RevokedAt.IsZero() {
+		t.RevokedAt = time.Now().UTC()
+		t.UpdatedAt = t.RevokedAt
+		s.state.StorageTokens[id] = t
+		if err := s.Save(); err != nil {
+			return model.StorageAccessToken{}, true, err
+		}
+	}
+	t.TokenHash = ""
+	return t, true, nil
+}
+
+func (s *Store) TouchStorageAccessToken(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.StorageTokens[id]
+	if !ok {
+		return nil
+	}
+	t.LastUsedAt = time.Now().UTC()
+	s.state.StorageTokens[id] = t
+	return s.Save()
 }
 
 func (s *Store) UpsertWorker(w model.WorkerScript) error {
@@ -1807,6 +2003,55 @@ func (s *Store) EnabledNotifyChannels() []model.NotifyChannel {
 	return out
 }
 
+// UpsertNotifyRule creates or updates a notification routing rule.
+func (s *Store) UpsertNotifyRule(rule model.NotifyRule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rule.UpdatedAt = time.Now().UTC()
+	if rule.CreatedAt.IsZero() {
+		rule.CreatedAt = rule.UpdatedAt
+	}
+	s.state.NotifyRules[rule.ID] = rule
+	return s.Save()
+}
+
+// NotifyRules returns all notification rules sorted by creation time.
+func (s *Store) NotifyRules() []model.NotifyRule {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.NotifyRule, 0, len(s.state.NotifyRules))
+	for _, rule := range s.state.NotifyRules {
+		out = append(out, rule)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// EnabledNotifyRules returns enabled notification rules.
+func (s *Store) EnabledNotifyRules() []model.NotifyRule {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []model.NotifyRule{}
+	for _, rule := range s.state.NotifyRules {
+		if rule.Enabled {
+			out = append(out, rule)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+// DeleteNotifyRule removes a notification routing rule.
+func (s *Store) DeleteNotifyRule(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.NotifyRules[id]; !ok {
+		return nil
+	}
+	delete(s.state.NotifyRules, id)
+	return s.Save()
+}
+
 // DeleteNotifyChannel removes a channel.
 func (s *Store) DeleteNotifyChannel(id string) error {
 	s.mu.Lock()
@@ -1815,6 +2060,22 @@ func (s *Store) DeleteNotifyChannel(id string) error {
 		return nil
 	}
 	delete(s.state.NotifyChannels, id)
+	for ruleID, rule := range s.state.NotifyRules {
+		next := make([]string, 0, len(rule.ChannelIDs))
+		changed := false
+		for _, channelID := range rule.ChannelIDs {
+			if channelID == id {
+				changed = true
+				continue
+			}
+			next = append(next, channelID)
+		}
+		if changed {
+			rule.ChannelIDs = next
+			rule.UpdatedAt = time.Now().UTC()
+			s.state.NotifyRules[ruleID] = rule
+		}
+	}
 	return s.Save()
 }
 

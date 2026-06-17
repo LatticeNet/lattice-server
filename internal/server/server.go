@@ -51,7 +51,9 @@ type Options struct {
 	// tail nothing. Injected by main (opened beside the state file with the same
 	// cipher), mirroring Store.
 	LogStore      *logstore.Store
+	AdminUsername string
 	AdminPassword string
+	Build         BuildInfo
 	SecureCookies bool
 	// TrustProxy enables reading the client address from proxy headers
 	// (CF-Connecting-IP, then X-Forwarded-For). Only enable when the server
@@ -79,6 +81,14 @@ type Options struct {
 	RenewalReminderInterval time.Duration
 	DisableRenewalScheduler bool
 	Logger                  *log.Logger
+}
+
+type BuildInfo struct {
+	ServerVersion  string `json:"server_version"`
+	ServerCommit   string `json:"server_commit"`
+	ServerDate     string `json:"server_date"`
+	DashboardRef   string `json:"dashboard_ref,omitempty"`
+	DashboardBuilt string `json:"dashboard_built,omitempty"`
 }
 
 type Server struct {
@@ -129,6 +139,10 @@ type Server struct {
 	// coreDNSBinary is copied into selfdns approval plans when configured. The
 	// apply path parses the reviewed plan, not this mutable server field.
 	coreDNSBinary selfdns.CoreDNSBinarySource
+	// build is immutable process metadata exposed by /api/version and dashboard
+	// About. It contains no secrets and is intentionally safe for unauthenticated
+	// health/version probes.
+	build BuildInfo
 	// reminderInterval is the coarse scheduler tick for machine renewal checks.
 	reminderInterval time.Duration
 	// proxyDrift tracks, per proxy node, whether the applied proxy config still
@@ -209,6 +223,7 @@ func New(opts Options) (*Server, error) {
 		oidc:             oidc.NewManager(),
 		publicURL:        strings.TrimRight(opts.PublicURL, "/"),
 		coreDNSBinary:    coreDNSBinary,
+		build:            normalizeBuildInfo(opts.Build),
 		pluginTrust:      opts.PluginTrust,
 		reminderInterval: opts.RenewalReminderInterval,
 		now:              func() time.Time { return time.Now().UTC() },
@@ -220,7 +235,7 @@ func New(opts Options) (*Server, error) {
 	}
 	s.emitNotify = s.notifyEvent
 	s.pluginRuntime = plugin.NewRuntimeManager(s.pluginHostServices())
-	if err := s.ensureAdmin(opts.AdminPassword); err != nil {
+	if err := s.ensureAdmin(opts.AdminUsername, opts.AdminPassword); err != nil {
 		return nil, err
 	}
 	s.loadPlugins(opts.PluginDir, opts.PluginTrust)
@@ -559,11 +574,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/plugins/verify", s.withAuth("plugin:verify", s.handlePluginVerify))
 	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
+	mux.HandleFunc("/api/storage/buckets", s.withAuth("", s.handleStorageBuckets))
+	mux.HandleFunc("/api/storage/bindings", s.withAuth("", s.handleStorageBindings))
+	mux.HandleFunc("/api/storage/bindings/delete", s.withAuth("", s.handleDeleteStorageBinding))
+	mux.HandleFunc("/api/storage/tokens", s.withAuth("", s.handleStorageTokens))
+	mux.HandleFunc("/api/storage/tokens/revoke", s.withAuth("", s.handleRevokeStorageToken))
 	mux.HandleFunc("/api/workers", s.withAuth("worker:deploy", s.handleWorkers))
 	mux.HandleFunc("/api/workers/run", s.withAuth("worker:deploy", s.handleWorkerRun))
 	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
 	mux.HandleFunc("/api/notify/channels", s.withAuth("notify:send", s.handleNotifyChannels))
 	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:send", s.handleDeleteNotifyChannel))
+	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:send", s.handleNotifyRules))
+	mux.HandleFunc("/api/notify/rules/delete", s.withAuth("notify:send", s.handleDeleteNotifyRule))
 	mux.HandleFunc("/api/ddns", s.withAuth("ddns:admin", s.handleDDNS))
 	mux.HandleFunc("/api/ddns/delete", s.withAuth("ddns:admin", s.handleDeleteDDNS))
 	mux.HandleFunc("/api/ddns/run", s.withAuth("ddns:admin", s.handleRunDDNS))
@@ -624,13 +646,18 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.Handle("/", s.staticHandler())
 	return s.withRequestID(s.securityHeaders(mux))
 }
 
-func (s *Server) ensureAdmin(password string) error {
-	if _, ok := s.store.UserByUsername("admin"); ok {
+func (s *Server) ensureAdmin(username, password string) error {
+	if s.store.UserCount() > 0 {
 		return nil
+	}
+	username, err := normalizeBootstrapUsername(username)
+	if err != nil {
+		return err
 	}
 	if password == "" {
 		generated, err := auth.NewRandomToken(24)
@@ -638,6 +665,7 @@ func (s *Server) ensureAdmin(password string) error {
 			return err
 		}
 		password = generated
+		s.logger.Printf("bootstrap admin username: %s", username)
 		s.logger.Printf("bootstrap admin password: %s", generated)
 	}
 	hash, err := auth.HashSecret(password)
@@ -646,22 +674,73 @@ func (s *Server) ensureAdmin(password string) error {
 	}
 	return s.store.UpsertUser(model.User{
 		ID:           "user_admin",
-		Username:     "admin",
+		Username:     username,
 		PasswordHash: hash,
 		Scopes:       []string{"*"},
 		CreatedAt:    time.Now().UTC(),
 	})
 }
 
-func (s *Server) staticHandler() http.Handler {
-	if s.webFS == nil {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			http.NotFound(w, r)
-		})
+func normalizeBootstrapUsername(username string) (string, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		username = "admin"
 	}
-	fileServer := http.FileServer(http.FS(s.webFS))
+	if len(username) > 128 {
+		return "", errors.New("admin username must be at most 128 characters")
+	}
+	for _, r := range username {
+		if r < 0x20 || r == 0x7f {
+			return "", errors.New("admin username must not contain control characters")
+		}
+	}
+	return username, nil
+}
+
+func normalizeBuildInfo(info BuildInfo) BuildInfo {
+	if info.ServerVersion == "" {
+		info.ServerVersion = "dev"
+	}
+	if info.ServerCommit == "" {
+		info.ServerCommit = "unknown"
+	}
+	if info.ServerDate == "" {
+		info.ServerDate = "unknown"
+	}
+	if info.DashboardRef == "" {
+		info.DashboardRef = "unknown"
+	}
+	return info
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, s.build)
+}
+
+func (s *Server) staticHandler() http.Handler {
+	var fileServer http.Handler
+	if s.webFS != nil {
+		fileServer = http.FileServer(http.FS(s.webFS))
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
+		host := requestHost(r.Host)
+		if binding, ok := s.store.StorageBindingForHost(model.StorageKindKV, host); ok {
+			s.serveKVBinding(w, r, binding)
+			return
+		}
+		if binding, ok := s.store.StorageBindingForHost(model.StorageKindStatic, host); ok {
+			s.serveStaticBinding(w, r, binding)
+			return
+		}
+		if s.webFS == nil {
 			http.NotFound(w, r)
 			return
 		}
@@ -1403,11 +1482,14 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principa
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 	totpEnabled := false
+	username := ""
 	if u, ok := s.store.User(p.ActorID); ok {
 		totpEnabled = u.TOTPEnabled
+		username = u.Username
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"actor_id":     p.ActorID,
+		"username":     username,
 		"token_id":     p.TokenID,
 		"scopes":       p.Scopes,
 		"csrf_token":   p.CSRFToken,
@@ -2334,6 +2416,7 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
 		var req struct {
+			ID      string            `json:"id"`
 			Name    string            `json:"name"`
 			Kind    string            `json:"kind"`
 			Config  map[string]string `json:"config"`
@@ -2351,18 +2434,35 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		channelID := strings.TrimSpace(req.ID)
+		if channelID == "" {
+			channelID = id.New("notify")
+		} else if err := validateNotifyID(channelID); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("id: %w", err))
+			return
+		}
 		channel := model.NotifyChannel{
-			ID:      id.New("notify"),
+			ID:      channelID,
 			Name:    req.Name,
 			Kind:    req.Kind,
 			Config:  req.Config,
 			Enabled: req.Enabled == nil || *req.Enabled,
 		}
+		for _, existing := range s.store.NotifyChannels() {
+			if existing.ID == channel.ID {
+				channel.CreatedAt = existing.CreatedAt
+				break
+			}
+		}
 		if err := s.store.UpsertNotifyChannel(channel); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.channel.create", Scope: "notify:send", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
+		action := "notify.channel.create"
+		if req.ID != "" {
+			action = "notify.channel.update"
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:send", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
 		writeJSON(w, http.StatusOK, toNotifyChannelView(channel))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -2388,10 +2488,146 @@ func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, map[string]any{"rules": s.store.NotifyRules()})
+	case http.MethodPost:
+		var req struct {
+			ID            string   `json:"id"`
+			Name          string   `json:"name"`
+			EventTypes    []string `json:"event_types"`
+			ChannelIDs    []string `json:"channel_ids"`
+			TitleTemplate string   `json:"title_template"`
+			BodyTemplate  string   `json:"body_template"`
+			Enabled       *bool    `json:"enabled"`
+		}
+		if !decodeClientJSON(w, r, &req) {
+			return
+		}
+		rule, err := normalizeNotifyRule(req.ID, req.Name, req.EventTypes, req.ChannelIDs, req.TitleTemplate, req.BodyTemplate, req.Enabled, s.store.NotifyChannels())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if existingRules := s.store.NotifyRules(); rule.ID != "" {
+			for _, existing := range existingRules {
+				if existing.ID == rule.ID {
+					rule.CreatedAt = existing.CreatedAt
+					break
+				}
+			}
+		}
+		if err := s.store.UpsertNotifyRule(rule); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:send", Metadata: map[string]string{"rule_id": rule.ID}})
+		writeJSON(w, http.StatusOK, rule)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func (s *Server) handleDeleteNotifyRule(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.ID) == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+	if err := s.store.DeleteNotifyRule(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.delete", Scope: "notify:send", Metadata: map[string]string{"rule_id": req.ID}})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // notifyEvent fans a message out to every enabled notification channel,
 // asynchronously so it never blocks the triggering request.
 func (s *Server) notifyEvent(title, body string) {
 	channels := s.store.EnabledNotifyChannels()
+	deliveries := s.planNotifyDeliveries(classifyNotifyEvent(title), title, body, channels, s.store.EnabledNotifyRules())
+	if len(deliveries) == 0 {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for _, delivery := range deliveries {
+			if len(delivery.Channels) == 0 {
+				continue
+			}
+			for _, res := range notify.NewDispatcher(delivery.Channels...).Send(ctx, delivery.Message) {
+				if res.Err != nil {
+					s.logger.Printf("notify: %s delivery failed: %v", res.Kind, res.Err)
+				}
+			}
+		}
+	}()
+}
+
+type notifyDelivery struct {
+	Channels []notify.Channel
+	Message  notify.Message
+}
+
+func (s *Server) planNotifyDeliveries(eventType, title, body string, channels []model.NotifyChannel, rules []model.NotifyRule) []notifyDelivery {
+	if len(channels) == 0 {
+		return nil
+	}
+	if len(rules) == 0 {
+		built := s.buildNotifyChannels(channels)
+		if len(built) == 0 {
+			return nil
+		}
+		return []notifyDelivery{{Channels: built, Message: notify.Message{Title: title, Body: body}}}
+	}
+	channelsByID := make(map[string]model.NotifyChannel, len(channels))
+	for _, channel := range channels {
+		channelsByID[channel.ID] = channel
+	}
+	deliveries := []notifyDelivery{}
+	for _, rule := range rules {
+		if !notifyRuleMatches(rule, eventType) {
+			continue
+		}
+		selected := make([]model.NotifyChannel, 0, len(rule.ChannelIDs))
+		seen := map[string]bool{}
+		for _, channelID := range rule.ChannelIDs {
+			if seen[channelID] {
+				continue
+			}
+			seen[channelID] = true
+			channel, ok := channelsByID[channelID]
+			if !ok {
+				s.logger.Printf("notify: rule %s references missing or disabled channel %s", rule.ID, channelID)
+				continue
+			}
+			selected = append(selected, channel)
+		}
+		built := s.buildNotifyChannels(selected)
+		if len(built) == 0 {
+			continue
+		}
+		vars := map[string]string{"event_type": eventType, "title": title, "body": body}
+		outTitle := renderNotifyTemplate(rule.TitleTemplate, title, vars)
+		outBody := renderNotifyTemplate(rule.BodyTemplate, body, vars)
+		deliveries = append(deliveries, notifyDelivery{Channels: built, Message: notify.Message{Title: outTitle, Body: outBody}})
+	}
+	return deliveries
+}
+
+func (s *Server) buildNotifyChannels(channels []model.NotifyChannel) []notify.Channel {
 	built := make([]notify.Channel, 0, len(channels))
 	for _, c := range channels {
 		ch, err := buildChannel(c.Kind, c.Config)
@@ -2401,18 +2637,151 @@ func (s *Server) notifyEvent(title, body string) {
 		}
 		built = append(built, ch)
 	}
-	if len(built) == 0 {
-		return
+	return built
+}
+
+func notifyRuleMatches(rule model.NotifyRule, eventType string) bool {
+	if len(rule.EventTypes) == 0 {
+		return true
 	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		for _, res := range notify.NewDispatcher(built...).Send(ctx, notify.Message{Title: title, Body: body}) {
-			if res.Err != nil {
-				s.logger.Printf("notify: %s delivery failed: %v", res.Kind, res.Err)
-			}
+	for _, candidate := range rule.EventTypes {
+		if candidate == "*" || candidate == eventType {
+			return true
 		}
-	}()
+	}
+	return false
+}
+
+func renderNotifyTemplate(tmpl, fallback string, vars map[string]string) string {
+	tmpl = strings.TrimSpace(tmpl)
+	if tmpl == "" {
+		return fallback
+	}
+	out := tmpl
+	for key, value := range vars {
+		out = strings.ReplaceAll(out, "{{"+key+"}}", value)
+	}
+	return out
+}
+
+func classifyNotifyEvent(title string) string {
+	switch {
+	case strings.Contains(title, "Monitor recovered"):
+		return "monitor.recovered"
+	case strings.Contains(title, "Monitor down"):
+		return "monitor.down"
+	case strings.Contains(title, "SSH login"):
+		return "ssh.login"
+	case strings.HasPrefix(title, "Lattice proxy quota"):
+		return "proxy.quota"
+	case strings.HasPrefix(title, "Lattice proxy expiry"):
+		return "proxy.expiry"
+	default:
+		return "generic"
+	}
+}
+
+func normalizeNotifyRule(idValue, name string, eventTypes, channelIDs []string, titleTemplate, bodyTemplate string, enabled *bool, channels []model.NotifyChannel) (model.NotifyRule, error) {
+	idValue = strings.TrimSpace(idValue)
+	if idValue == "" {
+		idValue = id.New("notify_rule")
+	} else if err := validateNotifyID(idValue); err != nil {
+		return model.NotifyRule{}, fmt.Errorf("id: %w", err)
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return model.NotifyRule{}, errors.New("name is required")
+	}
+	cleanEvents, err := normalizeNotifyEvents(eventTypes)
+	if err != nil {
+		return model.NotifyRule{}, err
+	}
+	existingChannels := map[string]bool{}
+	for _, channel := range channels {
+		existingChannels[channel.ID] = true
+	}
+	cleanChannels := []string{}
+	seenChannels := map[string]bool{}
+	for _, channelID := range channelIDs {
+		channelID = strings.TrimSpace(channelID)
+		if channelID == "" {
+			continue
+		}
+		if !existingChannels[channelID] {
+			return model.NotifyRule{}, fmt.Errorf("channel %q does not exist", channelID)
+		}
+		if !seenChannels[channelID] {
+			seenChannels[channelID] = true
+			cleanChannels = append(cleanChannels, channelID)
+		}
+	}
+	if len(cleanChannels) == 0 {
+		return model.NotifyRule{}, errors.New("at least one channel is required")
+	}
+	rule := model.NotifyRule{
+		ID:            idValue,
+		Name:          name,
+		EventTypes:    cleanEvents,
+		ChannelIDs:    cleanChannels,
+		TitleTemplate: strings.TrimSpace(titleTemplate),
+		BodyTemplate:  strings.TrimSpace(bodyTemplate),
+		Enabled:       enabled == nil || *enabled,
+	}
+	return rule, nil
+}
+
+func normalizeNotifyEvents(eventTypes []string) ([]string, error) {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, eventType := range eventTypes {
+		eventType = strings.TrimSpace(strings.ToLower(eventType))
+		if eventType == "" {
+			continue
+		}
+		if err := validateNotifyEventType(eventType); err != nil {
+			return nil, err
+		}
+		if eventType == "*" {
+			return []string{"*"}, nil
+		}
+		if !seen[eventType] {
+			seen[eventType] = true
+			out = append(out, eventType)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"*"}, nil
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func validateNotifyEventType(eventType string) error {
+	if eventType == "*" {
+		return nil
+	}
+	if len(eventType) > 64 {
+		return errors.New("event type is too long")
+	}
+	for _, r := range eventType {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == ':' || r == '-' {
+			continue
+		}
+		return fmt.Errorf("invalid event type %q", eventType)
+	}
+	return nil
+}
+
+func validateNotifyID(value string) error {
+	if value == "" || len(value) > 128 {
+		return errors.New("invalid id")
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return errors.New("id contains control characters")
+		}
+	}
+	return nil
 }
 
 // notifyMonitorTransition emits an alert when a monitor's success state flips

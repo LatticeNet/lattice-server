@@ -1,0 +1,65 @@
+name: package cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "Most recent untagged versions to keep"
+        required: true
+        default: "2"
+      dry_run:
+        description: "List deletions without deleting"
+        required: true
+        default: "true"
+  schedule:
+    - cron: "17 4 * * 0"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  clean-untagged:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ORG: LatticeNet
+      PACKAGE_NAME: lattice-server
+      KEEP_UNTAGGED: ${{ github.event.inputs.keep || '2' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+    steps:
+      - name: delete old untagged container versions
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$KEEP_UNTAGGED" =~ ^[0-9]+$ ]]; then
+            echo "keep must be a non-negative integer" >&2
+            exit 2
+          fi
+
+          mapfile -t rows < <(
+            gh api --paginate "/orgs/${ORG}/packages/container/${PACKAGE_NAME}/versions?per_page=100" \
+              --jq '.[] | select(((.metadata.container.tags // []) | length) == 0) | [.id, .name, .created_at] | @tsv'
+          )
+
+          total=${#rows[@]}
+          echo "found ${total} untagged package versions"
+          if (( total <= KEEP_UNTAGGED )); then
+            echo "nothing to delete; keeping ${KEEP_UNTAGGED}"
+            exit 0
+          fi
+
+          for ((i = KEEP_UNTAGGED; i < total; i++)); do
+            row="${rows[$i]}"
+            id="$(cut -f1 <<< "$row")"
+            name="$(cut -f2 <<< "$row")"
+            created="$(cut -f3 <<< "$row")"
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "dry-run delete id=${id} name=${name} created_at=${created}"
+            else
+              echo "delete id=${id} name=${name} created_at=${created}"
+              gh api \
+                --method DELETE \
+                "/orgs/${ORG}/packages/container/${PACKAGE_NAME}/versions/${id}"
+            fi
+          done

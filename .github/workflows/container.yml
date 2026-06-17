@@ -73,6 +73,8 @@ jobs:
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
           build-args: |
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}

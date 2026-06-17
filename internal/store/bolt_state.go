@@ -31,6 +31,9 @@ var (
 	boltBucketAudit           = []byte("audit")
 	boltBucketKV              = []byte("kv")
 	boltBucketStatic          = []byte("static")
+	boltBucketStorageBuckets  = []byte("storage_buckets")
+	boltBucketStorageBindings = []byte("storage_bindings")
+	boltBucketStorageTokens   = []byte("storage_tokens")
 	boltBucketWorkers         = []byte("workers")
 	boltBucketPlugins         = []byte("plugins")
 	boltBucketApprovals       = []byte("approvals")
@@ -40,6 +43,7 @@ var (
 	boltBucketMonResults      = []byte("monitor_results")
 	boltBucketLogSources      = []byte("log_sources")
 	boltBucketNotifyChannels  = []byte("notify_channels")
+	boltBucketNotifyRules     = []byte("notify_rules")
 	boltBucketTunnels         = []byte("tunnels")
 	boltBucketMachineProfiles = []byte("machine_profiles")
 	boltBucketNFTInputs       = []byte("nft_inputs")
@@ -66,6 +70,9 @@ var boltStateBuckets = [][]byte{
 	boltBucketAudit,
 	boltBucketKV,
 	boltBucketStatic,
+	boltBucketStorageBuckets,
+	boltBucketStorageBindings,
+	boltBucketStorageTokens,
 	boltBucketWorkers,
 	boltBucketPlugins,
 	boltBucketApprovals,
@@ -75,6 +82,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketMonResults,
 	boltBucketLogSources,
 	boltBucketNotifyChannels,
+	boltBucketNotifyRules,
 	boltBucketTunnels,
 	boltBucketMachineProfiles,
 	boltBucketNFTInputs,
@@ -198,6 +206,15 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketStatic, persist.Static); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketStorageBuckets, persist.StorageBuckets); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketStorageBindings, persist.StorageBindings); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketStorageTokens, persist.StorageTokens); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketWorkers, persist.Workers); err != nil {
 			return err
 		}
@@ -223,6 +240,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 			return err
 		}
 		if err := putMap(tx, boltBucketNotifyChannels, persist.NotifyChannels); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketNotifyRules, persist.NotifyRules); err != nil {
 			return err
 		}
 		if err := putMap(tx, boltBucketTunnels, persist.Tunnels); err != nil {
@@ -322,6 +342,15 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 		if err := readMap(tx, boltBucketStatic, st.Static); err != nil {
 			return err
 		}
+		if err := readMap(tx, boltBucketStorageBuckets, st.StorageBuckets); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketStorageBindings, st.StorageBindings); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketStorageTokens, st.StorageTokens); err != nil {
+			return err
+		}
 		if err := readMap(tx, boltBucketWorkers, st.Workers); err != nil {
 			return err
 		}
@@ -347,6 +376,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketNotifyChannels, st.NotifyChannels); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketNotifyRules, st.NotifyRules); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketTunnels, st.Tunnels); err != nil {
@@ -2223,12 +2255,101 @@ func (bs *BoltStateStore) EnabledNotifyChannels() ([]model.NotifyChannel, error)
 	return channels, err
 }
 
+func (bs *BoltStateStore) UpsertNotifyRule(rule model.NotifyRule) error {
+	rule.UpdatedAt = time.Now().UTC()
+	if rule.CreatedAt.IsZero() {
+		rule.CreatedAt = rule.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketNotifyRules, rule.ID, rule)
+	})
+}
+
+func (bs *BoltStateStore) NotifyRules() ([]model.NotifyRule, error) {
+	rules := []model.NotifyRule{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		rules, err = listMapValues[model.NotifyRule](tx, boltBucketNotifyRules)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(rules, func(i, j int) bool { return rules[i].CreatedAt.Before(rules[j].CreatedAt) })
+	return rules, nil
+}
+
+func (bs *BoltStateStore) EnabledNotifyRules() ([]model.NotifyRule, error) {
+	rules := []model.NotifyRule{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		all, err := listMapValues[model.NotifyRule](tx, boltBucketNotifyRules)
+		if err != nil {
+			return err
+		}
+		for _, rule := range all {
+			if rule.Enabled {
+				rules = append(rules, rule)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(rules, func(i, j int) bool { return rules[i].CreatedAt.Before(rules[j].CreatedAt) })
+	return rules, nil
+}
+
+func (bs *BoltStateStore) DeleteNotifyRule(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketNotifyRules, id)
+	})
+}
+
 func (bs *BoltStateStore) DeleteNotifyChannel(id string) error {
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
 			return err
 		}
-		return deleteRecord(tx, boltBucketNotifyChannels, id)
+		if err := deleteRecord(tx, boltBucketNotifyChannels, id); err != nil {
+			return err
+		}
+		rules, err := listMapValues[model.NotifyRule](tx, boltBucketNotifyRules)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		for _, rule := range rules {
+			next := make([]string, 0, len(rule.ChannelIDs))
+			changed := false
+			for _, channelID := range rule.ChannelIDs {
+				if channelID == id {
+					changed = true
+					continue
+				}
+				next = append(next, channelID)
+			}
+			if changed {
+				rule.ChannelIDs = next
+				rule.UpdatedAt = now
+				if err := putRecord(tx, boltBucketNotifyRules, rule.ID, rule); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
 }
 

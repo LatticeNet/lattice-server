@@ -2,13 +2,15 @@ name: container
 
 # Image builds are TAG-DRIVEN only — nothing is built or published on ordinary
 # pushes/PRs. Triggers:
-#   - v*        → release: publishes {{version}}, {{major}}.{{minor}}, and `latest`
+#   - latest    → rolling latest: publishes `latest`
 #   - alpha     → rolling alpha: publishes `alpha`
 #   - alpha-*   → pinned alpha (e.g. alpha-0.2.4): publishes that exact tag name
+#   - v*        → immutable release: publishes {{version}} and {{major}}.{{minor}}
 #   - manual    → workflow_dispatch builds for validation but does NOT push
 on:
   push:
     tags:
+      - "latest"
       - "v*"
       - "alpha"
       - "alpha-*"
@@ -58,7 +60,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/tags/latest' }}
             type=raw,value=alpha,enable=${{ github.ref == 'refs/tags/alpha' }}
             type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/alpha-') }}
       - name: build and optionally push

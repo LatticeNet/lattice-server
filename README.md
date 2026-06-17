@@ -94,12 +94,13 @@ Published image:
 ghcr.io/latticenet/lattice-server
 ```
 
-Image publication is tag-driven. Stable `v*` tags publish the matching version
-tag and `latest`; the moving `alpha` git tag publishes `alpha`. Source pushes to
-`main` run CI but do not publish a `main` image channel. Build provenance/SBOM
-attestations are disabled for the image workflow so GHCR does not accumulate
-extra untagged attestation manifests; the `package cleanup` workflow prunes old
-untagged container package versions and keeps the most recent two by default.
+Image publication is tag-driven. The moving `latest` git tag publishes
+`:latest`, the moving `alpha` git tag publishes `:alpha`, and stable `v*` tags
+publish immutable version tags. Source pushes to `main` run CI but do not
+publish a `main` image channel. Build provenance/SBOM attestations are disabled
+for the image workflow, and the `package cleanup` workflow prunes old untagged
+container package versions while keeping the most recent two child manifests by
+default.
 
 The container leaves `LATTICE_MASTER_KEY_FILE` unset by default so first boot can
 generate `/var/lib/lattice/master.key` automatically. Set it only when restoring

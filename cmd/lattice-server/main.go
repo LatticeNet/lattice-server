@@ -63,7 +63,7 @@ func main() {
 	flag.StringVar(&coreDNSVersion, "coredns-binary-version", env("LATTICE_COREDNS_BINARY_VERSION", ""), "pinned CoreDNS binary version for self-host DNS apply (requires -coredns-binary-url and -coredns-binary-sha256)")
 	flag.StringVar(&coreDNSURL, "coredns-binary-url", env("LATTICE_COREDNS_BINARY_URL", ""), "HTTPS URL to a direct CoreDNS executable binary for self-host DNS apply")
 	flag.StringVar(&coreDNSSHA256, "coredns-binary-sha256", env("LATTICE_COREDNS_BINARY_SHA256", ""), "SHA-256 hex digest of the CoreDNS executable binary")
-	flag.StringVar(&geoIPLookupURL, "geoip-lookup-url", env("LATTICE_GEOIP_LOOKUP_URL", ""), "HTTPS GeoIP lookup URL template containing {ip}; empty disables automatic node geolocation")
+	flag.StringVar(&geoIPLookupURL, "geoip-lookup-url", env("LATTICE_GEOIP_LOOKUP_URL", geoip.DefaultLookupURL), "HTTPS GeoIP lookup URL template containing {ip}; set off/none/disabled to disable automatic node geolocation")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-server version and exit")
 	flag.Parse()
 	if printVersion {
@@ -121,7 +121,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if geoResolver != nil {
-		log.Printf("geoip lookup: enabled via configured HTTPS template")
+		log.Printf("geoip lookup: enabled")
+	} else {
+		log.Printf("geoip lookup: disabled")
 	}
 	app, err := server.New(server.Options{
 		Store:         st,

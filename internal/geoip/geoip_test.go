@@ -43,6 +43,43 @@ func TestNormalizeParsesIPAPIShape(t *testing.T) {
 	}
 }
 
+func TestNormalizeParsesIPWhoIsShape(t *testing.T) {
+	out, err := normalize("8.8.8.8", map[string]any{
+		"ip":           "8.8.8.8",
+		"success":      true,
+		"country":      "United States",
+		"country_code": "US",
+		"region":       "California",
+		"city":         "Mountain View",
+		"latitude":     37.3860517,
+		"longitude":    -122.0838511,
+		"connection": map[string]any{
+			"asn": float64(15169),
+			"org": "Google LLC",
+			"isp": "Google LLC",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Country != "US" || out.Region != "California" || out.City != "Mountain View" {
+		t.Fatalf("bad normalized result: %+v", out)
+	}
+	if out.ASN != 15169 || out.ASOrg != "Google LLC" || out.Provider != "Google LLC" {
+		t.Fatalf("bad connection fields: %+v", out)
+	}
+}
+
+func TestNormalizeRejectsProviderFailure(t *testing.T) {
+	_, err := normalize("203.0.113.10", map[string]any{
+		"success": false,
+		"message": "reserved range",
+	})
+	if err == nil || err.Error() != "reserved range" {
+		t.Fatalf("expected provider failure message, got %v", err)
+	}
+}
+
 func TestNormalizeRejectsMissingCoordinates(t *testing.T) {
 	if _, err := normalize("8.8.8.8", map[string]any{"country": "US"}); err == nil {
 		t.Fatal("expected missing coordinates to fail")
@@ -55,5 +92,17 @@ func TestNewHTTPResolverRequiresExplicitIPTokenAndHTTPS(t *testing.T) {
 	}
 	if _, err := NewHTTPResolver("http://example.com/{ip}"); err == nil {
 		t.Fatal("expected non-local http to fail")
+	}
+}
+
+func TestNewHTTPResolverAllowsDisableSentinels(t *testing.T) {
+	for _, value := range []string{"off", "none", "disabled", "false", "0"} {
+		resolver, err := NewHTTPResolver(value)
+		if err != nil {
+			t.Fatalf("%q should disable without error: %v", value, err)
+		}
+		if resolver != nil {
+			t.Fatalf("%q should return nil resolver", value)
+		}
 	}
 }

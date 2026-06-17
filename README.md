@@ -59,17 +59,20 @@ The URL must be HTTPS and point directly to an executable binary. The reviewed
 approval plan includes the version, URL, SHA-256, and fixed install path
 (`/usr/local/bin/coredns`); the node installs only after digest verification.
 
-Fleet Map automatic node placement is disabled unless you configure an explicit
-GeoIP endpoint. The URL must contain `{ip}` and return JSON with coordinates
-using common IPInfo/ip-api/ipapi-style fields:
+Fleet Map automatic node placement is enabled by default with the no-token
+`https://ipwho.is/{ip}` HTTPS JSON API. You do not need an IPInfo token for the
+normal Nezha-like auto-location flow. To disable external lookup entirely:
 
 ```sh
-LATTICE_GEOIP_LOOKUP_URL='https://ipinfo.io/{ip}/json?token=replace-with-token' \
+LATTICE_GEOIP_LOOKUP_URL=off \
 go run ./cmd/lattice-server
 ```
 
-Use an internal GeoIP service if you do not want node public IPs sent to a
-third-party provider. Manual map coordinates work without this setting.
+To use a self-hosted or internal provider instead, set
+`LATTICE_GEOIP_LOOKUP_URL` to an HTTPS URL template containing `{ip}`. The
+response must be JSON with common `country_code`, `region`, `city`,
+`latitude`/`longitude`, and optional ASN/provider fields. Manual map coordinates
+work even when automatic lookup is disabled.
 
 ## Build
 
@@ -150,10 +153,16 @@ Use the compose file and deployment guide in the umbrella repository:
 - Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
   advisory telemetry only. They are sanitized and clamped server-side and must
   not be used for authorization or policy decisions.
-- Fleet Map GeoIP lookup is opt-in. When `LATTICE_GEOIP_LOOKUP_URL` is unset,
-  the server does not send node public IPs to any external service; dashboard
-  auto-location reports that the resolver is disabled. Automatically resolved
+- Fleet Map GeoIP lookup defaults to the no-token `ipwho.is` HTTPS provider so
+  nodes can be placed without extra setup. Set `LATTICE_GEOIP_LOOKUP_URL=off`
+  to prevent the server from sending node public IPs to an external service, or
+  set it to an internal HTTPS template containing `{ip}`. Automatically resolved
   NodeGeo is marked `source=auto` and manual saves are marked `source=operator`.
+- Browser Terminal uses scoped, in-memory server sessions and outbound
+  node-agent polling. It is not inbound SSH, and the server does not store SSH
+  keys. Operators need `terminal:open`; nodes must run `lattice-agent` with
+  `LATTICE_AGENT_ALLOW_TERMINAL=1`. Session open/close events are audited, while
+  live terminal I/O is kept in bounded process memory for the active session.
 - MachineProfile cost/vendor/renewal data is server-only and is never sent to
   agents. Console/detail links are encrypted at rest and list APIs return only
   `has_console_url` / `has_detail_url` booleans.

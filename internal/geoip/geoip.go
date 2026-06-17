@@ -18,6 +18,11 @@ import (
 const (
 	lookupIPToken = "{ip}"
 	maxBodyBytes  = 64 * 1024
+
+	// DefaultLookupURL gives Fleet Map a Nezha-like no-token auto-location path.
+	// Operators who do not want node public IPs sent to a public provider can set
+	// LATTICE_GEOIP_LOOKUP_URL=off or point the setting at an internal service.
+	DefaultLookupURL = "https://ipwho.is/{ip}"
 )
 
 // Result is a normalized location returned by a GeoIP provider. Coordinates are
@@ -40,12 +45,16 @@ type Resolver interface {
 
 type HTTPResolver struct {
 	template string
+	provider string
 	client   *http.Client
 }
 
 func NewHTTPResolver(template string) (*HTTPResolver, error) {
 	template = strings.TrimSpace(template)
 	if template == "" {
+		return nil, nil
+	}
+	if isDisabledTemplate(template) {
 		return nil, nil
 	}
 	if !strings.Contains(template, lookupIPToken) {
@@ -64,6 +73,7 @@ func NewHTTPResolver(template string) (*HTTPResolver, error) {
 	}
 	return &HTTPResolver{
 		template: template,
+		provider: providerName(parsed),
 		client:   &http.Client{Timeout: 4 * time.Second},
 	}, nil
 }
@@ -101,10 +111,20 @@ func (r *HTTPResolver) Lookup(ctx context.Context, ip string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	if out.Provider == "" {
+		out.Provider = r.provider
+	}
 	return out, nil
 }
 
 func normalize(ip string, payload map[string]any) (Result, error) {
+	if success, ok := firstBool(payload, "success"); ok && !success {
+		message := firstString(payload, "message", "error", "reason")
+		if message == "" {
+			message = "provider reported lookup failure"
+		}
+		return Result{}, errors.New(message)
+	}
 	country := strings.ToUpper(firstString(payload, "country_code", "countryCode", "country"))
 	if len(country) > 2 {
 		country = ""
@@ -133,10 +153,23 @@ func normalize(ip string, payload map[string]any) (Result, error) {
 	if asn == 0 {
 		asn, asOrg = parseASN(firstString(payload, "org"))
 	}
+	if asn == 0 {
+		if conn := firstObject(payload, "connection"); conn != nil {
+			asn, asOrg = parseASN(firstString(conn, "asn", "as"))
+			if asOrg == "" {
+				asOrg = firstString(conn, "org", "isp", "domain")
+			}
+		}
+	}
 	if asOrg == "" {
 		asOrg = firstString(payload, "as_org", "asOrg", "org")
 	}
 	provider := firstString(payload, "provider", "isp", "org")
+	if provider == "" {
+		if conn := firstObject(payload, "connection"); conn != nil {
+			provider = firstString(conn, "org", "isp", "domain")
+		}
+	}
 
 	return Result{
 		IP:       ip,
@@ -169,6 +202,40 @@ func firstString(payload map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstObject(payload map[string]any, keys ...string) map[string]any {
+	for _, key := range keys {
+		value, ok := payload[key]
+		if !ok || value == nil {
+			continue
+		}
+		if obj, ok := value.(map[string]any); ok {
+			return obj
+		}
+	}
+	return nil
+}
+
+func firstBool(payload map[string]any, keys ...string) (bool, bool) {
+	for _, key := range keys {
+		value, ok := payload[key]
+		if !ok || value == nil {
+			continue
+		}
+		switch v := value.(type) {
+		case bool:
+			return v, true
+		case string:
+			switch strings.ToLower(strings.TrimSpace(v)) {
+			case "true", "1", "yes":
+				return true, true
+			case "false", "0", "no":
+				return false, true
+			}
+		}
+	}
+	return false, false
 }
 
 func firstFloat(payload map[string]any, keys ...string) (float64, bool) {
@@ -223,4 +290,24 @@ func isLocalHTTP(u *url.URL) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func isDisabledTemplate(template string) bool {
+	switch strings.ToLower(strings.TrimSpace(template)) {
+	case "0", "false", "off", "none", "disabled", "disable":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerName(u *url.URL) string {
+	host := strings.TrimSpace(u.Hostname())
+	if host == "" {
+		return "geoip"
+	}
+	if strings.EqualFold(host, "ipwho.is") {
+		return "ipwho.is"
+	}
+	return host
 }

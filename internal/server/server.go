@@ -76,9 +76,8 @@ type Options struct {
 	// apply scripts may install. Empty preserves the fail-closed precondition
 	// that coredns already exists on the node.
 	CoreDNSBinary selfdns.CoreDNSBinarySource
-	// GeoResolver optionally maps node public IPs to advisory coordinates for the
-	// Fleet Map. Nil keeps automatic lookup disabled; manual NodeGeo remains
-	// available.
+	// GeoResolver maps node public IPs to advisory coordinates for the Fleet Map.
+	// Nil keeps automatic lookup disabled; manual NodeGeo remains available.
 	GeoResolver geoip.Resolver
 	// RenewalReminderInterval controls the machine-renewal reminder scheduler.
 	// Zero uses the production default. DisableRenewalScheduler is intended for
@@ -144,9 +143,13 @@ type Server struct {
 	// coreDNSBinary is copied into selfdns approval plans when configured. The
 	// apply path parses the reviewed plan, not this mutable server field.
 	coreDNSBinary selfdns.CoreDNSBinarySource
-	// geoResolver is nil unless the operator configured an explicit GeoIP data
-	// source. The server never sends node IPs to third parties by default.
+	// geoResolver is nil only when the operator explicitly disables automatic
+	// lookup. The command default uses a no-token HTTPS provider; privacy-focused
+	// deployments should set an internal provider or disable lookup.
 	geoResolver geoip.Resolver
+	// terminalBroker owns short-lived interactive terminal sessions. Sessions are
+	// intentionally in-memory only; a server restart forces operators to reopen.
+	terminalBroker *terminalBroker
 	// build is immutable process metadata exposed by /api/version and dashboard
 	// About. It contains no secrets and is intentionally safe for unauthenticated
 	// health/version probes.
@@ -232,6 +235,7 @@ func New(opts Options) (*Server, error) {
 		publicURL:        strings.TrimRight(opts.PublicURL, "/"),
 		coreDNSBinary:    coreDNSBinary,
 		geoResolver:      opts.GeoResolver,
+		terminalBroker:   newTerminalBroker(),
 		build:            normalizeBuildInfo(opts.Build),
 		pluginTrust:      opts.PluginTrust,
 		reminderInterval: opts.RenewalReminderInterval,
@@ -578,6 +582,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
+	mux.HandleFunc("/api/terminal/sessions", s.withAuth("", s.handleTerminalSessions))
+	mux.HandleFunc("/api/terminal/sessions/", s.withAuth("", s.handleTerminalSessionPath))
 	mux.HandleFunc("/api/audit", s.withAuth("audit:read", s.handleAudit))
 	mux.HandleFunc("/api/audit/verify", s.withAuth("audit:read", s.handleAuditVerify))
 	mux.HandleFunc("/api/plugins", s.withAuth("audit:read", s.handlePlugins))
@@ -649,6 +655,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/proxy-usage", s.withAgentLimit(s.handleAgentProxyUsage))
 	mux.HandleFunc("/api/agent/tasks", s.withAgentLimit(s.handleAgentTasks))
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
+	mux.HandleFunc("/api/agent/terminal/sessions", s.withAgentLimit(s.handleAgentTerminalSessions))
+	mux.HandleFunc("/api/agent/terminal/sessions/", s.withAgentLimit(s.handleAgentTerminalSessionPath))
 	mux.HandleFunc("/api/agent/config", s.withAgentLimit(s.handleAgentConfig))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))

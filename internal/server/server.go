@@ -670,10 +670,23 @@ func (s *Server) staticHandler() http.Handler {
 			name = "index.html"
 		}
 		if _, err := fs.Stat(s.webFS, name); err != nil {
-			r.URL.Path = "/index.html"
+			name = "index.html"
+			r.URL.Path = "/"
 		}
+		w.Header().Set("Cache-Control", staticCacheControl(name))
 		fileServer.ServeHTTP(w, r)
 	})
+}
+
+func staticCacheControl(name string) string {
+	switch {
+	case name == "index.html" || name == "theme-init.js":
+		return "no-cache"
+	case strings.HasPrefix(name, "assets/"):
+		return "public, max-age=31536000, immutable"
+	default:
+		return "public, max-age=3600"
+	}
 }
 
 // withAgentLimit applies per-source rate limiting to the unauthenticated-facing

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/fstest"
 
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -80,5 +81,50 @@ func TestCleanObjectPathRejectsTraversal(t *testing.T) {
 	}
 	if clean != "site/index.html" {
 		t.Fatalf("unexpected clean path %q", clean)
+	}
+}
+
+func TestStaticHandlerCacheHeaders(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{
+		Store:         st,
+		AdminPassword: "correct horse battery staple",
+		WebFS: fstest.MapFS{
+			"index.html":        {Data: []byte("<div id=\"app\"></div>")},
+			"theme-init.js":     {Data: []byte("/* theme bootstrap */")},
+			"assets/app-abc.js": {Data: []byte("export default 1")},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"/", "no-cache"},
+		{"/login", "no-cache"},
+		{"/theme-init.js", "no-cache"},
+		{"/assets/app-abc.js", "public, max-age=31536000, immutable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+			res := resp.Result()
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("status %d", res.StatusCode)
+			}
+			if got := res.Header.Get("Cache-Control"); got != tc.want {
+				t.Fatalf("Cache-Control = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

@@ -102,6 +102,11 @@ generate `/var/lib/lattice/master.key` automatically. Set it only when restoring
 or mounting a pre-existing key. The entrypoint fixes ownership of the mounted
 data directory before dropping privileges to the `lattice` user.
 
+Dashboard static serving is cache-aware: `index.html`, SPA fallback routes, and
+`theme-init.js` are served with `Cache-Control: no-cache`; content-hashed Vite
+assets under `/assets/` are served with `Cache-Control: public, max-age=31536000,
+immutable`.
+
 Use the compose file and deployment guide in the umbrella repository:
 `lattice/compose/docker-compose.yml` and `lattice/docs/tutorials/docker-server.md`.
 
@@ -110,6 +115,9 @@ Use the compose file and deployment guide in the umbrella repository:
 - First-run password is random unless `LATTICE_ADMIN_PASSWORD` is set. After
   state exists, that environment variable remains bootstrap-only; rotate the
   current operator password with authenticated `POST /api/auth/password`.
+- Password login sends username/password as JSON over HTTPS. Do not expose the
+  dashboard over remote cleartext `http://`; use TLS, secure cookies, and HSTS in
+  production.
 - Container images embed the dashboard commit pinned in `dashboard.ref`;
   update that file when intentionally rolling a new dashboard into the server
   image.

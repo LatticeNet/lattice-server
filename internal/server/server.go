@@ -732,11 +732,11 @@ func (s *Server) staticHandler() http.Handler {
 			return
 		}
 		host := requestHost(r.Host)
-		if binding, ok := s.store.StorageBindingForHost(model.StorageKindKV, host); ok {
+		if binding, ok := s.storageBindingForRequest(model.StorageKindKV, host, r.URL.Path); ok {
 			s.serveKVBinding(w, r, binding)
 			return
 		}
-		if binding, ok := s.store.StorageBindingForHost(model.StorageKindStatic, host); ok {
+		if binding, ok := s.storageBindingForRequest(model.StorageKindStatic, host, r.URL.Path); ok {
 			s.serveStaticBinding(w, r, binding)
 			return
 		}

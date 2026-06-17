@@ -117,6 +117,12 @@ func (s *Server) handleStorageBindings(w http.ResponseWriter, r *http.Request, p
 			writeError(w, http.StatusBadRequest, fmt.Errorf("%s bucket %q does not exist", kind, binding.Bucket))
 			return
 		}
+		for _, existing := range s.store.StorageBindings(kind) {
+			if existing.ID != binding.ID && sameStorageBindingRoute(existing, binding) {
+				writeError(w, http.StatusConflict, errors.New("storage binding route already exists"))
+				return
+			}
+		}
 		if err := s.store.UpsertStorageBinding(binding); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -150,6 +156,17 @@ func (s *Server) handleDeleteStorageBinding(w http.ResponseWriter, r *http.Reque
 	}
 	if req.ID == "" {
 		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+	found := false
+	for _, binding := range s.store.StorageBindings(kind) {
+		if binding.ID == req.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, errors.New("storage binding not found"))
 		return
 	}
 	if err := s.store.DeleteStorageBinding(req.ID); err != nil {
@@ -221,12 +238,17 @@ func (s *Server) handleRevokeStorageToken(w http.ResponseWriter, r *http.Request
 	if !s.requireScope(w, p, storageAdminScope(kind)) {
 		return
 	}
-	token, ok, err := s.store.RevokeStorageAccessToken(req.TokenID)
+	token, ok := s.store.StorageAccessToken(req.TokenID)
+	if !ok || token.Kind != kind {
+		writeError(w, http.StatusNotFound, errors.New("storage token not found"))
+		return
+	}
+	token, ok, err = s.store.RevokeStorageAccessToken(req.TokenID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if !ok || token.Kind != kind {
+	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("storage token not found"))
 		return
 	}
@@ -572,6 +594,31 @@ func storageTokenAllows(token model.StorageAccessToken, bucket, required string)
 		return true
 	}
 	return token.Access == required
+}
+
+func (s *Server) storageBindingForRequest(kind, hostname, urlPath string) (model.StorageBinding, bool) {
+	var best model.StorageBinding
+	bestPrefixLen := -1
+	for _, binding := range s.store.StorageBindings(kind) {
+		if !binding.Enabled || !strings.EqualFold(binding.Hostname, hostname) {
+			continue
+		}
+		if _, ok := bindingObjectPath(binding, urlPath); !ok {
+			continue
+		}
+		prefixLen := len(strings.Trim(binding.PathPrefix, "/"))
+		if prefixLen > bestPrefixLen || (prefixLen == bestPrefixLen && binding.ID < best.ID) {
+			best = binding
+			bestPrefixLen = prefixLen
+		}
+	}
+	return best, bestPrefixLen >= 0
+}
+
+func sameStorageBindingRoute(a, b model.StorageBinding) bool {
+	return a.Kind == b.Kind &&
+		strings.EqualFold(a.Hostname, b.Hostname) &&
+		strings.Trim(a.PathPrefix, "/") == strings.Trim(b.PathPrefix, "/")
 }
 
 func bindingObjectPath(binding model.StorageBinding, urlPath string) (string, bool) {

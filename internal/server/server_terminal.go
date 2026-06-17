@@ -24,6 +24,12 @@ const (
 	terminalMaxEventBytes   = 32 * 1024
 	terminalMaxEventCount   = 600
 	terminalMaxSessionBytes = 512 * 1024
+	terminalMaxSessions     = 128
+
+	terminalMaxActiveSessionsPerNode = 4
+	terminalPendingTTL               = 10 * time.Minute
+	terminalIdleTTL                  = 4 * time.Hour
+	terminalClosedTTL                = 30 * time.Minute
 )
 
 type terminalBroker struct {
@@ -43,9 +49,25 @@ func newTerminalBroker() *terminalBroker {
 	return &terminalBroker{sessions: map[string]*terminalSessionState{}}
 }
 
-func (b *terminalBroker) create(nodeID, actorID, tokenID, shell string, cols, rows int, now time.Time) model.TerminalSession {
+func (b *terminalBroker) create(nodeID, actorID, tokenID, shell string, cols, rows int, now time.Time) (model.TerminalSession, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	now = now.UTC()
+	b.pruneLocked(now)
+	var activeForNode int
+	for _, state := range b.sessions {
+		if state.session.NodeID == nodeID && terminalActiveStatus(state.session.Status) {
+			activeForNode++
+		}
+	}
+	if activeForNode >= terminalMaxActiveSessionsPerNode {
+		return model.TerminalSession{}, fmt.Errorf("node already has %d active terminal sessions", terminalMaxActiveSessionsPerNode)
+	}
+	for len(b.sessions) >= terminalMaxSessions && b.dropOldestClosedLocked() {
+	}
+	if len(b.sessions) >= terminalMaxSessions {
+		return model.TerminalSession{}, errors.New("terminal session capacity reached")
+	}
 	shell = normalizeTerminalShell(shell)
 	cols, rows = normalizeTerminalSize(cols, rows)
 	session := model.TerminalSession{
@@ -57,16 +79,17 @@ func (b *terminalBroker) create(nodeID, actorID, tokenID, shell string, cols, ro
 		Cols:      cols,
 		Rows:      rows,
 		Status:    model.TerminalPending,
-		CreatedAt: now.UTC(),
-		LastSeen:  now.UTC(),
+		CreatedAt: now,
+		LastSeen:  now,
 	}
 	b.sessions[session.ID] = &terminalSessionState{session: session, nextEventSeq: 1, nextInputSeq: 1}
-	return session
+	return session, nil
 }
 
-func (b *terminalBroker) list() []model.TerminalSession {
+func (b *terminalBroker) list(now time.Time) []model.TerminalSession {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.pruneLocked(now.UTC())
 	out := make([]model.TerminalSession, 0, len(b.sessions))
 	for _, state := range b.sessions {
 		out = append(out, state.session)
@@ -74,9 +97,10 @@ func (b *terminalBroker) list() []model.TerminalSession {
 	return out
 }
 
-func (b *terminalBroker) get(sessionID string) (model.TerminalSession, bool) {
+func (b *terminalBroker) get(sessionID string, now time.Time) (model.TerminalSession, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.pruneLocked(now.UTC())
 	state, ok := b.sessions[sessionID]
 	if !ok {
 		return model.TerminalSession{}, false
@@ -84,9 +108,10 @@ func (b *terminalBroker) get(sessionID string) (model.TerminalSession, bool) {
 	return state.session, true
 }
 
-func (b *terminalBroker) eventsAfter(sessionID string, cursor int64) (model.TerminalSession, []model.TerminalEvent, bool) {
+func (b *terminalBroker) eventsAfter(sessionID string, cursor int64, now time.Time) (model.TerminalSession, []model.TerminalEvent, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.pruneLocked(now.UTC())
 	state, ok := b.sessions[sessionID]
 	if !ok {
 		return model.TerminalSession{}, nil, false
@@ -103,6 +128,8 @@ func (b *terminalBroker) eventsAfter(sessionID string, cursor int64) (model.Term
 func (b *terminalBroker) pendingForAgent(nodeID string, now time.Time) []model.TerminalSession {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	now = now.UTC()
+	b.pruneLocked(now)
 	var out []model.TerminalSession
 	for _, state := range b.sessions {
 		if state.session.NodeID != nodeID || state.session.Status != model.TerminalPending {
@@ -117,6 +144,8 @@ func (b *terminalBroker) pendingForAgent(nodeID string, now time.Time) []model.T
 func (b *terminalBroker) addInput(sessionID, kind, data string, cols, rows int, now time.Time) (model.TerminalSession, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	now = now.UTC()
+	b.pruneLocked(now)
 	state, ok := b.sessions[sessionID]
 	if !ok {
 		return model.TerminalSession{}, errors.New("terminal session not found")
@@ -140,7 +169,7 @@ func (b *terminalBroker) addInput(sessionID, kind, data string, cols, rows int, 
 	case "close":
 		if state.session.Status == model.TerminalPending {
 			state.session.Status = model.TerminalClosed
-			state.session.ClosedAt = now.UTC()
+			state.session.ClosedAt = now
 		}
 	default:
 		return model.TerminalSession{}, errors.New("unsupported terminal input kind")
@@ -151,22 +180,24 @@ func (b *terminalBroker) addInput(sessionID, kind, data string, cols, rows int, 
 		Data:      data,
 		Cols:      cols,
 		Rows:      rows,
-		CreatedAt: now.UTC(),
+		CreatedAt: now,
 	}
 	state.nextInputSeq++
 	state.inputs = append(state.inputs, input)
-	state.session.LastSeen = now.UTC()
+	state.session.LastSeen = now
 	return state.session, nil
 }
 
 func (b *terminalBroker) inputsAfter(sessionID, nodeID string, cursor int64, now time.Time) (model.TerminalSession, []model.TerminalInput, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	now = now.UTC()
+	b.pruneLocked(now)
 	state, ok := b.sessions[sessionID]
 	if !ok || state.session.NodeID != nodeID {
 		return model.TerminalSession{}, nil, false
 	}
-	state.session.LastSeen = now.UTC()
+	state.session.LastSeen = now
 	inputs := make([]model.TerminalInput, 0, len(state.inputs))
 	for _, input := range state.inputs {
 		if input.Seq > cursor {
@@ -179,6 +210,8 @@ func (b *terminalBroker) inputsAfter(sessionID, nodeID string, cursor int64, now
 func (b *terminalBroker) agentUpdate(sessionID, nodeID, status, message string, events []model.TerminalEvent, now time.Time) (model.TerminalSession, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	now = now.UTC()
+	b.pruneLocked(now)
 	state, ok := b.sessions[sessionID]
 	if !ok {
 		return model.TerminalSession{}, errors.New("terminal session not found")
@@ -186,7 +219,6 @@ func (b *terminalBroker) agentUpdate(sessionID, nodeID, status, message string, 
 	if state.session.NodeID != nodeID {
 		return model.TerminalSession{}, errors.New("terminal session does not belong to node")
 	}
-	now = now.UTC()
 	switch status {
 	case "", model.TerminalPending:
 	case model.TerminalOpen:
@@ -225,6 +257,67 @@ func (b *terminalBroker) agentUpdate(sessionID, nodeID, status, message string, 
 	}
 	trimTerminalEvents(state)
 	return state.session, nil
+}
+
+func (b *terminalBroker) pruneLocked(now time.Time) {
+	for sessionID, state := range b.sessions {
+		session := &state.session
+		switch {
+		case session.Status == model.TerminalPending && now.Sub(session.CreatedAt) > terminalPendingTTL:
+			session.Status = model.TerminalFailed
+			session.Error = "terminal session expired before node accepted it"
+			session.ClosedAt = now
+			session.LastSeen = now
+		case terminalActiveStatus(session.Status) && !session.LastSeen.IsZero() && now.Sub(session.LastSeen) > terminalIdleTTL:
+			session.Status = model.TerminalFailed
+			session.Error = "terminal session expired after inactivity"
+			session.ClosedAt = now
+			session.LastSeen = now
+		}
+		if terminalClosedStatus(session.Status) && now.Sub(terminalClosedAt(*session)) >= terminalClosedTTL {
+			delete(b.sessions, sessionID)
+		}
+	}
+	for len(b.sessions) > terminalMaxSessions && b.dropOldestClosedLocked() {
+	}
+}
+
+func (b *terminalBroker) dropOldestClosedLocked() bool {
+	var oldestID string
+	var oldestAt time.Time
+	for sessionID, state := range b.sessions {
+		if !terminalClosedStatus(state.session.Status) {
+			continue
+		}
+		closedAt := terminalClosedAt(state.session)
+		if oldestID == "" || closedAt.Before(oldestAt) {
+			oldestID = sessionID
+			oldestAt = closedAt
+		}
+	}
+	if oldestID == "" {
+		return false
+	}
+	delete(b.sessions, oldestID)
+	return true
+}
+
+func terminalActiveStatus(status string) bool {
+	return status != model.TerminalClosed && status != model.TerminalFailed
+}
+
+func terminalClosedStatus(status string) bool {
+	return status == model.TerminalClosed || status == model.TerminalFailed
+}
+
+func terminalClosedAt(session model.TerminalSession) time.Time {
+	if !session.ClosedAt.IsZero() {
+		return session.ClosedAt
+	}
+	if !session.LastSeen.IsZero() {
+		return session.LastSeen
+	}
+	return session.CreatedAt
 }
 
 func trimTerminalEvents(state *terminalSessionState) {
@@ -281,7 +374,7 @@ func (s *Server) handleTerminalSessions(w http.ResponseWriter, r *http.Request, 
 		if !s.requireScope(w, p, "terminal:open") {
 			return
 		}
-		sessions := s.terminalBroker.list()
+		sessions := s.terminalBroker.list(s.now())
 		visible := make([]model.TerminalSession, 0, len(sessions))
 		for _, session := range sessions {
 			if rbac.Allows(p.Principal, "terminal:open", session.NodeID) {
@@ -311,7 +404,11 @@ func (s *Server) handleTerminalSessions(w http.ResponseWriter, r *http.Request, 
 			writeError(w, http.StatusNotFound, errors.New("node not found"))
 			return
 		}
-		session := s.terminalBroker.create(req.NodeID, p.ActorID, p.TokenID, req.Shell, req.Cols, req.Rows, s.now())
+		session, err := s.terminalBroker.create(req.NodeID, p.ActorID, p.TokenID, req.Shell, req.Cols, req.Rows, s.now())
+		if err != nil {
+			writeError(w, http.StatusTooManyRequests, err)
+			return
+		}
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:     id.New("audit"),
 			NodeID: req.NodeID,
@@ -334,7 +431,7 @@ func (s *Server) handleTerminalSessionPath(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusNotFound, errors.New("terminal endpoint not found"))
 		return
 	}
-	session, ok := s.terminalBroker.get(sessionID)
+	session, ok := s.terminalBroker.get(sessionID, s.now())
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("terminal session not found"))
 		return
@@ -349,7 +446,7 @@ func (s *Server) handleTerminalSessionPath(w http.ResponseWriter, r *http.Reques
 			return
 		}
 		cursor := parseInt64Query(r, "cursor")
-		session, events, ok := s.terminalBroker.eventsAfter(sessionID, cursor)
+		session, events, ok := s.terminalBroker.eventsAfter(sessionID, cursor, s.now())
 		if !ok {
 			writeError(w, http.StatusNotFound, errors.New("terminal session not found"))
 			return

@@ -163,6 +163,9 @@ Use the compose file and deployment guide in the umbrella repository:
   keys. Operators need `terminal:open`; nodes must run `lattice-agent` with
   `LATTICE_AGENT_ALLOW_TERMINAL=1`. Session open/close events are audited, while
   live terminal I/O is kept in bounded process memory for the active session.
+  The broker limits each node to four active sessions, expires unaccepted
+  sessions after 10 minutes, expires idle sessions after four hours, and prunes
+  closed transcripts after 30 minutes.
 - MachineProfile cost/vendor/renewal data is server-only and is never sent to
   agents. Console/detail links are encrypted at rest and list APIs return only
   `has_console_url` / `has_detail_url` booleans.

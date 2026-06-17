@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -98,5 +99,31 @@ func TestTerminalRequiresTerminalScope(t *testing.T) {
 	defer denied.Body.Close()
 	if denied.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected terminal scope denial, got %d", denied.StatusCode)
+	}
+}
+
+func TestTerminalBrokerLimitsAndPrunesSessions(t *testing.T) {
+	broker := newTerminalBroker()
+	now := time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < terminalMaxActiveSessionsPerNode; i++ {
+		if _, err := broker.create("node-a", "admin", "", "sh", 0, 0, now); err != nil {
+			t.Fatalf("create active session %d failed: %v", i, err)
+		}
+	}
+	if _, err := broker.create("node-a", "admin", "", "sh", 0, 0, now); err == nil {
+		t.Fatal("expected per-node active terminal limit")
+	}
+	if sessions := broker.pendingForAgent("node-a", now.Add(terminalPendingTTL+time.Second)); len(sessions) != 0 {
+		t.Fatalf("expired pending sessions should not be offered to agent: %+v", sessions)
+	}
+	if sessions := broker.list(now.Add(terminalPendingTTL + time.Second)); len(sessions) != terminalMaxActiveSessionsPerNode {
+		t.Fatalf("expired sessions should remain visible until closed TTL, got %d", len(sessions))
+	}
+	if sessions := broker.list(now.Add(terminalPendingTTL + terminalClosedTTL + time.Second)); len(sessions) != 0 {
+		t.Fatalf("closed TTL should prune expired sessions, got %+v", sessions)
+	}
+	if _, err := broker.create("node-a", "admin", "", "sh", 0, 0, now.Add(terminalPendingTTL+terminalClosedTTL+2*time.Second)); err != nil {
+		t.Fatalf("create after prune failed: %v", err)
 	}
 }

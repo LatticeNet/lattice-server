@@ -167,8 +167,8 @@ func (b *terminalBroker) addInput(sessionID, kind, data string, cols, rows int, 
 		state.session.Cols = cols
 		state.session.Rows = rows
 	case "close":
-		if state.session.Status == model.TerminalPending {
-			state.session.Status = model.TerminalClosed
+		state.session.Status = model.TerminalClosed
+		if state.session.ClosedAt.IsZero() {
 			state.session.ClosedAt = now
 		}
 	default:

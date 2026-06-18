@@ -102,6 +102,55 @@ func TestTerminalRequiresTerminalScope(t *testing.T) {
 	}
 }
 
+func TestTerminalCloseMarksOpenSessionClosedAndDeliversCloseInput(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	create := doJSON(t, handler, http.MethodPost, "/api/terminal/sessions", `{"node_id":"node-a","shell":"sh"}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create terminal failed: %d", create.StatusCode)
+	}
+	var session model.TerminalSession
+	if err := json.NewDecoder(create.Body).Decode(&session); err != nil {
+		t.Fatal(err)
+	}
+
+	open := doAgentRaw(t, handler, http.MethodPost, "/api/agent/terminal/sessions/"+session.ID+"/events",
+		`{"node_id":"node-a","status":"open"}`, nodeToken)
+	if open.Code != http.StatusOK {
+		t.Fatalf("agent open failed: %d", open.Code)
+	}
+
+	closeResp := doJSON(t, handler, http.MethodPost, "/api/terminal/sessions/"+session.ID+"/close", `{}`, cookies, csrf)
+	defer closeResp.Body.Close()
+	if closeResp.StatusCode != http.StatusOK {
+		t.Fatalf("operator close failed: %d", closeResp.StatusCode)
+	}
+	var closed model.TerminalSession
+	if err := json.NewDecoder(closeResp.Body).Decode(&closed); err != nil {
+		t.Fatal(err)
+	}
+	if closed.Status != model.TerminalClosed || closed.ClosedAt.IsZero() {
+		t.Fatalf("close should immediately mark session closed: %+v", closed)
+	}
+
+	inputs := doAgentRaw(t, handler, http.MethodGet, "/api/agent/terminal/sessions/"+session.ID+"/inputs?node_id=node-a&cursor=0", "", nodeToken)
+	if inputs.Code != http.StatusOK {
+		t.Fatalf("agent input poll failed: %d", inputs.Code)
+	}
+	var inputsBody struct {
+		Inputs []model.TerminalInput `json:"inputs"`
+	}
+	if err := json.NewDecoder(inputs.Body).Decode(&inputsBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(inputsBody.Inputs) != 1 || inputsBody.Inputs[0].Kind != "close" {
+		t.Fatalf("close input not delivered to agent: %+v", inputsBody.Inputs)
+	}
+}
+
 func TestTerminalBrokerLimitsAndPrunesSessions(t *testing.T) {
 	broker := newTerminalBroker()
 	now := time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)

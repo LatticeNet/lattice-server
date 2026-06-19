@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -669,7 +670,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.Handle("/", s.staticHandler())
-	return s.withRequestID(s.securityHeaders(mux))
+	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
 }
 
 func (s *Server) ensureAdmin(username, password string) error {
@@ -4557,6 +4558,74 @@ func (s *Server) withRequestID(next http.Handler) http.Handler {
 func requestIDFromRequest(r *http.Request) string {
 	requestID, _ := r.Context().Value(requestIDContextKey{}).(string)
 	return requestID
+}
+
+// logResponseWriter records the status code and byte count of a response so the
+// request-logging middleware can report them. It forwards Flush so streaming
+// handlers keep working.
+type logResponseWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+	wrote  bool
+}
+
+func (w *logResponseWriter) WriteHeader(code int) {
+	if !w.wrote {
+		w.status = code
+		w.wrote = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *logResponseWriter) Write(b []byte) (int, error) {
+	if !w.wrote {
+		w.status = http.StatusOK
+		w.wrote = true
+	}
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += n
+	return n, err
+}
+
+func (w *logResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// withRequestLog logs HTTP requests with method, path, status, response size,
+// latency, client IP, and request id. It is quiet by default: only requests
+// slower than the threshold (or 5xx) are logged, so it is safe to leave enabled
+// in production. Tunables (read at startup):
+//
+//	LATTICE_ACCESS_LOG=1            log every request (verbose)
+//	LATTICE_SLOW_REQUEST_MS=<n>     slow-request threshold in ms (default 1000)
+func (s *Server) withRequestLog(next http.Handler) http.Handler {
+	logAll := os.Getenv("LATTICE_ACCESS_LOG") == "1"
+	slowMS := 1000
+	if v := strings.TrimSpace(os.Getenv("LATTICE_SLOW_REQUEST_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			slowMS = n
+		}
+	}
+	slow := time.Duration(slowMS) * time.Millisecond
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &logResponseWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(lw, r)
+		dur := time.Since(start)
+		if !logAll && dur < slow && lw.status < 500 {
+			return
+		}
+		tag := "request"
+		if dur >= slow {
+			tag = "SLOW request"
+		}
+		s.logger.Printf("%s: %s %s -> %d %dB %s (ip=%s id=%s)",
+			tag, r.Method, r.URL.Path, lw.status, lw.bytes,
+			dur.Round(time.Millisecond), s.clientIP(r), requestIDFromRequest(r))
+	})
 }
 
 // recordAudit writes an audit event and, unlike a bare best-effort call, logs

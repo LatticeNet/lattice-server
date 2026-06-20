@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -151,6 +152,10 @@ type Server struct {
 	// terminalBroker owns short-lived interactive terminal sessions. Sessions are
 	// intentionally in-memory only; a server restart forces operators to reopen.
 	terminalBroker *terminalBroker
+	// terminalHub splices a browser attach WebSocket to the agent-dialed stream
+	// WebSocket for the same session (the streaming transport). It owns no
+	// session metadata; terminalBroker remains authoritative for lifecycle.
+	terminalHub *terminalHub
 	// build is immutable process metadata exposed by /api/version and dashboard
 	// About. It contains no secrets and is intentionally safe for unauthenticated
 	// health/version probes.
@@ -237,6 +242,7 @@ func New(opts Options) (*Server, error) {
 		coreDNSBinary:    coreDNSBinary,
 		geoResolver:      opts.GeoResolver,
 		terminalBroker:   newTerminalBroker(),
+		terminalHub:      newTerminalHub(),
 		build:            normalizeBuildInfo(opts.Build),
 		pluginTrust:      opts.PluginTrust,
 		reminderInterval: opts.RenewalReminderInterval,
@@ -658,6 +664,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
 	mux.HandleFunc("/api/agent/terminal/sessions", s.withAgentLimit(s.handleAgentTerminalSessions))
 	mux.HandleFunc("/api/agent/terminal/sessions/", s.withAgentLimit(s.handleAgentTerminalSessionPath))
+	mux.HandleFunc("/api/agent/terminal/stream", s.withAgentLimit(s.handleAgentTerminalStream))
 	mux.HandleFunc("/api/agent/config", s.withAgentLimit(s.handleAgentConfig))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
@@ -4592,6 +4599,17 @@ func (w *logResponseWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack forwards to the underlying ResponseWriter so WebSocket upgrades (the
+// terminal stream/attach routes) keep working. Without it this logging wrapper
+// would mask the connection's http.Hijacker and every upgrade would fail.
+func (w *logResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response does not support hijacking")
+	}
+	return hj.Hijack()
 }
 
 // withRequestLog logs HTTP requests with method, path, status, response size,

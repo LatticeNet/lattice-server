@@ -11,5 +11,6 @@ require (
 
 require (
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	github.com/gorilla/websocket v1.5.3 // indirect
 	golang.org/x/sys v0.29.0 // indirect
 )

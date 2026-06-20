@@ -12,6 +12,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/websocketx"
 )
 
 const (
@@ -257,6 +258,55 @@ func (b *terminalBroker) agentUpdate(sessionID, nodeID, status, message string, 
 	}
 	trimTerminalEvents(state)
 	return state.session, nil
+}
+
+// markOpen transitions a session to open when its live agent stream connects.
+// It mirrors the status-transition half of agentUpdate(status=open) without
+// touching the event byte buffers, which the streaming transport bypasses.
+func (b *terminalBroker) markOpen(sessionID string, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now = now.UTC()
+	b.pruneLocked(now)
+	state, ok := b.sessions[sessionID]
+	if !ok {
+		return
+	}
+	if state.session.Status == model.TerminalClosed || state.session.Status == model.TerminalFailed {
+		return
+	}
+	if state.session.Status == model.TerminalPending {
+		state.session.OpenedAt = now
+	}
+	state.session.Status = model.TerminalOpen
+	state.session.Error = ""
+	state.session.LastSeen = now
+}
+
+// markClosed transitions a session to a terminal status when its live stream
+// ends. It mirrors the status-transition half of agentUpdate(status=closed|
+// failed) without touching the event byte buffers. status defaults to closed
+// for any non-terminal value; an already-closed session is left unchanged.
+func (b *terminalBroker) markClosed(sessionID, status, errMsg string, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now = now.UTC()
+	b.pruneLocked(now)
+	state, ok := b.sessions[sessionID]
+	if !ok {
+		return
+	}
+	if status != model.TerminalClosed && status != model.TerminalFailed {
+		status = model.TerminalClosed
+	}
+	if state.session.Status != model.TerminalClosed && state.session.Status != model.TerminalFailed {
+		state.session.Status = status
+		state.session.Error = clampPrintable(errMsg, 256)
+		if state.session.ClosedAt.IsZero() {
+			state.session.ClosedAt = now
+		}
+	}
+	state.session.LastSeen = now
 }
 
 func (b *terminalBroker) pruneLocked(now time.Time) {
@@ -507,6 +557,32 @@ func (s *Server) handleTerminalSessionPath(w http.ResponseWriter, r *http.Reques
 			},
 		})
 		writeJSON(w, http.StatusOK, session)
+	case "attach":
+		// Live WebSocket attach (dark-launched; no client uses it yet). The RBAC
+		// gate above (requireNodeScope terminal:open) has already run, so the
+		// upgrade is reached only for an authorized principal on this node.
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+			return
+		}
+		conn, err := terminalUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			// Upgrade has already written an error response to the client.
+			return
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID:     id.New("audit"),
+			NodeID: session.NodeID,
+			Action: "terminal.attach",
+			Scope:  "terminal:open",
+			Metadata: map[string]string{
+				"session_id": session.ID,
+			},
+		})
+		// attachBrowser blocks until the agent bridges and the byte pump tears
+		// down (or the attach times out); the session is then marked closed.
+		s.terminalHub.attachBrowser(session.ID, websocketx.NewConn(conn))
+		s.terminalBroker.markClosed(session.ID, model.TerminalClosed, "", s.now())
 	default:
 		writeError(w, http.StatusNotFound, errors.New("terminal endpoint not found"))
 	}

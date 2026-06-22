@@ -3,8 +3,9 @@ module github.com/LatticeNet/lattice-server
 go 1.26
 
 require (
-	github.com/LatticeNet/lattice-sdk v0.2.3
+	github.com/LatticeNet/lattice-sdk v0.2.4
 	github.com/coreos/go-oidc/v3 v3.18.0
+	github.com/gorilla/websocket v1.5.3
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/oauth2 v0.36.0
 )

@@ -53,6 +53,8 @@ type State struct {
 	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
 	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
+	Groups          map[string]model.Group              `json:"groups"`
+	GroupPolicies   map[string]model.GroupNetPolicy     `json:"group_policies"`
 	GeoRouting      map[string]model.GeoRouting         `json:"geo_routing"`
 	AgentUpdates    map[string]model.AgentUpdatePolicy  `json:"agent_updates"`
 	ProxyInbounds   map[string]model.ProxyInbound       `json:"proxy_inbounds"`
@@ -156,6 +158,8 @@ func emptyState() State {
 		NFTInputs:       map[string]model.NFTInputs{},
 		DNSDeployments:  map[string]model.DNSDeployment{},
 		NetPolicies:     map[string]model.NetPolicy{},
+		Groups:          map[string]model.Group{},
+		GroupPolicies:   map[string]model.GroupNetPolicy{},
 		GeoRouting:      map[string]model.GeoRouting{},
 		AgentUpdates:    map[string]model.AgentUpdatePolicy{},
 		ProxyInbounds:   map[string]model.ProxyInbound{},
@@ -241,6 +245,14 @@ func (st *State) ensureMaps() {
 	}
 	if st.NetPolicies == nil {
 		st.NetPolicies = map[string]model.NetPolicy{}
+	}
+	// Nil-checked here so an existing on-disk state file from before grouping
+	// upgrades cleanly to an empty groups/group-policies collection on load.
+	if st.Groups == nil {
+		st.Groups = map[string]model.Group{}
+	}
+	if st.GroupPolicies == nil {
+		st.GroupPolicies = map[string]model.GroupNetPolicy{}
 	}
 	if st.GeoRouting == nil {
 		st.GeoRouting = map[string]model.GeoRouting{}
@@ -1516,6 +1528,150 @@ func (s *Store) DeleteNetPolicy(nodeID string) error {
 	}
 	delete(s.state.NetPolicies, nodeID)
 	return s.Save()
+}
+
+// UpsertGroup creates or updates a fleet group. The group's own ID is the key;
+// callers mint it as "grp_<id>" (see internal/id). Slices are deep-copied on
+// store so the caller cannot mutate persisted state through a retained header.
+//
+// Phase 1: group CRUD endpoints add slug/name uniqueness, parent-cycle, and
+// nesting-depth validation here (or in a service layer above this method); this
+// Phase-0 store write intentionally persists intent without those checks.
+func (s *Store) UpsertGroup(g model.Group) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g.UpdatedAt = time.Now().UTC()
+	if g.CreatedAt.IsZero() {
+		g.CreatedAt = g.UpdatedAt
+	}
+	s.state.Groups[g.ID] = cloneGroup(g)
+	return s.Save()
+}
+
+// Group returns a group by id (deep-copied).
+func (s *Store) Group(id string) (model.Group, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.state.Groups[id]
+	return cloneGroup(g), ok
+}
+
+// Groups returns all groups sorted by id. Callers that render the tree order by
+// (ParentID, Order); id-sort here only guarantees a deterministic list.
+func (s *Store) Groups() []model.Group {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Group, 0, len(s.state.Groups))
+	for _, g := range s.state.Groups {
+		out = append(out, cloneGroup(g))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// DeleteGroup removes a group. It refuses (returns an error) when the group
+// still has child groups (another group's ParentID points at it) or is the
+// scope of any GroupNetPolicy, so deletion cannot orphan a subtree or silently
+// drop an authored policy. Phase 1 surfaces this as an explicit
+// reparent-to-root flow before delete. A missing id is a no-op (idempotent,
+// matching the other Delete* methods).
+func (s *Store) DeleteGroup(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Groups[id]; !ok {
+		return nil
+	}
+	for _, child := range s.state.Groups {
+		if child.ParentID == id {
+			return fmt.Errorf("group %q has child group %q; reparent or delete children first", id, child.ID)
+		}
+	}
+	for _, gp := range s.state.GroupPolicies {
+		if gp.ScopeGroupID == id {
+			return fmt.Errorf("group %q is referenced by group policy %q; delete the policy first", id, gp.ID)
+		}
+	}
+	delete(s.state.Groups, id)
+	return s.Save()
+}
+
+// UpsertGroupPolicy creates or updates a group-scoped network policy. The
+// policy ID is the key; callers mint it as "gnp_<id>" (see internal/id). Rules
+// (and their Ports) are deep-copied on store.
+func (s *Store) UpsertGroupPolicy(p model.GroupNetPolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p.UpdatedAt = time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	s.state.GroupPolicies[p.ID] = cloneGroupPolicy(p)
+	return s.Save()
+}
+
+// GroupPolicy returns a group policy by id (deep-copied).
+func (s *Store) GroupPolicy(id string) (model.GroupNetPolicy, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.state.GroupPolicies[id]
+	return cloneGroupPolicy(p), ok
+}
+
+// GroupPolicies returns all group policies sorted by id. Expansion (Phase 2)
+// applies the (Priority, id, ruleIndex) precedence; id-sort here only
+// guarantees a deterministic list.
+func (s *Store) GroupPolicies() []model.GroupNetPolicy {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.GroupNetPolicy, 0, len(s.state.GroupPolicies))
+	for _, p := range s.state.GroupPolicies {
+		out = append(out, cloneGroupPolicy(p))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// DeleteGroupPolicy removes a group-scoped network policy. A missing id is a
+// no-op (idempotent, matching the other Delete* methods).
+func (s *Store) DeleteGroupPolicy(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.GroupPolicies[id]; !ok {
+		return nil
+	}
+	delete(s.state.GroupPolicies, id)
+	return s.Save()
+}
+
+// cloneGroup deep-copies a group's mutable slices (Members and the optional
+// Selector with its match sets) so persisted state and returned values never
+// share a backing array with the caller. Nil slices stay nil so JSON omitempty
+// round-trips unchanged.
+func cloneGroup(g model.Group) model.Group {
+	g.Members = append([]string(nil), g.Members...)
+	if g.Selector != nil {
+		sel := *g.Selector
+		sel.MatchTagsAny = append([]string(nil), g.Selector.MatchTagsAny...)
+		sel.MatchRoles = append([]string(nil), g.Selector.MatchRoles...)
+		sel.MatchCountry = append([]string(nil), g.Selector.MatchCountry...)
+		sel.MatchContinent = append([]string(nil), g.Selector.MatchContinent...)
+		g.Selector = &sel
+	}
+	return g
+}
+
+// cloneGroupPolicy deep-copies a group policy's Rules (and each rule's Ports)
+// so persisted state and returned values never share a backing array.
+func cloneGroupPolicy(p model.GroupNetPolicy) model.GroupNetPolicy {
+	if p.Rules != nil {
+		rules := make([]model.GroupNetRule, len(p.Rules))
+		for i, r := range p.Rules {
+			r.Ports = append([]int(nil), r.Ports...)
+			rules[i] = r
+		}
+		p.Rules = rules
+	}
+	return p
 }
 
 // UpsertGeoRouting creates or updates a geo-routing record.

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -31,6 +32,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/cftunnel"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
 	"github.com/LatticeNet/lattice-server/internal/geoip"
+	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/logstore"
 	"github.com/LatticeNet/lattice-server/internal/network"
@@ -151,6 +153,10 @@ type Server struct {
 	// terminalBroker owns short-lived interactive terminal sessions. Sessions are
 	// intentionally in-memory only; a server restart forces operators to reopen.
 	terminalBroker *terminalBroker
+	// terminalHub splices a browser attach WebSocket to the agent-dialed stream
+	// WebSocket for the same session (the streaming transport). It owns no
+	// session metadata; terminalBroker remains authoritative for lifecycle.
+	terminalHub *terminalHub
 	// build is immutable process metadata exposed by /api/version and dashboard
 	// About. It contains no secrets and is intentionally safe for unauthenticated
 	// health/version probes.
@@ -237,6 +243,7 @@ func New(opts Options) (*Server, error) {
 		coreDNSBinary:    coreDNSBinary,
 		geoResolver:      opts.GeoResolver,
 		terminalBroker:   newTerminalBroker(),
+		terminalHub:      newTerminalHub(),
 		build:            normalizeBuildInfo(opts.Build),
 		pluginTrust:      opts.PluginTrust,
 		reminderInterval: opts.RenewalReminderInterval,
@@ -644,6 +651,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netpolicy/plan", s.withAuth("", s.handleNetPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/delete", s.withAuth("", s.handleDeleteNetPolicy))
 	mux.HandleFunc("/api/netpolicy/graph", s.withAuth("", s.handleNetPolicyGraph))
+	mux.HandleFunc("/api/groups", s.withAuth("", s.handleGroups))
+	mux.HandleFunc("/api/groups/delete", s.withAuth("group:admin", s.handleDeleteGroup))
+	mux.HandleFunc("/api/groups/reorder", s.withAuth("group:admin", s.handleReorderGroups))
+	mux.HandleFunc("/api/groups/members", s.withAuth("group:admin", s.handleGroupMembers))
+	mux.HandleFunc("/api/groups/preview", s.withAuth("group:read", s.handleGroupPreview))
+	mux.HandleFunc("/api/groups/seed", s.withAuth("group:admin", s.handleGroupSeed))
+	mux.HandleFunc("/api/group-policies", s.withAuth("", s.handleGroupPolicy))
+	mux.HandleFunc("/api/group-policies/delete", s.withAuth("netpolicy:admin", s.handleDeleteGroupPolicy))
+	mux.HandleFunc("/api/group-policies/plan", s.withAuth("netpolicy:admin", s.handleGroupPolicyPlan))
+	mux.HandleFunc("/api/netpolicy/matrix", s.withAuth("netpolicy:read", s.handleNetPolicyMatrix))
 	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("network:plan", s.handleWireGuardPlan))
 	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
 	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))
@@ -658,6 +675,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
 	mux.HandleFunc("/api/agent/terminal/sessions", s.withAgentLimit(s.handleAgentTerminalSessions))
 	mux.HandleFunc("/api/agent/terminal/sessions/", s.withAgentLimit(s.handleAgentTerminalSessionPath))
+	mux.HandleFunc("/api/agent/terminal/stream", s.withAgentLimit(s.handleAgentTerminalStream))
 	mux.HandleFunc("/api/agent/config", s.withAgentLimit(s.handleAgentConfig))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
@@ -1538,6 +1556,7 @@ type nodeView struct {
 	HostFacts          model.HostFacts        `json:"host_facts"`
 	Geo                *model.NodeGeo         `json:"geo,omitempty"`
 	AgentDebug         model.AgentDebugPolicy `json:"agent_debug"`
+	GroupIDs           []string               `json:"group_ids,omitempty"`
 	CreatedAt          time.Time              `json:"created_at"`
 }
 
@@ -1548,7 +1567,7 @@ func toNodeView(n model.Node) nodeView {
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }
 
@@ -1558,9 +1577,13 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, p principal
 		return
 	}
 	nodes := s.store.Nodes()
+	// Resolve group membership once so each node view carries its group_ids
+	// (server-computed; never client-authored). Groups are display-layer here.
+	resolvedGroups := groups.ResolveAll(s.store.Groups(), nodes)
 	views := make([]nodeView, 0, len(nodes))
 	for _, n := range nodes {
 		if rbac.Allows(p.Principal, "node:read", n.ID) {
+			n.GroupIDs = groups.GroupIDsForNode(n.ID, resolvedGroups)
 			views = append(views, toNodeView(n))
 		}
 	}
@@ -4592,6 +4615,17 @@ func (w *logResponseWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// Hijack forwards to the underlying ResponseWriter so WebSocket upgrades (the
+// terminal stream/attach routes) keep working. Without it this logging wrapper
+// would mask the connection's http.Hijacker and every upgrade would fail.
+func (w *logResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("response does not support hijacking")
+	}
+	return hj.Hijack()
 }
 
 // withRequestLog logs HTTP requests with method, path, status, response size,

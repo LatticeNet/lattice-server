@@ -80,6 +80,20 @@ func (m *Manager) provider(ctx context.Context, issuer string) (*oidc.Provider, 
 	return p, nil
 }
 
+// Probe runs OIDC discovery for the issuer and returns the advertised
+// authorization and token endpoints. It is the read-only "test connection"
+// counterpart to AuthCodeURL: the same discovery path, but no login is started.
+// Latency is bounded by the passed-in ctx (and the manager's timeout-bounded
+// client); a successful probe harmlessly warms the discovery cache.
+func (m *Manager) Probe(ctx context.Context, issuer string) (authEndpoint, tokenEndpoint string, err error) {
+	prov, err := m.provider(ctx, issuer)
+	if err != nil {
+		return "", "", err
+	}
+	ep := prov.Endpoint()
+	return ep.AuthURL, ep.TokenURL, nil
+}
+
 // scopesFor returns the request scopes, always including openid.
 func scopesFor(p model.OIDCProvider) []string {
 	if len(p.Scopes) == 0 {

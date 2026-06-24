@@ -573,6 +573,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth/oidc/callback", s.handleOIDCCallback)
 	mux.HandleFunc("/api/auth/oidc/providers", s.withAuth("oidc:admin", s.handleOIDCProviders))
 	mux.HandleFunc("/api/auth/oidc/providers/delete", s.withAuth("oidc:admin", s.handleDeleteOIDCProvider))
+	mux.HandleFunc("/api/auth/oidc/providers/test", s.withAuth("oidc:admin", s.handleOIDCProviderTest))
 	mux.HandleFunc("/api/logout", s.withAuth("", s.handleLogout))
 	mux.HandleFunc("/api/me", s.withAuth("", s.handleMe))
 	mux.HandleFunc("/api/auth/password", s.withAuth("", s.handlePasswordChange))

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"net/http"
@@ -395,4 +396,53 @@ func (s *Server) handleDeleteOIDCProvider(w http.ResponseWriter, r *http.Request
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.delete", Scope: "oidc:admin", Metadata: map[string]string{"provider": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// handleOIDCProviderTest probes an issuer's OIDC discovery document and reports
+// the resolved authorization/token endpoints — the "test connection" check for
+// the provider form. Non-destructive: it writes no state and is bounded by a
+// short timeout so a slow IdP cannot hang the admin UI. A failed discovery is
+// returned as 200 {ok:false,error} (a probe result, not a server error) so the
+// UI can render the reason inline; the detailed cause is logged server-side.
+func (s *Server) handleOIDCProviderTest(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		Issuer string `json:"issuer"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	issuer := strings.TrimRight(strings.TrimSpace(req.Issuer), "/")
+	if !strings.HasPrefix(issuer, "https://") {
+		writeError(w, http.StatusBadRequest, errors.New("issuer must be an https URL"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+	defer cancel()
+	authEP, tokenEP, err := s.oidc.Probe(ctx, issuer)
+	ok := err == nil
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:       id.New("audit"),
+		Action:   "oidc.provider.test",
+		Scope:    "oidc:admin",
+		Metadata: map[string]string{"issuer": issuer, "ok": map[bool]string{true: "true", false: "false"}[ok]},
+	})
+	if err != nil {
+		s.logger.Printf("oidc provider test (%s): %v", issuer, err)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":     false,
+			"issuer": issuer,
+			"error":  "discovery failed: provider unreachable or discovery document malformed",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                     true,
+		"issuer":                 issuer,
+		"authorization_endpoint": authEP,
+		"token_endpoint":         tokenEP,
+	})
 }

@@ -38,3 +38,71 @@ func scopeAllowed(scopes []string, required string) bool {
 	}
 	return false
 }
+
+// KnownScopes is the catalog of grantable RBAC scope strings. It is the
+// authoritative allowlist the user-management API validates assignments against
+// so an operator cannot be saddled with a typo'd or made-up scope that silently
+// grants nothing (or, worse, a future-meaningful string). Keep it in sync with
+// the scopes actually checked by withAuth(...)/requireScope across the server.
+var KnownScopes = map[string]struct{}{
+	"audit:read":      {},
+	"ddns:admin":      {},
+	"dns:admin":       {},
+	"geo:admin":       {},
+	"geo:read":        {},
+	"group:admin":     {},
+	"group:read":      {},
+	"inventory:admin": {},
+	"inventory:read":  {},
+	"kv:admin":        {},
+	"kv:read":         {},
+	"kv:write":        {},
+	"log:admin":       {},
+	"log:read":        {},
+	"log:write":       {},
+	"monitor:admin":   {},
+	"monitor:read":    {},
+	"netpolicy:admin": {},
+	"netpolicy:read":  {},
+	"network:apply":   {},
+	"network:plan":    {},
+	"node:admin":      {},
+	"node:read":       {},
+	"notify:send":     {},
+	"oidc:admin":      {},
+	"plugin:admin":    {},
+	"plugin:verify":   {},
+	"proxy:admin":     {},
+	"proxy:read":      {},
+	"static:admin":    {},
+	"static:read":     {},
+	"static:write":    {},
+	"task:read":       {},
+	"task:run":        {},
+	"terminal:open":   {},
+	"token:admin":     {},
+	"tunnel:admin":    {},
+	"user:admin":      {},
+	"worker:deploy":   {},
+}
+
+// ValidScope reports whether s is a grantable scope: the global superuser "*", a
+// known catalog member, or a domain wildcard ("node:*") whose prefix matches a
+// known scope's domain.
+func ValidScope(s string) bool {
+	if s == "*" {
+		return true
+	}
+	if _, ok := KnownScopes[s]; ok {
+		return true
+	}
+	if strings.HasSuffix(s, ":*") {
+		prefix := strings.TrimSuffix(s, "*")
+		for k := range KnownScopes {
+			if strings.HasPrefix(k, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}

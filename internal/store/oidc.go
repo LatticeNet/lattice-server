@@ -86,6 +86,26 @@ func (s *Store) PutOIDCIdentity(idn model.OIDCIdentity) error {
 	return s.Save()
 }
 
+// DeleteOIDCIdentitiesByUser removes every durable subject→user link bound to
+// userID. The map is keyed by provider+subject (not user id), so it is scanned.
+// Used when deleting a user so a stale link can never re-resolve to a removed
+// account. Returns the count removed.
+func (s *Store) DeleteOIDCIdentitiesByUser(userID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k, idn := range s.state.OIDCIdentities {
+		if idn.UserID == userID {
+			delete(s.state.OIDCIdentities, k)
+			n++
+		}
+	}
+	if n > 0 {
+		_ = s.Save()
+	}
+	return n
+}
+
 // --- ephemeral auth states (single-use) ----------------------------------
 
 func (s *Store) PutOIDCAuthState(st auth.OIDCAuthState) error {

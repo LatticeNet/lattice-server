@@ -421,6 +421,92 @@ func (s *Store) Tokens() []model.Token {
 	return out
 }
 
+// Users returns all operator user records (for the user-management admin API).
+// Callers must project to a secret-free view before serializing.
+func (s *Store) Users() []model.User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.User, 0, len(s.state.Users))
+	for _, u := range s.state.Users {
+		out = append(out, u)
+	}
+	return out
+}
+
+// DeleteUser removes a user by id. Returns false if no such user existed.
+func (s *Store) DeleteUser(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Users[id]; !ok {
+		return false
+	}
+	delete(s.state.Users, id)
+	_ = s.Save()
+	return true
+}
+
+// CountWildcardAdmins counts users holding the global "*" scope, excluding the
+// given user id. It is the last-admin guard for the user-management API: a
+// delete or de-admin that would drop this to zero must be refused.
+func (s *Store) CountWildcardAdmins(excludeID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, u := range s.state.Users {
+		if id == excludeID {
+			continue
+		}
+		for _, sc := range u.Scopes {
+			if sc == "*" {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+// RevokeTokensByActor marks every non-revoked API token owned by actorID as
+// revoked. Used when deleting a user: bearer tokens are validated by hash +
+// RevokedAt and ignore the user's SecurityEpoch, so they must be revoked
+// explicitly or they outlive the account. Returns the count revoked.
+func (s *Store) RevokeTokensByActor(actorID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	n := 0
+	for id, t := range s.state.Tokens {
+		if t.ActorID == actorID && t.RevokedAt.IsZero() {
+			t.RevokedAt = now
+			s.state.Tokens[id] = t
+			n++
+		}
+	}
+	if n > 0 {
+		_ = s.Save()
+	}
+	return n
+}
+
+// DeleteSessionsByActor drops all live cookie sessions for actorID. Used on user
+// delete so sessions are killed immediately rather than only failing closed on
+// their next lookup. Returns the count removed.
+func (s *Store) DeleteSessionsByActor(actorID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, sess := range s.state.Sessions {
+		if sess.ActorID == actorID {
+			delete(s.state.Sessions, id)
+			n++
+		}
+	}
+	if n > 0 {
+		_ = s.Save()
+	}
+	return n
+}
+
 func (s *Store) UpsertNode(n model.Node) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -12,6 +12,7 @@ package websocketx
 import (
 	"io"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -24,8 +25,9 @@ var _ io.ReadWriteCloser = (*Conn)(nil)
 // data and control writers never race.
 type Conn struct {
 	*websocket.Conn
-	writeMu sync.Mutex
-	readBuf []byte
+	writeMu   sync.Mutex
+	readBuf   []byte
+	writeWait time.Duration
 }
 
 // NewConn wraps conn. The returned Conn owns all writes to conn; callers must
@@ -35,11 +37,33 @@ func NewConn(conn *websocket.Conn) *Conn {
 	return &Conn{Conn: conn}
 }
 
+// SetWriteWait bounds every subsequent write with a per-write deadline. A write
+// that cannot complete within d (e.g. a stalled peer or a half-open connection
+// through a proxy) fails fast instead of blocking the byte pump indefinitely,
+// which is what lets a wedged terminal leg tear down promptly rather than
+// pinning the PTY drain. d<=0 disables the deadline. The deadline is set under
+// the same mutex as the write itself, so it is always paired with its write and
+// never races a concurrent writer.
+func (c *Conn) SetWriteWait(d time.Duration) {
+	c.writeMu.Lock()
+	c.writeWait = d
+	c.writeMu.Unlock()
+}
+
+// armWriteDeadlineLocked applies the configured per-write deadline. Caller holds
+// writeMu.
+func (c *Conn) armWriteDeadlineLocked() {
+	if c.writeWait > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.writeWait))
+	}
+}
+
 // Write sends data as a single binary WebSocket frame. Safe to call
 // concurrently with WriteMessage; both serialize on the same mutex.
 func (c *Conn) Write(data []byte) (int, error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.armWriteDeadlineLocked()
 	if err := c.Conn.WriteMessage(websocket.BinaryMessage, data); err != nil {
 		return 0, err
 	}
@@ -53,6 +77,7 @@ func (c *Conn) Write(data []byte) (int, error) {
 func (c *Conn) WriteMessage(messageType int, data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	c.armWriteDeadlineLocked()
 	return c.Conn.WriteMessage(messageType, data)
 }
 

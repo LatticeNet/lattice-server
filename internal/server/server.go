@@ -263,6 +263,7 @@ func New(opts Options) (*Server, error) {
 	if !opts.DisableRenewalScheduler {
 		s.startRenewalScheduler()
 	}
+	s.startTerminalReaper()
 	return s, nil
 }
 
@@ -588,6 +589,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
+	mux.HandleFunc("/api/nodes/terminal-transport", s.withAuth("", s.handleNodeTerminalTransport))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/terminal/sessions", s.withAuth("", s.handleTerminalSessions))

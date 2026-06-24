@@ -31,6 +31,15 @@ const (
 	terminalCloseTryAgain = 1013
 	// terminalStreamBufferBytes sizes the upgrader's read/write buffers.
 	terminalStreamBufferBytes = 32 * 1024
+
+	// Keepalive + write-deadline tunables for the spliced bridge legs. The server
+	// pings both peers so a half-open connection (browser tab frozen, agent host
+	// off the network, a proxy that dropped the flow) is detected within pongWait
+	// instead of wedging the byte pump. writeWait bounds a single frame write so a
+	// stalled peer errors the leg rather than blocking the opposite leg's drain.
+	terminalStreamPingInterval = 10 * time.Second
+	terminalStreamPongWait     = 30 * time.Second
+	terminalStreamWriteWait    = 10 * time.Second
 )
 
 // terminalUpgrader upgrades terminal HTTP requests to WebSocket. CheckOrigin
@@ -107,11 +116,14 @@ func (p *pendingBridge) close() {
 }
 
 // attachBrowser registers the browser connection for sessionID and waits for the
-// agent to dial in. On agent arrival it splices the two connections (blocking
-// until the bridge tears down). On timeout it closes the browser with a
-// try-again close so the UI can report the node as unreachable. The caller owns
-// the browser connection's lifecycle bookkeeping (audit, markClosed).
-func (h *terminalHub) attachBrowser(sessionID string, c *websocketx.Conn) {
+// agent to dial in. On agent arrival it invokes onBridge (used by the caller to
+// clear the session's detached state under the broker lock) and splices the two
+// connections, blocking until the bridge tears down; it then returns true. On
+// timeout it closes the browser with a try-again close so the UI can report the
+// node as unreachable, and returns false. The bridged return value lets the
+// caller distinguish "the user's viewer left a live session" (start the detach
+// window) from "no agent ever connected" (leave lifecycle to the TTL reaper).
+func (h *terminalHub) attachBrowser(sessionID string, c *websocketx.Conn, onBridge func()) bool {
 	bridge := &pendingBridge{
 		sessionID: sessionID,
 		browser:   c,
@@ -139,7 +151,11 @@ func (h *terminalHub) attachBrowser(sessionID string, c *websocketx.Conn) {
 	defer timer.Stop()
 	select {
 	case agent := <-bridge.agentCh:
+		if onBridge != nil {
+			onBridge()
+		}
 		h.bridge(c, agent)
+		return true
 	case <-timer.C:
 		_ = c.WriteControl(
 			websocket.CloseMessage,
@@ -147,6 +163,7 @@ func (h *terminalHub) attachBrowser(sessionID string, c *websocketx.Conn) {
 			time.Now().Add(time.Second),
 		)
 		_ = c.Close()
+		return false
 	}
 }
 
@@ -184,13 +201,50 @@ func (h *terminalHub) bridgeAgent(sessionID string, c *websocketx.Conn) {
 // bridge splices two terminal connections with a pair of byte pumps. The first
 // side to error or hit EOF tears both down. errc is buffered (cap 2) so the
 // second goroutine never blocks on send after we have already returned.
+//
+// Both legs get a per-write deadline (a stalled peer errors its write instead of
+// pinning the opposite leg's drain) and a ping/pong keepalive (a half-open
+// connection is detected within pongWait and torn down, rather than appearing
+// alive forever). When the browser leg ends, the agent leg is closed too, which
+// surfaces to the agent as a WS error — the agent keeps its PTY alive and
+// redials, so this teardown is a detach, not a kill.
 func (h *terminalHub) bridge(b, a *websocketx.Conn) {
 	defer b.Close()
 	defer a.Close()
+	b.SetWriteWait(terminalStreamWriteWait)
+	a.SetWriteWait(terminalStreamWriteWait)
+	stop := make(chan struct{})
+	defer close(stop)
+	go keepAliveLeg(b, stop)
+	go keepAliveLeg(a, stop)
 	errc := make(chan error, 2)
 	go func() { _, err := io.Copy(a, b); errc <- err }()
 	go func() { _, err := io.Copy(b, a); errc <- err }()
 	<-errc
+}
+
+// keepAliveLeg pings c every pingInterval and arms a read deadline that the pong
+// handler resets, so a peer that stops responding is detected within pongWait
+// and its next Read errors (tearing the bridge down). Data frames do not reset
+// the deadline; the steady stream of pongs does, so an idle-but-alive leg stays
+// open while a dead leg is reaped. Stops when the bridge signals via stop.
+func keepAliveLeg(c *websocketx.Conn, stop <-chan struct{}) {
+	_ = c.SetReadDeadline(time.Now().Add(terminalStreamPongWait))
+	c.SetPongHandler(func(string) error {
+		return c.SetReadDeadline(time.Now().Add(terminalStreamPongWait))
+	})
+	ticker := time.NewTicker(terminalStreamPingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if err := c.WriteControl(websocket.PingMessage, nil, time.Now().Add(terminalStreamWriteWait)); err != nil {
+				return
+			}
+		}
+	}
 }
 
 // handleAgentTerminalStream upgrades an agent's outbound WebSocket dial and hands

@@ -99,7 +99,75 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 			MaxLineBytes:  defaultAgentDebugMaxLineBytes,
 			MaxBatchLines: defaultAgentDebugMaxBatchLines,
 		},
+		TerminalTransport: normalizeNodeTerminalTransport(node.TerminalTransport),
 	})
+}
+
+// normalizeNodeTerminalTransport clamps a stored per-node transport to the wire
+// vocabulary the agent understands. An unrecognized or empty value yields ""
+// (no override), so the agent keeps its startup transport.
+func normalizeNodeTerminalTransport(transport string) string {
+	switch strings.ToLower(strings.TrimSpace(transport)) {
+	case "stream":
+		return "stream"
+	case "poll":
+		return "poll"
+	default:
+		return ""
+	}
+}
+
+// handleNodeTerminalTransport sets (or clears) a node's terminal transport
+// override — the per-node rollout lever for promoting the streaming terminal.
+// An empty transport clears the override so the node falls back to its agent's
+// startup default. Mirrors handleNodeDebugPolicy's node:admin gating and audit.
+func (s *Server) handleNodeTerminalTransport(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID    string `json:"node_id"`
+		Transport string `json:"transport"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	transport := strings.ToLower(strings.TrimSpace(req.Transport))
+	switch transport {
+	case "", "poll", "stream":
+	default:
+		writeError(w, http.StatusBadRequest, errors.New(`transport must be "poll", "stream", or "" to clear`))
+		return
+	}
+	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
+		return
+	}
+	node, ok := s.store.Node(req.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	node.TerminalTransport = transport
+	if err := s.store.UpsertNode(node); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:     id.New("audit"),
+		NodeID: node.ID,
+		Action: "node.terminal.transport",
+		Scope:  "node:admin",
+		Metadata: map[string]string{
+			"transport": transport,
+		},
+	})
+	writeJSON(w, http.StatusOK, toNodeView(node))
 }
 
 func (s *Server) handleAgentDebugEvents(w http.ResponseWriter, r *http.Request) {

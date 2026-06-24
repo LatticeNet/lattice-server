@@ -176,3 +176,70 @@ func TestTerminalBrokerLimitsAndPrunesSessions(t *testing.T) {
 		t.Fatalf("create after prune failed: %v", err)
 	}
 }
+
+// TestTerminalBrokerDetachGraceReaped covers the streaming detach window: when a
+// live bridge ends with the session still open (the viewer dropped), the session
+// is kept alive for the detach grace so a reattach can resume the PTY, then
+// reaped if no reattach arrives.
+func TestTerminalBrokerDetachGraceReaped(t *testing.T) {
+	broker := newTerminalBroker()
+	t0 := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	sess, err := broker.create("node-a", "admin", "", "sh", 0, 0, t0)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	broker.markOpen(sess.ID, t0)        // agent dialed in
+	broker.clearDetached(sess.ID, t0)   // browser bridged
+	if st := broker.sessions[sess.ID]; !st.bridged || !st.detachedAt.IsZero() {
+		t.Fatalf("after clearDetached: bridged=%v detachedAt=%v", st.bridged, st.detachedAt)
+	}
+
+	dropAt := t0.Add(time.Minute)
+	broker.markDetached(sess.ID, dropAt) // browser WebSocket dropped
+	if st := broker.sessions[sess.ID]; st.bridged || st.detachedAt.IsZero() {
+		t.Fatalf("after markDetached: bridged=%v detachedAt=%v", st.bridged, st.detachedAt)
+	}
+
+	// Within the grace window the kept-alive session must survive for a reattach.
+	withinGrace := dropAt.Add(terminalDetachGrace / 2)
+	broker.reap(withinGrace)
+	if s, _ := broker.get(sess.ID, withinGrace); s.Status != model.TerminalOpen {
+		t.Fatalf("within detach grace should stay open, got %s", s.Status)
+	}
+
+	// Past the grace window with no reattach, the reaper closes it.
+	pastGrace := dropAt.Add(terminalDetachGrace + 2*time.Second)
+	broker.reap(pastGrace)
+	if s, _ := broker.get(sess.ID, pastGrace); s.Status != model.TerminalFailed {
+		t.Fatalf("past detach grace should fail the session, got %s", s.Status)
+	}
+}
+
+// TestTerminalBrokerBridgedExemptFromIdle covers the liveness fix: a session with
+// a live bridge carries its bytes over the WebSocket relay (which never touches
+// the broker), so it must be exempt from the idle TTL — only the absolute
+// max-life cap may close it.
+func TestTerminalBrokerBridgedExemptFromIdle(t *testing.T) {
+	broker := newTerminalBroker()
+	t0 := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	sess, err := broker.create("node-a", "admin", "", "sh", 0, 0, t0)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	broker.markOpen(sess.ID, t0)
+	broker.clearDetached(sess.ID, t0) // live bridge, viewer present
+
+	// Far past the idle TTL: a bridged session must NOT be idle-reaped.
+	late := t0.Add(terminalIdleTTL + time.Hour)
+	broker.reap(late)
+	if s, _ := broker.get(sess.ID, late); s.Status != model.TerminalOpen {
+		t.Fatalf("bridged session must be exempt from idle TTL, got %s", s.Status)
+	}
+
+	// The absolute max-life cap still applies even to a bridged session.
+	beyond := t0.Add(terminalMaxLifeTTL + time.Minute)
+	broker.reap(beyond)
+	if s, _ := broker.get(sess.ID, beyond); s.Status != model.TerminalFailed {
+		t.Fatalf("max-life cap should fail even a bridged session, got %s", s.Status)
+	}
+}

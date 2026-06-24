@@ -9,6 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
@@ -29,8 +31,27 @@ const (
 
 	terminalMaxActiveSessionsPerNode = 4
 	terminalPendingTTL               = 10 * time.Minute
-	terminalIdleTTL                  = 4 * time.Hour
-	terminalClosedTTL                = 30 * time.Minute
+	// terminalIdleTTL bounds an open session that is NOT currently bridged (no
+	// live viewer↔agent splice). A bridged session is exempt: its bytes flow over
+	// the WebSocket relay and never touch the broker, so LastSeen cannot track its
+	// liveness — the agent enforces real idle (no PTY output AND no stdin) itself
+	// and closes the session explicitly. This is therefore a backstop for the
+	// not-currently-bridged case (e.g. a stuck pending→open with no viewer).
+	terminalIdleTTL = 30 * time.Minute
+	// terminalDetachGrace bounds how long a session whose viewer disconnected is
+	// kept alive awaiting a reattach. Within this window a brief network blip,
+	// page reload, or laptop-sleep is forgiven and the kept-alive PTY is rejoined;
+	// past it the session is reaped (the node is presumed unreachable / abandoned).
+	terminalDetachGrace = 45 * time.Second
+	// terminalMaxLifeTTL is an absolute cap from OpenedAt regardless of activity —
+	// defense in depth so a forgotten-but-busy session cannot live forever.
+	terminalMaxLifeTTL = 8 * time.Hour
+	// terminalClosedTTL retains a closed session so the UI can render its final
+	// status before it is garbage-collected.
+	terminalClosedTTL = 30 * time.Minute
+	// terminalReaperTick is the background reaper cadence; it sets the granularity
+	// at which the detach grace and idle/max caps are enforced.
+	terminalReaperTick = 5 * time.Second
 )
 
 type terminalBroker struct {
@@ -44,10 +65,33 @@ type terminalSessionState struct {
 	nextInputSeq int64
 	events       []model.TerminalEvent
 	inputs       []model.TerminalInput
+	// bridged is true while a live browser↔agent splice exists for this session
+	// (streaming transport). A bridged session is exempt from the idle/detach
+	// reaper: its liveness is owned by the agent, which sees every byte and
+	// enforces the real idle cap itself.
+	bridged bool
+	// detachedAt is set when a live bridge ends with the session still open (the
+	// viewer left or the link blipped) and cleared when a new bridge forms. The
+	// detach grace is measured from it. Zero when bridged or never-bridged.
+	detachedAt time.Time
 }
 
 func newTerminalBroker() *terminalBroker {
 	return &terminalBroker{sessions: map[string]*terminalSessionState{}}
+}
+
+// startTerminalReaper runs the terminal lifecycle GC on a fixed cadence so the
+// detach grace and idle/max caps are enforced even for a stable streaming
+// session that otherwise never re-touches the broker. Mirrors the renewal
+// scheduler: a single goroutine for the process lifetime.
+func (s *Server) startTerminalReaper() {
+	go func() {
+		ticker := time.NewTicker(terminalReaperTick)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.terminalBroker.reap(s.now())
+		}
+	}()
 }
 
 func (b *terminalBroker) create(nodeID, actorID, tokenID, shell string, cols, rows int, now time.Time) (model.TerminalSession, error) {
@@ -306,7 +350,56 @@ func (b *terminalBroker) markClosed(sessionID, status, errMsg string, now time.T
 			state.session.ClosedAt = now
 		}
 	}
+	state.bridged = false
+	state.detachedAt = time.Time{}
 	state.session.LastSeen = now
+}
+
+// clearDetached marks a session as live-bridged: a browser↔agent splice has just
+// formed. It cancels any pending detach grace and refreshes LastSeen. Called
+// (under no other lock) by the attach handler the instant the agent leg arrives,
+// so a reattach within the grace window seamlessly resumes the kept-alive PTY.
+func (b *terminalBroker) clearDetached(sessionID string, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	state, ok := b.sessions[sessionID]
+	if !ok {
+		return
+	}
+	state.bridged = true
+	state.detachedAt = time.Time{}
+	state.session.LastSeen = now.UTC()
+}
+
+// markDetached records that a live bridge ended with the session still open (the
+// viewer's WebSocket dropped — a tab close, reload, or network blip). It does
+// NOT close the session: the PTY is kept alive on the agent, and the detach
+// grace (enforced by the reaper) governs how long we wait for a reattach. An
+// already-closed session is left closed.
+func (b *terminalBroker) markDetached(sessionID string, now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now = now.UTC()
+	state, ok := b.sessions[sessionID]
+	if !ok {
+		return
+	}
+	state.bridged = false
+	if terminalActiveStatus(state.session.Status) && state.detachedAt.IsZero() {
+		state.detachedAt = now
+	}
+	state.session.LastSeen = now
+}
+
+// reap runs the lifecycle GC out of band. The lazy prune on every broker access
+// is retained, but a stable streaming session touches the broker only on (re)dial
+// and explicit close, so without a periodic sweep a detached/idle/over-age
+// session could linger until the next unrelated access. The reaper bounds that
+// to terminalReaperTick.
+func (b *terminalBroker) reap(now time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pruneLocked(now.UTC())
 }
 
 func (b *terminalBroker) pruneLocked(now time.Time) {
@@ -314,15 +407,16 @@ func (b *terminalBroker) pruneLocked(now time.Time) {
 		session := &state.session
 		switch {
 		case session.Status == model.TerminalPending && now.Sub(session.CreatedAt) > terminalPendingTTL:
-			session.Status = model.TerminalFailed
-			session.Error = "terminal session expired before node accepted it"
-			session.ClosedAt = now
-			session.LastSeen = now
-		case terminalActiveStatus(session.Status) && !session.LastSeen.IsZero() && now.Sub(session.LastSeen) > terminalIdleTTL:
-			session.Status = model.TerminalFailed
-			session.Error = "terminal session expired after inactivity"
-			session.ClosedAt = now
-			session.LastSeen = now
+			failTerminalSession(state, "terminal session expired before node accepted it", now)
+		case terminalActiveStatus(session.Status):
+			switch {
+			case !session.OpenedAt.IsZero() && now.Sub(session.OpenedAt) > terminalMaxLifeTTL:
+				failTerminalSession(state, "terminal session reached maximum duration", now)
+			case !state.bridged && !state.detachedAt.IsZero() && now.Sub(state.detachedAt) > terminalDetachGrace:
+				failTerminalSession(state, "terminal viewer disconnected and did not return", now)
+			case !state.bridged && !session.LastSeen.IsZero() && now.Sub(session.LastSeen) > terminalIdleTTL:
+				failTerminalSession(state, "terminal session expired after inactivity", now)
+			}
 		}
 		if terminalClosedStatus(session.Status) && now.Sub(terminalClosedAt(*session)) >= terminalClosedTTL {
 			delete(b.sessions, sessionID)
@@ -330,6 +424,20 @@ func (b *terminalBroker) pruneLocked(now time.Time) {
 	}
 	for len(b.sessions) > terminalMaxSessions && b.dropOldestClosedLocked() {
 	}
+}
+
+// failTerminalSession transitions a state to failed with a reason, recording the
+// close time once. It also clears the bridge/detach bookkeeping so the closed
+// session is inert.
+func failTerminalSession(state *terminalSessionState, reason string, now time.Time) {
+	state.session.Status = model.TerminalFailed
+	state.session.Error = reason
+	if state.session.ClosedAt.IsZero() {
+		state.session.ClosedAt = now
+	}
+	state.session.LastSeen = now
+	state.bridged = false
+	state.detachedAt = time.Time{}
 }
 
 func (b *terminalBroker) dropOldestClosedLocked() bool {
@@ -570,6 +678,20 @@ func (s *Server) handleTerminalSessionPath(w http.ResponseWriter, r *http.Reques
 			// Upgrade has already written an error response to the client.
 			return
 		}
+		// If the session already ended (shell exited, reaped, or closed), tell the
+		// browser cleanly with a normal close so it stops reconnecting instead of
+		// waiting out the agent-dial timeout. A WebSocket handshake failure can't
+		// convey this — the browser only sees an abnormal 1006 — so we must upgrade
+		// first and then send the 1000 close frame.
+		if cur, ok := s.terminalBroker.get(session.ID, s.now()); ok && terminalClosedStatus(cur.Status) {
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, "terminal session closed"),
+				time.Now().Add(time.Second),
+			)
+			_ = conn.Close()
+			return
+		}
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:     id.New("audit"),
 			NodeID: session.NodeID,
@@ -580,9 +702,21 @@ func (s *Server) handleTerminalSessionPath(w http.ResponseWriter, r *http.Reques
 			},
 		})
 		// attachBrowser blocks until the agent bridges and the byte pump tears
-		// down (or the attach times out); the session is then marked closed.
-		s.terminalHub.attachBrowser(session.ID, websocketx.NewConn(conn))
-		s.terminalBroker.markClosed(session.ID, model.TerminalClosed, "", s.now())
+		// down (or the attach times out). When a live bridge forms, onBridge
+		// clears any detach grace (a reattach within the window resumes the
+		// kept-alive PTY). When the bridge ends with the session still open we do
+		// NOT close it: the viewer's socket merely dropped (tab close, reload,
+		// network blip). markDetached starts the detach grace; the agent keeps the
+		// shell alive and redials, and the reaper closes the session only if no
+		// reattach arrives in time or the agent reports the shell exited. If no
+		// agent ever connected (bridged == false), the session was never live, so
+		// its lifecycle is left to the pending/idle reaper.
+		bridged := s.terminalHub.attachBrowser(session.ID, websocketx.NewConn(conn), func() {
+			s.terminalBroker.clearDetached(session.ID, s.now())
+		})
+		if bridged {
+			s.terminalBroker.markDetached(session.ID, s.now())
+		}
 	default:
 		writeError(w, http.StatusNotFound, errors.New("terminal endpoint not found"))
 	}

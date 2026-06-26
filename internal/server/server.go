@@ -2009,7 +2009,7 @@ type auditQueryResponse struct {
 
 func auditQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset"} {
+	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset", "q", "at_from", "at_to"} {
 		if _, ok := q[key]; ok {
 			return true
 		}
@@ -2027,9 +2027,27 @@ func queryAuditEvents(r *http.Request, events []model.AuditEvent) (auditQueryRes
 	if err != nil {
 		return auditQueryResponse{}, err
 	}
+	atFrom, err := parseAuditTime(q.Get("at_from"), "at_from")
+	if err != nil {
+		return auditQueryResponse{}, err
+	}
+	atTo, err := parseAuditTime(q.Get("at_to"), "at_to")
+	if err != nil {
+		return auditQueryResponse{}, err
+	}
+	text := strings.ToLower(strings.TrimSpace(q.Get("q")))
 	filtered := make([]model.AuditEvent, 0, len(events))
 	for _, ev := range events {
 		if !auditEventMatches(ev, q.Get("action"), q.Get("decision"), q.Get("node_id"), q.Get("actor_id"), q.Get("token_id"), q.Get("scope"), q.Get("correlation_id")) {
+			continue
+		}
+		if !atFrom.IsZero() && ev.At.Before(atFrom) {
+			continue
+		}
+		if !atTo.IsZero() && ev.At.After(atTo) {
+			continue
+		}
+		if text != "" && !auditTextMatch(ev, text) {
 			continue
 		}
 		filtered = append(filtered, ev)
@@ -2075,7 +2093,43 @@ func auditEventMatches(ev model.AuditEvent, action, decision, nodeID, actorID, t
 
 func auditFieldMatches(value, want string) bool {
 	want = strings.TrimSpace(want)
-	return want == "" || value == want
+	if want == "" {
+		return true
+	}
+	// A trailing "*" enables namespace/prefix matching, e.g. action=task.* — so a
+	// geek can explore by namespace instead of guessing exact action strings.
+	if strings.HasSuffix(want, "*") {
+		return strings.HasPrefix(value, strings.TrimSuffix(want, "*"))
+	}
+	return value == want
+}
+
+func parseAuditTime(raw, name string) (time.Time, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%s must be an RFC3339 timestamp", name)
+	}
+	return t, nil
+}
+
+// auditTextMatch is the free-text "q" search: a case-insensitive substring scan
+// across every human-meaningful field, including reason and metadata values.
+func auditTextMatch(ev model.AuditEvent, lowerQ string) bool {
+	for _, f := range []string{ev.Action, ev.Decision, ev.NodeID, ev.ActorID, ev.TokenID, ev.Scope, ev.CorrelationID, ev.Reason} {
+		if strings.Contains(strings.ToLower(f), lowerQ) {
+			return true
+		}
+	}
+	for k, v := range ev.Metadata {
+		if strings.Contains(strings.ToLower(k), lowerQ) || strings.Contains(strings.ToLower(v), lowerQ) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleAuditVerify validates the tamper-evident audit WAL chain and reports the

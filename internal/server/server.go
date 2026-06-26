@@ -3025,21 +3025,44 @@ func (s *Server) handleRunDDNS(w http.ResponseWriter, r *http.Request, p princip
 	writeJSON(w, http.StatusOK, toDDNSView(updated))
 }
 
-// resolvePublicIPs picks the public IPs to record for an agent request. Values
-// the agent reports win; otherwise the observed source address fills the
-// matching family, giving zero-config DDNS for dial-out agents.
-func (s *Server) resolvePublicIPs(r *http.Request, reportedV4, reportedV6 string) (v4, v6 string) {
-	v4, v6 = reportedV4, reportedV6
-	if ip := net.ParseIP(s.clientIP(r)); ip != nil {
-		if ip.To4() != nil {
-			if v4 == "" {
-				v4 = ip.String()
-			}
-		} else if v6 == "" {
-			v6 = ip.String()
+// resolvePublicIPs picks the public IPs to record for an agent request, per
+// family. Precedence: (1) the agent-reported value (the authoritative source —
+// agent-side discovery, validated upstream by validateAgentNetworkMetadata);
+// (2) the observed connection source address, but ONLY if it is itself a
+// routable public address; (3) the last-known stored value, again only if it is
+// still routable. A non-routable observation (e.g. a reverse-proxy / Docker
+// bridge gateway such as 172.18.0.1 when the server runs containerized behind
+// nginx) is rejected and never persisted, so a proxied deployment cannot poison
+// the node's public IP, the Fleet Map, or DDNS. The stored-value re-validation
+// is self-healing: a previously-poisoned bridge IP is dropped to "" on the next
+// report rather than preserved forever.
+func (s *Server) resolvePublicIPs(r *http.Request, reportedV4, reportedV6, currentV4, currentV6 string) (v4, v6 string) {
+	observed := net.ParseIP(s.clientIP(r))
+	return s.pickPublicIP(observed, reportedV4, currentV4, true),
+		s.pickPublicIP(observed, reportedV6, currentV6, false)
+}
+
+func (s *Server) pickPublicIP(observed net.IP, reported, current string, wantV4 bool) string {
+	if reported = strings.TrimSpace(reported); reported != "" {
+		// Already validated upstream for this family; trust the agent.
+		return reported
+	}
+	if observed != nil && (observed.To4() != nil) == wantV4 {
+		cand := observed.String()
+		if err := validateReportedPublicIP(cand, wantV4, "observed source"); err == nil {
+			return cand
+		} else if s.logger != nil {
+			s.logger.Printf("resolvePublicIPs: ignoring non-routable observed source %s (%v)", cand, err)
 		}
 	}
-	return v4, v6
+	// Preserve last-known only if it is still a routable public address; this
+	// drops a value poisoned by an earlier unvalidated observation.
+	if current = strings.TrimSpace(current); current != "" {
+		if validateReportedPublicIP(current, wantV4, "stored public ip") == nil {
+			return current
+		}
+	}
+	return ""
 }
 
 // maybeTriggerDDNS runs every profile bound to a node when its public IP changed.
@@ -4078,7 +4101,7 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	oldV4, oldV6 := n.PublicIP, n.PublicIPv6
-	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6)
+	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6, n.PublicIP, n.PublicIPv6)
 	n.AgentVersion = req.Version
 	n.PublicIP = v4
 	n.PublicIPv6 = v6
@@ -4122,7 +4145,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6)
+	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6, old.PublicIP, old.PublicIPv6)
 	hostFacts, _ := normalizeHostFacts(req.HostFacts, s.now())
 	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, req.WireGuardIP, hostFacts); err != nil {
 		writeError(w, http.StatusInternalServerError, err)

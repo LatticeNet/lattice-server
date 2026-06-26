@@ -1554,6 +1554,8 @@ type nodeView struct {
 	WireGuardPort      int                    `json:"wireguard_port,omitempty"`
 	PublicIP           string                 `json:"public_ip"`
 	PublicIPv6         string                 `json:"public_ipv6,omitempty"`
+	InternalIP         string                 `json:"internal_ip,omitempty"`
+	InternalIPv6       string                 `json:"internal_ipv6,omitempty"`
 	AgentVersion       string                 `json:"agent_version"`
 	Online             bool                   `json:"online"`
 	Disabled           bool                   `json:"disabled,omitempty"`
@@ -1571,7 +1573,7 @@ func toNodeView(n model.Node) nodeView {
 		ID: n.ID, Name: n.Name, Tags: n.Tags, Role: n.Role,
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
-		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, AgentVersion: n.AgentVersion,
+		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
 		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
@@ -4152,6 +4154,12 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	n.AgentVersion = req.Version
 	n.PublicIP = v4
 	n.PublicIPv6 = v6
+	if ip := strings.TrimSpace(req.InternalIP); ip != "" && net.ParseIP(ip) != nil {
+		n.InternalIP = ip
+	}
+	if ip := strings.TrimSpace(req.InternalIPv6); ip != "" && net.ParseIP(ip) != nil {
+		n.InternalIPv6 = ip
+	}
 	n.WireGuardIP = req.WireGuardIP
 	if req.WGPublicKey != "" {
 		n.WireGuardPublicKey = req.WGPublicKey
@@ -4193,8 +4201,15 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	v4, v6 := s.resolvePublicIPs(r, req.PublicIP, req.PublicIPv6, old.PublicIP, old.PublicIPv6)
+	inV4, inV6 := "", ""
+	if ip := strings.TrimSpace(req.InternalIP); net.ParseIP(ip) != nil {
+		inV4 = ip
+	}
+	if ip := strings.TrimSpace(req.InternalIPv6); net.ParseIP(ip) != nil {
+		inV6 = ip
+	}
 	hostFacts, _ := normalizeHostFacts(req.HostFacts, s.now())
-	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, req.WireGuardIP, hostFacts); err != nil {
+	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, inV4, inV6, req.WireGuardIP, hostFacts); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -4456,11 +4471,13 @@ func (s *Server) validateTaskResultOutput(result model.TaskResult) error {
 }
 
 type agentAuthRequest struct {
-	NodeID      string          `json:"node_id"`
-	Version     string          `json:"version"`
-	PublicIP    string          `json:"public_ip"`
-	PublicIPv6  string          `json:"public_ipv6"`
-	WireGuardIP string          `json:"wireguard_ip"`
+	NodeID       string          `json:"node_id"`
+	Version      string          `json:"version"`
+	PublicIP     string          `json:"public_ip"`
+	PublicIPv6   string          `json:"public_ipv6"`
+	InternalIP   string          `json:"internal_ip"`
+	InternalIPv6 string          `json:"internal_ipv6"`
+	WireGuardIP  string          `json:"wireguard_ip"`
 	WGPublicKey string          `json:"wireguard_public_key"`
 	WGEndpoint  string          `json:"wireguard_endpoint"`
 	WGPort      int             `json:"wireguard_port"`

@@ -127,7 +127,7 @@ func TestNodeGeoResolveUpdatesFromReportedPublicIP(t *testing.T) {
 	}})
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
-	if err := st.UpdateMetrics("node-a", model.Metrics{}, "0.2.1", "8.8.8.8", "", "", model.HostFacts{}); err != nil {
+	if err := st.UpdateMetrics("node-a", model.Metrics{}, "0.2.1", "8.8.8.8", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -158,7 +158,7 @@ func TestNodeGeoResolveDoesNotOverwriteManualGeoByDefault(t *testing.T) {
 	}})
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
-	if err := st.UpdateMetrics("node-a", model.Metrics{}, "0.2.1", "8.8.8.8", "", "", model.HostFacts{}); err != nil {
+	if err := st.UpdateMetrics("node-a", model.Metrics{}, "0.2.1", "8.8.8.8", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatal(err)
 	}
 	manual := doJSON(t, handler, http.MethodPost, "/api/nodes/geo", `{
@@ -208,7 +208,7 @@ func TestNodeGeoResolveFillsPartialGeoWithoutCoordinates(t *testing.T) {
 	}})
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
-	if err := st.UpdateMetrics("node-a", model.Metrics{}, "0.2.1", "8.8.8.8", "", "", model.HostFacts{}); err != nil {
+	if err := st.UpdateMetrics("node-a", model.Metrics{}, "0.2.1", "8.8.8.8", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, err := st.UpdateNodeGeo("node-a", &model.NodeGeo{Country: "US", Source: "operator"}); err != nil || !ok {
@@ -237,7 +237,7 @@ func TestNodeGeoResolveReportsDisabledResolver(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
-	if err := st.UpdateMetrics("node-a", model.Metrics{}, "0.2.1", "8.8.8.8", "", "", model.HostFacts{}); err != nil {
+	if err := st.UpdateMetrics("node-a", model.Metrics{}, "0.2.1", "8.8.8.8", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatal(err)
 	}
 

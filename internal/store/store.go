@@ -579,7 +579,7 @@ func (s *Store) Nodes() []model.Node {
 	return out
 }
 
-func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, publicIPv6, wgIP string, hostFacts model.HostFacts) error {
+func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, publicIPv6, internalIP, internalIPv6, wgIP string, hostFacts model.HostFacts) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, ok := s.state.Nodes[nodeID]
@@ -597,6 +597,12 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	}
 	if publicIPv6 != "" {
 		n.PublicIPv6 = publicIPv6
+	}
+	if internalIP != "" {
+		n.InternalIP = internalIP
+	}
+	if internalIPv6 != "" {
+		n.InternalIPv6 = internalIPv6
 	}
 	if wgIP != "" {
 		n.WireGuardIP = wgIP

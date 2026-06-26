@@ -227,6 +227,24 @@ func (s *Server) upsertGroup(req model.Group, p principal) (groupView, error) {
 	// Explicit members: dedupe and drop references to non-existent nodes.
 	req.Members = dedupeExistingNodes(req.Members, byNode)
 
+	// Leader: if set, it must be an explicit member of the group. The explicit
+	// Members list is the canonical membership, so a leader that is only a
+	// selector match (display-only) is rejected — a leader has to be a real,
+	// policy-relevant member.
+	req.LeaderID = strings.TrimSpace(req.LeaderID)
+	if req.LeaderID != "" {
+		isMember := false
+		for _, m := range req.Members {
+			if m == req.LeaderID {
+				isMember = true
+				break
+			}
+		}
+		if !isMember {
+			return groupView{}, errors.New("leader_id must be an explicit member of the group")
+		}
+	}
+
 	// Selector: trim entries; nil out an empty selector so omitempty round-trips.
 	req.Selector = normalizeGroupSelector(req.Selector)
 
@@ -388,6 +406,20 @@ func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request, p pr
 		byNode[n.ID] = n
 	}
 	g.Members = dedupeExistingNodes(kept, byNode)
+	// Keep the leader invariant: a leader must be an explicit member, so drop a
+	// dangling LeaderID when that node is no longer a member.
+	if g.LeaderID != "" {
+		stillMember := false
+		for _, m := range g.Members {
+			if m == g.LeaderID {
+				stillMember = true
+				break
+			}
+		}
+		if !stillMember {
+			g.LeaderID = ""
+		}
+	}
 	if err := s.store.UpsertGroup(g); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

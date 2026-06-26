@@ -1607,12 +1607,35 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		Tags        []string `json:"tags"`
 		Role        string   `json:"role"`
 		WireGuardIP string   `json:"wireguard_ip"`
+		// GroupIDs assigns the freshly enrolled node into one or more existing
+		// groups by appending it to each group's explicit Members (the canonical
+		// membership). It is optional and idempotent; unknown group ids are
+		// rejected before the node is created so enrollment has no partial effect.
+		GroupIDs []string `json:"group_ids"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
 	if req.NodeID == "" {
 		req.NodeID = id.New("node")
+	}
+	// Validate group assignments up front (before any mutation) so a bad group id
+	// rejects the whole enroll rather than leaving an orphaned node behind.
+	enrollGroupIDs := make([]string, 0, len(req.GroupIDs))
+	{
+		seen := make(map[string]bool, len(req.GroupIDs))
+		for _, gid := range req.GroupIDs {
+			gid = strings.TrimSpace(gid)
+			if gid == "" || seen[gid] {
+				continue
+			}
+			if _, ok := s.store.Group(gid); !ok {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("group %q not found", gid))
+				return
+			}
+			seen[gid] = true
+			enrollGroupIDs = append(enrollGroupIDs, gid)
+		}
 	}
 	// withAuth's allowlist check keys on the ?node_id query param, which this POST
 	// does not carry, so a RESTRICTED node:admin token (one with a non-empty
@@ -1658,6 +1681,30 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	if err := s.store.UpsertNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	// Append the new node into each requested group's explicit Members — the same
+	// canonical membership path handleGroupMembers uses. Idempotent: a node that
+	// is already a member is left untouched.
+	for _, gid := range enrollGroupIDs {
+		g, ok := s.store.Group(gid)
+		if !ok {
+			continue // validated above; a concurrent delete just no-ops here
+		}
+		already := false
+		for _, m := range g.Members {
+			if m == n.ID {
+				already = true
+				break
+			}
+		}
+		if already {
+			continue
+		}
+		g.Members = append(g.Members, n.ID)
+		if err := s.store.UpsertGroup(g); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "node.enroll", Scope: "node:admin", NodeID: req.NodeID})
 	serverURL := s.agentEnrollServerURL()

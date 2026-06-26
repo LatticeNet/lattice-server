@@ -26,6 +26,10 @@ const maxSessions = 4096
 // maxMonitorResults caps the retained history per monitor to bound state growth.
 const maxMonitorResults = 500
 
+// maxTaskResults bounds total retained task-execution results. On-disk state grew
+// unbounded otherwise; results are historical, so the oldest are evicted first.
+const maxTaskResults = 2000
+
 type State struct {
 	Users           map[string]model.User               `json:"users"`
 	Tokens          map[string]model.Token              `json:"tokens"`
@@ -680,6 +684,9 @@ func (s *Store) AddTaskResult(r model.TaskResult) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.state.Results = append(s.state.Results, r)
+	if len(s.state.Results) > maxTaskResults {
+		s.state.Results = s.state.Results[len(s.state.Results)-maxTaskResults:]
+	}
 	if t, ok := s.state.Tasks[r.TaskID]; ok {
 		if r.Error != "" || r.ExitCode != 0 {
 			t.Status = model.TaskFailed

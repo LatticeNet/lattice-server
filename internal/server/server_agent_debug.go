@@ -188,6 +188,7 @@ func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p pr
 		StaticIPv4 string   `json:"static_ipv4"`
 		StaticIPv6 string   `json:"static_ipv6"`
 		Resolvers  []string `json:"resolvers"`
+		Script     string   `json:"script"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -197,17 +198,17 @@ func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
 		return
 	}
-	cfg, err := validateNodeIPConfig(req.Mode, req.StaticIPv4, req.StaticIPv6, req.Resolvers)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
 	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
 		return
 	}
 	node, ok := s.store.Node(req.NodeID)
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	cfg, err := validateNodeIPConfig(req.Mode, req.StaticIPv4, req.StaticIPv6, req.Resolvers, req.Script, node.IPConfig)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	mode := ""
@@ -233,17 +234,20 @@ func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p pr
 // validateNodeIPConfig validates an operator-supplied per-node IP override. An
 // empty mode returns (nil, nil) meaning "clear the override". Static addresses
 // must parse for their family; static mode requires at least one; resolver URLs
-// must be http(s). Trimmed/cleaned values are returned ready to persist.
-func validateNodeIPConfig(mode, v4, v6 string, resolvers []string) (*model.NodeIPConfig, error) {
+// must be http(s). Script mode requires a script body on first save, but an
+// empty body preserves the existing script so the UI can show only a hash and
+// still let operators change metadata without re-pasting secret-bearing code.
+// Trimmed/cleaned values are returned ready to persist.
+func validateNodeIPConfig(mode, v4, v6 string, resolvers []string, script string, existing *model.NodeIPConfig) (*model.NodeIPConfig, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	v4 = strings.TrimSpace(v4)
 	v6 = strings.TrimSpace(v6)
 	switch mode {
 	case "":
 		return nil, nil
-	case model.NodeIPModeAuto, model.NodeIPModeStatic, model.NodeIPModeResolver:
+	case model.NodeIPModeAuto, model.NodeIPModeStatic, model.NodeIPModeResolver, model.NodeIPModeScript:
 	default:
-		return nil, errors.New("mode must be auto, static, resolver, or empty to clear")
+		return nil, errors.New("mode must be auto, static, resolver, script, or empty to clear")
 	}
 	if v4 != "" {
 		if ip := net.ParseIP(v4); ip == nil || ip.To4() == nil {
@@ -269,12 +273,48 @@ func validateNodeIPConfig(mode, v4, v6 string, resolvers []string) (*model.NodeI
 		}
 		cleaned = append(cleaned, r)
 	}
+	script = strings.TrimSpace(script)
+	scriptSHA := ""
+	if mode == model.NodeIPModeScript {
+		if script == "" && existing != nil && existing.Mode == model.NodeIPModeScript {
+			script = existing.Script
+			scriptSHA = existing.ScriptSHA256
+		}
+		if script == "" {
+			return nil, errors.New("script mode requires a script body")
+		}
+		if len(script) > 16*1024 {
+			return nil, errors.New("script body must be 16 KiB or smaller")
+		}
+		if scriptSHA == "" {
+			scriptSHA = shortSHA256(script)
+		}
+	}
 	return &model.NodeIPConfig{
-		Mode:       mode,
-		StaticIPv4: v4,
-		StaticIPv6: v6,
-		Resolvers:  cleaned,
+		Mode:         mode,
+		StaticIPv4:   v4,
+		StaticIPv6:   v6,
+		Resolvers:    cleaned,
+		Script:       script,
+		ScriptSHA256: scriptSHA,
 	}, nil
+}
+
+func redactNodeIPConfig(cfg *model.NodeIPConfig) *model.NodeIPConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := *cfg
+	out.Script = ""
+	if out.Mode == model.NodeIPModeScript && out.ScriptSHA256 == "" && cfg.Script != "" {
+		out.ScriptSHA256 = shortSHA256(cfg.Script)
+	}
+	return &out
+}
+
+func shortSHA256(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 func (s *Server) handleAgentDebugEvents(w http.ResponseWriter, r *http.Request) {

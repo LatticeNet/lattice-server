@@ -68,10 +68,11 @@ func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
 		t.Fatalf("enroll: %d", res.StatusCode)
 	}
 	var out struct {
-		NodeID    string `json:"node_id"`
-		Token     string `json:"token"`
-		ServerURL string `json:"server_url"`
-		Command   string `json:"command"`
+		NodeID    string            `json:"node_id"`
+		Token     string            `json:"token"`
+		ServerURL string            `json:"server_url"`
+		Command   string            `json:"command"`
+		Commands  map[string]string `json:"commands"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
 		t.Fatal(err)
@@ -80,12 +81,16 @@ func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
 		t.Fatalf("server_url = %q", out.ServerURL)
 	}
 	for _, want := range []string{
-		"lattice-agent -server 'https://lattice.example.com'",
-		"-node-id 'node-a'",
-		"-token '" + out.Token + "'",
+		"curl -fsSL 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh'",
+		"LATTICE_SERVER='https://lattice.example.com'",
+		"LATTICE_NODE_ID='node-a'",
+		"LATTICE_NODE_TOKEN='" + out.Token + "'",
 	} {
 		if !strings.Contains(out.Command, want) {
 			t.Fatalf("command missing %q:\n%s", want, out.Command)
 		}
+	}
+	if out.Commands["manual"] == "" || !strings.Contains(out.Commands["manual"], "lattice-agent -server 'https://lattice.example.com'") {
+		t.Fatalf("manual command missing or invalid: %+v", out.Commands)
 	}
 }

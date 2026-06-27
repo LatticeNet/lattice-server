@@ -1580,7 +1580,7 @@ func toNodeView(n model.Node) nodeView {
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, IPConfig: n.IPConfig, GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }
 
@@ -1715,11 +1715,13 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "node.enroll", Scope: "node:admin", NodeID: req.NodeID})
 	serverURL := s.agentEnrollServerURL()
-	writeJSON(w, http.StatusOK, map[string]string{
+	commands := s.agentEnrollCommands(serverURL, req.NodeID, token)
+	writeJSON(w, http.StatusOK, map[string]any{
 		"node_id":    req.NodeID,
 		"token":      token,
 		"server_url": serverURL,
-		"command":    s.agentEnrollCommand(serverURL, req.NodeID, token),
+		"command":    commands["linux"],
+		"commands":   commands,
 	})
 }
 
@@ -1731,11 +1733,26 @@ func (s *Server) agentEnrollServerURL() string {
 }
 
 func (s *Server) agentEnrollCommand(serverURL, nodeID, token string) string {
-	return fmt.Sprintf("lattice-agent -server %s -node-id %s -token %s",
+	return s.agentEnrollCommands(serverURL, nodeID, token)["linux"]
+}
+
+func (s *Server) agentEnrollCommands(serverURL, nodeID, token string) map[string]string {
+	manual := fmt.Sprintf("lattice-agent -server %s -node-id %s -token %s",
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		shellQuote(token),
 	)
+	installURL := "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
+	linux := fmt.Sprintf("curl -fsSL %s -o lattice-agent-install.sh && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s ./lattice-agent-install.sh",
+		shellQuote(installURL),
+		shellQuote(serverURL),
+		shellQuote(nodeID),
+		shellQuote(token),
+	)
+	return map[string]string{
+		"linux":  linux,
+		"manual": manual,
+	}
 }
 
 // handleRotateNodeToken issues a fresh token for an existing node, invalidating

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -12,23 +13,26 @@ func TestValidateNodeIPConfig(t *testing.T) {
 		name         string
 		mode, v4, v6 string
 		resolvers    []string
+		script       string
 		wantErr      bool
 		wantNil      bool
 	}{
-		{"empty clears", "", "", "", nil, false, true},
-		{"auto ok", "auto", "", "", nil, false, false},
-		{"static needs an ip", "static", "", "", nil, true, false},
-		{"static v4 ok", "static", "203.0.113.7", "", nil, false, false},
-		{"unknown mode", "bogus", "", "", nil, true, false},
-		{"bad v4", "auto", "not-an-ip", "", nil, true, false},
-		{"v6 in the v4 slot", "auto", "2001:db8::1", "", nil, true, false},
-		{"static v6 ok", "static", "", "2001:db8::1", nil, false, false},
-		{"resolver must be a url", "resolver", "", "", []string{"1.1.1.1"}, true, false},
-		{"resolver url ok", "resolver", "", "", []string{"https://api.ipify.org"}, false, false},
+		{"empty clears", "", "", "", nil, "", false, true},
+		{"auto ok", "auto", "", "", nil, "", false, false},
+		{"static needs an ip", "static", "", "", nil, "", true, false},
+		{"static v4 ok", "static", "203.0.113.7", "", nil, "", false, false},
+		{"unknown mode", "bogus", "", "", nil, "", true, false},
+		{"bad v4", "auto", "not-an-ip", "", nil, "", true, false},
+		{"v6 in the v4 slot", "auto", "2001:db8::1", "", nil, "", true, false},
+		{"static v6 ok", "static", "", "2001:db8::1", nil, "", false, false},
+		{"resolver must be a url", "resolver", "", "", []string{"1.1.1.1"}, "", true, false},
+		{"resolver url ok", "resolver", "", "", []string{"https://api.ipify.org"}, "", false, false},
+		{"script needs body", "script", "", "", nil, "", true, false},
+		{"script ok", "script", "", "", nil, "echo 8.8.8.8", false, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			cfg, err := validateNodeIPConfig(c.mode, c.v4, c.v6, c.resolvers)
+			cfg, err := validateNodeIPConfig(c.mode, c.v4, c.v6, c.resolvers, c.script, nil)
 			if (err != nil) != c.wantErr {
 				t.Fatalf("err=%v wantErr=%v", err, c.wantErr)
 			}
@@ -59,6 +63,45 @@ func TestNodeIPConfigHTTP(t *testing.T) {
 	}
 	if len(n.IPConfig.Resolvers) != 1 || n.IPConfig.Resolvers[0] != "https://api.ipify.org" {
 		t.Fatalf("resolvers not stored: %+v", n.IPConfig.Resolvers)
+	}
+
+	script := doJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",
+		`{"node_id":"node-a","mode":"script","script":"echo 8.8.8.8"}`,
+		cookies, csrf)
+	defer script.Body.Close()
+	if script.StatusCode != http.StatusOK {
+		t.Fatalf("set script ip-config failed: %d", script.StatusCode)
+	}
+	var scriptView struct {
+		IPConfig *model.NodeIPConfig `json:"ip_config"`
+	}
+	if err := json.NewDecoder(script.Body).Decode(&scriptView); err != nil {
+		t.Fatal(err)
+	}
+	if scriptView.IPConfig == nil || scriptView.IPConfig.Mode != model.NodeIPModeScript {
+		t.Fatalf("script ip-config not returned: %+v", scriptView.IPConfig)
+	}
+	if scriptView.IPConfig.Script != "" {
+		t.Fatalf("script body leaked in node view: %q", scriptView.IPConfig.Script)
+	}
+	if scriptView.IPConfig.ScriptSHA256 == "" {
+		t.Fatalf("script hash missing in node view: %+v", scriptView.IPConfig)
+	}
+	n, _ = st.Node("node-a")
+	if n.IPConfig == nil || n.IPConfig.Script != "echo 8.8.8.8" {
+		t.Fatalf("stored script missing: %+v", n.IPConfig)
+	}
+
+	preserve := doJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",
+		`{"node_id":"node-a","mode":"script"}`,
+		cookies, csrf)
+	preserve.Body.Close()
+	if preserve.StatusCode != http.StatusOK {
+		t.Fatalf("preserve script failed: %d", preserve.StatusCode)
+	}
+	n, _ = st.Node("node-a")
+	if n.IPConfig == nil || n.IPConfig.Script != "echo 8.8.8.8" {
+		t.Fatalf("empty script should preserve existing script: %+v", n.IPConfig)
 	}
 
 	bad := doJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",

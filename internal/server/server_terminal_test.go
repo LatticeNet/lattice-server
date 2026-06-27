@@ -188,8 +188,8 @@ func TestTerminalBrokerDetachGraceReaped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	broker.markOpen(sess.ID, t0)        // agent dialed in
-	broker.clearDetached(sess.ID, t0)   // browser bridged
+	broker.markOpen(sess.ID, t0)      // agent dialed in
+	broker.clearDetached(sess.ID, t0) // browser bridged
 	if st := broker.sessions[sess.ID]; !st.bridged || !st.detachedAt.IsZero() {
 		t.Fatalf("after clearDetached: bridged=%v detachedAt=%v", st.bridged, st.detachedAt)
 	}

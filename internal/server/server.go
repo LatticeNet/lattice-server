@@ -594,6 +594,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
 	mux.HandleFunc("/api/nodes/terminal-transport", s.withAuth("", s.handleNodeTerminalTransport))
+	mux.HandleFunc("/api/nodes/ip-config", s.withAuth("", s.handleNodeIPConfig))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/tasks/cancel", s.withAuth("", s.handleCancelTask))
 	mux.HandleFunc("/api/tasks/delete", s.withAuth("", s.handleDeleteTask))
@@ -1567,6 +1568,7 @@ type nodeView struct {
 	HostFacts          model.HostFacts        `json:"host_facts"`
 	Geo                *model.NodeGeo         `json:"geo,omitempty"`
 	AgentDebug         model.AgentDebugPolicy `json:"agent_debug"`
+	IPConfig           *model.NodeIPConfig    `json:"ip_config,omitempty"`
 	GroupIDs           []string               `json:"group_ids,omitempty"`
 	CreatedAt          time.Time              `json:"created_at"`
 }
@@ -1578,7 +1580,7 @@ func toNodeView(n model.Node) nodeView {
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, IPConfig: n.IPConfig, GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -100,6 +101,7 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 			MaxBatchLines: defaultAgentDebugMaxBatchLines,
 		},
 		TerminalTransport: normalizeNodeTerminalTransport(node.TerminalTransport),
+		IPConfig:          node.IPConfig,
 	})
 }
 
@@ -168,6 +170,111 @@ func (s *Server) handleNodeTerminalTransport(w http.ResponseWriter, r *http.Requ
 		},
 	})
 	writeJSON(w, http.StatusOK, toNodeView(node))
+}
+
+// handleNodeIPConfig sets (or clears) a node's public-IP discovery override —
+// the per-node IP config the agent polls via AgentConfig. An empty mode clears
+// the override so the node falls back to its agent's startup flags. Mirrors
+// handleNodeTerminalTransport's node:admin gating and audit. Script-based
+// discovery is intentionally not accepted here (separate sandboxed feature).
+func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID     string   `json:"node_id"`
+		Mode       string   `json:"mode"`
+		StaticIPv4 string   `json:"static_ipv4"`
+		StaticIPv6 string   `json:"static_ipv6"`
+		Resolvers  []string `json:"resolvers"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	cfg, err := validateNodeIPConfig(req.Mode, req.StaticIPv4, req.StaticIPv6, req.Resolvers)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
+		return
+	}
+	node, ok := s.store.Node(req.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	mode := ""
+	if cfg != nil {
+		cfg.UpdatedAt = s.now().UTC()
+		mode = cfg.Mode
+	}
+	node.IPConfig = cfg
+	if err := s.store.UpsertNode(node); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   node.ID,
+		Action:   "node.ip.config",
+		Scope:    "node:admin",
+		Metadata: map[string]string{"mode": mode},
+	})
+	writeJSON(w, http.StatusOK, toNodeView(node))
+}
+
+// validateNodeIPConfig validates an operator-supplied per-node IP override. An
+// empty mode returns (nil, nil) meaning "clear the override". Static addresses
+// must parse for their family; static mode requires at least one; resolver URLs
+// must be http(s). Trimmed/cleaned values are returned ready to persist.
+func validateNodeIPConfig(mode, v4, v6 string, resolvers []string) (*model.NodeIPConfig, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	v4 = strings.TrimSpace(v4)
+	v6 = strings.TrimSpace(v6)
+	switch mode {
+	case "":
+		return nil, nil
+	case model.NodeIPModeAuto, model.NodeIPModeStatic, model.NodeIPModeResolver:
+	default:
+		return nil, errors.New("mode must be auto, static, resolver, or empty to clear")
+	}
+	if v4 != "" {
+		if ip := net.ParseIP(v4); ip == nil || ip.To4() == nil {
+			return nil, errors.New("static_ipv4 is not a valid IPv4 address")
+		}
+	}
+	if v6 != "" {
+		if ip := net.ParseIP(v6); ip == nil || ip.To4() != nil {
+			return nil, errors.New("static_ipv6 is not a valid IPv6 address")
+		}
+	}
+	if mode == model.NodeIPModeStatic && v4 == "" && v6 == "" {
+		return nil, errors.New("static mode requires static_ipv4 and/or static_ipv6")
+	}
+	cleaned := make([]string, 0, len(resolvers))
+	for _, raw := range resolvers {
+		r := strings.TrimSpace(raw)
+		if r == "" {
+			continue
+		}
+		if !strings.HasPrefix(r, "http://") && !strings.HasPrefix(r, "https://") {
+			return nil, fmt.Errorf("resolver %q must be an http(s) URL", r)
+		}
+		cleaned = append(cleaned, r)
+	}
+	return &model.NodeIPConfig{
+		Mode:       mode,
+		StaticIPv4: v4,
+		StaticIPv6: v6,
+		Resolvers:  cleaned,
+	}, nil
 }
 
 func (s *Server) handleAgentDebugEvents(w http.ResponseWriter, r *http.Request) {

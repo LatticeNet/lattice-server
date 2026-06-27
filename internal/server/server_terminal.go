@@ -464,6 +464,41 @@ func terminalActiveStatus(status string) bool {
 	return status != model.TerminalClosed && status != model.TerminalFailed
 }
 
+// activeSessionsForNode counts the node's currently-active (non-terminal)
+// sessions. Used by the node-delete plan to preview how many sessions a delete
+// would close.
+func (b *terminalBroker) activeSessionsForNode(nodeID string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	count := 0
+	for _, state := range b.sessions {
+		if state.session.NodeID == nodeID && terminalActiveStatus(state.session.Status) {
+			count++
+		}
+	}
+	return count
+}
+
+// closeForNode terminates every active session belonging to nodeID (used when
+// the node is hard-deleted) and returns how many it closed. IDs are collected
+// under the broker lock, then markClosed is called per-session without the lock
+// held (markClosed takes the non-reentrant broker mutex itself).
+func (b *terminalBroker) closeForNode(nodeID string, now time.Time) int {
+	now = now.UTC()
+	b.mu.Lock()
+	ids := make([]string, 0)
+	for _, state := range b.sessions {
+		if state.session.NodeID == nodeID && terminalActiveStatus(state.session.Status) {
+			ids = append(ids, state.session.ID)
+		}
+	}
+	b.mu.Unlock()
+	for _, sid := range ids {
+		b.markClosed(sid, model.TerminalClosed, "node deleted", now)
+	}
+	return len(ids)
+}
+
 func terminalClosedStatus(status string) bool {
 	return status == model.TerminalClosed || status == model.TerminalFailed
 }

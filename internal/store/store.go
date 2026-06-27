@@ -707,6 +707,55 @@ func (s *Store) Results() []model.TaskResult {
 	return out
 }
 
+// Task management sentinel errors so handlers can map store outcomes to HTTP
+// status codes without string matching.
+var (
+	ErrTaskNotFound      = errors.New("task not found")
+	ErrTaskNotCancelable = errors.New("only queued tasks can be cancelled")
+)
+
+// CancelTask marks a queued task as cancelled so agents will not lease it. A
+// task that is already leased is running on the agent and cannot be reliably
+// stopped from the server, so this refuses it with ErrTaskNotCancelable. The
+// check and the mutation happen under one lock, so concurrent lease/cancel
+// cannot race.
+func (s *Store) CancelTask(id string) (model.Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.Tasks[id]
+	if !ok {
+		return model.Task{}, ErrTaskNotFound
+	}
+	if t.Status != model.TaskQueued {
+		return model.Task{}, ErrTaskNotCancelable
+	}
+	t.Status = model.TaskCancelled
+	t.FinishedAt = time.Now().UTC()
+	s.state.Tasks[id] = t
+	return t, s.Save()
+}
+
+// DeleteTask removes a task and any stored results for it from history. It
+// returns ErrTaskNotFound when no such task exists.
+func (s *Store) DeleteTask(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.Tasks[id]; !ok {
+		return ErrTaskNotFound
+	}
+	delete(s.state.Tasks, id)
+	if len(s.state.Results) > 0 {
+		kept := s.state.Results[:0]
+		for _, r := range s.state.Results {
+			if r.TaskID != id {
+				kept = append(kept, r)
+			}
+		}
+		s.state.Results = kept
+	}
+	return s.Save()
+}
+
 func (s *Store) AppendAudit(ev model.AuditEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

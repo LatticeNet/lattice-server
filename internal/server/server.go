@@ -595,6 +595,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
 	mux.HandleFunc("/api/nodes/terminal-transport", s.withAuth("", s.handleNodeTerminalTransport))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
+	mux.HandleFunc("/api/tasks/cancel", s.withAuth("", s.handleCancelTask))
+	mux.HandleFunc("/api/tasks/delete", s.withAuth("", s.handleDeleteTask))
+	mux.HandleFunc("/api/tasks/rerun", s.withAuth("", s.handleRerunTask))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/terminal/sessions", s.withAuth("", s.handleTerminalSessions))
 	mux.HandleFunc("/api/terminal/sessions/", s.withAuth("", s.handleTerminalSessionPath))
@@ -1878,6 +1881,122 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 		writeJSON(w, http.StatusOK, toTaskView(task))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+// handleCancelTask cancels a queued task so it is never leased. Leased/finished
+// tasks are rejected (a leased task is already running on the agent).
+func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	task, ok := s.store.Task(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
+		return
+	}
+	if !s.requireAllNodeScopes(w, p, "task:run", task.Targets) {
+		return
+	}
+	updated, err := s.store.CancelTask(req.ID)
+	if err != nil {
+		s.writeTaskStoreError(w, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.cancel", Scope: "task:run", Metadata: map[string]string{"task_id": req.ID}})
+	writeJSON(w, http.StatusOK, toTaskView(updated))
+}
+
+// handleDeleteTask removes a task and its stored results from history.
+func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	task, ok := s.store.Task(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
+		return
+	}
+	if !s.requireAllNodeScopes(w, p, "task:run", task.Targets) {
+		return
+	}
+	if err := s.store.DeleteTask(req.ID); err != nil {
+		s.writeTaskStoreError(w, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.delete", Scope: "task:run", Metadata: map[string]string{"task_id": req.ID}})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleRerunTask queues a fresh task from a stored one. The script body never
+// leaves the server (task views expose only its SHA/size), so rerun is a
+// server-side re-create rather than a client round-trip.
+func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	src, ok := s.store.Task(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
+		return
+	}
+	if !s.requireAllNodeScopes(w, p, "task:run", src.Targets) {
+		return
+	}
+	if err := validateTaskCreate(src.Interpreter, src.Script, src.TimeoutSec, src.OutputLimit); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	task := model.Task{
+		ID:          id.New("task"),
+		ActorID:     p.ActorID,
+		TokenID:     p.TokenID,
+		Targets:     src.Targets,
+		Interpreter: src.Interpreter,
+		Script:      src.Script,
+		TimeoutSec:  src.TimeoutSec,
+		OutputLimit: src.OutputLimit,
+		Status:      model.TaskQueued,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := s.store.CreateTask(task); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.rerun", Scope: "task:run", Metadata: map[string]string{"task_id": task.ID, "rerun_of": src.ID}})
+	writeJSON(w, http.StatusOK, toTaskView(task))
+}
+
+// writeTaskStoreError maps task store sentinel errors to HTTP responses.
+func (s *Server) writeTaskStoreError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrTaskNotFound):
+		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
+	case errors.Is(err, store.ErrTaskNotCancelable):
+		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "only queued tasks can be cancelled"))
+	default:
+		writeError(w, http.StatusInternalServerError, err)
 	}
 }
 
@@ -4532,10 +4651,10 @@ type agentAuthRequest struct {
 	InternalIP   string          `json:"internal_ip"`
 	InternalIPv6 string          `json:"internal_ipv6"`
 	WireGuardIP  string          `json:"wireguard_ip"`
-	WGPublicKey string          `json:"wireguard_public_key"`
-	WGEndpoint  string          `json:"wireguard_endpoint"`
-	WGPort      int             `json:"wireguard_port"`
-	HostFacts   model.HostFacts `json:"host_facts"`
+	WGPublicKey  string          `json:"wireguard_public_key"`
+	WGEndpoint   string          `json:"wireguard_endpoint"`
+	WGPort       int             `json:"wireguard_port"`
+	HostFacts    model.HostFacts `json:"host_facts"`
 }
 
 var blockedReportedPublicPrefixes = []netip.Prefix{

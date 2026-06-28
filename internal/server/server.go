@@ -176,6 +176,13 @@ type Server struct {
 	// signal toward a reviewed apply, not authoritative security state.
 	proxyDriftMu sync.RWMutex
 	proxyDrift   map[string]proxyDriftState
+
+	// singboxInv is the live, in-memory mirror of on-box sing-box nodes that
+	// agents discover via read-only `sb --json list` (the adoption bridge). It is
+	// re-reported each agent interval and intentionally NOT persisted — a restart
+	// simply repopulates it from the next round of reports.
+	singboxInvMu sync.RWMutex
+	singboxInv   map[string]model.SingBoxInventory
 }
 
 const (
@@ -650,6 +657,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/usage", s.withAuth("", s.handleProxyUsage))
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))
+	mux.HandleFunc("/api/proxy/discovered", s.withAuth("proxy:read", s.handleProxyDiscovered))
 	mux.HandleFunc("/api/proxy/nodes/", s.withAuth("", s.handleProxyNodePlan))
 	mux.HandleFunc("/api/substore/import", s.withAuth("", s.handleSubStoreImport))
 	mux.HandleFunc("/api/substore/status", s.withAuth("", s.handleSubStoreStatus))
@@ -694,6 +702,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
 	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
 	mux.HandleFunc("/api/agent/proxy-usage", s.withAgentLimit(s.handleAgentProxyUsage))
+	mux.HandleFunc("/api/agent/singbox-inventory", s.withAgentLimit(s.handleAgentSingBoxInventory))
 	mux.HandleFunc("/api/agent/tasks", s.withAgentLimit(s.handleAgentTasks))
 	mux.HandleFunc("/api/agent/task-result", s.withAgentLimit(s.handleAgentTaskResult))
 	mux.HandleFunc("/api/agent/terminal/sessions", s.withAgentLimit(s.handleAgentTerminalSessions))

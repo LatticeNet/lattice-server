@@ -53,43 +53,82 @@ func (s *Server) vpnCoreNodesRPC(_ context.Context, method string, request []byt
 }
 
 func (s *Server) vpnCoreExportNodes(request []byte) ([]byte, error) {
+	// IncludeDiscovered defaults to true (via a *bool so an omitted field still
+	// means "include"): an adoption-bridge consumer wants the on-box (233boy)
+	// nodes by default, not only Lattice-rendered ones.
 	var req struct {
-		UserID string `json:"user_id"`
+		UserID            string `json:"user_id"`
+		IncludeDiscovered *bool  `json:"include_discovered"`
+		IncludeManaged    *bool  `json:"include_managed"`
 	}
 	if len(bytes.TrimSpace(request)) > 0 {
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, fmt.Errorf("vpn-core export: invalid request: %w", err)
 		}
 	}
-
-	var users []model.ProxyUser
-	if req.UserID != "" {
-		u, ok := s.store.ProxyUser(req.UserID)
-		if !ok {
-			return nil, fmt.Errorf("vpn-core export: proxy user %q not found", req.UserID)
-		}
-		users = []model.ProxyUser{u}
-	} else {
-		users = s.store.ProxyUsers()
-	}
-
-	profiles := s.proxySubscriptionProfiles()
-	inbounds := s.store.ProxyInbounds()
-	opts := proxycore.SubscriptionOptions{Now: s.now()}
+	includeDiscovered := req.IncludeDiscovered == nil || *req.IncludeDiscovered
+	includeManaged := req.IncludeManaged == nil || *req.IncludeManaged
 
 	out := struct {
 		Links    []string `json:"links"`
 		Count    int      `json:"count"`
 		Warnings []string `json:"warnings,omitempty"`
 	}{Links: []string{}}
-	for _, u := range users {
-		links, warnings, err := proxycore.VLESSRealityLinks(u, profiles, inbounds, opts)
-		if err != nil {
-			return nil, fmt.Errorf("vpn-core export: render user %s: %w", u.ID, err)
+	seen := map[string]bool{}
+	appendLink := func(link string) {
+		if link == "" || seen[link] {
+			return
 		}
-		out.Links = append(out.Links, links...)
-		out.Warnings = append(out.Warnings, warnings...)
+		seen[link] = true
+		out.Links = append(out.Links, link)
 	}
+
+	// (1) Lattice-managed proxy users rendered through the proxy store (Model-A).
+	if includeManaged {
+		var users []model.ProxyUser
+		if req.UserID != "" {
+			u, ok := s.store.ProxyUser(req.UserID)
+			if !ok {
+				return nil, fmt.Errorf("vpn-core export: proxy user %q not found", req.UserID)
+			}
+			users = []model.ProxyUser{u}
+		} else {
+			users = s.store.ProxyUsers()
+		}
+		profiles := s.proxySubscriptionProfiles()
+		inbounds := s.store.ProxyInbounds()
+		opts := proxycore.SubscriptionOptions{Now: s.now()}
+		for _, u := range users {
+			links, warnings, err := proxycore.VLESSRealityLinks(u, profiles, inbounds, opts)
+			if err != nil {
+				return nil, fmt.Errorf("vpn-core export: render user %s: %w", u.ID, err)
+			}
+			for _, l := range links {
+				appendLink(l)
+			}
+			out.Warnings = append(out.Warnings, warnings...)
+		}
+	}
+
+	// (2) On-box discovered nodes (adoption bridge): the share_url each agent
+	// reported via read-only `sb --json list`. user_id does not apply (these are
+	// machine-owned, not Lattice subscribers), so they are included whole when
+	// no specific user filter is requested, giving the Sub-Store companion the
+	// full picture of adopted machines.
+	if includeDiscovered && req.UserID == "" {
+		s.singboxInvMu.RLock()
+		for _, inv := range s.singboxInv {
+			if inv.Status != "" && inv.Status != "ok" {
+				out.Warnings = append(out.Warnings, fmt.Sprintf("node %s discovery status %q: %s", inv.NodeID, inv.Status, inv.Error))
+				continue
+			}
+			for _, n := range inv.Nodes {
+				appendLink(n.ShareURL)
+			}
+		}
+		s.singboxInvMu.RUnlock()
+	}
+
 	out.Count = len(out.Links)
 	return json.Marshal(out)
 }

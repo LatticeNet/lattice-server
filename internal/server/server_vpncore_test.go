@@ -5,8 +5,78 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
+
+func TestVPNCoreExportIncludesDiscoveredNodes(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Inject a discovered inventory (as the agent report would).
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"node-a": {NodeID: "node-a", Status: "ok", Nodes: []model.SingBoxNode{
+			{Name: "VLESS-REALITY-17891.json", ShareURL: "vless://a@h:17891#n1"},
+			{Name: "Hysteria2-17892.json", ShareURL: "hysteria2://b@h:17892#n2"},
+		}},
+		// A node reporting a discovery error contributes a warning, no links.
+		"node-b": {NodeID: "node-b", Status: "error", Error: "sb not found"},
+	}
+	srv.singboxInvMu.Unlock()
+
+	call := func(body string) struct {
+		Links    []string `json:"links"`
+		Count    int      `json:"count"`
+		Warnings []string `json:"warnings"`
+	} {
+		raw, err := srv.pluginRPC.Call(context.Background(), vpnCorePluginID, vpnCoreNodesService, "export", []byte(body))
+		if err != nil {
+			t.Fatalf("export(%s): %v", body, err)
+		}
+		var out struct {
+			Links    []string `json:"links"`
+			Count    int      `json:"count"`
+			Warnings []string `json:"warnings"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return out
+	}
+
+	// Default (no body) includes discovered nodes.
+	def := call("")
+	if def.Count != 2 || len(def.Links) != 2 {
+		t.Fatalf("default export should include 2 discovered links, got %+v", def)
+	}
+	hasWarn := false
+	for _, w := range def.Warnings {
+		if w != "" {
+			hasWarn = true
+		}
+	}
+	if !hasWarn {
+		t.Fatalf("expected a discovery-error warning for node-b, got %+v", def.Warnings)
+	}
+
+	// include_discovered=false excludes them (empty managed store -> 0).
+	off := call(`{"include_discovered":false}`)
+	if off.Count != 0 {
+		t.Fatalf("include_discovered=false should yield 0 links, got %+v", off)
+	}
+
+	// A user_id filter scopes to managed subscribers only (no discovered nodes);
+	// unknown user errors rather than silently returning discovered links.
+	if _, err := srv.pluginRPC.Call(context.Background(), vpnCorePluginID, vpnCoreNodesService, "export", []byte(`{"user_id":"nope"}`)); err == nil {
+		t.Fatalf("expected error for unknown user_id")
+	}
+}
 
 func TestVPNCoreNodesRPCRegisteredAndExports(t *testing.T) {
 	st, err := store.Open("")

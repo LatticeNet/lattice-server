@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -48,6 +49,29 @@ type Runner interface {
 	Name() string
 	Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error)
 	Stop(ctx context.Context, req RunnerStopRequest) error
+}
+
+// InvokeRequest asks an armed plugin to perform one action. Payload is the raw
+// JSON body handed to the plugin; the runner frames {action,payload} as a single
+// stdin line and reads the reply from stdout.
+type InvokeRequest struct {
+	PluginID string
+	Action   string
+	Payload  json.RawMessage
+}
+
+// InvokeResponse is the decoded plugin reply. Result carries the plugin's body
+// (e.g. a rendered plan) for the host to act on under its own privileges.
+type InvokeResponse struct {
+	OK      bool
+	Message string
+	Result  json.RawMessage
+}
+
+// Invoker is an optional runner capability: a request/response action protocol
+// with the plugin. The system runner implements it; the noop runner does not.
+type Invoker interface {
+	Invoke(ctx context.Context, req InvokeRequest) (InvokeResponse, error)
 }
 
 type runtimeInstance struct {
@@ -230,6 +254,30 @@ func (m *RuntimeManager) Snapshot() map[string]RuntimeStatus {
 func (m *RuntimeManager) IsArmed(pluginID string) bool {
 	status, ok := m.Status(pluginID)
 	return ok && status.State == RuntimeStateArmed
+}
+
+// Invoke dispatches one action to an armed plugin whose runner supports the
+// request/response protocol. It fails closed if the plugin is not armed or its
+// runner is not an Invoker (e.g. the noop runner), so a disabled or
+// execution-disabled plugin can never be invoked.
+func (m *RuntimeManager) Invoke(ctx context.Context, pluginID, action string, payload json.RawMessage) (InvokeResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.Lock()
+	inst, ok := m.instances[pluginID]
+	m.mu.Unlock()
+	if !ok {
+		return InvokeResponse{}, fmt.Errorf("plugin %q has no runtime", pluginID)
+	}
+	if inst.status.State != RuntimeStateArmed || inst.runner == nil {
+		return InvokeResponse{}, fmt.Errorf("plugin %q is not armed", pluginID)
+	}
+	inv, ok := inst.runner.(Invoker)
+	if !ok {
+		return InvokeResponse{}, fmt.Errorf("plugin %q runner %q does not support invocation", pluginID, inst.runner.Name())
+	}
+	return inv.Invoke(ctx, InvokeRequest{PluginID: pluginID, Action: action, Payload: payload})
 }
 
 func (m *RuntimeManager) runnerFor(pluginType string) Runner {

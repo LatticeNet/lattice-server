@@ -34,6 +34,7 @@ func (s *Server) pluginHostServices() plugin.HostServices {
 		HTTP:   host,
 		Log:    host,
 		Audit:  host,
+		RPC:    s.pluginRPC,
 	}
 }
 

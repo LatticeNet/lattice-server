@@ -136,6 +136,10 @@ type Server struct {
 	plugins []plugin.Loaded
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
+	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First
+	// party in-core providers register services on it; plugins reach it through
+	// the capability-scoped broker (HostServices.RPC).
+	pluginRPC *plugin.RPCRegistry
 	// pluginTrust is the operator policy used by both startup loading and
 	// pre-install verification endpoints. It is intentionally not client supplied.
 	pluginTrust plugin.TrustPolicy
@@ -255,6 +259,8 @@ func New(opts Options) (*Server, error) {
 		s.reminderInterval = time.Hour
 	}
 	s.emitNotify = s.notifyEvent
+	s.pluginRPC = plugin.NewRPCRegistry()
+	s.registerVPNCoreRPC()
 	s.pluginRuntime = plugin.NewRuntimeManager(s.pluginHostServices())
 	if err := s.ensureAdmin(opts.AdminUsername, opts.AdminPassword); err != nil {
 		return nil, err

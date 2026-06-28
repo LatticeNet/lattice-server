@@ -599,6 +599,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
+	mux.HandleFunc("/api/nodes/update", s.withAuth("node:admin", s.handleUpdateNode))
 	mux.HandleFunc("/api/nodes/delete", s.withAuth("node:admin", s.handleDeleteNode))
 	mux.HandleFunc("/api/nodes/delete/plan", s.withAuth("node:admin", s.handleDeleteNodePlan))
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
@@ -1844,6 +1845,43 @@ func (s *Server) handleNodeDisable(w http.ResponseWriter, r *http.Request, p pri
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "node:admin"})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "disabled": req.Disabled})
+}
+
+// handleUpdateNode sets operator-owned node identity (name/role/tags). These were
+// previously settable only at enrollment; this makes them editable per node from
+// the dashboard.
+func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID string   `json:"node_id"`
+		Name   string   `json:"name"`
+		Role   string   `json:"role"`
+		Tags   []string `json:"tags"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
+		return
+	}
+	node, ok, err := s.store.UpdateNodeMeta(req.NodeID, strings.TrimSpace(req.Name), strings.TrimSpace(req.Role), req.Tags)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.update", Scope: "node:admin"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "tags": node.Tags})
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal) {

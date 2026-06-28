@@ -600,6 +600,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
 	mux.HandleFunc("/api/nodes/update", s.withAuth("node:admin", s.handleUpdateNode))
+	mux.HandleFunc("/api/nodes/duplicates", s.withAuth("node:read", s.handleNodeDuplicates))
 	mux.HandleFunc("/api/nodes/delete", s.withAuth("node:admin", s.handleDeleteNode))
 	mux.HandleFunc("/api/nodes/delete/plan", s.withAuth("node:admin", s.handleDeleteNodePlan))
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))

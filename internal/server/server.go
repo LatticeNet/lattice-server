@@ -658,6 +658,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))
 	mux.HandleFunc("/api/proxy/discovered", s.withAuth("proxy:read", s.handleProxyDiscovered))
+	mux.HandleFunc("/api/proxy/managed/add", s.withAuth("", s.handleSingBoxManageAdd))
+	mux.HandleFunc("/api/proxy/managed/delete", s.withAuth("", s.handleSingBoxManageDelete))
 	mux.HandleFunc("/api/proxy/nodes/", s.withAuth("", s.handleProxyNodePlan))
 	mux.HandleFunc("/api/substore/import", s.withAuth("", s.handleSubStoreImport))
 	mux.HandleFunc("/api/substore/status", s.withAuth("", s.handleSubStoreStatus))

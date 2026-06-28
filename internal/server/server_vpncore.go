@@ -31,6 +31,8 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export"}, s.vpnCoreNodesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreNodesService, err)
 	}
+	// Grant the first-party Sub-Store companion the directed edge to import nodes.
+	s.pluginRPC.Allow(subStorePluginID, vpnCoreNodesService)
 }
 
 // vpnCoreNodesRPC serves the vpn-core/nodes inter-plugin service — the seam the

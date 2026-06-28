@@ -1505,16 +1505,45 @@ func (s *Server) normalizeProxyInbound(req, existing model.ProxyInbound, hadExis
 		out.RealityPrivateKey = strings.TrimSpace(req.RealityPrivateKey)
 	}
 	if out.RealityPrivateKey == "" {
-		return model.ProxyInbound{}, errors.New("reality_private_key is required until key generation lands")
+		// Generate an X25519 REALITY keypair server-side so an operator can create
+		// a REALITY inbound without running sing-box/xray by hand (design-09 §E,
+		// Phase B). The matching public key is set in the same step.
+		priv, pub, err := proxycore.GenerateRealityKeypair()
+		if err != nil {
+			return model.ProxyInbound{}, fmt.Errorf("generate reality keypair: %w", err)
+		}
+		out.RealityPrivateKey = priv
+		out.RealityPublicKey = pub
 	}
 	if !proxyKeyRe.MatchString(out.RealityPrivateKey) {
 		return model.ProxyInbound{}, errors.New("invalid reality_private_key")
 	}
-	out.RealityPublicKey = strings.TrimSpace(req.RealityPublicKey)
-	if out.RealityPublicKey != "" && !proxyKeyRe.MatchString(out.RealityPublicKey) {
+	if strings.TrimSpace(req.RealityPublicKey) != "" {
+		out.RealityPublicKey = strings.TrimSpace(req.RealityPublicKey)
+	}
+	if out.RealityPublicKey == "" {
+		// Derive the public key from the (operator-supplied) private key so the
+		// subscription/share link always carries a correct pbk.
+		pub, err := proxycore.RealityPublicKeyFromPrivate(out.RealityPrivateKey)
+		if err != nil {
+			return model.ProxyInbound{}, fmt.Errorf("derive reality_public_key: %w", err)
+		}
+		out.RealityPublicKey = pub
+	}
+	if !proxyKeyRe.MatchString(out.RealityPublicKey) {
 		return model.ProxyInbound{}, errors.New("invalid reality_public_key")
 	}
-	shortIDs, err := normalizeProxyShortIDs(req.RealityShortIDs)
+	shortIDsIn := req.RealityShortIDs
+	if len(shortIDsIn) == 0 {
+		// Auto-generate a short id so a freshly created inbound is immediately
+		// renderable (the core requires >=1 non-empty short id).
+		sid, err := proxycore.GenerateRealityShortID(4)
+		if err != nil {
+			return model.ProxyInbound{}, fmt.Errorf("generate reality short id: %w", err)
+		}
+		shortIDsIn = []string{sid}
+	}
+	shortIDs, err := normalizeProxyShortIDs(shortIDsIn)
 	if err != nil {
 		return model.ProxyInbound{}, err
 	}

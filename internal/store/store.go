@@ -618,6 +618,32 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	return s.Save()
 }
 
+// MarkStaleNodesOffline flips Online -> false for every node that is currently
+// Online but whose last heartbeat (LastSeen) is older than threshold. It is the
+// liveness sweep that corrects the otherwise-sticky Online flag (which was only
+// ever set true on a beat and never reset, so a dead node kept showing online
+// forever). It returns the nodes that transitioned online->offline so the caller
+// can audit/notify, and persists once if anything changed.
+func (s *Store) MarkStaleNodesOffline(threshold time.Duration, now time.Time) ([]model.Node, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var flipped []model.Node
+	for nodeID, n := range s.state.Nodes {
+		if n.Online && !n.LastSeen.IsZero() && now.Sub(n.LastSeen) > threshold {
+			n.Online = false
+			s.state.Nodes[nodeID] = n
+			flipped = append(flipped, n)
+		}
+	}
+	if len(flipped) == 0 {
+		return nil, nil
+	}
+	if err := s.Save(); err != nil {
+		return flipped, err
+	}
+	return flipped, nil
+}
+
 func (s *Store) CreateTask(t model.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

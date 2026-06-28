@@ -481,6 +481,52 @@ func (s *Server) startRenewalScheduler() {
 	}()
 }
 
+const (
+	// nodeOfflineThreshold is how long a node may go without a heartbeat before
+	// the liveness sweep marks it offline. The agent beats ~every 10s by default,
+	// so 90s tolerates several missed beats / a brief agent restart without
+	// flapping, while still surfacing a genuinely dead node within ~2 minutes.
+	nodeOfflineThreshold = 90 * time.Second
+	// nodeLivenessSweepInterval is how often the liveness sweep runs.
+	nodeLivenessSweepInterval = 20 * time.Second
+)
+
+// startNodeLivenessSweeper periodically flips nodes whose heartbeat has gone
+// stale to offline. Without it, model.Node.Online (set true on every beat and
+// never reset) stayed sticky-true after an agent died, so the fleet kept showing
+// dead nodes as online and geo-routing kept treating them as healthy.
+func (s *Server) startNodeLivenessSweeper() {
+	go func() {
+		s.sweepNodeLiveness(s.now())
+		ticker := time.NewTicker(nodeLivenessSweepInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.sweepNodeLiveness(s.now())
+		}
+	}()
+}
+
+func (s *Server) sweepNodeLiveness(now time.Time) {
+	flipped, err := s.store.MarkStaleNodesOffline(nodeOfflineThreshold, now)
+	if err != nil {
+		s.logger.Printf("node liveness sweep: %v", err)
+	}
+	for _, n := range flipped {
+		name := n.Name
+		if name == "" {
+			name = n.ID
+		}
+		s.recordAudit(model.AuditEvent{
+			ID:     id.New("audit"),
+			NodeID: n.ID,
+			Action: "node.offline",
+			Scope:  "node:read",
+			Reason: "no heartbeat within liveness threshold",
+		})
+		s.emitNotify("🔌 节点离线", fmt.Sprintf("节点 %s (%s) 超过 %s 未上报心跳，已标记为离线。", name, n.ID, nodeOfflineThreshold))
+	}
+}
+
 func (s *Server) evaluateReminders(now time.Time) {
 	fired, err := s.evaluateMachineReminders(now, "", nil)
 	if err != nil {

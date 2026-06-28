@@ -268,6 +268,7 @@ func New(opts Options) (*Server, error) {
 	s.loadPlugins(opts.PluginDir, opts.PluginTrust)
 	if !opts.DisableRenewalScheduler {
 		s.startRenewalScheduler()
+		s.startNodeLivenessSweeper()
 	}
 	s.startTerminalReaper()
 	return s, nil

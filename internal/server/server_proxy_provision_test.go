@@ -21,8 +21,10 @@ func TestProxyCoreApplyScriptSingBoxAutoProvisions(t *testing.T) {
 		"/etc/systemd/system/sing-box.service",                 // unit path
 		"ExecStart=$SB_RUN run -c $SB_CFG",                     // unit points at the config we apply
 		"systemctl daemon-reload",
-		"sing-box check -c",         // existing config validation preserved
-		"systemctl reload sing-box", // existing reload preserved
+		"sing-box check -c",                  // existing config validation preserved
+		"systemctl reload sing-box",          // existing reload preserved
+		"/opt/lattice/.archive_backup",       // auto-backup before apply
+		"sing-box-$(date -u +%Y%m%d-%H%M%S)", // timestamped per-node archive
 	} {
 		if !strings.Contains(script, needle) {
 			t.Fatalf("sing-box apply script missing %q:\n%s", needle, script)

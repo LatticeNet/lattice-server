@@ -952,6 +952,17 @@ func proxyCoreApplyScript(artifact proxycore.Artifact) string {
 		"DIR=" + shellQuote(dir) + "\n" +
 		"RESTORE_TARGET=none\n" +
 		"mkdir -p \"$DIR\"\n" +
+		// Archive the existing config data (config.json + conf/ if present) before
+		// applying, so every change leaves a timestamped per-node backup. Best
+		// effort: a backup failure must never block or fail the apply.
+		"LATTICE_ARCHIVE=/opt/lattice/.archive_backup\n" +
+		"if command -v tar >/dev/null 2>&1 && { [ -f \"$TARGET\" ] || [ -d \"$DIR/conf\" ]; }; then\n" +
+		"  mkdir -p \"$LATTICE_ARCHIVE\" 2>/dev/null || true\n" +
+		"  LATTICE_BK_ITEMS=\"\"\n" +
+		"  [ -f \"$TARGET\" ] && LATTICE_BK_ITEMS=\"$LATTICE_BK_ITEMS $(basename \"$TARGET\")\"\n" +
+		"  [ -d \"$DIR/conf\" ] && LATTICE_BK_ITEMS=\"$LATTICE_BK_ITEMS conf\"\n" +
+		"  tar -C \"$DIR\" -czf \"$LATTICE_ARCHIVE/" + service + "-$(date -u +%Y%m%d-%H%M%S).tar.gz\" $LATTICE_BK_ITEMS 2>/dev/null || true\n" +
+		"fi\n" +
 		"cleanup_candidate() {\n" +
 		"  rm -f \"$CANDIDATE\"\n" +
 		"}\n" +

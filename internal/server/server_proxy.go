@@ -945,10 +945,7 @@ func proxyCoreApplyScript(artifact proxycore.Artifact) string {
 	}
 	return "set -e\n" +
 		"umask 077\n" +
-		"if ! command -v " + binary + " >/dev/null 2>&1; then\n" +
-		"  echo " + shellQuote("lattice proxycore: "+binary+" binary not found on node") + " >&2\n" +
-		"  exit 1\n" +
-		"fi\n" +
+		proxyCoreEnsureRuntime(artifact.Core, binary, target) +
 		"TARGET=" + shellQuote(target) + "\n" +
 		"CANDIDATE=" + shellQuote(candidate) + "\n" +
 		"BACKUP=" + shellQuote(backup) + "\n" +
@@ -1009,6 +1006,74 @@ func proxyCoreApplyFacts(core string) (binary, service, checkCmd, marker string,
 	default:
 		return "", "", "", "", fmt.Errorf("unsupported proxy core %q", core)
 	}
+}
+
+// defaultSingBoxVersion is the fallback sing-box release used only if the node
+// cannot resolve the latest release tag at provision time. The provision block
+// normally installs whatever the SagerNet "latest" redirect resolves to.
+const defaultSingBoxVersion = "1.11.0"
+
+// proxyCoreEnsureRuntime returns a shell prelude that guarantees the proxy core
+// binary and a service unit exist before config is applied.
+//
+// For sing-box (the prioritized core) it AUTO-PROVISIONS — download the binary
+// and create a systemd unit — but only when they are missing, so an already
+// provisioned node (whether by Lattice or by hand) is left completely untouched
+// and a re-apply has no install side effects (design-09 §E.3, Phase B). The
+// install is gated by the operator approving the plan, whose preview is this
+// very script. For any other core it keeps the original fail-closed behavior:
+// the binary must already be present.
+func proxyCoreEnsureRuntime(core, binary, configPath string) string {
+	if core != model.ProxyCoreSingbox {
+		return "if ! command -v " + binary + " >/dev/null 2>&1; then\n" +
+			"  echo " + shellQuote("lattice proxycore: "+binary+" binary not found on node") + " >&2\n" +
+			"  exit 1\n" +
+			"fi\n"
+	}
+	unitPath := "/etc/systemd/system/sing-box.service"
+	return "SB_BIN=/usr/local/bin/sing-box\n" +
+		"if ! command -v sing-box >/dev/null 2>&1 && [ ! -x \"$SB_BIN\" ]; then\n" +
+		"  echo " + shellQuote("lattice proxycore: sing-box not found, installing ...") + " >&2\n" +
+		"  case \"$(uname -m)\" in\n" +
+		"    x86_64|amd64) SB_ARCH=amd64 ;;\n" +
+		"    aarch64|arm64) SB_ARCH=arm64 ;;\n" +
+		"    armv7l|armv7) SB_ARCH=armv7 ;;\n" +
+		"    *) echo " + shellQuote("lattice proxycore: unsupported arch") + " \"$(uname -m)\" >&2; exit 1 ;;\n" +
+		"  esac\n" +
+		"  SB_VER=\"$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | sed -E 's#.*/tag/v?##')\"\n" +
+		"  [ -n \"$SB_VER\" ] || SB_VER=" + shellQuote(defaultSingBoxVersion) + "\n" +
+		"  SB_NAME=\"sing-box-${SB_VER}-linux-${SB_ARCH}\"\n" +
+		"  SB_URL=\"https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/${SB_NAME}.tar.gz\"\n" +
+		"  SB_TMP=\"$(mktemp -d)\"\n" +
+		"  if command -v curl >/dev/null 2>&1; then curl -fsSL \"$SB_URL\" -o \"$SB_TMP/sb.tgz\";\n" +
+		"  elif command -v wget >/dev/null 2>&1; then wget -qO \"$SB_TMP/sb.tgz\" \"$SB_URL\";\n" +
+		"  else echo " + shellQuote("lattice proxycore: need curl or wget to install sing-box") + " >&2; exit 1; fi\n" +
+		"  tar -xzf \"$SB_TMP/sb.tgz\" -C \"$SB_TMP\"\n" +
+		"  install -m 0755 \"$SB_TMP/${SB_NAME}/sing-box\" \"$SB_BIN\"\n" +
+		"  rm -rf \"$SB_TMP\"\n" +
+		"fi\n" +
+		"command -v sing-box >/dev/null 2>&1 || export PATH=\"/usr/local/bin:$PATH\"\n" +
+		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
+		"  if [ ! -f " + shellQuote(unitPath) + " ] && ! systemctl cat sing-box >/dev/null 2>&1; then\n" +
+		"    SB_RUN=\"$(command -v sing-box || echo /usr/local/bin/sing-box)\"\n" +
+		"    SB_CFG=" + shellQuote(configPath) + "\n" +
+		"    cat > " + shellQuote(unitPath) + " <<LATTICE_SB_UNIT_EOF\n" +
+		"[Unit]\n" +
+		"Description=sing-box (managed by Lattice)\n" +
+		"After=network.target nss-lookup.target\n" +
+		"[Service]\n" +
+		"Type=simple\n" +
+		"ExecStart=$SB_RUN run -c $SB_CFG\n" +
+		"Restart=on-failure\n" +
+		"RestartSec=5s\n" +
+		"LimitNOFILE=1048576\n" +
+		"[Install]\n" +
+		"WantedBy=multi-user.target\n" +
+		"LATTICE_SB_UNIT_EOF\n" +
+		"    systemctl daemon-reload\n" +
+		"    systemctl enable sing-box >/dev/null 2>&1 || true\n" +
+		"  fi\n" +
+		"fi\n"
 }
 
 func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {

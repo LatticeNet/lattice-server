@@ -17,6 +17,8 @@ const (
 	capKVWrite    = "kv:write"
 	capLogWrite   = "log:write"
 	capNotifySend = "notify:send"
+	capRPCCall    = "rpc:call"
+	capRPCExpose  = "rpc:expose"
 
 	// kvBucketPrefix is prepended to a plugin id to derive the fixed,
 	// server-visible KV bucket a plugin is confined to. The plugin never gets to
@@ -75,6 +77,9 @@ type HostServices struct {
 	HTTP   HTTPHost
 	Log    LogHost
 	Audit  HostAudit
+	// RPC dispatches inter-plugin calls (design-09 §F). When nil, a plugin with
+	// rpc:call gets ErrHostServiceUnavailable rather than a panic.
+	RPC RPCHost
 	// GuardURL, when set, validates an outbound HTTP target's URL/host BEFORE the
 	// broker delegates to HTTP.Do. It makes SSRF/egress guarding structural at the
 	// broker boundary rather than relying on every HTTPHost implementation to
@@ -109,6 +114,14 @@ type LogHost interface {
 // HostAudit records broker allow/deny decisions for host API calls.
 type HostAudit interface {
 	RecordHostCall(ctx context.Context, event HostCallEvent)
+}
+
+// RPCHost dispatches an inter-plugin RPC call to a server-owned registry that
+// resolves the target service, enforces the directed caller->callee allow-list,
+// and invokes the callee's handler. caller is the VERIFIED id of the calling
+// plugin, supplied by the broker; a plugin cannot spoof it.
+type RPCHost interface {
+	Call(ctx context.Context, caller, service, method string, request []byte) ([]byte, error)
 }
 
 // HostHTTPRequest is the broker's stable outbound HTTP request shape.
@@ -204,6 +217,13 @@ func (b *Broker) PluginID() string {
 func (b *Broker) HasCapability(cap string) bool {
 	_, ok := b.capabilities[cap]
 	return ok
+}
+
+// CanExposeRPC reports whether the verified plugin declared rpc:expose, i.e. may
+// register a callable service in the inter-plugin RPC registry. The server checks
+// this before registering a plugin's handlers (design-09 §F).
+func (b *Broker) CanExposeRPC() bool {
+	return b.HasCapability(capRPCExpose)
 }
 
 // KVGet reads a KV value and requires kv:read. The plugin-supplied key names
@@ -308,6 +328,36 @@ func (b *Broker) Log(ctx context.Context, level, message string, fields map[stri
 		Message:  boundLogMessage(message),
 		Fields:   boundLogFields(fields),
 	})
+}
+
+// RPCCall invokes method on another plugin's exposed service and requires
+// rpc:call. The broker stamps the VERIFIED caller id (b.pluginID) so the
+// registry can authorize the directed edge; a plugin cannot impersonate another
+// caller. Registry-level denials (ErrRPCDenied) are additionally recorded as a
+// deny event for audit visibility (the capability check itself already recorded
+// an allow). Service/method-not-found are client errors, not security denials,
+// so they are returned without an extra deny event.
+func (b *Broker) RPCCall(ctx context.Context, service, method string, request []byte) ([]byte, error) {
+	if err := b.require(ctx, "rpc.call", capRPCCall); err != nil {
+		return nil, err
+	}
+	if b.services.RPC == nil {
+		return nil, fmt.Errorf("%w: rpc", ErrHostServiceUnavailable)
+	}
+	resp, err := b.services.RPC.Call(ctx, b.pluginID, service, method, append([]byte(nil), request...))
+	if err != nil {
+		if errors.Is(err, ErrRPCDenied) {
+			b.record(ctx, HostCallEvent{
+				PluginID:   b.pluginID,
+				Action:     "rpc.call:" + service + "/" + method,
+				Capability: capRPCCall,
+				Decision:   "deny",
+				Reason:     err.Error(),
+			})
+		}
+		return nil, err
+	}
+	return append([]byte(nil), resp...), nil
 }
 
 // normalizeLogLevel maps an arbitrary plugin-supplied level to the closed set of

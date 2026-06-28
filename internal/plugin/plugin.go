@@ -77,6 +77,14 @@ var capabilityRisk = map[string]string{
 	"static:write":    RiskHost,
 	"task:run":        RiskHost,
 	"tunnel:admin":    RiskHost,
+	// Inter-plugin RPC (design-09 §F). rpc:expose lets a plugin register a
+	// callable service; rpc:call lets a plugin invoke another plugin's service
+	// through the broker. Both are host-risk (system-only, signed in prod): a
+	// plugin reaching into another plugin's logic is a powerful primitive that
+	// must go through the operator's trust policy, the capability gate, the
+	// server-owned registry's directed allow-list, and the audit log.
+	"rpc:call":   RiskHost,
+	"rpc:expose": RiskHost,
 }
 
 // hostRiskExemptForNonSystem lists host-risk capabilities that non-system plugins

@@ -116,8 +116,7 @@ func (s *Server) vpnCoreExportNodes(request []byte) ([]byte, error) {
 	// no specific user filter is requested, giving the Sub-Store companion the
 	// full picture of adopted machines.
 	if includeDiscovered && req.UserID == "" {
-		s.singboxInvMu.RLock()
-		for _, inv := range s.singboxInv {
+		for _, inv := range s.liveSingBoxInventories(s.now()) {
 			if inv.Status != "" && inv.Status != "ok" {
 				out.Warnings = append(out.Warnings, fmt.Sprintf("node %s discovery status %q: %s", inv.NodeID, inv.Status, inv.Error))
 				continue
@@ -126,7 +125,6 @@ func (s *Server) vpnCoreExportNodes(request []byte) ([]byte, error) {
 				appendLink(n.ShareURL)
 			}
 		}
-		s.singboxInvMu.RUnlock()
 	}
 
 	out.Count = len(out.Links)

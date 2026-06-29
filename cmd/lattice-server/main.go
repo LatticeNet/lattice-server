@@ -42,6 +42,7 @@ func main() {
 	var tlsKey string
 	var pluginDir string
 	var pluginTrust string
+	var pluginRuntimeDir string
 	var masterKeyFile string
 	var publicURL string
 	var coreDNSVersion string
@@ -58,6 +59,7 @@ func main() {
 	flag.StringVar(&tlsKey, "tls-key", os.Getenv("LATTICE_TLS_KEY"), "TLS private key file")
 	flag.StringVar(&pluginDir, "plugin-dir", env("LATTICE_PLUGIN_DIR", ""), "directory of installed plugin bundles (empty disables plugins)")
 	flag.StringVar(&pluginTrust, "plugin-trust", env("LATTICE_PLUGIN_TRUST", ""), "path to the operator plugin trust policy JSON")
+	flag.StringVar(&pluginRuntimeDir, "plugin-runtime-dir", env("LATTICE_PLUGIN_RUNTIME_DIR", ""), "writable dir enabling the Tier-2 system runner (empty keeps the noop runner)")
 	flag.StringVar(&masterKeyFile, "master-key-file", env("LATTICE_MASTER_KEY_FILE", ""), "path to the at-rest encryption master key file (auto-generated under the data dir if unset)")
 	flag.StringVar(&publicURL, "public-url", env("LATTICE_PUBLIC_URL", ""), "externally-reachable base URL (scheme+host), required for OIDC/SSO redirect")
 	flag.StringVar(&coreDNSVersion, "coredns-binary-version", env("LATTICE_COREDNS_BINARY_VERSION", ""), "pinned CoreDNS binary version for self-host DNS apply (requires -coredns-binary-url and -coredns-binary-sha256)")
@@ -138,14 +140,15 @@ func main() {
 			DashboardRef:   os.Getenv("LATTICE_DASHBOARD_COMMIT"),
 			DashboardBuilt: os.Getenv("LATTICE_DASHBOARD_BUILT_AT"),
 		},
-		SecureCookies: secureCookies,
-		TrustProxy:    trustProxy,
-		PluginDir:     pluginDir,
-		PluginTrust:   trustPolicy,
-		PublicURL:     publicURL,
-		CoreDNSBinary: selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
-		GeoResolver:   geoResolver,
-		Logger:        log.Default(),
+		SecureCookies:    secureCookies,
+		TrustProxy:       trustProxy,
+		PluginDir:        pluginDir,
+		PluginRuntimeDir: pluginRuntimeDir,
+		PluginTrust:      trustPolicy,
+		PublicURL:        publicURL,
+		CoreDNSBinary:    selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
+		GeoResolver:      geoResolver,
+		Logger:           log.Default(),
 	})
 	if err != nil {
 		log.Fatal(err)

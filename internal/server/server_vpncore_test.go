@@ -18,6 +18,13 @@ func TestVPNCoreExportIncludesDiscoveredNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// The nodes must exist (the export filters discovery to live nodes), as they
+	// would when a real agent reports.
+	for _, id := range []string{"node-a", "node-b"} {
+		if err := st.UpsertNode(model.Node{ID: id, Name: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	// Inject a discovered inventory (as the agent report would).
 	srv.singboxInvMu.Lock()
 	srv.singboxInv = map[string]model.SingBoxInventory{

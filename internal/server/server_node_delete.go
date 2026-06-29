@@ -179,6 +179,9 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 	}
 	s.proxyDriftMu.Unlock()
 
+	// Step 22: drop the in-memory on-box sing-box discovery mirror for the node.
+	s.removeSingBoxInventory(req.NodeID)
+
 	// Exactly one node.delete audit event, AFTER all cleanups so counts are
 	// final. Audit rows are append-only and never deleted.
 	s.recordPrincipalAudit(p, model.AuditEvent{

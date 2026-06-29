@@ -71,6 +71,11 @@ type Options struct {
 	// time. The zero value is fail-closed: host-risk plugins require a trusted
 	// publisher signature.
 	PluginTrust plugin.TrustPolicy
+	// PluginRuntimeDir, when set, enables the Tier-2 system runner: each system
+	// plugin gets a confined 0700 working dir under this path and its verified
+	// artifact is executed there (design-08). Empty keeps the noop runner (broker
+	// armed, artifact NOT executed) — the deliberate default.
+	PluginRuntimeDir string
 	// PublicURL is the externally-reachable base URL of this server (scheme +
 	// host, no trailing slash), used to build the OIDC redirect URL. Required
 	// for SSO login; empty disables the OIDC start/callback flow.
@@ -268,7 +273,21 @@ func New(opts Options) (*Server, error) {
 	s.emitNotify = s.notifyEvent
 	s.pluginRPC = plugin.NewRPCRegistry()
 	s.registerVPNCoreRPC()
-	s.pluginRuntime = plugin.NewRuntimeManager(s.pluginHostServices())
+	if dir := strings.TrimSpace(opts.PluginRuntimeDir); dir != "" {
+		// Tier-2 system runner: execute verified system-plugin artifacts in a
+		// confined per-plugin dir. Host mutation still flows through the in-core
+		// plan->approve->apply pipeline; the runner only runs the artifact's
+		// request/response actions. EnvAllowlist is empty (a safe fixed PATH is
+		// always provided), so no host env leaks into a plugin.
+		sysRunner := plugin.NewSystemRunner(plugin.SystemRunnerOptions{RuntimeDir: dir})
+		s.pluginRuntime = plugin.NewRuntimeManagerWithOptions(plugin.RuntimeManagerOptions{
+			Services: s.pluginHostServices(),
+			Runners:  map[string]plugin.Runner{plugin.TypeSystem: sysRunner},
+		})
+		s.logger.Printf("plugin runtime: system runner enabled (runtime dir=%s)", dir)
+	} else {
+		s.pluginRuntime = plugin.NewRuntimeManager(s.pluginHostServices())
+	}
 	if err := s.ensureAdmin(opts.AdminUsername, opts.AdminPassword); err != nil {
 		return nil, err
 	}

@@ -3517,6 +3517,14 @@ func toTokenView(t model.Token) tokenView {
 		ServerAllowlist: t.ServerAllowlist,
 		CreatedAt:       t.CreatedAt,
 	}
+	// Serialize empty lists as [] (not null): a nil slice marshals to JSON null,
+	// and clients that do `server_allowlist.length` would throw on it.
+	if v.ServerAllowlist == nil {
+		v.ServerAllowlist = []string{}
+	}
+	if v.Scopes == nil {
+		v.Scopes = []string{}
+	}
 	// Only emit revoked_at for genuinely revoked tokens. encoding/json's omitempty
 	// does NOT omit a zero time.Time (it is a struct), so emitting it raw makes
 	// active tokens look revoked to clients — use a pointer so it is nil (omitted)

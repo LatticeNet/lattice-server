@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
@@ -18,6 +19,9 @@ const (
 	// vpnCoreNodesService is the inter-plugin service id other plugins call to
 	// import live node data (e.g. the Sub-Store companion).
 	vpnCoreNodesService = "latticenet.vpn-core/nodes"
+	// vpnCoreLinesService is the read-model the dashboard calls (via the design-10
+	// gateway) to render the unified, node-grouped Lines view (design-12 S1).
+	vpnCoreLinesService = "latticenet.vpn-core/lines"
 )
 
 // registerVPNCoreRPC registers the in-core vpn-core services on the server's RPC
@@ -31,8 +35,55 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export", "list"}, s.vpnCoreNodesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreNodesService, err)
 	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get"}, s.vpnCoreLinesRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreLinesService, err)
+	}
 	// Grant the first-party Sub-Store companion the directed edge to import nodes.
 	s.pluginRPC.Allow(subStorePluginID, vpnCoreNodesService)
+}
+
+// vpnCoreLinesRPC serves the vpn-core/lines read-model — the unified, node-grouped
+// view of managed + discovered proxy lines the dashboard renders (design-12 S1).
+//
+//	list             -> {"groups":[{node_id,node_name,lines:[...]}], "count":N}
+//	get {line_hash_id} -> {"line": {...}}
+func (s *Server) vpnCoreLinesRPC(_ context.Context, method string, request []byte) ([]byte, error) {
+	switch method {
+	case "list":
+		groups := s.buildLineGroups()
+		count := 0
+		for _, g := range groups {
+			count += len(g.Lines)
+		}
+		return json.Marshal(struct {
+			Groups []LineGroup `json:"groups"`
+			Count  int         `json:"count"`
+		}{Groups: groups, Count: count})
+	case "get":
+		var req struct {
+			LineHashID string `json:"line_hash_id"`
+		}
+		if len(bytes.TrimSpace(request)) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, fmt.Errorf("vpn-core/lines get: invalid request: %w", err)
+			}
+		}
+		if strings.TrimSpace(req.LineHashID) == "" {
+			return nil, fmt.Errorf("vpn-core/lines get: line_hash_id required")
+		}
+		for _, g := range s.buildLineGroups() {
+			for _, ln := range g.Lines {
+				if ln.LineHashID == req.LineHashID {
+					return json.Marshal(struct {
+						Line Line `json:"line"`
+					}{Line: ln})
+				}
+			}
+		}
+		return nil, fmt.Errorf("vpn-core/lines get: line %q not found", req.LineHashID)
+	default:
+		return nil, fmt.Errorf("vpn-core/lines: unknown method %q", method)
+	}
 }
 
 // vpnCoreNodesRPC serves the vpn-core/nodes inter-plugin service — the seam the

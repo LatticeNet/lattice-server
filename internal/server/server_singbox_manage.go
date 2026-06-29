@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -113,9 +114,16 @@ func buildSingBoxProbeScript(taskID, addr string) string {
 // nodeSBAddr returns the address to pass as `sb --addr` so share links render
 // with the right host: the node's public IP (falls back to empty -> the script
 // keeps whatever it autodetects, but we always try to provide one).
+//
+// PublicIP is agent-reported and therefore only as trustworthy as the agent.
+// shellQuote already neutralises any injection, but a malformed value (a stray
+// hostname fragment, an unbracketed IPv6 address, garbage) would make `sb --addr`
+// fail or emit wrong share URLs with no diagnostic. So we only forward a value
+// that parses as a real IP and otherwise fall back to "" (the script then keeps
+// whatever sb autodetects), keeping the probe robust against bad heartbeat data.
 func (s *Server) nodeSBAddr(nodeID string) string {
 	if n, ok := s.store.Node(nodeID); ok {
-		if ip := strings.TrimSpace(n.PublicIP); ip != "" {
+		if ip := strings.TrimSpace(n.PublicIP); ip != "" && net.ParseIP(ip) != nil {
 			return ip
 		}
 	}

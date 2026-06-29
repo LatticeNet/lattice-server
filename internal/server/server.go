@@ -644,6 +644,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/plugins", s.withAuth("audit:read", s.handlePlugins))
 	mux.HandleFunc("/api/plugins/lifecycle", s.withAuth("plugin:admin", s.handlePluginLifecycle))
 	mux.HandleFunc("/api/plugins/verify", s.withAuth("plugin:verify", s.handlePluginVerify))
+	mux.HandleFunc("/api/plugins/invoke", s.withAuth("plugin:admin", s.handlePluginInvoke))
 	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
 	mux.HandleFunc("/api/storage/buckets", s.withAuth("", s.handleStorageBuckets))

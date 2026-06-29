@@ -172,6 +172,27 @@ func TestSystemRunnerBreakerResetsOnSuccess(t *testing.T) {
 	}
 }
 
+// Gate (design-12 runtime review HIGH-1): a valid terminal reply followed by a
+// non-zero exit (noisy teardown) must NOT count as a failure — the reply is
+// returned and the circuit breaker stays closed even past CrashThreshold.
+func TestSystemRunnerValidReplySurvivesNonZeroExit(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{CrashThreshold: 3})
+	// drains stdin, writes a valid reply, then exits non-zero
+	loaded := makeBundle(t, "p.noisyexit", "#!/bin/sh\nIN=$(cat)\necho '{\"ok\":true,\"message\":\"done\"}'\nexit 1\n", "")
+	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := 0; i < 6; i++ { // > CrashThreshold(3): breaker must never trip on a valid reply
+		resp, err := r.Invoke(context.Background(), InvokeRequest{PluginID: loaded.Manifest.ID, Action: "plan"})
+		if err != nil {
+			t.Fatalf("invoke %d: unexpected error (valid reply must not trip the breaker): %v", i, err)
+		}
+		if !resp.OK || resp.Message != "done" {
+			t.Fatalf("invoke %d: unexpected response %+v", i, resp)
+		}
+	}
+}
+
 // Gate: digest mismatch at start is rejected (TOCTOU defense).
 func TestSystemRunnerDigestMismatch(t *testing.T) {
 	r := newRunner(t, SystemRunnerOptions{})

@@ -350,8 +350,15 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 			return abort(fmt.Errorf("decode plugin response: %w", err))
 		}
 		_ = hostRespW.Close()
-		if err := wait(); err != nil {
-			return systemRunnerReply{}, stderr.Bytes(), err
+		if werr := wait(); werr != nil {
+			// The plugin already produced a valid terminal reply. A non-zero exit
+			// during teardown (e.g. a noisy cleanup deferred after the reply was
+			// written) must NOT be treated as an invocation failure — doing so would
+			// trip the circuit breaker against an otherwise-correct plugin and
+			// silently disable it (design-12 runtime review HIGH-1). Surface the
+			// exit via stderr (which the caller already returns/logs) and return the
+			// valid reply so the breaker does not trip.
+			fmt.Fprintf(stderr, "\n[lattice] plugin %q exited non-zero after a valid reply: %v\n", req.PluginID, werr)
 		}
 		return reply, stderr.Bytes(), nil
 	}

@@ -3504,20 +3504,28 @@ type tokenView struct {
 	ActorID         string    `json:"actor_id"`
 	Scopes          []string  `json:"scopes"`
 	ServerAllowlist []string  `json:"server_allowlist"`
-	CreatedAt       time.Time `json:"created_at"`
-	RevokedAt       time.Time `json:"revoked_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
 }
 
 func toTokenView(t model.Token) tokenView {
-	return tokenView{
+	v := tokenView{
 		ID:              t.ID,
 		Name:            t.Name,
 		ActorID:         t.ActorID,
 		Scopes:          t.Scopes,
 		ServerAllowlist: t.ServerAllowlist,
 		CreatedAt:       t.CreatedAt,
-		RevokedAt:       t.RevokedAt,
 	}
+	// Only emit revoked_at for genuinely revoked tokens. encoding/json's omitempty
+	// does NOT omit a zero time.Time (it is a struct), so emitting it raw makes
+	// active tokens look revoked to clients — use a pointer so it is nil (omitted)
+	// while the token is active.
+	if !t.RevokedAt.IsZero() {
+		r := t.RevokedAt.UTC()
+		v.RevokedAt = &r
+	}
+	return v
 }
 
 func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principal) {

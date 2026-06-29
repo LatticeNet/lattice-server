@@ -229,6 +229,53 @@ func TestSingBoxManageProbeDeduplicates(t *testing.T) {
 	r3.Body.Close()
 }
 
+func TestSingBoxManageProbeEvictsStaleEntry(t *testing.T) {
+	srv, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	// Probe 1: accepted normally; capture the generated task ID.
+	r1 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+		`{"node_id":"node-a"}`, cookies, csrf)
+	if r1.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(r1.Body)
+		t.Fatalf("probe 1: want 200, got %d (%s)", r1.StatusCode, b)
+	}
+	var out1 struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.NewDecoder(r1.Body).Decode(&out1); err != nil || out1.TaskID == "" {
+		t.Fatalf("probe 1: missing task_id: %v", err)
+	}
+	r1.Body.Close()
+
+	// Cancel the task directly via the store to force it into a terminal state
+	// without going through handleSingBoxProbeTaskResult, which would clear the
+	// pending-map entry. The entry "node-a" -> out1.TaskID still exists.
+	if _, err := srv.store.CancelTask(out1.TaskID); err != nil {
+		t.Fatalf("cancel task: %v", err)
+	}
+
+	// Probe 2: the stale-eviction branch should detect that the stored task is
+	// no longer Queued or Leased, evict the entry, and accept the new probe.
+	r2 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+		`{"node_id":"node-a"}`, cookies, csrf)
+	if r2.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(r2.Body)
+		t.Fatalf("probe 2 after stale eviction: want 200, got %d (%s)", r2.StatusCode, b)
+	}
+	var out2 struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.NewDecoder(r2.Body).Decode(&out2); err != nil || out2.TaskID == "" {
+		t.Fatalf("probe 2: missing task_id: %v", err)
+	}
+	r2.Body.Close()
+	if out2.TaskID == out1.TaskID {
+		t.Fatalf("probe 2 reused the cancelled task ID; expected a fresh task")
+	}
+}
+
 func TestSingBoxProbeTaskResultErrorPaths(t *testing.T) {
 	tests := []struct {
 		name            string

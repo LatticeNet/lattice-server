@@ -31,6 +31,7 @@ var (
 	pluginMethodRe        = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,48}$`)
 	pluginServiceSuffixRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]{0,127}$`)
 	pluginBuiltinViews    = map[string]string{
+		"vpn-core.lines":      "latticenet.vpn-core",
 		"proxy.inbounds":      "latticenet.vpn-core",
 		"proxy.users":         "latticenet.vpn-core",
 		"proxy.profiles":      "latticenet.vpn-core",

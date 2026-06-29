@@ -22,6 +22,11 @@ const (
 	// vpnCoreLinesService is the read-model the dashboard calls (via the design-10
 	// gateway) to render the unified, node-grouped Lines view (design-12 S1).
 	vpnCoreLinesService = "latticenet.vpn-core/lines"
+	// vpnCoreUsersService is the read side of the identity model (design-12 S2),
+	// scoped proxy:read; vpnCoreUsersAdminService carries the mutations at
+	// proxy:admin so reads and writes are gated independently by the gateway.
+	vpnCoreUsersService      = "latticenet.vpn-core/users"
+	vpnCoreUsersAdminService = "latticenet.vpn-core/users-admin"
 )
 
 // registerVPNCoreRPC registers the in-core vpn-core services on the server's RPC
@@ -37,6 +42,12 @@ func (s *Server) registerVPNCoreRPC() {
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get"}, s.vpnCoreLinesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreLinesService, err)
+	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersService, "v1", []string{"list", "get"}, s.vpnCoreUsersRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersService, err)
+	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersAdminService, "v1", []string{"create", "update", "delete", "bind", "unbind"}, s.vpnCoreUsersAdminRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersAdminService, err)
 	}
 	// Grant the first-party Sub-Store companion the directed edge to import nodes.
 	s.pluginRPC.Allow(subStorePluginID, vpnCoreNodesService)

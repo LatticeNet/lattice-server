@@ -880,6 +880,13 @@ func (s *Store) PutKV(entry model.KVEntry) error {
 	return s.Save()
 }
 
+func (s *Store) DeleteKV(bucket, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.state.KV, bucket+"/"+key)
+	return s.Save()
+}
+
 func (s *Store) KV(bucket string) []model.KVEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()

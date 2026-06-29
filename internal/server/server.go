@@ -189,12 +189,13 @@ type Server struct {
 	singboxInvMu sync.RWMutex
 	singboxInv   map[string]model.SingBoxInventory
 
-	// pendingSingboxProbeNodeIDs tracks nodes for which a probe task is currently
-	// queued or leased. A second probe request for the same node is rejected with
-	// 409 Conflict until the first result arrives, preventing unbounded task
-	// pile-up against slow or offline nodes.
+	// pendingSingboxProbeNodeIDs maps a node ID to the task ID of the most recent
+	// probe task. A second probe request for the same node is rejected with 409
+	// Conflict if the stored task is still Queued or Leased. If the agent went
+	// offline without reporting, the entry is stale and is evicted on the next
+	// probe request after checking the actual task status.
 	pendingSingboxProbeMu      sync.Mutex
-	pendingSingboxProbeNodeIDs map[string]struct{}
+	pendingSingboxProbeNodeIDs map[string]string // nodeID → probe task ID
 }
 
 const (

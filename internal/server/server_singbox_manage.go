@@ -142,23 +142,34 @@ func (s *Server) handleSingBoxManageProbe(w http.ResponseWriter, r *http.Request
 	}
 	s.pendingSingboxProbeMu.Lock()
 	if s.pendingSingboxProbeNodeIDs == nil {
-		s.pendingSingboxProbeNodeIDs = map[string]struct{}{}
+		s.pendingSingboxProbeNodeIDs = map[string]string{}
 	}
-	if _, alreadyPending := s.pendingSingboxProbeNodeIDs[req.NodeID]; alreadyPending {
-		s.pendingSingboxProbeMu.Unlock()
-		writeError(w, http.StatusConflict, errors.New("a probe is already in progress for this node"))
-		return
+	if pendingTaskID, alreadyPending := s.pendingSingboxProbeNodeIDs[req.NodeID]; alreadyPending {
+		// Check whether the stored task is still active. If the agent went offline
+		// or timed out without reporting a result, the entry is stale and should be
+		// evicted so the operator can retry without restarting the server.
+		taskStillActive := false
+		if t, ok := s.store.Task(pendingTaskID); ok {
+			taskStillActive = t.Status == model.TaskQueued || t.Status == model.TaskLeased
+		}
+		if taskStillActive {
+			s.pendingSingboxProbeMu.Unlock()
+			writeError(w, http.StatusConflict, errors.New("a probe is already in progress for this node"))
+			return
+		}
+		// Stale entry: evict and allow a fresh probe.
+		delete(s.pendingSingboxProbeNodeIDs, req.NodeID)
 	}
-	s.pendingSingboxProbeNodeIDs[req.NodeID] = struct{}{}
-	s.pendingSingboxProbeMu.Unlock()
+	// Hold the mutex through task creation so the task ID is recorded
+	// atomically — no concurrent probe can observe a blank-ID placeholder.
 	task, err := s.queueSingBoxProbeTask(p, req.NodeID)
 	if err != nil {
-		s.pendingSingboxProbeMu.Lock()
-		delete(s.pendingSingboxProbeNodeIDs, req.NodeID)
 		s.pendingSingboxProbeMu.Unlock()
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.pendingSingboxProbeNodeIDs[req.NodeID] = task.ID
+	s.pendingSingboxProbeMu.Unlock()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.manage.probe", Scope: "task:run",
 		Metadata: map[string]string{"task_id": task.ID},

@@ -180,7 +180,7 @@ func TestSingBoxProbeTaskResultRefreshesInventory(t *testing.T) {
 func TestSingBoxManageProbeDeduplicates(t *testing.T) {
 	_, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
-	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 
 	// First probe: must be accepted.
 	r1 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
@@ -199,6 +199,34 @@ func TestSingBoxManageProbeDeduplicates(t *testing.T) {
 		t.Fatalf("second probe: want 409, got %d (%s)", r2.StatusCode, b)
 	}
 	r2.Body.Close()
+
+	// Agent picks up the task and reports a result, which clears the pending slot.
+	tasksRec := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-a", "", nodeToken)
+	if tasksRec.Code != http.StatusOK {
+		t.Fatalf("lease: %d %s", tasksRec.Code, tasksRec.Body.String())
+	}
+	var tasks []struct {
+		ID      string `json:"id"`
+		LeaseID string `json:"lease_id"`
+	}
+	if err := json.NewDecoder(tasksRec.Body).Decode(&tasks); err != nil || len(tasks) != 1 {
+		t.Fatalf("want one task: err=%v tasks=%+v", err, tasks)
+	}
+	result := `{"node_id":"node-a","result":{"task_id":` + string(mustJSON(t, tasks[0].ID)) +
+		`,"lease_id":` + string(mustJSON(t, tasks[0].LeaseID)) + `,"exit_code":0,"stdout":""}}`
+	resultRec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", result, nodeToken)
+	if resultRec.Code != http.StatusOK {
+		t.Fatalf("task result: %d %s", resultRec.Code, resultRec.Body.String())
+	}
+
+	// Third probe after slot is cleared: must be accepted again.
+	r3 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+		`{"node_id":"node-a"}`, cookies, csrf)
+	if r3.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(r3.Body)
+		t.Fatalf("third probe after result: want 200, got %d (%s)", r3.StatusCode, b)
+	}
+	r3.Body.Close()
 }
 
 func TestSingBoxProbeTaskResultErrorPaths(t *testing.T) {

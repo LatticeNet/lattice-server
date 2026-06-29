@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/LatticeNet/lattice-server/internal/geoip"
@@ -43,6 +44,7 @@ func main() {
 	var pluginDir string
 	var pluginTrust string
 	var pluginRuntimeDir string
+	var pluginRuntimeEnv string
 	var masterKeyFile string
 	var publicURL string
 	var coreDNSVersion string
@@ -60,6 +62,7 @@ func main() {
 	flag.StringVar(&pluginDir, "plugin-dir", env("LATTICE_PLUGIN_DIR", ""), "directory of installed plugin bundles (empty disables plugins)")
 	flag.StringVar(&pluginTrust, "plugin-trust", env("LATTICE_PLUGIN_TRUST", ""), "path to the operator plugin trust policy JSON")
 	flag.StringVar(&pluginRuntimeDir, "plugin-runtime-dir", env("LATTICE_PLUGIN_RUNTIME_DIR", ""), "writable dir enabling the Tier-2 system runner (empty keeps the noop runner)")
+	flag.StringVar(&pluginRuntimeEnv, "plugin-runtime-env", env("LATTICE_PLUGIN_RUNTIME_ENV", ""), "comma/space-separated environment variable allowlist forwarded to Tier-2 system plugins")
 	flag.StringVar(&masterKeyFile, "master-key-file", env("LATTICE_MASTER_KEY_FILE", ""), "path to the at-rest encryption master key file (auto-generated under the data dir if unset)")
 	flag.StringVar(&publicURL, "public-url", env("LATTICE_PUBLIC_URL", ""), "externally-reachable base URL (scheme+host), required for OIDC/SSO redirect")
 	flag.StringVar(&coreDNSVersion, "coredns-binary-version", env("LATTICE_COREDNS_BINARY_VERSION", ""), "pinned CoreDNS binary version for self-host DNS apply (requires -coredns-binary-url and -coredns-binary-sha256)")
@@ -71,6 +74,10 @@ func main() {
 	if printVersion {
 		fmt.Printf("lattice-server %s (%s, %s)\n", version, commit, date)
 		return
+	}
+	pluginRuntimeEnvAllowlist, err := parseEnvAllowlist(pluginRuntimeEnv)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	trustPolicy, err := loadPluginTrust(pluginTrust)
@@ -144,6 +151,7 @@ func main() {
 		TrustProxy:       trustProxy,
 		PluginDir:        pluginDir,
 		PluginRuntimeDir: pluginRuntimeDir,
+		PluginRuntimeEnv: pluginRuntimeEnvAllowlist,
 		PluginTrust:      trustPolicy,
 		PublicURL:        publicURL,
 		CoreDNSBinary:    selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
@@ -190,6 +198,48 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func parseEnvAllowlist(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
+	})
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+		if !validEnvName(name) {
+			return nil, fmt.Errorf("invalid -plugin-runtime-env variable name %q", name)
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+func validEnvName(name string) bool {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		case c == '_':
+		case i > 0 && c >= '0' && c <= '9':
+		default:
+			return false
+		}
+	}
+	return name != ""
 }
 
 // loadPluginTrust reads the operator plugin trust policy. An empty path yields

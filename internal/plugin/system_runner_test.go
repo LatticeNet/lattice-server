@@ -191,6 +191,70 @@ func TestSystemRunnerDigestMatch(t *testing.T) {
 	}
 }
 
+func TestSystemRunnerHostCallBridge(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{})
+	script := `#!/bin/sh
+read req
+echo '{"host_call":{"id":"rpc","method":"rpc.call","params":{"service":"test.svc","method":"list","request":{"want":"nodes"}}}}'
+read rpc <&3
+echo '{"host_call":{"id":"http","method":"http.do","params":{"method":"POST","url":"https://example.com/api","body":"payload"}}}'
+read http <&3
+printf '{"ok":true,"result":{"rpc":%s,"http":%s}}\n' "$rpc" "$http"
+`
+	loaded := makeBundle(t, "p.bridge", script, "")
+	loaded.Manifest.Capabilities = []string{"rpc:call", "http:egress"}
+	loaded.Capabilities = []string{"rpc:call", "http:egress"}
+	services := &fakeHostServices{kvValues: map[string][]byte{}}
+	broker, err := NewBroker(loaded, HostServices{
+		HTTP: services,
+		RPC: fakeRPCHost(func(ctx context.Context, caller, service, method string, request []byte) ([]byte, error) {
+			if caller != "p.bridge" || service != "test.svc" || method != "list" || string(request) != `{"want":"nodes"}` {
+				t.Fatalf("unexpected rpc call: caller=%s service=%s method=%s request=%s", caller, service, method, request)
+			}
+			return []byte(`{"nodes":2}`), nil
+		}),
+		Audit:    services,
+		GuardURL: func(string) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded, Broker: broker}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	resp, err := r.Invoke(context.Background(), InvokeRequest{PluginID: loaded.Manifest.ID, Action: "call"})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	var got struct {
+		RPC struct {
+			HostResponse struct {
+				OK     bool `json:"ok"`
+				Result struct {
+					Nodes int `json:"nodes"`
+				} `json:"result"`
+			} `json:"host_response"`
+		} `json:"rpc"`
+		HTTP struct {
+			HostResponse struct {
+				OK     bool `json:"ok"`
+				Result struct {
+					StatusCode int `json:"status_code"`
+				} `json:"result"`
+			} `json:"host_response"`
+		} `json:"http"`
+	}
+	if err := json.Unmarshal(resp.Result, &got); err != nil {
+		t.Fatalf("decode result: %v (%s)", err, resp.Result)
+	}
+	if !got.RPC.HostResponse.OK || got.RPC.HostResponse.Result.Nodes != 2 {
+		t.Fatalf("rpc host response wrong: %+v", got.RPC.HostResponse)
+	}
+	if !got.HTTP.HostResponse.OK || got.HTTP.HostResponse.Result.StatusCode != 202 || services.httpCalls != 1 {
+		t.Fatalf("http host response wrong: %+v calls=%d", got.HTTP.HostResponse, services.httpCalls)
+	}
+}
+
 func TestSystemRunnerNotArmed(t *testing.T) {
 	r := newRunner(t, SystemRunnerOptions{})
 	if _, err := r.Invoke(context.Background(), InvokeRequest{PluginID: "nope", Action: "plan"}); err == nil {
@@ -210,6 +274,12 @@ func TestCappedBuffer(t *testing.T) {
 	if got := len(c.Bytes()); got != 100 {
 		t.Fatalf("capped buffer stored %d bytes, want 100", got)
 	}
+}
+
+type fakeRPCHost func(ctx context.Context, caller, service, method string, request []byte) ([]byte, error)
+
+func (f fakeRPCHost) Call(ctx context.Context, caller, service, method string, request []byte) ([]byte, error) {
+	return f(ctx, caller, service, method, request)
 }
 
 // Integration: RuntimeManager routes Invoke to the system runner, and refuses to

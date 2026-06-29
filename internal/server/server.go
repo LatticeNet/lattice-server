@@ -76,6 +76,10 @@ type Options struct {
 	// artifact is executed there (design-08). Empty keeps the noop runner (broker
 	// armed, artifact NOT executed) — the deliberate default.
 	PluginRuntimeDir string
+	// PluginRuntimeEnv is the explicit environment-variable allowlist forwarded
+	// to Tier-2 system plugins. Empty means plugins receive only the runner's
+	// fixed safe PATH/HOME/TMPDIR.
+	PluginRuntimeEnv []string
 	// PublicURL is the externally-reachable base URL of this server (scheme +
 	// host, no trailing slash), used to build the OIDC redirect URL. Required
 	// for SSO login; empty disables the OIDC start/callback flow.
@@ -294,7 +298,10 @@ func New(opts Options) (*Server, error) {
 		// plan->approve->apply pipeline; the runner only runs the artifact's
 		// request/response actions. EnvAllowlist is empty (a safe fixed PATH is
 		// always provided), so no host env leaks into a plugin.
-		sysRunner := plugin.NewSystemRunner(plugin.SystemRunnerOptions{RuntimeDir: dir})
+		sysRunner := plugin.NewSystemRunner(plugin.SystemRunnerOptions{
+			RuntimeDir:   dir,
+			EnvAllowlist: opts.PluginRuntimeEnv,
+		})
 		s.pluginRuntime = plugin.NewRuntimeManagerWithOptions(plugin.RuntimeManagerOptions{
 			Services: s.pluginHostServices(),
 			Runners:  map[string]plugin.Runner{plugin.TypeSystem: sysRunner},

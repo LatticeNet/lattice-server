@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -196,6 +197,20 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	defer cancel()
 	out, err := s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(req.Payload))
 	if err != nil {
+		if errors.Is(err, plugin.ErrRPCNoService) {
+			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, req.Payload)
+			if err == nil {
+				s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "allow", "")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				if len(out) == 0 {
+					_, _ = w.Write([]byte("null"))
+					return
+				}
+				_, _ = w.Write(out)
+				return
+			}
+		}
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -208,6 +223,31 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	_, _ = w.Write(out)
+}
+
+func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service, method string, payload json.RawMessage) ([]byte, error) {
+	if s.pluginRuntime == nil {
+		return nil, errors.New("plugin runtime unavailable")
+	}
+	body, err := json.Marshal(struct {
+		Service string          `json:"service"`
+		Method  string          `json:"method"`
+		Payload json.RawMessage `json:"payload,omitempty"`
+	}{Service: service, Method: method, Payload: payload})
+	if err != nil {
+		return nil, fmt.Errorf("marshal plugin call payload: %w", err)
+	}
+	resp, err := s.pluginRuntime.Invoke(ctx, pluginID, "call", body)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.OK {
+		if resp.Message == "" {
+			resp.Message = "plugin call failed"
+		}
+		return nil, errors.New(resp.Message)
+	}
+	return resp.Result, nil
 }
 
 // pluginCallScopes returns all scopes required to call an ACTIVE plugin's
@@ -242,6 +282,38 @@ func (s *Server) pluginCallScopes(pluginID, service, method string) ([]string, b
 					return uniqueStrings(scopes), true
 				}
 			}
+		}
+	}
+	if scopes, ok := firstPartyBuiltinInterfaceScopes(pluginID, service, method); ok {
+		return scopes, true
+	}
+	return nil, false
+}
+
+func firstPartyBuiltinInterfaceScopes(pluginID, service, method string) ([]string, bool) {
+	if pluginID != vpnCorePluginID {
+		return nil, false
+	}
+	readonly := []string{"proxy:read"}
+	switch service {
+	case vpnCoreNodesService:
+		switch method {
+		case "list", "export":
+			return readonly, true
+		}
+	case vpnCoreLinesService:
+		switch method {
+		case "list", "get":
+			return readonly, true
+		}
+	case vpnCoreUsersService:
+		switch method {
+		case "list", "get":
+			return readonly, true
+		}
+	case vpnCoreUsageService:
+		if method == "query" {
+			return readonly, true
 		}
 	}
 	return nil, false

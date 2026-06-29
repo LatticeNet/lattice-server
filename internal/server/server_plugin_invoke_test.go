@@ -84,6 +84,64 @@ func TestPluginInvokeExecutesArtifact(t *testing.T) {
 	}
 }
 
+func TestPluginCallFallsBackToRuntimeArtifact(t *testing.T) {
+	pluginRoot := t.TempDir()
+	manifest := plugin.Manifest{
+		ID: "test.runtime", Name: "Runtime Test", Type: "system", Version: "0.1.0",
+		Capabilities: []string{"node:read"},
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.runtime/items",
+			Methods: []string{"list"},
+			Scopes:  []string{"proxy:read"},
+		}},
+	}
+	script := "#!/bin/sh\nread line\ncase \"$line\" in *'\"action\":\"call\"'*) echo '{\"ok\":true,\"result\":{\"rows\":[{\"id\":\"from-artifact\"}],\"count\":1}}' ;; *) echo '{\"ok\":false,\"message\":\"unexpected action\"}' ;; esac\n"
+	writeServerBundle(t, pluginRoot, "test.runtime", manifest, []byte(script))
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{
+		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
+		PluginDir:        pluginRoot,
+		PluginRuntimeDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	for _, status := range []string{model.PluginStatusInstalled, model.PluginStatusActive} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle",
+			`{"id":"test.runtime","status":"`+status+`"}`, cookies, csrf)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("lifecycle %s: got %d", status, resp.StatusCode)
+		}
+	}
+
+	readToken := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, nil)
+	call := doBearerJSON(t, handler, http.MethodPost, "/api/plugins/call",
+		`{"id":"test.runtime","service":"test.runtime/items","method":"list"}`, readToken)
+	defer call.Body.Close()
+	if call.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(call.Body)
+		t.Fatalf("runtime call: want 200, got %d (%s)", call.StatusCode, b)
+	}
+	var out struct {
+		Rows []struct {
+			ID string `json:"id"`
+		} `json:"rows"`
+		Count int `json:"count"`
+	}
+	if err := json.NewDecoder(call.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Count != 1 || len(out.Rows) != 1 || out.Rows[0].ID != "from-artifact" {
+		t.Fatalf("plugin call did not execute artifact: %+v", out)
+	}
+}
+
 func TestPluginContributionsAndCallGatewayEnforceActionScopes(t *testing.T) {
 	pluginRoot := t.TempDir()
 	manifest := plugin.Manifest{

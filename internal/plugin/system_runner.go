@@ -1,11 +1,14 @@
 package plugin
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +30,7 @@ const (
 	defaultStopGrace      = 3 * time.Second
 	defaultMaxOutputBytes = 1 << 20 // 1 MiB
 	defaultCrashThreshold = 5
+	defaultMaxHostCalls   = 64
 )
 
 // ErrCircuitOpen is returned once a plugin has failed CrashThreshold times in a
@@ -54,11 +58,14 @@ type SystemRunnerOptions struct {
 	// CrashThreshold trips the circuit breaker after this many consecutive failed
 	// invocations (default 5).
 	CrashThreshold int
+	// MaxHostCalls caps broker calls during one invocation (default 64).
+	MaxHostCalls int
 }
 
 type systemPluginState struct {
 	execPath string
 	workDir  string
+	broker   *Broker
 	failures int
 	tripped  bool
 }
@@ -84,6 +91,9 @@ func NewSystemRunner(opts SystemRunnerOptions) *SystemRunner {
 	}
 	if opts.CrashThreshold <= 0 {
 		opts.CrashThreshold = defaultCrashThreshold
+	}
+	if opts.MaxHostCalls <= 0 {
+		opts.MaxHostCalls = defaultMaxHostCalls
 	}
 	return &SystemRunner{opts: opts, st: map[string]*systemPluginState{}}
 }
@@ -137,7 +147,7 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	}
 
 	r.mu.Lock()
-	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir}
+	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker}
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
 }
@@ -169,8 +179,10 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	st := r.st[req.PluginID]
 	tripped := st != nil && st.tripped
 	execPath, workDir := "", ""
+	var broker *Broker
 	if st != nil {
 		execPath, workDir = st.execPath, st.workDir
+		broker = st.broker
 	}
 	r.mu.Unlock()
 	if st == nil {
@@ -180,50 +192,19 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 		return InvokeResponse{}, fmt.Errorf("%w: %s", ErrCircuitOpen, req.PluginID)
 	}
 
-	input, err := json.Marshal(struct {
-		Action  string          `json:"action"`
-		Payload json.RawMessage `json:"payload,omitempty"`
-	}{Action: req.Action, Payload: req.Payload})
-	if err != nil {
-		return InvokeResponse{}, fmt.Errorf("marshal invoke request: %w", err)
-	}
-	input = append(input, '\n')
-
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	runCtx, cancel := context.WithTimeout(ctx, r.opts.InvokeTimeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, execPath)
-	cmd.Dir = workDir
-	cmd.Env = r.childEnv()
-	cmd.Stdin = bytes.NewReader(input)
-	stdout := &cappedBuffer{limit: r.opts.MaxOutputBytes}
-	stderr := &cappedBuffer{limit: r.opts.MaxOutputBytes}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	// Graceful stop: send SIGTERM when runCtx is done, then SIGKILL after grace.
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
-	cmd.WaitDelay = r.opts.StopGrace
-
-	if runErr := cmd.Run(); runErr != nil {
+	reply, stderr, runErr := r.runInvocation(runCtx, req, execPath, workDir, broker)
+	if runErr != nil {
 		r.recordFailure(req.PluginID)
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			return InvokeResponse{}, fmt.Errorf("plugin %q invocation timed out after %s", req.PluginID, r.opts.InvokeTimeout)
 		}
-		return InvokeResponse{}, fmt.Errorf("plugin %q invocation failed: %w (stderr: %s)", req.PluginID, runErr, truncForErr(stderr.Bytes()))
-	}
-
-	var reply struct {
-		OK      bool            `json:"ok"`
-		Message string          `json:"message"`
-		Result  json.RawMessage `json:"result"`
-		Plan    json.RawMessage `json:"plan"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &reply); err != nil {
-		r.recordFailure(req.PluginID)
-		return InvokeResponse{}, fmt.Errorf("plugin %q returned invalid JSON: %w", req.PluginID, err)
+		return InvokeResponse{}, fmt.Errorf("plugin %q invocation failed: %w (stderr: %s)", req.PluginID, runErr, truncForErr(stderr))
 	}
 	result := reply.Result
 	if len(result) == 0 {
@@ -231,10 +212,307 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	}
 	r.recordSuccess(req.PluginID)
 	if !reply.OK {
-		return InvokeResponse{OK: false, Message: reply.Message, Result: result},
-			fmt.Errorf("plugin %q reported failure: %s", req.PluginID, reply.Message)
+		msg := reply.Message
+		if msg == "" {
+			msg = reply.Error
+		}
+		return InvokeResponse{OK: false, Message: msg, Result: result},
+			fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
 	}
 	return InvokeResponse{OK: true, Message: reply.Message, Result: result}, nil
+}
+
+type systemRunnerReply struct {
+	OK      bool            `json:"ok"`
+	Message string          `json:"message"`
+	Result  json.RawMessage `json:"result"`
+	Plan    json.RawMessage `json:"plan"`
+	Error   string          `json:"error"`
+}
+
+type systemHostCall struct {
+	ID     string          `json:"id,omitempty"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
+type systemHostResponseEnvelope struct {
+	HostResponse systemHostResponse `json:"host_response"`
+}
+
+type systemHostResponse struct {
+	ID     string          `json:"id,omitempty"`
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  string          `json:"error,omitempty"`
+}
+
+func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, execPath, workDir string, broker *Broker) (systemRunnerReply, []byte, error) {
+	cmd := exec.CommandContext(ctx, execPath)
+	cmd.Dir = workDir
+	cmd.Env = append(r.childEnv(), "LATTICE_HOST_RESPONSE_FD=3")
+	// Graceful stop: send SIGTERM when ctx is done, then SIGKILL after grace.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return signalProcessGroup(cmd.Process, syscall.SIGTERM) }
+	cmd.WaitDelay = r.opts.StopGrace
+
+	hostRespR, hostRespW, err := os.Pipe()
+	if err != nil {
+		return systemRunnerReply{}, nil, fmt.Errorf("open host response pipe: %w", err)
+	}
+	cmd.ExtraFiles = append(cmd.ExtraFiles, hostRespR)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		_ = hostRespR.Close()
+		_ = hostRespW.Close()
+		return systemRunnerReply{}, nil, fmt.Errorf("open stdin: %w", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = hostRespR.Close()
+		_ = hostRespW.Close()
+		return systemRunnerReply{}, nil, fmt.Errorf("open stdout: %w", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		_ = hostRespR.Close()
+		_ = hostRespW.Close()
+		return systemRunnerReply{}, nil, fmt.Errorf("open stderr: %w", err)
+	}
+	stderr := &cappedBuffer{limit: r.opts.MaxOutputBytes}
+	stderrDone := make(chan struct{})
+
+	waited := false
+	wait := func() error {
+		waited = true
+		err := cmd.Wait()
+		<-stderrDone
+		return err
+	}
+	abort := func(cause error) (systemRunnerReply, []byte, error) {
+		_ = stdin.Close()
+		_ = hostRespW.Close()
+		if cmd.Process != nil {
+			_ = signalProcessGroup(cmd.Process, syscall.SIGKILL)
+		}
+		if !waited {
+			_ = wait()
+		}
+		return systemRunnerReply{}, stderr.Bytes(), cause
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = hostRespR.Close()
+		_ = hostRespW.Close()
+		return systemRunnerReply{}, stderr.Bytes(), fmt.Errorf("start artifact: %w", err)
+	}
+	_ = hostRespR.Close()
+	go func() {
+		_, _ = io.Copy(stderr, stderrPipe)
+		close(stderrDone)
+	}()
+
+	enc := json.NewEncoder(stdin)
+	hostEnc := json.NewEncoder(hostRespW)
+	if err := enc.Encode(struct {
+		Action  string          `json:"action"`
+		Payload json.RawMessage `json:"payload,omitempty"`
+	}{Action: req.Action, Payload: req.Payload}); err != nil {
+		return abort(fmt.Errorf("write invoke request: %w", err))
+	}
+	_ = stdin.Close()
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), r.opts.MaxOutputBytes)
+	hostCalls := 0
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		if call, ok, err := decodeSystemHostCall(line); err != nil {
+			return abort(err)
+		} else if ok {
+			hostCalls++
+			if hostCalls > r.opts.MaxHostCalls {
+				return abort(fmt.Errorf("plugin exceeded host-call limit %d", r.opts.MaxHostCalls))
+			}
+			resp := r.handleHostCall(ctx, broker, call)
+			if err := hostEnc.Encode(systemHostResponseEnvelope{HostResponse: resp}); err != nil {
+				return abort(fmt.Errorf("write host response: %w", err))
+			}
+			continue
+		}
+
+		var reply systemRunnerReply
+		if err := json.Unmarshal(line, &reply); err != nil {
+			return abort(fmt.Errorf("decode plugin response: %w", err))
+		}
+		_ = hostRespW.Close()
+		if err := wait(); err != nil {
+			return systemRunnerReply{}, stderr.Bytes(), err
+		}
+		return reply, stderr.Bytes(), nil
+	}
+	if err := scanner.Err(); err != nil {
+		return abort(fmt.Errorf("read plugin stdout: %w", err))
+	}
+	_ = hostRespW.Close()
+	if err := wait(); err != nil {
+		return systemRunnerReply{}, stderr.Bytes(), err
+	}
+	return systemRunnerReply{}, stderr.Bytes(), errors.New("plugin exited without a response")
+}
+
+func decodeSystemHostCall(line []byte) (systemHostCall, bool, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(line, &envelope); err != nil {
+		return systemHostCall{}, false, nil
+	}
+	raw, ok := envelope["host_call"]
+	if !ok {
+		return systemHostCall{}, false, nil
+	}
+	var call systemHostCall
+	if err := json.Unmarshal(raw, &call); err != nil {
+		return systemHostCall{}, false, fmt.Errorf("decode host_call: %w", err)
+	}
+	if call.Method == "" {
+		return systemHostCall{}, false, errors.New("host_call method is required")
+	}
+	return call, true, nil
+}
+
+func signalProcessGroup(proc *os.Process, sig syscall.Signal) error {
+	if proc == nil {
+		return nil
+	}
+	if err := syscall.Kill(-proc.Pid, sig); err != nil {
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return proc.Signal(sig)
+	}
+	return nil
+}
+
+func (r *SystemRunner) handleHostCall(ctx context.Context, broker *Broker, call systemHostCall) systemHostResponse {
+	result, err := dispatchHostCall(ctx, broker, call)
+	if err != nil {
+		return systemHostResponse{ID: call.ID, OK: false, Error: err.Error()}
+	}
+	return systemHostResponse{ID: call.ID, OK: true, Result: result}
+}
+
+func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) (json.RawMessage, error) {
+	if broker == nil {
+		return nil, errors.New("plugin broker unavailable")
+	}
+	switch call.Method {
+	case "rpc.call":
+		var req struct {
+			Service string          `json:"service"`
+			Method  string          `json:"method"`
+			Request json.RawMessage `json:"request,omitempty"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("rpc.call params: %w", err)
+		}
+		return broker.RPCCall(ctx, req.Service, req.Method, req.Request)
+	case "http.do":
+		var req struct {
+			Method     string            `json:"method,omitempty"`
+			URL        string            `json:"url"`
+			Header     map[string]string `json:"header,omitempty"`
+			Body       string            `json:"body,omitempty"`
+			BodyBase64 string            `json:"body_base64,omitempty"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("http.do params: %w", err)
+		}
+		body := []byte(req.Body)
+		if req.BodyBase64 != "" {
+			decoded, err := base64.StdEncoding.DecodeString(req.BodyBase64)
+			if err != nil {
+				return nil, fmt.Errorf("http.do body_base64: %w", err)
+			}
+			body = decoded
+		}
+		resp, err := broker.HTTPDo(ctx, HostHTTPRequest{Method: req.Method, URL: req.URL, Header: req.Header, Body: body})
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(struct {
+			StatusCode int               `json:"status_code"`
+			Header     map[string]string `json:"header,omitempty"`
+			BodyBase64 string            `json:"body_base64,omitempty"`
+		}{StatusCode: resp.StatusCode, Header: resp.Header, BodyBase64: base64.StdEncoding.EncodeToString(resp.Body)})
+	case "kv.get":
+		var req struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("kv.get params: %w", err)
+		}
+		value, ok, err := broker.KVGet(ctx, req.Key)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(struct {
+			OK          bool   `json:"ok"`
+			Value       string `json:"value,omitempty"`
+			ValueBase64 string `json:"value_base64,omitempty"`
+		}{OK: ok, Value: string(value), ValueBase64: base64.StdEncoding.EncodeToString(value)})
+	case "kv.put":
+		var req struct {
+			Key         string `json:"key"`
+			Value       string `json:"value,omitempty"`
+			ValueBase64 string `json:"value_base64,omitempty"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("kv.put params: %w", err)
+		}
+		value := []byte(req.Value)
+		if req.ValueBase64 != "" {
+			decoded, err := base64.StdEncoding.DecodeString(req.ValueBase64)
+			if err != nil {
+				return nil, fmt.Errorf("kv.put value_base64: %w", err)
+			}
+			value = decoded
+		}
+		if err := broker.KVPut(ctx, req.Key, value); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{}`), nil
+	case "notify.send":
+		var req struct {
+			Title string `json:"title"`
+			Body  string `json:"body"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("notify.send params: %w", err)
+		}
+		if err := broker.Notify(ctx, req.Title, req.Body); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{}`), nil
+	case "log.write":
+		var req struct {
+			Level   string            `json:"level"`
+			Message string            `json:"message"`
+			Fields  map[string]string `json:"fields,omitempty"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("log.write params: %w", err)
+		}
+		if err := broker.Log(ctx, req.Level, req.Message, req.Fields); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{}`), nil
+	default:
+		return nil, fmt.Errorf("unsupported host_call method %q", call.Method)
+	}
 }
 
 func (r *SystemRunner) recordFailure(pluginID string) {

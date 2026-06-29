@@ -27,6 +27,8 @@ const (
 	// proxy:admin so reads and writes are gated independently by the gateway.
 	vpnCoreUsersService      = "latticenet.vpn-core/users"
 	vpnCoreUsersAdminService = "latticenet.vpn-core/users-admin"
+	// vpnCoreUsageService is the 3-D usage read-model (design-12 S3), proxy:read.
+	vpnCoreUsageService = "latticenet.vpn-core/usage"
 )
 
 // registerVPNCoreRPC registers the in-core vpn-core services on the server's RPC
@@ -48,6 +50,9 @@ func (s *Server) registerVPNCoreRPC() {
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersAdminService, "v1", []string{"create", "update", "delete", "bind", "unbind"}, s.vpnCoreUsersAdminRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersAdminService, err)
+	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsageService, "v1", []string{"query"}, s.vpnCoreUsageRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsageService, err)
 	}
 	// Grant the first-party Sub-Store companion the directed edge to import nodes.
 	s.pluginRPC.Allow(subStorePluginID, vpnCoreNodesService)

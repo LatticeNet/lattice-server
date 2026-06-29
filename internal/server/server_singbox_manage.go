@@ -364,10 +364,19 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 		Nodes:  []model.SingBoxNode{},
 	}
 	status := "ok"
+	updateInventory := true
 	if result.ExitCode != 0 || strings.TrimSpace(result.Error) != "" {
 		status = "error"
 		inv.Status = "error"
 		inv.Error = taskFailureSummary(result)
+		if isAgentExecDisabledTaskResult(result) {
+			// This is a task-execution capability failure, not a sing-box
+			// discovery failure. Do not erase a good read-only inventory reported
+			// by an agent-side discovery source or sidecar; the operator should
+			// still see the runtime config that is actually present on the box.
+			status = "exec_disabled"
+			updateInventory = false
+		}
 	} else if parsed, err := parseSingBoxProbeStdout(result.NodeID, inv.At, result.Stdout); err != nil {
 		status = singBoxProbeResultParseFailed
 		inv.Status = "error"
@@ -376,12 +385,14 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 		inv = parsed
 	}
 
-	s.singboxInvMu.Lock()
-	if s.singboxInv == nil {
-		s.singboxInv = map[string]model.SingBoxInventory{}
+	if updateInventory {
+		s.singboxInvMu.Lock()
+		if s.singboxInv == nil {
+			s.singboxInv = map[string]model.SingBoxInventory{}
+		}
+		s.singboxInv[result.NodeID] = inv
+		s.singboxInvMu.Unlock()
 	}
-	s.singboxInv[result.NodeID] = inv
-	s.singboxInvMu.Unlock()
 
 	// Intentionally does NOT touch pendingSingboxProbeNodeIDs here.
 	// Entries are evicted exclusively by handleSingBoxManageProbe during
@@ -402,6 +413,12 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 			"nodes":   nodes,
 		},
 	})
+}
+
+func isAgentExecDisabledTaskResult(result model.TaskResult) bool {
+	msg := strings.ToLower(strings.TrimSpace(result.Error + "\n" + result.Stderr))
+	return strings.Contains(msg, "agent task execution disabled") ||
+		strings.Contains(msg, "restart with -allow-exec=true")
 }
 
 func taskResultInventoryTime(result model.TaskResult, fallback time.Time) time.Time {

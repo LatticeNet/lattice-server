@@ -434,6 +434,66 @@ func TestSingBoxProbeTaskResultErrorPaths(t *testing.T) {
 	}
 }
 
+func TestSingBoxProbeExecDisabledDoesNotEraseReadOnlyInventory(t *testing.T) {
+	srv, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-noexec", "Node NoExec")
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"node-noexec": {
+			NodeID: "node-noexec",
+			Status: "ok",
+			Nodes:  []model.SingBoxNode{{Name: "VLESS-REALITY-31001.json", Protocol: "vless", Port: "31001"}},
+		},
+	}
+	srv.singboxInvMu.Unlock()
+
+	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+		`{"node_id":"node-noexec"}`, cookies, csrf)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("probe: want 200, got %d (%s)", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+
+	tasksRec := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-noexec", "", nodeToken)
+	if tasksRec.Code != http.StatusOK {
+		t.Fatalf("lease failed: %d %s", tasksRec.Code, tasksRec.Body.String())
+	}
+	var tasks []struct {
+		ID      string `json:"id"`
+		LeaseID string `json:"lease_id"`
+	}
+	if err := json.NewDecoder(tasksRec.Body).Decode(&tasks); err != nil || len(tasks) != 1 {
+		t.Fatalf("want one task: err=%v tasks=%+v", err, tasks)
+	}
+	result := `{"node_id":"node-noexec","result":{"task_id":` + string(mustJSON(t, tasks[0].ID)) +
+		`,"lease_id":` + string(mustJSON(t, tasks[0].LeaseID)) +
+		`,"exit_code":-1,"error":"agent task execution disabled; restart with -allow-exec=true to enable"}}`
+	resultRec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", result, nodeToken)
+	if resultRec.Code != http.StatusOK {
+		t.Fatalf("task result failed: %d %s", resultRec.Code, resultRec.Body.String())
+	}
+
+	discovered := doJSON(t, handler, http.MethodGet, "/api/proxy/discovered", "", cookies, csrf)
+	if discovered.StatusCode != http.StatusOK {
+		t.Fatalf("discovered failed: %d", discovered.StatusCode)
+	}
+	var out struct {
+		Inventories []model.SingBoxInventory `json:"inventories"`
+	}
+	if err := json.NewDecoder(discovered.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	discovered.Body.Close()
+	if len(out.Inventories) != 1 || out.Inventories[0].Status != "ok" || len(out.Inventories[0].Nodes) != 1 {
+		t.Fatalf("exec-disabled probe erased read-only inventory: %+v", out.Inventories)
+	}
+	if out.Inventories[0].Nodes[0].Name != "VLESS-REALITY-31001.json" {
+		t.Fatalf("wrong preserved node: %+v", out.Inventories[0].Nodes)
+	}
+}
+
 func TestSingBoxManageDeleteRequiresDiscoveredName(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)

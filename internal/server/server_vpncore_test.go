@@ -95,12 +95,14 @@ func TestVPNCoreNodesRPCRegisteredAndExports(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	// The in-core vpn-core/nodes service is registered with the export method.
+	// The in-core vpn-core/nodes service is registered with the export + list
+	// methods (list backs the design-10 plugin-contributed Nodes table; Services()
+	// returns methods sorted, so the expected slice is ["export","list"]).
 	var found bool
 	for _, d := range srv.pluginRPC.Services() {
 		if d.Service == vpnCoreNodesService {
 			found = true
-			if len(d.Methods) != 1 || d.Methods[0] != "export" {
+			if len(d.Methods) != 2 || d.Methods[0] != "export" || d.Methods[1] != "list" {
 				t.Fatalf("unexpected methods: %+v", d.Methods)
 			}
 			if d.Owner != vpnCorePluginID {
@@ -126,6 +128,26 @@ func TestVPNCoreNodesRPCRegisteredAndExports(t *testing.T) {
 	}
 	if resp.Count != 0 || len(resp.Links) != 0 {
 		t.Fatalf("expected empty export, got %+v", resp)
+	}
+
+	// list (the design-10 table data source) returns a valid, empty envelope on
+	// an empty store — rows is a non-nil [] so the dashboard table renders cleanly.
+	listOut, err := srv.pluginRPC.Call(context.Background(), vpnCorePluginID, vpnCoreNodesService, "list", nil)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var listResp struct {
+		Rows  []map[string]any `json:"rows"`
+		Count int              `json:"count"`
+	}
+	if err := json.Unmarshal(listOut, &listResp); err != nil {
+		t.Fatalf("unmarshal list: %v", err)
+	}
+	if listResp.Rows == nil {
+		t.Fatalf("list rows must be non-nil JSON array, got null")
+	}
+	if listResp.Count != 0 || len(listResp.Rows) != 0 {
+		t.Fatalf("expected empty list, got %+v", listResp)
 	}
 
 	// Unknown method is rejected by the handler.

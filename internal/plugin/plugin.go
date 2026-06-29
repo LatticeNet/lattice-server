@@ -34,6 +34,11 @@ type Manifest struct {
 	Publisher        string   `json:"publisher,omitempty"`
 	DigestSHA256     string   `json:"digest_sha256,omitempty"`
 	SignatureEd25519 string   `json:"signature_ed25519,omitempty"`
+	// UI + Interfaces are the design-10 dashboard contributions: declarative data
+	// (nav/views) + the interfaces the plugin exposes. They are covered by the
+	// signature (see SigningPayload) so a tampered contribution fails verification.
+	UI         *ManifestUI         `json:"ui,omitempty"`
+	Interfaces []InterfaceContract `json:"interfaces,omitempty"`
 }
 
 type TrustPolicy struct {
@@ -143,6 +148,9 @@ func ValidateManifest(m Manifest) error {
 			return fmt.Errorf("capability %q is not available to worker plugins", cap)
 		}
 	}
+	if err := validateContributions(m); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -246,6 +254,15 @@ func SigningPayload(m Manifest) []byte {
 		m.Publisher,
 		m.DigestSHA256,
 		strings.Join(caps, "\x00"),
+	}
+	// Backward compatible: only manifests that declare dashboard contributions
+	// extend the payload, so existing signed manifests (no ui/interfaces) keep
+	// verifying. ui/interfaces are structs, so json.Marshal is deterministic
+	// (declaration-order keys) and thus a stable signing input.
+	if m.UI != nil || len(m.Interfaces) > 0 {
+		uiJSON, _ := json.Marshal(m.UI)
+		ifJSON, _ := json.Marshal(m.Interfaces)
+		fields = append(fields, string(uiJSON), string(ifJSON))
 	}
 	return []byte(strings.Join(fields, "\n"))
 }

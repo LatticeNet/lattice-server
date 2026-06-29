@@ -357,12 +357,16 @@ func pluginInstallationFromLoaded(pl plugin.Loaded, status string) model.PluginI
 }
 
 type pluginView struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Type         string   `json:"type"`
-	Version      string   `json:"version,omitempty"`
-	Publisher    string   `json:"publisher,omitempty"`
-	Capabilities []string `json:"capabilities"`
+	ID           string                     `json:"id"`
+	Name         string                     `json:"name"`
+	Type         string                     `json:"type"`
+	Version      string                     `json:"version,omitempty"`
+	Publisher    string                     `json:"publisher,omitempty"`
+	Capabilities []string                   `json:"capabilities"`
+	Status       string                     `json:"status,omitempty"`
+	Active       bool                       `json:"active"`
+	UI           *plugin.ManifestUI         `json:"ui,omitempty"`
+	Interfaces   []plugin.InterfaceContract `json:"interfaces,omitempty"`
 }
 
 type pluginCapabilityView struct {
@@ -406,6 +410,10 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, p princip
 	}
 	views := make([]pluginView, 0, len(s.plugins))
 	for _, pl := range s.plugins {
+		status := ""
+		if inst, ok := s.store.PluginInstallation(pl.Manifest.ID); ok {
+			status = inst.Status
+		}
 		views = append(views, pluginView{
 			ID:           pl.Manifest.ID,
 			Name:         pl.Manifest.Name,
@@ -413,6 +421,13 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request, p princip
 			Version:      pl.Manifest.Version,
 			Publisher:    pl.Manifest.Publisher,
 			Capabilities: pl.Capabilities,
+			Status:       status,
+			Active:       status == model.PluginStatusActive,
+			// Contributions are only surfaced for ACTIVE plugins, so the dashboard
+			// shows a plugin's UI exactly when it is active (and hides it when
+			// disabled). Declarative data only — never plugin code.
+			UI:         contributionsIfActive(pl.Manifest.UI, status),
+			Interfaces: pl.Manifest.Interfaces,
 		})
 	}
 	writeJSON(w, http.StatusOK, views)
@@ -645,6 +660,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/plugins/lifecycle", s.withAuth("plugin:admin", s.handlePluginLifecycle))
 	mux.HandleFunc("/api/plugins/verify", s.withAuth("plugin:verify", s.handlePluginVerify))
 	mux.HandleFunc("/api/plugins/invoke", s.withAuth("plugin:admin", s.handlePluginInvoke))
+	mux.HandleFunc("/api/plugins/call", s.withAuth("", s.handlePluginCall))
 	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
 	mux.HandleFunc("/api/storage/buckets", s.withAuth("", s.handleStorageBuckets))

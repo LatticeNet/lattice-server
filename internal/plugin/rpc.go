@@ -137,6 +137,23 @@ func (r *RPCRegistry) Services() []RPCServiceDescriptor {
 	return out
 }
 
+// CallOperator dispatches a service method on behalf of the OPERATOR (the
+// dashboard gateway), bypassing the plugin->plugin directed allow-list — the
+// HTTP layer has already enforced the interface's declared RBAC scopes + audit.
+// Service/method-not-found are still errors. The handler runs OUTSIDE the lock.
+func (r *RPCRegistry) CallOperator(ctx context.Context, service, method string, request []byte) ([]byte, error) {
+	r.mu.RLock()
+	svc := r.services[service]
+	r.mu.RUnlock()
+	if svc == nil {
+		return nil, fmt.Errorf("%w: %s", ErrRPCNoService, service)
+	}
+	if _, ok := svc.methods[method]; !ok {
+		return nil, fmt.Errorf("%w: %s/%s", ErrRPCNoMethod, service, method)
+	}
+	return svc.handler(ctx, method, request)
+}
+
 // Call implements RPCHost: resolve the service, enforce the directed allow-list
 // (the owner may always self-call), check the method, then dispatch to the
 // handler OUTSIDE the lock so a slow or re-entrant handler cannot block the bus.

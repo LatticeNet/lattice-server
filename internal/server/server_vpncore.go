@@ -28,7 +28,7 @@ func (s *Server) registerVPNCoreRPC() {
 	if s.pluginRPC == nil {
 		return
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export"}, s.vpnCoreNodesRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export", "list"}, s.vpnCoreNodesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreNodesService, err)
 	}
 	// Grant the first-party Sub-Store companion the directed edge to import nodes.
@@ -47,9 +47,39 @@ func (s *Server) vpnCoreNodesRPC(_ context.Context, method string, request []byt
 	switch method {
 	case "export":
 		return s.vpnCoreExportNodes(request)
+	case "list":
+		return s.vpnCoreListNodes()
 	default:
 		return nil, fmt.Errorf("vpn-core/nodes: unknown method %q", method)
 	}
+}
+
+// vpnCoreListNodes returns the discovered on-box nodes flattened across all live
+// machines — the data source for the plugin-contributed "vpn-core Nodes" table.
+func (s *Server) vpnCoreListNodes() ([]byte, error) {
+	type row struct {
+		NodeID   string `json:"node_id"`
+		Name     string `json:"name"`
+		Protocol string `json:"protocol,omitempty"`
+		Network  string `json:"network,omitempty"`
+		Port     string `json:"port,omitempty"`
+		Address  string `json:"address,omitempty"`
+		ShareURL string `json:"share_url,omitempty"`
+	}
+	out := struct {
+		Rows  []row `json:"rows"`
+		Count int   `json:"count"`
+	}{Rows: []row{}}
+	for _, inv := range s.liveSingBoxInventories(s.now()) {
+		for _, n := range inv.Nodes {
+			out.Rows = append(out.Rows, row{
+				NodeID: inv.NodeID, Name: n.Name, Protocol: n.Protocol, Network: n.Network,
+				Port: n.Port, Address: n.Address, ShareURL: n.ShareURL,
+			})
+		}
+	}
+	out.Count = len(out.Rows)
+	return json.Marshal(out)
 }
 
 func (s *Server) vpnCoreExportNodes(request []byte) ([]byte, error) {

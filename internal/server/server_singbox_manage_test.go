@@ -256,6 +256,16 @@ func TestSingBoxManageProbeEvictsStaleEntry(t *testing.T) {
 		t.Fatalf("cancel task: %v", err)
 	}
 
+	// Precondition: the pending-map entry must still be present with the
+	// cancelled task's ID. If it were absent, probe 2 would take the
+	// alreadyPending=false path and the test would not cover stale eviction.
+	srv.pendingSingboxProbeMu.Lock()
+	got := srv.pendingSingboxProbeNodeIDs["node-a"]
+	srv.pendingSingboxProbeMu.Unlock()
+	if got != out1.TaskID {
+		t.Fatalf("precondition: pending entry = %q, want %q", got, out1.TaskID)
+	}
+
 	// Probe 2: the stale-eviction branch should detect that the stored task is
 	// no longer Queued or Leased, evict the entry, and accept the new probe.
 	r2 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",

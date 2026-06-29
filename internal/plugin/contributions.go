@@ -34,6 +34,7 @@ var (
 		"vpn-core.lines":      "latticenet.vpn-core",
 		"vpn-core.users":      "latticenet.vpn-core",
 		"vpn-core.usage":      "latticenet.vpn-core",
+		"vpn-core.profiles":   "latticenet.vpn-core",
 		"proxy.inbounds":      "latticenet.vpn-core",
 		"proxy.users":         "latticenet.vpn-core",
 		"proxy.profiles":      "latticenet.vpn-core",

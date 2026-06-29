@@ -31,6 +31,9 @@ const (
 	vpnCoreUsageService = "latticenet.vpn-core/usage"
 	// vpnCoreProfilesService is the per-node runtime read-model (design-12 S4), proxy:read.
 	vpnCoreProfilesService = "latticenet.vpn-core/profiles"
+	// vpnCoreSubscriptionsService is the producer-side subscription state read-model
+	// (design-12 S5); Sub-Store remains the publisher. proxy:read.
+	vpnCoreSubscriptionsService = "latticenet.vpn-core/subscriptions"
 )
 
 // registerVPNCoreRPC registers the in-core vpn-core services on the server's RPC
@@ -58,6 +61,9 @@ func (s *Server) registerVPNCoreRPC() {
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProfilesService, "v1", []string{"query"}, s.vpnCoreProfilesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreProfilesService, err)
+	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionsService, "v1", []string{"query"}, s.vpnCoreSubscriptionsRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreSubscriptionsService, err)
 	}
 	// Grant the first-party Sub-Store companion the directed edge to import nodes.
 	s.pluginRPC.Allow(subStorePluginID, vpnCoreNodesService)

@@ -31,17 +31,18 @@ var (
 	pluginMethodRe        = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,48}$`)
 	pluginServiceSuffixRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]{0,127}$`)
 	pluginBuiltinViews    = map[string]string{
-		"vpn-core.lines":      "latticenet.vpn-core",
-		"vpn-core.users":      "latticenet.vpn-core",
-		"vpn-core.usage":      "latticenet.vpn-core",
-		"vpn-core.profiles":   "latticenet.vpn-core",
-		"proxy.inbounds":      "latticenet.vpn-core",
-		"proxy.users":         "latticenet.vpn-core",
-		"proxy.profiles":      "latticenet.vpn-core",
-		"proxy.subscriptions": "latticenet.vpn-core",
-		"proxy.usage":         "latticenet.vpn-core",
-		"proxy.discovered":    "latticenet.vpn-core",
-		"proxy.substore":      "latticenet.sub-store",
+		"vpn-core.lines":         "latticenet.vpn-core",
+		"vpn-core.users":         "latticenet.vpn-core",
+		"vpn-core.usage":         "latticenet.vpn-core",
+		"vpn-core.profiles":      "latticenet.vpn-core",
+		"vpn-core.subscriptions": "latticenet.vpn-core",
+		"proxy.inbounds":         "latticenet.vpn-core",
+		"proxy.users":            "latticenet.vpn-core",
+		"proxy.profiles":         "latticenet.vpn-core",
+		"proxy.subscriptions":    "latticenet.vpn-core",
+		"proxy.usage":            "latticenet.vpn-core",
+		"proxy.discovered":       "latticenet.vpn-core",
+		"proxy.substore":         "latticenet.sub-store",
 	}
 )
 

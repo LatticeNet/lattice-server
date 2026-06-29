@@ -190,10 +190,13 @@ type Server struct {
 	singboxInv   map[string]model.SingBoxInventory
 
 	// pendingSingboxProbeNodeIDs maps a node ID to the task ID of the most recent
-	// probe task. A second probe request for the same node is rejected with 409
-	// Conflict if the stored task is still Queued or Leased. If the agent went
-	// offline without reporting, the entry is stale and is evicted on the next
-	// probe request after checking the actual task status.
+	// probe task. Entries are written and evicted exclusively by
+	// handleSingBoxManageProbe (under pendingSingboxProbeMu); the result handler
+	// never touches this map. On each new probe, the handler checks the stored
+	// task status: Queued or Leased → 409; any other state → evict stale entry
+	// and queue a fresh probe. This single-writer design eliminates the TOCTOU
+	// where AddTaskResult (updating the store) and a concurrent pending-map clear
+	// could race and delete a legitimately active entry.
 	pendingSingboxProbeMu      sync.Mutex
 	pendingSingboxProbeNodeIDs map[string]string // nodeID → probe task ID
 }

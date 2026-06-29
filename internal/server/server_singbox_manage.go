@@ -339,9 +339,12 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 	s.singboxInv[result.NodeID] = inv
 	s.singboxInvMu.Unlock()
 
-	s.pendingSingboxProbeMu.Lock()
-	delete(s.pendingSingboxProbeNodeIDs, result.NodeID)
-	s.pendingSingboxProbeMu.Unlock()
+	// Intentionally does NOT touch pendingSingboxProbeNodeIDs here.
+	// Entries are evicted exclusively by handleSingBoxManageProbe during
+	// stale detection (when the stored task is no longer Queued or Leased).
+	// Clearing the entry here would race with a concurrent probe that has
+	// already read a terminal task status, evicted the old entry, and written
+	// a new task ID — this delete would silently remove that new entry.
 
 	nodes := strconv.Itoa(len(inv.Nodes))
 	s.recordRequestAudit(r, model.AuditEvent{

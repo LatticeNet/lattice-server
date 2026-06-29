@@ -200,7 +200,9 @@ func TestSingBoxManageProbeDeduplicates(t *testing.T) {
 	}
 	r2.Body.Close()
 
-	// Agent picks up the task and reports a result, which clears the pending slot.
+	// Agent picks up the task and reports a result. The pending-map entry is NOT
+	// cleared here; it stays in the map with the task ID. Probe 3 below will
+	// detect the task is no longer active and evict it via stale detection.
 	tasksRec := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-a", "", nodeToken)
 	if tasksRec.Code != http.StatusOK {
 		t.Fatalf("lease: %d %s", tasksRec.Code, tasksRec.Body.String())
@@ -219,7 +221,7 @@ func TestSingBoxManageProbeDeduplicates(t *testing.T) {
 		t.Fatalf("task result: %d %s", resultRec.Code, resultRec.Body.String())
 	}
 
-	// Third probe after slot is cleared: must be accepted again.
+	// Third probe: stale detection evicts the finished task entry and accepts the new probe.
 	r3 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
 		`{"node_id":"node-a"}`, cookies, csrf)
 	if r3.StatusCode != http.StatusOK {

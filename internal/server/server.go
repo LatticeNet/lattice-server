@@ -695,6 +695,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))
 	mux.HandleFunc("/api/proxy/discovered", s.withAuth("proxy:read", s.handleProxyDiscovered))
+	mux.HandleFunc("/api/proxy/managed/probe", s.withAuth("", s.handleSingBoxManageProbe))
 	mux.HandleFunc("/api/proxy/managed/add", s.withAuth("", s.handleSingBoxManageAdd))
 	mux.HandleFunc("/api/proxy/managed/delete", s.withAuth("", s.handleSingBoxManageDelete))
 	mux.HandleFunc("/api/proxy/nodes/", s.withAuth("", s.handleProxyNodePlan))
@@ -4592,6 +4593,7 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 	if err := s.handleApprovalTaskResult(r, task, req.Result); err != nil {
 		s.logger.Printf("approval task result update failed: %v", err)
 	}
+	s.handleSingBoxProbeTaskResult(r, task, req.Result)
 	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

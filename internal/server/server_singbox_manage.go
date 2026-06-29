@@ -1,12 +1,14 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
@@ -40,6 +42,14 @@ var singBoxNodeNameRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,128}$`)
 // singBoxArgRe bounds an optional free arg value (uuid / sni / password / path).
 var singBoxArgRe = regexp.MustCompile(`^[A-Za-z0-9._:/@-]{1,128}$`)
 
+const (
+	singBoxProbeScriptMarker      = "# lattice:singbox-probe-v1 task="
+	singBoxProbeListMarker        = "__LATTICE_SINGBOX_PROBE_LIST_V1__"
+	singBoxProbeProvisionMarker   = "__LATTICE_SINGBOX_PROBE_PROVISION_V1__"
+	singBoxProbeResultAction      = "singbox.manage.probe.result"
+	singBoxProbeResultParseFailed = "parse_failed"
+)
+
 // queueSingBoxTask builds the sh script and queues it as a task:run task to one
 // node, returning the created task.
 func (s *Server) queueSingBoxTask(p principal, nodeID, script string) (model.Task, error) {
@@ -61,6 +71,40 @@ func (s *Server) queueSingBoxTask(p principal, nodeID, script string) (model.Tas
 	return task, nil
 }
 
+func (s *Server) queueSingBoxProbeTask(p principal, nodeID string) (model.Task, error) {
+	task := model.Task{
+		ID:          id.New("task"),
+		ActorID:     p.ActorID,
+		TokenID:     p.TokenID,
+		Targets:     []string{nodeID},
+		Interpreter: "sh",
+		TimeoutSec:  defaultTaskTimeoutSec,
+		OutputLimit: defaultTaskOutputLimit,
+		Status:      model.TaskQueued,
+		CreatedAt:   s.now(),
+	}
+	task.Script = buildSingBoxProbeScript(task.ID, s.nodeSBAddr(nodeID))
+	if err := s.store.CreateTask(task); err != nil {
+		return model.Task{}, err
+	}
+	return task, nil
+}
+
+func buildSingBoxProbeScript(taskID, addr string) string {
+	parts := []string{"sb"}
+	if addr = strings.TrimSpace(addr); addr != "" {
+		parts = append(parts, "--addr", shellQuote(addr))
+	}
+	parts = append(parts, "--json")
+	base := strings.Join(parts, " ")
+	return "set -e\n" +
+		singBoxProbeScriptMarker + taskID + "\n" +
+		"echo " + shellQuote(singBoxProbeListMarker) + "\n" +
+		base + " list\n" +
+		"echo " + shellQuote(singBoxProbeProvisionMarker) + "\n" +
+		base + " provision || true\n"
+}
+
 // nodeSBAddr returns the address to pass as `sb --addr` so share links render
 // with the right host: the node's public IP (falls back to empty -> the script
 // keeps whatever it autodetects, but we always try to provide one).
@@ -71,6 +115,36 @@ func (s *Server) nodeSBAddr(nodeID string) string {
 		}
 	}
 	return ""
+}
+
+func (s *Server) handleSingBoxManageProbe(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID string `json:"node_id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
+		return
+	}
+	task, err := s.queueSingBoxProbeTask(p, req.NodeID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.manage.probe", Scope: "task:run",
+		Metadata: map[string]string{"task_id": task.ID},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task_id": task.ID})
 }
 
 func (s *Server) handleSingBoxManageAdd(w http.ResponseWriter, r *http.Request, p principal) {
@@ -199,4 +273,107 @@ func (s *Server) singBoxInventoryHasNode(nodeID, name string) bool {
 		}
 	}
 	return false
+}
+
+func isSingBoxProbeTask(task model.Task) bool {
+	return strings.Contains(task.Script, singBoxProbeScriptMarker+task.ID)
+}
+
+func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, result model.TaskResult) {
+	if !isSingBoxProbeTask(task) {
+		return
+	}
+	inv := model.SingBoxInventory{
+		NodeID: result.NodeID,
+		At:     taskResultInventoryTime(result, s.now()),
+		Status: "ok",
+		Nodes:  []model.SingBoxNode{},
+	}
+	status := "ok"
+	if result.ExitCode != 0 || strings.TrimSpace(result.Error) != "" {
+		status = "error"
+		inv.Status = "error"
+		inv.Error = taskFailureSummary(result)
+	} else if parsed, err := parseSingBoxProbeStdout(result.NodeID, inv.At, result.Stdout); err != nil {
+		status = singBoxProbeResultParseFailed
+		inv.Status = "error"
+		inv.Error = truncateMetadataValue(err.Error(), 240)
+	} else {
+		inv = parsed
+	}
+
+	s.singboxInvMu.Lock()
+	if s.singboxInv == nil {
+		s.singboxInv = map[string]model.SingBoxInventory{}
+	}
+	s.singboxInv[result.NodeID] = inv
+	s.singboxInvMu.Unlock()
+
+	nodes := strconv.Itoa(len(inv.Nodes))
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   result.NodeID,
+		Action:   singBoxProbeResultAction,
+		Decision: "allow",
+		Metadata: map[string]string{
+			"task_id": task.ID,
+			"status":  status,
+			"nodes":   nodes,
+		},
+	})
+}
+
+func taskResultInventoryTime(result model.TaskResult, fallback time.Time) time.Time {
+	if !result.FinishedAt.IsZero() {
+		return result.FinishedAt.UTC()
+	}
+	return fallback.UTC()
+}
+
+func parseSingBoxProbeStdout(nodeID string, at time.Time, stdout string) (model.SingBoxInventory, error) {
+	listJSON, ok := probeSection(stdout, singBoxProbeListMarker, singBoxProbeProvisionMarker)
+	if !ok {
+		return model.SingBoxInventory{}, errors.New("probe stdout missing list marker")
+	}
+	var listResp struct {
+		OK    bool                `json:"ok"`
+		Count int                 `json:"count"`
+		Nodes []model.SingBoxNode `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(listJSON), &listResp); err != nil {
+		return model.SingBoxInventory{}, fmt.Errorf("decode probe list: %w", err)
+	}
+	inv := model.SingBoxInventory{
+		NodeID: nodeID,
+		At:     at.UTC(),
+		Status: "ok",
+		Nodes:  []model.SingBoxNode{},
+	}
+	if listResp.Nodes != nil {
+		inv.Nodes = listResp.Nodes
+	}
+	if provisionJSON, ok := probeSection(stdout, singBoxProbeProvisionMarker, ""); ok {
+		var provision struct {
+			Version string `json:"version"`
+		}
+		if err := json.Unmarshal([]byte(provisionJSON), &provision); err == nil {
+			inv.CoreVersion = strings.TrimSpace(provision.Version)
+		}
+	}
+	return inv, nil
+}
+
+func probeSection(stdout, startMarker, endMarker string) (string, bool) {
+	start := strings.Index(stdout, startMarker)
+	if start < 0 {
+		return "", false
+	}
+	body := stdout[start+len(startMarker):]
+	body = strings.TrimLeft(body, "\r\n")
+	if endMarker != "" {
+		if end := strings.Index(body, endMarker); end >= 0 {
+			body = body[:end]
+		}
+	}
+	return strings.TrimSpace(body), true
 }

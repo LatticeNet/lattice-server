@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -173,6 +174,121 @@ func TestSingBoxProbeTaskResultRefreshesInventory(t *testing.T) {
 	}
 	if got := out.Inventories[0].Nodes[0].Name; got != "VLESS-REALITY-443.json" {
 		t.Fatalf("node name = %q", got)
+	}
+}
+
+func TestSingBoxManageProbeDeduplicates(t *testing.T) {
+	_, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	// First probe: must be accepted.
+	r1 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+		`{"node_id":"node-a"}`, cookies, csrf)
+	if r1.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(r1.Body)
+		t.Fatalf("first probe: want 200, got %d (%s)", r1.StatusCode, b)
+	}
+	r1.Body.Close()
+
+	// Second probe while first is still pending: must be rejected with 409.
+	r2 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+		`{"node_id":"node-a"}`, cookies, csrf)
+	if r2.StatusCode != http.StatusConflict {
+		b, _ := io.ReadAll(r2.Body)
+		t.Fatalf("second probe: want 409, got %d (%s)", r2.StatusCode, b)
+	}
+	r2.Body.Close()
+}
+
+func TestSingBoxProbeTaskResultErrorPaths(t *testing.T) {
+	tests := []struct {
+		name            string
+		exitCode        int
+		stdout          string
+		wantStatus      string
+		wantErrContains string
+	}{
+		{
+			name:       "nonzero exit code",
+			exitCode:   1,
+			stdout:     "",
+			wantStatus: "error",
+		},
+		{
+			name:            "stdout missing list marker",
+			exitCode:        0,
+			stdout:          "sb: some output with no sentinel markers",
+			wantStatus:      "error",
+			wantErrContains: "missing list marker",
+		},
+		{
+			name:            "list marker present but non-JSON body",
+			exitCode:        0,
+			stdout:          singBoxProbeListMarker + "\n" + "not valid json\n" + singBoxProbeProvisionMarker + "\n",
+			wantStatus:      "error",
+			wantErrContains: "decode probe list",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			_, handler := newManageTestServer(t)
+			cookies, csrf := loginSession(t, handler)
+			nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+			resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+				`{"node_id":"node-a"}`, cookies, csrf)
+			if resp.StatusCode != http.StatusOK {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("probe: want 200, got %d (%s)", resp.StatusCode, b)
+			}
+			resp.Body.Close()
+
+			tasksRec := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-a", "", nodeToken)
+			if tasksRec.Code != http.StatusOK {
+				t.Fatalf("lease: %d %s", tasksRec.Code, tasksRec.Body.String())
+			}
+			var tasks []struct {
+				ID      string `json:"id"`
+				LeaseID string `json:"lease_id"`
+			}
+			if err := json.NewDecoder(tasksRec.Body).Decode(&tasks); err != nil || len(tasks) != 1 {
+				t.Fatalf("want one task: err=%v tasks=%+v", err, tasks)
+			}
+
+			result := `{"node_id":"node-a","result":{"task_id":` + string(mustJSON(t, tasks[0].ID)) +
+				`,"lease_id":` + string(mustJSON(t, tasks[0].LeaseID)) +
+				`,"exit_code":` + strconv.Itoa(tc.exitCode) +
+				`,"stdout":` + string(mustJSON(t, tc.stdout)) + `}}`
+			resultRec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", result, nodeToken)
+			if resultRec.Code != http.StatusOK {
+				t.Fatalf("task result: %d %s", resultRec.Code, resultRec.Body.String())
+			}
+
+			disc := doJSON(t, handler, http.MethodGet, "/api/proxy/discovered", "", cookies, csrf)
+			if disc.StatusCode != http.StatusOK {
+				t.Fatalf("discovered: %d", disc.StatusCode)
+			}
+			var out struct {
+				Inventories []model.SingBoxInventory `json:"inventories"`
+			}
+			if err := json.NewDecoder(disc.Body).Decode(&out); err != nil {
+				t.Fatal(err)
+			}
+			disc.Body.Close()
+			if len(out.Inventories) != 1 {
+				t.Fatalf("want 1 inventory entry, got %d: %+v", len(out.Inventories), out.Inventories)
+			}
+			inv := out.Inventories[0]
+			if inv.Status != tc.wantStatus {
+				t.Errorf("status = %q, want %q", inv.Status, tc.wantStatus)
+			}
+			if tc.wantErrContains != "" && !strings.Contains(inv.Error, tc.wantErrContains) {
+				t.Errorf("error field = %q, want it to contain %q", inv.Error, tc.wantErrContains)
+			}
+		})
 	}
 }
 

@@ -48,6 +48,11 @@ const (
 	singBoxProbeProvisionMarker   = "__LATTICE_SINGBOX_PROBE_PROVISION_V1__"
 	singBoxProbeResultAction      = "singbox.manage.probe.result"
 	singBoxProbeResultParseFailed = "parse_failed"
+	// singBoxProbeOutputLimit is larger than defaultTaskOutputLimit because
+	// sb --json list output grows linearly with the number of managed configs.
+	// Using the global maximum prevents silent inventory truncation on hosts
+	// with many nodes.
+	singBoxProbeOutputLimit = maxTaskOutputLimit
 )
 
 // queueSingBoxTask builds the sh script and queues it as a task:run task to one
@@ -79,7 +84,7 @@ func (s *Server) queueSingBoxProbeTask(p principal, nodeID string) (model.Task, 
 		Targets:     []string{nodeID},
 		Interpreter: "sh",
 		TimeoutSec:  defaultTaskTimeoutSec,
-		OutputLimit: defaultTaskOutputLimit,
+		OutputLimit: singBoxProbeOutputLimit,
 		Status:      model.TaskQueued,
 		CreatedAt:   s.now(),
 	}
@@ -135,8 +140,22 @@ func (s *Server) handleSingBoxManageProbe(w http.ResponseWriter, r *http.Request
 	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
 		return
 	}
+	s.pendingSingboxProbeMu.Lock()
+	if s.pendingSingboxProbeNodeIDs == nil {
+		s.pendingSingboxProbeNodeIDs = map[string]struct{}{}
+	}
+	if _, alreadyPending := s.pendingSingboxProbeNodeIDs[req.NodeID]; alreadyPending {
+		s.pendingSingboxProbeMu.Unlock()
+		writeError(w, http.StatusConflict, errors.New("a probe is already in progress for this node"))
+		return
+	}
+	s.pendingSingboxProbeNodeIDs[req.NodeID] = struct{}{}
+	s.pendingSingboxProbeMu.Unlock()
 	task, err := s.queueSingBoxProbeTask(p, req.NodeID)
 	if err != nil {
+		s.pendingSingboxProbeMu.Lock()
+		delete(s.pendingSingboxProbeNodeIDs, req.NodeID)
+		s.pendingSingboxProbeMu.Unlock()
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -308,6 +327,10 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 	}
 	s.singboxInv[result.NodeID] = inv
 	s.singboxInvMu.Unlock()
+
+	s.pendingSingboxProbeMu.Lock()
+	delete(s.pendingSingboxProbeNodeIDs, result.NodeID)
+	s.pendingSingboxProbeMu.Unlock()
 
 	nodes := strconv.Itoa(len(inv.Nodes))
 	s.recordRequestAudit(r, model.AuditEvent{

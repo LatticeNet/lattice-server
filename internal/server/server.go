@@ -188,6 +188,13 @@ type Server struct {
 	// simply repopulates it from the next round of reports.
 	singboxInvMu sync.RWMutex
 	singboxInv   map[string]model.SingBoxInventory
+
+	// pendingSingboxProbeNodeIDs tracks nodes for which a probe task is currently
+	// queued or leased. A second probe request for the same node is rejected with
+	// 409 Conflict until the first result arrives, preventing unbounded task
+	// pile-up against slow or offline nodes.
+	pendingSingboxProbeMu      sync.Mutex
+	pendingSingboxProbeNodeIDs map[string]struct{}
 }
 
 const (

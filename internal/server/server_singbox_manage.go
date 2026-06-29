@@ -103,12 +103,48 @@ func buildSingBoxProbeScript(taskID, addr string) string {
 	}
 	parts = append(parts, "--json")
 	base := strings.Join(parts, " ")
-	return "set -e\n" +
+	return "set -u\n" +
 		singBoxProbeScriptMarker + taskID + "\n" +
+		"SB_ADDR=" + shellQuote(addr) + "\n" +
+		"lattice_singbox_runtime_files() {\n" +
+		"  line=\"$(ps -eo args 2>/dev/null | grep '[s]ing-box run' | head -n 1 || true)\"\n" +
+		"  [ -n \"$line\" ] || line=\"$(systemctl cat sing-box 2>/dev/null | sed -n 's/^ExecStart=//p' | head -n 1 || true)\"\n" +
+		"  if [ -n \"$line\" ]; then\n" +
+		"    set -- $line\n" +
+		"    while [ \"$#\" -gt 0 ]; do\n" +
+		"      case \"$1\" in\n" +
+		"        -c|--config) shift; [ \"$#\" -gt 0 ] && [ -f \"$1\" ] && printf '%s\\n' \"$1\" ;;\n" +
+		"        -C|--config-directory) shift; [ \"$#\" -gt 0 ] && [ -d \"$1\" ] && find \"$1\" -maxdepth 1 -type f -name '*.json' 2>/dev/null ;;\n" +
+		"        -c=*|--config=*) f=\"${1#*=}\"; [ -f \"$f\" ] && printf '%s\\n' \"$f\" ;;\n" +
+		"        -C=*|--config-directory=*) d=\"${1#*=}\"; [ -d \"$d\" ] && find \"$d\" -maxdepth 1 -type f -name '*.json' 2>/dev/null ;;\n" +
+		"      esac\n" +
+		"      shift || break\n" +
+		"    done\n" +
+		"  fi\n" +
+		"  [ -f /etc/sing-box/config.json ] && printf '%s\\n' /etc/sing-box/config.json\n" +
+		"  [ -d /etc/sing-box/conf ] && find /etc/sing-box/conf -maxdepth 1 -type f -name '*.json' 2>/dev/null\n" +
+		"}\n" +
+		"lattice_singbox_runtime_list() {\n" +
+		"  command -v jq >/dev/null 2>&1 || { printf '%s\\n' '{\"ok\":true,\"count\":0,\"nodes\":[]}'; return 0; }\n" +
+		"  files=\"$(lattice_singbox_runtime_files | sort -u)\"\n" +
+		"  [ -n \"$files\" ] || { printf '%s\\n' '{\"ok\":true,\"count\":0,\"nodes\":[]}'; return 0; }\n" +
+		"  # shellcheck disable=SC2086 # config paths are sing-box runtime paths; no spaces in supported installs.\n" +
+		"  jq -s --arg addr \"$SB_ADDR\" '\n" +
+		"    [ .[] | .inbounds[]? | {\n" +
+		"      name: (.tag // \"\"),\n" +
+		"      protocol: (.type // \"\"),\n" +
+		"      network: (if (.tls.reality.enabled // false) then \"reality\" elif ((.transport.type // \"\") != \"\") then .transport.type else \"tcp\" end),\n" +
+		"      address: $addr,\n" +
+		"      port: ((.listen_port // \"\") | tostring),\n" +
+		"      sni: (.tls.server_name // .tls.reality.handshake.server // \"\"),\n" +
+		"      host: (.listen // \"\")\n" +
+		"    } ] as $nodes | {ok:true,count:($nodes|length),nodes:$nodes}\n" +
+		"  ' $files\n" +
+		"}\n" +
 		"echo " + shellQuote(singBoxProbeListMarker) + "\n" +
-		base + " list\n" +
+		"if ! " + base + " list; then lattice_singbox_runtime_list; fi\n" +
 		"echo " + shellQuote(singBoxProbeProvisionMarker) + "\n" +
-		base + " provision || true\n"
+		"if ! " + base + " provision; then command -v sing-box >/dev/null 2>&1 && sing-box version 2>/dev/null | awk 'NR==1{gsub(/\\033\\[[0-9;]*m/,\"\"); print \"{\\\"version\\\":\\\"\" $2 \"\\\"}\"; exit}' || printf '%s\\n' '{}'; fi\n"
 }
 
 // nodeSBAddr returns the address to pass as `sb --addr` so share links render

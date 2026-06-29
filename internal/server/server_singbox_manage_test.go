@@ -108,7 +108,7 @@ func TestSingBoxManageProbeQueuesReadOnlyTask(t *testing.T) {
 	if task == nil {
 		t.Fatal("probe task not queued")
 	}
-	for _, needle := range []string{singBoxProbeScriptMarker + task.ID, "--json", " list", " provision"} {
+	for _, needle := range []string{singBoxProbeScriptMarker + task.ID, "--json", " list", " provision", "lattice_singbox_runtime_list", "/etc/sing-box/conf"} {
 		if !strings.Contains(task.Script, needle) {
 			t.Fatalf("probe script missing %q:\n%s", needle, task.Script)
 		}
@@ -174,6 +174,61 @@ func TestSingBoxProbeTaskResultRefreshesInventory(t *testing.T) {
 	}
 	if got := out.Inventories[0].Nodes[0].Name; got != "VLESS-REALITY-443.json" {
 		t.Fatalf("node name = %q", got)
+	}
+}
+
+func TestSingBoxProbeTaskResultAcceptsRuntimeFallbackList(t *testing.T) {
+	_, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-runtime", "Node Runtime")
+
+	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+		`{"node_id":"node-runtime"}`, cookies, csrf)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("probe: want 200, got %d (%s)", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+
+	tasksRec := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-runtime", "", nodeToken)
+	if tasksRec.Code != http.StatusOK {
+		t.Fatalf("lease failed: %d %s", tasksRec.Code, tasksRec.Body.String())
+	}
+	var tasks []struct {
+		ID      string `json:"id"`
+		LeaseID string `json:"lease_id"`
+	}
+	if err := json.NewDecoder(tasksRec.Body).Decode(&tasks); err != nil || len(tasks) != 1 {
+		t.Fatalf("want one task: err=%v tasks=%+v", err, tasks)
+	}
+	stdout := singBoxProbeListMarker + `
+{"ok":true,"count":1,"nodes":[{"name":"VLESS-REALITY-31001.json","protocol":"vless","network":"reality","address":"64.186.227.5","port":"31001","sni":"www.cloudflare.com","host":"::"}]}
+` + singBoxProbeProvisionMarker + `
+{"version":"1.13.12"}
+`
+	result := `{"node_id":"node-runtime","result":{"task_id":"` + tasks[0].ID + `","lease_id":"` + tasks[0].LeaseID + `","exit_code":0,"stdout":` + string(mustJSON(t, stdout)) + `}}`
+	resultRec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", result, nodeToken)
+	if resultRec.Code != http.StatusOK {
+		t.Fatalf("task result failed: %d %s", resultRec.Code, resultRec.Body.String())
+	}
+
+	discovered := doJSON(t, handler, http.MethodGet, "/api/proxy/discovered", "", cookies, csrf)
+	if discovered.StatusCode != http.StatusOK {
+		t.Fatalf("discovered failed: %d", discovered.StatusCode)
+	}
+	var out struct {
+		Inventories []model.SingBoxInventory `json:"inventories"`
+	}
+	if err := json.NewDecoder(discovered.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	discovered.Body.Close()
+	if len(out.Inventories) != 1 || len(out.Inventories[0].Nodes) != 1 {
+		t.Fatalf("unexpected inventory: %+v", out.Inventories)
+	}
+	n := out.Inventories[0].Nodes[0]
+	if n.Name != "VLESS-REALITY-31001.json" || n.Port != "31001" || n.SNI != "www.cloudflare.com" {
+		t.Fatalf("runtime fallback node parse wrong: %+v", n)
 	}
 }
 

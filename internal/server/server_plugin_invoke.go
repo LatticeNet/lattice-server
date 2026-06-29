@@ -284,38 +284,6 @@ func (s *Server) pluginCallScopes(pluginID, service, method string) ([]string, b
 			}
 		}
 	}
-	if scopes, ok := firstPartyBuiltinInterfaceScopes(pluginID, service, method); ok {
-		return scopes, true
-	}
-	return nil, false
-}
-
-func firstPartyBuiltinInterfaceScopes(pluginID, service, method string) ([]string, bool) {
-	if pluginID != vpnCorePluginID {
-		return nil, false
-	}
-	readonly := []string{"proxy:read"}
-	switch service {
-	case vpnCoreNodesService:
-		switch method {
-		case "list", "export":
-			return readonly, true
-		}
-	case vpnCoreLinesService:
-		switch method {
-		case "list", "get":
-			return readonly, true
-		}
-	case vpnCoreUsersService:
-		switch method {
-		case "list", "get":
-			return readonly, true
-		}
-	case vpnCoreUsageService:
-		if method == "query" {
-			return readonly, true
-		}
-	}
 	return nil, false
 }
 

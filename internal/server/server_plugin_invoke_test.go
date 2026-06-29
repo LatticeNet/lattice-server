@@ -1,13 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -77,5 +81,164 @@ func TestPluginInvokeExecutesArtifact(t *testing.T) {
 	}
 	if !out.OK || out.Message != "executed" || string(out.Result) != `{"ran":true}` {
 		t.Fatalf("artifact did not execute as expected: %+v (raw %s)", out, body)
+	}
+}
+
+func TestPluginContributionsAndCallGatewayEnforceActionScopes(t *testing.T) {
+	pluginRoot := t.TempDir()
+	manifest := plugin.Manifest{
+		ID: "test.ui", Name: "Test UI", Type: "system", Version: "0.1.0",
+		Capabilities: []string{"node:read"},
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.ui/nodes",
+			Methods: []string{"list", "delete"},
+			Scopes:  []string{"proxy:read"},
+		}},
+		UI: &plugin.ManifestUI{
+			Nav: []plugin.NavContribution{{
+				Section: "vpn-manage", SectionTitle: "VPN Manage", Title: "Nodes",
+				Route: "vpn-core/nodes", Icon: "Radar", Scopes: []string{"proxy:read"},
+			}},
+			Views: []plugin.ViewContribution{{
+				Route: "vpn-core/nodes", Title: "Nodes", Kind: "table",
+				Source: &plugin.ViewSource{Interface: "test.ui/nodes", Method: "list"},
+				Actions: []plugin.ViewAction{{
+					Label: "Delete", Interface: "test.ui/nodes", Method: "delete", Scopes: []string{"proxy:admin"},
+				}},
+			}},
+		},
+	}
+	writeServerBundle(t, pluginRoot, "test.ui", manifest, []byte("artifact"))
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PluginDir: pluginRoot, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := srv.pluginRPC.Register("test.ui", "test.ui/nodes", "v1", []string{"list", "delete"}, func(_ context.Context, method string, _ []byte) ([]byte, error) {
+		if method == "list" {
+			return []byte(`{"rows":[{"id":"n1"}],"count":1}`), nil
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	for _, status := range []string{model.PluginStatusInstalled, model.PluginStatusActive} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle",
+			`{"id":"test.ui","status":"`+status+`"}`, cookies, csrf)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("lifecycle %s: got %d", status, resp.StatusCode)
+		}
+	}
+	readToken := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, nil)
+
+	contrib := doBearerJSON(t, handler, http.MethodGet, "/api/plugin-contributions", "", readToken)
+	if contrib.StatusCode != http.StatusOK {
+		t.Fatalf("contributions should be visible with proxy:read, got %d", contrib.StatusCode)
+	}
+	var plugins []pluginView
+	if err := json.NewDecoder(contrib.Body).Decode(&plugins); err != nil {
+		t.Fatal(err)
+	}
+	contrib.Body.Close()
+	if len(plugins) != 1 || plugins[0].UI == nil || len(plugins[0].UI.Nav) != 1 || plugins[0].UI.Nav[0].Section != "vpn-manage" {
+		t.Fatalf("unexpected contributions: %+v", plugins)
+	}
+	if got := plugins[0].UI.Views[0].Actions; len(got) != 0 {
+		t.Fatalf("proxy:read contribution view must not expose proxy:admin action, got %+v", got)
+	}
+	if got := plugins[0].Interfaces; len(got) != 1 || len(got[0].Methods) != 1 || got[0].Methods[0] != "list" {
+		t.Fatalf("proxy:read contribution response must expose only visible interface methods, got %+v", got)
+	}
+
+	list := doBearerJSON(t, handler, http.MethodPost, "/api/plugins/call",
+		`{"id":"test.ui","service":"test.ui/nodes","method":"list"}`, readToken)
+	list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list should be allowed with proxy:read, got %d", list.StatusCode)
+	}
+	denied := doBearerJSON(t, handler, http.MethodPost, "/api/plugins/call",
+		`{"id":"test.ui","service":"test.ui/nodes","method":"delete"}`, readToken)
+	denied.Body.Close()
+	if denied.StatusCode != http.StatusForbidden {
+		t.Fatalf("delete should require action scope proxy:admin, got %d", denied.StatusCode)
+	}
+	var sawDeny bool
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "plugin.call" && ev.Decision == "deny" && ev.Metadata["method"] == "delete" && strings.Contains(ev.Scope, "proxy:admin") {
+			sawDeny = true
+		}
+	}
+	if !sawDeny {
+		t.Fatalf("expected plugin.call deny audit for action scope failure, got %+v", st.AuditEvents())
+	}
+}
+
+func TestPluginContributionsHideBuiltinViewWithoutNavScope(t *testing.T) {
+	pluginRoot := t.TempDir()
+	manifest := plugin.Manifest{
+		ID: "latticenet.vpn-core", Name: "vpn-core", Type: "system", Version: "0.1.0",
+		Capabilities: []string{"node:read"},
+		UI: &plugin.ManifestUI{
+			Nav: []plugin.NavContribution{{
+				Section: "vpn-manage", SectionTitle: "VPN Manage", Title: "Users",
+				Route: "users", Icon: "Users", Scopes: []string{"proxy:read"},
+			}},
+			Views: []plugin.ViewContribution{{
+				Route: "users", Title: "Users", Kind: "builtin", ComponentKey: "proxy.users",
+			}},
+		},
+	}
+	writeServerBundle(t, pluginRoot, "latticenet.vpn-core", manifest, []byte("artifact"))
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PluginDir: pluginRoot, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	for _, status := range []string{model.PluginStatusInstalled, model.PluginStatusActive} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle",
+			`{"id":"latticenet.vpn-core","status":"`+status+`"}`, cookies, csrf)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("lifecycle %s: got %d", status, resp.StatusCode)
+		}
+	}
+
+	noProxyToken := createPAT(t, handler, cookies, csrf, []string{"node:read"}, nil)
+	hidden := doBearerJSON(t, handler, http.MethodGet, "/api/plugin-contributions", "", noProxyToken)
+	if hidden.StatusCode != http.StatusOK {
+		t.Fatalf("contributions should remain callable, got %d", hidden.StatusCode)
+	}
+	var hiddenPlugins []pluginView
+	if err := json.NewDecoder(hidden.Body).Decode(&hiddenPlugins); err != nil {
+		t.Fatal(err)
+	}
+	hidden.Body.Close()
+	if len(hiddenPlugins) != 0 {
+		t.Fatalf("source-less builtin view must be hidden when nav scope is missing, got %+v", hiddenPlugins)
+	}
+
+	readToken := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, nil)
+	visible := doBearerJSON(t, handler, http.MethodGet, "/api/plugin-contributions", "", readToken)
+	if visible.StatusCode != http.StatusOK {
+		t.Fatalf("contributions should be visible with proxy:read, got %d", visible.StatusCode)
+	}
+	var visiblePlugins []pluginView
+	if err := json.NewDecoder(visible.Body).Decode(&visiblePlugins); err != nil {
+		t.Fatal(err)
+	}
+	visible.Body.Close()
+	if len(visiblePlugins) != 1 || visiblePlugins[0].UI == nil || len(visiblePlugins[0].UI.Views) != 1 || visiblePlugins[0].UI.Views[0].Kind != "builtin" {
+		t.Fatalf("expected builtin view visible with proxy:read, got %+v", visiblePlugins)
 	}
 }

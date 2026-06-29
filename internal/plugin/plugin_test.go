@@ -125,6 +125,168 @@ func TestValidateManifestAcceptsRestrictedWorker(t *testing.T) {
 	}
 }
 
+func TestValidateManifestAcceptsScopedCustomPluginSectionAndNestedRoute(t *testing.T) {
+	err := ValidateManifest(Manifest{
+		ID:           "vpn-ui",
+		Name:         "VPN UI",
+		Type:         TypeSystem,
+		Capabilities: []string{"node:read"},
+		Interfaces: []InterfaceContract{{
+			Service: "vpn-ui/nodes",
+			Methods: []string{"list"},
+			Scopes:  []string{"proxy:read"},
+		}},
+		UI: &ManifestUI{
+			Nav: []NavContribution{{
+				Section: "vpn-manage", SectionTitle: "VPN Manage", Title: "Nodes",
+				Route: "vpn-core/nodes", Scopes: []string{"proxy:read"},
+			}},
+			Views: []ViewContribution{{
+				Route: "vpn-core/nodes", Title: "Nodes", Kind: "table",
+				Source: &ViewSource{Interface: "vpn-ui/nodes", Method: "list"},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateManifestAcceptsOwnedBuiltinView(t *testing.T) {
+	err := ValidateManifest(Manifest{
+		ID:           "latticenet.vpn-core",
+		Name:         "vpn-core",
+		Type:         TypeSystem,
+		Capabilities: []string{"node:read", "network:plan", "network:apply", "task:run"},
+		UI: &ManifestUI{
+			Nav: []NavContribution{{
+				Section: "vpn-manage", SectionTitle: "VPN Manage", Title: "Users",
+				Route: "users", Icon: "Users", Scopes: []string{"proxy:read"},
+			}},
+			Views: []ViewContribution{{
+				Route: "users", Title: "Users", Kind: "builtin", ComponentKey: "proxy.users",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateManifestRejectsForeignBuiltinView(t *testing.T) {
+	err := ValidateManifest(Manifest{
+		ID:           "other-plugin",
+		Name:         "Other Plugin",
+		Type:         TypeSystem,
+		Capabilities: []string{"node:read"},
+		UI: &ManifestUI{Views: []ViewContribution{{
+			Route: "users", Title: "Users", Kind: "builtin", ComponentKey: "proxy.users",
+		}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "builtin component") {
+		t.Fatalf("expected foreign builtin component rejection, got %v", err)
+	}
+}
+
+func TestValidateManifestRejectsComponentKeyOnNonBuiltinView(t *testing.T) {
+	err := ValidateManifest(Manifest{
+		ID:           "table-ui",
+		Name:         "Table UI",
+		Type:         TypeSystem,
+		Capabilities: []string{"node:read"},
+		UI: &ManifestUI{Views: []ViewContribution{{
+			Route: "nodes", Title: "Nodes", Kind: "table", ComponentKey: "proxy.users",
+		}}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "component_key requires builtin") {
+		t.Fatalf("expected non-builtin component_key rejection, got %v", err)
+	}
+}
+
+func TestValidateManifestRejectsUnknownContributionScope(t *testing.T) {
+	err := ValidateManifest(Manifest{
+		ID:           "bad-scope-ui",
+		Name:         "Bad Scope UI",
+		Type:         TypeSystem,
+		Capabilities: []string{"node:read"},
+		Interfaces: []InterfaceContract{{
+			Service: "bad-scope-ui/nodes",
+			Methods: []string{"list"},
+			Scopes:  []string{"prox:read"},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid scope") {
+		t.Fatalf("expected unknown RBAC scope rejection, got %v", err)
+	}
+}
+
+func TestValidateManifestRejectsForeignInterfaceService(t *testing.T) {
+	err := ValidateManifest(Manifest{
+		ID:           "honest-ui",
+		Name:         "Honest UI",
+		Type:         TypeSystem,
+		Capabilities: []string{"node:read"},
+		Interfaces: []InterfaceContract{{
+			Service: "other-plugin/nodes",
+			Methods: []string{"list"},
+			Scopes:  []string{"proxy:read"},
+		}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "must be under plugin id") {
+		t.Fatalf("expected foreign interface service rejection, got %v", err)
+	}
+}
+
+func TestValidateManifestRejectsInvalidInterfaceMethods(t *testing.T) {
+	base := Manifest{
+		ID:           "method-ui",
+		Name:         "Method UI",
+		Type:         TypeSystem,
+		Capabilities: []string{"node:read"},
+		Interfaces: []InterfaceContract{{
+			Service: "method-ui/nodes",
+			Methods: []string{"list"},
+			Scopes:  []string{"proxy:read"},
+		}},
+	}
+	base.Interfaces[0].Methods = []string{"list", "bad method"}
+	if err := ValidateManifest(base); err == nil || !strings.Contains(err.Error(), "invalid method") {
+		t.Fatalf("expected invalid method rejection, got %v", err)
+	}
+	base.Interfaces[0].Methods = []string{"list", "list"}
+	if err := ValidateManifest(base); err == nil || !strings.Contains(err.Error(), "duplicate method") {
+		t.Fatalf("expected duplicate method rejection, got %v", err)
+	}
+}
+
+func TestValidateManifestRejectsUndeclaredActionAndUnscopedAction(t *testing.T) {
+	base := Manifest{
+		ID:           "actions-ui",
+		Name:         "Actions UI",
+		Type:         TypeSystem,
+		Capabilities: []string{"node:read"},
+		Interfaces: []InterfaceContract{{
+			Service: "actions-ui/nodes",
+			Methods: []string{"list"},
+			Scopes:  []string{"proxy:read"},
+		}},
+		UI: &ManifestUI{Views: []ViewContribution{{
+			Route: "nodes", Title: "Nodes", Kind: "table",
+			Source:  &ViewSource{Interface: "actions-ui/nodes", Method: "list"},
+			Actions: []ViewAction{{Label: "Delete", Interface: "actions-ui/nodes", Method: "delete", Scopes: []string{"proxy:admin"}}},
+		}}},
+	}
+	if err := ValidateManifest(base); err == nil || !strings.Contains(err.Error(), "not declared") {
+		t.Fatalf("expected undeclared action rejection, got %v", err)
+	}
+	base.Interfaces = []InterfaceContract{{Service: "actions-ui/nodes", Methods: []string{"delete"}}}
+	base.UI.Views[0].Source = nil
+	base.UI.Views[0].Actions[0].Scopes = nil
+	if err := ValidateManifest(base); err == nil || !strings.Contains(err.Error(), "must declare scopes") {
+		t.Fatalf("expected unscoped action rejection, got %v", err)
+	}
+}
+
 func TestVerifyManifestAcceptsTrustedPublisherSignature(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

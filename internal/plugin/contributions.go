@@ -3,6 +3,9 @@ package plugin
 import (
 	"fmt"
 	"regexp"
+	"strings"
+
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
 // Design-10: a plugin contributes dashboard UI and declares the interfaces it
@@ -14,7 +17,7 @@ import (
 // can never smuggle an unknown renderer, primitive, or target section.
 var (
 	pluginNavSections = map[string]bool{"plugins": true, "proxy": true}
-	pluginViewKinds   = map[string]bool{"table": true, "detail": true, "form": true, "kv": true, "markdown": true}
+	pluginViewKinds   = map[string]bool{"table": true, "detail": true, "form": true, "kv": true, "markdown": true, "builtin": true}
 	pluginRenderHints = map[string]bool{"": true, "copy-secret": true, "bytes": true, "relative-time": true, "badge": true, "code": true}
 	pluginFormKinds   = map[string]bool{"text": true, "int": true, "select": true}
 	// Icons the dashboard knows (lucide names). Conservative starter set.
@@ -22,18 +25,31 @@ var (
 		"": true, "Radar": true, "Boxes": true, "Store": true, "ServerCog": true,
 		"DoorOpen": true, "Users": true, "Link": true, "Gauge": true, "Blocks": true,
 	}
-	pluginRouteRe = regexp.MustCompile(`^[a-z0-9][a-z0-9/_-]{0,64}$`)
-	pluginKeyRe   = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,48}$`)
+	pluginSectionRe       = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,48}$`)
+	pluginRouteRe         = regexp.MustCompile(`^[a-z0-9][a-z0-9/_-]{0,64}$`)
+	pluginKeyRe           = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,48}$`)
+	pluginMethodRe        = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,48}$`)
+	pluginServiceSuffixRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]{0,127}$`)
+	pluginBuiltinViews    = map[string]string{
+		"proxy.inbounds":      "latticenet.vpn-core",
+		"proxy.users":         "latticenet.vpn-core",
+		"proxy.profiles":      "latticenet.vpn-core",
+		"proxy.subscriptions": "latticenet.vpn-core",
+		"proxy.usage":         "latticenet.vpn-core",
+		"proxy.discovered":    "latticenet.vpn-core",
+		"proxy.substore":      "latticenet.sub-store",
+	}
 )
 
 // NavContribution is a sidebar entry a plugin adds. Route is plugin-relative and
 // mounted at /plugins/<id>/<route>.
 type NavContribution struct {
-	Section string   `json:"section"`
-	Title   string   `json:"title"`
-	Route   string   `json:"route"`
-	Icon    string   `json:"icon,omitempty"`
-	Scopes  []string `json:"scopes,omitempty"`
+	Section      string   `json:"section"`
+	SectionTitle string   `json:"section_title,omitempty"`
+	Title        string   `json:"title"`
+	Route        string   `json:"route"`
+	Icon         string   `json:"icon,omitempty"`
+	Scopes       []string `json:"scopes,omitempty"`
 }
 
 // ViewSource binds a view's data to a plugin interface method.
@@ -68,12 +84,13 @@ type ViewAction struct {
 
 // ViewContribution is one declarative view rendered by a fixed dashboard primitive.
 type ViewContribution struct {
-	Route   string       `json:"route"`
-	Title   string       `json:"title"`
-	Kind    string       `json:"kind"`
-	Source  *ViewSource  `json:"source,omitempty"`
-	Columns []ViewColumn `json:"columns,omitempty"`
-	Actions []ViewAction `json:"actions,omitempty"`
+	Route        string       `json:"route"`
+	Title        string       `json:"title"`
+	Kind         string       `json:"kind"`
+	ComponentKey string       `json:"component_key,omitempty"`
+	Source       *ViewSource  `json:"source,omitempty"`
+	Columns      []ViewColumn `json:"columns,omitempty"`
+	Actions      []ViewAction `json:"actions,omitempty"`
 }
 
 // ManifestUI is a plugin's dashboard contribution set.
@@ -93,24 +110,42 @@ type InterfaceContract struct {
 // validateContributions checks a manifest's ui + interfaces against the
 // allow-lists. Empty contributions are valid (most plugins have none).
 func validateContributions(m Manifest) error {
+	contracts := map[string]map[string][]string{}
 	for _, c := range m.Interfaces {
 		if c.Service == "" {
 			return fmt.Errorf("interface service is required")
+		}
+		if !serviceOwnedByPlugin(m.ID, c.Service) {
+			return fmt.Errorf("interface service %q must be under plugin id %q", c.Service, m.ID)
 		}
 		if len(c.Methods) == 0 {
 			return fmt.Errorf("interface %q must declare at least one method", c.Service)
 		}
 		for _, s := range c.Scopes {
-			if !scopeLooksValid(s) {
+			if !scopeAllowedInManifest(s) {
 				return fmt.Errorf("interface %q invalid scope %q", c.Service, s)
 			}
+		}
+		if contracts[c.Service] == nil {
+			contracts[c.Service] = map[string][]string{}
+		}
+		seenMethods := map[string]bool{}
+		for _, method := range c.Methods {
+			if !pluginMethodRe.MatchString(method) {
+				return fmt.Errorf("interface %q invalid method %q", c.Service, method)
+			}
+			if seenMethods[method] {
+				return fmt.Errorf("interface %q duplicate method %q", c.Service, method)
+			}
+			seenMethods[method] = true
+			contracts[c.Service][method] = c.Scopes
 		}
 	}
 	if m.UI == nil {
 		return nil
 	}
 	for _, n := range m.UI.Nav {
-		if !pluginNavSections[n.Section] {
+		if !sectionAllowed(n.Section) {
 			return fmt.Errorf("nav section %q is not allowed", n.Section)
 		}
 		if n.Title == "" || !pluginRouteRe.MatchString(n.Route) {
@@ -120,7 +155,7 @@ func validateContributions(m Manifest) error {
 			return fmt.Errorf("nav icon %q is not allowed", n.Icon)
 		}
 		for _, s := range n.Scopes {
-			if !scopeLooksValid(s) {
+			if !scopeAllowedInManifest(s) {
 				return fmt.Errorf("nav scope %q invalid", s)
 			}
 		}
@@ -132,6 +167,19 @@ func validateContributions(m Manifest) error {
 		if !pluginViewKinds[v.Kind] {
 			return fmt.Errorf("view kind %q is not allowed", v.Kind)
 		}
+		if v.Kind == "builtin" {
+			owner, ok := pluginBuiltinViews[v.ComponentKey]
+			if !ok || owner != m.ID {
+				return fmt.Errorf("view %q builtin component %q is not allowed for plugin %q", v.Route, v.ComponentKey, m.ID)
+			}
+		} else if v.ComponentKey != "" {
+			return fmt.Errorf("view %q component_key requires builtin kind", v.Route)
+		}
+		if v.Source != nil {
+			if !methodDeclared(contracts, v.Source.Interface, v.Source.Method) {
+				return fmt.Errorf("view %q source %s/%s is not declared in interfaces", v.Route, v.Source.Interface, v.Source.Method)
+			}
+		}
 		for _, col := range v.Columns {
 			if !pluginKeyRe.MatchString(col.Key) || !pluginRenderHints[col.Render] {
 				return fmt.Errorf("view %q invalid column (key %q render %q)", v.Route, col.Key, col.Render)
@@ -140,6 +188,18 @@ func validateContributions(m Manifest) error {
 		for _, a := range v.Actions {
 			if a.Label == "" || a.Interface == "" || a.Method == "" {
 				return fmt.Errorf("view %q action needs label/interface/method", v.Route)
+			}
+			contractScopes, declared := declaredMethodScopes(contracts, a.Interface, a.Method)
+			if !declared {
+				return fmt.Errorf("view %q action %s/%s is not declared in interfaces", v.Route, a.Interface, a.Method)
+			}
+			if len(contractScopes) == 0 && len(a.Scopes) == 0 {
+				return fmt.Errorf("view %q action %s/%s must declare scopes or inherit scoped interface", v.Route, a.Interface, a.Method)
+			}
+			for _, s := range a.Scopes {
+				if !scopeAllowedInManifest(s) {
+					return fmt.Errorf("view %q action scope %q invalid", v.Route, s)
+				}
 			}
 			for _, f := range a.Form {
 				if !pluginKeyRe.MatchString(f.Key) || !pluginFormKinds[f.Kind] {
@@ -151,8 +211,34 @@ func validateContributions(m Manifest) error {
 	return nil
 }
 
+func sectionAllowed(section string) bool {
+	return pluginNavSections[section] || pluginSectionRe.MatchString(section)
+}
+
+func serviceOwnedByPlugin(pluginID, service string) bool {
+	suffix := strings.TrimPrefix(service, pluginID+"/")
+	return suffix != service && pluginServiceSuffixRe.MatchString(suffix)
+}
+
+func methodDeclared(contracts map[string]map[string][]string, service, method string) bool {
+	_, ok := declaredMethodScopes(contracts, service, method)
+	return ok
+}
+
+func declaredMethodScopes(contracts map[string]map[string][]string, service, method string) ([]string, bool) {
+	if contracts[service] == nil {
+		return nil, false
+	}
+	scopes, ok := contracts[service][method]
+	return scopes, ok
+}
+
 // scopeLooksValid bounds an RBAC scope token shape (domain:action). The dashboard
 // + server RBAC enforce the actual scope; this only rejects malformed values.
 func scopeLooksValid(s string) bool {
 	return regexp.MustCompile(`^[a-z][a-z0-9]*:[a-z][a-z0-9]*$`).MatchString(s)
+}
+
+func scopeAllowedInManifest(s string) bool {
+	return scopeLooksValid(s) && rbac.ValidScope(s)
 }

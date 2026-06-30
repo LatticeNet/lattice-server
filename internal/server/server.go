@@ -675,6 +675,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/geo", s.withAuth("", s.handleNodesGeo))
 	mux.HandleFunc("/api/nodes/geo/resolve", s.withAuth("", s.handleNodesGeoResolve))
 	mux.HandleFunc("/api/nodes/agent-updates", s.withAuth("", s.handleAgentUpdatePolicies))
+	mux.HandleFunc("/api/nodes/agent-updates/releases", s.withAuth("node:read", s.handleAgentUpdateReleaseInfo))
 	mux.HandleFunc("/api/nodes/agent-updates/delete", s.withAuth("node:admin", s.handleDeleteAgentUpdatePolicy))
 	mux.HandleFunc("/api/nodes/agent-updates/plan", s.withAuth("", s.handleAgentUpdatePlan))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))

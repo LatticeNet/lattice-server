@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,6 +44,16 @@ type agentUpdatePayload struct {
 	SHA256        string `json:"sha256"`
 	InstallPath   string `json:"install_path"`
 	ServiceName   string `json:"service_name"`
+}
+
+type agentReleaseInfoView struct {
+	Repo          string            `json:"repo"`
+	LatestTag     string            `json:"latest_tag"`
+	LatestVersion string            `json:"latest_version"`
+	ReleaseURL    string            `json:"release_url"`
+	Artifacts     []string          `json:"artifacts"`
+	SHA256        map[string]string `json:"sha256"`
+	FetchedAt     time.Time         `json:"fetched_at"`
 }
 
 func (s *Server) handleAgentUpdatePolicies(w http.ResponseWriter, r *http.Request, p principal) {
@@ -141,6 +152,19 @@ func (s *Server) handleAgentUpdatePlan(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
+}
+
+func (s *Server) handleAgentUpdateReleaseInfo(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	info, err := s.fetchAgentReleaseInfo()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
 }
 
 var errAgentUpdateNoop = errors.New("agent already reports the target version")
@@ -440,6 +464,45 @@ func (s *Server) fetchLatestAgentReleaseTag() (string, error) {
 		return "", errors.New("latest agent release has no v* tag")
 	}
 	return tag, nil
+}
+
+func (s *Server) fetchAgentReleaseInfo() (agentReleaseInfoView, error) {
+	tag, err := s.fetchLatestAgentReleaseTag()
+	if err != nil {
+		return agentReleaseInfoView{}, err
+	}
+	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", s.agentReleaseRepo, url.PathEscape(tag))
+	sums, err := s.fetchAgentReleaseText(base + "/SHA256SUMS")
+	if err != nil {
+		return agentReleaseInfoView{}, err
+	}
+	sha := map[string]string{}
+	for _, line := range strings.Split(sums, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		sum := strings.ToLower(fields[0])
+		artifact := fields[1]
+		if !agentSHA256Re.MatchString(sum) {
+			continue
+		}
+		sha[artifact] = sum
+	}
+	artifacts := make([]string, 0, len(sha))
+	for artifact := range sha {
+		artifacts = append(artifacts, artifact)
+	}
+	sort.Strings(artifacts)
+	return agentReleaseInfoView{
+		Repo:          s.agentReleaseRepo,
+		LatestTag:     tag,
+		LatestVersion: strings.TrimPrefix(tag, "v"),
+		ReleaseURL:    "https://github.com/" + s.agentReleaseRepo + "/releases/tag/" + url.PathEscape(tag),
+		Artifacts:     artifacts,
+		SHA256:        sha,
+		FetchedAt:     s.now(),
+	}, nil
 }
 
 func (s *Server) fetchAgentReleaseText(rawURL string) (string, error) {

@@ -179,7 +179,11 @@ Use the compose file and deployment guide in the umbrella repository:
   `lattice-agent-linux-amd64` or `lattice-agent-linux-arm64`, reads the release
   `SHA256SUMS`, and creates the reviewed update task with the concrete URL and
   digest. `target_version=latest` resolves to the latest `v*` GitHub release at
-  plan time. Approval and node-side exec/root-exec requirements still apply.
+  plan time. `/api/nodes/agent-updates/releases` exposes a read-only snapshot of
+  the current latest tag and published checksums for dashboard guidance; the
+  approval plan remains authoritative because it binds the concrete URL and
+  SHA-256 server-side. Approval and node-side exec/root-exec requirements still
+  apply.
   Default install targets are treated as auto-detectable: the task script
   inspects the running agent parent process and systemd cgroup, then updates the
   currently executing `lattice-agent` path and restarts the detected service

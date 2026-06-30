@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 func nodeTokenAuthOK(t *testing.T, handler http.Handler, nodeID, token string) bool {
@@ -92,5 +94,40 @@ func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
 	}
 	if out.Commands["manual"] == "" || !strings.Contains(out.Commands["manual"], "lattice-agent -server 'https://lattice.example.com'") {
 		t.Fatalf("manual command missing or invalid: %+v", out.Commands)
+	}
+}
+
+func TestNodeReconfigureCommandSourcesCanonicalAndLegacyEnv(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://lattice.example.com/")
+	cookies, csrf := loginSession(t, handler)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A"}); err != nil {
+		t.Fatal(err)
+	}
+
+	res := doJSON(t, handler, http.MethodPost, "/api/nodes/reconfigure-command", `{
+		"node_id":"node-a",
+		"agent_launch":{"allow_exec":true,"allow_root_exec":true,"allow_terminal":true,"terminal_transport":"stream"}
+	}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("reconfigure: %d", res.StatusCode)
+	}
+	var out struct {
+		Command string `json:"command"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env",
+		"LATTICE_NODE_ID='node-a'",
+		"LATTICE_AGENT_ALLOW_EXEC='1'",
+		"LATTICE_AGENT_ALLOW_ROOT_EXEC='1'",
+		"LATTICE_AGENT_ALLOW_TERMINAL='1'",
+		"LATTICE_TERMINAL_TRANSPORT='stream'",
+	} {
+		if !strings.Contains(out.Command, want) {
+			t.Fatalf("reconfigure command missing %q:\n%s", want, out.Command)
+		}
 	}
 }

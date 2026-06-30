@@ -187,6 +187,11 @@ Use the compose file and deployment guide in the umbrella repository:
   custom `/opt/lattice/node-agent/lattice-agent` layouts working. A successful
   task result records `last_applied_version`; the live source of truth remains
   the next node heartbeat's reported `agent_version`.
+- Node reconfigure commands source both the canonical
+  `/opt/lattice/lattice-agent.env` and legacy `/opt/lattice/node-agent/agent.env`
+  before rerunning the installer. Operators can therefore reconfigure or upgrade
+  old nodes without copying the node token again, while the installer still
+  refuses node-id/token mismatches.
 - Browser Terminal uses scoped, in-memory server sessions and outbound
   node-agent polling. It is not inbound SSH, and the server does not store SSH
   keys. Operators need `terminal:open`; nodes must run `lattice-agent` with

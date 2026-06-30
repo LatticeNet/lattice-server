@@ -42,7 +42,7 @@ const (
 	// kept alive awaiting a reattach. Within this window a brief network blip,
 	// page reload, or laptop-sleep is forgiven and the kept-alive PTY is rejoined;
 	// past it the session is reaped (the node is presumed unreachable / abandoned).
-	terminalDetachGrace = 45 * time.Second
+	terminalDetachGrace = 90 * time.Second
 	// terminalMaxLifeTTL is an absolute cap from OpenedAt regardless of activity —
 	// defense in depth so a forgotten-but-busy session cannot live forever.
 	terminalMaxLifeTTL = 8 * time.Hour
@@ -746,7 +746,9 @@ func (s *Server) handleTerminalSessionPath(w http.ResponseWriter, r *http.Reques
 		// reattach arrives in time or the agent reports the shell exited. If no
 		// agent ever connected (bridged == false), the session was never live, so
 		// its lifecycle is left to the pending/idle reaper.
-		bridged := s.terminalHub.attachBrowser(session.ID, websocketx.NewConn(conn), func() {
+		browserConn := websocketx.NewConn(conn)
+		browserConn.SetReadLimit(terminalMaxInputBytes)
+		bridged := s.terminalHub.attachBrowser(session.ID, browserConn, func() {
 			s.terminalBroker.clearDetached(session.ID, s.now())
 		})
 		if bridged {

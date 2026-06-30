@@ -156,6 +156,14 @@ func (h *terminalHub) attachBrowser(sessionID string, c *websocketx.Conn, onBrid
 		}
 		h.bridge(c, agent)
 		return true
+	case <-bridge.done:
+		_ = c.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseServiceRestart, "terminal attach superseded"),
+			time.Now().Add(time.Second),
+		)
+		_ = c.Close()
+		return false
 	case <-timer.C:
 		_ = c.WriteControl(
 			websocket.CloseMessage,
@@ -266,6 +274,10 @@ func (s *Server) handleAgentTerminalStream(w http.ResponseWriter, r *http.Reques
 	sess, ok := s.terminalBroker.get(sessionID, s.now())
 	if !ok || sess.NodeID != nodeID {
 		writeError(w, http.StatusNotFound, errors.New("terminal session not found"))
+		return
+	}
+	if terminalClosedStatus(sess.Status) {
+		writeError(w, http.StatusNotFound, errors.New("terminal session is closed"))
 		return
 	}
 	s.terminalBroker.markOpen(sessionID, s.now())

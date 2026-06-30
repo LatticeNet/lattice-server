@@ -281,9 +281,13 @@ func TestNetPolicyStalePlanCannotApproveOrMarkCurrentPolicyApplied(t *testing.T)
 	}
 	approveOld := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
 		`{"approval_id":"`+staleApproval.ID+`","queue_apply":true,"plan_sha256":"`+hex.EncodeToString(staleSHA[:])+`"}`, cookies, csrf)
-	approveOld.Body.Close()
 	if approveOld.StatusCode != http.StatusConflict {
+		approveOld.Body.Close()
 		t.Fatalf("stale approval should be rejected, got %d", approveOld.StatusCode)
+	}
+	approveOldErr := errorBodyFromResponse(t, approveOld)
+	if approveOldErr.Error.Code != model.APIErrorApprovalStale {
+		t.Fatalf("stale approval code = %q want %q", approveOldErr.Error.Code, model.APIErrorApprovalStale)
 	}
 
 	freshPlanRes := doJSON(t, handler, http.MethodPost, "/api/netpolicy/plan", `{"node_id":"node-a"}`, cookies, csrf)

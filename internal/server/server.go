@@ -4672,13 +4672,13 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	}
 	if approval.Plugin == "nftpolicy" {
 		if err := s.requireCurrentNetPolicyApproval(approval); err != nil {
-			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
 			return
 		}
 	}
 	if approval.Plugin == proxyCorePlugin {
 		if err := s.requireCurrentProxyCoreApproval(approval); err != nil {
-			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
 			return
 		}
 	}
@@ -4707,14 +4707,14 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 				return
 			}
 			if err := s.requireSelfDNSDeploymentForApproval(approval); err != nil {
-				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
 				return
 			}
 		case proxyCorePlugin:
 			var err error
 			applyScript, err = s.proxyCoreApplyScript(approval)
 			if err != nil {
-				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
 				return
 			}
 		case agentUpdatePlugin:

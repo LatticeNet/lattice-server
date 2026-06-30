@@ -419,6 +419,49 @@ func TestDNSPlanBindsPinnedCoreDNSBinaryIntoReviewedPlan(t *testing.T) {
 	}
 }
 
+func TestDNSApproveRejectsStaleDeletedDeployment(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create failed: %d", create.StatusCode)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	plan := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("plan failed: %d", plan.StatusCode)
+	}
+	var approval model.Approval
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteDNSDeployment(created.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
+	if approve.StatusCode != http.StatusConflict {
+		approve.Body.Close()
+		t.Fatalf("stale selfdns approval should be rejected, got %d", approve.StatusCode)
+	}
+	approveErr := errorBodyFromResponse(t, approve)
+	if approveErr.Error.Code != model.APIErrorApprovalStale {
+		t.Fatalf("stale selfdns approval code = %q want %q", approveErr.Error.Code, model.APIErrorApprovalStale)
+	}
+}
+
 func TestDNSPlanRequiresNetworkPlanScope(t *testing.T) {
 	_, handler, _ := newDNSServer(t)
 	cookies, csrf := loginSession(t, handler)

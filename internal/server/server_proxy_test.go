@@ -1292,9 +1292,13 @@ func TestProxyApproveRejectsStalePlan(t *testing.T) {
 
 	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
 		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
-	defer approve.Body.Close()
 	if approve.StatusCode != http.StatusConflict {
+		approve.Body.Close()
 		t.Fatalf("stale proxycore plan should be rejected, got %d", approve.StatusCode)
+	}
+	approveErr := errorBodyFromResponse(t, approve)
+	if approveErr.Error.Code != model.APIErrorApprovalStale {
+		t.Fatalf("stale proxycore approval code = %q want %q", approveErr.Error.Code, model.APIErrorApprovalStale)
 	}
 }
 

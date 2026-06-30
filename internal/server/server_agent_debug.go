@@ -78,7 +78,7 @@ func (s *Server) handleNodeDebugPolicy(w http.ResponseWriter, r *http.Request, p
 			"collect": strconv.FormatBool(node.AgentDebug.Collect),
 		},
 	})
-	writeJSON(w, http.StatusOK, toNodeView(node))
+	writeJSON(w, http.StatusOK, s.toNodeView(node))
 }
 
 func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +169,7 @@ func (s *Server) handleNodeTerminalTransport(w http.ResponseWriter, r *http.Requ
 			"transport": transport,
 		},
 	})
-	writeJSON(w, http.StatusOK, toNodeView(node))
+	writeJSON(w, http.StatusOK, s.toNodeView(node))
 }
 
 // handleNodeIPConfig sets (or clears) a node's public-IP discovery override —
@@ -228,7 +228,7 @@ func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p pr
 		Scope:    "node:admin",
 		Metadata: map[string]string{"mode": mode},
 	})
-	writeJSON(w, http.StatusOK, toNodeView(node))
+	writeJSON(w, http.StatusOK, s.toNodeView(node))
 }
 
 // validateNodeIPConfig validates an operator-supplied per-node IP override. An

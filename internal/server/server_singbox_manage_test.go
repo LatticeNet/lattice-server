@@ -202,8 +202,10 @@ func TestSingBoxProbeTaskResultAcceptsRuntimeFallbackList(t *testing.T) {
 		t.Fatalf("want one task: err=%v tasks=%+v", err, tasks)
 	}
 	stdout := singBoxProbeListMarker + `
+ERROR: unknown flag --addr; use sing-box help
 {"ok":true,"count":1,"nodes":[{"name":"VLESS-REALITY-31001.json","protocol":"vless","network":"reality","address":"64.186.227.5","port":"31001","sni":"www.cloudflare.com","host":"::"}]}
 ` + singBoxProbeProvisionMarker + `
+ERROR: unknown flag --addr; use sing-box help
 {"version":"1.13.12"}
 `
 	result := `{"node_id":"node-runtime","result":{"task_id":"` + tasks[0].ID + `","lease_id":"` + tasks[0].LeaseID + `","exit_code":0,"stdout":` + string(mustJSON(t, stdout)) + `}}`

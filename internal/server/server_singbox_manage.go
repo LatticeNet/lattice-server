@@ -147,10 +147,21 @@ func buildSingBoxProbeScript(taskID, addr string) string {
 		"      } ] as $nodes | {ok:true,count:($nodes|length),nodes:$nodes}\n" +
 		"  ' $files\n" +
 		"}\n" +
+		"lattice_singbox_try_sb() {\n" +
+		"  mode=\"$1\"; shift\n" +
+		"  out=\"$(mktemp \"${TMPDIR:-/tmp}/lattice-sb-${mode}.out.XXXXXX\")\" || exit 1\n" +
+		"  err=\"$(mktemp \"${TMPDIR:-/tmp}/lattice-sb-${mode}.err.XXXXXX\")\" || exit 1\n" +
+		"  if \"$@\" >\"$out\" 2>\"$err\"; then cat \"$out\"; rm -f \"$out\" \"$err\"; return 0; fi\n" +
+		"  code=$?\n" +
+		"  [ -s \"$err\" ] && { printf 'sb %s failed with exit %s:\\n' \"$mode\" \"$code\" >&2; cat \"$err\" >&2; }\n" +
+		"  [ -s \"$out\" ] && { printf 'sb %s stdout before fallback:\\n' \"$mode\" >&2; cat \"$out\" >&2; }\n" +
+		"  rm -f \"$out\" \"$err\"\n" +
+		"  return \"$code\"\n" +
+		"}\n" +
 		"echo " + shellQuote(singBoxProbeListMarker) + "\n" +
-		"if ! " + base + " list; then lattice_singbox_runtime_list; fi\n" +
+		"if ! lattice_singbox_try_sb list " + base + " list; then lattice_singbox_runtime_list; fi\n" +
 		"echo " + shellQuote(singBoxProbeProvisionMarker) + "\n" +
-		"if ! " + base + " provision; then command -v sing-box >/dev/null 2>&1 && sing-box version 2>/dev/null | awk 'NR==1{gsub(/\\033\\[[0-9;]*m/,\"\"); print \"{\\\"version\\\":\\\"\" $2 \"\\\"}\"; exit}' || printf '%s\\n' '{}'; fi\n"
+		"if ! lattice_singbox_try_sb provision " + base + " provision; then command -v sing-box >/dev/null 2>&1 && sing-box version 2>/dev/null | awk 'NR==1{gsub(/\\033\\[[0-9;]*m/,\"\"); print \"{\\\"version\\\":\\\"\" $2 \"\\\"}\"; exit}' || printf '%s\\n' '{}'; fi\n"
 }
 
 // nodeSBAddr returns the address to pass as `sb --addr` so share links render
@@ -386,7 +397,7 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 	} else if parsed, err := parseSingBoxProbeStdout(result.NodeID, inv.At, result.Stdout); err != nil {
 		status = singBoxProbeResultParseFailed
 		inv.Status = "error"
-		inv.Error = truncateMetadataValue(err.Error(), 240)
+		inv.Error = truncateMetadataValue(fmt.Sprintf("%s (task %s; inspect Task History for stdout/stderr)", err.Error(), task.ID), 240)
 	} else {
 		inv = parsed
 	}
@@ -413,12 +424,20 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 		NodeID:   result.NodeID,
 		Action:   singBoxProbeResultAction,
 		Decision: "allow",
-		Metadata: map[string]string{
-			"task_id": task.ID,
-			"status":  status,
-			"nodes":   nodes,
-		},
+		Metadata: singBoxProbeResultMetadata(task.ID, status, nodes, inv.Error),
 	})
+}
+
+func singBoxProbeResultMetadata(taskID, status, nodes, errText string) map[string]string {
+	metadata := map[string]string{
+		"task_id": taskID,
+		"status":  status,
+		"nodes":   nodes,
+	}
+	if errText = strings.TrimSpace(errText); errText != "" {
+		metadata["error"] = truncateMetadataValue(errText, 240)
+	}
+	return metadata
 }
 
 func isAgentExecDisabledTaskResult(result model.TaskResult) bool {
@@ -444,7 +463,7 @@ func parseSingBoxProbeStdout(nodeID string, at time.Time, stdout string) (model.
 		Count int                 `json:"count"`
 		Nodes []model.SingBoxNode `json:"nodes"`
 	}
-	if err := json.Unmarshal([]byte(listJSON), &listResp); err != nil {
+	if err := decodeProbeJSONSection(listJSON, &listResp); err != nil {
 		return model.SingBoxInventory{}, fmt.Errorf("decode probe list: %w", err)
 	}
 	inv := model.SingBoxInventory{
@@ -460,7 +479,7 @@ func parseSingBoxProbeStdout(nodeID string, at time.Time, stdout string) (model.
 		var provision struct {
 			Version string `json:"version"`
 		}
-		if err := json.Unmarshal([]byte(provisionJSON), &provision); err == nil {
+		if err := decodeProbeJSONSection(provisionJSON, &provision); err == nil {
 			inv.CoreVersion = strings.TrimSpace(provision.Version)
 		}
 	}
@@ -480,4 +499,51 @@ func probeSection(stdout, startMarker, endMarker string) (string, bool) {
 		}
 	}
 	return strings.TrimSpace(body), true
+}
+
+func decodeProbeJSONSection(section string, target any) error {
+	jsonText, err := firstJSONObject(section)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(jsonText), target)
+}
+
+func firstJSONObject(section string) (string, error) {
+	start := strings.Index(section, "{")
+	if start < 0 {
+		return "", errors.New("no JSON object found")
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(section); i++ {
+		ch := section[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return section[start : i+1], nil
+			}
+		}
+	}
+	return "", errors.New("unterminated JSON object")
 }

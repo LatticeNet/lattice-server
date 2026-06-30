@@ -199,6 +199,13 @@ type Server struct {
 	singboxInvMu sync.RWMutex
 	singboxInv   map[string]model.SingBoxInventory
 
+	// agentRuntime is live proof of the startup flags reported by node-agent
+	// heartbeats. It is intentionally in-memory: old agents omit it, new agents
+	// refresh it every metrics interval, and a server restart repopulates it from
+	// the next heartbeat without adding persistence coupling to lattice-sdk.
+	agentRuntimeMu sync.RWMutex
+	agentRuntime   map[string]agentRuntimeConfig
+
 	// pendingSingboxProbeNodeIDs maps a node ID to the task ID of the most recent
 	// probe task. Entries are written and evicted exclusively by
 	// handleSingBoxManageProbe (under pendingSingboxProbeMu); the result handler
@@ -1667,20 +1674,48 @@ type nodeView struct {
 	Geo                *model.NodeGeo           `json:"geo,omitempty"`
 	AgentDebug         model.AgentDebugPolicy   `json:"agent_debug"`
 	AgentLaunch        *model.AgentLaunchConfig `json:"agent_launch,omitempty"`
+	AgentRuntime       *agentRuntimeConfig      `json:"agent_runtime,omitempty"`
 	IPConfig           *model.NodeIPConfig      `json:"ip_config,omitempty"`
 	GroupIDs           []string                 `json:"group_ids,omitempty"`
 	CreatedAt          time.Time                `json:"created_at"`
 }
 
-func toNodeView(n model.Node) nodeView {
+type agentRuntimeConfig struct {
+	AllowExec             bool      `json:"allow_exec"`
+	AllowRootExec         bool      `json:"allow_root_exec"`
+	NoExec                bool      `json:"no_exec"`
+	AllowTerminal         bool      `json:"allow_terminal"`
+	TerminalTransport     string    `json:"terminal_transport,omitempty"`
+	SSHAlerts             bool      `json:"ssh_alerts"`
+	SingBoxDiscover       bool      `json:"singbox_discover"`
+	SingBoxBin            string    `json:"singbox_bin,omitempty"`
+	ProxyUsageFile        string    `json:"proxy_usage_file,omitempty"`
+	ProxyUsageURL         string    `json:"proxy_usage_url,omitempty"`
+	ProxyUsageXrayAPI     string    `json:"proxy_usage_xray_api,omitempty"`
+	ProxyUsageXrayBin     string    `json:"proxy_usage_xray_bin,omitempty"`
+	ProxyUsageXrayPattern string    `json:"proxy_usage_xray_pattern,omitempty"`
+	ReportedAt            time.Time `json:"reported_at,omitempty"`
+}
+
+func (s *Server) toNodeView(n model.Node) nodeView {
 	return nodeView{
 		ID: n.ID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role,
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
+}
+
+func (s *Server) agentRuntimeSnapshot(nodeID string) *agentRuntimeConfig {
+	s.agentRuntimeMu.RLock()
+	defer s.agentRuntimeMu.RUnlock()
+	if runtime, ok := s.agentRuntime[nodeID]; ok {
+		cp := runtime
+		return &cp
+	}
+	return nil
 }
 
 func normalizeNodeTags(tags []string) []string {
@@ -1711,7 +1746,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, p principal
 	for _, n := range nodes {
 		if rbac.Allows(p.Principal, "node:read", n.ID) {
 			n.GroupIDs = groups.GroupIDsForNode(n.ID, resolvedGroups)
-			views = append(views, toNodeView(n))
+			views = append(views, s.toNodeView(n))
 		}
 	}
 	writeJSON(w, http.StatusOK, views)
@@ -1962,6 +1997,35 @@ func normalizeAgentLaunchConfig(in model.AgentLaunchConfig) model.AgentLaunchCon
 	out.ProxyUsageXrayAPI = strings.TrimSpace(out.ProxyUsageXrayAPI)
 	out.ProxyUsageXrayBin = strings.TrimSpace(out.ProxyUsageXrayBin)
 	out.ProxyUsageXrayPattern = strings.TrimSpace(out.ProxyUsageXrayPattern)
+	return out
+}
+
+func normalizeAgentRuntimeConfig(in agentRuntimeConfig, now time.Time) agentRuntimeConfig {
+	out := in
+	if out.NoExec {
+		out.AllowExec = false
+		out.AllowRootExec = false
+		out.AllowTerminal = false
+	}
+	switch strings.ToLower(strings.TrimSpace(out.TerminalTransport)) {
+	case "stream":
+		out.TerminalTransport = "stream"
+	case "poll":
+		out.TerminalTransport = "poll"
+	default:
+		out.TerminalTransport = ""
+	}
+	out.SingBoxBin = strings.TrimSpace(out.SingBoxBin)
+	out.ProxyUsageFile = strings.TrimSpace(out.ProxyUsageFile)
+	out.ProxyUsageURL = strings.TrimSpace(out.ProxyUsageURL)
+	out.ProxyUsageXrayAPI = strings.TrimSpace(out.ProxyUsageXrayAPI)
+	out.ProxyUsageXrayBin = strings.TrimSpace(out.ProxyUsageXrayBin)
+	out.ProxyUsageXrayPattern = strings.TrimSpace(out.ProxyUsageXrayPattern)
+	if out.ReportedAt.IsZero() {
+		out.ReportedAt = now.UTC()
+	} else {
+		out.ReportedAt = out.ReportedAt.UTC()
+	}
 	return out
 }
 
@@ -4773,7 +4837,8 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		agentAuthRequest
-		Metrics model.Metrics `json:"metrics"`
+		Metrics      model.Metrics       `json:"metrics"`
+		AgentRuntime *agentRuntimeConfig `json:"agent_runtime"`
 	}
 	if !decodeAgentJSON(w, r, &req) {
 		return
@@ -4799,6 +4864,15 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, inV4, inV6, req.WireGuardIP, hostFacts); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if req.AgentRuntime != nil {
+		runtime := normalizeAgentRuntimeConfig(*req.AgentRuntime, s.now())
+		s.agentRuntimeMu.Lock()
+		if s.agentRuntime == nil {
+			s.agentRuntime = map[string]agentRuntimeConfig{}
+		}
+		s.agentRuntime[req.NodeID] = runtime
+		s.agentRuntimeMu.Unlock()
 	}
 	s.maybeTriggerDDNS(req.NodeID, old.PublicIP, old.PublicIPv6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

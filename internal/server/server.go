@@ -660,6 +660,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/agent-updates/delete", s.withAuth("node:admin", s.handleDeleteAgentUpdatePolicy))
 	mux.HandleFunc("/api/nodes/agent-updates/plan", s.withAuth("", s.handleAgentUpdatePlan))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
+	mux.HandleFunc("/api/nodes/reconfigure-command", s.withAuth("node:admin", s.handleNodeReconfigureCommand))
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
 	mux.HandleFunc("/api/nodes/update", s.withAuth("node:admin", s.handleUpdateNode))
@@ -673,6 +674,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tasks/cancel", s.withAuth("", s.handleCancelTask))
 	mux.HandleFunc("/api/tasks/delete", s.withAuth("", s.handleDeleteTask))
 	mux.HandleFunc("/api/tasks/rerun", s.withAuth("", s.handleRerunTask))
+	mux.HandleFunc("/api/tasks/rerun-node", s.withAuth("", s.handleRerunTask))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/terminal/sessions", s.withAuth("", s.handleTerminalSessions))
 	mux.HandleFunc("/api/terminal/sessions/", s.withAuth("", s.handleTerminalSessionPath))
@@ -1632,29 +1634,30 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 }
 
 type nodeView struct {
-	ID                 string                 `json:"id"`
-	Name               string                 `json:"name"`
-	Tags               []string               `json:"tags"`
-	Role               string                 `json:"role"`
-	WireGuardIP        string                 `json:"wireguard_ip"`
-	WireGuardPublicKey string                 `json:"wireguard_public_key,omitempty"`
-	WireGuardEndpoint  string                 `json:"wireguard_endpoint,omitempty"`
-	WireGuardPort      int                    `json:"wireguard_port,omitempty"`
-	PublicIP           string                 `json:"public_ip"`
-	PublicIPv6         string                 `json:"public_ipv6,omitempty"`
-	InternalIP         string                 `json:"internal_ip,omitempty"`
-	InternalIPv6       string                 `json:"internal_ipv6,omitempty"`
-	AgentVersion       string                 `json:"agent_version"`
-	Online             bool                   `json:"online"`
-	Disabled           bool                   `json:"disabled,omitempty"`
-	LastSeen           time.Time              `json:"last_seen"`
-	Metrics            model.Metrics          `json:"metrics"`
-	HostFacts          model.HostFacts        `json:"host_facts"`
-	Geo                *model.NodeGeo         `json:"geo,omitempty"`
-	AgentDebug         model.AgentDebugPolicy `json:"agent_debug"`
-	IPConfig           *model.NodeIPConfig    `json:"ip_config,omitempty"`
-	GroupIDs           []string               `json:"group_ids,omitempty"`
-	CreatedAt          time.Time              `json:"created_at"`
+	ID                 string                   `json:"id"`
+	Name               string                   `json:"name"`
+	Tags               []string                 `json:"tags"`
+	Role               string                   `json:"role"`
+	WireGuardIP        string                   `json:"wireguard_ip"`
+	WireGuardPublicKey string                   `json:"wireguard_public_key,omitempty"`
+	WireGuardEndpoint  string                   `json:"wireguard_endpoint,omitempty"`
+	WireGuardPort      int                      `json:"wireguard_port,omitempty"`
+	PublicIP           string                   `json:"public_ip"`
+	PublicIPv6         string                   `json:"public_ipv6,omitempty"`
+	InternalIP         string                   `json:"internal_ip,omitempty"`
+	InternalIPv6       string                   `json:"internal_ipv6,omitempty"`
+	AgentVersion       string                   `json:"agent_version"`
+	Online             bool                     `json:"online"`
+	Disabled           bool                     `json:"disabled,omitempty"`
+	LastSeen           time.Time                `json:"last_seen"`
+	Metrics            model.Metrics            `json:"metrics"`
+	HostFacts          model.HostFacts          `json:"host_facts"`
+	Geo                *model.NodeGeo           `json:"geo,omitempty"`
+	AgentDebug         model.AgentDebugPolicy   `json:"agent_debug"`
+	AgentLaunch        *model.AgentLaunchConfig `json:"agent_launch,omitempty"`
+	IPConfig           *model.NodeIPConfig      `json:"ip_config,omitempty"`
+	GroupIDs           []string                 `json:"group_ids,omitempty"`
+	CreatedAt          time.Time                `json:"created_at"`
 }
 
 func toNodeView(n model.Node) nodeView {
@@ -1664,7 +1667,7 @@ func toNodeView(n model.Node) nodeView {
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }
 
@@ -1693,11 +1696,12 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		NodeID      string   `json:"node_id"`
-		Name        string   `json:"name"`
-		Tags        []string `json:"tags"`
-		Role        string   `json:"role"`
-		WireGuardIP string   `json:"wireguard_ip"`
+		NodeID      string                  `json:"node_id"`
+		Name        string                  `json:"name"`
+		Tags        []string                `json:"tags"`
+		Role        string                  `json:"role"`
+		WireGuardIP string                  `json:"wireguard_ip"`
+		AgentLaunch model.AgentLaunchConfig `json:"agent_launch"`
 		// GroupIDs assigns the freshly enrolled node into one or more existing
 		// groups by appending it to each group's explicit Members (the canonical
 		// membership). It is optional and idempotent; unknown group ids are
@@ -1750,6 +1754,8 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	if req.Name == "" {
 		req.Name = req.NodeID
 	}
+	launch := normalizeAgentLaunchConfig(req.AgentLaunch)
+	launch.UpdatedAt = time.Now().UTC()
 	token, err := auth.NewRandomToken(32)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -1767,6 +1773,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		Tags:        req.Tags,
 		Role:        req.Role,
 		WireGuardIP: req.WireGuardIP,
+		AgentLaunch: &launch,
 		CreatedAt:   time.Now().UTC(),
 	}
 	if err := s.store.UpsertNode(n); err != nil {
@@ -1799,13 +1806,14 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "node.enroll", Scope: "node:admin", NodeID: req.NodeID})
 	serverURL := s.agentEnrollServerURL()
-	commands := s.agentEnrollCommands(serverURL, req.NodeID, token)
+	commands := s.agentEnrollCommands(serverURL, req.NodeID, token, launch)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node_id":    req.NodeID,
-		"token":      token,
-		"server_url": serverURL,
-		"command":    commands["linux"],
-		"commands":   commands,
+		"node_id":      req.NodeID,
+		"token":        token,
+		"server_url":   serverURL,
+		"command":      commands["linux"],
+		"commands":     commands,
+		"agent_launch": launch,
 	})
 }
 
@@ -1817,26 +1825,201 @@ func (s *Server) agentEnrollServerURL() string {
 }
 
 func (s *Server) agentEnrollCommand(serverURL, nodeID, token string) string {
-	return s.agentEnrollCommands(serverURL, nodeID, token)["linux"]
+	return s.agentEnrollCommands(serverURL, nodeID, token, model.AgentLaunchConfig{})["linux"]
 }
 
-func (s *Server) agentEnrollCommands(serverURL, nodeID, token string) map[string]string {
-	manual := fmt.Sprintf("lattice-agent -server %s -node-id %s -token %s",
+func (s *Server) agentEnrollCommands(serverURL, nodeID, token string, launch model.AgentLaunchConfig) map[string]string {
+	env := agentLaunchEnv(launch)
+	manualFlags := agentLaunchFlags(launch)
+	manual := fmt.Sprintf("lattice-agent -server %s -node-id %s -token %s%s",
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		shellQuote(token),
+		manualFlags,
 	)
 	installURL := "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
-	linux := fmt.Sprintf("curl -fsSL %s -o lattice-agent-install.sh && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s ./lattice-agent-install.sh",
+	linux := fmt.Sprintf("curl -fsSL %s -o lattice-agent-install.sh && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s ./lattice-agent-install.sh",
 		shellQuote(installURL),
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		shellQuote(token),
+		env,
 	)
 	return map[string]string{
 		"linux":  linux,
 		"manual": manual,
 	}
+}
+
+func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID      string                  `json:"node_id"`
+		AgentLaunch model.AgentLaunchConfig `json:"agent_launch"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
+		return
+	}
+	node, ok := s.store.Node(req.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
+		return
+	}
+	launch := normalizeAgentLaunchConfig(req.AgentLaunch)
+	launch.UpdatedAt = time.Now().UTC()
+	node.AgentLaunch = &launch
+	if err := s.store.UpsertNode(node); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	serverURL := s.agentEnrollServerURL()
+	commands := s.agentReconfigureCommands(serverURL, req.NodeID, launch)
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.reconfigure.command", Scope: "node:admin"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node_id":      req.NodeID,
+		"server_url":   serverURL,
+		"command":      commands["linux"],
+		"commands":     commands,
+		"agent_launch": launch,
+	})
+}
+
+func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model.AgentLaunchConfig) map[string]string {
+	installURL := "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
+	env := agentLaunchEnv(launch)
+	linux := fmt.Sprintf("curl -fsSL %s -o lattice-agent-install.sh && chmod +x lattice-agent-install.sh && set -a; [ -f /opt/lattice/lattice-agent.env ] && . /opt/lattice/lattice-agent.env; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s ./lattice-agent-install.sh",
+		shellQuote(installURL),
+		shellQuote(serverURL),
+		shellQuote(nodeID),
+		env,
+	)
+	manual := fmt.Sprintf("lattice-agent -server %s -node-id %s%s",
+		shellQuote(serverURL),
+		shellQuote(nodeID),
+		agentLaunchFlags(launch),
+	)
+	return map[string]string{"linux": linux, "manual": manual}
+}
+
+func normalizeAgentLaunchConfig(in model.AgentLaunchConfig) model.AgentLaunchConfig {
+	out := in
+	if out.NoExec {
+		out.AllowExec = false
+		out.AllowRootExec = false
+		out.AllowTerminal = false
+	}
+	switch strings.ToLower(strings.TrimSpace(out.TerminalTransport)) {
+	case "stream":
+		out.TerminalTransport = "stream"
+	case "poll":
+		out.TerminalTransport = "poll"
+	default:
+		out.TerminalTransport = ""
+	}
+	out.SingBoxBin = strings.TrimSpace(out.SingBoxBin)
+	out.ProxyUsageFile = strings.TrimSpace(out.ProxyUsageFile)
+	out.ProxyUsageURL = strings.TrimSpace(out.ProxyUsageURL)
+	out.ProxyUsageXrayAPI = strings.TrimSpace(out.ProxyUsageXrayAPI)
+	out.ProxyUsageXrayBin = strings.TrimSpace(out.ProxyUsageXrayBin)
+	out.ProxyUsageXrayPattern = strings.TrimSpace(out.ProxyUsageXrayPattern)
+	return out
+}
+
+func agentLaunchEnv(launch model.AgentLaunchConfig) string {
+	env := []struct {
+		key   string
+		value string
+	}{
+		{"LATTICE_AGENT_ALLOW_EXEC", boolEnv(launch.AllowExec)},
+		{"LATTICE_AGENT_ALLOW_ROOT_EXEC", boolEnv(launch.AllowRootExec)},
+		{"LATTICE_NO_EXEC", boolEnv(launch.NoExec)},
+		{"LATTICE_AGENT_ALLOW_TERMINAL", boolEnv(launch.AllowTerminal)},
+		{"LATTICE_TERMINAL_TRANSPORT", launch.TerminalTransport},
+		{"LATTICE_SSH_ALERTS", boolEnv(launch.SSHAlerts)},
+		{"LATTICE_SINGBOX_DISCOVER", boolEnv(launch.SingBoxDiscover)},
+		{"LATTICE_SINGBOX_BIN", launch.SingBoxBin},
+		{"LATTICE_PROXY_USAGE_FILE", launch.ProxyUsageFile},
+		{"LATTICE_PROXY_USAGE_URL", launch.ProxyUsageURL},
+		{"LATTICE_PROXY_USAGE_XRAY_API", launch.ProxyUsageXrayAPI},
+		{"LATTICE_PROXY_USAGE_XRAY_BIN", launch.ProxyUsageXrayBin},
+		{"LATTICE_PROXY_USAGE_XRAY_PATTERN", launch.ProxyUsageXrayPattern},
+	}
+	parts := make([]string, 0, len(env))
+	for _, item := range env {
+		if item.value == "" {
+			continue
+		}
+		parts = append(parts, item.key+"="+shellQuote(item.value))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " " + strings.Join(parts, " ")
+}
+
+func agentLaunchFlags(launch model.AgentLaunchConfig) string {
+	flags := []string{}
+	if launch.AllowExec {
+		flags = append(flags, "-allow-exec=true")
+	}
+	if launch.AllowRootExec {
+		flags = append(flags, "-allow-root-exec=true")
+	}
+	if launch.NoExec {
+		flags = append(flags, "-no-exec=true")
+	}
+	if launch.AllowTerminal {
+		flags = append(flags, "-allow-terminal=true")
+	}
+	if launch.TerminalTransport != "" {
+		flags = append(flags, "-terminal-transport "+shellQuote(launch.TerminalTransport))
+	}
+	if launch.SSHAlerts {
+		flags = append(flags, "-ssh-alerts=true")
+	}
+	if launch.SingBoxDiscover {
+		flags = append(flags, "-singbox-discover=true")
+	}
+	if launch.SingBoxBin != "" {
+		flags = append(flags, "-singbox-bin "+shellQuote(launch.SingBoxBin))
+	}
+	if launch.ProxyUsageFile != "" {
+		flags = append(flags, "-proxy-usage-file "+shellQuote(launch.ProxyUsageFile))
+	}
+	if launch.ProxyUsageURL != "" {
+		flags = append(flags, "-proxy-usage-url "+shellQuote(launch.ProxyUsageURL))
+	}
+	if launch.ProxyUsageXrayAPI != "" {
+		flags = append(flags, "-proxy-usage-xray-api "+shellQuote(launch.ProxyUsageXrayAPI))
+	}
+	if launch.ProxyUsageXrayBin != "" {
+		flags = append(flags, "-proxy-usage-xray-bin "+shellQuote(launch.ProxyUsageXrayBin))
+	}
+	if launch.ProxyUsageXrayPattern != "" {
+		flags = append(flags, "-proxy-usage-xray-pattern "+shellQuote(launch.ProxyUsageXrayPattern))
+	}
+	if len(flags) == 0 {
+		return ""
+	}
+	return " " + strings.Join(flags, " ")
+}
+
+func boolEnv(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
 }
 
 // handleRotateNodeToken issues a fresh token for an existing node, invalidating
@@ -2032,7 +2215,8 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		ID string `json:"id"`
+		ID     string `json:"id"`
+		NodeID string `json:"node_id"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -2061,7 +2245,8 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		ID string `json:"id"`
+		ID     string `json:"id"`
+		NodeID string `json:"node_id"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -2091,7 +2276,8 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 		return
 	}
 	var req struct {
-		ID string `json:"id"`
+		ID     string `json:"id"`
+		NodeID string `json:"node_id"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -2101,7 +2287,17 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
 		return
 	}
-	if !s.requireAllNodeScopes(w, p, "task:run", src.Targets) {
+	targets := append([]string(nil), src.Targets...)
+	rerunOfNode := ""
+	if strings.TrimSpace(req.NodeID) != "" {
+		rerunOfNode = strings.TrimSpace(req.NodeID)
+		if !taskTargetContains(src.Targets, rerunOfNode) {
+			writeError(w, http.StatusBadRequest, errors.New("node_id is not a target of the source task"))
+			return
+		}
+		targets = []string{rerunOfNode}
+	}
+	if !s.requireAllNodeScopes(w, p, "task:run", targets) {
 		return
 	}
 	if err := validateTaskCreate(src.Interpreter, src.Script, src.TimeoutSec, src.OutputLimit); err != nil {
@@ -2109,23 +2305,45 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 		return
 	}
 	task := model.Task{
-		ID:          id.New("task"),
-		ActorID:     p.ActorID,
-		TokenID:     p.TokenID,
-		Targets:     src.Targets,
-		Interpreter: src.Interpreter,
-		Script:      src.Script,
-		TimeoutSec:  src.TimeoutSec,
-		OutputLimit: src.OutputLimit,
-		Status:      model.TaskQueued,
-		CreatedAt:   time.Now().UTC(),
+		ID:            id.New("task"),
+		ActorID:       p.ActorID,
+		TokenID:       p.TokenID,
+		Targets:       targets,
+		Interpreter:   src.Interpreter,
+		Script:        src.Script,
+		TimeoutSec:    src.TimeoutSec,
+		OutputLimit:   src.OutputLimit,
+		Status:        model.TaskQueued,
+		RerunOfTaskID: rootTaskID(src),
+		RerunOfNodeID: rerunOfNode,
+		CreatedAt:     time.Now().UTC(),
 	}
 	if err := s.store.CreateTask(task); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.rerun", Scope: "task:run", Metadata: map[string]string{"task_id": task.ID, "rerun_of": src.ID}})
+	metadata := map[string]string{"task_id": task.ID, "rerun_of": task.RerunOfTaskID}
+	if rerunOfNode != "" {
+		metadata["node_id"] = rerunOfNode
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.rerun", Scope: "task:run", Metadata: metadata})
 	writeJSON(w, http.StatusOK, toTaskView(task))
+}
+
+func rootTaskID(t model.Task) string {
+	if strings.TrimSpace(t.RerunOfTaskID) != "" {
+		return t.RerunOfTaskID
+	}
+	return t.ID
+}
+
+func taskTargetContains(targets []string, nodeID string) bool {
+	for _, target := range targets {
+		if target == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 // writeTaskStoreError maps task store sentinel errors to HTTP responses.
@@ -2168,6 +2386,8 @@ type taskView struct {
 	OutputLimit     int       `json:"output_limit"`
 	Status          string    `json:"status"`
 	LeasedBy        string    `json:"leased_by,omitempty"`
+	RerunOfTaskID   string    `json:"rerun_of_task_id,omitempty"`
+	RerunOfNodeID   string    `json:"rerun_of_node_id,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	StartedAt       time.Time `json:"started_at,omitempty"`
 	FinishedAt      time.Time `json:"finished_at,omitempty"`
@@ -2186,6 +2406,8 @@ func toTaskView(t model.Task) taskView {
 		OutputLimit:     t.OutputLimit,
 		Status:          t.Status,
 		LeasedBy:        t.LeasedBy,
+		RerunOfTaskID:   t.RerunOfTaskID,
+		RerunOfNodeID:   t.RerunOfNodeID,
 		CreatedAt:       t.CreatedAt,
 		StartedAt:       t.StartedAt,
 		FinishedAt:      t.FinishedAt,
@@ -3499,11 +3721,11 @@ func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, reco
 // tokenView is the safe projection of a token returned to clients: it never
 // includes the hash or the secret.
 type tokenView struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	ActorID         string    `json:"actor_id"`
-	Scopes          []string  `json:"scopes"`
-	ServerAllowlist []string  `json:"server_allowlist"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	ActorID         string     `json:"actor_id"`
+	Scopes          []string   `json:"scopes"`
+	ServerAllowlist []string   `json:"server_allowlist"`
 	CreatedAt       time.Time  `json:"created_at"`
 	RevokedAt       *time.Time `json:"revoked_at,omitempty"`
 }
@@ -4760,8 +4982,13 @@ func (s *Server) requireTaskLease(w http.ResponseWriter, r *http.Request, nodeID
 		writeError(w, http.StatusForbidden, apiError(model.APIErrorInvalidTaskLease, "invalid task lease"))
 		return false
 	}
-	if task.Status != model.TaskLeased || task.LeasedBy != nodeID ||
-		task.LeaseID == "" || result.LeaseID == "" || task.LeaseID != result.LeaseID {
+	validLease := false
+	if lease, ok := task.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
+		validLease = result.LeaseID != "" && lease.LeaseID == result.LeaseID
+	} else {
+		validLease = task.LeasedBy == nodeID && task.LeaseID != "" && result.LeaseID != "" && task.LeaseID == result.LeaseID
+	}
+	if task.Status != model.TaskLeased || !validLease {
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   nodeID,

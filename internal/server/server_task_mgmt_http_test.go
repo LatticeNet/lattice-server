@@ -46,9 +46,12 @@ func TestTaskCancelDeleteRerunHTTP(t *testing.T) {
 		t.Fatalf("rerun failed: %d", rerunRes.StatusCode)
 	}
 	var rerun struct {
-		ID           string `json:"id"`
-		Status       string `json:"status"`
-		ScriptSHA256 string `json:"script_sha256"`
+		ID            string   `json:"id"`
+		Status        string   `json:"status"`
+		ScriptSHA256  string   `json:"script_sha256"`
+		RerunOfTaskID string   `json:"rerun_of_task_id"`
+		RerunOfNodeID string   `json:"rerun_of_node_id"`
+		Targets       []string `json:"targets"`
 	}
 	if err := json.NewDecoder(rerunRes.Body).Decode(&rerun); err != nil {
 		t.Fatal(err)
@@ -61,6 +64,31 @@ func TestTaskCancelDeleteRerunHTTP(t *testing.T) {
 	}
 	if rerun.ScriptSHA256 != created.ScriptSHA256 {
 		t.Fatalf("rerun script sha %q != original %q", rerun.ScriptSHA256, created.ScriptSHA256)
+	}
+	if rerun.RerunOfTaskID != created.ID || rerun.RerunOfNodeID != "" {
+		t.Fatalf("rerun ancestry = task:%q node:%q want task:%q node empty", rerun.RerunOfTaskID, rerun.RerunOfNodeID, created.ID)
+	}
+
+	// Rerun-node mints a child task for exactly one target while preserving
+	// ancestry under the original task.
+	rerunNodeRes := doJSON(t, handler, http.MethodPost, "/api/tasks/rerun-node",
+		`{"id":"`+created.ID+`","node_id":"node-a"}`, cookies, csrf)
+	defer rerunNodeRes.Body.Close()
+	if rerunNodeRes.StatusCode != http.StatusOK {
+		t.Fatalf("rerun-node failed: %d", rerunNodeRes.StatusCode)
+	}
+	var rerunNode struct {
+		ID            string   `json:"id"`
+		RerunOfTaskID string   `json:"rerun_of_task_id"`
+		RerunOfNodeID string   `json:"rerun_of_node_id"`
+		Targets       []string `json:"targets"`
+	}
+	if err := json.NewDecoder(rerunNodeRes.Body).Decode(&rerunNode); err != nil {
+		t.Fatal(err)
+	}
+	if rerunNode.RerunOfTaskID != created.ID || rerunNode.RerunOfNodeID != "node-a" ||
+		len(rerunNode.Targets) != 1 || rerunNode.Targets[0] != "node-a" {
+		t.Fatalf("bad rerun-node view: %+v", rerunNode)
 	}
 
 	// Cancel the original (queued) task.

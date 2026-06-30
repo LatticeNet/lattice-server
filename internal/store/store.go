@@ -715,21 +715,30 @@ func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 		if len(out) >= limit {
 			break
 		}
-		if t.Status != model.TaskQueued || !contains(t.Targets, nodeID) {
+		if !taskCanLeaseTarget(t, nodeID, s.state.Results) {
 			continue
 		}
+		leaseSecret, err := auth.NewRandomToken(24)
+		if err != nil {
+			return nil, err
+		}
+		leaseID := "lease_" + leaseSecret
+		if t.TargetLeases == nil {
+			t.TargetLeases = map[string]model.TaskLease{}
+		}
+		t.TargetLeases[nodeID] = model.TaskLease{LeaseID: leaseID, StartedAt: now}
 		t.Status = model.TaskLeased
 		t.LeasedBy = nodeID
-		if t.LeaseID == "" {
-			leaseSecret, err := auth.NewRandomToken(24)
-			if err != nil {
-				return nil, err
-			}
-			t.LeaseID = "lease_" + leaseSecret
+		t.LeaseID = leaseID
+		if t.StartedAt.IsZero() {
+			t.StartedAt = now
 		}
-		t.StartedAt = now
 		s.state.Tasks[id] = t
-		out = append(out, t)
+		leased := t
+		leased.LeaseID = leaseID
+		leased.LeasedBy = nodeID
+		leased.StartedAt = now
+		out = append(out, leased)
 	}
 	if len(out) == 0 {
 		return out, nil
@@ -745,15 +754,79 @@ func (s *Store) AddTaskResult(r model.TaskResult) error {
 		s.state.Results = s.state.Results[len(s.state.Results)-maxTaskResults:]
 	}
 	if t, ok := s.state.Tasks[r.TaskID]; ok {
-		if r.Error != "" || r.ExitCode != 0 {
-			t.Status = model.TaskFailed
-		} else {
-			t.Status = model.TaskFinished
-		}
-		t.FinishedAt = r.FinishedAt
+		t.Status, t.FinishedAt = taskAggregateStatus(t, s.state.Results)
 		s.state.Tasks[t.ID] = t
 	}
 	return s.Save()
+}
+
+func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult) bool {
+	if !contains(t.Targets, nodeID) {
+		return false
+	}
+	if t.Status != model.TaskQueued && t.Status != model.TaskLeased {
+		return false
+	}
+	for _, r := range results {
+		if r.TaskID == t.ID && r.NodeID == nodeID {
+			return false
+		}
+	}
+	if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
+		return false
+	}
+	// Backward-compatible single-lease tasks created before TargetLeases
+	// existed must not be handed to the same node twice.
+	if t.LeasedBy == nodeID && t.LeaseID != "" {
+		return false
+	}
+	return true
+}
+
+func taskAggregateStatus(t model.Task, results []model.TaskResult) (string, time.Time) {
+	if len(t.Targets) == 0 {
+		return model.TaskFinished, time.Now().UTC()
+	}
+	latest := map[string]model.TaskResult{}
+	for _, r := range results {
+		if r.TaskID != t.ID || !contains(t.Targets, r.NodeID) {
+			continue
+		}
+		prev, ok := latest[r.NodeID]
+		if !ok || r.FinishedAt.After(prev.FinishedAt) {
+			latest[r.NodeID] = r
+		}
+	}
+	if len(latest) < len(uniqueStrings(t.Targets)) {
+		return model.TaskLeased, time.Time{}
+	}
+	finishedAt := time.Time{}
+	failed := false
+	for _, r := range latest {
+		if r.Error != "" || r.ExitCode != 0 {
+			failed = true
+		}
+		if r.FinishedAt.After(finishedAt) {
+			finishedAt = r.FinishedAt
+		}
+	}
+	if failed {
+		return model.TaskFailed, finishedAt
+	}
+	return model.TaskFinished, finishedAt
+}
+
+func uniqueStrings(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, v := range in {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 func (s *Store) Results() []model.TaskResult {

@@ -51,6 +51,7 @@ func main() {
 	var coreDNSURL string
 	var coreDNSSHA256 string
 	var geoIPLookupURL string
+	var agentReleaseRepo string
 	var printVersion bool
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
@@ -69,6 +70,7 @@ func main() {
 	flag.StringVar(&coreDNSURL, "coredns-binary-url", env("LATTICE_COREDNS_BINARY_URL", ""), "HTTPS URL to a direct CoreDNS executable binary for self-host DNS apply")
 	flag.StringVar(&coreDNSSHA256, "coredns-binary-sha256", env("LATTICE_COREDNS_BINARY_SHA256", ""), "SHA-256 hex digest of the CoreDNS executable binary")
 	flag.StringVar(&geoIPLookupURL, "geoip-lookup-url", env("LATTICE_GEOIP_LOOKUP_URL", geoip.DefaultLookupURL), "HTTPS GeoIP lookup URL template containing {ip}; set off/none/disabled to disable automatic node geolocation")
+	flag.StringVar(&agentReleaseRepo, "agent-release-repo", env("LATTICE_AGENT_RELEASE_REPO", ""), "trusted GitHub owner/repo for official lattice-agent releases")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-server version and exit")
 	flag.Parse()
 	if printVersion {
@@ -156,6 +158,7 @@ func main() {
 		PublicURL:        publicURL,
 		CoreDNSBinary:    selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
 		GeoResolver:      geoResolver,
+		AgentReleaseRepo: agentReleaseRepo,
 		Logger:           log.Default(),
 	})
 	if err != nil {

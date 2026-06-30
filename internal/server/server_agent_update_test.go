@@ -137,6 +137,34 @@ func TestAgentUpdateAutoPlanDoesNotDuplicatePendingApproval(t *testing.T) {
 	}
 }
 
+func TestOfficialAgentReleaseHelpers(t *testing.T) {
+	target, err := normalizeOfficialAgentTarget("")
+	if err != nil || target != agentReleaseLatest {
+		t.Fatalf("empty official target = %q, %v", target, err)
+	}
+	target, err = normalizeOfficialAgentTarget("v0.2.2")
+	if err != nil || target != "0.2.2" {
+		t.Fatalf("v-prefixed official target = %q, %v", target, err)
+	}
+	if _, err := normalizeOfficialAgentTarget("../bad"); err == nil {
+		t.Fatal("invalid official target should fail")
+	}
+
+	artifact, err := agentArtifactForNode(model.Node{HostFacts: model.HostFacts{OS: "linux", Arch: "x86_64"}})
+	if err != nil || artifact != "lattice-agent-linux-amd64" {
+		t.Fatalf("linux/x86_64 artifact = %q, %v", artifact, err)
+	}
+	artifact, err = agentArtifactForNode(model.Node{HostFacts: model.HostFacts{Platform: "debian", Arch: "aarch64"}})
+	if err != nil || artifact != "lattice-agent-linux-arm64" {
+		t.Fatalf("fallback linux/aarch64 artifact = %q, %v", artifact, err)
+	}
+
+	sha, ok := shaFromSums(agentUpdateTestSHA+"  lattice-agent-linux-amd64\n", "lattice-agent-linux-amd64")
+	if !ok || sha != agentUpdateTestSHA {
+		t.Fatalf("shaFromSums = %q, %v", sha, ok)
+	}
+}
+
 func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

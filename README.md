@@ -171,6 +171,15 @@ Use the compose file and deployment guide in the umbrella repository:
   to prevent the server from sending node public IPs to an external service, or
   set it to an internal HTTPS template containing `{ip}`. Automatically resolved
   NodeGeo is marked `source=auto` and manual saves are marked `source=operator`.
+- Node-agent update policies have two modes. Legacy policies may pin an explicit
+  HTTPS binary URL and SHA-256 digest. The dashboard's primary node detail UI
+  uses the official-release mode by leaving `binary_url` and `sha256` empty:
+  the server resolves `LATTICE_AGENT_RELEASE_REPO` (default
+  `LatticeNet/lattice-node-agent`), maps the node OS/arch to
+  `lattice-agent-linux-amd64` or `lattice-agent-linux-arm64`, reads the release
+  `SHA256SUMS`, and creates the reviewed update task with the concrete URL and
+  digest. `target_version=latest` resolves to the latest `v*` GitHub release at
+  plan time. Approval and node-side exec/root-exec requirements still apply.
 - Browser Terminal uses scoped, in-memory server sessions and outbound
   node-agent polling. It is not inbound SSH, and the server does not store SSH
   keys. Operators need `terminal:open`; nodes must run `lattice-agent` with

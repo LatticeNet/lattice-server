@@ -91,6 +91,9 @@ type Options struct {
 	// GeoResolver maps node public IPs to advisory coordinates for the Fleet Map.
 	// Nil keeps automatic lookup disabled; manual NodeGeo remains available.
 	GeoResolver geoip.Resolver
+	// AgentReleaseRepo is the trusted GitHub repository used by the simplified
+	// node-agent update UX. Empty uses LatticeNet/lattice-node-agent.
+	AgentReleaseRepo string
 	// RenewalReminderInterval controls the machine-renewal reminder scheduler.
 	// Zero uses the production default. DisableRenewalScheduler is intended for
 	// tests that need full control over reminder evaluation.
@@ -163,6 +166,9 @@ type Server struct {
 	// lookup. The command default uses a no-token HTTPS provider; privacy-focused
 	// deployments should set an internal provider or disable lookup.
 	geoResolver geoip.Resolver
+	// agentReleaseRepo is constrained to owner/repo and used only to construct
+	// GitHub release URLs for the first-party node-agent update resolver.
+	agentReleaseRepo string
 	// terminalBroker owns short-lived interactive terminal sessions. Sessions are
 	// intentionally in-memory only; a server restart forces operators to reopen.
 	terminalBroker *terminalBroker
@@ -244,6 +250,10 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	agentReleaseRepo, err := normalizeAgentReleaseRepo(opts.AgentReleaseRepo)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		store:         opts.Store,
 		logStore:      opts.LogStore,
@@ -273,6 +283,7 @@ func New(opts Options) (*Server, error) {
 		publicURL:        strings.TrimRight(opts.PublicURL, "/"),
 		coreDNSBinary:    coreDNSBinary,
 		geoResolver:      opts.GeoResolver,
+		agentReleaseRepo: agentReleaseRepo,
 		terminalBroker:   newTerminalBroker(),
 		terminalHub:      newTerminalHub(),
 		build:            normalizeBuildInfo(opts.Build),

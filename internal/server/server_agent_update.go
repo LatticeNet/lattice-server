@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -23,12 +24,15 @@ const (
 
 	defaultAgentInstallPath = "/usr/local/bin/lattice-agent"
 	defaultAgentServiceName = "lattice-agent.service"
+	defaultAgentReleaseRepo = "LatticeNet/lattice-node-agent"
+	agentReleaseLatest      = "latest"
 )
 
 var (
 	agentVersionRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+:-]{0,63}$`)
 	agentSHA256Re  = regexp.MustCompile(`^[a-f0-9]{64}$`)
 	agentServiceRe = regexp.MustCompile(`^[A-Za-z0-9_.@:-]{1,128}$`)
+	agentRepoRe    = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
 )
 
 type agentUpdatePayload struct {
@@ -156,17 +160,34 @@ func (s *Server) normalizeAgentUpdatePolicy(req model.AgentUpdatePolicy) (model.
 	out.Enabled = req.Enabled
 	out.AutoPlan = req.AutoPlan
 	out.TargetVersion = strings.TrimSpace(req.TargetVersion)
-	if !agentVersionRe.MatchString(out.TargetVersion) {
+	binaryRaw := strings.TrimSpace(req.BinaryURL)
+	shaRaw := strings.TrimSpace(req.SHA256)
+	officialRelease := binaryRaw == "" && shaRaw == ""
+	if (binaryRaw == "") != (shaRaw == "") {
+		return model.AgentUpdatePolicy{}, errors.New("binary_url and sha256 must be provided together, or both left empty for the official release")
+	}
+	if officialRelease {
+		target, err := normalizeOfficialAgentTarget(out.TargetVersion)
+		if err != nil {
+			return model.AgentUpdatePolicy{}, err
+		}
+		out.TargetVersion = target
+	} else if !agentVersionRe.MatchString(out.TargetVersion) {
 		return model.AgentUpdatePolicy{}, errors.New("target_version is required and must be an auditable version string")
 	}
-	binaryURL, err := normalizeAgentUpdateURL(req.BinaryURL)
-	if err != nil {
-		return model.AgentUpdatePolicy{}, err
-	}
-	out.BinaryURL = binaryURL
-	out.SHA256 = strings.ToLower(strings.TrimSpace(req.SHA256))
-	if !agentSHA256Re.MatchString(out.SHA256) {
-		return model.AgentUpdatePolicy{}, errors.New("sha256 must be a 64-character lowercase hex digest")
+	if officialRelease {
+		out.BinaryURL = ""
+		out.SHA256 = ""
+	} else {
+		binaryURL, err := normalizeAgentUpdateURL(req.BinaryURL)
+		if err != nil {
+			return model.AgentUpdatePolicy{}, err
+		}
+		out.BinaryURL = binaryURL
+		out.SHA256 = strings.ToLower(strings.TrimSpace(req.SHA256))
+		if !agentSHA256Re.MatchString(out.SHA256) {
+			return model.AgentUpdatePolicy{}, errors.New("sha256 must be a 64-character lowercase hex digest")
+		}
 	}
 	out.InstallPath = strings.TrimSpace(req.InstallPath)
 	if out.InstallPath == "" {
@@ -183,6 +204,31 @@ func (s *Server) normalizeAgentUpdatePolicy(req model.AgentUpdatePolicy) (model.
 		return model.AgentUpdatePolicy{}, errors.New("service_name contains unsupported characters")
 	}
 	return out, nil
+}
+
+func normalizeOfficialAgentTarget(raw string) (string, error) {
+	target := strings.TrimSpace(raw)
+	if target == "" || strings.EqualFold(target, agentReleaseLatest) {
+		return agentReleaseLatest, nil
+	}
+	if strings.HasPrefix(target, "v") && len(target) > 1 {
+		target = strings.TrimPrefix(target, "v")
+	}
+	if !agentVersionRe.MatchString(target) {
+		return "", errors.New("target_version must be latest or an auditable version string")
+	}
+	return target, nil
+}
+
+func normalizeAgentReleaseRepo(raw string) (string, error) {
+	repo := strings.TrimSpace(raw)
+	if repo == "" {
+		repo = defaultAgentReleaseRepo
+	}
+	if !agentRepoRe.MatchString(repo) {
+		return "", errors.New("agent release repo must be owner/repo")
+	}
+	return repo, nil
 }
 
 func normalizeAgentUpdateURL(raw string) (string, error) {
@@ -244,16 +290,12 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 	if !ok || !policy.Enabled {
 		return model.Approval{}, errors.New("agent update policy is not enabled for this node")
 	}
-	if !force && strings.TrimSpace(node.AgentVersion) == policy.TargetVersion {
-		return model.Approval{}, errAgentUpdateNoop
+	payload, err := s.agentUpdatePayloadForPolicy(node, policy)
+	if err != nil {
+		return model.Approval{}, err
 	}
-	payload := agentUpdatePayload{
-		NodeID:        policy.NodeID,
-		TargetVersion: policy.TargetVersion,
-		BinaryURL:     policy.BinaryURL,
-		SHA256:        policy.SHA256,
-		InstallPath:   policy.InstallPath,
-		ServiceName:   policy.ServiceName,
+	if !force && strings.TrimSpace(node.AgentVersion) == payload.TargetVersion {
+		return model.Approval{}, errAgentUpdateNoop
 	}
 	if s.hasOpenAgentUpdateApproval(payload) {
 		return model.Approval{}, errors.New("an equivalent agent update approval is already open")
@@ -274,6 +316,9 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 		return model.Approval{}, err
 	}
 	policy.LastPlannedVersion = policy.TargetVersion
+	if payload.TargetVersion != "" {
+		policy.LastPlannedVersion = payload.TargetVersion
+	}
 	policy.LastPlannedAt = now
 	policy.LastError = ""
 	if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
@@ -293,6 +338,173 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 		},
 	})
 	return approval, nil
+}
+
+func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.AgentUpdatePolicy) (agentUpdatePayload, error) {
+	policy.NodeID = strings.TrimSpace(policy.NodeID)
+	if policy.NodeID == "" {
+		return agentUpdatePayload{}, errors.New("agent update policy is missing node_id")
+	}
+	if policy.InstallPath == "" {
+		policy.InstallPath = defaultAgentInstallPath
+	}
+	if err := validateAgentInstallPath(policy.InstallPath); err != nil {
+		return agentUpdatePayload{}, err
+	}
+	if policy.ServiceName == "" {
+		policy.ServiceName = defaultAgentServiceName
+	}
+	if !agentServiceRe.MatchString(policy.ServiceName) {
+		return agentUpdatePayload{}, errors.New("invalid service_name")
+	}
+	if strings.TrimSpace(policy.BinaryURL) != "" && strings.TrimSpace(policy.SHA256) != "" {
+		normalized, err := sNormalizeAgentUpdatePayload(policy)
+		if err != nil {
+			return agentUpdatePayload{}, err
+		}
+		return agentUpdatePayload{
+			NodeID:        normalized.NodeID,
+			TargetVersion: normalized.TargetVersion,
+			BinaryURL:     normalized.BinaryURL,
+			SHA256:        normalized.SHA256,
+			InstallPath:   normalized.InstallPath,
+			ServiceName:   normalized.ServiceName,
+		}, nil
+	}
+	return s.resolveOfficialAgentUpdatePayload(node, policy)
+}
+
+func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model.AgentUpdatePolicy) (agentUpdatePayload, error) {
+	target, tag, err := s.officialAgentTargetAndTag(policy.TargetVersion)
+	if err != nil {
+		return agentUpdatePayload{}, err
+	}
+	artifact, err := agentArtifactForNode(node)
+	if err != nil {
+		return agentUpdatePayload{}, err
+	}
+	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", s.agentReleaseRepo, url.PathEscape(tag))
+	sums, err := s.fetchAgentReleaseText(base + "/SHA256SUMS")
+	if err != nil {
+		return agentUpdatePayload{}, err
+	}
+	sha, ok := shaFromSums(sums, artifact)
+	if !ok {
+		return agentUpdatePayload{}, fmt.Errorf("official release %s does not publish checksum for %s", tag, artifact)
+	}
+	return agentUpdatePayload{
+		NodeID:        policy.NodeID,
+		TargetVersion: target,
+		BinaryURL:     base + "/" + url.PathEscape(artifact),
+		SHA256:        sha,
+		InstallPath:   policy.InstallPath,
+		ServiceName:   policy.ServiceName,
+	}, nil
+}
+
+func (s *Server) officialAgentTargetAndTag(raw string) (targetVersion string, tag string, err error) {
+	target := strings.TrimSpace(raw)
+	if target == "" || strings.EqualFold(target, agentReleaseLatest) {
+		tag, err := s.fetchLatestAgentReleaseTag()
+		if err != nil {
+			return "", "", err
+		}
+		return strings.TrimPrefix(tag, "v"), tag, nil
+	}
+	if strings.HasPrefix(target, "v") {
+		tag = target
+		target = strings.TrimPrefix(target, "v")
+	} else {
+		tag = "v" + target
+	}
+	if !agentVersionRe.MatchString(target) {
+		return "", "", errors.New("target_version is required and must be an auditable version string")
+	}
+	return target, tag, nil
+}
+
+func (s *Server) fetchLatestAgentReleaseTag() (string, error) {
+	body, err := s.fetchAgentReleaseText("https://api.github.com/repos/" + s.agentReleaseRepo + "/releases/latest")
+	if err != nil {
+		return "", err
+	}
+	var res struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.Unmarshal([]byte(body), &res); err != nil {
+		return "", fmt.Errorf("decode latest agent release: %w", err)
+	}
+	tag := strings.TrimSpace(res.TagName)
+	if tag == "" || !strings.HasPrefix(tag, "v") {
+		return "", errors.New("latest agent release has no v* tag")
+	}
+	return tag, nil
+}
+
+func (s *Server) fetchAgentReleaseText(rawURL string) (string, error) {
+	client := &http.Client{Timeout: 12 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json, text/plain")
+	req.Header.Set("User-Agent", "lattice-server-agent-update")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch agent release metadata: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("fetch agent release metadata: %s", resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func shaFromSums(sums string, artifact string) (string, bool) {
+	for _, line := range strings.Split(sums, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[1] == artifact && agentSHA256Re.MatchString(strings.ToLower(fields[0])) {
+			return strings.ToLower(fields[0]), true
+		}
+	}
+	return "", false
+}
+
+func agentArtifactForNode(node model.Node) (string, error) {
+	osName := strings.ToLower(strings.TrimSpace(node.HostFacts.OS))
+	if osName == "" {
+		platform := strings.ToLower(strings.TrimSpace(node.HostFacts.Platform))
+		if strings.Contains(platform, "darwin") || strings.Contains(platform, "mac") {
+			osName = "darwin"
+		} else {
+			osName = "linux"
+		}
+	}
+	switch osName {
+	case "linux", "darwin":
+	default:
+		return "", fmt.Errorf("official lattice-agent releases do not support os %q", osName)
+	}
+	arch := strings.ToLower(strings.TrimSpace(node.HostFacts.Arch))
+	switch arch {
+	case "", "x86_64":
+		arch = "amd64"
+	case "aarch64":
+		arch = "arm64"
+	}
+	switch arch {
+	case "amd64", "arm64":
+	default:
+		return "", fmt.Errorf("official lattice-agent releases do not support arch %q", arch)
+	}
+	return "lattice-agent-" + osName + "-" + arch, nil
 }
 
 func (s *Server) hasOpenAgentUpdateApproval(payload agentUpdatePayload) bool {
@@ -428,13 +640,13 @@ func (s *Server) requireCurrentAgentUpdateApproval(approval model.Approval) erro
 	if !policy.Enabled {
 		return fmt.Errorf("agent update policy %q is disabled; re-enable and re-plan before approving", approval.NodeID)
 	}
-	current := agentUpdatePayload{
-		NodeID:        policy.NodeID,
-		TargetVersion: policy.TargetVersion,
-		BinaryURL:     policy.BinaryURL,
-		SHA256:        policy.SHA256,
-		InstallPath:   policy.InstallPath,
-		ServiceName:   policy.ServiceName,
+	node, ok := s.store.Node(approval.NodeID)
+	if !ok {
+		return fmt.Errorf("agent update node %q not found; re-plan before approving", approval.NodeID)
+	}
+	current, err := s.agentUpdatePayloadForPolicy(node, policy)
+	if err != nil {
+		return fmt.Errorf("agent update policy %q is invalid; re-plan before approving: %w", approval.NodeID, err)
 	}
 	if current != payload {
 		return fmt.Errorf("agent update policy changed since this approval was planned; re-plan before approving")

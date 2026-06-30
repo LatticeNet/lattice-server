@@ -250,8 +250,57 @@ func TestAgentUpdateApproveRequiresCurrentPolicy(t *testing.T) {
 	if approve.StatusCode != http.StatusConflict {
 		t.Fatalf("stale agent update approval should require re-plan, got %d", approve.StatusCode)
 	}
+	stale, ok := st.Approval(approval.ID)
+	if !ok || stale.Status != model.ApprovalRejected {
+		t.Fatalf("stale agent update approval should be closed as rejected: ok=%v approval=%+v", ok, stale)
+	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("stale update approval queued tasks: %+v", st.Tasks())
+	}
+}
+
+func TestAgentUpdateNewPlanRejectsSupersededPendingApproval(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oldApproval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.3.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    strings.Repeat("a", 64), InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	newApproval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldApproval.ID == newApproval.ID {
+		t.Fatal("expected a distinct replacement approval")
+	}
+
+	oldStored, ok := st.Approval(oldApproval.ID)
+	if !ok || oldStored.Status != model.ApprovalRejected {
+		t.Fatalf("superseded pending approval should be rejected: ok=%v approval=%+v", ok, oldStored)
+	}
+	newStored, ok := st.Approval(newApproval.ID)
+	if !ok || newStored.Status != model.ApprovalPending {
+		t.Fatalf("replacement approval should stay pending: ok=%v approval=%+v", ok, newStored)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("replanning must not queue tasks before approval: %+v", st.Tasks())
 	}
 }
 

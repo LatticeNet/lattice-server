@@ -167,7 +167,10 @@ func (s *Server) handleAgentUpdateReleaseInfo(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, info)
 }
 
-var errAgentUpdateNoop = errors.New("agent already reports the target version")
+var (
+	errAgentUpdateNoop          = errors.New("agent already reports the target version")
+	errAgentUpdateApprovalStale = errors.New("agent update policy changed since this approval was planned")
+)
 
 func (s *Server) normalizeAgentUpdatePolicy(req model.AgentUpdatePolicy) (model.AgentUpdatePolicy, error) {
 	out := model.AgentUpdatePolicy{}
@@ -321,6 +324,9 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 	}
 	if !force && strings.TrimSpace(node.AgentVersion) == payload.TargetVersion {
 		return model.Approval{}, errAgentUpdateNoop
+	}
+	if err := s.rejectSupersededAgentUpdateApprovals(nodeID, agentUpdateApprovalAction(payload), now); err != nil {
+		return model.Approval{}, err
 	}
 	if s.hasOpenAgentUpdateApproval(payload) {
 		return model.Approval{}, errors.New("an equivalent agent update approval is already open")
@@ -713,9 +719,35 @@ func (s *Server) requireCurrentAgentUpdateApproval(approval model.Approval) erro
 		return fmt.Errorf("agent update policy %q is invalid; re-plan before approving: %w", approval.NodeID, err)
 	}
 	if current != payload {
-		return fmt.Errorf("agent update policy changed since this approval was planned; re-plan before approving")
+		return fmt.Errorf("%w; re-plan before approving", errAgentUpdateApprovalStale)
 	}
 	return nil
+}
+
+func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction string, now time.Time) error {
+	for _, approval := range s.store.Approvals() {
+		if approval.Plugin != agentUpdatePlugin || approval.NodeID != nodeID || approval.Action == currentAction {
+			continue
+		}
+		if approval.Status != model.ApprovalPending {
+			continue
+		}
+		approval.Status = model.ApprovalRejected
+		approval.UpdatedAt = now
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) rejectAgentUpdateApproval(approval model.Approval, now time.Time) error {
+	if approval.Plugin != agentUpdatePlugin || approval.Status != model.ApprovalPending {
+		return nil
+	}
+	approval.Status = model.ApprovalRejected
+	approval.UpdatedAt = now
+	return s.store.UpsertApproval(approval)
 }
 
 func agentUpdateApplyScript(approval model.Approval) (string, error) {

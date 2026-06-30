@@ -50,7 +50,7 @@ func seedLinesFixture(t *testing.T, srv *Server) {
 		"node-a": {
 			NodeID: "node-a", At: srv.now(), Status: "ok",
 			Nodes: []model.SingBoxNode{
-				{Name: "hy2-8443", Protocol: "hysteria2", Network: "udp", Address: "203.0.113.5", Port: "8443", ShareURL: "hysteria2://x"},
+				{Name: "hy2-8443", Protocol: "hysteria2", Network: "udp", Address: "203.0.113.5", Port: "8443", ListenHost: "::", OutboundRef: "relay-a", UserCount: 2, UserKnown: true, Metadata: map[string]string{"owner": "ops"}, ShareURL: "hysteria2://x"},
 				{Name: "vless-443", Protocol: "vless", Network: "tcp", Address: "203.0.113.5", Port: "443", ShareURL: "vless://y"},
 			},
 		},
@@ -100,7 +100,9 @@ func TestBuildLineGroupsMergesAndDedups(t *testing.T) {
 		t.Fatalf("managed line hash unset: %+v", managed)
 	}
 
-	if discovered.Managed || discovered.Type != "hysteria2" || discovered.ListenPort != 8443 || discovered.UserKnown {
+	if discovered.Managed || discovered.Type != "hysteria2" || discovered.ListenPort != 8443 ||
+		discovered.ListenHost != "::" || discovered.OutboundRef != "relay-a" ||
+		!discovered.UserKnown || discovered.UserCount != 2 || discovered.Metadata["owner"] != "ops" {
 		t.Fatalf("discovered line wrong: %+v", discovered)
 	}
 }

@@ -118,8 +118,9 @@ func (s *Server) buildLineGroups() []LineGroup {
 	}
 
 	// (2) Discovered lines: read-only `sb --json list` mirror. Connection shape is
-	// known; listen_host / outbound / user_count are not until `sb inspect` (S1
-	// enrichment), so they are left empty and UserKnown=false.
+	// known. Newer discovery sources also include listen_host / outbound_ref /
+	// user_count from runtime config inspection; older agents leave them empty
+	// and UserKnown=false.
 	for _, inv := range s.liveSingBoxInventories(s.now()) {
 		for _, n := range inv.Nodes {
 			port, _ := strconv.Atoi(strings.TrimSpace(n.Port))
@@ -140,14 +141,16 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Name:        n.Name,
 				Tag:         n.Name,
 				Type:        n.Protocol,
+				ListenHost:  n.ListenHost,
 				ListenPort:  port,
 				PublicHost:  n.Address,
 				Domain:      firstNonEmpty(n.SNI, n.Host),
-				OutboundRef: "", // unknown until inspect
-				UserCount:   0,
-				UserKnown:   false,
+				OutboundRef: n.OutboundRef,
+				UserCount:   n.UserCount,
+				UserKnown:   n.UserKnown,
 				Status:      status,
 				LastError:   lastErr,
+				Metadata:    n.Metadata,
 			}
 			ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
 			ln.ID = ln.LineHashID

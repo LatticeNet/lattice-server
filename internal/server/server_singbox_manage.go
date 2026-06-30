@@ -130,15 +130,21 @@ func buildSingBoxProbeScript(taskID, addr string) string {
 		"  [ -n \"$files\" ] || { printf '%s\\n' '{\"ok\":true,\"count\":0,\"nodes\":[]}'; return 0; }\n" +
 		"  # shellcheck disable=SC2086 # config paths are sing-box runtime paths; no spaces in supported installs.\n" +
 		"  jq -s --arg addr \"$SB_ADDR\" '\n" +
-		"    [ .[] | .inbounds[]? | {\n" +
-		"      name: (.tag // \"\"),\n" +
-		"      protocol: (.type // \"\"),\n" +
-		"      network: (if (.tls.reality.enabled // false) then \"reality\" elif ((.transport.type // \"\") != \"\") then .transport.type else \"tcp\" end),\n" +
-		"      address: $addr,\n" +
-		"      port: ((.listen_port // \"\") | tostring),\n" +
-		"      sni: (.tls.server_name // .tls.reality.handshake.server // \"\"),\n" +
-		"      host: (.listen // \"\")\n" +
-		"    } ] as $nodes | {ok:true,count:($nodes|length),nodes:$nodes}\n" +
+		"    . as $cfgs\n" +
+		"    | ([ $cfgs[].route.rules[]? | select((.outbound // \"\") != \"\") | . as $r | ($r.inbound // [])[]? | {key:., value:$r.outbound} ] | from_entries) as $routes\n" +
+		"    | [ $cfgs[] | .inbounds[]? | . as $in | {\n" +
+		"        name: ($in.tag // \"\"),\n" +
+		"        protocol: ($in.type // \"\"),\n" +
+		"        network: (if ($in.tls.reality.enabled // false) then \"reality\" elif (($in.transport.type // \"\") != \"\") then $in.transport.type else \"tcp\" end),\n" +
+		"        address: $addr,\n" +
+		"        port: (($in.listen_port // \"\") | tostring),\n" +
+		"        sni: ($in.tls.server_name // $in.tls.reality.handshake.server // \"\"),\n" +
+		"        listen_host: ($in.listen // \"\"),\n" +
+		"        outbound_ref: ($routes[$in.tag] // \"\"),\n" +
+		"        user_count: (($in.users // []) | length),\n" +
+		"        user_known: ($in.users != null),\n" +
+		"        metadata: (($in._lattice // {}) | with_entries(select((.value|type) == \"string\")))\n" +
+		"      } ] as $nodes | {ok:true,count:($nodes|length),nodes:$nodes}\n" +
 		"  ' $files\n" +
 		"}\n" +
 		"echo " + shellQuote(singBoxProbeListMarker) + "\n" +

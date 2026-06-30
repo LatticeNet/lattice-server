@@ -644,11 +644,12 @@ func (s *Store) MarkStaleNodesOffline(threshold time.Duration, now time.Time) ([
 	return flipped, nil
 }
 
-// UpdateNodeMeta sets the operator-owned node identity fields (name, role, tags)
+// UpdateNodeMeta sets the operator-owned node identity fields (name, role,
+// comment, tags)
 // in one locked read-modify-write so it cannot clobber concurrently-reported
 // metrics/last-seen. Tags are trimmed, de-duplicated, and empties dropped.
 // Returns the updated node and whether it existed.
-func (s *Store) UpdateNodeMeta(nodeID, name, role string, tags []string) (model.Node, bool, error) {
+func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string) (model.Node, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, ok := s.state.Nodes[nodeID]
@@ -657,6 +658,7 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role string, tags []string) (model.
 	}
 	n.Name = name
 	n.Role = role
+	n.Comment = comment
 	cleaned := []string{}
 	seen := map[string]bool{}
 	for _, t := range tags {
@@ -667,6 +669,7 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role string, tags []string) (model.
 		seen[t] = true
 		cleaned = append(cleaned, t)
 	}
+	sort.Strings(cleaned)
 	n.Tags = cleaned
 	s.state.Nodes[nodeID] = n
 	if err := s.Save(); err != nil {

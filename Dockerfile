@@ -11,7 +11,7 @@ COPY . /src/lattice-server
 COPY --from=lattice-sdk . /src/lattice-sdk
 
 RUN go work init ./lattice-sdk ./lattice-server
-RUN go work edit -replace=github.com/LatticeNet/lattice-sdk@v0.2.0=./lattice-sdk
+RUN go work edit -replace=github.com/LatticeNet/lattice-sdk=./lattice-sdk
 
 WORKDIR /src/lattice-server
 ARG VERSION=dev

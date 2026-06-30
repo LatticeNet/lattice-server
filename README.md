@@ -7,6 +7,8 @@ Responsibilities:
 - Admin login, sessions, CSRF checks, and secure cookie defaults.
 - Scope and server allowlist authorization.
 - Node enrollment and outbound-agent APIs.
+- Operator-owned node metadata: name, role, sorted tags, and control-plane-only
+  comments.
 - Fleet metrics and HostFacts inventory telemetry ingestion.
 - Server-only machine inventory profiles: vendor, region, encrypted console/detail links,
   cost, renewal cycles, and renewal reminders.
@@ -153,6 +155,17 @@ Use the compose file and deployment guide in the umbrella repository:
 - Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
   advisory telemetry only. They are sanitized and clamped server-side and must
   not be used for authorization or policy decisions.
+- Node comments are operator-owned control-plane notes. They are returned to the
+  dashboard, editable through `POST /api/nodes/update`, and never sent to the
+  node-agent. Do not store secrets in comments and do not use comments as policy
+  input.
+- Node tags are normalized on metadata writes: trimmed, deduplicated, and sorted
+  for stable display and selector behavior. Tags can feed group smart selectors,
+  but group membership remains a separate canonical model.
+- Internal IP/IPv6 fields are agent-reported informational telemetry. On many
+  VPS providers the primary interface address is also the public address; when a
+  dashboard needs a distinct LAN address it must treat equality with the public
+  IP as "not separately reported" rather than as proof of private addressing.
 - Fleet Map GeoIP lookup defaults to the no-token `ipwho.is` HTTPS provider so
   nodes can be placed without extra setup. Set `LATTICE_GEOIP_LOOKUP_URL=off`
   to prevent the server from sending node public IPs to an external service, or

@@ -1636,6 +1636,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 type nodeView struct {
 	ID                 string                   `json:"id"`
 	Name               string                   `json:"name"`
+	Comment            string                   `json:"comment,omitempty"`
 	Tags               []string                 `json:"tags"`
 	Role               string                   `json:"role"`
 	WireGuardIP        string                   `json:"wireguard_ip"`
@@ -1662,13 +1663,28 @@ type nodeView struct {
 
 func toNodeView(n model.Node) nodeView {
 	return nodeView{
-		ID: n.ID, Name: n.Name, Tags: n.Tags, Role: n.Role,
+		ID: n.ID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role,
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
 		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
+}
+
+func normalizeNodeTags(tags []string) []string {
+	cleaned := []string{}
+	seen := map[string]bool{}
+	for _, tag := range tags {
+		tag = strings.TrimSpace(tag)
+		if tag == "" || seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		cleaned = append(cleaned, tag)
+	}
+	sort.Strings(cleaned)
+	return cleaned
 }
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, p principal) {
@@ -1698,6 +1714,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	var req struct {
 		NodeID      string                  `json:"node_id"`
 		Name        string                  `json:"name"`
+		Comment     string                  `json:"comment"`
 		Tags        []string                `json:"tags"`
 		Role        string                  `json:"role"`
 		WireGuardIP string                  `json:"wireguard_ip"`
@@ -1769,9 +1786,10 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	n := model.Node{
 		ID:          req.NodeID,
 		Name:        req.Name,
+		Comment:     strings.TrimSpace(req.Comment),
 		TokenHash:   hash,
-		Tags:        req.Tags,
-		Role:        req.Role,
+		Tags:        normalizeNodeTags(req.Tags),
+		Role:        strings.TrimSpace(req.Role),
 		WireGuardIP: req.WireGuardIP,
 		AgentLaunch: &launch,
 		CreatedAt:   time.Now().UTC(),
@@ -2111,10 +2129,11 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		NodeID string   `json:"node_id"`
-		Name   string   `json:"name"`
-		Role   string   `json:"role"`
-		Tags   []string `json:"tags"`
+		NodeID  string   `json:"node_id"`
+		Name    string   `json:"name"`
+		Role    string   `json:"role"`
+		Comment string   `json:"comment"`
+		Tags    []string `json:"tags"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -2126,7 +2145,13 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
 		return
 	}
-	node, ok, err := s.store.UpdateNodeMeta(req.NodeID, strings.TrimSpace(req.Name), strings.TrimSpace(req.Role), req.Tags)
+	node, ok, err := s.store.UpdateNodeMeta(
+		req.NodeID,
+		strings.TrimSpace(req.Name),
+		strings.TrimSpace(req.Role),
+		strings.TrimSpace(req.Comment),
+		req.Tags,
+	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -2136,7 +2161,7 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.update", Scope: "node:admin"})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "tags": node.Tags})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "comment": node.Comment, "tags": node.Tags})
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal) {

@@ -17,15 +17,15 @@ func TestUpdateNodeMeta(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	n, ok, err := s.UpdateNodeMeta("n1", "new-name", "hub", []string{" x ", "x", "", "y"})
+	n, ok, err := s.UpdateNodeMeta("n1", "new-name", "hub", "rack 9", []string{" y ", "x", "", "x"})
 	if err != nil || !ok {
 		t.Fatalf("UpdateNodeMeta: ok=%v err=%v", ok, err)
 	}
-	if n.Name != "new-name" || n.Role != "hub" {
+	if n.Name != "new-name" || n.Role != "hub" || n.Comment != "rack 9" {
 		t.Fatalf("name/role not updated: %+v", n)
 	}
 	if len(n.Tags) != 2 || n.Tags[0] != "x" || n.Tags[1] != "y" {
-		t.Fatalf("tags not trimmed/deduped: %+v", n.Tags)
+		t.Fatalf("tags not trimmed/deduped/sorted: %+v", n.Tags)
 	}
 
 	// Liveness fields must be preserved (no read-modify-write clobber).
@@ -35,7 +35,7 @@ func TestUpdateNodeMeta(t *testing.T) {
 	}
 
 	// Unknown node returns ok=false, no error.
-	if _, ok, err := s.UpdateNodeMeta("nope", "x", "y", nil); ok || err != nil {
+	if _, ok, err := s.UpdateNodeMeta("nope", "x", "y", "", nil); ok || err != nil {
 		t.Fatalf("unknown node: ok=%v err=%v", ok, err)
 	}
 }

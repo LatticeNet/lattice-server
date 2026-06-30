@@ -22,8 +22,9 @@ const (
 	agentUpdateAction       = "update-agent"
 	agentUpdateActionPrefix = agentUpdateAction + ":"
 
-	defaultAgentInstallPath = "/usr/local/bin/lattice-agent"
+	defaultAgentInstallPath = "/opt/lattice/lattice-agent"
 	defaultAgentServiceName = "lattice-agent.service"
+	legacyAgentInstallPath  = "/usr/local/bin/lattice-agent"
 	defaultAgentReleaseRepo = "LatticeNet/lattice-node-agent"
 	agentReleaseLatest      = "latest"
 )
@@ -667,6 +668,27 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"TARGET=" + shellQuote(payload.InstallPath) + "\n" +
 		"SERVICE=" + shellQuote(payload.ServiceName) + "\n" +
 		"TARGET_VERSION=" + shellQuote(payload.TargetVersion) + "\n" +
+		"DEFAULT_TARGET=" + shellQuote(defaultAgentInstallPath) + "\n" +
+		"LEGACY_TARGET=" + shellQuote(legacyAgentInstallPath) + "\n" +
+		"DEFAULT_SERVICE=" + shellQuote(defaultAgentServiceName) + "\n" +
+		"RUNNING_AGENT=\"\"\n" +
+		"if [ -r \"/proc/$PPID/exe\" ]; then\n" +
+		"  RUNNING_AGENT=$(readlink -f \"/proc/$PPID/exe\" 2>/dev/null || readlink \"/proc/$PPID/exe\" 2>/dev/null || true)\n" +
+		"fi\n" +
+		"case \"$RUNNING_AGENT\" in\n" +
+		"  */lattice-agent)\n" +
+		"    if [ \"$TARGET\" = \"$DEFAULT_TARGET\" ] || [ \"$TARGET\" = \"$LEGACY_TARGET\" ]; then TARGET=\"$RUNNING_AGENT\"; fi\n" +
+		"    ;;\n" +
+		"esac\n" +
+		"RUNNING_SERVICE=\"\"\n" +
+		"if [ -r \"/proc/$PPID/cgroup\" ]; then\n" +
+		"  RUNNING_SERVICE=$(sed -n 's#.*system\\.slice/\\([^/]*\\.service\\).*#\\1#p' \"/proc/$PPID/cgroup\" | head -n 1)\n" +
+		"fi\n" +
+		"if [ -z \"$RUNNING_SERVICE\" ] && [ -r /proc/self/cgroup ]; then\n" +
+		"  RUNNING_SERVICE=$(sed -n 's#.*system\\.slice/\\([^/]*\\.service\\).*#\\1#p' /proc/self/cgroup | head -n 1)\n" +
+		"fi\n" +
+		"if [ -n \"$RUNNING_SERVICE\" ] && [ \"$SERVICE\" = \"$DEFAULT_SERVICE\" ]; then SERVICE=\"$RUNNING_SERVICE\"; fi\n" +
+		"echo \"lattice agent update: effective target=$TARGET service=$SERVICE\"\n" +
 		"WORK=$(mktemp -d \"${TMPDIR:-/tmp}/lattice-agent-update.XXXXXX\")\n" +
 		"cleanup() { rm -rf \"$WORK\"; }\n" +
 		"trap cleanup EXIT\n" +
@@ -705,6 +727,10 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"mv \"$TARGET.new\" \"$TARGET\"\n" +
 		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
 		"  systemctl daemon-reload\n" +
+		"  if ! systemctl status \"$SERVICE\" >/dev/null 2>&1 && ! systemctl list-unit-files \"$SERVICE\" 2>/dev/null | grep -q .; then\n" +
+		"    echo \"lattice agent update: service $SERVICE not found after installing $TARGET\" >&2\n" +
+		"    exit 1\n" +
+		"  fi\n" +
 		"  if command -v systemd-run >/dev/null 2>&1; then\n" +
 		"    systemd-run --unit=lattice-agent-delayed-restart --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n" +
 		"  else\n" +

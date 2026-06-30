@@ -180,6 +180,13 @@ Use the compose file and deployment guide in the umbrella repository:
   `SHA256SUMS`, and creates the reviewed update task with the concrete URL and
   digest. `target_version=latest` resolves to the latest `v*` GitHub release at
   plan time. Approval and node-side exec/root-exec requirements still apply.
+  Default install targets are treated as auto-detectable: the task script
+  inspects the running agent parent process and systemd cgroup, then updates the
+  currently executing `lattice-agent` path and restarts the detected service
+  unit. This keeps current `/opt/lattice/lattice-agent` installs and older
+  custom `/opt/lattice/node-agent/lattice-agent` layouts working. A successful
+  task result records `last_applied_version`; the live source of truth remains
+  the next node heartbeat's reported `agent_version`.
 - Browser Terminal uses scoped, in-memory server sessions and outbound
   node-agent polling. It is not inbound SSH, and the server does not store SSH
   keys. Operators need `terminal:open`; nodes must run `lattice-agent` with

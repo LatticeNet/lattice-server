@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // Usage is the vpn-core 3-D usage read-model (design-12 S3). It presents traffic
@@ -13,10 +14,8 @@ import (
 // ProxyUser.UsedBytes (monotonic per-user total) and the latest ProxyUsageSnapshot
 // per node (raw per-(node,user) counters), mapped onto VpnUser identities.
 //
-// The target shape carries line_hash_id so the future per-line collector (S3b:
-// `sb stats` over the sing-box clash/v2ray stats API, with an up/down split) can
-// populate it without a model change. Until then per-line attribution is unknown
-// (line_hash_id empty) and bytes are a single total, not an up/down split.
+// S3b line-aware collectors populate line_user_bytes in ProxyUsageSnapshot; older
+// collectors continue to produce aggregate rows with line_hash_id empty.
 type UsageByUser struct {
 	UserID     string `json:"user_id"`
 	Email      string `json:"email,omitempty"`
@@ -55,7 +54,7 @@ type UsageCollector struct {
 // buildUsage assembles the usage read-model. proxyUserID → VpnUser identity is
 // resolved through the migration link so usage is reported against the new
 // identity (email) where one exists, falling back to the legacy ProxyUser name.
-func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows []UsageRow, collectors []UsageCollector) {
+func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows []UsageRow, collectors []UsageCollector, perLine bool) {
 	// proxyUserID -> (email, vpnUserID) via the migration link.
 	type ident struct{ id, email string }
 	identByProxyUser := map[string]ident{}
@@ -90,11 +89,39 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 		nodeName := s.nodeDisplayName(snap.NodeID)
 		nodeTotal := int64(0)
 		userCount := 0
-		for proxyUserID, bytes := range snap.UserBytes {
+		seenUsers := map[string]bool{}
+		representedProxyUsers := map[string]bool{}
+		addRow := func(proxyUserID, lineHashID string, bytes int64) {
+			proxyUserID = strings.TrimSpace(proxyUserID)
+			if proxyUserID == "" {
+				return
+			}
 			uid, email := resolve(proxyUserID, proxyUserID)
-			rows = append(rows, UsageRow{NodeID: snap.NodeID, NodeName: nodeName, UserID: uid, Email: email, Bytes: bytes})
+			rows = append(rows, UsageRow{NodeID: snap.NodeID, NodeName: nodeName, UserID: uid, Email: email, LineHashID: lineHashID, Bytes: bytes})
 			nodeTotal += bytes
-			userCount++
+			if !seenUsers[uid] {
+				seenUsers[uid] = true
+				userCount++
+			}
+			if lineHashID != "" {
+				perLine = true
+				representedProxyUsers[proxyUserID] = true
+			}
+		}
+		for lineHashID, byProxyUser := range snap.LineUserBytes {
+			lineHashID = strings.TrimSpace(lineHashID)
+			if lineHashID == "" {
+				continue
+			}
+			for proxyUserID, bytes := range byProxyUser {
+				addRow(proxyUserID, lineHashID, bytes)
+			}
+		}
+		for proxyUserID, bytes := range snap.UserBytes {
+			if representedProxyUsers[strings.TrimSpace(proxyUserID)] {
+				continue
+			}
+			addRow(proxyUserID, "", bytes)
 		}
 		bn := UsageByNode{NodeID: snap.NodeID, NodeName: nodeName, UsedBytes: nodeTotal, UserCount: userCount}
 		if !snap.At.IsZero() {
@@ -115,19 +142,22 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 		if rows[i].NodeID != rows[j].NodeID {
 			return rows[i].NodeID < rows[j].NodeID
 		}
+		if rows[i].LineHashID != rows[j].LineHashID {
+			return rows[i].LineHashID < rows[j].LineHashID
+		}
 		return rows[i].Bytes > rows[j].Bytes
 	})
 	sort.Slice(collectors, func(i, j int) bool { return collectors[i].NodeID < collectors[j].NodeID })
-	return byUser, byNode, rows, collectors
+	return byUser, byNode, rows, collectors, perLine
 }
 
 // vpnCoreUsageRPC serves latticenet.vpn-core/usage (design-12 S3), proxy:read.
 //
-//	query -> {by_user, by_node, rows, collectors, per_line: false}
+//	query -> {by_user, by_node, rows, collectors, per_line}
 func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, _ []byte) ([]byte, error) {
 	switch method {
 	case "query":
-		byUser, byNode, rows, collectors := s.buildUsage()
+		byUser, byNode, rows, collectors, perLine := s.buildUsage()
 		if byUser == nil {
 			byUser = []UsageByUser{}
 		}
@@ -145,8 +175,8 @@ func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, _ []byte) ([]
 			ByNode     []UsageByNode    `json:"by_node"`
 			Rows       []UsageRow       `json:"rows"`
 			Collectors []UsageCollector `json:"collectors"`
-			PerLine    bool             `json:"per_line"` // false until the sb-stats collector lands (S3b)
-		}{ByUser: byUser, ByNode: byNode, Rows: rows, Collectors: collectors, PerLine: false})
+			PerLine    bool             `json:"per_line"`
+		}{ByUser: byUser, ByNode: byNode, Rows: rows, Collectors: collectors, PerLine: perLine})
 	default:
 		return nil, fmt.Errorf("vpn-core/usage: unknown method %q", method)
 	}

@@ -22,6 +22,7 @@ func TestVPNCoreUsageRPC(t *testing.T) {
 	}
 	if err := srv.store.UpsertProxyUsageSnapshot(model.ProxyUsageSnapshot{
 		NodeID: "node-a", At: srv.now(), UserBytes: map[string]int64{"pu-1": 3200},
+		LineUserBytes: map[string]map[string]int64{"line-a": {"pu-1": 3200}},
 		CollectorSource: "file", CollectorStatus: "ok",
 	}); err != nil {
 		t.Fatal(err)
@@ -51,14 +52,14 @@ func TestVPNCoreUsageRPC(t *testing.T) {
 	if len(out.ByNode) != 1 || out.ByNode[0].UsedBytes != 3200 || out.ByNode[0].UserCount != 1 {
 		t.Fatalf("by_node wrong: %+v", out.ByNode)
 	}
-	if len(out.Rows) != 1 || out.Rows[0].Bytes != 3200 || out.Rows[0].Email != "alice@example.com" {
+	if len(out.Rows) != 1 || out.Rows[0].Bytes != 3200 || out.Rows[0].Email != "alice@example.com" || out.Rows[0].LineHashID != "line-a" {
 		t.Fatalf("rows wrong: %+v", out.Rows)
 	}
 	if len(out.Collectors) != 1 || out.Collectors[0].Status != "ok" {
 		t.Fatalf("collectors wrong: %+v", out.Collectors)
 	}
-	if out.PerLine {
-		t.Fatal("per_line should be false until the sb-stats collector lands")
+	if !out.PerLine {
+		t.Fatal("per_line should be true when line_user_bytes are present")
 	}
 	if _, err := srv.vpnCoreUsageRPC(context.Background(), "bogus", nil); err == nil {
 		t.Fatal("bogus method should error")

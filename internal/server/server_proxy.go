@@ -1398,8 +1398,16 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		return proxyUsageApplyResult{}, errors.New("user_bytes has too many entries")
 	}
 	eligible := s.proxyUsageEligibleUsers(profile)
+	lineUserBytes, lineUserTotals, lineUsersIgnored, err := s.sanitizeProxyUsageLineUserBytes(snapshot.LineUserBytes, eligible)
+	if err != nil {
+		return proxyUsageApplyResult{}, err
+	}
+	snapshot.LineUserBytes = lineUserBytes
+	if len(snapshot.UserBytes) == 0 && len(lineUserTotals) > 0 {
+		snapshot.UserBytes = lineUserTotals
+	}
 	sanitized := map[string]int64{}
-	ignored := 0
+	ignored := lineUsersIgnored
 	for userID, value := range snapshot.UserBytes {
 		userID = strings.TrimSpace(userID)
 		if !proxyIDRe.MatchString(userID) {
@@ -1473,6 +1481,68 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		return proxyUsageApplyResult{}, err
 	}
 	return result, nil
+}
+
+func (s *Server) sanitizeProxyUsageLineUserBytes(input map[string]map[string]int64, eligible map[string]model.ProxyUser) (map[string]map[string]int64, map[string]int64, int, error) {
+	if len(input) == 0 {
+		return nil, nil, 0, nil
+	}
+	if len(input) > 4096 {
+		return nil, nil, 0, errors.New("line_user_bytes has too many lines")
+	}
+	knownLines := map[string]bool{}
+	for _, group := range s.buildLineGroups() {
+		for _, line := range group.Lines {
+			if line.LineHashID != "" {
+				knownLines[line.LineHashID] = true
+			}
+		}
+	}
+	out := map[string]map[string]int64{}
+	totals := map[string]int64{}
+	ignored := 0
+	entries := 0
+	for lineID, users := range input {
+		lineID = strings.TrimSpace(lineID)
+		if lineID == "" {
+			return nil, nil, 0, errors.New("line_user_bytes line id cannot be empty")
+		}
+		if len(lineID) > 256 {
+			return nil, nil, 0, errors.New("line_user_bytes line id is too long")
+		}
+		if !knownLines[lineID] {
+			ignored += len(users)
+			continue
+		}
+		dst := out[lineID]
+		for userID, value := range users {
+			entries++
+			if entries > 4096 {
+				return nil, nil, 0, errors.New("line_user_bytes has too many entries")
+			}
+			userID = strings.TrimSpace(userID)
+			if !proxyIDRe.MatchString(userID) {
+				return nil, nil, 0, fmt.Errorf("invalid proxy user id %q", userID)
+			}
+			if value < 0 {
+				return nil, nil, 0, fmt.Errorf("proxy usage for %s on line %s cannot be negative", userID, lineID)
+			}
+			if _, ok := eligible[userID]; !ok {
+				ignored++
+				continue
+			}
+			if dst == nil {
+				dst = map[string]int64{}
+				out[lineID] = dst
+			}
+			dst[userID] += value
+			totals[userID] += value
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil, ignored, nil
+	}
+	return out, totals, ignored, nil
 }
 
 func (s *Server) proxyUsageEligibleUsers(profile model.ProxyNodeProfile) map[string]model.ProxyUser {

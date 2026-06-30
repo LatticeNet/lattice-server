@@ -4666,7 +4666,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	if req.PlanSHA256 != "" {
 		sum := sha256.Sum256([]byte(approval.Plan))
 		if !strings.EqualFold(req.PlanSHA256, hex.EncodeToString(sum[:])) {
-			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "plan changed since review; re-review before approving"))
+			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, "plan changed since review; re-review before approving"))
 			return
 		}
 	}
@@ -4689,6 +4689,8 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 					writeError(w, http.StatusInternalServerError, rejectErr)
 					return
 				}
+				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
+				return
 			}
 			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
 			return
@@ -4701,7 +4703,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			var err error
 			applyScript, err = selfdns.ApplyScriptFromPlan(approval.Plan)
 			if err != nil {
-				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "selfdns plan is no longer applyable; re-plan before approving"))
+				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, "selfdns plan is no longer applyable; re-plan before approving"))
 				return
 			}
 			if err := s.requireSelfDNSDeploymentForApproval(approval); err != nil {

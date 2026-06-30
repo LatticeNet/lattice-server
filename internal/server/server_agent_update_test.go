@@ -250,6 +250,13 @@ func TestAgentUpdateApproveRequiresCurrentPolicy(t *testing.T) {
 	if approve.StatusCode != http.StatusConflict {
 		t.Fatalf("stale agent update approval should require re-plan, got %d", approve.StatusCode)
 	}
+	var apiErr model.APIErrorResponse
+	if err := json.NewDecoder(approve.Body).Decode(&apiErr); err != nil {
+		t.Fatal(err)
+	}
+	if apiErr.Error.Code != model.APIErrorApprovalStale {
+		t.Fatalf("stale agent update approval code = %q want %q", apiErr.Error.Code, model.APIErrorApprovalStale)
+	}
 	stale, ok := st.Approval(approval.ID)
 	if !ok || stale.Status != model.ApprovalRejected {
 		t.Fatalf("stale agent update approval should be closed as rejected: ok=%v approval=%+v", ok, stale)

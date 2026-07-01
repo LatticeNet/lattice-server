@@ -4025,6 +4025,10 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
+	if err := s.rejectLocallyStaleAgentUpdateApprovals(s.now()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	approvals := s.store.Approvals()
 	visible := make([]model.Approval, 0, len(approvals))
 	for _, approval := range approvals {

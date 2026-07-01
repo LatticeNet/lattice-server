@@ -267,6 +267,54 @@ func TestAgentUpdateApproveRequiresCurrentPolicy(t *testing.T) {
 	}
 }
 
+func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.3.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    strings.Repeat("a", 64), InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/network/approvals", "", cookies, csrf)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list approvals failed: %d", list.StatusCode)
+	}
+	var views []approvalView
+	if err := json.NewDecoder(list.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("expected one approval view, got %+v", views)
+	}
+	if views[0].ID != approval.ID || views[0].Status != model.ApprovalRejected {
+		t.Fatalf("historical stale agent update approval should be listed as rejected: %+v", views[0])
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalRejected {
+		t.Fatalf("historical stale agent update approval should be persisted rejected: ok=%v approval=%+v", ok, stored)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("stale update approval list cleanup queued tasks: %+v", st.Tasks())
+	}
+}
+
 func TestAgentUpdatePolicySaveRejectsPendingApproval(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

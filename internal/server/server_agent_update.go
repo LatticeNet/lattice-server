@@ -777,6 +777,67 @@ func (s *Server) rejectAgentUpdateApproval(approval model.Approval, now time.Tim
 	return s.store.UpsertApproval(approval)
 }
 
+func (s *Server) rejectLocallyStaleAgentUpdateApprovals(now time.Time) error {
+	for _, approval := range s.store.Approvals() {
+		if approval.Plugin != agentUpdatePlugin || approval.Status != model.ApprovalPending {
+			continue
+		}
+		if s.isAgentUpdateApprovalLocallyStale(approval) {
+			if err := s.rejectAgentUpdateApproval(approval, now); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) isAgentUpdateApprovalLocallyStale(approval model.Approval) bool {
+	payload, err := agentUpdatePayloadFromApproval(approval)
+	if err != nil {
+		return true
+	}
+	policy, ok := s.store.AgentUpdatePolicy(approval.NodeID)
+	if !ok || !policy.Enabled {
+		return true
+	}
+	node, ok := s.store.Node(approval.NodeID)
+	if !ok {
+		return true
+	}
+	binaryURL := strings.TrimSpace(policy.BinaryURL)
+	sha256 := strings.TrimSpace(policy.SHA256)
+	if binaryURL != "" || sha256 != "" {
+		if binaryURL == "" || sha256 == "" {
+			return true
+		}
+		current, err := s.agentUpdatePayloadForPolicy(node, policy)
+		if err != nil {
+			return true
+		}
+		return current != payload
+	}
+	if policy.InstallPath == "" {
+		policy.InstallPath = defaultAgentInstallPath
+	}
+	if err := validateAgentInstallPath(policy.InstallPath); err != nil {
+		return true
+	}
+	if policy.ServiceName == "" {
+		policy.ServiceName = defaultAgentServiceName
+	}
+	if !agentServiceRe.MatchString(policy.ServiceName) {
+		return true
+	}
+	if policy.InstallPath != payload.InstallPath || policy.ServiceName != payload.ServiceName {
+		return true
+	}
+	target, err := normalizeOfficialAgentTarget(policy.TargetVersion)
+	if err != nil {
+		return true
+	}
+	return target != agentReleaseLatest && target != payload.TargetVersion
+}
+
 func agentUpdateApplyScript(approval model.Approval) (string, error) {
 	payload, err := agentUpdatePayloadFromApproval(approval)
 	if err != nil {

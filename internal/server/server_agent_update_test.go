@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -308,6 +309,39 @@ func TestAgentUpdateNewPlanRejectsSupersededPendingApproval(t *testing.T) {
 	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("replanning must not queue tasks before approval: %+v", st.Tasks())
+	}
+}
+
+func TestAgentUpdateNoopRejectsPendingApprovalForCurrentTarget(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = srv.createAgentUpdateApproval("node-a", "", false, "auto", now.Add(time.Minute))
+	if !errors.Is(err, errAgentUpdateNoop) {
+		t.Fatalf("current target should be a noop, got %v", err)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalRejected {
+		t.Fatalf("noop target should close pending update approval: ok=%v approval=%+v", ok, stored)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("noop update queued tasks: %+v", st.Tasks())
 	}
 }
 

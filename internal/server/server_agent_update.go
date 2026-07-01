@@ -323,9 +323,13 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 		return model.Approval{}, err
 	}
 	if !force && strings.TrimSpace(node.AgentVersion) == payload.TargetVersion {
+		if err := s.rejectSupersededAgentUpdateApprovals(nodeID, "", now); err != nil {
+			return model.Approval{}, err
+		}
 		return model.Approval{}, errAgentUpdateNoop
 	}
-	if err := s.rejectSupersededAgentUpdateApprovals(nodeID, agentUpdateApprovalAction(payload), now); err != nil {
+	currentAction := agentUpdateApprovalAction(payload)
+	if err := s.rejectSupersededAgentUpdateApprovals(nodeID, currentAction, now); err != nil {
 		return model.Approval{}, err
 	}
 	if s.hasOpenAgentUpdateApproval(payload) {
@@ -726,7 +730,10 @@ func (s *Server) requireCurrentAgentUpdateApproval(approval model.Approval) erro
 
 func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction string, now time.Time) error {
 	for _, approval := range s.store.Approvals() {
-		if approval.Plugin != agentUpdatePlugin || approval.NodeID != nodeID || approval.Action == currentAction {
+		if approval.Plugin != agentUpdatePlugin || approval.NodeID != nodeID {
+			continue
+		}
+		if currentAction != "" && approval.Action == currentAction {
 			continue
 		}
 		if approval.Status != model.ApprovalPending {

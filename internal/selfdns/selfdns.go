@@ -576,7 +576,7 @@ func writeCoreDNSBootstrap(b *strings.Builder, binary *CoreDNSBinarySource) {
 	b.WriteString("  command -v install >/dev/null || { echo 'lattice selfdns: install command not found' >&2; return 1; }\n")
 	b.WriteString("  tmpdir=$(mktemp -d /tmp/lattice-coredns.XXXXXX)\n")
 	b.WriteString("  tmpbin=\"$tmpdir/coredns\"\n")
-	b.WriteString("  if command -v curl >/dev/null; then curl -fsSL --proto '=https' --tlsv1.2 \"$COREDNS_URL\" -o \"$tmpbin\"; elif command -v wget >/dev/null; then wget -qO \"$tmpbin\" \"$COREDNS_URL\"; else echo 'lattice selfdns: curl or wget is required for pinned CoreDNS install' >&2; return 1; fi\n")
+	b.WriteString("  if command -v curl >/dev/null; then curl -fsSL --proto '=https' --tlsv1.2 \"$COREDNS_URL\" -o \"$tmpbin\"; elif command -v wget >/dev/null; then wget --https-only -qO \"$tmpbin\" \"$COREDNS_URL\"; else echo 'lattice selfdns: curl or wget is required for pinned CoreDNS install' >&2; return 1; fi\n")
 	b.WriteString("  verify_coredns_sha256 \"$tmpbin\"\n")
 	b.WriteString("  install -m 0755 \"$tmpbin\" \"$COREDNS_BIN\"\n")
 	b.WriteString("  rm -rf \"$tmpdir\"\n")

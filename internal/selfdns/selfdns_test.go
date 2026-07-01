@@ -261,6 +261,7 @@ func TestPinnedCoreDNSBinaryIsPlanBoundAndInstalledByDigest(t *testing.T) {
 		"COREDNS_SHA256='" + strings.Repeat("a", 64) + "'",
 		"verify_coredns_sha256",
 		"curl -fsSL --proto '=https' --tlsv1.2",
+		"wget --https-only -qO \"$tmpbin\" \"$COREDNS_URL\"",
 		"install -m 0755 \"$tmpbin\" \"$COREDNS_BIN\"",
 		"\"$COREDNS_BIN\" -conf '/etc/lattice/selfdns/Corefile' -plugins",
 		"ExecStart=/usr/local/bin/coredns -conf /etc/lattice/selfdns/Corefile",

@@ -16,10 +16,13 @@ func TestProxyCoreApplyScriptSingBoxAutoProvisions(t *testing.T) {
 	})
 	for _, needle := range []string{
 		"https://github.com/SagerNet/sing-box/releases/latest", // resolve latest version
-		"sing-box-${SB_VER}-linux-${SB_ARCH}",                  // arch + version artifact name
-		"install -m 0755",                                      // binary install
-		"/etc/systemd/system/sing-box.service",                 // unit path
-		"ExecStart=$SB_RUN run -c $SB_CFG",                     // unit points at the config we apply
+		"curl -fsSL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}'",
+		"curl -fsSL --proto '=https' --tlsv1.2 \"$SB_URL\" -o \"$SB_TMP/sb.tgz\"",
+		"wget --https-only -qO \"$SB_TMP/sb.tgz\" \"$SB_URL\"",
+		"sing-box-${SB_VER}-linux-${SB_ARCH}",  // arch + version artifact name
+		"install -m 0755",                      // binary install
+		"/etc/systemd/system/sing-box.service", // unit path
+		"ExecStart=$SB_RUN run -c $SB_CFG",     // unit points at the config we apply
 		"systemctl daemon-reload",
 		"sing-box check -c",                  // existing config validation preserved
 		"systemctl reload sing-box",          // existing reload preserved

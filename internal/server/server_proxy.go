@@ -1051,13 +1051,13 @@ func proxyCoreEnsureRuntime(core, binary, configPath string) string {
 		"    armv7l|armv7) SB_ARCH=armv7 ;;\n" +
 		"    *) echo " + shellQuote("lattice proxycore: unsupported arch") + " \"$(uname -m)\" >&2; exit 1 ;;\n" +
 		"  esac\n" +
-		"  SB_VER=\"$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | sed -E 's#.*/tag/v?##')\"\n" +
+		"  SB_VER=\"$(curl -fsSL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null | sed -E 's#.*/tag/v?##')\"\n" +
 		"  [ -n \"$SB_VER\" ] || SB_VER=" + shellQuote(defaultSingBoxVersion) + "\n" +
 		"  SB_NAME=\"sing-box-${SB_VER}-linux-${SB_ARCH}\"\n" +
 		"  SB_URL=\"https://github.com/SagerNet/sing-box/releases/download/v${SB_VER}/${SB_NAME}.tar.gz\"\n" +
 		"  SB_TMP=\"$(mktemp -d)\"\n" +
-		"  if command -v curl >/dev/null 2>&1; then curl -fsSL \"$SB_URL\" -o \"$SB_TMP/sb.tgz\";\n" +
-		"  elif command -v wget >/dev/null 2>&1; then wget -qO \"$SB_TMP/sb.tgz\" \"$SB_URL\";\n" +
+		"  if command -v curl >/dev/null 2>&1; then curl -fsSL --proto '=https' --tlsv1.2 \"$SB_URL\" -o \"$SB_TMP/sb.tgz\";\n" +
+		"  elif command -v wget >/dev/null 2>&1; then wget --https-only -qO \"$SB_TMP/sb.tgz\" \"$SB_URL\";\n" +
 		"  else echo " + shellQuote("lattice proxycore: need curl or wget to install sing-box") + " >&2; exit 1; fi\n" +
 		"  tar -xzf \"$SB_TMP/sb.tgz\" -C \"$SB_TMP\"\n" +
 		"  install -m 0755 \"$SB_TMP/${SB_NAME}/sing-box\" \"$SB_BIN\"\n" +

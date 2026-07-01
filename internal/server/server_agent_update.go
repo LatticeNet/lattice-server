@@ -80,9 +80,16 @@ func (s *Server) handleAgentUpdatePolicies(w http.ResponseWriter, r *http.Reques
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		existing, hadExisting := s.store.AgentUpdatePolicy(policy.NodeID)
 		if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if !hadExisting || agentUpdatePolicyApprovalBindingChanged(existing, policy) {
+			if err := s.rejectSupersededAgentUpdateApprovals(policy.NodeID, "", s.now()); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:     id.New("audit"),
@@ -116,6 +123,10 @@ func (s *Server) handleDeleteAgentUpdatePolicy(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err := s.store.DeleteAgentUpdatePolicy(nodeID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.rejectSupersededAgentUpdateApprovals(nodeID, "", s.now()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -246,6 +257,15 @@ func normalizeOfficialAgentTarget(raw string) (string, error) {
 		return "", errors.New("target_version must be latest or an auditable version string")
 	}
 	return target, nil
+}
+
+func agentUpdatePolicyApprovalBindingChanged(before, after model.AgentUpdatePolicy) bool {
+	return before.Enabled != after.Enabled ||
+		before.TargetVersion != after.TargetVersion ||
+		before.BinaryURL != after.BinaryURL ||
+		before.SHA256 != after.SHA256 ||
+		before.InstallPath != after.InstallPath ||
+		before.ServiceName != after.ServiceName
 }
 
 func normalizeAgentReleaseRepo(raw string) (string, error) {

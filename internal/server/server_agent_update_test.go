@@ -267,6 +267,64 @@ func TestAgentUpdateApproveRequiresCurrentPolicy(t *testing.T) {
 	}
 }
 
+func TestAgentUpdatePolicySaveRejectsPendingApproval(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.2.0")
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("plan update failed: %d", plan.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	plan.Body.Close()
+
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.3.0")
+
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalRejected {
+		t.Fatalf("policy save should reject stale pending approval: ok=%v approval=%+v", ok, stored)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("policy save queued tasks: %+v", st.Tasks())
+	}
+}
+
+func TestAgentUpdatePolicyDeleteRejectsPendingApproval(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.2.0")
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("plan update failed: %d", plan.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	plan.Body.Close()
+
+	del := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/delete", `{"node_id":"node-a"}`, cookies, csrf)
+	defer del.Body.Close()
+	if del.StatusCode != http.StatusOK {
+		t.Fatalf("delete policy failed: %d", del.StatusCode)
+	}
+
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalRejected {
+		t.Fatalf("policy delete should reject stale pending approval: ok=%v approval=%+v", ok, stored)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("policy delete queued tasks: %+v", st.Tasks())
+	}
+}
+
 func TestAgentUpdateNewPlanRejectsSupersededPendingApproval(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

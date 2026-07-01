@@ -98,6 +98,8 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 		"CANDIDATE_VERSION=$(\"$CANDIDATE\" -version)",
 		"version mismatch expected=$TARGET_VERSION actual=$CANDIDATE_VERSION",
 		"service $SERVICE not found after installing $TARGET",
+		"systemctl --no-legend list-unit-files \"$SERVICE\"",
+		"grep -Fxq \"$SERVICE\"",
 		"lattice-agent-delayed-restart",
 		"systemctl restart \"$SERVICE\"",
 	} {
@@ -107,6 +109,9 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	}
 	if strings.Contains(script, "sh -c") {
 		t.Fatalf("update script must not use nested shell command strings:\n%s", script)
+	}
+	if strings.Contains(script, "list-unit-files \"$SERVICE\" 2>/dev/null | grep -q .") {
+		t.Fatalf("update script must match the service unit exactly:\n%s", script)
 	}
 }
 

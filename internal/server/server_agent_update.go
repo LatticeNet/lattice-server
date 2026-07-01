@@ -946,7 +946,7 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"mv \"$TARGET.new\" \"$TARGET\"\n" +
 		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
 		"  systemctl daemon-reload\n" +
-		"  if ! systemctl status \"$SERVICE\" >/dev/null 2>&1 && ! systemctl list-unit-files \"$SERVICE\" 2>/dev/null | grep -q .; then\n" +
+		"  if ! systemctl status \"$SERVICE\" >/dev/null 2>&1 && ! systemctl --no-legend list-unit-files \"$SERVICE\" 2>/dev/null | awk '{print $1}' | grep -Fxq \"$SERVICE\"; then\n" +
 		"    echo \"lattice agent update: service $SERVICE not found after installing $TARGET\" >&2\n" +
 		"    exit 1\n" +
 		"  fi\n" +

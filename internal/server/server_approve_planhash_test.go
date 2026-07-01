@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // planSHA256 is the test-side equivalent of the dashboard's client-computed
@@ -70,5 +72,50 @@ func TestApprovePlanHashBinding(t *testing.T) {
 	retry.Body.Close()
 	if retry.StatusCode != http.StatusOK {
 		t.Fatalf("approved retry without hash should remain idempotent, got %d", retry.StatusCode)
+	}
+}
+
+func TestRejectApprovalClosesPendingPlan(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
+		`{"node_id":"pn1","public_tcp":[443]}`, cookies, csrf)
+	if plan.StatusCode != http.StatusOK {
+		plan.Body.Close()
+		t.Fatalf("nft plan: %d", plan.StatusCode)
+	}
+	var created approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	plan.Body.Close()
+	if created.ID == "" {
+		t.Fatalf("expected approval id, got %+v", created)
+	}
+
+	reject := doJSON(t, handler, http.MethodPost, "/api/network/approvals/reject",
+		string(mustJSON(t, map[string]any{"approval_id": created.ID})), cookies, csrf)
+	defer reject.Body.Close()
+	if reject.StatusCode != http.StatusOK {
+		t.Fatalf("reject pending approval should succeed, got %d", reject.StatusCode)
+	}
+	var rejected approvalView
+	if err := json.NewDecoder(reject.Body).Decode(&rejected); err != nil {
+		t.Fatal(err)
+	}
+	if rejected.Status != model.ApprovalRejected {
+		t.Fatalf("reject response status = %q, want %q", rejected.Status, model.ApprovalRejected)
+	}
+	stored, ok := st.Approval(created.ID)
+	if !ok || stored.Status != model.ApprovalRejected {
+		t.Fatalf("stored approval should be rejected: ok=%v approval=%+v", ok, stored)
+	}
+
+	retry := doJSON(t, handler, http.MethodPost, "/api/network/approvals/reject",
+		string(mustJSON(t, map[string]any{"approval_id": created.ID})), cookies, csrf)
+	retry.Body.Close()
+	if retry.StatusCode != http.StatusOK {
+		t.Fatalf("reject retry should remain idempotent, got %d", retry.StatusCode)
 	}
 }

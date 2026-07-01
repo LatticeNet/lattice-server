@@ -781,6 +781,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tunnels/plan", s.withAuth("tunnel:admin", s.handleTunnelPlan))
 	mux.HandleFunc("/api/network/approvals", s.withAuth("network:plan", s.handleApprovals))
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
+	mux.HandleFunc("/api/network/approvals/reject", s.withAuth("network:apply", s.handleRejectApproval))
 	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleProxySubscription))
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
 	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
@@ -4764,6 +4765,44 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		}
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
+	writeJSON(w, http.StatusOK, toApprovalView(approval))
+}
+
+func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ApprovalID string `json:"approval_id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	approval, ok := s.store.Approval(strings.TrimSpace(req.ApprovalID))
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("approval not found"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "network:apply", approval.NodeID) {
+		return
+	}
+	if approval.Status == model.ApprovalPending {
+		approval.Status = model.ApprovalRejected
+		approval.UpdatedAt = s.now()
+		if err := s.store.UpsertApproval(approval); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   approval.NodeID,
+			Action:   "network." + approval.Plugin + ".reject",
+			Scope:    "network:apply",
+			Decision: "deny",
+			Metadata: map[string]string{"approval_id": approval.ID},
+		})
+	}
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
 }
 

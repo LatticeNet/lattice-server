@@ -119,7 +119,7 @@ func TestNodeReconfigureCommandSourcesCanonicalAndLegacyEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env",
+		"for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env",
 		"LATTICE_NODE_ID='node-a'",
 		"LATTICE_AGENT_ALLOW_EXEC='1'",
 		"LATTICE_AGENT_ALLOW_ROOT_EXEC='1'",

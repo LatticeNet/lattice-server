@@ -1964,7 +1964,7 @@ func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Req
 func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model.AgentLaunchConfig) map[string]string {
 	installURL := "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
 	env := agentLaunchEnv(launch)
-	linux := fmt.Sprintf("curl -fsSL %s -o lattice-agent-install.sh && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s ./lattice-agent-install.sh",
+	linux := fmt.Sprintf("curl -fsSL %s -o lattice-agent-install.sh && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s ./lattice-agent-install.sh",
 		shellQuote(installURL),
 		shellQuote(serverURL),
 		shellQuote(nodeID),

@@ -19,6 +19,8 @@ type approvalView struct {
 	Plan       string    `json:"plan"`
 	Status     string    `json:"status"`
 	Reason     string    `json:"reason,omitempty"`
+	Stale      bool      `json:"stale,omitempty"`
+	StaleCode  string    `json:"stale_code,omitempty"`
 	ActorID    string    `json:"actor_id"`
 	ApprovedBy string    `json:"approved_by,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -39,11 +41,19 @@ func toApprovalView(a model.Approval) approvalView {
 	if a.Plugin == agentUpdatePlugin {
 		action = agentUpdateApprovalDisplayAction(a.Action)
 	}
+	stale, staleCode := approvalStaleMetadata(a)
 	return approvalView{
 		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
-		Plan: a.Plan, Status: a.Status, Reason: a.Reason, ActorID: a.ActorID,
+		Plan: a.Plan, Status: a.Status, Reason: a.Reason, Stale: stale, StaleCode: staleCode, ActorID: a.ActorID,
 		ApprovedBy: a.ApprovedBy, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 	}
+}
+
+func approvalStaleMetadata(a model.Approval) (bool, string) {
+	if a.Plugin == agentUpdatePlugin && a.Reason == agentUpdateApprovalStaleReason {
+		return true, agentUpdateApprovalStaleCode
+	}
+	return false, ""
 }
 
 func toApprovalViews(in []model.Approval) []approvalView {

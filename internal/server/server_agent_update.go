@@ -184,7 +184,10 @@ var (
 	errAgentUpdateApprovalStale = errors.New("agent update policy changed since this approval was planned")
 )
 
-const agentUpdateApprovalStaleReason = "agent update policy changed since this approval was planned; re-plan before approving"
+const (
+	agentUpdateApprovalStaleCode   = "agent_update_policy_changed"
+	agentUpdateApprovalStaleReason = "agent update policy changed since this approval was planned; re-plan before approving"
+)
 
 func (s *Server) normalizeAgentUpdatePolicy(req model.AgentUpdatePolicy) (model.AgentUpdatePolicy, error) {
 	out := model.AgentUpdatePolicy{}

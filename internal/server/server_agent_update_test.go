@@ -307,7 +307,9 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	}
 	var views []struct {
 		approvalView
-		Reason string `json:"reason"`
+		Reason    string `json:"reason"`
+		Stale     bool   `json:"stale"`
+		StaleCode string `json:"stale_code"`
 	}
 	if err := json.NewDecoder(list.Body).Decode(&views); err != nil {
 		t.Fatal(err)
@@ -320,6 +322,9 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	}
 	if !strings.Contains(views[0].Reason, "policy changed") || !strings.Contains(views[0].Reason, "re-plan") {
 		t.Fatalf("historical stale agent update approval should expose rejection reason, got %q", views[0].Reason)
+	}
+	if !views[0].Stale || views[0].StaleCode != agentUpdateApprovalStaleCode {
+		t.Fatalf("historical stale agent update approval should expose structured stale metadata, got stale=%v code=%q", views[0].Stale, views[0].StaleCode)
 	}
 	stored, ok := st.Approval(approval.ID)
 	if !ok || stored.Status != model.ApprovalRejected {

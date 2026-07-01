@@ -18,6 +18,7 @@ type approvalView struct {
 	Action     string    `json:"action"`
 	Plan       string    `json:"plan"`
 	Status     string    `json:"status"`
+	Reason     string    `json:"reason,omitempty"`
 	ActorID    string    `json:"actor_id"`
 	ApprovedBy string    `json:"approved_by,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -40,7 +41,7 @@ func toApprovalView(a model.Approval) approvalView {
 	}
 	return approvalView{
 		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
-		Plan: a.Plan, Status: a.Status, ActorID: a.ActorID,
+		Plan: a.Plan, Status: a.Status, Reason: a.Reason, ActorID: a.ActorID,
 		ApprovedBy: a.ApprovedBy, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 	}
 }

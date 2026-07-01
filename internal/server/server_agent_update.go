@@ -183,6 +183,8 @@ var (
 	errAgentUpdateApprovalStale = errors.New("agent update policy changed since this approval was planned")
 )
 
+const agentUpdateApprovalStaleReason = "agent update policy changed since this approval was planned; re-plan before approving"
+
 func (s *Server) normalizeAgentUpdatePolicy(req model.AgentUpdatePolicy) (model.AgentUpdatePolicy, error) {
 	out := model.AgentUpdatePolicy{}
 	nodeID := strings.TrimSpace(req.NodeID)
@@ -760,6 +762,7 @@ func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction stri
 			continue
 		}
 		approval.Status = model.ApprovalRejected
+		approval.Reason = agentUpdateApprovalStaleReason
 		approval.UpdatedAt = now
 		if err := s.store.UpsertApproval(approval); err != nil {
 			return err
@@ -773,6 +776,7 @@ func (s *Server) rejectAgentUpdateApproval(approval model.Approval, now time.Tim
 		return nil
 	}
 	approval.Status = model.ApprovalRejected
+	approval.Reason = agentUpdateApprovalStaleReason
 	approval.UpdatedAt = now
 	return s.store.UpsertApproval(approval)
 }

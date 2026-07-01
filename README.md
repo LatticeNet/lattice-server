@@ -186,6 +186,8 @@ Use the compose file and deployment guide in the umbrella repository:
   approvals for that node, and if a node already reports the current target
   before a pending update approval is applied, the scheduler closes the no-op
   approval as rejected instead of leaving stale host-mutation work in the inbox.
+  Automatically closed update approvals include a plain-text rejection reason
+  so operators can re-plan without guessing which policy or node state changed.
   Approval and node-side exec/root-exec requirements still apply.
   Default install targets are treated as auto-detectable: the task script
   inspects the running agent parent process and systemd cgroup, then updates the

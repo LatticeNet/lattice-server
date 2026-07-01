@@ -296,7 +296,10 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	if list.StatusCode != http.StatusOK {
 		t.Fatalf("list approvals failed: %d", list.StatusCode)
 	}
-	var views []approvalView
+	var views []struct {
+		approvalView
+		Reason string `json:"reason"`
+	}
 	if err := json.NewDecoder(list.Body).Decode(&views); err != nil {
 		t.Fatal(err)
 	}
@@ -305,6 +308,9 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	}
 	if views[0].ID != approval.ID || views[0].Status != model.ApprovalRejected {
 		t.Fatalf("historical stale agent update approval should be listed as rejected: %+v", views[0])
+	}
+	if !strings.Contains(views[0].Reason, "policy changed") || !strings.Contains(views[0].Reason, "re-plan") {
+		t.Fatalf("historical stale agent update approval should expose rejection reason, got %q", views[0].Reason)
 	}
 	stored, ok := st.Approval(approval.ID)
 	if !ok || stored.Status != model.ApprovalRejected {

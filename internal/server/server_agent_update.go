@@ -943,6 +943,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		policy.LastAppliedAt = result.FinishedAt
 		policy.LastError = ""
 		approval.Status = model.ApprovalApplied
+		approval.Reason = ""
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,
@@ -953,6 +954,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	} else {
 		policy.LastError = boundedTaskError(result)
 		approval.Status = model.ApprovalRejected
+		approval.Reason = policy.LastError
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,

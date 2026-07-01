@@ -201,6 +201,9 @@ func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 	if !ok || failedApproval.Status != model.ApprovalRejected {
 		t.Fatalf("failed update should close approval as rejected: ok=%v approval=%+v", ok, failedApproval)
 	}
+	if !strings.Contains(failedApproval.Reason, "download failed") {
+		t.Fatalf("failed update approval should expose failure reason, got %q", failedApproval.Reason)
+	}
 	policy, ok := st.AgentUpdatePolicy("node-a")
 	if !ok || !strings.Contains(policy.LastError, "download failed") {
 		t.Fatalf("policy should retain bounded failure reason: ok=%v policy=%+v", ok, policy)

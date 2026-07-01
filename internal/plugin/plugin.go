@@ -302,7 +302,7 @@ func decodeSignature(value string) ([]byte, error) {
 }
 
 func decodePublicKey(value string) (ed25519.PublicKey, error) {
-	key, err := decodeBytes(value)
+	key, err := decodeBase64Bytes(value)
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +312,7 @@ func decodePublicKey(value string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(key), nil
 }
 
-func decodeBytes(value string) ([]byte, error) {
+func decodeBase64Bytes(value string) ([]byte, error) {
 	value = strings.TrimSpace(value)
 	if out, err := base64.RawStdEncoding.DecodeString(value); err == nil {
 		return out, nil
@@ -320,11 +320,7 @@ func decodeBytes(value string) ([]byte, error) {
 	if out, err := base64.StdEncoding.DecodeString(value); err == nil {
 		return out, nil
 	}
-	out, err := hex.DecodeString(value)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+	return nil, errors.New("invalid base64")
 }
 
 func ensureNoTrailingJSON(dec *json.Decoder) error {

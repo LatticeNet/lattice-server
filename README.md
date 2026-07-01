@@ -344,7 +344,8 @@ Use the compose file and deployment guide in the umbrella repository:
   capability lists before any plugin can be trusted by the control plane.
   Host-risk/system plugins can be verified with an operator trust policy:
   trusted `publisher` Ed25519 keys, artifact `digest_sha256`, and
-  `signature_ed25519` over the canonical Lattice plugin signing payload.
+  standard-base64 `signature_ed25519` over the canonical Lattice plugin signing
+  payload.
   Plugin installation/loading code should use the strict verifier path:
   decode manifest JSON with unknown fields rejected, verify artifact digest, then
   verify publisher signature when host-risk capabilities are present.
@@ -409,7 +410,7 @@ Example plugin trust policy JSON:
 {
   "allow_unsigned_host_risk": false,
   "trusted_publishers": {
-    "latticenet": "base64-raw-ed25519-public-key"
+    "latticenet": "standard-base64-of-32-byte-ed25519-public-key"
   }
 }
 ```
@@ -435,9 +436,9 @@ Content-Type: application/json
     "capabilities": ["network:plan"],
     "publisher": "latticenet",
     "digest_sha256": "hex-sha256-of-artifact",
-    "signature_ed25519": "base64-raw-ed25519-signature"
+    "signature_ed25519": "standard-base64-of-64-byte-ed25519-signature"
   },
-  "artifact_base64": "base64-raw-artifact-bytes"
+  "artifact_base64": "standard-base64-artifact-bytes"
 }
 ```
 

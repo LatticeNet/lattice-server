@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -486,6 +487,49 @@ func TestParseTrustPolicyJSONRejectsInvalidPublisherKey(t *testing.T) {
 	}`))
 	if err == nil || !strings.Contains(err.Error(), "invalid trusted publisher key") {
 		t.Fatalf("expected invalid key rejection, got %v", err)
+	}
+}
+
+func TestParseTrustPolicyJSONAcceptsStandardBase64PublisherKey(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyBytes, err := json.Marshal(map[string]any{
+		"trusted_publishers": map[string]string{
+			"latticenet": base64.StdEncoding.EncodeToString(pub),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	policy, err := ParseTrustPolicyJSON(policyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := policy.TrustedPublishers["latticenet"]; string(got) != string(pub) {
+		t.Fatalf("decoded wrong publisher key: got %x want %x", []byte(got), []byte(pub))
+	}
+}
+
+func TestParseTrustPolicyJSONRejectsHexPublisherKey(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyBytes, err := json.Marshal(map[string]any{
+		"trusted_publishers": map[string]string{
+			"latticenet": hex.EncodeToString(pub),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = ParseTrustPolicyJSON(policyBytes)
+	if err == nil || !strings.Contains(err.Error(), "invalid trusted publisher key") {
+		t.Fatalf("expected hex key rejection, got %v", err)
 	}
 }
 

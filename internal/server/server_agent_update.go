@@ -914,7 +914,7 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"if command -v curl >/dev/null 2>&1; then\n" +
 		"  curl -fsSL --proto '=https' --tlsv1.2 -o \"$CANDIDATE\" \"$URL\"\n" +
 		"elif command -v wget >/dev/null 2>&1; then\n" +
-		"  wget -qO \"$CANDIDATE\" \"$URL\"\n" +
+		"  wget --https-only -qO \"$CANDIDATE\" \"$URL\"\n" +
 		"else\n" +
 		"  echo 'lattice agent update: curl or wget is required' >&2\n" +
 		"  exit 1\n" +

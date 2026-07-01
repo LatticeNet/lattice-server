@@ -234,7 +234,10 @@ Use the compose file and deployment guide in the umbrella repository:
   filesystem, database, or token-bearing error strings.
   Security-sensitive denials use stable business codes such as
   `capability_denied`, `invalid_node_token`, `invalid_task_lease`, and
-  `task_output_limit_exceeded`.
+  `task_output_limit_exceeded`. Approval workflows also expose stable conflict
+  codes such as `approval_stale` for changed reviewed plans and
+  `agent_update_noop` when an agent update plan is a no-op because the node
+  already reports the target version.
 - nft baseline inputs are persisted per node and normalized before plan
   generation. The plan still becomes an approval before agent-side validation;
   actual firewall mutation remains behind `network:apply`.

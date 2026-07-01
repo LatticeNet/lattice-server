@@ -615,6 +615,33 @@ func TestAgentUpdateNoopRejectsPendingApprovalForCurrentTarget(t *testing.T) {
 	}
 }
 
+func TestAgentUpdatePlanNoopReturnsStableCode(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.2.0")
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.0"}); err != nil {
+		t.Fatal(err)
+	}
+
+	res := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan",
+		`{"node_id":"node-a"}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("noop plan should return 409, got %d", res.StatusCode)
+	}
+	var apiErr model.APIErrorResponse
+	if err := json.NewDecoder(res.Body).Decode(&apiErr); err != nil {
+		t.Fatal(err)
+	}
+	if apiErr.Error.Code != agentUpdateNoopAPIError {
+		t.Fatalf("noop plan code = %q want %q", apiErr.Error.Code, agentUpdateNoopAPIError)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("noop planning must not queue tasks: %+v", st.Tasks())
+	}
+}
+
 func saveAgentUpdatePolicy(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf, version string) {
 	t.Helper()
 	save := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates", `{

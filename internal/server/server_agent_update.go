@@ -22,6 +22,7 @@ const (
 	agentUpdatePlugin       = "agentupdate"
 	agentUpdateAction       = "update-agent"
 	agentUpdateActionPrefix = agentUpdateAction + ":"
+	agentUpdateNoopAPIError = "agent_update_noop"
 
 	defaultAgentInstallPath = "/opt/lattice/lattice-agent"
 	defaultAgentServiceName = "lattice-agent.service"
@@ -158,6 +159,7 @@ func (s *Server) handleAgentUpdatePlan(w http.ResponseWriter, r *http.Request, p
 		status := http.StatusBadRequest
 		if errors.Is(err, errAgentUpdateNoop) {
 			status = http.StatusConflict
+			err = apiError(agentUpdateNoopAPIError, err.Error())
 		}
 		writeError(w, status, err)
 		return

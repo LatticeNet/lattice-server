@@ -634,8 +634,8 @@ func TestAgentUpdatePlanNoopReturnsStableCode(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&apiErr); err != nil {
 		t.Fatal(err)
 	}
-	if apiErr.Error.Code != agentUpdateNoopAPIError {
-		t.Fatalf("noop plan code = %q want %q", apiErr.Error.Code, agentUpdateNoopAPIError)
+	if apiErr.Error.Code != model.APIErrorAgentUpdateNoop {
+		t.Fatalf("noop plan code = %q want %q", apiErr.Error.Code, model.APIErrorAgentUpdateNoop)
 	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("noop planning must not queue tasks: %+v", st.Tasks())

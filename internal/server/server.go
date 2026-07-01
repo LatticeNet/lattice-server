@@ -779,7 +779,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
 	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))
 	mux.HandleFunc("/api/tunnels/plan", s.withAuth("tunnel:admin", s.handleTunnelPlan))
-	mux.HandleFunc("/api/network/approvals", s.withAuth("network:plan", s.handleApprovals))
+	mux.HandleFunc("/api/network/approvals", s.withAuth("", s.handleApprovals))
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
 	mux.HandleFunc("/api/network/approvals/reject", s.withAuth("network:apply", s.handleRejectApproval))
 	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleProxySubscription))
@@ -4032,11 +4032,32 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 	approvals := s.store.Approvals()
 	visible := make([]model.Approval, 0, len(approvals))
 	for _, approval := range approvals {
-		if rbac.Allows(p.Principal, "network:plan", approval.NodeID) {
+		if s.approvalVisibleToPrincipal(p, approval) {
 			visible = append(visible, approval)
 		}
 	}
 	writeJSON(w, http.StatusOK, toApprovalViews(visible))
+}
+
+func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval) bool {
+	switch approval.Plugin {
+	case "nftpolicy":
+		return rbac.Allows(p.Principal, "netpolicy:admin", approval.NodeID)
+	case agentUpdatePlugin:
+		return rbac.Allows(p.Principal, "node:admin", approval.NodeID) &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	case "selfdns":
+		return rbac.Allows(p.Principal, "dns:admin", approval.NodeID) &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	case proxyCorePlugin:
+		return !principalHasNodeRestriction(p) &&
+			rbac.Allows(p.Principal, "proxy:read", "") &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	case "cftunnel":
+		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
+	default:
+		return rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	}
 }
 
 func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p principal) {

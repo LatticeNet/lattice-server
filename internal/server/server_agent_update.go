@@ -871,6 +871,13 @@ func (s *Server) isAgentUpdateApprovalLocallyStale(approval model.Approval) bool
 	if err != nil {
 		return true
 	}
+	if target == agentReleaseLatest {
+		resolved := strings.TrimSpace(policy.LastPlannedVersion)
+		if strings.HasPrefix(resolved, "v") {
+			resolved = strings.TrimPrefix(resolved, "v")
+		}
+		return resolved != "" && resolved != payload.TargetVersion
+	}
 	return target != agentReleaseLatest && target != payload.TargetVersion
 }
 

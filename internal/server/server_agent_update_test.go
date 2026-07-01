@@ -330,6 +330,61 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	}
 }
 
+func TestAgentUpdateApprovalsListRejectsHistoricalLatestApprovalWithDifferentResolvedTarget(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID:             "node-a",
+		Enabled:            true,
+		AutoPlan:           true,
+		TargetVersion:      agentReleaseLatest,
+		LastPlannedVersion: "0.3.0",
+		InstallPath:        defaultAgentInstallPath,
+		ServiceName:        defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload := agentUpdatePayload{
+		NodeID:        "node-a",
+		TargetVersion: "0.2.0",
+		BinaryURL:     "https://github.com/LatticeNet/lattice-node-agent/releases/download/v0.2.0/lattice-agent-linux-amd64",
+		SHA256:        agentUpdateTestSHA,
+		InstallPath:   defaultAgentInstallPath,
+		ServiceName:   defaultAgentServiceName,
+	}
+	approval := model.Approval{
+		ID:        "approval-latest-stale",
+		NodeID:    "node-a",
+		Plugin:    agentUpdatePlugin,
+		Action:    agentUpdateApprovalAction(payload),
+		Plan:      renderAgentUpdatePlan(model.Node{ID: "node-a", AgentVersion: "0.1.0"}, payload, "auto"),
+		Status:    model.ApprovalPending,
+		CreatedAt: time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC),
+		UpdatedAt: time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC),
+	}
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/network/approvals", "", cookies, csrf)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list approvals failed: %d", list.StatusCode)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalRejected {
+		t.Fatalf("historical latest approval should be rejected after resolved target changes: ok=%v approval=%+v", ok, stored)
+	}
+	if !strings.Contains(stored.Reason, "policy changed") || !strings.Contains(stored.Reason, "re-plan") {
+		t.Fatalf("historical latest approval should expose re-plan reason, got %q", stored.Reason)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("stale latest approval list cleanup queued tasks: %+v", st.Tasks())
+	}
+}
+
 func TestAgentUpdateApprovalsListRejectsHistoricalStaleApprovedWithoutActiveTask(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

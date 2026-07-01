@@ -22,7 +22,7 @@ func TestVPNCoreUsageRPC(t *testing.T) {
 	}
 	if err := srv.store.UpsertProxyUsageSnapshot(model.ProxyUsageSnapshot{
 		NodeID: "node-a", At: srv.now(), UserBytes: map[string]int64{"pu-1": 3200},
-		LineUserBytes: map[string]map[string]int64{"line-a": {"pu-1": 3200}},
+		LineUserBytes:   map[string]map[string]int64{"line-a": {"pu-1": 3200}},
 		CollectorSource: "file", CollectorStatus: "ok",
 	}); err != nil {
 		t.Fatal(err)

@@ -1,11 +1,5 @@
-github.com/LatticeNet/lattice-sdk v0.2.11 h1:LzSTqhbFwgOHWvsOl6TA7qnq8Aswu9aMv+iTNYOnExs=
-github.com/LatticeNet/lattice-sdk v0.2.11/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
-github.com/LatticeNet/lattice-sdk v0.2.12 h1:e06T4epQ/+yVRu2xdco0a+D4EHBjDgyOc/6e/zw48KY=
-github.com/LatticeNet/lattice-sdk v0.2.12/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
-github.com/LatticeNet/lattice-sdk v0.2.13-0.20260701064424-3387a243251c h1:g+aUiXRBtiJ5+kH+e4ZO72PwxXrnYmcO3YPrYHoYByY=
-github.com/LatticeNet/lattice-sdk v0.2.13-0.20260701064424-3387a243251c/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
-github.com/LatticeNet/lattice-sdk v0.2.13-0.20260701135831-406dc7de575d h1:yaM8gfhRrF5zv28HsP0VyVg/U8jDB9OjR9gqSn5bI9E=
-github.com/LatticeNet/lattice-sdk v0.2.13-0.20260701135831-406dc7de575d/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
+github.com/LatticeNet/lattice-sdk v0.2.13 h1:9UvnES66PGLmjAvyrKyzwozPV1TbE2Gncj3RNU0crZU=
+github.com/LatticeNet/lattice-sdk v0.2.13/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
 github.com/coreos/go-oidc/v3 v3.18.0 h1:V9orjXynvu5wiC9SemFTWnG4F45v403aIcjWo0d41+A=
 github.com/coreos/go-oidc/v3 v3.18.0/go.mod h1:DYCf24+ncYi+XkIH97GY1+dqoRlbaSI26KVTCI9SrY4=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

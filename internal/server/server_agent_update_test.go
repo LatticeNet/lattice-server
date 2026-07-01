@@ -324,6 +324,90 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	}
 }
 
+func TestAgentUpdateApprovalsListRejectsHistoricalStaleApprovedWithoutActiveTask(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "manual", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.3.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    strings.Repeat("a", 64), InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/network/approvals", "", cookies, csrf)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list approvals failed: %d", list.StatusCode)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalRejected {
+		t.Fatalf("approved stale update without active task should be rejected: ok=%v approval=%+v", ok, stored)
+	}
+	if !strings.Contains(stored.Reason, "policy changed") || !strings.Contains(stored.Reason, "re-plan") {
+		t.Fatalf("approved stale update should expose re-plan reason, got %q", stored.Reason)
+	}
+}
+
+func TestAgentUpdateApprovalsListKeepsApprovedWithActiveTask(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "manual", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(model.Task{ID: "task-active-update", ApprovalID: approval.ID, Targets: []string{"node-a"}, Status: model.TaskQueued}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.3.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    strings.Repeat("a", 64), InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/network/approvals", "", cookies, csrf)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list approvals failed: %d", list.StatusCode)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalApproved {
+		t.Fatalf("approved update with active task should remain in-flight: ok=%v approval=%+v", ok, stored)
+	}
+}
+
 func TestAgentUpdatePolicySaveRejectsPendingApproval(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
@@ -348,6 +432,76 @@ func TestAgentUpdatePolicySaveRejectsPendingApproval(t *testing.T) {
 	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("policy save queued tasks: %+v", st.Tasks())
+	}
+}
+
+func TestAgentUpdatePolicySaveRejectsApprovedApprovalWithoutActiveTask(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.2.0")
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("plan update failed: %d", plan.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	plan.Body.Close()
+	stored, ok := st.Approval(approval.ID)
+	if !ok {
+		t.Fatalf("planned approval not stored: %s", approval.ID)
+	}
+	stored.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(stored); err != nil {
+		t.Fatal(err)
+	}
+
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.3.0")
+
+	stored, ok = st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalRejected {
+		t.Fatalf("policy save should reject stale approved-only approval: ok=%v approval=%+v", ok, stored)
+	}
+	if !strings.Contains(stored.Reason, "policy changed") || !strings.Contains(stored.Reason, "re-plan") {
+		t.Fatalf("stale approved-only approval should expose re-plan reason, got %q", stored.Reason)
+	}
+}
+
+func TestAgentUpdatePolicySaveKeepsApprovedApprovalWithActiveTask(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.2.0")
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("plan update failed: %d", plan.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	plan.Body.Close()
+	stored, ok := st.Approval(approval.ID)
+	if !ok {
+		t.Fatalf("planned approval not stored: %s", approval.ID)
+	}
+	stored.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(stored); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(model.Task{ID: "task-active-policy-save", ApprovalID: approval.ID, Targets: []string{"node-a"}, Status: model.TaskQueued}); err != nil {
+		t.Fatal(err)
+	}
+
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.3.0")
+
+	stored, ok = st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalApproved {
+		t.Fatalf("policy save should keep approved approval with active task: ok=%v approval=%+v", ok, stored)
 	}
 }
 

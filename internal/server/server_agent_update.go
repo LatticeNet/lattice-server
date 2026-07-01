@@ -616,6 +616,24 @@ func (s *Server) hasOpenAgentUpdateApproval(payload agentUpdatePayload) bool {
 	return false
 }
 
+func (s *Server) hasActiveTaskForApproval(approvalID string) bool {
+	_, ok := s.activeTaskApprovalIDs()[approvalID]
+	return ok
+}
+
+func (s *Server) activeTaskApprovalIDs() map[string]struct{} {
+	active := map[string]struct{}{}
+	for _, task := range s.store.Tasks() {
+		if task.ApprovalID == "" {
+			continue
+		}
+		if task.Status == model.TaskQueued || task.Status == model.TaskLeased {
+			active[task.ApprovalID] = struct{}{}
+		}
+	}
+	return active
+}
+
 func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "plugin: agentupdate\n")
@@ -751,6 +769,7 @@ func (s *Server) requireCurrentAgentUpdateApproval(approval model.Approval) erro
 }
 
 func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction string, now time.Time) error {
+	activeApprovals := s.activeTaskApprovalIDs()
 	for _, approval := range s.store.Approvals() {
 		if approval.Plugin != agentUpdatePlugin || approval.NodeID != nodeID {
 			continue
@@ -758,7 +777,7 @@ func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction stri
 		if currentAction != "" && approval.Action == currentAction {
 			continue
 		}
-		if approval.Status != model.ApprovalPending {
+		if !agentUpdateApprovalCanAutoReject(approval, activeApprovals) {
 			continue
 		}
 		approval.Status = model.ApprovalRejected
@@ -772,7 +791,7 @@ func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction stri
 }
 
 func (s *Server) rejectAgentUpdateApproval(approval model.Approval, now time.Time) error {
-	if approval.Plugin != agentUpdatePlugin || approval.Status != model.ApprovalPending {
+	if !agentUpdateApprovalCanAutoReject(approval, s.activeTaskApprovalIDs()) {
 		return nil
 	}
 	approval.Status = model.ApprovalRejected
@@ -782,8 +801,9 @@ func (s *Server) rejectAgentUpdateApproval(approval model.Approval, now time.Tim
 }
 
 func (s *Server) rejectLocallyStaleAgentUpdateApprovals(now time.Time) error {
+	activeApprovals := s.activeTaskApprovalIDs()
 	for _, approval := range s.store.Approvals() {
-		if approval.Plugin != agentUpdatePlugin || approval.Status != model.ApprovalPending {
+		if !agentUpdateApprovalCanAutoReject(approval, activeApprovals) {
 			continue
 		}
 		if s.isAgentUpdateApprovalLocallyStale(approval) {
@@ -793,6 +813,17 @@ func (s *Server) rejectLocallyStaleAgentUpdateApprovals(now time.Time) error {
 		}
 	}
 	return nil
+}
+
+func agentUpdateApprovalCanAutoReject(approval model.Approval, activeApprovals map[string]struct{}) bool {
+	if approval.Plugin != agentUpdatePlugin {
+		return false
+	}
+	if approval.Status == model.ApprovalPending {
+		return true
+	}
+	_, active := activeApprovals[approval.ID]
+	return approval.Status == model.ApprovalApproved && !active
 }
 
 func (s *Server) isAgentUpdateApprovalLocallyStale(approval model.Approval) bool {

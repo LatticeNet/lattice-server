@@ -185,7 +185,7 @@ var (
 )
 
 const (
-	agentUpdateApprovalStaleCode   = "agent_update_policy_changed"
+	agentUpdateApprovalStaleCode   = model.ApprovalStaleAgentUpdatePolicyChanged
 	agentUpdateApprovalStaleReason = "agent update policy changed since this approval was planned; re-plan before approving"
 )
 

@@ -389,6 +389,7 @@ func (s *Server) handleSelfDNSTaskResult(r *http.Request, approval model.Approva
 		dep.LastAppliedAt = result.FinishedAt
 		dep.LastError = ""
 		approval.Status = model.ApprovalApplied
+		approval.Reason = ""
 		approval.UpdatedAt = time.Now().UTC()
 		if err := s.store.UpsertDNSDeployment(dep); err != nil {
 			return fmt.Errorf("mark dns deployment running: %w", err)
@@ -410,6 +411,9 @@ func (s *Server) handleSelfDNSTaskResult(r *http.Request, approval model.Approva
 	dep.LastError = reason
 	if err := s.store.UpsertDNSDeployment(dep); err != nil {
 		return fmt.Errorf("mark dns deployment failed: %w", err)
+	}
+	if err := s.rejectApprovalWithReason(approval, reason); err != nil {
+		return fmt.Errorf("mark selfdns approval rejected: %w", err)
 	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID:       id.New("audit"),

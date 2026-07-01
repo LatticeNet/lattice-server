@@ -246,6 +246,9 @@ Use the compose file and deployment guide in the umbrella repository:
   backed by node-filled nft sets refreshed through systemd or cron.d. Ingress
   deny/allow rules compose into Network Guard's single `lattice_guard` input
   render rather than a competing input table.
+- Approval-backed task results close failed approvals as `rejected` with a
+  bounded plain-text `reason`, so the approvals inbox shows why a reviewed
+  mutation did not apply instead of leaving it indefinitely `approved`.
 - DNS deployment state (`/api/dns/deployments`) is server-owned intent for
   CoreDNS deployment. Writes require `dns:admin` on the target node, node
   existence is checked, Cloudflare tokens are write-only and encrypted at rest,

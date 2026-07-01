@@ -5056,6 +5056,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 		if err := s.store.UpsertNetPolicy(policy); err != nil {
 			return fmt.Errorf("mark stale netpolicy result: %w", err)
 		}
+		if err := s.rejectApprovalWithReason(approval, reason); err != nil {
+			return fmt.Errorf("mark stale netpolicy approval rejected: %w", err)
+		}
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,
@@ -5073,6 +5076,7 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 		policy.LastAppliedAt = result.FinishedAt
 		policy.LastError = ""
 		approval.Status = model.ApprovalApplied
+		approval.Reason = ""
 		approval.UpdatedAt = time.Now().UTC()
 		if err := s.store.UpsertApproval(approval); err != nil {
 			return fmt.Errorf("mark approval applied: %w", err)
@@ -5093,6 +5097,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	policy.LastError = reason
 	if err := s.store.UpsertNetPolicy(policy); err != nil {
 		return fmt.Errorf("mark netpolicy failed: %w", err)
+	}
+	if err := s.rejectApprovalWithReason(approval, reason); err != nil {
+		return fmt.Errorf("mark netpolicy approval rejected: %w", err)
 	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID:       id.New("audit"),
@@ -5116,6 +5123,17 @@ func taskFailureSummary(result model.TaskResult) string {
 	default:
 		return "task failed"
 	}
+}
+
+func (s *Server) rejectApprovalWithReason(approval model.Approval, reason string) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "approval task failed"
+	}
+	approval.Status = model.ApprovalRejected
+	approval.Reason = truncateMetadataValue(reason, 240)
+	approval.UpdatedAt = s.now()
+	return s.store.UpsertApproval(approval)
 }
 
 func truncateMetadataValue(value string, max int) string {

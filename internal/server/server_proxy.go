@@ -1109,6 +1109,7 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 		profile.LastApplyAt = result.FinishedAt
 		profile.LastError = ""
 		approval.Status = model.ApprovalApplied
+		approval.Reason = ""
 		approval.UpdatedAt = time.Now().UTC()
 		if err := s.store.UpsertApproval(approval); err != nil {
 			return fmt.Errorf("mark proxycore approval applied: %w", err)
@@ -1132,6 +1133,9 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 	profile.LastError = reason
 	if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
 		return fmt.Errorf("mark proxycore apply failed: %w", err)
+	}
+	if err := s.rejectApprovalWithReason(approval, reason); err != nil {
+		return fmt.Errorf("mark proxycore approval rejected: %w", err)
 	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID:       id.New("audit"),

@@ -4657,7 +4657,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusNotFound, errors.New("approval not found"))
 		return
 	}
-	if !s.requireNodeScope(w, p, "network:apply", approval.NodeID) {
+	if !s.requireApprovalDecisionScopes(w, p, approval) {
 		return
 	}
 	if approval.Status != model.ApprovalPending {
@@ -4768,7 +4768,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			}
 		}
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: "network:apply", Metadata: map[string]string{"approval_id": approval.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: approvalDecisionAuditScope(approval), Metadata: map[string]string{"approval_id": approval.ID}})
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
 }
 
@@ -4788,7 +4788,7 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusNotFound, errors.New("approval not found"))
 		return
 	}
-	if !s.requireNodeScope(w, p, "network:apply", approval.NodeID) {
+	if !s.requireApprovalDecisionScopes(w, p, approval) {
 		return
 	}
 	if approval.Status == model.ApprovalPending {
@@ -4802,12 +4802,47 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,
 			Action:   "network." + approval.Plugin + ".reject",
-			Scope:    "network:apply",
+			Scope:    approvalDecisionAuditScope(approval),
 			Decision: "deny",
 			Metadata: map[string]string{"approval_id": approval.ID},
 		})
 	}
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
+}
+
+func (s *Server) requireApprovalDecisionScopes(w http.ResponseWriter, p principal, approval model.Approval) bool {
+	if !s.requireNodeScope(w, p, "network:apply", approval.NodeID) {
+		return false
+	}
+	extra := approvalDecisionExtraScope(approval)
+	if extra == "" {
+		return true
+	}
+	return s.requireNodeScope(w, p, extra, approval.NodeID)
+}
+
+func approvalDecisionExtraScope(approval model.Approval) string {
+	switch approval.Plugin {
+	case "nftpolicy":
+		return "netpolicy:admin"
+	case agentUpdatePlugin:
+		return "node:admin"
+	case "selfdns":
+		return "dns:admin"
+	case proxyCorePlugin:
+		return "proxy:admin"
+	case "cftunnel":
+		return "tunnel:admin"
+	default:
+		return ""
+	}
+}
+
+func approvalDecisionAuditScope(approval model.Approval) string {
+	if extra := approvalDecisionExtraScope(approval); extra != "" {
+		return "network:apply," + extra
+	}
+	return "network:apply"
 }
 
 func approvalRequiresPlanHash(approval model.Approval) bool {

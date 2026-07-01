@@ -251,6 +251,10 @@ Use the compose file and deployment guide in the umbrella repository:
 - Approval-backed task results close failed approvals as `rejected` with a
   bounded plain-text `reason`, so the approvals inbox shows why a reviewed
   mutation did not apply instead of leaving it indefinitely `approved`.
+- Approval decisions always require `network:apply`; domain-specific host
+  mutations also require their owning admin scope (`dns:admin` for selfdns,
+  `netpolicy:admin` for nftpolicy, `proxy:admin` for proxycore, `node:admin`
+  for agentupdate, and `tunnel:admin` for cftunnel) on the target node.
 - DNS deployment state (`/api/dns/deployments`) is server-owned intent for
   CoreDNS deployment. Writes require `dns:admin` on the target node, node
   existence is checked, Cloudflare tokens are write-only and encrypted at rest,

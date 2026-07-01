@@ -1903,9 +1903,8 @@ func (s *Server) agentEnrollCommands(serverURL, nodeID, token string, launch mod
 		shellQuote(token),
 		manualFlags,
 	)
-	installURL := "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
-	linux := fmt.Sprintf("curl -fsSL %s -o lattice-agent-install.sh && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s ./lattice-agent-install.sh",
-		shellQuote(installURL),
+	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s ./lattice-agent-install.sh",
+		agentInstallScriptDownloadCommand(),
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		shellQuote(token),
@@ -1962,10 +1961,9 @@ func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Req
 }
 
 func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model.AgentLaunchConfig) map[string]string {
-	installURL := "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
 	env := agentLaunchEnv(launch)
-	linux := fmt.Sprintf("curl -fsSL %s -o lattice-agent-install.sh && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s ./lattice-agent-install.sh",
-		shellQuote(installURL),
+	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s ./lattice-agent-install.sh",
+		agentInstallScriptDownloadCommand(),
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		env,
@@ -1976,6 +1974,11 @@ func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model
 		agentLaunchFlags(launch),
 	)
 	return map[string]string{"linux": linux, "manual": manual}
+}
+
+func agentInstallScriptDownloadCommand() string {
+	const installURL = "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
+	return fmt.Sprintf("curl -fsSL --proto '=https' --tlsv1.2 %s -o lattice-agent-install.sh", shellQuote(installURL))
 }
 
 func normalizeAgentLaunchConfig(in model.AgentLaunchConfig) model.AgentLaunchConfig {

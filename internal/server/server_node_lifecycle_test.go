@@ -83,7 +83,7 @@ func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
 		t.Fatalf("server_url = %q", out.ServerURL)
 	}
 	for _, want := range []string{
-		"curl -fsSL 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh'",
+		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh'",
 		"LATTICE_SERVER='https://lattice.example.com'",
 		"LATTICE_NODE_ID='node-a'",
 		"LATTICE_NODE_TOKEN='" + out.Token + "'",
@@ -119,6 +119,7 @@ func TestNodeReconfigureCommandSourcesCanonicalAndLegacyEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
+		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh'",
 		"for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env",
 		"LATTICE_NODE_ID='node-a'",
 		"LATTICE_AGENT_ALLOW_EXEC='1'",

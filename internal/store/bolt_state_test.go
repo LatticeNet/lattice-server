@@ -119,6 +119,47 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	}
 }
 
+func TestBoltStateTouchNodeTokenRecordsUseAndThrottles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	bs, err := OpenBoltState(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+	base := time.Unix(1_700_000_000, 0).UTC()
+	if err := bs.UpsertNode(model.Node{ID: "node-a", Name: "Node A"}); err != nil {
+		t.Fatal(err)
+	}
+
+	touched, err := bs.TouchNodeToken("node-a", base, time.Minute)
+	if err != nil || !touched {
+		t.Fatalf("first touch: touched=%v err=%v", touched, err)
+	}
+	n, ok, err := bs.Node("node-a")
+	if err != nil || !ok || !n.TokenLastUsedAt.Equal(base) {
+		t.Fatalf("first touch not stored: ok=%v node=%+v err=%v", ok, n, err)
+	}
+
+	touched, err = bs.TouchNodeToken("node-a", base.Add(30*time.Second), time.Minute)
+	if err != nil || touched {
+		t.Fatalf("throttled touch: touched=%v err=%v", touched, err)
+	}
+	n, _, err = bs.Node("node-a")
+	if err != nil || !n.TokenLastUsedAt.Equal(base) {
+		t.Fatalf("throttled touch changed timestamp: node=%+v err=%v", n, err)
+	}
+
+	next := base.Add(61 * time.Second)
+	touched, err = bs.TouchNodeToken("node-a", next, time.Minute)
+	if err != nil || !touched {
+		t.Fatalf("second window touch: touched=%v err=%v", touched, err)
+	}
+	n, _, err = bs.Node("node-a")
+	if err != nil || !n.TokenLastUsedAt.Equal(next) {
+		t.Fatalf("second window touch not stored: node=%+v err=%v", n, err)
+	}
+}
+
 func TestBoltStateExportEmptyDatabaseReturnsInitializedState(t *testing.T) {
 	bs, err := OpenBoltState(filepath.Join(t.TempDir(), "state.db"), nil)
 	if err != nil {

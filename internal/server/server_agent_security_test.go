@@ -95,6 +95,57 @@ func TestAgentPostEndpointsAcceptBearerToken(t *testing.T) {
 	}
 }
 
+func TestAgentBearerAuthTouchesNodeTokenLastUsedAt(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
+
+	invalid := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello",
+		`{"node_id":"`+nodeID+`","version":"test"}`, nodeToken+"-wrong")
+	if invalid.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid token status = %d", invalid.Code)
+	}
+	n, ok := st.Node(nodeID)
+	if !ok {
+		t.Fatal("node missing")
+	}
+	if !n.TokenLastUsedAt.IsZero() {
+		t.Fatalf("failed auth must not touch token last-used timestamp: %s", n.TokenLastUsedAt)
+	}
+
+	valid := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello",
+		`{"node_id":"`+nodeID+`","version":"test"}`, nodeToken)
+	if valid.Code != http.StatusOK {
+		t.Fatalf("valid token status = %d (%s)", valid.Code, valid.Body.String())
+	}
+	n, ok = st.Node(nodeID)
+	if !ok || n.TokenLastUsedAt.IsZero() {
+		t.Fatalf("successful auth did not touch token last-used timestamp: ok=%v node=%+v", ok, n)
+	}
+
+	nodes := doJSON(t, handler, http.MethodGet, "/api/nodes", "", cookies, csrf)
+	defer nodes.Body.Close()
+	if nodes.StatusCode != http.StatusOK {
+		t.Fatalf("node list status = %d", nodes.StatusCode)
+	}
+	var views []struct {
+		ID              string    `json:"id"`
+		TokenLastUsedAt time.Time `json:"token_last_used_at"`
+	}
+	if err := json.NewDecoder(nodes.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	for _, view := range views {
+		if view.ID == nodeID {
+			if view.TokenLastUsedAt.IsZero() {
+				t.Fatalf("node view omitted token_last_used_at: %+v", view)
+			}
+			return
+		}
+	}
+	t.Fatalf("node %q missing from node views: %+v", nodeID, views)
+}
+
 func TestAgentPostEndpointsRejectBodyTokenWithoutBearer(t *testing.T) {
 	handler, _ := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)

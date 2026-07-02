@@ -529,6 +529,27 @@ func (s *Store) RotateNodeToken(nodeID, tokenHash string) (bool, error) {
 		return false, nil
 	}
 	n.TokenHash = tokenHash
+	n.TokenLastUsedAt = time.Time{}
+	s.state.Nodes[nodeID] = n
+	return true, s.Save()
+}
+
+func (s *Store) TouchNodeToken(nodeID string, at time.Time, minInterval time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return false, nil
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	} else {
+		at = at.UTC()
+	}
+	if minInterval > 0 && !n.TokenLastUsedAt.IsZero() && at.Sub(n.TokenLastUsedAt) < minInterval {
+		return false, nil
+	}
+	n.TokenLastUsedAt = at
 	s.state.Nodes[nodeID] = n
 	return true, s.Save()
 }

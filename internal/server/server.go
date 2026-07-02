@@ -225,6 +225,7 @@ const (
 	maxTaskOutputLimit     = 256 * 1024
 	maxTaskScriptBytes     = 64 * 1024
 	requestIDHeader        = "X-Lattice-Request-ID"
+	nodeTokenTouchInterval = time.Minute
 	// maxTOTPChallengeAttempts burns a 2FA challenge after this many failed codes.
 	maxTOTPChallengeAttempts = 5
 )
@@ -1670,6 +1671,7 @@ type nodeView struct {
 	AgentVersion       string                   `json:"agent_version"`
 	Online             bool                     `json:"online"`
 	Disabled           bool                     `json:"disabled,omitempty"`
+	TokenLastUsedAt    time.Time                `json:"token_last_used_at,omitempty"`
 	LastSeen           time.Time                `json:"last_seen"`
 	Metrics            model.Metrics            `json:"metrics"`
 	HostFacts          model.HostFacts          `json:"host_facts"`
@@ -1705,7 +1707,7 @@ func (s *Server) toNodeView(n model.Node) nodeView {
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
-		Online: n.Online, Disabled: n.Disabled, LastSeen: n.LastSeen, Metrics: n.Metrics,
+		Online: n.Online, Disabled: n.Disabled, TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
 		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }
@@ -5453,7 +5455,16 @@ func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {
 	if n.Disabled {
 		return model.Node{}, false
 	}
-	return n, auth.VerifySecret(n.TokenHash, token)
+	if !auth.VerifySecret(n.TokenHash, token) {
+		return model.Node{}, false
+	}
+	touchedAt := s.now().UTC()
+	if touched, err := s.store.TouchNodeToken(nodeID, touchedAt, nodeTokenTouchInterval); err != nil {
+		s.logger.Printf("node token touch failed: node_id=%s: %v", nodeID, err)
+	} else if touched {
+		n.TokenLastUsedAt = touchedAt
+	}
+	return n, true
 }
 
 func (s *Server) authenticateAgentRequest(r *http.Request, nodeID string) (model.Node, bool) {

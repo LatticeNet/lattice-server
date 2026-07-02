@@ -17,7 +17,7 @@ func nodeTokenAuthOK(t *testing.T, handler http.Handler, nodeID, token string) b
 }
 
 func TestNodeTokenRotationAndRevocation(t *testing.T) {
-	handler, _ := newTestServer(t)
+	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 
 	nodeID, old := enrollNode(t, handler, cookies, csrf)
@@ -39,6 +39,13 @@ func TestNodeTokenRotationAndRevocation(t *testing.T) {
 	}
 	if nodeTokenAuthOK(t, handler, nodeID, old) {
 		t.Fatal("rotated-away token must no longer authenticate")
+	}
+	node, ok := st.Node(nodeID)
+	if !ok {
+		t.Fatal("node missing after token rotation")
+	}
+	if !node.TokenLastUsedAt.IsZero() {
+		t.Fatalf("token rotation must clear previous token last-used timestamp: %s", node.TokenLastUsedAt)
 	}
 	if !nodeTokenAuthOK(t, handler, nodeID, rot.Token) {
 		t.Fatal("new rotated token must authenticate")

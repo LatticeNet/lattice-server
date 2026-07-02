@@ -458,6 +458,32 @@ func (bs *BoltStateStore) UpsertNode(n model.Node) error {
 	})
 }
 
+func (bs *BoltStateStore) TouchNodeToken(nodeID string, at time.Time, minInterval time.Duration) (bool, error) {
+	var touched bool
+	err := bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var n model.Node
+		ok, err := getRecord(tx, boltBucketNodes, nodeID, &n)
+		if err != nil || !ok {
+			return err
+		}
+		if at.IsZero() {
+			at = time.Now().UTC()
+		} else {
+			at = at.UTC()
+		}
+		if minInterval > 0 && !n.TokenLastUsedAt.IsZero() && at.Sub(n.TokenLastUsedAt) < minInterval {
+			return nil
+		}
+		n.TokenLastUsedAt = at
+		touched = true
+		return putRecord(tx, boltBucketNodes, nodeID, n)
+	})
+	return touched, err
+}
+
 func (bs *BoltStateStore) UpdateNodeGeo(nodeID string, geo *model.NodeGeo) (model.Node, bool, error) {
 	var out model.Node
 	var ok bool

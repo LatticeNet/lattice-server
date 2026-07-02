@@ -151,7 +151,10 @@ Use the compose file and deployment guide in the umbrella repository:
 - Management APIs are intended for localhost, WireGuard, or a hardened reverse proxy.
 - Agent APIs authenticate node tokens only through the `Authorization: Bearer`
   header; JSON body tokens are rejected so credentials do not enter request
-  logs, traces, or failure captures.
+  logs, traces, or failure captures. Successful node-token authentication
+  updates `token_last_used_at` on the node record with a short write-throttle,
+  giving operators lifecycle telemetry without turning every poll into a full
+  state-file rewrite.
 - Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
   advisory telemetry only. They are sanitized and clamped server-side and must
   not be used for authorization or policy decisions.

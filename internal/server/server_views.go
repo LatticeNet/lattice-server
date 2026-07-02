@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -50,7 +51,7 @@ func toApprovalView(a model.Approval) approvalView {
 }
 
 func approvalStaleMetadata(a model.Approval) (bool, string) {
-	if a.Plugin == agentUpdatePlugin && a.Reason == agentUpdateApprovalStaleReason {
+	if a.Plugin == agentUpdatePlugin && strings.HasPrefix(a.Reason, errAgentUpdateApprovalStale.Error()) {
 		return true, agentUpdateApprovalStaleCode
 	}
 	return false, ""

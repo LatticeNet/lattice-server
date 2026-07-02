@@ -328,12 +328,44 @@ func TestAgentUpdateApproveRequiresCurrentPolicy(t *testing.T) {
 	if apiErr.Error.Code != model.APIErrorApprovalStale {
 		t.Fatalf("stale agent update approval code = %q want %q", apiErr.Error.Code, model.APIErrorApprovalStale)
 	}
+	if !strings.Contains(apiErr.Error.Message, "changed fields:") ||
+		!strings.Contains(apiErr.Error.Message, "target_version planned=0.2.0 current=0.3.0") ||
+		!strings.Contains(apiErr.Error.Message, "install_path planned=/usr/local/bin/lattice-agent current=/opt/lattice/lattice-agent") {
+		t.Fatalf("stale agent update approval should explain changed fields, got %q", apiErr.Error.Message)
+	}
 	stale, ok := st.Approval(approval.ID)
 	if !ok || stale.Status != model.ApprovalRejected {
 		t.Fatalf("stale agent update approval should be closed as rejected: ok=%v approval=%+v", ok, stale)
 	}
+	if !strings.Contains(stale.Reason, "changed fields:") ||
+		!strings.Contains(stale.Reason, "target_version planned=0.2.0 current=0.3.0") ||
+		!strings.Contains(stale.Reason, "install_path planned=/usr/local/bin/lattice-agent current=/opt/lattice/lattice-agent") {
+		t.Fatalf("stale agent update approval should persist changed fields, got %q", stale.Reason)
+	}
+	view := toApprovalView(stale)
+	if !view.Stale || view.StaleCode != agentUpdateApprovalStaleCode {
+		t.Fatalf("detailed stale reason should preserve stale metadata, got stale=%v code=%q", view.Stale, view.StaleCode)
+	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("stale update approval queued tasks: %+v", st.Tasks())
+	}
+}
+
+func TestAgentUpdatePayloadChangeSummaryNamesSHAChanges(t *testing.T) {
+	planned := agentUpdatePayload{
+		NodeID:        "node-a",
+		TargetVersion: "0.2.7",
+		BinaryURL:     "https://github.com/LatticeNet/lattice-node-agent/releases/download/v0.2.7/lattice-agent-linux-amd64",
+		SHA256:        strings.Repeat("6", 64),
+		InstallPath:   defaultAgentInstallPath,
+		ServiceName:   defaultAgentServiceName,
+	}
+	current := planned
+	current.SHA256 = strings.Repeat("5", 64)
+
+	summary := agentUpdatePayloadChangeSummary(planned, current)
+	if !strings.Contains(summary, "sha256 planned=6666666666666666... current=5555555555555555...") {
+		t.Fatalf("sha256 change summary missing digest diff: %q", summary)
 	}
 }
 

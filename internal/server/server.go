@@ -4871,7 +4871,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	if approval.Plugin == agentUpdatePlugin {
 		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
 			if errors.Is(err, errAgentUpdateApprovalStale) {
-				if rejectErr := s.rejectAgentUpdateApproval(approval, s.now()); rejectErr != nil {
+				if rejectErr := s.rejectAgentUpdateApprovalWithReason(approval, err.Error(), s.now()); rejectErr != nil {
 					writeError(w, http.StatusInternalServerError, rejectErr)
 					return
 				}

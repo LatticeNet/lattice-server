@@ -780,9 +780,39 @@ func (s *Server) requireCurrentAgentUpdateApproval(approval model.Approval) erro
 		return fmt.Errorf("agent update policy %q is invalid; re-plan before approving: %w", approval.NodeID, err)
 	}
 	if current != payload {
-		return fmt.Errorf("%w; re-plan before approving", errAgentUpdateApprovalStale)
+		return fmt.Errorf("%w; %s; re-plan before approving", errAgentUpdateApprovalStale, agentUpdatePayloadChangeSummary(payload, current))
 	}
 	return nil
+}
+
+func agentUpdatePayloadChangeSummary(planned, current agentUpdatePayload) string {
+	changes := []string{}
+	if planned.TargetVersion != current.TargetVersion {
+		changes = append(changes, fmt.Sprintf("target_version planned=%s current=%s", planned.TargetVersion, current.TargetVersion))
+	}
+	if planned.BinaryURL != current.BinaryURL {
+		changes = append(changes, fmt.Sprintf("binary_url planned=%s current=%s", planned.BinaryURL, current.BinaryURL))
+	}
+	if planned.SHA256 != current.SHA256 {
+		changes = append(changes, fmt.Sprintf("sha256 planned=%s current=%s", shortDigest(planned.SHA256), shortDigest(current.SHA256)))
+	}
+	if planned.InstallPath != current.InstallPath {
+		changes = append(changes, fmt.Sprintf("install_path planned=%s current=%s", planned.InstallPath, current.InstallPath))
+	}
+	if planned.ServiceName != current.ServiceName {
+		changes = append(changes, fmt.Sprintf("service_name planned=%s current=%s", planned.ServiceName, current.ServiceName))
+	}
+	if len(changes) == 0 {
+		return "resolved update payload changed"
+	}
+	return "changed fields: " + strings.Join(changes, "; ")
+}
+
+func shortDigest(value string) string {
+	if len(value) <= 16 {
+		return value
+	}
+	return value[:16] + "..."
 }
 
 func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction string, now time.Time) error {
@@ -808,11 +838,18 @@ func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction stri
 }
 
 func (s *Server) rejectAgentUpdateApproval(approval model.Approval, now time.Time) error {
+	return s.rejectAgentUpdateApprovalWithReason(approval, agentUpdateApprovalStaleReason, now)
+}
+
+func (s *Server) rejectAgentUpdateApprovalWithReason(approval model.Approval, reason string, now time.Time) error {
 	if !agentUpdateApprovalCanAutoReject(approval, s.activeTaskApprovalIDs()) {
 		return nil
 	}
 	approval.Status = model.ApprovalRejected
-	approval.Reason = agentUpdateApprovalStaleReason
+	approval.Reason = strings.TrimSpace(reason)
+	if approval.Reason == "" {
+		approval.Reason = agentUpdateApprovalStaleReason
+	}
 	approval.UpdatedAt = now
 	return s.store.UpsertApproval(approval)
 }

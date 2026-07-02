@@ -182,8 +182,8 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	for _, sc := range scopes {
-		if !rbac.Allows(p.Principal, sc, "") {
-			s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", "missing scope "+sc)
+		if ok, reason := pluginGatewayScopeAllowed(p, sc); !ok {
+			s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", reason)
 			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 			return
 		}
@@ -316,11 +316,25 @@ func uniqueStrings(values []string) []string {
 
 func principalHasScopes(p principal, scopes []string) bool {
 	for _, sc := range scopes {
-		if !rbac.Allows(p.Principal, sc, "") {
+		if ok, _ := pluginGatewayScopeAllowed(p, sc); !ok {
 			return false
 		}
 	}
 	return true
+}
+
+func pluginGatewayScopeAllowed(p principal, scope string) (bool, string) {
+	if !rbac.Allows(p.Principal, scope, "") {
+		return false, "missing scope " + scope
+	}
+	if pluginGatewayScopeRequiresUnrestrictedAllowlist(scope) && principalHasNodeRestriction(p) {
+		return false, "global proxy plugin views require an unrestricted server allowlist"
+	}
+	return true, ""
+}
+
+func pluginGatewayScopeRequiresUnrestrictedAllowlist(scope string) bool {
+	return scope == "proxy:*" || scope == "proxy:read" || scope == "proxy:admin"
 }
 
 // handlePluginInvoke runs one action on an ACTIVE plugin via the runtime (the

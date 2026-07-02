@@ -214,11 +214,31 @@ func TestPluginContributionsAndCallGatewayEnforceActionScopes(t *testing.T) {
 		t.Fatalf("proxy:read contribution response must expose only visible interface methods, got %+v", got)
 	}
 
+	restrictedToken := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, []string{"node-a"})
+	restrictedContrib := doBearerJSON(t, handler, http.MethodGet, "/api/plugin-contributions", "", restrictedToken)
+	if restrictedContrib.StatusCode != http.StatusOK {
+		t.Fatalf("restricted contributions should remain callable, got %d", restrictedContrib.StatusCode)
+	}
+	var restrictedPlugins []pluginView
+	if err := json.NewDecoder(restrictedContrib.Body).Decode(&restrictedPlugins); err != nil {
+		t.Fatal(err)
+	}
+	restrictedContrib.Body.Close()
+	if len(restrictedPlugins) != 0 {
+		t.Fatalf("server-allowlisted proxy token must not see global proxy plugin views, got %+v", restrictedPlugins)
+	}
+
 	list := doBearerJSON(t, handler, http.MethodPost, "/api/plugins/call",
 		`{"id":"test.ui","service":"test.ui/nodes","method":"list"}`, readToken)
 	list.Body.Close()
 	if list.StatusCode != http.StatusOK {
 		t.Fatalf("list should be allowed with proxy:read, got %d", list.StatusCode)
+	}
+	restrictedList := doBearerJSON(t, handler, http.MethodPost, "/api/plugins/call",
+		`{"id":"test.ui","service":"test.ui/nodes","method":"list"}`, restrictedToken)
+	restrictedList.Body.Close()
+	if restrictedList.StatusCode != http.StatusForbidden {
+		t.Fatalf("restricted proxy token must not call global proxy plugin views, got %d", restrictedList.StatusCode)
 	}
 	denied := doBearerJSON(t, handler, http.MethodPost, "/api/plugins/call",
 		`{"id":"test.ui","service":"test.ui/nodes","method":"delete"}`, readToken)
@@ -226,14 +246,20 @@ func TestPluginContributionsAndCallGatewayEnforceActionScopes(t *testing.T) {
 	if denied.StatusCode != http.StatusForbidden {
 		t.Fatalf("delete should require action scope proxy:admin, got %d", denied.StatusCode)
 	}
-	var sawDeny bool
+	var sawDeny, sawRestrictedDeny bool
 	for _, ev := range st.AuditEvents() {
 		if ev.Action == "plugin.call" && ev.Decision == "deny" && ev.Metadata["method"] == "delete" && strings.Contains(ev.Scope, "proxy:admin") {
 			sawDeny = true
 		}
+		if ev.Action == "plugin.call" && ev.Decision == "deny" && ev.Metadata["method"] == "list" && strings.Contains(ev.Reason, "unrestricted server allowlist") {
+			sawRestrictedDeny = true
+		}
 	}
 	if !sawDeny {
 		t.Fatalf("expected plugin.call deny audit for action scope failure, got %+v", st.AuditEvents())
+	}
+	if !sawRestrictedDeny {
+		t.Fatalf("expected plugin.call deny audit for restricted proxy token, got %+v", st.AuditEvents())
 	}
 }
 

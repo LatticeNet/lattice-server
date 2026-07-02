@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	oidctest "github.com/LatticeNet/lattice-server/internal/oidc"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -118,7 +120,7 @@ func writeJSONRaw(w http.ResponseWriter, v any) {
 
 // --- helpers --------------------------------------------------------------
 
-func newOIDCServer(t *testing.T) (*Server, *store.Store) {
+func newOIDCServer(t *testing.T, clients ...*http.Client) (*Server, *store.Store) {
 	t.Helper()
 	st, err := store.OpenWithCipher("", nil)
 	if err != nil {
@@ -127,6 +129,9 @@ func newOIDCServer(t *testing.T) (*Server, *store.Store) {
 	srv, err := New(Options{Store: st, AdminPassword: "correct horse battery staple", PublicURL: "https://lattice.test"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(clients) > 0 {
+		srv.oidc = oidctest.NewManagerWithClient(clients[0])
 	}
 	return srv, st
 }
@@ -175,7 +180,7 @@ func TestOIDCEndToEndLogin(t *testing.T) {
 	idp.email = "alice@example.com"
 	idp.emailVerified = true
 
-	srv, st := newOIDCServer(t)
+	srv, st := newOIDCServer(t, idp.server.Client())
 	h := srv.Handler()
 
 	if err := st.UpsertOIDCProvider(model.OIDCProvider{
@@ -227,7 +232,7 @@ func TestOIDCCallbackRequiresBindingCookie(t *testing.T) {
 	idp.email = "csrf@example.com"
 	idp.emailVerified = true
 
-	srv, st := newOIDCServer(t)
+	srv, st := newOIDCServer(t, idp.server.Client())
 	h := srv.Handler()
 	st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, AllowedDomains: []string{"example.com"}, CreatedAt: time.Now().UTC()})
 	st.UpsertUser(model.User{ID: "u-csrf", Username: "csrf@example.com"})
@@ -258,7 +263,7 @@ func TestOIDCHonorsLocalTOTP(t *testing.T) {
 	idp.email = "twofa@example.com"
 	idp.emailVerified = true
 
-	srv, st := newOIDCServer(t)
+	srv, st := newOIDCServer(t, idp.server.Client())
 	h := srv.Handler()
 	st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, AllowedDomains: []string{"example.com"}, CreatedAt: time.Now().UTC()})
 	// A user with local 2FA enabled.
@@ -284,7 +289,7 @@ func TestOIDCCallbackRejectsNonceMismatch(t *testing.T) {
 	idp.email = "x@example.com"
 	idp.emailVerified = true
 
-	srv, st := newOIDCServer(t)
+	srv, st := newOIDCServer(t, idp.server.Client())
 	h := srv.Handler()
 	st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, AllowedDomains: []string{"example.com"}, CreatedAt: time.Now().UTC()})
 	st.UpsertUser(model.User{ID: "ux", Username: "x@example.com"})
@@ -310,7 +315,7 @@ func TestOIDCCallbackDeniesUnprovisionedUser(t *testing.T) {
 	idp.email = "ghost@example.com"
 	idp.emailVerified = true
 
-	srv, st := newOIDCServer(t)
+	srv, st := newOIDCServer(t, idp.server.Client())
 	h := srv.Handler()
 	st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, AllowedDomains: []string{"example.com"}, CreatedAt: time.Now().UTC()})
 	// No local user for ghost@example.com.
@@ -343,6 +348,16 @@ func TestOIDCStartUnknownProvider(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("want 404 for unknown provider, got %d", rec.Code)
+	}
+}
+
+func TestOIDCDefaultClientBlocksInternalIssuer(t *testing.T) {
+	srv, _ := newOIDCServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _, err := srv.oidc.Probe(ctx, "https://127.0.0.1:1")
+	if err == nil || !strings.Contains(err.Error(), "blocked address") {
+		t.Fatalf("default OIDC client must block internal issuers, got %v", err)
 	}
 }
 

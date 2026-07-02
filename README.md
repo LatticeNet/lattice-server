@@ -341,8 +341,11 @@ Use the compose file and deployment guide in the umbrella repository:
   are rejected before storage.
 - Accepted task results are stored and returned through the control plane without
   the agent-only `lease_id`.
-- Operator-configured outbound webhooks use a guarded HTTP client that rejects
-  loopback, private, link-local, metadata, CGNAT, and documentation ranges.
+- Operator-configured outbound webhooks and OIDC IdP calls use guarded HTTP
+  clients that reject loopback, private, link-local, metadata, CGNAT, and
+  documentation ranges. This applies to OIDC discovery, JWKS fetches, and token
+  exchange, so an admin-supplied issuer cannot make the server reach internal
+  services.
 - Plugin manifests require stable lowercase ids and non-empty duplicate-free
   capability lists before any plugin can be trusted by the control plane.
   Host-risk/system plugins can be verified with an operator trust policy:

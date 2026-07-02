@@ -21,6 +21,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/outbound"
 )
 
 // netTimeout bounds every outbound call to an IdP (discovery, JWKS, token
@@ -42,11 +43,22 @@ type Manager struct {
 	httpClient *http.Client
 }
 
-// NewManager returns a manager whose outbound IdP calls are timeout-bounded.
+// NewManager returns a manager whose outbound IdP calls are timeout-bounded and
+// guarded against SSRF/private-network targets.
 func NewManager() *Manager {
+	return NewManagerWithClient(outbound.NewClient(netTimeout))
+}
+
+// NewManagerWithClient returns a manager using client for all IdP calls. It is
+// primarily for hermetic tests that need to talk to a local httptest IdP; pass
+// nil to use the production guarded client.
+func NewManagerWithClient(client *http.Client) *Manager {
+	if client == nil {
+		client = outbound.NewClient(netTimeout)
+	}
 	return &Manager{
 		providers:  map[string]*oidc.Provider{},
-		httpClient: &http.Client{Timeout: netTimeout},
+		httpClient: client,
 	}
 }
 

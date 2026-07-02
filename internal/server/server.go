@@ -1752,6 +1752,9 @@ type agentRuntimeConfig struct {
 	NoExec                bool      `json:"no_exec"`
 	AllowTerminal         bool      `json:"allow_terminal"`
 	TerminalTransport     string    `json:"terminal_transport,omitempty"`
+	TaskSandbox           string    `json:"task_sandbox,omitempty"`
+	TaskSandboxFeatures   []string  `json:"task_sandbox_features,omitempty"`
+	TaskSandboxWarning    string    `json:"task_sandbox_warning,omitempty"`
 	SSHAlerts             bool      `json:"ssh_alerts"`
 	SingBoxDiscover       bool      `json:"singbox_discover"`
 	SingBoxBin            string    `json:"singbox_bin,omitempty"`
@@ -2136,6 +2139,13 @@ func normalizeAgentLaunchConfig(in model.AgentLaunchConfig) model.AgentLaunchCon
 	return out
 }
 
+const (
+	maxAgentRuntimeField        = 96
+	maxAgentRuntimeWarning      = 240
+	maxAgentRuntimeFeature      = 64
+	maxAgentRuntimeFeatureCount = 16
+)
+
 func normalizeAgentRuntimeConfig(in agentRuntimeConfig, now time.Time) agentRuntimeConfig {
 	out := in
 	if out.NoExec {
@@ -2151,6 +2161,9 @@ func normalizeAgentRuntimeConfig(in agentRuntimeConfig, now time.Time) agentRunt
 	default:
 		out.TerminalTransport = ""
 	}
+	out.TaskSandbox = clampPrintable(out.TaskSandbox, maxAgentRuntimeField)
+	out.TaskSandboxFeatures = normalizeStringList(out.TaskSandboxFeatures, maxAgentRuntimeFeature, maxAgentRuntimeFeatureCount)
+	out.TaskSandboxWarning = clampPrintable(out.TaskSandboxWarning, maxAgentRuntimeWarning)
 	out.SingBoxBin = strings.TrimSpace(out.SingBoxBin)
 	out.ProxyUsageFile = strings.TrimSpace(out.ProxyUsageFile)
 	out.ProxyUsageURL = strings.TrimSpace(out.ProxyUsageURL)
@@ -2162,6 +2175,27 @@ func normalizeAgentRuntimeConfig(in agentRuntimeConfig, now time.Time) agentRunt
 	} else {
 		out.ReportedAt = out.ReportedAt.UTC()
 	}
+	return out
+}
+
+func normalizeStringList(values []string, maxValueBytes, maxItems int) []string {
+	if len(values) == 0 || maxValueBytes <= 0 || maxItems <= 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, min(len(values), maxItems))
+	for _, value := range values {
+		value = clampPrintable(value, maxValueBytes)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+		if len(out) >= maxItems {
+			break
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 

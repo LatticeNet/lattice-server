@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -408,6 +409,95 @@ func TestAgentHostFactsAreStoredAsSanitizedTelemetry(t *testing.T) {
 	}
 }
 
+func TestAgentRuntimeReportsTaskSandboxProfile(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
+
+	body := `{
+		"node_id":"` + nodeID + `",
+		"version":"test",
+		"metrics":{},
+		"agent_runtime":{
+			"allow_exec":true,
+			"allow_root_exec":false,
+			"task_sandbox":" linux-rlimit-process-group ",
+			"task_sandbox_features":["timeout","", "rlimit-cpu", "timeout", "minimal-env"],
+			"task_sandbox_warning":" task scripts run as root "
+		}
+	}`
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/metrics", body, nodeToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics with runtime failed: %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/nodes", "", cookies, "")
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list nodes failed: %d", list.StatusCode)
+	}
+	var nodes []struct {
+		ID           string `json:"id"`
+		AgentRuntime struct {
+			AllowExec           bool     `json:"allow_exec"`
+			TaskSandbox         string   `json:"task_sandbox"`
+			TaskSandboxFeatures []string `json:"task_sandbox_features"`
+			TaskSandboxWarning  string   `json:"task_sandbox_warning"`
+		} `json:"agent_runtime"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&nodes); err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].ID != nodeID {
+		t.Fatalf("unexpected nodes: %+v", nodes)
+	}
+	runtime := nodes[0].AgentRuntime
+	if !runtime.AllowExec || runtime.TaskSandbox != "linux-rlimit-process-group" {
+		t.Fatalf("runtime sandbox fields not stored: %+v", runtime)
+	}
+	wantFeatures := []string{"minimal-env", "rlimit-cpu", "timeout"}
+	if !reflect.DeepEqual(runtime.TaskSandboxFeatures, wantFeatures) {
+		t.Fatalf("features = %+v, want %+v", runtime.TaskSandboxFeatures, wantFeatures)
+	}
+	if runtime.TaskSandboxWarning != "task scripts run as root" {
+		t.Fatalf("warning not trimmed: %q", runtime.TaskSandboxWarning)
+	}
+}
+
+func TestNormalizeAgentRuntimeConfigBoundsTaskSandboxFields(t *testing.T) {
+	truncatedFeature := strings.Repeat("x", maxAgentRuntimeFeature)
+	features := []string{"timeout", " timeout ", "", "rlimit-cpu\ncontrol", strings.Repeat("x", maxAgentRuntimeFeature+32)}
+	for i := 0; i < maxAgentRuntimeFeatureCount+4; i++ {
+		features = append(features, fmt.Sprintf("feature-%02d", i))
+	}
+
+	got := normalizeAgentRuntimeConfig(agentRuntimeConfig{
+		TaskSandbox:         " " + strings.Repeat("s", maxAgentRuntimeField+32) + "\n",
+		TaskSandboxFeatures: features,
+		TaskSandboxWarning:  strings.Repeat("w", maxAgentRuntimeWarning+32),
+	}, time.Now())
+
+	if len(got.TaskSandbox) != maxAgentRuntimeField {
+		t.Fatalf("sandbox field should be clamped to %d bytes, got %d", maxAgentRuntimeField, len(got.TaskSandbox))
+	}
+	if len(got.TaskSandboxWarning) != maxAgentRuntimeWarning {
+		t.Fatalf("sandbox warning should be clamped to %d bytes, got %d", maxAgentRuntimeWarning, len(got.TaskSandboxWarning))
+	}
+	if len(got.TaskSandboxFeatures) > maxAgentRuntimeFeatureCount {
+		t.Fatalf("feature list should be capped at %d entries, got %d", maxAgentRuntimeFeatureCount, len(got.TaskSandboxFeatures))
+	}
+	if !stringSliceContains(got.TaskSandboxFeatures, "rlimit-cpucontrol") ||
+		!stringSliceContains(got.TaskSandboxFeatures, "timeout") ||
+		!stringSliceContains(got.TaskSandboxFeatures, truncatedFeature) {
+		t.Fatalf("features should be sanitized and deduped, got %+v", got.TaskSandboxFeatures)
+	}
+	for _, feature := range got.TaskSandboxFeatures {
+		if len(feature) > maxAgentRuntimeFeature || strings.ContainsAny(feature, "\n\r\t") {
+			t.Fatalf("feature should be printable and capped, got %q", feature)
+		}
+	}
+}
+
 func TestNormalizeHostFactsDropsAbsurdValues(t *testing.T) {
 	now := time.Date(2026, 6, 13, 10, 0, 0, 0, time.UTC)
 	tooLongCPU := strings.Repeat("x", maxHostFactLong+32)
@@ -441,6 +531,15 @@ func TestNormalizeHostFactsDropsAbsurdValues(t *testing.T) {
 	if !got.ReportedAt.Equal(now) {
 		t.Fatalf("reported_at must be server-stamped, got %s", got.ReportedAt)
 	}
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAgentGenericEventAuditUsesRequestID(t *testing.T) {

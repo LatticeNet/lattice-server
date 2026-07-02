@@ -668,6 +668,7 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "- download is HTTPS-only and verified against the pinned SHA-256 digest\n")
 	fmt.Fprintf(&b, "- binary is installed atomically with a timestamped backup\n")
 	fmt.Fprintf(&b, "- service restart is delayed so the current agent can post the task result\n")
+	fmt.Fprintf(&b, "- default/legacy install targets follow the running lattice-agent path and default service may follow the running systemd unit\n")
 	fmt.Fprintf(&b, "- execution still requires node-agent -allow-exec and root updates require -allow-root-exec\n")
 	return b.String()
 }

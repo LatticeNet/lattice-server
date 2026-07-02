@@ -67,7 +67,12 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	if approval.Plugin != agentUpdatePlugin || approval.Action != agentUpdateAction || approval.NodeID != "node-a" {
 		t.Fatalf("bad approval view: %+v", approval)
 	}
-	for _, want := range []string{"target_version: 0.2.0", "sha256: " + agentUpdateTestSHA, "service restart is delayed"} {
+	for _, want := range []string{
+		"target_version: 0.2.0",
+		"sha256: " + agentUpdateTestSHA,
+		"service restart is delayed",
+		"default/legacy install targets follow the running lattice-agent path",
+	} {
 		if !strings.Contains(approval.Plan, want) {
 			t.Fatalf("approval plan missing %q:\n%s", want, approval.Plan)
 		}

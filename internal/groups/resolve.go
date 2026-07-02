@@ -28,9 +28,8 @@ import (
 // allNodes.
 //
 // Membership is flat, so no cycle guard is needed here. Parent-cycle and
-// nesting-depth validation over Group.ParentID is a CRUD-layer concern.
-// TODO(Phase 1): enforce ParentID acyclicity + max nesting depth in the group
-// CRUD/service layer (this resolver never walks ParentID).
+// nesting-depth validation over Group.ParentID is enforced by the group CRUD
+// layer; this resolver never walks ParentID.
 func ResolveMembers(g model.Group, allNodes []model.Node) []string {
 	set := make(map[string]struct{}, len(g.Members))
 	for _, id := range g.Members {

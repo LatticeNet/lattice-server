@@ -2875,7 +2875,14 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request, p pri
 		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
 		return
 	}
-	out := map[string]any{"enabled": true, "ok": err == nil, "count": res.Count, "head": res.Head}
+	out := map[string]any{"enabled": true, "ok": err == nil, "count": res.Count, "head": res.Head, "anchored": res.Anchor != nil}
+	if res.Anchor != nil {
+		out["anchor_count"] = res.Anchor.Count
+		out["anchor_head"] = res.Anchor.Head
+		if res.Anchor.Pending != nil {
+			out["anchor_pending"] = res.Anchor.Pending
+		}
+	}
 	if err != nil {
 		out["error"] = err.Error()
 	}

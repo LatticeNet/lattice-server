@@ -33,7 +33,7 @@ Responsibilities:
   output, and baseline proxy usage rollup.
 - Operator-owned NodeGeo API and optional server-side GeoIP lookup for the
   dashboard Fleet Map.
-- Append-only audit events.
+- Append-only audit events with a hash-chained WAL and sidecar head anchor.
 
 ## Run Locally
 
@@ -396,7 +396,9 @@ Use the compose file and deployment guide in the umbrella repository:
 ## Storage
 
 - The default server store is still the encrypted JSON state file plus the
-  append-only hash-chained audit WAL (`<state>.audit-wal`).
+  append-only hash-chained audit WAL (`<state>.audit-wal`) and a local sidecar
+  head anchor (`<state>.audit-anchor`) that detects end-truncation on open and
+  through `/api/audit/verify`.
 - `internal/store.BoltStateStore` is the Phase C bbolt foundation. It can import
   and export the full `State`, stores each top-level collection in its own
   bucket, reuses the existing AES-256-GCM secret encryption boundary, and now

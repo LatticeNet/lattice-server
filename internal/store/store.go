@@ -72,12 +72,13 @@ type State struct {
 }
 
 type Store struct {
-	mu      sync.Mutex
-	path    string
-	state   State
-	cipher  secret.Cipher // at-rest encryptor for persisted credentials
-	wal     *audit.WAL    // append-only tamper-evident audit log; nil for in-memory stores
-	walPath string
+	mu            sync.Mutex
+	path          string
+	state         State
+	cipher        secret.Cipher // at-rest encryptor for persisted credentials
+	wal           *audit.WAL    // append-only tamper-evident audit log; nil for in-memory stores
+	walPath       string
+	walAnchorPath string
 }
 
 // Open loads (or initializes) the store at path, resolving the at-rest
@@ -110,12 +111,14 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 		return s, nil
 	}
 	walPath := path + ".audit-wal"
-	wal, err := audit.OpenWAL(walPath)
+	walAnchorPath := path + ".audit-anchor"
+	wal, err := audit.OpenAnchoredWAL(walPath, walAnchorPath)
 	if err != nil {
 		return nil, err
 	}
 	s.wal = wal
 	s.walPath = walPath
+	s.walAnchorPath = walAnchorPath
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -934,12 +937,7 @@ func (s *Store) AuditWALVerify() (audit.Result, bool, error) {
 	if s.walPath == "" {
 		return audit.Result{}, false, nil
 	}
-	f, err := os.Open(s.walPath)
-	if err != nil {
-		return audit.Result{}, true, err
-	}
-	defer f.Close()
-	res, err := audit.Verify(f)
+	res, err := audit.VerifyAnchoredFile(s.walPath, s.walAnchorPath)
 	return res, true, err
 }
 

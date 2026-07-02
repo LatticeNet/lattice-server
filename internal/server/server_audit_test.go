@@ -3,10 +3,12 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func TestAuditDefaultResponseRemainsArray(t *testing.T) {
@@ -104,6 +106,52 @@ func TestAuditQueryFiltersByCorrelationID(t *testing.T) {
 	}
 	if out.Total != 1 || len(out.Events) != 1 || out.Events[0].ID != "audit_req_a" {
 		t.Fatalf("expected exact correlation match, got %+v", out)
+	}
+}
+
+func TestAuditVerifyReportsAnchorStatus(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, _ := loginSession(t, handler)
+	if err := st.AppendAudit(model.AuditEvent{
+		ID:       "audit_anchor_status",
+		At:       time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC),
+		Action:   "audit.anchor_status",
+		Decision: "allow",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res := doJSON(t, handler, http.MethodGet, "/api/audit/verify", "", cookies, "")
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("audit verify failed: %d", res.StatusCode)
+	}
+	var out struct {
+		Enabled     bool   `json:"enabled"`
+		OK          bool   `json:"ok"`
+		Count       int    `json:"count"`
+		Head        string `json:"head"`
+		Anchored    bool   `json:"anchored"`
+		AnchorCount int    `json:"anchor_count"`
+		AnchorHead  string `json:"anchor_head"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.Enabled || !out.OK || !out.Anchored || out.Count == 0 {
+		t.Fatalf("unexpected verify response: %+v", out)
+	}
+	if out.AnchorCount != out.Count || out.AnchorHead == "" || out.AnchorHead != out.Head {
+		t.Fatalf("anchor fields do not match verified head: %+v", out)
 	}
 }
 

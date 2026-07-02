@@ -231,7 +231,9 @@ Use the compose file and deployment guide in the umbrella repository:
   support `action`, `decision`, `node_id`, `actor_id`, `token_id`, `scope`,
   `correlation_id`, `limit`, and `offset`. `limit` defaults to 100 and is capped
   at 500 so dashboards and plugins do not accidentally fetch unbounded audit
-  history.
+  history. Personal access tokens with a non-global `server_allowlist` see only
+  audit rows whose `node_id` is explicitly inside that allowlist; global audit
+  rows are reserved for unrestricted operators.
   Server-side `5xx` responses deliberately return generic public messages
   (`internal server error` or `upstream service error`) rather than raw provider,
   filesystem, database, or token-bearing error strings.

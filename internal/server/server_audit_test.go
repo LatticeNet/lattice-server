@@ -107,6 +107,51 @@ func TestAuditQueryFiltersByCorrelationID(t *testing.T) {
 	}
 }
 
+func TestAuditReadTokenIsServerAllowlistScoped(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	base := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	for _, ev := range []model.AuditEvent{
+		{ID: "audit_node_a", At: base, NodeID: "node-a", Action: "task.result", Decision: "allow"},
+		{ID: "audit_node_b", At: base.Add(time.Minute), NodeID: "node-b", Action: "task.result", Decision: "allow"},
+		{ID: "audit_global", At: base.Add(2 * time.Minute), Action: "token.create", Decision: "allow"},
+	} {
+		if err := st.AppendAudit(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token := createPAT(t, handler, cookies, csrf, []string{"audit:read"}, []string{"node-a"})
+
+	defaultRes := doBearerJSON(t, handler, http.MethodGet, "/api/audit", "", token)
+	defer defaultRes.Body.Close()
+	if defaultRes.StatusCode != http.StatusOK {
+		t.Fatalf("default audit list failed: %d", defaultRes.StatusCode)
+	}
+	var defaultEvents []model.AuditEvent
+	if err := json.NewDecoder(defaultRes.Body).Decode(&defaultEvents); err != nil {
+		t.Fatal(err)
+	}
+	if len(defaultEvents) != 1 || defaultEvents[0].ID != "audit_node_a" {
+		t.Fatalf("restricted default audit events = %+v, want only node-a", defaultEvents)
+	}
+
+	queryRes := doBearerJSON(t, handler, http.MethodGet, "/api/audit?action=task.result&limit=10", "", token)
+	defer queryRes.Body.Close()
+	if queryRes.StatusCode != http.StatusOK {
+		t.Fatalf("audit query failed: %d", queryRes.StatusCode)
+	}
+	var out struct {
+		Events []model.AuditEvent `json:"events"`
+		Total  int                `json:"total"`
+	}
+	if err := json.NewDecoder(queryRes.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Total != 1 || len(out.Events) != 1 || out.Events[0].ID != "audit_node_a" {
+		t.Fatalf("restricted query audit events = %+v total=%d, want only node-a", out.Events, out.Total)
+	}
+}
+
 func TestAuditQueryRejectsInvalidPagination(t *testing.T) {
 	handler, _ := newTestServer(t)
 	cookies, _ := loginSession(t, handler)

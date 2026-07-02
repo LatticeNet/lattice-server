@@ -2568,7 +2568,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	events := s.store.AuditEvents()
+	events := visibleAuditEvents(p, s.store.AuditEvents())
 	if !auditQueryRequested(r) {
 		writeJSON(w, http.StatusOK, events)
 		return
@@ -2579,6 +2579,22 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func visibleAuditEvents(p principal, events []model.AuditEvent) []model.AuditEvent {
+	if !principalHasNodeRestriction(p) {
+		return events
+	}
+	visible := make([]model.AuditEvent, 0, len(events))
+	for _, ev := range events {
+		if ev.NodeID == "" {
+			continue
+		}
+		if rbac.Allows(p.Principal, "audit:read", ev.NodeID) {
+			visible = append(visible, ev)
+		}
+	}
+	return visible
 }
 
 const (

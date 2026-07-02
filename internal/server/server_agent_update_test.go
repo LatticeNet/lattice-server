@@ -174,6 +174,10 @@ func TestOfficialAgentReleaseHelpers(t *testing.T) {
 	if err != nil || artifact != "lattice-agent-linux-arm64" {
 		t.Fatalf("fallback linux/aarch64 artifact = %q, %v", artifact, err)
 	}
+	if _, err := agentArtifactForNode(model.Node{HostFacts: model.HostFacts{OS: "darwin", Arch: "arm64"}}); err == nil ||
+		!strings.Contains(err.Error(), "manual-only") {
+		t.Fatalf("darwin managed update should be rejected as manual-only, got %v", err)
+	}
 
 	sha, ok := shaFromSums(agentUpdateTestSHA+"  lattice-agent-linux-amd64\n", "lattice-agent-linux-amd64")
 	if !ok || sha != agentUpdateTestSHA {
@@ -197,7 +201,7 @@ func TestNormalizeAgentUpdateURLRejectsSecretBearingURLs(t *testing.T) {
 
 func TestAgentUpdatePayloadRejectsPartialExplicitArtifactPolicy(t *testing.T) {
 	srv, _, _ := newInventoryServer(t)
-	node := model.Node{ID: "node-a", HostFacts: model.HostFacts{OS: "plan9", Arch: "amd64"}}
+	node := model.Node{ID: "node-a", HostFacts: model.HostFacts{OS: "linux", Arch: "amd64"}}
 	cases := []model.AgentUpdatePolicy{
 		{
 			NodeID:        "node-a",
@@ -220,6 +224,23 @@ func TestAgentUpdatePayloadRejectsPartialExplicitArtifactPolicy(t *testing.T) {
 		if _, err := srv.agentUpdatePayloadForPolicy(node, policy); err == nil || !strings.Contains(err.Error(), "binary_url and sha256 must be provided together") {
 			t.Fatalf("partial explicit artifact policy should fail closed before official resolution, got %v", err)
 		}
+	}
+}
+
+func TestAgentUpdatePayloadRejectsNonLinuxManagedUpdates(t *testing.T) {
+	srv, _, _ := newInventoryServer(t)
+	node := model.Node{ID: "node-a", HostFacts: model.HostFacts{OS: "darwin", Arch: "arm64"}}
+	policy := model.AgentUpdatePolicy{
+		NodeID:        "node-a",
+		Enabled:       true,
+		TargetVersion: "0.2.0",
+		BinaryURL:     "https://downloads.example.com/lattice-agent-darwin-arm64",
+		SHA256:        agentUpdateTestSHA,
+		InstallPath:   defaultAgentInstallPath,
+		ServiceName:   defaultAgentServiceName,
+	}
+	if _, err := srv.agentUpdatePayloadForPolicy(node, policy); err == nil || !strings.Contains(err.Error(), "manual-only") {
+		t.Fatalf("darwin managed update should be rejected before planning, got %v", err)
 	}
 }
 

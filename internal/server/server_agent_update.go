@@ -406,6 +406,9 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 }
 
 func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.AgentUpdatePolicy) (agentUpdatePayload, error) {
+	if _, err := managedAgentUpdateOS(node); err != nil {
+		return agentUpdatePayload{}, err
+	}
 	policy.NodeID = strings.TrimSpace(policy.NodeID)
 	if policy.NodeID == "" {
 		return agentUpdatePayload{}, errors.New("agent update policy is missing node_id")
@@ -590,19 +593,9 @@ func shaFromSums(sums string, artifact string) (string, bool) {
 }
 
 func agentArtifactForNode(node model.Node) (string, error) {
-	osName := strings.ToLower(strings.TrimSpace(node.HostFacts.OS))
-	if osName == "" {
-		platform := strings.ToLower(strings.TrimSpace(node.HostFacts.Platform))
-		if strings.Contains(platform, "darwin") || strings.Contains(platform, "mac") {
-			osName = "darwin"
-		} else {
-			osName = "linux"
-		}
-	}
-	switch osName {
-	case "linux", "darwin":
-	default:
-		return "", fmt.Errorf("official lattice-agent releases do not support os %q", osName)
+	osName, err := managedAgentUpdateOS(node)
+	if err != nil {
+		return "", err
 	}
 	arch := strings.ToLower(strings.TrimSpace(node.HostFacts.Arch))
 	switch arch {
@@ -617,6 +610,26 @@ func agentArtifactForNode(node model.Node) (string, error) {
 		return "", fmt.Errorf("official lattice-agent releases do not support arch %q", arch)
 	}
 	return "lattice-agent-" + osName + "-" + arch, nil
+}
+
+func managedAgentUpdateOS(node model.Node) (string, error) {
+	osName := strings.ToLower(strings.TrimSpace(node.HostFacts.OS))
+	if osName == "" {
+		platform := strings.ToLower(strings.TrimSpace(node.HostFacts.Platform))
+		if strings.Contains(platform, "darwin") || strings.Contains(platform, "mac") {
+			osName = "darwin"
+		} else {
+			osName = "linux"
+		}
+	}
+	switch osName {
+	case "linux":
+		return osName, nil
+	case "darwin":
+		return "", errors.New("server-controlled agent updates currently require linux/systemd nodes; darwin release artifacts are manual-only")
+	default:
+		return "", fmt.Errorf("server-controlled agent updates currently require linux/systemd nodes; got os %q", osName)
+	}
 }
 
 func (s *Server) hasOpenAgentUpdateApproval(payload agentUpdatePayload) bool {

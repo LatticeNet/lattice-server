@@ -211,7 +211,10 @@ Use the compose file and deployment guide in the umbrella repository:
   `LatticeNet/lattice-node-agent`), maps the node OS/arch to
   `lattice-agent-linux-amd64` or `lattice-agent-linux-arm64`, reads the release
   `SHA256SUMS` (bounded to 512 KiB), and creates the reviewed update task with
-  the concrete URL and digest. `target_version=latest` resolves to the latest
+  the concrete URL and digest. Server-controlled updates currently require
+  Linux/systemd nodes because the reviewed task installs the binary and schedules
+  a service restart; published darwin release artifacts remain manual-update
+  artifacts. `target_version=latest` resolves to the latest
   `v*` GitHub release at plan time. `/api/nodes/agent-updates/releases` exposes
   a read-only snapshot of the current latest tag and published checksums for
   dashboard guidance; the approval plan remains authoritative because it binds

@@ -416,6 +416,10 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	if !strings.Contains(views[0].Reason, "policy changed") || !strings.Contains(views[0].Reason, "re-plan") {
 		t.Fatalf("historical stale agent update approval should expose rejection reason, got %q", views[0].Reason)
 	}
+	if !strings.Contains(views[0].Reason, "target_version planned=0.2.0 current=0.3.0") ||
+		!strings.Contains(views[0].Reason, "sha256 planned=0123456789abcdef... current=aaaaaaaaaaaaaaaa...") {
+		t.Fatalf("historical stale agent update approval should expose changed fields, got %q", views[0].Reason)
+	}
 	if !views[0].Stale || views[0].StaleCode != agentUpdateApprovalStaleCode {
 		t.Fatalf("historical stale agent update approval should expose structured stale metadata, got stale=%v code=%q", views[0].Stale, views[0].StaleCode)
 	}
@@ -589,6 +593,9 @@ func TestAgentUpdatePolicySaveRejectsPendingApproval(t *testing.T) {
 	if !ok || stored.Status != model.ApprovalRejected {
 		t.Fatalf("policy save should reject stale pending approval: ok=%v approval=%+v", ok, stored)
 	}
+	if !strings.Contains(stored.Reason, "target_version planned=0.2.0 current=0.3.0") {
+		t.Fatalf("policy save should record changed fields, got %q", stored.Reason)
+	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("policy save queued tasks: %+v", st.Tasks())
 	}
@@ -689,6 +696,9 @@ func TestAgentUpdatePolicyDeleteRejectsPendingApproval(t *testing.T) {
 	stored, ok := st.Approval(approval.ID)
 	if !ok || stored.Status != model.ApprovalRejected {
 		t.Fatalf("policy delete should reject stale pending approval: ok=%v approval=%+v", ok, stored)
+	}
+	if !strings.Contains(stored.Reason, `policy "node-a" not found`) {
+		t.Fatalf("policy delete should record missing policy detail, got %q", stored.Reason)
 	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("policy delete queued tasks: %+v", st.Tasks())

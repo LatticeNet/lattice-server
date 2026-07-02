@@ -828,7 +828,7 @@ func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction stri
 			continue
 		}
 		approval.Status = model.ApprovalRejected
-		approval.Reason = agentUpdateApprovalStaleReason
+		approval.Reason = s.agentUpdateApprovalStaleReason(approval)
 		approval.UpdatedAt = now
 		if err := s.store.UpsertApproval(approval); err != nil {
 			return err
@@ -838,7 +838,7 @@ func (s *Server) rejectSupersededAgentUpdateApprovals(nodeID, currentAction stri
 }
 
 func (s *Server) rejectAgentUpdateApproval(approval model.Approval, now time.Time) error {
-	return s.rejectAgentUpdateApprovalWithReason(approval, agentUpdateApprovalStaleReason, now)
+	return s.rejectAgentUpdateApprovalWithReason(approval, s.agentUpdateApprovalStaleReason(approval), now)
 }
 
 func (s *Server) rejectAgentUpdateApprovalWithReason(approval model.Approval, reason string, now time.Time) error {
@@ -860,8 +860,8 @@ func (s *Server) rejectLocallyStaleAgentUpdateApprovals(now time.Time) error {
 		if !agentUpdateApprovalCanAutoReject(approval, activeApprovals) {
 			continue
 		}
-		if s.isAgentUpdateApprovalLocallyStale(approval) {
-			if err := s.rejectAgentUpdateApproval(approval, now); err != nil {
+		if stale, reason := s.agentUpdateApprovalLocalStaleness(approval); stale {
+			if err := s.rejectAgentUpdateApprovalWithReason(approval, reason, now); err != nil {
 				return err
 			}
 		}
@@ -880,58 +880,93 @@ func agentUpdateApprovalCanAutoReject(approval model.Approval, activeApprovals m
 	return approval.Status == model.ApprovalApproved && !active
 }
 
-func (s *Server) isAgentUpdateApprovalLocallyStale(approval model.Approval) bool {
+func (s *Server) agentUpdateApprovalStaleReason(approval model.Approval) string {
+	_, reason := s.agentUpdateApprovalLocalStaleness(approval)
+	return reason
+}
+
+func agentUpdateApprovalStaleReasonWithDetails(details string) string {
+	details = strings.TrimSpace(details)
+	if details == "" {
+		return agentUpdateApprovalStaleReason
+	}
+	return fmt.Sprintf("%s; %s; re-plan before approving", errAgentUpdateApprovalStale.Error(), details)
+}
+
+func (s *Server) agentUpdateApprovalLocalStaleness(approval model.Approval) (bool, string) {
 	payload, err := agentUpdatePayloadFromApproval(approval)
 	if err != nil {
-		return true
+		return true, agentUpdateApprovalStaleReasonWithDetails("approval payload is invalid")
 	}
 	policy, ok := s.store.AgentUpdatePolicy(approval.NodeID)
 	if !ok || !policy.Enabled {
-		return true
+		if !ok {
+			return true, agentUpdateApprovalStaleReasonWithDetails(fmt.Sprintf("policy %q not found", approval.NodeID))
+		}
+		return true, agentUpdateApprovalStaleReasonWithDetails(fmt.Sprintf("policy %q is disabled", approval.NodeID))
 	}
 	node, ok := s.store.Node(approval.NodeID)
 	if !ok {
-		return true
+		return true, agentUpdateApprovalStaleReasonWithDetails(fmt.Sprintf("node %q not found", approval.NodeID))
 	}
 	binaryURL := strings.TrimSpace(policy.BinaryURL)
 	sha256 := strings.TrimSpace(policy.SHA256)
 	if binaryURL != "" || sha256 != "" {
 		if binaryURL == "" || sha256 == "" {
-			return true
+			return true, agentUpdateApprovalStaleReasonWithDetails("binary_url and sha256 are no longer provided together")
 		}
 		current, err := s.agentUpdatePayloadForPolicy(node, policy)
 		if err != nil {
-			return true
+			return true, agentUpdateApprovalStaleReasonWithDetails("current policy is invalid: " + err.Error())
 		}
-		return current != payload
+		if current != payload {
+			return true, agentUpdateApprovalStaleReasonWithDetails(agentUpdatePayloadChangeSummary(payload, current))
+		}
+		return false, ""
 	}
+	current := payload
+	changed := false
 	if policy.InstallPath == "" {
 		policy.InstallPath = defaultAgentInstallPath
 	}
 	if err := validateAgentInstallPath(policy.InstallPath); err != nil {
-		return true
+		return true, agentUpdateApprovalStaleReasonWithDetails("install_path is invalid: " + err.Error())
+	}
+	if policy.InstallPath != payload.InstallPath {
+		current.InstallPath = policy.InstallPath
+		changed = true
 	}
 	if policy.ServiceName == "" {
 		policy.ServiceName = defaultAgentServiceName
 	}
 	if !agentServiceRe.MatchString(policy.ServiceName) {
-		return true
+		return true, agentUpdateApprovalStaleReasonWithDetails("service_name is invalid")
 	}
-	if policy.InstallPath != payload.InstallPath || policy.ServiceName != payload.ServiceName {
-		return true
+	if policy.ServiceName != payload.ServiceName {
+		current.ServiceName = policy.ServiceName
+		changed = true
 	}
 	target, err := normalizeOfficialAgentTarget(policy.TargetVersion)
 	if err != nil {
-		return true
+		return true, agentUpdateApprovalStaleReasonWithDetails("target_version is invalid: " + err.Error())
 	}
 	if target == agentReleaseLatest {
 		resolved := strings.TrimSpace(policy.LastPlannedVersion)
 		if strings.HasPrefix(resolved, "v") {
 			resolved = strings.TrimPrefix(resolved, "v")
 		}
-		return resolved != "" && resolved != payload.TargetVersion
+		if resolved != "" && resolved != payload.TargetVersion {
+			current.TargetVersion = resolved
+			changed = true
+		}
+	} else if target != payload.TargetVersion {
+		current.TargetVersion = target
+		changed = true
 	}
-	return target != agentReleaseLatest && target != payload.TargetVersion
+	if changed {
+		return true, agentUpdateApprovalStaleReasonWithDetails(agentUpdatePayloadChangeSummary(payload, current))
+	}
+	return false, ""
 }
 
 func agentUpdateApplyScript(approval model.Approval) (string, error) {

@@ -190,6 +190,34 @@ func TestNormalizeAgentUpdateURLRejectsSecretBearingURLs(t *testing.T) {
 	}
 }
 
+func TestAgentUpdatePayloadRejectsPartialExplicitArtifactPolicy(t *testing.T) {
+	srv, _, _ := newInventoryServer(t)
+	node := model.Node{ID: "node-a", HostFacts: model.HostFacts{OS: "plan9", Arch: "amd64"}}
+	cases := []model.AgentUpdatePolicy{
+		{
+			NodeID:        "node-a",
+			Enabled:       true,
+			TargetVersion: "0.2.0",
+			BinaryURL:     "https://downloads.example.com/lattice-agent-linux-amd64",
+			InstallPath:   defaultAgentInstallPath,
+			ServiceName:   defaultAgentServiceName,
+		},
+		{
+			NodeID:        "node-a",
+			Enabled:       true,
+			TargetVersion: "0.2.0",
+			SHA256:        agentUpdateTestSHA,
+			InstallPath:   defaultAgentInstallPath,
+			ServiceName:   defaultAgentServiceName,
+		},
+	}
+	for _, policy := range cases {
+		if _, err := srv.agentUpdatePayloadForPolicy(node, policy); err == nil || !strings.Contains(err.Error(), "binary_url and sha256 must be provided together") {
+			t.Fatalf("partial explicit artifact policy should fail closed before official resolution, got %v", err)
+		}
+	}
+}
+
 func TestFetchAgentReleaseTextRejectsOversizedMetadata(t *testing.T) {
 	srv, _, _ := newInventoryServer(t)
 	metadata := strings.Repeat("x", agentReleaseMetadataLimit+1)

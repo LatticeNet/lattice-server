@@ -422,7 +422,12 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 	if !agentServiceRe.MatchString(policy.ServiceName) {
 		return agentUpdatePayload{}, errors.New("invalid service_name")
 	}
-	if strings.TrimSpace(policy.BinaryURL) != "" && strings.TrimSpace(policy.SHA256) != "" {
+	binaryRaw := strings.TrimSpace(policy.BinaryURL)
+	shaRaw := strings.TrimSpace(policy.SHA256)
+	if (binaryRaw == "") != (shaRaw == "") {
+		return agentUpdatePayload{}, errors.New("binary_url and sha256 must be provided together, or both left empty for the official release")
+	}
+	if binaryRaw != "" {
 		normalized, err := sNormalizeAgentUpdatePayload(policy)
 		if err != nil {
 			return agentUpdatePayload{}, err

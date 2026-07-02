@@ -90,6 +90,30 @@ func TestGeoRoutingCreateListPlanDelete(t *testing.T) {
 	}
 }
 
+func TestGeoRoutingAdminOnlyPATCanWriteButNotRead(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedGeoNode(t, st, "eu1", "192.0.2.1", 50.1, 8.7)
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"geo:admin"}, nil)
+
+	create := doBearerJSON(t, handler, http.MethodPost, "/api/geo-routing", `{
+		"name":"admin only",
+		"hostname":"geo.roobli.org",
+		"node_ids":["eu1"],
+		"dns_node_ids":["eu1"]
+	}`, token)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("geo:admin-only token should create geo-routing, got %d", create.StatusCode)
+	}
+
+	list := doBearerJSON(t, handler, http.MethodGet, "/api/geo-routing", "", token)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusForbidden {
+		t.Fatalf("geo:admin-only token should not read geo-routing list, got %d", list.StatusCode)
+	}
+}
+
 func TestGeoRoutingValidation(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedGeoNode(t, st, "eu1", "192.0.2.1", 50, 8)

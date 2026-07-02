@@ -48,6 +48,9 @@ func (s *Server) buildGeoInput(gr model.GeoRouting) georouting.Input {
 func (s *Server) handleGeoRoutings(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
+		if !s.requireScope(w, p, "geo:read") {
+			return
+		}
 		records := s.store.GeoRoutings()
 		writeJSON(w, http.StatusOK, map[string]any{"geo_routings": records})
 	case http.MethodPost:

@@ -152,6 +152,26 @@ func TestLogIngestCrossNodeRejected(t *testing.T) {
 	}
 }
 
+func TestLogSourceAdminOnlyPATCanWriteButNotRead(t *testing.T) {
+	handler, _ := newLogServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, _ := enrollNode(t, handler, cookies, csrf)
+	token := createPAT(t, handler, cookies, csrf, []string{"log:admin"}, []string{nodeID})
+
+	create := doBearerJSON(t, handler, http.MethodPost, "/api/logs/sources",
+		`{"name":"admin-only","node_id":"`+nodeID+`","path":"/var/log/admin-only.log"}`, token)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("log:admin-only token should create log source, got %d", create.StatusCode)
+	}
+
+	list := doBearerJSON(t, handler, http.MethodGet, "/api/logs/sources", "", token)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusForbidden {
+		t.Fatalf("log:admin-only token should not read log sources, got %d", list.StatusCode)
+	}
+}
+
 func TestLogSourcePathValidationRejectedAtCreate(t *testing.T) {
 	handler, _ := newLogServer(t)
 	cookies, csrf := loginSession(t, handler)

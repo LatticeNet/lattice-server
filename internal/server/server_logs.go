@@ -112,11 +112,14 @@ func logSourceVisibleToPrincipal(p principal, scope string, ls model.LogSource) 
 // --- operator endpoints --------------------------------------------------
 
 func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p principal) {
-	if !s.logStoreReady(w) {
-		return
-	}
 	switch r.Method {
 	case http.MethodGet:
+		if !s.requireScope(w, p, "log:read") {
+			return
+		}
+		if !s.logStoreReady(w) {
+			return
+		}
 		sources := s.store.LogSources()
 		visible := make([]model.LogSource, 0, len(sources))
 		for _, ls := range sources {
@@ -150,6 +153,9 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p prin
 			return
 		}
 		if !s.requireNodeScope(w, p, "log:admin", req.NodeID) {
+			return
+		}
+		if !s.logStoreReady(w) {
 			return
 		}
 		if _, ok := s.store.Node(req.NodeID); !ok {

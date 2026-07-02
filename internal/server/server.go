@@ -726,7 +726,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/dns/deployments/delete", s.withAuth("dns:admin", s.handleDeleteDNSDeployment))
 	mux.HandleFunc("/api/dns/plan", s.withAuth("dns:admin", s.handleDNSPlan))
 	mux.HandleFunc("/api/dns/publish", s.withAuth("dns:admin", s.handleDNSPublish))
-	mux.HandleFunc("/api/geo-routing", s.withAuth("geo:read", s.handleGeoRoutings))
+	mux.HandleFunc("/api/geo-routing", s.withAuth("", s.handleGeoRoutings))
 	mux.HandleFunc("/api/geo-routing/delete", s.withAuth("geo:admin", s.handleDeleteGeoRouting))
 	mux.HandleFunc("/api/geo-routing/plan", s.withAuth("geo:read", s.handleGeoRoutingPlan))
 	mux.HandleFunc("/api/proxy/inbounds", s.withAuth("", s.handleProxyInbounds))
@@ -749,10 +749,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/machines/delete", s.withAuth("inventory:admin", s.handleDeleteMachine))
 	mux.HandleFunc("/api/machines/renew", s.withAuth("inventory:admin", s.handleMachineRenew))
 	mux.HandleFunc("/api/machines/reminders/run", s.withAuth("inventory:admin", s.handleMachineRemindersRun))
-	mux.HandleFunc("/api/monitors", s.withAuth("monitor:read", s.handleMonitors))
+	mux.HandleFunc("/api/monitors", s.withAuth("", s.handleMonitors))
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
-	mux.HandleFunc("/api/logs/sources", s.withAuth("log:read", s.handleLogSources))
+	mux.HandleFunc("/api/logs/sources", s.withAuth("", s.handleLogSources))
 	mux.HandleFunc("/api/logs/sources/delete", s.withAuth("log:admin", s.handleDeleteLogSource))
 	mux.HandleFunc("/api/logs/query", s.withAuth("log:read", s.handleLogQuery))
 	mux.HandleFunc("/api/logs/stats", s.withAuth("log:read", s.handleLogStats))
@@ -2970,6 +2970,9 @@ func buildChannel(kind string, cfg map[string]string) (notify.Channel, error) {
 func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
+		if !s.requireScope(w, p, "monitor:read") {
+			return
+		}
 		monitors := s.store.Monitors()
 		visible := make([]model.Monitor, 0, len(monitors))
 		for _, mon := range monitors {
@@ -2979,8 +2982,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		}
 		writeJSON(w, http.StatusOK, toMonitorViews(visible))
 	case http.MethodPost:
-		if !rbac.Allows(p.Principal, "monitor:admin", "") {
-			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "missing monitor:admin"))
+		if !s.requireScope(w, p, "monitor:admin") {
 			return
 		}
 		var req model.Monitor

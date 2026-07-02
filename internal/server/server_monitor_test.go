@@ -83,6 +83,25 @@ func TestMonitorLifecycleAndAgentRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMonitorAdminOnlyPATCanWriteButNotRead(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"monitor:admin"}, nil)
+
+	create := doBearerJSON(t, handler, http.MethodPost, "/api/monitors",
+		`{"name":"admin-only","type":"tcp","target":"example.com:443","assign_all":true}`, token)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("monitor:admin-only token should create monitor, got %d", create.StatusCode)
+	}
+
+	list := doBearerJSON(t, handler, http.MethodGet, "/api/monitors", "", token)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusForbidden {
+		t.Fatalf("monitor:admin-only token should not read monitors, got %d", list.StatusCode)
+	}
+}
+
 func TestMonitorRejectsICMP(t *testing.T) {
 	handler, _ := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)

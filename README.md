@@ -145,6 +145,12 @@ Use the compose file and deployment guide in the umbrella repository:
 - Password login sends username/password as JSON over HTTPS. Do not expose the
   dashboard over remote cleartext `http://`; use TLS, secure cookies, and HSTS in
   production.
+- Set `LATTICE_REQUIRE_TOTP=1` or `-require-totp` to enforce TOTP for
+  interactive operator sessions. Password/SSO login still creates a constrained
+  session so an operator can open `/settings/security`, enroll, and activate
+  TOTP; all other session-backed APIs return the stable `mfa_required` error
+  until enrollment is complete. Bearer PAT automation is not an interactive
+  session and is not gated by this policy.
 - Container images embed the dashboard commit pinned in `dashboard.ref`;
   update that file when intentionally rolling a new dashboard into the server
   image.

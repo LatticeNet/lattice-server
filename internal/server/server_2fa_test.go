@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // doLoginFrom issues a login-family request from a specific client IP so each
@@ -209,5 +211,128 @@ func TestTwoFactorPerUserBruteForceLockout(t *testing.T) {
 	}
 	if lockedAt > 6 {
 		t.Fatalf("per-user lockout too loose: engaged only at attempt %d", lockedAt)
+	}
+}
+
+func TestRequireTOTPPolicyGatesInteractiveSessionsUntilEnrollment(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, RequireTOTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+
+	me := doJSON(t, handler, http.MethodGet, "/api/me", "", cookies, csrf)
+	defer me.Body.Close()
+	var principal struct {
+		TOTPEnabled        bool `json:"totp_enabled"`
+		MFARequired        bool `json:"mfa_required"`
+		TOTPPolicyRequired bool `json:"totp_policy_required"`
+	}
+	if err := json.NewDecoder(me.Body).Decode(&principal); err != nil {
+		t.Fatal(err)
+	}
+	if principal.TOTPEnabled || !principal.MFARequired || !principal.TOTPPolicyRequired {
+		t.Fatalf("policy state not exposed on /api/me: %+v", principal)
+	}
+
+	denied := doJSON(t, handler, http.MethodGet, "/api/nodes", "", cookies, csrf)
+	defer denied.Body.Close()
+	if denied.StatusCode != http.StatusForbidden {
+		t.Fatalf("non-setup API should be gated before TOTP activation, got %d", denied.StatusCode)
+	}
+	var deniedBody model.APIErrorResponse
+	if err := json.NewDecoder(denied.Body).Decode(&deniedBody); err != nil {
+		t.Fatal(err)
+	}
+	if deniedBody.Error.Code != model.APIErrorMFARequired {
+		t.Fatalf("gate code = %q, want %q", deniedBody.Error.Code, model.APIErrorMFARequired)
+	}
+	foundAudit := false
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "GET /api/nodes" && ev.Scope == "mfa:required" && ev.Decision == "deny" {
+			foundAudit = true
+			break
+		}
+	}
+	if !foundAudit {
+		t.Fatalf("missing mfa_required deny audit: %+v", st.AuditEvents())
+	}
+
+	enroll := doJSON(t, handler, http.MethodPost, "/api/2fa/totp/enroll", "{}", cookies, csrf)
+	var enrollment struct {
+		Secret string `json:"secret"`
+	}
+	if err := json.NewDecoder(enroll.Body).Decode(&enrollment); err != nil {
+		t.Fatal(err)
+	}
+	enroll.Body.Close()
+	if enroll.StatusCode != http.StatusOK || enrollment.Secret == "" {
+		t.Fatalf("policy must allow enrollment: status=%d enrollment=%+v", enroll.StatusCode, enrollment)
+	}
+	code, _ := auth.TOTPCodeAt(enrollment.Secret, time.Now().UTC())
+	activate := doJSON(t, handler, http.MethodPost, "/api/2fa/totp/activate", `{"code":"`+code+`"}`, cookies, csrf)
+	activate.Body.Close()
+	if activate.StatusCode != http.StatusOK {
+		t.Fatalf("policy must allow activation: %d", activate.StatusCode)
+	}
+
+	allowed := doJSON(t, handler, http.MethodGet, "/api/nodes", "", cookies, csrf)
+	allowed.Body.Close()
+	if allowed.StatusCode != http.StatusOK {
+		t.Fatalf("activated TOTP session should pass policy gate, got %d", allowed.StatusCode)
+	}
+	me = doJSON(t, handler, http.MethodGet, "/api/me", "", cookies, csrf)
+	defer me.Body.Close()
+	principal = struct {
+		TOTPEnabled        bool `json:"totp_enabled"`
+		MFARequired        bool `json:"mfa_required"`
+		TOTPPolicyRequired bool `json:"totp_policy_required"`
+	}{}
+	if err := json.NewDecoder(me.Body).Decode(&principal); err != nil {
+		t.Fatal(err)
+	}
+	if !principal.TOTPEnabled || principal.MFARequired || !principal.TOTPPolicyRequired {
+		t.Fatalf("post-activation policy state not exposed correctly: %+v", principal)
+	}
+}
+
+func TestRequireTOTPPolicyDoesNotGateBearerTokens(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, RequireTOTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, ok := st.UserByUsername("admin")
+	if !ok {
+		t.Fatal("admin user missing")
+	}
+	secret := "automation-token-secret"
+	hash, err := auth.HashSecret(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertToken(model.Token{
+		ID:        "tok_test",
+		Name:      "automation",
+		TokenHash: hash,
+		ActorID:   user.ID,
+		Scopes:    []string{"node:read"},
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res := doBearerJSON(t, srv.Handler(), http.MethodGet, "/api/nodes", "", auth.FormatToken("tok_test", secret))
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("bearer token should not be gated by interactive TOTP policy, got %d", res.StatusCode)
 	}
 }

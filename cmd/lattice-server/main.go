@@ -39,6 +39,7 @@ func main() {
 	var webRoot string
 	var secureCookies bool
 	var trustProxy bool
+	var requireTOTP bool
 	var tlsCert string
 	var tlsKey string
 	var pluginDir string
@@ -58,6 +59,7 @@ func main() {
 	flag.StringVar(&webRoot, "web", env("LATTICE_WEB_ROOT", "../lattice-dashboard"), "static dashboard root")
 	flag.BoolVar(&secureCookies, "secure-cookies", env("LATTICE_SECURE_COOKIES", "") == "1", "set Secure on session cookies (enables HSTS)")
 	flag.BoolVar(&trustProxy, "trust-proxy", env("LATTICE_TRUST_PROXY", "") == "1", "trust CF-Connecting-IP / X-Forwarded-For for client IP (only behind a trusted proxy)")
+	flag.BoolVar(&requireTOTP, "require-totp", env("LATTICE_REQUIRE_TOTP", "") == "1", "require interactive users to enable TOTP before using non-setup APIs")
 	flag.StringVar(&tlsCert, "tls-cert", os.Getenv("LATTICE_TLS_CERT"), "TLS certificate file; enables HTTPS when set with -tls-key")
 	flag.StringVar(&tlsKey, "tls-key", os.Getenv("LATTICE_TLS_KEY"), "TLS private key file")
 	flag.StringVar(&pluginDir, "plugin-dir", env("LATTICE_PLUGIN_DIR", ""), "directory of installed plugin bundles (empty disables plugins)")
@@ -151,6 +153,7 @@ func main() {
 		},
 		SecureCookies:    secureCookies,
 		TrustProxy:       trustProxy,
+		RequireTOTP:      requireTOTP,
 		PluginDir:        pluginDir,
 		PluginRuntimeDir: pluginRuntimeDir,
 		PluginRuntimeEnv: pluginRuntimeEnvAllowlist,

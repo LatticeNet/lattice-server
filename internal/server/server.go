@@ -64,6 +64,11 @@ type Options struct {
 	// sits behind a trusted reverse proxy / Cloudflare; otherwise clients can
 	// spoof the header and evade per-IP rate limiting.
 	TrustProxy bool
+	// RequireTOTP forces interactive user sessions to enable TOTP before they can
+	// use non-setup APIs. Existing password/SSO login still issues a session so
+	// the operator can enroll, but withAuth gates every other route until TOTP is
+	// active. Bearer PATs are not interactive sessions and are unaffected.
+	RequireTOTP bool
 	// PluginDir is the root directory of installed plugin bundles. Empty disables
 	// plugin loading entirely.
 	PluginDir string
@@ -116,6 +121,7 @@ type Server struct {
 	webFS         fs.FS
 	secureCookies bool
 	trustProxy    bool
+	requireTOTP   bool
 	logger        *log.Logger
 	loginLimiter  *ratelimit.Limiter
 	totpLimiter   *ratelimit.Limiter
@@ -269,6 +275,7 @@ func New(opts Options) (*Server, error) {
 		webFS:         opts.WebFS,
 		secureCookies: opts.SecureCookies,
 		trustProxy:    opts.TrustProxy,
+		requireTOTP:   opts.RequireTOTP,
 		logger:        opts.Logger,
 		// Login is intentionally strict: 5/min sustained, small burst, to slow
 		// password guessing without locking out legitimate retries.
@@ -962,6 +969,19 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 			writeError(w, http.StatusUnauthorized, err)
 			return
 		}
+		if s.mfaRequiredForPrincipal(p) && !mfaSetupAllowedPath(r.URL.Path) {
+			s.recordAudit(model.AuditEvent{
+				ID:            id.New("audit"),
+				ActorID:       p.ActorID,
+				Action:        r.Method + " " + r.URL.Path,
+				Scope:         "mfa:required",
+				Decision:      "deny",
+				Reason:        "totp enrollment required",
+				CorrelationID: p.CorrelationID,
+			})
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorMFARequired, "two-factor enrollment required"))
+			return
+		}
 		if scope != "" && !rbac.Allows(p.Principal, scope, r.URL.Query().Get("node_id")) {
 			s.recordAudit(model.AuditEvent{
 				ID:            id.New("audit"),
@@ -987,6 +1007,23 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 		}
 		next(w, r, p)
 	}
+}
+
+func mfaSetupAllowedPath(path string) bool {
+	switch path {
+	case "/api/me", "/api/logout", "/api/2fa/totp/enroll", "/api/2fa/totp/activate":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) mfaRequiredForPrincipal(p principal) bool {
+	if !s.requireTOTP || p.viaBearer || p.ActorID == "" {
+		return false
+	}
+	user, ok := s.store.User(p.ActorID)
+	return ok && !user.TOTPEnabled
 }
 
 func (s *Server) requireNodeScope(w http.ResponseWriter, p principal, scope, nodeID string) bool {
@@ -1309,7 +1346,12 @@ func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, user model
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"csrf_token": session.CSRFToken, "actor_id": user.ID})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"csrf_token":           session.CSRFToken,
+		"actor_id":             user.ID,
+		"mfa_required":         s.requireTOTP && !user.TOTPEnabled,
+		"totp_policy_required": s.requireTOTP,
+	})
 }
 
 func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request, p principal) {
@@ -1640,18 +1682,22 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principa
 
 func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 	totpEnabled := false
+	mfaRequired := false
 	username := ""
 	if u, ok := s.store.User(p.ActorID); ok {
 		totpEnabled = u.TOTPEnabled
+		mfaRequired = !p.viaBearer && s.requireTOTP && !u.TOTPEnabled
 		username = u.Username
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"actor_id":     p.ActorID,
-		"username":     username,
-		"token_id":     p.TokenID,
-		"scopes":       p.Scopes,
-		"csrf_token":   p.CSRFToken,
-		"totp_enabled": totpEnabled,
+		"actor_id":             p.ActorID,
+		"username":             username,
+		"token_id":             p.TokenID,
+		"scopes":               p.Scopes,
+		"csrf_token":           p.CSRFToken,
+		"totp_enabled":         totpEnabled,
+		"mfa_required":         mfaRequired,
+		"totp_policy_required": s.requireTOTP,
 	})
 }
 

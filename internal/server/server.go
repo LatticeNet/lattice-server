@@ -102,6 +102,10 @@ type Options struct {
 	// AuditHeadShipping periodically POSTs the verified, locally anchored audit
 	// WAL head to an operator-controlled HTTPS endpoint. Empty URL disables it.
 	AuditHeadShipping AuditHeadShippingOptions
+	// TaskExecutionDisabled is a server-side fleet kill switch. When true, new
+	// tasks are not queued and agents receive no task leases. Already leased
+	// task results are still accepted so in-flight work can report terminal state.
+	TaskExecutionDisabled bool
 	// RenewalReminderInterval controls the machine-renewal reminder scheduler.
 	// Zero uses the production default. DisableRenewalScheduler is intended for
 	// tests that need full control over reminder evaluation.
@@ -111,11 +115,12 @@ type Options struct {
 }
 
 type BuildInfo struct {
-	ServerVersion  string `json:"server_version"`
-	ServerCommit   string `json:"server_commit"`
-	ServerDate     string `json:"server_date"`
-	DashboardRef   string `json:"dashboard_ref,omitempty"`
-	DashboardBuilt string `json:"dashboard_built,omitempty"`
+	ServerVersion         string `json:"server_version"`
+	ServerCommit          string `json:"server_commit"`
+	ServerDate            string `json:"server_date"`
+	DashboardRef          string `json:"dashboard_ref,omitempty"`
+	DashboardBuilt        string `json:"dashboard_built,omitempty"`
+	TaskExecutionDisabled bool   `json:"task_execution_disabled,omitempty"`
 }
 
 type Server struct {
@@ -181,6 +186,10 @@ type Server struct {
 	// auditHeadShipper owns optional automated off-box custody for the verified
 	// audit WAL head. Nil means disabled.
 	auditHeadShipper *auditHeadShipper
+	// taskExecutionDisabled is the server-side fleet kill switch. It is process
+	// config, not persisted policy; restart with the flag/env cleared to re-enable
+	// queueing and leasing.
+	taskExecutionDisabled bool
 	// terminalBroker owns short-lived interactive terminal sessions. Sessions are
 	// intentionally in-memory only; a server restart forces operators to reopen.
 	terminalBroker *terminalBroker
@@ -236,6 +245,7 @@ const (
 	defaultTaskOutputLimit         = 64 * 1024
 	maxTaskOutputLimit             = 256 * 1024
 	maxTaskScriptBytes             = 64 * 1024
+	apiErrorTaskExecutionDisabled  = "task_execution_disabled"
 	requestIDHeader                = "X-Lattice-Request-ID"
 	nodeTokenTouchInterval         = time.Minute
 	maxAgentSourceAllowlistEntries = 64
@@ -249,6 +259,8 @@ var allowedTaskInterpreters = map[string]bool{
 	"python3": true,
 	"node":    true,
 }
+
+var errTaskExecutionDisabled = errors.New("task execution is disabled by server fleet kill switch")
 
 type principal struct {
 	rbac.Principal
@@ -279,6 +291,8 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	build := normalizeBuildInfo(opts.Build)
+	build.TaskExecutionDisabled = opts.TaskExecutionDisabled
 	s := &Server{
 		store:         opts.Store,
 		logStore:      opts.LogStore,
@@ -305,23 +319,27 @@ func New(opts Options) (*Server, error) {
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
-		oidc:             oidc.NewManager(),
-		publicURL:        strings.TrimRight(opts.PublicURL, "/"),
-		coreDNSBinary:    coreDNSBinary,
-		geoResolver:      opts.GeoResolver,
-		agentReleaseRepo: agentReleaseRepo,
-		auditHeadShipper: auditHeadShipper,
-		terminalBroker:   newTerminalBroker(),
-		terminalHub:      newTerminalHub(),
-		build:            normalizeBuildInfo(opts.Build),
-		pluginTrust:      opts.PluginTrust,
-		reminderInterval: opts.RenewalReminderInterval,
-		now:              func() time.Time { return time.Now().UTC() },
-		userLoginFail:    make(map[string]*loginFailBucket),
-		proxyDrift:       make(map[string]proxyDriftState),
+		oidc:                  oidc.NewManager(),
+		publicURL:             strings.TrimRight(opts.PublicURL, "/"),
+		coreDNSBinary:         coreDNSBinary,
+		geoResolver:           opts.GeoResolver,
+		agentReleaseRepo:      agentReleaseRepo,
+		auditHeadShipper:      auditHeadShipper,
+		taskExecutionDisabled: opts.TaskExecutionDisabled,
+		terminalBroker:        newTerminalBroker(),
+		terminalHub:           newTerminalHub(),
+		build:                 build,
+		pluginTrust:           opts.PluginTrust,
+		reminderInterval:      opts.RenewalReminderInterval,
+		now:                   func() time.Time { return time.Now().UTC() },
+		userLoginFail:         make(map[string]*loginFailBucket),
+		proxyDrift:            make(map[string]proxyDriftState),
 	}
 	if s.reminderInterval <= 0 {
 		s.reminderInterval = time.Hour
+	}
+	if s.taskExecutionDisabled {
+		s.logger.Printf("WARNING: task execution fleet kill switch is enabled; new tasks will not queue and agents will receive no task leases")
 	}
 	s.emitNotify = s.notifyEvent
 	s.pluginRPC = plugin.NewRPCRegistry()
@@ -2477,7 +2495,12 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			Status:      model.TaskQueued,
 			CreatedAt:   time.Now().UTC(),
 		}
-		if err := s.store.CreateTask(task); err != nil {
+		if err := s.queueTask(task); err != nil {
+			if errors.Is(err, errTaskExecutionDisabled) {
+				s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.create", Scope: "task:run", Decision: "deny", Reason: err.Error()})
+				writeTaskExecutionDisabled(w)
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -2599,7 +2622,12 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 		RerunOfNodeID: rerunOfNode,
 		CreatedAt:     time.Now().UTC(),
 	}
-	if err := s.store.CreateTask(task); err != nil {
+	if err := s.queueTask(task); err != nil {
+		if errors.Is(err, errTaskExecutionDisabled) {
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.rerun", Scope: "task:run", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"rerun_of": src.ID}})
+			writeTaskExecutionDisabled(w)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2653,6 +2681,17 @@ func validateTaskCreate(interpreter, script string, timeoutSec, outputLimit int)
 		return fmt.Errorf("script exceeds %d bytes", maxTaskScriptBytes)
 	}
 	return nil
+}
+
+func (s *Server) queueTask(task model.Task) error {
+	if s.taskExecutionDisabled {
+		return errTaskExecutionDisabled
+	}
+	return s.store.CreateTask(task)
+}
+
+func writeTaskExecutionDisabled(w http.ResponseWriter) {
+	writeError(w, http.StatusConflict, apiError(apiErrorTaskExecutionDisabled, errTaskExecutionDisabled.Error()))
 }
 
 type taskView struct {
@@ -4930,6 +4969,19 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 	}
+	if req.QueueApply && s.taskExecutionDisabled {
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   approval.NodeID,
+			Action:   "network." + approval.Plugin + ".approve",
+			Scope:    approvalDecisionAuditScope(approval),
+			Decision: "deny",
+			Reason:   errTaskExecutionDisabled.Error(),
+			Metadata: map[string]string{"approval_id": approval.ID},
+		})
+		writeTaskExecutionDisabled(w)
+		return
+	}
 	applyScript := ""
 	if req.QueueApply {
 		switch approval.Plugin {
@@ -4986,7 +5038,20 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			Status:      model.TaskQueued,
 			CreatedAt:   time.Now().UTC(),
 		}
-		if err := s.store.CreateTask(task); err != nil {
+		if err := s.queueTask(task); err != nil {
+			if errors.Is(err, errTaskExecutionDisabled) {
+				s.recordPrincipalAudit(p, model.AuditEvent{
+					ID:       id.New("audit"),
+					NodeID:   approval.NodeID,
+					Action:   "network." + approval.Plugin + ".approve",
+					Scope:    approvalDecisionAuditScope(approval),
+					Decision: "deny",
+					Reason:   err.Error(),
+					Metadata: map[string]string{"approval_id": approval.ID},
+				})
+				writeTaskExecutionDisabled(w)
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -5201,6 +5266,11 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	token := bearerToken(r)
 	if _, ok := s.authenticateNode(r, nodeID, token); !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
+		return
+	}
+	if s.taskExecutionDisabled {
+		w.Header().Set("X-Lattice-Task-Execution-Disabled", "1")
+		writeJSON(w, http.StatusOK, []agentTaskView{})
 		return
 	}
 	tasks, err := s.store.LeaseTasks(nodeID, 3)

@@ -71,7 +71,7 @@ func (s *Server) queueSingBoxTask(p principal, nodeID, script string) (model.Tas
 		Status:      model.TaskQueued,
 		CreatedAt:   s.now(),
 	}
-	if err := s.store.CreateTask(task); err != nil {
+	if err := s.queueTask(task); err != nil {
 		return model.Task{}, err
 	}
 	return task, nil
@@ -90,7 +90,7 @@ func (s *Server) queueSingBoxProbeTask(p principal, nodeID string) (model.Task, 
 		CreatedAt:   s.now(),
 	}
 	task.Script = buildSingBoxProbeScript(task.ID, s.nodeSBAddr(nodeID))
-	if err := s.store.CreateTask(task); err != nil {
+	if err := s.queueTask(task); err != nil {
 		return model.Task{}, err
 	}
 	return task, nil
@@ -226,6 +226,11 @@ func (s *Server) handleSingBoxManageProbe(w http.ResponseWriter, r *http.Request
 	task, err := s.queueSingBoxProbeTask(p, req.NodeID)
 	if err != nil {
 		s.pendingSingboxProbeMu.Unlock()
+		if errors.Is(err, errTaskExecutionDisabled) {
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.manage.probe", Scope: "task:run", Decision: "deny", Reason: err.Error()})
+			writeTaskExecutionDisabled(w)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -294,6 +299,11 @@ func (s *Server) handleSingBoxManageAdd(w http.ResponseWriter, r *http.Request, 
 
 	task, err := s.queueSingBoxTask(p, req.NodeID, script)
 	if err != nil {
+		if errors.Is(err, errTaskExecutionDisabled) {
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.manage.add", Scope: "task:run", Decision: "deny", Reason: err.Error()})
+			writeTaskExecutionDisabled(w)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -339,6 +349,11 @@ func (s *Server) handleSingBoxManageDelete(w http.ResponseWriter, r *http.Reques
 	script := "set -e\n" + strings.Join(parts, " ") + "\n"
 	task, err := s.queueSingBoxTask(p, req.NodeID, script)
 	if err != nil {
+		if errors.Is(err, errTaskExecutionDisabled) {
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.manage.delete", Scope: "task:run", Decision: "deny", Reason: err.Error()})
+			writeTaskExecutionDisabled(w)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

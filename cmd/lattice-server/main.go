@@ -56,6 +56,7 @@ func main() {
 	var auditHeadWebhookURL string
 	var auditHeadWebhookToken string
 	var auditHeadInterval time.Duration
+	var taskExecDisabled bool
 	var printVersion bool
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
@@ -79,6 +80,7 @@ func main() {
 	flag.StringVar(&auditHeadWebhookURL, "audit-head-webhook-url", env("LATTICE_AUDIT_HEAD_WEBHOOK_URL", ""), "HTTPS webhook URL for off-box audit WAL head shipping (empty disables)")
 	flag.StringVar(&auditHeadWebhookToken, "audit-head-webhook-token", env("LATTICE_AUDIT_HEAD_WEBHOOK_TOKEN", ""), "bearer token for -audit-head-webhook-url")
 	flag.DurationVar(&auditHeadInterval, "audit-head-interval", envDuration("LATTICE_AUDIT_HEAD_INTERVAL", 15*time.Minute), "audit head webhook shipping interval")
+	flag.BoolVar(&taskExecDisabled, "task-exec-disabled", env("LATTICE_TASK_EXEC_DISABLED", "") == "1", "server-side fleet kill switch: block new task queueing and agent task leases")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-server version and exit")
 	flag.Parse()
 	if printVersion {
@@ -173,7 +175,8 @@ func main() {
 			BearerToken: auditHeadWebhookToken,
 			Interval:    auditHeadInterval,
 		},
-		Logger: log.Default(),
+		TaskExecutionDisabled: taskExecDisabled,
+		Logger:                log.Default(),
 	})
 	if err != nil {
 		log.Fatal(err)

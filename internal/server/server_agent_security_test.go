@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func errorCodeFromRecorder(t *testing.T, rec *httptest.ResponseRecorder) string {
@@ -144,6 +146,161 @@ func TestAgentBearerAuthTouchesNodeTokenLastUsedAt(t *testing.T) {
 		}
 	}
 	t.Fatalf("node %q missing from node views: %+v", nodeID, views)
+}
+
+func TestAgentSourceAllowlistRestrictsBearerAuth(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
+
+	update := doJSON(t, handler, http.MethodPost, "/api/nodes/update", `{
+		"node_id":"`+nodeID+`",
+		"name":"Node A",
+		"agent_source_allowlist":["198.51.100.10/32"]
+	}`, cookies, csrf)
+	update.Body.Close()
+	if update.StatusCode != http.StatusOK {
+		t.Fatalf("set allowlist status = %d", update.StatusCode)
+	}
+
+	spoofed := httptest.NewRequest(http.MethodPost, "/api/agent/hello",
+		strings.NewReader(`{"node_id":"`+nodeID+`","version":"test"}`))
+	spoofed.RemoteAddr = "203.0.113.20:1234"
+	spoofed.Header.Set("Content-Type", "application/json")
+	spoofed.Header.Set("Authorization", "Bearer "+nodeToken)
+	spoofed.Header.Set("X-Forwarded-For", "198.51.100.10")
+	denied := serveReq(handler, spoofed)
+	if denied.Code != http.StatusUnauthorized {
+		t.Fatalf("spoofed source must be rejected when TrustProxy=false, got %d (%s)", denied.Code, denied.Body.String())
+	}
+	n, ok := st.Node(nodeID)
+	if !ok || !n.TokenLastUsedAt.IsZero() {
+		t.Fatalf("source-denied auth must not touch token timestamp: ok=%v node=%+v", ok, n)
+	}
+
+	allowed := httptest.NewRequest(http.MethodPost, "/api/agent/hello",
+		strings.NewReader(`{"node_id":"`+nodeID+`","version":"test"}`))
+	allowed.RemoteAddr = "198.51.100.10:1234"
+	allowed.Header.Set("Content-Type", "application/json")
+	allowed.Header.Set("Authorization", "Bearer "+nodeToken)
+	rec := serveReq(handler, allowed)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("allowed source status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	n, ok = st.Node(nodeID)
+	if !ok || n.TokenLastUsedAt.IsZero() {
+		t.Fatalf("allowed source did not touch token timestamp: ok=%v node=%+v", ok, n)
+	}
+
+	nodes := doJSON(t, handler, http.MethodGet, "/api/nodes", "", cookies, csrf)
+	defer nodes.Body.Close()
+	var views []struct {
+		ID                   string   `json:"id"`
+		AgentSourceAllowlist []string `json:"agent_source_allowlist"`
+	}
+	if err := json.NewDecoder(nodes.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	for _, view := range views {
+		if view.ID == nodeID {
+			if len(view.AgentSourceAllowlist) != 1 || view.AgentSourceAllowlist[0] != "198.51.100.10/32" {
+				t.Fatalf("node view did not expose normalized allowlist: %+v", view.AgentSourceAllowlist)
+			}
+			return
+		}
+	}
+	t.Fatalf("node %q missing from node views: %+v", nodeID, views)
+}
+
+func TestAgentSourceAllowlistCanBeSetAtEnrollment(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodPost, "/api/nodes/enroll-token", `{
+		"node_id":"node-source-bound",
+		"name":"Source Bound",
+		"agent_source_allowlist":["198.51.100.10/32"]
+	}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("enroll with allowlist status = %d", res.StatusCode)
+	}
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+
+	denied := httptest.NewRequest(http.MethodPost, "/api/agent/hello",
+		strings.NewReader(`{"node_id":"node-source-bound","version":"test"}`))
+	denied.RemoteAddr = "203.0.113.20:1234"
+	denied.Header.Set("Content-Type", "application/json")
+	denied.Header.Set("Authorization", "Bearer "+out.Token)
+	if rec := serveReq(handler, denied); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("enrolled allowlist did not deny first wrong-source auth: %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	allowed := httptest.NewRequest(http.MethodPost, "/api/agent/hello",
+		strings.NewReader(`{"node_id":"node-source-bound","version":"test"}`))
+	allowed.RemoteAddr = "198.51.100.10:1234"
+	allowed.Header.Set("Content-Type", "application/json")
+	allowed.Header.Set("Authorization", "Bearer "+out.Token)
+	if rec := serveReq(handler, allowed); rec.Code != http.StatusOK {
+		t.Fatalf("enrolled allowlist denied allowed first source: %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAgentSourceAllowlistHonorsTrustedProxyHeaders(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TrustProxy: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
+
+	update := doJSON(t, handler, http.MethodPost, "/api/nodes/update", `{
+		"node_id":"`+nodeID+`",
+		"name":"Node A",
+		"agent_source_allowlist":["198.51.100.10"]
+	}`, cookies, csrf)
+	update.Body.Close()
+	if update.StatusCode != http.StatusOK {
+		t.Fatalf("set allowlist status = %d", update.StatusCode)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/hello",
+		strings.NewReader(`{"node_id":"`+nodeID+`","version":"test"}`))
+	req.RemoteAddr = "203.0.113.20:1234"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+nodeToken)
+	req.Header.Set("X-Forwarded-For", "198.51.100.10, 203.0.113.1")
+	rec := serveReq(handler, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trusted proxy source status = %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAgentSourceAllowlistRejectsInvalidEntries(t *testing.T) {
+	if _, err := normalizeAgentSourceAllowlist([]string{"198.51.100.10", "198.51.100.0/24"}); err != nil {
+		t.Fatalf("valid allowlist rejected: %v", err)
+	}
+	for _, value := range []string{"not-an-ip", "198.51.100.0/not-bits", "https://example.com"} {
+		if _, err := normalizeAgentSourceAllowlist([]string{value}); err == nil {
+			t.Fatalf("invalid allowlist entry %q accepted", value)
+		}
+	}
+	tooMany := make([]string, 0, maxAgentSourceAllowlistEntries+1)
+	for i := 0; i <= maxAgentSourceAllowlistEntries; i++ {
+		tooMany = append(tooMany, fmt.Sprintf("198.51.100.%d", i))
+	}
+	if _, err := normalizeAgentSourceAllowlist(tooMany); err == nil {
+		t.Fatal("oversized allowlist accepted")
+	}
 }
 
 func TestAgentPostEndpointsRejectBodyTokenWithoutBearer(t *testing.T) {

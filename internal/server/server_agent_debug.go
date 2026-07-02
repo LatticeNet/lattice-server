@@ -87,7 +87,7 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
-	node, ok := s.authenticateNode(nodeID, bearerToken(r))
+	node, ok := s.authenticateNode(r, nodeID, bearerToken(r))
 	if !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return

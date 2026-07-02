@@ -154,7 +154,11 @@ Use the compose file and deployment guide in the umbrella repository:
   logs, traces, or failure captures. Successful node-token authentication
   updates `token_last_used_at` on the node record with a short write-throttle,
   giving operators lifecycle telemetry without turning every poll into a full
-  state-file rewrite.
+  state-file rewrite. Nodes may also set `agent_source_allowlist` with exact IPs
+  or CIDR prefixes; the token is then accepted only from those sources. Direct
+  deployments use the socket remote address, while `CF-Connecting-IP` /
+  `X-Forwarded-For` are honored only when the server is explicitly configured
+  with `TrustProxy`.
 - Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
   advisory telemetry only. They are sanitized and clamped server-side and must
   not be used for authorization or policy decisions.

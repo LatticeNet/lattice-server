@@ -262,7 +262,7 @@ func keepAliveLeg(c *websocketx.Conn, stop <-chan struct{}) {
 // foreign node.
 func (s *Server) handleAgentTerminalStream(w http.ResponseWriter, r *http.Request) {
 	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
-	if _, ok := s.authenticateNode(nodeID, bearerToken(r)); !ok {
+	if _, ok := s.authenticateNode(r, nodeID, bearerToken(r)); !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}

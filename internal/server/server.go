@@ -219,13 +219,14 @@ type Server struct {
 }
 
 const (
-	defaultTaskTimeoutSec  = 30
-	maxTaskTimeoutSec      = 10 * 60
-	defaultTaskOutputLimit = 64 * 1024
-	maxTaskOutputLimit     = 256 * 1024
-	maxTaskScriptBytes     = 64 * 1024
-	requestIDHeader        = "X-Lattice-Request-ID"
-	nodeTokenTouchInterval = time.Minute
+	defaultTaskTimeoutSec          = 30
+	maxTaskTimeoutSec              = 10 * 60
+	defaultTaskOutputLimit         = 64 * 1024
+	maxTaskOutputLimit             = 256 * 1024
+	maxTaskScriptBytes             = 64 * 1024
+	requestIDHeader                = "X-Lattice-Request-ID"
+	nodeTokenTouchInterval         = time.Minute
+	maxAgentSourceAllowlistEntries = 64
 	// maxTOTPChallengeAttempts burns a 2FA challenge after this many failed codes.
 	maxTOTPChallengeAttempts = 5
 )
@@ -1655,33 +1656,34 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 }
 
 type nodeView struct {
-	ID                 string                   `json:"id"`
-	Name               string                   `json:"name"`
-	Comment            string                   `json:"comment,omitempty"`
-	Tags               []string                 `json:"tags"`
-	Role               string                   `json:"role"`
-	WireGuardIP        string                   `json:"wireguard_ip"`
-	WireGuardPublicKey string                   `json:"wireguard_public_key,omitempty"`
-	WireGuardEndpoint  string                   `json:"wireguard_endpoint,omitempty"`
-	WireGuardPort      int                      `json:"wireguard_port,omitempty"`
-	PublicIP           string                   `json:"public_ip"`
-	PublicIPv6         string                   `json:"public_ipv6,omitempty"`
-	InternalIP         string                   `json:"internal_ip,omitempty"`
-	InternalIPv6       string                   `json:"internal_ipv6,omitempty"`
-	AgentVersion       string                   `json:"agent_version"`
-	Online             bool                     `json:"online"`
-	Disabled           bool                     `json:"disabled,omitempty"`
-	TokenLastUsedAt    time.Time                `json:"token_last_used_at,omitempty"`
-	LastSeen           time.Time                `json:"last_seen"`
-	Metrics            model.Metrics            `json:"metrics"`
-	HostFacts          model.HostFacts          `json:"host_facts"`
-	Geo                *model.NodeGeo           `json:"geo,omitempty"`
-	AgentDebug         model.AgentDebugPolicy   `json:"agent_debug"`
-	AgentLaunch        *model.AgentLaunchConfig `json:"agent_launch,omitempty"`
-	AgentRuntime       *agentRuntimeConfig      `json:"agent_runtime,omitempty"`
-	IPConfig           *model.NodeIPConfig      `json:"ip_config,omitempty"`
-	GroupIDs           []string                 `json:"group_ids,omitempty"`
-	CreatedAt          time.Time                `json:"created_at"`
+	ID                   string                   `json:"id"`
+	Name                 string                   `json:"name"`
+	Comment              string                   `json:"comment,omitempty"`
+	Tags                 []string                 `json:"tags"`
+	Role                 string                   `json:"role"`
+	WireGuardIP          string                   `json:"wireguard_ip"`
+	WireGuardPublicKey   string                   `json:"wireguard_public_key,omitempty"`
+	WireGuardEndpoint    string                   `json:"wireguard_endpoint,omitempty"`
+	WireGuardPort        int                      `json:"wireguard_port,omitempty"`
+	PublicIP             string                   `json:"public_ip"`
+	PublicIPv6           string                   `json:"public_ipv6,omitempty"`
+	InternalIP           string                   `json:"internal_ip,omitempty"`
+	InternalIPv6         string                   `json:"internal_ipv6,omitempty"`
+	AgentVersion         string                   `json:"agent_version"`
+	Online               bool                     `json:"online"`
+	Disabled             bool                     `json:"disabled,omitempty"`
+	AgentSourceAllowlist []string                 `json:"agent_source_allowlist,omitempty"`
+	TokenLastUsedAt      time.Time                `json:"token_last_used_at,omitempty"`
+	LastSeen             time.Time                `json:"last_seen"`
+	Metrics              model.Metrics            `json:"metrics"`
+	HostFacts            model.HostFacts          `json:"host_facts"`
+	Geo                  *model.NodeGeo           `json:"geo,omitempty"`
+	AgentDebug           model.AgentDebugPolicy   `json:"agent_debug"`
+	AgentLaunch          *model.AgentLaunchConfig `json:"agent_launch,omitempty"`
+	AgentRuntime         *agentRuntimeConfig      `json:"agent_runtime,omitempty"`
+	IPConfig             *model.NodeIPConfig      `json:"ip_config,omitempty"`
+	GroupIDs             []string                 `json:"group_ids,omitempty"`
+	CreatedAt            time.Time                `json:"created_at"`
 }
 
 type agentRuntimeConfig struct {
@@ -1707,7 +1709,7 @@ func (s *Server) toNodeView(n model.Node) nodeView {
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
-		Online: n.Online, Disabled: n.Disabled, TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
+		Online: n.Online, Disabled: n.Disabled, AgentSourceAllowlist: append([]string(nil), n.AgentSourceAllowlist...), TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
 		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }
@@ -1737,6 +1739,66 @@ func normalizeNodeTags(tags []string) []string {
 	return cleaned
 }
 
+func normalizeAgentSourceAllowlist(values []string) ([]string, error) {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		normalized := ""
+		if strings.Contains(value, "/") {
+			prefix, err := netip.ParsePrefix(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid agent_source_allowlist entry %q", value)
+			}
+			normalized = prefix.Masked().String()
+		} else {
+			addr, err := netip.ParseAddr(value)
+			if err != nil {
+				return nil, fmt.Errorf("invalid agent_source_allowlist entry %q", value)
+			}
+			normalized = addr.Unmap().String()
+		}
+		if seen[normalized] {
+			continue
+		}
+		if len(out) >= maxAgentSourceAllowlistEntries {
+			return nil, fmt.Errorf("agent_source_allowlist must contain at most %d entries", maxAgentSourceAllowlistEntries)
+		}
+		seen[normalized] = true
+		out = append(out, normalized)
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func agentSourceAllowed(allowlist []string, source string) bool {
+	if len(allowlist) == 0 {
+		return true
+	}
+	addr, err := netip.ParseAddr(strings.TrimSpace(source))
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, entry := range allowlist {
+		if strings.Contains(entry, "/") {
+			prefix, err := netip.ParsePrefix(entry)
+			if err == nil && prefix.Contains(addr) {
+				return true
+			}
+			continue
+		}
+		allowed, err := netip.ParseAddr(entry)
+		if err == nil && allowed.Unmap() == addr {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -1762,13 +1824,14 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		NodeID      string                  `json:"node_id"`
-		Name        string                  `json:"name"`
-		Comment     string                  `json:"comment"`
-		Tags        []string                `json:"tags"`
-		Role        string                  `json:"role"`
-		WireGuardIP string                  `json:"wireguard_ip"`
-		AgentLaunch model.AgentLaunchConfig `json:"agent_launch"`
+		NodeID               string                  `json:"node_id"`
+		Name                 string                  `json:"name"`
+		Comment              string                  `json:"comment"`
+		Tags                 []string                `json:"tags"`
+		Role                 string                  `json:"role"`
+		WireGuardIP          string                  `json:"wireguard_ip"`
+		AgentSourceAllowlist []string                `json:"agent_source_allowlist"`
+		AgentLaunch          model.AgentLaunchConfig `json:"agent_launch"`
 		// GroupIDs assigns the freshly enrolled node into one or more existing
 		// groups by appending it to each group's explicit Members (the canonical
 		// membership). It is optional and idempotent; unknown group ids are
@@ -1821,6 +1884,11 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	if req.Name == "" {
 		req.Name = req.NodeID
 	}
+	agentSourceAllowlist, err := normalizeAgentSourceAllowlist(req.AgentSourceAllowlist)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	launch := normalizeAgentLaunchConfig(req.AgentLaunch)
 	launch.UpdatedAt = time.Now().UTC()
 	token, err := auth.NewRandomToken(32)
@@ -1834,15 +1902,16 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	n := model.Node{
-		ID:          req.NodeID,
-		Name:        req.Name,
-		Comment:     strings.TrimSpace(req.Comment),
-		TokenHash:   hash,
-		Tags:        normalizeNodeTags(req.Tags),
-		Role:        strings.TrimSpace(req.Role),
-		WireGuardIP: req.WireGuardIP,
-		AgentLaunch: &launch,
-		CreatedAt:   time.Now().UTC(),
+		ID:                   req.NodeID,
+		Name:                 req.Name,
+		Comment:              strings.TrimSpace(req.Comment),
+		TokenHash:            hash,
+		Tags:                 normalizeNodeTags(req.Tags),
+		Role:                 strings.TrimSpace(req.Role),
+		WireGuardIP:          req.WireGuardIP,
+		AgentSourceAllowlist: agentSourceAllowlist,
+		AgentLaunch:          &launch,
+		CreatedAt:            time.Now().UTC(),
 	}
 	if err := s.store.UpsertNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -2211,11 +2280,12 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		NodeID  string   `json:"node_id"`
-		Name    string   `json:"name"`
-		Role    string   `json:"role"`
-		Comment string   `json:"comment"`
-		Tags    []string `json:"tags"`
+		NodeID               string    `json:"node_id"`
+		Name                 string    `json:"name"`
+		Role                 string    `json:"role"`
+		Comment              string    `json:"comment"`
+		Tags                 []string  `json:"tags"`
+		AgentSourceAllowlist *[]string `json:"agent_source_allowlist"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -2227,12 +2297,22 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 	if !s.requireNodeScope(w, p, "node:admin", req.NodeID) {
 		return
 	}
+	var agentSourceAllowlist *[]string
+	if req.AgentSourceAllowlist != nil {
+		normalized, err := normalizeAgentSourceAllowlist(*req.AgentSourceAllowlist)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		agentSourceAllowlist = &normalized
+	}
 	node, ok, err := s.store.UpdateNodeMeta(
 		req.NodeID,
 		strings.TrimSpace(req.Name),
 		strings.TrimSpace(req.Role),
 		strings.TrimSpace(req.Comment),
 		req.Tags,
+		agentSourceAllowlist,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -2243,7 +2323,7 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.update", Scope: "node:admin"})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "comment": node.Comment, "tags": node.Tags})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "comment": node.Comment, "tags": node.Tags, "agent_source_allowlist": append([]string{}, node.AgentSourceAllowlist...)})
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal) {
@@ -3118,7 +3198,7 @@ func monitorManageableByPrincipal(p principal, mon model.Monitor) bool {
 // handleAgentMonitors returns the monitors an authenticated agent should run.
 func (s *Server) handleAgentMonitors(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("node_id")
-	if _, ok := s.authenticateNode(nodeID, bearerToken(r)); !ok {
+	if _, ok := s.authenticateNode(r, nodeID, bearerToken(r)); !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
@@ -5018,7 +5098,7 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	// Token must arrive in the Authorization header only. Accepting it from the
 	// query string would leak the credential into access logs and proxy caches.
 	token := bearerToken(r)
-	if _, ok := s.authenticateNode(nodeID, token); !ok {
+	if _, ok := s.authenticateNode(r, nodeID, token); !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
@@ -5444,7 +5524,7 @@ func validateWireGuardIP(value string) error {
 	return nil
 }
 
-func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {
+func (s *Server) authenticateNode(r *http.Request, nodeID, token string) (model.Node, bool) {
 	if nodeID == "" || token == "" {
 		return model.Node{}, false
 	}
@@ -5456,6 +5536,18 @@ func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {
 		return model.Node{}, false
 	}
 	if !auth.VerifySecret(n.TokenHash, token) {
+		return model.Node{}, false
+	}
+	sourceIP := s.clientIP(r)
+	if !agentSourceAllowed(n.AgentSourceAllowlist, sourceIP) {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   nodeID,
+			Action:   "agent.auth",
+			Decision: "deny",
+			Reason:   "agent source ip denied",
+			Metadata: map[string]string{"source_ip": sourceIP},
+		})
 		return model.Node{}, false
 	}
 	touchedAt := s.now().UTC()
@@ -5470,7 +5562,7 @@ func (s *Server) authenticateNode(nodeID, token string) (model.Node, bool) {
 func (s *Server) authenticateAgentRequest(r *http.Request, nodeID string) (model.Node, bool) {
 	// Agent credentials are accepted only from Authorization. JSON body tokens
 	// are easy to leak through logs, traces, and failed request captures.
-	return s.authenticateNode(nodeID, bearerToken(r))
+	return s.authenticateNode(r, nodeID, bearerToken(r))
 }
 
 func (s *Server) securityHeaders(next http.Handler) http.Handler {

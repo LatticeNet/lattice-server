@@ -414,7 +414,7 @@ func (s *Server) handleLogStats(w http.ResponseWriter, r *http.Request, p princi
 
 func (s *Server) handleAgentLogSources(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("node_id")
-	if _, ok := s.authenticateNode(nodeID, bearerToken(r)); !ok {
+	if _, ok := s.authenticateNode(r, nodeID, bearerToken(r)); !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}

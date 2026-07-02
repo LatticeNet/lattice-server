@@ -665,12 +665,13 @@ func (s *Store) MarkStaleNodesOffline(threshold time.Duration, now time.Time) ([
 	return flipped, nil
 }
 
-// UpdateNodeMeta sets the operator-owned node identity fields (name, role,
-// comment, tags)
-// in one locked read-modify-write so it cannot clobber concurrently-reported
-// metrics/last-seen. Tags are trimmed, de-duplicated, and empties dropped.
-// Returns the updated node and whether it existed.
-func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string) (model.Node, bool, error) {
+// UpdateNodeMeta sets the operator-owned node identity fields and optional
+// agent source allowlist in one locked read-modify-write so it cannot clobber
+// concurrently-reported metrics/last-seen. Tags are trimmed, de-duplicated, and
+// empties dropped. A nil agentSourceAllowlist leaves that policy unchanged;
+// non-nil replaces it, including an empty slice to clear it. Returns the updated
+// node and whether it existed.
+func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string, agentSourceAllowlist *[]string) (model.Node, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, ok := s.state.Nodes[nodeID]
@@ -692,6 +693,9 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string
 	}
 	sort.Strings(cleaned)
 	n.Tags = cleaned
+	if agentSourceAllowlist != nil {
+		n.AgentSourceAllowlist = append([]string(nil), (*agentSourceAllowlist)...)
+	}
 	s.state.Nodes[nodeID] = n
 	if err := s.Save(); err != nil {
 		return model.Node{}, true, err

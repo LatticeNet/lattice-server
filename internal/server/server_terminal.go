@@ -765,7 +765,7 @@ func (s *Server) handleAgentTerminalSessions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	nodeID := r.URL.Query().Get("node_id")
-	if _, ok := s.authenticateNode(nodeID, bearerToken(r)); !ok {
+	if _, ok := s.authenticateNode(r, nodeID, bearerToken(r)); !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
@@ -786,7 +786,7 @@ func (s *Server) handleAgentTerminalSessionPath(w http.ResponseWriter, r *http.R
 			return
 		}
 		nodeID := r.URL.Query().Get("node_id")
-		if _, ok := s.authenticateNode(nodeID, bearerToken(r)); !ok {
+		if _, ok := s.authenticateNode(r, nodeID, bearerToken(r)); !ok {
 			writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 			return
 		}

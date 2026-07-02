@@ -705,8 +705,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/plugins/verify", s.withAuth("plugin:verify", s.handlePluginVerify))
 	mux.HandleFunc("/api/plugins/invoke", s.withAuth("plugin:admin", s.handlePluginInvoke))
 	mux.HandleFunc("/api/plugins/call", s.withAuth("", s.handlePluginCall))
-	mux.HandleFunc("/api/kv", s.withAuth("kv:read", s.handleKV))
-	mux.HandleFunc("/api/static", s.withAuth("static:read", s.handleStatic))
+	mux.HandleFunc("/api/kv", s.withAuth("", s.handleKV))
+	mux.HandleFunc("/api/static", s.withAuth("", s.handleStatic))
 	mux.HandleFunc("/api/storage/buckets", s.withAuth("", s.handleStorageBuckets))
 	mux.HandleFunc("/api/storage/bindings", s.withAuth("", s.handleStorageBindings))
 	mux.HandleFunc("/api/storage/bindings/delete", s.withAuth("", s.handleDeleteStorageBinding))
@@ -2745,10 +2745,12 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 	}
 	switch r.Method {
 	case http.MethodGet:
+		if !s.requireScope(w, p, "kv:read") {
+			return
+		}
 		writeJSON(w, http.StatusOK, s.store.KV(bucket))
 	case http.MethodPost:
-		if !rbac.Allows(p.Principal, "kv:write", "") {
-			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "missing kv:write"))
+		if !s.requireScope(w, p, "kv:write") {
 			return
 		}
 		var req struct {
@@ -2793,10 +2795,12 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 	}
 	switch r.Method {
 	case http.MethodGet:
+		if !s.requireScope(w, p, "static:read") {
+			return
+		}
 		writeJSON(w, http.StatusOK, s.store.Static(bucket))
 	case http.MethodPost:
-		if !rbac.Allows(p.Principal, "static:write", "") {
-			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "missing static:write"))
+		if !s.requireScope(w, p, "static:write") {
 			return
 		}
 		var req struct {

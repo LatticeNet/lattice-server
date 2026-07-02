@@ -831,6 +831,37 @@ func TestCapabilityDenialUsesStableErrorCode(t *testing.T) {
 	}
 }
 
+func TestStorageWriteOnlyPATCanWriteButNotRead(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+
+	kvWriter := createPAT(t, handler, cookies, csrf, []string{"kv:write"}, nil)
+	kvPut := doBearerJSON(t, handler, http.MethodPost, "/api/kv",
+		`{"bucket":"default","key":"writer-only","value":"ok"}`, kvWriter)
+	defer kvPut.Body.Close()
+	if kvPut.StatusCode != http.StatusOK {
+		t.Fatalf("kv:write-only token should write KV, got %d", kvPut.StatusCode)
+	}
+	kvGet := doBearerJSON(t, handler, http.MethodGet, "/api/kv?bucket=default", "", kvWriter)
+	defer kvGet.Body.Close()
+	if kvGet.StatusCode != http.StatusForbidden {
+		t.Fatalf("kv:write-only token should not read KV, got %d", kvGet.StatusCode)
+	}
+
+	staticWriter := createPAT(t, handler, cookies, csrf, []string{"static:write"}, nil)
+	staticPut := doBearerJSON(t, handler, http.MethodPost, "/api/static",
+		`{"bucket":"site","path":"index.html","content":"ok","content_type":"text/plain"}`, staticWriter)
+	defer staticPut.Body.Close()
+	if staticPut.StatusCode != http.StatusOK {
+		t.Fatalf("static:write-only token should write static object, got %d", staticPut.StatusCode)
+	}
+	staticGet := doBearerJSON(t, handler, http.MethodGet, "/api/static?bucket=site", "", staticWriter)
+	defer staticGet.Body.Close()
+	if staticGet.StatusCode != http.StatusForbidden {
+		t.Fatalf("static:write-only token should not read static objects, got %d", staticGet.StatusCode)
+	}
+}
+
 // Admin (scope "*") can create a task: the previously-buggy static:write gate
 // is gone, so task:run alone (via the route) is sufficient.
 func TestTaskCreateNoLongerRequiresStaticWrite(t *testing.T) {

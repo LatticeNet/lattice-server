@@ -176,6 +176,34 @@ func TestOfficialAgentReleaseHelpers(t *testing.T) {
 	}
 }
 
+func TestNormalizeAgentUpdateURLRejectsSecretBearingURLs(t *testing.T) {
+	cases := []string{
+		"https://downloads.example.com/lattice-agent?token=secret",
+		"https://downloads.example.com/lattice-agent?",
+		"https://user:pass@downloads.example.com/lattice-agent",
+		"https://downloads.example.com/lattice-agent#fragment",
+	}
+	for _, raw := range cases {
+		if _, err := normalizeAgentUpdateURL(raw); err == nil {
+			t.Fatalf("normalizeAgentUpdateURL(%q) should reject secret-bearing URL parts", raw)
+		}
+	}
+}
+
+func TestFetchAgentReleaseTextRejectsOversizedMetadata(t *testing.T) {
+	srv, _, _ := newInventoryServer(t)
+	metadata := strings.Repeat("x", agentReleaseMetadataLimit+1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(metadata))
+	}))
+	defer upstream.Close()
+
+	_, err := srv.fetchAgentReleaseText(upstream.URL)
+	if err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("oversized release metadata should be rejected, got %v", err)
+	}
+}
+
 func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

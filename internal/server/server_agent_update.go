@@ -23,11 +23,12 @@ const (
 	agentUpdateAction       = "update-agent"
 	agentUpdateActionPrefix = agentUpdateAction + ":"
 
-	defaultAgentInstallPath = "/opt/lattice/lattice-agent"
-	defaultAgentServiceName = "lattice-agent.service"
-	legacyAgentInstallPath  = "/usr/local/bin/lattice-agent"
-	defaultAgentReleaseRepo = "LatticeNet/lattice-node-agent"
-	agentReleaseLatest      = "latest"
+	defaultAgentInstallPath   = "/opt/lattice/lattice-agent"
+	defaultAgentServiceName   = "lattice-agent.service"
+	legacyAgentInstallPath    = "/usr/local/bin/lattice-agent"
+	defaultAgentReleaseRepo   = "LatticeNet/lattice-node-agent"
+	agentReleaseLatest        = "latest"
+	agentReleaseMetadataLimit = 512 * 1024
 )
 
 var (
@@ -297,6 +298,9 @@ func normalizeAgentUpdateURL(raw string) (string, error) {
 	if u.User != nil {
 		return "", errors.New("binary_url must not contain userinfo")
 	}
+	if u.RawQuery != "" || u.ForceQuery {
+		return "", errors.New("binary_url must not contain a query")
+	}
 	if u.Fragment != "" {
 		return "", errors.New("binary_url must not contain a fragment")
 	}
@@ -557,9 +561,12 @@ func (s *Server) fetchAgentReleaseText(rawURL string) (string, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("fetch agent release metadata: %s", resp.Status)
 	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, agentReleaseMetadataLimit+1))
 	if err != nil {
 		return "", err
+	}
+	if len(data) > agentReleaseMetadataLimit {
+		return "", fmt.Errorf("fetch agent release metadata: response exceeds %d bytes", agentReleaseMetadataLimit)
 	}
 	return string(data), nil
 }

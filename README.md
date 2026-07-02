@@ -172,17 +172,20 @@ Use the compose file and deployment guide in the umbrella repository:
   set it to an internal HTTPS template containing `{ip}`. Automatically resolved
   NodeGeo is marked `source=auto` and manual saves are marked `source=operator`.
 - Node-agent update policies have two modes. Legacy policies may pin an explicit
-  HTTPS binary URL and SHA-256 digest. The dashboard's primary node detail UI
+  HTTPS binary URL and SHA-256 digest; the URL must not contain userinfo, query
+  parameters, or fragments because the reviewed approval plan displays it. The
+  dashboard's primary node detail UI
   uses the official-release mode by leaving `binary_url` and `sha256` empty:
   the server resolves `LATTICE_AGENT_RELEASE_REPO` (default
   `LatticeNet/lattice-node-agent`), maps the node OS/arch to
   `lattice-agent-linux-amd64` or `lattice-agent-linux-arm64`, reads the release
-  `SHA256SUMS`, and creates the reviewed update task with the concrete URL and
-  digest. `target_version=latest` resolves to the latest `v*` GitHub release at
-  plan time. `/api/nodes/agent-updates/releases` exposes a read-only snapshot of
-  the current latest tag and published checksums for dashboard guidance; the
-  approval plan remains authoritative because it binds the concrete URL and
-  SHA-256 server-side. Editing or deleting a policy closes pending and
+  `SHA256SUMS` (bounded to 512 KiB), and creates the reviewed update task with
+  the concrete URL and digest. `target_version=latest` resolves to the latest
+  `v*` GitHub release at plan time. `/api/nodes/agent-updates/releases` exposes
+  a read-only snapshot of the current latest tag and published checksums for
+  dashboard guidance; the approval plan remains authoritative because it binds
+  the concrete URL and SHA-256 server-side. Editing or deleting a policy closes
+  pending and
   approved-without-active-task update approvals for that node; active queued or
   leased update tasks remain in flight until their task result closes the
   approval. If a node already reports the current target before a pending update

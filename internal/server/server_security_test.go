@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1005,6 +1006,31 @@ func TestPATCreateUseAndRevoke(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Result().StatusCode != http.StatusUnauthorized {
 		t.Fatalf("revoked token must be rejected, got %d", rec.Result().StatusCode)
+	}
+}
+
+func TestMeExposesBearerServerAllowlist(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"node:read"}, []string{"node-a", "node-b"})
+
+	res := doBearerJSON(t, handler, http.MethodGet, "/api/me", "", token)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("/api/me failed: %d", res.StatusCode)
+	}
+	var principal struct {
+		TokenID         string   `json:"token_id"`
+		ServerAllowlist []string `json:"server_allowlist"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&principal); err != nil {
+		t.Fatal(err)
+	}
+	if principal.TokenID == "" {
+		t.Fatal("bearer principal did not expose token_id")
+	}
+	if !reflect.DeepEqual(principal.ServerAllowlist, []string{"node-a", "node-b"}) {
+		t.Fatalf("server_allowlist = %#v", principal.ServerAllowlist)
 	}
 }
 

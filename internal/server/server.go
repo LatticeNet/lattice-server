@@ -1721,11 +1721,13 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 		mfaRequired = !p.viaBearer && s.requireTOTP && !u.TOTPEnabled
 		username = u.Username
 	}
+	serverAllowlist := append([]string{}, p.ServerAllowlist...)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"actor_id":             p.ActorID,
 		"username":             username,
 		"token_id":             p.TokenID,
 		"scopes":               p.Scopes,
+		"server_allowlist":     serverAllowlist,
 		"csrf_token":           p.CSRFToken,
 		"totp_enabled":         totpEnabled,
 		"mfa_required":         mfaRequired,

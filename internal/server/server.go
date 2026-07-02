@@ -99,6 +99,9 @@ type Options struct {
 	// AgentReleaseRepo is the trusted GitHub repository used by the simplified
 	// node-agent update UX. Empty uses LatticeNet/lattice-node-agent.
 	AgentReleaseRepo string
+	// AuditHeadShipping periodically POSTs the verified, locally anchored audit
+	// WAL head to an operator-controlled HTTPS endpoint. Empty URL disables it.
+	AuditHeadShipping AuditHeadShippingOptions
 	// RenewalReminderInterval controls the machine-renewal reminder scheduler.
 	// Zero uses the production default. DisableRenewalScheduler is intended for
 	// tests that need full control over reminder evaluation.
@@ -175,6 +178,9 @@ type Server struct {
 	// agentReleaseRepo is constrained to owner/repo and used only to construct
 	// GitHub release URLs for the first-party node-agent update resolver.
 	agentReleaseRepo string
+	// auditHeadShipper owns optional automated off-box custody for the verified
+	// audit WAL head. Nil means disabled.
+	auditHeadShipper *auditHeadShipper
 	// terminalBroker owns short-lived interactive terminal sessions. Sessions are
 	// intentionally in-memory only; a server restart forces operators to reopen.
 	terminalBroker *terminalBroker
@@ -269,6 +275,10 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	auditHeadShipper, err := newAuditHeadShipper(opts.Store, opts.Logger, opts.AuditHeadShipping)
+	if err != nil {
+		return nil, err
+	}
 	s := &Server{
 		store:         opts.Store,
 		logStore:      opts.LogStore,
@@ -300,6 +310,7 @@ func New(opts Options) (*Server, error) {
 		coreDNSBinary:    coreDNSBinary,
 		geoResolver:      opts.GeoResolver,
 		agentReleaseRepo: agentReleaseRepo,
+		auditHeadShipper: auditHeadShipper,
 		terminalBroker:   newTerminalBroker(),
 		terminalHub:      newTerminalHub(),
 		build:            normalizeBuildInfo(opts.Build),
@@ -344,6 +355,9 @@ func New(opts Options) (*Server, error) {
 	if !opts.DisableRenewalScheduler {
 		s.startRenewalScheduler()
 		s.startNodeLivenessSweeper()
+	}
+	if s.auditHeadShipper != nil {
+		s.auditHeadShipper.start()
 	}
 	s.startTerminalReaper()
 	return s, nil

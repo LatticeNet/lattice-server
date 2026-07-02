@@ -53,6 +53,9 @@ func main() {
 	var coreDNSSHA256 string
 	var geoIPLookupURL string
 	var agentReleaseRepo string
+	var auditHeadWebhookURL string
+	var auditHeadWebhookToken string
+	var auditHeadInterval time.Duration
 	var printVersion bool
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
@@ -73,6 +76,9 @@ func main() {
 	flag.StringVar(&coreDNSSHA256, "coredns-binary-sha256", env("LATTICE_COREDNS_BINARY_SHA256", ""), "SHA-256 hex digest of the CoreDNS executable binary")
 	flag.StringVar(&geoIPLookupURL, "geoip-lookup-url", env("LATTICE_GEOIP_LOOKUP_URL", geoip.DefaultLookupURL), "HTTPS GeoIP lookup URL template containing {ip}; set off/none/disabled to disable automatic node geolocation")
 	flag.StringVar(&agentReleaseRepo, "agent-release-repo", env("LATTICE_AGENT_RELEASE_REPO", ""), "trusted GitHub owner/repo for official lattice-agent releases")
+	flag.StringVar(&auditHeadWebhookURL, "audit-head-webhook-url", env("LATTICE_AUDIT_HEAD_WEBHOOK_URL", ""), "HTTPS webhook URL for off-box audit WAL head shipping (empty disables)")
+	flag.StringVar(&auditHeadWebhookToken, "audit-head-webhook-token", env("LATTICE_AUDIT_HEAD_WEBHOOK_TOKEN", ""), "bearer token for -audit-head-webhook-url")
+	flag.DurationVar(&auditHeadInterval, "audit-head-interval", envDuration("LATTICE_AUDIT_HEAD_INTERVAL", 15*time.Minute), "audit head webhook shipping interval")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-server version and exit")
 	flag.Parse()
 	if printVersion {
@@ -162,7 +168,12 @@ func main() {
 		CoreDNSBinary:    selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
 		GeoResolver:      geoResolver,
 		AgentReleaseRepo: agentReleaseRepo,
-		Logger:           log.Default(),
+		AuditHeadShipping: server.AuditHeadShippingOptions{
+			URL:         auditHeadWebhookURL,
+			BearerToken: auditHeadWebhookToken,
+			Interval:    auditHeadInterval,
+		},
+		Logger: log.Default(),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -204,6 +215,18 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Fatalf("invalid %s duration %q: %v", key, raw, err)
+	}
+	return d
 }
 
 func parseEnvAllowlist(raw string) ([]string, error) {

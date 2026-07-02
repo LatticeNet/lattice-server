@@ -76,6 +76,24 @@ response must be JSON with common `country_code`, `region`, `city`,
 `latitude`/`longitude`, and optional ASN/provider fields. Manual map coordinates
 work even when automatic lookup is disabled.
 
+Audit WAL head custody can be automated with an HTTPS webhook. The server ships
+only a verified, locally anchored head; failed verification, a missing committed
+anchor, HTTP failures, or SSRF/egress-guard blocks are logged and do not block
+normal API traffic:
+
+```sh
+LATTICE_AUDIT_HEAD_WEBHOOK_URL='https://audit-archive.example.com/lattice/head' \
+LATTICE_AUDIT_HEAD_WEBHOOK_TOKEN='opaque-bearer-token' \
+LATTICE_AUDIT_HEAD_INTERVAL=15m \
+go run ./cmd/lattice-server
+```
+
+The webhook URL must be HTTPS and must not contain userinfo, query, or fragment
+secrets. Outbound delivery uses the same guarded HTTP client as operator
+webhooks: local, private, link-local, metadata, special-use targets, and guarded
+redirects are blocked. The receiver is responsible for immutable retention and
+rollback alerts.
+
 ## Build
 
 From the organization workspace:
@@ -398,7 +416,8 @@ Use the compose file and deployment guide in the umbrella repository:
 - The default server store is still the encrypted JSON state file plus the
   append-only hash-chained audit WAL (`<state>.audit-wal`) and a local sidecar
   head anchor (`<state>.audit-anchor`) that detects end-truncation on open and
-  through `/api/audit/verify`.
+  through `/api/audit/verify`. Configure `LATTICE_AUDIT_HEAD_WEBHOOK_URL` to
+  periodically ship the verified anchored head to an HTTPS off-box archive.
 - `internal/store.BoltStateStore` is the Phase C bbolt foundation. It can import
   and export the full `State`, stores each top-level collection in its own
   bucket, reuses the existing AES-256-GCM secret encryption boundary, and now

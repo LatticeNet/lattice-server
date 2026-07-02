@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -41,10 +43,11 @@ var subStoreClient = &http.Client{Timeout: 15 * time.Second}
 // local subscription in the Sub-Store backend at baseURL. Returns the number of
 // links pushed.
 func (s *Server) importToSubStore(ctx context.Context, baseURL, subName, userID string) (int, error) {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	if baseURL == "" {
-		return 0, errors.New("sub-store base url is required")
+	normalizedBaseURL, err := normalizeSubStoreBaseURL(baseURL)
+	if err != nil {
+		return 0, err
 	}
+	baseURL = normalizedBaseURL
 	if subName == "" {
 		subName = defaultSubStoreSubName
 	}
@@ -124,7 +127,7 @@ func (s *Server) handleSubStoreImport(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if !s.requireScope(w, p, "proxy:admin") {
+	if !s.requireGlobalProxyScope(w, p, "proxy:admin") {
 		return
 	}
 	var req struct {
@@ -139,9 +142,14 @@ func (s *Server) handleSubStoreImport(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusBadRequest, errors.New("base_url is required"))
 		return
 	}
+	baseURL, err := normalizeSubStoreBaseURL(req.BaseURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	pushed, err := s.importToSubStore(ctx, req.BaseURL, req.SubName, req.UserID)
+	pushed, err := s.importToSubStore(ctx, baseURL, req.SubName, req.UserID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -155,12 +163,16 @@ func (s *Server) handleSubStoreImport(w http.ResponseWriter, r *http.Request, p 
 }
 
 func (s *Server) handleSubStoreStatus(w http.ResponseWriter, r *http.Request, p principal) {
-	if !s.requireScope(w, p, "proxy:read") {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	baseURL := strings.TrimRight(strings.TrimSpace(r.URL.Query().Get("base_url")), "/")
-	if baseURL == "" {
-		writeError(w, http.StatusBadRequest, errors.New("base_url is required"))
+	if !s.requireGlobalProxyScope(w, p, "proxy:read") {
+		return
+	}
+	baseURL, err := normalizeSubStoreBaseURL(r.URL.Query().Get("base_url"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
@@ -168,4 +180,68 @@ func (s *Server) handleSubStoreStatus(w http.ResponseWriter, r *http.Request, p 
 	status, err := subStoreDo(ctx, http.MethodGet, baseURL+"/api/utils/env", nil)
 	reachable := err == nil && status >= 200 && status < 500
 	writeJSON(w, http.StatusOK, map[string]any{"reachable": reachable, "sub_name": defaultSubStoreSubName})
+}
+
+func normalizeSubStoreBaseURL(value string) (string, error) {
+	raw := strings.TrimSpace(value)
+	if raw == "" {
+		return "", errors.New("base_url is required")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" {
+		return "", errors.New("base_url must be an absolute http(s) URL")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return "", errors.New("base_url must use http or https")
+	}
+	if parsed.Host == "" {
+		return "", errors.New("base_url must be an absolute http(s) URL")
+	}
+	if parsed.User != nil {
+		return "", errors.New("base_url must not include credentials")
+	}
+	if strings.EqualFold(parsed.Scheme, "http") && !isSubStoreLoopbackHost(parsed.Hostname()) {
+		return "", errors.New("base_url may use http only for localhost or loopback; use https for remote Sub-Store backends")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("base_url must not include query or fragment")
+	}
+	if parsed.Path == "" || parsed.Path == "/" {
+		return "", errors.New("base_url must include the Sub-Store secret path")
+	}
+	hasSecretPathSegment := false
+	for _, segment := range strings.Split(parsed.Path, "/") {
+		switch segment {
+		case "":
+			continue
+		case ".", "..":
+			return "", errors.New("base_url path must not contain dot segments")
+		default:
+			hasSecretPathSegment = true
+		}
+	}
+	if !hasSecretPathSegment {
+		return "", errors.New("base_url must include the Sub-Store secret path")
+	}
+	if parsed.Hostname() == "" {
+		return "", errors.New("base_url must include a host")
+	}
+	if port := parsed.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", errors.New("base_url port is invalid")
+		}
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func isSubStoreLoopbackHost(host string) bool {
+	h := strings.TrimSpace(strings.ToLower(host))
+	if h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
 }

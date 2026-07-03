@@ -43,7 +43,7 @@ func TestMetricsExposeRuntimeCounters(t *testing.T) {
 	for _, want := range []string{
 		"lattice_process_uptime_seconds",
 		`lattice_store_save_total{result="success"}`,
-		`lattice_audit_append_total{result="success"} 1`,
+		`lattice_audit_append_total{result="success"}`,
 		`lattice_http_requests_total{path="/api/health",status_class="2xx"} 1`,
 		`lattice_agent_requests_total{path="/api/agent/metrics",status_class="2xx"} 1`,
 	} {

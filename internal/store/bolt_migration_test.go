@@ -17,6 +17,8 @@ func seedMigrationState(now time.Time) State {
 	st.DDNS["d1"] = model.DDNSProfile{ID: "d1", Name: "dns", Provider: "cloudflare", CFAPIToken: cfTokenPlain}
 	st.NotifyChannels["ch1"] = model.NotifyChannel{ID: "ch1", Name: "tg", Kind: "telegram", Config: map[string]string{"bot_token": botTokenPlain}}
 	st.OIDCProviders["oidc"] = model.OIDCProvider{ID: "oidc", DisplayName: "OIDC", ClientID: "client-id", ClientSecret: "oidc-secret", CreatedAt: now}
+	st.Groups["grp1"] = model.Group{ID: "grp1", Name: "Edge", Slug: "edge", Color: "sky", Members: []string{"node-a"}, CreatedAt: now}
+	st.GroupPolicies["gnp1"] = model.GroupNetPolicy{ID: "gnp1", ScopeGroupID: "grp1", Enabled: true, Priority: 10, Rules: []model.GroupNetRule{{ID: "rule1", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: []int{443}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}, CreatedAt: now}
 	st.Audit = []model.AuditEvent{{ID: "audit-1", At: now, Action: "migration.test", Decision: "allow"}}
 	return st
 }
@@ -65,6 +67,9 @@ func TestMigrateJSONToBoltAndExportBack(t *testing.T) {
 	if got.Users["u1"].TOTPSecret != totpPlain || got.DDNS["d1"].CFAPIToken != cfTokenPlain || got.OIDCProviders["oidc"].ClientSecret != "oidc-secret" {
 		t.Fatalf("migrated state did not decrypt correctly: %+v %+v %+v", got.Users["u1"], got.DDNS["d1"], got.OIDCProviders["oidc"])
 	}
+	if got.Groups["grp1"].Members[0] != "node-a" || got.GroupPolicies["gnp1"].Rules[0].Ports[0] != 443 {
+		t.Fatalf("migrated group state did not recover: %+v %+v", got.Groups["grp1"], got.GroupPolicies["gnp1"])
+	}
 
 	if err := ExportBoltToJSON(boltPath, exportPath, c, MigrationOptions{}); err != nil {
 		t.Fatal(err)
@@ -80,7 +85,7 @@ func TestMigrateJSONToBoltAndExportBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if back.Nodes["node-a"].Name != "Node A" || len(back.Audit) != 1 || back.NotifyChannels["ch1"].Config["bot_token"] != botTokenPlain {
+	if back.Nodes["node-a"].Name != "Node A" || len(back.Audit) != 1 || back.NotifyChannels["ch1"].Config["bot_token"] != botTokenPlain || back.Groups["grp1"].Name != "Edge" || back.GroupPolicies["gnp1"].ScopeGroupID != "grp1" {
 		t.Fatalf("exported JSON did not round-trip: %+v", back)
 	}
 }

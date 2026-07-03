@@ -29,6 +29,8 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	st.NFTInputs["n1"] = model.NFTInputs{ID: "n1", NodeID: "n1", InterfaceName: "ens3", WireGuardCIDR: "10.66.0.0/24", PublicTCP: []int{80, 443}, PublicUDP: []int{53}}
 	st.DNSDeployments["dns1"] = model.DNSDeployment{ID: "dns1", Name: "private dns", NodeID: "n1", Engine: model.DNSEngineCoreDNS, ListenPort: 53, EnableUDP: true, Exposure: model.DNSExposureMesh, Zones: []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}}, Hostname: "n1.dns.example.com", CFAPIToken: dnsCFTokenPlain, Status: model.DNSStatusPending, CreatedAt: now}
 	st.NetPolicies["n1"] = model.NetPolicy{ID: "n1", TargetNodeID: "n1", Enabled: true, Rules: []model.NetRule{{ID: "r1", Action: model.NetRuleDeny, Direction: model.NetDirEgress, Protocol: model.NetProtoTCP, Ports: []int{1234}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}}
+	st.Groups["grp1"] = model.Group{ID: "grp1", Name: "Edge", Slug: "edge", Color: "sky", Members: []string{"n1"}, Selector: &model.GroupSelector{MatchTagsAny: []string{"edge"}}, CreatedAt: now}
+	st.GroupPolicies["gnp1"] = model.GroupNetPolicy{ID: "gnp1", ScopeGroupID: "grp1", Enabled: true, Priority: 10, Rules: []model.GroupNetRule{{ID: "gr1", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: []int{443}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}, CreatedAt: now}
 	st.ProxyInbounds["pin1"] = model.ProxyInbound{ID: "pin1", Name: "vless reality", Core: model.ProxyCoreSingbox, Protocol: model.ProxyProtocolVLESS, Transport: model.ProxyTransportTCP, Security: model.ProxySecurityReality, Port: 443, RealityPrivateKey: proxyRealityPrivateKeyPlain, RealityPublicKey: "pub", Enabled: true, CreatedAt: now}
 	st.ProxyUsers["pu1"] = model.ProxyUser{ID: "pu1", Name: "alice", Enabled: true, UUID: proxyUUIDPlain, Password: proxyPasswordPlain, SubToken: proxySubTokenPlain, InboundIDs: []string{"pin1"}, Status: model.ProxyUserStatusActive, CreatedAt: now}
 	st.ProxyProfiles["n1"] = model.ProxyNodeProfile{ID: "n1", NodeID: "n1", Core: model.ProxyCoreSingbox, InboundIDs: []string{"pin1"}, Hostname: "n1.dns.example.com", CreatedAt: now}
@@ -90,6 +92,12 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	if got.NetPolicies["n1"].Rules[0].Ports[0] != 1234 {
 		t.Fatalf("net policy not recovered: %+v", got.NetPolicies["n1"])
 	}
+	if got.Groups["grp1"].Members[0] != "n1" || got.Groups["grp1"].Selector.MatchTagsAny[0] != "edge" {
+		t.Fatalf("group not recovered: %+v", got.Groups["grp1"])
+	}
+	if got.GroupPolicies["gnp1"].ScopeGroupID != "grp1" || got.GroupPolicies["gnp1"].Rules[0].Ports[0] != 443 {
+		t.Fatalf("group policy not recovered: %+v", got.GroupPolicies["gnp1"])
+	}
 	if got.ProxyInbounds["pin1"].RealityPrivateKey != proxyRealityPrivateKeyPlain || got.ProxyInbounds["pin1"].Port != 443 {
 		t.Fatalf("proxy inbound not recovered/decrypted: %+v", got.ProxyInbounds["pin1"])
 	}
@@ -116,6 +124,62 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	}
 	if len(got.MonResults["m1"]) != 1 || got.MonResults["m1"][0].MonitorID != "m1" {
 		t.Fatalf("monitor results not recovered: %+v", got.MonResults)
+	}
+}
+
+func TestBoltStateGroupCRUDAndDeleteGuards(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	bs, err := OpenBoltState(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+
+	root := model.Group{ID: "grp-root", Name: "Root", Slug: "root", Color: "sky", Members: []string{"node-a"}}
+	child := model.Group{ID: "grp-child", Name: "Child", Slug: "child", Color: "violet", ParentID: root.ID}
+	policy := model.GroupNetPolicy{
+		ID:           "gnp-root",
+		ScopeGroupID: root.ID,
+		Enabled:      true,
+		Rules: []model.GroupNetRule{{
+			ID:        "rule-a",
+			Action:    model.NetRuleAllow,
+			Direction: model.NetDirEgress,
+			Protocol:  model.NetProtoTCP,
+			Ports:     []int{443},
+			Remote:    model.NetEndpoint{Kind: model.NetRefAny},
+		}},
+	}
+	if err := bs.UpsertGroup(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertGroup(child); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.UpsertGroupPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteGroup(root.ID); err == nil || !strings.Contains(err.Error(), "child group") {
+		t.Fatalf("expected child guard, got %v", err)
+	}
+	if err := bs.DeleteGroup(child.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteGroup(root.ID); err == nil || !strings.Contains(err.Error(), "group policy") {
+		t.Fatalf("expected group policy guard, got %v", err)
+	}
+	if err := bs.DeleteGroupPolicy(policy.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.DeleteGroup(root.ID); err != nil {
+		t.Fatal(err)
+	}
+	groups, err := bs.Groups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 0 {
+		t.Fatalf("expected groups to be deleted, got %+v", groups)
 	}
 }
 

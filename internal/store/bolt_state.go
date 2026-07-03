@@ -49,6 +49,8 @@ var (
 	boltBucketNFTInputs       = []byte("nft_inputs")
 	boltBucketDNSDeployments  = []byte("dns_deployments")
 	boltBucketNetPolicies     = []byte("net_policies")
+	boltBucketGroups          = []byte("groups")
+	boltBucketGroupPolicies   = []byte("group_policies")
 	boltBucketGeoRouting      = []byte("geo_routing")
 	boltBucketAgentUpdates    = []byte("agent_updates")
 	boltBucketProxyInbounds   = []byte("proxy_inbounds")
@@ -88,6 +90,8 @@ var boltStateBuckets = [][]byte{
 	boltBucketNFTInputs,
 	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
+	boltBucketGroups,
+	boltBucketGroupPolicies,
 	boltBucketGeoRouting,
 	boltBucketAgentUpdates,
 	boltBucketProxyInbounds,
@@ -260,6 +264,12 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketNetPolicies, persist.NetPolicies); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketGroups, persist.Groups); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketGroupPolicies, persist.GroupPolicies); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketGeoRouting, persist.GeoRouting); err != nil {
 			return err
 		}
@@ -394,6 +404,12 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketNetPolicies, st.NetPolicies); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketGroups, st.Groups); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketGroupPolicies, st.GroupPolicies); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketGeoRouting, st.GeoRouting); err != nil {
@@ -1918,6 +1934,155 @@ func (bs *BoltStateStore) DeleteNetPolicy(nodeID string) error {
 			return err
 		}
 		return deleteRecord(tx, boltBucketNetPolicies, nodeID)
+	})
+}
+
+func (bs *BoltStateStore) UpsertGroup(g model.Group) error {
+	g.UpdatedAt = time.Now().UTC()
+	if g.CreatedAt.IsZero() {
+		g.CreatedAt = g.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketGroups, g.ID, cloneGroup(g))
+	})
+}
+
+func (bs *BoltStateStore) Group(id string) (model.Group, bool, error) {
+	var out model.Group
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketGroups, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out = cloneGroup(out)
+		return nil
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) Groups() ([]model.Group, error) {
+	groups := []model.Group{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		groups, err = listMapValues[model.Group](tx, boltBucketGroups)
+		if err != nil {
+			return err
+		}
+		for i := range groups {
+			groups[i] = cloneGroup(groups[i])
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].ID < groups[j].ID })
+	return groups, nil
+}
+
+func (bs *BoltStateStore) DeleteGroup(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var existing model.Group
+		ok, err := getRecord(tx, boltBucketGroups, id, &existing)
+		if err != nil || !ok {
+			return err
+		}
+		groups, err := listMapValues[model.Group](tx, boltBucketGroups)
+		if err != nil {
+			return err
+		}
+		for _, child := range groups {
+			if child.ParentID == id {
+				return fmt.Errorf("group %q has child group %q; reparent or delete children first", id, child.ID)
+			}
+		}
+		policies, err := listMapValues[model.GroupNetPolicy](tx, boltBucketGroupPolicies)
+		if err != nil {
+			return err
+		}
+		for _, gp := range policies {
+			if gp.ScopeGroupID == id {
+				return fmt.Errorf("group %q is referenced by group policy %q; delete the policy first", id, gp.ID)
+			}
+		}
+		return deleteRecord(tx, boltBucketGroups, id)
+	})
+}
+
+func (bs *BoltStateStore) UpsertGroupPolicy(p model.GroupNetPolicy) error {
+	p.UpdatedAt = time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketGroupPolicies, p.ID, cloneGroupPolicy(p))
+	})
+}
+
+func (bs *BoltStateStore) GroupPolicy(id string) (model.GroupNetPolicy, bool, error) {
+	var out model.GroupNetPolicy
+	var ok bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketGroupPolicies, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		out = cloneGroupPolicy(out)
+		return nil
+	})
+	return out, ok, err
+}
+
+func (bs *BoltStateStore) GroupPolicies() ([]model.GroupNetPolicy, error) {
+	policies := []model.GroupNetPolicy{}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		policies, err = listMapValues[model.GroupNetPolicy](tx, boltBucketGroupPolicies)
+		if err != nil {
+			return err
+		}
+		for i := range policies {
+			policies[i] = cloneGroupPolicy(policies[i])
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(policies, func(i, j int) bool { return policies[i].ID < policies[j].ID })
+	return policies, nil
+}
+
+func (bs *BoltStateStore) DeleteGroupPolicy(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketGroupPolicies, id)
 	})
 }
 

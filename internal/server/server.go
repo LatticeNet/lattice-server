@@ -5653,16 +5653,49 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 }
 
 func taskFailureSummary(result model.TaskResult) string {
-	switch {
-	case strings.TrimSpace(result.Error) != "":
-		return truncateMetadataValue(result.Error, 240)
-	case strings.TrimSpace(result.Stderr) != "":
-		return truncateMetadataValue(result.Stderr, 240)
-	case result.ExitCode != 0:
-		return fmt.Sprintf("task exited with code %d", result.ExitCode)
-	default:
+	parts := make([]string, 0, 4)
+	if msg := normalizeTaskResultText(result.Error); msg != "" {
+		parts = append(parts, "error="+taskResultTail(msg, 320))
+	}
+	if result.ExitCode != 0 {
+		parts = append(parts, fmt.Sprintf("exit_code=%d", result.ExitCode))
+	}
+	if msg := normalizeTaskResultText(result.Stderr); msg != "" {
+		parts = append(parts, "stderr="+taskResultTail(msg, 640))
+	}
+	if msg := normalizeTaskResultText(result.Stdout); msg != "" {
+		parts = append(parts, "stdout="+taskResultTail(msg, 640))
+	}
+	if len(parts) == 0 {
 		return "task failed"
 	}
+	return truncateMetadataValue(strings.Join(parts, "; "), 1600)
+}
+
+func normalizeTaskResultText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = strings.Map(func(r rune) rune {
+		if r < 32 && r != '\n' && r != '\r' && r != '\t' {
+			return -1
+		}
+		return r
+	}, value)
+	return strings.Join(strings.Fields(value), " ")
+}
+
+func taskResultTail(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || value == "" {
+		return value
+	}
+	runes := []rune(value)
+	if len(runes) <= max {
+		return value
+	}
+	return "..." + string(runes[len(runes)-max:])
 }
 
 func (s *Server) rejectApprovalWithReason(approval model.Approval, reason string) error {

@@ -1105,7 +1105,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 			Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
 		})
 	} else {
-		policy.LastError = boundedTaskError(result)
+		policy.LastError = taskFailureSummary(result)
 		approval.Status = model.ApprovalRejected
 		approval.Reason = policy.LastError
 		s.recordRequestAudit(r, model.AuditEvent{
@@ -1180,25 +1180,4 @@ func (s *Server) reconcileAgentUpdateHeartbeat(r *http.Request, nodeID, version 
 		})
 	}
 	return nil
-}
-
-func boundedTaskError(result model.TaskResult) string {
-	msg := strings.TrimSpace(result.Error)
-	if msg == "" {
-		msg = strings.TrimSpace(result.Stderr)
-	}
-	if msg == "" && result.ExitCode != 0 {
-		msg = fmt.Sprintf("exit code %d", result.ExitCode)
-	}
-	msg = strings.Map(func(r rune) rune {
-		if r < 32 && r != '\t' {
-			return -1
-		}
-		return r
-	}, msg)
-	const max = 512
-	if len([]rune(msg)) > max {
-		return string([]rune(msg)[:max])
-	}
-	return msg
 }

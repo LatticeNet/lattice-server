@@ -87,3 +87,23 @@ func TestApprovalTaskFailureClosesApprovalWithReason(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskFailureSummaryIncludesDebugOutput(t *testing.T) {
+	result := model.TaskResult{
+		ExitCode: 1,
+		Error:    "exit status 1",
+		Stderr:   "line one\npermission denied while moving binary",
+		Stdout:   "lattice agent update: downloaded candidate",
+	}
+	summary := taskFailureSummary(result)
+	for _, want := range []string{
+		"error=exit status 1",
+		"exit_code=1",
+		"stderr=line one permission denied while moving binary",
+		"stdout=lattice agent update: downloaded candidate",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Fatalf("summary missing %q: %q", want, summary)
+		}
+	}
+}

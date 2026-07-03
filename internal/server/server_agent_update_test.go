@@ -406,6 +406,8 @@ func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 	if err := srv.handleAgentUpdateTaskResult(httptest.NewRequest(http.MethodPost, "/api/agent/task-result", nil), approval, model.TaskResult{
 		NodeID:     "node-a",
 		ExitCode:   1,
+		Error:      "exit status 1",
+		Stdout:     "lattice agent update: downloading official binary",
 		Stderr:     "download failed",
 		FinishedAt: now.Add(time.Minute),
 	}); err != nil {
@@ -418,8 +420,11 @@ func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 	if !strings.Contains(failedApproval.Reason, "download failed") {
 		t.Fatalf("failed update approval should expose failure reason, got %q", failedApproval.Reason)
 	}
+	if !strings.Contains(failedApproval.Reason, "error=exit status 1") || !strings.Contains(failedApproval.Reason, "exit_code=1") {
+		t.Fatalf("failed update approval should expose error and exit code, got %q", failedApproval.Reason)
+	}
 	policy, ok := st.AgentUpdatePolicy("node-a")
-	if !ok || !strings.Contains(policy.LastError, "download failed") {
+	if !ok || !strings.Contains(policy.LastError, "download failed") || !strings.Contains(policy.LastError, "stdout=lattice agent update") {
 		t.Fatalf("policy should retain bounded failure reason: ok=%v policy=%+v", ok, policy)
 	}
 	srv.evaluateAgentUpdatePolicies(now.Add(2 * time.Hour))

@@ -813,6 +813,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/logs/stats", s.withAuth("log:read", s.handleLogStats))
 	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
+	mux.HandleFunc("/api/tokens/delete", s.withAuth("token:admin", s.handleDeleteToken))
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
 	mux.HandleFunc("/api/network/nft/inputs", s.withAuth("network:plan", s.handleNFTInputs))
 	mux.HandleFunc("/api/network/nft/inputs/delete", s.withAuth("network:plan", s.handleDeleteNFTInputs))
@@ -4278,6 +4279,39 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request, p pri
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.revoke", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
 	writeJSON(w, http.StatusOK, toTokenView(tok))
+}
+
+func (s *Server) handleDeleteToken(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		TokenID string `json:"token_id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	tok, ok := s.store.Token(req.TokenID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("token not found"))
+		return
+	}
+	if tok.RevokedAt.IsZero() {
+		writeError(w, http.StatusConflict, errors.New("token must be revoked before deletion"))
+		return
+	}
+	deleted, ok, err := s.store.DeleteToken(tok.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("token not found"))
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.delete", Scope: "token:admin", Metadata: map[string]string{"token_id": deleted.ID}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p principal) {

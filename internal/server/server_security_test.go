@@ -542,6 +542,14 @@ func TestRemainingPrivilegedAllowAuditsUseRequestID(t *testing.T) {
 	}
 	assertResponseAuditCorrelation(t, st, tokenRevoke, "token.revoke", "token:admin")
 
+	tokenDelete := doJSON(t, handler, http.MethodPost, "/api/tokens/delete",
+		string(mustJSON(t, map[string]string{"token_id": tokenOut.ID})), cookies, csrf)
+	tokenDelete.Body.Close()
+	if tokenDelete.StatusCode != http.StatusOK {
+		t.Fatalf("token delete failed: %d", tokenDelete.StatusCode)
+	}
+	assertResponseAuditCorrelation(t, st, tokenDelete, "token.delete", "token:admin")
+
 	tunnelCreate := doJSON(t, handler, http.MethodPost, "/api/tunnels",
 		`{"name":"audit-delete-tunnel","node_id":"audit-node","tunnel_id":"tun-delete","ingress":[{"hostname":"delete.example.com","service":"http://localhost:8088"}]}`, cookies, csrf)
 	if tunnelCreate.StatusCode != http.StatusOK {
@@ -996,6 +1004,14 @@ func TestPATCreateUseAndRevoke(t *testing.T) {
 		t.Fatalf("bearer without task:run should be forbidden, got %d", rec.Result().StatusCode)
 	}
 
+	// Delete is a cleanup action only: active credentials must be revoked first.
+	delActive := doJSON(t, handler, http.MethodPost, "/api/tokens/delete",
+		`{"token_id":"`+created.ID+`"}`, cookies, csrf)
+	delActive.Body.Close()
+	if delActive.StatusCode != http.StatusConflict {
+		t.Fatalf("active token delete should conflict, got %d", delActive.StatusCode)
+	}
+
 	// Revoke, then the same token must be rejected.
 	rev := doJSON(t, handler, http.MethodPost, "/api/tokens/revoke",
 		`{"token_id":"`+created.ID+`"}`, cookies, csrf)
@@ -1006,6 +1022,28 @@ func TestPATCreateUseAndRevoke(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Result().StatusCode != http.StatusUnauthorized {
 		t.Fatalf("revoked token must be rejected, got %d", rec.Result().StatusCode)
+	}
+
+	delRevoked := doJSON(t, handler, http.MethodPost, "/api/tokens/delete",
+		`{"token_id":"`+created.ID+`"}`, cookies, csrf)
+	delRevoked.Body.Close()
+	if delRevoked.StatusCode != http.StatusOK {
+		t.Fatalf("revoked token delete failed: %d", delRevoked.StatusCode)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/tokens", "", cookies, "")
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("token list failed after delete: %d", list.StatusCode)
+	}
+	var views []tokenView
+	if err := json.NewDecoder(list.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	for _, view := range views {
+		if view.ID == created.ID {
+			t.Fatal("deleted token still appears in token list")
+		}
 	}
 }
 

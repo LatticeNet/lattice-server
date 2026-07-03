@@ -1427,6 +1427,23 @@ func (bs *BoltStateStore) Tokens() ([]model.Token, error) {
 	return tokens, err
 }
 
+func (bs *BoltStateStore) DeleteToken(id string) (model.Token, bool, error) {
+	var out model.Token
+	var ok bool
+	err := bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var err error
+		ok, err = getRecord(tx, boltBucketTokens, id, &out)
+		if err != nil || !ok {
+			return err
+		}
+		return deleteRecord(tx, boltBucketTokens, id)
+	})
+	return out, ok, err
+}
+
 func (bs *BoltStateStore) PutSession(sess auth.Session) error {
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {

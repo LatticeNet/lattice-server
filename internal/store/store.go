@@ -654,6 +654,19 @@ func (s *Store) Tokens() []model.Token {
 	return out
 }
 
+// DeleteToken removes a revoked API token by id. Active tokens must be revoked
+// first by the caller so cleanup cannot accidentally invalidate live automation.
+func (s *Store) DeleteToken(id string) (model.Token, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.Tokens[id]
+	if !ok {
+		return model.Token{}, false, nil
+	}
+	delete(s.state.Tokens, id)
+	return t, true, s.Save()
+}
+
 // Users returns all operator user records (for the user-management admin API).
 // Callers must project to a secret-free view before serializing.
 func (s *Store) Users() []model.User {

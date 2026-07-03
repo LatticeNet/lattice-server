@@ -174,6 +174,39 @@ func TestAgentUpdateAutoPlanDoesNotDuplicatePendingApproval(t *testing.T) {
 	}
 }
 
+func TestAgentUpdateManualPlanReturnsExistingEquivalentApproval(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.2.0")
+
+	first := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first plan failed: %d", first.StatusCode)
+	}
+	var firstApproval approvalView
+	if err := json.NewDecoder(first.Body).Decode(&firstApproval); err != nil {
+		t.Fatal(err)
+	}
+	first.Body.Close()
+
+	second := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("second plan should return existing approval, got %d", second.StatusCode)
+	}
+	var secondApproval approvalView
+	if err := json.NewDecoder(second.Body).Decode(&secondApproval); err != nil {
+		t.Fatal(err)
+	}
+	second.Body.Close()
+	if secondApproval.ID != firstApproval.ID {
+		t.Fatalf("second plan should reuse existing approval %s, got %s", firstApproval.ID, secondApproval.ID)
+	}
+	if approvals := st.Approvals(); len(approvals) != 1 {
+		t.Fatalf("reusing existing approval should not create duplicates: %+v", approvals)
+	}
+}
+
 func TestOfficialAgentReleaseHelpers(t *testing.T) {
 	target, err := normalizeOfficialAgentTarget("")
 	if err != nil || target != agentReleaseLatest {

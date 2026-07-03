@@ -362,8 +362,8 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 	if err := s.rejectSupersededAgentUpdateApprovals(nodeID, currentAction, now); err != nil {
 		return model.Approval{}, err
 	}
-	if s.hasOpenAgentUpdateApproval(payload) {
-		return model.Approval{}, errors.New("an equivalent agent update approval is already open")
+	if approval, ok := s.openAgentUpdateApproval(payload); ok {
+		return approval, nil
 	}
 	plan := renderAgentUpdatePlan(node, payload, mode)
 	approval := model.Approval{
@@ -632,17 +632,17 @@ func managedAgentUpdateOS(node model.Node) (string, error) {
 	}
 }
 
-func (s *Server) hasOpenAgentUpdateApproval(payload agentUpdatePayload) bool {
+func (s *Server) openAgentUpdateApproval(payload agentUpdatePayload) (model.Approval, bool) {
 	action := agentUpdateApprovalAction(payload)
 	for _, approval := range s.store.Approvals() {
 		if approval.Plugin != agentUpdatePlugin || approval.NodeID != payload.NodeID || approval.Action != action {
 			continue
 		}
 		if approval.Status == model.ApprovalPending || approval.Status == model.ApprovalApproved {
-			return true
+			return approval, true
 		}
 	}
-	return false
+	return model.Approval{}, false
 }
 
 func (s *Server) hasActiveTaskForApproval(approvalID string) bool {

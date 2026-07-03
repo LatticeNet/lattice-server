@@ -248,7 +248,7 @@ const (
 	maxTaskScriptBytes             = 64 * 1024
 	apiErrorTaskExecutionDisabled  = "task_execution_disabled"
 	requestIDHeader                = "X-Lattice-Request-ID"
-	nodeTokenTouchInterval         = time.Minute
+	nodeTokenTouchInterval         = 15 * time.Minute
 	maxAgentSourceAllowlistEntries = 64
 	// maxTOTPChallengeAttempts burns a 2FA challenge after this many failed codes.
 	maxTOTPChallengeAttempts = 5

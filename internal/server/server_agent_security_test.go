@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/secret"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -147,6 +150,67 @@ func TestAgentBearerAuthTouchesNodeTokenLastUsedAt(t *testing.T) {
 		}
 	}
 	t.Fatalf("node %q missing from node views: %+v", nodeID, views)
+}
+
+func TestAgentBearerAuthDoesNotRewriteTokenTouchInsideDurableWindow(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	st, err := store.OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := "strong-node-token"
+	hash, err := auth.HashSecret(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", TokenHash: hash}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	base := time.Unix(1_700_000_000, 0).UTC()
+
+	srv.now = func() time.Time { return base }
+	first := httptest.NewRequest(http.MethodGet, "/api/agent/config?node_id=node-a", nil)
+	first.Header.Set("Authorization", "Bearer "+token)
+	if rec := serveReq(handler, first); rec.Code != http.StatusOK {
+		t.Fatalf("first config status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	afterFirst, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv.now = func() time.Time { return base.Add(10 * time.Minute) }
+	second := httptest.NewRequest(http.MethodGet, "/api/agent/config?node_id=node-a", nil)
+	second.Header.Set("Authorization", "Bearer "+token)
+	if rec := serveReq(handler, second); rec.Code != http.StatusOK {
+		t.Fatalf("second config status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	afterSecond, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterSecond) != string(afterFirst) {
+		t.Fatalf("agent token touch rewrote state inside durable window")
+	}
+
+	srv.now = func() time.Time { return base.Add(16 * time.Minute) }
+	third := httptest.NewRequest(http.MethodGet, "/api/agent/config?node_id=node-a", nil)
+	third.Header.Set("Authorization", "Bearer "+token)
+	if rec := serveReq(handler, third); rec.Code != http.StatusOK {
+		t.Fatalf("third config status = %d (%s)", rec.Code, rec.Body.String())
+	}
+	afterThird, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterThird) == string(afterSecond) {
+		t.Fatalf("agent token touch was not persisted after durable window")
+	}
 }
 
 func TestAgentSourceAllowlistRestrictsBearerAuth(t *testing.T) {

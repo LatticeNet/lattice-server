@@ -1016,6 +1016,19 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"fi\n" +
 		"if [ -n \"$RUNNING_SERVICE\" ] && [ \"$SERVICE\" = \"$DEFAULT_SERVICE\" ]; then SERVICE=\"$RUNNING_SERVICE\"; fi\n" +
 		"echo \"lattice agent update: effective target=$TARGET service=$SERVICE\"\n" +
+		"if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then\n" +
+		"  echo 'lattice agent update: systemd is required for managed agent updates; refusing to install without a restart manager' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"if ! command -v systemd-run >/dev/null 2>&1; then\n" +
+		"  echo 'lattice agent update: systemd-run is required to schedule a verified delayed restart' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"systemctl daemon-reload\n" +
+		"if ! systemctl status \"$SERVICE\" >/dev/null 2>&1 && ! systemctl --no-legend list-unit-files \"$SERVICE\" 2>/dev/null | awk '{print $1}' | grep -Fxq \"$SERVICE\"; then\n" +
+		"  echo \"lattice agent update: service $SERVICE not found before installing $TARGET\" >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
 		"WORK=$(mktemp -d \"${TMPDIR:-/tmp}/lattice-agent-update.XXXXXX\")\n" +
 		"cleanup() { rm -rf \"$WORK\"; }\n" +
 		"trap cleanup EXIT\n" +
@@ -1052,21 +1065,9 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"fi\n" +
 		"install -m 0755 \"$CANDIDATE\" \"$TARGET.new\"\n" +
 		"mv \"$TARGET.new\" \"$TARGET\"\n" +
-		"if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
-		"  systemctl daemon-reload\n" +
-		"  if ! systemctl status \"$SERVICE\" >/dev/null 2>&1 && ! systemctl --no-legend list-unit-files \"$SERVICE\" 2>/dev/null | awk '{print $1}' | grep -Fxq \"$SERVICE\"; then\n" +
-		"    echo \"lattice agent update: service $SERVICE not found after installing $TARGET\" >&2\n" +
-		"    exit 1\n" +
-		"  fi\n" +
-		"  if command -v systemd-run >/dev/null 2>&1; then\n" +
-		"    systemd-run --unit=lattice-agent-delayed-restart --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n" +
-		"  else\n" +
-		"    ( sleep 3; systemctl restart \"$SERVICE\" ) >/dev/null 2>&1 &\n" +
-		"  fi\n" +
-		"  echo \"lattice agent update: installed $TARGET_VERSION and scheduled $SERVICE restart\"\n" +
-		"else\n" +
-		"  echo \"lattice agent update: installed $TARGET_VERSION; restart $SERVICE manually (systemd unavailable)\"\n" +
-		"fi\n", nil
+		"systemctl daemon-reload\n" +
+		"systemd-run --unit=lattice-agent-delayed-restart --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n" +
+		"echo \"lattice agent update: installed $TARGET_VERSION and scheduled $SERVICE restart\"\n", nil
 }
 
 func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.Approval, result model.TaskResult) error {

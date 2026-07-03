@@ -100,9 +100,11 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 		"RUNNING_AGENT=$(readlink -f \"/proc/$PPID/exe\"",
 		"RUNNING_SERVICE=$(sed -n 's#.*system\\.slice/",
 		"effective target=$TARGET service=$SERVICE",
+		"systemd is required for managed agent updates",
+		"systemd-run is required to schedule a verified delayed restart",
 		"CANDIDATE_VERSION=$(\"$CANDIDATE\" -version)",
 		"version mismatch expected=$TARGET_VERSION actual=$CANDIDATE_VERSION",
-		"service $SERVICE not found after installing $TARGET",
+		"service $SERVICE not found before installing $TARGET",
 		"systemctl --no-legend list-unit-files \"$SERVICE\"",
 		"grep -Fxq \"$SERVICE\"",
 		"lattice-agent-delayed-restart",
@@ -117,6 +119,25 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	}
 	if strings.Contains(script, "list-unit-files \"$SERVICE\" 2>/dev/null | grep -q .") {
 		t.Fatalf("update script must match the service unit exactly:\n%s", script)
+	}
+	systemdCheck := strings.Index(script, "systemd is required for managed agent updates")
+	systemdRunCheck := strings.Index(script, "systemd-run is required to schedule a verified delayed restart")
+	serviceCheck := strings.Index(script, "service $SERVICE not found before installing $TARGET")
+	download := strings.Index(script, "curl -fsSL --proto '=https' --tlsv1.2")
+	install := strings.Index(script, "install -m 0755 \"$CANDIDATE\" \"$TARGET.new\"")
+	if systemdCheck < 0 || systemdRunCheck < 0 || serviceCheck < 0 || download < 0 || install < 0 {
+		t.Fatalf("update script missing ordered safety checkpoints:\n%s", script)
+	}
+	if systemdCheck > download || systemdRunCheck > download {
+		t.Fatalf("restart manager checks must happen before download:\n%s", script)
+	}
+	if serviceCheck > install {
+		t.Fatalf("service existence check must happen before install:\n%s", script)
+	}
+	for _, forbidden := range []string{"restart $SERVICE manually", "sleep 3; systemctl restart"} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("managed update script must not use unverified restart fallback %q:\n%s", forbidden, script)
+		}
 	}
 }
 

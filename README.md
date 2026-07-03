@@ -234,9 +234,12 @@ Use the compose file and deployment guide in the umbrella repository:
   inspects the running agent parent process and systemd cgroup, then updates the
   currently executing `lattice-agent` path and restarts the detected service
   unit. This keeps current `/opt/lattice/lattice-agent` installs and older
-  custom `/opt/lattice/node-agent/lattice-agent` layouts working. A successful
-  task result records `last_applied_version`; the live source of truth remains
-  the next node heartbeat's reported `agent_version`.
+  custom `/opt/lattice/node-agent/lattice-agent` layouts working. The task
+  fails before downloading or installing if systemd, `systemd-run`, or the
+  target unit is unavailable, so a successful task result means the binary was
+  installed and systemd accepted the delayed restart unit. That success records
+  `last_applied_version`; the live source of truth remains the next node
+  heartbeat's reported `agent_version`.
 - Node reconfigure commands source both the canonical
   `/opt/lattice/lattice-agent.env` and legacy `/opt/lattice/node-agent/agent.env`
   before rerunning the installer. Operators can therefore reconfigure or upgrade

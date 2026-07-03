@@ -34,6 +34,10 @@ const maxTaskResults = 2000
 // without rewriting the full encrypted JSON store on every agent poll.
 const metricsPersistenceInterval = time.Minute
 
+// monitorResultPersistenceInterval keeps monitor history live in memory while
+// avoiding a full snapshot rewrite for every unchanged probe cycle.
+const monitorResultPersistenceInterval = time.Minute
+
 type State struct {
 	Users           map[string]model.User               `json:"users"`
 	Tokens          map[string]model.Token              `json:"tokens"`
@@ -80,6 +84,7 @@ type Store struct {
 	path               string
 	state              State
 	metricsPersistedAt map[string]time.Time
+	monitorPersistedAt map[string]time.Time
 	cipher             secret.Cipher // at-rest encryptor for persisted credentials
 	wal                *audit.WAL    // append-only tamper-evident audit log; nil for in-memory stores
 	walPath            string
@@ -111,7 +116,13 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 	if cph == nil {
 		cph = secret.Disabled()
 	}
-	s := &Store{path: path, state: emptyState(), metricsPersistedAt: map[string]time.Time{}, cipher: cph}
+	s := &Store{
+		path:               path,
+		state:              emptyState(),
+		metricsPersistedAt: map[string]time.Time{},
+		monitorPersistedAt: map[string]time.Time{},
+		cipher:             cph,
+	}
 	if path == "" {
 		return s, nil
 	}
@@ -142,6 +153,7 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 	}
 	s.ensureMaps()
 	s.seedMetricsPersistence()
+	s.seedMonitorResultPersistence()
 	return s, nil
 }
 
@@ -151,6 +163,24 @@ func (s *Store) seedMetricsPersistence() {
 			s.metricsPersistedAt[nodeID] = n.LastSeen
 		}
 	}
+}
+
+func (s *Store) seedMonitorResultPersistence() {
+	for monitorID, series := range s.state.MonResults {
+		for _, r := range series {
+			if r.NodeID == "" || r.At.IsZero() {
+				continue
+			}
+			key := monitorResultPersistenceKey(monitorID, r.NodeID)
+			if prev, ok := s.monitorPersistedAt[key]; !ok || r.At.After(prev) {
+				s.monitorPersistedAt[key] = r.At
+			}
+		}
+	}
+}
+
+func monitorResultPersistenceKey(monitorID, nodeID string) string {
+	return monitorID + "\x00" + nodeID
 }
 
 func emptyState() State {
@@ -2428,6 +2458,11 @@ func (s *Store) DeleteMonitor(id string) error {
 	}
 	delete(s.state.Monitors, id)
 	delete(s.state.MonResults, id)
+	for key := range s.monitorPersistedAt {
+		if strings.HasPrefix(key, id+"\x00") {
+			delete(s.monitorPersistedAt, key)
+		}
+	}
 	return s.Save()
 }
 
@@ -2436,15 +2471,40 @@ func (s *Store) DeleteMonitor(id string) error {
 func (s *Store) AddMonitorResult(r model.MonitorResult) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r.At.IsZero() {
-		r.At = time.Now().UTC()
+	if s.monitorPersistedAt == nil {
+		s.monitorPersistedAt = map[string]time.Time{}
 	}
-	series := append(s.state.MonResults[r.MonitorID], r)
+	now := time.Now().UTC()
+	if r.At.IsZero() {
+		r.At = now
+	}
+	series := s.state.MonResults[r.MonitorID]
+	var prior model.MonitorResult
+	hadPrior := false
+	for i := len(series) - 1; i >= 0; i-- {
+		if series[i].NodeID == r.NodeID {
+			prior = series[i]
+			hadPrior = true
+			break
+		}
+	}
+	series = append(series, r)
 	if len(series) > maxMonitorResults {
 		series = series[len(series)-maxMonitorResults:]
 	}
 	s.state.MonResults[r.MonitorID] = series
-	return s.Save()
+
+	key := monitorResultPersistenceKey(r.MonitorID, r.NodeID)
+	transitioned := !hadPrior || prior.Success != r.Success || prior.Error != r.Error
+	lastPersisted, persisted := s.monitorPersistedAt[key]
+	if persisted && !transitioned && now.Sub(lastPersisted) < monitorResultPersistenceInterval {
+		return nil
+	}
+	if err := s.Save(); err != nil {
+		return err
+	}
+	s.monitorPersistedAt[key] = now
+	return nil
 }
 
 // MonitorResults returns the result history for a monitor (oldest first).

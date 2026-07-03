@@ -352,6 +352,7 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 				}
 			}
 			s.state.MonResults[mid] = kept
+			delete(s.monitorPersistedAt, monitorResultPersistenceKey(mid, nodeID))
 		}
 	}
 

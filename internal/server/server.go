@@ -4779,25 +4779,15 @@ func nftGuardApplyScript(plan, serverURL string) string {
 		"CANDIDATE=/etc/lattice/guard.nft.new\n" +
 		"ACTIVE=/etc/lattice/guard.nft\n" +
 		"ROLLBACK=/etc/lattice/guard.rollback.nft\n" +
-		"WATCHDOG=\n" +
 		heredocWrite("$CANDIDATE", "LATTICE_NFT_GUARD_EOF", plan) +
 		"nft -c -f \"$CANDIDATE\"\n" +
 		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"\n" +
-		"cleanup_watchdog() {\n" +
-		"  if [ -n \"$WATCHDOG\" ]; then\n" +
-		"    kill \"$WATCHDOG\" 2>/dev/null || true\n" +
-		"    wait \"$WATCHDOG\" 2>/dev/null || true\n" +
-		"  fi\n" +
-		"}\n" +
-		"rollback() {\n" +
-		"  echo 'lattice nft: rolling back guard ruleset' >&2\n" +
-		"  nft -f \"$ROLLBACK\" 2>/dev/null || true\n" +
-		"}\n" +
+		nftRollbackWatchdogScript("nft", "lattice nft: watchdog rollback fired", "lattice nft: rolling back guard ruleset") +
 		"trap 'rollback; cleanup_watchdog' ERR\n" +
-		"( sleep 60; echo 'lattice nft: watchdog rollback fired' >&2; rollback ) &\n" +
-		"WATCHDOG=$!\n" +
+		"start_watchdog\n" +
 		"nft -f \"$CANDIDATE\"\n" +
 		selfcheck +
+		"assert_watchdog_clean\n" +
 		"trap - ERR\n" +
 		"cleanup_watchdog\n" +
 		"mv \"$CANDIDATE\" \"$ACTIVE\"\n" +
@@ -4820,32 +4810,52 @@ func nftPolicyApplyScript(plan, serverURL string, domainSets []nftPolicyDomainSe
 		"CANDIDATE=/etc/lattice/policy.nft.new\n" +
 		"ACTIVE=/etc/lattice/policy.nft\n" +
 		"ROLLBACK=/etc/lattice/policy.rollback.nft\n" +
-		"WATCHDOG=\n" +
 		heredocWrite("$CANDIDATE", "LATTICE_NFT_POLICY_EOF", plan) +
 		"nft -c -f \"$CANDIDATE\"\n" +
 		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"\n" +
-		"cleanup_watchdog() {\n" +
-		"  if [ -n \"$WATCHDOG\" ]; then\n" +
-		"    kill \"$WATCHDOG\" 2>/dev/null || true\n" +
-		"    wait \"$WATCHDOG\" 2>/dev/null || true\n" +
-		"  fi\n" +
-		"}\n" +
-		"rollback() {\n" +
-		"  echo 'lattice nftpolicy: rolling back ruleset' >&2\n" +
-		"  nft -f \"$ROLLBACK\" 2>/dev/null || true\n" +
-		"}\n" +
+		nftRollbackWatchdogScript("nftpolicy", "lattice nftpolicy: watchdog rollback fired", "lattice nftpolicy: rolling back ruleset") +
 		"trap 'rollback; cleanup_watchdog' ERR\n" +
-		"( sleep 60; echo 'lattice nftpolicy: watchdog rollback fired' >&2; rollback ) &\n" +
-		"WATCHDOG=$!\n" +
+		"start_watchdog\n" +
 		"nft -f \"$CANDIDATE\"\n" +
 		"AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
 		domainSetUpdate +
 		"\"$AGENT_BIN\" --selfcheck-controlplane -server " + shellQuote(serverURL) + "\n" +
 		domainRefresh +
+		"assert_watchdog_clean\n" +
 		"trap - ERR\n" +
 		"cleanup_watchdog\n" +
 		"mv \"$CANDIDATE\" \"$ACTIVE\"\n" +
 		"echo 'lattice nftpolicy: applied and verified'\n"
+}
+
+func nftRollbackWatchdogScript(name, firedMessage, rollbackMessage string) string {
+	return "WATCHDOG=\n" +
+		"WATCHDOG_FIRED=/tmp/lattice-" + name + "-watchdog.$$\n" +
+		"cleanup_watchdog() {\n" +
+		"  if [ -n \"$WATCHDOG\" ]; then\n" +
+		"    kill \"$WATCHDOG\" 2>/dev/null || true\n" +
+		"    wait \"$WATCHDOG\" 2>/dev/null || true\n" +
+		"  fi\n" +
+		"  rm -f \"$WATCHDOG_FIRED\"\n" +
+		"}\n" +
+		"rollback() {\n" +
+		"  echo '" + rollbackMessage + "' >&2\n" +
+		"  nft -f \"$ROLLBACK\" 2>/dev/null || true\n" +
+		"}\n" +
+		"start_watchdog() {\n" +
+		"  if command -v setsid >/dev/null 2>&1; then\n" +
+		"    setsid sh -c 'sleep 60; echo \"" + firedMessage + "\" >&2; touch \"$1\" 2>/dev/null || true; echo \"" + rollbackMessage + "\" >&2; nft -f \"$2\" 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$ROLLBACK\" &\n" +
+		"  else\n" +
+		"    ( sleep 60; echo '" + firedMessage + "' >&2; touch \"$WATCHDOG_FIRED\" 2>/dev/null || true; rollback ) &\n" +
+		"  fi\n" +
+		"  WATCHDOG=$!\n" +
+		"}\n" +
+		"assert_watchdog_clean() {\n" +
+		"  if [ -f \"$WATCHDOG_FIRED\" ]; then\n" +
+		"    echo '" + firedMessage + " before commit; refusing to mark apply verified' >&2\n" +
+		"    false\n" +
+		"  fi\n" +
+		"}\n"
 }
 
 func controlPlaneDomainSetHost(serverURL string) (string, bool) {

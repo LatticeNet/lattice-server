@@ -352,6 +352,10 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 		"{ echo 'flush ruleset'; nft list ruleset; } > \"$NFT_ROLLBACK\"",
 		"nft -f \"$NFT_CANDIDATE\"",
 		"CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$",
+		"WATCHDOG_FIRED=/tmp/lattice-selfdns-watchdog.$$",
+		"setsid sh -c",
+		"assert_watchdog_clean",
+		"refusing to mark apply verified",
 		"lattice-selfdns.service",
 		"systemctl is-active --quiet lattice-selfdns.service",
 	} {

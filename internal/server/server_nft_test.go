@@ -157,7 +157,16 @@ func TestNFTPlanComposesIngressNetPolicyIntoGuard(t *testing.T) {
 	if task.TimeoutSec != networkApplyTaskTimeoutSec {
 		t.Fatalf("guard apply timeout = %d, want %d", task.TimeoutSec, networkApplyTaskTimeoutSec)
 	}
-	for _, needle := range []string{"guard.rollback.nft", "nft -f \"$CANDIDATE\"", "{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"", "--selfcheck-controlplane -server 'https://203.0.113.99'"} {
+	for _, needle := range []string{
+		"guard.rollback.nft",
+		"nft -f \"$CANDIDATE\"",
+		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"",
+		"WATCHDOG_FIRED=/tmp/lattice-nft-watchdog.$$",
+		"setsid sh -c",
+		"assert_watchdog_clean",
+		"refusing to mark apply verified",
+		"--selfcheck-controlplane -server 'https://203.0.113.99'",
+	} {
 		if !strings.Contains(task.Script, needle) {
 			t.Fatalf("guard apply script missing %q:\n%s", needle, task.Script)
 		}

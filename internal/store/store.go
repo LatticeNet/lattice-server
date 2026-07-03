@@ -90,6 +90,8 @@ type Store struct {
 	wal                *audit.WAL    // append-only tamper-evident audit log; nil for in-memory stores
 	walPath            string
 	walAnchorPath      string
+	runtimeBoltHot     *BoltStateStore // optional record-level sidecar for high-churn runtime domains
+	runtimeBoltHotPath string
 }
 
 // Open loads (or initializes) the store at path, resolving the at-rest
@@ -156,6 +158,139 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	return s, nil
+}
+
+// EnableRuntimeBoltHotStore moves high-churn runtime collections to a
+// record-level bbolt sidecar while keeping the Store API and in-memory read
+// model unchanged. It is intentionally opt-in so operators can canary the Phase
+// C runtime cutover without changing the JSON control-plane store.
+//
+// The sidecar owns audit events, interactive sessions, proxy users, per-node
+// proxy profiles, and proxy usage snapshots. Existing JSON values are imported
+// into bbolt on first enable; existing bbolt values are merged back into memory
+// on every enable so a restart recovers hot-domain writes that intentionally did
+// not rewrite the whole JSON file.
+func (s *Store) EnableRuntimeBoltHotStore(path string) error {
+	if path == "" {
+		return errors.New("runtime bbolt hot store path is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.runtimeBoltHot != nil {
+		if s.runtimeBoltHotPath == path {
+			return nil
+		}
+		return fmt.Errorf("runtime bbolt hot store already enabled at %s", s.runtimeBoltHotPath)
+	}
+	bs, err := OpenBoltState(path, s.cipher)
+	if err != nil {
+		return err
+	}
+	if err := syncRuntimeBoltHotState(bs, s.state); err != nil {
+		bs.Close()
+		return err
+	}
+	hot, err := bs.ExportState()
+	if err != nil {
+		bs.Close()
+		return err
+	}
+	mergeRuntimeBoltHotState(&s.state, hot)
+	s.seedMetricsPersistence()
+	s.seedMonitorResultPersistence()
+	s.runtimeBoltHot = bs
+	s.runtimeBoltHotPath = path
+	return nil
+}
+
+func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
+	existing, err := bs.ExportState()
+	if err != nil {
+		return err
+	}
+	seenAudit := map[string]struct{}{}
+	for _, ev := range existing.Audit {
+		seenAudit[auditEventStorageKey(ev)] = struct{}{}
+	}
+	for _, ev := range st.Audit {
+		if _, ok := seenAudit[auditEventStorageKey(ev)]; ok {
+			continue
+		}
+		if err := bs.AppendAudit(ev); err != nil {
+			return err
+		}
+	}
+	now := time.Now().UTC()
+	for _, sess := range st.Sessions {
+		if _, ok := existing.Sessions[sess.ID]; !ok && sess.Active(now) {
+			if err := bs.PutSession(sess); err != nil {
+				return err
+			}
+		}
+	}
+	for _, user := range st.ProxyUsers {
+		if current, ok := existing.ProxyUsers[user.ID]; ok && !user.UpdatedAt.After(current.UpdatedAt) {
+			continue
+		}
+		if err := bs.UpsertProxyUser(user); err != nil {
+			return err
+		}
+	}
+	for _, profile := range st.ProxyProfiles {
+		if current, ok := existing.ProxyProfiles[profile.NodeID]; ok && !profile.UpdatedAt.After(current.UpdatedAt) {
+			continue
+		}
+		if err := bs.UpsertProxyNodeProfile(profile); err != nil {
+			return err
+		}
+	}
+	for _, snapshot := range st.ProxyUsage {
+		if current, ok := existing.ProxyUsage[snapshot.NodeID]; ok && !snapshot.At.After(current.At) {
+			continue
+		}
+		if err := bs.UpsertProxyUsageSnapshot(snapshot); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func mergeRuntimeBoltHotState(dst *State, hot State) {
+	if len(hot.Audit) > 0 {
+		merged := append([]model.AuditEvent(nil), dst.Audit...)
+		seen := make(map[string]struct{}, len(merged))
+		for _, ev := range merged {
+			seen[auditEventStorageKey(ev)] = struct{}{}
+		}
+		for _, ev := range hot.Audit {
+			if _, ok := seen[auditEventStorageKey(ev)]; ok {
+				continue
+			}
+			merged = append(merged, ev)
+		}
+		sort.Slice(merged, func(i, j int) bool { return merged[i].At.After(merged[j].At) })
+		dst.Audit = merged
+	}
+	if len(hot.Sessions) > 0 {
+		dst.Sessions = hot.Sessions
+	}
+	if len(hot.ProxyUsers) > 0 {
+		dst.ProxyUsers = hot.ProxyUsers
+	}
+	if len(hot.ProxyProfiles) > 0 {
+		dst.ProxyProfiles = hot.ProxyProfiles
+	}
+	if len(hot.ProxyUsage) > 0 {
+		dst.ProxyUsage = hot.ProxyUsage
+	}
+	dst.ensureMaps()
+}
+
+func auditEventStorageKey(ev model.AuditEvent) string {
+	if ev.ID != "" {
+		return ev.ID
+	}
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s", ev.At.UTC().Format(time.RFC3339Nano), ev.Action, ev.Scope, ev.Decision, ev.CorrelationID)
 }
 
 func (s *Store) seedMetricsPersistence() {
@@ -358,7 +493,7 @@ func (s *Store) Save() error {
 	if err = os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
-	persist, err := encryptedState(s.state, s.cipher)
+	persist, err := encryptedState(s.jsonPersistState(), s.cipher)
 	if err != nil {
 		return fmt.Errorf("encrypt state: %w", err)
 	}
@@ -368,6 +503,19 @@ func (s *Store) Save() error {
 	}
 	err = syncedAtomicWrite(s.path, data, 0o600)
 	return err
+}
+
+func (s *Store) jsonPersistState() State {
+	st := s.state
+	if s.runtimeBoltHot == nil {
+		return st
+	}
+	st.Audit = []model.AuditEvent{}
+	st.Sessions = map[string]auth.Session{}
+	st.ProxyUsers = map[string]model.ProxyUser{}
+	st.ProxyProfiles = map[string]model.ProxyNodeProfile{}
+	st.ProxyUsage = map[string]model.ProxyUsageSnapshot{}
+	return st
 }
 
 // ReadyCheck verifies that the in-memory state is initialized and can still be
@@ -382,7 +530,12 @@ func (s *Store) ReadyCheck() error {
 			return fmt.Errorf("stat state file: %w", err)
 		}
 	}
-	persist, err := encryptedState(s.state, s.cipher)
+	if s.runtimeBoltHot != nil {
+		if _, err := s.runtimeBoltHot.ExportState(); err != nil {
+			return fmt.Errorf("runtime bbolt hot store: %w", err)
+		}
+	}
+	persist, err := encryptedState(s.jsonPersistState(), s.cipher)
 	if err != nil {
 		return fmt.Errorf("encrypt state: %w", err)
 	}
@@ -575,13 +728,21 @@ func (s *Store) DeleteSessionsByActor(actorID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
+	deletedIDs := []string{}
 	for id, sess := range s.state.Sessions {
 		if sess.ActorID == actorID {
 			delete(s.state.Sessions, id)
+			deletedIDs = append(deletedIDs, id)
 			n++
 		}
 	}
 	if n > 0 {
+		if s.runtimeBoltHot != nil {
+			for _, id := range deletedIDs {
+				_ = s.runtimeBoltHot.DeleteSession(id)
+			}
+			return n
+		}
 		_ = s.Save()
 	}
 	return n
@@ -1049,6 +1210,9 @@ func (s *Store) AppendAudit(ev model.AuditEvent) error {
 			return err
 		}
 	}
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.AppendAudit(ev)
+	}
 	return s.Save()
 }
 
@@ -1080,10 +1244,18 @@ func (s *Store) AuditWALHead() (string, int, bool) {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var closeErr error
 	if s.wal != nil {
-		return s.wal.Close()
+		closeErr = s.wal.Close()
+		s.wal = nil
 	}
-	return nil
+	if s.runtimeBoltHot != nil {
+		if err := s.runtimeBoltHot.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
+		s.runtimeBoltHot = nil
+	}
+	return closeErr
 }
 
 func (s *Store) AuditEvents() []model.AuditEvent {
@@ -1536,6 +1708,9 @@ func (s *Store) PutSession(sess auth.Session) error {
 	if len(s.state.Sessions) > maxSessions {
 		s.evictOldestSessionLocked()
 	}
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.PutSession(sess)
+	}
 	return s.Save()
 }
 
@@ -1559,6 +1734,9 @@ func (s *Store) DeleteSession(id string) error {
 		return nil
 	}
 	delete(s.state.Sessions, id)
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.DeleteSession(id)
+	}
 	return s.Save()
 }
 
@@ -2264,6 +2442,9 @@ func (s *Store) UpsertProxyUser(u model.ProxyUser) error {
 	defer s.mu.Unlock()
 	u = normalizeProxyUserForStore(u, time.Now().UTC())
 	s.state.ProxyUsers[u.ID] = u
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.UpsertProxyUser(u)
+	}
 	return s.Save()
 }
 
@@ -2328,6 +2509,9 @@ func (s *Store) DeleteProxyUser(id string) error {
 		return nil
 	}
 	delete(s.state.ProxyUsers, id)
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.DeleteProxyUser(id)
+	}
 	return s.Save()
 }
 
@@ -2337,6 +2521,9 @@ func (s *Store) UpsertProxyNodeProfile(profile model.ProxyNodeProfile) error {
 	defer s.mu.Unlock()
 	profile = normalizeProxyNodeProfileForStore(profile, time.Now().UTC())
 	s.state.ProxyProfiles[profile.NodeID] = profile
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.UpsertProxyNodeProfile(profile)
+	}
 	return s.Save()
 }
 
@@ -2379,6 +2566,9 @@ func (s *Store) DeleteProxyNodeProfile(nodeID string) error {
 		return nil
 	}
 	delete(s.state.ProxyProfiles, nodeID)
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.DeleteProxyNodeProfile(nodeID)
+	}
 	return s.Save()
 }
 
@@ -2388,6 +2578,9 @@ func (s *Store) UpsertProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) erro
 	defer s.mu.Unlock()
 	snapshot = normalizeProxyUsageSnapshotForStore(snapshot, time.Now().UTC())
 	s.state.ProxyUsage[snapshot.NodeID] = snapshot
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.UpsertProxyUsageSnapshot(snapshot)
+	}
 	return s.Save()
 }
 
@@ -2412,10 +2605,19 @@ func (s *Store) ApplyProxyUsageUpdate(users []model.ProxyUser, profile *model.Pr
 	if profile != nil {
 		normalized := normalizeProxyNodeProfileForStore(*profile, now)
 		s.state.ProxyProfiles[normalized.NodeID] = normalized
+		profile = &normalized
 	}
 	if snapshot != nil {
 		normalized := normalizeProxyUsageSnapshotForStore(*snapshot, now)
 		s.state.ProxyUsage[normalized.NodeID] = normalized
+		snapshot = &normalized
+	}
+	if s.runtimeBoltHot != nil {
+		normalizedUsers := make([]model.ProxyUser, 0, len(users))
+		for _, user := range users {
+			normalizedUsers = append(normalizedUsers, normalizeProxyUserForStore(user, now))
+		}
+		return s.runtimeBoltHot.ApplyProxyUsageUpdate(normalizedUsers, profile, snapshot)
 	}
 	return s.Save()
 }
@@ -2448,6 +2650,9 @@ func (s *Store) DeleteProxyUsageSnapshot(nodeID string) error {
 		return nil
 	}
 	delete(s.state.ProxyUsage, nodeID)
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.DeleteProxyUsageSnapshot(nodeID)
+	}
 	return s.Save()
 }
 

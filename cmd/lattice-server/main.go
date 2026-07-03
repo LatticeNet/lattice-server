@@ -46,6 +46,7 @@ func main() {
 	var pluginTrust string
 	var pluginRuntimeDir string
 	var pluginRuntimeEnv string
+	var runtimeBoltHotStore string
 	var masterKeyFile string
 	var publicURL string
 	var coreDNSVersion string
@@ -70,6 +71,7 @@ func main() {
 	flag.StringVar(&pluginTrust, "plugin-trust", env("LATTICE_PLUGIN_TRUST", ""), "path to the operator plugin trust policy JSON")
 	flag.StringVar(&pluginRuntimeDir, "plugin-runtime-dir", env("LATTICE_PLUGIN_RUNTIME_DIR", ""), "writable dir enabling the Tier-2 system runner (empty keeps the noop runner)")
 	flag.StringVar(&pluginRuntimeEnv, "plugin-runtime-env", env("LATTICE_PLUGIN_RUNTIME_ENV", ""), "comma/space-separated environment variable allowlist forwarded to Tier-2 system plugins")
+	flag.StringVar(&runtimeBoltHotStore, "runtime-bolt-hot-store", env("LATTICE_RUNTIME_BOLT_HOT_STORE", ""), "optional bbolt sidecar for high-churn runtime domains (audit, sessions, proxy usage)")
 	flag.StringVar(&masterKeyFile, "master-key-file", env("LATTICE_MASTER_KEY_FILE", ""), "path to the at-rest encryption master key file (auto-generated under the data dir if unset)")
 	flag.StringVar(&publicURL, "public-url", env("LATTICE_PUBLIC_URL", ""), "externally-reachable base URL (scheme+host), required for OIDC/SSO redirect")
 	flag.StringVar(&coreDNSVersion, "coredns-binary-version", env("LATTICE_COREDNS_BINARY_VERSION", ""), "pinned CoreDNS binary version for self-host DNS apply (requires -coredns-binary-url and -coredns-binary-sha256)")
@@ -120,6 +122,13 @@ func main() {
 	st, err := store.OpenWithCipher(dataPath, keyRes.Cipher)
 	if err != nil {
 		log.Fatal(err)
+	}
+	defer st.Close()
+	if runtimeBoltHotStore != "" {
+		if err := st.EnableRuntimeBoltHotStore(runtimeBoltHotStore); err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("runtime bbolt hot store: %s (audit/session/proxy hot domains)", runtimeBoltHotStore)
 	}
 	// Open the dedicated bounded log store (logs.db) beside the state file, with
 	// the same at-rest cipher. In-memory mode (no dataPath) disables ingestion.

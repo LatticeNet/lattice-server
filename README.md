@@ -465,9 +465,22 @@ Use the compose file and deployment guide in the umbrella repository:
   will not generate a new key during migration. If the key is not under the JSON
   state directory as `master.key`, pass `-master-key-file` or set
   `LATTICE_MASTER_KEY_FILE`.
-- bbolt is not the default runtime store yet. The next storage slice should be
-  an explicit startup switch plus backup/restore workflow depth before the
-  server path moves off JSON.
+- The runtime path now has an opt-in bbolt hot-store sidecar for the highest
+  churn domains:
+
+  ```sh
+  LATTICE_RUNTIME_BOLT_HOT_STORE=/var/lib/lattice/state-hot.db lattice-server
+  ```
+
+  When enabled, startup imports/merges existing JSON hot records into the
+  sidecar, then audit events, interactive sessions, proxy users, proxy node
+  profiles, and proxy usage snapshots are written at record level in bbolt
+  instead of forcing a whole encrypted JSON rewrite. The in-memory read model
+  remains unchanged and `/readyz` verifies the sidecar. The default remains the
+  JSON state file so operators can canary the cutover per deployment.
+- The full runtime store is not bbolt-only yet. The next storage slice should
+  add backup/restore drills and then migrate the remaining low-churn control
+  plane collections behind an error-returning store interface.
 
 Example plugin trust policy JSON:
 

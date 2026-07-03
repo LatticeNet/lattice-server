@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
 )
 
 func TestProxyCollectionsJSONStoreCRUDAndEncryption(t *testing.T) {
@@ -181,6 +182,94 @@ func TestApplyProxyUsageUpdateJSONStorePersistsReportAtomically(t *testing.T) {
 	}
 	if reopenedUsage, ok := reopened.ProxyUsageSnapshot("node-a"); !ok || reopenedUsage.CoreUptimeSec != 30 {
 		t.Fatalf("batched usage did not persist after reopen: ok=%v usage=%+v", ok, reopenedUsage)
+	}
+}
+
+func TestRuntimeBoltHotStoreKeepsHighChurnDomainsOutOfJSON(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "state.json")
+	boltPath := filepath.Join(dir, "state-hot.db")
+	c := testCipher(t)
+	now := time.Now().UTC()
+
+	s, err := OpenWithCipher(jsonPath, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNode(model.Node{ID: "node-hot", Name: "Hot Node"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnableRuntimeBoltHotStore(boltPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ApplyProxyUsageUpdate(
+		[]model.ProxyUser{{ID: "runtime-proxy-user", Name: "runtime user", Enabled: true, UsedBytes: 4096}},
+		&model.ProxyNodeProfile{NodeID: "node-hot", Hostname: "runtime-hot.example.com"},
+		&model.ProxyUsageSnapshot{NodeID: "node-hot", At: now, CoreUptimeSec: 42, UserBytes: map[string]int64{"runtime-proxy-user": 4096}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSession(auth.Session{ID: "runtime-session", ActorID: "admin", CreatedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendAudit(model.AuditEvent{ID: "runtime-audit", At: now, Action: "runtime.hot", Decision: "allow"}); err != nil {
+		t.Fatal(err)
+	}
+
+	jsonState, err := LoadJSONState(jsonPath, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := jsonState.ProxyUsers["runtime-proxy-user"]; ok {
+		t.Fatal("proxy user should live in runtime bbolt hot store, not JSON state")
+	}
+	if _, ok := jsonState.ProxyProfiles["node-hot"]; ok {
+		t.Fatal("proxy node profile should live in runtime bbolt hot store, not JSON state")
+	}
+	if _, ok := jsonState.ProxyUsage["node-hot"]; ok {
+		t.Fatal("proxy usage should live in runtime bbolt hot store, not JSON state")
+	}
+	if _, ok := jsonState.Sessions["runtime-session"]; ok {
+		t.Fatal("session should live in runtime bbolt hot store, not JSON state")
+	}
+	for _, ev := range jsonState.Audit {
+		if ev.ID == "runtime-audit" {
+			t.Fatal("audit event should live in runtime bbolt hot store, not JSON state")
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenWithCipher(jsonPath, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.EnableRuntimeBoltHotStore(boltPath); err != nil {
+		t.Fatal(err)
+	}
+	if user, ok := reopened.ProxyUser("runtime-proxy-user"); !ok || user.UsedBytes != 4096 {
+		t.Fatalf("proxy user not recovered from runtime bbolt hot store: ok=%v user=%+v", ok, user)
+	}
+	if profile, ok := reopened.ProxyNodeProfile("node-hot"); !ok || profile.Hostname != "runtime-hot.example.com" {
+		t.Fatalf("proxy node profile not recovered from runtime bbolt hot store: ok=%v profile=%+v", ok, profile)
+	}
+	if usage, ok := reopened.ProxyUsageSnapshot("node-hot"); !ok || usage.CoreUptimeSec != 42 {
+		t.Fatalf("proxy usage not recovered from runtime bbolt hot store: ok=%v usage=%+v", ok, usage)
+	}
+	if sess, ok := reopened.Session("runtime-session"); !ok || sess.ActorID != "admin" {
+		t.Fatalf("session not recovered from runtime bbolt hot store: ok=%v session=%+v", ok, sess)
+	}
+	events := reopened.AuditEvents()
+	foundAudit := false
+	for _, ev := range events {
+		if ev.ID == "runtime-audit" {
+			foundAudit = true
+			break
+		}
+	}
+	if !foundAudit {
+		t.Fatalf("audit event not recovered from runtime bbolt hot store: %+v", events)
 	}
 }
 

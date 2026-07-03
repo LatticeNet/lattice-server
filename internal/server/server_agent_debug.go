@@ -217,6 +217,11 @@ func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if cfg != nil && cfg.Mode == model.NodeIPModeScript {
+		if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
+			return
+		}
+	}
 	if s.taskExecutionDisabled && cfg != nil && cfg.Mode == model.NodeIPModeScript {
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:       id.New("audit"),

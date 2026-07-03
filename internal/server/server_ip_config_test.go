@@ -163,6 +163,41 @@ func TestNodeIPConfigScriptObeysTaskExecutionKillSwitch(t *testing.T) {
 	}
 }
 
+func TestNodeIPConfigScriptRequiresNetworkPlanScope(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	nodeAdmin := createPAT(t, handler, cookies, csrf, []string{"node:admin"}, []string{"node-a"})
+	static := doBearerJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",
+		`{"node_id":"node-a","mode":"static","static_ipv4":"203.0.113.7"}`, nodeAdmin)
+	static.Body.Close()
+	if static.StatusCode != http.StatusOK {
+		t.Fatalf("node:admin should set static ip-config, got %d", static.StatusCode)
+	}
+
+	scriptDenied := doBearerJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",
+		`{"node_id":"node-a","mode":"script","script":"echo 8.8.8.8"}`, nodeAdmin)
+	scriptDenied.Body.Close()
+	if scriptDenied.StatusCode != http.StatusForbidden {
+		t.Fatalf("node:admin-only script ip-config status = %d, want 403", scriptDenied.StatusCode)
+	}
+	if n, _ := st.Node("node-a"); n.IPConfig == nil || n.IPConfig.Mode != model.NodeIPModeStatic {
+		t.Fatalf("denied script update should leave static config intact: %+v", n.IPConfig)
+	}
+
+	withNetworkPlan := createPAT(t, handler, cookies, csrf, []string{"node:admin", "network:plan"}, []string{"node-a"})
+	scriptAllowed := doBearerJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",
+		`{"node_id":"node-a","mode":"script","script":"echo 8.8.4.4"}`, withNetworkPlan)
+	scriptAllowed.Body.Close()
+	if scriptAllowed.StatusCode != http.StatusOK {
+		t.Fatalf("node:admin + network:plan should set script ip-config, got %d", scriptAllowed.StatusCode)
+	}
+	if n, _ := st.Node("node-a"); n.IPConfig == nil || n.IPConfig.Mode != model.NodeIPModeScript || n.IPConfig.Script != "echo 8.8.4.4" {
+		t.Fatalf("script config not stored with network:plan: %+v", n.IPConfig)
+	}
+}
+
 func TestAgentConfigSuppressesScriptIPConfigWhenTaskExecutionDisabled(t *testing.T) {
 	handler, st := newTaskExecutionDisabledTestServer(t)
 	cookies, csrf := loginSession(t, handler)

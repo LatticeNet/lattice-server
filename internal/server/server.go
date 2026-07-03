@@ -241,6 +241,7 @@ type Server struct {
 
 const (
 	defaultTaskTimeoutSec          = 30
+	networkApplyTaskTimeoutSec     = 90
 	maxTaskTimeoutSec              = 10 * 60
 	defaultTaskOutputLimit         = 64 * 1024
 	maxTaskOutputLimit             = 256 * 1024
@@ -4309,6 +4310,17 @@ func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval
 	}
 }
 
+func approvalApplyTaskTimeoutSec(plugin string) int {
+	switch plugin {
+	case agentUpdatePlugin:
+		return 300
+	case "nft", "nftpolicy", "selfdns":
+		return networkApplyTaskTimeoutSec
+	default:
+		return defaultTaskTimeoutSec
+	}
+}
+
 func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
@@ -4697,7 +4709,7 @@ func nftGuardApplyScript(plan, serverURL string) string {
 		"WATCHDOG=\n" +
 		heredocWrite("$CANDIDATE", "LATTICE_NFT_GUARD_EOF", plan) +
 		"nft -c -f \"$CANDIDATE\"\n" +
-		"nft list ruleset > \"$ROLLBACK\"\n" +
+		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"\n" +
 		"cleanup_watchdog() {\n" +
 		"  if [ -n \"$WATCHDOG\" ]; then\n" +
 		"    kill \"$WATCHDOG\" 2>/dev/null || true\n" +
@@ -4738,7 +4750,7 @@ func nftPolicyApplyScript(plan, serverURL string, domainSets []nftPolicyDomainSe
 		"WATCHDOG=\n" +
 		heredocWrite("$CANDIDATE", "LATTICE_NFT_POLICY_EOF", plan) +
 		"nft -c -f \"$CANDIDATE\"\n" +
-		"nft list ruleset > \"$ROLLBACK\"\n" +
+		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"\n" +
 		"cleanup_watchdog() {\n" +
 		"  if [ -n \"$WATCHDOG\" ]; then\n" +
 		"    kill \"$WATCHDOG\" 2>/dev/null || true\n" +
@@ -5023,10 +5035,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		return
 	}
 	if req.QueueApply {
-		timeoutSec := 30
-		if approval.Plugin == agentUpdatePlugin {
-			timeoutSec = 300
-		}
+		timeoutSec := approvalApplyTaskTimeoutSec(approval.Plugin)
 		task := model.Task{
 			ID:          id.New("task"),
 			ApprovalID:  approval.ID,

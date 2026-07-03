@@ -198,7 +198,7 @@ func TestParseApprovalPlanAndApplyScript(t *testing.T) {
 		"CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$",
 		"trap rollback ERR INT TERM HUP",
 		"nft -c -f \"$NFT_CANDIDATE\"",
-		"nft list ruleset > \"$NFT_ROLLBACK\"",
+		"{ echo 'flush ruleset'; nft list ruleset; } > \"$NFT_ROLLBACK\"",
 		"nft -f \"$NFT_CANDIDATE\"",
 		"lattice-selfdns.service",
 		"systemctl is-active --quiet lattice-selfdns.service",
@@ -207,6 +207,9 @@ func TestParseApprovalPlanAndApplyScript(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Fatalf("apply script missing %q:\n%s", want, script)
 		}
+	}
+	if strings.Contains(script, "nft list ruleset > \"$NFT_ROLLBACK\"") {
+		t.Fatalf("selfdns rollback snapshot must flush before replay:\n%s", script)
 	}
 }
 

@@ -153,10 +153,17 @@ func TestNFTPlanComposesIngressNetPolicyIntoGuard(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("expected one queued guard task, got %+v", tasks)
 	}
-	for _, needle := range []string{"guard.rollback.nft", "nft -f \"$CANDIDATE\"", "--selfcheck-controlplane -server 'https://203.0.113.99'"} {
-		if !strings.Contains(tasks[0].Script, needle) {
-			t.Fatalf("guard apply script missing %q:\n%s", needle, tasks[0].Script)
+	task := tasks[0]
+	if task.TimeoutSec != networkApplyTaskTimeoutSec {
+		t.Fatalf("guard apply timeout = %d, want %d", task.TimeoutSec, networkApplyTaskTimeoutSec)
+	}
+	for _, needle := range []string{"guard.rollback.nft", "nft -f \"$CANDIDATE\"", "{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"", "--selfcheck-controlplane -server 'https://203.0.113.99'"} {
+		if !strings.Contains(task.Script, needle) {
+			t.Fatalf("guard apply script missing %q:\n%s", needle, task.Script)
 		}
+	}
+	if strings.Contains(task.Script, "nft list ruleset > \"$ROLLBACK\"") {
+		t.Fatalf("guard rollback snapshot must flush before replay:\n%s", task.Script)
 	}
 }
 

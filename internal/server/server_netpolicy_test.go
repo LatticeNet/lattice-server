@@ -203,10 +203,16 @@ func TestNetPolicyPlanApproveAndResultUpdatesPolicy(t *testing.T) {
 	if task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != "node-a" {
 		t.Fatalf("task not linked to approval: %+v", task)
 	}
-	for _, needle := range []string{"policy.rollback.nft", "--selfcheck-controlplane", "https://203.0.113.99"} {
+	if task.TimeoutSec != networkApplyTaskTimeoutSec {
+		t.Fatalf("netpolicy apply timeout = %d, want %d", task.TimeoutSec, networkApplyTaskTimeoutSec)
+	}
+	for _, needle := range []string{"policy.rollback.nft", "{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"", "--selfcheck-controlplane", "https://203.0.113.99"} {
 		if !strings.Contains(task.Script, needle) {
 			t.Fatalf("apply script missing %q:\n%s", needle, task.Script)
 		}
+	}
+	if strings.Contains(task.Script, "nft list ruleset > \"$ROLLBACK\"") {
+		t.Fatalf("netpolicy rollback snapshot must flush before replay:\n%s", task.Script)
 	}
 	for _, needle := range []string{
 		"systemctl disable --now lattice-nftpolicy-domain-refresh.timer",

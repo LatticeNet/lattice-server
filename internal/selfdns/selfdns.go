@@ -348,7 +348,7 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString("\"$COREDNS_BIN\" -conf " + shellQuote(CorefilePath) + " -plugins >/dev/null\n")
 	b.WriteString(heredocWrite(NFTGuardPath+".new", "LATTICE_SELF_DNS_NFT_EOF", artifacts.NFTRuleset))
 	b.WriteString("nft -c -f \"$NFT_CANDIDATE\"\n")
-	b.WriteString("nft list ruleset > \"$NFT_ROLLBACK\"\n")
+	b.WriteString("{ echo 'flush ruleset'; nft list ruleset; } > \"$NFT_ROLLBACK\"\n")
 	b.WriteString("( sleep 60; echo 'lattice selfdns: watchdog rollback fired' >&2; rollback ) &\n")
 	b.WriteString("WATCHDOG=$!\n")
 	b.WriteString("nft -f \"$NFT_CANDIDATE\"\n")

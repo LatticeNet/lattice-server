@@ -339,6 +339,9 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 	if task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != "n1" {
 		t.Fatalf("bad queued task: %+v", task)
 	}
+	if task.TimeoutSec != networkApplyTaskTimeoutSec {
+		t.Fatalf("selfdns apply timeout = %d, want %d", task.TimeoutSec, networkApplyTaskTimeoutSec)
+	}
 	queuedDep, ok := st.DNSDeployment(created.ID)
 	if !ok || queuedDep.Status != model.DNSStatusApplying {
 		t.Fatalf("deployment should be marked applying after queue: ok=%v dep=%+v", ok, queuedDep)
@@ -346,6 +349,7 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 	for _, want := range []string{
 		"command -v coredns",
 		"nft -c -f \"$NFT_CANDIDATE\"",
+		"{ echo 'flush ruleset'; nft list ruleset; } > \"$NFT_ROLLBACK\"",
 		"nft -f \"$NFT_CANDIDATE\"",
 		"CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$",
 		"lattice-selfdns.service",
@@ -354,6 +358,9 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 		if !strings.Contains(task.Script, want) {
 			t.Fatalf("queued selfdns script missing %q:\n%s", want, task.Script)
 		}
+	}
+	if strings.Contains(task.Script, "nft list ruleset > \"$NFT_ROLLBACK\"") {
+		t.Fatalf("selfdns rollback snapshot must flush before replay:\n%s", task.Script)
 	}
 }
 

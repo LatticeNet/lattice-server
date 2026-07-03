@@ -990,6 +990,16 @@ func TestAgentUpdateNoopRejectsPendingApprovalForCurrentTarget(t *testing.T) {
 	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.0"}); err != nil {
 		t.Fatal(err)
 	}
+	policy, ok := st.AgentUpdatePolicy("node-a")
+	if !ok {
+		t.Fatal("agent update policy missing")
+	}
+	policy.LastAppliedVersion = "0.1.9"
+	policy.LastAppliedAt = now.Add(-time.Hour)
+	policy.LastError = "error=exit status 1"
+	if err := st.UpsertAgentUpdatePolicy(policy); err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = srv.createAgentUpdateApproval("node-a", "", false, "auto", now.Add(time.Minute))
 	if !errors.Is(err, errAgentUpdateNoop) {
@@ -1001,6 +1011,10 @@ func TestAgentUpdateNoopRejectsPendingApprovalForCurrentTarget(t *testing.T) {
 	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("noop update queued tasks: %+v", st.Tasks())
+	}
+	policy, ok = st.AgentUpdatePolicy("node-a")
+	if !ok || policy.LastError != "" || policy.LastAppliedVersion != "0.2.0" || !policy.LastAppliedAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("noop target should mark policy satisfied: ok=%v policy=%+v", ok, policy)
 	}
 }
 

@@ -357,6 +357,9 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 		if err := s.rejectSupersededAgentUpdateApprovals(nodeID, "", now); err != nil {
 			return model.Approval{}, err
 		}
+		if err := s.markAgentUpdatePolicySatisfied(policy, payload.TargetVersion, now); err != nil {
+			return model.Approval{}, err
+		}
 		return model.Approval{}, errAgentUpdateNoop
 	}
 	currentAction := agentUpdateApprovalAction(payload)
@@ -404,6 +407,31 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 		},
 	})
 	return approval, nil
+}
+
+func (s *Server) markAgentUpdatePolicySatisfied(policy model.AgentUpdatePolicy, targetVersion string, now time.Time) error {
+	targetVersion = strings.TrimSpace(targetVersion)
+	changed := false
+	if strings.TrimSpace(policy.LastError) != "" {
+		policy.LastError = ""
+		changed = true
+	}
+	if targetVersion != "" && policy.LastAppliedVersion != targetVersion {
+		policy.LastAppliedVersion = targetVersion
+		if now.IsZero() {
+			now = s.now()
+		}
+		policy.LastAppliedAt = now.UTC()
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	if now.IsZero() {
+		now = s.now()
+	}
+	policy.UpdatedAt = now.UTC()
+	return s.store.UpsertAgentUpdatePolicy(policy)
 }
 
 func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.AgentUpdatePolicy) (agentUpdatePayload, error) {

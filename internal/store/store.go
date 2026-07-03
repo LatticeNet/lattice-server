@@ -32,11 +32,11 @@ const maxTaskResults = 2000
 
 // metricsPersistenceInterval keeps hot heartbeat telemetry fresh in memory
 // without rewriting the full encrypted JSON store on every agent poll.
-const metricsPersistenceInterval = time.Minute
+const metricsPersistenceInterval = 5 * time.Minute
 
 // monitorResultPersistenceInterval keeps monitor history live in memory while
 // avoiding a full snapshot rewrite for every unchanged probe cycle.
-const monitorResultPersistenceInterval = time.Minute
+const monitorResultPersistenceInterval = 5 * time.Minute
 
 type State struct {
 	Users           map[string]model.User               `json:"users"`

@@ -256,3 +256,47 @@ func TestUpdateMetricsIgnoresVolatileHostFactsForDurableWrites(t *testing.T) {
 		t.Fatalf("durable host fact change was not persisted")
 	}
 }
+
+func TestUpdateMetricsPersistsPeriodicHeartbeatSnapshot(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	s, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNode(model.Node{ID: "node-a", Name: "Node A"}); err != nil {
+		t.Fatal(err)
+	}
+
+	first := model.Metrics{CPUPercent: 10, NetRxBytes: 100, CollectedAt: time.Unix(100, 0).UTC()}
+	if err := s.UpdateMetrics("node-a", first, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
+		t.Fatalf("first metrics update: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.metricsPersistedAt["node-a"] = time.Now().UTC().Add(-metricsPersistenceInterval - time.Second)
+	second := model.Metrics{CPUPercent: 42, NetRxBytes: 250, CollectedAt: time.Unix(200, 0).UTC()}
+	if err := s.UpdateMetrics("node-a", second, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
+		t.Fatalf("periodic metrics update: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) == string(before) {
+		t.Fatalf("periodic heartbeat snapshot was not persisted")
+	}
+	reopened, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, ok := reopened.Node("node-a")
+	if !ok {
+		t.Fatal("node missing after reopen")
+	}
+	if n.Metrics.CPUPercent != second.CPUPercent || n.Metrics.NetRxBytes != second.NetRxBytes {
+		t.Fatalf("periodic metrics snapshot not durable: %+v", n.Metrics)
+	}
+}

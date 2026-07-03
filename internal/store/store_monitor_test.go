@@ -88,3 +88,44 @@ func TestAddMonitorResultPersistsStateTransitionImmediately(t *testing.T) {
 		t.Fatalf("transition result not durable: %+v", latest)
 	}
 }
+
+func TestAddMonitorResultPersistsPeriodicStableSnapshot(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	s, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := model.MonitorResult{MonitorID: "mon-a", NodeID: "node-a", At: time.Unix(100, 0).UTC(), Success: true, LatencyMs: 12}
+	if err := s.AddMonitorResult(first); err != nil {
+		t.Fatalf("first monitor result: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := monitorResultPersistenceKey("mon-a", "node-a")
+	s.monitorPersistedAt[key] = time.Now().UTC().Add(-monitorResultPersistenceInterval - time.Second)
+	second := model.MonitorResult{MonitorID: "mon-a", NodeID: "node-a", At: time.Unix(200, 0).UTC(), Success: true, LatencyMs: 15}
+	if err := s.AddMonitorResult(second); err != nil {
+		t.Fatalf("periodic monitor result: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) == string(before) {
+		t.Fatalf("periodic stable monitor result was not persisted")
+	}
+	reopened, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, ok := reopened.LastMonitorResultForNode("mon-a", "node-a")
+	if !ok {
+		t.Fatal("missing durable monitor result after reopen")
+	}
+	if !latest.At.Equal(second.At) || latest.LatencyMs != second.LatencyMs {
+		t.Fatalf("periodic monitor result not durable: %+v", latest)
+	}
+}

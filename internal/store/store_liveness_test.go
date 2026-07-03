@@ -195,3 +195,64 @@ func TestUpdateMetricsPersistsSlowChangingAgentFieldsImmediately(t *testing.T) {
 		t.Fatalf("slow-changing fields not durable: version=%q public_ip=%q", n.AgentVersion, n.PublicIP)
 	}
 }
+
+func TestUpdateMetricsIgnoresVolatileHostFactsForDurableWrites(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	s, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNode(model.Node{ID: "node-a", Name: "Node A"}); err != nil {
+		t.Fatal(err)
+	}
+	metrics := model.Metrics{CPUPercent: 10, CollectedAt: time.Unix(100, 0).UTC()}
+	boot := time.Unix(1_699_999_000, 123_000_000).UTC()
+	firstFacts := model.HostFacts{
+		Hostname:      "node-a",
+		OS:            "linux",
+		KernelVersion: "6.1.0",
+		BootTime:      boot,
+		ReportedAt:    time.Unix(1_700_000_000, 0).UTC(),
+	}
+	if err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", firstFacts); err != nil {
+		t.Fatalf("first metrics update: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondFacts := firstFacts
+	secondFacts.ReportedAt = secondFacts.ReportedAt.Add(30 * time.Second)
+	secondFacts.BootTime = secondFacts.BootTime.Add(30 * time.Second)
+	if err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", secondFacts); err != nil {
+		t.Fatalf("volatile host facts metrics update: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("volatile host facts rewrote persisted state")
+	}
+	n, ok := s.Node("node-a")
+	if !ok {
+		t.Fatal("node missing after second metrics update")
+	}
+	if !n.HostFacts.ReportedAt.Equal(secondFacts.ReportedAt) || !n.HostFacts.BootTime.Equal(secondFacts.BootTime) {
+		t.Fatalf("in-memory host facts not refreshed: %+v", n.HostFacts)
+	}
+
+	changedFacts := secondFacts
+	changedFacts.KernelVersion = "6.8.0"
+	if err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", changedFacts); err != nil {
+		t.Fatalf("durable host facts metrics update: %v", err)
+	}
+	changed, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(changed) == string(before) {
+		t.Fatalf("durable host fact change was not persisted")
+	}
+}

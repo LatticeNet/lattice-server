@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func TestSingBoxDiscoverReportAndList(t *testing.T) {
@@ -60,4 +62,78 @@ func TestSingBoxDiscoverReportAndList(t *testing.T) {
 	if inv.Nodes[0].Name != "VLESS-REALITY-17891.json" || inv.Nodes[0].Network != "reality" {
 		t.Fatalf("node 0 wrong: %+v", inv.Nodes[0])
 	}
+}
+
+func TestSingBoxDiscoverReportAuditIsThrottledForUnchangedInventory(t *testing.T) {
+	handler, st, srv := newSingBoxDiscoverAuditTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	now := time.Unix(1_700_000_000, 0).UTC()
+	srv.now = func() time.Time { return now }
+
+	body := `{
+		"node_id":"node-a",
+		"inventory":{"status":"ok","nodes":[
+			{"name":"VLESS-REALITY-17891.json","protocol":"vless","network":"reality","port":"17891","share_url":"vless://x@h:17891"}
+		]}
+	}`
+	reportSingBoxInventory(t, handler, nodeToken, body)
+	if got := countAuditAction(st, "singbox.discover.report"); got != 1 {
+		t.Fatalf("first report should audit once, got %d", got)
+	}
+
+	now = now.Add(time.Minute)
+	reportSingBoxInventory(t, handler, nodeToken, body)
+	if got := countAuditAction(st, "singbox.discover.report"); got != 1 {
+		t.Fatalf("unchanged report inside throttle window should not audit again, got %d", got)
+	}
+
+	changed := `{
+		"node_id":"node-a",
+		"inventory":{"status":"ok","nodes":[
+			{"name":"VLESS-REALITY-17891.json","protocol":"vless","network":"reality","port":"17891","share_url":"vless://x@h:17891"},
+			{"name":"Hysteria2-17892.json","protocol":"hysteria2","port":"17892","share_url":"hysteria2://y@h:17892"}
+		]}
+	}`
+	reportSingBoxInventory(t, handler, nodeToken, changed)
+	if got := countAuditAction(st, "singbox.discover.report"); got != 2 {
+		t.Fatalf("changed report should audit immediately, got %d", got)
+	}
+
+	now = now.Add(singBoxDiscoveryAuditInterval)
+	reportSingBoxInventory(t, handler, nodeToken, changed)
+	if got := countAuditAction(st, "singbox.discover.report"); got != 3 {
+		t.Fatalf("unchanged report after throttle window should audit a sample, got %d", got)
+	}
+}
+
+func newSingBoxDiscoverAuditTestServer(t *testing.T) (http.Handler, *store.Store, *Server) {
+	t.Helper()
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv.Handler(), st, srv
+}
+
+func reportSingBoxInventory(t *testing.T, handler http.Handler, nodeToken, body string) {
+	t.Helper()
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/singbox-inventory", body, nodeToken)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("report: want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func countAuditAction(st *store.Store, action string) int {
+	n := 0
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == action {
+			n++
+		}
+	}
+	return n
 }

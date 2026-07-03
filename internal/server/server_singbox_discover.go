@@ -1,6 +1,9 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -17,6 +20,13 @@ import (
 // in memory as a live mirror (singboxInv) and exposes it so the dashboard can
 // see proxies on machines provisioned out-of-band — without Lattice owning or
 // mutating them. Nothing here writes node config.
+
+const singBoxDiscoveryAuditInterval = 10 * time.Minute
+
+type singBoxDiscoveryAuditState struct {
+	fingerprint string
+	auditedAt   time.Time
+}
 
 // handleAgentSingBoxInventory ingests one node's on-box sing-box inventory.
 func (s *Server) handleAgentSingBoxInventory(w http.ResponseWriter, r *http.Request) {
@@ -50,17 +60,64 @@ func (s *Server) handleAgentSingBoxInventory(w http.ResponseWriter, r *http.Requ
 	s.singboxInv[req.NodeID] = inv
 	s.singboxInvMu.Unlock()
 
-	s.recordRequestAudit(r, model.AuditEvent{
-		ID:       id.New("audit"),
-		Action:   "singbox.discover.report",
-		Decision: "allow",
-		NodeID:   req.NodeID,
-		Metadata: map[string]string{
-			"nodes":  strconv.Itoa(len(inv.Nodes)),
-			"status": inv.Status,
-		},
-	})
+	if s.shouldAuditSingBoxDiscovery(req.NodeID, inv, s.now()) {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "singbox.discover.report",
+			Decision: "allow",
+			NodeID:   req.NodeID,
+			Metadata: map[string]string{
+				"nodes":  strconv.Itoa(len(inv.Nodes)),
+				"status": inv.Status,
+			},
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "nodes": len(inv.Nodes)})
+}
+
+func (s *Server) shouldAuditSingBoxDiscovery(nodeID string, inv model.SingBoxInventory, now time.Time) bool {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	fingerprint := singBoxDiscoveryFingerprint(inv)
+	s.singboxDiscoverAuditMu.Lock()
+	defer s.singboxDiscoverAuditMu.Unlock()
+	if s.singboxDiscoverAudit == nil {
+		s.singboxDiscoverAudit = map[string]singBoxDiscoveryAuditState{}
+	}
+	prev, ok := s.singboxDiscoverAudit[nodeID]
+	if !ok || prev.fingerprint != fingerprint || now.Sub(prev.auditedAt) >= singBoxDiscoveryAuditInterval {
+		s.singboxDiscoverAudit[nodeID] = singBoxDiscoveryAuditState{
+			fingerprint: fingerprint,
+			auditedAt:   now,
+		}
+		return true
+	}
+	return false
+}
+
+func singBoxDiscoveryFingerprint(inv model.SingBoxInventory) string {
+	inv.NodeID = ""
+	inv.At = time.Time{}
+	inv.Nodes = append([]model.SingBoxNode(nil), inv.Nodes...)
+	sort.Slice(inv.Nodes, func(i, j int) bool {
+		a, b := inv.Nodes[i], inv.Nodes[j]
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		if a.Protocol != b.Protocol {
+			return a.Protocol < b.Protocol
+		}
+		if a.Port != b.Port {
+			return a.Port < b.Port
+		}
+		return a.ShareURL < b.ShareURL
+	})
+	data, _ := json.Marshal(inv)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // singBoxInventory returns the latest discovered inventory for a node.
@@ -97,6 +154,9 @@ func (s *Server) removeSingBoxInventory(nodeID string) {
 	s.singboxInvMu.Lock()
 	delete(s.singboxInv, nodeID)
 	s.singboxInvMu.Unlock()
+	s.singboxDiscoverAuditMu.Lock()
+	delete(s.singboxDiscoverAudit, nodeID)
+	s.singboxDiscoverAuditMu.Unlock()
 }
 
 // handleProxyDiscovered lists every live node's discovered on-box sing-box

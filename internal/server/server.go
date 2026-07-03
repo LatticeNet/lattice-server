@@ -219,6 +219,11 @@ type Server struct {
 	// simply repopulates it from the next round of reports.
 	singboxInvMu sync.RWMutex
 	singboxInv   map[string]model.SingBoxInventory
+	// singboxDiscoverAudit tracks the last audited discovery fingerprint per
+	// node so automatic inventory reports do not append an audit row, and
+	// therefore rewrite the encrypted JSON store, on every agent poll.
+	singboxDiscoverAuditMu sync.Mutex
+	singboxDiscoverAudit   map[string]singBoxDiscoveryAuditState
 
 	// agentRuntime is live proof of the startup flags reported by node-agent
 	// heartbeats. It is intentionally in-memory: old agents omit it, new agents

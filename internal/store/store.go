@@ -699,7 +699,7 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 		n.WireGuardIP = wgIP
 	}
 	if !hostFacts.ReportedAt.IsZero() {
-		durableChanged = durableChanged || n.HostFacts != hostFacts
+		durableChanged = durableChanged || hostFactsDurableChanged(n.HostFacts, hostFacts)
 		n.HostFacts = hostFacts
 	}
 	s.state.Nodes[nodeID] = n
@@ -712,6 +712,28 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	}
 	s.metricsPersistedAt[nodeID] = now
 	return nil
+}
+
+func hostFactsDurableChanged(prev, next model.HostFacts) bool {
+	prevBoot, nextBoot := prev.BootTime, next.BootTime
+	prev.ReportedAt = time.Time{}
+	next.ReportedAt = time.Time{}
+	prev.BootTime = time.Time{}
+	next.BootTime = time.Time{}
+	if prev != next {
+		return true
+	}
+	if prevBoot.IsZero() || nextBoot.IsZero() {
+		return !prevBoot.Equal(nextBoot)
+	}
+	return absDuration(prevBoot.Sub(nextBoot)) > 2*time.Minute
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 // MarkStaleNodesOffline flips Online -> false for every node that is currently

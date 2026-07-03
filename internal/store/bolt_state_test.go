@@ -290,6 +290,30 @@ func TestBoltStateRecordLevelNodeKVAndAudit(t *testing.T) {
 	if !ok || n.Geo == nil || n.Geo.Country != "JP" || n.Geo.City != "Tokyo" {
 		t.Fatalf("node geo not updated: ok=%v node=%+v", ok, n)
 	}
+	metricsAt := now.Add(2 * time.Minute)
+	if err := bs.UpdateMetrics(
+		"n2",
+		model.Metrics{CPUPercent: 12.5, MemoryTotal: 1024, CollectedAt: metricsAt},
+		"0.2.7",
+		"203.0.113.7",
+		"2001:db8::7",
+		"10.0.0.7",
+		"fd00::7",
+		"10.66.0.7",
+		model.HostFacts{Hostname: "node-two", OS: "linux", ReportedAt: metricsAt},
+	); err != nil {
+		t.Fatal(err)
+	}
+	n, ok, err = bs.Node("n2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || !n.Online || n.AgentVersion != "0.2.7" || n.PublicIP != "203.0.113.7" || n.WireGuardIP != "10.66.0.7" || n.HostFacts.Hostname != "node-two" {
+		t.Fatalf("node metrics not updated: ok=%v node=%+v", ok, n)
+	}
+	if err := bs.UpdateMetrics("missing", model.Metrics{}, "", "", "", "", "", "", model.HostFacts{}); err == nil {
+		t.Fatal("expected missing node metrics update to fail")
+	}
 	nodes, err := bs.Nodes()
 	if err != nil {
 		t.Fatal(err)

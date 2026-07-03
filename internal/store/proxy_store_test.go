@@ -272,11 +272,55 @@ func TestBoltStateRecordLevelProxyCollections(t *testing.T) {
 	if !ok || usage.UserBytes["u-a"] != 2048 {
 		t.Fatalf("proxy usage snapshot not recovered: ok=%v usage=%+v", ok, usage)
 	}
+	batchProfile := model.ProxyNodeProfile{
+		NodeID: "node-b", Core: model.ProxyCoreSingbox, InboundIDs: []string{"in-a"},
+		Hostname: "node-b.dns.example.com", StatsAPI: "127.0.0.1:9191",
+	}
+	batchSnapshot := model.ProxyUsageSnapshot{
+		NodeID: "node-b", At: now.Add(time.Minute), CoreUptimeSec: 101, UserBytes: map[string]int64{"u-b": 4096},
+	}
+	if err := bs.ApplyProxyUsageUpdate([]model.ProxyUser{{
+		ID: "u-b", Name: "bob", Enabled: true, UUID: proxyUUIDPlain,
+		Password: proxyPasswordPlain, SubToken: proxySubTokenPlain,
+		InboundIDs: []string{"in-a"}, Status: model.ProxyUserStatusActive, CreatedAt: now.Add(time.Minute),
+	}}, &batchProfile, &batchSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	batchUser, ok, err := bs.ProxyUser("u-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || batchUser.Password != proxyPasswordPlain || batchUser.SubToken != proxySubTokenPlain || batchUser.UpdatedAt.IsZero() {
+		t.Fatalf("batched proxy user not recovered: ok=%v user=%+v", ok, batchUser)
+	}
+	batchedProfile, ok, err := bs.ProxyNodeProfile("node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || batchedProfile.ID != "node-b" || batchedProfile.StatsAPI != "127.0.0.1:9191" {
+		t.Fatalf("batched proxy profile not recovered: ok=%v profile=%+v", ok, batchedProfile)
+	}
+	batchedUsage, ok, err := bs.ProxyUsageSnapshot("node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || batchedUsage.CoreUptimeSec != 101 || batchedUsage.UserBytes["u-b"] != 4096 {
+		t.Fatalf("batched proxy usage not recovered: ok=%v usage=%+v", ok, batchedUsage)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain} {
+		if strings.Contains(string(raw), leak) {
+			t.Fatalf("batched proxy secret leaked to bbolt store: %q", leak)
+		}
+	}
 	exported, err := bs.ExportState()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exported.ProxyUsers["u-a"].SubToken != proxySubTokenPlain || exported.ProxyInbounds["in-a"].RealityPrivateKey != proxyRealityPrivateKeyPlain {
+	if exported.ProxyUsers["u-a"].SubToken != proxySubTokenPlain || exported.ProxyUsers["u-b"].SubToken != proxySubTokenPlain || exported.ProxyInbounds["in-a"].RealityPrivateKey != proxyRealityPrivateKeyPlain {
 		t.Fatalf("proxy records did not export/decrypt: %+v %+v", exported.ProxyUsers["u-a"], exported.ProxyInbounds["in-a"])
 	}
 

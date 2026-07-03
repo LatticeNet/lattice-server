@@ -554,6 +554,47 @@ func (bs *BoltStateStore) Nodes() ([]model.Node, error) {
 	return nodes, nil
 }
 
+func (bs *BoltStateStore) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, publicIPv6, internalIP, internalIPv6, wgIP string, hostFacts model.HostFacts) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		var n model.Node
+		ok, err := getRecord(tx, boltBucketNodes, nodeID, &n)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("node %q not found", nodeID)
+		}
+		n.Metrics = metrics
+		n.LastSeen = time.Now().UTC()
+		n.Online = true
+		if version != "" {
+			n.AgentVersion = version
+		}
+		if publicIP != "" {
+			n.PublicIP = publicIP
+		}
+		if publicIPv6 != "" {
+			n.PublicIPv6 = publicIPv6
+		}
+		if internalIP != "" {
+			n.InternalIP = internalIP
+		}
+		if internalIPv6 != "" {
+			n.InternalIPv6 = internalIPv6
+		}
+		if wgIP != "" {
+			n.WireGuardIP = wgIP
+		}
+		if !hostFacts.ReportedAt.IsZero() {
+			n.HostFacts = hostFacts
+		}
+		return putRecord(tx, boltBucketNodes, nodeID, n)
+	})
+}
+
 func (bs *BoltStateStore) PutKV(entry model.KVEntry) error {
 	entry.UpdatedAt = time.Now().UTC()
 	return bs.db.Update(func(tx *bolt.Tx) error {
@@ -2335,6 +2376,41 @@ func (bs *BoltStateStore) UpsertProxyUsageSnapshot(snapshot model.ProxyUsageSnap
 			return err
 		}
 		return putRecord(tx, boltBucketProxyUsage, snapshot.NodeID, snapshot)
+	})
+}
+
+func (bs *BoltStateStore) ApplyProxyUsageUpdate(users []model.ProxyUser, profile *model.ProxyNodeProfile, snapshot *model.ProxyUsageSnapshot) error {
+	if len(users) == 0 && profile == nil && snapshot == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		for _, user := range users {
+			user = normalizeProxyUserForStore(user, now)
+			enc, err := encryptProxyUserRecord(user.ID, user, bs.cipher)
+			if err != nil {
+				return err
+			}
+			if err := putRecord(tx, boltBucketProxyUsers, user.ID, enc); err != nil {
+				return err
+			}
+		}
+		if profile != nil {
+			normalized := normalizeProxyNodeProfileForStore(*profile, now)
+			if err := putRecord(tx, boltBucketProxyProfiles, normalized.NodeID, normalized); err != nil {
+				return err
+			}
+		}
+		if snapshot != nil {
+			normalized := normalizeProxyUsageSnapshotForStore(*snapshot, now)
+			if err := putRecord(tx, boltBucketProxyUsage, normalized.NodeID, normalized); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

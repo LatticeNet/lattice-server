@@ -141,6 +141,78 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	}
 }
 
+func TestAgentUpdateApplyRequiresHeartbeatConfirmation(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	plan := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	if plan.StatusCode != http.StatusOK {
+		plan.Body.Close()
+		t.Fatalf("plan update failed: %d", plan.StatusCode)
+	}
+	var approval approvalView
+	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
+		t.Fatal(err)
+	}
+	plan.Body.Close()
+
+	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})),
+		cookies, csrf)
+	approve.Body.Close()
+	if approve.StatusCode != http.StatusOK {
+		t.Fatalf("approve update failed: %d", approve.StatusCode)
+	}
+
+	tasksRec := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-a", "", nodeToken)
+	if tasksRec.Code != http.StatusOK {
+		t.Fatalf("lease update task failed: %d %s", tasksRec.Code, tasksRec.Body.String())
+	}
+	var tasks []agentTaskView
+	if err := json.NewDecoder(tasksRec.Body).Decode(&tasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].LeaseID == "" {
+		t.Fatalf("expected one leased update task, got %+v", tasks)
+	}
+	result := `{"node_id":"node-a","result":{"task_id":` + string(mustJSON(t, tasks[0].ID)) +
+		`,"lease_id":` + string(mustJSON(t, tasks[0].LeaseID)) + `,"exit_code":0,"stdout":"installed"}}`
+	resultRec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", result, nodeToken)
+	if resultRec.Code != http.StatusOK {
+		t.Fatalf("task result failed: %d %s", resultRec.Code, resultRec.Body.String())
+	}
+
+	awaiting, ok := st.Approval(approval.ID)
+	if !ok || awaiting.Status != model.ApprovalApproved || !strings.Contains(awaiting.Reason, "awaiting agent version confirmation") {
+		t.Fatalf("successful update task should await heartbeat confirmation: ok=%v approval=%+v", ok, awaiting)
+	}
+	policy, ok := st.AgentUpdatePolicy("node-a")
+	if !ok || policy.LastAppliedVersion != "" || !policy.LastAppliedAt.IsZero() || !strings.Contains(policy.LastError, "awaiting agent version confirmation") {
+		t.Fatalf("policy should not be applied until target-version heartbeat: ok=%v policy=%+v", ok, policy)
+	}
+
+	hello := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello", `{"node_id":"node-a","version":"0.2.0"}`, nodeToken)
+	if hello.Code != http.StatusOK {
+		t.Fatalf("target-version heartbeat failed: %d %s", hello.Code, hello.Body.String())
+	}
+	confirmed, ok := st.Approval(approval.ID)
+	if !ok || confirmed.Status != model.ApprovalApplied || confirmed.Reason != "" {
+		t.Fatalf("target-version heartbeat should confirm update approval: ok=%v approval=%+v", ok, confirmed)
+	}
+	policy, ok = st.AgentUpdatePolicy("node-a")
+	if !ok || policy.LastAppliedVersion != "0.2.0" || policy.LastAppliedAt.IsZero() || policy.LastError != "" {
+		t.Fatalf("target-version heartbeat should confirm update policy: ok=%v policy=%+v", ok, policy)
+	}
+}
+
 func TestAgentUpdateAutoPlanDoesNotDuplicatePendingApproval(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
@@ -504,6 +576,75 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("stale update approval list cleanup queued tasks: %+v", st.Tasks())
+	}
+}
+
+func TestDismissStaleAgentUpdateApprovalHidesItFromDefaultList(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.3.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    strings.Repeat("a", 64), InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	dismiss := doJSON(t, handler, http.MethodPost, "/api/network/approvals/dismiss",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID})), cookies, csrf)
+	defer dismiss.Body.Close()
+	if dismiss.StatusCode != http.StatusOK {
+		t.Fatalf("dismiss stale approval should succeed, got %d", dismiss.StatusCode)
+	}
+	var dismissed approvalView
+	if err := json.NewDecoder(dismiss.Body).Decode(&dismissed); err != nil {
+		t.Fatal(err)
+	}
+	if dismissed.ID != approval.ID || dismissed.Status != "dismissed" || !dismissed.Stale {
+		t.Fatalf("dismiss response should mark stale approval dismissed, got %+v", dismissed)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != "dismissed" {
+		t.Fatalf("dismiss should persist a tombstone without deleting approval: ok=%v approval=%+v", ok, stored)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/network/approvals", "", cookies, csrf)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list approvals failed: %d", list.StatusCode)
+	}
+	var visible []approvalView
+	if err := json.NewDecoder(list.Body).Decode(&visible); err != nil {
+		t.Fatal(err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("dismissed stale approval should be hidden from default list, got %+v", visible)
+	}
+
+	withDismissed := doJSON(t, handler, http.MethodGet, "/api/network/approvals?include_dismissed=true", "", cookies, csrf)
+	defer withDismissed.Body.Close()
+	if withDismissed.StatusCode != http.StatusOK {
+		t.Fatalf("list approvals with dismissed failed: %d", withDismissed.StatusCode)
+	}
+	var all []approvalView
+	if err := json.NewDecoder(withDismissed.Body).Decode(&all); err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 1 || all[0].ID != approval.ID || all[0].Status != "dismissed" {
+		t.Fatalf("include_dismissed should return dismissed approval, got %+v", all)
 	}
 }
 

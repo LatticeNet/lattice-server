@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	agentUpdatePlugin       = "agentupdate"
-	agentUpdateAction       = "update-agent"
-	agentUpdateActionPrefix = agentUpdateAction + ":"
+	agentUpdatePlugin         = "agentupdate"
+	agentUpdateAction         = "update-agent"
+	agentUpdateActionPrefix   = agentUpdateAction + ":"
+	agentUpdateAwaitingPrefix = "awaiting agent version confirmation"
 
 	defaultAgentInstallPath   = "/opt/lattice/lattice-agent"
 	defaultAgentServiceName   = "lattice-agent.service"
@@ -898,6 +899,18 @@ func (s *Server) agentUpdateApprovalStaleReason(approval model.Approval) string 
 	return reason
 }
 
+func (s *Server) dismissibleAgentUpdateApprovalReason(approval model.Approval) (string, bool) {
+	reason := strings.TrimSpace(approval.Reason)
+	if strings.HasPrefix(reason, errAgentUpdateApprovalStale.Error()) {
+		return reason, true
+	}
+	stale, reason := s.agentUpdateApprovalLocalStaleness(approval)
+	if stale {
+		return reason, true
+	}
+	return "", false
+}
+
 func agentUpdateApprovalStaleReasonWithDetails(details string) string {
 	details = strings.TrimSpace(details)
 	if details == "" {
@@ -1080,15 +1093,14 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		policy = model.AgentUpdatePolicy{NodeID: payload.NodeID}
 	}
 	if result.Error == "" && result.ExitCode == 0 {
-		policy.LastAppliedVersion = payload.TargetVersion
-		policy.LastAppliedAt = result.FinishedAt
-		policy.LastError = ""
-		approval.Status = model.ApprovalApplied
-		approval.Reason = ""
+		reason := agentUpdateAwaitingConfirmationReason(payload.TargetVersion)
+		policy.LastError = reason
+		approval.Status = model.ApprovalApproved
+		approval.Reason = reason
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,
-			Action:   "agent.update.applied",
+			Action:   "agent.update.awaiting_confirmation",
 			Decision: "allow",
 			Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
 		})
@@ -1110,6 +1122,64 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	}
 	approval.UpdatedAt = time.Now().UTC()
 	return s.store.UpsertApproval(approval)
+}
+
+func agentUpdateAwaitingConfirmationReason(targetVersion string) string {
+	targetVersion = strings.TrimSpace(targetVersion)
+	if targetVersion == "" {
+		return agentUpdateAwaitingPrefix
+	}
+	return agentUpdateAwaitingPrefix + ": " + targetVersion
+}
+
+func isAgentUpdateAwaitingConfirmation(approval model.Approval) bool {
+	return approval.Plugin == agentUpdatePlugin &&
+		approval.Status == model.ApprovalApproved &&
+		strings.HasPrefix(strings.TrimSpace(approval.Reason), agentUpdateAwaitingPrefix)
+}
+
+func (s *Server) reconcileAgentUpdateHeartbeat(r *http.Request, nodeID, version string, seenAt time.Time) error {
+	nodeID = strings.TrimSpace(nodeID)
+	version = strings.TrimSpace(version)
+	if nodeID == "" || version == "" {
+		return nil
+	}
+	if seenAt.IsZero() {
+		seenAt = s.now().UTC()
+	}
+	for _, approval := range s.store.Approvals() {
+		if approval.NodeID != nodeID || !isAgentUpdateAwaitingConfirmation(approval) {
+			continue
+		}
+		payload, err := agentUpdatePayloadFromApproval(approval)
+		if err != nil || payload.TargetVersion != version {
+			continue
+		}
+		policy, ok := s.store.AgentUpdatePolicy(nodeID)
+		if !ok {
+			policy = model.AgentUpdatePolicy{NodeID: nodeID}
+		}
+		policy.LastAppliedVersion = payload.TargetVersion
+		policy.LastAppliedAt = seenAt.UTC()
+		policy.LastError = ""
+		approval.Status = model.ApprovalApplied
+		approval.Reason = ""
+		approval.UpdatedAt = seenAt.UTC()
+		if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
+			return err
+		}
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return err
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   nodeID,
+			Action:   "agent.update.applied",
+			Decision: "allow",
+			Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
+		})
+	}
+	return nil
 }
 
 func boundedTaskError(result model.TaskResult) string {

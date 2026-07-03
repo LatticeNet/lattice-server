@@ -837,6 +837,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/network/approvals", s.withAuth("", s.handleApprovals))
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
 	mux.HandleFunc("/api/network/approvals/reject", s.withAuth("network:apply", s.handleRejectApproval))
+	mux.HandleFunc("/api/network/approvals/dismiss", s.withAuth("network:apply", s.handleDismissApproval))
 	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleProxySubscription))
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
 	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
@@ -4352,14 +4353,29 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	includeDismissed := requestBool(r, "include_dismissed")
 	approvals := s.store.Approvals()
 	visible := make([]model.Approval, 0, len(approvals))
 	for _, approval := range approvals {
+		if approval.Status == approvalStatusDismissed && !includeDismissed {
+			continue
+		}
 		if s.approvalVisibleToPrincipal(p, approval) {
 			visible = append(visible, approval)
 		}
 	}
 	writeJSON(w, http.StatusOK, toApprovalViews(visible))
+}
+
+const approvalStatusDismissed = "dismissed"
+
+func requestBool(r *http.Request, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval) bool {
@@ -5198,6 +5214,60 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
 }
 
+func (s *Server) handleDismissApproval(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ApprovalID string `json:"approval_id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	approval, ok := s.store.Approval(strings.TrimSpace(req.ApprovalID))
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("approval not found"))
+		return
+	}
+	if !s.requireApprovalDecisionScopes(w, p, approval) {
+		return
+	}
+	if approval.Status == approvalStatusDismissed {
+		writeJSON(w, http.StatusOK, toApprovalView(approval))
+		return
+	}
+	if approval.Plugin != agentUpdatePlugin {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "only stale agent update approvals can be dismissed"))
+		return
+	}
+	if s.hasActiveTaskForApproval(approval.ID) {
+		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "approval has an active apply task and cannot be dismissed"))
+		return
+	}
+	reason, ok := s.dismissibleAgentUpdateApprovalReason(approval)
+	if !ok {
+		writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, "approval is not stale; reject or approve it explicitly"))
+		return
+	}
+	approval.Status = approvalStatusDismissed
+	approval.Reason = reason
+	approval.UpdatedAt = s.now()
+	if err := s.store.UpsertApproval(approval); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   "network." + approval.Plugin + ".dismiss",
+		Scope:    approvalDecisionAuditScope(approval),
+		Decision: "dismiss",
+		Metadata: map[string]string{"approval_id": approval.ID, "stale_code": agentUpdateApprovalStaleCode},
+	})
+	writeJSON(w, http.StatusOK, toApprovalView(approval))
+}
+
 func (s *Server) requireApprovalDecisionScopes(w http.ResponseWriter, p principal, approval model.Approval) bool {
 	if !s.requireNodeScope(w, p, "network:apply", approval.NodeID) {
 		return false
@@ -5305,6 +5375,10 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if err := s.reconcileAgentUpdateHeartbeat(r, req.NodeID, req.Version, n.LastSeen); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	s.maybeTriggerDDNS(req.NodeID, oldV4, oldV6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -5337,6 +5411,10 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	hostFacts, _ := normalizeHostFacts(req.HostFacts, s.now())
 	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, inV4, inV6, req.WireGuardIP, hostFacts); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.reconcileAgentUpdateHeartbeat(r, req.NodeID, req.Version, s.now()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

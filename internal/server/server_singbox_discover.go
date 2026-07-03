@@ -21,7 +21,7 @@ import (
 // see proxies on machines provisioned out-of-band — without Lattice owning or
 // mutating them. Nothing here writes node config.
 
-const singBoxDiscoveryAuditInterval = 10 * time.Minute
+const singBoxDiscoveryAuditInterval = 6 * time.Hour
 
 type singBoxDiscoveryAuditState struct {
 	fingerprint string

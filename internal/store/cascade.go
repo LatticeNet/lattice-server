@@ -407,6 +407,7 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 	// purged with the record).
 	if mutate {
 		delete(s.state.Nodes, nodeID)
+		delete(s.metricsPersistedAt, nodeID)
 	}
 
 	return report, true

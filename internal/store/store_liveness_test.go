@@ -1,10 +1,12 @@
 package store
 
 import (
+	"os"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/secret"
 )
 
 func TestMarkStaleNodesOffline(t *testing.T) {
@@ -102,5 +104,94 @@ func TestTouchNodeTokenRecordsUseAndThrottles(t *testing.T) {
 	n, _ = s.Node("node-a")
 	if !n.TokenLastUsedAt.IsZero() {
 		t.Fatalf("token rotation must clear stale last-used timestamp: %s", n.TokenLastUsedAt)
+	}
+}
+
+func TestUpdateMetricsThrottlesPureHeartbeatPersistence(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	s, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNode(model.Node{ID: "node-a", Name: "Node A"}); err != nil {
+		t.Fatal(err)
+	}
+
+	first := model.Metrics{CPUPercent: 10, Load1: 0.25, NetRxBytes: 100, CollectedAt: time.Unix(100, 0).UTC()}
+	if err := s.UpdateMetrics("node-a", first, "0.2.7", "203.0.113.10", "", "10.0.0.10", "", "10.44.0.10", model.HostFacts{}); err != nil {
+		t.Fatalf("first metrics update: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, ok := s.Node("node-a")
+	if !ok {
+		t.Fatal("node missing after first metrics update")
+	}
+	firstSeen := n.LastSeen
+
+	time.Sleep(time.Millisecond)
+	second := model.Metrics{CPUPercent: 42, Load1: 1.5, NetRxBytes: 250, CollectedAt: time.Unix(110, 0).UTC()}
+	if err := s.UpdateMetrics("node-a", second, "0.2.7", "203.0.113.10", "", "10.0.0.10", "", "10.44.0.10", model.HostFacts{}); err != nil {
+		t.Fatalf("second metrics update: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("pure metrics heartbeat rewrote persisted state")
+	}
+	n, ok = s.Node("node-a")
+	if !ok {
+		t.Fatal("node missing after second metrics update")
+	}
+	if n.Metrics.CPUPercent != second.CPUPercent || n.Metrics.NetRxBytes != second.NetRxBytes {
+		t.Fatalf("in-memory metrics not refreshed: %+v", n.Metrics)
+	}
+	if !n.LastSeen.After(firstSeen) {
+		t.Fatalf("in-memory last_seen did not advance: first=%s second=%s", firstSeen, n.LastSeen)
+	}
+}
+
+func TestUpdateMetricsPersistsSlowChangingAgentFieldsImmediately(t *testing.T) {
+	path := t.TempDir() + "/state.json"
+	s, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNode(model.Node{ID: "node-a", Name: "Node A"}); err != nil {
+		t.Fatal(err)
+	}
+	metrics := model.Metrics{CPUPercent: 10, CollectedAt: time.Unix(100, 0).UTC()}
+	if err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
+		t.Fatalf("first metrics update: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.UpdateMetrics("node-a", metrics, "0.2.8", "203.0.113.11", "", "", "", "", model.HostFacts{}); err != nil {
+		t.Fatalf("slow field metrics update: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) == string(before) {
+		t.Fatalf("agent version/public IP change was not persisted")
+	}
+	reopened, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, ok := reopened.Node("node-a")
+	if !ok {
+		t.Fatal("node missing after reopen")
+	}
+	if n.AgentVersion != "0.2.8" || n.PublicIP != "203.0.113.11" {
+		t.Fatalf("slow-changing fields not durable: version=%q public_ip=%q", n.AgentVersion, n.PublicIP)
 	}
 }

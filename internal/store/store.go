@@ -30,6 +30,10 @@ const maxMonitorResults = 500
 // unbounded otherwise; results are historical, so the oldest are evicted first.
 const maxTaskResults = 2000
 
+// metricsPersistenceInterval keeps hot heartbeat telemetry fresh in memory
+// without rewriting the full encrypted JSON store on every agent poll.
+const metricsPersistenceInterval = time.Minute
+
 type State struct {
 	Users           map[string]model.User               `json:"users"`
 	Tokens          map[string]model.Token              `json:"tokens"`
@@ -72,13 +76,14 @@ type State struct {
 }
 
 type Store struct {
-	mu            sync.Mutex
-	path          string
-	state         State
-	cipher        secret.Cipher // at-rest encryptor for persisted credentials
-	wal           *audit.WAL    // append-only tamper-evident audit log; nil for in-memory stores
-	walPath       string
-	walAnchorPath string
+	mu                 sync.Mutex
+	path               string
+	state              State
+	metricsPersistedAt map[string]time.Time
+	cipher             secret.Cipher // at-rest encryptor for persisted credentials
+	wal                *audit.WAL    // append-only tamper-evident audit log; nil for in-memory stores
+	walPath            string
+	walAnchorPath      string
 }
 
 // Open loads (or initializes) the store at path, resolving the at-rest
@@ -106,7 +111,7 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 	if cph == nil {
 		cph = secret.Disabled()
 	}
-	s := &Store{path: path, state: emptyState(), cipher: cph}
+	s := &Store{path: path, state: emptyState(), metricsPersistedAt: map[string]time.Time{}, cipher: cph}
 	if path == "" {
 		return s, nil
 	}
@@ -136,7 +141,16 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	s.ensureMaps()
+	s.seedMetricsPersistence()
 	return s, nil
+}
+
+func (s *Store) seedMetricsPersistence() {
+	for nodeID, n := range s.state.Nodes {
+		if !n.LastSeen.IsZero() {
+			s.metricsPersistedAt[nodeID] = n.LastSeen
+		}
+	}
 }
 
 func emptyState() State {
@@ -521,6 +535,14 @@ func (s *Store) UpsertNode(n model.Node) error {
 		n.CreatedAt = time.Now().UTC()
 	}
 	s.state.Nodes[n.ID] = cloneNode(n)
+	if !n.LastSeen.IsZero() {
+		if s.metricsPersistedAt == nil {
+			s.metricsPersistedAt = map[string]time.Time{}
+		}
+		s.metricsPersistedAt[n.ID] = n.LastSeen
+	} else if s.metricsPersistedAt != nil {
+		delete(s.metricsPersistedAt, n.ID)
+	}
 	return s.Save()
 }
 
@@ -614,32 +636,52 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	if !ok {
 		return fmt.Errorf("node %q not found", nodeID)
 	}
+	if s.metricsPersistedAt == nil {
+		s.metricsPersistedAt = map[string]time.Time{}
+	}
+	now := time.Now().UTC()
+	durableChanged := !n.Online
 	n.Metrics = metrics
-	n.LastSeen = time.Now().UTC()
+	n.LastSeen = now
 	n.Online = true
 	if version != "" {
+		durableChanged = durableChanged || n.AgentVersion != version
 		n.AgentVersion = version
 	}
 	if publicIP != "" {
+		durableChanged = durableChanged || n.PublicIP != publicIP
 		n.PublicIP = publicIP
 	}
 	if publicIPv6 != "" {
+		durableChanged = durableChanged || n.PublicIPv6 != publicIPv6
 		n.PublicIPv6 = publicIPv6
 	}
 	if internalIP != "" {
+		durableChanged = durableChanged || n.InternalIP != internalIP
 		n.InternalIP = internalIP
 	}
 	if internalIPv6 != "" {
+		durableChanged = durableChanged || n.InternalIPv6 != internalIPv6
 		n.InternalIPv6 = internalIPv6
 	}
 	if wgIP != "" {
+		durableChanged = durableChanged || n.WireGuardIP != wgIP
 		n.WireGuardIP = wgIP
 	}
 	if !hostFacts.ReportedAt.IsZero() {
+		durableChanged = durableChanged || n.HostFacts != hostFacts
 		n.HostFacts = hostFacts
 	}
 	s.state.Nodes[nodeID] = n
-	return s.Save()
+	lastPersisted, persisted := s.metricsPersistedAt[nodeID]
+	if persisted && !durableChanged && now.Sub(lastPersisted) < metricsPersistenceInterval {
+		return nil
+	}
+	if err := s.Save(); err != nil {
+		return err
+	}
+	s.metricsPersistedAt[nodeID] = now
+	return nil
 }
 
 // MarkStaleNodesOffline flips Online -> false for every node that is currently

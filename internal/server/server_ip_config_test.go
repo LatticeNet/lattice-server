@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -91,6 +92,12 @@ func TestNodeIPConfigHTTP(t *testing.T) {
 	if n.IPConfig == nil || n.IPConfig.Script != "echo 8.8.8.8" {
 		t.Fatalf("stored script missing: %+v", n.IPConfig)
 	}
+	if !auditMetadataSeen(st, "node.ip.config", "script_sha256", n.IPConfig.ScriptSHA256) {
+		t.Fatalf("script update audit missing script hash: %+v", st.AuditEvents())
+	}
+	if !auditMetadataSeen(st, "node.ip.config", "script_size_bytes", "12") {
+		t.Fatalf("script update audit missing script size: %+v", st.AuditEvents())
+	}
 
 	preserve := doJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",
 		`{"node_id":"node-a","mode":"script"}`,
@@ -119,5 +126,88 @@ func TestNodeIPConfigHTTP(t *testing.T) {
 	}
 	if n2, _ := st.Node("node-a"); n2.IPConfig != nil {
 		t.Fatalf("override not cleared: %+v", n2.IPConfig)
+	}
+}
+
+func TestNodeIPConfigScriptObeysTaskExecutionKillSwitch(t *testing.T) {
+	handler, st := newTaskExecutionDisabledTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	script := doJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",
+		`{"node_id":"node-a","mode":"script","script":"echo 8.8.8.8"}`,
+		cookies, csrf)
+	defer script.Body.Close()
+	if script.StatusCode != http.StatusConflict {
+		t.Fatalf("script ip-config under kill switch status = %d, want 409", script.StatusCode)
+	}
+	if code := errorCodeFromHTTPResponse(t, script); code != apiErrorTaskExecutionDisabled {
+		t.Fatalf("script ip-config under kill switch code = %q", code)
+	}
+	if n, _ := st.Node("node-a"); n.IPConfig != nil {
+		t.Fatalf("kill switch must not store script ip-config: %+v", n.IPConfig)
+	}
+	if !auditMetadataSeen(st, "node.ip.config", "script_sha256", shortSHA256("echo 8.8.8.8")) {
+		t.Fatalf("denied script update audit missing script hash: %+v", st.AuditEvents())
+	}
+
+	static := doJSON(t, handler, http.MethodPost, "/api/nodes/ip-config",
+		`{"node_id":"node-a","mode":"static","static_ipv4":"203.0.113.7"}`,
+		cookies, csrf)
+	defer static.Body.Close()
+	if static.StatusCode != http.StatusOK {
+		t.Fatalf("static ip-config should remain allowed under kill switch: %d", static.StatusCode)
+	}
+	if n, _ := st.Node("node-a"); n.IPConfig == nil || n.IPConfig.Mode != model.NodeIPModeStatic {
+		t.Fatalf("static ip-config not stored under kill switch: %+v", n.IPConfig)
+	}
+}
+
+func TestAgentConfigSuppressesScriptIPConfigWhenTaskExecutionDisabled(t *testing.T) {
+	handler, st := newTaskExecutionDisabledTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	node, ok := st.Node("node-a")
+	if !ok {
+		t.Fatal("node not enrolled")
+	}
+	node.IPConfig = &model.NodeIPConfig{
+		Mode:         model.NodeIPModeScript,
+		Script:       "echo 8.8.8.8",
+		ScriptSHA256: shortSHA256("echo 8.8.8.8"),
+	}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/config?node_id=node-a", nil)
+	req.Header.Set("Authorization", "Bearer "+nodeToken)
+	rec := serveReq(handler, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent config failed: %d (%s)", rec.Code, rec.Body.String())
+	}
+	var cfg model.AgentConfig
+	if err := json.NewDecoder(rec.Body).Decode(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IPConfig != nil {
+		t.Fatalf("kill switch must suppress script ip-config in agent config: %+v", cfg.IPConfig)
+	}
+
+	node.IPConfig = &model.NodeIPConfig{Mode: model.NodeIPModeStatic, StaticIPv4: "203.0.113.7"}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	rec = serveReq(handler, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("agent config for static failed: %d (%s)", rec.Code, rec.Body.String())
+	}
+	cfg = model.AgentConfig{}
+	if err := json.NewDecoder(rec.Body).Decode(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IPConfig == nil || cfg.IPConfig.Mode != model.NodeIPModeStatic || cfg.IPConfig.StaticIPv4 != "203.0.113.7" {
+		t.Fatalf("kill switch should still return non-script ip-config: %+v", cfg.IPConfig)
 	}
 }

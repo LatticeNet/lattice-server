@@ -101,8 +101,15 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 			MaxBatchLines: defaultAgentDebugMaxBatchLines,
 		},
 		TerminalTransport: normalizeNodeTerminalTransport(node.TerminalTransport),
-		IPConfig:          node.IPConfig,
+		IPConfig:          s.agentIPConfig(node.IPConfig),
 	})
+}
+
+func (s *Server) agentIPConfig(cfg *model.NodeIPConfig) *model.NodeIPConfig {
+	if s.taskExecutionDisabled && cfg != nil && cfg.Mode == model.NodeIPModeScript {
+		return nil
+	}
+	return cfg
 }
 
 // normalizeNodeTerminalTransport clamps a stored per-node transport to the wire
@@ -175,8 +182,7 @@ func (s *Server) handleNodeTerminalTransport(w http.ResponseWriter, r *http.Requ
 // handleNodeIPConfig sets (or clears) a node's public-IP discovery override —
 // the per-node IP config the agent polls via AgentConfig. An empty mode clears
 // the override so the node falls back to its agent's startup flags. Mirrors
-// handleNodeTerminalTransport's node:admin gating and audit. Script-based
-// discovery is intentionally not accepted here (separate sandboxed feature).
+// handleNodeTerminalTransport's node:admin gating and audit.
 func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -211,10 +217,21 @@ func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	mode := ""
+	if s.taskExecutionDisabled && cfg != nil && cfg.Mode == model.NodeIPModeScript {
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   node.ID,
+			Action:   "node.ip.config",
+			Scope:    "node:admin",
+			Decision: "deny",
+			Reason:   errTaskExecutionDisabled.Error(),
+			Metadata: nodeIPConfigAuditMetadata(cfg),
+		})
+		writeTaskExecutionDisabled(w)
+		return
+	}
 	if cfg != nil {
 		cfg.UpdatedAt = s.now().UTC()
-		mode = cfg.Mode
 	}
 	node.IPConfig = cfg
 	if err := s.store.UpsertNode(node); err != nil {
@@ -226,9 +243,22 @@ func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p pr
 		NodeID:   node.ID,
 		Action:   "node.ip.config",
 		Scope:    "node:admin",
-		Metadata: map[string]string{"mode": mode},
+		Metadata: nodeIPConfigAuditMetadata(cfg),
 	})
 	writeJSON(w, http.StatusOK, s.toNodeView(node))
+}
+
+func nodeIPConfigAuditMetadata(cfg *model.NodeIPConfig) map[string]string {
+	metadata := map[string]string{"mode": ""}
+	if cfg == nil {
+		return metadata
+	}
+	metadata["mode"] = cfg.Mode
+	if cfg.Mode == model.NodeIPModeScript {
+		metadata["script_sha256"] = cfg.ScriptSHA256
+		metadata["script_size_bytes"] = strconv.Itoa(len([]byte(cfg.Script)))
+	}
+	return metadata
 }
 
 // validateNodeIPConfig validates an operator-supplied per-node IP override. An

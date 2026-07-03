@@ -1392,7 +1392,7 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		result.CollectorSource = profile.UsageCollectorSource
 		result.CollectorStatus = profile.UsageCollectorStatus
 		if profile.UsageCollectorStatus == model.ProxyUsageCollectorStatusError {
-			if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
+			if err := s.store.ApplyProxyUsageUpdate(nil, &profile, nil); err != nil {
 				return proxyUsageApplyResult{}, err
 			}
 			return result, nil
@@ -1427,15 +1427,12 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		sanitized[userID] = value
 	}
 	snapshot.UserBytes = sanitized
-	if collectorUpdated {
-		if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
-			return proxyUsageApplyResult{}, err
-		}
-	}
 
 	previous, hadPrevious := s.store.ProxyUsageSnapshot(snapshot.NodeID)
 	result.UsersIgnored = ignored
 	now := s.now()
+	usersToSave := []model.ProxyUser{}
+	alertsToEmit := []proxyUserNotificationFire{}
 	if hadPrevious {
 		reset := snapshot.CoreUptimeSec < previous.CoreUptimeSec
 		for userID, current := range snapshot.UserBytes {
@@ -1459,10 +1456,8 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 			user.LastSeenAt = snapshot.At
 			user.Status = derivedProxyUserStatusAt(user, now)
 			user, alerts := nextProxyUserNotifications(user, now)
-			if err := s.store.UpsertProxyUser(user); err != nil {
-				return proxyUsageApplyResult{}, err
-			}
-			s.emitProxyUserNotifications(alerts)
+			usersToSave = append(usersToSave, user)
+			alertsToEmit = append(alertsToEmit, alerts...)
 			result.BytesDelta += delta
 			result.UsersUpdated++
 			result.AlertsFired += len(alerts)
@@ -1473,17 +1468,20 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 			user.LastSeenAt = snapshot.At
 			user.Status = derivedProxyUserStatusAt(user, now)
 			user, alerts := nextProxyUserNotifications(user, now)
-			if err := s.store.UpsertProxyUser(user); err != nil {
-				return proxyUsageApplyResult{}, err
-			}
-			s.emitProxyUserNotifications(alerts)
+			usersToSave = append(usersToSave, user)
+			alertsToEmit = append(alertsToEmit, alerts...)
 			result.UsersUpdated++
 			result.AlertsFired += len(alerts)
 		}
 	}
-	if err := s.store.UpsertProxyUsageSnapshot(snapshot); err != nil {
+	var profileToSave *model.ProxyNodeProfile
+	if collectorUpdated {
+		profileToSave = &profile
+	}
+	if err := s.store.ApplyProxyUsageUpdate(usersToSave, profileToSave, &snapshot); err != nil {
 		return proxyUsageApplyResult{}, err
 	}
+	s.emitProxyUserNotifications(alertsToEmit)
 	return result, nil
 }
 

@@ -2139,12 +2139,17 @@ func (s *Store) DeleteProxyInbound(id string) error {
 func (s *Store) UpsertProxyUser(u model.ProxyUser) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	u.UpdatedAt = time.Now().UTC()
+	u = normalizeProxyUserForStore(u, time.Now().UTC())
+	s.state.ProxyUsers[u.ID] = u
+	return s.Save()
+}
+
+func normalizeProxyUserForStore(u model.ProxyUser, now time.Time) model.ProxyUser {
+	u.UpdatedAt = now
 	if u.CreatedAt.IsZero() {
 		u.CreatedAt = u.UpdatedAt
 	}
-	s.state.ProxyUsers[u.ID] = u
-	return s.Save()
+	return u
 }
 
 // ProxyUser returns a proxy user by id.
@@ -2207,15 +2212,20 @@ func (s *Store) DeleteProxyUser(id string) error {
 func (s *Store) UpsertProxyNodeProfile(profile model.ProxyNodeProfile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	profile.UpdatedAt = time.Now().UTC()
+	profile = normalizeProxyNodeProfileForStore(profile, time.Now().UTC())
+	s.state.ProxyProfiles[profile.NodeID] = profile
+	return s.Save()
+}
+
+func normalizeProxyNodeProfileForStore(profile model.ProxyNodeProfile, now time.Time) model.ProxyNodeProfile {
+	profile.UpdatedAt = now
 	if profile.CreatedAt.IsZero() {
 		profile.CreatedAt = profile.UpdatedAt
 	}
 	if profile.ID == "" {
 		profile.ID = profile.NodeID
 	}
-	s.state.ProxyProfiles[profile.NodeID] = profile
-	return s.Save()
+	return profile
 }
 
 // ProxyNodeProfile returns a proxy node profile by node id.
@@ -2253,10 +2263,37 @@ func (s *Store) DeleteProxyNodeProfile(nodeID string) error {
 func (s *Store) UpsertProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if snapshot.At.IsZero() {
-		snapshot.At = time.Now().UTC()
-	}
+	snapshot = normalizeProxyUsageSnapshotForStore(snapshot, time.Now().UTC())
 	s.state.ProxyUsage[snapshot.NodeID] = snapshot
+	return s.Save()
+}
+
+func normalizeProxyUsageSnapshotForStore(snapshot model.ProxyUsageSnapshot, now time.Time) model.ProxyUsageSnapshot {
+	if snapshot.At.IsZero() {
+		snapshot.At = now
+	}
+	return snapshot
+}
+
+func (s *Store) ApplyProxyUsageUpdate(users []model.ProxyUser, profile *model.ProxyNodeProfile, snapshot *model.ProxyUsageSnapshot) error {
+	if len(users) == 0 && profile == nil && snapshot == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	for _, user := range users {
+		user = normalizeProxyUserForStore(user, now)
+		s.state.ProxyUsers[user.ID] = user
+	}
+	if profile != nil {
+		normalized := normalizeProxyNodeProfileForStore(*profile, now)
+		s.state.ProxyProfiles[normalized.NodeID] = normalized
+	}
+	if snapshot != nil {
+		normalized := normalizeProxyUsageSnapshotForStore(*snapshot, now)
+		s.state.ProxyUsage[normalized.NodeID] = normalized
+	}
 	return s.Save()
 }
 

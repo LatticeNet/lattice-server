@@ -127,6 +127,63 @@ func TestProxyCollectionsJSONStoreCRUDAndEncryption(t *testing.T) {
 	}
 }
 
+func TestApplyProxyUsageUpdateJSONStorePersistsReportAtomically(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	c := testCipher(t)
+	s, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_700_002_000, 0).UTC()
+
+	if err := s.ApplyProxyUsageUpdate(
+		[]model.ProxyUser{
+			{ID: "u-a", Name: "alice", Enabled: true, UUID: proxyUUIDPlain, Password: proxyPasswordPlain, SubToken: proxySubTokenPlain},
+			{ID: "u-b", Name: "bob", Enabled: true, UsedBytes: 4096},
+		},
+		&model.ProxyNodeProfile{NodeID: "node-a", Core: model.ProxyCoreSingbox, Hostname: "node-a.example.com"},
+		&model.ProxyUsageSnapshot{NodeID: "node-a", At: now, CoreUptimeSec: 30, UserBytes: map[string]int64{"u-a": 1024, "u-b": 4096}},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	user, ok := s.ProxyUser("u-a")
+	if !ok || user.UUID != proxyUUIDPlain || user.Password != proxyPasswordPlain || user.SubToken != proxySubTokenPlain || user.CreatedAt.IsZero() || user.UpdatedAt.IsZero() {
+		t.Fatalf("proxy user not stored with normalized timestamps/secrets: ok=%v user=%+v", ok, user)
+	}
+	profile, ok := s.ProxyNodeProfile("node-a")
+	if !ok || profile.ID != "node-a" || profile.Hostname != "node-a.example.com" || profile.UpdatedAt.IsZero() {
+		t.Fatalf("proxy profile not stored with normalized id/timestamps: ok=%v profile=%+v", ok, profile)
+	}
+	usage, ok := s.ProxyUsageSnapshot("node-a")
+	if !ok || usage.UserBytes["u-a"] != 1024 || usage.UserBytes["u-b"] != 4096 {
+		t.Fatalf("proxy usage not stored: ok=%v usage=%+v", ok, usage)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk := string(raw)
+	for _, leak := range []string{proxyUUIDPlain, proxyPasswordPlain, proxySubTokenPlain} {
+		if strings.Contains(disk, leak) {
+			t.Fatalf("batched proxy usage update leaked secret to JSON store: %q", leak)
+		}
+	}
+
+	reopened, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reopenedUser, ok := reopened.ProxyUser("u-a"); !ok || reopenedUser.UUID != proxyUUIDPlain {
+		t.Fatalf("batched proxy user did not decrypt after reopen: ok=%v user=%+v", ok, reopenedUser)
+	}
+	if reopenedUsage, ok := reopened.ProxyUsageSnapshot("node-a"); !ok || reopenedUsage.CoreUptimeSec != 30 {
+		t.Fatalf("batched usage did not persist after reopen: ok=%v usage=%+v", ok, reopenedUsage)
+	}
+}
+
 func TestBoltStateRecordLevelProxyCollections(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.db")

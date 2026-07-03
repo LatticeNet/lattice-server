@@ -167,6 +167,7 @@ func main() {
 		PluginRuntimeEnv: pluginRuntimeEnvAllowlist,
 		PluginTrust:      trustPolicy,
 		PublicURL:        publicURL,
+		MetricsToken:     os.Getenv("LATTICE_METRICS_TOKEN"),
 		CoreDNSBinary:    selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
 		GeoResolver:      geoResolver,
 		AgentReleaseRepo: agentReleaseRepo,

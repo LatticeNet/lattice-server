@@ -16,6 +16,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/audit"
 	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/secret"
+	"github.com/LatticeNet/lattice-server/internal/telemetry"
 )
 
 // maxSessions bounds how many sessions are retained to keep both memory and the
@@ -342,6 +343,11 @@ func (s *Store) ensureMaps() {
 }
 
 func (s *Store) Save() error {
+	start := time.Now()
+	var err error
+	defer func() {
+		telemetry.ObserveStoreSave(time.Since(start), err)
+	}()
 	if s.path == "" {
 		return nil
 	}
@@ -349,7 +355,7 @@ func (s *Store) Save() error {
 	// in the auto-generate case, the master key. It must match the 0o700 used
 	// by secret.generateKeyFile so neither path can widen the other (MkdirAll
 	// is a no-op once the directory exists, so the first creator's mode wins).
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	if err = os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
 	}
 	persist, err := encryptedState(s.state, s.cipher)
@@ -360,7 +366,30 @@ func (s *Store) Save() error {
 	if err != nil {
 		return err
 	}
-	return syncedAtomicWrite(s.path, data, 0o600)
+	err = syncedAtomicWrite(s.path, data, 0o600)
+	return err
+}
+
+// ReadyCheck verifies that the in-memory state is initialized and can still be
+// serialized with the configured at-rest cipher. It does not write to disk or
+// return state contents; callers use it for readiness probes.
+func (s *Store) ReadyCheck() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureMaps()
+	if s.path != "" {
+		if _, err := os.Stat(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat state file: %w", err)
+		}
+	}
+	persist, err := encryptedState(s.state, s.cipher)
+	if err != nil {
+		return fmt.Errorf("encrypt state: %w", err)
+	}
+	if _, err := json.Marshal(persist); err != nil {
+		return fmt.Errorf("marshal state: %w", err)
+	}
+	return nil
 }
 
 // syncedAtomicWrite writes data to a temp file, fsyncs the file, atomically

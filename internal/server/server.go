@@ -43,6 +43,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/store"
+	"github.com/LatticeNet/lattice-server/internal/telemetry"
 	"github.com/LatticeNet/lattice-server/internal/wireguard"
 	"github.com/LatticeNet/lattice-server/internal/worker"
 )
@@ -89,6 +90,10 @@ type Options struct {
 	// host, no trailing slash), used to build the OIDC redirect URL. Required
 	// for SSO login; empty disables the OIDC start/callback flow.
 	PublicURL string
+	// MetricsToken enables the /metrics endpoint when non-empty. The endpoint
+	// accepts only Authorization: Bearer <token>; empty keeps it hidden so public
+	// deployments do not expose fleet runtime counters by default.
+	MetricsToken string
 	// CoreDNSBinary optionally pins the CoreDNS executable that self-host DNS
 	// apply scripts may install. Empty preserves the fail-closed precondition
 	// that coredns already exists on the node.
@@ -173,6 +178,8 @@ type Server struct {
 	oidc *oidc.Manager
 	// publicURL is the external base URL used to build the OIDC redirect URI.
 	publicURL string
+	// metricsToken gates /metrics. Empty disables the route response entirely.
+	metricsToken string
 	// coreDNSBinary is copied into selfdns approval plans when configured. The
 	// apply path parses the reviewed plan, not this mutable server field.
 	coreDNSBinary selfdns.CoreDNSBinarySource
@@ -327,6 +334,7 @@ func New(opts Options) (*Server, error) {
 		},
 		oidc:                  oidc.NewManager(),
 		publicURL:             strings.TrimRight(opts.PublicURL, "/"),
+		metricsToken:          strings.TrimSpace(opts.MetricsToken),
 		coreDNSBinary:         coreDNSBinary,
 		geoResolver:           opts.GeoResolver,
 		agentReleaseRepo:      agentReleaseRepo,
@@ -849,6 +857,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("/readyz", s.handleReadyz)
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.Handle("/", s.staticHandler())
 	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
@@ -924,6 +934,59 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.build)
 }
 
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if s.metricsToken == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if !constantTokenEqual(bearerToken(r), s.metricsToken) {
+		writeError(w, http.StatusUnauthorized, errors.New("unauthorized"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	_, _ = io.WriteString(w, telemetry.Prometheus())
+}
+
+func constantTokenEqual(got, want string) bool {
+	if got == "" || want == "" {
+		return false
+	}
+	gotHash := sha256.Sum256([]byte(got))
+	wantHash := sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(gotHash[:], wantHash[:]) == 1
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	status := "ok"
+	code := http.StatusOK
+	checks := map[string]string{}
+	if err := s.store.ReadyCheck(); err != nil {
+		status = "error"
+		code = http.StatusServiceUnavailable
+		checks["store"] = err.Error()
+	} else {
+		checks["store"] = "ok"
+	}
+	if _, enabled, err := s.store.AuditWALVerify(); err != nil {
+		status = "error"
+		code = http.StatusServiceUnavailable
+		checks["audit_wal"] = err.Error()
+	} else if enabled {
+		checks["audit_wal"] = "ok"
+	} else {
+		checks["audit_wal"] = "disabled"
+	}
+	writeJSON(w, code, map[string]any{"status": status, "checks": checks})
+}
+
 func (s *Server) staticHandler() http.Handler {
 	var fileServer http.Handler
 	if s.webFS != nil {
@@ -975,11 +1038,16 @@ func staticCacheControl(name string) string {
 // agent endpoints so a flood cannot exhaust CPU on token verification.
 func (s *Server) withAgentLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &logResponseWriter{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			telemetry.ObserveAgentRequest(r.URL.Path, lw.status, time.Since(start))
+		}()
 		if !s.agentLimiter.Allow(s.clientIP(r)) {
-			writeError(w, http.StatusTooManyRequests, errors.New("rate limited"))
+			writeError(lw, http.StatusTooManyRequests, errors.New("rate limited"))
 			return
 		}
-		next(w, r)
+		next(lw, r)
 	}
 }
 
@@ -5850,11 +5918,13 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 		lw := &logResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(lw, r)
 		dur := time.Since(start)
+		slowRequest := dur >= slow
+		telemetry.ObserveHTTPRequest(r.URL.Path, lw.status, dur, slowRequest)
 		if !logAll && dur < slow && lw.status < 500 {
 			return
 		}
 		tag := "request"
-		if dur >= slow {
+		if slowRequest {
 			tag = "SLOW request"
 		}
 		s.logger.Printf("%s: %s %s -> %d %dB %s (ip=%s id=%s)",
@@ -5866,7 +5936,9 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 // recordAudit writes an audit event and, unlike a bare best-effort call, logs
 // when the sink fails so audit gaps are visible instead of silent.
 func (s *Server) recordAudit(ev model.AuditEvent) {
-	if err := audit.Record(s.store, ev); err != nil {
+	err := audit.Record(s.store, ev)
+	telemetry.ObserveAuditAppend(err)
+	if err != nil {
 		s.logger.Printf("audit: failed to record %q: %v", ev.Action, err)
 	}
 }

@@ -46,6 +46,18 @@ go run ./cmd/lattice-server
 
 Open `http://127.0.0.1:8088`.
 
+Readiness and runtime metrics are split by exposure risk. `/readyz` returns a
+small JSON readiness result for load balancers. `/metrics` is hidden unless a
+bearer token is configured, because it exposes fleet runtime counters:
+
+```sh
+LATTICE_METRICS_TOKEN='opaque-prometheus-token' \
+go run ./cmd/lattice-server
+
+curl -H 'Authorization: Bearer opaque-prometheus-token' \
+  http://127.0.0.1:8088/metrics
+```
+
 Self-host DNS can optionally install a pinned CoreDNS executable during an
 approved `selfdns` apply. Leave these unset to keep the stricter precondition
 that `coredns` must already exist on the node:

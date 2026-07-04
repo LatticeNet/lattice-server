@@ -268,6 +268,10 @@ const (
 	requestIDHeader                = "X-Lattice-Request-ID"
 	nodeTokenTouchInterval         = 15 * time.Minute
 	maxAgentSourceAllowlistEntries = 64
+	// maxNodeInventoryQualityLen / maxNodeInventoryNotesLen bound the operator's
+	// free-form node inventory metadata. Notes mirrors MachineProfile.Notes.
+	maxNodeInventoryQualityLen = 64
+	maxNodeInventoryNotesLen   = 2048
 	// maxTOTPChallengeAttempts burns a 2FA challenge after this many failed codes.
 	maxTOTPChallengeAttempts = 5
 )
@@ -1830,6 +1834,7 @@ type nodeView struct {
 	Comment              string                   `json:"comment,omitempty"`
 	Tags                 []string                 `json:"tags"`
 	Role                 string                   `json:"role"`
+	Inventory            *model.NodeInventory     `json:"inventory,omitempty"`
 	WireGuardIP          string                   `json:"wireguard_ip"`
 	WireGuardPublicKey   string                   `json:"wireguard_public_key,omitempty"`
 	WireGuardEndpoint    string                   `json:"wireguard_endpoint,omitempty"`
@@ -1877,7 +1882,7 @@ type agentRuntimeConfig struct {
 
 func (s *Server) toNodeView(n model.Node) nodeView {
 	return nodeView{
-		ID: n.ID, LatticeIdentityUUID: n.LatticeIdentityUUID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role,
+		ID: n.ID, LatticeIdentityUUID: n.LatticeIdentityUUID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role, Inventory: n.Inventory,
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
@@ -1939,6 +1944,39 @@ func normalizeNodeTags(tags []string) []string {
 	}
 	sort.Strings(cleaned)
 	return cleaned
+}
+
+// normalizeNodeInventory validates and canonicalizes operator-registered node
+// inventory metadata. Quality/Notes are trimmed; over-long values and a
+// PurityPercent outside 0-100 are rejected. If every field is empty/nil after
+// trimming it returns (nil, nil) so an empty object clears the stored inventory
+// rather than persisting a hollow record. Returned pointers never alias the
+// input.
+func normalizeNodeInventory(inv *model.NodeInventory) (*model.NodeInventory, error) {
+	if inv == nil {
+		return nil, nil
+	}
+	out := model.NodeInventory{
+		Quality: strings.TrimSpace(inv.Quality),
+		Notes:   strings.TrimSpace(inv.Notes),
+	}
+	if len(out.Quality) > maxNodeInventoryQualityLen {
+		return nil, fmt.Errorf("inventory.quality must be at most %d characters", maxNodeInventoryQualityLen)
+	}
+	if len(out.Notes) > maxNodeInventoryNotesLen {
+		return nil, fmt.Errorf("inventory.notes must be at most %d characters", maxNodeInventoryNotesLen)
+	}
+	if inv.PurityPercent != nil {
+		p := *inv.PurityPercent
+		if p < 0 || p > 100 {
+			return nil, fmt.Errorf("inventory.purity_percent must be between 0 and 100")
+		}
+		out.PurityPercent = &p
+	}
+	if out.PurityPercent == nil && out.Quality == "" && out.Notes == "" {
+		return nil, nil
+	}
+	return &out, nil
 }
 
 func normalizeAgentSourceAllowlist(values []string) ([]string, error) {
@@ -2033,6 +2071,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		Role                 string                  `json:"role"`
 		WireGuardIP          string                  `json:"wireguard_ip"`
 		AgentSourceAllowlist []string                `json:"agent_source_allowlist"`
+		Inventory            *model.NodeInventory    `json:"inventory"`
 		AgentLaunch          model.AgentLaunchConfig `json:"agent_launch"`
 		// GroupIDs assigns the freshly enrolled node into one or more existing
 		// groups by appending it to each group's explicit Members (the canonical
@@ -2091,6 +2130,11 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	inventory, err := normalizeNodeInventory(req.Inventory)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	launch := normalizeAgentLaunchConfig(req.AgentLaunch)
 	launch.UpdatedAt = time.Now().UTC()
 	token, err := auth.NewRandomToken(32)
@@ -2110,6 +2154,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		TokenHash:            hash,
 		Tags:                 normalizeNodeTags(req.Tags),
 		Role:                 strings.TrimSpace(req.Role),
+		Inventory:            inventory,
 		WireGuardIP:          req.WireGuardIP,
 		AgentSourceAllowlist: agentSourceAllowlist,
 		AgentLaunch:          &launch,
@@ -2517,12 +2562,13 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		NodeID               string    `json:"node_id"`
-		Name                 string    `json:"name"`
-		Role                 string    `json:"role"`
-		Comment              string    `json:"comment"`
-		Tags                 []string  `json:"tags"`
-		AgentSourceAllowlist *[]string `json:"agent_source_allowlist"`
+		NodeID               string               `json:"node_id"`
+		Name                 string               `json:"name"`
+		Role                 string               `json:"role"`
+		Comment              string               `json:"comment"`
+		Tags                 []string             `json:"tags"`
+		AgentSourceAllowlist *[]string            `json:"agent_source_allowlist"`
+		Inventory            *model.NodeInventory `json:"inventory"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -2543,6 +2589,18 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		}
 		agentSourceAllowlist = &normalized
 	}
+	// Pointer-of-pointer carries the update intent: a nil outer pointer means the
+	// client omitted inventory (leave stored value untouched); a non-nil outer
+	// means replace, where a normalized-to-nil inner clears the inventory.
+	var inventory **model.NodeInventory
+	if req.Inventory != nil {
+		normalized, err := normalizeNodeInventory(req.Inventory)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		inventory = &normalized
+	}
 	node, ok, err := s.store.UpdateNodeMeta(
 		req.NodeID,
 		strings.TrimSpace(req.Name),
@@ -2550,6 +2608,7 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		strings.TrimSpace(req.Comment),
 		req.Tags,
 		agentSourceAllowlist,
+		inventory,
 	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -2560,7 +2619,7 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.update", Scope: "node:admin"})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "comment": node.Comment, "tags": node.Tags, "agent_source_allowlist": append([]string{}, node.AgentSourceAllowlist...)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "comment": node.Comment, "tags": node.Tags, "agent_source_allowlist": append([]string{}, node.AgentSourceAllowlist...), "inventory": node.Inventory})
 }
 
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal) {

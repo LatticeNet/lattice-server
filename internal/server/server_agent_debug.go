@@ -92,8 +92,17 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
+	if strings.TrimSpace(node.LatticeIdentityUUID) == "" {
+		identity, err := s.ensureNodeIdentityUUID(node.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		node.LatticeIdentityUUID = identity
+	}
 	collect := node.AgentDebug.Enabled && node.AgentDebug.Collect && s.logStore != nil
 	writeJSON(w, http.StatusOK, model.AgentConfig{
+		LatticeIdentityUUID: node.LatticeIdentityUUID,
 		Debug: model.AgentDebugConfig{
 			Enabled:       node.AgentDebug.Enabled,
 			Collect:       collect,

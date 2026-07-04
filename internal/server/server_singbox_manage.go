@@ -269,6 +269,11 @@ func (s *Server) handleSingBoxManageAdd(w http.ResponseWriter, r *http.Request, 
 	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
 		return
 	}
+	identityUUID, err := s.ensureNodeIdentityUUID(req.NodeID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 
 	// Build the arg-vector as quoted shell words. Every value is validated then
 	// shellQuote'd, so no input can break out of its argument.
@@ -295,7 +300,11 @@ func (s *Server) handleSingBoxManageAdd(w http.ResponseWriter, r *http.Request, 
 		}
 		parts = append(parts, shellQuote(a))
 	}
-	script := "set -e\n" + strings.Join(parts, " ") + "\n"
+	script := "set -e\n" +
+		"LATTICE_NODE_ID=" + shellQuote(req.NodeID) + "\n" +
+		"LATTICE_IDENTITY_UUID=" + shellQuote(identityUUID) + "\n" +
+		"export LATTICE_NODE_ID LATTICE_IDENTITY_UUID\n" +
+		strings.Join(parts, " ") + "\n"
 
 	task, err := s.queueSingBoxTask(p, req.NodeID, script)
 	if err != nil {

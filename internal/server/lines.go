@@ -19,26 +19,28 @@ import (
 // the server package, not the shared SDK). Secret-free: it carries only
 // connection-shape metadata, never private keys or passwords.
 type Line struct {
-	ID          string            `json:"id"`           // == LineHashID (stable handle)
-	LineHashID  string            `json:"line_hash_id"` // stable across re-probes; see lineHash
-	NodeID      string            `json:"node_id"`
-	Core        string            `json:"core"`    // sing-box | xray | mihomo
-	Source      string            `json:"source"`  // managed | discovered | imported
-	Managed     bool              `json:"managed"` // under Lattice config management
-	Name        string            `json:"name"`
-	Tag         string            `json:"tag,omitempty"`
-	Type        string            `json:"type,omitempty"` // protocol
-	ListenHost  string            `json:"listen_host,omitempty"`
-	ListenPort  int               `json:"listen_port,omitempty"`
-	PublicHost  string            `json:"public_host,omitempty"`
-	Domain      string            `json:"domain,omitempty"`
-	OutboundRef string            `json:"outbound_ref,omitempty"` // direct | <host/tag> | "" unknown
-	JumpEdges   []string          `json:"jump_edges,omitempty"`   // line_hash_ids this line relays to
-	UserCount   int               `json:"user_count"`
-	UserKnown   bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
-	Status      string            `json:"status,omitempty"` // ok | pending | error | stale
-	LastError   string            `json:"last_error,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
+	ID               string            `json:"id"`           // == LineHashID (stable handle)
+	LineHashID       string            `json:"line_hash_id"` // stable across re-probes; see lineHash / stableLineHandle
+	LineID           string            `json:"line_id,omitempty"`
+	NodeID           string            `json:"node_id"`
+	NodeIdentityUUID string            `json:"node_identity_uuid,omitempty"`
+	Core             string            `json:"core"`    // sing-box | xray | mihomo
+	Source           string            `json:"source"`  // managed | discovered | imported
+	Managed          bool              `json:"managed"` // under Lattice config management
+	Name             string            `json:"name"`
+	Tag              string            `json:"tag,omitempty"`
+	Type             string            `json:"type,omitempty"` // protocol
+	ListenHost       string            `json:"listen_host,omitempty"`
+	ListenPort       int               `json:"listen_port,omitempty"`
+	PublicHost       string            `json:"public_host,omitempty"`
+	Domain           string            `json:"domain,omitempty"`
+	OutboundRef      string            `json:"outbound_ref,omitempty"` // direct | <host/tag> | "" unknown
+	JumpEdges        []string          `json:"jump_edges,omitempty"`   // line_hash_ids this line relays to
+	UserCount        int               `json:"user_count"`
+	UserKnown        bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
+	Status           string            `json:"status,omitempty"` // ok | pending | error | stale
+	LastError        string            `json:"last_error,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
 }
 
 // LineGroup is the set of lines on one node — the unit the dashboard renders.
@@ -57,6 +59,20 @@ func lineHash(nodeID, core, typ, listenHost string, listenPort int, tag, outboun
 		nodeID, core, typ, listenHost, strconv.Itoa(listenPort), tag, outbound,
 	}, "\x00")))
 	return "line_" + hex.EncodeToString(sum[:])[:24]
+}
+
+func stableLineHandle(lineID string) string {
+	lineID = strings.ToLower(strings.TrimSpace(lineID))
+	if lineID == "" || len(lineID) > 128 {
+		return ""
+	}
+	for _, r := range lineID {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return ""
+	}
+	return "line_" + lineID
 }
 
 // buildLineGroups merges Lattice-managed inbounds and on-box discovered nodes into
@@ -93,22 +109,23 @@ func (s *Server) buildLineGroups() []LineGroup {
 				status = "error"
 			}
 			ln := Line{
-				NodeID:      prof.NodeID,
-				Core:        core,
-				Source:      "managed",
-				Managed:     true,
-				Name:        firstNonEmpty(ib.Name, ib.ID),
-				Tag:         ib.ID,
-				Type:        ib.Protocol,
-				ListenHost:  listenHost,
-				ListenPort:  ib.Port,
-				PublicHost:  firstNonEmpty(prof.Hostname, s.nodePublicHost(prof.NodeID)),
-				Domain:      domain,
-				OutboundRef: outbound,
-				UserCount:   countInboundUsers(users, inboundID),
-				UserKnown:   true,
-				Status:      status,
-				LastError:   prof.LastError,
+				NodeID:           prof.NodeID,
+				NodeIdentityUUID: s.nodeIdentityUUID(prof.NodeID),
+				Core:             core,
+				Source:           "managed",
+				Managed:          true,
+				Name:             firstNonEmpty(ib.Name, ib.ID),
+				Tag:              ib.ID,
+				Type:             ib.Protocol,
+				ListenHost:       listenHost,
+				ListenPort:       ib.Port,
+				PublicHost:       firstNonEmpty(prof.Hostname, s.nodePublicHost(prof.NodeID)),
+				Domain:           domain,
+				OutboundRef:      outbound,
+				UserCount:        countInboundUsers(users, inboundID),
+				UserKnown:        true,
+				Status:           status,
+				LastError:        prof.LastError,
 			}
 			ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, outbound)
 			ln.ID = ln.LineHashID
@@ -133,26 +150,33 @@ func (s *Server) buildLineGroups() []LineGroup {
 				status = "error"
 				lastErr = inv.Error
 			}
+			lineID := firstNonEmpty(n.LineID, n.Metadata["line_id"])
+			nodeUUID := firstNonEmpty(n.NodeIdentityUUID, n.Metadata["node_uuid"], n.Metadata["lattice_identity_uuid"], s.nodeIdentityUUID(inv.NodeID))
 			ln := Line{
-				NodeID:      inv.NodeID,
-				Core:        "sing-box",
-				Source:      "discovered",
-				Managed:     false,
-				Name:        n.Name,
-				Tag:         n.Name,
-				Type:        n.Protocol,
-				ListenHost:  n.ListenHost,
-				ListenPort:  port,
-				PublicHost:  n.Address,
-				Domain:      firstNonEmpty(n.SNI, n.Host),
-				OutboundRef: n.OutboundRef,
-				UserCount:   n.UserCount,
-				UserKnown:   n.UserKnown,
-				Status:      status,
-				LastError:   lastErr,
-				Metadata:    n.Metadata,
+				LineID:           lineID,
+				NodeID:           inv.NodeID,
+				NodeIdentityUUID: nodeUUID,
+				Core:             "sing-box",
+				Source:           "discovered",
+				Managed:          false,
+				Name:             n.Name,
+				Tag:              n.Name,
+				Type:             n.Protocol,
+				ListenHost:       n.ListenHost,
+				ListenPort:       port,
+				PublicHost:       n.Address,
+				Domain:           firstNonEmpty(n.SNI, n.Host),
+				OutboundRef:      n.OutboundRef,
+				UserCount:        n.UserCount,
+				UserKnown:        n.UserKnown,
+				Status:           status,
+				LastError:        lastErr,
+				Metadata:         n.Metadata,
 			}
-			ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
+			ln.LineHashID = stableLineHandle(ln.LineID)
+			if ln.LineHashID == "" {
+				ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
+			}
 			ln.ID = ln.LineHashID
 			byNode[ln.NodeID] = append(byNode[ln.NodeID], ln)
 		}
@@ -202,6 +226,13 @@ func countInboundUsers(users []model.ProxyUser, inboundID string) int {
 func (s *Server) nodePublicHost(nodeID string) string {
 	if n, ok := s.store.Node(nodeID); ok {
 		return strings.TrimSpace(n.PublicIP)
+	}
+	return ""
+}
+
+func (s *Server) nodeIdentityUUID(nodeID string) string {
+	if n, ok := s.store.Node(nodeID); ok {
+		return strings.TrimSpace(n.LatticeIdentityUUID)
 	}
 	return ""
 }

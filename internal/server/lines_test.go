@@ -27,7 +27,7 @@ func newLinesTestServer(t *testing.T) *Server {
 // plus a DUPLICATE of the managed line (vless:443) that must be deduped away.
 func seedLinesFixture(t *testing.T, srv *Server) {
 	t.Helper()
-	if err := srv.store.UpsertNode(model.Node{ID: "node-a", Name: "Node A", PublicIP: "203.0.113.5"}); err != nil {
+	if err := srv.store.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "node-uuid-a", Name: "Node A", PublicIP: "203.0.113.5"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := srv.store.UpsertProxyInbound(model.ProxyInbound{
@@ -50,7 +50,7 @@ func seedLinesFixture(t *testing.T, srv *Server) {
 		"node-a": {
 			NodeID: "node-a", At: srv.now(), Status: "ok",
 			Nodes: []model.SingBoxNode{
-				{Name: "hy2-8443", Protocol: "hysteria2", Network: "udp", Address: "203.0.113.5", Port: "8443", ListenHost: "::", OutboundRef: "relay-a", UserCount: 2, UserKnown: true, Metadata: map[string]string{"owner": "ops"}, ShareURL: "hysteria2://x"},
+				{Name: "hy2-8443", LineID: "line-uuid-a", NodeIdentityUUID: "node-uuid-a", Protocol: "hysteria2", Network: "udp", Address: "203.0.113.5", Port: "8443", ListenHost: "::", OutboundRef: "relay-a", UserCount: 2, UserKnown: true, Metadata: map[string]string{"owner": "ops", "line_id": "line-uuid-a", "node_uuid": "node-uuid-a"}, ShareURL: "hysteria2://x"},
 				{Name: "vless-443", Protocol: "vless", Network: "tcp", Address: "203.0.113.5", Port: "443", ShareURL: "vless://y"},
 			},
 		},
@@ -90,7 +90,7 @@ func TestBuildLineGroupsMergesAndDedups(t *testing.T) {
 
 	if !managed.Managed || managed.Type != "vless" || managed.ListenPort != 443 ||
 		managed.OutboundRef != "direct" || managed.Domain != "www.example.com" ||
-		managed.PublicHost != "203.0.113.5" || managed.Status != "ok" {
+		managed.PublicHost != "203.0.113.5" || managed.NodeIdentityUUID != "node-uuid-a" || managed.Status != "ok" {
 		t.Fatalf("managed line wrong: %+v", managed)
 	}
 	if managed.UserCount != 1 || !managed.UserKnown {
@@ -102,7 +102,9 @@ func TestBuildLineGroupsMergesAndDedups(t *testing.T) {
 
 	if discovered.Managed || discovered.Type != "hysteria2" || discovered.ListenPort != 8443 ||
 		discovered.ListenHost != "::" || discovered.OutboundRef != "relay-a" ||
-		!discovered.UserKnown || discovered.UserCount != 2 || discovered.Metadata["owner"] != "ops" {
+		discovered.LineID != "line-uuid-a" || discovered.LineHashID != "line_line-uuid-a" ||
+		discovered.NodeIdentityUUID != "node-uuid-a" || !discovered.UserKnown ||
+		discovered.UserCount != 2 || discovered.Metadata["owner"] != "ops" {
 		t.Fatalf("discovered line wrong: %+v", discovered)
 	}
 }
@@ -115,6 +117,15 @@ func TestLineHashStableAndDistinct(t *testing.T) {
 	}
 	if a == lineHash("node-a", "sing-box", "vless", "0.0.0.0", 8443, "in-1", "direct") {
 		t.Fatal("lineHash should differ when the port differs")
+	}
+}
+
+func TestStableLineHandlePrefersLatticeLineID(t *testing.T) {
+	if got := stableLineHandle("F8DD1E42-ABCD"); got != "line_f8dd1e42-abcd" {
+		t.Fatalf("stableLineHandle = %q", got)
+	}
+	if got := stableLineHandle("bad/value"); got != "" {
+		t.Fatalf("stableLineHandle should reject unsafe ids, got %q", got)
 	}
 }
 

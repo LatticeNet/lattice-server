@@ -64,6 +64,45 @@ func TestSingBoxDiscoverReportAndList(t *testing.T) {
 	}
 }
 
+func TestSingBoxDiscoverHonorsServerAllowlist(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeAToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	nodeBToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
+	reportSingBoxInventory(t, handler, nodeAToken, `{
+		"node_id":"node-a",
+		"inventory":{"status":"ok","nodes":[
+			{"name":"node-a-line.json","protocol":"vless","port":"17891","share_url":"vless://node-a-secret"}
+		]}
+	}`)
+	reportSingBoxInventory(t, handler, nodeBToken, `{
+		"node_id":"node-b",
+		"inventory":{"status":"ok","nodes":[
+			{"name":"node-b-line.json","protocol":"vless","port":"27891","share_url":"vless://node-b-secret"}
+		]}
+	}`)
+
+	token := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, []string{"node-a"})
+	resp := doBearerJSON(t, handler, http.MethodGet, "/api/proxy/discovered", "", token)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("discovered: want 200, got %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var out struct {
+		Inventories []model.SingBoxInventory `json:"inventories"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if len(out.Inventories) != 1 || out.Inventories[0].NodeID != "node-a" {
+		t.Fatalf("allowlisted token saw wrong inventories: %+v", out.Inventories)
+	}
+	if len(out.Inventories[0].Nodes) != 1 || out.Inventories[0].Nodes[0].ShareURL != "vless://node-a-secret" {
+		t.Fatalf("allowed inventory was not preserved: %+v", out.Inventories[0].Nodes)
+	}
+}
+
 func TestSingBoxDiscoverReportAuditIsThrottledForUnchangedInventory(t *testing.T) {
 	handler, st, srv := newSingBoxDiscoverAuditTestServer(t)
 	cookies, csrf := loginSession(t, handler)

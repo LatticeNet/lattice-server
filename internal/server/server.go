@@ -1813,6 +1813,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 
 type nodeView struct {
 	ID                   string                   `json:"id"`
+	LatticeIdentityUUID  string                   `json:"lattice_identity_uuid,omitempty"`
 	Name                 string                   `json:"name"`
 	Comment              string                   `json:"comment,omitempty"`
 	Tags                 []string                 `json:"tags"`
@@ -1864,13 +1865,43 @@ type agentRuntimeConfig struct {
 
 func (s *Server) toNodeView(n model.Node) nodeView {
 	return nodeView{
-		ID: n.ID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role,
+		ID: n.ID, LatticeIdentityUUID: n.LatticeIdentityUUID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role,
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Disabled: n.Disabled, AgentSourceAllowlist: append([]string(nil), n.AgentSourceAllowlist...), TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
 		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
+}
+
+func ensureNodeIdentityUUIDInPlace(n *model.Node) error {
+	if strings.TrimSpace(n.LatticeIdentityUUID) != "" {
+		n.LatticeIdentityUUID = strings.TrimSpace(n.LatticeIdentityUUID)
+		return nil
+	}
+	uuid, err := newProxyUUID()
+	if err != nil {
+		return err
+	}
+	n.LatticeIdentityUUID = uuid
+	return nil
+}
+
+func (s *Server) ensureNodeIdentityUUID(nodeID string) (string, error) {
+	n, ok := s.store.Node(nodeID)
+	if !ok {
+		return "", fmt.Errorf("node %q not found", nodeID)
+	}
+	if existing := strings.TrimSpace(n.LatticeIdentityUUID); existing != "" {
+		return existing, nil
+	}
+	if err := ensureNodeIdentityUUIDInPlace(&n); err != nil {
+		return "", err
+	}
+	if err := s.store.UpsertNode(n); err != nil {
+		return "", err
+	}
+	return n.LatticeIdentityUUID, nil
 }
 
 func (s *Server) agentRuntimeSnapshot(nodeID string) *agentRuntimeConfig {
@@ -2071,6 +2102,10 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		AgentSourceAllowlist: agentSourceAllowlist,
 		AgentLaunch:          &launch,
 		CreatedAt:            time.Now().UTC(),
+	}
+	if err := ensureNodeIdentityUUIDInPlace(&n); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	if err := s.store.UpsertNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -5377,6 +5412,10 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := validateAgentNetworkMetadata(req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := ensureNodeIdentityUUIDInPlace(&n); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	oldV4, oldV6 := n.PublicIP, n.PublicIPv6

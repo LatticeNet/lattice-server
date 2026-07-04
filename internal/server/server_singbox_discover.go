@@ -12,6 +12,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
 // Adoption bridge — discovery side (read-only). Agents that run with
@@ -165,5 +166,17 @@ func (s *Server) handleProxyDiscovered(w http.ResponseWriter, _ *http.Request, p
 	if !s.requireScope(w, p, "proxy:read") {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"inventories": s.liveSingBoxInventories(s.now())})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"inventories": filterSingBoxInventoriesForPrincipal(s.liveSingBoxInventories(s.now()), p),
+	})
+}
+
+func filterSingBoxInventoriesForPrincipal(inventories []model.SingBoxInventory, p principal) []model.SingBoxInventory {
+	out := make([]model.SingBoxInventory, 0, len(inventories))
+	for _, inv := range inventories {
+		if rbac.Allows(p.Principal, "proxy:read", inv.NodeID) {
+			out = append(out, inv)
+		}
+	}
+	return out
 }

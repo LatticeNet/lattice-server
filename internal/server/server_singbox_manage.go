@@ -330,8 +330,9 @@ func (s *Server) handleSingBoxManageDelete(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var req struct {
-		NodeID string `json:"node_id"`
-		Name   string `json:"name"`
+		NodeID      string `json:"node_id"`
+		Name        string `json:"name"`
+		StepUpGrant string `json:"step_up_grant"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -355,6 +356,9 @@ func (s *Server) handleSingBoxManageDelete(w http.ResponseWriter, r *http.Reques
 	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
 		return
 	}
+	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "singbox.manage.delete") {
+		return
+	}
 	parts := []string{"sb", "--json", "del", shellQuote(name)}
 	script := "set -e\n" + strings.Join(parts, " ") + "\n"
 	task, err := s.queueSingBoxTask(p, req.NodeID, script)
@@ -372,6 +376,158 @@ func (s *Server) handleSingBoxManageDelete(w http.ResponseWriter, r *http.Reques
 		Metadata: map[string]string{"task_id": task.ID, "name": name},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task_id": task.ID})
+}
+
+func (s *Server) handleSingBoxManageUsers(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID        string   `json:"node_id"`
+		LineHashID    string   `json:"line_hash_id"`
+		BindUserIDs   []string `json:"bind_user_ids"`
+		UnbindUserIDs []string `json:"unbind_user_ids"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	req.LineHashID = strings.TrimSpace(req.LineHashID)
+	if req.NodeID == "" || req.LineHashID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id and line_hash_id are required"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "proxy:admin", req.NodeID) || !s.requireNodeScope(w, p, "task:run", req.NodeID) {
+		return
+	}
+	line, ok := s.findLine(req.NodeID, req.LineHashID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("line not found"))
+		return
+	}
+	if line.Source != "discovered" || line.Core != "sing-box" {
+		writeError(w, http.StatusBadRequest, errors.New("runtime user sync is only supported for discovered sing-box lines"))
+		return
+	}
+	name := strings.TrimSpace(firstNonEmpty(line.Name, line.Tag))
+	if name == "" || !singBoxNodeNameRe.MatchString(name) {
+		writeError(w, http.StatusBadRequest, errors.New("line has no valid sing-box config name"))
+		return
+	}
+	if !s.singBoxInventoryHasNode(req.NodeID, name) {
+		writeError(w, http.StatusBadRequest, errors.New("name is not a discovered node on this machine"))
+		return
+	}
+	bindIDs := uniqueNonEmpty(req.BindUserIDs)
+	unbindIDs := uniqueNonEmpty(req.UnbindUserIDs)
+	if len(bindIDs) == 0 && len(unbindIDs) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("at least one user id is required"))
+		return
+	}
+
+	commands := []string{}
+	userIDsTouched := map[string]bool{}
+	for _, userID := range bindIDs {
+		u, ok := s.getVpnUser(userID)
+		if !ok || !u.Enabled {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("vpn user %q not found or disabled", userID))
+			return
+		}
+		payload, err := singBoxUserPayloadForLine(u, line, "")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("user %s: %w", userID, err))
+			return
+		}
+		commands = append(commands, "sb --json user add "+shellQuote(name)+" "+shellQuote(payload))
+		userIDsTouched[userID] = true
+	}
+	for _, userID := range unbindIDs {
+		u, ok := s.getVpnUser(userID)
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("vpn user %q not found", userID))
+			return
+		}
+		payload, err := singBoxUserPayloadForLine(u, line, "")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("user %s: %w", userID, err))
+			return
+		}
+		commands = append(commands, "sb --json user del "+shellQuote(name)+" "+shellQuote(payload))
+		userIDsTouched[userID] = true
+	}
+
+	script := "set -e\nexport TERM=xterm\n" + strings.Join(commands, "\n") + "\nsb --json inspect " + shellQuote(name) + "\n"
+	task, err := s.queueSingBoxTask(p, req.NodeID, script)
+	if err != nil {
+		if errors.Is(err, errTaskExecutionDisabled) {
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.manage.users", Scope: "task:run", Decision: "deny", Reason: err.Error()})
+			writeTaskExecutionDisabled(w)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.updateVpnUserLineBindings(req.LineHashID, bindIDs, unbindIDs); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:     id.New("audit"),
+		NodeID: req.NodeID,
+		Action: "singbox.manage.users",
+		Scope:  "task:run",
+		Metadata: map[string]string{
+			"task_id": task.ID,
+			"name":    name,
+			"users":   strconv.Itoa(len(userIDsTouched)),
+		},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":              true,
+		"task_id":         task.ID,
+		"bind_user_ids":   bindIDs,
+		"unbind_user_ids": unbindIDs,
+	})
+}
+
+func (s *Server) handleRevealSingBoxLine(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID      string `json:"node_id"`
+		LineHashID  string `json:"line_hash_id"`
+		StepUpGrant string `json:"step_up_grant"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	req.LineHashID = strings.TrimSpace(req.LineHashID)
+	if req.NodeID == "" || req.LineHashID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id and line_hash_id are required"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "proxy:admin", req.NodeID) {
+		return
+	}
+	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "singbox.line.reveal") {
+		return
+	}
+	line, ok := s.findLine(req.NodeID, req.LineHashID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("line not found"))
+		return
+	}
+	node, ok := s.singBoxInventoryNode(req.NodeID, firstNonEmpty(line.Name, line.Tag))
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("line is not present in the latest sing-box inventory"))
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.line.reveal", Scope: "proxy:admin", Metadata: map[string]string{"line_hash_id": line.LineHashID}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "line_hash_id": line.LineHashID, "share_url": node.ShareURL, "node": node})
 }
 
 func (s *Server) handleSingBoxManageConncheck(w http.ResponseWriter, r *http.Request, p principal) {
@@ -459,18 +615,23 @@ func (s *Server) handleSingBoxManageConncheck(w http.ResponseWriter, r *http.Req
 // singBoxInventoryHasNode reports whether name is one of the nodes the machine
 // most recently reported via discovery.
 func (s *Server) singBoxInventoryHasNode(nodeID, name string) bool {
+	_, ok := s.singBoxInventoryNode(nodeID, name)
+	return ok
+}
+
+func (s *Server) singBoxInventoryNode(nodeID, name string) (model.SingBoxNode, bool) {
 	s.singboxInvMu.RLock()
 	defer s.singboxInvMu.RUnlock()
 	inv, ok := s.singboxInv[nodeID]
 	if !ok {
-		return false
+		return model.SingBoxNode{}, false
 	}
 	for _, n := range inv.Nodes {
 		if n.Name == name {
-			return true
+			return n, true
 		}
 	}
-	return false
+	return model.SingBoxNode{}, false
 }
 
 func isSingBoxProbeTask(task model.Task) bool {

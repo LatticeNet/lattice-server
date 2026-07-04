@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -23,6 +25,48 @@ func newManageTestServer(t *testing.T) (*Server, http.Handler) {
 		t.Fatal(err)
 	}
 	return srv, srv.Handler()
+}
+
+func issueStepUpGrant(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf string) string {
+	t.Helper()
+	res := doJSON(t, handler, http.MethodPost, "/api/2fa/totp/enroll", "{}", cookies, csrf)
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		t.Fatalf("step-up enroll: want 200, got %d (%s)", res.StatusCode, b)
+	}
+	var enroll struct {
+		Secret string `json:"secret"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&enroll); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	code, err := auth.TOTPCodeAt(enroll.Secret, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	res = doJSON(t, handler, http.MethodPost, "/api/2fa/totp/activate", `{"code":"`+code+`"}`, cookies, csrf)
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		t.Fatalf("step-up activate: want 200, got %d (%s)", res.StatusCode, b)
+	}
+	res.Body.Close()
+	res = doJSON(t, handler, http.MethodPost, "/api/security/step-up", `{"code":"`+code+`"}`, cookies, csrf)
+	if res.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(res.Body)
+		t.Fatalf("step-up: want 200, got %d (%s)", res.StatusCode, b)
+	}
+	var out struct {
+		Grant string `json:"grant"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if out.Grant == "" {
+		t.Fatal("step-up returned empty grant")
+	}
+	return out.Grant
 }
 
 func TestSingBoxManageAddValidatesAndQueues(t *testing.T) {
@@ -515,8 +559,16 @@ func TestSingBoxManageDeleteRequiresDiscoveredName(t *testing.T) {
 		"node-a": {NodeID: "node-a", Status: "ok", Nodes: []model.SingBoxNode{{Name: "VLESS-REALITY-17891.json"}}},
 	}
 	srv.singboxInvMu.Unlock()
-	ok := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/delete",
+	noGrant := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/delete",
 		`{"node_id":"node-a","name":"VLESS-REALITY-17891.json"}`, cookies, csrf)
+	if noGrant.StatusCode != http.StatusForbidden {
+		t.Fatalf("delete without step-up: want 403, got %d", noGrant.StatusCode)
+	}
+	noGrant.Body.Close()
+
+	grant := issueStepUpGrant(t, handler, cookies, csrf)
+	ok := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/delete",
+		`{"node_id":"node-a","name":"VLESS-REALITY-17891.json","step_up_grant":"`+grant+`"}`, cookies, csrf)
 	if ok.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(ok.Body)
 		t.Fatalf("discovered delete: want 200, got %d (%s)", ok.StatusCode, b)
@@ -530,6 +582,259 @@ func TestSingBoxManageDeleteRequiresDiscoveredName(t *testing.T) {
 		t.Fatalf("bad name: want 400, got %d", bad.StatusCode)
 	}
 	bad.Body.Close()
+}
+
+func TestSingBoxManageUsersQueuesRuntimeSyncAndUpdatesBindings(t *testing.T) {
+	srv, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"node-a": {
+			NodeID: "node-a",
+			Status: "ok",
+			Nodes: []model.SingBoxNode{{
+				Name:       "VLESS-REALITY-31001.json",
+				Protocol:   "vless",
+				ListenHost: "0.0.0.0",
+				Port:       "31001",
+				Address:    "203.0.113.10",
+				SNI:        "www.example.com",
+				UserKnown:  true,
+				UserCount:  1,
+			}},
+		},
+	}
+	srv.singboxInvMu.Unlock()
+	groups := srv.buildLineGroups()
+	if len(groups) != 1 || len(groups[0].Lines) != 1 {
+		t.Fatalf("unexpected line groups: %+v", groups)
+	}
+	lineHash := groups[0].Lines[0].LineHashID
+
+	now := srv.now()
+	if err := srv.putVpnUser(VpnUser{
+		ID:      "vpn-user-a",
+		Email:   "alice@example.com",
+		Name:    "Alice",
+		Enabled: true,
+		Credentials: []VpnCredential{{
+			Protocol: "vless",
+			UUID:     "11111111-1111-4111-8111-111111111111",
+			Flow:     "xtls-rprx-vision",
+		}},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/users",
+		`{"node_id":"node-a","line_hash_id":"`+lineHash+`","bind_user_ids":["vpn-user-a"]}`, cookies, csrf)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("users bind: want 200, got %d (%s)", resp.StatusCode, b)
+	}
+	var out struct {
+		TaskID string `json:"task_id"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	_ = json.Unmarshal(body, &out)
+	if out.TaskID == "" {
+		t.Fatalf("no task id: %s", body)
+	}
+	var task *model.Task
+	for _, tk := range srv.store.Tasks() {
+		if tk.ID == out.TaskID {
+			tt := tk
+			task = &tt
+		}
+	}
+	if task == nil || len(task.Targets) != 1 || task.Targets[0] != "node-a" {
+		t.Fatalf("unexpected task: %+v", task)
+	}
+	for _, needle := range []string{
+		"export TERM=xterm",
+		"sb --json user add",
+		"'VLESS-REALITY-31001.json'",
+		"11111111-1111-4111-8111-111111111111",
+		"xtls-rprx-vision",
+		"sb --json inspect",
+	} {
+		if !strings.Contains(task.Script, needle) {
+			t.Fatalf("users script missing %q:\n%s", needle, task.Script)
+		}
+	}
+	stored, ok := srv.getVpnUser("vpn-user-a")
+	if !ok || len(stored.Bindings) != 1 || stored.Bindings[0].LineHashID != lineHash || !stored.Bindings[0].Enabled {
+		t.Fatalf("binding not updated: %+v", stored)
+	}
+
+	resp = doJSON(t, handler, http.MethodPost, "/api/proxy/managed/users",
+		`{"node_id":"node-a","line_hash_id":"`+lineHash+`","unbind_user_ids":["vpn-user-a"]}`, cookies, csrf)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("users unbind: want 200, got %d (%s)", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+	stored, _ = srv.getVpnUser("vpn-user-a")
+	if len(stored.Bindings) != 0 {
+		t.Fatalf("binding not removed: %+v", stored.Bindings)
+	}
+}
+
+func TestSensitiveLineAndCredentialRevealRequireStepUp(t *testing.T) {
+	srv, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"node-a": {
+			NodeID: "node-a",
+			Status: "ok",
+			Nodes: []model.SingBoxNode{{
+				Name:       "VLESS-REALITY-31001.json",
+				Protocol:   "vless",
+				ListenHost: "0.0.0.0",
+				Port:       "31001",
+				Address:    "203.0.113.10",
+				SNI:        "www.example.com",
+				ShareURL:   "vless://11111111-1111-4111-8111-111111111111@example.test:31001?encryption=none#alice",
+				UserKnown:  true,
+				UserCount:  1,
+			}},
+		},
+	}
+	srv.singboxInvMu.Unlock()
+	groups := srv.buildLineGroups()
+	if len(groups) != 1 || len(groups[0].Lines) != 1 {
+		t.Fatalf("unexpected line groups: %+v", groups)
+	}
+	lineHash := groups[0].Lines[0].LineHashID
+	now := srv.now()
+	if err := srv.putVpnUser(VpnUser{
+		ID:      "vpn-user-a",
+		Email:   "alice@example.com",
+		Name:    "Alice",
+		Enabled: true,
+		Credentials: []VpnCredential{{
+			Protocol: "vless",
+			UUID:     "11111111-1111-4111-8111-111111111111",
+			Flow:     "xtls-rprx-vision",
+		}},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	noLineGrant := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/reveal-line",
+		`{"node_id":"node-a","line_hash_id":"`+lineHash+`"}`, cookies, csrf)
+	if noLineGrant.StatusCode != http.StatusForbidden {
+		t.Fatalf("line reveal without step-up: want 403, got %d", noLineGrant.StatusCode)
+	}
+	noLineGrant.Body.Close()
+	noUserGrant := doJSON(t, handler, http.MethodPost, "/api/proxy/users/reveal-credentials",
+		`{"id":"vpn-user-a"}`, cookies, csrf)
+	if noUserGrant.StatusCode != http.StatusForbidden {
+		t.Fatalf("credential reveal without step-up: want 403, got %d", noUserGrant.StatusCode)
+	}
+	noUserGrant.Body.Close()
+
+	grant := issueStepUpGrant(t, handler, cookies, csrf)
+	lineReveal := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/reveal-line",
+		`{"node_id":"node-a","line_hash_id":"`+lineHash+`","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	if lineReveal.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(lineReveal.Body)
+		t.Fatalf("line reveal: want 200, got %d (%s)", lineReveal.StatusCode, b)
+	}
+	var lineOut struct {
+		ShareURL string `json:"share_url"`
+	}
+	if err := json.NewDecoder(lineReveal.Body).Decode(&lineOut); err != nil {
+		t.Fatal(err)
+	}
+	lineReveal.Body.Close()
+	if !strings.HasPrefix(lineOut.ShareURL, "vless://") {
+		t.Fatalf("missing share url: %+v", lineOut)
+	}
+
+	userReveal := doJSON(t, handler, http.MethodPost, "/api/proxy/users/reveal-credentials",
+		`{"id":"vpn-user-a","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	if userReveal.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(userReveal.Body)
+		t.Fatalf("credential reveal: want 200, got %d (%s)", userReveal.StatusCode, b)
+	}
+	var userOut struct {
+		Credentials []VpnCredential `json:"credentials"`
+	}
+	if err := json.NewDecoder(userReveal.Body).Decode(&userOut); err != nil {
+		t.Fatal(err)
+	}
+	userReveal.Body.Close()
+	if len(userOut.Credentials) != 1 || userOut.Credentials[0].UUID != "11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("missing credential secret: %+v", userOut.Credentials)
+	}
+}
+
+func TestTaskScriptRevealRequiresStepUp(t *testing.T) {
+	_, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
+		`{"node_id":"node-a"}`, cookies, csrf)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("probe: want 200, got %d (%s)", resp.StatusCode, b)
+	}
+	var queued struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&queued); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if queued.TaskID == "" {
+		t.Fatal("probe returned empty task id")
+	}
+	redacted := doJSON(t, handler, http.MethodGet, "/api/tasks", "", cookies, csrf)
+	if redacted.StatusCode != http.StatusOK {
+		t.Fatalf("tasks list: want 200, got %d", redacted.StatusCode)
+	}
+	listBody, _ := io.ReadAll(redacted.Body)
+	redacted.Body.Close()
+	if strings.Contains(string(listBody), singBoxProbeScriptMarker) {
+		t.Fatalf("task list leaked script: %s", listBody)
+	}
+
+	noGrant := doJSON(t, handler, http.MethodPost, "/api/tasks/reveal-script",
+		`{"id":"`+queued.TaskID+`"}`, cookies, csrf)
+	if noGrant.StatusCode != http.StatusForbidden {
+		t.Fatalf("reveal without step-up: want 403, got %d", noGrant.StatusCode)
+	}
+	noGrant.Body.Close()
+	grant := issueStepUpGrant(t, handler, cookies, csrf)
+	reveal := doJSON(t, handler, http.MethodPost, "/api/tasks/reveal-script",
+		`{"id":"`+queued.TaskID+`","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	if reveal.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(reveal.Body)
+		t.Fatalf("reveal: want 200, got %d (%s)", reveal.StatusCode, b)
+	}
+	var out struct {
+		Script string `json:"script"`
+		SHA256 string `json:"script_sha256"`
+	}
+	if err := json.NewDecoder(reveal.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	reveal.Body.Close()
+	if !strings.Contains(out.Script, singBoxProbeScriptMarker) || out.SHA256 == "" {
+		t.Fatalf("bad reveal payload: %+v", out)
+	}
 }
 
 func TestSingBoxManageConncheckQueuesValidatedTask(t *testing.T) {

@@ -249,6 +249,12 @@ type Server struct {
 	// could race and delete a legitimately active entry.
 	pendingSingboxProbeMu      sync.Mutex
 	pendingSingboxProbeNodeIDs map[string]string // nodeID → probe task ID
+
+	// stepUpGrants are short-lived, interactive-session-bound 2FA grants used to
+	// reveal sensitive operational data or perform destructive proxy-line actions.
+	// They are intentionally in-memory: a server restart expires them.
+	stepUpMu     sync.Mutex
+	stepUpGrants map[string]stepUpGrant
 }
 
 const (
@@ -726,6 +732,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/2fa/totp/enroll", s.withAuth("", s.handle2FAEnroll))
 	mux.HandleFunc("/api/2fa/totp/activate", s.withAuth("", s.handle2FAActivate))
 	mux.HandleFunc("/api/2fa/totp/disable", s.withAuth("", s.handle2FADisable))
+	mux.HandleFunc("/api/security/step-up", s.withAuth("", s.handleSecurityStepUp))
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
 	mux.HandleFunc("/api/nodes/geo", s.withAuth("", s.handleNodesGeo))
 	mux.HandleFunc("/api/nodes/geo/resolve", s.withAuth("", s.handleNodesGeoResolve))
@@ -749,6 +756,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/tasks/delete", s.withAuth("", s.handleDeleteTask))
 	mux.HandleFunc("/api/tasks/rerun", s.withAuth("", s.handleRerunTask))
 	mux.HandleFunc("/api/tasks/rerun-node", s.withAuth("", s.handleRerunTask))
+	mux.HandleFunc("/api/tasks/reveal-script", s.withAuth("", s.handleRevealTaskScript))
 	mux.HandleFunc("/api/task-results", s.withAuth("task:read", s.handleTaskResults))
 	mux.HandleFunc("/api/terminal/sessions", s.withAuth("", s.handleTerminalSessions))
 	mux.HandleFunc("/api/terminal/sessions/", s.withAuth("", s.handleTerminalSessionPath))
@@ -787,6 +795,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/inbounds", s.withAuth("", s.handleProxyInbounds))
 	mux.HandleFunc("/api/proxy/inbounds/delete", s.withAuth("", s.handleDeleteProxyInbound))
 	mux.HandleFunc("/api/proxy/users", s.withAuth("", s.handleProxyUsers))
+	mux.HandleFunc("/api/proxy/users/reveal-credentials", s.withAuth("", s.handleRevealVPNUserCredentials))
 	mux.HandleFunc("/api/proxy/users/rotate-sub-token", s.withAuth("", s.handleRotateProxyUserSubToken))
 	mux.HandleFunc("/api/proxy/users/delete", s.withAuth("", s.handleDeleteProxyUser))
 	mux.HandleFunc("/api/proxy/usage", s.withAuth("", s.handleProxyUsage))
@@ -797,6 +806,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/managed/add", s.withAuth("", s.handleSingBoxManageAdd))
 	mux.HandleFunc("/api/proxy/managed/delete", s.withAuth("", s.handleSingBoxManageDelete))
 	mux.HandleFunc("/api/proxy/managed/conncheck", s.withAuth("", s.handleSingBoxManageConncheck))
+	mux.HandleFunc("/api/proxy/managed/users", s.withAuth("", s.handleSingBoxManageUsers))
+	mux.HandleFunc("/api/proxy/managed/reveal-line", s.withAuth("", s.handleRevealSingBoxLine))
 	mux.HandleFunc("/api/proxy/nodes/", s.withAuth("", s.handleProxyNodePlan))
 	mux.HandleFunc("/api/substore/import", s.withAuth("", s.handleSubStoreImport))
 	mux.HandleFunc("/api/substore/status", s.withAuth("", s.handleSubStoreStatus))
@@ -2866,6 +2877,40 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		}
 	}
 	writeJSON(w, http.StatusOK, visible)
+}
+
+func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID          string `json:"id"`
+		StepUpGrant string `json:"step_up_grant"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	task, ok := s.store.Task(strings.TrimSpace(req.ID))
+	if !ok {
+		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
+		return
+	}
+	if !s.requireAllNodeScopes(w, p, "task:read", task.Targets) {
+		return
+	}
+	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "task.script.reveal") {
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                true,
+		"id":                task.ID,
+		"interpreter":       task.Interpreter,
+		"script":            task.Script,
+		"script_sha256":     scriptSHA256(task.Script),
+		"script_size_bytes": len([]byte(task.Script)),
+	})
 }
 
 type taskResultView struct {

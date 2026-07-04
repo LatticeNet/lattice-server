@@ -44,7 +44,33 @@ func newTestServerWithGeoResolver(t *testing.T, resolver geoip.Resolver) (http.H
 func TestNodeGeoUpdateListAndClear(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
-	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	node, ok := st.Node("node-a")
+	if !ok {
+		t.Fatal("enrolled node not stored")
+	}
+	node.Tags = []string{"gomami", "openjobs-vpn"}
+	node.InternalIP = "10.0.0.8"
+	node.WireGuardIP = "10.66.0.8"
+	node.HostFacts = model.HostFacts{Hostname: "node-a-host", OS: "linux", Platform: "debian", Arch: "amd64"}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	metrics := doAgentRaw(t, handler, http.MethodPost, "/api/agent/metrics", `{
+		"node_id":"node-a",
+		"version":"0.2.8",
+		"metrics":{},
+		"agent_runtime":{
+			"allow_exec":true,
+			"allow_root_exec":true,
+			"allow_terminal":true,
+			"terminal_transport":"stream",
+			"singbox_discover":true
+		}
+	}`, nodeToken)
+	if metrics.Code != http.StatusOK {
+		t.Fatalf("agent runtime update failed: %d (%s)", metrics.Code, metrics.Body.String())
+	}
 
 	update := doJSON(t, handler, http.MethodPost, "/api/nodes/geo", `{
 		"node_id":"node-a",
@@ -69,7 +95,7 @@ func TestNodeGeoUpdateListAndClear(t *testing.T) {
 	if view.Geo == nil || view.Geo.Country != "JP" || view.Geo.City != "TokyoControl" || view.Geo.ASN != 2516 || view.Geo.Source != "operator" || view.Geo.UpdatedAt.IsZero() {
 		t.Fatalf("geo was not normalized: %+v", view.Geo)
 	}
-	node, ok := st.Node("node-a")
+	node, ok = st.Node("node-a")
 	if !ok || node.Geo == nil || node.Geo.Provider != "oracle jp" {
 		t.Fatalf("geo not stored: ok=%v node=%+v", ok, node)
 	}
@@ -95,6 +121,18 @@ func TestNodeGeoUpdateListAndClear(t *testing.T) {
 	}
 	if len(geoViews) != 1 || geoViews[0].ID != "node-a" || geoViews[0].Geo == nil {
 		t.Fatalf("bad geo list: %+v", geoViews)
+	}
+	if len(geoViews[0].Tags) != 2 || geoViews[0].Tags[0] != "gomami" || geoViews[0].Tags[1] != "openjobs-vpn" {
+		t.Fatalf("geo list did not expose node tags for map filters: %+v", geoViews[0].Tags)
+	}
+	if geoViews[0].InternalIP != "10.0.0.8" || geoViews[0].WireGuardIP != "10.66.0.8" {
+		t.Fatalf("geo list did not expose node IP fields for map filters: %+v", geoViews[0])
+	}
+	if geoViews[0].HostFacts.Hostname != "node-a-host" || geoViews[0].HostFacts.OS != "linux" || geoViews[0].HostFacts.Arch != "amd64" {
+		t.Fatalf("geo list did not expose host facts for map filters: %+v", geoViews[0].HostFacts)
+	}
+	if geoViews[0].AgentRuntime == nil || !geoViews[0].AgentRuntime.AllowExec || !geoViews[0].AgentRuntime.AllowRootExec || !geoViews[0].AgentRuntime.AllowTerminal || !geoViews[0].AgentRuntime.SingBoxDiscover {
+		t.Fatalf("geo list did not expose agent runtime for map filters: %+v", geoViews[0].AgentRuntime)
 	}
 
 	clear := doJSON(t, handler, http.MethodPost, "/api/nodes/geo", `{"node_id":"node-a","clear":true}`, cookies, csrf)

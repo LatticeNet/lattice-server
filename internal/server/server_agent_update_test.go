@@ -279,6 +279,121 @@ func TestAgentUpdateManualPlanReturnsExistingEquivalentApproval(t *testing.T) {
 	}
 }
 
+func TestAgentUpdatePolicyDefaultsToNodeAgentInstallPath(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+
+	policy, err := srv.normalizeAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID:        "node-a",
+		Enabled:       true,
+		AutoPlan:      true,
+		TargetVersion: "0.2.0",
+		BinaryURL:     "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:        agentUpdateTestSHA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.InstallPath != defaultAgentInstallPath {
+		t.Fatalf("empty install_path should default to node-agent path %q, got %q", defaultAgentInstallPath, policy.InstallPath)
+	}
+
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID:        "node-a",
+		Enabled:       true,
+		TargetVersion: "0.2.0",
+		BinaryURL:     "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:        agentUpdateTestSHA,
+		InstallPath:   previousDefaultAgentInstallPath,
+		ServiceName:   defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := srv.agentUpdatePayloadForPolicy(model.Node{ID: "node-a", AgentVersion: "0.1.0"}, model.AgentUpdatePolicy{
+		NodeID:        "node-a",
+		Enabled:       true,
+		TargetVersion: "0.2.0",
+		BinaryURL:     "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:        agentUpdateTestSHA,
+		InstallPath:   previousDefaultAgentInstallPath,
+		ServiceName:   defaultAgentServiceName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.InstallPath != defaultAgentInstallPath {
+		t.Fatalf("previous default path should normalize to node-agent path %q, got %q", defaultAgentInstallPath, payload.InstallPath)
+	}
+}
+
+func TestAgentUpdatePlanRejectsDowngradeTarget(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.8"}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	saveAgentUpdatePolicy(t, handler, cookies, csrf, "0.2.7")
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/nodes/agent-updates/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusBadRequest {
+		t.Fatalf("downgrade plan should be rejected, got %d", plan.StatusCode)
+	}
+	var apiErr model.APIErrorResponse
+	if err := json.NewDecoder(plan.Body).Decode(&apiErr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(apiErr.Error.Message, "refusing to plan agent downgrade from 0.2.8 to 0.2.7") {
+		t.Fatalf("downgrade rejection should name both versions, got %q", apiErr.Error.Message)
+	}
+	if approvals := st.Approvals(); len(approvals) != 0 {
+		t.Fatalf("downgrade plan should not create approvals: %+v", approvals)
+	}
+}
+
+func TestAgentUpdateCurrentVersionChangeSupersedesApproval(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.7"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.8",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(first.Plan, "current_version: 0.2.7") {
+		t.Fatalf("first plan should freeze current version:\n%s", first.Plan)
+	}
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", time.Date(2026, 7, 4, 10, 5, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("current_version change should create a fresh approval, reused %s", first.ID)
+	}
+	if !strings.Contains(second.Plan, "current_version: 0.2.2") {
+		t.Fatalf("second plan should show the new current version:\n%s", second.Plan)
+	}
+	stale, ok := st.Approval(first.ID)
+	if !ok || stale.Status != model.ApprovalRejected {
+		t.Fatalf("old approval should be rejected as stale: ok=%v approval=%+v", ok, stale)
+	}
+	if !strings.Contains(stale.Reason, "current_version planned=0.2.7 current=0.2.2") {
+		t.Fatalf("stale reason should explain current_version change, got %q", stale.Reason)
+	}
+}
+
 func TestOfficialAgentReleaseHelpers(t *testing.T) {
 	target, err := normalizeOfficialAgentTarget("")
 	if err != nil || target != agentReleaseLatest {
@@ -482,7 +597,7 @@ func TestAgentUpdateApproveRequiresCurrentPolicy(t *testing.T) {
 	}
 	if !strings.Contains(apiErr.Error.Message, "changed fields:") ||
 		!strings.Contains(apiErr.Error.Message, "target_version planned=0.2.0 current=0.3.0") ||
-		!strings.Contains(apiErr.Error.Message, "install_path planned=/usr/local/bin/lattice-agent current=/opt/lattice/lattice-agent") {
+		!strings.Contains(apiErr.Error.Message, "install_path planned=/usr/local/bin/lattice-agent current="+defaultAgentInstallPath) {
 		t.Fatalf("stale agent update approval should explain changed fields, got %q", apiErr.Error.Message)
 	}
 	stale, ok := st.Approval(approval.ID)
@@ -491,7 +606,7 @@ func TestAgentUpdateApproveRequiresCurrentPolicy(t *testing.T) {
 	}
 	if !strings.Contains(stale.Reason, "changed fields:") ||
 		!strings.Contains(stale.Reason, "target_version planned=0.2.0 current=0.3.0") ||
-		!strings.Contains(stale.Reason, "install_path planned=/usr/local/bin/lattice-agent current=/opt/lattice/lattice-agent") {
+		!strings.Contains(stale.Reason, "install_path planned=/usr/local/bin/lattice-agent current="+defaultAgentInstallPath) {
 		t.Fatalf("stale agent update approval should persist changed fields, got %q", stale.Reason)
 	}
 	view := toApprovalView(stale)

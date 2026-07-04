@@ -969,9 +969,12 @@ func (s *Store) MarkStaleNodesOffline(threshold time.Duration, now time.Time) ([
 // agent source allowlist in one locked read-modify-write so it cannot clobber
 // concurrently-reported metrics/last-seen. Tags are trimmed, de-duplicated, and
 // empties dropped. A nil agentSourceAllowlist leaves that policy unchanged;
-// non-nil replaces it, including an empty slice to clear it. Returns the updated
-// node and whether it existed.
-func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string, agentSourceAllowlist *[]string) (model.Node, bool, error) {
+// non-nil replaces it, including an empty slice to clear it. inventory uses the
+// same nil-means-unchanged convention one level deeper: a nil outer pointer
+// leaves the stored inventory untouched, while a non-nil outer replaces it with
+// its (possibly nil, i.e. cleared) inner value. Returns the updated node and
+// whether it existed.
+func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string, agentSourceAllowlist *[]string, inventory **model.NodeInventory) (model.Node, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, ok := s.state.Nodes[nodeID]
@@ -995,6 +998,9 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string
 	n.Tags = cleaned
 	if agentSourceAllowlist != nil {
 		n.AgentSourceAllowlist = append([]string(nil), (*agentSourceAllowlist)...)
+	}
+	if inventory != nil {
+		n.Inventory = *inventory
 	}
 	s.state.Nodes[nodeID] = n
 	if err := s.Save(); err != nil {
@@ -1667,6 +1673,14 @@ func cloneNode(n model.Node) model.Node {
 	if n.Geo != nil {
 		geo := *n.Geo
 		n.Geo = &geo
+	}
+	if n.Inventory != nil {
+		inv := *n.Inventory
+		if inv.PurityPercent != nil {
+			p := *inv.PurityPercent
+			inv.PurityPercent = &p
+		}
+		n.Inventory = &inv
 	}
 	return n
 }

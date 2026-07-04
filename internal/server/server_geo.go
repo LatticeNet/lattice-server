@@ -17,13 +17,20 @@ import (
 var countryCodePattern = regexp.MustCompile(`^[A-Z]{2}$`)
 
 type nodeGeoView struct {
-	ID         string         `json:"id"`
-	Name       string         `json:"name"`
-	Role       string         `json:"role,omitempty"`
-	Online     bool           `json:"online"`
-	PublicIP   string         `json:"public_ip,omitempty"`
-	PublicIPv6 string         `json:"public_ipv6,omitempty"`
-	Geo        *model.NodeGeo `json:"geo,omitempty"`
+	ID           string              `json:"id"`
+	Name         string              `json:"name"`
+	Role         string              `json:"role,omitempty"`
+	Tags         []string            `json:"tags,omitempty"`
+	Online       bool                `json:"online"`
+	Disabled     bool                `json:"disabled,omitempty"`
+	PublicIP     string              `json:"public_ip,omitempty"`
+	PublicIPv6   string              `json:"public_ipv6,omitempty"`
+	InternalIP   string              `json:"internal_ip,omitempty"`
+	InternalIPv6 string              `json:"internal_ipv6,omitempty"`
+	WireGuardIP  string              `json:"wireguard_ip,omitempty"`
+	HostFacts    model.HostFacts     `json:"host_facts"`
+	AgentRuntime *agentRuntimeConfig `json:"agent_runtime,omitempty"`
+	Geo          *model.NodeGeo      `json:"geo,omitempty"`
 }
 
 type nodeGeoInput struct {
@@ -64,7 +71,7 @@ func (s *Server) handleNodesGeo(w http.ResponseWriter, r *http.Request, p princi
 		views := make([]nodeGeoView, 0, len(nodes))
 		for _, node := range nodes {
 			if rbac.Allows(p.Principal, "node:read", node.ID) {
-				views = append(views, toNodeGeoView(node))
+				views = append(views, s.toNodeGeoView(node))
 			}
 		}
 		writeJSON(w, http.StatusOK, views)
@@ -114,21 +121,28 @@ func (s *Server) handleNodesGeo(w http.ResponseWriter, r *http.Request, p princi
 			Scope:    "node:admin",
 			Metadata: map[string]string{"node_id": req.NodeID},
 		})
-		writeJSON(w, http.StatusOK, toNodeGeoView(node))
+		writeJSON(w, http.StatusOK, s.toNodeGeoView(node))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
 }
 
-func toNodeGeoView(node model.Node) nodeGeoView {
+func (s *Server) toNodeGeoView(node model.Node) nodeGeoView {
 	return nodeGeoView{
-		ID:         node.ID,
-		Name:       node.Name,
-		Role:       node.Role,
-		Online:     node.Online,
-		PublicIP:   node.PublicIP,
-		PublicIPv6: node.PublicIPv6,
-		Geo:        node.Geo,
+		ID:           node.ID,
+		Name:         node.Name,
+		Role:         node.Role,
+		Tags:         append([]string(nil), node.Tags...),
+		Online:       node.Online,
+		Disabled:     node.Disabled,
+		PublicIP:     node.PublicIP,
+		PublicIPv6:   node.PublicIPv6,
+		InternalIP:   node.InternalIP,
+		InternalIPv6: node.InternalIPv6,
+		WireGuardIP:  node.WireGuardIP,
+		HostFacts:    node.HostFacts,
+		AgentRuntime: s.agentRuntimeSnapshot(node.ID),
+		Geo:          node.Geo,
 	}
 }
 
@@ -210,7 +224,7 @@ func (s *Server) resolveNodeGeo(r *http.Request, p principal, node model.Node, r
 		result.Message = "node not found"
 		return result
 	}
-	view := toNodeGeoView(updated)
+	view := s.toNodeGeoView(updated)
 	result.Status = "updated"
 	result.Node = &view
 	result.Geo = view.Geo

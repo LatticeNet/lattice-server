@@ -531,3 +531,61 @@ func TestSingBoxManageDeleteRequiresDiscoveredName(t *testing.T) {
 	}
 	bad.Body.Close()
 }
+
+func TestSingBoxManageConncheckQueuesValidatedTask(t *testing.T) {
+	srv, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	// Unknown name cannot be used as an arbitrary sb argument.
+	unknown := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/conncheck",
+		`{"node_id":"node-a","name":"VLESS-REALITY-31001.json"}`, cookies, csrf)
+	if unknown.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown name: want 400, got %d", unknown.StatusCode)
+	}
+	unknown.Body.Close()
+
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"node-a": {NodeID: "node-a", Status: "ok", Nodes: []model.SingBoxNode{{Name: "VLESS-REALITY-31001.json"}}},
+	}
+	srv.singboxInvMu.Unlock()
+
+	badURL := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/conncheck",
+		`{"node_id":"node-a","name":"VLESS-REALITY-31001.json","url":"file:///etc/passwd"}`, cookies, csrf)
+	if badURL.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad url: want 400, got %d", badURL.StatusCode)
+	}
+	badURL.Body.Close()
+
+	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/conncheck",
+		`{"node_id":"node-a","name":"VLESS-REALITY-31001.json","url":"https://example.com/health?x=1","timeout_sec":7}`, cookies, csrf)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("conncheck: want 200, got %d (%s)", resp.StatusCode, b)
+	}
+	var out struct {
+		TaskID string `json:"task_id"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	_ = json.Unmarshal(body, &out)
+	if out.TaskID == "" {
+		t.Fatalf("no task id: %s", body)
+	}
+	var task *model.Task
+	for _, tk := range srv.store.Tasks() {
+		if tk.ID == out.TaskID {
+			tt := tk
+			task = &tt
+		}
+	}
+	if task == nil || len(task.Targets) != 1 || task.Targets[0] != "node-a" || task.Interpreter != "sh" {
+		t.Fatalf("unexpected task: %+v", task)
+	}
+	for _, needle := range []string{"sb ", "--json", "conncheck", "'VLESS-REALITY-31001.json'", "'https://example.com/health?x=1'", " 7"} {
+		if !strings.Contains(task.Script, needle) {
+			t.Fatalf("conncheck script missing %q:\n%s", needle, task.Script)
+		}
+	}
+}

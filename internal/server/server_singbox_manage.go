@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -369,6 +370,88 @@ func (s *Server) handleSingBoxManageDelete(w http.ResponseWriter, r *http.Reques
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.manage.delete", Scope: "task:run",
 		Metadata: map[string]string{"task_id": task.ID, "name": name},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task_id": task.ID})
+}
+
+func (s *Server) handleSingBoxManageConncheck(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID     string `json:"node_id"`
+		Name       string `json:"name"`
+		URL        string `json:"url"`
+		TimeoutSec int    `json:"timeout_sec"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	name := strings.TrimSpace(req.Name)
+	if req.NodeID == "" || name == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id and name are required"))
+		return
+	}
+	if !singBoxNodeNameRe.MatchString(name) {
+		writeError(w, http.StatusBadRequest, errors.New("invalid node name"))
+		return
+	}
+	if !s.singBoxInventoryHasNode(req.NodeID, name) {
+		writeError(w, http.StatusBadRequest, errors.New("name is not a discovered node on this machine"))
+		return
+	}
+	checkURL := strings.TrimSpace(req.URL)
+	if checkURL == "" {
+		checkURL = "https://www.cloudflare.com/cdn-cgi/trace"
+	}
+	parsed, err := url.Parse(checkURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		writeError(w, http.StatusBadRequest, errors.New("url must be http(s)"))
+		return
+	}
+	if len(checkURL) > 2048 || strings.ContainsAny(checkURL, "\r\n\t ") {
+		writeError(w, http.StatusBadRequest, errors.New("url is invalid"))
+		return
+	}
+	timeoutSec := req.TimeoutSec
+	if timeoutSec == 0 {
+		timeoutSec = 10
+	}
+	if timeoutSec < 2 || timeoutSec > 60 {
+		writeError(w, http.StatusBadRequest, errors.New("timeout_sec must be 2-60"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
+		return
+	}
+	parts := []string{"sb"}
+	if addr := s.nodeSBAddr(req.NodeID); addr != "" {
+		parts = append(parts, "--addr", shellQuote(addr))
+	}
+	parts = append(parts, "--json", "conncheck", shellQuote(name), shellQuote(checkURL), strconv.Itoa(timeoutSec))
+	script := "set -e\n" + strings.Join(parts, " ") + "\n"
+	task, err := s.queueSingBoxTask(p, req.NodeID, script)
+	if err != nil {
+		if errors.Is(err, errTaskExecutionDisabled) {
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.manage.conncheck", Scope: "task:run", Decision: "deny", Reason: err.Error()})
+			writeTaskExecutionDisabled(w)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:     id.New("audit"),
+		NodeID: req.NodeID,
+		Action: "singbox.manage.conncheck",
+		Scope:  "task:run",
+		Metadata: map[string]string{
+			"task_id":  task.ID,
+			"name":     name,
+			"url_host": parsed.Hostname(),
+		},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "task_id": task.ID})
 }

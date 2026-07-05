@@ -26,6 +26,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-webauthn/webauthn/webauthn"
+
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/audit"
 	"github.com/LatticeNet/lattice-server/internal/auth"
@@ -88,7 +90,9 @@ type Options struct {
 	PluginRuntimeEnv []string
 	// PublicURL is the externally-reachable base URL of this server (scheme +
 	// host, no trailing slash), used to build the OIDC redirect URL. Required
-	// for SSO login; empty disables the OIDC start/callback flow.
+	// for SSO login; empty disables the OIDC start/callback flow. It is also the
+	// canonical source for the WebAuthn relying-party ID and origin (RPID = host,
+	// RPOrigin = scheme://host[:port]); passkeys fail closed when it is empty.
 	PublicURL string
 	// MetricsToken enables the /metrics endpoint when non-empty. The endpoint
 	// accepts only Authorization: Bearer <token>; empty keeps it hidden so public
@@ -255,6 +259,13 @@ type Server struct {
 	// They are intentionally in-memory: a server restart expires them.
 	stepUpMu     sync.Mutex
 	stepUpGrants map[string]stepUpGrant
+
+	// webauthnRP is the passkey relying party derived once from publicURL. It is
+	// built lazily (webauthnOnce) so an invalid/absent external URL does not fail
+	// server start; passkey endpoints surface the error as 503 instead.
+	webauthnOnce sync.Once
+	webauthnRP   *webauthn.WebAuthn
+	webauthnErr  error
 }
 
 const (
@@ -733,6 +744,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/2fa/totp/activate", s.withAuth("", s.handle2FAActivate))
 	mux.HandleFunc("/api/2fa/totp/disable", s.withAuth("", s.handle2FADisable))
 	mux.HandleFunc("/api/security/step-up", s.withAuth("", s.handleSecurityStepUp))
+	mux.HandleFunc("/api/security/webauthn/register/begin", s.withAuth("", s.handleWebAuthnRegisterBegin))
+	mux.HandleFunc("/api/security/webauthn/register/finish", s.withAuth("", s.handleWebAuthnRegisterFinish))
+	mux.HandleFunc("/api/security/webauthn/credentials", s.withAuth("", s.handleWebAuthnCredentials))
+	mux.HandleFunc("/api/security/webauthn/credentials/rename", s.withAuth("", s.handleWebAuthnRename))
+	mux.HandleFunc("/api/security/webauthn/credentials/delete", s.withAuth("", s.handleWebAuthnDelete))
+	mux.HandleFunc("/api/auth/webauthn/login/begin", s.handleWebAuthnLoginBegin)
+	mux.HandleFunc("/api/auth/webauthn/login/finish", s.handleWebAuthnLoginFinish)
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
 	mux.HandleFunc("/api/nodes/geo", s.withAuth("", s.handleNodesGeo))
 	mux.HandleFunc("/api/nodes/geo/resolve", s.withAuth("", s.handleNodesGeoResolve))

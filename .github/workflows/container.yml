@@ -74,6 +74,9 @@ jobs:
             type=raw,value=beta,enable=${{ github.ref == 'refs/tags/beta' }}
             type=raw,value=${{ github.ref_name }},enable=${{ startsWith(github.ref, 'refs/tags/beta-') }}
             type=raw,value=manual-${{ github.run_id }},enable=${{ github.event_name == 'workflow_dispatch' }}
+      - name: build timestamp
+        id: build-date
+        run: echo "value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - name: build and optionally push
         uses: docker/build-push-action@v7
         with:
@@ -91,7 +94,7 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
             COMMIT=${{ github.sha }}
-            DATE=${{ github.event.repository.updated_at }}
+            DATE=${{ steps.build-date.outputs.value }}
             DASHBOARD_COMMIT=${{ steps.dashboard.outputs.ref }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

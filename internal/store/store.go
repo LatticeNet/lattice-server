@@ -78,6 +78,13 @@ type State struct {
 	OIDCProviders   map[string]model.OIDCProvider       `json:"oidc_providers"`
 	OIDCIdentities  map[string]model.OIDCIdentity       `json:"oidc_identities"`
 	OIDCAuthStates  map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
+	// WebAuthnCreds holds registered passkeys keyed by store record id. The public
+	// keys and credential ids are non-secret, so this map is persisted as-is (no
+	// at-rest envelope like Users/Sessions carry).
+	WebAuthnCreds map[string]auth.WebAuthnCredential `json:"webauthn_credentials"`
+	// WebAuthnChallenges holds pending, short-lived passkey ceremony challenges,
+	// mirroring TOTPChallenges.
+	WebAuthnChallenges map[string]auth.WebAuthnChallenge `json:"webauthn_challenges"`
 }
 
 type Store struct {
@@ -357,6 +364,9 @@ func emptyState() State {
 		OIDCProviders:   map[string]model.OIDCProvider{},
 		OIDCIdentities:  map[string]model.OIDCIdentity{},
 		OIDCAuthStates:  map[string]auth.OIDCAuthState{},
+		WebAuthnCreds:   map[string]auth.WebAuthnCredential{},
+
+		WebAuthnChallenges: map[string]auth.WebAuthnChallenge{},
 	}
 }
 
@@ -470,6 +480,14 @@ func (st *State) ensureMaps() {
 	}
 	if st.OIDCAuthStates == nil {
 		st.OIDCAuthStates = map[string]auth.OIDCAuthState{}
+	}
+	// Nil-checked so a state file written before passkeys existed upgrades cleanly
+	// to empty passkey collections on load.
+	if st.WebAuthnCreds == nil {
+		st.WebAuthnCreds = map[string]auth.WebAuthnCredential{}
+	}
+	if st.WebAuthnChallenges == nil {
+		st.WebAuthnChallenges = map[string]auth.WebAuthnChallenge{}
 	}
 }
 

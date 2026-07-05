@@ -25,7 +25,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ORG: LatticeNet
       PACKAGE_NAME: lattice-server
-      ACTIVE_TAGS: latest alpha
+      ACTIVE_TAGS: latest alpha beta
       KEEP_UNTAGGED: ${{ github.event.inputs.keep || '0' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
     steps:

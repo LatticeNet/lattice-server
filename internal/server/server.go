@@ -6107,9 +6107,6 @@ func (s *Server) authenticateNode(r *http.Request, nodeID, token string) (model.
 	if n.Disabled {
 		return model.Node{}, false
 	}
-	if !auth.VerifySecret(n.TokenHash, token) {
-		return model.Node{}, false
-	}
 	sourceIP := s.clientIP(r)
 	if !agentSourceAllowed(n.AgentSourceAllowlist, sourceIP) {
 		s.recordRequestAudit(r, model.AuditEvent{
@@ -6123,6 +6120,9 @@ func (s *Server) authenticateNode(r *http.Request, nodeID, token string) (model.
 		return model.Node{}, false
 	}
 	touchedAt := s.now().UTC()
+	if !verifyAgentNodeSecret(nodeID, sourceIP, n.TokenHash, token, touchedAt) {
+		return model.Node{}, false
+	}
 	if touched, err := s.store.TouchNodeToken(nodeID, touchedAt, nodeTokenTouchInterval); err != nil {
 		s.logger.Printf("node token touch failed: node_id=%s: %v", nodeID, err)
 	} else if touched {

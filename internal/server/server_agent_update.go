@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,12 +25,13 @@ const (
 	agentUpdateActionPrefix   = agentUpdateAction + ":"
 	agentUpdateAwaitingPrefix = "awaiting agent version confirmation"
 
-	defaultAgentInstallPath   = "/opt/lattice/lattice-agent"
-	defaultAgentServiceName   = "lattice-agent.service"
-	legacyAgentInstallPath    = "/usr/local/bin/lattice-agent"
-	defaultAgentReleaseRepo   = "LatticeNet/lattice-node-agent"
-	agentReleaseLatest        = "latest"
-	agentReleaseMetadataLimit = 512 * 1024
+	defaultAgentInstallPath         = "/opt/lattice/node-agent/lattice-agent"
+	previousDefaultAgentInstallPath = "/opt/lattice/lattice-agent"
+	defaultAgentServiceName         = "lattice-agent.service"
+	legacyAgentInstallPath          = "/usr/local/bin/lattice-agent"
+	defaultAgentReleaseRepo         = "LatticeNet/lattice-node-agent"
+	agentReleaseLatest              = "latest"
+	agentReleaseMetadataLimit       = 512 * 1024
 )
 
 var (
@@ -40,12 +42,13 @@ var (
 )
 
 type agentUpdatePayload struct {
-	NodeID        string `json:"node_id"`
-	TargetVersion string `json:"target_version"`
-	BinaryURL     string `json:"binary_url"`
-	SHA256        string `json:"sha256"`
-	InstallPath   string `json:"install_path"`
-	ServiceName   string `json:"service_name"`
+	NodeID         string `json:"node_id"`
+	CurrentVersion string `json:"current_version"`
+	TargetVersion  string `json:"target_version"`
+	BinaryURL      string `json:"binary_url"`
+	SHA256         string `json:"sha256"`
+	InstallPath    string `json:"install_path"`
+	ServiceName    string `json:"service_name"`
 }
 
 type agentReleaseInfoView struct {
@@ -240,6 +243,7 @@ func (s *Server) normalizeAgentUpdatePolicy(req model.AgentUpdatePolicy) (model.
 	if out.InstallPath == "" {
 		out.InstallPath = defaultAgentInstallPath
 	}
+	out.InstallPath = normalizeDefaultAgentInstallPath(out.InstallPath)
 	if err := validateAgentInstallPath(out.InstallPath); err != nil {
 		return model.AgentUpdatePolicy{}, err
 	}
@@ -274,6 +278,69 @@ func agentUpdatePolicyApprovalBindingChanged(before, after model.AgentUpdatePoli
 		before.SHA256 != after.SHA256 ||
 		before.InstallPath != after.InstallPath ||
 		before.ServiceName != after.ServiceName
+}
+
+func normalizeDefaultAgentInstallPath(value string) string {
+	switch strings.TrimSpace(value) {
+	case "", previousDefaultAgentInstallPath:
+		return defaultAgentInstallPath
+	default:
+		return value
+	}
+}
+
+func isAgentVersionDowngrade(current, target string) bool {
+	cmp, ok := compareAgentVersions(current, target)
+	return ok && cmp > 0
+}
+
+func compareAgentVersions(a, b string) (int, bool) {
+	left, okLeft := parseAgentVersionParts(a)
+	right, okRight := parseAgentVersionParts(b)
+	if !okLeft || !okRight {
+		return 0, false
+	}
+	maxLen := len(left)
+	if len(right) > maxLen {
+		maxLen = len(right)
+	}
+	for i := 0; i < maxLen; i++ {
+		var lv, rv int
+		if i < len(left) {
+			lv = left[i]
+		}
+		if i < len(right) {
+			rv = right[i]
+		}
+		if lv > rv {
+			return 1, true
+		}
+		if lv < rv {
+			return -1, true
+		}
+	}
+	return 0, true
+}
+
+func parseAgentVersionParts(raw string) ([]int, bool) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "v")
+	if raw == "" {
+		return nil, false
+	}
+	parts := strings.Split(raw, ".")
+	out := make([]int, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			return nil, false
+		}
+		value, err := strconv.Atoi(part)
+		if err != nil || value < 0 {
+			return nil, false
+		}
+		out = append(out, value)
+	}
+	return out, true
 }
 
 func normalizeAgentReleaseRepo(raw string) (string, error) {
@@ -352,6 +419,9 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 	payload, err := s.agentUpdatePayloadForPolicy(node, policy)
 	if err != nil {
 		return model.Approval{}, err
+	}
+	if !force && isAgentVersionDowngrade(strings.TrimSpace(node.AgentVersion), payload.TargetVersion) {
+		return model.Approval{}, fmt.Errorf("refusing to plan agent downgrade from %s to %s", strings.TrimSpace(node.AgentVersion), payload.TargetVersion)
 	}
 	if !force && strings.TrimSpace(node.AgentVersion) == payload.TargetVersion {
 		if err := s.rejectSupersededAgentUpdateApprovals(nodeID, "", now); err != nil {
@@ -445,6 +515,7 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 	if policy.InstallPath == "" {
 		policy.InstallPath = defaultAgentInstallPath
 	}
+	policy.InstallPath = normalizeDefaultAgentInstallPath(policy.InstallPath)
 	if err := validateAgentInstallPath(policy.InstallPath); err != nil {
 		return agentUpdatePayload{}, err
 	}
@@ -465,12 +536,13 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 			return agentUpdatePayload{}, err
 		}
 		return agentUpdatePayload{
-			NodeID:        normalized.NodeID,
-			TargetVersion: normalized.TargetVersion,
-			BinaryURL:     normalized.BinaryURL,
-			SHA256:        normalized.SHA256,
-			InstallPath:   normalized.InstallPath,
-			ServiceName:   normalized.ServiceName,
+			NodeID:         normalized.NodeID,
+			CurrentVersion: strings.TrimSpace(node.AgentVersion),
+			TargetVersion:  normalized.TargetVersion,
+			BinaryURL:      normalized.BinaryURL,
+			SHA256:         normalized.SHA256,
+			InstallPath:    normalized.InstallPath,
+			ServiceName:    normalized.ServiceName,
 		}, nil
 	}
 	return s.resolveOfficialAgentUpdatePayload(node, policy)
@@ -495,12 +567,13 @@ func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model
 		return agentUpdatePayload{}, fmt.Errorf("official release %s does not publish checksum for %s", tag, artifact)
 	}
 	return agentUpdatePayload{
-		NodeID:        policy.NodeID,
-		TargetVersion: target,
-		BinaryURL:     base + "/" + url.PathEscape(artifact),
-		SHA256:        sha,
-		InstallPath:   policy.InstallPath,
-		ServiceName:   policy.ServiceName,
+		NodeID:         policy.NodeID,
+		CurrentVersion: strings.TrimSpace(node.AgentVersion),
+		TargetVersion:  target,
+		BinaryURL:      base + "/" + url.PathEscape(artifact),
+		SHA256:         sha,
+		InstallPath:    policy.InstallPath,
+		ServiceName:    policy.ServiceName,
 	}, nil
 }
 
@@ -700,7 +773,11 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	if node.Name != "" {
 		fmt.Fprintf(&b, "node_name: %s\n", node.Name)
 	}
-	fmt.Fprintf(&b, "current_version: %s\n", node.AgentVersion)
+	currentVersion := strings.TrimSpace(payload.CurrentVersion)
+	if currentVersion == "" {
+		currentVersion = strings.TrimSpace(node.AgentVersion)
+	}
+	fmt.Fprintf(&b, "current_version: %s\n", currentVersion)
 	fmt.Fprintf(&b, "target_version: %s\n", payload.TargetVersion)
 	fmt.Fprintf(&b, "binary_url: %s\n", payload.BinaryURL)
 	fmt.Fprintf(&b, "sha256: %s\n", payload.SHA256)
@@ -749,6 +826,7 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 	if payload.NodeID != approval.NodeID {
 		return agentUpdatePayload{}, errors.New("agent update approval node_id mismatch")
 	}
+	payload.CurrentVersion = strings.TrimSpace(payload.CurrentVersion)
 	policy := model.AgentUpdatePolicy{
 		NodeID:        payload.NodeID,
 		Enabled:       true,
@@ -763,12 +841,13 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 		return agentUpdatePayload{}, err
 	}
 	return agentUpdatePayload{
-		NodeID:        payload.NodeID,
-		TargetVersion: normalized.TargetVersion,
-		BinaryURL:     normalized.BinaryURL,
-		SHA256:        normalized.SHA256,
-		InstallPath:   normalized.InstallPath,
-		ServiceName:   normalized.ServiceName,
+		NodeID:         payload.NodeID,
+		CurrentVersion: payload.CurrentVersion,
+		TargetVersion:  normalized.TargetVersion,
+		BinaryURL:      normalized.BinaryURL,
+		SHA256:         normalized.SHA256,
+		InstallPath:    normalized.InstallPath,
+		ServiceName:    normalized.ServiceName,
 	}, nil
 }
 
@@ -789,6 +868,7 @@ func sNormalizeAgentUpdatePayload(policy model.AgentUpdatePolicy) (model.AgentUp
 	if policy.InstallPath == "" {
 		policy.InstallPath = defaultAgentInstallPath
 	}
+	policy.InstallPath = normalizeDefaultAgentInstallPath(policy.InstallPath)
 	if err := validateAgentInstallPath(policy.InstallPath); err != nil {
 		return model.AgentUpdatePolicy{}, err
 	}
@@ -829,6 +909,9 @@ func (s *Server) requireCurrentAgentUpdateApproval(approval model.Approval) erro
 
 func agentUpdatePayloadChangeSummary(planned, current agentUpdatePayload) string {
 	changes := []string{}
+	if planned.CurrentVersion != current.CurrentVersion {
+		changes = append(changes, fmt.Sprintf("current_version planned=%s current=%s", planned.CurrentVersion, current.CurrentVersion))
+	}
 	if planned.TargetVersion != current.TargetVersion {
 		changes = append(changes, fmt.Sprintf("target_version planned=%s current=%s", planned.TargetVersion, current.TargetVersion))
 	}
@@ -983,6 +1066,7 @@ func (s *Server) agentUpdateApprovalLocalStaleness(approval model.Approval) (boo
 	if policy.InstallPath == "" {
 		policy.InstallPath = defaultAgentInstallPath
 	}
+	policy.InstallPath = normalizeDefaultAgentInstallPath(policy.InstallPath)
 	if err := validateAgentInstallPath(policy.InstallPath); err != nil {
 		return true, agentUpdateApprovalStaleReasonWithDetails("install_path is invalid: " + err.Error())
 	}
@@ -1037,6 +1121,7 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"SERVICE=" + shellQuote(payload.ServiceName) + "\n" +
 		"TARGET_VERSION=" + shellQuote(payload.TargetVersion) + "\n" +
 		"DEFAULT_TARGET=" + shellQuote(defaultAgentInstallPath) + "\n" +
+		"OLD_DEFAULT_TARGET=" + shellQuote(previousDefaultAgentInstallPath) + "\n" +
 		"LEGACY_TARGET=" + shellQuote(legacyAgentInstallPath) + "\n" +
 		"DEFAULT_SERVICE=" + shellQuote(defaultAgentServiceName) + "\n" +
 		"RUNNING_AGENT=\"\"\n" +
@@ -1045,7 +1130,7 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"fi\n" +
 		"case \"$RUNNING_AGENT\" in\n" +
 		"  */lattice-agent)\n" +
-		"    if [ \"$TARGET\" = \"$DEFAULT_TARGET\" ] || [ \"$TARGET\" = \"$LEGACY_TARGET\" ]; then TARGET=\"$RUNNING_AGENT\"; fi\n" +
+		"    if [ \"$TARGET\" = \"$DEFAULT_TARGET\" ] || [ \"$TARGET\" = \"$OLD_DEFAULT_TARGET\" ] || [ \"$TARGET\" = \"$LEGACY_TARGET\" ]; then TARGET=\"$RUNNING_AGENT\"; fi\n" +
 		"    ;;\n" +
 		"esac\n" +
 		"RUNNING_SERVICE=\"\"\n" +

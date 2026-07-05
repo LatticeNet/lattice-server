@@ -208,6 +208,10 @@ type Server struct {
 	// WebSocket for the same session (the streaming transport). It owns no
 	// session metadata; terminalBroker remains authoritative for lifecycle.
 	terminalHub *terminalHub
+	// agentControlHub owns long-lived outbound agent control sockets. It is used
+	// to push low-rate control-plane events such as terminal.open so idle agents
+	// do not need subsecond terminal discovery polling.
+	agentControlHub *agentControlHub
 	// build is immutable process metadata exposed by /api/version and dashboard
 	// About. It contains no secrets and is intentionally safe for unauthenticated
 	// health/version probes.
@@ -363,6 +367,7 @@ func New(opts Options) (*Server, error) {
 		taskExecutionDisabled: opts.TaskExecutionDisabled,
 		terminalBroker:        newTerminalBroker(),
 		terminalHub:           newTerminalHub(),
+		agentControlHub:       newAgentControlHub(),
 		build:                 build,
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
@@ -883,6 +888,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/terminal/sessions", s.withAgentLimit(s.handleAgentTerminalSessions))
 	mux.HandleFunc("/api/agent/terminal/sessions/", s.withAgentLimit(s.handleAgentTerminalSessionPath))
 	mux.HandleFunc("/api/agent/terminal/stream", s.withAgentLimit(s.handleAgentTerminalStream))
+	mux.HandleFunc("/api/agent/control/stream", s.withAgentLimit(s.handleAgentControlStream))
 	mux.HandleFunc("/api/agent/config", s.withAgentLimit(s.handleAgentConfig))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))

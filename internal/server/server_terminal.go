@@ -602,6 +602,7 @@ func (s *Server) handleTerminalSessions(w http.ResponseWriter, r *http.Request, 
 			writeError(w, http.StatusTooManyRequests, err)
 			return
 		}
+		s.agentControlHub.notifyTerminalOpen(session)
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:     id.New("audit"),
 			NodeID: req.NodeID,

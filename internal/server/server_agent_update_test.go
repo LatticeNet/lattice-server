@@ -499,6 +499,57 @@ func TestFetchAgentReleaseTextRejectsOversizedMetadata(t *testing.T) {
 	}
 }
 
+func TestFetchAgentReleaseTextCachesFailures(t *testing.T) {
+	srv, _, _ := newInventoryServer(t)
+	now := time.Date(2026, 7, 5, 14, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return now }
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "rate limited", http.StatusForbidden)
+	}))
+	defer upstream.Close()
+
+	for i := 0; i < 2; i++ {
+		if _, err := srv.fetchAgentReleaseText(upstream.URL); err == nil || !strings.Contains(err.Error(), "403") {
+			t.Fatalf("rate limited release metadata should fail with 403, got %v", err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("release metadata failures should be cached briefly, got %d upstream calls", calls)
+	}
+	now = now.Add(agentReleaseErrorCacheTTL + time.Second)
+	if _, err := srv.fetchAgentReleaseText(upstream.URL); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("expired cached release metadata error should refetch and fail with 403, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expired release metadata failure cache should refetch, got %d upstream calls", calls)
+	}
+}
+
+func TestFetchLatestAgentReleaseTagUsesRedirect(t *testing.T) {
+	srv, _, _ := newInventoryServer(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/owner/repo/releases/latest":
+			http.Redirect(w, r, "/owner/repo/releases/tag/v0.3.0", http.StatusFound)
+		case "/owner/repo/releases/tag/v0.3.0":
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	tag, err := srv.fetchLatestAgentReleaseRedirectTag(upstream.URL + "/owner/repo/releases/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag != "v0.3.0" {
+		t.Fatalf("latest release redirect tag = %q want v0.3.0", tag)
+	}
+}
+
 func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

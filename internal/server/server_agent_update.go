@@ -32,6 +32,8 @@ const (
 	defaultAgentReleaseRepo         = "LatticeNet/lattice-node-agent"
 	agentReleaseLatest              = "latest"
 	agentReleaseMetadataLimit       = 512 * 1024
+	agentReleaseSuccessCacheTTL     = 10 * time.Minute
+	agentReleaseErrorCacheTTL       = 60 * time.Second
 )
 
 var (
@@ -59,6 +61,12 @@ type agentReleaseInfoView struct {
 	Artifacts     []string          `json:"artifacts"`
 	SHA256        map[string]string `json:"sha256"`
 	FetchedAt     time.Time         `json:"fetched_at"`
+}
+
+type agentReleaseCacheEntry struct {
+	body      string
+	err       error
+	expiresAt time.Time
 }
 
 func (s *Server) handleAgentUpdatePolicies(w http.ResponseWriter, r *http.Request, p principal) {
@@ -599,21 +607,48 @@ func (s *Server) officialAgentTargetAndTag(raw string) (targetVersion string, ta
 }
 
 func (s *Server) fetchLatestAgentReleaseTag() (string, error) {
-	body, err := s.fetchAgentReleaseText("https://api.github.com/repos/" + s.agentReleaseRepo + "/releases/latest")
+	tag, err := s.fetchCachedAgentReleaseValue("latest-tag:"+s.agentReleaseRepo, func() (string, error) {
+		return s.fetchLatestAgentReleaseRedirectTag("https://github.com/" + s.agentReleaseRepo + "/releases/latest")
+	})
 	if err != nil {
 		return "", err
 	}
-	var res struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.Unmarshal([]byte(body), &res); err != nil {
-		return "", fmt.Errorf("decode latest agent release: %w", err)
-	}
-	tag := strings.TrimSpace(res.TagName)
+	tag = strings.TrimSpace(tag)
 	if tag == "" || !strings.HasPrefix(tag, "v") {
 		return "", errors.New("latest agent release has no v* tag")
 	}
 	return tag, nil
+}
+
+func (s *Server) fetchLatestAgentReleaseRedirectTag(rawURL string) (string, error) {
+	client := &http.Client{Timeout: 12 * time.Second}
+	req, err := http.NewRequest(http.MethodHead, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "lattice-server-agent-update")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch latest agent release redirect: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("fetch latest agent release redirect: %s", resp.Status)
+	}
+	if resp.Request == nil || resp.Request.URL == nil {
+		return "", errors.New("latest agent release redirect did not expose final URL")
+	}
+	parts := strings.Split(strings.Trim(resp.Request.URL.EscapedPath(), "/"), "/")
+	for i := 0; i+1 < len(parts); i++ {
+		if parts[i] == "tag" {
+			tag, err := url.PathUnescape(parts[i+1])
+			if err != nil {
+				return "", fmt.Errorf("decode latest agent release tag: %w", err)
+			}
+			return strings.TrimSpace(tag), nil
+		}
+	}
+	return "", fmt.Errorf("latest agent release redirect did not resolve to a release tag: %s", resp.Request.URL.String())
 }
 
 func (s *Server) fetchAgentReleaseInfo() (agentReleaseInfoView, error) {
@@ -656,6 +691,37 @@ func (s *Server) fetchAgentReleaseInfo() (agentReleaseInfoView, error) {
 }
 
 func (s *Server) fetchAgentReleaseText(rawURL string) (string, error) {
+	return s.fetchCachedAgentReleaseValue("text:"+rawURL, func() (string, error) {
+		return s.fetchAgentReleaseTextUncached(rawURL)
+	})
+}
+
+func (s *Server) fetchCachedAgentReleaseValue(key string, fetch func() (string, error)) (string, error) {
+	now := s.now()
+	s.agentReleaseCacheMu.Lock()
+	if s.agentReleaseCache != nil {
+		if cached, ok := s.agentReleaseCache[key]; ok && now.Before(cached.expiresAt) {
+			s.agentReleaseCacheMu.Unlock()
+			return cached.body, cached.err
+		}
+	}
+	s.agentReleaseCacheMu.Unlock()
+
+	body, err := fetch()
+	ttl := agentReleaseSuccessCacheTTL
+	if err != nil {
+		ttl = agentReleaseErrorCacheTTL
+	}
+	s.agentReleaseCacheMu.Lock()
+	if s.agentReleaseCache == nil {
+		s.agentReleaseCache = map[string]agentReleaseCacheEntry{}
+	}
+	s.agentReleaseCache[key] = agentReleaseCacheEntry{body: body, err: err, expiresAt: now.Add(ttl)}
+	s.agentReleaseCacheMu.Unlock()
+	return body, err
+}
+
+func (s *Server) fetchAgentReleaseTextUncached(rawURL string) (string, error) {
 	client := &http.Client{Timeout: 12 * time.Second}
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {

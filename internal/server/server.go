@@ -193,7 +193,9 @@ type Server struct {
 	geoResolver geoip.Resolver
 	// agentReleaseRepo is constrained to owner/repo and used only to construct
 	// GitHub release URLs for the first-party node-agent update resolver.
-	agentReleaseRepo string
+	agentReleaseRepo    string
+	agentReleaseCacheMu sync.Mutex
+	agentReleaseCache   map[string]agentReleaseCacheEntry
 	// auditHeadShipper owns optional automated off-box custody for the verified
 	// audit WAL head. Nil means disabled.
 	auditHeadShipper *auditHeadShipper

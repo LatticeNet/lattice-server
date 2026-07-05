@@ -32,22 +32,14 @@ jobs:
         uses: actions/checkout@v6
         with:
           path: lattice-server
-      - name: checkout lattice-sdk matching ref
-        id: checkout-sdk-ref
-        continue-on-error: true
+      - name: read sdk ref
+        id: sdk
+        run: echo "ref=$(cat lattice-server/sdk.ref)" >> "$GITHUB_OUTPUT"
+      - name: checkout lattice-sdk
         uses: actions/checkout@v6
         with:
           repository: LatticeNet/lattice-sdk
-          ref: ${{ github.head_ref || github.ref_name }}
-          path: lattice-sdk
-      - name: reset failed sdk checkout
-        if: steps.checkout-sdk-ref.outcome == 'failure'
-        run: rm -rf lattice-sdk
-      - name: checkout lattice-sdk default ref
-        if: steps.checkout-sdk-ref.outcome == 'failure'
-        uses: actions/checkout@v6
-        with:
-          repository: LatticeNet/lattice-sdk
+          ref: ${{ steps.sdk.outputs.ref }}
           path: lattice-sdk
       - name: read dashboard ref
         id: dashboard

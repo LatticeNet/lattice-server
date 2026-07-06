@@ -144,12 +144,18 @@ ghcr.io/latticenet/lattice-server
 
 Image publication is tag-driven. The moving `latest` git tag publishes
 `:latest`, the moving `alpha` git tag publishes `:alpha`, and stable `v*` tags
-publish immutable version tags. Source pushes to `main` run CI but do not
-publish a `main` image channel. Build provenance/SBOM attestations are disabled
-for the image workflow, and the `package cleanup` workflow prunes old untagged
-container package versions. The cleanup job protects child manifests referenced
-by the active `latest` and `alpha` manifest lists, then deletes stale untagged
-digests by default.
+publish immutable version tags. Pushed image builds also publish a
+`sha-<commit>` tag, and the rolling alpha channel additionally publishes
+`alpha-<commit>`, so the GitHub Packages page has human-readable immutable
+entries instead of only raw digest rows. Source pushes to `main` run CI but do
+not publish a `main` image channel.
+
+The image workflow writes OCI title, description, source, revision, license, and
+vendor metadata as both image labels and multi-arch manifest annotations. Build
+provenance/SBOM attestations are disabled to avoid extra untagged package
+versions. The `package cleanup` workflow prunes old untagged container package
+versions, protects child manifests referenced by every currently tagged image,
+and keeps the newest 10 stale untagged versions by default as a rollback buffer.
 
 The container leaves `LATTICE_MASTER_KEY_FILE` unset by default so first boot can
 generate `/var/lib/lattice/master.key` automatically. Set it only when restoring

@@ -107,12 +107,16 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 		"service $SERVICE not found before installing $TARGET",
 		"systemctl --no-legend list-unit-files \"$SERVICE\"",
 		"grep -Fxq \"$SERVICE\"",
-		"lattice-agent-delayed-restart",
-		"systemctl restart \"$SERVICE\"",
+		"RESTART_UNIT=\"lattice-agent-delayed-restart-$(date +%Y%m%d%H%M%S)-$$\"",
+		"systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\"",
+		"scheduled $SERVICE restart via $RESTART_UNIT",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("update script missing %q:\n%s", want, script)
 		}
+	}
+	if strings.Contains(script, "--unit=lattice-agent-delayed-restart --on-active=3s") {
+		t.Fatalf("update script must not reuse a fixed transient restart unit:\n%s", script)
 	}
 	if strings.Contains(script, "sh -c") {
 		t.Fatalf("update script must not use nested shell command strings:\n%s", script)

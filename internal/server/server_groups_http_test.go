@@ -294,6 +294,113 @@ func TestGroupPolicyPlanExpandsAndGuardsClobber(t *testing.T) {
 	}
 }
 
+func TestGroupPolicyPlanReportsSelectorImpactAndRejectsStaleSelectorApproval(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	for _, id := range []string{"web1", "web2", "db1"} {
+		enrollNamedNodeToken(t, handler, cookies, csrf, id, id)
+	}
+	setNodeIP(t, st, "web1", "10.66.0.1/32", "203.0.113.10")
+	setNodeIP(t, st, "web2", "10.66.0.2/32", "203.0.113.20")
+	setNodeIP(t, st, "db1", "10.66.0.3/32", "203.0.113.30")
+	setNodeMeta(t, st, "web1", func(n *model.Node) { n.Tags = []string{"web"} })
+	setNodeMeta(t, st, "web2", func(n *model.Node) { n.Tags = []string{"web"} })
+
+	web := decodeGroup(t, doJSON(t, handler, http.MethodPost, "/api/groups",
+		`{"name":"Web","slug":"web","members":["web1"],"selector":{"match_tags_any":["web"]}}`, cookies, csrf))
+	db := decodeGroup(t, doJSON(t, handler, http.MethodPost, "/api/groups",
+		`{"name":"DB","slug":"db","members":["db1"]}`, cookies, csrf))
+
+	gpWeb := doJSON(t, handler, http.MethodPost, "/api/group-policies",
+		`{"scope_group_id":"`+web.ID+`","enabled":true,"priority":0,"rules":[{"id":"r1","action":"allow","direction":"egress","protocol":"tcp","ports":[5432],"remote":{"kind":"group","group_id":"`+db.ID+`"}}]}`,
+		cookies, csrf)
+	gpWeb.Body.Close()
+	if gpWeb.StatusCode != http.StatusOK {
+		t.Fatalf("group policy create failed: %d", gpWeb.StatusCode)
+	}
+
+	planRes := doJSON(t, handler, http.MethodPost, "/api/group-policies/plan", "{}", cookies, csrf)
+	defer planRes.Body.Close()
+	if planRes.StatusCode != http.StatusOK {
+		t.Fatalf("group plan failed: %d", planRes.StatusCode)
+	}
+	var plan struct {
+		Affected []struct {
+			NodeID     string `json:"node_id"`
+			ApprovalID string `json:"approval_id"`
+			PlanSHA    string `json:"plan_sha"`
+		} `json:"affected"`
+		SelectorImpacts []struct {
+			GroupID           string   `json:"group_id"`
+			GroupName         string   `json:"group_name"`
+			Uses              []string `json:"uses"`
+			PolicyIDs         []string `json:"policy_ids"`
+			ExplicitMemberIDs []string `json:"explicit_member_ids"`
+			SelectorMemberIDs []string `json:"selector_member_ids"`
+			ResolvedMemberIDs []string `json:"resolved_member_ids"`
+		} `json:"selector_impacts"`
+	}
+	if err := json.NewDecoder(planRes.Body).Decode(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.SelectorImpacts) != 1 {
+		t.Fatalf("expected one selector impact, got %+v", plan.SelectorImpacts)
+	}
+	impact := plan.SelectorImpacts[0]
+	if impact.GroupID != web.ID || impact.GroupName != "Web" {
+		t.Fatalf("unexpected selector impact group: %+v", impact)
+	}
+	if strings.Join(impact.Uses, ",") != "scope" {
+		t.Fatalf("selector impact should mark scope use, got %+v", impact.Uses)
+	}
+	if strings.Join(impact.ExplicitMemberIDs, ",") != "web1" {
+		t.Fatalf("explicit members = %+v, want web1", impact.ExplicitMemberIDs)
+	}
+	if strings.Join(impact.SelectorMemberIDs, ",") != "web2" {
+		t.Fatalf("selector-added members = %+v, want web2", impact.SelectorMemberIDs)
+	}
+	if strings.Join(impact.ResolvedMemberIDs, ",") != "web1,web2" {
+		t.Fatalf("resolved members = %+v, want web1/web2", impact.ResolvedMemberIDs)
+	}
+
+	affected := map[string]string{}
+	for _, a := range plan.Affected {
+		affected[a.NodeID] = a.ApprovalID
+	}
+	web2ApprovalID := affected["web2"]
+	if web2ApprovalID == "" {
+		t.Fatalf("selector-added web2 should receive a per-node approval, got %+v", plan.Affected)
+	}
+
+	approval, ok := st.Approval(web2ApprovalID)
+	if !ok {
+		t.Fatalf("missing web2 approval %s", web2ApprovalID)
+	}
+
+	// Change the selector facts after planning. web2 is no longer in the Web
+	// group, so the stale approval must be rejected instead of applying an
+	// outdated plan.
+	setNodeMeta(t, st, "web2", func(n *model.Node) { n.Tags = nil })
+	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{
+			"approval_id": web2ApprovalID,
+			"queue_apply": false,
+			"plan_sha256": planSHA256(approval.Plan),
+		})),
+		cookies, csrf)
+	defer approve.Body.Close()
+	if approve.StatusCode != http.StatusConflict {
+		t.Fatalf("stale selector approval should be rejected with 409, got %d", approve.StatusCode)
+	}
+	var errOut model.APIErrorResponse
+	if err := json.NewDecoder(approve.Body).Decode(&errOut); err != nil {
+		t.Fatal(err)
+	}
+	if errOut.Error.Code != model.APIErrorApprovalStale || !strings.Contains(errOut.Error.Message, "re-plan") {
+		t.Fatalf("unexpected stale approval error: %+v", errOut)
+	}
+}
+
 func TestNetPolicyMatrixHTTP(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)

@@ -1,6 +1,7 @@
 // Package groups resolves fleet group membership. Membership is computed from a
-// group's explicit Members list (the canonical, policy-relevant source of
-// truth) unioned with the nodes matched by its optional display-only Selector.
+// group's explicit Members list unioned with the nodes matched by its optional
+// dynamic Selector. The union is policy-relevant: group-policy planning expands
+// from this resolved membership and must surface selector impact to operators.
 //
 // This package is intentionally pure and side-effect free so it can be table
 // tested without a store or server: every function is a deterministic
@@ -16,11 +17,10 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-// ResolveMembers returns the resolved node IDs for a single group: the explicit
-// g.Members (canonical authored membership) unioned with every node matched by
-// g.Selector (display-only smart filter). The result is deduplicated and stably
-// sorted by node ID. When Selector is nil, the result is just the deduped,
-// sorted explicit Members.
+// ResolveMembers returns the resolved node IDs for a single group: explicit
+// g.Members unioned with every node matched by g.Selector. The result is
+// deduplicated and stably sorted by node ID. When Selector is nil, the result is
+// just the deduped, sorted explicit Members.
 //
 // Explicit Members are returned verbatim (deduped) even if a listed node no
 // longer exists in allNodes — the authored list is canonical and stale-entry
@@ -79,10 +79,10 @@ func GroupIDsForNode(nodeID string, resolved map[string][]string) []string {
 	return out
 }
 
-// selectorMatches reports whether a node satisfies a display-only group
-// selector. Each populated criterion is an OR-set (the node need only match one
-// value within it), and the populated criteria are AND-ed together (the node
-// must satisfy every criterion that is set) — the conventional "smart filter"
+// selectorMatches reports whether a node satisfies a dynamic group selector.
+// Each populated criterion is an OR-set (the node need only match one value
+// within it), and the populated criteria are AND-ed together (the node must
+// satisfy every criterion that is set) — the conventional "smart filter"
 // narrowing semantic, consistent with Kubernetes-style label selectors.
 //
 // A selector with no populated criteria matches NO nodes: a group must never be

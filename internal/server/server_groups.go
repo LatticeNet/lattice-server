@@ -227,10 +227,9 @@ func (s *Server) upsertGroup(req model.Group, p principal) (groupView, error) {
 	// Explicit members: dedupe and drop references to non-existent nodes.
 	req.Members = dedupeExistingNodes(req.Members, byNode)
 
-	// Leader: if set, it must be an explicit member of the group. The explicit
-	// Members list is the canonical membership, so a leader that is only a
-	// selector match (display-only) is rejected — a leader has to be a real,
-	// policy-relevant member.
+	// Leader: if set, it must be an explicit member of the group. Selectors are
+	// dynamic and can change as node facts change, so a leader must be pinned by
+	// the operator rather than inferred from selector membership.
 	req.LeaderID = strings.TrimSpace(req.LeaderID)
 	if req.LeaderID != "" {
 		isMember := false

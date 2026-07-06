@@ -172,6 +172,17 @@ type groupPlanConflict struct {
 	Reason string `json:"reason"`
 }
 
+type groupPlanSelectorImpact struct {
+	GroupID           string               `json:"group_id"`
+	GroupName         string               `json:"group_name"`
+	Uses              []string             `json:"uses"`
+	PolicyIDs         []string             `json:"policy_ids"`
+	Selector          *model.GroupSelector `json:"selector,omitempty"`
+	ExplicitMemberIDs []string             `json:"explicit_member_ids"`
+	SelectorMemberIDs []string             `json:"selector_member_ids"`
+	ResolvedMemberIDs []string             `json:"resolved_member_ids"`
+}
+
 // handleGroupPolicyPlan materializes the EFFECTIVE per-node policy for every
 // node covered by any enabled group policy, compiles each via the existing
 // per-node compiler, and creates one Approval per node. It re-expands from
@@ -191,8 +202,11 @@ func (s *Server) handleGroupPolicyPlan(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	nodes := s.store.Nodes()
-	resolved := groups.ResolveAll(s.store.Groups(), nodes)
-	effective := netpolicy.ExpandGroupPolicies(s.store.GroupPolicies(), resolved)
+	groupList := s.store.Groups()
+	groupPolicies := s.store.GroupPolicies()
+	resolved := groups.ResolveAll(groupList, nodes)
+	selectorImpacts := groupPolicySelectorImpacts(groupPolicies, groupList, resolved)
+	effective := netpolicy.ExpandGroupPolicies(groupPolicies, resolved)
 
 	// Authorization: the caller must hold netpolicy:admin on every affected node.
 	targets := make([]string, 0, len(effective))
@@ -206,6 +220,10 @@ func (s *Server) handleGroupPolicyPlan(w http.ResponseWriter, r *http.Request, p
 
 	results := make([]groupPlanResult, 0, len(targets))
 	conflicts := make([]groupPlanConflict, 0)
+	approvalReason := ""
+	if len(selectorImpacts) > 0 {
+		approvalReason = "Planned from selector-backed group policy; selector membership is dynamic. Re-plan before approving if node tags, role, or geo changed."
+	}
 	for _, nodeID := range targets {
 		eff := effective[nodeID]
 		// Clobber-guard: never overwrite a manual (non-group-derived) policy.
@@ -239,6 +257,7 @@ func (s *Server) handleGroupPolicyPlan(w http.ResponseWriter, r *http.Request, p
 			Action:    nftPolicyApprovalAction(s.publicURL, nftPolicyDomainSetBindings(egressPlan.DomainSets)...),
 			Plan:      plan,
 			Status:    model.ApprovalPending,
+			Reason:    approvalReason,
 			ActorID:   p.ActorID,
 			CreatedAt: time.Now().UTC(),
 		}
@@ -265,16 +284,143 @@ func (s *Server) handleGroupPolicyPlan(w http.ResponseWriter, r *http.Request, p
 		Action: "group.policy.plan",
 		Scope:  "netpolicy:admin",
 		Metadata: map[string]string{
-			"affected":  fmt.Sprintf("%d", len(results)),
-			"conflicts": fmt.Sprintf("%d", len(conflicts)),
-			"orphaned":  fmt.Sprintf("%d", len(orphaned)),
+			"affected":        fmt.Sprintf("%d", len(results)),
+			"conflicts":       fmt.Sprintf("%d", len(conflicts)),
+			"orphaned":        fmt.Sprintf("%d", len(orphaned)),
+			"selector_groups": fmt.Sprintf("%d", len(selectorImpacts)),
 		},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
-		"affected":  results,
-		"conflicts": conflicts,
-		"orphaned":  orphaned,
+		"affected":         results,
+		"conflicts":        conflicts,
+		"orphaned":         orphaned,
+		"selector_impacts": selectorImpacts,
 	})
+}
+
+func groupPolicySelectorImpacts(policies []model.GroupNetPolicy, groupList []model.Group, resolved map[string][]string) []groupPlanSelectorImpact {
+	type usage struct {
+		uses      map[string]struct{}
+		policyIDs map[string]struct{}
+	}
+
+	used := make(map[string]*usage)
+	mark := func(groupID, use, policyID string) {
+		groupID = strings.TrimSpace(groupID)
+		if groupID == "" {
+			return
+		}
+		u := used[groupID]
+		if u == nil {
+			u = &usage{uses: map[string]struct{}{}, policyIDs: map[string]struct{}{}}
+			used[groupID] = u
+		}
+		u.uses[use] = struct{}{}
+		if policyID != "" {
+			u.policyIDs[policyID] = struct{}{}
+		}
+	}
+
+	for _, policy := range policies {
+		if !policy.Enabled {
+			continue
+		}
+		mark(policy.ScopeGroupID, "scope", policy.ID)
+		for _, rule := range policy.Rules {
+			if rule.Disabled || rule.Remote.Kind != model.NetRefGroup {
+				continue
+			}
+			mark(rule.Remote.GroupID, "remote", policy.ID)
+		}
+	}
+
+	byID := make(map[string]model.Group, len(groupList))
+	for _, g := range groupList {
+		byID[g.ID] = g
+	}
+
+	out := make([]groupPlanSelectorImpact, 0, len(used))
+	for groupID, u := range used {
+		g, ok := byID[groupID]
+		if !ok || g.Selector == nil {
+			continue
+		}
+		explicit := sortedNonEmptyUnique(g.Members)
+		explicitSet := make(map[string]struct{}, len(explicit))
+		for _, id := range explicit {
+			explicitSet[id] = struct{}{}
+		}
+		resolvedMembers := sortedNonEmptyUnique(resolved[groupID])
+		selectorMembers := make([]string, 0)
+		for _, id := range resolvedMembers {
+			if _, explicit := explicitSet[id]; !explicit {
+				selectorMembers = append(selectorMembers, id)
+			}
+		}
+		out = append(out, groupPlanSelectorImpact{
+			GroupID:           groupID,
+			GroupName:         g.Name,
+			Uses:              sortedSetKeys(u.uses),
+			PolicyIDs:         sortedSetKeys(u.policyIDs),
+			Selector:          g.Selector,
+			ExplicitMemberIDs: explicit,
+			SelectorMemberIDs: selectorMembers,
+			ResolvedMemberIDs: resolvedMembers,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].GroupName != out[j].GroupName {
+			return out[i].GroupName < out[j].GroupName
+		}
+		return out[i].GroupID < out[j].GroupID
+	})
+	return out
+}
+
+func sortedSetKeys(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for key := range set {
+		if strings.TrimSpace(key) != "" {
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedNonEmptyUnique(in []string) []string {
+	set := make(map[string]struct{}, len(in))
+	for _, value := range in {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			set[value] = struct{}{}
+		}
+	}
+	return sortedSetKeys(set)
+}
+
+func (s *Server) currentGroupDerivedPolicyPlanSHA(nodeID string) (string, error) {
+	opts, err := s.netPolicyCompileOptions()
+	if err != nil {
+		return "", err
+	}
+	nodes := s.store.Nodes()
+	resolved := groups.ResolveAll(s.store.Groups(), nodes)
+	effective := netpolicy.ExpandGroupPolicies(s.store.GroupPolicies(), resolved)
+	eff, ok := effective[nodeID]
+	if !ok {
+		return "", fmt.Errorf("group-derived netpolicy %q is no longer covered by any enabled group policy; re-plan before approving", nodeID)
+	}
+	normalized, err := netpolicy.NormalizePolicy(eff, s.resolveNode)
+	if err != nil {
+		return "", fmt.Errorf("group-derived netpolicy %q no longer validates; re-plan before approving: %w", nodeID, err)
+	}
+	plan, err := netpolicy.CompileEgressPlan(normalized, s.resolveNode, opts)
+	if err != nil {
+		return "", fmt.Errorf("group-derived netpolicy %q no longer compiles; re-plan before approving: %w", nodeID, err)
+	}
+	sum := sha256.Sum256([]byte(plan.Ruleset))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // --- Reachability matrix (read-only) ---

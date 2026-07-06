@@ -109,6 +109,76 @@ func TestMachineProfileUpdateKeepsLinksWriteOnly(t *testing.T) {
 	}
 }
 
+func TestMachineProfileUpdatePreservesOmittedFields(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/machines", `{
+		"node_id":"node-a",
+		"label":"gmami-jp1",
+		"vendor":"DMIT",
+		"region":"JP-Tokyo",
+		"notes":"billing owner cd",
+		"price_cents":990,
+		"currency":"usd",
+		"renewal_cycle":"annual",
+		"next_renewal":"2026-07-01T00:00:00Z",
+		"remind_days_before":[14,7,1],
+		"reminders_enabled":true,
+		"auto_roll":true
+	}`, cookies, csrf)
+	defer create.Body.Close()
+	var created machineView
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+
+	update := doJSON(t, handler, http.MethodPost, "/api/machines/update",
+		`{"id":"`+created.ID+`","vendor":"Vultr"}`,
+		cookies, csrf)
+	defer update.Body.Close()
+	if update.StatusCode != http.StatusOK {
+		t.Fatalf("update failed: %d", update.StatusCode)
+	}
+	stored, ok := st.MachineProfile(created.ID)
+	if !ok {
+		t.Fatal("profile missing after update")
+	}
+	if stored.Vendor != "Vultr" || stored.Label != "gmami-jp1" || stored.Region != "JP-Tokyo" ||
+		stored.Notes != "billing owner cd" || stored.PriceCents != 990 || stored.Currency != "USD" ||
+		stored.RenewalCycle != model.RenewalCycleAnnual || stored.NextRenewal.IsZero() ||
+		!stored.AutoRoll || !stored.RemindersEnabled || len(stored.RemindDaysBefore) != 3 {
+		t.Fatalf("partial update should preserve omitted fields: %+v", stored)
+	}
+
+	clear := doJSON(t, handler, http.MethodPost, "/api/machines/update", `{
+		"id":"`+created.ID+`",
+		"label":"",
+		"region":"",
+		"notes":"",
+		"price_cents":0,
+		"currency":"",
+		"renewal_cycle":"",
+		"cycle_days":0,
+		"next_renewal":null,
+		"auto_roll":false,
+		"remind_days_before":[],
+		"reminders_enabled":false
+	}`, cookies, csrf)
+	defer clear.Body.Close()
+	if clear.StatusCode != http.StatusOK {
+		t.Fatalf("clear failed: %d", clear.StatusCode)
+	}
+	stored, _ = st.MachineProfile(created.ID)
+	if stored.Label != "" || stored.Region != "" || stored.Notes != "" || stored.PriceCents != 0 ||
+		stored.Currency != "" || stored.RenewalCycle != "" || !stored.NextRenewal.IsZero() ||
+		stored.AutoRoll || stored.RemindersEnabled || len(stored.RemindDaysBefore) != 0 {
+		t.Fatalf("explicit zero values should clear fields: %+v", stored)
+	}
+}
+
 func TestMachineProfilesRespectNodeAllowlist(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {

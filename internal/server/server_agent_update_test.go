@@ -556,6 +556,44 @@ func TestLatestStableAgentReleaseTagRejectsOnlyPrereleases(t *testing.T) {
 	}
 }
 
+func TestAgentReleaseCandidatesExposeChannels(t *testing.T) {
+	candidates, err := agentReleaseCandidates("LatticeNet/lattice-node-agent", `[
+		{"tag_name":"v0.3.4-beta.1","draft":false,"prerelease":true},
+		{"tag_name":"v0.3.3-alpha.2","draft":false,"prerelease":true},
+		{"tag_name":"v0.3.2-alpha.1","draft":false,"prerelease":true},
+		{"tag_name":"v0.2.8","draft":false,"prerelease":false},
+		{"tag_name":"v0.2.7","draft":false,"prerelease":false},
+		{"tag_name":"v0.2.9-rc.1","draft":true,"prerelease":true},
+		{"tag_name":"not-semver","draft":false,"prerelease":false}
+	]`, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 5 {
+		t.Fatalf("candidates len = %d want 5: %+v", len(candidates), candidates)
+	}
+	want := []struct {
+		version string
+		channel string
+		latest  bool
+	}{
+		{"0.3.4-beta.1", "beta", true},
+		{"0.3.3-alpha.2", "alpha", true},
+		{"0.3.2-alpha.1", "alpha", false},
+		{"0.2.8", "stable", true},
+		{"0.2.7", "stable", false},
+	}
+	for i, w := range want {
+		got := candidates[i]
+		if got.Version != w.version || got.Channel != w.channel || got.LatestForChannel != w.latest {
+			t.Fatalf("candidate %d = %+v want version=%s channel=%s latest=%t", i, got, w.version, w.channel, w.latest)
+		}
+		if !strings.Contains(got.ReleaseURL, "/releases/tag/v"+w.version) {
+			t.Fatalf("candidate %d release url = %q", i, got.ReleaseURL)
+		}
+	}
+}
+
 func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

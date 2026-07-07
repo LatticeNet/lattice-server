@@ -55,12 +55,19 @@ type agentUpdatePayload struct {
 
 type agentReleaseInfoView struct {
 	Repo          string            `json:"repo"`
+	Channel       string            `json:"channel"`
 	LatestTag     string            `json:"latest_tag"`
 	LatestVersion string            `json:"latest_version"`
 	ReleaseURL    string            `json:"release_url"`
 	Artifacts     []string          `json:"artifacts"`
 	SHA256        map[string]string `json:"sha256"`
 	FetchedAt     time.Time         `json:"fetched_at"`
+}
+
+type githubAgentRelease struct {
+	TagName    string `json:"tag_name"`
+	Draft      bool   `json:"draft"`
+	Prerelease bool   `json:"prerelease"`
 }
 
 type agentReleaseCacheEntry struct {
@@ -607,8 +614,12 @@ func (s *Server) officialAgentTargetAndTag(raw string) (targetVersion string, ta
 }
 
 func (s *Server) fetchLatestAgentReleaseTag() (string, error) {
-	tag, err := s.fetchCachedAgentReleaseValue("latest-tag:"+s.agentReleaseRepo, func() (string, error) {
-		return s.fetchLatestAgentReleaseRedirectTag("https://github.com/" + s.agentReleaseRepo + "/releases/latest")
+	tag, err := s.fetchCachedAgentReleaseValue("latest-stable-tag:"+s.agentReleaseRepo, func() (string, error) {
+		body, err := s.fetchAgentReleaseTextUncached("https://api.github.com/repos/" + s.agentReleaseRepo + "/releases?per_page=20")
+		if err != nil {
+			return "", err
+		}
+		return latestStableAgentReleaseTag(body)
 	})
 	if err != nil {
 		return "", err
@@ -618,6 +629,21 @@ func (s *Server) fetchLatestAgentReleaseTag() (string, error) {
 		return "", errors.New("latest agent release has no v* tag")
 	}
 	return tag, nil
+}
+
+func latestStableAgentReleaseTag(body string) (string, error) {
+	var releases []githubAgentRelease
+	if err := json.Unmarshal([]byte(body), &releases); err != nil {
+		return "", fmt.Errorf("decode agent releases: %w", err)
+	}
+	for _, release := range releases {
+		tag := strings.TrimSpace(release.TagName)
+		if release.Draft || release.Prerelease || !strings.HasPrefix(tag, "v") {
+			continue
+		}
+		return tag, nil
+	}
+	return "", errors.New("no stable v* agent release found")
 }
 
 func (s *Server) fetchLatestAgentReleaseRedirectTag(rawURL string) (string, error) {
@@ -681,6 +707,7 @@ func (s *Server) fetchAgentReleaseInfo() (agentReleaseInfoView, error) {
 	sort.Strings(artifacts)
 	return agentReleaseInfoView{
 		Repo:          s.agentReleaseRepo,
+		Channel:       "stable",
 		LatestTag:     tag,
 		LatestVersion: strings.TrimPrefix(tag, "v"),
 		ReleaseURL:    "https://github.com/" + s.agentReleaseRepo + "/releases/tag/" + url.PathEscape(tag),

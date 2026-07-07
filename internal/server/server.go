@@ -3905,6 +3905,8 @@ func classifyNotifyEvent(title string) string {
 		return "proxy.quota"
 	case strings.HasPrefix(title, "Lattice proxy expiry"):
 		return "proxy.expiry"
+	case strings.HasPrefix(title, "Lattice renewal"):
+		return "inventory.renewal"
 	default:
 		return "generic"
 	}

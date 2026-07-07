@@ -35,6 +35,7 @@ type machineView struct {
 	Notes            string          `json:"notes,omitempty"`
 	PriceCents       int64           `json:"price_cents,omitempty"`
 	Currency         string          `json:"currency,omitempty"`
+	PurchasedAt      time.Time       `json:"purchased_at,omitempty"`
 	RenewalCycle     string          `json:"renewal_cycle,omitempty"`
 	CycleDays        int             `json:"cycle_days,omitempty"`
 	NextRenewal      time.Time       `json:"next_renewal,omitempty"`
@@ -59,6 +60,7 @@ type machineProfileRequest struct {
 	Notes            string    `json:"notes"`
 	PriceCents       int64     `json:"price_cents"`
 	Currency         string    `json:"currency"`
+	PurchasedAt      time.Time `json:"purchased_at"`
 	RenewalCycle     string    `json:"renewal_cycle"`
 	CycleDays        int       `json:"cycle_days"`
 	NextRenewal      time.Time `json:"next_renewal"`
@@ -82,6 +84,7 @@ var machineProfileRequestFields = map[string]bool{
 	"notes":              true,
 	"price_cents":        true,
 	"currency":           true,
+	"purchased_at":       true,
 	"renewal_cycle":      true,
 	"cycle_days":         true,
 	"next_renewal":       true,
@@ -399,6 +402,7 @@ func toMachineView(node model.Node, profile model.MachineProfile, now time.Time)
 		Notes:            profile.Notes,
 		PriceCents:       profile.PriceCents,
 		Currency:         profile.Currency,
+		PurchasedAt:      profile.PurchasedAt,
 		RenewalCycle:     profile.RenewalCycle,
 		CycleDays:        profile.CycleDays,
 		NextRenewal:      profile.NextRenewal,
@@ -448,6 +452,9 @@ func (s *Server) machineProfileFromRequest(req machineProfileRequest, existing m
 	}
 	if create || req.has("currency") {
 		out.Currency = strings.ToUpper(clampPrintable(req.Currency, 12))
+	}
+	if create || req.has("purchased_at") {
+		out.PurchasedAt = dateOnlyUTC(req.PurchasedAt)
 	}
 	if create || req.has("renewal_cycle") {
 		out.RenewalCycle = clampPrintable(req.RenewalCycle, maxMachineShort)

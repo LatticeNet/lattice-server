@@ -42,6 +42,7 @@ func TestMachineProfileCreateListHidesLinks(t *testing.T) {
 		"region":"JP-Tokyo",
 		"price_cents":990,
 		"currency":"usd",
+		"purchased_at":"2024-07-01T00:00:00Z",
 		"renewal_cycle":"annual",
 		"next_renewal":"2026-07-01T00:00:00Z",
 		"remind_days_before":[14,7,1],
@@ -66,6 +67,9 @@ func TestMachineProfileCreateListHidesLinks(t *testing.T) {
 	}
 	if !strings.Contains(body.String(), `"currency":"USD"`) {
 		t.Fatalf("currency should be normalized to uppercase: %s", body.String())
+	}
+	if !strings.Contains(body.String(), `"purchased_at":"2024-07-01T00:00:00Z"`) {
+		t.Fatalf("machine list missing purchased_at: %s", body.String())
 	}
 }
 
@@ -123,6 +127,7 @@ func TestMachineProfileUpdatePreservesOmittedFields(t *testing.T) {
 		"notes":"billing owner cd",
 		"price_cents":990,
 		"currency":"usd",
+		"purchased_at":"2024-07-01T00:00:00Z",
 		"renewal_cycle":"annual",
 		"next_renewal":"2026-07-01T00:00:00Z",
 		"remind_days_before":[14,7,1],
@@ -148,7 +153,7 @@ func TestMachineProfileUpdatePreservesOmittedFields(t *testing.T) {
 	}
 	if stored.Vendor != "Vultr" || stored.Label != "gmami-jp1" || stored.Region != "JP-Tokyo" ||
 		stored.Notes != "billing owner cd" || stored.PriceCents != 990 || stored.Currency != "USD" ||
-		stored.RenewalCycle != model.RenewalCycleAnnual || stored.NextRenewal.IsZero() ||
+		stored.PurchasedAt.IsZero() || stored.RenewalCycle != model.RenewalCycleAnnual || stored.NextRenewal.IsZero() ||
 		!stored.AutoRoll || !stored.RemindersEnabled || len(stored.RemindDaysBefore) != 3 {
 		t.Fatalf("partial update should preserve omitted fields: %+v", stored)
 	}
@@ -160,6 +165,7 @@ func TestMachineProfileUpdatePreservesOmittedFields(t *testing.T) {
 		"notes":"",
 		"price_cents":0,
 		"currency":"",
+		"purchased_at":null,
 		"renewal_cycle":"",
 		"cycle_days":0,
 		"next_renewal":null,
@@ -173,7 +179,7 @@ func TestMachineProfileUpdatePreservesOmittedFields(t *testing.T) {
 	}
 	stored, _ = st.MachineProfile(created.ID)
 	if stored.Label != "" || stored.Region != "" || stored.Notes != "" || stored.PriceCents != 0 ||
-		stored.Currency != "" || stored.RenewalCycle != "" || !stored.NextRenewal.IsZero() ||
+		stored.Currency != "" || !stored.PurchasedAt.IsZero() || stored.RenewalCycle != "" || !stored.NextRenewal.IsZero() ||
 		stored.AutoRoll || stored.RemindersEnabled || len(stored.RemindDaysBefore) != 0 {
 		t.Fatalf("explicit zero values should clear fields: %+v", stored)
 	}

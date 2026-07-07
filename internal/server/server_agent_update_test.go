@@ -531,26 +531,28 @@ func TestFetchAgentReleaseTextCachesFailures(t *testing.T) {
 	}
 }
 
-func TestFetchLatestAgentReleaseTagUsesRedirect(t *testing.T) {
-	srv, _, _ := newInventoryServer(t)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/owner/repo/releases/latest":
-			http.Redirect(w, r, "/owner/repo/releases/tag/v0.3.0", http.StatusFound)
-		case "/owner/repo/releases/tag/v0.3.0":
-			w.WriteHeader(http.StatusOK)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer upstream.Close()
-
-	tag, err := srv.fetchLatestAgentReleaseRedirectTag(upstream.URL + "/owner/repo/releases/latest")
+func TestLatestStableAgentReleaseTagSkipsPrereleases(t *testing.T) {
+	tag, err := latestStableAgentReleaseTag(`[
+		{"tag_name":"v0.3.3","draft":false,"prerelease":true},
+		{"tag_name":"v0.3.2-alpha.2","draft":false,"prerelease":true},
+		{"tag_name":"v0.2.8","draft":false,"prerelease":false}
+	]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tag != "v0.3.0" {
-		t.Fatalf("latest release redirect tag = %q want v0.3.0", tag)
+	if tag != "v0.2.8" {
+		t.Fatalf("latest stable tag = %q want v0.2.8", tag)
+	}
+}
+
+func TestLatestStableAgentReleaseTagRejectsOnlyPrereleases(t *testing.T) {
+	_, err := latestStableAgentReleaseTag(`[
+		{"tag_name":"v0.3.3","draft":false,"prerelease":true},
+		{"tag_name":"not-semver","draft":false,"prerelease":false},
+		{"tag_name":"v0.2.9","draft":true,"prerelease":false}
+	]`)
+	if err == nil {
+		t.Fatal("expected no stable v* release error")
 	}
 }
 

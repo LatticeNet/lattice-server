@@ -142,9 +142,11 @@ Published image:
 ghcr.io/latticenet/lattice-server
 ```
 
-Image publication is tag-driven. The moving `latest` git tag publishes
-`:latest`, the moving `alpha` git tag publishes `:alpha`, and stable `v*` tags
-publish immutable version tags. Pushed image builds also publish a
+Image publication is tag-driven. During rapid alpha development, test
+deployments use `alpha-0.2.1aN` tags and only increment the trailing alpha
+number. The moving `latest` git tag publishes `:latest`, the moving `alpha` git
+tag publishes `:alpha`, and stable `v*` tags publish immutable version tags only
+after an explicit stable-release decision. Pushed image builds also publish a
 `sha-<commit>` tag, and the rolling alpha channel additionally publishes
 `alpha-<commit>`, so the GitHub Packages page has human-readable immutable
 entries instead of only raw digest rows. Source pushes to `main` run CI but do
@@ -272,11 +274,14 @@ Use the compose file and deployment guide in the umbrella repository:
   the concrete URL and digest. Server-controlled updates currently require
   Linux/systemd nodes because the reviewed task installs the binary and schedules
   a service restart; published darwin release artifacts remain manual-update
-  artifacts. `target_version=latest` resolves to the latest
-  `v*` GitHub release at plan time. `/api/nodes/agent-updates/releases` exposes
-  a read-only snapshot of the current latest tag and published checksums for
-  dashboard guidance; the approval plan remains authoritative because it binds
-  the concrete URL and SHA-256 server-side. Editing or deleting a policy closes
+  artifacts. `target_version=latest` resolves to the latest stable
+  `v*` GitHub release at plan time, explicitly skipping draft and prerelease
+  alpha/beta/rc releases. Operators can still opt into a test node-agent by
+  entering its exact prerelease version and reviewing the bound plan.
+  `/api/nodes/agent-updates/releases` exposes a read-only snapshot of the current
+  stable latest tag and published checksums for dashboard guidance; the approval
+  plan remains authoritative because it binds the concrete URL and SHA-256
+  server-side. Editing or deleting a policy closes
   pending and
   approved-without-active-task update approvals for that node; active queued or
   leased update tasks remain in flight until their task result closes the

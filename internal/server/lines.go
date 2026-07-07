@@ -34,8 +34,10 @@ type Line struct {
 	ListenPort       int               `json:"listen_port,omitempty"`
 	PublicHost       string            `json:"public_host,omitempty"`
 	Domain           string            `json:"domain,omitempty"`
-	OutboundRef      string            `json:"outbound_ref,omitempty"` // direct | <host/tag> | "" unknown
-	JumpEdges        []string          `json:"jump_edges,omitempty"`   // line_hash_ids this line relays to
+	OutboundRef      string            `json:"outbound_ref,omitempty"`    // direct | <host/tag> | "" unknown
+	OutboundServer   string            `json:"outbound_server,omitempty"` // downstream server host the outbound routes to
+	OutboundPort     int               `json:"outbound_port,omitempty"`   // downstream server port the outbound routes to
+	JumpEdges        []string          `json:"jump_edges,omitempty"`      // line_hash_ids this line relays to
 	UserCount        int               `json:"user_count"`
 	UserKnown        bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
 	Status           string            `json:"status,omitempty"` // ok | pending | error | stale
@@ -167,6 +169,8 @@ func (s *Server) buildLineGroups() []LineGroup {
 				PublicHost:       n.Address,
 				Domain:           firstNonEmpty(n.SNI, n.Host),
 				OutboundRef:      n.OutboundRef,
+				OutboundServer:   n.OutboundServer,
+				OutboundPort:     atoiSafe(n.OutboundPort),
 				UserCount:        n.UserCount,
 				UserKnown:        n.UserKnown,
 				Status:           status,
@@ -180,6 +184,42 @@ func (s *Server) buildLineGroups() []LineGroup {
 			ln.ID = ln.LineHashID
 			byNode[ln.NodeID] = append(byNode[ln.NodeID], ln)
 		}
+	}
+
+	// (3) Fleet-wide relay (jump) edge resolver. A line whose outbound resolves to
+	// a downstream server:port that matches another line's endpoint is a hub → exit
+	// chain: record the downstream line's stable hash on the hub line's JumpEdges.
+	// This is what lets the dashboard draw cross-node (A → B) relay edges.
+	index := map[string]string{} // normHostPort(host,port) -> line_hash_id
+	for _, lines := range byNode {
+		for _, ln := range lines {
+			for _, host := range []string{ln.PublicHost, ln.Domain, ln.ListenHost} {
+				if strings.TrimSpace(host) == "" {
+					continue
+				}
+				index[normHostPort(host, ln.ListenPort)] = ln.LineHashID
+			}
+		}
+	}
+	for nodeID, lines := range byNode {
+		for i := range lines {
+			ln := &lines[i]
+			if strings.TrimSpace(ln.OutboundServer) == "" || ln.OutboundPort <= 0 {
+				continue
+			}
+			ref := strings.ToLower(strings.TrimSpace(ln.OutboundRef))
+			if ref == "direct" || ref == "" {
+				continue
+			}
+			target := index[normHostPort(ln.OutboundServer, ln.OutboundPort)]
+			if target == "" || target == ln.LineHashID {
+				continue
+			}
+			if !containsString(ln.JumpEdges, target) {
+				ln.JumpEdges = append(ln.JumpEdges, target)
+			}
+		}
+		byNode[nodeID] = lines
 	}
 
 	// Group, name, and sort deterministically (nodes by id, lines by port then tag).
@@ -199,6 +239,30 @@ func (s *Server) buildLineGroups() []LineGroup {
 
 func managedDedupKey(nodeID, typ string, port int) string {
 	return nodeID + "\x00" + typ + "\x00" + strconv.Itoa(port)
+}
+
+// atoiSafe parses a decimal port string, returning 0 on any failure.
+func atoiSafe(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// normHostPort is the case-insensitive host:port key used to match an outbound's
+// downstream destination against another line's listening endpoint.
+func normHostPort(host string, port int) string {
+	return strings.ToLower(strings.TrimSpace(host)) + "|" + strconv.Itoa(port)
+}
+
+func containsString(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 // countInboundUsers counts enabled proxy users eligible for an inbound. An empty

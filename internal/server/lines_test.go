@@ -109,6 +109,67 @@ func TestBuildLineGroupsMergesAndDedups(t *testing.T) {
 	}
 }
 
+// TestBuildLineGroupsResolvesJumpEdges verifies the fleet-wide resolver: a hub
+// line whose outbound destination (server:port) matches a downstream node's line
+// endpoint gets that line's hash on its JumpEdges, while a direct line gets none.
+func TestBuildLineGroupsResolvesJumpEdges(t *testing.T) {
+	srv := newLinesTestServer(t)
+	if err := srv.store.UpsertNode(model.Node{ID: "node-a", Name: "Node A", PublicIP: "203.0.113.5"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.UpsertNode(model.Node{ID: "node-b", Name: "Node B", PublicIP: "198.51.100.9"}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"node-a": {
+			NodeID: "node-a", At: srv.now(), Status: "ok",
+			Nodes: []model.SingBoxNode{
+				// Hub inbound relays to node B's endpoint (198.51.100.9:8443).
+				{Name: "hub-a", Protocol: "vless", Network: "tcp", Address: "203.0.113.5", Port: "443", OutboundRef: "exit-b", OutboundServer: "198.51.100.9", OutboundPort: "8443", OutboundType: "vless"},
+				// Direct inbound: no downstream, must not gain a jump edge.
+				{Name: "direct-a", Protocol: "vless", Network: "tcp", Address: "203.0.113.5", Port: "80", OutboundRef: "direct"},
+			},
+		},
+		"node-b": {
+			NodeID: "node-b", At: srv.now(), Status: "ok",
+			Nodes: []model.SingBoxNode{
+				{Name: "exit-b-in", Protocol: "vless", Network: "tcp", Address: "198.51.100.9", Port: "8443"},
+			},
+		},
+	}
+	srv.singboxInvMu.Unlock()
+
+	groups := srv.buildLineGroups()
+
+	// Node B's downstream line hash (no _lattice line_id ⇒ derived from shape).
+	wantTarget := lineHash("node-b", "sing-box", "vless", "", 8443, "exit-b-in", "")
+
+	var hub, direct *Line
+	for gi := range groups {
+		if groups[gi].NodeID != "node-a" {
+			continue
+		}
+		for li := range groups[gi].Lines {
+			switch groups[gi].Lines[li].Tag {
+			case "hub-a":
+				hub = &groups[gi].Lines[li]
+			case "direct-a":
+				direct = &groups[gi].Lines[li]
+			}
+		}
+	}
+	if hub == nil || direct == nil {
+		t.Fatalf("expected hub + direct lines on node-a: %+v", groups)
+	}
+	if len(hub.JumpEdges) != 1 || hub.JumpEdges[0] != wantTarget {
+		t.Fatalf("hub jump edges = %v, want [%s]", hub.JumpEdges, wantTarget)
+	}
+	if len(direct.JumpEdges) != 0 {
+		t.Fatalf("direct line must have no jump edges, got %v", direct.JumpEdges)
+	}
+}
+
 func TestLineHashStableAndDistinct(t *testing.T) {
 	a := lineHash("node-a", "sing-box", "vless", "0.0.0.0", 443, "in-1", "direct")
 	b := lineHash("node-a", "sing-box", "vless", "0.0.0.0", 443, "in-1", "direct")

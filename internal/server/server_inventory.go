@@ -35,11 +35,11 @@ type machineView struct {
 	Notes            string          `json:"notes,omitempty"`
 	PriceCents       int64           `json:"price_cents,omitempty"`
 	Currency         string          `json:"currency,omitempty"`
-	PurchasedAt      time.Time       `json:"purchased_at,omitempty"`
+	PurchasedAt      *time.Time      `json:"purchased_at,omitempty"`
 	RenewalCycle     string          `json:"renewal_cycle,omitempty"`
 	CycleDays        int             `json:"cycle_days,omitempty"`
-	NextRenewal      time.Time       `json:"next_renewal,omitempty"`
-	DaysUntilRenewal int             `json:"days_until_renewal"`
+	NextRenewal      *time.Time      `json:"next_renewal,omitempty"`
+	DaysUntilRenewal *int            `json:"days_until_renewal,omitempty"`
 	AutoRoll         bool            `json:"auto_roll"`
 	RemindDaysBefore []int           `json:"remind_days_before,omitempty"`
 	RemindersEnabled bool            `json:"reminders_enabled"`
@@ -388,6 +388,13 @@ func (s *Server) machineViewsForPrincipal(p principal) []machineView {
 }
 
 func toMachineView(node model.Node, profile model.MachineProfile, now time.Time) machineView {
+	purchasedAt := optionalDate(profile.PurchasedAt)
+	nextRenewal := optionalDate(profile.NextRenewal)
+	var daysUntil *int
+	if nextRenewal != nil {
+		days := daysUntilRenewal(now, *nextRenewal)
+		daysUntil = &days
+	}
 	return machineView{
 		ID:               profile.ID,
 		NodeID:           firstNonEmpty(profile.NodeID, node.ID),
@@ -402,17 +409,25 @@ func toMachineView(node model.Node, profile model.MachineProfile, now time.Time)
 		Notes:            profile.Notes,
 		PriceCents:       profile.PriceCents,
 		Currency:         profile.Currency,
-		PurchasedAt:      profile.PurchasedAt,
+		PurchasedAt:      purchasedAt,
 		RenewalCycle:     profile.RenewalCycle,
 		CycleDays:        profile.CycleDays,
-		NextRenewal:      profile.NextRenewal,
-		DaysUntilRenewal: daysUntilRenewal(now, profile.NextRenewal),
+		NextRenewal:      nextRenewal,
+		DaysUntilRenewal: daysUntil,
 		AutoRoll:         profile.AutoRoll,
 		RemindDaysBefore: append([]int(nil), profile.RemindDaysBefore...),
 		RemindersEnabled: profile.RemindersEnabled,
 		CreatedAt:        profile.CreatedAt,
 		UpdatedAt:        profile.UpdatedAt,
 	}
+}
+
+func optionalDate(input time.Time) *time.Time {
+	date := dateOnlyUTC(input)
+	if date.IsZero() {
+		return nil
+	}
+	return &date
 }
 
 func (s *Server) machineProfileFromRequest(req machineProfileRequest, existing model.MachineProfile, create bool) (model.MachineProfile, error) {

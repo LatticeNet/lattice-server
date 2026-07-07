@@ -113,6 +113,31 @@ func TestMachineProfileUpdateKeepsLinksWriteOnly(t *testing.T) {
 	}
 }
 
+func TestMachineProfileListOmitsUnsetRenewalDates(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/machines",
+		`{"node_id":"node-a","label":"openjobs-data","vendor":"OpenJobs AI"}`,
+		cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create failed: %d", create.StatusCode)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/machines", "", cookies, "")
+	defer list.Body.Close()
+	body := new(bytes.Buffer)
+	body.ReadFrom(list.Body)
+	if strings.Contains(body.String(), `"next_renewal"`) ||
+		strings.Contains(body.String(), `"days_until_renewal"`) ||
+		strings.Contains(body.String(), `"purchased_at"`) {
+		t.Fatalf("unset dates should be omitted from machine list: %s", body.String())
+	}
+}
+
 func TestMachineProfileUpdatePreservesOmittedFields(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {

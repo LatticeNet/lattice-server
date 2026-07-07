@@ -38,6 +38,8 @@ RUN corepack enable \
     && pnpm build
 
 FROM alpine:3.22
+ARG VERSION=dev
+ARG COMMIT=unknown
 ARG DASHBOARD_COMMIT=unknown
 ARG DATE=unknown
 
@@ -52,7 +54,15 @@ COPY --from=dashboard /src/dashboard/dist /app/dashboard
 COPY docker-entrypoint.sh /usr/local/bin/lattice-entrypoint
 RUN chmod 0755 /usr/local/bin/lattice-entrypoint
 
-LABEL org.opencontainers.image.latticenet.dashboard-revision="${DASHBOARD_COMMIT}"
+LABEL org.opencontainers.image.title="Lattice Server" \
+    org.opencontainers.image.description="Lattice control-plane server with embedded dashboard assets" \
+    org.opencontainers.image.source="https://github.com/LatticeNet/lattice-server" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.revision="${COMMIT}" \
+    org.opencontainers.image.created="${DATE}" \
+    org.opencontainers.image.licenses="MIT" \
+    org.opencontainers.image.vendor="LatticeNet" \
+    org.opencontainers.image.latticenet.dashboard-revision="${DASHBOARD_COMMIT}"
 
 ENV LATTICE_LISTEN=0.0.0.0:8088 \
     LATTICE_DATA=/var/lib/lattice/state.json \

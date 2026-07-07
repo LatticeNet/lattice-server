@@ -5520,6 +5520,16 @@ func (s *Server) requireCurrentNetPolicyApproval(approval model.Approval) error 
 		return fmt.Errorf("netpolicy %q not found; re-plan before approving", approval.NodeID)
 	}
 	planSHA := approvalPlanSHA(approval)
+	if policy.GroupDerived {
+		currentSHA, err := s.currentGroupDerivedPolicyPlanSHA(approval.NodeID)
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(currentSHA, planSHA) {
+			return errors.New("group policy membership or rules changed since this plan was created; re-plan before approving")
+		}
+		return nil
+	}
 	if policy.LastPlanSHA == "" || !strings.EqualFold(policy.LastPlanSHA, planSHA) {
 		return errors.New("netpolicy changed since this plan was created; re-plan before approving")
 	}

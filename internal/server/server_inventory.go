@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -65,6 +66,54 @@ type machineProfileRequest struct {
 	RemindDaysBefore []int     `json:"remind_days_before"`
 	RemindersEnabled bool      `json:"reminders_enabled"`
 	LastRemindedKey  string    `json:"last_reminded_key"`
+	fields           map[string]bool
+}
+
+var machineProfileRequestFields = map[string]bool{
+	"id":                 true,
+	"node_id":            true,
+	"label":              true,
+	"vendor":             true,
+	"console_url":        true,
+	"detail_url":         true,
+	"clear_console_url":  true,
+	"clear_detail_url":   true,
+	"region":             true,
+	"notes":              true,
+	"price_cents":        true,
+	"currency":           true,
+	"renewal_cycle":      true,
+	"cycle_days":         true,
+	"next_renewal":       true,
+	"auto_roll":          true,
+	"remind_days_before": true,
+	"reminders_enabled":  true,
+	"last_reminded_key":  true,
+}
+
+func (r *machineProfileRequest) UnmarshalJSON(data []byte) error {
+	type wire machineProfileRequest
+	var out wire
+	if err := json.Unmarshal(data, &out); err != nil {
+		return err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*r = machineProfileRequest(out)
+	r.fields = make(map[string]bool, len(raw))
+	for field := range raw {
+		if !machineProfileRequestFields[field] {
+			return fmt.Errorf("json: unknown field %q", field)
+		}
+		r.fields[field] = true
+	}
+	return nil
+}
+
+func (r machineProfileRequest) has(field string) bool {
+	return r.fields == nil || r.fields[field]
 }
 
 type renewalReminderFire struct {
@@ -370,35 +419,57 @@ func (s *Server) machineProfileFromRequest(req machineProfileRequest, existing m
 		return model.MachineProfile{}, errors.New("valid id is required")
 	}
 	out.ID = strings.TrimSpace(req.ID)
-	nodeID := strings.TrimSpace(req.NodeID)
-	if nodeID == "" && !create {
-		nodeID = existing.NodeID
+	if create || req.has("node_id") {
+		out.NodeID = strings.TrimSpace(req.NodeID)
 	}
-	if nodeID == "" {
+	if out.NodeID == "" {
 		return model.MachineProfile{}, errors.New("node_id is required")
 	}
-	out.NodeID = nodeID
-	out.Label = clampPrintable(req.Label, maxMachineShort)
-	out.Vendor = clampPrintable(req.Vendor, maxMachineShort)
-	out.Region = clampPrintable(req.Region, maxMachineShort)
-	out.Notes = clampPrintable(req.Notes, maxMachineNotes)
+	if create || req.has("label") {
+		out.Label = clampPrintable(req.Label, maxMachineShort)
+	}
+	if create || req.has("vendor") {
+		out.Vendor = clampPrintable(req.Vendor, maxMachineShort)
+	}
+	if create || req.has("region") {
+		out.Region = clampPrintable(req.Region, maxMachineShort)
+	}
+	if create || req.has("notes") {
+		out.Notes = clampPrintable(req.Notes, maxMachineNotes)
+	}
 	if create || req.ConsoleURL != "" || req.ClearConsoleURL {
 		out.ConsoleURL = clampPrintable(req.ConsoleURL, maxMachineURL)
 	}
 	if create || req.DetailURL != "" || req.ClearDetailURL {
 		out.DetailURL = clampPrintable(req.DetailURL, maxMachineURL)
 	}
-	out.PriceCents = req.PriceCents
-	out.Currency = strings.ToUpper(clampPrintable(req.Currency, 12))
-	out.RenewalCycle = clampPrintable(req.RenewalCycle, maxMachineShort)
-	out.CycleDays = req.CycleDays
-	out.NextRenewal = dateOnlyUTC(req.NextRenewal)
-	out.AutoRoll = req.AutoRoll
-	out.RemindDaysBefore = normalizeReminderDays(req.RemindDaysBefore)
-	out.RemindersEnabled = req.RemindersEnabled
+	if create || req.has("price_cents") {
+		out.PriceCents = req.PriceCents
+	}
+	if create || req.has("currency") {
+		out.Currency = strings.ToUpper(clampPrintable(req.Currency, 12))
+	}
+	if create || req.has("renewal_cycle") {
+		out.RenewalCycle = clampPrintable(req.RenewalCycle, maxMachineShort)
+	}
+	if create || req.has("cycle_days") {
+		out.CycleDays = req.CycleDays
+	}
+	if create || req.has("next_renewal") {
+		out.NextRenewal = dateOnlyUTC(req.NextRenewal)
+	}
+	if create || req.has("auto_roll") {
+		out.AutoRoll = req.AutoRoll
+	}
+	if create || req.has("remind_days_before") {
+		out.RemindDaysBefore = normalizeReminderDays(req.RemindDaysBefore)
+	}
+	if create || req.has("reminders_enabled") {
+		out.RemindersEnabled = req.RemindersEnabled
+	}
 	if create {
 		out.LastRemindedKey = ""
-	} else if req.LastRemindedKey != "" {
+	} else if req.has("last_reminded_key") && req.LastRemindedKey != "" {
 		// LastRemindedKey is server-managed; clients cannot forge it.
 		return model.MachineProfile{}, errors.New("last_reminded_key is server-managed")
 	}

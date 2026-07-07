@@ -6,7 +6,7 @@ on:
       keep:
         description: "Extra stale untagged versions to keep after protecting active tag children"
         required: true
-        default: "0"
+        default: "10"
       dry_run:
         description: "List deletions without deleting"
         required: true
@@ -25,8 +25,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ORG: LatticeNet
       PACKAGE_NAME: lattice-server
-      ACTIVE_TAGS: latest alpha beta
-      KEEP_UNTAGGED: ${{ github.event.inputs.keep || '0' }}
+      KEEP_UNTAGGED: ${{ github.event.inputs.keep || '10' }}
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
     steps:
       - name: delete old untagged container versions
@@ -39,8 +38,15 @@ jobs:
           fi
 
           org_image="$(tr '[:upper:]' '[:lower:]' <<< "$ORG")"
+
+          mapfile -t active_tags < <(
+            gh api --paginate "/orgs/${ORG}/packages/container/${PACKAGE_NAME}/versions?per_page=100" \
+              --jq '.[] | (.metadata.container.tags // [])[]' \
+              | sort -u
+          )
+
           protected="$(mktemp)"
-          for tag in $ACTIVE_TAGS; do
+          for tag in "${active_tags[@]}"; do
             image="ghcr.io/${org_image}/${PACKAGE_NAME}:${tag}"
             echo "protecting child manifests for ${image}"
             if ! manifest="$(docker manifest inspect "$image" 2>/dev/null)"; then
@@ -53,12 +59,13 @@ jobs:
 
           mapfile -t rows < <(
             gh api --paginate "/orgs/${ORG}/packages/container/${PACKAGE_NAME}/versions?per_page=100" \
-              --jq '.[] | select(((.metadata.container.tags // []) | length) == 0) | [.id, .name, .created_at] | @tsv'
+              --jq '.[] | select(((.metadata.container.tags // []) | length) == 0) | [.created_at, .id, .name] | @tsv' \
+              | sort -r
           )
 
           stale=()
           for row in "${rows[@]}"; do
-            digest="$(cut -f2 <<< "$row")"
+            digest="$(cut -f3 <<< "$row")"
             if grep -Fxq "$digest" "$protected"; then
               echo "protect active child digest=${digest}"
               continue
@@ -76,9 +83,9 @@ jobs:
 
           for ((i = KEEP_UNTAGGED; i < stale_total; i++)); do
             row="${stale[$i]}"
-            id="$(cut -f1 <<< "$row")"
-            name="$(cut -f2 <<< "$row")"
-            created="$(cut -f3 <<< "$row")"
+            created="$(cut -f1 <<< "$row")"
+            id="$(cut -f2 <<< "$row")"
+            name="$(cut -f3 <<< "$row")"
             if [[ "$DRY_RUN" == "true" ]]; then
               echo "dry-run delete id=${id} name=${name} created_at=${created}"
             else

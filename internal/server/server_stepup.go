@@ -25,7 +25,7 @@ func (s *Server) handleSecurityStepUp(w http.ResponseWriter, r *http.Request, p 
 		return
 	}
 	if p.viaBearer || p.ActorID == "" || p.sessionID == "" {
-		writeError(w, http.StatusForbidden, errors.New("2fa step-up requires an interactive session"))
+		writeError(w, http.StatusForbidden, errors.New("second-factor step-up requires an interactive session"))
 		return
 	}
 	var req struct {
@@ -36,7 +36,7 @@ func (s *Server) handleSecurityStepUp(w http.ResponseWriter, r *http.Request, p 
 	}
 	user, ok := s.store.User(p.ActorID)
 	if !ok || !user.TOTPEnabled || user.TOTPSecret == "" {
-		writeError(w, http.StatusForbidden, errors.New("2fa must be enabled before sensitive actions"))
+		writeError(w, http.StatusForbidden, errors.New("an authenticator passcode must be enabled before passcode step-up"))
 		return
 	}
 	step, ok := auth.ValidateTOTPStep(user.TOTPSecret, req.Code, s.now())
@@ -55,10 +55,19 @@ func (s *Server) handleSecurityStepUp(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusUnauthorized, errors.New("invalid second factor"))
 		return
 	}
-	token, err := auth.NewRandomToken(32)
+	grant, expiresAt, err := s.issueStepUpGrant(p)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "security.step_up", Decision: "allow", Reason: "totp"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "grant": grant, "expires_at": expiresAt})
+}
+
+func (s *Server) issueStepUpGrant(p principal) (string, time.Time, error) {
+	token, err := auth.NewRandomToken(32)
+	if err != nil {
+		return "", time.Time{}, err
 	}
 	expiresAt := s.now().UTC().Add(stepUpGrantTTL)
 	s.stepUpMu.Lock()
@@ -78,17 +87,16 @@ func (s *Server) handleSecurityStepUp(w http.ResponseWriter, r *http.Request, p 
 		ExpiresAt: expiresAt,
 	}
 	s.stepUpMu.Unlock()
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "security.step_up", Decision: "allow"})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "grant": token, "expires_at": expiresAt})
+	return token, expiresAt, nil
 }
 
 func (s *Server) requireStepUpGrant(w http.ResponseWriter, p principal, grantID, action string) bool {
 	if p.viaBearer || p.ActorID == "" || p.sessionID == "" {
-		writeError(w, http.StatusForbidden, errors.New("2fa step-up requires an interactive session"))
+		writeError(w, http.StatusForbidden, errors.New("second-factor step-up requires an interactive session"))
 		return false
 	}
 	if grantID == "" {
-		writeError(w, http.StatusForbidden, errors.New("2fa step-up required"))
+		writeError(w, http.StatusForbidden, errors.New("second-factor step-up required"))
 		return false
 	}
 	now := s.now().UTC()
@@ -101,8 +109,8 @@ func (s *Server) requireStepUpGrant(w http.ResponseWriter, p principal, grantID,
 	}
 	grant, ok := s.stepUpGrants[grantID]
 	if !ok || grant.ActorID != p.ActorID || grant.SessionID != p.sessionID || !grant.ExpiresAt.After(now) {
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Decision: "deny", Reason: "missing or expired 2fa step-up"})
-		writeError(w, http.StatusForbidden, errors.New("2fa step-up required"))
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Decision: "deny", Reason: "missing or expired second-factor step-up"})
+		writeError(w, http.StatusForbidden, errors.New("second-factor step-up required"))
 		return false
 	}
 	return true

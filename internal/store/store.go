@@ -63,6 +63,7 @@ type State struct {
 	NotifyRules     map[string]model.NotifyRule         `json:"notify_rules"`
 	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
 	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
+	MachineVendors  map[string]model.MachineVendor      `json:"machine_vendors"`
 	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
 	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
@@ -349,6 +350,7 @@ func emptyState() State {
 		NotifyRules:     map[string]model.NotifyRule{},
 		Tunnels:         map[string]model.TunnelProfile{},
 		MachineProfiles: map[string]model.MachineProfile{},
+		MachineVendors:  map[string]model.MachineVendor{},
 		NFTInputs:       map[string]model.NFTInputs{},
 		DNSDeployments:  map[string]model.DNSDeployment{},
 		NetPolicies:     map[string]model.NetPolicy{},
@@ -433,6 +435,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.MachineProfiles == nil {
 		st.MachineProfiles = map[string]model.MachineProfile{}
+	}
+	if st.MachineVendors == nil {
+		st.MachineVendors = map[string]model.MachineVendor{}
 	}
 	if st.NFTInputs == nil {
 		st.NFTInputs = map[string]model.NFTInputs{}
@@ -2037,6 +2042,61 @@ func (s *Store) DeleteMachineProfile(id string) error {
 		return nil
 	}
 	delete(s.state.MachineProfiles, id)
+	return s.Save()
+}
+
+// UpsertMachineVendor creates or updates operator-authored vendor metadata.
+func (s *Store) UpsertMachineVendor(v model.MachineVendor) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v.UpdatedAt = time.Now().UTC()
+	if v.CreatedAt.IsZero() {
+		v.CreatedAt = v.UpdatedAt
+	}
+	s.state.MachineVendors[v.ID] = v
+	return s.Save()
+}
+
+func (s *Store) MachineVendor(id string) (model.MachineVendor, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.state.MachineVendors[id]
+	return v, ok
+}
+
+func (s *Store) MachineVendorByName(name string) (model.MachineVendor, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	needle := strings.ToLower(strings.TrimSpace(name))
+	if needle == "" {
+		return model.MachineVendor{}, false
+	}
+	for _, v := range s.state.MachineVendors {
+		if strings.ToLower(strings.TrimSpace(v.Name)) == needle {
+			return v, true
+		}
+	}
+	return model.MachineVendor{}, false
+}
+
+func (s *Store) MachineVendors() []model.MachineVendor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.MachineVendor, 0, len(s.state.MachineVendors))
+	for _, v := range s.state.MachineVendors {
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
+	return out
+}
+
+func (s *Store) DeleteMachineVendor(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.MachineVendors[id]; !ok {
+		return nil
+	}
+	delete(s.state.MachineVendors, id)
 	return s.Save()
 }
 

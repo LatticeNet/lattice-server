@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,29 +23,30 @@ const (
 )
 
 type machineView struct {
-	ID               string          `json:"id,omitempty"`
-	NodeID           string          `json:"node_id"`
-	NodeName         string          `json:"node_name,omitempty"`
-	Label            string          `json:"label,omitempty"`
-	Online           bool            `json:"online"`
-	HostFacts        model.HostFacts `json:"host_facts"`
-	Vendor           string          `json:"vendor,omitempty"`
-	Region           string          `json:"region,omitempty"`
-	HasConsoleURL    bool            `json:"has_console_url"`
-	HasDetailURL     bool            `json:"has_detail_url"`
-	Notes            string          `json:"notes,omitempty"`
-	PriceCents       int64           `json:"price_cents,omitempty"`
-	Currency         string          `json:"currency,omitempty"`
-	PurchasedAt      *time.Time      `json:"purchased_at,omitempty"`
-	RenewalCycle     string          `json:"renewal_cycle,omitempty"`
-	CycleDays        int             `json:"cycle_days,omitempty"`
-	NextRenewal      *time.Time      `json:"next_renewal,omitempty"`
-	DaysUntilRenewal *int            `json:"days_until_renewal,omitempty"`
-	AutoRoll         bool            `json:"auto_roll"`
-	RemindDaysBefore []int           `json:"remind_days_before,omitempty"`
-	RemindersEnabled bool            `json:"reminders_enabled"`
-	CreatedAt        time.Time       `json:"created_at,omitempty"`
-	UpdatedAt        time.Time       `json:"updated_at,omitempty"`
+	ID               string               `json:"id,omitempty"`
+	NodeID           string               `json:"node_id"`
+	NodeName         string               `json:"node_name,omitempty"`
+	Label            string               `json:"label,omitempty"`
+	Online           bool                 `json:"online"`
+	HostFacts        model.HostFacts      `json:"host_facts"`
+	Vendor           string               `json:"vendor,omitempty"`
+	VendorProfile    *model.MachineVendor `json:"vendor_profile,omitempty"`
+	Region           string               `json:"region,omitempty"`
+	HasConsoleURL    bool                 `json:"has_console_url"`
+	HasDetailURL     bool                 `json:"has_detail_url"`
+	Notes            string               `json:"notes,omitempty"`
+	PriceCents       int64                `json:"price_cents,omitempty"`
+	Currency         string               `json:"currency,omitempty"`
+	PurchasedAt      *time.Time           `json:"purchased_at,omitempty"`
+	RenewalCycle     string               `json:"renewal_cycle,omitempty"`
+	CycleDays        int                  `json:"cycle_days,omitempty"`
+	NextRenewal      *time.Time           `json:"next_renewal,omitempty"`
+	DaysUntilRenewal *int                 `json:"days_until_renewal,omitempty"`
+	AutoRoll         bool                 `json:"auto_roll"`
+	RemindDaysBefore []int                `json:"remind_days_before,omitempty"`
+	RemindersEnabled bool                 `json:"reminders_enabled"`
+	CreatedAt        time.Time            `json:"created_at,omitempty"`
+	UpdatedAt        time.Time            `json:"updated_at,omitempty"`
 }
 
 type machineProfileRequest struct {
@@ -69,6 +71,14 @@ type machineProfileRequest struct {
 	RemindersEnabled bool      `json:"reminders_enabled"`
 	LastRemindedKey  string    `json:"last_reminded_key"`
 	fields           map[string]bool
+}
+
+type machineVendorRequest struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	URL         string `json:"url"`
+	LogoURL     string `json:"logo_url"`
+	Description string `json:"description"`
 }
 
 var machineProfileRequestFields = map[string]bool{
@@ -172,10 +182,74 @@ func (s *Server) handleMachines(w http.ResponseWriter, r *http.Request, p princi
 		})
 		created, _ := s.store.MachineProfile(profile.ID)
 		node, _ := s.store.Node(profile.NodeID)
-		writeJSON(w, http.StatusOK, toMachineView(node, created, s.now()))
+		writeJSON(w, http.StatusOK, toMachineView(node, created, s.machineVendorMap(), s.now()))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+func (s *Server) handleMachineVendors(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		if !s.requireScope(w, p, "inventory:read") {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string][]model.MachineVendor{"vendors": s.machineVendorsForPrincipal(p)})
+	case http.MethodPost:
+		var req machineVendorRequest
+		if !decodeClientJSON(w, r, &req) {
+			return
+		}
+		if !s.requireScope(w, p, "inventory:admin") {
+			return
+		}
+		vendor, err := s.machineVendorFromRequest(req)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertMachineVendor(vendor); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		stored, _ := s.store.MachineVendor(vendor.ID)
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID:     id.New("audit"),
+			Action: "inventory.vendor.upsert",
+			Scope:  "inventory:admin",
+			Metadata: map[string]string{
+				"vendor_id": vendor.ID,
+				"name":      vendor.Name,
+			},
+		})
+		writeJSON(w, http.StatusOK, map[string]model.MachineVendor{"vendor": stored})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+func (s *Server) handleDeleteMachineVendor(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id is required"))
+		return
+	}
+	if err := s.store.DeleteMachineVendor(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "inventory.vendor.delete", Scope: "inventory:admin", Metadata: map[string]string{"vendor_id": req.ID}})
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleMachineUpdate(w http.ResponseWriter, r *http.Request, p principal) {
@@ -228,7 +302,7 @@ func (s *Server) handleMachineUpdate(w http.ResponseWriter, r *http.Request, p p
 	})
 	stored, _ := s.store.MachineProfile(updated.ID)
 	node, _ := s.store.Node(stored.NodeID)
-	writeJSON(w, http.StatusOK, toMachineView(node, stored, s.now()))
+	writeJSON(w, http.StatusOK, toMachineView(node, stored, s.machineVendorMap(), s.now()))
 }
 
 func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request, p principal) {
@@ -317,7 +391,7 @@ func (s *Server) handleMachineRenew(w http.ResponseWriter, r *http.Request, p pr
 	})
 	stored, _ := s.store.MachineProfile(profile.ID)
 	node, _ := s.store.Node(stored.NodeID)
-	writeJSON(w, http.StatusOK, toMachineView(node, stored, s.now()))
+	writeJSON(w, http.StatusOK, toMachineView(node, stored, s.machineVendorMap(), s.now()))
 }
 
 func (s *Server) handleMachineRemindersRun(w http.ResponseWriter, r *http.Request, p principal) {
@@ -357,12 +431,57 @@ func (s *Server) handleMachineRemindersRun(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string][]renewalReminderFire{"fired": fired})
 }
 
+func (s *Server) handleMachineLinkReveal(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID          string `json:"id"`
+		Kind        string `json:"kind"`
+		StepUpGrant string `json:"step_up_grant"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	req.Kind = strings.TrimSpace(req.Kind)
+	profile, ok := s.store.MachineProfile(req.ID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("machine profile not found"))
+		return
+	}
+	if !s.requireNodeScope(w, p, "inventory:admin", profile.NodeID) {
+		return
+	}
+	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "inventory.link.reveal") {
+		return
+	}
+	link := ""
+	switch req.Kind {
+	case "console":
+		link = profile.ConsoleURL
+	case "detail":
+		link = profile.DetailURL
+	default:
+		writeError(w, http.StatusBadRequest, errors.New("kind must be console or detail"))
+		return
+	}
+	if strings.TrimSpace(link) == "" {
+		writeError(w, http.StatusNotFound, errors.New("link is not set"))
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: profile.NodeID, Action: "inventory.link.reveal", Scope: "inventory:admin", Metadata: map[string]string{"machine_id": profile.ID, "kind": req.Kind}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": profile.ID, "kind": req.Kind, "url": link})
+}
+
 func (s *Server) machineViewsForPrincipal(p principal) []machineView {
 	now := s.now()
 	profiles := map[string]model.MachineProfile{}
 	for _, profile := range s.store.MachineProfiles() {
 		profiles[profile.NodeID] = profile
 	}
+	vendors := s.machineVendorMap()
 	views := []machineView{}
 	seen := map[string]bool{}
 	for _, node := range s.store.Nodes() {
@@ -370,13 +489,13 @@ func (s *Server) machineViewsForPrincipal(p principal) []machineView {
 			continue
 		}
 		seen[node.ID] = true
-		views = append(views, toMachineView(node, profiles[node.ID], now))
+		views = append(views, toMachineView(node, profiles[node.ID], vendors, now))
 	}
 	for _, profile := range profiles {
 		if seen[profile.NodeID] || !rbac.Allows(p.Principal, "inventory:read", profile.NodeID) {
 			continue
 		}
-		views = append(views, toMachineView(model.Node{ID: profile.NodeID}, profile, now))
+		views = append(views, toMachineView(model.Node{ID: profile.NodeID}, profile, vendors, now))
 	}
 	sort.Slice(views, func(i, j int) bool {
 		if views[i].NodeName == views[j].NodeName {
@@ -387,13 +506,59 @@ func (s *Server) machineViewsForPrincipal(p principal) []machineView {
 	return views
 }
 
-func toMachineView(node model.Node, profile model.MachineProfile, now time.Time) machineView {
+func (s *Server) machineVendorMap() map[string]model.MachineVendor {
+	out := map[string]model.MachineVendor{}
+	for _, vendor := range s.store.MachineVendors() {
+		key := strings.ToLower(strings.TrimSpace(vendor.Name))
+		if key != "" {
+			out[key] = vendor
+		}
+	}
+	return out
+}
+
+func (s *Server) machineVendorsForPrincipal(p principal) []model.MachineVendor {
+	seen := map[string]model.MachineVendor{}
+	for _, vendor := range s.store.MachineVendors() {
+		key := strings.ToLower(strings.TrimSpace(vendor.Name))
+		if key == "" {
+			continue
+		}
+		seen[key] = vendor
+	}
+	for _, profile := range s.store.MachineProfiles() {
+		if !rbac.Allows(p.Principal, "inventory:read", profile.NodeID) {
+			continue
+		}
+		name := strings.TrimSpace(profile.Vendor)
+		key := strings.ToLower(name)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; !ok {
+			seen[key] = model.MachineVendor{ID: "derived:" + key, Name: name}
+		}
+	}
+	out := make([]model.MachineVendor, 0, len(seen))
+	for _, vendor := range seen {
+		out = append(out, vendor)
+	}
+	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
+	return out
+}
+
+func toMachineView(node model.Node, profile model.MachineProfile, vendors map[string]model.MachineVendor, now time.Time) machineView {
 	purchasedAt := optionalDate(profile.PurchasedAt)
 	nextRenewal := optionalDate(profile.NextRenewal)
 	var daysUntil *int
 	if nextRenewal != nil {
 		days := daysUntilRenewal(now, *nextRenewal)
 		daysUntil = &days
+	}
+	var vendorProfile *model.MachineVendor
+	if vendor, ok := vendors[strings.ToLower(strings.TrimSpace(profile.Vendor))]; ok {
+		v := vendor
+		vendorProfile = &v
 	}
 	return machineView{
 		ID:               profile.ID,
@@ -403,6 +568,7 @@ func toMachineView(node model.Node, profile model.MachineProfile, now time.Time)
 		Online:           node.Online,
 		HostFacts:        node.HostFacts,
 		Vendor:           profile.Vendor,
+		VendorProfile:    vendorProfile,
 		Region:           profile.Region,
 		HasConsoleURL:    profile.ConsoleURL != "",
 		HasDetailURL:     profile.DetailURL != "",
@@ -501,6 +667,37 @@ func (s *Server) machineProfileFromRequest(req machineProfileRequest, existing m
 	return out, nil
 }
 
+func (s *Server) machineVendorFromRequest(req machineVendorRequest) (model.MachineVendor, error) {
+	name := clampPrintable(req.Name, maxMachineShort)
+	if name == "" {
+		return model.MachineVendor{}, errors.New("name is required")
+	}
+	vendor := model.MachineVendor{ID: strings.TrimSpace(req.ID)}
+	if strings.HasPrefix(vendor.ID, "derived:") {
+		vendor.ID = ""
+	}
+	if vendor.ID != "" {
+		if existing, ok := s.store.MachineVendor(vendor.ID); ok {
+			vendor = existing
+		}
+	} else if existing, ok := s.store.MachineVendorByName(name); ok {
+		vendor = existing
+	} else {
+		vendor.ID = id.New("vendor")
+	}
+	vendor.Name = name
+	vendor.URL = clampPrintable(req.URL, maxMachineURL)
+	vendor.LogoURL = clampPrintable(req.LogoURL, maxMachineURL)
+	vendor.Description = clampPrintable(req.Description, maxMachineNotes)
+	if vendor.URL != "" && !validHTTPURL(vendor.URL) {
+		return model.MachineVendor{}, errors.New("url must be an absolute http(s) URL")
+	}
+	if vendor.LogoURL != "" && !validHTTPURL(vendor.LogoURL) {
+		return model.MachineVendor{}, errors.New("logo_url must be an absolute http(s) URL")
+	}
+	return vendor, nil
+}
+
 func validateMachineProfile(p model.MachineProfile) error {
 	if p.NodeID == "" {
 		return errors.New("node_id is required")
@@ -509,7 +706,7 @@ func validateMachineProfile(p model.MachineProfile) error {
 		return errors.New("price_cents cannot be negative")
 	}
 	if p.PriceCents > 0 && !validCurrency(p.Currency) {
-		return errors.New("currency must be a 3-letter ISO code when price_cents is set")
+		return errors.New("currency must be a 3-5 character code such as USD, CNY, USDT, or USDC when price_cents is set")
 	}
 	switch p.RenewalCycle {
 	case "":
@@ -551,7 +748,7 @@ func normalizeReminderDays(in []int) []int {
 }
 
 func validCurrency(value string) bool {
-	if len(value) != 3 {
+	if len(value) < 3 || len(value) > 5 {
 		return false
 	}
 	for _, r := range value {
@@ -560,6 +757,17 @@ func validCurrency(value string) bool {
 		}
 	}
 	return true
+}
+
+func validHTTPURL(value string) bool {
+	u, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	if u.User != nil {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
 }
 
 func (s *Server) startRenewalScheduler() {

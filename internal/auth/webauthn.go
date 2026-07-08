@@ -51,6 +51,7 @@ type WebAuthnCredential struct {
 const (
 	WebAuthnPurposeRegister = "register"
 	WebAuthnPurposeLogin    = "login"
+	WebAuthnPurposeStepUp   = "step_up"
 )
 
 // WebAuthnChallenge is the short-lived, single-use, IP-bound gate that ties the

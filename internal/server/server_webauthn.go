@@ -570,6 +570,105 @@ func (s *Server) handleWebAuthnLoginFinish(w http.ResponseWriter, r *http.Reques
 	s.issueSession(w, r, resolved)
 }
 
+// handleWebAuthnStepUpBegin starts an authenticated, user-bound passkey
+// assertion for issuing the same short-lived step-up grant as TOTP.
+func (s *Server) handleWebAuthnStepUpBegin(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	user, ok := s.requireInteractiveUser(w, p)
+	if !ok {
+		return
+	}
+	if s.store.CountWebAuthnCredentialsByUser(user.ID) == 0 {
+		writeError(w, http.StatusForbidden, errors.New("no passkey is registered for this account"))
+		return
+	}
+	rp, err := s.webAuthnRP()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	assertion, session, err := rp.BeginLogin(s.webAuthnUser(user), webauthn.WithUserVerification(protocol.VerificationRequired))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	challengeID, ok := s.storeWebAuthnChallenge(w, user.ID, s.clientIP(r), auth.WebAuthnPurposeStepUp, session)
+	if !ok {
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "security.step_up.webauthn", Decision: "observe"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"challenge_id": challengeID,
+		"publicKey":    assertion.Response,
+	})
+}
+
+func (s *Server) handleWebAuthnStepUpFinish(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	user, ok := s.requireInteractiveUser(w, p)
+	if !ok {
+		return
+	}
+	var req struct {
+		ChallengeID string          `json:"challenge_id"`
+		Credential  json.RawMessage `json:"credential"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	challenge, session, ok := s.loadWebAuthnChallenge(w, req.ChallengeID, s.clientIP(r), auth.WebAuthnPurposeStepUp)
+	if !ok {
+		return
+	}
+	if challenge.UserID != user.ID {
+		writeError(w, http.StatusUnauthorized, errors.New("invalid or expired challenge"))
+		return
+	}
+	rp, err := s.webAuthnRP()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	parsed, err := protocol.ParseCredentialRequestResponseBody(bytes.NewReader(req.Credential))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "invalid assertion response"))
+		return
+	}
+	credential, err := rp.ValidateLogin(s.webAuthnUser(user), *session, parsed)
+	_ = s.store.ConsumeWebAuthnChallenge(challenge.ID)
+	if err != nil {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "security.step_up.webauthn", Decision: "deny", Reason: "assertion verification failed"})
+		writeError(w, http.StatusUnauthorized, errors.New("passkey verification failed"))
+		return
+	}
+	stored, found := s.store.WebAuthnCredentialByCredentialID(credential.ID)
+	if !found || stored.UserID != user.ID {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "security.step_up.webauthn", Decision: "deny", Reason: "credential not registered to user"})
+		writeError(w, http.StatusUnauthorized, errors.New("passkey verification failed"))
+		return
+	}
+	if stored.SignCount != 0 && credential.Authenticator.SignCount != 0 && credential.Authenticator.SignCount <= stored.SignCount {
+		s.logger.Printf("WARNING: passkey sign-count regression for step-up user %s credential %s (stored=%d presented=%d); possible cloned authenticator", user.ID, stored.ID, stored.SignCount, credential.Authenticator.SignCount)
+	}
+	if err := s.store.TouchWebAuthnCredential(stored.ID, credential.Authenticator.SignCount, credential.Flags.BackupState, s.now()); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	grant, expiresAt, err := s.issueStepUpGrant(p)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "security.step_up", Decision: "allow", Reason: "webauthn"})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "grant": grant, "expires_at": expiresAt})
+}
+
 // storeWebAuthnChallenge serialises the ceremony session data and persists a
 // short-lived, single-use, IP-bound challenge, returning the store record id the
 // client echoes back at finish. Returns ("", false) (after writing the error)

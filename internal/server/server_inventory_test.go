@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -70,6 +71,115 @@ func TestMachineProfileCreateListHidesLinks(t *testing.T) {
 	}
 	if !strings.Contains(body.String(), `"purchased_at":"2024-07-01T00:00:00Z"`) {
 		t.Fatalf("machine list missing purchased_at: %s", body.String())
+	}
+}
+
+func TestMachineVendorCatalogAndExtendedCurrency(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "gmami-hkg", Online: true}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+
+	vendor := doJSON(t, handler, http.MethodPost, "/api/machine-vendors", `{
+		"name":"Gomami",
+		"url":"https://gomami.io",
+		"logo_url":"https://gomami.io/logo.png",
+		"description":"Hong Kong provider"
+	}`, cookies, csrf)
+	defer vendor.Body.Close()
+	if vendor.StatusCode != http.StatusOK {
+		t.Fatalf("vendor upsert failed: %d", vendor.StatusCode)
+	}
+
+	create := doJSON(t, handler, http.MethodPost, "/api/machines", `{
+		"node_id":"node-a",
+		"vendor":"Gomami",
+		"price_cents":1200,
+		"currency":"usdt",
+		"renewal_cycle":"monthly",
+		"next_renewal":"2026-08-01T00:00:00Z"
+	}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create failed: %d", create.StatusCode)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/machines", "", cookies, "")
+	defer list.Body.Close()
+	var views []machineView
+	if err := json.NewDecoder(list.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("machine views = %d, want 1", len(views))
+	}
+	if views[0].Currency != "USDT" {
+		t.Fatalf("currency = %q, want USDT", views[0].Currency)
+	}
+	if views[0].VendorProfile == nil || views[0].VendorProfile.URL != "https://gomami.io" ||
+		views[0].VendorProfile.LogoURL != "https://gomami.io/logo.png" {
+		t.Fatalf("vendor profile not attached to machine view: %+v", views[0].VendorProfile)
+	}
+}
+
+func TestMachineLinkRevealRequiresCurrentStepUpGrant(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	create := doJSON(t, handler, http.MethodPost, "/api/machines",
+		`{"node_id":"node-a","vendor":"DMIT","console_url":"https://console.example.com/secret","detail_url":"https://detail.example.com/secret"}`,
+		cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create failed: %d", create.StatusCode)
+	}
+	var created machineView
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+
+	denied := doJSON(t, handler, http.MethodPost, "/api/machines/reveal-link",
+		`{"id":"`+created.ID+`","kind":"console"}`, cookies, csrf)
+	defer denied.Body.Close()
+	if denied.StatusCode != http.StatusForbidden {
+		t.Fatalf("reveal without grant should be forbidden, got %d", denied.StatusCode)
+	}
+
+	user, ok := st.UserByUsername("admin")
+	if !ok {
+		t.Fatal("admin user missing")
+	}
+	sessionID := ""
+	for _, cookie := range cookies {
+		if cookie.Name == "lattice_session" {
+			sessionID = cookie.Value
+			break
+		}
+	}
+	if sessionID == "" {
+		t.Fatal("login did not return lattice_session cookie")
+	}
+	grant, _, err := srv.issueStepUpGrant(principal{Principal: rbac.Principal{ActorID: user.ID}, sessionID: sessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reveal := doJSON(t, handler, http.MethodPost, "/api/machines/reveal-link",
+		`{"id":"`+created.ID+`","kind":"console","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	defer reveal.Body.Close()
+	if reveal.StatusCode != http.StatusOK {
+		t.Fatalf("reveal with grant failed: %d", reveal.StatusCode)
+	}
+	var out struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(reveal.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.URL != "https://console.example.com/secret" {
+		t.Fatalf("revealed url = %q", out.URL)
 	}
 }
 

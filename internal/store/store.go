@@ -65,6 +65,9 @@ type State struct {
 	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
 	MachineVendors  map[string]model.MachineVendor      `json:"machine_vendors"`
 	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
+	SecurityGroups  map[string]model.SecurityGroup      `json:"security_groups"`
+	GuardZones      map[string]model.GuardZone          `json:"guard_zones"`
+	GuardBindings   map[string]model.NodeGuardBinding   `json:"guard_bindings"`
 	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
 	Groups          map[string]model.Group              `json:"groups"`
@@ -352,6 +355,9 @@ func emptyState() State {
 		MachineProfiles: map[string]model.MachineProfile{},
 		MachineVendors:  map[string]model.MachineVendor{},
 		NFTInputs:       map[string]model.NFTInputs{},
+		SecurityGroups:  map[string]model.SecurityGroup{},
+		GuardZones:      map[string]model.GuardZone{},
+		GuardBindings:   map[string]model.NodeGuardBinding{},
 		DNSDeployments:  map[string]model.DNSDeployment{},
 		NetPolicies:     map[string]model.NetPolicy{},
 		Groups:          map[string]model.Group{},
@@ -441,6 +447,17 @@ func (st *State) ensureMaps() {
 	}
 	if st.NFTInputs == nil {
 		st.NFTInputs = map[string]model.NFTInputs{}
+	}
+	// Nil-checked so a pre-design-13 on-disk state file upgrades cleanly to
+	// empty netguard collections on load.
+	if st.SecurityGroups == nil {
+		st.SecurityGroups = map[string]model.SecurityGroup{}
+	}
+	if st.GuardZones == nil {
+		st.GuardZones = map[string]model.GuardZone{}
+	}
+	if st.GuardBindings == nil {
+		st.GuardBindings = map[string]model.NodeGuardBinding{}
 	}
 	if st.DNSDeployments == nil {
 		st.DNSDeployments = map[string]model.DNSDeployment{}
@@ -2244,6 +2261,172 @@ func (s *Store) DeleteNetPolicy(nodeID string) error {
 		return nil
 	}
 	delete(s.state.NetPolicies, nodeID)
+	return s.Save()
+}
+
+// ErrGuardVersionConflict is returned when an optimistic-concurrency upsert
+// carries a stale Version. Security groups and node guard bindings require the
+// caller to echo the current version so two operators cannot silently clobber
+// each other's firewall edits (design-13, closing the NFTInputs upsert gap).
+var ErrGuardVersionConflict = errors.New("guard record version conflict")
+
+// UpsertSecurityGroup creates or updates a reusable security group. New
+// records must carry Version 0; updates must echo the stored Version. The
+// store bumps the version and returns the persisted record.
+func (s *Store) UpsertSecurityGroup(group model.SecurityGroup) (model.SecurityGroup, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if existing, ok := s.state.SecurityGroups[group.ID]; ok {
+		if group.Version != existing.Version {
+			return model.SecurityGroup{}, ErrGuardVersionConflict
+		}
+		group.CreatedAt = existing.CreatedAt
+	} else {
+		if group.Version != 0 {
+			return model.SecurityGroup{}, ErrGuardVersionConflict
+		}
+		group.CreatedAt = now
+	}
+	group.Version++
+	group.UpdatedAt = now
+	s.state.SecurityGroups[group.ID] = group
+	if err := s.Save(); err != nil {
+		return model.SecurityGroup{}, err
+	}
+	return group, nil
+}
+
+// SecurityGroup returns one stored security group by id.
+func (s *Store) SecurityGroup(id string) (model.SecurityGroup, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	group, ok := s.state.SecurityGroups[id]
+	return group, ok
+}
+
+// SecurityGroups returns all stored security groups sorted by id.
+func (s *Store) SecurityGroups() []model.SecurityGroup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.SecurityGroup, 0, len(s.state.SecurityGroups))
+	for _, group := range s.state.SecurityGroups {
+		out = append(out, group)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// DeleteSecurityGroup removes a stored security group.
+func (s *Store) DeleteSecurityGroup(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.SecurityGroups[id]; !ok {
+		return nil
+	}
+	delete(s.state.SecurityGroups, id)
+	return s.Save()
+}
+
+// UpsertGuardZone creates or updates a named guard zone.
+func (s *Store) UpsertGuardZone(zone model.GuardZone) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	zone.UpdatedAt = time.Now().UTC()
+	if existing, ok := s.state.GuardZones[zone.ID]; ok {
+		zone.CreatedAt = existing.CreatedAt
+	} else if zone.CreatedAt.IsZero() {
+		zone.CreatedAt = zone.UpdatedAt
+	}
+	s.state.GuardZones[zone.ID] = zone
+	return s.Save()
+}
+
+// GuardZone returns one stored guard zone by id.
+func (s *Store) GuardZone(id string) (model.GuardZone, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	zone, ok := s.state.GuardZones[id]
+	return zone, ok
+}
+
+// GuardZones returns all stored guard zones sorted by id.
+func (s *Store) GuardZones() []model.GuardZone {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.GuardZone, 0, len(s.state.GuardZones))
+	for _, zone := range s.state.GuardZones {
+		out = append(out, zone)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// DeleteGuardZone removes a stored guard zone.
+func (s *Store) DeleteGuardZone(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.GuardZones[id]; !ok {
+		return nil
+	}
+	delete(s.state.GuardZones, id)
+	return s.Save()
+}
+
+// UpsertNodeGuardBinding creates or updates a node's guard binding with the
+// same optimistic-concurrency contract as UpsertSecurityGroup.
+func (s *Store) UpsertNodeGuardBinding(binding model.NodeGuardBinding) (model.NodeGuardBinding, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if existing, ok := s.state.GuardBindings[binding.NodeID]; ok {
+		if binding.Version != existing.Version {
+			return model.NodeGuardBinding{}, ErrGuardVersionConflict
+		}
+		binding.CreatedAt = existing.CreatedAt
+	} else {
+		if binding.Version != 0 {
+			return model.NodeGuardBinding{}, ErrGuardVersionConflict
+		}
+		binding.CreatedAt = now
+	}
+	binding.Version++
+	binding.UpdatedAt = now
+	s.state.GuardBindings[binding.NodeID] = binding
+	if err := s.Save(); err != nil {
+		return model.NodeGuardBinding{}, err
+	}
+	return binding, nil
+}
+
+// NodeGuardBinding returns the guard binding for a node.
+func (s *Store) NodeGuardBinding(nodeID string) (model.NodeGuardBinding, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	binding, ok := s.state.GuardBindings[nodeID]
+	return binding, ok
+}
+
+// NodeGuardBindings returns all guard bindings sorted by node id.
+func (s *Store) NodeGuardBindings() []model.NodeGuardBinding {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.NodeGuardBinding, 0, len(s.state.GuardBindings))
+	for _, binding := range s.state.GuardBindings {
+		out = append(out, binding)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// DeleteNodeGuardBinding removes a node's guard binding.
+func (s *Store) DeleteNodeGuardBinding(nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.GuardBindings[nodeID]; !ok {
+		return nil
+	}
+	delete(s.state.GuardBindings, nodeID)
 	return s.Save()
 }
 

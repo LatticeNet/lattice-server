@@ -2,6 +2,7 @@
 /lattice-server
 *.test
 coverage.out
+master.key
 
 # OMC orchestration tool state (not part of the project)
 .omc/

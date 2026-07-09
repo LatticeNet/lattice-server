@@ -187,6 +187,46 @@ Use the compose file and deployment guide in the umbrella repository:
   TOTP; all other session-backed APIs return the stable `mfa_required` error
   until enrollment is complete. Bearer PAT automation is not an interactive
   session and is not gated by this policy.
+- **Passkeys (WebAuthn).** Operators can register passkeys (platform
+  authenticators such as Apple Passwords / iCloud Keychain, or roaming security
+  keys) and sign in with them. Verification uses
+  [`github.com/go-webauthn/webauthn`](https://github.com/go-webauthn/webauthn) —
+  hand-rolling CBOR/COSE/attestation parsing is a security anti-pattern, and the
+  server already carries vetted third-party auth deps (go-oidc). Attestation
+  conveyance is `none`; discoverable (resident) keys and user verification are
+  both **required** so the credential syncs and usernameless login works.
+  - **Relying-party identity.** The RP ID and origin are derived from the
+    server's external URL (`PublicURL` / `LATTICE_PUBLIC_URL`, the same value
+    that anchors OIDC — no new config surface): `RPID = host` (no scheme/port),
+    `RPOrigin = scheme://host[:port]`. For `https://lattice.roobli.org` that is
+    `RPID=lattice.roobli.org`, origin `https://lattice.roobli.org` — **zero
+    Apple-specific configuration**. If `PublicURL` is unset, passkey endpoints
+    fail closed with `503` (`passkeys are not configured (server public URL
+    unset)`), exactly as the OIDC login handlers do. A prod RP ID will not match
+    a dev origin, so local development must set `LATTICE_PUBLIC_URL` to the dev
+    origin (e.g. `http://localhost:5273`); passkeys require the RP ID to match the
+    browser origin, so use that dev origin directly rather than the prod host.
+  - **Endpoints.** Registration (interactive session):
+    `POST /api/security/webauthn/register/{begin,finish}`. Management:
+    `GET /api/security/webauthn/credentials`,
+    `POST /api/security/webauthn/credentials/{rename,delete}`. Login (pre-auth,
+    usernameless): `POST /api/auth/webauthn/login/{begin,finish}`. Adding or
+    deleting a login-capable credential requires a fresh 2FA step-up grant when
+    the account has TOTP enrolled (same `step_up_grant` verb used for secret
+    reveals); rename does not.
+  - **Login.** A finished login resolves the user from the authenticator's user
+    handle and issues the **same** session the password+TOTP path issues — a
+    user-verified passkey satisfies possession + inherence, so no separate second
+    factor is required. Challenges are short-lived (≤5 min), single-use, and
+    IP-bound like the TOTP challenge.
+  - **Sign counters.** A zero or non-incrementing counter is not an error
+    (synced passkeys, including Apple's, always report `0`). Only a regression
+    from a previously non-zero counter is logged as a possible-clone warning;
+    login is never hard-failed on the counter alone.
+  - **Apple Passwords.** On Apple devices over HTTPS the passkey is saved to
+    Apple Passwords and synced through iCloud Keychain automatically — there is
+    no Apple-specific server setup beyond serving the dashboard over HTTPS at the
+    RP-ID host.
 - Container images embed the dashboard commit pinned in `dashboard.ref`;
   update that file when intentionally rolling a new dashboard into the server
   image.

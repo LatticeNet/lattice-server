@@ -174,6 +174,55 @@ func TestValidateManifestAcceptsOwnedBuiltinView(t *testing.T) {
 	}
 }
 
+func TestValidateManifestAcceptsOfficialNetworkSecurityBuiltins(t *testing.T) {
+	for _, tc := range []struct {
+		id           string
+		name         string
+		title        string
+		route        string
+		icon         string
+		componentKey string
+	}{
+		{
+			id:           "latticenet.netguard",
+			name:         "netguard (nftables security groups)",
+			title:        "Firewall",
+			route:        "firewall",
+			icon:         "Shield",
+			componentKey: "netguard.firewall",
+		},
+		{
+			id:           "latticenet.wireguard",
+			name:         "wireguard (VPN networks)",
+			title:        "Networks",
+			route:        "networks",
+			icon:         "Spline",
+			componentKey: "wireguard.networks",
+		},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			err := ValidateManifest(Manifest{
+				ID:           tc.id,
+				Name:         tc.name,
+				Type:         TypeSystem,
+				Capabilities: []string{"node:read", "network:plan", "network:apply", "task:run"},
+				UI: &ManifestUI{
+					Nav: []NavContribution{{
+						Section: "network-security", SectionTitle: "Network Security", Title: tc.title,
+						Route: tc.route, Icon: tc.icon, Scopes: []string{"network:plan"},
+					}},
+					Views: []ViewContribution{{
+						Route: tc.route, Title: tc.title, Kind: "builtin", ComponentKey: tc.componentKey,
+					}},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestValidateManifestRejectsForeignBuiltinView(t *testing.T) {
 	err := ValidateManifest(Manifest{
 		ID:           "other-plugin",

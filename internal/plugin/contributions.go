@@ -24,6 +24,7 @@ var (
 	pluginIcons = map[string]bool{
 		"": true, "Radar": true, "Boxes": true, "Store": true, "ServerCog": true,
 		"DoorOpen": true, "Users": true, "Link": true, "Gauge": true, "Blocks": true,
+		"Shield": true, "Spline": true,
 	}
 	pluginSectionRe       = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,48}$`)
 	pluginRouteRe         = regexp.MustCompile(`^[a-z0-9][a-z0-9/_-]{0,64}$`)
@@ -43,6 +44,8 @@ var (
 		"proxy.usage":            "latticenet.vpn-core",
 		"proxy.discovered":       "latticenet.vpn-core",
 		"proxy.substore":         "latticenet.sub-store",
+		"netguard.firewall":      "latticenet.netguard",
+		"wireguard.networks":     "latticenet.wireguard",
 	}
 )
 

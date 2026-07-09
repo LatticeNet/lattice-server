@@ -36,6 +36,11 @@ const (
 )
 
 type NFTInputRule struct {
+	// Interface, when set, scopes the rule to traffic arriving on that inbound
+	// interface (rendered as `iifname "<name>"`). It is how a trusted overlay
+	// zone (wireguard, tailscale) is accepted without widening the public
+	// surface. Empty means "any inbound interface".
+	Interface   string
 	SourceCIDRs []string
 	Protocol    string
 	Ports       []int
@@ -147,6 +152,9 @@ func normalizeInputRule(rule NFTInputRule) (NFTInputRule, error) {
 	default:
 		return NFTInputRule{}, fmt.Errorf("invalid protocol %q", rule.Protocol)
 	}
+	if rule.Interface != "" && !ifaceNameRe.MatchString(rule.Interface) {
+		return NFTInputRule{}, fmt.Errorf("invalid interface name %q", rule.Interface)
+	}
 	var err error
 	if rule.Ports, err = normalizePorts(rule.Ports); err != nil {
 		return NFTInputRule{}, fmt.Errorf("ports: %w", err)
@@ -241,6 +249,9 @@ func renderInputRule(rule NFTInputRule) []string {
 	lines := make([]string, 0, len(sourceExprs))
 	for _, sourceExpr := range sourceExprs {
 		parts := []string{}
+		if rule.Interface != "" {
+			parts = append(parts, fmt.Sprintf("iifname %q", rule.Interface))
+		}
 		if sourceExpr != "" {
 			parts = append(parts, sourceExpr)
 		}

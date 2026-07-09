@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -205,6 +207,237 @@ func TestNetGuardStoredBindingSupersedesLegacyView(t *testing.T) {
 	}
 	if nodes.Nodes[0].Source != "stored" || !nodes.Nodes[0].Binding.Managed {
 		t.Fatalf("bad stored view: %+v", nodes.Nodes[0])
+	}
+}
+
+// End-to-end G2: adopt a legacy node, then plan from the new model. The plan
+// must be a lattice_guard ruleset carried by an `nft` approval so it rides the
+// existing rollback-protected apply script unchanged.
+func TestNetGuardAdoptThenPlan(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs", `{
+		"node_id":"node-a","interface_name":"ens3","public_tcp":[22,443]
+	}`, cookies, csrf)
+	defer save.Body.Close()
+	if save.StatusCode != http.StatusOK {
+		t.Fatalf("save inputs: %d", save.StatusCode)
+	}
+
+	// Planning before adoption is refused: converted views are observe-only.
+	early := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer early.Body.Close()
+	if early.StatusCode != http.StatusBadRequest {
+		t.Fatalf("plan before adopt = %d, want 400", early.StatusCode)
+	}
+
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusOK {
+		t.Fatalf("adopt failed: %d", adopt.StatusCode)
+	}
+	binding, ok := st.NodeGuardBinding("node-a")
+	if !ok || !binding.Managed {
+		t.Fatalf("adopt must persist a managed binding, got %+v", binding)
+	}
+	if _, ok := st.SecurityGroup("sg-legacy-node-a"); !ok {
+		t.Fatal("adopt must persist the converted group")
+	}
+
+	// Adopting twice is a conflict, not a silent re-materialization.
+	again := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer again.Body.Close()
+	if again.StatusCode != http.StatusConflict {
+		t.Fatalf("re-adopt = %d, want 409", again.StatusCode)
+	}
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("netguard plan failed: %d", plan.StatusCode)
+	}
+	var planRes struct {
+		Approval model.Approval `json:"approval"`
+		Findings []struct {
+			Code string `json:"code"`
+		} `json:"findings"`
+	}
+	if err := json.NewDecoder(plan.Body).Decode(&planRes); err != nil {
+		t.Fatal(err)
+	}
+	if planRes.Approval.Plugin != "nft" || planRes.Approval.Action != "apply-ruleset" {
+		t.Fatalf("plan must ride the existing nft apply path: %+v", planRes.Approval)
+	}
+	for _, want := range []string{
+		`destroy table inet lattice_guard`,
+		`iifname "ens3" tcp dport { 22, 443 }`,
+		`counter drop`,
+	} {
+		if !strings.Contains(planRes.Approval.Plan, want) {
+			t.Fatalf("plan missing %q:\n%s", want, planRes.Approval.Plan)
+		}
+	}
+	if len(planRes.Findings) != 0 {
+		t.Fatalf("a plan allowing tcp/22 with a public url must be clean: %+v", planRes.Findings)
+	}
+}
+
+// The dmit-eb-wee guard: a plan with no management-port accept is refused
+// before it can ever reach a node, and only an explicit, audited override
+// lets it through.
+func TestNetGuardPlanBlocksLockoutRisk(t *testing.T) {
+	handler, _ := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+
+	// A baseline with the real incident's shape: services, but no SSH.
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","public_tcp":[7443,7500]}`, cookies, csrf)
+	defer save.Body.Close()
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusOK {
+		t.Fatalf("adopt: %d", adopt.StatusCode)
+	}
+
+	blocked := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer blocked.Body.Close()
+	if blocked.StatusCode != http.StatusConflict {
+		t.Fatalf("lockout plan = %d, want 409", blocked.StatusCode)
+	}
+	var blockedRes struct {
+		Findings []struct {
+			Code     string `json:"code"`
+			Severity string `json:"severity"`
+		} `json:"findings"`
+	}
+	if err := json.NewDecoder(blocked.Body).Decode(&blockedRes); err != nil {
+		t.Fatal(err)
+	}
+	if len(blockedRes.Findings) == 0 || blockedRes.Findings[0].Code != "lockout_risk_ssh" ||
+		blockedRes.Findings[0].Severity != "block" {
+		t.Fatalf("findings = %+v", blockedRes.Findings)
+	}
+
+	forced := doJSON(t, handler, http.MethodPost, "/api/netguard/plan",
+		`{"node_id":"node-a","accept_lockout_risk":true}`, cookies, csrf)
+	defer forced.Body.Close()
+	if forced.StatusCode != http.StatusOK {
+		t.Fatalf("explicit override = %d, want 200", forced.StatusCode)
+	}
+}
+
+// A trusted overlay zone is the safe remedy for the lockout case: the node
+// keeps its tailscale path and the plan stops blocking.
+func TestNetGuardTrustedZoneClearsLockoutAndRendersIifname(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","public_tcp":[7443]}`, cookies, csrf)
+	defer save.Body.Close()
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+
+	zone := doJSON(t, handler, http.MethodPost, "/api/netguard/zones",
+		`{"id":"tailscale","name":"tailscale","interfaces":["tailscale0"]}`, cookies, csrf)
+	defer zone.Body.Close()
+	if zone.StatusCode != http.StatusOK {
+		t.Fatalf("create zone: %d", zone.StatusCode)
+	}
+
+	binding, _ := st.NodeGuardBinding("node-a")
+	body := `{"node_id":"node-a","managed":true,"version":` +
+		strconv.FormatInt(binding.Version, 10) +
+		`,"group_ids":["sg-legacy-node-a"],"zone_ids":["tailscale"]}`
+	bind := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings", body, cookies, csrf)
+	defer bind.Body.Close()
+	if bind.StatusCode != http.StatusOK {
+		t.Fatalf("bind zone: %d", bind.StatusCode)
+	}
+
+	plan := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusOK {
+		t.Fatalf("plan with trusted zone = %d, want 200 (lockout lint satisfied)", plan.StatusCode)
+	}
+	var planRes struct {
+		Approval model.Approval `json:"approval"`
+	}
+	if err := json.NewDecoder(plan.Body).Decode(&planRes); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(planRes.Approval.Plan, `iifname "tailscale0" accept comment "trusted zone tailscale"`) {
+		t.Fatalf("trusted zone accept missing:\n%s", planRes.Approval.Plan)
+	}
+
+	// A zone still trusted by a node cannot be deleted out from under it.
+	del := doJSON(t, handler, http.MethodPost, "/api/netguard/zones/delete", `{"id":"tailscale"}`, cookies, csrf)
+	defer del.Body.Close()
+	if del.StatusCode != http.StatusConflict {
+		t.Fatalf("delete in-use zone = %d, want 409", del.StatusCode)
+	}
+}
+
+func TestNetGuardWriteValidationAndConflicts(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+
+	// An unrenderable rule must be rejected at write time, never stored.
+	bad := doJSON(t, handler, http.MethodPost, "/api/netguard/groups", `{
+		"id":"sg-bad","name":"bad","rules":[{"id":"r","action":"allow","direction":"ingress",
+		"protocol":"icmp","remote":{"kind":"zone","zone_id":"public"}}]}`, cookies, csrf)
+	defer bad.Body.Close()
+	if bad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("icmp rule = %d, want 400", bad.StatusCode)
+	}
+
+	good := doJSON(t, handler, http.MethodPost, "/api/netguard/groups", `{
+		"id":"sg-web","name":"web","rules":[{"id":"https","action":"allow","direction":"ingress",
+		"protocol":"tcp","ports":[{"from":443,"to":443}],"remote":{"kind":"zone","zone_id":"public"}}]}`, cookies, csrf)
+	defer good.Body.Close()
+	if good.StatusCode != http.StatusOK {
+		t.Fatalf("valid group = %d, want 200", good.StatusCode)
+	}
+
+	// Stale version write is a 409, not a silent clobber.
+	stale := doJSON(t, handler, http.MethodPost, "/api/netguard/groups",
+		`{"id":"sg-web","name":"clobber","version":0}`, cookies, csrf)
+	defer stale.Body.Close()
+	if stale.StatusCode != http.StatusConflict {
+		t.Fatalf("stale group write = %d, want 409", stale.StatusCode)
+	}
+
+	// Reserved legacy id space cannot be squatted.
+	squat := doJSON(t, handler, http.MethodPost, "/api/netguard/groups",
+		`{"id":"sg-legacy-node-a","name":"squat"}`, cookies, csrf)
+	defer squat.Body.Close()
+	if squat.StatusCode != http.StatusBadRequest {
+		t.Fatalf("legacy id squat = %d, want 400", squat.StatusCode)
+	}
+
+	// A group attached to a node cannot be deleted.
+	bind := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings",
+		`{"node_id":"node-a","managed":true,"group_ids":["sg-web"]}`, cookies, csrf)
+	defer bind.Body.Close()
+	if bind.StatusCode != http.StatusOK {
+		t.Fatalf("bind: %d", bind.StatusCode)
+	}
+	del := doJSON(t, handler, http.MethodPost, "/api/netguard/groups/delete", `{"id":"sg-web"}`, cookies, csrf)
+	defer del.Body.Close()
+	if del.StatusCode != http.StatusConflict {
+		t.Fatalf("delete attached group = %d, want 409", del.StatusCode)
+	}
+
+	// The loopback zone is not editable.
+	lo := doJSON(t, handler, http.MethodPost, "/api/netguard/zones",
+		`{"id":"loopback","name":"lo","interfaces":["lo"]}`, cookies, csrf)
+	defer lo.Body.Close()
+	if lo.StatusCode != http.StatusBadRequest {
+		t.Fatalf("edit loopback zone = %d, want 400", lo.StatusCode)
 	}
 }
 

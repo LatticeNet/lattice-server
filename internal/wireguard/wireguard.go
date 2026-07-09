@@ -9,6 +9,7 @@
 package wireguard
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -44,6 +45,8 @@ type Interface struct {
 	Name       string
 	Address    string // mesh address, e.g. 10.66.0.1/24
 	ListenPort int
+	MTU        int      // rendered only when > 0
+	DNS        []string // resolver IPs; rendered only when non-empty
 }
 
 // Peer is one [Peer] section.
@@ -115,17 +118,31 @@ func GenerateConfig(iface Interface, peers []Peer) (string, error) {
 	if _, _, err := net.ParseCIDR(iface.Address); err != nil {
 		return "", fmt.Errorf("invalid interface address %q: %w", iface.Address, err)
 	}
+	if iface.MTU != 0 && (iface.MTU < 576 || iface.MTU > 9000) {
+		return "", fmt.Errorf("invalid mtu %d", iface.MTU)
+	}
+	for _, dns := range iface.DNS {
+		if net.ParseIP(dns) == nil {
+			return "", fmt.Errorf("invalid dns address %q", dns)
+		}
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "[Interface]\n")
 	fmt.Fprintf(&b, "Address = %s\n", iface.Address)
 	fmt.Fprintf(&b, "ListenPort = %d\n", iface.ListenPort)
 	fmt.Fprintf(&b, "PrivateKey = %s\n", PrivateKeyPlaceholder)
+	if iface.MTU > 0 {
+		fmt.Fprintf(&b, "MTU = %d\n", iface.MTU)
+	}
+	if len(iface.DNS) > 0 {
+		fmt.Fprintf(&b, "DNS = %s\n", strings.Join(iface.DNS, ", "))
+	}
 	for _, p := range peers {
 		if !ValidatePublicKey(p.PublicKey) {
 			return "", fmt.Errorf("invalid public key for peer %q", p.Name)
 		}
-		if _, _, err := net.ParseCIDR(p.AllowedIPs); err != nil {
-			return "", fmt.Errorf("invalid allowed ips %q: %w", p.AllowedIPs, err)
+		if err := validateAllowedIPs(p.AllowedIPs); err != nil {
+			return "", fmt.Errorf("peer %q: %w", p.Name, err)
 		}
 		if err := validateEndpoint(p.Endpoint); err != nil {
 			return "", fmt.Errorf("peer %q: %w", p.Name, err)
@@ -144,6 +161,23 @@ func GenerateConfig(iface Interface, peers []Peer) (string, error) {
 		}
 	}
 	return b.String(), nil
+}
+
+// validateAllowedIPs accepts one or more comma-separated CIDRs. A hub may
+// advertise additive routes beyond its own pinned host route, so this is no
+// longer a single-value field; every element must still parse as a CIDR so
+// nothing operator-influenced reaches the config uncanonicalized.
+func validateAllowedIPs(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return errors.New("empty allowed ips")
+	}
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if _, _, err := net.ParseCIDR(part); err != nil {
+			return fmt.Errorf("invalid allowed ips %q: %w", part, err)
+		}
+	}
+	return nil
 }
 
 func validateEndpoint(ep string) error {

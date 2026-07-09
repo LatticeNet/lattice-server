@@ -3,7 +3,7 @@ module github.com/LatticeNet/lattice-server
 go 1.26
 
 require (
-	github.com/LatticeNet/lattice-sdk v0.2.17-0.20260709050800-d0f6124704ec
+	github.com/LatticeNet/lattice-sdk v0.2.17-0.20260709055807-30d4d08e6fa8
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/descope/virtualwebauthn v1.0.5
 	github.com/go-webauthn/webauthn v0.17.4

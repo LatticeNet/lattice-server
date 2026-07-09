@@ -878,8 +878,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/group-policies/plan", s.withAuth("netpolicy:admin", s.handleGroupPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/matrix", s.withAuth("netpolicy:read", s.handleNetPolicyMatrix))
 	mux.HandleFunc("/api/netguard/groups", s.withAuth("netguard:read", s.handleNetGuardGroups))
+	mux.HandleFunc("/api/netguard/groups/delete", s.withAuth("netguard:admin", s.handleDeleteSecurityGroup))
 	mux.HandleFunc("/api/netguard/zones", s.withAuth("netguard:read", s.handleNetGuardZones))
+	mux.HandleFunc("/api/netguard/zones/delete", s.withAuth("netguard:admin", s.handleDeleteGuardZone))
 	mux.HandleFunc("/api/netguard/nodes", s.withAuth("netguard:read", s.handleNetGuardNodes))
+	mux.HandleFunc("/api/netguard/bindings", s.withAuth("", s.handleNetGuardBindings))
+	mux.HandleFunc("/api/netguard/nodes/adopt", s.withAuth("", s.handleNetGuardAdopt))
+	mux.HandleFunc("/api/netguard/plan", s.withAuth("", s.handleNetGuardPlan))
 	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("network:plan", s.handleWireGuardPlan))
 	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
 	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))
@@ -4811,17 +4816,7 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 			"cloudflared --config /etc/cloudflared/config.yml ingress validate\n" +
 			"systemctl reload cloudflared 2>/dev/null || systemctl restart cloudflared 2>/dev/null || echo 'config written; start cloudflared manually'\n"
 	case "wireguard":
-		return "set -e\n" +
-			"umask 077\n" +
-			"mkdir -p /etc/wireguard\n" +
-			"KEY_FILE=${LATTICE_WG_KEY:-/etc/wireguard/lattice.key}\n" +
-			"if [ ! -f \"$KEY_FILE\" ]; then echo \"missing wireguard private key at $KEY_FILE\" >&2; exit 1; fi\n" +
-			"PRIV=$(cat \"$KEY_FILE\")\n" +
-			heredocWrite("/etc/wireguard/wg0.conf.new", "LATTICE_WG_EOF", approval.Plan) +
-			"sed -i \"s|" + wireguard.PrivateKeyPlaceholder + "|$PRIV|\" /etc/wireguard/wg0.conf.new\n" +
-			"mv /etc/wireguard/wg0.conf.new /etc/wireguard/wg0.conf\n" +
-			"wg-quick down wg0 2>/dev/null || true\n" +
-			"wg-quick up wg0\n"
+		return wireguardApplyScript(approval.Plan, serverURL)
 	case "nftpolicy":
 		payload, err := nftPolicyApprovalPayload(approval, serverURL)
 		if err != nil {
@@ -5054,6 +5049,128 @@ func nftPolicyApplyScript(plan, serverURL string, domainSets []nftPolicyDomainSe
 		"echo 'lattice nftpolicy: applied and verified'\n"
 }
 
+// applyWatchdogWindowSec is the dead-man window every host-mutating apply arms
+// before committing. If the operator's own control path is severed by the
+// change, the detached watchdog restores the snapshot after this many seconds.
+// It is a single named constant so the nft, nftpolicy, selfdns, and wireguard
+// paths cannot drift apart.
+const applyWatchdogWindowSec = 60
+
+// wireguardApplyScript gives WireGuard the same dead-man protection the nft
+// paths have had: validate the candidate, snapshot the live config, arm a
+// detached watchdog, commit, verify the control plane is still reachable, then
+// disarm. A bad wg0.conf used to strand a node with no way back (the interface
+// carrying the agent's own route could go down and nothing would restore it).
+//
+// Peer-only changes take a `wg syncconf` fast path so established tunnels do
+// not flap; interface-level changes (address, listen port, MTU) still require
+// a full down/up, which is why the candidate is compared block-by-block first.
+func wireguardApplyScript(plan, serverURL string) string {
+	serverURL = strings.TrimRight(serverURL, "/")
+	selfcheck := "echo 'lattice wireguard: control-plane selfcheck skipped because public_url is unset' >&2\n"
+	done := "echo \"lattice wireguard: applied via $MODE; control-plane selfcheck skipped\"\n"
+	if serverURL != "" {
+		selfcheck = "AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
+			"\"$AGENT_BIN\" --selfcheck-controlplane -server " + shellQuote(serverURL) + "\n"
+		done = "echo \"lattice wireguard: applied via $MODE and verified\"\n"
+	}
+	return "set -e\n" +
+		"umask 077\n" +
+		"mkdir -p /etc/wireguard\n" +
+		"KEY_FILE=${LATTICE_WG_KEY:-/etc/wireguard/lattice.key}\n" +
+		"if [ ! -f \"$KEY_FILE\" ]; then echo \"missing wireguard private key at $KEY_FILE\" >&2; exit 1; fi\n" +
+		"PRIV=$(cat \"$KEY_FILE\")\n" +
+		"CANDIDATE=/etc/wireguard/wg0.conf.new\n" +
+		"ACTIVE=/etc/wireguard/wg0.conf\n" +
+		"ROLLBACK=/etc/wireguard/wg0.rollback.conf\n" +
+		"STRIPPED=/etc/wireguard/wg0.stripped.conf\n" +
+		heredocWrite("$CANDIDATE", "LATTICE_WG_EOF", plan) +
+		"sed -i \"s|" + wireguard.PrivateKeyPlaceholder + "|$PRIV|\" \"$CANDIDATE\"\n" +
+		// Parse the candidate before it can touch the kernel. This is the
+		// wg-quick analogue of `nft -c`.
+		"wg-quick strip \"$CANDIDATE\" > /dev/null\n" +
+		"HAD_ACTIVE=0\n" +
+		"if [ -f \"$ACTIVE\" ]; then cp \"$ACTIVE\" \"$ROLLBACK\"; HAD_ACTIVE=1; else rm -f \"$ROLLBACK\"; fi\n" +
+		"iface_block() { awk 'BEGIN{p=1} /^[[:space:]]*\\[Peer\\]/{p=0} p{print}' \"$1\"; }\n" +
+		wireguardRollbackWatchdogScript() +
+		// $STRIPPED carries the substituted private key. Clear it on every exit
+		// path, not just the happy one, so a failed syncconf cannot leave key
+		// material behind.
+		"trap 'rollback; cleanup_watchdog; rm -f \"$STRIPPED\"' ERR\n" +
+		"start_watchdog\n" +
+		"MODE=restart\n" +
+		"if [ \"$HAD_ACTIVE\" = 1 ] && wg show wg0 >/dev/null 2>&1 && " +
+		"[ \"$(iface_block \"$ACTIVE\")\" = \"$(iface_block \"$CANDIDATE\")\" ]; then\n" +
+		"  MODE=syncconf\n" +
+		"fi\n" +
+		"mv \"$CANDIDATE\" \"$ACTIVE\"\n" +
+		"if [ \"$MODE\" = syncconf ]; then\n" +
+		"  wg-quick strip \"$ACTIVE\" > \"$STRIPPED\"\n" +
+		"  wg syncconf wg0 \"$STRIPPED\"\n" +
+		"  rm -f \"$STRIPPED\"\n" +
+		"else\n" +
+		"  wg-quick down wg0 2>/dev/null || true\n" +
+		"  wg-quick up wg0\n" +
+		"fi\n" +
+		selfcheck +
+		"assert_watchdog_clean\n" +
+		"trap - ERR\n" +
+		"cleanup_watchdog\n" +
+		"rm -f \"$ROLLBACK\"\n" +
+		done
+}
+
+// wireguardRollbackWatchdogScript mirrors nftRollbackWatchdogScript, but its
+// rollback restores the previous wg0.conf and re-establishes the interface (or
+// tears it down when there was no prior config), because `nft -f` has no
+// meaning for WireGuard state.
+func wireguardRollbackWatchdogScript() string {
+	window := strconv.Itoa(applyWatchdogWindowSec)
+	const fired = "lattice wireguard: watchdog rollback fired"
+	const rolling = "lattice wireguard: rolling back wg0 configuration"
+	// restoreBody runs both in-process (rollback) and inside the detached
+	// watchdog child, which receives the paths as positional parameters.
+	restore := "if [ -f \"$1\" ]; then cp \"$1\" \"$2\" 2>/dev/null || true; " +
+		"wg-quick down wg0 2>/dev/null || true; wg-quick up wg0 2>/dev/null || true; " +
+		"else wg-quick down wg0 2>/dev/null || true; rm -f \"$2\"; fi"
+	return "WATCHDOG=\n" +
+		"WATCHDOG_FIRED=/tmp/lattice-wireguard-watchdog.$$\n" +
+		"cleanup_watchdog() {\n" +
+		"  if [ -n \"$WATCHDOG\" ]; then\n" +
+		"    kill \"$WATCHDOG\" 2>/dev/null || true\n" +
+		"    wait \"$WATCHDOG\" 2>/dev/null || true\n" +
+		"  fi\n" +
+		"  rm -f \"$WATCHDOG_FIRED\"\n" +
+		"}\n" +
+		"rollback() {\n" +
+		"  echo '" + rolling + "' >&2\n" +
+		"  sh -c '" + restore + "' sh \"$ROLLBACK\" \"$ACTIVE\"\n" +
+		"}\n" +
+		"start_watchdog() {\n" +
+		"  if command -v setsid >/dev/null 2>&1; then\n" +
+		"    setsid sh -c 'sleep " + window + "; echo \"" + fired + "\" >&2; touch \"$1\" 2>/dev/null || true; " +
+		"echo \"" + rolling + "\" >&2; " + restoreShiftedBody(restore) + "' sh \"$WATCHDOG_FIRED\" \"$ROLLBACK\" \"$ACTIVE\" &\n" +
+		"  else\n" +
+		"    ( sleep " + window + "; echo '" + fired + "' >&2; touch \"$WATCHDOG_FIRED\" 2>/dev/null || true; rollback ) &\n" +
+		"  fi\n" +
+		"  WATCHDOG=$!\n" +
+		"}\n" +
+		"assert_watchdog_clean() {\n" +
+		"  if [ -f \"$WATCHDOG_FIRED\" ]; then\n" +
+		"    echo '" + fired + " before commit; refusing to mark apply verified' >&2\n" +
+		"    false\n" +
+		"  fi\n" +
+		"}\n"
+}
+
+// restoreShiftedBody rewrites the restore body's positional parameters for the
+// detached watchdog child, whose $1 is the fired-marker path, so $ROLLBACK and
+// $ACTIVE land on $2 and $3.
+func restoreShiftedBody(restore string) string {
+	shifted := strings.ReplaceAll(restore, "\"$2\"", "\"$3\"")
+	return strings.ReplaceAll(shifted, "\"$1\"", "\"$2\"")
+}
+
 func nftRollbackWatchdogScript(name, firedMessage, rollbackMessage string) string {
 	return "WATCHDOG=\n" +
 		"WATCHDOG_FIRED=/tmp/lattice-" + name + "-watchdog.$$\n" +
@@ -5070,9 +5187,9 @@ func nftRollbackWatchdogScript(name, firedMessage, rollbackMessage string) strin
 		"}\n" +
 		"start_watchdog() {\n" +
 		"  if command -v setsid >/dev/null 2>&1; then\n" +
-		"    setsid sh -c 'sleep 60; echo \"" + firedMessage + "\" >&2; touch \"$1\" 2>/dev/null || true; echo \"" + rollbackMessage + "\" >&2; nft -f \"$2\" 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$ROLLBACK\" &\n" +
+		"    setsid sh -c 'sleep " + strconv.Itoa(applyWatchdogWindowSec) + "; echo \"" + firedMessage + "\" >&2; touch \"$1\" 2>/dev/null || true; echo \"" + rollbackMessage + "\" >&2; nft -f \"$2\" 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$ROLLBACK\" &\n" +
 		"  else\n" +
-		"    ( sleep 60; echo '" + firedMessage + "' >&2; touch \"$WATCHDOG_FIRED\" 2>/dev/null || true; rollback ) &\n" +
+		"    ( sleep " + strconv.Itoa(applyWatchdogWindowSec) + "; echo '" + firedMessage + "' >&2; touch \"$WATCHDOG_FIRED\" 2>/dev/null || true; rollback ) &\n" +
 		"  fi\n" +
 		"  WATCHDOG=$!\n" +
 		"}\n" +

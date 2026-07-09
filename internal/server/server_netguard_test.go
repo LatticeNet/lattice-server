@@ -210,6 +210,68 @@ func TestNetGuardStoredBindingSupersedesLegacyView(t *testing.T) {
 	}
 }
 
+func TestNetGuardGlobalCatalogRejectsRestrictedToken(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	enrollNamedNode(t, handler, cookies, csrf, "node-b", "Node B")
+
+	for _, nodeID := range []string{"node-a", "node-b"} {
+		save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+			`{"node_id":"`+nodeID+`","public_tcp":[22]}`, cookies, csrf)
+		save.Body.Close()
+		if save.StatusCode != http.StatusOK {
+			t.Fatalf("save nft inputs for %s failed: %d", nodeID, save.StatusCode)
+		}
+	}
+
+	token := createPAT(t, handler, cookies, csrf,
+		[]string{"netguard:read", "netguard:admin", "network:plan"},
+		[]string{"node-a"})
+
+	nodesRes := doBearerJSON(t, handler, http.MethodGet, "/api/netguard/nodes", "", token)
+	defer nodesRes.Body.Close()
+	if nodesRes.StatusCode != http.StatusOK {
+		t.Fatalf("restricted node view = %d, want 200", nodesRes.StatusCode)
+	}
+	var nodes netGuardNodesResponse
+	if err := json.NewDecoder(nodesRes.Body).Decode(&nodes); err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes.Nodes) != 1 || nodes.Nodes[0].NodeID != "node-a" {
+		t.Fatalf("restricted node view leaked nodes: %+v", nodes.Nodes)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{name: "list groups", method: http.MethodGet, path: "/api/netguard/groups"},
+		{name: "create group", method: http.MethodPost, path: "/api/netguard/groups", body: `{"id":"sg-a","name":"a"}`},
+		{name: "list zones", method: http.MethodGet, path: "/api/netguard/zones"},
+		{name: "create zone", method: http.MethodPost, path: "/api/netguard/zones", body: `{"id":"tail","name":"tail","interfaces":["tailscale0"]}`},
+	} {
+		res := doBearerJSON(t, handler, tc.method, tc.path, tc.body, token)
+		res.Body.Close()
+		if res.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s with restricted token = %d, want 403", tc.name, res.StatusCode)
+		}
+	}
+
+	adoptA := doBearerJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, token)
+	defer adoptA.Body.Close()
+	if adoptA.StatusCode != http.StatusOK {
+		t.Fatalf("restricted token should adopt node-a, got %d", adoptA.StatusCode)
+	}
+	adoptB := doBearerJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-b"}`, token)
+	defer adoptB.Body.Close()
+	if adoptB.StatusCode != http.StatusForbidden {
+		t.Fatalf("restricted token must not adopt node-b, got %d", adoptB.StatusCode)
+	}
+}
+
 // End-to-end G2: adopt a legacy node, then plan from the new model. The plan
 // must be a lattice_guard ruleset carried by an `nft` approval so it rides the
 // existing rollback-protected apply script unchanged.

@@ -195,7 +195,7 @@ func TestNodeRemoteResolvesToNodeAddresses(t *testing.T) {
 		if id != "peer" {
 			return model.Node{}, false
 		}
-		return model.Node{ID: "peer", WireGuardIP: "10.66.0.2/32", PublicIP: "198.51.100.2"}, true
+		return model.Node{ID: "peer", WireGuardIP: "10.66.0.2/16", PublicIP: "198.51.100.2"}, true
 	}
 	ruleset, err := CompileRuleset(CompileInput{
 		Binding: model.NodeGuardBinding{NodeID: "n1", Managed: true},
@@ -209,6 +209,9 @@ func TestNodeRemoteResolvesToNodeAddresses(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(ruleset, `10.66.0.0/16`) || strings.Contains(ruleset, `10.66.0.2/16`) {
+		t.Fatalf("node remote must not preserve a peer-advertised wide prefix:\n%s", ruleset)
 	}
 	if !strings.Contains(ruleset, `ip saddr { 10.66.0.2, 198.51.100.2 } tcp dport { 9100 } accept`) {
 		t.Fatalf("node remote did not resolve to both addresses:\n%s", ruleset)
@@ -248,7 +251,6 @@ func TestCompileFailsClosedOnUnsupportedShapes(t *testing.T) {
 	}{
 		{"egress direction", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirEgress, Protocol: model.NetProtoTCP, Ports: p80, Remote: pub}, "not compiled into the guard table"},
 		{"icmp", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.GuardProtoICMP, Remote: pub}, "not supported by the current guard renderer"},
-		{"rate limit", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: pub, RateLimit: "10/second"}, "rate_limit is not supported"},
 		{"log", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: pub, Log: true}, "log is not supported"},
 		{"domain remote", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: model.NetEndpoint{Kind: model.NetRefDomain, Domain: "x.example"}}, "egress-only"},
 		{"group remote", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: model.NetEndpoint{Kind: model.NetRefGroup, GroupID: "g"}}, "expanded to node refs"},

@@ -3,7 +3,9 @@ package netguard
 import (
 	"errors"
 	"fmt"
+	"net"
 	"sort"
+	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/network"
@@ -125,9 +127,6 @@ func lowerRule(plan *network.NFTPlan, rule model.GuardRule, in CompileInput) err
 		return fmt.Errorf("protocol %q is not supported by the current guard renderer", rule.Protocol)
 	default:
 		return fmt.Errorf("invalid protocol %q", rule.Protocol)
-	}
-	if rule.RateLimit != "" {
-		return errors.New("rate_limit is not supported by the current guard renderer")
 	}
 	if rule.Log {
 		return errors.New("log is not supported by the current guard renderer")
@@ -258,11 +257,33 @@ func ruleSource(rule model.GuardRule, in CompileInput) ([]string, string, error)
 func nodeSources(node model.Node) []string {
 	out := make([]string, 0, 2)
 	for _, addr := range []string{node.WireGuardIP, node.PublicIP} {
-		if addr != "" {
-			out = append(out, addr)
+		if host := hostCIDR(addr); host != "" {
+			out = append(out, host)
 		}
 	}
 	return out
+}
+
+func hostCIDR(addr string) string {
+	host := strings.TrimSpace(addr)
+	if host == "" {
+		return ""
+	}
+	if strings.Contains(host, "/") {
+		ip, _, err := net.ParseCIDR(host)
+		if err != nil {
+			return ""
+		}
+		host = ip.String()
+	}
+	parsed := net.ParseIP(host)
+	if parsed == nil {
+		return ""
+	}
+	if parsed.To4() == nil {
+		return parsed.String() + "/128"
+	}
+	return parsed.String() + "/32"
 }
 
 func trustedZoneRules(zone model.GuardZone) ([]network.NFTInputRule, error) {

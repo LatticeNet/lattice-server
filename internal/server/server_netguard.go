@@ -48,6 +48,9 @@ var guardIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 func (s *Server) handleNetGuardGroups(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
+		if !s.requireGlobalNetGuardScope(w, p, "netguard:read") {
+			return
+		}
 	case http.MethodPost:
 		s.handleUpsertSecurityGroup(w, r, p)
 		return
@@ -79,6 +82,9 @@ func (s *Server) handleNetGuardGroups(w http.ResponseWriter, r *http.Request, p 
 func (s *Server) handleNetGuardZones(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
+		if !s.requireGlobalNetGuardScope(w, p, "netguard:read") {
+			return
+		}
 	case http.MethodPost:
 		s.handleUpsertGuardZone(w, r, p)
 		return
@@ -174,6 +180,27 @@ func (s *Server) nodeName(nodeID string) string {
 	return ""
 }
 
+func (s *Server) requireGlobalNetGuardScope(w http.ResponseWriter, p principal, scope string) bool {
+	if !s.requireScope(w, p, scope) {
+		return false
+	}
+	if !principalHasNodeRestriction(p) {
+		return true
+	}
+	s.recordAudit(model.AuditEvent{
+		ID:            id.New("audit"),
+		ActorID:       p.ActorID,
+		TokenID:       p.TokenID,
+		Action:        "authorize.scope",
+		Scope:         scope,
+		Decision:      "deny",
+		Reason:        "global netguard objects require an unrestricted server allowlist",
+		CorrelationID: p.CorrelationID,
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+	return false
+}
+
 // resolveNodeZones builds the zone map used to compile one node. Zones are
 // fleet-scoped by name but resolve per-node facts: the "public" zone means
 // *this* node's public interface, the "wireguard" zone means *this* node's
@@ -238,8 +265,7 @@ func (s *Server) compileInputFor(nodeID string) (netguard.CompileInput, error) {
 }
 
 func (s *Server) handleUpsertSecurityGroup(w http.ResponseWriter, r *http.Request, p principal) {
-	if !rbac.Allows(p.Principal, "netguard:admin", "") {
-		writeError(w, http.StatusForbidden, errors.New("netguard:admin is required"))
+	if !s.requireGlobalNetGuardScope(w, p, "netguard:admin") {
 		return
 	}
 	var req model.SecurityGroup
@@ -313,8 +339,7 @@ func (s *Server) handleDeleteSecurityGroup(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if !rbac.Allows(p.Principal, "netguard:admin", "") {
-		writeError(w, http.StatusForbidden, errors.New("netguard:admin is required"))
+	if !s.requireGlobalNetGuardScope(w, p, "netguard:admin") {
 		return
 	}
 	var req struct {
@@ -348,8 +373,7 @@ func (s *Server) handleDeleteSecurityGroup(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleUpsertGuardZone(w http.ResponseWriter, r *http.Request, p principal) {
-	if !rbac.Allows(p.Principal, "netguard:admin", "") {
-		writeError(w, http.StatusForbidden, errors.New("netguard:admin is required"))
+	if !s.requireGlobalNetGuardScope(w, p, "netguard:admin") {
 		return
 	}
 	var req model.GuardZone
@@ -396,8 +420,7 @@ func (s *Server) handleDeleteGuardZone(w http.ResponseWriter, r *http.Request, p
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if !rbac.Allows(p.Principal, "netguard:admin", "") {
-		writeError(w, http.StatusForbidden, errors.New("netguard:admin is required"))
+	if !s.requireGlobalNetGuardScope(w, p, "netguard:admin") {
 		return
 	}
 	var req struct {

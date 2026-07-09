@@ -62,6 +62,8 @@ var KnownScopes = map[string]struct{}{
 	"log:write":       {},
 	"monitor:admin":   {},
 	"monitor:read":    {},
+	"netguard:admin":  {},
+	"netguard:read":   {},
 	"netpolicy:admin": {},
 	"netpolicy:read":  {},
 	"network:apply":   {},

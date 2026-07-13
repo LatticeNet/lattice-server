@@ -153,103 +153,16 @@ func TestValidateManifestAcceptsScopedCustomPluginSectionAndNestedRoute(t *testi
 	}
 }
 
-func TestValidateManifestAcceptsOwnedBuiltinView(t *testing.T) {
+func TestValidateManifestRejectsBuiltinView(t *testing.T) {
 	err := ValidateManifest(Manifest{
-		ID:           "latticenet.vpn-core",
-		Name:         "vpn-core",
-		Type:         TypeSystem,
-		Capabilities: []string{"node:read", "network:plan", "network:apply", "task:run"},
-		UI: &ManifestUI{
-			Nav: []NavContribution{{
-				Section: "vpn-manage", SectionTitle: "VPN Manage", Title: "Users",
-				Route: "users", Icon: "Users", Scopes: []string{"proxy:read"},
-			}},
-			Views: []ViewContribution{{
-				Route: "users", Title: "Users", Kind: "builtin", ComponentKey: "proxy.users",
-			}},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestValidateManifestAcceptsOfficialNetworkSecurityBuiltins(t *testing.T) {
-	for _, tc := range []struct {
-		id           string
-		name         string
-		title        string
-		route        string
-		icon         string
-		componentKey string
-	}{
-		{
-			id:           "latticenet.netguard",
-			name:         "netguard (nftables security groups)",
-			title:        "Firewall",
-			route:        "firewall",
-			icon:         "Shield",
-			componentKey: "netguard.firewall",
-		},
-		{
-			id:           "latticenet.wireguard",
-			name:         "wireguard (VPN networks)",
-			title:        "Networks",
-			route:        "networks",
-			icon:         "Spline",
-			componentKey: "wireguard.networks",
-		},
-	} {
-		t.Run(tc.id, func(t *testing.T) {
-			err := ValidateManifest(Manifest{
-				ID:           tc.id,
-				Name:         tc.name,
-				Type:         TypeSystem,
-				Capabilities: []string{"node:read", "network:plan", "network:apply", "task:run"},
-				UI: &ManifestUI{
-					Nav: []NavContribution{{
-						Section: "network-security", SectionTitle: "Network Security", Title: tc.title,
-						Route: tc.route, Icon: tc.icon, Scopes: []string{"network:plan"},
-					}},
-					Views: []ViewContribution{{
-						Route: tc.route, Title: tc.title, Kind: "builtin", ComponentKey: tc.componentKey,
-					}},
-				},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func TestValidateManifestRejectsForeignBuiltinView(t *testing.T) {
-	err := ValidateManifest(Manifest{
-		ID:           "other-plugin",
-		Name:         "Other Plugin",
-		Type:         TypeSystem,
+		ID: "legacy-ui", Name: "Legacy UI", Type: TypeSystem,
 		Capabilities: []string{"node:read"},
 		UI: &ManifestUI{Views: []ViewContribution{{
-			Route: "users", Title: "Users", Kind: "builtin", ComponentKey: "proxy.users",
+			Route: "nodes", Title: "Nodes", Kind: "builtin",
 		}}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "builtin component") {
-		t.Fatalf("expected foreign builtin component rejection, got %v", err)
-	}
-}
-
-func TestValidateManifestRejectsComponentKeyOnNonBuiltinView(t *testing.T) {
-	err := ValidateManifest(Manifest{
-		ID:           "table-ui",
-		Name:         "Table UI",
-		Type:         TypeSystem,
-		Capabilities: []string{"node:read"},
-		UI: &ManifestUI{Views: []ViewContribution{{
-			Route: "nodes", Title: "Nodes", Kind: "table", ComponentKey: "proxy.users",
-		}}},
-	})
-	if err == nil || !strings.Contains(err.Error(), "component_key requires builtin") {
-		t.Fatalf("expected non-builtin component_key rejection, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "view kind") {
+		t.Fatalf("expected builtin view rejection, got %v", err)
 	}
 }
 

@@ -149,6 +149,16 @@ func (r *RPCRegistry) Services() []RPCServiceDescriptor {
 	return out
 }
 
+// Owns reports whether service is registered by ownerPluginID. The dashboard
+// gateway uses this exact owner check before dispatching a v2 plugin call to an
+// in-core implementation; a manifest cannot claim another plugin's service.
+func (r *RPCRegistry) Owns(ownerPluginID, service string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	svc := r.services[service]
+	return svc != nil && svc.owner == ownerPluginID
+}
+
 // CallOperator dispatches a service method on behalf of the OPERATOR (the
 // dashboard gateway), bypassing the plugin->plugin directed allow-list — the
 // HTTP layer has already enforced the interface's declared RBAC scopes + audit.

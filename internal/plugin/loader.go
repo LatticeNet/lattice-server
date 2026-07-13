@@ -80,6 +80,9 @@ func (l Loader) Load() ([]Loaded, []LoadOutcome, error) {
 	}
 	var loaded []Loaded
 	var outcomes []LoadOutcome
+	var verified []Loaded
+	var verifiedOutcomeIndexes []int
+	verifiedCounts := map[string]int{}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -90,8 +93,19 @@ func (l Loader) Load() ([]Loaded, []LoadOutcome, error) {
 			outcomes = append(outcomes, LoadOutcome{BundlePath: bundle, Loaded: false, Reason: err.Error()})
 			continue
 		}
-		loaded = append(loaded, got)
 		outcomes = append(outcomes, LoadOutcome{BundlePath: bundle, PluginID: got.Manifest.ID, Loaded: true})
+		verified = append(verified, got)
+		verifiedOutcomeIndexes = append(verifiedOutcomeIndexes, len(outcomes)-1)
+		verifiedCounts[got.Manifest.ID]++
+	}
+	for i, got := range verified {
+		if verifiedCounts[got.Manifest.ID] > 1 {
+			outcome := &outcomes[verifiedOutcomeIndexes[i]]
+			outcome.Loaded = false
+			outcome.Reason = fmt.Sprintf("duplicate plugin id %q", got.Manifest.ID)
+			continue
+		}
+		loaded = append(loaded, got)
 	}
 	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Manifest.ID < loaded[j].Manifest.ID })
 	return loaded, outcomes, nil

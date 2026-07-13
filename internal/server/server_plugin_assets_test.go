@@ -153,9 +153,9 @@ func TestPluginContributionsV2ExposeOnlySafeRuntimeMetadata(t *testing.T) {
 	}
 }
 
-func TestPluginCallV2NeverFallsBackToInCoreRPC(t *testing.T) {
+func TestPluginCallV2DoesNotUseCoreServiceOwnedByAnotherPlugin(t *testing.T) {
 	srv, handler, cookies, csrf, _ := newPluginAssetTestServer(t)
-	if err := srv.pluginRPC.Register("test.assets", "test.assets/items", "core", []string{"list"}, func(context.Context, string, []byte) ([]byte, error) {
+	if err := srv.pluginRPC.Register("another.plugin", "test.assets/items", "core", []string{"list"}, func(context.Context, string, []byte) ([]byte, error) {
 		return []byte(`{"source":"core"}`), nil
 	}); err != nil {
 		t.Fatal(err)
@@ -172,7 +172,7 @@ func TestPluginCallV2NeverFallsBackToInCoreRPC(t *testing.T) {
 	body, _ := io.ReadAll(res.Body)
 	res.Body.Close()
 	if res.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"source":"runtime"`)) || bytes.Contains(body, []byte(`"source":"core"`)) {
-		t.Fatalf("v2 call did not stay on runtime: status=%d body=%s", res.StatusCode, body)
+		t.Fatalf("v2 call used a core service owned by another plugin: status=%d body=%s", res.StatusCode, body)
 	}
 }
 

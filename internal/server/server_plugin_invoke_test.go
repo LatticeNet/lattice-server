@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -310,6 +311,116 @@ func TestPluginCallV2UsesExactMethodScopes(t *testing.T) {
 	}
 }
 
+func TestPluginCallV2DispatchesOwnedCoreService(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "test.v2-owned", Name: "V2 owned", Type: plugin.TypeSystem,
+		Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.v2-owned/items",
+			MethodSpecs: []plugin.InterfaceMethod{{
+				Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"},
+			}},
+		}},
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID: manifest.ID, Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		store:     st,
+		plugins:   []plugin.Loaded{{Manifest: manifest}},
+		pluginRPC: plugin.NewRPCRegistry(),
+	}
+	if err := srv.pluginRPC.Register(manifest.ID, "test.v2-owned/items", "v1", []string{"list"},
+		func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+			return []byte(`{"rows":[{"id":"from-core"}]}`), nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(
+		`{"id":"test.v2-owned","service":"test.v2-owned/items","method":"list"}`,
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owned v2 core service: want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "from-core") {
+		t.Fatalf("owned v2 call did not reach core service: %s", rec.Body.String())
+	}
+}
+
+func TestPluginCallV2DoesNotDispatchCoreServiceForForeignPublisher(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "test.v2-foreign", Name: "V2 foreign", Type: plugin.TypeSystem,
+		Publisher: "other",
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.v2-foreign/items",
+			MethodSpecs: []plugin.InterfaceMethod{{
+				Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"},
+			}},
+		}},
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID: manifest.ID, Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	srv := &Server{
+		store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(),
+	}
+	if err := srv.pluginRPC.Register(manifest.ID, "test.v2-foreign/items", "v1", []string{"list"},
+		func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+			called = true
+			return []byte(`{"rows":[]}`), nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(
+		`{"id":"test.v2-foreign","service":"test.v2-foreign/items","method":"list"}`,
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("foreign publisher must not reach core service: got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if called {
+		t.Fatal("foreign publisher reached an in-core RPC handler")
+	}
+}
+
+func TestPluginGatewayGlobalNetworkScopesRequireUnrestrictedPrincipal(t *testing.T) {
+	restricted := principal{Principal: rbac.Principal{
+		Scopes:          []string{"node:read", "network:plan", "network:apply", "netguard:read", "netguard:admin"},
+		ServerAllowlist: []string{"node-a"},
+	}}
+	for _, scope := range []string{"node:read", "network:plan", "network:apply", "netguard:read", "netguard:admin"} {
+		if ok, _ := pluginGatewayScopeAllowed(restricted, scope); ok {
+			t.Fatalf("restricted principal must not use global plugin scope %q", scope)
+		}
+	}
+	unrestricted := principal{Principal: rbac.Principal{Scopes: []string{"node:read", "network:plan", "network:apply", "netguard:read", "netguard:admin"}}}
+	for _, scope := range []string{"node:read", "network:plan", "network:apply", "netguard:read", "netguard:admin"} {
+		if ok, reason := pluginGatewayScopeAllowed(unrestricted, scope); !ok {
+			t.Fatalf("unrestricted principal should use scope %q: %s", scope, reason)
+		}
+	}
+}
+
 func TestExtractOperatorTargetsRequiresDeclaredPayloadField(t *testing.T) {
 	targets, err := extractOperatorTargets(json.RawMessage(`{"base_url":"https://10.0.0.5/secret"}`), []string{"base_url"})
 	if err != nil || len(targets) != 1 || targets[0] != "https://10.0.0.5/secret" {
@@ -324,69 +435,5 @@ func TestExtractOperatorTargetsRequiresDeclaredPayloadField(t *testing.T) {
 		if _, err := extractOperatorTargets(payload, []string{"base_url"}); err == nil {
 			t.Fatalf("payload %s must not mint an operator target", payload)
 		}
-	}
-}
-
-func TestPluginContributionsHideBuiltinViewWithoutNavScope(t *testing.T) {
-	pluginRoot := t.TempDir()
-	manifest := plugin.Manifest{
-		ID: "latticenet.vpn-core", Name: "vpn-core", Type: "system", Version: "0.1.0",
-		Capabilities: []string{"node:read"},
-		UI: &plugin.ManifestUI{
-			Nav: []plugin.NavContribution{{
-				Section: "vpn-manage", SectionTitle: "VPN Manage", Title: "Users",
-				Route: "users", Icon: "Users", Scopes: []string{"proxy:read"},
-			}},
-			Views: []plugin.ViewContribution{{
-				Route: "users", Title: "Users", Kind: "builtin", ComponentKey: "proxy.users",
-			}},
-		},
-	}
-	writeServerBundle(t, pluginRoot, "latticenet.vpn-core", manifest, []byte("artifact"))
-	st, err := store.Open("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PluginDir: pluginRoot, DisableRenewalScheduler: true})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	handler := srv.Handler()
-	cookies, csrf := loginSession(t, handler)
-	for _, status := range []string{model.PluginStatusInstalled, model.PluginStatusActive} {
-		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle",
-			`{"id":"latticenet.vpn-core","status":"`+status+`"}`, cookies, csrf)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("lifecycle %s: got %d", status, resp.StatusCode)
-		}
-	}
-
-	noProxyToken := createPAT(t, handler, cookies, csrf, []string{"node:read"}, nil)
-	hidden := doBearerJSON(t, handler, http.MethodGet, "/api/plugin-contributions", "", noProxyToken)
-	if hidden.StatusCode != http.StatusOK {
-		t.Fatalf("contributions should remain callable, got %d", hidden.StatusCode)
-	}
-	var hiddenPlugins []pluginView
-	if err := json.NewDecoder(hidden.Body).Decode(&hiddenPlugins); err != nil {
-		t.Fatal(err)
-	}
-	hidden.Body.Close()
-	if len(hiddenPlugins) != 0 {
-		t.Fatalf("source-less builtin view must be hidden when nav scope is missing, got %+v", hiddenPlugins)
-	}
-
-	readToken := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, nil)
-	visible := doBearerJSON(t, handler, http.MethodGet, "/api/plugin-contributions", "", readToken)
-	if visible.StatusCode != http.StatusOK {
-		t.Fatalf("contributions should be visible with proxy:read, got %d", visible.StatusCode)
-	}
-	var visiblePlugins []pluginView
-	if err := json.NewDecoder(visible.Body).Decode(&visiblePlugins); err != nil {
-		t.Fatal(err)
-	}
-	visible.Body.Close()
-	if len(visiblePlugins) != 1 || visiblePlugins[0].UI == nil || len(visiblePlugins[0].UI.Views) != 1 || visiblePlugins[0].UI.Views[0].Kind != "builtin" {
-		t.Fatalf("expected builtin view visible with proxy:read, got %+v", visiblePlugins)
 	}
 }

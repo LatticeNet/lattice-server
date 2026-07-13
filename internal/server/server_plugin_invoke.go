@@ -222,6 +222,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
+	ctx = context.WithValue(ctx, pluginOperatorPrincipalKey{}, p)
 	operatorTargets, err := extractOperatorTargets(req.Payload, methodContract.OperatorTargetFields)
 	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
@@ -231,7 +232,11 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	loaded, loadedOK := s.loadedPlugin(req.ID)
 	var out []byte
 	err = nil
-	if loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2 {
+	if loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2 &&
+		loaded.Manifest.Publisher == "latticenet" && s.pluginRPC != nil &&
+		s.pluginRPC.Owns(req.ID, req.Service) {
+		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(req.Payload))
+	} else if loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2 {
 		out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, req.Payload, operatorTargets)
 	} else if s.pluginRPC == nil {
 		err = errors.New("plugin rpc bus unavailable")
@@ -243,6 +248,13 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	}
 	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
+		var operationErr *pluginOperationError
+		if errors.As(err, &operationErr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(operationErr.StatusCode)
+			_, _ = w.Write(operationErr.Body)
+			return
+		}
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
@@ -387,13 +399,24 @@ func pluginGatewayScopeAllowed(p principal, scope string) (bool, string) {
 		return false, "missing scope " + scope
 	}
 	if pluginGatewayScopeRequiresUnrestrictedAllowlist(scope) && principalHasNodeRestriction(p) {
-		return false, "global proxy plugin views require an unrestricted server allowlist"
+		if strings.HasPrefix(scope, "proxy:") {
+			return false, "global proxy plugin views require an unrestricted server allowlist"
+		}
+		return false, "global network plugin views require an unrestricted server allowlist"
 	}
 	return true, ""
 }
 
 func pluginGatewayScopeRequiresUnrestrictedAllowlist(scope string) bool {
-	return scope == "proxy:*" || scope == "proxy:read" || scope == "proxy:admin"
+	switch scope {
+	case "proxy:*", "proxy:read", "proxy:admin",
+		"node:read", "node:admin",
+		"network:plan", "network:apply",
+		"netguard:read", "netguard:admin":
+		return true
+	default:
+		return false
+	}
 }
 
 // handlePluginInvoke runs one action on an ACTIVE plugin via the runtime (the

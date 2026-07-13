@@ -124,6 +124,23 @@ func TestRPCRegistryServicesDiscovery(t *testing.T) {
 	}
 }
 
+func TestRPCRegistryOwnsRequiresExactOwner(t *testing.T) {
+	r := NewRPCRegistry()
+	h := func(context.Context, string, []byte) ([]byte, error) { return nil, nil }
+	if err := r.Register("owner.plugin", "owner.plugin/nodes", "v1", []string{"list"}, h); err != nil {
+		t.Fatal(err)
+	}
+	if !r.Owns("owner.plugin", "owner.plugin/nodes") {
+		t.Fatal("registered owner must own its service")
+	}
+	if r.Owns("spoof.plugin", "owner.plugin/nodes") {
+		t.Fatal("a different plugin must not inherit service ownership")
+	}
+	if r.Owns("owner.plugin", "missing/service") {
+		t.Fatal("an unknown service must not report ownership")
+	}
+}
+
 func TestRPCRegistryMethodGrantDoesNotExpandWithService(t *testing.T) {
 	r := NewRPCRegistry()
 	if err := r.Register("owner.plugin", "owner.plugin/nodes", "v1", []string{"export", "delete"},

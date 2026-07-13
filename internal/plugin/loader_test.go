@@ -128,6 +128,40 @@ func TestLoaderEmptyAndMissingDir(t *testing.T) {
 	}
 }
 
+func TestLoaderRejectsEveryBundleWithDuplicatePluginID(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	artifact := []byte("duplicate plugin artifact")
+	manifest := signedManifest(t, priv, Manifest{
+		ID: "duplicate.plugin", Name: "Duplicate", Type: TypeSystem, Version: "1.0.0",
+		Entrypoint: "system-go/duplicate", Publisher: "latticenet",
+		Capabilities: []string{"network:plan"},
+	}, artifact)
+	writeBundle(t, root, "first", manifest, artifact)
+	writeBundle(t, root, "second", manifest, artifact)
+
+	loaded, outcomes, err := (Loader{Dir: root, Policy: TrustPolicy{
+		TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": pub},
+	}}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 0 {
+		t.Fatalf("duplicate IDs must fail closed, got %+v", loaded)
+	}
+	if len(outcomes) != 2 {
+		t.Fatalf("expected two duplicate outcomes, got %+v", outcomes)
+	}
+	for _, outcome := range outcomes {
+		if outcome.Loaded || outcome.PluginID != manifest.ID || !strings.Contains(outcome.Reason, "duplicate plugin id") {
+			t.Fatalf("unexpected duplicate outcome: %+v", outcome)
+		}
+	}
+}
+
 func TestLoaderAllowsUnsignedHostRiskOnlyWhenOptedIn(t *testing.T) {
 	root := t.TempDir()
 	artifact := []byte("dev artifact")

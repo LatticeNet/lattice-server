@@ -143,7 +143,6 @@ func TestManifestV2RejectsLegacyAndIncompleteContracts(t *testing.T) {
 		{"missing compatibility", func(m *Manifest) { m.Compatibility = nil }, "compatibility is required"},
 		{"builtin view", func(m *Manifest) {
 			m.UI.Views[0].Kind = "builtin"
-			m.UI.Views[0].ComponentKey = "netguard.firewall"
 		}, "builtin"},
 		{"sandbox without runtime", func(m *Manifest) { m.UIRuntime = nil }, "ui_runtime"},
 		{"unknown effect", func(m *Manifest) { m.Interfaces[0].MethodSpecs[0].Effect = "execute" }, "effect"},

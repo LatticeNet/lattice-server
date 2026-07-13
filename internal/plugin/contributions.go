@@ -19,7 +19,7 @@ import (
 // can never smuggle an unknown renderer, primitive, or target section.
 var (
 	pluginNavSections = map[string]bool{"plugins": true, "proxy": true}
-	pluginViewKinds   = map[string]bool{"table": true, "detail": true, "form": true, "kv": true, "markdown": true, "builtin": true, "sandbox": true}
+	pluginViewKinds   = map[string]bool{"table": true, "detail": true, "form": true, "kv": true, "markdown": true, "sandbox": true}
 	pluginRenderHints = map[string]bool{"": true, "copy-secret": true, "bytes": true, "relative-time": true, "badge": true, "code": true}
 	pluginFormKinds   = map[string]bool{"text": true, "int": true, "select": true}
 	// Icons the dashboard knows (lucide names). Conservative starter set.
@@ -33,21 +33,6 @@ var (
 	pluginKeyRe           = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,48}$`)
 	pluginMethodRe        = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,48}$`)
 	pluginServiceSuffixRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]{0,127}$`)
-	pluginBuiltinViews    = map[string]string{
-		"vpn-core.lines":         "latticenet.vpn-core",
-		"vpn-core.users":         "latticenet.vpn-core",
-		"vpn-core.usage":         "latticenet.vpn-core",
-		"vpn-core.profiles":      "latticenet.vpn-core",
-		"vpn-core.subscriptions": "latticenet.vpn-core",
-		"proxy.inbounds":         "latticenet.vpn-core",
-		"proxy.users":            "latticenet.vpn-core",
-		"proxy.profiles":         "latticenet.vpn-core",
-		"proxy.subscriptions":    "latticenet.vpn-core",
-		"proxy.usage":            "latticenet.vpn-core",
-		"proxy.discovered":       "latticenet.vpn-core",
-		"netguard.firewall":      "latticenet.netguard",
-		"wireguard.networks":     "latticenet.wireguard",
-	}
 )
 
 // NavContribution is a sidebar entry a plugin adds. Route is plugin-relative and
@@ -93,13 +78,12 @@ type ViewAction struct {
 
 // ViewContribution is one declarative view rendered by a fixed dashboard primitive.
 type ViewContribution struct {
-	Route        string       `json:"route"`
-	Title        string       `json:"title"`
-	Kind         string       `json:"kind"`
-	ComponentKey string       `json:"component_key,omitempty"`
-	Source       *ViewSource  `json:"source,omitempty"`
-	Columns      []ViewColumn `json:"columns,omitempty"`
-	Actions      []ViewAction `json:"actions,omitempty"`
+	Route   string       `json:"route"`
+	Title   string       `json:"title"`
+	Kind    string       `json:"kind"`
+	Source  *ViewSource  `json:"source,omitempty"`
+	Columns []ViewColumn `json:"columns,omitempty"`
+	Actions []ViewAction `json:"actions,omitempty"`
 }
 
 // ManifestUI is a plugin's dashboard contribution set.
@@ -338,25 +322,14 @@ func validateContributions(m Manifest) error {
 		if !pluginViewKinds[v.Kind] {
 			return fmt.Errorf("view kind %q is not allowed", v.Kind)
 		}
-		if m.Schema == ManifestSchemaV2 && v.Kind == "builtin" {
-			return fmt.Errorf("view %q builtin components are not allowed in manifest v2", v.Route)
-		}
 		if v.Kind == "sandbox" && m.UIRuntime == nil {
 			return fmt.Errorf("view %q sandbox kind requires ui_runtime", v.Route)
 		}
 		if m.Schema == "" && v.Kind == "sandbox" {
 			return fmt.Errorf("view %q sandbox kind requires manifest schema v2", v.Route)
 		}
-		if v.Kind == "sandbox" && (v.ComponentKey != "" || v.Source != nil || len(v.Columns) > 0 || len(v.Actions) > 0) {
-			return fmt.Errorf("view %q sandbox kind cannot declare dashboard-rendered component, source, columns, or actions", v.Route)
-		}
-		if v.Kind == "builtin" {
-			owner, ok := pluginBuiltinViews[v.ComponentKey]
-			if !ok || owner != m.ID {
-				return fmt.Errorf("view %q builtin component %q is not allowed for plugin %q", v.Route, v.ComponentKey, m.ID)
-			}
-		} else if v.ComponentKey != "" {
-			return fmt.Errorf("view %q component_key requires builtin kind", v.Route)
+		if v.Kind == "sandbox" && (v.Source != nil || len(v.Columns) > 0 || len(v.Actions) > 0) {
+			return fmt.Errorf("view %q sandbox kind cannot declare dashboard-rendered source, columns, or actions", v.Route)
 		}
 		if v.Source != nil {
 			if !methodDeclared(contracts, v.Source.Interface, v.Source.Method) {

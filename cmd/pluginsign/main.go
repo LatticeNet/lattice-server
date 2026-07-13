@@ -52,14 +52,22 @@ func main() {
 		art, err := os.ReadFile(*artifactPath)
 		must(err, "read artifact")
 		digest := plugin.DigestSHA256(art)
+		manifestDigest := m.DigestSHA256
+		if m.Schema == plugin.ManifestSchemaV2 && m.Bundle != nil {
+			manifestDigest = m.Bundle.DigestSHA256
+		}
 		switch {
-		case m.DigestSHA256 == "":
-			m.DigestSHA256 = digest
-		case m.DigestSHA256 != digest && *updateDigest:
-			fmt.Fprintf(os.Stderr, "pluginsign: updating digest %s -> %s\n", m.DigestSHA256, digest)
-			m.DigestSHA256 = digest
-		case m.DigestSHA256 != digest:
-			fatal(fmt.Sprintf("digest mismatch: manifest=%s artifact=%s (pass -update-digest to overwrite)", m.DigestSHA256, digest))
+		case manifestDigest == "" || (manifestDigest != digest && *updateDigest):
+			if manifestDigest != "" {
+				fmt.Fprintf(os.Stderr, "pluginsign: updating digest %s -> %s\n", manifestDigest, digest)
+			}
+			if m.Schema == plugin.ManifestSchemaV2 && m.Bundle != nil {
+				m.Bundle.DigestSHA256 = digest
+			} else {
+				m.DigestSHA256 = digest
+			}
+		case manifestDigest != digest:
+			fatal(fmt.Sprintf("digest mismatch: manifest=%s artifact=%s (pass -update-digest to overwrite)", manifestDigest, digest))
 		}
 	}
 
@@ -75,7 +83,11 @@ func main() {
 	out = append(out, '\n')
 
 	fmt.Printf("publisher pubkey (base64): %s\n", base64.StdEncoding.EncodeToString(pub))
-	fmt.Printf("digest_sha256          : %s\n", m.DigestSHA256)
+	digest := m.DigestSHA256
+	if m.Schema == plugin.ManifestSchemaV2 && m.Bundle != nil {
+		digest = m.Bundle.DigestSHA256
+	}
+	fmt.Printf("artifact digest_sha256 : %s\n", digest)
 	fmt.Printf("signature_ed25519      : %s\n", m.SignatureEd25519)
 	fmt.Printf("signing payload bytes  : %d\n", len(payload))
 

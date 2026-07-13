@@ -1,6 +1,8 @@
 package plugin
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -17,7 +19,7 @@ import (
 // can never smuggle an unknown renderer, primitive, or target section.
 var (
 	pluginNavSections = map[string]bool{"plugins": true, "proxy": true}
-	pluginViewKinds   = map[string]bool{"table": true, "detail": true, "form": true, "kv": true, "markdown": true, "builtin": true}
+	pluginViewKinds   = map[string]bool{"table": true, "detail": true, "form": true, "kv": true, "markdown": true, "builtin": true, "sandbox": true}
 	pluginRenderHints = map[string]bool{"": true, "copy-secret": true, "bytes": true, "relative-time": true, "badge": true, "code": true}
 	pluginFormKinds   = map[string]bool{"text": true, "int": true, "select": true}
 	// Icons the dashboard knows (lucide names). Conservative starter set.
@@ -43,7 +45,6 @@ var (
 		"proxy.subscriptions":    "latticenet.vpn-core",
 		"proxy.usage":            "latticenet.vpn-core",
 		"proxy.discovered":       "latticenet.vpn-core",
-		"proxy.substore":         "latticenet.sub-store",
 		"netguard.firewall":      "latticenet.netguard",
 		"wireguard.networks":     "latticenet.wireguard",
 	}
@@ -110,15 +111,127 @@ type ManifestUI struct {
 // InterfaceContract declares an interface the plugin exposes (service + methods),
 // callable through the dashboard->plugin gateway under the given scopes.
 type InterfaceContract struct {
-	Service string   `json:"service"`
-	Methods []string `json:"methods"`
-	Scopes  []string `json:"scopes,omitempty"`
+	Service string `json:"service"`
+	// Methods remains the normalized name list so v1 callers keep their source
+	// contract. MethodSpecs carries the signed v2 effect and method-level scopes.
+	Methods      []string          `json:"-"`
+	MethodSpecs  []InterfaceMethod `json:"-"`
+	Scopes       []string          `json:"scopes,omitempty"`
+	typedMethods bool
+}
+
+func (c InterfaceContract) MarshalJSON() ([]byte, error) {
+	type stringMethods struct {
+		Service string   `json:"service"`
+		Methods []string `json:"methods"`
+		Scopes  []string `json:"scopes,omitempty"`
+	}
+	type typedMethods struct {
+		Service string            `json:"service"`
+		Methods []InterfaceMethod `json:"methods"`
+		Scopes  []string          `json:"scopes,omitempty"`
+	}
+	if c.typedMethods || len(c.MethodSpecs) > 0 {
+		return json.Marshal(typedMethods{Service: c.Service, Methods: c.MethodSpecs, Scopes: c.Scopes})
+	}
+	return json.Marshal(stringMethods{Service: c.Service, Methods: c.Methods, Scopes: c.Scopes})
+}
+
+func (c *InterfaceContract) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Service string          `json:"service"`
+		Methods json.RawMessage `json:"methods"`
+		Scopes  []string        `json:"scopes,omitempty"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return err
+	}
+	if err := ensureNoTrailingJSON(dec); err != nil {
+		return err
+	}
+	*c = InterfaceContract{Service: raw.Service, Scopes: raw.Scopes}
+	if len(raw.Methods) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(raw.Methods, &c.Methods); err == nil {
+		return nil
+	}
+	methodDec := json.NewDecoder(bytes.NewReader(raw.Methods))
+	methodDec.DisallowUnknownFields()
+	if err := methodDec.Decode(&c.MethodSpecs); err != nil {
+		return fmt.Errorf("interface methods must be all strings or all typed objects: %w", err)
+	}
+	if err := ensureNoTrailingJSON(methodDec); err != nil {
+		return fmt.Errorf("interface methods: %w", err)
+	}
+	c.typedMethods = true
+	c.Methods = make([]string, len(c.MethodSpecs))
+	for i, method := range c.MethodSpecs {
+		c.Methods[i] = method.Name
+	}
+	return nil
+}
+
+func (c InterfaceContract) effectiveMethods() []InterfaceMethod {
+	if c.typedMethods || len(c.MethodSpecs) > 0 {
+		return c.MethodSpecs
+	}
+	out := make([]InterfaceMethod, len(c.Methods))
+	for i, name := range c.Methods {
+		out[i] = InterfaceMethod{Name: name, Effect: InterfaceEffectRead, Scopes: c.Scopes}
+	}
+	return out
+}
+
+func (c InterfaceContract) TypedMethods() bool {
+	return c.typedMethods || len(c.MethodSpecs) > 0
+}
+
+func (c InterfaceContract) MethodContracts() []InterfaceMethod {
+	methods := c.effectiveMethods()
+	out := make([]InterfaceMethod, len(methods))
+	for i, method := range methods {
+		out[i] = method
+		out[i].Scopes = append([]string(nil), method.Scopes...)
+	}
+	return out
+}
+
+func (c InterfaceContract) MethodContract(name string) (InterfaceMethod, bool) {
+	for _, method := range c.effectiveMethods() {
+		if method.Name == name {
+			method.Scopes = append([]string(nil), method.Scopes...)
+			return method, true
+		}
+	}
+	return InterfaceMethod{}, false
+}
+
+func (c InterfaceContract) EffectiveMethodScopes(name string) ([]string, bool) {
+	method, ok := c.MethodContract(name)
+	if !ok {
+		return nil, false
+	}
+	if len(method.Scopes) > 0 {
+		return method.Scopes, true
+	}
+	return append([]string(nil), c.Scopes...), true
 }
 
 // validateContributions checks a manifest's ui + interfaces against the
 // allow-lists. Empty contributions are valid (most plugins have none).
 func validateContributions(m Manifest) error {
 	contracts := map[string]map[string][]string{}
+	hasOperatorTargetCapability := false
+	for _, capability := range m.Capabilities {
+		if capability == capHTTPOperatorTarget {
+			hasOperatorTargetCapability = true
+			break
+		}
+	}
+	usesOperatorTargetBinding := false
 	for _, c := range m.Interfaces {
 		if c.Service == "" {
 			return fmt.Errorf("interface service is required")
@@ -126,8 +239,18 @@ func validateContributions(m Manifest) error {
 		if !serviceOwnedByPlugin(m.ID, c.Service) {
 			return fmt.Errorf("interface service %q must be under plugin id %q", c.Service, m.ID)
 		}
-		if len(c.Methods) == 0 {
+		if m.Schema == ManifestSchemaV2 && contracts[c.Service] != nil {
+			return fmt.Errorf("interface service %q is duplicated", c.Service)
+		}
+		methods := c.effectiveMethods()
+		if len(methods) == 0 {
 			return fmt.Errorf("interface %q must declare at least one method", c.Service)
+		}
+		if m.Schema == ManifestSchemaV2 && !c.typedMethods && len(c.MethodSpecs) == 0 {
+			return fmt.Errorf("interface %q manifest v2 requires typed method objects", c.Service)
+		}
+		if m.Schema == "" && (c.typedMethods || len(c.MethodSpecs) > 0) {
+			return fmt.Errorf("interface %q typed method objects require manifest schema v2", c.Service)
 		}
 		for _, s := range c.Scopes {
 			if !scopeAllowedInManifest(s) {
@@ -138,22 +261,62 @@ func validateContributions(m Manifest) error {
 			contracts[c.Service] = map[string][]string{}
 		}
 		seenMethods := map[string]bool{}
-		for _, method := range c.Methods {
-			if !pluginMethodRe.MatchString(method) {
-				return fmt.Errorf("interface %q invalid method %q", c.Service, method)
+		for _, method := range methods {
+			if !pluginMethodRe.MatchString(method.Name) {
+				return fmt.Errorf("interface %q invalid method %q", c.Service, method.Name)
 			}
-			if seenMethods[method] {
-				return fmt.Errorf("interface %q duplicate method %q", c.Service, method)
+			if seenMethods[method.Name] {
+				return fmt.Errorf("interface %q duplicate method %q", c.Service, method.Name)
 			}
-			seenMethods[method] = true
-			contracts[c.Service][method] = c.Scopes
+			seenMethods[method.Name] = true
+			effectiveScopes := c.Scopes
+			if m.Schema == ManifestSchemaV2 {
+				if method.Effect != InterfaceEffectRead && method.Effect != InterfaceEffectWrite && method.Effect != InterfaceEffectPlan {
+					return fmt.Errorf("interface %q method %q has invalid effect %q", c.Service, method.Name, method.Effect)
+				}
+				for _, scope := range method.Scopes {
+					if !scopeAllowedInManifest(scope) {
+						return fmt.Errorf("interface %q method %q invalid scope %q", c.Service, method.Name, scope)
+					}
+				}
+				if (method.Effect == InterfaceEffectWrite || method.Effect == InterfaceEffectPlan) && len(method.Scopes) == 0 {
+					return fmt.Errorf("interface %q method %q effect %q requires method scopes", c.Service, method.Name, method.Effect)
+				}
+				if len(method.Scopes) > 0 {
+					effectiveScopes = method.Scopes
+				}
+				if len(effectiveScopes) == 0 {
+					return fmt.Errorf("interface %q method %q must declare scopes or inherit scoped interface", c.Service, method.Name)
+				}
+				if len(method.OperatorTargetFields) > 4 {
+					return fmt.Errorf("interface %q method %q declares too many operator target fields", c.Service, method.Name)
+				}
+				seenTargetFields := map[string]bool{}
+				for _, field := range method.OperatorTargetFields {
+					if !pluginKeyRe.MatchString(field) {
+						return fmt.Errorf("interface %q method %q has invalid operator target field %q", c.Service, method.Name, field)
+					}
+					if seenTargetFields[field] {
+						return fmt.Errorf("interface %q method %q has duplicate operator target field %q", c.Service, method.Name, field)
+					}
+					seenTargetFields[field] = true
+					usesOperatorTargetBinding = true
+				}
+				if len(method.OperatorTargetFields) > 0 && !hasOperatorTargetCapability {
+					return fmt.Errorf("interface %q method %q operator target fields require %s capability", c.Service, method.Name, capHTTPOperatorTarget)
+				}
+			}
+			contracts[c.Service][method.Name] = effectiveScopes
 		}
+	}
+	if m.Schema == ManifestSchemaV2 && hasOperatorTargetCapability && !usesOperatorTargetBinding {
+		return fmt.Errorf("manifest v2 capability %s requires a method-bound operator target field", capHTTPOperatorTarget)
 	}
 	if m.UI == nil {
 		return nil
 	}
 	for _, n := range m.UI.Nav {
-		if !sectionAllowed(n.Section) {
+		if !sectionAllowed(m, n.Section) {
 			return fmt.Errorf("nav section %q is not allowed", n.Section)
 		}
 		if n.Title == "" || !pluginRouteRe.MatchString(n.Route) {
@@ -174,6 +337,18 @@ func validateContributions(m Manifest) error {
 		}
 		if !pluginViewKinds[v.Kind] {
 			return fmt.Errorf("view kind %q is not allowed", v.Kind)
+		}
+		if m.Schema == ManifestSchemaV2 && v.Kind == "builtin" {
+			return fmt.Errorf("view %q builtin components are not allowed in manifest v2", v.Route)
+		}
+		if v.Kind == "sandbox" && m.UIRuntime == nil {
+			return fmt.Errorf("view %q sandbox kind requires ui_runtime", v.Route)
+		}
+		if m.Schema == "" && v.Kind == "sandbox" {
+			return fmt.Errorf("view %q sandbox kind requires manifest schema v2", v.Route)
+		}
+		if v.Kind == "sandbox" && (v.ComponentKey != "" || v.Source != nil || len(v.Columns) > 0 || len(v.Actions) > 0) {
+			return fmt.Errorf("view %q sandbox kind cannot declare dashboard-rendered component, source, columns, or actions", v.Route)
 		}
 		if v.Kind == "builtin" {
 			owner, ok := pluginBuiltinViews[v.ComponentKey]
@@ -219,7 +394,10 @@ func validateContributions(m Manifest) error {
 	return nil
 }
 
-func sectionAllowed(section string) bool {
+func sectionAllowed(m Manifest, section string) bool {
+	if m.Schema == ManifestSchemaV2 {
+		return section == "extensions"
+	}
 	return pluginNavSections[section] || pluginSectionRe.MatchString(section)
 }
 

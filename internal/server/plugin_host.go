@@ -29,12 +29,13 @@ type pluginHost struct {
 func (s *Server) pluginHostServices() plugin.HostServices {
 	host := &pluginHost{server: s}
 	return plugin.HostServices{
-		KV:     host,
-		Notify: host,
-		HTTP:   host,
-		Log:    host,
-		Audit:  host,
-		RPC:    s.pluginRPC,
+		KV:           host,
+		Notify:       host,
+		HTTP:         host,
+		OperatorHTTP: host,
+		Log:          host,
+		Audit:        host,
+		RPC:          s.pluginRPC,
 	}
 }
 
@@ -93,6 +94,14 @@ func (h *pluginHost) Send(ctx context.Context, title, body string) error {
 }
 
 func (h *pluginHost) Do(ctx context.Context, req plugin.HostHTTPRequest) (plugin.HostHTTPResponse, error) {
+	return h.doHTTP(ctx, req, outbound.NewClient(10*time.Second))
+}
+
+func (h *pluginHost) DoOperator(ctx context.Context, req plugin.HostHTTPRequest) (plugin.HostHTTPResponse, error) {
+	return h.doHTTP(ctx, req, outbound.NewOperatorClient(10*time.Second))
+}
+
+func (h *pluginHost) doHTTP(ctx context.Context, req plugin.HostHTTPRequest, client *http.Client) (plugin.HostHTTPResponse, error) {
 	if len(req.Body) > pluginHTTPRequestLimit {
 		return plugin.HostHTTPResponse{}, errors.New("plugin http request body exceeds size limit")
 	}
@@ -107,7 +116,7 @@ func (h *pluginHost) Do(ctx context.Context, req plugin.HostHTTPRequest) (plugin
 	for k, v := range req.Header {
 		httpReq.Header.Set(k, v)
 	}
-	resp, err := outbound.NewClient(10 * time.Second).Do(httpReq)
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		return plugin.HostHTTPResponse{}, err
 	}

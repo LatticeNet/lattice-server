@@ -25,15 +25,21 @@ const (
 )
 
 type Manifest struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	Type             string   `json:"type"`
-	Capabilities     []string `json:"capabilities"`
-	Version          string   `json:"version,omitempty"`
-	Entrypoint       string   `json:"entrypoint,omitempty"`
-	Publisher        string   `json:"publisher,omitempty"`
-	DigestSHA256     string   `json:"digest_sha256,omitempty"`
-	SignatureEd25519 string   `json:"signature_ed25519,omitempty"`
+	Schema           string             `json:"schema,omitempty"`
+	ID               string             `json:"id"`
+	Name             string             `json:"name"`
+	Type             string             `json:"type"`
+	Capabilities     []string           `json:"capabilities"`
+	Version          string             `json:"version,omitempty"`
+	Entrypoint       string             `json:"entrypoint,omitempty"`
+	Publisher        string             `json:"publisher,omitempty"`
+	DigestSHA256     string             `json:"digest_sha256,omitempty"`
+	SignatureEd25519 string             `json:"signature_ed25519,omitempty"`
+	Bundle           *BundleSpec        `json:"bundle,omitempty"`
+	Runtime          *RuntimeSpec       `json:"runtime,omitempty"`
+	UIRuntime        *UIRuntimeSpec     `json:"ui_runtime,omitempty"`
+	Compatibility    *CompatibilitySpec `json:"compatibility,omitempty"`
+	HostAccess       *HostAccessSpec    `json:"host_access,omitempty"`
 	// UI + Interfaces are the design-10 dashboard contributions: declarative data
 	// (nav/views) + the interfaces the plugin exposes. They are covered by the
 	// signature (see SigningPayload) so a tampered contribution fails verification.
@@ -62,28 +68,29 @@ var capabilityRisk = map[string]string{
 	// VerifyManifest). It is intentionally exempt from the system-only restriction
 	// (see hostRiskExemptForNonSystem) so a SIGNED third-party wasm plugin may
 	// still request guarded egress through the broker.
-	"http:egress":     RiskHost,
-	"kv:read":         RiskRead,
-	"monitor:read":    RiskRead,
-	"netguard:read":   RiskRead,
-	"netpolicy:read":  RiskRead,
-	"node:read":       RiskRead,
-	"static:read":     RiskRead,
-	"task:read":       RiskRead,
-	"kv:write":        RiskWrite,
-	"log:write":       RiskWrite,
-	"notify:send":     RiskWrite,
-	"worker:route":    RiskWrite,
-	"ddns:admin":      RiskHost,
-	"monitor:admin":   RiskHost,
-	"netguard:admin":  RiskHost,
-	"network:apply":   RiskHost,
-	"network:plan":    RiskHost,
-	"netpolicy:admin": RiskHost,
-	"node:admin":      RiskHost,
-	"static:write":    RiskHost,
-	"task:run":        RiskHost,
-	"tunnel:admin":    RiskHost,
+	"http:egress":          RiskHost,
+	"http:operator-target": RiskHost,
+	"kv:read":              RiskRead,
+	"monitor:read":         RiskRead,
+	"netguard:read":        RiskRead,
+	"netpolicy:read":       RiskRead,
+	"node:read":            RiskRead,
+	"static:read":          RiskRead,
+	"task:read":            RiskRead,
+	"kv:write":             RiskWrite,
+	"log:write":            RiskWrite,
+	"notify:send":          RiskWrite,
+	"worker:route":         RiskWrite,
+	"ddns:admin":           RiskHost,
+	"monitor:admin":        RiskHost,
+	"netguard:admin":       RiskHost,
+	"network:apply":        RiskHost,
+	"network:plan":         RiskHost,
+	"netpolicy:admin":      RiskHost,
+	"node:admin":           RiskHost,
+	"static:write":         RiskHost,
+	"task:run":             RiskHost,
+	"tunnel:admin":         RiskHost,
 	// Inter-plugin RPC (design-09 §F). rpc:expose lets a plugin register a
 	// callable service; rpc:call lets a plugin invoke another plugin's service
 	// through the broker. Both are host-risk (system-only, signed in prod): a
@@ -150,6 +157,9 @@ func ValidateManifest(m Manifest) error {
 			return fmt.Errorf("capability %q is not available to worker plugins", cap)
 		}
 	}
+	if err := validateManifestVersion(m); err != nil {
+		return err
+	}
 	if err := validateContributions(m); err != nil {
 		return err
 	}
@@ -160,9 +170,10 @@ func VerifyManifest(m Manifest, artifact []byte, policy TrustPolicy) error {
 	if err := ValidateManifest(m); err != nil {
 		return err
 	}
-	requireSignature := manifestHasRisk(m, RiskHost) && !policy.AllowUnsignedHostRisk
-	if m.DigestSHA256 != "" {
-		if err := verifyDigest(m.DigestSHA256, artifact); err != nil {
+	requireSignature := m.Schema == ManifestSchemaV2 || (manifestHasRisk(m, RiskHost) && !policy.AllowUnsignedHostRisk)
+	digest := manifestArtifactDigest(m)
+	if digest != "" {
+		if err := verifyDigest(digest, artifact); err != nil {
 			return err
 		}
 	}
@@ -179,10 +190,10 @@ func VerifyManifest(m Manifest, artifact []byte, policy TrustPolicy) error {
 	if len(pub) != ed25519.PublicKeySize {
 		return fmt.Errorf("trusted publisher %q has invalid ed25519 key", m.Publisher)
 	}
-	if m.DigestSHA256 == "" {
-		return errors.New("manifest signature requires digest_sha256")
+	if digest == "" {
+		return errors.New("manifest signature requires an artifact digest")
 	}
-	if err := verifyDigest(m.DigestSHA256, artifact); err != nil {
+	if err := verifyDigest(digest, artifact); err != nil {
 		return err
 	}
 	sig, err := decodeSignature(m.SignatureEd25519)
@@ -196,6 +207,17 @@ func VerifyManifest(m Manifest, artifact []byte, policy TrustPolicy) error {
 }
 
 func VerifyInstallManifest(manifestBytes, artifact []byte, policy TrustPolicy) (Manifest, error) {
+	m, err := DecodeManifest(manifestBytes)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if err := VerifyManifest(m, artifact, policy); err != nil {
+		return Manifest{}, err
+	}
+	return m, nil
+}
+
+func DecodeManifest(manifestBytes []byte) (Manifest, error) {
 	var m Manifest
 	dec := json.NewDecoder(bytes.NewReader(manifestBytes))
 	dec.DisallowUnknownFields()
@@ -204,9 +226,6 @@ func VerifyInstallManifest(manifestBytes, artifact []byte, policy TrustPolicy) (
 	}
 	if err := ensureNoTrailingJSON(dec); err != nil {
 		return Manifest{}, fmt.Errorf("decode manifest: %w", err)
-	}
-	if err := VerifyManifest(m, artifact, policy); err != nil {
-		return Manifest{}, err
 	}
 	return m, nil
 }
@@ -244,6 +263,12 @@ func DigestSHA256(artifact []byte) string {
 }
 
 func SigningPayload(m Manifest) []byte {
+	if m.Schema == ManifestSchemaV2 {
+		unsigned := m
+		unsigned.SignatureEd25519 = ""
+		encoded, _ := json.Marshal(unsigned)
+		return append([]byte("LATTICE-PLUGIN-MANIFEST-V2\n"), encoded...)
+	}
 	caps := append([]string(nil), m.Capabilities...)
 	sort.Strings(caps)
 	fields := []string{

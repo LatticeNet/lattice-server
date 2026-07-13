@@ -32,13 +32,12 @@ func TestVPNCoreSubscriptionsRPC(t *testing.T) {
 	var out struct {
 		Subscriptions []SubscriptionSummary `json:"subscriptions"`
 		Count         int                   `json:"count"`
-		Publisher     string                `json:"publisher"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if out.Count != 2 || out.Publisher != "latticenet.sub-store" {
-		t.Fatalf("count/publisher wrong: %+v", out)
+	if out.Count != 2 {
+		t.Fatalf("count wrong: %+v", out)
 	}
 	byID := map[string]SubscriptionSummary{}
 	for _, s := range out.Subscriptions {

@@ -75,6 +75,9 @@ type Options struct {
 	// PluginDir is the root directory of installed plugin bundles. Empty disables
 	// plugin loading entirely.
 	PluginDir string
+	// PluginBundleCacheDir is the private content-addressed extraction cache for
+	// signed manifest v2 archives. V2 plugins fail closed when it is empty.
+	PluginBundleCacheDir string
 	// PluginTrust is the operator policy used to verify plugin signatures at load
 	// time. The zero value is fail-closed: host-risk plugins require a trusted
 	// publisher signature.
@@ -411,7 +414,7 @@ func New(opts Options) (*Server, error) {
 	if err := s.ensureAdmin(opts.AdminUsername, opts.AdminPassword); err != nil {
 		return nil, err
 	}
-	s.loadPlugins(opts.PluginDir, opts.PluginTrust)
+	s.loadPlugins(opts.PluginDir, opts.PluginBundleCacheDir, opts.PluginTrust)
 	if !opts.DisableRenewalScheduler {
 		s.startRenewalScheduler()
 		s.startNodeLivenessSweeper()
@@ -427,8 +430,8 @@ func New(opts Options) (*Server, error) {
 // at which the signature/digest/capability trust model becomes load-bearing.
 // Verification failures are audited and skipped — one bad or untrusted bundle
 // never blocks boot. Execution (host-API binding) is a later milestone.
-func (s *Server) loadPlugins(dir string, policy plugin.TrustPolicy) {
-	loaded, outcomes, err := plugin.Loader{Dir: dir, Policy: policy}.Load()
+func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
+	loaded, outcomes, err := plugin.Loader{Dir: dir, CacheDir: cacheDir, Policy: policy}.Load()
 	if err != nil {
 		s.logger.Printf("plugin loader: %v", err)
 		return
@@ -443,8 +446,10 @@ func (s *Server) loadPlugins(dir string, policy plugin.TrustPolicy) {
 			s.logger.Printf("plugin lifecycle: failed to record %s: %v", pl.Manifest.ID, err)
 		}
 		if status == model.PluginStatusActive {
+			s.applyPluginHostAccess(pl)
 			rt, err := s.pluginRuntime.Start(context.Background(), pl)
 			if err != nil {
+				s.revokePluginHostAccess(pl)
 				s.logger.Printf("plugin runtime: failed to arm %s: %v", pl.Manifest.ID, err)
 				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
 			} else {
@@ -473,7 +478,7 @@ func pluginInstallationFromLoaded(pl plugin.Loaded, status string) model.PluginI
 		Entrypoint:     pl.Manifest.Entrypoint,
 		Publisher:      pl.Manifest.Publisher,
 		Capabilities:   append([]string(nil), pl.Capabilities...),
-		ArtifactSHA256: pl.Manifest.DigestSHA256,
+		ArtifactSHA256: pl.ArtifactDigest,
 		BundlePath:     pl.BundlePath,
 		Status:         status,
 	}
@@ -490,6 +495,14 @@ type pluginView struct {
 	Active       bool                       `json:"active"`
 	UI           *plugin.ManifestUI         `json:"ui,omitempty"`
 	Interfaces   []plugin.InterfaceContract `json:"interfaces,omitempty"`
+	UIRuntime    *pluginUIRuntimeView       `json:"ui_runtime,omitempty"`
+}
+
+type pluginUIRuntimeView struct {
+	Mode          string `json:"mode"`
+	EntryURL      string `json:"entry_url"`
+	BridgeVersion string `json:"bridge_version"`
+	AssetDigest   string `json:"asset_digest"`
 }
 
 type pluginCapabilityView struct {
@@ -589,8 +602,10 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 		}
 		if req.Status == model.PluginStatusActive {
 			loaded, _ := s.loadedPlugin(req.ID)
+			s.applyPluginHostAccess(loaded)
 			rt, err := s.pluginRuntime.Start(r.Context(), loaded)
 			if err != nil {
+				s.revokePluginHostAccess(loaded)
 				_, _ = s.pluginRuntime.Stop(req.ID, "activation failed")
 				_ = s.store.SetPluginStatus(req.ID, model.PluginStatusDisabled)
 				s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": req.ID, "state": plugin.RuntimeStateFailed}})
@@ -600,6 +615,8 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "allow", Metadata: map[string]string{"plugin_id": req.ID, "state": rt.State}})
 		}
 		if req.Status == model.PluginStatusDisabled {
+			loaded, _ := s.loadedPlugin(req.ID)
+			s.revokePluginHostAccess(loaded)
 			rt, err := s.pluginRuntime.Stop(req.ID, "operator disabled plugin")
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
@@ -799,6 +816,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/plugins/verify", s.withAuth("plugin:verify", s.handlePluginVerify))
 	mux.HandleFunc("/api/plugins/invoke", s.withAuth("plugin:admin", s.handlePluginInvoke))
 	mux.HandleFunc("/api/plugins/call", s.withAuth("", s.handlePluginCall))
+	mux.HandleFunc("/api/plugins/assets/", s.handlePluginAsset)
 	mux.HandleFunc("/api/kv", s.withAuth("", s.handleKV))
 	mux.HandleFunc("/api/static", s.withAuth("", s.handleStatic))
 	mux.HandleFunc("/api/storage/buckets", s.withAuth("", s.handleStorageBuckets))
@@ -840,8 +858,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/managed/users", s.withAuth("", s.handleSingBoxManageUsers))
 	mux.HandleFunc("/api/proxy/managed/reveal-line", s.withAuth("", s.handleRevealSingBoxLine))
 	mux.HandleFunc("/api/proxy/nodes/", s.withAuth("", s.handleProxyNodePlan))
-	mux.HandleFunc("/api/substore/import", s.withAuth("", s.handleSubStoreImport))
-	mux.HandleFunc("/api/substore/status", s.withAuth("", s.handleSubStoreStatus))
 	mux.HandleFunc("/api/machines", s.withAuth("", s.handleMachines))
 	mux.HandleFunc("/api/machines/update", s.withAuth("inventory:admin", s.handleMachineUpdate))
 	mux.HandleFunc("/api/machines/delete", s.withAuth("inventory:admin", s.handleDeleteMachine))

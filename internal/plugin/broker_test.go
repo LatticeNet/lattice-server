@@ -81,6 +81,57 @@ func TestBrokerDeniesHostCallsWithoutDeclaredCapabilityAndAudits(t *testing.T) {
 	}
 }
 
+func TestBrokerOperatorTargetHTTPIsSeparateSystemOnlyCapability(t *testing.T) {
+	if err := ValidateManifest(Manifest{
+		ID: "operator-target-wasm", Name: "Operator Target", Type: TypeWasm,
+		Capabilities: []string{"http:operator-target"},
+	}); err == nil || !strings.Contains(err.Error(), "requires a system plugin") {
+		t.Fatalf("operator-target capability must be system-only, got %v", err)
+	}
+
+	services := &fakeHostServices{kvValues: map[string][]byte{}}
+	broker, err := NewBroker(Loaded{
+		Manifest: Manifest{ID: "operator-target", Name: "Operator Target", Type: TypeSystem,
+			Capabilities: []string{"http:operator-target"}},
+		Capabilities: []string{"http:operator-target"},
+	}, HostServices{
+		OperatorHTTP: services,
+		Audit:        services,
+		GuardOperatorURL: func(raw string) error {
+			if raw != "http://127.0.0.1:3000/secret" {
+				t.Fatalf("unexpected target %q", raw)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundCtx, err := BindOperatorTargets(context.Background(), []string{"http://127.0.0.1:3000/secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := broker.HTTPOperatorDo(boundCtx, HostHTTPRequest{
+		Method: "GET", URL: "http://127.0.0.1:3000/secret",
+	})
+	if err != nil || resp.StatusCode != 202 || services.operatorHTTPCalls != 1 {
+		t.Fatalf("operator-target call failed: response=%+v calls=%d err=%v", resp, services.operatorHTTPCalls, err)
+	}
+	want := HostCallEvent{PluginID: "operator-target", Action: "http.operator.do", Capability: "http:operator-target", Decision: "allow"}
+	if len(services.events) != 1 || !reflect.DeepEqual(services.events[0], want) {
+		t.Fatalf("operator-target audit=%+v want %+v", services.events, want)
+	}
+	if _, err := broker.HTTPOperatorDo(context.Background(), HostHTTPRequest{Method: "GET", URL: "http://127.0.0.1:3000/secret"}); err == nil || !strings.Contains(err.Error(), "not bound") {
+		t.Fatalf("unbound operator target must be denied, got %v", err)
+	}
+	if services.operatorHTTPCalls != 1 {
+		t.Fatalf("denied operator target reached host: calls=%d", services.operatorHTTPCalls)
+	}
+	if _, err := broker.HTTPDo(context.Background(), HostHTTPRequest{URL: "https://example.com/"}); !errors.Is(err, ErrCapabilityDenied) {
+		t.Fatalf("operator-target capability must not imply ordinary egress, got %v", err)
+	}
+}
+
 func TestBrokerNamespacesKVToOwnBucketAndRejectsBucketSmuggling(t *testing.T) {
 	services := &fakeHostServices{kvValues: map[string][]byte{}}
 	newWritableKVBroker := func(id string) *Broker {
@@ -326,13 +377,14 @@ func TestBrokerLogBoundsLevelMessageAndFields(t *testing.T) {
 }
 
 type fakeHostServices struct {
-	kvValues  map[string][]byte
-	kvPuts    int
-	notifies  int
-	httpCalls int
-	logs      int
-	lastLog   HostLogEntry
-	events    []HostCallEvent
+	kvValues          map[string][]byte
+	kvPuts            int
+	notifies          int
+	httpCalls         int
+	operatorHTTPCalls int
+	logs              int
+	lastLog           HostLogEntry
+	events            []HostCallEvent
 }
 
 func (f *fakeHostServices) Get(ctx context.Context, key string) ([]byte, bool, error) {
@@ -353,6 +405,11 @@ func (f *fakeHostServices) Send(ctx context.Context, title, body string) error {
 
 func (f *fakeHostServices) Do(ctx context.Context, req HostHTTPRequest) (HostHTTPResponse, error) {
 	f.httpCalls++
+	return HostHTTPResponse{StatusCode: 202, Body: []byte("accepted")}, nil
+}
+
+func (f *fakeHostServices) DoOperator(ctx context.Context, req HostHTTPRequest) (HostHTTPResponse, error) {
+	f.operatorHTTPCalls++
 	return HostHTTPResponse{StatusCode: 202, Body: []byte("accepted")}, nil
 }
 

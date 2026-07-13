@@ -12,13 +12,14 @@ import (
 )
 
 const (
-	capHTTPEgress = "http:egress"
-	capKVRead     = "kv:read"
-	capKVWrite    = "kv:write"
-	capLogWrite   = "log:write"
-	capNotifySend = "notify:send"
-	capRPCCall    = "rpc:call"
-	capRPCExpose  = "rpc:expose"
+	capHTTPEgress         = "http:egress"
+	capHTTPOperatorTarget = "http:operator-target"
+	capKVRead             = "kv:read"
+	capKVWrite            = "kv:write"
+	capLogWrite           = "log:write"
+	capNotifySend         = "notify:send"
+	capRPCCall            = "rpc:call"
+	capRPCExpose          = "rpc:expose"
 
 	// kvBucketPrefix is prepended to a plugin id to derive the fixed,
 	// server-visible KV bucket a plugin is confined to. The plugin never gets to
@@ -72,11 +73,12 @@ func (e *CapabilityError) Unwrap() error {
 // HostServices are the real server-owned handles exposed through the broker.
 // The broker keeps these handles behind per-call capability checks.
 type HostServices struct {
-	KV     KVHost
-	Notify NotifyHost
-	HTTP   HTTPHost
-	Log    LogHost
-	Audit  HostAudit
+	KV           KVHost
+	Notify       NotifyHost
+	HTTP         HTTPHost
+	OperatorHTTP OperatorHTTPHost
+	Log          LogHost
+	Audit        HostAudit
 	// RPC dispatches inter-plugin calls (design-09 §F). When nil, a plugin with
 	// rpc:call gets ErrHostServiceUnavailable rather than a panic.
 	RPC RPCHost
@@ -86,7 +88,8 @@ type HostServices struct {
 	// remember to guard. A non-nil error rejects the request before any dial. When
 	// nil, the broker falls back to a built-in guard (see defaultGuardURL) so an
 	// HTTPHost is never trusted by convention alone.
-	GuardURL func(url string) error
+	GuardURL         func(url string) error
+	GuardOperatorURL func(url string) error
 }
 
 // KVHost is the plugin-facing KV subset. The implementation remains server-owned.
@@ -104,6 +107,13 @@ type NotifyHost interface {
 // server's SSRF/egress policy before dialing.
 type HTTPHost interface {
 	Do(ctx context.Context, req HostHTTPRequest) (HostHTTPResponse, error)
+}
+
+// OperatorHTTPHost performs HTTP to an explicitly operator-selected endpoint.
+// It is separate from ordinary egress so private-network access cannot be
+// enabled by a caller-controlled flag on http.do.
+type OperatorHTTPHost interface {
+	DoOperator(ctx context.Context, req HostHTTPRequest) (HostHTTPResponse, error)
 }
 
 // LogHost records a plugin-authored log entry after the broker stamps plugin id.
@@ -170,7 +180,49 @@ type Broker struct {
 	// the HTTPHost. It is always non-nil after NewBroker (it defaults to the
 	// built-in outbound guard) so egress filtering is structural, not by
 	// convention.
-	guardURL func(url string) error
+	guardURL         func(url string) error
+	guardOperatorURL func(url string) error
+}
+
+type operatorTargetsContextKey struct{}
+
+// BindOperatorTargets attaches server-authorized base URLs to one invocation.
+// Only the system runner and server tests should mint this context value.
+func BindOperatorTargets(ctx context.Context, targets []string) (context.Context, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(targets) == 0 {
+		return ctx, nil
+	}
+	if len(targets) > 4 {
+		return nil, errors.New("too many invocation-bound operator targets")
+	}
+	bound := make([]string, 0, len(targets))
+	seen := map[string]bool{}
+	for _, target := range targets {
+		if err := outbound.GuardOperatorURL(target); err != nil {
+			return nil, fmt.Errorf("invalid invocation-bound operator target: %w", err)
+		}
+		if !seen[target] {
+			seen[target] = true
+			bound = append(bound, target)
+		}
+	}
+	return context.WithValue(ctx, operatorTargetsContextKey{}, bound), nil
+}
+
+func operatorTargetBound(ctx context.Context, target string) error {
+	if ctx == nil {
+		return errors.New("operator target is not bound to this invocation")
+	}
+	bound, _ := ctx.Value(operatorTargetsContextKey{}).([]string)
+	for _, base := range bound {
+		if outbound.GuardOperatorTargetBinding(base, target) == nil {
+			return nil
+		}
+	}
+	return errors.New("operator target is not bound to this invocation")
 }
 
 // NewBroker binds a verified plugin registry entry to server-owned host services.
@@ -192,12 +244,17 @@ func NewBroker(loaded Loaded, services HostServices) (*Broker, error) {
 		// egress structurally rather than trusting the HTTPHost by convention.
 		guard = defaultGuardURL
 	}
+	operatorGuard := services.GuardOperatorURL
+	if operatorGuard == nil {
+		operatorGuard = outbound.GuardOperatorURL
+	}
 	out := &Broker{
-		pluginID:     loaded.Manifest.ID,
-		capabilities: make(map[string]struct{}, len(caps)),
-		services:     services,
-		kvBucket:     kvBucketPrefix + loaded.Manifest.ID,
-		guardURL:     guard,
+		pluginID:         loaded.Manifest.ID,
+		capabilities:     make(map[string]struct{}, len(caps)),
+		services:         services,
+		kvBucket:         kvBucketPrefix + loaded.Manifest.ID,
+		guardURL:         guard,
+		guardOperatorURL: operatorGuard,
 	}
 	for _, cap := range caps {
 		if _, ok := CapabilityRisk(cap); !ok {
@@ -305,6 +362,31 @@ func (b *Broker) HTTPDo(ctx context.Context, req HostHTTPRequest) (HostHTTPRespo
 	req.Header = cloneStringMap(req.Header)
 	req.Body = append([]byte(nil), req.Body...)
 	resp, err := b.services.HTTP.Do(ctx, req)
+	resp.Header = cloneStringMap(resp.Header)
+	resp.Body = append([]byte(nil), resp.Body...)
+	return resp, err
+}
+
+// HTTPOperatorDo reaches an explicitly operator-selected endpoint and requires
+// the distinct system-only http:operator-target capability. It never weakens
+// HTTPDo or its SSRF boundary.
+func (b *Broker) HTTPOperatorDo(ctx context.Context, req HostHTTPRequest) (HostHTTPResponse, error) {
+	if err := b.require(ctx, "http.operator.do", capHTTPOperatorTarget); err != nil {
+		return HostHTTPResponse{}, err
+	}
+	if b.services.OperatorHTTP == nil {
+		return HostHTTPResponse{}, fmt.Errorf("%w: operator http", ErrHostServiceUnavailable)
+	}
+	if err := operatorTargetBound(ctx, req.URL); err != nil {
+		b.record(ctx, HostCallEvent{PluginID: b.pluginID, Action: "http.operator.do", Capability: capHTTPOperatorTarget, Decision: "deny", Reason: err.Error()})
+		return HostHTTPResponse{}, err
+	}
+	if err := b.guardOperatorURL(req.URL); err != nil {
+		return HostHTTPResponse{}, fmt.Errorf("plugin operator target blocked: %w", err)
+	}
+	req.Header = cloneStringMap(req.Header)
+	req.Body = append([]byte(nil), req.Body...)
+	resp, err := b.services.OperatorHTTP.DoOperator(ctx, req)
 	resp.Header = cloneStringMap(resp.Header)
 	resp.Body = append([]byte(nil), resp.Body...)
 	return resp, err

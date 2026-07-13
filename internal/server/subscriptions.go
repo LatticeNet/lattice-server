@@ -9,12 +9,11 @@ import (
 
 // SubscriptionSummary is the producer-side, per-identity subscription state
 // (design-12 S5). The locked boundary: vpn-core PRODUCES the source (identities,
-// credentials, line bindings, a sub token) and Sub-Store COMBINES + PUBLISHES the
-// actual delivery. So this read-model intentionally exposes only subscription
+// credentials, line bindings, and a sub token). A separately installed plugin
+// may consume that source and publish it. This read-model intentionally exposes only subscription
 // STATE (eligibility, binding/credential counts, whether a sub token exists) — NOT
 // the raw sub token or rendered links, which remain with the legacy /sub substrate
-// and the Sub-Store publisher. The dashboard renders a thin view of this and points
-// the operator at Sub-Store for publishing.
+// and any independently installed publisher plugin.
 type SubscriptionSummary struct {
 	UserID          string `json:"user_id"`
 	Email           string `json:"email,omitempty"`
@@ -50,9 +49,10 @@ func (s *Server) buildSubscriptions() []SubscriptionSummary {
 }
 
 // vpnCoreSubscriptionsRPC serves latticenet.vpn-core/subscriptions (design-12 S5),
-// proxy:read. The publisher (Sub-Store) is a separate plugin; this is source-only.
+// proxy:read. This endpoint remains source-only and has no knowledge of any
+// optional publisher plugin.
 //
-//	query -> {subscriptions: [...], count, publisher: "latticenet.sub-store"}
+//	query -> {subscriptions: [...], count}
 func (s *Server) vpnCoreSubscriptionsRPC(_ context.Context, method string, _ []byte) ([]byte, error) {
 	switch method {
 	case "query":
@@ -60,8 +60,7 @@ func (s *Server) vpnCoreSubscriptionsRPC(_ context.Context, method string, _ []b
 		return json.Marshal(struct {
 			Subscriptions []SubscriptionSummary `json:"subscriptions"`
 			Count         int                   `json:"count"`
-			Publisher     string                `json:"publisher"`
-		}{Subscriptions: subs, Count: len(subs), Publisher: subStorePluginID})
+		}{Subscriptions: subs, Count: len(subs)})
 	default:
 		return nil, fmt.Errorf("vpn-core/subscriptions: unknown method %q", method)
 	}

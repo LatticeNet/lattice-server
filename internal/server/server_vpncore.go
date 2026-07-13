@@ -17,7 +17,7 @@ const (
 	// to other plugins through the inter-plugin RPC bus (design-09 §F).
 	vpnCorePluginID = "latticenet.vpn-core"
 	// vpnCoreNodesService is the inter-plugin service id other plugins call to
-	// import live node data (e.g. the Sub-Store companion).
+	// import live node data through a signed, active manifest dependency.
 	vpnCoreNodesService = "latticenet.vpn-core/nodes"
 	// vpnCoreLinesService is the read-model the dashboard calls (via the design-10
 	// gateway) to render the unified, node-grouped Lines view (design-12 S1).
@@ -32,7 +32,7 @@ const (
 	// vpnCoreProfilesService is the per-node runtime read-model (design-12 S4), proxy:read.
 	vpnCoreProfilesService = "latticenet.vpn-core/profiles"
 	// vpnCoreSubscriptionsService is the producer-side subscription state read-model
-	// (design-12 S5); Sub-Store remains the publisher. proxy:read.
+	// (design-12 S5). proxy:read.
 	vpnCoreSubscriptionsService = "latticenet.vpn-core/subscriptions"
 )
 
@@ -65,8 +65,6 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionsService, "v1", []string{"query"}, s.vpnCoreSubscriptionsRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreSubscriptionsService, err)
 	}
-	// Grant the first-party Sub-Store companion the directed edge to import nodes.
-	s.pluginRPC.Allow(subStorePluginID, vpnCoreNodesService)
 }
 
 // vpnCoreLinesRPC serves the vpn-core/lines read-model — the unified, node-grouped
@@ -114,7 +112,8 @@ func (s *Server) vpnCoreLinesRPC(_ context.Context, method string, request []byt
 }
 
 // vpnCoreNodesRPC serves the vpn-core/nodes inter-plugin service — the seam the
-// Sub-Store companion uses to import live node connection info.
+// Optional plugins can use to import live node connection info after the host
+// grants their signed manifest dependency.
 //
 //	export {"user_id"?: string} -> {"links":[vless://...], "count":N, "warnings":[...]}
 //
@@ -221,7 +220,7 @@ func (s *Server) vpnCoreExportNodes(request []byte) ([]byte, error) {
 	// (2) On-box discovered nodes (adoption bridge): the share_url each agent
 	// reported via read-only `sb --json list`. user_id does not apply (these are
 	// machine-owned, not Lattice subscribers), so they are included whole when
-	// no specific user filter is requested, giving the Sub-Store companion the
+	// no specific user filter is requested, giving an authorized publisher plugin the
 	// full picture of adopted machines.
 	if includeDiscovered && req.UserID == "" {
 		for _, inv := range s.liveSingBoxInventories(s.now()) {

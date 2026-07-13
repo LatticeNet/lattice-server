@@ -12,6 +12,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -260,6 +261,69 @@ func TestPluginContributionsAndCallGatewayEnforceActionScopes(t *testing.T) {
 	}
 	if !sawRestrictedDeny {
 		t.Fatalf("expected plugin.call deny audit for restricted proxy token, got %+v", st.AuditEvents())
+	}
+}
+
+func TestPluginCallV2UsesExactMethodScopes(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "test.v2", Name: "V2", Type: plugin.TypeSystem,
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.v2/items",
+			MethodSpecs: []plugin.InterfaceMethod{
+				{Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"}},
+				{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:admin"}, OperatorTargetFields: []string{"base_url"}},
+			},
+		}},
+		UI: &plugin.ManifestUI{
+			Nav:   []plugin.NavContribution{{Section: "extensions", Title: "V2", Route: "items", Scopes: []string{"proxy:read"}}},
+			Views: []plugin.ViewContribution{{Route: "items", Title: "V2", Kind: "sandbox"}},
+		},
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: manifest.ID, Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}}
+	if got, ok := srv.pluginCallScopes(manifest.ID, "test.v2/items", "list"); !ok || len(got) != 1 || got[0] != "proxy:read" {
+		t.Fatalf("read method scopes wrong: scopes=%v declared=%v", got, ok)
+	}
+	if got, ok := srv.pluginCallScopes(manifest.ID, "test.v2/items", "save"); !ok || len(got) != 1 || got[0] != "proxy:admin" {
+		t.Fatalf("write method scopes wrong: scopes=%v declared=%v", got, ok)
+	}
+	if got, ok := srv.pluginCallMethod(manifest.ID, "test.v2/items", "save"); !ok || len(got.OperatorTargetFields) != 1 || got.OperatorTargetFields[0] != "base_url" {
+		t.Fatalf("operator target fields were not preserved: contract=%+v declared=%v", got, ok)
+	}
+
+	readPrincipal := principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}}
+	filteredUI := filterPluginUIForPrincipal(manifest.UI, manifest.Interfaces, readPrincipal)
+	filtered := filterPluginInterfacesForUI(filteredUI, manifest.Interfaces, readPrincipal)
+	if len(filtered) != 1 || len(filtered[0].MethodSpecs) != 1 || filtered[0].MethodSpecs[0].Name != "list" {
+		t.Fatalf("read principal saw unauthorized v2 methods: %+v", filtered)
+	}
+	adminPrincipal := principal{Principal: rbac.Principal{Scopes: []string{"proxy:read", "proxy:admin"}}}
+	filtered = filterPluginInterfacesForUI(filterPluginUIForPrincipal(manifest.UI, manifest.Interfaces, adminPrincipal), manifest.Interfaces, adminPrincipal)
+	if len(filtered) != 1 || len(filtered[0].MethodSpecs) != 2 {
+		t.Fatalf("admin principal did not see both v2 methods: %+v", filtered)
+	}
+}
+
+func TestExtractOperatorTargetsRequiresDeclaredPayloadField(t *testing.T) {
+	targets, err := extractOperatorTargets(json.RawMessage(`{"base_url":"https://10.0.0.5/secret"}`), []string{"base_url"})
+	if err != nil || len(targets) != 1 || targets[0] != "https://10.0.0.5/secret" {
+		t.Fatalf("valid operator target extraction: targets=%v err=%v", targets, err)
+	}
+	for _, payload := range []json.RawMessage{
+		json.RawMessage(`{}`),
+		json.RawMessage(`{"base_url":""}`),
+		json.RawMessage(`{"base_url":"http://10.0.0.5/secret"}`),
+		json.RawMessage(`{"base_url":"https://169.254.169.254/latest"}`),
+	} {
+		if _, err := extractOperatorTargets(payload, []string{"base_url"}); err == nil {
+			t.Fatalf("payload %s must not mint an operator target", payload)
+		}
 	}
 }
 

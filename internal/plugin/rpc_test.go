@@ -124,6 +124,21 @@ func TestRPCRegistryServicesDiscovery(t *testing.T) {
 	}
 }
 
+func TestRPCRegistryMethodGrantDoesNotExpandWithService(t *testing.T) {
+	r := NewRPCRegistry()
+	if err := r.Register("owner.plugin", "owner.plugin/nodes", "v1", []string{"export", "delete"},
+		func(_ context.Context, method string, _ []byte) ([]byte, error) { return []byte(method), nil }); err != nil {
+		t.Fatal(err)
+	}
+	r.AllowMethods("caller.plugin", "owner.plugin/nodes", []string{"export"})
+	if out, err := r.Call(context.Background(), "caller.plugin", "owner.plugin/nodes", "export", nil); err != nil || string(out) != "export" {
+		t.Fatalf("granted method failed: out=%q err=%v", out, err)
+	}
+	if _, err := r.Call(context.Background(), "caller.plugin", "owner.plugin/nodes", "delete", nil); !errors.Is(err, ErrRPCDenied) {
+		t.Fatalf("undeclared dependency method: want ErrRPCDenied, got %v", err)
+	}
+}
+
 func TestBrokerRPCCallRequiresCapability(t *testing.T) {
 	reg := NewRPCRegistry()
 	_ = reg.Register("owner.plugin", "owner.plugin/nodes", "v1", []string{"export"},

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -32,6 +33,13 @@ func writeBundle(t *testing.T, root, name string, manifest Manifest, artifact []
 func signedManifest(t *testing.T, priv ed25519.PrivateKey, base Manifest, artifact []byte) Manifest {
 	t.Helper()
 	base.DigestSHA256 = DigestSHA256(artifact)
+	base.SignatureEd25519 = base64.RawStdEncoding.EncodeToString(ed25519.Sign(priv, SigningPayload(base)))
+	return base
+}
+
+func signedManifestV2(t *testing.T, priv ed25519.PrivateKey, base Manifest, artifact []byte) Manifest {
+	t.Helper()
+	base.Bundle.DigestSHA256 = DigestSHA256(artifact)
 	base.SignatureEd25519 = base64.RawStdEncoding.EncodeToString(ed25519.Sign(priv, SigningPayload(base)))
 	return base
 }
@@ -137,5 +145,69 @@ func TestLoaderAllowsUnsignedHostRiskOnlyWhenOptedIn(t *testing.T) {
 	loaded, _, _ = Loader{Dir: root, Policy: TrustPolicy{AllowUnsignedHostRisk: true}}.Load()
 	if len(loaded) != 1 {
 		t.Fatalf("opt-out should load the dev plugin, got %+v", loaded)
+	}
+}
+
+func TestLoaderV2ExtractsSignedBundleForSelectedPlatform(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	cache := t.TempDir()
+	archive := makeTestArchive(t,
+		testArchiveEntry{name: "bin/linux-amd64/plugin", body: []byte("amd64")},
+		testArchiveEntry{name: "bin/linux-arm64/plugin", body: []byte("arm64")},
+		testArchiveEntry{name: "ui/index.html", body: []byte("<main>v2</main>")},
+	)
+	m := validManifestV2()
+	m.Runtime.Entrypoints["linux/arm64"] = "bin/linux-arm64/plugin"
+	m = signedManifestV2(t, priv, m, archive)
+	writeBundle(t, root, "v2", m, archive)
+
+	loaded, outcomes, err := (Loader{
+		Dir: root, CacheDir: cache, Platform: "linux/arm64",
+		Policy: TrustPolicy{TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": pub}},
+	}).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outcomes) != 1 || !outcomes[0].Loaded || len(loaded) != 1 {
+		t.Fatalf("unexpected load outcome: loaded=%+v outcomes=%+v", loaded, outcomes)
+	}
+	got := loaded[0]
+	if got.Manifest.Schema != ManifestSchemaV2 || got.ArtifactDigest != m.Bundle.DigestSHA256 {
+		t.Fatalf("v2 metadata missing: %+v", got)
+	}
+	if got.RuntimeEntry != "bin/linux-arm64/plugin" || filepath.Base(filepath.Dir(got.RuntimePath)) != "linux-arm64" {
+		t.Fatalf("wrong platform runtime selected: entry=%q path=%q", got.RuntimeEntry, got.RuntimePath)
+	}
+	if got.ExtractedRoot == "" || got.UIEntry == "" || len(got.Inventory) != 3 {
+		t.Fatalf("extracted metadata incomplete: %+v", got)
+	}
+	if data, err := os.ReadFile(got.RuntimePath); err != nil || string(data) != "arm64" {
+		t.Fatalf("selected runtime bytes wrong: %q err=%v", data, err)
+	}
+}
+
+func TestLoaderV2RequiresCacheAndMatchingPlatform(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	archive := makeTestArchive(t, testArchiveEntry{name: "bin/linux-amd64/plugin", body: []byte("runtime")}, testArchiveEntry{name: "ui/index.html", body: []byte("ui")})
+	m := signedManifestV2(t, priv, validManifestV2(), archive)
+	writeBundle(t, root, "v2", m, archive)
+	policy := TrustPolicy{TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": pub}}
+
+	loaded, outcomes, err := (Loader{Dir: root, Platform: "linux/amd64", Policy: policy}).Load()
+	if err != nil || len(loaded) != 0 || len(outcomes) != 1 || !strings.Contains(outcomes[0].Reason, "cache") {
+		t.Fatalf("v2 without cache must be rejected: loaded=%+v outcomes=%+v err=%v", loaded, outcomes, err)
+	}
+
+	loaded, outcomes, err = (Loader{Dir: root, CacheDir: t.TempDir(), Platform: "linux/riscv64", Policy: policy}).Load()
+	if err != nil || len(loaded) != 0 || len(outcomes) != 1 || !strings.Contains(outcomes[0].Reason, "platform") {
+		t.Fatalf("v2 without platform entrypoint must be rejected: loaded=%+v outcomes=%+v err=%v", loaded, outcomes, err)
 	}
 }

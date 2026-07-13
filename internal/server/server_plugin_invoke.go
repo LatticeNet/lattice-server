@@ -11,6 +11,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/outbound"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
@@ -49,10 +50,24 @@ func (s *Server) handlePluginContributions(w http.ResponseWriter, r *http.Reques
 			Version: pl.Manifest.Version, Publisher: pl.Manifest.Publisher,
 			Capabilities: []string{},
 			Status:       inst.Status, Active: true, UI: ui,
-			Interfaces: filterPluginInterfacesForUI(ui, pl.Manifest.Interfaces),
+			Interfaces: filterPluginInterfacesForUI(ui, pl.Manifest.Interfaces, p),
+			UIRuntime:  pluginUIRuntimeForLoaded(pl),
 		})
 	}
 	writeJSON(w, http.StatusOK, views)
+}
+
+func pluginUIRuntimeForLoaded(loaded plugin.Loaded) *pluginUIRuntimeView {
+	ui := loaded.Manifest.UIRuntime
+	if loaded.Manifest.Schema != plugin.ManifestSchemaV2 || ui == nil || loaded.ArtifactDigest == "" {
+		return nil
+	}
+	return &pluginUIRuntimeView{
+		Mode:          ui.Mode,
+		EntryURL:      "/api/plugins/assets/" + loaded.Manifest.ID + "/" + strings.ToLower(loaded.ArtifactDigest) + "/" + ui.Entrypoint,
+		BridgeVersion: ui.BridgeVersion,
+		AssetDigest:   strings.ToLower(loaded.ArtifactDigest),
+	}
 }
 
 func filterPluginUIForPrincipal(ui *plugin.ManifestUI, contracts []plugin.InterfaceContract, p principal) *plugin.ManifestUI {
@@ -61,8 +76,9 @@ func filterPluginUIForPrincipal(ui *plugin.ManifestUI, contracts []plugin.Interf
 	}
 	contractScopes := map[string][]string{}
 	for _, c := range contracts {
-		for _, m := range c.Methods {
-			contractScopes[c.Service+"/"+m] = c.Scopes
+		for _, method := range c.MethodContracts() {
+			scopes, _ := c.EffectiveMethodScopes(method.Name)
+			contractScopes[c.Service+"/"+method.Name] = scopes
 		}
 	}
 	visibleRoutes := map[string]struct{}{}
@@ -98,7 +114,7 @@ func filterPluginUIForPrincipal(ui *plugin.ManifestUI, contracts []plugin.Interf
 	return out
 }
 
-func filterPluginInterfacesForUI(ui *plugin.ManifestUI, contracts []plugin.InterfaceContract) []plugin.InterfaceContract {
+func filterPluginInterfacesForUI(ui *plugin.ManifestUI, contracts []plugin.InterfaceContract, p principal) []plugin.InterfaceContract {
 	if ui == nil {
 		return nil
 	}
@@ -113,6 +129,13 @@ func filterPluginInterfacesForUI(ui *plugin.ManifestUI, contracts []plugin.Inter
 		needed[service][method] = struct{}{}
 	}
 	for _, v := range ui.Views {
+		if v.Kind == "sandbox" {
+			for _, contract := range contracts {
+				for _, method := range contract.MethodContracts() {
+					add(contract.Service, method.Name)
+				}
+			}
+		}
 		if v.Source != nil {
 			add(v.Source.Interface, v.Source.Method)
 		}
@@ -130,19 +153,27 @@ func filterPluginInterfacesForUI(ui *plugin.ManifestUI, contracts []plugin.Inter
 			continue
 		}
 		methods := []string{}
-		for _, m := range c.Methods {
-			if _, ok := methodSet[m]; ok {
-				methods = append(methods, m)
+		methodSpecs := []plugin.InterfaceMethod{}
+		for _, method := range c.MethodContracts() {
+			scopes, _ := c.EffectiveMethodScopes(method.Name)
+			if _, ok := methodSet[method.Name]; ok && principalHasScopes(p, scopes) {
+				methods = append(methods, method.Name)
+				methodSpecs = append(methodSpecs, method)
 			}
 		}
 		if len(methods) == 0 {
 			continue
 		}
-		out = append(out, plugin.InterfaceContract{
+		filtered := plugin.InterfaceContract{
 			Service: c.Service,
 			Methods: methods,
 			Scopes:  append([]string(nil), c.Scopes...),
-		})
+		}
+		if c.TypedMethods() {
+			filtered.Methods = nil
+			filtered.MethodSpecs = methodSpecs
+		}
+		out = append(out, filtered)
 	}
 	return out
 }
@@ -175,12 +206,13 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	// The plugin must be ACTIVE and must DECLARE this service+method (with its
 	// required scopes) in its manifest interfaces — a call to an undeclared
 	// service is refused even if the registry has it.
-	scopes, ok := s.pluginCallScopes(req.ID, req.Service, req.Method)
+	methodContract, ok := s.pluginCallMethod(req.ID, req.Service, req.Method)
 	if !ok {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, nil, "deny", "plugin does not expose this interface/method (or is not active)")
 		writeError(w, http.StatusBadRequest, errors.New("plugin does not expose this interface/method (or is not active)"))
 		return
 	}
+	scopes := methodContract.Scopes
 	for _, sc := range scopes {
 		if ok, reason := pluginGatewayScopeAllowed(p, sc); !ok {
 			s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", reason)
@@ -188,29 +220,28 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			return
 		}
 	}
-	if s.pluginRPC == nil {
-		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", "plugin rpc bus unavailable")
-		writeError(w, http.StatusServiceUnavailable, errors.New("plugin rpc bus unavailable"))
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
-	out, err := s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(req.Payload))
+	operatorTargets, err := extractOperatorTargets(req.Payload, methodContract.OperatorTargetFields)
 	if err != nil {
+		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	loaded, loadedOK := s.loadedPlugin(req.ID)
+	var out []byte
+	err = nil
+	if loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2 {
+		out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, req.Payload, operatorTargets)
+	} else if s.pluginRPC == nil {
+		err = errors.New("plugin rpc bus unavailable")
+	} else {
+		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(req.Payload))
 		if errors.Is(err, plugin.ErrRPCNoService) {
-			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, req.Payload)
-			if err == nil {
-				s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "allow", "")
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusOK)
-				if len(out) == 0 {
-					_, _ = w.Write([]byte("null"))
-					return
-				}
-				_, _ = w.Write(out)
-				return
-			}
+			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, req.Payload, nil)
 		}
+	}
+	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -225,7 +256,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	_, _ = w.Write(out)
 }
 
-func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service, method string, payload json.RawMessage) ([]byte, error) {
+func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service, method string, payload json.RawMessage, operatorTargets []string) ([]byte, error) {
 	if s.pluginRuntime == nil {
 		return nil, errors.New("plugin runtime unavailable")
 	}
@@ -237,7 +268,7 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 	if err != nil {
 		return nil, fmt.Errorf("marshal plugin call payload: %w", err)
 	}
-	resp, err := s.pluginRuntime.Invoke(ctx, pluginID, "call", body)
+	resp, err := s.pluginRuntime.InvokeConstrained(ctx, pluginID, "call", body, plugin.InvokeConstraints{OperatorTargets: operatorTargets})
 	if err != nil {
 		return nil, err
 	}
@@ -255,9 +286,14 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 // matching UI action scopes, because ViewAction.Scopes are part of the security
 // contract and must not be frontend-only.
 func (s *Server) pluginCallScopes(pluginID, service, method string) ([]string, bool) {
+	contract, ok := s.pluginCallMethod(pluginID, service, method)
+	return contract.Scopes, ok
+}
+
+func (s *Server) pluginCallMethod(pluginID, service, method string) (plugin.InterfaceMethod, bool) {
 	inst, ok := s.store.PluginInstallation(pluginID)
 	if !ok || inst.Status != model.PluginStatusActive {
-		return nil, false
+		return plugin.InterfaceMethod{}, false
 	}
 	for _, pl := range s.plugins {
 		if pl.Manifest.ID != pluginID {
@@ -267,24 +303,47 @@ func (s *Server) pluginCallScopes(pluginID, service, method string) ([]string, b
 			if c.Service != service {
 				continue
 			}
-			for _, m := range c.Methods {
-				if m == method {
-					scopes := append([]string(nil), c.Scopes...)
-					if pl.Manifest.UI != nil {
-						for _, v := range pl.Manifest.UI.Views {
-							for _, a := range v.Actions {
-								if a.Interface == service && a.Method == method {
-									scopes = append(scopes, a.Scopes...)
-								}
+			if methodContract, declared := c.MethodContract(method); declared {
+				methodScopes, _ := c.EffectiveMethodScopes(method)
+				scopes := append([]string(nil), methodScopes...)
+				if pl.Manifest.UI != nil {
+					for _, v := range pl.Manifest.UI.Views {
+						for _, a := range v.Actions {
+							if a.Interface == service && a.Method == method {
+								scopes = append(scopes, a.Scopes...)
 							}
 						}
 					}
-					return uniqueStrings(scopes), true
 				}
+				methodContract.Scopes = uniqueStrings(scopes)
+				return methodContract, true
 			}
 		}
 	}
-	return nil, false
+	return plugin.InterfaceMethod{}, false
+}
+
+func extractOperatorTargets(payload json.RawMessage, fields []string) ([]string, error) {
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	var values map[string]json.RawMessage
+	if len(payload) == 0 || json.Unmarshal(payload, &values) != nil {
+		return nil, errors.New("plugin method payload must be an object with operator target fields")
+	}
+	targets := make([]string, 0, len(fields))
+	for _, field := range fields {
+		var target string
+		if raw := values[field]; len(raw) == 0 || json.Unmarshal(raw, &target) != nil || strings.TrimSpace(target) == "" {
+			return nil, fmt.Errorf("operator target field %q must be a non-empty string", field)
+		}
+		target = strings.TrimSpace(target)
+		if err := outbound.GuardOperatorURL(target); err != nil {
+			return nil, fmt.Errorf("operator target field %q is invalid: %w", field, err)
+		}
+		targets = append(targets, target)
+	}
+	return uniqueStrings(targets), nil
 }
 
 func (s *Server) recordPluginCallAudit(p principal, pluginID, service, method string, scopes []string, decision, reason string) {

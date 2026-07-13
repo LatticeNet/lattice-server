@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -123,15 +124,9 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 		return RunnerStartResult{}, fmt.Errorf("invalid plugin id %q", pluginID)
 	}
 
-	artifactPath := filepath.Join(req.Loaded.BundlePath, artifactFileName)
-	data, err := os.ReadFile(artifactPath)
+	data, err := r.verifiedRuntimeBytes(req.Loaded)
 	if err != nil {
-		return RunnerStartResult{}, fmt.Errorf("read artifact: %w", err)
-	}
-	if req.Loaded.Manifest.DigestSHA256 != "" {
-		if err := verifyDigest(req.Loaded.Manifest.DigestSHA256, data); err != nil {
-			return RunnerStartResult{}, fmt.Errorf("artifact digest mismatch at start: %w", err)
-		}
+		return RunnerStartResult{}, err
 	}
 
 	workDir := filepath.Join(r.opts.RuntimeDir, pluginID)
@@ -150,6 +145,96 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker}
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
+}
+
+func (r *SystemRunner) verifiedRuntimeBytes(loaded Loaded) ([]byte, error) {
+	if loaded.Manifest.Schema != ManifestSchemaV2 {
+		artifactPath := loaded.ArtifactPath
+		if artifactPath == "" {
+			artifactPath = filepath.Join(loaded.BundlePath, artifactFileName)
+		}
+		data, err := os.ReadFile(artifactPath)
+		if err != nil {
+			return nil, fmt.Errorf("read artifact: %w", err)
+		}
+		if loaded.Manifest.DigestSHA256 != "" {
+			if err := verifyDigest(loaded.Manifest.DigestSHA256, data); err != nil {
+				return nil, fmt.Errorf("artifact digest mismatch at start: %w", err)
+			}
+		}
+		return data, nil
+	}
+	if loaded.Manifest.Bundle == nil || loaded.ArtifactDigest != loaded.Manifest.Bundle.DigestSHA256 {
+		return nil, errors.New("v2 loaded bundle digest metadata is inconsistent")
+	}
+	artifactPath := loaded.ArtifactPath
+	if artifactPath == "" {
+		artifactPath = filepath.Join(loaded.BundlePath, artifactFileName)
+	}
+	limit := normalizedBundleLimits(loaded.BundleLimits).MaxCompressedBytes
+	archive, err := readBoundedRegularFile(artifactPath, limit)
+	if err != nil {
+		return nil, fmt.Errorf("read v2 bundle artifact: %w", err)
+	}
+	if err := verifyDigest(loaded.Manifest.Bundle.DigestSHA256, archive); err != nil {
+		return nil, fmt.Errorf("v2 bundle digest mismatch at start: %w", err)
+	}
+	if loaded.ExtractedRoot == "" || loaded.RuntimeEntry == "" || loaded.RuntimePath == "" {
+		return nil, errors.New("v2 loaded plugin has no selected runtime metadata")
+	}
+	if !safeBundlePath(loaded.RuntimeEntry) {
+		return nil, errors.New("v2 loaded plugin has invalid runtime entry")
+	}
+	wantPath := filepath.Join(loaded.ExtractedRoot, filepath.FromSlash(loaded.RuntimeEntry))
+	if filepath.Clean(loaded.RuntimePath) != filepath.Clean(wantPath) {
+		return nil, errors.New("v2 runtime path does not match extracted root and entry")
+	}
+	want, ok := loaded.Inventory[loaded.RuntimeEntry]
+	if !ok {
+		return nil, errors.New("v2 runtime is missing from verified inventory")
+	}
+	if err := validateRuntimePath(loaded.ExtractedRoot, loaded.RuntimePath, os.FileMode(want.Mode)); err != nil {
+		return nil, fmt.Errorf("v2 runtime metadata validation failed: %w", err)
+	}
+	data, err := os.ReadFile(loaded.RuntimePath)
+	if err != nil {
+		return nil, fmt.Errorf("read v2 runtime: %w", err)
+	}
+	if int64(len(data)) != want.Size || DigestSHA256(data) != want.SHA256 {
+		return nil, errors.New("v2 runtime size or digest differs from verified inventory")
+	}
+	return data, nil
+}
+
+func validateRuntimePath(root, runtimePath string, wantMode os.FileMode) error {
+	root = filepath.Clean(root)
+	runtimePath = filepath.Clean(runtimePath)
+	rel, err := filepath.Rel(root, runtimePath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return errors.New("runtime path escapes extracted root")
+	}
+	current := root
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i, part := range parts {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("path component %q is a symlink", current)
+		}
+		if i < len(parts)-1 {
+			if !info.IsDir() || info.Mode().Perm() != 0o700 {
+				return fmt.Errorf("path component %q is not a secure directory", current)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != wantMode.Perm() {
+			return fmt.Errorf("runtime %q is not a regular file with mode %o", current, wantMode.Perm())
+		}
+	}
+	return nil
 }
 
 // Stop clears the plugin's staged state and removes its runtime dir. In-flight
@@ -197,6 +282,10 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	}
 	runCtx, cancel := context.WithTimeout(ctx, r.opts.InvokeTimeout)
 	defer cancel()
+	runCtx, err := BindOperatorTargets(runCtx, req.Constraints.OperatorTargets)
+	if err != nil {
+		return InvokeResponse{}, fmt.Errorf("bind operator targets: %w", err)
+	}
 
 	reply, stderr, runErr := r.runInvocation(runCtx, req, execPath, workDir, broker)
 	if runErr != nil {
@@ -427,7 +516,7 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 			return nil, fmt.Errorf("rpc.call params: %w", err)
 		}
 		return broker.RPCCall(ctx, req.Service, req.Method, req.Request)
-	case "http.do":
+	case "http.do", "http.operator.do":
 		var req struct {
 			Method     string            `json:"method,omitempty"`
 			URL        string            `json:"url"`
@@ -436,17 +525,24 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 			BodyBase64 string            `json:"body_base64,omitempty"`
 		}
 		if err := json.Unmarshal(call.Params, &req); err != nil {
-			return nil, fmt.Errorf("http.do params: %w", err)
+			return nil, fmt.Errorf("%s params: %w", call.Method, err)
 		}
 		body := []byte(req.Body)
 		if req.BodyBase64 != "" {
 			decoded, err := base64.StdEncoding.DecodeString(req.BodyBase64)
 			if err != nil {
-				return nil, fmt.Errorf("http.do body_base64: %w", err)
+				return nil, fmt.Errorf("%s body_base64: %w", call.Method, err)
 			}
 			body = decoded
 		}
-		resp, err := broker.HTTPDo(ctx, HostHTTPRequest{Method: req.Method, URL: req.URL, Header: req.Header, Body: body})
+		hostReq := HostHTTPRequest{Method: req.Method, URL: req.URL, Header: req.Header, Body: body}
+		var resp HostHTTPResponse
+		var err error
+		if call.Method == "http.operator.do" {
+			resp, err = broker.HTTPOperatorDo(ctx, hostReq)
+		} else {
+			resp, err = broker.HTTPDo(ctx, hostReq)
+		}
 		if err != nil {
 			return nil, err
 		}

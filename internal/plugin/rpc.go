@@ -52,14 +52,14 @@ type rpcService struct {
 type RPCRegistry struct {
 	mu       sync.RWMutex
 	services map[string]*rpcService
-	grants   map[string]map[string]struct{} // service -> set of allowed caller plugin ids
+	grants   map[string]map[string]map[string]struct{} // service -> caller -> allowed methods ("*" grants all)
 }
 
 // NewRPCRegistry returns an empty registry.
 func NewRPCRegistry() *RPCRegistry {
 	return &RPCRegistry{
 		services: map[string]*rpcService{},
-		grants:   map[string]map[string]struct{}{},
+		grants:   map[string]map[string]map[string]struct{}{},
 	}
 }
 
@@ -102,11 +102,23 @@ func (r *RPCRegistry) Unregister(service string) {
 // Allow grants callerPluginID permission to call service. Grants are directed and
 // additive; a service owner can always call its own service.
 func (r *RPCRegistry) Allow(callerPluginID, service string) {
+	r.AllowMethods(callerPluginID, service, []string{"*"})
+}
+
+// AllowMethods grants only the named methods. This prevents a plugin from
+// inheriting future methods added to a dependency service.
+func (r *RPCRegistry) AllowMethods(callerPluginID, service string, methods []string) {
 	r.mu.Lock()
 	if r.grants[service] == nil {
-		r.grants[service] = map[string]struct{}{}
+		r.grants[service] = map[string]map[string]struct{}{}
 	}
-	r.grants[service][callerPluginID] = struct{}{}
+	set := map[string]struct{}{}
+	for _, method := range methods {
+		if method != "" {
+			set[method] = struct{}{}
+		}
+	}
+	r.grants[service][callerPluginID] = set
 	r.mu.Unlock()
 }
 
@@ -162,7 +174,11 @@ func (r *RPCRegistry) Call(ctx context.Context, caller, service, method string, 
 	svc := r.services[service]
 	allowed := false
 	if svc != nil {
-		_, allowed = r.grants[service][caller]
+		if methods := r.grants[service][caller]; methods != nil {
+			_, wildcard := methods["*"]
+			_, exact := methods[method]
+			allowed = wildcard || exact
+		}
 		if caller == svc.owner {
 			allowed = true
 		}

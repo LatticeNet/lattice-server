@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -153,6 +155,36 @@ func TestPluginHostServicesHTTPUsesOutboundGuard(t *testing.T) {
 		t.Fatalf("expected outbound guard to block loopback, got %v", err)
 	}
 	requirePluginHostAudit(t, st, "plugin.host.http.do", "http:egress", "http-plugin", "allow", "req-plugin-http")
+}
+
+func TestPluginHostServicesOperatorTargetAllowsLoopbackOnlyWithExplicitCapability(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/secret/status" {
+			t.Fatalf("unexpected operator target path %q", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	srv, st := newServerForPluginHost(t)
+	ctx := context.WithValue(context.Background(), requestIDContextKey{}, "req-plugin-operator-http")
+	ctx, err := plugin.BindOperatorTargets(ctx, []string{target.URL + "/secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := plugin.NewBroker(plugin.Loaded{
+		Manifest: plugin.Manifest{ID: "operator-http-plugin", Name: "Operator HTTP Plugin", Type: plugin.TypeSystem,
+			Capabilities: []string{"http:operator-target"}},
+		Capabilities: []string{"http:operator-target"},
+	}, srv.pluginHostServices())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := broker.HTTPOperatorDo(ctx, plugin.HostHTTPRequest{Method: http.MethodGet, URL: target.URL + "/secret/status"})
+	if err != nil || resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("operator target response=%+v err=%v", resp, err)
+	}
+	requirePluginHostAudit(t, st, "plugin.host.http.operator.do", "http:operator-target", "operator-http-plugin", "allow", "req-plugin-operator-http")
 }
 
 func TestPluginHostServicesHTTPRejectsOversizedRequestBodyBeforeDial(t *testing.T) {

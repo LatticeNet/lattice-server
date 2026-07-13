@@ -55,9 +55,17 @@ type Runner interface {
 // JSON body handed to the plugin; the runner frames {action,payload} as a single
 // stdin line and reads the reply from stdout.
 type InvokeRequest struct {
-	PluginID string
-	Action   string
-	Payload  json.RawMessage
+	PluginID    string
+	Action      string
+	Payload     json.RawMessage
+	Constraints InvokeConstraints
+}
+
+// InvokeConstraints are host-owned, invocation-scoped grants. They are never
+// serialized to the child process and therefore cannot be expanded by plugin
+// code after the operator call has been authorized.
+type InvokeConstraints struct {
+	OperatorTargets []string
 }
 
 // InvokeResponse is the decoded plugin reply. Result carries the plugin's body
@@ -261,6 +269,10 @@ func (m *RuntimeManager) IsArmed(pluginID string) bool {
 // runner is not an Invoker (e.g. the noop runner), so a disabled or
 // execution-disabled plugin can never be invoked.
 func (m *RuntimeManager) Invoke(ctx context.Context, pluginID, action string, payload json.RawMessage) (InvokeResponse, error) {
+	return m.InvokeConstrained(ctx, pluginID, action, payload, InvokeConstraints{})
+}
+
+func (m *RuntimeManager) InvokeConstrained(ctx context.Context, pluginID, action string, payload json.RawMessage, constraints InvokeConstraints) (InvokeResponse, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -277,7 +289,7 @@ func (m *RuntimeManager) Invoke(ctx context.Context, pluginID, action string, pa
 	if !ok {
 		return InvokeResponse{}, fmt.Errorf("plugin %q runner %q does not support invocation", pluginID, inst.runner.Name())
 	}
-	return inv.Invoke(ctx, InvokeRequest{PluginID: pluginID, Action: action, Payload: payload})
+	return inv.Invoke(ctx, InvokeRequest{PluginID: pluginID, Action: action, Payload: payload, Constraints: constraints})
 }
 
 func (m *RuntimeManager) runnerFor(pluginType string) Runner {

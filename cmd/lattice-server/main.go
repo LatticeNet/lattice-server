@@ -45,6 +45,7 @@ func main() {
 	var pluginDir string
 	var pluginTrust string
 	var pluginRuntimeDir string
+	var pluginBundleCacheDir string
 	var pluginRuntimeEnv string
 	var runtimeBoltHotStore string
 	var masterKeyFile string
@@ -70,6 +71,7 @@ func main() {
 	flag.StringVar(&pluginDir, "plugin-dir", env("LATTICE_PLUGIN_DIR", ""), "directory of installed plugin bundles (empty disables plugins)")
 	flag.StringVar(&pluginTrust, "plugin-trust", env("LATTICE_PLUGIN_TRUST", ""), "path to the operator plugin trust policy JSON")
 	flag.StringVar(&pluginRuntimeDir, "plugin-runtime-dir", env("LATTICE_PLUGIN_RUNTIME_DIR", ""), "writable dir enabling the Tier-2 system runner (empty keeps the noop runner)")
+	flag.StringVar(&pluginBundleCacheDir, "plugin-bundle-cache-dir", env("LATTICE_PLUGIN_BUNDLE_CACHE_DIR", ""), "private content-addressed extraction cache for signed plugin v2 bundles")
 	flag.StringVar(&pluginRuntimeEnv, "plugin-runtime-env", env("LATTICE_PLUGIN_RUNTIME_ENV", ""), "comma/space-separated environment variable allowlist forwarded to Tier-2 system plugins")
 	flag.StringVar(&runtimeBoltHotStore, "runtime-bolt-hot-store", env("LATTICE_RUNTIME_BOLT_HOT_STORE", ""), "optional bbolt sidecar for high-churn runtime domains (audit, sessions, proxy usage)")
 	flag.StringVar(&masterKeyFile, "master-key-file", env("LATTICE_MASTER_KEY_FILE", ""), "path to the at-rest encryption master key file (auto-generated under the data dir if unset)")
@@ -168,18 +170,19 @@ func main() {
 			DashboardRef:   os.Getenv("LATTICE_DASHBOARD_COMMIT"),
 			DashboardBuilt: os.Getenv("LATTICE_DASHBOARD_BUILT_AT"),
 		},
-		SecureCookies:    secureCookies,
-		TrustProxy:       trustProxy,
-		RequireTOTP:      requireTOTP,
-		PluginDir:        pluginDir,
-		PluginRuntimeDir: pluginRuntimeDir,
-		PluginRuntimeEnv: pluginRuntimeEnvAllowlist,
-		PluginTrust:      trustPolicy,
-		PublicURL:        publicURL,
-		MetricsToken:     os.Getenv("LATTICE_METRICS_TOKEN"),
-		CoreDNSBinary:    selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
-		GeoResolver:      geoResolver,
-		AgentReleaseRepo: agentReleaseRepo,
+		SecureCookies:        secureCookies,
+		TrustProxy:           trustProxy,
+		RequireTOTP:          requireTOTP,
+		PluginDir:            pluginDir,
+		PluginBundleCacheDir: pluginBundleCacheDir,
+		PluginRuntimeDir:     pluginRuntimeDir,
+		PluginRuntimeEnv:     pluginRuntimeEnvAllowlist,
+		PluginTrust:          trustPolicy,
+		PublicURL:            publicURL,
+		MetricsToken:         os.Getenv("LATTICE_METRICS_TOKEN"),
+		CoreDNSBinary:        selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
+		GeoResolver:          geoResolver,
+		AgentReleaseRepo:     agentReleaseRepo,
 		AuditHeadShipping: server.AuditHeadShippingOptions{
 			URL:         auditHeadWebhookURL,
 			BearerToken: auditHeadWebhookToken,

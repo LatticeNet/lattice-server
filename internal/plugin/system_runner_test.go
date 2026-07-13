@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -212,6 +213,84 @@ func TestSystemRunnerDigestMatch(t *testing.T) {
 	}
 }
 
+func TestSystemRunnerV2StagesVerifiedSelectedRuntime(t *testing.T) {
+	script := "#!/bin/sh\nread line\necho '{\"ok\":true,\"result\":{\"v2\":true}}'\n"
+	archive := makeTestArchive(t,
+		testArchiveEntry{name: "bin/linux-amd64/plugin", body: []byte(script)},
+		testArchiveEntry{name: "ui/index.html", body: []byte("ui")},
+	)
+	m := testManifestForArchive(archive)
+	extracted, err := ExtractBundleV2(t.TempDir(), m, archive, "linux/amd64", DefaultBundleLimits(), testV2TrustPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, artifactFileName), archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded := Loaded{
+		Manifest: m, Capabilities: append([]string(nil), m.Capabilities...), BundlePath: source,
+		ArtifactPath: filepath.Join(source, artifactFileName), ArtifactDigest: m.Bundle.DigestSHA256,
+		ExtractedRoot: extracted.Root, RuntimeEntry: "bin/linux-amd64/plugin", RuntimePath: extracted.RuntimePath,
+		UIRoot: extracted.UIRoot, UIEntry: extracted.UIEntry, Inventory: extracted.Inventory,
+		BundleLimits: DefaultBundleLimits(),
+	}
+	r := newRunner(t, SystemRunnerOptions{})
+	resp, err := startInvoke(t, r, loaded, "call", nil)
+	if err != nil || !resp.OK || string(resp.Result) != `{"v2":true}` {
+		t.Fatalf("v2 runtime failed: resp=%+v err=%v", resp, err)
+	}
+}
+
+func TestSystemRunnerV2RejectsSourceAndCacheTampering(t *testing.T) {
+	archive := makeTestArchive(t,
+		testArchiveEntry{name: "bin/linux-amd64/plugin", body: []byte("#!/bin/sh\necho '{\"ok\":true}'\n")},
+		testArchiveEntry{name: "ui/index.html", body: []byte("ui")},
+	)
+	m := testManifestForArchive(archive)
+	cache := t.TempDir()
+	extracted, err := ExtractBundleV2(cache, m, archive, "linux/amd64", DefaultBundleLimits(), testV2TrustPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := t.TempDir()
+	artifactPath := filepath.Join(source, artifactFileName)
+	if err := os.WriteFile(artifactPath, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded := Loaded{
+		Manifest: m, Capabilities: m.Capabilities, BundlePath: source,
+		ArtifactPath: artifactPath, ArtifactDigest: m.Bundle.DigestSHA256,
+		ExtractedRoot: extracted.Root, RuntimeEntry: "bin/linux-amd64/plugin", RuntimePath: extracted.RuntimePath,
+		Inventory: extracted.Inventory, BundleLimits: DefaultBundleLimits(),
+	}
+
+	if err := os.WriteFile(artifactPath, []byte("tampered source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newRunner(t, SystemRunnerOptions{}).Start(context.Background(), RunnerStartRequest{PluginID: m.ID, Loaded: loaded}); err == nil || !strings.Contains(err.Error(), "bundle digest") {
+		t.Fatalf("expected source bundle digest rejection, got %v", err)
+	}
+
+	loaded.BundleLimits.MaxCompressedBytes = int64(len(archive) + 1)
+	if err := os.WriteFile(artifactPath, bytes.Repeat([]byte("x"), len(archive)+2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newRunner(t, SystemRunnerOptions{}).Start(context.Background(), RunnerStartRequest{PluginID: m.ID, Loaded: loaded}); err == nil || !strings.Contains(err.Error(), "compressed size") {
+		t.Fatalf("expected bounded source archive rejection, got %v", err)
+	}
+
+	if err := os.WriteFile(artifactPath, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(extracted.RuntimePath, []byte("tampered cache"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newRunner(t, SystemRunnerOptions{}).Start(context.Background(), RunnerStartRequest{PluginID: m.ID, Loaded: loaded}); err == nil || !strings.Contains(err.Error(), "runtime") {
+		t.Fatalf("expected cached runtime rejection, got %v", err)
+	}
+}
+
 func TestSystemRunnerHostCallBridge(t *testing.T) {
 	r := newRunner(t, SystemRunnerOptions{})
 	script := `#!/bin/sh
@@ -273,6 +352,36 @@ printf '{"ok":true,"result":{"rpc":%s,"http":%s}}\n' "$rpc" "$http"
 	}
 	if !got.HTTP.HostResponse.OK || got.HTTP.HostResponse.Result.StatusCode != 202 || services.httpCalls != 1 {
 		t.Fatalf("http host response wrong: %+v calls=%d", got.HTTP.HostResponse, services.httpCalls)
+	}
+}
+
+func TestDispatchHostCallOperatorHTTP(t *testing.T) {
+	services := &fakeHostServices{kvValues: map[string][]byte{}}
+	broker, err := NewBroker(Loaded{
+		Manifest: Manifest{ID: "p.operator", Name: "Operator", Type: TypeSystem,
+			Capabilities: []string{"http:operator-target"}},
+		Capabilities: []string{"http:operator-target"},
+	}, HostServices{
+		OperatorHTTP:     services,
+		Audit:            services,
+		GuardOperatorURL: func(string) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundCtx, err := BindOperatorTargets(context.Background(), []string{"https://10.0.0.5/secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := dispatchHostCall(boundCtx, broker, systemHostCall{
+		ID: "operator", Method: "http.operator.do",
+		Params: json.RawMessage(`{"method":"PATCH","url":"https://10.0.0.5/secret","body":"payload"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if services.operatorHTTPCalls != 1 || !bytes.Contains(result, []byte(`"status_code":202`)) {
+		t.Fatalf("operator host call result=%s calls=%d", result, services.operatorHTTPCalls)
 	}
 }
 

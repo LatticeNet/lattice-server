@@ -164,6 +164,11 @@ generate `/var/lib/lattice/master.key` automatically. Set it only when restoring
 or mounting a pre-existing key. The entrypoint fixes ownership of the mounted
 data directory before dropping privileges to the `lattice` user.
 
+Manifest-v2 plugins require a writable private extraction cache, for example
+`LATTICE_PLUGIN_BUNDLE_CACHE_DIR=/var/lib/lattice/plugin-bundles`. Keep this
+separate from both the read-only plugin source mount (`LATTICE_PLUGIN_DIR`) and
+the executable working directories (`LATTICE_PLUGIN_RUNTIME_DIR`).
+
 Dashboard static serving is cache-aware: `index.html`, SPA fallback routes, and
 `theme-init.js` are served with `Cache-Control: no-cache`; content-hashed Vite
 assets under `/assets/` are served with `Cache-Control: public, max-age=31536000,

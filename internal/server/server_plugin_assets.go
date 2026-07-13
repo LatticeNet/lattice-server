@@ -3,7 +3,9 @@ package server
 import (
 	"bytes"
 	"errors"
+	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -89,7 +91,7 @@ func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset 
 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'")
+	w.Header().Set("Content-Security-Policy", pluginAssetCSP(s.publicURL, pluginAssetRequestOrigin(r)))
 	if strings.EqualFold(filepath.Ext(assetPath), ".html") {
 		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 		w.Header().Set("Cache-Control", "private, no-cache, max-age=0, must-revalidate")
@@ -99,6 +101,65 @@ func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset 
 		w.Header().Set("Cache-Control", "private, no-cache, max-age=0, must-revalidate")
 	}
 	http.ServeContent(w, r, filepath.Base(assetPath), time.Time{}, bytes.NewReader(data))
+}
+
+func pluginAssetCSP(publicURL, requestOrigin string) string {
+	assetSources := "'self'"
+	origin := canonicalPluginAssetOrigin(publicURL)
+	if origin == "" {
+		origin = canonicalPluginAssetOrigin(requestOrigin)
+	}
+	if origin != "" {
+		// Sandboxed plugin documents intentionally have an opaque origin. Their
+		// signed external assets therefore need the configured control-plane
+		// origin in addition to 'self', which does not match from an opaque origin.
+		assetSources += " " + origin
+	}
+	return "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; " +
+		"object-src 'none'; style-src " + assetSources + "; script-src " + assetSources + "; " +
+		"img-src " + assetSources + " data:; font-src " + assetSources + "; connect-src 'none'"
+}
+
+func pluginAssetRequestOrigin(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+func canonicalPluginAssetOrigin(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" ||
+		parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	hostname := parsed.Hostname()
+	if hostname == "" || (net.ParseIP(hostname) == nil && !validPluginAssetDNSHost(hostname)) {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+func validPluginAssetDNSHost(host string) bool {
+	if len(host) > 253 || strings.Contains(host, "..") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+				(char < '0' || char > '9') && char != '-' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func pluginAssetContentType(ext string) (string, bool) {

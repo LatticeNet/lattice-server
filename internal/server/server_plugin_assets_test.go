@@ -110,6 +110,7 @@ func newPluginAssetTestServer(t *testing.T) (*Server, http.Handler, []*http.Cook
 		PluginDir: pluginRoot, PluginBundleCacheDir: t.TempDir(),
 		PluginRuntimeDir: t.TempDir(),
 		PluginTrust:      plugin.TrustPolicy{TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": pub}},
+		PublicURL:        "https://lattice.example.test",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -245,7 +246,10 @@ func TestPluginAssetHeadersCacheAndPathValidation(t *testing.T) {
 	if got := html.Header.Get("X-Frame-Options"); got != "SAMEORIGIN" {
 		t.Fatalf("plugin HTML frame policy=%q", got)
 	}
-	if csp := html.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "connect-src 'none'") || !strings.Contains(csp, "frame-ancestors 'self'") {
+	if csp := html.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "connect-src 'none'") ||
+		!strings.Contains(csp, "frame-ancestors 'self'") ||
+		!strings.Contains(csp, "script-src 'self' https://lattice.example.test") ||
+		!strings.Contains(csp, "style-src 'self' https://lattice.example.test") {
 		t.Fatalf("plugin CSP=%q", csp)
 	}
 	if cache := html.Header.Get("Cache-Control"); !strings.Contains(cache, "no-cache") {
@@ -289,5 +293,31 @@ func TestPluginAssetHeadersCacheAndPathValidation(t *testing.T) {
 	core.Body.Close()
 	if core.Header.Get("X-Frame-Options") != "DENY" || strings.Contains(core.Header.Get("Content-Security-Policy"), "frame-ancestors 'self'") {
 		t.Fatalf("core security headers were relaxed: frame=%q csp=%q", core.Header.Get("X-Frame-Options"), core.Header.Get("Content-Security-Policy"))
+	}
+}
+
+func TestPluginAssetCSPOnlyAcceptsCanonicalHTTPOrigins(t *testing.T) {
+	valid := pluginAssetCSP("https://lattice.example.test:8443", "http://ignored.test")
+	if !strings.Contains(valid, "script-src 'self' https://lattice.example.test:8443") ||
+		!strings.Contains(valid, "img-src 'self' https://lattice.example.test:8443 data:") {
+		t.Fatalf("valid public origin missing from CSP: %q", valid)
+	}
+
+	for _, invalid := range []string{
+		"https://lattice.example.test/path",
+		"https://user@lattice.example.test",
+		"javascript:alert(1)",
+		"https://lattice.example.test/#fragment",
+		"https://lattice.example.test;script-src.example",
+	} {
+		csp := pluginAssetCSP(invalid, "")
+		if strings.Contains(csp, invalid) || !strings.Contains(csp, "script-src 'self';") {
+			t.Fatalf("invalid public URL %q affected CSP: %q", invalid, csp)
+		}
+	}
+
+	fallback := pluginAssetCSP("", "http://127.0.0.1:8088")
+	if !strings.Contains(fallback, "script-src 'self' http://127.0.0.1:8088") {
+		t.Fatalf("request origin fallback missing from CSP: %q", fallback)
 	}
 }

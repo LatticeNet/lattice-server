@@ -92,6 +92,12 @@ func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", pluginAssetCSP(s.publicURL, pluginAssetRequestOrigin(r)))
+	if !asset.isEntrypoint {
+		// The sandboxed entrypoint has an opaque origin, so its external scripts
+		// and styles use credentialless CORS. These resources remain bound to an
+		// active, verified bundle by plugin ID, digest, and inventory path.
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
 	if strings.EqualFold(filepath.Ext(assetPath), ".html") {
 		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
 		w.Header().Set("Cache-Control", "private, no-cache, max-age=0, must-revalidate")

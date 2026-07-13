@@ -63,8 +63,9 @@ func newPluginAssetTestServer(t *testing.T) (*Server, http.Handler, []*http.Cook
 	}
 	archive := makeServerPluginV2Archive(t, map[string][]byte{
 		"bin/" + runtime.GOOS + "-" + runtime.GOARCH + "/plugin": []byte("#!/bin/sh\nread line\necho '{\"ok\":true,\"result\":{\"source\":\"runtime\"}}'\n"),
-		"ui/index.html":                 []byte("<!doctype html><main>Plugin UI</main>"),
-		"ui/assets/app.0123456789ab.js": []byte("globalThis.pluginLoaded = true"),
+		"ui/index.html":                  []byte("<!doctype html><main>Plugin UI</main>"),
+		"ui/assets/app.0123456789ab.css": []byte("main { display: block; }"),
+		"ui/assets/app.0123456789ab.js":  []byte("globalThis.pluginLoaded = true"),
 	})
 	m := plugin.Manifest{
 		Schema: plugin.ManifestSchemaV2,
@@ -258,11 +259,30 @@ func TestPluginAssetHeadersCacheAndPathValidation(t *testing.T) {
 	if got := html.Header.Get("X-Content-Type-Options"); got != "nosniff" {
 		t.Fatalf("nosniff=%q", got)
 	}
+	if got := html.Header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("authenticated HTML must not expose wildcard CORS, got %q", got)
+	}
 
-	js := doJSON(t, handler, http.MethodGet, base+"/ui/assets/app.0123456789ab.js", "", cookies, "")
-	js.Body.Close()
-	if js.StatusCode != http.StatusOK || js.Header.Get("Content-Type") != "text/javascript; charset=utf-8" || !strings.Contains(js.Header.Get("Cache-Control"), "immutable") {
-		t.Fatalf("hashed JS headers: status=%d type=%q cache=%q", js.StatusCode, js.Header.Get("Content-Type"), js.Header.Get("Cache-Control"))
+	for _, asset := range []struct {
+		path        string
+		contentType string
+	}{
+		{path: "/ui/assets/app.0123456789ab.js", contentType: "text/javascript; charset=utf-8"},
+		{path: "/ui/assets/app.0123456789ab.css", contentType: "text/css; charset=utf-8"},
+	} {
+		request := httptest.NewRequest(http.MethodGet, base+asset.path, nil)
+		request.Header.Set("Origin", "null")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Header().Get("Content-Type") != asset.contentType || !strings.Contains(response.Header().Get("Cache-Control"), "immutable") {
+			t.Fatalf("hashed asset %q headers: status=%d type=%q cache=%q", asset.path, response.Code, response.Header().Get("Content-Type"), response.Header().Get("Cache-Control"))
+		}
+		if got := response.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Fatalf("opaque-origin plugin subresource %q CORS=%q, want wildcard credentialless access", asset.path, got)
+		}
+		if got := response.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Fatalf("plugin subresource %q must remain credentialless, got credentials header %q", asset.path, got)
+		}
 	}
 
 	badPaths := []string{

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -435,5 +436,89 @@ func TestExtractOperatorTargetsRequiresDeclaredPayloadField(t *testing.T) {
 		if _, err := extractOperatorTargets(payload, []string{"base_url"}); err == nil {
 			t.Fatalf("payload %s must not mint an operator target", payload)
 		}
+	}
+}
+
+// The raw invoke channel is gated only by plugin:admin. It must therefore never reach
+// an action with an effect on domain state: `call` and `plan` would bypass the
+// manifest's per-method scopes and operator-target binding, and `execute` would bypass
+// the plan/approval/one-time-capability binding entirely.
+func TestPluginInvokeRefusesNonDiagnosticActions(t *testing.T) {
+	pluginRoot := t.TempDir()
+	bundle := filepath.Join(pluginRoot, "test.exec")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "manifest.json"),
+		[]byte(`{"id":"test.exec","name":"Exec Test","type":"system","capabilities":["node:read"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The artifact would happily answer anything; the host must refuse before it runs.
+	script := "#!/bin/sh\nread line\necho '{\"ok\":true,\"message\":\"executed\",\"result\":{\"ran\":true}}'\n"
+	if err := os.WriteFile(filepath.Join(bundle, "artifact"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{
+		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
+		PluginDir:        pluginRoot,
+		PluginRuntimeDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+
+	for _, status := range []string{"installed", "active"} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle",
+			`{"id":"test.exec","status":"`+status+`"}`, cookies, csrf)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("lifecycle %s: %d", status, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	for _, action := range []string{"call", "plan", "execute", "migrate", "anything"} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/invoke",
+			`{"id":"test.exec","action":"`+action+`"}`, cookies, csrf)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("invoke %q: want 403, got %d (%s)", action, resp.StatusCode, body)
+		}
+		if bytes.Contains(body, []byte("executed")) {
+			t.Fatalf("invoke %q reached the artifact: %s", action, body)
+		}
+	}
+
+	// Diagnostics remain reachable.
+	for _, action := range []string{"describe", "health"} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/invoke",
+			`{"id":"test.exec","action":"`+action+`"}`, cookies, csrf)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("invoke %q: want 200, got %d", action, resp.StatusCode)
+		}
+	}
+}
+
+// An operator target may carry its secret in the URL path. url.Parse errors echo the
+// URL they failed on, and that text reaches both the audit record and the API
+// response, so the guard's reason must be surfaced without the value.
+func TestOperatorTargetErrorRedactsSecret(t *testing.T) {
+	const secret = "https://sub.example.test/aVerySecretToken123/api"
+	payload := json.RawMessage(`{"base_url":"` + secret + "\x7f" + `"}`)
+
+	_, err := extractOperatorTargets(payload, []string{"base_url"})
+	if err == nil {
+		t.Fatal("want an error for a malformed operator target")
+	}
+	if strings.Contains(err.Error(), "aVerySecretToken123") {
+		t.Fatalf("operator target secret leaked into the error: %q", err)
 	}
 }

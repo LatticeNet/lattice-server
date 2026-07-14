@@ -317,7 +317,7 @@ func TestPluginAssetHeadersCacheAndPathValidation(t *testing.T) {
 }
 
 func TestPluginAssetCSPOnlyAcceptsCanonicalHTTPOrigins(t *testing.T) {
-	valid := pluginAssetCSP("https://lattice.example.test:8443", "http://ignored.test")
+	valid := pluginAssetCSP("https://lattice.example.test:8443")
 	if !strings.Contains(valid, "script-src 'self' https://lattice.example.test:8443") ||
 		!strings.Contains(valid, "img-src 'self' https://lattice.example.test:8443 data:") {
 		t.Fatalf("valid public origin missing from CSP: %q", valid)
@@ -330,14 +330,25 @@ func TestPluginAssetCSPOnlyAcceptsCanonicalHTTPOrigins(t *testing.T) {
 		"https://lattice.example.test/#fragment",
 		"https://lattice.example.test;script-src.example",
 	} {
-		csp := pluginAssetCSP(invalid, "")
+		csp := pluginAssetCSP(invalid)
 		if strings.Contains(csp, invalid) || !strings.Contains(csp, "script-src 'self';") {
 			t.Fatalf("invalid public URL %q affected CSP: %q", invalid, csp)
 		}
 	}
+}
 
-	fallback := pluginAssetCSP("", "http://127.0.0.1:8088")
-	if !strings.Contains(fallback, "script-src 'self' http://127.0.0.1:8088") {
-		t.Fatalf("request origin fallback missing from CSP: %q", fallback)
+// The policy that confines plugin code must never be derived from the request being
+// confined: a caller-controlled Host header could otherwise name a script source.
+// Asset serving fails closed when the public URL is unset, so no request-derived
+// origin can reach the CSP.
+func TestPluginAssetCSPIgnoresRequestOrigin(t *testing.T) {
+	csp := pluginAssetCSP("")
+	if !strings.Contains(csp, "script-src 'self';") {
+		t.Fatalf("unset public URL must yield a bare 'self' script-src: %q", csp)
+	}
+	for _, host := range []string{"127.0.0.1:8088", "evil.test", "lattice.example.test"} {
+		if strings.Contains(csp, host) {
+			t.Fatalf("request-derived host %q leaked into CSP: %q", host, csp)
+		}
 	}
 }

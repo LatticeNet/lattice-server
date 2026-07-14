@@ -69,6 +69,15 @@ func (s *Server) resolvePluginAssetRequest(r *http.Request) (resolvedPluginAsset
 
 func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset resolvedPluginAsset) {
 	loaded, assetPath := asset.loaded, asset.assetPath
+	// The confining policy is derived from the configured public URL. Without it there
+	// is no trustworthy origin to name as a script source — and the only alternative,
+	// the caller's Host header, would let the request shape the policy meant to confine
+	// it. Fail closed rather than serve executable plugin code under a weaker policy.
+	if canonicalPluginAssetOrigin(s.publicURL) == "" {
+		writeError(w, http.StatusServiceUnavailable,
+			errors.New("plugin assets are not available (server public URL unset)"))
+		return
+	}
 	if strings.EqualFold(filepath.Ext(assetPath), ".html") && !asset.isEntrypoint {
 		http.NotFound(w, r)
 		return
@@ -91,7 +100,7 @@ func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset 
 
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", pluginAssetCSP(s.publicURL, pluginAssetRequestOrigin(r)))
+	w.Header().Set("Content-Security-Policy", pluginAssetCSP(s.publicURL))
 	if !asset.isEntrypoint {
 		// The sandboxed entrypoint has an opaque origin, so its external scripts
 		// and styles use credentialless CORS. These resources remain bound to an
@@ -109,29 +118,23 @@ func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset 
 	http.ServeContent(w, r, filepath.Base(assetPath), time.Time{}, bytes.NewReader(data))
 }
 
-func pluginAssetCSP(publicURL, requestOrigin string) string {
+// pluginAssetCSP builds the per-route policy for a sandboxed plugin document. The
+// allowed origin is taken only from the server's configured public URL: a request's
+// Host header is caller-controlled, and letting it name a script source would make
+// the policy that confines plugin code depend on the request it is confining.
+// Serving is refused outright when the public URL is unset (see servePluginAsset),
+// so there is no request-derived fallback to reach.
+func pluginAssetCSP(publicURL string) string {
 	assetSources := "'self'"
-	origin := canonicalPluginAssetOrigin(publicURL)
-	if origin == "" {
-		origin = canonicalPluginAssetOrigin(requestOrigin)
-	}
-	if origin != "" {
+	if origin := canonicalPluginAssetOrigin(publicURL); origin != "" {
 		// Sandboxed plugin documents intentionally have an opaque origin. Their
 		// signed external assets therefore need the configured control-plane
 		// origin in addition to 'self', which does not match from an opaque origin.
 		assetSources += " " + origin
 	}
 	return "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; " +
-		"object-src 'none'; style-src " + assetSources + "; script-src " + assetSources + "; " +
+		"object-src 'none'; frame-src 'none'; style-src " + assetSources + "; script-src " + assetSources + "; " +
 		"img-src " + assetSources + " data:; font-src " + assetSources + "; connect-src 'none'"
-}
-
-func pluginAssetRequestOrigin(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return scheme + "://" + r.Host
 }
 
 func canonicalPluginAssetOrigin(raw string) string {

@@ -30,6 +30,7 @@ var (
 	boltBucketResults         = []byte("results")
 	boltBucketAudit           = []byte("audit")
 	boltBucketKV              = []byte("kv")
+	boltBucketPluginSecrets   = []byte("plugin_secrets")
 	boltBucketStatic          = []byte("static")
 	boltBucketStorageBuckets  = []byte("storage_buckets")
 	boltBucketStorageBindings = []byte("storage_bindings")
@@ -72,6 +73,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketResults,
 	boltBucketAudit,
 	boltBucketKV,
+	boltBucketPluginSecrets,
 	boltBucketStatic,
 	boltBucketStorageBuckets,
 	boltBucketStorageBindings,
@@ -204,6 +206,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 			return err
 		}
 		if err := putSlice(tx, boltBucketAudit, persist.Audit); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketPluginSecrets, persist.PluginSecrets); err != nil {
 			return err
 		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
@@ -349,6 +354,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readSlice(tx, boltBucketAudit, &st.Audit); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketPluginSecrets, st.PluginSecrets); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {

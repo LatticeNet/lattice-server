@@ -99,6 +99,16 @@ var capabilityRisk = map[string]string{
 	// server-owned registry's directed allow-list, and the audit log.
 	"rpc:call":   RiskHost,
 	"rpc:expose": RiskHost,
+	// Encrypted plugin secret storage (spec §9.4). Reversible credentials, private
+	// keys, and generated tokens are held here rather than in KV, which is plaintext
+	// at rest. Both are host-risk — so system-only, and signed by a trusted publisher
+	// — because the value a plugin stores here is exactly the material an attacker
+	// wants, and because secret:read on a compromised plugin reads back everything it
+	// ever wrote. Deliberately absent from hostRiskExemptForNonSystem: unlike guarded
+	// egress, there is no broker check that makes handing a sandboxed third party a
+	// key vault safe.
+	"secret:read":  RiskHost,
+	"secret:write": RiskHost,
 }
 
 // hostRiskExemptForNonSystem lists host-risk capabilities that non-system plugins

@@ -588,6 +588,53 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 			return nil, err
 		}
 		return json.RawMessage(`{}`), nil
+	case "secret.get":
+		var req struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("secret.get params: %w", err)
+		}
+		value, ok, err := broker.SecretGet(ctx, req.Key)
+		if err != nil {
+			return nil, err
+		}
+		// Base64 only. kv.get returns the raw string alongside the encoded one, and a
+		// raw secret field is exactly what gets accidentally %v-logged or folded into
+		// an error message somewhere downstream. One encoding, and it is not readable
+		// by eye.
+		return json.Marshal(struct {
+			OK          bool   `json:"ok"`
+			ValueBase64 string `json:"value_base64,omitempty"`
+		}{OK: ok, ValueBase64: base64.StdEncoding.EncodeToString([]byte(value))})
+	case "secret.put":
+		var req struct {
+			Key         string `json:"key"`
+			ValueBase64 string `json:"value_base64"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("secret.put params: %w", err)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(req.ValueBase64)
+		if err != nil {
+			// Report the failure, never the payload that caused it.
+			return nil, errors.New("secret.put value_base64 is not valid base64")
+		}
+		if err := broker.SecretPut(ctx, req.Key, string(decoded)); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{}`), nil
+	case "secret.delete":
+		var req struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("secret.delete params: %w", err)
+		}
+		if err := broker.SecretDelete(ctx, req.Key); err != nil {
+			return nil, err
+		}
+		return json.RawMessage(`{}`), nil
 	case "notify.send":
 		var req struct {
 			Title string `json:"title"`

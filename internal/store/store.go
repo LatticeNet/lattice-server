@@ -40,13 +40,18 @@ const metricsPersistenceInterval = 5 * time.Minute
 const monitorResultPersistenceInterval = 5 * time.Minute
 
 type State struct {
-	Users           map[string]model.User               `json:"users"`
-	Tokens          map[string]model.Token              `json:"tokens"`
-	Nodes           map[string]model.Node               `json:"nodes"`
-	Tasks           map[string]model.Task               `json:"tasks"`
-	Results         []model.TaskResult                  `json:"results"`
-	Audit           []model.AuditEvent                  `json:"audit"`
-	KV              map[string]model.KVEntry            `json:"kv"`
+	Users   map[string]model.User    `json:"users"`
+	Tokens  map[string]model.Token   `json:"tokens"`
+	Nodes   map[string]model.Node    `json:"nodes"`
+	Tasks   map[string]model.Task    `json:"tasks"`
+	Results []model.TaskResult       `json:"results"`
+	Audit   []model.AuditEvent       `json:"audit"`
+	KV      map[string]model.KVEntry `json:"kv"`
+	// PluginSecrets is the encrypted, namespaced plugin vault (spec §9.4). It is a
+	// distinct collection from KV on purpose: KV is plaintext at rest AND readable
+	// over GET /api/kv by any principal holding kv:read. A secret must have neither
+	// property, so it gets its own map, its own cipher pass, and no HTTP handler.
+	PluginSecrets   map[string]model.KVEntry            `json:"plugin_secrets"`
 	Static          map[string]model.StaticObject       `json:"static"`
 	StorageBuckets  map[string]model.StorageBucket      `json:"storage_buckets"`
 	StorageBindings map[string]model.StorageBinding     `json:"storage_bindings"`
@@ -337,6 +342,7 @@ func emptyState() State {
 		Nodes:           map[string]model.Node{},
 		Tasks:           map[string]model.Task{},
 		KV:              map[string]model.KVEntry{},
+		PluginSecrets:   map[string]model.KVEntry{},
 		Static:          map[string]model.StaticObject{},
 		StorageBuckets:  map[string]model.StorageBucket{},
 		StorageBindings: map[string]model.StorageBinding{},
@@ -393,6 +399,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.KV == nil {
 		st.KV = map[string]model.KVEntry{}
+	}
+	if st.PluginSecrets == nil {
+		st.PluginSecrets = map[string]model.KVEntry{}
 	}
 	if st.Static == nil {
 		st.Static = map[string]model.StaticObject{}
@@ -1358,6 +1367,62 @@ func (s *Store) KVEntry(bucket, key string) (model.KVEntry, bool) {
 	defer s.mu.Unlock()
 	e, ok := s.state.KV[bucket+"/"+key]
 	return e, ok
+}
+
+// MaxPluginSecretsPerBucket bounds one plugin's vault. KV is unbounded, which is
+// tolerable for plaintext scratch data; it is not tolerable here, because every write
+// re-encrypts and rewrites the entire state file, so an unbounded vault is both a disk
+// amplifier and a way for one plugin to bloat every other plugin's persistence path.
+const MaxPluginSecretsPerBucket = 256
+
+// PutPluginSecret stores an encrypted-at-rest secret. There is deliberately no
+// PluginSecrets(bucket) listing counterpart: a plugin reads back a key it chose to
+// write, and nothing — not a plugin, not an HTTP handler — can enumerate the vault.
+func (s *Store) PutPluginSecret(entry model.KVEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := entry.Bucket + "/" + entry.Key
+	if _, exists := s.state.PluginSecrets[id]; !exists {
+		count := 0
+		for _, e := range s.state.PluginSecrets {
+			if e.Bucket == entry.Bucket {
+				count++
+			}
+		}
+		if count >= MaxPluginSecretsPerBucket {
+			return fmt.Errorf("plugin secret bucket holds the maximum of %d entries", MaxPluginSecretsPerBucket)
+		}
+	}
+	entry.UpdatedAt = time.Now().UTC()
+	s.state.PluginSecrets[id] = entry
+	return s.Save()
+}
+
+func (s *Store) PluginSecret(bucket, key string) (model.KVEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.state.PluginSecrets[bucket+"/"+key]
+	return e, ok
+}
+
+func (s *Store) DeletePluginSecret(bucket, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.state.PluginSecrets, bucket+"/"+key)
+	return s.Save()
+}
+
+// PurgePluginSecrets removes an entire plugin's vault. Spec §10 makes purging plugin
+// data an explicit, audited operator action; this is the primitive it needs.
+func (s *Store) PurgePluginSecrets(bucket string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, e := range s.state.PluginSecrets {
+		if e.Bucket == bucket {
+			delete(s.state.PluginSecrets, id)
+		}
+	}
+	return s.Save()
 }
 
 func (s *Store) PutStatic(obj model.StaticObject) error {

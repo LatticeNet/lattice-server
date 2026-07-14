@@ -96,6 +96,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.DDNS = ddns
 
+	pluginSecrets := make(map[string]model.KVEntry, len(st.PluginSecrets))
+	for id, e := range st.PluginSecrets {
+		enc, err := encryptPluginSecretRecord(id, e, c)
+		if err != nil {
+			return State{}, err
+		}
+		pluginSecrets[id] = enc
+	}
+	out.PluginSecrets = pluginSecrets
+
 	dnsDeployments := make(map[string]model.DNSDeployment, len(st.DNSDeployments))
 	for id, d := range st.DNSDeployments {
 		enc, err := encryptDNSDeploymentRecord(id, d, c)
@@ -244,6 +254,16 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.DDNS = ddns
 
+	pluginSecrets := make(map[string]model.KVEntry, len(st.PluginSecrets))
+	for id, e := range st.PluginSecrets {
+		dec, err := decryptPluginSecretRecord(id, e, c)
+		if err != nil {
+			return err
+		}
+		pluginSecrets[id] = dec
+	}
+	st.PluginSecrets = pluginSecrets
+
 	dnsDeployments := make(map[string]model.DNSDeployment, len(st.DNSDeployments))
 	for id, d := range st.DNSDeployments {
 		dec, err := decryptDNSDeploymentRecord(id, d, c)
@@ -343,6 +363,11 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, challenge := range st.TOTPChallenges {
 		if secret.IsEnvelope(challenge.ID) {
+			return true
+		}
+	}
+	for _, e := range st.PluginSecrets {
+		if secret.IsEnvelope(e.Value) {
 			return true
 		}
 	}
@@ -496,6 +521,34 @@ func decryptTOTPChallengeRecord(id string, challenge auth.TOTPChallenge, c secre
 	}
 	challenge.ID = dec
 	return challenge, nil
+}
+
+// encryptPluginSecretRecord is the per-record crypto boundary for the plugin vault
+// (spec §9.4). Only the value is sealed: the bucket and key name the secret, they are
+// not the secret, and keeping them clear is what lets the store look one up without
+// decrypting the whole collection.
+func encryptPluginSecretRecord(id string, e model.KVEntry, c secret.Cipher) (model.KVEntry, error) {
+	value, err := c.Encrypt(e.Value)
+	if err != nil {
+		return model.KVEntry{}, fmt.Errorf("encrypt plugin secret %s: %w", id, err)
+	}
+	e.Value = value
+	return e, nil
+}
+
+func decryptPluginSecretRecord(id string, e model.KVEntry, c secret.Cipher) (model.KVEntry, error) {
+	// Authoritative fail-closed point for the bbolt path, which calls these helpers
+	// directly rather than through decryptState. Without it a lost master key would
+	// quietly hand the envelope back to a plugin as if it were the secret.
+	if !c.Enabled() && secret.IsEnvelope(e.Value) {
+		return model.KVEntry{}, lostMasterKeyError()
+	}
+	value, err := c.Decrypt(e.Value)
+	if err != nil {
+		return model.KVEntry{}, fmt.Errorf("decrypt plugin secret %s: %w", id, err)
+	}
+	e.Value = value
+	return e, nil
 }
 
 func encryptDDNSRecord(id string, d model.DDNSProfile, c secret.Cipher) (model.DDNSProfile, error) {

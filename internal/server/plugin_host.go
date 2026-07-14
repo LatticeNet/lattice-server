@@ -35,6 +35,7 @@ func (s *Server) pluginHostServices() plugin.HostServices {
 		// plaintext at rest, the secret store is encrypted, and a value written to the
 		// wrong one is a private key in cleartext.
 		Secret:       &pluginSecretHost{server: s},
+		Task:         &pluginTaskHost{server: s},
 		Notify:       host,
 		HTTP:         host,
 		OperatorHTTP: host,
@@ -81,6 +82,59 @@ func (h *pluginSecretHost) Delete(_ context.Context, key string) error {
 	}
 	return h.server.store.DeletePluginSecret(bucket, entryKey)
 }
+
+// pluginTaskHost implements plugin.TaskHost (spec §9.3 step 5). The broker has already
+// checked that this invocation carries an approved operation grant and that the target
+// is one the operator approved; this side enforces everything an OPERATOR queueing the
+// same task would face, so a plugin can never reach a wider interpreter set, a longer
+// timeout, or a bigger script than a human could.
+type pluginTaskHost struct{ server *Server }
+
+func (h *pluginTaskHost) Enqueue(_ context.Context, req plugin.HostTaskRequest) (string, error) {
+	task := model.Task{
+		ID: id.New("task"),
+		// ApprovalID is the join key the generic result handler uses to reconcile the
+		// approval once the agent reports back. Without it the approval would sit in
+		// `approved` forever, having actually run.
+		ApprovalID:  req.ApprovalID,
+		ActorID:     "plugin:" + req.PluginID,
+		Targets:     []string{req.NodeID},
+		Interpreter: req.Interpreter,
+		Script:      req.Script,
+		TimeoutSec:  req.TimeoutSec,
+		OutputLimit: pluginTaskOutputLimit,
+		Status:      "pending",
+		CreatedAt:   time.Now().UTC(),
+	}
+	if task.TimeoutSec <= 0 {
+		task.TimeoutSec = pluginTaskDefaultTimeoutSec
+	}
+	// The same validation an operator's POST /api/tasks passes: the interpreter
+	// allow-list, the timeout and output bounds, the script size cap.
+	if err := validateTaskCreate(task.Interpreter, task.Script, task.TimeoutSec, task.OutputLimit); err != nil {
+		return "", fmt.Errorf("plugin task rejected: %w", err)
+	}
+	// queueTask, never store.CreateTask: it is the sole enforcement point of the fleet
+	// task-execution kill switch, and a plugin must not be able to route around it.
+	if err := h.server.queueTask(task); err != nil {
+		return "", err
+	}
+	h.server.recordAudit(model.AuditEvent{
+		ID: id.New("audit"), At: time.Now().UTC(),
+		Action: "plugin.task.enqueue", Scope: "task:run", Decision: "allow",
+		NodeID: req.NodeID,
+		Metadata: map[string]string{
+			"plugin_id": req.PluginID, "approval_id": req.ApprovalID,
+			"task_id": task.ID, "interpreter": task.Interpreter,
+		},
+	})
+	return task.ID, nil
+}
+
+const (
+	pluginTaskOutputLimit       = 64 * 1024
+	pluginTaskDefaultTimeoutSec = 300
+)
 
 // pluginSecretBucketPrefix is the namespace every plugin secret access must live
 // under. As with KV, the broker pins it and the host re-checks it, so a hand-crafted

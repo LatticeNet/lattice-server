@@ -314,8 +314,34 @@ func (s *Server) dispatchV2PluginCall(
 			return nil, fmt.Errorf("plugin %q declares service %q as runtime-backed, but a core provider also owns it",
 				pluginID, service)
 		}
+		// A plan-effect method does not answer the browser with whatever JSON the plugin
+		// felt like returning. It compiles a plan, and a plan is a proposal: it becomes a
+		// pending approval bound to the plugin, its version, its artifact, this request,
+		// and the nodes it named. Nothing is applied until an operator reads it and
+		// approves that exact hash (§9.3).
+		if methodEffect(contract, method) == plugin.InterfaceEffectPlan {
+			return s.planPluginOperation(ctx, principalFromContext(ctx), loaded, service, method, payload, operatorTargets)
+		}
 		return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets)
 	}
+}
+
+// methodEffect resolves a declared method's effect. Unknown methods cannot reach here:
+// the gateway already refused anything the manifest does not declare.
+func methodEffect(contract plugin.InterfaceContract, method string) string {
+	for _, candidate := range contract.MethodContracts() {
+		if candidate.Name == method {
+			return candidate.Effect
+		}
+	}
+	return ""
+}
+
+// principalFromContext recovers the operator the gateway stamped onto the invocation
+// context, so the plan path can authorize targets against the person who asked for it.
+func principalFromContext(ctx context.Context) principal {
+	p, _ := ctx.Value(pluginOperatorPrincipalKey{}).(principal)
+	return p
 }
 
 func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service, method string, payload json.RawMessage, operatorTargets []string) ([]byte, error) {

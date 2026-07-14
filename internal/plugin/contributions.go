@@ -92,16 +92,65 @@ type ManifestUI struct {
 	Views []ViewContribution `json:"views,omitempty"`
 }
 
+// Backing names who actually serves an interface's methods.
+//
+// A plugin is not required to carry its own engine. Some domain engines — the
+// nftables renderer, the WireGuard key/config engine — deliberately stay in core so
+// the trust base stays small (ADR-001 D5). What the plugin owns in that case is the
+// UI, the validation, and the workflow intent; core owns the engine.
+//
+// That arrangement is legitimate. What is not legitimate is leaving it implicit: a
+// manifest that declares a method core secretly answers is a contract that lies, and
+// no operator or auditor can see the difference. Backing makes the split an explicit,
+// signed, per-service declaration.
+const (
+	// BackingRuntime: the plugin's own artifact serves the method. The default.
+	BackingRuntime = "runtime"
+	// BackingCore: a core-registered provider owned by this plugin serves the method.
+	// Host-risk by nature — only a system plugin may declare it, and every v2 manifest
+	// already requires a trusted-publisher signature.
+	BackingCore = "core"
+)
+
 // InterfaceContract declares an interface the plugin exposes (service + methods),
 // callable through the dashboard->plugin gateway under the given scopes.
 type InterfaceContract struct {
 	Service string `json:"service"`
 	// Methods remains the normalized name list so v1 callers keep their source
 	// contract. MethodSpecs carries the signed v2 effect and method-level scopes.
-	Methods      []string          `json:"-"`
-	MethodSpecs  []InterfaceMethod `json:"-"`
-	Scopes       []string          `json:"scopes,omitempty"`
+	Methods     []string          `json:"-"`
+	MethodSpecs []InterfaceMethod `json:"-"`
+	Scopes      []string          `json:"scopes,omitempty"`
+	// Backing is empty on manifests signed before the field existed. Empty stays
+	// omitted from the signing payload, so those signatures remain byte-identical
+	// and valid; the gateway resolves them through a logged legacy path until they
+	// are re-signed with an explicit declaration.
+	Backing      string `json:"backing,omitempty"`
 	typedMethods bool
+}
+
+// InterfaceFor returns the contract the manifest declares for a service.
+func (m Manifest) InterfaceFor(service string) (InterfaceContract, bool) {
+	for _, contract := range m.Interfaces {
+		if contract.Service == service {
+			return contract, true
+		}
+	}
+	return InterfaceContract{}, false
+}
+
+// EffectiveBacking resolves the declared backing, defaulting to runtime.
+func (c InterfaceContract) EffectiveBacking() string {
+	if c.Backing == "" {
+		return BackingRuntime
+	}
+	return c.Backing
+}
+
+// DeclaresBacking reports whether the manifest said who serves this service, rather
+// than leaving the host to infer it.
+func (c InterfaceContract) DeclaresBacking() bool {
+	return c.Backing != ""
 }
 
 func (c InterfaceContract) MarshalJSON() ([]byte, error) {
@@ -109,16 +158,18 @@ func (c InterfaceContract) MarshalJSON() ([]byte, error) {
 		Service string   `json:"service"`
 		Methods []string `json:"methods"`
 		Scopes  []string `json:"scopes,omitempty"`
+		Backing string   `json:"backing,omitempty"`
 	}
 	type typedMethods struct {
 		Service string            `json:"service"`
 		Methods []InterfaceMethod `json:"methods"`
 		Scopes  []string          `json:"scopes,omitempty"`
+		Backing string            `json:"backing,omitempty"`
 	}
 	if c.typedMethods || len(c.MethodSpecs) > 0 {
-		return json.Marshal(typedMethods{Service: c.Service, Methods: c.MethodSpecs, Scopes: c.Scopes})
+		return json.Marshal(typedMethods{Service: c.Service, Methods: c.MethodSpecs, Scopes: c.Scopes, Backing: c.Backing})
 	}
-	return json.Marshal(stringMethods{Service: c.Service, Methods: c.Methods, Scopes: c.Scopes})
+	return json.Marshal(stringMethods{Service: c.Service, Methods: c.Methods, Scopes: c.Scopes, Backing: c.Backing})
 }
 
 func (c *InterfaceContract) UnmarshalJSON(data []byte) error {
@@ -126,6 +177,7 @@ func (c *InterfaceContract) UnmarshalJSON(data []byte) error {
 		Service string          `json:"service"`
 		Methods json.RawMessage `json:"methods"`
 		Scopes  []string        `json:"scopes,omitempty"`
+		Backing string          `json:"backing,omitempty"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -135,7 +187,7 @@ func (c *InterfaceContract) UnmarshalJSON(data []byte) error {
 	if err := ensureNoTrailingJSON(dec); err != nil {
 		return err
 	}
-	*c = InterfaceContract{Service: raw.Service, Scopes: raw.Scopes}
+	*c = InterfaceContract{Service: raw.Service, Scopes: raw.Scopes, Backing: raw.Backing}
 	if len(raw.Methods) == 0 {
 		return nil
 	}
@@ -235,6 +287,21 @@ func validateContributions(m Manifest) error {
 		}
 		if m.Schema == "" && (c.typedMethods || len(c.MethodSpecs) > 0) {
 			return fmt.Errorf("interface %q typed method objects require manifest schema v2", c.Service)
+		}
+		switch c.Backing {
+		case "", BackingRuntime, BackingCore:
+		default:
+			return fmt.Errorf("interface %q has invalid backing %q (want %q or %q)",
+				c.Service, c.Backing, BackingRuntime, BackingCore)
+		}
+		if c.Backing != "" && m.Schema != ManifestSchemaV2 {
+			return fmt.Errorf("interface %q backing requires manifest schema v2", c.Service)
+		}
+		// Declaring that core serves a method is a claim on the host's own trust base,
+		// so it is confined to system plugins. Every v2 manifest already requires a
+		// trusted-publisher signature, so the declaration is signed by construction.
+		if c.Backing == BackingCore && m.Type != TypeSystem {
+			return fmt.Errorf("interface %q backing %q requires a system plugin", c.Service, BackingCore)
 		}
 		for _, s := range c.Scopes {
 			if !scopeAllowedInManifest(s) {

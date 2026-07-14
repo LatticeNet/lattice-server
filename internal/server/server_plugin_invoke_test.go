@@ -522,3 +522,147 @@ func TestOperatorTargetErrorRedactsSecret(t *testing.T) {
 		t.Fatalf("operator target secret leaked into the error: %q", err)
 	}
 }
+
+// A manifest that declares a service as runtime-backed must never be answered by core.
+// Silent core fallback is the exact ambiguity the backing declaration exists to remove:
+// it let a plugin ship methods its own artifact could not serve while core quietly
+// answered them, with no way for an operator to tell the difference.
+func TestPluginCallRuntimeBackedServiceIsNeverAnsweredByCore(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "test.v2-runtime", Name: "V2 runtime", Type: plugin.TypeSystem,
+		Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.v2-runtime/items",
+			Backing: plugin.BackingRuntime,
+			MethodSpecs: []plugin.InterfaceMethod{{
+				Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"},
+			}},
+		}},
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID: manifest.ID, Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry()}
+	// Core owns a provider that shadows the runtime-backed service.
+	if err := srv.pluginRPC.Register(manifest.ID, "test.v2-runtime/items", "v1", []string{"list"},
+		func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+			return []byte(`{"rows":[{"id":"from-core"}]}`), nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(
+		`{"id":"test.v2-runtime","service":"test.v2-runtime/items","method":"list"}`,
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+
+	if strings.Contains(rec.Body.String(), "from-core") {
+		t.Fatalf("a runtime-backed service was answered by core: %s", rec.Body.String())
+	}
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a core provider shadowing a runtime-backed service must fail closed, got 200: %s", rec.Body.String())
+	}
+}
+
+// A core-backed declaration is honoured: the plugin owns the UI and the workflow, core
+// owns the engine, and the manifest says so out loud.
+func TestPluginCallCoreBackedServiceDispatchesToCore(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "test.v2-core", Name: "V2 core", Type: plugin.TypeSystem,
+		Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.v2-core/items",
+			Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{
+				Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"},
+			}},
+		}},
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID: manifest.ID, Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry()}
+	srv.pluginRPC.SetOwnerActive(srv.pluginIsActive)
+	if err := srv.pluginRPC.Register(manifest.ID, "test.v2-core/items", "v1", []string{"list"},
+		func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+			return []byte(`{"rows":[{"id":"from-core"}]}`), nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+
+	call := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(
+			`{"id":"test.v2-core","service":"test.v2-core/items","method":"list"}`,
+		))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		return rec
+	}
+
+	rec := call()
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "from-core") {
+		t.Fatalf("core-backed call did not reach core: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Disable must stop the BACKEND, not merely hide the UI. The core provider is wired
+	// at boot and never unregistered, so without a lifecycle gate it would keep serving.
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID: manifest.ID, Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusDisabled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := call(); rec.Code == http.StatusOK {
+		t.Fatalf("a disabled plugin's core-backed service kept serving: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A manifest cannot name core as its backend and have the host quietly find something
+// else to answer with.
+func TestPluginCallCoreBackedWithoutProviderFailsClosed(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "test.v2-orphan", Name: "V2 orphan", Type: plugin.TypeSystem,
+		Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.v2-orphan/items",
+			Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{
+				Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"},
+			}},
+		}},
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID: manifest.ID, Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry()}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(
+		`{"id":"test.v2-orphan","service":"test.v2-orphan/items","method":"list"}`,
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	if rec.Code == http.StatusOK {
+		t.Fatalf("core-backed service with no core provider must fail closed, got 200: %s", rec.Body.String())
+	}
+}

@@ -24,7 +24,15 @@ var (
 	ErrRPCDenied = errors.New("rpc call denied")
 	// ErrRPCInvalid is returned for a malformed service registration.
 	ErrRPCInvalid = errors.New("invalid rpc registration")
+	// ErrRPCOwnerInactive is returned when the plugin owning a service is not active.
+	// Disable must stop the backend, not merely hide the UI: core-registered providers
+	// are wired at boot and never unregistered, so without this gate a disabled plugin
+	// kept serving — to the gateway, and to any consumer still holding a granted edge.
+	ErrRPCOwnerInactive = errors.New("rpc service owner is not active")
 )
+
+// OwnerActiveFunc reports whether the plugin owning a service is currently active.
+type OwnerActiveFunc func(pluginID string) bool
 
 // RPCHandler serves one inter-plugin RPC method: it receives the method name and
 // raw request bytes and returns raw response bytes. Implementations must be safe
@@ -50,9 +58,10 @@ type rpcService struct {
 // RPCRegistry is the server-owned inter-plugin RPC bus. It is safe for concurrent
 // use and implements the broker's RPCHost interface.
 type RPCRegistry struct {
-	mu       sync.RWMutex
-	services map[string]*rpcService
-	grants   map[string]map[string]map[string]struct{} // service -> caller -> allowed methods ("*" grants all)
+	mu          sync.RWMutex
+	services    map[string]*rpcService
+	grants      map[string]map[string]map[string]struct{} // service -> caller -> allowed methods ("*" grants all)
+	ownerActive OwnerActiveFunc
 }
 
 // NewRPCRegistry returns an empty registry.
@@ -61,6 +70,32 @@ func NewRPCRegistry() *RPCRegistry {
 		services: map[string]*rpcService{},
 		grants:   map[string]map[string]map[string]struct{}{},
 	}
+}
+
+// SetOwnerActive installs the lifecycle predicate consulted before every dispatch.
+// Until it is set the registry serves any registered service, which is the correct
+// default for a bus with no lifecycle to consult (tests, boot).
+func (r *RPCRegistry) SetOwnerActive(fn OwnerActiveFunc) {
+	r.mu.Lock()
+	r.ownerActive = fn
+	r.mu.Unlock()
+}
+
+// serviceIfActive resolves a service and refuses it when its owning plugin is not
+// active. Returns ErrRPCNoService when unregistered so a disabled plugin and an
+// absent one are indistinguishable to a caller probing for services.
+func (r *RPCRegistry) serviceIfActive(service string) (*rpcService, error) {
+	r.mu.RLock()
+	svc := r.services[service]
+	active := r.ownerActive
+	r.mu.RUnlock()
+	if svc == nil {
+		return nil, fmt.Errorf("%w: %s", ErrRPCNoService, service)
+	}
+	if active != nil && !active(svc.owner) {
+		return nil, fmt.Errorf("%w: %s (owner %s)", ErrRPCOwnerInactive, service, svc.owner)
+	}
+	return svc, nil
 }
 
 // Register adds (or replaces) a service exposed by ownerPluginID. service is the
@@ -164,11 +199,9 @@ func (r *RPCRegistry) Owns(ownerPluginID, service string) bool {
 // HTTP layer has already enforced the interface's declared RBAC scopes + audit.
 // Service/method-not-found are still errors. The handler runs OUTSIDE the lock.
 func (r *RPCRegistry) CallOperator(ctx context.Context, service, method string, request []byte) ([]byte, error) {
-	r.mu.RLock()
-	svc := r.services[service]
-	r.mu.RUnlock()
-	if svc == nil {
-		return nil, fmt.Errorf("%w: %s", ErrRPCNoService, service)
+	svc, err := r.serviceIfActive(service)
+	if err != nil {
+		return nil, err
 	}
 	if _, ok := svc.methods[method]; !ok {
 		return nil, fmt.Errorf("%w: %s/%s", ErrRPCNoMethod, service, method)
@@ -180,24 +213,25 @@ func (r *RPCRegistry) CallOperator(ctx context.Context, service, method string, 
 // (the owner may always self-call), check the method, then dispatch to the
 // handler OUTSIDE the lock so a slow or re-entrant handler cannot block the bus.
 func (r *RPCRegistry) Call(ctx context.Context, caller, service, method string, request []byte) ([]byte, error) {
+	// A granted edge does not outlive its provider: a consumer holding rpc:call on a
+	// disabled plugin's service is refused here, not served by a backend that only
+	// looks alive because core registered it at boot.
+	svc, err := r.serviceIfActive(service)
+	if err != nil {
+		return nil, err
+	}
+
 	r.mu.RLock()
-	svc := r.services[service]
-	allowed := false
-	if svc != nil {
+	allowed := caller == svc.owner
+	if !allowed {
 		if methods := r.grants[service][caller]; methods != nil {
 			_, wildcard := methods["*"]
 			_, exact := methods[method]
 			allowed = wildcard || exact
 		}
-		if caller == svc.owner {
-			allowed = true
-		}
 	}
 	r.mu.RUnlock()
 
-	if svc == nil {
-		return nil, fmt.Errorf("%w: %s", ErrRPCNoService, service)
-	}
 	if !allowed {
 		return nil, fmt.Errorf("%w: %s -> %s", ErrRPCDenied, caller, service)
 	}

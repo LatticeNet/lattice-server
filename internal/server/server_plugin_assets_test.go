@@ -79,6 +79,7 @@ func newPluginAssetTestServer(t *testing.T) (*Server, http.Handler, []*http.Cook
 		Compatibility: &plugin.CompatibilitySpec{Server: ">=0.2.1", DashboardHost: ">=1", RuntimeProtocol: ">=1"},
 		Interfaces: []plugin.InterfaceContract{{
 			Service:     "test.assets/items",
+			Backing:     plugin.BackingRuntime,
 			MethodSpecs: []plugin.InterfaceMethod{{Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"}}},
 		}},
 		UI: &plugin.ManifestUI{

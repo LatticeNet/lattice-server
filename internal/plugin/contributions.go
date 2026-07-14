@@ -147,12 +147,6 @@ func (c InterfaceContract) EffectiveBacking() string {
 	return c.Backing
 }
 
-// DeclaresBacking reports whether the manifest said who serves this service, rather
-// than leaving the host to infer it.
-func (c InterfaceContract) DeclaresBacking() bool {
-	return c.Backing != ""
-}
-
 func (c InterfaceContract) MarshalJSON() ([]byte, error) {
 	type stringMethods struct {
 		Service string   `json:"service"`
@@ -296,6 +290,14 @@ func validateContributions(m Manifest) error {
 		}
 		if c.Backing != "" && m.Schema != ManifestSchemaV2 {
 			return fmt.Errorf("interface %q backing requires manifest schema v2", c.Service)
+		}
+		// A v2 manifest must say who serves each method. Leaving it out is what let a
+		// plugin declare methods its own artifact could not answer while core quietly
+		// answered them instead. Rejecting the manifest outright is louder, and safer,
+		// than resolving it by inference and failing somewhere further downstream.
+		if m.Schema == ManifestSchemaV2 && c.Backing == "" {
+			return fmt.Errorf("interface %q must declare backing (%q or %q)",
+				c.Service, BackingRuntime, BackingCore)
 		}
 		// Declaring that core serves a method is a claim on the host's own trust base,
 		// so it is confined to system plugins. Every v2 manifest already requires a

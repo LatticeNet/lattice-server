@@ -275,6 +275,7 @@ func TestPluginCallV2UsesExactMethodScopes(t *testing.T) {
 		Schema: plugin.ManifestSchemaV2, ID: "test.v2", Name: "V2", Type: plugin.TypeSystem,
 		Interfaces: []plugin.InterfaceContract{{
 			Service: "test.v2/items",
+			Backing: plugin.BackingRuntime,
 			MethodSpecs: []plugin.InterfaceMethod{
 				{Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"}},
 				{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:admin"}, OperatorTargetFields: []string{"base_url"}},
@@ -322,6 +323,7 @@ func TestPluginCallV2DispatchesOwnedCoreService(t *testing.T) {
 		Publisher: "latticenet",
 		Interfaces: []plugin.InterfaceContract{{
 			Service: "test.v2-owned/items",
+			Backing: plugin.BackingCore,
 			MethodSpecs: []plugin.InterfaceMethod{{
 				Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"},
 			}},
@@ -368,6 +370,7 @@ func TestPluginCallV2DoesNotDispatchCoreServiceForForeignPublisher(t *testing.T)
 		Publisher: "other",
 		Interfaces: []plugin.InterfaceContract{{
 			Service: "test.v2-foreign/items",
+			Backing: plugin.BackingRuntime,
 			MethodSpecs: []plugin.InterfaceMethod{{
 				Name: "list", Effect: plugin.InterfaceEffectRead, Scopes: []string{"proxy:read"},
 			}},

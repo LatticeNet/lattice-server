@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -277,17 +276,17 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 // in-core handler, so a manifest could declare methods its own artifact could not serve
 // and no operator could see the difference.
 //
-// Backing is now a per-service declaration inside the signed manifest, and dispatch
-// follows it exactly:
+// Backing is a per-service declaration inside the signed manifest, and dispatch follows
+// it exactly:
 //
 //   - backing "core": a core provider owned by this plugin must exist. If it does not,
 //     the call fails — a manifest cannot name core as its backend and have the host
 //     quietly find something else.
 //   - backing "runtime": the artifact serves it, and core never answers in its place.
 //     This is what closes the silent-fallback hole.
-//   - undeclared: manifests signed before the field existed. Resolved through the legacy
-//     inference, logged once per service so the remaining ones are visible, and refused
-//     the moment a re-signed manifest declares its backing.
+//
+// There is no third case. A v2 manifest that declares no backing is rejected at load
+// (see validateInterfaces), so the host never has to guess who owns a method.
 func (s *Server) dispatchV2PluginCall(
 	ctx context.Context,
 	loaded plugin.Loaded,
@@ -300,17 +299,6 @@ func (s *Server) dispatchV2PluginCall(
 		return nil, fmt.Errorf("plugin %q does not declare service %q", pluginID, service)
 	}
 	coreOwns := s.pluginRPC != nil && s.pluginRPC.Owns(pluginID, service)
-
-	if !contract.DeclaresBacking() {
-		// Reproduce the pre-backing inference exactly, publisher constraint included, so
-		// an already-signed manifest keeps working unchanged. A third party still cannot
-		// reach a core provider by naming a service core happens to own.
-		if coreOwns && loaded.Manifest.Publisher == trustedCorePublisher {
-			s.warnUndeclaredBacking(pluginID, service)
-			return s.pluginRPC.CallOperator(ctx, service, method, []byte(payload))
-		}
-		return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets)
-	}
 
 	switch contract.EffectiveBacking() {
 	case plugin.BackingCore:
@@ -328,21 +316,6 @@ func (s *Server) dispatchV2PluginCall(
 		}
 		return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets)
 	}
-}
-
-// warnUndeclaredBacking logs each legacy core-backed service once, so the set of
-// manifests still relying on inference is visible rather than silent.
-func (s *Server) warnUndeclaredBacking(pluginID, service string) {
-	if _, alreadyWarned := s.undeclaredBackingOnce.LoadOrStore(pluginID+"/"+service, true); alreadyWarned {
-		return
-	}
-	const format = "plugin gateway: %s does not declare backing for %q; core is answering it by inference. " +
-		"Re-sign the manifest with \"backing\":\"core\" — inference will be removed."
-	if s.logger != nil {
-		s.logger.Printf(format, pluginID, service)
-		return
-	}
-	log.Printf(format, pluginID, service)
 }
 
 func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service, method string, payload json.RawMessage, operatorTargets []string) ([]byte, error) {
@@ -533,11 +506,6 @@ var diagnosticPluginActions = map[string]bool{
 	"describe": true,
 	"health":   true,
 }
-
-// trustedCorePublisher is the publisher whose manifests may be inferred as core-backed
-// while they predate the explicit `backing` declaration. It gates only the legacy path;
-// a declared backing is authorized by the manifest signature itself.
-const trustedCorePublisher = "latticenet"
 
 // handlePluginInvoke runs one DIAGNOSTIC action on an ACTIVE plugin via the
 // runtime (the Tier-2 system runner execs the artifact's {action,payload}->

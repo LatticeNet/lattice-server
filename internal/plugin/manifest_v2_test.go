@@ -40,6 +40,7 @@ func validManifestV2() Manifest {
 		},
 		Interfaces: []InterfaceContract{{
 			Service: "latticenet.example/items",
+			Backing: BackingRuntime,
 			MethodSpecs: []InterfaceMethod{
 				{Name: "list", Effect: InterfaceEffectRead, Scopes: []string{"proxy:read"}},
 				{Name: "save", Effect: InterfaceEffectWrite, Scopes: []string{"proxy:admin"}},
@@ -149,7 +150,8 @@ func TestManifestV2RejectsLegacyAndIncompleteContracts(t *testing.T) {
 		{"write without method scopes", func(m *Manifest) { m.Interfaces[0].MethodSpecs[1].Scopes = nil }, "method scopes"},
 		{"legacy string methods", func(m *Manifest) {
 			m.Interfaces[0] = InterfaceContract{
-				Service: "latticenet.example/items", Methods: []string{"list"}, Scopes: []string{"proxy:read"},
+				Service: "latticenet.example/items", Backing: BackingRuntime,
+				Methods: []string{"list"}, Scopes: []string{"proxy:read"},
 			}
 		}, "typed method"},
 		{"duplicate interface service", func(m *Manifest) {
@@ -387,13 +389,19 @@ func TestBackingValidation(t *testing.T) {
 		}
 	}
 
-	for _, valid := range []string{"", BackingRuntime, BackingCore} {
+	for _, valid := range []string{BackingRuntime, BackingCore} {
 		if err := ValidateManifest(newManifest(TypeSystem, valid)); err != nil {
 			t.Fatalf("backing %q should be valid for a system plugin: %v", valid, err)
 		}
 	}
 	if err := ValidateManifest(newManifest(TypeSystem, "wasm")); err == nil {
 		t.Fatal("an unknown backing must be rejected")
+	}
+	// A v2 manifest that says nothing about who serves a method is what let a plugin
+	// declare methods its artifact could not answer. It is now rejected outright rather
+	// than resolved by inference.
+	if err := ValidateManifest(newManifest(TypeSystem, "")); err == nil {
+		t.Fatal("a v2 interface without a backing declaration must be rejected")
 	}
 	// Claiming core is a claim on the host's own trust base.
 	if err := ValidateManifest(newManifest(TypeWasm, BackingCore)); err == nil {

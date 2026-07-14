@@ -178,6 +178,10 @@ type Server struct {
 	// party in-core providers register services on it; plugins reach it through
 	// the capability-scoped broker (HostServices.RPC).
 	pluginRPC *plugin.RPCRegistry
+
+	// undeclaredBackingOnce tracks which legacy services have already been reported
+	// as core-backed-by-inference, so the warning names each one exactly once.
+	undeclaredBackingOnce sync.Map
 	// pluginTrust is the operator policy used by both startup loading and
 	// pre-install verification endpoints. It is intentionally not client supplied.
 	pluginTrust plugin.TrustPolicy
@@ -388,6 +392,11 @@ func New(opts Options) (*Server, error) {
 	}
 	s.emitNotify = s.notifyEvent
 	s.pluginRPC = plugin.NewRPCRegistry()
+	// In-core providers are wired once at boot and never unregistered, so without a
+	// lifecycle predicate a disabled plugin's backend kept serving — disable would only
+	// hide the UI. A service is servable exactly while its owning plugin is active,
+	// whether the engine behind it lives in core or in the plugin's own artifact.
+	s.pluginRPC.SetOwnerActive(s.pluginIsActive)
 	s.registerVPNCoreRPC()
 	s.registerNetworkPluginRPC()
 	// Derive vpn-core identities (VpnUser) from legacy ProxyUsers. Idempotent and

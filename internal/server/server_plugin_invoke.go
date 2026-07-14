@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -234,15 +235,12 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	loaded, loadedOK := s.loadedPlugin(req.ID)
 	var out []byte
 	err = nil
-	if loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2 &&
-		loaded.Manifest.Publisher == "latticenet" && s.pluginRPC != nil &&
-		s.pluginRPC.Owns(req.ID, req.Service) {
-		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(req.Payload))
-	} else if loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2 {
-		out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, req.Payload, operatorTargets)
-	} else if s.pluginRPC == nil {
+	switch {
+	case loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2:
+		out, err = s.dispatchV2PluginCall(ctx, loaded, req.ID, req.Service, req.Method, req.Payload, operatorTargets)
+	case s.pluginRPC == nil:
 		err = errors.New("plugin rpc bus unavailable")
-	} else {
+	default:
 		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(req.Payload))
 		if errors.Is(err, plugin.ErrRPCNoService) {
 			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, req.Payload, nil)
@@ -268,6 +266,83 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	_, _ = w.Write(out)
+}
+
+// dispatchV2PluginCall routes a v2 call to whoever the SIGNED MANIFEST says serves it.
+//
+// A plugin need not carry its own engine — the nftables renderer and the WireGuard
+// key/config engine deliberately stay in core so the trust base stays small. What is
+// not acceptable is inferring that from the publisher's name: routing used to send any
+// service that core happened to own and whose publisher string was "latticenet" to the
+// in-core handler, so a manifest could declare methods its own artifact could not serve
+// and no operator could see the difference.
+//
+// Backing is now a per-service declaration inside the signed manifest, and dispatch
+// follows it exactly:
+//
+//   - backing "core": a core provider owned by this plugin must exist. If it does not,
+//     the call fails — a manifest cannot name core as its backend and have the host
+//     quietly find something else.
+//   - backing "runtime": the artifact serves it, and core never answers in its place.
+//     This is what closes the silent-fallback hole.
+//   - undeclared: manifests signed before the field existed. Resolved through the legacy
+//     inference, logged once per service so the remaining ones are visible, and refused
+//     the moment a re-signed manifest declares its backing.
+func (s *Server) dispatchV2PluginCall(
+	ctx context.Context,
+	loaded plugin.Loaded,
+	pluginID, service, method string,
+	payload json.RawMessage,
+	operatorTargets []string,
+) ([]byte, error) {
+	contract, ok := loaded.Manifest.InterfaceFor(service)
+	if !ok {
+		return nil, fmt.Errorf("plugin %q does not declare service %q", pluginID, service)
+	}
+	coreOwns := s.pluginRPC != nil && s.pluginRPC.Owns(pluginID, service)
+
+	if !contract.DeclaresBacking() {
+		// Reproduce the pre-backing inference exactly, publisher constraint included, so
+		// an already-signed manifest keeps working unchanged. A third party still cannot
+		// reach a core provider by naming a service core happens to own.
+		if coreOwns && loaded.Manifest.Publisher == trustedCorePublisher {
+			s.warnUndeclaredBacking(pluginID, service)
+			return s.pluginRPC.CallOperator(ctx, service, method, []byte(payload))
+		}
+		return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets)
+	}
+
+	switch contract.EffectiveBacking() {
+	case plugin.BackingCore:
+		if !coreOwns {
+			return nil, fmt.Errorf("plugin %q declares service %q as core-backed, but no core provider owns it",
+				pluginID, service)
+		}
+		return s.pluginRPC.CallOperator(ctx, service, method, []byte(payload))
+	default:
+		if coreOwns {
+			// A runtime-backed service shadowed by a core provider is exactly the
+			// ambiguity backing exists to remove. Refuse rather than pick one.
+			return nil, fmt.Errorf("plugin %q declares service %q as runtime-backed, but a core provider also owns it",
+				pluginID, service)
+		}
+		return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets)
+	}
+}
+
+// warnUndeclaredBacking logs each legacy core-backed service once, so the set of
+// manifests still relying on inference is visible rather than silent.
+func (s *Server) warnUndeclaredBacking(pluginID, service string) {
+	if _, alreadyWarned := s.undeclaredBackingOnce.LoadOrStore(pluginID+"/"+service, true); alreadyWarned {
+		return
+	}
+	const format = "plugin gateway: %s does not declare backing for %q; core is answering it by inference. " +
+		"Re-sign the manifest with \"backing\":\"core\" — inference will be removed."
+	if s.logger != nil {
+		s.logger.Printf(format, pluginID, service)
+		return
+	}
+	log.Printf(format, pluginID, service)
 }
 
 func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service, method string, payload json.RawMessage, operatorTargets []string) ([]byte, error) {
@@ -458,6 +533,11 @@ var diagnosticPluginActions = map[string]bool{
 	"describe": true,
 	"health":   true,
 }
+
+// trustedCorePublisher is the publisher whose manifests may be inferred as core-backed
+// while they predate the explicit `backing` declaration. It gates only the legacy path;
+// a declared backing is authorized by the manifest signature itself.
+const trustedCorePublisher = "latticenet"
 
 // handlePluginInvoke runs one DIAGNOSTIC action on an ACTIVE plugin via the
 // runtime (the Tier-2 system runner execs the artifact's {action,payload}->

@@ -327,3 +327,76 @@ func cloneManifestV2(t *testing.T, in Manifest) Manifest {
 	}
 	return out
 }
+
+// Backing is omitempty, so a manifest signed before the field existed must serialize to
+// exactly the same bytes and keep its signature valid. The publisher seed is operator-
+// held: if this parity broke, every deployed plugin would need re-signing before it
+// could load again.
+func TestBackingOmittedKeepsSigningPayloadByteIdentical(t *testing.T) {
+	base := Manifest{
+		Schema: ManifestSchemaV2, ID: "latticenet.example", Name: "Example", Type: TypeSystem,
+		Version: "0.2.1-alpha.1", Publisher: "latticenet", Capabilities: []string{"kv:read"},
+		Bundle:  &BundleSpec{Format: BundleFormatTarGzip, DigestSHA256: strings.Repeat("a", 64)},
+		Runtime: &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV1, Entrypoints: map[string]string{"linux/amd64": "bin/linux-amd64/plugin"}},
+		Compatibility: &CompatibilitySpec{
+			Server: ">=0.2.1", DashboardHost: ">=1", RuntimeProtocol: ">=1",
+		},
+		Interfaces: []InterfaceContract{{
+			Service:     "latticenet.example/items",
+			MethodSpecs: []InterfaceMethod{{Name: "list", Effect: InterfaceEffectRead, Scopes: []string{"proxy:read"}}},
+		}},
+	}
+
+	undeclared := SigningPayload(base)
+	if strings.Contains(string(undeclared), "backing") {
+		t.Fatalf("an undeclared backing must not appear in the signing payload: %s", undeclared)
+	}
+
+	// Declaring backing MUST change the payload — it is a security-relevant claim and
+	// has to be covered by the signature, not swappable after signing.
+	declared := base
+	declared.Interfaces = []InterfaceContract{{
+		Service:     "latticenet.example/items",
+		Backing:     BackingCore,
+		MethodSpecs: []InterfaceMethod{{Name: "list", Effect: InterfaceEffectRead, Scopes: []string{"proxy:read"}}},
+	}}
+	signed := SigningPayload(declared)
+	if string(undeclared) == string(signed) {
+		t.Fatal("declaring backing must change the signing payload, or it could be swapped after signing")
+	}
+	if !strings.Contains(string(signed), `"backing":"core"`) {
+		t.Fatalf("declared backing missing from signing payload: %s", signed)
+	}
+}
+
+func TestBackingValidation(t *testing.T) {
+	newManifest := func(pluginType, backing string) Manifest {
+		return Manifest{
+			Schema: ManifestSchemaV2, ID: "latticenet.example", Name: "Example", Type: pluginType,
+			Version: "0.2.1-alpha.1", Publisher: "latticenet", Capabilities: []string{"kv:read"},
+			Bundle:  &BundleSpec{Format: BundleFormatTarGzip, DigestSHA256: strings.Repeat("a", 64)},
+			Runtime: &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV1, Entrypoints: map[string]string{"linux/amd64": "bin/linux-amd64/plugin"}},
+			Compatibility: &CompatibilitySpec{
+				Server: ">=0.2.1", DashboardHost: ">=1", RuntimeProtocol: ">=1",
+			},
+			Interfaces: []InterfaceContract{{
+				Service:     "latticenet.example/items",
+				Backing:     backing,
+				MethodSpecs: []InterfaceMethod{{Name: "list", Effect: InterfaceEffectRead, Scopes: []string{"proxy:read"}}},
+			}},
+		}
+	}
+
+	for _, valid := range []string{"", BackingRuntime, BackingCore} {
+		if err := ValidateManifest(newManifest(TypeSystem, valid)); err != nil {
+			t.Fatalf("backing %q should be valid for a system plugin: %v", valid, err)
+		}
+	}
+	if err := ValidateManifest(newManifest(TypeSystem, "wasm")); err == nil {
+		t.Fatal("an unknown backing must be rejected")
+	}
+	// Claiming core is a claim on the host's own trust base.
+	if err := ValidateManifest(newManifest(TypeWasm, BackingCore)); err == nil {
+		t.Fatal("a non-system plugin must not declare core backing")
+	}
+}

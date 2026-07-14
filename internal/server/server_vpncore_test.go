@@ -9,6 +9,19 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
+// activateCorePlugin marks a plugin active so its services are servable. A service is
+// only served while its owning plugin is active, whether the engine behind it lives in
+// core or in the plugin's artifact — so even an in-core provider needs its plugin
+// installed and active, exactly as in a real deployment.
+func activateCorePlugin(t *testing.T, st *store.Store, pluginID string) {
+	t.Helper()
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{
+		ID: pluginID, Name: pluginID, Type: "system", Status: model.PluginStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestVPNCoreExportIncludesDiscoveredNodes(t *testing.T) {
 	st, err := store.Open("")
 	if err != nil {
@@ -18,6 +31,7 @@ func TestVPNCoreExportIncludesDiscoveredNodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	activateCorePlugin(t, st, vpnCorePluginID)
 	// The nodes must exist (the export filters discovery to live nodes), as they
 	// would when a real agent reports.
 	for _, id := range []string{"node-a", "node-b"} {
@@ -94,6 +108,7 @@ func TestVPNCoreNodesRPCRegisteredAndExports(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	activateCorePlugin(t, st, vpnCorePluginID)
 
 	// The in-core vpn-core/nodes service is registered with the export + list
 	// methods (list backs the design-10 plugin-contributed Nodes table; Services()

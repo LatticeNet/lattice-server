@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -351,11 +353,35 @@ func extractOperatorTargets(payload json.RawMessage, fields []string) ([]string,
 		}
 		target = strings.TrimSpace(target)
 		if err := outbound.GuardOperatorURL(target); err != nil {
-			return nil, fmt.Errorf("operator target field %q is invalid: %w", field, err)
+			return nil, fmt.Errorf("operator target field %q is invalid: %s", field, redactOperatorTarget(err, target))
 		}
 		targets = append(targets, target)
 	}
 	return uniqueStrings(targets), nil
+}
+
+// redactOperatorTarget keeps a guard failure's reason but strips the secret-bearing
+// target out of it. An operator target may carry its secret in the URL path, and this
+// text reaches both the audit record and the API response — the audit record must
+// never contain it.
+func redactOperatorTarget(err error, target string) string {
+	message := err.Error()
+	// *url.Error renders as `parse "<url>": <reason>` with the URL quoted and escaped,
+	// so scrubbing the raw target cannot remove it. Keep only the reason, which never
+	// carries the URL.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		message = urlErr.Err.Error()
+	}
+	if target == "" {
+		return message
+	}
+	// Any other guard that echoes the target does so either raw or Go-escaped.
+	escaped := strconv.Quote(target)
+	for _, form := range []string{target, escaped, escaped[1 : len(escaped)-1]} {
+		message = strings.ReplaceAll(message, form, "[redacted]")
+	}
+	return message
 }
 
 func (s *Server) recordPluginCallAudit(p principal, pluginID, service, method string, scopes []string, decision, reason string) {
@@ -419,13 +445,27 @@ func pluginGatewayScopeRequiresUnrestrictedAllowlist(scope string) bool {
 	}
 }
 
-// handlePluginInvoke runs one action on an ACTIVE plugin via the runtime (the
-// Tier-2 system runner execs the artifact's {action,payload}->{ok,result}
-// protocol). This is the minimal seed of the design-10 dashboard->plugin gateway:
-// it makes plugin EXECUTION reachable (the system runner otherwise stages the
-// artifact but nothing triggers it). Gated by plugin:admin + audited. A plugin
-// that is not armed, or whose runner cannot invoke (noop), returns an error
-// rather than silently doing nothing.
+// diagnosticPluginActions is the closed set of actions reachable through the raw
+// invoke channel. Everything with an effect on domain state must go through
+// /api/plugins/call, which is the only path that enforces the manifest's
+// per-method scopes, binds operator targets to a single invocation, and (for
+// host-risk work) requires a plan and an approval.
+//
+// This list must stay closed. `call` and `plan` would bypass per-method scopes;
+// `execute` would bypass the whole plan/approval/one-time-capability binding, so
+// an operator holding only plugin:admin could apply host changes unreviewed.
+var diagnosticPluginActions = map[string]bool{
+	"describe": true,
+	"health":   true,
+}
+
+// handlePluginInvoke runs one DIAGNOSTIC action on an ACTIVE plugin via the
+// runtime (the Tier-2 system runner execs the artifact's {action,payload}->
+// {ok,result} protocol). It exists so an operator can interrogate a staged
+// artifact directly; it is not a gateway. Gated by plugin:admin, restricted to
+// diagnosticPluginActions, and audited. A plugin that is not armed, or whose
+// runner cannot invoke (noop), returns an error rather than silently doing
+// nothing.
 func (s *Server) handlePluginInvoke(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -444,6 +484,15 @@ func (s *Server) handlePluginInvoke(w http.ResponseWriter, r *http.Request, p pr
 	}
 	if req.ID == "" || req.Action == "" {
 		writeError(w, http.StatusBadRequest, errors.New("id and action are required"))
+		return
+	}
+	if !diagnosticPluginActions[req.Action] {
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID: id.New("audit"), Action: "plugin.invoke", Scope: "plugin:admin", Decision: "deny",
+			Reason:   "action is not a diagnostic action; use /api/plugins/call",
+			Metadata: map[string]string{"plugin_id": req.ID, "plugin_action": req.Action},
+		})
+		writeError(w, http.StatusForbidden, errors.New("only diagnostic actions may be invoked directly; use /api/plugins/call"))
 		return
 	}
 	if s.pluginRuntime == nil {

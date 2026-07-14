@@ -29,7 +29,12 @@ type pluginHost struct {
 func (s *Server) pluginHostServices() plugin.HostServices {
 	host := &pluginHost{server: s}
 	return plugin.HostServices{
-		KV:           host,
+		KV: host,
+		// Secrets get their own host type rather than another method on pluginHost.
+		// The two vaults must never be reachable through one another by a typo: KV is
+		// plaintext at rest, the secret store is encrypted, and a value written to the
+		// wrong one is a private key in cleartext.
+		Secret:       &pluginSecretHost{server: s},
 		Notify:       host,
 		HTTP:         host,
 		OperatorHTTP: host,
@@ -37,6 +42,70 @@ func (s *Server) pluginHostServices() plugin.HostServices {
 		Audit:        host,
 		RPC:          s.pluginRPC,
 	}
+}
+
+// pluginSecretHost implements plugin.SecretHost over the store's encrypted collection
+// (spec §9.4). Every method resolves the plugin-pinned composite key, so a plugin can
+// only ever reach its own vault.
+type pluginSecretHost struct{ server *Server }
+
+func (h *pluginSecretHost) Get(_ context.Context, key string) (string, bool, error) {
+	bucket, entryKey, err := splitPluginSecretKey(key)
+	if err != nil {
+		return "", false, err
+	}
+	entry, ok := h.server.store.PluginSecret(bucket, entryKey)
+	if !ok {
+		return "", false, nil
+	}
+	return entry.Value, true, nil
+}
+
+func (h *pluginSecretHost) Put(_ context.Context, key, value string) error {
+	bucket, entryKey, err := splitPluginSecretKey(key)
+	if err != nil {
+		return err
+	}
+	// The error deliberately carries the key name and never the value: this text
+	// reaches the broker's audit record and the plugin's own error channel.
+	if err := h.server.store.PutPluginSecret(model.KVEntry{Bucket: bucket, Key: entryKey, Value: value}); err != nil {
+		return fmt.Errorf("store plugin secret %q: %w", entryKey, err)
+	}
+	return nil
+}
+
+func (h *pluginSecretHost) Delete(_ context.Context, key string) error {
+	bucket, entryKey, err := splitPluginSecretKey(key)
+	if err != nil {
+		return err
+	}
+	return h.server.store.DeletePluginSecret(bucket, entryKey)
+}
+
+// pluginSecretBucketPrefix is the namespace every plugin secret access must live
+// under. As with KV, the broker pins it and the host re-checks it, so a hand-crafted
+// composite key cannot resolve into another plugin's vault.
+const pluginSecretBucketPrefix = "pluginsecret:"
+
+func splitPluginSecretKey(key string) (string, string, error) {
+	bucket, entryKey, ok := strings.Cut(key, "/")
+	if !ok {
+		return "", "", errors.New("plugin secret key must be bucket/key")
+	}
+	pluginID, ok := strings.CutPrefix(bucket, pluginSecretBucketPrefix)
+	if !ok {
+		return "", "", errors.New("plugin secret bucket must be namespaced to the plugin")
+	}
+	if err := validateStorageName(pluginID); err != nil {
+		return "", "", fmt.Errorf("plugin id: %w", err)
+	}
+	if err := validateStorageName(bucket); err != nil {
+		return "", "", fmt.Errorf("bucket: %w", err)
+	}
+	if err := validateStorageName(entryKey); err != nil {
+		return "", "", fmt.Errorf("key: %w", err)
+	}
+	return bucket, entryKey, nil
 }
 
 func (h *pluginHost) Get(ctx context.Context, key string) ([]byte, bool, error) {

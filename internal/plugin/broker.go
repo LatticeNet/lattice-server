@@ -20,6 +20,8 @@ const (
 	capNotifySend         = "notify:send"
 	capRPCCall            = "rpc:call"
 	capRPCExpose          = "rpc:expose"
+	capSecretRead         = "secret:read"
+	capSecretWrite        = "secret:write"
 
 	// kvBucketPrefix is prepended to a plugin id to derive the fixed,
 	// server-visible KV bucket a plugin is confined to. The plugin never gets to
@@ -27,6 +29,18 @@ const (
 	// plugin with kv:read/kv:write can only touch its OWN namespace and cannot act
 	// as a confused deputy against the shared operator KV store.
 	kvBucketPrefix = "plugin:"
+
+	// secretBucketPrefix is the equivalent pin for encrypted secret storage. It is a
+	// SEPARATE namespace from kvBucketPrefix on purpose: KV is plaintext at rest, so
+	// a plugin that confused one for the other would silently write a private key
+	// into cleartext storage. Distinct prefixes make that impossible to do by
+	// accident — a secret written through the secret host call can only ever land in
+	// the encrypted collection.
+	secretBucketPrefix = "pluginsecret:"
+
+	// secretMaxValueBytes caps one stored secret. Credentials and private keys are
+	// small; a large value here is a sign of misuse, not of a legitimate secret.
+	secretMaxValueBytes = 64 * 1024
 
 	// logMaxMessageBytes caps a plugin-authored log message. Anything longer is
 	// truncated (with a marker) so a plugin cannot flood the operator log sink.
@@ -73,7 +87,11 @@ func (e *CapabilityError) Unwrap() error {
 // HostServices are the real server-owned handles exposed through the broker.
 // The broker keeps these handles behind per-call capability checks.
 type HostServices struct {
-	KV           KVHost
+	KV KVHost
+	// Secret is the encrypted namespaced store (spec §9.4). When nil, a plugin
+	// holding secret:read/secret:write gets ErrHostServiceUnavailable rather than
+	// silently falling back to plaintext KV.
+	Secret       SecretHost
 	Notify       NotifyHost
 	HTTP         HTTPHost
 	OperatorHTTP OperatorHTTPHost
@@ -96,6 +114,20 @@ type HostServices struct {
 type KVHost interface {
 	Get(ctx context.Context, key string) ([]byte, bool, error)
 	Put(ctx context.Context, key string, value []byte) error
+}
+
+// SecretHost is the plugin-facing encrypted-secret subset (spec §9.4). It is shaped
+// like KVHost on purpose, but the implementation stores values through the server's
+// at-rest cipher. The distinction is not a naming convention: a value written here is
+// encrypted in the persisted state, and a value written through KVHost is not.
+//
+// There is no List. A plugin reads back a key it chose to write; it cannot enumerate
+// its own vault, so a read-only compromise cannot sweep for secrets whose names it
+// does not already know.
+type SecretHost interface {
+	Get(ctx context.Context, key string) (string, bool, error)
+	Put(ctx context.Context, key, value string) error
+	Delete(ctx context.Context, key string) error
 }
 
 // NotifyHost sends an operator notification through server-owned channels.
@@ -176,6 +208,9 @@ type Broker struct {
 	// broker pins every KV access to this bucket so the plugin can never reach
 	// another bucket in the shared operator KV store.
 	kvBucket string
+	// secretBucket is the fixed, per-plugin ENCRYPTED namespace
+	// ("pluginsecret:<pluginID>"), pinned by the broker exactly as kvBucket is.
+	secretBucket string
 	// guardURL guards every outbound HTTP target before the broker delegates to
 	// the HTTPHost. It is always non-nil after NewBroker (it defaults to the
 	// built-in outbound guard) so egress filtering is structural, not by
@@ -253,6 +288,7 @@ func NewBroker(loaded Loaded, services HostServices) (*Broker, error) {
 		capabilities:     make(map[string]struct{}, len(caps)),
 		services:         services,
 		kvBucket:         kvBucketPrefix + loaded.Manifest.ID,
+		secretBucket:     secretBucketPrefix + loaded.Manifest.ID,
 		guardURL:         guard,
 		guardOperatorURL: operatorGuard,
 	}
@@ -330,6 +366,73 @@ func (b *Broker) scopedKVKey(key string) (string, error) {
 		return "", errors.New("plugin kv key must not contain a slash")
 	}
 	return b.kvBucket + "/" + key, nil
+}
+
+// SecretGet reads an encrypted secret and requires secret:read. As with KV, the
+// bucket is pinned by the broker, so a plugin can only read secrets it wrote itself.
+//
+// The value is returned to the PLUGIN BACKEND only. It never crosses the browser
+// bridge: the bridge can invoke a plugin's declared interface methods, and what a
+// method chooses to return is the plugin's own business, but the host never places a
+// secret into a plan, an error, an audit record, or a log line.
+func (b *Broker) SecretGet(ctx context.Context, key string) (string, bool, error) {
+	if err := b.require(ctx, "secret.get", capSecretRead); err != nil {
+		return "", false, err
+	}
+	if b.services.Secret == nil {
+		return "", false, fmt.Errorf("%w: secret", ErrHostServiceUnavailable)
+	}
+	scoped, err := b.scopedSecretKey(key)
+	if err != nil {
+		return "", false, err
+	}
+	return b.services.Secret.Get(ctx, scoped)
+}
+
+// SecretPut writes an encrypted secret and requires secret:write.
+func (b *Broker) SecretPut(ctx context.Context, key, value string) error {
+	if err := b.require(ctx, "secret.put", capSecretWrite); err != nil {
+		return err
+	}
+	if b.services.Secret == nil {
+		return fmt.Errorf("%w: secret", ErrHostServiceUnavailable)
+	}
+	if len(value) > secretMaxValueBytes {
+		return fmt.Errorf("plugin secret value exceeds %d bytes", secretMaxValueBytes)
+	}
+	scoped, err := b.scopedSecretKey(key)
+	if err != nil {
+		return err
+	}
+	return b.services.Secret.Put(ctx, scoped, value)
+}
+
+// SecretDelete removes an encrypted secret and requires secret:write.
+func (b *Broker) SecretDelete(ctx context.Context, key string) error {
+	if err := b.require(ctx, "secret.delete", capSecretWrite); err != nil {
+		return err
+	}
+	if b.services.Secret == nil {
+		return fmt.Errorf("%w: secret", ErrHostServiceUnavailable)
+	}
+	scoped, err := b.scopedSecretKey(key)
+	if err != nil {
+		return err
+	}
+	return b.services.Secret.Delete(ctx, scoped)
+}
+
+// scopedSecretKey pins the bucket exactly as scopedKVKey does. The plugin chooses
+// only the entry name, and a "/" in it would let it smuggle a bucket and escape its
+// namespace — here that would mean reading another plugin's private keys.
+func (b *Broker) scopedSecretKey(key string) (string, error) {
+	if key == "" {
+		return "", errors.New("plugin secret key must not be empty")
+	}
+	if strings.ContainsAny(key, "/\\") {
+		return "", errors.New("plugin secret key must not contain a slash")
+	}
+	return b.secretBucket + "/" + key, nil
 }
 
 // Notify sends an operator notification and requires notify:send.

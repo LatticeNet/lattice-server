@@ -5444,6 +5444,38 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		writeTaskExecutionDisabled(w)
 		return
 	}
+	// A plugin operation (§9.3) is applied by its own artifact, not by a core apply
+	// script. This is the generic branch the spec asks for: no per-plugin case, no
+	// script the server had to know how to write. The plugin compiled the plan; the
+	// operator approved the exact bytes of it; the plugin now executes it under a
+	// one-time grant bound to that approval, and every task it enqueues is checked
+	// against the approved target set.
+	if isPluginOperationApproval(approval) {
+		approval.Status = model.ApprovalApproved
+		approval.ApprovedBy = p.ActorID
+		if err := s.store.UpsertApproval(approval); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if req.QueueApply {
+			if err := s.executePluginOperation(r.Context(), p, approval); err != nil {
+				// The approval stays approved-but-unexecuted rather than half-applied:
+				// re-checks fail closed (plugin disabled, upgraded, re-signed, targets
+				// no longer authorized), and the operator re-plans.
+				s.recordPrincipalAudit(p, model.AuditEvent{
+					ID: id.New("audit"), NodeID: approval.NodeID,
+					Action: "plugin.operation.execute", Scope: approvalDecisionAuditScope(approval),
+					Decision: "deny", Reason: err.Error(),
+					Metadata: map[string]string{"approval_id": approval.ID, "plugin_id": approval.Plugin},
+				})
+				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
+				return
+			}
+		}
+		writeJSON(w, http.StatusOK, toApprovalView(approval))
+		return
+	}
+
 	applyScript := ""
 	if req.QueueApply {
 		switch approval.Plugin {
@@ -5905,6 +5937,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)
+	}
+	if isPluginOperationApproval(approval) {
+		return s.handlePluginOperationTaskResult(r, approval, task, result)
 	}
 	if approval.Plugin != "nftpolicy" {
 		return nil

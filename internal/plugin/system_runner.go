@@ -286,6 +286,12 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	if err != nil {
 		return InvokeResponse{}, fmt.Errorf("bind operator targets: %w", err)
 	}
+	// The approved operation's authority lives here, on the host side of the boundary,
+	// for exactly this invocation. The child never receives it.
+	runCtx, err = BindOperation(runCtx, req.Constraints.Operation)
+	if err != nil {
+		return InvokeResponse{}, fmt.Errorf("bind operation: %w", err)
+	}
 
 	reply, stderr, runErr := r.runInvocation(runCtx, req, execPath, workDir, broker)
 	if runErr != nil {
@@ -588,6 +594,28 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 			return nil, err
 		}
 		return json.RawMessage(`{}`), nil
+	case "task.enqueue":
+		var req struct {
+			NodeID      string `json:"node_id"`
+			Interpreter string `json:"interpreter"`
+			Script      string `json:"script"`
+			TimeoutSec  int    `json:"timeout_sec"`
+		}
+		if err := json.Unmarshal(call.Params, &req); err != nil {
+			return nil, fmt.Errorf("task.enqueue params: %w", err)
+		}
+		taskID, err := broker.TaskEnqueue(ctx, HostTaskRequest{
+			NodeID:      req.NodeID,
+			Interpreter: req.Interpreter,
+			Script:      req.Script,
+			TimeoutSec:  req.TimeoutSec,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(struct {
+			TaskID string `json:"task_id"`
+		}{TaskID: taskID})
 	case "secret.get":
 		var req struct {
 			Key string `json:"key"`

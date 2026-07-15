@@ -22,6 +22,7 @@ const (
 	capRPCExpose          = "rpc:expose"
 	capSecretRead         = "secret:read"
 	capSecretWrite        = "secret:write"
+	capTaskRun            = "task:run"
 
 	// kvBucketPrefix is prepended to a plugin id to derive the fixed,
 	// server-visible KV bucket a plugin is confined to. The plugin never gets to
@@ -91,7 +92,11 @@ type HostServices struct {
 	// Secret is the encrypted namespaced store (spec §9.4). When nil, a plugin
 	// holding secret:read/secret:write gets ErrHostServiceUnavailable rather than
 	// silently falling back to plaintext KV.
-	Secret       SecretHost
+	Secret SecretHost
+	// Task enqueues agent work for an APPROVED operation (spec §9.3). Reachable only
+	// with task:run AND a context-bound operation grant, so a plugin cannot touch a
+	// node outside a plan an operator read and approved.
+	Task         TaskHost
 	Notify       NotifyHost
 	HTTP         HTTPHost
 	OperatorHTTP OperatorHTTPHost
@@ -433,6 +438,98 @@ func (b *Broker) scopedSecretKey(key string) (string, error) {
 		return "", errors.New("plugin secret key must not contain a slash")
 	}
 	return b.secretBucket + "/" + key, nil
+}
+
+// operationContextKey carries the approved OperationGrant. Private, so only this
+// package can bind or read it, and never serialized to the child.
+type operationContextKey struct{}
+
+// BindOperation attaches an approved operation's one-time authority to a single
+// invocation. Only the approval executor calls this; an ordinary /api/plugins/call
+// invocation binds nothing, so a plugin reached any other way holds no grant and its
+// task.enqueue is refused.
+func BindOperation(ctx context.Context, grant *OperationGrant) (context.Context, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if grant == nil {
+		return ctx, nil
+	}
+	if grant.ApprovalID == "" || grant.PlanSHA256 == "" || len(grant.Targets) == 0 {
+		return nil, errors.New("operation grant must bind an approval, a plan hash, and targets")
+	}
+	return context.WithValue(ctx, operationContextKey{}, grant), nil
+}
+
+func boundOperation(ctx context.Context) *OperationGrant {
+	if ctx == nil {
+		return nil
+	}
+	grant, _ := ctx.Value(operationContextKey{}).(*OperationGrant)
+	return grant
+}
+
+// TaskHost enqueues bounded agent work. The implementation remains server-owned and
+// applies the operator's own task validation, so a plugin can never reach a wider
+// interpreter set, a longer timeout, or a bigger script than an operator could.
+type TaskHost interface {
+	Enqueue(ctx context.Context, req HostTaskRequest) (string, error)
+}
+
+// HostTaskRequest is the broker's stable task-enqueue shape.
+type HostTaskRequest struct {
+	PluginID    string
+	ApprovalID  string
+	NodeID      string
+	Interpreter string
+	Script      string
+	TimeoutSec  int
+}
+
+// TaskEnqueue queues agent work for an APPROVED operation and requires task:run.
+//
+// The capability alone grants nothing. task:run says a plugin is *eligible* to run
+// work; the operation grant says which work, on which nodes, under which approval —
+// and it exists only inside an invocation the approval executor started. So the ways a
+// plugin might try to reach a node all fail here:
+//
+//   - called through the ordinary gateway, there is no grant at all;
+//   - holding a grant, it cannot aim at a node the operator did not approve;
+//   - it cannot enqueue against a plan other than the one that was approved;
+//   - it cannot enqueue more times than the approval allowed.
+//
+// The script itself is arbitrary — `sh` on a node is full execution by design. That is
+// exactly why the grant binds the target set: the blast radius is the reviewed one.
+func (b *Broker) TaskEnqueue(ctx context.Context, req HostTaskRequest) (string, error) {
+	if err := b.require(ctx, "task.enqueue", capTaskRun); err != nil {
+		return "", err
+	}
+	if b.services.Task == nil {
+		return "", fmt.Errorf("%w: task", ErrHostServiceUnavailable)
+	}
+	grant := boundOperation(ctx)
+	if grant == nil {
+		return "", errors.New("task.enqueue requires an approved operation; plan and approve it first")
+	}
+	if grant.PluginID != b.pluginID {
+		// The broker stamps the verified plugin id, so this can only mean a grant was
+		// somehow crossed between plugins. Refuse rather than reason about it.
+		return "", errors.New("operation grant belongs to another plugin")
+	}
+	if grant.Remaining <= 0 {
+		return "", errors.New("operation grant is exhausted")
+	}
+	if !grant.AllowsTarget(req.NodeID) {
+		return "", fmt.Errorf("node %q is not among the approved targets", req.NodeID)
+	}
+	if len(req.Script) > maxOperationScriptSize {
+		return "", fmt.Errorf("task script exceeds %d bytes", maxOperationScriptSize)
+	}
+	grant.Remaining--
+
+	req.PluginID = b.pluginID
+	req.ApprovalID = grant.ApprovalID
+	return b.services.Task.Enqueue(ctx, req)
 }
 
 // Notify sends an operator notification and requires notify:send.

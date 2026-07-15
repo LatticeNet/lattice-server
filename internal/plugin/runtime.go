@@ -66,6 +66,11 @@ type InvokeRequest struct {
 // code after the operator call has been authorized.
 type InvokeConstraints struct {
 	OperatorTargets []string
+	// Operation is the one-time authority for an approved host-risk operation (§9.3).
+	// Like OperatorTargets it stays on the host side of the boundary: the plugin never
+	// receives it, so it cannot forge or widen one — it can only make a host call that
+	// the broker then checks against it.
+	Operation *OperationGrant
 }
 
 // InvokeResponse is the decoded plugin reply. Result carries the plugin's body

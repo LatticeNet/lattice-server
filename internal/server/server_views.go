@@ -26,6 +26,15 @@ type approvalView struct {
 	ApprovedBy string    `json:"approved_by,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+
+	// Operation binding (§9.3), surfaced so an operator reviews what will actually run:
+	// which plugin version, which artifact, which nodes. Non-secret by construction —
+	// the plan preview is where the plugin redacts anything sensitive.
+	PluginVersion  string   `json:"plugin_version,omitempty"`
+	ArtifactDigest string   `json:"artifact_digest,omitempty"`
+	Service        string   `json:"service,omitempty"`
+	Method         string   `json:"method,omitempty"`
+	Targets        []string `json:"targets,omitempty"`
 }
 
 func toApprovalView(a model.Approval) approvalView {
@@ -47,6 +56,8 @@ func toApprovalView(a model.Approval) approvalView {
 		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
 		Plan: a.Plan, Status: a.Status, Reason: a.Reason, Stale: stale, StaleCode: staleCode, ActorID: a.ActorID,
 		ApprovedBy: a.ApprovedBy, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
+		PluginVersion: a.PluginVersion, ArtifactDigest: a.ArtifactDigest,
+		Service: a.Service, Method: a.Method, Targets: a.Targets,
 	}
 }
 

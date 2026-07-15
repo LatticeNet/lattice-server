@@ -17,38 +17,33 @@ import (
 // exactly what they read, and only then is the plugin invoked — once — with a grant
 // narrow enough that the worst it can do is the thing that was approved.
 //
-// The binding is the whole point. An approval that names only "plugin X, action Y" can
-// be honoured by a different version of X, or a re-signed artifact, or against nodes the
-// reviewer never saw, or after the plan was swapped underneath it. So the approval binds
-// the plugin ID, its version, the exact artifact digest, the service and method, a hash
-// of the request that produced the plan, the target nodes, and a hash of the plan itself
-// — and every one of those is re-checked at execution.
+// The binding lives in typed columns on the approval (Approval.PluginVersion,
+// ArtifactDigest, Service, Method, RequestSHA256, Targets), not in the reviewable plan
+// text. Each column records the exact code and inputs that produced the plan, and each
+// is compared to live state at execution: a plugin that was upgraded, re-signed, or
+// disabled between approval and execute no longer matches what the operator approved.
+// The plan text itself — what the operator reads — is covered by the existing approval
+// plan-hash gate.
 
 const (
-	// OperationPlanKind marks the canonical envelope stored in Approval.Plan. The
-	// approval's existing plan-hash gate hashes that string, so putting the whole
-	// binding tuple inside it means the operator's approval covers all of it — the
-	// reviewer cannot approve a plan and have a different plugin, version, artifact,
-	// or target set executed under it.
-	OperationPlanKind = "lattice.plugin.operation.v1"
-
 	maxOperationSteps      = 128
 	maxOperationTargets    = 64
 	maxOperationSummary    = 4096
 	maxOperationPreview    = 64 * 1024
-	maxOperationPlanData   = 256 * 1024
 	maxOperationScriptSize = 64 * 1024
+	maxOperationPlanData   = 256 * 1024
 )
 
 // PluginOperationPlan is what a plugin's `plan`-effect method returns: a deterministic,
 // reviewable description of what an apply would do. It is authored by the plugin and
-// never trusted as authorization — only as a proposal.
+// never trusted as authorization — only as a proposal. It is what the server stores in
+// Approval.Plan and what the operator reads.
 type PluginOperationPlan struct {
 	// Summary is the one-line intent an operator sees first.
 	Summary string `json:"summary"`
 	// Targets are the node IDs this operation would touch. The server authorizes each
-	// one against the approving principal; a plugin cannot widen its own blast radius
-	// by naming extra nodes, because the approval binds this exact set.
+	// one against the approving principal and records them as Approval.Targets; a plugin
+	// cannot widen its own blast radius by naming extra nodes.
 	Targets []string `json:"targets"`
 	// Preview is the redacted, human-reviewable body of the change. It is what the
 	// operator actually reads, so it must not contain secrets — the plugin redacts it,
@@ -59,57 +54,32 @@ type PluginOperationPlan struct {
 	// Rollback states what undoing this looks like. A plan that cannot say how it is
 	// undone is a plan an operator cannot safely approve.
 	Rollback string `json:"rollback,omitempty"`
-	// Data is opaque plugin-owned state carried through approval back into execute.
-	// The server does not interpret it; it only guarantees it is exactly what was
-	// approved, byte for byte.
+	// Data is opaque plugin-owned state carried through approval back into execute. The
+	// server does not interpret it; it hands back exactly what was approved.
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
-// OperationEnvelope is the canonical, signed-by-approval binding tuple. It is what gets
-// serialized into Approval.Plan, so the approval's plan hash covers every field.
-type OperationEnvelope struct {
-	Kind string `json:"kind"`
-
-	PluginID       string `json:"plugin_id"`
-	PluginVersion  string `json:"plugin_version"`
-	ArtifactDigest string `json:"artifact_digest"`
-	Service        string `json:"service"`
-	Method         string `json:"method"`
-	// RequestSHA256 hashes the request that produced this plan. Re-planning with
-	// different inputs produces a different approval; an approval cannot be replayed
-	// against a request the operator never saw.
-	RequestSHA256 string `json:"request_sha256"`
-
-	Plan PluginOperationPlan `json:"plan"`
-}
-
-// CanonicalOperationEnvelope renders the envelope deterministically. Determinism is
-// load-bearing: the approval's plan hash is taken over these bytes, so any ambiguity in
-// the encoding would be an ambiguity in what the operator approved.
-func CanonicalOperationEnvelope(env OperationEnvelope) (string, error) {
-	env.Kind = OperationPlanKind
-	// json.Marshal sorts struct fields by declaration and map keys lexically, and the
-	// envelope contains no maps except the plugin's opaque Data, which is passed
-	// through verbatim as the bytes the plugin produced.
-	raw, err := json.Marshal(env)
+// CanonicalOperationPlan renders the reviewable plan deterministically. This string is
+// stored in Approval.Plan and hashed by the approval plan-hash gate, so the operator
+// approves exactly these bytes; any ambiguity in the encoding would be an ambiguity in
+// what was approved.
+func CanonicalOperationPlan(plan PluginOperationPlan) (string, error) {
+	raw, err := json.Marshal(plan)
 	if err != nil {
-		return "", fmt.Errorf("canonicalize operation envelope: %w", err)
+		return "", fmt.Errorf("canonicalize operation plan: %w", err)
 	}
 	return string(raw), nil
 }
 
-// ParseOperationEnvelope reads back what CanonicalOperationEnvelope wrote.
-func ParseOperationEnvelope(plan string) (OperationEnvelope, error) {
-	var env OperationEnvelope
+// ParseOperationPlan reads back a stored plan.
+func ParseOperationPlan(plan string) (PluginOperationPlan, error) {
+	var out PluginOperationPlan
 	decoder := json.NewDecoder(strings.NewReader(plan))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&env); err != nil {
-		return OperationEnvelope{}, fmt.Errorf("parse operation envelope: %w", err)
+	if err := decoder.Decode(&out); err != nil {
+		return PluginOperationPlan{}, fmt.Errorf("parse operation plan: %w", err)
 	}
-	if env.Kind != OperationPlanKind {
-		return OperationEnvelope{}, fmt.Errorf("approval is not a plugin operation (kind %q)", env.Kind)
-	}
-	return env, nil
+	return out, nil
 }
 
 // ValidateOperationPlan bounds what a plugin may propose. A plan is plugin-authored
@@ -150,11 +120,21 @@ func ValidateOperationPlan(plan PluginOperationPlan) error {
 	return nil
 }
 
-// SHA256Hex is the one hashing helper the operation protocol uses, so plan hashes,
-// request hashes, and task payload hashes are all computed the same way.
+// SHA256Hex is the one hashing helper the operation protocol uses, so plan hashes and
+// request hashes are computed the same way.
 func SHA256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+// OperationExecuteRequest is what the approval executor hands the plugin's `execute`
+// action: the approved plan's opaque data and the approved targets. The plugin acts on
+// this, but every task it then tries to enqueue is checked by the broker against the
+// grant — so this payload is a convenience, not an authority.
+type OperationExecuteRequest struct {
+	ApprovalID string          `json:"approval_id"`
+	Targets    []string        `json:"targets"`
+	Data       json.RawMessage `json:"data,omitempty"`
 }
 
 // OperationGrant is the one-time, invocation-scoped authority handed to a plugin when
@@ -168,12 +148,11 @@ func SHA256Hex(data []byte) string {
 type OperationGrant struct {
 	ApprovalID string
 	PluginID   string
-	// PlanSHA256 is the hash of the exact approved envelope. Every task the plugin
-	// tries to enqueue is checked against this, so a plugin cannot execute one approval
-	// and enqueue work belonging to another.
+	// PlanSHA256 is the hash of the exact approved plan text. Carried for audit so a
+	// task can be tied back to the approval it ran under.
 	PlanSHA256 string
-	// Targets is the approved node set. The broker refuses any task aimed elsewhere,
-	// so a plugin holding a legitimate grant still cannot reach an unapproved node.
+	// Targets is the approved node set. The broker refuses any task aimed elsewhere, so
+	// a plugin holding a legitimate grant still cannot reach an unapproved node.
 	Targets []string
 	// Remaining bounds how many tasks this single approved operation may enqueue.
 	Remaining int

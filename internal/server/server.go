@@ -5938,6 +5938,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)
 	}
+	if isPluginOperationApproval(approval) {
+		return s.handlePluginOperationTaskResult(r, approval, task, result)
+	}
 	if approval.Plugin != "nftpolicy" {
 		return nil
 	}

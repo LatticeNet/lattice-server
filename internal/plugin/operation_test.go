@@ -159,46 +159,6 @@ func TestTaskEnqueueRequiresTheCapability(t *testing.T) {
 	}
 }
 
-// The envelope is the approval's plan text, so its hash is what the operator approves.
-// Any field moving must move the hash, or an approval could be honoured for a plugin,
-// version, artifact, request, or target set the reviewer never saw.
-func TestEveryBoundFieldChangesThePlanHash(t *testing.T) {
-	base := OperationEnvelope{
-		PluginID: "latticenet.wireguard", PluginVersion: "0.1.0", ArtifactDigest: strings.Repeat("a", 64),
-		Service: "latticenet.wireguard/networks", Method: "apply", RequestSHA256: strings.Repeat("b", 64),
-		Plan: PluginOperationPlan{Summary: "rotate keys", Targets: []string{"node-a"}},
-	}
-	canonical, err := CanonicalOperationEnvelope(base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseHash := SHA256Hex([]byte(canonical))
-
-	mutations := map[string]func(*OperationEnvelope){
-		"plugin id":       func(e *OperationEnvelope) { e.PluginID = "latticenet.vpn-core" },
-		"plugin version":  func(e *OperationEnvelope) { e.PluginVersion = "0.2.0" },
-		"artifact digest": func(e *OperationEnvelope) { e.ArtifactDigest = strings.Repeat("c", 64) },
-		"service":         func(e *OperationEnvelope) { e.Service = "latticenet.wireguard/other" },
-		"method":          func(e *OperationEnvelope) { e.Method = "destroy" },
-		"request hash":    func(e *OperationEnvelope) { e.RequestSHA256 = strings.Repeat("d", 64) },
-		"targets":         func(e *OperationEnvelope) { e.Plan.Targets = []string{"node-a", "node-b"} },
-		"summary":         func(e *OperationEnvelope) { e.Plan.Summary = "something else entirely" },
-		"plan data":       func(e *OperationEnvelope) { e.Plan.Data = json.RawMessage(`{"x":1}`) },
-	}
-	for name, mutate := range mutations {
-		mutated := base
-		mutate(&mutated)
-		canonical, err := CanonicalOperationEnvelope(mutated)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if SHA256Hex([]byte(canonical)) == baseHash {
-			t.Fatalf("changing the %s did not change the plan hash: an approval could be "+
-				"honoured for something the operator never approved", name)
-		}
-	}
-}
-
 func TestOperationPlanIsBounded(t *testing.T) {
 	if err := ValidateOperationPlan(PluginOperationPlan{Targets: []string{"node-a"}}); err == nil {
 		t.Fatal("a plan with no summary is not reviewable")
@@ -225,12 +185,32 @@ func TestOperationPlanIsBounded(t *testing.T) {
 	}
 }
 
-func TestParseOperationEnvelopeRejectsForeignPlans(t *testing.T) {
-	// The nft/dns/agent-update approvals are plain strings; they must not be mistaken
-	// for plugin operations, or the generic executor would try to run them.
-	for _, plan := range []string{"", "nft add rule ...", `{"kind":"something.else"}`} {
-		if _, err := ParseOperationEnvelope(plan); err == nil {
-			t.Fatalf("plan %q was accepted as a plugin operation", plan)
-		}
+// The stored plan is what the operator's plan-hash approval covers, so its serialization
+// must be deterministic: the same plan must always render to the same bytes, or the same
+// plan could hash two ways and an approval could be for a rendering the operator did not
+// see.
+func TestCanonicalOperationPlanIsDeterministic(t *testing.T) {
+	plan := PluginOperationPlan{
+		Summary: "rotate keys", Targets: []string{"node-a", "node-b"},
+		Preview: "…", Steps: []string{"a", "b"}, Rollback: "restore",
+		Data: json.RawMessage(`{"k":1}`),
+	}
+	first, err := CanonicalOperationPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CanonicalOperationPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("canonical plan is not stable: %q vs %q", first, second)
+	}
+	back, err := ParseOperationPlan(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Summary != plan.Summary || len(back.Targets) != 2 || string(back.Data) != `{"k":1}` {
+		t.Fatalf("plan did not round-trip: %+v", back)
 	}
 }

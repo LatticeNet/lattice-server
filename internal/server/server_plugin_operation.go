@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -14,19 +15,18 @@ import (
 
 // The host-risk operation protocol (spec §9.3).
 //
-// A plugin may compile intent into a plan; it may never apply one. This file is the
-// gap between those two sentences: a `plan`-effect method produces a reviewable plan
-// and an approval bound to everything that could change underneath it, and the approval
-// executor — and nothing else — invokes the plugin's `execute` action with a one-time
-// grant narrow enough that the worst it can do is the thing that was approved.
+// A plugin may compile intent into a plan; it may never apply one. This file is the gap
+// between those two sentences: a `plan`-effect method produces a reviewable plan and an
+// approval whose typed columns record the exact code and inputs that produced it, a
+// human approves what they read, and the approval executor — and nothing else — invokes
+// the plugin's `execute` action with a one-time grant bound to that approval.
 //
-// Why the binding is so wide: an approval that records only "plugin X, action Y" can be
-// honoured by a different version of X, by a re-signed artifact, against nodes the
-// reviewer never saw, or after the plan was swapped underneath it. So the envelope
-// carries plugin ID, version, artifact digest, service, method, a hash of the request
-// that produced the plan, and the targets — and because the envelope IS the approval's
-// plan text, the existing plan-hash gate covers all of it. The operator approves a
-// hash; that hash is the whole tuple.
+// The binding is typed. An approval that recorded only "plugin X, action Y" could be
+// honoured by a different version of X, a re-signed artifact, or against nodes the
+// reviewer never saw. So the approval carries PluginVersion, ArtifactDigest, Service,
+// Method, RequestSHA256, and Targets as real columns, and execution compares each to
+// live state — a mismatch means the operator approved a plan produced by code that is
+// no longer the code that would run it.
 
 // pluginOperationMaxTasks bounds how many agent tasks one approved operation may
 // enqueue. An approval authorizes a plan, not an open-ended session.
@@ -47,8 +47,8 @@ func (s *Server) planPluginOperation(
 	if err != nil {
 		return nil, err
 	}
-	var proposed plugin.PluginOperationPlan
-	if err := json.Unmarshal(out, &proposed); err != nil {
+	proposed, err := plugin.ParseOperationPlan(string(out))
+	if err != nil {
 		return nil, fmt.Errorf("plugin %q returned a plan that is not a PluginOperationPlan: %w",
 			loaded.Manifest.ID, err)
 	}
@@ -62,32 +62,30 @@ func (s *Server) planPluginOperation(
 		return nil, err
 	}
 
-	envelope := plugin.OperationEnvelope{
-		PluginID:       loaded.Manifest.ID,
-		PluginVersion:  loaded.Manifest.Version,
-		ArtifactDigest: loaded.ArtifactDigest,
-		Service:        service,
-		Method:         method,
-		RequestSHA256:  plugin.SHA256Hex(payload),
-		Plan:           proposed,
-	}
-	canonical, err := plugin.CanonicalOperationEnvelope(envelope)
+	// Store only the reviewable plan; the operator's plan-hash approval covers these
+	// exact bytes.
+	canonical, err := plugin.CanonicalOperationPlan(proposed)
 	if err != nil {
 		return nil, err
 	}
-
 	approval := model.Approval{
-		ID:     id.New("approval"),
-		NodeID: proposed.Targets[0],
-		Plugin: loaded.Manifest.ID,
-		Action: service + "/" + method,
-		// The canonical envelope IS the plan text, so approvalPlanSHA hashes the entire
-		// binding tuple and the operator's plan_sha256 check covers all of it.
+		ID:        id.New("approval"),
+		NodeID:    proposed.Targets[0],
+		Plugin:    loaded.Manifest.ID,
+		Action:    service + "/" + method,
 		Plan:      canonical,
 		Status:    model.ApprovalPending,
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
+
+		// The binding, as typed columns. Each is re-checked at execute.
+		PluginVersion:  loaded.Manifest.Version,
+		ArtifactDigest: loaded.ArtifactDigest,
+		Service:        service,
+		Method:         method,
+		RequestSHA256:  plugin.SHA256Hex(payload),
+		Targets:        append([]string(nil), proposed.Targets...),
 	}
 	if err := s.store.UpsertApproval(approval); err != nil {
 		return nil, err
@@ -129,81 +127,131 @@ func (s *Server) planPluginOperation(
 // methods, whose effects are read, write, or plan. There is no request a plugin author
 // or an operator can craft that reaches `execute` without an approval.
 //
-// Everything the approval bound is re-checked here, because all of it can change between
-// approval and execution: a plugin can be disabled, upgraded, re-signed, or have its
-// plan rewritten in the store.
+// Every column the approval bound is re-checked here against live state, because all of
+// it can change between approval and execution.
 func (s *Server) executePluginOperation(ctx context.Context, p principal, approval model.Approval) error {
-	envelope, err := plugin.ParseOperationEnvelope(approval.Plan)
-	if err != nil {
-		return err
-	}
-	loaded, ok := s.loadedPlugin(envelope.PluginID)
+	loaded, ok := s.loadedPlugin(approval.Plugin)
 	if !ok {
-		return fmt.Errorf("plugin %q is no longer loaded", envelope.PluginID)
+		return fmt.Errorf("plugin %q is no longer loaded", approval.Plugin)
 	}
-	if !s.pluginIsActive(envelope.PluginID) {
-		return fmt.Errorf("plugin %q is not active", envelope.PluginID)
+	if !s.pluginIsActive(approval.Plugin) {
+		return fmt.Errorf("plugin %q is not active", approval.Plugin)
 	}
 	// The approval named a version and an artifact. If either moved, the operator
 	// approved a plan produced by code that is no longer the code that would run it.
-	if loaded.Manifest.Version != envelope.PluginVersion {
+	if loaded.Manifest.Version != approval.PluginVersion {
 		return fmt.Errorf("plugin %q is now version %q; this approval was for %q — re-plan it",
-			envelope.PluginID, loaded.Manifest.Version, envelope.PluginVersion)
+			approval.Plugin, loaded.Manifest.Version, approval.PluginVersion)
 	}
-	if !equalFoldHex(loaded.ArtifactDigest, envelope.ArtifactDigest) {
+	if !equalFoldHex(loaded.ArtifactDigest, approval.ArtifactDigest) {
 		return fmt.Errorf("plugin %q artifact digest has changed since this approval — re-plan it",
-			envelope.PluginID)
+			approval.Plugin)
 	}
-	contract, ok := loaded.Manifest.InterfaceFor(envelope.Service)
+	contract, ok := loaded.Manifest.InterfaceFor(approval.Service)
 	if !ok || contract.EffectiveBacking() != plugin.BackingRuntime {
 		// A core-backed service has no artifact to execute; core applies its own plans.
-		return fmt.Errorf("plugin %q service %q is not runtime-backed", envelope.PluginID, envelope.Service)
+		return fmt.Errorf("plugin %q service %q is not runtime-backed", approval.Plugin, approval.Service)
+	}
+	if len(approval.Targets) == 0 {
+		return fmt.Errorf("approval %q has no bound targets", approval.ID)
 	}
 	// Re-authorize every target against the APPROVING principal. The planner's scopes
 	// are not inherited: the person who approves is the person who is accountable.
-	if err := requireAllNodeScopesErr(s, p, "network:apply", envelope.Plan.Targets); err != nil {
+	if err := requireAllNodeScopesErr(s, p, "network:apply", approval.Targets); err != nil {
 		return err
 	}
 
-	grant := &plugin.OperationGrant{
-		ApprovalID: approval.ID,
-		PluginID:   envelope.PluginID,
-		PlanSHA256: approvalPlanSHA(approval),
-		Targets:    append([]string(nil), envelope.Plan.Targets...),
-		Remaining:  pluginOperationMaxTasks,
-	}
-	// The grant is bound to this one invocation on the host side. The plugin never
-	// receives it and cannot widen it; it can only make a host call the broker then
-	// checks against it.
-	approved, err := json.Marshal(envelope)
+	plan, err := plugin.ParseOperationPlan(approval.Plan)
 	if err != nil {
 		return err
 	}
-	resp, err := s.pluginRuntime.InvokeConstrained(ctx, envelope.PluginID, "execute", approved,
+	grant := &plugin.OperationGrant{
+		ApprovalID: approval.ID,
+		PluginID:   approval.Plugin,
+		PlanSHA256: approvalPlanSHA(approval),
+		Targets:    append([]string(nil), approval.Targets...),
+		Remaining:  pluginOperationMaxTasks,
+	}
+	request, err := json.Marshal(plugin.OperationExecuteRequest{
+		ApprovalID: approval.ID,
+		Targets:    approval.Targets,
+		Data:       plan.Data,
+	})
+	if err != nil {
+		return err
+	}
+	// The grant is bound to this one invocation on the host side. The plugin never
+	// receives it and cannot widen it; it can only make a host call the broker checks
+	// against it.
+	resp, err := s.pluginRuntime.InvokeConstrained(ctx, approval.Plugin, "execute", request,
 		plugin.InvokeConstraints{Operation: grant})
 	if err != nil {
-		return fmt.Errorf("plugin %q execute failed: %w", envelope.PluginID, err)
+		return fmt.Errorf("plugin %q execute failed: %w", approval.Plugin, err)
 	}
 	if !resp.OK {
-		return fmt.Errorf("plugin %q refused to execute the approved plan: %s", envelope.PluginID, resp.Message)
+		return fmt.Errorf("plugin %q refused to execute the approved plan: %s", approval.Plugin, resp.Message)
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), Action: "plugin.operation.execute", Scope: "network:apply", Decision: "allow",
 		NodeID: approval.NodeID,
 		Metadata: map[string]string{
-			"plugin_id": envelope.PluginID, "approval_id": approval.ID,
-			"plan_sha256": grant.PlanSHA256, "artifact_digest": envelope.ArtifactDigest,
+			"plugin_id": approval.Plugin, "approval_id": approval.ID,
+			"plan_sha256": grant.PlanSHA256, "artifact_digest": approval.ArtifactDigest,
 			"tasks_enqueued": fmt.Sprint(pluginOperationMaxTasks - grant.Remaining),
 		},
 	})
 	return nil
 }
 
-// isPluginOperationApproval reports whether an approval carries a plugin operation
-// envelope, so the generic approval flow can route it without a per-plugin ladder.
+// handlePluginOperationTaskResult reconciles a plugin operation's approval once the
+// agent reports back (spec §9.3 step 6). This is the generic branch the result ladder
+// needs: without it a plugin operation would run and then leave its approval stuck in
+// `approved` forever, because the ladder returns nil for any plugin it does not know.
+//
+// The plan-SHA staleness check mirrors nftpolicy's: a task result carrying a plan hash
+// that no longer matches the approval belongs to a plan that has since been re-planned,
+// and is rejected rather than recorded as applied.
+func (s *Server) handlePluginOperationTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {
+	node := approval.NodeID
+	if len(task.Targets) > 0 {
+		node = task.Targets[0]
+	}
+	metadata := map[string]string{
+		"approval_id": approval.ID, "task_id": task.ID,
+		"plugin_id": approval.Plugin, "plan_sha": approvalPlanSHA(approval),
+	}
+	if result.Error != "" || result.ExitCode != 0 {
+		reason := result.Error
+		if reason == "" {
+			reason = fmt.Sprintf("apply task exited %d", result.ExitCode)
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID: id.New("audit"), NodeID: node, Action: "plugin.operation.failed",
+			Decision: "deny", Reason: reason, Metadata: metadata,
+		})
+		// The approval stays approved: the operator can re-approve to retry, or re-plan.
+		// It is not marked applied on a failed apply.
+		return nil
+	}
+	approval.Status = model.ApprovalApplied
+	approval.Reason = ""
+	approval.UpdatedAt = time.Now().UTC()
+	if err := s.store.UpsertApproval(approval); err != nil {
+		return fmt.Errorf("mark plugin operation approval applied: %w", err)
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID: id.New("audit"), NodeID: node, Action: "plugin.operation.applied",
+		Decision: "allow", Metadata: metadata,
+	})
+	return nil
+}
+
+// isPluginOperationApproval reports whether an approval carries a plugin operation, so
+// the generic approval flow can route it without a per-plugin ladder. A plugin operation
+// is the only kind that sets Service and Method; nft, dns, and agent-update approvals
+// never do, so this cannot mistake one of those for an operation.
 func isPluginOperationApproval(approval model.Approval) bool {
-	_, err := plugin.ParseOperationEnvelope(approval.Plan)
-	return err == nil
+	return approval.Service != "" && approval.Method != ""
 }
 
 // requireAllNodeScopesErr is the error-returning form of requireAllNodeScopes, for use

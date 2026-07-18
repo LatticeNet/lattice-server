@@ -19,30 +19,32 @@ import (
 // the server package, not the shared SDK). Secret-free: it carries only
 // connection-shape metadata, never private keys or passwords.
 type Line struct {
-	ID               string            `json:"id"`           // == LineHashID (stable handle)
-	LineHashID       string            `json:"line_hash_id"` // stable across re-probes; see lineHash / stableLineHandle
-	LineID           string            `json:"line_id,omitempty"`
-	NodeID           string            `json:"node_id"`
-	NodeIdentityUUID string            `json:"node_identity_uuid,omitempty"`
-	Core             string            `json:"core"`    // sing-box | xray | mihomo
-	Source           string            `json:"source"`  // managed | discovered | imported
-	Managed          bool              `json:"managed"` // under Lattice config management
-	Name             string            `json:"name"`
-	Tag              string            `json:"tag,omitempty"`
-	Type             string            `json:"type,omitempty"` // protocol
-	ListenHost       string            `json:"listen_host,omitempty"`
-	ListenPort       int               `json:"listen_port,omitempty"`
-	PublicHost       string            `json:"public_host,omitempty"`
-	Domain           string            `json:"domain,omitempty"`
-	OutboundRef      string            `json:"outbound_ref,omitempty"`    // direct | <host/tag> | "" unknown
-	OutboundServer   string            `json:"outbound_server,omitempty"` // downstream server host the outbound routes to
-	OutboundPort     int               `json:"outbound_port,omitempty"`   // downstream server port the outbound routes to
-	JumpEdges        []string          `json:"jump_edges,omitempty"`      // line_hash_ids this line relays to
-	UserCount        int               `json:"user_count"`
-	UserKnown        bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
-	Status           string            `json:"status,omitempty"` // ok | pending | error | stale
-	LastError        string            `json:"last_error,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
+	ID                 string            `json:"id"`           // == LineHashID (stable handle)
+	LineHashID         string            `json:"line_hash_id"` // stable across re-probes; see lineHash / stableLineHandle
+	LineID             string            `json:"line_id,omitempty"`
+	NodeID             string            `json:"node_id"`
+	NodeIdentityUUID   string            `json:"node_identity_uuid,omitempty"`
+	LineUUID           string            `json:"line_uuid,omitempty"`            // design-15 D1: durable control-plane identity (vpnmeta/lineuuid)
+	DownstreamLineUUID string            `json:"downstream_line_uuid,omitempty"` // design-15 §6: declared chain edge target
+	Core               string            `json:"core"`                           // sing-box | xray | mihomo
+	Source             string            `json:"source"`                         // managed | discovered | imported
+	Managed            bool              `json:"managed"`                        // under Lattice config management
+	Name               string            `json:"name"`
+	Tag                string            `json:"tag,omitempty"`
+	Type               string            `json:"type,omitempty"` // protocol
+	ListenHost         string            `json:"listen_host,omitempty"`
+	ListenPort         int               `json:"listen_port,omitempty"`
+	PublicHost         string            `json:"public_host,omitempty"`
+	Domain             string            `json:"domain,omitempty"`
+	OutboundRef        string            `json:"outbound_ref,omitempty"`    // direct | <host/tag> | "" unknown
+	OutboundServer     string            `json:"outbound_server,omitempty"` // downstream server host the outbound routes to
+	OutboundPort       int               `json:"outbound_port,omitempty"`   // downstream server port the outbound routes to
+	JumpEdges          []string          `json:"jump_edges,omitempty"`      // line_hash_ids this line relays to
+	UserCount          int               `json:"user_count"`
+	UserKnown          bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
+	Status             string            `json:"status,omitempty"` // ok | pending | error | stale
+	LastError          string            `json:"last_error,omitempty"`
+	Metadata           map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
 }
 
 // LineGroup is the set of lines on one node — the unit the dashboard renders.
@@ -155,27 +157,28 @@ func (s *Server) buildLineGroups() []LineGroup {
 			lineID := firstNonEmpty(n.LineID, n.Metadata["line_id"])
 			nodeUUID := firstNonEmpty(n.NodeIdentityUUID, n.Metadata["node_uuid"], n.Metadata["lattice_identity_uuid"], s.nodeIdentityUUID(inv.NodeID))
 			ln := Line{
-				LineID:           lineID,
-				NodeID:           inv.NodeID,
-				NodeIdentityUUID: nodeUUID,
-				Core:             "sing-box",
-				Source:           "discovered",
-				Managed:          false,
-				Name:             n.Name,
-				Tag:              n.Name,
-				Type:             n.Protocol,
-				ListenHost:       n.ListenHost,
-				ListenPort:       port,
-				PublicHost:       n.Address,
-				Domain:           firstNonEmpty(n.SNI, n.Host),
-				OutboundRef:      n.OutboundRef,
-				OutboundServer:   n.OutboundServer,
-				OutboundPort:     atoiSafe(n.OutboundPort),
-				UserCount:        n.UserCount,
-				UserKnown:        n.UserKnown,
-				Status:           status,
-				LastError:        lastErr,
-				Metadata:         n.Metadata,
+				LineID:             lineID,
+				NodeID:             inv.NodeID,
+				NodeIdentityUUID:   nodeUUID,
+				DownstreamLineUUID: strings.TrimSpace(n.DownstreamLineUUID),
+				Core:               "sing-box",
+				Source:             "discovered",
+				Managed:            false,
+				Name:               n.Name,
+				Tag:                n.Name,
+				Type:               n.Protocol,
+				ListenHost:         n.ListenHost,
+				ListenPort:         port,
+				PublicHost:         n.Address,
+				Domain:             firstNonEmpty(n.SNI, n.Host),
+				OutboundRef:        n.OutboundRef,
+				OutboundServer:     n.OutboundServer,
+				OutboundPort:       atoiSafe(n.OutboundPort),
+				UserCount:          n.UserCount,
+				UserKnown:          n.UserKnown,
+				Status:             status,
+				LastError:          lastErr,
+				Metadata:           n.Metadata,
 			}
 			ln.LineHashID = stableLineHandle(ln.LineID)
 			if ln.LineHashID == "" {
@@ -218,6 +221,22 @@ func (s *Server) buildLineGroups() []LineGroup {
 			if !containsString(ln.JumpEdges, target) {
 				ln.JumpEdges = append(ln.JumpEdges, target)
 			}
+		}
+		byNode[nodeID] = lines
+	}
+
+	// (4) design-15 D1: attach the durable control-plane line_uuid to every line.
+	// Allocation failure must degrade (uuid left empty + log) and never fail the
+	// whole read model. Managed lines have no downstream metadata source yet, so
+	// DownstreamLineUUID stays empty for them this slice.
+	for nodeID, lines := range byNode {
+		for i := range lines {
+			uuid, err := s.ensureLineUUID(lines[i].LineHashID)
+			if err != nil {
+				s.logger.Printf("linemeta: allocate line_uuid for %s: %v", lines[i].LineHashID, err)
+				continue
+			}
+			lines[i].LineUUID = uuid
 		}
 		byNode[nodeID] = lines
 	}

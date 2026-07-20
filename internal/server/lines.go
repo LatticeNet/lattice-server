@@ -19,32 +19,36 @@ import (
 // the server package, not the shared SDK). Secret-free: it carries only
 // connection-shape metadata, never private keys or passwords.
 type Line struct {
-	ID                 string            `json:"id"`           // == LineHashID (stable handle)
-	LineHashID         string            `json:"line_hash_id"` // stable across re-probes; see lineHash / stableLineHandle
-	LineID             string            `json:"line_id,omitempty"`
-	NodeID             string            `json:"node_id"`
-	NodeIdentityUUID   string            `json:"node_identity_uuid,omitempty"`
-	LineUUID           string            `json:"line_uuid,omitempty"`            // design-15 D1: durable control-plane identity (vpnmeta/lineuuid)
-	DownstreamLineUUID string            `json:"downstream_line_uuid,omitempty"` // design-15 §6: declared chain edge target
-	Core               string            `json:"core"`                           // sing-box | xray | mihomo
-	Source             string            `json:"source"`                         // managed | discovered | imported
-	Managed            bool              `json:"managed"`                        // under Lattice config management
-	Name               string            `json:"name"`
-	Tag                string            `json:"tag,omitempty"`
-	Type               string            `json:"type,omitempty"` // protocol
-	ListenHost         string            `json:"listen_host,omitempty"`
-	ListenPort         int               `json:"listen_port,omitempty"`
-	PublicHost         string            `json:"public_host,omitempty"`
-	Domain             string            `json:"domain,omitempty"`
-	OutboundRef        string            `json:"outbound_ref,omitempty"`    // direct | <host/tag> | "" unknown
-	OutboundServer     string            `json:"outbound_server,omitempty"` // downstream server host the outbound routes to
-	OutboundPort       int               `json:"outbound_port,omitempty"`   // downstream server port the outbound routes to
-	JumpEdges          []string          `json:"jump_edges,omitempty"`      // line_hash_ids this line relays to
-	UserCount          int               `json:"user_count"`
-	UserKnown          bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
-	Status             string            `json:"status,omitempty"` // ok | pending | error | stale
-	LastError          string            `json:"last_error,omitempty"`
-	Metadata           map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
+	ID                 string   `json:"id"`           // == LineHashID (stable handle)
+	LineHashID         string   `json:"line_hash_id"` // stable across re-probes; see lineHash / stableLineHandle
+	LineID             string   `json:"line_id,omitempty"`
+	NodeID             string   `json:"node_id"`
+	NodeIdentityUUID   string   `json:"node_identity_uuid,omitempty"`
+	LineUUID           string   `json:"line_uuid,omitempty"`            // design-15 D1: durable control-plane identity (vpnmeta/lineuuid)
+	DownstreamLineUUID string   `json:"downstream_line_uuid,omitempty"` // design-15 §6: declared chain edge target
+	Core               string   `json:"core"`                           // sing-box | xray | mihomo
+	Source             string   `json:"source"`                         // managed | discovered | imported
+	Managed            bool     `json:"managed"`                        // under Lattice config management
+	Name               string   `json:"name"`
+	Tag                string   `json:"tag,omitempty"`
+	Type               string   `json:"type,omitempty"` // protocol
+	ListenHost         string   `json:"listen_host,omitempty"`
+	ListenPort         int      `json:"listen_port,omitempty"`
+	PublicHost         string   `json:"public_host,omitempty"`
+	Domain             string   `json:"domain,omitempty"`
+	OutboundRef        string   `json:"outbound_ref,omitempty"`    // direct | <host/tag> | "" unknown
+	OutboundServer     string   `json:"outbound_server,omitempty"` // downstream server host the outbound routes to
+	OutboundPort       int      `json:"outbound_port,omitempty"`   // downstream server port the outbound routes to
+	JumpEdges          []string `json:"jump_edges,omitempty"`      // line_hash_ids this line relays to
+	// DeclaredJumpEdges is the subset of JumpEdges resolved from the sidecar's
+	// declared downstream_line_uuid (design-15 §6), not inferred from outbound
+	// host/port — the UI badges these as orchestrated edges.
+	DeclaredJumpEdges []string          `json:"declared_jump_edges,omitempty"`
+	UserCount         int               `json:"user_count"`
+	UserKnown         bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
+	Status            string            `json:"status,omitempty"` // ok | pending | error | stale
+	LastError         string            `json:"last_error,omitempty"`
+	Metadata          map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
 }
 
 // LineGroup is the set of lines on one node — the unit the dashboard renders.
@@ -237,6 +241,38 @@ func (s *Server) buildLineGroups() []LineGroup {
 				continue
 			}
 			lines[i].LineUUID = uuid
+		}
+		byNode[nodeID] = lines
+	}
+
+	// (5) design-15 §6: declared chain edges. A sidecar-declared
+	// downstream_line_uuid resolves to the downstream line's hash fleet-wide —
+	// exact across machines, immune to NAT and shared ports — and takes
+	// provenance precedence over the inferred (host,port) edges from (3).
+	uuidIndex := map[string]string{} // line_uuid -> line_hash_id
+	for _, lines := range byNode {
+		for _, ln := range lines {
+			if ln.LineUUID != "" {
+				uuidIndex[ln.LineUUID] = ln.LineHashID
+			}
+		}
+	}
+	for nodeID, lines := range byNode {
+		for i := range lines {
+			declared := strings.TrimSpace(lines[i].DownstreamLineUUID)
+			if declared == "" {
+				continue
+			}
+			target := uuidIndex[declared]
+			if target == "" || target == lines[i].LineHashID {
+				continue // downstream unknown to the fleet (deleted/down) or self
+			}
+			if !containsString(lines[i].JumpEdges, target) {
+				lines[i].JumpEdges = append(lines[i].JumpEdges, target)
+			}
+			if !containsString(lines[i].DeclaredJumpEdges, target) {
+				lines[i].DeclaredJumpEdges = append(lines[i].DeclaredJumpEdges, target)
+			}
 		}
 		byNode[nodeID] = lines
 	}

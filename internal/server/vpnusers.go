@@ -244,6 +244,19 @@ func (s *Server) vpnCoreUsersRPC(_ context.Context, method string, request []byt
 // ── RPC: writes (proxy:admin) ─────────────────────────────────────────────────
 
 func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
+	out, err := s.vpnCoreUsersAdminDispatch(ctx, method, request)
+	// design-15 §7: every committed mutation re-arms the Sub-Store auto-sync;
+	// plan methods only queue approvals and do not change subscription content.
+	if err == nil {
+		switch method {
+		case "create", "update", "delete", "bind", "unbind", "rotate":
+			s.triggerVPNCoreMutation()
+		}
+	}
+	return out, err
+}
+
+func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "create":
 		return s.vpnUserCreate(request)

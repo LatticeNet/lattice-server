@@ -157,6 +157,10 @@ type Server struct {
 	// concurrent read-model builds cannot allocate two UUIDs for one line
 	// (design-15 D1).
 	lineUUIDMu sync.Mutex
+	// subStoreSync holds the debounced Sub-Store auto-sync trigger that fires
+	// after committed vpn-core mutations (design-15 §7). Nil-safe: trigger and
+	// fire paths both tolerate it.
+	subStoreSync *subStoreSyncState
 	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
 	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
 	// who already targets a known account cannot widen the password-guess budget by
@@ -363,6 +367,7 @@ func New(opts Options) (*Server, error) {
 		// consume the operator/API limiter or widen token-search throughput.
 		subLimiter:       ratelimit.New(ratelimit.Config{Rate: 2, Burst: 20}),
 		logIngestLimiter: ratelimit.New(ratelimit.Config{Rate: 5000, Burst: 10000}),
+		subStoreSync:     &subStoreSyncState{},
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},

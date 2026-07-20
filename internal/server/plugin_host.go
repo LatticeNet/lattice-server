@@ -83,6 +83,19 @@ func (h *pluginSecretHost) Delete(_ context.Context, key string) error {
 	return h.server.store.DeletePluginSecret(bucket, entryKey)
 }
 
+// pluginSecretValue is the ONLY non-broker read path into the encrypted plugin
+// vault: in-core system code (design-15 §7 auto-sync and secret:// operator-
+// target resolution) reads through here so the store-level accessors stay
+// confined to this file (TestNoHTTPHandlerReachesThePluginSecretStore). It is
+// never exposed over HTTP and must never gain a handler.
+func (s *Server) pluginSecretValue(pluginID, key string) (string, bool) {
+	entry, ok := s.store.PluginSecret(pluginSecretBucketPrefix+pluginID, key)
+	if !ok {
+		return "", false
+	}
+	return entry.Value, true
+}
+
 // pluginTaskHost implements plugin.TaskHost (spec §9.3 step 5). The broker has already
 // checked that this invocation carries an approved operation grant and that the target
 // is one the operator approved; this side enforces everything an OPERATOR queueing the

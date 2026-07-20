@@ -181,6 +181,58 @@ func TestBuildLineGroupsFillsLineUUIDs(t *testing.T) {
 	}
 }
 
+// (c2) A declared downstream_line_uuid resolves to the downstream line's hash
+// fleet-wide (design-15 §6): the hub gains a declared jump edge, and provenance
+// is kept separate from inferred edges. Unknown/self uuids resolve to nothing.
+func TestBuildLineGroupsDeclaredEdges(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	seedLinemetaNodes(t, srv)
+
+	// Pre-seed the downstream's mapping so its allocated uuid equals the hub's
+	// declared downstream_line_uuid (hub-a -> exit-b-in).
+	exitHash := findLine(t, srv.buildLineGroups(), "node-b", "exit-b-in").LineHashID
+	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: exitHash, Value: "1eec4b5a-9c2f-4a1b-8d3e-5f6a7b8c9d0e"}); err != nil {
+		t.Fatal(err)
+	}
+	hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+	if !containsString(hub.JumpEdges, exitHash) {
+		t.Fatalf("declared edge missing from jump_edges: %+v", hub)
+	}
+	if !containsString(hub.DeclaredJumpEdges, exitHash) {
+		t.Fatalf("declared edge missing from declared_jump_edges: %+v", hub)
+	}
+	// The inferred path already found hub-a -> exit-b via (host,port); the
+	// declared resolution must not duplicate it.
+	count := 0
+	for _, edge := range hub.JumpEdges {
+		if edge == exitHash {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("edge duplicated: %+v", hub.JumpEdges)
+	}
+	// A line without a resolvable downstream has no declared edges.
+	orphan := findLine(t, srv.buildLineGroups(), "node-a", "orphan-relay")
+	if len(orphan.DeclaredJumpEdges) != 0 {
+		t.Fatalf("orphan must not gain declared edges: %+v", orphan)
+	}
+	// A declared uuid unknown to the fleet resolves to nothing.
+	srv.singboxInvMu.Lock()
+	inv := srv.singboxInv["node-a"]
+	inv.Nodes[2].DownstreamLineUUID = "7c3d8e2f-5a4b-4c6d-9e0f-1a2b3c4d5e6f"
+	srv.singboxInv["node-a"] = inv
+	srv.singboxInvMu.Unlock()
+	dangling := findLine(t, srv.buildLineGroups(), "node-a", "direct-a")
+	if len(dangling.DeclaredJumpEdges) != 0 || len(dangling.JumpEdges) != 0 {
+		t.Fatalf("unknown downstream uuid must resolve to no edge: %+v", dangling)
+	}
+}
+
 // (d) The renderer emits the exact contract shape (mirrors fixtures/v2-valid-full.json).
 func TestRenderLineMetadataJSON(t *testing.T) {
 	st, err := store.Open("")

@@ -138,6 +138,7 @@ type vpnCoreProfilePluginConfig struct {
 	ProxyUsageXrayAPI     string `json:"proxy_usage_xray_api,omitempty"`
 	ProxyUsageXrayBin     string `json:"proxy_usage_xray_bin,omitempty"`
 	ProxyUsageXrayPattern string `json:"proxy_usage_xray_pattern,omitempty"`
+	SingBoxStatsAPI       string `json:"singbox_stats_api,omitempty"`
 }
 
 type vpnCoreProfileSettingsRequest struct {
@@ -318,7 +319,7 @@ func (s *Server) vpnCoreProfileSettings(nodeID string) (vpnCoreProfileSettings, 
 			SingBoxDiscover: runtime.SingBoxDiscover, SingBoxBin: runtime.SingBoxBin,
 			ProxyUsageFile: runtime.ProxyUsageFile, ProxyUsageURL: runtime.ProxyUsageURL,
 			ProxyUsageXrayAPI: runtime.ProxyUsageXrayAPI, ProxyUsageXrayBin: runtime.ProxyUsageXrayBin,
-			ProxyUsageXrayPattern: runtime.ProxyUsageXrayPattern,
+			ProxyUsageXrayPattern: runtime.ProxyUsageXrayPattern, SingBoxStatsAPI: runtime.SingBoxStatsAPI,
 		}
 		settings.Reported = &reported
 		settings.Prerequisites.ReportedAllowExec = runtime.AllowExec
@@ -336,7 +337,7 @@ func vpnCoreProfilePluginConfigFromLaunch(launch model.AgentLaunchConfig) vpnCor
 		SingBoxDiscover: launch.SingBoxDiscover, SingBoxBin: launch.SingBoxBin,
 		ProxyUsageFile: launch.ProxyUsageFile, ProxyUsageURL: launch.ProxyUsageURL,
 		ProxyUsageXrayAPI: launch.ProxyUsageXrayAPI, ProxyUsageXrayBin: launch.ProxyUsageXrayBin,
-		ProxyUsageXrayPattern: launch.ProxyUsageXrayPattern,
+		ProxyUsageXrayPattern: launch.ProxyUsageXrayPattern, SingBoxStatsAPI: launch.SingBoxStatsAPI,
 	}
 }
 
@@ -348,6 +349,7 @@ func applyVPNCoreProfilePluginConfig(launch *model.AgentLaunchConfig, config vpn
 	launch.ProxyUsageXrayAPI = config.ProxyUsageXrayAPI
 	launch.ProxyUsageXrayBin = config.ProxyUsageXrayBin
 	launch.ProxyUsageXrayPattern = config.ProxyUsageXrayPattern
+	launch.SingBoxStatsAPI = config.SingBoxStatsAPI
 }
 
 func normalizeVPNCoreProfilePluginConfig(in vpnCoreProfilePluginConfig) (vpnCoreProfilePluginConfig, error) {
@@ -383,6 +385,12 @@ func normalizeVPNCoreProfilePluginConfig(in vpnCoreProfilePluginConfig) (vpnCore
 	out.ProxyUsageXrayAPI = strings.TrimSpace(out.ProxyUsageXrayAPI)
 	if out.ProxyUsageXrayAPI != "" {
 		if err := validateProxyHostPort(out.ProxyUsageXrayAPI, "proxy_usage_xray_api"); err != nil {
+			return vpnCoreProfilePluginConfig{}, err
+		}
+	}
+	out.SingBoxStatsAPI = strings.TrimSpace(out.SingBoxStatsAPI)
+	if out.SingBoxStatsAPI != "" {
+		if err := validateProxyHostPort(out.SingBoxStatsAPI, "singbox_stats_api"); err != nil {
 			return vpnCoreProfilePluginConfig{}, err
 		}
 	}

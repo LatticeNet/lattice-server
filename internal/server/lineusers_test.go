@@ -295,3 +295,126 @@ func TestLineUserTaskResult(t *testing.T) {
 		}
 	}
 }
+
+// design-15 §8: a singbox-stats snapshot's u_<hash> counters are reversed into
+// (line, proxy user) rows — the per-user total advances through the normal
+// monotonic diff and the line granularity persists in line_user_bytes.
+func TestFoldUserLineUsageEndToEnd(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	line, _ := seedLineUserFixture(t, srv)
+	if err := srv.store.UpsertProxyNodeProfile(model.ProxyNodeProfile{ID: "proxy-a", NodeID: "node-a", Core: "sing-box", InboundIDs: []string{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.UpsertProxyUser(model.ProxyUser{ID: "pu-1", Name: "alice@example.com", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	srv.migrateProxyUsersToVpnUsers()
+	migrated, ok := srv.getVpnUser("vu_pu-1")
+	if !ok {
+		t.Fatal("migration did not produce vu_pu-1")
+	}
+	migrated.Bindings = []LineBinding{{LineHashID: line.LineHashID, Enabled: true}}
+	if err := srv.putVpnUser(migrated); err != nil {
+		t.Fatal(err)
+	}
+	name := userLineName(migrated.ID, line.LineUUID)
+	if got := srv.userLineNameIndex()[name]; got.LineHashID != line.LineHashID || got.ProxyUserID != "pu-1" {
+		t.Fatalf("index: %+v", got)
+	}
+
+	report := func(up, down int64) {
+		t.Helper()
+		_, err := srv.applyProxyUsageSnapshot(model.ProxyUsageSnapshot{
+			NodeID: "node-a", At: srv.now(), CoreUptimeSec: 1000,
+			UserBytes: map[string]int64{name: up + down, "u_unknown1234567": 55},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	report(100, 250) // baseline
+	report(160, 400) // delta 310
+
+	user, ok := srv.store.ProxyUser("pu-1")
+	if !ok {
+		t.Fatal("proxy user missing")
+	}
+	if user.UsedBytes != 210 { // (560-350) across both directions
+		t.Fatalf("UsedBytes = %d, want 210", user.UsedBytes)
+	}
+	snapshot, ok := srv.store.ProxyUsageSnapshot("node-a")
+	if !ok {
+		t.Fatal("snapshot missing")
+	}
+	if snapshot.UserBytes[name] != 0 {
+		t.Fatalf("u_name must be folded away: %+v", snapshot.UserBytes)
+	}
+	if snapshot.UserBytes["pu-1"] != 560 {
+		t.Fatalf("folded total: %+v", snapshot.UserBytes)
+	}
+	lineBucket := snapshot.LineUserBytes[line.LineHashID]
+	if lineBucket["pu-1"] != 560 {
+		t.Fatalf("line bucket: %+v", snapshot.LineUserBytes)
+	}
+	// Unknown u_ names degrade to ignored, never to fabricated traffic.
+	if snapshot.UserBytes["u_unknown1234567"] != 0 {
+		t.Fatalf("unknown name must be dropped by eligibility: %+v", snapshot.UserBytes)
+	}
+}
+
+// The same user on two lines sums into one proxy-user total while each line
+// keeps its own bucket.
+func TestFoldUserLineUsageTwoLines(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	seedLinemetaNodes(t, srv)
+	hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+	direct := findLine(t, srv.buildLineGroups(), "node-a", "direct-a")
+	if err := srv.store.UpsertProxyNodeProfile(model.ProxyNodeProfile{ID: "proxy-a", NodeID: "node-a", Core: "sing-box"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.UpsertProxyUser(model.ProxyUser{ID: "pu-2", Name: "bob@example.com", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	srv.migrateProxyUsersToVpnUsers()
+	u, _ := srv.getVpnUser("vu_pu-2")
+	u.Bindings = []LineBinding{{LineHashID: hub.LineHashID, Enabled: true}, {LineHashID: direct.LineHashID, Enabled: true}}
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	nameHub := userLineName(u.ID, hub.LineUUID)
+	nameDirect := userLineName(u.ID, direct.LineUUID)
+	if nameHub == nameDirect {
+		t.Fatal("names must differ per line")
+	}
+	if _, err := srv.applyProxyUsageSnapshot(model.ProxyUsageSnapshot{
+		NodeID: "node-a", At: srv.now(), CoreUptimeSec: 1000,
+		UserBytes: map[string]int64{nameHub: 100, nameDirect: 40},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.applyProxyUsageSnapshot(model.ProxyUsageSnapshot{
+		NodeID: "node-a", At: srv.now(), CoreUptimeSec: 1001,
+		UserBytes: map[string]int64{nameHub: 150, nameDirect: 90},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	user, _ := srv.store.ProxyUser("pu-2")
+	if user.UsedBytes != 100 { // (150-100) + (90-40)
+		t.Fatalf("UsedBytes = %d, want 100", user.UsedBytes)
+	}
+	snapshot, _ := srv.store.ProxyUsageSnapshot("node-a")
+	if snapshot.LineUserBytes[hub.LineHashID]["pu-2"] != 150 || snapshot.LineUserBytes[direct.LineHashID]["pu-2"] != 90 {
+		t.Fatalf("line buckets: %+v", snapshot.LineUserBytes)
+	}
+	if snapshot.UserBytes["pu-2"] != 240 {
+		t.Fatalf("summed total: %+v", snapshot.UserBytes)
+	}
+}

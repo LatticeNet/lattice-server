@@ -1401,6 +1401,9 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	if len(snapshot.UserBytes) > 4096 {
 		return proxyUsageApplyResult{}, errors.New("user_bytes has too many entries")
 	}
+	// design-15 §8: reverse on-box u_<hash> stat names into (line, proxy user)
+	// accounting rows before eligibility checks and monotonic diffing.
+	foldUserLineUsage(&snapshot, s.userLineNameIndex())
 	eligible := s.proxyUsageEligibleUsers(profile)
 	lineUserBytes, lineUserTotals, lineUsersIgnored, err := s.sanitizeProxyUsageLineUserBytes(snapshot.LineUserBytes, eligible)
 	if err != nil {

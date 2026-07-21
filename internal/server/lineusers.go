@@ -426,3 +426,68 @@ func (s *Server) vpnUserRotateCredential(ctxPrincipal principal, request []byte)
 		RevealedCredential string `json:"revealed_credential"`
 	}{User: toVpnUserView(u), Protocol: protocol, RevealedCredential: revealed})
 }
+
+// ── usage name reversal (design-15 §8) ───────────────────────────────────────
+
+// userLineNameTarget identifies the accounting row a u_<hash> counter maps to.
+type userLineNameTarget struct {
+	LineHashID  string
+	ProxyUserID string
+}
+
+// userLineNameIndex recomputes the design-15 §5 on-box names for every
+// (identity, line) pair and maps them back to (line_hash_id, proxy user id) —
+// the server's half of the per-user stats join. Identities that never migrated
+// from the ProxyUser substrate have no accounting row and are skipped: their
+// counters degrade to "ignored", never to zero-filled traffic.
+func (s *Server) userLineNameIndex() map[string]userLineNameTarget {
+	index := map[string]userLineNameTarget{}
+	for _, u := range s.listVpnUsers() {
+		proxyID := strings.TrimSpace(u.MigratedFromProxyUser)
+		if proxyID == "" {
+			continue
+		}
+		for _, b := range u.Bindings {
+			if !b.Enabled {
+				continue
+			}
+			lineUUID := ""
+			if e, ok := s.store.KVEntry(lineUUIDKVBucket, b.LineHashID); ok {
+				lineUUID = strings.TrimSpace(e.Value)
+			}
+			if lineUUID == "" {
+				continue
+			}
+			index[userLineName(u.ID, lineUUID)] = userLineNameTarget{LineHashID: b.LineHashID, ProxyUserID: proxyID}
+		}
+	}
+	return index
+}
+
+// foldUserLineUsage rewrites a singbox-stats snapshot's on-box u_<hash> keys
+// into the server's accounting shape: the per-user total joins the proxy user
+// id (so the normal monotonic-diff path advances it) and the line-scoped
+// granularity lands in line_user_bytes. Unmatched names stay untouched and
+// degrade to "ignored" — never zero-filled traffic (design-15 §8).
+func foldUserLineUsage(snapshot *model.ProxyUsageSnapshot, index map[string]userLineNameTarget) {
+	if len(index) == 0 || len(snapshot.UserBytes) == 0 {
+		return
+	}
+	for name, value := range snapshot.UserBytes {
+		target, ok := index[name]
+		if !ok {
+			continue
+		}
+		delete(snapshot.UserBytes, name)
+		snapshot.UserBytes[target.ProxyUserID] += value
+		if snapshot.LineUserBytes == nil {
+			snapshot.LineUserBytes = map[string]map[string]int64{}
+		}
+		bucket := snapshot.LineUserBytes[target.LineHashID]
+		if bucket == nil {
+			bucket = map[string]int64{}
+			snapshot.LineUserBytes[target.LineHashID] = bucket
+		}
+		bucket[target.ProxyUserID] += value
+	}
+}

@@ -1947,6 +1947,7 @@ type agentRuntimeConfig struct {
 	ProxyUsageXrayAPI     string    `json:"proxy_usage_xray_api,omitempty"`
 	ProxyUsageXrayBin     string    `json:"proxy_usage_xray_bin,omitempty"`
 	ProxyUsageXrayPattern string    `json:"proxy_usage_xray_pattern,omitempty"`
+	SingBoxStatsAPI       string    `json:"singbox_stats_api,omitempty"`
 	ReportedAt            time.Time `json:"reported_at,omitempty"`
 }
 
@@ -2475,6 +2476,7 @@ func agentLaunchEnv(launch model.AgentLaunchConfig) string {
 		{"LATTICE_PROXY_USAGE_XRAY_API", launch.ProxyUsageXrayAPI},
 		{"LATTICE_PROXY_USAGE_XRAY_BIN", launch.ProxyUsageXrayBin},
 		{"LATTICE_PROXY_USAGE_XRAY_PATTERN", launch.ProxyUsageXrayPattern},
+		{"LATTICE_SINGBOX_STATS_API", launch.SingBoxStatsAPI},
 	}
 	parts := make([]string, 0, len(env))
 	for _, item := range env {

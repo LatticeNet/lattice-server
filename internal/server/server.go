@@ -161,6 +161,10 @@ type Server struct {
 	// after committed vpn-core mutations (design-15 §7). Nil-safe: trigger and
 	// fire paths both tolerate it.
 	subStoreSync *subStoreSyncState
+	// linemetaSyncFP tracks the last-queued discovery fingerprint per node so a
+	// sidecar sync is queued only when the discovered line set actually changed.
+	linemetaSyncMu sync.Mutex
+	linemetaSyncFP map[string]string
 	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
 	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
 	// who already targets a known account cannot widen the password-guess budget by
@@ -4840,6 +4844,9 @@ func (s *Server) applyScriptFor(approval model.Approval) string {
 	if approval.Plugin == singBoxLineUserPlugin {
 		return s.lineUserApplyScript(approval)
 	}
+	if approval.Plugin == singBoxLineMetaPlugin {
+		return s.lineMetaApplyScript(approval)
+	}
 	return applyScriptForWithServer(approval, s.publicURL)
 }
 
@@ -5951,6 +5958,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == singBoxLineUserPlugin {
 		return s.handleLineUserTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin == singBoxLineMetaPlugin {
+		return s.handleLineMetaTaskResult(r, approval, task, result)
 	}
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)

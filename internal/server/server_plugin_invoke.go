@@ -225,7 +225,13 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	ctx = context.WithValue(ctx, pluginOperatorPrincipalKey{}, p)
-	operatorTargets, err := extractOperatorTargets(req.Payload, methodContract.OperatorTargetFields)
+	payload, err := s.resolveSecretOperatorTargets(p, req.ID, req.Payload, methodContract.OperatorTargetFields)
+	if err != nil {
+		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	operatorTargets, err := extractOperatorTargets(payload, methodContract.OperatorTargetFields)
 	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
 		writeError(w, http.StatusBadRequest, err)
@@ -236,13 +242,13 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	err = nil
 	switch {
 	case loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2:
-		out, err = s.dispatchV2PluginCall(ctx, loaded, req.ID, req.Service, req.Method, req.Payload, operatorTargets)
+		out, err = s.dispatchV2PluginCall(ctx, loaded, req.ID, req.Service, req.Method, payload, operatorTargets)
 	case s.pluginRPC == nil:
 		err = errors.New("plugin rpc bus unavailable")
 	default:
-		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(req.Payload))
+		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(payload))
 		if errors.Is(err, plugin.ErrRPCNoService) {
-			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, req.Payload, nil)
+			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil)
 		}
 	}
 	if err != nil {
@@ -499,8 +505,13 @@ func pluginGatewayScopeAllowed(p principal, scope string) (bool, string) {
 		return false, "missing scope " + scope
 	}
 	if pluginGatewayScopeRequiresUnrestrictedAllowlist(scope) && principalHasNodeRestriction(p) {
-		if strings.HasPrefix(scope, "proxy:") {
+		switch {
+		case strings.HasPrefix(scope, "proxy:"):
 			return false, "global proxy plugin views require an unrestricted server allowlist"
+		case strings.HasPrefix(scope, "vpncore:"):
+			return false, "global vpn-core plugin views require an unrestricted server allowlist"
+		case strings.HasPrefix(scope, "substore:"):
+			return false, "global sub-store plugin views require an unrestricted server allowlist"
 		}
 		return false, "global network plugin views require an unrestricted server allowlist"
 	}
@@ -510,6 +521,8 @@ func pluginGatewayScopeAllowed(p principal, scope string) (bool, string) {
 func pluginGatewayScopeRequiresUnrestrictedAllowlist(scope string) bool {
 	switch scope {
 	case "proxy:*", "proxy:read", "proxy:admin",
+		"vpncore:*", "vpncore:read", "vpncore:admin",
+		"substore:*", "substore:read", "substore:admin",
 		"node:read", "node:admin",
 		"network:plan", "network:apply",
 		"netguard:read", "netguard:admin":

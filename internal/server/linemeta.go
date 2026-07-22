@@ -116,8 +116,8 @@ func (s *Server) renderLineMetadataJSON(nodeID string) ([]byte, error) {
 		if tag == "" {
 			return nil, fmt.Errorf("line %s has no tag", ln.LineHashID)
 		}
-		if ln.LineUUID == "" {
-			return nil, fmt.Errorf("line %s has no line_uuid (allocation degraded)", ln.LineHashID)
+		if !validLineUUIDv4(ln.LineUUID) {
+			return nil, fmt.Errorf("line %s has invalid line_uuid %q (want UUIDv4)", ln.LineHashID, ln.LineUUID)
 		}
 		ib := lineMetadataInboundV2{Tag: tag, LineUUID: ln.LineUUID, LineHashID: ln.LineHashID}
 		ds := strings.TrimSpace(ln.DownstreamLineUUID)
@@ -161,25 +161,55 @@ func (s *Server) renderLineMetadataJSON(nodeID string) ([]byte, error) {
 // ── sidecar apply task (reviewed script; trigger wiring is a later slice) ─────
 
 // lineMetadataApplyScript renders the on-box apply script for the v2 sidecar:
-// atomic tmp+mv write, sibling .bak backup, 0644 root:root. sing-box never reads
-// the file, so no service reload follows.
+// validated JSON merge, atomic tmp+mv write, sibling .bak backup, 0644
+// root:root. sing-box never reads the file, so no service reload follows.
 func lineMetadataApplyScript(payload []byte) string {
-	target := lineMetadataPath
+	return lineMetadataApplyScriptForTarget(payload, lineMetadataPath)
+}
+
+// lineMetadataApplyScriptForTarget keeps the production path fixed at the
+// caller while allowing execution tests to prove the reviewed shell workflow
+// without touching /etc. When a prior document exists its unknown top-level
+// fields survive; the freshly rendered canonical v2 fields always win.
+func lineMetadataApplyScriptForTarget(payload []byte, target string) string {
+	generated := target + ".lattice-generated"
 	candidate := target + ".lattice-new"
 	backup := target + ".bak"
+	validateV2 := "type == \"object\" and " +
+		".schema == \"" + lineMetadataSchemaV2 + "\" and " +
+		"(.node_id | type == \"string\") and " +
+		"((has(\"node_uuid\") | not) or (.node_uuid | type == \"string\")) and " +
+		"(.updated_at | type == \"string\") and " +
+		".writer == \"" + lineMetadataWriter + "\" and " +
+		"(.inbounds | type == \"array\") and " +
+		"all(.inbounds[]; type == \"object\" and (.tag | type == \"string\") and (.line_uuid | type == \"string\")) and " +
+		"(.reserved | type == \"object\") and " +
+		".reserved.in_config_key == \"_lattice\" and " +
+		"(.reserved.fields | type == \"object\")"
 	return "set -e\n" +
 		"umask 022\n" +
 		"TARGET=" + shellQuote(target) + "\n" +
+		"GENERATED=" + shellQuote(generated) + "\n" +
 		"CANDIDATE=" + shellQuote(candidate) + "\n" +
 		"BACKUP=" + shellQuote(backup) + "\n" +
 		"mkdir -p " + shellQuote(path.Dir(target)) + "\n" +
-		"trap 'rm -f \"$CANDIDATE\"' ERR\n" +
-		heredocWrite("\"$CANDIDATE\"", "LATTICE_LINEMETA", string(payload)) +
+		"trap 'rm -f \"$GENERATED\" \"$CANDIDATE\"' 0\n" +
+		"command -v jq >/dev/null 2>&1 || { echo 'lattice linemeta: jq is required' >&2; exit 1; }\n" +
+		heredocWrite("\"$GENERATED\"", "LATTICE_LINEMETA", string(payload)) +
+		"jq -e '" + validateV2 + "' \"$GENERATED\" >/dev/null\n" +
+		"if [ -f \"$TARGET\" ]; then\n" +
+		"  jq -e 'type == \"object\"' \"$TARGET\" >/dev/null\n" +
+		"  cp -p \"$TARGET\" \"$BACKUP\"\n" +
+		"  jq -s '.[0] + .[1]' \"$TARGET\" \"$GENERATED\" >\"$CANDIDATE\"\n" +
+		"else\n" +
+		"  cp \"$GENERATED\" \"$CANDIDATE\"\n" +
+		"fi\n" +
+		"jq -e '" + validateV2 + "' \"$CANDIDATE\" >/dev/null\n" +
 		"chmod 0644 \"$CANDIDATE\"\n" +
 		"chown root:root \"$CANDIDATE\" 2>/dev/null || true\n" +
-		"if [ -f \"$TARGET\" ]; then cp -p \"$TARGET\" \"$BACKUP\"; fi\n" +
 		"mv -f \"$CANDIDATE\" \"$TARGET\"\n" +
-		"trap - ERR\n" +
+		"trap - 0\n" +
+		"rm -f \"$GENERATED\"\n" +
 		"echo " + shellQuote("lattice linemeta: "+target+" applied") + "\n"
 }
 

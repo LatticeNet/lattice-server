@@ -157,6 +157,17 @@ type Server struct {
 	// concurrent read-model builds cannot allocate two UUIDs for one line
 	// (design-15 D1).
 	lineUUIDMu sync.Mutex
+	// subStoreSync holds the debounced Sub-Store auto-sync trigger that fires
+	// after committed vpn-core mutations (design-15 §7). Nil-safe: trigger and
+	// fire paths both tolerate it.
+	subStoreSync *subStoreSyncState
+	// lineCache memoizes the unified Lines read model until an explicit
+	// invalidation (lines_cache.go).
+	lineCache lineReadModelCache
+	// linemetaSyncFP tracks the last-queued discovery fingerprint per node so a
+	// sidecar sync is queued only when the discovered line set actually changed.
+	linemetaSyncMu sync.Mutex
+	linemetaSyncFP map[string]string
 	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
 	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
 	// who already targets a known account cannot widen the password-guess budget by
@@ -363,6 +374,7 @@ func New(opts Options) (*Server, error) {
 		// consume the operator/API limiter or widen token-search throughput.
 		subLimiter:       ratelimit.New(ratelimit.Config{Rate: 2, Burst: 20}),
 		logIngestLimiter: ratelimit.New(ratelimit.Config{Rate: 5000, Burst: 10000}),
+		subStoreSync:     &subStoreSyncState{},
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
@@ -1942,6 +1954,7 @@ type agentRuntimeConfig struct {
 	ProxyUsageXrayAPI     string    `json:"proxy_usage_xray_api,omitempty"`
 	ProxyUsageXrayBin     string    `json:"proxy_usage_xray_bin,omitempty"`
 	ProxyUsageXrayPattern string    `json:"proxy_usage_xray_pattern,omitempty"`
+	SingBoxStatsAPI       string    `json:"singbox_stats_api,omitempty"`
 	ReportedAt            time.Time `json:"reported_at,omitempty"`
 }
 
@@ -1983,6 +1996,7 @@ func (s *Server) ensureNodeIdentityUUID(nodeID string) (string, error) {
 	if err := s.store.UpsertNode(n); err != nil {
 		return "", err
 	}
+	s.invalidateLineReadModel()
 	return n.LatticeIdentityUUID, nil
 }
 
@@ -2233,6 +2247,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	// Append the new node into each requested group's explicit Members — the same
 	// canonical membership path handleGroupMembers uses. Idempotent: a node that
 	// is already a member is left untouched.
@@ -2470,6 +2485,7 @@ func agentLaunchEnv(launch model.AgentLaunchConfig) string {
 		{"LATTICE_PROXY_USAGE_XRAY_API", launch.ProxyUsageXrayAPI},
 		{"LATTICE_PROXY_USAGE_XRAY_BIN", launch.ProxyUsageXrayBin},
 		{"LATTICE_PROXY_USAGE_XRAY_PATTERN", launch.ProxyUsageXrayPattern},
+		{"LATTICE_SINGBOX_STATS_API", launch.SingBoxStatsAPI},
 	}
 	parts := make([]string, 0, len(env))
 	for _, item := range env {
@@ -4417,7 +4433,11 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 		// Privilege containment: a caller may only mint a token whose scopes are
 		// a subset of its own, so token creation cannot be used to escalate.
 		for _, scope := range req.Scopes {
-			if !rbac.Allows(p.Principal, scope, "") {
+			if !rbac.ValidScope(scope) {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("unknown scope %q", scope))
+				return
+			}
+			if !rbac.CanDelegateScope(p.Principal, scope) {
 				writeError(w, http.StatusForbidden, fmt.Errorf("cannot grant scope %q beyond your own", scope))
 				return
 			}
@@ -4832,6 +4852,9 @@ func (s *Server) applyScriptFor(approval model.Approval) string {
 	}
 	if approval.Plugin == singBoxLineUserPlugin {
 		return s.lineUserApplyScript(approval)
+	}
+	if approval.Plugin == singBoxLineMetaPlugin {
+		return s.lineMetaApplyScript(approval)
 	}
 	return applyScriptForWithServer(approval, s.publicURL)
 }
@@ -5424,6 +5447,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 	}
+	if approval.Plugin == singBoxLineUserPlugin {
+		if _, _, _, _, _, err := s.validateLineUserApproval(approval); err != nil {
+			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
+			return
+		}
+	}
 	if approval.Plugin == agentUpdatePlugin {
 		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
 			if errors.Is(err, errAgentUpdateApprovalStale) {
@@ -5677,6 +5706,8 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 		return "dns:admin"
 	case proxyCorePlugin:
 		return "proxy:admin"
+	case singBoxLineUserPlugin, singBoxLineMetaPlugin:
+		return "vpncore:admin"
 	case "cftunnel":
 		return "tunnel:admin"
 	default:
@@ -5743,6 +5774,7 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	oldNodeIdentity := n.LatticeIdentityUUID
 	if err := ensureNodeIdentityUUIDInPlace(&n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -5776,6 +5808,9 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpsertNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if oldV4 != n.PublicIP || oldV6 != n.PublicIPv6 || oldNodeIdentity != n.LatticeIdentityUUID {
+		s.invalidateLineReadModel()
 	}
 	if err := s.reconcileAgentUpdateHeartbeat(r, req.NodeID, req.Version, n.LastSeen); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -5815,6 +5850,9 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, inV4, inV6, req.WireGuardIP, hostFacts); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if old.PublicIP != v4 || old.PublicIPv6 != v6 {
+		s.invalidateLineReadModel()
 	}
 	if err := s.reconcileAgentUpdateHeartbeat(r, req.NodeID, req.Version, s.now()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -5944,6 +5982,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == singBoxLineUserPlugin {
 		return s.handleLineUserTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin == singBoxLineMetaPlugin {
+		return s.handleLineMetaTaskResult(r, approval, task, result)
 	}
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)

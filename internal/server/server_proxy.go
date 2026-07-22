@@ -378,6 +378,7 @@ func (s *Server) handleProxyInbounds(w http.ResponseWriter, r *http.Request, p p
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateLineReadModel()
 		if stored, ok := s.store.ProxyInbound(inbound.ID); ok {
 			inbound = stored
 		}
@@ -430,6 +431,7 @@ func (s *Server) handleDeleteProxyInbound(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "proxy.inbound.delete",
@@ -472,6 +474,7 @@ func (s *Server) handleProxyUsers(w http.ResponseWriter, r *http.Request, p prin
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateLineReadModel()
 		if stored, ok := s.store.ProxyUser(user.ID); ok {
 			user = stored
 		}
@@ -510,6 +513,7 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "proxy.user.delete",
@@ -687,6 +691,7 @@ func (s *Server) handleProxyProfiles(w http.ResponseWriter, r *http.Request, p p
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateLineReadModel()
 		if stored, ok := s.store.ProxyNodeProfile(profile.NodeID); ok {
 			profile = stored
 		}
@@ -726,6 +731,7 @@ func (s *Server) handleDeleteProxyProfile(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		NodeID:   req.NodeID,
@@ -839,6 +845,10 @@ func proxyNodeIDFromPlanPath(path string) (string, bool) {
 }
 
 func (s *Server) renderProxyCoreArtifact(nodeID string) (model.Node, model.ProxyNodeProfile, proxycore.Artifact, error) {
+	return s.renderProxyCoreArtifactWithVpnUser(nodeID, nil)
+}
+
+func (s *Server) renderProxyCoreArtifactWithVpnUser(nodeID string, override *VpnUser) (model.Node, model.ProxyNodeProfile, proxycore.Artifact, error) {
 	node, ok := s.store.Node(nodeID)
 	if !ok {
 		return model.Node{}, model.ProxyNodeProfile{}, proxycore.Artifact{}, errProxyPlanNodeNotFound
@@ -851,11 +861,12 @@ func (s *Server) renderProxyCoreArtifact(nodeID string) (model.Node, model.Proxy
 		artifact proxycore.Artifact
 		err      error
 	)
+	users := s.proxyUsersForManagedRender(override)
 	switch profile.Core {
 	case model.ProxyCoreSingbox:
-		artifact, err = proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), s.store.ProxyUsers(), proxycore.RenderOptions{})
+		artifact, err = proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), users, proxycore.RenderOptions{})
 	case model.ProxyCoreXray:
-		artifact, err = proxycore.RenderXrayConfigJSON(profile, s.store.ProxyInbounds(), s.store.ProxyUsers(), proxycore.RenderOptions{})
+		artifact, err = proxycore.RenderXrayConfigJSON(profile, s.store.ProxyInbounds(), users, proxycore.RenderOptions{})
 	default:
 		err = fmt.Errorf("unsupported proxy core %q", profile.Core)
 	}
@@ -863,6 +874,71 @@ func (s *Server) renderProxyCoreArtifact(nodeID string) (model.Node, model.Proxy
 		return model.Node{}, model.ProxyNodeProfile{}, proxycore.Artifact{}, err
 	}
 	return node, profile, artifact, nil
+}
+
+func (s *Server) proxyUsersForManagedRender(override *VpnUser) []model.ProxyUser {
+	vpnUsers := s.listVpnUsers()
+	if override != nil {
+		replaced := false
+		for i := range vpnUsers {
+			if vpnUsers[i].ID == override.ID {
+				vpnUsers[i], replaced = *override, true
+				break
+			}
+		}
+		if !replaced {
+			vpnUsers = append(vpnUsers, *override)
+		}
+	}
+	lineByHash := map[string]Line{}
+	groups, _ := s.lineReadModel()
+	for _, group := range groups {
+		for _, line := range group.Lines {
+			lineByHash[line.LineHashID] = line
+		}
+	}
+	replacedProxyUser := map[string]bool{}
+	for _, user := range vpnUsers {
+		if user.MigratedFromProxyUser == "" {
+			replacedProxyUser[user.ID] = true // canonical usage projection, never a render source
+			continue
+		}
+		if override != nil && override.ID == user.ID {
+			replacedProxyUser[user.MigratedFromProxyUser] = true
+			continue
+		}
+		for _, binding := range user.Bindings {
+			if binding.Enabled && lineByHash[binding.LineHashID].Managed {
+				replacedProxyUser[user.MigratedFromProxyUser] = true
+				break
+			}
+		}
+	}
+	out := make([]model.ProxyUser, 0, len(s.store.ProxyUsers())+len(vpnUsers))
+	for _, user := range s.store.ProxyUsers() {
+		if !replacedProxyUser[user.ID] {
+			out = append(out, user)
+		}
+	}
+	for _, user := range vpnUsers {
+		credential, ok := vpnCredentialForProtocol(user.Credentials, model.ProxyProtocolVLESS)
+		if !ok || credential.UUID == "" {
+			continue
+		}
+		for _, binding := range user.Bindings {
+			line := lineByHash[binding.LineHashID]
+			if !binding.Enabled || !line.Managed || line.Type != model.ProxyProtocolVLESS {
+				continue
+			}
+			name := userLineName(user.ID, line.LineUUID)
+			out = append(out, model.ProxyUser{
+				ID: name, Name: name, Enabled: user.Enabled,
+				UUID: credential.UUID, InboundIDs: []string{line.Tag}, TrafficLimitBytes: user.QuotaBytes,
+				ExpiresAt: user.ExpiresAt, Status: model.ProxyUserStatusActive, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
+			})
+		}
+	}
+	return out
 }
 
 var (
@@ -1117,6 +1193,7 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 		if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
 			return fmt.Errorf("mark proxycore profile applied: %w", err)
 		}
+		s.invalidateLineReadModel()
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,
@@ -1134,6 +1211,7 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 	if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
 		return fmt.Errorf("mark proxycore apply failed: %w", err)
 	}
+	s.invalidateLineReadModel()
 	if err := s.rejectApprovalWithReason(approval, reason); err != nil {
 		return fmt.Errorf("mark proxycore approval rejected: %w", err)
 	}
@@ -1401,6 +1479,9 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	if len(snapshot.UserBytes) > 4096 {
 		return proxyUsageApplyResult{}, errors.New("user_bytes has too many entries")
 	}
+	// design-15 §8: reverse on-box u_<hash> stat names into (line, proxy user)
+	// accounting rows before eligibility checks and monotonic diffing.
+	foldUserLineUsage(&snapshot, s.userLineNameIndex())
 	eligible := s.proxyUsageEligibleUsers(profile)
 	lineUserBytes, lineUserTotals, lineUsersIgnored, err := s.sanitizeProxyUsageLineUserBytes(snapshot.LineUserBytes, eligible)
 	if err != nil {
@@ -1493,7 +1574,8 @@ func (s *Server) sanitizeProxyUsageLineUserBytes(input map[string]map[string]int
 		return nil, nil, 0, errors.New("line_user_bytes has too many lines")
 	}
 	knownLines := map[string]bool{}
-	for _, group := range s.buildLineGroups() {
+	groups, _ := s.lineReadModel()
+	for _, group := range groups {
 		for _, line := range group.Lines {
 			if line.LineHashID != "" {
 				knownLines[line.LineHashID] = true
@@ -1554,7 +1636,48 @@ func (s *Server) proxyUsageEligibleUsers(profile model.ProxyNodeProfile) map[str
 			out[user.ID] = user
 		}
 	}
+	lineNode := map[string]string{}
+	groups, _ := s.lineReadModel()
+	for _, group := range groups {
+		for _, line := range group.Lines {
+			lineNode[line.LineHashID] = group.NodeID
+		}
+	}
+	for _, user := range s.listVpnUsers() {
+		if user.MigratedFromProxyUser != "" {
+			continue
+		}
+		applies := false
+		for _, binding := range user.Bindings {
+			if binding.Enabled && lineNode[binding.LineHashID] == profile.NodeID {
+				applies = true
+				break
+			}
+		}
+		if applies {
+			projection := vpnUserUsageProjection(user)
+			if previous, ok := out[user.ID]; ok {
+				projection.UsedBytes = previous.UsedBytes
+				projection.LastSeenAt = previous.LastSeenAt
+				projection.LastQuotaNotifiedKey = previous.LastQuotaNotifiedKey
+				projection.LastExpiryNotifiedKey = previous.LastExpiryNotifiedKey
+			}
+			out[user.ID] = projection
+		}
+	}
 	return out
+}
+
+func vpnUserUsageProjection(user VpnUser) model.ProxyUser {
+	status := model.ProxyUserStatusActive
+	if !user.Enabled {
+		status = model.ProxyUserStatusDisabled
+	}
+	return model.ProxyUser{
+		ID: user.ID, Name: user.Email, Enabled: user.Enabled, InboundIDs: []string{"__vpn_line_scoped__"},
+		TrafficLimitBytes: user.QuotaBytes, ExpiresAt: user.ExpiresAt, Status: status,
+		CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
+	}
 }
 
 func proxyUserAppliesToProfile(user model.ProxyUser, profile model.ProxyNodeProfile) bool {

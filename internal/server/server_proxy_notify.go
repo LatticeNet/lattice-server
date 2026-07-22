@@ -32,6 +32,7 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 	users := s.store.ProxyUsers()
 	fired := []proxyUserNotificationFire{}
 	found := onlyID == ""
+	changed := false
 	for _, user := range users {
 		if onlyID != "" && user.ID != onlyID {
 			continue
@@ -45,14 +46,19 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 				if err := s.store.UpsertProxyUser(updated); err != nil {
 					return nil, err
 				}
+				changed = true
 			}
 			continue
 		}
 		if err := s.store.UpsertProxyUser(updated); err != nil {
 			return nil, err
 		}
+		changed = true
 		s.emitProxyUserNotifications(alerts)
 		fired = append(fired, alerts...)
+	}
+	if changed {
+		s.invalidateLineReadModel()
 	}
 	if !found {
 		return nil, fmt.Errorf("proxy user not found")

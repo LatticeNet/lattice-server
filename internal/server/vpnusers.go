@@ -175,6 +175,9 @@ func (s *Server) deleteVpnUser(id string) error {
 // left untouched, and the ProxyUser remains the subscription-render substrate.
 func (s *Server) migrateProxyUsersToVpnUsers() {
 	for _, pu := range s.store.ProxyUsers() {
+		if _, canonical := s.getVpnUser(pu.ID); canonical {
+			continue // canonical-ID usage compatibility projection, not a legacy identity
+		}
 		vid := "vu_" + pu.ID
 		if _, ok := s.getVpnUser(vid); ok {
 			continue // already migrated
@@ -244,6 +247,20 @@ func (s *Server) vpnCoreUsersRPC(_ context.Context, method string, request []byt
 // ── RPC: writes (proxy:admin) ─────────────────────────────────────────────────
 
 func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
+	out, err := s.vpnCoreUsersAdminDispatch(ctx, method, request)
+	// design-15 §7: every committed mutation re-arms the Sub-Store auto-sync;
+	// plan methods only queue approvals and do not change subscription content.
+	if err == nil {
+		switch method {
+		case "create", "update", "delete", "bind", "unbind", "rotate":
+			s.triggerVPNCoreMutation()
+			s.invalidateLineReadModel()
+		}
+	}
+	return out, err
+}
+
+func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "create":
 		return s.vpnUserCreate(request)
@@ -254,8 +271,14 @@ func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, reques
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := s.getVpnUser(id); !ok {
+		user, ok := s.getVpnUser(id)
+		if !ok {
 			return nil, fmt.Errorf("vpn-core/users-admin delete: user %q not found", id)
+		}
+		if user.MigratedFromProxyUser == "" {
+			if err := s.store.DeleteProxyUser(id); err != nil {
+				return nil, fmt.Errorf("delete canonical usage projection: %w", err)
+			}
 		}
 		if err := s.deleteVpnUser(id); err != nil {
 			return nil, err
@@ -265,12 +288,15 @@ func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, reques
 		return s.vpnUserBind(request)
 	case "unbind":
 		return s.vpnUserUnbind(request)
-	case "plan_add", "plan_remove":
+	case "plan_add", "plan_update", "plan_remove":
 		p, err := pluginOperatorPrincipal(ctx)
 		if err != nil {
 			return nil, err
 		}
 		op := lineUserOpAdd
+		if method == "plan_update" {
+			op = lineUserOpUpdate
+		}
 		if method == "plan_remove" {
 			op = lineUserOpRemove
 		}
@@ -488,14 +514,8 @@ func (s *Server) vpnUserEmailInUse(email, exceptID string) bool {
 
 // lineExists reports whether a line_hash_id is currently present on any node.
 func (s *Server) lineExists(lineHash string) bool {
-	for _, g := range s.buildLineGroups() {
-		for _, ln := range g.Lines {
-			if ln.LineHashID == lineHash {
-				return true
-			}
-		}
-	}
-	return false
+	_, ok := s.lineFromReadModel(lineHash)
+	return ok
 }
 
 // normalizeCredentials validates protocols and secret material, auto-generating a

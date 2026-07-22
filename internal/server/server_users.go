@@ -73,7 +73,7 @@ func (s *Server) validateGrantScopes(p principal, scopes []string) (int, error) 
 		if !rbac.ValidScope(sc) {
 			return http.StatusBadRequest, fmt.Errorf("unknown scope %q", sc)
 		}
-		if !rbac.Allows(p.Principal, sc, "") {
+		if !rbac.CanDelegateScope(p.Principal, sc) {
 			return http.StatusForbidden, fmt.Errorf("cannot grant scope %q beyond your own access", sc)
 		}
 	}

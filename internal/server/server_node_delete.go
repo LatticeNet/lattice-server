@@ -141,6 +141,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("node not found"))
 		return

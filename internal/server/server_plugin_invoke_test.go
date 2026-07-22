@@ -425,6 +425,41 @@ func TestPluginGatewayGlobalNetworkScopesRequireUnrestrictedPrincipal(t *testing
 	}
 }
 
+func TestPluginGatewayScopeMigrationCompatibilityAndIsolation(t *testing.T) {
+	tests := []struct {
+		name     string
+		granted  string
+		required string
+		want     bool
+	}{
+		{name: "legacy proxy reaches migrated vpn-core", granted: "proxy:read", required: "vpncore:read", want: true},
+		{name: "legacy proxy reaches migrated sub-store", granted: "proxy:read", required: "substore:read", want: true},
+		{name: "vpn-core reaches legacy native scope", granted: "vpncore:read", required: "proxy:read", want: true},
+		{name: "sub-store cannot reach legacy native scope", granted: "substore:read", required: "proxy:read", want: false},
+		{name: "sub-store cannot reach vpn-core", granted: "substore:read", required: "vpncore:read", want: false},
+		{name: "vpn-core cannot reach sub-store", granted: "vpncore:read", required: "substore:read", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := principal{Principal: rbac.Principal{Scopes: []string{tt.granted}}}
+			got, _ := pluginGatewayScopeAllowed(p, tt.required)
+			if got != tt.want {
+				t.Fatalf("pluginGatewayScopeAllowed(%q, %q) = %v, want %v", tt.granted, tt.required, got, tt.want)
+			}
+		})
+	}
+
+	for _, scope := range []string{"vpncore:read", "vpncore:admin", "substore:read", "substore:admin"} {
+		p := principal{Principal: rbac.Principal{
+			Scopes:          []string{scope},
+			ServerAllowlist: []string{"node-a"},
+		}}
+		if ok, reason := pluginGatewayScopeAllowed(p, scope); ok || !strings.Contains(reason, "unrestricted server allowlist") {
+			t.Errorf("restricted principal with %q: allowed=%v reason=%q", scope, ok, reason)
+		}
+	}
+}
+
 func TestExtractOperatorTargetsRequiresDeclaredPayloadField(t *testing.T) {
 	targets, err := extractOperatorTargets(json.RawMessage(`{"base_url":"https://10.0.0.5/secret"}`), []string{"base_url"})
 	if err != nil || len(targets) != 1 || targets[0] != "https://10.0.0.5/secret" {

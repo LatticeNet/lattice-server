@@ -124,3 +124,51 @@ func TestUserManagementGuardrails(t *testing.T) {
 		t.Fatal("admin lost its wildcard scope despite refusal")
 	}
 }
+
+func TestScopeDelegationCannotLaunderRuntimeCompatibility(t *testing.T) {
+	h, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, h)
+
+	// vpncore:* can satisfy legacy proxy checks at runtime, but that compatibility
+	// must not let a delegated administrator mint durable proxy or sub-store grants.
+	narrowToken := createPAT(t, h, cookies, csrf, []string{"vpncore:*", "user:admin", "token:admin"}, nil)
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "user proxy grant", path: "/api/users", body: `{"username":"launder-user@example.com","scopes":["proxy:read"]}`},
+		{name: "user cross-plugin grant", path: "/api/users", body: `{"username":"cross-plugin@example.com","scopes":["substore:read"]}`},
+		{name: "PAT proxy grant", path: "/api/tokens", body: `{"name":"launder-token","scopes":["proxy:read"]}`},
+		{name: "PAT cross-plugin grant", path: "/api/tokens", body: `{"name":"cross-plugin-token","scopes":["substore:read"]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := doBearerJSON(t, h, http.MethodPost, tc.path, tc.body, narrowToken)
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusForbidden {
+				t.Fatalf("want 403, got %d", res.StatusCode)
+			}
+		})
+	}
+
+	// A legacy wildcard administrator may deliberately migrate assignments into
+	// either canonical domain, including equivalent domain wildcards.
+	legacyToken := createPAT(t, h, cookies, csrf, []string{"proxy:*", "user:admin", "token:admin"}, nil)
+	userGrant := doBearerJSON(t, h, http.MethodPost, "/api/users",
+		`{"username":"migrated-user@example.com","scopes":["vpncore:*","substore:read"]}`, legacyToken)
+	defer userGrant.Body.Close()
+	if userGrant.StatusCode != http.StatusOK {
+		t.Fatalf("legacy user migration grant: got %d", userGrant.StatusCode)
+	}
+	patGrant := doBearerJSON(t, h, http.MethodPost, "/api/tokens",
+		`{"name":"migrated-token","scopes":["vpncore:read","substore:*"]}`, legacyToken)
+	defer patGrant.Body.Close()
+	if patGrant.StatusCode != http.StatusOK {
+		t.Fatalf("legacy PAT migration grant: got %d", patGrant.StatusCode)
+	}
+
+	unknown := authedPost(t, h, cookies, csrf, "/api/tokens", `{"name":"future-token","scopes":["future:admin"]}`)
+	if unknown.Code != http.StatusBadRequest {
+		t.Fatalf("unknown PAT scope: want 400, got %d", unknown.Code)
+	}
+}

@@ -17,6 +17,8 @@ func TestApprovalDecisionExtraScope(t *testing.T) {
 		{plugin: agentUpdatePlugin, want: "node:admin"},
 		{plugin: "selfdns", want: "dns:admin"},
 		{plugin: proxyCorePlugin, want: "proxy:admin"},
+		{plugin: singBoxLineUserPlugin, want: "vpncore:admin"},
+		{plugin: singBoxLineMetaPlugin, want: "vpncore:admin"},
 		{plugin: "cftunnel", want: "tunnel:admin"},
 		{plugin: "nftpolicy", want: "netpolicy:admin"},
 		{plugin: "wireguard", want: ""},
@@ -26,6 +28,65 @@ func TestApprovalDecisionExtraScope(t *testing.T) {
 			got := approvalDecisionExtraScope(model.Approval{Plugin: tc.plugin})
 			if got != tc.want {
 				t.Fatalf("extra scope = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDesign15ApprovalsRequireVPNCoreAdmin(t *testing.T) {
+	for _, pluginID := range []string{singBoxLineUserPlugin, singBoxLineMetaPlugin} {
+		t.Run(pluginID, func(t *testing.T) {
+			srv, handler, st := newInventoryServer(t)
+			seedLinemetaNodes(t, srv)
+			var approval model.Approval
+			if pluginID == singBoxLineUserPlugin {
+				line, user := seedLineUserFixture(t, srv)
+				user.Bindings = nil
+				if err := srv.putVpnUser(user); err != nil {
+					t.Fatal(err)
+				}
+				out, err := srv.vpnUserLinePlan(lineUserTestPrincipal(), mustJSON(t, map[string]string{
+					"user_id": user.ID, "line_hash_id": line.LineHashID,
+				}), lineUserOpAdd)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var response struct {
+					Approval model.Approval `json:"approval"`
+				}
+				_ = json.Unmarshal(out, &response)
+				approval = response.Approval
+			} else {
+				out, err := srv.queueLineMetaSync(lineUserTestPrincipal(), "node-a")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var response struct {
+					Approval model.Approval `json:"approval"`
+				}
+				_ = json.Unmarshal(out, &response)
+				approval = response.Approval
+			}
+			cookies, csrf := loginSession(t, handler)
+			networkOnly := createPAT(t, handler, cookies, csrf, []string{"network:apply"}, []string{"node-a"})
+			denied := doBearerJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+				string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": false, "plan_sha256": planSHA256(approval.Plan)})), networkOnly)
+			defer denied.Body.Close()
+			if denied.StatusCode != http.StatusForbidden {
+				t.Fatalf("network-only approval must fail closed, got %d", denied.StatusCode)
+			}
+			if got, _ := st.Approval(approval.ID); got.Status != model.ApprovalPending {
+				t.Fatalf("denied decision mutated approval: %+v", got)
+			}
+
+			// Legacy proxy:admin remains a compatibility grant for canonical
+			// vpncore:admin while operators migrate their PATs.
+			legacy := createPAT(t, handler, cookies, csrf, []string{"network:apply", "proxy:admin"}, []string{"node-a"})
+			allowed := doBearerJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+				string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": false, "plan_sha256": planSHA256(approval.Plan)})), legacy)
+			defer allowed.Body.Close()
+			if allowed.StatusCode != http.StatusOK {
+				t.Fatalf("legacy proxy:admin compatibility approval failed: %d", allowed.StatusCode)
 			}
 		})
 	}

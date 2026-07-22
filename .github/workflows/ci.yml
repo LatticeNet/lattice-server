@@ -14,33 +14,13 @@ jobs:
         uses: actions/checkout@v6
         with:
           path: lattice-server
-      - name: checkout lattice-sdk matching ref
-        id: checkout-sdk-ref
-        continue-on-error: true
-        uses: actions/checkout@v6
-        with:
-          repository: LatticeNet/lattice-sdk
-          ref: ${{ github.head_ref || github.ref_name }}
-          path: lattice-sdk
-      - name: reset failed sdk checkout
-        if: steps.checkout-sdk-ref.outcome == 'failure'
-        run: rm -rf lattice-sdk
-      - name: checkout lattice-sdk default ref
-        if: steps.checkout-sdk-ref.outcome == 'failure'
-        uses: actions/checkout@v6
-        with:
-          repository: LatticeNet/lattice-sdk
-          path: lattice-sdk
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26.x'
           check-latest: true
           cache-dependency-path: |
-            lattice-sdk/go.mod
             lattice-server/go.mod
             lattice-server/go.sum
-      - name: create workspace
-        run: go work init ./lattice-sdk ./lattice-server
       - name: gofmt
         working-directory: lattice-server
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
@@ -54,9 +34,10 @@ jobs:
         working-directory: lattice-server
         run: go test -race -cover ./...
       - name: gosec
+        working-directory: lattice-server
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec ./lattice-server/...
+          gosec ./...
       - name: govulncheck
         working-directory: lattice-server
         run: |

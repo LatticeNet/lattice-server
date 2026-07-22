@@ -34,10 +34,9 @@ jobs:
         working-directory: lattice-server
         run: go test -race -cover ./...
       - name: gosec
-        working-directory: lattice-server
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec ./...
+          gosec ./lattice-server/...
       - name: govulncheck
         working-directory: lattice-server
         run: |

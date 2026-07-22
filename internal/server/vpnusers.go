@@ -243,7 +243,7 @@ func (s *Server) vpnCoreUsersRPC(_ context.Context, method string, request []byt
 
 // ── RPC: writes (proxy:admin) ─────────────────────────────────────────────────
 
-func (s *Server) vpnCoreUsersAdminRPC(_ context.Context, method string, request []byte) ([]byte, error) {
+func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "create":
 		return s.vpnUserCreate(request)
@@ -265,6 +265,22 @@ func (s *Server) vpnCoreUsersAdminRPC(_ context.Context, method string, request 
 		return s.vpnUserBind(request)
 	case "unbind":
 		return s.vpnUserUnbind(request)
+	case "plan_add", "plan_remove":
+		p, err := pluginOperatorPrincipal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		op := lineUserOpAdd
+		if method == "plan_remove" {
+			op = lineUserOpRemove
+		}
+		return s.vpnUserLinePlan(p, request, op)
+	case "rotate":
+		p, err := pluginOperatorPrincipal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return s.vpnUserRotateCredential(p, request)
 	default:
 		return nil, fmt.Errorf("vpn-core/users-admin: unknown method %q", method)
 	}

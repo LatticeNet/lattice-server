@@ -4830,6 +4830,9 @@ func (s *Server) applyScriptFor(approval model.Approval) string {
 		}
 		return script
 	}
+	if approval.Plugin == singBoxLineUserPlugin {
+		return s.lineUserApplyScript(approval)
+	}
 	return applyScriptForWithServer(approval, s.publicURL)
 }
 
@@ -5938,6 +5941,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == proxyCorePlugin {
 		return s.handleProxyCoreTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin == singBoxLineUserPlugin {
+		return s.handleLineUserTaskResult(r, approval, task, result)
 	}
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)

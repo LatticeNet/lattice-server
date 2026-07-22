@@ -249,6 +249,7 @@ func (s *Server) vpnCoreProfilesRPC(ctx context.Context, method string, request 
 		if err := s.store.UpsertNode(node); err != nil {
 			return nil, err
 		}
+		s.invalidateLineReadModel()
 		settings, err := s.vpnCoreProfileSettings(req.NodeID)
 		if err != nil {
 			return nil, err

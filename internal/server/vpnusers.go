@@ -251,6 +251,7 @@ func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, reques
 		switch method {
 		case "create", "update", "delete", "bind", "unbind", "rotate":
 			s.triggerVPNCoreMutation()
+			s.invalidateLineReadModel()
 		}
 	}
 	return out, err
@@ -501,14 +502,8 @@ func (s *Server) vpnUserEmailInUse(email, exceptID string) bool {
 
 // lineExists reports whether a line_hash_id is currently present on any node.
 func (s *Server) lineExists(lineHash string) bool {
-	for _, g := range s.buildLineGroups() {
-		for _, ln := range g.Lines {
-			if ln.LineHashID == lineHash {
-				return true
-			}
-		}
-	}
-	return false
+	_, ok := s.lineFromReadModel(lineHash)
+	return ok
 }
 
 // normalizeCredentials validates protocols and secret material, auto-generating a

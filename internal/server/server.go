@@ -161,6 +161,9 @@ type Server struct {
 	// after committed vpn-core mutations (design-15 §7). Nil-safe: trigger and
 	// fire paths both tolerate it.
 	subStoreSync *subStoreSyncState
+	// lineCache memoizes the unified Lines read model until an explicit
+	// invalidation (lines_cache.go).
+	lineCache lineReadModelCache
 	// linemetaSyncFP tracks the last-queued discovery fingerprint per node so a
 	// sidecar sync is queued only when the discovered line set actually changed.
 	linemetaSyncMu sync.Mutex
@@ -1993,6 +1996,7 @@ func (s *Server) ensureNodeIdentityUUID(nodeID string) (string, error) {
 	if err := s.store.UpsertNode(n); err != nil {
 		return "", err
 	}
+	s.invalidateLineReadModel()
 	return n.LatticeIdentityUUID, nil
 }
 
@@ -2243,6 +2247,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	// Append the new node into each requested group's explicit Members — the same
 	// canonical membership path handleGroupMembers uses. Idempotent: a node that
 	// is already a member is left untouched.

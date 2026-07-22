@@ -137,7 +137,8 @@ func lineUserCredentialSHA(payload lineUserCredentialPayload) (string, error) {
 // lines take the whole-config render path (design-15 D6 deferred), so they are
 // rejected here with an explicit error rather than silently mis-routed.
 func (s *Server) resolveAdoptedLine(lineHashID string) (Line, error) {
-	for _, g := range s.buildLineGroups() {
+	groups, _ := s.lineReadModel()
+	for _, g := range groups {
 		for _, ln := range g.Lines {
 			if ln.LineHashID != lineHashID {
 				continue

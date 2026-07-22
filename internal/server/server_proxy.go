@@ -378,6 +378,7 @@ func (s *Server) handleProxyInbounds(w http.ResponseWriter, r *http.Request, p p
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateLineReadModel()
 		if stored, ok := s.store.ProxyInbound(inbound.ID); ok {
 			inbound = stored
 		}
@@ -430,6 +431,7 @@ func (s *Server) handleDeleteProxyInbound(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "proxy.inbound.delete",
@@ -472,6 +474,7 @@ func (s *Server) handleProxyUsers(w http.ResponseWriter, r *http.Request, p prin
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateLineReadModel()
 		if stored, ok := s.store.ProxyUser(user.ID); ok {
 			user = stored
 		}
@@ -510,6 +513,7 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "proxy.user.delete",
@@ -687,6 +691,7 @@ func (s *Server) handleProxyProfiles(w http.ResponseWriter, r *http.Request, p p
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		s.invalidateLineReadModel()
 		if stored, ok := s.store.ProxyNodeProfile(profile.NodeID); ok {
 			profile = stored
 		}
@@ -726,6 +731,7 @@ func (s *Server) handleDeleteProxyProfile(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.invalidateLineReadModel()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		NodeID:   req.NodeID,
@@ -1117,6 +1123,7 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 		if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
 			return fmt.Errorf("mark proxycore profile applied: %w", err)
 		}
+		s.invalidateLineReadModel()
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,
@@ -1134,6 +1141,7 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 	if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
 		return fmt.Errorf("mark proxycore apply failed: %w", err)
 	}
+	s.invalidateLineReadModel()
 	if err := s.rejectApprovalWithReason(approval, reason); err != nil {
 		return fmt.Errorf("mark proxycore approval rejected: %w", err)
 	}
@@ -1496,7 +1504,8 @@ func (s *Server) sanitizeProxyUsageLineUserBytes(input map[string]map[string]int
 		return nil, nil, 0, errors.New("line_user_bytes has too many lines")
 	}
 	knownLines := map[string]bool{}
-	for _, group := range s.buildLineGroups() {
+	groups, _ := s.lineReadModel()
+	for _, group := range groups {
 		for _, line := range group.Lines {
 			if line.LineHashID != "" {
 				knownLines[line.LineHashID] = true

@@ -69,7 +69,7 @@ func (s *Server) registerVPNCoreRPC() {
 func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "list":
-		groups := s.buildLineGroups()
+		groups, _ := s.lineReadModel()
 		count := 0
 		for _, g := range groups {
 			count += len(g.Lines)
@@ -96,14 +96,10 @@ func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []b
 		if strings.TrimSpace(req.LineHashID) == "" {
 			return nil, fmt.Errorf("vpn-core/lines get: line_hash_id required")
 		}
-		for _, g := range s.buildLineGroups() {
-			for _, ln := range g.Lines {
-				if ln.LineHashID == req.LineHashID {
-					return json.Marshal(struct {
-						Line Line `json:"line"`
-					}{Line: ln})
-				}
-			}
+		if ln, ok := s.lineFromReadModel(req.LineHashID); ok {
+			return json.Marshal(struct {
+				Line Line `json:"line"`
+			}{Line: ln})
 		}
 		return nil, fmt.Errorf("vpn-core/lines get: line %q not found", req.LineHashID)
 	default:

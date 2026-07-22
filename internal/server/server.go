@@ -4433,7 +4433,11 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 		// Privilege containment: a caller may only mint a token whose scopes are
 		// a subset of its own, so token creation cannot be used to escalate.
 		for _, scope := range req.Scopes {
-			if !rbac.Allows(p.Principal, scope, "") {
+			if !rbac.ValidScope(scope) {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("unknown scope %q", scope))
+				return
+			}
+			if !rbac.CanDelegateScope(p.Principal, scope) {
 				writeError(w, http.StatusForbidden, fmt.Errorf("cannot grant scope %q beyond your own", scope))
 				return
 			}

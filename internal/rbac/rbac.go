@@ -70,6 +70,30 @@ func compatibleScopes(required string) []string {
 	}
 }
 
+// CanDelegateScope reports whether p may assign delegated to another user or
+// token. Unlike Allows, delegation is intentionally not symmetric across the
+// runtime compatibility aliases: vpn-core and sub-store grants stay confined
+// to their own domains. Legacy proxy grants may delegate equal-strength scopes
+// into either replacement domain during the migration window.
+func CanDelegateScope(p Principal, delegated string) bool {
+	if !ValidScope(delegated) {
+		return false
+	}
+	if directlyAllows(p.Scopes, delegated) {
+		return true
+	}
+	switch delegated {
+	case "vpncore:read", "substore:read":
+		return directlyAllows(p.Scopes, "proxy:read")
+	case "vpncore:admin", "substore:admin":
+		return directlyAllows(p.Scopes, "proxy:admin")
+	case "vpncore:*", "substore:*":
+		return directlyAllows(p.Scopes, "proxy:*")
+	default:
+		return false
+	}
+}
+
 // KnownScopes is the catalog of grantable RBAC scope strings. It is the
 // authoritative allowlist the user-management API validates assignments against
 // so an operator cannot be saddled with a typo'd or made-up scope that silently

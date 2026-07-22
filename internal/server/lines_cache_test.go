@@ -1,6 +1,8 @@
 package server
 
 import (
+	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -79,6 +81,89 @@ func TestLineReadModelCacheLifecycle(t *testing.T) {
 	}
 	if !seen {
 		t.Fatal("TTL expiry must force a rebuild")
+	}
+}
+
+func TestAgentPublicAddressChangesInvalidateLineReadModel(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	srv.lineReadModel()
+
+	generation := func() uint64 {
+		srv.lineCache.mu.RLock()
+		defer srv.lineCache.mu.RUnlock()
+		return srv.lineCache.generation
+	}
+	beforeHello := generation()
+	hello := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello", `{"node_id":"node-a","version":"test","public_ip":"8.8.8.8"}`, token)
+	if hello.Code != http.StatusOK {
+		t.Fatalf("hello: %d %s", hello.Code, hello.Body.String())
+	}
+	if got := generation(); got != beforeHello+1 {
+		t.Fatalf("hello public address change generation=%d want %d", got, beforeHello+1)
+	}
+
+	srv.lineReadModel()
+	beforeMetrics := generation()
+	metrics := doAgentRaw(t, handler, http.MethodPost, "/api/agent/metrics", `{"node_id":"node-a","version":"test","public_ip":"1.1.1.1","metrics":{}}`, token)
+	if metrics.Code != http.StatusOK {
+		t.Fatalf("metrics: %d %s", metrics.Code, metrics.Body.String())
+	}
+	if got := generation(); got != beforeMetrics+1 {
+		t.Fatalf("metrics public address change generation=%d want %d", got, beforeMetrics+1)
+	}
+}
+
+func TestLineReadModelInvalidationDuringBuildCannotPublishStaleResult(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	seedLinemetaNodes(t, srv)
+
+	buildReady := make(chan struct{})
+	continueBuild := make(chan struct{})
+	var once sync.Once
+	srv.lineCache.beforePublish = func() {
+		once.Do(func() {
+			close(buildReady)
+			<-continueBuild
+		})
+	}
+
+	done := make(chan []LineGroup, 1)
+	go func() {
+		groups, _ := srv.lineReadModel()
+		done <- groups
+	}()
+	<-buildReady
+
+	srv.singboxInvMu.Lock()
+	inv := srv.singboxInv["node-a"]
+	inv.Nodes = append(inv.Nodes, model.SingBoxNode{Name: "during-build", Protocol: "trojan", Port: "9443", Address: "203.0.113.5"})
+	srv.singboxInv["node-a"] = inv
+	srv.singboxInvMu.Unlock()
+	srv.invalidateLineReadModel()
+	close(continueBuild)
+
+	groups := <-done
+	if got := findLine(t, groups, "node-a", "during-build"); got.Tag != "during-build" {
+		t.Fatalf("rebuild after concurrent invalidation returned stale groups: %+v", groups)
+	}
+	srv.lineCache.mu.RLock()
+	defer srv.lineCache.mu.RUnlock()
+	if !srv.lineCache.valid || srv.lineCache.generation != 1 {
+		t.Fatalf("cache state after guarded publication: valid=%v generation=%d", srv.lineCache.valid, srv.lineCache.generation)
 	}
 }
 

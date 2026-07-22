@@ -96,6 +96,17 @@ func (s *Server) pluginSecretValue(pluginID, key string) (string, bool) {
 	return entry.Value, true
 }
 
+// putPluginSecretValue is the matching in-core write seam. Keeping the actual
+// encrypted-store accessor in this adapter preserves the no-handler vault
+// boundary enforced by TestNoHTTPHandlerReachesThePluginSecretStore.
+func (s *Server) putPluginSecretValue(pluginID, key, value string) error {
+	return s.store.PutPluginSecret(model.KVEntry{
+		Bucket: pluginSecretBucketPrefix + pluginID,
+		Key:    key,
+		Value:  value,
+	})
+}
+
 // pluginTaskHost implements plugin.TaskHost (spec §9.3 step 5). The broker has already
 // checked that this invocation carries an approved operation grant and that the target
 // is one the operator approved; this side enforces everything an OPERATOR queueing the

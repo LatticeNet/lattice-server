@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -173,5 +174,87 @@ func TestVPNCoreNodesRPCRegisteredAndExports(t *testing.T) {
 	// The registry is wired into the broker host services so plugins can reach it.
 	if srv.pluginHostServices().RPC == nil {
 		t.Fatalf("HostServices.RPC not wired")
+	}
+}
+
+func TestVPNCoreDesign15MutationMethodsRegisteredAndReachable(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	activateCorePlugin(t, st, vpnCorePluginID)
+	line, user := seedLineUserFixture(t, srv)
+	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, lineUserTestPrincipal())
+
+	var methods []string
+	for _, service := range srv.pluginRPC.Services() {
+		if service.Service == vpnCoreUsersAdminService {
+			methods = service.Methods
+		}
+	}
+	for _, want := range []string{"plan_add", "plan_update", "plan_remove", "rotate"} {
+		if !containsString(methods, want) {
+			t.Fatalf("users-admin method %q not registered: %v", want, methods)
+		}
+	}
+	request := mustJSON(t, map[string]string{"user_id": user.ID, "line_hash_id": line.LineHashID})
+	for _, method := range []string{"plan_update", "plan_remove"} {
+		if _, err := srv.pluginRPC.Call(ctx, vpnCorePluginID, vpnCoreUsersAdminService, method, request); err != nil {
+			t.Fatalf("%s unreachable: %v", method, err)
+		}
+	}
+	user.Bindings = nil
+	if err := srv.putVpnUser(user); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.pluginRPC.Call(ctx, vpnCorePluginID, vpnCoreUsersAdminService, "plan_add", request); err != nil {
+		t.Fatalf("plan_add unreachable: %v", err)
+	}
+	if _, err := srv.pluginRPC.Call(ctx, vpnCorePluginID, vpnCoreUsersAdminService, "rotate",
+		mustJSON(t, map[string]string{"user_id": user.ID, "protocol": "trojan"})); err != nil {
+		t.Fatalf("rotate unreachable: %v", err)
+	}
+	if _, err := srv.pluginRPC.Call(ctx, vpnCorePluginID, vpnCoreLinesService, "sync_metadata",
+		mustJSON(t, map[string]string{"node_id": line.NodeID})); err != nil {
+		t.Fatalf("lines.sync_metadata unreachable: %v", err)
+	}
+}
+
+func TestVPNCoreLinesReattachAuditsAndRejectsCollisions(t *testing.T) {
+	st, _ := store.Open("")
+	srv := newLinemetaTestServer(t, st)
+	seedLinemetaNodes(t, srv)
+	line := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, lineUserTestPrincipal())
+	want := "44444444-4444-4444-8444-444444444444"
+	out, err := srv.vpnCoreLinesRPC(ctx, "reattach", mustJSON(t, map[string]string{
+		"line_hash_id": line.LineHashID, "line_uuid": want,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("reattach response: %s", out)
+	}
+	entry, ok := st.KVEntry(lineUUIDKVBucket, line.LineHashID)
+	if !ok || entry.Value != want {
+		t.Fatalf("reattach mapping: %+v ok=%v", entry, ok)
+	}
+	if !auditMetadataSeen(st, "line.uuid.reattach", "line_uuid", want) {
+		t.Fatalf("reattach audit missing: %+v", st.AuditEvents())
+	}
+	if _, err := srv.vpnCoreLinesRPC(ctx, "reattach", mustJSON(t, map[string]string{
+		"line_hash_id": line.LineHashID, "line_uuid": "not-v4",
+	})); err == nil {
+		t.Fatal("invalid reattach UUID must fail")
+	}
+	if err := st.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: "line_other", Value: "55555555-5555-4555-8555-555555555555"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.vpnCoreLinesRPC(ctx, "reattach", mustJSON(t, map[string]string{
+		"line_hash_id": line.LineHashID, "line_uuid": "55555555-5555-4555-8555-555555555555",
+	})); err == nil {
+		t.Fatal("colliding reattach UUID must fail")
 	}
 }

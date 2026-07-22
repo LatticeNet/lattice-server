@@ -34,6 +34,21 @@ func lineMetaSHA(payload []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func lineMetaSemanticSHA(payload []byte) string {
+	// updated_at is observability, not sidecar intent. Excluding it keeps the
+	// approval identity stable when an operator re-renders unchanged metadata.
+	semantic := payload
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(payload, &doc) == nil && string(doc["schema"]) == `"`+lineMetadataSchemaV2+`"` {
+		delete(doc, "updated_at")
+		if normalized, err := json.Marshal(doc); err == nil {
+			semantic = normalized
+		}
+	}
+	sum := sha256.Sum256(semantic)
+	return hex.EncodeToString(sum[:])
+}
+
 // vpnCoreLinesSyncMetadata queues one sidecar apply for review. It is
 // idempotent: an identical pending approval (same node, same metadata bytes)
 // is returned instead of duplicated.
@@ -55,20 +70,61 @@ func (s *Server) vpnCoreLinesSyncMetadata(p principal, request []byte) ([]byte, 
 // for it (or returns the identical pending one). The operator still approves
 // every byte — queuing never applies.
 func (s *Server) queueLineMetaSync(p principal, nodeID string) ([]byte, error) {
+	s.linemetaSyncMu.Lock()
+	defer s.linemetaSyncMu.Unlock()
+	return s.queueLineMetaSyncLocked(p, nodeID)
+}
+
+// queueLineMetaSyncLocked requires linemetaSyncMu. Serializing the scan and
+// write guarantees at most one pending metadata approval per node even when a
+// manual sync races discovery.
+func (s *Server) queueLineMetaSyncLocked(p principal, nodeID string) ([]byte, error) {
 	payload, err := s.renderLineMetadataJSON(nodeID)
 	if err != nil {
 		return nil, err
 	}
 	action := lineMetaApplyActionPrefix + lineMetaSHA(payload)
+	semanticSHA := lineMetaSemanticSHA(payload)
+	var pending *model.Approval
 	for _, ap := range s.store.Approvals() {
-		if ap.Plugin == singBoxLineMetaPlugin && ap.NodeID == nodeID &&
-			ap.Action == action && ap.Status == model.ApprovalPending {
-			return json.Marshal(struct {
-				Approval model.Approval `json:"approval"`
-				Queued   bool           `json:"queued"`
-			}{Approval: ap, Queued: false})
+		if ap.Plugin != singBoxLineMetaPlugin || ap.NodeID != nodeID || ap.Status != model.ApprovalPending {
+			continue
+		}
+		if pending == nil {
+			candidate := ap
+			pending = &candidate
+			continue
+		}
+		ap.Status = model.ApprovalRejected
+		ap.Reason = "superseded by a newer line metadata plan"
+		ap.UpdatedAt = s.now().UTC()
+		if err := s.store.UpsertApproval(ap); err != nil {
+			return nil, fmt.Errorf("reject superseded linemeta approval %s: %w", ap.ID, err)
 		}
 	}
+	if pending != nil {
+		queued := lineMetaSemanticSHA([]byte(pending.Plan)) != semanticSHA
+		if !queued {
+			// Keep the already-reviewed bytes when only updated_at changed.
+			payload = []byte(pending.Plan)
+			action = pending.Action
+		}
+		pending.Action = action
+		pending.Plan = string(payload)
+		pending.ActorID = p.ActorID
+		pending.Reason = ""
+		pending.UpdatedAt = s.now().UTC()
+		// Re-persist even an identical pending record. A previous Save may have
+		// failed after mutating the in-memory store, and retry must make it durable.
+		if err := s.store.UpsertApproval(*pending); err != nil {
+			return nil, err
+		}
+		return json.Marshal(struct {
+			Approval model.Approval `json:"approval"`
+			Queued   bool           `json:"queued"`
+		}{Approval: *pending, Queued: queued})
+	}
+	now := s.now().UTC()
 	approval := model.Approval{
 		ID:        id.New("approval"),
 		NodeID:    nodeID,
@@ -77,8 +133,8 @@ func (s *Server) queueLineMetaSync(p principal, nodeID string) ([]byte, error) {
 		Plan:      string(payload),
 		Status:    model.ApprovalPending,
 		ActorID:   p.ActorID,
-		CreatedAt: time.Now().UTC(),
-		UpdatedAt: time.Now().UTC(),
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 	if err := s.store.UpsertApproval(approval); err != nil {
 		return nil, err
@@ -104,19 +160,21 @@ func (s *Server) maybeQueueLineMetaSyncOnDiscovery(nodeID string, inv model.Sing
 	}
 	fingerprint := singBoxDiscoveryFingerprint(inv)
 	s.linemetaSyncMu.Lock()
+	defer s.linemetaSyncMu.Unlock()
 	if s.linemetaSyncFP == nil {
 		s.linemetaSyncFP = map[string]string{}
 	}
 	prev, seen := s.linemetaSyncFP[nodeID]
 	if seen && prev == fingerprint {
-		s.linemetaSyncMu.Unlock()
 		return // unchanged inventory: nothing new to describe on-box
 	}
-	s.linemetaSyncFP[nodeID] = fingerprint
-	s.linemetaSyncMu.Unlock()
-	if _, err := s.queueLineMetaSync(principal{Principal: rbac.Principal{ActorID: "system"}}, nodeID); err != nil {
+	if _, err := s.queueLineMetaSyncLocked(principal{Principal: rbac.Principal{ActorID: "system"}}, nodeID); err != nil {
 		s.logger.Printf("linemeta: queue sync for %s: %v", nodeID, err)
+		return
 	}
+	// Commit only after UpsertApproval succeeded. A persistence failure leaves
+	// the fingerprint unchanged so the next discovery can retry.
+	s.linemetaSyncFP[nodeID] = fingerprint
 }
 
 // lineMetaApplyScript renders the atomic on-box sidecar write for an approved

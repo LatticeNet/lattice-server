@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -181,6 +183,71 @@ func TestBuildLineGroupsFillsLineUUIDs(t *testing.T) {
 	}
 }
 
+func TestBuildLineGroupsSafelyRestoresAgentLineUUID(t *testing.T) {
+	const (
+		reported = "550e8400-e29b-41d4-a716-446655440000"
+		other    = "6ba7b810-9dad-41d1-80b4-00c04fd430c8"
+	)
+	hubHash := lineHash("node-a", "sing-box", "vless", "", 443, "hub-a", "exit-b")
+	newServer := func(t *testing.T, report string) *Server {
+		t.Helper()
+		st, err := store.Open("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := newLinemetaTestServer(t, st)
+		seedLinemetaNodes(t, srv)
+		srv.singboxInvMu.Lock()
+		inv := srv.singboxInv["node-a"]
+		inv.Nodes[0].LineUUID = report
+		srv.singboxInv["node-a"] = inv
+		srv.singboxInvMu.Unlock()
+		return srv
+	}
+
+	t.Run("restore missing mapping", func(t *testing.T) {
+		srv := newServer(t, reported)
+		hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		if hub.LineUUID != reported {
+			t.Fatalf("agent UUID was not restored: %+v", hub)
+		}
+		entry, ok := srv.store.KVEntry(lineUUIDKVBucket, hubHash)
+		if !ok || entry.Value != reported {
+			t.Fatalf("restored mapping not persisted: %+v ok=%v", entry, ok)
+		}
+	})
+
+	t.Run("control plane mapping wins", func(t *testing.T) {
+		srv := newServer(t, reported)
+		if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hubHash, Value: other}); err != nil {
+			t.Fatal(err)
+		}
+		hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		if hub.LineUUID != other {
+			t.Fatalf("agent overwrote authoritative mapping: %+v", hub)
+		}
+	})
+
+	t.Run("invalid report allocates fresh v4", func(t *testing.T) {
+		srv := newServer(t, "not-a-uuid")
+		hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		if !validLineUUIDv4(hub.LineUUID) || hub.LineUUID == "not-a-uuid" {
+			t.Fatalf("invalid report was accepted: %+v", hub)
+		}
+	})
+
+	t.Run("collision allocates fresh v4", func(t *testing.T) {
+		srv := newServer(t, reported)
+		if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: "line_other", Value: reported}); err != nil {
+			t.Fatal(err)
+		}
+		hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		if !validLineUUIDv4(hub.LineUUID) || hub.LineUUID == reported {
+			t.Fatalf("colliding report was accepted: %+v", hub)
+		}
+	})
+}
+
 // (c2) A declared downstream_line_uuid resolves to the downstream line's hash
 // fleet-wide (design-15 §6): the hub gains a declared jump edge, and provenance
 // is kept separate from inferred edges. Unknown/self uuids resolve to nothing.
@@ -230,6 +297,35 @@ func TestBuildLineGroupsDeclaredEdges(t *testing.T) {
 	dangling := findLine(t, srv.buildLineGroups(), "node-a", "direct-a")
 	if len(dangling.DeclaredJumpEdges) != 0 || len(dangling.JumpEdges) != 0 {
 		t.Fatalf("unknown downstream uuid must resolve to no edge: %+v", dangling)
+	}
+}
+
+func TestBuildLineGroupsDeclaredEdgeOverridesConflictingInference(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	seedLinemetaNodes(t, srv)
+	initial := srv.buildLineGroups()
+	hub := findLine(t, initial, "node-a", "hub-a")
+	direct := findLine(t, initial, "node-a", "direct-a")
+	exit := findLine(t, initial, "node-b", "exit-b-in")
+	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: direct.LineHashID, Value: direct.LineUUID}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	inv := srv.singboxInv["node-a"]
+	inv.Nodes[0].DownstreamLineUUID = direct.LineUUID
+	srv.singboxInv["node-a"] = inv
+	srv.singboxInvMu.Unlock()
+
+	hub = findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+	if len(hub.JumpEdges) != 1 || hub.JumpEdges[0] != direct.LineHashID {
+		t.Fatalf("declared edge must win over inferred %q: %+v", exit.LineHashID, hub)
+	}
+	if len(hub.DeclaredJumpEdges) != 1 || hub.DeclaredJumpEdges[0] != direct.LineHashID {
+		t.Fatalf("declared provenance mismatch: %+v", hub)
 	}
 }
 
@@ -396,6 +492,27 @@ func TestBuildLineGroupsDegradesWhenAllocationFails(t *testing.T) {
 	}
 }
 
+func TestRenderLineMetadataRejectsPersistedNonUUIDv4(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	seedLinemetaNodes(t, srv)
+	groups := srv.buildLineGroups()
+	hub := findLine(t, groups, "node-a", "hub-a")
+	if err := srv.store.PutKV(model.KVEntry{
+		Bucket: lineUUIDKVBucket,
+		Key:    hub.LineHashID,
+		Value:  "11111111-1111-5111-8111-111111111111",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.renderLineMetadataJSON("node-a"); err == nil || !strings.Contains(err.Error(), "UUIDv4") {
+		t.Fatalf("render must reject non-v4 persisted identity, got %v", err)
+	}
+}
+
 // The apply task helper renders the sidecar into a reviewed sh script (atomic
 // tmp+mv, .bak backup, 0644) and shapes the task without queueing it.
 func TestLineMetadataApplyTaskShape(t *testing.T) {
@@ -416,7 +533,7 @@ func TestLineMetadataApplyTaskShape(t *testing.T) {
 	}
 	for _, want := range []string{
 		"set -e", "/etc/sing-box/lattice-metadata.json", ".lattice-new", ".bak",
-		"chmod 0644", "mv -f \"$CANDIDATE\" \"$TARGET\"", "lattice.singbox-metadata.v2",
+		"command -v jq", "chmod 0644", "mv -f \"$CANDIDATE\" \"$TARGET\"", "lattice.singbox-metadata.v2",
 	} {
 		if !strings.Contains(task.Script, want) {
 			t.Fatalf("script missing %q:\n%s", want, task.Script)
@@ -424,5 +541,135 @@ func TestLineMetadataApplyTaskShape(t *testing.T) {
 	}
 	if _, err := srv.newLineMetadataApplyTask(principal{Principal: rbac.Principal{ActorID: "op-1"}}, "node-missing"); err == nil {
 		t.Fatal("unknown node: want error")
+	}
+}
+
+func validLineMetadataApplyPayload() []byte {
+	return []byte(`{
+  "schema": "lattice.singbox-metadata.v2",
+  "node_id": "node-new",
+  "node_uuid": "uuid-new",
+  "updated_at": "2026-07-22T12:00:00Z",
+  "writer": "lattice-server",
+  "inbounds": [{"tag":"new","line_uuid":"550e8400-e29b-41d4-a716-446655440000"}],
+  "reserved": {"in_config_key":"_lattice","fields":{"line_uuid":"string","node_uuid":"string","line_hash_id":"string"}}
+}`)
+}
+
+func runLineMetadataApplyScript(t *testing.T, target string) ([]byte, error) {
+	t.Helper()
+	cmd := exec.Command("sh", "-c", lineMetadataApplyScriptForTarget(validLineMetadataApplyPayload(), target))
+	return cmd.CombinedOutput()
+}
+
+func readJSONMap(t *testing.T, filename string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode %s: %v\n%s", filename, err, raw)
+	}
+	return doc
+}
+
+func TestLineMetadataApplyPreservesV1UnknownTopLevelFields(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "lattice-metadata.json")
+	old := []byte(`{"schema":"lattice.singbox-metadata.v1","vendor_extension":{"enabled":true},"site_label":"hk-canary"}`)
+	if err := os.WriteFile(target, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runLineMetadataApplyScript(t, target); err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	doc := readJSONMap(t, target)
+	if doc["site_label"] != "hk-canary" {
+		t.Fatalf("unknown scalar field lost: %+v", doc)
+	}
+	extension, ok := doc["vendor_extension"].(map[string]any)
+	if !ok || extension["enabled"] != true {
+		t.Fatalf("unknown object field lost: %+v", doc)
+	}
+	backup, err := os.ReadFile(target + ".bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(backup, old) {
+		t.Fatalf("backup changed old document:\n got %s\nwant %s", backup, old)
+	}
+}
+
+func TestLineMetadataApplyReplacesCanonicalFields(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "lattice-metadata.json")
+	old := []byte(`{"schema":"lattice.singbox-metadata.v1","node_id":"node-old","node_uuid":"uuid-old","updated_at":"old","writer":"old-writer","inbounds":[],"reserved":{"old":true}}`)
+	if err := os.WriteFile(target, old, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runLineMetadataApplyScript(t, target); err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	doc := readJSONMap(t, target)
+	for key, want := range map[string]string{
+		"schema":     lineMetadataSchemaV2,
+		"node_id":    "node-new",
+		"node_uuid":  "uuid-new",
+		"updated_at": "2026-07-22T12:00:00Z",
+		"writer":     lineMetadataWriter,
+	} {
+		if doc[key] != want {
+			t.Errorf("%s = %#v, want %q", key, doc[key], want)
+		}
+	}
+	inbounds, ok := doc["inbounds"].([]any)
+	if !ok || len(inbounds) != 1 {
+		t.Fatalf("canonical inbounds not replaced: %+v", doc["inbounds"])
+	}
+	reserved, ok := doc["reserved"].(map[string]any)
+	if !ok || reserved["in_config_key"] != "_lattice" || reserved["old"] != nil {
+		t.Fatalf("canonical reserved not replaced: %+v", doc["reserved"])
+	}
+}
+
+func TestLineMetadataApplyRejectsCorruptExistingTarget(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "lattice-metadata.json")
+	old := []byte(`{"schema":`)
+	if err := os.WriteFile(target, old, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := runLineMetadataApplyScript(t, target); err == nil {
+		t.Fatalf("corrupt target unexpectedly applied:\n%s", out)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, old) {
+		t.Fatalf("corrupt target changed:\n got %s\nwant %s", got, old)
+	}
+	if _, err := os.Stat(target + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("invalid target must not create a misleading backup, stat err=%v", err)
+	}
+}
+
+func TestLineMetadataApplyWithoutExistingTarget(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "nested", "lattice-metadata.json")
+	if out, err := runLineMetadataApplyScript(t, target); err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	doc := readJSONMap(t, target)
+	if doc["schema"] != lineMetadataSchemaV2 || doc["node_id"] != "node-new" {
+		t.Fatalf("new target mismatch: %+v", doc)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Fatalf("mode = %o, want 644", info.Mode().Perm())
+	}
+	if _, err := os.Stat(target + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("new target unexpectedly has backup, stat err=%v", err)
 	}
 }

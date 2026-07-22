@@ -5447,6 +5447,12 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 	}
+	if approval.Plugin == singBoxLineUserPlugin {
+		if _, _, _, _, _, err := s.validateLineUserApproval(approval); err != nil {
+			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
+			return
+		}
+	}
 	if approval.Plugin == agentUpdatePlugin {
 		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
 			if errors.Is(err, errAgentUpdateApprovalStale) {
@@ -5700,6 +5706,8 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 		return "dns:admin"
 	case proxyCorePlugin:
 		return "proxy:admin"
+	case singBoxLineUserPlugin, singBoxLineMetaPlugin:
+		return "vpncore:admin"
 	case "cftunnel":
 		return "tunnel:admin"
 	default:
@@ -5766,6 +5774,7 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	oldNodeIdentity := n.LatticeIdentityUUID
 	if err := ensureNodeIdentityUUIDInPlace(&n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -5799,6 +5808,9 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpsertNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if oldV4 != n.PublicIP || oldV6 != n.PublicIPv6 || oldNodeIdentity != n.LatticeIdentityUUID {
+		s.invalidateLineReadModel()
 	}
 	if err := s.reconcileAgentUpdateHeartbeat(r, req.NodeID, req.Version, n.LastSeen); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -5838,6 +5850,9 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, inV4, inV6, req.WireGuardIP, hostFacts); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if old.PublicIP != v4 || old.PublicIPv6 != v6 {
+		s.invalidateLineReadModel()
 	}
 	if err := s.reconcileAgentUpdateHeartbeat(r, req.NodeID, req.Version, s.now()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)

@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -81,6 +82,69 @@ func stableLineHandle(lineID string) string {
 		return ""
 	}
 	return "line_" + lineID
+}
+
+func validLineUUIDv4(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if !proxyUUIDRe.MatchString(value) || value[14] != '4' {
+		return false
+	}
+	return strings.ContainsRune("89ab", rune(value[19]))
+}
+
+// resolveLineUUIDAuthority restores a missing control-plane mapping from the
+// agent sidecar only when the reported UUID is a collision-free UUIDv4. An
+// existing DB mapping is authoritative and cannot be changed by an agent.
+func (s *Server) resolveLineUUIDAuthority(lineHashID, reported string) (string, error) {
+	lineHashID = strings.TrimSpace(lineHashID)
+	if lineHashID == "" {
+		return "", fmt.Errorf("line_hash_id is required")
+	}
+	reported = strings.ToLower(strings.TrimSpace(reported))
+	s.lineUUIDMu.Lock()
+	defer s.lineUUIDMu.Unlock()
+
+	entries := s.store.KV(lineUUIDKVBucket)
+	if existing, ok := s.store.KVEntry(lineUUIDKVBucket, lineHashID); ok && strings.TrimSpace(existing.Value) != "" {
+		value := strings.ToLower(strings.TrimSpace(existing.Value))
+		if !validLineUUIDv4(value) {
+			return "", fmt.Errorf("persisted line_uuid for %s is not UUIDv4", lineHashID)
+		}
+		for _, entry := range entries {
+			if entry.Key != lineHashID && strings.EqualFold(strings.TrimSpace(entry.Value), value) {
+				return "", fmt.Errorf("persisted line_uuid %s collides with line %s", value, entry.Key)
+			}
+		}
+		if reported != "" && reported != value {
+			s.logger.Printf("linemeta: ignore agent line_uuid %s for %s; control-plane mapping is %s", reported, lineHashID, value)
+		}
+		return value, nil
+	}
+
+	candidate := ""
+	if validLineUUIDv4(reported) {
+		candidate = reported
+		for _, entry := range entries {
+			if strings.EqualFold(strings.TrimSpace(entry.Value), candidate) {
+				s.logger.Printf("linemeta: reject agent line_uuid %s for %s; already assigned to %s", candidate, lineHashID, entry.Key)
+				candidate = ""
+				break
+			}
+		}
+	} else if reported != "" {
+		s.logger.Printf("linemeta: reject invalid agent line_uuid %q for %s", reported, lineHashID)
+	}
+	if candidate == "" {
+		var err error
+		candidate, err = newProxyUUID()
+		if err != nil {
+			return "", err
+		}
+	}
+	if err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: lineHashID, Value: candidate}); err != nil {
+		return "", err
+	}
+	return candidate, nil
 }
 
 // buildLineGroups merges Lattice-managed inbounds and on-box discovered nodes into
@@ -162,6 +226,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 			nodeUUID := firstNonEmpty(n.NodeIdentityUUID, n.Metadata["node_uuid"], n.Metadata["lattice_identity_uuid"], s.nodeIdentityUUID(inv.NodeID))
 			ln := Line{
 				LineID:             lineID,
+				LineUUID:           strings.TrimSpace(n.LineUUID),
 				NodeID:             inv.NodeID,
 				NodeIdentityUUID:   nodeUUID,
 				DownstreamLineUUID: strings.TrimSpace(n.DownstreamLineUUID),
@@ -235,7 +300,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// DownstreamLineUUID stays empty for them this slice.
 	for nodeID, lines := range byNode {
 		for i := range lines {
-			uuid, err := s.ensureLineUUID(lines[i].LineHashID)
+			uuid, err := s.resolveLineUUIDAuthority(lines[i].LineHashID, lines[i].LineUUID)
 			if err != nil {
 				s.logger.Printf("linemeta: allocate line_uuid for %s: %v", lines[i].LineHashID, err)
 				continue
@@ -267,9 +332,10 @@ func (s *Server) buildLineGroups() []LineGroup {
 			if target == "" || target == lines[i].LineHashID {
 				continue // downstream unknown to the fleet (deleted/down) or self
 			}
-			if !containsString(lines[i].JumpEdges, target) {
-				lines[i].JumpEdges = append(lines[i].JumpEdges, target)
-			}
+			// Declared is authoritative when it resolves. Discard every inferred
+			// candidate, including a conflicting host/port match: design-15's
+			// first-match-wins rule is about the source, not merely de-duplication.
+			lines[i].JumpEdges = []string{target}
 			if !containsString(lines[i].DeclaredJumpEdges, target) {
 				lines[i].DeclaredJumpEdges = append(lines[i].DeclaredJumpEdges, target)
 			}

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
 )
 
@@ -44,13 +46,13 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export", "list"}, s.vpnCoreNodesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreNodesService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata"}, s.vpnCoreLinesRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach"}, s.vpnCoreLinesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreLinesService, err)
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersService, "v1", []string{"list", "get"}, s.vpnCoreUsersRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersAdminService, "v1", []string{"create", "update", "delete", "bind", "unbind"}, s.vpnCoreUsersAdminRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersAdminService, "v1", []string{"create", "update", "delete", "bind", "unbind", "plan_add", "plan_update", "plan_remove", "rotate"}, s.vpnCoreUsersAdminRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersAdminService, err)
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsageService, "v1", []string{"query"}, s.vpnCoreUsageRPC); err != nil {
@@ -84,6 +86,12 @@ func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []b
 			return nil, err
 		}
 		return s.vpnCoreLinesSyncMetadata(p, request)
+	case "reattach":
+		p, err := pluginOperatorPrincipal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return s.vpnCoreLinesReattach(p, request)
 	case "get":
 		var req struct {
 			LineHashID string `json:"line_hash_id"`
@@ -105,6 +113,63 @@ func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []b
 	default:
 		return nil, fmt.Errorf("vpn-core/lines: unknown method %q", method)
 	}
+}
+
+func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, error) {
+	var req struct {
+		LineHashID string `json:"line_hash_id"`
+		LineUUID   string `json:"line_uuid"`
+	}
+	if err := json.Unmarshal(request, &req); err != nil {
+		return nil, fmt.Errorf("vpn-core/lines reattach: invalid request: %w", err)
+	}
+	req.LineHashID = strings.TrimSpace(req.LineHashID)
+	req.LineUUID = strings.ToLower(strings.TrimSpace(req.LineUUID))
+	line, ok := s.lineFromReadModel(req.LineHashID)
+	if !ok {
+		return nil, fmt.Errorf("vpn-core/lines reattach: line %q not found", req.LineHashID)
+	}
+	if !validLineUUIDv4(req.LineUUID) {
+		return nil, errors.New("vpn-core/lines reattach: line_uuid must be UUIDv4")
+	}
+	s.lineUUIDMu.Lock()
+	previous, hadPrevious := s.store.KVEntry(lineUUIDKVBucket, req.LineHashID)
+	for _, entry := range s.store.KV(lineUUIDKVBucket) {
+		if entry.Key != req.LineHashID && strings.EqualFold(strings.TrimSpace(entry.Value), req.LineUUID) {
+			s.lineUUIDMu.Unlock()
+			return nil, fmt.Errorf("vpn-core/lines reattach: line_uuid is already assigned to %s", entry.Key)
+		}
+	}
+	err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: req.LineHashID, Value: req.LineUUID})
+	s.lineUUIDMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	s.invalidateLineReadModel()
+	metadataPlan, syncErr := s.queueLineMetaSync(p, line.NodeID)
+	if syncErr != nil {
+		s.lineUUIDMu.Lock()
+		if hadPrevious {
+			err = s.store.PutKV(previous)
+		} else {
+			err = s.store.DeleteKV(lineUUIDKVBucket, req.LineHashID)
+		}
+		s.lineUUIDMu.Unlock()
+		s.invalidateLineReadModel()
+		if err != nil {
+			return nil, fmt.Errorf("metadata sync plan failed and line_uuid rollback failed: %v; rollback: %w", syncErr, err)
+		}
+		return nil, fmt.Errorf("metadata sync plan failed; line_uuid rolled back: %w", syncErr)
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID: id.New("audit"), NodeID: line.NodeID, Action: "line.uuid.reattach", Scope: "vpncore:admin",
+		Metadata: map[string]string{"line_hash_id": req.LineHashID, "line_uuid": req.LineUUID},
+	})
+	return json.Marshal(struct {
+		LineHashID       string          `json:"line_hash_id"`
+		LineUUID         string          `json:"line_uuid"`
+		MetadataApproval json.RawMessage `json:"metadata_approval"`
+	}{LineHashID: req.LineHashID, LineUUID: req.LineUUID, MetadataApproval: metadataPlan})
 }
 
 // vpnCoreNodesRPC serves the vpn-core/nodes inter-plugin service — the seam the

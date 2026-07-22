@@ -19,46 +19,63 @@ import (
 const lineReadModelTTL = 60 * time.Second
 
 type lineReadModelCache struct {
-	mu      sync.RWMutex
-	groups  []LineGroup
-	byHash  map[string]Line
-	builtAt time.Time
-	valid   bool
+	mu         sync.RWMutex
+	groups     []LineGroup
+	byHash     map[string]Line
+	builtAt    time.Time
+	valid      bool
+	generation uint64
+	// beforePublish is a deterministic concurrency seam used only by tests.
+	// Production servers leave it nil.
+	beforePublish func()
 }
 
 // lineReadModel returns the cached Lines view, rebuilding it after an
 // invalidation or when the TTL safety net expired. Callers must not mutate the
 // returned slices.
 func (s *Server) lineReadModel() ([]LineGroup, map[string]Line) {
-	now := s.now()
-	s.lineCache.mu.RLock()
-	if s.lineCache.valid && now.Sub(s.lineCache.builtAt) < lineReadModelTTL {
-		defer s.lineCache.mu.RUnlock()
-		return s.lineCache.groups, s.lineCache.byHash
-	}
-	s.lineCache.mu.RUnlock()
-	groups := s.buildLineGroups()
-	index := make(map[string]Line, 64)
-	for _, g := range groups {
-		for _, ln := range g.Lines {
-			if ln.LineHashID != "" {
-				index[ln.LineHashID] = ln
+	for {
+		now := s.now()
+		s.lineCache.mu.RLock()
+		if s.lineCache.valid && now.Sub(s.lineCache.builtAt) < lineReadModelTTL {
+			defer s.lineCache.mu.RUnlock()
+			return s.lineCache.groups, s.lineCache.byHash
+		}
+		generation := s.lineCache.generation
+		beforePublish := s.lineCache.beforePublish
+		s.lineCache.mu.RUnlock()
+
+		groups := s.buildLineGroups()
+		index := make(map[string]Line, 64)
+		for _, g := range groups {
+			for _, ln := range g.Lines {
+				if ln.LineHashID != "" {
+					index[ln.LineHashID] = ln
+				}
 			}
 		}
+		if beforePublish != nil {
+			beforePublish()
+		}
+		s.lineCache.mu.Lock()
+		if s.lineCache.generation != generation {
+			s.lineCache.mu.Unlock()
+			continue
+		}
+		s.lineCache.groups = groups
+		s.lineCache.byHash = index
+		s.lineCache.builtAt = now
+		s.lineCache.valid = true
+		s.lineCache.mu.Unlock()
+		return groups, index
 	}
-	s.lineCache.mu.Lock()
-	s.lineCache.groups = groups
-	s.lineCache.byHash = index
-	s.lineCache.builtAt = now
-	s.lineCache.valid = true
-	s.lineCache.mu.Unlock()
-	return groups, index
 }
 
 // invalidateLineReadModel marks the Lines view stale. It is called on every
 // state change the view derives from (see file header).
 func (s *Server) invalidateLineReadModel() {
 	s.lineCache.mu.Lock()
+	s.lineCache.generation++
 	s.lineCache.valid = false
 	s.lineCache.groups = nil
 	s.lineCache.byHash = nil

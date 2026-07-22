@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // Usage is the vpn-core 3-D usage read-model (design-12 S3). It presents traffic
@@ -58,7 +60,10 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 	// proxyUserID -> (email, vpnUserID) via the migration link.
 	type ident struct{ id, email string }
 	identByProxyUser := map[string]ident{}
+	vpnByID := map[string]VpnUser{}
 	for _, vu := range s.listVpnUsers() {
+		vpnByID[vu.ID] = vu
+		identByProxyUser[vu.ID] = ident{id: vu.ID, email: vu.Email}
 		if vu.MigratedFromProxyUser != "" {
 			identByProxyUser[vu.MigratedFromProxyUser] = ident{id: vu.ID, email: vu.Email}
 		}
@@ -76,6 +81,13 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 		row := UsageByUser{
 			UserID: uid, Email: email, UsedBytes: pu.UsedBytes,
 			QuotaBytes: pu.TrafficLimitBytes, Status: pu.Status,
+		}
+		if vu, ok := vpnByID[uid]; ok {
+			row.Email = vu.Email
+			row.QuotaBytes = vu.QuotaBytes
+			if !vu.Enabled {
+				row.Status = model.ProxyUserStatusDisabled
+			}
 		}
 		if !pu.LastSeenAt.IsZero() {
 			row.LastSeen = pu.LastSeenAt.UTC().Format("2006-01-02T15:04:05Z07:00")

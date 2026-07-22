@@ -153,6 +153,10 @@ type Server struct {
 	// returns 429 + Retry-After. Disk is independently bounded by the store caps.
 	logIngestLimiter *ratelimit.Limiter
 	proxyUsageMu     sync.Mutex
+	// lineUUIDMu serializes the line_hash_id -> line_uuid check-and-set so
+	// concurrent read-model builds cannot allocate two UUIDs for one line
+	// (design-15 D1).
+	lineUUIDMu sync.Mutex
 	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
 	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
 	// who already targets a known account cannot widen the password-guess budget by

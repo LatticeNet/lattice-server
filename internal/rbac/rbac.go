@@ -25,6 +25,18 @@ func Allows(p Principal, scope string, nodeID string) bool {
 }
 
 func scopeAllowed(scopes []string, required string) bool {
+	if directlyAllows(scopes, required) {
+		return true
+	}
+	for _, compatible := range compatibleScopes(required) {
+		if directlyAllows(scopes, compatible) {
+			return true
+		}
+	}
+	return false
+}
+
+func directlyAllows(scopes []string, required string) bool {
 	for _, scope := range scopes {
 		if scope == "*" || scope == required {
 			return true
@@ -37,6 +49,25 @@ func scopeAllowed(scopes []string, required string) bool {
 		}
 	}
 	return false
+}
+
+// compatibleScopes keeps existing proxy grants working while the first-party
+// vpn-core and sub-store manifests move to narrower domain scopes. vpn-core
+// also fronts the existing native proxy APIs, so its scopes bridge those legacy
+// checks. Sub-store scopes deliberately do not grant proxy or vpn-core access.
+func compatibleScopes(required string) []string {
+	switch required {
+	case "proxy:read":
+		return []string{"vpncore:read"}
+	case "proxy:admin":
+		return []string{"vpncore:admin"}
+	case "vpncore:read", "substore:read":
+		return []string{"proxy:read"}
+	case "vpncore:admin", "substore:admin":
+		return []string{"proxy:admin"}
+	default:
+		return nil
+	}
 }
 
 // KnownScopes is the catalog of grantable RBAC scope strings. It is the
@@ -76,6 +107,8 @@ var KnownScopes = map[string]struct{}{
 	"plugin:verify":   {},
 	"proxy:admin":     {},
 	"proxy:read":      {},
+	"substore:admin":  {},
+	"substore:read":   {},
 	"static:admin":    {},
 	"static:read":     {},
 	"static:write":    {},
@@ -85,6 +118,8 @@ var KnownScopes = map[string]struct{}{
 	"token:admin":     {},
 	"tunnel:admin":    {},
 	"user:admin":      {},
+	"vpncore:admin":   {},
+	"vpncore:read":    {},
 	"worker:deploy":   {},
 }
 

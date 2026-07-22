@@ -505,8 +505,13 @@ func pluginGatewayScopeAllowed(p principal, scope string) (bool, string) {
 		return false, "missing scope " + scope
 	}
 	if pluginGatewayScopeRequiresUnrestrictedAllowlist(scope) && principalHasNodeRestriction(p) {
-		if strings.HasPrefix(scope, "proxy:") {
+		switch {
+		case strings.HasPrefix(scope, "proxy:"):
 			return false, "global proxy plugin views require an unrestricted server allowlist"
+		case strings.HasPrefix(scope, "vpncore:"):
+			return false, "global vpn-core plugin views require an unrestricted server allowlist"
+		case strings.HasPrefix(scope, "substore:"):
+			return false, "global sub-store plugin views require an unrestricted server allowlist"
 		}
 		return false, "global network plugin views require an unrestricted server allowlist"
 	}
@@ -516,6 +521,8 @@ func pluginGatewayScopeAllowed(p principal, scope string) (bool, string) {
 func pluginGatewayScopeRequiresUnrestrictedAllowlist(scope string) bool {
 	switch scope {
 	case "proxy:*", "proxy:read", "proxy:admin",
+		"vpncore:*", "vpncore:read", "vpncore:admin",
+		"substore:*", "substore:read", "substore:admin",
 		"node:read", "node:admin",
 		"network:plan", "network:apply",
 		"netguard:read", "netguard:admin":

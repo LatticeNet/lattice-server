@@ -81,9 +81,10 @@ func (r *RPCRegistry) SetOwnerActive(fn OwnerActiveFunc) {
 	r.mu.Unlock()
 }
 
-// serviceIfActive resolves a service and refuses it when its owning plugin is not
-// active. Returns ErrRPCNoService when unregistered so a disabled plugin and an
-// absent one are indistinguishable to a caller probing for services.
+// serviceIfActive resolves a service for operator or already-authorized dispatch
+// and refuses it when its owning plugin is not active. It intentionally returns
+// distinct absent and inactive errors; plugin-to-plugin Call checks grants before
+// exposing those lifecycle details.
 func (r *RPCRegistry) serviceIfActive(service string) (*rpcService, error) {
 	r.mu.RLock()
 	svc := r.services[service]
@@ -209,20 +210,15 @@ func (r *RPCRegistry) CallOperator(ctx context.Context, service, method string, 
 	return svc.handler(ctx, method, request)
 }
 
-// Call implements RPCHost: resolve the service, enforce the directed allow-list
-// (the owner may always self-call), check the method, then dispatch to the
-// handler OUTSIDE the lock so a slow or re-entrant handler cannot block the bus.
+// Call implements RPCHost: enforce the directed allow-list (the owner may always
+// self-call), then reveal service/lifecycle/method details only to authorized
+// callers. The handler runs OUTSIDE the lock so a slow or re-entrant handler
+// cannot block the bus.
 func (r *RPCRegistry) Call(ctx context.Context, caller, service, method string, request []byte) ([]byte, error) {
-	// A granted edge does not outlive its provider: a consumer holding rpc:call on a
-	// disabled plugin's service is refused here, not served by a backend that only
-	// looks alive because core registered it at boot.
-	svc, err := r.serviceIfActive(service)
-	if err != nil {
-		return nil, err
-	}
-
 	r.mu.RLock()
-	allowed := caller == svc.owner
+	svc := r.services[service]
+	active := r.ownerActive
+	allowed := svc != nil && caller == svc.owner
 	if !allowed {
 		if methods := r.grants[service][caller]; methods != nil {
 			_, wildcard := methods["*"]
@@ -230,13 +226,28 @@ func (r *RPCRegistry) Call(ctx context.Context, caller, service, method string, 
 			allowed = wildcard || exact
 		}
 	}
-	r.mu.RUnlock()
-
 	if !allowed {
+		r.mu.RUnlock()
 		return nil, fmt.Errorf("%w: %s -> %s", ErrRPCDenied, caller, service)
 	}
-	if _, ok := svc.methods[method]; !ok {
+
+	if svc == nil {
+		r.mu.RUnlock()
+		return nil, fmt.Errorf("%w: %s", ErrRPCNoService, service)
+	}
+	owner := svc.owner
+	methods := svc.methods
+	handler := svc.handler
+	r.mu.RUnlock()
+
+	// A granted edge does not outlive its provider: a consumer holding rpc:call on a
+	// disabled plugin's service is refused here, not served by a backend that only
+	// looks alive because core registered it at boot.
+	if active != nil && !active(owner) {
+		return nil, fmt.Errorf("%w: %s (owner %s)", ErrRPCOwnerInactive, service, owner)
+	}
+	if _, ok := methods[method]; !ok {
 		return nil, fmt.Errorf("%w: %s/%s", ErrRPCNoMethod, service, method)
 	}
-	return svc.handler(ctx, method, request)
+	return handler(ctx, method, request)
 }

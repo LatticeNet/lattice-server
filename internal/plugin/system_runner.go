@@ -27,11 +27,11 @@ import (
 // existing plan->approve->apply path — so the runner cannot bypass approvals.
 
 const (
-	defaultInvokeTimeout  = 10 * time.Second
+	defaultInvokeTimeout  = time.Duration(DefaultInvokeTimeoutMS) * time.Millisecond
 	defaultStopGrace      = 3 * time.Second
-	defaultMaxOutputBytes = 1 << 20 // 1 MiB
+	defaultMaxOutputBytes = DefaultInvokeStdoutBytes
 	defaultCrashThreshold = 5
-	defaultMaxHostCalls   = 64
+	defaultMaxHostCalls   = DefaultInvokeHostCalls
 )
 
 // ErrCircuitOpen is returned once a plugin has failed CrashThreshold times in a
@@ -61,6 +61,8 @@ type SystemRunnerOptions struct {
 	CrashThreshold int
 	// MaxHostCalls caps broker calls during one invocation (default 64).
 	MaxHostCalls int
+	// Logf receives host-visible runtime warnings. Nil disables warning logs.
+	Logf func(format string, args ...any)
 }
 
 type systemPluginState struct {
@@ -73,9 +75,10 @@ type systemPluginState struct {
 
 // SystemRunner implements Runner and Invoker.
 type SystemRunner struct {
-	opts SystemRunnerOptions
-	mu   sync.Mutex
-	st   map[string]*systemPluginState
+	opts           SystemRunnerOptions
+	mu             sync.Mutex
+	st             map[string]*systemPluginState
+	budgetWarnings map[string]bool
 }
 
 // NewSystemRunner returns a system runner with the given options and safe
@@ -96,7 +99,7 @@ func NewSystemRunner(opts SystemRunnerOptions) *SystemRunner {
 	if opts.MaxHostCalls <= 0 {
 		opts.MaxHostCalls = defaultMaxHostCalls
 	}
-	return &SystemRunner{opts: opts, st: map[string]*systemPluginState{}}
+	return &SystemRunner{opts: opts, st: map[string]*systemPluginState{}, budgetWarnings: map[string]bool{}}
 }
 
 func (r *SystemRunner) Name() string { return "system" }
@@ -280,9 +283,13 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	runCtx, cancel := context.WithTimeout(ctx, r.opts.InvokeTimeout)
+	budget, err := r.invokeBudget(req)
+	if err != nil {
+		return InvokeResponse{}, err
+	}
+	runCtx, cancel := context.WithTimeout(ctx, budget.Timeout)
 	defer cancel()
-	runCtx, err := BindOperatorTargets(runCtx, req.Constraints.OperatorTargets)
+	runCtx, err = BindOperatorTargets(runCtx, req.Constraints.OperatorTargets)
 	if err != nil {
 		return InvokeResponse{}, fmt.Errorf("bind operator targets: %w", err)
 	}
@@ -293,11 +300,11 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 		return InvokeResponse{}, fmt.Errorf("bind operation: %w", err)
 	}
 
-	reply, stderr, runErr := r.runInvocation(runCtx, req, execPath, workDir, broker)
+	reply, stderr, stderrTruncated, runErr := r.runInvocation(runCtx, req, execPath, workDir, broker, budget)
 	if runErr != nil {
 		r.recordFailure(req.PluginID)
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
-			return InvokeResponse{}, fmt.Errorf("plugin %q invocation timed out after %s", req.PluginID, r.opts.InvokeTimeout)
+			return InvokeResponse{}, fmt.Errorf("plugin %q invocation timed out after %s", req.PluginID, budget.Timeout)
 		}
 		return InvokeResponse{}, fmt.Errorf("plugin %q invocation failed: %w (stderr: %s)", req.PluginID, runErr, truncForErr(stderr))
 	}
@@ -306,15 +313,21 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 		result = reply.Plan // tolerate the bootstrap template's {"plan":...} shape
 	}
 	r.recordSuccess(req.PluginID)
+	var warnings []string
+	if stderrTruncated {
+		warning := fmt.Sprintf("stderr truncated after %d bytes", budget.StderrBytes)
+		warnings = append(warnings, warning)
+		r.logf("plugin runtime: %s for %s %s", warning, req.PluginID, budgetLogLabel(req))
+	}
 	if !reply.OK {
 		msg := reply.Message
 		if msg == "" {
 			msg = reply.Error
 		}
-		return InvokeResponse{OK: false, Message: msg, Result: result},
+		return InvokeResponse{OK: false, Message: msg, Result: result, Warnings: warnings},
 			fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
 	}
-	return InvokeResponse{OK: true, Message: reply.Message, Result: result}, nil
+	return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
 }
 
 type systemRunnerReply struct {
@@ -342,7 +355,7 @@ type systemHostResponse struct {
 	Error  string          `json:"error,omitempty"`
 }
 
-func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, execPath, workDir string, broker *Broker) (systemRunnerReply, []byte, error) {
+func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, execPath, workDir string, broker *Broker, budget ResolvedInvokeBudget) (systemRunnerReply, []byte, bool, error) {
 	cmd := exec.CommandContext(ctx, execPath)
 	cmd.Dir = workDir
 	cmd.Env = append(r.childEnv(), "LATTICE_HOST_RESPONSE_FD=3")
@@ -353,7 +366,7 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 
 	hostRespR, hostRespW, err := os.Pipe()
 	if err != nil {
-		return systemRunnerReply{}, nil, fmt.Errorf("open host response pipe: %w", err)
+		return systemRunnerReply{}, nil, false, fmt.Errorf("open host response pipe: %w", err)
 	}
 	cmd.ExtraFiles = append(cmd.ExtraFiles, hostRespR)
 
@@ -361,21 +374,21 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 	if err != nil {
 		_ = hostRespR.Close()
 		_ = hostRespW.Close()
-		return systemRunnerReply{}, nil, fmt.Errorf("open stdin: %w", err)
+		return systemRunnerReply{}, nil, false, fmt.Errorf("open stdin: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		_ = hostRespR.Close()
 		_ = hostRespW.Close()
-		return systemRunnerReply{}, nil, fmt.Errorf("open stdout: %w", err)
+		return systemRunnerReply{}, nil, false, fmt.Errorf("open stdout: %w", err)
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		_ = hostRespR.Close()
 		_ = hostRespW.Close()
-		return systemRunnerReply{}, nil, fmt.Errorf("open stderr: %w", err)
+		return systemRunnerReply{}, nil, false, fmt.Errorf("open stderr: %w", err)
 	}
-	stderr := &cappedBuffer{limit: r.opts.MaxOutputBytes}
+	stderr := &cappedBuffer{limit: budget.StderrBytes}
 	stderrDone := make(chan struct{})
 
 	waited := false
@@ -385,7 +398,7 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 		<-stderrDone
 		return err
 	}
-	abort := func(cause error) (systemRunnerReply, []byte, error) {
+	abort := func(cause error) (systemRunnerReply, []byte, bool, error) {
 		_ = stdin.Close()
 		_ = hostRespW.Close()
 		if cmd.Process != nil {
@@ -394,13 +407,13 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 		if !waited {
 			_ = wait()
 		}
-		return systemRunnerReply{}, stderr.Bytes(), cause
+		return systemRunnerReply{}, stderr.Bytes(), stderr.Truncated(), cause
 	}
 
 	if err := cmd.Start(); err != nil {
 		_ = hostRespR.Close()
 		_ = hostRespW.Close()
-		return systemRunnerReply{}, stderr.Bytes(), fmt.Errorf("start artifact: %w", err)
+		return systemRunnerReply{}, stderr.Bytes(), stderr.Truncated(), fmt.Errorf("start artifact: %w", err)
 	}
 	_ = hostRespR.Close()
 	go func() {
@@ -419,7 +432,7 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 	_ = stdin.Close()
 
 	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), r.opts.MaxOutputBytes)
+	scanner.Buffer(make([]byte, 0, 64*1024), budget.StdoutBytes)
 	hostCalls := 0
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
@@ -430,8 +443,8 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 			return abort(err)
 		} else if ok {
 			hostCalls++
-			if hostCalls > r.opts.MaxHostCalls {
-				return abort(fmt.Errorf("plugin exceeded host-call limit %d", r.opts.MaxHostCalls))
+			if hostCalls > budget.HostCalls {
+				return abort(fmt.Errorf("plugin exceeded host-call limit %d", budget.HostCalls))
 			}
 			resp := r.handleHostCall(ctx, broker, call)
 			if err := hostEnc.Encode(systemHostResponseEnvelope{HostResponse: resp}); err != nil {
@@ -455,16 +468,71 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 			// valid reply so the breaker does not trip.
 			fmt.Fprintf(stderr, "\n[lattice] plugin %q exited non-zero after a valid reply: %v\n", req.PluginID, werr)
 		}
-		return reply, stderr.Bytes(), nil
+		return reply, stderr.Bytes(), stderr.Truncated(), nil
 	}
 	if err := scanner.Err(); err != nil {
+		if strings.Contains(err.Error(), "token too long") {
+			return abort(fmt.Errorf("plugin stdout exceeded budget %d bytes", budget.StdoutBytes))
+		}
 		return abort(fmt.Errorf("read plugin stdout: %w", err))
 	}
 	_ = hostRespW.Close()
 	if err := wait(); err != nil {
-		return systemRunnerReply{}, stderr.Bytes(), err
+		return systemRunnerReply{}, stderr.Bytes(), stderr.Truncated(), err
 	}
-	return systemRunnerReply{}, stderr.Bytes(), errors.New("plugin exited without a response")
+	return systemRunnerReply{}, stderr.Bytes(), stderr.Truncated(), errors.New("plugin exited without a response")
+}
+
+func (r *SystemRunner) invokeBudget(req InvokeRequest) (ResolvedInvokeBudget, error) {
+	defaults := InvokeBudgetSpec{
+		TimeoutMS:   int(r.opts.InvokeTimeout / time.Millisecond),
+		StdoutBytes: r.opts.MaxOutputBytes,
+		StderrBytes: r.opts.MaxOutputBytes,
+		HostCalls:   r.opts.MaxHostCalls,
+	}
+	if req.Constraints.Budget != nil {
+		if err := validateInvokeBudgetPositive(*req.Constraints.Budget); err != nil {
+			return ResolvedInvokeBudget{}, fmt.Errorf("invoke budget: %w", err)
+		}
+	}
+	budget := ResolveInvokeBudget(req.Constraints.Budget, defaults)
+	if !budget.Declared {
+		r.warnDefaultBudgetOnce(req, budget)
+	}
+	return budget, nil
+}
+
+func (r *SystemRunner) warnDefaultBudgetOnce(req InvokeRequest, budget ResolvedInvokeBudget) {
+	if r.opts.Logf == nil {
+		return
+	}
+	label := budgetLogLabel(req)
+	key := req.PluginID + "\x00" + label
+	r.mu.Lock()
+	if r.budgetWarnings[key] {
+		r.mu.Unlock()
+		return
+	}
+	r.budgetWarnings[key] = true
+	r.mu.Unlock()
+	r.logf("plugin runtime: %s %s has no declared budget; using defaults timeout=%s stdout_bytes=%d stderr_bytes=%d host_calls=%d",
+		req.PluginID, label, budget.Timeout, budget.StdoutBytes, budget.StderrBytes, budget.HostCalls)
+}
+
+func (r *SystemRunner) logf(format string, args ...any) {
+	if r.opts.Logf != nil {
+		r.opts.Logf(format, args...)
+	}
+}
+
+func budgetLogLabel(req InvokeRequest) string {
+	if req.Constraints.BudgetLabel != "" {
+		return req.Constraints.BudgetLabel
+	}
+	if req.Action != "" {
+		return req.Action
+	}
+	return "invoke"
 }
 
 func decodeSystemHostCall(line []byte) (systemHostCall, bool, error) {
@@ -737,12 +805,17 @@ func (r *SystemRunner) childEnv() []string {
 // still reporting full consumption, so the child's output pipe never blocks and
 // host memory stays bounded.
 type cappedBuffer struct {
-	limit int
-	buf   bytes.Buffer
+	limit     int
+	buf       bytes.Buffer
+	truncated bool
 }
 
 func (c *cappedBuffer) Write(p []byte) (int, error) {
-	if room := c.limit - c.buf.Len(); room > 0 {
+	room := c.limit - c.buf.Len()
+	if room < len(p) {
+		c.truncated = true
+	}
+	if room > 0 {
 		if room > len(p) {
 			room = len(p)
 		}
@@ -752,6 +825,8 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 }
 
 func (c *cappedBuffer) Bytes() []byte { return c.buf.Bytes() }
+
+func (c *cappedBuffer) Truncated() bool { return c.truncated }
 
 func truncForErr(b []byte) string {
 	const max = 512

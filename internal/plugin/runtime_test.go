@@ -227,6 +227,35 @@ func TestRuntimeManagerStopDoesNotClobberNewStart(t *testing.T) {
 	}
 }
 
+func TestRuntimeManagerPassesInvocationBudgetToRunner(t *testing.T) {
+	runner := &recordingInvokeRunner{}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{
+		Runners: map[string]Runner{TypeSystem: runner},
+	})
+	loaded := Loaded{
+		Manifest: Manifest{
+			ID: "budget.bundle", Name: "Budget", Type: TypeSystem,
+			Capabilities: []string{"node:read"},
+		},
+		Capabilities: []string{"node:read"},
+		BundlePath:   t.TempDir(),
+	}
+	if _, err := m.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+	budget := &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 2 << 20, StderrBytes: 64 << 10, HostCalls: 0}
+	resp, err := m.InvokeConstrained(context.Background(), loaded.Manifest.ID, "call", json.RawMessage(`{"ok":true}`), InvokeConstraints{
+		Budget:      budget,
+		BudgetLabel: "budget.bundle/list",
+	})
+	if err != nil || !resp.OK {
+		t.Fatalf("InvokeConstrained: resp=%+v err=%v", resp, err)
+	}
+	if runner.invokeReq.Constraints.Budget != budget || runner.invokeReq.Constraints.BudgetLabel != "budget.bundle/list" {
+		t.Fatalf("budget constraints did not reach runner: %+v", runner.invokeReq.Constraints)
+	}
+}
+
 func TestRuntimeManagerStopAndSnapshotAreSafe(t *testing.T) {
 	m := NewRuntimeManager(HostServices{})
 	loaded := Loaded{
@@ -332,4 +361,25 @@ func (r *blockingStopRunner) Stop(ctx context.Context, req RunnerStopRequest) er
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+type recordingInvokeRunner struct {
+	invokeReq InvokeRequest
+}
+
+func (r *recordingInvokeRunner) Name() string {
+	return "recording-invoker"
+}
+
+func (r *recordingInvokeRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
+	return RunnerStartResult{Message: "recording invoker armed"}, ctx.Err()
+}
+
+func (r *recordingInvokeRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
+	return ctx.Err()
+}
+
+func (r *recordingInvokeRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeResponse, error) {
+	r.invokeReq = req
+	return InvokeResponse{OK: true, Result: json.RawMessage(`{"recorded":true}`)}, ctx.Err()
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -210,6 +211,119 @@ func TestSystemRunnerDigestMatch(t *testing.T) {
 	loaded := makeBundle(t, "p.digest2", script, DigestSHA256([]byte(script)))
 	if _, err := startInvoke(t, r, loaded, "plan", nil); err != nil {
 		t.Fatalf("valid digest start/invoke: %v", err)
+	}
+}
+
+func TestSystemRunnerHonorsDeclaredStdoutBudget(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{})
+	script := `#!/bin/sh
+read line
+printf '{"ok":true,"result":"'
+head -c 1049000 /dev/zero | tr '\000' a
+printf '"}\n'
+`
+	loaded := makeBundle(t, "p.stdoutbudget", script, "")
+	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	largeBudget := &InvokeBudgetSpec{TimeoutMS: 10_000, StdoutBytes: 2 << 20, StderrBytes: 1 << 10, HostCalls: 0}
+	resp, err := r.Invoke(context.Background(), InvokeRequest{
+		PluginID: loaded.Manifest.ID, Action: "call",
+		Constraints: InvokeConstraints{Budget: largeBudget, BudgetLabel: "p.stdoutbudget/list"},
+	})
+	if err != nil {
+		t.Fatalf("declared budget above old 1MiB default should allow the response: %v", err)
+	}
+	if !resp.OK || len(resp.Result) <= defaultMaxOutputBytes {
+		t.Fatalf("expected successful >1MiB result, ok=%t len=%d", resp.OK, len(resp.Result))
+	}
+
+	smallBudget := &InvokeBudgetSpec{TimeoutMS: 10_000, StdoutBytes: 256 << 10, StderrBytes: 1 << 10, HostCalls: 0}
+	_, err = r.Invoke(context.Background(), InvokeRequest{
+		PluginID: loaded.Manifest.ID, Action: "call",
+		Constraints: InvokeConstraints{Budget: smallBudget, BudgetLabel: "p.stdoutbudget/list"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "stdout exceeded budget") {
+		t.Fatalf("expected declared stdout budget failure, got %v", err)
+	}
+}
+
+func TestSystemRunnerDefaultsAbsentBudgetWithWarnOnce(t *testing.T) {
+	var logs []string
+	r := newRunner(t, SystemRunnerOptions{Logf: func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}})
+	loaded := makeBundle(t, "p.defaultbudget", "#!/bin/sh\nread line\necho '{\"ok\":true,\"result\":{\"ok\":true}}'\n", "")
+	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := r.Invoke(context.Background(), InvokeRequest{
+			PluginID: loaded.Manifest.ID, Action: "call",
+			Constraints: InvokeConstraints{BudgetLabel: "p.defaultbudget/list"},
+		})
+		if err != nil || !resp.OK {
+			t.Fatalf("invoke %d: resp=%+v err=%v", i, resp, err)
+		}
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "has no declared budget") ||
+		!strings.Contains(logs[0], "stdout_bytes=1048576") {
+		t.Fatalf("absent budget should warn once with old defaults, logs=%+v", logs)
+	}
+}
+
+func TestSystemRunnerSurfacesStderrTruncationOnSuccess(t *testing.T) {
+	var logs []string
+	r := newRunner(t, SystemRunnerOptions{Logf: func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}})
+	script := `#!/bin/sh
+read line
+head -c 2048 /dev/zero | tr '\000' e >&2
+echo '{"ok":true,"message":"done","result":{"ok":true}}'
+`
+	loaded := makeBundle(t, "p.stderrbudget", script, "")
+	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	resp, err := r.Invoke(context.Background(), InvokeRequest{
+		PluginID: loaded.Manifest.ID, Action: "call",
+		Constraints: InvokeConstraints{
+			Budget:      &InvokeBudgetSpec{TimeoutMS: 10_000, StdoutBytes: 1 << 10, StderrBytes: 64, HostCalls: 0},
+			BudgetLabel: "p.stderrbudget/list",
+		},
+	})
+	if err != nil || !resp.OK {
+		t.Fatalf("stderr truncation on success must not fail: resp=%+v err=%v", resp, err)
+	}
+	if len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], "stderr truncated after 64 bytes") {
+		t.Fatalf("missing stderr truncation warning: %+v", resp.Warnings)
+	}
+	if len(logs) != 1 || !strings.Contains(logs[0], "stderr truncated after 64 bytes") {
+		t.Fatalf("missing host log for stderr truncation: %+v", logs)
+	}
+}
+
+func TestSystemRunnerHonorsZeroHostCallBudget(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{})
+	script := `#!/bin/sh
+read req
+echo '{"host_call":{"id":"kv","method":"kv.get","params":{"key":"x"}}}'
+`
+	loaded := makeBundle(t, "p.nohostcalls", script, "")
+	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	_, err := r.Invoke(context.Background(), InvokeRequest{
+		PluginID: loaded.Manifest.ID, Action: "call",
+		Constraints: InvokeConstraints{
+			Budget:      &InvokeBudgetSpec{TimeoutMS: 10_000, StdoutBytes: 1 << 10, StderrBytes: 1 << 10, HostCalls: 0},
+			BudgetLabel: "p.nohostcalls/list",
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "host-call limit 0") {
+		t.Fatalf("expected zero host-call budget to fail loudly, got %v", err)
 	}
 }
 

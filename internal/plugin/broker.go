@@ -617,8 +617,8 @@ func (b *Broker) Log(ctx context.Context, level, message string, fields map[stri
 // registry can authorize the directed edge; a plugin cannot impersonate another
 // caller. Registry-level denials (ErrRPCDenied) are additionally recorded as a
 // deny event for audit visibility (the capability check itself already recorded
-// an allow). Service/method-not-found are client errors, not security denials,
-// so they are returned without an extra deny event.
+// an allow). Service/method-not-found are client errors once the directed edge is
+// authorized, so they are returned without an extra deny event.
 func (b *Broker) RPCCall(ctx context.Context, service, method string, request []byte) ([]byte, error) {
 	if err := b.require(ctx, "rpc.call", capRPCCall); err != nil {
 		return nil, err

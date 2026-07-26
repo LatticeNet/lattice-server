@@ -96,8 +96,9 @@ func TestRPCRegistryCallAuthorization(t *testing.T) {
 	}
 
 	// unknown service / method
-	if _, err := r.Call(context.Background(), "owner.plugin", "missing/svc", "export", nil); !errors.Is(err, ErrRPCNoService) {
-		t.Fatalf("missing service: want ErrRPCNoService, got %v", err)
+	r.Allow("caller.plugin", "missing/svc")
+	if _, err := r.Call(context.Background(), "caller.plugin", "missing/svc", "export", nil); !errors.Is(err, ErrRPCNoService) {
+		t.Fatalf("granted missing service: want ErrRPCNoService, got %v", err)
 	}
 	if _, err := r.Call(context.Background(), "owner.plugin", "owner.plugin/nodes", "nope", nil); !errors.Is(err, ErrRPCNoMethod) {
 		t.Fatalf("missing method: want ErrRPCNoMethod, got %v", err)
@@ -105,8 +106,56 @@ func TestRPCRegistryCallAuthorization(t *testing.T) {
 
 	// unregister
 	r.Unregister("owner.plugin/nodes")
-	if _, err := r.Call(context.Background(), "owner.plugin", "owner.plugin/nodes", "export", nil); !errors.Is(err, ErrRPCNoService) {
-		t.Fatalf("after unregister: want ErrRPCNoService, got %v", err)
+	if _, err := r.Call(context.Background(), "owner.plugin", "owner.plugin/nodes", "export", nil); !errors.Is(err, ErrRPCDenied) {
+		t.Fatalf("after unregister without grant: want ErrRPCDenied, got %v", err)
+	}
+}
+
+func TestRPCRegistryCallDeniesBeforeRevealingServiceState(t *testing.T) {
+	r := NewRPCRegistry()
+	var calls int
+	handler := func(context.Context, string, []byte) ([]byte, error) {
+		calls++
+		return []byte("ok"), nil
+	}
+	if err := r.Register("active.owner", "active.owner/items", "v1", []string{"list"}, handler); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register("disabled.owner", "disabled.owner/items", "v1", []string{"list"}, handler); err != nil {
+		t.Fatal(err)
+	}
+	r.SetOwnerActive(func(pluginID string) bool {
+		return pluginID == "active.owner"
+	})
+
+	for _, service := range []string{
+		"missing.owner/items",
+		"active.owner/items",
+		"disabled.owner/items",
+	} {
+		if _, err := r.Call(context.Background(), "caller.plugin", service, "list", nil); !errors.Is(err, ErrRPCDenied) {
+			t.Fatalf("ungranted call to %s: want ErrRPCDenied, got %v", service, err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("ungranted calls reached handler %d times", calls)
+	}
+}
+
+func TestRPCRegistryAuthorizedCallStillChecksLifecycle(t *testing.T) {
+	r := NewRPCRegistry()
+	if err := r.Register("disabled.owner", "disabled.owner/items", "v1", []string{"list"},
+		func(context.Context, string, []byte) ([]byte, error) { return []byte("ok"), nil }); err != nil {
+		t.Fatal(err)
+	}
+	r.SetOwnerActive(func(string) bool { return false })
+	r.Allow("caller.plugin", "disabled.owner/items")
+
+	if _, err := r.Call(context.Background(), "caller.plugin", "disabled.owner/items", "list", nil); !errors.Is(err, ErrRPCOwnerInactive) {
+		t.Fatalf("authorized inactive call: want ErrRPCOwnerInactive, got %v", err)
+	}
+	if _, err := r.CallOperator(context.Background(), "disabled.owner/items", "list", nil); !errors.Is(err, ErrRPCOwnerInactive) {
+		t.Fatalf("operator inactive call: want ErrRPCOwnerInactive, got %v", err)
 	}
 }
 

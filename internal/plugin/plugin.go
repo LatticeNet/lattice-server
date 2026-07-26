@@ -39,6 +39,7 @@ type Manifest struct {
 	Runtime          *RuntimeSpec       `json:"runtime,omitempty"`
 	UIRuntime        *UIRuntimeSpec     `json:"ui_runtime,omitempty"`
 	Compatibility    *CompatibilitySpec `json:"compatibility,omitempty"`
+	MinServer        string             `json:"min_server,omitempty"`
 	HostAccess       *HostAccessSpec    `json:"host_access,omitempty"`
 	// UI + Interfaces are the design-10 dashboard contributions: declarative data
 	// (nav/views) + the interfaces the plugin exposes. They are covered by the

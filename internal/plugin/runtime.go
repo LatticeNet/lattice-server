@@ -66,6 +66,12 @@ type InvokeRequest struct {
 // code after the operator call has been authorized.
 type InvokeConstraints struct {
 	OperatorTargets []string
+	// Budget is the signed method-level runtime budget resolved by the host. Nil
+	// is the additive compatibility path for already-signed manifests and resolves
+	// to the old global defaults with a host warning.
+	Budget *InvokeBudgetSpec
+	// BudgetLabel is a stable service/method label used only for host logs.
+	BudgetLabel string
 	// Operation is the one-time authority for an approved host-risk operation (§9.3).
 	// Like OperatorTargets it stays on the host side of the boundary: the plugin never
 	// receives it, so it cannot forge or widen one — it can only make a host call that
@@ -76,9 +82,10 @@ type InvokeConstraints struct {
 // InvokeResponse is the decoded plugin reply. Result carries the plugin's body
 // (e.g. a rendered plan) for the host to act on under its own privileges.
 type InvokeResponse struct {
-	OK      bool
-	Message string
-	Result  json.RawMessage
+	OK       bool            `json:"ok"`
+	Message  string          `json:"message,omitempty"`
+	Result   json.RawMessage `json:"result,omitempty"`
+	Warnings []string        `json:"warnings,omitempty"`
 }
 
 // Invoker is an optional runner capability: a request/response action protocol

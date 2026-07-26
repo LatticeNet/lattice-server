@@ -358,6 +358,11 @@ func validateContributions(m Manifest) error {
 				if len(method.OperatorTargetFields) > 0 && !hasOperatorTargetCapability {
 					return fmt.Errorf("interface %q method %q operator target fields require %s capability", c.Service, method.Name, capHTTPOperatorTarget)
 				}
+				if method.Budget != nil {
+					if err := ValidateInvokeBudgetSpec(*method.Budget); err != nil {
+						return fmt.Errorf("interface %q method %q budget: %w", c.Service, method.Name, err)
+					}
+				}
 			}
 			contracts[c.Service][method.Name] = effectiveScopes
 		}

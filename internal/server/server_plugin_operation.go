@@ -42,8 +42,9 @@ func (s *Server) planPluginOperation(
 	service, method string,
 	payload json.RawMessage,
 	operatorTargets []string,
+	budget *plugin.InvokeBudgetSpec,
 ) ([]byte, error) {
-	out, err := s.callRuntimePluginService(ctx, loaded.Manifest.ID, service, method, payload, operatorTargets)
+	out, err := s.callRuntimePluginService(ctx, loaded.Manifest.ID, service, method, payload, operatorTargets, budget)
 	if err != nil {
 		return nil, err
 	}

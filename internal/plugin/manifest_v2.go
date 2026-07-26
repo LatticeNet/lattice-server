@@ -58,10 +58,11 @@ type RPCDependency struct {
 }
 
 type InterfaceMethod struct {
-	Name                 string   `json:"name"`
-	Effect               string   `json:"effect"`
-	Scopes               []string `json:"scopes,omitempty"`
-	OperatorTargetFields []string `json:"operator_target_fields,omitempty"`
+	Name                 string            `json:"name"`
+	Effect               string            `json:"effect"`
+	Scopes               []string          `json:"scopes,omitempty"`
+	OperatorTargetFields []string          `json:"operator_target_fields,omitempty"`
+	Budget               *InvokeBudgetSpec `json:"budget,omitempty"`
 }
 
 func validateManifestVersion(m Manifest) error {

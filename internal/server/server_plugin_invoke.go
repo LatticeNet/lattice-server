@@ -222,7 +222,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			return
 		}
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), pluginCallTimeout(methodContract))
 	defer cancel()
 	ctx = context.WithValue(ctx, pluginOperatorPrincipalKey{}, p)
 	payload, err := s.resolveSecretOperatorTargets(p, req.ID, req.Payload, methodContract.OperatorTargetFields)
@@ -248,7 +248,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	default:
 		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(payload))
 		if errors.Is(err, plugin.ErrRPCNoService) {
-			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil)
+			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil, nil)
 		}
 	}
 	if err != nil {
@@ -325,22 +325,12 @@ func (s *Server) dispatchV2PluginCall(
 		// pending approval bound to the plugin, its version, its artifact, this request,
 		// and the nodes it named. Nothing is applied until an operator reads it and
 		// approves that exact hash (§9.3).
-		if methodEffect(contract, method) == plugin.InterfaceEffectPlan {
-			return s.planPluginOperation(ctx, principalFromContext(ctx), loaded, service, method, payload, operatorTargets)
+		methodContract, _ := contract.MethodContract(method)
+		if methodContract.Effect == plugin.InterfaceEffectPlan {
+			return s.planPluginOperation(ctx, principalFromContext(ctx), loaded, service, method, payload, operatorTargets, methodContract.Budget)
 		}
-		return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets)
+		return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets, methodContract.Budget)
 	}
-}
-
-// methodEffect resolves a declared method's effect. Unknown methods cannot reach here:
-// the gateway already refused anything the manifest does not declare.
-func methodEffect(contract plugin.InterfaceContract, method string) string {
-	for _, candidate := range contract.MethodContracts() {
-		if candidate.Name == method {
-			return candidate.Effect
-		}
-	}
-	return ""
 }
 
 // principalFromContext recovers the operator the gateway stamped onto the invocation
@@ -350,9 +340,12 @@ func principalFromContext(ctx context.Context) principal {
 	return p
 }
 
-func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service, method string, payload json.RawMessage, operatorTargets []string) ([]byte, error) {
+func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service, method string, payload json.RawMessage, operatorTargets []string, budget *plugin.InvokeBudgetSpec) ([]byte, error) {
 	if s.pluginRuntime == nil {
 		return nil, errors.New("plugin runtime unavailable")
+	}
+	if budget == nil {
+		budget = s.pluginMethodBudget(pluginID, service, method)
 	}
 	body, err := json.Marshal(struct {
 		Service string          `json:"service"`
@@ -362,7 +355,11 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 	if err != nil {
 		return nil, fmt.Errorf("marshal plugin call payload: %w", err)
 	}
-	resp, err := s.pluginRuntime.InvokeConstrained(ctx, pluginID, "call", body, plugin.InvokeConstraints{OperatorTargets: operatorTargets})
+	resp, err := s.pluginRuntime.InvokeConstrained(ctx, pluginID, "call", body, plugin.InvokeConstraints{
+		OperatorTargets: operatorTargets,
+		Budget:          budget,
+		BudgetLabel:     service + "/" + method,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -373,6 +370,29 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 		return nil, errors.New(resp.Message)
 	}
 	return resp.Result, nil
+}
+
+func pluginCallTimeout(method plugin.InterfaceMethod) time.Duration {
+	if method.Budget == nil {
+		return 15 * time.Second
+	}
+	return plugin.ResolveInvokeBudget(method.Budget, plugin.DefaultInvokeBudgetSpec()).Timeout
+}
+
+func (s *Server) pluginMethodBudget(pluginID, service, method string) *plugin.InvokeBudgetSpec {
+	loaded, ok := s.loadedPlugin(pluginID)
+	if !ok || loaded.Manifest.Schema != plugin.ManifestSchemaV2 {
+		return nil
+	}
+	contract, ok := loaded.Manifest.InterfaceFor(service)
+	if !ok {
+		return nil
+	}
+	methodContract, ok := contract.MethodContract(method)
+	if !ok {
+		return nil
+	}
+	return methodContract.Budget
 }
 
 // pluginCallScopes returns all scopes required to call an ACTIVE plugin's
@@ -601,5 +621,9 @@ func (s *Server) handlePluginInvoke(w http.ResponseWriter, r *http.Request, p pr
 		ID: id.New("audit"), Action: "plugin.invoke", Scope: "plugin:admin", Decision: "allow",
 		Metadata: map[string]string{"plugin_id": req.ID, "plugin_action": req.Action},
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"ok": resp.OK, "message": resp.Message, "result": resp.Result})
+	out := map[string]any{"ok": resp.OK, "message": resp.Message, "result": resp.Result}
+	if len(resp.Warnings) > 0 {
+		out["warnings"] = resp.Warnings
+	}
+	writeJSON(w, http.StatusOK, out)
 }

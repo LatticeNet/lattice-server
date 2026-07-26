@@ -258,7 +258,9 @@ func (s *Server) runOneSubStoreAutoSync() error {
 	}
 	invoke := s.subStoreSync.invoke
 	if invoke == nil {
-		invoke = s.callRuntimePluginService
+		invoke = func(ctx context.Context, pluginID, service, method string, payload json.RawMessage, operatorTargets []string) ([]byte, error) {
+			return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets, nil)
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

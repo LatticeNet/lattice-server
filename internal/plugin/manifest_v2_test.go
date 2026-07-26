@@ -284,6 +284,9 @@ func TestSigningPayloadV2CoversTypedManifest(t *testing.T) {
 		"interface scopes":  func(m *Manifest) { m.Interfaces[0].MethodSpecs[0].Scopes = []string{"proxy:admin"} },
 		"interface service": func(m *Manifest) { m.Interfaces[0].Service += ".changed" },
 		"interface method":  func(m *Manifest) { m.Interfaces[0].MethodSpecs[0].Name = "get" },
+		"method budget": func(m *Manifest) {
+			m.Interfaces[0].MethodSpecs[0].Budget = &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 2 << 20, StderrBytes: 64 << 10, HostCalls: 0}
+		},
 	}
 	basePayload := string(SigningPayload(base))
 	for name, mutate := range mutations {
@@ -368,6 +371,67 @@ func TestBackingOmittedKeepsSigningPayloadByteIdentical(t *testing.T) {
 	}
 	if !strings.Contains(string(signed), `"backing":"core"`) {
 		t.Fatalf("declared backing missing from signing payload: %s", signed)
+	}
+}
+
+func TestBudgetOmittedKeepsSigningPayloadByteIdentical(t *testing.T) {
+	base := validManifestV2()
+	withoutBudget := SigningPayload(base)
+	if strings.Contains(string(withoutBudget), "budget") {
+		t.Fatalf("an undeclared budget must not appear in the signing payload: %s", withoutBudget)
+	}
+
+	declared := cloneManifestV2(t, base)
+	declared.Interfaces[0].MethodSpecs[0].Budget = &InvokeBudgetSpec{
+		TimeoutMS: 5_000, StdoutBytes: 2 << 20, StderrBytes: 64 << 10, HostCalls: 0,
+	}
+	withBudget := SigningPayload(declared)
+	if string(withoutBudget) == string(withBudget) {
+		t.Fatal("declaring budget must change the signing payload, or it could be swapped after signing")
+	}
+	if !strings.Contains(string(withBudget), `"budget":`) || !strings.Contains(string(withBudget), `"host_calls":0`) {
+		t.Fatalf("declared budget missing from signing payload: %s", withBudget)
+	}
+}
+
+func TestInvokeBudgetValidation(t *testing.T) {
+	valid := validManifestV2()
+	valid.Interfaces[0].MethodSpecs[0].Budget = &InvokeBudgetSpec{
+		TimeoutMS: 1_000, StdoutBytes: 2 << 20, StderrBytes: 64 << 10, HostCalls: 0,
+	}
+	if err := ValidateManifest(valid); err != nil {
+		t.Fatalf("valid budget rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*InvokeBudgetSpec)
+		want   string
+	}{
+		{name: "timeout", mutate: func(b *InvokeBudgetSpec) { b.TimeoutMS = 0 }, want: "timeout_ms"},
+		{name: "stdout", mutate: func(b *InvokeBudgetSpec) { b.StdoutBytes = 0 }, want: "stdout_bytes"},
+		{name: "stderr", mutate: func(b *InvokeBudgetSpec) { b.StderrBytes = 0 }, want: "stderr_bytes"},
+		{name: "host calls", mutate: func(b *InvokeBudgetSpec) { b.HostCalls = -1 }, want: "host_calls"},
+		{name: "timeout max", mutate: func(b *InvokeBudgetSpec) { b.TimeoutMS = HostMaxInvokeTimeoutMS + 1 }, want: "host maximum"},
+		{name: "stdout max", mutate: func(b *InvokeBudgetSpec) { b.StdoutBytes = HostMaxInvokeStdoutBytes + 1 }, want: "host maximum"},
+		{name: "stderr max", mutate: func(b *InvokeBudgetSpec) { b.StderrBytes = HostMaxInvokeStderrBytes + 1 }, want: "host maximum"},
+		{name: "host call max", mutate: func(b *InvokeBudgetSpec) { b.HostCalls = HostMaxInvokeHostCalls + 1 }, want: "host maximum"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := cloneManifestV2(t, valid)
+			tc.mutate(m.Interfaces[0].MethodSpecs[0].Budget)
+			err := ValidateManifest(m)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %q budget rejection, got %v", tc.want, err)
+			}
+		})
+	}
+
+	var partial InvokeBudgetSpec
+	err := json.Unmarshal([]byte(`{"timeout_ms":1000,"stdout_bytes":1024,"stderr_bytes":1024}`), &partial)
+	if err == nil || !strings.Contains(err.Error(), "requires timeout_ms") {
+		t.Fatalf("partial budget must be rejected at decode, got %v", err)
 	}
 }
 

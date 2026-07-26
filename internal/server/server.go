@@ -424,6 +424,7 @@ func New(opts Options) (*Server, error) {
 		sysRunner := plugin.NewSystemRunner(plugin.SystemRunnerOptions{
 			RuntimeDir:   dir,
 			EnvAllowlist: opts.PluginRuntimeEnv,
+			Logf:         s.logger.Printf,
 		})
 		s.pluginRuntime = plugin.NewRuntimeManagerWithOptions(plugin.RuntimeManagerOptions{
 			Services: s.pluginHostServices(),

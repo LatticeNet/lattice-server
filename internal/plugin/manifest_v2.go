@@ -67,8 +67,8 @@ type InterfaceMethod struct {
 
 func validateManifestVersion(m Manifest) error {
 	if m.Schema == "" {
-		if m.Bundle != nil || m.Runtime != nil || m.UIRuntime != nil || m.Compatibility != nil || m.HostAccess != nil {
-			return errors.New("bundle, runtime, ui_runtime, compatibility and host_access require manifest schema v2")
+		if m.Bundle != nil || m.Runtime != nil || m.UIRuntime != nil || m.Compatibility != nil || m.MinServer != "" || m.HostAccess != nil {
+			return errors.New("bundle, runtime, ui_runtime, compatibility, min_server and host_access require manifest schema v2")
 		}
 		return nil
 	}
@@ -131,6 +131,9 @@ func validateManifestVersion(m Manifest) error {
 		!boundedContractValue(m.Compatibility.DashboardHost) ||
 		!boundedContractValue(m.Compatibility.RuntimeProtocol) {
 		return errors.New("manifest v2 compatibility fields must be printable non-empty values")
+	}
+	if m.MinServer != "" && !boundedContractValue(m.MinServer) {
+		return errors.New("manifest v2 min_server must be a printable non-empty value")
 	}
 	if err := validateHostAccess(m); err != nil {
 		return err

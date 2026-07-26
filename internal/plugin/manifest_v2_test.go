@@ -274,6 +274,7 @@ func TestSigningPayloadV2CoversTypedManifest(t *testing.T) {
 		"server compat":    func(m *Manifest) { m.Compatibility.Server = ">=9" },
 		"dashboard compat": func(m *Manifest) { m.Compatibility.DashboardHost = ">=9" },
 		"protocol compat":  func(m *Manifest) { m.Compatibility.RuntimeProtocol = ">=9" },
+		"min server":       func(m *Manifest) { m.MinServer = ">=0.3.0" },
 		"host access": func(m *Manifest) {
 			m.Capabilities = append(m.Capabilities, "rpc:call")
 			m.HostAccess = &HostAccessSpec{RPC: []RPCDependency{{Service: "owner.plugin/items", Methods: []string{"list"}}}}
@@ -391,6 +392,48 @@ func TestBudgetOmittedKeepsSigningPayloadByteIdentical(t *testing.T) {
 	}
 	if !strings.Contains(string(withBudget), `"budget":`) || !strings.Contains(string(withBudget), `"host_calls":0`) {
 		t.Fatalf("declared budget missing from signing payload: %s", withBudget)
+	}
+}
+
+func TestMinServerOmittedKeepsSigningPayloadByteIdentical(t *testing.T) {
+	base := validManifestV2()
+	withoutMinServer := SigningPayload(base)
+	if strings.Contains(string(withoutMinServer), "min_server") {
+		t.Fatalf("an undeclared min_server must not appear in the signing payload: %s", withoutMinServer)
+	}
+
+	declared := cloneManifestV2(t, base)
+	declared.MinServer = ">=0.3.0"
+	withMinServer := SigningPayload(declared)
+	if string(withoutMinServer) == string(withMinServer) {
+		t.Fatal("declaring min_server must change the signing payload, or it could be swapped after signing")
+	}
+	if !strings.Contains(string(withMinServer), `"min_server":"\u003e=0.3.0"`) {
+		t.Fatalf("declared min_server missing from signing payload: %s", withMinServer)
+	}
+}
+
+func TestMinServerValidation(t *testing.T) {
+	legacy := Manifest{
+		ID: "legacy.min-server", Name: "Legacy", Type: TypeSystem,
+		Capabilities: []string{"node:read"}, MinServer: ">=0.3.0",
+	}
+	if err := ValidateManifest(legacy); err == nil || !strings.Contains(err.Error(), "min_server") {
+		t.Fatalf("legacy min_server should require schema v2, got %v", err)
+	}
+
+	v2 := validManifestV2()
+	v2.MinServer = ">=0.3.0"
+	if err := ValidateManifest(v2); err != nil {
+		t.Fatalf("valid min_server rejected: %v", err)
+	}
+	v2.MinServer = ""
+	if err := ValidateManifest(v2); err != nil {
+		t.Fatalf("omitted min_server must remain additive: %v", err)
+	}
+	v2.MinServer = strings.Repeat("x", 257)
+	if err := ValidateManifest(v2); err == nil || !strings.Contains(err.Error(), "min_server") {
+		t.Fatalf("oversized min_server should be rejected, got %v", err)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -102,6 +103,12 @@ func main() {
 	}
 	if trustPolicy.AllowUnsignedHostRisk {
 		log.Printf("WARNING: plugin trust policy sets allow_unsigned_host_risk=true; UNSIGNED host-risk plugins will load. Do not use in production.")
+	}
+	// The dashboard announces this too (GET /api/plugin-trust), but a server nobody is
+	// looking at must still say it. Two independent surfaces, one condition.
+	if names := nonOfficialPublishers(trustPolicy); len(names) > 0 {
+		log.Printf("WARNING: plugin trust policy trusts non-official publisher(s) %s; bundles signed by them will load. Production trusts only the project publisher.",
+			strings.Join(names, ", "))
 	}
 
 	dataDir := ""
@@ -298,4 +305,17 @@ func loadPluginTrust(path string) (plugin.TrustPolicy, error) {
 		return plugin.TrustPolicy{}, fmt.Errorf("read plugin trust policy: %w", err)
 	}
 	return plugin.ParseTrustPolicyJSON(data)
+}
+
+// nonOfficialPublishers lists trusted publishers other than the project's own, by NAME.
+// Key material never appears in a log line, the same rule the trust endpoint follows.
+func nonOfficialPublishers(policy plugin.TrustPolicy) []string {
+	var names []string
+	for name := range policy.TrustedPublishers {
+		if name != "latticenet" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }

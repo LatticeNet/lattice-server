@@ -247,6 +247,8 @@ func readSeed(path string) (ed25519.PrivateKey, ed25519.PublicKey, error) {
 	return priv, pub, nil
 }
 
+var verifyLocalFileMode = verifyMode
+
 func requireNewLocalFile(path string) error {
 	if path == "" {
 		return errors.New("empty path")
@@ -291,21 +293,43 @@ func writeNewLocalFile(path string, data []byte, perm os.FileMode) error {
 	if path == "" {
 		return errors.New("empty path")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err := requireNewLocalFile(path); err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	return verifyMode(path, perm)
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := verifyLocalFileMode(tmpPath, perm); err != nil {
+		return err
+	}
+	if err := os.Link(tmpPath, path); err != nil {
+		return err
+	}
+	if err := verifyLocalFileMode(path, perm); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return nil
 }
 
 func writeAtomicLocalFile(path string, data []byte, perm os.FileMode) error {
@@ -341,7 +365,7 @@ func writeAtomicLocalFile(path string, data []byte, perm os.FileMode) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return err
 	}
-	return verifyMode(path, perm)
+	return verifyLocalFileMode(path, perm)
 }
 
 func verifyMode(path string, perm os.FileMode) error {

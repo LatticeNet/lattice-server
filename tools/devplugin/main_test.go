@@ -138,6 +138,54 @@ func TestKeygenExistingTrustLeavesNoPartialSeed(t *testing.T) {
 	}
 }
 
+func TestKeygenFirstOutputPostCreateFailureLeavesNoFinalPaths(t *testing.T) {
+	root := t.TempDir()
+	seedPath := filepath.Join(root, ".lattice-dev", "publisher.seed")
+	trustPath := filepath.Join(root, ".lattice-dev", "plugin-trust.local.json")
+	failModeVerificationFor(t, seedPath)
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{
+		"keygen",
+		"-publisher", "dev.hephaestus",
+		"-seed", seedPath,
+		"-trust", trustPath,
+	}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "injected mode failure") {
+		t.Fatalf("expected injected seed write failure, code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(seedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("seed final path should be absent after first output failure, err=%v", err)
+	}
+	if _, err := os.Stat(trustPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("trust final path should be absent after first output failure, err=%v", err)
+	}
+}
+
+func TestKeygenSecondOutputPostCreateFailureLeavesNoFinalPaths(t *testing.T) {
+	root := t.TempDir()
+	seedPath := filepath.Join(root, ".lattice-dev", "publisher.seed")
+	trustPath := filepath.Join(root, ".lattice-dev", "plugin-trust.local.json")
+	failModeVerificationFor(t, trustPath)
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{
+		"keygen",
+		"-publisher", "dev.hephaestus",
+		"-seed", seedPath,
+		"-trust", trustPath,
+	}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "injected mode failure") {
+		t.Fatalf("expected injected trust write failure, code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(seedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("seed final path should be removed after second output failure, err=%v", err)
+	}
+	if _, err := os.Stat(trustPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("trust final path should be absent after second output failure, err=%v", err)
+	}
+}
+
 func TestSignWritesDevManifestAndVerifiesWithServerPath(t *testing.T) {
 	root := t.TempDir()
 	seed := bytes.Repeat([]byte{7}, ed25519.SeedSize)
@@ -348,4 +396,26 @@ func mustRead(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func failModeVerificationFor(t *testing.T, target string) {
+	t.Helper()
+	targetAbs, err := filepath.Abs(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := verifyLocalFileMode
+	verifyLocalFileMode = func(path string, perm os.FileMode) error {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		if abs == targetAbs {
+			return errors.New("injected mode failure")
+		}
+		return verifyMode(path, perm)
+	}
+	t.Cleanup(func() {
+		verifyLocalFileMode = old
+	})
 }

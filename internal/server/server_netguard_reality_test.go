@@ -1,0 +1,413 @@
+package server
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
+)
+
+type guardRealitySummaryTest struct {
+	NodeID            string     `json:"node_id"`
+	SnapshotStatus    string     `json:"snapshot_status"`
+	CollectedAt       *time.Time `json:"collected_at,omitempty"`
+	ReceivedAt        *time.Time `json:"received_at,omitempty"`
+	StaleAfter        *time.Time `json:"stale_after,omitempty"`
+	ManagedSHA        string     `json:"managed_sha,omitempty"`
+	ListenerCount     *int       `json:"listener_count,omitempty"`
+	InterfaceCount    *int       `json:"interface_count,omitempty"`
+	ForeignTableCount *int       `json:"foreign_table_count,omitempty"`
+}
+
+type guardRealityListTest struct {
+	Nodes      []guardRealitySummaryTest `json:"nodes"`
+	NextCursor string                    `json:"next_cursor,omitempty"`
+}
+
+type guardRealityDetailTest struct {
+	Node struct {
+		NodeID         string                  `json:"node_id"`
+		SnapshotStatus string                  `json:"snapshot_status"`
+		Reality        *model.GuardNodeReality `json:"reality"`
+		ReceivedAt     *time.Time              `json:"received_at"`
+		StaleAfter     *time.Time              `json:"stale_after"`
+	} `json:"node"`
+}
+
+func newGuardRealityServerForTest(t *testing.T, now *time.Time) (*Server, http.Handler, *store.Store, []*http.Cookie, string) {
+	t.Helper()
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	srv, err := New(Options{
+		Store:                   st,
+		AdminPassword:           testAdminPass,
+		DisableRenewalScheduler: true,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+	srv.now = func() time.Time { return now.UTC() }
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	return srv, handler, st, cookies, csrf
+}
+
+func guardRealityFixture(nodeID string, collectedAt time.Time) model.GuardNodeReality {
+	return model.GuardNodeReality{
+		NodeID: nodeID,
+		Listeners: []model.GuardListener{{
+			Protocol: "tcp",
+			Port:     22,
+			Address:  "2001:db8::10",
+			Process:  "sshd",
+		}},
+		Interfaces: []model.GuardInterface{{
+			Name:      "ens3",
+			Addresses: []string{"2001:db8::10/128"},
+			Up:        true,
+		}},
+		ManagedSHA:    strings.Repeat("a", 64),
+		ForeignTables: []string{"inet docker"},
+		NFTVersion:    "nftables v1.0.9",
+		CollectedAt:   collectedAt,
+	}
+}
+
+func postGuardRealityForTest(t *testing.T, handler http.Handler, token, nodeID string, reality model.GuardNodeReality) *httptestResponse {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"node_id": nodeID,
+		"reality": reality,
+		"future_agent_field": map[string]any{
+			"ignored": true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal guard reality body: %v", err)
+	}
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/guard-reality", string(body), token)
+	return &httptestResponse{code: rec.Code, body: rec.Body.String()}
+}
+
+type httptestResponse struct {
+	code int
+	body string
+}
+
+func assertAPIErrorCodeFromBody(t *testing.T, body string, want string) {
+	t.Helper()
+	var out model.APIErrorResponse
+	if err := json.Unmarshal([]byte(body), &out); err != nil {
+		t.Fatalf("decode error body %q: %v", body, err)
+	}
+	if out.Error.Code != want {
+		t.Fatalf("error code = %q, want %q; body=%s", out.Error.Code, want, body)
+	}
+}
+
+func TestNetGuardRealityAgentWriteAndReadContract(t *testing.T) {
+	now := time.Date(2026, 7, 31, 13, 0, 1, 0, time.UTC)
+	srv, handler, st, cookies, csrf := newGuardRealityServerForTest(t, &now)
+
+	tokenA := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
+
+	collectedAt := now.Add(-time.Second)
+	reality := guardRealityFixture("node-a", collectedAt)
+	resp := postGuardRealityForTest(t, handler, tokenA, "node-a", reality)
+	if resp.code != http.StatusOK {
+		t.Fatalf("agent write status = %d, body=%s", resp.code, resp.body)
+	}
+	var accepted struct {
+		OK                 bool      `json:"ok"`
+		NodeID             string    `json:"node_id"`
+		CollectedAt        time.Time `json:"collected_at"`
+		ReceivedAt         time.Time `json:"received_at"`
+		CollectedAtClamped bool      `json:"collected_at_clamped"`
+	}
+	if err := json.Unmarshal([]byte(resp.body), &accepted); err != nil {
+		t.Fatalf("decode accepted response: %v", err)
+	}
+	if !accepted.OK || accepted.NodeID != "node-a" {
+		t.Fatalf("unexpected accepted response: %+v", accepted)
+	}
+	if !accepted.CollectedAt.Equal(collectedAt) || !accepted.ReceivedAt.Equal(now) || accepted.CollectedAtClamped {
+		t.Fatalf("unexpected accepted timestamps: %+v", accepted)
+	}
+	stored, ok := st.GuardRealitySnapshot("node-a")
+	if !ok {
+		t.Fatalf("snapshot not persisted")
+	}
+	if stored.Reality.NodeID != "node-a" || stored.Reality.Listeners[0].Process != "sshd" {
+		t.Fatalf("unexpected persisted snapshot: %+v", stored.Reality)
+	}
+	foundAudit := false
+	for _, ev := range st.AuditEvents() {
+		if ev.Action != "netguard.reality.report" {
+			continue
+		}
+		foundAudit = true
+		if ev.NodeID != "node-a" {
+			t.Fatalf("reality audit node_id = %q, want node-a", ev.NodeID)
+		}
+		wantMetadata := map[string]string{
+			"listener_count":      "1",
+			"interface_count":     "1",
+			"foreign_table_count": "1",
+		}
+		if len(ev.Metadata) != len(wantMetadata) {
+			t.Fatalf("reality audit metadata = %+v, want counts only", ev.Metadata)
+		}
+		for key, want := range wantMetadata {
+			if ev.Metadata[key] != want {
+				t.Fatalf("reality audit metadata[%s] = %q, want %q", key, ev.Metadata[key], want)
+			}
+		}
+	}
+	if !foundAudit {
+		t.Fatalf("missing netguard.reality.report audit: %+v", st.AuditEvents())
+	}
+
+	listRes := doJSON(t, handler, http.MethodGet, "/api/netguard/reality", "", cookies, csrf)
+	defer listRes.Body.Close()
+	if listRes.StatusCode != http.StatusOK {
+		t.Fatalf("list status = %d", listRes.StatusCode)
+	}
+	listRaw, err := io.ReadAll(listRes.Body)
+	if err != nil {
+		t.Fatalf("read list body: %v", err)
+	}
+	for _, forbidden := range []string{"sshd", "2001:db8::10", "2001:db8::10/128", "inet docker"} {
+		if strings.Contains(string(listRaw), forbidden) {
+			t.Fatalf("summary response leaked detail %q: %s", forbidden, string(listRaw))
+		}
+	}
+	var list guardRealityListTest
+	if err := json.Unmarshal(listRaw, &list); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if len(list.Nodes) != 2 {
+		t.Fatalf("list node count = %d, want 2: %s", len(list.Nodes), string(listRaw))
+	}
+	if list.Nodes[0].NodeID != "node-a" || list.Nodes[0].SnapshotStatus != "fresh" {
+		t.Fatalf("node-a summary = %+v", list.Nodes[0])
+	}
+	if list.Nodes[0].ListenerCount == nil || *list.Nodes[0].ListenerCount != 1 {
+		t.Fatalf("node-a listener_count = %+v", list.Nodes[0].ListenerCount)
+	}
+	if list.Nodes[0].InterfaceCount == nil || *list.Nodes[0].InterfaceCount != 1 {
+		t.Fatalf("node-a interface_count = %+v", list.Nodes[0].InterfaceCount)
+	}
+	if list.Nodes[0].ForeignTableCount == nil || *list.Nodes[0].ForeignTableCount != 1 {
+		t.Fatalf("node-a foreign_table_count = %+v", list.Nodes[0].ForeignTableCount)
+	}
+	if list.Nodes[1].NodeID != "node-b" || list.Nodes[1].SnapshotStatus != "unknown" {
+		t.Fatalf("node-b summary = %+v", list.Nodes[1])
+	}
+	if list.Nodes[1].CollectedAt != nil || list.Nodes[1].ListenerCount != nil {
+		t.Fatalf("unknown node exposed snapshot-derived fields: %+v", list.Nodes[1])
+	}
+
+	now = collectedAt.Add(30 * time.Hour)
+	srv.now = func() time.Time { return now.UTC() }
+	detailRes := doJSON(t, handler, http.MethodGet, "/api/netguard/reality?node_id=node-a", "", cookies, csrf)
+	defer detailRes.Body.Close()
+	if detailRes.StatusCode != http.StatusOK {
+		t.Fatalf("detail status = %d", detailRes.StatusCode)
+	}
+	var detail guardRealityDetailTest
+	if err := json.NewDecoder(detailRes.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail.Node.NodeID != "node-a" || detail.Node.SnapshotStatus != "stale" {
+		t.Fatalf("detail status = %+v", detail.Node)
+	}
+	if detail.Node.Reality == nil || detail.Node.Reality.Listeners[0].Process != "sshd" {
+		t.Fatalf("detail did not include full normalized reality: %+v", detail.Node.Reality)
+	}
+	if detail.Node.StaleAfter == nil || !detail.Node.StaleAfter.Equal(collectedAt.Add(30*time.Hour)) {
+		t.Fatalf("stale_after = %+v, want %s", detail.Node.StaleAfter, collectedAt.Add(30*time.Hour))
+	}
+}
+
+func TestNetGuardRealityValidationAndStaleConflicts(t *testing.T) {
+	now := time.Date(2026, 7, 31, 13, 0, 0, 0, time.UTC)
+	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, &now)
+	tokenA := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	tokenB := enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
+
+	mismatch := guardRealityFixture("other-node", now)
+	body, err := json.Marshal(map[string]any{"node_id": "node-a", "reality": mismatch})
+	if err != nil {
+		t.Fatalf("marshal mismatch: %v", err)
+	}
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/guard-reality", string(body), tokenA)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("mismatched node status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	assertAPIErrorCodeFromBody(t, rec.Body.String(), model.APIErrorBadRequest)
+
+	rawWithToken := `{"node_id":"node-a","token":"` + tokenA + `","reality":` + string(mustJSON(t, guardRealityFixture("node-a", now))) + `}`
+	rec = doAgentRaw(t, handler, http.MethodPost, "/api/agent/guard-reality", rawWithToken, "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("body token auth status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	assertAPIErrorCodeFromBody(t, rec.Body.String(), model.APIErrorInvalidNodeToken)
+
+	valid := guardRealityFixture("node-a", now)
+	rec = doAgentRaw(t, handler, http.MethodPost, "/api/agent/guard-reality", string(mustJSON(t, map[string]any{"node_id": "node-a", "reality": valid}))+" {}", tokenA)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("trailing JSON status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	assertAPIErrorCodeFromBody(t, rec.Body.String(), model.APIErrorBadRequest)
+
+	resp := postGuardRealityForTest(t, handler, tokenA, "node-a", valid)
+	if resp.code != http.StatusOK {
+		t.Fatalf("valid seed status = %d, body=%s", resp.code, resp.body)
+	}
+	older := guardRealityFixture("node-a", now.Add(-time.Second))
+	resp = postGuardRealityForTest(t, handler, tokenA, "node-a", older)
+	if resp.code != http.StatusConflict {
+		t.Fatalf("older status = %d, body=%s", resp.code, resp.body)
+	}
+	assertAPIErrorCodeFromBody(t, resp.body, "guard_reality_stale")
+
+	diffSameTime := guardRealityFixture("node-a", now)
+	diffSameTime.ManagedSHA = strings.Repeat("b", 64)
+	resp = postGuardRealityForTest(t, handler, tokenA, "node-a", diffSameTime)
+	if resp.code != http.StatusConflict {
+		t.Fatalf("same-time diff status = %d, body=%s", resp.code, resp.body)
+	}
+	assertAPIErrorCodeFromBody(t, resp.body, "guard_reality_stale")
+
+	future := guardRealityFixture("node-b", now.Add(10*time.Minute))
+	resp = postGuardRealityForTest(t, handler, tokenB, "node-b", future)
+	if resp.code != http.StatusOK {
+		t.Fatalf("future-clamp status = %d, body=%s", resp.code, resp.body)
+	}
+	var accepted struct {
+		CollectedAt        time.Time `json:"collected_at"`
+		CollectedAtClamped bool      `json:"collected_at_clamped"`
+	}
+	if err := json.Unmarshal([]byte(resp.body), &accepted); err != nil {
+		t.Fatalf("decode future response: %v", err)
+	}
+	if !accepted.CollectedAt.Equal(now) || !accepted.CollectedAtClamped {
+		t.Fatalf("future clamp response = %+v, want collected_at=%s clamped=true", accepted, now)
+	}
+
+	badProtocol := guardRealityFixture("node-b", now.Add(time.Minute))
+	badProtocol.Listeners[0].Protocol = "icmp"
+	resp = postGuardRealityForTest(t, handler, tokenB, "node-b", badProtocol)
+	if resp.code != http.StatusBadRequest {
+		t.Fatalf("bad protocol status = %d, body=%s", resp.code, resp.body)
+	}
+	assertAPIErrorCodeFromBody(t, resp.body, model.APIErrorBadRequest)
+
+	tooManyListeners := guardRealityFixture("node-b", now.Add(time.Minute))
+	tooManyListeners.Listeners = make([]model.GuardListener, 4097)
+	for i := range tooManyListeners.Listeners {
+		tooManyListeners.Listeners[i] = model.GuardListener{Protocol: "tcp", Port: 1024 + i%1000}
+	}
+	resp = postGuardRealityForTest(t, handler, tokenB, "node-b", tooManyListeners)
+	if resp.code != http.StatusBadRequest {
+		t.Fatalf("too many listeners status = %d, body=%s", resp.code, resp.body)
+	}
+	assertAPIErrorCodeFromBody(t, resp.body, model.APIErrorBadRequest)
+}
+
+func TestNetGuardRealityReadVisibilityAndPagination(t *testing.T) {
+	now := time.Date(2026, 7, 31, 13, 0, 0, 0, time.UTC)
+	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, &now)
+	tokenA := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
+	tokenC := enrollNamedNodeToken(t, handler, cookies, csrf, "node-c", "Node C")
+
+	if resp := postGuardRealityForTest(t, handler, tokenA, "node-a", guardRealityFixture("node-a", now)); resp.code != http.StatusOK {
+		t.Fatalf("seed node-a status=%d body=%s", resp.code, resp.body)
+	}
+	if resp := postGuardRealityForTest(t, handler, tokenC, "node-c", guardRealityFixture("node-c", now)); resp.code != http.StatusOK {
+		t.Fatalf("seed node-c status=%d body=%s", resp.code, resp.body)
+	}
+
+	pat := createPAT(t, handler, cookies, csrf, []string{"netguard:read"}, []string{"node-b", "node-c"})
+	first := doBearerJSON(t, handler, http.MethodGet, "/api/netguard/reality?limit=1", "", pat)
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first page status = %d", first.StatusCode)
+	}
+	var firstPage guardRealityListTest
+	if err := json.NewDecoder(first.Body).Decode(&firstPage); err != nil {
+		t.Fatalf("decode first page: %v", err)
+	}
+	if len(firstPage.Nodes) != 1 || firstPage.Nodes[0].NodeID != "node-b" || firstPage.Nodes[0].SnapshotStatus != "unknown" {
+		t.Fatalf("first page = %+v", firstPage)
+	}
+	if firstPage.NextCursor == "" {
+		t.Fatalf("first page missing next_cursor")
+	}
+
+	second := doBearerJSON(t, handler, http.MethodGet, "/api/netguard/reality?cursor="+firstPage.NextCursor+"&limit=1", "", pat)
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("second page status = %d", second.StatusCode)
+	}
+	var secondPage guardRealityListTest
+	if err := json.NewDecoder(second.Body).Decode(&secondPage); err != nil {
+		t.Fatalf("decode second page: %v", err)
+	}
+	if len(secondPage.Nodes) != 1 || secondPage.Nodes[0].NodeID != "node-c" || secondPage.Nodes[0].SnapshotStatus != "fresh" {
+		t.Fatalf("second page = %+v", secondPage)
+	}
+	if secondPage.NextCursor != "" {
+		t.Fatalf("final page next_cursor = %q, want empty", secondPage.NextCursor)
+	}
+
+	hidden := doBearerJSON(t, handler, http.MethodGet, "/api/netguard/reality?node_id=node-a", "", pat)
+	defer hidden.Body.Close()
+	if hidden.StatusCode != http.StatusNotFound {
+		t.Fatalf("hidden detail status = %d", hidden.StatusCode)
+	}
+	body, err := io.ReadAll(hidden.Body)
+	if err != nil {
+		t.Fatalf("read hidden detail: %v", err)
+	}
+	assertAPIErrorCodeFromBody(t, string(body), model.APIErrorNotFound)
+
+	unknown := doBearerJSON(t, handler, http.MethodGet, "/api/netguard/reality?node_id=node-b", "", pat)
+	defer unknown.Body.Close()
+	if unknown.StatusCode != http.StatusOK {
+		t.Fatalf("unknown detail status = %d", unknown.StatusCode)
+	}
+	var unknownDetail guardRealityDetailTest
+	if err := json.NewDecoder(unknown.Body).Decode(&unknownDetail); err != nil {
+		t.Fatalf("decode unknown detail: %v", err)
+	}
+	if unknownDetail.Node.NodeID != "node-b" || unknownDetail.Node.SnapshotStatus != "unknown" || unknownDetail.Node.Reality != nil || unknownDetail.Node.ReceivedAt != nil {
+		t.Fatalf("unknown detail = %+v", unknownDetail.Node)
+	}
+
+	for _, path := range []string{
+		"/api/netguard/reality?node_id=node-b&limit=1",
+		"/api/netguard/reality?cursor=not-base64",
+		"/api/netguard/reality?limit=501",
+	} {
+		res := doBearerJSON(t, handler, http.MethodGet, path, "", pat)
+		body, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			t.Fatalf("read %s body: %v", path, err)
+		}
+		if res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s status = %d, body=%s", path, res.StatusCode, string(body))
+		}
+		assertAPIErrorCodeFromBody(t, string(body), model.APIErrorBadRequest)
+	}
+}

@@ -51,42 +51,43 @@ type State struct {
 	// distinct collection from KV on purpose: KV is plaintext at rest AND readable
 	// over GET /api/kv by any principal holding kv:read. A secret must have neither
 	// property, so it gets its own map, its own cipher pass, and no HTTP handler.
-	PluginSecrets   map[string]model.KVEntry            `json:"plugin_secrets"`
-	Static          map[string]model.StaticObject       `json:"static"`
-	StorageBuckets  map[string]model.StorageBucket      `json:"storage_buckets"`
-	StorageBindings map[string]model.StorageBinding     `json:"storage_bindings"`
-	StorageTokens   map[string]model.StorageAccessToken `json:"storage_tokens"`
-	Workers         map[string]model.WorkerScript       `json:"workers"`
-	Plugins         map[string]model.PluginInstallation `json:"plugins"`
-	Approvals       map[string]model.Approval           `json:"approvals"`
-	Sessions        map[string]auth.Session             `json:"sessions"`
-	DDNS            map[string]model.DDNSProfile        `json:"ddns"`
-	Monitors        map[string]model.Monitor            `json:"monitors"`
-	MonResults      map[string][]model.MonitorResult    `json:"monitor_results"`
-	LogSources      map[string]model.LogSource          `json:"log_sources"`
-	NotifyChannels  map[string]model.NotifyChannel      `json:"notify_channels"`
-	NotifyRules     map[string]model.NotifyRule         `json:"notify_rules"`
-	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
-	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
-	MachineVendors  map[string]model.MachineVendor      `json:"machine_vendors"`
-	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
-	SecurityGroups  map[string]model.SecurityGroup      `json:"security_groups"`
-	GuardZones      map[string]model.GuardZone          `json:"guard_zones"`
-	GuardBindings   map[string]model.NodeGuardBinding   `json:"guard_bindings"`
-	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
-	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
-	Groups          map[string]model.Group              `json:"groups"`
-	GroupPolicies   map[string]model.GroupNetPolicy     `json:"group_policies"`
-	GeoRouting      map[string]model.GeoRouting         `json:"geo_routing"`
-	AgentUpdates    map[string]model.AgentUpdatePolicy  `json:"agent_updates"`
-	ProxyInbounds   map[string]model.ProxyInbound       `json:"proxy_inbounds"`
-	ProxyUsers      map[string]model.ProxyUser          `json:"proxy_users"`
-	ProxyProfiles   map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
-	ProxyUsage      map[string]model.ProxyUsageSnapshot `json:"proxy_usage"`
-	TOTPChallenges  map[string]auth.TOTPChallenge       `json:"totp_challenges"`
-	OIDCProviders   map[string]model.OIDCProvider       `json:"oidc_providers"`
-	OIDCIdentities  map[string]model.OIDCIdentity       `json:"oidc_identities"`
-	OIDCAuthStates  map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
+	PluginSecrets         map[string]model.KVEntry            `json:"plugin_secrets"`
+	Static                map[string]model.StaticObject       `json:"static"`
+	StorageBuckets        map[string]model.StorageBucket      `json:"storage_buckets"`
+	StorageBindings       map[string]model.StorageBinding     `json:"storage_bindings"`
+	StorageTokens         map[string]model.StorageAccessToken `json:"storage_tokens"`
+	Workers               map[string]model.WorkerScript       `json:"workers"`
+	Plugins               map[string]model.PluginInstallation `json:"plugins"`
+	Approvals             map[string]model.Approval           `json:"approvals"`
+	Sessions              map[string]auth.Session             `json:"sessions"`
+	DDNS                  map[string]model.DDNSProfile        `json:"ddns"`
+	Monitors              map[string]model.Monitor            `json:"monitors"`
+	MonResults            map[string][]model.MonitorResult    `json:"monitor_results"`
+	LogSources            map[string]model.LogSource          `json:"log_sources"`
+	NotifyChannels        map[string]model.NotifyChannel      `json:"notify_channels"`
+	NotifyRules           map[string]model.NotifyRule         `json:"notify_rules"`
+	Tunnels               map[string]model.TunnelProfile      `json:"tunnels"`
+	MachineProfiles       map[string]model.MachineProfile     `json:"machine_profiles"`
+	MachineVendors        map[string]model.MachineVendor      `json:"machine_vendors"`
+	NFTInputs             map[string]model.NFTInputs          `json:"nft_inputs"`
+	SecurityGroups        map[string]model.SecurityGroup      `json:"security_groups"`
+	GuardZones            map[string]model.GuardZone          `json:"guard_zones"`
+	GuardBindings         map[string]model.NodeGuardBinding   `json:"guard_bindings"`
+	GuardRealitySnapshots map[string]GuardRealitySnapshot     `json:"guard_reality_snapshots"`
+	DNSDeployments        map[string]model.DNSDeployment      `json:"dns_deployments"`
+	NetPolicies           map[string]model.NetPolicy          `json:"net_policies"`
+	Groups                map[string]model.Group              `json:"groups"`
+	GroupPolicies         map[string]model.GroupNetPolicy     `json:"group_policies"`
+	GeoRouting            map[string]model.GeoRouting         `json:"geo_routing"`
+	AgentUpdates          map[string]model.AgentUpdatePolicy  `json:"agent_updates"`
+	ProxyInbounds         map[string]model.ProxyInbound       `json:"proxy_inbounds"`
+	ProxyUsers            map[string]model.ProxyUser          `json:"proxy_users"`
+	ProxyProfiles         map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
+	ProxyUsage            map[string]model.ProxyUsageSnapshot `json:"proxy_usage"`
+	TOTPChallenges        map[string]auth.TOTPChallenge       `json:"totp_challenges"`
+	OIDCProviders         map[string]model.OIDCProvider       `json:"oidc_providers"`
+	OIDCIdentities        map[string]model.OIDCIdentity       `json:"oidc_identities"`
+	OIDCAuthStates        map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
 	// WebAuthnCreds holds registered passkeys keyed by store record id. The public
 	// keys and credential ids are non-secret, so this map is persisted as-is (no
 	// at-rest envelope like Users/Sessions carry).
@@ -337,48 +338,49 @@ func monitorResultPersistenceKey(monitorID, nodeID string) string {
 
 func emptyState() State {
 	return State{
-		Users:           map[string]model.User{},
-		Tokens:          map[string]model.Token{},
-		Nodes:           map[string]model.Node{},
-		Tasks:           map[string]model.Task{},
-		KV:              map[string]model.KVEntry{},
-		PluginSecrets:   map[string]model.KVEntry{},
-		Static:          map[string]model.StaticObject{},
-		StorageBuckets:  map[string]model.StorageBucket{},
-		StorageBindings: map[string]model.StorageBinding{},
-		StorageTokens:   map[string]model.StorageAccessToken{},
-		Workers:         map[string]model.WorkerScript{},
-		Plugins:         map[string]model.PluginInstallation{},
-		Approvals:       map[string]model.Approval{},
-		Sessions:        map[string]auth.Session{},
-		DDNS:            map[string]model.DDNSProfile{},
-		Monitors:        map[string]model.Monitor{},
-		MonResults:      map[string][]model.MonitorResult{},
-		LogSources:      map[string]model.LogSource{},
-		NotifyChannels:  map[string]model.NotifyChannel{},
-		NotifyRules:     map[string]model.NotifyRule{},
-		Tunnels:         map[string]model.TunnelProfile{},
-		MachineProfiles: map[string]model.MachineProfile{},
-		MachineVendors:  map[string]model.MachineVendor{},
-		NFTInputs:       map[string]model.NFTInputs{},
-		SecurityGroups:  map[string]model.SecurityGroup{},
-		GuardZones:      map[string]model.GuardZone{},
-		GuardBindings:   map[string]model.NodeGuardBinding{},
-		DNSDeployments:  map[string]model.DNSDeployment{},
-		NetPolicies:     map[string]model.NetPolicy{},
-		Groups:          map[string]model.Group{},
-		GroupPolicies:   map[string]model.GroupNetPolicy{},
-		GeoRouting:      map[string]model.GeoRouting{},
-		AgentUpdates:    map[string]model.AgentUpdatePolicy{},
-		ProxyInbounds:   map[string]model.ProxyInbound{},
-		ProxyUsers:      map[string]model.ProxyUser{},
-		ProxyProfiles:   map[string]model.ProxyNodeProfile{},
-		ProxyUsage:      map[string]model.ProxyUsageSnapshot{},
-		TOTPChallenges:  map[string]auth.TOTPChallenge{},
-		OIDCProviders:   map[string]model.OIDCProvider{},
-		OIDCIdentities:  map[string]model.OIDCIdentity{},
-		OIDCAuthStates:  map[string]auth.OIDCAuthState{},
-		WebAuthnCreds:   map[string]auth.WebAuthnCredential{},
+		Users:                 map[string]model.User{},
+		Tokens:                map[string]model.Token{},
+		Nodes:                 map[string]model.Node{},
+		Tasks:                 map[string]model.Task{},
+		KV:                    map[string]model.KVEntry{},
+		PluginSecrets:         map[string]model.KVEntry{},
+		Static:                map[string]model.StaticObject{},
+		StorageBuckets:        map[string]model.StorageBucket{},
+		StorageBindings:       map[string]model.StorageBinding{},
+		StorageTokens:         map[string]model.StorageAccessToken{},
+		Workers:               map[string]model.WorkerScript{},
+		Plugins:               map[string]model.PluginInstallation{},
+		Approvals:             map[string]model.Approval{},
+		Sessions:              map[string]auth.Session{},
+		DDNS:                  map[string]model.DDNSProfile{},
+		Monitors:              map[string]model.Monitor{},
+		MonResults:            map[string][]model.MonitorResult{},
+		LogSources:            map[string]model.LogSource{},
+		NotifyChannels:        map[string]model.NotifyChannel{},
+		NotifyRules:           map[string]model.NotifyRule{},
+		Tunnels:               map[string]model.TunnelProfile{},
+		MachineProfiles:       map[string]model.MachineProfile{},
+		MachineVendors:        map[string]model.MachineVendor{},
+		NFTInputs:             map[string]model.NFTInputs{},
+		SecurityGroups:        map[string]model.SecurityGroup{},
+		GuardZones:            map[string]model.GuardZone{},
+		GuardBindings:         map[string]model.NodeGuardBinding{},
+		GuardRealitySnapshots: map[string]GuardRealitySnapshot{},
+		DNSDeployments:        map[string]model.DNSDeployment{},
+		NetPolicies:           map[string]model.NetPolicy{},
+		Groups:                map[string]model.Group{},
+		GroupPolicies:         map[string]model.GroupNetPolicy{},
+		GeoRouting:            map[string]model.GeoRouting{},
+		AgentUpdates:          map[string]model.AgentUpdatePolicy{},
+		ProxyInbounds:         map[string]model.ProxyInbound{},
+		ProxyUsers:            map[string]model.ProxyUser{},
+		ProxyProfiles:         map[string]model.ProxyNodeProfile{},
+		ProxyUsage:            map[string]model.ProxyUsageSnapshot{},
+		TOTPChallenges:        map[string]auth.TOTPChallenge{},
+		OIDCProviders:         map[string]model.OIDCProvider{},
+		OIDCIdentities:        map[string]model.OIDCIdentity{},
+		OIDCAuthStates:        map[string]auth.OIDCAuthState{},
+		WebAuthnCreds:         map[string]auth.WebAuthnCredential{},
 
 		WebAuthnChallenges: map[string]auth.WebAuthnChallenge{},
 	}
@@ -467,6 +469,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.GuardBindings == nil {
 		st.GuardBindings = map[string]model.NodeGuardBinding{}
+	}
+	if st.GuardRealitySnapshots == nil {
+		st.GuardRealitySnapshots = map[string]GuardRealitySnapshot{}
 	}
 	if st.DNSDeployments == nil {
 		st.DNSDeployments = map[string]model.DNSDeployment{}

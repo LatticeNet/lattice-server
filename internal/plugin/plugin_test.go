@@ -277,6 +277,42 @@ func TestVerifyManifestAcceptsTrustedPublisherSignature(t *testing.T) {
 	}
 }
 
+func TestVerifyManifestRejectsDevPublisherNotInTrustPolicy(t *testing.T) {
+	devPub, devPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	officialPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact := []byte("dev signed bundle bytes")
+	manifest := Manifest{
+		ID:           "dev-signed-plugin",
+		Name:         "Dev Signed Plugin",
+		Type:         TypeSystem,
+		Version:      "0.1.0",
+		Entrypoint:   "system-go/dev-signed-plugin",
+		Capabilities: []string{"network:plan"},
+		Publisher:    "dev.hephaestus",
+		DigestSHA256: DigestSHA256(artifact),
+	}
+	manifest.SignatureEd25519 = base64.RawStdEncoding.EncodeToString(ed25519.Sign(devPriv, SigningPayload(manifest)))
+
+	if err := VerifyManifest(manifest, artifact, TrustPolicy{
+		TrustedPublishers: map[string]ed25519.PublicKey{"dev.hephaestus": devPub},
+	}); err != nil {
+		t.Fatalf("dev-signed manifest should verify when the dev publisher is trusted: %v", err)
+	}
+
+	err = VerifyManifest(manifest, artifact, TrustPolicy{
+		TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": officialPub},
+	})
+	if err == nil || !strings.Contains(err.Error(), `publisher "dev.hephaestus" is not trusted publisher`) {
+		t.Fatalf("expected dev publisher to be rejected when absent from trust policy, got %v", err)
+	}
+}
+
 func TestVerifyManifestRejectsDigestMismatch(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {

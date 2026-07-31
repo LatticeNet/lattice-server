@@ -50,8 +50,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
-	fmt.Fprintln(w, "  devplugin keygen -publisher dev.<handle> -seed <path> -trust <path> [-force]")
-	fmt.Fprintln(w, "  devplugin sign -publisher dev.<handle> -seed <path> -manifest <manifest.json> -artifact <bundle.tar.gz> -output <manifest.dev.json> [-force]")
+	fmt.Fprintln(w, "  devplugin keygen -publisher dev.<handle> -seed <path> -trust <path>")
+	fmt.Fprintln(w, "  devplugin sign -publisher dev.<handle> -seed <path> -manifest <manifest.json> -artifact <bundle.tar.gz> -output <manifest.dev.json>")
 }
 
 func runKeygen(args []string, stdout, stderr io.Writer) int {
@@ -60,7 +60,6 @@ func runKeygen(args []string, stdout, stderr io.Writer) int {
 	publisher := fs.String("publisher", "", "dev publisher id, e.g. dev.alice")
 	seedPath := fs.String("seed", "", "path for the local 32-byte ed25519 seed")
 	trustPath := fs.String("trust", "", "path for the local plugin trust JSON")
-	force := fs.Bool("force", false, "overwrite existing local files")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -76,6 +75,14 @@ func runKeygen(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "devplugin keygen: -seed and -trust must be separate files")
 		return 2
 	}
+	if err := requireNewLocalFile(*seedPath); err != nil {
+		fmt.Fprintf(stderr, "devplugin keygen: seed destination: %v\n", err)
+		return 1
+	}
+	if err := requireNewLocalFile(*trustPath); err != nil {
+		fmt.Fprintf(stderr, "devplugin keygen: trust destination: %v\n", err)
+		return 1
+	}
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -83,7 +90,7 @@ func runKeygen(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	seed := priv.Seed()
-	if err := writeLocalFile(*seedPath, seed, 0o600, *force); err != nil {
+	if err := writeNewLocalFile(*seedPath, seed, 0o600); err != nil {
 		fmt.Fprintf(stderr, "devplugin keygen: write seed: %v\n", err)
 		return 1
 	}
@@ -100,7 +107,8 @@ func runKeygen(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	raw = append(raw, '\n')
-	if err := writeLocalFile(*trustPath, raw, 0o600, *force); err != nil {
+	if err := writeNewLocalFile(*trustPath, raw, 0o600); err != nil {
+		_ = os.Remove(*seedPath)
 		fmt.Fprintf(stderr, "devplugin keygen: write trust policy: %v\n", err)
 		return 1
 	}
@@ -120,7 +128,6 @@ func runSign(args []string, stdout, stderr io.Writer) int {
 	manifestPath := fs.String("manifest", "", "source manifest.json")
 	artifactPath := fs.String("artifact", "", "packaged plugin artifact")
 	outputPath := fs.String("output", "", "dev manifest output path, or '-' for stdout")
-	force := fs.Bool("force", false, "overwrite the output path")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -135,6 +142,12 @@ func runSign(args []string, stdout, stderr io.Writer) int {
 	if *outputPath != "-" && samePath(*outputPath, *manifestPath) {
 		fmt.Fprintln(stderr, "devplugin sign: -output must not overwrite the checked-in source manifest")
 		return 2
+	}
+	if *outputPath != "-" {
+		if err := rejectInputAlias(*outputPath, *seedPath, *manifestPath, *artifactPath); err != nil {
+			fmt.Fprintf(stderr, "devplugin sign: output destination: %v\n", err)
+			return 2
+		}
 	}
 
 	priv, pub, err := readSeed(*seedPath)
@@ -187,7 +200,7 @@ func runSign(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
-	if err := writeLocalFile(*outputPath, out, 0o600, *force); err != nil {
+	if err := writeAtomicLocalFile(*outputPath, out, 0o600); err != nil {
 		fmt.Fprintf(stderr, "devplugin sign: write manifest: %v\n", err)
 		return 1
 	}
@@ -234,20 +247,54 @@ func readSeed(path string) (ed25519.PrivateKey, ed25519.PublicKey, error) {
 	return priv, pub, nil
 }
 
-func writeLocalFile(path string, data []byte, perm os.FileMode, force bool) error {
+func requireNewLocalFile(path string) error {
+	if path == "" {
+		return errors.New("empty path")
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink", path)
+		}
+		return fmt.Errorf("%s already exists", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func rejectInputAlias(output string, inputs ...string) error {
+	if output == "" {
+		return errors.New("empty path")
+	}
+	if info, err := os.Lstat(output); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink", output)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, input := range inputs {
+		if input == "" {
+			continue
+		}
+		if samePath(output, input) {
+			return fmt.Errorf("%s aliases input %s", output, input)
+		}
+		outInfo, outErr := os.Stat(output)
+		inInfo, inErr := os.Stat(input)
+		if outErr == nil && inErr == nil && os.SameFile(outInfo, inInfo) {
+			return fmt.Errorf("%s aliases input %s", output, input)
+		}
+	}
+	return nil
+}
+
+func writeNewLocalFile(path string, data []byte, perm os.FileMode) error {
 	if path == "" {
 		return errors.New("empty path")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	flags := os.O_WRONLY | os.O_CREATE
-	if force {
-		flags |= os.O_TRUNC
-	} else {
-		flags |= os.O_EXCL
-	}
-	f, err := os.OpenFile(path, flags, perm)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
 		return err
 	}
@@ -255,7 +302,57 @@ func writeLocalFile(path string, data []byte, perm os.FileMode, force bool) erro
 		_ = f.Close()
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return verifyMode(path, perm)
+}
+
+func writeAtomicLocalFile(path string, data []byte, perm os.FileMode) error {
+	if path == "" {
+		return errors.New("empty path")
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	return verifyMode(path, perm)
+}
+
+func verifyMode(path string, perm os.FileMode) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if got := info.Mode().Perm(); got != perm {
+		return fmt.Errorf("%s mode: got %o want %o", path, got, perm)
+	}
+	return nil
 }
 
 func samePath(a, b string) bool {

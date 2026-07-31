@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,6 +78,66 @@ func TestKeygenRejectsNonDevPublisher(t *testing.T) {
 	}
 }
 
+func TestKeygenExistingTrustLeavesExistingPairUntouched(t *testing.T) {
+	root := t.TempDir()
+	seedPath := filepath.Join(root, ".lattice-dev", "publisher.seed")
+	trustPath := filepath.Join(root, ".lattice-dev", "plugin-trust.local.json")
+	if err := os.MkdirAll(filepath.Dir(seedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldSeed := bytes.Repeat([]byte{3}, ed25519.SeedSize)
+	oldTrust := []byte("{\"trusted_publishers\":{\"dev.hephaestus\":\"old\"}}\n")
+	if err := os.WriteFile(seedPath, oldSeed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trustPath, oldTrust, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{
+		"keygen",
+		"-publisher", "dev.hephaestus",
+		"-seed", seedPath,
+		"-trust", trustPath,
+	}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "already exists") {
+		t.Fatalf("expected existing destination rejection, code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if got := mustRead(t, seedPath); !bytes.Equal(got, oldSeed) {
+		t.Fatalf("seed changed on failed keygen: got %x want %x", got, oldSeed)
+	}
+	if got := mustRead(t, trustPath); !bytes.Equal(got, oldTrust) {
+		t.Fatalf("trust file changed on failed keygen: got %q want %q", got, oldTrust)
+	}
+}
+
+func TestKeygenExistingTrustLeavesNoPartialSeed(t *testing.T) {
+	root := t.TempDir()
+	seedPath := filepath.Join(root, ".lattice-dev", "publisher.seed")
+	trustPath := filepath.Join(root, ".lattice-dev", "plugin-trust.local.json")
+	if err := os.MkdirAll(filepath.Dir(seedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trustPath, []byte("old trust\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{
+		"keygen",
+		"-publisher", "dev.hephaestus",
+		"-seed", seedPath,
+		"-trust", trustPath,
+	}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "already exists") {
+		t.Fatalf("expected existing trust rejection, code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(seedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("seed should not be created when trust destination exists, err=%v", err)
+	}
+}
+
 func TestSignWritesDevManifestAndVerifiesWithServerPath(t *testing.T) {
 	root := t.TempDir()
 	seed := bytes.Repeat([]byte{7}, ed25519.SeedSize)
@@ -142,8 +203,97 @@ func TestSignWritesDevManifestAndVerifiesWithServerPath(t *testing.T) {
 	}
 }
 
+func TestSignReplacesExistingOutputWithPrivateMode(t *testing.T) {
+	root := t.TempDir()
+	seedPath, artifactPath, manifestPath := writeSignInputs(t, root)
+	outputPath := filepath.Join(root, "manifest.dev.json")
+	if err := os.WriteFile(outputPath, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{
+		"sign",
+		"-publisher", "dev.hephaestus",
+		"-seed", seedPath,
+		"-manifest", manifestPath,
+		"-artifact", artifactPath,
+		"-output", outputPath,
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("sign exit %d, stderr: %s", code, stderr.String())
+	}
+	if info, err := os.Stat(outputPath); err != nil {
+		t.Fatal(err)
+	} else if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("output mode: got %o want 600", got)
+	}
+}
+
 func TestSignRejectsInPlaceManifestOutput(t *testing.T) {
 	root := t.TempDir()
+	seedPath, artifactPath, manifestPath := writeSignInputs(t, root)
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{
+		"sign",
+		"-publisher", "dev.hephaestus",
+		"-seed", seedPath,
+		"-manifest", manifestPath,
+		"-artifact", artifactPath,
+		"-output", manifestPath,
+	}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "must not overwrite") {
+		t.Fatalf("expected in-place manifest rejection, code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestSignRejectsOutputThatAliasesAnInput(t *testing.T) {
+	root := t.TempDir()
+	seedPath, artifactPath, manifestPath := writeSignInputs(t, root)
+	outputPath := filepath.Join(root, "seed-alias")
+	if err := os.Link(seedPath, outputPath); err != nil {
+		t.Skipf("hardlinks unavailable: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{
+		"sign",
+		"-publisher", "dev.hephaestus",
+		"-seed", seedPath,
+		"-manifest", manifestPath,
+		"-artifact", artifactPath,
+		"-output", outputPath,
+	}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "aliases input") {
+		t.Fatalf("expected input alias rejection, code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestSignRejectsSymlinkOutput(t *testing.T) {
+	root := t.TempDir()
+	seedPath, artifactPath, manifestPath := writeSignInputs(t, root)
+	outputPath := filepath.Join(root, "manifest.dev.json")
+	if err := os.Symlink(filepath.Join(root, "elsewhere"), outputPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{
+		"sign",
+		"-publisher", "dev.hephaestus",
+		"-seed", seedPath,
+		"-manifest", manifestPath,
+		"-artifact", artifactPath,
+		"-output", outputPath,
+	}, &stdout, &stderr)
+	if code == 0 || !strings.Contains(stderr.String(), "symlink") {
+		t.Fatalf("expected symlink output rejection, code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+}
+
+func writeSignInputs(t *testing.T, root string) (string, string, string) {
+	t.Helper()
 	seedPath := filepath.Join(root, "publisher.seed")
 	if err := os.WriteFile(seedPath, bytes.Repeat([]byte{9}, ed25519.SeedSize), 0o600); err != nil {
 		t.Fatal(err)
@@ -156,20 +306,7 @@ func TestSignRejectsInPlaceManifestOutput(t *testing.T) {
 	if err := os.WriteFile(manifestPath, manifestBytes(t, "latticenet", strings.Repeat("0", 64)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var stdout, stderr bytes.Buffer
-
-	code := run([]string{
-		"sign",
-		"-publisher", "dev.hephaestus",
-		"-seed", seedPath,
-		"-manifest", manifestPath,
-		"-artifact", artifactPath,
-		"-output", manifestPath,
-		"-force",
-	}, &stdout, &stderr)
-	if code == 0 || !strings.Contains(stderr.String(), "must not overwrite") {
-		t.Fatalf("expected in-place manifest rejection, code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-	}
+	return seedPath, artifactPath, manifestPath
 }
 
 func manifestBytes(t *testing.T, publisher, digest string) []byte {

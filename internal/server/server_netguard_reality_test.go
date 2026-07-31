@@ -242,13 +242,21 @@ func TestNetGuardRealityValidationAndStaleConflicts(t *testing.T) {
 	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, &now)
 	tokenA := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 	tokenB := enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
+	tokenC := enrollNamedNodeToken(t, handler, cookies, csrf, "node-c", "Node C")
+
+	missingNodeID := string(mustJSON(t, map[string]any{"reality": guardRealityFixture("node-a", now)}))
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/guard-reality", missingNodeID, tokenA)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing node_id status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	assertAPIErrorCodeFromBody(t, rec.Body.String(), model.APIErrorBadRequest)
 
 	mismatch := guardRealityFixture("other-node", now)
 	body, err := json.Marshal(map[string]any{"node_id": "node-a", "reality": mismatch})
 	if err != nil {
 		t.Fatalf("marshal mismatch: %v", err)
 	}
-	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/guard-reality", string(body), tokenA)
+	rec = doAgentRaw(t, handler, http.MethodPost, "/api/agent/guard-reality", string(body), tokenA)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("mismatched node status = %d, body=%s", rec.Code, rec.Body.String())
 	}
@@ -286,6 +294,24 @@ func TestNetGuardRealityValidationAndStaleConflicts(t *testing.T) {
 		t.Fatalf("same-time diff status = %d, body=%s", resp.code, resp.body)
 	}
 	assertAPIErrorCodeFromBody(t, resp.body, "guard_reality_stale")
+
+	omittedEmpty := model.GuardNodeReality{
+		NodeID:      "node-c",
+		Interfaces:  []model.GuardInterface{{Name: "lo"}},
+		CollectedAt: now,
+	}
+	resp = postGuardRealityForTest(t, handler, tokenC, "node-c", omittedEmpty)
+	if resp.code != http.StatusOK {
+		t.Fatalf("omitted-empty seed status = %d, body=%s", resp.code, resp.body)
+	}
+	explicitEmpty := omittedEmpty
+	explicitEmpty.Listeners = []model.GuardListener{}
+	explicitEmpty.Interfaces[0].Addresses = []string{}
+	explicitEmpty.ForeignTables = []string{}
+	resp = postGuardRealityForTest(t, handler, tokenC, "node-c", explicitEmpty)
+	if resp.code != http.StatusOK {
+		t.Fatalf("explicit-empty retry status = %d, body=%s", resp.code, resp.body)
+	}
 
 	future := guardRealityFixture("node-b", now.Add(10*time.Minute))
 	resp = postGuardRealityForTest(t, handler, tokenB, "node-b", future)

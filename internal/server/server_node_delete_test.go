@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func decodeNodeDeleteSummary(t *testing.T, res *http.Response) nodeDeleteSummary {
@@ -28,6 +30,7 @@ func TestNodeDeletePlanIsNonMutating(t *testing.T) {
 	if err := st.UpsertDDNSProfile(model.DDNSProfile{ID: "ddns-1", NodeID: nodeID, Provider: model.DDNSProviderCloudflare}); err != nil {
 		t.Fatalf("seed ddns: %v", err)
 	}
+	seedNodeGuardReality(t, st, nodeID)
 
 	res := doJSON(t, handler, http.MethodPost, "/api/nodes/delete/plan", `{"node_id":"`+nodeID+`"}`, cookies, csrf)
 	if res.StatusCode != http.StatusOK {
@@ -43,9 +46,15 @@ func TestNodeDeletePlanIsNonMutating(t *testing.T) {
 	if summary.DDNSProfiles != 1 {
 		t.Fatalf("plan ddns_profiles = %d want 1", summary.DDNSProfiles)
 	}
+	if summary.GuardRealitySnapshots != 1 {
+		t.Fatalf("plan guard_reality_snapshots = %d want 1", summary.GuardRealitySnapshots)
+	}
 	// The node must still exist after a plan.
 	if _, ok := st.Node(nodeID); !ok {
 		t.Fatal("plan deleted the node")
+	}
+	if _, ok := st.GuardRealitySnapshot(nodeID); !ok {
+		t.Fatal("plan deleted guard reality snapshot")
 	}
 }
 
@@ -60,6 +69,7 @@ func TestNodeDeleteRemovesNodeAndAudits(t *testing.T) {
 	if err := st.UpsertDDNSProfile(model.DDNSProfile{ID: "ddns-1", NodeID: nodeID, Provider: model.DDNSProviderCloudflare}); err != nil {
 		t.Fatalf("seed ddns: %v", err)
 	}
+	seedNodeGuardReality(t, st, nodeID)
 
 	// A plan first: it must not write an audit row.
 	planRes := doJSON(t, handler, http.MethodPost, "/api/nodes/delete/plan", `{"node_id":"`+nodeID+`"}`, cookies, csrf)
@@ -80,6 +90,9 @@ func TestNodeDeleteRemovesNodeAndAudits(t *testing.T) {
 	if summary.DDNSProfiles != 1 {
 		t.Fatalf("delete ddns_profiles = %d want 1", summary.DDNSProfiles)
 	}
+	if summary.GuardRealitySnapshots != 1 {
+		t.Fatalf("delete guard_reality_snapshots = %d want 1", summary.GuardRealitySnapshots)
+	}
 
 	if _, ok := st.Node(nodeID); ok {
 		t.Fatal("node survived delete")
@@ -98,6 +111,9 @@ func TestNodeDeleteRemovesNodeAndAudits(t *testing.T) {
 	}
 	if ev.Metadata["ddns"] != "1" {
 		t.Fatalf("audit metadata ddns = %q want 1", ev.Metadata["ddns"])
+	}
+	if ev.Metadata["guard_reality_snapshots"] != "1" {
+		t.Fatalf("audit metadata guard_reality_snapshots = %q want 1", ev.Metadata["guard_reality_snapshots"])
 	}
 
 	// Idempotent: a second delete returns 404.
@@ -178,4 +194,19 @@ func lastDeleteAudit(st interface {
 		}
 	}
 	return last
+}
+
+func seedNodeGuardReality(t *testing.T, st *store.Store, nodeID string) {
+	t.Helper()
+	node, ok := st.Node(nodeID)
+	if !ok {
+		t.Fatal("seed node missing")
+	}
+	collectedAt := time.Date(2026, 7, 31, 13, 0, 0, 0, time.UTC)
+	if _, _, err := st.UpsertGuardRealitySnapshot(node.LatticeIdentityUUID, store.GuardRealitySnapshot{
+		Reality:    model.GuardNodeReality{NodeID: nodeID, CollectedAt: collectedAt},
+		ReceivedAt: collectedAt.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("seed guard reality: %v", err)
+	}
 }

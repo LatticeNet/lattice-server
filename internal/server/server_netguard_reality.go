@@ -82,6 +82,10 @@ func (s *Server) handleAgentGuardReality(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.NodeID = strings.TrimSpace(req.NodeID)
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "node_id is required"))
+		return
+	}
 	node, ok := s.authenticateAgentRequest(r, req.NodeID)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
@@ -98,10 +102,20 @@ func (s *Server) handleAgentGuardReality(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, err.Error()))
 		return
 	}
-	stored, _, err := s.store.UpsertGuardRealitySnapshot(store.GuardRealitySnapshot{
+	stored, _, err := s.store.UpsertGuardRealitySnapshot(node.LatticeIdentityUUID, store.GuardRealitySnapshot{
 		Reality:    reality,
 		ReceivedAt: receivedAt,
 	})
+	if errors.Is(err, store.ErrGuardRealityDurabilityDegraded) {
+		if s.logger != nil {
+			s.logger.Printf("guard reality committed with degraded durability: node_id=%s: %v", node.ID, err)
+		}
+		err = nil
+	}
+	if errors.Is(err, store.ErrGuardRealityNodeChanged) {
+		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
+		return
+	}
 	if errors.Is(err, store.ErrGuardRealityStale) {
 		writeError(w, http.StatusConflict, apiError("guard_reality_stale", "guard reality snapshot is stale"))
 		return

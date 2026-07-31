@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -19,11 +20,20 @@ func seedNodeCascade(t *testing.T) *Store {
 	}
 	const node = "node-target"
 	const other = "node-other"
-	if err := s.UpsertNode(model.Node{ID: node, Name: "target"}); err != nil {
+	if err := s.UpsertNode(model.Node{ID: node, LatticeIdentityUUID: "generation-target", Name: "target"}); err != nil {
 		t.Fatalf("upsert node: %v", err)
 	}
-	if err := s.UpsertNode(model.Node{ID: other, Name: "other"}); err != nil {
+	if err := s.UpsertNode(model.Node{ID: other, LatticeIdentityUUID: "generation-other", Name: "other"}); err != nil {
 		t.Fatalf("upsert other: %v", err)
+	}
+	collectedAt := time.Date(2026, 7, 31, 13, 0, 0, 0, time.UTC)
+	for nodeID, generation := range map[string]string{node: "generation-target", other: "generation-other"} {
+		if _, _, err := s.UpsertGuardRealitySnapshot(generation, GuardRealitySnapshot{
+			Reality:    model.GuardNodeReality{NodeID: nodeID, CollectedAt: collectedAt},
+			ReceivedAt: collectedAt.Add(time.Second),
+		}); err != nil {
+			t.Fatalf("guard reality %s: %v", nodeID, err)
+		}
 	}
 
 	// Step 1/2: a sole-target task (deleted) and a multi-target task (stripped),
@@ -154,6 +164,7 @@ func expectedCascade() NodeCascadeReport {
 		Groups:                   1,
 		Approvals:                1,
 		Tunnels:                  1,
+		GuardRealitySnapshots:    1,
 	}
 }
 
@@ -182,6 +193,9 @@ func TestPlanDeleteNodeMatchesDelete(t *testing.T) {
 	}
 	if _, ok := s.NFTInputs("node-target"); !ok {
 		t.Fatal("plan deleted nft inputs")
+	}
+	if _, ok := s.GuardRealitySnapshot("node-target"); !ok {
+		t.Fatal("plan deleted guard reality snapshot")
 	}
 
 	del, ok, err := s.DeleteNode("node-target")
@@ -223,6 +237,12 @@ func TestDeleteNodeCascade(t *testing.T) {
 	}
 	if _, ok := s.NetPolicy("node-target"); ok {
 		t.Fatal("net policy survived")
+	}
+	if _, ok := s.GuardRealitySnapshot("node-target"); ok {
+		t.Fatal("guard reality snapshot survived")
+	}
+	if _, ok := s.GuardRealitySnapshot("node-other"); !ok {
+		t.Fatal("bystander guard reality snapshot was deleted")
 	}
 	if _, ok := s.AgentUpdatePolicy("node-target"); ok {
 		t.Fatal("agent update policy survived")

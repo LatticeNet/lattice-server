@@ -109,6 +109,7 @@ type Store struct {
 	walAnchorPath      string
 	runtimeBoltHot     *BoltStateStore // optional record-level sidecar for high-churn runtime domains
 	runtimeBoltHotPath string
+	syncParentDir      func(string) error
 }
 
 // Open loads (or initializes) the store at path, resolving the at-rest
@@ -142,6 +143,7 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 		metricsPersistedAt: map[string]time.Time{},
 		monitorPersistedAt: map[string]time.Time{},
 		cipher:             cph,
+		syncParentDir:      syncDir,
 	}
 	if path == "" {
 		return s, nil
@@ -532,35 +534,48 @@ func (s *Store) ensureMaps() {
 }
 
 func (s *Store) Save() error {
+	_, err := s.persistState(s.jsonPersistState())
+	return err
+}
+
+// persistState writes the supplied state without changing the live read model.
+// Callers that need commit-style publication can persist a staged copy and
+// install it in s.state only after this returns successfully.
+func (s *Store) persistState(st State) (committed bool, err error) {
 	start := time.Now()
-	var err error
 	defer func() {
 		telemetry.ObserveStoreSave(time.Since(start), err)
 	}()
 	if s.path == "" {
-		return nil
+		return true, nil
 	}
 	// 0o700: this directory holds only the server's private state file and,
 	// in the auto-generate case, the master key. It must match the 0o700 used
 	// by secret.generateKeyFile so neither path can widen the other (MkdirAll
 	// is a no-op once the directory exists, so the first creator's mode wins).
 	if err = os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
+		return false, err
 	}
-	persist, err := encryptedState(s.jsonPersistState(), s.cipher)
+	persist, err := encryptedState(st, s.cipher)
 	if err != nil {
-		return fmt.Errorf("encrypt state: %w", err)
+		return false, fmt.Errorf("encrypt state: %w", err)
 	}
 	data, err := json.MarshalIndent(persist, "", "  ")
 	if err != nil {
-		return err
+		return false, err
 	}
-	err = syncedAtomicWrite(s.path, data, 0o600)
-	return err
+	syncParentDir := s.syncParentDir
+	if syncParentDir == nil {
+		syncParentDir = syncDir
+	}
+	return syncedAtomicWriteStatus(s.path, data, 0o600, syncParentDir)
 }
 
 func (s *Store) jsonPersistState() State {
-	st := s.state
+	return s.jsonPersistStateFrom(s.state)
+}
+
+func (s *Store) jsonPersistStateFrom(st State) State {
 	if s.runtimeBoltHot == nil {
 		return st
 	}
@@ -607,16 +622,23 @@ func (s *Store) ReadyCheck() error {
 // For the primary state file that holds all credentials/secrets, that window is
 // total data loss, so we close it the same way the audit WAL already does.
 func syncedAtomicWrite(path string, data []byte, perm os.FileMode) error {
+	_, err := syncedAtomicWriteStatus(path, data, perm, syncDir)
+	return err
+}
+
+// syncedAtomicWriteStatus reports whether rename crossed the commit point even
+// when the following parent-directory fsync fails.
+func syncedAtomicWriteStatus(path string, data []byte, perm os.FileMode, syncParentDir func(string) error) (bool, error) {
 	tmp := path + ".tmp"
 	if err := writeSyncedFile(tmp, data, perm); err != nil {
 		os.Remove(tmp)
-		return err
+		return false, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
-		return err
+		return false, err
 	}
-	return syncDir(filepath.Dir(path))
+	return true, syncParentDir(filepath.Dir(path))
 }
 
 // writeSyncedFile writes data to path (creating/truncating) and fsyncs the file

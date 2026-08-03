@@ -137,8 +137,17 @@ func Open(path string) (*Store, error) {
 // it after logging the resolved key source; tests use it to inject a known
 // cipher. A nil cipher disables encryption.
 func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
+	return openWithCipher(path, cph, syncDir)
+}
+
+// openWithCipher lets store tests inject the startup directory sync without
+// widening the public constructor or persistence API.
+func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) error) (*Store, error) {
 	if cph == nil {
 		cph = secret.Disabled()
+	}
+	if syncParentDir == nil {
+		syncParentDir = syncDir
 	}
 	s := &Store{
 		path:               path,
@@ -146,7 +155,7 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 		metricsPersistedAt: map[string]time.Time{},
 		monitorPersistedAt: map[string]time.Time{},
 		cipher:             cph,
-		syncParentDir:      syncDir,
+		syncParentDir:      syncParentDir,
 	}
 	if path == "" {
 		return s, nil
@@ -168,6 +177,7 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 		return nil, err
 	}
 	if len(data) == 0 {
+		s.confirmParentDirDurability()
 		return s, nil
 	}
 	if err := json.Unmarshal(data, &s.state); err != nil {
@@ -179,7 +189,16 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 	s.ensureMaps()
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
+	s.confirmParentDirDurability()
 	return s, nil
+}
+
+func (s *Store) confirmParentDirDurability() {
+	syncParentDir := s.syncParentDir
+	if syncParentDir == nil {
+		syncParentDir = syncDir
+	}
+	s.durabilityDegraded = syncParentDir(filepath.Dir(s.path)) != nil
 }
 
 // EnableRuntimeBoltHotStore moves high-churn runtime collections to a

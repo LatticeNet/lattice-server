@@ -268,6 +268,52 @@ func TestGuardRealitySnapshotPersistFailureDoesNotPublish(t *testing.T) {
 	}
 }
 
+func TestOpenWithCipherSyncsOnlyExistingStateParentDirectory(t *testing.T) {
+	tests := []struct {
+		name      string
+		create    bool
+		contents  []byte
+		wantCalls int
+	}{
+		{name: "absent", wantCalls: 0},
+		{name: "empty", create: true, wantCalls: 1},
+		{name: "populated", create: true, contents: []byte("{}"), wantCalls: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			if tt.create {
+				if err := os.WriteFile(path, tt.contents, 0o600); err != nil {
+					t.Fatalf("write state fixture: %v", err)
+				}
+			}
+			calls := 0
+			syncedDir := ""
+			st, err := openWithCipher(path, testCipher(t), func(dir string) error {
+				calls++
+				syncedDir = dir
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			if calls != tt.wantCalls {
+				t.Fatalf("startup parent sync calls = %d, want %d", calls, tt.wantCalls)
+			}
+			if tt.wantCalls == 0 && syncedDir != "" {
+				t.Fatalf("absent state synced directory %q", syncedDir)
+			}
+			if tt.wantCalls == 1 && syncedDir != filepath.Dir(path) {
+				t.Fatalf("startup parent sync directory = %q, want %q", syncedDir, filepath.Dir(path))
+			}
+			if err := st.ReadyCheck(); err != nil {
+				t.Fatalf("successful startup path degraded readiness: %v", err)
+			}
+		})
+	}
+}
+
 func TestGuardRealitySnapshotPostRenameFailurePublishesCommittedState(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	cipher := testCipher(t)
@@ -275,6 +321,7 @@ func TestGuardRealitySnapshotPostRenameFailurePublishesCommittedState(t *testing
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
+	t.Cleanup(func() { _ = st.Close() })
 	if err := st.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "generation-a"}); err != nil {
 		t.Fatalf("upsert node: %v", err)
 	}
@@ -313,20 +360,94 @@ func TestGuardRealitySnapshotPostRenameFailurePublishesCommittedState(t *testing
 	if !ok || got.Reality.ManagedSHA != strings.Repeat("b", 64) {
 		t.Fatalf("live state did not publish committed snapshot: ok=%v snapshot=%+v", ok, got)
 	}
-	reopened, err := OpenWithCipher(path, cipher)
+	startupSyncCalls := 0
+	startupSyncDir := ""
+	reopened, err := openWithCipher(path, cipher, func(dir string) error {
+		startupSyncCalls++
+		startupSyncDir = dir
+		return errors.New("forced startup parent sync failure")
+	})
 	if err != nil {
 		t.Fatalf("reopen committed snapshot: %v", err)
 	}
+	t.Cleanup(func() { _ = reopened.Close() })
 	got, ok = reopened.GuardRealitySnapshot("node-a")
 	if !ok || got.Reality.ManagedSHA != strings.Repeat("b", 64) {
 		t.Fatalf("reopened state did not contain committed snapshot: ok=%v snapshot=%+v", ok, got)
 	}
-
-	st.syncParentDir = syncDir
+	if err := reopened.ReadyCheck(); err == nil {
+		t.Fatal("restart cleared durability degradation without confirming parent directory sync")
+	}
+	if startupSyncCalls != 1 {
+		t.Fatalf("startup parent sync calls = %d, want 1", startupSyncCalls)
+	}
+	if startupSyncDir != filepath.Dir(path) {
+		t.Fatalf("startup parent sync directory = %q, want %q", startupSyncDir, filepath.Dir(path))
+	}
+	reopenedStored, reopenedChanged, err := reopened.UpsertGuardRealitySnapshot("generation-a", newer)
+	if err != nil || reopenedChanged {
+		t.Fatalf("reopened committed retry changed=%v err=%v", reopenedChanged, err)
+	}
+	if !reopenedStored.ReceivedAt.Equal(newer.ReceivedAt) {
+		t.Fatalf("reopened committed retry received_at = %s, want %s", reopenedStored.ReceivedAt, newer.ReceivedAt)
+	}
+	if err := reopened.ReadyCheck(); err == nil {
+		t.Fatal("reopened idempotent retry cleared durability degradation without a parent sync")
+	}
+	if startupSyncCalls != 1 {
+		t.Fatalf("idempotent retry parent sync calls = %d, want 1", startupSyncCalls)
+	}
 	confirmed := newer
 	confirmed.Reality.CollectedAt = newer.Reality.CollectedAt.Add(time.Minute)
 	confirmed.Reality.ManagedSHA = strings.Repeat("c", 64)
 	confirmed.ReceivedAt = newer.ReceivedAt.Add(time.Minute)
+	recoverySyncCalls := 0
+	recoverySyncDir := ""
+	reopened.syncParentDir = func(dir string) error {
+		recoverySyncCalls++
+		recoverySyncDir = dir
+		return nil
+	}
+	reopenedStored, reopenedChanged, err = reopened.UpsertGuardRealitySnapshot("generation-a", confirmed)
+	if err != nil || !reopenedChanged {
+		t.Fatalf("startup-degraded recovery changed=%v err=%v", reopenedChanged, err)
+	}
+	if recoverySyncCalls != 1 {
+		t.Fatalf("recovery parent sync calls = %d, want 1", recoverySyncCalls)
+	}
+	if recoverySyncDir != filepath.Dir(path) {
+		t.Fatalf("recovery parent sync directory = %q, want %q", recoverySyncDir, filepath.Dir(path))
+	}
+	if err := reopened.ReadyCheck(); err != nil {
+		t.Fatalf("confirmed recovery sync left startup readiness degraded: %v", err)
+	}
+
+	confirmedSyncCalls := 0
+	confirmedSyncDir := ""
+	confirmedOpen, err := openWithCipher(path, cipher, func(dir string) error {
+		confirmedSyncCalls++
+		confirmedSyncDir = dir
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("reopen with confirmed parent sync: %v", err)
+	}
+	t.Cleanup(func() { _ = confirmedOpen.Close() })
+	if confirmedSyncCalls != 1 {
+		t.Fatalf("confirmed startup parent sync calls = %d, want 1", confirmedSyncCalls)
+	}
+	if confirmedSyncDir != filepath.Dir(path) {
+		t.Fatalf("confirmed startup parent sync directory = %q, want %q", confirmedSyncDir, filepath.Dir(path))
+	}
+	if err := confirmedOpen.ReadyCheck(); err != nil {
+		t.Fatalf("successful startup parent sync left readiness degraded: %v", err)
+	}
+	got, ok = confirmedOpen.GuardRealitySnapshot("node-a")
+	if !ok || got.Reality.ManagedSHA != strings.Repeat("c", 64) {
+		t.Fatalf("confirmed startup snapshot: ok=%v snapshot=%+v", ok, got)
+	}
+
+	st.syncParentDir = syncDir
 	if err := os.Mkdir(path+".tmp", 0o700); err != nil {
 		t.Fatalf("install degraded save-failure fixture: %v", err)
 	}
@@ -355,11 +476,12 @@ func TestGuardRealitySnapshotPostRenameFailurePublishesCommittedState(t *testing
 	if err := st.ReadyCheck(); err != nil {
 		t.Fatalf("successful parent sync did not clear durability-degraded readiness: %v", err)
 	}
-	reopened, err = OpenWithCipher(path, cipher)
+	finalReopened, err := OpenWithCipher(path, cipher)
 	if err != nil {
 		t.Fatalf("reopen confirmed durable snapshot: %v", err)
 	}
-	got, ok = reopened.GuardRealitySnapshot("node-a")
+	t.Cleanup(func() { _ = finalReopened.Close() })
+	got, ok = finalReopened.GuardRealitySnapshot("node-a")
 	if !ok || got.Reality.ManagedSHA != strings.Repeat("c", 64) {
 		t.Fatalf("reopened confirmed snapshot: ok=%v snapshot=%+v", ok, got)
 	}

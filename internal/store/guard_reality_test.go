@@ -224,6 +224,9 @@ func TestGuardRealitySnapshotPersistFailureDoesNotPublish(t *testing.T) {
 	if _, _, err := st.UpsertGuardRealitySnapshot("generation-b", firstInsert); err == nil {
 		t.Fatal("first insert unexpectedly survived forced persist failure")
 	}
+	if err := st.ReadyCheck(); err != nil {
+		t.Fatalf("pre-rename failure degraded readiness: %v", err)
+	}
 
 	got, ok := st.GuardRealitySnapshot("node-a")
 	if !ok || got.Reality.ManagedSHA != strings.Repeat("a", 64) {
@@ -287,6 +290,9 @@ func TestGuardRealitySnapshotPostRenameFailurePublishesCommittedState(t *testing
 	if _, _, err := st.UpsertGuardRealitySnapshot("generation-a", first); err != nil {
 		t.Fatalf("seed snapshot: %v", err)
 	}
+	if err := st.ReadyCheck(); err != nil {
+		t.Fatalf("healthy persistence degraded readiness: %v", err)
+	}
 
 	newer := first
 	newer.Reality.CollectedAt = collectedAt.Add(time.Minute)
@@ -296,6 +302,9 @@ func TestGuardRealitySnapshotPostRenameFailurePublishesCommittedState(t *testing
 	stored, changed, err := st.UpsertGuardRealitySnapshot("generation-a", newer)
 	if !errors.Is(err, ErrGuardRealityDurabilityDegraded) || !changed {
 		t.Fatalf("post-rename result changed=%v err=%v", changed, err)
+	}
+	if err := st.ReadyCheck(); err == nil {
+		t.Fatal("post-rename sync failure left readiness healthy")
 	}
 	if stored.Reality.ManagedSHA != strings.Repeat("b", 64) {
 		t.Fatalf("returned committed snapshot = %+v", stored)
@@ -314,12 +323,45 @@ func TestGuardRealitySnapshotPostRenameFailurePublishesCommittedState(t *testing
 	}
 
 	st.syncParentDir = syncDir
+	confirmed := newer
+	confirmed.Reality.CollectedAt = newer.Reality.CollectedAt.Add(time.Minute)
+	confirmed.Reality.ManagedSHA = strings.Repeat("c", 64)
+	confirmed.ReceivedAt = newer.ReceivedAt.Add(time.Minute)
+	if err := os.Mkdir(path+".tmp", 0o700); err != nil {
+		t.Fatalf("install degraded save-failure fixture: %v", err)
+	}
+	if _, _, err := st.UpsertGuardRealitySnapshot("generation-a", confirmed); err == nil {
+		t.Fatal("pre-rename failure unexpectedly succeeded while durability was degraded")
+	}
+	if err := st.ReadyCheck(); err == nil {
+		t.Fatal("pre-rename failure cleared durability-degraded readiness")
+	}
+
 	stored, changed, err = st.UpsertGuardRealitySnapshot("generation-a", newer)
 	if err != nil || changed {
 		t.Fatalf("committed retry changed=%v err=%v", changed, err)
 	}
 	if !stored.ReceivedAt.Equal(newer.ReceivedAt) {
 		t.Fatalf("committed retry received_at = %s, want %s", stored.ReceivedAt, newer.ReceivedAt)
+	}
+	if err := st.ReadyCheck(); err == nil {
+		t.Fatal("idempotent retry cleared durability-degraded readiness without a parent sync")
+	}
+
+	stored, changed, err = st.UpsertGuardRealitySnapshot("generation-a", confirmed)
+	if err != nil || !changed {
+		t.Fatalf("confirmed durable update changed=%v err=%v", changed, err)
+	}
+	if err := st.ReadyCheck(); err != nil {
+		t.Fatalf("successful parent sync did not clear durability-degraded readiness: %v", err)
+	}
+	reopened, err = OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatalf("reopen confirmed durable snapshot: %v", err)
+	}
+	got, ok = reopened.GuardRealitySnapshot("node-a")
+	if !ok || got.Reality.ManagedSHA != strings.Repeat("c", 64) {
+		t.Fatalf("reopened confirmed snapshot: ok=%v snapshot=%+v", ok, got)
 	}
 }
 

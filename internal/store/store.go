@@ -39,6 +39,8 @@ const metricsPersistenceInterval = 5 * time.Minute
 // avoiding a full snapshot rewrite for every unchanged probe cycle.
 const monitorResultPersistenceInterval = 5 * time.Minute
 
+var errStoreDurabilityDegraded = errors.New("store durability degraded: parent directory sync not confirmed")
+
 type State struct {
 	Users   map[string]model.User    `json:"users"`
 	Tokens  map[string]model.Token   `json:"tokens"`
@@ -110,6 +112,7 @@ type Store struct {
 	runtimeBoltHot     *BoltStateStore // optional record-level sidecar for high-churn runtime domains
 	runtimeBoltHotPath string
 	syncParentDir      func(string) error
+	durabilityDegraded bool // guarded by mu; only a confirmed parent sync clears it
 }
 
 // Open loads (or initializes) the store at path, resolving the at-rest
@@ -568,7 +571,11 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 	if syncParentDir == nil {
 		syncParentDir = syncDir
 	}
-	return syncedAtomicWriteStatus(s.path, data, 0o600, syncParentDir)
+	committed, err = syncedAtomicWriteStatus(s.path, data, 0o600, syncParentDir)
+	if committed {
+		s.durabilityDegraded = err != nil
+	}
+	return committed, err
 }
 
 func (s *Store) jsonPersistState() State {
@@ -587,13 +594,17 @@ func (s *Store) jsonPersistStateFrom(st State) State {
 	return st
 }
 
-// ReadyCheck verifies that the in-memory state is initialized and can still be
-// serialized with the configured at-rest cipher. It does not write to disk or
-// return state contents; callers use it for readiness probes.
+// ReadyCheck verifies that persistence has no unresolved directory-sync
+// failure and that the in-memory state can still be serialized with the
+// configured at-rest cipher. It does not write to disk or return state
+// contents; callers use it for readiness probes.
 func (s *Store) ReadyCheck() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureMaps()
+	if s.durabilityDegraded {
+		return errStoreDurabilityDegraded
+	}
 	if s.path != "" {
 		if _, err := os.Stat(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat state file: %w", err)

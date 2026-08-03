@@ -36,6 +36,7 @@ type NodeCascadeReport struct {
 	Groups                   int `json:"groups"`    // Members/LeaderID edited
 	Approvals                int `json:"approvals"` // NO existing primitive
 	Tunnels                  int `json:"tunnels"`
+	GuardRealitySnapshots    int `json:"guard_reality_snapshots"`
 	// RemovedLogSourceIDs lists the log-source IDs whose records this delete
 	// removed from the JSON store. The SERVER must call logStore.PurgeSource on
 	// each (the log lines live in a separate bbolt db the store cannot reach).
@@ -404,7 +405,15 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		}
 	}
 
-	// Step 17: the node itself (embedded TokenHash/Metrics/HostFacts/Geo/etc all
+	// Step 17: latest low-trust NetGuard reality snapshot (node-owned).
+	if _, ok := s.state.GuardRealitySnapshots[nodeID]; ok {
+		report.GuardRealitySnapshots++
+		if mutate {
+			delete(s.state.GuardRealitySnapshots, nodeID)
+		}
+	}
+
+	// Step 18: the node itself (embedded TokenHash/Metrics/HostFacts/Geo/etc all
 	// purged with the record).
 	if mutate {
 		delete(s.state.Nodes, nodeID)

@@ -39,6 +39,8 @@ const metricsPersistenceInterval = 5 * time.Minute
 // avoiding a full snapshot rewrite for every unchanged probe cycle.
 const monitorResultPersistenceInterval = 5 * time.Minute
 
+var errStoreDurabilityDegraded = errors.New("store durability degraded: parent directory sync not confirmed")
+
 type State struct {
 	Users   map[string]model.User    `json:"users"`
 	Tokens  map[string]model.Token   `json:"tokens"`
@@ -51,42 +53,43 @@ type State struct {
 	// distinct collection from KV on purpose: KV is plaintext at rest AND readable
 	// over GET /api/kv by any principal holding kv:read. A secret must have neither
 	// property, so it gets its own map, its own cipher pass, and no HTTP handler.
-	PluginSecrets   map[string]model.KVEntry            `json:"plugin_secrets"`
-	Static          map[string]model.StaticObject       `json:"static"`
-	StorageBuckets  map[string]model.StorageBucket      `json:"storage_buckets"`
-	StorageBindings map[string]model.StorageBinding     `json:"storage_bindings"`
-	StorageTokens   map[string]model.StorageAccessToken `json:"storage_tokens"`
-	Workers         map[string]model.WorkerScript       `json:"workers"`
-	Plugins         map[string]model.PluginInstallation `json:"plugins"`
-	Approvals       map[string]model.Approval           `json:"approvals"`
-	Sessions        map[string]auth.Session             `json:"sessions"`
-	DDNS            map[string]model.DDNSProfile        `json:"ddns"`
-	Monitors        map[string]model.Monitor            `json:"monitors"`
-	MonResults      map[string][]model.MonitorResult    `json:"monitor_results"`
-	LogSources      map[string]model.LogSource          `json:"log_sources"`
-	NotifyChannels  map[string]model.NotifyChannel      `json:"notify_channels"`
-	NotifyRules     map[string]model.NotifyRule         `json:"notify_rules"`
-	Tunnels         map[string]model.TunnelProfile      `json:"tunnels"`
-	MachineProfiles map[string]model.MachineProfile     `json:"machine_profiles"`
-	MachineVendors  map[string]model.MachineVendor      `json:"machine_vendors"`
-	NFTInputs       map[string]model.NFTInputs          `json:"nft_inputs"`
-	SecurityGroups  map[string]model.SecurityGroup      `json:"security_groups"`
-	GuardZones      map[string]model.GuardZone          `json:"guard_zones"`
-	GuardBindings   map[string]model.NodeGuardBinding   `json:"guard_bindings"`
-	DNSDeployments  map[string]model.DNSDeployment      `json:"dns_deployments"`
-	NetPolicies     map[string]model.NetPolicy          `json:"net_policies"`
-	Groups          map[string]model.Group              `json:"groups"`
-	GroupPolicies   map[string]model.GroupNetPolicy     `json:"group_policies"`
-	GeoRouting      map[string]model.GeoRouting         `json:"geo_routing"`
-	AgentUpdates    map[string]model.AgentUpdatePolicy  `json:"agent_updates"`
-	ProxyInbounds   map[string]model.ProxyInbound       `json:"proxy_inbounds"`
-	ProxyUsers      map[string]model.ProxyUser          `json:"proxy_users"`
-	ProxyProfiles   map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
-	ProxyUsage      map[string]model.ProxyUsageSnapshot `json:"proxy_usage"`
-	TOTPChallenges  map[string]auth.TOTPChallenge       `json:"totp_challenges"`
-	OIDCProviders   map[string]model.OIDCProvider       `json:"oidc_providers"`
-	OIDCIdentities  map[string]model.OIDCIdentity       `json:"oidc_identities"`
-	OIDCAuthStates  map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
+	PluginSecrets         map[string]model.KVEntry            `json:"plugin_secrets"`
+	Static                map[string]model.StaticObject       `json:"static"`
+	StorageBuckets        map[string]model.StorageBucket      `json:"storage_buckets"`
+	StorageBindings       map[string]model.StorageBinding     `json:"storage_bindings"`
+	StorageTokens         map[string]model.StorageAccessToken `json:"storage_tokens"`
+	Workers               map[string]model.WorkerScript       `json:"workers"`
+	Plugins               map[string]model.PluginInstallation `json:"plugins"`
+	Approvals             map[string]model.Approval           `json:"approvals"`
+	Sessions              map[string]auth.Session             `json:"sessions"`
+	DDNS                  map[string]model.DDNSProfile        `json:"ddns"`
+	Monitors              map[string]model.Monitor            `json:"monitors"`
+	MonResults            map[string][]model.MonitorResult    `json:"monitor_results"`
+	LogSources            map[string]model.LogSource          `json:"log_sources"`
+	NotifyChannels        map[string]model.NotifyChannel      `json:"notify_channels"`
+	NotifyRules           map[string]model.NotifyRule         `json:"notify_rules"`
+	Tunnels               map[string]model.TunnelProfile      `json:"tunnels"`
+	MachineProfiles       map[string]model.MachineProfile     `json:"machine_profiles"`
+	MachineVendors        map[string]model.MachineVendor      `json:"machine_vendors"`
+	NFTInputs             map[string]model.NFTInputs          `json:"nft_inputs"`
+	SecurityGroups        map[string]model.SecurityGroup      `json:"security_groups"`
+	GuardZones            map[string]model.GuardZone          `json:"guard_zones"`
+	GuardBindings         map[string]model.NodeGuardBinding   `json:"guard_bindings"`
+	GuardRealitySnapshots map[string]GuardRealitySnapshot     `json:"guard_reality_snapshots"`
+	DNSDeployments        map[string]model.DNSDeployment      `json:"dns_deployments"`
+	NetPolicies           map[string]model.NetPolicy          `json:"net_policies"`
+	Groups                map[string]model.Group              `json:"groups"`
+	GroupPolicies         map[string]model.GroupNetPolicy     `json:"group_policies"`
+	GeoRouting            map[string]model.GeoRouting         `json:"geo_routing"`
+	AgentUpdates          map[string]model.AgentUpdatePolicy  `json:"agent_updates"`
+	ProxyInbounds         map[string]model.ProxyInbound       `json:"proxy_inbounds"`
+	ProxyUsers            map[string]model.ProxyUser          `json:"proxy_users"`
+	ProxyProfiles         map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
+	ProxyUsage            map[string]model.ProxyUsageSnapshot `json:"proxy_usage"`
+	TOTPChallenges        map[string]auth.TOTPChallenge       `json:"totp_challenges"`
+	OIDCProviders         map[string]model.OIDCProvider       `json:"oidc_providers"`
+	OIDCIdentities        map[string]model.OIDCIdentity       `json:"oidc_identities"`
+	OIDCAuthStates        map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
 	// WebAuthnCreds holds registered passkeys keyed by store record id. The public
 	// keys and credential ids are non-secret, so this map is persisted as-is (no
 	// at-rest envelope like Users/Sessions carry).
@@ -108,6 +111,8 @@ type Store struct {
 	walAnchorPath      string
 	runtimeBoltHot     *BoltStateStore // optional record-level sidecar for high-churn runtime domains
 	runtimeBoltHotPath string
+	syncParentDir      func(string) error
+	durabilityDegraded bool // guarded by mu; only a confirmed parent sync clears it
 }
 
 // Open loads (or initializes) the store at path, resolving the at-rest
@@ -132,8 +137,17 @@ func Open(path string) (*Store, error) {
 // it after logging the resolved key source; tests use it to inject a known
 // cipher. A nil cipher disables encryption.
 func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
+	return openWithCipher(path, cph, syncDir)
+}
+
+// openWithCipher lets store tests inject the startup directory sync without
+// widening the public constructor or persistence API.
+func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) error) (*Store, error) {
 	if cph == nil {
 		cph = secret.Disabled()
+	}
+	if syncParentDir == nil {
+		syncParentDir = syncDir
 	}
 	s := &Store{
 		path:               path,
@@ -141,6 +155,7 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 		metricsPersistedAt: map[string]time.Time{},
 		monitorPersistedAt: map[string]time.Time{},
 		cipher:             cph,
+		syncParentDir:      syncParentDir,
 	}
 	if path == "" {
 		return s, nil
@@ -162,6 +177,7 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 		return nil, err
 	}
 	if len(data) == 0 {
+		s.confirmParentDirDurability()
 		return s, nil
 	}
 	if err := json.Unmarshal(data, &s.state); err != nil {
@@ -173,7 +189,16 @@ func OpenWithCipher(path string, cph secret.Cipher) (*Store, error) {
 	s.ensureMaps()
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
+	s.confirmParentDirDurability()
 	return s, nil
+}
+
+func (s *Store) confirmParentDirDurability() {
+	syncParentDir := s.syncParentDir
+	if syncParentDir == nil {
+		syncParentDir = syncDir
+	}
+	s.durabilityDegraded = syncParentDir(filepath.Dir(s.path)) != nil
 }
 
 // EnableRuntimeBoltHotStore moves high-churn runtime collections to a
@@ -337,48 +362,49 @@ func monitorResultPersistenceKey(monitorID, nodeID string) string {
 
 func emptyState() State {
 	return State{
-		Users:           map[string]model.User{},
-		Tokens:          map[string]model.Token{},
-		Nodes:           map[string]model.Node{},
-		Tasks:           map[string]model.Task{},
-		KV:              map[string]model.KVEntry{},
-		PluginSecrets:   map[string]model.KVEntry{},
-		Static:          map[string]model.StaticObject{},
-		StorageBuckets:  map[string]model.StorageBucket{},
-		StorageBindings: map[string]model.StorageBinding{},
-		StorageTokens:   map[string]model.StorageAccessToken{},
-		Workers:         map[string]model.WorkerScript{},
-		Plugins:         map[string]model.PluginInstallation{},
-		Approvals:       map[string]model.Approval{},
-		Sessions:        map[string]auth.Session{},
-		DDNS:            map[string]model.DDNSProfile{},
-		Monitors:        map[string]model.Monitor{},
-		MonResults:      map[string][]model.MonitorResult{},
-		LogSources:      map[string]model.LogSource{},
-		NotifyChannels:  map[string]model.NotifyChannel{},
-		NotifyRules:     map[string]model.NotifyRule{},
-		Tunnels:         map[string]model.TunnelProfile{},
-		MachineProfiles: map[string]model.MachineProfile{},
-		MachineVendors:  map[string]model.MachineVendor{},
-		NFTInputs:       map[string]model.NFTInputs{},
-		SecurityGroups:  map[string]model.SecurityGroup{},
-		GuardZones:      map[string]model.GuardZone{},
-		GuardBindings:   map[string]model.NodeGuardBinding{},
-		DNSDeployments:  map[string]model.DNSDeployment{},
-		NetPolicies:     map[string]model.NetPolicy{},
-		Groups:          map[string]model.Group{},
-		GroupPolicies:   map[string]model.GroupNetPolicy{},
-		GeoRouting:      map[string]model.GeoRouting{},
-		AgentUpdates:    map[string]model.AgentUpdatePolicy{},
-		ProxyInbounds:   map[string]model.ProxyInbound{},
-		ProxyUsers:      map[string]model.ProxyUser{},
-		ProxyProfiles:   map[string]model.ProxyNodeProfile{},
-		ProxyUsage:      map[string]model.ProxyUsageSnapshot{},
-		TOTPChallenges:  map[string]auth.TOTPChallenge{},
-		OIDCProviders:   map[string]model.OIDCProvider{},
-		OIDCIdentities:  map[string]model.OIDCIdentity{},
-		OIDCAuthStates:  map[string]auth.OIDCAuthState{},
-		WebAuthnCreds:   map[string]auth.WebAuthnCredential{},
+		Users:                 map[string]model.User{},
+		Tokens:                map[string]model.Token{},
+		Nodes:                 map[string]model.Node{},
+		Tasks:                 map[string]model.Task{},
+		KV:                    map[string]model.KVEntry{},
+		PluginSecrets:         map[string]model.KVEntry{},
+		Static:                map[string]model.StaticObject{},
+		StorageBuckets:        map[string]model.StorageBucket{},
+		StorageBindings:       map[string]model.StorageBinding{},
+		StorageTokens:         map[string]model.StorageAccessToken{},
+		Workers:               map[string]model.WorkerScript{},
+		Plugins:               map[string]model.PluginInstallation{},
+		Approvals:             map[string]model.Approval{},
+		Sessions:              map[string]auth.Session{},
+		DDNS:                  map[string]model.DDNSProfile{},
+		Monitors:              map[string]model.Monitor{},
+		MonResults:            map[string][]model.MonitorResult{},
+		LogSources:            map[string]model.LogSource{},
+		NotifyChannels:        map[string]model.NotifyChannel{},
+		NotifyRules:           map[string]model.NotifyRule{},
+		Tunnels:               map[string]model.TunnelProfile{},
+		MachineProfiles:       map[string]model.MachineProfile{},
+		MachineVendors:        map[string]model.MachineVendor{},
+		NFTInputs:             map[string]model.NFTInputs{},
+		SecurityGroups:        map[string]model.SecurityGroup{},
+		GuardZones:            map[string]model.GuardZone{},
+		GuardBindings:         map[string]model.NodeGuardBinding{},
+		GuardRealitySnapshots: map[string]GuardRealitySnapshot{},
+		DNSDeployments:        map[string]model.DNSDeployment{},
+		NetPolicies:           map[string]model.NetPolicy{},
+		Groups:                map[string]model.Group{},
+		GroupPolicies:         map[string]model.GroupNetPolicy{},
+		GeoRouting:            map[string]model.GeoRouting{},
+		AgentUpdates:          map[string]model.AgentUpdatePolicy{},
+		ProxyInbounds:         map[string]model.ProxyInbound{},
+		ProxyUsers:            map[string]model.ProxyUser{},
+		ProxyProfiles:         map[string]model.ProxyNodeProfile{},
+		ProxyUsage:            map[string]model.ProxyUsageSnapshot{},
+		TOTPChallenges:        map[string]auth.TOTPChallenge{},
+		OIDCProviders:         map[string]model.OIDCProvider{},
+		OIDCIdentities:        map[string]model.OIDCIdentity{},
+		OIDCAuthStates:        map[string]auth.OIDCAuthState{},
+		WebAuthnCreds:         map[string]auth.WebAuthnCredential{},
 
 		WebAuthnChallenges: map[string]auth.WebAuthnChallenge{},
 	}
@@ -468,6 +494,9 @@ func (st *State) ensureMaps() {
 	if st.GuardBindings == nil {
 		st.GuardBindings = map[string]model.NodeGuardBinding{}
 	}
+	if st.GuardRealitySnapshots == nil {
+		st.GuardRealitySnapshots = map[string]GuardRealitySnapshot{}
+	}
 	if st.DNSDeployments == nil {
 		st.DNSDeployments = map[string]model.DNSDeployment{}
 	}
@@ -527,35 +556,52 @@ func (s *Store) ensureMaps() {
 }
 
 func (s *Store) Save() error {
+	_, err := s.persistState(s.jsonPersistState())
+	return err
+}
+
+// persistState writes the supplied state without changing the live read model.
+// Callers that need commit-style publication can persist a staged copy and
+// install it in s.state only after this returns successfully.
+func (s *Store) persistState(st State) (committed bool, err error) {
 	start := time.Now()
-	var err error
 	defer func() {
 		telemetry.ObserveStoreSave(time.Since(start), err)
 	}()
 	if s.path == "" {
-		return nil
+		return true, nil
 	}
 	// 0o700: this directory holds only the server's private state file and,
 	// in the auto-generate case, the master key. It must match the 0o700 used
 	// by secret.generateKeyFile so neither path can widen the other (MkdirAll
 	// is a no-op once the directory exists, so the first creator's mode wins).
 	if err = os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
-		return err
+		return false, err
 	}
-	persist, err := encryptedState(s.jsonPersistState(), s.cipher)
+	persist, err := encryptedState(st, s.cipher)
 	if err != nil {
-		return fmt.Errorf("encrypt state: %w", err)
+		return false, fmt.Errorf("encrypt state: %w", err)
 	}
 	data, err := json.MarshalIndent(persist, "", "  ")
 	if err != nil {
-		return err
+		return false, err
 	}
-	err = syncedAtomicWrite(s.path, data, 0o600)
-	return err
+	syncParentDir := s.syncParentDir
+	if syncParentDir == nil {
+		syncParentDir = syncDir
+	}
+	committed, err = syncedAtomicWriteStatus(s.path, data, 0o600, syncParentDir)
+	if committed {
+		s.durabilityDegraded = err != nil
+	}
+	return committed, err
 }
 
 func (s *Store) jsonPersistState() State {
-	st := s.state
+	return s.jsonPersistStateFrom(s.state)
+}
+
+func (s *Store) jsonPersistStateFrom(st State) State {
 	if s.runtimeBoltHot == nil {
 		return st
 	}
@@ -567,13 +613,17 @@ func (s *Store) jsonPersistState() State {
 	return st
 }
 
-// ReadyCheck verifies that the in-memory state is initialized and can still be
-// serialized with the configured at-rest cipher. It does not write to disk or
-// return state contents; callers use it for readiness probes.
+// ReadyCheck verifies that persistence has no unresolved directory-sync
+// failure and that the in-memory state can still be serialized with the
+// configured at-rest cipher. It does not write to disk or return state
+// contents; callers use it for readiness probes.
 func (s *Store) ReadyCheck() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureMaps()
+	if s.durabilityDegraded {
+		return errStoreDurabilityDegraded
+	}
 	if s.path != "" {
 		if _, err := os.Stat(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("stat state file: %w", err)
@@ -602,16 +652,23 @@ func (s *Store) ReadyCheck() error {
 // For the primary state file that holds all credentials/secrets, that window is
 // total data loss, so we close it the same way the audit WAL already does.
 func syncedAtomicWrite(path string, data []byte, perm os.FileMode) error {
+	_, err := syncedAtomicWriteStatus(path, data, perm, syncDir)
+	return err
+}
+
+// syncedAtomicWriteStatus reports whether rename crossed the commit point even
+// when the following parent-directory fsync fails.
+func syncedAtomicWriteStatus(path string, data []byte, perm os.FileMode, syncParentDir func(string) error) (bool, error) {
 	tmp := path + ".tmp"
 	if err := writeSyncedFile(tmp, data, perm); err != nil {
 		os.Remove(tmp)
-		return err
+		return false, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
-		return err
+		return false, err
 	}
-	return syncDir(filepath.Dir(path))
+	return true, syncParentDir(filepath.Dir(path))
 }
 
 // writeSyncedFile writes data to path (creating/truncating) and fsyncs the file

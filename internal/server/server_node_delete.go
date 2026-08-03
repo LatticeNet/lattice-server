@@ -40,6 +40,7 @@ type nodeDeleteSummary struct {
 	Groups                   int    `json:"groups"`
 	Approvals                int    `json:"approvals"`
 	Tunnels                  int    `json:"tunnels"`
+	GuardRealitySnapshots    int    `json:"guard_reality_snapshots"`
 	TerminalSessions         int    `json:"terminal_sessions"`    // closed (delete) / active (plan)
 	ProxyDriftCleared        int    `json:"proxy_drift_cleared"`  // 0/1
 	LogStorePurged           int    `json:"log_store_purged"`     // delete only
@@ -57,7 +58,7 @@ func newNodeDeleteSummary(nodeID, name string, mutated bool, r store.NodeCascade
 		AgentUpdatePolicies: r.AgentUpdatePolicies, ProxyNodeProfiles: r.ProxyNodeProfiles,
 		ProxyUsageSnapshots: r.ProxyUsageSnapshots, MonitorsStripped: r.MonitorsStripped,
 		MonitorResults: r.MonitorResults, LogSources: r.LogSources, Groups: r.Groups,
-		Approvals: r.Approvals, Tunnels: r.Tunnels,
+		Approvals: r.Approvals, Tunnels: r.Tunnels, GuardRealitySnapshots: r.GuardRealitySnapshots,
 	}
 }
 
@@ -191,31 +192,32 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 		Action: "node.delete",
 		Scope:  "node:admin",
 		Metadata: map[string]string{
-			"node_name":           name,
-			"tasks_stripped":      strconv.Itoa(summary.TasksStripped),
-			"tasks_deleted":       strconv.Itoa(summary.TasksDeleted),
-			"task_results":        strconv.Itoa(summary.TaskResults),
-			"ddns":                strconv.Itoa(summary.DDNSProfiles),
-			"machine_profiles":    strconv.Itoa(summary.MachineProfiles),
-			"nft":                 strconv.Itoa(summary.NFTInputs),
-			"dns_deployments":     strconv.Itoa(summary.DNSDeployments),
-			"net_policies":        strconv.Itoa(summary.NetPolicies),
-			"net_peer_rules":      strconv.Itoa(summary.NetPeerRulesStripped),
-			"group_policy_rules":  strconv.Itoa(summary.GroupPolicyRulesStripped),
-			"geo_stripped":        strconv.Itoa(summary.GeoRoutingStripped),
-			"geo_deleted":         strconv.Itoa(summary.GeoRoutingDeleted),
-			"agent_updates":       strconv.Itoa(summary.AgentUpdatePolicies),
-			"proxy_profiles":      strconv.Itoa(summary.ProxyNodeProfiles),
-			"proxy_usage":         strconv.Itoa(summary.ProxyUsageSnapshots),
-			"monitors_stripped":   strconv.Itoa(summary.MonitorsStripped),
-			"monitor_results":     strconv.Itoa(summary.MonitorResults),
-			"log_sources":         strconv.Itoa(summary.LogSources),
-			"groups":              strconv.Itoa(summary.Groups),
-			"approvals":           strconv.Itoa(summary.Approvals),
-			"tunnels":             strconv.Itoa(summary.Tunnels),
-			"terminal_sessions":   strconv.Itoa(summary.TerminalSessions),
-			"proxy_drift_cleared": strconv.Itoa(summary.ProxyDriftCleared),
-			"log_purge_errors":    strconv.Itoa(summary.LogStorePurgeErrs),
+			"node_name":               name,
+			"tasks_stripped":          strconv.Itoa(summary.TasksStripped),
+			"tasks_deleted":           strconv.Itoa(summary.TasksDeleted),
+			"task_results":            strconv.Itoa(summary.TaskResults),
+			"ddns":                    strconv.Itoa(summary.DDNSProfiles),
+			"machine_profiles":        strconv.Itoa(summary.MachineProfiles),
+			"nft":                     strconv.Itoa(summary.NFTInputs),
+			"dns_deployments":         strconv.Itoa(summary.DNSDeployments),
+			"net_policies":            strconv.Itoa(summary.NetPolicies),
+			"net_peer_rules":          strconv.Itoa(summary.NetPeerRulesStripped),
+			"group_policy_rules":      strconv.Itoa(summary.GroupPolicyRulesStripped),
+			"geo_stripped":            strconv.Itoa(summary.GeoRoutingStripped),
+			"geo_deleted":             strconv.Itoa(summary.GeoRoutingDeleted),
+			"agent_updates":           strconv.Itoa(summary.AgentUpdatePolicies),
+			"proxy_profiles":          strconv.Itoa(summary.ProxyNodeProfiles),
+			"proxy_usage":             strconv.Itoa(summary.ProxyUsageSnapshots),
+			"monitors_stripped":       strconv.Itoa(summary.MonitorsStripped),
+			"monitor_results":         strconv.Itoa(summary.MonitorResults),
+			"log_sources":             strconv.Itoa(summary.LogSources),
+			"groups":                  strconv.Itoa(summary.Groups),
+			"approvals":               strconv.Itoa(summary.Approvals),
+			"tunnels":                 strconv.Itoa(summary.Tunnels),
+			"guard_reality_snapshots": strconv.Itoa(summary.GuardRealitySnapshots),
+			"terminal_sessions":       strconv.Itoa(summary.TerminalSessions),
+			"proxy_drift_cleared":     strconv.Itoa(summary.ProxyDriftCleared),
+			"log_purge_errors":        strconv.Itoa(summary.LogStorePurgeErrs),
 		},
 	})
 

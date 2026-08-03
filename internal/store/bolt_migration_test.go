@@ -3,6 +3,7 @@ package store
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +14,23 @@ import (
 func seedMigrationState(now time.Time) State {
 	st := emptyState()
 	st.Users["u1"] = model.User{ID: "u1", Username: "admin", TOTPSecret: totpPlain, CreatedAt: now}
-	st.Nodes["node-a"] = model.Node{ID: "node-a", Name: "Node A", TokenHash: "node-token-hash", CreatedAt: now}
+	st.Nodes["node-a"] = model.Node{ID: "node-a", LatticeIdentityUUID: "generation-a", Name: "Node A", TokenHash: "node-token-hash", CreatedAt: now}
+	st.GuardRealitySnapshots["node-a"] = GuardRealitySnapshot{
+		Reality: model.GuardNodeReality{
+			NodeID: "node-a",
+			Listeners: []model.GuardListener{{
+				Protocol: "tcp", Port: 443, Address: "2001:db8::10", Process: "edge-proxy",
+			}},
+			Interfaces: []model.GuardInterface{{
+				Name: "ens3", Addresses: []string{"2001:db8::10/128", "2001:db8::11/128"}, Up: true,
+			}},
+			ManagedSHA:    strings.Repeat("a", 64),
+			ForeignTables: []string{"inet docker", "inet podman"},
+			NFTVersion:    "nftables v1.0.9",
+			CollectedAt:   now.Add(123456789 * time.Nanosecond),
+		},
+		ReceivedAt: now.Add(987654321 * time.Nanosecond),
+	}
 	st.DDNS["d1"] = model.DDNSProfile{ID: "d1", Name: "dns", Provider: "cloudflare", CFAPIToken: cfTokenPlain}
 	st.NotifyChannels["ch1"] = model.NotifyChannel{ID: "ch1", Name: "tg", Kind: "telegram", Config: map[string]string{"bot_token": botTokenPlain}}
 	st.OIDCProviders["oidc"] = model.OIDCProvider{ID: "oidc", DisplayName: "OIDC", ClientID: "client-id", ClientSecret: "oidc-secret", CreatedAt: now}
@@ -31,7 +48,8 @@ func TestMigrateJSONToBoltAndExportBack(t *testing.T) {
 	c := testCipher(t)
 	now := time.Unix(1_700_000_001, 0).UTC()
 
-	if err := WriteJSONState(jsonPath, seedMigrationState(now), c, MigrationOptions{}); err != nil {
+	want := seedMigrationState(now)
+	if err := WriteJSONState(jsonPath, want, c, MigrationOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	rawJSON, err := os.ReadFile(jsonPath)
@@ -70,6 +88,9 @@ func TestMigrateJSONToBoltAndExportBack(t *testing.T) {
 	if got.Groups["grp1"].Members[0] != "node-a" || got.GroupPolicies["gnp1"].Rules[0].Ports[0] != 443 {
 		t.Fatalf("migrated group state did not recover: %+v %+v", got.Groups["grp1"], got.GroupPolicies["gnp1"])
 	}
+	if !reflect.DeepEqual(got.GuardRealitySnapshots["node-a"], want.GuardRealitySnapshots["node-a"]) {
+		t.Fatalf("migrated guard reality did not recover:\n got=%+v\nwant=%+v", got.GuardRealitySnapshots["node-a"], want.GuardRealitySnapshots["node-a"])
+	}
 
 	if err := ExportBoltToJSON(boltPath, exportPath, c, MigrationOptions{}); err != nil {
 		t.Fatal(err)
@@ -87,6 +108,9 @@ func TestMigrateJSONToBoltAndExportBack(t *testing.T) {
 	}
 	if back.Nodes["node-a"].Name != "Node A" || len(back.Audit) != 1 || back.NotifyChannels["ch1"].Config["bot_token"] != botTokenPlain || back.Groups["grp1"].Name != "Edge" || back.GroupPolicies["gnp1"].ScopeGroupID != "grp1" {
 		t.Fatalf("exported JSON did not round-trip: %+v", back)
+	}
+	if !reflect.DeepEqual(back.GuardRealitySnapshots["node-a"], want.GuardRealitySnapshots["node-a"]) {
+		t.Fatalf("exported guard reality did not round-trip:\n got=%+v\nwant=%+v", back.GuardRealitySnapshots["node-a"], want.GuardRealitySnapshots["node-a"])
 	}
 }
 

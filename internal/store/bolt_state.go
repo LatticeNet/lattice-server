@@ -49,6 +49,7 @@ var (
 	boltBucketMachineProfiles = []byte("machine_profiles")
 	boltBucketMachineVendors  = []byte("machine_vendors")
 	boltBucketNFTInputs       = []byte("nft_inputs")
+	boltBucketGuardReality    = []byte("guard_reality_snapshots")
 	boltBucketDNSDeployments  = []byte("dns_deployments")
 	boltBucketNetPolicies     = []byte("net_policies")
 	boltBucketGroups          = []byte("groups")
@@ -92,6 +93,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketMachineProfiles,
 	boltBucketMachineVendors,
 	boltBucketNFTInputs,
+	boltBucketGuardReality,
 	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
 	boltBucketGroups,
@@ -268,6 +270,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketNFTInputs, persist.NFTInputs); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketGuardReality, persist.GuardRealitySnapshots); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketDNSDeployments, persist.DNSDeployments); err != nil {
 			return err
 		}
@@ -414,6 +419,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketNFTInputs, st.NFTInputs); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketGuardReality, st.GuardRealitySnapshots); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketDNSDeployments, st.DNSDeployments); err != nil {

@@ -3,6 +3,10 @@ package server
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func TestSharePathFromRequest(t *testing.T) {
@@ -49,5 +53,70 @@ func TestShareSlugRejectsPathSyntax(t *testing.T) {
 		if !shareSlugRe.MatchString(good) {
 			t.Fatalf("slug %q was rejected", good)
 		}
+	}
+}
+
+func newShareTestServer(t *testing.T) (*Server, *store.Store) {
+	t.Helper()
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv, st
+}
+
+func mustUpsertShare(t *testing.T, st *store.Store, share model.SubscriptionShare) {
+	t.Helper()
+	if err := st.UpsertSubscriptionShare(share); err != nil {
+		t.Fatalf("upsert share %s: %v", share.ID, err)
+	}
+}
+
+// Every rejection reason must be the same nothing. A caller able to tell them
+// apart would learn which of its guesses was a real token.
+func TestResolveShareRejectionsAreIndistinguishable(t *testing.T) {
+	s, st := newShareTestServer(t)
+	now := time.Now().UTC()
+	past := now.Add(-time.Hour)
+
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "a", Slug: "team", Token: strings.Repeat("a", 32), Enabled: true})
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "b", Slug: "off", Token: strings.Repeat("b", 32), Enabled: false})
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "c", Slug: "old", Token: strings.Repeat("c", 32), Enabled: true, ExpiresAt: &past})
+
+	if _, ok := s.resolveShare("team", strings.Repeat("a", 32), now); !ok {
+		t.Fatal("valid share did not resolve")
+	}
+	for _, tc := range []struct{ name, slug, token string }{
+		{"unknown token", "team", strings.Repeat("z", 32)},
+		{"right token wrong slug", "wrong", strings.Repeat("a", 32)},
+		{"disabled share", "off", strings.Repeat("b", 32)},
+		{"expired share", "old", strings.Repeat("c", 32)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := s.resolveShare(tc.slug, tc.token, now); ok {
+				t.Fatalf("%s resolved; every rejection must look the same", tc.name)
+			}
+		})
+	}
+}
+
+// A share whose expiry is in the future still resolves; the boundary is
+// exclusive at the instant of expiry.
+func TestResolveShareExpiryBoundary(t *testing.T) {
+	s, st := newShareTestServer(t)
+	now := time.Now().UTC()
+	at := now
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "a", Slug: "team", Token: strings.Repeat("a", 32), Enabled: true, ExpiresAt: &at})
+	if _, ok := s.resolveShare("team", strings.Repeat("a", 32), now); ok {
+		t.Fatal("a share expiring exactly now still resolved")
+	}
+	future := now.Add(time.Minute)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "b", Slug: "live", Token: strings.Repeat("b", 32), Enabled: true, ExpiresAt: &future})
+	if _, ok := s.resolveShare("live", strings.Repeat("b", 32), now); !ok {
+		t.Fatal("a share expiring in the future did not resolve")
 	}
 }

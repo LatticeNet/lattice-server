@@ -166,6 +166,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.ProxyUsers = proxyUsers
 
+	subscriptionShares := make(map[string]model.SubscriptionShare, len(st.SubscriptionShares))
+	for id, share := range st.SubscriptionShares {
+		enc, err := encryptSubscriptionShareRecord(id, share, c)
+		if err != nil {
+			return State{}, err
+		}
+		subscriptionShares[id] = enc
+	}
+	out.SubscriptionShares = subscriptionShares
+
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
 		rid := recordID(id, authState.State)
@@ -323,6 +333,16 @@ func decryptState(st *State, c secret.Cipher) error {
 		proxyUsers[id] = dec
 	}
 	st.ProxyUsers = proxyUsers
+
+	subscriptionShares := make(map[string]model.SubscriptionShare, len(st.SubscriptionShares))
+	for id, share := range st.SubscriptionShares {
+		dec, err := decryptSubscriptionShareRecord(id, share, c)
+		if err != nil {
+			return err
+		}
+		subscriptionShares[id] = dec
+	}
+	st.SubscriptionShares = subscriptionShares
 
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
@@ -749,6 +769,32 @@ func decryptProxyUserRecord(id string, u model.ProxyUser, c secret.Cipher) (mode
 	u.Password = password
 	u.SubToken = subToken
 	return u, nil
+}
+
+// encryptSubscriptionShareRecord seals a share's token. The token is a bearer
+// credential for an unauthenticated public URL, so it belongs in the same class
+// as the proxy-user subscription token sealed above. Slug is deliberately left in
+// the clear: it is a label that already appears in reverse-proxy access logs, and
+// sealing it would imply a secrecy it does not have.
+func encryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c secret.Cipher) (model.SubscriptionShare, error) {
+	token, err := c.Encrypt(share.Token)
+	if err != nil {
+		return model.SubscriptionShare{}, fmt.Errorf("encrypt subscription share %s token: %w", id, err)
+	}
+	share.Token = token
+	return share, nil
+}
+
+func decryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c secret.Cipher) (model.SubscriptionShare, error) {
+	if !c.Enabled() && secret.IsEnvelope(share.Token) {
+		return model.SubscriptionShare{}, lostMasterKeyError()
+	}
+	token, err := c.Decrypt(share.Token)
+	if err != nil {
+		return model.SubscriptionShare{}, fmt.Errorf("decrypt subscription share %s token: %w", id, err)
+	}
+	share.Token = token
+	return share, nil
 }
 
 func encryptOIDCAuthStateRecord(id string, authState auth.OIDCAuthState, c secret.Cipher) (auth.OIDCAuthState, error) {

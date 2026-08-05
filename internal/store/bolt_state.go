@@ -58,6 +58,7 @@ var (
 	boltBucketAgentUpdates    = []byte("agent_updates")
 	boltBucketProxyInbounds   = []byte("proxy_inbounds")
 	boltBucketProxyUsers      = []byte("proxy_users")
+	boltBucketSubShares       = []byte("subscription_shares")
 	boltBucketProxyProfiles   = []byte("proxy_profiles")
 	boltBucketProxyUsage      = []byte("proxy_usage")
 	boltBucketTOTPChallenges  = []byte("totp_challenges")
@@ -102,6 +103,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketAgentUpdates,
 	boltBucketProxyInbounds,
 	boltBucketProxyUsers,
+	boltBucketSubShares,
 	boltBucketProxyProfiles,
 	boltBucketProxyUsage,
 	boltBucketTOTPChallenges,
@@ -297,6 +299,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketProxyUsers, persist.ProxyUsers); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketSubShares, persist.SubscriptionShares); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketProxyProfiles, persist.ProxyProfiles); err != nil {
 			return err
 		}
@@ -446,6 +451,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketProxyUsers, st.ProxyUsers); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketSubShares, st.SubscriptionShares); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketProxyProfiles, st.ProxyProfiles); err != nil {
@@ -2349,6 +2357,35 @@ func (bs *BoltStateStore) DeleteProxyUser(id string) error {
 			return err
 		}
 		return deleteRecord(tx, boltBucketProxyUsers, id)
+	})
+}
+
+// UpsertSubscriptionShare writes one share record. The token is sealed by the
+// same cipher pass the proxy-user record uses, so a bolt file lifted on its own
+// carries no usable subscription URL.
+func (bs *BoltStateStore) UpsertSubscriptionShare(share model.SubscriptionShare) error {
+	share.UpdatedAt = time.Now().UTC()
+	if share.CreatedAt.IsZero() {
+		share.CreatedAt = share.UpdatedAt
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		enc, err := encryptSubscriptionShareRecord(share.ID, share, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketSubShares, share.ID, enc)
+	})
+}
+
+func (bs *BoltStateStore) DeleteSubscriptionShare(id string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketSubShares, id)
 	})
 }
 

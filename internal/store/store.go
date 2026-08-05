@@ -54,6 +54,7 @@ type State struct {
 	// over GET /api/kv by any principal holding kv:read. A secret must have neither
 	// property, so it gets its own map, its own cipher pass, and no HTTP handler.
 	PluginSecrets         map[string]model.KVEntry            `json:"plugin_secrets"`
+	SubscriptionShares    map[string]model.SubscriptionShare  `json:"subscription_shares"`
 	Static                map[string]model.StaticObject       `json:"static"`
 	StorageBuckets        map[string]model.StorageBucket      `json:"storage_buckets"`
 	StorageBindings       map[string]model.StorageBinding     `json:"storage_bindings"`
@@ -368,6 +369,7 @@ func emptyState() State {
 		Tasks:                 map[string]model.Task{},
 		KV:                    map[string]model.KVEntry{},
 		PluginSecrets:         map[string]model.KVEntry{},
+		SubscriptionShares:    map[string]model.SubscriptionShare{},
 		Static:                map[string]model.StaticObject{},
 		StorageBuckets:        map[string]model.StorageBucket{},
 		StorageBindings:       map[string]model.StorageBinding{},
@@ -428,6 +430,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.PluginSecrets == nil {
 		st.PluginSecrets = map[string]model.KVEntry{}
+	}
+	if st.SubscriptionShares == nil {
+		st.SubscriptionShares = map[string]model.SubscriptionShare{}
 	}
 	if st.Static == nil {
 		st.Static = map[string]model.StaticObject{}
@@ -610,6 +615,11 @@ func (s *Store) jsonPersistStateFrom(st State) State {
 	st.ProxyUsers = map[string]model.ProxyUser{}
 	st.ProxyProfiles = map[string]model.ProxyNodeProfile{}
 	st.ProxyUsage = map[string]model.ProxyUsageSnapshot{}
+	// Shares are read on every public subscription fetch and written whenever one
+	// is created or rotated. They belong on the record-level path for the same
+	// reason proxy users do: keeping them here would put a hot read behind a file
+	// that is rewritten in full and fsynced on every unrelated state write.
+	st.SubscriptionShares = map[string]model.SubscriptionShare{}
 	return st
 }
 

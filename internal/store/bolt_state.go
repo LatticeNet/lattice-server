@@ -59,6 +59,7 @@ var (
 	boltBucketProxyInbounds   = []byte("proxy_inbounds")
 	boltBucketProxyUsers      = []byte("proxy_users")
 	boltBucketSubShares       = []byte("subscription_shares")
+	boltBucketSubSnapshots    = []byte("subscription_snapshots")
 	boltBucketProxyProfiles   = []byte("proxy_profiles")
 	boltBucketProxyUsage      = []byte("proxy_usage")
 	boltBucketTOTPChallenges  = []byte("totp_challenges")
@@ -104,6 +105,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketProxyInbounds,
 	boltBucketProxyUsers,
 	boltBucketSubShares,
+	boltBucketSubSnapshots,
 	boltBucketProxyProfiles,
 	boltBucketProxyUsage,
 	boltBucketTOTPChallenges,
@@ -302,6 +304,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketSubShares, persist.SubscriptionShares); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketSubSnapshots, persist.SubscriptionSnapshots); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketProxyProfiles, persist.ProxyProfiles); err != nil {
 			return err
 		}
@@ -454,6 +459,9 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 			return err
 		}
 		if err := readMap(tx, boltBucketSubShares, st.SubscriptionShares); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketSubSnapshots, st.SubscriptionSnapshots); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketProxyProfiles, st.ProxyProfiles); err != nil {
@@ -2386,6 +2394,28 @@ func (bs *BoltStateStore) DeleteSubscriptionShare(id string) error {
 			return err
 		}
 		return deleteRecord(tx, boltBucketSubShares, id)
+	})
+}
+
+// UpsertSubscriptionSnapshot writes one provider payload. Snapshots are not
+// sealed: they are public subscription content the provider already served over
+// the network, and sealing them would cost a cipher pass per refresh for no
+// secret.
+func (bs *BoltStateStore) UpsertSubscriptionSnapshot(key string, snap model.SubscriptionSnapshot) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketSubSnapshots, key, snap)
+	})
+}
+
+func (bs *BoltStateStore) DeleteSubscriptionSnapshot(key string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketSubSnapshots, key)
 	})
 }
 

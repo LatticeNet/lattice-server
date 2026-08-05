@@ -149,111 +149,6 @@ type proxyUsageApplyResult struct {
 	CollectorStatus string `json:"collector_status,omitempty"`
 }
 
-func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
-		return
-	}
-	token, ok := subscriptionTokenFromPath(r.URL.Path)
-	tokenHash := proxySubTokenAuditHash(token)
-	if !ok {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			Action:   "proxy.subscription.fetch",
-			Decision: "deny",
-			Reason:   "invalid subscription token path",
-			Metadata: map[string]string{"token_sha256": tokenHash},
-		})
-		writeError(w, http.StatusNotFound, errors.New("subscription not found"))
-		return
-	}
-	format, err := normalizeProxySubscriptionFormat(r.URL.Query().Get("format"))
-	if err != nil {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			Action:   "proxy.subscription.fetch",
-			Decision: "deny",
-			Reason:   "invalid subscription format",
-			Metadata: map[string]string{"token_sha256": tokenHash},
-		})
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	user, found, duplicate := s.proxyUserBySubToken(token)
-	if duplicate {
-		s.logger.Printf("proxy subscription: duplicate sub_token hash %s; refusing public subscription", tokenHash)
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			Action:   "proxy.subscription.fetch",
-			Decision: "deny",
-			Reason:   "duplicate subscription token",
-			Metadata: map[string]string{"token_sha256": tokenHash},
-		})
-		writeError(w, http.StatusNotFound, errors.New("subscription not found"))
-		return
-	}
-	if !found {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			Action:   "proxy.subscription.fetch",
-			Decision: "deny",
-			Reason:   "subscription token not found",
-			Metadata: map[string]string{"token_sha256": tokenHash},
-		})
-		writeError(w, http.StatusNotFound, errors.New("subscription not found"))
-		return
-	}
-
-	endpoints, warnings, err := proxycore.VLESSRealityEndpoints(user, s.proxySubscriptionProfiles(), s.store.ProxyInbounds(), proxycore.SubscriptionOptions{Now: s.now()})
-	if err != nil {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			ActorID:  user.ID,
-			Action:   "proxy.subscription.fetch",
-			Decision: "deny",
-			Reason:   "subscription render failed",
-			Metadata: map[string]string{"token_sha256": tokenHash, "user_id": user.ID},
-		})
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	body, contentType, err := proxySubscriptionBody(format, endpoints)
-	if err != nil {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			ActorID:  user.ID,
-			Action:   "proxy.subscription.fetch",
-			Decision: "deny",
-			Reason:   "subscription encode failed",
-			Metadata: map[string]string{"token_sha256": tokenHash, "user_id": user.ID},
-		})
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if contentType == "" {
-		contentType = "text/plain; charset=utf-8"
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Subscription-Userinfo", proxycore.SubscriptionUserinfo(user))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
-	s.recordRequestAudit(r, model.AuditEvent{
-		ID:       id.New("audit"),
-		ActorID:  user.ID,
-		Action:   "proxy.subscription.fetch",
-		Decision: "allow",
-		Metadata: map[string]string{
-			"token_sha256":  tokenHash,
-			"user_id":       user.ID,
-			"format":        format,
-			"link_count":    strconv.Itoa(len(endpoints)),
-			"warning_count": strconv.Itoa(len(warnings)),
-		},
-	})
-}
-
 func proxySubscriptionBody(format string, endpoints []proxycore.VLESSRealityEndpoint) ([]byte, string, error) {
 	links := make([]string, 0, len(endpoints))
 	for _, endpoint := range endpoints {
@@ -273,17 +168,6 @@ func proxySubscriptionBody(format string, endpoints []proxycore.VLESSRealityEndp
 	default:
 		return nil, "", errors.New("unsupported subscription format")
 	}
-}
-
-func subscriptionTokenFromPath(value string) (string, bool) {
-	if !strings.HasPrefix(value, "/sub/") {
-		return "", false
-	}
-	token := strings.TrimPrefix(value, "/sub/")
-	if token == "" || strings.Contains(token, "/") || !proxySubTokenRe.MatchString(token) {
-		return token, false
-	}
-	return token, true
 }
 
 func normalizeProxySubscriptionFormat(value string) (string, error) {

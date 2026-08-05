@@ -1,6 +1,9 @@
 package server
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -119,4 +122,115 @@ func TestResolveShareExpiryBoundary(t *testing.T) {
 	if _, ok := s.resolveShare("live", strings.Repeat("b", 32), now); !ok {
 		t.Fatal("a share expiring in the future did not resolve")
 	}
+}
+
+func shareRequest(path, ua string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if ua != "" {
+		req.Header.Set("User-Agent", ua)
+	}
+	return req
+}
+
+// This is the single most destructive way the endpoint can fail: a proxy client
+// that receives an empty but successful subscription deletes every node it had.
+// A core proxy-user source with no eligible inbound renders zero endpoints, which
+// is exactly that situation arriving through a legitimate path.
+func TestSubscriptionShareNeverServesEmptyBodyWith200(t *testing.T) {
+	s, st := newShareTestServer(t)
+	if err := st.UpsertProxyUser(model.ProxyUser{ID: "u1", Name: "u1", UUID: "uuid", SubToken: "unused"}); err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	mustUpsertShare(t, st, model.SubscriptionShare{
+		ID: "s1", Slug: "team", Token: strings.Repeat("a", 32), Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourceCoreProxyUser, ProxyUserID: "u1"},
+	})
+
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest("/sub/team/"+strings.Repeat("a", 32), "Surge/2000"))
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("empty render returned 200 with body %q; a client would wipe its nodes", rec.Body.String())
+	}
+	if rec.Code < 500 {
+		t.Fatalf("status = %d, want a 5xx for an internal failure", rec.Code)
+	}
+}
+
+func TestSubscriptionShareUnknownTokenIs404(t *testing.T) {
+	s, st := newShareTestServer(t)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: strings.Repeat("a", 32), Enabled: true})
+
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest("/sub/team/"+strings.Repeat("z", 32), "Surge/2000"))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+// A valid token behind the wrong slug must be byte-identical to an unknown
+// token, response body included.
+func TestSubscriptionShareWrongSlugMatchesUnknownTokenExactly(t *testing.T) {
+	s, st := newShareTestServer(t)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: strings.Repeat("a", 32), Enabled: true})
+
+	wrongSlug := httptest.NewRecorder()
+	s.handleSubscriptionShare(wrongSlug, shareRequest("/sub/other/"+strings.Repeat("a", 32), "Surge/2000"))
+
+	unknown := httptest.NewRecorder()
+	s.handleSubscriptionShare(unknown, shareRequest("/sub/other/"+strings.Repeat("z", 32), "Surge/2000"))
+
+	if wrongSlug.Code != unknown.Code {
+		t.Fatalf("status differs: wrong slug %d, unknown token %d", wrongSlug.Code, unknown.Code)
+	}
+	// request_id is deliberately unique per request and says nothing about the
+	// token, so it is normalized away; everything else must match exactly.
+	if got, want := stripRequestID(wrongSlug.Body.String()), stripRequestID(unknown.Body.String()); got != want {
+		t.Fatalf("body differs:\nwrong slug: %q\nunknown:    %q", got, want)
+	}
+}
+
+func TestSubscriptionShareRejectsNonGET(t *testing.T) {
+	s, st := newShareTestServer(t)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: strings.Repeat("a", 32), Enabled: true})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sub/team/"+strings.Repeat("a", 32), nil)
+	s.handleSubscriptionShare(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}
+
+// No audit event for this endpoint may ever contain the raw token.
+func TestSubscriptionShareAuditNeverCarriesTheRawToken(t *testing.T) {
+	s, st := newShareTestServer(t)
+	token := strings.Repeat("a", 32)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true})
+
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest("/sub/team/"+token, "Surge/2000"))
+
+	events := st.AuditEvents()
+	if len(events) == 0 {
+		t.Fatal("no audit event recorded")
+	}
+	for _, ev := range events {
+		for k, v := range ev.Metadata {
+			if strings.Contains(v, token) {
+				t.Fatalf("audit metadata %q carried the raw token: %q", k, v)
+			}
+		}
+		if strings.Contains(ev.Reason, token) {
+			t.Fatalf("audit reason carried the raw token: %q", ev.Reason)
+		}
+	}
+}
+
+var requestIDInBody = regexp.MustCompile(`"request_id":"[^"]*"`)
+
+func stripRequestID(body string) string {
+	return requestIDInBody.ReplaceAllString(body, `"request_id":"<normalized>"`)
 }

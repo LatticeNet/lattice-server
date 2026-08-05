@@ -19,7 +19,11 @@ type subscriptionCacheEntry struct {
 	key         subscriptionCacheKey
 	body        []byte
 	contentType string
-	expiresAt   time.Time
+	// userinfo is the provider's traffic header. It travels with the body rather
+	// than in a parallel map so a cache hit can never serve one client's body
+	// with another's remaining-quota figures.
+	userinfo  string
+	expiresAt time.Time
 }
 
 // subscriptionCache keeps rendered subscription bodies for a short time so a
@@ -52,26 +56,26 @@ func newSubscriptionCache(max int, ttl time.Duration) *subscriptionCache {
 	}
 }
 
-func (c *subscriptionCache) Get(key subscriptionCacheKey, now time.Time) ([]byte, string, bool) {
+func (c *subscriptionCache) Get(key subscriptionCacheKey, now time.Time) ([]byte, string, string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.entries[key]
 	if !ok {
-		return nil, "", false
+		return nil, "", "", false
 	}
 	entry := el.Value.(*subscriptionCacheEntry)
 	if !now.Before(entry.expiresAt) {
 		c.removeElement(el)
-		return nil, "", false
+		return nil, "", "", false
 	}
 	c.order.MoveToFront(el)
-	return entry.body, entry.contentType, true
+	return entry.body, entry.contentType, entry.userinfo, true
 }
 
 // Put ignores an empty body. The endpoint refuses to serve one, so letting it
 // into the cache would create a path back to the exact response that makes a
 // client delete every node it had.
-func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentType string, now time.Time) {
+func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentType, userinfo string, now time.Time) {
 	if len(body) == 0 {
 		return
 	}
@@ -84,6 +88,7 @@ func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentTy
 		key:         key,
 		body:        body,
 		contentType: contentType,
+		userinfo:    userinfo,
 		expiresAt:   now.Add(c.ttl),
 	})
 	c.entries[key] = el

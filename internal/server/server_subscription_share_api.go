@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -132,6 +133,8 @@ func (s *Server) handleSubscriptionShareItem(w http.ResponseWriter, r *http.Requ
 	switch {
 	case action == "rotate" && r.Method == http.MethodPost:
 		s.rotateSubscriptionShare(w, share, p)
+	case action == "refresh" && r.Method == http.MethodPost:
+		s.refreshSubscriptionShare(w, r, share, p)
 	case action == "" && r.Method == http.MethodDelete:
 		if err := s.store.DeleteSubscriptionShare(share.ID); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -180,6 +183,41 @@ func (s *Server) rotateSubscriptionShare(w http.ResponseWriter, share model.Subs
 	})
 	stored, _ := s.store.SubscriptionShare(share.ID)
 	writeJSON(w, http.StatusOK, shareViewOf(stored))
+}
+
+// refreshSubscriptionShare forces a provider fetch now rather than waiting for
+// the lazy refresh a client poll would trigger. It reports what happened rather
+// than only whether it succeeded: a refresh that failed but still has a usable
+// snapshot is a different situation from one that has nothing, and the operator
+// needs to tell them apart.
+func (s *Server) refreshSubscriptionShare(w http.ResponseWriter, r *http.Request, share model.SubscriptionShare, p principal) {
+	if share.Source.Kind != model.ShareSourcePlugin {
+		writeError(w, http.StatusBadRequest, errors.New("only a plugin-sourced share has a provider to refresh"))
+		return
+	}
+	snap, err := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, true)
+	if err != nil {
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID: id.New("audit"), Action: auditActionSubscriptionFetch, Scope: "proxy:admin", Decision: "deny",
+			Reason:   "manual refresh failed with no snapshot to fall back to",
+			Metadata: map[string]string{"share_id": share.ID, "slug": share.Slug},
+		})
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	// A forced refresh always invalidates: the whole point is to make the next
+	// fetch see new content, and a cached body would hide it.
+	s.subscriptionCache.InvalidateShare(share.ID)
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID: id.New("audit"), Action: auditActionSubscriptionFetch, Scope: "proxy:admin", Decision: "allow",
+		Metadata: map[string]string{"share_id": share.ID, "slug": share.Slug, "stale": fmt.Sprintf("%t", snap.FetchError != "")},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"fetched_at": snap.FetchedAt,
+		"bytes":      len(snap.Raw),
+		"stale":      snap.FetchError != "",
+		"error":      snap.FetchError,
+	})
 }
 
 func validateShareSource(source model.ShareSource) error {

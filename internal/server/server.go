@@ -187,6 +187,10 @@ type Server struct {
 	emitNotify func(title, body string)
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
+	// subscriptionCache holds rendered public subscription bodies for a short
+	// time. It exists so a client poll does not re-enter a plugin - and boot a
+	// JavaScript VM - on every fetch.
+	subscriptionCache *subscriptionCache
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First
@@ -392,6 +396,7 @@ func New(opts Options) (*Server, error) {
 		build:                 build,
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
+		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
 		now:                   func() time.Time { return time.Now().UTC() },
 		userLoginFail:         make(map[string]*loginFailBucket),
 		proxyDrift:            make(map[string]proxyDriftState),
@@ -934,7 +939,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
 	mux.HandleFunc("/api/network/approvals/reject", s.withAuth("network:apply", s.handleRejectApproval))
 	mux.HandleFunc("/api/network/approvals/dismiss", s.withAuth("network:apply", s.handleDismissApproval))
-	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleProxySubscription))
+	mux.HandleFunc("/api/subscription-shares", s.withAuth("proxy:admin", s.handleSubscriptionShares))
+	mux.HandleFunc("/api/subscription-shares/", s.withAuth("proxy:admin", s.handleSubscriptionShareItem))
+	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleSubscriptionShare))
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
 	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
 	mux.HandleFunc("/api/agent/proxy-usage", s.withAgentLimit(s.handleAgentProxyUsage))

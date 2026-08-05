@@ -90,8 +90,17 @@ var capabilityRisk = map[string]string{
 	"netpolicy:admin":      RiskHost,
 	"node:admin":           RiskHost,
 	"static:write":         RiskHost,
-	"task:run":             RiskHost,
-	"tunnel:admin":         RiskHost,
+	// subscription:serve lets a plugin produce the BODY of a subscription the
+	// core serves on an unauthenticated public URL. It grants no route, no port,
+	// no listener, no response header and no access to the share's token - the
+	// core keeps all of that. It is host-risk and deliberately absent from
+	// hostRiskExemptForNonSystem: what the plugin returns is what a proxy client
+	// consumes, so it must come from a trusted publisher and a system plugin. A
+	// general http:serve capability was rejected for handing token checking and
+	// rate limiting to plugin code.
+	"subscription:serve": RiskHost,
+	"task:run":           RiskHost,
+	"tunnel:admin":       RiskHost,
 	// Inter-plugin RPC (design-09 §F). rpc:expose lets a plugin register a
 	// callable service; rpc:call lets a plugin invoke another plugin's service
 	// through the broker. Both are host-risk (system-only, signed in prod): a

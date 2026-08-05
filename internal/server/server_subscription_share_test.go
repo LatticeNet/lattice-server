@@ -152,8 +152,10 @@ func TestSubscriptionShareNeverServesEmptyBodyWith200(t *testing.T) {
 	if rec.Code == http.StatusOK {
 		t.Fatalf("empty render returned 200 with body %q; a client would wipe its nodes", rec.Body.String())
 	}
-	if rec.Code < 500 {
-		t.Fatalf("status = %d, want a 5xx for an internal failure", rec.Code)
+	// And not a 5xx: an internal-error status would confirm the token was valid
+	// and only the content empty. See TestEverySubscriptionRejectionIsByteIdentical.
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want the same 404 every other rejection returns", rec.Code)
 	}
 }
 
@@ -199,8 +201,8 @@ func TestSubscriptionShareRejectsNonGET(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/sub/team/"+strings.Repeat("a", 32), nil)
 	s.handleSubscriptionShare(rec, req)
 
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 — a 405 would confirm the path exists", rec.Code)
 	}
 }
 

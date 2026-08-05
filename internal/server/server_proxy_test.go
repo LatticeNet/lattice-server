@@ -692,13 +692,17 @@ func TestProxySubscriptionRejectsUnknownMethodsFormatsAndDuplicateTokens(t *test
 	}
 	post := doJSON(t, handler, http.MethodPost, subURL, "", nil, "")
 	post.Body.Close()
-	if post.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("subscription POST should 405, got %d", post.StatusCode)
+	// A 405 would confirm the path exists, so a wrong method answers like a
+	// wrong path.
+	if post.StatusCode != http.StatusNotFound {
+		t.Fatalf("subscription POST should be indistinguishable from an unknown path, got %d", post.StatusCode)
 	}
 	badFormat := doJSON(t, handler, http.MethodGet, subURL+"?format=xml", "", nil, "")
 	badFormat.Body.Close()
-	if badFormat.StatusCode != http.StatusBadRequest {
-		t.Fatalf("bad subscription format should 400, got %d", badFormat.StatusCode)
+	// A 400 here would have said the token was valid, which is the one fact the
+	// token exists to keep.
+	if badFormat.StatusCode != http.StatusNotFound {
+		t.Fatalf("a bad format must not reveal that the token was valid, got %d", badFormat.StatusCode)
 	}
 
 	sameUserUpdate := doJSON(t, handler, http.MethodPost, "/api/proxy/users", `{
@@ -769,8 +773,10 @@ func TestProxySubscriptionOmitsInactiveUsersAndUnappliedProfiles(t *testing.T) {
 	if inactive.StatusCode == http.StatusOK {
 		t.Fatal("an unapplied profile produced a 200; a client would wipe its nodes")
 	}
-	if inactive.StatusCode < 500 {
-		t.Fatalf("status = %d, want a 5xx", inactive.StatusCode)
+	// Not a 5xx either: an internal-error status would tell a prober the token
+	// was real and the content merely empty.
+	if inactive.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want the same 404 an unknown token gets", inactive.StatusCode)
 	}
 
 	profile, ok := st.ProxyNodeProfile("node-a")
@@ -794,8 +800,8 @@ func TestProxySubscriptionOmitsInactiveUsersAndUnappliedProfiles(t *testing.T) {
 	// that must not reach the client as a successful empty subscription.
 	disabled := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
 	defer disabled.Body.Close()
-	if disabled.StatusCode == http.StatusOK {
-		t.Fatal("a disabled user produced a 200; a client would wipe its nodes")
+	if disabled.StatusCode != http.StatusNotFound {
+		t.Fatalf("a disabled user must answer like an unknown path, got %d", disabled.StatusCode)
 	}
 }
 

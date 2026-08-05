@@ -19,10 +19,6 @@ import (
 // auditActionShareFetch names the public subscription fetch in the audit log.
 const auditActionShareFetch = "subscription.share.fetch"
 
-// errSubscriptionNotFound is the single message every rejection returns, so the
-// response body cannot distinguish them either.
-var errSubscriptionNotFound = errors.New("subscription not found")
-
 // shareSlugRe bounds the URL's first segment. It is narrow on purpose: the slug
 // carries no authority, so the only jobs it has are to be readable and to be
 // incapable of expressing path syntax.
@@ -94,42 +90,50 @@ const (
 // response headers. A source only ever produces bytes; it cannot see the token,
 // set a header, or decide a status code.
 func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request) {
+	// Every rejection below writes the same decoy and audits the real reason.
+	// The audit is where an operator finds out what happened; the response is
+	// where a prober finds out nothing.
+	deny := func(reason string, meta map[string]string) {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
+			Reason: reason, Metadata: meta,
+		})
+		s.writeSubscriptionDecoy(w)
+	}
+
 	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		// A 405 would confirm the path exists, so a wrong method is treated as a
+		// wrong path.
+		deny("method not allowed", map[string]string{"method": r.Method})
 		return
 	}
 	slug, token, ok := sharePathFromRequest(r.URL.Path)
 	tokenHash := proxySubTokenAuditHash(token)
 	if !ok {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
-			Reason: "invalid subscription path", Metadata: map[string]string{"token_sha256": tokenHash},
-		})
-		writeError(w, http.StatusNotFound, errSubscriptionNotFound)
+		deny("invalid subscription path", map[string]string{"token_sha256": tokenHash})
+		return
+	}
+
+	// Format is checked before the token is resolved, so a bad format cannot
+	// reveal whether the token was good.
+	requested := r.URL.Query().Get("format")
+	if strings.TrimSpace(requested) != "" && !subscriptionFormatIsKnown(requested) {
+		deny("invalid subscription format", map[string]string{"slug": slug, "token_sha256": tokenHash})
 		return
 	}
 
 	share, ok := s.resolveShare(slug, token, s.now())
 	if !ok {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
-			Reason: "subscription not found", Metadata: map[string]string{"slug": slug, "token_sha256": tokenHash},
-		})
-		writeError(w, http.StatusNotFound, errSubscriptionNotFound)
+		deny("subscription not found", map[string]string{"slug": slug, "token_sha256": tokenHash})
 		return
 	}
 
-	requested := r.URL.Query().Get("format")
 	if strings.TrimSpace(requested) == "" {
 		requested = share.DefaultFormat
 	}
 	format, err := normalizeProxySubscriptionFormat(requested)
 	if err != nil {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
-			Reason: "invalid subscription format", Metadata: map[string]string{"slug": slug, "token_sha256": tokenHash},
-		})
-		writeError(w, http.StatusBadRequest, err)
+		deny("invalid default subscription format", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 		return
 	}
 
@@ -138,26 +142,17 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 
 	body, contentType, userinfo, cached := s.subscriptionCache.Get(key, s.now())
 	if !cached {
-		rendered, err := s.renderShare(r.Context(), share, format, uaClass)
-		body, contentType, userinfo = rendered.Body, rendered.ContentType, rendered.Userinfo
-		if err != nil {
-			s.recordRequestAudit(r, model.AuditEvent{
-				ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
-				Reason: "render failed", Metadata: map[string]string{"slug": slug, "token_sha256": tokenHash},
-			})
-			writeError(w, http.StatusBadGateway, err)
+		rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass)
+		if renderErr != nil {
+			deny("render failed: "+renderErr.Error(), map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
-		// The rule this endpoint is built around: a proxy client that receives an
-		// empty but successful subscription deletes every node it had. Any internal
-		// failure must therefore reach the client as a failure, never as an empty
-		// success, so it keeps the configuration it already has.
+		body, contentType, userinfo = rendered.Body, rendered.ContentType, rendered.Userinfo
+		// A client that receives an empty but successful subscription deletes
+		// every node it had. Answering with the decoy keeps that from happening
+		// AND keeps the emptiness from confirming that the token was real.
 		if len(body) == 0 {
-			s.recordRequestAudit(r, model.AuditEvent{
-				ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
-				Reason: "empty render refused", Metadata: map[string]string{"slug": slug, "token_sha256": tokenHash},
-			})
-			writeError(w, http.StatusBadGateway, errors.New("subscription produced no content"))
+			deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
 		s.subscriptionCache.Put(key, body, contentType, userinfo, s.now())

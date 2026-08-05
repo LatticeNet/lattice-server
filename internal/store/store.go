@@ -53,43 +53,45 @@ type State struct {
 	// distinct collection from KV on purpose: KV is plaintext at rest AND readable
 	// over GET /api/kv by any principal holding kv:read. A secret must have neither
 	// property, so it gets its own map, its own cipher pass, and no HTTP handler.
-	PluginSecrets         map[string]model.KVEntry            `json:"plugin_secrets"`
-	Static                map[string]model.StaticObject       `json:"static"`
-	StorageBuckets        map[string]model.StorageBucket      `json:"storage_buckets"`
-	StorageBindings       map[string]model.StorageBinding     `json:"storage_bindings"`
-	StorageTokens         map[string]model.StorageAccessToken `json:"storage_tokens"`
-	Workers               map[string]model.WorkerScript       `json:"workers"`
-	Plugins               map[string]model.PluginInstallation `json:"plugins"`
-	Approvals             map[string]model.Approval           `json:"approvals"`
-	Sessions              map[string]auth.Session             `json:"sessions"`
-	DDNS                  map[string]model.DDNSProfile        `json:"ddns"`
-	Monitors              map[string]model.Monitor            `json:"monitors"`
-	MonResults            map[string][]model.MonitorResult    `json:"monitor_results"`
-	LogSources            map[string]model.LogSource          `json:"log_sources"`
-	NotifyChannels        map[string]model.NotifyChannel      `json:"notify_channels"`
-	NotifyRules           map[string]model.NotifyRule         `json:"notify_rules"`
-	Tunnels               map[string]model.TunnelProfile      `json:"tunnels"`
-	MachineProfiles       map[string]model.MachineProfile     `json:"machine_profiles"`
-	MachineVendors        map[string]model.MachineVendor      `json:"machine_vendors"`
-	NFTInputs             map[string]model.NFTInputs          `json:"nft_inputs"`
-	SecurityGroups        map[string]model.SecurityGroup      `json:"security_groups"`
-	GuardZones            map[string]model.GuardZone          `json:"guard_zones"`
-	GuardBindings         map[string]model.NodeGuardBinding   `json:"guard_bindings"`
-	GuardRealitySnapshots map[string]GuardRealitySnapshot     `json:"guard_reality_snapshots"`
-	DNSDeployments        map[string]model.DNSDeployment      `json:"dns_deployments"`
-	NetPolicies           map[string]model.NetPolicy          `json:"net_policies"`
-	Groups                map[string]model.Group              `json:"groups"`
-	GroupPolicies         map[string]model.GroupNetPolicy     `json:"group_policies"`
-	GeoRouting            map[string]model.GeoRouting         `json:"geo_routing"`
-	AgentUpdates          map[string]model.AgentUpdatePolicy  `json:"agent_updates"`
-	ProxyInbounds         map[string]model.ProxyInbound       `json:"proxy_inbounds"`
-	ProxyUsers            map[string]model.ProxyUser          `json:"proxy_users"`
-	ProxyProfiles         map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
-	ProxyUsage            map[string]model.ProxyUsageSnapshot `json:"proxy_usage"`
-	TOTPChallenges        map[string]auth.TOTPChallenge       `json:"totp_challenges"`
-	OIDCProviders         map[string]model.OIDCProvider       `json:"oidc_providers"`
-	OIDCIdentities        map[string]model.OIDCIdentity       `json:"oidc_identities"`
-	OIDCAuthStates        map[string]auth.OIDCAuthState       `json:"oidc_auth_states"`
+	PluginSecrets         map[string]model.KVEntry              `json:"plugin_secrets"`
+	SubscriptionShares    map[string]model.SubscriptionShare    `json:"subscription_shares"`
+	SubscriptionSnapshots map[string]model.SubscriptionSnapshot `json:"subscription_snapshots"`
+	Static                map[string]model.StaticObject         `json:"static"`
+	StorageBuckets        map[string]model.StorageBucket        `json:"storage_buckets"`
+	StorageBindings       map[string]model.StorageBinding       `json:"storage_bindings"`
+	StorageTokens         map[string]model.StorageAccessToken   `json:"storage_tokens"`
+	Workers               map[string]model.WorkerScript         `json:"workers"`
+	Plugins               map[string]model.PluginInstallation   `json:"plugins"`
+	Approvals             map[string]model.Approval             `json:"approvals"`
+	Sessions              map[string]auth.Session               `json:"sessions"`
+	DDNS                  map[string]model.DDNSProfile          `json:"ddns"`
+	Monitors              map[string]model.Monitor              `json:"monitors"`
+	MonResults            map[string][]model.MonitorResult      `json:"monitor_results"`
+	LogSources            map[string]model.LogSource            `json:"log_sources"`
+	NotifyChannels        map[string]model.NotifyChannel        `json:"notify_channels"`
+	NotifyRules           map[string]model.NotifyRule           `json:"notify_rules"`
+	Tunnels               map[string]model.TunnelProfile        `json:"tunnels"`
+	MachineProfiles       map[string]model.MachineProfile       `json:"machine_profiles"`
+	MachineVendors        map[string]model.MachineVendor        `json:"machine_vendors"`
+	NFTInputs             map[string]model.NFTInputs            `json:"nft_inputs"`
+	SecurityGroups        map[string]model.SecurityGroup        `json:"security_groups"`
+	GuardZones            map[string]model.GuardZone            `json:"guard_zones"`
+	GuardBindings         map[string]model.NodeGuardBinding     `json:"guard_bindings"`
+	GuardRealitySnapshots map[string]GuardRealitySnapshot       `json:"guard_reality_snapshots"`
+	DNSDeployments        map[string]model.DNSDeployment        `json:"dns_deployments"`
+	NetPolicies           map[string]model.NetPolicy            `json:"net_policies"`
+	Groups                map[string]model.Group                `json:"groups"`
+	GroupPolicies         map[string]model.GroupNetPolicy       `json:"group_policies"`
+	GeoRouting            map[string]model.GeoRouting           `json:"geo_routing"`
+	AgentUpdates          map[string]model.AgentUpdatePolicy    `json:"agent_updates"`
+	ProxyInbounds         map[string]model.ProxyInbound         `json:"proxy_inbounds"`
+	ProxyUsers            map[string]model.ProxyUser            `json:"proxy_users"`
+	ProxyProfiles         map[string]model.ProxyNodeProfile     `json:"proxy_profiles"`
+	ProxyUsage            map[string]model.ProxyUsageSnapshot   `json:"proxy_usage"`
+	TOTPChallenges        map[string]auth.TOTPChallenge         `json:"totp_challenges"`
+	OIDCProviders         map[string]model.OIDCProvider         `json:"oidc_providers"`
+	OIDCIdentities        map[string]model.OIDCIdentity         `json:"oidc_identities"`
+	OIDCAuthStates        map[string]auth.OIDCAuthState         `json:"oidc_auth_states"`
 	// WebAuthnCreds holds registered passkeys keyed by store record id. The public
 	// keys and credential ids are non-secret, so this map is persisted as-is (no
 	// at-rest envelope like Users/Sessions carry).
@@ -368,6 +370,8 @@ func emptyState() State {
 		Tasks:                 map[string]model.Task{},
 		KV:                    map[string]model.KVEntry{},
 		PluginSecrets:         map[string]model.KVEntry{},
+		SubscriptionShares:    map[string]model.SubscriptionShare{},
+		SubscriptionSnapshots: map[string]model.SubscriptionSnapshot{},
 		Static:                map[string]model.StaticObject{},
 		StorageBuckets:        map[string]model.StorageBucket{},
 		StorageBindings:       map[string]model.StorageBinding{},
@@ -428,6 +432,12 @@ func (st *State) ensureMaps() {
 	}
 	if st.PluginSecrets == nil {
 		st.PluginSecrets = map[string]model.KVEntry{}
+	}
+	if st.SubscriptionShares == nil {
+		st.SubscriptionShares = map[string]model.SubscriptionShare{}
+	}
+	if st.SubscriptionSnapshots == nil {
+		st.SubscriptionSnapshots = map[string]model.SubscriptionSnapshot{}
 	}
 	if st.Static == nil {
 		st.Static = map[string]model.StaticObject{}
@@ -610,6 +620,15 @@ func (s *Store) jsonPersistStateFrom(st State) State {
 	st.ProxyUsers = map[string]model.ProxyUser{}
 	st.ProxyProfiles = map[string]model.ProxyNodeProfile{}
 	st.ProxyUsage = map[string]model.ProxyUsageSnapshot{}
+	// Shares are read on every public subscription fetch and written whenever one
+	// is created or rotated. They belong on the record-level path for the same
+	// reason proxy users do: keeping them here would put a hot read behind a file
+	// that is rewritten in full and fsynced on every unrelated state write.
+	st.SubscriptionShares = map[string]model.SubscriptionShare{}
+	// Snapshots are provider payloads: potentially megabytes each, rewritten on
+	// every refresh. Keeping them in the JSON state would make every unrelated
+	// write pay for them.
+	st.SubscriptionSnapshots = map[string]model.SubscriptionSnapshot{}
 	return st
 }
 

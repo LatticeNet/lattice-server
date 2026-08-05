@@ -618,3 +618,21 @@ func TestVerifyManifestAllowUnsignedHostRiskOptOut(t *testing.T) {
 		t.Fatalf("opt-out should allow unsigned host-risk plugin, got %v", err)
 	}
 }
+
+func TestSubscriptionServeIsHostRiskAndSystemOnly(t *testing.T) {
+	risk, ok := capabilityRisk["subscription:serve"]
+	if !ok {
+		t.Fatal("subscription:serve is not a known capability")
+	}
+	if risk != RiskHost {
+		t.Fatalf("subscription:serve risk = %q, want %q", risk, RiskHost)
+	}
+	// Producing the body of an unauthenticated public URL is not something a
+	// third-party wasm plugin may do merely by being signed.
+	if hostRiskExemptForNonSystem["subscription:serve"] {
+		t.Fatal("subscription:serve must not be exempt from the system-only restriction")
+	}
+	if workerCapabilities["subscription:serve"] {
+		t.Fatal("workers must not be able to declare subscription:serve")
+	}
+}

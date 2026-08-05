@@ -51,8 +51,13 @@ import (
 )
 
 type Options struct {
-	Store *store.Store
-	WebFS fs.FS
+	// SubscriptionDecoy shapes the response every non-servable public
+	// subscription request receives. Its zero value is an empty-bodied 404, which
+	// a reverse proxy can replace with its own error page so /sub/<anything> and
+	// an unknown path are indistinguishable.
+	SubscriptionDecoy subscriptionDecoyOptions
+	Store             *store.Store
+	WebFS             fs.FS
 	// LogStore is the dedicated bounded log-line database (logs.db). Nil disables
 	// the log-ingestion feature: its endpoints return 503 and agents are told to
 	// tail nothing. Injected by main (opened beside the state file with the same
@@ -187,6 +192,14 @@ type Server struct {
 	emitNotify func(title, body string)
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
+	// subscriptionDecoy shapes the answer every non-servable subscription request
+	// receives, so an operator can make it byte-identical to what their reverse
+	// proxy returns for a path that does not exist.
+	subscriptionDecoy subscriptionDecoyOptions
+	// subscriptionCache holds rendered public subscription bodies for a short
+	// time. It exists so a client poll does not re-enter a plugin - and boot a
+	// JavaScript VM - on every fetch.
+	subscriptionCache *subscriptionCache
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First
@@ -392,6 +405,8 @@ func New(opts Options) (*Server, error) {
 		build:                 build,
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
+		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		subscriptionDecoy:     opts.SubscriptionDecoy,
 		now:                   func() time.Time { return time.Now().UTC() },
 		userLoginFail:         make(map[string]*loginFailBucket),
 		proxyDrift:            make(map[string]proxyDriftState),
@@ -934,7 +949,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/network/approvals/approve", s.withAuth("network:apply", s.handleApprove))
 	mux.HandleFunc("/api/network/approvals/reject", s.withAuth("network:apply", s.handleRejectApproval))
 	mux.HandleFunc("/api/network/approvals/dismiss", s.withAuth("network:apply", s.handleDismissApproval))
-	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleProxySubscription))
+	mux.HandleFunc("/api/subscription-shares", s.withAuth("proxy:admin", s.handleSubscriptionShares))
+	mux.HandleFunc("/api/subscription-shares/", s.withAuth("proxy:admin", s.handleSubscriptionShareItem))
+	mux.HandleFunc("/sub/", s.withSubscriptionLimit(s.handleSubscriptionShare))
 	mux.HandleFunc("/api/agent/hello", s.withAgentLimit(s.handleAgentHello))
 	mux.HandleFunc("/api/agent/metrics", s.withAgentLimit(s.handleAgentMetrics))
 	mux.HandleFunc("/api/agent/proxy-usage", s.withAgentLimit(s.handleAgentProxyUsage))
@@ -1156,7 +1173,14 @@ func (s *Server) withAgentLimit(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) withSubscriptionLimit(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.subLimiter.Allow(s.clientIP(r)) {
-			writeError(w, http.StatusTooManyRequests, errors.New("rate limited"))
+			// A 429 here would tell a prober that this path is specially rate
+			// limited, which is itself evidence that it exists. The limit still
+			// applies; it just refuses in the same voice as everything else.
+			s.recordRequestAudit(r, model.AuditEvent{
+				ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
+				Reason: "rate limited",
+			})
+			s.writeSubscriptionDecoy(w)
 			return
 		}
 		next(w, r)

@@ -221,12 +221,28 @@ func proxySubTokenAuditHash(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Server) proxySubscriptionURL(_ *http.Request, token string) string {
-	base := strings.TrimRight(s.publicURL, "/")
-	if base == "" {
-		return "/sub/" + url.PathEscape(token)
+// proxySubscriptionURL returns the public URL a proxy user is actually reachable
+// at, which is the URL of a SHARE pointing at them - not anything derived from
+// their own token.
+//
+// This distinction is the whole point of shares and it has a consequence worth
+// stating: rotating a user's sub token no longer changes public access, because
+// the share holds the credential the public URL carries. A user with no share is
+// not published at all, and this returns empty rather than a plausible-looking
+// address that would 404.
+func (s *Server) proxySubscriptionURL(_ *http.Request, userID string) string {
+	for _, share := range s.store.SubscriptionShares() {
+		if share.Source.Kind != model.ShareSourceCoreProxyUser || share.Source.ProxyUserID != userID {
+			continue
+		}
+		path := "/sub/" + url.PathEscape(share.Slug) + "/" + url.PathEscape(share.Token)
+		base := strings.TrimRight(s.publicURL, "/")
+		if base == "" {
+			return path
+		}
+		return base + path
 	}
-	return base + "/sub/" + url.PathEscape(token)
+	return ""
 }
 
 func (s *Server) handleProxyInbounds(w http.ResponseWriter, r *http.Request, p principal) {
@@ -459,9 +475,13 @@ func (s *Server) handleRotateProxyUserSubToken(w http.ResponseWriter, r *http.Re
 		},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
-		"user":             toProxyUserView(user),
-		"subscription_url": s.proxySubscriptionURL(r, token),
-		"token_sha256":     newHash,
+		"user": toProxyUserView(user),
+		// Empty unless a share publishes this user. Rotating the user token does
+		// not rotate that share: the share owns the public credential, and saying
+		// so through an empty field is better than implying otherwise.
+		"subscription_url":      s.proxySubscriptionURL(r, user.ID),
+		"rotates_public_access": false,
+		"token_sha256":          newHash,
 	})
 }
 

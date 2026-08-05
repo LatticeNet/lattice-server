@@ -176,6 +176,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
 		Metadata: map[string]string{
+			"share_id":     share.ID,
 			"slug":         slug,
 			"token_sha256": tokenHash,
 			"format":       format,

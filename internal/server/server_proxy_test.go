@@ -5,12 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func TestProxyInboundAndUserViewsHideSecrets(t *testing.T) {
@@ -497,6 +497,21 @@ func TestProxyPlanSupportsXrayApplyScript(t *testing.T) {
 	}
 }
 
+// publishProxyUserShare gives a proxy user a public URL. Since the single-segment
+// /sub/<token> form was removed, a user is only reachable through a share, so
+// every test that fetches a subscription has to create one first - which is the
+// same thing an operator now has to do.
+func publishProxyUserShare(t *testing.T, st *store.Store, userID, slug, token string) string {
+	t.Helper()
+	if err := st.UpsertSubscriptionShare(model.SubscriptionShare{
+		ID: "share-" + userID, Slug: slug, Token: token, Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourceCoreProxyUser, ProxyUserID: userID},
+	}); err != nil {
+		t.Fatalf("publish share for %s: %v", userID, err)
+	}
+	return "/sub/" + slug + "/" + token
+}
+
 func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
@@ -513,7 +528,8 @@ func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 	}
 
 	const token = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
-	plain := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=plain", "", nil, "")
+	subURL := publishProxyUserShare(t, st, "alice", "alice-team", token)
+	plain := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
 	defer plain.Body.Close()
 	if plain.StatusCode != http.StatusOK {
 		t.Fatalf("plain subscription failed: %d", plain.StatusCode)
@@ -546,7 +562,7 @@ func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 		}
 	}
 
-	encoded := doJSON(t, handler, http.MethodGet, "/sub/"+token, "", nil, "")
+	encoded := doJSON(t, handler, http.MethodGet, subURL, "", nil, "")
 	defer encoded.Body.Close()
 	if encoded.StatusCode != http.StatusOK {
 		t.Fatalf("base64 subscription failed: %d", encoded.StatusCode)
@@ -561,7 +577,7 @@ func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 		t.Fatalf("base64 decoded body mismatch:\ngot  %q\nwant %q", decoded, body)
 	}
 
-	singBox := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=sing-box", "", nil, "")
+	singBox := doJSON(t, handler, http.MethodGet, subURL+"?format=sing-box", "", nil, "")
 	defer singBox.Body.Close()
 	if singBox.StatusCode != http.StatusOK {
 		t.Fatalf("sing-box subscription failed: %d", singBox.StatusCode)
@@ -594,7 +610,7 @@ func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 		t.Fatalf("unexpected sing-box credentials: %+v", singBoxOut.Outbounds[0])
 	}
 
-	clash := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=clash-meta", "", nil, "")
+	clash := doJSON(t, handler, http.MethodGet, subURL+"?format=clash-meta", "", nil, "")
 	defer clash.Body.Close()
 	if clash.StatusCode != http.StatusOK {
 		t.Fatalf("clash subscription failed: %d", clash.StatusCode)
@@ -627,11 +643,11 @@ func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 	}
 
 	hash := proxySubTokenAuditHash(token)
-	if !auditMetadataSeen(st, "proxy.subscription.fetch", "token_sha256", hash) {
+	if !auditMetadataSeen(st, auditActionShareFetch, "token_sha256", hash) {
 		t.Fatalf("subscription fetch audit missing token hash: %+v", st.AuditEvents())
 	}
 	for _, ev := range st.AuditEvents() {
-		if ev.Action != "proxy.subscription.fetch" {
+		if ev.Action != auditActionShareFetch {
 			continue
 		}
 		if ev.Reason == token {
@@ -660,17 +676,26 @@ func TestProxySubscriptionRejectsUnknownMethodsFormatsAndDuplicateTokens(t *test
 	}
 
 	const token = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
-	unknown := doJSON(t, handler, http.MethodGet, "/sub/unknown-token-secret-abcdefghijklmnopqrstuvwxyz", "", nil, "")
+	subURL := publishProxyUserShare(t, st, "alice", "alice-team", token)
+
+	// A single-segment path is no longer a route at all, and an unknown token
+	// under a real slug is the ordinary not-found. Both must be 404.
+	legacy := doJSON(t, handler, http.MethodGet, "/sub/"+token, "", nil, "")
+	legacy.Body.Close()
+	if legacy.StatusCode != http.StatusNotFound {
+		t.Fatalf("the removed single-segment form should 404, got %d", legacy.StatusCode)
+	}
+	unknown := doJSON(t, handler, http.MethodGet, "/sub/alice-team/unknown-token-secret-abcdefghijklmnop", "", nil, "")
 	unknown.Body.Close()
 	if unknown.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown token should 404, got %d", unknown.StatusCode)
 	}
-	post := doJSON(t, handler, http.MethodPost, "/sub/"+token, "", nil, "")
+	post := doJSON(t, handler, http.MethodPost, subURL, "", nil, "")
 	post.Body.Close()
 	if post.StatusCode != http.StatusMethodNotAllowed {
 		t.Fatalf("subscription POST should 405, got %d", post.StatusCode)
 	}
-	badFormat := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=xml", "", nil, "")
+	badFormat := doJSON(t, handler, http.MethodGet, subURL+"?format=xml", "", nil, "")
 	badFormat.Body.Close()
 	if badFormat.StatusCode != http.StatusBadRequest {
 		t.Fatalf("bad subscription format should 400, got %d", badFormat.StatusCode)
@@ -711,10 +736,16 @@ func TestProxySubscriptionRejectsUnknownMethodsFormatsAndDuplicateTokens(t *test
 	if err := st.UpsertProxyUser(dirtyDuplicate); err != nil {
 		t.Fatal(err)
 	}
-	failClosed := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=plain", "", nil, "")
-	failClosed.Body.Close()
-	if failClosed.StatusCode != http.StatusNotFound {
-		t.Fatalf("dirty duplicate token should fail closed with 404, got %d", failClosed.StatusCode)
+	// A duplicated user sub_token used to make the public fetch fail closed,
+	// because the old endpoint resolved a user BY that token. A share resolves by
+	// its own token instead, so a duplicate among user tokens can no longer make
+	// one user's URL serve another's nodes - the ambiguity it guarded against is
+	// gone rather than unguarded. What must still hold is that the share resolves,
+	// so the response is anything but the 404 that means "no such subscription".
+	stillResolves := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
+	stillResolves.Body.Close()
+	if stillResolves.StatusCode == http.StatusNotFound {
+		t.Fatal("a duplicate among user sub tokens broke share resolution")
 	}
 }
 
@@ -725,15 +756,21 @@ func TestProxySubscriptionOmitsInactiveUsersAndUnappliedProfiles(t *testing.T) {
 	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
 
 	const token = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
-	inactive := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=plain", "", nil, "")
+	subURL := publishProxyUserShare(t, st, "alice", "alice-team", token)
+
+	// BEHAVIOUR CHANGE: this used to answer 200 with an empty body. It now
+	// refuses, because a proxy client that receives an empty but successful
+	// subscription deletes every node it had - so "the profile is not applied
+	// yet" would arrive at the client as "you have no nodes, forget them all".
+	// A non-2xx leaves the client's existing configuration alone, which is the
+	// only safe answer while the fleet is still converging.
+	inactive := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
 	defer inactive.Body.Close()
-	if inactive.StatusCode != http.StatusOK {
-		t.Fatalf("unapplied profile should still return an empty subscription, got %d", inactive.StatusCode)
+	if inactive.StatusCode == http.StatusOK {
+		t.Fatal("an unapplied profile produced a 200; a client would wipe its nodes")
 	}
-	body := new(bytes.Buffer)
-	body.ReadFrom(inactive.Body)
-	if body.Len() != 0 {
-		t.Fatalf("unapplied profile should return an empty body, got %q", body.String())
+	if inactive.StatusCode < 500 {
+		t.Fatalf("status = %d, want a 5xx", inactive.StatusCode)
 	}
 
 	profile, ok := st.ProxyNodeProfile("node-a")
@@ -753,19 +790,16 @@ func TestProxySubscriptionOmitsInactiveUsersAndUnappliedProfiles(t *testing.T) {
 	if err := st.UpsertProxyUser(alice); err != nil {
 		t.Fatal(err)
 	}
-	disabled := doJSON(t, handler, http.MethodGet, "/sub/"+token+"?format=plain", "", nil, "")
+	// Same behaviour change as above: a disabled user renders no endpoints, and
+	// that must not reach the client as a successful empty subscription.
+	disabled := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
 	defer disabled.Body.Close()
-	if disabled.StatusCode != http.StatusOK {
-		t.Fatalf("disabled user should still return an empty subscription, got %d", disabled.StatusCode)
-	}
-	body.Reset()
-	body.ReadFrom(disabled.Body)
-	if body.Len() != 0 {
-		t.Fatalf("disabled user should return an empty body, got %q", body.String())
+	if disabled.StatusCode == http.StatusOK {
+		t.Fatal("a disabled user produced a 200; a client would wipe its nodes")
 	}
 }
 
-func TestProxyRotateSubscriptionTokenReturnsURLAndInvalidatesOldToken(t *testing.T) {
+func TestProxyRotateSubTokenDoesNotChangePublicAccess(t *testing.T) {
 	const publicURL = "https://lattice.example.test"
 	handler, st := newTestServerWithPublicURL(t, publicURL)
 	cookies, csrf := loginSession(t, handler)
@@ -780,22 +814,31 @@ func TestProxyRotateSubscriptionTokenReturnsURLAndInvalidatesOldToken(t *testing
 		t.Fatal(err)
 	}
 
-	const oldToken = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
-	oldSub := doJSON(t, handler, http.MethodGet, "/sub/"+oldToken+"?format=plain", "", nil, "")
-	oldSub.Body.Close()
-	if oldSub.StatusCode != http.StatusOK {
-		t.Fatalf("old token should be valid before rotation, got %d", oldSub.StatusCode)
+	// BEHAVIOUR CHANGE: a user's sub token used to BE the public credential, so
+	// rotating it changed the URL and killed the old one. A share now holds the
+	// public credential, so rotating the user token changes what is stored and
+	// nothing a client can see. Rotating public access is the share's rotate
+	// endpoint, which is a different operation on a different object.
+	const shareToken = "share-token-for-alice-abcdefghijklmnop"
+	subURL := publishProxyUserShare(t, st, "alice", "alice-team", shareToken)
+
+	before := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
+	before.Body.Close()
+	if before.StatusCode != http.StatusOK {
+		t.Fatalf("share should serve before rotation, got %d", before.StatusCode)
 	}
 
+	const oldToken = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
 	rotate := doJSON(t, handler, http.MethodPost, "/api/proxy/users/rotate-sub-token", `{"id":"alice"}`, cookies, csrf)
 	defer rotate.Body.Close()
 	if rotate.StatusCode != http.StatusOK {
 		t.Fatalf("rotate failed: %d", rotate.StatusCode)
 	}
 	var out struct {
-		User            proxyUserView `json:"user"`
-		SubscriptionURL string        `json:"subscription_url"`
-		TokenSHA256     string        `json:"token_sha256"`
+		User                proxyUserView `json:"user"`
+		SubscriptionURL     string        `json:"subscription_url"`
+		RotatesPublicAccess bool          `json:"rotates_public_access"`
+		TokenSHA256         string        `json:"token_sha256"`
 	}
 	if err := json.NewDecoder(rotate.Body).Decode(&out); err != nil {
 		t.Fatal(err)
@@ -803,42 +846,39 @@ func TestProxyRotateSubscriptionTokenReturnsURLAndInvalidatesOldToken(t *testing
 	if out.User.ID != "alice" || !out.User.HasSubToken {
 		t.Fatalf("bad rotated user view: %+v", out.User)
 	}
-	if out.SubscriptionURL == "" || !strings.HasPrefix(out.SubscriptionURL, publicURL+"/sub/") {
-		t.Fatalf("bad subscription url: %q", out.SubscriptionURL)
+	if out.RotatesPublicAccess {
+		t.Fatal("the response claims rotating a user token rotates public access")
 	}
-	if strings.Contains(out.SubscriptionURL, oldToken) {
-		t.Fatalf("rotated subscription url reused old token: %q", out.SubscriptionURL)
-	}
-	newToken := strings.TrimPrefix(out.SubscriptionURL, publicURL+"/sub/")
-	if !proxySubTokenRe.MatchString(newToken) {
-		t.Fatalf("new token has unexpected shape: %q", newToken)
-	}
-	if out.TokenSHA256 != proxySubTokenAuditHash(newToken) {
-		t.Fatalf("token hash mismatch: got %s want %s", out.TokenSHA256, proxySubTokenAuditHash(newToken))
-	}
-	if stored, ok := st.ProxyUser("alice"); !ok || stored.SubToken != newToken || stored.SubToken == oldToken {
-		t.Fatalf("stored token did not rotate: ok=%v user=%+v", ok, stored)
+	if out.SubscriptionURL != publicURL+subURL {
+		t.Fatalf("subscription_url = %q, want the share URL %q", out.SubscriptionURL, publicURL+subURL)
 	}
 
-	oldAgain := doJSON(t, handler, http.MethodGet, "/sub/"+oldToken+"?format=plain", "", nil, "")
-	oldAgain.Body.Close()
-	if oldAgain.StatusCode != http.StatusNotFound {
-		t.Fatalf("old token should be invalid after rotation, got %d", oldAgain.StatusCode)
+	stored, ok := st.ProxyUser("alice")
+	if !ok {
+		t.Fatal("alice missing after rotation")
 	}
-	newSub := doJSON(t, handler, http.MethodGet, "/sub/"+newToken+"?format=plain", "", nil, "")
-	newSub.Body.Close()
-	if newSub.StatusCode != http.StatusOK {
-		t.Fatalf("new token should fetch subscription, got %d", newSub.StatusCode)
+	if stored.SubToken == oldToken || stored.SubToken == "" {
+		t.Fatalf("stored token did not rotate: %q", stored.SubToken)
+	}
+	if out.TokenSHA256 != proxySubTokenAuditHash(stored.SubToken) {
+		t.Fatalf("token hash mismatch: got %s want %s", out.TokenSHA256, proxySubTokenAuditHash(stored.SubToken))
+	}
+
+	// The share URL is untouched by the rotation, and still serves.
+	after := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
+	after.Body.Close()
+	if after.StatusCode != http.StatusOK {
+		t.Fatalf("share stopped serving after an unrelated user-token rotation, got %d", after.StatusCode)
 	}
 
 	list := doJSON(t, handler, http.MethodGet, "/api/proxy/users", "", cookies, "")
 	defer list.Body.Close()
 	listBody := new(bytes.Buffer)
 	listBody.ReadFrom(list.Body)
-	if strings.Contains(listBody.String(), oldToken) || strings.Contains(listBody.String(), newToken) {
+	if strings.Contains(listBody.String(), oldToken) || strings.Contains(listBody.String(), stored.SubToken) {
 		t.Fatalf("proxy user list leaked subscription token: %s", listBody.String())
 	}
-	if !auditMetadataSeen(st, "proxy.user.rotate_sub_token", "new_token_sha256", proxySubTokenAuditHash(newToken)) {
+	if !auditMetadataSeen(st, "proxy.user.rotate_sub_token", "new_token_sha256", proxySubTokenAuditHash(stored.SubToken)) {
 		t.Fatalf("missing token rotate audit: %+v", st.AuditEvents())
 	}
 	for _, ev := range st.AuditEvents() {
@@ -846,45 +886,37 @@ func TestProxyRotateSubscriptionTokenReturnsURLAndInvalidatesOldToken(t *testing
 			continue
 		}
 		for key, value := range ev.Metadata {
-			if strings.Contains(key, oldToken) || strings.Contains(key, newToken) || strings.Contains(value, oldToken) || strings.Contains(value, newToken) {
+			if strings.Contains(key, oldToken) || strings.Contains(key, stored.SubToken) || strings.Contains(value, oldToken) || strings.Contains(value, stored.SubToken) {
 				t.Fatalf("raw token leaked into rotate audit metadata: %+v", ev.Metadata)
 			}
 		}
 	}
 }
 
-func TestProxyRotateSubscriptionTokenWithoutPublicURLReturnsRelativePath(t *testing.T) {
+// A user nobody has published has no public URL, and reporting an empty string
+// is the honest answer. The old behaviour synthesised one from the user's own
+// token, which now points at a route that does not exist.
+func TestProxyRotateSubTokenReportsNoURLForAnUnpublishedUser(t *testing.T) {
 	handler, _ := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
 	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/proxy/users/rotate-sub-token", strings.NewReader(`{"id":"alice"}`))
-	req.Host = "attacker.example"
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Lattice-CSRF", csrf)
-	for _, cookie := range cookies {
-		req.AddCookie(cookie)
-	}
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("rotate failed: %d body=%s", rec.Code, rec.Body.String())
+	rotate := doJSON(t, handler, http.MethodPost, "/api/proxy/users/rotate-sub-token", `{"id":"alice"}`, cookies, csrf)
+	defer rotate.Body.Close()
+	if rotate.StatusCode != http.StatusOK {
+		t.Fatalf("rotate failed: %d", rotate.StatusCode)
 	}
 	var out struct {
 		SubscriptionURL string `json:"subscription_url"`
 	}
-	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(rotate.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(out.SubscriptionURL, "/sub/") {
-		t.Fatalf("expected relative subscription path without public URL, got %q", out.SubscriptionURL)
-	}
-	if strings.Contains(out.SubscriptionURL, "attacker.example") {
-		t.Fatalf("subscription URL reflected request host: %q", out.SubscriptionURL)
+	if out.SubscriptionURL != "" {
+		t.Fatalf("an unpublished user reported a subscription URL: %q", out.SubscriptionURL)
 	}
 }
-
 func TestProxyUsageReportBaselinesAndRollsForward(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)

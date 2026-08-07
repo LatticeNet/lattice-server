@@ -238,11 +238,22 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 		bs.Close()
 		return err
 	}
+	// Whether the file still carries the two domains that just moved. The point
+	// of moving them is that state.json stops being rewritten with them in it,
+	// which only takes effect once the stale copy is actually dropped.
+	staleInJSON := len(s.state.KV) > 0 || len(s.state.Static) > 0
 	mergeRuntimeBoltHotState(&s.state, hot)
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	s.runtimeBoltHot = bs
 	s.runtimeBoltHotPath = path
+	if staleInJSON {
+		// Now that runtimeBoltHot is set, jsonPersistState excludes both domains,
+		// so this write is what removes them from the file. A failure here is not
+		// fatal — bolt already holds the entries and the migration flag is set,
+		// so the next successful write drops them instead.
+		_ = s.Save()
+	}
 	return nil
 }
 
@@ -295,6 +306,38 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			return err
 		}
 	}
+	// KV and Static are moving out of the JSON state. Entries written under the
+	// old behaviour live only there, so they are pushed across — without this
+	// they would vanish the moment the JSON copy stopped being read.
+	//
+	// Exactly once, and guarded by a flag rather than by "is bolt empty": the
+	// JSON file keeps its stale copy until the next write, so a second run would
+	// push back every entry deleted since the first one and resurrect it.
+	migrated, err := bs.KVStaticMigrated()
+	if err != nil {
+		return err
+	}
+	if !migrated {
+		for key, entry := range st.KV {
+			if _, ok := existing.KV[key]; ok {
+				continue
+			}
+			if err := bs.PutKV(entry); err != nil {
+				return err
+			}
+		}
+		for key, obj := range st.Static {
+			if _, ok := existing.Static[key]; ok {
+				continue
+			}
+			if err := bs.PutStatic(obj); err != nil {
+				return err
+			}
+		}
+		if err := bs.MarkKVStaticMigrated(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -326,6 +369,13 @@ func mergeRuntimeBoltHotState(dst *State, hot State) {
 	if len(hot.ProxyUsage) > 0 {
 		dst.ProxyUsage = hot.ProxyUsage
 	}
+	// Unconditional, unlike the domains above. Those fall back to the JSON copy
+	// when bolt is empty, which is right while a domain is still written to
+	// both. KV and Static are no longer written to the JSON state at all, so an
+	// empty bolt means empty — and taking the length as permission to keep the
+	// stale JSON copy would resurrect every entry ever deleted.
+	dst.KV = hot.KV
+	dst.Static = hot.Static
 	dst.ensureMaps()
 }
 
@@ -629,6 +679,15 @@ func (s *Store) jsonPersistStateFrom(st State) State {
 	// every refresh. Keeping them in the JSON state would make every unrelated
 	// write pay for them.
 	st.SubscriptionSnapshots = map[string]model.SubscriptionSnapshot{}
+	// KV and Static were the last two domains left in the JSON state that have
+	// a record-level path in bolt. The buckets existed and were populated by a
+	// whole-state import, but nothing wrote through to them and the merge on
+	// open discarded what it read — so the authoritative copy was here, and
+	// every plugin KV write and every uploaded object was rewritten and fsynced
+	// in full alongside unrelated state. `static` in particular is designed to
+	// hold file-sized content, which is the same argument that moved snapshots.
+	st.KV = map[string]model.KVEntry{}
+	st.Static = map[string]model.StaticObject{}
 	return st
 }
 
@@ -1415,6 +1474,9 @@ func (s *Store) PutKV(entry model.KVEntry) error {
 	defer s.mu.Unlock()
 	entry.UpdatedAt = time.Now().UTC()
 	s.state.KV[entry.Bucket+"/"+entry.Key] = entry
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.PutKV(entry)
+	}
 	return s.Save()
 }
 
@@ -1422,6 +1484,9 @@ func (s *Store) DeleteKV(bucket, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.state.KV, bucket+"/"+key)
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.DeleteKV(bucket, key)
+	}
 	return s.Save()
 }
 
@@ -1507,6 +1572,23 @@ func (s *Store) PutStatic(obj model.StaticObject) error {
 	obj.UpdatedAt = time.Now().UTC()
 	obj.Size = len(obj.Content)
 	s.state.Static[obj.Bucket+"/"+obj.Path] = obj
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.PutStatic(obj)
+	}
+	return s.Save()
+}
+
+// DeleteStatic removes one object. Static was write-only until now, which is
+// tolerable for a handful of hand-uploaded assets and is not tolerable once
+// something writes an object per record: without a delete, replacing a file's
+// generator script would leave every previous version behind.
+func (s *Store) DeleteStatic(bucket, objectPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.state.Static, bucket+"/"+objectPath)
+	if s.runtimeBoltHot != nil {
+		return s.runtimeBoltHot.DeleteStatic(bucket, objectPath)
+	}
 	return s.Save()
 }
 

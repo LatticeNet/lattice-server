@@ -21,8 +21,14 @@ import (
 const boltStateVersion = "1"
 
 var (
-	boltBucketMeta            = []byte("_meta")
-	boltKeyVersion            = []byte("version")
+	boltBucketMeta = []byte("_meta")
+	boltKeyVersion = []byte("version")
+	// boltKeyKVStaticMigrated records that KV and Static have been moved out of
+	// the JSON state. The move cannot be inferred from the buckets being
+	// non-empty: a store whose entries were all deleted looks identical to one
+	// that never migrated, and re-running the migration against the stale JSON
+	// copy would resurrect exactly those deletions.
+	boltKeyKVStaticMigrated   = []byte("kv_static_migrated")
 	boltBucketUsers           = []byte("users")
 	boltBucketTokens          = []byte("tokens")
 	boltBucketNodes           = []byte("nodes")
@@ -645,6 +651,41 @@ func (bs *BoltStateStore) PutKV(entry model.KVEntry) error {
 	})
 }
 
+// KVStaticMigrated reports whether the one-time move of KV and Static out of
+// the JSON state has already run against this store.
+func (bs *BoltStateStore) KVStaticMigrated() (bool, error) {
+	migrated := false
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		meta := tx.Bucket(boltBucketMeta)
+		if meta == nil {
+			return nil
+		}
+		migrated = meta.Get(boltKeyKVStaticMigrated) != nil
+		return nil
+	})
+	return migrated, err
+}
+
+// MarkKVStaticMigrated is written once the JSON entries have been copied across.
+func (bs *BoltStateStore) MarkKVStaticMigrated() error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		meta, err := tx.CreateBucketIfNotExists(boltBucketMeta)
+		if err != nil {
+			return err
+		}
+		return meta.Put(boltKeyKVStaticMigrated, []byte("1"))
+	})
+}
+
+func (bs *BoltStateStore) DeleteKV(bucket, key string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketKV, bucket+"/"+key)
+	})
+}
+
 func (bs *BoltStateStore) KV(bucket string) ([]model.KVEntry, error) {
 	entries := []model.KVEntry{}
 	err := bs.db.View(func(tx *bolt.Tx) error {
@@ -716,6 +757,18 @@ func (bs *BoltStateStore) PutStatic(obj model.StaticObject) error {
 			return err
 		}
 		return putRecord(tx, boltBucketStatic, obj.Bucket+"/"+obj.Path, obj)
+	})
+}
+
+// DeleteStatic removes one object. Static had no delete at all until files
+// began storing generator scripts here: without one, replacing a file's script
+// would leave the old bytes behind forever.
+func (bs *BoltStateStore) DeleteStatic(bucket, objectPath string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return deleteRecord(tx, boltBucketStatic, bucket+"/"+objectPath)
 	})
 }
 

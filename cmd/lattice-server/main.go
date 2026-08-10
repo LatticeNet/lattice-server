@@ -60,6 +60,7 @@ func main() {
 	var auditHeadWebhookToken string
 	var auditHeadInterval time.Duration
 	var taskExecDisabled bool
+	var approvalAutoRules string
 	var printVersion bool
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
@@ -86,6 +87,7 @@ func main() {
 	flag.StringVar(&auditHeadWebhookToken, "audit-head-webhook-token", env("LATTICE_AUDIT_HEAD_WEBHOOK_TOKEN", ""), "bearer token for -audit-head-webhook-url")
 	flag.DurationVar(&auditHeadInterval, "audit-head-interval", envDuration("LATTICE_AUDIT_HEAD_INTERVAL", 15*time.Minute), "audit head webhook shipping interval")
 	flag.BoolVar(&taskExecDisabled, "task-exec-disabled", env("LATTICE_TASK_EXEC_DISABLED", "") == "1", "server-side fleet kill switch: block new task queueing and agent task leases")
+	flag.StringVar(&approvalAutoRules, "approval-auto-rules", env("LATTICE_APPROVAL_AUTO_RULES", ""), "JSON array of approval auto-approve rules (empty keeps approvals fully manual)")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-server version and exit")
 	flag.Parse()
 	if printVersion {
@@ -196,6 +198,7 @@ func main() {
 			Interval:    auditHeadInterval,
 		},
 		TaskExecutionDisabled: taskExecDisabled,
+		ApprovalAutoRules:     approvalAutoRules,
 		Logger:                log.Default(),
 	})
 	if err != nil {

@@ -123,6 +123,10 @@ type Options struct {
 	// tasks are not queued and agents receive no task leases. Already leased
 	// task results are still accepted so in-flight work can report terminal state.
 	TaskExecutionDisabled bool
+	// ApprovalAutoRules is the operator's JSON-encoded auto-approve policy list
+	// (LATTICE_APPROVAL_AUTO_RULES). Empty keeps approvals fully manual — the
+	// default. Malformed input is logged and ignored, never fatal.
+	ApprovalAutoRules string
 	// RenewalReminderInterval controls the machine-renewal reminder scheduler.
 	// Zero uses the production default. DisableRenewalScheduler is intended for
 	// tests that need full control over reminder evaluation.
@@ -234,6 +238,9 @@ type Server struct {
 	// config, not persisted policy; restart with the flag/env cleared to re-enable
 	// queueing and leasing.
 	taskExecutionDisabled bool
+	// approvalAutoRules is the parsed auto-approve policy list. Nil (the
+	// default) keeps every approval manual.
+	approvalAutoRules []approvalAutoRule
 	// terminalBroker owns short-lived interactive terminal sessions. Sessions are
 	// intentionally in-memory only; a server restart forces operators to reopen.
 	terminalBroker *terminalBroker
@@ -364,6 +371,13 @@ func New(opts Options) (*Server, error) {
 	}
 	build := normalizeBuildInfo(opts.Build)
 	build.TaskExecutionDisabled = opts.TaskExecutionDisabled
+	approvalAutoRules, err := parseApprovalAutoRules(opts.ApprovalAutoRules)
+	if err != nil {
+		// Auto-approve is an operator opt-in; malformed policy must never block
+		// startup, so fall back to the zero-rule (fully manual) default.
+		opts.Logger.Printf("WARNING: ignoring approval auto-approve rules: %v", err)
+		approvalAutoRules = nil
+	}
 	s := &Server{
 		store:         opts.Store,
 		logStore:      opts.LogStore,
@@ -399,6 +413,7 @@ func New(opts Options) (*Server, error) {
 		agentReleaseRepo:      agentReleaseRepo,
 		auditHeadShipper:      auditHeadShipper,
 		taskExecutionDisabled: opts.TaskExecutionDisabled,
+		approvalAutoRules:     approvalAutoRules,
 		terminalBroker:        newTerminalBroker(),
 		terminalHub:           newTerminalHub(),
 		agentControlHub:       newAgentControlHub(),
@@ -416,6 +431,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if s.taskExecutionDisabled {
 		s.logger.Printf("WARNING: task execution fleet kill switch is enabled; new tasks will not queue and agents will receive no task leases")
+	}
+	if len(s.approvalAutoRules) > 0 {
+		s.logger.Printf("approval auto-approve: %d rule(s) active", len(s.approvalAutoRules))
 	}
 	s.emitNotify = s.notifyEvent
 	s.pluginRPC = plugin.NewRPCRegistry()
@@ -4621,7 +4639,8 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
 	}
-	if err := s.store.UpsertApproval(approval); err != nil {
+	approval, err = s.submitApproval(approval)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -4801,7 +4820,8 @@ func (s *Server) handleTunnelPlan(w http.ResponseWriter, r *http.Request, p prin
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
 	}
-	if err := s.store.UpsertApproval(approval); err != nil {
+	approval, err = s.submitApproval(approval)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -4852,7 +4872,8 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
 	}
-	if err := s.store.UpsertApproval(approval); err != nil {
+	approval, err = s.submitApproval(approval)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -5448,31 +5469,66 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	if !s.requireApprovalDecisionScopes(w, p, approval) {
 		return
 	}
-	if approval.Status != model.ApprovalPending {
-		writeJSON(w, http.StatusOK, toApprovalView(approval))
-		return
-	}
-	if approvalRequiresPlanHash(approval) && req.PlanSHA256 == "" {
-		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "plan_sha256 is required for this approval"))
-		return
-	}
-	if req.PlanSHA256 != "" {
-		sum := sha256.Sum256([]byte(approval.Plan))
-		if !strings.EqualFold(req.PlanSHA256, hex.EncodeToString(sum[:])) {
-			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, "plan changed since review; re-review before approving"))
+	updated, err := s.approveApprovalCore(p, approval, req.QueueApply, req.PlanSHA256)
+	if err != nil {
+		var decisionErr *approvalDecisionError
+		if errors.As(err, &decisionErr) {
+			if decisionErr.taskExecutionDisabled {
+				writeTaskExecutionDisabled(w)
+				return
+			}
+			writeError(w, decisionErr.status, decisionErr.err)
 			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toApprovalView(updated))
+}
+
+// approvalDecisionError pairs a failed approval decision with the HTTP
+// response the manual endpoint would have produced, so non-HTTP callers (the
+// auto-approve policy engine) share one decision path without losing response
+// fidelity at the endpoint.
+type approvalDecisionError struct {
+	status int
+	err    error
+	// taskExecutionDisabled selects the dedicated kill-switch response body.
+	taskExecutionDisabled bool
+}
+
+func (e *approvalDecisionError) Error() string { return e.err.Error() }
+
+// approveApprovalCore is the single decision path behind both the manual
+// approve endpoint and auto-approve policies. It re-validates the reviewed
+// plan (the plan_sha256 binding), re-checks plugin-specific freshness, marks
+// the approval approved, and optionally queues the apply task. Keeping one
+// implementation matters most for the hash binding: an approval must only
+// ever transition for the exact stored plan bytes, whichever entry point
+// drove the decision.
+func (s *Server) approveApprovalCore(p principal, approval model.Approval, queueApply bool, planSHA256 string) (model.Approval, error) {
+	if approval.Status != model.ApprovalPending {
+		// Already-decided approvals stay idempotent, matching the manual
+		// endpoint's retry semantics.
+		return approval, nil
+	}
+	if approvalRequiresPlanHash(approval) && planSHA256 == "" {
+		return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest, "plan_sha256 is required for this approval")}
+	}
+	if planSHA256 != "" {
+		sum := sha256.Sum256([]byte(approval.Plan))
+		if !strings.EqualFold(planSHA256, hex.EncodeToString(sum[:])) {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "plan changed since review; re-review before approving")}
 		}
 	}
 	if approval.Plugin == "nftpolicy" {
 		if err := s.requireCurrentNetPolicyApproval(approval); err != nil {
-			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
-			return
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
 	if approval.Plugin == proxyCorePlugin {
 		if err := s.requireCurrentProxyCoreApproval(approval); err != nil {
-			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
-			return
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
 	if approval.Plugin == singBoxLineUserPlugin {
@@ -5485,17 +5541,14 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
 			if errors.Is(err, errAgentUpdateApprovalStale) {
 				if rejectErr := s.rejectAgentUpdateApprovalWithReason(approval, err.Error(), s.now()); rejectErr != nil {
-					writeError(w, http.StatusInternalServerError, rejectErr)
-					return
+					return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: rejectErr}
 				}
-				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
-				return
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 			}
-			writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
-			return
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 		}
 	}
-	if req.QueueApply && s.taskExecutionDisabled {
+	if queueApply && s.taskExecutionDisabled {
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,
@@ -5505,8 +5558,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 			Reason:   errTaskExecutionDisabled.Error(),
 			Metadata: map[string]string{"approval_id": approval.ID},
 		})
-		writeTaskExecutionDisabled(w)
-		return
+		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(apiErrorTaskExecutionDisabled, errTaskExecutionDisabled.Error()), taskExecutionDisabled: true}
 	}
 	// A plugin operation (§9.3) is applied by its own artifact, not by a core apply
 	// script. This is the generic branch the spec asks for: no per-plugin case, no
@@ -5541,32 +5593,28 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	}
 
 	applyScript := ""
-	if req.QueueApply {
+	if queueApply {
 		switch approval.Plugin {
 		case "selfdns":
 			var err error
 			applyScript, err = selfdns.ApplyScriptFromPlan(approval.Plan)
 			if err != nil {
-				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, "selfdns plan is no longer applyable; re-plan before approving"))
-				return
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "selfdns plan is no longer applyable; re-plan before approving")}
 			}
 			if err := s.requireSelfDNSDeploymentForApproval(approval); err != nil {
-				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
-				return
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 			}
 		case proxyCorePlugin:
 			var err error
 			applyScript, err = s.proxyCoreApplyScript(approval)
 			if err != nil {
-				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
-				return
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 			}
 		case agentUpdatePlugin:
 			var err error
 			applyScript, err = agentUpdateApplyScript(approval)
 			if err != nil {
-				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
-				return
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 			}
 		default:
 			applyScript = s.applyScriptFor(approval)
@@ -5575,10 +5623,9 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	approval.Status = model.ApprovalApproved
 	approval.ApprovedBy = p.ActorID
 	if err := s.store.UpsertApproval(approval); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 	}
-	if req.QueueApply {
+	if queueApply {
 		timeoutSec := approvalApplyTaskTimeoutSec(approval.Plugin)
 		task := model.Task{
 			ID:          id.New("task"),
@@ -5604,21 +5651,18 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 					Reason:   err.Error(),
 					Metadata: map[string]string{"approval_id": approval.ID},
 				})
-				writeTaskExecutionDisabled(w)
-				return
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(apiErrorTaskExecutionDisabled, errTaskExecutionDisabled.Error()), taskExecutionDisabled: true}
 			}
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
 		if approval.Plugin == "selfdns" {
 			if err := s.markSelfDNSApplying(approval); err != nil {
-				writeError(w, http.StatusInternalServerError, err)
-				return
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 			}
 		}
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: approvalDecisionAuditScope(approval), Metadata: map[string]string{"approval_id": approval.ID}})
-	writeJSON(w, http.StatusOK, toApprovalView(approval))
+	return approval, nil
 }
 
 func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p principal) {

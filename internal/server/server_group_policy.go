@@ -261,7 +261,8 @@ func (s *Server) handleGroupPolicyPlan(w http.ResponseWriter, r *http.Request, p
 			ActorID:   p.ActorID,
 			CreatedAt: time.Now().UTC(),
 		}
-		if err := s.store.UpsertApproval(approval); err != nil {
+		approval, err = s.submitApproval(approval)
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}

@@ -6,6 +6,7 @@ master.key
 
 # OMC orchestration tool state (not part of the project)
 .omc/
+.ace-tool/
 
 # Publisher signing material. `cmd/pluginsign` reads a raw 32-byte Ed25519 seed from a
 # file path, so a stray `seed.bin` in the working tree is one `git add -A` away from

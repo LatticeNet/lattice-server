@@ -45,7 +45,9 @@ func toApprovalView(a model.Approval) approvalView {
 	stale, staleCode := approvalStaleMetadata(a)
 	return approvalView{
 		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
-		Plan: a.Plan, Status: a.Status, Reason: a.Reason, Stale: stale, StaleCode: staleCode, ActorID: a.ActorID,
+		// Reason is derived at read time (never migrated into stored rows) so
+		// pre-reason approvals also answer a human-readable sentence.
+		Plan: a.Plan, Status: a.Status, Reason: approvalDisplayReason(a), Stale: stale, StaleCode: staleCode, ActorID: a.ActorID,
 		ApprovedBy: a.ApprovedBy, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 	}
 }

@@ -243,7 +243,7 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
 	}
-	approval, err = s.submitApproval(approval)
+	approval, err = s.submitApproval(r.Context(), approval)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

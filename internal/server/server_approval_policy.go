@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -58,6 +59,12 @@ func parseApprovalAutoRules(raw string) ([]approvalAutoRule, error) {
 		if rules[i].DailyCap < 0 {
 			return nil, fmt.Errorf("approval auto rule %q has a negative daily_cap", rules[i].Name)
 		}
+		// A rule with no matcher at all would fire on EVERY fresh approval —
+		// including plans a human just submitted. That is never a legitimate
+		// policy, so it is a config error, not a silent wildcard.
+		if rules[i].Writer == "" && rules[i].Plugin == "" && rules[i].ActionPrefix == "" {
+			return nil, fmt.Errorf("approval auto rule %q must name at least one of writer, plugin, action_prefix", rules[i].Name)
+		}
 	}
 	return rules, nil
 }
@@ -83,26 +90,30 @@ func (r approvalAutoRule) matches(a model.Approval) bool {
 // pre-evaluation pending one. Status transitions of existing approvals
 // (approve/reject/dismiss/apply) keep calling store.UpsertApproval directly —
 // policies only ever act on fresh pending submissions.
-func (s *Server) submitApproval(a model.Approval) (model.Approval, error) {
+func (s *Server) submitApproval(ctx context.Context, a model.Approval) (model.Approval, error) {
 	if err := s.store.UpsertApproval(a); err != nil {
 		return model.Approval{}, err
 	}
-	return s.evaluateApprovalAutoRules(a), nil
+	return s.evaluateApprovalAutoRules(ctx, a), nil
 }
 
 // evaluateApprovalAutoRules runs the first matching auto-approve rule against
 // a freshly submitted approval. With no rules configured (the default) it is
 // a pure pass-through, so an unconfigured server behaves exactly as before.
-func (s *Server) evaluateApprovalAutoRules(a model.Approval) model.Approval {
+func (s *Server) evaluateApprovalAutoRules(ctx context.Context, a model.Approval) model.Approval {
 	if a.Status != model.ApprovalPending || len(s.approvalAutoRules) == 0 {
 		return a
 	}
+	// Serialise match + cap-count + decide: concurrent plan submissions must not
+	// all observe the cap below its limit and all approve (check-then-act).
+	s.approvalPolicyMu.Lock()
+	defer s.approvalPolicyMu.Unlock()
 	for _, rule := range s.approvalAutoRules {
 		if !rule.matches(a) {
 			continue
 		}
 		// First matching rule wins; later rules never see the approval.
-		return s.applyApprovalAutoRule(a, rule)
+		return s.applyApprovalAutoRule(ctx, a, rule)
 	}
 	return a
 }
@@ -111,7 +122,7 @@ func (s *Server) evaluateApprovalAutoRules(a model.Approval) model.Approval {
 // same decision path as the manual approve endpoint, crediting the decision to
 // the rule's synthetic policy identity. Any failure leaves the approval
 // pending for a human; a policy engine must never lose a submitted plan.
-func (s *Server) applyApprovalAutoRule(a model.Approval, rule approvalAutoRule) model.Approval {
+func (s *Server) applyApprovalAutoRule(ctx context.Context, a model.Approval, rule approvalAutoRule) model.Approval {
 	actor := approvalPolicyActorPrefix + rule.Name
 	if rule.DailyCap > 0 && s.countPolicyApprovalsToday(actor, s.now()) >= rule.DailyCap {
 		s.recordAudit(model.AuditEvent{
@@ -130,7 +141,7 @@ func (s *Server) applyApprovalAutoRule(a model.Approval, rule approvalAutoRule) 
 	// the one recorded for review.
 	sum := sha256.Sum256([]byte(a.Plan))
 	p := principal{Principal: rbac.Principal{ActorID: actor}}
-	updated, err := s.approveApprovalCore(p, a, rule.Queue, hex.EncodeToString(sum[:]))
+	updated, err := s.approveApprovalCore(ctx, p, a, rule.Queue, hex.EncodeToString(sum[:]))
 	if err != nil {
 		s.logger.Printf("approval auto-approve policy %q left approval %s pending: %v", rule.Name, a.ID, err)
 		// The in-memory copy may lag what the decision path persisted (e.g. a
@@ -140,15 +151,11 @@ func (s *Server) applyApprovalAutoRule(a model.Approval, rule approvalAutoRule) 
 		}
 		return a
 	}
-	// Stamp the policy identity as the record's actor so the daily cap can
-	// count policy-driven approvals without a new store index, and so readers
-	// can tell an automated decision from a human one. Done after the decision
-	// path so a failed auto-approve never poisons the cap, and so the original
-	// writer remains on the creation audit event.
-	updated.ActorID = actor
-	if err := s.store.UpsertApproval(updated); err != nil {
-		s.logger.Printf("approval auto-approve policy %q: restamp actor on %s: %v", rule.Name, a.ID, err)
-	}
+	// The decision path already records the policy identity in ApprovedBy, and
+	// the creation audit keeps the original writer. ActorID is NOT restamped:
+	// the creator is part of the record's identity (a partially auto-approved
+	// event must still group as one event), and the daily cap counts decisions
+	// by ApprovedBy instead.
 	s.recordAudit(model.AuditEvent{
 		ID:       id.New("audit"),
 		NodeID:   updated.NodeID,
@@ -161,14 +168,15 @@ func (s *Server) applyApprovalAutoRule(a model.Approval, rule approvalAutoRule) 
 }
 
 // countPolicyApprovalsToday counts approvals the policy actor already decided
-// on the same UTC day as now. It is an O(N) scan over the approvals table;
+// on the same UTC day as now. Decisions are attributed by ApprovedBy — ActorID
+// stays with the plan's creator. It is an O(N) scan over the approvals table;
 // acceptable at the current scale of tens of approvals, and worth revisiting
 // only if approval volume grows substantially.
 func (s *Server) countPolicyApprovalsToday(actor string, now time.Time) int {
 	year, month, day := now.UTC().Date()
 	count := 0
 	for _, a := range s.store.Approvals() {
-		if a.ActorID != actor {
+		if a.ApprovedBy != actor {
 			continue
 		}
 		ay, am, ad := a.CreatedAt.UTC().Date()

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -136,7 +137,9 @@ func (s *Server) queueLineMetaSyncLocked(p principal, nodeID string) ([]byte, er
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := s.store.UpsertApproval(approval); err != nil {
+	// The plugin-RPC dispatch layer carries no request context; policy
+	// evaluation here is synchronous and not request-bound.
+	if _, err := s.submitApproval(context.Background(), approval); err != nil {
 		return nil, err
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
@@ -168,7 +171,7 @@ func (s *Server) maybeQueueLineMetaSyncOnDiscovery(nodeID string, inv model.Sing
 	if seen && prev == fingerprint {
 		return // unchanged inventory: nothing new to describe on-box
 	}
-	if _, err := s.queueLineMetaSyncLocked(principal{Principal: rbac.Principal{ActorID: "system"}}, nodeID); err != nil {
+	if _, err := s.queueLineMetaSyncLocked(principal{Principal: rbac.Principal{ActorID: systemActorID}}, nodeID); err != nil {
 		s.logger.Printf("linemeta: queue sync for %s: %v", nodeID, err)
 		return
 	}

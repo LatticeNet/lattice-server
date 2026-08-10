@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"io"
 	"log"
 	"strings"
@@ -30,6 +31,8 @@ func TestParseApprovalAutoRules(t *testing.T) {
 		{name: "rule without name is rejected", raw: `[{"plugin":"nft"}]`, wantErr: true},
 		{name: "whitespace-only name is rejected", raw: `[{"name":"  "}]`, wantErr: true},
 		{name: "negative daily cap is rejected", raw: `[{"name":"x","daily_cap":-1}]`, wantErr: true},
+		{name: "match-everything rule is rejected", raw: `[{"name":"all"}]`, wantErr: true},
+		{name: "single matcher is enough", raw: `[{"name":"only-writer","writer":"lattice-server"}]`, wantLen: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -135,7 +138,7 @@ func auditActions(st *store.Store) []string {
 
 func TestApprovalAutoApproveDefaultOff(t *testing.T) {
 	srv, st := newTestServerWithApprovalRules(t, "")
-	stored, err := srv.submitApproval(pendingTestApproval("ap-1", "lattice-server", "nft", "apply-ruleset"))
+	stored, err := srv.submitApproval(context.Background(), pendingTestApproval("ap-1", "lattice-server", "nft", "apply-ruleset"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +158,7 @@ func TestApprovalAutoApproveDefaultOff(t *testing.T) {
 func TestApprovalAutoApproveNeverTouchesUserSubmissions(t *testing.T) {
 	srv, st := newTestServerWithApprovalRules(t,
 		`[{"name":"fleet-nft","writer":"lattice-server","plugin":"nft","action_prefix":"apply-ruleset","queue":true}]`)
-	stored, err := srv.submitApproval(pendingTestApproval("ap-user", "user-admin", "nft", "apply-ruleset"))
+	stored, err := srv.submitApproval(context.Background(), pendingTestApproval("ap-user", "user-admin", "nft", "apply-ruleset"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,21 +178,21 @@ func TestApprovalAutoApproveNeverTouchesUserSubmissions(t *testing.T) {
 func TestApprovalAutoApproveAndQueue(t *testing.T) {
 	srv, st := newTestServerWithApprovalRules(t,
 		`[{"name":"linemeta-fleet","writer":"lattice-server","plugin":"singbox-linemeta","action_prefix":"apply-metadata","queue":true,"daily_cap":100}]`)
-	stored, err := srv.submitApproval(pendingTestApproval("ap-auto", "lattice-server", "singbox-linemeta", "apply-metadata:0123456789abcdef"))
+	stored, err := srv.submitApproval(context.Background(), pendingTestApproval("ap-auto", "lattice-server", "singbox-linemeta", "apply-metadata:0123456789abcdef"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stored.Status != model.ApprovalApproved {
 		t.Fatalf("expected approved, got %q", stored.Status)
 	}
-	if stored.ActorID != "policy:linemeta-fleet" {
-		t.Fatalf("expected policy actor identity on the record, got %q", stored.ActorID)
+	if stored.ActorID != "lattice-server" {
+		t.Fatalf("creator identity must be preserved, got %q", stored.ActorID)
 	}
 	if stored.ApprovedBy != "policy:linemeta-fleet" {
 		t.Fatalf("expected policy approver identity, got %q", stored.ApprovedBy)
 	}
 	persisted, ok := st.Approval("ap-auto")
-	if !ok || persisted.Status != model.ApprovalApproved || persisted.ActorID != "policy:linemeta-fleet" {
+	if !ok || persisted.Status != model.ApprovalApproved || persisted.ActorID != "lattice-server" || persisted.ApprovedBy != "policy:linemeta-fleet" {
 		t.Fatalf("stored row mismatch: %+v", persisted)
 	}
 	tasks := st.Tasks()
@@ -217,7 +220,7 @@ func TestApprovalAutoApproveAndQueue(t *testing.T) {
 func TestApprovalAutoApproveOnlyDoesNotQueue(t *testing.T) {
 	srv, st := newTestServerWithApprovalRules(t,
 		`[{"name":"linemeta-fleet","writer":"lattice-server","plugin":"singbox-linemeta","action_prefix":"apply-metadata","queue":false}]`)
-	stored, err := srv.submitApproval(pendingTestApproval("ap-only", "lattice-server", "singbox-linemeta", "apply-metadata:abc"))
+	stored, err := srv.submitApproval(context.Background(), pendingTestApproval("ap-only", "lattice-server", "singbox-linemeta", "apply-metadata:abc"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,15 +241,15 @@ func TestApprovalAutoApproveFirstMatchWins(t *testing.T) {
 	srv, st := newTestServerWithApprovalRules(t,
 		`[{"name":"first","writer":"lattice-server","plugin":"singbox-linemeta","queue":false},`+
 			`{"name":"second","writer":"lattice-server","plugin":"singbox-linemeta","queue":true}]`)
-	stored, err := srv.submitApproval(pendingTestApproval("ap-prec", "lattice-server", "singbox-linemeta", "apply-metadata:abc"))
+	stored, err := srv.submitApproval(context.Background(), pendingTestApproval("ap-prec", "lattice-server", "singbox-linemeta", "apply-metadata:abc"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stored.Status != model.ApprovalApproved {
 		t.Fatalf("expected approved, got %q", stored.Status)
 	}
-	if stored.ActorID != "policy:first" {
-		t.Fatalf("first matching rule must win, got actor %q", stored.ActorID)
+	if stored.ApprovedBy != "policy:first" {
+		t.Fatalf("first matching rule must win, got approver %q", stored.ApprovedBy)
 	}
 	if tasks := st.Tasks(); len(tasks) != 0 {
 		t.Fatalf("first rule is approve-only; expected no tasks, got %d", len(tasks))
@@ -258,24 +261,25 @@ func TestApprovalAutoApproveDailyCap(t *testing.T) {
 		`[{"name":"capped","writer":"lattice-server","plugin":"singbox-linemeta","queue":false,"daily_cap":1}]`)
 	// A decision from a previous UTC day must not consume today's budget.
 	if err := st.UpsertApproval(model.Approval{
-		ID:        "ap-old",
-		NodeID:    "node-1",
-		Plugin:    "singbox-linemeta",
-		Action:    "apply-metadata:old",
-		Status:    model.ApprovalApproved,
-		ActorID:   "policy:capped",
-		CreatedAt: time.Now().UTC().Add(-25 * time.Hour),
+		ID:         "ap-old",
+		NodeID:     "node-1",
+		Plugin:     "singbox-linemeta",
+		Action:     "apply-metadata:old",
+		Status:     model.ApprovalApproved,
+		ActorID:    "lattice-server",
+		ApprovedBy: "policy:capped",
+		CreatedAt:  time.Now().UTC().Add(-25 * time.Hour),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	first, err := srv.submitApproval(pendingTestApproval("ap-cap-1", "lattice-server", "singbox-linemeta", "apply-metadata:1"))
+	first, err := srv.submitApproval(context.Background(), pendingTestApproval("ap-cap-1", "lattice-server", "singbox-linemeta", "apply-metadata:1"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if first.Status != model.ApprovalApproved {
 		t.Fatalf("first approval within cap must be approved, got %q", first.Status)
 	}
-	second, err := srv.submitApproval(pendingTestApproval("ap-cap-2", "lattice-server", "singbox-linemeta", "apply-metadata:2"))
+	second, err := srv.submitApproval(context.Background(), pendingTestApproval("ap-cap-2", "lattice-server", "singbox-linemeta", "apply-metadata:2"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,7 +318,7 @@ func TestApprovalAutoApproveLeavesPendingOnDecisionFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stored, err := srv.submitApproval(pendingTestApproval("ap-kill", "lattice-server", "nft", "apply-ruleset"))
+	stored, err := srv.submitApproval(context.Background(), pendingTestApproval("ap-kill", "lattice-server", "nft", "apply-ruleset"))
 	if err != nil {
 		t.Fatal(err)
 	}

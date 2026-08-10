@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -104,7 +105,7 @@ func TestAgentUpdateApprovalDecisionRequiresNodeAdmin(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "manual", time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "manual", time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +163,7 @@ func TestApprovalListRequiresDomainVisibilityScope(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "manual", time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "manual", time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}

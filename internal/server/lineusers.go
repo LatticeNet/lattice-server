@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -297,7 +298,9 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	} else {
 		approval.ArtifactDigest = sha
 	}
-	if err := s.store.UpsertApproval(approval); err != nil {
+	// The plugin-RPC dispatch layer carries no request context; policy
+	// evaluation here is synchronous and not request-bound.
+	if _, err := s.submitApproval(context.Background(), approval); err != nil {
 		return nil, err
 	}
 	s.recordPrincipalAudit(ctxPrincipal, model.AuditEvent{

@@ -177,3 +177,20 @@ func TestToApprovalViewPopulatesReason(t *testing.T) {
 		t.Fatalf("derivation must not mutate the stored approval, reason = %q", a.Reason)
 	}
 }
+
+func TestApprovalActorViewNormalizesSyntheticCreators(t *testing.T) {
+	// Early deployments stamped server-proposed approvals "system" (line
+	// metadata discovery) or "" (auto-planned agent updates). Readers see one
+	// identity; stored rows are never rewritten.
+	cases := []struct{ actor, want string }{
+		{"system", systemActorID},
+		{"", systemActorID},
+		{systemActorID, systemActorID},
+		{"operator:alice", "operator:alice"},
+	}
+	for _, tc := range cases {
+		if got := approvalActorView(tc.actor); got != tc.want {
+			t.Errorf("approvalActorView(%q) = %q, want %q", tc.actor, got, tc.want)
+		}
+	}
+}

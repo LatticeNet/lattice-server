@@ -88,7 +88,7 @@ func (s *Server) planPluginOperation(
 		RequestSHA256:  plugin.SHA256Hex(payload),
 		Targets:        append([]string(nil), proposed.Targets...),
 	}
-	if err := s.store.UpsertApproval(approval); err != nil {
+	if _, err := s.submitApproval(ctx, approval); err != nil {
 		return nil, err
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -183,7 +184,7 @@ func (s *Server) handleAgentUpdatePlan(w http.ResponseWriter, r *http.Request, p
 	if !s.requireNodeScope(w, p, "network:plan", nodeID) {
 		return
 	}
-	approval, err := s.createAgentUpdateApproval(nodeID, p.ActorID, req.Force, "manual", s.now())
+	approval, err := s.createAgentUpdateApproval(r.Context(), nodeID, p.ActorID, req.Force, "manual", s.now())
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, errAgentUpdateNoop) {
@@ -426,13 +427,13 @@ func (s *Server) evaluateAgentUpdatePolicies(now time.Time) {
 		if !policy.Enabled || !policy.AutoPlan {
 			continue
 		}
-		if _, err := s.createAgentUpdateApproval(policy.NodeID, "", false, "auto", now); err != nil && !errors.Is(err, errAgentUpdateNoop) {
+		if _, err := s.createAgentUpdateApproval(context.Background(), policy.NodeID, systemActorID, false, "auto", now); err != nil && !errors.Is(err, errAgentUpdateNoop) {
 			s.logger.Printf("agent update policy %s: %v", policy.NodeID, err)
 		}
 	}
 }
 
-func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, mode string, now time.Time) (model.Approval, error) {
+func (s *Server) createAgentUpdateApproval(ctx context.Context, nodeID, actorID string, force bool, mode string, now time.Time) (model.Approval, error) {
 	node, ok := s.store.Node(nodeID)
 	if !ok {
 		return model.Approval{}, errors.New("node not found")
@@ -476,7 +477,7 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	approval, err = s.submitApproval(approval)
+	approval, err = s.submitApproval(ctx, approval)
 	if err != nil {
 		return model.Approval{}, err
 	}

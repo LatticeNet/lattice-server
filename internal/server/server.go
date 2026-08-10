@@ -241,6 +241,9 @@ type Server struct {
 	// approvalAutoRules is the parsed auto-approve policy list. Nil (the
 	// default) keeps every approval manual.
 	approvalAutoRules []approvalAutoRule
+	// approvalPolicyMu serialises policy evaluation so the daily cap's
+	// count-then-decide cannot race across concurrent submissions.
+	approvalPolicyMu sync.Mutex
 	// terminalBroker owns short-lived interactive terminal sessions. Sessions are
 	// intentionally in-memory only; a server restart forces operators to reopen.
 	terminalBroker *terminalBroker
@@ -4639,7 +4642,7 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
 	}
-	approval, err = s.submitApproval(approval)
+	approval, err = s.submitApproval(r.Context(), approval)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -4820,7 +4823,7 @@ func (s *Server) handleTunnelPlan(w http.ResponseWriter, r *http.Request, p prin
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
 	}
-	approval, err = s.submitApproval(approval)
+	approval, err = s.submitApproval(r.Context(), approval)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -4872,7 +4875,7 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
 	}
-	approval, err = s.submitApproval(approval)
+	approval, err = s.submitApproval(r.Context(), approval)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -5469,7 +5472,7 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request, p princip
 	if !s.requireApprovalDecisionScopes(w, p, approval) {
 		return
 	}
-	updated, err := s.approveApprovalCore(p, approval, req.QueueApply, req.PlanSHA256)
+	updated, err := s.approveApprovalCore(r.Context(), p, approval, req.QueueApply, req.PlanSHA256)
 	if err != nil {
 		var decisionErr *approvalDecisionError
 		if errors.As(err, &decisionErr) {
@@ -5506,7 +5509,7 @@ func (e *approvalDecisionError) Error() string { return e.err.Error() }
 // implementation matters most for the hash binding: an approval must only
 // ever transition for the exact stored plan bytes, whichever entry point
 // drove the decision.
-func (s *Server) approveApprovalCore(p principal, approval model.Approval, queueApply bool, planSHA256 string) (model.Approval, error) {
+func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval model.Approval, queueApply bool, planSHA256 string) (model.Approval, error) {
 	if approval.Status != model.ApprovalPending {
 		// Already-decided approvals stay idempotent, matching the manual
 		// endpoint's retry semantics.
@@ -5533,8 +5536,7 @@ func (s *Server) approveApprovalCore(p principal, approval model.Approval, queue
 	}
 	if approval.Plugin == singBoxLineUserPlugin {
 		if _, _, _, _, _, err := s.validateLineUserApproval(approval); err != nil {
-			writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
-			return
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
 	if approval.Plugin == agentUpdatePlugin {
@@ -5570,11 +5572,10 @@ func (s *Server) approveApprovalCore(p principal, approval model.Approval, queue
 		approval.Status = model.ApprovalApproved
 		approval.ApprovedBy = p.ActorID
 		if err := s.store.UpsertApproval(approval); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
-		if req.QueueApply {
-			if err := s.executePluginOperation(r.Context(), p, approval); err != nil {
+		if queueApply {
+			if err := s.executePluginOperation(ctx, p, approval); err != nil {
 				// The approval stays approved-but-unexecuted rather than half-applied:
 				// re-checks fail closed (plugin disabled, upgraded, re-signed, targets
 				// no longer authorized), and the operator re-plans.
@@ -5584,12 +5585,10 @@ func (s *Server) approveApprovalCore(p principal, approval model.Approval, queue
 					Decision: "deny", Reason: err.Error(),
 					Metadata: map[string]string{"approval_id": approval.ID, "plugin_id": approval.Plugin},
 				})
-				writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, err.Error()))
-				return
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 			}
 		}
-		writeJSON(w, http.StatusOK, toApprovalView(approval))
-		return
+		return approval, nil
 	}
 
 	applyScript := ""

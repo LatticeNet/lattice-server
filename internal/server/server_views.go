@@ -37,6 +37,20 @@ type approvalView struct {
 	Targets        []string `json:"targets,omitempty"`
 }
 
+// systemActorID is the recorded creator for approvals the server proposed
+// itself (line-metadata discovery syncs, auto-planned agent updates). Early
+// deployments stamped these "system" or left the actor empty; the view
+// normalises both so readers see one honest identity and stored rows stay
+// untouched.
+const systemActorID = "lattice-server"
+
+func approvalActorView(actor string) string {
+	if actor == "" || actor == "system" {
+		return systemActorID
+	}
+	return actor
+}
+
 func toApprovalView(a model.Approval) approvalView {
 	action := a.Action
 	if a.Plugin == "nftpolicy" {
@@ -56,7 +70,7 @@ func toApprovalView(a model.Approval) approvalView {
 		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
 		// Reason is derived at read time (never migrated into stored rows) so
 		// pre-reason approvals also answer a human-readable sentence.
-		Plan: a.Plan, Status: a.Status, Reason: approvalDisplayReason(a), Stale: stale, StaleCode: staleCode, ActorID: a.ActorID,
+		Plan: a.Plan, Status: a.Status, Reason: approvalDisplayReason(a), Stale: stale, StaleCode: staleCode, ActorID: approvalActorView(a.ActorID),
 		ApprovedBy: a.ApprovedBy, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 		PluginVersion: a.PluginVersion, ArtifactDigest: a.ArtifactDigest,
 		Service: a.Service, Method: a.Method, Targets: a.Targets,

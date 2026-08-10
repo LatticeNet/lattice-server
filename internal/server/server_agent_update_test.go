@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -368,7 +369,7 @@ func TestAgentUpdateCurrentVersionChangeSupersedesApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC))
+	first, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "auto", time.Date(2026, 7, 4, 10, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +380,7 @@ func TestAgentUpdateCurrentVersionChangeSupersedesApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", time.Date(2026, 7, 4, 10, 5, 0, 0, time.UTC))
+	second, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "auto", time.Date(2026, 7, 4, 10, 5, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +606,7 @@ func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
-	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "manual", now)
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "manual", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -743,7 +744,7 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStalePendingApproval(t *testin
 	}); err != nil {
 		t.Fatal(err)
 	}
-	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "auto", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -806,7 +807,7 @@ func TestDismissStaleAgentUpdateApprovalHidesItFromDefaultList(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "auto", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -930,7 +931,7 @@ func TestAgentUpdateApprovalsListRejectsHistoricalStaleApprovedWithoutActiveTask
 	}); err != nil {
 		t.Fatal(err)
 	}
-	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "manual", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "manual", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -972,7 +973,7 @@ func TestAgentUpdateApprovalsListKeepsApprovedWithActiveTask(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "manual", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "manual", time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1148,7 +1149,7 @@ func TestAgentUpdateNewPlanRejectsSupersededPendingApproval(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	oldApproval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", now)
+	oldApproval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "auto", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1160,7 +1161,7 @@ func TestAgentUpdateNewPlanRejectsSupersededPendingApproval(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	newApproval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", now.Add(time.Minute))
+	newApproval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "auto", now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1193,7 +1194,7 @@ func TestAgentUpdateNoopRejectsPendingApprovalForCurrentTarget(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	approval, err := srv.createAgentUpdateApproval("node-a", "admin", false, "auto", now)
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "auto", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1211,7 +1212,7 @@ func TestAgentUpdateNoopRejectsPendingApprovalForCurrentTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = srv.createAgentUpdateApproval("node-a", "", false, "auto", now.Add(time.Minute))
+	_, err = srv.createAgentUpdateApproval(context.Background(), "node-a", "", false, "auto", now.Add(time.Minute))
 	if !errors.Is(err, errAgentUpdateNoop) {
 		t.Fatalf("current target should be a noop, got %v", err)
 	}

@@ -194,6 +194,15 @@ Use the compose file and deployment guide in the umbrella repository:
   TOTP; all other session-backed APIs return the stable `mfa_required` error
   until enrollment is complete. Bearer PAT automation is not an interactive
   session and is not gated by this policy.
+- Approvals are manual by default. `LATTICE_APPROVAL_AUTO_RULES` (or
+  `-approval-auto-rules`) accepts a JSON array of opt-in auto-approve rules for
+  trusted writers, e.g.
+  `[{"name":"linemeta-fleet","writer":"lattice-server","plugin":"singbox-linemeta","action_prefix":"apply-metadata","queue":true,"daily_cap":100}]`.
+  The first matching rule wins; `queue` selects approve-and-queue over
+  approve-only, `daily_cap` bounds auto-approvals per UTC day (0 = uncapped),
+  and automated decisions are audited as `approval.auto_approve` /
+  `approval.auto_skip`. Malformed JSON is logged and ignored — the server
+  starts fully manual.
 - **Passkeys (WebAuthn).** Operators can register passkeys (platform
   authenticators such as Apple Passwords / iCloud Keychain, or roaming security
   keys) and sign in with them. Verification uses

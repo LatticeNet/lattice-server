@@ -476,7 +476,8 @@ func (s *Server) createAgentUpdateApproval(nodeID, actorID string, force bool, m
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := s.store.UpsertApproval(approval); err != nil {
+	approval, err = s.submitApproval(approval)
+	if err != nil {
 		return model.Approval{}, err
 	}
 	policy.LastPlannedVersion = policy.TargetVersion

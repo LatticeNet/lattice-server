@@ -260,6 +260,11 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			_, _ = w.Write(operationErr.Body)
 			return
 		}
+		var serviceErr *pluginServiceError
+		if errors.As(err, &serviceErr) {
+			writeError(w, http.StatusBadRequest, errors.New(serviceErr.message))
+			return
+		}
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
@@ -361,16 +366,33 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 		BudgetLabel:     service + "/" + method,
 	})
 	if err != nil {
+		// The system runner reports a plugin's own refusal twice: as a response
+		// carrying OK:false + the plugin's message, AND as a non-nil error.
+		// When the message is present the refusal is the truth worth answering —
+		// honor the response and drop the wrapper. A bare error (timeout, spawn
+		// failure, protocol break) stays an upstream 502.
+		if !resp.OK && resp.Message != "" {
+			return nil, &pluginServiceError{message: resp.Message}
+		}
 		return nil, err
 	}
 	if !resp.OK {
 		if resp.Message == "" {
 			resp.Message = "plugin call failed"
 		}
-		return nil, errors.New(resp.Message)
+		return nil, &pluginServiceError{message: resp.Message}
 	}
 	return resp.Result, nil
 }
+
+// pluginServiceError is a plugin's own operator-facing refusal (its
+// ErrorResponse channel). It is not an upstream failure: the message is written
+// for the operator by the plugin, and the engine redacts internals before they
+// reach it. The HTTP layer answers 400 with the message intact instead of a
+// sanitised 502 that would read as an infrastructure outage.
+type pluginServiceError struct{ message string }
+
+func (e *pluginServiceError) Error() string { return e.message }
 
 func pluginCallTimeout(method plugin.InterfaceMethod) time.Duration {
 	if method.Budget == nil {

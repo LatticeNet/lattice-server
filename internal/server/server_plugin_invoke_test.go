@@ -704,3 +704,55 @@ func TestPluginCallCoreBackedWithoutProviderFailsClosed(t *testing.T) {
 		t.Fatalf("core-backed service with no core provider must fail closed, got 200: %s", rec.Body.String())
 	}
 }
+
+func TestPluginCallServiceErrorKeepsItsMessageAs400(t *testing.T) {
+	// A plugin's ErrorResponse is an operator-facing refusal, not an upstream
+	// outage: it must surface as 400 with the plugin's own message, not the
+	// sanitised 502 that reads like an infrastructure failure.
+	pluginRoot := t.TempDir()
+	manifest := plugin.Manifest{
+		ID: "test.refusal", Name: "Refusal Test", Type: "system", Version: "0.1.0",
+		Capabilities: []string{"node:read"},
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "test.refusal/items",
+			Methods: []string{"preview"},
+			Scopes:  []string{"proxy:read"},
+		}},
+	}
+	script := "#!/bin/sh\nread line\necho '{\"ok\":false,\"message\":\"preview needs subscription content\"}'\n"
+	writeServerBundle(t, pluginRoot, "test.refusal", manifest, []byte(script))
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{
+		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
+		PluginDir:        pluginRoot,
+		PluginRuntimeDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	for _, status := range []string{model.PluginStatusInstalled, model.PluginStatusActive} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle",
+			`{"id":"test.refusal","status":"`+status+`"}`, cookies, csrf)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("lifecycle %s: got %d", status, resp.StatusCode)
+		}
+	}
+
+	readToken := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, nil)
+	call := doBearerJSON(t, handler, http.MethodPost, "/api/plugins/call",
+		`{"id":"test.refusal","service":"test.refusal/items","method":"preview"}`, readToken)
+	defer call.Body.Close()
+	body, _ := io.ReadAll(call.Body)
+	if call.StatusCode != http.StatusBadRequest {
+		t.Fatalf("plugin refusal: want 400, got %d (%s)", call.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "preview needs subscription content") {
+		t.Fatalf("plugin refusal lost its message: %s", body)
+	}
+}

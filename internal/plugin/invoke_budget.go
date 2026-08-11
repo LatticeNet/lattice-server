@@ -17,7 +17,13 @@ const (
 	HostMaxInvokeTimeoutMS   = 30_000
 	HostMaxInvokeStdoutBytes = 8 << 20
 	HostMaxInvokeStderrBytes = 1 << 20
-	HostMaxInvokeHostCalls   = 64
+	// HostMaxInvokeHostCalls bounds what a signed manifest may declare per
+	// method. 64 was sized for CRUD shapes; the sub-store plugin's real shapes
+	// run past it — an export reattaches one program key per script file and
+	// the store caps at 256 records (2 + 256 = 258), and a migration is that
+	// plus three upstream fetches (263). 512 covers the store-bounded worst
+	// cases with headroom while still killing a runaway plugin.
+	HostMaxInvokeHostCalls = 512
 )
 
 // InvokeBudgetSpec is signed method-level runtime data. An absent budget stays

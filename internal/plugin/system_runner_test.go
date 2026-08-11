@@ -562,3 +562,57 @@ func TestRuntimeManagerInvokeRoutesToSystemRunner(t *testing.T) {
 		t.Fatalf("invoke after stop should fail")
 	}
 }
+
+func TestKVGetResponseDropsRawValueWhenLarge(t *testing.T) {
+	// The kv.get response rides one frame that the plugin scans with a 1 MiB
+	// cap. Carrying the value twice (raw + base64) doubles the frame; past
+	// ~430 KiB of value the plugin dies mid-invocation and the runner sees a
+	// broken pipe. Base64-only past the small threshold keeps it inside.
+	big := make([]byte, 600<<10)
+	for i := range big {
+		big[i] = byte('a' + i%26)
+	}
+	services := &fakeHostServices{kvValues: map[string][]byte{
+		"plugin:p.kv/big":   big,
+		"plugin:p.kv/small": []byte("green"),
+	}}
+	broker := newTestBroker(t, "p.kv", []string{"kv:read"}, HostServices{KV: services, Audit: services})
+
+	call := systemHostCall{ID: "h1", Method: "kv.get"}
+	params, _ := json.Marshal(map[string]string{"key": "big"})
+	call.Params = params
+	out, err := dispatchHostCall(context.Background(), broker, call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		OK          bool   `json:"ok"`
+		Value       string `json:"value"`
+		ValueBase64 string `json:"value_base64"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.OK || resp.ValueBase64 == "" {
+		t.Fatalf("big value lost its base64 encoding: %s", string(out)[:120])
+	}
+	if resp.Value != "" {
+		t.Fatalf("big value carried the raw duplicate (%d bytes raw) — frame would exceed the plugin's read cap", len(resp.Value))
+	}
+
+	params2, _ := json.Marshal(map[string]string{"key": "small"})
+	call.Params = params2
+	out2, err := dispatchHostCall(context.Background(), broker, call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp2 struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(out2, &resp2); err != nil {
+		t.Fatal(err)
+	}
+	if resp2.Value != "green" {
+		t.Fatalf("small value should keep its raw form for debuggability: %s", string(out2)[:120])
+	}
+}

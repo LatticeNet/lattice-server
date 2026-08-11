@@ -636,11 +636,22 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 		if err != nil {
 			return nil, err
 		}
-		return json.Marshal(struct {
+		// The response rides one stdout-ish frame that the plugin scans with a
+		// 1 MiB cap (sdk DefaultMaxHostResponseBytes). Sending the value twice —
+		// raw AND base64 — doubles the frame, and any value past ~430 KiB kills
+		// the plugin mid-invocation (runner sees a broken pipe). The SDK reader
+		// prefers value_base64 whenever it is present, so past a small debug
+		// threshold the raw duplicate is dropped. (2026-08-11: every plugin call
+		// 502'd once the sub-store store grew past it.)
+		resp := struct {
 			OK          bool   `json:"ok"`
 			Value       string `json:"value,omitempty"`
 			ValueBase64 string `json:"value_base64,omitempty"`
-		}{OK: ok, Value: string(value), ValueBase64: base64.StdEncoding.EncodeToString(value)})
+		}{OK: ok, ValueBase64: base64.StdEncoding.EncodeToString(value)}
+		if len(value) <= 64<<10 {
+			resp.Value = string(value)
+		}
+		return json.Marshal(resp)
 	case "kv.put":
 		var req struct {
 			Key         string `json:"key"`

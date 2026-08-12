@@ -1219,6 +1219,28 @@ func (s *Store) AddTaskResult(r model.TaskResult) error {
 	return s.Save()
 }
 
+// taskLeaseSafetyMargin bounds how long a lease may outlive its task timeout
+// before the lease is treated as dead. The agent kills the task at TimeoutSec
+// and reports immediately, so timeout + margin is a generous upper bound on a
+// live lease. Without this, an agent that dies between lease and report held
+// the task (and its approval) hostage forever — observed in production
+// 2026-08-12: two singbox-linemeta approvals stuck "approved" behind leases
+// from 2026-07-29 whose agents never reported.
+const taskLeaseSafetyMargin = 5 * time.Minute
+
+// taskLeaseExpired reports whether the lease started at startedAt under a task
+// with the given timeout is certainly dead. A zero start (legacy rows) never
+// expires — better a stuck task than double-execution on a guess.
+func taskLeaseExpired(startedAt time.Time, timeoutSec int) bool {
+	if startedAt.IsZero() {
+		return false
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = 900
+	}
+	return time.Since(startedAt) > time.Duration(timeoutSec)*time.Second+taskLeaseSafetyMargin
+}
+
 func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult) bool {
 	if !contains(t.Targets, nodeID) {
 		return false
@@ -1232,12 +1254,19 @@ func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult)
 		}
 	}
 	if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
-		return false
+		if !taskLeaseExpired(lease.StartedAt, t.TimeoutSec) {
+			return false
+		}
+		// Expired: the new lease overwrites the dead one below, and a zombie
+		// agent's late result is rejected by the lease-id check on report.
 	}
 	// Backward-compatible single-lease tasks created before TargetLeases
-	// existed must not be handed to the same node twice.
+	// existed must not be handed to the same node twice — unless the lease is
+	// certainly dead (same expiry rule as TargetLeases).
 	if t.LeasedBy == nodeID && t.LeaseID != "" {
-		return false
+		if !taskLeaseExpired(t.StartedAt, t.TimeoutSec) {
+			return false
+		}
 	}
 	return true
 }

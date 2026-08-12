@@ -385,8 +385,8 @@ func TestManagedLineTaskResultReconcile(t *testing.T) {
 		t.Fatalf("failed def = %+v", failed)
 	}
 	stored, _ := srv.store.Approval(approval.ID)
-	if stored.Status == model.ApprovalApplied {
-		t.Fatal("failed task must not mark the approval applied")
+	if stored.Status != model.ApprovalPending || !strings.Contains(stored.Reason, "execution failed") {
+		t.Fatalf("failed task must return the approval to pending with the reason, got %q %q", stored.Status, stored.Reason)
 	}
 
 	// Success: def applied, approval applied, rediscovery probe queued.

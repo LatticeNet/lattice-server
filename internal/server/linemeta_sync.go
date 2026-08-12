@@ -209,6 +209,16 @@ func (s *Server) handleLineMetaTaskResult(r *http.Request, approval model.Approv
 		if reason == "" {
 			reason = fmt.Sprintf("linemeta task exited %d", result.ExitCode)
 		}
+		// Execution failure is not a decision: return the approval to pending
+		// with the reason, so the operator can fix the cause and re-approve.
+		// Leaving it approved stranded the plan forever — the approve endpoint
+		// is intentionally a no-op on non-pending approvals.
+		approval.Status = model.ApprovalPending
+		approval.Reason = "execution failed: " + reason
+		approval.UpdatedAt = time.Now().UTC()
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return fmt.Errorf("return failed linemeta approval to pending: %w", err)
+		}
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID: id.New("audit"), NodeID: approval.NodeID, Action: "linemeta.sync.failed",
 			Decision: "deny", Reason: reason, Metadata: metadata,

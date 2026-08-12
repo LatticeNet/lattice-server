@@ -90,8 +90,8 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("expected one update task, got %+v", tasks)
 	}
-	if tasks[0].TimeoutSec != 300 {
-		t.Fatalf("agent update should get a longer download timeout, got %d", tasks[0].TimeoutSec)
+	if tasks[0].TimeoutSec != 900 {
+		t.Fatalf("agent update should get the extended download timeout (900s), got %d", tasks[0].TimeoutSec)
 	}
 	script := tasks[0].Script
 	for _, want := range []string{

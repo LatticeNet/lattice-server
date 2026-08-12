@@ -4715,7 +4715,10 @@ func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval
 func approvalApplyTaskTimeoutSec(plugin string) int {
 	switch plugin {
 	case agentUpdatePlugin:
-		return 300
+		// 900s: the download leg is github-release egress from the node's own
+		// network — a CN residential uplink can need minutes for ~7 MiB, and
+		// 300s produced "context deadline exceeded" on cd-hs-sh (2026-08-12).
+		return 900
 	case "nft", "nftpolicy", "selfdns":
 		return networkApplyTaskTimeoutSec
 	default:

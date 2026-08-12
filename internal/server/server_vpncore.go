@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -46,7 +47,7 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export", "list"}, s.vpnCoreNodesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreNodesService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach"}, s.vpnCoreLinesRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach", "managed", "rollout"}, s.vpnCoreLinesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreLinesService, err)
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersService, "v1", []string{"list", "get"}, s.vpnCoreUsersRPC); err != nil {
@@ -92,6 +93,49 @@ func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []b
 			return nil, err
 		}
 		return s.vpnCoreLinesReattach(p, request)
+	case "managed":
+		// design-17 S3: the redacted managed-line definition listing the Lines
+		// view renders as per-node overlay status. Read-only.
+		defs, err := s.managedLineDefs()
+		if err != nil {
+			return nil, err
+		}
+		views := make([]managedLineDefView, 0, len(defs))
+		for _, def := range defs {
+			views = append(views, toManagedLineDefView(def))
+		}
+		return json.Marshal(struct {
+			ManagedLines []managedLineDefView `json:"managed_lines"`
+		}{ManagedLines: views})
+	case "rollout":
+		// design-17 S1 driven from the Lines view: compiles per-node plans and
+		// files them as one approval batch. Mutates nothing on any node.
+		p, err := pluginOperatorPrincipal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var req managedLineRolloutRequest
+		if len(bytes.TrimSpace(request)) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, fmt.Errorf("vpn-core/lines rollout: invalid request: %w", err)
+			}
+		}
+		planned, skipped, err := s.compileManagedLineRollout(ctx, p, req)
+		if err != nil {
+			return nil, err
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID: id.New("audit"), Action: "network.lines.managed_rollout", Scope: "network:plan",
+			Metadata: map[string]string{
+				"user_id": strings.TrimSpace(req.UserID), "via": "plugin-rpc",
+				"planned": strconv.Itoa(len(planned)), "skipped": strconv.Itoa(len(skipped)),
+			},
+		})
+		return json.Marshal(struct {
+			OK      bool                     `json:"ok"`
+			Planned []managedLinePlannedView `json:"planned"`
+			Skipped []managedLineSkippedView `json:"skipped"`
+		}{OK: true, Planned: planned, Skipped: skipped})
 	case "get":
 		var req struct {
 			LineHashID string `json:"line_hash_id"`

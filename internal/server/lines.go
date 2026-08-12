@@ -45,6 +45,13 @@ type Line struct {
 	// declared downstream_line_uuid (design-15 §6), not inferred from outbound
 	// host/port — the UI badges these as orchestrated edges.
 	DeclaredJumpEdges []string          `json:"declared_jump_edges,omitempty"`
+	// design-17: a line backed by a server-owned managed-line definition (the
+	// overlay) carries the definition's state. The join is by line_hash_id —
+	// the compiler pre-computes the hash discovery will assign, so a
+	// rediscovered applied line lands on its definition exactly.
+	Overlay       bool              `json:"overlay,omitempty"`
+	OverlayStatus string            `json:"overlay_status,omitempty"` // planned | applied | failed
+	OverlayUser   string            `json:"overlay_user,omitempty"`
 	UserCount         int               `json:"user_count"`
 	UserKnown         bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
 	Status            string            `json:"status,omitempty"` // ok | pending | error | stale
@@ -308,6 +315,30 @@ func (s *Server) buildLineGroups() []LineGroup {
 			lines[i].LineUUID = uuid
 		}
 		byNode[nodeID] = lines
+	}
+
+	// (4b) design-17: join the managed-line overlay definitions onto their
+	// rediscovered lines. Defs are keyed by the planned line_hash_id; a
+	// definition whose apply never landed simply has no line to join, and its
+	// status surfaces through the lines service's "managed" listing instead.
+	// Join failure degrades (no overlay flags) and never fails the read model.
+	if defs, err := s.managedLineDefs(); err != nil {
+		s.logger.Printf("linemeta: list managed line defs: %v", err)
+	} else if len(defs) > 0 {
+		byHash := map[string]managedLineDef{}
+		for _, def := range defs {
+			byHash[def.LineHashID] = def
+		}
+		for nodeID, lines := range byNode {
+			for i := range lines {
+				if def, ok := byHash[lines[i].LineHashID]; ok {
+					lines[i].Overlay = true
+					lines[i].OverlayStatus = def.Status
+					lines[i].OverlayUser = def.UserID
+				}
+			}
+			byNode[nodeID] = lines
+		}
 	}
 
 	// (5) design-15 §6: declared chain edges. A sidecar-declared

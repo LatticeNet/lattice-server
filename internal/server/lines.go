@@ -44,7 +44,7 @@ type Line struct {
 	// DeclaredJumpEdges is the subset of JumpEdges resolved from the sidecar's
 	// declared downstream_line_uuid (design-15 §6), not inferred from outbound
 	// host/port — the UI badges these as orchestrated edges.
-	DeclaredJumpEdges []string          `json:"declared_jump_edges,omitempty"`
+	DeclaredJumpEdges []string `json:"declared_jump_edges,omitempty"`
 	// design-17: a line backed by a server-owned managed-line definition (the
 	// overlay) carries the definition's state. The join is by line_hash_id —
 	// the compiler pre-computes the hash discovery will assign, so a
@@ -52,11 +52,11 @@ type Line struct {
 	Overlay       bool              `json:"overlay,omitempty"`
 	OverlayStatus string            `json:"overlay_status,omitempty"` // planned | applied | failed
 	OverlayUser   string            `json:"overlay_user,omitempty"`
-	UserCount         int               `json:"user_count"`
-	UserKnown         bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
-	Status            string            `json:"status,omitempty"` // ok | pending | error | stale
-	LastError         string            `json:"last_error,omitempty"`
-	Metadata          map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
+	UserCount     int               `json:"user_count"`
+	UserKnown     bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
+	Status        string            `json:"status,omitempty"` // ok | pending | error | stale
+	LastError     string            `json:"last_error,omitempty"`
+	Metadata      map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
 }
 
 // LineGroup is the set of lines on one node — the unit the dashboard renders.

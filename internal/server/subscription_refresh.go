@@ -70,6 +70,12 @@ func (s *Server) snapshotFor(ctx context.Context, pluginID, subscriptionID strin
 	if err := s.store.UpsertSubscriptionSnapshot(fetched); err != nil {
 		return model.SubscriptionSnapshot{}, err
 	}
+	// The content moved: any rendered body cached for a share sourcing this
+	// record is now stale, no matter how much TTL it had left. Without this the
+	// revalidation cadence, not the content, would decide what clients get.
+	if has && existing.Raw != fetched.Raw {
+		s.invalidateSharesForSource(pluginID, subscriptionID)
+	}
 	s.recordAudit(model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionSubscriptionFetch, Decision: "allow",
 		Metadata: map[string]string{

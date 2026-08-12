@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,11 +80,20 @@ const (
 	// bounds the classes per share, so this is a share-count budget rather than a
 	// defence against key explosion.
 	subscriptionCacheEntries = 512
-	// subscriptionCacheTTL keeps a body reusable for long enough to absorb a
-	// client's retry burst without making a rotation take noticeably longer to
-	// take effect. Rotation does not wait for it: it invalidates directly.
-	subscriptionCacheTTL = 300 * time.Second
+	// subscriptionCacheTTL is the revalidation cadence, not the freshness bound:
+	// an expired entry whose content hash still matches is extended without a
+	// re-render, so the engine only ever runs when the content actually moved.
+	// It aligns with subscriptionRefreshInterval so one poll cycle performs at
+	// most one provider fetch and zero renders in the steady state.
+	subscriptionCacheTTL = 30 * time.Minute
 )
+
+// subscriptionContentHash digests the render input. The bytes themselves are
+// never stored on the key; the hash is only ever compared for equality.
+func subscriptionContentHash(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
 
 // handleSubscriptionShare serves the public subscription endpoint.
 //
@@ -141,6 +152,25 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass}
 
 	body, contentType, userinfo, cached := s.subscriptionCache.Get(key, s.now())
+	if !cached && share.Source.Kind == model.ShareSourcePlugin {
+		// Revalidate before paying for a render. A render boots the plugin's
+		// JavaScript engine, which costs seconds; comparing the content digest
+		// costs a store read and, at most, one provider fetch. When the digest
+		// still matches, the cached body is exact and is extended. When the
+		// source cannot be reached at all, the last good body is served — a
+		// provider outage must not take a client's configuration with it, the
+		// same rule the snapshot layer applies one step down.
+		if stale, ok := s.subscriptionCache.GetStale(key); ok {
+			snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false)
+			switch {
+			case snapErr != nil:
+				body, contentType, userinfo, cached = stale.body, stale.contentType, stale.userinfo, true
+			case subscriptionContentHash(snap.Raw) == stale.contentHash:
+				s.subscriptionCache.Extend(key, s.now())
+				body, contentType, userinfo, cached = stale.body, stale.contentType, stale.userinfo, true
+			}
+		}
+	}
 	if !cached {
 		rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass)
 		if renderErr != nil {
@@ -155,7 +185,15 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
-		s.subscriptionCache.Put(key, body, contentType, userinfo, s.now())
+		contentHash := ""
+		if share.Source.Kind == model.ShareSourcePlugin {
+			// renderShare already refreshed the snapshot, so this read is the
+			// fresh record, never a second fetch.
+			if snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false); snapErr == nil {
+				contentHash = subscriptionContentHash(snap.Raw)
+			}
+		}
+		s.subscriptionCache.Put(key, body, contentType, userinfo, contentHash, s.now())
 	}
 
 	if contentType == "" {
@@ -179,6 +217,30 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			"cache":        strconv.FormatBool(cached),
 		},
 	})
+}
+
+// invalidateSharesForPlugin drops every cached body rendered from one plugin's
+// store. A mutating management call (save/delete/import/migrate) can change
+// what any of its records render to, and the content hash cannot see it — the
+// record, not the content, is what changed — so the edit path invalidates here.
+func (s *Server) invalidateSharesForPlugin(pluginID string) {
+	for _, share := range s.store.SubscriptionShares() {
+		if share.Source.Kind == model.ShareSourcePlugin && share.Source.PluginID == pluginID {
+			s.subscriptionCache.InvalidateShare(share.ID)
+		}
+	}
+}
+
+// invalidateSharesForSource drops cached bodies for shares sourcing one record.
+// The refresh path calls it when a fetch returns different bytes than the
+// stored snapshot.
+func (s *Server) invalidateSharesForSource(pluginID, subscriptionID string) {
+	for _, share := range s.store.SubscriptionShares() {
+		if share.Source.Kind == model.ShareSourcePlugin &&
+			share.Source.PluginID == pluginID && share.Source.SubscriptionID == subscriptionID {
+			s.subscriptionCache.InvalidateShare(share.ID)
+		}
+	}
 }
 
 // renderShare asks the share's source for content. It never shows the source the

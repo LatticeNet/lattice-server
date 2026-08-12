@@ -269,6 +269,16 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "allow", "")
+	// A successful mutation of a plugin's subscription store can change what
+	// shares sourcing it render. Drop those cached bodies now — otherwise the
+	// edit would only take effect at the cache's revalidation cadence, and the
+	// content hash cannot see it (the record changed, not the content).
+	if req.Service == req.ID+"/subscription" {
+		switch req.Method {
+		case "save", "delete", "import", "migrate":
+			s.invalidateSharesForPlugin(req.ID)
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if len(out) == 0 {

@@ -88,7 +88,7 @@ func TestRotateInvalidatesTheCachedBody(t *testing.T) {
 	s, _ := newShareTestServer(t)
 	share := mustCreateShare(t, s)
 	key := subscriptionCacheKey{ShareID: share.ID, Format: "base64", UAClass: "surge"}
-	s.subscriptionCache.Put(key, []byte("stale"), "text/plain", "", s.now())
+	s.subscriptionCache.Put(key, []byte("stale"), "text/plain", "", "", s.now())
 
 	rec := httptest.NewRecorder()
 	s.rotateSubscriptionShare(rec, share, principal{})

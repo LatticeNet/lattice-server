@@ -939,6 +939,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
 	mux.HandleFunc("/api/network/nft/inputs", s.withAuth("network:plan", s.handleNFTInputs))
 	mux.HandleFunc("/api/network/nft/inputs/delete", s.withAuth("network:plan", s.handleDeleteNFTInputs))
+	// design-17 S1: managed-line overlay rollout compiler + definition views.
+	mux.HandleFunc("/api/network/lines/managed-rollout", s.withAuth("network:plan", s.handleManagedLineRollout))
 	mux.HandleFunc("/api/netpolicy", s.withAuth("", s.handleNetPolicy))
 	mux.HandleFunc("/api/netpolicy/plan", s.withAuth("", s.handleNetPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/delete", s.withAuth("", s.handleDeleteNetPolicy))
@@ -5539,6 +5541,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
+	if approval.Plugin == singBoxManagedLinePlugin {
+		if _, _, _, err := s.validateManagedLineApproval(approval); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+	}
 	if approval.Plugin == agentUpdatePlugin {
 		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
 			if errors.Is(err, errAgentUpdateApprovalStale) {
@@ -5615,6 +5622,10 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			if err != nil {
 				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 			}
+		case singBoxManagedLinePlugin:
+			// The script self-validates at render time; a stale plan yields a
+			// script that fails closed on the box instead of mutating it.
+			applyScript = s.managedLineApplyScript(approval)
 		default:
 			applyScript = s.applyScriptFor(approval)
 		}
@@ -6056,6 +6067,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == singBoxLineMetaPlugin {
 		return s.handleLineMetaTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin == singBoxManagedLinePlugin {
+		return s.handleManagedLineTaskResult(r, approval, task, result)
 	}
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)

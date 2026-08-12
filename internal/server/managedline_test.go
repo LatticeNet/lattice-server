@@ -418,3 +418,82 @@ func TestManagedLineTaskResultReconcile(t *testing.T) {
 		t.Fatal("successful apply must queue rediscovery")
 	}
 }
+
+// The applied overlay line is rediscovered under its planned identity and the
+// read model joins the definition onto it — the Lines view's managed badge.
+func TestManagedLineOverlayJoinsReadModel(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	seedManagedLineNode(t, srv, "node-a", realityInventoryLines())
+	seedManagedLineUser(t, srv)
+	approval, def := compileApproval(t, srv)
+
+	// Simulate the post-apply probe: the fragment's line appears in the
+	// node's inventory exactly as the parity test pinned (tag, vless, no
+	// listen host, no outbound ref).
+	lines := append(realityInventoryLines(), model.SingBoxNode{
+		Name: def.Tag, Protocol: "vless", Network: "reality",
+		Address: "203.0.113.10", Port: strconv.Itoa(def.Port), SNI: def.SNI,
+	})
+	seedManagedLineNode(t, srv, "node-a", lines)
+	def.Status = managedLineStatusApplied
+	if err := srv.putManagedLineDef(def); err != nil {
+		t.Fatal(err)
+	}
+
+	ln := findLine(t, srv.buildLineGroups(), "node-a", def.Tag)
+	if ln.LineHashID != def.LineHashID {
+		t.Fatalf("rediscovered line hash %q != planned %q", ln.LineHashID, def.LineHashID)
+	}
+	if !ln.Overlay || ln.OverlayStatus != managedLineStatusApplied || ln.OverlayUser != def.UserID {
+		t.Fatalf("overlay join wrong: %+v", ln)
+	}
+	_ = approval
+}
+
+// The Lines view drives both through the vpn-core interface bridge: the
+// redacted definition listing and the rollout compile.
+func TestManagedLineRPCManagedAndRollout(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	seedManagedLineNode(t, srv, "node-a", realityInventoryLines())
+	seedManagedLineUser(t, srv)
+	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, lineUserTestPrincipal())
+
+	out, err := srv.vpnCoreLinesRPC(ctx, "rollout", []byte(`{"user_id":"vpnuser_cdcd"}`))
+	if err != nil {
+		t.Fatalf("rollout rpc: %v", err)
+	}
+	var rolloutResp struct {
+		OK      bool                     `json:"ok"`
+		Planned []managedLinePlannedView `json:"planned"`
+		Skipped []managedLineSkippedView `json:"skipped"`
+	}
+	if err := json.Unmarshal(out, &rolloutResp); err != nil {
+		t.Fatal(err)
+	}
+	if !rolloutResp.OK || len(rolloutResp.Planned) != 1 || len(rolloutResp.Skipped) != 0 {
+		t.Fatalf("rollout rpc response = %+v", rolloutResp)
+	}
+
+	out, err = srv.vpnCoreLinesRPC(ctx, "managed", nil)
+	if err != nil {
+		t.Fatalf("managed rpc: %v", err)
+	}
+	var managedResp struct {
+		ManagedLines []managedLineDefView `json:"managed_lines"`
+	}
+	if err := json.Unmarshal(out, &managedResp); err != nil {
+		t.Fatal(err)
+	}
+	if len(managedResp.ManagedLines) != 1 {
+		t.Fatalf("managed lines = %d, want 1", len(managedResp.ManagedLines))
+	}
+	view := managedResp.ManagedLines[0]
+	if view.LineUUID != rolloutResp.Planned[0].LineUUID || view.Status != managedLineStatusPlanned {
+		t.Fatalf("managed view = %+v", view)
+	}
+	// The RPC view is the redacted one — serializing it must not expose the
+	// private key anywhere.
+	if raw, _ := json.Marshal(view); strings.Contains(string(raw), "private") {
+		t.Fatalf("managed view leaks key material: %s", raw)
+	}
+}

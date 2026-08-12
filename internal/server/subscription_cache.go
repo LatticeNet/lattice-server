@@ -22,8 +22,14 @@ type subscriptionCacheEntry struct {
 	// userinfo is the provider's traffic header. It travels with the body rather
 	// than in a parallel map so a cache hit can never serve one client's body
 	// with another's remaining-quota figures.
-	userinfo  string
-	expiresAt time.Time
+	userinfo string
+	// contentHash is the render input's digest. On expiry the serve path
+	// re-fetches the (cheap) content and compares hashes: unchanged means the
+	// body is still exact and the entry is extended instead of re-rendered,
+	// which is what keeps a client poll from booting the plugin's JavaScript
+	// engine on every cycle.
+	contentHash string
+	expiresAt   time.Time
 }
 
 // subscriptionCache keeps rendered subscription bodies for a short time so a
@@ -65,17 +71,44 @@ func (c *subscriptionCache) Get(key subscriptionCacheKey, now time.Time) ([]byte
 	}
 	entry := el.Value.(*subscriptionCacheEntry)
 	if !now.Before(entry.expiresAt) {
-		c.removeElement(el)
+		// Expired is not deleted: the revalidation path may still extend this
+		// entry unchanged or serve it as the last good body. The LRU bound and
+		// the next Put are what reclaim it.
 		return nil, "", "", false
 	}
 	c.order.MoveToFront(el)
 	return entry.body, entry.contentType, entry.userinfo, true
 }
 
+// GetStale returns a copy of the entry whether or not it has expired. The
+// revalidation path uses it to extend an unchanged body — or to serve the last
+// good body when the source is unreachable — instead of dropping the client to
+// an error.
+func (c *subscriptionCache) GetStale(key subscriptionCacheKey) (subscriptionCacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.entries[key]
+	if !ok {
+		return subscriptionCacheEntry{}, false
+	}
+	return *el.Value.(*subscriptionCacheEntry), true
+}
+
+// Extend re-stamps an entry the serve path has revalidated against the current
+// content, so a subscription whose bytes did not move is never re-rendered.
+func (c *subscriptionCache) Extend(key subscriptionCacheKey, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[key]; ok {
+		el.Value.(*subscriptionCacheEntry).expiresAt = now.Add(c.ttl)
+		c.order.MoveToFront(el)
+	}
+}
+
 // Put ignores an empty body. The endpoint refuses to serve one, so letting it
 // into the cache would create a path back to the exact response that makes a
 // client delete every node it had.
-func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentType, userinfo string, now time.Time) {
+func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentType, userinfo, contentHash string, now time.Time) {
 	if len(body) == 0 {
 		return
 	}
@@ -89,6 +122,7 @@ func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentTy
 		body:        body,
 		contentType: contentType,
 		userinfo:    userinfo,
+		contentHash: contentHash,
 		expiresAt:   now.Add(c.ttl),
 	})
 	c.entries[key] = el

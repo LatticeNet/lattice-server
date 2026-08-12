@@ -13,7 +13,7 @@ func TestSubscriptionCacheServesFreshAndExpires(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	c := newSubscriptionCache(8, time.Minute)
 
-	c.Put(shareCacheKey("a"), []byte("body-a"), "text/plain", "", base)
+	c.Put(shareCacheKey("a"), []byte("body-a"), "text/plain", "", "", base)
 
 	body, ct, _, ok := c.Get(shareCacheKey("a"), base.Add(30*time.Second))
 	if !ok || string(body) != "body-a" || ct != "text/plain" {
@@ -28,9 +28,9 @@ func TestSubscriptionCacheIsBounded(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	c := newSubscriptionCache(2, time.Minute)
 
-	c.Put(shareCacheKey("x"), []byte("x"), "text/plain", "", base)
-	c.Put(shareCacheKey("y"), []byte("y"), "text/plain", "", base)
-	c.Put(shareCacheKey("z"), []byte("z"), "text/plain", "", base)
+	c.Put(shareCacheKey("x"), []byte("x"), "text/plain", "", "", base)
+	c.Put(shareCacheKey("y"), []byte("y"), "text/plain", "", "", base)
+	c.Put(shareCacheKey("z"), []byte("z"), "text/plain", "", "", base)
 
 	if c.Len() > 2 {
 		t.Fatalf("cache holds %d entries, cap is 2", c.Len())
@@ -50,11 +50,11 @@ func TestSubscriptionCacheNeverStoresEmptyBodies(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	c := newSubscriptionCache(4, time.Minute)
 
-	c.Put(shareCacheKey("a"), nil, "text/plain", "", base)
+	c.Put(shareCacheKey("a"), nil, "text/plain", "", "", base)
 	if _, _, _, ok := c.Get(shareCacheKey("a"), base); ok {
 		t.Fatal("a nil body was cached")
 	}
-	c.Put(shareCacheKey("a"), []byte{}, "text/plain", "", base)
+	c.Put(shareCacheKey("a"), []byte{}, "text/plain", "", "", base)
 	if _, _, _, ok := c.Get(shareCacheKey("a"), base); ok {
 		t.Fatal("an empty body was cached")
 	}
@@ -66,9 +66,9 @@ func TestSubscriptionCacheKeysOnFormatAndUAClass(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	c := newSubscriptionCache(8, time.Minute)
 
-	c.Put(subscriptionCacheKey{ShareID: "a", Format: "base64", UAClass: "surge"}, []byte("b64-surge"), "text/plain", "", base)
-	c.Put(subscriptionCacheKey{ShareID: "a", Format: "plain", UAClass: "surge"}, []byte("plain-surge"), "text/plain", "", base)
-	c.Put(subscriptionCacheKey{ShareID: "a", Format: "base64", UAClass: "loon"}, []byte("b64-loon"), "text/plain", "", base)
+	c.Put(subscriptionCacheKey{ShareID: "a", Format: "base64", UAClass: "surge"}, []byte("b64-surge"), "text/plain", "", "", base)
+	c.Put(subscriptionCacheKey{ShareID: "a", Format: "plain", UAClass: "surge"}, []byte("plain-surge"), "text/plain", "", "", base)
+	c.Put(subscriptionCacheKey{ShareID: "a", Format: "base64", UAClass: "loon"}, []byte("b64-loon"), "text/plain", "", "", base)
 
 	for _, tc := range []struct {
 		key  subscriptionCacheKey
@@ -88,9 +88,9 @@ func TestSubscriptionCacheKeysOnFormatAndUAClass(t *testing.T) {
 func TestSubscriptionCacheInvalidateShareDropsEveryFormat(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	c := newSubscriptionCache(8, time.Minute)
-	c.Put(subscriptionCacheKey{ShareID: "a", Format: "base64", UAClass: "surge"}, []byte("x"), "text/plain", "", base)
-	c.Put(subscriptionCacheKey{ShareID: "a", Format: "plain", UAClass: "loon"}, []byte("y"), "text/plain", "", base)
-	c.Put(subscriptionCacheKey{ShareID: "b", Format: "base64", UAClass: "surge"}, []byte("z"), "text/plain", "", base)
+	c.Put(subscriptionCacheKey{ShareID: "a", Format: "base64", UAClass: "surge"}, []byte("x"), "text/plain", "", "", base)
+	c.Put(subscriptionCacheKey{ShareID: "a", Format: "plain", UAClass: "loon"}, []byte("y"), "text/plain", "", "", base)
+	c.Put(subscriptionCacheKey{ShareID: "b", Format: "base64", UAClass: "surge"}, []byte("z"), "text/plain", "", "", base)
 
 	c.InvalidateShare("a")
 
@@ -111,8 +111,8 @@ func TestSubscriptionCacheInvalidateShareDropsEveryFormat(t *testing.T) {
 func TestSubscriptionCacheCarriesUserinfoWithTheBody(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	c := newSubscriptionCache(8, time.Minute)
-	c.Put(shareCacheKey("a"), []byte("a"), "text/plain", "upload=1; download=2; total=3", base)
-	c.Put(shareCacheKey("b"), []byte("b"), "text/plain", "upload=9", base)
+	c.Put(shareCacheKey("a"), []byte("a"), "text/plain", "upload=1; download=2; total=3", "", base)
+	c.Put(shareCacheKey("b"), []byte("b"), "text/plain", "upload=9", "", base)
 
 	_, _, ua, ok := c.Get(shareCacheKey("a"), base)
 	if !ok || ua != "upload=1; download=2; total=3" {
@@ -121,5 +121,45 @@ func TestSubscriptionCacheCarriesUserinfoWithTheBody(t *testing.T) {
 	_, _, ub, ok := c.Get(shareCacheKey("b"), base)
 	if !ok || ub != "upload=9" {
 		t.Fatalf("userinfo for b = %q (ok=%v)", ub, ok)
+	}
+}
+
+func TestSubscriptionCacheRevalidationExtendsUnchangedBody(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	c := newSubscriptionCache(8, time.Minute)
+	key := shareCacheKey("a")
+	c.Put(key, []byte("body-a"), "text/plain", "ui", "hash-1", base)
+
+	// Past expiry the plain Get misses, but the stale entry is still readable
+	// for the revalidation decision.
+	if _, _, _, ok := c.Get(key, base.Add(2*time.Minute)); ok {
+		t.Fatal("expired entry served without revalidation")
+	}
+	stale, ok := c.GetStale(key)
+	if !ok || string(stale.body) != "body-a" || stale.contentHash != "hash-1" {
+		t.Fatalf("stale entry = %q %q %v", stale.body, stale.contentHash, ok)
+	}
+
+	// The serve path's "hash still matches" branch: extend, and the entry
+	// serves again for a full TTL from the extension.
+	c.Extend(key, base.Add(2*time.Minute))
+	body, _, ui, ok := c.Get(key, base.Add(2*time.Minute+30*time.Second))
+	if !ok || string(body) != "body-a" || ui != "ui" {
+		t.Fatalf("extended entry not served: %q %q %v", body, ui, ok)
+	}
+}
+
+func TestSubscriptionCacheHashChangeForcesReplace(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	c := newSubscriptionCache(8, time.Minute)
+	key := shareCacheKey("a")
+	c.Put(key, []byte("old"), "text/plain", "", "hash-1", base)
+
+	// The "hash moved" branch re-renders and Puts under the new hash; a later
+	// revalidation against the old hash must not resurrect the old body.
+	c.Put(key, []byte("new"), "text/plain", "", "hash-2", base.Add(2*time.Minute))
+	stale, ok := c.GetStale(key)
+	if !ok || string(stale.body) != "new" || stale.contentHash != "hash-2" {
+		t.Fatalf("replaced entry = %q %q %v", stale.body, stale.contentHash, ok)
 	}
 }

@@ -776,6 +776,15 @@ func (s *Server) handleManagedLineTaskResult(r *http.Request, approval model.App
 				return fmt.Errorf("persist failed managed line def: %w", err)
 			}
 		}
+		// Execution failure is not a decision: the approval returns to pending
+		// with the reason so the operator can fix the cause and re-approve the
+		// same plan (the definition's status keeps the script-side outcome).
+		approval.Status = model.ApprovalPending
+		approval.Reason = "execution failed: " + reason
+		approval.UpdatedAt = time.Now().UTC()
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return fmt.Errorf("return failed managed-line approval to pending: %w", err)
+		}
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID: id.New("audit"), NodeID: approval.NodeID, Action: "network.lines.managed_rollout.failed",
 			Decision: "deny", Reason: reason, Metadata: metadata,

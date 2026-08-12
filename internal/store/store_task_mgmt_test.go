@@ -124,3 +124,40 @@ func TestTaskFanoutLeasesEveryTargetAndAggregatesStatus(t *testing.T) {
 		t.Fatalf("final status: ok=%v status=%q finished=%v", ok, task.Status, task.FinishedAt)
 	}
 }
+
+func TestTaskLeaseExpiryReleasesDeadLease(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := s.CreateTask(model.Task{ID: "task-ghost", Targets: []string{"n1"}, TimeoutSec: 60, Status: model.TaskQueued}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	first, err := s.LeaseTasks("n1", 3)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first lease: len=%d err=%v", len(first), err)
+	}
+	// A live lease is never re-handed-out.
+	if dup, err := s.LeaseTasks("n1", 3); err != nil || len(dup) != 0 {
+		t.Fatalf("live lease re-handed: len=%d err=%v", len(dup), err)
+	}
+	// Backdate the lease past timeout+margin: the agent is certainly dead (it
+	// kills the task at TimeoutSec), so the task must become leasable again,
+	// under a NEW lease id so the zombie's late report fails validation.
+	s.mu.Lock()
+	ghost := s.state.Tasks["task-ghost"]
+	lease := ghost.TargetLeases["n1"]
+	lease.StartedAt = time.Now().UTC().Add(-20 * time.Minute)
+	ghost.TargetLeases["n1"] = lease
+	ghost.StartedAt = lease.StartedAt
+	s.state.Tasks["task-ghost"] = ghost
+	s.mu.Unlock()
+
+	second, err := s.LeaseTasks("n1", 3)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("expired lease not re-handed: len=%d err=%v", len(second), err)
+	}
+	if second[0].LeaseID == "" || second[0].LeaseID == first[0].LeaseID {
+		t.Fatalf("re-lease must mint a fresh lease id: first=%q second=%q", first[0].LeaseID, second[0].LeaseID)
+	}
+}

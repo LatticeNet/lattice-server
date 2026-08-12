@@ -1291,6 +1291,15 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 	}
 	return "set -e\n" +
 		"umask 077\n" +
+		// The task shim caps every file the script writes at 8 MiB
+		// (RLIMIT_FSIZE, agent taskexec) — and the agent release binary is
+		// larger, so the download dies to SIGXFSZ (exit 153, "File size limit
+		// exceeded"). That cap is inherited, and tasks run as root, so the
+		// script can raise its own limit here; this is the only fix that works
+		// with the agents already on the fleet (a taskexec fix only ships with
+		// the binary this very task is trying to install).
+		"ulimit -Hf unlimited 2>/dev/null || true\n" +
+		"ulimit -Sf unlimited 2>/dev/null || true\n" +
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
 		"URL=" + shellQuote(payload.BinaryURL) + "\n" +
 		"EXPECT_SHA=" + shellQuote(payload.SHA256) + "\n" +
@@ -1397,8 +1406,13 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		})
 	} else {
 		policy.LastError = taskFailureSummary(result)
-		approval.Status = model.ApprovalRejected
-		approval.Reason = policy.LastError
+		// An execution failure is not a decision: return the approval to
+		// pending with the failure reason attached, so the operator can fix the
+		// cause and re-approve the exact same plan. Marking it rejected burned
+		// the review and left no retry path (2026-08-12 fleet rollout: 20
+		// nodes failed on the rlimit and read as "rejected" in the UI).
+		approval.Status = model.ApprovalPending
+		approval.Reason = "execution failed: " + policy.LastError
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   approval.NodeID,

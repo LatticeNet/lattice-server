@@ -62,10 +62,22 @@ func TestRealV2HelperTwoInvocations(t *testing.T) {
 	if err := tr.awaitReady(1); err != nil {
 		t.Fatal(err)
 	}
+	var pid int
 	for i := 0; i < 2; i++ {
 		r, err := tr.invokeV2(t.Context(), 1, fmt.Sprintf("i%d", i), InvokeRequest{Action: "x"}, func(systemHostCall) systemHostResponse { return systemHostResponse{ID: "h1", OK: true} })
 		if err != nil || !r.OK {
 			t.Fatalf("invoke %d: %+v %v", i, r, err)
+		}
+		var body struct {
+			PID int `json:"pid"`
+		}
+		if err := json.Unmarshal(r.Result, &body); err != nil || body.PID <= 0 {
+			t.Fatalf("missing helper pid: %s", r.Result)
+		}
+		if i == 0 {
+			pid = body.PID
+		} else if body.PID != pid {
+			t.Fatalf("pid changed: %d -> %d", pid, body.PID)
 		}
 	}
 }

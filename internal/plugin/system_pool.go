@@ -146,12 +146,11 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 			}
 			p.mu.Unlock()
 			if !removed {
-				select {
-				case res := <-ch:
-					if res.worker != nil {
-						p.release(res.worker, false, time.Now())
-					}
-				case <-time.After(time.Millisecond):
+				// wakeLocked has removed this waiter and owns the buffered result;
+				// reconcile synchronously so a lease can never be lost.
+				res := <-ch
+				if res.worker != nil {
+					p.release(res.worker, false, time.Now())
 				}
 			}
 			return nil, ctx.Err()

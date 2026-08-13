@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 )
 
 func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse) (systemRunnerReply, error) {
@@ -242,8 +243,14 @@ func (t *systemWorkerTransport) abort() error {
 	}
 	t.abortOnce.Do(func() {
 		_ = syscall.Kill(-t.pgid, syscall.SIGTERM)
-		_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
-		t.abortErr = t.cmd.Wait()
+		done := make(chan error, 1)
+		go func() { done <- t.cmd.Wait() }()
+		select {
+		case t.abortErr = <-done:
+		case <-time.After(100 * time.Millisecond):
+			_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
+			t.abortErr = <-done
+		}
 		t.closePipes()
 	})
 	return t.abortErr

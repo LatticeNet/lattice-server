@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -427,8 +428,39 @@ func TestQueuedNetGuardTaskIsWithheldAfterAgentCapabilityDowngrade(t *testing.T)
 	if err := json.Unmarshal(allowed.Body.Bytes(), &allowedTasks); err != nil {
 		t.Fatal(err)
 	}
-	if len(allowedTasks) != 1 || !strings.Contains(allowedTasks[0].Script, "--guard-managed-sha") {
+	if len(allowedTasks) != 1 || !allowedTasks[0].DurableResult || !strings.Contains(allowedTasks[0].Script, "--guard-managed-sha") {
 		t.Fatalf("capable agent did not receive netguard task: %+v", allowedTasks)
+	}
+	leasedID := allowedTasks[0].LeaseID
+	legacyRetry := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-a", "", token)
+	if legacyRetry.Code != http.StatusOK {
+		t.Fatalf("legacy redelivery poll: %d %s", legacyRetry.Code, legacyRetry.Body.String())
+	}
+	if err := json.Unmarshal(legacyRetry.Body.Bytes(), &blockedTasks); err != nil {
+		t.Fatal(err)
+	}
+	if len(blockedTasks) != 0 {
+		t.Fatalf("capability downgrade received an existing netguard lease: %+v", blockedTasks)
+	}
+	allowedAgain := httptest.NewRecorder()
+	handler.ServeHTTP(allowedAgain, allowedReq.Clone(allowedReq.Context()))
+	if allowedAgain.Code != http.StatusOK {
+		t.Fatalf("capable redelivery poll: %d %s", allowedAgain.Code, allowedAgain.Body.String())
+	}
+	var redelivered []agentTaskView
+	if err := json.Unmarshal(allowedAgain.Body.Bytes(), &redelivered); err != nil {
+		t.Fatal(err)
+	}
+	if len(redelivered) != 1 || redelivered[0].LeaseID != leasedID {
+		t.Fatalf("capability recovery changed lease: first=%+v redelivered=%+v", allowedTasks, redelivered)
+	}
+	zeroFinished := fmt.Sprintf(
+		`{"node_id":"node-a","result":{"task_id":%q,"lease_id":%q,"exit_code":0}}`,
+		allowedTasks[0].ID, leasedID,
+	)
+	rejected := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", zeroFinished, token)
+	if rejected.Code != http.StatusBadRequest {
+		t.Fatalf("netguard result without finished_at = %d %s, want 400", rejected.Code, rejected.Body.String())
 	}
 }
 
@@ -708,6 +740,9 @@ func postNetGuardTaskResult(t *testing.T, handler http.Handler, token string, ta
 	t.Helper()
 	result.TaskID = task.ID
 	result.LeaseID = task.LeaseID
+	if result.FinishedAt.IsZero() {
+		result.FinishedAt = time.Date(2026, 8, 13, 7, 30, 0, 0, time.UTC)
+	}
 	payload, err := json.Marshal(map[string]any{
 		"node_id": task.LeasedBy,
 		"result":  result,

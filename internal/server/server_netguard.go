@@ -916,6 +916,10 @@ func (s *Server) handleNetGuardTaskResult(r *http.Request, approval model.Approv
 		if committed {
 			if err != nil {
 				s.logger.Printf("netguard task result committed with degraded durability: %v", err)
+				// The exact transition is visible for idempotent retry, but the agent
+				// must retain its result journal until a later request confirms the
+				// state-file directory entry and receives HTTP 200.
+				return err
 			}
 			action, decision := "netguard.apply.applied", "allow"
 			if reason != "" {

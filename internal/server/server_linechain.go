@@ -599,13 +599,14 @@ func (s *Server) handleLineChainTaskResult(approval model.Approval, result model
 }
 
 func (s *Server) classifyLineChainTerminal(approvalID string) (string, string, error) {
-	snapshot, err := s.captureLineChainCompileSnapshot()
-	if err != nil {
-		return "", "", err
-	}
-	attempt, ok := snapshot.Chains.Attempts[approvalID]
+	persistent := s.store.LineChainCompileStateSnapshot()
+	attempt, ok := persistent.Chains.Attempts[approvalID]
 	if !ok {
 		return "", "", store.ErrLineChainAttemptNotFound
+	}
+	snapshot, err := s.captureLineChainCompileSnapshotFromState(persistent)
+	if err != nil {
+		return store.LineChainStatusDrifted, "inputs_changed", nil
 	}
 	frozen := attempt.CandidateDefinition
 	source := snapshot.Lines[attempt.SourceLineUUID]
@@ -626,7 +627,7 @@ func (s *Server) classifyLineChainTerminal(approvalID string) (string, string, e
 		return store.LineChainStatusDrifted, "target_missing", nil
 	}
 	if _, ok := snapshot.Definitions[frozen.TargetLineUUID]; !ok {
-		return store.LineChainStatusDrifted, "target_missing", nil
+		return store.LineChainStatusDrifted, "inputs_changed", nil
 	}
 	compiled, err := s.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: attempt.SourceLineUUID, TargetLineUUID: attempt.CandidateTargetLineUUID})
 	if err != nil || !sameLineChainCandidate(compiled.CandidateDefinition, frozen) {

@@ -257,6 +257,71 @@ func TestLineChainCompilerUsesImmutableCapturedSnapshot(t *testing.T) {
 	}
 }
 
+func TestLineChainTerminalAcceptsIssuedSuccessWhenLiveDescriptorDrifts(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *Server, string)
+	}{
+		{name: "managed_definition_missing", mutate: func(t *testing.T, srv *Server, targetUUID string) {
+			vpnPublic, vpnPrivate := srv.store.VpnUserRecords()
+			managedPublic, managedPrivate := srv.store.ManagedLineRecords()
+			delete(managedPublic, targetUUID)
+			delete(managedPrivate, targetUUID)
+			if err := srv.store.ReplaceLineSecretRecords(vpnPublic, vpnPrivate, managedPublic, managedPrivate, nil); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "credential_changed", mutate: func(t *testing.T, srv *Server, _ string) {
+			vpnPublic, vpnPrivate := srv.store.VpnUserRecords()
+			for id, record := range vpnPrivate {
+				if len(record.Credentials) > 0 {
+					record.Credentials[0].UUID = "33333333-3333-4333-8333-333333333333"
+					vpnPrivate[id] = record
+					break
+				}
+			}
+			managedPublic, managedPrivate := srv.store.ManagedLineRecords()
+			if err := srv.store.ReplaceLineSecretRecords(vpnPublic, vpnPrivate, managedPublic, managedPrivate, nil); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+			compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+			if err != nil {
+				t.Fatal(err)
+			}
+			planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+			approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+			if err != nil || len(deliveries) != 1 {
+				t.Fatalf("lease=%+v err=%v", deliveries, err)
+			}
+			tc.mutate(t, srv, targetUUID)
+			status, driftCode, err := srv.classifyLineChainTerminal(approval.ID)
+			if err != nil || status != store.LineChainStatusDrifted || driftCode != "inputs_changed" {
+				t.Fatalf("classification status=%q code=%q err=%v", status, driftCode, err)
+			}
+			result := model.TaskResult{TaskID: deliveries[0].Task.ID, NodeID: "node-b", LeaseID: deliveries[0].Task.LeaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}
+			if committed, err := srv.store.CompleteLineChainTaskResult(result, approval, status, driftCode, ""); err != nil || !committed {
+				t.Fatalf("complete committed=%v err=%v", committed, err)
+			}
+			if matches, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
+				t.Fatalf("exact replay matches=%v found=%v err=%v", matches, found, err)
+			}
+		})
+	}
+}
+
 func TestLineChainCompilerRejectsMissingConsumerCapability(t *testing.T) {
 	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
 	srv.replaceAgentCapabilities("node-b", nil)

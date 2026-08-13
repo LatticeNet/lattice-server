@@ -61,6 +61,10 @@ func (s *Server) handleAgentSingBoxInventory(w http.ResponseWriter, r *http.Requ
 	s.singboxInv[req.NodeID] = inv
 	s.singboxInvMu.Unlock()
 	s.invalidateLineReadModel()
+	if err := s.reconcileLineChainsForNode(req.NodeID); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 
 	// design-15 D2: a changed line set queues a sidecar sync (pending approval —
 	// discovery still never mutates the node by itself).

@@ -89,6 +89,11 @@ type LineChainSnapshot struct {
 	Revision    uint64
 }
 
+type LineChainObservation struct {
+	OutboundTag        string
+	DownstreamLineUUID string
+}
+
 // LineChainCompileStateSnapshot is the persistent half of the compiler input.
 // It is copied under one store lock and is safe for server-side projection
 // without further store reads or identity allocation.
@@ -166,6 +171,47 @@ func (s *Store) LineChainSnapshot() LineChainSnapshot {
 	}
 }
 
+// ReconcileLineChains advances committed set/replace definitions and remove
+// tombstones from host-applied state using scheduled inventory evidence.
+func (s *Store) ReconcileLineChains(observations map[string]LineChainObservation) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	definitions := cloneLineChainDefinitions(s.state.LineChainDefinitions)
+	now, changed := time.Now().UTC(), false
+	for sourceUUID, observation := range observations {
+		definition, ok := definitions[sourceUUID]
+		if !ok {
+			continue
+		}
+		status, driftCode := LineChainStatusDrifted, "observed_mismatch"
+		if definition.TargetLineUUID == "" {
+			if observation.OutboundTag == "" && observation.DownstreamLineUUID == "" {
+				status, driftCode = LineChainStatusConverged, ""
+			} else {
+				driftCode = "remove_artifacts_present"
+			}
+		} else if observation.OutboundTag == definition.OutboundTag && observation.DownstreamLineUUID == definition.TargetLineUUID {
+			status, driftCode = LineChainStatusConverged, ""
+		}
+		if definition.Status == status && definition.DriftCode == driftCode {
+			continue
+		}
+		definition.Status, definition.DriftCode, definition.UpdatedAt = status, driftCode, now
+		definitions[sourceUUID], changed = definition, true
+	}
+	if !changed {
+		return false, nil
+	}
+	staged := s.state
+	staged.LineChainDefinitions = definitions
+	staged.LineChainGraphRevision++
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return committed, err
+}
+
 func validateLineChainAttempt(attempt LineChainAttempt) error {
 	if strings.TrimSpace(attempt.ApprovalID) == "" || strings.TrimSpace(attempt.SourceLineUUID) == "" {
 		return errors.New("line chain approval_id and source_line_uuid are required")
@@ -229,6 +275,11 @@ func (s *Store) planLineChainLocked(attempt LineChainAttempt, approval *model.Ap
 	attempt.UpdatedAt = now
 	staged := s.state
 	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+	for approvalID, prior := range staged.LineChainAttempts {
+		if prior.SourceLineUUID == attempt.SourceLineUUID && prior.Status == LineChainStatusFailed {
+			delete(staged.LineChainAttempts, approvalID)
+		}
+	}
 	staged.LineChainAttempts[attempt.ApprovalID] = attempt
 	if approval != nil {
 		if approval.ID != attempt.ApprovalID || approval.Status != model.ApprovalPending {
@@ -351,9 +402,23 @@ func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.A
 	if !ok || task.ApprovalID != approval.ID || !taskLeaseMatches(task, r.NodeID, r.LeaseID) {
 		return false, ErrTaskLeaseMismatch
 	}
+	storedApproval, ok := s.state.Approvals[approval.ID]
+	if !ok || storedApproval.Status != model.ApprovalApproved || storedApproval.Plugin != "singbox-linechain" || storedApproval.Service != "network/lines" ||
+		(storedApproval.Method != "chain_set_apply" && storedApproval.Method != "chain_remove_apply") || !strings.HasPrefix(storedApproval.Action, "apply-line-chain:") ||
+		storedApproval.Action != approval.Action || storedApproval.Plan != approval.Plan || storedApproval.ArtifactDigest != approval.ArtifactDigest ||
+		storedApproval.RequestSHA256 != approval.RequestSHA256 || storedApproval.NodeID != approval.NodeID {
+		return false, ErrTaskTransitionConflict
+	}
 	attempt, ok := s.state.LineChainAttempts[approval.ID]
 	if !ok || attempt.Status != LineChainStatusApplying || attempt.IssuedTaskID != task.ID || attempt.IssuedLeaseID != r.LeaseID ||
-		attempt.IssuedScriptSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(task.Script))) || attempt.IssuedArtifactSHA256 != approval.ArtifactDigest {
+		attempt.ApprovalID != approval.ID || attempt.SourceNodeID != r.NodeID || attempt.IssuedScriptSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(task.Script))) ||
+		attempt.IssuedArtifactSHA256 != storedApproval.ArtifactDigest || attempt.CandidateArtifactSHA256 != storedApproval.ArtifactDigest {
+		return false, ErrTaskTransitionConflict
+	}
+	success := r.ExitCode == 0 && r.Error == ""
+	validDriftCode := errorCode == "inputs_changed" || errorCode == "target_missing" || errorCode == "source_missing"
+	if len(terminalError) > 512 || (success && !((terminalStatus == LineChainStatusAppliedUnobserved && errorCode == "") || (terminalStatus == LineChainStatusDrifted && validDriftCode))) ||
+		(!success && (errorCode != "host_apply_failed" || terminalError == "")) {
 		return false, ErrTaskTransitionConflict
 	}
 	now := time.Now().UTC()
@@ -377,11 +442,10 @@ func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.A
 	for id, value := range s.state.Approvals {
 		staged.Approvals[id] = value
 	}
-	approval.CreatedAt = s.state.Approvals[approval.ID].CreatedAt
+	approval = storedApproval
 	approval.UpdatedAt = now
 	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
 	staged.LineChainDefinitions = cloneLineChainDefinitions(s.state.LineChainDefinitions)
-	success := r.ExitCode == 0 && r.Error == ""
 	if success {
 		approval.Status, approval.Reason = model.ApprovalApplied, ""
 		definition := attempt.CandidateDefinition
@@ -395,7 +459,7 @@ func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.A
 		staged.LineChainDefinitions[attempt.SourceLineUUID] = definition
 		delete(staged.LineChainAttempts, approval.ID)
 	} else {
-		approval.Status, approval.Reason = model.ApprovalApplied, "execution failed"
+		approval.Status, approval.Reason = model.ApprovalApproved, "execution failed; fresh plan required"
 		attempt.Status, attempt.LastErrorCode, attempt.LastError, attempt.UpdatedAt = LineChainStatusFailed, errorCode, terminalError, now
 		staged.LineChainAttempts[approval.ID] = attempt
 	}

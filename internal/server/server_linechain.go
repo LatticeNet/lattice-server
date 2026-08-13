@@ -575,23 +575,12 @@ func (s *Server) validateLineChainFirstLease(persistent store.LineChainCompileSt
 }
 
 func (s *Server) handleLineChainTaskResult(approval model.Approval, result model.TaskResult) error {
-	var plan lineChainPlan
-	if err := json.Unmarshal([]byte(approval.Plan), &plan); err != nil {
-		return err
-	}
 	status, driftCode := store.LineChainStatusAppliedUnobserved, ""
 	if result.ExitCode == 0 && result.Error == "" {
 		var err error
-		if plan.Operation == store.LineChainOperationRemove {
-			_, err = s.compileLineChainRemove(plan.SourceLineUUID)
-		} else {
-			_, err = s.compileLineChain(lineChainCompileRequest{SourceLineUUID: plan.SourceLineUUID, TargetLineUUID: plan.TargetLineUUID})
-		}
+		status, driftCode, err = s.classifyLineChainTerminal(approval.ID)
 		if err != nil {
-			status, driftCode = store.LineChainStatusDrifted, "inputs_changed"
-			if strings.Contains(err.Error(), "target") || strings.Contains(err.Error(), "line_uuid") {
-				driftCode = "target_missing"
-			}
+			return err
 		}
 	}
 	terminalError := result.Error
@@ -606,6 +595,72 @@ func (s *Server) handleLineChainTaskResult(approval model.Approval, result model
 	if committed && err != nil {
 		s.logger.Printf("line chain terminal result committed with degraded durability: %v", err)
 	}
+	return err
+}
+
+func (s *Server) classifyLineChainTerminal(approvalID string) (string, string, error) {
+	snapshot, err := s.captureLineChainCompileSnapshot()
+	if err != nil {
+		return "", "", err
+	}
+	attempt, ok := snapshot.Chains.Attempts[approvalID]
+	if !ok {
+		return "", "", store.ErrLineChainAttemptNotFound
+	}
+	frozen := attempt.CandidateDefinition
+	source := snapshot.Lines[attempt.SourceLineUUID]
+	if len(source) != 1 {
+		return store.LineChainStatusDrifted, "source_missing", nil
+	}
+	if source[0].NodeID != frozen.SourceNodeID || source[0].LineHashID != frozen.SourceLineHashID || source[0].Tag != frozen.SourceInboundTag {
+		return store.LineChainStatusDrifted, "inputs_changed", nil
+	}
+	if attempt.Operation == store.LineChainOperationRemove {
+		base := snapshot.Chains.Definitions[attempt.SourceLineUUID]
+		if base.Generation != attempt.BaseGeneration || base.ArtifactSHA256 != attempt.BaseArtifactSHA256 {
+			return store.LineChainStatusDrifted, "inputs_changed", nil
+		}
+		return store.LineChainStatusAppliedUnobserved, "", nil
+	}
+	if _, ok := snapshot.Nodes[frozen.TargetNodeID]; !ok || len(snapshot.Lines[frozen.TargetLineUUID]) != 1 {
+		return store.LineChainStatusDrifted, "target_missing", nil
+	}
+	if _, ok := snapshot.Definitions[frozen.TargetLineUUID]; !ok {
+		return store.LineChainStatusDrifted, "target_missing", nil
+	}
+	compiled, err := s.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: attempt.SourceLineUUID, TargetLineUUID: attempt.CandidateTargetLineUUID})
+	if err != nil || !sameLineChainCandidate(compiled.CandidateDefinition, frozen) {
+		return store.LineChainStatusDrifted, "inputs_changed", nil
+	}
+	return store.LineChainStatusAppliedUnobserved, "", nil
+}
+
+func sameLineChainCandidate(a, b store.LineChainDefinition) bool {
+	return a.SourceLineUUID == b.SourceLineUUID && a.SourceNodeID == b.SourceNodeID && a.SourceLineHashID == b.SourceLineHashID &&
+		a.SourceInboundTag == b.SourceInboundTag && a.TargetLineUUID == b.TargetLineUUID && a.TargetNodeID == b.TargetNodeID &&
+		a.TargetDefinitionDigest == b.TargetDefinitionDigest && a.TargetPublicMaterialDigest == b.TargetPublicMaterialDigest &&
+		a.TargetCredentialDigest == b.TargetCredentialDigest && a.OutboundTag == b.OutboundTag && a.FragmentPath == b.FragmentPath &&
+		a.FragmentSHA256 == b.FragmentSHA256 && a.SidecarSHA256 == b.SidecarSHA256 && a.ArtifactSHA256 == b.ArtifactSHA256
+}
+
+func (s *Server) reconcileLineChainsForNode(nodeID string) error {
+	snapshot, err := s.captureLineChainCompileSnapshot()
+	if err != nil {
+		return err
+	}
+	observations := make(map[string]store.LineChainObservation)
+	for sourceUUID, definition := range snapshot.Chains.Definitions {
+		if definition.SourceNodeID != nodeID {
+			continue
+		}
+		observation := store.LineChainObservation{}
+		if lines := snapshot.Lines[sourceUUID]; len(lines) == 1 {
+			observation.OutboundTag = strings.TrimSpace(lines[0].OutboundRef)
+			observation.DownstreamLineUUID = strings.TrimSpace(lines[0].DownstreamLineUUID)
+		}
+		observations[sourceUUID] = observation
+	}
+	_, err = s.store.ReconcileLineChains(observations)
 	return err
 }
 

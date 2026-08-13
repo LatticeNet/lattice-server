@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -232,5 +234,101 @@ func TestCompleteLineChainTaskResultPromotesFrozenCandidateAndReplaysExactly(t *
 	conflict.ExitCode = 1
 	if matches, found, _ := s.ConfirmTaskResultReplay(conflict); !found || matches {
 		t.Fatalf("conflicting replay accepted: matches=%v found=%v", matches, found)
+	}
+}
+
+func TestCompleteLineChainTaskResultFailurePreservesBaselineAndFreshPlanSupersedes(t *testing.T) {
+	s, approval, task, leaseID := seedLineChainResultAttempt(t)
+	baseline := LineChainDefinition{SourceLineUUID: "source", SourceNodeID: "node-a", TargetLineUUID: "old-target", ArtifactSHA256: "old", Generation: 4, Status: LineChainStatusConverged}
+	s.state.LineChainDefinitions["source"] = baseline
+	attempt := s.state.LineChainAttempts[approval.ID]
+	attempt.BaseGeneration, attempt.BaseArtifactSHA256 = 4, "old"
+	s.state.LineChainAttempts[approval.ID] = attempt
+	result := model.TaskResult{TaskID: task.ID, NodeID: "node-a", LeaseID: leaseID, ExitCode: 1, Error: "host failed", FinishedAt: time.Now().UTC()}
+	if committed, err := s.CompleteLineChainTaskResult(result, approval, LineChainStatusAppliedUnobserved, "host_apply_failed", "host failed"); err != nil || !committed {
+		t.Fatalf("complete committed=%v err=%v", committed, err)
+	}
+	gotApproval, _ := s.Approval(approval.ID)
+	snapshot := s.LineChainSnapshot()
+	if gotApproval.Status != model.ApprovalApproved || gotApproval.Reason != "execution failed; fresh plan required" || !reflect.DeepEqual(snapshot.Definitions["source"], baseline) || snapshot.Attempts[approval.ID].Status != LineChainStatusFailed || snapshot.Revision != 2 {
+		t.Fatalf("failed result changed baseline or authority: approval=%+v snapshot=%+v", gotApproval, snapshot)
+	}
+	newApproval := model.Approval{ID: "approval-fresh", NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines", Method: "chain_set_apply", Action: "apply-line-chain:new", ArtifactDigest: "new", RequestSHA256: "fresh", Status: model.ApprovalPending}
+	newAttempt := LineChainAttempt{ApprovalID: newApproval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a", CandidateTargetLineUUID: "new-target", BaseGeneration: 4, BaseArtifactSHA256: "old", CandidateArtifactSHA256: "new", RequestSHA256: "fresh", PlanGraphRevision: 2}
+	if _, _, err := s.PlanLineChainApproval(newAttempt, newApproval); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := s.LineChainSnapshot().Attempts[approval.ID]; exists {
+		t.Fatal("fresh plan retained an unordered failed attempt for the same source")
+	}
+}
+
+func TestCompleteLineChainTaskResultPostRenameReplayConfirmsDurability(t *testing.T) {
+	s, approval, task, leaseID := seedLineChainResultAttempt(t)
+	calls := 0
+	s.syncParentDir = func(string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("forced directory sync failure")
+		}
+		return nil
+	}
+	result := model.TaskResult{TaskID: task.ID, NodeID: "node-a", LeaseID: leaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}
+	if committed, err := s.CompleteLineChainTaskResult(result, approval, LineChainStatusAppliedUnobserved, "", ""); !committed || err == nil {
+		t.Fatalf("post-rename result committed=%v err=%v", committed, err)
+	}
+	if matches, found, err := s.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
+		t.Fatalf("exact retry did not reconfirm durability: matches=%v found=%v err=%v", matches, found, err)
+	}
+}
+
+func seedLineChainResultAttempt(t *testing.T) (*Store, model.Approval, model.Task, string) {
+	t.Helper()
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{ID: "approval-result-helper", NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines", Method: "chain_set_apply", Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending}
+	frozen := LineChainDefinition{SourceLineUUID: "source", SourceNodeID: "node-a", SourceLineHashID: "hash", SourceInboundTag: "in", TargetLineUUID: "target", TargetNodeID: "node-b", ArtifactSHA256: "digest"}
+	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a", CandidateTargetLineUUID: "target", CandidateArtifactSHA256: "digest", CandidateDefinition: frozen, RequestSHA256: "request"}
+	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	task := model.Task{ID: "task-result-helper", ApprovalID: approval.ID, Targets: []string{"node-a"}, Script: "script", Status: model.TaskQueued}
+	if _, committed, err := s.ApproveLineChain(approval, task); err != nil || !committed {
+		t.Fatalf("approve committed=%v err=%v", committed, err)
+	}
+	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil })
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	}
+	return s, approval, task, deliveries[0].Task.LeaseID
+}
+
+func TestReconcileLineChainsUsesExactObservedSetAndRemoveEvidence(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.state.LineChainDefinitions["set-ok"] = LineChainDefinition{SourceLineUUID: "set-ok", TargetLineUUID: "target", OutboundTag: "out", Status: LineChainStatusAppliedUnobserved}
+	s.state.LineChainDefinitions["set-bad"] = LineChainDefinition{SourceLineUUID: "set-bad", TargetLineUUID: "target", OutboundTag: "out", Status: LineChainStatusAppliedUnobserved}
+	s.state.LineChainDefinitions["remove-ok"] = LineChainDefinition{SourceLineUUID: "remove-ok", OutboundTag: "old-out", Status: LineChainStatusAppliedUnobserved}
+	s.state.LineChainDefinitions["remove-bad"] = LineChainDefinition{SourceLineUUID: "remove-bad", OutboundTag: "old-out", Status: LineChainStatusAppliedUnobserved}
+	s.state.LineChainGraphRevision = 7
+	committed, err := s.ReconcileLineChains(map[string]LineChainObservation{
+		"set-ok":     {OutboundTag: "out", DownstreamLineUUID: "target"},
+		"set-bad":    {OutboundTag: "wrong", DownstreamLineUUID: "target"},
+		"remove-ok":  {},
+		"remove-bad": {OutboundTag: "old-out"},
+	})
+	if err != nil || !committed {
+		t.Fatalf("reconcile committed=%v err=%v", committed, err)
+	}
+	snapshot := s.LineChainSnapshot()
+	if snapshot.Definitions["set-ok"].Status != LineChainStatusConverged || snapshot.Definitions["set-bad"].DriftCode != "observed_mismatch" ||
+		snapshot.Definitions["remove-ok"].Status != LineChainStatusConverged || snapshot.Definitions["remove-ok"].TargetLineUUID != "" ||
+		snapshot.Definitions["remove-bad"].DriftCode != "remove_artifacts_present" || snapshot.Revision != 8 {
+		t.Fatalf("unexpected reconciliation: %+v", snapshot)
 	}
 }

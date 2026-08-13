@@ -51,6 +51,14 @@ func (p *systemPool) hasTransport() bool {
 			return true
 		}
 	}
+	for w := range p.leased {
+		w.state = workerRetiring
+		if w.transport != nil {
+			_ = w.transport.abort()
+		}
+		w.state = workerDead
+	}
+	p.leased = map[*pooledWorker]struct{}{}
 	return false
 }
 

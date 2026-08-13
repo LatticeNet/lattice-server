@@ -265,6 +265,10 @@ func validateRuntimePath(root, runtimePath string, wantMode os.FileMode) error {
 func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 	r.mu.Lock()
 	st := r.st[req.PluginID]
+	if st != nil && req.Generation != 0 && st.pool != nil && req.Generation != st.pool.generation {
+		r.mu.Unlock()
+		return nil
+	}
 	delete(r.st, req.PluginID)
 	r.mu.Unlock()
 	if st != nil {

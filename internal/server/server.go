@@ -2114,10 +2114,13 @@ func (s *Server) agentRuntimeSnapshot(nodeID string) *agentRuntimeConfig {
 }
 
 func (s *Server) replaceAgentCapabilities(nodeID string, capabilities []string) {
-	known := make(map[string]struct{}, 1)
+	known := make(map[string]struct{}, 2)
 	for _, capability := range capabilities {
-		if strings.TrimSpace(capability) == netGuardManagedSHACapability {
+		switch strings.TrimSpace(capability) {
+		case netGuardManagedSHACapability:
 			known[netGuardManagedSHACapability] = struct{}{}
+		case lineChainDurableCapability:
+			known[lineChainDurableCapability] = struct{}{}
 		}
 	}
 	s.agentCapabilitiesMu.Lock()

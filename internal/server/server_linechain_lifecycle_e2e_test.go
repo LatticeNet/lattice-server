@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -163,6 +164,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sh", "-c", leased[0].Script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	crashMarker := filepath.Join(root, "crash.marker")
 	cmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"), "LATTICE_AGENT_BIN="+agent, "LATTICE_LINECHAIN_TXN_DIR="+txnDir, "LATTICE_LINECHAIN_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+sidecar, "LATTICE_TASK_ID="+leased[0].ID, "LATTICE_TASK_LEASE_ID="+leased[0].LeaseID, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+fmt.Sprintf("%x", sha256.Sum256([]byte(leased[0].Script))), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_CRASH_MARKER="+crashMarker)
 	// The production Manager resolves sing-box by name. The wrapper executes only
@@ -172,9 +174,24 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(binDir, "sing-box"), []byte(wrapper), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := cmd.CombinedOutput(); err != nil {
-		diagnostics, _ := os.ReadFile(checkLog)
-		t.Fatalf("real agent helper failed: %v: %s; sing-box: %s", err, out, diagnostics)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	markerDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(crashMarker); err == nil {
+			break
+		}
+		if time.Now().After(markerDeadline) {
+			t.Fatal("leased helper did not reach deterministic crash marker")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("crash attempt unexpectedly completed successfully")
 	}
 	recoveryResult := filepath.Join(root, "recovery-result.json")
 	recoverCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2ERecoverHelper$", "--", root)
@@ -185,8 +202,6 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if raw, err := os.ReadFile(recoveryResult); err != nil || !bytes.Contains(raw, []byte(leased[0].ID)) {
 		t.Fatalf("recovery result missing leased task: err=%v raw=%s", err, raw)
 	}
-	lifecycleKillPIDFile(root, "b")
-	lifecycleStartProcess(t, singbox, root, "b-applied", configDir, bPort)
 	sidecarBytes, _ := os.ReadFile(sidecar)
 	if !bytes.Contains(sidecarBytes, []byte(`"unknown_root":{"keep":true}`)) || !bytes.Contains(sidecarBytes, []byte(`"ordinary":"keep"`)) {
 		t.Fatalf("host fields lost: %s", sidecarBytes)
@@ -201,15 +216,22 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	// Exercise deterministic process-group recovery before reporting the task
 	// result. The recovered B must preserve the applied server-issued config.
-	lifecycleKillPIDFile(root, "b-applied")
-	lifecycleStartProcess(t, singbox, root, "b-recovered", configDir, bPort)
 	lifecycleSOCKSEcho(t, clientPort, origin)
 	if observer.accepted() < 2 {
 		t.Fatal("recovered B did not traverse observer -> A")
 	}
 
-	finished := time.Now().UTC().Format(time.RFC3339Nano)
-	resultBody := fmt.Sprintf(`{"node_id":"node-b","result":{"task_id":%q,"lease_id":%q,"exit_code":0,"finished_at":%q}}`, leased[0].ID, leased[0].LeaseID, finished)
+	resolveResult := filepath.Join(root, "resolve-result.json")
+	resolveCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EResolveHelper$", "--", root)
+	resolveCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_TASK="+leased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+leased[0].LeaseID, "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT="+resolveResult)
+	if out, err := resolveCmd.CombinedOutput(); err != nil {
+		t.Fatalf("resolve helper failed: %v: %s", err, out)
+	}
+	resolveRaw, err := os.ReadFile(resolveResult)
+	if err != nil || !bytes.Contains(resolveRaw, []byte(leased[0].ID)) {
+		t.Fatalf("resolve result missing leased task: err=%v raw=%s", err, resolveRaw)
+	}
+	resultBody := fmt.Sprintf(`{"node_id":"node-b","result":%s}`, resolveRaw)
 	// First 200 is deliberately ignored; exact replay must remain idempotent.
 	for attempt := 0; attempt < 2; attempt++ {
 		req, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/agent/task-result", strings.NewReader(resultBody))
@@ -250,7 +272,17 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	observed.Status = "ok"
 	observed.At = time.Now().UTC()
-	inventoryRaw, _ := json.Marshal(map[string]any{"node_id": "node-b", "inventory": observed})
+	inventoryResult := filepath.Join(root, "inventory-result.json")
+	invCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
+	invCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+inventoryResult)
+	if out, err := invCmd.CombinedOutput(); err != nil {
+		t.Fatalf("inventory helper failed: %v: %s", err, out)
+	}
+	actualInventory, err := os.ReadFile(inventoryResult)
+	if err != nil || len(actualInventory) == 0 {
+		t.Fatalf("inventory helper result missing: %v", err)
+	}
+	inventoryRaw := []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, actualInventory))
 	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, inventoryRaw)
 	if len(srv.store.Tasks()) != 1 {
 		t.Fatalf("inventory queued an extra E3 task: %d", len(srv.store.Tasks()))

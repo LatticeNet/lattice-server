@@ -93,20 +93,6 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err := srv.store.UpsertNode(nodeA); err != nil {
 		t.Fatal(err)
 	}
-	srv.singboxInvMu.Lock()
-	if inv := srv.singboxInv["node-a"]; len(inv.Nodes) > 0 {
-		lineID := target.LineHashID
-		for _, entry := range srv.store.KV(lineUUIDKVBucket) {
-			if strings.EqualFold(strings.TrimSpace(entry.Value), targetUUID) {
-				lineID = entry.Key
-				break
-			}
-		}
-		inv.Nodes[0].Protocol, inv.Nodes[0].Network, inv.Nodes[0].Address = "vless", "tcp", "127.0.0.1"
-		inv.Nodes[0].Port, inv.Nodes[0].SNI, inv.Nodes[0].LineUUID, inv.Nodes[0].LineID = strconv.Itoa(target.Port), target.SNI, targetUUID, strings.TrimPrefix(lineID, "line_")
-		srv.singboxInv["node-a"] = inv
-	}
-	srv.singboxInvMu.Unlock()
 	_ = srv.buildLineGroups()
 
 	aDir := filepath.Join(root, "a")

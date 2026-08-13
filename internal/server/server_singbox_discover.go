@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"sort"
 	"strconv"
 	"time"
@@ -145,14 +146,59 @@ func (s *Server) singBoxInventory(nodeID string) (model.SingBoxInventory, bool) 
 // same correctness rule as the node-liveness sweep; without this a deleted node's
 // discovery lingered, e.g. a duplicate node that was removed).
 func (s *Server) liveSingBoxInventories(now time.Time) []model.SingBoxInventory {
-	s.singboxInvMu.Lock()
-	defer s.singboxInvMu.Unlock()
-	out := make([]model.SingBoxInventory, 0, len(s.singboxInv))
+	return s.liveSingBoxInventoriesWithNodeExists(now, func(nodeID string) bool {
+		_, ok := s.store.Node(nodeID)
+		return ok
+	})
+}
+
+// liveSingBoxInventoriesWithNodeExists keeps Store lookups outside
+// singboxInvMu. Line-chain result classification intentionally holds the Store
+// lock while reading the inventory mirror, so taking these locks in the reverse
+// order here would deadlock result commits against inventory pruning.
+func (s *Server) liveSingBoxInventoriesWithNodeExists(now time.Time, nodeExists func(string) bool) []model.SingBoxInventory {
+	s.singboxInvMu.RLock()
+	snapshot := make(map[string]model.SingBoxInventory, len(s.singboxInv))
 	for id, inv := range s.singboxInv {
-		if _, ok := s.store.Node(id); !ok || (!inv.At.IsZero() && now.Sub(inv.At) > nodeOfflineThreshold) {
+		inv.Nodes = append([]model.SingBoxNode(nil), inv.Nodes...)
+		snapshot[id] = inv
+	}
+	s.singboxInvMu.RUnlock()
+
+	live := make(map[string]model.SingBoxInventory, len(snapshot))
+	stale := make(map[string]model.SingBoxInventory)
+	staleNodeExists := make(map[string]bool)
+	for id, inv := range snapshot {
+		exists := nodeExists(id)
+		if !exists || (!inv.At.IsZero() && now.Sub(inv.At) > nodeOfflineThreshold) {
+			stale[id] = inv
+			staleNodeExists[id] = exists
+			continue
+		}
+		live[id] = inv
+	}
+
+	// Delete only the exact entry inspected above. A concurrent inventory report
+	// replaces the map value and must not be erased by a stale pruning decision.
+	s.singboxInvMu.Lock()
+	for id, inspected := range stale {
+		current, ok := s.singboxInv[id]
+		if !ok {
+			continue
+		}
+		if reflect.DeepEqual(current, inspected) {
 			delete(s.singboxInv, id)
 			continue
 		}
+		if staleNodeExists[id] && (current.At.IsZero() || now.Sub(current.At) <= nodeOfflineThreshold) {
+			current.Nodes = append([]model.SingBoxNode(nil), current.Nodes...)
+			live[id] = current
+		}
+	}
+	s.singboxInvMu.Unlock()
+
+	out := make([]model.SingBoxInventory, 0, len(live))
+	for _, inv := range live {
 		out = append(out, inv)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })

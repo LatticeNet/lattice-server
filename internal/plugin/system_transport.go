@@ -1,7 +1,10 @@
 package plugin
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -16,6 +19,28 @@ type systemWorkerTransport struct {
 	hostResp *os.File
 	stderr   *os.File
 	pgid     int
+}
+
+func (t *systemWorkerTransport) awaitReady(generation uint64) error {
+	if t == nil || t.stdout == nil {
+		return fmt.Errorf("worker stdout unavailable")
+	}
+	s := bufio.NewScanner(t.stdout)
+	s.Buffer(make([]byte, 0, 4096), 64*1024)
+	if !s.Scan() {
+		return fmt.Errorf("worker exited before runtime_ready")
+	}
+	var f stdioJSONV2Frame
+	if err := json.Unmarshal(s.Bytes(), &f); err != nil {
+		return fmt.Errorf("decode runtime_ready: %w", err)
+	}
+	if f.Kind != "runtime_ready" {
+		return fmt.Errorf("expected runtime_ready, got %q", f.Kind)
+	}
+	if f.Generation != generation || f.Protocol != 2 {
+		return fmt.Errorf("runtime_ready correlation mismatch")
+	}
+	return nil
 }
 
 func startSystemWorker(ctx context.Context, path, dir string, env []string) (*systemWorkerTransport, error) {

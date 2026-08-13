@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -82,19 +83,20 @@ const (
 // VpnUserPublicRecord is the non-secret half of a vpn-core identity. It is a
 // typed store collection so generic KV APIs cannot enumerate or overwrite it.
 type VpnUserPublicRecord struct {
-	ID                    string                    `json:"id"`
-	Email                 string                    `json:"email"`
-	Name                  string                    `json:"name,omitempty"`
-	Enabled               bool                      `json:"enabled"`
-	Credentials           []VpnUserCredentialPublic `json:"credentials"`
-	Bindings              []VpnUserLineBinding      `json:"bindings"`
-	QuotaBytes            int64                     `json:"quota_bytes,omitempty"`
-	ExpiresAt             time.Time                 `json:"expires_at,omitempty"`
-	Group                 string                    `json:"group,omitempty"`
-	Comment               string                    `json:"comment,omitempty"`
-	MigratedFromProxyUser string                    `json:"migrated_from_proxy_user,omitempty"`
-	CreatedAt             time.Time                 `json:"created_at"`
-	UpdatedAt             time.Time                 `json:"updated_at"`
+	ID                     string                    `json:"id"`
+	Email                  string                    `json:"email"`
+	Name                   string                    `json:"name,omitempty"`
+	Enabled                bool                      `json:"enabled"`
+	Credentials            []VpnUserCredentialPublic `json:"credentials"`
+	Bindings               []VpnUserLineBinding      `json:"bindings"`
+	QuotaBytes             int64                     `json:"quota_bytes,omitempty"`
+	ExpiresAt              time.Time                 `json:"expires_at,omitempty"`
+	Group                  string                    `json:"group,omitempty"`
+	Comment                string                    `json:"comment,omitempty"`
+	MigratedFromProxyUser  string                    `json:"migrated_from_proxy_user,omitempty"`
+	CreatedAt              time.Time                 `json:"created_at"`
+	UpdatedAt              time.Time                 `json:"updated_at"`
+	SubscriptionGeneration uint64                    `json:"subscription_generation"`
 }
 
 type VpnUserCredentialPublic struct {
@@ -378,6 +380,12 @@ func (s *Store) ReplaceLineSecretRecords(vpnPublic map[string]VpnUserPublicRecor
 }
 
 func (s *Store) replaceLineSecretRecordsLocked(public map[string]VpnUserPublicRecord, private map[string]VpnUserSecretRecord, managedPublic map[string]ManagedLinePublicRecord, managedPrivate map[string]ManagedLineSecretRecord, legacy []LegacyKVKey) error {
+	for id, record := range public {
+		if record.SubscriptionGeneration == 0 {
+			record.SubscriptionGeneration = 1
+			public[id] = record
+		}
+	}
 	if err := validateVpnUserCollections(public, private); err != nil {
 		return err
 	}
@@ -436,11 +444,25 @@ func (s *Store) ManagedLineRecords() (map[string]ManagedLinePublicRecord, map[st
 func (s *Store) PutVpnUserRecord(public VpnUserPublicRecord, private VpnUserSecretRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	public.SubscriptionGeneration = nextSubscriptionGeneration(s.state.VpnUsers[public.ID], s.state.VpnUserSecrets[public.ID], public, private)
 	publicRecords := cloneVpnUserPublicRecords(s.state.VpnUsers)
 	privateRecords := cloneVpnUserSecretRecords(s.state.VpnUserSecrets)
 	publicRecords[public.ID] = public
 	privateRecords[public.ID] = private
 	return s.replaceVpnUserRecordsLocked(publicRecords, privateRecords, nil)
+}
+
+func nextSubscriptionGeneration(currentPublic VpnUserPublicRecord, currentPrivate VpnUserSecretRecord, nextPublic VpnUserPublicRecord, nextPrivate VpnUserSecretRecord) uint64 {
+	if currentPublic.ID == "" || currentPublic.SubscriptionGeneration == 0 {
+		return 1
+	}
+	if currentPublic.Enabled == nextPublic.Enabled && currentPublic.ExpiresAt.Equal(nextPublic.ExpiresAt) &&
+		reflect.DeepEqual(currentPublic.Credentials, nextPublic.Credentials) &&
+		reflect.DeepEqual(currentPublic.Bindings, nextPublic.Bindings) &&
+		reflect.DeepEqual(currentPrivate.Credentials, nextPrivate.Credentials) {
+		return currentPublic.SubscriptionGeneration
+	}
+	return currentPublic.SubscriptionGeneration + 1
 }
 
 func (s *Store) DeleteVpnUserRecord(id string) error {

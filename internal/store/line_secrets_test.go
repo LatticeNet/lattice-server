@@ -539,3 +539,47 @@ func TestReplaceVpnUserRecordsPublishesCommittedStateOnParentSyncFailure(t *test
 		t.Fatalf("committed durability warning did not degrade readiness: %v", store.ReadyCheck())
 	}
 }
+
+func TestPutVpnUserRecordOwnsMonotonicSubscriptionGeneration(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, private := testVpnUserRecords("vpn-generation", "secret")
+	public.SubscriptionGeneration = 99
+	if err := s.PutVpnUserRecord(public, private); err != nil {
+		t.Fatal(err)
+	}
+	got, gotSecret, ok := s.VpnUserRecord(public.ID)
+	if !ok || got.SubscriptionGeneration != 1 {
+		t.Fatalf("create generation = %d, want 1", got.SubscriptionGeneration)
+	}
+
+	got.Comment = "display-only change"
+	got.SubscriptionGeneration = 500
+	if err := s.PutVpnUserRecord(got, gotSecret); err != nil {
+		t.Fatal(err)
+	}
+	unchanged, unchangedSecret, _ := s.VpnUserRecord(public.ID)
+	if unchanged.SubscriptionGeneration != 1 {
+		t.Fatalf("display-only write advanced generation to %d", unchanged.SubscriptionGeneration)
+	}
+
+	unchanged.Bindings = append(unchanged.Bindings, VpnUserLineBinding{LineHashID: "line-b", Enabled: true})
+	if err := s.PutVpnUserRecord(unchanged, unchangedSecret); err != nil {
+		t.Fatal(err)
+	}
+	bound, boundSecret, _ := s.VpnUserRecord(public.ID)
+	if bound.SubscriptionGeneration != 2 {
+		t.Fatalf("binding generation = %d, want 2", bound.SubscriptionGeneration)
+	}
+
+	boundSecret.Credentials[0].Password = "rotated-secret"
+	if err := s.PutVpnUserRecord(bound, boundSecret); err != nil {
+		t.Fatal(err)
+	}
+	rotated, _, _ := s.VpnUserRecord(public.ID)
+	if rotated.SubscriptionGeneration != 3 {
+		t.Fatalf("credential generation = %d, want 3", rotated.SubscriptionGeneration)
+	}
+}

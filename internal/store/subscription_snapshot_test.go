@@ -76,7 +76,7 @@ func TestSnapshotOnlyAndShareOnlyLostKeyFailClosed(t *testing.T) {
 func TestLegacyPlaintextSubscriptionSecretsMigrateInOneStagedRewrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	legacy := emptyState()
-	legacy.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}
+	legacy.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{SchemaVersion: 1, PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}
 	legacy.SubscriptionShares["share"] = model.SubscriptionShare{ID: "share", Token: "share-plaintext-canary"}
 	raw, err := json.Marshal(legacy)
 	if err != nil {
@@ -115,7 +115,7 @@ func TestCorruptSubscriptionEnvelopeMakesNoMigrationWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacy := emptyState()
-	legacy.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: corruptEnvelope}
+	legacy.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{SchemaVersion: 1, PluginID: "p", SubscriptionID: "s", Raw: corruptEnvelope}
 	raw, err := json.Marshal(legacy)
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +142,7 @@ func TestLegacyPlaintextSubscriptionSecretsMigrateInOneBoltUpdate(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacySnapshot := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}
+	legacySnapshot := model.SubscriptionSnapshot{SchemaVersion: 1, PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}
 	legacyShare := model.SubscriptionShare{ID: "share", Token: "share-plaintext-canary"}
 	if err := bs.db.Update(func(tx *bolt.Tx) error {
 		if err := putRecord(tx, boltBucketSubSnapshots, "p/s", legacySnapshot); err != nil {
@@ -190,7 +190,7 @@ func TestSubscriptionSnapshotRawEncryptedFullBoltRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	state := emptyState()
-	state.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary, FetchedAt: time.Now().UTC()}
+	state.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{SchemaVersion: model.SubscriptionSnapshotSchemaVersion, PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary, FetchedAt: time.Now().UTC()}
 	if err := bs.ImportState(state); err != nil {
 		t.Fatal(err)
 	}

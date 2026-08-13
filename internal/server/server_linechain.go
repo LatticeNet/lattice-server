@@ -332,6 +332,14 @@ func lineChainApproveAudit(p principal, approval model.Approval, taskID string) 
 		Metadata: lineChainAuditMetadata(approval, taskID)}
 }
 
+func lineChainFailedAudit(p principal, approval model.Approval, taskID, code, reason string) model.AuditEvent {
+	metadata := lineChainAuditMetadata(approval, taskID)
+	metadata["error_code"] = code
+	return model.AuditEvent{ID: lineChainAuditID("failed", approval.ID, taskID+"\x00"+code), At: time.Now().UTC(), ActorID: p.ActorID, TokenID: p.TokenID,
+		NodeID: approval.NodeID, Action: "linechain.failed", Scope: approvalDecisionAuditScope(approval), Decision: "deny", Reason: reason,
+		CorrelationID: p.CorrelationID, Metadata: metadata}
+}
+
 func (s *Server) lineChainTerminalAudit(approval model.Approval, task model.Task, result model.TaskResult, status, driftCode string) model.AuditEvent {
 	auditID := lineChainAuditID("terminal", approval.ID, task.ID+"\x00"+result.NodeID)
 	action, decision, reason := "linechain.apply", "allow", ""

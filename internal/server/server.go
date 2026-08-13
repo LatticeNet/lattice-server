@@ -5713,7 +5713,9 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		}
 		_, script, err := s.validateLineChainApprovalForQueue(approval)
 		if err != nil {
-			committed, rejectErr := s.store.RejectLineChainApprovalStale(approval.ID, "line_chain_inputs_changed", "line chain inputs changed during approval; fresh plan required")
+			reason := "line chain inputs changed during approval; fresh plan required"
+			failedAudit := lineChainFailedAudit(p, approval, "", "line_chain_inputs_changed", reason)
+			committed, rejectErr := s.store.RejectLineChainApprovalStale(approval.ID, "line_chain_inputs_changed", reason, failedAudit)
 			if rejectErr != nil {
 				if committed {
 					s.logger.Printf("line chain approval stale transition committed with degraded durability: %v", rejectErr)
@@ -5858,8 +5860,15 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	} else if isLineChainApproval(approval) {
 		approveAudit := lineChainApproveAudit(p, approval, task.ID)
 		approveAudit.At = task.CreatedAt
-		_, committed, err := s.store.ApproveLineChain(approval, task, approveAudit)
+		failedAudit := lineChainFailedAudit(p, approval, task.ID, "line_chain_inputs_changed", "line chain inputs changed while queueing; fresh plan required")
+		_, committed, err := s.store.ApproveLineChain(approval, task, approveAudit, failedAudit)
 		if committed && err != nil {
+			if errors.Is(err, store.ErrLineChainRevisionConflict) || errors.Is(err, store.ErrLineChainCycle) || errors.Is(err, store.ErrTaskTransitionConflict) {
+				if appendErr := s.appendRequiredLineChainAudit(failedAudit); appendErr != nil {
+					return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: appendErr}
+				}
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+			}
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
 		if !committed {
@@ -5926,6 +5935,25 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 		return
 	}
 	if approval.Status == model.ApprovalPending {
+		if isLineChainApproval(approval) {
+			reason := "line chain approval rejected by operator"
+			failedAudit := lineChainFailedAudit(p, approval, "", "approval_rejected", reason)
+			committed, err := s.store.RejectLineChainApproval(approval.ID, reason, failedAudit)
+			if err != nil {
+				if committed {
+					s.logger.Printf("line chain rejection committed with degraded durability: %v", err)
+				}
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			approval, _ = s.store.Approval(approval.ID)
+			if err := s.appendRequiredLineChainAudit(failedAudit); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, toApprovalView(approval))
+			return
+		}
 		approval.Status = model.ApprovalRejected
 		approval.UpdatedAt = s.now()
 		if err := s.store.UpsertApproval(approval); err != nil {

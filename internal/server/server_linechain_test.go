@@ -326,6 +326,53 @@ func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 	}
 }
 
+func TestGenericTaskHTTPMutationCannotBypassLineChainProtocol(t *testing.T) {
+	for _, leased := range []bool{false, true} {
+		t.Run(fmt.Sprintf("leased=%t", leased), func(t *testing.T) {
+			srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+			compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+			if err != nil {
+				t.Fatal(err)
+			}
+			planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+			if _, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA); err != nil {
+				t.Fatal(err)
+			}
+			if leased {
+				deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+				if err != nil || len(deliveries) != 1 {
+					t.Fatalf("lease=%+v err=%v", deliveries, err)
+				}
+			}
+			beforeChains, beforeTasks := srv.store.LineChainSnapshot(), srv.store.Tasks()
+			handler := srv.Handler()
+			cookies, csrf := loginSession(t, handler)
+			for _, request := range []struct {
+				path string
+				body string
+			}{
+				{path: "/api/tasks/cancel", body: fmt.Sprintf(`{"id":%q}`, beforeTasks[0].ID)},
+				{path: "/api/tasks/delete", body: fmt.Sprintf(`{"id":%q}`, beforeTasks[0].ID)},
+				{path: "/api/tasks/rerun", body: fmt.Sprintf(`{"id":%q}`, beforeTasks[0].ID)},
+				{path: "/api/tasks/rerun-node", body: fmt.Sprintf(`{"id":%q,"node_id":"node-b"}`, beforeTasks[0].ID)},
+			} {
+				response := doJSON(t, handler, http.MethodPost, request.path, request.body, cookies, csrf)
+				response.Body.Close()
+				if response.StatusCode != http.StatusConflict {
+					t.Fatalf("%s status=%d want 409", request.path, response.StatusCode)
+				}
+			}
+			if afterChains, afterTasks := srv.store.LineChainSnapshot(), srv.store.Tasks(); !reflect.DeepEqual(beforeChains, afterChains) || !reflect.DeepEqual(beforeTasks, afterTasks) || len(afterTasks) != 1 {
+				t.Fatalf("generic endpoints mutated E3 state: before=%+v/%+v after=%+v/%+v", beforeChains, beforeTasks, afterChains, afterTasks)
+			}
+		})
+	}
+}
+
 func TestLineChainTaskScriptRevealIsDeniedBeforeStepUp(t *testing.T) {
 	srv := newManagedLineTestServer(t)
 	approval := model.Approval{ID: "approval-secret", NodeID: "node-a", Plugin: lineChainPlugin, Service: lineChainService,

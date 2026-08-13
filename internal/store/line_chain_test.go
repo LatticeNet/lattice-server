@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -356,6 +357,16 @@ func TestCompleteLineChainTaskResultPostRenameReplayConfirmsDurability(t *testin
 
 func seedLineChainResultAttempt(t *testing.T) (*Store, model.Approval, model.Task, string) {
 	t.Helper()
+	s, approval, task := seedQueuedLineChainTask(t)
+	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil })
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	}
+	return s, approval, task, deliveries[0].Task.LeaseID
+}
+
+func seedQueuedLineChainTask(t *testing.T) (*Store, model.Approval, model.Task) {
+	t.Helper()
 	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
 	if err != nil {
 		t.Fatal(err)
@@ -371,11 +382,32 @@ func seedLineChainResultAttempt(t *testing.T) (*Store, model.Approval, model.Tas
 	if _, committed, err := s.ApproveLineChain(approval, task); err != nil || !committed {
 		t.Fatalf("approve committed=%v err=%v", committed, err)
 	}
-	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil })
-	if err != nil || len(deliveries) != 1 {
-		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	return s, approval, task
+}
+
+func TestGenericTaskMutationCannotBypassLineChainProtocol(t *testing.T) {
+	for _, leased := range []bool{false, true} {
+		t.Run(fmt.Sprintf("leased=%t", leased), func(t *testing.T) {
+			s, _, task := seedQueuedLineChainTask(t)
+			if leased {
+				deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil })
+				if err != nil || len(deliveries) != 1 {
+					t.Fatalf("lease=%+v err=%v", deliveries, err)
+				}
+			}
+			before := s.LineChainSnapshot()
+			tasksBefore := s.Tasks()
+			if _, err := s.CancelTask(task.ID); !errors.Is(err, ErrTaskDurableProtected) {
+				t.Fatalf("cancel err=%v", err)
+			}
+			if err := s.DeleteTask(task.ID); !errors.Is(err, ErrTaskDurableProtected) {
+				t.Fatalf("delete err=%v", err)
+			}
+			if !s.TaskUsesLineChainProtocol(task.ID) || !reflect.DeepEqual(before, s.LineChainSnapshot()) || !reflect.DeepEqual(tasksBefore, s.Tasks()) {
+				t.Fatalf("generic mutation changed E3 state: before=%+v after=%+v", before, s.LineChainSnapshot())
+			}
+		})
 	}
-	return s, approval, task, deliveries[0].Task.LeaseID
 }
 
 func TestReconcileLineChainsUsesExactObservedSetAndRemoveEvidence(t *testing.T) {

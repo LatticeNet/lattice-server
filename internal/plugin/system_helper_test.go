@@ -34,6 +34,9 @@ func runV2Helper() {
 			fmt.Fprintln(os.Stdout, string(b))
 			br := bufio.NewReader(os.NewFile(uintptr(3), "host-response"))
 			_, _ = br.ReadBytes('\n')
+			if os.Getenv("LATTICE_TEST_V2_STALL") == "1" {
+				select {}
+			}
 		}
 		if os.Getenv("LATTICE_TEST_V2_NO_READY") == "1" {
 			resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID, Response: json.RawMessage(`{"ok":true,"result":{"once":true}}`)}

@@ -3,7 +3,7 @@ package plugin
 import "testing"
 
 func TestValidateStdioJSONV2FrameCorrelation(t *testing.T) {
-	base := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: 7, InvocationID: "i-1", HostCallID: "h-1"}
+	base := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: 7, InvocationID: "i-1", Response: []byte(`{"ok":true}`)}
 	for name, frame := range map[string]stdioJSONV2Frame{
 		"valid":            base,
 		"wrong protocol":   func() stdioJSONV2Frame { f := base; f.Protocol = 1; return f }(),

@@ -88,6 +88,34 @@ func TestLineChainReserveRejectsTwoNodeCycleWithoutRevisionMutation(t *testing.T
 	}
 }
 
+func TestLineChainReserveRejectsThreeNodeCycleAtExactCASRevision(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	edges := []LineChainAttempt{
+		{ApprovalID: "a-b", Operation: LineChainOperationSet, SourceLineUUID: "a", CandidateTargetLineUUID: "b", RequestSHA256: "a-b", PlanGraphRevision: 0},
+		{ApprovalID: "b-c", Operation: LineChainOperationSet, SourceLineUUID: "b", CandidateTargetLineUUID: "c", RequestSHA256: "b-c", PlanGraphRevision: 1},
+		{ApprovalID: "c-a", Operation: LineChainOperationSet, SourceLineUUID: "c", CandidateTargetLineUUID: "a", RequestSHA256: "c-a", PlanGraphRevision: 2},
+	}
+	for i, edge := range edges {
+		if _, _, err := s.PlanLineChain(edge); err != nil {
+			t.Fatalf("plan edge %d: %v", i, err)
+		}
+		_, err := s.ReserveLineChain(edge.ApprovalID, uint64(i))
+		if i < 2 && err != nil {
+			t.Fatalf("reserve edge %d: %v", i, err)
+		}
+		if i == 2 && !errors.Is(err, ErrLineChainCycle) {
+			t.Fatalf("closing three-node cycle error=%v", err)
+		}
+	}
+	snapshot := s.LineChainSnapshot()
+	if snapshot.Revision != 2 || snapshot.Attempts["c-a"].Status != LineChainStatusPlanned {
+		t.Fatalf("cycle CAS mutated revision/candidate: %+v", snapshot)
+	}
+}
+
 func TestApproveLineChainQueuesTaskAndReservesRevisionAtomically(t *testing.T) {
 	s, err := Open("")
 	if err != nil {

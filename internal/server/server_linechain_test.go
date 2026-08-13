@@ -114,6 +114,23 @@ func TestLineChainHTTPReadScopeDenialDoesNotMutate(t *testing.T) {
 	}
 }
 
+func TestLineChainHTTPPlanScopeDenialHasNoDomainSideEffects(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, nil)
+	before, tasksBefore, approvalsBefore := srv.store.LineChainSnapshot(), len(srv.store.Tasks()), len(srv.store.Approvals())
+	body := fmt.Sprintf(`{"source_line_uuid":%q,"target_line_uuid":%q}`, sourceUUID, targetUUID)
+	response := doBearerJSON(t, handler, http.MethodPost, "/api/network/lines/chains/plan", body, token)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected network:plan denial, got %d", response.StatusCode)
+	}
+	if after := srv.store.LineChainSnapshot(); !reflect.DeepEqual(before, after) || len(srv.store.Tasks()) != tasksBefore || len(srv.store.Approvals()) != approvalsBefore {
+		t.Fatalf("denied plan mutated domain state: before=%+v after=%+v", before, after)
+	}
+}
+
 func TestLineChainPublicOperationProjectsReplace(t *testing.T) {
 	if got := publicLineChainOperation(store.LineChainAttempt{Operation: store.LineChainOperationSet, BaseGeneration: 2}); got != "replace" {
 		t.Fatalf("set over committed generation projected as %q", got)
@@ -128,6 +145,70 @@ func TestLineChainAgentTaskViewCarriesExactDurableProtocol(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"durable_protocol":"linechain-e3-v1"`) {
 		t.Fatalf("linechain response protocol mismatch: %s", raw)
+	}
+}
+
+func TestLineChainHTTPPollRecoveryRedeliveryAndResultReplay(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	if _, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA); err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	originalNode, _ := srv.store.Node("node-b")
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
+	enrolledNode, _ := srv.store.Node("node-b")
+	originalNode.TokenHash = enrolledNode.TokenHash
+	if err := srv.store.UpsertNode(originalNode); err != nil {
+		t.Fatal(err)
+	}
+	poll := func(capable bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/agent/tasks?node_id=node-b", nil)
+		req.Header.Set("Authorization", "Bearer "+nodeToken)
+		if capable {
+			req.Header.Set(agentCapabilitiesHeader, lineChainDurableCapability)
+		}
+		return serveReq(handler, req)
+	}
+	blocked := poll(false)
+	var blockedTasks []agentTaskView
+	if blocked.Code != http.StatusOK || json.Unmarshal(blocked.Body.Bytes(), &blockedTasks) != nil || len(blockedTasks) != 0 {
+		t.Fatalf("capability downgrade exposed task: code=%d body=%s", blocked.Code, blocked.Body.String())
+	}
+	first := poll(true)
+	var firstTasks []agentTaskView
+	if first.Code != http.StatusOK || json.Unmarshal(first.Body.Bytes(), &firstTasks) != nil || len(firstTasks) != 1 || firstTasks[0].DurableProtocol != store.DurableProtocolLineChainV1 {
+		t.Fatalf("capability recovery did not lease E3 task: code=%d body=%s snapshot=%+v", first.Code, first.Body.String(), srv.store.LineChainSnapshot())
+	}
+	second := poll(true)
+	var secondTasks []agentTaskView
+	if second.Code != http.StatusOK || json.Unmarshal(second.Body.Bytes(), &secondTasks) != nil || len(secondTasks) != 1 || secondTasks[0].LeaseID != firstTasks[0].LeaseID {
+		t.Fatalf("same-lease redelivery mismatch: first=%+v second=%s", firstTasks, second.Body.String())
+	}
+	finishedAt := time.Unix(1_700_000_100, 0).UTC().Format(time.RFC3339Nano)
+	body := fmt.Sprintf(`{"node_id":"node-b","result":{"task_id":%q,"lease_id":%q,"exit_code":0,"finished_at":%q}}`, firstTasks[0].ID, firstTasks[0].LeaseID, finishedAt)
+	for attempt := 1; attempt <= 2; attempt++ {
+		result := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", body, nodeToken)
+		if result.Code != http.StatusOK {
+			t.Fatalf("exact result attempt %d code=%d body=%s", attempt, result.Code, result.Body.String())
+		}
+	}
+	conflictBody := strings.Replace(body, `"exit_code":0`, `"exit_code":1`, 1)
+	conflict := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", conflictBody, nodeToken)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("conflicting replay code=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+	if snapshot := srv.store.LineChainSnapshot(); snapshot.Revision != 2 || snapshot.Definitions[sourceUUID].Status != store.LineChainStatusAppliedUnobserved {
+		t.Fatalf("HTTP result did not promote exactly once: %+v", snapshot)
 	}
 }
 
@@ -511,6 +592,106 @@ func TestLineChainCompilerRejectsMissingConsumerCapability(t *testing.T) {
 	}
 }
 
+func TestLineChainFirstLeaseRejectsBoundDependencyMutationsAtomically(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *Server, string, string, VpnUser, managedLineDef)
+	}{
+		{name: "source_tag_and_hash", mutate: func(t *testing.T, srv *Server, sourceUUID, _ string, _ VpnUser, _ managedLineDef) {
+			seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-mutated", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443", LineUUID: sourceUUID}})
+		}},
+		{name: "target_host", mutate: func(t *testing.T, srv *Server, _, targetUUID string, _ VpnUser, def managedLineDef) {
+			seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{Name: def.Tag, Protocol: "vless", Network: "tcp", Address: "203.0.113.99", Port: fmt.Sprint(def.Port), SNI: def.SNI, LineUUID: targetUUID}})
+		}},
+		{name: "target_port", mutate: func(t *testing.T, srv *Server, _, _ string, _ VpnUser, def managedLineDef) {
+			def.Port++
+			if err := srv.putManagedLineDef(def); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "target_public_material", mutate: func(t *testing.T, srv *Server, _, _ string, _ VpnUser, def managedLineDef) {
+			def.RealityPublicKey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+			if err := srv.putManagedLineDef(def); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "target_definition", mutate: func(t *testing.T, srv *Server, _, _ string, _ VpnUser, def managedLineDef) {
+			def.SNI = "changed.example.com"
+			if err := srv.putManagedLineDef(def); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "target_credential", mutate: func(t *testing.T, srv *Server, _, _ string, user VpnUser, _ managedLineDef) {
+			user.Credentials[0].UUID = "33333333-3333-4333-8333-333333333333"
+			if err := srv.putVpnUser(user); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, sourceUUID, targetUUID, user, def := seedLineChainFixture(t)
+			compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+			if err != nil {
+				t.Fatal(err)
+			}
+			planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+			approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			task := srv.store.Tasks()[0]
+			tc.mutate(t, srv, sourceUUID, targetUUID, user, def)
+			deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+			if err != nil || len(deliveries) != 0 {
+				t.Fatalf("mutated dependency leased: deliveries=%+v err=%v", deliveries, err)
+			}
+			gotApproval, _ := srv.store.Approval(approval.ID)
+			gotTask, _ := srv.store.Task(task.ID)
+			attempt := srv.store.LineChainSnapshot().Attempts[approval.ID]
+			if gotApproval.Status != model.ApprovalRejected || !gotApproval.Stale || gotTask.Status != model.TaskCancelled || attempt.Status != store.LineChainStatusFailed || srv.store.LineChainSnapshot().Revision != 2 {
+				t.Fatalf("first-lease rejection was not atomic: approval=%+v task=%+v attempt=%+v snapshot=%+v", gotApproval, gotTask, attempt, srv.store.LineChainSnapshot())
+			}
+		})
+	}
+}
+
+func TestLineChainFirstLeaseRejectsTamperedQueuedScriptAtomically(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := srv.store.Tasks()[0]
+	task.Script += "\n# tampered"
+	if err := srv.store.CreateTask(task); err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+	if err != nil || len(deliveries) != 0 {
+		t.Fatalf("tampered task leased: deliveries=%+v err=%v", deliveries, err)
+	}
+	gotApproval, _ := srv.store.Approval(approval.ID)
+	gotTask, _ := srv.store.Task(task.ID)
+	attempt := srv.store.LineChainSnapshot().Attempts[approval.ID]
+	if gotApproval.Status != model.ApprovalRejected || gotTask.Status != model.TaskCancelled || attempt.Status != store.LineChainStatusFailed || srv.store.LineChainSnapshot().Revision != 2 {
+		t.Fatalf("tampered task rejection was not atomic: approval=%+v task=%+v attempt=%+v", gotApproval, gotTask, attempt)
+	}
+}
+
 func TestLineChainCompilerDoesNotAllocateMissingUUIDAuthority(t *testing.T) {
 	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
 	snapshot, err := srv.captureLineChainCompileSnapshot()
@@ -605,5 +786,81 @@ func TestLineChainPlanRejectsStaleCompiledRevision(t *testing.T) {
 	}
 	if _, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled); !errors.Is(err, store.ErrLineChainRevisionConflict) {
 		t.Fatalf("stale compiled revision error=%v", err)
+	}
+}
+
+func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, def := seedLineChainFixture(t)
+	apply := func(t *testing.T, compiled lineChainCompiledArtifact) model.Approval {
+		t.Helper()
+		beforeTasks := len(srv.store.Tasks())
+		approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+		if err != nil {
+			t.Fatal(err)
+		}
+		planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+		approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(srv.store.Tasks()) != beforeTasks+1 {
+			t.Fatalf("approval queued %d tasks, want one", len(srv.store.Tasks())-beforeTasks)
+		}
+		deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+		if err != nil || len(deliveries) != 1 || len(deliveries[0].Task.Targets) != 1 || deliveries[0].Task.Targets[0] != "node-b" {
+			t.Fatalf("source-only lease mismatch: %+v err=%v", deliveries, err)
+		}
+		result := model.TaskResult{TaskID: deliveries[0].Task.ID, NodeID: "node-b", LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
+		if err := srv.handleLineChainTaskResult(approval, deliveries[0].Task, result); err != nil {
+			t.Fatal(err)
+		}
+		return approval
+	}
+
+	setArtifact, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(t, setArtifact)
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusAppliedUnobserved || got.TargetLineUUID != targetUUID {
+		t.Fatalf("set terminal did not promote frozen definition: %+v", got)
+	}
+	observedHash := lineHash("node-b", model.ProxyCoreSingbox, "vless", "", 1443, "source-b", setArtifact.Plan.OutboundTag)
+	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: observedHash, Value: sourceUUID}); err != nil {
+		t.Fatal(err)
+	}
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443",
+		LineUUID: sourceUUID, OutboundRef: setArtifact.Plan.OutboundTag, DownstreamLineUUID: targetUUID}})
+	if err := srv.reconcileLineChainsForNode("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged {
+		t.Fatalf("scheduled observation did not converge set: %+v", got)
+	}
+	metadata, err := srv.renderLineMetadataJSON("node-b")
+	if err != nil || !strings.Contains(string(metadata), targetUUID) {
+		t.Fatalf("metadata did not retain committed chain: %s err=%v", metadata, err)
+	}
+
+	removeArtifact, err := srv.compileLineChainRemove(sourceUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply(t, removeArtifact)
+	removed := srv.store.LineChainSnapshot().Definitions[sourceUUID]
+	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || removed.OutboundTag != setArtifact.Plan.OutboundTag {
+		t.Fatalf("remove did not preserve authoritative tombstone: %+v", removed)
+	}
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443", LineUUID: sourceUUID}})
+	if err := srv.reconcileLineChainsForNode("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	removed = srv.store.LineChainSnapshot().Definitions[sourceUUID]
+	if removed.Status != store.LineChainStatusConverged || removed.TargetLineUUID != "" || len(srv.store.Tasks()) != 2 {
+		t.Fatalf("remove observation/task count mismatch: definition=%+v tasks=%+v", removed, srv.store.Tasks())
+	}
+	metadata, err = srv.renderLineMetadataJSON("node-b")
+	if err != nil || strings.Contains(string(metadata), targetUUID) || !strings.Contains(string(metadata), sourceUUID) || def.LineUUID != targetUUID {
+		t.Fatalf("metadata did not clear only the observed chain: %s err=%v", metadata, err)
 	}
 }

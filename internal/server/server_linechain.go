@@ -470,13 +470,15 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 		return lineChainCompiledArtifact{}, err
 	}
 	current := chainSnapshot.Definitions[source.LineUUID]
-	expectedDownstream := source.DownstreamLineUUID
+	expectedDownstream := ""
 	if current.TargetLineUUID != "" {
 		observed := strings.ToLower(strings.TrimSpace(source.DownstreamLineUUID))
 		if observed != "" && observed != strings.ToLower(current.TargetLineUUID) {
 			return lineChainCompiledArtifact{}, errors.New("observed source chain conflicts with committed baseline")
 		}
 		expectedDownstream = current.TargetLineUUID
+	} else if strings.TrimSpace(source.DownstreamLineUUID) != "" {
+		return lineChainCompiledArtifact{}, errors.New("true create requires an unclaimed source chain declaration")
 	}
 	_, sidecarPatch, sidecarPatchSHA, err := canonicalLineChainSidecarPatch(source.LineUUID, source.Tag, expectedDownstream, target.LineUUID)
 	if err != nil {

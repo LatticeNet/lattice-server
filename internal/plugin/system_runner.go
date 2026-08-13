@@ -145,7 +145,6 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 		return RunnerStartResult{}, fmt.Errorf("stage artifact: %w", err)
 	}
 
-	r.mu.Lock()
 	pool := newSystemPool(256, time.Hour, req.Generation)
 	if req.Loaded.Manifest.Runtime != nil && req.Loaded.Manifest.Runtime.Protocol == RuntimeProtocolStdioJSONV2 {
 		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -165,6 +164,7 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 			return RunnerStartResult{}, err
 		}
 	}
+	r.mu.Lock()
 	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool}
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil

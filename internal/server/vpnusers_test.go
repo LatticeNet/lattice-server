@@ -39,6 +39,74 @@ func TestVpnUserMigrationIdempotent(t *testing.T) {
 	}
 }
 
+func TestTUICCredentialPreservesUUIDAndPasswordAcrossNormalizeMigrationAndReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := store.OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const uuid = "11111111-1111-4111-8111-111111111111"
+	credentials, err := srv.normalizeCredentials([]VpnCredential{{Protocol: "tuic", UUID: uuid, Password: "created-secret"}})
+	if err != nil || len(credentials) != 1 || credentials[0].UUID != uuid || credentials[0].Password != "created-secret" {
+		t.Fatalf("normalize lost TUIC dual secret: %+v err=%v", credentials, err)
+	}
+	user := VpnUser{ID: "vpn-tuic", Email: "tuic@example.com", Enabled: true, Credentials: credentials}
+	if err := srv.putVpnUser(user); err != nil {
+		t.Fatal(err)
+	}
+	credentials, err = srv.normalizeCredentials([]VpnCredential{{Protocol: "tuic", UUID: uuid, Password: "updated-secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user.Credentials = credentials
+	if err := srv.putVpnUser(user); err != nil {
+		t.Fatal(err)
+	}
+	legacy := VpnUser{ID: "vpn-tuic-legacy", Email: "legacy-tuic@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "tuic", UUID: "22222222-2222-4222-8222-222222222222", Password: "legacy-secret"}}}
+	raw, _ := json.Marshal(legacy)
+	if err := st.PutKV(model.KVEntry{Bucket: vpnCoreKVBucket, Key: vpnUserKey(legacy.ID), Value: string(raw)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.migrateProxyUsersToVpnUsers(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	srv, err = New(Options{Store: reopened, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]VpnCredential{
+		user.ID:   {UUID: uuid, Password: "updated-secret"},
+		legacy.ID: {UUID: "22222222-2222-4222-8222-222222222222", Password: "legacy-secret"},
+	} {
+		got, ok := srv.getVpnUser(id)
+		if !ok || len(got.Credentials) != 1 || got.Credentials[0].UUID != want.UUID || got.Credentials[0].Password != want.Password {
+			t.Fatalf("TUIC reopen lost %s dual secret: %+v ok=%v", id, got, ok)
+		}
+		payload, err := lineUserCredential(got, "tuic", "user-tuic")
+		if err != nil || payload.UUID != want.UUID || payload.Password != want.Password {
+			t.Fatalf("line-user TUIC payload lost %s dual secret: %+v err=%v", id, payload, err)
+		}
+	}
+	for _, missing := range []VpnCredential{{Protocol: "tuic", UUID: uuid}, {Protocol: "tuic", Password: "secret"}} {
+		if _, err := srv.normalizeCredentials([]VpnCredential{missing}); err == nil {
+			t.Fatalf("normalize accepted incomplete TUIC credential: %+v", missing)
+		}
+	}
+}
+
 func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	key := make([]byte, secret.KeySize)
 	for i := range key {

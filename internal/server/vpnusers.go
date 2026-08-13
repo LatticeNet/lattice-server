@@ -612,6 +612,9 @@ func (s *Server) normalizeCredentials(in []VpnCredential) ([]VpnCredential, erro
 		if vpnCredUUIDProtos[proto] {
 			uuid := strings.ToLower(strings.TrimSpace(c.UUID))
 			if uuid == "" {
+				if proto == "tuic" {
+					return nil, errors.New("TUIC credential requires uuid and password")
+				}
 				gen, err := newProxyUUID()
 				if err != nil {
 					return nil, err
@@ -621,7 +624,8 @@ func (s *Server) normalizeCredentials(in []VpnCredential) ([]VpnCredential, erro
 				return nil, fmt.Errorf("invalid uuid for protocol %q", proto)
 			}
 			nc.UUID = uuid
-		} else {
+		}
+		if !vpnCredUUIDProtos[proto] || proto == "tuic" {
 			pw := c.Password
 			if strings.ContainsFunc(pw, proxyUnsafeControl) {
 				return nil, errors.New("password contains control characters")
@@ -630,6 +634,9 @@ func (s *Server) normalizeCredentials(in []VpnCredential) ([]VpnCredential, erro
 				return nil, errors.New("password is too long")
 			}
 			nc.Password = pw
+		}
+		if err := store.ValidateVpnUserCredentialSecret(store.VpnUserCredentialSecret{Protocol: nc.Protocol, UUID: nc.UUID, Password: nc.Password}); err != nil {
+			return nil, err
 		}
 		out = append(out, nc)
 	}

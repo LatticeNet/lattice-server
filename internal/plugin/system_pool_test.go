@@ -76,3 +76,44 @@ func TestSystemPoolPrimaryOverflowCapacity(t *testing.T) {
 		t.Fatal("pool exceeded primary+overflow capacity")
 	}
 }
+
+func TestSystemPoolGracefulDrainRetiresLeasedWithoutResurrection(t *testing.T) {
+	p := newSystemPool(2, time.Hour)
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	w, err := p.checkout(context.Background(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.gracefulDrain(1)
+	p.mu.Lock()
+	if !p.closed || p.active != 1 || len(p.leased) != 1 {
+		t.Fatalf("closed=%v active=%d leased=%d", p.closed, p.active, len(p.leased))
+	}
+	p.mu.Unlock()
+	p.release(w, true, time.Now())
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.active != 0 || len(p.leased) != 0 || len(p.workers) != 0 {
+		t.Fatalf("resurrected pool: active=%d leased=%d workers=%d", p.active, len(p.leased), len(p.workers))
+	}
+}
+
+func TestSystemPoolWaiterReceivesCloseError(t *testing.T) {
+	p := newSystemPool(2, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, err := p.checkout(ctx, time.Now()); done <- err }()
+	time.Sleep(time.Millisecond)
+	p.abortClose(1)
+	select {
+	case err := <-done:
+		if err != errSystemPoolClosed {
+			t.Fatalf("err=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiter not woken")
+	}
+}

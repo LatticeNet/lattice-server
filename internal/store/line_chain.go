@@ -372,6 +372,46 @@ func (s *Store) ReserveLineChain(approvalID string, expectedRevision uint64) (Li
 	return attempt, err
 }
 
+// RejectLineChainApprovalStale atomically retires a planned candidate whose
+// bound inputs changed during approval-time recompile. Planned candidates have
+// not reserved graph membership, so this transition never increments R.
+func (s *Store) RejectLineChainApprovalStale(approvalID, staleCode, reason string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	approval, ok := s.state.Approvals[approvalID]
+	if !ok || approval.Status != model.ApprovalPending {
+		return false, ErrTaskTransitionConflict
+	}
+	attempt, ok := s.state.LineChainAttempts[approvalID]
+	if !ok || attempt.Status != LineChainStatusPlanned || attempt.QueuedGraphRevision != 0 || attempt.IssuedLeaseID != "" {
+		return false, ErrTaskTransitionConflict
+	}
+	now := time.Now().UTC()
+	staged := s.state
+	staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+	for id, current := range s.state.Approvals {
+		staged.Approvals[id] = current
+	}
+	approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, true, staleCode
+	approval.Reason, approval.UpdatedAt = reason, now
+	staged.Approvals[approvalID] = approval
+	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+	attempt.Status, attempt.LastErrorCode, attempt.LastError, attempt.UpdatedAt = LineChainStatusFailed, staleCode, reason, now
+	staged.LineChainAttempts[approvalID] = attempt
+	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks))
+	for id, task := range s.state.Tasks {
+		if task.ApprovalID == approvalID {
+			task.Status = model.TaskCancelled
+		}
+		staged.Tasks[id] = task
+	}
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return committed, err
+}
+
 // ApproveLineChain atomically changes the reviewed approval and attempt to
 // applying, reserves the candidate graph edge, queues exactly one bound task,
 // and advances R to R+1 in one persistence transaction.

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 )
 
@@ -122,13 +123,15 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 // systemWorkerTransport owns one persistent worker process and all descriptors.
 // It is intentionally independent of the evolving SDK session API.
 type systemWorkerTransport struct {
-	cmd      *exec.Cmd
-	stdin    *os.File
-	stdout   *os.File
-	hostResp *os.File
-	stderr   *os.File
-	pgid     int
-	scanner  *bufio.Scanner
+	cmd       *exec.Cmd
+	stdin     *os.File
+	stdout    *os.File
+	hostResp  *os.File
+	stderr    *os.File
+	pgid      int
+	scanner   *bufio.Scanner
+	abortOnce sync.Once
+	abortErr  error
 }
 
 func (t *systemWorkerTransport) closePipes() {
@@ -228,11 +231,13 @@ func (t *systemWorkerTransport) abort() error {
 	if t == nil || t.cmd == nil || t.cmd.Process == nil {
 		return nil
 	}
-	_ = syscall.Kill(-t.pgid, syscall.SIGTERM)
-	_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
-	err := t.cmd.Wait()
-	t.closePipes()
-	return err
+	t.abortOnce.Do(func() {
+		_ = syscall.Kill(-t.pgid, syscall.SIGTERM)
+		_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
+		t.abortErr = t.cmd.Wait()
+		t.closePipes()
+	})
+	return t.abortErr
 }
 
 func (t *systemWorkerTransport) wait() error {

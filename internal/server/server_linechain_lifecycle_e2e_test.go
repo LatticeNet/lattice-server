@@ -113,9 +113,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	configDir := filepath.Join(root, "conf")
 	clientDir := filepath.Join(root, "client")
 	txnDir := filepath.Join(root, "txn")
+	outboxDir := filepath.Join(root, "outbox")
 	sidecar := filepath.Join(root, "lattice-metadata.json")
 	binDir := filepath.Join(root, "bin")
-	for _, dir := range []string{aDir, configDir, clientDir, txnDir, binDir} {
+	for _, dir := range []string{aDir, configDir, clientDir, txnDir, outboxDir, binDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -237,7 +238,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	recoveryResult := filepath.Join(root, "recovery-result.json")
 	recoverCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2ERecoverHelper$", "--", root)
-	recoverCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_CRASH_MARKER="+crashMarker, "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT="+recoveryResult)
+	recoverCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_CRASH_MARKER="+crashMarker, "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT="+recoveryResult, "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+leased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+leased[0].LeaseID)
 	_ = runLifecycleAgentHelper(t, recoverCmd)
 	if raw, err := os.ReadFile(recoveryResult); err != nil || !bytes.Contains(raw, []byte(leased[0].ID)) {
 		t.Fatalf("recovery result missing leased task: err=%v raw=%s", err, raw)
@@ -298,7 +299,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 
 	resolveResult := filepath.Join(root, "resolve-result.json")
 	resolveCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EResolveHelper$", "--", root)
-	resolveCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_TASK="+retryLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT="+resolveResult)
+	resolveCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_TASK="+retryLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT="+resolveResult, "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir)
 	_ = runLifecycleAgentHelper(t, resolveCmd)
 	resolveRaw, err := os.ReadFile(resolveResult)
 	if err != nil || !bytes.Contains(resolveRaw, []byte(retryLeased[0].ID)) {

@@ -82,6 +82,7 @@ type lineChainCompileSnapshot struct {
 	Nodes        map[string]model.Node
 	Chains       store.LineChainSnapshot
 	Capabilities map[string]bool
+	EvidenceAt   time.Time
 }
 
 func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, error) {
@@ -122,6 +123,9 @@ func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, er
 	}
 	now := s.now()
 	for _, inventory := range inventories {
+		if inventory.At.After(snapshot.EvidenceAt) {
+			snapshot.EvidenceAt = inventory.At
+		}
 		if _, ok := persistent.Nodes[inventory.NodeID]; !ok || inventory.Status != "ok" || (!inventory.At.IsZero() && now.Sub(inventory.At) > nodeOfflineThreshold) {
 			continue
 		}
@@ -320,7 +324,7 @@ func (s *Server) renderLineChainSidecarSnapshot(snapshot lineChainCompileSnapsho
 	node := snapshot.Nodes[nodeID]
 	doc := lineMetadataDocV2{
 		Schema: lineMetadataSchemaV2, NodeID: nodeID, NodeUUID: strings.TrimSpace(node.LatticeIdentityUUID),
-		UpdatedAt: s.now().UTC().Format(time.RFC3339), Writer: lineMetadataWriter, Inbounds: inbounds,
+		UpdatedAt: snapshot.EvidenceAt.UTC().Format(time.RFC3339), Writer: lineMetadataWriter, Inbounds: inbounds,
 		Reserved: lineMetadataReservedV2{InConfigKey: "_lattice", Fields: lineMetadataReservedFields{LineUUID: "string", NodeUUID: "string", LineHashID: "string"}},
 	}
 	out, err := json.MarshalIndent(doc, "", "  ")
@@ -372,34 +376,31 @@ func (s *Server) renderLineChainSidecar(nodeID, sourceUUID, targetUUID string) (
 }
 
 func (s *Server) compileLineChainRemove(sourceUUID string) (lineChainCompiledArtifact, error) {
+	snapshot, err := s.captureLineChainCompileSnapshot()
+	if err != nil {
+		return lineChainCompiledArtifact{}, err
+	}
+	return s.compileLineChainRemoveSnapshot(snapshot, sourceUUID)
+}
+
+func (s *Server) compileLineChainRemoveSnapshot(snapshot lineChainCompileSnapshot, sourceUUID string) (lineChainCompiledArtifact, error) {
 	sourceUUID = strings.ToLower(strings.TrimSpace(sourceUUID))
 	if !validLineUUIDv4(sourceUUID) {
 		return lineChainCompiledArtifact{}, errors.New("source_line_uuid must be UUIDv4")
 	}
-	snapshot := s.store.LineChainSnapshot()
-	current, ok := snapshot.Definitions[sourceUUID]
+	current, ok := snapshot.Chains.Definitions[sourceUUID]
 	if !ok || current.TargetLineUUID == "" {
 		return lineChainCompiledArtifact{}, errors.New("source has no committed chain to remove")
 	}
-	var source Line
-	found := false
-	for _, group := range s.buildLineGroups() {
-		for _, line := range group.Lines {
-			if strings.EqualFold(line.LineUUID, sourceUUID) {
-				if found {
-					return lineChainCompiledArtifact{}, errors.New("source line identity is ambiguous")
-				}
-				source, found = line, true
-			}
-		}
-	}
-	if !found || source.NodeID != current.SourceNodeID || source.Tag == "" {
+	matches := snapshot.Lines[sourceUUID]
+	if len(matches) != 1 || matches[0].NodeID != current.SourceNodeID || matches[0].Tag == "" {
 		return lineChainCompiledArtifact{}, errors.New("committed source line is unavailable")
 	}
-	if !s.agentHasCapability(source.NodeID, lineChainDurableCapability) {
+	source := matches[0]
+	if !snapshot.Capabilities[source.NodeID] {
 		return lineChainCompiledArtifact{}, errors.New("source node does not advertise durable-task-result-v1")
 	}
-	sidecar, err := s.renderLineChainSidecar(source.NodeID, sourceUUID, "")
+	sidecar, err := s.renderLineChainSidecarSnapshot(snapshot, source.NodeID, sourceUUID, "")
 	if err != nil {
 		return lineChainCompiledArtifact{}, err
 	}
@@ -411,8 +412,9 @@ func (s *Server) compileLineChainRemove(sourceUUID string) (lineChainCompiledArt
 		SidecarSHA256: digestText(string(sidecar)), ArtifactSHA256: artifactSHA, RequestSHA256: requestSHA,
 		PreviousTargetLineUUID: current.TargetLineUUID, PreviousArtifactSHA256: current.ArtifactSHA256,
 		PreflightChecks: []string{"source_identity", "committed_baseline", "consumer_capability"},
-		Summary:         fmt.Sprintf("Remove managed downstream from %s on %s", source.Name, s.nodeDisplayName(source.NodeID)),
-	}, SidecarJSON: string(sidecar)}, nil
+		Summary: fmt.Sprintf("Remove managed downstream from %s on %s", source.Name,
+			firstNonEmpty(strings.TrimSpace(snapshot.Nodes[source.NodeID].Name), source.NodeID)),
+	}, SidecarJSON: string(sidecar), BaseGeneration: current.Generation, PlanGraphRevision: snapshot.Chains.Revision}, nil
 }
 
 func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArtifact) (model.Approval, error) {

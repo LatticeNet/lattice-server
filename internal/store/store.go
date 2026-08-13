@@ -1326,9 +1326,15 @@ func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 // TaskDelivery carries protocol metadata decided under the same store lock as
 // the lease. DurableResult is true only for the exact gated NetGuard action.
 type TaskDelivery struct {
-	Task          model.Task
-	DurableResult bool
+	Task            model.Task
+	DurableResult   bool
+	DurableProtocol string
 }
+
+const (
+	DurableProtocolNetGuardV1  = "netguard-v1"
+	DurableProtocolLineChainV1 = "linechain-v1"
+)
 
 // LeaseTasksWithApprovalGate leases the same task set as LeaseTasks while
 // gating one exact approval plugin/action pair. The approval lookup, current
@@ -1360,6 +1366,14 @@ func onlyGenericTaskDeliveries(deliveries []TaskDelivery) bool {
 }
 
 func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, plugin, action string, allowed bool) ([]TaskDelivery, error) {
+	return s.leaseTaskDeliveries(nodeID, limit, plugin, action, allowed, false)
+}
+
+func (s *Store) LeaseTaskDeliveriesWithDurableProtocols(nodeID string, limit int, netGuardAllowed, lineChainAllowed bool) ([]TaskDelivery, error) {
+	return s.leaseTaskDeliveries(nodeID, limit, "nft", "apply-ruleset:netguard-v1", netGuardAllowed, lineChainAllowed)
+}
+
+func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action string, allowed, lineChainAllowed bool) ([]TaskDelivery, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
@@ -1381,20 +1395,26 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 		}
 		return a.CreatedAt.Before(b.CreatedAt)
 	})
-	gated := func(t model.Task) (isGated, eligible bool) {
+	gated := func(t model.Task) (protocol string, eligible bool) {
 		if plugin == "" || action == "" || t.ApprovalID == "" {
-			return false, true
+			return "", true
 		}
 		approval, ok := s.state.Approvals[t.ApprovalID]
 		if !ok {
-			return false, false
+			return "", false
+		}
+		if approval.Plugin == "singbox-linechain" && approval.Service == "network/lines" &&
+			(approval.Method == "chain_set_apply" || approval.Method == "chain_remove_apply") && strings.HasPrefix(approval.Action, "apply-line-chain:") {
+			attempt, attemptOK := s.state.LineChainAttempts[approval.ID]
+			return DurableProtocolLineChainV1, lineChainAllowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID &&
+				attemptOK && attempt.Status == LineChainStatusApplying && attempt.SourceNodeID == nodeID
 		}
 		if approval.Plugin != plugin || approval.Action != action {
-			return false, true
+			return "", true
 		}
 		binding, bindingOK := s.state.GuardBindings[nodeID]
 		planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
-		return true, allowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID && bindingOK && strings.EqualFold(binding.LastPlanSHA, planSHA)
+		return DurableProtocolNetGuardV1, allowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID && bindingOK && strings.EqualFold(binding.LastPlanSHA, planSHA)
 	}
 
 	// Only the explicitly gated NetGuard action opts into durable same-lease
@@ -1406,8 +1426,8 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 			break
 		}
 		t := staged.Tasks[id]
-		isGated, current := gated(t)
-		if !isGated || !current || !taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts) {
+		protocol, current := gated(t)
+		if protocol == "" || !current || !taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts) {
 			continue
 		}
 		// A lease is a durable delivery token, not a one-shot HTTP response. If
@@ -1421,13 +1441,13 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 			redelivered.LeaseID = lease.LeaseID
 			redelivered.LeasedBy = nodeID
 			redelivered.StartedAt = lease.StartedAt
-			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true})
+			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true, DurableProtocol: protocol})
 			continue
 		}
 		if t.LeasedBy == nodeID && t.LeaseID != "" {
 			redelivered := t
 			redelivered.Status = model.TaskLeased
-			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true})
+			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true, DurableProtocol: protocol})
 			continue
 		}
 	}
@@ -1448,9 +1468,21 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 				break
 			}
 			t := staged.Tasks[id]
-			isGated, current := gated(t)
+			protocol, current := gated(t)
+			isGated := protocol != ""
 			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results) {
 				continue
+			}
+			if protocol == DurableProtocolLineChainV1 {
+				attempt := staged.LineChainAttempts[t.ApprovalID]
+				currentDefinition := staged.LineChainDefinitions[attempt.SourceLineUUID]
+				if currentDefinition.Generation != attempt.BaseGeneration || currentDefinition.ArtifactSHA256 != attempt.BaseArtifactSHA256 || lineChainGraphHasCycle(staged.LineChainDefinitions, staged.LineChainAttempts) {
+					continue
+				}
+				staged.LineChainAttempts = cloneLineChainAttempts(staged.LineChainAttempts)
+				attempt.FirstLeaseGraphRevision = staged.LineChainGraphRevision
+				attempt.UpdatedAt = now
+				staged.LineChainAttempts[t.ApprovalID] = attempt
 			}
 			leaseSecret, err := auth.NewRandomToken(24)
 			if err != nil {
@@ -1479,7 +1511,7 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 			leased.LeaseID = leaseID
 			leased.LeasedBy = nodeID
 			leased.StartedAt = now
-			out = append(out, TaskDelivery{Task: leased, DurableResult: isGated})
+			out = append(out, TaskDelivery{Task: leased, DurableResult: isGated, DurableProtocol: protocol})
 		}
 		return nil
 	}

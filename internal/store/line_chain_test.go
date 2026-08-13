@@ -3,6 +3,9 @@ package store
 import (
 	"errors"
 	"testing"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 func TestLineChainPlanAndReserveUseExactGraphRevision(t *testing.T) {
@@ -80,5 +83,59 @@ func TestLineChainReserveRejectsTwoNodeCycleWithoutRevisionMutation(t *testing.T
 	snapshot := store.LineChainSnapshot()
 	if snapshot.Revision != 1 || snapshot.Attempts[second.ApprovalID].Status != LineChainStatusPlanned {
 		t.Fatalf("cycle failure mutated state: %+v", snapshot)
+	}
+}
+
+func TestApproveLineChainQueuesTaskAndReservesRevisionAtomically(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_700_000_000, 0).UTC()
+	approval := model.Approval{ID: "approval-1", NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines",
+		Method: "chain_set_apply", Action: "apply-line-chain:digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending, CreatedAt: now}
+	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a",
+		CandidateTargetLineUUID: "target", RequestSHA256: "request", PlanGraphRevision: 0}
+	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
+		t.Fatal(err)
+	}
+	approved := approval
+	approved.Status = model.ApprovalApproved
+	approved.ApprovedBy = "admin"
+	task := model.Task{ID: "task-1", ApprovalID: approval.ID, Targets: []string{"node-a"}, Script: "apply", Status: model.TaskQueued}
+	reserved, committed, err := s.ApproveLineChain(approved, task)
+	if err != nil || !committed {
+		t.Fatalf("approve line chain: reserved=%+v committed=%v err=%v", reserved, committed, err)
+	}
+	snapshot := s.LineChainSnapshot()
+	if snapshot.Revision != 1 || snapshot.Attempts[approval.ID].Status != LineChainStatusApplying || snapshot.Attempts[approval.ID].QueuedGraphRevision != 1 {
+		t.Fatalf("reservation not atomic: %+v", snapshot)
+	}
+	storedApproval, ok := s.Approval(approval.ID)
+	if !ok || storedApproval.Status != model.ApprovalApproved {
+		t.Fatalf("approval not committed: %+v ok=%v", storedApproval, ok)
+	}
+	storedTask, ok := s.Task(task.ID)
+	if !ok || storedTask.ApprovalID != approval.ID || len(s.Tasks()) != 1 {
+		t.Fatalf("task not committed exactly once: %+v ok=%v all=%+v", storedTask, ok, s.Tasks())
+	}
+	if _, _, err := s.ApproveLineChain(approved, task); !errors.Is(err, ErrTaskTransitionConflict) {
+		t.Fatalf("reapproval minted second task: %v", err)
+	}
+	blocked, err := s.LeaseTaskDeliveriesWithDurableProtocols("node-a", 1, false, false)
+	if err != nil || len(blocked) != 0 {
+		t.Fatalf("capability downgrade exposed linechain task: deliveries=%+v err=%v", blocked, err)
+	}
+	deliveries, err := s.LeaseTaskDeliveriesWithDurableProtocols("node-a", 1, false, true)
+	if err != nil || len(deliveries) != 1 || deliveries[0].DurableProtocol != DurableProtocolLineChainV1 || !deliveries[0].DurableResult {
+		t.Fatalf("linechain durable lease mismatch: deliveries=%+v err=%v", deliveries, err)
+	}
+	leased := s.LineChainSnapshot().Attempts[approval.ID]
+	if leased.FirstLeaseGraphRevision != 1 || s.LineChainSnapshot().Revision != 1 {
+		t.Fatalf("first lease changed revision or missed L: %+v", leased)
+	}
+	redelivered, err := s.LeaseTaskDeliveriesWithDurableProtocols("node-a", 1, false, true)
+	if err != nil || len(redelivered) != 1 || redelivered[0].Task.LeaseID != deliveries[0].Task.LeaseID || s.LineChainSnapshot().Revision != 1 {
+		t.Fatalf("same lease was not redelivered: first=%+v second=%+v err=%v", deliveries, redelivered, err)
 	}
 }

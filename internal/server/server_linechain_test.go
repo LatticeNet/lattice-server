@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
@@ -74,9 +75,18 @@ func TestLineChainCompilerUsesImmutableCapturedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	first, err := srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
 	srv.replaceAgentCapabilities("node-b", nil)
-	if _, err := srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err != nil {
+	srv.now = func() time.Time { return time.Unix(2_000_000_000, 0).UTC() }
+	second, err := srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
 		t.Fatalf("captured snapshot changed after live capability mutation: %v", err)
+	}
+	if first.SidecarJSON != second.SidecarJSON || first.Plan.ArtifactSHA256 != second.Plan.ArtifactSHA256 || first.Plan.RequestSHA256 != second.Plan.RequestSHA256 {
+		t.Fatalf("captured snapshot changed across wall clock: first=%+v second=%+v", first.Plan, second.Plan)
 	}
 }
 

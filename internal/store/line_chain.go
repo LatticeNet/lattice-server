@@ -267,6 +267,70 @@ func (s *Store) ReserveLineChain(approvalID string, expectedRevision uint64) (Li
 	return attempt, err
 }
 
+// ApproveLineChain atomically changes the reviewed approval and attempt to
+// applying, reserves the candidate graph edge, queues exactly one bound task,
+// and advances R to R+1 in one persistence transaction.
+func (s *Store) ApproveLineChain(approval model.Approval, task model.Task) (LineChainAttempt, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	currentApproval, ok := s.state.Approvals[approval.ID]
+	if !ok || currentApproval.Status != model.ApprovalPending || approval.Status != model.ApprovalApproved ||
+		currentApproval.Plugin != approval.Plugin || currentApproval.Service != approval.Service || currentApproval.Method != approval.Method ||
+		currentApproval.Action != approval.Action || currentApproval.Plan != approval.Plan || currentApproval.RequestSHA256 != approval.RequestSHA256 {
+		return LineChainAttempt{}, false, ErrTaskTransitionConflict
+	}
+	attempt, ok := s.state.LineChainAttempts[approval.ID]
+	if !ok || attempt.Status != LineChainStatusPlanned || attempt.PlanGraphRevision != s.state.LineChainGraphRevision {
+		return LineChainAttempt{}, false, ErrLineChainRevisionConflict
+	}
+	currentDefinition := s.state.LineChainDefinitions[attempt.SourceLineUUID]
+	if currentDefinition.Generation != attempt.BaseGeneration || currentDefinition.ArtifactSHA256 != attempt.BaseArtifactSHA256 {
+		return LineChainAttempt{}, false, ErrLineChainRevisionConflict
+	}
+	if task.ID == "" || task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != attempt.SourceNodeID {
+		return LineChainAttempt{}, false, ErrTaskTransitionConflict
+	}
+	for _, existing := range s.state.Tasks {
+		if existing.ApprovalID == approval.ID {
+			return LineChainAttempt{}, false, ErrTaskTransitionConflict
+		}
+	}
+	attempts := cloneLineChainAttempts(s.state.LineChainAttempts)
+	attempt.Status = LineChainStatusApplying
+	attempt.QueuedGraphRevision = s.state.LineChainGraphRevision + 1
+	attempt.UpdatedAt = time.Now().UTC()
+	attempts[approval.ID] = attempt
+	if lineChainGraphHasCycle(s.state.LineChainDefinitions, attempts) {
+		return LineChainAttempt{}, false, ErrLineChainCycle
+	}
+	staged := s.state
+	staged.LineChainAttempts = attempts
+	staged.LineChainGraphRevision = attempt.QueuedGraphRevision
+	staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+	for id, value := range s.state.Approvals {
+		staged.Approvals[id] = value
+	}
+	approval.CreatedAt = currentApproval.CreatedAt
+	approval.UpdatedAt = attempt.UpdatedAt
+	staged.Approvals[approval.ID] = approval
+	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks)+1)
+	for id, value := range s.state.Tasks {
+		staged.Tasks[id] = value
+	}
+	if task.CreatedAt.IsZero() {
+		task.CreatedAt = attempt.UpdatedAt
+	}
+	if task.Status == "" {
+		task.Status = model.TaskQueued
+	}
+	staged.Tasks[task.ID] = task
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return attempt, committed, err
+}
+
 func lineChainGraphHasCycle(definitions map[string]LineChainDefinition, attempts map[string]LineChainAttempt) bool {
 	edges := make(map[string][]string)
 	for source, definition := range definitions {

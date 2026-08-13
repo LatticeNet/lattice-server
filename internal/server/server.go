@@ -6132,10 +6132,8 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	// last heartbeat capability from server memory. The store still applies the
 	// approval and current plan-anchor checks atomically with the lease mutation.
 	netGuardCapable := requestHasAgentCapability(r, netGuardManagedSHACapability)
-	deliveries, err := s.store.LeaseTaskDeliveriesWithApprovalGate(
-		nodeID, 3, "nft", netGuardApprovalAction,
-		netGuardCapable,
-	)
+	lineChainCapable := requestHasAgentCapability(r, lineChainDurableCapability)
+	deliveries, err := s.store.LeaseTaskDeliveriesWithDurableProtocols(nodeID, 3, netGuardCapable, lineChainCapable)
 	if err != nil {
 		if !onlyGenericAgentTaskDeliveries(deliveries) {
 			writeError(w, http.StatusInternalServerError, err)
@@ -6149,7 +6147,7 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]agentTaskView, 0, len(deliveries))
 	for _, delivery := range deliveries {
-		views = append(views, toAgentTaskView(delivery.Task, delivery.DurableResult))
+		views = append(views, toAgentTaskView(delivery.Task, delivery.DurableResult, delivery.DurableProtocol))
 	}
 	writeJSON(w, http.StatusOK, views)
 }
@@ -6178,24 +6176,30 @@ func requestHasAgentCapability(r *http.Request, capability string) bool {
 }
 
 type agentTaskView struct {
-	ID            string `json:"id"`
-	LeaseID       string `json:"lease_id"`
-	Interpreter   string `json:"interpreter"`
-	Script        string `json:"script"`
-	TimeoutSec    int    `json:"timeout_sec"`
-	OutputLimit   int    `json:"output_limit"`
-	DurableResult bool   `json:"durable_result,omitempty"`
+	ID              string `json:"id"`
+	LeaseID         string `json:"lease_id"`
+	Interpreter     string `json:"interpreter"`
+	Script          string `json:"script"`
+	TimeoutSec      int    `json:"timeout_sec"`
+	OutputLimit     int    `json:"output_limit"`
+	DurableResult   bool   `json:"durable_result,omitempty"`
+	DurableProtocol string `json:"durable_protocol,omitempty"`
 }
 
-func toAgentTaskView(t model.Task, durableResult bool) agentTaskView {
+func toAgentTaskView(t model.Task, durableResult bool, durableProtocol ...string) agentTaskView {
+	protocol := ""
+	if len(durableProtocol) > 0 {
+		protocol = durableProtocol[0]
+	}
 	return agentTaskView{
-		ID:            t.ID,
-		LeaseID:       t.LeaseID,
-		Interpreter:   t.Interpreter,
-		Script:        t.Script,
-		TimeoutSec:    t.TimeoutSec,
-		OutputLimit:   t.OutputLimit,
-		DurableResult: durableResult,
+		ID:              t.ID,
+		LeaseID:         t.LeaseID,
+		Interpreter:     t.Interpreter,
+		Script:          t.Script,
+		TimeoutSec:      t.TimeoutSec,
+		OutputLimit:     t.OutputLimit,
+		DurableResult:   durableResult,
+		DurableProtocol: protocol,
 	}
 }
 

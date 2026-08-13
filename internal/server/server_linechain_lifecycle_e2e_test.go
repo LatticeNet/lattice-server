@@ -25,6 +25,21 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
+func runLifecycleAgentHelper(t *testing.T, cmd *exec.Cmd) []byte {
+	t.Helper()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("agent helper start: %v", err)
+	}
+	err := cmd.Wait()
+	if err != nil {
+		t.Fatalf("agent helper failed: %v: %s", err, out.Bytes())
+	}
+	return out.Bytes()
+}
+
 func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	agent := requireE2EFile(t, "LATTICE_AGENT_E2E_BIN")
 	agentTest := requireE2EFile(t, "LATTICE_AGENT_E2E_TEST_BIN")
@@ -223,9 +238,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	recoveryResult := filepath.Join(root, "recovery-result.json")
 	recoverCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2ERecoverHelper$", "--", root)
 	recoverCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_CRASH_MARKER="+crashMarker, "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT="+recoveryResult)
-	if out, err := recoverCmd.CombinedOutput(); err != nil {
-		t.Fatalf("startup recovery helper failed: %v: %s", err, out)
-	}
+	_ = runLifecycleAgentHelper(t, recoverCmd)
 	if raw, err := os.ReadFile(recoveryResult); err != nil || !bytes.Contains(raw, []byte(leased[0].ID)) {
 		t.Fatalf("recovery result missing leased task: err=%v raw=%s", err, raw)
 	}
@@ -286,9 +299,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	resolveResult := filepath.Join(root, "resolve-result.json")
 	resolveCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EResolveHelper$", "--", root)
 	resolveCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_TASK="+retryLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT="+resolveResult)
-	if out, err := resolveCmd.CombinedOutput(); err != nil {
-		t.Fatalf("resolve helper failed: %v: %s", err, out)
-	}
+	_ = runLifecycleAgentHelper(t, resolveCmd)
 	resolveRaw, err := os.ReadFile(resolveResult)
 	if err != nil || !bytes.Contains(resolveRaw, []byte(retryLeased[0].ID)) {
 		t.Fatalf("resolve result missing leased task: err=%v raw=%s", err, resolveRaw)
@@ -328,9 +339,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	inventoryResult := filepath.Join(root, "inventory-result.json")
 	invCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
 	invCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+inventoryResult)
-	if out, err := invCmd.CombinedOutput(); err != nil {
-		t.Fatalf("inventory helper failed: %v: %s", err, out)
-	}
+	_ = runLifecycleAgentHelper(t, invCmd)
 	actualInventory, err := os.ReadFile(inventoryResult)
 	if err != nil || len(actualInventory) == 0 {
 		t.Fatalf("inventory helper result missing: %v", err)
@@ -394,9 +403,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	removeResolve := filepath.Join(root, "remove-resolve-result.json")
 	removeResolveCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EResolveHelper$", "--", root)
 	removeResolveCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_TASK="+removeLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+removeLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT="+removeResolve)
-	if out, err := removeResolveCmd.CombinedOutput(); err != nil {
-		t.Fatalf("remove resolve helper failed: %v: %s", err, out)
-	}
+	_ = runLifecycleAgentHelper(t, removeResolveCmd)
 	removeResult, err := os.ReadFile(removeResolve)
 	if err != nil || !bytes.Contains(removeResult, []byte(removeLeased[0].ID)) {
 		t.Fatalf("remove result missing: %v", err)
@@ -405,9 +412,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	removeInventory := filepath.Join(root, "remove-inventory-result.json")
 	removeInventoryCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
 	removeInventoryCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+removeInventory)
-	if out, err := removeInventoryCmd.CombinedOutput(); err != nil {
-		t.Fatalf("remove inventory helper failed: %v: %s", err, out)
-	}
+	_ = runLifecycleAgentHelper(t, removeInventoryCmd)
 	removeInventoryRaw, err := os.ReadFile(removeInventory)
 	if err != nil || len(removeInventoryRaw) == 0 {
 		t.Fatalf("remove inventory result missing: %v", err)

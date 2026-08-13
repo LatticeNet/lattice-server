@@ -561,7 +561,8 @@ func (s *Server) unmetActiveDependencies(manifest plugin.Manifest) []string {
 	return unmet
 }
 
-func pluginInstallationFromLoaded(pl plugin.Loaded, status string) model.PluginInstallation {	return model.PluginInstallation{
+func pluginInstallationFromLoaded(pl plugin.Loaded, status string) model.PluginInstallation {
+	return model.PluginInstallation{
 		ID:             pl.Manifest.ID,
 		Name:           pl.Manifest.Name,
 		Type:           pl.Manifest.Type,

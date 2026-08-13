@@ -266,6 +266,11 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	s.ensureMaps()
+	snapshots, err := validateCloneSubscriptionSnapshots(s.state.SubscriptionSnapshots)
+	if err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	s.state.SubscriptionSnapshots = snapshots
 	if err := validateVpnUserCollections(s.state.VpnUsers, s.state.VpnUserSecrets); err != nil {
 		return nil, fmt.Errorf("store: invalid vpn user secret collections: %w", err)
 	}
@@ -285,6 +290,11 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 }
 
 func subscriptionSecretsNeedMigration(st State, cph secret.Cipher) bool {
+	for _, snapshot := range st.SubscriptionSnapshots {
+		if snapshot.NeedsRewrite() {
+			return true
+		}
+	}
 	if cph == nil || !cph.Enabled() {
 		return false
 	}
@@ -416,27 +426,36 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 		}
 	}
 	if !subscriptionAuthorityInitialized {
-		for _, share := range st.SubscriptionShares {
-			if current, ok := existing.SubscriptionShares[share.ID]; ok && !share.UpdatedAt.After(current.UpdatedAt) {
-				continue
-			}
-			if err := bs.UpsertSubscriptionShare(share); err != nil {
-				return err
-			}
-		}
-		for key, snapshot := range st.SubscriptionSnapshots {
-			if current, ok := existing.SubscriptionSnapshots[key]; ok && !subscriptionSnapshotNewer(snapshot, current) {
-				continue
-			}
-			if err := bs.UpsertSubscriptionSnapshot(key, snapshot); err != nil {
-				return err
-			}
-		}
-		if err := bs.markSubscriptionHotAuthorityInitialized(); err != nil {
+		if err := bs.initializeSubscriptionHotAuthority(mergeSubscriptionHotSeed(st, existing)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func mergeSubscriptionHotSeed(jsonState, unmarkedBolt State) State {
+	merged := jsonState
+	merged.SubscriptionShares = make(map[string]model.SubscriptionShare, len(jsonState.SubscriptionShares)+len(unmarkedBolt.SubscriptionShares))
+	for id, share := range unmarkedBolt.SubscriptionShares {
+		merged.SubscriptionShares[id] = share
+	}
+	for id, share := range jsonState.SubscriptionShares {
+		if existing, ok := merged.SubscriptionShares[id]; ok && !share.UpdatedAt.After(existing.UpdatedAt) {
+			continue
+		}
+		merged.SubscriptionShares[id] = share
+	}
+	merged.SubscriptionSnapshots = make(map[string]model.SubscriptionSnapshot, len(jsonState.SubscriptionSnapshots)+len(unmarkedBolt.SubscriptionSnapshots))
+	for key, snapshot := range unmarkedBolt.SubscriptionSnapshots {
+		merged.SubscriptionSnapshots[key] = snapshot
+	}
+	for key, snapshot := range jsonState.SubscriptionSnapshots {
+		if existing, ok := merged.SubscriptionSnapshots[key]; ok && !subscriptionSnapshotNewer(snapshot, existing) {
+			continue
+		}
+		merged.SubscriptionSnapshots[key] = snapshot
+	}
+	return merged
 }
 
 func subscriptionSnapshotNewer(candidate, current model.SubscriptionSnapshot) bool {

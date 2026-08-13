@@ -90,19 +90,6 @@ func (bs *BoltStateStore) subscriptionHotAuthorityInitialized() (bool, error) {
 	return initialized, err
 }
 
-func (bs *BoltStateStore) markSubscriptionHotAuthorityInitialized() error {
-	return bs.db.Update(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		meta := tx.Bucket(boltBucketMeta)
-		if meta == nil {
-			return errors.New("missing bolt metadata bucket")
-		}
-		return meta.Put(boltKeySubscriptionHotAuthority, []byte("initialized"))
-	})
-}
-
 var boltStateBuckets = [][]byte{
 	boltBucketUsers,
 	boltBucketTokens,
@@ -171,9 +158,67 @@ var boltStateBuckets = [][]byte{
 // drift from the JSON store, so changes here MUST be mirrored and tested against
 // internal/store/store.go.
 type BoltStateStore struct {
-	db              *bolt.DB
-	cipher          secret.Cipher
-	testUpdateCalls int
+	db                          *bolt.DB
+	cipher                      secret.Cipher
+	testUpdateCalls             int
+	testSubscriptionSeedFailure func(stage string) error
+}
+
+func (bs *BoltStateStore) initializeSubscriptionHotAuthority(st State) error {
+	snapshots, err := validateCloneSubscriptionSnapshots(st.SubscriptionSnapshots)
+	if err != nil {
+		return err
+	}
+	encryptedSnapshots := make(map[string]model.SubscriptionSnapshot, len(snapshots))
+	for key, snapshot := range snapshots {
+		encrypted, err := encryptSubscriptionSnapshotRecord(key, snapshot, bs.cipher)
+		if err != nil {
+			return err
+		}
+		encryptedSnapshots[key] = encrypted
+	}
+	encryptedShares := make(map[string]model.SubscriptionShare, len(st.SubscriptionShares))
+	for id, share := range st.SubscriptionShares {
+		encrypted, err := encryptSubscriptionShareRecord(id, share, bs.cipher)
+		if err != nil {
+			return err
+		}
+		encryptedShares[id] = encrypted
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		for _, bucket := range [][]byte{boltBucketSubShares, boltBucketSubSnapshots} {
+			if err := tx.DeleteBucket(bucket); err != nil && !errors.Is(err, bolt.ErrBucketNotFound) {
+				return err
+			}
+			if _, err := tx.CreateBucket(bucket); err != nil {
+				return err
+			}
+		}
+		if err := putMap(tx, boltBucketSubShares, encryptedShares); err != nil {
+			return err
+		}
+		if bs.testSubscriptionSeedFailure != nil {
+			if err := bs.testSubscriptionSeedFailure("after_shares"); err != nil {
+				return err
+			}
+		}
+		if err := putMap(tx, boltBucketSubSnapshots, encryptedSnapshots); err != nil {
+			return err
+		}
+		if bs.testSubscriptionSeedFailure != nil {
+			if err := bs.testSubscriptionSeedFailure("before_marker"); err != nil {
+				return err
+			}
+		}
+		meta := tx.Bucket(boltBucketMeta)
+		if meta == nil {
+			return errors.New("missing bolt metadata bucket")
+		}
+		return meta.Put(boltKeySubscriptionHotAuthority, []byte("initialized"))
+	})
 }
 
 func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
@@ -253,6 +298,11 @@ func (bs *BoltStateStore) ImportState(st State) error {
 
 func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized bool) error {
 	st.ensureMaps()
+	snapshots, err := validateCloneSubscriptionSnapshots(st.SubscriptionSnapshots)
+	if err != nil {
+		return err
+	}
+	st.SubscriptionSnapshots = snapshots
 	if err := validateVpnUserCollections(st.VpnUsers, st.VpnUserSecrets); err != nil {
 		return fmt.Errorf("invalid vpn user secret collections: %w", err)
 	}
@@ -627,6 +677,11 @@ func (bs *BoltStateStore) exportState(migrate bool) (State, error) {
 		return State{}, err
 	}
 	st.ensureMaps()
+	snapshots, err := validateCloneSubscriptionSnapshots(st.SubscriptionSnapshots)
+	if err != nil {
+		return State{}, err
+	}
+	st.SubscriptionSnapshots = snapshots
 	if err := validateVpnUserCollections(st.VpnUsers, st.VpnUserSecrets); err != nil {
 		return State{}, fmt.Errorf("invalid vpn user secret collections: %w", err)
 	}
@@ -2610,11 +2665,18 @@ func (bs *BoltStateStore) DeleteSubscriptionShare(id string) error {
 // may contain bearer credentials and complete proxy URIs even though the public
 // subscription endpoint later serves it to an authorized client.
 func (bs *BoltStateStore) UpsertSubscriptionSnapshot(key string, snap model.SubscriptionSnapshot) error {
+	validated, err := validateCloneSubscriptionSnapshot(snap)
+	if err != nil {
+		return err
+	}
+	if want := model.SnapshotKey(validated.PluginID, validated.SubscriptionID); key != want {
+		return fmt.Errorf("subscription snapshot key %q does not match identity %q", key, want)
+	}
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
 			return err
 		}
-		enc, err := encryptSubscriptionSnapshotRecord(key, snap, bs.cipher)
+		enc, err := encryptSubscriptionSnapshotRecord(key, validated, bs.cipher)
 		if err != nil {
 			return err
 		}

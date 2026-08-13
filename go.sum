@@ -1,9 +1,5 @@
-github.com/LatticeNet/lattice-sdk v0.2.18-0.20260722123932-4a318f246d23 h1:2qpbnG8jO9lOlVRpp4OCeami34HUyV7VGmp3vj4IRQI=
-github.com/LatticeNet/lattice-sdk v0.2.18-0.20260722123932-4a318f246d23/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
-github.com/LatticeNet/lattice-sdk v0.2.19-0.20260805094510-5478e57e4569 h1:6f0Xa1MLeArLJdVIiRKKykdftnUO8dEEw0VVFAee5o8=
-github.com/LatticeNet/lattice-sdk v0.2.19-0.20260805094510-5478e57e4569/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
-github.com/LatticeNet/lattice-sdk v0.2.19-0.20260805102934-5de2ef61a718 h1:tmvsmC1MdS6yYAoRKNUMUdlmWkDzw7BBlHu5zszmGsA=
-github.com/LatticeNet/lattice-sdk v0.2.19-0.20260805102934-5de2ef61a718/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
+github.com/LatticeNet/lattice-sdk v0.2.19-0.20260813221107-c151b2e11168 h1:+Sy2Uz61rCei+NFySVHW7AyBIEL5AMvrlKCViN2+CDM=
+github.com/LatticeNet/lattice-sdk v0.2.19-0.20260813221107-c151b2e11168/go.mod h1:7ENUQ4EoS/TSW/eNomCGfZGliUPJZ46uAvp7dVcEXoE=
 github.com/coreos/go-oidc/v3 v3.18.0 h1:V9orjXynvu5wiC9SemFTWnG4F45v403aIcjWo0d41+A=
 github.com/coreos/go-oidc/v3 v3.18.0/go.mod h1:DYCf24+ncYi+XkIH97GY1+dqoRlbaSI26KVTCI9SrY4=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

@@ -51,6 +51,20 @@ func decodeStrictV2(data []byte, dst any) error {
 	return nil
 }
 
+func requireV2Fields(data []byte, fields ...string) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	for _, k := range fields {
+		v, ok := m[k]
+		if !ok || len(v) == 0 || string(v) == "null" {
+			return fmt.Errorf("missing required v2 field %q", k)
+		}
+	}
+	return nil
+}
+
 type stdioV2Session struct {
 	mu         sync.Mutex
 	generation uint64

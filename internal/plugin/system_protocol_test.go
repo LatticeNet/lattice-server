@@ -33,3 +33,15 @@ func TestDecodeStrictV2RejectsDuplicateAndTrailing(t *testing.T) {
 		t.Fatal("trailing frame accepted")
 	}
 }
+
+func TestRequireV2FieldsRejectsMissingAndNull(t *testing.T) {
+	valid := []byte(`{"protocol":2,"kind":"runtime_ready","generation":1,"invocation_id":"runtime"}`)
+	if err := requireV2Fields(valid, "protocol", "kind", "generation", "invocation_id"); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range [][]byte{[]byte(`{"protocol":2,"kind":null,"generation":1,"invocation_id":"runtime"}`), []byte(`{"protocol":2,"kind":"runtime_ready","generation":1}`)} {
+		if err := requireV2Fields(raw, "protocol", "kind", "generation", "invocation_id"); err == nil {
+			t.Fatal("accepted missing/null required field")
+		}
+	}
+}

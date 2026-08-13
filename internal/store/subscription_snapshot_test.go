@@ -263,11 +263,171 @@ func TestSnapshotOnlyAndShareOnlyLostKeyFailClosed(t *testing.T) {
 			if err := tc.seed(s); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := OpenWithCipher(path, secret.Disabled()); err == nil {
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := sha256.Sum256(before)
+			for _, sidecar := range []string{path + ".audit-wal", path + ".audit-anchor"} {
+				if err := os.Remove(sidecar); err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+			}
+			if _, err := OpenWithCipher(path, secret.Disabled()); err == nil || !strings.Contains(err.Error(), "enabled cipher") {
 				t.Fatal("encrypted record opened without its master key")
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := sha256.Sum256(after); got != want {
+				t.Fatalf("lost-key open changed JSON: %x != %x", got, want)
+			}
+			for _, sidecar := range []string{path + ".audit-wal", path + ".audit-anchor"} {
+				if _, err := os.Stat(sidecar); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("lost-key open created %s: %v", sidecar, err)
+				}
 			}
 		})
 	}
+}
+
+func TestDisabledCipherRejectsPersistentSubscriptionSecretsBeforeMutation(t *testing.T) {
+	t.Run("memory exemption", func(t *testing.T) {
+		s, err := OpenWithCipher("", secret.Disabled())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpsertSubscriptionShare(model.SubscriptionShare{ID: "share", Token: "memory-token"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{SchemaVersion: model.SubscriptionSnapshotSchemaVersion, PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		put  func(*Store) error
+		has  func(*Store) bool
+	}{
+		{name: "json share", put: func(s *Store) error {
+			return s.UpsertSubscriptionShare(model.SubscriptionShare{ID: "share", Token: "plaintext-token"})
+		}, has: func(s *Store) bool { _, ok := s.SubscriptionShare("share"); return ok }},
+		{name: "json snapshot", put: func(s *Store) error {
+			return s.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{SchemaVersion: model.SubscriptionSnapshotSchemaVersion, PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary})
+		}, has: func(s *Store) bool { _, ok := s.SubscriptionSnapshot("p", "s"); return ok }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			s, err := OpenWithCipher(path, secret.Disabled())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.put(s); err == nil || !strings.Contains(err.Error(), "enabled cipher") {
+				t.Fatalf("write error = %v", err)
+			}
+			if tc.has(s) {
+				t.Fatal("failed plaintext write published live state")
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("failed plaintext write created state file: %v", err)
+			}
+		})
+	}
+
+	t.Run("json v1 open", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "state.json")
+		raw := legacySubscriptionStateJSON(t, snapshotRawCanary, map[string]model.SubscriptionShare{"share": {ID: "share", Token: "plaintext-token"}})
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		want := sha256.Sum256(raw)
+		if _, err := OpenWithCipher(path, secret.Disabled()); err == nil || !strings.Contains(err.Error(), "enabled cipher") {
+			t.Fatalf("open error = %v", err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sha256.Sum256(after); got != want {
+			t.Fatalf("failed open changed JSON: %x != %x", got, want)
+		}
+		for _, sidecar := range []string{path + ".audit-wal", path + ".audit-anchor"} {
+			if _, err := os.Stat(sidecar); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("failed open created %s: %v", sidecar, err)
+			}
+		}
+	})
+
+	t.Run("runtime hot", func(t *testing.T) {
+		s, err := OpenWithCipher("", secret.Disabled())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpsertSubscriptionShare(model.SubscriptionShare{ID: "share", Token: "memory-token"}); err != nil {
+			t.Fatal(err)
+		}
+		boltPath := filepath.Join(t.TempDir(), "hot.db")
+		if err := s.EnableRuntimeBoltHotStore(boltPath); err == nil || !strings.Contains(err.Error(), "enabled cipher") {
+			t.Fatalf("enable error = %v", err)
+		}
+		if _, err := os.Stat(boltPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed runtime-hot enable created Bolt file: %v", err)
+		}
+		if got, ok := s.SubscriptionShare("share"); !ok || got.Token != "memory-token" {
+			t.Fatalf("failed enable changed live state: %+v ok=%v", got, ok)
+		}
+	})
+
+	t.Run("full bolt write and v1 open", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.db")
+		bs, err := OpenBoltState(path, secret.Disabled())
+		if err != nil {
+			t.Fatal(err)
+		}
+		before, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := bs.UpsertSubscriptionSnapshot("p/s", model.SubscriptionSnapshot{SchemaVersion: model.SubscriptionSnapshotSchemaVersion, PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}); err == nil || !strings.Contains(err.Error(), "enabled cipher") {
+			t.Fatalf("write error = %v", err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(after, before) {
+			t.Fatal("failed Bolt write changed file")
+		}
+		if err := bs.db.Update(func(tx *bolt.Tx) error {
+			return putRecord(tx, boltBucketSubSnapshots, "p/s", legacySubscriptionSnapshotV1{SchemaVersion: 1, PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary})
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := bs.Close(); err != nil {
+			t.Fatal(err)
+		}
+		legacy, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := sha256.Sum256(legacy)
+		if _, err := OpenBoltState(path, secret.Disabled()); err == nil || !strings.Contains(err.Error(), "enabled cipher") {
+			t.Fatalf("open error = %v", err)
+		}
+		unchanged, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sha256.Sum256(unchanged); got != want {
+			t.Fatalf("failed Bolt open changed file: %x != %x", got, want)
+		}
+	})
 }
 
 func TestLegacyPlaintextSubscriptionSecretsMigrateInOneStagedRewrite(t *testing.T) {

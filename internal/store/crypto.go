@@ -930,6 +930,9 @@ func decryptVpnUserSecretRecord(id string, record VpnUserSecretRecord, c secret.
 // the clear: it is a label that already appears in reverse-proxy access logs, and
 // sealing it would imply a secrecy it does not have.
 func encryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c secret.Cipher) (model.SubscriptionShare, error) {
+	if share.Token != "" && (c == nil || !c.Enabled()) {
+		return model.SubscriptionShare{}, fmt.Errorf("encrypt subscription share %s token: enabled cipher is required", id)
+	}
 	token, err := c.Encrypt(share.Token)
 	if err != nil {
 		return model.SubscriptionShare{}, fmt.Errorf("encrypt subscription share %s token: %w", id, err)
@@ -957,12 +960,32 @@ func decryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c 
 // is opaque to the store, but not public at rest, so every backend seals it at
 // this shared per-record boundary.
 func encryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSnapshot, c secret.Cipher) (model.SubscriptionSnapshot, error) {
+	if snapshot.Raw != "" && (c == nil || !c.Enabled()) {
+		return model.SubscriptionSnapshot{}, fmt.Errorf("encrypt subscription snapshot %s raw: enabled cipher is required", id)
+	}
 	raw, err := c.Encrypt(snapshot.Raw)
 	if err != nil {
 		return model.SubscriptionSnapshot{}, fmt.Errorf("encrypt subscription snapshot %s raw: %w", id, err)
 	}
 	snapshot.Raw = raw
 	return snapshot, nil
+}
+
+func rejectSubscriptionSecretsWithoutCipher(st State, c secret.Cipher) error {
+	if c != nil && c.Enabled() {
+		return nil
+	}
+	for id, share := range st.SubscriptionShares {
+		if share.Token != "" {
+			return fmt.Errorf("subscription share %s token requires an enabled cipher", id)
+		}
+	}
+	for id, snapshot := range st.SubscriptionSnapshots {
+		if snapshot.Raw != "" {
+			return fmt.Errorf("subscription snapshot %s raw requires an enabled cipher", id)
+		}
+	}
+	return nil
 }
 
 func decryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSnapshot, c secret.Cipher) (model.SubscriptionSnapshot, error) {

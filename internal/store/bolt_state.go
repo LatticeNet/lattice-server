@@ -298,6 +298,9 @@ func (bs *BoltStateStore) ImportState(st State) error {
 
 func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized bool) error {
 	st.ensureMaps()
+	if err := rejectSubscriptionSecretsWithoutCipher(st, bs.cipher); err != nil {
+		return err
+	}
 	snapshots, err := validateCloneSubscriptionSnapshots(st.SubscriptionSnapshots)
 	if err != nil {
 		return err
@@ -670,6 +673,9 @@ func (bs *BoltStateStore) exportState(migrate bool) (State, error) {
 		return readMap(tx, boltBucketOIDCAuthStates, st.OIDCAuthStates)
 	})
 	if err != nil {
+		return State{}, err
+	}
+	if err := rejectSubscriptionSecretsWithoutCipher(st, bs.cipher); err != nil {
 		return State{}, err
 	}
 	migrateSubscriptionSecrets := subscriptionSecretsNeedMigration(st, bs.cipher)

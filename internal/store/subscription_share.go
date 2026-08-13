@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"sort"
 	"time"
 
@@ -13,6 +14,11 @@ import (
 func (s *Store) UpsertSubscriptionShare(share model.SubscriptionShare) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Pathless stores are explicitly ephemeral test/runtime views. Any disk-backed
+	// store must have a real cipher before accepting bearer material.
+	if s.path != "" && share.Token != "" && (s.cipher == nil || !s.cipher.Enabled()) {
+		return errors.New("subscription share token requires an enabled cipher")
+	}
 	s.ensureMaps()
 	now := time.Now().UTC()
 	share.UpdatedAt = now

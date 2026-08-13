@@ -50,6 +50,11 @@ func validateCloneSubscriptionSnapshots(in map[string]model.SubscriptionSnapshot
 func (s *Store) UpsertSubscriptionSnapshot(snap model.SubscriptionSnapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Pathless stores are explicitly ephemeral test/runtime views. Any disk-backed
+	// store must have a real cipher before accepting opaque provider credentials.
+	if s.path != "" && snap.Raw != "" && (s.cipher == nil || !s.cipher.Enabled()) {
+		return errors.New("subscription snapshot raw content requires an enabled cipher")
+	}
 	s.ensureMaps()
 	if snap.SchemaVersion == 0 {
 		snap.SchemaVersion = model.SubscriptionSnapshotSchemaVersion

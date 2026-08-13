@@ -238,6 +238,20 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	if path == "" {
 		return s, nil
 	}
+	if !cph.Enabled() {
+		data, readErr := os.ReadFile(path)
+		if readErr == nil && len(data) != 0 {
+			var probe State
+			if err := json.Unmarshal(data, &probe); err != nil {
+				return nil, err
+			}
+			if err := rejectSubscriptionSecretsWithoutCipher(probe, cph); err != nil {
+				return nil, fmt.Errorf("store: %w", err)
+			}
+		} else if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return nil, readErr
+		}
+	}
 	walPath := path + ".audit-wal"
 	walAnchorPath := path + ".audit-anchor"
 	wal, err := audit.OpenAnchoredWAL(walPath, walAnchorPath)
@@ -340,6 +354,9 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 			return nil
 		}
 		return fmt.Errorf("runtime bbolt hot store already enabled at %s", s.runtimeBoltHotPath)
+	}
+	if err := rejectSubscriptionSecretsWithoutCipher(s.state, s.cipher); err != nil {
+		return err
 	}
 	bs, err := OpenBoltState(path, s.cipher)
 	if err != nil {

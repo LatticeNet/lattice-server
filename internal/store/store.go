@@ -1333,7 +1333,7 @@ type TaskDelivery struct {
 
 const (
 	DurableProtocolNetGuardV1  = "netguard-v1"
-	DurableProtocolLineChainV1 = "linechain-v1"
+	DurableProtocolLineChainV1 = "linechain-e3-v1"
 )
 
 // LeaseTasksWithApprovalGate leases the same task set as LeaseTasks while

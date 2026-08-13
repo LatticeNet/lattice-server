@@ -1,9 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +41,89 @@ func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, manag
 		t.Fatal("fixture failed to record durable capability")
 	}
 	return srv, sourceUUID, def.LineUUID, user, def
+}
+
+func TestLineChainPublicViewsMatchHTTPAndRPCContract(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	const sourceUUID = "22222222-2222-4222-8222-222222222222"
+	approval := model.Approval{ID: "approval-public", NodeID: "node-b", Plugin: lineChainPlugin, Service: lineChainService,
+		Method: lineChainSetMethod, Action: lineChainActionPrefix + "artifact", RequestSHA256: "request", Plan: `{"private":"credential-canary"}`, Status: model.ApprovalPending}
+	attempt := store.LineChainAttempt{ApprovalID: approval.ID, Operation: store.LineChainOperationSet, SourceLineUUID: sourceUUID,
+		SourceNodeID: "node-b", CandidateTargetLineUUID: "11111111-1111-4111-8111-111111111111", CandidateTargetNodeID: "node-a",
+		CandidateArtifactSHA256: "artifact", RequestSHA256: "request", PlanGraphRevision: 0}
+	if _, _, err := srv.store.PlanLineChainApproval(attempt, approval); err != nil {
+		t.Fatal(err)
+	}
+	view, err := srv.lineChainViews()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Chains) != 1 || view.Chains[0].Current != nil || view.Chains[0].Attempt == nil ||
+		view.Chains[0].Status != store.LineChainStatusPlanned || view.Chains[0].Attempt.Operation != store.LineChainOperationSet {
+		t.Fatalf("unexpected public chain projection: %+v", view)
+	}
+	rpcJSON, err := srv.vpnCoreLineChainsRPC(context.Background(), "chains", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rpcView lineChainListView
+	if err := json.Unmarshal(rpcJSON, &rpcView); err != nil || !reflect.DeepEqual(view, rpcView) {
+		t.Fatalf("RPC view mismatch: view=%+v rpc=%+v err=%v", view, rpcView, err)
+	}
+	handler := srv.Handler()
+	cookies, _ := loginSession(t, handler)
+	req, rec := httptest.NewRequest(http.MethodGet, "/api/network/lines/chains", nil), httptest.NewRecorder()
+	for _, cookie := range cookies {
+		req.AddCookie(cookie)
+	}
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("HTTP chains status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var httpShape map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &httpShape); err != nil {
+		t.Fatal(err)
+	}
+	if len(httpShape) != 1 || httpShape["chains"] == nil || httpShape["definitions"] != nil || httpShape["attempts"] != nil || httpShape["graph_revision"] != nil {
+		t.Fatalf("HTTP exposed internal shape: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "credential-canary") || strings.Contains(string(rpcJSON), "credential-canary") {
+		t.Fatalf("public view leaked approval secret: http=%s rpc=%s", rec.Body.String(), rpcJSON)
+	}
+}
+
+func TestLineChainHTTPReadScopeDenialDoesNotMutate(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"network:plan"}, nil)
+	before := srv.store.LineChainSnapshot()
+	response := doBearerJSON(t, handler, http.MethodGet, "/api/network/lines/chains", "", token)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected proxy:read denial, got %d", response.StatusCode)
+	}
+	after := srv.store.LineChainSnapshot()
+	if !reflect.DeepEqual(before, after) {
+		t.Fatalf("denied read mutated chain state: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestLineChainPublicOperationProjectsReplace(t *testing.T) {
+	if got := publicLineChainOperation(store.LineChainAttempt{Operation: store.LineChainOperationSet, BaseGeneration: 2}); got != "replace" {
+		t.Fatalf("set over committed generation projected as %q", got)
+	}
+}
+
+func TestLineChainAgentTaskViewCarriesExactDurableProtocol(t *testing.T) {
+	view := toAgentTaskView(model.Task{ID: "task-1", LeaseID: "lease-1"}, true, store.DurableProtocolLineChainV1)
+	raw, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"durable_protocol":"linechain-e3-v1"`) {
+		t.Fatalf("linechain response protocol mismatch: %s", raw)
+	}
 }
 
 func TestLineChainCompilerProducesDeterministicRedactedArtifact(t *testing.T) {

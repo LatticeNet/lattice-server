@@ -144,6 +144,7 @@ func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, er
 				Source: "discovered", Name: discovered.Name, Tag: discovered.Name, Type: discovered.Protocol,
 				Transport: discovered.Network, ListenHost: discovered.ListenHost, ListenPort: port,
 				PublicHost: discovered.Address, Domain: firstNonEmpty(discovered.SNI, discovered.Host),
+				OutboundRef: discovered.OutboundRef, OutboundServer: discovered.OutboundServer, OutboundPort: atoiSafe(discovered.OutboundPort),
 				DownstreamLineUUID: strings.TrimSpace(discovered.DownstreamLineUUID), Status: "ok", Metadata: discovered.Metadata}
 			if definition, ok := snapshot.Definitions[uuid]; ok && definition.LineHashID == hashID {
 				line.Overlay, line.OverlayStatus, line.OverlayUser, line.Security = true, definition.Status, definition.UserID, model.ProxySecurityReality
@@ -512,18 +513,121 @@ func (s *Server) handleLineChains(w http.ResponseWriter, r *http.Request, _ prin
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.lineChainViews())
+	view, err := s.lineChainViews()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
-func (s *Server) lineChainViews() map[string]any {
-	snapshot := s.store.LineChainSnapshot()
-	return map[string]any{"definitions": snapshot.Definitions, "attempts": snapshot.Attempts, "graph_revision": snapshot.Revision}
+type lineChainCurrentView struct {
+	TargetLineUUID string `json:"target_line_uuid,omitempty"`
+	TargetNodeID   string `json:"target_node_id,omitempty"`
+	ArtifactDigest string `json:"artifact_digest"`
+	Status         string `json:"status"`
+}
+
+type lineChainAttemptView struct {
+	Operation               string `json:"operation"`
+	CandidateTargetLineUUID string `json:"candidate_target_line_uuid,omitempty"`
+	ApprovalID              string `json:"approval_id"`
+	CandidateArtifactDigest string `json:"candidate_artifact_digest,omitempty"`
+	Status                  string `json:"status"`
+	ErrorCode               string `json:"error_code,omitempty"`
+	Error                   string `json:"error,omitempty"`
+}
+
+type lineChainView struct {
+	SourceLineUUID             string                `json:"source_line_uuid"`
+	SourceNodeID               string                `json:"source_node_id"`
+	Status                     string                `json:"status"`
+	Current                    *lineChainCurrentView `json:"current"`
+	Attempt                    *lineChainAttemptView `json:"attempt"`
+	ObservedOutboundTag        string                `json:"observed_outbound_tag,omitempty"`
+	ObservedDownstreamLineUUID string                `json:"observed_downstream_line_uuid,omitempty"`
+	LastError                  string                `json:"last_error,omitempty"`
+}
+
+type lineChainListView struct {
+	Chains []lineChainView `json:"chains"`
+}
+
+func (s *Server) lineChainViews() (lineChainListView, error) {
+	snapshot, err := s.captureLineChainCompileSnapshot()
+	if err != nil {
+		return lineChainListView{}, err
+	}
+	bySource := make(map[string]lineChainView)
+	for source, definition := range snapshot.Chains.Definitions {
+		row := bySource[source]
+		row.SourceLineUUID, row.SourceNodeID, row.Status = source, definition.SourceNodeID, definition.Status
+		row.Current = &lineChainCurrentView{TargetLineUUID: definition.TargetLineUUID, TargetNodeID: definition.TargetNodeID, ArtifactDigest: definition.ArtifactSHA256, Status: definition.Status}
+		row.LastError = definition.DriftCode
+		bySource[source] = row
+	}
+	for _, attempt := range snapshot.Chains.Attempts {
+		row := bySource[attempt.SourceLineUUID]
+		row.SourceLineUUID, row.SourceNodeID, row.Status = attempt.SourceLineUUID, attempt.SourceNodeID, attempt.Status
+		operation := publicLineChainOperation(attempt)
+		publicError := redactLineChainError(attempt.LastError, snapshot)
+		row.Attempt = &lineChainAttemptView{Operation: operation, CandidateTargetLineUUID: attempt.CandidateTargetLineUUID,
+			ApprovalID: attempt.ApprovalID, CandidateArtifactDigest: attempt.CandidateArtifactSHA256, Status: attempt.Status,
+			ErrorCode: attempt.LastErrorCode, Error: publicError}
+		if publicError != "" {
+			row.LastError = publicError
+		}
+		bySource[attempt.SourceLineUUID] = row
+	}
+	chains := make([]lineChainView, 0, len(bySource))
+	for source, row := range bySource {
+		if lines := snapshot.Lines[source]; len(lines) == 1 {
+			row.ObservedOutboundTag = lines[0].OutboundRef
+			row.ObservedDownstreamLineUUID = lines[0].DownstreamLineUUID
+		}
+		chains = append(chains, row)
+	}
+	sort.Slice(chains, func(i, j int) bool { return chains[i].SourceLineUUID < chains[j].SourceLineUUID })
+	return lineChainListView{Chains: chains}, nil
+}
+
+func publicLineChainOperation(attempt store.LineChainAttempt) string {
+	if attempt.Operation == store.LineChainOperationSet && attempt.BaseGeneration > 0 {
+		return "replace"
+	}
+	return attempt.Operation
+}
+
+func redactLineChainError(message string, snapshot lineChainCompileSnapshot) string {
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	secrets := make([]string, 0)
+	for _, user := range snapshot.Users {
+		secrets = append(secrets, user.SubID)
+		for _, credential := range user.Credentials {
+			secrets = append(secrets, credential.UUID, credential.Password)
+		}
+	}
+	for _, definition := range snapshot.Definitions {
+		secrets = append(secrets, definition.RealityPrivateKey)
+	}
+	for _, secret := range secrets {
+		if strings.TrimSpace(secret) != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	return message
 }
 
 func (s *Server) vpnCoreLineChainsRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "chains":
-		return json.Marshal(s.lineChainViews())
+		view, err := s.lineChainViews()
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(view)
 	case "plan_chain":
 		p, err := pluginOperatorPrincipal(ctx)
 		if err != nil {

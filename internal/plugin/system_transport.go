@@ -85,15 +85,15 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 			}
 			continue
 		}
+		if f.Kind == "invoke_ready" {
+			return systemRunnerReply{}, fmt.Errorf("invoke_ready before result")
+		}
 		if f.Kind != "invoke_result" {
 			return systemRunnerReply{}, fmt.Errorf("unexpected v2 frame %q", f.Kind)
 		}
 		var reply systemRunnerReply
 		if err := json.Unmarshal(f.Response, &reply); err != nil {
 			return systemRunnerReply{}, err
-		}
-		if f.Kind == "invoke_ready" {
-			return systemRunnerReply{}, fmt.Errorf("invoke_ready before result")
 		}
 		if f.Kind == "invoke_result" {
 			for {

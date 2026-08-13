@@ -206,6 +206,30 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	// exact non-success result before any inventory or observable traffic.
 	recoveryRaw, _ := os.ReadFile(recoveryResult)
 	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","result":%s}`, recoveryRaw)))
+	// The interrupted lease is terminally failed; obtain a fresh approval and
+	// lease before any retry resolve. The server must reproduce the exact
+	// approved document bytes rather than allowing a new authority.
+	var retryPlanned struct {
+		Approval model.Approval `json:"approval"`
+	}
+	persistentJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/network/lines/chains/plan", planBody, cookies, csrf, &retryPlanned)
+	retryPlanSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(retryPlanned.Approval.Plan)))
+	persistentJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/network/approvals/approve", fmt.Sprintf(`{"approval_id":%q,"queue_apply":true,"plan_sha256":%q}`, retryPlanned.Approval.ID, retryPlanSHA), cookies, csrf, nil)
+	retryReq, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/api/agent/tasks?node_id=node-b", nil)
+	retryReq.Header.Set("Authorization", "Bearer "+nodeToken)
+	retryReq.Header.Set(agentCapabilitiesHeader, lineChainDurableCapability)
+	retryRes, err := httpServer.Client().Do(retryReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retryRes.Body.Close()
+	var retryLeased []agentTaskView
+	if retryRes.StatusCode != http.StatusOK || json.NewDecoder(retryRes.Body).Decode(&retryLeased) != nil || len(retryLeased) != 1 {
+		t.Fatalf("retry lease=%d %+v", retryRes.StatusCode, retryLeased)
+	}
+	if retryLeased[0].Script != leased[0].Script {
+		t.Fatal("retry lease document bytes differ from the original approved artifact")
+	}
 	sidecarBytes, _ := os.ReadFile(sidecar)
 	if !bytes.Contains(sidecarBytes, []byte(`"unknown_root":{"keep":true}`)) || !bytes.Contains(sidecarBytes, []byte(`"ordinary":"keep"`)) {
 		t.Fatalf("host fields lost: %s", sidecarBytes)
@@ -227,7 +251,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 
 	resolveResult := filepath.Join(root, "resolve-result.json")
 	resolveCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EResolveHelper$", "--", root)
-	resolveCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_TASK="+leased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+leased[0].LeaseID, "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT="+resolveResult)
+	resolveCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_TASK="+retryLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT="+resolveResult)
 	if out, err := resolveCmd.CombinedOutput(); err != nil {
 		t.Fatalf("resolve helper failed: %v: %s", err, out)
 	}

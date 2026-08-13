@@ -100,6 +100,11 @@ func (o *lifecycleObserver) accepted() int {
 	defer o.mu.Unlock()
 	return o.count
 }
+func (o *lifecycleObserver) reset() {
+	o.mu.Lock()
+	o.count = 0
+	o.mu.Unlock()
+}
 
 func lifecycleRealityKeypair(t *testing.T, bin string) (string, string) {
 	t.Helper()

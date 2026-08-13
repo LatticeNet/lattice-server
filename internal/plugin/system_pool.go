@@ -38,6 +38,7 @@ type systemPool struct {
 	maxAge      time.Duration
 	maxOverflow int
 	closed      bool
+	replenishFn func(uint64) (*pooledWorker, error)
 }
 
 func (p *systemPool) hasTransport() bool {
@@ -156,6 +157,11 @@ func (p *systemPool) poison(w *pooledWorker) {
 	p.mu.Lock()
 	w.state = workerDead
 	p.mu.Unlock()
+	if p.replenishFn != nil {
+		if nw, err := p.replenishFn(w.generation); err == nil && nw != nil {
+			_ = p.publishTransport(w.generation, nw.transport, time.Now())
+		}
+	}
 }
 
 func (p *systemPool) drain(generation uint64) {

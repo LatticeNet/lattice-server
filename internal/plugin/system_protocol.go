@@ -3,7 +3,33 @@ package plugin
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 )
+
+type stdioV2Session struct {
+	mu         sync.Mutex
+	generation uint64
+	invocation string
+	dispatched bool
+}
+
+func (s *stdioV2Session) dispatch(generation uint64, invocation string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dispatched {
+		return fmt.Errorf("stdio invocation already dispatched")
+	}
+	s.generation, s.invocation, s.dispatched = generation, invocation, true
+	return nil
+}
+
+func (s *stdioV2Session) validate(f stdioJSONV2Frame) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return validateStdioJSONV2Frame(f, s.generation, s.invocation, "")
+}
+
+func (s *stdioV2Session) reset() { s.mu.Lock(); s.dispatched = false; s.invocation = ""; s.mu.Unlock() }
 
 // stdioJSONV2Frame is the correlated envelope used by pooled workers.
 type stdioJSONV2Frame struct {

@@ -5707,6 +5707,13 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		}
 		_, script, err := s.validateLineChainApprovalForQueue(approval)
 		if err != nil {
+			committed, rejectErr := s.store.RejectLineChainApprovalStale(approval.ID, "line_chain_inputs_changed", "line chain inputs changed during approval; fresh plan required")
+			if rejectErr != nil {
+				if committed {
+					s.logger.Printf("line chain approval stale transition committed with degraded durability: %v", rejectErr)
+				}
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: rejectErr}
+			}
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 		lineChainScript = script

@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -60,6 +61,49 @@ func TestLineChainPlanDeduplicatesExactRequestAndSerializesSource(t *testing.T) 
 	if _, _, err := store.PlanLineChain(different); !errors.Is(err, ErrLineChainSourceBusy) {
 		t.Fatalf("different concurrent plan error=%v", err)
 	}
+}
+
+func TestRejectLineChainApprovalStaleUsesAtomicPersistenceBoundary(t *testing.T) {
+	setup := func(t *testing.T) *Store {
+		s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		approval := model.Approval{ID: "approval-stale-plan", Status: model.ApprovalPending}
+		attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", CandidateTargetLineUUID: "target", RequestSHA256: "request"}
+		if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	t.Run("pre_rename", func(t *testing.T) {
+		s := setup(t)
+		if err := os.Mkdir(s.path+".tmp", 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if committed, err := s.RejectLineChainApprovalStale("approval-stale-plan", "line_chain_inputs_changed", "fresh plan required"); committed || err == nil {
+			t.Fatalf("reject committed=%v err=%v", committed, err)
+		}
+		approval, _ := s.Approval("approval-stale-plan")
+		if approval.Status != model.ApprovalPending || s.LineChainSnapshot().Attempts[approval.ID].Status != LineChainStatusPlanned || s.LineChainSnapshot().Revision != 0 {
+			t.Fatalf("pre-rename stale transition published: approval=%+v snapshot=%+v", approval, s.LineChainSnapshot())
+		}
+		if committed, err := s.RejectLineChainApprovalStale("approval-stale-plan", "line_chain_inputs_changed", "fresh plan required"); !committed || err != nil {
+			t.Fatalf("retry committed=%v err=%v", committed, err)
+		}
+	})
+	t.Run("post_rename", func(t *testing.T) {
+		s := setup(t)
+		s.syncParentDir = func(string) error { return errors.New("forced post-rename sync failure") }
+		if committed, err := s.RejectLineChainApprovalStale("approval-stale-plan", "line_chain_inputs_changed", "fresh plan required"); !committed || err == nil {
+			t.Fatalf("reject committed=%v err=%v", committed, err)
+		}
+		approval, _ := s.Approval("approval-stale-plan")
+		attempt := s.LineChainSnapshot().Attempts[approval.ID]
+		if approval.Status != model.ApprovalRejected || !approval.Stale || attempt.Status != LineChainStatusFailed || s.LineChainSnapshot().Revision != 0 {
+			t.Fatalf("post-rename stale transition not published: approval=%+v attempt=%+v", approval, attempt)
+		}
+	})
 }
 
 func TestLineChainReserveRejectsTwoNodeCycleWithoutRevisionMutation(t *testing.T) {

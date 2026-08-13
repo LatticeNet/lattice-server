@@ -21,6 +21,13 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
+type countingRejectTransport struct{ calls int }
+
+func (t *countingRejectTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.calls++
+	return nil, errors.New("unexpected external transport call")
+}
+
 func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, managedLineDef) {
 	t.Helper()
 	srv := newManagedLineTestServer(t)
@@ -119,6 +126,10 @@ func TestLineChainHTTPPlanScopeDenialHasNoDomainSideEffects(t *testing.T) {
 	handler := srv.Handler()
 	cookies, csrf := loginSession(t, handler)
 	token := createPAT(t, handler, cookies, csrf, []string{"proxy:read"}, nil)
+	transport := &countingRejectTransport{}
+	previousTransport := http.DefaultTransport
+	http.DefaultTransport = transport
+	t.Cleanup(func() { http.DefaultTransport = previousTransport })
 	before, tasksBefore, approvalsBefore := srv.store.LineChainSnapshot(), len(srv.store.Tasks()), len(srv.store.Approvals())
 	body := fmt.Sprintf(`{"source_line_uuid":%q,"target_line_uuid":%q}`, sourceUUID, targetUUID)
 	response := doBearerJSON(t, handler, http.MethodPost, "/api/network/lines/chains/plan", body, token)
@@ -128,6 +139,9 @@ func TestLineChainHTTPPlanScopeDenialHasNoDomainSideEffects(t *testing.T) {
 	}
 	if after := srv.store.LineChainSnapshot(); !reflect.DeepEqual(before, after) || len(srv.store.Tasks()) != tasksBefore || len(srv.store.Approvals()) != approvalsBefore {
 		t.Fatalf("denied plan mutated domain state: before=%+v after=%+v", before, after)
+	}
+	if transport.calls != 0 {
+		t.Fatalf("denied plan made %d external transport calls", transport.calls)
 	}
 }
 
@@ -694,7 +708,9 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 				t.Fatal("approval accepted mutated bound dependency")
 			}
 			stored, _ := srv.store.Approval(approval.ID)
-			if len(srv.store.Tasks()) != 0 || srv.store.LineChainSnapshot().Revision != 0 || stored.Status != model.ApprovalPending {
+			attempt := srv.store.LineChainSnapshot().Attempts[approval.ID]
+			if len(srv.store.Tasks()) != 0 || srv.store.LineChainSnapshot().Revision != 0 || stored.Status != model.ApprovalRejected || !stored.Stale ||
+				stored.StaleCode != "line_chain_inputs_changed" || attempt.Status != store.LineChainStatusFailed || attempt.LastErrorCode != "line_chain_inputs_changed" {
 				t.Fatalf("stale approval mutated queue/graph: approval=%+v tasks=%+v snapshot=%+v", stored, srv.store.Tasks(), srv.store.LineChainSnapshot())
 			}
 		})

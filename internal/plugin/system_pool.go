@@ -145,6 +145,18 @@ func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 	p.wakeLocked()
 }
 
+func (p *systemPool) poison(w *pooledWorker) {
+	if w == nil {
+		return
+	}
+	if w.transport != nil {
+		_ = w.transport.abort()
+	}
+	p.mu.Lock()
+	w.state = workerDead
+	p.mu.Unlock()
+}
+
 func (p *systemPool) drain(generation uint64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

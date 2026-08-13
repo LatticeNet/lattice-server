@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, req InvokeRequest) (systemRunnerReply, error) {
+func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse) (systemRunnerReply, error) {
 	if t == nil || t.stdin == nil || t.scanner == nil {
 		return systemRunnerReply{}, fmt.Errorf("worker transport unavailable")
 	}
@@ -32,6 +32,19 @@ func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, r
 			return systemRunnerReply{}, err
 		}
 		if f.Kind == "host_call" {
+			if host == nil || f.HostCallID == "" {
+				return systemRunnerReply{}, fmt.Errorf("invalid host call")
+			}
+			var call systemHostCall
+			if err := decodeStrictV2(f.HostCall, &call); err != nil {
+				return systemRunnerReply{}, err
+			}
+			resp := host(call)
+			out := stdioJSONV2Frame{Protocol: 2, Kind: "host_response", Generation: generation, InvocationID: invocation, HostCallID: f.HostCallID}
+			out.HostResponse, _ = json.Marshal(resp)
+			if err := json.NewEncoder(t.hostResp).Encode(out); err != nil {
+				return systemRunnerReply{}, err
+			}
 			continue
 		}
 		if f.Kind != "invoke_result" {
@@ -45,7 +58,7 @@ func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, r
 			return systemRunnerReply{}, io.ErrUnexpectedEOF
 		}
 		var ready stdioJSONV2Frame
-		if err := json.Unmarshal(t.scanner.Bytes(), &ready); err != nil || ready.Kind != "invoke_ready" {
+		if err := decodeStrictV2(t.scanner.Bytes(), &ready); err != nil || ready.Kind != "invoke_ready" || ready.Protocol != 2 || ready.Generation != generation || ready.InvocationID != invocation {
 			return systemRunnerReply{}, fmt.Errorf("missing invoke_ready")
 		}
 		return reply, nil

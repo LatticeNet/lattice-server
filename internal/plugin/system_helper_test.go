@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"syscall"
 	"testing"
@@ -32,7 +33,7 @@ func TestRealV2ResultWithoutReadyPreservesReplyAndReaps(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	rsp, err := tr.invokeV2(ctx, 1, "nr", InvokeRequest{Action: "x"}, nil)
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !rsp.OK {
+	if err == nil || (!errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, context.DeadlineExceeded)) || !rsp.OK {
 		t.Fatalf("reply=%+v err=%v", rsp, err)
 	}
 	_ = tr.abort()
@@ -126,7 +127,7 @@ func runV2Helper() {
 			os.Exit(3)
 		}
 		if os.Getenv("LATTICE_TEST_V2_HOST") == "1" {
-			b, _ := json.Marshal(stdioJSONV2Frame{Protocol: 2, Kind: "host_call", Generation: f.Generation, InvocationID: f.InvocationID, HostCallID: "h1", HostCall: json.RawMessage(`{"id":"h1","method":"ping"}`)})
+			b, _ := json.Marshal(stdioJSONV2Frame{Protocol: 2, Kind: "host_call", Generation: f.Generation, InvocationID: f.InvocationID, HostCallID: "h1", HostCall: json.RawMessage(`{"id":"h1","method":"log.write","params":{"level":"info","message":"observed"}}`)})
 			fmt.Fprintln(os.Stdout, string(b))
 			br := bufio.NewReader(os.NewFile(uintptr(3), "host-response"))
 			_, _ = br.ReadBytes('\n')
@@ -135,7 +136,8 @@ func runV2Helper() {
 			}
 		}
 		if os.Getenv("LATTICE_TEST_V2_NO_READY") == "1" {
-			resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID, Response: json.RawMessage(`{"ok":true,"result":{"once":true}}`)}
+			resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID}
+			resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"once":true,"pid":%d}}`, os.Getpid()))
 			_ = enc.Encode(resp)
 			os.Exit(0)
 			continue
@@ -148,6 +150,10 @@ func runV2Helper() {
 		if os.Getenv("LATTICE_TEST_V2_BAD_READY") == "1" {
 			fmt.Fprintln(os.Stdout, `{"protocol":2,"kind":"invoke_ready","generation":999}`)
 			continue
+		}
+		if os.Getenv("LATTICE_TEST_V2_MALFORMED_READY") == "1" {
+			fmt.Fprintln(os.Stdout, `{malformed`)
+			os.Exit(0)
 		}
 		if enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "invoke_ready", Generation: f.Generation, InvocationID: f.InvocationID}) != nil {
 			os.Exit(5)

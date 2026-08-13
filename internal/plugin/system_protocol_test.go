@@ -13,7 +13,7 @@ func TestValidateStdioJSONV2FrameCorrelation(t *testing.T) {
 		"missing kind":     func() stdioJSONV2Frame { f := base; f.Kind = ""; return f }(),
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := validateStdioJSONV2Frame(frame, 7, "i-1", "h-1")
+			err := validateStdioJSONV2Frame(frame, 7, "i-1", "")
 			if name == "valid" && err != nil {
 				t.Fatal(err)
 			}

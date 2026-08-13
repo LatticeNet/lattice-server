@@ -340,6 +340,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 			t.Fatalf("result replay %d", got.StatusCode)
 		}
 	}
+	ack2 := filepath.Join(root, "ack-task2.json")
+	ack2Cmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EAckHelper$", "--", root)
+	ack2Cmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+retryLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_ACK_RESULT="+ack2)
+	_ = runLifecycleAgentHelper(t, ack2Cmd)
 	snapshot := srv.store.LineChainSnapshot()
 	if snapshot.Definitions[sourceUUID].Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 1 {
 		t.Fatalf("promotion/task mismatch: %+v tasks=%d", snapshot, len(srv.store.Tasks()))

@@ -261,6 +261,7 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	if err := json.Unmarshal(data, &s.state); err != nil {
 		return nil, err
 	}
+	migrateSubscriptionSecrets := subscriptionSecretsNeedMigration(s.state, s.cipher)
 	if err := decryptState(&s.state, s.cipher); err != nil {
 		return nil, fmt.Errorf("store: %w", err)
 	}
@@ -271,10 +272,33 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	if err := validateManagedLineCollections(s.state.ManagedLines, s.state.ManagedLineSecrets); err != nil {
 		return nil, fmt.Errorf("store: invalid managed line secret collections: %w", err)
 	}
+	if migrateSubscriptionSecrets {
+		committed, err := s.persistState(s.jsonPersistState())
+		if err != nil || !committed {
+			return nil, fmt.Errorf("store: migrate subscription secrets: %w", err)
+		}
+	}
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	s.confirmParentDirDurability()
 	return s, nil
+}
+
+func subscriptionSecretsNeedMigration(st State, cph secret.Cipher) bool {
+	if cph == nil || !cph.Enabled() {
+		return false
+	}
+	for _, snapshot := range st.SubscriptionSnapshots {
+		if snapshot.Raw != "" && !secret.IsEnvelope(snapshot.Raw) {
+			return true
+		}
+	}
+	for _, share := range st.SubscriptionShares {
+		if share.Token != "" && !secret.IsEnvelope(share.Token) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) confirmParentDirDurability() {

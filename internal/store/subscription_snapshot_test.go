@@ -1,6 +1,8 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -67,6 +69,69 @@ func TestSnapshotOnlyAndShareOnlyLostKeyFailClosed(t *testing.T) {
 				t.Fatal("encrypted record opened without its master key")
 			}
 		})
+	}
+}
+
+func TestLegacyPlaintextSubscriptionSecretsMigrateInOneStagedRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := emptyState()
+	legacy.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}
+	legacy.SubscriptionShares["share"] = model.SubscriptionShare{ID: "share", Token: "share-plaintext-canary"}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := OpenWithCipher(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.testPersistCalls != 1 {
+		t.Fatalf("migration persist calls = %d, want 1", s.testPersistCalls)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(after), snapshotRawCanary) || strings.Contains(string(after), "share-plaintext-canary") {
+		t.Fatal("legacy plaintext survived migration")
+	}
+	if got, _ := s.SubscriptionSnapshot("p", "s"); got.Raw != snapshotRawCanary {
+		t.Fatalf("snapshot changed: %+v", got)
+	}
+	if got, _ := s.SubscriptionShare("share"); got.Token != "share-plaintext-canary" {
+		t.Fatalf("share changed: %+v", got)
+	}
+}
+
+func TestCorruptSubscriptionEnvelopeMakesNoMigrationWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	firstCipher := testCipher(t)
+	corruptEnvelope, err := firstCipher.Encrypt(snapshotRawCanary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := emptyState()
+	legacy.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: corruptEnvelope}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(raw)
+	if _, err := OpenWithCipher(path, testCipher(t)); err == nil {
+		t.Fatal("corrupt envelope accepted")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sha256.Sum256(after); got != want {
+		t.Fatalf("failed migration changed file digest: %x != %x", got, want)
 	}
 }
 

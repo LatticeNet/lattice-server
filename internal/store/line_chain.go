@@ -83,6 +83,40 @@ type LineChainSnapshot struct {
 	Revision    uint64
 }
 
+// LineChainCompileStateSnapshot is the persistent half of the compiler input.
+// It is copied under one store lock and is safe for server-side projection
+// without further store reads or identity allocation.
+type LineChainCompileStateSnapshot struct {
+	Nodes              map[string]model.Node
+	LineUUIDByHash     map[string]string
+	VpnUsers           map[string]VpnUserPublicRecord
+	VpnUserSecrets     map[string]VpnUserSecretRecord
+	ManagedLines       map[string]ManagedLinePublicRecord
+	ManagedLineSecrets map[string]ManagedLineSecretRecord
+	Chains             LineChainSnapshot
+}
+
+func (s *Store) LineChainCompileStateSnapshot() LineChainCompileStateSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nodes := make(map[string]model.Node, len(s.state.Nodes))
+	for id, node := range s.state.Nodes {
+		nodes[id] = cloneNode(node)
+	}
+	uuidByHash := make(map[string]string)
+	for _, entry := range s.state.KV {
+		if entry.Bucket == "vpnmeta/lineuuid" {
+			uuidByHash[entry.Key] = entry.Value
+		}
+	}
+	return LineChainCompileStateSnapshot{
+		Nodes: nodes, LineUUIDByHash: uuidByHash,
+		VpnUsers: cloneVpnUserPublicRecords(s.state.VpnUsers), VpnUserSecrets: cloneVpnUserSecretRecords(s.state.VpnUserSecrets),
+		ManagedLines: cloneManagedLinePublicRecords(s.state.ManagedLines), ManagedLineSecrets: cloneManagedLineSecretRecords(s.state.ManagedLineSecrets),
+		Chains: LineChainSnapshot{Definitions: cloneLineChainDefinitions(s.state.LineChainDefinitions), Attempts: cloneLineChainAttempts(s.state.LineChainAttempts), Revision: s.state.LineChainGraphRevision},
+	}
+}
+
 // WouldCreateLineChainCycle evaluates a candidate against every committed edge
 // and every already-reserved applying candidate from the supplied immutable
 // snapshot. Planned attempts do not reserve graph membership.
@@ -160,6 +194,13 @@ func (s *Store) planLineChainLocked(attempt LineChainAttempt, approval *model.Ap
 	if err := validateLineChainAttempt(attempt); err != nil {
 		return LineChainAttempt{}, false, err
 	}
+	if attempt.PlanGraphRevision != s.state.LineChainGraphRevision {
+		return LineChainAttempt{}, false, ErrLineChainRevisionConflict
+	}
+	current := s.state.LineChainDefinitions[attempt.SourceLineUUID]
+	if current.Generation != attempt.BaseGeneration || current.ArtifactSHA256 != attempt.BaseArtifactSHA256 {
+		return LineChainAttempt{}, false, ErrLineChainRevisionConflict
+	}
 	for approvalID, current := range s.state.LineChainAttempts {
 		if current.SourceLineUUID != attempt.SourceLineUUID || current.Status == LineChainStatusFailed {
 			continue
@@ -171,7 +212,6 @@ func (s *Store) planLineChainLocked(attempt LineChainAttempt, approval *model.Ap
 		return LineChainAttempt{}, false, fmt.Errorf("%w: source %s has approval %s", ErrLineChainSourceBusy, attempt.SourceLineUUID, approvalID)
 	}
 	now := time.Now().UTC()
-	attempt.PlanGraphRevision = s.state.LineChainGraphRevision
 	attempt.Status = LineChainStatusPlanned
 	if attempt.CreatedAt.IsZero() {
 		attempt.CreatedAt = now

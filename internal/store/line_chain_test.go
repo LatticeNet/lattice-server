@@ -69,7 +69,7 @@ func TestLineChainReserveRejectsTwoNodeCycleWithoutRevisionMutation(t *testing.T
 	if _, err := store.ReserveLineChain(first.ApprovalID, 0); err != nil {
 		t.Fatal(err)
 	}
-	second := LineChainAttempt{ApprovalID: "a-b", Operation: LineChainOperationSet, SourceLineUUID: "a", CandidateTargetLineUUID: "b", RequestSHA256: "a-b"}
+	second := LineChainAttempt{ApprovalID: "a-b", Operation: LineChainOperationSet, SourceLineUUID: "a", CandidateTargetLineUUID: "b", RequestSHA256: "a-b", PlanGraphRevision: 1}
 	planned, _, err := store.PlanLineChain(second)
 	if err != nil || planned.PlanGraphRevision != 1 {
 		t.Fatalf("second plan=%+v err=%v", planned, err)

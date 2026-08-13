@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -29,6 +30,7 @@ func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, manag
 		Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443",
 		LineUUID: sourceUUID,
 	}})
+	_ = srv.buildLineGroups() // test setup establishes persistent UUID authority before pure compile
 	srv.replaceAgentCapabilities("node-b", []string{lineChainDurableCapability})
 	if !srv.agentHasCapability("node-b", lineChainDurableCapability) {
 		t.Fatal("fixture failed to record durable capability")
@@ -83,6 +85,24 @@ func TestLineChainCompilerRejectsMissingConsumerCapability(t *testing.T) {
 	srv.replaceAgentCapabilities("node-b", nil)
 	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil || !strings.Contains(err.Error(), lineChainDurableCapability) {
 		t.Fatalf("missing capability error=%v", err)
+	}
+}
+
+func TestLineChainCompilerDoesNotAllocateMissingUUIDAuthority(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	snapshot, err := srv.captureLineChainCompileSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := snapshot.Lines[sourceUUID][0]
+	if err := srv.store.DeleteKV(lineUUIDKVBucket, source.LineHashID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil {
+		t.Fatal("compile unexpectedly allocated missing UUID authority")
+	}
+	if _, ok := srv.store.KVEntry(lineUUIDKVBucket, source.LineHashID); ok {
+		t.Fatal("failed compile mutated UUID authority")
 	}
 }
 
@@ -142,5 +162,25 @@ func TestLineChainPlanPersistsTypedApprovalAndSeparateAttempt(t *testing.T) {
 	again, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
 	if err != nil || again.ID != approval.ID {
 		t.Fatalf("identical plan did not deduplicate: again=%+v err=%v", again, err)
+	}
+}
+
+func TestLineChainPlanRejectsStaleCompiledRevision(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := store.LineChainAttempt{ApprovalID: "other", Operation: store.LineChainOperationSet,
+		SourceLineUUID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", CandidateTargetLineUUID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+		RequestSHA256: "other", PlanGraphRevision: compiled.PlanGraphRevision}
+	if _, _, err := srv.store.PlanLineChain(other); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.store.ReserveLineChain(other.ApprovalID, compiled.PlanGraphRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled); !errors.Is(err, store.ErrLineChainRevisionConflict) {
+		t.Fatalf("stale compiled revision error=%v", err)
 	}
 }

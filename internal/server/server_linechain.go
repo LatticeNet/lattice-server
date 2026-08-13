@@ -25,7 +25,7 @@ const (
 	lineChainRemoveMethod       = "chain_remove_apply"
 	lineChainActionPrefix       = "apply-line-chain:"
 	lineChainDurableCapability  = "durable-task-result-v1"
-	lineChainFragmentPathPrefix = "/etc/sing-box/conf.d/lattice-linechain-"
+	lineChainFragmentPathPrefix = "lattice-linechain-"
 )
 
 type lineChainCompileRequest struct {
@@ -68,6 +68,8 @@ type lineChainCompiledArtifact struct {
 	TargetPublicKey      string
 	TargetShortID        string
 	TargetDefinition     managedLineDef
+	BaseGeneration       uint64
+	PlanGraphRevision    uint64
 }
 
 // lineChainCompileSnapshot freezes every resolved compiler input before any
@@ -86,34 +88,65 @@ func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, er
 	snapshot := lineChainCompileSnapshot{
 		Lines: make(map[string][]Line), Definitions: make(map[string]managedLineDef),
 		Users: make(map[string]VpnUser), Nodes: make(map[string]model.Node),
-		Chains: s.store.LineChainSnapshot(), Capabilities: make(map[string]bool),
+		Capabilities: make(map[string]bool),
 	}
-	for _, group := range s.buildLineGroups() {
-		for _, line := range group.Lines {
-			if line.LineUUID != "" {
-				uuid := strings.ToLower(line.LineUUID)
-				snapshot.Lines[uuid] = append(snapshot.Lines[uuid], line)
-			}
-		}
-	}
-	definitions, err := s.managedLineDefs()
-	if err != nil {
-		return lineChainCompileSnapshot{}, err
-	}
-	for _, definition := range definitions {
-		snapshot.Definitions[strings.ToLower(definition.LineUUID)] = definition
-	}
-	for _, user := range s.listVpnUsers() {
-		snapshot.Users[user.ID] = user
-	}
-	for _, node := range s.store.Nodes() {
-		snapshot.Nodes[node.ID] = node
+	// Fixed lock order for the two live inputs; the persistent snapshot is then
+	// copied under one Store lock and no compiler path performs a write.
+	s.singboxInvMu.RLock()
+	inventories := make([]model.SingBoxInventory, 0, len(s.singboxInv))
+	for _, inventory := range s.singboxInv {
+		copyInventory := inventory
+		copyInventory.Nodes = append([]model.SingBoxNode(nil), inventory.Nodes...)
+		inventories = append(inventories, copyInventory)
 	}
 	s.agentCapabilitiesMu.RLock()
 	for nodeID, capabilities := range s.agentCapabilities {
 		_, snapshot.Capabilities[nodeID] = capabilities[lineChainDurableCapability]
 	}
 	s.agentCapabilitiesMu.RUnlock()
+	s.singboxInvMu.RUnlock()
+	persistent := s.store.LineChainCompileStateSnapshot()
+	snapshot.Nodes = persistent.Nodes
+	snapshot.Chains = persistent.Chains
+	for uuid, public := range persistent.ManagedLines {
+		private, ok := persistent.ManagedLineSecrets[uuid]
+		if ok {
+			snapshot.Definitions[strings.ToLower(uuid)] = joinManagedLineRecord(public, private)
+		}
+	}
+	for id, public := range persistent.VpnUsers {
+		private, ok := persistent.VpnUserSecrets[id]
+		if ok {
+			snapshot.Users[id] = joinVpnUserRecord(public, private)
+		}
+	}
+	now := s.now()
+	for _, inventory := range inventories {
+		if _, ok := persistent.Nodes[inventory.NodeID]; !ok || inventory.Status != "ok" || (!inventory.At.IsZero() && now.Sub(inventory.At) > nodeOfflineThreshold) {
+			continue
+		}
+		for _, discovered := range inventory.Nodes {
+			port := atoiSafe(discovered.Port)
+			hashID := stableLineHandle(discovered.LineID)
+			if hashID == "" {
+				hashID = lineHash(inventory.NodeID, model.ProxyCoreSingbox, discovered.Protocol, discovered.ListenHost, port, discovered.Name, discovered.OutboundRef)
+			}
+			uuid := strings.ToLower(strings.TrimSpace(persistent.LineUUIDByHash[hashID]))
+			if uuid == "" || !validLineUUIDv4(uuid) {
+				continue
+			}
+			line := Line{ID: hashID, LineHashID: hashID, LineID: discovered.LineID, LineUUID: uuid,
+				NodeID: inventory.NodeID, NodeIdentityUUID: discovered.NodeIdentityUUID, Core: model.ProxyCoreSingbox,
+				Source: "discovered", Name: discovered.Name, Tag: discovered.Name, Type: discovered.Protocol,
+				Transport: discovered.Network, ListenHost: discovered.ListenHost, ListenPort: port,
+				PublicHost: discovered.Address, Domain: firstNonEmpty(discovered.SNI, discovered.Host),
+				DownstreamLineUUID: strings.TrimSpace(discovered.DownstreamLineUUID), Status: "ok", Metadata: discovered.Metadata}
+			if definition, ok := snapshot.Definitions[uuid]; ok && definition.LineHashID == hashID {
+				line.Overlay, line.OverlayStatus, line.OverlayUser, line.Security = true, definition.Status, definition.UserID, model.ProxySecurityReality
+			}
+			snapshot.Lines[uuid] = append(snapshot.Lines[uuid], line)
+		}
+	}
 	return snapshot, nil
 }
 
@@ -228,6 +261,8 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 		TargetCredential string                  `json:"target_credential_digest"`
 		Artifact         string                  `json:"artifact_sha256"`
 	}{req, source.LineHashID, digestManagedLineDefinition(definition), digestText(credential.UUID), combined})
+	sourceNodeLabel := firstNonEmpty(strings.TrimSpace(snapshot.Nodes[source.NodeID].Name), source.NodeID)
+	current := chainSnapshot.Definitions[source.LineUUID]
 	plan := lineChainPlan{
 		Operation: "set", SourceLineUUID: source.LineUUID, TargetLineUUID: target.LineUUID,
 		SourceNodeID: source.NodeID, TargetNodeID: target.NodeID, SourceLabel: source.Name, TargetLabel: target.Name,
@@ -237,15 +272,16 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 		FragmentSHA256: fragment.SHA256, SidecarSHA256: sidecarSHA, ArtifactSHA256: combined,
 		RequestSHA256:   digestText(string(requestBinding)),
 		PreflightChecks: []string{"source_identity", "target_managed_applied", "target_credential", "consumer_capability", "distinct_nodes"},
-		Summary:         fmt.Sprintf("Route %s on %s through managed target %s", source.Name, s.nodeDisplayName(source.NodeID), target.Name),
+		Summary:         fmt.Sprintf("Route %s on %s through managed target %s", source.Name, sourceNodeLabel, target.Name),
 	}
-	if current, ok := chainSnapshot.Definitions[source.LineUUID]; ok {
+	if current.SourceLineUUID != "" {
 		plan.PreviousTargetLineUUID = current.TargetLineUUID
 		plan.PreviousArtifactSHA256 = current.ArtifactSHA256
 	}
 	return lineChainCompiledArtifact{
 		Plan: plan, FragmentJSON: fragment.JSON, SidecarJSON: string(sidecar), TargetCredentialUUID: credential.UUID,
 		TargetPublicKey: definition.RealityPublicKey, TargetShortID: definition.ShortID, TargetDefinition: definition,
+		BaseGeneration: current.Generation, PlanGraphRevision: chainSnapshot.Revision,
 	}, nil
 }
 
@@ -398,13 +434,12 @@ func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArt
 		Plan: string(planJSON), Status: model.ApprovalPending, ActorID: p.ActorID,
 		CreatedAt: s.now(), UpdatedAt: s.now(),
 	}
-	current := s.store.LineChainSnapshot().Definitions[compiled.Plan.SourceLineUUID]
 	attempt := store.LineChainAttempt{
 		ApprovalID: approval.ID, Operation: operation, SourceLineUUID: compiled.Plan.SourceLineUUID,
 		SourceNodeID: compiled.Plan.SourceNodeID, CandidateTargetLineUUID: compiled.Plan.TargetLineUUID,
-		CandidateTargetNodeID: compiled.Plan.TargetNodeID, BaseGeneration: current.Generation,
-		BaseArtifactSHA256: current.ArtifactSHA256, CandidateArtifactSHA256: compiled.Plan.ArtifactSHA256,
-		RequestSHA256: compiled.Plan.RequestSHA256,
+		CandidateTargetNodeID: compiled.Plan.TargetNodeID, BaseGeneration: compiled.BaseGeneration,
+		BaseArtifactSHA256: compiled.Plan.PreviousArtifactSHA256, CandidateArtifactSHA256: compiled.Plan.ArtifactSHA256,
+		RequestSHA256: compiled.Plan.RequestSHA256, PlanGraphRevision: compiled.PlanGraphRevision,
 	}
 	planned, deduped, err := s.store.PlanLineChainApproval(attempt, approval)
 	if err != nil {

@@ -8,6 +8,33 @@ import (
 )
 
 func decodeStrictV2(data []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return fmt.Errorf("v2 frame must be object")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := k.(string)
+		if !ok {
+			return fmt.Errorf("invalid v2 key")
+		}
+		if seen[key] {
+			return fmt.Errorf("duplicate v2 key %q", key)
+		}
+		seen[key] = true
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return err
+		}
+	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err

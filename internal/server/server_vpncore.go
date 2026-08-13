@@ -80,17 +80,24 @@ func (s *Server) vpnCoreSubscriptionSourcesRPC(_ context.Context, method string,
 		response.Error = composeFailureView(composeFailure("invalid_request"))
 		return json.Marshal(response)
 	}
-	// One persistent snapshot and one live projection are the complete authority
-	// for this call. composeGraphSubscription performs no subsequent server reads.
-	persistent := s.store.LineChainCompileStateSnapshot()
-	snapshot, err := s.captureLineChainCompileSnapshotFromState(persistent)
-	if err == nil {
-		response, err = composeGraphSubscription(snapshot, req, time.Now().UTC())
-	}
+	response, err := composeGraphSubscriptionFromCapture(func() (lineChainCompileSnapshot, error) {
+		// One persistent snapshot and one live projection are the complete
+		// authority for this call. The pure composer performs no later reads.
+		persistent := s.store.LineChainCompileStateSnapshot()
+		return s.captureLineChainCompileSnapshotFromState(persistent)
+	}, req, time.Now().UTC())
 	if err != nil {
 		response = graphSubscriptionResponse{SchemaVersion: 1, Error: composeFailureView(err)}
 	}
 	return json.Marshal(response)
+}
+
+func composeGraphSubscriptionFromCapture(capture func() (lineChainCompileSnapshot, error), req graphSubscriptionRequest, now time.Time) (graphSubscriptionResponse, error) {
+	snapshot, err := capture()
+	if err != nil {
+		return graphSubscriptionResponse{}, err
+	}
+	return composeGraphSubscription(snapshot, req, now)
 }
 
 // vpnCoreLinesRPC serves the vpn-core/lines read-model — the unified, node-grouped

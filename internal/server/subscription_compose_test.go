@@ -111,3 +111,119 @@ func TestComposeGraphSubscriptionFailsAllOrNoneWithRedactedStableError(t *testin
 		t.Fatalf("drift error = %+v", got)
 	}
 }
+
+func TestComposeGraphSubscriptionFailureMatrixAndRetainedBaseline(t *testing.T) {
+	req := graphSubscriptionRequest{SchemaVersion: 1, IdentityID: "identity", EntryRoots: []string{composeRootUUID}}
+	now := time.Unix(1_700_000_000, 0)
+	tests := []struct {
+		name   string
+		code   string
+		mutate func(*lineChainCompileSnapshot, *graphSubscriptionRequest)
+	}{
+		{name: "identity whitespace", code: "invalid_request", mutate: func(_ *lineChainCompileSnapshot, r *graphSubscriptionRequest) { r.IdentityID = " identity" }},
+		{name: "root whitespace", code: "invalid_request", mutate: func(_ *lineChainCompileSnapshot, r *graphSubscriptionRequest) { r.EntryRoots[0] += " " }},
+		{name: "duplicate root", code: "invalid_request", mutate: func(_ *lineChainCompileSnapshot, r *graphSubscriptionRequest) {
+			r.EntryRoots = append(r.EntryRoots, r.EntryRoots[0])
+		}},
+		{name: "root bound exceeded", code: "bounds_exceeded", mutate: func(_ *lineChainCompileSnapshot, r *graphSubscriptionRequest) {
+			r.EntryRoots = make([]string, model.MaxSubscriptionSourceRoots+1)
+		}},
+		{name: "absent root", code: "root_unavailable", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) { delete(s.Lines, composeRootUUID) }},
+		{name: "ambiguous root", code: "root_unavailable", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			s.Lines[composeRootUUID] = append(s.Lines[composeRootUUID], s.Lines[composeRootUUID][0])
+		}},
+		{name: "unbound root", code: "identity_unavailable", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			u := s.Users["identity"]
+			u.Bindings = nil
+			s.Users["identity"] = u
+		}},
+		{name: "disabled identity", code: "identity_unavailable", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			u := s.Users["identity"]
+			u.Enabled = false
+			s.Users["identity"] = u
+		}},
+		{name: "expired identity", code: "identity_unavailable", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			u := s.Users["identity"]
+			u.ExpiresAt = now
+			s.Users["identity"] = u
+		}},
+		{name: "missing credential", code: "identity_unavailable", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			u := s.Users["identity"]
+			u.Credentials = nil
+			s.Users["identity"] = u
+		}},
+		{name: "planned root", code: "graph_busy", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			s.Chains.Attempts["plan"] = store.LineChainAttempt{SourceLineUUID: composeRootUUID, Status: store.LineChainStatusPlanned}
+		}},
+		{name: "applying reachable terminal", code: "graph_busy", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			s.Chains.Attempts["apply"] = store.LineChainAttempt{SourceLineUUID: composeTerminalUUID, Status: store.LineChainStatusApplying}
+		}},
+		{name: "not converged", code: "graph_not_converged", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			d := s.Chains.Definitions[composeRootUUID]
+			d.Status = store.LineChainStatusDrifted
+			s.Chains.Definitions[composeRootUUID] = d
+		}},
+		{name: "undeclared", code: "graph_undeclared", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			delete(s.Chains.Definitions, composeRootUUID)
+		}},
+		{name: "observed drift", code: "graph_drifted", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			s.Lines[composeRootUUID][0].DownstreamLineUUID = ""
+		}},
+		{name: "cycle", code: "graph_cycle", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			d := s.Chains.Definitions[composeTerminalUUID]
+			d.TargetLineUUID = composeRootUUID
+			s.Chains.Definitions[composeTerminalUUID] = d
+			s.Lines[composeTerminalUUID][0].DownstreamLineUUID = composeRootUUID
+		}},
+		{name: "unsupported endpoint", code: "unsupported_line", mutate: func(s *lineChainCompileSnapshot, _ *graphSubscriptionRequest) {
+			s.Lines[composeRootUUID][0].Transport = model.ProxyTransportWS
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snapshot := testGraphComposeSnapshot()
+			request := req
+			request.EntryRoots = append([]string(nil), req.EntryRoots...)
+			tt.mutate(&snapshot, &request)
+			response, err := composeGraphSubscription(snapshot, request, now)
+			if got := composeFailureView(err); got.Code != tt.code {
+				t.Fatalf("error = %+v, response=%+v, want code %q", got, response, tt.code)
+			}
+			if response.OK || response.SourceVersion != "" || len(response.SourceManifest) != 0 || len(response.Entries) != 0 || response.Raw != "" {
+				t.Fatalf("failure returned partial content: %+v", response)
+			}
+		})
+	}
+
+	snapshot := testGraphComposeSnapshot()
+	snapshot.Chains.Attempts["failed"] = store.LineChainAttempt{SourceLineUUID: composeRootUUID, Status: store.LineChainStatusFailed}
+	if response, err := composeGraphSubscription(snapshot, req, now); err != nil || !response.OK {
+		t.Fatalf("failed attempt shadowed retained converged baseline: response=%+v err=%v", response, err)
+	}
+}
+
+func TestComposeGraphSubscriptionRootOrderAndTombstoneAreCanonicalInputs(t *testing.T) {
+	snapshot := testGraphComposeSnapshot()
+	user := snapshot.Users["identity"]
+	user.Bindings = append(user.Bindings, LineBinding{LineHashID: "terminal-hash", Enabled: true})
+	snapshot.Users["identity"] = user
+	now := time.Unix(1_700_000_000, 0)
+	forward, err := composeGraphSubscription(snapshot, graphSubscriptionRequest{SchemaVersion: 1, IdentityID: "identity", EntryRoots: []string{composeRootUUID, composeTerminalUUID}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverse, err := composeGraphSubscription(snapshot, graphSubscriptionRequest{SchemaVersion: 1, IdentityID: "identity", EntryRoots: []string{composeTerminalUUID, composeRootUUID}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forward.SourceVersion == reverse.SourceVersion || reflect.DeepEqual(forward.Entries, reverse.Entries) || forward.Raw == reverse.Raw {
+		t.Fatalf("root reorder did not change ordered output: forward=%+v reverse=%+v", forward, reverse)
+	}
+	var manifest model.SubscriptionSourceManifestV1
+	if err := json.Unmarshal(forward.SourceManifest, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Entries[1].Path) != 0 || manifest.Entries[1].Terminal.LineUUID != composeTerminalUUID || manifest.Entries[1].Terminal.Generation != 2 {
+		t.Fatalf("committed converged tombstone was not emitted as terminal: %+v", manifest.Entries[1])
+	}
+}

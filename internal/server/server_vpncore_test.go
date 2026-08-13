@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
@@ -215,6 +216,18 @@ func TestVPNCoreSubscriptionSourcesRPCRegisteredAndFailsAllOrNone(t *testing.T) 
 		if strings.Contains(string(raw), composeRootUUID) || strings.Contains(string(raw), "missing") {
 			t.Fatalf("failure leaked request inputs: %s", raw)
 		}
+	}
+}
+
+func TestVPNCoreSubscriptionSourcesComposeCapturesExactlyOneSnapshot(t *testing.T) {
+	calls := 0
+	snapshot := testGraphComposeSnapshot()
+	response, err := composeGraphSubscriptionFromCapture(func() (lineChainCompileSnapshot, error) {
+		calls++
+		return snapshot, nil
+	}, graphSubscriptionRequest{SchemaVersion: 1, IdentityID: "identity", EntryRoots: []string{composeRootUUID}}, time.Unix(1_700_000_000, 0))
+	if err != nil || !response.OK || calls != 1 {
+		t.Fatalf("compose capture calls=%d response=%+v err=%v", calls, response, err)
 	}
 }
 

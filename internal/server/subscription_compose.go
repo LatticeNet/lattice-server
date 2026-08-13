@@ -119,8 +119,11 @@ func composeFailureView(err error) *graphSubscriptionError {
 
 func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscriptionRequest, now time.Time) (graphSubscriptionResponse, error) {
 	identityID := strings.TrimSpace(req.IdentityID)
-	if req.SchemaVersion != 1 || identityID == "" || len(req.EntryRoots) == 0 || len(req.EntryRoots) > model.MaxSubscriptionSourceRoots {
+	if req.SchemaVersion != 1 || identityID == "" || identityID != req.IdentityID || len(req.EntryRoots) == 0 {
 		return graphSubscriptionResponse{}, composeFailure("invalid_request")
+	}
+	if len(req.EntryRoots) > model.MaxSubscriptionSourceRoots {
+		return graphSubscriptionResponse{}, composeFailure("bounds_exceeded")
 	}
 	identity, ok := snapshot.Users[identityID]
 	if !ok || !identity.Enabled || (!identity.ExpiresAt.IsZero() && !now.Before(identity.ExpiresAt)) || identity.SubscriptionGeneration == 0 {
@@ -153,7 +156,7 @@ func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscr
 	rawBytes := 0
 	for _, requestedRoot := range req.EntryRoots {
 		root := strings.TrimSpace(requestedRoot)
-		if root != strings.ToLower(root) || !validLineUUIDv4(root) || seenRoots[root] {
+		if root != requestedRoot || root != strings.ToLower(root) || !validLineUUIDv4(root) || seenRoots[root] {
 			return graphSubscriptionResponse{}, composeFailure("invalid_request")
 		}
 		seenRoots[root] = true

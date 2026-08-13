@@ -206,6 +206,21 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err := os.WriteFile(systemctl, []byte(systemctlBody), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	taskJSON := filepath.Join(root, "task1.json")
+	taskBytes, _ := json.Marshal(struct {
+		ID, LeaseID, Interpreter, Script string
+		TimeoutSec, OutputLimit          int
+	}{leased[0].ID, leased[0].LeaseID, leased[0].Interpreter, leased[0].Script, leased[0].TimeoutSec, leased[0].OutputLimit})
+	if err := os.WriteFile(taskJSON, taskBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beginResult := filepath.Join(root, "begin-result.json")
+	beginCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EBeginHelper$", "--", root)
+	beginCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_TASK_JSON="+taskJSON, "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_BEGIN_RESULT="+beginResult)
+	_ = runLifecycleAgentHelper(t, beginCmd)
+	if raw, err := os.ReadFile(beginResult); err != nil || !bytes.Contains(raw, []byte(`"committed":true`)) {
+		t.Fatalf("begin durability missing: %v %s", err, raw)
+	}
 	cmd := exec.Command("sh", "-c", leased[0].Script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	crashMarker := filepath.Join(root, "crash.marker")

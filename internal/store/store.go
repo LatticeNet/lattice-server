@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -42,13 +43,14 @@ const monitorResultPersistenceInterval = 5 * time.Minute
 var errStoreDurabilityDegraded = errors.New("store durability degraded: parent directory sync not confirmed")
 
 type State struct {
-	Users   map[string]model.User    `json:"users"`
-	Tokens  map[string]model.Token   `json:"tokens"`
-	Nodes   map[string]model.Node    `json:"nodes"`
-	Tasks   map[string]model.Task    `json:"tasks"`
-	Results []model.TaskResult       `json:"results"`
-	Audit   []model.AuditEvent       `json:"audit"`
-	KV      map[string]model.KVEntry `json:"kv"`
+	Users              map[string]model.User        `json:"users"`
+	Tokens             map[string]model.Token       `json:"tokens"`
+	Nodes              map[string]model.Node        `json:"nodes"`
+	Tasks              map[string]model.Task        `json:"tasks"`
+	Results            []model.TaskResult           `json:"results"`
+	TaskResultReceipts map[string]TaskResultReceipt `json:"task_result_receipts,omitempty"`
+	Audit              []model.AuditEvent           `json:"audit"`
+	KV                 map[string]model.KVEntry     `json:"kv"`
 	// PluginSecrets is the encrypted, namespaced plugin vault (spec §9.4). It is a
 	// distinct collection from KV on purpose: KV is plaintext at rest AND readable
 	// over GET /api/kv by any principal holding kv:read. A secret must have neither
@@ -101,6 +103,15 @@ type State struct {
 	WebAuthnChallenges map[string]auth.WebAuthnChallenge `json:"webauthn_challenges"`
 }
 
+// TaskResultReceipt is the compact, durable idempotency record retained for a
+// task target even after bounded result history evicts the display payload.
+type TaskResultReceipt struct {
+	TaskID  string `json:"task_id"`
+	NodeID  string `json:"node_id"`
+	LeaseID string `json:"lease_id"`
+	Digest  string `json:"digest"`
+}
+
 type Store struct {
 	mu                 sync.Mutex
 	path               string
@@ -115,6 +126,62 @@ type Store struct {
 	runtimeBoltHotPath string
 	syncParentDir      func(string) error
 	durabilityDegraded bool // guarded by mu; only a confirmed parent sync clears it
+}
+
+// NetGuardCompileSnapshot is one immutable, revision-consistent view of every
+// store record that can affect compilation for a node.
+type NetGuardCompileSnapshot struct {
+	Node        model.Node
+	Binding     model.NodeGuardBinding
+	Groups      []model.SecurityGroup
+	GuardZones  []model.GuardZone
+	NFTInputs   model.NFTInputs
+	HasNFTInput bool
+	Nodes       map[string]model.Node
+}
+
+var ErrNetGuardCompileNodeNotFound = errors.New("netguard compile node not found")
+
+// NetGuardCompileSnapshot captures all compiler inputs under one store lock so
+// review, approval, and result validation cannot observe a combination of
+// policy revisions that never existed together.
+func (s *Store) NetGuardCompileSnapshot(nodeID string) (NetGuardCompileSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	node, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return NetGuardCompileSnapshot{}, fmt.Errorf("%w: %q", ErrNetGuardCompileNodeNotFound, nodeID)
+	}
+	binding, ok := s.state.GuardBindings[nodeID]
+	if !ok {
+		return NetGuardCompileSnapshot{}, fmt.Errorf("node %q has no guard binding; adopt it first", nodeID)
+	}
+	snapshot := NetGuardCompileSnapshot{
+		Node:       cloneNode(node),
+		Binding:    cloneNodeGuardBinding(binding),
+		Groups:     make([]model.SecurityGroup, 0, len(binding.GroupIDs)),
+		GuardZones: make([]model.GuardZone, 0, len(s.state.GuardZones)),
+		Nodes:      make(map[string]model.Node, len(s.state.Nodes)),
+	}
+	for _, groupID := range binding.GroupIDs {
+		group, ok := s.state.SecurityGroups[groupID]
+		if !ok {
+			return NetGuardCompileSnapshot{}, fmt.Errorf("security group %q not found", groupID)
+		}
+		snapshot.Groups = append(snapshot.Groups, cloneSecurityGroup(group))
+	}
+	for _, zone := range s.state.GuardZones {
+		snapshot.GuardZones = append(snapshot.GuardZones, cloneGuardZone(zone))
+	}
+	sort.Slice(snapshot.GuardZones, func(i, j int) bool { return snapshot.GuardZones[i].ID < snapshot.GuardZones[j].ID })
+	if inputs, ok := s.state.NFTInputs[nodeID]; ok {
+		snapshot.NFTInputs = cloneNFTInputs(inputs)
+		snapshot.HasNFTInput = true
+	}
+	for id, candidate := range s.state.Nodes {
+		snapshot.Nodes[id] = cloneNode(candidate)
+	}
+	return snapshot, nil
 }
 
 // Open loads (or initializes) the store at path, resolving the at-rest
@@ -368,6 +435,7 @@ func emptyState() State {
 		Tokens:                map[string]model.Token{},
 		Nodes:                 map[string]model.Node{},
 		Tasks:                 map[string]model.Task{},
+		TaskResultReceipts:    map[string]TaskResultReceipt{},
 		KV:                    map[string]model.KVEntry{},
 		PluginSecrets:         map[string]model.KVEntry{},
 		SubscriptionShares:    map[string]model.SubscriptionShare{},
@@ -426,6 +494,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.Tasks == nil {
 		st.Tasks = map[string]model.Task{}
+	}
+	if st.TaskResultReceipts == nil {
+		st.TaskResultReceipts = map[string]TaskResultReceipt{}
 	}
 	if st.KV == nil {
 		st.KV = map[string]model.KVEntry{}
@@ -889,10 +960,14 @@ func (s *Store) DeleteSessionsByActor(actorID string) int {
 func (s *Store) UpsertNode(n model.Node) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previous, existed := s.state.Nodes[n.ID]
 	if n.CreatedAt.IsZero() {
 		n.CreatedAt = time.Now().UTC()
 	}
 	s.state.Nodes[n.ID] = cloneNode(n)
+	if existed && (previous.PublicIP != n.PublicIP || previous.WireGuardIP != n.WireGuardIP) {
+		s.invalidateGuardBindingsForNodeLocked(n.ID)
+	}
 	if !n.LastSeen.IsZero() {
 		if s.metricsPersistedAt == nil {
 			s.metricsPersistedAt = map[string]time.Time{}
@@ -999,6 +1074,7 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	}
 	now := time.Now().UTC()
 	durableChanged := !n.Online
+	previousPublicIP, previousWireGuardIP := n.PublicIP, n.WireGuardIP
 	n.Metrics = metrics
 	n.LastSeen = now
 	n.Online = true
@@ -1031,6 +1107,10 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 		n.HostFacts = hostFacts
 	}
 	s.state.Nodes[nodeID] = n
+	if previousPublicIP != n.PublicIP || previousWireGuardIP != n.WireGuardIP {
+		s.invalidateGuardBindingsForNodeLocked(nodeID)
+		durableChanged = true
+	}
 	lastPersisted, persisted := s.metricsPersistedAt[nodeID]
 	if persisted && !durableChanged && now.Sub(lastPersisted) < metricsPersistenceInterval {
 		return nil
@@ -1166,16 +1246,43 @@ func (s *Store) Task(id string) (model.Task, bool) {
 }
 
 func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
+	return s.LeaseTasksWithApprovalGate(nodeID, limit, "", "", true)
+}
+
+// LeaseTasksWithApprovalGate leases the same task set as LeaseTasks while
+// gating one exact approval plugin/action pair. The approval lookup, current
+// guard-plan-anchor check, and lease mutation share s.mu, so neither a
+// capability downgrade nor dependency invalidation can slip through a
+// server-side check-to-lease race. Empty plugin/action disables the gate.
+func (s *Store) LeaseTasksWithApprovalGate(nodeID string, limit int, plugin, action string, allowed bool) ([]model.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
 	out := []model.Task{}
-	for id, t := range s.state.Tasks {
+	staged := s.state
+	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks))
+	for id, task := range s.state.Tasks {
+		staged.Tasks[id] = task
+	}
+	for id, t := range staged.Tasks {
 		if len(out) >= limit {
 			break
 		}
 		if !taskCanLeaseTarget(t, nodeID, s.state.Results) {
 			continue
+		}
+		if plugin != "" && action != "" && t.ApprovalID != "" {
+			approval, ok := s.state.Approvals[t.ApprovalID]
+			if !ok {
+				continue
+			}
+			if approval.Plugin == plugin && approval.Action == action {
+				binding, bindingOK := s.state.GuardBindings[nodeID]
+				planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+				if !allowed || approval.Status != model.ApprovalApproved || approval.NodeID != nodeID || !bindingOK || !strings.EqualFold(binding.LastPlanSHA, planSHA) {
+					continue
+				}
+			}
 		}
 		leaseSecret, err := auth.NewRandomToken(24)
 		if err != nil {
@@ -1184,6 +1291,12 @@ func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 		leaseID := "lease_" + leaseSecret
 		if t.TargetLeases == nil {
 			t.TargetLeases = map[string]model.TaskLease{}
+		} else {
+			leases := make(map[string]model.TaskLease, len(t.TargetLeases)+1)
+			for target, lease := range t.TargetLeases {
+				leases[target] = lease
+			}
+			t.TargetLeases = leases
 		}
 		t.TargetLeases[nodeID] = model.TaskLease{LeaseID: leaseID, StartedAt: now}
 		t.Status = model.TaskLeased
@@ -1192,7 +1305,7 @@ func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 		if t.StartedAt.IsZero() {
 			t.StartedAt = now
 		}
-		s.state.Tasks[id] = t
+		staged.Tasks[id] = t
 		leased := t
 		leased.LeaseID = leaseID
 		leased.LeasedBy = nodeID
@@ -1202,21 +1315,137 @@ func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 	if len(out) == 0 {
 		return out, nil
 	}
-	return out, s.Save()
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if !committed {
+		return nil, err
+	}
+	s.state = staged
+	// The rename committed the leases and persistState already degraded
+	// readiness when only the parent-directory fsync failed. Deliver those exact
+	// leases instead of returning 500 and stranding them before the agent sees
+	// their IDs.
+	return out, nil
 }
 
 func (s *Store) AddTaskResult(r model.TaskResult) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state.Results = append(s.state.Results, r)
-	if len(s.state.Results) > maxTaskResults {
-		s.state.Results = s.state.Results[len(s.state.Results)-maxTaskResults:]
+	staged := s.state
+	storedResult := r
+	storedResult.LeaseID = ""
+	staged.Results = append(append([]model.TaskResult(nil), s.state.Results...), storedResult)
+	if len(staged.Results) > maxTaskResults {
+		staged.Results = append([]model.TaskResult(nil), staged.Results[len(staged.Results)-maxTaskResults:]...)
 	}
-	if t, ok := s.state.Tasks[r.TaskID]; ok {
-		t.Status, t.FinishedAt = taskAggregateStatus(t, s.state.Results)
-		s.state.Tasks[t.ID] = t
+	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks))
+	for id, task := range s.state.Tasks {
+		staged.Tasks[id] = task
 	}
-	return s.Save()
+	if t, ok := staged.Tasks[r.TaskID]; ok {
+		t.Status, t.FinishedAt = taskAggregateStatus(t, staged.Results)
+		staged.Tasks[t.ID] = t
+	}
+	staged.TaskResultReceipts = cloneTaskResultReceipts(s.state.TaskResultReceipts)
+	if _, taskExists := staged.Tasks[r.TaskID]; taskExists && r.NodeID != "" && r.LeaseID != "" {
+		receipt := taskResultReceipt(r)
+		staged.TaskResultReceipts[taskResultReceiptKey(r.TaskID, r.NodeID)] = receipt
+	}
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
+}
+
+// CompleteNetGuardTaskResult commits the terminal task result together with
+// the approval and binding transition it proves. The three records are staged
+// and persisted as one state snapshot so callers never acknowledge a task
+// whose authoritative apply state was dropped.
+//
+// committed is true once the atomic rename crossed the persistence commit
+// point. A non-nil error with committed=true means the parent-directory sync
+// was not confirmed; live state is still published and ReadyCheck reports the
+// durability degradation.
+func (s *Store) CompleteNetGuardTaskResult(r model.TaskResult, approval model.Approval, binding model.NodeGuardBinding) (committed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	task, ok := s.state.Tasks[r.TaskID]
+	if !ok || task.ApprovalID == "" || task.ApprovalID != approval.ID || !contains(task.Targets, r.NodeID) {
+		return false, ErrTaskNotFound
+	}
+	if task.Status != model.TaskLeased || !taskLeaseMatches(task, r.NodeID, r.LeaseID) {
+		return false, ErrTaskLeaseMismatch
+	}
+	currentApproval, ok := s.state.Approvals[approval.ID]
+	if !ok || currentApproval.NodeID != r.NodeID {
+		return false, ErrTaskNotFound
+	}
+	if currentApproval.Status != model.ApprovalApproved ||
+		currentApproval.Plugin != approval.Plugin || currentApproval.Action != approval.Action || currentApproval.Plan != approval.Plan {
+		return false, ErrTaskTransitionConflict
+	}
+	currentBinding, ok := s.state.GuardBindings[binding.NodeID]
+	if !ok || binding.NodeID != r.NodeID {
+		return false, ErrGuardVersionConflict
+	}
+	if binding.Version != currentBinding.Version {
+		return false, ErrGuardVersionConflict
+	}
+
+	now := time.Now().UTC()
+	storedResult := r
+	storedResult.LeaseID = ""
+	if storedResult.FinishedAt.IsZero() {
+		storedResult.FinishedAt = now
+	}
+	approval.CreatedAt = currentApproval.CreatedAt
+	approval.UpdatedAt = now
+	binding.CreatedAt = currentBinding.CreatedAt
+	binding.Version++
+	binding.UpdatedAt = now
+
+	staged := s.state
+	staged.Results = append(append([]model.TaskResult(nil), s.state.Results...), storedResult)
+	if len(staged.Results) > maxTaskResults {
+		staged.Results = append([]model.TaskResult(nil), staged.Results[len(staged.Results)-maxTaskResults:]...)
+	}
+	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks))
+	for id, value := range s.state.Tasks {
+		staged.Tasks[id] = value
+	}
+	task.Status, task.FinishedAt = taskAggregateStatus(task, staged.Results)
+	staged.Tasks[task.ID] = task
+	staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+	for id, value := range s.state.Approvals {
+		staged.Approvals[id] = value
+	}
+	staged.Approvals[approval.ID] = approval
+	staged.GuardBindings = make(map[string]model.NodeGuardBinding, len(s.state.GuardBindings))
+	for id, value := range s.state.GuardBindings {
+		staged.GuardBindings[id] = value
+	}
+	staged.GuardBindings[binding.NodeID] = cloneNodeGuardBinding(binding)
+	staged.TaskResultReceipts = cloneTaskResultReceipts(s.state.TaskResultReceipts)
+	receiptResult := storedResult
+	receiptResult.LeaseID = r.LeaseID
+	staged.TaskResultReceipts[taskResultReceiptKey(r.TaskID, r.NodeID)] = taskResultReceipt(receiptResult)
+
+	committed, err = s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return committed, err
+}
+
+func taskLeaseMatches(task model.Task, nodeID, leaseID string) bool {
+	if leaseID == "" {
+		return false
+	}
+	if lease, ok := task.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
+		return lease.LeaseID == leaseID
+	}
+	return task.LeasedBy == nodeID && task.LeaseID != "" && task.LeaseID == leaseID
 }
 
 func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult) bool {
@@ -1296,11 +1525,68 @@ func (s *Store) Results() []model.TaskResult {
 	return out
 }
 
+// TaskResult returns the recorded terminal result for one task target. Task
+// results are idempotent by (task,node): an agent may retry the same durable
+// outbox entry after losing the HTTP acknowledgement without executing the
+// task again.
+func (s *Store) TaskResult(taskID, nodeID string) (model.TaskResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.state.Results) - 1; i >= 0; i-- {
+		result := s.state.Results[i]
+		if result.TaskID == taskID && result.NodeID == nodeID {
+			return result, true
+		}
+	}
+	return model.TaskResult{}, false
+}
+
+// TaskResultReceiptMatches reports whether a durable replay receipt exists and
+// whether the supplied lease/result exactly matches it.
+func (s *Store) TaskResultReceiptMatches(r model.TaskResult) (matches, found bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	receipt, found := s.state.TaskResultReceipts[taskResultReceiptKey(r.TaskID, r.NodeID)]
+	if !found {
+		return false, false
+	}
+	if _, taskExists := s.state.Tasks[r.TaskID]; !taskExists {
+		return false, false
+	}
+	candidate := taskResultReceipt(r)
+	return receipt.LeaseID == candidate.LeaseID && receipt.Digest == candidate.Digest, true
+}
+
+func taskResultReceipt(r model.TaskResult) TaskResultReceipt {
+	leaseID := r.LeaseID
+	r.LeaseID = ""
+	data, _ := json.Marshal(r)
+	digest := sha256.Sum256(data)
+	return TaskResultReceipt{
+		TaskID: r.TaskID, NodeID: r.NodeID, LeaseID: leaseID, Digest: fmt.Sprintf("%x", digest[:]),
+	}
+}
+
+func taskResultReceiptKey(taskID, nodeID string) string {
+	digest := sha256.Sum256([]byte(taskID + "\x00" + nodeID))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func cloneTaskResultReceipts(in map[string]TaskResultReceipt) map[string]TaskResultReceipt {
+	out := make(map[string]TaskResultReceipt, len(in)+1)
+	for key, receipt := range in {
+		out[key] = receipt
+	}
+	return out
+}
+
 // Task management sentinel errors so handlers can map store outcomes to HTTP
 // status codes without string matching.
 var (
-	ErrTaskNotFound      = errors.New("task not found")
-	ErrTaskNotCancelable = errors.New("only queued tasks can be cancelled")
+	ErrTaskNotFound           = errors.New("task not found")
+	ErrTaskNotCancelable      = errors.New("only queued tasks can be cancelled")
+	ErrTaskLeaseMismatch      = errors.New("task lease mismatch")
+	ErrTaskTransitionConflict = errors.New("task approval transition conflict")
 )
 
 // CancelTask marks a queued task as cancelled so agents will not lease it. A
@@ -1333,6 +1619,11 @@ func (s *Store) DeleteTask(id string) error {
 		return ErrTaskNotFound
 	}
 	delete(s.state.Tasks, id)
+	for key, receipt := range s.state.TaskResultReceipts {
+		if receipt.TaskID == id {
+			delete(s.state.TaskResultReceipts, key)
+		}
+	}
 	if len(s.state.Results) > 0 {
 		kept := s.state.Results[:0]
 		for _, r := range s.state.Results {
@@ -1871,6 +2162,44 @@ func clonePluginInstallation(p model.PluginInstallation) model.PluginInstallatio
 	return p
 }
 
+func cloneNFTInputs(inputs model.NFTInputs) model.NFTInputs {
+	inputs.PublicTCP = append([]int(nil), inputs.PublicTCP...)
+	inputs.PublicUDP = append([]int(nil), inputs.PublicUDP...)
+	inputs.WireGuardTCP = append([]int(nil), inputs.WireGuardTCP...)
+	inputs.WireGuardUDP = append([]int(nil), inputs.WireGuardUDP...)
+	return inputs
+}
+
+func cloneGuardRules(rules []model.GuardRule) []model.GuardRule {
+	if rules == nil {
+		return nil
+	}
+	out := make([]model.GuardRule, len(rules))
+	for i, rule := range rules {
+		out[i] = rule
+		out[i].Ports = append([]model.GuardPortRange(nil), rule.Ports...)
+	}
+	return out
+}
+
+func cloneSecurityGroup(group model.SecurityGroup) model.SecurityGroup {
+	group.Rules = cloneGuardRules(group.Rules)
+	return group
+}
+
+func cloneGuardZone(zone model.GuardZone) model.GuardZone {
+	zone.Interfaces = append([]string(nil), zone.Interfaces...)
+	zone.CIDRs = append([]string(nil), zone.CIDRs...)
+	return zone
+}
+
+func cloneNodeGuardBinding(binding model.NodeGuardBinding) model.NodeGuardBinding {
+	binding.GroupIDs = append([]string(nil), binding.GroupIDs...)
+	binding.Overrides = cloneGuardRules(binding.Overrides)
+	binding.ZoneIDs = append([]string(nil), binding.ZoneIDs...)
+	return binding
+}
+
 func (s *Store) UpsertApproval(a model.Approval) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1880,6 +2209,69 @@ func (s *Store) UpsertApproval(a model.Approval) error {
 	}
 	s.state.Approvals[a.ID] = a
 	return s.Save()
+}
+
+// ApproveNetGuard atomically transitions the reviewed NetGuard approval and,
+// when task is non-nil, queues its one host task while the reviewed binding plan
+// anchor is still current. This closes the approval-check-to-decision window: a group,
+// zone, node-address, or NFT-input mutation either invalidates the binding
+// first and this call fails, or happens after the task exists and the leasing
+// gate withholds the now-stale task.
+func (s *Store) ApproveNetGuard(approval model.Approval, task *model.Task) (committed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	currentApproval, ok := s.state.Approvals[approval.ID]
+	if !ok || currentApproval.Status != model.ApprovalPending ||
+		currentApproval.NodeID != approval.NodeID || currentApproval.Plugin != approval.Plugin ||
+		currentApproval.Action != approval.Action || currentApproval.Plan != approval.Plan {
+		return false, ErrTaskTransitionConflict
+	}
+	binding, ok := s.state.GuardBindings[approval.NodeID]
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	if !ok || binding.LastPlanSHA == "" || !strings.EqualFold(binding.LastPlanSHA, planSHA) {
+		return false, ErrGuardVersionConflict
+	}
+	if task != nil {
+		if task.ID == "" || task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != approval.NodeID {
+			return false, ErrTaskTransitionConflict
+		}
+		if _, exists := s.state.Tasks[task.ID]; exists {
+			return false, ErrTaskTransitionConflict
+		}
+	}
+
+	now := time.Now().UTC()
+	approval.CreatedAt = currentApproval.CreatedAt
+	approval.UpdatedAt = now
+	if task != nil {
+		if task.CreatedAt.IsZero() {
+			task.CreatedAt = now
+		}
+		if task.Status == "" {
+			task.Status = model.TaskQueued
+		}
+	}
+
+	staged := s.state
+	staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+	for id, value := range s.state.Approvals {
+		staged.Approvals[id] = value
+	}
+	staged.Approvals[approval.ID] = approval
+	if task != nil {
+		staged.Tasks = make(map[string]model.Task, len(s.state.Tasks)+1)
+		for id, value := range s.state.Tasks {
+			staged.Tasks[id] = value
+		}
+		staged.Tasks[task.ID] = *task
+	}
+
+	committed, err = s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return committed, err
 }
 
 func (s *Store) Approval(id string) (model.Approval, bool) {
@@ -2269,7 +2661,12 @@ func (s *Store) UpsertNFTInputs(inputs model.NFTInputs) error {
 		inputs.CreatedAt = inputs.UpdatedAt
 	}
 	inputs.ID = inputs.NodeID
-	s.state.NFTInputs[inputs.NodeID] = inputs
+	s.state.NFTInputs[inputs.NodeID] = cloneNFTInputs(inputs)
+	// NFTInputs supply the per-node public interface and WireGuard CIDR used
+	// while resolving builtin zones. Conservatively invalidate on every
+	// operator upsert so future compiler inputs added to this record cannot
+	// bypass the plan revision contract.
+	s.invalidateGuardBindingLocked(inputs.NodeID)
 	return s.Save()
 }
 
@@ -2278,7 +2675,7 @@ func (s *Store) NFTInputs(nodeID string) (model.NFTInputs, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	inputs, ok := s.state.NFTInputs[nodeID]
-	return inputs, ok
+	return cloneNFTInputs(inputs), ok
 }
 
 // AllNFTInputs returns all persisted nft inputs sorted by node id.
@@ -2287,7 +2684,7 @@ func (s *Store) AllNFTInputs() []model.NFTInputs {
 	defer s.mu.Unlock()
 	out := make([]model.NFTInputs, 0, len(s.state.NFTInputs))
 	for _, inputs := range s.state.NFTInputs {
-		out = append(out, inputs)
+		out = append(out, cloneNFTInputs(inputs))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out
@@ -2301,6 +2698,7 @@ func (s *Store) DeleteNFTInputs(nodeID string) error {
 		return nil
 	}
 	delete(s.state.NFTInputs, nodeID)
+	s.invalidateGuardBindingLocked(nodeID)
 	return s.Save()
 }
 
@@ -2431,11 +2829,12 @@ func (s *Store) UpsertSecurityGroup(group model.SecurityGroup) (model.SecurityGr
 	}
 	group.Version++
 	group.UpdatedAt = now
-	s.state.SecurityGroups[group.ID] = group
+	s.state.SecurityGroups[group.ID] = cloneSecurityGroup(group)
+	s.invalidateGuardBindingsForGroupLocked(group.ID)
 	if err := s.Save(); err != nil {
 		return model.SecurityGroup{}, err
 	}
-	return group, nil
+	return cloneSecurityGroup(group), nil
 }
 
 // SecurityGroup returns one stored security group by id.
@@ -2443,7 +2842,7 @@ func (s *Store) SecurityGroup(id string) (model.SecurityGroup, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	group, ok := s.state.SecurityGroups[id]
-	return group, ok
+	return cloneSecurityGroup(group), ok
 }
 
 // SecurityGroups returns all stored security groups sorted by id.
@@ -2452,7 +2851,7 @@ func (s *Store) SecurityGroups() []model.SecurityGroup {
 	defer s.mu.Unlock()
 	out := make([]model.SecurityGroup, 0, len(s.state.SecurityGroups))
 	for _, group := range s.state.SecurityGroups {
-		out = append(out, group)
+		out = append(out, cloneSecurityGroup(group))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -2466,6 +2865,7 @@ func (s *Store) DeleteSecurityGroup(id string) error {
 		return nil
 	}
 	delete(s.state.SecurityGroups, id)
+	s.invalidateGuardBindingsForGroupLocked(id)
 	return s.Save()
 }
 
@@ -2479,7 +2879,8 @@ func (s *Store) UpsertGuardZone(zone model.GuardZone) error {
 	} else if zone.CreatedAt.IsZero() {
 		zone.CreatedAt = zone.UpdatedAt
 	}
-	s.state.GuardZones[zone.ID] = zone
+	s.state.GuardZones[zone.ID] = cloneGuardZone(zone)
+	s.invalidateGuardBindingsForZoneLocked(zone.ID)
 	return s.Save()
 }
 
@@ -2488,7 +2889,7 @@ func (s *Store) GuardZone(id string) (model.GuardZone, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	zone, ok := s.state.GuardZones[id]
-	return zone, ok
+	return cloneGuardZone(zone), ok
 }
 
 // GuardZones returns all stored guard zones sorted by id.
@@ -2497,7 +2898,7 @@ func (s *Store) GuardZones() []model.GuardZone {
 	defer s.mu.Unlock()
 	out := make([]model.GuardZone, 0, len(s.state.GuardZones))
 	for _, zone := range s.state.GuardZones {
-		out = append(out, zone)
+		out = append(out, cloneGuardZone(zone))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -2511,7 +2912,86 @@ func (s *Store) DeleteGuardZone(id string) error {
 		return nil
 	}
 	delete(s.state.GuardZones, id)
+	s.invalidateGuardBindingsForZoneLocked(id)
 	return s.Save()
+}
+
+const guardPlanInvalidatedReason = "netguard dependency changed since the last plan; create a new plan before applying"
+
+// invalidateGuardBindings*Locked closes the check-to-commit window for
+// NetGuard plans. Every store mutation that can change compiled rules clears
+// the affected plan anchor and bumps the binding version in the same critical
+// section. CompleteNetGuardTaskResult can therefore use the binding version as
+// a dependency revision, not merely as authoring concurrency metadata.
+// Callers must hold s.mu and persist the surrounding mutation exactly once.
+func (s *Store) invalidateGuardBindingLocked(nodeID string) {
+	binding, ok := s.state.GuardBindings[nodeID]
+	if !ok || binding.LastPlanSHA == "" {
+		return
+	}
+	binding.LastPlanSHA = ""
+	binding.LastError = guardPlanInvalidatedReason
+	binding.Version++
+	binding.UpdatedAt = time.Now().UTC()
+	s.state.GuardBindings[nodeID] = binding
+}
+
+func (s *Store) invalidateGuardBindingsForGroupLocked(groupID string) {
+	for nodeID, binding := range s.state.GuardBindings {
+		if contains(binding.GroupIDs, groupID) {
+			s.invalidateGuardBindingLocked(nodeID)
+		}
+	}
+}
+
+func (s *Store) invalidateGuardBindingsForZoneLocked(zoneID string) {
+	for nodeID, binding := range s.state.GuardBindings {
+		if contains(binding.ZoneIDs, zoneID) || guardRulesReferenceZone(binding.Overrides, zoneID) {
+			s.invalidateGuardBindingLocked(nodeID)
+			continue
+		}
+		for _, groupID := range binding.GroupIDs {
+			group, ok := s.state.SecurityGroups[groupID]
+			if ok && guardRulesReferenceZone(group.Rules, zoneID) {
+				s.invalidateGuardBindingLocked(nodeID)
+				break
+			}
+		}
+	}
+}
+
+func (s *Store) invalidateGuardBindingsForNodeLocked(referencedNodeID string) {
+	for nodeID, binding := range s.state.GuardBindings {
+		if guardRulesReferenceNode(binding.Overrides, referencedNodeID) {
+			s.invalidateGuardBindingLocked(nodeID)
+			continue
+		}
+		for _, groupID := range binding.GroupIDs {
+			group, ok := s.state.SecurityGroups[groupID]
+			if ok && guardRulesReferenceNode(group.Rules, referencedNodeID) {
+				s.invalidateGuardBindingLocked(nodeID)
+				break
+			}
+		}
+	}
+}
+
+func guardRulesReferenceZone(rules []model.GuardRule, zoneID string) bool {
+	for _, rule := range rules {
+		if rule.Remote.Kind == model.NetRefZone && rule.Remote.ZoneID == zoneID {
+			return true
+		}
+	}
+	return false
+}
+
+func guardRulesReferenceNode(rules []model.GuardRule, nodeID string) bool {
+	for _, rule := range rules {
+		if rule.Remote.Kind == model.NetRefNode && rule.Remote.NodeID == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 // UpsertNodeGuardBinding creates or updates a node's guard binding with the
@@ -2533,11 +3013,11 @@ func (s *Store) UpsertNodeGuardBinding(binding model.NodeGuardBinding) (model.No
 	}
 	binding.Version++
 	binding.UpdatedAt = now
-	s.state.GuardBindings[binding.NodeID] = binding
+	s.state.GuardBindings[binding.NodeID] = cloneNodeGuardBinding(binding)
 	if err := s.Save(); err != nil {
 		return model.NodeGuardBinding{}, err
 	}
-	return binding, nil
+	return cloneNodeGuardBinding(binding), nil
 }
 
 // NodeGuardBinding returns the guard binding for a node.
@@ -2545,7 +3025,7 @@ func (s *Store) NodeGuardBinding(nodeID string) (model.NodeGuardBinding, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	binding, ok := s.state.GuardBindings[nodeID]
-	return binding, ok
+	return cloneNodeGuardBinding(binding), ok
 }
 
 // NodeGuardBindings returns all guard bindings sorted by node id.
@@ -2554,7 +3034,7 @@ func (s *Store) NodeGuardBindings() []model.NodeGuardBinding {
 	defer s.mu.Unlock()
 	out := make([]model.NodeGuardBinding, 0, len(s.state.GuardBindings))
 	for _, binding := range s.state.GuardBindings {
-		out = append(out, binding)
+		out = append(out, cloneNodeGuardBinding(binding))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 	return out

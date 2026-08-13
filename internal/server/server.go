@@ -289,6 +289,11 @@ type Server struct {
 	// the next heartbeat without adding persistence coupling to lattice-sdk.
 	agentRuntimeMu sync.RWMutex
 	agentRuntime   map[string]agentRuntimeConfig
+	// agentCapabilities is live, agent-reported feature negotiation. It is
+	// intentionally in-memory and fail-closed: after a server restart a node
+	// must heartbeat again before capability-gated tasks can be queued.
+	agentCapabilitiesMu sync.RWMutex
+	agentCapabilities   map[string]map[string]struct{}
 
 	// pendingSingboxProbeNodeIDs maps a node ID to the task ID of the most recent
 	// probe task. Entries are written and evicted exclusively by
@@ -324,8 +329,10 @@ const (
 	maxTaskScriptBytes             = 64 * 1024
 	apiErrorTaskExecutionDisabled  = "task_execution_disabled"
 	requestIDHeader                = "X-Lattice-Request-ID"
+	agentCapabilitiesHeader        = "X-Lattice-Agent-Capabilities"
 	nodeTokenTouchInterval         = 15 * time.Minute
 	maxAgentSourceAllowlistEntries = 64
+	netGuardManagedSHACapability   = "netguard-managed-sha-v1"
 	// maxNodeInventoryQualityLen / maxNodeInventoryNotesLen bound the operator's
 	// free-form node inventory metadata. Notes mirrors MachineProfile.Notes.
 	maxNodeInventoryQualityLen = 64
@@ -959,6 +966,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netguard/zones/delete", s.withAuth("netguard:admin", s.handleDeleteGuardZone))
 	mux.HandleFunc("/api/netguard/nodes", s.withAuth("netguard:read", s.handleNetGuardNodes))
 	mux.HandleFunc("/api/netguard/reality", s.withAuth("", s.handleNetGuardReality))
+	mux.HandleFunc("/api/netguard/review", s.withAuth("netguard:read", s.handleNetGuardReview))
 	mux.HandleFunc("/api/netguard/bindings", s.withAuth("", s.handleNetGuardBindings))
 	mux.HandleFunc("/api/netguard/nodes/adopt", s.withAuth("", s.handleNetGuardAdopt))
 	mux.HandleFunc("/api/netguard/plan", s.withAuth("", s.handleNetGuardPlan))
@@ -2057,6 +2065,32 @@ func (s *Server) agentRuntimeSnapshot(nodeID string) *agentRuntimeConfig {
 		return &cp
 	}
 	return nil
+}
+
+func (s *Server) replaceAgentCapabilities(nodeID string, capabilities []string) {
+	known := make(map[string]struct{}, 1)
+	for _, capability := range capabilities {
+		if strings.TrimSpace(capability) == netGuardManagedSHACapability {
+			known[netGuardManagedSHACapability] = struct{}{}
+		}
+	}
+	s.agentCapabilitiesMu.Lock()
+	defer s.agentCapabilitiesMu.Unlock()
+	if s.agentCapabilities == nil {
+		s.agentCapabilities = make(map[string]map[string]struct{})
+	}
+	if len(known) == 0 {
+		delete(s.agentCapabilities, nodeID)
+		return
+	}
+	s.agentCapabilities[nodeID] = known
+}
+
+func (s *Server) agentHasCapability(nodeID, capability string) bool {
+	s.agentCapabilitiesMu.RLock()
+	defer s.agentCapabilitiesMu.RUnlock()
+	_, ok := s.agentCapabilities[nodeID][capability]
+	return ok
 }
 
 func normalizeNodeTags(tags []string) []string {
@@ -4930,6 +4964,9 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 		}
 		return nftPolicyApplyScript(approval.Plan, payload.PublicURL, payload.DomainSets)
 	case "nft":
+		if approval.Action == netGuardApprovalAction {
+			return netGuardApplyScript(approval.Plan, serverURL)
+		}
 		return nftGuardApplyScript(approval.Plan, serverURL)
 	case "selfdns":
 		script, err := selfdns.ApplyScriptFromPlan(approval.Plan)
@@ -5090,13 +5127,27 @@ func validateNftPolicyDomainSetBindings(domainSets []nftPolicyDomainSetBinding) 
 }
 
 func nftGuardApplyScript(plan, serverURL string) string {
+	return nftGuardApplyScriptWithManagedSHA(plan, serverURL, false)
+}
+
+func netGuardApplyScript(plan, serverURL string) string {
+	return nftGuardApplyScriptWithManagedSHA(plan, serverURL, true)
+}
+
+func nftGuardApplyScriptWithManagedSHA(plan, serverURL string, reportManagedSHA bool) string {
 	serverURL = strings.TrimRight(serverURL, "/")
 	selfcheck := "echo 'lattice nft: control-plane selfcheck skipped because public_url is unset' >&2\n"
 	done := "echo 'lattice nft: applied; control-plane selfcheck skipped'\n"
+	managedSHA := ""
 	if serverURL != "" {
 		selfcheck = "AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
 			"\"$AGENT_BIN\" --selfcheck-controlplane -server " + shellQuote(serverURL) + "\n"
 		done = "echo 'lattice nft: applied and verified'\n"
+	}
+	if reportManagedSHA {
+		managedSHA = "AGENT_BIN=${LATTICE_AGENT_BIN:-lattice-agent}\n" +
+			"MANAGED_SHA=$(\"$AGENT_BIN\" --guard-managed-sha)\n" +
+			"echo \"lattice netguard: managed_sha=$MANAGED_SHA\"\n"
 	}
 	return "set -e\n" +
 		"umask 077\n" +
@@ -5112,6 +5163,7 @@ func nftGuardApplyScript(plan, serverURL string) string {
 		"start_watchdog\n" +
 		"nft -f \"$CANDIDATE\"\n" +
 		selfcheck +
+		managedSHA +
 		"assert_watchdog_clean\n" +
 		"trap - ERR\n" +
 		"cleanup_watchdog\n" +
@@ -5529,6 +5581,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
+	if isNetGuardApproval(approval) {
+		if err := s.requireCurrentNetGuardApproval(approval); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+	}
 	if approval.Plugin == proxyCorePlugin {
 		if err := s.requireCurrentProxyCoreApproval(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
@@ -5548,6 +5605,13 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 			}
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
+		}
+	}
+	if queueApply && isNetGuardApproval(approval) && !s.agentHasCapability(approval.NodeID, netGuardManagedSHACapability) {
+		return approval, &approvalDecisionError{
+			status: http.StatusConflict,
+			err: apiError(model.APIErrorBadRequest,
+				"node agent has not advertised netguard-managed-sha-v1; update or reconnect the agent before applying"),
 		}
 	}
 	if queueApply && s.taskExecutionDisabled {
@@ -5621,12 +5685,10 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	}
 	approval.Status = model.ApprovalApproved
 	approval.ApprovedBy = p.ActorID
-	if err := s.store.UpsertApproval(approval); err != nil {
-		return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
-	}
+	var task model.Task
 	if queueApply {
 		timeoutSec := approvalApplyTaskTimeoutSec(approval.Plugin)
-		task := model.Task{
+		task = model.Task{
 			ID:          id.New("task"),
 			ApprovalID:  approval.ID,
 			ActorID:     p.ActorID,
@@ -5639,24 +5701,49 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			Status:      model.TaskQueued,
 			CreatedAt:   time.Now().UTC(),
 		}
-		if err := s.queueTask(task); err != nil {
-			if errors.Is(err, errTaskExecutionDisabled) {
-				s.recordPrincipalAudit(p, model.AuditEvent{
-					ID:       id.New("audit"),
-					NodeID:   approval.NodeID,
-					Action:   "network." + approval.Plugin + ".approve",
-					Scope:    approvalDecisionAuditScope(approval),
-					Decision: "deny",
-					Reason:   err.Error(),
-					Metadata: map[string]string{"approval_id": approval.ID},
-				})
-				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(apiErrorTaskExecutionDisabled, errTaskExecutionDisabled.Error()), taskExecutionDisabled: true}
+	}
+	if isNetGuardApproval(approval) {
+		var queuedTask *model.Task
+		if queueApply {
+			queuedTask = &task
+		}
+		committed, err := s.store.ApproveNetGuard(approval, queuedTask)
+		if committed {
+			if err != nil {
+				s.logger.Printf("netguard approval and task committed with degraded durability: %v", err)
 			}
+		} else if errors.Is(err, store.ErrGuardVersionConflict) || errors.Is(err, store.ErrTaskTransitionConflict) {
+			return approval, &approvalDecisionError{
+				status: http.StatusConflict,
+				err:    apiError(model.APIErrorApprovalStale, "netguard intent changed while queueing; re-plan before approving"),
+			}
+		} else {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
-		if approval.Plugin == "selfdns" {
-			if err := s.markSelfDNSApplying(approval); err != nil {
+	} else {
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+		}
+		if queueApply {
+			if err := s.queueTask(task); err != nil {
+				if errors.Is(err, errTaskExecutionDisabled) {
+					s.recordPrincipalAudit(p, model.AuditEvent{
+						ID:       id.New("audit"),
+						NodeID:   approval.NodeID,
+						Action:   "network." + approval.Plugin + ".approve",
+						Scope:    approvalDecisionAuditScope(approval),
+						Decision: "deny",
+						Reason:   err.Error(),
+						Metadata: map[string]string{"approval_id": approval.ID},
+					})
+					return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(apiErrorTaskExecutionDisabled, errTaskExecutionDisabled.Error()), taskExecutionDisabled: true}
+				}
 				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+			}
+			if approval.Plugin == "selfdns" {
+				if err := s.markSelfDNSApplying(approval); err != nil {
+					return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+				}
 			}
 		}
 	}
@@ -5880,6 +5967,7 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.replaceAgentCapabilities(req.NodeID, req.Capabilities)
 	if oldV4 != n.PublicIP || oldV6 != n.PublicIPv6 || oldNodeIdentity != n.LatticeIdentityUUID {
 		s.invalidateLineReadModel()
 	}
@@ -5922,6 +6010,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.replaceAgentCapabilities(req.NodeID, req.Capabilities)
 	if old.PublicIP != v4 || old.PublicIPv6 != v6 {
 		s.invalidateLineReadModel()
 	}
@@ -5956,7 +6045,15 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []agentTaskView{})
 		return
 	}
-	tasks, err := s.store.LeaseTasks(nodeID, 3)
+	// Lease-time capability proof belongs to this exact polling process. An old
+	// replacement process omits the header and cannot inherit a newer process's
+	// last heartbeat capability from server memory. The store still applies the
+	// approval and current plan-anchor checks atomically with the lease mutation.
+	netGuardCapable := requestHasAgentCapability(r, netGuardManagedSHACapability)
+	tasks, err := s.store.LeaseTasksWithApprovalGate(
+		nodeID, 3, "nft", netGuardApprovalAction,
+		netGuardCapable,
+	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -5966,6 +6063,17 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 		views = append(views, toAgentTaskView(task))
 	}
 	writeJSON(w, http.StatusOK, views)
+}
+
+func requestHasAgentCapability(r *http.Request, capability string) bool {
+	for _, value := range r.Header.Values(agentCapabilitiesHeader) {
+		for _, candidate := range strings.Split(value, ",") {
+			if strings.TrimSpace(candidate) == capability {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 type agentTaskView struct {
@@ -6001,6 +6109,27 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Result.NodeID = req.NodeID
+	if stored, ok := s.store.TaskResult(req.Result.TaskID, req.NodeID); ok {
+		// The agent keeps a durable result outbox and may legitimately retry after
+		// the server committed the transition but the HTTP response was lost. Only
+		// acknowledge the identical lease/result; a different replay remains a
+		// conflict instead of silently replacing history.
+		task, taskOK := s.store.Task(req.Result.TaskID)
+		if taskOK && taskResultReplayLeaseMatches(task, req.NodeID, req.Result.LeaseID) && sameTaskResult(stored, req.Result) {
+			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+			return
+		}
+		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "task result conflicts with the recorded terminal result"))
+		return
+	}
+	if matches, found := s.store.TaskResultReceiptMatches(req.Result); found {
+		if matches {
+			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+			return
+		}
+		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "task result conflicts with the recorded terminal result"))
+		return
+	}
 	if !s.requireTaskLease(w, r, req.NodeID, req.Result) {
 		return
 	}
@@ -6024,7 +6153,25 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 	if req.Result.FinishedAt.IsZero() {
 		req.Result.FinishedAt = time.Now().UTC()
 	}
-	req.Result.LeaseID = ""
+	if approval, ok := s.store.Approval(task.ApprovalID); ok && isNetGuardApproval(approval) {
+		if err := s.handleNetGuardTaskResult(r, approval, task, req.Result); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, store.ErrTaskNotFound) || errors.Is(err, store.ErrTaskLeaseMismatch) {
+				status = http.StatusForbidden
+			} else if errors.Is(err, store.ErrGuardVersionConflict) || errors.Is(err, store.ErrTaskTransitionConflict) {
+				status = http.StatusConflict
+			}
+			s.recordRequestAudit(r, model.AuditEvent{
+				ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result",
+				Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"task_id": req.Result.TaskID},
+			})
+			writeError(w, status, err)
+			return
+		}
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
 	if err := s.store.AddTaskResult(req.Result); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -6035,6 +6182,23 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 	s.handleSingBoxProbeTaskResult(r, task, req.Result)
 	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func taskResultReplayLeaseMatches(task model.Task, nodeID, leaseID string) bool {
+	if leaseID == "" {
+		return false
+	}
+	if lease, ok := task.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
+		return lease.LeaseID == leaseID
+	}
+	return task.LeasedBy == nodeID && task.LeaseID == leaseID
+}
+
+func sameTaskResult(stored, retried model.TaskResult) bool {
+	return stored.TaskID == retried.TaskID && stored.NodeID == retried.NodeID &&
+		stored.ExitCode == retried.ExitCode && stored.Stdout == retried.Stdout &&
+		stored.Stderr == retried.Stderr && stored.Error == retried.Error &&
+		stored.StartedAt.Equal(retried.StartedAt) && stored.FinishedAt.Equal(retried.FinishedAt)
 }
 
 func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, result model.TaskResult) error {
@@ -6269,6 +6433,7 @@ func (s *Server) validateTaskResultOutput(result model.TaskResult) error {
 type agentAuthRequest struct {
 	NodeID       string          `json:"node_id"`
 	Version      string          `json:"version"`
+	Capabilities []string        `json:"capabilities"`
 	PublicIP     string          `json:"public_ip"`
 	PublicIPv6   string          `json:"public_ipv6"`
 	InternalIP   string          `json:"internal_ip"`

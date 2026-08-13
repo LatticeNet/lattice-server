@@ -161,6 +161,11 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 			}
 		}
 		s.state.Results = kept
+		for key, receipt := range s.state.TaskResultReceipts {
+			if receipt.NodeID == nodeID || taskGone(receipt.TaskID) {
+				delete(s.state.TaskResultReceipts, key)
+			}
+		}
 	} else {
 		for _, r := range s.state.Results {
 			if r.NodeID == nodeID || taskGone(r.TaskID) {
@@ -416,6 +421,11 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 	// Step 18: the node itself (embedded TokenHash/Metrics/HostFacts/Geo/etc all
 	// purged with the record).
 	if mutate {
+		// A surviving NetGuard binding may resolve this node from a node-ref
+		// rule. Invalidate those compiled-plan anchors before removing the source
+		// record so no already-reviewed task can commit against a dangling
+		// dependency.
+		s.invalidateGuardBindingsForNodeLocked(nodeID)
 		delete(s.state.Nodes, nodeID)
 		delete(s.metricsPersistedAt, nodeID)
 	}

@@ -329,7 +329,7 @@ func TestNetGuardAdoptThenPlan(t *testing.T) {
 	if err := json.NewDecoder(plan.Body).Decode(&planRes); err != nil {
 		t.Fatal(err)
 	}
-	if planRes.Approval.Plugin != "nft" || planRes.Approval.Action != "apply-ruleset" {
+	if planRes.Approval.Plugin != "nft" || planRes.Approval.Action != netGuardApprovalAction {
 		t.Fatalf("plan must ride the existing nft apply path: %+v", planRes.Approval)
 	}
 	for _, want := range []string{

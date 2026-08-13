@@ -35,7 +35,7 @@ func runV2Helper() {
 			continue
 		}
 		resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID}
-		resp.Response = json.RawMessage(`{"ok":true,"result":{"helper":true}}`)
+		resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"helper":true,"pid":%d}}`, os.Getpid()))
 		if enc.Encode(resp) != nil {
 			os.Exit(4)
 		}

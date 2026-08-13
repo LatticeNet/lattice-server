@@ -256,6 +256,17 @@ func (s *Server) captureLineChainCompileSnapshotFromStateLocked(persistent store
 		for _, discovered := range inventory.Nodes {
 			port := atoiSafe(discovered.Port)
 			hashID := stableLineHandle(discovered.LineID)
+			if hashID == "" && validLineUUIDv4(discovered.LineUUID) {
+				matches := []string{}
+				for hash, uuid := range persistent.LineUUIDByHash {
+					if strings.EqualFold(strings.TrimSpace(uuid), strings.TrimSpace(discovered.LineUUID)) {
+						matches = append(matches, hash)
+					}
+				}
+				if len(matches) == 1 {
+					hashID = matches[0]
+				}
+			}
 			if hashID == "" {
 				hashID = lineHash(inventory.NodeID, model.ProxyCoreSingbox, discovered.Protocol, discovered.ListenHost, port, discovered.Name, discovered.OutboundRef)
 			}

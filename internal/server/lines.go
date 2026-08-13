@@ -260,6 +260,17 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Metadata:           n.Metadata,
 			}
 			ln.LineHashID = stableLineHandle(ln.LineID)
+			if ln.LineHashID == "" && validLineUUIDv4(ln.LineUUID) {
+				matches := []string{}
+				for _, entry := range s.store.KV(lineUUIDKVBucket) {
+					if strings.EqualFold(strings.TrimSpace(entry.Value), ln.LineUUID) {
+						matches = append(matches, entry.Key)
+					}
+				}
+				if len(matches) == 1 {
+					ln.LineHashID = matches[0]
+				}
+			}
 			if ln.LineHashID == "" {
 				ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
 			}

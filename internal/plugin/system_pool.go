@@ -156,7 +156,9 @@ func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 		if p.replenishFn != nil {
 			go func(gen uint64) {
 				if nw, err := p.replenishFn(gen); err == nil && nw != nil {
-					_ = p.publishTransport(gen, nw.transport, time.Now())
+					if err := p.publishTransport(gen, nw.transport, time.Now()); err != nil && nw.transport != nil {
+						_ = nw.transport.abort()
+					}
 				}
 			}(w.generation)
 		}
@@ -176,11 +178,16 @@ func (p *systemPool) poison(w *pooledWorker) {
 		_ = w.transport.abort()
 	}
 	p.mu.Lock()
+	if p.active > 0 {
+		p.active--
+	}
 	w.state = workerDead
 	p.mu.Unlock()
 	if p.replenishFn != nil {
-		if nw, err := p.replenishFn(w.generation); err == nil && nw != nil {
-			_ = p.publishTransport(w.generation, nw.transport, time.Now())
+		if nw, err := p.replenishFn(p.generation); err == nil && nw != nil {
+			if err := p.publishTransport(p.generation, nw.transport, time.Now()); err != nil && nw.transport != nil {
+				_ = nw.transport.abort()
+			}
 		}
 	}
 }

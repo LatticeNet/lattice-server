@@ -46,17 +46,19 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	realityPrivate, realityPublic := lifecycleRealityKeypair(t, singbox)
 
 	srv, sourceUUID, targetUUID, user, target := seedLineChainFixture(t)
-	observer := newLifecycleObserverAtPort(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(aPort)), target.Port)
+	observer := newLifecycleObserverAtPort(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(aPort)), aPort)
 	credential, ok := vpnCredentialForProtocol(user.Credentials, model.ProxyProtocolVLESS)
 	if !ok {
 		t.Fatal("managed target credential missing")
 	}
 	target.SNI = "e2e.lattice.invalid"
+	target.Port = aPort
 	target.HandshakeServer = decoyHost
 	target.HandshakePort = decoyPort
 	target.RealityPrivateKey = realityPrivate
 	target.RealityPublicKey = realityPublic
 	target.ShortID = "0123456789abcdef"
+	target.LineHashID = lineHash("node-a", model.ProxyCoreSingbox, "vless", "", target.Port, target.Tag, "")
 	if err := srv.putManagedLineDef(target); err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +67,13 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err := srv.store.UpsertNode(nodeA); err != nil {
 		t.Fatal(err)
 	}
-	seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{Name: target.Tag, Protocol: "vless", Network: "tcp", Address: "127.0.0.1", Port: strconv.Itoa(target.Port), SNI: target.SNI, LineUUID: targetUUID}})
+	srv.singboxInvMu.Lock()
+	if inv := srv.singboxInv["node-a"]; len(inv.Nodes) > 0 {
+		inv.Nodes[0].Protocol, inv.Nodes[0].Network, inv.Nodes[0].Address = "vless", "tcp", "127.0.0.1"
+		inv.Nodes[0].Port, inv.Nodes[0].SNI, inv.Nodes[0].LineUUID = strconv.Itoa(target.Port), target.SNI, targetUUID
+		srv.singboxInv["node-a"] = inv
+	}
+	srv.singboxInvMu.Unlock()
 	_ = srv.buildLineGroups()
 
 	aDir := filepath.Join(root, "a")
@@ -86,6 +94,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	lifecycleStartProcess(t, singbox, root, "b", configDir, bPort)
 	lifecycleStartProcess(t, singbox, root, "client", clientDir, clientPort)
 	lifecycleSOCKSEcho(t, clientPort, origin)
+	observer.reset()
 	if observer.accepted() != 0 {
 		t.Fatal("B traversed A before the server-issued chain was applied")
 	}

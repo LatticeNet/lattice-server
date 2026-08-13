@@ -106,6 +106,18 @@ func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 	return nil
 }
 
+func (t *systemWorkerTransport) awaitReadyContext(ctx context.Context, generation uint64) error {
+	result := make(chan error, 1)
+	go func() { result <- t.awaitReady(generation) }()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		_ = t.abort()
+		return ctx.Err()
+	}
+}
+
 func startSystemWorker(ctx context.Context, path, dir string, env []string) (*systemWorkerTransport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -143,14 +155,6 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid}
 	t.scanner = bufio.NewScanner(t.stdout)
 	t.scanner.Buffer(make([]byte, 0, 4096), 64*1024)
-	if done := ctx.Done(); done != nil {
-		go func() {
-			<-done
-			if ctx.Err() != nil {
-				_ = t.abort()
-			}
-		}()
-	}
 	return t, nil
 }
 

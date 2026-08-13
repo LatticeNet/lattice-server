@@ -150,7 +150,7 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.childEnv())
 		if startErr == nil {
-			startErr = transport.awaitReady(req.Generation)
+			startErr = transport.awaitReadyContext(startupCtx, req.Generation)
 		}
 		cancel()
 		if startErr != nil {

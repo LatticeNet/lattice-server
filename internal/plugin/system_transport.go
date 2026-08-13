@@ -114,7 +114,7 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 					return reply, err
 				case <-ctx.Done():
 					_ = t.abort()
-					return systemRunnerReply{}, ctx.Err()
+					return reply, ctx.Err()
 				}
 				var ready stdioJSONV2Frame
 				if err := decodeStrictV2(line, &ready); err != nil {

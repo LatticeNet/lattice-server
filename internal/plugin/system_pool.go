@@ -84,6 +84,14 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 		case w := <-ch:
 			return w, nil
 		case <-ctx.Done():
+			p.mu.Lock()
+			for i, waiter := range p.waiters {
+				if waiter == ch {
+					p.waiters = append(p.waiters[:i], p.waiters[i+1:]...)
+					break
+				}
+			}
+			p.mu.Unlock()
 			return nil, ctx.Err()
 		}
 	}

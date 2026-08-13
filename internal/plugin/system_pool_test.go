@@ -1,0 +1,65 @@
+package plugin
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestSystemPoolGenerationAndExclusiveLease(t *testing.T) {
+	p := newSystemPool(2, time.Hour)
+	if err := p.publish(1, false, time.Now()); err == nil {
+		t.Fatal("unready worker published")
+	}
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	w, err := p.checkout(context.Background(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := p.checkout(ctx, time.Now()); err == nil {
+		t.Fatal("second checkout exceeded pool bound")
+	}
+	p.release(w, true, time.Now())
+	if _, err := p.checkout(context.Background(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	p.drain(1)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel2()
+	if _, err := p.checkout(ctx2, time.Now()); err == nil {
+		t.Fatal("drained pool leased worker")
+	}
+}
+
+func TestSystemPoolConcurrentNoDoubleLease(t *testing.T) {
+	p := newSystemPool(1, time.Hour)
+	_ = p.publish(1, true, time.Now())
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	leases := 0
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			w, err := p.checkout(ctx, time.Now())
+			if err == nil {
+				mu.Lock()
+				leases++
+				mu.Unlock()
+				time.Sleep(time.Millisecond)
+				p.release(w, false, time.Now())
+			}
+		}()
+	}
+	wg.Wait()
+	if leases != 1 {
+		t.Fatalf("leases=%d, expected one concurrent lease", leases)
+	}
+}

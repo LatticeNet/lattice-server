@@ -71,6 +71,7 @@ type systemPluginState struct {
 	broker   *Broker
 	failures int
 	tripped  bool
+	pool     *systemPool
 }
 
 // SystemRunner implements Runner and Invoker.
@@ -145,7 +146,8 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	}
 
 	r.mu.Lock()
-	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker}
+	pool := newSystemPool(256, time.Hour)
+	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool}
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
 }
@@ -248,6 +250,9 @@ func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 	delete(r.st, req.PluginID)
 	r.mu.Unlock()
 	if st != nil {
+		if st.pool != nil {
+			st.pool.drain(st.pool.generation)
+		}
 		_ = os.RemoveAll(st.workDir)
 	}
 	if ctx != nil {

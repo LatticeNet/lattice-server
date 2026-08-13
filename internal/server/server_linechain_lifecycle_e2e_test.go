@@ -261,7 +261,13 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	// Recovery is the only authority for the interrupted attempt. Post its
 	// exact non-success result before any inventory or observable traffic.
 	recoveryRaw, _ := os.ReadFile(recoveryResult)
-	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","result":%s}`, recoveryRaw)))
+	recoveryBody := []byte(fmt.Sprintf(`{"node_id":"node-b","result":%s}`, recoveryRaw))
+	if !bytes.Contains(recoveryRaw, []byte(`"exit_code":-1`)) || !bytes.Contains(recoveryRaw, []byte(`"error":"`)) {
+		t.Fatalf("recovery result was not an interrupted failure: %s", recoveryRaw)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, recoveryBody)
+	}
 	ackResult := filepath.Join(root, "ack-task1.json")
 	ackCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EAckHelper$", "--", root)
 	ackCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+leased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+leased[0].LeaseID, "LATTICE_LINECHAIN_E2E_ACK_RESULT="+ackResult)
@@ -290,6 +296,18 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if retryLeased[0].Script != leased[0].Script {
 		t.Fatal("retry lease document bytes differ from the original approved artifact")
 	}
+	retryTaskJSON := filepath.Join(root, "task2.json")
+	retryTaskBytes, _ := json.Marshal(struct {
+		ID, LeaseID, Interpreter, Script string
+		TimeoutSec, OutputLimit          int
+	}{retryLeased[0].ID, retryLeased[0].LeaseID, retryLeased[0].Interpreter, retryLeased[0].Script, retryLeased[0].TimeoutSec, retryLeased[0].OutputLimit})
+	if err := os.WriteFile(retryTaskJSON, retryTaskBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retryBegin := filepath.Join(root, "begin-task2.json")
+	retryBeginCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EBeginHelper$", "--", root)
+	retryBeginCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_TASK_JSON="+retryTaskJSON, "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_BEGIN_RESULT="+retryBegin)
+	_ = runLifecycleAgentHelper(t, retryBeginCmd)
 	retryCmd := exec.Command("sh", "-c", retryLeased[0].Script)
 	retryCmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"), "LATTICE_AGENT_BIN="+agent, "LATTICE_LINECHAIN_TXN_DIR="+txnDir, "LATTICE_LINECHAIN_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+sidecar, "LATTICE_TASK_ID="+retryLeased[0].ID, "LATTICE_TASK_LEASE_ID="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+fmt.Sprintf("%x", sha256.Sum256([]byte(retryLeased[0].Script))), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort))
 	if out, err := retryCmd.CombinedOutput(); err != nil {

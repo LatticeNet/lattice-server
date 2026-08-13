@@ -39,6 +39,11 @@ func TestRealV2ResultWithoutReadyPreservesReplyAndReaps(t *testing.T) {
 	if err := syscall.Kill(-tr.pgid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("pgid still alive: %v", err)
 	}
+	ctx2, cancel2 := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel2()
+	if _, err := tr.invokeV2(ctx2, 1, "nr2", InvokeRequest{Action: "x"}, nil); err == nil {
+		t.Fatal("retired worker reused")
+	}
 }
 
 func TestRealV2StalledHostCallCancellationReaps(t *testing.T) {

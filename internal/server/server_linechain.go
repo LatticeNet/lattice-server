@@ -482,7 +482,7 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 	fragment, err := proxycore.RenderLineChainFragment(proxycore.LineChainOutboundOptions{
 		Tag: outboundTag, SourceInboundTag: source.Tag, Server: targetHost, ServerPort: definition.Port,
 		UUID: credential.UUID, Flow: firstNonEmpty(credential.Flow, "xtls-rprx-vision"), SNI: definition.SNI,
-		RealityPublicKey: definition.RealityPublicKey, RealityShortID: definition.ShortID,
+		RealityPublicKey: definition.RealityPublicKey, RealityShortID: definition.ShortID, ClientFingerprint: proxycore.LineChainRealityClientFingerprint,
 	})
 	if err != nil {
 		return lineChainCompiledArtifact{}, err

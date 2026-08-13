@@ -505,6 +505,12 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 			s.logger.Printf("plugin lifecycle: failed to record %s: %v", pl.Manifest.ID, err)
 		}
 		if status == model.PluginStatusActive {
+			if unmet := s.unmetActiveDependencies(pl.Manifest); len(unmet) > 0 {
+				reason := "required dependencies not active: " + strings.Join(unmet, ", ")
+				s.logger.Printf("plugin runtime: %s stays unarmed: %s", pl.Manifest.ID, reason)
+				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: reason, Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
+				continue
+			}
 			s.applyPluginHostAccess(pl)
 			rt, err := s.pluginRuntime.Start(context.Background(), pl)
 			if err != nil {
@@ -526,6 +532,33 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 	if len(outcomes) > 0 {
 		s.logger.Printf("plugin loader: %d loaded, %d rejected (dir=%s)", len(loaded), len(outcomes)-len(loaded), dir)
 	}
+}
+
+// unmetActiveDependencies lists a manifest's REQUIRED dependencies that are
+// not satisfied by an active, in-range installation (design-18 E1). Load
+// refuses absent/out-of-range dependency plugins outright; this gate covers
+// the remaining gap: a dependency that is installed but not active cannot
+// serve rpc:calls, so activation must refuse until it is.
+func (s *Server) unmetActiveDependencies(manifest plugin.Manifest) []string {
+	var unmet []string
+	for _, dep := range manifest.Dependencies {
+		if dep.Optional {
+			continue
+		}
+		inst, ok := s.store.PluginInstallation(dep.ID)
+		if !ok {
+			unmet = append(unmet, dep.ID+" (not installed)")
+			continue
+		}
+		if inst.Status != model.PluginStatusActive {
+			unmet = append(unmet, dep.ID+" (not active)")
+			continue
+		}
+		if !plugin.VersionInRange(inst.Version, dep.Version) {
+			unmet = append(unmet, fmt.Sprintf("%s (installed %s, need %s)", dep.ID, inst.Version, dep.Version))
+		}
+	}
+	return unmet
 }
 
 func pluginInstallationFromLoaded(pl plugin.Loaded, status string) model.PluginInstallation {
@@ -654,6 +687,15 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 		if pluginStatusRequiresLoadedBundle(req.Status) && !s.pluginLoaded(req.ID) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("plugin bundle is not currently verified and loaded: %s", req.ID))
 			return
+		}
+		if req.Status == model.PluginStatusActive {
+			if loaded, ok := s.loadedPlugin(req.ID); ok {
+				if unmet := s.unmetActiveDependencies(loaded.Manifest); len(unmet) > 0 {
+					s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.status", Scope: "plugin:admin", Decision: "deny", Reason: "required dependencies not active: " + strings.Join(unmet, ", "), Metadata: map[string]string{"plugin_id": req.ID, "status": req.Status}})
+					writeError(w, http.StatusConflict, fmt.Errorf("required dependencies not active: %s", strings.Join(unmet, ", ")))
+					return
+				}
+			}
 		}
 		if err := s.store.SetPluginStatus(req.ID, req.Status); err != nil {
 			writeError(w, http.StatusBadRequest, err)

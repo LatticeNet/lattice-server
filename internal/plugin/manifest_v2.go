@@ -12,6 +12,7 @@ const (
 	ManifestSchemaV2           = "lattice.plugin.manifest.v2"
 	BundleFormatTarGzip        = "tar+gzip"
 	RuntimeProtocolStdioJSONV1 = "stdio-json-v1"
+	RuntimeProtocolStdioJSONV2 = "stdio-json-v2"
 	UIRuntimeModeSandbox       = "sandbox"
 	UIBridgeVersion1           = "1"
 

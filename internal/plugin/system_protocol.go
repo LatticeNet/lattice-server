@@ -102,5 +102,30 @@ func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationI
 	if f.Kind == "" {
 		return fmt.Errorf("stdio frame kind is required")
 	}
+	nonempty := func(b json.RawMessage) bool { return len(b) != 0 && string(b) != "null" }
+	switch f.Kind {
+	case "runtime_ready":
+		if f.InvocationID != "runtime" || f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
+			return fmt.Errorf("invalid runtime_ready schema")
+		}
+	case "invoke_result":
+		if !nonempty(f.Response) || f.HostCallID != "" || nonempty(f.Request) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
+			return fmt.Errorf("invalid invoke_result schema")
+		}
+	case "invoke_ready":
+		if f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
+			return fmt.Errorf("invalid invoke_ready schema")
+		}
+	case "host_call":
+		if f.HostCallID == "" || !nonempty(f.HostCall) || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostResponse) {
+			return fmt.Errorf("invalid host_call schema")
+		}
+	case "host_response":
+		if f.HostCallID == "" || !nonempty(f.HostResponse) || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) {
+			return fmt.Errorf("invalid host_response schema")
+		}
+	default:
+		return fmt.Errorf("unknown stdio frame kind %q", f.Kind)
+	}
 	return nil
 }

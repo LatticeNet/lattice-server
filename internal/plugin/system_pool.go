@@ -41,7 +41,6 @@ type systemPool struct {
 	replenishFn func(uint64) (*pooledWorker, error)
 	active      int
 	leased      map[*pooledWorker]struct{}
-	draining    map[*pooledWorker]struct{}
 }
 
 type poolCheckoutResult struct {
@@ -73,7 +72,7 @@ func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *sy
 	if len(generations) > 0 && generations[0] != 0 {
 		generation = generations[0]
 	}
-	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1, leased: map[*pooledWorker]struct{}{}, draining: map[*pooledWorker]struct{}{}}
+	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1, leased: map[*pooledWorker]struct{}{}}
 }
 
 func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error {
@@ -166,7 +165,6 @@ func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 		p.active--
 	}
 	delete(p.leased, w)
-	delete(p.draining, w)
 	if resultSeen {
 		w.state = workerResultSeen
 	}
@@ -241,9 +239,6 @@ func (p *systemPool) gracefulDrain(generation uint64) {
 		w.state = workerDead
 	}
 	p.workers = nil
-	for w := range p.leased {
-		p.draining[w] = struct{}{}
-	}
 	waiters := p.waiters
 	p.waiters = nil
 	p.mu.Unlock()
@@ -276,7 +271,6 @@ func (p *systemPool) abortClose(generation uint64) {
 	}
 	p.workers = nil
 	p.leased = map[*pooledWorker]struct{}{}
-	p.draining = map[*pooledWorker]struct{}{}
 	p.active = 0
 	waiters := p.waiters
 	p.waiters = nil

@@ -844,7 +844,7 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 			}
 		}},
 		{name: "target_public_material", mutate: func(t *testing.T, srv *Server, _, _ string, _ VpnUser, def managedLineDef) {
-			def.RealityPublicKey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+			def.RealityPublicKey = def.RealityPublicKey[:len(def.RealityPublicKey)-1] + "E"
 			if err := srv.putManagedLineDef(def); err != nil {
 				t.Fatal(err)
 			}

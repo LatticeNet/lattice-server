@@ -18,7 +18,7 @@ func TestVpnUserMigrationIdempotent(t *testing.T) {
 	srv := newLinesTestServer(t)
 	if err := srv.store.UpsertProxyUser(model.ProxyUser{
 		ID: "pu-1", Name: "alice@example.com", Enabled: true,
-		UUID: "11111111-1111-1111-1111-111111111111", SubToken: "tok-alice",
+		UUID: "11111111-1111-4111-8111-111111111111", SubToken: "tok-alice",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +34,7 @@ func TestVpnUserMigrationIdempotent(t *testing.T) {
 		t.Fatalf("migrated identity wrong: %+v", u)
 	}
 	if len(u.Credentials) != 1 || u.Credentials[0].Protocol != "vless" ||
-		u.Credentials[0].UUID != "11111111-1111-1111-1111-111111111111" {
+		u.Credentials[0].UUID != "11111111-1111-4111-8111-111111111111" {
 		t.Fatalf("migrated credential wrong: %+v", u.Credentials)
 	}
 }
@@ -57,8 +57,8 @@ func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 		Credentials: []VpnCredential{{Protocol: "vless", UUID: "11111111-1111-4111-8111-111111111111"}}, SubID: "restart-sub", Bindings: []LineBinding{}}
 	approvalID := "approval-managed-pre-migration"
 	managed := managedLineDef{LineUUID: "22222222-2222-4222-8222-222222222222", NodeID: "node-migration", Tag: "managed-restart",
-		Port: 24443, SNI: "example.com", HandshakeServer: "example.com", HandshakePort: 443, RealityPrivateKey: "restart-private",
-		RealityPublicKey: "restart-public", ShortID: "abcdef12", UserID: legacy.ID, Status: managedLineStatusPlanned, ApprovalID: approvalID}
+		Port: 24443, SNI: "example.com", HandshakeServer: "example.com", HandshakePort: 443, RealityPrivateKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		RealityPublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ShortID: "abcdef12", UserID: legacy.ID, Status: managedLineStatusPlanned, ApprovalID: approvalID}
 	managed.LineHashID = managedLinePlannedHash(managed.NodeID, managed.Tag, managed.Port)
 	managed.UserName = userLineName(legacy.ID, managed.LineUUID)
 	managed.FragmentSHA256, err = managedLineFragmentSHA(managed, lineUserCredentialPayload{
@@ -144,7 +144,7 @@ func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	if _, err := srv.vpnUserRotateCredential(lineUserTestPrincipal(), []byte(`{"user_id":"`+legacy.ID+`","protocol":"vless"}`)); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok, err := srv.managedLineDefByUUID(managed.LineUUID); err != nil || !ok || got.RealityPrivateKey != "restart-private" {
+	if got, ok, err := srv.managedLineDefByUUID(managed.LineUUID); err != nil || !ok || got.RealityPrivateKey != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
 		t.Fatalf("managed definition after restart: %+v ok=%v err=%v", got, ok, err)
 	}
 	if subscriptions := srv.buildSubscriptions(); len(subscriptions) == 0 {
@@ -179,7 +179,7 @@ func TestVpnUserLegacyKVSecretMigrationIsFailClosedAndIdempotent(t *testing.T) {
 	srv := newLinesTestServer(t)
 	legacy := VpnUser{
 		ID: "vpn-legacy", Email: "legacy@example.com", Enabled: true,
-		Credentials: []VpnCredential{{Protocol: "vless", UUID: "credential-canary"}},
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "33333333-3333-4333-8333-333333333333"}},
 		Bindings:    []LineBinding{}, SubID: "subscription-canary",
 	}
 	raw, err := json.Marshal(legacy)
@@ -199,7 +199,7 @@ func TestVpnUserLegacyKVSecretMigrationIsFailClosedAndIdempotent(t *testing.T) {
 		t.Fatal("secret-bearing legacy KV entry survived migration")
 	}
 	got, ok := srv.getVpnUser(legacy.ID)
-	if !ok || got.Credentials[0].UUID != "credential-canary" || got.SubID != "subscription-canary" {
+	if !ok || got.Credentials[0].UUID != "33333333-3333-4333-8333-333333333333" || got.SubID != "subscription-canary" {
 		t.Fatalf("typed migration lost secret material: %+v, ok=%v", got, ok)
 	}
 	public, ok := srv.store.VpnUserPublicRecord(legacy.ID)
@@ -219,12 +219,12 @@ func TestLineSecretMigrationMovesVpnUserAndManagedLineInOneTypedTransition(t *te
 	srv := newLinesTestServer(t)
 	user := VpnUser{
 		ID: "vpn-legacy-pair", Email: "pair@example.com", Enabled: true,
-		Credentials: []VpnCredential{{Protocol: "vless", UUID: "credential-pair-canary"}},
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "44444444-4444-4444-8444-444444444444"}},
 		Bindings:    []LineBinding{},
 	}
 	managed := managedLineDef{
 		LineUUID: "11111111-1111-4111-8111-111111111111", NodeID: "node-a", Tag: "managed-pair",
-		RealityPrivateKey: "reality-pair-canary", RealityPublicKey: "public", Status: managedLineStatusApplied,
+		RealityPrivateKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", RealityPublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", Status: managedLineStatusApplied,
 	}
 	userJSON, _ := json.Marshal(user)
 	managedJSON, _ := json.Marshal(managed)
@@ -244,11 +244,11 @@ func TestLineSecretMigrationMovesVpnUserAndManagedLineInOneTypedTransition(t *te
 		t.Fatal("legacy managed line survived unified migration")
 	}
 	gotUser, ok := srv.getVpnUser(user.ID)
-	if !ok || gotUser.Credentials[0].UUID != "credential-pair-canary" {
+	if !ok || gotUser.Credentials[0].UUID != "44444444-4444-4444-8444-444444444444" {
 		t.Fatalf("vpn user secret missing after unified migration: %+v", gotUser)
 	}
 	gotManaged, ok, err := srv.managedLineDefByUUID(managed.LineUUID)
-	if err != nil || !ok || gotManaged.RealityPrivateKey != "reality-pair-canary" {
+	if err != nil || !ok || gotManaged.RealityPrivateKey != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
 		t.Fatalf("managed line secret missing after unified migration: %+v ok=%v err=%v", gotManaged, ok, err)
 	}
 }

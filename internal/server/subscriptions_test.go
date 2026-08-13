@@ -11,7 +11,7 @@ func TestVPNCoreSubscriptionsRPC(t *testing.T) {
 	// enabled identity with a sub token + bindings + credentials
 	if err := srv.putVpnUser(VpnUser{
 		ID: "vu-1", Email: "a@example.com", Enabled: true, SubID: "tok-a",
-		Credentials: []VpnCredential{{Protocol: "vless", UUID: "x"}},
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "11111111-1111-4111-8111-111111111111"}},
 		Bindings:    []LineBinding{{LineHashID: "line_x", Enabled: true}},
 		CreatedAt:   srv.now(), UpdatedAt: srv.now(),
 	}); err != nil {

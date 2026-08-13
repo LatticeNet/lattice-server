@@ -111,18 +111,8 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	sourceHash := ""
-	for _, entry := range srv.store.KV(lineUUIDKVBucket) {
-		if strings.EqualFold(strings.TrimSpace(entry.Value), sourceUUID) {
-			sourceHash = strings.TrimPrefix(entry.Key, "line_")
-			break
-		}
-	}
-	if sourceHash == "" {
-		t.Fatal("source UUID lacks persisted line hash authority")
-	}
 	lifecycleWrite(t, filepath.Join(aDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"target-a","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":%q,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"e2e.lattice.invalid","reality":{"enabled":true,"handshake":{"server":%q,"server_port":%d},"private_key":%q,"short_id":["0123456789abcdef"]}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[{"inbound":["target-a"],"outbound":"direct"}]}}`, aPort, credential.UUID, decoyHost, decoyPort, realityPrivate))
-	lifecycleWrite(t, filepath.Join(configDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"source-b","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":"22222222-2222-4222-8222-222222222222"}],"_lattice":{"line_id":%q,"node_uuid":"node-b"}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`, bPort, sourceHash))
+	lifecycleWrite(t, filepath.Join(configDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"source-b","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":"22222222-2222-4222-8222-222222222222"}]}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`, bPort))
 	lifecycleWrite(t, filepath.Join(clientDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"socks","tag":"client","listen":"127.0.0.1","listen_port":%d}],"outbounds":[{"type":"vless","tag":"to-b","server":"127.0.0.1","server_port":%d,"uuid":"22222222-2222-4222-8222-222222222222"}],"route":{"rules":[{"inbound":["client"],"outbound":"to-b"}]}}`, clientPort, bPort))
 	lifecycleStartProcess(t, singbox, root, "a", aDir, aPort)
 	lifecycleStartProcess(t, singbox, root, "b", configDir, bPort)

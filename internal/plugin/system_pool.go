@@ -63,6 +63,20 @@ func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error
 	return nil
 }
 
+func (p *systemPool) publishTransport(generation uint64, t *systemWorkerTransport, now time.Time) error {
+	if t == nil {
+		return errors.New("nil worker transport")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || generation != p.generation {
+		return errors.New("stale pool generation")
+	}
+	p.workers = append(p.workers, &pooledWorker{state: workerIdle, generation: generation, started: now, transport: t})
+	p.wakeLocked()
+	return nil
+}
+
 func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker, error) {
 	for {
 		p.mu.Lock()

@@ -1,0 +1,235 @@
+package store
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	LineChainOperationSet    = "set"
+	LineChainOperationRemove = "remove"
+
+	LineChainStatusPlanned           = "planned"
+	LineChainStatusApplying          = "applying"
+	LineChainStatusAppliedUnobserved = "applied_unobserved"
+	LineChainStatusConverged         = "converged"
+	LineChainStatusDrifted           = "drifted"
+	LineChainStatusFailed            = "failed"
+)
+
+var (
+	ErrLineChainRevisionConflict = errors.New("line chain graph revision conflict")
+	ErrLineChainCycle            = errors.New("line chain cycle")
+	ErrLineChainSourceBusy       = errors.New("line chain source already has an active attempt")
+	ErrLineChainAttemptNotFound  = errors.New("line chain attempt not found")
+)
+
+// LineChainDefinition is the committed host baseline. Target fields are empty
+// only for a committed remove tombstone awaiting scheduled observation.
+type LineChainDefinition struct {
+	SourceLineUUID             string    `json:"source_line_uuid"`
+	SourceNodeID               string    `json:"source_node_id"`
+	SourceLineHashID           string    `json:"source_line_hash_id"`
+	SourceInboundTag           string    `json:"source_inbound_tag"`
+	TargetLineUUID             string    `json:"target_line_uuid,omitempty"`
+	TargetNodeID               string    `json:"target_node_id,omitempty"`
+	TargetDefinitionDigest     string    `json:"target_definition_digest,omitempty"`
+	TargetPublicMaterialDigest string    `json:"target_public_material_digest,omitempty"`
+	TargetCredentialDigest     string    `json:"target_credential_digest,omitempty"`
+	OutboundTag                string    `json:"outbound_tag"`
+	FragmentPath               string    `json:"fragment_path"`
+	FragmentSHA256             string    `json:"fragment_sha256"`
+	SidecarSHA256              string    `json:"sidecar_sha256"`
+	ArtifactSHA256             string    `json:"artifact_sha256"`
+	ApprovalID                 string    `json:"approval_id"`
+	Status                     string    `json:"status"`
+	DriftCode                  string    `json:"drift_code,omitempty"`
+	Generation                 uint64    `json:"generation"`
+	CreatedAt                  time.Time `json:"created_at"`
+	UpdatedAt                  time.Time `json:"updated_at"`
+}
+
+// LineChainAttempt is an in-flight candidate, stored separately so a failed
+// replace/remove cannot overwrite the active committed edge.
+type LineChainAttempt struct {
+	ApprovalID              string    `json:"approval_id"`
+	Operation               string    `json:"operation"`
+	SourceLineUUID          string    `json:"source_line_uuid"`
+	SourceNodeID            string    `json:"source_node_id"`
+	CandidateTargetLineUUID string    `json:"candidate_target_line_uuid,omitempty"`
+	CandidateTargetNodeID   string    `json:"candidate_target_node_id,omitempty"`
+	BaseGeneration          uint64    `json:"base_generation"`
+	BaseArtifactSHA256      string    `json:"base_artifact_sha256,omitempty"`
+	CandidateArtifactSHA256 string    `json:"candidate_artifact_sha256,omitempty"`
+	RequestSHA256           string    `json:"request_sha256"`
+	PlanGraphRevision       uint64    `json:"plan_graph_revision"`
+	QueuedGraphRevision     uint64    `json:"queued_graph_revision,omitempty"`
+	FirstLeaseGraphRevision uint64    `json:"first_lease_graph_revision,omitempty"`
+	Status                  string    `json:"status"`
+	LastErrorCode           string    `json:"last_error_code,omitempty"`
+	LastError               string    `json:"last_error,omitempty"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+type LineChainSnapshot struct {
+	Definitions map[string]LineChainDefinition
+	Attempts    map[string]LineChainAttempt
+	Revision    uint64
+}
+
+func cloneLineChainDefinitions(in map[string]LineChainDefinition) map[string]LineChainDefinition {
+	out := make(map[string]LineChainDefinition, len(in))
+	for id, definition := range in {
+		out[id] = definition
+	}
+	return out
+}
+
+func cloneLineChainAttempts(in map[string]LineChainAttempt) map[string]LineChainAttempt {
+	out := make(map[string]LineChainAttempt, len(in))
+	for id, attempt := range in {
+		out[id] = attempt
+	}
+	return out
+}
+
+func (s *Store) LineChainSnapshot() LineChainSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return LineChainSnapshot{
+		Definitions: cloneLineChainDefinitions(s.state.LineChainDefinitions),
+		Attempts:    cloneLineChainAttempts(s.state.LineChainAttempts),
+		Revision:    s.state.LineChainGraphRevision,
+	}
+}
+
+func validateLineChainAttempt(attempt LineChainAttempt) error {
+	if strings.TrimSpace(attempt.ApprovalID) == "" || strings.TrimSpace(attempt.SourceLineUUID) == "" {
+		return errors.New("line chain approval_id and source_line_uuid are required")
+	}
+	if attempt.Operation != LineChainOperationSet && attempt.Operation != LineChainOperationRemove {
+		return fmt.Errorf("unsupported line chain operation %q", attempt.Operation)
+	}
+	if attempt.Operation == LineChainOperationSet && strings.TrimSpace(attempt.CandidateTargetLineUUID) == "" {
+		return errors.New("set line chain requires a target")
+	}
+	if attempt.Operation == LineChainOperationRemove && strings.TrimSpace(attempt.CandidateTargetLineUUID) != "" {
+		return errors.New("remove line chain must not carry a target")
+	}
+	if attempt.SourceLineUUID == attempt.CandidateTargetLineUUID {
+		return ErrLineChainCycle
+	}
+	return nil
+}
+
+// PlanLineChain persists one planned attempt without reserving graph membership
+// or incrementing the global revision.
+func (s *Store) PlanLineChain(attempt LineChainAttempt) (LineChainAttempt, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateLineChainAttempt(attempt); err != nil {
+		return LineChainAttempt{}, false, err
+	}
+	for approvalID, current := range s.state.LineChainAttempts {
+		if current.SourceLineUUID != attempt.SourceLineUUID || current.Status == LineChainStatusFailed {
+			continue
+		}
+		if current.RequestSHA256 == attempt.RequestSHA256 && current.Operation == attempt.Operation &&
+			current.CandidateTargetLineUUID == attempt.CandidateTargetLineUUID {
+			return current, true, nil
+		}
+		return LineChainAttempt{}, false, fmt.Errorf("%w: source %s has approval %s", ErrLineChainSourceBusy, attempt.SourceLineUUID, approvalID)
+	}
+	now := time.Now().UTC()
+	attempt.PlanGraphRevision = s.state.LineChainGraphRevision
+	attempt.Status = LineChainStatusPlanned
+	if attempt.CreatedAt.IsZero() {
+		attempt.CreatedAt = now
+	}
+	attempt.UpdatedAt = now
+	staged := s.state
+	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+	staged.LineChainAttempts[attempt.ApprovalID] = attempt
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return attempt, false, err
+}
+
+// ReserveLineChain performs the exact approval-time R -> R+1 graph CAS.
+func (s *Store) ReserveLineChain(approvalID string, expectedRevision uint64) (LineChainAttempt, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.LineChainGraphRevision != expectedRevision {
+		return LineChainAttempt{}, ErrLineChainRevisionConflict
+	}
+	attempt, ok := s.state.LineChainAttempts[approvalID]
+	if !ok || attempt.Status != LineChainStatusPlanned || attempt.PlanGraphRevision != expectedRevision {
+		return LineChainAttempt{}, ErrLineChainAttemptNotFound
+	}
+	definitions := cloneLineChainDefinitions(s.state.LineChainDefinitions)
+	attempts := cloneLineChainAttempts(s.state.LineChainAttempts)
+	attempt.Status = LineChainStatusApplying
+	attempt.QueuedGraphRevision = expectedRevision + 1
+	attempt.UpdatedAt = time.Now().UTC()
+	attempts[approvalID] = attempt
+	if lineChainGraphHasCycle(definitions, attempts) {
+		return LineChainAttempt{}, ErrLineChainCycle
+	}
+	staged := s.state
+	staged.LineChainAttempts = attempts
+	staged.LineChainGraphRevision = expectedRevision + 1
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return attempt, err
+}
+
+func lineChainGraphHasCycle(definitions map[string]LineChainDefinition, attempts map[string]LineChainAttempt) bool {
+	edges := make(map[string][]string)
+	for source, definition := range definitions {
+		if definition.TargetLineUUID != "" {
+			edges[source] = append(edges[source], definition.TargetLineUUID)
+		}
+	}
+	for _, attempt := range attempts {
+		if attempt.Status == LineChainStatusApplying && attempt.CandidateTargetLineUUID != "" {
+			edges[attempt.SourceLineUUID] = append(edges[attempt.SourceLineUUID], attempt.CandidateTargetLineUUID)
+		}
+	}
+	state := make(map[string]uint8)
+	var visit func(string) bool
+	visit = func(node string) bool {
+		if state[node] == 1 {
+			return true
+		}
+		if state[node] == 2 {
+			return false
+		}
+		state[node] = 1
+		for _, target := range edges[node] {
+			if visit(target) {
+				return true
+			}
+		}
+		state[node] = 2
+		return false
+	}
+	nodes := make([]string, 0, len(edges))
+	for node := range edges {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+	for _, node := range nodes {
+		if visit(node) {
+			return true
+		}
+	}
+	return false
+}

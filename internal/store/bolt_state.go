@@ -35,6 +35,8 @@ var (
 	boltBucketVpnUserSecrets  = []byte("vpn_user_secrets")
 	boltBucketManagedLines    = []byte("managed_lines")
 	boltBucketManagedSecrets  = []byte("managed_line_secrets")
+	boltBucketLineChains      = []byte("line_chain_definitions")
+	boltBucketLineAttempts    = []byte("line_chain_attempts")
 	boltBucketStatic          = []byte("static")
 	boltBucketStorageBuckets  = []byte("storage_buckets")
 	boltBucketStorageBindings = []byte("storage_bindings")
@@ -85,6 +87,8 @@ var boltStateBuckets = [][]byte{
 	boltBucketVpnUserSecrets,
 	boltBucketManagedLines,
 	boltBucketManagedSecrets,
+	boltBucketLineChains,
+	boltBucketLineAttempts,
 	boltBucketStatic,
 	boltBucketStorageBuckets,
 	boltBucketStorageBindings,
@@ -235,6 +239,15 @@ func (bs *BoltStateStore) ImportState(st State) error {
 			return err
 		}
 		if err := putMap(tx, boltBucketManagedSecrets, persist.ManagedLineSecrets); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketLineChains, persist.LineChainDefinitions); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketLineAttempts, persist.LineChainAttempts); err != nil {
+			return err
+		}
+		if err := tx.Bucket(boltBucketMeta).Put([]byte("line_chain_graph_revision"), []byte(strconv.FormatUint(persist.LineChainGraphRevision, 10))); err != nil {
 			return err
 		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
@@ -405,6 +418,19 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 		}
 		if err := readMap(tx, boltBucketManagedSecrets, st.ManagedLineSecrets); err != nil {
 			return err
+		}
+		if err := readMap(tx, boltBucketLineChains, st.LineChainDefinitions); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketLineAttempts, st.LineChainAttempts); err != nil {
+			return err
+		}
+		if raw := tx.Bucket(boltBucketMeta).Get([]byte("line_chain_graph_revision")); len(raw) > 0 {
+			revision, err := strconv.ParseUint(string(raw), 10, 64)
+			if err != nil {
+				return fmt.Errorf("decode line chain graph revision: %w", err)
+			}
+			st.LineChainGraphRevision = revision
 		}
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {
 			return err

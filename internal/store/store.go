@@ -55,49 +55,52 @@ type State struct {
 	// distinct collection from KV on purpose: KV is plaintext at rest AND readable
 	// over GET /api/kv by any principal holding kv:read. A secret must have neither
 	// property, so it gets its own map, its own cipher pass, and no HTTP handler.
-	PluginSecrets         map[string]model.KVEntry              `json:"plugin_secrets"`
-	VpnUsers              map[string]VpnUserPublicRecord        `json:"vpn_users"`
-	VpnUserSecrets        map[string]VpnUserSecretRecord        `json:"vpn_user_secrets"`
-	ManagedLines          map[string]ManagedLinePublicRecord    `json:"managed_lines"`
-	ManagedLineSecrets    map[string]ManagedLineSecretRecord    `json:"managed_line_secrets"`
-	SubscriptionShares    map[string]model.SubscriptionShare    `json:"subscription_shares"`
-	SubscriptionSnapshots map[string]model.SubscriptionSnapshot `json:"subscription_snapshots"`
-	Static                map[string]model.StaticObject         `json:"static"`
-	StorageBuckets        map[string]model.StorageBucket        `json:"storage_buckets"`
-	StorageBindings       map[string]model.StorageBinding       `json:"storage_bindings"`
-	StorageTokens         map[string]model.StorageAccessToken   `json:"storage_tokens"`
-	Workers               map[string]model.WorkerScript         `json:"workers"`
-	Plugins               map[string]model.PluginInstallation   `json:"plugins"`
-	Approvals             map[string]model.Approval             `json:"approvals"`
-	Sessions              map[string]auth.Session               `json:"sessions"`
-	DDNS                  map[string]model.DDNSProfile          `json:"ddns"`
-	Monitors              map[string]model.Monitor              `json:"monitors"`
-	MonResults            map[string][]model.MonitorResult      `json:"monitor_results"`
-	LogSources            map[string]model.LogSource            `json:"log_sources"`
-	NotifyChannels        map[string]model.NotifyChannel        `json:"notify_channels"`
-	NotifyRules           map[string]model.NotifyRule           `json:"notify_rules"`
-	Tunnels               map[string]model.TunnelProfile        `json:"tunnels"`
-	MachineProfiles       map[string]model.MachineProfile       `json:"machine_profiles"`
-	MachineVendors        map[string]model.MachineVendor        `json:"machine_vendors"`
-	NFTInputs             map[string]model.NFTInputs            `json:"nft_inputs"`
-	SecurityGroups        map[string]model.SecurityGroup        `json:"security_groups"`
-	GuardZones            map[string]model.GuardZone            `json:"guard_zones"`
-	GuardBindings         map[string]model.NodeGuardBinding     `json:"guard_bindings"`
-	GuardRealitySnapshots map[string]GuardRealitySnapshot       `json:"guard_reality_snapshots"`
-	DNSDeployments        map[string]model.DNSDeployment        `json:"dns_deployments"`
-	NetPolicies           map[string]model.NetPolicy            `json:"net_policies"`
-	Groups                map[string]model.Group                `json:"groups"`
-	GroupPolicies         map[string]model.GroupNetPolicy       `json:"group_policies"`
-	GeoRouting            map[string]model.GeoRouting           `json:"geo_routing"`
-	AgentUpdates          map[string]model.AgentUpdatePolicy    `json:"agent_updates"`
-	ProxyInbounds         map[string]model.ProxyInbound         `json:"proxy_inbounds"`
-	ProxyUsers            map[string]model.ProxyUser            `json:"proxy_users"`
-	ProxyProfiles         map[string]model.ProxyNodeProfile     `json:"proxy_profiles"`
-	ProxyUsage            map[string]model.ProxyUsageSnapshot   `json:"proxy_usage"`
-	TOTPChallenges        map[string]auth.TOTPChallenge         `json:"totp_challenges"`
-	OIDCProviders         map[string]model.OIDCProvider         `json:"oidc_providers"`
-	OIDCIdentities        map[string]model.OIDCIdentity         `json:"oidc_identities"`
-	OIDCAuthStates        map[string]auth.OIDCAuthState         `json:"oidc_auth_states"`
+	PluginSecrets          map[string]model.KVEntry              `json:"plugin_secrets"`
+	VpnUsers               map[string]VpnUserPublicRecord        `json:"vpn_users"`
+	VpnUserSecrets         map[string]VpnUserSecretRecord        `json:"vpn_user_secrets"`
+	ManagedLines           map[string]ManagedLinePublicRecord    `json:"managed_lines"`
+	ManagedLineSecrets     map[string]ManagedLineSecretRecord    `json:"managed_line_secrets"`
+	LineChainDefinitions   map[string]LineChainDefinition        `json:"line_chain_definitions"`
+	LineChainAttempts      map[string]LineChainAttempt           `json:"line_chain_attempts"`
+	LineChainGraphRevision uint64                                `json:"line_chain_graph_revision"`
+	SubscriptionShares     map[string]model.SubscriptionShare    `json:"subscription_shares"`
+	SubscriptionSnapshots  map[string]model.SubscriptionSnapshot `json:"subscription_snapshots"`
+	Static                 map[string]model.StaticObject         `json:"static"`
+	StorageBuckets         map[string]model.StorageBucket        `json:"storage_buckets"`
+	StorageBindings        map[string]model.StorageBinding       `json:"storage_bindings"`
+	StorageTokens          map[string]model.StorageAccessToken   `json:"storage_tokens"`
+	Workers                map[string]model.WorkerScript         `json:"workers"`
+	Plugins                map[string]model.PluginInstallation   `json:"plugins"`
+	Approvals              map[string]model.Approval             `json:"approvals"`
+	Sessions               map[string]auth.Session               `json:"sessions"`
+	DDNS                   map[string]model.DDNSProfile          `json:"ddns"`
+	Monitors               map[string]model.Monitor              `json:"monitors"`
+	MonResults             map[string][]model.MonitorResult      `json:"monitor_results"`
+	LogSources             map[string]model.LogSource            `json:"log_sources"`
+	NotifyChannels         map[string]model.NotifyChannel        `json:"notify_channels"`
+	NotifyRules            map[string]model.NotifyRule           `json:"notify_rules"`
+	Tunnels                map[string]model.TunnelProfile        `json:"tunnels"`
+	MachineProfiles        map[string]model.MachineProfile       `json:"machine_profiles"`
+	MachineVendors         map[string]model.MachineVendor        `json:"machine_vendors"`
+	NFTInputs              map[string]model.NFTInputs            `json:"nft_inputs"`
+	SecurityGroups         map[string]model.SecurityGroup        `json:"security_groups"`
+	GuardZones             map[string]model.GuardZone            `json:"guard_zones"`
+	GuardBindings          map[string]model.NodeGuardBinding     `json:"guard_bindings"`
+	GuardRealitySnapshots  map[string]GuardRealitySnapshot       `json:"guard_reality_snapshots"`
+	DNSDeployments         map[string]model.DNSDeployment        `json:"dns_deployments"`
+	NetPolicies            map[string]model.NetPolicy            `json:"net_policies"`
+	Groups                 map[string]model.Group                `json:"groups"`
+	GroupPolicies          map[string]model.GroupNetPolicy       `json:"group_policies"`
+	GeoRouting             map[string]model.GeoRouting           `json:"geo_routing"`
+	AgentUpdates           map[string]model.AgentUpdatePolicy    `json:"agent_updates"`
+	ProxyInbounds          map[string]model.ProxyInbound         `json:"proxy_inbounds"`
+	ProxyUsers             map[string]model.ProxyUser            `json:"proxy_users"`
+	ProxyProfiles          map[string]model.ProxyNodeProfile     `json:"proxy_profiles"`
+	ProxyUsage             map[string]model.ProxyUsageSnapshot   `json:"proxy_usage"`
+	TOTPChallenges         map[string]auth.TOTPChallenge         `json:"totp_challenges"`
+	OIDCProviders          map[string]model.OIDCProvider         `json:"oidc_providers"`
+	OIDCIdentities         map[string]model.OIDCIdentity         `json:"oidc_identities"`
+	OIDCAuthStates         map[string]auth.OIDCAuthState         `json:"oidc_auth_states"`
 	// WebAuthnCreds holds registered passkeys keyed by store record id. The public
 	// keys and credential ids are non-secret, so this map is persisted as-is (no
 	// at-rest envelope like Users/Sessions carry).
@@ -446,6 +449,8 @@ func emptyState() State {
 		VpnUserSecrets:        map[string]VpnUserSecretRecord{},
 		ManagedLines:          map[string]ManagedLinePublicRecord{},
 		ManagedLineSecrets:    map[string]ManagedLineSecretRecord{},
+		LineChainDefinitions:  map[string]LineChainDefinition{},
+		LineChainAttempts:     map[string]LineChainAttempt{},
 		SubscriptionShares:    map[string]model.SubscriptionShare{},
 		SubscriptionSnapshots: map[string]model.SubscriptionSnapshot{},
 		Static:                map[string]model.StaticObject{},
@@ -523,6 +528,12 @@ func (st *State) ensureMaps() {
 	}
 	if st.ManagedLineSecrets == nil {
 		st.ManagedLineSecrets = map[string]ManagedLineSecretRecord{}
+	}
+	if st.LineChainDefinitions == nil {
+		st.LineChainDefinitions = map[string]LineChainDefinition{}
+	}
+	if st.LineChainAttempts == nil {
+		st.LineChainAttempts = map[string]LineChainAttempt{}
 	}
 	if st.SubscriptionShares == nil {
 		st.SubscriptionShares = map[string]model.SubscriptionShare{}

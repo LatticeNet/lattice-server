@@ -262,6 +262,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	// exact non-success result before any inventory or observable traffic.
 	recoveryRaw, _ := os.ReadFile(recoveryResult)
 	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","result":%s}`, recoveryRaw)))
+	ackResult := filepath.Join(root, "ack-task1.json")
+	ackCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EAckHelper$", "--", root)
+	ackCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+leased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+leased[0].LeaseID, "LATTICE_LINECHAIN_E2E_ACK_RESULT="+ackResult)
+	_ = runLifecycleAgentHelper(t, ackCmd)
 	// The interrupted lease is terminally failed; obtain a fresh approval and
 	// lease before any retry resolve. The server must reproduce the exact
 	// approved document bytes rather than allowing a new authority.

@@ -58,7 +58,6 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	target.RealityPrivateKey = realityPrivate
 	target.RealityPublicKey = realityPublic
 	target.ShortID = "0123456789abcdef"
-	target.LineHashID = lineHash("node-a", model.ProxyCoreSingbox, "vless", "", target.Port, target.Tag, "")
 	if err := srv.putManagedLineDef(target); err != nil {
 		t.Fatal(err)
 	}

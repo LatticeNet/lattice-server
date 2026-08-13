@@ -75,6 +75,34 @@ var (
 	boltBucketOIDCAuthStates  = []byte("oidc_auth_states")
 )
 
+var boltKeySubscriptionHotAuthority = []byte("subscription_hot_authority_v1")
+
+func (bs *BoltStateStore) subscriptionHotAuthorityInitialized() (bool, error) {
+	var initialized bool
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		meta := tx.Bucket(boltBucketMeta)
+		initialized = meta != nil && string(meta.Get(boltKeySubscriptionHotAuthority)) == "initialized"
+		return nil
+	})
+	return initialized, err
+}
+
+func (bs *BoltStateStore) markSubscriptionHotAuthorityInitialized() error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		meta := tx.Bucket(boltBucketMeta)
+		if meta == nil {
+			return errors.New("missing bolt metadata bucket")
+		}
+		return meta.Put(boltKeySubscriptionHotAuthority, []byte("initialized"))
+	})
+}
+
 var boltStateBuckets = [][]byte{
 	boltBucketUsers,
 	boltBucketTokens,

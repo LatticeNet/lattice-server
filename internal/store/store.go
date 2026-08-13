@@ -357,6 +357,10 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 	if err != nil {
 		return err
 	}
+	subscriptionAuthorityInitialized, err := bs.subscriptionHotAuthorityInitialized()
+	if err != nil {
+		return err
+	}
 	seenAudit := map[string]struct{}{}
 	for _, ev := range existing.Audit {
 		seenAudit[auditEventStorageKey(ev)] = struct{}{}
@@ -411,19 +415,24 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			return err
 		}
 	}
-	for _, share := range st.SubscriptionShares {
-		if current, ok := existing.SubscriptionShares[share.ID]; ok && !share.UpdatedAt.After(current.UpdatedAt) {
-			continue
+	if !subscriptionAuthorityInitialized {
+		for _, share := range st.SubscriptionShares {
+			if current, ok := existing.SubscriptionShares[share.ID]; ok && !share.UpdatedAt.After(current.UpdatedAt) {
+				continue
+			}
+			if err := bs.UpsertSubscriptionShare(share); err != nil {
+				return err
+			}
 		}
-		if err := bs.UpsertSubscriptionShare(share); err != nil {
-			return err
+		for key, snapshot := range st.SubscriptionSnapshots {
+			if current, ok := existing.SubscriptionSnapshots[key]; ok && !subscriptionSnapshotNewer(snapshot, current) {
+				continue
+			}
+			if err := bs.UpsertSubscriptionSnapshot(key, snapshot); err != nil {
+				return err
+			}
 		}
-	}
-	for key, snapshot := range st.SubscriptionSnapshots {
-		if current, ok := existing.SubscriptionSnapshots[key]; ok && !subscriptionSnapshotNewer(snapshot, current) {
-			continue
-		}
-		if err := bs.UpsertSubscriptionSnapshot(key, snapshot); err != nil {
+		if err := bs.markSubscriptionHotAuthorityInitialized(); err != nil {
 			return err
 		}
 	}

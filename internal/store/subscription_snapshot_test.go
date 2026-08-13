@@ -262,6 +262,77 @@ func TestSubscriptionSnapshotRawEncryptedRuntimeHotAndDeleteAuthoritative(t *tes
 	}
 }
 
+func TestRuntimeHotSubscriptionAuthorityPreventsJSONSeedResurrectionAfterDeleteAndEmpty(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath, boltPath := filepath.Join(dir, "state.json"), filepath.Join(dir, "hot.db")
+	cipher := testCipher(t)
+	s, err := OpenWithCipher(jsonPath, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSubscriptionShare(model.SubscriptionShare{ID: "share", Token: "stale-json-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnableRuntimeBoltHotStore(boltPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "hot-update", LastAttemptAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSubscriptionShare(model.SubscriptionShare{ID: "share", Token: "hot-update-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenWithCipher(jsonPath, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.EnableRuntimeBoltHotStore(boltPath); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := reopened.SubscriptionSnapshot("p", "s"); !ok || got.Raw != "hot-update" {
+		t.Fatalf("stale JSON overrode authoritative hot update: %+v ok=%v", got, ok)
+	}
+	if got, ok := reopened.SubscriptionShare("share"); !ok || got.Token != "hot-update-token" {
+		t.Fatalf("stale JSON overrode authoritative hot share: %+v ok=%v", got, ok)
+	}
+	if err := reopened.DeleteSubscriptionSnapshot("p", "s"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.DeleteSubscriptionShare("share"); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err = OpenWithCipher(jsonPath, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.EnableRuntimeBoltHotStore(boltPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reopened.SubscriptionSnapshot("p", "s"); ok {
+		t.Fatal("deleted hot snapshot resurrected from stale JSON seed")
+	}
+	if _, ok := reopened.SubscriptionShare("share"); ok {
+		t.Fatal("deleted hot share resurrected from stale JSON seed")
+	}
+	if got := reopened.SubscriptionSnapshots(); len(got) != 0 {
+		t.Fatalf("authoritative hot snapshot collection is not empty: %+v", got)
+	}
+	if got := reopened.SubscriptionShares(); len(got) != 0 {
+		t.Fatalf("authoritative hot share collection is not empty: %+v", got)
+	}
+}
+
 func TestSubscriptionSnapshotPersistenceFailurePreservesLastGood(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	s, err := OpenWithCipher(path, testCipher(t))

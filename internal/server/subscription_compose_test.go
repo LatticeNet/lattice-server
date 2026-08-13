@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -225,5 +226,62 @@ func TestComposeGraphSubscriptionRootOrderAndTombstoneAreCanonicalInputs(t *test
 	}
 	if len(manifest.Entries[1].Path) != 0 || manifest.Entries[1].Terminal.LineUUID != composeTerminalUUID || manifest.Entries[1].Terminal.Generation != 2 {
 		t.Fatalf("committed converged tombstone was not emitted as terminal: %+v", manifest.Entries[1])
+	}
+}
+
+func TestComposeGraphSubscriptionBoundsActualTraversalAcrossSharedSuffixes(t *testing.T) {
+	snapshot := testGraphComposeSnapshot()
+	secondRoot := "44444444-4444-4444-8444-444444444444"
+	sharedCount := model.MaxSubscriptionSourceVisits / 2
+	shared := make([]string, sharedCount)
+	for i := range shared {
+		shared[i] = fmt.Sprintf("aaaaaaaa-aaaa-4aaa-8aaa-%012x", i+1)
+	}
+	line := func(uuid, hash, downstream string) Line {
+		return Line{LineUUID: uuid, LineHashID: hash, NodeID: "node-root", Core: model.ProxyCoreSingbox, Type: model.ProxyProtocolVLESS,
+			Transport: model.ProxyTransportTCP, Security: model.ProxySecurityReality, Name: "entry", Tag: "in-entry", PublicHost: "entry.example.com",
+			ListenPort: 443, DownstreamLineUUID: downstream, Overlay: true, OverlayStatus: managedLineStatusApplied, Status: "ok"}
+	}
+	managed := func(uuid string) managedLineDef {
+		return managedLineDef{LineUUID: uuid, NodeID: "node-root", Port: 443, SNI: "entry.example.com",
+			RealityPublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", ShortID: "0123456789abcdef", Status: managedLineStatusApplied}
+	}
+	for i, uuid := range shared {
+		target := ""
+		if i+1 < len(shared) {
+			target = shared[i+1]
+		}
+		snapshot.Lines[uuid] = []Line{line(uuid, "shared-"+uuid, target)}
+		snapshot.Definitions[uuid] = managed(uuid)
+		snapshot.Chains.Definitions[uuid] = store.LineChainDefinition{SourceLineUUID: uuid, TargetLineUUID: target,
+			Status: store.LineChainStatusConverged, Generation: 1, ObservationRevision: 1}
+	}
+	for _, root := range []string{composeRootUUID, secondRoot} {
+		snapshot.Lines[root] = []Line{line(root, "hash-"+root, shared[0])}
+		snapshot.Definitions[root] = managed(root)
+		snapshot.Chains.Definitions[root] = store.LineChainDefinition{SourceLineUUID: root, TargetLineUUID: shared[0],
+			Status: store.LineChainStatusConverged, Generation: 1, ObservationRevision: 1}
+	}
+	user := snapshot.Users["identity"]
+	user.Bindings = []LineBinding{{LineHashID: "hash-" + composeRootUUID, Enabled: true}, {LineHashID: "hash-" + secondRoot, Enabled: true}}
+	snapshot.Users["identity"] = user
+
+	visits := 0
+	if _, _, err := composeDeclaredPath(snapshot, composeRootUUID, nil, &visits); err != nil {
+		t.Fatalf("first shared path failed at %d visits: %v", visits, err)
+	}
+	if visits != sharedCount+1 {
+		t.Fatalf("first path visits = %d, want %d", visits, sharedCount+1)
+	}
+	if _, _, err := composeDeclaredPath(snapshot, secondRoot, nil, &visits); composeFailureView(err).Code != "bounds_exceeded" {
+		t.Fatalf("second path error = %v at %d visits", err, visits)
+	}
+	if visits != model.MaxSubscriptionSourceVisits+1 {
+		t.Fatalf("budget failed at visit %d, want %d", visits, model.MaxSubscriptionSourceVisits+1)
+	}
+	response, err := composeGraphSubscription(snapshot, graphSubscriptionRequest{SchemaVersion: 1, IdentityID: "identity",
+		EntryRoots: []string{composeRootUUID, secondRoot}}, time.Unix(1_700_000_000, 0))
+	if composeFailureView(err).Code != "bounds_exceeded" || response.OK || response.SourceVersion != "" || len(response.SourceManifest) != 0 || len(response.Entries) != 0 || response.Raw != "" {
+		t.Fatalf("amplified traversal returned partial content: response=%+v err=%v", response, err)
 	}
 }

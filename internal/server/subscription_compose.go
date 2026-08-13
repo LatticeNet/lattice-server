@@ -146,7 +146,7 @@ func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscr
 		}
 	}
 	seenRoots := make(map[string]bool, len(req.EntryRoots))
-	visitedAll := make(map[string]bool)
+	totalTraversalVisits := 0
 	manifest := model.SubscriptionSourceManifestV1{
 		Schema: model.SubscriptionSourceManifestSchemaV1, Renderer: model.SubscriptionSourceRendererV1,
 		Identity:   model.SubscriptionSourceManifestIdentity{ID: identityID, Generation: identity.SubscriptionGeneration},
@@ -188,7 +188,7 @@ func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscr
 		if rawBytes > model.MaxSubscriptionRawBytes {
 			return graphSubscriptionResponse{}, composeFailure("bounds_exceeded")
 		}
-		path, terminal, err := composeDeclaredPath(snapshot, root, activeSources, visitedAll)
+		path, terminal, err := composeDeclaredPath(snapshot, root, activeSources, &totalTraversalVisits)
 		if err != nil {
 			return graphSubscriptionResponse{}, err
 		}
@@ -223,21 +223,19 @@ func composeLine(snapshot lineChainCompileSnapshot, uuid string) (Line, managedL
 	return line, definition, nil
 }
 
-func composeDeclaredPath(snapshot lineChainCompileSnapshot, root string, activeSources, visitedAll map[string]bool) ([]model.SubscriptionSourceManifestEdge, model.SubscriptionSourceManifestTerminal, error) {
+func composeDeclaredPath(snapshot lineChainCompileSnapshot, root string, activeSources map[string]bool, totalTraversalVisits *int) ([]model.SubscriptionSourceManifestEdge, model.SubscriptionSourceManifestTerminal, error) {
 	path := make([]model.SubscriptionSourceManifestEdge, 0)
 	seen := make(map[string]bool)
 	current := root
 	for {
+		*totalTraversalVisits++
+		if *totalTraversalVisits > model.MaxSubscriptionSourceVisits {
+			return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("bounds_exceeded")
+		}
 		if seen[current] {
 			return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("graph_cycle")
 		}
 		seen[current] = true
-		if !visitedAll[current] {
-			visitedAll[current] = true
-			if len(visitedAll) > model.MaxSubscriptionSourceVisits {
-				return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("bounds_exceeded")
-			}
-		}
 		if activeSources[current] {
 			return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("graph_busy")
 		}

@@ -10,16 +10,21 @@ import (
 	"strings"
 )
 
+// LineChainRealityClientFingerprint is the reviewed strict-alpha uTLS profile
+// bound into every canonical line-chain fragment.
+const LineChainRealityClientFingerprint = "chrome"
+
 type LineChainOutboundOptions struct {
-	Tag              string
-	SourceInboundTag string
-	Server           string
-	ServerPort       int
-	UUID             string
-	Flow             string
-	SNI              string
-	RealityPublicKey string
-	RealityShortID   string
+	Tag               string
+	SourceInboundTag  string
+	Server            string
+	ServerPort        int
+	UUID              string
+	Flow              string
+	SNI               string
+	RealityPublicKey  string
+	RealityShortID    string
+	ClientFingerprint string
 }
 
 type LineChainFragment struct {
@@ -45,7 +50,13 @@ type lineChainOutbound struct {
 type lineChainClientTLS struct {
 	Enabled    bool                   `json:"enabled"`
 	ServerName string                 `json:"server_name"`
+	UTLS       lineChainClientUTLS    `json:"utls"`
 	Reality    lineChainClientReality `json:"reality"`
+}
+
+type lineChainClientUTLS struct {
+	Enabled     bool   `json:"enabled"`
+	Fingerprint string `json:"fingerprint"`
 }
 
 type lineChainClientReality struct {
@@ -90,6 +101,9 @@ func RenderLineChainFragment(opts LineChainOutboundOptions) (LineChainFragment, 
 	if !realityShortIDRe.MatchString(strings.TrimSpace(opts.RealityShortID)) || len(strings.TrimSpace(opts.RealityShortID))%2 != 0 {
 		return LineChainFragment{}, errors.New("line chain REALITY short id is invalid")
 	}
+	if opts.ClientFingerprint != LineChainRealityClientFingerprint {
+		return LineChainFragment{}, errors.New("line chain REALITY client fingerprint is invalid")
+	}
 	fragment := lineChainFragmentJSON{
 		Outbounds: []lineChainOutbound{{
 			Type: modelProxyProtocolVLESS(), Tag: strings.TrimSpace(opts.Tag),
@@ -97,6 +111,7 @@ func RenderLineChainFragment(opts LineChainOutboundOptions) (LineChainFragment, 
 			UUID: strings.ToLower(strings.TrimSpace(opts.UUID)), Flow: strings.TrimSpace(opts.Flow),
 			TLS: lineChainClientTLS{
 				Enabled: true, ServerName: strings.TrimSpace(opts.SNI),
+				UTLS:    lineChainClientUTLS{Enabled: true, Fingerprint: opts.ClientFingerprint},
 				Reality: lineChainClientReality{Enabled: true, PublicKey: strings.TrimSpace(opts.RealityPublicKey), ShortID: strings.TrimSpace(opts.RealityShortID)},
 			},
 		}},

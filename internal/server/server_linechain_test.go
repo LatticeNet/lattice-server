@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/proxycore"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -299,6 +300,22 @@ func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 		doc.SidecarPatch.DesiredDownstreamLineUUID == nil || *doc.SidecarPatch.DesiredDownstreamLineUUID != targetUUID ||
 		doc.ArtifactSHA256 != compiled.Plan.ArtifactSHA256 || doc.SidecarPatchSHA256 != compiled.Plan.SidecarPatchSHA256 {
 		t.Fatalf("unexpected v2 document: %+v", doc)
+	}
+	var fragment struct {
+		Outbounds []struct {
+			TLS struct {
+				UTLS struct {
+					Enabled     bool   `json:"enabled"`
+					Fingerprint string `json:"fingerprint"`
+				} `json:"utls"`
+			} `json:"tls"`
+		} `json:"outbounds"`
+	}
+	if err := json.Unmarshal([]byte(*doc.Fragment), &fragment); err != nil {
+		t.Fatalf("decode issued fragment: %v", err)
+	}
+	if len(fragment.Outbounds) != 1 || !fragment.Outbounds[0].TLS.UTLS.Enabled || fragment.Outbounds[0].TLS.UTLS.Fingerprint != proxycore.LineChainRealityClientFingerprint {
+		t.Fatalf("issued fragment lacks reviewed REALITY uTLS authority: %s", *doc.Fragment)
 	}
 	for _, forbidden := range []string{"config_dir", "fragment_path", "sidecar_path", `"sidecar"`, "combined_sha256"} {
 		if strings.Contains(string(raw), forbidden) {

@@ -211,15 +211,21 @@ func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 }
 
 func (t *systemWorkerTransport) awaitReadyContext(ctx context.Context, generation uint64) error {
-	result := make(chan error, 1)
-	go func() { result <- t.awaitReady(generation) }()
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
+	line, err := t.nextFrame(ctx)
+	if err != nil {
 		_ = t.abort()
-		return ctx.Err()
+		return err
 	}
+	var f stdioJSONV2Frame
+	if err := decodeStrictV2(line, &f); err != nil {
+		_ = t.abort()
+		return err
+	}
+	if f.Protocol != 2 || f.Kind != "runtime_ready" || f.Generation != generation || f.InvocationID != "runtime" || f.HostCallID != "" || len(f.Request) != 0 || len(f.Response) != 0 || len(f.HostCall) != 0 || len(f.HostResponse) != 0 {
+		_ = t.abort()
+		return fmt.Errorf("invalid runtime_ready")
+	}
+	return nil
 }
 
 func startSystemWorker(ctx context.Context, path, dir string, env []string) (*systemWorkerTransport, error) {

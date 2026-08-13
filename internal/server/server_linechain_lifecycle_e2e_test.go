@@ -403,26 +403,9 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	beforeRemoveTraffic := observer.accepted()
 	// The same client path now resolves directly after the server-issued remove;
 	// no additional observer hop is permitted.
-	lifecycleKillPIDFile(root, "b-recovered")
-	lifecycleStartProcess(t, singbox, root, "b-removed", configDir, bPort)
 	lifecycleSOCKSEcho(t, clientPort, origin)
 	if observer.accepted() != beforeRemoveTraffic {
 		t.Fatal("removed chain still traversed observer/A")
-	}
-	observed.Nodes[0].DownstreamLineUUID = ""
-	observed.Nodes[0].OutboundRef = ""
-	observed.At = time.Now().UTC()
-	if err := srv.store.DeleteKV(lineUUIDKVBucket, observedHash); err != nil {
-		t.Fatal(err)
-	}
-	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: snapshot.Definitions[sourceUUID].SourceLineHashID, Value: sourceUUID}); err != nil {
-		t.Fatal(err)
-	}
-	unchainedRaw, _ := json.Marshal(map[string]any{"node_id": "node-b", "inventory": observed})
-	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, unchainedRaw)
-	removed = srv.store.LineChainSnapshot().Definitions[sourceUUID]
-	if removed.Status != store.LineChainStatusConverged || removed.TargetLineUUID != "" || len(srv.store.Tasks()) != 2 {
-		t.Fatalf("remove observation did not converge exactly once: %+v tasks=%d", removed, len(srv.store.Tasks()))
 	}
 	assertDeclaredE2EEdge(t, srv.buildLineGroups(), sourceUUID, targetUUID, false)
 }

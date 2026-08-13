@@ -292,7 +292,7 @@ func TestLineSecretBoundsRejectRecord100001AndAggregate256MiB(t *testing.T) {
 	for i := 0; i < records; i++ {
 		id := fmt.Sprintf("vpn-%05d", i)
 		public[id] = VpnUserPublicRecord{ID: id, Credentials: []VpnUserCredentialPublic{{Protocol: "trojan"}}}
-		private[id] = VpnUserSecretRecord{Credentials: []VpnUserCredentialSecret{{Protocol: "trojan", Password: payload}}}
+		private[id] = VpnUserSecretRecord{Credentials: []VpnUserCredentialSecret{{Protocol: "trojan", Password: "x"}}, SubID: payload}
 	}
 	if err := validateVpnUserCollections(public, private); err == nil || !strings.Contains(err.Error(), "aggregate encoded bytes") {
 		t.Fatalf("aggregate secret collection beyond 256 MiB was not rejected: %v", err)
@@ -412,6 +412,14 @@ func TestLineSecretValidationRejectsMalformedCredentialAndRealityMaterial(t *tes
 		{name: "password_protocol_with_uuid", mutate: func(_ *VpnUserPublicRecord, s *VpnUserSecretRecord) {
 			s.Credentials[0].UUID = "11111111-1111-4111-8111-111111111111"
 		}},
+		{name: "tuic_missing_password", mutate: func(p *VpnUserPublicRecord, s *VpnUserSecretRecord) {
+			p.Credentials[0].Protocol = "tuic"
+			s.Credentials[0] = VpnUserCredentialSecret{Protocol: "tuic", UUID: "11111111-1111-4111-8111-111111111111"}
+		}},
+		{name: "tuic_missing_uuid", mutate: func(p *VpnUserPublicRecord, s *VpnUserSecretRecord) {
+			p.Credentials[0].Protocol = "tuic"
+			s.Credentials[0] = VpnUserCredentialSecret{Protocol: "tuic", Password: "secret"}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -467,6 +475,29 @@ func TestFullBoltImportExportValidatesTypedSecretDomains(t *testing.T) {
 	}
 	if _, err := bs.ExportState(); err == nil || !strings.Contains(err.Error(), "invalid vpn user secret collections") {
 		t.Fatalf("corrupt full-Bolt export was accepted: %v", err)
+	}
+}
+
+func TestTUICCredentialPreservesUUIDAndPasswordAcrossFullBolt(t *testing.T) {
+	bs, err := OpenBoltState(filepath.Join(t.TempDir(), "state.db"), secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+	state := emptyState()
+	public := VpnUserPublicRecord{ID: "vpn-tuic", Credentials: []VpnUserCredentialPublic{{Protocol: "tuic"}}}
+	private := VpnUserSecretRecord{Credentials: []VpnUserCredentialSecret{{Protocol: "tuic", UUID: "11111111-1111-4111-8111-111111111111", Password: "tuic-secret"}}}
+	state.VpnUsers[public.ID], state.VpnUserSecrets[public.ID] = public, private
+	if err := bs.ImportState(state); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := exported.VpnUserSecrets[public.ID].Credentials[0]
+	if got.UUID != private.Credentials[0].UUID || got.Password != private.Credentials[0].Password {
+		t.Fatalf("TUIC full-Bolt round trip lost dual secrets: %+v", got)
 	}
 }
 

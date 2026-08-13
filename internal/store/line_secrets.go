@@ -3,15 +3,19 @@ package store
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 var vpnCredentialProtocols = map[string]bool{"vless": true, "vmess": true, "trojan": true, "shadowsocks": true, "hysteria2": true, "tuic": true, "anytls": true}
+
+const MaxVpnCredentialPasswordBytes = 256
 
 func validSecretUUIDv4(value string) bool {
 	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' || value[14] != '4' || !strings.ContainsRune("89ab", rune(value[19])) {
@@ -31,6 +35,41 @@ func validSecretUUIDv4(value string) bool {
 func validRealityKey(value string) bool {
 	raw, err := base64.RawURLEncoding.DecodeString(value)
 	return err == nil && len(raw) == 32 && base64.RawURLEncoding.EncodeToString(raw) == value
+}
+
+// ValidateVpnUserCredentialSecret is the shared canonical protocol-shape
+// contract used by typed persistence and server request normalization.
+func ValidateVpnUserCredentialSecret(credential VpnUserCredentialSecret) error {
+	protocol := strings.TrimSpace(credential.Protocol)
+	if protocol == "" || credential.Protocol != strings.ToLower(protocol) || !vpnCredentialProtocols[protocol] {
+		return fmt.Errorf("unsupported or noncanonical credential protocol %q", credential.Protocol)
+	}
+	validatePassword := func(required bool) error {
+		if (!required && credential.Password != "") || (required && strings.TrimSpace(credential.Password) == "") {
+			return errors.New("credential has invalid password presence")
+		}
+		if len(credential.Password) > MaxVpnCredentialPasswordBytes || strings.ContainsFunc(credential.Password, unicode.IsControl) {
+			return errors.New("credential password is invalid or too long")
+		}
+		return nil
+	}
+	switch protocol {
+	case "vless", "vmess":
+		if !validSecretUUIDv4(credential.UUID) {
+			return errors.New("credential UUID must be canonical UUIDv4")
+		}
+		return validatePassword(false)
+	case "tuic":
+		if !validSecretUUIDv4(credential.UUID) {
+			return errors.New("TUIC UUID must be canonical UUIDv4")
+		}
+		return validatePassword(true)
+	default:
+		if credential.UUID != "" {
+			return errors.New("password credential must not carry UUID")
+		}
+		return validatePassword(true)
+	}
 }
 
 const (
@@ -162,13 +201,8 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 				return fmt.Errorf("vpn user %q has duplicate %q credential", id, protocol)
 			}
 			seen[protocol] = struct{}{}
-			requiresUUID := protocol == "vless" || protocol == "vmess" || protocol == "tuic"
-			if requiresUUID {
-				if !validSecretUUIDv4(credential.UUID) || credential.Password != "" {
-					return fmt.Errorf("vpn user %q credential %q has invalid UUID/password shape", id, protocol)
-				}
-			} else if credential.UUID != "" || strings.TrimSpace(credential.Password) == "" {
-				return fmt.Errorf("vpn user %q credential %q has invalid password/UUID shape", id, protocol)
+			if err := ValidateVpnUserCredentialSecret(credential); err != nil {
+				return fmt.Errorf("vpn user %q credential %q: %w", id, protocol, err)
 			}
 		}
 		encoded, err := json.Marshal(record)

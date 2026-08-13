@@ -8,6 +8,10 @@ import (
 )
 
 func decodeStrictV2(data []byte, dst any) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
 	if err := d.Decode(dst); err != nil {

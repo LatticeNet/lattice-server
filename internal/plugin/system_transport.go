@@ -123,6 +123,7 @@ type systemWorkerTransport struct {
 	pgid      int
 	scanner   *bufio.Scanner
 	frames    chan transportFrame
+	done      chan struct{}
 	abortOnce sync.Once
 	abortErr  error
 }
@@ -140,14 +141,20 @@ func (t *systemWorkerTransport) nextFrame(ctx context.Context) ([]byte, error) {
 }
 func (t *systemWorkerTransport) readPump() {
 	for t.scanner.Scan() {
-		t.frames <- transportFrame{line: append([]byte(nil), t.scanner.Bytes()...)}
+		select {
+		case t.frames <- transportFrame{line: append([]byte(nil), t.scanner.Bytes()...)}:
+		case <-t.done:
+			return
+		}
 	}
 	err := t.scanner.Err()
 	if err == nil {
 		err = io.ErrUnexpectedEOF
 	}
-	t.frames <- transportFrame{err: err}
-	close(t.frames)
+	select {
+	case t.frames <- transportFrame{err: err}:
+	case <-t.done:
+	}
 }
 
 func (t *systemWorkerTransport) closePipes() {
@@ -238,7 +245,7 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 		return nil, err
 	}
 	_ = hostRead.Close()
-	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid, scanner: bufio.NewScanner(out), frames: make(chan transportFrame, 1)}
+	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid, scanner: bufio.NewScanner(out), frames: make(chan transportFrame, 1), done: make(chan struct{})}
 	t.scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	go t.readPump()
 	return t, nil
@@ -249,6 +256,7 @@ func (t *systemWorkerTransport) abort() error {
 		return nil
 	}
 	t.abortOnce.Do(func() {
+		close(t.done)
 		_ = syscall.Kill(-t.pgid, syscall.SIGTERM)
 		done := make(chan error, 1)
 		go func() { done <- t.cmd.Wait() }()

@@ -395,11 +395,12 @@ func TestLineChainCompilerProducesDeterministicRedactedArtifact(t *testing.T) {
 
 func TestLineChainSemanticPatchAndArtifactCanonicalVector(t *testing.T) {
 	const (
-		sourceUUID  = "22222222-2222-4222-8222-222222222222"
-		targetUUID  = "11111111-1111-4111-8111-111111111111"
-		patchJSON   = `{"schema":"lattice.singbox-linechain-sidecar-patch.v1","source_line_uuid":"22222222-2222-4222-8222-222222222222","source_inbound_tag":"source-b","expected_downstream_line_uuid":null,"desired_downstream_line_uuid":"11111111-1111-4111-8111-111111111111"}`
-		patchSHA    = "7394c9367aa36d0e37e1e6bb70d3de70afc1d6792f56754741ba118ca2137188"
-		artifactSHA = "bb59094488756276a385921951eaac3e36dc604eb4a03c4cb2e1a52797aee261"
+		sourceUUID   = "22222222-2222-4222-8222-222222222222"
+		targetUUID   = "11111111-1111-4111-8111-111111111111"
+		patchJSON    = `{"schema":"lattice.singbox-linechain-sidecar-patch.v1","source_line_uuid":"22222222-2222-4222-8222-222222222222","source_inbound_tag":"source-b","expected_downstream_line_uuid":null,"desired_downstream_line_uuid":"11111111-1111-4111-8111-111111111111"}`
+		patchSHA     = "7394c9367aa36d0e37e1e6bb70d3de70afc1d6792f56754741ba118ca2137188"
+		artifactJSON = `{"schema":"lattice.singbox-linechain-artifact.v2","operation":"create","fragment_basename":"lattice-linechain-0123456789abcdef0123.json","previous_fragment_sha256":null,"fragment_sha256":"0000000000000000000000000000000000000000000000000000000000000000","sidecar_patch_sha256":"7394c9367aa36d0e37e1e6bb70d3de70afc1d6792f56754741ba118ca2137188"}`
+		artifactSHA  = "bb59094488756276a385921951eaac3e36dc604eb4a03c4cb2e1a52797aee261"
 	)
 	patch, raw, gotPatchSHA, err := canonicalLineChainSidecarPatch(strings.ToUpper(sourceUUID), "source-b", "", strings.ToUpper(targetUUID))
 	if err != nil {
@@ -409,14 +410,41 @@ func TestLineChainSemanticPatchAndArtifactCanonicalVector(t *testing.T) {
 		patch.DesiredDownstreamLineUUID == nil || *patch.DesiredDownstreamLineUUID != targetUUID {
 		t.Fatalf("canonical patch mismatch: raw=%s sha=%s patch=%+v", raw, gotPatchSHA, patch)
 	}
-	gotArtifactSHA, err := canonicalLineChainArtifact("create", "lattice-linechain-0123456789abcdef0123.json", "", strings.Repeat("0", 64), patchSHA)
-	if err != nil || gotArtifactSHA != artifactSHA {
-		t.Fatalf("canonical artifact mismatch: sha=%s err=%v", gotArtifactSHA, err)
+	artifactRaw, gotArtifactSHA, err := canonicalLineChainArtifactJSON("create", "lattice-linechain-0123456789abcdef0123.json", "", strings.Repeat("0", 64), patchSHA)
+	if err != nil || artifactRaw != artifactJSON || gotArtifactSHA != artifactSHA {
+		t.Fatalf("canonical artifact mismatch: raw=%s sha=%s err=%v", artifactRaw, gotArtifactSHA, err)
 	}
 	_, removeRaw, _, err := canonicalLineChainSidecarPatch(sourceUUID, "source-b", targetUUID, "")
 	if err != nil || !strings.Contains(removeRaw, `"expected_downstream_line_uuid":"`+targetUUID+`"`) ||
 		!strings.Contains(removeRaw, `"desired_downstream_line_uuid":null`) {
 		t.Fatalf("remove patch did not preserve explicit nullable CAS fields: raw=%s err=%v", removeRaw, err)
+	}
+}
+
+func TestLineChainArtifactOperationShapeMatchesAgent(t *testing.T) {
+	sha := strings.Repeat("a", 64)
+	tests := []struct {
+		name, operation, previous, fragment string
+		valid                               bool
+	}{
+		{name: "create", operation: "create", fragment: sha, valid: true},
+		{name: "create_with_previous", operation: "create", previous: sha, fragment: sha},
+		{name: "create_without_fragment", operation: "create"},
+		{name: "replace", operation: "replace", previous: sha, fragment: sha, valid: true},
+		{name: "replace_without_previous", operation: "replace", fragment: sha},
+		{name: "replace_without_fragment", operation: "replace", previous: sha},
+		{name: "remove", operation: "remove", previous: sha, valid: true},
+		{name: "remove_without_previous", operation: "remove"},
+		{name: "remove_with_fragment", operation: "remove", previous: sha, fragment: sha},
+		{name: "plan_operation", operation: "set", fragment: sha},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := canonicalLineChainArtifact(tc.operation, "lattice-linechain-0123456789abcdef0123.json", tc.previous, tc.fragment, sha)
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v err=%v", tc.valid, err)
+			}
+		})
 	}
 }
 

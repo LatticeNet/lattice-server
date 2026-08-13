@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/auth"
@@ -242,6 +243,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 // encrypted under a key that is no longer configured; that is reported as an
 // error instead of corrupting the value into the raw envelope string.
 func decryptState(st *State, c secret.Cipher) error {
+	for id, snapshot := range st.SubscriptionSnapshots {
+		if err := rejectMalformedSecretEnvelope(snapshot.Raw); err != nil {
+			return fmt.Errorf("decrypt subscription snapshot %s raw: %w", id, err)
+		}
+	}
+	for id, share := range st.SubscriptionShares {
+		if err := rejectMalformedSecretEnvelope(share.Token); err != nil {
+			return fmt.Errorf("decrypt subscription share %s token: %w", id, err)
+		}
+	}
 	if !c.Enabled() {
 		if stateHasEnvelope(st) {
 			return fmt.Errorf("state contains encrypted secrets but no master key is configured (set %s or %s)",
@@ -928,6 +939,9 @@ func encryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c 
 }
 
 func decryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c secret.Cipher) (model.SubscriptionShare, error) {
+	if err := rejectMalformedSecretEnvelope(share.Token); err != nil {
+		return model.SubscriptionShare{}, fmt.Errorf("decrypt subscription share %s token: %w", id, err)
+	}
 	if !c.Enabled() && secret.IsEnvelope(share.Token) {
 		return model.SubscriptionShare{}, lostMasterKeyError()
 	}
@@ -952,6 +966,9 @@ func encryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSna
 }
 
 func decryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSnapshot, c secret.Cipher) (model.SubscriptionSnapshot, error) {
+	if err := rejectMalformedSecretEnvelope(snapshot.Raw); err != nil {
+		return model.SubscriptionSnapshot{}, fmt.Errorf("decrypt subscription snapshot %s raw: %w", id, err)
+	}
 	if !c.Enabled() && secret.IsEnvelope(snapshot.Raw) {
 		return model.SubscriptionSnapshot{}, lostMasterKeyError()
 	}
@@ -961,6 +978,13 @@ func decryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSna
 	}
 	snapshot.Raw = raw
 	return snapshot, nil
+}
+
+func rejectMalformedSecretEnvelope(value string) error {
+	if strings.HasPrefix(value, "lat$") && !secret.IsEnvelope(value) {
+		return fmt.Errorf("malformed encrypted envelope")
+	}
+	return nil
 }
 
 func encryptOIDCAuthStateRecord(id string, authState auth.OIDCAuthState, c secret.Cipher) (auth.OIDCAuthState, error) {

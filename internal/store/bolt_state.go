@@ -183,6 +183,11 @@ func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
 	if cph == nil {
 		cph = secret.Disabled()
 	}
+	info, statErr := os.Stat(path)
+	preexisting := statErr == nil && info.Size() > 0
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return nil, statErr
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
@@ -191,9 +196,21 @@ func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
 		return nil, err
 	}
 	bs := &BoltStateStore{db: db, cipher: cph}
+	if preexisting {
+		if _, err := bs.exportState(false); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	if err := bs.ensureBuckets(); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if preexisting {
+		if _, err := bs.ExportState(); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	return bs, nil
 }
@@ -423,6 +440,10 @@ func resetBoltBuckets(tx *bolt.Tx) error {
 // ExportState reads every bbolt bucket and returns a decrypted, initialized
 // State. Values returned by bbolt are decoded inside the transaction.
 func (bs *BoltStateStore) ExportState() (State, error) {
+	return bs.exportState(true)
+}
+
+func (bs *BoltStateStore) exportState(migrate bool) (State, error) {
 	st := emptyState()
 	err := bs.db.View(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
@@ -470,7 +491,11 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 		if err := readMap(tx, boltBucketLineAudit, st.LineChainAuditEvidence); err != nil {
 			return err
 		}
-		if raw := tx.Bucket(boltBucketMeta).Get([]byte("line_chain_graph_revision")); len(raw) > 0 {
+		var raw []byte
+		if meta := tx.Bucket(boltBucketMeta); meta != nil {
+			raw = meta.Get([]byte("line_chain_graph_revision"))
+		}
+		if len(raw) > 0 {
 			revision, err := strconv.ParseUint(string(raw), 10, 64)
 			if err != nil {
 				return fmt.Errorf("decode line chain graph revision: %w", err)
@@ -598,7 +623,7 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 	if err := validateManagedLineCollections(st.ManagedLines, st.ManagedLineSecrets); err != nil {
 		return State{}, fmt.Errorf("invalid managed line secret collections: %w", err)
 	}
-	if migrateSubscriptionSecrets {
+	if migrate && migrateSubscriptionSecrets {
 		if err := bs.ImportState(st); err != nil {
 			return State{}, fmt.Errorf("migrate subscription secrets: %w", err)
 		}

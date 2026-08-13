@@ -136,6 +136,64 @@ func TestCorruptSubscriptionEnvelopeMakesNoMigrationWrite(t *testing.T) {
 	}
 }
 
+func TestMalformedSubscriptionEnvelopeMakesNoJSONOrBoltWrite(t *testing.T) {
+	for _, malformed := range []string{"lat$", "lat$not-base64", "lat$YWJj"} {
+		t.Run(malformed, func(t *testing.T) {
+			jsonPath := filepath.Join(t.TempDir(), "state.json")
+			legacy := emptyState()
+			legacy.SubscriptionSnapshots["p/s"] = model.SubscriptionSnapshot{SchemaVersion: 1, PluginID: "p", SubscriptionID: "s", Raw: malformed}
+			raw, err := json.Marshal(legacy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(jsonPath, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			wantJSON := sha256.Sum256(raw)
+			if _, err := OpenWithCipher(jsonPath, testCipher(t)); err == nil {
+				t.Fatal("malformed JSON envelope accepted")
+			}
+			afterJSON, err := os.ReadFile(jsonPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := sha256.Sum256(afterJSON); got != wantJSON {
+				t.Fatalf("failed JSON open changed digest: %x != %x", got, wantJSON)
+			}
+
+			boltPath := filepath.Join(t.TempDir(), "state.db")
+			bs, err := OpenBoltState(boltPath, testCipher(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := bs.db.Update(func(tx *bolt.Tx) error {
+				return putRecord(tx, boltBucketSubSnapshots, "p/s", legacy.SubscriptionSnapshots["p/s"])
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := bs.Close(); err != nil {
+				t.Fatal(err)
+			}
+			beforeBolt, err := os.ReadFile(boltPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBolt := sha256.Sum256(beforeBolt)
+			if reopened, err := OpenBoltState(boltPath, testCipher(t)); err == nil {
+				reopened.Close()
+				t.Fatal("malformed Bolt envelope accepted")
+			}
+			afterBolt, err := os.ReadFile(boltPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := sha256.Sum256(afterBolt); got != wantBolt {
+				t.Fatalf("failed Bolt open changed digest: %x != %x", got, wantBolt)
+			}
+		})
+	}
+}
+
 func TestLegacyPlaintextSubscriptionSecretsMigrateInOneBoltUpdate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	bs, err := OpenBoltState(path, testCipher(t))

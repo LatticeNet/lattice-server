@@ -23,3 +23,13 @@ func TestValidateStdioJSONV2FrameCorrelation(t *testing.T) {
 		})
 	}
 }
+
+func TestDecodeStrictV2RejectsDuplicateAndTrailing(t *testing.T) {
+	var f stdioJSONV2Frame
+	if err := decodeStrictV2([]byte(`{"protocol":2,"protocol":2,"kind":"runtime_ready"}`), &f); err == nil {
+		t.Fatal("duplicate key accepted")
+	}
+	if err := decodeStrictV2([]byte(`{"protocol":2,"kind":"runtime_ready"}{}`), &f); err == nil {
+		t.Fatal("trailing frame accepted")
+	}
+}

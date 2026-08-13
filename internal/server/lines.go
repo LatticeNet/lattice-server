@@ -93,6 +93,24 @@ func stableLineHandle(lineID string) string {
 	return "line_" + lineID
 }
 
+// buildLineUUIDReverseIndex builds the persistent sidecar authority once.
+// Empty values denote ambiguous UUIDs and therefore never resolve.
+func buildLineUUIDReverseIndex(entries []model.KVEntry) map[string]string {
+	index := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		uuid := strings.ToLower(strings.TrimSpace(entry.Value))
+		if uuid == "" {
+			continue
+		}
+		if _, exists := index[uuid]; exists {
+			index[uuid] = ""
+		} else {
+			index[uuid] = entry.Key
+		}
+	}
+	return index
+}
+
 func validLineUUIDv4(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if !proxyUUIDRe.MatchString(value) || value[14] != '4' {
@@ -219,18 +237,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// known. Newer discovery sources also include listen_host / outbound_ref /
 	// user_count from runtime config inspection; older agents leave them empty
 	// and UserKnown=false.
-	uuidToHash := make(map[string]string)
-	for _, entry := range s.store.KV(lineUUIDKVBucket) {
-		uuid := strings.ToLower(strings.TrimSpace(entry.Value))
-		if uuid == "" {
-			continue
-		}
-		if _, exists := uuidToHash[uuid]; exists {
-			uuidToHash[uuid] = ""
-		} else {
-			uuidToHash[uuid] = entry.Key
-		}
-	}
+	uuidToHash := buildLineUUIDReverseIndex(s.store.KV(lineUUIDKVBucket))
 	for _, inv := range s.liveSingBoxInventories(s.now()) {
 		for _, n := range inv.Nodes {
 			port, _ := strconv.Atoi(strings.TrimSpace(n.Port))

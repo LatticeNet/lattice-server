@@ -454,9 +454,13 @@ func (s *Server) createAgentUpdateApproval(ctx context.Context, nodeID, actorID 
 	if err != nil {
 		return model.Approval{}, err
 	}
-	cmp, comparable := compareAgentVersions(strings.TrimSpace(node.AgentVersion), payload.TargetVersion)
+	currentVersion := strings.TrimSpace(node.AgentVersion)
+	cmp, comparable := 0, true
+	if currentVersion != "" {
+		cmp, comparable = compareAgentVersions(currentVersion, payload.TargetVersion)
+	}
 	if !force && !comparable {
-		return model.Approval{}, fmt.Errorf("unsupported agent version syntax: current=%q target=%q", strings.TrimSpace(node.AgentVersion), payload.TargetVersion)
+		return model.Approval{}, fmt.Errorf("unsupported agent version syntax: current=%q target=%q", currentVersion, payload.TargetVersion)
 	}
 	if !force && cmp > 0 {
 		return model.Approval{}, fmt.Errorf("refusing to plan agent downgrade from %s to %s", strings.TrimSpace(node.AgentVersion), payload.TargetVersion)

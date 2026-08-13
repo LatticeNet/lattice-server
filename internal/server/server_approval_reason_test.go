@@ -86,9 +86,9 @@ func TestApprovalDisplayReason(t *testing.T) {
 			want:     "Apply nftables ruleset",
 		},
 		{
-			name:     "nft ruleset from netguard shares the sentence",
-			approval: model.Approval{Plugin: "nft", Action: "apply-ruleset", Plan: "table inet lattice_guard {}", ActorID: "user-1"},
-			want:     "Apply nftables ruleset",
+			name:     "netguard ruleset is distinguishable from legacy nft",
+			approval: model.Approval{Plugin: "nft", Action: netGuardApprovalAction, Plan: "table inet lattice_guard {}", ActorID: "user-1"},
+			want:     "Apply NetGuard nftables ruleset",
 		},
 		{
 			name:     "nftpolicy bare action",

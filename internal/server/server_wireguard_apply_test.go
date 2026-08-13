@@ -134,6 +134,7 @@ func TestApplyScriptsAreValidShell(t *testing.T) {
 	}{
 		{"wireguard", model.Approval{Plugin: "wireguard", Plan: testWGPlan}},
 		{"nft", model.Approval{Plugin: "nft", Plan: "table inet lattice_guard {\n}\n"}},
+		{"netguard", model.Approval{Plugin: "nft", Action: netGuardApprovalAction, Plan: "table inet lattice_guard {\n}\n"}},
 	}
 	for _, tc := range cases {
 		for _, serverURL := range []string{"", "https://203.0.113.99"} {

@@ -4,7 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"regexp"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,6 +43,35 @@ type nodeGuardView struct {
 	Groups   []securityGroupView    `json:"groups"`
 	Zones    []model.GuardZone      `json:"zones"`
 }
+
+type netGuardReplanInput struct {
+	NodeID            string `json:"node_id"`
+	AcceptLockoutRisk bool   `json:"accept_lockout_risk"`
+}
+
+type netGuardReview struct {
+	Node        nodeGuardView         `json:"node"`
+	Reality     guardRealityDetail    `json:"reality"`
+	Suggestions []netguard.Suggestion `json:"suggestions"`
+	DriftState  string                `json:"drift_state"`
+	ReplanInput netGuardReplanInput   `json:"replan_input"`
+}
+
+type netGuardReviewResponse struct {
+	Review netGuardReview `json:"review"`
+}
+
+const (
+	netGuardDriftUnknown  = "unknown"
+	netGuardDriftInSync   = "in_sync"
+	netGuardDriftDetected = "drift"
+
+	// Keep the historical apply-ruleset prefix so existing opt-in
+	// auto-approval policies continue to match, while the exact suffix keeps
+	// NetGuard writeback/capability handling distinct from legacy plain nft.
+	netGuardApprovalAction         = "apply-ruleset:netguard-v1"
+	netGuardManagedSHAResultPrefix = "lattice netguard: managed_sha="
+)
 
 // guardIDRe bounds operator-chosen group and zone ids to a charset that is
 // safe wherever they surface (nft comments, routes, audit metadata).
@@ -150,6 +182,106 @@ func (s *Server) handleNetGuardNodes(w http.ResponseWriter, r *http.Request, p p
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": views})
 }
 
+func (s *Server) handleNetGuardReview(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	nodeID := strings.TrimSpace(r.URL.Query().Get("node_id"))
+	if nodeID == "" {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "node_id is required"))
+		return
+	}
+	if !rbac.Allows(p.Principal, "netguard:read", nodeID) {
+		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "not found"))
+		return
+	}
+	input, node, err := s.compileInputSnapshotFor(nodeID)
+	if err != nil {
+		if errors.Is(err, store.ErrNetGuardCompileNodeNotFound) {
+			writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "not found"))
+			return
+		}
+		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, err.Error()))
+		return
+	}
+	reality := s.guardRealityDetailForNode(nodeID, s.now().UTC())
+	suggestions := make([]netguard.Suggestion, 0)
+	if reality.Reality != nil {
+		suggestions, err = netguard.Suggest(netguard.SuggestInput{
+			Binding: input.Binding,
+			Groups:  input.Groups,
+			Zones:   input.Zones,
+			Reality: *reality.Reality,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, netGuardReviewResponse{Review: netGuardReview{
+		Node:        netGuardViewFromCompileInput(input, node.Name),
+		Reality:     reality,
+		Suggestions: suggestions,
+		DriftState:  netGuardDriftState(input.Binding, reality.Reality),
+		ReplanInput: netGuardReplanInput{NodeID: nodeID},
+	}})
+}
+
+func netGuardViewFromCompileInput(input netguard.CompileInput, nodeName string) nodeGuardView {
+	groups := make([]securityGroupView, 0, len(input.Groups))
+	for _, group := range input.Groups {
+		groups = append(groups, securityGroupView{SecurityGroup: group, Source: netGuardSourceStored})
+	}
+	zoneIDs := map[string]bool{
+		model.GuardZonePublic:    true,
+		model.GuardZoneWireGuard: true,
+	}
+	for _, zoneID := range input.Binding.ZoneIDs {
+		zoneIDs[zoneID] = true
+	}
+	collectRuleZoneIDs := func(rules []model.GuardRule) {
+		for _, rule := range rules {
+			if rule.Remote.Kind == model.NetRefZone && rule.Remote.ZoneID != "" {
+				zoneIDs[rule.Remote.ZoneID] = true
+			}
+		}
+	}
+	collectRuleZoneIDs(input.Binding.Overrides)
+	for _, group := range input.Groups {
+		collectRuleZoneIDs(group.Rules)
+	}
+	orderedZoneIDs := make([]string, 0, len(zoneIDs))
+	for zoneID := range zoneIDs {
+		orderedZoneIDs = append(orderedZoneIDs, zoneID)
+	}
+	sort.Strings(orderedZoneIDs)
+	zones := make([]model.GuardZone, 0, len(orderedZoneIDs))
+	for _, zoneID := range orderedZoneIDs {
+		if zone, ok := input.Zones[zoneID]; ok {
+			zones = append(zones, zone)
+		}
+	}
+	return nodeGuardView{
+		NodeID:   input.Binding.NodeID,
+		NodeName: nodeName,
+		Binding:  input.Binding,
+		Source:   netGuardSourceStored,
+		Groups:   groups,
+		Zones:    zones,
+	}
+}
+
+func netGuardDriftState(binding model.NodeGuardBinding, reality *model.GuardNodeReality) string {
+	if reality == nil || strings.TrimSpace(binding.AppliedTableSHA) == "" || strings.TrimSpace(reality.ManagedSHA) == "" {
+		return netGuardDriftUnknown
+	}
+	if strings.EqualFold(binding.AppliedTableSHA, reality.ManagedSHA) {
+		return netGuardDriftInSync
+	}
+	return netGuardDriftDetected
+}
+
 func (s *Server) storedNodeGuardView(binding model.NodeGuardBinding) nodeGuardView {
 	groups := make([]securityGroupView, 0, len(binding.GroupIDs))
 	for _, groupID := range binding.GroupIDs {
@@ -207,11 +339,15 @@ func (s *Server) requireGlobalNetGuardScope(w http.ResponseWriter, p principal, 
 // mesh CIDR. Operator-authored zones (e.g. a tailscale zone pinning
 // tailscale0) are used verbatim.
 func (s *Server) resolveNodeZones(nodeID string) map[string]model.GuardZone {
-	zones := netguard.ZoneMap(s.store.GuardZones())
+	inputs, hasInputs := s.store.NFTInputs(nodeID)
+	return resolveNodeZonesFrom(s.store.GuardZones(), inputs, hasInputs)
+}
+
+func resolveNodeZonesFrom(guardZones []model.GuardZone, inputs model.NFTInputs, hasInputs bool) map[string]model.GuardZone {
+	zones := netguard.ZoneMap(guardZones)
 	if zones == nil {
 		zones = map[string]model.GuardZone{}
 	}
-	inputs, hasInputs := s.store.NFTInputs(nodeID)
 
 	public := zones[model.GuardZonePublic]
 	public.ID, public.Name, public.Builtin = model.GuardZonePublic, "public", true
@@ -244,24 +380,25 @@ func (s *Server) resolveNodeZones(nodeID string) map[string]model.GuardZone {
 }
 
 func (s *Server) compileInputFor(nodeID string) (netguard.CompileInput, error) {
-	binding, ok := s.store.NodeGuardBinding(nodeID)
-	if !ok {
-		return netguard.CompileInput{}, fmt.Errorf("node %q has no guard binding; adopt it first", nodeID)
+	input, _, err := s.compileInputSnapshotFor(nodeID)
+	return input, err
+}
+
+func (s *Server) compileInputSnapshotFor(nodeID string) (netguard.CompileInput, model.Node, error) {
+	snapshot, err := s.store.NetGuardCompileSnapshot(nodeID)
+	if err != nil {
+		return netguard.CompileInput{}, model.Node{}, err
 	}
-	groups := make([]model.SecurityGroup, 0, len(binding.GroupIDs))
-	for _, groupID := range binding.GroupIDs {
-		group, ok := s.store.SecurityGroup(groupID)
-		if !ok {
-			return netguard.CompileInput{}, fmt.Errorf("security group %q not found", groupID)
-		}
-		groups = append(groups, group)
-	}
+	nodes := snapshot.Nodes
 	return netguard.CompileInput{
-		Binding: binding,
-		Groups:  groups,
-		Zones:   s.resolveNodeZones(nodeID),
-		Resolve: s.resolveNode,
-	}, nil
+		Binding: snapshot.Binding,
+		Groups:  snapshot.Groups,
+		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
+		Resolve: func(id string) (model.Node, bool) {
+			node, ok := nodes[id]
+			return node, ok
+		},
+	}, snapshot.Node, nil
 }
 
 func (s *Server) handleUpsertSecurityGroup(w http.ResponseWriter, r *http.Request, p principal) {
@@ -478,6 +615,7 @@ func (s *Server) handleNetGuardBindings(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	req = s.serverAuthoritativeGuardBinding(req)
 	saved, err := s.store.UpsertNodeGuardBinding(req)
 	if err != nil {
 		if errors.Is(err, store.ErrGuardVersionConflict) {
@@ -492,6 +630,39 @@ func (s *Server) handleNetGuardBindings(w http.ResponseWriter, r *http.Request, 
 		Metadata: map[string]string{"node_id": req.NodeID},
 	})
 	writeJSON(w, http.StatusOK, s.storedNodeGuardView(saved))
+}
+
+func (s *Server) serverAuthoritativeGuardBinding(req model.NodeGuardBinding) model.NodeGuardBinding {
+	existing, ok := s.store.NodeGuardBinding(req.NodeID)
+	if !ok {
+		req.LastPlanSHA = ""
+		req.LastAppliedAt = time.Time{}
+		req.LastError = ""
+		req.AppliedTableSHA = ""
+		return req
+	}
+	intentChanged := !guardBindingIntentEqual(existing, req)
+	req.LastPlanSHA = existing.LastPlanSHA
+	req.LastAppliedAt = existing.LastAppliedAt
+	req.LastError = existing.LastError
+	req.AppliedTableSHA = existing.AppliedTableSHA
+	if intentChanged {
+		req.LastPlanSHA = ""
+		req.LastError = "binding changed since the last plan; create a new plan before applying"
+	}
+	return req
+}
+
+func guardBindingIntentEqual(a, b model.NodeGuardBinding) bool {
+	if a.Managed != b.Managed || !slices.Equal(a.GroupIDs, b.GroupIDs) || !slices.Equal(a.ZoneIDs, b.ZoneIDs) || len(a.Overrides) != len(b.Overrides) {
+		return false
+	}
+	for i := range a.Overrides {
+		if !reflect.DeepEqual(a.Overrides[i], b.Overrides[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // handleNetGuardAdopt materializes a node's converted legacy baseline into
@@ -602,11 +773,22 @@ func (s *Server) handleNetGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 		ID:        id.New("approval"),
 		NodeID:    req.NodeID,
 		Plugin:    "nft",
-		Action:    "apply-ruleset",
+		Action:    netGuardApprovalAction,
 		Plan:      ruleset,
 		Status:    model.ApprovalPending,
 		ActorID:   p.ActorID,
 		CreatedAt: time.Now().UTC(),
+	}
+	binding := input.Binding
+	binding.LastPlanSHA = approvalPlanSHA(approval)
+	binding.LastError = ""
+	if _, err := s.store.UpsertNodeGuardBinding(binding); err != nil {
+		if errors.Is(err, store.ErrGuardVersionConflict) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	approval, err = s.submitApproval(r.Context(), approval)
 	if err != nil {
@@ -625,4 +807,156 @@ func (s *Server) handleNetGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 		ID: id.New("audit"), NodeID: req.NodeID, Action: "netguard.plan", Scope: "network:plan", Metadata: metadata,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"approval": approval, "findings": findings})
+}
+
+func (s *Server) requireCurrentNetGuardApproval(approval model.Approval) error {
+	if !isNetGuardApproval(approval) {
+		return nil
+	}
+	binding, ok := s.store.NodeGuardBinding(approval.NodeID)
+	if !ok {
+		return fmt.Errorf("netguard binding %q not found; re-plan before approving", approval.NodeID)
+	}
+	planSHA := approvalPlanSHA(approval)
+	if binding.LastPlanSHA == "" || !strings.EqualFold(binding.LastPlanSHA, planSHA) {
+		return errors.New("netguard binding changed since this plan was created; re-plan before approving")
+	}
+	currentSHA, err := s.currentNetGuardPlanSHA(approval.NodeID)
+	if err != nil {
+		return fmt.Errorf("current netguard intent cannot be compiled: %w", err)
+	}
+	if !strings.EqualFold(currentSHA, planSHA) {
+		return errors.New("netguard binding dependencies changed since this plan was created; re-plan before approving")
+	}
+	return nil
+}
+
+func isNetGuardApproval(approval model.Approval) bool {
+	return approval.Plugin == "nft" && approval.Action == netGuardApprovalAction
+}
+
+func (s *Server) currentNetGuardPlanSHA(nodeID string) (string, error) {
+	input, err := s.compileInputFor(nodeID)
+	if err != nil {
+		return "", err
+	}
+	compiled, err := netguard.Compile(input)
+	if err != nil {
+		return "", err
+	}
+	ruleset, err := network.GenerateNFTPlan(compiled)
+	if err != nil {
+		return "", err
+	}
+	return approvalPlanSHA(model.Approval{Plan: ruleset}), nil
+}
+
+func (s *Server) handleNetGuardTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {
+	const maxTransitionAttempts = 4
+	for attempt := 0; attempt < maxTransitionAttempts; attempt++ {
+		currentApproval, ok := s.store.Approval(approval.ID)
+		if !ok || !isNetGuardApproval(currentApproval) {
+			return store.ErrTaskNotFound
+		}
+		binding, ok := s.store.NodeGuardBinding(currentApproval.NodeID)
+		if !ok {
+			return store.ErrGuardVersionConflict
+		}
+		planSHA := approvalPlanSHA(currentApproval)
+		metadata := map[string]string{
+			"approval_id": currentApproval.ID,
+			"task_id":     task.ID,
+			"plan_sha":    planSHA,
+		}
+
+		reason := ""
+		if binding.LastPlanSHA == "" || !strings.EqualFold(binding.LastPlanSHA, planSHA) {
+			if strings.Contains(binding.LastError, "dependency changed") {
+				reason = "task result belongs to a stale netguard plan after a binding dependency changed; re-plan before applying"
+			} else {
+				reason = "task result belongs to a stale netguard plan; re-plan before applying the current binding"
+			}
+		} else if currentSHA, err := s.currentNetGuardPlanSHA(currentApproval.NodeID); err != nil {
+			reason = "task result belongs to stale netguard intent that no longer compiles: " + err.Error()
+		} else if !strings.EqualFold(currentSHA, planSHA) {
+			reason = "task result belongs to a stale netguard plan after a binding dependency changed; re-plan before applying"
+		} else if result.Error != "" || result.ExitCode != 0 {
+			reason = taskFailureSummary(result)
+		}
+
+		managedSHA := ""
+		if reason == "" {
+			var err error
+			managedSHA, err = netGuardManagedSHAFromTaskResult(result.Stdout)
+			if err != nil {
+				reason = err.Error()
+			}
+		}
+		if result.FinishedAt.IsZero() {
+			result.FinishedAt = time.Now().UTC()
+		}
+		if reason == "" {
+			binding.LastAppliedAt = result.FinishedAt
+			binding.LastError = ""
+			binding.AppliedTableSHA = managedSHA
+			currentApproval.Status = model.ApprovalApplied
+			currentApproval.Reason = ""
+			metadata["managed_sha"] = managedSHA
+		} else {
+			reason = strings.TrimSpace(reason)
+			if reason == "" {
+				reason = "netguard apply failed"
+			}
+			binding.LastError = reason
+			currentApproval.Status = model.ApprovalRejected
+			currentApproval.Reason = truncateMetadataValue(reason, 240)
+		}
+
+		committed, err := s.store.CompleteNetGuardTaskResult(result, currentApproval, binding)
+		if committed {
+			if err != nil {
+				s.logger.Printf("netguard task result committed with degraded durability: %v", err)
+				// The exact transition is visible for idempotent retry, but the agent
+				// must retain its result journal until a later request confirms the
+				// state-file directory entry and receives HTTP 200.
+				return err
+			}
+			action, decision := "netguard.apply.applied", "allow"
+			if reason != "" {
+				action, decision = "netguard.apply.failed", "deny"
+			}
+			s.recordRequestAudit(r, model.AuditEvent{
+				ID: id.New("audit"), NodeID: currentApproval.NodeID, Action: action,
+				Decision: decision, Reason: reason, Metadata: metadata,
+			})
+			return nil
+		}
+		if errors.Is(err, store.ErrGuardVersionConflict) {
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("netguard binding changed repeatedly while recording task result: %w", store.ErrGuardVersionConflict)
+}
+
+func netGuardManagedSHAFromTaskResult(stdout string) (string, error) {
+	managedSHA := ""
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, netGuardManagedSHAResultPrefix) {
+			continue
+		}
+		candidate := strings.TrimSpace(strings.TrimPrefix(line, netGuardManagedSHAResultPrefix))
+		if managedSHA != "" {
+			return "", errors.New("successful netguard task returned multiple canonical managed-table hashes")
+		}
+		managedSHA = candidate
+	}
+	if managedSHA == "" {
+		return "", errors.New("successful netguard task did not return the canonical managed-table hash")
+	}
+	if !isLowerHex64(managedSHA) {
+		return "", errors.New("successful netguard task returned an invalid canonical managed-table hash")
+	}
+	return managedSHA, nil
 }

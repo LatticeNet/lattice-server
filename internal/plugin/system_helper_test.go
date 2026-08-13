@@ -67,6 +67,29 @@ func TestRealV2StalledHostCallCancellationReaps(t *testing.T) {
 	}
 }
 
+func TestTransportWaitOrders(t *testing.T) {
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1")
+	a, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	_ = a.abort()
+	_ = a.wait()
+	env = append(env, "LATTICE_TEST_V2_EXIT_AFTER_READY=1")
+	b, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	_ = b.wait()
+	_ = b.abort()
+}
+
 func TestRealV2MalformedReadyPreservesReply(t *testing.T) {
 	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_BAD_READY=1")
 	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)

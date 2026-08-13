@@ -30,13 +30,14 @@ type pooledWorker struct {
 // systemPool provides generation-fenced FIFO leases. Process transport is
 // deliberately supplied by the runner; this type owns lifecycle invariants.
 type systemPool struct {
-	mu         sync.Mutex
-	generation uint64
-	workers    []*pooledWorker
-	waiters    []chan *pooledWorker
-	maxUses    int
-	maxAge     time.Duration
-	closed     bool
+	mu          sync.Mutex
+	generation  uint64
+	workers     []*pooledWorker
+	waiters     []chan *pooledWorker
+	maxUses     int
+	maxAge      time.Duration
+	maxOverflow int
+	closed      bool
 }
 
 func (p *systemPool) hasTransport() bool {
@@ -61,7 +62,7 @@ func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *sy
 	if len(generations) > 0 && generations[0] != 0 {
 		generation = generations[0]
 	}
-	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation}
+	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1}
 }
 
 func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error {
@@ -166,6 +167,9 @@ func (p *systemPool) drain(generation uint64) {
 	p.generation++
 	for _, w := range p.workers {
 		w.state = workerRetiring
+		if w.transport != nil {
+			_ = w.transport.abort()
+		}
 		w.state = workerDead
 	}
 	p.workers = nil

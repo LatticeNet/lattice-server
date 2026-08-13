@@ -39,14 +39,18 @@ type systemPool struct {
 	closed     bool
 }
 
-func newSystemPool(maxUses int, maxAge time.Duration) *systemPool {
+func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *systemPool {
 	if maxUses <= 0 {
 		maxUses = 256
 	}
 	if maxAge <= 0 {
 		maxAge = time.Hour
 	}
-	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: 1}
+	generation := uint64(1)
+	if len(generations) > 0 && generations[0] != 0 {
+		generation = generations[0]
+	}
+	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation}
 }
 
 func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error {

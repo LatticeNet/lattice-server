@@ -146,7 +146,7 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	}
 
 	r.mu.Lock()
-	pool := newSystemPool(256, time.Hour)
+	pool := newSystemPool(256, time.Hour, req.Generation)
 	if req.Loaded.Manifest.Runtime != nil && req.Loaded.Manifest.Runtime.Protocol == RuntimeProtocolStdioJSONV2 {
 		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.childEnv())

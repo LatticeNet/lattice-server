@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"reflect"
 	"syscall"
 	"testing"
 	"time"
@@ -14,12 +16,13 @@ const retirementTestPluginID = "p.test"
 
 func TestSystemRunnerPoolRetiresPostResultReadyFailures(t *testing.T) {
 	cases := []struct {
-		name string
-		flag string
+		name      string
+		flag      string
+		resultKey string
 	}{
-		{name: "NO_READY", flag: "LATTICE_TEST_V2_NO_READY=1"},
-		{name: "MALFORMED_READY", flag: "LATTICE_TEST_V2_MALFORMED_READY=1"},
-		{name: "BAD_READY", flag: "LATTICE_TEST_V2_BAD_READY=1"},
+		{name: "NO_READY", flag: "LATTICE_TEST_V2_NO_READY=1", resultKey: "once"},
+		{name: "MALFORMED_READY", flag: "LATTICE_TEST_V2_MALFORMED_READY=1", resultKey: "helper"},
+		{name: "BAD_READY", flag: "LATTICE_TEST_V2_BAD_READY=1", resultKey: "helper"},
 	}
 
 	for _, tc := range cases {
@@ -47,11 +50,18 @@ func TestSystemRunnerPoolRetiresPostResultReadyFailures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("first Invoke: %v", err)
 			}
-			if !first.OK || len(first.Warnings) == 0 {
+			if !first.OK {
 				t.Fatalf("first response did not preserve terminal result and warning: %+v", first)
+			}
+			if len(first.Warnings) != 1 || first.Warnings[0] != "persistent worker retired after terminal protocol failure" {
+				t.Fatalf("first warnings=%q, want deterministic retirement warning", first.Warnings)
 			}
 			if got := resultPID(t, first.Result); got != badPID {
 				t.Fatalf("first result pid=%d, want retired pid=%d", got, badPID)
+			}
+			wantResult := json.RawMessage(`{"` + tc.resultKey + `":true,"pid":` + fmt.Sprint(badPID) + `}`)
+			if !jsonEqual(first.Result, wantResult) {
+				t.Fatalf("first result=%s, want exact business payload %s", first.Result, wantResult)
 			}
 			assertProcessGroupGone(t, badPID)
 
@@ -65,6 +75,13 @@ func TestSystemRunnerPoolRetiresPostResultReadyFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+func jsonEqual(got, want json.RawMessage) bool {
+	var gotValue, wantValue any
+	return json.Unmarshal(got, &gotValue) == nil &&
+		json.Unmarshal(want, &wantValue) == nil &&
+		reflect.DeepEqual(gotValue, wantValue)
 }
 
 func TestSystemRunnerPoolCancellationAtObservedHostCallReaps(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -495,5 +496,41 @@ func TestManagedLineRPCManagedAndRollout(t *testing.T) {
 	// private key anywhere.
 	if raw, _ := json.Marshal(view); strings.Contains(string(raw), "private") {
 		t.Fatalf("managed view leaks key material: %s", raw)
+	}
+}
+
+// The activation gate (design-18 E1): a plugin whose required dependency is
+// missing, inactive, or out of range must not arm.
+func TestUnmetActiveDependencies(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	seed := []model.PluginInstallation{
+		{ID: "dep.active", Version: "0.8.0-alpha.7", Status: model.PluginStatusActive},
+		{ID: "dep.inactive", Version: "1.0.0", Status: model.PluginStatusDisabled},
+		{ID: "dep.old", Version: "0.7.0", Status: model.PluginStatusActive},
+	}
+	for _, inst := range seed {
+		if err := srv.store.UpsertPluginInstallation(inst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifest := plugin.Manifest{ID: "p.test", Dependencies: []plugin.DependencySpec{
+		{ID: "dep.active", Version: ">=0.8.0-alpha.5"},
+		{ID: "dep.inactive"},
+		{ID: "dep.old", Version: ">=0.8.0"},
+		{ID: "dep.missing"},
+		{ID: "dep.optional-ghost", Optional: true},
+	}}
+	unmet := srv.unmetActiveDependencies(manifest)
+	if len(unmet) != 3 {
+		t.Fatalf("unmet = %v, want 3 entries (inactive, old, missing)", unmet)
+	}
+	joined := strings.Join(unmet, ", ")
+	for _, want := range []string{"dep.inactive (not active)", "dep.old (installed 0.7.0, need >=0.8.0)", "dep.missing (not installed)"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("unmet missing %q in %q", want, joined)
+		}
+	}
+	if strings.Contains(joined, "dep.active") || strings.Contains(joined, "optional-ghost") {
+		t.Fatalf("satisfied/optional deps must not appear: %q", joined)
 	}
 }

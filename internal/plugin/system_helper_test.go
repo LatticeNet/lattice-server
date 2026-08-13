@@ -2,10 +2,14 @@ package plugin
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -14,6 +18,27 @@ func TestMain(m *testing.M) {
 		return
 	}
 	os.Exit(m.Run())
+}
+
+func TestRealV2ResultWithoutReadyPreservesReplyAndReaps(t *testing.T) {
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_NO_READY=1")
+	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	rsp, err := tr.invokeV2(ctx, 1, "nr", InvokeRequest{Action: "x"}, nil)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || !rsp.OK {
+		t.Fatalf("reply=%+v err=%v", rsp, err)
+	}
+	_ = tr.abort()
+	if err := syscall.Kill(-tr.pgid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("pgid still alive: %v", err)
+	}
 }
 
 func runV2Helper() {

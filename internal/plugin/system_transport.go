@@ -20,23 +20,31 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 		Action  string          `json:"action"`
 		Payload json.RawMessage `json:"payload,omitempty"`
 	}{req.Action, req.Payload})
-	if err := json.NewEncoder(t.stdin).Encode(frame); err != nil {
-		return systemRunnerReply{}, err
-	}
-	lines := make(chan []byte, 1)
-	scanErr := make(chan error, 1)
-	go func() {
-		if t.scanner.Scan() {
-			lines <- append([]byte(nil), t.scanner.Bytes()...)
-			return
+	write := make(chan error, 1)
+	go func() { write <- json.NewEncoder(t.stdin).Encode(frame) }()
+	select {
+	case err := <-write:
+		if err != nil {
+			return systemRunnerReply{}, err
 		}
-		scanErr <- io.ErrUnexpectedEOF
-	}()
+	case <-ctx.Done():
+		_ = t.abort()
+		return systemRunnerReply{}, ctx.Err()
+	}
 	for {
+		lines := make(chan []byte, 1)
+		errs := make(chan error, 1)
+		go func() {
+			if t.scanner.Scan() {
+				lines <- append([]byte(nil), t.scanner.Bytes()...)
+				return
+			}
+			errs <- io.ErrUnexpectedEOF
+		}()
 		var line []byte
 		select {
 		case line = <-lines:
-		case err := <-scanErr:
+		case err := <-errs:
 			return systemRunnerReply{}, err
 		case <-ctx.Done():
 			_ = t.abort()
@@ -75,14 +83,38 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 		if err := json.Unmarshal(f.Response, &reply); err != nil {
 			return systemRunnerReply{}, err
 		}
-		if !t.scanner.Scan() {
-			return systemRunnerReply{}, io.ErrUnexpectedEOF
+		if f.Kind == "invoke_ready" {
+			return systemRunnerReply{}, fmt.Errorf("invoke_ready before result")
 		}
-		var ready stdioJSONV2Frame
-		if err := decodeStrictV2(t.scanner.Bytes(), &ready); err != nil || ready.Kind != "invoke_ready" || ready.Protocol != 2 || ready.Generation != generation || ready.InvocationID != invocation {
-			return systemRunnerReply{}, fmt.Errorf("missing invoke_ready")
+		if f.Kind == "invoke_result" {
+			for {
+				lines := make(chan []byte, 1)
+				errs := make(chan error, 1)
+				go func() {
+					if t.scanner.Scan() {
+						lines <- append([]byte(nil), t.scanner.Bytes()...)
+					} else {
+						errs <- io.ErrUnexpectedEOF
+					}
+				}()
+				select {
+				case line = <-lines:
+				case err := <-errs:
+					return systemRunnerReply{}, err
+				case <-ctx.Done():
+					_ = t.abort()
+					return systemRunnerReply{}, ctx.Err()
+				}
+				var ready stdioJSONV2Frame
+				if err := decodeStrictV2(line, &ready); err != nil {
+					return systemRunnerReply{}, err
+				}
+				if ready.Kind == "invoke_ready" && ready.Generation == generation && ready.InvocationID == invocation {
+					return reply, nil
+				}
+				return systemRunnerReply{}, fmt.Errorf("missing invoke_ready")
+			}
 		}
-		return reply, nil
 	}
 	return systemRunnerReply{}, io.ErrUnexpectedEOF
 }

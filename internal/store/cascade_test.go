@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -393,7 +394,7 @@ func TestDeleteNodeUnknownIsIdempotent(t *testing.T) {
 
 func seedLineChainCascade(t *testing.T, lease bool) (*Store, model.Approval, model.Task, string) {
 	t.Helper()
-	s, err := Open("")
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,4 +477,42 @@ func TestDeleteTargetNodePreservesIssuedCandidateAndPromotesTargetMissing(t *tes
 	if definition.TargetLineUUID != "target-line" || definition.Status != LineChainStatusDrifted || definition.DriftCode != "target_missing" || s.LineChainSnapshot().Revision != 3 {
 		t.Fatalf("frozen target authority was not retained: %+v snapshot=%+v", definition, s.LineChainSnapshot())
 	}
+}
+
+func TestDeleteNodeLineChainCascadePersistenceBoundaries(t *testing.T) {
+	t.Run("source_before_lease_pre_rename_failure_publishes_nothing", func(t *testing.T) {
+		s, approval, task, _ := seedLineChainCascade(t, false)
+		before := s.LineChainSnapshot()
+		if err := os.Mkdir(s.path+".tmp", 0o700); err != nil {
+			t.Fatal(err)
+		}
+		report, ok, err := s.DeleteNode("source-node")
+		if !ok || err == nil || report.LineChainAttemptsReleased != 1 {
+			t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+		}
+		gotApproval, _ := s.Approval(approval.ID)
+		gotTask, _ := s.Task(task.ID)
+		if _, found := s.Node("source-node"); !found || !reflect.DeepEqual(before, s.LineChainSnapshot()) || gotApproval.Status != model.ApprovalApproved || gotTask.Status != model.TaskQueued {
+			t.Fatalf("pre-rename cascade published state: approval=%+v task=%+v before=%+v after=%+v", gotApproval, gotTask, before, s.LineChainSnapshot())
+		}
+		if _, ok, err := s.DeleteNode("source-node"); err != nil || !ok {
+			t.Fatalf("retry did not commit cleanly: ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("target_after_lease_post_rename_failure_publishes_once", func(t *testing.T) {
+		s, _, _, _ := seedLineChainCascade(t, true)
+		s.syncParentDir = func(string) error { return errors.New("forced post-rename sync failure") }
+		report, ok, err := s.DeleteNode("target-node")
+		if !ok || err == nil || report.LineChainTargetsDrifted != 1 || report.ManagedLines != 1 {
+			t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+		}
+		if _, found := s.Node("target-node"); found || s.LineChainSnapshot().Revision != 2 {
+			t.Fatalf("post-rename cascade was not published exactly once: %+v", s.LineChainSnapshot())
+		}
+		s.syncParentDir = syncDir
+		if retry, ok, err := s.DeleteNode("target-node"); err != nil || ok || retry.NodeID != "target-node" || s.LineChainSnapshot().Revision != 2 {
+			t.Fatalf("retry was not idempotent: report=%+v ok=%v err=%v snapshot=%+v", retry, ok, err, s.LineChainSnapshot())
+		}
+	})
 }

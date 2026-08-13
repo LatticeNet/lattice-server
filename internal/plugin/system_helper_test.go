@@ -67,6 +67,25 @@ func TestRealV2StalledHostCallCancellationReaps(t *testing.T) {
 	}
 }
 
+func TestRealV2MalformedReadyPreservesReply(t *testing.T) {
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_BAD_READY=1")
+	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	rsp, err := tr.invokeV2(t.Context(), 1, "bad", InvokeRequest{Action: "x"}, nil)
+	if err == nil || !rsp.OK {
+		t.Fatalf("reply=%+v err=%v", rsp, err)
+	}
+	_ = tr.abort()
+	if err := syscall.Kill(-tr.pgid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("pgid alive: %v", err)
+	}
+}
+
 func runV2Helper() {
 	generation := uint64(1)
 	if _, err := fmt.Fprintf(os.Stdout, `{"protocol":2,"kind":"runtime_ready","generation":%d,"invocation_id":"runtime"}
@@ -98,6 +117,10 @@ func runV2Helper() {
 		resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"helper":true,"pid":%d}}`, os.Getpid()))
 		if enc.Encode(resp) != nil {
 			os.Exit(4)
+		}
+		if os.Getenv("LATTICE_TEST_V2_BAD_READY") == "1" {
+			fmt.Fprintln(os.Stdout, `{"protocol":2,"kind":"invoke_ready","generation":999}`)
+			continue
 		}
 		if enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "invoke_ready", Generation: f.Generation, InvocationID: f.InvocationID}) != nil {
 			os.Exit(5)

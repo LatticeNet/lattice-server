@@ -133,7 +133,7 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 		return RunnerStartResult{}, err
 	}
 
-	workDir := filepath.Join(r.opts.RuntimeDir, pluginID)
+	workDir := filepath.Join(r.opts.RuntimeDir, pluginID, fmt.Sprintf("generation-%d", req.Generation))
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return RunnerStartResult{}, fmt.Errorf("create plugin runtime dir: %w", err)
 	}

@@ -51,14 +51,6 @@ func (p *systemPool) hasTransport() bool {
 			return true
 		}
 	}
-	for w := range p.leased {
-		w.state = workerRetiring
-		if w.transport != nil {
-			_ = w.transport.abort()
-		}
-		w.state = workerDead
-	}
-	p.leased = map[*pooledWorker]struct{}{}
 	return false
 }
 
@@ -228,6 +220,7 @@ func (p *systemPool) wakeLocked() {
 	p.workers = p.workers[1:]
 	w.state = workerLeased
 	p.active++
+	p.leased[w] = struct{}{}
 	ch := p.waiters[0]
 	p.waiters = p.waiters[1:]
 	ch <- w

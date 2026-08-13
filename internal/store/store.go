@@ -387,7 +387,30 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			return err
 		}
 	}
+	for _, share := range st.SubscriptionShares {
+		if current, ok := existing.SubscriptionShares[share.ID]; ok && !share.UpdatedAt.After(current.UpdatedAt) {
+			continue
+		}
+		if err := bs.UpsertSubscriptionShare(share); err != nil {
+			return err
+		}
+	}
+	for key, snapshot := range st.SubscriptionSnapshots {
+		if current, ok := existing.SubscriptionSnapshots[key]; ok && !subscriptionSnapshotNewer(snapshot, current) {
+			continue
+		}
+		if err := bs.UpsertSubscriptionSnapshot(key, snapshot); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func subscriptionSnapshotNewer(candidate, current model.SubscriptionSnapshot) bool {
+	if !candidate.LastAttemptAt.Equal(current.LastAttemptAt) {
+		return candidate.LastAttemptAt.After(current.LastAttemptAt)
+	}
+	return candidate.FetchedAt.After(current.FetchedAt)
 }
 
 func mergeRuntimeBoltHotState(dst *State, hot State) {
@@ -418,6 +441,11 @@ func mergeRuntimeBoltHotState(dst *State, hot State) {
 	if len(hot.ProxyUsage) > 0 {
 		dst.ProxyUsage = hot.ProxyUsage
 	}
+	// Once enabled, Bolt is authoritative for these hot collections, including
+	// explicit empty/delete state. Conditional non-empty merge resurrects records
+	// from the stale JSON bootstrap after a valid hot deletion.
+	dst.SubscriptionShares = hot.SubscriptionShares
+	dst.SubscriptionSnapshots = hot.SubscriptionSnapshots
 	dst.ensureMaps()
 }
 

@@ -197,6 +197,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.SubscriptionShares = subscriptionShares
 
+	subscriptionSnapshots := make(map[string]model.SubscriptionSnapshot, len(st.SubscriptionSnapshots))
+	for id, snapshot := range st.SubscriptionSnapshots {
+		enc, err := encryptSubscriptionSnapshotRecord(id, snapshot, c)
+		if err != nil {
+			return State{}, err
+		}
+		subscriptionSnapshots[id] = enc
+	}
+	out.SubscriptionSnapshots = subscriptionSnapshots
+
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
 		rid := recordID(id, authState.State)
@@ -389,6 +399,16 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.SubscriptionShares = subscriptionShares
 
+	subscriptionSnapshots := make(map[string]model.SubscriptionSnapshot, len(st.SubscriptionSnapshots))
+	for id, snapshot := range st.SubscriptionSnapshots {
+		dec, err := decryptSubscriptionSnapshotRecord(id, snapshot, c)
+		if err != nil {
+			return err
+		}
+		subscriptionSnapshots[id] = dec
+	}
+	st.SubscriptionSnapshots = subscriptionSnapshots
+
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
 		dec, err := decryptOIDCAuthStateRecord(id, authState, c)
@@ -485,6 +505,16 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, u := range st.ProxyUsers {
 		if secret.IsEnvelope(u.UUID) || secret.IsEnvelope(u.Password) || secret.IsEnvelope(u.SubToken) {
+			return true
+		}
+	}
+	for _, snapshot := range st.SubscriptionSnapshots {
+		if secret.IsEnvelope(snapshot.Raw) {
+			return true
+		}
+	}
+	for _, share := range st.SubscriptionShares {
+		if secret.IsEnvelope(share.Token) {
 			return true
 		}
 	}
@@ -907,6 +937,30 @@ func decryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c 
 	}
 	share.Token = token
 	return share, nil
+}
+
+// Subscription Raw can contain bearer credentials and complete proxy URIs. It
+// is opaque to the store, but not public at rest, so every backend seals it at
+// this shared per-record boundary.
+func encryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSnapshot, c secret.Cipher) (model.SubscriptionSnapshot, error) {
+	raw, err := c.Encrypt(snapshot.Raw)
+	if err != nil {
+		return model.SubscriptionSnapshot{}, fmt.Errorf("encrypt subscription snapshot %s raw: %w", id, err)
+	}
+	snapshot.Raw = raw
+	return snapshot, nil
+}
+
+func decryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSnapshot, c secret.Cipher) (model.SubscriptionSnapshot, error) {
+	if !c.Enabled() && secret.IsEnvelope(snapshot.Raw) {
+		return model.SubscriptionSnapshot{}, lostMasterKeyError()
+	}
+	raw, err := c.Decrypt(snapshot.Raw)
+	if err != nil {
+		return model.SubscriptionSnapshot{}, fmt.Errorf("decrypt subscription snapshot %s raw: %w", id, err)
+	}
+	snapshot.Raw = raw
+	return snapshot, nil
 }
 
 func encryptOIDCAuthStateRecord(id string, authState auth.OIDCAuthState, c secret.Cipher) (auth.OIDCAuthState, error) {

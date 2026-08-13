@@ -2478,16 +2478,19 @@ func (bs *BoltStateStore) DeleteSubscriptionShare(id string) error {
 	})
 }
 
-// UpsertSubscriptionSnapshot writes one provider payload. Snapshots are not
-// sealed: they are public subscription content the provider already served over
-// the network, and sealing them would cost a cipher pass per refresh for no
-// secret.
+// UpsertSubscriptionSnapshot writes one provider payload with Raw sealed. Raw
+// may contain bearer credentials and complete proxy URIs even though the public
+// subscription endpoint later serves it to an authorized client.
 func (bs *BoltStateStore) UpsertSubscriptionSnapshot(key string, snap model.SubscriptionSnapshot) error {
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
 			return err
 		}
-		return putRecord(tx, boltBucketSubSnapshots, key, snap)
+		enc, err := encryptSubscriptionSnapshotRecord(key, snap, bs.cipher)
+		if err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketSubSnapshots, key, enc)
 	})
 }
 

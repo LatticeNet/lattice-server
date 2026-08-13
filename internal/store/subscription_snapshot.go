@@ -21,11 +21,24 @@ func (s *Store) UpsertSubscriptionSnapshot(snap model.SubscriptionSnapshot) erro
 		snap.FetchedAt = time.Now().UTC()
 	}
 	key := model.SnapshotKey(snap.PluginID, snap.SubscriptionID)
-	s.state.SubscriptionSnapshots[key] = snap
 	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.UpsertSubscriptionSnapshot(key, snap)
+		if err := s.runtimeBoltHot.UpsertSubscriptionSnapshot(key, snap); err != nil {
+			return err
+		}
+		s.state.SubscriptionSnapshots[key] = snap
+		return nil
 	}
-	return s.Save()
+	staged := s.state
+	staged.SubscriptionSnapshots = make(map[string]model.SubscriptionSnapshot, len(s.state.SubscriptionSnapshots)+1)
+	for id, current := range s.state.SubscriptionSnapshots {
+		staged.SubscriptionSnapshots[id] = current
+	}
+	staged.SubscriptionSnapshots[key] = snap
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
 }
 
 func (s *Store) SubscriptionSnapshot(pluginID, subscriptionID string) (model.SubscriptionSnapshot, bool) {
@@ -53,9 +66,23 @@ func (s *Store) DeleteSubscriptionSnapshot(pluginID, subscriptionID string) erro
 	defer s.mu.Unlock()
 	s.ensureMaps()
 	key := model.SnapshotKey(pluginID, subscriptionID)
-	delete(s.state.SubscriptionSnapshots, key)
 	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.DeleteSubscriptionSnapshot(key)
+		if err := s.runtimeBoltHot.DeleteSubscriptionSnapshot(key); err != nil {
+			return err
+		}
+		delete(s.state.SubscriptionSnapshots, key)
+		return nil
 	}
-	return s.Save()
+	staged := s.state
+	staged.SubscriptionSnapshots = make(map[string]model.SubscriptionSnapshot, len(s.state.SubscriptionSnapshots))
+	for id, current := range s.state.SubscriptionSnapshots {
+		if id != key {
+			staged.SubscriptionSnapshots[id] = current
+		}
+	}
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
 }

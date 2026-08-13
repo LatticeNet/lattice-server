@@ -62,6 +62,7 @@ type State struct {
 	ManagedLineSecrets     map[string]ManagedLineSecretRecord    `json:"managed_line_secrets"`
 	LineChainDefinitions   map[string]LineChainDefinition        `json:"line_chain_definitions"`
 	LineChainAttempts      map[string]LineChainAttempt           `json:"line_chain_attempts"`
+	LineChainAuditEvidence map[string]model.AuditEvent           `json:"line_chain_audit_evidence,omitempty"`
 	LineChainGraphRevision uint64                                `json:"line_chain_graph_revision"`
 	SubscriptionShares     map[string]model.SubscriptionShare    `json:"subscription_shares"`
 	SubscriptionSnapshots  map[string]model.SubscriptionSnapshot `json:"subscription_snapshots"`
@@ -343,6 +344,16 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 		if err := bs.AppendAudit(ev); err != nil {
 			return err
 		}
+		seenAudit[auditEventStorageKey(ev)] = struct{}{}
+	}
+	for _, ev := range st.LineChainAuditEvidence {
+		if _, ok := seenAudit[auditEventStorageKey(ev)]; ok {
+			continue
+		}
+		if err := bs.AppendAudit(ev); err != nil {
+			return err
+		}
+		seenAudit[auditEventStorageKey(ev)] = struct{}{}
 	}
 	now := time.Now().UTC()
 	for _, sess := range st.Sessions {
@@ -445,58 +456,59 @@ func monitorResultPersistenceKey(monitorID, nodeID string) string {
 
 func emptyState() State {
 	return State{
-		Users:                 map[string]model.User{},
-		Tokens:                map[string]model.Token{},
-		Nodes:                 map[string]model.Node{},
-		Tasks:                 map[string]model.Task{},
-		TaskResultReceipts:    map[string]TaskResultReceipt{},
-		KV:                    map[string]model.KVEntry{},
-		PluginSecrets:         map[string]model.KVEntry{},
-		VpnUsers:              map[string]VpnUserPublicRecord{},
-		VpnUserSecrets:        map[string]VpnUserSecretRecord{},
-		ManagedLines:          map[string]ManagedLinePublicRecord{},
-		ManagedLineSecrets:    map[string]ManagedLineSecretRecord{},
-		LineChainDefinitions:  map[string]LineChainDefinition{},
-		LineChainAttempts:     map[string]LineChainAttempt{},
-		SubscriptionShares:    map[string]model.SubscriptionShare{},
-		SubscriptionSnapshots: map[string]model.SubscriptionSnapshot{},
-		Static:                map[string]model.StaticObject{},
-		StorageBuckets:        map[string]model.StorageBucket{},
-		StorageBindings:       map[string]model.StorageBinding{},
-		StorageTokens:         map[string]model.StorageAccessToken{},
-		Workers:               map[string]model.WorkerScript{},
-		Plugins:               map[string]model.PluginInstallation{},
-		Approvals:             map[string]model.Approval{},
-		Sessions:              map[string]auth.Session{},
-		DDNS:                  map[string]model.DDNSProfile{},
-		Monitors:              map[string]model.Monitor{},
-		MonResults:            map[string][]model.MonitorResult{},
-		LogSources:            map[string]model.LogSource{},
-		NotifyChannels:        map[string]model.NotifyChannel{},
-		NotifyRules:           map[string]model.NotifyRule{},
-		Tunnels:               map[string]model.TunnelProfile{},
-		MachineProfiles:       map[string]model.MachineProfile{},
-		MachineVendors:        map[string]model.MachineVendor{},
-		NFTInputs:             map[string]model.NFTInputs{},
-		SecurityGroups:        map[string]model.SecurityGroup{},
-		GuardZones:            map[string]model.GuardZone{},
-		GuardBindings:         map[string]model.NodeGuardBinding{},
-		GuardRealitySnapshots: map[string]GuardRealitySnapshot{},
-		DNSDeployments:        map[string]model.DNSDeployment{},
-		NetPolicies:           map[string]model.NetPolicy{},
-		Groups:                map[string]model.Group{},
-		GroupPolicies:         map[string]model.GroupNetPolicy{},
-		GeoRouting:            map[string]model.GeoRouting{},
-		AgentUpdates:          map[string]model.AgentUpdatePolicy{},
-		ProxyInbounds:         map[string]model.ProxyInbound{},
-		ProxyUsers:            map[string]model.ProxyUser{},
-		ProxyProfiles:         map[string]model.ProxyNodeProfile{},
-		ProxyUsage:            map[string]model.ProxyUsageSnapshot{},
-		TOTPChallenges:        map[string]auth.TOTPChallenge{},
-		OIDCProviders:         map[string]model.OIDCProvider{},
-		OIDCIdentities:        map[string]model.OIDCIdentity{},
-		OIDCAuthStates:        map[string]auth.OIDCAuthState{},
-		WebAuthnCreds:         map[string]auth.WebAuthnCredential{},
+		Users:                  map[string]model.User{},
+		Tokens:                 map[string]model.Token{},
+		Nodes:                  map[string]model.Node{},
+		Tasks:                  map[string]model.Task{},
+		TaskResultReceipts:     map[string]TaskResultReceipt{},
+		KV:                     map[string]model.KVEntry{},
+		PluginSecrets:          map[string]model.KVEntry{},
+		VpnUsers:               map[string]VpnUserPublicRecord{},
+		VpnUserSecrets:         map[string]VpnUserSecretRecord{},
+		ManagedLines:           map[string]ManagedLinePublicRecord{},
+		ManagedLineSecrets:     map[string]ManagedLineSecretRecord{},
+		LineChainDefinitions:   map[string]LineChainDefinition{},
+		LineChainAttempts:      map[string]LineChainAttempt{},
+		LineChainAuditEvidence: map[string]model.AuditEvent{},
+		SubscriptionShares:     map[string]model.SubscriptionShare{},
+		SubscriptionSnapshots:  map[string]model.SubscriptionSnapshot{},
+		Static:                 map[string]model.StaticObject{},
+		StorageBuckets:         map[string]model.StorageBucket{},
+		StorageBindings:        map[string]model.StorageBinding{},
+		StorageTokens:          map[string]model.StorageAccessToken{},
+		Workers:                map[string]model.WorkerScript{},
+		Plugins:                map[string]model.PluginInstallation{},
+		Approvals:              map[string]model.Approval{},
+		Sessions:               map[string]auth.Session{},
+		DDNS:                   map[string]model.DDNSProfile{},
+		Monitors:               map[string]model.Monitor{},
+		MonResults:             map[string][]model.MonitorResult{},
+		LogSources:             map[string]model.LogSource{},
+		NotifyChannels:         map[string]model.NotifyChannel{},
+		NotifyRules:            map[string]model.NotifyRule{},
+		Tunnels:                map[string]model.TunnelProfile{},
+		MachineProfiles:        map[string]model.MachineProfile{},
+		MachineVendors:         map[string]model.MachineVendor{},
+		NFTInputs:              map[string]model.NFTInputs{},
+		SecurityGroups:         map[string]model.SecurityGroup{},
+		GuardZones:             map[string]model.GuardZone{},
+		GuardBindings:          map[string]model.NodeGuardBinding{},
+		GuardRealitySnapshots:  map[string]GuardRealitySnapshot{},
+		DNSDeployments:         map[string]model.DNSDeployment{},
+		NetPolicies:            map[string]model.NetPolicy{},
+		Groups:                 map[string]model.Group{},
+		GroupPolicies:          map[string]model.GroupNetPolicy{},
+		GeoRouting:             map[string]model.GeoRouting{},
+		AgentUpdates:           map[string]model.AgentUpdatePolicy{},
+		ProxyInbounds:          map[string]model.ProxyInbound{},
+		ProxyUsers:             map[string]model.ProxyUser{},
+		ProxyProfiles:          map[string]model.ProxyNodeProfile{},
+		ProxyUsage:             map[string]model.ProxyUsageSnapshot{},
+		TOTPChallenges:         map[string]auth.TOTPChallenge{},
+		OIDCProviders:          map[string]model.OIDCProvider{},
+		OIDCIdentities:         map[string]model.OIDCIdentity{},
+		OIDCAuthStates:         map[string]auth.OIDCAuthState{},
+		WebAuthnCreds:          map[string]auth.WebAuthnCredential{},
 
 		WebAuthnChallenges: map[string]auth.WebAuthnChallenge{},
 	}
@@ -541,6 +553,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.LineChainAttempts == nil {
 		st.LineChainAttempts = map[string]LineChainAttempt{}
+	}
+	if st.LineChainAuditEvidence == nil {
+		st.LineChainAuditEvidence = map[string]model.AuditEvent{}
 	}
 	if st.SubscriptionShares == nil {
 		st.SubscriptionShares = map[string]model.SubscriptionShare{}
@@ -2018,6 +2033,9 @@ func (s *Store) AppendAuditIdempotent(ev model.AuditEvent) (bool, error) {
 		right, _ := json.Marshal(b)
 		return string(left) == string(right)
 	}
+	if frozen, ok := s.state.LineChainAuditEvidence[ev.ID]; ok && !equal(frozen, ev) {
+		return false, fmt.Errorf("audit id %q conflicts with frozen line chain evidence", ev.ID)
+	}
 	exists := false
 	for _, current := range s.state.Audit {
 		if current.ID != ev.ID {
@@ -2070,6 +2088,9 @@ func (s *Store) AppendAuditIdempotent(ev model.AuditEvent) (bool, error) {
 func (s *Store) AuditEventByID(id string) (model.AuditEvent, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if event, ok := s.state.LineChainAuditEvidence[id]; ok {
+		return event, true
+	}
 	for _, event := range s.state.Audit {
 		if event.ID == id {
 			return event, true

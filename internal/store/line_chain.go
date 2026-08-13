@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -161,6 +162,28 @@ func cloneLineChainAttempts(in map[string]LineChainAttempt) map[string]LineChain
 	return out
 }
 
+func stageLineChainAuditEvidence(staged *State, current State, audits []model.AuditEvent) error {
+	staged.LineChainAuditEvidence = make(map[string]model.AuditEvent, len(current.LineChainAuditEvidence)+len(audits))
+	for id, event := range current.LineChainAuditEvidence {
+		staged.LineChainAuditEvidence[id] = event
+	}
+	for _, event := range audits {
+		if event.ID == "" || event.At.IsZero() || event.Decision == "" {
+			return errors.New("line chain audit evidence requires id, at, and decision")
+		}
+		if existing, ok := staged.LineChainAuditEvidence[event.ID]; ok {
+			left, _ := json.Marshal(existing)
+			right, _ := json.Marshal(event)
+			if string(left) != string(right) {
+				return fmt.Errorf("line chain audit id %q conflicts with frozen evidence", event.ID)
+			}
+			continue
+		}
+		staged.LineChainAuditEvidence[event.ID] = event
+	}
+	return nil
+}
+
 func (s *Store) LineChainSnapshot() LineChainSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -174,10 +197,17 @@ func (s *Store) LineChainSnapshot() LineChainSnapshot {
 // ReconcileLineChains advances committed set/replace definitions and remove
 // tombstones from host-applied state using scheduled inventory evidence.
 func (s *Store) ReconcileLineChains(observations map[string]LineChainObservation) (bool, error) {
+	return s.ReconcileLineChainsWithAudits(observations, nil)
+}
+
+// ReconcileLineChainsWithAudits freezes evidence in the same authoritative
+// JSON commit as its observed definition status transition.
+func (s *Store) ReconcileLineChainsWithAudits(observations map[string]LineChainObservation, auditFor func(LineChainDefinition) (model.AuditEvent, bool)) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	definitions := cloneLineChainDefinitions(s.state.LineChainDefinitions)
 	now, changed := time.Now().UTC(), false
+	audits := []model.AuditEvent{}
 	for sourceUUID, observation := range observations {
 		definition, ok := definitions[sourceUUID]
 		if !ok {
@@ -198,12 +228,20 @@ func (s *Store) ReconcileLineChains(observations map[string]LineChainObservation
 		}
 		definition.Status, definition.DriftCode, definition.UpdatedAt = status, driftCode, now
 		definitions[sourceUUID], changed = definition, true
+		if auditFor != nil {
+			if event, ok := auditFor(definition); ok {
+				audits = append(audits, event)
+			}
+		}
 	}
 	if !changed {
 		return false, nil
 	}
 	staged := s.state
 	staged.LineChainDefinitions = definitions
+	if err := stageLineChainAuditEvidence(&staged, s.state, audits); err != nil {
+		return false, err
+	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
@@ -239,13 +277,13 @@ func (s *Store) PlanLineChain(attempt LineChainAttempt) (LineChainAttempt, bool,
 }
 
 // PlanLineChainApproval persists the typed approval and candidate together.
-func (s *Store) PlanLineChainApproval(attempt LineChainAttempt, approval model.Approval) (LineChainAttempt, bool, error) {
+func (s *Store) PlanLineChainApproval(attempt LineChainAttempt, approval model.Approval, audits ...model.AuditEvent) (LineChainAttempt, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.planLineChainLocked(attempt, &approval)
+	return s.planLineChainLocked(attempt, &approval, audits...)
 }
 
-func (s *Store) planLineChainLocked(attempt LineChainAttempt, approval *model.Approval) (LineChainAttempt, bool, error) {
+func (s *Store) planLineChainLocked(attempt LineChainAttempt, approval *model.Approval, audits ...model.AuditEvent) (LineChainAttempt, bool, error) {
 	if err := validateLineChainAttempt(attempt); err != nil {
 		return LineChainAttempt{}, false, err
 	}
@@ -290,6 +328,9 @@ func (s *Store) planLineChainLocked(attempt LineChainAttempt, approval *model.Ap
 		}
 		staged.Approvals[approval.ID] = *approval
 	}
+	if err := stageLineChainAuditEvidence(&staged, s.state, audits); err != nil {
+		return LineChainAttempt{}, false, err
+	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
@@ -330,7 +371,7 @@ func (s *Store) ReserveLineChain(approvalID string, expectedRevision uint64) (Li
 // ApproveLineChain atomically changes the reviewed approval and attempt to
 // applying, reserves the candidate graph edge, queues exactly one bound task,
 // and advances R to R+1 in one persistence transaction.
-func (s *Store) ApproveLineChain(approval model.Approval, task model.Task) (LineChainAttempt, bool, error) {
+func (s *Store) ApproveLineChain(approval model.Approval, task model.Task, audits ...model.AuditEvent) (LineChainAttempt, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	currentApproval, ok := s.state.Approvals[approval.ID]
@@ -385,6 +426,9 @@ func (s *Store) ApproveLineChain(approval model.Approval, task model.Task) (Line
 		task.Status = model.TaskQueued
 	}
 	staged.Tasks[task.ID] = task
+	if err := stageLineChainAuditEvidence(&staged, s.state, audits); err != nil {
+		return LineChainAttempt{}, false, err
+	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
@@ -394,7 +438,7 @@ func (s *Store) ApproveLineChain(approval model.Approval, task model.Task) (Line
 
 // CompleteLineChainTaskResult durably records the exact issued lease result and
 // promotes (or fails) its candidate in one graph revision transition.
-func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.Approval, terminalStatus, errorCode, terminalError string) (bool, error) {
+func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.Approval, terminalStatus, errorCode, terminalError string, audits ...model.AuditEvent) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	task, ok := s.state.Tasks[r.TaskID]
@@ -472,6 +516,9 @@ func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.A
 	receiptResult := stored
 	receiptResult.LeaseID = r.LeaseID
 	staged.TaskResultReceipts[taskResultReceiptKey(r.TaskID, r.NodeID)] = taskResultReceipt(receiptResult)
+	if err := stageLineChainAuditEvidence(&staged, s.state, audits); err != nil {
+		return false, err
+	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged

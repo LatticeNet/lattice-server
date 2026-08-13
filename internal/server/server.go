@@ -5657,7 +5657,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			if taskID == "" {
 				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: errors.New("approved line chain task is missing")}
 			}
-			if err := s.ensureLineChainApproveAudit(p, approval, taskID); err != nil {
+			storedAudit, ok := s.store.AuditEventByID(lineChainAuditID("approve", approval.ID, taskID))
+			if !ok {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: errors.New("approved line chain audit is missing")}
+			}
+			if err := s.appendRequiredLineChainAudit(storedAudit); err != nil {
 				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 			}
 		}
@@ -5743,7 +5747,7 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	// operator approved the exact bytes of it; the plugin now executes it under a
 	// one-time grant bound to that approval, and every task it enqueues is checked
 	// against the approved target set.
-	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) {
+	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) && approval.Plugin != singBoxManagedLinePlugin {
 		approval.Status = model.ApprovalApproved
 		approval.ApprovedBy = p.ActorID
 		if err := s.store.UpsertApproval(approval); err != nil {
@@ -5839,7 +5843,9 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
 	} else if isLineChainApproval(approval) {
-		_, committed, err := s.store.ApproveLineChain(approval, task)
+		approveAudit := lineChainApproveAudit(p, approval, task.ID)
+		approveAudit.At = task.CreatedAt
+		_, committed, err := s.store.ApproveLineChain(approval, task, approveAudit)
 		if committed && err != nil {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
@@ -5851,7 +5857,7 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: status, err: apiError(model.APIErrorApprovalStale, "line chain inputs changed while queueing; re-plan before approving")}
 		}
 		approval, _ = s.store.Approval(approval.ID)
-		if err := s.ensureLineChainApproveAudit(p, approval, task.ID); err != nil {
+		if err := s.appendRequiredLineChainAudit(approveAudit); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
 	} else {
@@ -6342,7 +6348,7 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if lineChainResult {
-		if err := s.handleLineChainTaskResult(approval, req.Result); err != nil {
+		if err := s.handleLineChainTaskResult(approval, task, req.Result); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, store.ErrTaskLeaseMismatch) {
 				status = http.StatusForbidden

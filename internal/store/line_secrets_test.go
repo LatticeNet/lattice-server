@@ -169,6 +169,35 @@ func TestLineSecretMigrationTenThousandRecordsUsesOneJSONCommit(t *testing.T) {
 	}
 }
 
+func BenchmarkLineSecretMigrationLinear(b *testing.B) {
+	for _, records := range []int{1_000, 10_000} {
+		b.Run(fmt.Sprintf("records_%d", records), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ReportMetric(float64(records*2), "typed-records/op")
+			for n := 0; n < b.N; n++ {
+				s, err := Open("")
+				if err != nil {
+					b.Fatal(err)
+				}
+				err = s.MigrateLineSecrets(func(source LineSecretMigrationSource) (LineSecretMigrationBuild, error) {
+					for i := 0; i < records; i++ {
+						id := fmt.Sprintf("vpn-%05d", i)
+						source.VpnUsers[id], source.VpnUserSecrets[id] = testVpnUserRecords(id, "secret-"+id)
+						lineID := fmt.Sprintf("line-%05d", i)
+						source.ManagedLines[lineID] = ManagedLinePublicRecord{LineUUID: lineID, NodeID: "node-a", Status: "applied"}
+						source.ManagedLineSecrets[lineID] = ManagedLineSecretRecord{RealityPrivateKey: "private-" + lineID}
+					}
+					return LineSecretMigrationBuild{VpnUsers: source.VpnUsers, VpnUserSecrets: source.VpnUserSecrets,
+						ManagedLines: source.ManagedLines, ManagedLineSecrets: source.ManagedLineSecrets}, nil
+				})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	s, err := Open("")
 	if err != nil {
@@ -213,6 +242,32 @@ func TestLineSecretMigrationFullBoltUsesExactlyOneUpdate(t *testing.T) {
 	}
 	if calls := bs.testUpdateCalls - before; calls != 1 {
 		t.Fatalf("full Bolt migration used %d write transactions, want exactly one", calls)
+	}
+}
+
+func TestRuntimeHotBoltContainsNoTypedLineSecretCanaries(t *testing.T) {
+	dir := t.TempDir()
+	s, err := OpenWithCipher(filepath.Join(dir, "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hotPath := filepath.Join(dir, "runtime.db")
+	if err := s.EnableRuntimeBoltHotStore(hotPath); err != nil {
+		t.Fatal(err)
+	}
+	public, private := testVpnUserRecords("public-canary", "private-canary")
+	if err := s.PutVpnUserRecord(public, private); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(hotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "public-canary") || strings.Contains(string(raw), "private-canary") {
+		t.Fatal("runtime-hot Bolt contained typed line public/private canary")
 	}
 }
 

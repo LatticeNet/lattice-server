@@ -2,11 +2,16 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/secret"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func TestVpnUserMigrationIdempotent(t *testing.T) {
@@ -31,6 +36,114 @@ func TestVpnUserMigrationIdempotent(t *testing.T) {
 	if len(u.Credentials) != 1 || u.Credentials[0].Protocol != "vless" ||
 		u.Credentials[0].UUID != "11111111-1111-1111-1111-111111111111" {
 		t.Fatalf("migrated credential wrong: %+v", u.Credentials)
+	}
+}
+
+func TestLineSecretMigrationRestartSupportsOperations(t *testing.T) {
+	key := make([]byte, secret.KeySize)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	cipher, err := secret.NewAESGCM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := store.OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := VpnUser{ID: "vpn-restart", Email: "restart@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "11111111-1111-4111-8111-111111111111"}}, SubID: "restart-sub", Bindings: []LineBinding{}}
+	managed := managedLineDef{LineUUID: "22222222-2222-4222-8222-222222222222", NodeID: "node-a", LineHashID: "line-restart", Tag: "managed-restart",
+		Port: 24443, SNI: "example.com", HandshakeServer: "example.com", HandshakePort: 443, RealityPrivateKey: "restart-private",
+		RealityPublicKey: "restart-public", ShortID: "abcdef12", UserID: legacy.ID, Status: managedLineStatusApplied}
+	userJSON, _ := json.Marshal(legacy)
+	managedJSON, _ := json.Marshal(managed)
+	if err := st.PutKV(model.KVEntry{Bucket: vpnCoreKVBucket, Key: vpnUserKey(legacy.ID), Value: string(userJSON)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutKV(model.KVEntry{Bucket: managedLineDefBucket, Key: managed.LineUUID, Value: string(managedJSON)}); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.migrateProxyUsersToVpnUsers(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := store.OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err = New(Options{Store: reopened, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedLinesFixture(t, srv)
+	groups := srv.buildLineGroups()
+	lineHash := groups[0].Lines[0].LineHashID
+	if _, err := srv.vpnCoreUsersAdminRPC(context.Background(), "bind", []byte(`{"user_id":"`+legacy.ID+`","line_hash_id":"`+lineHash+`"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.vpnUserRotateCredential(lineUserTestPrincipal(), []byte(`{"user_id":"`+legacy.ID+`","protocol":"vless"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := srv.managedLineDefByUUID(managed.LineUUID); err != nil || !ok || got.RealityPrivateKey != "restart-private" {
+		t.Fatalf("managed definition after restart: %+v ok=%v err=%v", got, ok, err)
+	}
+	seedManagedLineNode(t, srv, "node-migration", realityInventoryLines())
+	planned, skipped, err := srv.compileManagedLineRollout(context.Background(), lineUserTestPrincipal(), managedLineRolloutRequest{UserID: legacy.ID, NodeIDs: []string{"node-migration"}})
+	if err != nil || len(planned) != 1 || len(skipped) != 0 {
+		t.Fatalf("managed-line operation after migration restart: planned=%+v skipped=%+v err=%v", planned, skipped, err)
+	}
+	approval, ok := srv.store.Approval(planned[0].ApprovalID)
+	if !ok || !strings.Contains(srv.managedLineApplyScript(approval), "systemctl restart sing-box") {
+		t.Fatalf("migrated private records could not produce a managed-line apply: approval=%+v ok=%v", approval, ok)
+	}
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	approved, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	if err != nil || approved.Status != model.ApprovalApproved {
+		t.Fatalf("pending managed-line approval could not execute after restart: approval=%+v err=%v", approved, err)
+	}
+	managedTaskFound := false
+	for _, task := range srv.store.Tasks() {
+		if task.ApprovalID == approval.ID && strings.Contains(task.Script, "systemctl restart sing-box") {
+			managedTaskFound = true
+		}
+	}
+	if !managedTaskFound {
+		t.Fatal("managed-line approval did not queue its executable apply task")
+	}
+	if subscriptions := srv.buildSubscriptions(); len(subscriptions) == 0 {
+		t.Fatal("migrated user could not render a subscription summary after restart")
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	secondRestart, err := store.OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondRestart.Close()
+	srv, err = New(Options{Store: secondRestart, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	userAfter, ok := srv.getVpnUser(legacy.ID)
+	if !ok || len(userAfter.Credentials) == 0 || userAfter.Credentials[0].UUID == legacy.Credentials[0].UUID || len(userAfter.Bindings) == 0 {
+		t.Fatalf("second restart lost rotated credential/binding: %+v ok=%v", userAfter, ok)
+	}
+	approvedAfter, ok := srv.store.Approval(approval.ID)
+	if !ok || approvedAfter.Status != model.ApprovalApproved {
+		t.Fatalf("second restart lost managed-line approval: %+v ok=%v", approvedAfter, ok)
+	}
+	if subscriptions := srv.buildSubscriptions(); len(subscriptions) == 0 {
+		t.Fatal("second restart could not render migrated subscription")
 	}
 }
 

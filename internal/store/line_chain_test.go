@@ -357,3 +357,98 @@ func TestAppendAuditIdempotentRepairsDurabilityWithoutDuplicates(t *testing.T) {
 		t.Fatalf("audit retry duplicated evidence: %+v", events)
 	}
 }
+
+func TestLineChainTransitionAuditEvidenceSurvivesRuntimeHotRestartBeforeSink(t *testing.T) {
+	dir := t.TempDir()
+	statePath, hotPath := filepath.Join(dir, "state.json"), filepath.Join(dir, "runtime.db")
+	cipher := testCipher(t)
+	open := func() *Store {
+		s, err := OpenWithCipher(statePath, cipher)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.EnableRuntimeBoltHotStore(hotPath); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	now := time.Unix(1_700_000_000, 0).UTC()
+	event := func(id, action string, at time.Time) model.AuditEvent {
+		return model.AuditEvent{ID: id, At: at, Action: action, Decision: "allow"}
+	}
+	approval := model.Approval{ID: "approval-hot-evidence", NodeID: "node-a", Plugin: "singbox-linechain", PluginVersion: "1", Service: "network/lines",
+		Method: "chain_set_apply", Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending, Targets: []string{"node-a"}}
+	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a",
+		CandidateTargetLineUUID: "target", CandidateArtifactSHA256: "digest", CandidateDefinition: LineChainDefinition{SourceLineUUID: "source", SourceNodeID: "node-a", TargetLineUUID: "target", TargetNodeID: "node-b", OutboundTag: "out", ArtifactSHA256: "digest"}, RequestSHA256: "request"}
+	s := open()
+	planAudit := event("audit-plan-hot", "linechain.plan", now)
+	if _, _, err := s.PlanLineChainApproval(attempt, approval, planAudit); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open()
+	if got, ok := s.AuditEventByID(planAudit.ID); !ok || !reflect.DeepEqual(got, planAudit) {
+		t.Fatalf("plan evidence missing after sinkless restart: %+v ok=%v", got, ok)
+	}
+	approval.Status = model.ApprovalApproved
+	task := model.Task{ID: "task-hot-evidence", ApprovalID: approval.ID, Targets: []string{"node-a"}, Script: "script", Status: model.TaskQueued}
+	approveAudit := event("audit-approve-hot", "linechain.approve", now.Add(time.Second))
+	if _, committed, err := s.ApproveLineChain(approval, task, approveAudit); err != nil || !committed {
+		t.Fatalf("approve committed=%v err=%v", committed, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open()
+	if got, ok := s.AuditEventByID(approveAudit.ID); !ok || !reflect.DeepEqual(got, approveAudit) {
+		t.Fatalf("approve evidence missing after sinkless restart: %+v ok=%v", got, ok)
+	}
+	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil })
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	}
+	result := model.TaskResult{TaskID: task.ID, NodeID: "node-a", LeaseID: deliveries[0].Task.LeaseID, FinishedAt: now.Add(2 * time.Second)}
+	terminalAudit := event("audit-terminal-hot", "linechain.apply", result.FinishedAt)
+	if committed, err := s.CompleteLineChainTaskResult(result, approval, LineChainStatusAppliedUnobserved, "", "", terminalAudit); err != nil || !committed {
+		t.Fatalf("terminal committed=%v err=%v", committed, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open()
+	if got, ok := s.AuditEventByID(terminalAudit.ID); !ok || !reflect.DeepEqual(got, terminalAudit) {
+		t.Fatalf("terminal evidence missing after sinkless restart: %+v ok=%v", got, ok)
+	}
+	driftAudit := event("audit-reconcile-drift-hot", "linechain.drift", now.Add(3*time.Second))
+	driftAudit.Decision, driftAudit.Reason = "deny", "observed_mismatch"
+	if committed, err := s.ReconcileLineChainsWithAudits(map[string]LineChainObservation{"source": {OutboundTag: "wrong", DownstreamLineUUID: "target"}}, func(definition LineChainDefinition) (model.AuditEvent, bool) {
+		driftAudit.At = definition.UpdatedAt
+		return driftAudit, true
+	}); err != nil || !committed {
+		t.Fatalf("drift reconcile committed=%v err=%v", committed, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open()
+	if got, ok := s.AuditEventByID(driftAudit.ID); !ok || !reflect.DeepEqual(got, driftAudit) {
+		t.Fatalf("drift reconciliation evidence missing after sinkless restart: %+v ok=%v", got, ok)
+	}
+	convergedAudit := event("audit-reconcile-converged-hot", "linechain.apply", now.Add(4*time.Second))
+	if committed, err := s.ReconcileLineChainsWithAudits(map[string]LineChainObservation{"source": {OutboundTag: "out", DownstreamLineUUID: "target"}}, func(definition LineChainDefinition) (model.AuditEvent, bool) {
+		convergedAudit.At = definition.UpdatedAt
+		return convergedAudit, true
+	}); err != nil || !committed {
+		t.Fatalf("converged reconcile committed=%v err=%v", committed, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open()
+	defer s.Close()
+	if got, ok := s.AuditEventByID(convergedAudit.ID); !ok || !reflect.DeepEqual(got, convergedAudit) {
+		t.Fatalf("converged reconciliation evidence missing after sinkless restart: %+v ok=%v", got, ok)
+	}
+}

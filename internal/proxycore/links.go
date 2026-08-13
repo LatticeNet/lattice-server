@@ -3,6 +3,7 @@ package proxycore
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -51,6 +52,60 @@ type VLESSRealityEndpoint struct {
 	ALPN        []string
 	PublicKey   string
 	ShortID     string
+}
+
+type VLESSRealityEndpointOptions struct {
+	Label, Tag, NodeID, InboundID string
+	Server                        string
+	ServerPort                    int
+	UUID, Flow, SNI, Fingerprint  string
+	ALPN                          []string
+	PublicKey, ShortID            string
+}
+
+// NewVLESSRealityEndpoint is the single validated constructor for typed
+// VLESS+REALITY+TCP subscription output. Callers must not assemble links from
+// ShareURL or concatenate credential-bearing URIs themselves.
+func NewVLESSRealityEndpoint(opts VLESSRealityEndpointOptions) (VLESSRealityEndpoint, error) {
+	if err := validateSubscriptionHost(opts.Server); err != nil {
+		return VLESSRealityEndpoint{}, fmt.Errorf("endpoint host: %w", err)
+	}
+	if opts.ServerPort < 1 || opts.ServerPort > 65535 {
+		return VLESSRealityEndpoint{}, errors.New("endpoint port is invalid")
+	}
+	uuid := strings.ToLower(strings.TrimSpace(opts.UUID))
+	if !uuidRe.MatchString(uuid) {
+		return VLESSRealityEndpoint{}, errors.New("endpoint UUID is invalid")
+	}
+	if opts.PublicKey == "" || !realityKeyRe.MatchString(opts.PublicKey) {
+		return VLESSRealityEndpoint{}, errors.New("endpoint reality public key is invalid")
+	}
+	shortID := strings.ToLower(strings.TrimSpace(opts.ShortID))
+	if shortID == "" || !realityShortIDRe.MatchString(shortID) || len(shortID)%2 != 0 {
+		return VLESSRealityEndpoint{}, errors.New("endpoint reality short id is invalid")
+	}
+	if opts.SNI != "" {
+		if err := validateHostToken(strings.TrimSpace(opts.SNI)); err != nil {
+			return VLESSRealityEndpoint{}, fmt.Errorf("endpoint sni: %w", err)
+		}
+	}
+	fingerprint := strings.TrimSpace(opts.Fingerprint)
+	if fingerprint == "" {
+		fingerprint = "chrome"
+	}
+	if strings.ContainsFunc(fingerprint, isUnsafeControl) {
+		return VLESSRealityEndpoint{}, errors.New("endpoint fingerprint is invalid")
+	}
+	flow := strings.TrimSpace(opts.Flow)
+	if flow == "" {
+		flow = "xtls-rprx-vision"
+	}
+	return VLESSRealityEndpoint{
+		Label: strings.TrimSpace(opts.Label), Tag: strings.TrimSpace(opts.Tag), NodeID: strings.TrimSpace(opts.NodeID),
+		InboundID: strings.TrimSpace(opts.InboundID), Server: strings.TrimSpace(opts.Server), ServerPort: opts.ServerPort,
+		UUID: uuid, Flow: flow, Network: model.ProxyTransportTCP, SNI: strings.TrimSpace(opts.SNI), Fingerprint: fingerprint,
+		ALPN: cleanStringList(opts.ALPN), PublicKey: opts.PublicKey, ShortID: shortID,
+	}, nil
 }
 
 // VLESSRealityLinks renders MVP VLESS+REALITY links for one subscriber across
@@ -154,46 +209,20 @@ func vlessRealityEndpointFor(user model.ProxyUser, sp SubscriptionProfile, inbou
 	if err := validateVLESSRealityInbound(inbound); err != nil {
 		return VLESSRealityEndpoint{}, err
 	}
-	if inbound.RealityPublicKey == "" || !realityKeyRe.MatchString(inbound.RealityPublicKey) {
-		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s has invalid reality public key", inbound.ID)
-	}
 	if len(inbound.RealityShortIDs) == 0 {
 		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s requires at least one reality short id", inbound.ID)
 	}
-	shortID := strings.ToLower(strings.TrimSpace(inbound.RealityShortIDs[0]))
-	if shortID == "" || !realityShortIDRe.MatchString(shortID) || len(shortID)%2 != 0 {
-		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s has invalid reality short id %q", inbound.ID, inbound.RealityShortIDs[0])
-	}
-	sni := strings.TrimSpace(inbound.SNI)
-	if inbound.SNI != "" {
-		if err := validateHostToken(sni); err != nil {
-			return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s sni: %w", inbound.ID, err)
-		}
-	}
-	fingerprint := strings.TrimSpace(inbound.Fingerprint)
-	if fingerprint == "" {
-		fingerprint = "chrome"
-	}
-	if strings.ContainsFunc(fingerprint, isUnsafeControl) {
-		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s fingerprint contains control characters", inbound.ID)
-	}
 	label := subscriptionLabel(sp, inbound)
-	return VLESSRealityEndpoint{
-		Label:       label,
-		Tag:         label,
-		NodeID:      strings.TrimSpace(sp.Profile.NodeID),
-		InboundID:   inbound.ID,
-		Server:      host,
-		ServerPort:  inbound.Port,
-		UUID:        strings.ToLower(user.UUID),
-		Flow:        "xtls-rprx-vision",
-		Network:     model.ProxyTransportTCP,
-		SNI:         sni,
-		Fingerprint: fingerprint,
-		ALPN:        cleanStringList(inbound.ALPN),
-		PublicKey:   inbound.RealityPublicKey,
-		ShortID:     shortID,
-	}, nil
+	endpoint, err := NewVLESSRealityEndpoint(VLESSRealityEndpointOptions{
+		Label: label, Tag: label, NodeID: sp.Profile.NodeID, InboundID: inbound.ID,
+		Server: host, ServerPort: inbound.Port, UUID: user.UUID, Flow: "xtls-rprx-vision",
+		SNI: inbound.SNI, Fingerprint: inbound.Fingerprint, ALPN: inbound.ALPN,
+		PublicKey: inbound.RealityPublicKey, ShortID: inbound.RealityShortIDs[0],
+	})
+	if err != nil {
+		return VLESSRealityEndpoint{}, fmt.Errorf("inbound %s: %w", inbound.ID, err)
+	}
+	return endpoint, nil
 }
 
 func (e VLESSRealityEndpoint) Link() string {

@@ -135,13 +135,24 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 			return res.worker, res.err
 		case <-ctx.Done():
 			p.mu.Lock()
+			removed := false
 			for i, waiter := range p.waiters {
 				if waiter == ch {
 					p.waiters = append(p.waiters[:i], p.waiters[i+1:]...)
+					removed = true
 					break
 				}
 			}
 			p.mu.Unlock()
+			if !removed {
+				select {
+				case res := <-ch:
+					if res.worker != nil {
+						p.release(res.worker, false, time.Now())
+					}
+				case <-time.After(time.Millisecond):
+				}
+			}
 			return nil, ctx.Err()
 		}
 	}
@@ -225,8 +236,10 @@ func (p *systemPool) gracefulDrain(generation uint64) {
 		return
 	}
 	p.closed = true
-	p.generation++
 	idle := append([]*pooledWorker(nil), p.workers...)
+	for _, w := range idle {
+		w.state = workerDead
+	}
 	p.workers = nil
 	for w := range p.leased {
 		p.draining[w] = struct{}{}
@@ -241,7 +254,6 @@ func (p *systemPool) gracefulDrain(generation uint64) {
 		if w.transport != nil {
 			_ = w.transport.abort()
 		}
-		w.state = workerDead
 	}
 }
 
@@ -254,10 +266,13 @@ func (p *systemPool) abortClose(generation uint64) {
 		return
 	}
 	p.closed = true
-	p.generation++
 	all := append([]*pooledWorker(nil), p.workers...)
 	for w := range p.leased {
+		w.state = workerDead
 		all = append(all, w)
+	}
+	for _, w := range p.workers {
+		w.state = workerDead
 	}
 	p.workers = nil
 	p.leased = map[*pooledWorker]struct{}{}
@@ -270,7 +285,6 @@ func (p *systemPool) abortClose(generation uint64) {
 		ch <- poolCheckoutResult{err: errSystemPoolClosed}
 	}
 	for _, w := range all {
-		w.state = workerDead
 		if w.transport != nil {
 			_ = w.transport.abort()
 		}

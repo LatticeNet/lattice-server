@@ -40,11 +40,13 @@ type subscriptionCacheEntry struct {
 // bounds how many entries one share can produce; an unbounded map keyed on
 // caller-supplied data would be a memory amplifier.
 type subscriptionCache struct {
-	mu      sync.Mutex
-	max     int
-	ttl     time.Duration
-	entries map[subscriptionCacheKey]*list.Element
-	order   *list.List
+	mu       sync.Mutex
+	max      int
+	maxBytes int
+	bytes    int
+	ttl      time.Duration
+	entries  map[subscriptionCacheKey]*list.Element
+	order    *list.List
 }
 
 func newSubscriptionCache(max int, ttl time.Duration) *subscriptionCache {
@@ -55,10 +57,11 @@ func newSubscriptionCache(max int, ttl time.Duration) *subscriptionCache {
 		ttl = time.Minute
 	}
 	return &subscriptionCache{
-		max:     max,
-		ttl:     ttl,
-		entries: map[subscriptionCacheKey]*list.Element{},
-		order:   list.New(),
+		max:      max,
+		maxBytes: 64 << 20,
+		ttl:      ttl,
+		entries:  map[subscriptionCacheKey]*list.Element{},
+		order:    list.New(),
 	}
 }
 
@@ -114,19 +117,26 @@ func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentTy
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(body) > c.maxBytes {
+		if el, ok := c.entries[key]; ok {
+			c.removeElement(el)
+		}
+		return
+	}
 	if el, ok := c.entries[key]; ok {
 		c.removeElement(el)
 	}
 	el := c.order.PushFront(&subscriptionCacheEntry{
 		key:         key,
-		body:        body,
+		body:        append([]byte(nil), body...),
 		contentType: contentType,
 		userinfo:    userinfo,
 		contentHash: contentHash,
 		expiresAt:   now.Add(c.ttl),
 	})
 	c.entries[key] = el
-	for c.order.Len() > c.max {
+	c.bytes += len(body)
+	for c.order.Len() > c.max || c.bytes > c.maxBytes {
 		if oldest := c.order.Back(); oldest != nil {
 			c.removeElement(oldest)
 			continue
@@ -158,6 +168,7 @@ func (c *subscriptionCache) Len() int {
 // removeElement drops one element from both the list and the index. Callers hold
 // the mutex.
 func (c *subscriptionCache) removeElement(el *list.Element) {
+	c.bytes -= len(el.Value.(*subscriptionCacheEntry).body)
 	c.order.Remove(el)
 	delete(c.entries, el.Value.(*subscriptionCacheEntry).key)
 }

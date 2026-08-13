@@ -43,6 +43,42 @@ func TestSubscriptionCacheIsBounded(t *testing.T) {
 	}
 }
 
+func TestSubscriptionCacheBoundsBytesAndAccountsForReplacement(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	c := newSubscriptionCache(8, time.Minute)
+	c.maxBytes = 5
+	c.Put(shareCacheKey("a"), []byte("123"), "text/plain", "", "", base)
+	c.Put(shareCacheKey("b"), []byte("45"), "text/plain", "", "", base)
+	c.Put(shareCacheKey("a"), []byte("1"), "text/plain", "", "", base)
+	if c.bytes != 3 || c.Len() != 2 {
+		t.Fatalf("replacement accounting bytes=%d entries=%d", c.bytes, c.Len())
+	}
+	c.Put(shareCacheKey("c"), []byte("678"), "text/plain", "", "", base)
+	if c.bytes > c.maxBytes || c.Len() != 2 {
+		t.Fatalf("byte eviction bytes=%d entries=%d", c.bytes, c.Len())
+	}
+	if _, _, _, ok := c.Get(shareCacheKey("b"), base); ok {
+		t.Fatal("least-recent byte-budget entry was not evicted")
+	}
+}
+
+func TestSubscriptionCacheBypassesOversizedAndCopiesBodies(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	c := newSubscriptionCache(8, time.Minute)
+	c.maxBytes = 3
+	body := []byte("abc")
+	c.Put(shareCacheKey("a"), body, "text/plain", "", "", base)
+	body[0] = 'x'
+	got, _, _, ok := c.Get(shareCacheKey("a"), base)
+	if !ok || string(got) != "abc" {
+		t.Fatalf("cache retained caller alias: %q %v", got, ok)
+	}
+	c.Put(shareCacheKey("a"), []byte("oversized"), "text/plain", "", "", base)
+	if _, _, _, ok := c.Get(shareCacheKey("a"), base); ok || c.bytes != 0 {
+		t.Fatalf("oversized replacement remained cached: bytes=%d", c.bytes)
+	}
+}
+
 // An empty body must never become something the cache can hand back later: the
 // endpoint refuses to serve one, so storing it would create a path back to the
 // exact response that wipes a client's nodes.

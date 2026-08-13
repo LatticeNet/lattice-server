@@ -380,7 +380,9 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 		if callErr != nil {
 			st.pool.poison(w)
 			if reply.OK || reply.Result != nil || reply.Message != "" {
-				return InvokeResponse{OK: reply.OK, Message: reply.Message, Result: reply.Result}, callErr
+				warning := "persistent worker retired after terminal protocol failure"
+				r.logf("plugin runtime: %s %s", warning, req.PluginID)
+				return InvokeResponse{OK: reply.OK, Message: reply.Message, Result: reply.Result, Warnings: []string{warning}}, nil
 			}
 			return InvokeResponse{}, callErr
 		}

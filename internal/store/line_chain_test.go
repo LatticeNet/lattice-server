@@ -93,9 +93,9 @@ func TestApproveLineChainQueuesTaskAndReservesRevisionAtomically(t *testing.T) {
 	}
 	now := time.Unix(1_700_000_000, 0).UTC()
 	approval := model.Approval{ID: "approval-1", NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines",
-		Method: "chain_set_apply", Action: "apply-line-chain:digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending, CreatedAt: now}
+		Method: "chain_set_apply", Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending, CreatedAt: now}
 	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a",
-		CandidateTargetLineUUID: "target", RequestSHA256: "request", PlanGraphRevision: 0}
+		CandidateTargetLineUUID: "target", CandidateArtifactSHA256: "digest", RequestSHA256: "request", PlanGraphRevision: 0}
 	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
 		t.Fatal(err)
 	}
@@ -126,16 +126,67 @@ func TestApproveLineChainQueuesTaskAndReservesRevisionAtomically(t *testing.T) {
 	if err != nil || len(blocked) != 0 {
 		t.Fatalf("capability downgrade exposed linechain task: deliveries=%+v err=%v", blocked, err)
 	}
-	deliveries, err := s.LeaseTaskDeliveriesWithDurableProtocols("node-a", 1, false, true)
+	validator := func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil }
+	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, validator)
 	if err != nil || len(deliveries) != 1 || deliveries[0].DurableProtocol != DurableProtocolLineChainV1 || !deliveries[0].DurableResult {
 		t.Fatalf("linechain durable lease mismatch: deliveries=%+v err=%v", deliveries, err)
 	}
 	leased := s.LineChainSnapshot().Attempts[approval.ID]
-	if leased.FirstLeaseGraphRevision != 1 || s.LineChainSnapshot().Revision != 1 {
+	if leased.FirstLeaseGraphRevision != 1 || leased.IssuedTaskID != task.ID || leased.IssuedLeaseID != deliveries[0].Task.LeaseID || leased.IssuedScriptSHA256 == "" || leased.IssuedArtifactSHA256 != approval.ArtifactDigest || s.LineChainSnapshot().Revision != 1 {
 		t.Fatalf("first lease changed revision or missed L: %+v", leased)
 	}
-	redelivered, err := s.LeaseTaskDeliveriesWithDurableProtocols("node-a", 1, false, true)
+	redelivered, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, validator)
 	if err != nil || len(redelivered) != 1 || redelivered[0].Task.LeaseID != deliveries[0].Task.LeaseID || s.LineChainSnapshot().Revision != 1 {
 		t.Fatalf("same lease was not redelivered: first=%+v second=%+v err=%v", deliveries, redelivered, err)
+	}
+	s.mu.Lock()
+	mutated := s.state.Tasks[task.ID]
+	mutated.Script = "mutated-after-lease"
+	s.state.Tasks[task.ID] = mutated
+	s.mu.Unlock()
+	afterMutation, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, validator)
+	if !errors.Is(err, ErrTaskTransitionConflict) || len(afterMutation) != 0 {
+		t.Fatalf("mutated issued task reused lease: deliveries=%+v err=%v", afterMutation, err)
+	}
+	staleApproval, _ := s.Approval(approval.ID)
+	staleTask, _ := s.Task(task.ID)
+	issuedAfter := s.LineChainSnapshot().Attempts[approval.ID]
+	if staleApproval.Status != model.ApprovalApproved || staleTask.Status != model.TaskLeased || s.LineChainSnapshot().Revision != 1 || issuedAfter.IssuedLeaseID != leased.IssuedLeaseID {
+		t.Fatalf("post-lease corruption mutated frozen authority: approval=%+v task=%+v snapshot=%+v", staleApproval, staleTask, s.LineChainSnapshot())
+	}
+}
+
+func TestLineChainFirstLeaseValidationFailureReleasesReservationAtomically(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{ID: "approval-stale", NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines",
+		Method: "chain_set_apply", Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending}
+	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a",
+		CandidateTargetLineUUID: "target", CandidateArtifactSHA256: "digest", RequestSHA256: "request", PlanGraphRevision: 0}
+	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
+		t.Fatal(err)
+	}
+	approved := approval
+	approved.Status = model.ApprovalApproved
+	task := model.Task{ID: "task-stale", ApprovalID: approval.ID, Targets: []string{"node-a"}, Script: "stale", Status: model.TaskQueued}
+	if _, committed, err := s.ApproveLineChain(approved, task); err != nil || !committed {
+		t.Fatalf("approve: committed=%v err=%v", committed, err)
+	}
+	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true,
+		func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error {
+			return errors.New("credential changed")
+		})
+	if err != nil || len(deliveries) != 0 {
+		t.Fatalf("stale task was delivered: %+v err=%v", deliveries, err)
+	}
+	gotApproval, _ := s.Approval(approval.ID)
+	gotTask, _ := s.Task(task.ID)
+	snapshot := s.LineChainSnapshot()
+	gotAttempt := snapshot.Attempts[approval.ID]
+	if gotApproval.Status != model.ApprovalRejected || !gotApproval.Stale || gotApproval.StaleCode != "line_chain_inputs_changed" ||
+		gotTask.Status != model.TaskCancelled || gotAttempt.Status != LineChainStatusFailed || snapshot.Revision != 2 {
+		t.Fatalf("stale release not atomic: approval=%+v task=%+v attempt=%+v revision=%d", gotApproval, gotTask, gotAttempt, snapshot.Revision)
 	}
 }

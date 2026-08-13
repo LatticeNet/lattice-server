@@ -2,11 +2,15 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -123,6 +127,62 @@ func TestLineChainAgentTaskViewCarriesExactDurableProtocol(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"durable_protocol":"linechain-e3-v1"`) {
 		t.Fatalf("linechain response protocol mismatch: %s", raw)
+	}
+}
+
+func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	approved, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approved.Status != model.ApprovalApproved {
+		t.Fatalf("approval not approved: %+v", approved)
+	}
+	tasks := srv.store.Tasks()
+	if len(tasks) != 1 || !strings.HasPrefix(tasks[0].Script, "# lattice-linechain-e3-v1\n") {
+		t.Fatalf("expected one E3 task: %+v", tasks)
+	}
+	tmp := t.TempDir()
+	capture := filepath.Join(tmp, "document.json")
+	helper := filepath.Join(tmp, "agent")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\ntest \"$1\" = -linechain-apply\ncat > \"$CAPTURE\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", tasks[0].Script)
+	cmd.Env = append(os.Environ(), "LATTICE_AGENT_BIN="+helper, "LATTICE_LINECHAIN_TXN_DIR="+tmp, "CAPTURE="+capture)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("execute task script: %v: %s", err, out)
+	}
+	raw, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc lineChainAgentDocumentV2
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Version != 2 || doc.Operation != "create" || doc.FragmentBasename != compiled.Plan.FragmentPath ||
+		doc.Fragment == nil || doc.Sidecar == nil || doc.CombinedSHA256 != compiled.Plan.ArtifactSHA256 {
+		t.Fatalf("unexpected v2 document: %+v", doc)
+	}
+	for _, forbidden := range []string{"config_dir", "fragment_path", "sidecar_path", "previous_sidecar_sha256"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("v2 document contains forbidden %s: %s", forbidden, raw)
+		}
+	}
+	snapshot := srv.store.LineChainSnapshot()
+	if snapshot.Revision != 1 || snapshot.Attempts[approval.ID].Status != store.LineChainStatusApplying {
+		t.Fatalf("approval/task/reservation not atomic: %+v", snapshot)
 	}
 }
 

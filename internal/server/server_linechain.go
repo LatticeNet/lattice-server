@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -61,15 +62,16 @@ type lineChainPlan struct {
 }
 
 type lineChainCompiledArtifact struct {
-	Plan                 lineChainPlan
-	FragmentJSON         string
-	SidecarJSON          string
-	TargetCredentialUUID string
-	TargetPublicKey      string
-	TargetShortID        string
-	TargetDefinition     managedLineDef
-	BaseGeneration       uint64
-	PlanGraphRevision    uint64
+	Plan                   lineChainPlan
+	FragmentJSON           string
+	SidecarJSON            string
+	TargetCredentialUUID   string
+	TargetPublicKey        string
+	TargetShortID          string
+	TargetDefinition       managedLineDef
+	BaseGeneration         uint64
+	PlanGraphRevision      uint64
+	PreviousFragmentSHA256 string
 }
 
 // lineChainCompileSnapshot freezes every resolved compiler input before any
@@ -86,13 +88,17 @@ type lineChainCompileSnapshot struct {
 }
 
 func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, error) {
+	return s.captureLineChainCompileSnapshotFromState(s.store.LineChainCompileStateSnapshot())
+}
+
+func (s *Server) captureLineChainCompileSnapshotFromState(persistent store.LineChainCompileStateSnapshot) (lineChainCompileSnapshot, error) {
 	snapshot := lineChainCompileSnapshot{
 		Lines: make(map[string][]Line), Definitions: make(map[string]managedLineDef),
 		Users: make(map[string]VpnUser), Nodes: make(map[string]model.Node),
 		Capabilities: make(map[string]bool),
 	}
-	// Fixed lock order for the two live inputs; the persistent snapshot is then
-	// copied under one Store lock and no compiler path performs a write.
+	// Fixed live-input lock order. The supplied persistent snapshot was copied
+	// under one Store lock; this helper never re-enters Store.
 	s.singboxInvMu.RLock()
 	inventories := make([]model.SingBoxInventory, 0, len(s.singboxInv))
 	for _, inventory := range s.singboxInv {
@@ -106,7 +112,6 @@ func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, er
 	}
 	s.agentCapabilitiesMu.RUnlock()
 	s.singboxInvMu.RUnlock()
-	persistent := s.store.LineChainCompileStateSnapshot()
 	snapshot.Nodes = persistent.Nodes
 	snapshot.Chains = persistent.Chains
 	for uuid, public := range persistent.ManagedLines {
@@ -286,7 +291,7 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 	return lineChainCompiledArtifact{
 		Plan: plan, FragmentJSON: fragment.JSON, SidecarJSON: string(sidecar), TargetCredentialUUID: credential.UUID,
 		TargetPublicKey: definition.RealityPublicKey, TargetShortID: definition.ShortID, TargetDefinition: definition,
-		BaseGeneration: current.Generation, PlanGraphRevision: chainSnapshot.Revision,
+		BaseGeneration: current.Generation, PlanGraphRevision: chainSnapshot.Revision, PreviousFragmentSHA256: current.FragmentSHA256,
 	}, nil
 }
 
@@ -325,7 +330,7 @@ func (s *Server) renderLineChainSidecarSnapshot(snapshot lineChainCompileSnapsho
 	node := snapshot.Nodes[nodeID]
 	doc := lineMetadataDocV2{
 		Schema: lineMetadataSchemaV2, NodeID: nodeID, NodeUUID: strings.TrimSpace(node.LatticeIdentityUUID),
-		UpdatedAt: snapshot.EvidenceAt.UTC().Format(time.RFC3339), Writer: lineMetadataWriter, Inbounds: inbounds,
+		UpdatedAt: time.Unix(0, 0).UTC().Format(time.RFC3339), Writer: lineMetadataWriter, Inbounds: inbounds,
 		Reserved: lineMetadataReservedV2{InConfigKey: "_lattice", Fields: lineMetadataReservedFields{LineUUID: "string", NodeUUID: "string", LineHashID: "string"}},
 	}
 	out, err := json.MarshalIndent(doc, "", "  ")
@@ -415,7 +420,71 @@ func (s *Server) compileLineChainRemoveSnapshot(snapshot lineChainCompileSnapsho
 		PreflightChecks: []string{"source_identity", "committed_baseline", "consumer_capability"},
 		Summary: fmt.Sprintf("Remove managed downstream from %s on %s", source.Name,
 			firstNonEmpty(strings.TrimSpace(snapshot.Nodes[source.NodeID].Name), source.NodeID)),
-	}, SidecarJSON: string(sidecar), BaseGeneration: current.Generation, PlanGraphRevision: snapshot.Chains.Revision}, nil
+	}, SidecarJSON: string(sidecar), BaseGeneration: current.Generation, PlanGraphRevision: snapshot.Chains.Revision,
+		PreviousFragmentSHA256: current.FragmentSHA256}, nil
+}
+
+type lineChainAgentDocumentV2 struct {
+	Version                int     `json:"version"`
+	Operation              string  `json:"operation"`
+	FragmentBasename       string  `json:"fragment_basename"`
+	Fragment               *string `json:"fragment,omitempty"`
+	Sidecar                *string `json:"sidecar"`
+	PreviousFragmentSHA256 string  `json:"previous_fragment_sha256,omitempty"`
+	FragmentSHA256         string  `json:"fragment_sha256,omitempty"`
+	SidecarSHA256          string  `json:"sidecar_sha256"`
+	CombinedSHA256         string  `json:"combined_sha256"`
+}
+
+func lineChainApplyScript(compiled lineChainCompiledArtifact) (string, error) {
+	operation := "create"
+	var fragment *string
+	if compiled.Plan.Operation == store.LineChainOperationRemove {
+		operation = "remove"
+	} else {
+		fragment = &compiled.FragmentJSON
+		if compiled.BaseGeneration > 0 {
+			operation = "replace"
+		}
+	}
+	sidecar := compiled.SidecarJSON
+	doc := lineChainAgentDocumentV2{Version: 2, Operation: operation, FragmentBasename: compiled.Plan.FragmentPath,
+		Fragment: fragment, Sidecar: &sidecar, PreviousFragmentSHA256: compiled.PreviousFragmentSHA256,
+		FragmentSHA256: compiled.Plan.FragmentSHA256, SidecarSHA256: compiled.Plan.SidecarSHA256, CombinedSHA256: compiled.Plan.ArtifactSHA256}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return "", err
+	}
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	return "# lattice-linechain-e3-v1\nset -eu\n: \"${LATTICE_AGENT_BIN:?}\" \"${LATTICE_LINECHAIN_TXN_DIR:?}\"\nprintf '%s' '" + encoded + "' | base64 -d | \"$LATTICE_AGENT_BIN\" -linechain-apply\n", nil
+}
+
+func isLineChainApproval(approval model.Approval) bool {
+	return approval.Plugin == lineChainPlugin && approval.Service == lineChainService &&
+		(approval.Method == lineChainSetMethod || approval.Method == lineChainRemoveMethod) && strings.HasPrefix(approval.Action, lineChainActionPrefix)
+}
+
+func (s *Server) validateLineChainApprovalForQueue(approval model.Approval) (lineChainCompiledArtifact, string, error) {
+	var reviewed lineChainPlan
+	if err := json.Unmarshal([]byte(approval.Plan), &reviewed); err != nil {
+		return lineChainCompiledArtifact{}, "", err
+	}
+	var compiled lineChainCompiledArtifact
+	var err error
+	if reviewed.Operation == store.LineChainOperationRemove {
+		compiled, err = s.compileLineChainRemove(reviewed.SourceLineUUID)
+	} else {
+		compiled, err = s.compileLineChain(lineChainCompileRequest{SourceLineUUID: reviewed.SourceLineUUID, TargetLineUUID: reviewed.TargetLineUUID})
+	}
+	if err != nil {
+		return lineChainCompiledArtifact{}, "", err
+	}
+	if compiled.Plan.ArtifactSHA256 != approval.ArtifactDigest || compiled.Plan.RequestSHA256 != approval.RequestSHA256 ||
+		approval.Action != lineChainActionPrefix+compiled.Plan.ArtifactSHA256 {
+		return lineChainCompiledArtifact{}, "", errors.New("line chain inputs changed after review")
+	}
+	script, err := lineChainApplyScript(compiled)
+	return compiled, script, err
 }
 
 func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArtifact) (model.Approval, error) {
@@ -460,6 +529,39 @@ func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArt
 		Metadata: map[string]string{"approval_id": approval.ID, "source_line_uuid": compiled.Plan.SourceLineUUID, "target_line_uuid": compiled.Plan.TargetLineUUID, "artifact_sha256": compiled.Plan.ArtifactSHA256},
 	})
 	return approval, nil
+}
+
+func (s *Server) validateLineChainFirstLease(persistent store.LineChainCompileStateSnapshot, approval model.Approval, attempt store.LineChainAttempt, task model.Task) error {
+	snapshot, err := s.captureLineChainCompileSnapshotFromState(persistent)
+	if err != nil {
+		return err
+	}
+	var reviewed lineChainPlan
+	if err := json.Unmarshal([]byte(approval.Plan), &reviewed); err != nil {
+		return fmt.Errorf("decode reviewed line chain plan: %w", err)
+	}
+	var compiled lineChainCompiledArtifact
+	if attempt.Operation == store.LineChainOperationRemove {
+		compiled, err = s.compileLineChainRemoveSnapshot(snapshot, attempt.SourceLineUUID)
+	} else {
+		compiled, err = s.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: attempt.SourceLineUUID, TargetLineUUID: attempt.CandidateTargetLineUUID})
+	}
+	if err != nil {
+		return err
+	}
+	if compiled.Plan.ArtifactSHA256 != approval.ArtifactDigest || compiled.Plan.RequestSHA256 != approval.RequestSHA256 ||
+		approval.Action != lineChainActionPrefix+compiled.Plan.ArtifactSHA256 || compiled.Plan.ArtifactSHA256 != attempt.CandidateArtifactSHA256 ||
+		compiled.BaseGeneration != attempt.BaseGeneration || compiled.PlanGraphRevision != persistent.Chains.Revision || reviewed.ArtifactSHA256 != compiled.Plan.ArtifactSHA256 {
+		return errors.New("reviewed line chain artifact no longer matches live inputs")
+	}
+	if task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != attempt.SourceNodeID {
+		return errors.New("line chain task binding changed")
+	}
+	expectedScript, err := lineChainApplyScript(compiled)
+	if err != nil || task.Script != expectedScript {
+		return errors.New("line chain task script no longer matches live artifact")
+	}
+	return nil
 }
 
 func (s *Server) handleLineChainPlan(w http.ResponseWriter, r *http.Request, p principal) {

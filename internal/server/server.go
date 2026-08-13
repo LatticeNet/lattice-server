@@ -5628,6 +5628,7 @@ func (e *approvalDecisionError) Error() string { return e.err.Error() }
 // ever transition for the exact stored plan bytes, whichever entry point
 // drove the decision.
 func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval model.Approval, queueApply bool, planSHA256 string) (model.Approval, error) {
+	lineChainScript := ""
 	if approval.Status != model.ApprovalPending {
 		// Already-decided approvals stay idempotent, matching the manual
 		// endpoint's retry semantics. A previous transition may have crossed the
@@ -5673,6 +5674,16 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
+	if isLineChainApproval(approval) {
+		if !queueApply {
+			return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest, "line chain approvals must atomically queue their apply task")}
+		}
+		_, script, err := s.validateLineChainApprovalForQueue(approval)
+		if err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+		lineChainScript = script
+	}
 	if approval.Plugin == agentUpdatePlugin {
 		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
 			if errors.Is(err, errAgentUpdateApprovalStale) {
@@ -5709,7 +5720,7 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	// operator approved the exact bytes of it; the plugin now executes it under a
 	// one-time grant bound to that approval, and every task it enqueues is checked
 	// against the approved target set.
-	if isPluginOperationApproval(approval) {
+	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) {
 		approval.Status = model.ApprovalApproved
 		approval.ApprovedBy = p.ActorID
 		if err := s.store.UpsertApproval(approval); err != nil {
@@ -5760,6 +5771,8 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			// The script self-validates at render time; a stale plan yields a
 			// script that fails closed on the box instead of mutating it.
 			applyScript = s.managedLineApplyScript(approval)
+		case lineChainPlugin:
+			applyScript = lineChainScript
 		default:
 			applyScript = s.applyScriptFor(approval)
 		}
@@ -5801,6 +5814,18 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			}
 		} else {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+		}
+	} else if isLineChainApproval(approval) {
+		_, committed, err := s.store.ApproveLineChain(approval, task)
+		if committed && err != nil {
+			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+		}
+		if !committed {
+			status := http.StatusInternalServerError
+			if errors.Is(err, store.ErrLineChainRevisionConflict) || errors.Is(err, store.ErrLineChainCycle) || errors.Is(err, store.ErrTaskTransitionConflict) {
+				status = http.StatusConflict
+			}
+			return approval, &approvalDecisionError{status: status, err: apiError(model.APIErrorApprovalStale, "line chain inputs changed while queueing; re-plan before approving")}
 		}
 	} else {
 		if err := s.store.UpsertApproval(approval); err != nil {
@@ -6133,7 +6158,7 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	// approval and current plan-anchor checks atomically with the lease mutation.
 	netGuardCapable := requestHasAgentCapability(r, netGuardManagedSHACapability)
 	lineChainCapable := requestHasAgentCapability(r, lineChainDurableCapability)
-	deliveries, err := s.store.LeaseTaskDeliveriesWithDurableProtocols(nodeID, 3, netGuardCapable, lineChainCapable)
+	deliveries, err := s.store.LeaseTaskDeliveriesWithLineChainValidator(nodeID, 3, netGuardCapable, lineChainCapable, s.validateLineChainFirstLease)
 	if err != nil {
 		if !onlyGenericAgentTaskDeliveries(deliveries) {
 			writeError(w, http.StatusInternalServerError, err)

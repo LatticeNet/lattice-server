@@ -1370,10 +1370,16 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 }
 
 func (s *Store) LeaseTaskDeliveriesWithDurableProtocols(nodeID string, limit int, netGuardAllowed, lineChainAllowed bool) ([]TaskDelivery, error) {
-	return s.leaseTaskDeliveries(nodeID, limit, "nft", "apply-ruleset:netguard-v1", netGuardAllowed, lineChainAllowed)
+	return s.LeaseTaskDeliveriesWithLineChainValidator(nodeID, limit, netGuardAllowed, lineChainAllowed, nil)
 }
 
-func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action string, allowed, lineChainAllowed bool) ([]TaskDelivery, error) {
+type LineChainFirstLeaseValidator func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error
+
+func (s *Store) LeaseTaskDeliveriesWithLineChainValidator(nodeID string, limit int, netGuardAllowed, lineChainAllowed bool, validate LineChainFirstLeaseValidator) ([]TaskDelivery, error) {
+	return s.leaseTaskDeliveries(nodeID, limit, "nft", "apply-ruleset:netguard-v1", netGuardAllowed, lineChainAllowed, validate)
+}
+
+func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action string, allowed, lineChainAllowed bool, validate ...LineChainFirstLeaseValidator) ([]TaskDelivery, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
@@ -1383,6 +1389,44 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks))
 	for id, task := range s.state.Tasks {
 		staged.Tasks[id] = task
+	}
+	staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+	for id, approval := range s.state.Approvals {
+		staged.Approvals[id] = approval
+	}
+	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+	var lineChainValidator LineChainFirstLeaseValidator
+	if len(validate) > 0 {
+		lineChainValidator = validate[0]
+	}
+	lineChainStaled := make(map[string]bool)
+	lineChainMapsCloned := true
+	staleLineChain := func(t model.Task, cause error) {
+		if lineChainMapsCloned == false {
+			staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+			for id, approval := range s.state.Approvals {
+				staged.Approvals[id] = approval
+			}
+			staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+			lineChainMapsCloned = true
+		}
+		approval := staged.Approvals[t.ApprovalID]
+		approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, true, "line_chain_inputs_changed"
+		approval.Reason, approval.UpdatedAt = "line chain inputs changed after approval", now
+		staged.Approvals[approval.ID] = approval
+		t.Status = model.TaskCancelled
+		staged.Tasks[t.ID] = t
+		attempt := staged.LineChainAttempts[t.ApprovalID]
+		attempt.Status, attempt.LastErrorCode, attempt.UpdatedAt = LineChainStatusFailed, "line_chain_inputs_changed", now
+		if cause != nil {
+			attempt.LastError = cause.Error()
+			if len(attempt.LastError) > 512 {
+				attempt.LastError = attempt.LastError[:512]
+			}
+		}
+		staged.LineChainAttempts[t.ApprovalID] = attempt
+		staged.LineChainGraphRevision++
+		lineChainStaled[t.ID], stateChanged = true, true
 	}
 	ids := make([]string, 0, len(staged.Tasks))
 	for id := range staged.Tasks {
@@ -1436,6 +1480,14 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		// can execute, so this closes the lost-response hole without creating a
 		// second execution authority.
 		if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
+			if protocol == DurableProtocolLineChainV1 {
+				attempt := s.state.LineChainAttempts[t.ApprovalID]
+				scriptSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(t.Script)))
+				approval := s.state.Approvals[t.ApprovalID]
+				if attempt.IssuedTaskID != t.ID || attempt.IssuedLeaseID != lease.LeaseID || attempt.IssuedScriptSHA256 != scriptSHA || attempt.IssuedArtifactSHA256 != approval.ArtifactDigest {
+					return nil, ErrTaskTransitionConflict
+				}
+			}
 			redelivered := t
 			redelivered.Status = model.TaskLeased
 			redelivered.LeaseID = lease.LeaseID
@@ -1451,7 +1503,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			continue
 		}
 	}
-	if len(out) > 0 {
+	if len(out) > 0 && !stateChanged {
 		if err := s.confirmDurabilityLocked(); err != nil {
 			return nil, err
 		}
@@ -1467,6 +1519,9 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			if len(out) >= limit {
 				break
 			}
+			if lineChainStaled[id] {
+				continue
+			}
 			t := staged.Tasks[id]
 			protocol, current := gated(t)
 			isGated := protocol != ""
@@ -1476,10 +1531,22 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			if protocol == DurableProtocolLineChainV1 {
 				attempt := staged.LineChainAttempts[t.ApprovalID]
 				currentDefinition := staged.LineChainDefinitions[attempt.SourceLineUUID]
+				var validationErr error
 				if currentDefinition.Generation != attempt.BaseGeneration || currentDefinition.ArtifactSHA256 != attempt.BaseArtifactSHA256 || lineChainGraphHasCycle(staged.LineChainDefinitions, staged.LineChainAttempts) {
+					validationErr = ErrLineChainRevisionConflict
+				} else if lineChainValidator == nil {
+					validationErr = errors.New("line chain first lease validator is required")
+				} else {
+					validationErr = lineChainValidator(s.lineChainCompileStateSnapshotLocked(), staged.Approvals[t.ApprovalID], attempt, t)
+				}
+				if validationErr != nil {
+					staleLineChain(t, validationErr)
 					continue
 				}
-				staged.LineChainAttempts = cloneLineChainAttempts(staged.LineChainAttempts)
+				if !lineChainMapsCloned {
+					staged.LineChainAttempts = cloneLineChainAttempts(staged.LineChainAttempts)
+					lineChainMapsCloned = true
+				}
 				attempt.FirstLeaseGraphRevision = staged.LineChainGraphRevision
 				attempt.UpdatedAt = now
 				staged.LineChainAttempts[t.ApprovalID] = attempt
@@ -1506,6 +1573,13 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 				t.StartedAt = now
 			}
 			staged.Tasks[id] = t
+			if protocol == DurableProtocolLineChainV1 {
+				attempt := staged.LineChainAttempts[t.ApprovalID]
+				attempt.IssuedTaskID, attempt.IssuedLeaseID = t.ID, leaseID
+				attempt.IssuedScriptSHA256 = fmt.Sprintf("%x", sha256.Sum256([]byte(t.Script)))
+				attempt.IssuedArtifactSHA256 = staged.Approvals[t.ApprovalID].ArtifactDigest
+				staged.LineChainAttempts[t.ApprovalID] = attempt
+			}
 			stateChanged = true
 			leased := t
 			leased.LeaseID = leaseID
@@ -1515,15 +1589,17 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		}
 		return nil
 	}
-	if err := leaseFresh(true); err != nil {
-		return nil, err
-	}
 	if len(out) == 0 {
+		if err := leaseFresh(true); err != nil {
+			return nil, err
+		}
+	}
+	if len(out) == 0 && !stateChanged {
 		if err := leaseFresh(false); err != nil {
 			return nil, err
 		}
 	}
-	if len(out) == 0 {
+	if len(out) == 0 && !stateChanged {
 		return out, nil
 	}
 	if !stateChanged {

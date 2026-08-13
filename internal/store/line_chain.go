@@ -70,6 +70,10 @@ type LineChainAttempt struct {
 	PlanGraphRevision       uint64    `json:"plan_graph_revision"`
 	QueuedGraphRevision     uint64    `json:"queued_graph_revision,omitempty"`
 	FirstLeaseGraphRevision uint64    `json:"first_lease_graph_revision,omitempty"`
+	IssuedTaskID            string    `json:"issued_task_id,omitempty"`
+	IssuedLeaseID           string    `json:"issued_lease_id,omitempty"`
+	IssuedScriptSHA256      string    `json:"issued_script_sha256,omitempty"`
+	IssuedArtifactSHA256    string    `json:"issued_artifact_sha256,omitempty"`
 	Status                  string    `json:"status"`
 	LastErrorCode           string    `json:"last_error_code,omitempty"`
 	LastError               string    `json:"last_error,omitempty"`
@@ -99,6 +103,10 @@ type LineChainCompileStateSnapshot struct {
 func (s *Store) LineChainCompileStateSnapshot() LineChainCompileStateSnapshot {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.lineChainCompileStateSnapshotLocked()
+}
+
+func (s *Store) lineChainCompileStateSnapshotLocked() LineChainCompileStateSnapshot {
 	nodes := make(map[string]model.Node, len(s.state.Nodes))
 	for id, node := range s.state.Nodes {
 		nodes[id] = cloneNode(node)
@@ -287,7 +295,8 @@ func (s *Store) ApproveLineChain(approval model.Approval, task model.Task) (Line
 	if currentDefinition.Generation != attempt.BaseGeneration || currentDefinition.ArtifactSHA256 != attempt.BaseArtifactSHA256 {
 		return LineChainAttempt{}, false, ErrLineChainRevisionConflict
 	}
-	if task.ID == "" || task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != attempt.SourceNodeID {
+	if task.ID == "" || task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != attempt.SourceNodeID ||
+		strings.TrimSpace(task.Script) == "" || approval.ArtifactDigest == "" || approval.ArtifactDigest != attempt.CandidateArtifactSHA256 {
 		return LineChainAttempt{}, false, ErrTaskTransitionConflict
 	}
 	for _, existing := range s.state.Tasks {

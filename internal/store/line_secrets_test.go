@@ -583,3 +583,115 @@ func TestPutVpnUserRecordOwnsMonotonicSubscriptionGeneration(t *testing.T) {
 		t.Fatalf("credential generation = %d, want 3", rotated.SubscriptionGeneration)
 	}
 }
+
+func TestVpnUserSubscriptionGenerationCoversRoutingInputsWithoutOrderChurn(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := VpnUserPublicRecord{
+		ID: "vpn-generation-routing", Email: "routing@example.com", Enabled: true,
+		ExpiresAt: time.Unix(1_800_000_000, 0).UTC(),
+		Credentials: []VpnUserCredentialPublic{
+			{Protocol: "trojan", Security: "tls"},
+			{Protocol: "vless", Flow: "xtls-rprx-vision", Security: "reality"},
+		},
+		Bindings: []VpnUserLineBinding{
+			{LineHashID: "line-a", Enabled: true, FlowOverride: "xtls-rprx-vision"},
+			{LineHashID: "line-b", Enabled: true},
+		},
+	}
+	private := VpnUserSecretRecord{
+		SubID: "sub-a",
+		Credentials: []VpnUserCredentialSecret{
+			{Protocol: "trojan", Password: "secret"},
+			{Protocol: "vless", UUID: "11111111-1111-4111-8111-111111111111"},
+		},
+	}
+	if err := s.PutVpnUserRecord(public, private); err != nil {
+		t.Fatal(err)
+	}
+	got, secret, _ := s.VpnUserRecord(public.ID)
+	if got.SubscriptionGeneration != 1 {
+		t.Fatalf("create generation = %d", got.SubscriptionGeneration)
+	}
+
+	got.Credentials[0], got.Credentials[1] = got.Credentials[1], got.Credentials[0]
+	got.Bindings[0], got.Bindings[1] = got.Bindings[1], got.Bindings[0]
+	secret.Credentials[0], secret.Credentials[1] = secret.Credentials[1], secret.Credentials[0]
+	if err := s.PutVpnUserRecord(got, secret); err != nil {
+		t.Fatal(err)
+	}
+	reordered, reorderedSecret, _ := s.VpnUserRecord(public.ID)
+	if reordered.SubscriptionGeneration != 1 {
+		t.Fatalf("semantic reorder advanced generation to %d", reordered.SubscriptionGeneration)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*VpnUserPublicRecord, *VpnUserSecretRecord)
+	}{
+		{name: "sub id", mutate: func(_ *VpnUserPublicRecord, s *VpnUserSecretRecord) { s.SubID = "sub-b" }},
+		{name: "enabled", mutate: func(p *VpnUserPublicRecord, _ *VpnUserSecretRecord) { p.Enabled = false }},
+		{name: "expiry", mutate: func(p *VpnUserPublicRecord, _ *VpnUserSecretRecord) { p.ExpiresAt = p.ExpiresAt.Add(time.Hour) }},
+		{name: "resolved flow", mutate: func(p *VpnUserPublicRecord, _ *VpnUserSecretRecord) {
+			for i := range p.Credentials {
+				if p.Credentials[i].Protocol == "vless" {
+					p.Credentials[i].Flow = "xtls-rprx-vision-updated"
+				}
+			}
+		}},
+	}
+	want := uint64(1)
+	currentPublic, currentPrivate := reordered, reorderedSecret
+	for _, tc := range mutations {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.mutate(&currentPublic, &currentPrivate)
+			if err := s.PutVpnUserRecord(currentPublic, currentPrivate); err != nil {
+				t.Fatal(err)
+			}
+			want++
+			currentPublic, currentPrivate, _ = s.VpnUserRecord(public.ID)
+			if currentPublic.SubscriptionGeneration != want {
+				t.Fatalf("generation = %d, want %d", currentPublic.SubscriptionGeneration, want)
+			}
+		})
+	}
+}
+
+func TestReplaceVpnUserRecordsCannotRewindOrOverflowSubscriptionGeneration(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, private := testVpnUserRecords("vpn-replace-generation", "secret")
+	public.SubscriptionGeneration = 7
+	if err := s.ReplaceVpnUserRecords(map[string]VpnUserPublicRecord{public.ID: public}, map[string]VpnUserSecretRecord{public.ID: private}, nil); err != nil {
+		t.Fatal(err)
+	}
+	public.SubscriptionGeneration = 1
+	if err := s.ReplaceVpnUserRecords(map[string]VpnUserPublicRecord{public.ID: public}, map[string]VpnUserSecretRecord{public.ID: private}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, gotPrivate, _ := s.VpnUserRecord(public.ID)
+	if got.SubscriptionGeneration != 7 {
+		t.Fatalf("bulk replace rewound generation to %d", got.SubscriptionGeneration)
+	}
+
+	overflowStore, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.SubscriptionGeneration = ^uint64(0)
+	if err := overflowStore.ReplaceVpnUserRecords(map[string]VpnUserPublicRecord{got.ID: got}, map[string]VpnUserSecretRecord{got.ID: gotPrivate}, nil); err != nil {
+		t.Fatal(err)
+	}
+	gotPrivate.SubID = "changed-at-overflow"
+	if err := overflowStore.PutVpnUserRecord(got, gotPrivate); err == nil {
+		t.Fatal("generation overflow was accepted")
+	}
+	after, afterPrivate, _ := overflowStore.VpnUserRecord(got.ID)
+	if after.SubscriptionGeneration != ^uint64(0) || afterPrivate.SubID == "changed-at-overflow" {
+		t.Fatalf("overflow mutated state: public=%+v private=%+v", after, afterPrivate)
+	}
+}

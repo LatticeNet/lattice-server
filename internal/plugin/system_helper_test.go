@@ -29,6 +29,12 @@ func runV2Helper() {
 		if json.Unmarshal(s.Bytes(), &f) != nil {
 			os.Exit(3)
 		}
+		if os.Getenv("LATTICE_TEST_V2_HOST") == "1" {
+			b, _ := json.Marshal(stdioJSONV2Frame{Protocol: 2, Kind: "host_call", Generation: f.Generation, InvocationID: f.InvocationID, HostCallID: "h1", HostCall: json.RawMessage(`{"id":"h1","method":"ping"}`)})
+			fmt.Fprintln(os.Stdout, string(b))
+			br := bufio.NewReader(os.NewFile(uintptr(3), "host-response"))
+			_, _ = br.ReadBytes('\n')
+		}
 		if os.Getenv("LATTICE_TEST_V2_NO_READY") == "1" {
 			resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID, Response: json.RawMessage(`{"ok":true,"result":{"once":true}}`)}
 			_ = enc.Encode(resp)
@@ -47,7 +53,7 @@ func runV2Helper() {
 }
 
 func TestRealV2HelperTwoInvocations(t *testing.T) {
-	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1")
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_HOST=1")
 	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
 	if err != nil {
 		t.Fatal(err)
@@ -57,7 +63,7 @@ func TestRealV2HelperTwoInvocations(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		r, err := tr.invokeV2(t.Context(), 1, fmt.Sprintf("i%d", i), InvokeRequest{Action: "x"}, nil)
+		r, err := tr.invokeV2(t.Context(), 1, fmt.Sprintf("i%d", i), InvokeRequest{Action: "x"}, func(systemHostCall) systemHostResponse { return systemHostResponse{ID: "h1", OK: true} })
 		if err != nil || !r.OK {
 			t.Fatalf("invoke %d: %+v %v", i, r, err)
 		}

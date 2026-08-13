@@ -84,7 +84,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 			}
 		}
 		inv.Nodes[0].Protocol, inv.Nodes[0].Network, inv.Nodes[0].Address = "vless", "tcp", "127.0.0.1"
-		inv.Nodes[0].Port, inv.Nodes[0].SNI, inv.Nodes[0].LineUUID, inv.Nodes[0].LineID = strconv.Itoa(target.Port), target.SNI, targetUUID, lineID
+		inv.Nodes[0].Port, inv.Nodes[0].SNI, inv.Nodes[0].LineUUID, inv.Nodes[0].LineID = strconv.Itoa(target.Port), target.SNI, targetUUID, strings.TrimPrefix(lineID, "line_")
 		srv.singboxInv["node-a"] = inv
 	}
 	srv.singboxInvMu.Unlock()

@@ -3,7 +3,6 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,22 +92,62 @@ func stableLineHandle(lineID string) string {
 	return "line_" + lineID
 }
 
-// buildLineUUIDReverseIndex builds the persistent sidecar authority once.
-// Empty values denote ambiguous UUIDs and therefore never resolve.
-func buildLineUUIDReverseIndex(entries []model.KVEntry) map[string]string {
-	index := make(map[string]string, len(entries))
-	for _, entry := range entries {
-		uuid := strings.ToLower(strings.TrimSpace(entry.Value))
-		if uuid == "" {
-			continue
-		}
-		if _, exists := index[uuid]; exists {
-			index[uuid] = ""
-		} else {
-			index[uuid] = entry.Key
+// lineUUIDAuthorityResolver is the pure, immutable reverse authority used by
+// every discovered-line projection. Construction scans the supplied authority
+// exactly once. Empty values denote ambiguous UUIDs and never resolve.
+type lineUUIDAuthorityResolver struct {
+	hashByUUID map[string]string
+	uuidByHash map[string]string
+}
+
+func newLineUUIDAuthorityResolver(each func(func(hash, uuid string))) lineUUIDAuthorityResolver {
+	resolver := lineUUIDAuthorityResolver{
+		hashByUUID: make(map[string]string),
+		uuidByHash: make(map[string]string),
+	}
+	each(func(hash, uuid string) {
+		resolver.add(hash, uuid)
+	})
+	return resolver
+}
+
+func (r lineUUIDAuthorityResolver) add(hash, uuid string) {
+	hash = strings.TrimSpace(hash)
+	uuid = strings.ToLower(strings.TrimSpace(uuid))
+	if hash == "" {
+		return
+	}
+	r.uuidByHash[hash] = uuid
+	if !validLineUUIDv4(uuid) {
+		return
+	}
+	if prior, exists := r.hashByUUID[uuid]; exists && prior != hash {
+		r.hashByUUID[uuid] = ""
+	} else if !exists {
+		r.hashByUUID[uuid] = hash
+	}
+}
+
+func (r lineUUIDAuthorityResolver) resolve(lineID, reportedUUID string, fallback func() string) string {
+	if explicit := stableLineHandle(lineID); explicit != "" {
+		return explicit
+	}
+	reportedUUID = strings.ToLower(strings.TrimSpace(reportedUUID))
+	if validLineUUIDv4(reportedUUID) {
+		if hash := r.hashByUUID[reportedUUID]; hash != "" {
+			return hash
 		}
 	}
-	return index
+	return fallback()
+}
+
+// uuid returns a UUID only when both directions uniquely identify the same
+// hash. This round trip prevents a dynamically computed hash from re-admitting
+// a duplicated UUID into compiler or read-model output.
+func (r lineUUIDAuthorityResolver) uuid(hash string) (string, bool) {
+	hash = strings.TrimSpace(hash)
+	uuid := r.uuidByHash[hash]
+	return uuid, uuid != "" && r.hashByUUID[uuid] == hash
 }
 
 func validLineUUIDv4(value string) bool {
@@ -119,66 +158,22 @@ func validLineUUIDv4(value string) bool {
 	return strings.ContainsRune("89ab", rune(value[19]))
 }
 
-// resolveLineUUIDAuthority restores a missing control-plane mapping from the
-// agent sidecar only when the reported UUID is a collision-free UUIDv4. An
-// existing DB mapping is authoritative and cannot be changed by an agent.
-func (s *Server) resolveLineUUIDAuthority(lineHashID, reported string) (string, error) {
-	lineHashID = strings.TrimSpace(lineHashID)
-	if lineHashID == "" {
-		return "", fmt.Errorf("line_hash_id is required")
-	}
-	reported = strings.ToLower(strings.TrimSpace(reported))
-	s.lineUUIDMu.Lock()
-	defer s.lineUUIDMu.Unlock()
-
-	entries := s.store.KV(lineUUIDKVBucket)
-	if existing, ok := s.store.KVEntry(lineUUIDKVBucket, lineHashID); ok && strings.TrimSpace(existing.Value) != "" {
-		value := strings.ToLower(strings.TrimSpace(existing.Value))
-		if !validLineUUIDv4(value) {
-			return "", fmt.Errorf("persisted line_uuid for %s is not UUIDv4", lineHashID)
-		}
-		for _, entry := range entries {
-			if entry.Key != lineHashID && strings.EqualFold(strings.TrimSpace(entry.Value), value) {
-				return "", fmt.Errorf("persisted line_uuid %s collides with line %s", value, entry.Key)
-			}
-		}
-		if reported != "" && reported != value {
-			s.logger.Printf("linemeta: ignore agent line_uuid %s for %s; control-plane mapping is %s", reported, lineHashID, value)
-		}
-		return value, nil
-	}
-
-	candidate := ""
-	if validLineUUIDv4(reported) {
-		candidate = reported
-		for _, entry := range entries {
-			if strings.EqualFold(strings.TrimSpace(entry.Value), candidate) {
-				s.logger.Printf("linemeta: reject agent line_uuid %s for %s; already assigned to %s", candidate, lineHashID, entry.Key)
-				candidate = ""
-				break
-			}
-		}
-	} else if reported != "" {
-		s.logger.Printf("linemeta: reject invalid agent line_uuid %q for %s", reported, lineHashID)
-	}
-	if candidate == "" {
-		var err error
-		candidate, err = newProxyUUID()
-		if err != nil {
-			return "", err
-		}
-	}
-	if err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: lineHashID, Value: candidate}); err != nil {
-		return "", err
-	}
-	return candidate, nil
-}
-
 // buildLineGroups merges Lattice-managed inbounds and on-box discovered nodes into
 // one node-grouped Line set. Managed lines win a (node,type,port) collision (the
 // managed view is richer and editable); the matching discovered entry is dropped
 // so an applied-then-discovered inbound is not listed twice.
 func (s *Server) buildLineGroups() []LineGroup {
+	// A projection owns one immutable view of UUID authority. Holding the
+	// authority lock across the batch prevents concurrent reattach from mixing
+	// generations and lets all known lines resolve without per-line KV scans.
+	s.lineUUIDMu.Lock()
+	defer s.lineUUIDMu.Unlock()
+	uuidResolver := newLineUUIDAuthorityResolver(func(yield func(hash, uuid string)) {
+		for _, entry := range s.store.KV(lineUUIDKVBucket) {
+			yield(entry.Key, entry.Value)
+		}
+	})
+
 	byNode := map[string][]Line{}
 	// (nodeID|type|port) -> already have a managed line, so skip the discovered dup.
 	managedKey := map[string]bool{}
@@ -237,7 +232,6 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// known. Newer discovery sources also include listen_host / outbound_ref /
 	// user_count from runtime config inspection; older agents leave them empty
 	// and UserKnown=false.
-	uuidToHash := buildLineUUIDReverseIndex(s.store.KV(lineUUIDKVBucket))
 	for _, inv := range s.liveSingBoxInventories(s.now()) {
 		for _, n := range inv.Nodes {
 			port, _ := strconv.Atoi(strings.TrimSpace(n.Port))
@@ -278,13 +272,9 @@ func (s *Server) buildLineGroups() []LineGroup {
 				LastError:          lastErr,
 				Metadata:           n.Metadata,
 			}
-			ln.LineHashID = stableLineHandle(ln.LineID)
-			if ln.LineHashID == "" && validLineUUIDv4(ln.LineUUID) {
-				ln.LineHashID = uuidToHash[strings.ToLower(strings.TrimSpace(ln.LineUUID))]
-			}
-			if ln.LineHashID == "" {
-				ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
-			}
+			ln.LineHashID = uuidResolver.resolve(ln.LineID, ln.LineUUID, func() string {
+				return lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
+			})
 			ln.ID = ln.LineHashID
 			byNode[ln.NodeID] = append(byNode[ln.NodeID], ln)
 		}
@@ -332,12 +322,33 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// DownstreamLineUUID stays empty for them this slice.
 	for nodeID, lines := range byNode {
 		for i := range lines {
-			uuid, err := s.resolveLineUUIDAuthority(lines[i].LineHashID, lines[i].LineUUID)
-			if err != nil {
-				s.logger.Printf("linemeta: allocate line_uuid for %s: %v", lines[i].LineHashID, err)
+			if uuid, ok := uuidResolver.uuid(lines[i].LineHashID); ok {
+				lines[i].LineUUID = uuid
+				continue
+			}
+			if persisted := uuidResolver.uuidByHash[lines[i].LineHashID]; persisted != "" {
+				s.logger.Printf("linemeta: reject non-unique or invalid persisted line_uuid %s for %s", persisted, lines[i].LineHashID)
+				lines[i].LineUUID = ""
+				continue
+			}
+			uuid := strings.ToLower(strings.TrimSpace(lines[i].LineUUID))
+			_, uuidKnown := uuidResolver.hashByUUID[uuid]
+			if !validLineUUIDv4(uuid) || uuidKnown {
+				var err error
+				uuid, err = newProxyUUID()
+				if err != nil {
+					s.logger.Printf("linemeta: allocate line_uuid for %s: %v", lines[i].LineHashID, err)
+					lines[i].LineUUID = ""
+					continue
+				}
+			}
+			if err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: lines[i].LineHashID, Value: uuid}); err != nil {
+				s.logger.Printf("linemeta: persist line_uuid for %s: %v", lines[i].LineHashID, err)
+				lines[i].LineUUID = ""
 				continue
 			}
 			lines[i].LineUUID = uuid
+			uuidResolver.add(lines[i].LineHashID, uuid)
 		}
 		byNode[nodeID] = lines
 	}
@@ -388,11 +399,16 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// downstream_line_uuid resolves to the downstream line's hash fleet-wide —
 	// exact across machines, immune to NAT and shared ports — and takes
 	// provenance precedence over the inferred (host,port) edges from (3).
-	uuidIndex := map[string]string{} // line_uuid -> line_hash_id
+	uuidIndex := map[string]string{} // line_uuid -> unique line_hash_id; empty means ambiguous
 	for _, lines := range byNode {
 		for _, ln := range lines {
-			if ln.LineUUID != "" {
-				uuidIndex[ln.LineUUID] = ln.LineHashID
+			uuid := strings.ToLower(strings.TrimSpace(ln.LineUUID))
+			if uuid != "" {
+				if prior, exists := uuidIndex[uuid]; exists && prior != ln.LineHashID {
+					uuidIndex[uuid] = ""
+				} else if !exists {
+					uuidIndex[uuid] = ln.LineHashID
+				}
 			}
 		}
 	}

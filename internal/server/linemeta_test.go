@@ -236,14 +236,63 @@ func TestBuildLineGroupsSafelyRestoresAgentLineUUID(t *testing.T) {
 		}
 	})
 
-	t.Run("collision allocates fresh v4", func(t *testing.T) {
+	t.Run("known uuid survives shape mutation", func(t *testing.T) {
 		srv := newServer(t, reported)
-		if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: "line_other", Value: reported}); err != nil {
+		if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hubHash, Value: reported}); err != nil {
+			t.Fatal(err)
+		}
+		srv.singboxInvMu.Lock()
+		inv := srv.singboxInv["node-a"]
+		inv.Nodes[0].ListenHost = "127.0.0.2"
+		inv.Nodes[0].OutboundRef = "mutated-exit"
+		srv.singboxInv["node-a"] = inv
+		srv.singboxInvMu.Unlock()
+		hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		if hub.LineHashID != hubHash || hub.LineUUID != reported {
+			t.Fatalf("persisted UUID authority did not survive shape mutation: %+v", hub)
+		}
+	})
+
+	t.Run("explicit line id wins over uuid", func(t *testing.T) {
+		srv := newServer(t, reported)
+		if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hubHash, Value: reported}); err != nil {
+			t.Fatal(err)
+		}
+		srv.singboxInvMu.Lock()
+		inv := srv.singboxInv["node-a"]
+		inv.Nodes[0].LineID = "agent-stable-id"
+		srv.singboxInv["node-a"] = inv
+		srv.singboxInvMu.Unlock()
+		hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		if hub.LineHashID != "line_agent-stable-id" {
+			t.Fatalf("explicit line_id did not override UUID authority: %+v", hub)
+		}
+	})
+
+	t.Run("unknown uuid uses dynamic hash without hijack", func(t *testing.T) {
+		srv := newServer(t, reported)
+		if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: "line_other", Value: other}); err != nil {
 			t.Fatal(err)
 		}
 		hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
-		if !validLineUUIDv4(hub.LineUUID) || hub.LineUUID == reported {
-			t.Fatalf("colliding report was accepted: %+v", hub)
+		if hub.LineHashID != hubHash || hub.LineUUID != reported {
+			t.Fatalf("unknown UUID did not retain dynamic identity: %+v", hub)
+		}
+		if entry, ok := srv.store.KVEntry(lineUUIDKVBucket, "line_other"); !ok || entry.Value != other {
+			t.Fatalf("unknown UUID overwrote unrelated authority: %+v ok=%v", entry, ok)
+		}
+	})
+
+	t.Run("duplicate uuid falls back and allocates fresh v4", func(t *testing.T) {
+		srv := newServer(t, reported)
+		for _, hash := range []string{"line_other_one", "line_other_two"} {
+			if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hash, Value: reported}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		hub := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		if hub.LineHashID != hubHash || !validLineUUIDv4(hub.LineUUID) || hub.LineUUID == reported {
+			t.Fatalf("ambiguous UUID did not fall back safely: %+v", hub)
 		}
 	})
 }

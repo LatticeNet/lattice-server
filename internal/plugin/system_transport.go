@@ -18,6 +18,13 @@ type transportFrame struct {
 	err  error
 }
 
+func validateInvokeReady(f stdioJSONV2Frame, generation uint64, invocation string) error {
+	if f.Protocol != 2 || f.Kind != "invoke_ready" || f.Generation != generation || f.InvocationID != invocation || f.HostCallID != "" || len(f.Request) != 0 || len(f.Response) != 0 || len(f.HostCall) != 0 || len(f.HostResponse) != 0 {
+		return fmt.Errorf("invalid invoke_ready frame")
+	}
+	return nil
+}
+
 func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse) (systemRunnerReply, error) {
 	if t == nil || t.stdin == nil || t.scanner == nil {
 		return systemRunnerReply{}, fmt.Errorf("worker transport unavailable")
@@ -103,10 +110,11 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 				if err := decodeStrictV2(line, &ready); err != nil {
 					return systemRunnerReply{}, err
 				}
-				if ready.Kind == "invoke_ready" && ready.Generation == generation && ready.InvocationID == invocation {
+				if err := validateInvokeReady(ready, generation, invocation); err == nil {
 					return reply, nil
 				}
-				return reply, fmt.Errorf("missing invoke_ready")
+				_ = t.abort()
+				return reply, fmt.Errorf("invalid invoke_ready")
 			}
 		}
 	}

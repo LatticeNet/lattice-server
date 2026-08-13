@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -165,6 +166,77 @@ func TestLineSecretMigrationTenThousandRecordsUsesOneJSONCommit(t *testing.T) {
 				t.Fatalf("migration persisted %d times, want exactly one", calls)
 			}
 		})
+	}
+}
+
+func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := model.Approval{ID: "approval-managed-pending", NodeID: "node-a", Plugin: "singbox-managedline", Status: model.ApprovalPending, Plan: `{"private":"approval-canary"}`}
+	if err := s.UpsertApproval(pending); err != nil {
+		t.Fatal(err)
+	}
+	pending, _ = s.Approval(pending.ID)
+	if err := s.MigrateLineSecrets(func(source LineSecretMigrationSource) (LineSecretMigrationBuild, error) {
+		public, private := testVpnUserRecords("vpn-1", "credential-canary")
+		source.VpnUsers[public.ID], source.VpnUserSecrets[public.ID] = public, private
+		return LineSecretMigrationBuild{VpnUsers: source.VpnUsers, VpnUserSecrets: source.VpnUserSecrets,
+			ManagedLines: source.ManagedLines, ManagedLineSecrets: source.ManagedLineSecrets}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.Approval(pending.ID)
+	if !ok || !reflect.DeepEqual(got, pending) {
+		t.Fatalf("pending managed-line approval changed during migration: got=%+v ok=%v", got, ok)
+	}
+}
+
+func TestLineSecretMigrationFullBoltUsesExactlyOneUpdate(t *testing.T) {
+	bs, err := OpenBoltState(filepath.Join(t.TempDir(), "state.db"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+	state := emptyState()
+	for i := 0; i < 10_000; i++ {
+		id := fmt.Sprintf("vpn-%05d", i)
+		state.VpnUsers[id], state.VpnUserSecrets[id] = testVpnUserRecords(id, "secret-"+id)
+		lineID := fmt.Sprintf("line-%05d", i)
+		state.ManagedLines[lineID] = ManagedLinePublicRecord{LineUUID: lineID, NodeID: "node-a", Status: "applied"}
+		state.ManagedLineSecrets[lineID] = ManagedLineSecretRecord{RealityPrivateKey: "private-" + lineID}
+	}
+	before := bs.testUpdateCalls
+	if err := bs.ImportState(state); err != nil {
+		t.Fatal(err)
+	}
+	if calls := bs.testUpdateCalls - before; calls != 1 {
+		t.Fatalf("full Bolt migration used %d write transactions, want exactly one", calls)
+	}
+}
+
+func TestLineSecretBoundsRejectRecord100001AndAggregate256MiB(t *testing.T) {
+	tooMany := make(map[string]VpnUserPublicRecord, MaxVpnUserRecords+1)
+	for i := 0; i <= MaxVpnUserRecords; i++ {
+		id := fmt.Sprintf("vpn-%06d", i)
+		tooMany[id] = VpnUserPublicRecord{ID: id}
+	}
+	if err := validateVpnUserCollections(tooMany, nil); err == nil || !strings.Contains(err.Error(), "more than 100000") {
+		t.Fatalf("record 100001 was not rejected: %v", err)
+	}
+
+	const records = 17_000
+	payload := strings.Repeat("x", 16_200)
+	public := make(map[string]VpnUserPublicRecord, records)
+	private := make(map[string]VpnUserSecretRecord, records)
+	for i := 0; i < records; i++ {
+		id := fmt.Sprintf("vpn-%05d", i)
+		public[id] = VpnUserPublicRecord{ID: id, Credentials: []VpnUserCredentialPublic{{Protocol: "vless"}}}
+		private[id] = VpnUserSecretRecord{Credentials: []VpnUserCredentialSecret{{Protocol: "vless", UUID: payload}}}
+	}
+	if err := validateVpnUserCollections(public, private); err == nil || !strings.Contains(err.Error(), "aggregate encoded bytes") {
+		t.Fatalf("aggregate secret collection beyond 256 MiB was not rejected: %v", err)
 	}
 }
 

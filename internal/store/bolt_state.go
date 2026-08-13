@@ -141,8 +141,9 @@ var boltStateBuckets = [][]byte{
 // drift from the JSON store, so changes here MUST be mirrored and tested against
 // internal/store/store.go.
 type BoltStateStore struct {
-	db     *bolt.DB
-	cipher secret.Cipher
+	db              *bolt.DB
+	cipher          secret.Cipher
+	testUpdateCalls int
 }
 
 func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
@@ -204,6 +205,7 @@ func (bs *BoltStateStore) ImportState(st State) error {
 	if err != nil {
 		return err
 	}
+	bs.testUpdateCalls++
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := resetBoltBuckets(tx); err != nil {
 			return err

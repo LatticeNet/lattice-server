@@ -1,10 +1,24 @@
 package plugin
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sync"
 )
+
+func decodeStrictV2(data []byte, dst any) error {
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.DisallowUnknownFields()
+	if err := d.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := d.Decode(&extra); err == nil {
+		return fmt.Errorf("trailing v2 frame data")
+	}
+	return nil
+}
 
 type stdioV2Session struct {
 	mu         sync.Mutex

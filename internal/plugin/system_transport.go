@@ -25,7 +25,7 @@ func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, r
 	}
 	for t.scanner.Scan() {
 		var f stdioJSONV2Frame
-		if err := json.Unmarshal(t.scanner.Bytes(), &f); err != nil {
+		if err := decodeStrictV2(t.scanner.Bytes(), &f); err != nil {
 			return systemRunnerReply{}, err
 		}
 		if err := validateStdioJSONV2Frame(f, generation, invocation, ""); err != nil {
@@ -94,7 +94,7 @@ func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 		return fmt.Errorf("worker exited before runtime_ready")
 	}
 	var f stdioJSONV2Frame
-	if err := json.Unmarshal(t.scanner.Bytes(), &f); err != nil {
+	if err := decodeStrictV2(t.scanner.Bytes(), &f); err != nil {
 		return fmt.Errorf("decode runtime_ready: %w", err)
 	}
 	if f.Kind != "runtime_ready" {

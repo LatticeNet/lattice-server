@@ -163,7 +163,8 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sh", "-c", leased[0].Script)
-	cmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"), "LATTICE_AGENT_BIN="+agent, "LATTICE_LINECHAIN_TXN_DIR="+txnDir, "LATTICE_LINECHAIN_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+sidecar, "LATTICE_TASK_ID="+leased[0].ID, "LATTICE_TASK_LEASE_ID="+leased[0].LeaseID, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+fmt.Sprintf("%x", sha256.Sum256([]byte(leased[0].Script))))
+	crashMarker := filepath.Join(root, "crash.marker")
+	cmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"), "LATTICE_AGENT_BIN="+agent, "LATTICE_LINECHAIN_TXN_DIR="+txnDir, "LATTICE_LINECHAIN_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+sidecar, "LATTICE_TASK_ID="+leased[0].ID, "LATTICE_TASK_LEASE_ID="+leased[0].LeaseID, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+fmt.Sprintf("%x", sha256.Sum256([]byte(leased[0].Script))), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_CRASH_MARKER="+crashMarker)
 	// The production Manager resolves sing-box by name. The wrapper executes only
 	// the official binary and preserves its diagnostics for an actionable failure.
 	checkLog := filepath.Join(root, "sing-box-check.log")
@@ -174,6 +175,15 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		diagnostics, _ := os.ReadFile(checkLog)
 		t.Fatalf("real agent helper failed: %v: %s; sing-box: %s", err, out, diagnostics)
+	}
+	recoveryResult := filepath.Join(root, "recovery-result.json")
+	recoverCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2ERecoverHelper$", "--", root)
+	recoverCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_CRASH_MARKER="+crashMarker, "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT="+recoveryResult)
+	if out, err := recoverCmd.CombinedOutput(); err != nil {
+		t.Fatalf("startup recovery helper failed: %v: %s", err, out)
+	}
+	if raw, err := os.ReadFile(recoveryResult); err != nil || !bytes.Contains(raw, []byte(leased[0].ID)) {
+		t.Fatalf("recovery result missing leased task: err=%v raw=%s", err, raw)
 	}
 	lifecycleKillPIDFile(root, "b")
 	lifecycleStartProcess(t, singbox, root, "b-applied", configDir, bPort)

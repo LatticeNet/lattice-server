@@ -19,6 +19,7 @@ type systemWorkerTransport struct {
 	hostResp *os.File
 	stderr   *os.File
 	pgid     int
+	scanner  *bufio.Scanner
 }
 
 func (t *systemWorkerTransport) closePipes() {
@@ -43,13 +44,14 @@ func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 	if t == nil || t.stdout == nil {
 		return fmt.Errorf("worker stdout unavailable")
 	}
-	s := bufio.NewScanner(t.stdout)
-	s.Buffer(make([]byte, 0, 4096), 64*1024)
-	if !s.Scan() {
+	if t.scanner == nil {
+		return fmt.Errorf("worker decoder unavailable")
+	}
+	if !t.scanner.Scan() {
 		return fmt.Errorf("worker exited before runtime_ready")
 	}
 	var f stdioJSONV2Frame
-	if err := json.Unmarshal(s.Bytes(), &f); err != nil {
+	if err := json.Unmarshal(t.scanner.Bytes(), &f); err != nil {
 		return fmt.Errorf("decode runtime_ready: %w", err)
 	}
 	if f.Kind != "runtime_ready" {
@@ -62,7 +64,7 @@ func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 }
 
 func startSystemWorker(ctx context.Context, path, dir string, env []string) (*systemWorkerTransport, error) {
-	cmd := exec.CommandContext(ctx, path)
+	cmd := exec.Command(path)
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -92,7 +94,10 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 		return nil, err
 	}
 	_ = hostRead.Close()
-	return &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid}, nil
+	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid}
+	t.scanner = bufio.NewScanner(t.stdout)
+	t.scanner.Buffer(make([]byte, 0, 4096), 64*1024)
+	return t, nil
 }
 
 func (t *systemWorkerTransport) abort() error {

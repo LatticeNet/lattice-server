@@ -479,6 +479,41 @@ func TestGenericTaskMutationCannotBypassLineChainProtocol(t *testing.T) {
 	}
 }
 
+func TestFirstLeaseStagesEveryFailedAuditInOneBatch(t *testing.T) {
+	s, _ := Open("")
+	for i, source := range []string{"source-a", "source-b"} {
+		id := fmt.Sprintf("approval-batch-%d", i)
+		approval := model.Approval{ID: id, NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines", Method: "chain_set_apply",
+			Action: "apply-line-chain:" + id, ArtifactDigest: id, RequestSHA256: id, Plan: "{}", Status: model.ApprovalPending, Targets: []string{"node-a"}}
+		attempt := LineChainAttempt{ApprovalID: id, Operation: LineChainOperationSet, SourceLineUUID: source, SourceNodeID: "node-a", CandidateTargetLineUUID: "target-" + source,
+			CandidateArtifactSHA256: id, CandidateDefinition: LineChainDefinition{SourceLineUUID: source, TargetLineUUID: "target-" + source, ArtifactSHA256: id}, RequestSHA256: id,
+			PlanGraphRevision: s.LineChainSnapshot().Revision}
+		if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
+			t.Fatal(err)
+		}
+		approval.Status = model.ApprovalApproved
+		task := model.Task{ID: "task-" + id, ApprovalID: id, ActorID: "approver", TokenID: "token", Targets: []string{"node-a"}, Script: "script", Status: model.TaskQueued}
+		if _, committed, err := s.ApproveLineChain(approval, task); err != nil || !committed {
+			t.Fatalf("approve %s committed=%v err=%v", id, committed, err)
+		}
+	}
+	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 2, false, true, func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error {
+		return errors.New("dependency changed")
+	})
+	if err != nil || len(deliveries) != 0 {
+		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	}
+	for i := range 2 {
+		approvalID, taskID := fmt.Sprintf("approval-batch-%d", i), fmt.Sprintf("task-approval-batch-%d", i)
+		approval, _ := s.Approval(approvalID)
+		task, _ := s.Task(taskID)
+		event := lineChainFirstLeaseFailureAudit(approval, task, time.Now().UTC(), "dependency changed")
+		if stored, ok := s.AuditEventByID(event.ID); !ok || stored.Action != "linechain.failed" || stored.Metadata["task_id"] != taskID {
+			t.Fatalf("missing batched failure audit %s: ok=%v event=%+v", taskID, ok, stored)
+		}
+	}
+}
+
 func TestReconcileLineChainsUsesExactObservedSetAndRemoveEvidence(t *testing.T) {
 	s, err := Open("")
 	if err != nil {

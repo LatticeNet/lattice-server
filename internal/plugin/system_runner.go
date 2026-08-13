@@ -305,6 +305,30 @@ func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 	return nil
 }
 
+// StopAll drains every generation and reaps all persistent workers during
+// graceful server shutdown.
+func (r *SystemRunner) StopAll(ctx context.Context) error {
+	r.mu.Lock()
+	states := make([]*systemPluginState, 0, len(r.st))
+	for _, st := range r.st {
+		states = append(states, st)
+	}
+	r.st = map[string]*systemPluginState{}
+	r.mu.Unlock()
+	for _, st := range states {
+		if st.pool != nil {
+			st.pool.drain(st.pool.generation)
+		}
+		if st.workDir != "" {
+			_ = os.RemoveAll(st.workDir)
+		}
+	}
+	if ctx != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
 // Invoke runs the plugin for one action and returns its decoded reply. The
 // process is spawned with arg-vector exec (NO shell, so payload content can never
 // be interpreted as a command), a confined working directory, an allowlisted

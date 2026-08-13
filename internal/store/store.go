@@ -2004,6 +2004,80 @@ func (s *Store) AppendAudit(ev model.AuditEvent) error {
 	return s.Save()
 }
 
+// AppendAuditIdempotent records required domain evidence exactly once by ID.
+// External audit sinks deduplicate before the staged JSON authority is
+// persisted, so a retry after any partial failure safely repairs the gap.
+func (s *Store) AppendAuditIdempotent(ev model.AuditEvent) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ev.ID == "" || ev.At.IsZero() || ev.Decision == "" {
+		return false, errors.New("idempotent audit requires id, at, and decision")
+	}
+	equal := func(a, b model.AuditEvent) bool {
+		left, _ := json.Marshal(a)
+		right, _ := json.Marshal(b)
+		return string(left) == string(right)
+	}
+	exists := false
+	for _, current := range s.state.Audit {
+		if current.ID != ev.ID {
+			continue
+		}
+		if !equal(current, ev) {
+			return false, fmt.Errorf("audit id %q conflicts with existing evidence", ev.ID)
+		}
+		exists = true
+		break
+	}
+	if s.wal != nil {
+		if _, err := s.wal.AppendIdempotent(ev); err != nil {
+			return false, err
+		}
+	}
+	if s.runtimeBoltHot != nil {
+		hotEvents, err := s.runtimeBoltHot.AuditEvents()
+		if err != nil {
+			return false, err
+		}
+		hotExists := false
+		for _, current := range hotEvents {
+			if current.ID == ev.ID {
+				if !equal(current, ev) {
+					return false, fmt.Errorf("hot audit id %q conflicts with existing evidence", ev.ID)
+				}
+				hotExists = true
+				break
+			}
+		}
+		if !hotExists {
+			if err := s.runtimeBoltHot.AppendAudit(ev); err != nil {
+				return false, err
+			}
+		}
+	}
+	if exists {
+		return false, s.confirmDurabilityLocked()
+	}
+	staged := s.state
+	staged.Audit = append(append([]model.AuditEvent(nil), s.state.Audit...), ev)
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return committed, err
+}
+
+func (s *Store) AuditEventByID(id string) (model.AuditEvent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, event := range s.state.Audit {
+		if event.ID == id {
+			return event, true
+		}
+	}
+	return model.AuditEvent{}, false
+}
+
 // AuditWALVerify re-reads the append-only audit WAL and validates its hash chain.
 // The second return is false when no WAL is configured (in-memory store).
 func (s *Store) AuditWALVerify() (audit.Result, bool, error) {

@@ -176,6 +176,89 @@ func digestText(value string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func lineChainAuditID(kind, approvalID, suffix string) string {
+	digest := sha256.Sum256([]byte(kind + "\x00" + approvalID + "\x00" + suffix))
+	return "audit_linechain_" + hex.EncodeToString(digest[:16])
+}
+
+func (s *Server) appendRequiredLineChainAudit(event model.AuditEvent) error {
+	_, err := s.store.AppendAuditIdempotent(event)
+	return err
+}
+
+func lineChainAuditMetadata(approval model.Approval, taskID string) map[string]string {
+	metadata := map[string]string{"approval_id": approval.ID, "artifact_sha256": approval.ArtifactDigest}
+	if taskID != "" {
+		metadata["task_id"] = taskID
+	}
+	var plan lineChainPlan
+	if json.Unmarshal([]byte(approval.Plan), &plan) == nil {
+		metadata["source_line_uuid"] = plan.SourceLineUUID
+		if plan.TargetLineUUID != "" {
+			metadata["target_line_uuid"] = plan.TargetLineUUID
+		}
+	}
+	return metadata
+}
+
+func (s *Server) ensureLineChainPlanAudit(p principal, approval model.Approval) error {
+	event := model.AuditEvent{ID: lineChainAuditID("plan", approval.ID, ""), At: approval.CreatedAt, ActorID: p.ActorID, TokenID: p.TokenID,
+		NodeID: approval.NodeID, Action: "linechain.plan", Scope: "network:plan", Decision: "allow", CorrelationID: p.CorrelationID,
+		Metadata: lineChainAuditMetadata(approval, "")}
+	return s.appendRequiredLineChainAudit(event)
+}
+
+func (s *Server) ensureLineChainApproveAudit(p principal, approval model.Approval, taskID string) error {
+	event := model.AuditEvent{ID: lineChainAuditID("approve", approval.ID, taskID), At: approval.UpdatedAt, ActorID: p.ActorID, TokenID: p.TokenID,
+		NodeID: approval.NodeID, Action: "linechain.approve", Scope: approvalDecisionAuditScope(approval), Decision: "allow", CorrelationID: p.CorrelationID,
+		Metadata: lineChainAuditMetadata(approval, taskID)}
+	return s.appendRequiredLineChainAudit(event)
+}
+
+func (s *Server) ensureLineChainTerminalAudit(approval model.Approval, task model.Task, result model.TaskResult) error {
+	auditID := lineChainAuditID("terminal", approval.ID, task.ID+"\x00"+result.NodeID)
+	if _, ok := s.store.AuditEventByID(auditID); ok {
+		return nil
+	}
+	action, decision, reason := "linechain.apply", "allow", ""
+	if result.ExitCode != 0 || result.Error != "" {
+		action, decision, reason = "linechain.failed", "deny", "host apply failed"
+	} else if approval.Method == lineChainRemoveMethod {
+		action = "linechain.remove"
+	} else if definition := s.store.LineChainSnapshot().Definitions[lineChainAuditMetadata(approval, task.ID)["source_line_uuid"]]; definition.Status == store.LineChainStatusDrifted {
+		action, reason = "linechain.drift", definition.DriftCode
+	}
+	event := model.AuditEvent{ID: auditID, At: result.FinishedAt, ActorID: approval.ActorID, TokenID: task.TokenID, NodeID: approval.NodeID,
+		Action: action, Scope: "network:apply", Decision: decision, Reason: reason, Metadata: lineChainAuditMetadata(approval, task.ID)}
+	return s.appendRequiredLineChainAudit(event)
+}
+
+func (s *Server) ensureLineChainReconciliationAudits(nodeID string) error {
+	for _, definition := range s.store.LineChainSnapshot().Definitions {
+		if definition.SourceNodeID != nodeID || (definition.Status != store.LineChainStatusConverged && definition.Status != store.LineChainStatusDrifted) {
+			continue
+		}
+		action, decision := "linechain.apply", "allow"
+		if definition.TargetLineUUID == "" {
+			action = "linechain.remove"
+		}
+		if definition.Status == store.LineChainStatusDrifted {
+			action, decision = "linechain.drift", "deny"
+		}
+		approval, ok := s.store.Approval(definition.ApprovalID)
+		if !ok {
+			continue
+		}
+		event := model.AuditEvent{ID: lineChainAuditID("observe", approval.ID, definition.Status+"\x00"+definition.DriftCode), At: definition.UpdatedAt,
+			ActorID: approval.ActorID, NodeID: definition.SourceNodeID, Action: action, Scope: "network:apply", Decision: decision,
+			Reason: definition.DriftCode, Metadata: lineChainAuditMetadata(approval, "")}
+		if err := s.appendRequiredLineChainAudit(event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func shortFingerprint(value string) string {
 	digest := digestText(value)
 	return digest[:16]
@@ -532,12 +615,14 @@ func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArt
 		if !ok {
 			return model.Approval{}, errors.New("deduplicated line chain approval is missing")
 		}
+		if err := s.ensureLineChainPlanAudit(p, existing); err != nil {
+			return existing, err
+		}
 		return existing, nil
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{
-		ID: id.New("audit"), NodeID: approval.NodeID, Action: "linechain.plan", Scope: "network:plan",
-		Metadata: map[string]string{"approval_id": approval.ID, "source_line_uuid": compiled.Plan.SourceLineUUID, "target_line_uuid": compiled.Plan.TargetLineUUID, "artifact_sha256": compiled.Plan.ArtifactSHA256},
-	})
+	if err := s.ensureLineChainPlanAudit(p, approval); err != nil {
+		return approval, err
+	}
 	return approval, nil
 }
 
@@ -662,7 +747,10 @@ func (s *Server) reconcileLineChainsForNode(nodeID string) error {
 		observations[sourceUUID] = observation
 	}
 	_, err = s.store.ReconcileLineChains(observations)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.ensureLineChainReconciliationAudits(nodeID)
 }
 
 func (s *Server) handleLineChainPlan(w http.ResponseWriter, r *http.Request, p principal) {

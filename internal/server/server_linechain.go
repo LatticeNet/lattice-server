@@ -93,6 +93,16 @@ func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, er
 }
 
 func (s *Server) captureLineChainCompileSnapshotFromState(persistent store.LineChainCompileStateSnapshot) (lineChainCompileSnapshot, error) {
+	s.singboxInvMu.RLock()
+	s.agentCapabilitiesMu.RLock()
+	defer s.agentCapabilitiesMu.RUnlock()
+	defer s.singboxInvMu.RUnlock()
+	return s.captureLineChainCompileSnapshotFromStateLocked(persistent)
+}
+
+// captureLineChainCompileSnapshotFromStateLocked requires both live-input read
+// locks. Result promotion uses it while retaining those locks through commit.
+func (s *Server) captureLineChainCompileSnapshotFromStateLocked(persistent store.LineChainCompileStateSnapshot) (lineChainCompileSnapshot, error) {
 	snapshot := lineChainCompileSnapshot{
 		Lines: make(map[string][]Line), Definitions: make(map[string]managedLineDef),
 		Users: make(map[string]VpnUser), Nodes: make(map[string]model.Node),
@@ -100,19 +110,15 @@ func (s *Server) captureLineChainCompileSnapshotFromState(persistent store.LineC
 	}
 	// Fixed live-input lock order. The supplied persistent snapshot was copied
 	// under one Store lock; this helper never re-enters Store.
-	s.singboxInvMu.RLock()
 	inventories := make([]model.SingBoxInventory, 0, len(s.singboxInv))
 	for _, inventory := range s.singboxInv {
 		copyInventory := inventory
 		copyInventory.Nodes = append([]model.SingBoxNode(nil), inventory.Nodes...)
 		inventories = append(inventories, copyInventory)
 	}
-	s.agentCapabilitiesMu.RLock()
 	for nodeID, capabilities := range s.agentCapabilities {
 		_, snapshot.Capabilities[nodeID] = capabilities[lineChainDurableCapability]
 	}
-	s.agentCapabilitiesMu.RUnlock()
-	s.singboxInvMu.RUnlock()
 	snapshot.Nodes = persistent.Nodes
 	snapshot.Chains = persistent.Chains
 	for uuid, public := range persistent.ManagedLines {
@@ -242,18 +248,7 @@ func (s *Server) ensureLineChainReconciliationAudits(nodeID string) error {
 		if definition.SourceNodeID != nodeID || (definition.Status != store.LineChainStatusConverged && definition.Status != store.LineChainStatusDrifted) {
 			continue
 		}
-		approval, ok := s.store.Approval(definition.ApprovalID)
-		if !ok {
-			continue
-		}
-		taskID := ""
-		for _, task := range s.store.Tasks() {
-			if task.ApprovalID == approval.ID {
-				taskID = task.ID
-				break
-			}
-		}
-		event := lineChainReconciliationAudit(definition, approval, taskID)
+		event := lineChainReconciliationAudit(definition)
 		if err := s.appendRequiredLineChainAudit(event); err != nil {
 			return err
 		}
@@ -261,7 +256,7 @@ func (s *Server) ensureLineChainReconciliationAudits(nodeID string) error {
 	return nil
 }
 
-func lineChainReconciliationAudit(definition store.LineChainDefinition, approval model.Approval, taskID string) model.AuditEvent {
+func lineChainReconciliationAudit(definition store.LineChainDefinition) model.AuditEvent {
 	action, decision := "linechain.apply", "allow"
 	if definition.TargetLineUUID == "" {
 		action = "linechain.remove"
@@ -269,9 +264,14 @@ func lineChainReconciliationAudit(definition store.LineChainDefinition, approval
 	if definition.Status == store.LineChainStatusDrifted {
 		action, decision = "linechain.drift", "deny"
 	}
-	return model.AuditEvent{ID: lineChainAuditID("observe", approval.ID, definition.Status+"\x00"+definition.DriftCode), At: definition.UpdatedAt,
-		ActorID: approval.ActorID, NodeID: definition.SourceNodeID, Action: action, Scope: "network:apply", Decision: decision,
-		Reason: definition.DriftCode, Metadata: lineChainAuditMetadata(approval, taskID)}
+	metadata := map[string]string{"approval_id": definition.ApprovalID, "task_id": definition.TaskID, "artifact_sha256": definition.ArtifactSHA256,
+		"source_line_uuid": definition.SourceLineUUID}
+	if definition.AuditTargetLineUUID != "" {
+		metadata["target_line_uuid"] = definition.AuditTargetLineUUID
+	}
+	return model.AuditEvent{ID: lineChainAuditID("observe", definition.ApprovalID, definition.Status+"\x00"+definition.DriftCode), At: definition.UpdatedAt,
+		ActorID: definition.ActorID, NodeID: definition.SourceNodeID, Action: action, Scope: "network:apply", Decision: decision,
+		Reason: definition.DriftCode, Metadata: metadata}
 }
 
 func shortFingerprint(value string) string {
@@ -680,42 +680,53 @@ func (s *Server) validateLineChainFirstLease(persistent store.LineChainCompileSt
 }
 
 func (s *Server) handleLineChainTaskResult(approval model.Approval, task model.Task, result model.TaskResult) error {
-	status, driftCode := store.LineChainStatusAppliedUnobserved, ""
-	if result.ExitCode == 0 && result.Error == "" {
-		var err error
-		status, driftCode, err = s.classifyLineChainTerminal(approval.ID)
-		if err != nil {
-			return err
-		}
-	}
 	terminalError := result.Error
 	if terminalError == "" && result.ExitCode != 0 {
 		terminalError = fmt.Sprintf("line chain task exited %d", result.ExitCode)
 	}
-	errorCode := driftCode
-	if result.ExitCode != 0 || result.Error != "" {
-		errorCode = "host_apply_failed"
-	}
-	terminalAudit := s.lineChainTerminalAudit(approval, task, result, status, errorCode)
-	committed, err := s.store.CompleteLineChainTaskResult(result, approval, status, errorCode, terminalError, terminalAudit)
+	committed, err := s.store.CompleteLineChainTaskResultClassified(result, approval, terminalError,
+		func(persistent store.LineChainCompileStateSnapshot, _ store.LineChainAttempt) (string, string, func(), error) {
+			s.singboxInvMu.RLock()
+			s.agentCapabilitiesMu.RLock()
+			release := func() {
+				s.agentCapabilitiesMu.RUnlock()
+				s.singboxInvMu.RUnlock()
+			}
+			snapshot, err := s.captureLineChainCompileSnapshotFromStateLocked(persistent)
+			if err != nil {
+				return store.LineChainStatusDrifted, "inputs_changed", release, nil
+			}
+			status, code, err := s.classifyLineChainTerminalCompiledSnapshot(snapshot, approval.ID)
+			return status, code, release, err
+		},
+		func(status, code string) model.AuditEvent {
+			return s.lineChainTerminalAudit(approval, task, result, status, code)
+		})
 	if committed && err != nil {
 		s.logger.Printf("line chain terminal result committed with degraded durability: %v", err)
 	}
 	if err != nil {
 		return err
 	}
-	return s.appendRequiredLineChainAudit(terminalAudit)
+	return s.ensureLineChainTerminalAudit(approval, task, result)
 }
 
 func (s *Server) classifyLineChainTerminal(approvalID string) (string, string, error) {
-	persistent := s.store.LineChainCompileStateSnapshot()
-	attempt, ok := persistent.Chains.Attempts[approvalID]
-	if !ok {
-		return "", "", store.ErrLineChainAttemptNotFound
-	}
+	return s.classifyLineChainTerminalSnapshot(s.store.LineChainCompileStateSnapshot(), approvalID)
+}
+
+func (s *Server) classifyLineChainTerminalSnapshot(persistent store.LineChainCompileStateSnapshot, approvalID string) (string, string, error) {
 	snapshot, err := s.captureLineChainCompileSnapshotFromState(persistent)
 	if err != nil {
 		return store.LineChainStatusDrifted, "inputs_changed", nil
+	}
+	return s.classifyLineChainTerminalCompiledSnapshot(snapshot, approvalID)
+}
+
+func (s *Server) classifyLineChainTerminalCompiledSnapshot(snapshot lineChainCompileSnapshot, approvalID string) (string, string, error) {
+	attempt, ok := snapshot.Chains.Attempts[approvalID]
+	if !ok {
+		return "", "", store.ErrLineChainAttemptNotFound
 	}
 	frozen := attempt.CandidateDefinition
 	source := snapshot.Lines[attempt.SourceLineUUID]
@@ -770,24 +781,11 @@ func (s *Server) reconcileLineChainsForNode(nodeID string) error {
 		}
 		observations[sourceUUID] = observation
 	}
-	approvals := make(map[string]model.Approval)
-	taskIDs := make(map[string]string)
-	for _, task := range s.store.Tasks() {
-		if task.ApprovalID != "" {
-			taskIDs[task.ApprovalID] = task.ID
-		}
-	}
-	for _, definition := range snapshot.Chains.Definitions {
-		if approval, ok := s.store.Approval(definition.ApprovalID); ok {
-			approvals[definition.ApprovalID] = approval
-		}
-	}
 	_, err = s.store.ReconcileLineChainsWithAudits(observations, func(definition store.LineChainDefinition) (model.AuditEvent, bool) {
-		approval, ok := approvals[definition.ApprovalID]
-		if !ok {
+		if definition.ApprovalID == "" || definition.TaskID == "" {
 			return model.AuditEvent{}, false
 		}
-		return lineChainReconciliationAudit(definition, approval, taskIDs[approval.ID]), true
+		return lineChainReconciliationAudit(definition), true
 	})
 	if err != nil {
 		return err

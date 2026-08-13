@@ -49,6 +49,9 @@ type LineChainDefinition struct {
 	SidecarSHA256              string    `json:"sidecar_sha256"`
 	ArtifactSHA256             string    `json:"artifact_sha256"`
 	ApprovalID                 string    `json:"approval_id"`
+	TaskID                     string    `json:"task_id,omitempty"`
+	ActorID                    string    `json:"actor_id,omitempty"`
+	AuditTargetLineUUID        string    `json:"audit_target_line_uuid,omitempty"`
 	Status                     string    `json:"status"`
 	DriftCode                  string    `json:"drift_code,omitempty"`
 	Generation                 uint64    `json:"generation"`
@@ -441,6 +444,24 @@ func (s *Store) ApproveLineChain(approval model.Approval, task model.Task, audit
 func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.Approval, terminalStatus, errorCode, terminalError string, audits ...model.AuditEvent) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.completeLineChainTaskResultLocked(r, approval, terminalStatus, errorCode, terminalError, nil, nil, audits)
+}
+
+// CompleteLineChainTaskResultClassified runs success drift classification from
+// one current persistent snapshot while holding the same lock through receipt
+// and definition promotion. auditFor freezes evidence from that exact result.
+func (s *Store) CompleteLineChainTaskResultClassified(r model.TaskResult, approval model.Approval, terminalError string,
+	classifier func(LineChainCompileStateSnapshot, LineChainAttempt) (string, string, func(), error),
+	auditFor func(string, string) model.AuditEvent,
+) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.completeLineChainTaskResultLocked(r, approval, LineChainStatusAppliedUnobserved, "host_apply_failed", terminalError, classifier, auditFor, nil)
+}
+
+func (s *Store) completeLineChainTaskResultLocked(r model.TaskResult, approval model.Approval, terminalStatus, errorCode, terminalError string,
+	classifier func(LineChainCompileStateSnapshot, LineChainAttempt) (string, string, func(), error), auditFor func(string, string) model.AuditEvent, audits []model.AuditEvent,
+) (bool, error) {
 	task, ok := s.state.Tasks[r.TaskID]
 	if !ok || task.ApprovalID != approval.ID || !taskLeaseMatches(task, r.NodeID, r.LeaseID) {
 		return false, ErrTaskLeaseMismatch
@@ -463,6 +484,23 @@ func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.A
 		return false, ErrTaskTransitionConflict
 	}
 	success := r.ExitCode == 0 && r.Error == ""
+	if success && classifier != nil {
+		var err error
+		var release func()
+		terminalStatus, errorCode, release, err = classifier(s.lineChainCompileStateSnapshotLocked(), attempt)
+		if err != nil {
+			if release != nil {
+				release()
+			}
+			return false, err
+		}
+		if release != nil {
+			defer release()
+		}
+	}
+	if auditFor != nil {
+		audits = append(audits, auditFor(terminalStatus, errorCode))
+	}
 	validDriftCode := errorCode == "inputs_changed" || errorCode == "target_missing" || errorCode == "source_missing"
 	if len(terminalError) > 512 || (success && !((terminalStatus == LineChainStatusAppliedUnobserved && errorCode == "") || (terminalStatus == LineChainStatusDrifted && validDriftCode))) ||
 		(!success && (errorCode != "host_apply_failed" || terminalError == "")) {
@@ -497,6 +535,12 @@ func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.A
 		approval.Status, approval.Reason = model.ApprovalApplied, ""
 		definition := attempt.CandidateDefinition
 		definition.ApprovalID = approval.ID
+		definition.TaskID = task.ID
+		definition.ActorID = approval.ActorID
+		definition.AuditTargetLineUUID = definition.TargetLineUUID
+		if definition.AuditTargetLineUUID == "" {
+			definition.AuditTargetLineUUID = s.state.LineChainDefinitions[attempt.SourceLineUUID].TargetLineUUID
+		}
 		definition.Generation = attempt.BaseGeneration + 1
 		definition.CreatedAt = s.state.LineChainDefinitions[attempt.SourceLineUUID].CreatedAt
 		if definition.CreatedAt.IsZero() {

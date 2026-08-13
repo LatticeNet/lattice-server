@@ -379,6 +379,9 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 		reply, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) })
 		if callErr != nil {
 			st.pool.poison(w)
+			if reply.OK || reply.Result != nil || reply.Message != "" {
+				return InvokeResponse{OK: reply.OK, Message: reply.Message, Result: reply.Result}, callErr
+			}
 			return InvokeResponse{}, callErr
 		}
 		st.pool.release(w, callErr == nil, time.Now())

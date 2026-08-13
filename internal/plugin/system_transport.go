@@ -109,7 +109,9 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 				select {
 				case line = <-lines:
 				case err := <-errs:
-					return systemRunnerReply{}, err
+					// A valid result is still delivered once; readiness failure
+					// retires the worker but must not erase the result.
+					return reply, err
 				case <-ctx.Done():
 					_ = t.abort()
 					return systemRunnerReply{}, ctx.Err()
@@ -121,7 +123,7 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 				if ready.Kind == "invoke_ready" && ready.Generation == generation && ready.InvocationID == invocation {
 					return reply, nil
 				}
-				return systemRunnerReply{}, fmt.Errorf("missing invoke_ready")
+				return reply, fmt.Errorf("missing invoke_ready")
 			}
 		}
 	}

@@ -163,12 +163,17 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 		return RuntimeStatus{}, err
 	}
 	runner := m.runnerFor(loaded.Manifest.Type)
+	m.mu.Lock()
+	m.nextGen++
+	generation := m.nextGen
+	m.mu.Unlock()
 	startCtx, cancel := context.WithTimeout(ctx, m.timeout)
 	defer cancel()
 	result, err := runner.Start(startCtx, RunnerStartRequest{
-		PluginID: loaded.Manifest.ID,
-		Loaded:   loaded,
-		Broker:   broker,
+		PluginID:   loaded.Manifest.ID,
+		Generation: generation,
+		Loaded:     loaded,
+		Broker:     broker,
 	})
 	now := time.Now().UTC()
 	status := RuntimeStatus{
@@ -179,8 +184,6 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.nextGen++
-	generation := m.nextGen
 	if err != nil {
 		status.State = RuntimeStateFailed
 		status.Message = err.Error()
@@ -209,7 +212,7 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 
 	if ok && runner != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
-		err := runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message})
+		err := runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message, Generation: generation})
 		cancel()
 		if err != nil {
 			m.mu.Lock()
@@ -304,7 +307,7 @@ func (m *RuntimeManager) InvokeConstrained(ctx context.Context, pluginID, action
 	if !ok {
 		return InvokeResponse{}, fmt.Errorf("plugin %q runner %q does not support invocation", pluginID, inst.runner.Name())
 	}
-	return inv.Invoke(ctx, InvokeRequest{PluginID: pluginID, Action: action, Payload: payload, Constraints: constraints})
+	return inv.Invoke(ctx, InvokeRequest{PluginID: pluginID, Generation: inst.generation, Action: action, Payload: payload, Constraints: constraints})
 }
 
 func (m *RuntimeManager) runnerFor(pluginType string) Runner {

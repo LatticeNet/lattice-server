@@ -39,6 +39,7 @@ type systemPool struct {
 	maxOverflow int
 	closed      bool
 	replenishFn func(uint64) (*pooledWorker, error)
+	active      int
 }
 
 func (p *systemPool) hasTransport() bool {
@@ -72,6 +73,9 @@ func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error
 	if p.closed || generation != p.generation {
 		return errors.New("stale pool generation")
 	}
+	if len(p.workers)+p.active >= 1+p.maxOverflow {
+		return errors.New("pool capacity exceeded")
+	}
 	if !ready {
 		return errors.New("worker is not ready")
 	}
@@ -100,6 +104,7 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 		for i, w := range p.workers {
 			if w.state == workerIdle && w.generation == p.generation && now.Sub(w.started) < p.maxAge && w.uses < p.maxUses {
 				w.state = workerLeased
+				p.active++
 				p.workers = append(p.workers[:i], p.workers[i+1:]...)
 				p.mu.Unlock()
 				return w, nil
@@ -133,6 +138,9 @@ func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	w.uses++
+	if p.active > 0 {
+		p.active--
+	}
 	if resultSeen {
 		w.state = workerResultSeen
 	}
@@ -198,6 +206,7 @@ func (p *systemPool) wakeLocked() {
 	w := p.workers[0]
 	p.workers = p.workers[1:]
 	w.state = workerLeased
+	p.active++
 	ch := p.waiters[0]
 	p.waiters = p.waiters[1:]
 	ch <- w

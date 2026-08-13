@@ -28,9 +28,10 @@ type RuntimeStatus struct {
 }
 
 type RunnerStartRequest struct {
-	PluginID string
-	Loaded   Loaded
-	Broker   *Broker
+	PluginID   string
+	Generation uint64
+	Loaded     Loaded
+	Broker     *Broker
 }
 
 type RunnerStartResult struct {
@@ -38,8 +39,9 @@ type RunnerStartResult struct {
 }
 
 type RunnerStopRequest struct {
-	PluginID string
-	Reason   string
+	PluginID   string
+	Reason     string
+	Generation uint64
 }
 
 // Runner is the narrow runtime contract concrete plugin runtimes must satisfy.
@@ -56,6 +58,7 @@ type Runner interface {
 // stdin line and reads the reply from stdout.
 type InvokeRequest struct {
 	PluginID    string
+	Generation  uint64
 	Action      string
 	Payload     json.RawMessage
 	Constraints InvokeConstraints

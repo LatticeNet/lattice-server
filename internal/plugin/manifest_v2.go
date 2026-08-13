@@ -97,8 +97,8 @@ func validateManifestVersion(m Manifest) error {
 	if m.Runtime == nil {
 		return errors.New("manifest v2 runtime is required")
 	}
-	if m.Runtime.Protocol != RuntimeProtocolStdioJSONV1 {
-		return fmt.Errorf("manifest v2 runtime protocol must be %q", RuntimeProtocolStdioJSONV1)
+	if m.Runtime.Protocol != RuntimeProtocolStdioJSONV1 && m.Runtime.Protocol != RuntimeProtocolStdioJSONV2 {
+		return fmt.Errorf("manifest v2 runtime protocol must be %q or %q", RuntimeProtocolStdioJSONV1, RuntimeProtocolStdioJSONV2)
 	}
 	if len(m.Runtime.Entrypoints) == 0 {
 		return errors.New("manifest v2 requires at least one platform entrypoint")

@@ -307,17 +307,18 @@ func TestLineChainTaskScriptRevealIsDeniedBeforeStepUp(t *testing.T) {
 }
 
 func TestLineChainReconciliationAuditFreezesActionReasonAndTaskMetadata(t *testing.T) {
-	approval := model.Approval{ID: "approval-observe", ActorID: "planner", NodeID: "node-a", ArtifactDigest: "artifact",
-		Plan: `{"source_line_uuid":"22222222-2222-4222-8222-222222222222","previous_target_line_uuid":"11111111-1111-4111-8111-111111111111"}`}
 	at := time.Unix(1_700_000_000, 0).UTC()
 	drift := lineChainReconciliationAudit(store.LineChainDefinition{SourceLineUUID: "22222222-2222-4222-8222-222222222222", SourceNodeID: "node-a",
-		TargetLineUUID: "11111111-1111-4111-8111-111111111111", Status: store.LineChainStatusDrifted, DriftCode: "observed_mismatch", UpdatedAt: at}, approval, "task-observe")
+		TargetLineUUID: "11111111-1111-4111-8111-111111111111", AuditTargetLineUUID: "11111111-1111-4111-8111-111111111111",
+		ApprovalID: "approval-observe", TaskID: "task-observe", ActorID: "planner", ArtifactSHA256: "artifact",
+		Status: store.LineChainStatusDrifted, DriftCode: "observed_mismatch", UpdatedAt: at})
 	if drift.Action != "linechain.drift" || drift.Decision != "deny" || drift.Reason != "observed_mismatch" ||
 		drift.Metadata["task_id"] != "task-observe" || drift.Metadata["target_line_uuid"] != "11111111-1111-4111-8111-111111111111" {
 		t.Fatalf("drift evidence lost frozen metadata: %+v", drift)
 	}
 	remove := lineChainReconciliationAudit(store.LineChainDefinition{SourceLineUUID: "22222222-2222-4222-8222-222222222222", SourceNodeID: "node-a",
-		Status: store.LineChainStatusConverged, UpdatedAt: at}, approval, "task-observe")
+		AuditTargetLineUUID: "11111111-1111-4111-8111-111111111111", ApprovalID: "approval-observe", TaskID: "task-observe", ActorID: "planner",
+		Status: store.LineChainStatusConverged, UpdatedAt: at})
 	if remove.Action != "linechain.remove" || remove.Decision != "allow" || remove.Metadata["target_line_uuid"] == "" {
 		t.Fatalf("remove evidence lost prior target metadata: %+v", remove)
 	}
@@ -545,6 +546,54 @@ func TestLineChainTerminalAcceptsIssuedSuccessWhenLiveDescriptorDrifts(t *testin
 				t.Fatalf("exact replay duplicated terminal audit %d times", count)
 			}
 		})
+	}
+}
+
+func TestLineChainTerminalConcurrentLiveMutationCommitsConsistentDrift(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	}
+	result := model.TaskResult{TaskID: deliveries[0].Task.ID, NodeID: "node-b", LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
+
+	// Hold the live-input write lock while the result path starts. The result
+	// transaction holds its persistent snapshot lock, waits for this mutation,
+	// then retains the live read locks through receipt/definition commit.
+	srv.singboxInvMu.Lock()
+	inventory := srv.singboxInv["node-a"]
+	inventory.Nodes[0].Address = "203.0.113.99"
+	srv.singboxInv["node-a"] = inventory
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		close(started)
+		done <- srv.handleLineChainTaskResult(approval, deliveries[0].Task, result)
+	}()
+	<-started
+	srv.singboxInvMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	definition := srv.store.LineChainSnapshot().Definitions[sourceUUID]
+	if definition.Status != store.LineChainStatusDrifted || definition.DriftCode != "inputs_changed" {
+		t.Fatalf("concurrent target mutation committed inconsistent status: %+v", definition)
+	}
+	if matches, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
+		t.Fatalf("concurrent result was not exactly replayable: matches=%v found=%v err=%v", matches, found, err)
 	}
 }
 

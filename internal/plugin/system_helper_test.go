@@ -92,6 +92,9 @@ func runV2Helper() {
 `, generation); err != nil {
 		os.Exit(2)
 	}
+	if os.Getenv("LATTICE_TEST_V2_EXIT_AFTER_READY") == "1" {
+		os.Exit(0)
+	}
 	s := bufio.NewScanner(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
 	for s.Scan() {
@@ -111,6 +114,7 @@ func runV2Helper() {
 		if os.Getenv("LATTICE_TEST_V2_NO_READY") == "1" {
 			resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID, Response: json.RawMessage(`{"ok":true,"result":{"once":true}}`)}
 			_ = enc.Encode(resp)
+			os.Exit(0)
 			continue
 		}
 		resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID}

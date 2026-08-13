@@ -246,18 +246,11 @@ func (s *Server) captureLineChainCompileSnapshotFromStateLocked(persistent store
 		}
 	}
 	now := s.now()
-	uuidToHash := make(map[string]string, len(persistent.LineUUIDByHash))
-	for hash, uuid := range persistent.LineUUIDByHash {
-		uuid = strings.ToLower(strings.TrimSpace(uuid))
-		if uuid == "" {
-			continue
+	uuidResolver := newLineUUIDAuthorityResolver(func(yield func(hash, uuid string)) {
+		for hash, uuid := range persistent.LineUUIDByHash {
+			yield(hash, uuid)
 		}
-		if _, exists := uuidToHash[uuid]; exists {
-			uuidToHash[uuid] = ""
-		} else {
-			uuidToHash[uuid] = hash
-		}
-	}
+	})
 	for _, inventory := range inventories {
 		if inventory.At.After(snapshot.EvidenceAt) {
 			snapshot.EvidenceAt = inventory.At
@@ -267,15 +260,11 @@ func (s *Server) captureLineChainCompileSnapshotFromStateLocked(persistent store
 		}
 		for _, discovered := range inventory.Nodes {
 			port := atoiSafe(discovered.Port)
-			hashID := stableLineHandle(discovered.LineID)
-			if hashID == "" && validLineUUIDv4(discovered.LineUUID) {
-				hashID = uuidToHash[strings.ToLower(strings.TrimSpace(discovered.LineUUID))]
-			}
-			if hashID == "" {
-				hashID = lineHash(inventory.NodeID, model.ProxyCoreSingbox, discovered.Protocol, discovered.ListenHost, port, discovered.Name, discovered.OutboundRef)
-			}
-			uuid := strings.ToLower(strings.TrimSpace(persistent.LineUUIDByHash[hashID]))
-			if uuid == "" || !validLineUUIDv4(uuid) {
+			hashID := uuidResolver.resolve(discovered.LineID, discovered.LineUUID, func() string {
+				return lineHash(inventory.NodeID, model.ProxyCoreSingbox, discovered.Protocol, discovered.ListenHost, port, discovered.Name, discovered.OutboundRef)
+			})
+			uuid, authoritative := uuidResolver.uuid(hashID)
+			if !authoritative {
 				continue
 			}
 			line := Line{ID: hashID, LineHashID: hashID, LineID: discovered.LineID, LineUUID: uuid,

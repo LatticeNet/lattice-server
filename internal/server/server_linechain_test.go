@@ -1002,6 +1002,29 @@ func TestLineChainCompilerDoesNotAllocateMissingUUIDAuthority(t *testing.T) {
 	}
 }
 
+func TestLineChainCompilerRejectsAmbiguousUUIDAuthorityWithoutMutation(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	snapshot, err := srv.captureLineChainCompileSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := snapshot.Lines[sourceUUID][0]
+	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: "line_duplicate_authority", Value: sourceUUID}); err != nil {
+		t.Fatal(err)
+	}
+	before := srv.store.KV(lineUUIDKVBucket)
+	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil {
+		t.Fatal("compile accepted ambiguous UUID authority")
+	}
+	after := srv.store.KV(lineUUIDKVBucket)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed compile mutated UUID authority: before=%+v after=%+v", before, after)
+	}
+	if entry, ok := srv.store.KVEntry(lineUUIDKVBucket, source.LineHashID); !ok || entry.Value != sourceUUID {
+		t.Fatalf("source authority changed: %+v ok=%v", entry, ok)
+	}
+}
+
 func TestLineChainCompilerRejectsUnsupportedTargetTransport(t *testing.T) {
 	srv, sourceUUID, targetUUID, _, def := seedLineChainFixture(t)
 	seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{
@@ -1158,16 +1181,13 @@ func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 			t.Fatalf("immediate set->%s artifact=%s want=%s err=%v", operation, immediate.Plan.ArtifactSHA256, wantArtifact, err)
 		}
 	}
-	observedHash := lineHash("node-b", model.ProxyCoreSingbox, "vless", "", 1443, "source-b", setArtifact.Plan.OutboundTag)
-	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: observedHash, Value: sourceUUID}); err != nil {
-		t.Fatal(err)
-	}
-	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443",
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443", ListenHost: "127.0.0.2",
 		LineUUID: sourceUUID, OutboundRef: setArtifact.Plan.OutboundTag, DownstreamLineUUID: targetUUID}})
 	if err := srv.reconcileLineChainsForNode("node-b"); err != nil {
 		t.Fatal(err)
 	}
-	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged {
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged ||
+		got.SourceLineHashID != setArtifact.CandidateDefinition.SourceLineHashID {
 		t.Fatalf("scheduled observation did not converge set: %+v", got)
 	}
 	for _, event := range srv.store.AuditEvents() {

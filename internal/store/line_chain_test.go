@@ -520,6 +520,30 @@ func TestReconcileLineChainsPreservesStickyPostLeaseDrift(t *testing.T) {
 	}
 }
 
+func TestReconcileLineChainsAdvancesObservationRevisionPerTransition(t *testing.T) {
+	s, _ := Open("")
+	s.state.LineChainDefinitions["source"] = LineChainDefinition{SourceLineUUID: "source", TargetLineUUID: "target", OutboundTag: "out", Status: LineChainStatusAppliedUnobserved}
+	steps := []struct {
+		observation LineChainObservation
+		status      string
+		code        string
+		revision    uint64
+	}{
+		{observation: LineChainObservation{OutboundTag: "out", DownstreamLineUUID: "target"}, status: LineChainStatusConverged, revision: 1},
+		{observation: LineChainObservation{OutboundTag: "wrong", DownstreamLineUUID: "target"}, status: LineChainStatusDrifted, code: "observed_mismatch", revision: 2},
+		{observation: LineChainObservation{OutboundTag: "out", DownstreamLineUUID: "target"}, status: LineChainStatusConverged, revision: 3},
+	}
+	for _, step := range steps {
+		if committed, err := s.ReconcileLineChains(map[string]LineChainObservation{"source": step.observation}); err != nil || !committed {
+			t.Fatalf("reconcile committed=%v err=%v", committed, err)
+		}
+		definition := s.LineChainSnapshot().Definitions["source"]
+		if definition.Status != step.status || definition.DriftCode != step.code || definition.ObservationRevision != step.revision {
+			t.Fatalf("transition=%+v want status=%s code=%s revision=%d", definition, step.status, step.code, step.revision)
+		}
+	}
+}
+
 func TestAppendAuditIdempotentRepairsDurabilityWithoutDuplicates(t *testing.T) {
 	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
 	if err != nil {

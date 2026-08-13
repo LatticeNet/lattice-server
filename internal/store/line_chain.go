@@ -56,6 +56,7 @@ type LineChainDefinition struct {
 	Status                     string    `json:"status"`
 	DriftCode                  string    `json:"drift_code,omitempty"`
 	Generation                 uint64    `json:"generation"`
+	ObservationRevision        uint64    `json:"observation_revision,omitempty"`
 	CreatedAt                  time.Time `json:"created_at"`
 	UpdatedAt                  time.Time `json:"updated_at"`
 }
@@ -234,6 +235,7 @@ func (s *Store) ReconcileLineChainsWithAudits(observations map[string]LineChainO
 			continue
 		}
 		definition.Status, definition.DriftCode, definition.UpdatedAt = status, driftCode, now
+		definition.ObservationRevision++
 		definitions[sourceUUID], changed = definition, true
 		if auditFor != nil {
 			if event, ok := auditFor(definition); ok {

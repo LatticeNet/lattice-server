@@ -104,13 +104,14 @@ type LineChainObservation struct {
 // It is copied under one store lock and is safe for server-side projection
 // without further store reads or identity allocation.
 type LineChainCompileStateSnapshot struct {
-	Nodes              map[string]model.Node
-	LineUUIDByHash     map[string]string
-	VpnUsers           map[string]VpnUserPublicRecord
-	VpnUserSecrets     map[string]VpnUserSecretRecord
-	ManagedLines       map[string]ManagedLinePublicRecord
-	ManagedLineSecrets map[string]ManagedLineSecretRecord
-	Chains             LineChainSnapshot
+	Nodes               map[string]model.Node
+	LineUUIDByHash      map[string]string
+	LineUUIDOwnerByHash map[string]string
+	VpnUsers            map[string]VpnUserPublicRecord
+	VpnUserSecrets      map[string]VpnUserSecretRecord
+	ManagedLines        map[string]ManagedLinePublicRecord
+	ManagedLineSecrets  map[string]ManagedLineSecretRecord
+	Chains              LineChainSnapshot
 }
 
 func (s *Store) LineChainCompileStateSnapshot() LineChainCompileStateSnapshot {
@@ -125,17 +126,57 @@ func (s *Store) lineChainCompileStateSnapshotLocked() LineChainCompileStateSnaps
 		nodes[id] = cloneNode(node)
 	}
 	uuidByHash := make(map[string]string)
+	ownerByHash := make(map[string]string)
 	for _, entry := range s.state.KV {
 		if entry.Bucket == "vpnmeta/lineuuid" {
 			uuidByHash[entry.Key] = entry.Value
+		} else if entry.Bucket == "vpnmeta/lineuuid-owner" {
+			ownerByHash[entry.Key] = entry.Value
 		}
 	}
 	return LineChainCompileStateSnapshot{
-		Nodes: nodes, LineUUIDByHash: uuidByHash,
+		Nodes: nodes, LineUUIDByHash: uuidByHash, LineUUIDOwnerByHash: ownerByHash,
 		VpnUsers: cloneVpnUserPublicRecords(s.state.VpnUsers), VpnUserSecrets: cloneVpnUserSecretRecords(s.state.VpnUserSecrets),
 		ManagedLines: cloneManagedLinePublicRecords(s.state.ManagedLines), ManagedLineSecrets: cloneManagedLineSecretRecords(s.state.ManagedLineSecrets),
 		Chains: LineChainSnapshot{Definitions: cloneLineChainDefinitions(s.state.LineChainDefinitions), Attempts: cloneLineChainAttempts(s.state.LineChainAttempts), Revision: s.state.LineChainGraphRevision},
 	}
+}
+
+// LineUUIDAuthoritySnapshot returns the UUID and owning-node maps from one
+// store generation. Callers can project an entire inventory without per-line
+// store reads.
+func (s *Store) LineUUIDAuthoritySnapshot() (map[string]string, map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.lineChainCompileStateSnapshotLocked()
+	return state.LineUUIDByHash, state.LineUUIDOwnerByHash
+}
+
+// PutLineUUIDAuthority persists hash, UUID, and owning node as one store
+// transition. Empty UUID removes both entries and is used only for rollback.
+func (s *Store) PutLineUUIDAuthority(hash, uuid, nodeID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nextKV := make(map[string]model.KVEntry, len(s.state.KV)+2)
+	for key, entry := range s.state.KV {
+		nextKV[key] = entry
+	}
+	if uuid == "" {
+		delete(nextKV, "vpnmeta/lineuuid/"+hash)
+		delete(nextKV, "vpnmeta/lineuuid-owner/"+hash)
+	} else {
+		now := time.Now().UTC()
+		nextKV["vpnmeta/lineuuid/"+hash] = model.KVEntry{Bucket: "vpnmeta/lineuuid", Key: hash, Value: uuid, UpdatedAt: now}
+		nextKV["vpnmeta/lineuuid-owner/"+hash] = model.KVEntry{Bucket: "vpnmeta/lineuuid-owner", Key: hash, Value: nodeID, UpdatedAt: now}
+	}
+	staged := s.state
+	staged.KV = nextKV
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if !committed {
+		return err
+	}
+	s.state.KV = nextKV
+	return err
 }
 
 // WouldCreateLineChainCycle evaluates a candidate against every committed edge

@@ -3,7 +3,6 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,6 +92,86 @@ func stableLineHandle(lineID string) string {
 	return "line_" + lineID
 }
 
+func effectiveDiscoveredLineID(node model.SingBoxNode) string {
+	return firstNonEmpty(node.LineID, node.Metadata["line_id"])
+}
+
+func provesLineUUIDAuthorityHash(line Line) bool {
+	if explicit := stableLineHandle(line.LineID); explicit != "" {
+		return explicit == line.LineHashID
+	}
+	return lineHash(line.NodeID, line.Core, line.Type, line.ListenHost, line.ListenPort, line.Tag, line.OutboundRef) == line.LineHashID
+}
+
+// lineUUIDAuthorityResolver is the pure, immutable reverse authority used by
+// every discovered-line projection. Construction scans the supplied authority
+// exactly once. Empty values denote ambiguous UUIDs and never resolve.
+type lineUUIDAuthorityResolver struct {
+	hashByUUID  map[string]string
+	uuidByHash  map[string]string
+	ownerByHash map[string]string
+}
+
+func newLineUUIDAuthorityResolver(each func(func(hash, uuid, ownerNodeID string))) lineUUIDAuthorityResolver {
+	resolver := lineUUIDAuthorityResolver{
+		hashByUUID:  make(map[string]string),
+		uuidByHash:  make(map[string]string),
+		ownerByHash: make(map[string]string),
+	}
+	each(func(hash, uuid, ownerNodeID string) {
+		resolver.add(hash, uuid, ownerNodeID)
+	})
+	return resolver
+}
+
+func (r lineUUIDAuthorityResolver) add(hash, uuid, ownerNodeID string) {
+	hash = strings.TrimSpace(hash)
+	uuid = strings.ToLower(strings.TrimSpace(uuid))
+	if hash == "" {
+		return
+	}
+	r.uuidByHash[hash] = uuid
+	r.ownerByHash[hash] = strings.TrimSpace(ownerNodeID)
+	if !validLineUUIDv4(uuid) {
+		return
+	}
+	if prior, exists := r.hashByUUID[uuid]; exists && prior != hash {
+		r.hashByUUID[uuid] = ""
+	} else if !exists {
+		r.hashByUUID[uuid] = hash
+	}
+}
+
+func (r lineUUIDAuthorityResolver) resolve(nodeID, lineID, reportedUUID string, fallback func() string) string {
+	if explicit := stableLineHandle(lineID); explicit != "" {
+		return explicit
+	}
+	reportedUUID = strings.ToLower(strings.TrimSpace(reportedUUID))
+	if validLineUUIDv4(reportedUUID) {
+		if hash := r.hashByUUID[reportedUUID]; hash != "" {
+			owner := r.ownerByHash[hash]
+			if owner == strings.TrimSpace(nodeID) {
+				return hash
+			}
+			candidate := fallback()
+			if owner == "" && candidate == hash {
+				return hash
+			}
+			return candidate
+		}
+	}
+	return fallback()
+}
+
+// uuid returns a UUID only when both directions uniquely identify the same
+// hash. This round trip prevents a dynamically computed hash from re-admitting
+// a duplicated UUID into compiler or read-model output.
+func (r lineUUIDAuthorityResolver) uuid(hash string) (string, bool) {
+	hash = strings.TrimSpace(hash)
+	uuid := r.uuidByHash[hash]
+	return uuid, uuid != "" && r.hashByUUID[uuid] == hash
+}
+
 func validLineUUIDv4(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if !proxyUUIDRe.MatchString(value) || value[14] != '4' {
@@ -101,66 +180,23 @@ func validLineUUIDv4(value string) bool {
 	return strings.ContainsRune("89ab", rune(value[19]))
 }
 
-// resolveLineUUIDAuthority restores a missing control-plane mapping from the
-// agent sidecar only when the reported UUID is a collision-free UUIDv4. An
-// existing DB mapping is authoritative and cannot be changed by an agent.
-func (s *Server) resolveLineUUIDAuthority(lineHashID, reported string) (string, error) {
-	lineHashID = strings.TrimSpace(lineHashID)
-	if lineHashID == "" {
-		return "", fmt.Errorf("line_hash_id is required")
-	}
-	reported = strings.ToLower(strings.TrimSpace(reported))
-	s.lineUUIDMu.Lock()
-	defer s.lineUUIDMu.Unlock()
-
-	entries := s.store.KV(lineUUIDKVBucket)
-	if existing, ok := s.store.KVEntry(lineUUIDKVBucket, lineHashID); ok && strings.TrimSpace(existing.Value) != "" {
-		value := strings.ToLower(strings.TrimSpace(existing.Value))
-		if !validLineUUIDv4(value) {
-			return "", fmt.Errorf("persisted line_uuid for %s is not UUIDv4", lineHashID)
-		}
-		for _, entry := range entries {
-			if entry.Key != lineHashID && strings.EqualFold(strings.TrimSpace(entry.Value), value) {
-				return "", fmt.Errorf("persisted line_uuid %s collides with line %s", value, entry.Key)
-			}
-		}
-		if reported != "" && reported != value {
-			s.logger.Printf("linemeta: ignore agent line_uuid %s for %s; control-plane mapping is %s", reported, lineHashID, value)
-		}
-		return value, nil
-	}
-
-	candidate := ""
-	if validLineUUIDv4(reported) {
-		candidate = reported
-		for _, entry := range entries {
-			if strings.EqualFold(strings.TrimSpace(entry.Value), candidate) {
-				s.logger.Printf("linemeta: reject agent line_uuid %s for %s; already assigned to %s", candidate, lineHashID, entry.Key)
-				candidate = ""
-				break
-			}
-		}
-	} else if reported != "" {
-		s.logger.Printf("linemeta: reject invalid agent line_uuid %q for %s", reported, lineHashID)
-	}
-	if candidate == "" {
-		var err error
-		candidate, err = newProxyUUID()
-		if err != nil {
-			return "", err
-		}
-	}
-	if err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: lineHashID, Value: candidate}); err != nil {
-		return "", err
-	}
-	return candidate, nil
-}
-
 // buildLineGroups merges Lattice-managed inbounds and on-box discovered nodes into
 // one node-grouped Line set. Managed lines win a (node,type,port) collision (the
 // managed view is richer and editable); the matching discovered entry is dropped
 // so an applied-then-discovered inbound is not listed twice.
 func (s *Server) buildLineGroups() []LineGroup {
+	// A projection owns one immutable view of UUID authority. Holding the
+	// authority lock across the batch prevents concurrent reattach from mixing
+	// generations and lets all known lines resolve without per-line KV scans.
+	s.lineUUIDMu.Lock()
+	defer s.lineUUIDMu.Unlock()
+	uuidByHash, ownerByHash := s.store.LineUUIDAuthoritySnapshot()
+	uuidResolver := newLineUUIDAuthorityResolver(func(yield func(hash, uuid, ownerNodeID string)) {
+		for hash, uuid := range uuidByHash {
+			yield(hash, uuid, ownerByHash[hash])
+		}
+	})
+
 	byNode := map[string][]Line{}
 	// (nodeID|type|port) -> already have a managed line, so skip the discovered dup.
 	managedKey := map[string]bool{}
@@ -231,7 +267,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				status = "error"
 				lastErr = inv.Error
 			}
-			lineID := firstNonEmpty(n.LineID, n.Metadata["line_id"])
+			lineID := effectiveDiscoveredLineID(n)
 			nodeUUID := firstNonEmpty(n.NodeIdentityUUID, n.Metadata["node_uuid"], n.Metadata["lattice_identity_uuid"], s.nodeIdentityUUID(inv.NodeID))
 			ln := Line{
 				LineID:             lineID,
@@ -259,10 +295,9 @@ func (s *Server) buildLineGroups() []LineGroup {
 				LastError:          lastErr,
 				Metadata:           n.Metadata,
 			}
-			ln.LineHashID = stableLineHandle(ln.LineID)
-			if ln.LineHashID == "" {
-				ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
-			}
+			ln.LineHashID = uuidResolver.resolve(ln.NodeID, ln.LineID, ln.LineUUID, func() string {
+				return lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
+			})
 			ln.ID = ln.LineHashID
 			byNode[ln.NodeID] = append(byNode[ln.NodeID], ln)
 		}
@@ -310,12 +345,43 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// DownstreamLineUUID stays empty for them this slice.
 	for nodeID, lines := range byNode {
 		for i := range lines {
-			uuid, err := s.resolveLineUUIDAuthority(lines[i].LineHashID, lines[i].LineUUID)
-			if err != nil {
-				s.logger.Printf("linemeta: allocate line_uuid for %s: %v", lines[i].LineHashID, err)
+			if uuid, ok := uuidResolver.uuid(lines[i].LineHashID); ok {
+				owner := uuidResolver.ownerByHash[lines[i].LineHashID]
+				if owner == lines[i].NodeID {
+					lines[i].LineUUID = uuid
+					continue
+				}
+				if owner == "" && provesLineUUIDAuthorityHash(lines[i]) {
+					if err := s.store.PutLineUUIDAuthority(lines[i].LineHashID, uuid, lines[i].NodeID); err == nil {
+						uuidResolver.ownerByHash[lines[i].LineHashID] = lines[i].NodeID
+						lines[i].LineUUID = uuid
+						continue
+					}
+				}
+			}
+			if persisted := uuidResolver.uuidByHash[lines[i].LineHashID]; persisted != "" {
+				s.logger.Printf("linemeta: reject non-unique or invalid persisted line_uuid %s for %s", persisted, lines[i].LineHashID)
+				lines[i].LineUUID = ""
+				continue
+			}
+			uuid := strings.ToLower(strings.TrimSpace(lines[i].LineUUID))
+			_, uuidKnown := uuidResolver.hashByUUID[uuid]
+			if !validLineUUIDv4(uuid) || uuidKnown {
+				var err error
+				uuid, err = newProxyUUID()
+				if err != nil {
+					s.logger.Printf("linemeta: allocate line_uuid for %s: %v", lines[i].LineHashID, err)
+					lines[i].LineUUID = ""
+					continue
+				}
+			}
+			if err := s.store.PutLineUUIDAuthority(lines[i].LineHashID, uuid, lines[i].NodeID); err != nil {
+				s.logger.Printf("linemeta: persist line_uuid for %s: %v", lines[i].LineHashID, err)
+				lines[i].LineUUID = ""
 				continue
 			}
 			lines[i].LineUUID = uuid
+			uuidResolver.add(lines[i].LineHashID, uuid, lines[i].NodeID)
 		}
 		byNode[nodeID] = lines
 	}
@@ -366,11 +432,16 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// downstream_line_uuid resolves to the downstream line's hash fleet-wide —
 	// exact across machines, immune to NAT and shared ports — and takes
 	// provenance precedence over the inferred (host,port) edges from (3).
-	uuidIndex := map[string]string{} // line_uuid -> line_hash_id
+	uuidIndex := map[string]string{} // line_uuid -> unique line_hash_id; empty means ambiguous
 	for _, lines := range byNode {
 		for _, ln := range lines {
-			if ln.LineUUID != "" {
-				uuidIndex[ln.LineUUID] = ln.LineHashID
+			uuid := strings.ToLower(strings.TrimSpace(ln.LineUUID))
+			if uuid != "" {
+				if prior, exists := uuidIndex[uuid]; exists && prior != ln.LineHashID {
+					uuidIndex[uuid] = ""
+				} else if !exists {
+					uuidIndex[uuid] = ln.LineHashID
+				}
 			}
 		}
 	}

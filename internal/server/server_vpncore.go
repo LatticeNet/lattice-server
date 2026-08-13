@@ -179,14 +179,16 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 		return nil, errors.New("vpn-core/lines reattach: line_uuid must be UUIDv4")
 	}
 	s.lineUUIDMu.Lock()
-	previous, hadPrevious := s.store.KVEntry(lineUUIDKVBucket, req.LineHashID)
-	for _, entry := range s.store.KV(lineUUIDKVBucket) {
-		if entry.Key != req.LineHashID && strings.EqualFold(strings.TrimSpace(entry.Value), req.LineUUID) {
+	uuidByHash, ownerByHash := s.store.LineUUIDAuthoritySnapshot()
+	previousUUID, hadPrevious := uuidByHash[req.LineHashID]
+	previousOwner := ownerByHash[req.LineHashID]
+	for hash, uuid := range uuidByHash {
+		if hash != req.LineHashID && strings.EqualFold(strings.TrimSpace(uuid), req.LineUUID) {
 			s.lineUUIDMu.Unlock()
-			return nil, fmt.Errorf("vpn-core/lines reattach: line_uuid is already assigned to %s", entry.Key)
+			return nil, fmt.Errorf("vpn-core/lines reattach: line_uuid is already assigned to %s", hash)
 		}
 	}
-	err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: req.LineHashID, Value: req.LineUUID})
+	err := s.store.PutLineUUIDAuthority(req.LineHashID, req.LineUUID, line.NodeID)
 	s.lineUUIDMu.Unlock()
 	if err != nil {
 		return nil, err
@@ -195,11 +197,10 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 	metadataPlan, syncErr := s.queueLineMetaSync(p, line.NodeID)
 	if syncErr != nil {
 		s.lineUUIDMu.Lock()
-		if hadPrevious {
-			err = s.store.PutKV(previous)
-		} else {
-			err = s.store.DeleteKV(lineUUIDKVBucket, req.LineHashID)
+		if !hadPrevious {
+			previousUUID, previousOwner = "", ""
 		}
+		err = s.store.PutLineUUIDAuthority(req.LineHashID, previousUUID, previousOwner)
 		s.lineUUIDMu.Unlock()
 		s.invalidateLineReadModel()
 		if err != nil {
@@ -209,7 +210,7 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), NodeID: line.NodeID, Action: "line.uuid.reattach", Scope: "vpncore:admin",
-		Metadata: map[string]string{"line_hash_id": req.LineHashID, "line_uuid": req.LineUUID},
+		Metadata: map[string]string{"line_hash_id": req.LineHashID, "line_uuid": req.LineUUID, "owner_node_id": line.NodeID},
 	})
 	return json.Marshal(struct {
 		LineHashID       string          `json:"line_hash_id"`

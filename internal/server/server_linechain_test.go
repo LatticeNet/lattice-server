@@ -1002,6 +1002,114 @@ func TestLineChainCompilerDoesNotAllocateMissingUUIDAuthority(t *testing.T) {
 	}
 }
 
+func TestLineChainCompilerRejectsAmbiguousUUIDAuthorityWithoutMutation(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	snapshot, err := srv.captureLineChainCompileSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := snapshot.Lines[sourceUUID][0]
+	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: "line_duplicate_authority", Value: sourceUUID}); err != nil {
+		t.Fatal(err)
+	}
+	before := srv.store.KV(lineUUIDKVBucket)
+	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil {
+		t.Fatal("compile accepted ambiguous UUID authority")
+	}
+	after := srv.store.KV(lineUUIDKVBucket)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed compile mutated UUID authority: before=%+v after=%+v", before, after)
+	}
+	if entry, ok := srv.store.KVEntry(lineUUIDKVBucket, source.LineHashID); !ok || entry.Value != sourceUUID {
+		t.Fatalf("source authority changed: %+v ok=%v", entry, ok)
+	}
+}
+
+func TestLineChainCompilerRejectsCrossNodeUUIDTakeoverWithoutMutation(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	before := srv.store.KV(lineUUIDKVBucket)
+	srv.singboxInvMu.Lock()
+	owner := srv.singboxInv["node-b"]
+	delete(srv.singboxInv, "node-b")
+	owner.NodeID = "node-c"
+	srv.singboxInv["node-c"] = owner
+	srv.singboxInvMu.Unlock()
+	if err := srv.store.UpsertNode(model.Node{ID: "node-c", Name: "Node C"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil {
+		t.Fatal("compile admitted cross-node UUID takeover")
+	}
+	if after := srv.store.KV(lineUUIDKVBucket); !reflect.DeepEqual(after, before) {
+		t.Fatalf("failed compile mutated UUID authority: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestLineChainCompilerUsesMetadataLineIDAuthority(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	snapshot, err := srv.captureLineChainCompileSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHash := snapshot.Lines[sourceUUID][0].LineHashID
+	if err := srv.store.PutLineUUIDAuthority(oldHash, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	const lineID = "metadata-stable-source"
+	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: "line_" + lineID, Value: sourceUUID}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	inv := srv.singboxInv["node-b"]
+	inv.Nodes[0].LineID = ""
+	if inv.Nodes[0].Metadata == nil {
+		inv.Nodes[0].Metadata = map[string]string{}
+	}
+	inv.Nodes[0].Metadata["line_id"] = lineID
+	srv.singboxInv["node-b"] = inv
+	srv.singboxInvMu.Unlock()
+	_ = srv.buildLineGroups()
+	if owner, ok := srv.store.KVEntry(lineUUIDOwnerKVBucket, "line_"+lineID); !ok || owner.Value != "node-b" {
+		t.Fatalf("read projection did not publish metadata line_id owner: %+v ok=%v", owner, ok)
+	}
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compiled.CandidateDefinition.SourceLineHashID != "line_"+lineID {
+		t.Fatalf("compiler ignored metadata line_id: %+v", compiled.CandidateDefinition)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("metadata line_id lease=%+v err=%v", deliveries, err)
+	}
+	result := model.TaskResult{TaskID: deliveries[0].Task.ID, NodeID: "node-b", LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
+	if err := srv.handleLineChainTaskResult(approval, deliveries[0].Task, result); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	inv = srv.singboxInv["node-b"]
+	inv.Nodes[0].DownstreamLineUUID = targetUUID
+	inv.Nodes[0].OutboundRef = compiled.Plan.OutboundTag
+	srv.singboxInv["node-b"] = inv
+	srv.singboxInvMu.Unlock()
+	if err := srv.reconcileLineChainsForNode("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || got.SourceLineHashID != "line_"+lineID {
+		t.Fatalf("metadata line_id authority did not reconcile: %+v", got)
+	}
+}
+
 func TestLineChainCompilerRejectsUnsupportedTargetTransport(t *testing.T) {
 	srv, sourceUUID, targetUUID, _, def := seedLineChainFixture(t)
 	seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{
@@ -1158,16 +1266,13 @@ func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 			t.Fatalf("immediate set->%s artifact=%s want=%s err=%v", operation, immediate.Plan.ArtifactSHA256, wantArtifact, err)
 		}
 	}
-	observedHash := lineHash("node-b", model.ProxyCoreSingbox, "vless", "", 1443, "source-b", setArtifact.Plan.OutboundTag)
-	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: observedHash, Value: sourceUUID}); err != nil {
-		t.Fatal(err)
-	}
-	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443",
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443", ListenHost: "127.0.0.2",
 		LineUUID: sourceUUID, OutboundRef: setArtifact.Plan.OutboundTag, DownstreamLineUUID: targetUUID}})
 	if err := srv.reconcileLineChainsForNode("node-b"); err != nil {
 		t.Fatal(err)
 	}
-	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged {
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged ||
+		got.SourceLineHashID != setArtifact.CandidateDefinition.SourceLineHashID {
 		t.Fatalf("scheduled observation did not converge set: %+v", got)
 	}
 	for _, event := range srv.store.AuditEvents() {

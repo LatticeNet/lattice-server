@@ -58,6 +58,14 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	target.RealityPrivateKey = realityPrivate
 	target.RealityPublicKey = realityPublic
 	target.ShortID = "0123456789abcdef"
+	// Preserve the fixture-owned line-hash authority when rewriting target
+	// runtime metadata; linemeta rejects reusing a UUID under a new hash key.
+	for _, entry := range srv.store.KV(lineUUIDKVBucket) {
+		if strings.EqualFold(strings.TrimSpace(entry.Value), targetUUID) {
+			target.LineHashID = entry.Key
+			break
+		}
+	}
 	if err := srv.putManagedLineDef(target); err != nil {
 		t.Fatal(err)
 	}

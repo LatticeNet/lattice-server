@@ -151,6 +151,19 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 
 	pool := newSystemPool(256, time.Hour, req.Generation)
 	if req.Loaded.Manifest.Runtime != nil && req.Loaded.Manifest.Runtime.Protocol == RuntimeProtocolStdioJSONV2 {
+		pool.replenishFn = func(gen uint64) (*pooledWorker, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			t, err := startSystemWorker(ctx, execPath, workDir, r.childEnv())
+			if err != nil {
+				return nil, err
+			}
+			if err := t.awaitReadyContext(ctx, gen); err != nil {
+				_ = t.abort()
+				return nil, err
+			}
+			return &pooledWorker{generation: gen, started: time.Now(), transport: t}, nil
+		}
 		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.childEnv())
 		if startErr == nil {
@@ -170,8 +183,12 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	}
 	r.mu.Lock()
 	isV2 := req.Loaded.Manifest.Runtime != nil && req.Loaded.Manifest.Runtime.Protocol == RuntimeProtocolStdioJSONV2
+	old := r.st[pluginID]
 	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2}
 	r.mu.Unlock()
+	if old != nil && old.pool != nil && old.pool != pool {
+		old.pool.drain(old.pool.generation)
+	}
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
 }
 

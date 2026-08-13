@@ -145,6 +145,11 @@ func canonicalLineChainSidecarPatch(sourceUUID, sourceTag, expected, desired str
 }
 
 func canonicalLineChainArtifact(operation, fragmentBasename, previousFragmentSHA, fragmentSHA, patchSHA string) (string, error) {
+	_, digest, err := canonicalLineChainArtifactJSON(operation, fragmentBasename, previousFragmentSHA, fragmentSHA, patchSHA)
+	return digest, err
+}
+
+func canonicalLineChainArtifactJSON(operation, fragmentBasename, previousFragmentSHA, fragmentSHA, patchSHA string) (string, string, error) {
 	nullableSHA := func(value string) (*string, error) {
 		value = strings.ToLower(strings.TrimSpace(value))
 		if value == "" {
@@ -160,23 +165,39 @@ func canonicalLineChainArtifact(operation, fragmentBasename, previousFragmentSHA
 	}
 	previous, err := nullableSHA(previousFragmentSHA)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	fragment, err := nullableSHA(fragmentSHA)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	patchSHA = strings.ToLower(strings.TrimSpace(patchSHA))
 	if _, err := nullableSHA(patchSHA); err != nil || patchSHA == "" {
-		return "", errors.New("artifact binding contains invalid sidecar patch sha256")
+		return "", "", errors.New("artifact binding contains invalid sidecar patch sha256")
+	}
+	switch operation {
+	case "create":
+		if previous != nil || fragment == nil {
+			return "", "", errors.New("create artifact requires previous fragment null and fragment sha256 present")
+		}
+	case "replace":
+		if previous == nil || fragment == nil {
+			return "", "", errors.New("replace artifact requires previous and desired fragment sha256")
+		}
+	case "remove":
+		if previous == nil || fragment != nil {
+			return "", "", errors.New("remove artifact requires previous fragment sha256 and desired fragment null")
+		}
+	default:
+		return "", "", fmt.Errorf("unsupported line-chain artifact operation %q", operation)
 	}
 	binding := lineChainArtifactBindingV2{Schema: lineChainArtifactSchema, Operation: operation, FragmentBasename: fragmentBasename,
 		PreviousFragmentSHA256: previous, FragmentSHA256: fragment, SidecarPatchSHA256: patchSHA}
 	raw, err := json.Marshal(binding)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return digestText(string(raw)), nil
+	return string(raw), digestText(string(raw)), nil
 }
 
 func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, error) {

@@ -93,6 +93,11 @@ func TestSystemPoolGracefulDrainRetiresLeasedWithoutResurrection(t *testing.T) {
 	}
 	p.mu.Unlock()
 	p.release(w, true, time.Now())
+	select {
+	case <-p.drained:
+	case <-time.After(time.Second):
+		t.Fatal("drain did not complete")
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.active != 0 || len(p.leased) != 0 || len(p.workers) != 0 {

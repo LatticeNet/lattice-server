@@ -41,6 +41,7 @@ type systemPool struct {
 	replenishFn func(uint64) (*pooledWorker, error)
 	active      int
 	starting    int
+	drained     chan struct{}
 	leased      map[*pooledWorker]struct{}
 }
 
@@ -75,7 +76,7 @@ func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *sy
 	if len(generations) > 0 && generations[0] != 0 {
 		generation = generations[0]
 	}
-	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1, leased: map[*pooledWorker]struct{}{}}
+	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1, leased: map[*pooledWorker]struct{}{}, drained: make(chan struct{})}
 }
 
 func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error {
@@ -190,6 +191,13 @@ func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 		p.active--
 	}
 	delete(p.leased, w)
+	if p.closed && p.active == 0 {
+		select {
+		case <-p.drained:
+		default:
+			close(p.drained)
+		}
+	}
 	if resultSeen {
 		w.state = workerResultSeen
 	}
@@ -252,11 +260,12 @@ func (p *systemPool) drain(generation uint64) {
 
 // gracefulDrain closes admission, aborts idle workers, and lets leased work
 // finish. Leased workers retire on release and are never replenished.
-func (p *systemPool) gracefulDrain(generation uint64) {
+func (p *systemPool) gracefulDrain(generation uint64) <-chan struct{} {
 	p.mu.Lock()
 	if generation != p.generation {
+		done := p.drained
 		p.mu.Unlock()
-		return
+		return done
 	}
 	p.closed = true
 	idle := append([]*pooledWorker(nil), p.workers...)
@@ -275,6 +284,7 @@ func (p *systemPool) gracefulDrain(generation uint64) {
 			_ = w.transport.abort()
 		}
 	}
+	return p.drained
 }
 
 // abortClose immediately revokes idle and leased workers; all waits happen

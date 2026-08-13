@@ -187,7 +187,8 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2}
 	r.mu.Unlock()
 	if old != nil && old.pool != nil && old.pool != pool {
-		old.pool.gracefulDrain(old.pool.generation)
+		drained := old.pool.gracefulDrain(old.pool.generation)
+		go func(dir string) { <-drained; _ = os.RemoveAll(dir) }(old.workDir)
 	}
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
 }

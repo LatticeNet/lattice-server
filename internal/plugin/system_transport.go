@@ -16,7 +16,7 @@ func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, r
 		return systemRunnerReply{}, fmt.Errorf("worker transport unavailable")
 	}
 	frame := stdioJSONV2Frame{Protocol: 2, Kind: "invoke", Generation: generation, InvocationID: invocation}
-	frame.Payload, _ = json.Marshal(struct {
+	frame.Request, _ = json.Marshal(struct {
 		Action  string          `json:"action"`
 		Payload json.RawMessage `json:"payload,omitempty"`
 	}{req.Action, req.Payload})
@@ -38,7 +38,7 @@ func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, r
 			return systemRunnerReply{}, fmt.Errorf("unexpected v2 frame %q", f.Kind)
 		}
 		var reply systemRunnerReply
-		if err := json.Unmarshal(f.Payload, &reply); err != nil {
+		if err := json.Unmarshal(f.Response, &reply); err != nil {
 			return systemRunnerReply{}, err
 		}
 		if !t.scanner.Scan() {

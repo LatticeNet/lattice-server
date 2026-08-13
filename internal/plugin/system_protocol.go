@@ -38,7 +38,10 @@ type stdioJSONV2Frame struct {
 	Generation   uint64          `json:"generation"`
 	InvocationID string          `json:"invocation_id"`
 	HostCallID   string          `json:"host_call_id,omitempty"`
-	Payload      json.RawMessage `json:"payload,omitempty"`
+	Request      json.RawMessage `json:"request,omitempty"`
+	Response     json.RawMessage `json:"response,omitempty"`
+	HostCall     json.RawMessage `json:"host_call,omitempty"`
+	HostResponse json.RawMessage `json:"host_response,omitempty"`
 }
 
 func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationID, hostCallID string) error {

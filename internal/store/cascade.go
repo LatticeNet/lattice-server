@@ -1,6 +1,13 @@
 package store
 
-import "github.com/LatticeNet/lattice-sdk/model"
+import (
+	"errors"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+)
+
+var ErrLineChainDeleteConflict = errors.New("node deletion conflicts with an issued line chain lease")
 
 // NodeCascadeReport tallies what a node hard-delete removed (or, in plan mode,
 // would remove) from the JSON store. It is a server-LOCAL plain report: the
@@ -23,20 +30,25 @@ type NodeCascadeReport struct {
 	// NetPeerRulesStripped / GroupPolicyRulesStripped count node-reference rules
 	// removed from OTHER nodes' net policies and from group policies (SHARED:
 	// strip the dangling Remote.NodeID rule, keep the owner's policy).
-	NetPeerRulesStripped     int `json:"net_peer_rules_stripped"`
-	GroupPolicyRulesStripped int `json:"group_policy_rules_stripped"`
-	GeoRoutingStripped       int `json:"geo_routing_stripped"` // SHARED: stripped, kept
-	GeoRoutingDeleted        int `json:"geo_routing_deleted"`  // became empty -> deleted
-	AgentUpdatePolicies      int `json:"agent_update_policies"`
-	ProxyNodeProfiles        int `json:"proxy_node_profiles"`
-	ProxyUsageSnapshots      int `json:"proxy_usage_snapshots"`
-	MonitorsStripped         int `json:"monitors_stripped"` // SHARED: stripped from Monitor.NodeIDs
-	MonitorResults           int `json:"monitor_results"`
-	LogSources               int `json:"log_sources"`
-	Groups                   int `json:"groups"`    // Members/LeaderID edited
-	Approvals                int `json:"approvals"` // NO existing primitive
-	Tunnels                  int `json:"tunnels"`
-	GuardRealitySnapshots    int `json:"guard_reality_snapshots"`
+	NetPeerRulesStripped        int `json:"net_peer_rules_stripped"`
+	GroupPolicyRulesStripped    int `json:"group_policy_rules_stripped"`
+	GeoRoutingStripped          int `json:"geo_routing_stripped"` // SHARED: stripped, kept
+	GeoRoutingDeleted           int `json:"geo_routing_deleted"`  // became empty -> deleted
+	AgentUpdatePolicies         int `json:"agent_update_policies"`
+	ProxyNodeProfiles           int `json:"proxy_node_profiles"`
+	ProxyUsageSnapshots         int `json:"proxy_usage_snapshots"`
+	MonitorsStripped            int `json:"monitors_stripped"` // SHARED: stripped from Monitor.NodeIDs
+	MonitorResults              int `json:"monitor_results"`
+	LogSources                  int `json:"log_sources"`
+	Groups                      int `json:"groups"`    // Members/LeaderID edited
+	Approvals                   int `json:"approvals"` // NO existing primitive
+	Tunnels                     int `json:"tunnels"`
+	GuardRealitySnapshots       int `json:"guard_reality_snapshots"`
+	ManagedLines                int `json:"managed_lines"`
+	LineChainAttemptsReleased   int `json:"line_chain_attempts_released"`
+	LineChainDefinitionsDeleted int `json:"line_chain_definitions_deleted"`
+	LineChainTargetsDrifted     int `json:"line_chain_targets_drifted"`
+	LineChainLeaseConflicts     int `json:"line_chain_lease_conflicts"`
 	// RemovedLogSourceIDs lists the log-source IDs whose records this delete
 	// removed from the JSON store. The SERVER must call logStore.PurgeSource on
 	// each (the log lines live in a separate bbolt db the store cannot reach).
@@ -90,10 +102,14 @@ func withoutString(values []string, value string) []string {
 func (s *Store) DeleteNode(nodeID string) (NodeCascadeReport, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	report, ok := s.buildNodeCascadeLocked(nodeID, true)
+	preview, ok := s.buildNodeCascadeLocked(nodeID, false)
 	if !ok {
-		return report, false, nil
+		return preview, false, nil
 	}
+	if preview.LineChainLeaseConflicts > 0 {
+		return preview, true, ErrLineChainDeleteConflict
+	}
+	report, ok := s.buildNodeCascadeLocked(nodeID, true)
 	return report, true, s.Save()
 }
 
@@ -117,11 +133,92 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		return report, false
 	}
 
+	// Line-chain authority is inspected before generic task/approval deletion.
+	// An issued source lease is frozen execution authority and blocks deletion.
+	// Unissued source/target candidates are cancelled and released; target-side
+	// issued candidates survive so their exact frozen result can still commit.
+	now := time.Now().UTC()
+	preserveApprovals := map[string]bool{}
+	preserveTasks := map[string]bool{}
+	chainChanged := false
+	for approvalID, attempt := range s.state.LineChainAttempts {
+		sourceGone := attempt.SourceNodeID == nodeID
+		targetGone := attempt.CandidateTargetNodeID == nodeID
+		if !sourceGone && !targetGone {
+			continue
+		}
+		if attempt.IssuedLeaseID != "" {
+			preserveApprovals[approvalID] = true
+			preserveTasks[attempt.IssuedTaskID] = true
+			if sourceGone {
+				report.LineChainLeaseConflicts++
+			}
+			if targetGone {
+				report.LineChainTargetsDrifted++
+				chainChanged = true
+			}
+			continue
+		}
+		report.LineChainAttemptsReleased++
+		chainChanged = true
+		if !mutate {
+			continue
+		}
+		delete(s.state.LineChainAttempts, approvalID)
+		if approval, ok := s.state.Approvals[approvalID]; ok {
+			approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, true, "line_chain_dependency_deleted"
+			approval.Reason, approval.UpdatedAt = "line chain source or target was deleted before first lease", now
+			s.state.Approvals[approvalID] = approval
+			preserveApprovals[approvalID] = true
+		}
+		for taskID, task := range s.state.Tasks {
+			if task.ApprovalID == approvalID {
+				task.Status = model.TaskCancelled
+				s.state.Tasks[taskID] = task
+				preserveTasks[taskID] = true
+			}
+		}
+	}
+	for sourceUUID, definition := range s.state.LineChainDefinitions {
+		if definition.SourceNodeID == nodeID {
+			report.LineChainDefinitionsDeleted++
+			chainChanged = true
+			if mutate {
+				delete(s.state.LineChainDefinitions, sourceUUID)
+			}
+			continue
+		}
+		if definition.TargetNodeID == nodeID && (definition.Status != LineChainStatusDrifted || definition.DriftCode != "target_missing") {
+			report.LineChainTargetsDrifted++
+			chainChanged = true
+			if mutate {
+				definition.Status, definition.DriftCode, definition.UpdatedAt = LineChainStatusDrifted, "target_missing", now
+				s.state.LineChainDefinitions[sourceUUID] = definition
+			}
+		}
+	}
+	for lineUUID, definition := range s.state.ManagedLines {
+		if definition.NodeID != nodeID {
+			continue
+		}
+		report.ManagedLines++
+		if mutate {
+			delete(s.state.ManagedLines, lineUUID)
+			delete(s.state.ManagedLineSecrets, lineUUID)
+		}
+	}
+	if mutate && chainChanged {
+		s.state.LineChainGraphRevision++
+	}
+
 	// Step 1: Tasks (multi-target). Strip nodeID from Targets; delete the task
 	// only when it was the sole target. Track deleted task IDs so step 2 prunes
 	// their results consistently in both plan and delete modes.
 	deletedTasks := map[string]bool{}
 	for tid, t := range s.state.Tasks {
+		if preserveTasks[tid] {
+			continue
+		}
 		if !contains(t.Targets, nodeID) {
 			continue
 		}
@@ -392,6 +489,9 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 
 	// Step 15: Approval (no DeleteApproval primitive exists).
 	for id, a := range s.state.Approvals {
+		if preserveApprovals[id] {
+			continue
+		}
 		if a.NodeID == nodeID {
 			report.Approvals++
 			if mutate {

@@ -15,36 +15,41 @@ import (
 // cleanup counts (terminal sessions, proxy-drift cache, cross-store log purge).
 // Mutated distinguishes a dry-run plan (false) from an applied delete (true).
 type nodeDeleteSummary struct {
-	NodeID                   string `json:"node_id"`
-	NodeName                 string `json:"node_name"`
-	Found                    bool   `json:"found"`
-	Mutated                  bool   `json:"mutated"` // false=plan, true=delete
-	TasksStripped            int    `json:"tasks_stripped"`
-	TasksDeleted             int    `json:"tasks_deleted"`
-	TaskResults              int    `json:"task_results"`
-	DDNSProfiles             int    `json:"ddns_profiles"`
-	MachineProfiles          int    `json:"machine_profiles"`
-	NFTInputs                int    `json:"nft_inputs"`
-	DNSDeployments           int    `json:"dns_deployments"`
-	NetPolicies              int    `json:"net_policies"`
-	NetPeerRulesStripped     int    `json:"net_peer_rules_stripped"`
-	GroupPolicyRulesStripped int    `json:"group_policy_rules_stripped"`
-	GeoRoutingStripped       int    `json:"geo_routing_stripped"`
-	GeoRoutingDeleted        int    `json:"geo_routing_deleted"`
-	AgentUpdatePolicies      int    `json:"agent_update_policies"`
-	ProxyNodeProfiles        int    `json:"proxy_node_profiles"`
-	ProxyUsageSnapshots      int    `json:"proxy_usage_snapshots"`
-	MonitorsStripped         int    `json:"monitors_stripped"`
-	MonitorResults           int    `json:"monitor_results"`
-	LogSources               int    `json:"log_sources"`
-	Groups                   int    `json:"groups"`
-	Approvals                int    `json:"approvals"`
-	Tunnels                  int    `json:"tunnels"`
-	GuardRealitySnapshots    int    `json:"guard_reality_snapshots"`
-	TerminalSessions         int    `json:"terminal_sessions"`    // closed (delete) / active (plan)
-	ProxyDriftCleared        int    `json:"proxy_drift_cleared"`  // 0/1
-	LogStorePurged           int    `json:"log_store_purged"`     // delete only
-	LogStorePurgeErrs        int    `json:"log_store_purge_errs"` // surfaced, not swallowed
+	NodeID                      string `json:"node_id"`
+	NodeName                    string `json:"node_name"`
+	Found                       bool   `json:"found"`
+	Mutated                     bool   `json:"mutated"` // false=plan, true=delete
+	TasksStripped               int    `json:"tasks_stripped"`
+	TasksDeleted                int    `json:"tasks_deleted"`
+	TaskResults                 int    `json:"task_results"`
+	DDNSProfiles                int    `json:"ddns_profiles"`
+	MachineProfiles             int    `json:"machine_profiles"`
+	NFTInputs                   int    `json:"nft_inputs"`
+	DNSDeployments              int    `json:"dns_deployments"`
+	NetPolicies                 int    `json:"net_policies"`
+	NetPeerRulesStripped        int    `json:"net_peer_rules_stripped"`
+	GroupPolicyRulesStripped    int    `json:"group_policy_rules_stripped"`
+	GeoRoutingStripped          int    `json:"geo_routing_stripped"`
+	GeoRoutingDeleted           int    `json:"geo_routing_deleted"`
+	AgentUpdatePolicies         int    `json:"agent_update_policies"`
+	ProxyNodeProfiles           int    `json:"proxy_node_profiles"`
+	ProxyUsageSnapshots         int    `json:"proxy_usage_snapshots"`
+	MonitorsStripped            int    `json:"monitors_stripped"`
+	MonitorResults              int    `json:"monitor_results"`
+	LogSources                  int    `json:"log_sources"`
+	Groups                      int    `json:"groups"`
+	Approvals                   int    `json:"approvals"`
+	Tunnels                     int    `json:"tunnels"`
+	GuardRealitySnapshots       int    `json:"guard_reality_snapshots"`
+	ManagedLines                int    `json:"managed_lines"`
+	LineChainAttemptsReleased   int    `json:"line_chain_attempts_released"`
+	LineChainDefinitionsDeleted int    `json:"line_chain_definitions_deleted"`
+	LineChainTargetsDrifted     int    `json:"line_chain_targets_drifted"`
+	LineChainLeaseConflicts     int    `json:"line_chain_lease_conflicts"`
+	TerminalSessions            int    `json:"terminal_sessions"`    // closed (delete) / active (plan)
+	ProxyDriftCleared           int    `json:"proxy_drift_cleared"`  // 0/1
+	LogStorePurged              int    `json:"log_store_purged"`     // delete only
+	LogStorePurgeErrs           int    `json:"log_store_purge_errs"` // surfaced, not swallowed
 }
 
 func newNodeDeleteSummary(nodeID, name string, mutated bool, r store.NodeCascadeReport) nodeDeleteSummary {
@@ -59,6 +64,9 @@ func newNodeDeleteSummary(nodeID, name string, mutated bool, r store.NodeCascade
 		ProxyUsageSnapshots: r.ProxyUsageSnapshots, MonitorsStripped: r.MonitorsStripped,
 		MonitorResults: r.MonitorResults, LogSources: r.LogSources, Groups: r.Groups,
 		Approvals: r.Approvals, Tunnels: r.Tunnels, GuardRealitySnapshots: r.GuardRealitySnapshots,
+		ManagedLines: r.ManagedLines, LineChainAttemptsReleased: r.LineChainAttemptsReleased,
+		LineChainDefinitionsDeleted: r.LineChainDefinitionsDeleted, LineChainTargetsDrifted: r.LineChainTargetsDrifted,
+		LineChainLeaseConflicts: r.LineChainLeaseConflicts,
 	}
 }
 
@@ -139,7 +147,11 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 
 	report, ok, err := s.store.DeleteNode(req.NodeID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		status := http.StatusInternalServerError
+		if errors.Is(err, store.ErrLineChainDeleteConflict) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err)
 		return
 	}
 	s.invalidateLineReadModel()

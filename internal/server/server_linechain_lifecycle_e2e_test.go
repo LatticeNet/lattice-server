@@ -294,15 +294,6 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if len(observed.Nodes) != 1 {
 		t.Fatalf("seeded source inventory missing: %+v", observed)
 	}
-	observed.Nodes[0].DownstreamLineUUID = targetUUID
-	observed.Nodes[0].OutboundRef = snapshot.Definitions[sourceUUID].OutboundTag
-	if err := srv.store.DeleteKV(lineUUIDKVBucket, snapshot.Definitions[sourceUUID].SourceLineHashID); err != nil {
-		t.Fatal(err)
-	}
-	observedHash := lineHash("node-b", model.ProxyCoreSingbox, "vless", "", 1443, "source-b", observed.Nodes[0].OutboundRef)
-	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: observedHash, Value: sourceUUID}); err != nil {
-		t.Fatal(err)
-	}
 	observed.Status = "ok"
 	observed.At = time.Now().UTC()
 	inventoryResult := filepath.Join(root, "inventory-result.json")

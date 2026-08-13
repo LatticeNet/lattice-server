@@ -375,9 +375,20 @@ func (s *Store) ReserveLineChain(approvalID string, expectedRevision uint64) (Li
 // RejectLineChainApprovalStale atomically retires a planned candidate whose
 // bound inputs changed during approval-time recompile. Planned candidates have
 // not reserved graph membership, so this transition never increments R.
-func (s *Store) RejectLineChainApprovalStale(approvalID, staleCode, reason string) (bool, error) {
+func (s *Store) RejectLineChainApprovalStale(approvalID, staleCode, reason string, audits ...model.AuditEvent) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.rejectLineChainApprovalLocked(approvalID, true, staleCode, reason, audits)
+}
+
+// RejectLineChainApproval atomically retires a manually rejected candidate.
+func (s *Store) RejectLineChainApproval(approvalID, reason string, audits ...model.AuditEvent) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rejectLineChainApprovalLocked(approvalID, false, "approval_rejected", reason, audits)
+}
+
+func (s *Store) rejectLineChainApprovalLocked(approvalID string, stale bool, staleCode, reason string, audits []model.AuditEvent) (bool, error) {
 	approval, ok := s.state.Approvals[approvalID]
 	if !ok || approval.Status != model.ApprovalPending {
 		return false, ErrTaskTransitionConflict
@@ -392,7 +403,7 @@ func (s *Store) RejectLineChainApprovalStale(approvalID, staleCode, reason strin
 	for id, current := range s.state.Approvals {
 		staged.Approvals[id] = current
 	}
-	approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, true, staleCode
+	approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, stale, staleCode
 	approval.Reason, approval.UpdatedAt = reason, now
 	staged.Approvals[approvalID] = approval
 	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
@@ -404,6 +415,9 @@ func (s *Store) RejectLineChainApprovalStale(approvalID, staleCode, reason strin
 			task.Status = model.TaskCancelled
 		}
 		staged.Tasks[id] = task
+	}
+	if err := stageLineChainAuditEvidence(&staged, s.state, audits); err != nil {
+		return false, err
 	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
@@ -418,6 +432,11 @@ func (s *Store) RejectLineChainApprovalStale(approvalID, staleCode, reason strin
 func (s *Store) ApproveLineChain(approval model.Approval, task model.Task, audits ...model.AuditEvent) (LineChainAttempt, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	failureAudits := []model.AuditEvent(nil)
+	if len(audits) > 1 {
+		failureAudits = audits[1:]
+		audits = audits[:1]
+	}
 	currentApproval, ok := s.state.Approvals[approval.ID]
 	if !ok || currentApproval.Status != model.ApprovalPending || approval.Status != model.ApprovalApproved ||
 		currentApproval.Plugin != approval.Plugin || currentApproval.Service != approval.Service || currentApproval.Method != approval.Method ||
@@ -426,11 +445,22 @@ func (s *Store) ApproveLineChain(approval model.Approval, task model.Task, audit
 	}
 	attempt, ok := s.state.LineChainAttempts[approval.ID]
 	if !ok || attempt.Status != LineChainStatusPlanned || attempt.PlanGraphRevision != s.state.LineChainGraphRevision {
+		if ok && attempt.Status == LineChainStatusPlanned {
+			committed, err := s.rejectLineChainApprovalLocked(approval.ID, true, "line_chain_inputs_changed", "line chain graph revision changed while queueing", failureAudits)
+			if err != nil {
+				return LineChainAttempt{}, committed, err
+			}
+			return LineChainAttempt{}, committed, ErrLineChainRevisionConflict
+		}
 		return LineChainAttempt{}, false, ErrLineChainRevisionConflict
 	}
 	currentDefinition := s.state.LineChainDefinitions[attempt.SourceLineUUID]
 	if currentDefinition.Generation != attempt.BaseGeneration || currentDefinition.ArtifactSHA256 != attempt.BaseArtifactSHA256 {
-		return LineChainAttempt{}, false, ErrLineChainRevisionConflict
+		committed, err := s.rejectLineChainApprovalLocked(approval.ID, true, "line_chain_inputs_changed", "line chain baseline changed while queueing", failureAudits)
+		if err != nil {
+			return LineChainAttempt{}, committed, err
+		}
+		return LineChainAttempt{}, committed, ErrLineChainRevisionConflict
 	}
 	if task.ID == "" || task.ApprovalID != approval.ID || len(task.Targets) != 1 || task.Targets[0] != attempt.SourceNodeID ||
 		strings.TrimSpace(task.Script) == "" || approval.ArtifactDigest == "" || approval.ArtifactDigest != attempt.CandidateArtifactSHA256 {
@@ -447,7 +477,11 @@ func (s *Store) ApproveLineChain(approval model.Approval, task model.Task, audit
 	attempt.UpdatedAt = time.Now().UTC()
 	attempts[approval.ID] = attempt
 	if lineChainGraphHasCycle(s.state.LineChainDefinitions, attempts) {
-		return LineChainAttempt{}, false, ErrLineChainCycle
+		committed, err := s.rejectLineChainApprovalLocked(approval.ID, true, "line_chain_cycle", "line chain candidate would create a cycle", failureAudits)
+		if err != nil {
+			return LineChainAttempt{}, committed, err
+		}
+		return LineChainAttempt{}, committed, ErrLineChainCycle
 	}
 	staged := s.state
 	staged.LineChainAttempts = attempts

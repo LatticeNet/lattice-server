@@ -373,6 +373,33 @@ func TestGenericTaskHTTPMutationCannotBypassLineChainProtocol(t *testing.T) {
 	}
 }
 
+func TestLineChainManualRejectRetiresCandidateAndAllowsFreshPlan(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	response := doJSON(t, handler, http.MethodPost, "/api/network/approvals/reject", fmt.Sprintf(`{"approval_id":%q}`, approval.ID), cookies, csrf)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("reject status=%d", response.StatusCode)
+	}
+	stored, _ := srv.store.Approval(approval.ID)
+	attempt := srv.store.LineChainSnapshot().Attempts[approval.ID]
+	if stored.Status != model.ApprovalRejected || stored.Stale || attempt.Status != store.LineChainStatusFailed || len(srv.store.Tasks()) != 0 {
+		t.Fatalf("manual rejection did not retire candidate: approval=%+v attempt=%+v tasks=%+v", stored, attempt, srv.store.Tasks())
+	}
+	if _, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled); err != nil {
+		t.Fatalf("fresh plan blocked after rejection: %v", err)
+	}
+}
+
 func TestLineChainTaskScriptRevealIsDeniedBeforeStepUp(t *testing.T) {
 	srv := newManagedLineTestServer(t)
 	approval := model.Approval{ID: "approval-secret", NodeID: "node-a", Plugin: lineChainPlugin, Service: lineChainService,
@@ -840,6 +867,9 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 				stored.StaleCode != "line_chain_inputs_changed" || attempt.Status != store.LineChainStatusFailed || attempt.LastErrorCode != "line_chain_inputs_changed" {
 				t.Fatalf("stale approval mutated queue/graph: approval=%+v tasks=%+v snapshot=%+v", stored, srv.store.Tasks(), srv.store.LineChainSnapshot())
 			}
+			if event, ok := srv.store.AuditEventByID(lineChainAuditID("failed", approval.ID, "\x00line_chain_inputs_changed")); !ok || event.Action != "linechain.failed" || event.Decision != "deny" {
+				t.Fatalf("stale approval missing frozen failure audit: ok=%v event=%+v", ok, event)
+			}
 		})
 		t.Run(tc.name+"/first_lease", func(t *testing.T) {
 			srv, sourceUUID, targetUUID, user, def := seedLineChainFixture(t)
@@ -867,6 +897,9 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 			attempt := srv.store.LineChainSnapshot().Attempts[approval.ID]
 			if gotApproval.Status != model.ApprovalRejected || !gotApproval.Stale || gotTask.Status != model.TaskCancelled || attempt.Status != store.LineChainStatusFailed || srv.store.LineChainSnapshot().Revision != 2 {
 				t.Fatalf("first-lease rejection was not atomic: approval=%+v task=%+v attempt=%+v snapshot=%+v", gotApproval, gotTask, attempt, srv.store.LineChainSnapshot())
+			}
+			if event, ok := srv.store.AuditEventByID(lineChainAuditID("failed", approval.ID, task.ID+"\x00line_chain_inputs_changed")); !ok || event.Action != "linechain.failed" || event.Metadata["task_id"] != task.ID {
+				t.Fatalf("first-lease rejection missing frozen failure audit: ok=%v event=%+v", ok, event)
 			}
 		})
 	}

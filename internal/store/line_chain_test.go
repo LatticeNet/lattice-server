@@ -107,6 +107,75 @@ func TestRejectLineChainApprovalStaleUsesAtomicPersistenceBoundary(t *testing.T)
 	})
 }
 
+func TestLineChainApprovalConflictAndManualRejectRetireCandidates(t *testing.T) {
+	newPlan := func(t *testing.T, s *Store, approvalID, source, target string) (model.Approval, model.Task) {
+		t.Helper()
+		approval := model.Approval{ID: approvalID, NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines", Method: "chain_set_apply",
+			Action: "apply-line-chain:" + approvalID, ArtifactDigest: approvalID, RequestSHA256: approvalID, Plan: "{}", Status: model.ApprovalPending}
+		attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: source, SourceNodeID: "node-a",
+			CandidateTargetLineUUID: target, CandidateArtifactSHA256: approvalID, CandidateDefinition: LineChainDefinition{SourceLineUUID: source, TargetLineUUID: target, ArtifactSHA256: approvalID}, RequestSHA256: approvalID,
+			PlanGraphRevision: s.LineChainSnapshot().Revision}
+		if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
+			t.Fatal(err)
+		}
+		approval.Status = model.ApprovalApproved
+		return approval, model.Task{ID: "task-" + approvalID, ApprovalID: approval.ID, Targets: []string{"node-a"}, Script: "script", Status: model.TaskQueued}
+	}
+	failureAudit := func(id string) model.AuditEvent {
+		return model.AuditEvent{ID: "audit-" + id, At: time.Now().UTC(), Action: "linechain.failed", Decision: "deny"}
+	}
+
+	t.Run("revision_conflict", func(t *testing.T) {
+		s, _ := Open("")
+		approval, task := newPlan(t, s, "revision", "source", "target")
+		s.state.LineChainGraphRevision++
+		if _, committed, err := s.ApproveLineChain(approval, task, model.AuditEvent{}, failureAudit("revision")); !committed || !errors.Is(err, ErrLineChainRevisionConflict) {
+			t.Fatalf("approve committed=%v err=%v", committed, err)
+		}
+		stored, _ := s.Approval(approval.ID)
+		attempt := s.LineChainSnapshot().Attempts[approval.ID]
+		if stored.Status != model.ApprovalRejected || !stored.Stale || attempt.Status != LineChainStatusFailed || len(s.Tasks()) != 0 {
+			t.Fatalf("conflict did not retire candidate: approval=%+v attempt=%+v tasks=%+v", stored, attempt, s.Tasks())
+		}
+		if _, _, err := s.PlanLineChainApproval(LineChainAttempt{ApprovalID: "fresh", Operation: LineChainOperationSet, SourceLineUUID: "source", CandidateTargetLineUUID: "fresh-target", RequestSHA256: "fresh", PlanGraphRevision: s.LineChainSnapshot().Revision}, model.Approval{ID: "fresh", Status: model.ApprovalPending}); err != nil {
+			t.Fatalf("fresh plan blocked by retired candidate: %v", err)
+		}
+	})
+
+	t.Run("cycle_conflict", func(t *testing.T) {
+		s, _ := Open("")
+		firstApproval, firstTask := newPlan(t, s, "first", "b", "a")
+		if _, committed, err := s.ApproveLineChain(firstApproval, firstTask); err != nil || !committed {
+			t.Fatalf("first approve committed=%v err=%v", committed, err)
+		}
+		secondApproval, secondTask := newPlan(t, s, "cycle", "a", "b")
+		if _, committed, err := s.ApproveLineChain(secondApproval, secondTask, model.AuditEvent{}, failureAudit("cycle")); !committed || !errors.Is(err, ErrLineChainCycle) {
+			t.Fatalf("cycle approve committed=%v err=%v", committed, err)
+		}
+		stored, _ := s.Approval(secondApproval.ID)
+		attempt := s.LineChainSnapshot().Attempts[secondApproval.ID]
+		if stored.Status != model.ApprovalRejected || attempt.Status != LineChainStatusFailed || len(s.Tasks()) != 1 {
+			t.Fatalf("cycle did not retire only candidate: approval=%+v attempt=%+v tasks=%+v", stored, attempt, s.Tasks())
+		}
+	})
+
+	t.Run("manual_reject", func(t *testing.T) {
+		s, _ := Open("")
+		approval, _ := newPlan(t, s, "manual", "source", "target")
+		if committed, err := s.RejectLineChainApproval(approval.ID, "operator rejected", failureAudit("manual")); err != nil || !committed {
+			t.Fatalf("reject committed=%v err=%v", committed, err)
+		}
+		stored, _ := s.Approval(approval.ID)
+		attempt := s.LineChainSnapshot().Attempts[approval.ID]
+		if stored.Status != model.ApprovalRejected || stored.Stale || stored.StaleCode != "approval_rejected" || attempt.Status != LineChainStatusFailed {
+			t.Fatalf("manual rejection not atomic: approval=%+v attempt=%+v", stored, attempt)
+		}
+		if _, _, err := s.PlanLineChainApproval(LineChainAttempt{ApprovalID: "fresh", Operation: LineChainOperationSet, SourceLineUUID: "source", CandidateTargetLineUUID: "fresh-target", RequestSHA256: "fresh", PlanGraphRevision: s.LineChainSnapshot().Revision}, model.Approval{ID: "fresh", Status: model.ApprovalPending}); err != nil {
+			t.Fatalf("fresh plan blocked after manual rejection: %v", err)
+		}
+	})
+}
+
 func TestLineChainReserveRejectsTwoNodeCycleWithoutRevisionMutation(t *testing.T) {
 	store, err := Open("")
 	if err != nil {

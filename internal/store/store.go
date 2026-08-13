@@ -1417,6 +1417,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		lineChainValidator = validate[0]
 	}
 	lineChainStaled := make(map[string]bool)
+	var lineChainAuditErr error
 	lineChainMapsCloned := true
 	staleLineChain := func(t model.Task, cause error) {
 		if lineChainMapsCloned == false {
@@ -1442,6 +1443,11 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			}
 		}
 		staged.LineChainAttempts[t.ApprovalID] = attempt
+		failureAudit := lineChainFirstLeaseFailureAudit(approval, t, now, attempt.LastError)
+		if err := stageLineChainAuditEvidence(&staged, s.state, []model.AuditEvent{failureAudit}); err != nil {
+			lineChainAuditErr = err
+			return
+		}
 		staged.LineChainGraphRevision++
 		lineChainStaled[t.ID], stateChanged = true, true
 	}
@@ -1616,6 +1622,9 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			return nil, err
 		}
 	}
+	if lineChainAuditErr != nil {
+		return nil, lineChainAuditErr
+	}
 	if len(out) == 0 && !stateChanged {
 		return out, nil
 	}
@@ -1643,6 +1652,14 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		return nil, err
 	}
 	return out, nil
+}
+
+func lineChainFirstLeaseFailureAudit(approval model.Approval, task model.Task, at time.Time, reason string) model.AuditEvent {
+	code := "line_chain_inputs_changed"
+	digest := sha256.Sum256([]byte("failed\x00" + approval.ID + "\x00" + task.ID + "\x00" + code))
+	metadata := map[string]string{"approval_id": approval.ID, "task_id": task.ID, "artifact_sha256": approval.ArtifactDigest, "error_code": code}
+	return model.AuditEvent{ID: "audit_linechain_" + fmt.Sprintf("%x", digest[:16]), At: at, ActorID: task.ActorID, TokenID: task.TokenID,
+		NodeID: approval.NodeID, Action: "linechain.failed", Scope: "network:apply", Decision: "deny", Reason: reason, Metadata: metadata}
 }
 
 func (s *Store) AddTaskResult(r model.TaskResult) error {

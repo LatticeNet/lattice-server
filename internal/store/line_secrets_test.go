@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/secret"
 )
 
 func testVpnUserRecords(id, secretValue string) (VpnUserPublicRecord, VpnUserSecretRecord) {
@@ -177,6 +179,29 @@ func TestVpnUserRecordValidationRejectsOrphansAndProtocolMismatch(t *testing.T) 
 	private.Credentials[0].Protocol = "trojan"
 	if err := validateVpnUserCollections(map[string]VpnUserPublicRecord{"vpn-1": public}, map[string]VpnUserSecretRecord{"vpn-1": private}); err == nil {
 		t.Fatal("mismatched public/private protocol sets were accepted")
+	}
+	public, private = testVpnUserRecords("vpn-1", "credential-canary")
+	public.Credentials[0].Protocol = " VLESS "
+	private.Credentials[0].Protocol = " VLESS "
+	if err := validateVpnUserCollections(map[string]VpnUserPublicRecord{"vpn-1": public}, map[string]VpnUserSecretRecord{"vpn-1": private}); err == nil {
+		t.Fatal("noncanonical public/private protocols were accepted")
+	}
+}
+
+func TestOpenRejectsOrphanLineSecretCollections(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := emptyState()
+	_, private := testVpnUserRecords("vpn-1", "credential-canary")
+	state.VpnUserSecrets["vpn-1"] = private
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenWithCipher(path, secret.Disabled()); err == nil || !strings.Contains(err.Error(), "invalid vpn user secret collections") {
+		t.Fatalf("expected fail-closed startup validation, got %v", err)
 	}
 }
 

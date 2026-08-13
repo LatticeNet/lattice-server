@@ -263,6 +263,12 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	s.ensureMaps()
+	if err := validateVpnUserCollections(s.state.VpnUsers, s.state.VpnUserSecrets); err != nil {
+		return nil, fmt.Errorf("store: invalid vpn user secret collections: %w", err)
+	}
+	if err := validateManagedLineCollections(s.state.ManagedLines, s.state.ManagedLineSecrets); err != nil {
+		return nil, fmt.Errorf("store: invalid managed line secret collections: %w", err)
+	}
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	s.confirmParentDirDurability()

@@ -91,6 +91,23 @@ type LegacyKVKey struct {
 	Key    string
 }
 
+type LineSecretMigrationSource struct {
+	VpnUsers           map[string]VpnUserPublicRecord
+	VpnUserSecrets     map[string]VpnUserSecretRecord
+	ManagedLines       map[string]ManagedLinePublicRecord
+	ManagedLineSecrets map[string]ManagedLineSecretRecord
+	KV                 []model.KVEntry
+	ProxyUsers         []model.ProxyUser
+}
+
+type LineSecretMigrationBuild struct {
+	VpnUsers           map[string]VpnUserPublicRecord
+	VpnUserSecrets     map[string]VpnUserSecretRecord
+	ManagedLines       map[string]ManagedLinePublicRecord
+	ManagedLineSecrets map[string]ManagedLineSecretRecord
+	Legacy             []LegacyKVKey
+}
+
 func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private map[string]VpnUserSecretRecord) error {
 	if len(public) > MaxVpnUserRecords || len(private) > MaxVpnUserRecords {
 		return fmt.Errorf("vpn user collection holds more than %d records", MaxVpnUserRecords)
@@ -111,6 +128,9 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 			protocol := strings.TrimSpace(credential.Protocol)
 			if protocol == "" {
 				return fmt.Errorf("vpn user %q has credential with empty protocol", id)
+			}
+			if credential.Protocol != strings.ToLower(protocol) {
+				return fmt.Errorf("vpn user %q has noncanonical private protocol %q", id, credential.Protocol)
 			}
 			if _, ok := seen[protocol]; ok {
 				return fmt.Errorf("vpn user %q has duplicate %q credential", id, protocol)
@@ -149,6 +169,9 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 			if protocol == "" {
 				return fmt.Errorf("vpn user %q has public credential with empty protocol", id)
 			}
+			if credential.Protocol != strings.ToLower(protocol) {
+				return fmt.Errorf("vpn user %q has noncanonical public protocol %q", id, credential.Protocol)
+			}
 			if _, exists := publicProtocols[protocol]; exists {
 				return fmt.Errorf("vpn user %q has duplicate public %q credential", id, protocol)
 			}
@@ -158,7 +181,7 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 			return fmt.Errorf("vpn user %q public/private credential sets differ", id)
 		}
 		for _, credential := range secretRecord.Credentials {
-			if _, exists := publicProtocols[strings.TrimSpace(credential.Protocol)]; !exists {
+			if _, exists := publicProtocols[credential.Protocol]; !exists {
 				return fmt.Errorf("vpn user %q public/private credential sets differ", id)
 			}
 		}
@@ -234,6 +257,33 @@ func cloneManagedLineSecretRecords(in map[string]ManagedLineSecretRecord) map[st
 		out[id] = record
 	}
 	return out
+}
+
+// MigrateLineSecrets holds the authoritative store lock while the caller
+// transforms a revision-consistent source snapshot and while the staged result
+// crosses the JSON persistence commit point.
+func (s *Store) MigrateLineSecrets(build func(LineSecretMigrationSource) (LineSecretMigrationBuild, error)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kv := make([]model.KVEntry, 0, len(s.state.KV))
+	for _, entry := range s.state.KV {
+		kv = append(kv, entry)
+	}
+	proxyUsers := make([]model.ProxyUser, 0, len(s.state.ProxyUsers))
+	for _, user := range s.state.ProxyUsers {
+		user.InboundIDs = append([]string(nil), user.InboundIDs...)
+		proxyUsers = append(proxyUsers, user)
+	}
+	source := LineSecretMigrationSource{
+		VpnUsers: cloneVpnUserPublicRecords(s.state.VpnUsers), VpnUserSecrets: cloneVpnUserSecretRecords(s.state.VpnUserSecrets),
+		ManagedLines: cloneManagedLinePublicRecords(s.state.ManagedLines), ManagedLineSecrets: cloneManagedLineSecretRecords(s.state.ManagedLineSecrets),
+		KV: kv, ProxyUsers: proxyUsers,
+	}
+	result, err := build(source)
+	if err != nil {
+		return err
+	}
+	return s.replaceLineSecretRecordsLocked(result.VpnUsers, result.VpnUserSecrets, result.ManagedLines, result.ManagedLineSecrets, result.Legacy)
 }
 
 // ReplaceVpnUserRecords migrates public/private identities and removes legacy

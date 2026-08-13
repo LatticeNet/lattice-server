@@ -24,7 +24,7 @@ const (
 	lineChainRemoveMethod       = "chain_remove_apply"
 	lineChainActionPrefix       = "apply-line-chain:"
 	lineChainDurableCapability  = "durable-task-result-v1"
-	lineChainFragmentPathPrefix = "/etc/sing-box/conf.d/lattice-chain-"
+	lineChainFragmentPathPrefix = "/etc/sing-box/conf.d/lattice-linechain-"
 )
 
 type lineChainCompileRequest struct {

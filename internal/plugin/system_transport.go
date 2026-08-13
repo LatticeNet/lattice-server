@@ -37,10 +37,19 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 		_ = in.Close()
 		return nil, err
 	}
-	if err := cmd.Start(); err != nil {
+	hostRead, hostWrite, err := os.Pipe()
+	if err != nil {
+		_ = in.Close()
 		return nil, err
 	}
-	return &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), stderr: errout.(*os.File), pgid: cmd.Process.Pid}, nil
+	cmd.ExtraFiles = []*os.File{hostRead}
+	if err := cmd.Start(); err != nil {
+		_ = hostRead.Close()
+		_ = hostWrite.Close()
+		return nil, err
+	}
+	_ = hostRead.Close()
+	return &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid}, nil
 }
 
 func (t *systemWorkerTransport) abort() error {

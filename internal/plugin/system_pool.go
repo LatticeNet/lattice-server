@@ -24,6 +24,7 @@ type pooledWorker struct {
 	generation uint64
 	uses       int
 	started    time.Time
+	transport  *systemWorkerTransport
 }
 
 // systemPool provides generation-fenced FIFO leases. Process transport is

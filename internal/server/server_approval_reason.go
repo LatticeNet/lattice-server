@@ -24,6 +24,8 @@ func approvalDisplayReason(a model.Approval) string {
 		return agentUpdateDisplayReason(a.Plan)
 	case a.Plugin == "singbox-linemeta" && approvalActionIs(a.Action, "apply-metadata"):
 		return lineMetaDisplayReason(a.Plan)
+	case a.Plugin == "nft" && a.Action == netGuardApprovalAction:
+		return "Apply NetGuard nftables ruleset"
 	case a.Plugin == "nft" && a.Action == "apply-ruleset":
 		return "Apply nftables ruleset"
 	case a.Plugin == "nftpolicy" && approvalActionIs(a.Action, nftPolicyApplyAction):

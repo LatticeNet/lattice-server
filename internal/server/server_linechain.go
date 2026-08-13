@@ -194,42 +194,46 @@ func lineChainAuditMetadata(approval model.Approval, taskID string) map[string]s
 	var plan lineChainPlan
 	if json.Unmarshal([]byte(approval.Plan), &plan) == nil {
 		metadata["source_line_uuid"] = plan.SourceLineUUID
-		if plan.TargetLineUUID != "" {
-			metadata["target_line_uuid"] = plan.TargetLineUUID
+		target := firstNonEmpty(plan.TargetLineUUID, plan.PreviousTargetLineUUID)
+		if target != "" {
+			metadata["target_line_uuid"] = target
 		}
 	}
 	return metadata
 }
 
-func (s *Server) ensureLineChainPlanAudit(p principal, approval model.Approval) error {
-	event := model.AuditEvent{ID: lineChainAuditID("plan", approval.ID, ""), At: approval.CreatedAt, ActorID: p.ActorID, TokenID: p.TokenID,
+func lineChainPlanAudit(p principal, approval model.Approval) model.AuditEvent {
+	return model.AuditEvent{ID: lineChainAuditID("plan", approval.ID, ""), At: approval.CreatedAt, ActorID: p.ActorID, TokenID: p.TokenID,
 		NodeID: approval.NodeID, Action: "linechain.plan", Scope: "network:plan", Decision: "allow", CorrelationID: p.CorrelationID,
 		Metadata: lineChainAuditMetadata(approval, "")}
-	return s.appendRequiredLineChainAudit(event)
 }
 
-func (s *Server) ensureLineChainApproveAudit(p principal, approval model.Approval, taskID string) error {
-	event := model.AuditEvent{ID: lineChainAuditID("approve", approval.ID, taskID), At: approval.UpdatedAt, ActorID: p.ActorID, TokenID: p.TokenID,
+func lineChainApproveAudit(p principal, approval model.Approval, taskID string) model.AuditEvent {
+	return model.AuditEvent{ID: lineChainAuditID("approve", approval.ID, taskID), At: approval.UpdatedAt, ActorID: p.ActorID, TokenID: p.TokenID,
 		NodeID: approval.NodeID, Action: "linechain.approve", Scope: approvalDecisionAuditScope(approval), Decision: "allow", CorrelationID: p.CorrelationID,
 		Metadata: lineChainAuditMetadata(approval, taskID)}
-	return s.appendRequiredLineChainAudit(event)
 }
 
-func (s *Server) ensureLineChainTerminalAudit(approval model.Approval, task model.Task, result model.TaskResult) error {
+func (s *Server) lineChainTerminalAudit(approval model.Approval, task model.Task, result model.TaskResult, status, driftCode string) model.AuditEvent {
 	auditID := lineChainAuditID("terminal", approval.ID, task.ID+"\x00"+result.NodeID)
-	if _, ok := s.store.AuditEventByID(auditID); ok {
-		return nil
-	}
 	action, decision, reason := "linechain.apply", "allow", ""
 	if result.ExitCode != 0 || result.Error != "" {
 		action, decision, reason = "linechain.failed", "deny", "host apply failed"
 	} else if approval.Method == lineChainRemoveMethod {
 		action = "linechain.remove"
-	} else if definition := s.store.LineChainSnapshot().Definitions[lineChainAuditMetadata(approval, task.ID)["source_line_uuid"]]; definition.Status == store.LineChainStatusDrifted {
-		action, reason = "linechain.drift", definition.DriftCode
+	} else if status == store.LineChainStatusDrifted {
+		action, reason = "linechain.drift", driftCode
 	}
-	event := model.AuditEvent{ID: auditID, At: result.FinishedAt, ActorID: approval.ActorID, TokenID: task.TokenID, NodeID: approval.NodeID,
+	return model.AuditEvent{ID: auditID, At: result.FinishedAt, ActorID: approval.ActorID, TokenID: task.TokenID, NodeID: approval.NodeID,
 		Action: action, Scope: "network:apply", Decision: decision, Reason: reason, Metadata: lineChainAuditMetadata(approval, task.ID)}
+}
+
+func (s *Server) ensureLineChainTerminalAudit(approval model.Approval, task model.Task, result model.TaskResult) error {
+	auditID := lineChainAuditID("terminal", approval.ID, task.ID+"\x00"+result.NodeID)
+	event, ok := s.store.AuditEventByID(auditID)
+	if !ok {
+		return errors.New("committed line chain terminal audit is missing")
+	}
 	return s.appendRequiredLineChainAudit(event)
 }
 
@@ -238,25 +242,36 @@ func (s *Server) ensureLineChainReconciliationAudits(nodeID string) error {
 		if definition.SourceNodeID != nodeID || (definition.Status != store.LineChainStatusConverged && definition.Status != store.LineChainStatusDrifted) {
 			continue
 		}
-		action, decision := "linechain.apply", "allow"
-		if definition.TargetLineUUID == "" {
-			action = "linechain.remove"
-		}
-		if definition.Status == store.LineChainStatusDrifted {
-			action, decision = "linechain.drift", "deny"
-		}
 		approval, ok := s.store.Approval(definition.ApprovalID)
 		if !ok {
 			continue
 		}
-		event := model.AuditEvent{ID: lineChainAuditID("observe", approval.ID, definition.Status+"\x00"+definition.DriftCode), At: definition.UpdatedAt,
-			ActorID: approval.ActorID, NodeID: definition.SourceNodeID, Action: action, Scope: "network:apply", Decision: decision,
-			Reason: definition.DriftCode, Metadata: lineChainAuditMetadata(approval, "")}
+		taskID := ""
+		for _, task := range s.store.Tasks() {
+			if task.ApprovalID == approval.ID {
+				taskID = task.ID
+				break
+			}
+		}
+		event := lineChainReconciliationAudit(definition, approval, taskID)
 		if err := s.appendRequiredLineChainAudit(event); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func lineChainReconciliationAudit(definition store.LineChainDefinition, approval model.Approval, taskID string) model.AuditEvent {
+	action, decision := "linechain.apply", "allow"
+	if definition.TargetLineUUID == "" {
+		action = "linechain.remove"
+	}
+	if definition.Status == store.LineChainStatusDrifted {
+		action, decision = "linechain.drift", "deny"
+	}
+	return model.AuditEvent{ID: lineChainAuditID("observe", approval.ID, definition.Status+"\x00"+definition.DriftCode), At: definition.UpdatedAt,
+		ActorID: approval.ActorID, NodeID: definition.SourceNodeID, Action: action, Scope: "network:apply", Decision: decision,
+		Reason: definition.DriftCode, Metadata: lineChainAuditMetadata(approval, taskID)}
 }
 
 func shortFingerprint(value string) string {
@@ -606,7 +621,8 @@ func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArt
 		BaseArtifactSHA256: compiled.Plan.PreviousArtifactSHA256, CandidateArtifactSHA256: compiled.Plan.ArtifactSHA256,
 		RequestSHA256: compiled.Plan.RequestSHA256, PlanGraphRevision: compiled.PlanGraphRevision, CandidateDefinition: compiled.CandidateDefinition,
 	}
-	planned, deduped, err := s.store.PlanLineChainApproval(attempt, approval)
+	planAudit := lineChainPlanAudit(p, approval)
+	planned, deduped, err := s.store.PlanLineChainApproval(attempt, approval, planAudit)
 	if err != nil {
 		return model.Approval{}, err
 	}
@@ -615,12 +631,16 @@ func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArt
 		if !ok {
 			return model.Approval{}, errors.New("deduplicated line chain approval is missing")
 		}
-		if err := s.ensureLineChainPlanAudit(p, existing); err != nil {
+		storedAudit, ok := s.store.AuditEventByID(lineChainAuditID("plan", existing.ID, ""))
+		if !ok {
+			return existing, errors.New("deduplicated line chain plan audit is missing")
+		}
+		if err := s.appendRequiredLineChainAudit(storedAudit); err != nil {
 			return existing, err
 		}
 		return existing, nil
 	}
-	if err := s.ensureLineChainPlanAudit(p, approval); err != nil {
+	if err := s.appendRequiredLineChainAudit(planAudit); err != nil {
 		return approval, err
 	}
 	return approval, nil
@@ -659,7 +679,7 @@ func (s *Server) validateLineChainFirstLease(persistent store.LineChainCompileSt
 	return nil
 }
 
-func (s *Server) handleLineChainTaskResult(approval model.Approval, result model.TaskResult) error {
+func (s *Server) handleLineChainTaskResult(approval model.Approval, task model.Task, result model.TaskResult) error {
 	status, driftCode := store.LineChainStatusAppliedUnobserved, ""
 	if result.ExitCode == 0 && result.Error == "" {
 		var err error
@@ -676,11 +696,15 @@ func (s *Server) handleLineChainTaskResult(approval model.Approval, result model
 	if result.ExitCode != 0 || result.Error != "" {
 		errorCode = "host_apply_failed"
 	}
-	committed, err := s.store.CompleteLineChainTaskResult(result, approval, status, errorCode, terminalError)
+	terminalAudit := s.lineChainTerminalAudit(approval, task, result, status, errorCode)
+	committed, err := s.store.CompleteLineChainTaskResult(result, approval, status, errorCode, terminalError, terminalAudit)
 	if committed && err != nil {
 		s.logger.Printf("line chain terminal result committed with degraded durability: %v", err)
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return s.appendRequiredLineChainAudit(terminalAudit)
 }
 
 func (s *Server) classifyLineChainTerminal(approvalID string) (string, string, error) {
@@ -746,7 +770,25 @@ func (s *Server) reconcileLineChainsForNode(nodeID string) error {
 		}
 		observations[sourceUUID] = observation
 	}
-	_, err = s.store.ReconcileLineChains(observations)
+	approvals := make(map[string]model.Approval)
+	taskIDs := make(map[string]string)
+	for _, task := range s.store.Tasks() {
+		if task.ApprovalID != "" {
+			taskIDs[task.ApprovalID] = task.ID
+		}
+	}
+	for _, definition := range snapshot.Chains.Definitions {
+		if approval, ok := s.store.Approval(definition.ApprovalID); ok {
+			approvals[definition.ApprovalID] = approval
+		}
+	}
+	_, err = s.store.ReconcileLineChainsWithAudits(observations, func(definition store.LineChainDefinition) (model.AuditEvent, bool) {
+		approval, ok := approvals[definition.ApprovalID]
+		if !ok {
+			return model.AuditEvent{}, false
+		}
+		return lineChainReconciliationAudit(definition, approval, taskIDs[approval.ID]), true
+	})
 	if err != nil {
 		return err
 	}

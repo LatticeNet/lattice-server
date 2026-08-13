@@ -149,6 +149,10 @@ func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 	if approved.Status != model.ApprovalApproved {
 		t.Fatalf("approval not approved: %+v", approved)
 	}
+	retryPrincipal := principal{Principal: rbac.Principal{ActorID: "op-retry", TokenID: "token-retry"}, CorrelationID: "retry-correlation"}
+	if _, err := srv.approveApprovalCore(context.Background(), retryPrincipal, approved, true, planSHA); err != nil {
+		t.Fatalf("approved retry with a different principal did not repair immutable evidence: %v", err)
+	}
 	tasks := srv.store.Tasks()
 	if len(tasks) != 1 || !strings.HasPrefix(tasks[0].Script, "# lattice-linechain-e3-v1\n") {
 		t.Fatalf("expected one E3 task: %+v", tasks)
@@ -196,6 +200,10 @@ func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 	if actions["linechain.plan"] != 1 || actions["linechain.approve"] != 1 || actions["network.singbox-linechain.approve"] != 0 {
 		t.Fatalf("unexpected approval audit actions: %+v", actions)
 	}
+	approveEvent, ok := srv.store.AuditEventByID(lineChainAuditID("approve", approval.ID, tasks[0].ID))
+	if !ok || approveEvent.ActorID != lineUserTestPrincipal().ActorID || approveEvent.ActorID == retryPrincipal.ActorID {
+		t.Fatalf("approval retry rewrote immutable audit attribution: %+v", approveEvent)
+	}
 }
 
 func TestLineChainTaskScriptRevealIsDeniedBeforeStepUp(t *testing.T) {
@@ -214,6 +222,23 @@ func TestLineChainTaskScriptRevealIsDeniedBeforeStepUp(t *testing.T) {
 	srv.handleRevealTaskScript(rec, req, principal{Principal: rbac.Principal{ActorID: "admin", Scopes: []string{"task:read"}}})
 	if rec.Code != http.StatusForbidden || strings.Contains(rec.Body.String(), "credential-canary") {
 		t.Fatalf("E3 reveal status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestLineChainReconciliationAuditFreezesActionReasonAndTaskMetadata(t *testing.T) {
+	approval := model.Approval{ID: "approval-observe", ActorID: "planner", NodeID: "node-a", ArtifactDigest: "artifact",
+		Plan: `{"source_line_uuid":"22222222-2222-4222-8222-222222222222","previous_target_line_uuid":"11111111-1111-4111-8111-111111111111"}`}
+	at := time.Unix(1_700_000_000, 0).UTC()
+	drift := lineChainReconciliationAudit(store.LineChainDefinition{SourceLineUUID: "22222222-2222-4222-8222-222222222222", SourceNodeID: "node-a",
+		TargetLineUUID: "11111111-1111-4111-8111-111111111111", Status: store.LineChainStatusDrifted, DriftCode: "observed_mismatch", UpdatedAt: at}, approval, "task-observe")
+	if drift.Action != "linechain.drift" || drift.Decision != "deny" || drift.Reason != "observed_mismatch" ||
+		drift.Metadata["task_id"] != "task-observe" || drift.Metadata["target_line_uuid"] != "11111111-1111-4111-8111-111111111111" {
+		t.Fatalf("drift evidence lost frozen metadata: %+v", drift)
+	}
+	remove := lineChainReconciliationAudit(store.LineChainDefinition{SourceLineUUID: "22222222-2222-4222-8222-222222222222", SourceNodeID: "node-a",
+		Status: store.LineChainStatusConverged, UpdatedAt: at}, approval, "task-observe")
+	if remove.Action != "linechain.remove" || remove.Decision != "allow" || remove.Metadata["target_line_uuid"] == "" {
+		t.Fatalf("remove evidence lost prior target metadata: %+v", remove)
 	}
 }
 
@@ -274,14 +299,34 @@ func TestLineChainCompilerTenThousandProjectedLinesIsPure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := len(snapshot.Lines); i < 10_000; i++ {
-		uuid := fmt.Sprintf("projected-%05d", i)
-		snapshot.Lines[uuid] = []Line{{LineUUID: uuid, NodeID: "scale-node", LineHashID: "hash-" + uuid, Tag: "tag-" + uuid, Status: "ok"}}
+	sourceNodeID := snapshot.Lines[sourceUUID][0].NodeID
+	existing := 0
+	for _, matches := range snapshot.Lines {
+		for _, line := range matches {
+			if line.NodeID == sourceNodeID {
+				existing++
+			}
+		}
+	}
+	for i := existing; i < 10_000; i++ {
+		uuid := fmt.Sprintf("00000000-0000-4000-8000-%012x", i)
+		if _, collision := snapshot.Lines[uuid]; collision {
+			continue
+		}
+		snapshot.Lines[uuid] = []Line{{LineUUID: uuid, NodeID: sourceNodeID, LineHashID: "hash-" + uuid, Tag: "tag-" + uuid, Status: "ok"}}
 	}
 	before := srv.store.LineChainSnapshot()
 	var compileErr error
 	allocs := testing.AllocsPerRun(3, func() {
-		_, compileErr = srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+		compiled, err := srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+		compileErr = err
+		var sidecar lineMetadataDocV2
+		if err == nil {
+			compileErr = json.Unmarshal([]byte(compiled.SidecarJSON), &sidecar)
+		}
+		if compileErr == nil && len(sidecar.Inbounds) != 10_000 {
+			compileErr = fmt.Errorf("sidecar contains %d projected inbounds, want 10000", len(sidecar.Inbounds))
+		}
 	})
 	if compileErr != nil {
 		t.Fatal(compileErr)
@@ -290,6 +335,50 @@ func TestLineChainCompilerTenThousandProjectedLinesIsPure(t *testing.T) {
 		t.Fatalf("10k compile mutated store: before=%+v after=%+v", before, after)
 	}
 	t.Logf("10k projected-line compile allocations/run: %.0f", allocs)
+}
+
+func benchmarkLineChainSnapshot() (lineChainCompileSnapshot, string, string) {
+	const sourceUUID = "22222222-2222-4222-8222-222222222222"
+	const targetUUID = "11111111-1111-4111-8111-111111111111"
+	const userID = "vpn-benchmark"
+	snapshot := lineChainCompileSnapshot{
+		Lines: map[string][]Line{
+			sourceUUID: {{LineUUID: sourceUUID, NodeID: "node-b", LineHashID: "source-hash", Name: "source", Tag: "source", Core: model.ProxyCoreSingbox, Status: "ok"}},
+			targetUUID: {{LineUUID: targetUUID, NodeID: "node-a", LineHashID: "target-hash", Name: "target", Tag: "target", Core: model.ProxyCoreSingbox,
+				Type: model.ProxyProtocolVLESS, Security: model.ProxySecurityReality, Transport: model.ProxyTransportTCP, Overlay: true,
+				OverlayStatus: managedLineStatusApplied, Status: "ok", PublicHost: "203.0.113.10"}},
+		},
+		Definitions: map[string]managedLineDef{targetUUID: {LineUUID: targetUUID, NodeID: "node-a", LineHashID: "target-hash", Tag: "target",
+			Port: 443, SNI: "example.com", RealityPublicKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", RealityPrivateKey: "private-key", ShortID: "abcdef12", UserID: userID, Status: managedLineStatusApplied}},
+		Users:        map[string]VpnUser{userID: {ID: userID, Enabled: true, Credentials: []VpnCredential{{Protocol: model.ProxyProtocolVLESS, UUID: "33333333-3333-4333-8333-333333333333"}}}},
+		Nodes:        map[string]model.Node{"node-a": {ID: "node-a", PublicIP: "203.0.113.10"}, "node-b": {ID: "node-b", Name: "source-node"}},
+		Chains:       store.LineChainSnapshot{Definitions: map[string]store.LineChainDefinition{}, Attempts: map[string]store.LineChainAttempt{}},
+		Capabilities: map[string]bool{"node-b": true},
+	}
+	for i := 1; i < 10_000; i++ {
+		uuid := fmt.Sprintf("00000000-0000-4000-8000-%012x", i)
+		snapshot.Lines[uuid] = []Line{{LineUUID: uuid, NodeID: "node-b", LineHashID: "hash-" + uuid, Tag: "tag-" + uuid, Status: "ok"}}
+	}
+	return snapshot, sourceUUID, targetUUID
+}
+
+func BenchmarkLineChainCompilerTenThousandProjectedLines(b *testing.B) {
+	snapshot, sourceUUID, targetUUID := benchmarkLineChainSnapshot()
+	srv := &Server{}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		compiled, err := srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if i == 0 {
+			var sidecar lineMetadataDocV2
+			if err := json.Unmarshal([]byte(compiled.SidecarJSON), &sidecar); err != nil || len(sidecar.Inbounds) != 10_000 {
+				b.Fatalf("benchmark sidecar projected inbounds=%d err=%v", len(sidecar.Inbounds), err)
+			}
+		}
+	}
 }
 
 func TestLineChainTerminalAcceptsIssuedSuccessWhenLiveDescriptorDrifts(t *testing.T) {
@@ -347,7 +436,8 @@ func TestLineChainTerminalAcceptsIssuedSuccessWhenLiveDescriptorDrifts(t *testin
 				t.Fatalf("classification status=%q code=%q err=%v", status, driftCode, err)
 			}
 			result := model.TaskResult{TaskID: deliveries[0].Task.ID, NodeID: "node-b", LeaseID: deliveries[0].Task.LeaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}
-			if committed, err := srv.store.CompleteLineChainTaskResult(result, approval, status, driftCode, ""); err != nil || !committed {
+			terminalAudit := srv.lineChainTerminalAudit(approval, deliveries[0].Task, result, status, driftCode)
+			if committed, err := srv.store.CompleteLineChainTaskResult(result, approval, status, driftCode, "", terminalAudit); err != nil || !committed {
 				t.Fatalf("complete committed=%v err=%v", committed, err)
 			}
 			if matches, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
@@ -383,12 +473,20 @@ func TestLineChainFailedAndRemoveAuditsAreIdempotent(t *testing.T) {
 		Method: lineChainSetMethod, ArtifactDigest: "artifact", Plan: `{"source_line_uuid":"source","target_line_uuid":"target","private":"secret-canary"}`}
 	task := model.Task{ID: "task-audit", TokenID: "token"}
 	failed := model.TaskResult{TaskID: task.ID, NodeID: "node-a", ExitCode: 1, Error: "host failed", FinishedAt: time.Unix(1_700_000_000, 0).UTC()}
+	failedAudit := srv.lineChainTerminalAudit(base, task, failed, store.LineChainStatusFailed, "host_apply_failed")
+	if _, err := srv.store.AppendAuditIdempotent(failedAudit); err != nil {
+		t.Fatal(err)
+	}
 	if err := srv.ensureLineChainTerminalAudit(base, task, failed); err != nil {
 		t.Fatal(err)
 	}
 	remove := base
 	remove.ID, remove.Method = "approval-remove-audit", lineChainRemoveMethod
 	removed := model.TaskResult{TaskID: task.ID, NodeID: "node-a", FinishedAt: time.Unix(1_700_000_001, 0).UTC()}
+	removeAudit := srv.lineChainTerminalAudit(remove, task, removed, store.LineChainStatusAppliedUnobserved, "")
+	if _, err := srv.store.AppendAuditIdempotent(removeAudit); err != nil {
+		t.Fatal(err)
+	}
 	if err := srv.ensureLineChainTerminalAudit(remove, task, removed); err != nil {
 		t.Fatal(err)
 	}

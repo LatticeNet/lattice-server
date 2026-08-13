@@ -2,6 +2,7 @@ package audit
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,6 +66,71 @@ func TestWALAppendAndVerify(t *testing.T) {
 	w2.Close()
 	if res, err := verifyFile(t, path); err != nil || res.Count != 6 {
 		t.Fatalf("post-append verify: %+v %v", res, err)
+	}
+}
+
+func TestWALIdempotentRetryRepairsFinalAnchorWithoutDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	path, anchorPath := filepath.Join(dir, "audit.wal"), filepath.Join(dir, "audit.anchor")
+	w, err := OpenAnchoredWAL(path, anchorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realWrite := w.writeAnchor
+	writes := 0
+	w.writeAnchor = func(path string, anchor Anchor) error {
+		writes++
+		if writes == 2 {
+			return os.ErrPermission
+		}
+		return realWrite(path, anchor)
+	}
+	event := ev("exact-id", "linechain.apply")
+	if committed, err := w.AppendIdempotent(event); !committed || err == nil {
+		t.Fatalf("append committed=%v err=%v", committed, err)
+	}
+	w.writeAnchor = realWrite
+	if committed, err := w.AppendIdempotent(event); committed || err != nil {
+		t.Fatalf("retry committed=%v err=%v", committed, err)
+	}
+	if committed, err := w.AppendIdempotent(ev("exact-id", "linechain.failed")); committed || err == nil {
+		t.Fatalf("conflicting retry committed=%v err=%v", committed, err)
+	}
+	if result, err := verifyFile(t, path); err != nil || result.Count != 1 {
+		t.Fatalf("verify=%+v err=%v", result, err)
+	}
+	anchor, ok, err := readAnchor(anchorPath)
+	if err != nil || !ok || anchor.Count != 1 || anchor.Pending != nil {
+		t.Fatalf("final anchor was not repaired: anchor=%+v ok=%v err=%v", anchor, ok, err)
+	}
+}
+
+func TestOpenWALRejectsDuplicateEventIDs(t *testing.T) {
+	for _, conflicting := range []bool{false, true} {
+		t.Run(fmt.Sprintf("conflicting_%v", conflicting), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "audit.wal")
+			w, err := OpenWAL(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := ev("duplicate-id", "linechain.apply")
+			if err := w.Append(first); err != nil {
+				t.Fatal(err)
+			}
+			second := first
+			if conflicting {
+				second.Action = "linechain.failed"
+			}
+			if err := w.Append(second); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := OpenWAL(path); err == nil || !strings.Contains(err.Error(), "duplicate event id") {
+				t.Fatalf("duplicate WAL id was accepted: %v", err)
+			}
+		})
 	}
 }
 

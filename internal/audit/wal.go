@@ -117,12 +117,13 @@ func Verify(r io.Reader) (Result, error) {
 // of the main JSON state cannot silently erase audit history, and any edit,
 // reorder, or truncation of the WAL itself is detectable by Verify.
 type WAL struct {
-	mu         sync.Mutex
-	f          *os.File
-	seq        int
-	head       string
-	anchorPath string
-	eventIDs   map[string]struct{}
+	mu          sync.Mutex
+	f           *os.File
+	seq         int
+	head        string
+	anchorPath  string
+	eventsByID  map[string]model.AuditEvent
+	writeAnchor func(string, Anchor) error
 }
 
 // OpenWAL opens (creating if needed) the append-only audit WAL at path and
@@ -158,24 +159,24 @@ func openWAL(path, anchorPath string) (*WAL, error) {
 	if err != nil {
 		return nil, err
 	}
-	eventIDs, err := readWALEventIDs(path)
+	eventsByID, err := readWALEventsByID(path)
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	return &WAL{f: f, seq: res.Count, head: res.Head, anchorPath: anchorPath, eventIDs: eventIDs}, nil
+	return &WAL{f: f, seq: res.Count, head: res.Head, anchorPath: anchorPath, eventsByID: eventsByID, writeAnchor: writeAnchor}, nil
 }
 
-func readWALEventIDs(path string) (map[string]struct{}, error) {
+func readWALEventsByID(path string) (map[string]model.AuditEvent, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return map[string]struct{}{}, nil
+		return map[string]model.AuditEvent{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	ids := map[string]struct{}{}
+	events := map[string]model.AuditEvent{}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for scanner.Scan() {
@@ -184,10 +185,13 @@ func readWALEventIDs(path string) (map[string]struct{}, error) {
 			return nil, err
 		}
 		if entry.Event.ID != "" {
-			ids[entry.Event.ID] = struct{}{}
+			if _, exists := events[entry.Event.ID]; exists {
+				return nil, fmt.Errorf("audit wal contains duplicate event id %q", entry.Event.ID)
+			}
+			events[entry.Event.ID] = entry.Event
 		}
 	}
-	return ids, scanner.Err()
+	return events, scanner.Err()
 }
 
 // Append writes ev as the next chained record and fsyncs before returning.
@@ -201,7 +205,17 @@ func (w *WAL) AppendIdempotent(ev model.AuditEvent) (bool, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if ev.ID != "" {
-		if _, ok := w.eventIDs[ev.ID]; ok {
+		if current, ok := w.eventsByID[ev.ID]; ok {
+			left, _ := json.Marshal(current)
+			right, _ := json.Marshal(ev)
+			if string(left) != string(right) {
+				return false, fmt.Errorf("audit wal id %q conflicts with durable event", ev.ID)
+			}
+			if w.anchorPath != "" {
+				if err := w.writeAnchor(w.anchorPath, anchorCommitted(w.seq, w.head)); err != nil {
+					return false, err
+				}
+			}
 			return false, nil
 		}
 	}
@@ -219,7 +233,7 @@ func (w *WAL) appendLocked(ev model.AuditEvent) error {
 	}
 	next := AnchorCheckpoint{Count: seq, Head: hash}
 	if w.anchorPath != "" {
-		if err := writeAnchor(w.anchorPath, anchorWithPending(w.seq, w.head, &next)); err != nil {
+		if err := w.writeAnchor(w.anchorPath, anchorWithPending(w.seq, w.head, &next)); err != nil {
 			return err
 		}
 	}
@@ -235,13 +249,13 @@ func (w *WAL) appendLocked(ev model.AuditEvent) error {
 	}
 	w.seq = seq
 	w.head = hash
+	if ev.ID != "" {
+		w.eventsByID[ev.ID] = ev
+	}
 	if w.anchorPath != "" {
-		if err := writeAnchor(w.anchorPath, anchorCommitted(seq, hash)); err != nil {
+		if err := w.writeAnchor(w.anchorPath, anchorCommitted(seq, hash)); err != nil {
 			return err
 		}
-	}
-	if ev.ID != "" {
-		w.eventIDs[ev.ID] = struct{}{}
 	}
 	return nil
 }

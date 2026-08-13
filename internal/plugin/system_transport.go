@@ -21,6 +21,24 @@ type systemWorkerTransport struct {
 	pgid     int
 }
 
+func (t *systemWorkerTransport) closePipes() {
+	if t == nil {
+		return
+	}
+	if t.stdin != nil {
+		_ = t.stdin.Close()
+	}
+	if t.stdout != nil {
+		_ = t.stdout.Close()
+	}
+	if t.hostResp != nil {
+		_ = t.hostResp.Close()
+	}
+	if t.stderr != nil {
+		_ = t.stderr.Close()
+	}
+}
+
 func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 	if t == nil || t.stdout == nil {
 		return fmt.Errorf("worker stdout unavailable")
@@ -83,7 +101,9 @@ func (t *systemWorkerTransport) abort() error {
 	}
 	_ = syscall.Kill(-t.pgid, syscall.SIGTERM)
 	_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
-	return t.cmd.Wait()
+	err := t.cmd.Wait()
+	t.closePipes()
+	return err
 }
 
 func (t *systemWorkerTransport) wait() error {

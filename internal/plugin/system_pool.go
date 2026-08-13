@@ -128,17 +128,6 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 			p.mu.Unlock()
 			return nil, errSystemPoolClosed
 		}
-		// Materialize one bounded overflow worker when all capacity is leased.
-		if p.replenishFn != nil && len(p.workers)+p.active < 1+p.maxOverflow {
-			fn, gen := p.replenishFn, p.generation
-			p.mu.Unlock()
-			if nw, err := fn(gen); err == nil && nw != nil {
-				if err := p.publishTransport(gen, nw.transport, time.Now()); err != nil && nw.transport != nil {
-					_ = nw.transport.abort()
-				}
-			}
-			continue
-		}
 		ch := make(chan poolCheckoutResult, 1)
 		p.waiters = append(p.waiters, ch)
 		p.mu.Unlock()

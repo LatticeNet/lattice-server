@@ -194,8 +194,12 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	taskJSON := filepath.Join(root, "task1.json")
 	taskBytes, _ := json.Marshal(struct {
-		ID, LeaseID, Interpreter, Script string
-		TimeoutSec, OutputLimit          int
+		ID          string `json:"id"`
+		LeaseID     string `json:"lease_id"`
+		Interpreter string `json:"interpreter"`
+		Script      string `json:"script"`
+		TimeoutSec  int    `json:"timeout_sec"`
+		OutputLimit int    `json:"output_limit"`
 	}{leased[0].ID, leased[0].LeaseID, leased[0].Interpreter, leased[0].Script, leased[0].TimeoutSec, leased[0].OutputLimit})
 	if err := os.WriteFile(taskJSON, taskBytes, 0o600); err != nil {
 		t.Fatal(err)
@@ -284,8 +288,12 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	retryTaskJSON := filepath.Join(root, "task2.json")
 	retryTaskBytes, _ := json.Marshal(struct {
-		ID, LeaseID, Interpreter, Script string
-		TimeoutSec, OutputLimit          int
+		ID          string `json:"id"`
+		LeaseID     string `json:"lease_id"`
+		Interpreter string `json:"interpreter"`
+		Script      string `json:"script"`
+		TimeoutSec  int    `json:"timeout_sec"`
+		OutputLimit int    `json:"output_limit"`
 	}{retryLeased[0].ID, retryLeased[0].LeaseID, retryLeased[0].Interpreter, retryLeased[0].Script, retryLeased[0].TimeoutSec, retryLeased[0].OutputLimit})
 	if err := os.WriteFile(retryTaskJSON, retryTaskBytes, 0o600); err != nil {
 		t.Fatal(err)
@@ -421,8 +429,12 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	removeTaskJSON := filepath.Join(root, "task3.json")
 	removeTaskBytes, _ := json.Marshal(struct {
-		ID, LeaseID, Interpreter, Script string
-		TimeoutSec, OutputLimit          int
+		ID          string `json:"id"`
+		LeaseID     string `json:"lease_id"`
+		Interpreter string `json:"interpreter"`
+		Script      string `json:"script"`
+		TimeoutSec  int    `json:"timeout_sec"`
+		OutputLimit int    `json:"output_limit"`
 	}{removeLeased[0].ID, removeLeased[0].LeaseID, removeLeased[0].Interpreter, removeLeased[0].Script, removeLeased[0].TimeoutSec, removeLeased[0].OutputLimit})
 	if err := os.WriteFile(removeTaskJSON, removeTaskBytes, 0o600); err != nil {
 		t.Fatal(err)

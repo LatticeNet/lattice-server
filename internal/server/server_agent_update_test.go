@@ -24,6 +24,30 @@ func seedAgentUpdateNode(t *testing.T, st interface {
 	}
 }
 
+func TestCompareAgentVersionsPrereleaseOrdering(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want int
+		ok   bool
+	}{
+		{"0.3.3", "0.3.4-alpha.1", -1, true},
+		{"v0.3.4-alpha.1", "0.3.4-beta.1", -1, true},
+		{"0.3.4-beta.2", "0.3.4-rc.1", -1, true},
+		{"0.3.4-rc.9", "0.3.4", -1, true},
+		{"0.3.4-alpha.2", "0.3.4-alpha.1", 1, true},
+		{"0.3", "0.3.0", 0, false},
+		{"0.3.4-preview.1", "0.3.4", 0, false},
+		{" 0.3.4", "0.3.4", 0, false},
+		{"0.3.4 ", "0.3.4", 0, false},
+	}
+	for _, tc := range tests {
+		got, ok := compareAgentVersions(tc.a, tc.b)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("compare(%q,%q)=(%d,%v), want (%d,%v)", tc.a, tc.b, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

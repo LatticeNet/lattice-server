@@ -133,6 +133,7 @@ type Store struct {
 	runtimeBoltHotPath string
 	syncParentDir      func(string) error
 	durabilityDegraded bool // guarded by mu; only a confirmed parent sync clears it
+	testPersistCalls   int  // tests only: counts authoritative JSON persistence attempts
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every
@@ -682,6 +683,7 @@ func (s *Store) Save() error {
 // Callers that need commit-style publication can persist a staged copy and
 // install it in s.state only after this returns successfully.
 func (s *Store) persistState(st State) (committed bool, err error) {
+	s.testPersistCalls++
 	start := time.Now()
 	defer func() {
 		telemetry.ObserveStoreSave(time.Since(start), err)

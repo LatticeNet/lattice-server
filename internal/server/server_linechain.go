@@ -72,6 +72,7 @@ type lineChainCompiledArtifact struct {
 	BaseGeneration         uint64
 	PlanGraphRevision      uint64
 	PreviousFragmentSHA256 string
+	CandidateDefinition    store.LineChainDefinition
 }
 
 // lineChainCompileSnapshot freezes every resolved compiler input before any
@@ -288,10 +289,16 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 		plan.PreviousTargetLineUUID = current.TargetLineUUID
 		plan.PreviousArtifactSHA256 = current.ArtifactSHA256
 	}
+	candidateDefinition := store.LineChainDefinition{SourceLineUUID: source.LineUUID, SourceNodeID: source.NodeID, SourceLineHashID: source.LineHashID,
+		SourceInboundTag: source.Tag, TargetLineUUID: target.LineUUID, TargetNodeID: target.NodeID,
+		TargetDefinitionDigest: digestManagedLineDefinition(definition), TargetPublicMaterialDigest: digestText(definition.RealityPublicKey + "\x00" + definition.ShortID),
+		TargetCredentialDigest: digestText(credential.UUID), OutboundTag: outboundTag, FragmentPath: lineChainFragmentPath(source.LineUUID),
+		FragmentSHA256: fragment.SHA256, SidecarSHA256: sidecarSHA, ArtifactSHA256: combined}
 	return lineChainCompiledArtifact{
 		Plan: plan, FragmentJSON: fragment.JSON, SidecarJSON: string(sidecar), TargetCredentialUUID: credential.UUID,
 		TargetPublicKey: definition.RealityPublicKey, TargetShortID: definition.ShortID, TargetDefinition: definition,
 		BaseGeneration: current.Generation, PlanGraphRevision: chainSnapshot.Revision, PreviousFragmentSHA256: current.FragmentSHA256,
+		CandidateDefinition: candidateDefinition,
 	}, nil
 }
 
@@ -421,7 +428,10 @@ func (s *Server) compileLineChainRemoveSnapshot(snapshot lineChainCompileSnapsho
 		Summary: fmt.Sprintf("Remove managed downstream from %s on %s", source.Name,
 			firstNonEmpty(strings.TrimSpace(snapshot.Nodes[source.NodeID].Name), source.NodeID)),
 	}, SidecarJSON: string(sidecar), BaseGeneration: current.Generation, PlanGraphRevision: snapshot.Chains.Revision,
-		PreviousFragmentSHA256: current.FragmentSHA256}, nil
+		PreviousFragmentSHA256: current.FragmentSHA256, CandidateDefinition: store.LineChainDefinition{
+			SourceLineUUID: sourceUUID, SourceNodeID: source.NodeID, SourceLineHashID: source.LineHashID, SourceInboundTag: source.Tag,
+			OutboundTag: current.OutboundTag, FragmentPath: current.FragmentPath, SidecarSHA256: digestText(string(sidecar)), ArtifactSHA256: artifactSHA,
+		}}, nil
 }
 
 type lineChainAgentDocumentV2 struct {
@@ -511,7 +521,7 @@ func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArt
 		SourceNodeID: compiled.Plan.SourceNodeID, CandidateTargetLineUUID: compiled.Plan.TargetLineUUID,
 		CandidateTargetNodeID: compiled.Plan.TargetNodeID, BaseGeneration: compiled.BaseGeneration,
 		BaseArtifactSHA256: compiled.Plan.PreviousArtifactSHA256, CandidateArtifactSHA256: compiled.Plan.ArtifactSHA256,
-		RequestSHA256: compiled.Plan.RequestSHA256, PlanGraphRevision: compiled.PlanGraphRevision,
+		RequestSHA256: compiled.Plan.RequestSHA256, PlanGraphRevision: compiled.PlanGraphRevision, CandidateDefinition: compiled.CandidateDefinition,
 	}
 	planned, deduped, err := s.store.PlanLineChainApproval(attempt, approval)
 	if err != nil {
@@ -562,6 +572,41 @@ func (s *Server) validateLineChainFirstLease(persistent store.LineChainCompileSt
 		return errors.New("line chain task script no longer matches live artifact")
 	}
 	return nil
+}
+
+func (s *Server) handleLineChainTaskResult(approval model.Approval, result model.TaskResult) error {
+	var plan lineChainPlan
+	if err := json.Unmarshal([]byte(approval.Plan), &plan); err != nil {
+		return err
+	}
+	status, driftCode := store.LineChainStatusAppliedUnobserved, ""
+	if result.ExitCode == 0 && result.Error == "" {
+		var err error
+		if plan.Operation == store.LineChainOperationRemove {
+			_, err = s.compileLineChainRemove(plan.SourceLineUUID)
+		} else {
+			_, err = s.compileLineChain(lineChainCompileRequest{SourceLineUUID: plan.SourceLineUUID, TargetLineUUID: plan.TargetLineUUID})
+		}
+		if err != nil {
+			status, driftCode = store.LineChainStatusDrifted, "inputs_changed"
+			if strings.Contains(err.Error(), "target") || strings.Contains(err.Error(), "line_uuid") {
+				driftCode = "target_missing"
+			}
+		}
+	}
+	terminalError := result.Error
+	if terminalError == "" && result.ExitCode != 0 {
+		terminalError = fmt.Sprintf("line chain task exited %d", result.ExitCode)
+	}
+	errorCode := driftCode
+	if result.ExitCode != 0 || result.Error != "" {
+		errorCode = "host_apply_failed"
+	}
+	committed, err := s.store.CompleteLineChainTaskResult(result, approval, status, errorCode, terminalError)
+	if committed && err != nil {
+		s.logger.Printf("line chain terminal result committed with degraded durability: %v", err)
+	}
+	return err
 }
 
 func (s *Server) handleLineChainPlan(w http.ResponseWriter, r *http.Request, p principal) {

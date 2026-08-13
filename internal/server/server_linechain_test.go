@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -183,6 +184,25 @@ func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 	snapshot := srv.store.LineChainSnapshot()
 	if snapshot.Revision != 1 || snapshot.Attempts[approval.ID].Status != store.LineChainStatusApplying {
 		t.Fatalf("approval/task/reservation not atomic: %+v", snapshot)
+	}
+}
+
+func TestLineChainTaskScriptRevealIsDeniedBeforeStepUp(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	approval := model.Approval{ID: "approval-secret", NodeID: "node-a", Plugin: lineChainPlugin, Service: lineChainService,
+		Method: lineChainSetMethod, Action: lineChainActionPrefix + "digest", Status: model.ApprovalApproved}
+	if err := srv.store.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.CreateTask(model.Task{ID: "task-secret", ApprovalID: approval.ID, Targets: []string{"node-a"}, Script: "credential-canary", Status: model.TaskQueued}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/reveal-script", strings.NewReader(`{"id":"task-secret","step_up_grant":"otherwise-valid"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handleRevealTaskScript(rec, req, principal{Principal: rbac.Principal{ActorID: "admin", Scopes: []string{"task:read"}}})
+	if rec.Code != http.StatusForbidden || strings.Contains(rec.Body.String(), "credential-canary") {
+		t.Fatalf("E3 reveal status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

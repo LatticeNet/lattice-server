@@ -92,6 +92,82 @@ func TestVpnUserPrivateRecordsAreEncryptedAndBoltParityRoundTrips(t *testing.T) 
 	}
 }
 
+func TestLineSecretsReopen1024RecordsBeyondLegacyVaultCap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	cipher := testCipher(t)
+	s, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, private := make(map[string]VpnUserPublicRecord, 1024), make(map[string]VpnUserSecretRecord, 1024)
+	for i := 0; i < 1024; i++ {
+		id := fmt.Sprintf("vpn-%04d", i)
+		public[id], private[id] = testVpnUserRecords(id, "secret-"+id)
+	}
+	if err := s.ReplaceVpnUserRecords(public, private, nil); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotPublic, gotPrivate := reopened.VpnUserRecords()
+	if len(gotPublic) != 1024 || len(gotPrivate) != 1024 || gotPrivate["vpn-1023"].Credentials[0].UUID != "secret-vpn-1023" {
+		t.Fatalf("1024 reopen mismatch: public=%d private=%d last=%+v", len(gotPublic), len(gotPrivate), gotPrivate["vpn-1023"])
+	}
+}
+
+func TestLineSecretLostKeyRestartFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := OpenWithCipher(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, private := testVpnUserRecords("vpn-1", "credential-canary")
+	if err := s.PutVpnUserRecord(public, private); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenWithCipher(path, testCipher(t)); err == nil {
+		t.Fatal("restart with lost master key served encrypted line secrets")
+	}
+}
+
+func TestLineSecretMigrationTenThousandRecordsUsesOneJSONCommit(t *testing.T) {
+	for _, runtimeHot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("runtime_hot_%v", runtimeHot), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			s, err := OpenWithCipher(path, testCipher(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtimeHot {
+				if err := s.EnableRuntimeBoltHotStore(filepath.Join(t.TempDir(), "hot.db")); err != nil {
+					t.Fatal(err)
+				}
+				defer s.Close()
+			}
+			before := s.testPersistCalls
+			err = s.MigrateLineSecrets(func(source LineSecretMigrationSource) (LineSecretMigrationBuild, error) {
+				for i := 0; i < 10_000; i++ {
+					id := fmt.Sprintf("vpn-%05d", i)
+					source.VpnUsers[id], source.VpnUserSecrets[id] = testVpnUserRecords(id, "secret-"+id)
+					lineID := fmt.Sprintf("line-%05d", i)
+					source.ManagedLines[lineID] = ManagedLinePublicRecord{LineUUID: lineID, NodeID: "node-a", Status: "applied"}
+					source.ManagedLineSecrets[lineID] = ManagedLineSecretRecord{RealityPrivateKey: "private-" + lineID}
+				}
+				return LineSecretMigrationBuild{VpnUsers: source.VpnUsers, VpnUserSecrets: source.VpnUserSecrets,
+					ManagedLines: source.ManagedLines, ManagedLineSecrets: source.ManagedLineSecrets}, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls := s.testPersistCalls - before; calls != 1 {
+				t.Fatalf("migration persisted %d times, want exactly one", calls)
+			}
+		})
+	}
+}
+
 func TestReplaceVpnUserRecordsStagesLegacyRemovalAtomically(t *testing.T) {
 	store, err := Open("")
 	if err != nil {

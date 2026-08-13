@@ -326,18 +326,8 @@ func compareAgentVersions(a, b string) (int, bool) {
 	if !okLeft || !okRight {
 		return 0, false
 	}
-	maxLen := len(left)
-	if len(right) > maxLen {
-		maxLen = len(right)
-	}
-	for i := 0; i < maxLen; i++ {
-		var lv, rv int
-		if i < len(left) {
-			lv = left[i]
-		}
-		if i < len(right) {
-			rv = right[i]
-		}
+	for i := 0; i < 3; i++ {
+		lv, rv := left[i], right[i]
 		if lv > rv {
 			return 1, true
 		}
@@ -345,26 +335,44 @@ func compareAgentVersions(a, b string) (int, bool) {
 			return -1, true
 		}
 	}
+	if left[3] > right[3] {
+		return 1, true
+	}
+	if left[3] < right[3] {
+		return -1, true
+	}
+	if left[4] > right[4] {
+		return 1, true
+	}
+	if left[4] < right[4] {
+		return -1, true
+	}
 	return 0, true
 }
 
+var agentVersionPattern = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-(alpha|beta|rc)\.([0-9]+))?$`)
+
 func parseAgentVersionParts(raw string) ([]int, bool) {
-	raw = strings.TrimSpace(raw)
-	raw = strings.TrimPrefix(raw, "v")
-	if raw == "" {
+	match := agentVersionPattern.FindStringSubmatch(raw)
+	if match == nil {
 		return nil, false
 	}
-	parts := strings.Split(raw, ".")
-	out := make([]int, 0, len(parts))
-	for _, part := range parts {
-		if part == "" {
+	out := make([]int, 5)
+	for i := 1; i <= 3; i++ {
+		value, err := strconv.Atoi(match[i])
+		if err != nil {
 			return nil, false
 		}
-		value, err := strconv.Atoi(part)
-		if err != nil || value < 0 {
+		out[i-1] = value
+	}
+	ranks := map[string]int{"alpha": 0, "beta": 1, "rc": 2, "": 3}
+	out[3] = ranks[match[4]]
+	if match[5] != "" {
+		value, err := strconv.Atoi(match[5])
+		if err != nil {
 			return nil, false
 		}
-		out = append(out, value)
+		out[4] = value
 	}
 	return out, true
 }
@@ -446,7 +454,11 @@ func (s *Server) createAgentUpdateApproval(ctx context.Context, nodeID, actorID 
 	if err != nil {
 		return model.Approval{}, err
 	}
-	if !force && isAgentVersionDowngrade(strings.TrimSpace(node.AgentVersion), payload.TargetVersion) {
+	cmp, comparable := compareAgentVersions(strings.TrimSpace(node.AgentVersion), payload.TargetVersion)
+	if !force && !comparable {
+		return model.Approval{}, fmt.Errorf("unsupported agent version syntax: current=%q target=%q", strings.TrimSpace(node.AgentVersion), payload.TargetVersion)
+	}
+	if !force && cmp > 0 {
 		return model.Approval{}, fmt.Errorf("refusing to plan agent downgrade from %s to %s", strings.TrimSpace(node.AgentVersion), payload.TargetVersion)
 	}
 	if !force && strings.TrimSpace(node.AgentVersion) == payload.TargetVersion {

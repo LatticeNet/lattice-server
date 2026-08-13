@@ -3171,6 +3171,10 @@ func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
 		return
 	}
+	if approval, ok := s.store.Approval(task.ApprovalID); ok && isLineChainApproval(approval) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorForbidden, "line chain task scripts are available only to the targeted agent lease"))
+		return
+	}
 	if !s.requireAllNodeScopes(w, p, "task:read", task.Targets) {
 		return
 	}
@@ -3439,6 +3443,10 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 		}
 		if req.Bucket == "" {
 			req.Bucket = bucket
+		}
+		if reservedLineSecretKVBucket(req.Bucket) {
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorForbidden, "bucket is reserved for typed private state"))
+			return
 		}
 		if req.Key == "" {
 			writeError(w, http.StatusBadRequest, errors.New("key is required"))
@@ -6244,15 +6252,16 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 	task, taskOK := s.store.Task(req.Result.TaskID)
 	approval, netGuardResult := s.store.Approval(task.ApprovalID)
 	netGuardResult = taskOK && netGuardResult && isNetGuardApproval(approval)
-	if netGuardResult && req.Result.FinishedAt.IsZero() {
-		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "netguard task result finished_at is required for durable replay identity"))
+	lineChainResult := taskOK && isLineChainApproval(approval)
+	if (netGuardResult || lineChainResult) && req.Result.FinishedAt.IsZero() {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "durable task result finished_at is required for replay identity"))
 		return
 	}
 	// Only NetGuard opts into the durable replay protocol: its task, approval,
 	// binding and receipt are one atomic store transition. Generic task follow-up
 	// handlers remain outside this protocol because they are heterogeneous and
 	// not all crash-idempotent.
-	if netGuardResult {
+	if netGuardResult || lineChainResult {
 		matches, found, err := s.store.ConfirmTaskResultReplay(req.Result)
 		if found {
 			if err != nil {
@@ -6302,6 +6311,21 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if lineChainResult {
+		if err := s.handleLineChainTaskResult(approval, req.Result); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, store.ErrTaskLeaseMismatch) {
+				status = http.StatusForbidden
+			}
+			if errors.Is(err, store.ErrTaskTransitionConflict) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}

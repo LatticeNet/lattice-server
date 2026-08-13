@@ -190,3 +190,47 @@ func TestLineChainFirstLeaseValidationFailureReleasesReservationAtomically(t *te
 		t.Fatalf("stale release not atomic: approval=%+v task=%+v attempt=%+v revision=%d", gotApproval, gotTask, gotAttempt, snapshot.Revision)
 	}
 }
+
+func TestCompleteLineChainTaskResultPromotesFrozenCandidateAndReplaysExactly(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{ID: "approval-result", NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines", Method: "chain_set_apply",
+		Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending}
+	frozen := LineChainDefinition{SourceLineUUID: "source", SourceNodeID: "node-a", SourceLineHashID: "hash-source", SourceInboundTag: "in-source",
+		TargetLineUUID: "target", TargetNodeID: "node-b", TargetDefinitionDigest: "definition", TargetPublicMaterialDigest: "public",
+		TargetCredentialDigest: "credential", OutboundTag: "out", FragmentPath: "lattice-linechain-a.json", FragmentSHA256: "fragment", SidecarSHA256: "sidecar", ArtifactSHA256: "digest"}
+	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a",
+		CandidateTargetLineUUID: "target", CandidateArtifactSHA256: "digest", CandidateDefinition: frozen, RequestSHA256: "request", PlanGraphRevision: 0}
+	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
+		t.Fatal(err)
+	}
+	approved := approval
+	approved.Status = model.ApprovalApproved
+	task := model.Task{ID: "task-result", ApprovalID: approval.ID, Targets: []string{"node-a"}, Script: "exact-script", Status: model.TaskQueued}
+	if _, committed, err := s.ApproveLineChain(approved, task); err != nil || !committed {
+		t.Fatalf("approve committed=%v err=%v", committed, err)
+	}
+	validator := func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil }
+	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, validator)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	}
+	result := model.TaskResult{TaskID: task.ID, NodeID: "node-a", LeaseID: deliveries[0].Task.LeaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}
+	if committed, err := s.CompleteLineChainTaskResult(result, approved, LineChainStatusDrifted, "target_missing", ""); err != nil || !committed {
+		t.Fatalf("complete committed=%v err=%v", committed, err)
+	}
+	definition := s.LineChainSnapshot().Definitions["source"]
+	if definition.ApprovalID != approval.ID || definition.TargetCredentialDigest != "credential" || definition.Status != LineChainStatusDrifted || definition.DriftCode != "target_missing" || definition.Generation != 1 || len(s.LineChainSnapshot().Attempts) != 0 || s.LineChainSnapshot().Revision != 2 {
+		t.Fatalf("frozen promotion mismatch: %+v snapshot=%+v", definition, s.LineChainSnapshot())
+	}
+	if matches, found, err := s.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
+		t.Fatalf("lost-ACK replay matches=%v found=%v err=%v", matches, found, err)
+	}
+	conflict := result
+	conflict.ExitCode = 1
+	if matches, found, _ := s.ConfirmTaskResultReplay(conflict); !found || matches {
+		t.Fatalf("conflicting replay accepted: matches=%v found=%v", matches, found)
+	}
+}

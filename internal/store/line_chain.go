@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sort"
@@ -57,28 +58,29 @@ type LineChainDefinition struct {
 // LineChainAttempt is an in-flight candidate, stored separately so a failed
 // replace/remove cannot overwrite the active committed edge.
 type LineChainAttempt struct {
-	ApprovalID              string    `json:"approval_id"`
-	Operation               string    `json:"operation"`
-	SourceLineUUID          string    `json:"source_line_uuid"`
-	SourceNodeID            string    `json:"source_node_id"`
-	CandidateTargetLineUUID string    `json:"candidate_target_line_uuid,omitempty"`
-	CandidateTargetNodeID   string    `json:"candidate_target_node_id,omitempty"`
-	BaseGeneration          uint64    `json:"base_generation"`
-	BaseArtifactSHA256      string    `json:"base_artifact_sha256,omitempty"`
-	CandidateArtifactSHA256 string    `json:"candidate_artifact_sha256,omitempty"`
-	RequestSHA256           string    `json:"request_sha256"`
-	PlanGraphRevision       uint64    `json:"plan_graph_revision"`
-	QueuedGraphRevision     uint64    `json:"queued_graph_revision,omitempty"`
-	FirstLeaseGraphRevision uint64    `json:"first_lease_graph_revision,omitempty"`
-	IssuedTaskID            string    `json:"issued_task_id,omitempty"`
-	IssuedLeaseID           string    `json:"issued_lease_id,omitempty"`
-	IssuedScriptSHA256      string    `json:"issued_script_sha256,omitempty"`
-	IssuedArtifactSHA256    string    `json:"issued_artifact_sha256,omitempty"`
-	Status                  string    `json:"status"`
-	LastErrorCode           string    `json:"last_error_code,omitempty"`
-	LastError               string    `json:"last_error,omitempty"`
-	CreatedAt               time.Time `json:"created_at"`
-	UpdatedAt               time.Time `json:"updated_at"`
+	ApprovalID              string              `json:"approval_id"`
+	Operation               string              `json:"operation"`
+	SourceLineUUID          string              `json:"source_line_uuid"`
+	SourceNodeID            string              `json:"source_node_id"`
+	CandidateTargetLineUUID string              `json:"candidate_target_line_uuid,omitempty"`
+	CandidateTargetNodeID   string              `json:"candidate_target_node_id,omitempty"`
+	BaseGeneration          uint64              `json:"base_generation"`
+	BaseArtifactSHA256      string              `json:"base_artifact_sha256,omitempty"`
+	CandidateArtifactSHA256 string              `json:"candidate_artifact_sha256,omitempty"`
+	CandidateDefinition     LineChainDefinition `json:"candidate_definition"`
+	RequestSHA256           string              `json:"request_sha256"`
+	PlanGraphRevision       uint64              `json:"plan_graph_revision"`
+	QueuedGraphRevision     uint64              `json:"queued_graph_revision,omitempty"`
+	FirstLeaseGraphRevision uint64              `json:"first_lease_graph_revision,omitempty"`
+	IssuedTaskID            string              `json:"issued_task_id,omitempty"`
+	IssuedLeaseID           string              `json:"issued_lease_id,omitempty"`
+	IssuedScriptSHA256      string              `json:"issued_script_sha256,omitempty"`
+	IssuedArtifactSHA256    string              `json:"issued_artifact_sha256,omitempty"`
+	Status                  string              `json:"status"`
+	LastErrorCode           string              `json:"last_error_code,omitempty"`
+	LastError               string              `json:"last_error,omitempty"`
+	CreatedAt               time.Time           `json:"created_at"`
+	UpdatedAt               time.Time           `json:"updated_at"`
 }
 
 type LineChainSnapshot struct {
@@ -338,6 +340,76 @@ func (s *Store) ApproveLineChain(approval model.Approval, task model.Task) (Line
 		s.state = staged
 	}
 	return attempt, committed, err
+}
+
+// CompleteLineChainTaskResult durably records the exact issued lease result and
+// promotes (or fails) its candidate in one graph revision transition.
+func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.Approval, terminalStatus, errorCode, terminalError string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.state.Tasks[r.TaskID]
+	if !ok || task.ApprovalID != approval.ID || !taskLeaseMatches(task, r.NodeID, r.LeaseID) {
+		return false, ErrTaskLeaseMismatch
+	}
+	attempt, ok := s.state.LineChainAttempts[approval.ID]
+	if !ok || attempt.Status != LineChainStatusApplying || attempt.IssuedTaskID != task.ID || attempt.IssuedLeaseID != r.LeaseID ||
+		attempt.IssuedScriptSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(task.Script))) || attempt.IssuedArtifactSHA256 != approval.ArtifactDigest {
+		return false, ErrTaskTransitionConflict
+	}
+	now := time.Now().UTC()
+	stored := r
+	stored.LeaseID = ""
+	if stored.FinishedAt.IsZero() {
+		stored.FinishedAt = now
+	}
+	staged := s.state
+	staged.Results = append(append([]model.TaskResult(nil), s.state.Results...), stored)
+	if len(staged.Results) > maxTaskResults {
+		staged.Results = append([]model.TaskResult(nil), staged.Results[len(staged.Results)-maxTaskResults:]...)
+	}
+	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks))
+	for id, value := range s.state.Tasks {
+		staged.Tasks[id] = value
+	}
+	task.Status, task.FinishedAt = taskAggregateStatus(task, staged.Results)
+	staged.Tasks[task.ID] = task
+	staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+	for id, value := range s.state.Approvals {
+		staged.Approvals[id] = value
+	}
+	approval.CreatedAt = s.state.Approvals[approval.ID].CreatedAt
+	approval.UpdatedAt = now
+	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+	staged.LineChainDefinitions = cloneLineChainDefinitions(s.state.LineChainDefinitions)
+	success := r.ExitCode == 0 && r.Error == ""
+	if success {
+		approval.Status, approval.Reason = model.ApprovalApplied, ""
+		definition := attempt.CandidateDefinition
+		definition.ApprovalID = approval.ID
+		definition.Generation = attempt.BaseGeneration + 1
+		definition.CreatedAt = s.state.LineChainDefinitions[attempt.SourceLineUUID].CreatedAt
+		if definition.CreatedAt.IsZero() {
+			definition.CreatedAt = now
+		}
+		definition.UpdatedAt, definition.Status, definition.DriftCode = now, terminalStatus, errorCode
+		staged.LineChainDefinitions[attempt.SourceLineUUID] = definition
+		delete(staged.LineChainAttempts, approval.ID)
+	} else {
+		approval.Status, approval.Reason = model.ApprovalApplied, "execution failed"
+		attempt.Status, attempt.LastErrorCode, attempt.LastError, attempt.UpdatedAt = LineChainStatusFailed, errorCode, terminalError, now
+		staged.LineChainAttempts[approval.ID] = attempt
+	}
+	staged.Approvals[approval.ID] = approval
+	staged.LineChainGraphRevision++
+	staged.TaskResultReceipts = cloneTaskResultReceipts(s.state.TaskResultReceipts)
+	receiptResult := stored
+	receiptResult.LeaseID = r.LeaseID
+	staged.TaskResultReceipts[taskResultReceiptKey(r.TaskID, r.NodeID)] = taskResultReceipt(receiptResult)
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return committed, err
 }
 
 func lineChainGraphHasCycle(definitions map[string]LineChainDefinition, attempts map[string]LineChainAttempt) bool {

@@ -984,6 +984,13 @@ func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 		return approval
 	}
 
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443",
+		LineUUID: sourceUUID, DownstreamLineUUID: "33333333-3333-4333-8333-333333333333"}})
+	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil ||
+		!strings.Contains(err.Error(), "true create requires an unclaimed source") {
+		t.Fatalf("true create adopted an unrelated observed declaration: %v", err)
+	}
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443", LineUUID: sourceUUID}})
 	setArtifact, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
 	if err != nil {
 		t.Fatal(err)

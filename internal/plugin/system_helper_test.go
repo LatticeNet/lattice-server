@@ -41,6 +41,27 @@ func TestRealV2ResultWithoutReadyPreservesReplyAndReaps(t *testing.T) {
 	}
 }
 
+func TestRealV2StalledHostCallCancellationReaps(t *testing.T) {
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_HOST=1", "LATTICE_TEST_V2_STALL=1")
+	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	_, err = tr.invokeV2(ctx, 1, "stall", InvokeRequest{Action: "x"}, func(systemHostCall) systemHostResponse { return systemHostResponse{ID: "h1", OK: true} })
+	if err == nil {
+		t.Fatal("expected cancellation or transport termination")
+	}
+	_ = tr.abort()
+	if err := syscall.Kill(-tr.pgid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("pgid still alive: %v", err)
+	}
+}
+
 func runV2Helper() {
 	generation := uint64(1)
 	if _, err := fmt.Fprintf(os.Stdout, `{"protocol":2,"kind":"runtime_ready","generation":%d,"invocation_id":"runtime"}

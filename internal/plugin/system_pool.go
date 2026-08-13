@@ -39,6 +39,17 @@ type systemPool struct {
 	closed     bool
 }
 
+func (p *systemPool) hasTransport() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, w := range p.workers {
+		if w.transport != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *systemPool {
 	if maxUses <= 0 {
 		maxUses = 256

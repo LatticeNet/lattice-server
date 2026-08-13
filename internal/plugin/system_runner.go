@@ -309,6 +309,22 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	if tripped {
 		return InvokeResponse{}, fmt.Errorf("%w: %s", ErrCircuitOpen, req.PluginID)
 	}
+	if st.pool != nil && st.pool.hasTransport() {
+		w, err := st.pool.checkout(ctx, time.Now())
+		if err != nil {
+			return InvokeResponse{}, err
+		}
+		invocation := fmt.Sprintf("%d", time.Now().UnixNano())
+		reply, callErr := w.transport.invokeV2(req.Generation, invocation, req)
+		st.pool.release(w, callErr == nil, time.Now())
+		if callErr != nil {
+			return InvokeResponse{}, callErr
+		}
+		if !reply.OK {
+			return InvokeResponse{OK: false, Message: reply.Message, Result: reply.Result}, fmt.Errorf("plugin reported failure: %s", reply.Message)
+		}
+		return InvokeResponse{OK: true, Message: reply.Message, Result: reply.Result}, nil
+	}
 
 	if ctx == nil {
 		ctx = context.Background()

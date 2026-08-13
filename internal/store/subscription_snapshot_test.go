@@ -210,6 +210,10 @@ func TestLegacyPlaintextSubscriptionSecretsMigrateInOneBoltUpdate(t *testing.T) 
 	}); err != nil {
 		t.Fatal(err)
 	}
+	beforeInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	bs.testUpdateCalls = 0
 	got, err := bs.ExportState()
 	if err != nil {
@@ -220,6 +224,20 @@ func TestLegacyPlaintextSubscriptionSecretsMigrateInOneBoltUpdate(t *testing.T) 
 	}
 	if got.SubscriptionSnapshots["p/s"].Raw != snapshotRawCanary || got.SubscriptionShares["share"].Token != "share-plaintext-canary" {
 		t.Fatalf("migrated values changed: %+v", got)
+	}
+	afterInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(beforeInfo, afterInfo) {
+		t.Fatal("full-Bolt migration reused the source database instead of a fresh compact replacement")
+	}
+	wholeFile, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(wholeFile), snapshotRawCanary) || strings.Contains(string(wholeFile), "share-plaintext-canary") {
+		t.Fatal("fresh Bolt replacement retained a plaintext canary in obsolete pages")
 	}
 	if err := bs.db.View(func(tx *bolt.Tx) error {
 		for _, bucket := range [][]byte{boltBucketSubSnapshots, boltBucketSubShares} {

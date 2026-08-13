@@ -248,6 +248,10 @@ func (bs *BoltStateStore) ensureBuckets() error {
 // ImportState replaces the entire bbolt state atomically. Secret-bearing fields
 // are encrypted before they are written; the input State is not mutated.
 func (bs *BoltStateStore) ImportState(st State) error {
+	return bs.importState(st, false)
+}
+
+func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized bool) error {
 	st.ensureMaps()
 	if err := validateVpnUserCollections(st.VpnUsers, st.VpnUserSecrets); err != nil {
 		return fmt.Errorf("invalid vpn user secret collections: %w", err)
@@ -414,7 +418,13 @@ func (bs *BoltStateStore) ImportState(st State) error {
 		if err := putMap(tx, boltBucketOIDCIdentities, persist.OIDCIdentities); err != nil {
 			return err
 		}
-		return putMap(tx, boltBucketOIDCAuthStates, persist.OIDCAuthStates)
+		if err := putMap(tx, boltBucketOIDCAuthStates, persist.OIDCAuthStates); err != nil {
+			return err
+		}
+		if subscriptionAuthorityInitialized {
+			return tx.Bucket(boltBucketMeta).Put(boltKeySubscriptionHotAuthority, []byte("initialized"))
+		}
+		return nil
 	})
 }
 
@@ -624,11 +634,70 @@ func (bs *BoltStateStore) exportState(migrate bool) (State, error) {
 		return State{}, fmt.Errorf("invalid managed line secret collections: %w", err)
 	}
 	if migrate && migrateSubscriptionSecrets {
-		if err := bs.ImportState(st); err != nil {
+		if err := bs.replaceWithCompactEncryptedState(st); err != nil {
 			return State{}, fmt.Errorf("migrate subscription secrets: %w", err)
 		}
 	}
 	return st, nil
+}
+
+func (bs *BoltStateStore) replaceWithCompactEncryptedState(st State) error {
+	path := bs.db.Path()
+	authorityInitialized, err := bs.subscriptionHotAuthorityInitialized()
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".lattice-state-migrate-*.db")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	defer os.Remove(tmpPath)
+	tmpDB, err := bolt.Open(tmpPath, 0o600, &bolt.Options{Timeout: 2 * time.Second})
+	if err != nil {
+		return err
+	}
+	tmpStore := &BoltStateStore{db: tmpDB, cipher: bs.cipher}
+	closeTemp := func() { _ = tmpStore.Close() }
+	if err := tmpStore.importState(st, authorityInitialized); err != nil {
+		closeTemp()
+		return err
+	}
+	if err := tmpDB.Sync(); err != nil {
+		closeTemp()
+		return err
+	}
+	if err := tmpStore.Close(); err != nil {
+		return err
+	}
+	if err := bs.db.Close(); err != nil {
+		return err
+	}
+	bs.db = nil
+	reopen := func() error {
+		db, openErr := bolt.Open(path, 0o600, &bolt.Options{Timeout: 2 * time.Second})
+		if openErr == nil {
+			bs.db = db
+		}
+		return openErr
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = reopen()
+		return err
+	}
+	if err := syncDir(filepath.Dir(path)); err != nil {
+		_ = reopen()
+		return err
+	}
+	if err := reopen(); err != nil {
+		return err
+	}
+	bs.testUpdateCalls++
+	return nil
 }
 
 func checkBoltVersion(tx *bolt.Tx) error {

@@ -371,13 +371,33 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if !bytes.Contains(removedSidecar, []byte(`"ordinary_sync_generation":7`)) || !bytes.Contains(removedSidecar, []byte(`"unknown_root":{"keep":true}`)) || bytes.Contains(removedSidecar, []byte(`"downstream_line_uuid"`)) {
 		t.Fatalf("remove lost ordinary metadata or retained chain: %s", removedSidecar)
 	}
-	removeFinished := time.Now().UTC().Format(time.RFC3339Nano)
-	removeResult := fmt.Sprintf(`{"node_id":"node-b","result":{"task_id":%q,"lease_id":%q,"exit_code":0,"finished_at":%q}}`, removeLeased[0].ID, removeLeased[0].LeaseID, removeFinished)
-	for attempt := 0; attempt < 2; attempt++ {
-		postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, []byte(removeResult))
+	removeResolve := filepath.Join(root, "remove-resolve-result.json")
+	removeResolveCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EResolveHelper$", "--", root)
+	removeResolveCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_TASK="+removeLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+removeLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_RESOLVE_RESULT="+removeResolve)
+	if out, err := removeResolveCmd.CombinedOutput(); err != nil {
+		t.Fatalf("remove resolve helper failed: %v: %s", err, out)
 	}
+	removeResult, err := os.ReadFile(removeResolve)
+	if err != nil || !bytes.Contains(removeResult, []byte(removeLeased[0].ID)) {
+		t.Fatalf("remove result missing: %v", err)
+	}
+	removeBody := []byte(fmt.Sprintf(`{"node_id":"node-b","result":%s}`, removeResult))
+	removeInventory := filepath.Join(root, "remove-inventory-result.json")
+	removeInventoryCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
+	removeInventoryCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+removeInventory)
+	if out, err := removeInventoryCmd.CombinedOutput(); err != nil {
+		t.Fatalf("remove inventory helper failed: %v: %s", err, out)
+	}
+	removeInventoryRaw, err := os.ReadFile(removeInventory)
+	if err != nil || len(removeInventoryRaw) == 0 {
+		t.Fatalf("remove inventory result missing: %v", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, removeBody)
+	}
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, removeInventoryRaw)))
 	removed := srv.store.LineChainSnapshot().Definitions[sourceUUID]
-	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 2 {
+	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 3 {
 		t.Fatalf("remove promotion/task mismatch: %+v tasks=%d", removed, len(srv.store.Tasks()))
 	}
 	beforeRemoveTraffic := observer.accepted()

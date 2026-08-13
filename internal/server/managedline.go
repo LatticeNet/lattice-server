@@ -524,7 +524,7 @@ func (s *Server) compileManagedLineRollout(ctx context.Context, p principal, req
 
 		now := s.now()
 		lineHashID := managedLinePlannedHash(nodeID, tag, port)
-		lineUUID, err := s.ensureLineUUID(lineHashID)
+		lineUUID, err := s.ensureLineUUID(lineHashID, nodeID)
 		if err != nil {
 			skip("allocate line_uuid: " + err.Error())
 			continue

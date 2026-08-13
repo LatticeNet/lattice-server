@@ -40,6 +40,7 @@ type systemPool struct {
 	closed      bool
 	replenishFn func(uint64) (*pooledWorker, error)
 	active      int
+	starting    int
 	leased      map[*pooledWorker]struct{}
 }
 
@@ -128,6 +129,11 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 			p.mu.Unlock()
 			return nil, errSystemPoolClosed
 		}
+		if p.replenishFn != nil && len(p.workers)+p.active+p.starting < 1+p.maxOverflow {
+			p.starting++
+			fn, gen := p.replenishFn, p.generation
+			go p.spawnOverflow(fn, gen)
+		}
 		ch := make(chan poolCheckoutResult, 1)
 		p.waiters = append(p.waiters, ch)
 		p.mu.Unlock()
@@ -155,6 +161,24 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 			}
 			return nil, ctx.Err()
 		}
+	}
+}
+
+func (p *systemPool) spawnOverflow(fn func(uint64) (*pooledWorker, error), gen uint64) {
+	nw, err := fn(gen)
+	p.mu.Lock()
+	if p.starting > 0 {
+		p.starting--
+	}
+	valid := err == nil && nw != nil && !p.closed && p.generation == gen && len(p.workers)+p.active < 1+p.maxOverflow
+	if valid {
+		nw.state = workerIdle
+		p.workers = append(p.workers, nw)
+		p.wakeLocked()
+	}
+	p.mu.Unlock()
+	if !valid && nw != nil && nw.transport != nil {
+		_ = nw.transport.abort()
 	}
 }
 

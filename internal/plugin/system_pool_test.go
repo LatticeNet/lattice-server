@@ -132,6 +132,45 @@ func TestSystemPoolActiveMatchesLeasedAcrossTransitions(t *testing.T) {
 	p.mu.Unlock()
 }
 
+func TestSystemPoolOverflowReservesSingleStartingWorker(t *testing.T) {
+	p := newSystemPool(2, time.Hour)
+	_ = p.publish(1, true, time.Now())
+	w, err := p.checkout(context.Background(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	var calls int
+	p.replenishFn = func(uint64) (*pooledWorker, error) {
+		calls++
+		<-gate
+		return &pooledWorker{generation: 1, started: time.Now()}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	done := make(chan *pooledWorker, 1)
+	go func() { x, _ := p.checkout(ctx, time.Now()); done <- x }()
+	time.Sleep(time.Millisecond)
+	p.mu.Lock()
+	if p.starting != 1 {
+		t.Fatalf("starting=%d", p.starting)
+	}
+	p.mu.Unlock()
+	close(gate)
+	select {
+	case x := <-done:
+		if x == nil {
+			t.Fatal("no overflow lease")
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	p.release(w, false, time.Now())
+	if calls != 1 {
+		t.Fatalf("spawn calls=%d", calls)
+	}
+}
+
 func TestSystemPoolWaiterReceivesCloseError(t *testing.T) {
 	p := newSystemPool(2, time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())

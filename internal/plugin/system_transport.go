@@ -39,6 +39,9 @@ func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, r
 			if err := decodeStrictV2(f.HostCall, &call); err != nil {
 				return systemRunnerReply{}, err
 			}
+			if call.ID != "" && call.ID != f.HostCallID {
+				return systemRunnerReply{}, fmt.Errorf("host call id mismatch")
+			}
 			resp := host(call)
 			out := stdioJSONV2Frame{Protocol: 2, Kind: "host_response", Generation: generation, InvocationID: invocation, HostCallID: f.HostCallID}
 			out.HostResponse, _ = json.Marshal(resp)

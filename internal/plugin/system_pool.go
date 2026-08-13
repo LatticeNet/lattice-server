@@ -50,6 +50,8 @@ type poolCheckoutResult struct {
 
 var errSystemPoolClosed = errors.New("system pool closed")
 
+func (p *systemPool) invariantLocked() bool { return p.active == len(p.leased) }
+
 func (p *systemPool) hasTransport() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()

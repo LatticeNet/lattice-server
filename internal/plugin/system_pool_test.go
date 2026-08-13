@@ -100,6 +100,38 @@ func TestSystemPoolGracefulDrainRetiresLeasedWithoutResurrection(t *testing.T) {
 	}
 }
 
+func TestSystemPoolActiveMatchesLeasedAcrossTransitions(t *testing.T) {
+	p := newSystemPool(2, time.Hour)
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	w, err := p.checkout(context.Background(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	if !p.invariantLocked() {
+		t.Fatal("checkout invariant")
+	}
+	p.mu.Unlock()
+	p.release(w, false, time.Now())
+	p.mu.Lock()
+	if !p.invariantLocked() {
+		t.Fatal("release invariant")
+	}
+	p.mu.Unlock()
+	w, err = p.checkout(context.Background(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.poison(w)
+	p.mu.Lock()
+	if !p.invariantLocked() {
+		t.Fatal("poison invariant")
+	}
+	p.mu.Unlock()
+}
+
 func TestSystemPoolWaiterReceivesCloseError(t *testing.T) {
 	p := newSystemPool(2, time.Hour)
 	ctx, cancel := context.WithCancel(context.Background())

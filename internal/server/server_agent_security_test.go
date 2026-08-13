@@ -806,6 +806,42 @@ func TestAgentTaskResultRequiresMatchingLease(t *testing.T) {
 	}
 }
 
+func TestGenericAgentTaskKeepsOneShotLeaseDelivery(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
+	create := doJSON(t, handler, http.MethodPost, "/api/tasks",
+		`{"targets":["`+nodeID+`"],"interpreter":"sh","script":"echo exactly-once"}`, cookies, csrf)
+	create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("task create failed: %d", create.StatusCode)
+	}
+
+	poll := func() []agentTaskView {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/agent/tasks?node_id="+nodeID, nil)
+		req.Header.Set("Authorization", "Bearer "+nodeToken)
+		rec := serveReq(handler, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("task poll failed: %d %s", rec.Code, rec.Body.String())
+		}
+		var tasks []agentTaskView
+		if err := json.NewDecoder(rec.Body).Decode(&tasks); err != nil {
+			t.Fatal(err)
+		}
+		return tasks
+	}
+
+	first := poll()
+	if len(first) != 1 || first[0].LeaseID == "" {
+		t.Fatalf("first lease = %+v", first)
+	}
+	second := poll()
+	if len(second) != 0 {
+		t.Fatalf("generic one-shot lease was redelivered without durable protocol: first=%+v second=%+v", first, second)
+	}
+}
+
 func TestAgentTaskLeaseResponseIsMinimized(t *testing.T) {
 	handler, _ := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)

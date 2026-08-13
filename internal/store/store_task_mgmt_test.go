@@ -139,25 +139,121 @@ func TestLeaseTasksPersistenceFailureDoesNotPublishLiveLease(t *testing.T) {
 	}
 }
 
-func TestLeaseTasksReturnsCommittedLeaseOnPostRenameSyncFailure(t *testing.T) {
+func TestGenericLeasePostRenameSyncFailureStillReturnsOneShotDelivery(t *testing.T) {
 	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CreateTask(model.Task{ID: "task-lease-sync", Targets: []string{"n1"}, Status: model.TaskQueued}); err != nil {
+	if err := s.CreateTask(model.Task{ID: "task-generic-sync", Targets: []string{"n1"}, Status: model.TaskQueued}); err != nil {
 		t.Fatal(err)
 	}
 	s.syncParentDir = func(string) error { return errors.New("forced post-rename sync failure") }
-	leased, err := s.LeaseTasks("n1", 1)
-	if err != nil || len(leased) != 1 || leased[0].LeaseID == "" {
-		t.Fatalf("LeaseTasks() = %+v, %v; want committed lease", leased, err)
-	}
-	stored, _ := s.Task("task-lease-sync")
-	if stored.Status != model.TaskLeased || !taskLeaseMatches(stored, "n1", leased[0].LeaseID) {
-		t.Fatalf("committed lease not published: %+v", stored)
+	deliveries, err := s.LeaseTaskDeliveriesWithApprovalGate("n1", 1, "nft", "apply-ruleset:netguard-v1", true)
+	if err == nil || len(deliveries) != 1 || deliveries[0].DurableResult || deliveries[0].Task.LeaseID == "" {
+		t.Fatalf("generic committed delivery = %+v, %v; want one-shot lease plus visible durability warning", deliveries, err)
 	}
 	if !errors.Is(s.ReadyCheck(), errStoreDurabilityDegraded) {
+		t.Fatalf("generic post-rename sync failure did not degrade readiness: %v", s.ReadyCheck())
+	}
+
+	// The compatibility API preserves the pre-durable-protocol generic
+	// behavior: it returns a committed generic lease instead of stranding it.
+	s2, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.CreateTask(model.Task{ID: "task-generic-compat", Targets: []string{"n1"}, Status: model.TaskQueued}); err != nil {
+		t.Fatal(err)
+	}
+	s2.syncParentDir = func(string) error { return errors.New("forced post-rename sync failure") }
+	tasks, err := s2.LeaseTasks("n1", 1)
+	if err != nil || len(tasks) != 1 || tasks[0].LeaseID == "" {
+		t.Fatalf("generic compatibility lease = %+v, %v; want delivered committed lease", tasks, err)
+	}
+}
+
+func TestLeaseTasksWithholdsCommittedLeaseUntilDirectorySyncIsConfirmed(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := "table inet lattice_guard {}"
+	approval := model.Approval{ID: "approval-lease-sync", NodeID: "n1", Plugin: "nft", Action: "apply-ruleset:netguard-v1", Status: model.ApprovalApproved, Plan: plan}
+	if err := s.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "n1", Managed: true, LastPlanSHA: fmt.Sprintf("%x", sha256.Sum256([]byte(plan)))}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateTask(model.Task{ID: "task-lease-sync", ApprovalID: approval.ID, Targets: []string{"n1"}, Status: model.TaskQueued}); err != nil {
+		t.Fatal(err)
+	}
+	syncFails := true
+	syncCalls := 0
+	s.syncParentDir = func(string) error {
+		syncCalls++
+		if syncFails {
+			return errors.New("forced post-rename sync failure")
+		}
+		return nil
+	}
+	leased, err := s.LeaseTasksWithApprovalGate("n1", 1, "nft", "apply-ruleset:netguard-v1", true)
+	if err == nil || len(leased) != 0 {
+		t.Fatalf("LeaseTasks() = %+v, %v; want uncertain committed lease withheld", leased, err)
+	}
+	stored, _ := s.Task("task-lease-sync")
+	if stored.Status != model.TaskLeased || stored.TargetLeases["n1"].LeaseID == "" {
+		t.Fatalf("committed lease not published: %+v", stored)
+	}
+	wantLease := stored.TargetLeases["n1"].LeaseID
+	if !errors.Is(s.ReadyCheck(), errStoreDurabilityDegraded) {
 		t.Fatalf("post-rename lease sync failure did not degrade readiness: %v", s.ReadyCheck())
+	}
+	syncFails = false
+	redelivered, err := s.LeaseTasksWithApprovalGate("n1", 1, "nft", "apply-ruleset:netguard-v1", true)
+	if err != nil || len(redelivered) != 1 || redelivered[0].LeaseID != wantLease {
+		t.Fatalf("confirmed same-lease redelivery = %+v, %v; want %q", redelivered, err, wantLease)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("parent sync calls = %d, want initial failure plus confirmation", syncCalls)
+	}
+	if err := s.ReadyCheck(); err != nil {
+		t.Fatalf("confirmed lease redelivery left readiness degraded: %v", err)
+	}
+}
+
+func TestLeaseTasksPrioritizesExistingLeaseOverQueuedBacklog(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 13, 8, 0, 0, 0, time.UTC)
+	plan := "table inet lattice_guard { chain input {} }"
+	approval := model.Approval{ID: "approval-existing", NodeID: "n1", Plugin: "nft", Action: "apply-ruleset:netguard-v1", Status: model.ApprovalApproved, Plan: plan}
+	if err := s.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "n1", Managed: true, LastPlanSHA: fmt.Sprintf("%x", sha256.Sum256([]byte(plan)))}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateTask(model.Task{ID: "task-existing", ApprovalID: approval.ID, Targets: []string{"n1"}, Status: model.TaskQueued, CreatedAt: base}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.LeaseTasksWithApprovalGate("n1", 1, "nft", "apply-ruleset:netguard-v1", true)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("initial lease = %+v, %v", first, err)
+	}
+	for i := 0; i < 8; i++ {
+		if err := s.CreateTask(model.Task{
+			ID: fmt.Sprintf("task-queued-%d", i), Targets: []string{"n1"}, Status: model.TaskQueued,
+			CreatedAt: base.Add(time.Duration(i+1) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	redelivered, err := s.LeaseTasksWithApprovalGate("n1", 1, "nft", "apply-ruleset:netguard-v1", true)
+	if err != nil || len(redelivered) != 1 || redelivered[0].ID != first[0].ID || redelivered[0].LeaseID != first[0].LeaseID {
+		t.Fatalf("backlog displaced existing lease: first=%+v redelivered=%+v err=%v", first, redelivered, err)
 	}
 }
 
@@ -318,7 +414,7 @@ func TestTaskFanoutLeasesEveryTargetAndAggregatesStatus(t *testing.T) {
 		t.Fatalf("per-node leases not distinct: n1=%q n2=%q", n1[0].LeaseID, n2[0].LeaseID)
 	}
 	if dup, err := s.LeaseTasks("n1", 3); err != nil || len(dup) != 0 {
-		t.Fatalf("duplicate lease n1 got len=%d err=%v", len(dup), err)
+		t.Fatalf("generic fanout lease redelivered without durable protocol: %+v err=%v", dup, err)
 	}
 
 	now := time.Now().UTC()
@@ -502,5 +598,80 @@ func TestCompleteNetGuardTaskResultPublishesCommittedStateOnPostRenameSyncFailur
 	}
 	if !errors.Is(s.ReadyCheck(), errStoreDurabilityDegraded) {
 		t.Fatalf("post-rename sync failure did not degrade readiness: %v", s.ReadyCheck())
+	}
+	confirmCalls := 0
+	s.syncParentDir = func(string) error {
+		confirmCalls++
+		return nil
+	}
+	if err := s.ConfirmDurability(); err != nil {
+		t.Fatalf("confirm committed result durability: %v", err)
+	}
+	if confirmCalls != 1 {
+		t.Fatalf("confirmation sync calls = %d, want 1", confirmCalls)
+	}
+	if err := s.ReadyCheck(); err != nil {
+		t.Fatalf("confirmed result durability left readiness degraded: %v", err)
+	}
+}
+
+func TestConfirmTaskResultReplayRequiresExactResultAndDurability(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{
+		ID: "approval-replay-sync", NodeID: "n1", Plugin: "nft", Action: "apply-ruleset:netguard-v1",
+		Status: model.ApprovalApproved, Plan: "table inet lattice_guard {}",
+	}
+	if err := s.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := s.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "n1", Managed: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateTask(model.Task{ID: "task-replay-sync", ApprovalID: approval.ID, Targets: []string{"n1"}}); err != nil {
+		t.Fatal(err)
+	}
+	leased, err := s.LeaseTasks("n1", 1)
+	if err != nil || len(leased) != 1 {
+		t.Fatalf("lease = %+v, %v", leased, err)
+	}
+	result := model.TaskResult{
+		TaskID: leased[0].ID, NodeID: "n1", LeaseID: leased[0].LeaseID, ExitCode: 0,
+		Stdout: "exact", StartedAt: time.Date(2026, 8, 13, 8, 1, 0, 0, time.UTC),
+		FinishedAt: time.Date(2026, 8, 13, 8, 1, 1, 0, time.UTC),
+	}
+	approval.Status = model.ApprovalApplied
+	binding.AppliedTableSHA = strings.Repeat("a", 64)
+	syncFails := true
+	s.syncParentDir = func(string) error {
+		if syncFails {
+			return errors.New("forced post-rename sync failure")
+		}
+		return nil
+	}
+	committed, err := s.CompleteNetGuardTaskResult(result, approval, binding)
+	if !committed || err == nil {
+		t.Fatalf("complete outcome = committed %v, err %v", committed, err)
+	}
+	if matches, found, err := s.ConfirmTaskResultReplay(result); !found || matches || err == nil {
+		t.Fatalf("uncertain replay = matches %v, found %v, err %v", matches, found, err)
+	}
+	conflict := result
+	conflict.Stdout = "changed"
+	if matches, found, err := s.ConfirmTaskResultReplay(conflict); !found || matches || err != nil {
+		t.Fatalf("conflicting replay = matches %v, found %v, err %v", matches, found, err)
+	}
+	if !errors.Is(s.ReadyCheck(), errStoreDurabilityDegraded) {
+		t.Fatalf("conflict improperly cleared durability degradation: %v", s.ReadyCheck())
+	}
+	syncFails = false
+	if matches, found, err := s.ConfirmTaskResultReplay(result); !found || !matches || err != nil {
+		t.Fatalf("confirmed exact replay = matches %v, found %v, err %v", matches, found, err)
+	}
+	if err := s.ReadyCheck(); err != nil {
+		t.Fatalf("exact replay did not restore readiness: %v", err)
 	}
 }

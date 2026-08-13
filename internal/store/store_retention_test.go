@@ -44,17 +44,30 @@ func TestTaskResultReceiptSurvivesDisplayHistoryPruning(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.CreateTask(model.Task{
-		ID: "task-replay", Targets: []string{"node-a"}, Status: model.TaskLeased,
+		ID: "task-replay", ApprovalID: "approval-replay", Targets: []string{"node-a"}, Status: model.TaskLeased,
 		TargetLeases: map[string]model.TaskLease{"node-a": {LeaseID: "lease-a"}},
 	}); err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{
+		ID: "approval-replay", NodeID: "node-a", Plugin: "nft", Action: "apply-ruleset:netguard-v1",
+		Status: model.ApprovalApproved, Plan: "table inet lattice_guard {}",
+	}
+	if err := s.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := s.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "node-a", Managed: true})
+	if err != nil {
 		t.Fatal(err)
 	}
 	result := model.TaskResult{
 		TaskID: "task-replay", NodeID: "node-a", LeaseID: "lease-a", ExitCode: 0,
 		Stdout: "applied", StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC(),
 	}
-	if err := s.AddTaskResult(result); err != nil {
-		t.Fatal(err)
+	approval.Status = model.ApprovalApplied
+	binding.AppliedTableSHA = strings.Repeat("a", 64)
+	if committed, err := s.CompleteNetGuardTaskResult(result, approval, binding); !committed || err != nil {
+		t.Fatalf("complete NetGuard result = committed %v, err %v", committed, err)
 	}
 	s.mu.Lock()
 	s.state.Results = make([]model.TaskResult, maxTaskResults)

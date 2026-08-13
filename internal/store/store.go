@@ -734,6 +734,43 @@ func (s *Store) ReadyCheck() error {
 	return nil
 }
 
+// ConfirmDurability retries the parent-directory synchronization after a
+// committed atomic rename whose directory fsync was not confirmed. Callers use
+// it before acknowledging a durable protocol transition (for example a lease
+// delivery or terminal task-result receipt). A successful retry proves that the
+// current state-file directory entry is stable; it does not rewrite state.
+func (s *Store) ConfirmDurability() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.confirmDurabilityLocked()
+}
+
+func (s *Store) confirmDurabilityLocked() error {
+	if !s.durabilityDegraded {
+		return nil
+	}
+	if s.path == "" {
+		s.durabilityDegraded = false
+		return nil
+	}
+	info, err := os.Stat(s.path)
+	if err != nil {
+		return fmt.Errorf("confirm state durability: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("confirm state durability: state path is not a regular file: %s", s.path)
+	}
+	syncParentDir := s.syncParentDir
+	if syncParentDir == nil {
+		syncParentDir = syncDir
+	}
+	if err := syncParentDir(filepath.Dir(s.path)); err != nil {
+		return fmt.Errorf("confirm state durability: %w", err)
+	}
+	s.durabilityDegraded = false
+	return nil
+}
+
 // syncedAtomicWrite writes data to a temp file, fsyncs the file, atomically
 // renames it into place, then fsyncs the parent directory so the rename is
 // durable. Plain WriteFile+Rename makes the *name* atomic but leaves a crash
@@ -1249,70 +1286,181 @@ func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 	return s.LeaseTasksWithApprovalGate(nodeID, limit, "", "", true)
 }
 
+// TaskDelivery carries protocol metadata decided under the same store lock as
+// the lease. DurableResult is true only for the exact gated NetGuard action.
+type TaskDelivery struct {
+	Task          model.Task
+	DurableResult bool
+}
+
 // LeaseTasksWithApprovalGate leases the same task set as LeaseTasks while
 // gating one exact approval plugin/action pair. The approval lookup, current
 // guard-plan-anchor check, and lease mutation share s.mu, so neither a
 // capability downgrade nor dependency invalidation can slip through a
 // server-side check-to-lease race. Empty plugin/action disables the gate.
 func (s *Store) LeaseTasksWithApprovalGate(nodeID string, limit int, plugin, action string, allowed bool) ([]model.Task, error) {
+	deliveries, err := s.LeaseTaskDeliveriesWithApprovalGate(nodeID, limit, plugin, action, allowed)
+	if err != nil && !onlyGenericTaskDeliveries(deliveries) {
+		return nil, err
+	}
+	tasks := make([]model.Task, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		tasks = append(tasks, delivery.Task)
+	}
+	return tasks, nil
+}
+
+func onlyGenericTaskDeliveries(deliveries []TaskDelivery) bool {
+	if len(deliveries) == 0 {
+		return false
+	}
+	for _, delivery := range deliveries {
+		if delivery.DurableResult {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, plugin, action string, allowed bool) ([]TaskDelivery, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
-	out := []model.Task{}
+	out := []TaskDelivery{}
+	stateChanged := false
 	staged := s.state
 	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks))
 	for id, task := range s.state.Tasks {
 		staged.Tasks[id] = task
 	}
-	for id, t := range staged.Tasks {
+	ids := make([]string, 0, len(staged.Tasks))
+	for id := range staged.Tasks {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := staged.Tasks[ids[i]], staged.Tasks[ids[j]]
+		if a.CreatedAt.Equal(b.CreatedAt) {
+			return a.ID < b.ID
+		}
+		return a.CreatedAt.Before(b.CreatedAt)
+	})
+	gated := func(t model.Task) (isGated, eligible bool) {
+		if plugin == "" || action == "" || t.ApprovalID == "" {
+			return false, true
+		}
+		approval, ok := s.state.Approvals[t.ApprovalID]
+		if !ok {
+			return false, false
+		}
+		if approval.Plugin != plugin || approval.Action != action {
+			return false, true
+		}
+		binding, bindingOK := s.state.GuardBindings[nodeID]
+		planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+		return true, allowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID && bindingOK && strings.EqualFold(binding.LastPlanSHA, planSHA)
+	}
+
+	// Only the explicitly gated NetGuard action opts into durable same-lease
+	// redelivery. Its agent lease response carries durable_result=true and is
+	// journaled before host execution; heterogeneous legacy tasks keep their
+	// historical one-shot delivery/reconciliation behavior.
+	for _, id := range ids {
 		if len(out) >= limit {
 			break
 		}
-		if !taskCanLeaseTarget(t, nodeID, s.state.Results) {
+		t := staged.Tasks[id]
+		isGated, current := gated(t)
+		if !isGated || !current || !taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts) {
 			continue
 		}
-		if plugin != "" && action != "" && t.ApprovalID != "" {
-			approval, ok := s.state.Approvals[t.ApprovalID]
-			if !ok {
-				continue
-			}
-			if approval.Plugin == plugin && approval.Action == action {
-				binding, bindingOK := s.state.GuardBindings[nodeID]
-				planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
-				if !allowed || approval.Status != model.ApprovalApproved || approval.NodeID != nodeID || !bindingOK || !strings.EqualFold(binding.LastPlanSHA, planSHA) {
-					continue
-				}
-			}
+		// A lease is a durable delivery token, not a one-shot HTTP response. If
+		// the previous GET response was lost after the lease commit, redeliver the
+		// exact same lease. The agent journals (task, lease) idempotently before it
+		// can execute, so this closes the lost-response hole without creating a
+		// second execution authority.
+		if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
+			redelivered := t
+			redelivered.Status = model.TaskLeased
+			redelivered.LeaseID = lease.LeaseID
+			redelivered.LeasedBy = nodeID
+			redelivered.StartedAt = lease.StartedAt
+			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true})
+			continue
 		}
-		leaseSecret, err := auth.NewRandomToken(24)
-		if err != nil {
+		if t.LeasedBy == nodeID && t.LeaseID != "" {
+			redelivered := t
+			redelivered.Status = model.TaskLeased
+			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true})
+			continue
+		}
+	}
+	if len(out) > 0 {
+		if err := s.confirmDurabilityLocked(); err != nil {
 			return nil, err
 		}
-		leaseID := "lease_" + leaseSecret
-		if t.TargetLeases == nil {
-			t.TargetLeases = map[string]model.TaskLease{}
-		} else {
-			leases := make(map[string]model.TaskLease, len(t.TargetLeases)+1)
-			for target, lease := range t.TargetLeases {
-				leases[target] = lease
+		return out, nil
+	}
+
+	// Fresh batches are protocol-homogeneous. Prefer durable NetGuard work; if
+	// none is eligible, lease generic one-shot tasks. This lets the caller handle
+	// a post-rename directory-sync error without either exposing an unconfirmed
+	// NetGuard lease or stranding an unredeliverable generic lease.
+	leaseFresh := func(wantGated bool) error {
+		for _, id := range ids {
+			if len(out) >= limit {
+				break
 			}
-			t.TargetLeases = leases
+			t := staged.Tasks[id]
+			isGated, current := gated(t)
+			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results) {
+				continue
+			}
+			leaseSecret, err := auth.NewRandomToken(24)
+			if err != nil {
+				return err
+			}
+			leaseID := "lease_" + leaseSecret
+			if t.TargetLeases == nil {
+				t.TargetLeases = map[string]model.TaskLease{}
+			} else {
+				leases := make(map[string]model.TaskLease, len(t.TargetLeases)+1)
+				for target, lease := range t.TargetLeases {
+					leases[target] = lease
+				}
+				t.TargetLeases = leases
+			}
+			t.TargetLeases[nodeID] = model.TaskLease{LeaseID: leaseID, StartedAt: now}
+			t.Status = model.TaskLeased
+			t.LeasedBy = nodeID
+			t.LeaseID = leaseID
+			if t.StartedAt.IsZero() {
+				t.StartedAt = now
+			}
+			staged.Tasks[id] = t
+			stateChanged = true
+			leased := t
+			leased.LeaseID = leaseID
+			leased.LeasedBy = nodeID
+			leased.StartedAt = now
+			out = append(out, TaskDelivery{Task: leased, DurableResult: isGated})
 		}
-		t.TargetLeases[nodeID] = model.TaskLease{LeaseID: leaseID, StartedAt: now}
-		t.Status = model.TaskLeased
-		t.LeasedBy = nodeID
-		t.LeaseID = leaseID
-		if t.StartedAt.IsZero() {
-			t.StartedAt = now
-		}
-		staged.Tasks[id] = t
-		leased := t
-		leased.LeaseID = leaseID
-		leased.LeasedBy = nodeID
-		leased.StartedAt = now
-		out = append(out, leased)
+		return nil
+	}
+	if err := leaseFresh(true); err != nil {
+		return nil, err
 	}
 	if len(out) == 0 {
+		if err := leaseFresh(false); err != nil {
+			return nil, err
+		}
+	}
+	if len(out) == 0 {
+		return out, nil
+	}
+	if !stateChanged {
+		if err := s.confirmDurabilityLocked(); err != nil {
+			return nil, err
+		}
 		return out, nil
 	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
@@ -1320,10 +1468,18 @@ func (s *Store) LeaseTasksWithApprovalGate(nodeID string, limit int, plugin, act
 		return nil, err
 	}
 	s.state = staged
-	// The rename committed the leases and persistState already degraded
-	// readiness when only the parent-directory fsync failed. Deliver those exact
-	// leases instead of returning 500 and stranding them before the agent sees
-	// their IDs.
+	if err != nil {
+		if onlyGenericTaskDeliveries(out) {
+			// Generic tasks intentionally retain the historical one-shot protocol:
+			// return the committed lease despite the directory-sync warning so it is
+			// not permanently stranded. The HTTP layer logs this degraded outcome;
+			// ReadyCheck remains failed until durability is later confirmed.
+			return out, err
+		}
+		// Durable NetGuard leases remain live for same-lease redelivery, but the
+		// server must not expose them until a later poll confirms the parent dir.
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -1344,11 +1500,6 @@ func (s *Store) AddTaskResult(r model.TaskResult) error {
 	if t, ok := staged.Tasks[r.TaskID]; ok {
 		t.Status, t.FinishedAt = taskAggregateStatus(t, staged.Results)
 		staged.Tasks[t.ID] = t
-	}
-	staged.TaskResultReceipts = cloneTaskResultReceipts(s.state.TaskResultReceipts)
-	if _, taskExists := staged.Tasks[r.TaskID]; taskExists && r.NodeID != "" && r.LeaseID != "" {
-		receipt := taskResultReceipt(r)
-		staged.TaskResultReceipts[taskResultReceiptKey(r.TaskID, r.NodeID)] = receipt
 	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
@@ -1463,12 +1614,23 @@ func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult)
 	if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
 		return false
 	}
-	// Backward-compatible single-lease tasks created before TargetLeases
-	// existed must not be handed to the same node twice.
 	if t.LeasedBy == nodeID && t.LeaseID != "" {
 		return false
 	}
 	return true
+}
+
+func taskTargetAwaitingResult(t model.Task, nodeID string, results []model.TaskResult, receipts map[string]TaskResultReceipt) bool {
+	if !contains(t.Targets, nodeID) || (t.Status != model.TaskQueued && t.Status != model.TaskLeased) {
+		return false
+	}
+	for _, result := range results {
+		if result.TaskID == t.ID && result.NodeID == nodeID {
+			return false
+		}
+	}
+	_, complete := receipts[taskResultReceiptKey(t.ID, nodeID)]
+	return !complete
 }
 
 func taskAggregateStatus(t model.Task, results []model.TaskResult) (string, time.Time) {
@@ -1525,10 +1687,9 @@ func (s *Store) Results() []model.TaskResult {
 	return out
 }
 
-// TaskResult returns the recorded terminal result for one task target. Task
-// results are idempotent by (task,node): an agent may retry the same durable
-// outbox entry after losing the HTTP acknowledgement without executing the
-// task again.
+// TaskResult returns the latest recorded terminal result for one task target.
+// Durable NetGuard replay uses TaskResultReceipts instead of this bounded
+// display history.
 func (s *Store) TaskResult(taskID, nodeID string) (model.TaskResult, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1541,8 +1702,8 @@ func (s *Store) TaskResult(taskID, nodeID string) (model.TaskResult, bool) {
 	return model.TaskResult{}, false
 }
 
-// TaskResultReceiptMatches reports whether a durable replay receipt exists and
-// whether the supplied lease/result exactly matches it.
+// TaskResultReceiptMatches reports whether a durable NetGuard replay receipt
+// exists and whether the supplied lease/result exactly matches it.
 func (s *Store) TaskResultReceiptMatches(r model.TaskResult) (matches, found bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1555,6 +1716,30 @@ func (s *Store) TaskResultReceiptMatches(r model.TaskResult) (matches, found boo
 	}
 	candidate := taskResultReceipt(r)
 	return receipt.LeaseID == candidate.LeaseID && receipt.Digest == candidate.Digest, true
+}
+
+// ConfirmTaskResultReplay atomically classifies an agent result replay and, on
+// an exact match, confirms the state-file directory durability before the HTTP
+// layer may acknowledge it. Receipt matching survives display-history pruning;
+// generic task results intentionally remain outside this protocol.
+func (s *Store) ConfirmTaskResultReplay(r model.TaskResult) (matches, found bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	receipt, ok := s.state.TaskResultReceipts[taskResultReceiptKey(r.TaskID, r.NodeID)]
+	if !ok {
+		return false, false, nil
+	}
+	if _, taskExists := s.state.Tasks[r.TaskID]; !taskExists {
+		return false, false, nil
+	}
+	candidate := taskResultReceipt(r)
+	if receipt.LeaseID != candidate.LeaseID || receipt.Digest != candidate.Digest {
+		return false, true, nil
+	}
+	if err := s.confirmDurabilityLocked(); err != nil {
+		return false, true, err
+	}
+	return true, true, nil
 }
 
 func taskResultReceipt(r model.TaskResult) TaskResultReceipt {

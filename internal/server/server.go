@@ -5564,7 +5564,13 @@ func (e *approvalDecisionError) Error() string { return e.err.Error() }
 func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval model.Approval, queueApply bool, planSHA256 string) (model.Approval, error) {
 	if approval.Status != model.ApprovalPending {
 		// Already-decided approvals stay idempotent, matching the manual
-		// endpoint's retry semantics.
+		// endpoint's retry semantics. A previous transition may have crossed the
+		// rename commit point without confirming the parent directory; never turn
+		// that uncertain outcome into a success response until durability is
+		// explicitly re-confirmed.
+		if err := s.store.ConfirmDurability(); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+		}
 		return approval, nil
 	}
 	if approvalRequiresPlanHash(approval) && planSHA256 == "" {
@@ -5711,6 +5717,7 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		if committed {
 			if err != nil {
 				s.logger.Printf("netguard approval and task committed with degraded durability: %v", err)
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 			}
 		} else if errors.Is(err, store.ErrGuardVersionConflict) || errors.Is(err, store.ErrTaskTransitionConflict) {
 			return approval, &approvalDecisionError{
@@ -6050,19 +6057,38 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	// last heartbeat capability from server memory. The store still applies the
 	// approval and current plan-anchor checks atomically with the lease mutation.
 	netGuardCapable := requestHasAgentCapability(r, netGuardManagedSHACapability)
-	tasks, err := s.store.LeaseTasksWithApprovalGate(
+	deliveries, err := s.store.LeaseTaskDeliveriesWithApprovalGate(
 		nodeID, 3, "nft", netGuardApprovalAction,
 		netGuardCapable,
 	)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		if !onlyGenericAgentTaskDeliveries(deliveries) {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		// Generic tasks have no same-lease durable redelivery protocol. Preserve
+		// their historical one-shot response after the rename commit so a parent
+		// fsync warning cannot strand them; readiness remains degraded and the
+		// warning is explicit in server logs.
+		s.logger.Printf("generic task leases committed with degraded durability and delivered one-shot: %v", err)
 	}
-	views := make([]agentTaskView, 0, len(tasks))
-	for _, task := range tasks {
-		views = append(views, toAgentTaskView(task))
+	views := make([]agentTaskView, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		views = append(views, toAgentTaskView(delivery.Task, delivery.DurableResult))
 	}
 	writeJSON(w, http.StatusOK, views)
+}
+
+func onlyGenericAgentTaskDeliveries(deliveries []store.TaskDelivery) bool {
+	if len(deliveries) == 0 {
+		return false
+	}
+	for _, delivery := range deliveries {
+		if delivery.DurableResult {
+			return false
+		}
+	}
+	return true
 }
 
 func requestHasAgentCapability(r *http.Request, capability string) bool {
@@ -6077,22 +6103,24 @@ func requestHasAgentCapability(r *http.Request, capability string) bool {
 }
 
 type agentTaskView struct {
-	ID          string `json:"id"`
-	LeaseID     string `json:"lease_id"`
-	Interpreter string `json:"interpreter"`
-	Script      string `json:"script"`
-	TimeoutSec  int    `json:"timeout_sec"`
-	OutputLimit int    `json:"output_limit"`
+	ID            string `json:"id"`
+	LeaseID       string `json:"lease_id"`
+	Interpreter   string `json:"interpreter"`
+	Script        string `json:"script"`
+	TimeoutSec    int    `json:"timeout_sec"`
+	OutputLimit   int    `json:"output_limit"`
+	DurableResult bool   `json:"durable_result,omitempty"`
 }
 
-func toAgentTaskView(t model.Task) agentTaskView {
+func toAgentTaskView(t model.Task, durableResult bool) agentTaskView {
 	return agentTaskView{
-		ID:          t.ID,
-		LeaseID:     t.LeaseID,
-		Interpreter: t.Interpreter,
-		Script:      t.Script,
-		TimeoutSec:  t.TimeoutSec,
-		OutputLimit: t.OutputLimit,
+		ID:            t.ID,
+		LeaseID:       t.LeaseID,
+		Interpreter:   t.Interpreter,
+		Script:        t.Script,
+		TimeoutSec:    t.TimeoutSec,
+		OutputLimit:   t.OutputLimit,
+		DurableResult: durableResult,
 	}
 }
 
@@ -6109,26 +6137,31 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Result.NodeID = req.NodeID
-	if stored, ok := s.store.TaskResult(req.Result.TaskID, req.NodeID); ok {
-		// The agent keeps a durable result outbox and may legitimately retry after
-		// the server committed the transition but the HTTP response was lost. Only
-		// acknowledge the identical lease/result; a different replay remains a
-		// conflict instead of silently replacing history.
-		task, taskOK := s.store.Task(req.Result.TaskID)
-		if taskOK && taskResultReplayLeaseMatches(task, req.NodeID, req.Result.LeaseID) && sameTaskResult(stored, req.Result) {
-			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-			return
-		}
-		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "task result conflicts with the recorded terminal result"))
+	task, taskOK := s.store.Task(req.Result.TaskID)
+	approval, netGuardResult := s.store.Approval(task.ApprovalID)
+	netGuardResult = taskOK && netGuardResult && isNetGuardApproval(approval)
+	if netGuardResult && req.Result.FinishedAt.IsZero() {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "netguard task result finished_at is required for durable replay identity"))
 		return
 	}
-	if matches, found := s.store.TaskResultReceiptMatches(req.Result); found {
-		if matches {
+	// Only NetGuard opts into the durable replay protocol: its task, approval,
+	// binding and receipt are one atomic store transition. Generic task follow-up
+	// handlers remain outside this protocol because they are heterogeneous and
+	// not all crash-idempotent.
+	if netGuardResult {
+		matches, found, err := s.store.ConfirmTaskResultReplay(req.Result)
+		if found {
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			if !matches {
+				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "task result conflicts with the recorded terminal result"))
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 			return
 		}
-		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "task result conflicts with the recorded terminal result"))
-		return
 	}
 	if !s.requireTaskLease(w, r, req.NodeID, req.Result) {
 		return
@@ -6145,15 +6178,11 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	task, ok := s.store.Task(req.Result.TaskID)
-	if !ok {
+	if !taskOK {
 		writeError(w, http.StatusForbidden, apiError(model.APIErrorInvalidTaskLease, "invalid task lease"))
 		return
 	}
-	if req.Result.FinishedAt.IsZero() {
-		req.Result.FinishedAt = time.Now().UTC()
-	}
-	if approval, ok := s.store.Approval(task.ApprovalID); ok && isNetGuardApproval(approval) {
+	if netGuardResult {
 		if err := s.handleNetGuardTaskResult(r, approval, task, req.Result); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, store.ErrTaskNotFound) || errors.Is(err, store.ErrTaskLeaseMismatch) {
@@ -6172,6 +6201,9 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
+	if req.Result.FinishedAt.IsZero() {
+		req.Result.FinishedAt = time.Now().UTC()
+	}
 	if err := s.store.AddTaskResult(req.Result); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -6182,23 +6214,6 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 	s.handleSingBoxProbeTaskResult(r, task, req.Result)
 	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "task.result", Decision: "allow", Metadata: map[string]string{"task_id": req.Result.TaskID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func taskResultReplayLeaseMatches(task model.Task, nodeID, leaseID string) bool {
-	if leaseID == "" {
-		return false
-	}
-	if lease, ok := task.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
-		return lease.LeaseID == leaseID
-	}
-	return task.LeasedBy == nodeID && task.LeaseID == leaseID
-}
-
-func sameTaskResult(stored, retried model.TaskResult) bool {
-	return stored.TaskID == retried.TaskID && stored.NodeID == retried.NodeID &&
-		stored.ExitCode == retried.ExitCode && stored.Stdout == retried.Stdout &&
-		stored.Stderr == retried.Stderr && stored.Error == retried.Error &&
-		stored.StartedAt.Equal(retried.StartedAt) && stored.FinishedAt.Equal(retried.FinishedAt)
 }
 
 func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, result model.TaskResult) error {

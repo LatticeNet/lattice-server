@@ -51,6 +51,7 @@ type LineChainDefinition struct {
 	ApprovalID                 string    `json:"approval_id"`
 	TaskID                     string    `json:"task_id,omitempty"`
 	ActorID                    string    `json:"actor_id,omitempty"`
+	TokenID                    string    `json:"token_id,omitempty"`
 	AuditTargetLineUUID        string    `json:"audit_target_line_uuid,omitempty"`
 	Status                     string    `json:"status"`
 	DriftCode                  string    `json:"drift_code,omitempty"`
@@ -536,7 +537,8 @@ func (s *Store) completeLineChainTaskResultLocked(r model.TaskResult, approval m
 		definition := attempt.CandidateDefinition
 		definition.ApprovalID = approval.ID
 		definition.TaskID = task.ID
-		definition.ActorID = approval.ActorID
+		definition.ActorID = task.ActorID
+		definition.TokenID = task.TokenID
 		definition.AuditTargetLineUUID = definition.TargetLineUUID
 		if definition.AuditTargetLineUUID == "" {
 			definition.AuditTargetLineUUID = s.state.LineChainDefinitions[attempt.SourceLineUUID].TargetLineUUID

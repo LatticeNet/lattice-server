@@ -641,7 +641,7 @@ func TestLineChainCompilerRejectsMissingConsumerCapability(t *testing.T) {
 	}
 }
 
-func TestLineChainFirstLeaseRejectsBoundDependencyMutationsAtomically(t *testing.T) {
+func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*testing.T, *Server, string, string, VpnUser, managedLineDef)
@@ -678,7 +678,27 @@ func TestLineChainFirstLeaseRejectsBoundDependencyMutationsAtomically(t *testing
 		}},
 	}
 	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tc.name+"/approval", func(t *testing.T) {
+			srv, sourceUUID, targetUUID, user, def := seedLineChainFixture(t)
+			compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(t, srv, sourceUUID, targetUUID, user, def)
+			planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+			if _, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA); err == nil {
+				t.Fatal("approval accepted mutated bound dependency")
+			}
+			stored, _ := srv.store.Approval(approval.ID)
+			if len(srv.store.Tasks()) != 0 || srv.store.LineChainSnapshot().Revision != 0 || stored.Status != model.ApprovalPending {
+				t.Fatalf("stale approval mutated queue/graph: approval=%+v tasks=%+v snapshot=%+v", stored, srv.store.Tasks(), srv.store.LineChainSnapshot())
+			}
+		})
+		t.Run(tc.name+"/first_lease", func(t *testing.T) {
 			srv, sourceUUID, targetUUID, user, def := seedLineChainFixture(t)
 			compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
 			if err != nil {
@@ -840,15 +860,17 @@ func TestLineChainPlanRejectsStaleCompiledRevision(t *testing.T) {
 
 func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 	srv, sourceUUID, targetUUID, _, def := seedLineChainFixture(t)
+	planner := principal{Principal: rbac.Principal{ActorID: "planner-a", TokenID: "planner-token"}}
+	approver := principal{Principal: rbac.Principal{ActorID: "approver-b", TokenID: "approver-token"}}
 	apply := func(t *testing.T, compiled lineChainCompiledArtifact) model.Approval {
 		t.Helper()
 		beforeTasks := len(srv.store.Tasks())
-		approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+		approval, err := srv.persistLineChainPlan(planner, compiled)
 		if err != nil {
 			t.Fatal(err)
 		}
 		planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
-		approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+		approval, err = srv.approveApprovalCore(context.Background(), approver, approval, true, planSHA)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -885,6 +907,18 @@ func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 	}
 	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged {
 		t.Fatalf("scheduled observation did not converge set: %+v", got)
+	}
+	for _, event := range srv.store.AuditEvents() {
+		switch event.Action {
+		case "linechain.plan":
+			if event.ActorID != planner.ActorID {
+				t.Fatalf("plan audit actor=%q want %q", event.ActorID, planner.ActorID)
+			}
+		case "linechain.approve", "linechain.apply", "linechain.drift", "linechain.remove":
+			if event.ActorID != approver.ActorID {
+				t.Fatalf("execution audit %s actor=%q want %q", event.Action, event.ActorID, approver.ActorID)
+			}
+		}
 	}
 	metadata, err := srv.renderLineMetadataJSON("node-b")
 	if err != nil || !strings.Contains(string(metadata), targetUUID) {

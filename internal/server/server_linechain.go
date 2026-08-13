@@ -230,7 +230,7 @@ func (s *Server) lineChainTerminalAudit(approval model.Approval, task model.Task
 	} else if status == store.LineChainStatusDrifted {
 		action, reason = "linechain.drift", driftCode
 	}
-	return model.AuditEvent{ID: auditID, At: result.FinishedAt, ActorID: approval.ActorID, TokenID: task.TokenID, NodeID: approval.NodeID,
+	return model.AuditEvent{ID: auditID, At: result.FinishedAt, ActorID: task.ActorID, TokenID: task.TokenID, NodeID: approval.NodeID,
 		Action: action, Scope: "network:apply", Decision: decision, Reason: reason, Metadata: lineChainAuditMetadata(approval, task.ID)}
 }
 
@@ -270,7 +270,7 @@ func lineChainReconciliationAudit(definition store.LineChainDefinition) model.Au
 		metadata["target_line_uuid"] = definition.AuditTargetLineUUID
 	}
 	return model.AuditEvent{ID: lineChainAuditID("observe", definition.ApprovalID, definition.Status+"\x00"+definition.DriftCode), At: definition.UpdatedAt,
-		ActorID: definition.ActorID, NodeID: definition.SourceNodeID, Action: action, Scope: "network:apply", Decision: decision,
+		ActorID: definition.ActorID, TokenID: definition.TokenID, NodeID: definition.SourceNodeID, Action: action, Scope: "network:apply", Decision: decision,
 		Reason: definition.DriftCode, Metadata: metadata}
 }
 

@@ -1444,7 +1444,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		}
 		staged.LineChainAttempts[t.ApprovalID] = attempt
 		failureAudit := lineChainFirstLeaseFailureAudit(approval, t, now, attempt.LastError)
-		if err := stageLineChainAuditEvidence(&staged, s.state, []model.AuditEvent{failureAudit}); err != nil {
+		if err := stageLineChainAuditEvidence(&staged, staged, []model.AuditEvent{failureAudit}); err != nil {
 			lineChainAuditErr = err
 			return
 		}

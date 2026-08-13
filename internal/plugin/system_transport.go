@@ -132,7 +132,9 @@ type systemWorkerTransport struct {
 	scanner   *bufio.Scanner
 	frames    chan transportFrame
 	done      chan struct{}
-	waitDone  chan error
+	waitDone  chan struct{}
+	waitMu    sync.Mutex
+	waitErr   error
 	abortOnce sync.Once
 	abortErr  error
 }
@@ -254,8 +256,8 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 		return nil, err
 	}
 	_ = hostRead.Close()
-	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid, scanner: bufio.NewScanner(out), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan error, 1)}
-	go func() { t.waitDone <- cmd.Wait() }()
+	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid, scanner: bufio.NewScanner(out), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{})}
+	go func() { err := cmd.Wait(); t.waitMu.Lock(); t.waitErr = err; t.waitMu.Unlock(); close(t.waitDone) }()
 	t.scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	go t.readPump()
 	return t, nil
@@ -268,13 +270,18 @@ func (t *systemWorkerTransport) abort() error {
 	t.abortOnce.Do(func() {
 		close(t.done)
 		_ = syscall.Kill(-t.pgid, syscall.SIGTERM)
-		done := make(chan error, 1)
-		done = t.waitDone
+		done := t.waitDone
 		select {
-		case t.abortErr = <-done:
+		case <-done:
+			t.waitMu.Lock()
+			t.abortErr = t.waitErr
+			t.waitMu.Unlock()
 		case <-time.After(100 * time.Millisecond):
 			_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
-			t.abortErr = <-done
+			<-done
+			t.waitMu.Lock()
+			t.abortErr = t.waitErr
+			t.waitMu.Unlock()
 		}
 		t.closePipes()
 	})
@@ -285,5 +292,8 @@ func (t *systemWorkerTransport) wait() error {
 	if t == nil || t.cmd == nil {
 		return nil
 	}
-	return <-t.waitDone
+	<-t.waitDone
+	t.waitMu.Lock()
+	defer t.waitMu.Unlock()
+	return t.waitErr
 }

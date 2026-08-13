@@ -2143,6 +2143,30 @@ func (s *Store) AuditEventByID(id string) (model.AuditEvent, bool) {
 	return model.AuditEvent{}, false
 }
 
+// PendingLineChainAuditEvidence returns transition-owned evidence that has not
+// yet been copied into the ordinary audit sink. Callers use it to repair a
+// committed transition after a lost response or sink failure.
+func (s *Store) PendingLineChainAuditEvidence() []model.AuditEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing := make(map[string]bool, len(s.state.Audit))
+	for _, event := range s.state.Audit {
+		existing[event.ID] = true
+	}
+	ids := make([]string, 0, len(s.state.LineChainAuditEvidence))
+	for id := range s.state.LineChainAuditEvidence {
+		if !existing[id] {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	out := make([]model.AuditEvent, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, s.state.LineChainAuditEvidence[id])
+	}
+	return out
+}
+
 // AuditWALVerify re-reads the append-only audit WAL and validates its hash chain.
 // The second return is false when no WAL is configured (in-memory store).
 func (s *Store) AuditWALVerify() (audit.Result, bool, error) {

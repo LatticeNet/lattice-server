@@ -5671,6 +5671,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 			}
 		}
+		if isLineChainApproval(approval) && approval.Status == model.ApprovalRejected {
+			if err := s.repairLineChainAuditEvidence(); err != nil {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+			}
+		}
 		return approval, nil
 	}
 	if approvalRequiresPlanHash(approval) && planSHA256 == "" {
@@ -5721,6 +5726,9 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 					s.logger.Printf("line chain approval stale transition committed with degraded durability: %v", rejectErr)
 				}
 				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: rejectErr}
+			}
+			if err := s.appendRequiredLineChainAudit(failedAudit); err != nil {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 			}
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
@@ -5968,6 +5976,11 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 			Decision: "deny",
 			Metadata: map[string]string{"approval_id": approval.ID},
 		})
+	} else if isLineChainApproval(approval) && approval.Status == model.ApprovalRejected {
+		if err := s.repairLineChainAuditEvidence(); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
 }
@@ -6235,6 +6248,10 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	netGuardCapable := requestHasAgentCapability(r, netGuardManagedSHACapability)
 	lineChainCapable := requestHasAgentCapability(r, lineChainDurableCapability)
 	deliveries, err := s.store.LeaseTaskDeliveriesWithLineChainValidator(nodeID, 3, netGuardCapable, lineChainCapable, s.validateLineChainFirstLease)
+	if auditErr := s.repairLineChainAuditEvidence(); auditErr != nil {
+		writeError(w, http.StatusInternalServerError, auditErr)
+		return
+	}
 	if err != nil {
 		if !onlyGenericAgentTaskDeliveries(deliveries) {
 			writeError(w, http.StatusInternalServerError, err)

@@ -304,6 +304,15 @@ func (s *Server) appendRequiredLineChainAudit(event model.AuditEvent) error {
 	return err
 }
 
+func (s *Server) repairLineChainAuditEvidence() error {
+	for _, event := range s.store.PendingLineChainAuditEvidence() {
+		if err := s.appendRequiredLineChainAudit(event); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func lineChainAuditMetadata(approval model.Approval, taskID string) map[string]string {
 	metadata := map[string]string{"approval_id": approval.ID, "artifact_sha256": approval.ArtifactDigest}
 	if taskID != "" {

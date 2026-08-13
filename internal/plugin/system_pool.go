@@ -93,6 +93,9 @@ func (p *systemPool) publishTransport(generation uint64, t *systemWorkerTranspor
 	if p.closed || generation != p.generation {
 		return errors.New("stale pool generation")
 	}
+	if len(p.workers)+p.active >= 1+p.maxOverflow {
+		return errors.New("pool capacity exceeded")
+	}
 	p.workers = append(p.workers, &pooledWorker{state: workerIdle, generation: generation, started: now, transport: t})
 	p.wakeLocked()
 	return nil

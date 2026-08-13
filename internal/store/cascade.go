@@ -171,7 +171,7 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		if !sourceGone && !targetGone {
 			continue
 		}
-		if attempt.IssuedLeaseID != "" {
+		if attempt.IssuedLeaseID != "" && attempt.Status != LineChainStatusFailed {
 			preserveApprovals[approvalID] = true
 			preserveTasks[attempt.IssuedTaskID] = true
 			if sourceGone {

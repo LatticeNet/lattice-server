@@ -217,6 +217,9 @@ func (s *Store) ReconcileLineChainsWithAudits(observations map[string]LineChainO
 		if !ok {
 			continue
 		}
+		if definition.Status == LineChainStatusDrifted && stickyLineChainDriftCode(definition.DriftCode) {
+			continue
+		}
 		status, driftCode := LineChainStatusDrifted, "observed_mismatch"
 		if definition.TargetLineUUID == "" {
 			if observation.OutboundTag == "" && observation.DownstreamLineUUID == "" {
@@ -251,6 +254,10 @@ func (s *Store) ReconcileLineChainsWithAudits(observations map[string]LineChainO
 		s.state = staged
 	}
 	return committed, err
+}
+
+func stickyLineChainDriftCode(code string) bool {
+	return code == "inputs_changed" || code == "target_missing" || code == "source_missing"
 }
 
 func validateLineChainAttempt(attempt LineChainAttempt) error {

@@ -460,6 +460,25 @@ func TestDeleteSourceNodeConflictsWithIssuedLineChainLease(t *testing.T) {
 	}
 }
 
+func TestDeleteSourceNodeAfterTerminalFailureDoesNotRetainLeaseConflict(t *testing.T) {
+	s, approval, task, leaseID := seedLineChainCascade(t, true)
+	result := model.TaskResult{TaskID: task.ID, NodeID: "source-node", LeaseID: leaseID, ExitCode: 1, Error: "host failed", FinishedAt: time.Now().UTC()}
+	if committed, err := s.CompleteLineChainTaskResult(result, approval, LineChainStatusAppliedUnobserved, "host_apply_failed", "host failed"); err != nil || !committed {
+		t.Fatalf("complete failure committed=%v err=%v", committed, err)
+	}
+	plan, ok := s.PlanDeleteNode("source-node")
+	if !ok || plan.LineChainLeaseConflicts != 0 || plan.LineChainAttemptsReleased != 1 {
+		t.Fatalf("terminal failure still blocks dry-run: ok=%v plan=%+v", ok, plan)
+	}
+	report, ok, err := s.DeleteNode("source-node")
+	if err != nil || !ok || report.LineChainLeaseConflicts != 0 || report.LineChainAttemptsReleased != 1 {
+		t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+	}
+	if _, found := s.Node("source-node"); found || len(s.LineChainSnapshot().Attempts) != 0 {
+		t.Fatalf("terminal failed source authority survived deletion: %+v", s.LineChainSnapshot())
+	}
+}
+
 func TestDeleteTargetNodePreservesIssuedCandidateAndPromotesTargetMissing(t *testing.T) {
 	s, approval, task, leaseID := seedLineChainCascade(t, true)
 	report, ok, err := s.DeleteNode("target-node")

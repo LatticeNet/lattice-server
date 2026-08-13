@@ -29,7 +29,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	agent := requireE2EFile(t, "LATTICE_AGENT_E2E_BIN")
 	agentTest := requireE2EFile(t, "LATTICE_AGENT_E2E_TEST_BIN")
 	singbox := requireE2EFile(t, "LATTICE_SINGBOX_E2E_BIN")
-	root := t.TempDir()
+	root := strings.TrimSpace(os.Getenv("LATTICE_LINECHAIN_E2E_RUNTIME_ROOT"))
+	if root == "" || !filepath.IsAbs(root) {
+		t.Fatal("LATTICE_LINECHAIN_E2E_RUNTIME_ROOT must be an absolute path")
+	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -46,13 +49,14 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	realityPrivate, realityPublic := lifecycleRealityKeypair(t, singbox)
 
 	srv, sourceUUID, targetUUID, user, target := seedLineChainFixture(t)
-	observer := newLifecycleObserverAtPort(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(aPort)), aPort)
+	observerPort := lifecycleFreePort(t)
+	observer := newLifecycleObserverAtPort(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(aPort)), observerPort)
 	credential, ok := vpnCredentialForProtocol(user.Credentials, model.ProxyProtocolVLESS)
 	if !ok {
 		t.Fatal("managed target credential missing")
 	}
 	target.SNI = "e2e.lattice.invalid"
-	target.Port = aPort
+	target.Port = observerPort
 	target.HandshakeServer = decoyHost
 	target.HandshakePort = decoyPort
 	target.RealityPrivateKey = realityPrivate

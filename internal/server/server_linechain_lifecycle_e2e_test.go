@@ -415,6 +415,18 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if removeRes.StatusCode != http.StatusOK || json.NewDecoder(removeRes.Body).Decode(&removeLeased) != nil || len(removeLeased) != 1 || removeLeased[0].DurableProtocol != store.DurableProtocolLineChainV2 {
 		t.Fatalf("remove lease=%d %+v", removeRes.StatusCode, removeLeased)
 	}
+	removeTaskJSON := filepath.Join(root, "task3.json")
+	removeTaskBytes, _ := json.Marshal(struct {
+		ID, LeaseID, Interpreter, Script string
+		TimeoutSec, OutputLimit          int
+	}{removeLeased[0].ID, removeLeased[0].LeaseID, removeLeased[0].Interpreter, removeLeased[0].Script, removeLeased[0].TimeoutSec, removeLeased[0].OutputLimit})
+	if err := os.WriteFile(removeTaskJSON, removeTaskBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removeBegin := filepath.Join(root, "begin-task3.json")
+	removeBeginCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EBeginHelper$", "--", root)
+	removeBeginCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_TASK_JSON="+removeTaskJSON, "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_BEGIN_RESULT="+removeBegin)
+	_ = runLifecycleAgentHelper(t, removeBeginCmd)
 	removeCmd := exec.Command("sh", "-c", removeLeased[0].Script)
 	removeCmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"), "LATTICE_AGENT_BIN="+agent, "LATTICE_LINECHAIN_TXN_DIR="+txnDir, "LATTICE_LINECHAIN_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+sidecar, "LATTICE_TASK_ID="+removeLeased[0].ID, "LATTICE_TASK_LEASE_ID="+removeLeased[0].LeaseID, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+fmt.Sprintf("%x", sha256.Sum256([]byte(removeLeased[0].Script))))
 	if out, err := removeCmd.CombinedOutput(); err != nil {

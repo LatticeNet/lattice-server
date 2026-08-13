@@ -40,6 +40,7 @@ type systemPool struct {
 	closed      bool
 	replenishFn func(uint64) (*pooledWorker, error)
 	active      int
+	leased      map[*pooledWorker]struct{}
 }
 
 func (p *systemPool) hasTransport() bool {
@@ -64,7 +65,7 @@ func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *sy
 	if len(generations) > 0 && generations[0] != 0 {
 		generation = generations[0]
 	}
-	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1}
+	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1, leased: map[*pooledWorker]struct{}{}}
 }
 
 func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error {
@@ -108,6 +109,7 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 			if w.state == workerIdle && w.generation == p.generation && now.Sub(w.started) < p.maxAge && w.uses < p.maxUses {
 				w.state = workerLeased
 				p.active++
+				p.leased[w] = struct{}{}
 				p.workers = append(p.workers[:i], p.workers[i+1:]...)
 				p.mu.Unlock()
 				return w, nil
@@ -144,6 +146,7 @@ func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 	if p.active > 0 {
 		p.active--
 	}
+	delete(p.leased, w)
 	if resultSeen {
 		w.state = workerResultSeen
 	}

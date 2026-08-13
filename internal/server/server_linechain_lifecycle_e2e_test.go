@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,18 +26,67 @@ import (
 
 func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	agent := requireE2EFile(t, "LATTICE_AGENT_E2E_BIN")
+	agentTest := requireE2EFile(t, "LATTICE_AGENT_E2E_TEST_BIN")
 	singbox := requireE2EFile(t, "LATTICE_SINGBOX_E2E_BIN")
 	root := t.TempDir()
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
 
-	srv, sourceUUID, targetUUID, _, target := seedLineChainFixture(t)
-	// The ordinary fixture uses a shape-valid placeholder. The lifecycle gate
-	// intentionally supplies a real X25519 public key accepted by sing-box.
-	target.RealityPublicKey = "7YEFWE9O8F6l4a9tOj-QQ76Woa3dLj3P393ObtvQ91Q"
+	origin := lifecycleEchoOrigin(t)
+	aPort, bPort, clientPort := lifecycleFreePort(t), lifecycleFreePort(t), lifecycleFreePort(t)
+	decoy := httptest.NewTLSServer(nil)
+	t.Cleanup(decoy.Close)
+	decoyHost, decoyPortText, err := net.SplitHostPort(strings.TrimPrefix(decoy.URL, "https://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoyPort, _ := strconv.Atoi(decoyPortText)
+	realityPrivate, realityPublic := lifecycleRealityKeypair(t, singbox)
+
+	srv, sourceUUID, targetUUID, user, target := seedLineChainFixture(t)
+	observer := newLifecycleObserverAtPort(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(aPort)), target.Port)
+	credential, ok := vpnCredentialForProtocol(user.Credentials, model.ProxyProtocolVLESS)
+	if !ok {
+		t.Fatal("managed target credential missing")
+	}
+	target.SNI = "e2e.lattice.invalid"
+	target.HandshakeServer = decoyHost
+	target.HandshakePort = decoyPort
+	target.RealityPrivateKey = realityPrivate
+	target.RealityPublicKey = realityPublic
+	target.ShortID = "0123456789abcdef"
 	if err := srv.putManagedLineDef(target); err != nil {
 		t.Fatal(err)
+	}
+	nodeA, _ := srv.store.Node("node-a")
+	nodeA.PublicIP = "127.0.0.1"
+	if err := srv.store.UpsertNode(nodeA); err != nil {
+		t.Fatal(err)
+	}
+	seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{Name: target.Tag, Protocol: "vless", Network: "tcp", Address: "127.0.0.1", Port: strconv.Itoa(target.Port), SNI: target.SNI, LineUUID: targetUUID}})
+	_ = srv.buildLineGroups()
+
+	aDir := filepath.Join(root, "a")
+	configDir := filepath.Join(root, "conf")
+	clientDir := filepath.Join(root, "client")
+	txnDir := filepath.Join(root, "txn")
+	sidecar := filepath.Join(root, "lattice-metadata.json")
+	binDir := filepath.Join(root, "bin")
+	for _, dir := range []string{aDir, configDir, clientDir, txnDir, binDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lifecycleWrite(t, filepath.Join(aDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"target-a","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":%q,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"e2e.lattice.invalid","reality":{"enabled":true,"handshake":{"server":%q,"server_port":%d},"private_key":%q,"short_id":["0123456789abcdef"]}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[{"inbound":["target-a"],"outbound":"direct"}]}}`, aPort, credential.UUID, decoyHost, decoyPort, realityPrivate))
+	lifecycleWrite(t, filepath.Join(configDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"source-b","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":"22222222-2222-4222-8222-222222222222"}]}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`, bPort))
+	lifecycleWrite(t, filepath.Join(clientDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"socks","tag":"client","listen":"127.0.0.1","listen_port":%d}],"outbounds":[{"type":"vless","tag":"to-b","server":"127.0.0.1","server_port":%d,"uuid":"22222222-2222-4222-8222-222222222222"}],"route":{"rules":[{"inbound":["client"],"outbound":"to-b"}]}}`, clientPort, bPort))
+	lifecycleStartProcess(t, singbox, root, "a", aDir, aPort)
+	lifecycleStartProcess(t, singbox, root, "b", configDir, bPort)
+	lifecycleStartProcess(t, singbox, root, "client", clientDir, clientPort)
+	lifecycleSOCKSEcho(t, clientPort, origin)
+	if observer.accepted() != 0 {
+		t.Fatal("B traversed A before the server-issued chain was applied")
 	}
 	handler := srv.Handler()
 	httpServer := httptest.NewServer(handler)
@@ -43,6 +94,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	cookies, csrf := loginSession(t, handler)
 
 	planBody := fmt.Sprintf(`{"source_line_uuid":%q,"target_line_uuid":%q}`, sourceUUID, targetUUID)
+	t.Logf("lifecycle source=%s target=%s", sourceUUID, targetUUID)
 	var planned struct {
 		Approval model.Approval `json:"approval"`
 	}
@@ -102,23 +154,12 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatalf("server-issued fragment rejected by official sing-box: %v: %s", err, out)
 	}
 
-	configDir := filepath.Join(root, "conf")
-	txnDir := filepath.Join(root, "txn")
-	sidecar := filepath.Join(root, "lattice-metadata.json")
-	binDir := filepath.Join(root, "bin")
-	for _, dir := range []string{configDir, txnDir, binDir} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(`{"inbounds":[],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(sidecar, []byte(fmt.Sprintf(`{"schema":"lattice.singbox-metadata.v2","unknown_root":{"keep":true},"inbounds":[{"tag":"before","line_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},{"tag":"source-b","line_uuid":%q,"ordinary":"keep"},{"tag":"after","line_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}]}`, sourceUUID)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	systemctl := filepath.Join(binDir, "systemctl")
-	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	systemctlBody := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in\n  restart) exec %q -test.run=^TestLinechainE2ERestartHelper$ -- %q;;\n  is-active) exec %q -test.run=^TestLinechainE2EActiveHelper$ -- %q;;\n  *) exit 2;;\nesac\n", agentTest, root, agentTest, root)
+	if err := os.WriteFile(systemctl, []byte(systemctlBody), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	cmd := exec.Command("sh", "-c", leased[0].Script)
@@ -134,9 +175,27 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		diagnostics, _ := os.ReadFile(checkLog)
 		t.Fatalf("real agent helper failed: %v: %s; sing-box: %s", err, out, diagnostics)
 	}
+	lifecycleKillPIDFile(root, "b")
+	lifecycleStartProcess(t, singbox, root, "b-applied", configDir, bPort)
 	sidecarBytes, _ := os.ReadFile(sidecar)
 	if !bytes.Contains(sidecarBytes, []byte(`"unknown_root":{"keep":true}`)) || !bytes.Contains(sidecarBytes, []byte(`"ordinary":"keep"`)) {
 		t.Fatalf("host fields lost: %s", sidecarBytes)
+	}
+	// The exact leased server document is now live: B's real outbound must
+	// traverse observer -> A -> origin, proving the applied artifact rather
+	// than a separately hand-built client document.
+	lifecycleSOCKSEcho(t, clientPort, origin)
+	if observer.accepted() == 0 {
+		configBytes, _ := os.ReadFile(filepath.Join(configDir, "config.json"))
+		t.Fatalf("server-issued chain produced no B -> observer -> A traffic; config=%s", configBytes)
+	}
+	// Exercise deterministic process-group recovery before reporting the task
+	// result. The recovered B must preserve the applied server-issued config.
+	lifecycleKillPIDFile(root, "b-applied")
+	lifecycleStartProcess(t, singbox, root, "b-recovered", configDir, bPort)
+	lifecycleSOCKSEcho(t, clientPort, origin)
+	if observer.accepted() < 2 {
+		t.Fatal("recovered B did not traverse observer -> A")
 	}
 
 	finished := time.Now().UTC().Format(time.RFC3339Nano)
@@ -246,6 +305,15 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 2 {
 		t.Fatalf("remove promotion/task mismatch: %+v tasks=%d", removed, len(srv.store.Tasks()))
 	}
+	beforeRemoveTraffic := observer.accepted()
+	// The same client path now resolves directly after the server-issued remove;
+	// no additional observer hop is permitted.
+	lifecycleKillPIDFile(root, "b-recovered")
+	lifecycleStartProcess(t, singbox, root, "b-removed", configDir, bPort)
+	lifecycleSOCKSEcho(t, clientPort, origin)
+	if observer.accepted() != beforeRemoveTraffic {
+		t.Fatal("removed chain still traversed observer/A")
+	}
 	observed.Nodes[0].DownstreamLineUUID = ""
 	observed.Nodes[0].OutboundRef = ""
 	observed.At = time.Now().UTC()
@@ -285,6 +353,52 @@ func assertDeclaredE2EEdge(t *testing.T, groups []LineGroup, sourceUUID, targetU
 		len(source.DeclaredJumpEdges) == 1 && source.DeclaredJumpEdges[0] == target.LineHashID
 	if got != want {
 		t.Fatalf("declared edge want=%v source=%+v target=%+v", want, source, target)
+	}
+}
+
+func mergeLifecycleFragmentIntoConfig(t *testing.T, configDir string) {
+	t.Helper()
+	baseRaw, err := os.ReadFile(filepath.Join(configDir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var base map[string]any
+	if err := json.Unmarshal(baseRaw, &base); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := filepath.Glob(filepath.Join(configDir, "lattice-linechain-*.json"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected one server-issued fragment, got %v (%v)", entries, err)
+	}
+	fragmentRaw, err := os.ReadFile(entries[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fragment map[string]any
+	if err := json.Unmarshal(fragmentRaw, &fragment); err != nil {
+		t.Fatal(err)
+	}
+	if existing, ok := base["outbounds"].([]any); ok {
+		if fragmentOutbounds, ok := fragment["outbounds"].([]any); ok && len(fragmentOutbounds) > 0 {
+			if first, ok := fragmentOutbounds[0].(map[string]any); ok {
+				wantTag, _ := first["tag"].(string)
+				for _, item := range existing {
+					if row, ok := item.(map[string]any); ok && row["tag"] == wantTag {
+						return
+					}
+				}
+			}
+		}
+	}
+	for _, key := range []string{"outbounds", "route"} {
+		base[key] = fragment[key]
+	}
+	merged, err := json.Marshal(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), merged, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

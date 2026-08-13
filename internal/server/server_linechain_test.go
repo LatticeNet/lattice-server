@@ -437,6 +437,23 @@ func TestLineChainReconciliationAuditFreezesActionReasonAndTaskMetadata(t *testi
 	}
 }
 
+func TestLineChainReconciliationAuditIDsDistinguishRepeatedStatusCycles(t *testing.T) {
+	base := store.LineChainDefinition{SourceLineUUID: "22222222-2222-4222-8222-222222222222", SourceNodeID: "node-a", ApprovalID: "approval-a", TaskID: "task-a", Status: store.LineChainStatusConverged}
+	first := base
+	first.ObservationRevision = 1
+	drift := base
+	drift.Status, drift.DriftCode, drift.ObservationRevision = store.LineChainStatusDrifted, "observed_mismatch", 2
+	second := base
+	second.ObservationRevision = 3
+	firstAudit, driftAudit, secondAudit := lineChainReconciliationAudit(first), lineChainReconciliationAudit(drift), lineChainReconciliationAudit(second)
+	if firstAudit.ID == driftAudit.ID || driftAudit.ID == secondAudit.ID || firstAudit.ID == secondAudit.ID {
+		t.Fatalf("repeated reconciliation transitions reused audit ids: first=%s drift=%s second=%s", firstAudit.ID, driftAudit.ID, secondAudit.ID)
+	}
+	if retry := lineChainReconciliationAudit(second); !reflect.DeepEqual(secondAudit, retry) {
+		t.Fatalf("same transition is not idempotent: first=%+v retry=%+v", secondAudit, retry)
+	}
+}
+
 func TestLineChainCompilerProducesDeterministicRedactedArtifact(t *testing.T) {
 	srv, sourceUUID, targetUUID, user, def := seedLineChainFixture(t)
 	first, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})

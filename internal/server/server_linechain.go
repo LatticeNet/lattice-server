@@ -389,7 +389,8 @@ func lineChainReconciliationAudit(definition store.LineChainDefinition) model.Au
 	if definition.AuditTargetLineUUID != "" {
 		metadata["target_line_uuid"] = definition.AuditTargetLineUUID
 	}
-	return model.AuditEvent{ID: lineChainAuditID("observe", definition.ApprovalID, definition.Status+"\x00"+definition.DriftCode), At: definition.UpdatedAt,
+	transition := fmt.Sprintf("%d\x00%s\x00%s", definition.ObservationRevision, definition.Status, definition.DriftCode)
+	return model.AuditEvent{ID: lineChainAuditID("observe", definition.ApprovalID, transition), At: definition.UpdatedAt,
 		ActorID: definition.ActorID, TokenID: definition.TokenID, NodeID: definition.SourceNodeID, Action: action, Scope: "network:apply", Decision: decision,
 		Reason: definition.DriftCode, Metadata: metadata}
 }

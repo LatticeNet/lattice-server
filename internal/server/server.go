@@ -5646,6 +5646,21 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		if err := s.store.ConfirmDurability(); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
+		if isLineChainApproval(approval) && approval.Status == model.ApprovalApproved {
+			taskID := ""
+			for _, task := range s.store.Tasks() {
+				if task.ApprovalID == approval.ID {
+					taskID = task.ID
+					break
+				}
+			}
+			if taskID == "" {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: errors.New("approved line chain task is missing")}
+			}
+			if err := s.ensureLineChainApproveAudit(p, approval, taskID); err != nil {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+			}
+		}
 		return approval, nil
 	}
 	if approvalRequiresPlanHash(approval) && planSHA256 == "" {
@@ -5835,6 +5850,10 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			}
 			return approval, &approvalDecisionError{status: status, err: apiError(model.APIErrorApprovalStale, "line chain inputs changed while queueing; re-plan before approving")}
 		}
+		approval, _ = s.store.Approval(approval.ID)
+		if err := s.ensureLineChainApproveAudit(p, approval, task.ID); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+		}
 	} else {
 		if err := s.store.UpsertApproval(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
@@ -5862,7 +5881,9 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			}
 		}
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: approvalDecisionAuditScope(approval), Metadata: map[string]string{"approval_id": approval.ID}})
+	if !isLineChainApproval(approval) {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: approvalDecisionAuditScope(approval), Metadata: map[string]string{"approval_id": approval.ID}})
+	}
 	return approval, nil
 }
 
@@ -6272,6 +6293,12 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "task result conflicts with the recorded terminal result"))
 				return
 			}
+			if lineChainResult {
+				if err := s.ensureLineChainTerminalAudit(approval, task, req.Result); err != nil {
+					writeError(w, http.StatusInternalServerError, err)
+					return
+				}
+			}
 			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 			return
 		}
@@ -6324,6 +6351,10 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 				status = http.StatusConflict
 			}
 			writeError(w, status, err)
+			return
+		}
+		if err := s.ensureLineChainTerminalAudit(approval, task, req.Result); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

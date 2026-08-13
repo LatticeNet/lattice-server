@@ -332,3 +332,28 @@ func TestReconcileLineChainsUsesExactObservedSetAndRemoveEvidence(t *testing.T) 
 		t.Fatalf("unexpected reconciliation: %+v", snapshot)
 	}
 }
+
+func TestAppendAuditIdempotentRepairsDurabilityWithoutDuplicates(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	s.syncParentDir = func(string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("forced sync failure")
+		}
+		return nil
+	}
+	event := model.AuditEvent{ID: "audit_linechain_exact", At: time.Unix(1_700_000_000, 0).UTC(), Action: "linechain.apply", Decision: "allow"}
+	if committed, err := s.AppendAuditIdempotent(event); !committed || err == nil {
+		t.Fatalf("first append committed=%v err=%v", committed, err)
+	}
+	if committed, err := s.AppendAuditIdempotent(event); committed || err != nil {
+		t.Fatalf("retry committed=%v err=%v", committed, err)
+	}
+	if events := s.AuditEvents(); len(events) != 1 || events[0].ID != event.ID {
+		t.Fatalf("audit retry duplicated evidence: %+v", events)
+	}
+}

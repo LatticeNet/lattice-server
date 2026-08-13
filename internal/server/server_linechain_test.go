@@ -185,6 +185,17 @@ func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 	if snapshot.Revision != 1 || snapshot.Attempts[approval.ID].Status != store.LineChainStatusApplying {
 		t.Fatalf("approval/task/reservation not atomic: %+v", snapshot)
 	}
+	actions := map[string]int{}
+	for _, event := range srv.store.AuditEvents() {
+		actions[event.Action]++
+		raw, _ := json.Marshal(event)
+		if strings.Contains(string(raw), "credential-canary") || strings.Contains(string(raw), compiled.FragmentJSON) {
+			t.Fatalf("line-chain audit leaked execution material: %s", raw)
+		}
+	}
+	if actions["linechain.plan"] != 1 || actions["linechain.approve"] != 1 || actions["network.singbox-linechain.approve"] != 0 {
+		t.Fatalf("unexpected approval audit actions: %+v", actions)
+	}
 }
 
 func TestLineChainTaskScriptRevealIsDeniedBeforeStepUp(t *testing.T) {
@@ -257,6 +268,30 @@ func TestLineChainCompilerUsesImmutableCapturedSnapshot(t *testing.T) {
 	}
 }
 
+func TestLineChainCompilerTenThousandProjectedLinesIsPure(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	snapshot, err := srv.captureLineChainCompileSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(snapshot.Lines); i < 10_000; i++ {
+		uuid := fmt.Sprintf("projected-%05d", i)
+		snapshot.Lines[uuid] = []Line{{LineUUID: uuid, NodeID: "scale-node", LineHashID: "hash-" + uuid, Tag: "tag-" + uuid, Status: "ok"}}
+	}
+	before := srv.store.LineChainSnapshot()
+	var compileErr error
+	allocs := testing.AllocsPerRun(3, func() {
+		_, compileErr = srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	})
+	if compileErr != nil {
+		t.Fatal(compileErr)
+	}
+	if after := srv.store.LineChainSnapshot(); !reflect.DeepEqual(before, after) {
+		t.Fatalf("10k compile mutated store: before=%+v after=%+v", before, after)
+	}
+	t.Logf("10k projected-line compile allocations/run: %.0f", allocs)
+}
+
 func TestLineChainTerminalAcceptsIssuedSuccessWhenLiveDescriptorDrifts(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -318,7 +353,55 @@ func TestLineChainTerminalAcceptsIssuedSuccessWhenLiveDescriptorDrifts(t *testin
 			if matches, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
 				t.Fatalf("exact replay matches=%v found=%v err=%v", matches, found, err)
 			}
+			if err := srv.ensureLineChainTerminalAudit(approval, deliveries[0].Task, result); err != nil {
+				t.Fatal(err)
+			}
+			if err := srv.ensureLineChainTerminalAudit(approval, deliveries[0].Task, result); err != nil {
+				t.Fatal(err)
+			}
+			terminalID := lineChainAuditID("terminal", approval.ID, deliveries[0].Task.ID+"\x00"+result.NodeID)
+			event, ok := srv.store.AuditEventByID(terminalID)
+			if !ok || event.Action != "linechain.drift" {
+				t.Fatalf("missing drift audit: %+v ok=%v", event, ok)
+			}
+			count := 0
+			for _, candidate := range srv.store.AuditEvents() {
+				if candidate.ID == terminalID {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("exact replay duplicated terminal audit %d times", count)
+			}
 		})
+	}
+}
+
+func TestLineChainFailedAndRemoveAuditsAreIdempotent(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	base := model.Approval{ID: "approval-audit", NodeID: "node-a", ActorID: "actor", Plugin: lineChainPlugin, Service: lineChainService,
+		Method: lineChainSetMethod, ArtifactDigest: "artifact", Plan: `{"source_line_uuid":"source","target_line_uuid":"target","private":"secret-canary"}`}
+	task := model.Task{ID: "task-audit", TokenID: "token"}
+	failed := model.TaskResult{TaskID: task.ID, NodeID: "node-a", ExitCode: 1, Error: "host failed", FinishedAt: time.Unix(1_700_000_000, 0).UTC()}
+	if err := srv.ensureLineChainTerminalAudit(base, task, failed); err != nil {
+		t.Fatal(err)
+	}
+	remove := base
+	remove.ID, remove.Method = "approval-remove-audit", lineChainRemoveMethod
+	removed := model.TaskResult{TaskID: task.ID, NodeID: "node-a", FinishedAt: time.Unix(1_700_000_001, 0).UTC()}
+	if err := srv.ensureLineChainTerminalAudit(remove, task, removed); err != nil {
+		t.Fatal(err)
+	}
+	actions := map[string]int{}
+	for _, event := range srv.store.AuditEvents() {
+		actions[event.Action]++
+		raw, _ := json.Marshal(event)
+		if strings.Contains(string(raw), "secret-canary") {
+			t.Fatalf("audit leaked approval plan: %s", raw)
+		}
+	}
+	if actions["linechain.failed"] != 1 || actions["linechain.remove"] != 1 {
+		t.Fatalf("missing audit actions: %+v", actions)
 	}
 }
 

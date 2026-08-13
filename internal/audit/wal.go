@@ -122,6 +122,7 @@ type WAL struct {
 	seq        int
 	head       string
 	anchorPath string
+	eventIDs   map[string]struct{}
 }
 
 // OpenWAL opens (creating if needed) the append-only audit WAL at path and
@@ -157,13 +158,57 @@ func openWAL(path, anchorPath string) (*WAL, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &WAL{f: f, seq: res.Count, head: res.Head, anchorPath: anchorPath}, nil
+	eventIDs, err := readWALEventIDs(path)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &WAL{f: f, seq: res.Count, head: res.Head, anchorPath: anchorPath, eventIDs: eventIDs}, nil
+}
+
+func readWALEventIDs(path string) (map[string]struct{}, error) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]struct{}{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	ids := map[string]struct{}{}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		var entry Entry
+		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
+			return nil, err
+		}
+		if entry.Event.ID != "" {
+			ids[entry.Event.ID] = struct{}{}
+		}
+	}
+	return ids, scanner.Err()
 }
 
 // Append writes ev as the next chained record and fsyncs before returning.
 func (w *WAL) Append(ev model.AuditEvent) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.appendLocked(ev)
+}
+
+func (w *WAL) AppendIdempotent(ev model.AuditEvent) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if ev.ID != "" {
+		if _, ok := w.eventIDs[ev.ID]; ok {
+			return false, nil
+		}
+	}
+	return true, w.appendLocked(ev)
+}
+
+func (w *WAL) appendLocked(ev model.AuditEvent) error {
 	if w.f == nil {
 		return errors.New("audit wal is closed")
 	}
@@ -194,6 +239,9 @@ func (w *WAL) Append(ev model.AuditEvent) error {
 		if err := writeAnchor(w.anchorPath, anchorCommitted(seq, hash)); err != nil {
 			return err
 		}
+	}
+	if ev.ID != "" {
+		w.eventIDs[ev.ID] = struct{}{}
 	}
 	return nil
 }

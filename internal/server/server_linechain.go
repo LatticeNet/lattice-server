@@ -246,6 +246,18 @@ func (s *Server) captureLineChainCompileSnapshotFromStateLocked(persistent store
 		}
 	}
 	now := s.now()
+	uuidToHash := make(map[string]string, len(persistent.LineUUIDByHash))
+	for hash, uuid := range persistent.LineUUIDByHash {
+		uuid = strings.ToLower(strings.TrimSpace(uuid))
+		if uuid == "" {
+			continue
+		}
+		if _, exists := uuidToHash[uuid]; exists {
+			uuidToHash[uuid] = ""
+		} else {
+			uuidToHash[uuid] = hash
+		}
+	}
 	for _, inventory := range inventories {
 		if inventory.At.After(snapshot.EvidenceAt) {
 			snapshot.EvidenceAt = inventory.At
@@ -257,15 +269,7 @@ func (s *Server) captureLineChainCompileSnapshotFromStateLocked(persistent store
 			port := atoiSafe(discovered.Port)
 			hashID := stableLineHandle(discovered.LineID)
 			if hashID == "" && validLineUUIDv4(discovered.LineUUID) {
-				matches := []string{}
-				for hash, uuid := range persistent.LineUUIDByHash {
-					if strings.EqualFold(strings.TrimSpace(uuid), strings.TrimSpace(discovered.LineUUID)) {
-						matches = append(matches, hash)
-					}
-				}
-				if len(matches) == 1 {
-					hashID = matches[0]
-				}
+				hashID = uuidToHash[strings.ToLower(strings.TrimSpace(discovered.LineUUID))]
 			}
 			if hashID == "" {
 				hashID = lineHash(inventory.NodeID, model.ProxyCoreSingbox, discovered.Protocol, discovered.ListenHost, port, discovered.Name, discovered.OutboundRef)

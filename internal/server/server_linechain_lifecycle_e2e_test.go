@@ -93,6 +93,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err := srv.store.UpsertNode(nodeA); err != nil {
 		t.Fatal(err)
 	}
+	seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{
+		Name: target.Tag, Protocol: "vless", Network: "tcp", Address: "127.0.0.1",
+		Port: strconv.Itoa(observerPort), SNI: target.SNI, LineUUID: targetUUID,
+	}})
 	_ = srv.buildLineGroups()
 
 	aDir := filepath.Join(root, "a")

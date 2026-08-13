@@ -29,6 +29,11 @@ func runV2Helper() {
 		if json.Unmarshal(s.Bytes(), &f) != nil {
 			os.Exit(3)
 		}
+		if os.Getenv("LATTICE_TEST_V2_NO_READY") == "1" {
+			resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID, Response: json.RawMessage(`{"ok":true,"result":{"once":true}}`)}
+			_ = enc.Encode(resp)
+			continue
+		}
 		resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID}
 		resp.Response = json.RawMessage(`{"ok":true,"result":{"helper":true}}`)
 		if enc.Encode(resp) != nil {

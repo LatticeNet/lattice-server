@@ -138,7 +138,17 @@ func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 	}
 	if p.closed || w.generation != p.generation || w.uses >= p.maxUses || now.Sub(w.started) >= p.maxAge {
 		w.state = workerRetiring
+		if w.transport != nil {
+			_ = w.transport.abort()
+		}
 		w.state = workerDead
+		if p.replenishFn != nil {
+			go func(gen uint64) {
+				if nw, err := p.replenishFn(gen); err == nil && nw != nil {
+					_ = p.publishTransport(gen, nw.transport, time.Now())
+				}
+			}(w.generation)
+		}
 		return
 	}
 	w.state = workerResetting

@@ -202,6 +202,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if raw, err := os.ReadFile(recoveryResult); err != nil || !bytes.Contains(raw, []byte(leased[0].ID)) {
 		t.Fatalf("recovery result missing leased task: err=%v raw=%s", err, raw)
 	}
+	// Recovery is the only authority for the interrupted attempt. Post its
+	// exact non-success result before any inventory or observable traffic.
+	recoveryRaw, _ := os.ReadFile(recoveryResult)
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","result":%s}`, recoveryRaw)))
 	sidecarBytes, _ := os.ReadFile(sidecar)
 	if !bytes.Contains(sidecarBytes, []byte(`"unknown_root":{"keep":true}`)) || !bytes.Contains(sidecarBytes, []byte(`"ordinary":"keep"`)) {
 		t.Fatalf("host fields lost: %s", sidecarBytes)

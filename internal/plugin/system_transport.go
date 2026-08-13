@@ -117,7 +117,6 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 			}
 		}
 	}
-	return systemRunnerReply{}, io.ErrUnexpectedEOF
 }
 
 // systemWorkerTransport owns one persistent worker process and all descriptors.

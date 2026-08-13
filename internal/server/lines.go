@@ -219,6 +219,18 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// known. Newer discovery sources also include listen_host / outbound_ref /
 	// user_count from runtime config inspection; older agents leave them empty
 	// and UserKnown=false.
+	uuidToHash := make(map[string]string)
+	for _, entry := range s.store.KV(lineUUIDKVBucket) {
+		uuid := strings.ToLower(strings.TrimSpace(entry.Value))
+		if uuid == "" {
+			continue
+		}
+		if _, exists := uuidToHash[uuid]; exists {
+			uuidToHash[uuid] = ""
+		} else {
+			uuidToHash[uuid] = entry.Key
+		}
+	}
 	for _, inv := range s.liveSingBoxInventories(s.now()) {
 		for _, n := range inv.Nodes {
 			port, _ := strconv.Atoi(strings.TrimSpace(n.Port))
@@ -261,15 +273,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 			}
 			ln.LineHashID = stableLineHandle(ln.LineID)
 			if ln.LineHashID == "" && validLineUUIDv4(ln.LineUUID) {
-				matches := []string{}
-				for _, entry := range s.store.KV(lineUUIDKVBucket) {
-					if strings.EqualFold(strings.TrimSpace(entry.Value), ln.LineUUID) {
-						matches = append(matches, entry.Key)
-					}
-				}
-				if len(matches) == 1 {
-					ln.LineHashID = matches[0]
-				}
+				ln.LineHashID = uuidToHash[strings.ToLower(strings.TrimSpace(ln.LineUUID))]
 			}
 			if ln.LineHashID == "" {
 				ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)

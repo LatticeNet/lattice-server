@@ -146,6 +146,73 @@ func TestSingBoxDiscoverReportAuditIsThrottledForUnchangedInventory(t *testing.T
 	}
 }
 
+func TestLiveSingBoxInventoriesReleasesInventoryLockBeforeStoreLookup(t *testing.T) {
+	_, _, srv := newSingBoxDiscoverAuditTestServer(t)
+	now := time.Now().UTC()
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = make(map[string]model.SingBoxInventory)
+	srv.singboxInv["node-a"] = model.SingBoxInventory{NodeID: "node-a", At: now, Status: "ok"}
+	srv.singboxInvMu.Unlock()
+
+	lookups := 0
+	got := srv.liveSingBoxInventoriesWithNodeExists(now, func(nodeID string) bool {
+		lookups++
+		if nodeID != "node-a" {
+			t.Fatalf("unexpected lookup %q", nodeID)
+		}
+		if !srv.singboxInvMu.TryLock() {
+			t.Fatal("inventory lock remained held during Store lookup")
+		}
+		srv.singboxInvMu.Unlock()
+		return true
+	})
+	if lookups != 1 || len(got) != 1 || got[0].NodeID != "node-a" {
+		t.Fatalf("lookups=%d inventories=%+v", lookups, got)
+	}
+}
+
+func TestLiveSingBoxInventoriesConcurrentRefreshSurvivesStalePrune(t *testing.T) {
+	_, _, srv := newSingBoxDiscoverAuditTestServer(t)
+	now := time.Now().UTC()
+	stale := model.SingBoxInventory{NodeID: "node-a", At: now.Add(-nodeOfflineThreshold - time.Second), Status: "stale"}
+	fresh := model.SingBoxInventory{NodeID: "node-a", At: now, Status: "ok"}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = make(map[string]model.SingBoxInventory)
+	srv.singboxInv["node-a"] = stale
+	srv.singboxInvMu.Unlock()
+
+	lookupStarted := make(chan struct{})
+	resumeLookup := make(chan struct{})
+	done := make(chan []model.SingBoxInventory, 1)
+	go func() {
+		done <- srv.liveSingBoxInventoriesWithNodeExists(now, func(string) bool {
+			close(lookupStarted)
+			<-resumeLookup
+			return true
+		})
+	}()
+	<-lookupStarted
+	srv.singboxInvMu.Lock()
+	srv.singboxInv["node-a"] = fresh
+	srv.singboxInvMu.Unlock()
+	close(resumeLookup)
+
+	select {
+	case got := <-done:
+		if len(got) != 1 || !got[0].At.Equal(fresh.At) || got[0].Status != fresh.Status {
+			t.Fatalf("concurrent refresh was not returned: %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("inventory pruning deadlocked with a concurrent refresh")
+	}
+	srv.singboxInvMu.RLock()
+	retained, ok := srv.singboxInv["node-a"]
+	srv.singboxInvMu.RUnlock()
+	if !ok || !retained.At.Equal(fresh.At) || retained.Status != fresh.Status {
+		t.Fatalf("concurrent refresh was pruned: %+v ok=%v", retained, ok)
+	}
+}
+
 func newSingBoxDiscoverAuditTestServer(t *testing.T) (http.Handler, *store.Store, *Server) {
 	t.Helper()
 	st, err := store.Open("")

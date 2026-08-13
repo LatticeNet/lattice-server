@@ -1192,3 +1192,60 @@ func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 		t.Fatalf("set over committed remove tombstone was not create: artifact=%+v want=%s err=%v", recreate.Plan, wantRecreateArtifact, err)
 	}
 }
+
+func TestOrdinaryMetadataSyncRetainsMultipleCommittedChainDeclarations(t *testing.T) {
+	srv, sourceOne, targetUUID, _, _ := seedLineChainFixture(t)
+	const sourceTwo = "33333333-3333-4333-8333-333333333333"
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{
+		{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443", LineUUID: sourceOne},
+		{Name: "source-c", Protocol: "vless", Network: "tcp", Address: "198.51.100.21", Port: "2443", LineUUID: sourceTwo},
+	})
+	_ = srv.buildLineGroups()
+	apply := func(source string) {
+		t.Helper()
+		compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: source, TargetLineUUID: targetUUID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+		if err != nil {
+			t.Fatal(err)
+		}
+		planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+		approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+		if err != nil || len(deliveries) != 1 {
+			t.Fatalf("lease=%+v err=%v", deliveries, err)
+		}
+		result := model.TaskResult{TaskID: deliveries[0].Task.ID, NodeID: "node-b", LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
+		if err := srv.handleLineChainTaskResult(approval, deliveries[0].Task, result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply(sourceOne)
+	apply(sourceTwo)
+	definitions := srv.store.LineChainSnapshot().Definitions
+	if definitions[sourceOne].Status != store.LineChainStatusAppliedUnobserved || definitions[sourceTwo].Status != store.LineChainStatusAppliedUnobserved {
+		t.Fatalf("committed definitions not retained independently: %+v", definitions)
+	}
+	raw, err := srv.vpnCoreLinesSyncMetadata(lineUserTestPrincipal(), json.RawMessage(`{"node_id":"node-b"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Approval model.Approval `json:"approval"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(response.Approval.Plan, sourceOne) || !strings.Contains(response.Approval.Plan, sourceTwo) || strings.Count(response.Approval.Plan, targetUUID) < 2 {
+		t.Fatalf("ordinary metadata sync dropped committed declarations: %s", response.Approval.Plan)
+	}
+	after := srv.store.LineChainSnapshot().Definitions
+	if !reflect.DeepEqual(definitions, after) {
+		t.Fatalf("ordinary metadata sync mutated committed chain authority: before=%+v after=%+v", definitions, after)
+	}
+}

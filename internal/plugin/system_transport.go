@@ -13,6 +13,11 @@ import (
 	"time"
 )
 
+type transportFrame struct {
+	line []byte
+	err  error
+}
+
 func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse) (systemRunnerReply, error) {
 	if t == nil || t.stdin == nil || t.scanner == nil {
 		return systemRunnerReply{}, fmt.Errorf("worker transport unavailable")
@@ -34,24 +39,13 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 		return systemRunnerReply{}, ctx.Err()
 	}
 	for {
-		lines := make(chan []byte, 1)
-		errs := make(chan error, 1)
-		go func() {
-			if t.scanner.Scan() {
-				lines <- append([]byte(nil), t.scanner.Bytes()...)
-				return
-			}
-			errs <- io.ErrUnexpectedEOF
-		}()
 		var line []byte
-		select {
-		case line = <-lines:
-		case err := <-errs:
-			return systemRunnerReply{}, err
-		case <-ctx.Done():
+		fr, err := t.nextFrame(ctx)
+		if err != nil {
 			_ = t.abort()
-			return systemRunnerReply{}, ctx.Err()
+			return systemRunnerReply{}, err
 		}
+		line = fr
 		var f stdioJSONV2Frame
 		if err := decodeStrictV2(line, &f); err != nil {
 			return systemRunnerReply{}, err
@@ -98,24 +92,12 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 		}
 		if f.Kind == "invoke_result" {
 			for {
-				lines := make(chan []byte, 1)
-				errs := make(chan error, 1)
-				go func() {
-					if t.scanner.Scan() {
-						lines <- append([]byte(nil), t.scanner.Bytes()...)
-					} else {
-						errs <- io.ErrUnexpectedEOF
-					}
-				}()
-				select {
-				case line = <-lines:
-				case err := <-errs:
+				var err error
+				line, err = t.nextFrame(ctx)
+				if err != nil {
 					// A valid result is still delivered once; readiness failure
 					// retires the worker but must not erase the result.
 					return reply, err
-				case <-ctx.Done():
-					_ = t.abort()
-					return reply, ctx.Err()
 				}
 				var ready stdioJSONV2Frame
 				if err := decodeStrictV2(line, &ready); err != nil {
@@ -140,8 +122,32 @@ type systemWorkerTransport struct {
 	stderr    *os.File
 	pgid      int
 	scanner   *bufio.Scanner
+	frames    chan transportFrame
 	abortOnce sync.Once
 	abortErr  error
+}
+
+func (t *systemWorkerTransport) nextFrame(ctx context.Context) ([]byte, error) {
+	select {
+	case f, ok := <-t.frames:
+		if !ok {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return f.line, f.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (t *systemWorkerTransport) readPump() {
+	for t.scanner.Scan() {
+		t.frames <- transportFrame{line: append([]byte(nil), t.scanner.Bytes()...)}
+	}
+	err := t.scanner.Err()
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	t.frames <- transportFrame{err: err}
+	close(t.frames)
 }
 
 func (t *systemWorkerTransport) closePipes() {
@@ -169,11 +175,12 @@ func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 	if t.scanner == nil {
 		return fmt.Errorf("worker decoder unavailable")
 	}
-	if !t.scanner.Scan() {
+	line, err := t.nextFrame(context.Background())
+	if err != nil {
 		return fmt.Errorf("worker exited before runtime_ready")
 	}
 	var f stdioJSONV2Frame
-	if err := decodeStrictV2(t.scanner.Bytes(), &f); err != nil {
+	if err := decodeStrictV2(line, &f); err != nil {
 		return fmt.Errorf("decode runtime_ready: %w", err)
 	}
 	if f.Kind != "runtime_ready" {
@@ -231,9 +238,9 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 		return nil, err
 	}
 	_ = hostRead.Close()
-	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid}
-	t.scanner = bufio.NewScanner(t.stdout)
-	t.scanner.Buffer(make([]byte, 0, 4096), 64*1024)
+	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid, scanner: bufio.NewScanner(out), frames: make(chan transportFrame, 1)}
+	t.scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	go t.readPump()
 	return t, nil
 }
 

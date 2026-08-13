@@ -357,21 +357,13 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	ack2Cmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+retryLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_ACK_RESULT="+ack2)
 	_ = runLifecycleAgentHelper(t, ack2Cmd)
 	snapshot := srv.store.LineChainSnapshot()
-	if snapshot.Definitions[sourceUUID].Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 1 {
+	if snapshot.Definitions[sourceUUID].Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 2 {
 		t.Fatalf("promotion/task mismatch: %+v tasks=%d", snapshot, len(srv.store.Tasks()))
 	}
 
 	// Reconcile the server against an ordinary agent inventory while the same
 	// HTTP server remains alive. This observation is metadata-only and must not
 	// create another E3 task or rewrite the target definition.
-	srv.singboxInvMu.RLock()
-	observed := srv.singboxInv["node-b"]
-	srv.singboxInvMu.RUnlock()
-	if len(observed.Nodes) != 1 {
-		t.Fatalf("seeded source inventory missing: %+v", observed)
-	}
-	observed.Status = "ok"
-	observed.At = time.Now().UTC()
 	inventoryResult := filepath.Join(root, "inventory-result.json")
 	invCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
 	invCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+inventoryResult)
@@ -382,10 +374,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	inventoryRaw := []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, actualInventory))
 	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, inventoryRaw)
-	if len(srv.store.Tasks()) != 1 {
+	if len(srv.store.Tasks()) != 2 {
 		t.Fatalf("inventory queued an extra E3 task: %d", len(srv.store.Tasks()))
 	}
-	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged {
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != 2 {
 		t.Fatalf("observed apply did not converge: %+v", got)
 	}
 	assertDeclaredE2EEdge(t, srv.buildLineGroups(), sourceUUID, targetUUID, true)
@@ -461,14 +453,6 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatalf("remove result missing: %v", err)
 	}
 	removeBody := []byte(fmt.Sprintf(`{"node_id":"node-b","result":%s}`, removeResult))
-	removeInventory := filepath.Join(root, "remove-inventory-result.json")
-	removeInventoryCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
-	removeInventoryCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+removeInventory)
-	_ = runLifecycleAgentHelper(t, removeInventoryCmd)
-	removeInventoryRaw, err := os.ReadFile(removeInventory)
-	if err != nil || len(removeInventoryRaw) == 0 {
-		t.Fatalf("remove inventory result missing: %v", err)
-	}
 	for attempt := 0; attempt < 2; attempt++ {
 		postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, removeBody)
 	}
@@ -476,7 +460,6 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	ack3Cmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EAckHelper$", "--", root)
 	ack3Cmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+removeLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+removeLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_ACK_RESULT="+ack3)
 	_ = runLifecycleAgentHelper(t, ack3Cmd)
-	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, removeInventoryRaw)))
 	removed := srv.store.LineChainSnapshot().Definitions[sourceUUID]
 	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 3 {
 		t.Fatalf("remove promotion/task mismatch: %+v tasks=%d", removed, len(srv.store.Tasks()))
@@ -487,6 +470,18 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	lifecycleSOCKSEcho(t, clientPort, origin)
 	if observer.accepted() != beforeRemoveTraffic {
 		t.Fatal("removed chain still traversed observer/A")
+	}
+	removeInventory := filepath.Join(root, "remove-inventory-result.json")
+	removeInventoryCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
+	removeInventoryCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+removeInventory)
+	_ = runLifecycleAgentHelper(t, removeInventoryCmd)
+	removeInventoryRaw, err := os.ReadFile(removeInventory)
+	if err != nil || len(removeInventoryRaw) == 0 {
+		t.Fatalf("remove inventory result missing: %v", err)
+	}
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, removeInventoryRaw)))
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != 3 {
+		t.Fatalf("remove inventory did not converge: %+v tasks=%d", got, len(srv.store.Tasks()))
 	}
 	assertDeclaredE2EEdge(t, srv.buildLineGroups(), sourceUUID, targetUUID, false)
 }

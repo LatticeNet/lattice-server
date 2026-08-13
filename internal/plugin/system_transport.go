@@ -5,10 +5,53 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"syscall"
 )
+
+func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, req InvokeRequest) (systemRunnerReply, error) {
+	if t == nil || t.stdin == nil || t.scanner == nil {
+		return systemRunnerReply{}, fmt.Errorf("worker transport unavailable")
+	}
+	frame := stdioJSONV2Frame{Protocol: 2, Kind: "invoke", Generation: generation, InvocationID: invocation}
+	frame.Payload, _ = json.Marshal(struct {
+		Action  string          `json:"action"`
+		Payload json.RawMessage `json:"payload,omitempty"`
+	}{req.Action, req.Payload})
+	if err := json.NewEncoder(t.stdin).Encode(frame); err != nil {
+		return systemRunnerReply{}, err
+	}
+	for t.scanner.Scan() {
+		var f stdioJSONV2Frame
+		if err := json.Unmarshal(t.scanner.Bytes(), &f); err != nil {
+			return systemRunnerReply{}, err
+		}
+		if err := validateStdioJSONV2Frame(f, generation, invocation, ""); err != nil {
+			return systemRunnerReply{}, err
+		}
+		if f.Kind == "host_call" {
+			continue
+		}
+		if f.Kind != "invoke_result" {
+			return systemRunnerReply{}, fmt.Errorf("unexpected v2 frame %q", f.Kind)
+		}
+		var reply systemRunnerReply
+		if err := json.Unmarshal(f.Payload, &reply); err != nil {
+			return systemRunnerReply{}, err
+		}
+		if !t.scanner.Scan() {
+			return systemRunnerReply{}, io.ErrUnexpectedEOF
+		}
+		var ready stdioJSONV2Frame
+		if err := json.Unmarshal(t.scanner.Bytes(), &ready); err != nil || ready.Kind != "invoke_ready" {
+			return systemRunnerReply{}, fmt.Errorf("missing invoke_ready")
+		}
+		return reply, nil
+	}
+	return systemRunnerReply{}, io.ErrUnexpectedEOF
+}
 
 // systemWorkerTransport owns one persistent worker process and all descriptors.
 // It is intentionally independent of the evolving SDK session API.

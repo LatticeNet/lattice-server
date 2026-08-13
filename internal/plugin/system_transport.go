@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse) (systemRunnerReply, error) {
+func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse) (systemRunnerReply, error) {
 	if t == nil || t.stdin == nil || t.scanner == nil {
 		return systemRunnerReply{}, fmt.Errorf("worker transport unavailable")
 	}
@@ -23,9 +23,27 @@ func (t *systemWorkerTransport) invokeV2(generation uint64, invocation string, r
 	if err := json.NewEncoder(t.stdin).Encode(frame); err != nil {
 		return systemRunnerReply{}, err
 	}
-	for t.scanner.Scan() {
+	lines := make(chan []byte, 1)
+	scanErr := make(chan error, 1)
+	go func() {
+		if t.scanner.Scan() {
+			lines <- append([]byte(nil), t.scanner.Bytes()...)
+			return
+		}
+		scanErr <- io.ErrUnexpectedEOF
+	}()
+	for {
+		var line []byte
+		select {
+		case line = <-lines:
+		case err := <-scanErr:
+			return systemRunnerReply{}, err
+		case <-ctx.Done():
+			_ = t.abort()
+			return systemRunnerReply{}, ctx.Err()
+		}
 		var f stdioJSONV2Frame
-		if err := decodeStrictV2(t.scanner.Bytes(), &f); err != nil {
+		if err := decodeStrictV2(line, &f); err != nil {
 			return systemRunnerReply{}, err
 		}
 		if err := validateStdioJSONV2Frame(f, generation, invocation, ""); err != nil {

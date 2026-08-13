@@ -351,7 +351,7 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 			return InvokeResponse{}, err
 		}
 		invocation := fmt.Sprintf("%d", time.Now().UnixNano())
-		reply, callErr := w.transport.invokeV2(req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) })
+		reply, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) })
 		if callErr != nil {
 			st.pool.poison(w)
 			return InvokeResponse{}, callErr

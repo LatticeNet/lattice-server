@@ -3004,6 +3004,10 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 	if !s.requireAllNodeScopes(w, p, "task:run", targets) {
 		return
 	}
+	if s.store.TaskUsesLineChainProtocol(src.ID) {
+		s.writeTaskStoreError(w, store.ErrTaskDurableProtected)
+		return
+	}
 	if err := validateTaskCreate(src.Interpreter, src.Script, src.TimeoutSec, src.OutputLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -3062,6 +3066,8 @@ func (s *Server) writeTaskStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
 	case errors.Is(err, store.ErrTaskNotCancelable):
 		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "only queued tasks can be cancelled"))
+	case errors.Is(err, store.ErrTaskDurableProtected):
+		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "durable protocol task must be managed through its domain lifecycle"))
 	default:
 		writeError(w, http.StatusInternalServerError, err)
 	}

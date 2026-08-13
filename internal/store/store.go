@@ -1953,6 +1953,7 @@ func cloneTaskResultReceipts(in map[string]TaskResultReceipt) map[string]TaskRes
 var (
 	ErrTaskNotFound           = errors.New("task not found")
 	ErrTaskNotCancelable      = errors.New("only queued tasks can be cancelled")
+	ErrTaskDurableProtected   = errors.New("durable protocol task cannot be mutated through generic task management")
 	ErrTaskLeaseMismatch      = errors.New("task lease mismatch")
 	ErrTaskTransitionConflict = errors.New("task approval transition conflict")
 )
@@ -1969,6 +1970,9 @@ func (s *Store) CancelTask(id string) (model.Task, error) {
 	if !ok {
 		return model.Task{}, ErrTaskNotFound
 	}
+	if s.lineChainTaskLocked(t) {
+		return model.Task{}, ErrTaskDurableProtected
+	}
 	if t.Status != model.TaskQueued {
 		return model.Task{}, ErrTaskNotCancelable
 	}
@@ -1983,8 +1987,12 @@ func (s *Store) CancelTask(id string) (model.Task, error) {
 func (s *Store) DeleteTask(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.state.Tasks[id]; !ok {
+	task, ok := s.state.Tasks[id]
+	if !ok {
 		return ErrTaskNotFound
+	}
+	if s.lineChainTaskLocked(task) {
+		return ErrTaskDurableProtected
 	}
 	delete(s.state.Tasks, id)
 	for key, receipt := range s.state.TaskResultReceipts {
@@ -2002,6 +2010,25 @@ func (s *Store) DeleteTask(id string) error {
 		s.state.Results = kept
 	}
 	return s.Save()
+}
+
+// TaskUsesLineChainProtocol reports whether task mutation belongs to the E3
+// domain lifecycle rather than the generic task-management API.
+func (s *Store) TaskUsesLineChainProtocol(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.state.Tasks[id]
+	return ok && s.lineChainTaskLocked(task)
+}
+
+func (s *Store) lineChainTaskLocked(task model.Task) bool {
+	if task.ApprovalID == "" {
+		return false
+	}
+	approval, ok := s.state.Approvals[task.ApprovalID]
+	return ok && approval.Plugin == "singbox-linechain" && approval.Service == "network/lines" &&
+		(approval.Method == "chain_set_apply" || approval.Method == "chain_remove_apply") &&
+		strings.HasPrefix(approval.Action, "apply-line-chain:")
 }
 
 func (s *Store) AppendAudit(ev model.AuditEvent) error {

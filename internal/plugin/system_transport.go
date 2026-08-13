@@ -108,7 +108,8 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 				}
 				var ready stdioJSONV2Frame
 				if err := decodeStrictV2(line, &ready); err != nil {
-					return systemRunnerReply{}, err
+					_ = t.abort()
+					return reply, err
 				}
 				if err := validateInvokeReady(ready, generation, invocation); err == nil {
 					return reply, nil

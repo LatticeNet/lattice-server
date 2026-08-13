@@ -198,8 +198,8 @@ func TestCompleteLineChainTaskResultPromotesFrozenCandidateAndReplaysExactly(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	approval := model.Approval{ID: "approval-result", NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines", Method: "chain_set_apply",
-		Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending}
+	approval := model.Approval{ID: "approval-result", NodeID: "node-a", Plugin: "singbox-linechain", PluginVersion: "1", Service: "network/lines", Method: "chain_set_apply",
+		Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending, Targets: []string{"node-a"}}
 	frozen := LineChainDefinition{SourceLineUUID: "source", SourceNodeID: "node-a", SourceLineHashID: "hash-source", SourceInboundTag: "in-source",
 		TargetLineUUID: "target", TargetNodeID: "node-b", TargetDefinitionDigest: "definition", TargetPublicMaterialDigest: "public",
 		TargetCredentialDigest: "credential", OutboundTag: "out", FragmentPath: "lattice-linechain-a.json", FragmentSHA256: "fragment", SidecarSHA256: "sidecar", ArtifactSHA256: "digest"}
@@ -288,7 +288,7 @@ func seedLineChainResultAttempt(t *testing.T) (*Store, model.Approval, model.Tas
 	if err != nil {
 		t.Fatal(err)
 	}
-	approval := model.Approval{ID: "approval-result-helper", NodeID: "node-a", Plugin: "singbox-linechain", Service: "network/lines", Method: "chain_set_apply", Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending}
+	approval := model.Approval{ID: "approval-result-helper", NodeID: "node-a", Plugin: "singbox-linechain", PluginVersion: "1", Service: "network/lines", Method: "chain_set_apply", Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending, Targets: []string{"node-a"}}
 	frozen := LineChainDefinition{SourceLineUUID: "source", SourceNodeID: "node-a", SourceLineHashID: "hash", SourceInboundTag: "in", TargetLineUUID: "target", TargetNodeID: "node-b", ArtifactSHA256: "digest"}
 	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a", CandidateTargetLineUUID: "target", CandidateArtifactSHA256: "digest", CandidateDefinition: frozen, RequestSHA256: "request"}
 	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
@@ -328,7 +328,7 @@ func TestReconcileLineChainsUsesExactObservedSetAndRemoveEvidence(t *testing.T) 
 	snapshot := s.LineChainSnapshot()
 	if snapshot.Definitions["set-ok"].Status != LineChainStatusConverged || snapshot.Definitions["set-bad"].DriftCode != "observed_mismatch" ||
 		snapshot.Definitions["remove-ok"].Status != LineChainStatusConverged || snapshot.Definitions["remove-ok"].TargetLineUUID != "" ||
-		snapshot.Definitions["remove-bad"].DriftCode != "remove_artifacts_present" || snapshot.Revision != 8 {
+		snapshot.Definitions["remove-bad"].DriftCode != "remove_artifacts_present" || snapshot.Revision != 7 || len(s.Tasks()) != 0 {
 		t.Fatalf("unexpected reconciliation: %+v", snapshot)
 	}
 }

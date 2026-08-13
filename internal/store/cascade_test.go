@@ -405,8 +405,8 @@ func seedLineChainCascade(t *testing.T, lease bool) (*Store, model.Approval, mod
 	if err := s.PutManagedLineRecord(ManagedLinePublicRecord{LineUUID: "target-line", NodeID: "target-node", Status: "applied"}, ManagedLineSecretRecord{RealityPrivateKey: "private"}); err != nil {
 		t.Fatal(err)
 	}
-	approval := model.Approval{ID: "approval-chain-cascade", NodeID: "source-node", Plugin: "singbox-linechain", Service: "network/lines", Method: "chain_set_apply",
-		Action: "apply-line-chain:artifact", ArtifactDigest: "artifact", RequestSHA256: "request", Status: model.ApprovalPending}
+	approval := model.Approval{ID: "approval-chain-cascade", NodeID: "source-node", Plugin: "singbox-linechain", PluginVersion: "1", Service: "network/lines", Method: "chain_set_apply",
+		Action: "apply-line-chain:artifact", ArtifactDigest: "artifact", RequestSHA256: "request", Status: model.ApprovalPending, Targets: []string{"source-node"}}
 	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source-line", SourceNodeID: "source-node",
 		CandidateTargetLineUUID: "target-line", CandidateTargetNodeID: "target-node", CandidateArtifactSHA256: "artifact", RequestSHA256: "request",
 		CandidateDefinition: LineChainDefinition{SourceLineUUID: "source-line", SourceNodeID: "source-node", TargetLineUUID: "target-line", TargetNodeID: "target-node", ArtifactSHA256: "artifact"}}

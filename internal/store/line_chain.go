@@ -204,7 +204,6 @@ func (s *Store) ReconcileLineChains(observations map[string]LineChainObservation
 	}
 	staged := s.state
 	staged.LineChainDefinitions = definitions
-	staged.LineChainGraphRevision++
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
@@ -406,13 +405,17 @@ func (s *Store) CompleteLineChainTaskResult(r model.TaskResult, approval model.A
 	if !ok || storedApproval.Status != model.ApprovalApproved || storedApproval.Plugin != "singbox-linechain" || storedApproval.Service != "network/lines" ||
 		(storedApproval.Method != "chain_set_apply" && storedApproval.Method != "chain_remove_apply") || !strings.HasPrefix(storedApproval.Action, "apply-line-chain:") ||
 		storedApproval.Action != approval.Action || storedApproval.Plan != approval.Plan || storedApproval.ArtifactDigest != approval.ArtifactDigest ||
-		storedApproval.RequestSHA256 != approval.RequestSHA256 || storedApproval.NodeID != approval.NodeID {
+		storedApproval.RequestSHA256 != approval.RequestSHA256 || storedApproval.NodeID != approval.NodeID || storedApproval.PluginVersion != approval.PluginVersion ||
+		len(storedApproval.Targets) != len(approval.Targets) {
 		return false, ErrTaskTransitionConflict
 	}
 	attempt, ok := s.state.LineChainAttempts[approval.ID]
 	if !ok || attempt.Status != LineChainStatusApplying || attempt.IssuedTaskID != task.ID || attempt.IssuedLeaseID != r.LeaseID ||
 		attempt.ApprovalID != approval.ID || attempt.SourceNodeID != r.NodeID || attempt.IssuedScriptSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(task.Script))) ||
 		attempt.IssuedArtifactSHA256 != storedApproval.ArtifactDigest || attempt.CandidateArtifactSHA256 != storedApproval.ArtifactDigest {
+		return false, ErrTaskTransitionConflict
+	}
+	if len(storedApproval.Targets) != 1 || storedApproval.Targets[0] != attempt.SourceNodeID || approval.Targets[0] != attempt.SourceNodeID {
 		return false, ErrTaskTransitionConflict
 	}
 	success := r.ExitCode == 0 && r.Error == ""

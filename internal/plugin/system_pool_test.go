@@ -63,3 +63,16 @@ func TestSystemPoolConcurrentNoDoubleLease(t *testing.T) {
 		t.Fatalf("leases=%d, expected one concurrent lease", leases)
 	}
 }
+
+func TestSystemPoolPrimaryOverflowCapacity(t *testing.T) {
+	p := newSystemPool(2, time.Hour)
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.publish(1, true, time.Now()); err == nil {
+		t.Fatal("pool exceeded primary+overflow capacity")
+	}
+}

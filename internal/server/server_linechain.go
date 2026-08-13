@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
@@ -69,6 +70,53 @@ type lineChainCompiledArtifact struct {
 	TargetDefinition     managedLineDef
 }
 
+// lineChainCompileSnapshot freezes every resolved compiler input before any
+// validation or rendering. Compiler code below must not reach back into live
+// server/store state after this boundary.
+type lineChainCompileSnapshot struct {
+	Lines        map[string][]Line
+	Definitions  map[string]managedLineDef
+	Users        map[string]VpnUser
+	Nodes        map[string]model.Node
+	Chains       store.LineChainSnapshot
+	Capabilities map[string]bool
+}
+
+func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, error) {
+	snapshot := lineChainCompileSnapshot{
+		Lines: make(map[string][]Line), Definitions: make(map[string]managedLineDef),
+		Users: make(map[string]VpnUser), Nodes: make(map[string]model.Node),
+		Chains: s.store.LineChainSnapshot(), Capabilities: make(map[string]bool),
+	}
+	for _, group := range s.buildLineGroups() {
+		for _, line := range group.Lines {
+			if line.LineUUID != "" {
+				uuid := strings.ToLower(line.LineUUID)
+				snapshot.Lines[uuid] = append(snapshot.Lines[uuid], line)
+			}
+		}
+	}
+	definitions, err := s.managedLineDefs()
+	if err != nil {
+		return lineChainCompileSnapshot{}, err
+	}
+	for _, definition := range definitions {
+		snapshot.Definitions[strings.ToLower(definition.LineUUID)] = definition
+	}
+	for _, user := range s.listVpnUsers() {
+		snapshot.Users[user.ID] = user
+	}
+	for _, node := range s.store.Nodes() {
+		snapshot.Nodes[node.ID] = node
+	}
+	s.agentCapabilitiesMu.RLock()
+	for nodeID, capabilities := range s.agentCapabilities {
+		_, snapshot.Capabilities[nodeID] = capabilities[lineChainDurableCapability]
+	}
+	s.agentCapabilitiesMu.RUnlock()
+	return snapshot, nil
+}
+
 func deterministicLineChainTag(sourceUUID, targetUUID string) string {
 	sum := sha256.Sum256([]byte(strings.ToLower(sourceUUID) + "\x00" + strings.ToLower(targetUUID)))
 	return "lattice-chain-" + hex.EncodeToString(sum[:])[:20]
@@ -90,6 +138,14 @@ func shortFingerprint(value string) string {
 }
 
 func (s *Server) compileLineChain(req lineChainCompileRequest) (lineChainCompiledArtifact, error) {
+	snapshot, err := s.captureLineChainCompileSnapshot()
+	if err != nil {
+		return lineChainCompiledArtifact{}, err
+	}
+	return s.compileLineChainSnapshot(snapshot, req)
+}
+
+func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req lineChainCompileRequest) (lineChainCompiledArtifact, error) {
 	req.SourceLineUUID = strings.ToLower(strings.TrimSpace(req.SourceLineUUID))
 	req.TargetLineUUID = strings.ToLower(strings.TrimSpace(req.TargetLineUUID))
 	if !validLineUUIDv4(req.SourceLineUUID) || !validLineUUIDv4(req.TargetLineUUID) {
@@ -98,16 +154,8 @@ func (s *Server) compileLineChain(req lineChainCompileRequest) (lineChainCompile
 	if req.SourceLineUUID == req.TargetLineUUID {
 		return lineChainCompiledArtifact{}, errors.New("source and target line must differ")
 	}
-	byUUID := make(map[string][]Line)
-	for _, group := range s.buildLineGroups() {
-		for _, line := range group.Lines {
-			if line.LineUUID != "" {
-				byUUID[strings.ToLower(line.LineUUID)] = append(byUUID[strings.ToLower(line.LineUUID)], line)
-			}
-		}
-	}
 	resolve := func(uuid string) (Line, error) {
-		matches := byUUID[uuid]
+		matches := snapshot.Lines[uuid]
 		if len(matches) != 1 {
 			return Line{}, fmt.Errorf("line_uuid %s resolves to %d lines", uuid, len(matches))
 		}
@@ -127,21 +175,26 @@ func (s *Server) compileLineChain(req lineChainCompileRequest) (lineChainCompile
 	if source.Core != model.ProxyCoreSingbox || source.Tag == "" || source.Status != "ok" {
 		return lineChainCompiledArtifact{}, errors.New("source must be a healthy sing-box line with a stable inbound tag")
 	}
+	if target.Core != model.ProxyCoreSingbox || target.Type != model.ProxyProtocolVLESS ||
+		target.Security != model.ProxySecurityReality || target.Transport != model.ProxyTransportTCP {
+		return lineChainCompiledArtifact{}, errors.New("target must be sing-box VLESS+REALITY+TCP")
+	}
 	if !target.Overlay || target.OverlayStatus != managedLineStatusApplied || target.Status != "ok" {
 		return lineChainCompiledArtifact{}, errors.New("target must be a healthy applied managed-line overlay")
 	}
-	if !s.agentHasCapability(source.NodeID, lineChainDurableCapability) {
+	chainSnapshot := snapshot.Chains
+	if store.WouldCreateLineChainCycle(chainSnapshot, source.LineUUID, target.LineUUID) {
+		return lineChainCompiledArtifact{}, errors.New("candidate would create a line chain cycle")
+	}
+	if !snapshot.Capabilities[source.NodeID] {
 		return lineChainCompiledArtifact{}, errors.New("source node does not advertise durable-task-result-v1")
 	}
-	definition, ok, err := s.managedLineDefByUUID(target.LineUUID)
-	if err != nil {
-		return lineChainCompiledArtifact{}, err
-	}
+	definition, ok := snapshot.Definitions[strings.ToLower(target.LineUUID)]
 	if !ok || definition.Status != managedLineStatusApplied || definition.Port < 1 || definition.SNI == "" ||
 		definition.RealityPublicKey == "" || definition.ShortID == "" || definition.UserID == "" {
 		return lineChainCompiledArtifact{}, errors.New("target managed-line descriptor is incomplete")
 	}
-	user, ok := s.getVpnUser(definition.UserID)
+	user, ok := snapshot.Users[definition.UserID]
 	if !ok || !user.Enabled {
 		return lineChainCompiledArtifact{}, errors.New("target managed-line user is unavailable")
 	}
@@ -149,7 +202,7 @@ func (s *Server) compileLineChain(req lineChainCompileRequest) (lineChainCompile
 	if !ok || strings.TrimSpace(credential.UUID) == "" {
 		return lineChainCompiledArtifact{}, errors.New("target managed-line VLESS credential is unavailable")
 	}
-	targetHost := firstNonEmpty(target.PublicHost, s.nodePublicHost(target.NodeID))
+	targetHost := firstNonEmpty(target.PublicHost, strings.TrimSpace(snapshot.Nodes[target.NodeID].PublicIP))
 	if targetHost == "" {
 		return lineChainCompiledArtifact{}, errors.New("target public host is unavailable")
 	}
@@ -162,7 +215,7 @@ func (s *Server) compileLineChain(req lineChainCompileRequest) (lineChainCompile
 	if err != nil {
 		return lineChainCompiledArtifact{}, err
 	}
-	sidecar, err := s.renderLineChainSidecar(source.NodeID, source.LineUUID, target.LineUUID)
+	sidecar, err := s.renderLineChainSidecarSnapshot(snapshot, source.NodeID, source.LineUUID, target.LineUUID)
 	if err != nil {
 		return lineChainCompiledArtifact{}, err
 	}
@@ -186,7 +239,7 @@ func (s *Server) compileLineChain(req lineChainCompileRequest) (lineChainCompile
 		PreflightChecks: []string{"source_identity", "target_managed_applied", "target_credential", "consumer_capability", "distinct_nodes"},
 		Summary:         fmt.Sprintf("Route %s on %s through managed target %s", source.Name, s.nodeDisplayName(source.NodeID), target.Name),
 	}
-	if current, ok := s.store.LineChainSnapshot().Definitions[source.LineUUID]; ok {
+	if current, ok := chainSnapshot.Definitions[source.LineUUID]; ok {
 		plan.PreviousTargetLineUUID = current.TargetLineUUID
 		plan.PreviousArtifactSHA256 = current.ArtifactSHA256
 	}
@@ -194,6 +247,51 @@ func (s *Server) compileLineChain(req lineChainCompileRequest) (lineChainCompile
 		Plan: plan, FragmentJSON: fragment.JSON, SidecarJSON: string(sidecar), TargetCredentialUUID: credential.UUID,
 		TargetPublicKey: definition.RealityPublicKey, TargetShortID: definition.ShortID, TargetDefinition: definition,
 	}, nil
+}
+
+func (s *Server) renderLineChainSidecarSnapshot(snapshot lineChainCompileSnapshot, nodeID, sourceUUID, targetUUID string) ([]byte, error) {
+	inbounds := make([]lineMetadataInboundV2, 0)
+	found := false
+	for _, matches := range snapshot.Lines {
+		for _, line := range matches {
+			if line.NodeID != nodeID {
+				continue
+			}
+			if line.Tag == "" || !validLineUUIDv4(line.LineUUID) {
+				return nil, fmt.Errorf("line %s is missing stable sidecar identity", line.LineHashID)
+			}
+			inbound := lineMetadataInboundV2{Tag: line.Tag, LineUUID: line.LineUUID, LineHashID: line.LineHashID}
+			downstream := strings.TrimSpace(line.DownstreamLineUUID)
+			if strings.EqualFold(line.LineUUID, sourceUUID) {
+				downstream = targetUUID
+				found = true
+			}
+			if downstream != "" {
+				target := downstream
+				inbound.Chain = &lineMetadataChainV2{DownstreamLineUUID: &target}
+				if targetLines := snapshot.Lines[strings.ToLower(downstream)]; len(targetLines) == 1 {
+					targetNode := snapshot.Nodes[targetLines[0].NodeID]
+					inbound.Chain.DownstreamNode = firstNonEmpty(strings.TrimSpace(targetNode.Name), targetLines[0].NodeID)
+				}
+			}
+			inbounds = append(inbounds, inbound)
+		}
+	}
+	if !found {
+		return nil, errors.New("source line is absent from its node sidecar")
+	}
+	sort.Slice(inbounds, func(i, j int) bool { return inbounds[i].Tag < inbounds[j].Tag })
+	node := snapshot.Nodes[nodeID]
+	doc := lineMetadataDocV2{
+		Schema: lineMetadataSchemaV2, NodeID: nodeID, NodeUUID: strings.TrimSpace(node.LatticeIdentityUUID),
+		UpdatedAt: s.now().UTC().Format(time.RFC3339), Writer: lineMetadataWriter, Inbounds: inbounds,
+		Reserved: lineMetadataReservedV2{InConfigKey: "_lattice", Fields: lineMetadataReservedFields{LineUUID: "string", NodeUUID: "string", LineHashID: "string"}},
+	}
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
 }
 
 func digestManagedLineDefinition(definition managedLineDef) string {

@@ -83,6 +83,19 @@ type LineChainSnapshot struct {
 	Revision    uint64
 }
 
+// WouldCreateLineChainCycle evaluates a candidate against every committed edge
+// and every already-reserved applying candidate from the supplied immutable
+// snapshot. Planned attempts do not reserve graph membership.
+func WouldCreateLineChainCycle(snapshot LineChainSnapshot, sourceLineUUID, targetLineUUID string) bool {
+	attempts := cloneLineChainAttempts(snapshot.Attempts)
+	attempts["candidate"] = LineChainAttempt{
+		ApprovalID: "candidate", SourceLineUUID: sourceLineUUID,
+		CandidateTargetLineUUID: targetLineUUID, Operation: LineChainOperationSet,
+		Status: LineChainStatusApplying,
+	}
+	return lineChainGraphHasCycle(snapshot.Definitions, attempts)
+}
+
 func cloneLineChainDefinitions(in map[string]LineChainDefinition) map[string]LineChainDefinition {
 	out := make(map[string]LineChainDefinition, len(in))
 	for id, definition := range in {

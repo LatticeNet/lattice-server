@@ -66,11 +66,52 @@ func TestLineChainCompilerProducesDeterministicRedactedArtifact(t *testing.T) {
 	}
 }
 
+func TestLineChainCompilerUsesImmutableCapturedSnapshot(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	snapshot, err := srv.captureLineChainCompileSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.replaceAgentCapabilities("node-b", nil)
+	if _, err := srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err != nil {
+		t.Fatalf("captured snapshot changed after live capability mutation: %v", err)
+	}
+}
+
 func TestLineChainCompilerRejectsMissingConsumerCapability(t *testing.T) {
 	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
 	srv.replaceAgentCapabilities("node-b", nil)
 	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil || !strings.Contains(err.Error(), lineChainDurableCapability) {
 		t.Fatalf("missing capability error=%v", err)
+	}
+}
+
+func TestLineChainCompilerRejectsUnsupportedTargetTransport(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, def := seedLineChainFixture(t)
+	seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{
+		Name: def.Tag, Protocol: "vless", Network: "udp", Address: "203.0.113.10", Port: fmt.Sprint(def.Port),
+		SNI: def.SNI, LineUUID: def.LineUUID,
+	}})
+	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil || !strings.Contains(err.Error(), "VLESS+REALITY+TCP") {
+		t.Fatalf("unsupported target transport error=%v", err)
+	}
+}
+
+func TestLineChainCompilerRejectsCurrentGraphCycle(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	if _, _, err := srv.store.PlanLineChain(store.LineChainAttempt{
+		ApprovalID: "approval-existing", Operation: store.LineChainOperationSet,
+		SourceLineUUID: targetUUID, SourceNodeID: "node-a", CandidateTargetLineUUID: sourceUUID,
+		CandidateTargetNodeID: "node-b", RequestSHA256: "existing",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := srv.store.LineChainSnapshot()
+	if _, err := srv.store.ReserveLineChain("approval-existing", snapshot.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("cycle error=%v", err)
 	}
 }
 

@@ -33,6 +33,8 @@ type Line struct {
 	Name               string   `json:"name"`
 	Tag                string   `json:"tag,omitempty"`
 	Type               string   `json:"type,omitempty"` // protocol
+	Transport          string   `json:"transport,omitempty"`
+	Security           string   `json:"security,omitempty"`
 	ListenHost         string   `json:"listen_host,omitempty"`
 	ListenPort         int      `json:"listen_port,omitempty"`
 	PublicHost         string   `json:"public_host,omitempty"`
@@ -243,6 +245,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Name:               n.Name,
 				Tag:                n.Name,
 				Type:               n.Protocol,
+				Transport:          n.Network,
 				ListenHost:         n.ListenHost,
 				ListenPort:         port,
 				PublicHost:         n.Address,
@@ -335,6 +338,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 					lines[i].Overlay = true
 					lines[i].OverlayStatus = def.Status
 					lines[i].OverlayUser = def.UserID
+					lines[i].Security = model.ProxySecurityReality
 				}
 			}
 			byNode[nodeID] = lines

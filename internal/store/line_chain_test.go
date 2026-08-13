@@ -506,6 +506,20 @@ func TestReconcileLineChainsUsesExactObservedSetAndRemoveEvidence(t *testing.T) 
 	}
 }
 
+func TestReconcileLineChainsPreservesStickyPostLeaseDrift(t *testing.T) {
+	for _, code := range []string{"inputs_changed", "target_missing", "source_missing"} {
+		t.Run(code, func(t *testing.T) {
+			s, _ := Open("")
+			s.state.LineChainDefinitions["source"] = LineChainDefinition{SourceLineUUID: "source", TargetLineUUID: "target", OutboundTag: "out", Status: LineChainStatusDrifted, DriftCode: code, Generation: 4}
+			before := s.LineChainSnapshot()
+			committed, err := s.ReconcileLineChains(map[string]LineChainObservation{"source": {OutboundTag: "out", DownstreamLineUUID: "target"}})
+			if err != nil || committed || !reflect.DeepEqual(before, s.LineChainSnapshot()) {
+				t.Fatalf("sticky drift reconciled: committed=%v err=%v before=%+v after=%+v", committed, err, before, s.LineChainSnapshot())
+			}
+		})
+	}
+}
+
 func TestAppendAuditIdempotentRepairsDurabilityWithoutDuplicates(t *testing.T) {
 	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
 	if err != nil {

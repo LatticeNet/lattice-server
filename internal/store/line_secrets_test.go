@@ -198,7 +198,7 @@ func BenchmarkLineSecretMigrationLinear(b *testing.B) {
 	}
 }
 
-func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
+func TestLineSecretMigrationNarrowlyPreservesPendingManagedLineApprovalBytes(t *testing.T) {
 	s, err := Open("")
 	if err != nil {
 		t.Fatal(err)

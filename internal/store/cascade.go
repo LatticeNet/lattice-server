@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -109,8 +110,31 @@ func (s *Store) DeleteNode(nodeID string) (NodeCascadeReport, bool, error) {
 	if preview.LineChainLeaseConflicts > 0 {
 		return preview, true, ErrLineChainDeleteConflict
 	}
+	// The legacy cascade engine edits s.state inline. Run it against an exact
+	// deep clone, restore the published state, then persist/publish only at the
+	// atomic rename commit point.
+	raw, err := json.Marshal(s.state)
+	if err != nil {
+		return preview, true, err
+	}
+	staged := emptyState()
+	if err := json.Unmarshal(raw, &staged); err != nil {
+		return preview, true, err
+	}
+	staged.ensureMaps()
+	current := s.state
+	s.state = staged
 	report, ok := s.buildNodeCascadeLocked(nodeID, true)
-	return report, true, s.Save()
+	staged = s.state
+	s.state = current
+	if !ok {
+		return report, false, nil
+	}
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return report, true, err
 }
 
 // PlanDeleteNode computes the same cascade report DeleteNode would produce

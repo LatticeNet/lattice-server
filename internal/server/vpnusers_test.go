@@ -39,7 +39,7 @@ func TestVpnUserMigrationIdempotent(t *testing.T) {
 	}
 }
 
-func TestLineSecretMigrationRestartSupportsOperations(t *testing.T) {
+func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	key := make([]byte, secret.KeySize)
 	for i := range key {
 		key[i] = byte(i + 1)

@@ -35,11 +35,11 @@ func TestEnsureLineUUIDIdempotentAndPersistent(t *testing.T) {
 	srv := newLinemetaTestServer(t, st)
 
 	const hash = "line_0123456789abcdef01234567"
-	u1, err := srv.ensureLineUUID(hash)
+	u1, err := srv.ensureLineUUID(hash, "node-a")
 	if err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	u2, err := srv.ensureLineUUID(hash)
+	u2, err := srv.ensureLineUUID(hash, "node-a")
 	if err != nil {
 		t.Fatalf("ensure again: %v", err)
 	}
@@ -55,14 +55,14 @@ func TestEnsureLineUUIDIdempotentAndPersistent(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv2 := newLinemetaTestServer(t, st2)
-	u3, err := srv2.ensureLineUUID(hash)
+	u3, err := srv2.ensureLineUUID(hash, "node-a")
 	if err != nil {
 		t.Fatalf("ensure after reopen: %v", err)
 	}
 	if u3 != u1 {
 		t.Fatalf("uuid not persisted across reopen: %q vs %q", u3, u1)
 	}
-	if _, err := srv2.ensureLineUUID("  "); err == nil {
+	if _, err := srv2.ensureLineUUID("  ", "node-a"); err == nil {
 		t.Fatal("empty line_hash_id: want error")
 	}
 }
@@ -75,7 +75,7 @@ func TestEnsureLineUUIDFormatV4(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newLinemetaTestServer(t, st)
-	u, err := srv.ensureLineUUID("line_abcdef0123456789abcdef01")
+	u, err := srv.ensureLineUUID("line_abcdef0123456789abcdef01", "node-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestBuildLineGroupsSafelyRestoresAgentLineUUID(t *testing.T) {
 
 	t.Run("known uuid survives shape mutation", func(t *testing.T) {
 		srv := newServer(t, reported)
-		if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hubHash, Value: reported}); err != nil {
+		if err := srv.store.PutLineUUIDAuthority(hubHash, reported, "node-a"); err != nil {
 			t.Fatal(err)
 		}
 		srv.singboxInvMu.Lock()
@@ -255,7 +255,7 @@ func TestBuildLineGroupsSafelyRestoresAgentLineUUID(t *testing.T) {
 
 	t.Run("explicit line id wins over uuid", func(t *testing.T) {
 		srv := newServer(t, reported)
-		if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hubHash, Value: reported}); err != nil {
+		if err := srv.store.PutLineUUIDAuthority(hubHash, reported, "node-a"); err != nil {
 			t.Fatal(err)
 		}
 		srv.singboxInvMu.Lock()
@@ -295,6 +295,134 @@ func TestBuildLineGroupsSafelyRestoresAgentLineUUID(t *testing.T) {
 			t.Fatalf("ambiguous UUID did not fall back safely: %+v", hub)
 		}
 	})
+}
+
+func TestBuildLineGroupsRejectsCrossNodeUUIDTakeoverWhenOwnerOffline(t *testing.T) {
+	const claimed = "550e8400-e29b-41d4-a716-446655440000"
+	st, _ := store.Open("")
+	srv := newLinemetaTestServer(t, st)
+	seedLinemetaNodes(t, srv)
+	ownerHash := lineHash("node-a", "sing-box", "vless", "", 443, "hub-a", "exit-b")
+	if err := st.PutLineUUIDAuthority(ownerHash, claimed, "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	delete(srv.singboxInv, "node-a")
+	inv := srv.singboxInv["node-b"]
+	inv.Nodes[0].LineUUID = claimed
+	srv.singboxInv["node-b"] = inv
+	srv.singboxInvMu.Unlock()
+	line := findLine(t, srv.buildLineGroups(), "node-b", "exit-b-in")
+	if line.LineHashID == ownerHash || line.LineUUID == claimed {
+		t.Fatalf("cross-node claim inherited owner authority: %+v", line)
+	}
+	if owner, ok := st.KVEntry(lineUUIDOwnerKVBucket, ownerHash); !ok || owner.Value != "node-a" {
+		t.Fatalf("owner authority mutated: %+v ok=%v", owner, ok)
+	}
+}
+
+func TestBuildLineGroupsMetadataLineIDMatchesExplicitField(t *testing.T) {
+	build := func(metadataOnly bool) Line {
+		st, _ := store.Open("")
+		srv := newLinemetaTestServer(t, st)
+		seedLinemetaNodes(t, srv)
+		srv.singboxInvMu.Lock()
+		inv := srv.singboxInv["node-a"]
+		if metadataOnly {
+			inv.Nodes[0].Metadata = map[string]string{"line_id": "stable-from-agent"}
+		} else {
+			inv.Nodes[0].LineID = "stable-from-agent"
+		}
+		srv.singboxInv["node-a"] = inv
+		srv.singboxInvMu.Unlock()
+		return findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+	}
+	explicit, metadata := build(false), build(true)
+	if explicit.LineHashID != "line_stable-from-agent" || metadata.LineHashID != explicit.LineHashID {
+		t.Fatalf("line_id extraction diverged: explicit=%+v metadata=%+v", explicit, metadata)
+	}
+}
+
+func TestBuildLineGroupsLegacyOwnerlessAuthorityBootstrapsOnlyExactShape(t *testing.T) {
+	const reported = "550e8400-e29b-41d4-a716-446655440000"
+	newServer := func() (*Server, string) {
+		st, _ := store.Open("")
+		srv := newLinemetaTestServer(t, st)
+		seedLinemetaNodes(t, srv)
+		hash := lineHash("node-a", "sing-box", "vless", "", 443, "hub-a", "exit-b")
+		if err := st.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hash, Value: reported}); err != nil {
+			t.Fatal(err)
+		}
+		srv.singboxInvMu.Lock()
+		inv := srv.singboxInv["node-a"]
+		inv.Nodes[0].LineUUID = reported
+		srv.singboxInv["node-a"] = inv
+		srv.singboxInvMu.Unlock()
+		return srv, hash
+	}
+	t.Run("exact shape bootstraps owner", func(t *testing.T) {
+		srv, hash := newServer()
+		line := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		owner, ok := srv.store.KVEntry(lineUUIDOwnerKVBucket, hash)
+		if line.LineHashID != hash || line.LineUUID != reported || !ok || owner.Value != "node-a" {
+			t.Fatalf("safe bootstrap failed: line=%+v owner=%+v ok=%v", line, owner, ok)
+		}
+	})
+	t.Run("shape drift does not claim owner", func(t *testing.T) {
+		srv, hash := newServer()
+		srv.singboxInvMu.Lock()
+		inv := srv.singboxInv["node-a"]
+		inv.Nodes[0].ListenHost = "127.0.0.9"
+		srv.singboxInv["node-a"] = inv
+		srv.singboxInvMu.Unlock()
+		line := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+		if line.LineHashID == hash || line.LineUUID == reported {
+			t.Fatalf("legacy ownerless drift was silently claimed: %+v", line)
+		}
+		if _, ok := srv.store.KVEntry(lineUUIDOwnerKVBucket, hash); ok {
+			t.Fatal("legacy ownerless drift assigned an owner")
+		}
+	})
+}
+
+func TestBuildLineGroupsLegacyOwnerlessExplicitAuthorityBootstrapsEffectiveLineID(t *testing.T) {
+	const (
+		reported = "550e8400-e29b-41d4-a716-446655440000"
+		lineID   = "stable-ownerless"
+	)
+	for _, tc := range []struct {
+		name         string
+		metadataOnly bool
+	}{
+		{name: "top_level"},
+		{name: "metadata_only", metadataOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, _ := store.Open("")
+			srv := newLinemetaTestServer(t, st)
+			seedLinemetaNodes(t, srv)
+			hash := "line_" + lineID
+			if err := st.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hash, Value: reported}); err != nil {
+				t.Fatal(err)
+			}
+			srv.singboxInvMu.Lock()
+			inv := srv.singboxInv["node-a"]
+			inv.Nodes[0].LineUUID = reported
+			inv.Nodes[0].ListenHost = "127.0.0.99" // explicit identity must tolerate shape drift
+			if tc.metadataOnly {
+				inv.Nodes[0].Metadata = map[string]string{"line_id": lineID}
+			} else {
+				inv.Nodes[0].LineID = lineID
+			}
+			srv.singboxInv["node-a"] = inv
+			srv.singboxInvMu.Unlock()
+			line := findLine(t, srv.buildLineGroups(), "node-a", "hub-a")
+			owner, ok := st.KVEntry(lineUUIDOwnerKVBucket, hash)
+			if line.LineHashID != hash || line.LineUUID != reported || !ok || owner.Value != "node-a" {
+				t.Fatalf("explicit ownerless bootstrap failed: line=%+v owner=%+v ok=%v", line, owner, ok)
+			}
+		})
+	}
 }
 
 // (c2) A declared downstream_line_uuid resolves to the downstream line's hash
@@ -528,7 +656,7 @@ func TestBuildLineGroupsDegradesWhenAllocationFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := srv.ensureLineUUID("line_deadbeef0123456789abcdef"); err == nil {
+	if _, err := srv.ensureLineUUID("line_deadbeef0123456789abcdef", "node-a"); err == nil {
 		t.Fatal("ensureLineUUID with broken store: want error")
 	}
 	groups := srv.buildLineGroups()

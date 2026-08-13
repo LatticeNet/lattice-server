@@ -92,32 +92,46 @@ func stableLineHandle(lineID string) string {
 	return "line_" + lineID
 }
 
+func effectiveDiscoveredLineID(node model.SingBoxNode) string {
+	return firstNonEmpty(node.LineID, node.Metadata["line_id"])
+}
+
+func provesLineUUIDAuthorityHash(line Line) bool {
+	if explicit := stableLineHandle(line.LineID); explicit != "" {
+		return explicit == line.LineHashID
+	}
+	return lineHash(line.NodeID, line.Core, line.Type, line.ListenHost, line.ListenPort, line.Tag, line.OutboundRef) == line.LineHashID
+}
+
 // lineUUIDAuthorityResolver is the pure, immutable reverse authority used by
 // every discovered-line projection. Construction scans the supplied authority
 // exactly once. Empty values denote ambiguous UUIDs and never resolve.
 type lineUUIDAuthorityResolver struct {
-	hashByUUID map[string]string
-	uuidByHash map[string]string
+	hashByUUID  map[string]string
+	uuidByHash  map[string]string
+	ownerByHash map[string]string
 }
 
-func newLineUUIDAuthorityResolver(each func(func(hash, uuid string))) lineUUIDAuthorityResolver {
+func newLineUUIDAuthorityResolver(each func(func(hash, uuid, ownerNodeID string))) lineUUIDAuthorityResolver {
 	resolver := lineUUIDAuthorityResolver{
-		hashByUUID: make(map[string]string),
-		uuidByHash: make(map[string]string),
+		hashByUUID:  make(map[string]string),
+		uuidByHash:  make(map[string]string),
+		ownerByHash: make(map[string]string),
 	}
-	each(func(hash, uuid string) {
-		resolver.add(hash, uuid)
+	each(func(hash, uuid, ownerNodeID string) {
+		resolver.add(hash, uuid, ownerNodeID)
 	})
 	return resolver
 }
 
-func (r lineUUIDAuthorityResolver) add(hash, uuid string) {
+func (r lineUUIDAuthorityResolver) add(hash, uuid, ownerNodeID string) {
 	hash = strings.TrimSpace(hash)
 	uuid = strings.ToLower(strings.TrimSpace(uuid))
 	if hash == "" {
 		return
 	}
 	r.uuidByHash[hash] = uuid
+	r.ownerByHash[hash] = strings.TrimSpace(ownerNodeID)
 	if !validLineUUIDv4(uuid) {
 		return
 	}
@@ -128,14 +142,22 @@ func (r lineUUIDAuthorityResolver) add(hash, uuid string) {
 	}
 }
 
-func (r lineUUIDAuthorityResolver) resolve(lineID, reportedUUID string, fallback func() string) string {
+func (r lineUUIDAuthorityResolver) resolve(nodeID, lineID, reportedUUID string, fallback func() string) string {
 	if explicit := stableLineHandle(lineID); explicit != "" {
 		return explicit
 	}
 	reportedUUID = strings.ToLower(strings.TrimSpace(reportedUUID))
 	if validLineUUIDv4(reportedUUID) {
 		if hash := r.hashByUUID[reportedUUID]; hash != "" {
-			return hash
+			owner := r.ownerByHash[hash]
+			if owner == strings.TrimSpace(nodeID) {
+				return hash
+			}
+			candidate := fallback()
+			if owner == "" && candidate == hash {
+				return hash
+			}
+			return candidate
 		}
 	}
 	return fallback()
@@ -168,9 +190,10 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// generations and lets all known lines resolve without per-line KV scans.
 	s.lineUUIDMu.Lock()
 	defer s.lineUUIDMu.Unlock()
-	uuidResolver := newLineUUIDAuthorityResolver(func(yield func(hash, uuid string)) {
-		for _, entry := range s.store.KV(lineUUIDKVBucket) {
-			yield(entry.Key, entry.Value)
+	uuidByHash, ownerByHash := s.store.LineUUIDAuthoritySnapshot()
+	uuidResolver := newLineUUIDAuthorityResolver(func(yield func(hash, uuid, ownerNodeID string)) {
+		for hash, uuid := range uuidByHash {
+			yield(hash, uuid, ownerByHash[hash])
 		}
 	})
 
@@ -244,7 +267,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				status = "error"
 				lastErr = inv.Error
 			}
-			lineID := firstNonEmpty(n.LineID, n.Metadata["line_id"])
+			lineID := effectiveDiscoveredLineID(n)
 			nodeUUID := firstNonEmpty(n.NodeIdentityUUID, n.Metadata["node_uuid"], n.Metadata["lattice_identity_uuid"], s.nodeIdentityUUID(inv.NodeID))
 			ln := Line{
 				LineID:             lineID,
@@ -272,7 +295,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				LastError:          lastErr,
 				Metadata:           n.Metadata,
 			}
-			ln.LineHashID = uuidResolver.resolve(ln.LineID, ln.LineUUID, func() string {
+			ln.LineHashID = uuidResolver.resolve(ln.NodeID, ln.LineID, ln.LineUUID, func() string {
 				return lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
 			})
 			ln.ID = ln.LineHashID
@@ -323,8 +346,18 @@ func (s *Server) buildLineGroups() []LineGroup {
 	for nodeID, lines := range byNode {
 		for i := range lines {
 			if uuid, ok := uuidResolver.uuid(lines[i].LineHashID); ok {
-				lines[i].LineUUID = uuid
-				continue
+				owner := uuidResolver.ownerByHash[lines[i].LineHashID]
+				if owner == lines[i].NodeID {
+					lines[i].LineUUID = uuid
+					continue
+				}
+				if owner == "" && provesLineUUIDAuthorityHash(lines[i]) {
+					if err := s.store.PutLineUUIDAuthority(lines[i].LineHashID, uuid, lines[i].NodeID); err == nil {
+						uuidResolver.ownerByHash[lines[i].LineHashID] = lines[i].NodeID
+						lines[i].LineUUID = uuid
+						continue
+					}
+				}
 			}
 			if persisted := uuidResolver.uuidByHash[lines[i].LineHashID]; persisted != "" {
 				s.logger.Printf("linemeta: reject non-unique or invalid persisted line_uuid %s for %s", persisted, lines[i].LineHashID)
@@ -342,13 +375,13 @@ func (s *Server) buildLineGroups() []LineGroup {
 					continue
 				}
 			}
-			if err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: lines[i].LineHashID, Value: uuid}); err != nil {
+			if err := s.store.PutLineUUIDAuthority(lines[i].LineHashID, uuid, lines[i].NodeID); err != nil {
 				s.logger.Printf("linemeta: persist line_uuid for %s: %v", lines[i].LineHashID, err)
 				lines[i].LineUUID = ""
 				continue
 			}
 			lines[i].LineUUID = uuid
-			uuidResolver.add(lines[i].LineHashID, uuid)
+			uuidResolver.add(lines[i].LineHashID, uuid, lines[i].NodeID)
 		}
 		byNode[nodeID] = lines
 	}

@@ -12,6 +12,61 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
+func TestPutLineUUIDAuthorityPublishesOnlyCommittedPair(t *testing.T) {
+	const (
+		hash    = "line_authority"
+		oldUUID = "11111111-1111-4111-8111-111111111111"
+		newUUID = "22222222-2222-4222-8222-222222222222"
+	)
+	open := func(t *testing.T) *Store {
+		t.Helper()
+		s, err := Open(filepath.Join(t.TempDir(), "state.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutLineUUIDAuthority(hash, oldUUID, "node-a"); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	assertPair := func(t *testing.T, s *Store, uuid, owner string) {
+		t.Helper()
+		uuids, owners := s.LineUUIDAuthoritySnapshot()
+		if uuids[hash] != uuid || owners[hash] != owner {
+			t.Fatalf("authority pair uuid=%q owner=%q, want %q/%q", uuids[hash], owners[hash], uuid, owner)
+		}
+	}
+	t.Run("pre_rename_failure_publishes_neither", func(t *testing.T) {
+		s := open(t)
+		if err := os.Mkdir(s.path+".tmp", 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutLineUUIDAuthority(hash, newUUID, "node-b"); err == nil {
+			t.Fatal("pre-rename persistence failure returned nil")
+		}
+		assertPair(t, s, oldUUID, "node-a")
+	})
+	t.Run("post_rename_error_publishes_both_then_confirms", func(t *testing.T) {
+		s := open(t)
+		calls := 0
+		s.syncParentDir = func(string) error {
+			calls++
+			if calls == 1 {
+				return errors.New("forced post-rename sync failure")
+			}
+			return nil
+		}
+		if err := s.PutLineUUIDAuthority(hash, newUUID, "node-b"); err == nil {
+			t.Fatal("post-rename durability failure returned nil")
+		}
+		assertPair(t, s, newUUID, "node-b")
+		if err := s.ConfirmDurability(); err != nil {
+			t.Fatal(err)
+		}
+		assertPair(t, s, newUUID, "node-b")
+	})
+}
+
 func TestLineChainPlanAndReserveUseExactGraphRevision(t *testing.T) {
 	store, err := Open("")
 	if err != nil {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/secret"
+	bolt "go.etcd.io/bbolt"
 )
 
 const snapshotRawCanary = "vless://credential-canary@example.invalid:443"
@@ -132,6 +133,53 @@ func TestCorruptSubscriptionEnvelopeMakesNoMigrationWrite(t *testing.T) {
 	}
 	if got := sha256.Sum256(after); got != want {
 		t.Fatalf("failed migration changed file digest: %x != %x", got, want)
+	}
+}
+
+func TestLegacyPlaintextSubscriptionSecretsMigrateInOneBoltUpdate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	bs, err := OpenBoltState(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySnapshot := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: snapshotRawCanary}
+	legacyShare := model.SubscriptionShare{ID: "share", Token: "share-plaintext-canary"}
+	if err := bs.db.Update(func(tx *bolt.Tx) error {
+		if err := putRecord(tx, boltBucketSubSnapshots, "p/s", legacySnapshot); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketSubShares, "share", legacyShare)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bs.testUpdateCalls = 0
+	got, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bs.testUpdateCalls != 1 {
+		t.Fatalf("migration updates = %d, want 1", bs.testUpdateCalls)
+	}
+	if got.SubscriptionSnapshots["p/s"].Raw != snapshotRawCanary || got.SubscriptionShares["share"].Token != "share-plaintext-canary" {
+		t.Fatalf("migrated values changed: %+v", got)
+	}
+	if err := bs.db.View(func(tx *bolt.Tx) error {
+		for _, bucket := range [][]byte{boltBucketSubSnapshots, boltBucketSubShares} {
+			if err := tx.Bucket(bucket).ForEach(func(_, value []byte) error {
+				if strings.Contains(string(value), snapshotRawCanary) || strings.Contains(string(value), "share-plaintext-canary") {
+					t.Fatal("plaintext survived in authoritative Bolt records")
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bs.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

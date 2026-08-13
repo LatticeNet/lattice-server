@@ -559,6 +559,7 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 	if err != nil {
 		return State{}, err
 	}
+	migrateSubscriptionSecrets := subscriptionSecretsNeedMigration(st, bs.cipher)
 	if err := decryptState(&st, bs.cipher); err != nil {
 		return State{}, err
 	}
@@ -568,6 +569,11 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 	}
 	if err := validateManagedLineCollections(st.ManagedLines, st.ManagedLineSecrets); err != nil {
 		return State{}, fmt.Errorf("invalid managed line secret collections: %w", err)
+	}
+	if migrateSubscriptionSecrets {
+		if err := bs.ImportState(st); err != nil {
+			return State{}, fmt.Errorf("migrate subscription secrets: %w", err)
+		}
 	}
 	return st, nil
 }

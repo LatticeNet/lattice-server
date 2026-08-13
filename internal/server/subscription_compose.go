@@ -1,25 +1,73 @@
 package server
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"time"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
-const (
-	graphSubscriptionRenderer         = "vpn-core-graph-v1"
-	maxGraphSubscriptionRoots         = 2_048
-	maxGraphSubscriptionVisited       = 10_000
-	maxGraphSubscriptionURIBytes      = 4 << 10
-	maxGraphSubscriptionRawBytes      = 1 << 20
-	maxGraphSubscriptionManifestBytes = 1 << 20
-)
+func decodeStrictGraphSubscriptionRequest(raw []byte, out *graphSubscriptionRequest) error {
+	if len(bytes.TrimSpace(raw)) == 0 || len(raw) > model.MaxSubscriptionResponseBytes {
+		return errors.New("invalid request")
+	}
+	if err := scanUniqueJSONValue(json.NewDecoder(bytes.NewReader(raw))); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return errors.New("invalid trailing JSON")
+	}
+	return nil
+}
+
+func scanUniqueJSONValue(dec *json.Decoder) error {
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	if delim == '{' {
+		seen := map[string]bool{}
+		for dec.More() {
+			keyToken, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok || seen[key] {
+				return fmt.Errorf("duplicate or invalid JSON field")
+			}
+			seen[key] = true
+			if err := scanUniqueJSONValue(dec); err != nil {
+				return err
+			}
+		}
+	} else if delim == '[' {
+		for dec.More() {
+			if err := scanUniqueJSONValue(dec); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = dec.Token()
+	return err
+}
 
 type graphSubscriptionRequest struct {
 	SchemaVersion int      `json:"schema_version"`
@@ -40,53 +88,6 @@ type graphSubscriptionResponse struct {
 	Entries        []string                `json:"entries,omitempty"`
 	Raw            string                  `json:"raw,omitempty"`
 	Error          *graphSubscriptionError `json:"error,omitempty"`
-}
-
-type graphSubscriptionManifest struct {
-	Schema     string                            `json:"schema"`
-	Renderer   string                            `json:"renderer"`
-	Identity   graphSubscriptionManifestIdentity `json:"identity"`
-	EntryRoots []string                          `json:"entry_roots"`
-	Entries    []graphSubscriptionManifestEntry  `json:"entries"`
-}
-
-type graphSubscriptionManifestIdentity struct {
-	ID         string `json:"id"`
-	Generation uint64 `json:"generation"`
-}
-
-type graphSubscriptionManifestEntry struct {
-	Root     string                            `json:"root"`
-	Endpoint graphSubscriptionManifestEndpoint `json:"endpoint"`
-	Path     []graphSubscriptionManifestEdge   `json:"path"`
-	Terminal graphSubscriptionManifestTerminal `json:"terminal"`
-}
-
-type graphSubscriptionManifestEndpoint struct {
-	LineUUID    string   `json:"line_uuid"`
-	NodeID      string   `json:"node_id"`
-	Host        string   `json:"host"`
-	Port        int      `json:"port"`
-	SNI         string   `json:"sni"`
-	Fingerprint string   `json:"fingerprint"`
-	ALPN        []string `json:"alpn"`
-	PublicKey   string   `json:"public_key"`
-	ShortID     string   `json:"short_id"`
-}
-
-type graphSubscriptionManifestEdge struct {
-	Source              string `json:"source"`
-	Target              string `json:"target"`
-	Generation          uint64 `json:"generation"`
-	ObservationRevision uint64 `json:"observation_revision"`
-	Status              string `json:"status"`
-}
-
-type graphSubscriptionManifestTerminal struct {
-	LineUUID            string `json:"line_uuid"`
-	Generation          uint64 `json:"generation"`
-	ObservationRevision uint64 `json:"observation_revision"`
-	Status              string `json:"status"`
 }
 
 type graphComposeFailure struct{ code string }
@@ -118,7 +119,7 @@ func composeFailureView(err error) *graphSubscriptionError {
 
 func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscriptionRequest, now time.Time) (graphSubscriptionResponse, error) {
 	identityID := strings.TrimSpace(req.IdentityID)
-	if req.SchemaVersion != 1 || identityID == "" || len(req.EntryRoots) == 0 || len(req.EntryRoots) > maxGraphSubscriptionRoots {
+	if req.SchemaVersion != 1 || identityID == "" || len(req.EntryRoots) == 0 || len(req.EntryRoots) > model.MaxSubscriptionSourceRoots {
 		return graphSubscriptionResponse{}, composeFailure("invalid_request")
 	}
 	identity, ok := snapshot.Users[identityID]
@@ -143,10 +144,10 @@ func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscr
 	}
 	seenRoots := make(map[string]bool, len(req.EntryRoots))
 	visitedAll := make(map[string]bool)
-	manifest := graphSubscriptionManifest{
-		Schema: "lattice.vpn-core-graph-manifest.v1", Renderer: graphSubscriptionRenderer,
-		Identity:   graphSubscriptionManifestIdentity{ID: identityID, Generation: identity.SubscriptionGeneration},
-		EntryRoots: make([]string, 0, len(req.EntryRoots)), Entries: make([]graphSubscriptionManifestEntry, 0, len(req.EntryRoots)),
+	manifest := model.SubscriptionSourceManifestV1{
+		Schema: model.SubscriptionSourceManifestSchemaV1, Renderer: model.SubscriptionSourceRendererV1,
+		Identity:   model.SubscriptionSourceManifestIdentity{ID: identityID, Generation: identity.SubscriptionGeneration},
+		EntryRoots: make([]string, 0, len(req.EntryRoots)), Entries: make([]model.SubscriptionSourceManifestEntry, 0, len(req.EntryRoots)),
 	}
 	entries := make([]string, 0, len(req.EntryRoots))
 	rawBytes := 0
@@ -174,14 +175,14 @@ func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscr
 			return graphSubscriptionResponse{}, composeFailure("unsupported_line")
 		}
 		uri := endpoint.Link()
-		if len(uri) > maxGraphSubscriptionURIBytes {
+		if len(uri) > model.MaxSubscriptionURIBytes {
 			return graphSubscriptionResponse{}, composeFailure("bounds_exceeded")
 		}
 		rawBytes += len(uri)
 		if len(entries) > 0 {
 			rawBytes++
 		}
-		if rawBytes > maxGraphSubscriptionRawBytes {
+		if rawBytes > model.MaxSubscriptionRawBytes {
 			return graphSubscriptionResponse{}, composeFailure("bounds_exceeded")
 		}
 		path, terminal, err := composeDeclaredPath(snapshot, root, activeSources, visitedAll)
@@ -189,19 +190,18 @@ func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscr
 			return graphSubscriptionResponse{}, err
 		}
 		entries = append(entries, uri)
-		manifest.Entries = append(manifest.Entries, graphSubscriptionManifestEntry{
+		manifest.Entries = append(manifest.Entries, model.SubscriptionSourceManifestEntry{
 			Root: root,
-			Endpoint: graphSubscriptionManifestEndpoint{LineUUID: root, NodeID: rootLine.NodeID, Host: endpoint.Server, Port: endpoint.ServerPort,
-				SNI: endpoint.SNI, Fingerprint: endpoint.Fingerprint, ALPN: append([]string(nil), endpoint.ALPN...), PublicKey: endpoint.PublicKey, ShortID: endpoint.ShortID},
+			Endpoint: model.SubscriptionSourceManifestEndpoint{LineUUID: root, NodeID: rootLine.NodeID, Label: rootLine.Name, Host: endpoint.Server, Port: endpoint.ServerPort,
+				SNI: endpoint.SNI, Fingerprint: endpoint.Fingerprint, ALPN: append(make([]string, 0, len(endpoint.ALPN)), endpoint.ALPN...), PublicKey: endpoint.PublicKey, ShortID: endpoint.ShortID, Flow: endpoint.Flow},
 			Path: path, Terminal: terminal,
 		})
 	}
-	manifestRaw, err := json.Marshal(manifest)
-	if err != nil || len(manifestRaw) > maxGraphSubscriptionManifestBytes {
+	manifestRaw, sourceVersion, err := model.CanonicalSubscriptionSourceManifest(manifest)
+	if err != nil {
 		return graphSubscriptionResponse{}, composeFailure("bounds_exceeded")
 	}
-	digest := sha256.Sum256(manifestRaw)
-	return graphSubscriptionResponse{SchemaVersion: 1, OK: true, SourceVersion: "sv1:" + hex.EncodeToString(digest[:]),
+	return graphSubscriptionResponse{SchemaVersion: 1, OK: true, SourceVersion: sourceVersion,
 		SourceManifest: manifestRaw, Entries: entries, Raw: strings.Join(entries, "\n")}, nil
 }
 
@@ -220,45 +220,45 @@ func composeLine(snapshot lineChainCompileSnapshot, uuid string) (Line, managedL
 	return line, definition, nil
 }
 
-func composeDeclaredPath(snapshot lineChainCompileSnapshot, root string, activeSources, visitedAll map[string]bool) ([]graphSubscriptionManifestEdge, graphSubscriptionManifestTerminal, error) {
-	path := make([]graphSubscriptionManifestEdge, 0)
+func composeDeclaredPath(snapshot lineChainCompileSnapshot, root string, activeSources, visitedAll map[string]bool) ([]model.SubscriptionSourceManifestEdge, model.SubscriptionSourceManifestTerminal, error) {
+	path := make([]model.SubscriptionSourceManifestEdge, 0)
 	seen := make(map[string]bool)
 	current := root
 	for {
 		if seen[current] {
-			return nil, graphSubscriptionManifestTerminal{}, composeFailure("graph_cycle")
+			return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("graph_cycle")
 		}
 		seen[current] = true
 		if !visitedAll[current] {
 			visitedAll[current] = true
-			if len(visitedAll) > maxGraphSubscriptionVisited {
-				return nil, graphSubscriptionManifestTerminal{}, composeFailure("bounds_exceeded")
+			if len(visitedAll) > model.MaxSubscriptionSourceVisits {
+				return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("bounds_exceeded")
 			}
 		}
 		if activeSources[current] {
-			return nil, graphSubscriptionManifestTerminal{}, composeFailure("graph_busy")
+			return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("graph_busy")
 		}
 		line, _, err := composeLine(snapshot, current)
 		if err != nil {
-			return nil, graphSubscriptionManifestTerminal{}, err
+			return nil, model.SubscriptionSourceManifestTerminal{}, err
 		}
 		definition, ok := snapshot.Chains.Definitions[current]
 		if !ok {
-			return nil, graphSubscriptionManifestTerminal{}, composeFailure("graph_undeclared")
+			return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("graph_undeclared")
 		}
 		if definition.Status != store.LineChainStatusConverged {
-			return nil, graphSubscriptionManifestTerminal{}, composeFailure("graph_not_converged")
+			return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("graph_not_converged")
 		}
 		observed := strings.ToLower(strings.TrimSpace(line.DownstreamLineUUID))
 		target := strings.ToLower(strings.TrimSpace(definition.TargetLineUUID))
 		if observed != target {
-			return nil, graphSubscriptionManifestTerminal{}, composeFailure("graph_drifted")
+			return nil, model.SubscriptionSourceManifestTerminal{}, composeFailure("graph_drifted")
 		}
 		if target == "" {
-			return path, graphSubscriptionManifestTerminal{LineUUID: current, Generation: definition.Generation,
+			return path, model.SubscriptionSourceManifestTerminal{LineUUID: current, Generation: definition.Generation,
 				ObservationRevision: definition.ObservationRevision, Status: definition.Status}, nil
 		}
-		path = append(path, graphSubscriptionManifestEdge{Source: current, Target: target, Generation: definition.Generation,
+		path = append(path, model.SubscriptionSourceManifestEdge{Source: current, Target: target, Generation: definition.Generation,
 			ObservationRevision: definition.ObservationRevision, Status: definition.Status})
 		current = target
 	}

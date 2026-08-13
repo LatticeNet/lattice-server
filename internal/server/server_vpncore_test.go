@@ -177,6 +177,47 @@ func TestVPNCoreNodesRPCRegisteredAndExports(t *testing.T) {
 	}
 }
 
+func TestVPNCoreSubscriptionSourcesRPCRegisteredAndFailsAllOrNone(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateCorePlugin(t, st, vpnCorePluginID)
+	found := false
+	for _, service := range srv.pluginRPC.Services() {
+		if service.Service == vpnCoreSubscriptionSourcesService {
+			found = service.Owner == vpnCorePluginID && service.Version == "v1" && len(service.Methods) == 1 && service.Methods[0] == "compose"
+		}
+	}
+	if !found {
+		t.Fatalf("subscription sources service not registered: %+v", srv.pluginRPC.Services())
+	}
+	for _, request := range []string{
+		`{"schema_version":1,"identity_id":"missing","entry_roots":["` + composeRootUUID + `"]}`,
+		`{"schema_version":1,"schema_version":1,"identity_id":"missing","entry_roots":["` + composeRootUUID + `"]}`,
+		`{"schema_version":1,"identity_id":"missing","entry_roots":[],"unknown":true}`,
+	} {
+		raw, err := srv.pluginRPC.Call(context.Background(), vpnCorePluginID, vpnCoreSubscriptionSourcesService, "compose", []byte(request))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response graphSubscriptionResponse
+		if err := json.Unmarshal(raw, &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.OK || response.Error == nil || response.SourceVersion != "" || len(response.SourceManifest) != 0 || len(response.Entries) != 0 || response.Raw != "" {
+			t.Fatalf("failure was not all-or-none: %s", raw)
+		}
+		if strings.Contains(string(raw), composeRootUUID) || strings.Contains(string(raw), "missing") {
+			t.Fatalf("failure leaked request inputs: %s", raw)
+		}
+	}
+}
+
 func TestVPNCoreDesign15MutationMethodsRegisteredAndReachable(t *testing.T) {
 	st, err := store.Open("")
 	if err != nil {

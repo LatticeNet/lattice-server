@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
@@ -33,7 +34,8 @@ const (
 	// vpnCoreUsageService is the 3-D usage read-model (design-12 S3), proxy:read.
 	vpnCoreUsageService = "latticenet.vpn-core/usage"
 	// vpnCoreProfilesService is the per-node runtime read-model (design-12 S4), proxy:read.
-	vpnCoreProfilesService = "latticenet.vpn-core/profiles"
+	vpnCoreProfilesService            = "latticenet.vpn-core/profiles"
+	vpnCoreSubscriptionSourcesService = "latticenet.vpn-core/subscription-sources"
 )
 
 // registerVPNCoreRPC registers the in-core vpn-core services on the server's RPC
@@ -62,6 +64,33 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProfilesService, "v1", []string{"query", "settings", "configure"}, s.vpnCoreProfilesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreProfilesService, err)
 	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionSourcesService, "v1", []string{"compose"}, s.vpnCoreSubscriptionSourcesRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreSubscriptionSourcesService, err)
+	}
+}
+
+func (s *Server) vpnCoreSubscriptionSourcesRPC(_ context.Context, method string, request []byte) ([]byte, error) {
+	response := graphSubscriptionResponse{SchemaVersion: 1}
+	if method != "compose" || len(request) > model.MaxSubscriptionResponseBytes {
+		response.Error = composeFailureView(composeFailure("invalid_request"))
+		return json.Marshal(response)
+	}
+	var req graphSubscriptionRequest
+	if err := decodeStrictGraphSubscriptionRequest(request, &req); err != nil {
+		response.Error = composeFailureView(composeFailure("invalid_request"))
+		return json.Marshal(response)
+	}
+	// One persistent snapshot and one live projection are the complete authority
+	// for this call. composeGraphSubscription performs no subsequent server reads.
+	persistent := s.store.LineChainCompileStateSnapshot()
+	snapshot, err := s.captureLineChainCompileSnapshotFromState(persistent)
+	if err == nil {
+		response, err = composeGraphSubscription(snapshot, req, time.Now().UTC())
+	}
+	if err != nil {
+		response = graphSubscriptionResponse{SchemaVersion: 1, Error: composeFailureView(err)}
+	}
+	return json.Marshal(response)
 }
 
 // vpnCoreLinesRPC serves the vpn-core/lines read-model — the unified, node-grouped

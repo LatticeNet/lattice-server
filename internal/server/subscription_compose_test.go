@@ -63,10 +63,14 @@ func TestComposeGraphSubscriptionIsCanonicalSecretFreeAndStable(t *testing.T) {
 	if strings.Contains(string(first.SourceManifest), composeIdentityUUID) || strings.Contains(string(first.SourceManifest), "vless://") {
 		t.Fatalf("manifest contains credential or URI: %s", first.SourceManifest)
 	}
-	var manifest graphSubscriptionManifest
+	var manifest model.SubscriptionSourceManifestV1
 	if err := json.Unmarshal(first.SourceManifest, &manifest); err != nil || manifest.Identity.Generation != 7 ||
 		len(manifest.Entries) != 1 || len(manifest.Entries[0].Path) != 1 || manifest.Entries[0].Terminal.LineUUID != composeTerminalUUID {
 		t.Fatalf("manifest mismatch: %+v err=%v", manifest, err)
+	}
+	decoded, err := model.DecodeSubscriptionSourceManifest(first.SourceManifest)
+	if err != nil || !reflect.DeepEqual(decoded, manifest) || manifest.Entries[0].Endpoint.Label != composeRootUUID || manifest.Entries[0].Endpoint.Flow != "xtls-rprx-vision" || manifest.Entries[0].Endpoint.ALPN == nil {
+		t.Fatalf("SDK canonical manifest mismatch: %+v err=%v", decoded, err)
 	}
 
 	unrelated := testGraphComposeSnapshot()
@@ -82,6 +86,12 @@ func TestComposeGraphSubscriptionIsCanonicalSecretFreeAndStable(t *testing.T) {
 	changed, _ := composeGraphSubscription(rotated, req, time.Now())
 	if changed.SourceVersion == first.SourceVersion {
 		t.Fatal("credential generation did not change source version")
+	}
+	publicDrift := testGraphComposeSnapshot()
+	publicDrift.Lines[composeRootUUID][0].Name = "changed-label"
+	drifted, _ := composeGraphSubscription(publicDrift, req, time.Now())
+	if drifted.SourceVersion == first.SourceVersion {
+		t.Fatal("public renderer input did not change source version")
 	}
 }
 

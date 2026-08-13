@@ -72,6 +72,7 @@ type systemPluginState struct {
 	failures int
 	tripped  bool
 	pool     *systemPool
+	isV2     bool
 }
 
 // SystemRunner implements Runner and Invoker.
@@ -168,7 +169,8 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 		}
 	}
 	r.mu.Lock()
-	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool}
+	isV2 := req.Loaded.Manifest.Runtime != nil && req.Loaded.Manifest.Runtime.Protocol == RuntimeProtocolStdioJSONV2
+	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2}
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
 }
@@ -309,13 +311,30 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	if tripped {
 		return InvokeResponse{}, fmt.Errorf("%w: %s", ErrCircuitOpen, req.PluginID)
 	}
-	if st.pool != nil && st.pool.hasTransport() {
-		w, err := st.pool.checkout(ctx, time.Now())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	budget, err := r.invokeBudget(req)
+	if err != nil {
+		return InvokeResponse{}, err
+	}
+	runCtx, cancel := context.WithTimeout(ctx, budget.Timeout)
+	defer cancel()
+	runCtx, err = BindOperatorTargets(runCtx, req.Constraints.OperatorTargets)
+	if err != nil {
+		return InvokeResponse{}, err
+	}
+	runCtx, err = BindOperation(runCtx, req.Constraints.Operation)
+	if err != nil {
+		return InvokeResponse{}, err
+	}
+	if st.isV2 {
+		w, err := st.pool.checkout(runCtx, time.Now())
 		if err != nil {
 			return InvokeResponse{}, err
 		}
 		invocation := fmt.Sprintf("%d", time.Now().UnixNano())
-		reply, callErr := w.transport.invokeV2(req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(ctx, broker, call) })
+		reply, callErr := w.transport.invokeV2(req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) })
 		if callErr != nil {
 			st.pool.poison(w)
 			return InvokeResponse{}, callErr
@@ -330,25 +349,7 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 		return InvokeResponse{OK: true, Message: reply.Message, Result: reply.Result}, nil
 	}
 
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	budget, err := r.invokeBudget(req)
-	if err != nil {
-		return InvokeResponse{}, err
-	}
-	runCtx, cancel := context.WithTimeout(ctx, budget.Timeout)
-	defer cancel()
-	runCtx, err = BindOperatorTargets(runCtx, req.Constraints.OperatorTargets)
-	if err != nil {
-		return InvokeResponse{}, fmt.Errorf("bind operator targets: %w", err)
-	}
-	// The approved operation's authority lives here, on the host side of the boundary,
-	// for exactly this invocation. The child never receives it.
-	runCtx, err = BindOperation(runCtx, req.Constraints.Operation)
-	if err != nil {
-		return InvokeResponse{}, fmt.Errorf("bind operation: %w", err)
-	}
+	// The approved operation's authority is bound before protocol selection.
 
 	reply, stderr, stderrTruncated, runErr := r.runInvocation(runCtx, req, execPath, workDir, broker, budget)
 	if runErr != nil {

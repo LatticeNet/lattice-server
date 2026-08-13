@@ -90,8 +90,8 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("expected one update task, got %+v", tasks)
 	}
-	if tasks[0].TimeoutSec != 300 {
-		t.Fatalf("agent update should get a longer download timeout, got %d", tasks[0].TimeoutSec)
+	if tasks[0].TimeoutSec != 900 {
+		t.Fatalf("agent update should get the extended download timeout (900s), got %d", tasks[0].TimeoutSec)
 	}
 	script := tasks[0].Script
 	for _, want := range []string{
@@ -595,7 +595,7 @@ func TestAgentReleaseCandidatesExposeChannels(t *testing.T) {
 	}
 }
 
-func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
+func TestAgentUpdateFailureReturnsApprovalToPending(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
 	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
@@ -625,10 +625,10 @@ func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 		t.Fatal(err)
 	}
 	failedApproval, ok := st.Approval(approval.ID)
-	if !ok || failedApproval.Status != model.ApprovalRejected {
-		t.Fatalf("failed update should close approval as rejected: ok=%v approval=%+v", ok, failedApproval)
+	if !ok || failedApproval.Status != model.ApprovalPending {
+		t.Fatalf("failed update must return the approval to pending for retry (execution failure is not a decision): ok=%v approval=%+v", ok, failedApproval)
 	}
-	if !strings.Contains(failedApproval.Reason, "download failed") {
+	if !strings.Contains(failedApproval.Reason, "execution failed") || !strings.Contains(failedApproval.Reason, "download failed") {
 		t.Fatalf("failed update approval should expose failure reason, got %q", failedApproval.Reason)
 	}
 	if !strings.Contains(failedApproval.Reason, "error=exit status 1") || !strings.Contains(failedApproval.Reason, "exit_code=1") {
@@ -640,17 +640,14 @@ func TestAgentUpdateFailureClosesApprovalAndAllowsReplan(t *testing.T) {
 	}
 	srv.evaluateAgentUpdatePolicies(now.Add(2 * time.Hour))
 	approvals := st.Approvals()
-	if len(approvals) != 2 {
-		t.Fatalf("a rejected update should allow a fresh auto-plan, got %+v", approvals)
+	// The re-pended approval IS the retry vehicle: the auto-planner must dedup
+	// against it (same node, same action payload) instead of stacking a second
+	// pending card for the identical plan.
+	if len(approvals) != 1 {
+		t.Fatalf("re-planning must dedup against the re-pended failure, got %+v", approvals)
 	}
-	pending := 0
-	for _, approval := range approvals {
-		if approval.Status == model.ApprovalPending {
-			pending++
-		}
-	}
-	if pending != 1 {
-		t.Fatalf("expected exactly one fresh pending approval after failure, got %+v", approvals)
+	if approvals[0].Status != model.ApprovalPending || !strings.Contains(approvals[0].Reason, "execution failed") {
+		t.Fatalf("the re-pended approval remains the single pending retry card, got %+v", approvals[0])
 	}
 }
 
@@ -1271,5 +1268,33 @@ func saveAgentUpdatePolicy(t *testing.T, handler http.Handler, cookies []*http.C
 	defer save.Body.Close()
 	if save.StatusCode != http.StatusOK {
 		t.Fatalf("save policy %s failed: %d", version, save.StatusCode)
+	}
+}
+
+// The update task runs inside the agent's rlimit shim (RLIMIT_FSIZE 8 MiB) and
+// the release binary is larger — the fleet proved it on 2026-08-12 (SIGXFSZ,
+// exit 153, on 18 nodes). The script must lift its inherited cap before the
+// download; this works with the agents already deployed because tasks run as
+// root and the limit is raised by the script itself.
+func TestAgentUpdateApplyScriptLiftsFileSizeLimit(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "manual", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := agentUpdateApplyScript(approval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(script, "ulimit -Hf unlimited") || !strings.Contains(script, "ulimit -Sf unlimited") {
+		t.Fatalf("apply script must lift RLIMIT_FSIZE before the binary download:\n%s", script[:400])
 	}
 }

@@ -46,6 +46,20 @@ type Manifest struct {
 	// signature (see SigningPayload) so a tampered contribution fails verification.
 	UI         *ManifestUI         `json:"ui,omitempty"`
 	Interfaces []InterfaceContract `json:"interfaces,omitempty"`
+	// Dependencies declares plugin-to-plugin requirements (design-18 D3/E1).
+	// Required dependencies gate both load and activation; optional ones are
+	// advisory. Covered by the v2 signing payload like every other field.
+	Dependencies []DependencySpec `json:"dependencies,omitempty"`
+}
+
+// DependencySpec names one required or optional plugin dependency. Version is
+// a comparator set (">=0.8.0-alpha.5, <0.9"); empty means any installed
+// version. A missing required dependency refuses load; a present-but-inactive
+// one refuses activation.
+type DependencySpec struct {
+	ID       string `json:"id"`
+	Version  string `json:"version,omitempty"`
+	Optional bool   `json:"optional,omitempty"`
 }
 
 type TrustPolicy struct {
@@ -182,6 +196,30 @@ func ValidateManifest(m Manifest) error {
 	}
 	if err := validateContributions(m); err != nil {
 		return err
+	}
+	return validateDependencies(m)
+}
+
+// validateDependencies enforces the dependency block's shape (design-18 E1):
+// valid plugin ids, no self-reference, no duplicates, and a parseable version
+// comparator set. Satisfaction is a loader/activation concern; this is the
+// structural gate every signed manifest passes before trust evaluation.
+func validateDependencies(m Manifest) error {
+	seen := map[string]bool{}
+	for _, dep := range m.Dependencies {
+		if !validPluginID(dep.ID) {
+			return fmt.Errorf("dependency %q is not a valid plugin id", dep.ID)
+		}
+		if dep.ID == m.ID {
+			return errors.New("a plugin cannot depend on itself")
+		}
+		if seen[dep.ID] {
+			return fmt.Errorf("dependency %q is duplicated", dep.ID)
+		}
+		seen[dep.ID] = true
+		if err := validVersionRange(dep.Version); err != nil {
+			return fmt.Errorf("dependency %q: %w", dep.ID, err)
+		}
 	}
 	return nil
 }

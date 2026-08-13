@@ -512,6 +512,12 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 			s.logger.Printf("plugin lifecycle: failed to record %s: %v", pl.Manifest.ID, err)
 		}
 		if status == model.PluginStatusActive {
+			if unmet := s.unmetActiveDependencies(pl.Manifest); len(unmet) > 0 {
+				reason := "required dependencies not active: " + strings.Join(unmet, ", ")
+				s.logger.Printf("plugin runtime: %s stays unarmed: %s", pl.Manifest.ID, reason)
+				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: reason, Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
+				continue
+			}
 			s.applyPluginHostAccess(pl)
 			rt, err := s.pluginRuntime.Start(context.Background(), pl)
 			if err != nil {
@@ -533,6 +539,33 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 	if len(outcomes) > 0 {
 		s.logger.Printf("plugin loader: %d loaded, %d rejected (dir=%s)", len(loaded), len(outcomes)-len(loaded), dir)
 	}
+}
+
+// unmetActiveDependencies lists a manifest's REQUIRED dependencies that are
+// not satisfied by an active, in-range installation (design-18 E1). Load
+// refuses absent/out-of-range dependency plugins outright; this gate covers
+// the remaining gap: a dependency that is installed but not active cannot
+// serve rpc:calls, so activation must refuse until it is.
+func (s *Server) unmetActiveDependencies(manifest plugin.Manifest) []string {
+	var unmet []string
+	for _, dep := range manifest.Dependencies {
+		if dep.Optional {
+			continue
+		}
+		inst, ok := s.store.PluginInstallation(dep.ID)
+		if !ok {
+			unmet = append(unmet, dep.ID+" (not installed)")
+			continue
+		}
+		if inst.Status != model.PluginStatusActive {
+			unmet = append(unmet, dep.ID+" (not active)")
+			continue
+		}
+		if !plugin.VersionInRange(inst.Version, dep.Version) {
+			unmet = append(unmet, fmt.Sprintf("%s (installed %s, need %s)", dep.ID, inst.Version, dep.Version))
+		}
+	}
+	return unmet
 }
 
 func pluginInstallationFromLoaded(pl plugin.Loaded, status string) model.PluginInstallation {
@@ -661,6 +694,15 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 		if pluginStatusRequiresLoadedBundle(req.Status) && !s.pluginLoaded(req.ID) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("plugin bundle is not currently verified and loaded: %s", req.ID))
 			return
+		}
+		if req.Status == model.PluginStatusActive {
+			if loaded, ok := s.loadedPlugin(req.ID); ok {
+				if unmet := s.unmetActiveDependencies(loaded.Manifest); len(unmet) > 0 {
+					s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.status", Scope: "plugin:admin", Decision: "deny", Reason: "required dependencies not active: " + strings.Join(unmet, ", "), Metadata: map[string]string{"plugin_id": req.ID, "status": req.Status}})
+					writeError(w, http.StatusConflict, fmt.Errorf("required dependencies not active: %s", strings.Join(unmet, ", ")))
+					return
+				}
+			}
 		}
 		if err := s.store.SetPluginStatus(req.ID, req.Status); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -946,6 +988,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
 	mux.HandleFunc("/api/network/nft/inputs", s.withAuth("network:plan", s.handleNFTInputs))
 	mux.HandleFunc("/api/network/nft/inputs/delete", s.withAuth("network:plan", s.handleDeleteNFTInputs))
+	// design-17 S1: managed-line overlay rollout compiler + definition views.
+	mux.HandleFunc("/api/network/lines/managed-rollout", s.withAuth("network:plan", s.handleManagedLineRollout))
 	mux.HandleFunc("/api/netpolicy", s.withAuth("", s.handleNetPolicy))
 	mux.HandleFunc("/api/netpolicy/plan", s.withAuth("", s.handleNetPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/delete", s.withAuth("", s.handleDeleteNetPolicy))
@@ -4747,7 +4791,10 @@ func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval
 func approvalApplyTaskTimeoutSec(plugin string) int {
 	switch plugin {
 	case agentUpdatePlugin:
-		return 300
+		// 900s: the download leg is github-release egress from the node's own
+		// network — a CN residential uplink can need minutes for ~7 MiB, and
+		// 300s produced "context deadline exceeded" on cd-hs-sh (2026-08-12).
+		return 900
 	case "nft", "nftpolicy", "selfdns":
 		return networkApplyTaskTimeoutSec
 	default:
@@ -5602,6 +5649,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
+	if approval.Plugin == singBoxManagedLinePlugin {
+		if _, _, _, err := s.validateManagedLineApproval(approval); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+	}
 	if approval.Plugin == agentUpdatePlugin {
 		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
 			if errors.Is(err, errAgentUpdateApprovalStale) {
@@ -5685,6 +5737,10 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			if err != nil {
 				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 			}
+		case singBoxManagedLinePlugin:
+			// The script self-validates at render time; a stale plan yields a
+			// script that fails closed on the box instead of mutating it.
+			applyScript = s.managedLineApplyScript(approval)
 		default:
 			applyScript = s.applyScriptFor(approval)
 		}
@@ -6235,6 +6291,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == singBoxLineMetaPlugin {
 		return s.handleLineMetaTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin == singBoxManagedLinePlugin {
+		return s.handleManagedLineTaskResult(r, approval, task, result)
 	}
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)

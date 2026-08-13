@@ -1599,6 +1599,21 @@ func taskLeaseMatches(task model.Task, nodeID, leaseID string) bool {
 	return task.LeasedBy == nodeID && task.LeaseID != "" && task.LeaseID == leaseID
 }
 
+// taskLeaseSafetyMargin bounds how long a lease may outlive its task timeout
+// before it is treated as dead. A zero start remains non-expiring because
+// legacy rows do not provide enough evidence to authorize re-execution.
+const taskLeaseSafetyMargin = 5 * time.Minute
+
+func taskLeaseExpired(startedAt time.Time, timeoutSec int) bool {
+	if startedAt.IsZero() {
+		return false
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = 900
+	}
+	return time.Since(startedAt) > time.Duration(timeoutSec)*time.Second+taskLeaseSafetyMargin
+}
+
 func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult) bool {
 	if !contains(t.Targets, nodeID) {
 		return false
@@ -1612,10 +1627,16 @@ func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult)
 		}
 	}
 	if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
-		return false
+		if !taskLeaseExpired(lease.StartedAt, t.TimeoutSec) {
+			return false
+		}
 	}
+	// Backward-compatible single-lease tasks created before TargetLeases existed
+	// may be re-leased only when their recorded lease is certainly dead.
 	if t.LeasedBy == nodeID && t.LeaseID != "" {
-		return false
+		if !taskLeaseExpired(t.StartedAt, t.TimeoutSec) {
+			return false
+		}
 	}
 	return true
 }

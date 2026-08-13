@@ -345,6 +345,23 @@ func (s *Server) buildLineGroups() []LineGroup {
 		}
 	}
 
+	// E3 committed chain authority overlays ordinary discovery before metadata is
+	// rendered. Attempts are intentionally excluded: pending and failed
+	// candidates must never leak into DownstreamLineUUID/JumpEdges. A committed
+	// remove tombstone carries an empty target and therefore clears only the
+	// source declaration while observation catches up.
+	committedChains := s.store.LineChainSnapshot().Definitions
+	for nodeID, lines := range byNode {
+		for i := range lines {
+			definition, ok := committedChains[strings.ToLower(strings.TrimSpace(lines[i].LineUUID))]
+			if !ok {
+				continue
+			}
+			lines[i].DownstreamLineUUID = strings.ToLower(strings.TrimSpace(definition.TargetLineUUID))
+		}
+		byNode[nodeID] = lines
+	}
+
 	// (5) design-15 §6: declared chain edges. A sidecar-declared
 	// downstream_line_uuid resolves to the downstream line's hash fleet-wide —
 	// exact across machines, immune to NAT and shared ports — and takes

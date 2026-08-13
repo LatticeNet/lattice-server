@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -152,12 +153,12 @@ func TestLineChainPublicOperationProjectsReplace(t *testing.T) {
 }
 
 func TestLineChainAgentTaskViewCarriesExactDurableProtocol(t *testing.T) {
-	view := toAgentTaskView(model.Task{ID: "task-1", LeaseID: "lease-1"}, true, store.DurableProtocolLineChainV1)
+	view := toAgentTaskView(model.Task{ID: "task-1", LeaseID: "lease-1"}, true, store.DurableProtocolLineChainV2)
 	raw, err := json.Marshal(view)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `"durable_protocol":"linechain-e3-v1"`) {
+	if !strings.Contains(string(raw), `"durable_protocol":"linechain-e3-v2"`) {
 		t.Fatalf("linechain response protocol mismatch: %s", raw)
 	}
 }
@@ -200,7 +201,7 @@ func TestLineChainHTTPPollRecoveryRedeliveryAndResultReplay(t *testing.T) {
 	}
 	first := poll(true)
 	var firstTasks []agentTaskView
-	if first.Code != http.StatusOK || json.Unmarshal(first.Body.Bytes(), &firstTasks) != nil || len(firstTasks) != 1 || firstTasks[0].DurableProtocol != store.DurableProtocolLineChainV1 {
+	if first.Code != http.StatusOK || json.Unmarshal(first.Body.Bytes(), &firstTasks) != nil || len(firstTasks) != 1 || firstTasks[0].DurableProtocol != store.DurableProtocolLineChainV2 {
 		t.Fatalf("capability recovery did not lease E3 task: code=%d body=%s snapshot=%+v", first.Code, first.Body.String(), srv.store.LineChainSnapshot())
 	}
 	second := poll(true)
@@ -228,6 +229,11 @@ func TestLineChainHTTPPollRecoveryRedeliveryAndResultReplay(t *testing.T) {
 
 func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	fixturePath := strings.TrimSpace(os.Getenv("LATTICE_LINECHAIN_FIXTURE_OUT"))
+	if fixturePath == "" {
+		fixturePath = filepath.Join(t.TempDir(), "server-issued-linechain-v2.json")
+		t.Setenv("LATTICE_LINECHAIN_FIXTURE_OUT", fixturePath)
+	}
 	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
 	if err != nil {
 		t.Fatal(err)
@@ -249,7 +255,7 @@ func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 		t.Fatalf("approved retry with a different principal did not repair immutable evidence: %v", err)
 	}
 	tasks := srv.store.Tasks()
-	if len(tasks) != 1 || !strings.HasPrefix(tasks[0].Script, "# lattice-linechain-e3-v1\n") {
+	if len(tasks) != 1 || !strings.HasPrefix(tasks[0].Script, "# lattice-linechain-e3-v2\n") {
 		t.Fatalf("expected one E3 task: %+v", tasks)
 	}
 	tmp := t.TempDir()
@@ -271,11 +277,30 @@ func TestLineChainApprovalQueuesExecutableV2DocumentAtomically(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatal(err)
 	}
-	if doc.Version != 2 || doc.Operation != "create" || doc.FragmentBasename != compiled.Plan.FragmentPath ||
-		doc.Fragment == nil || doc.Sidecar == nil || doc.CombinedSHA256 != compiled.Plan.ArtifactSHA256 {
+	fixture, err := os.ReadFile(fixturePath)
+	var fixtureEnvelope lineChainCrossContractFixtureV2
+	if err != nil || json.Unmarshal(fixture, &fixtureEnvelope) != nil {
+		t.Fatalf("decode production fixture: err=%v fixture=%s", err, fixture)
+	}
+	fixtureDocument, _ := json.Marshal(fixtureEnvelope.Document)
+	if !bytes.Equal(bytes.TrimSpace(fixtureDocument), bytes.TrimSpace(raw)) ||
+		fixtureEnvelope.Schema != "lattice.linechain.cross-contract-fixture.v2" ||
+		fixtureEnvelope.ApprovalArtifactSHA256 != compiled.Plan.ArtifactSHA256 || fixtureEnvelope.RequestSHA256 != compiled.Plan.RequestSHA256 ||
+		fixtureEnvelope.TaskScriptSHA256 != digestText(tasks[0].Script) || fixtureEnvelope.TaskID == "" || fixtureEnvelope.LeaseID == "" {
+		t.Fatalf("production fixture does not bind queued server authority: fixture=%+v queued=%s", fixtureEnvelope, raw)
+	}
+	if info, err := os.Stat(fixturePath); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o600 {
+		t.Fatalf("production fixture permissions=%v", info.Mode().Perm())
+	}
+	if doc.Version != 2 || doc.DurableProtocol != lineChainDurableProtocol || doc.Operation != "create" || doc.FragmentBasename != compiled.Plan.FragmentPath ||
+		doc.Fragment == nil || doc.SidecarPatch.Schema != lineChainPatchSchema || doc.SidecarPatch.SourceLineUUID != sourceUUID ||
+		doc.SidecarPatch.DesiredDownstreamLineUUID == nil || *doc.SidecarPatch.DesiredDownstreamLineUUID != targetUUID ||
+		doc.ArtifactSHA256 != compiled.Plan.ArtifactSHA256 || doc.SidecarPatchSHA256 != compiled.Plan.SidecarPatchSHA256 {
 		t.Fatalf("unexpected v2 document: %+v", doc)
 	}
-	for _, forbidden := range []string{"config_dir", "fragment_path", "sidecar_path", "previous_sidecar_sha256"} {
+	for _, forbidden := range []string{"config_dir", "fragment_path", "sidecar_path", `"sidecar"`, "combined_sha256"} {
 		if strings.Contains(string(raw), forbidden) {
 			t.Fatalf("v2 document contains forbidden %s: %s", forbidden, raw)
 		}
@@ -348,14 +373,14 @@ func TestLineChainCompilerProducesDeterministicRedactedArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Plan.FragmentSHA256 != second.Plan.FragmentSHA256 || first.Plan.SidecarSHA256 != second.Plan.SidecarSHA256 || first.Plan.ArtifactSHA256 != second.Plan.ArtifactSHA256 {
+	if first.Plan.FragmentSHA256 != second.Plan.FragmentSHA256 || first.Plan.SidecarPatchSHA256 != second.Plan.SidecarPatchSHA256 || first.Plan.ArtifactSHA256 != second.Plan.ArtifactSHA256 {
 		t.Fatalf("compile is not deterministic: first=%+v second=%+v", first.Plan, second.Plan)
 	}
 	planJSON, err := json.Marshal(first.Plan)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{user.Credentials[0].UUID, def.RealityPrivateKey, first.FragmentJSON, first.SidecarJSON} {
+	for _, secret := range []string{user.Credentials[0].UUID, def.RealityPrivateKey, first.FragmentJSON, first.SidecarPatchJSON} {
 		if strings.Contains(string(planJSON), secret) {
 			t.Fatalf("redacted plan leaked secret/artifact %q: %s", secret, planJSON)
 		}
@@ -363,8 +388,35 @@ func TestLineChainCompilerProducesDeterministicRedactedArtifact(t *testing.T) {
 	if first.Plan.SourceNodeID != "node-b" || first.Plan.TargetNodeID != "node-a" || first.Plan.SourceInboundTag != "source-b" {
 		t.Fatalf("edge direction is wrong: %+v", first.Plan)
 	}
-	if !strings.Contains(first.FragmentJSON, `"outbounds"`) || !strings.Contains(first.SidecarJSON, targetUUID) {
-		t.Fatalf("compiled pair does not describe the same edge: fragment=%s sidecar=%s", first.FragmentJSON, first.SidecarJSON)
+	if !strings.Contains(first.FragmentJSON, `"outbounds"`) || !strings.Contains(first.SidecarPatchJSON, targetUUID) {
+		t.Fatalf("compiled pair does not describe the same edge: fragment=%s sidecar=%s", first.FragmentJSON, first.SidecarPatchJSON)
+	}
+}
+
+func TestLineChainSemanticPatchAndArtifactCanonicalVector(t *testing.T) {
+	const (
+		sourceUUID  = "22222222-2222-4222-8222-222222222222"
+		targetUUID  = "11111111-1111-4111-8111-111111111111"
+		patchJSON   = `{"schema":"lattice.singbox-linechain-sidecar-patch.v1","source_line_uuid":"22222222-2222-4222-8222-222222222222","source_inbound_tag":"source-b","expected_downstream_line_uuid":null,"desired_downstream_line_uuid":"11111111-1111-4111-8111-111111111111"}`
+		patchSHA    = "7394c9367aa36d0e37e1e6bb70d3de70afc1d6792f56754741ba118ca2137188"
+		artifactSHA = "bb59094488756276a385921951eaac3e36dc604eb4a03c4cb2e1a52797aee261"
+	)
+	patch, raw, gotPatchSHA, err := canonicalLineChainSidecarPatch(strings.ToUpper(sourceUUID), "source-b", "", strings.ToUpper(targetUUID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw != patchJSON || gotPatchSHA != patchSHA || patch.ExpectedDownstreamLineUUID != nil ||
+		patch.DesiredDownstreamLineUUID == nil || *patch.DesiredDownstreamLineUUID != targetUUID {
+		t.Fatalf("canonical patch mismatch: raw=%s sha=%s patch=%+v", raw, gotPatchSHA, patch)
+	}
+	gotArtifactSHA, err := canonicalLineChainArtifact("create", "lattice-linechain-0123456789abcdef0123.json", "", strings.Repeat("0", 64), patchSHA)
+	if err != nil || gotArtifactSHA != artifactSHA {
+		t.Fatalf("canonical artifact mismatch: sha=%s err=%v", gotArtifactSHA, err)
+	}
+	_, removeRaw, _, err := canonicalLineChainSidecarPatch(sourceUUID, "source-b", targetUUID, "")
+	if err != nil || !strings.Contains(removeRaw, `"expected_downstream_line_uuid":"`+targetUUID+`"`) ||
+		!strings.Contains(removeRaw, `"desired_downstream_line_uuid":null`) {
+		t.Fatalf("remove patch did not preserve explicit nullable CAS fields: raw=%s err=%v", removeRaw, err)
 	}
 }
 
@@ -384,7 +436,7 @@ func TestLineChainCompilerUsesImmutableCapturedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("captured snapshot changed after live capability mutation: %v", err)
 	}
-	if first.SidecarJSON != second.SidecarJSON || first.Plan.ArtifactSHA256 != second.Plan.ArtifactSHA256 || first.Plan.RequestSHA256 != second.Plan.RequestSHA256 {
+	if first.SidecarPatchJSON != second.SidecarPatchJSON || first.Plan.ArtifactSHA256 != second.Plan.ArtifactSHA256 || first.Plan.RequestSHA256 != second.Plan.RequestSHA256 {
 		t.Fatalf("captured snapshot changed across wall clock: first=%+v second=%+v", first.Plan, second.Plan)
 	}
 }
@@ -416,12 +468,12 @@ func TestLineChainCompilerTenThousandProjectedLinesIsPure(t *testing.T) {
 	allocs := testing.AllocsPerRun(3, func() {
 		compiled, err := srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
 		compileErr = err
-		var sidecar lineMetadataDocV2
+		var patch lineChainSidecarPatch
 		if err == nil {
-			compileErr = json.Unmarshal([]byte(compiled.SidecarJSON), &sidecar)
+			compileErr = json.Unmarshal([]byte(compiled.SidecarPatchJSON), &patch)
 		}
-		if compileErr == nil && len(sidecar.Inbounds) != 10_000 {
-			compileErr = fmt.Errorf("sidecar contains %d projected inbounds, want 10000", len(sidecar.Inbounds))
+		if compileErr == nil && (patch.SourceLineUUID != sourceUUID || patch.DesiredDownstreamLineUUID == nil || *patch.DesiredDownstreamLineUUID != targetUUID) {
+			compileErr = fmt.Errorf("semantic patch does not bind source/target: %+v", patch)
 		}
 	})
 	if compileErr != nil {
@@ -469,9 +521,9 @@ func BenchmarkLineChainCompilerTenThousandProjectedLines(b *testing.B) {
 			b.Fatal(err)
 		}
 		if i == 0 {
-			var sidecar lineMetadataDocV2
-			if err := json.Unmarshal([]byte(compiled.SidecarJSON), &sidecar); err != nil || len(sidecar.Inbounds) != 10_000 {
-				b.Fatalf("benchmark sidecar projected inbounds=%d err=%v", len(sidecar.Inbounds), err)
+			var patch lineChainSidecarPatch
+			if err := json.Unmarshal([]byte(compiled.SidecarPatchJSON), &patch); err != nil || patch.SourceLineUUID != sourceUUID {
+				b.Fatalf("benchmark patch=%+v err=%v", patch, err)
 			}
 		}
 	}
@@ -838,7 +890,7 @@ func TestLineChainPlanPersistsTypedApprovalAndSeparateAttempt(t *testing.T) {
 		approval.Action != lineChainActionPrefix+compiled.Plan.ArtifactSHA256 || len(approval.Targets) != 1 || approval.Targets[0] != "node-b" {
 		t.Fatalf("typed approval binding is wrong: %+v", approval)
 	}
-	for _, secret := range []string{user.Credentials[0].UUID, def.RealityPrivateKey, compiled.FragmentJSON, compiled.SidecarJSON} {
+	for _, secret := range []string{user.Credentials[0].UUID, def.RealityPrivateKey, compiled.FragmentJSON, compiled.SidecarPatchJSON} {
 		if strings.Contains(approval.Plan, secret) {
 			t.Fatalf("approval leaked secret/artifact %q: %s", secret, approval.Plan)
 		}
@@ -908,9 +960,41 @@ func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var setPatch lineChainSidecarPatch
+	if err := json.Unmarshal([]byte(setArtifact.SidecarPatchJSON), &setPatch); err != nil || setPatch.ExpectedDownstreamLineUUID != nil ||
+		setPatch.DesiredDownstreamLineUUID == nil || *setPatch.DesiredDownstreamLineUUID != targetUUID {
+		t.Fatalf("set patch lost semantic CAS: patch=%+v err=%v", setPatch, err)
+	}
 	apply(t, setArtifact)
 	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusAppliedUnobserved || got.TargetLineUUID != targetUUID {
 		t.Fatalf("set terminal did not promote frozen definition: %+v", got)
+	}
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443",
+		LineUUID: sourceUUID, DownstreamLineUUID: "33333333-3333-4333-8333-333333333333"}})
+	if _, err := srv.compileLineChainRemove(sourceUUID); err == nil || !strings.Contains(err.Error(), "conflicts with committed baseline") {
+		t.Fatalf("conflicting nonempty observation did not fail closed: %v", err)
+	}
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443", LineUUID: sourceUUID}})
+	for operation, compile := range map[string]func() (lineChainCompiledArtifact, error){
+		"replace": func() (lineChainCompiledArtifact, error) {
+			return srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+		},
+		"remove": func() (lineChainCompiledArtifact, error) { return srv.compileLineChainRemove(sourceUUID) },
+	} {
+		immediate, err := compile()
+		if err != nil {
+			t.Fatalf("immediate set->%s before inventory failed: %v", operation, err)
+		}
+		var patch lineChainSidecarPatch
+		if err := json.Unmarshal([]byte(immediate.SidecarPatchJSON), &patch); err != nil || patch.ExpectedDownstreamLineUUID == nil ||
+			*patch.ExpectedDownstreamLineUUID != targetUUID {
+			t.Fatalf("immediate set->%s did not freeze committed expected target: patch=%+v err=%v", operation, patch, err)
+		}
+		wantArtifact, err := canonicalLineChainArtifact(operation, immediate.Plan.FragmentPath, immediate.PreviousFragmentSHA256,
+			immediate.Plan.FragmentSHA256, immediate.Plan.SidecarPatchSHA256)
+		if err != nil || immediate.Plan.ArtifactSHA256 != wantArtifact {
+			t.Fatalf("immediate set->%s artifact=%s want=%s err=%v", operation, immediate.Plan.ArtifactSHA256, wantArtifact, err)
+		}
 	}
 	observedHash := lineHash("node-b", model.ProxyCoreSingbox, "vless", "", 1443, "source-b", setArtifact.Plan.OutboundTag)
 	if err := srv.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: observedHash, Value: sourceUUID}); err != nil {
@@ -945,6 +1029,11 @@ func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var removePatch lineChainSidecarPatch
+	if err := json.Unmarshal([]byte(removeArtifact.SidecarPatchJSON), &removePatch); err != nil || removePatch.ExpectedDownstreamLineUUID == nil ||
+		*removePatch.ExpectedDownstreamLineUUID != targetUUID || removePatch.DesiredDownstreamLineUUID != nil {
+		t.Fatalf("remove patch lost semantic CAS: patch=%+v err=%v", removePatch, err)
+	}
 	apply(t, removeArtifact)
 	removed := srv.store.LineChainSnapshot().Definitions[sourceUUID]
 	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || removed.OutboundTag != setArtifact.Plan.OutboundTag {
@@ -961,5 +1050,13 @@ func TestLineChainEndToEndSetObserveMetadataAndRemoveTrace(t *testing.T) {
 	metadata, err = srv.renderLineMetadataJSON("node-b")
 	if err != nil || strings.Contains(string(metadata), targetUUID) || !strings.Contains(string(metadata), sourceUUID) || def.LineUUID != targetUUID {
 		t.Fatalf("metadata did not clear only the observed chain: %s err=%v", metadata, err)
+	}
+	recreate, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRecreateArtifact, err := canonicalLineChainArtifact("create", recreate.Plan.FragmentPath, "", recreate.Plan.FragmentSHA256, recreate.Plan.SidecarPatchSHA256)
+	if err != nil || recreate.Plan.ArtifactSHA256 != wantRecreateArtifact || recreate.PreviousFragmentSHA256 != "" {
+		t.Fatalf("set over committed remove tombstone was not create: artifact=%+v want=%s err=%v", recreate.Plan, wantRecreateArtifact, err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -52,7 +53,7 @@ type lineChainPlan struct {
 	PublicKeyFingerprint   string   `json:"public_key_fingerprint,omitempty"`
 	ShortIDFingerprint     string   `json:"short_id_fingerprint,omitempty"`
 	FragmentSHA256         string   `json:"fragment_sha256"`
-	SidecarSHA256          string   `json:"sidecar_sha256"`
+	SidecarPatchSHA256     string   `json:"sidecar_patch_sha256"`
 	ArtifactSHA256         string   `json:"artifact_sha256"`
 	RequestSHA256          string   `json:"request_sha256"`
 	PreviousTargetLineUUID string   `json:"previous_target_line_uuid,omitempty"`
@@ -64,7 +65,7 @@ type lineChainPlan struct {
 type lineChainCompiledArtifact struct {
 	Plan                   lineChainPlan
 	FragmentJSON           string
-	SidecarJSON            string
+	SidecarPatchJSON       string
 	TargetCredentialUUID   string
 	TargetPublicKey        string
 	TargetShortID          string
@@ -86,6 +87,96 @@ type lineChainCompileSnapshot struct {
 	Chains       store.LineChainSnapshot
 	Capabilities map[string]bool
 	EvidenceAt   time.Time
+}
+
+const (
+	lineChainDurableProtocol = "linechain-e3-v2"
+	lineChainPatchSchema     = "lattice.singbox-linechain-sidecar-patch.v1"
+	lineChainArtifactSchema  = "lattice.singbox-linechain-artifact.v2"
+)
+
+type lineChainSidecarPatch struct {
+	Schema                     string  `json:"schema"`
+	SourceLineUUID             string  `json:"source_line_uuid"`
+	SourceInboundTag           string  `json:"source_inbound_tag"`
+	ExpectedDownstreamLineUUID *string `json:"expected_downstream_line_uuid"`
+	DesiredDownstreamLineUUID  *string `json:"desired_downstream_line_uuid"`
+}
+
+type lineChainArtifactBindingV2 struct {
+	Schema                 string  `json:"schema"`
+	Operation              string  `json:"operation"`
+	FragmentBasename       string  `json:"fragment_basename"`
+	PreviousFragmentSHA256 *string `json:"previous_fragment_sha256"`
+	FragmentSHA256         *string `json:"fragment_sha256"`
+	SidecarPatchSHA256     string  `json:"sidecar_patch_sha256"`
+}
+
+func canonicalLineChainSidecarPatch(sourceUUID, sourceTag, expected, desired string) (lineChainSidecarPatch, string, string, error) {
+	sourceUUID = strings.ToLower(strings.TrimSpace(sourceUUID))
+	if !validLineUUIDv4(sourceUUID) || sourceTag == "" || sourceTag != strings.TrimSpace(sourceTag) {
+		return lineChainSidecarPatch{}, "", "", errors.New("sidecar patch source identity is invalid")
+	}
+	normalizeNullableUUID := func(value string) (*string, error) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return nil, nil
+		}
+		if !validLineUUIDv4(value) {
+			return nil, fmt.Errorf("invalid downstream line_uuid %q", value)
+		}
+		return &value, nil
+	}
+	expectedUUID, err := normalizeNullableUUID(expected)
+	if err != nil {
+		return lineChainSidecarPatch{}, "", "", err
+	}
+	desiredUUID, err := normalizeNullableUUID(desired)
+	if err != nil {
+		return lineChainSidecarPatch{}, "", "", err
+	}
+	patch := lineChainSidecarPatch{Schema: lineChainPatchSchema, SourceLineUUID: sourceUUID, SourceInboundTag: sourceTag,
+		ExpectedDownstreamLineUUID: expectedUUID, DesiredDownstreamLineUUID: desiredUUID}
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		return lineChainSidecarPatch{}, "", "", err
+	}
+	return patch, string(raw), digestText(string(raw)), nil
+}
+
+func canonicalLineChainArtifact(operation, fragmentBasename, previousFragmentSHA, fragmentSHA, patchSHA string) (string, error) {
+	nullableSHA := func(value string) (*string, error) {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return nil, nil
+		}
+		if len(value) != sha256.Size*2 {
+			return nil, errors.New("artifact binding contains invalid sha256")
+		}
+		if _, err := hex.DecodeString(value); err != nil {
+			return nil, errors.New("artifact binding contains invalid sha256")
+		}
+		return &value, nil
+	}
+	previous, err := nullableSHA(previousFragmentSHA)
+	if err != nil {
+		return "", err
+	}
+	fragment, err := nullableSHA(fragmentSHA)
+	if err != nil {
+		return "", err
+	}
+	patchSHA = strings.ToLower(strings.TrimSpace(patchSHA))
+	if _, err := nullableSHA(patchSHA); err != nil || patchSHA == "" {
+		return "", errors.New("artifact binding contains invalid sidecar patch sha256")
+	}
+	binding := lineChainArtifactBindingV2{Schema: lineChainArtifactSchema, Operation: operation, FragmentBasename: fragmentBasename,
+		PreviousFragmentSHA256: previous, FragmentSHA256: fragment, SidecarPatchSHA256: patchSHA}
+	raw, err := json.Marshal(binding)
+	if err != nil {
+		return "", err
+	}
+	return digestText(string(raw)), nil
 }
 
 func (s *Server) captureLineChainCompileSnapshot() (lineChainCompileSnapshot, error) {
@@ -357,12 +448,27 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 	if err != nil {
 		return lineChainCompiledArtifact{}, err
 	}
-	sidecar, err := s.renderLineChainSidecarSnapshot(snapshot, source.NodeID, source.LineUUID, target.LineUUID)
+	current := chainSnapshot.Definitions[source.LineUUID]
+	expectedDownstream := source.DownstreamLineUUID
+	if current.TargetLineUUID != "" {
+		observed := strings.ToLower(strings.TrimSpace(source.DownstreamLineUUID))
+		if observed != "" && observed != strings.ToLower(current.TargetLineUUID) {
+			return lineChainCompiledArtifact{}, errors.New("observed source chain conflicts with committed baseline")
+		}
+		expectedDownstream = current.TargetLineUUID
+	}
+	_, sidecarPatch, sidecarPatchSHA, err := canonicalLineChainSidecarPatch(source.LineUUID, source.Tag, expectedDownstream, target.LineUUID)
 	if err != nil {
 		return lineChainCompiledArtifact{}, err
 	}
-	sidecarSHA := digestText(string(sidecar))
-	combined := digestText(fragment.JSON + "\x00" + string(sidecar))
+	agentOperation := "create"
+	if current.FragmentSHA256 != "" {
+		agentOperation = "replace"
+	}
+	combined, err := canonicalLineChainArtifact(agentOperation, lineChainFragmentPath(source.LineUUID), current.FragmentSHA256, fragment.SHA256, sidecarPatchSHA)
+	if err != nil {
+		return lineChainCompiledArtifact{}, err
+	}
 	requestBinding, _ := json.Marshal(struct {
 		Request          lineChainCompileRequest `json:"request"`
 		SourceLineHashID string                  `json:"source_line_hash_id"`
@@ -371,14 +477,13 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 		Artifact         string                  `json:"artifact_sha256"`
 	}{req, source.LineHashID, digestManagedLineDefinition(definition), digestText(credential.UUID), combined})
 	sourceNodeLabel := firstNonEmpty(strings.TrimSpace(snapshot.Nodes[source.NodeID].Name), source.NodeID)
-	current := chainSnapshot.Definitions[source.LineUUID]
 	plan := lineChainPlan{
 		Operation: "set", SourceLineUUID: source.LineUUID, TargetLineUUID: target.LineUUID,
 		SourceNodeID: source.NodeID, TargetNodeID: target.NodeID, SourceLabel: source.Name, TargetLabel: target.Name,
 		SourceInboundTag: source.Tag, OutboundTag: outboundTag, FragmentPath: lineChainFragmentPath(source.LineUUID),
 		TargetHost: targetHost, TargetPort: definition.Port, Protocol: model.ProxyProtocolVLESS, SNI: definition.SNI,
 		PublicKeyFingerprint: shortFingerprint(definition.RealityPublicKey), ShortIDFingerprint: shortFingerprint(definition.ShortID),
-		FragmentSHA256: fragment.SHA256, SidecarSHA256: sidecarSHA, ArtifactSHA256: combined,
+		FragmentSHA256: fragment.SHA256, SidecarPatchSHA256: sidecarPatchSHA, ArtifactSHA256: combined,
 		RequestSHA256:   digestText(string(requestBinding)),
 		PreflightChecks: []string{"source_identity", "target_managed_applied", "target_credential", "consumer_capability", "distinct_nodes"},
 		Summary:         fmt.Sprintf("Route %s on %s through managed target %s", source.Name, sourceNodeLabel, target.Name),
@@ -391,58 +496,13 @@ func (s *Server) compileLineChainSnapshot(snapshot lineChainCompileSnapshot, req
 		SourceInboundTag: source.Tag, TargetLineUUID: target.LineUUID, TargetNodeID: target.NodeID,
 		TargetDefinitionDigest: digestManagedLineDefinition(definition), TargetPublicMaterialDigest: digestText(definition.RealityPublicKey + "\x00" + definition.ShortID),
 		TargetCredentialDigest: digestText(credential.UUID), OutboundTag: outboundTag, FragmentPath: lineChainFragmentPath(source.LineUUID),
-		FragmentSHA256: fragment.SHA256, SidecarSHA256: sidecarSHA, ArtifactSHA256: combined}
+		FragmentSHA256: fragment.SHA256, SidecarPatchSHA256: sidecarPatchSHA, ArtifactSHA256: combined}
 	return lineChainCompiledArtifact{
-		Plan: plan, FragmentJSON: fragment.JSON, SidecarJSON: string(sidecar), TargetCredentialUUID: credential.UUID,
+		Plan: plan, FragmentJSON: fragment.JSON, SidecarPatchJSON: sidecarPatch, TargetCredentialUUID: credential.UUID,
 		TargetPublicKey: definition.RealityPublicKey, TargetShortID: definition.ShortID, TargetDefinition: definition,
 		BaseGeneration: current.Generation, PlanGraphRevision: chainSnapshot.Revision, PreviousFragmentSHA256: current.FragmentSHA256,
 		CandidateDefinition: candidateDefinition,
 	}, nil
-}
-
-func (s *Server) renderLineChainSidecarSnapshot(snapshot lineChainCompileSnapshot, nodeID, sourceUUID, targetUUID string) ([]byte, error) {
-	inbounds := make([]lineMetadataInboundV2, 0)
-	found := false
-	for _, matches := range snapshot.Lines {
-		for _, line := range matches {
-			if line.NodeID != nodeID {
-				continue
-			}
-			if line.Tag == "" || !validLineUUIDv4(line.LineUUID) {
-				return nil, fmt.Errorf("line %s is missing stable sidecar identity", line.LineHashID)
-			}
-			inbound := lineMetadataInboundV2{Tag: line.Tag, LineUUID: line.LineUUID, LineHashID: line.LineHashID}
-			downstream := strings.TrimSpace(line.DownstreamLineUUID)
-			if strings.EqualFold(line.LineUUID, sourceUUID) {
-				downstream = targetUUID
-				found = true
-			}
-			if downstream != "" {
-				target := downstream
-				inbound.Chain = &lineMetadataChainV2{DownstreamLineUUID: &target}
-				if targetLines := snapshot.Lines[strings.ToLower(downstream)]; len(targetLines) == 1 {
-					targetNode := snapshot.Nodes[targetLines[0].NodeID]
-					inbound.Chain.DownstreamNode = firstNonEmpty(strings.TrimSpace(targetNode.Name), targetLines[0].NodeID)
-				}
-			}
-			inbounds = append(inbounds, inbound)
-		}
-	}
-	if !found {
-		return nil, errors.New("source line is absent from its node sidecar")
-	}
-	sort.Slice(inbounds, func(i, j int) bool { return inbounds[i].Tag < inbounds[j].Tag })
-	node := snapshot.Nodes[nodeID]
-	doc := lineMetadataDocV2{
-		Schema: lineMetadataSchemaV2, NodeID: nodeID, NodeUUID: strings.TrimSpace(node.LatticeIdentityUUID),
-		UpdatedAt: time.Unix(0, 0).UTC().Format(time.RFC3339), Writer: lineMetadataWriter, Inbounds: inbounds,
-		Reserved: lineMetadataReservedV2{InConfigKey: "_lattice", Fields: lineMetadataReservedFields{LineUUID: "string", NodeUUID: "string", LineHashID: "string"}},
-	}
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(out, '\n'), nil
 }
 
 func digestManagedLineDefinition(definition managedLineDef) string {
@@ -452,38 +512,6 @@ func digestManagedLineDefinition(definition managedLineDef) string {
 		Private any `json:"private"`
 	}{public, private})
 	return digestText(string(raw))
-}
-
-func (s *Server) renderLineChainSidecar(nodeID, sourceUUID, targetUUID string) ([]byte, error) {
-	raw, err := s.renderLineMetadataJSON(nodeID)
-	if err != nil {
-		return nil, err
-	}
-	var doc lineMetadataDocV2
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, err
-	}
-	found := false
-	for i := range doc.Inbounds {
-		if strings.EqualFold(doc.Inbounds[i].LineUUID, sourceUUID) {
-			if targetUUID == "" {
-				doc.Inbounds[i].Chain = nil
-			} else {
-				target := targetUUID
-				doc.Inbounds[i].Chain = &lineMetadataChainV2{DownstreamLineUUID: &target, DownstreamNode: ""}
-			}
-			found = true
-		}
-	}
-	if !found {
-		return nil, errors.New("source line is absent from its node sidecar")
-	}
-	sort.Slice(doc.Inbounds, func(i, j int) bool { return doc.Inbounds[i].Tag < doc.Inbounds[j].Tag })
-	out, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(out, '\n'), nil
 }
 
 func (s *Server) compileLineChainRemove(sourceUUID string) (lineChainCompiledArtifact, error) {
@@ -511,60 +539,102 @@ func (s *Server) compileLineChainRemoveSnapshot(snapshot lineChainCompileSnapsho
 	if !snapshot.Capabilities[source.NodeID] {
 		return lineChainCompiledArtifact{}, errors.New("source node does not advertise durable-task-result-v1")
 	}
-	sidecar, err := s.renderLineChainSidecarSnapshot(snapshot, source.NodeID, sourceUUID, "")
+	observed := strings.ToLower(strings.TrimSpace(source.DownstreamLineUUID))
+	if observed != "" && observed != strings.ToLower(current.TargetLineUUID) {
+		return lineChainCompiledArtifact{}, errors.New("observed source chain conflicts with committed baseline")
+	}
+	_, sidecarPatch, sidecarPatchSHA, err := canonicalLineChainSidecarPatch(sourceUUID, source.Tag, current.TargetLineUUID, "")
 	if err != nil {
 		return lineChainCompiledArtifact{}, err
 	}
-	artifactSHA := digestText("\x00" + string(sidecar))
+	artifactSHA, err := canonicalLineChainArtifact("remove", current.FragmentPath, current.FragmentSHA256, "", sidecarPatchSHA)
+	if err != nil {
+		return lineChainCompiledArtifact{}, err
+	}
 	requestSHA := digestText("remove\x00" + sourceUUID + "\x00" + current.ArtifactSHA256 + "\x00" + artifactSHA)
 	return lineChainCompiledArtifact{Plan: lineChainPlan{
 		Operation: "remove", SourceLineUUID: sourceUUID, SourceNodeID: source.NodeID, SourceLabel: source.Name,
 		SourceInboundTag: source.Tag, OutboundTag: current.OutboundTag, FragmentPath: current.FragmentPath,
-		SidecarSHA256: digestText(string(sidecar)), ArtifactSHA256: artifactSHA, RequestSHA256: requestSHA,
+		SidecarPatchSHA256: sidecarPatchSHA, ArtifactSHA256: artifactSHA, RequestSHA256: requestSHA,
 		PreviousTargetLineUUID: current.TargetLineUUID, PreviousArtifactSHA256: current.ArtifactSHA256,
 		PreflightChecks: []string{"source_identity", "committed_baseline", "consumer_capability"},
 		Summary: fmt.Sprintf("Remove managed downstream from %s on %s", source.Name,
 			firstNonEmpty(strings.TrimSpace(snapshot.Nodes[source.NodeID].Name), source.NodeID)),
-	}, SidecarJSON: string(sidecar), BaseGeneration: current.Generation, PlanGraphRevision: snapshot.Chains.Revision,
+	}, SidecarPatchJSON: sidecarPatch, BaseGeneration: current.Generation, PlanGraphRevision: snapshot.Chains.Revision,
 		PreviousFragmentSHA256: current.FragmentSHA256, CandidateDefinition: store.LineChainDefinition{
 			SourceLineUUID: sourceUUID, SourceNodeID: source.NodeID, SourceLineHashID: source.LineHashID, SourceInboundTag: source.Tag,
-			OutboundTag: current.OutboundTag, FragmentPath: current.FragmentPath, SidecarSHA256: digestText(string(sidecar)), ArtifactSHA256: artifactSHA,
+			OutboundTag: current.OutboundTag, FragmentPath: current.FragmentPath, SidecarPatchSHA256: sidecarPatchSHA, ArtifactSHA256: artifactSHA,
 		}}, nil
 }
 
 type lineChainAgentDocumentV2 struct {
-	Version                int     `json:"version"`
-	Operation              string  `json:"operation"`
-	FragmentBasename       string  `json:"fragment_basename"`
-	Fragment               *string `json:"fragment,omitempty"`
-	Sidecar                *string `json:"sidecar"`
-	PreviousFragmentSHA256 string  `json:"previous_fragment_sha256,omitempty"`
-	FragmentSHA256         string  `json:"fragment_sha256,omitempty"`
-	SidecarSHA256          string  `json:"sidecar_sha256"`
-	CombinedSHA256         string  `json:"combined_sha256"`
+	Version                int                   `json:"version"`
+	DurableProtocol        string                `json:"durable_protocol"`
+	Operation              string                `json:"operation"`
+	FragmentBasename       string                `json:"fragment_basename"`
+	Fragment               *string               `json:"fragment"`
+	SidecarPatch           lineChainSidecarPatch `json:"sidecar_patch"`
+	PreviousFragmentSHA256 *string               `json:"previous_fragment_sha256"`
+	FragmentSHA256         *string               `json:"fragment_sha256"`
+	SidecarPatchSHA256     string                `json:"sidecar_patch_sha256"`
+	ArtifactSHA256         string                `json:"artifact_sha256"`
+}
+
+type lineChainCrossContractFixtureV2 struct {
+	Schema                 string                   `json:"schema"`
+	ApprovalArtifactSHA256 string                   `json:"approval_artifact_sha256"`
+	RequestSHA256          string                   `json:"request_sha256"`
+	TaskScriptSHA256       string                   `json:"task_script_sha256"`
+	TaskID                 string                   `json:"task_id"`
+	LeaseID                string                   `json:"lease_id"`
+	Document               lineChainAgentDocumentV2 `json:"document"`
 }
 
 func lineChainApplyScript(compiled lineChainCompiledArtifact) (string, error) {
 	operation := "create"
 	var fragment *string
+	var fragmentSHA *string
+	var previousFragmentSHA *string
 	if compiled.Plan.Operation == store.LineChainOperationRemove {
 		operation = "remove"
 	} else {
 		fragment = &compiled.FragmentJSON
-		if compiled.BaseGeneration > 0 {
+		fragmentSHA = &compiled.Plan.FragmentSHA256
+		if compiled.PreviousFragmentSHA256 != "" {
 			operation = "replace"
 		}
 	}
-	sidecar := compiled.SidecarJSON
-	doc := lineChainAgentDocumentV2{Version: 2, Operation: operation, FragmentBasename: compiled.Plan.FragmentPath,
-		Fragment: fragment, Sidecar: &sidecar, PreviousFragmentSHA256: compiled.PreviousFragmentSHA256,
-		FragmentSHA256: compiled.Plan.FragmentSHA256, SidecarSHA256: compiled.Plan.SidecarSHA256, CombinedSHA256: compiled.Plan.ArtifactSHA256}
+	if compiled.PreviousFragmentSHA256 != "" {
+		previousFragmentSHA = &compiled.PreviousFragmentSHA256
+	}
+	var patch lineChainSidecarPatch
+	if err := json.Unmarshal([]byte(compiled.SidecarPatchJSON), &patch); err != nil {
+		return "", fmt.Errorf("decode canonical sidecar patch: %w", err)
+	}
+	doc := lineChainAgentDocumentV2{Version: 2, DurableProtocol: lineChainDurableProtocol, Operation: operation, FragmentBasename: compiled.Plan.FragmentPath,
+		Fragment: fragment, SidecarPatch: patch, PreviousFragmentSHA256: previousFragmentSHA,
+		FragmentSHA256: fragmentSHA, SidecarPatchSHA256: compiled.Plan.SidecarPatchSHA256, ArtifactSHA256: compiled.Plan.ArtifactSHA256}
 	raw, err := json.Marshal(doc)
 	if err != nil {
 		return "", err
 	}
 	encoded := base64.StdEncoding.EncodeToString(raw)
-	return "# lattice-linechain-e3-v1\nset -eu\n: \"${LATTICE_AGENT_BIN:?}\" \"${LATTICE_LINECHAIN_TXN_DIR:?}\"\nprintf '%s' '" + encoded + "' | base64 -d | \"$LATTICE_AGENT_BIN\" -linechain-apply\n", nil
+	script := "# lattice-linechain-e3-v2\nset -eu\n: \"${LATTICE_AGENT_BIN:?}\" \"${LATTICE_LINECHAIN_TXN_DIR:?}\"\nprintf '%s' '" + encoded + "' | base64 -d | \"$LATTICE_AGENT_BIN\" -linechain-apply\n"
+	if fixturePath := strings.TrimSpace(os.Getenv("LATTICE_LINECHAIN_FIXTURE_OUT")); fixturePath != "" {
+		fixture := lineChainCrossContractFixtureV2{
+			Schema: "lattice.linechain.cross-contract-fixture.v2", ApprovalArtifactSHA256: compiled.Plan.ArtifactSHA256,
+			RequestSHA256: compiled.Plan.RequestSHA256, TaskScriptSHA256: digestText(script),
+			TaskID: "task-linechain-cross-contract-v2", LeaseID: "lease-linechain-cross-contract-v2", Document: doc,
+		}
+		fixtureRaw, err := json.Marshal(fixture)
+		if err != nil {
+			return "", fmt.Errorf("encode line-chain fixture: %w", err)
+		}
+		if err := os.WriteFile(fixturePath, append(fixtureRaw, '\n'), 0o600); err != nil {
+			return "", fmt.Errorf("write line-chain fixture: %w", err)
+		}
+	}
+	return script, nil
 }
 
 func isLineChainApproval(approval model.Approval) bool {
@@ -761,7 +831,7 @@ func sameLineChainCandidate(a, b store.LineChainDefinition) bool {
 		a.SourceInboundTag == b.SourceInboundTag && a.TargetLineUUID == b.TargetLineUUID && a.TargetNodeID == b.TargetNodeID &&
 		a.TargetDefinitionDigest == b.TargetDefinitionDigest && a.TargetPublicMaterialDigest == b.TargetPublicMaterialDigest &&
 		a.TargetCredentialDigest == b.TargetCredentialDigest && a.OutboundTag == b.OutboundTag && a.FragmentPath == b.FragmentPath &&
-		a.FragmentSHA256 == b.FragmentSHA256 && a.SidecarSHA256 == b.SidecarSHA256 && a.ArtifactSHA256 == b.ArtifactSHA256
+		a.FragmentSHA256 == b.FragmentSHA256 && a.SidecarPatchSHA256 == b.SidecarPatchSHA256 && a.ArtifactSHA256 == b.ArtifactSHA256
 }
 
 func (s *Server) reconcileLineChainsForNode(nodeID string) error {

@@ -1,6 +1,9 @@
 package server
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -228,6 +231,94 @@ func TestSubscriptionShareAuditNeverCarriesTheRawToken(t *testing.T) {
 		if strings.Contains(ev.Reason, token) {
 			t.Fatalf("audit reason carried the raw token: %q", ev.Reason)
 		}
+	}
+}
+
+func TestSubscriptionShareStaleCacheHitSetsHeaderAndSafeAudit(t *testing.T) {
+	s, st := newShareTestServer(t)
+	token := strings.Repeat("a", 32)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true, DefaultFormat: "plain",
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}})
+	fetchedAt := s.now().Add(-time.Hour)
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "last-good", FetchedAt: fetchedAt,
+		LastAttemptAt: fetchedAt, FetchError: "temporary outage", Stale: true}); err != nil {
+		t.Fatal(err)
+	}
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		return model.SubscriptionSnapshot{}, errors.New("still unavailable")
+	}
+	key := subscriptionCacheKey{ShareID: "s1", Format: "plain", UAClass: "surge"}
+	version := subscriptionContentHash("last-good")
+	s.subscriptionCache.PutSnapshot(key, []byte("last-good"), "text/plain", "upload=1", version, true, fetchedAt, s.now())
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest("/sub/team/"+token+"?format=plain", "Surge/2000"))
+	if rec.Code != http.StatusOK || rec.Body.String() != "last-good" || rec.Header().Get("X-Lattice-Subscription-Stale") != "true" {
+		t.Fatalf("stale cache response = code %d header %q body %q", rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"), rec.Body.String())
+	}
+	for _, event := range st.AuditEvents() {
+		if event.Action == auditActionShareFetch && event.Decision == "allow" {
+			if event.Metadata["stale"] != "true" || event.Metadata["source_version"] != version || event.Metadata["snapshot_age_seconds"] == "" {
+				t.Fatalf("share stale audit = %+v", event.Metadata)
+			}
+			if strings.Contains(strings.ToLower(fmt.Sprint(event.Metadata)), "error") {
+				t.Fatalf("diagnostic leaked into share audit: %+v", event.Metadata)
+			}
+		}
+	}
+}
+
+func TestSubscriptionShareStaleCacheHitRevalidatesAndClearsHeaderOnRecovery(t *testing.T) {
+	s, st := newShareTestServer(t)
+	token := strings.Repeat("a", 32)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true, DefaultFormat: "plain",
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}})
+	fetchedAt := s.now().Add(-time.Minute)
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "last-good", FetchedAt: fetchedAt,
+		LastAttemptAt: fetchedAt, FetchError: "temporary outage", Stale: true}); err != nil {
+		t.Fatal(err)
+	}
+	key := subscriptionCacheKey{ShareID: "s1", Format: "plain", UAClass: "surge"}
+	s.subscriptionCache.PutSnapshot(key, []byte("rendered-last-good"), "text/plain", "upload=1", subscriptionContentHash("last-good"), true, fetchedAt, s.now())
+	calls := 0
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		calls++
+		return model.SubscriptionSnapshot{Raw: "last-good", Userinfo: "upload=2"}, nil
+	}
+
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest("/sub/team/"+token+"?format=plain", "Surge/2000"))
+	if rec.Code != http.StatusOK || rec.Body.String() != "rendered-last-good" || rec.Header().Get("X-Lattice-Subscription-Stale") != "" || rec.Header().Get("Subscription-Userinfo") != "upload=2" || calls != 1 {
+		t.Fatalf("recovered cache response = code %d stale %q userinfo %q body %q calls %d", rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"), rec.Header().Get("Subscription-Userinfo"), rec.Body.String(), calls)
+	}
+	stored, ok := st.SubscriptionSnapshot("p", "graph")
+	if !ok || stored.Stale || stored.FetchError != "" {
+		t.Fatalf("recovered snapshot = %+v ok=%v", stored, ok)
+	}
+	cached, ok := s.subscriptionCache.GetSnapshot(key, s.now())
+	if !ok || cached.stale || cached.userinfo != "upload=2" {
+		t.Fatalf("recovered cache metadata = %+v ok=%v", cached, ok)
+	}
+}
+
+func TestSubscriptionShareExpiredCacheRevalidationRefreshesUserinfo(t *testing.T) {
+	s, st := newShareTestServer(t)
+	token := strings.Repeat("a", 32)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true, DefaultFormat: "plain",
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}})
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "same", Userinfo: "upload=2", FetchedAt: s.now()}); err != nil {
+		t.Fatal(err)
+	}
+	key := subscriptionCacheKey{ShareID: "s1", Format: "plain", UAClass: "surge"}
+	s.subscriptionCache.PutSnapshot(key, []byte("same-render"), "text/plain", "upload=1", subscriptionContentHash("same"), false, s.now(), s.now().Add(-subscriptionCacheTTL-time.Second))
+
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest("/sub/team/"+token+"?format=plain", "Surge/2000"))
+	if rec.Code != http.StatusOK || rec.Body.String() != "same-render" || rec.Header().Get("Subscription-Userinfo") != "upload=2" {
+		t.Fatalf("revalidated response = code %d userinfo %q body %q", rec.Code, rec.Header().Get("Subscription-Userinfo"), rec.Body.String())
+	}
+	cached, ok := s.subscriptionCache.GetSnapshot(key, s.now())
+	if !ok || cached.userinfo != "upload=2" {
+		t.Fatalf("revalidated cache metadata = %+v ok=%v", cached, ok)
 	}
 }
 

@@ -24,6 +24,20 @@ const subscriptionRefreshInterval = 30 * time.Minute
 
 const auditActionSubscriptionFetch = "subscription.source.fetch"
 
+func subscriptionSnapshotVersion(snapshot model.SubscriptionSnapshot) string {
+	if snapshot.SourceVersion != "" {
+		return snapshot.SourceVersion
+	}
+	return subscriptionContentHash(snapshot.Raw)
+}
+
+func (s *Server) persistSubscriptionSnapshot(snapshot model.SubscriptionSnapshot) error {
+	if s.subscriptionSnapshotPersist != nil {
+		return s.subscriptionSnapshotPersist(snapshot)
+	}
+	return s.store.UpsertSubscriptionSnapshot(snapshot)
+}
+
 // snapshotFor returns the content to render, refreshing it first when it is
 // missing or stale.
 //
@@ -33,12 +47,16 @@ const auditActionSubscriptionFetch = "subscription.source.fetch"
 // with it - that is the behaviour upstream implements as ignore-failed-remote-sub.
 func (s *Server) snapshotFor(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, error) {
 	existing, has := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
-	fresh := has && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval
+	fresh := has && !existing.Stale && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval
 	if fresh {
 		return existing, nil
 	}
 
-	fetched, err := s.fetchSubscriptionSource(ctx, pluginID, subscriptionID)
+	fetch := s.fetchSubscriptionSource
+	if s.subscriptionFetch != nil {
+		fetch = s.subscriptionFetch
+	}
+	fetched, err := fetch(ctx, pluginID, subscriptionID)
 	if err != nil {
 		if !has {
 			// Nothing to fall back to. Returning the error keeps the caller from
@@ -47,14 +65,16 @@ func (s *Server) snapshotFor(ctx context.Context, pluginID, subscriptionID strin
 		}
 		existing.FetchError = err.Error()
 		existing.LastAttemptAt = s.now()
-		if storeErr := s.store.UpsertSubscriptionSnapshot(existing); storeErr != nil {
-			s.logger.Printf("subscription snapshot: recording fetch failure for %s/%s: %v", pluginID, subscriptionID, storeErr)
+		existing.Stale = true
+		if storeErr := s.persistSubscriptionSnapshot(existing); storeErr != nil {
+			return model.SubscriptionSnapshot{}, fmt.Errorf("persist stale subscription %s/%s: %w", pluginID, subscriptionID, storeErr)
 		}
 		s.recordAudit(model.AuditEvent{
 			ID: id.New("audit"), Action: auditActionSubscriptionFetch, Decision: "observe",
 			Reason: "refresh failed; serving the last good snapshot",
 			Metadata: map[string]string{
 				"plugin_id": pluginID, "subscription_id": subscriptionID,
+				"stale": "true", "source_version": subscriptionSnapshotVersion(existing),
 				"snapshot_age_seconds": fmt.Sprintf("%.0f", s.now().Sub(existing.FetchedAt).Seconds()),
 			},
 		})
@@ -67,20 +87,22 @@ func (s *Server) snapshotFor(ctx context.Context, pluginID, subscriptionID strin
 	fetched.FetchedAt = s.now()
 	fetched.LastAttemptAt = fetched.FetchedAt
 	fetched.FetchError = ""
-	if err := s.store.UpsertSubscriptionSnapshot(fetched); err != nil {
+	fetched.Stale = false
+	if err := s.persistSubscriptionSnapshot(fetched); err != nil {
 		return model.SubscriptionSnapshot{}, err
 	}
 	// The content moved: any rendered body cached for a share sourcing this
 	// record is now stale, no matter how much TTL it had left. Without this the
 	// revalidation cadence, not the content, would decide what clients get.
-	if has && existing.Raw != fetched.Raw {
+	if has && subscriptionSnapshotVersion(existing) != subscriptionSnapshotVersion(fetched) {
 		s.invalidateSharesForSource(pluginID, subscriptionID)
 	}
 	s.recordAudit(model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionSubscriptionFetch, Decision: "allow",
 		Metadata: map[string]string{
 			"plugin_id": pluginID, "subscription_id": subscriptionID,
-			"raw_bytes": fmt.Sprintf("%d", len(fetched.Raw)),
+			"raw_bytes": fmt.Sprintf("%d", len(fetched.Raw)), "stale": "false",
+			"source_version": subscriptionSnapshotVersion(fetched), "snapshot_age_seconds": "0",
 		},
 	})
 	return fetched, nil
@@ -99,8 +121,10 @@ func (s *Server) fetchSubscriptionSource(ctx context.Context, pluginID, subscrip
 		return model.SubscriptionSnapshot{}, err
 	}
 	var reply struct {
-		Raw      string `json:"raw"`
-		Userinfo string `json:"userinfo"`
+		Raw            string          `json:"raw"`
+		Userinfo       string          `json:"userinfo"`
+		SourceVersion  string          `json:"source_version"`
+		SourceManifest json.RawMessage `json:"source_manifest"`
 	}
 	if err := json.Unmarshal(out, &reply); err != nil {
 		return model.SubscriptionSnapshot{}, fmt.Errorf("decode plugin fetch reply: %w", err)
@@ -110,5 +134,6 @@ func (s *Server) fetchSubscriptionSource(ctx context.Context, pluginID, subscrip
 		// it would overwrite a good snapshot with nothing and then serve nothing.
 		return model.SubscriptionSnapshot{}, errors.New("plugin fetch returned no content")
 	}
-	return model.SubscriptionSnapshot{Raw: reply.Raw, Userinfo: reply.Userinfo}, nil
+	return model.SubscriptionSnapshot{Raw: reply.Raw, Userinfo: reply.Userinfo, SourceVersion: reply.SourceVersion,
+		SourceManifest: append(json.RawMessage(nil), reply.SourceManifest...)}, nil
 }

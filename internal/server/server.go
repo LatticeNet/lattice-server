@@ -204,6 +204,10 @@ type Server struct {
 	// time. It exists so a client poll does not re-enter a plugin - and boot a
 	// JavaScript VM - on every fetch.
 	subscriptionCache *subscriptionCache
+	// subscriptionSnapshotPersist is a narrow persistence seam for exercising
+	// fail-closed last-good transitions. Production always falls back to Store.
+	subscriptionSnapshotPersist func(model.SubscriptionSnapshot) error
+	subscriptionFetch           func(context.Context, string, string) (model.SubscriptionSnapshot, error)
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First

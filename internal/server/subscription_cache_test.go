@@ -172,8 +172,8 @@ func TestSubscriptionCacheRevalidationExtendsUnchangedBody(t *testing.T) {
 		t.Fatal("expired entry served without revalidation")
 	}
 	stale, ok := c.GetStale(key)
-	if !ok || string(stale.body) != "body-a" || stale.contentHash != "hash-1" {
-		t.Fatalf("stale entry = %q %q %v", stale.body, stale.contentHash, ok)
+	if !ok || string(stale.body) != "body-a" || stale.contentVersion != "hash-1" {
+		t.Fatalf("stale entry = %q %q %v", stale.body, stale.contentVersion, ok)
 	}
 
 	// The serve path's "hash still matches" branch: extend, and the entry
@@ -182,6 +182,21 @@ func TestSubscriptionCacheRevalidationExtendsUnchangedBody(t *testing.T) {
 	body, _, ui, ok := c.Get(key, base.Add(2*time.Minute+30*time.Second))
 	if !ok || string(body) != "body-a" || ui != "ui" {
 		t.Fatalf("extended entry not served: %q %q %v", body, ui, ok)
+	}
+}
+
+func TestSubscriptionCacheGettersReturnDefensiveBodyCopies(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	c := newSubscriptionCache(8, time.Minute)
+	key := shareCacheKey("a")
+	c.Put(key, []byte("body"), "text/plain", "", "v1", base)
+	fresh, _, _, _ := c.Get(key, base)
+	fresh[0] = 'x'
+	stale, _ := c.GetStale(key)
+	stale.body[1] = 'y'
+	again, _, _, _ := c.Get(key, base)
+	if string(again) != "body" {
+		t.Fatalf("getter mutation rewrote cached body: %q", again)
 	}
 }
 
@@ -195,7 +210,7 @@ func TestSubscriptionCacheHashChangeForcesReplace(t *testing.T) {
 	// revalidation against the old hash must not resurrect the old body.
 	c.Put(key, []byte("new"), "text/plain", "", "hash-2", base.Add(2*time.Minute))
 	stale, ok := c.GetStale(key)
-	if !ok || string(stale.body) != "new" || stale.contentHash != "hash-2" {
-		t.Fatalf("replaced entry = %q %q %v", stale.body, stale.contentHash, ok)
+	if !ok || string(stale.body) != "new" || stale.contentVersion != "hash-2" {
+		t.Fatalf("replaced entry = %q %q %v", stale.body, stale.contentVersion, ok)
 	}
 }

@@ -151,8 +151,10 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	uaClass := classifyClientUA(r.Header.Get("User-Agent"))
 	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass}
 
-	body, contentType, userinfo, cached := s.subscriptionCache.Get(key, s.now())
-	if !cached && share.Source.Kind == model.ShareSourcePlugin {
+	cacheEntry, cached := s.subscriptionCache.GetSnapshot(key, s.now())
+	body, contentType, userinfo := cacheEntry.body, cacheEntry.contentType, cacheEntry.userinfo
+	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.contentVersion, cacheEntry.fetchedAt
+	if (!cached || staleResponse) && share.Source.Kind == model.ShareSourcePlugin {
 		// Revalidate before paying for a render. A render boots the plugin's
 		// JavaScript engine, which costs seconds; comparing the content digest
 		// costs a store read and, at most, one provider fetch. When the digest
@@ -160,14 +162,22 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		// source cannot be reached at all, the last good body is served — a
 		// provider outage must not take a client's configuration with it, the
 		// same rule the snapshot layer applies one step down.
-		if stale, ok := s.subscriptionCache.GetStale(key); ok {
+		stale, ok := cacheEntry, cached
+		if !ok {
+			stale, ok = s.subscriptionCache.GetStale(key)
+		}
+		if ok {
 			snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false)
 			switch {
 			case snapErr != nil:
-				body, contentType, userinfo, cached = stale.body, stale.contentType, stale.userinfo, true
-			case subscriptionContentHash(snap.Raw) == stale.contentHash:
-				s.subscriptionCache.Extend(key, s.now())
-				body, contentType, userinfo, cached = stale.body, stale.contentType, stale.userinfo, true
+				// A persistence failure in snapshotFor is not a successful last-good
+				// transition. Do not serve a cached stale body as though the failed
+				// attempt had been durably recorded.
+				cached = false
+			case subscriptionSnapshotVersion(snap) == stale.contentVersion:
+				s.subscriptionCache.ExtendSnapshot(key, snap.Userinfo, snap.Stale, snap.FetchedAt, s.now())
+				body, contentType, userinfo, cached = stale.body, stale.contentType, snap.Userinfo, true
+				staleResponse, sourceVersion, snapshotFetchedAt = snap.Stale, stale.contentVersion, snap.FetchedAt
 			}
 		}
 	}
@@ -178,6 +188,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		body, contentType, userinfo = rendered.Body, rendered.ContentType, rendered.Userinfo
+		staleResponse, sourceVersion, snapshotFetchedAt = rendered.Stale, rendered.SourceVersion, rendered.FetchedAt
 		// A client that receives an empty but successful subscription deletes
 		// every node it had. Answering with the decoy keeps that from happening
 		// AND keeps the emptiness from confirming that the token was real.
@@ -185,15 +196,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
-		contentHash := ""
-		if share.Source.Kind == model.ShareSourcePlugin {
-			// renderShare already refreshed the snapshot, so this read is the
-			// fresh record, never a second fetch.
-			if snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false); snapErr == nil {
-				contentHash = subscriptionContentHash(snap.Raw)
-			}
-		}
-		s.subscriptionCache.Put(key, body, contentType, userinfo, contentHash, s.now())
+		s.subscriptionCache.PutSnapshot(key, body, contentType, userinfo, sourceVersion, staleResponse, snapshotFetchedAt, s.now())
 	}
 
 	if contentType == "" {
@@ -204,19 +207,32 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	if userinfo != "" {
 		w.Header().Set("Subscription-Userinfo", userinfo)
 	}
+	if staleResponse {
+		w.Header().Set("X-Lattice-Subscription-Stale", "true")
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
 		Metadata: map[string]string{
-			"share_id":     share.ID,
-			"slug":         slug,
-			"token_sha256": tokenHash,
-			"format":       format,
-			"ua_class":     uaClass,
-			"cache":        strconv.FormatBool(cached),
+			"share_id":             share.ID,
+			"slug":                 slug,
+			"token_sha256":         tokenHash,
+			"format":               format,
+			"ua_class":             uaClass,
+			"cache":                strconv.FormatBool(cached),
+			"stale":                strconv.FormatBool(staleResponse),
+			"source_version":       sourceVersion,
+			"snapshot_age_seconds": snapshotAgeSeconds(s.now(), snapshotFetchedAt),
 		},
 	})
+}
+
+func snapshotAgeSeconds(now, fetchedAt time.Time) string {
+	if fetchedAt.IsZero() || now.Before(fetchedAt) {
+		return "0"
+	}
+	return strconv.FormatInt(int64(now.Sub(fetchedAt)/time.Second), 10)
 }
 
 // invalidateSharesForPlugin drops every cached body rendered from one plugin's
@@ -296,7 +312,8 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		}
 		// The provider's traffic figures are passed through verbatim so the
 		// client's remaining-quota display stays truthful.
-		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Userinfo: snap.Userinfo}, nil
+		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Userinfo: snap.Userinfo,
+			Stale: snap.Stale, SourceVersion: subscriptionSnapshotVersion(snap), FetchedAt: snap.FetchedAt}, nil
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
@@ -305,7 +322,10 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 // renderedSubscription is one produced body plus the metadata the core turns
 // into response headers. A source never sets a header itself.
 type renderedSubscription struct {
-	Body        []byte
-	ContentType string
-	Userinfo    string
+	Body          []byte
+	ContentType   string
+	Userinfo      string
+	Stale         bool
+	SourceVersion string
+	FetchedAt     time.Time
 }

@@ -1,16 +1,20 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 const (
@@ -213,8 +217,12 @@ func (s *Server) renderLineChainSidecar(nodeID, sourceUUID, targetUUID string) (
 	found := false
 	for i := range doc.Inbounds {
 		if strings.EqualFold(doc.Inbounds[i].LineUUID, sourceUUID) {
-			target := targetUUID
-			doc.Inbounds[i].Chain = &lineMetadataChainV2{DownstreamLineUUID: &target, DownstreamNode: ""}
+			if targetUUID == "" {
+				doc.Inbounds[i].Chain = nil
+			} else {
+				target := targetUUID
+				doc.Inbounds[i].Chain = &lineMetadataChainV2{DownstreamLineUUID: &target, DownstreamNode: ""}
+			}
 			found = true
 		}
 	}
@@ -227,4 +235,199 @@ func (s *Server) renderLineChainSidecar(nodeID, sourceUUID, targetUUID string) (
 		return nil, err
 	}
 	return append(out, '\n'), nil
+}
+
+func (s *Server) compileLineChainRemove(sourceUUID string) (lineChainCompiledArtifact, error) {
+	sourceUUID = strings.ToLower(strings.TrimSpace(sourceUUID))
+	if !validLineUUIDv4(sourceUUID) {
+		return lineChainCompiledArtifact{}, errors.New("source_line_uuid must be UUIDv4")
+	}
+	snapshot := s.store.LineChainSnapshot()
+	current, ok := snapshot.Definitions[sourceUUID]
+	if !ok || current.TargetLineUUID == "" {
+		return lineChainCompiledArtifact{}, errors.New("source has no committed chain to remove")
+	}
+	var source Line
+	found := false
+	for _, group := range s.buildLineGroups() {
+		for _, line := range group.Lines {
+			if strings.EqualFold(line.LineUUID, sourceUUID) {
+				if found {
+					return lineChainCompiledArtifact{}, errors.New("source line identity is ambiguous")
+				}
+				source, found = line, true
+			}
+		}
+	}
+	if !found || source.NodeID != current.SourceNodeID || source.Tag == "" {
+		return lineChainCompiledArtifact{}, errors.New("committed source line is unavailable")
+	}
+	if !s.agentHasCapability(source.NodeID, lineChainDurableCapability) {
+		return lineChainCompiledArtifact{}, errors.New("source node does not advertise durable-task-result-v1")
+	}
+	sidecar, err := s.renderLineChainSidecar(source.NodeID, sourceUUID, "")
+	if err != nil {
+		return lineChainCompiledArtifact{}, err
+	}
+	artifactSHA := digestText("\x00" + string(sidecar))
+	requestSHA := digestText("remove\x00" + sourceUUID + "\x00" + current.ArtifactSHA256 + "\x00" + artifactSHA)
+	return lineChainCompiledArtifact{Plan: lineChainPlan{
+		Operation: "remove", SourceLineUUID: sourceUUID, SourceNodeID: source.NodeID, SourceLabel: source.Name,
+		SourceInboundTag: source.Tag, OutboundTag: current.OutboundTag, FragmentPath: current.FragmentPath,
+		SidecarSHA256: digestText(string(sidecar)), ArtifactSHA256: artifactSHA, RequestSHA256: requestSHA,
+		PreviousTargetLineUUID: current.TargetLineUUID, PreviousArtifactSHA256: current.ArtifactSHA256,
+		PreflightChecks: []string{"source_identity", "committed_baseline", "consumer_capability"},
+		Summary:         fmt.Sprintf("Remove managed downstream from %s on %s", source.Name, s.nodeDisplayName(source.NodeID)),
+	}, SidecarJSON: string(sidecar)}, nil
+}
+
+func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArtifact) (model.Approval, error) {
+	planJSON, err := json.Marshal(compiled.Plan)
+	if err != nil {
+		return model.Approval{}, err
+	}
+	method := lineChainSetMethod
+	operation := store.LineChainOperationSet
+	if compiled.Plan.Operation == "remove" {
+		method = lineChainRemoveMethod
+		operation = store.LineChainOperationRemove
+	}
+	approval := model.Approval{
+		ID: id.New("approval"), NodeID: compiled.Plan.SourceNodeID, Plugin: lineChainPlugin,
+		PluginVersion: "design-18-e3-v1", Service: lineChainService, Method: method,
+		Action: lineChainActionPrefix + compiled.Plan.ArtifactSHA256, ArtifactDigest: compiled.Plan.ArtifactSHA256,
+		RequestSHA256: compiled.Plan.RequestSHA256, Targets: []string{compiled.Plan.SourceNodeID},
+		Plan: string(planJSON), Status: model.ApprovalPending, ActorID: p.ActorID,
+		CreatedAt: s.now(), UpdatedAt: s.now(),
+	}
+	current := s.store.LineChainSnapshot().Definitions[compiled.Plan.SourceLineUUID]
+	attempt := store.LineChainAttempt{
+		ApprovalID: approval.ID, Operation: operation, SourceLineUUID: compiled.Plan.SourceLineUUID,
+		SourceNodeID: compiled.Plan.SourceNodeID, CandidateTargetLineUUID: compiled.Plan.TargetLineUUID,
+		CandidateTargetNodeID: compiled.Plan.TargetNodeID, BaseGeneration: current.Generation,
+		BaseArtifactSHA256: current.ArtifactSHA256, CandidateArtifactSHA256: compiled.Plan.ArtifactSHA256,
+		RequestSHA256: compiled.Plan.RequestSHA256,
+	}
+	planned, deduped, err := s.store.PlanLineChainApproval(attempt, approval)
+	if err != nil {
+		return model.Approval{}, err
+	}
+	if deduped {
+		existing, ok := s.store.Approval(planned.ApprovalID)
+		if !ok {
+			return model.Approval{}, errors.New("deduplicated line chain approval is missing")
+		}
+		return existing, nil
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID: id.New("audit"), NodeID: approval.NodeID, Action: "linechain.plan", Scope: "network:plan",
+		Metadata: map[string]string{"approval_id": approval.ID, "source_line_uuid": compiled.Plan.SourceLineUUID, "target_line_uuid": compiled.Plan.TargetLineUUID, "artifact_sha256": compiled.Plan.ArtifactSHA256},
+	})
+	return approval, nil
+}
+
+func (s *Server) handleLineChainPlan(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req lineChainCompileRequest
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	compiled, err := s.compileLineChain(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	approval, err := s.persistLineChainPlan(p, compiled)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"approval": toApprovalView(approval), "preview": compiled.Plan})
+}
+
+func (s *Server) handleLineChainRemovePlan(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		SourceLineUUID string `json:"source_line_uuid"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	compiled, err := s.compileLineChainRemove(req.SourceLineUUID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	approval, err := s.persistLineChainPlan(p, compiled)
+	if err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"approval": toApprovalView(approval), "preview": compiled.Plan})
+}
+
+func (s *Server) handleLineChains(w http.ResponseWriter, r *http.Request, _ principal) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	writeJSON(w, http.StatusOK, s.lineChainViews())
+}
+
+func (s *Server) lineChainViews() map[string]any {
+	snapshot := s.store.LineChainSnapshot()
+	return map[string]any{"definitions": snapshot.Definitions, "attempts": snapshot.Attempts, "graph_revision": snapshot.Revision}
+}
+
+func (s *Server) vpnCoreLineChainsRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
+	switch method {
+	case "chains":
+		return json.Marshal(s.lineChainViews())
+	case "plan_chain":
+		p, err := pluginOperatorPrincipal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var req lineChainCompileRequest
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, err
+		}
+		compiled, err := s.compileLineChain(req)
+		if err != nil {
+			return nil, err
+		}
+		approval, err := s.persistLineChainPlan(p, compiled)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]any{"approval": toApprovalView(approval), "preview": compiled.Plan})
+	case "plan_remove_chain":
+		p, err := pluginOperatorPrincipal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var req struct {
+			SourceLineUUID string `json:"source_line_uuid"`
+		}
+		if err := json.Unmarshal(request, &req); err != nil {
+			return nil, err
+		}
+		compiled, err := s.compileLineChainRemove(req.SourceLineUUID)
+		if err != nil {
+			return nil, err
+		}
+		approval, err := s.persistLineChainPlan(p, compiled)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(map[string]any{"approval": toApprovalView(approval), "preview": compiled.Plan})
+	default:
+		return nil, fmt.Errorf("vpn-core/lines chain method %q is unknown", method)
+	}
 }

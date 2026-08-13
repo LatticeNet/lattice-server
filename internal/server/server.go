@@ -992,6 +992,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/network/nft/inputs/delete", s.withAuth("network:plan", s.handleDeleteNFTInputs))
 	// design-17 S1: managed-line overlay rollout compiler + definition views.
 	mux.HandleFunc("/api/network/lines/managed-rollout", s.withAuth("network:plan", s.handleManagedLineRollout))
+	mux.HandleFunc("/api/network/lines/chains", s.withAuth("proxy:read", s.handleLineChains))
+	mux.HandleFunc("/api/network/lines/chains/plan", s.withAuth("network:plan", s.handleLineChainPlan))
+	mux.HandleFunc("/api/network/lines/chains/remove-plan", s.withAuth("network:plan", s.handleLineChainRemovePlan))
 	mux.HandleFunc("/api/netpolicy", s.withAuth("", s.handleNetPolicy))
 	mux.HandleFunc("/api/netpolicy/plan", s.withAuth("", s.handleNetPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/delete", s.withAuth("", s.handleDeleteNetPolicy))

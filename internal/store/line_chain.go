@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 const (
@@ -131,6 +133,17 @@ func validateLineChainAttempt(attempt LineChainAttempt) error {
 func (s *Store) PlanLineChain(attempt LineChainAttempt) (LineChainAttempt, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.planLineChainLocked(attempt, nil)
+}
+
+// PlanLineChainApproval persists the typed approval and candidate together.
+func (s *Store) PlanLineChainApproval(attempt LineChainAttempt, approval model.Approval) (LineChainAttempt, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.planLineChainLocked(attempt, &approval)
+}
+
+func (s *Store) planLineChainLocked(attempt LineChainAttempt, approval *model.Approval) (LineChainAttempt, bool, error) {
 	if err := validateLineChainAttempt(attempt); err != nil {
 		return LineChainAttempt{}, false, err
 	}
@@ -154,6 +167,16 @@ func (s *Store) PlanLineChain(attempt LineChainAttempt) (LineChainAttempt, bool,
 	staged := s.state
 	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
 	staged.LineChainAttempts[attempt.ApprovalID] = attempt
+	if approval != nil {
+		if approval.ID != attempt.ApprovalID || approval.Status != model.ApprovalPending {
+			return LineChainAttempt{}, false, errors.New("line chain approval does not match planned attempt")
+		}
+		staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals)+1)
+		for id, current := range s.state.Approvals {
+			staged.Approvals[id] = current
+		}
+		staged.Approvals[approval.ID] = *approval
+	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged

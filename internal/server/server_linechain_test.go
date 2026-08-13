@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, managedLineDef) {
@@ -70,5 +71,35 @@ func TestLineChainCompilerRejectsMissingConsumerCapability(t *testing.T) {
 	srv.replaceAgentCapabilities("node-b", nil)
 	if _, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID}); err == nil || !strings.Contains(err.Error(), lineChainDurableCapability) {
 		t.Fatalf("missing capability error=%v", err)
+	}
+}
+
+func TestLineChainPlanPersistsTypedApprovalAndSeparateAttempt(t *testing.T) {
+	srv, sourceUUID, targetUUID, user, def := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approval.Plugin != lineChainPlugin || approval.Service != lineChainService || approval.Method != lineChainSetMethod ||
+		approval.Action != lineChainActionPrefix+compiled.Plan.ArtifactSHA256 || len(approval.Targets) != 1 || approval.Targets[0] != "node-b" {
+		t.Fatalf("typed approval binding is wrong: %+v", approval)
+	}
+	for _, secret := range []string{user.Credentials[0].UUID, def.RealityPrivateKey, compiled.FragmentJSON, compiled.SidecarJSON} {
+		if strings.Contains(approval.Plan, secret) {
+			t.Fatalf("approval leaked secret/artifact %q: %s", secret, approval.Plan)
+		}
+	}
+	snapshot := srv.store.LineChainSnapshot()
+	attempt, ok := snapshot.Attempts[approval.ID]
+	if !ok || attempt.Status != store.LineChainStatusPlanned || attempt.PlanGraphRevision != snapshot.Revision || len(snapshot.Definitions) != 0 {
+		t.Fatalf("planned state is not separate from committed definitions: %+v", snapshot)
+	}
+	again, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil || again.ID != approval.ID {
+		t.Fatalf("identical plan did not deduplicate: again=%+v err=%v", again, err)
 	}
 }

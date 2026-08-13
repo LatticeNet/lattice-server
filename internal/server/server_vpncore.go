@@ -47,7 +47,7 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export", "list"}, s.vpnCoreNodesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreNodesService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach", "managed", "rollout"}, s.vpnCoreLinesRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach", "managed", "rollout", "chains", "plan_chain", "plan_remove_chain"}, s.vpnCoreLinesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreLinesService, err)
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersService, "v1", []string{"list", "get"}, s.vpnCoreUsersRPC); err != nil {
@@ -71,6 +71,8 @@ func (s *Server) registerVPNCoreRPC() {
 //	get {line_hash_id} -> {"line": {...}}
 func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
+	case "chains", "plan_chain", "plan_remove_chain":
+		return s.vpnCoreLineChainsRPC(ctx, method, request)
 	case "list":
 		groups, _ := s.lineReadModel()
 		count := 0

@@ -72,8 +72,16 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 			resp := host(call)
 			out := stdioJSONV2Frame{Protocol: 2, Kind: "host_response", Generation: generation, InvocationID: invocation, HostCallID: f.HostCallID}
 			out.HostResponse, _ = json.Marshal(resp)
-			if err := json.NewEncoder(t.hostResp).Encode(out); err != nil {
-				return systemRunnerReply{}, err
+			writeResp := make(chan error, 1)
+			go func() { writeResp <- json.NewEncoder(t.hostResp).Encode(out) }()
+			select {
+			case err := <-writeResp:
+				if err != nil {
+					return systemRunnerReply{}, err
+				}
+			case <-ctx.Done():
+				_ = t.abort()
+				return systemRunnerReply{}, ctx.Err()
 			}
 			continue
 		}

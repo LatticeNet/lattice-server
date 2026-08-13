@@ -132,6 +132,7 @@ type systemWorkerTransport struct {
 	scanner   *bufio.Scanner
 	frames    chan transportFrame
 	done      chan struct{}
+	waitDone  chan error
 	abortOnce sync.Once
 	abortErr  error
 }
@@ -253,7 +254,8 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 		return nil, err
 	}
 	_ = hostRead.Close()
-	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid, scanner: bufio.NewScanner(out), frames: make(chan transportFrame, 1), done: make(chan struct{})}
+	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid, scanner: bufio.NewScanner(out), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan error, 1)}
+	go func() { t.waitDone <- cmd.Wait() }()
 	t.scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	go t.readPump()
 	return t, nil
@@ -267,7 +269,7 @@ func (t *systemWorkerTransport) abort() error {
 		close(t.done)
 		_ = syscall.Kill(-t.pgid, syscall.SIGTERM)
 		done := make(chan error, 1)
-		go func() { done <- t.cmd.Wait() }()
+		done = t.waitDone
 		select {
 		case t.abortErr = <-done:
 		case <-time.After(100 * time.Millisecond):
@@ -283,5 +285,5 @@ func (t *systemWorkerTransport) wait() error {
 	if t == nil || t.cmd == nil {
 		return nil
 	}
-	return t.cmd.Wait()
+	return <-t.waitDone
 }

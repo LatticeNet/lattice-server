@@ -17,6 +17,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // design-17: managed line overlay on adopted nodes. This file is the rollout
@@ -208,34 +209,27 @@ func managedLinePlannedHash(nodeID, tag string, port int) string {
 }
 
 func (s *Server) putManagedLineDef(def managedLineDef) error {
-	raw, err := json.Marshal(def)
-	if err != nil {
-		return err
-	}
-	return s.store.PutKV(model.KVEntry{Bucket: managedLineDefBucket, Key: def.LineUUID, Value: string(raw)})
+	public, private := splitManagedLineRecord(def)
+	return s.store.PutManagedLineRecord(public, private)
 }
 
 func (s *Server) managedLineDefByUUID(lineUUID string) (managedLineDef, bool, error) {
-	entry, ok := s.store.KVEntry(managedLineDefBucket, lineUUID)
+	public, private, ok := s.store.ManagedLineRecord(lineUUID)
 	if !ok {
 		return managedLineDef{}, false, nil
 	}
-	var def managedLineDef
-	if err := json.Unmarshal([]byte(entry.Value), &def); err != nil {
-		return managedLineDef{}, false, fmt.Errorf("decode managed line def %s: %w", lineUUID, err)
-	}
-	return def, true, nil
+	return joinManagedLineRecord(public, private), true, nil
 }
 
 func (s *Server) managedLineDefs() ([]managedLineDef, error) {
-	entries := s.store.KV(managedLineDefBucket)
-	defs := make([]managedLineDef, 0, len(entries))
-	for _, entry := range entries {
-		var def managedLineDef
-		if err := json.Unmarshal([]byte(entry.Value), &def); err != nil {
-			return nil, fmt.Errorf("decode managed line def %s: %w", entry.Key, err)
+	publicRecords, privateRecords := s.store.ManagedLineRecords()
+	defs := make([]managedLineDef, 0, len(publicRecords))
+	for lineUUID, public := range publicRecords {
+		private, ok := privateRecords[lineUUID]
+		if !ok {
+			return nil, fmt.Errorf("managed line def %s is missing private material", lineUUID)
 		}
-		defs = append(defs, def)
+		defs = append(defs, joinManagedLineRecord(public, private))
 	}
 	sort.Slice(defs, func(i, j int) bool {
 		if defs[i].NodeID != defs[j].NodeID {
@@ -244,6 +238,27 @@ func (s *Server) managedLineDefs() ([]managedLineDef, error) {
 		return defs[i].Tag < defs[j].Tag
 	})
 	return defs, nil
+}
+
+func splitManagedLineRecord(def managedLineDef) (store.ManagedLinePublicRecord, store.ManagedLineSecretRecord) {
+	return store.ManagedLinePublicRecord{
+		LineUUID: def.LineUUID, NodeID: def.NodeID, LineHashID: def.LineHashID, Tag: def.Tag,
+		Port: def.Port, SNI: def.SNI, HandshakeServer: def.HandshakeServer, HandshakePort: def.HandshakePort,
+		RealityPublicKey: def.RealityPublicKey, ShortID: def.ShortID, UserID: def.UserID, UserName: def.UserName,
+		FragmentSHA256: def.FragmentSHA256, Status: def.Status, ApprovalID: def.ApprovalID,
+		LastError: def.LastError, CreatedAt: def.CreatedAt, UpdatedAt: def.UpdatedAt,
+	}, store.ManagedLineSecretRecord{RealityPrivateKey: def.RealityPrivateKey}
+}
+
+func joinManagedLineRecord(public store.ManagedLinePublicRecord, private store.ManagedLineSecretRecord) managedLineDef {
+	return managedLineDef{
+		LineUUID: public.LineUUID, NodeID: public.NodeID, LineHashID: public.LineHashID, Tag: public.Tag,
+		Port: public.Port, SNI: public.SNI, HandshakeServer: public.HandshakeServer, HandshakePort: public.HandshakePort,
+		RealityPrivateKey: private.RealityPrivateKey, RealityPublicKey: public.RealityPublicKey,
+		ShortID: public.ShortID, UserID: public.UserID, UserName: public.UserName,
+		FragmentSHA256: public.FragmentSHA256, Status: public.Status, ApprovalID: public.ApprovalID,
+		LastError: public.LastError, CreatedAt: public.CreatedAt, UpdatedAt: public.UpdatedAt,
+	}
 }
 
 // managedLineDefByNode returns the node's live definition (planned/applied),

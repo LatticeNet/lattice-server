@@ -457,7 +457,9 @@ func New(opts Options) (*Server, error) {
 	// Derive vpn-core identities (VpnUser) from legacy ProxyUsers. Idempotent and
 	// additive — existing identities are untouched and ProxyUser stays the
 	// subscription-render substrate (design-12 S2).
-	s.migrateProxyUsersToVpnUsers()
+	if err := s.migrateProxyUsersToVpnUsers(); err != nil {
+		return nil, fmt.Errorf("migrate vpn user secrets: %w", err)
+	}
 	if dir := strings.TrimSpace(opts.PluginRuntimeDir); dir != "" {
 		// Tier-2 system runner: execute verified system-plugin artifacts in a
 		// confined per-plugin dir. Host mutation still flows through the in-core
@@ -3407,6 +3409,10 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 	if bucket == "" {
 		bucket = "default"
 	}
+	if reservedLineSecretKVBucket(bucket) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorForbidden, "bucket is reserved for typed private state"))
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if !s.requireScope(w, p, "kv:read") {
@@ -3450,6 +3456,13 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+func reservedLineSecretKVBucket(bucket string) bool {
+	bucket = strings.TrimSpace(bucket)
+	return bucket == vpnCoreKVBucket || bucket == "managedline/def" ||
+		bucket == "vpn_users" || bucket == "vpn_user_secrets" ||
+		bucket == "managed_line_secrets"
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principal) {

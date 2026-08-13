@@ -106,6 +106,27 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.PluginSecrets = pluginSecrets
 
+	vpnUserSecrets := make(map[string]VpnUserSecretRecord, len(st.VpnUserSecrets))
+	for id, record := range st.VpnUserSecrets {
+		enc, err := encryptVpnUserSecretRecord(id, record, c)
+		if err != nil {
+			return State{}, err
+		}
+		vpnUserSecrets[id] = enc
+	}
+	out.VpnUserSecrets = vpnUserSecrets
+
+	managedLineSecrets := make(map[string]ManagedLineSecretRecord, len(st.ManagedLineSecrets))
+	for id, record := range st.ManagedLineSecrets {
+		key, err := c.Encrypt(record.RealityPrivateKey)
+		if err != nil {
+			return State{}, fmt.Errorf("encrypt managed line %s reality private key: %w", id, err)
+		}
+		record.RealityPrivateKey = key
+		managedLineSecrets[id] = record
+	}
+	out.ManagedLineSecrets = managedLineSecrets
+
 	dnsDeployments := make(map[string]model.DNSDeployment, len(st.DNSDeployments))
 	for id, d := range st.DNSDeployments {
 		enc, err := encryptDNSDeploymentRecord(id, d, c)
@@ -274,6 +295,30 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.PluginSecrets = pluginSecrets
 
+	vpnUserSecrets := make(map[string]VpnUserSecretRecord, len(st.VpnUserSecrets))
+	for id, record := range st.VpnUserSecrets {
+		dec, err := decryptVpnUserSecretRecord(id, record, c)
+		if err != nil {
+			return err
+		}
+		vpnUserSecrets[id] = dec
+	}
+	st.VpnUserSecrets = vpnUserSecrets
+
+	managedLineSecrets := make(map[string]ManagedLineSecretRecord, len(st.ManagedLineSecrets))
+	for id, record := range st.ManagedLineSecrets {
+		if !c.Enabled() && secret.IsEnvelope(record.RealityPrivateKey) {
+			return lostMasterKeyError()
+		}
+		key, err := c.Decrypt(record.RealityPrivateKey)
+		if err != nil {
+			return fmt.Errorf("decrypt managed line %s reality private key: %w", id, err)
+		}
+		record.RealityPrivateKey = key
+		managedLineSecrets[id] = record
+	}
+	st.ManagedLineSecrets = managedLineSecrets
+
 	dnsDeployments := make(map[string]model.DNSDeployment, len(st.DNSDeployments))
 	for id, d := range st.DNSDeployments {
 		dec, err := decryptDNSDeploymentRecord(id, d, c)
@@ -388,6 +433,21 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, e := range st.PluginSecrets {
 		if secret.IsEnvelope(e.Value) {
+			return true
+		}
+	}
+	for _, record := range st.VpnUserSecrets {
+		if secret.IsEnvelope(record.SubID) {
+			return true
+		}
+		for _, credential := range record.Credentials {
+			if secret.IsEnvelope(credential.UUID) || secret.IsEnvelope(credential.Password) {
+				return true
+			}
+		}
+	}
+	for _, record := range st.ManagedLineSecrets {
+		if secret.IsEnvelope(record.RealityPrivateKey) {
 			return true
 		}
 	}
@@ -769,6 +829,58 @@ func decryptProxyUserRecord(id string, u model.ProxyUser, c secret.Cipher) (mode
 	u.Password = password
 	u.SubToken = subToken
 	return u, nil
+}
+
+func encryptVpnUserSecretRecord(id string, record VpnUserSecretRecord, c secret.Cipher) (VpnUserSecretRecord, error) {
+	out := record
+	out.Credentials = append([]VpnUserCredentialSecret(nil), record.Credentials...)
+	for i := range out.Credentials {
+		uuid, err := c.Encrypt(out.Credentials[i].UUID)
+		if err != nil {
+			return VpnUserSecretRecord{}, fmt.Errorf("encrypt vpn user %s credential %d uuid: %w", id, i, err)
+		}
+		password, err := c.Encrypt(out.Credentials[i].Password)
+		if err != nil {
+			return VpnUserSecretRecord{}, fmt.Errorf("encrypt vpn user %s credential %d password: %w", id, i, err)
+		}
+		out.Credentials[i].UUID = uuid
+		out.Credentials[i].Password = password
+	}
+	subID, err := c.Encrypt(out.SubID)
+	if err != nil {
+		return VpnUserSecretRecord{}, fmt.Errorf("encrypt vpn user %s subscription id: %w", id, err)
+	}
+	out.SubID = subID
+	return out, nil
+}
+
+func decryptVpnUserSecretRecord(id string, record VpnUserSecretRecord, c secret.Cipher) (VpnUserSecretRecord, error) {
+	out := record
+	out.Credentials = append([]VpnUserCredentialSecret(nil), record.Credentials...)
+	for i := range out.Credentials {
+		if !c.Enabled() && (secret.IsEnvelope(out.Credentials[i].UUID) || secret.IsEnvelope(out.Credentials[i].Password)) {
+			return VpnUserSecretRecord{}, lostMasterKeyError()
+		}
+		uuid, err := c.Decrypt(out.Credentials[i].UUID)
+		if err != nil {
+			return VpnUserSecretRecord{}, fmt.Errorf("decrypt vpn user %s credential %d uuid: %w", id, i, err)
+		}
+		password, err := c.Decrypt(out.Credentials[i].Password)
+		if err != nil {
+			return VpnUserSecretRecord{}, fmt.Errorf("decrypt vpn user %s credential %d password: %w", id, i, err)
+		}
+		out.Credentials[i].UUID = uuid
+		out.Credentials[i].Password = password
+	}
+	if !c.Enabled() && secret.IsEnvelope(out.SubID) {
+		return VpnUserSecretRecord{}, lostMasterKeyError()
+	}
+	subID, err := c.Decrypt(out.SubID)
+	if err != nil {
+		return VpnUserSecretRecord{}, fmt.Errorf("decrypt vpn user %s subscription id: %w", id, err)
+	}
+	out.SubID = subID
+	return out, nil
 }
 
 // encryptSubscriptionShareRecord seals a share's token. The token is a bearer

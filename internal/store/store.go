@@ -56,6 +56,10 @@ type State struct {
 	// over GET /api/kv by any principal holding kv:read. A secret must have neither
 	// property, so it gets its own map, its own cipher pass, and no HTTP handler.
 	PluginSecrets         map[string]model.KVEntry              `json:"plugin_secrets"`
+	VpnUsers              map[string]VpnUserPublicRecord        `json:"vpn_users"`
+	VpnUserSecrets        map[string]VpnUserSecretRecord        `json:"vpn_user_secrets"`
+	ManagedLines          map[string]ManagedLinePublicRecord    `json:"managed_lines"`
+	ManagedLineSecrets    map[string]ManagedLineSecretRecord    `json:"managed_line_secrets"`
 	SubscriptionShares    map[string]model.SubscriptionShare    `json:"subscription_shares"`
 	SubscriptionSnapshots map[string]model.SubscriptionSnapshot `json:"subscription_snapshots"`
 	Static                map[string]model.StaticObject         `json:"static"`
@@ -438,6 +442,10 @@ func emptyState() State {
 		TaskResultReceipts:    map[string]TaskResultReceipt{},
 		KV:                    map[string]model.KVEntry{},
 		PluginSecrets:         map[string]model.KVEntry{},
+		VpnUsers:              map[string]VpnUserPublicRecord{},
+		VpnUserSecrets:        map[string]VpnUserSecretRecord{},
+		ManagedLines:          map[string]ManagedLinePublicRecord{},
+		ManagedLineSecrets:    map[string]ManagedLineSecretRecord{},
 		SubscriptionShares:    map[string]model.SubscriptionShare{},
 		SubscriptionSnapshots: map[string]model.SubscriptionSnapshot{},
 		Static:                map[string]model.StaticObject{},
@@ -503,6 +511,18 @@ func (st *State) ensureMaps() {
 	}
 	if st.PluginSecrets == nil {
 		st.PluginSecrets = map[string]model.KVEntry{}
+	}
+	if st.VpnUsers == nil {
+		st.VpnUsers = map[string]VpnUserPublicRecord{}
+	}
+	if st.VpnUserSecrets == nil {
+		st.VpnUserSecrets = map[string]VpnUserSecretRecord{}
+	}
+	if st.ManagedLines == nil {
+		st.ManagedLines = map[string]ManagedLinePublicRecord{}
+	}
+	if st.ManagedLineSecrets == nil {
+		st.ManagedLineSecrets = map[string]ManagedLineSecretRecord{}
 	}
 	if st.SubscriptionShares == nil {
 		st.SubscriptionShares = map[string]model.SubscriptionShare{}

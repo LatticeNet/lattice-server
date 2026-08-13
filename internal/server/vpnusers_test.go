@@ -34,6 +34,84 @@ func TestVpnUserMigrationIdempotent(t *testing.T) {
 	}
 }
 
+func TestVpnUserLegacyKVSecretMigrationIsFailClosedAndIdempotent(t *testing.T) {
+	srv := newLinesTestServer(t)
+	legacy := VpnUser{
+		ID: "vpn-legacy", Email: "legacy@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "credential-canary"}},
+		Bindings:    []LineBinding{}, SubID: "subscription-canary",
+	}
+	raw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.PutKV(model.KVEntry{Bucket: vpnCoreKVBucket, Key: vpnUserKey(legacy.ID), Value: string(raw)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.migrateProxyUsersToVpnUsers(); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.migrateProxyUsersToVpnUsers(); err != nil {
+		t.Fatalf("second migration was not idempotent: %v", err)
+	}
+	if _, ok := srv.store.KVEntry(vpnCoreKVBucket, vpnUserKey(legacy.ID)); ok {
+		t.Fatal("secret-bearing legacy KV entry survived migration")
+	}
+	got, ok := srv.getVpnUser(legacy.ID)
+	if !ok || got.Credentials[0].UUID != "credential-canary" || got.SubID != "subscription-canary" {
+		t.Fatalf("typed migration lost secret material: %+v, ok=%v", got, ok)
+	}
+	public, ok := srv.store.VpnUserPublicRecord(legacy.ID)
+	if !ok {
+		t.Fatal("typed public record missing")
+	}
+	publicJSON, err := json.Marshal(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(publicJSON), "credential-canary") || strings.Contains(string(publicJSON), "subscription-canary") {
+		t.Fatalf("public record contains secret material: %s", publicJSON)
+	}
+}
+
+func TestLineSecretMigrationMovesVpnUserAndManagedLineInOneTypedTransition(t *testing.T) {
+	srv := newLinesTestServer(t)
+	user := VpnUser{
+		ID: "vpn-legacy-pair", Email: "pair@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "credential-pair-canary"}},
+		Bindings:    []LineBinding{},
+	}
+	managed := managedLineDef{
+		LineUUID: "11111111-1111-4111-8111-111111111111", NodeID: "node-a", Tag: "managed-pair",
+		RealityPrivateKey: "reality-pair-canary", RealityPublicKey: "public", Status: managedLineStatusApplied,
+	}
+	userJSON, _ := json.Marshal(user)
+	managedJSON, _ := json.Marshal(managed)
+	if err := srv.store.PutKV(model.KVEntry{Bucket: vpnCoreKVBucket, Key: vpnUserKey(user.ID), Value: string(userJSON)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.PutKV(model.KVEntry{Bucket: managedLineDefBucket, Key: managed.LineUUID, Value: string(managedJSON)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.migrateProxyUsersToVpnUsers(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := srv.store.KVEntry(vpnCoreKVBucket, vpnUserKey(user.ID)); ok {
+		t.Fatal("legacy vpn user survived unified migration")
+	}
+	if _, ok := srv.store.KVEntry(managedLineDefBucket, managed.LineUUID); ok {
+		t.Fatal("legacy managed line survived unified migration")
+	}
+	gotUser, ok := srv.getVpnUser(user.ID)
+	if !ok || gotUser.Credentials[0].UUID != "credential-pair-canary" {
+		t.Fatalf("vpn user secret missing after unified migration: %+v", gotUser)
+	}
+	gotManaged, ok, err := srv.managedLineDefByUUID(managed.LineUUID)
+	if err != nil || !ok || gotManaged.RealityPrivateKey != "reality-pair-canary" {
+		t.Fatalf("managed line secret missing after unified migration: %+v ok=%v err=%v", gotManaged, ok, err)
+	}
+}
+
 func TestVpnUserAdminRPCCRUDAndBind(t *testing.T) {
 	srv := newLinesTestServer(t)
 	seedLinesFixture(t, srv) // node-a + managed vless:443 line to bind against

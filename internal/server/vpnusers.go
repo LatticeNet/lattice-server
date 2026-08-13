@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // VpnUser is the vpn-core identity model (design-12 S2): one human/account identity
@@ -120,39 +120,30 @@ func toVpnUserView(u VpnUser) vpnUserView {
 	}
 }
 
-// ── KV persistence (vpn-core owns this bucket) ────────────────────────────────
+// ── Typed public/private persistence ─────────────────────────────────────────
 
 func vpnUserKey(id string) string { return vpnUserKeyPrefix + id }
 
 func (s *Server) putVpnUser(u VpnUser) error {
-	b, err := json.Marshal(u)
-	if err != nil {
-		return err
-	}
-	return s.store.PutKV(model.KVEntry{Bucket: vpnCoreKVBucket, Key: vpnUserKey(u.ID), Value: string(b)})
+	public, private := splitVpnUserRecord(u)
+	return s.store.PutVpnUserRecord(public, private)
 }
 
 func (s *Server) getVpnUser(id string) (VpnUser, bool) {
-	e, ok := s.store.KVEntry(vpnCoreKVBucket, vpnUserKey(id))
+	public, private, ok := s.store.VpnUserRecord(id)
 	if !ok {
 		return VpnUser{}, false
 	}
-	var u VpnUser
-	if err := json.Unmarshal([]byte(e.Value), &u); err != nil {
-		return VpnUser{}, false
-	}
-	return u, true
+	return joinVpnUserRecord(public, private), true
 }
 
 func (s *Server) listVpnUsers() []VpnUser {
-	out := []VpnUser{}
-	for _, e := range s.store.KV(vpnCoreKVBucket) {
-		if !strings.HasPrefix(e.Key, vpnUserKeyPrefix) {
-			continue
-		}
-		var u VpnUser
-		if err := json.Unmarshal([]byte(e.Value), &u); err == nil {
-			out = append(out, u)
+	publicRecords, privateRecords := s.store.VpnUserRecords()
+	out := make([]VpnUser, 0, len(publicRecords))
+	for id, public := range publicRecords {
+		private, ok := privateRecords[id]
+		if ok {
+			out = append(out, joinVpnUserRecord(public, private))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -165,7 +156,59 @@ func (s *Server) listVpnUsers() []VpnUser {
 }
 
 func (s *Server) deleteVpnUser(id string) error {
-	return s.store.DeleteKV(vpnCoreKVBucket, vpnUserKey(id))
+	return s.store.DeleteVpnUserRecord(id)
+}
+
+func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecretRecord) {
+	publicCredentials := make([]store.VpnUserCredentialPublic, 0, len(u.Credentials))
+	privateCredentials := make([]store.VpnUserCredentialSecret, 0, len(u.Credentials))
+	for _, credential := range u.Credentials {
+		publicCredentials = append(publicCredentials, store.VpnUserCredentialPublic{
+			Protocol: credential.Protocol, Flow: credential.Flow, Method: credential.Method, Security: credential.Security,
+		})
+		privateCredentials = append(privateCredentials, store.VpnUserCredentialSecret{
+			Protocol: credential.Protocol, UUID: credential.UUID, Password: credential.Password,
+		})
+	}
+	bindings := make([]store.VpnUserLineBinding, 0, len(u.Bindings))
+	for _, binding := range u.Bindings {
+		bindings = append(bindings, store.VpnUserLineBinding{
+			LineHashID: binding.LineHashID, Enabled: binding.Enabled, FlowOverride: binding.FlowOverride,
+		})
+	}
+	return store.VpnUserPublicRecord{
+		ID: u.ID, Email: u.Email, Name: u.Name, Enabled: u.Enabled,
+		Credentials: publicCredentials, Bindings: bindings, QuotaBytes: u.QuotaBytes,
+		ExpiresAt: u.ExpiresAt, Group: u.Group, Comment: u.Comment,
+		MigratedFromProxyUser: u.MigratedFromProxyUser, CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
+	}, store.VpnUserSecretRecord{Credentials: privateCredentials, SubID: u.SubID}
+}
+
+func joinVpnUserRecord(public store.VpnUserPublicRecord, private store.VpnUserSecretRecord) VpnUser {
+	secrets := make(map[string]store.VpnUserCredentialSecret, len(private.Credentials))
+	for _, credential := range private.Credentials {
+		secrets[credential.Protocol] = credential
+	}
+	credentials := make([]VpnCredential, 0, len(public.Credentials))
+	for _, credential := range public.Credentials {
+		secret := secrets[credential.Protocol]
+		credentials = append(credentials, VpnCredential{
+			Protocol: credential.Protocol, Flow: credential.Flow, Method: credential.Method, Security: credential.Security,
+			UUID: secret.UUID, Password: secret.Password,
+		})
+	}
+	bindings := make([]LineBinding, 0, len(public.Bindings))
+	for _, binding := range public.Bindings {
+		bindings = append(bindings, LineBinding{
+			LineHashID: binding.LineHashID, Enabled: binding.Enabled, FlowOverride: binding.FlowOverride,
+		})
+	}
+	return VpnUser{
+		ID: public.ID, Email: public.Email, Name: public.Name, Enabled: public.Enabled,
+		Credentials: credentials, Bindings: bindings, SubID: private.SubID, QuotaBytes: public.QuotaBytes,
+		ExpiresAt: public.ExpiresAt, Group: public.Group, Comment: public.Comment,
+		MigratedFromProxyUser: public.MigratedFromProxyUser, CreatedAt: public.CreatedAt, UpdatedAt: public.UpdatedAt,
+	}
 }
 
 // ── Migration (idempotent; runs at startup) ───────────────────────────────────
@@ -173,13 +216,39 @@ func (s *Server) deleteVpnUser(id string) error {
 // migrateProxyUsersToVpnUsers derives a VpnUser for each legacy ProxyUser that has
 // not already been migrated. It is additive and idempotent: existing VpnUsers are
 // left untouched, and the ProxyUser remains the subscription-render substrate.
-func (s *Server) migrateProxyUsersToVpnUsers() {
+func (s *Server) migrateProxyUsersToVpnUsers() error {
+	publicRecords, privateRecords := s.store.VpnUserRecords()
+	managedPublic, managedPrivate := s.store.ManagedLineRecords()
+	legacy := make([]store.LegacyKVKey, 0)
+	for _, entry := range s.store.KV(vpnCoreKVBucket) {
+		if !strings.HasPrefix(entry.Key, vpnUserKeyPrefix) {
+			continue
+		}
+		var user VpnUser
+		if err := json.Unmarshal([]byte(entry.Value), &user); err != nil {
+			return fmt.Errorf("decode legacy vpn user %q: %w", entry.Key, err)
+		}
+		if _, exists := publicRecords[user.ID]; !exists {
+			publicRecords[user.ID], privateRecords[user.ID] = splitVpnUserRecord(user)
+		}
+		legacy = append(legacy, store.LegacyKVKey{Bucket: entry.Bucket, Key: entry.Key})
+	}
+	for _, entry := range s.store.KV(managedLineDefBucket) {
+		var def managedLineDef
+		if err := json.Unmarshal([]byte(entry.Value), &def); err != nil {
+			return fmt.Errorf("decode legacy managed line %q: %w", entry.Key, err)
+		}
+		if _, exists := managedPublic[def.LineUUID]; !exists {
+			managedPublic[def.LineUUID], managedPrivate[def.LineUUID] = splitManagedLineRecord(def)
+		}
+		legacy = append(legacy, store.LegacyKVKey{Bucket: entry.Bucket, Key: entry.Key})
+	}
 	for _, pu := range s.store.ProxyUsers() {
-		if _, canonical := s.getVpnUser(pu.ID); canonical {
+		if _, canonical := publicRecords[pu.ID]; canonical {
 			continue // canonical-ID usage compatibility projection, not a legacy identity
 		}
 		vid := "vu_" + pu.ID
-		if _, ok := s.getVpnUser(vid); ok {
+		if _, ok := publicRecords[vid]; ok {
 			continue // already migrated
 		}
 		creds := []VpnCredential{}
@@ -207,10 +276,9 @@ func (s *Server) migrateProxyUsersToVpnUsers() {
 			CreatedAt:             created,
 			UpdatedAt:             s.now(),
 		}
-		if err := s.putVpnUser(u); err != nil {
-			s.logger.Printf("vpn-core: migrate proxy user %s failed: %v", pu.ID, err)
-		}
+		publicRecords[vid], privateRecords[vid] = splitVpnUserRecord(u)
 	}
+	return s.store.ReplaceLineSecretRecords(publicRecords, privateRecords, managedPublic, managedPrivate, legacy)
 }
 
 // ── RPC: reads (proxy:read) ───────────────────────────────────────────────────

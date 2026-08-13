@@ -844,7 +844,11 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 			}
 		}},
 		{name: "target_public_material", mutate: func(t *testing.T, srv *Server, _, _ string, _ VpnUser, def managedLineDef) {
-			def.RealityPublicKey = def.RealityPublicKey[:len(def.RealityPublicKey)-1] + "E"
+			replacement := "A"
+			if strings.HasSuffix(def.RealityPublicKey, replacement) {
+				replacement = "E"
+			}
+			def.RealityPublicKey = def.RealityPublicKey[:len(def.RealityPublicKey)-1] + replacement
 			if err := srv.putManagedLineDef(def); err != nil {
 				t.Fatal(err)
 			}
@@ -887,6 +891,9 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 			if event, ok := srv.store.AuditEventByID(lineChainAuditID("failed", approval.ID, "\x00line_chain_inputs_changed")); !ok || event.Action != "linechain.failed" || event.Decision != "deny" {
 				t.Fatalf("stale approval missing frozen failure audit: ok=%v event=%+v", ok, event)
 			}
+			if pending := srv.store.PendingLineChainAuditEvidence(); len(pending) != 0 {
+				t.Fatalf("stale approval did not repair audit sink: %+v", pending)
+			}
 		})
 		t.Run(tc.name+"/first_lease", func(t *testing.T) {
 			srv, sourceUUID, targetUUID, user, def := seedLineChainFixture(t)
@@ -917,6 +924,12 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 			}
 			if event, ok := srv.store.AuditEventByID(lineChainAuditID("failed", approval.ID, task.ID+"\x00line_chain_inputs_changed")); !ok || event.Action != "linechain.failed" || event.Metadata["task_id"] != task.ID {
 				t.Fatalf("first-lease rejection missing frozen failure audit: ok=%v event=%+v", ok, event)
+			}
+			if err := srv.repairLineChainAuditEvidence(); err != nil {
+				t.Fatal(err)
+			}
+			if err := srv.repairLineChainAuditEvidence(); err != nil || len(srv.store.PendingLineChainAuditEvidence()) != 0 {
+				t.Fatalf("first-lease audit repair was not idempotent: err=%v pending=%+v", err, srv.store.PendingLineChainAuditEvidence())
 			}
 		})
 	}

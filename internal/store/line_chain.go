@@ -46,7 +46,7 @@ type LineChainDefinition struct {
 	OutboundTag                string    `json:"outbound_tag"`
 	FragmentPath               string    `json:"fragment_path"`
 	FragmentSHA256             string    `json:"fragment_sha256"`
-	SidecarSHA256              string    `json:"sidecar_sha256"`
+	SidecarPatchSHA256         string    `json:"sidecar_patch_sha256"`
 	ArtifactSHA256             string    `json:"artifact_sha256"`
 	ApprovalID                 string    `json:"approval_id"`
 	TaskID                     string    `json:"task_id,omitempty"`

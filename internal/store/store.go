@@ -1350,7 +1350,7 @@ type TaskDelivery struct {
 
 const (
 	DurableProtocolNetGuardV1  = "netguard-v1"
-	DurableProtocolLineChainV1 = "linechain-e3-v1"
+	DurableProtocolLineChainV2 = "linechain-e3-v2"
 )
 
 // LeaseTasksWithApprovalGate leases the same task set as LeaseTasks while
@@ -1467,7 +1467,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		if approval.Plugin == "singbox-linechain" && approval.Service == "network/lines" &&
 			(approval.Method == "chain_set_apply" || approval.Method == "chain_remove_apply") && strings.HasPrefix(approval.Action, "apply-line-chain:") {
 			attempt, attemptOK := s.state.LineChainAttempts[approval.ID]
-			return DurableProtocolLineChainV1, lineChainAllowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID &&
+			return DurableProtocolLineChainV2, lineChainAllowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID &&
 				attemptOK && attempt.Status == LineChainStatusApplying && attempt.SourceNodeID == nodeID
 		}
 		if approval.Plugin != plugin || approval.Action != action {
@@ -1497,7 +1497,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		// can execute, so this closes the lost-response hole without creating a
 		// second execution authority.
 		if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
-			if protocol == DurableProtocolLineChainV1 {
+			if protocol == DurableProtocolLineChainV2 {
 				attempt := s.state.LineChainAttempts[t.ApprovalID]
 				scriptSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(t.Script)))
 				approval := s.state.Approvals[t.ApprovalID]
@@ -1545,7 +1545,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results) {
 				continue
 			}
-			if protocol == DurableProtocolLineChainV1 {
+			if protocol == DurableProtocolLineChainV2 {
 				attempt := staged.LineChainAttempts[t.ApprovalID]
 				currentDefinition := staged.LineChainDefinitions[attempt.SourceLineUUID]
 				var validationErr error
@@ -1590,7 +1590,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 				t.StartedAt = now
 			}
 			staged.Tasks[id] = t
-			if protocol == DurableProtocolLineChainV1 {
+			if protocol == DurableProtocolLineChainV2 {
 				attempt := staged.LineChainAttempts[t.ApprovalID]
 				attempt.IssuedTaskID, attempt.IssuedLeaseID = t.ID, leaseID
 				attempt.IssuedScriptSHA256 = fmt.Sprintf("%x", sha256.Sum256([]byte(t.Script)))

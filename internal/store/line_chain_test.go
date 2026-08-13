@@ -202,7 +202,7 @@ func TestApproveLineChainQueuesTaskAndReservesRevisionAtomically(t *testing.T) {
 	}
 	validator := func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil }
 	deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("node-a", 1, false, true, validator)
-	if err != nil || len(deliveries) != 1 || deliveries[0].DurableProtocol != DurableProtocolLineChainV1 || !deliveries[0].DurableResult {
+	if err != nil || len(deliveries) != 1 || deliveries[0].DurableProtocol != DurableProtocolLineChainV2 || !deliveries[0].DurableResult {
 		t.Fatalf("linechain durable lease mismatch: deliveries=%+v err=%v", deliveries, err)
 	}
 	leased := s.LineChainSnapshot().Attempts[approval.ID]
@@ -274,7 +274,7 @@ func TestCompleteLineChainTaskResultPromotesFrozenCandidateAndReplaysExactly(t *
 		Action: "apply-line-chain:digest", ArtifactDigest: "digest", RequestSHA256: "request", Plan: "{}", Status: model.ApprovalPending, Targets: []string{"node-a"}}
 	frozen := LineChainDefinition{SourceLineUUID: "source", SourceNodeID: "node-a", SourceLineHashID: "hash-source", SourceInboundTag: "in-source",
 		TargetLineUUID: "target", TargetNodeID: "node-b", TargetDefinitionDigest: "definition", TargetPublicMaterialDigest: "public",
-		TargetCredentialDigest: "credential", OutboundTag: "out", FragmentPath: "lattice-linechain-a.json", FragmentSHA256: "fragment", SidecarSHA256: "sidecar", ArtifactSHA256: "digest"}
+		TargetCredentialDigest: "credential", OutboundTag: "out", FragmentPath: "lattice-linechain-a.json", FragmentSHA256: "fragment", SidecarPatchSHA256: "sidecar", ArtifactSHA256: "digest"}
 	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source", SourceNodeID: "node-a",
 		CandidateTargetLineUUID: "target", CandidateArtifactSHA256: "digest", CandidateDefinition: frozen, RequestSHA256: "request", PlanGraphRevision: 0}
 	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {

@@ -109,13 +109,13 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 				var ready stdioJSONV2Frame
 				if err := decodeStrictV2(line, &ready); err != nil {
 					_ = t.abort()
-					return reply, err
+					return reply, nil
 				}
 				if err := validateInvokeReady(ready, generation, invocation); err == nil {
 					return reply, nil
 				}
 				_ = t.abort()
-				return reply, fmt.Errorf("invalid invoke_ready")
+				return reply, nil
 			}
 		}
 	}

@@ -55,15 +55,46 @@ func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	}
 	legacy := VpnUser{ID: "vpn-restart", Email: "restart@example.com", Enabled: true,
 		Credentials: []VpnCredential{{Protocol: "vless", UUID: "11111111-1111-4111-8111-111111111111"}}, SubID: "restart-sub", Bindings: []LineBinding{}}
-	managed := managedLineDef{LineUUID: "22222222-2222-4222-8222-222222222222", NodeID: "node-a", LineHashID: "line-restart", Tag: "managed-restart",
+	approvalID := "approval-managed-pre-migration"
+	managed := managedLineDef{LineUUID: "22222222-2222-4222-8222-222222222222", NodeID: "node-migration", Tag: "managed-restart",
 		Port: 24443, SNI: "example.com", HandshakeServer: "example.com", HandshakePort: 443, RealityPrivateKey: "restart-private",
-		RealityPublicKey: "restart-public", ShortID: "abcdef12", UserID: legacy.ID, Status: managedLineStatusApplied}
+		RealityPublicKey: "restart-public", ShortID: "abcdef12", UserID: legacy.ID, Status: managedLineStatusPlanned, ApprovalID: approvalID}
+	managed.LineHashID = managedLinePlannedHash(managed.NodeID, managed.Tag, managed.Port)
+	managed.UserName = userLineName(legacy.ID, managed.LineUUID)
+	managed.FragmentSHA256, err = managedLineFragmentSHA(managed, lineUserCredentialPayload{
+		Name: managed.UserName, UUID: legacy.Credentials[0].UUID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planJSON, err := json.Marshal(managedLinePlan{
+		NodeID: managed.NodeID, LineUUID: managed.LineUUID, LineHashID: managed.LineHashID,
+		Tag: managed.Tag, Port: managed.Port, SNI: managed.SNI,
+		HandshakeServer: managed.HandshakeServer, HandshakePort: managed.HandshakePort,
+		RealityPublicKey: managed.RealityPublicKey, ShortID: managed.ShortID,
+		UserID: managed.UserID, UserName: managed.UserName, FragmentSHA256: managed.FragmentSHA256,
+		Summary: "pre-migration pending managed-line approval",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := model.Approval{
+		ID: approvalID, NodeID: managed.NodeID, Plugin: singBoxManagedLinePlugin,
+		Action: managedLineActionPrefix + managed.FragmentSHA256, Plan: string(planJSON), Status: model.ApprovalPending,
+		ActorID: "pre-migration-planner", PluginVersion: managedLinePluginVersion,
+		Service: managedLineService, Method: managedLineMethod,
+		RequestSHA256: managedLineRequestSHA(legacy.ID, managed.NodeID, managed.Port),
+		Targets:       []string{managed.NodeID}, ArtifactDigest: managed.FragmentSHA256,
+	}
 	userJSON, _ := json.Marshal(legacy)
 	managedJSON, _ := json.Marshal(managed)
 	if err := st.PutKV(model.KVEntry{Bucket: vpnCoreKVBucket, Key: vpnUserKey(legacy.ID), Value: string(userJSON)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.PutKV(model.KVEntry{Bucket: managedLineDefBucket, Key: managed.LineUUID, Value: string(managedJSON)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertApproval(pending); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
@@ -84,6 +115,26 @@ func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	preserved, ok := srv.store.Approval(approvalID)
+	if !ok || preserved.Status != model.ApprovalPending || preserved.Plan != pending.Plan || preserved.ArtifactDigest != pending.ArtifactDigest {
+		t.Fatalf("migration/restart changed pending managed-line approval: %+v ok=%v", preserved, ok)
+	}
+	seedManagedLineNode(t, srv, managed.NodeID, realityInventoryLines())
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(preserved.Plan)))
+	approved, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), preserved, true, planSHA)
+	if err != nil || approved.Status != model.ApprovalApproved {
+		t.Fatalf("pre-migration pending managed-line approval could not execute after restart: approval=%+v err=%v", approved, err)
+	}
+	managedTaskFound := false
+	for _, task := range srv.store.Tasks() {
+		if task.ApprovalID == approvalID && strings.Contains(task.Script, "systemctl restart sing-box") {
+			managedTaskFound = true
+		}
+	}
+	if !managedTaskFound {
+		t.Fatal("pre-migration managed-line approval did not queue its executable apply task")
+	}
+
 	seedLinesFixture(t, srv)
 	groups := srv.buildLineGroups()
 	lineHash := groups[0].Lines[0].LineHashID
@@ -95,29 +146,6 @@ func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	}
 	if got, ok, err := srv.managedLineDefByUUID(managed.LineUUID); err != nil || !ok || got.RealityPrivateKey != "restart-private" {
 		t.Fatalf("managed definition after restart: %+v ok=%v err=%v", got, ok, err)
-	}
-	seedManagedLineNode(t, srv, "node-migration", realityInventoryLines())
-	planned, skipped, err := srv.compileManagedLineRollout(context.Background(), lineUserTestPrincipal(), managedLineRolloutRequest{UserID: legacy.ID, NodeIDs: []string{"node-migration"}})
-	if err != nil || len(planned) != 1 || len(skipped) != 0 {
-		t.Fatalf("managed-line operation after migration restart: planned=%+v skipped=%+v err=%v", planned, skipped, err)
-	}
-	approval, ok := srv.store.Approval(planned[0].ApprovalID)
-	if !ok || !strings.Contains(srv.managedLineApplyScript(approval), "systemctl restart sing-box") {
-		t.Fatalf("migrated private records could not produce a managed-line apply: approval=%+v ok=%v", approval, ok)
-	}
-	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
-	approved, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
-	if err != nil || approved.Status != model.ApprovalApproved {
-		t.Fatalf("pending managed-line approval could not execute after restart: approval=%+v err=%v", approved, err)
-	}
-	managedTaskFound := false
-	for _, task := range srv.store.Tasks() {
-		if task.ApprovalID == approval.ID && strings.Contains(task.Script, "systemctl restart sing-box") {
-			managedTaskFound = true
-		}
-	}
-	if !managedTaskFound {
-		t.Fatal("managed-line approval did not queue its executable apply task")
 	}
 	if subscriptions := srv.buildSubscriptions(); len(subscriptions) == 0 {
 		t.Fatal("migrated user could not render a subscription summary after restart")
@@ -138,7 +166,7 @@ func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	if !ok || len(userAfter.Credentials) == 0 || userAfter.Credentials[0].UUID == legacy.Credentials[0].UUID || len(userAfter.Bindings) == 0 {
 		t.Fatalf("second restart lost rotated credential/binding: %+v ok=%v", userAfter, ok)
 	}
-	approvedAfter, ok := srv.store.Approval(approval.ID)
+	approvedAfter, ok := srv.store.Approval(approvalID)
 	if !ok || approvedAfter.Status != model.ApprovalApproved {
 		t.Fatalf("second restart lost managed-line approval: %+v ok=%v", approvedAfter, ok)
 	}

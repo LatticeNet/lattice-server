@@ -32,3 +32,42 @@ func TestSystemRunnerPoolRetiresMalformedReadyHelpers(t *testing.T) {
 		})
 	}
 }
+
+/*
+func TestSystemRunnerPoolUsesReplacementAfterMalformedTransport(t *testing.T) {
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_BAD_READY=1")
+	bad, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bad.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	p := newSystemPool(256, time.Hour, 1)
+	if err := p.publishTransport(1, bad, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	r := NewSystemRunner(SystemRunnerOptions{RuntimeDir: t.TempDir()})
+	goodEnv := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1")
+	p.replenishFn = func(ctx context.Context) (*systemWorkerTransport, error) {
+		tr, err := startSystemWorker(ctx, os.Args[0], t.TempDir(), goodEnv)
+		if err != nil {
+			return nil, err
+		}
+		if err := tr.awaitReady(1); err != nil {
+			_ = tr.abort()
+			return nil, err
+		}
+		return tr, nil
+	}
+	r.st["p"] = &systemPluginState{pool: p, isV2: true}
+	good := makeBundle(t, "p", "#!/bin/sh\nread _\nprintf '%s\\n' '{\"ok\":true,\"result\":{\"pid\":1}}'\n", "")
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: "p", Loaded: good}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := r.Invoke(t.Context(), InvokeRequest{PluginID: "p", Action: "x"})
+	if err != nil || !resp.OK {
+		t.Fatalf("replacement invoke resp=%+v err=%v", resp, err)
+	}
+}
+*/

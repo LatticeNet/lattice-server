@@ -95,7 +95,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{
 		Name: target.Tag, Protocol: "vless", Network: "tcp", Address: "127.0.0.1",
-		Port: strconv.Itoa(observerPort), SNI: target.SNI, LineUUID: targetUUID,
+		Port: strconv.Itoa(observerPort), SNI: target.SNI, LineUUID: targetUUID, LineID: strings.TrimPrefix(target.LineHashID, "line_"),
 	}})
 	_ = srv.buildLineGroups()
 

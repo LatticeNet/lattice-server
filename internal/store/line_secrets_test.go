@@ -14,17 +14,25 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/secret"
+	bolt "go.etcd.io/bbolt"
 )
 
 func testVpnUserRecords(id, secretValue string) (VpnUserPublicRecord, VpnUserSecretRecord) {
 	return VpnUserPublicRecord{
 			ID: id, Email: id + "@example.com", Enabled: true,
-			Credentials: []VpnUserCredentialPublic{{Protocol: "vless", Flow: "xtls-rprx-vision"}},
+			Credentials: []VpnUserCredentialPublic{{Protocol: "trojan"}},
 			Bindings:    []VpnUserLineBinding{}, CreatedAt: time.Unix(1_700_000_000, 0).UTC(),
 		}, VpnUserSecretRecord{
-			Credentials: []VpnUserCredentialSecret{{Protocol: "vless", UUID: secretValue}},
+			Credentials: []VpnUserCredentialSecret{{Protocol: "trojan", Password: secretValue}},
 			SubID:       "sub-" + secretValue,
 		}
+}
+
+const testRealityKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+func testManagedLineRecords(i int) (ManagedLinePublicRecord, ManagedLineSecretRecord) {
+	id := fmt.Sprintf("%08x-0000-4000-8000-%012x", i, i)
+	return ManagedLinePublicRecord{LineUUID: id, NodeID: "node-a", RealityPublicKey: testRealityKey, Status: "applied"}, ManagedLineSecretRecord{RealityPrivateKey: testRealityKey}
 }
 
 func TestVpnUserPrivateRecordsAreEncryptedAndBoltParityRoundTrips(t *testing.T) {
@@ -39,8 +47,7 @@ func TestVpnUserPrivateRecordsAreEncryptedAndBoltParityRoundTrips(t *testing.T) 
 	if err := jsonStore.PutVpnUserRecord(public, private); err != nil {
 		t.Fatal(err)
 	}
-	managedPublic := ManagedLinePublicRecord{LineUUID: "line-1", NodeID: "node-1", Status: "applied"}
-	managedPrivate := ManagedLineSecretRecord{RealityPrivateKey: "reality-private-canary"}
+	managedPublic, managedPrivate := testManagedLineRecords(1)
 	if err := jsonStore.PutManagedLineRecord(managedPublic, managedPrivate); err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +63,7 @@ func TestVpnUserPrivateRecordsAreEncryptedAndBoltParityRoundTrips(t *testing.T) 
 		t.Fatal(err)
 	}
 	got, ok := reopened.VpnUserSecretRecord("vpn-1")
-	if !ok || got.Credentials[0].UUID != "credential-canary" || got.SubID != "sub-credential-canary" {
+	if !ok || got.Credentials[0].Password != "credential-canary" || got.SubID != "sub-credential-canary" {
 		t.Fatalf("JSON round trip lost secret: %+v, ok=%v", got, ok)
 	}
 
@@ -85,10 +92,10 @@ func TestVpnUserPrivateRecordsAreEncryptedAndBoltParityRoundTrips(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if exported.VpnUserSecrets[public.ID].Credentials[0].UUID != "credential-canary" {
+	if exported.VpnUserSecrets[public.ID].Credentials[0].Password != "credential-canary" {
 		t.Fatalf("bbolt round trip lost secret: %+v", exported.VpnUserSecrets[public.ID])
 	}
-	if exported.ManagedLineSecrets[managedPublic.LineUUID].RealityPrivateKey != "reality-private-canary" {
+	if exported.ManagedLineSecrets[managedPublic.LineUUID].RealityPrivateKey != testRealityKey {
 		t.Fatalf("bbolt round trip lost managed line secret: %+v", exported.ManagedLineSecrets[managedPublic.LineUUID])
 	}
 }
@@ -113,7 +120,7 @@ func TestLineSecretsReopen1024RecordsBeyondLegacyVaultCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	gotPublic, gotPrivate := reopened.VpnUserRecords()
-	if len(gotPublic) != 1024 || len(gotPrivate) != 1024 || gotPrivate["vpn-1023"].Credentials[0].UUID != "secret-vpn-1023" {
+	if len(gotPublic) != 1024 || len(gotPrivate) != 1024 || gotPrivate["vpn-1023"].Credentials[0].Password != "secret-vpn-1023" {
 		t.Fatalf("1024 reopen mismatch: public=%d private=%d last=%+v", len(gotPublic), len(gotPrivate), gotPrivate["vpn-1023"])
 	}
 }
@@ -152,9 +159,8 @@ func TestLineSecretMigrationTenThousandRecordsUsesOneJSONCommit(t *testing.T) {
 				for i := 0; i < 10_000; i++ {
 					id := fmt.Sprintf("vpn-%05d", i)
 					source.VpnUsers[id], source.VpnUserSecrets[id] = testVpnUserRecords(id, "secret-"+id)
-					lineID := fmt.Sprintf("line-%05d", i)
-					source.ManagedLines[lineID] = ManagedLinePublicRecord{LineUUID: lineID, NodeID: "node-a", Status: "applied"}
-					source.ManagedLineSecrets[lineID] = ManagedLineSecretRecord{RealityPrivateKey: "private-" + lineID}
+					managedPublic, managedPrivate := testManagedLineRecords(i)
+					source.ManagedLines[managedPublic.LineUUID], source.ManagedLineSecrets[managedPublic.LineUUID] = managedPublic, managedPrivate
 				}
 				return LineSecretMigrationBuild{VpnUsers: source.VpnUsers, VpnUserSecrets: source.VpnUserSecrets,
 					ManagedLines: source.ManagedLines, ManagedLineSecrets: source.ManagedLineSecrets}, nil
@@ -183,9 +189,8 @@ func BenchmarkLineSecretMigrationLinear(b *testing.B) {
 					for i := 0; i < records; i++ {
 						id := fmt.Sprintf("vpn-%05d", i)
 						source.VpnUsers[id], source.VpnUserSecrets[id] = testVpnUserRecords(id, "secret-"+id)
-						lineID := fmt.Sprintf("line-%05d", i)
-						source.ManagedLines[lineID] = ManagedLinePublicRecord{LineUUID: lineID, NodeID: "node-a", Status: "applied"}
-						source.ManagedLineSecrets[lineID] = ManagedLineSecretRecord{RealityPrivateKey: "private-" + lineID}
+						managedPublic, managedPrivate := testManagedLineRecords(i)
+						source.ManagedLines[managedPublic.LineUUID], source.ManagedLineSecrets[managedPublic.LineUUID] = managedPublic, managedPrivate
 					}
 					return LineSecretMigrationBuild{VpnUsers: source.VpnUsers, VpnUserSecrets: source.VpnUserSecrets,
 						ManagedLines: source.ManagedLines, ManagedLineSecrets: source.ManagedLineSecrets}, nil
@@ -232,9 +237,8 @@ func TestLineSecretMigrationFullBoltUsesExactlyOneUpdate(t *testing.T) {
 	for i := 0; i < 10_000; i++ {
 		id := fmt.Sprintf("vpn-%05d", i)
 		state.VpnUsers[id], state.VpnUserSecrets[id] = testVpnUserRecords(id, "secret-"+id)
-		lineID := fmt.Sprintf("line-%05d", i)
-		state.ManagedLines[lineID] = ManagedLinePublicRecord{LineUUID: lineID, NodeID: "node-a", Status: "applied"}
-		state.ManagedLineSecrets[lineID] = ManagedLineSecretRecord{RealityPrivateKey: "private-" + lineID}
+		managedPublic, managedPrivate := testManagedLineRecords(i)
+		state.ManagedLines[managedPublic.LineUUID], state.ManagedLineSecrets[managedPublic.LineUUID] = managedPublic, managedPrivate
 	}
 	before := bs.testUpdateCalls
 	if err := bs.ImportState(state); err != nil {
@@ -287,8 +291,8 @@ func TestLineSecretBoundsRejectRecord100001AndAggregate256MiB(t *testing.T) {
 	private := make(map[string]VpnUserSecretRecord, records)
 	for i := 0; i < records; i++ {
 		id := fmt.Sprintf("vpn-%05d", i)
-		public[id] = VpnUserPublicRecord{ID: id, Credentials: []VpnUserCredentialPublic{{Protocol: "vless"}}}
-		private[id] = VpnUserSecretRecord{Credentials: []VpnUserCredentialSecret{{Protocol: "vless", UUID: payload}}}
+		public[id] = VpnUserPublicRecord{ID: id, Credentials: []VpnUserCredentialPublic{{Protocol: "trojan"}}}
+		private[id] = VpnUserSecretRecord{Credentials: []VpnUserCredentialSecret{{Protocol: "trojan", Password: payload}}}
 	}
 	if err := validateVpnUserCollections(public, private); err == nil || !strings.Contains(err.Error(), "aggregate encoded bytes") {
 		t.Fatalf("aggregate secret collection beyond 256 MiB was not rejected: %v", err)
@@ -314,7 +318,7 @@ func TestReplaceVpnUserRecordsStagesLegacyRemovalAtomically(t *testing.T) {
 	if _, ok := store.KVEntry("plugin:latticenet.vpn-core", "vpnuser/vpn-1"); ok {
 		t.Fatal("secret-bearing legacy KV record survived migration")
 	}
-	if got, ok := store.VpnUserSecretRecord("vpn-1"); !ok || got.Credentials[0].UUID != "credential-canary" {
+	if got, ok := store.VpnUserSecretRecord("vpn-1"); !ok || got.Credentials[0].Password != "credential-canary" {
 		t.Fatalf("typed private record missing: %+v, ok=%v", got, ok)
 	}
 }
@@ -379,7 +383,9 @@ func TestVpnUserRecordValidationRejectsOrphansAndProtocolMismatch(t *testing.T) 
 	if err := validateVpnUserCollections(map[string]VpnUserPublicRecord{}, map[string]VpnUserSecretRecord{"vpn-1": private}); err == nil {
 		t.Fatal("orphan private record was accepted")
 	}
-	private.Credentials[0].Protocol = "trojan"
+	private.Credentials[0].Protocol = "vless"
+	private.Credentials[0].Password = ""
+	private.Credentials[0].UUID = "11111111-1111-4111-8111-111111111111"
 	if err := validateVpnUserCollections(map[string]VpnUserPublicRecord{"vpn-1": public}, map[string]VpnUserSecretRecord{"vpn-1": private}); err == nil {
 		t.Fatal("mismatched public/private protocol sets were accepted")
 	}
@@ -388,6 +394,79 @@ func TestVpnUserRecordValidationRejectsOrphansAndProtocolMismatch(t *testing.T) 
 	private.Credentials[0].Protocol = " VLESS "
 	if err := validateVpnUserCollections(map[string]VpnUserPublicRecord{"vpn-1": public}, map[string]VpnUserSecretRecord{"vpn-1": private}); err == nil {
 		t.Fatal("noncanonical public/private protocols were accepted")
+	}
+}
+
+func TestLineSecretValidationRejectsMalformedCredentialAndRealityMaterial(t *testing.T) {
+	public, private := testVpnUserRecords("vpn-1", "credential-canary")
+	cases := []struct {
+		name   string
+		mutate func(*VpnUserPublicRecord, *VpnUserSecretRecord)
+	}{
+		{name: "unsupported_protocol", mutate: func(p *VpnUserPublicRecord, s *VpnUserSecretRecord) {
+			p.Credentials[0].Protocol, s.Credentials[0].Protocol = "unknown", "unknown"
+		}},
+		{name: "invalid_vless_uuid", mutate: func(p *VpnUserPublicRecord, s *VpnUserSecretRecord) {
+			p.Credentials[0].Protocol, s.Credentials[0] = "vless", VpnUserCredentialSecret{Protocol: "vless", UUID: "not-a-uuid"}
+		}},
+		{name: "password_protocol_with_uuid", mutate: func(_ *VpnUserPublicRecord, s *VpnUserSecretRecord) {
+			s.Credentials[0].UUID = "11111111-1111-4111-8111-111111111111"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotPublic, gotPrivate := public, private
+			gotPublic.Credentials = append([]VpnUserCredentialPublic(nil), public.Credentials...)
+			gotPrivate.Credentials = append([]VpnUserCredentialSecret(nil), private.Credentials...)
+			tc.mutate(&gotPublic, &gotPrivate)
+			if err := validateVpnUserCollections(map[string]VpnUserPublicRecord{gotPublic.ID: gotPublic}, map[string]VpnUserSecretRecord{gotPublic.ID: gotPrivate}); err == nil {
+				t.Fatal("malformed credential material was accepted")
+			}
+		})
+	}
+	managedPublic, managedPrivate := testManagedLineRecords(1)
+	for _, tc := range []struct {
+		name string
+		pub  ManagedLinePublicRecord
+		priv ManagedLineSecretRecord
+	}{
+		{name: "invalid_uuid", pub: func() ManagedLinePublicRecord { p := managedPublic; p.LineUUID = "not-a-uuid"; return p }(), priv: managedPrivate},
+		{name: "invalid_public_key", pub: func() ManagedLinePublicRecord { p := managedPublic; p.RealityPublicKey = "bad"; return p }(), priv: managedPrivate},
+		{name: "invalid_private_key", pub: managedPublic, priv: ManagedLineSecretRecord{RealityPrivateKey: "bad"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateManagedLineCollections(map[string]ManagedLinePublicRecord{tc.pub.LineUUID: tc.pub}, map[string]ManagedLineSecretRecord{tc.pub.LineUUID: tc.priv}); err == nil {
+				t.Fatal("malformed managed line material was accepted")
+			}
+		})
+	}
+}
+
+func TestFullBoltImportExportValidatesTypedSecretDomains(t *testing.T) {
+	bs, err := OpenBoltState(filepath.Join(t.TempDir(), "state.db"), secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+	invalid := emptyState()
+	_, orphan := testVpnUserRecords("vpn-1", "secret")
+	invalid.VpnUserSecrets["vpn-1"] = orphan
+	before := bs.testUpdateCalls
+	if err := bs.ImportState(invalid); err == nil || bs.testUpdateCalls != before {
+		t.Fatalf("invalid import reached write transaction: err=%v calls=%d", err, bs.testUpdateCalls-before)
+	}
+	valid := emptyState()
+	public, private := testVpnUserRecords("vpn-1", "secret")
+	valid.VpnUsers[public.ID], valid.VpnUserSecrets[public.ID] = public, private
+	if err := bs.ImportState(valid); err != nil {
+		t.Fatal(err)
+	}
+	key, _ := boltStringKey(public.ID)
+	if err := bs.db.Update(func(tx *bolt.Tx) error { return tx.Bucket(boltBucketVpnUsers).Delete(key) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bs.ExportState(); err == nil || !strings.Contains(err.Error(), "invalid vpn user secret collections") {
+		t.Fatalf("corrupt full-Bolt export was accepted: %v", err)
 	}
 }
 
@@ -422,7 +501,7 @@ func TestReplaceVpnUserRecordsPublishesCommittedStateOnParentSyncFailure(t *test
 	if err == nil || !strings.Contains(err.Error(), "forced parent sync failure") {
 		t.Fatalf("expected durability warning, got %v", err)
 	}
-	if gotPublic, gotPrivate, ok := store.VpnUserRecord("vpn-1"); !ok || gotPublic.ID != "vpn-1" || gotPrivate.Credentials[0].UUID != "credential-canary" {
+	if gotPublic, gotPrivate, ok := store.VpnUserRecord("vpn-1"); !ok || gotPublic.ID != "vpn-1" || gotPrivate.Credentials[0].Password != "credential-canary" {
 		t.Fatalf("committed state was not published: public=%+v private=%+v ok=%v", gotPublic, gotPrivate, ok)
 	}
 	if !errors.Is(store.ReadyCheck(), errStoreDurabilityDegraded) {

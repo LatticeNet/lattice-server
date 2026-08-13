@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -9,6 +10,28 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
+
+var vpnCredentialProtocols = map[string]bool{"vless": true, "vmess": true, "trojan": true, "shadowsocks": true, "hysteria2": true, "tuic": true, "anytls": true}
+
+func validSecretUUIDv4(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' || value[14] != '4' || !strings.ContainsRune("89ab", rune(value[19])) {
+		return false
+	}
+	for i, r := range value {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func validRealityKey(value string) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(raw) == 32 && base64.RawURLEncoding.EncodeToString(raw) == value
+}
 
 const (
 	MaxVpnUserRecords            = 100_000
@@ -132,12 +155,20 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 			if credential.Protocol != strings.ToLower(protocol) {
 				return fmt.Errorf("vpn user %q has noncanonical private protocol %q", id, credential.Protocol)
 			}
+			if !vpnCredentialProtocols[protocol] {
+				return fmt.Errorf("vpn user %q has unsupported private protocol %q", id, protocol)
+			}
 			if _, ok := seen[protocol]; ok {
 				return fmt.Errorf("vpn user %q has duplicate %q credential", id, protocol)
 			}
 			seen[protocol] = struct{}{}
-			if strings.TrimSpace(credential.UUID) == "" && strings.TrimSpace(credential.Password) == "" {
-				return fmt.Errorf("vpn user %q credential %q has no secret", id, protocol)
+			requiresUUID := protocol == "vless" || protocol == "vmess" || protocol == "tuic"
+			if requiresUUID {
+				if !validSecretUUIDv4(credential.UUID) || credential.Password != "" {
+					return fmt.Errorf("vpn user %q credential %q has invalid UUID/password shape", id, protocol)
+				}
+			} else if credential.UUID != "" || strings.TrimSpace(credential.Password) == "" {
+				return fmt.Errorf("vpn user %q credential %q has invalid password/UUID shape", id, protocol)
 			}
 		}
 		encoded, err := json.Marshal(record)
@@ -172,6 +203,9 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 			if credential.Protocol != strings.ToLower(protocol) {
 				return fmt.Errorf("vpn user %q has noncanonical public protocol %q", id, credential.Protocol)
 			}
+			if !vpnCredentialProtocols[protocol] {
+				return fmt.Errorf("vpn user %q has unsupported public protocol %q", id, protocol)
+			}
 			if _, exists := publicProtocols[protocol]; exists {
 				return fmt.Errorf("vpn user %q has duplicate public %q credential", id, protocol)
 			}
@@ -195,8 +229,11 @@ func validateManagedLineCollections(public map[string]ManagedLinePublicRecord, p
 	}
 	total := 0
 	for id, record := range public {
-		if strings.TrimSpace(id) == "" || record.LineUUID != id {
+		if strings.TrimSpace(id) == "" || record.LineUUID != id || !validSecretUUIDv4(id) {
 			return fmt.Errorf("managed line public record %q has mismatched line uuid %q", id, record.LineUUID)
+		}
+		if !validRealityKey(record.RealityPublicKey) {
+			return fmt.Errorf("managed line %q has invalid reality public key", id)
 		}
 		if _, ok := private[id]; !ok {
 			return fmt.Errorf("managed line %q is missing private material", id)
@@ -206,8 +243,8 @@ func validateManagedLineCollections(public map[string]ManagedLinePublicRecord, p
 		if _, ok := public[id]; !ok {
 			return fmt.Errorf("managed line secret %q has no public record", id)
 		}
-		if strings.TrimSpace(record.RealityPrivateKey) == "" {
-			return fmt.Errorf("managed line secret %q has empty reality private key", id)
+		if !validRealityKey(record.RealityPrivateKey) {
+			return fmt.Errorf("managed line secret %q has invalid reality private key", id)
 		}
 		encoded, err := json.Marshal(record)
 		if err != nil {

@@ -203,6 +203,13 @@ func (bs *BoltStateStore) ensureBuckets() error {
 // ImportState replaces the entire bbolt state atomically. Secret-bearing fields
 // are encrypted before they are written; the input State is not mutated.
 func (bs *BoltStateStore) ImportState(st State) error {
+	st.ensureMaps()
+	if err := validateVpnUserCollections(st.VpnUsers, st.VpnUserSecrets); err != nil {
+		return fmt.Errorf("invalid vpn user secret collections: %w", err)
+	}
+	if err := validateManagedLineCollections(st.ManagedLines, st.ManagedLineSecrets); err != nil {
+		return fmt.Errorf("invalid managed line secret collections: %w", err)
+	}
 	persist, err := encryptedState(st, bs.cipher)
 	if err != nil {
 		return err
@@ -556,6 +563,12 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 		return State{}, err
 	}
 	st.ensureMaps()
+	if err := validateVpnUserCollections(st.VpnUsers, st.VpnUserSecrets); err != nil {
+		return State{}, fmt.Errorf("invalid vpn user secret collections: %w", err)
+	}
+	if err := validateManagedLineCollections(st.ManagedLines, st.ManagedLineSecrets); err != nil {
+		return State{}, fmt.Errorf("invalid managed line secret collections: %w", err)
+	}
 	return st, nil
 }
 

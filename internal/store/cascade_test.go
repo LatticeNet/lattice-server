@@ -392,6 +392,8 @@ func TestDeleteNodeUnknownIsIdempotent(t *testing.T) {
 	}
 }
 
+const cascadeTargetLineUUID = "11111111-1111-4111-8111-111111111111"
+
 func seedLineChainCascade(t *testing.T, lease bool) (*Store, model.Approval, model.Task, string) {
 	t.Helper()
 	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
@@ -403,14 +405,14 @@ func seedLineChainCascade(t *testing.T, lease bool) (*Store, model.Approval, mod
 			t.Fatal(err)
 		}
 	}
-	if err := s.PutManagedLineRecord(ManagedLinePublicRecord{LineUUID: "target-line", NodeID: "target-node", Status: "applied"}, ManagedLineSecretRecord{RealityPrivateKey: "private"}); err != nil {
+	if err := s.PutManagedLineRecord(ManagedLinePublicRecord{LineUUID: cascadeTargetLineUUID, NodeID: "target-node", RealityPublicKey: testRealityKey, Status: "applied"}, ManagedLineSecretRecord{RealityPrivateKey: testRealityKey}); err != nil {
 		t.Fatal(err)
 	}
 	approval := model.Approval{ID: "approval-chain-cascade", NodeID: "source-node", Plugin: "singbox-linechain", PluginVersion: "1", Service: "network/lines", Method: "chain_set_apply",
 		Action: "apply-line-chain:artifact", ArtifactDigest: "artifact", RequestSHA256: "request", Status: model.ApprovalPending, Targets: []string{"source-node"}}
 	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source-line", SourceNodeID: "source-node",
-		CandidateTargetLineUUID: "target-line", CandidateTargetNodeID: "target-node", CandidateArtifactSHA256: "artifact", RequestSHA256: "request",
-		CandidateDefinition: LineChainDefinition{SourceLineUUID: "source-line", SourceNodeID: "source-node", TargetLineUUID: "target-line", TargetNodeID: "target-node", ArtifactSHA256: "artifact"}}
+		CandidateTargetLineUUID: cascadeTargetLineUUID, CandidateTargetNodeID: "target-node", CandidateArtifactSHA256: "artifact", RequestSHA256: "request",
+		CandidateDefinition: LineChainDefinition{SourceLineUUID: "source-line", SourceNodeID: "source-node", TargetLineUUID: cascadeTargetLineUUID, TargetNodeID: "target-node", ArtifactSHA256: "artifact"}}
 	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +487,7 @@ func TestDeleteTargetNodePreservesIssuedCandidateAndPromotesTargetMissing(t *tes
 	if err != nil || !ok || report.ManagedLines != 1 || report.LineChainTargetsDrifted != 1 {
 		t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
 	}
-	if _, _, found := s.ManagedLineRecord("target-line"); found {
+	if _, _, found := s.ManagedLineRecord(cascadeTargetLineUUID); found {
 		t.Fatal("target managed-line definition survived node deletion")
 	}
 	result := model.TaskResult{TaskID: task.ID, NodeID: "source-node", LeaseID: leaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}
@@ -493,7 +495,7 @@ func TestDeleteTargetNodePreservesIssuedCandidateAndPromotesTargetMissing(t *tes
 		t.Fatalf("complete committed=%v err=%v", committed, err)
 	}
 	definition := s.LineChainSnapshot().Definitions["source-line"]
-	if definition.TargetLineUUID != "target-line" || definition.Status != LineChainStatusDrifted || definition.DriftCode != "target_missing" || s.LineChainSnapshot().Revision != 3 {
+	if definition.TargetLineUUID != cascadeTargetLineUUID || definition.Status != LineChainStatusDrifted || definition.DriftCode != "target_missing" || s.LineChainSnapshot().Revision != 3 {
 		t.Fatalf("frozen target authority was not retained: %+v snapshot=%+v", definition, s.LineChainSnapshot())
 	}
 }

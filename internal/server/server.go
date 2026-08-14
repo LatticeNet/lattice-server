@@ -7035,10 +7035,7 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 const redactedSubscriptionRequestLogPath = "/sub/:token"
 
 func requestLogPath(path string) string {
-	if strings.HasPrefix(path, "/sub/") {
-		return redactedSubscriptionRequestLogPath
-	}
-	return path
+	return telemetry.RedactSubscriptionPath(path)
 }
 
 // recordAudit writes an audit event and, unlike a bare best-effort call, logs

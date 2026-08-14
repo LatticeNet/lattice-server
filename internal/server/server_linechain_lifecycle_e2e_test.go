@@ -550,6 +550,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	recoverRaw, _ := io.ReadAll(recoverRes.Body)
 	recoverRes.Body.Close()
+	assertNoE5SecretCanaries(t, recoverRaw, secretCanaries)
 	var recoverView struct {
 		Stale bool   `json:"stale"`
 		Error string `json:"error"`

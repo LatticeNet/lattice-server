@@ -2,6 +2,7 @@ package telemetry
 
 import (
 	"fmt"
+	pathpkg "path"
 	"sort"
 	"strings"
 	"sync"
@@ -78,6 +79,18 @@ func Prometheus() string {
 
 func CurrentSnapshot() Snapshot {
 	return defaultRegistry.Snapshot()
+}
+
+// RedactSubscriptionPath removes public subscription authority before a
+// request path reaches any observability sink. ServeMux redirects
+// non-canonical paths after cleaning dot segments and repeated slashes, so
+// classify both the raw and effective paths without changing what routing
+// receives.
+func RedactSubscriptionPath(value string) string {
+	if isSubscriptionPath(value) || isSubscriptionPath(pathpkg.Clean(value)) {
+		return "/sub/:token"
+	}
+	return value
 }
 
 func (r *Registry) ObserveStoreSave(d time.Duration, err error) {
@@ -285,22 +298,27 @@ func statusClass(status int) string {
 	return fmt.Sprintf("%dxx", status/100)
 }
 
-func normalizePath(path string) string {
+func normalizePath(value string) string {
+	value = RedactSubscriptionPath(value)
 	switch {
-	case strings.HasPrefix(path, "/api/agent/terminal/sessions/"):
-		return "/api/agent/terminal/sessions/:id/:action"
-	case strings.HasPrefix(path, "/api/terminal/sessions/"):
-		return "/api/terminal/sessions/:id/:action"
-	case strings.HasPrefix(path, "/sub/"):
+	case value == "/sub/:token":
 		return "/sub/:token"
-	case strings.HasPrefix(path, "/assets/"):
+	case strings.HasPrefix(value, "/api/agent/terminal/sessions/"):
+		return "/api/agent/terminal/sessions/:id/:action"
+	case strings.HasPrefix(value, "/api/terminal/sessions/"):
+		return "/api/terminal/sessions/:id/:action"
+	case strings.HasPrefix(value, "/assets/"):
 		return "/assets/:asset"
 	default:
-		if path == "" {
+		if value == "" {
 			return "/"
 		}
-		return path
+		return value
 	}
+}
+
+func isSubscriptionPath(value string) bool {
+	return value == "/sub" || strings.HasPrefix(value, "/sub/")
 }
 
 func escapeLabel(value string) string {

@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,8 +32,8 @@ import (
 )
 
 const (
-	e5VPNCoreHead  = "e0af25babf99"
-	e5SubStoreHead = "7434d7aee8fe"
+	e5VPNCoreHead  = "e0af25babf99a90dc3f41701f6b232eadabe05cf"
+	e5SubStoreHead = "7434d7aee8fea649633aefafa96a9b5497e622a6"
 )
 
 type e5PluginServerFixture struct {
@@ -45,7 +46,20 @@ type e5PluginServerFixture struct {
 	runtimeDir string
 	cipher     secret.Cipher
 	trust      plugin.TrustPolicy
+	cleanup    *e5FixtureCleanup
 }
+
+type e5FixtureCleanup struct {
+	server                *Server
+	store                 *store.Store
+	serverOnce, storeOnce sync.Once
+	serverErr, storeErr   error
+}
+
+func (c *e5FixtureCleanup) closeServer(ctx context.Context) {
+	c.serverOnce.Do(func() { c.serverErr = c.server.Close(ctx) })
+}
+func (c *e5FixtureCleanup) closeStore() { c.storeOnce.Do(func() { c.storeErr = c.store.Close() }) }
 
 func newE5PluginServerFixture(t *testing.T, root string) e5PluginServerFixture {
 	t.Helper()
@@ -99,11 +113,12 @@ func newE5PluginServerFixture(t *testing.T, root string) e5PluginServerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registerE5FixtureCleanup(t, srv, st)
+	cleanup := &e5FixtureCleanup{server: srv, store: st}
+	registerE5FixtureCleanup(t, cleanup)
 	return e5PluginServerFixture{
 		server: srv, store: st, statePath: statePath, hotPath: hotPath,
 		pluginDir: pluginDir, cacheDir: cacheDir, runtimeDir: runtimeDir,
-		cipher: cipher, trust: policy,
+		cipher: cipher, trust: policy, cleanup: cleanup,
 	}
 }
 
@@ -126,8 +141,8 @@ func requireE2EHead(t *testing.T, dir, prefix string) {
 	if err != nil {
 		t.Fatalf("plugin head %s: %v: %s", dir, err, out)
 	}
-	if got := strings.TrimSpace(string(out)); !strings.HasPrefix(got, prefix) {
-		t.Fatalf("plugin source %s head=%s want prefix=%s", dir, got, prefix)
+	if got := strings.TrimSpace(string(out)); got != prefix {
+		t.Fatalf("plugin source %s head mismatch: got_len=%d expected_len=%d", dir, len(got), len(prefix))
 	}
 	if out, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output(); err != nil || len(out) != 0 {
 		t.Fatalf("plugin source %s must be clean: err=%v status=%s", dir, err, out)
@@ -210,7 +225,7 @@ func activateE5Plugin(t *testing.T, handler http.Handler, cookies []*http.Cookie
 			fmt.Sprintf(`{"id":%q,"status":%q}`, pluginID, status), cookies, csrf)
 		body := readAndClose(t, res)
 		if res.StatusCode != http.StatusOK {
-			t.Fatalf("activate %s as %s: status=%d body=%s", pluginID, status, res.StatusCode, body)
+			t.Fatalf("activate %s as %s: status=%d body_len=%d", pluginID, status, res.StatusCode, len(body))
 		}
 	}
 }
@@ -233,11 +248,11 @@ func callE5Plugin(t *testing.T, handler http.Handler, cookies []*http.Cookie, cs
 	response := doJSON(t, handler, http.MethodPost, "/api/plugins/call", string(body), cookies, csrf)
 	raw := readAndClose(t, response)
 	if response.StatusCode != http.StatusOK {
-		t.Fatalf("plugin call %s %s/%s: status=%d body=%s", pluginID, service, method, response.StatusCode, raw)
+		t.Fatalf("plugin call %s %s/%s: status=%d body_len=%d", pluginID, service, method, response.StatusCode, len(raw))
 	}
 	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {
-			t.Fatalf("decode plugin call %s %s/%s: %v: %s", pluginID, service, method, err, raw)
+			t.Fatalf("decode plugin call %s %s/%s: err=%v body_len=%d", pluginID, service, method, err, len(raw))
 		}
 	}
 	return raw
@@ -269,14 +284,14 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 	}
 	bound, ok := srv.getVpnUser(user.ID)
 	if !ok || bound.SubscriptionGeneration == 0 {
-		t.Fatalf("E5 identity generation missing after binding: %+v", bound)
+		t.Fatalf("E5 identity generation missing after binding: present=%t generation=%d", ok, bound.SubscriptionGeneration)
 	}
 	compileSnapshot, err := srv.captureLineChainCompileSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := composeLine(compileSnapshot, sourceUUID); err != nil {
-		t.Fatalf("E5 source is not composable: err=%v lines=%+v definition=%+v", err, compileSnapshot.Lines[sourceUUID], compileSnapshot.Definitions[sourceUUID])
+		t.Fatalf("E5 source is not composable: err=%v line_count=%d", err, len(compileSnapshot.Lines[sourceUUID]))
 	}
 
 	var coreOptions graphSubscriptionOptionsResponse
@@ -286,11 +301,11 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 	var composed graphSubscriptionResponse
 	callE5Plugin(t, handler, cookies, csrf, vpnCorePluginID, vpnCoreSubscriptionSourcesService, "compose", composeRequest, &composed)
 	if !composed.OK || composed.SourceVersion == "" || len(composed.SourceManifest) == 0 || len(composed.Entries) != 1 || composed.Raw != composed.Entries[0] {
-		t.Fatalf("production graph compose incomplete: %+v", composed)
+		t.Fatalf("production graph compose incomplete: ok=%t entries=%d raw_len=%d source_len=%d", composed.OK, len(composed.Entries), len(composed.Raw), len(composed.SourceVersion))
 	}
 	credential, _ := vpnCredentialForProtocol(bound.Credentials, model.ProxyProtocolVLESS)
 	if strings.EqualFold(sourceUUID, credential.UUID) || !strings.Contains(composed.Raw, credential.UUID+"@") || strings.Contains(composed.Raw, sourceUUID+"@") {
-		t.Fatalf("compose did not separate root and credential authority: root=%s credential=%s raw=%s", sourceUUID, credential.UUID, composed.Raw)
+		t.Fatalf("compose did not separate root and credential authority: raw_len=%d", len(composed.Raw))
 	}
 
 	const subStoreID = "latticenet.sub-store"
@@ -316,11 +331,11 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 		},
 	}, &preview)
 	if preview.SourceNodeCount != 1 || preview.NodeCount != 1 || preview.SourceVersion != composed.SourceVersion || preview.Stale {
-		t.Fatalf("graph preview authority mismatch: %+v compose=%s", preview, composed.SourceVersion)
+		t.Fatalf("graph preview authority mismatch: source_nodes=%d nodes=%d stale=%t source_version_match=%t", preview.SourceNodeCount, preview.NodeCount, preview.Stale, preview.SourceVersion == composed.SourceVersion)
 	}
 	afterPreviewKV := srv.store.KV("plugin:" + subStoreID)
 	if !equalE5JSON(beforeKV, afterPreviewKV) {
-		t.Fatalf("graph preview mutated plugin KV: before=%+v after=%+v", beforeKV, afterPreviewKV)
+		t.Fatal("graph preview mutated plugin KV")
 	}
 
 	const subscriptionID = "e5-graph"
@@ -357,17 +372,17 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 	}, &publishResult)
 	if publishResult.SubscriptionID != subscriptionID || publishResult.StatusCode != http.StatusNoContent ||
 		!strings.Contains(string(published), credential.UUID+"@") || strings.Contains(string(published), sourceUUID+"@") {
-		t.Fatalf("publish mismatch: result=%+v body=%q compose=%q", publishResult, published, composed.Raw)
+		t.Fatalf("publish mismatch: status=%d bytes=%d body_len=%d compose_len=%d", publishResult.StatusCode, publishResult.Bytes, len(published), len(composed.Raw))
 	}
 
 	createResponse := doJSON(t, handler, http.MethodPost, "/api/subscription-shares", `{"slug":"e5-graph","source":{"kind":"plugin","plugin_id":"latticenet.sub-store","subscription_id":"e5-graph"},"default_format":"plain"}`, cookies, csrf)
 	createRaw := readAndClose(t, createResponse)
 	if createResponse.StatusCode != http.StatusCreated {
-		t.Fatalf("create E5 share through HTTP: status=%d body=%s", createResponse.StatusCode, createRaw)
+		t.Fatalf("create E5 share through HTTP: status=%d body_len=%d", createResponse.StatusCode, len(createRaw))
 	}
 	var created shareView
 	if err := json.Unmarshal(createRaw, &created); err != nil || created.ID == "" || created.Token == "" {
-		t.Fatalf("decode created E5 share: %v body=%s", err, createRaw)
+		t.Fatalf("decode created E5 share: err=%v body_len=%d", err, len(createRaw))
 	}
 	storedShare, ok := srv.store.SubscriptionShare(created.ID)
 	if !ok || storedShare.Token != created.Token {
@@ -385,11 +400,11 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 	defer response.Body.Close()
 	responseRaw, _ := io.ReadAll(response.Body)
 	if response.StatusCode != http.StatusOK || response.Header.Get("X-Lattice-Subscription-Stale") != "" {
-		t.Fatalf("public graph share status=%d headers=%v body=%s", response.StatusCode, response.Header, responseRaw)
+		t.Fatalf("public graph share status=%d body_len=%d", response.StatusCode, len(responseRaw))
 	}
 	shareBody := strings.TrimSpace(string(responseRaw))
 	if shareBody != strings.TrimSpace(string(published)) {
-		t.Fatalf("preview/save/publish/share authority diverged: share=%q publish=%q compose=%q", shareBody, published, composed.Raw)
+		t.Fatalf("preview/save/publish/share authority diverged: share_len=%d publish_len=%d compose_len=%d", len(shareBody), len(published), len(composed.Raw))
 	}
 	return e5GraphPhaseResult{SourceVersion: composed.SourceVersion, Share: storedShare, URI: shareBody, Published: append([]byte(nil), published...)}
 }
@@ -397,7 +412,7 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 func assertE5GraphOptions(t *testing.T, options graphSubscriptionOptionsResponse, identityID, sourceUUID string) {
 	t.Helper()
 	if !options.OK || options.OptionsVersion == "" {
-		t.Fatalf("graph options unavailable: %+v", options)
+		t.Fatalf("graph options unavailable: ok=%t version_len=%d identities=%d roots=%d", options.OK, len(options.OptionsVersion), len(options.Identities), len(options.Roots))
 	}
 	identitySelectable := false
 	for _, identity := range options.Identities {
@@ -414,7 +429,7 @@ func assertE5GraphOptions(t *testing.T, options graphSubscriptionOptionsResponse
 		}
 	}
 	if !identitySelectable || !rootSelectable {
-		t.Fatalf("identity/root not selectable: identity=%v root=%v options=%+v", identitySelectable, rootSelectable, options)
+		t.Fatalf("identity/root not selectable: identity=%v root=%v", identitySelectable, rootSelectable)
 	}
 }
 
@@ -424,19 +439,19 @@ func equalE5JSON(a, b any) bool {
 	return leftErr == nil && rightErr == nil && bytes.Equal(left, right)
 }
 
-func startE5ClientFromShareURI(t *testing.T, singbox, root, uri string, socksPort int) {
+func startE5ClientFromShareURI(t *testing.T, singbox, root, name, uri string, socksPort int) {
 	t.Helper()
 	parsed, err := url.Parse(strings.TrimSpace(uri))
 	if err != nil || parsed.Scheme != "vless" || parsed.User == nil {
-		t.Fatalf("invalid public share URI: %v %q", err, uri)
+		t.Fatalf("invalid public share URI: err=%v uri_len=%d", err, len(uri))
 	}
 	port, err := strconv.Atoi(parsed.Port())
 	if err != nil || port < 1 {
-		t.Fatalf("invalid share URI port: %v %q", err, uri)
+		t.Fatalf("invalid share URI port: err=%v uri_len=%d", err, len(uri))
 	}
 	query := parsed.Query()
 	outbound := map[string]any{
-		"type": "vless", "tag": "e5-share", "server": parsed.Hostname(), "server_port": port,
+		"type": "vless", "tag": name, "server": parsed.Hostname(), "server_port": port,
 		"uuid": parsed.User.Username(), "flow": query.Get("flow"),
 	}
 	if query.Get("security") == "reality" {
@@ -450,18 +465,18 @@ func startE5ClientFromShareURI(t *testing.T, singbox, root, uri string, socksPor
 		"log":       map[string]any{"level": "error"},
 		"inbounds":  []any{map[string]any{"type": "socks", "tag": "client", "listen": "127.0.0.1", "listen_port": socksPort}},
 		"outbounds": []any{outbound},
-		"route":     map[string]any{"rules": []any{map[string]any{"inbound": []string{"client"}, "outbound": "e5-share"}}},
+		"route":     map[string]any{"rules": []any{map[string]any{"inbound": []string{"client"}, "outbound": name}}},
 	}
 	raw, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(root, "e5-share-client")
+	dir := filepath.Join(root, name)
 	lifecycleWrite(t, filepath.Join(dir, "config.json"), string(raw))
 	if out, err := exec.Command(singbox, "check", "-C", dir).CombinedOutput(); err != nil {
-		t.Fatalf("public share client config rejected: %v: %s\nuri=%s", err, out, uri)
+		t.Fatalf("public share client config rejected: err=%v output_len=%d", err, len(out))
 	}
-	lifecycleStartProcess(t, singbox, root, "e5-share-client", dir, socksPort)
+	lifecycleStartProcess(t, singbox, root, name, dir, socksPort)
 }
 
 func seedE5ConvergedTerminalDefinition(t *testing.T, srv *Server, target managedLineDef) {
@@ -501,7 +516,7 @@ func seedE5ConvergedTerminalDefinition(t *testing.T, srv *Server, target managed
 	}
 	deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator(target.NodeID, 1, false, true, validator)
 	if err != nil || len(deliveries) != 1 {
-		t.Fatalf("lease E5 terminal seed: deliveries=%+v err=%v", deliveries, err)
+		t.Fatalf("lease E5 terminal seed: delivery_count=%d err=%v", len(deliveries), err)
 	}
 	result := model.TaskResult{TaskID: task.ID, NodeID: target.NodeID, LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
 	if committed, err := srv.store.CompleteLineChainTaskResult(result, approved, store.LineChainStatusAppliedUnobserved, "", ""); err != nil || !committed {
@@ -512,7 +527,7 @@ func seedE5ConvergedTerminalDefinition(t *testing.T, srv *Server, target managed
 	}
 	definition := srv.store.LineChainSnapshot().Definitions[target.LineUUID]
 	if definition.Status != store.LineChainStatusConverged || definition.TargetLineUUID != "" {
-		t.Fatalf("E5 terminal definition did not converge: %+v", definition)
+		t.Fatalf("E5 terminal definition did not converge: status=%s target_present=%t", definition.Status, definition.TargetLineUUID != "")
 	}
 }
 
@@ -562,32 +577,39 @@ func (fixture e5PluginServerFixture) assertNoPlaintextCanaries(t *testing.T, can
 	}
 }
 
-func registerE5FixtureCleanup(t *testing.T, srv *Server, st *store.Store) {
+func registerE5FixtureCleanup(t *testing.T, c *e5FixtureCleanup) {
 	t.Helper()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := srv.Close(ctx); err != nil {
-			t.Errorf("close E5 server runtime: %v", err)
+		c.closeServer(ctx)
+		c.closeStore()
+		if c.serverErr != nil {
+			t.Errorf("close E5 server runtime: %v", c.serverErr)
 		}
-		if err := st.Close(); err != nil {
-			t.Errorf("close E5 store: %v", err)
+		if c.storeErr != nil {
+			t.Errorf("close E5 store: %v", c.storeErr)
 		}
 	})
 }
 
-func (fixture e5PluginServerFixture) reopen(t *testing.T, afterServerClose func()) e5PluginServerFixture {
+func (fixture e5PluginServerFixture) reopen(t *testing.T, beforeStoreClose func(), afterStoreClose func()) e5PluginServerFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := fixture.server.Close(ctx); err != nil {
-		t.Fatal(err)
+	fixture.cleanup.closeServer(ctx)
+	if fixture.cleanup.serverErr != nil {
+		t.Fatal(fixture.cleanup.serverErr)
 	}
-	if afterServerClose != nil {
-		afterServerClose()
+	if beforeStoreClose != nil {
+		beforeStoreClose()
 	}
-	if err := fixture.store.Close(); err != nil {
-		t.Fatal(err)
+	fixture.cleanup.closeStore()
+	if fixture.cleanup.storeErr != nil {
+		t.Fatal(fixture.cleanup.storeErr)
+	}
+	if afterStoreClose != nil {
+		afterStoreClose()
 	}
 	st, err := store.OpenWithCipher(fixture.statePath, fixture.cipher)
 	if err != nil {
@@ -602,9 +624,11 @@ func (fixture e5PluginServerFixture) reopen(t *testing.T, afterServerClose func(
 	if err != nil {
 		t.Fatal(err)
 	}
-	registerE5FixtureCleanup(t, srv, st)
+	cleanup := &e5FixtureCleanup{server: srv, store: st}
+	registerE5FixtureCleanup(t, cleanup)
 	fixture.server = srv
 	fixture.store = st
+	fixture.cleanup = cleanup
 	return fixture
 }
 

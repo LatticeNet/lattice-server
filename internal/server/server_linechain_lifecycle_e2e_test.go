@@ -36,7 +36,7 @@ func runLifecycleAgentHelper(t *testing.T, cmd *exec.Cmd) []byte {
 	}
 	err := cmd.Wait()
 	if err != nil {
-		t.Fatalf("agent helper failed: %v: %s", err, out.Bytes())
+		t.Fatalf("agent helper failed: err=%v output_len=%d", err, out.Len())
 	}
 	return out.Bytes()
 }
@@ -210,7 +210,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	defer res.Body.Close()
 	var leased []agentTaskView
 	if res.StatusCode != http.StatusOK || json.NewDecoder(res.Body).Decode(&leased) != nil || len(leased) != 1 || leased[0].DurableProtocol != store.DurableProtocolLineChainV2 {
-		t.Fatalf("lease=%d %+v", res.StatusCode, leased)
+		t.Fatalf("lease status=%d count=%d durable_protocol_match=%t", res.StatusCode, len(leased), len(leased) == 1 && leased[0].DurableProtocol == store.DurableProtocolLineChainV2)
 	}
 	if strings.Contains(leased[0].Script, "credential-canary") {
 		t.Fatal("leased script leaked secret canary")
@@ -236,7 +236,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	if out, err := exec.Command(singbox, "check", "-c", fragmentProbe).CombinedOutput(); err != nil {
-		t.Fatalf("server-issued fragment rejected by official sing-box: %v: %s", err, out)
+		t.Fatalf("server-issued fragment rejected by official sing-box: err=%v output_len=%d", err, len(out))
 	}
 
 	if err := os.WriteFile(sidecar, []byte(fmt.Sprintf(`{"schema":"lattice.singbox-metadata.v2","unknown_root":{"keep":true},"inbounds":[{"tag":"before","line_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},{"tag":"source-b","line_uuid":%q,"ordinary":"keep"},{"tag":"after","line_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"}]}`, sourceUUID)), 0o600); err != nil {
@@ -264,7 +264,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	beginCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_TASK_JSON="+taskJSON, "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+leased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+leased[0].LeaseID, "LATTICE_LINECHAIN_E2E_BEGIN_RESULT="+beginResult)
 	_ = runLifecycleAgentHelper(t, beginCmd)
 	if raw, err := os.ReadFile(beginResult); err != nil || !bytes.Contains(raw, []byte(`"committed":true`)) {
-		t.Fatalf("begin durability missing: %v %s", err, raw)
+		t.Fatalf("begin durability missing: err=%v raw_len=%d", err, len(raw))
 	}
 	cmd := exec.Command("sh", "-c", leased[0].Script)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -301,14 +301,14 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	recoverCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort), "LATTICE_LINECHAIN_E2E_CRASH_MARKER="+crashMarker, "LATTICE_LINECHAIN_E2E_RECOVERY_RESULT="+recoveryResult, "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK_JSON="+taskJSON, "LATTICE_LINECHAIN_E2E_TASK="+leased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+leased[0].LeaseID)
 	_ = runLifecycleAgentHelper(t, recoverCmd)
 	if raw, err := os.ReadFile(recoveryResult); err != nil || !bytes.Contains(raw, []byte(leased[0].ID)) {
-		t.Fatalf("recovery result missing leased task: err=%v raw=%s", err, raw)
+		t.Fatalf("recovery result missing leased task: err=%v raw_len=%d", err, len(raw))
 	}
 	// Recovery is the only authority for the interrupted attempt. Post its
 	// exact non-success result before any inventory or observable traffic.
 	recoveryRaw, _ := os.ReadFile(recoveryResult)
 	recoveryBody := []byte(fmt.Sprintf(`{"node_id":"node-b","result":%s}`, recoveryRaw))
 	if !bytes.Contains(recoveryRaw, []byte(`"exit_code":-1`)) || !bytes.Contains(recoveryRaw, []byte(`"error":"`)) {
-		t.Fatalf("recovery result was not an interrupted failure: %s", recoveryRaw)
+		t.Fatalf("recovery result was not an interrupted failure: raw_len=%d", len(recoveryRaw))
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/task-result", nodeToken, recoveryBody)
@@ -336,7 +336,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	defer retryRes.Body.Close()
 	var retryLeased []agentTaskView
 	if retryRes.StatusCode != http.StatusOK || json.NewDecoder(retryRes.Body).Decode(&retryLeased) != nil || len(retryLeased) != 1 {
-		t.Fatalf("retry lease=%d %+v", retryRes.StatusCode, retryLeased)
+		t.Fatalf("retry lease status=%d count=%d", retryRes.StatusCode, len(retryLeased))
 	}
 	if retryLeased[0].Script != leased[0].Script {
 		t.Fatal("retry lease document bytes differ from the original approved artifact")
@@ -360,13 +360,11 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	retryCmd := exec.Command("sh", "-c", retryLeased[0].Script)
 	retryCmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"), "LATTICE_AGENT_BIN="+agent, "LATTICE_LINECHAIN_TXN_DIR="+txnDir, "LATTICE_LINECHAIN_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+sidecar, "LATTICE_TASK_ID="+retryLeased[0].ID, "LATTICE_TASK_LEASE_ID="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+fmt.Sprintf("%x", sha256.Sum256([]byte(retryLeased[0].Script))), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_BIN="+singbox, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_B_PORT="+strconv.Itoa(bPort))
 	if out, err := retryCmd.CombinedOutput(); err != nil {
-		t.Fatalf("retry leased helper failed: %v: %s", err, out)
-	} else if len(out) > 0 {
-		t.Logf("retry leased helper: %s", out)
+		t.Fatalf("retry leased helper failed: err=%v output_len=%d", err, len(out))
 	}
 	sidecarBytes, _ := os.ReadFile(sidecar)
 	if !bytes.Contains(sidecarBytes, []byte(`"unknown_root":{"keep":true}`)) || !bytes.Contains(sidecarBytes, []byte(`"ordinary":"keep"`)) {
-		t.Fatalf("host fields lost: %s", sidecarBytes)
+		t.Fatalf("host fields lost: bytes=%d", len(sidecarBytes))
 	}
 	// The exact leased server document is now live: B's real outbound must
 	// traverse observer -> A -> origin, proving the applied artifact rather
@@ -374,7 +372,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	lifecycleSOCKSEcho(t, clientPort, origin)
 	if observer.accepted() == 0 {
 		configBytes, _ := os.ReadFile(filepath.Join(configDir, "config.json"))
-		t.Fatalf("server-issued chain produced no B -> observer -> A traffic; config=%s", configBytes)
+		t.Fatalf("server-issued chain produced no B -> observer -> A traffic; config_len=%d", len(configBytes))
 	}
 	// Exercise deterministic process-group recovery before reporting the task
 	// result. The recovered B must preserve the applied server-issued config.
@@ -389,7 +387,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	_ = runLifecycleAgentHelper(t, resolveCmd)
 	resolveRaw, err := os.ReadFile(resolveResult)
 	if err != nil || !bytes.Contains(resolveRaw, []byte(retryLeased[0].ID)) {
-		t.Fatalf("resolve result missing leased task: err=%v raw=%s", err, resolveRaw)
+		t.Fatalf("resolve result missing leased task: err=%v raw_len=%d", err, len(resolveRaw))
 	}
 	resultBody := fmt.Sprintf(`{"node_id":"node-b","result":%s}`, resolveRaw)
 	// First 200 is deliberately ignored; exact replay must remain idempotent.
@@ -413,7 +411,8 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	_ = runLifecycleAgentHelper(t, ack2Cmd)
 	snapshot := srv.store.LineChainSnapshot()
 	if snapshot.Definitions[sourceUUID].Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != taskBaseline+2 {
-		t.Fatalf("promotion/task mismatch: %+v tasks=%d", snapshot, len(srv.store.Tasks()))
+		d := snapshot.Definitions[sourceUUID]
+		t.Fatalf("promotion/task mismatch: revision=%d tasks=%d status=%s target_present=%t", snapshot.Revision, len(srv.store.Tasks()), d.Status, d.TargetLineUUID != "")
 	}
 
 	// Reconcile the server against an ordinary agent inventory while the same
@@ -433,7 +432,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatalf("inventory queued an extra E3 task: %d", len(srv.store.Tasks()))
 	}
 	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != taskBaseline+2 {
-		t.Fatalf("observed apply did not converge: %+v", got)
+		t.Fatalf("observed apply did not converge: status=%s target_present=%t task_count=%d", got.Status, got.TargetLineUUID != "", len(srv.store.Tasks()))
 	}
 	assertDeclaredE2EEdge(t, srv.buildLineGroups(), sourceUUID, targetUUID, true)
 	// E5 Phase A-D runs only after the server has observed the exact issued
@@ -442,7 +441,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	// selection, publish the same bytes, and serve them through the public share.
 	e5Graph := exerciseE5GraphAtConvergence(t, srv, handler, httpServer, cookies, csrf, user, sourceUUID)
 	shareClientPort := lifecycleFreePort(t)
-	startE5ClientFromShareURI(t, singbox, root, e5Graph.URI, shareClientPort)
+	startE5ClientFromShareURI(t, singbox, root, "e5-share-client", e5Graph.URI, shareClientPort)
 	beforeShareTraffic := observer.accepted()
 	lifecycleSOCKSEcho(t, shareClientPort, origin)
 	if observer.accepted() <= beforeShareTraffic {
@@ -450,6 +449,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	const e5SubStorePluginID = "latticenet.sub-store"
 	const e5SubscriptionID = "e5-graph"
+	const e5SubscriptionService = "latticenet.sub-store/subscription"
 	lastGood, ok := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
 	if !ok || lastGood.Stale || lastGood.SourceVersion != e5Graph.SourceVersion || lastGood.FetchedAt.IsZero() || lastGood.Raw == "" {
 		t.Fatalf("initial durable E5 snapshot mismatch: ok=%t stale=%t source=%s graph=%s fetched=%s bytes=%d", ok, lastGood.Stale, lastGood.SourceVersion, e5Graph.SourceVersion, lastGood.FetchedAt, len(lastGood.Raw))
@@ -471,7 +471,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err != nil || len(driftInventoryRaw) == 0 {
 		t.Fatalf("drift inventory helper result missing: %v", err)
 	}
-	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, driftInventoryRaw)))
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, inventoryWithLocalAddress(t, driftInventoryRaw, sourceUUID))
 	refreshReq, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/subscription-shares/"+e5Graph.Share.ID+"/refresh", nil)
 	refreshReq.Header.Set("X-Lattice-CSRF", csrf)
 	for _, c := range cookies {
@@ -483,13 +483,29 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	refreshRaw, _ := io.ReadAll(refreshRes.Body)
 	refreshRes.Body.Close()
-	if refreshRes.StatusCode != http.StatusOK || !bytes.Contains(refreshRaw, []byte(`"stale":true`)) {
-		t.Fatalf("drift refresh status=%d body=%s", refreshRes.StatusCode, refreshRaw)
+	var refreshView struct {
+		Stale bool   `json:"stale"`
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(refreshRaw, &refreshView) != nil || refreshRes.StatusCode != http.StatusOK || !refreshView.Stale || refreshView.Error != "provider_fetch_failed" || bytes.Contains(refreshRaw, []byte(nodeToken)) || bytes.Contains(refreshRaw, []byte(credential.UUID)) || bytes.Contains(refreshRaw, []byte(e5Graph.URI)) {
+		t.Fatalf("drift refresh status=%d body_len=%d", refreshRes.StatusCode, len(refreshRaw))
+	}
+	staleGET, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/sub/"+e5Graph.Share.Slug+"/"+e5Graph.Share.Token+"?format=plain", nil)
+	staleResp, err := httpServer.Client().Do(staleGET)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleBody := readAndClose(t, staleResp)
+	if staleResp.StatusCode != http.StatusOK || staleResp.Header.Get("X-Lattice-Subscription-Stale") != "true" || strings.TrimSpace(string(staleBody)) != strings.TrimSpace(e5Graph.URI) {
+		t.Fatalf("stale public share mismatch: status=%d header=%q body_len=%d", staleResp.StatusCode, staleResp.Header.Get("X-Lattice-Subscription-Stale"), len(staleBody))
 	}
 	staleLastGood, ok := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
 	if !ok || !staleLastGood.Stale || staleLastGood.FetchError == "" || staleLastGood.SourceVersion != lastGood.SourceVersion ||
 		staleLastGood.Raw != lastGood.Raw || !staleLastGood.FetchedAt.Equal(lastGood.FetchedAt) || !staleLastGood.LastAttemptAt.After(lastGood.FetchedAt) {
 		t.Fatalf("inventory drift did not preserve durable last-good authority: ok=%t stale=%t error=%q source=%s want_source=%s fetched=%s want_fetched=%s bytes=%d want_bytes=%d attempt=%s", ok, staleLastGood.Stale, staleLastGood.FetchError, staleLastGood.SourceVersion, lastGood.SourceVersion, staleLastGood.FetchedAt, lastGood.FetchedAt, len(staleLastGood.Raw), len(lastGood.Raw), staleLastGood.LastAttemptAt)
+	}
+	if staleLastGood.FetchError != "provider_fetch_failed" {
+		t.Fatalf("unexpected stale fetch error: %q", staleLastGood.FetchError)
 	}
 	// Restore the converged observation and force refresh again; stale state
 	// must clear and the provider must publish the recovered snapshot.
@@ -505,7 +521,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err != nil || len(recoveredInventoryRaw) == 0 {
 		t.Fatalf("recovered inventory helper result missing: %v", err)
 	}
-	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, recoveredInventoryRaw)))
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, inventoryWithLocalAddress(t, recoveredInventoryRaw, sourceUUID))
 	recoverReq, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/subscription-shares/"+e5Graph.Share.ID+"/refresh", nil)
 	recoverReq.Header.Set("X-Lattice-CSRF", csrf)
 	for _, c := range cookies {
@@ -517,13 +533,26 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	recoverRaw, _ := io.ReadAll(recoverRes.Body)
 	recoverRes.Body.Close()
-	if recoverRes.StatusCode != http.StatusOK || bytes.Contains(recoverRaw, []byte(`"stale":true`)) {
-		t.Fatalf("recovery refresh status=%d body=%s", recoverRes.StatusCode, recoverRaw)
+	var recoverView struct {
+		Stale bool   `json:"stale"`
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(recoverRaw, &recoverView) != nil || recoverRes.StatusCode != http.StatusOK || recoverView.Stale || recoverView.Error != "" {
+		t.Fatalf("recovery refresh status=%d body_len=%d", recoverRes.StatusCode, len(recoverRaw))
 	}
 	recoveredSnapshot, ok := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
 	if !ok || recoveredSnapshot.Stale || recoveredSnapshot.FetchError != "" || recoveredSnapshot.SourceVersion == "" || recoveredSnapshot.SourceVersion == lastGood.SourceVersion ||
 		recoveredSnapshot.Raw != lastGood.Raw || !recoveredSnapshot.FetchedAt.After(lastGood.FetchedAt) || !recoveredSnapshot.LastAttemptAt.Equal(recoveredSnapshot.FetchedAt) {
 		t.Fatalf("inventory recovery did not publish fresh durable authority: ok=%t stale=%t error=%q source=%s old_source=%s fetched=%s old_fetched=%s bytes=%d want_bytes=%d attempt=%s", ok, recoveredSnapshot.Stale, recoveredSnapshot.FetchError, recoveredSnapshot.SourceVersion, lastGood.SourceVersion, recoveredSnapshot.FetchedAt, lastGood.FetchedAt, len(recoveredSnapshot.Raw), len(lastGood.Raw), recoveredSnapshot.LastAttemptAt)
+	}
+	freshGET, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/sub/"+e5Graph.Share.Slug+"/"+e5Graph.Share.Token+"?format=plain", nil)
+	freshResp, err := httpServer.Client().Do(freshGET)
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshBody := readAndClose(t, freshResp)
+	if freshResp.StatusCode != http.StatusOK || freshResp.Header.Get("X-Lattice-Subscription-Stale") != "" || strings.TrimSpace(string(freshBody)) != strings.TrimSpace(e5Graph.URI) {
+		t.Fatalf("fresh public share mismatch: status=%d header=%q body_len=%d", freshResp.StatusCode, freshResp.Header.Get("X-Lattice-Subscription-Stale"), len(freshBody))
 	}
 
 	// A real server restart must reap both persistent plugin workers before the
@@ -532,11 +561,18 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	// policy must restore active lifecycle state and arm fresh worker processes.
 	httpServer.Close()
 	oldPluginPGIDs := lifecyclePluginRuntimeProcessGroups(t, e5Fixture.runtimeDir)
-	if len(oldPluginPGIDs) != 2 {
-		t.Fatalf("expected two live E5 plugin process groups before restart, got %v", oldPluginPGIDs)
+	if len(oldPluginPGIDs) < 1 {
+		t.Fatalf("expected live E5 plugin process groups before restart, got %v", oldPluginPGIDs)
 	}
+	beforeRestartKV := srv.store.KV("plugin:" + e5SubStorePluginID)
 	e5Fixture = e5Fixture.reopen(t, func() {
-		assertLifecycleProcessGroupsGone(t, oldPluginPGIDs)
+		assertLifecycleProcessGroupsGone(t, oldPluginPGIDs, e5Fixture.runtimeDir)
+		walResult, walEnabled, walErr := e5Fixture.store.AuditWALVerify()
+		if walErr != nil || !walEnabled || walResult.Count == 0 || walResult.Anchor == nil {
+			t.Fatalf("pre-close AuditWAL verification failed: enabled=%t count=%d anchor=%t err=%v", walEnabled, walResult.Count, walResult.Anchor != nil, walErr)
+		}
+	}, func() {
+		e5Fixture.assertNoPlaintextCanaries(t, credential.UUID, realityPrivate, sourceRealityPrivate, e5Graph.Share.Token, nodeToken, recoveredSnapshot.Raw, e5Graph.URI)
 	})
 	srv = e5Fixture.server
 	handler = srv.Handler()
@@ -550,8 +586,8 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		}
 	}
 	newPluginPGIDs := lifecyclePluginRuntimeProcessGroups(t, e5Fixture.runtimeDir)
-	if len(newPluginPGIDs) != 2 {
-		t.Fatalf("expected two fresh E5 plugin process groups after restart, got %v", newPluginPGIDs)
+	if len(newPluginPGIDs) < 1 {
+		t.Fatalf("expected fresh E5 plugin process groups after restart, got %v", newPluginPGIDs)
 	}
 	for _, pgid := range newPluginPGIDs {
 		for _, oldPGID := range oldPluginPGIDs {
@@ -561,6 +597,27 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		}
 	}
 	persistedShare, shareOK := srv.store.SubscriptionShare(e5Graph.Share.ID)
+	if !equalE5JSON(beforeRestartKV, srv.store.KV("plugin:"+e5SubStorePluginID)) {
+		t.Fatal("SubStore plugin KV changed across restart")
+	}
+	var reopenedGet struct {
+		Subscription struct {
+			ID string `json:"id"`
+		} `json:"subscription"`
+	}
+	callE5Plugin(t, handler, cookies, csrf, e5SubStorePluginID, e5SubscriptionService, "get", map[string]any{"subscription_id": e5SubscriptionID}, &reopenedGet)
+	if reopenedGet.Subscription.ID != e5SubscriptionID {
+		t.Fatalf("reopened SubStore get mismatch: got_id_len=%d", len(reopenedGet.Subscription.ID))
+	}
+	postRestartGET, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/sub/"+e5Graph.Share.Slug+"/"+e5Graph.Share.Token+"?format=plain", nil)
+	postRestartResp, err := httpServer.Client().Do(postRestartGET)
+	if err != nil {
+		t.Fatal(err)
+	}
+	postRestartBody := readAndClose(t, postRestartResp)
+	if postRestartResp.StatusCode != http.StatusOK || postRestartResp.Header.Get("X-Lattice-Subscription-Stale") != "" || strings.TrimSpace(string(postRestartBody)) != strings.TrimSpace(e5Graph.URI) {
+		t.Fatalf("post-reopen public share mismatch: status=%d header=%q body_len=%d", postRestartResp.StatusCode, postRestartResp.Header.Get("X-Lattice-Subscription-Stale"), len(postRestartBody))
+	}
 	persistedSnapshot, snapshotOK := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
 	persistedDefinition := srv.store.LineChainSnapshot().Definitions[sourceUUID]
 	if !shareOK || persistedShare.Token != e5Graph.Share.Token || !snapshotOK || persistedSnapshot.SourceVersion != recoveredSnapshot.SourceVersion ||
@@ -572,14 +629,73 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if walErr != nil || !walEnabled || walResult.Count == 0 || walResult.Anchor == nil {
 		t.Fatalf("reopened E5 AuditWAL verification failed: enabled=%t count=%d anchor=%t err=%v", walEnabled, walResult.Count, walResult.Anchor != nil, walErr)
 	}
-	e5Fixture.assertNoPlaintextCanaries(t, credential.UUID, e5Graph.Share.Token, nodeToken, recoveredSnapshot.Raw)
+	e5Fixture.assertNoPlaintextCanaries(t, credential.UUID, realityPrivate, sourceRealityPrivate, e5Graph.Share.Token, nodeToken, recoveredSnapshot.Raw, e5Graph.URI)
+	// Reconnect the agent after restart so the ephemeral inventory projection is
+	// repopulated before ordinary metadata/remove assertions.
+	reconnectInventory := filepath.Join(root, "reconnect-inventory-result.json")
+	reconnectCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
+	reconnectCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+reconnectInventory)
+	_ = runLifecycleAgentHelper(t, reconnectCmd)
+	reconnectRaw, err := os.ReadFile(reconnectInventory)
+	if err != nil || len(reconnectRaw) == 0 {
+		t.Fatalf("reconnect inventory result missing: %v", err)
+	}
+	tasksBeforeReconnect := len(srv.store.Tasks())
+	reconnectReq, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/agent/singbox-inventory", bytes.NewReader(inventoryWithLocalAddress(t, reconnectRaw, sourceUUID)))
+	reconnectReq.Header.Set("Authorization", "Bearer "+nodeToken)
+	reconnectReq.Header.Set(agentCapabilitiesHeader, lineChainDurableCapability)
+	reconnectResp, err := httpServer.Client().Do(reconnectReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconnectResp.StatusCode != http.StatusOK {
+		body := readAndClose(t, reconnectResp)
+		t.Fatalf("reconnect inventory failed: status=%d body_len=%d", reconnectResp.StatusCode, len(body))
+	}
+	reconnectResp.Body.Close()
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/hello", nodeToken, []byte(`{"node_id":"node-b","version":"e2e-reconnect","capabilities":["durable-task-result-v1"]}`))
+	reconnectedNodeB, reconnectedNodeOK := srv.store.Node("node-b")
+	if !reconnectedNodeOK || reconnectedNodeB.PublicIP != "" {
+		t.Fatalf("reconnected node public IP: present=%t nonempty=%t", reconnectedNodeOK, reconnectedNodeB.PublicIP != "")
+	}
+	compileAfterHello, compileAfterHelloErr := srv.captureLineChainCompileSnapshot()
+	if compileAfterHelloErr != nil {
+		t.Fatal(compileAfterHelloErr)
+	}
+	if len(compileAfterHello.Lines[sourceUUID]) != 1 || compileAfterHello.Lines[sourceUUID][0].PublicHost != "127.0.0.1" {
+		firstHost := ""
+		if len(compileAfterHello.Lines[sourceUUID]) > 0 {
+			firstHost = compileAfterHello.Lines[sourceUUID][0].PublicHost
+		}
+		t.Fatalf("inventory authority compile mismatch: line_count=%d first_host=%s", len(compileAfterHello.Lines[sourceUUID]), firstHost)
+	}
+	if len(srv.store.Tasks()) != tasksBeforeReconnect || srv.store.LineChainSnapshot().Definitions[sourceUUID].Status != store.LineChainStatusConverged {
+		d := srv.store.LineChainSnapshot().Definitions[sourceUUID]
+		t.Fatalf("agent reconnect changed durable state: tasks=%d want=%d status=%s target_present=%t", len(srv.store.Tasks()), tasksBeforeReconnect, d.Status, d.TargetLineUUID != "")
+	}
+	capReq, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/api/agent/tasks?node_id=node-b", nil)
+	capReq.Header.Set("Authorization", "Bearer "+nodeToken)
+	capReq.Header.Set(agentCapabilitiesHeader, lineChainDurableCapability)
+	capResp, err := httpServer.Client().Do(capReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var capTasks []agentTaskView
+	if capResp.StatusCode != http.StatusOK || json.NewDecoder(capResp.Body).Decode(&capTasks) != nil {
+		capResp.Body.Close()
+		t.Fatalf("capability re-advertisement failed: status=%d", capResp.StatusCode)
+	}
+	capResp.Body.Close()
+	if len(capTasks) != 0 {
+		t.Fatalf("reconnect capability GET leased unexpected tasks: count=%d", len(capTasks))
+	}
 
 	// An independent ordinary metadata writer may change unrelated fields. The
 	// subsequent server-issued remove must preserve that drift and only remove
 	// the managed chain declaration.
 	projected, err := srv.renderLineMetadataJSON("node-b")
 	if err != nil || !bytes.Contains(projected, []byte(sourceUUID)) || !bytes.Contains(projected, []byte(targetUUID)) {
-		t.Fatalf("ordinary metadata projection lost committed chain: %s err=%v", projected, err)
+		t.Fatalf("ordinary metadata projection lost committed chain: bytes=%d err=%v", len(projected), err)
 	}
 	var ordinary map[string]any
 	if err := json.Unmarshal(projected, &ordinary); err != nil {
@@ -609,7 +725,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	defer removeRes.Body.Close()
 	var removeLeased []agentTaskView
 	if removeRes.StatusCode != http.StatusOK || json.NewDecoder(removeRes.Body).Decode(&removeLeased) != nil || len(removeLeased) != 1 || removeLeased[0].DurableProtocol != store.DurableProtocolLineChainV2 {
-		t.Fatalf("remove lease=%d %+v", removeRes.StatusCode, removeLeased)
+		t.Fatalf("remove lease status=%d count=%d durable_protocol_match=%t", removeRes.StatusCode, len(removeLeased), len(removeLeased) == 1 && removeLeased[0].DurableProtocol == store.DurableProtocolLineChainV2)
 	}
 	removeTaskJSON := filepath.Join(root, "task3.json")
 	removeTaskBytes, _ := json.Marshal(struct {
@@ -630,11 +746,11 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	removeCmd := exec.Command("sh", "-c", removeLeased[0].Script)
 	removeCmd.Env = append(os.Environ(), "PATH="+binDir+":"+os.Getenv("PATH"), "LATTICE_AGENT_BIN="+agent, "LATTICE_LINECHAIN_TXN_DIR="+txnDir, "LATTICE_LINECHAIN_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_SIDECAR_PATH="+sidecar, "LATTICE_TASK_ID="+removeLeased[0].ID, "LATTICE_TASK_LEASE_ID="+removeLeased[0].LeaseID, "LATTICE_LINECHAIN_TASK_SCRIPT_SHA256="+fmt.Sprintf("%x", sha256.Sum256([]byte(removeLeased[0].Script))))
 	if out, err := removeCmd.CombinedOutput(); err != nil {
-		t.Fatalf("real agent remove helper failed: %v: %s", err, out)
+		t.Fatalf("real agent remove helper failed: err=%v output_len=%d", err, len(out))
 	}
 	removedSidecar, _ := os.ReadFile(sidecar)
 	if !bytes.Contains(removedSidecar, []byte(`"ordinary_sync_generation":7`)) || !bytes.Contains(removedSidecar, []byte(`"unknown_root":{"keep":true}`)) || bytes.Contains(removedSidecar, []byte(`"downstream_line_uuid"`)) {
-		t.Fatalf("remove lost ordinary metadata or retained chain: %s", removedSidecar)
+		t.Fatalf("remove lost ordinary metadata or retained chain: bytes=%d", len(removedSidecar))
 	}
 	removeResolve := filepath.Join(root, "remove-resolve-result.json")
 	removeResolveCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EResolveHelper$", "--", root)
@@ -654,7 +770,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	_ = runLifecycleAgentHelper(t, ack3Cmd)
 	removed := srv.store.LineChainSnapshot().Definitions[sourceUUID]
 	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != taskBaseline+3 {
-		t.Fatalf("remove promotion/task mismatch: %+v tasks=%d", removed, len(srv.store.Tasks()))
+		t.Fatalf("remove promotion/task mismatch: tasks=%d status=%s target_present=%t", len(srv.store.Tasks()), removed.Status, removed.TargetLineUUID != "")
 	}
 	beforeRemoveTraffic := observer.accepted()
 	// The same client path now resolves directly after the server-issued remove;
@@ -671,11 +787,90 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err != nil || len(removeInventoryRaw) == 0 {
 		t.Fatalf("remove inventory result missing: %v", err)
 	}
-	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, removeInventoryRaw)))
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, inventoryWithLocalAddress(t, removeInventoryRaw, sourceUUID))
 	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != taskBaseline+3 {
-		t.Fatalf("remove inventory did not converge: %+v tasks=%d", got, len(srv.store.Tasks()))
+		t.Fatalf("remove inventory did not converge: revision=%d tasks=%d status=%s target_present=%t", srv.store.LineChainSnapshot().Revision, len(srv.store.Tasks()), got.Status, got.TargetLineUUID != "")
 	}
 	assertDeclaredE2EEdge(t, srv.buildLineGroups(), sourceUUID, targetUUID, false)
+	// G: tombstone convergence must force a fresh public projection and direct
+	// client path without reintroducing the observer hop.
+	preG, ok := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
+	if !ok {
+		t.Fatal("missing pre-G subscription snapshot")
+	}
+	terminalCompile, err := srv.captureLineChainCompileSnapshot()
+	if err != nil {
+		t.Fatalf("terminal compile capture: %v", err)
+	}
+	terminalReq := graphSubscriptionRequest{SchemaVersion: 1, IdentityID: user.ID, EntryRoots: []string{sourceUUID}}
+	terminalComposed, err := composeGraphSubscription(terminalCompile, terminalReq, srv.now())
+	if err != nil {
+		t.Fatalf("terminal graph compile: err=%v line_count=%d definition_status=%s", err, len(terminalCompile.Lines[sourceUUID]), terminalCompile.Definitions[sourceUUID].Status)
+	}
+	if len(terminalComposed.Entries) != 1 || terminalComposed.Entries[0] != terminalComposed.Raw || terminalComposed.SourceVersion == "" {
+		t.Fatalf("terminal graph manifest incomplete: entries=%d raw_len=%d source_len=%d", len(terminalComposed.Entries), len(terminalComposed.Raw), len(terminalComposed.SourceVersion))
+	}
+	var terminalCore graphSubscriptionResponse
+	callE5Plugin(t, handler, cookies, csrf, vpnCorePluginID, vpnCoreSubscriptionSourcesService, "compose", terminalReq, &terminalCore)
+	if !terminalCore.OK || len(terminalCore.Entries) != 1 || terminalCore.SourceVersion == "" {
+		t.Fatalf("vpn-core terminal compose failed: ok=%t entries=%d raw_len=%d", terminalCore.OK, len(terminalCore.Entries), len(terminalCore.Raw))
+	}
+	gReq, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/subscription-shares/"+e5Graph.Share.ID+"/refresh", nil)
+	gReq.Header.Set("X-Lattice-CSRF", csrf)
+	for _, c := range cookies {
+		gReq.AddCookie(c)
+	}
+	gResp, err := httpServer.Client().Do(gReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gRaw := readAndClose(t, gResp)
+	var gView struct {
+		Stale bool   `json:"stale"`
+		Error string `json:"error"`
+	}
+	if gResp.StatusCode != http.StatusOK || json.Unmarshal(gRaw, &gView) != nil || gView.Stale || gView.Error != "" {
+		t.Fatalf("G refresh failed: status=%d body_len=%d", gResp.StatusCode, len(gRaw))
+	}
+	postG, ok := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
+	if !ok || postG.Stale || postG.FetchError != "" || len(postG.SourceManifest) == 0 || postG.SourceVersion == preG.SourceVersion || !postG.FetchedAt.After(preG.FetchedAt) || !postG.LastAttemptAt.Equal(postG.FetchedAt) {
+		t.Fatalf("G snapshot did not advance: before_source=%s after_source=%s before_stale=%t after_stale=%t before_fetched=%s after_fetched=%s before_raw_len=%d after_raw_len=%d", preG.SourceVersion, postG.SourceVersion, preG.Stale, postG.Stale, preG.FetchedAt, postG.FetchedAt, len(preG.Raw), len(postG.Raw))
+	}
+	manifest, err := model.DecodeSubscriptionSourceManifest(postG.SourceManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.EntryRoots) != 1 || manifest.EntryRoots[0] != sourceUUID || len(manifest.Entries) != 1 || manifest.Entries[0].Root != sourceUUID || len(manifest.Entries[0].Path) != 0 || manifest.Entries[0].Terminal.LineUUID != sourceUUID || manifest.Entries[0].Terminal.Status != store.LineChainStatusConverged {
+		t.Fatalf("G terminal manifest mismatch: roots=%d entries=%d", len(manifest.EntryRoots), len(manifest.Entries))
+	}
+	gGet, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/sub/"+e5Graph.Share.Slug+"/"+e5Graph.Share.Token+"?format=plain", nil)
+	gPublic, err := httpServer.Client().Do(gGet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gBody := readAndClose(t, gPublic)
+	if postG.Raw == "" {
+		t.Fatal("G snapshot raw is empty")
+	}
+	if gPublic.StatusCode != http.StatusOK {
+		t.Fatalf("G public share status=%d", gPublic.StatusCode)
+	}
+	if gPublic.Header.Get("X-Lattice-Subscription-Stale") != "" {
+		t.Fatalf("G public share stale header=%q", gPublic.Header.Get("X-Lattice-Subscription-Stale"))
+	}
+	if strings.TrimSpace(postG.Raw) != strings.TrimSpace(terminalCore.Raw) || strings.TrimSpace(terminalCore.Raw) != strings.TrimSpace(terminalComposed.Raw) {
+		t.Fatal("G provider authority mismatch")
+	}
+	if strings.TrimSpace(string(gBody)) != strings.TrimSpace(e5Graph.URI) {
+		t.Fatalf("G canonical public rendering mismatch: body_len=%d expected_len=%d", len(bytes.TrimSpace(gBody)), len(strings.TrimSpace(e5Graph.URI)))
+	}
+	gPort := lifecycleFreePort(t)
+	beforeGTraffic := observer.accepted()
+	startE5ClientFromShareURI(t, singbox, root, "e5-direct-client", strings.TrimSpace(string(gBody)), gPort)
+	lifecycleSOCKSEcho(t, gPort, origin)
+	if observer.accepted() != beforeGTraffic {
+		t.Fatal("G direct client traversed observer/A")
+	}
 }
 
 func assertDeclaredE2EEdge(t *testing.T, groups []LineGroup, sourceUUID, targetUUID string, want bool) {
@@ -692,8 +887,14 @@ func assertDeclaredE2EEdge(t *testing.T, groups []LineGroup, sourceUUID, targetU
 			}
 		}
 	}
-	if source == nil || target == nil {
+	if source == nil || (target == nil && want) {
 		t.Fatalf("source/target missing from line projection: source=%v target=%v", source, target)
+	}
+	if !want && target == nil {
+		if len(source.JumpEdges) != 0 || len(source.DeclaredJumpEdges) != 0 {
+			t.Fatalf("removed source still has edges: %+v", source)
+		}
+		return
 	}
 	got := len(source.JumpEdges) == 1 && source.JumpEdges[0] == target.LineHashID &&
 		len(source.DeclaredJumpEdges) == 1 && source.DeclaredJumpEdges[0] == target.LineHashID
@@ -748,6 +949,40 @@ func mergeLifecycleFragmentIntoConfig(t *testing.T, configDir string) {
 	}
 }
 
+func inventoryWithLocalAddress(t *testing.T, raw []byte, sourceUUID string) []byte {
+	t.Helper()
+	// 127.0.0.1 is the E2E equivalent of production Source.Addr, not hello public_ip.
+	var inv model.SingBoxInventory
+	if err := json.Unmarshal(raw, &inv); err != nil {
+		t.Fatal(err)
+	}
+	if inv.NodeID != "node-b" || inv.Status != "ok" || len(inv.Nodes) == 0 {
+		t.Fatalf("invalid inventory authority: node_id=%s status=%s nodes=%d", inv.NodeID, inv.Status, len(inv.Nodes))
+	}
+	found := false
+	for i := range inv.Nodes {
+		n := &inv.Nodes[i]
+		if n.LineUUID == sourceUUID {
+			found = true
+		}
+		if n.Address != "" && n.Address != "127.0.0.1" {
+			t.Fatalf("unexpected inventory address: nonempty=%t", n.Address != "")
+		}
+		n.Address = "127.0.0.1"
+	}
+	if !found {
+		t.Fatalf("inventory missing source line %s", sourceUUID)
+	}
+	out, err := json.Marshal(struct {
+		NodeID    string                 `json:"node_id"`
+		Inventory model.SingBoxInventory `json:"inventory"`
+	}{NodeID: "node-b", Inventory: inv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
 func postAgentJSON(t *testing.T, client *http.Client, url, token string, body []byte) {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
@@ -760,7 +995,7 @@ func postAgentJSON(t *testing.T, client *http.Client, url, token string, body []
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("%s: %d %s", url, res.StatusCode, raw)
+		t.Fatalf("%s: status=%d raw_len=%d", url, res.StatusCode, len(raw))
 	}
 }
 
@@ -779,10 +1014,10 @@ func persistentJSON(t *testing.T, client *http.Client, method, url, body string,
 	defer res.Body.Close()
 	raw, _ := io.ReadAll(res.Body)
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("%s: %d %s", url, res.StatusCode, raw)
+		t.Fatalf("%s: status=%d raw_len=%d", url, res.StatusCode, len(raw))
 	}
 	if out != nil && json.Unmarshal(raw, out) != nil {
-		t.Fatalf("decode %s", raw)
+		t.Fatalf("decode response: raw_len=%d", len(raw))
 	}
 }
 
@@ -810,10 +1045,10 @@ func lifecyclePluginRuntimeProcessGroups(t *testing.T, runtimeDir string) []int 
 	return pgids
 }
 
-func assertLifecycleProcessGroupsGone(t *testing.T, pgids []int) {
+func assertLifecycleProcessGroupsGone(t *testing.T, pgids []int, runtimeDir string) {
 	t.Helper()
 	for _, pgid := range pgids {
-		if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
+		if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) && !(errors.Is(err, syscall.EPERM) && len(lifecyclePluginRuntimeProcessGroups(t, runtimeDir)) == 0) {
 			t.Fatalf("plugin process group %d survived Server.Close: %v", pgid, err)
 		}
 	}

@@ -120,6 +120,54 @@ func TestSubscriptionSnapshotIngressAndGettersValidateAndDeepCloneManifest(t *te
 	}
 }
 
+func TestSubscriptionSnapshotPostRenameFailureReportsCommittedAndSurvivesRestart(t *testing.T) {
+	for _, transition := range []string{"stale", "success"} {
+		t.Run(transition, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			cipher := testCipher(t)
+			st, err := OpenWithCipher(path, cipher)
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "old", FetchedAt: time.Unix(1_700_000_000, 0).UTC()}
+			if err := st.UpsertSubscriptionSnapshot(base); err != nil {
+				t.Fatal(err)
+			}
+			next := base
+			if transition == "stale" {
+				next.Stale = true
+				next.FetchError = "provider_fetch_failed"
+				next.LastAttemptAt = base.FetchedAt.Add(time.Minute)
+			} else {
+				next.Raw = "new"
+				next.FetchedAt = base.FetchedAt.Add(time.Minute)
+				next.LastAttemptAt = next.FetchedAt
+			}
+			st.syncParentDir = func(string) error { return errors.New("forced post-rename sync failure") }
+			committed, err := st.UpsertSubscriptionSnapshotWithCommit(next)
+			if !committed || err == nil || !strings.Contains(err.Error(), "forced post-rename sync failure") {
+				t.Fatalf("post-rename outcome committed=%v err=%v", committed, err)
+			}
+			got, ok := st.SubscriptionSnapshot("p", "s")
+			if !ok || got.Raw != next.Raw || got.Stale != next.Stale || got.FetchError != next.FetchError {
+				t.Fatalf("committed live state=%+v ok=%v want=%+v", got, ok, next)
+			}
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := OpenWithCipher(path, cipher)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			got, ok = reopened.SubscriptionSnapshot("p", "s")
+			if !ok || got.Raw != next.Raw || got.Stale != next.Stale || got.FetchError != next.FetchError {
+				t.Fatalf("reopened committed state=%+v ok=%v want=%+v", got, ok, next)
+			}
+		})
+	}
+}
+
 func TestEncryptedV1SubscriptionSnapshotRewritesAndReopensWithEmptyProvenance(t *testing.T) {
 	dir := t.TempDir()
 	cipher := testCipher(t)

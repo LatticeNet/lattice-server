@@ -523,9 +523,10 @@ func TestSubscriptionShareFailsClosedWhenSourceChangesDuringBothRenderAttempts(t
 	calls := 0
 	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		calls++
-		s.subscriptionRefreshMu.Lock()
-		s.bumpSubscriptionSourceEpochLocked(subscriptionRefreshKey{pluginID: "p", subscriptionID: "graph"})
-		s.subscriptionRefreshMu.Unlock()
+		publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "graph"})
+		publication.mu.Lock()
+		publication.epoch++
+		publication.mu.Unlock()
 		return renderedSubscription{Body: []byte("superseded"), ContentType: "text/plain", RevalidationVersion: subscriptionRevalidationVersion(snap), FetchedAt: snap.FetchedAt}, nil
 	}
 	rec := httptest.NewRecorder()
@@ -555,13 +556,14 @@ func TestSubscriptionShareCacheHitCannotObservePartialSourcePublication(t *testi
 
 			persisted, releasePublish := make(chan struct{}), make(chan struct{})
 			var persistOnce sync.Once
-			s.subscriptionSnapshotPersist = func(snapshot model.SubscriptionSnapshot) error {
-				if err := st.UpsertSubscriptionSnapshot(snapshot); err != nil {
-					return err
+			s.subscriptionSnapshotPersist = func(snapshot model.SubscriptionSnapshot) (bool, error) {
+				committed, err := st.UpsertSubscriptionSnapshotWithCommit(snapshot)
+				if err != nil {
+					return committed, err
 				}
 				persistOnce.Do(func() { close(persisted) })
 				<-releasePublish
-				return nil
+				return true, nil
 			}
 			if transition == "stale" {
 				s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
@@ -595,8 +597,9 @@ func TestSubscriptionShareCacheHitCannotObservePartialSourcePublication(t *testi
 				responseDone <- rec
 			}()
 			<-lookupStarted
-			if s.subscriptionRefreshMu.TryLock() {
-				s.subscriptionRefreshMu.Unlock()
+			publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "graph"})
+			if publication.mu.TryLock() {
+				publication.mu.Unlock()
 				t.Fatal("cache lookup did not contend with the source publication lock")
 			}
 			close(releasePublish)
@@ -630,13 +633,14 @@ func TestSubscriptionShareRevalidationCannotExtendAcrossPartialSourcePublication
 	s.subscriptionCache.PutSnapshot(key, []byte("old-cache"), "text/plain", "", subscriptionRevalidationVersion(old), "", false, now, now.Add(-subscriptionCacheTTL-time.Second))
 
 	persisted, releasePublish := make(chan struct{}), make(chan struct{})
-	s.subscriptionSnapshotPersist = func(snapshot model.SubscriptionSnapshot) error {
-		if err := st.UpsertSubscriptionSnapshot(snapshot); err != nil {
-			return err
+	s.subscriptionSnapshotPersist = func(snapshot model.SubscriptionSnapshot) (bool, error) {
+		committed, err := st.UpsertSubscriptionSnapshotWithCommit(snapshot)
+		if err != nil {
+			return committed, err
 		}
 		close(persisted)
 		<-releasePublish
-		return nil
+		return true, nil
 	}
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
 		return model.SubscriptionSnapshot{Raw: "new"}, nil
@@ -665,8 +669,9 @@ func TestSubscriptionShareRevalidationCannotExtendAcrossPartialSourcePublication
 		responseDone <- rec
 	}()
 	<-extendStarted
-	if s.subscriptionRefreshMu.TryLock() {
-		s.subscriptionRefreshMu.Unlock()
+	publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "graph"})
+	if publication.mu.TryLock() {
+		publication.mu.Unlock()
 		t.Fatal("cache extension did not contend with partial source publication")
 	}
 	close(releasePublish)

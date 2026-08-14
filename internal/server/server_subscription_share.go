@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -277,9 +278,10 @@ func (s *Server) subscriptionCacheSnapshotForSource(pluginID, subscriptionID str
 		default:
 		}
 	}
-	s.subscriptionRefreshMu.Lock()
-	defer s.subscriptionRefreshMu.Unlock()
-	epoch := s.subscriptionSourceEpochs[subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}]
+	publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
+	publication.mu.Lock()
+	defer publication.mu.Unlock()
+	epoch := publication.epoch
 	if stale {
 		entry, ok := s.subscriptionCache.GetStale(key)
 		return entry, ok, epoch
@@ -317,18 +319,31 @@ func snapshotAgeSeconds(now, fetchedAt time.Time) string {
 // what any of its records render to, and the content hash cannot see it — the
 // record, not the content, is what changed — so the edit path invalidates here.
 func (s *Server) invalidateSharesForPlugin(pluginID string) {
-	s.subscriptionRefreshMu.Lock()
-	defer s.subscriptionRefreshMu.Unlock()
-	seen := make(map[subscriptionRefreshKey]struct{})
+	bySource := make(map[subscriptionRefreshKey][]string)
 	for _, share := range s.store.SubscriptionShares() {
 		if share.Source.Kind == model.ShareSourcePlugin && share.Source.PluginID == pluginID {
 			key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: share.Source.SubscriptionID}
-			if _, ok := seen[key]; !ok {
-				s.bumpSubscriptionSourceEpochLocked(key)
-				seen[key] = struct{}{}
-			}
-			s.subscriptionCache.InvalidateShare(share.ID)
+			bySource[key] = append(bySource[key], share.ID)
 		}
+	}
+	keys := make([]subscriptionRefreshKey, 0, len(bySource))
+	for key := range bySource {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].pluginID != keys[j].pluginID {
+			return keys[i].pluginID < keys[j].pluginID
+		}
+		return keys[i].subscriptionID < keys[j].subscriptionID
+	})
+	for _, key := range keys {
+		publication := s.subscriptionPublicationStateFor(key)
+		publication.mu.Lock()
+		publication.epoch++
+		for _, shareID := range bySource[key] {
+			s.subscriptionCache.InvalidateShare(shareID)
+		}
+		publication.mu.Unlock()
 	}
 }
 

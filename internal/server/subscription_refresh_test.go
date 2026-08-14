@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -82,13 +84,155 @@ func TestSnapshotForFailsLoudlyWhenStaleTransitionCannotPersist(t *testing.T) {
 	if err := st.UpsertSubscriptionSnapshot(base); err != nil {
 		t.Fatal(err)
 	}
-	s.subscriptionSnapshotPersist = func(model.SubscriptionSnapshot) error { return errors.New("persist denied") }
+	s.subscriptionSnapshotPersist = func(model.SubscriptionSnapshot) (bool, error) { return false, errors.New("persist denied") }
 	if got, err := s.snapshotFor(context.Background(), "p", "s1", true); err == nil || got.Raw != "" {
 		t.Fatalf("failed persistence looked successful: got=%+v err=%v", got, err)
 	}
 	stored, _ := st.SubscriptionSnapshot("p", "s1")
 	if stored.Stale || stored.FetchError != "" || stored.Raw != "last-good" {
 		t.Fatalf("failed transition published state: %+v", stored)
+	}
+}
+
+func TestSnapshotForCommittedDurabilityFailurePublishesEpochAndInvalidatesCache(t *testing.T) {
+	for _, transition := range []string{"stale", "success"} {
+		t.Run(transition, func(t *testing.T) {
+			s, st := newShareTestServer(t)
+			share := model.SubscriptionShare{ID: "share", Slug: "share", Token: strings.Repeat("a", 32), Enabled: true,
+				Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "s"}}
+			mustUpsertShare(t, st, share)
+			base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "old", FetchedAt: s.now().Add(-time.Hour)}
+			if err := st.UpsertSubscriptionSnapshot(base); err != nil {
+				t.Fatal(err)
+			}
+			cacheKey := shareCacheKey("share")
+			s.subscriptionCache.PutSnapshot(cacheKey, []byte("old-body"), "text/plain", "", subscriptionRevalidationVersion(base), "", false, base.FetchedAt, s.now())
+			publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "s"})
+			publication.mu.Lock()
+			beforeEpoch := publication.epoch
+			publication.mu.Unlock()
+			s.subscriptionSnapshotPersist = func(snapshot model.SubscriptionSnapshot) (bool, error) {
+				if err := st.UpsertSubscriptionSnapshot(snapshot); err != nil {
+					return false, err
+				}
+				return true, errors.New("durability degraded")
+			}
+			if transition == "stale" {
+				s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+					return model.SubscriptionSnapshot{}, errors.New("provider down")
+				}
+			} else {
+				s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+					return model.SubscriptionSnapshot{Raw: "new"}, nil
+				}
+			}
+			if got, err := s.snapshotFor(context.Background(), "p", "s", true); err == nil || got.Raw != "" {
+				t.Fatalf("committed durability failure looked successful: got=%+v err=%v", got, err)
+			}
+			publication.mu.Lock()
+			afterEpoch := publication.epoch
+			publication.mu.Unlock()
+			if afterEpoch != beforeEpoch+1 {
+				t.Fatalf("committed transition epoch=%d want=%d", afterEpoch, beforeEpoch+1)
+			}
+			if _, ok := s.subscriptionCache.GetStale(cacheKey); ok {
+				t.Fatal("committed durability failure left old cache visible")
+			}
+			stored, ok := st.SubscriptionSnapshot("p", "s")
+			if !ok || (transition == "stale" && !stored.Stale) || (transition == "success" && stored.Raw != "new") {
+				t.Fatalf("committed authority=%+v ok=%v", stored, ok)
+			}
+		})
+	}
+}
+
+func TestSubscriptionPublicationLockDoesNotBlockUnrelatedSourceCacheHit(t *testing.T) {
+	s, st := newShareTestServer(t)
+	for _, item := range []struct {
+		id, token string
+	}{{"a", strings.Repeat("a", 32)}, {"b", strings.Repeat("b", 32)}} {
+		mustUpsertShare(t, st, model.SubscriptionShare{ID: item.id, Slug: item.id, Token: item.token, Enabled: true, DefaultFormat: "plain",
+			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: item.id}})
+		if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: item.id, Raw: "raw-" + item.id, FetchedAt: s.now()}); err != nil {
+			t.Fatal(err)
+		}
+		s.subscriptionCache.PutSnapshot(subscriptionCacheKey{ShareID: item.id, Format: "plain", UAClass: "surge"}, []byte("body-"+item.id), "text/plain", "", subscriptionContentHash("raw-"+item.id), "", false, s.now(), s.now())
+	}
+	persisted, release := make(chan struct{}), make(chan struct{})
+	s.subscriptionSnapshotPersist = func(snapshot model.SubscriptionSnapshot) (bool, error) {
+		committed, err := st.UpsertSubscriptionSnapshotWithCommit(snapshot)
+		if snapshot.SubscriptionID == "a" {
+			close(persisted)
+			<-release
+		}
+		return committed, err
+	}
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		return model.SubscriptionSnapshot{Raw: "new-a"}, nil
+	}
+	refreshDone := make(chan error, 1)
+	go func() { _, err := s.snapshotFor(context.Background(), "p", "a", true); refreshDone <- err }()
+	<-persisted
+	stateA := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "a"})
+	if stateA.mu.TryLock() {
+		stateA.mu.Unlock()
+		t.Fatal("source A persistence did not hold its publication lock")
+	}
+	stateB := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "b"})
+	if !stateB.mu.TryLock() {
+		t.Fatal("source A persistence blocked unrelated source B publication lock")
+	}
+	stateB.mu.Unlock()
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest("/sub/b/"+strings.Repeat("b", 32)+"?format=plain", "Surge/2000"))
+	if rec.Code != http.StatusOK || rec.Body.String() != "body-b" {
+		t.Fatalf("unrelated source B cache hit code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	close(release)
+	if err := <-refreshDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSnapshotForRejectsFetchCapturedBeforePluginInvalidation(t *testing.T) {
+	s, st := newShareTestServer(t)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "share", Slug: "share", Token: strings.Repeat("a", 32), Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "s"}})
+	base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "base", FetchedAt: s.now().Add(-time.Hour)}
+	if err := st.UpsertSubscriptionSnapshot(base); err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	calls := 0
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		calls++
+		if calls == 1 {
+			close(started)
+			<-release
+			return model.SubscriptionSnapshot{Raw: "obsolete-fetch"}, nil
+		}
+		return model.SubscriptionSnapshot{Raw: "new-generation"}, nil
+	}
+	first := make(chan error, 1)
+	go func() { _, err := s.snapshotFor(context.Background(), "p", "s", true); first <- err }()
+	<-started
+	s.invalidateSharesForPlugin("p")
+	close(release)
+	if err := <-first; err == nil || !strings.Contains(err.Error(), "source changed") {
+		t.Fatalf("obsolete fetch outcome error=%v", err)
+	}
+	stored, _ := st.SubscriptionSnapshot("p", "s")
+	if stored.Raw != "base" {
+		t.Fatalf("obsolete fetch persisted after plugin invalidation: %+v", stored)
+	}
+	for _, event := range st.AuditEvents() {
+		if event.Action == auditActionSubscriptionFetch && event.Decision == "allow" {
+			t.Fatalf("obsolete fetch produced allow audit: %+v", event)
+		}
+	}
+	second, err := s.snapshotFor(context.Background(), "p", "s", true)
+	if err != nil || second.Raw != "new-generation" || calls != 2 {
+		t.Fatalf("fresh generation after invalidation calls=%d snapshot=%+v err=%v", calls, second, err)
 	}
 }
 

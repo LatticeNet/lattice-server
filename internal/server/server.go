@@ -206,11 +206,11 @@ type Server struct {
 	subscriptionCache *subscriptionCache
 	// subscriptionSnapshotPersist is a narrow persistence seam for exercising
 	// fail-closed last-good transitions. Production always falls back to Store.
-	subscriptionSnapshotPersist   func(model.SubscriptionSnapshot) error
+	subscriptionSnapshotPersist   func(model.SubscriptionSnapshot) (bool, error)
 	subscriptionFetch             func(context.Context, string, string) (model.SubscriptionSnapshot, error)
 	subscriptionRefreshMu         sync.Mutex
 	subscriptionRefreshFlights    map[subscriptionRefreshKey]*subscriptionRefreshFlight
-	subscriptionSourceEpochs      map[subscriptionRefreshKey]uint64
+	subscriptionPublicationStates map[subscriptionRefreshKey]*subscriptionPublicationState
 	subscriptionRefreshWaiter     chan<- struct{}
 	subscriptionRender            func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
 	subscriptionBeforeCacheExtend func()

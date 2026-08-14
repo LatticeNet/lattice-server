@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -38,6 +39,11 @@ type subscriptionRefreshFlight struct {
 	err      error
 }
 
+type subscriptionPublicationState struct {
+	mu    sync.Mutex
+	epoch uint64
+}
+
 type subscriptionRefreshKey struct {
 	pluginID       string
 	subscriptionID string
@@ -50,11 +56,25 @@ func subscriptionRevalidationVersion(snapshot model.SubscriptionSnapshot) string
 	return subscriptionContentHash(snapshot.Raw)
 }
 
-func (s *Server) persistSubscriptionSnapshot(snapshot model.SubscriptionSnapshot) error {
+func (s *Server) persistSubscriptionSnapshot(snapshot model.SubscriptionSnapshot) (bool, error) {
 	if s.subscriptionSnapshotPersist != nil {
 		return s.subscriptionSnapshotPersist(snapshot)
 	}
-	return s.store.UpsertSubscriptionSnapshot(snapshot)
+	return s.store.UpsertSubscriptionSnapshotWithCommit(snapshot)
+}
+
+func (s *Server) subscriptionPublicationStateFor(key subscriptionRefreshKey) *subscriptionPublicationState {
+	s.subscriptionRefreshMu.Lock()
+	defer s.subscriptionRefreshMu.Unlock()
+	if s.subscriptionPublicationStates == nil {
+		s.subscriptionPublicationStates = make(map[subscriptionRefreshKey]*subscriptionPublicationState)
+	}
+	state := s.subscriptionPublicationStates[key]
+	if state == nil {
+		state = &subscriptionPublicationState{}
+		s.subscriptionPublicationStates[key] = state
+	}
+	return state
 }
 
 // snapshotFor returns the content to render, refreshing it first when it is
@@ -80,7 +100,11 @@ func (s *Server) snapshotFor(ctx context.Context, pluginID, subscriptionID strin
 }
 
 func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, bool, error) {
+	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
+	publication := s.subscriptionPublicationStateFor(key)
+	publication.mu.Lock()
 	existing, has := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
+	publication.mu.Unlock()
 	fresh := has && !existing.Stale && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval
 	if fresh {
 		return existing, false, nil
@@ -91,7 +115,6 @@ func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscripti
 	if err := ctx.Err(); err != nil {
 		return model.SubscriptionSnapshot{}, false, err
 	}
-	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
 	s.subscriptionRefreshMu.Lock()
 	if s.subscriptionRefreshFlights == nil {
 		s.subscriptionRefreshFlights = make(map[subscriptionRefreshKey]*subscriptionRefreshFlight)
@@ -138,10 +161,15 @@ func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscripti
 }
 
 func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, error) {
+	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
+	publication := s.subscriptionPublicationStateFor(key)
 	// Re-read only after owning the source flight. This is the current durable
 	// authority all fetch outcomes compare against, so a caller that queued
 	// behind another refresh cannot overwrite the newer result it just observed.
+	publication.mu.Lock()
 	existing, has := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
+	fetchEpoch := publication.epoch
+	publication.mu.Unlock()
 	if has && !existing.Stale && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval {
 		return existing, nil
 	}
@@ -153,6 +181,14 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 		fetch = s.subscriptionFetch
 	}
 	fetched, err := fetch(ctx, pluginID, subscriptionID)
+	publication.mu.Lock()
+	defer publication.mu.Unlock()
+	if publication.epoch != fetchEpoch {
+		return model.SubscriptionSnapshot{}, errors.New("subscription source changed during refresh")
+	}
+	// Provider work runs without the publication lock so unrelated operations on
+	// this source can proceed. Re-read authority before applying the outcome.
+	existing, has = s.store.SubscriptionSnapshot(pluginID, subscriptionID)
 	if err != nil {
 		if !has {
 			// Nothing to fall back to. Returning the error keeps the caller from
@@ -164,18 +200,14 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 		existing.FetchError = "provider_fetch_failed"
 		existing.LastAttemptAt = s.now()
 		existing.Stale = true
-		s.subscriptionRefreshMu.Lock()
-		if storeErr := s.persistSubscriptionSnapshot(existing); storeErr != nil {
-			s.subscriptionRefreshMu.Unlock()
+		committed, storeErr := s.persistSubscriptionSnapshot(existing)
+		if committed {
+			publication.epoch++
+			s.invalidateSharesForSource(pluginID, subscriptionID)
+		}
+		if storeErr != nil {
 			return model.SubscriptionSnapshot{}, fmt.Errorf("persist stale subscription %s/%s: %w", pluginID, subscriptionID, storeErr)
 		}
-		s.bumpSubscriptionSourceEpochLocked(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
-		// Stale is snapshot authority, not one render variant's cache metadata.
-		// Drop every share/format/UA entry sourcing this snapshot so no sibling
-		// cache can continue advertising a fresh response after the durable
-		// failure transition.
-		s.invalidateSharesForSource(pluginID, subscriptionID)
-		s.subscriptionRefreshMu.Unlock()
 		metadata := map[string]string{
 			"plugin_id": pluginID, "subscription_id": subscriptionID,
 			"stale": "true", "snapshot_age_seconds": fmt.Sprintf("%.0f", s.now().Sub(existing.FetchedAt).Seconds()),
@@ -198,19 +230,18 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 	fetched.LastAttemptAt = fetched.FetchedAt
 	fetched.FetchError = ""
 	fetched.Stale = false
-	s.subscriptionRefreshMu.Lock()
-	if err := s.persistSubscriptionSnapshot(fetched); err != nil {
-		s.subscriptionRefreshMu.Unlock()
-		return model.SubscriptionSnapshot{}, err
+	committed, persistErr := s.persistSubscriptionSnapshot(fetched)
+	if committed {
+		publication.epoch++
+		// The content moved: any rendered body cached for a share sourcing this
+		// record is now stale, no matter how much TTL it had left.
+		if has && (force || existing.Stale || existing.Userinfo != fetched.Userinfo || subscriptionRevalidationVersion(existing) != subscriptionRevalidationVersion(fetched)) {
+			s.invalidateSharesForSource(pluginID, subscriptionID)
+		}
 	}
-	s.bumpSubscriptionSourceEpochLocked(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
-	// The content moved: any rendered body cached for a share sourcing this
-	// record is now stale, no matter how much TTL it had left. Without this the
-	// revalidation cadence, not the content, would decide what clients get.
-	if has && (force || existing.Stale || existing.Userinfo != fetched.Userinfo || subscriptionRevalidationVersion(existing) != subscriptionRevalidationVersion(fetched)) {
-		s.invalidateSharesForSource(pluginID, subscriptionID)
+	if persistErr != nil {
+		return model.SubscriptionSnapshot{}, persistErr
 	}
-	s.subscriptionRefreshMu.Unlock()
 	metadata := map[string]string{
 		"plugin_id": pluginID, "subscription_id": subscriptionID,
 		"raw_bytes": fmt.Sprintf("%d", len(fetched.Raw)), "stale": "false", "snapshot_age_seconds": "0",
@@ -225,30 +256,25 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 	return fetched, nil
 }
 
-func (s *Server) bumpSubscriptionSourceEpochLocked(key subscriptionRefreshKey) {
-	if s.subscriptionSourceEpochs == nil {
-		s.subscriptionSourceEpochs = make(map[subscriptionRefreshKey]uint64)
-	}
-	s.subscriptionSourceEpochs[key]++
-}
-
 func (s *Server) subscriptionSnapshotEpoch(pluginID, subscriptionID string, snapshot model.SubscriptionSnapshot) (uint64, bool) {
 	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
-	s.subscriptionRefreshMu.Lock()
-	defer s.subscriptionRefreshMu.Unlock()
+	publication := s.subscriptionPublicationStateFor(key)
+	publication.mu.Lock()
+	defer publication.mu.Unlock()
 	current, ok := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
 	if !ok || current.Raw != snapshot.Raw || current.Userinfo != snapshot.Userinfo || current.SourceVersion != snapshot.SourceVersion ||
 		current.Stale != snapshot.Stale || current.FetchedAt != snapshot.FetchedAt || current.LastAttemptAt != snapshot.LastAttemptAt {
 		return 0, false
 	}
-	return s.subscriptionSourceEpochs[key], true
+	return publication.epoch, true
 }
 
 func (s *Server) putSubscriptionCacheForSource(key subscriptionCacheKey, pluginID, subscriptionID string, expectedEpoch uint64, entry subscriptionCacheEntry, now time.Time) bool {
 	sourceKey := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
-	s.subscriptionRefreshMu.Lock()
-	defer s.subscriptionRefreshMu.Unlock()
-	if s.subscriptionSourceEpochs[sourceKey] != expectedEpoch {
+	publication := s.subscriptionPublicationStateFor(sourceKey)
+	publication.mu.Lock()
+	defer publication.mu.Unlock()
+	if publication.epoch != expectedEpoch {
 		return false
 	}
 	s.subscriptionCache.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion, entry.publicSourceVersion, entry.stale, entry.fetchedAt, now)
@@ -263,10 +289,11 @@ func (s *Server) extendSubscriptionCacheForSource(key subscriptionCacheKey, plug
 		}
 	}
 	sourceKey := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
-	s.subscriptionRefreshMu.Lock()
-	defer s.subscriptionRefreshMu.Unlock()
+	publication := s.subscriptionPublicationStateFor(sourceKey)
+	publication.mu.Lock()
+	defer publication.mu.Unlock()
 	current, ok := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
-	if !ok || s.subscriptionSourceEpochs[sourceKey] != expectedEpoch || !subscriptionSnapshotsEqualForCache(current, snapshot) {
+	if !ok || publication.epoch != expectedEpoch || !subscriptionSnapshotsEqualForCache(current, snapshot) {
 		return false
 	}
 	return s.subscriptionCache.ExtendSnapshot(key, expectedRevision, snapshot.Userinfo, snapshot.SourceVersion, snapshot.Stale, snapshot.FetchedAt, now)

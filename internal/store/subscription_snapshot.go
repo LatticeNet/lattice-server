@@ -48,12 +48,21 @@ func validateCloneSubscriptionSnapshots(in map[string]model.SubscriptionSnapshot
 // It is durable rather than cached: it is what keeps clients served when a
 // provider is unreachable.
 func (s *Store) UpsertSubscriptionSnapshot(snap model.SubscriptionSnapshot) error {
+	_, err := s.UpsertSubscriptionSnapshotWithCommit(snap)
+	return err
+}
+
+// UpsertSubscriptionSnapshotWithCommit distinguishes a pre-commit failure from
+// a committed rename whose parent-directory durability confirmation failed.
+// Callers must publish the committed state to their own cache authority even
+// when err reports degraded durability.
+func (s *Store) UpsertSubscriptionSnapshotWithCommit(snap model.SubscriptionSnapshot) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Pathless stores are explicitly ephemeral test/runtime views. Any disk-backed
 	// store must have a real cipher before accepting opaque provider credentials.
 	if s.path != "" && snap.Raw != "" && (s.cipher == nil || !s.cipher.Enabled()) {
-		return errors.New("subscription snapshot raw content requires an enabled cipher")
+		return false, errors.New("subscription snapshot raw content requires an enabled cipher")
 	}
 	s.ensureMaps()
 	if snap.SchemaVersion == 0 {
@@ -65,15 +74,15 @@ func (s *Store) UpsertSubscriptionSnapshot(snap model.SubscriptionSnapshot) erro
 	var err error
 	snap, err = validateCloneSubscriptionSnapshot(snap)
 	if err != nil {
-		return err
+		return false, err
 	}
 	key := model.SnapshotKey(snap.PluginID, snap.SubscriptionID)
 	if s.runtimeBoltHot != nil {
 		if err := s.runtimeBoltHot.UpsertSubscriptionSnapshot(key, snap); err != nil {
-			return err
+			return false, err
 		}
 		s.state.SubscriptionSnapshots[key] = snap
-		return nil
+		return true, nil
 	}
 	staged := s.state
 	staged.SubscriptionSnapshots = make(map[string]model.SubscriptionSnapshot, len(s.state.SubscriptionSnapshots)+1)
@@ -85,7 +94,7 @@ func (s *Store) UpsertSubscriptionSnapshot(snap model.SubscriptionSnapshot) erro
 	if committed {
 		s.state = staged
 	}
-	return err
+	return committed, err
 }
 
 func (s *Store) SubscriptionSnapshot(pluginID, subscriptionID string) (model.SubscriptionSnapshot, bool) {

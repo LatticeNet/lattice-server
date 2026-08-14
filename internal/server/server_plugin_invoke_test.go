@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -429,7 +430,7 @@ func TestPluginSubscriptionMutationRejectsFetchAfterLastShareDeletion(t *testing
 	if err := st.UpsertSubscriptionShare(share); err != nil {
 		t.Fatal(err)
 	}
-	base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "base", FetchedAt: time.Now().UTC().Add(-time.Hour)}
+	base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "base", FetchedAt: time.Now().UTC()}
 	if err := st.UpsertSubscriptionSnapshot(base); err != nil {
 		t.Fatal(err)
 	}
@@ -488,6 +489,153 @@ func TestPluginSubscriptionMutationRejectsFetchAfterLastShareDeletion(t *testing
 	got, err := srv.snapshotFor(context.Background(), "p", "graph", false)
 	if err != nil || got.Raw != "after-mutation" || fetchCalls != 2 {
 		t.Fatalf("recreated share snapshot=%+v calls=%d err=%v", got, fetchCalls, err)
+	}
+}
+
+func TestPluginSubscriptionMutationPanicReleasesGate(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "before-panic", FetchedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSubscriptionShare(model.SubscriptionShare{ID: "active", Slug: "active", Token: strings.Repeat("a", 32), Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			panic("uncooperative plugin panic")
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invoke := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		return rec
+	}
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("plugin panic did not propagate to the HTTP recovery boundary")
+			}
+		}()
+		_ = invoke()
+	}()
+	if snapshot, ok := st.SubscriptionSnapshot("p", "graph"); !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" {
+		t.Fatalf("failed plugin mutation did not retain conservative stale authority: %+v ok=%v", snapshot, ok)
+	}
+	rec := invoke()
+	if rec.Code != http.StatusOK || calls != 2 {
+		t.Fatalf("mutation gate stranded after panic code=%d calls=%d body=%q", rec.Code, calls, rec.Body.String())
+	}
+	srv.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		return model.SubscriptionSnapshot{Raw: "after-success"}, nil
+	}
+	refreshed, err := srv.snapshotFor(context.Background(), "p", "graph", false)
+	if err != nil || refreshed.Raw != "after-success" || refreshed.Stale {
+		t.Fatalf("fresh pre-mutation snapshot was reused after successful mutation: %+v err=%v", refreshed, err)
+	}
+}
+
+func TestPluginSubscriptionMutationPersistenceFailurePreventsDispatch(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache:           newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		subscriptionMutationPersist: func(string, time.Time) (bool, error) { return false, errors.New("disk secret") }}
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		called = true
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	if rec.Code == http.StatusOK || called || strings.Contains(rec.Body.String(), "secret") {
+		t.Fatalf("persistence failure dispatched=%v code=%d body=%q", called, rec.Code, rec.Body.String())
+	}
+}
+
+func TestPluginSubscriptionMutationCanceledWhileQueuedDoesNotDispatch(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	started, release := make(chan struct{}), make(chan struct{})
+	calls := 0
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			close(started)
+			<-release // deliberately ignores the request context
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invoke := func(ctx context.Context) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`)).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		return rec
+	}
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- invoke(context.Background()) }()
+	<-started
+	waiting := make(chan struct{}, 1)
+	srv.subscriptionPluginGateWaiter = waiting
+	canceled, cancel := context.WithCancel(context.Background())
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { secondDone <- invoke(canceled) }()
+	<-waiting
+	cancel()
+	second := <-secondDone
+	if second.Code == http.StatusOK || calls != 1 {
+		t.Fatalf("canceled queued mutation code=%d calls=%d body=%q", second.Code, calls, second.Body.String())
+	}
+	close(release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first mutation code=%d body=%q", first.Code, first.Body.String())
+	}
+	third := invoke(context.Background())
+	if third.Code != http.StatusOK || calls != 2 {
+		t.Fatalf("gate did not recover code=%d calls=%d body=%q", third.Code, calls, third.Body.String())
 	}
 }
 

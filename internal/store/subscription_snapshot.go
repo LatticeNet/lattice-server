@@ -120,6 +120,55 @@ func (s *Store) SubscriptionSnapshots() []model.SubscriptionSnapshot {
 	return out
 }
 
+// MarkPluginSubscriptionSnapshotsStale invalidates every durable snapshot
+// owned by one plugin in one store transaction. It deliberately preserves the
+// last-good payload and provenance; the next access must fetch again before the
+// snapshot can become fresh authority.
+func (s *Store) MarkPluginSubscriptionSnapshotsStale(pluginID string, _ time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureMaps()
+	changed := make(map[string]model.SubscriptionSnapshot)
+	for key, current := range s.state.SubscriptionSnapshots {
+		if current.PluginID != pluginID {
+			continue
+		}
+		current.Stale = true
+		current.FetchError = "source_mutated"
+		// This is an authority invalidation, not a provider failure. Leave the
+		// retry timestamp empty so the next access immediately fetches the new
+		// plugin state rather than observing the outage backoff interval.
+		current.LastAttemptAt = time.Time{}
+		changed[key] = current
+	}
+	if len(changed) == 0 {
+		return true, nil
+	}
+	if s.runtimeBoltHot != nil {
+		if err := s.runtimeBoltHot.UpsertSubscriptionSnapshots(changed); err != nil {
+			return false, err
+		}
+		for key, snapshot := range changed {
+			s.state.SubscriptionSnapshots[key] = snapshot
+		}
+		return true, nil
+	}
+	staged := s.state
+	staged.SubscriptionSnapshots = make(map[string]model.SubscriptionSnapshot, len(s.state.SubscriptionSnapshots))
+	for key, current := range s.state.SubscriptionSnapshots {
+		if replacement, ok := changed[key]; ok {
+			staged.SubscriptionSnapshots[key] = replacement
+		} else {
+			staged.SubscriptionSnapshots[key] = current
+		}
+	}
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return committed, err
+}
+
 func (s *Store) DeleteSubscriptionSnapshot(pluginID, subscriptionID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

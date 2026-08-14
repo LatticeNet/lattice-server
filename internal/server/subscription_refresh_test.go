@@ -236,6 +236,25 @@ func TestSnapshotForRejectsFetchCapturedBeforePluginInvalidation(t *testing.T) {
 	}
 }
 
+func TestSubscriptionPluginGateHonorsCanceledWaiterAndRecovers(t *testing.T) {
+	s, _ := newShareTestServer(t)
+	_, release, err := s.acquireSubscriptionPluginGate(context.Background(), "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := s.acquireSubscriptionPluginGate(ctx, "p"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled queued acquire error=%v", err)
+	}
+	release()
+	_, releaseAgain, err := s.acquireSubscriptionPluginGate(context.Background(), "p")
+	if err != nil {
+		t.Fatalf("gate did not recover after canceled waiter: %v", err)
+	}
+	releaseAgain()
+}
+
 func TestSubscriptionRevalidationVersionKeepsLegacyHashPrivate(t *testing.T) {
 	graphA := model.SubscriptionSnapshot{Raw: "first", SourceVersion: "sv1:same"}
 	graphB := model.SubscriptionSnapshot{Raw: "changed", SourceVersion: "sv1:same"}

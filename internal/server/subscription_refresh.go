@@ -50,6 +50,7 @@ type subscriptionPublicationState struct {
 // may publish. Mutation handlers hold it across the plugin operation, so a
 // fetch cannot publish in the post-mutation/pre-invalidation scheduling gap.
 type subscriptionPluginMutationState struct {
+	gate       chan struct{}
 	mu         sync.Mutex
 	generation uint64
 }
@@ -95,26 +96,31 @@ func (s *Server) subscriptionPluginMutationStateFor(pluginID string) *subscripti
 	}
 	state := s.subscriptionPluginMutations[pluginID]
 	if state == nil {
-		state = &subscriptionPluginMutationState{}
+		state = &subscriptionPluginMutationState{gate: make(chan struct{}, 1)}
+		state.gate <- struct{}{}
 		s.subscriptionPluginMutations[pluginID] = state
 	}
 	return state
 }
 
-func (s *Server) beginSubscriptionPluginMutation(pluginID string) func(bool) {
+func (s *Server) acquireSubscriptionPluginGate(ctx context.Context, pluginID string) (*subscriptionPluginMutationState, func(), error) {
 	state := s.subscriptionPluginMutationStateFor(pluginID)
-	state.mu.Lock()
-	// Advancing before the operation invalidates every fetch that captured the
-	// old plugin authority. The mutex stays held until the operation completes,
-	// preventing a new fetch from capturing a half-mutated plugin store.
-	state.generation++
-	return func(committed bool) {
-		state.generation++
-		state.mu.Unlock()
-		if committed {
-			s.invalidateSharesForPlugin(pluginID)
+	if waiter := s.subscriptionPluginGateWaiter; waiter != nil {
+		select {
+		case waiter <- struct{}{}:
+		default:
 		}
 	}
+	select {
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	case <-state.gate:
+	}
+	if err := ctx.Err(); err != nil {
+		state.gate <- struct{}{}
+		return nil, nil, err
+	}
+	return state, func() { state.gate <- struct{}{} }, nil
 }
 
 // snapshotFor returns the content to render, refreshing it first when it is
@@ -203,7 +209,10 @@ func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscripti
 func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, error) {
 	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
 	publication := s.subscriptionPublicationStateFor(key)
-	pluginMutation := s.subscriptionPluginMutationStateFor(pluginID)
+	pluginMutation, releaseInitialPlugin, err := s.acquireSubscriptionPluginGate(ctx, pluginID)
+	if err != nil {
+		return model.SubscriptionSnapshot{}, err
+	}
 	pluginMutation.mu.Lock()
 	pluginGeneration := pluginMutation.generation
 	pluginMutation.mu.Unlock()
@@ -215,19 +224,28 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 	fetchEpoch := publication.epoch
 	publication.mu.Unlock()
 	if has && !existing.Stale && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval {
+		releaseInitialPlugin()
 		return existing, nil
 	}
 	if has && existing.Stale && !force && !existing.LastAttemptAt.IsZero() && s.now().Sub(existing.LastAttemptAt) < subscriptionStaleRetryInterval {
+		releaseInitialPlugin()
 		return existing, nil
 	}
+	releaseInitialPlugin()
 	fetch := s.fetchSubscriptionSource
 	if s.subscriptionFetch != nil {
 		fetch = s.subscriptionFetch
 	}
 	fetched, err := fetch(ctx, pluginID, subscriptionID)
+	pluginMutation, releasePlugin, gateErr := s.acquireSubscriptionPluginGate(ctx, pluginID)
+	if gateErr != nil {
+		return model.SubscriptionSnapshot{}, gateErr
+	}
+	defer releasePlugin()
 	pluginMutation.mu.Lock()
-	defer pluginMutation.mu.Unlock()
-	if pluginMutation.generation != pluginGeneration {
+	currentPluginGeneration := pluginMutation.generation
+	pluginMutation.mu.Unlock()
+	if currentPluginGeneration != pluginGeneration {
 		return model.SubscriptionSnapshot{}, errors.New("subscription plugin changed during refresh")
 	}
 	publication.mu.Lock()

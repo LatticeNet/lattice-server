@@ -168,6 +168,105 @@ func TestSubscriptionSnapshotPostRenameFailureReportsCommittedAndSurvivesRestart
 	}
 }
 
+func TestMarkPluginSubscriptionSnapshotsStaleIsAtomicAndSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	cipher := testCipher(t)
+	st, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshot := range []model.SubscriptionSnapshot{
+		{PluginID: "p", SubscriptionID: "one", Raw: "one", FetchedAt: time.Now().UTC()},
+		{PluginID: "p", SubscriptionID: "two", Raw: "two", FetchedAt: time.Now().UTC()},
+		{PluginID: "other", SubscriptionID: "one", Raw: "other", FetchedAt: time.Now().UTC()},
+	} {
+		if err := st.UpsertSubscriptionSnapshot(snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	committed, err := st.MarkPluginSubscriptionSnapshotsStale("p", time.Now())
+	if err != nil || !committed {
+		t.Fatalf("mark stale committed=%v err=%v", committed, err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for _, id := range []string{"one", "two"} {
+		snapshot, ok := reopened.SubscriptionSnapshot("p", id)
+		if !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" || !snapshot.LastAttemptAt.IsZero() {
+			t.Fatalf("reopened mutated snapshot %s=%+v ok=%v", id, snapshot, ok)
+		}
+	}
+	other, ok := reopened.SubscriptionSnapshot("other", "one")
+	if !ok || other.Stale || other.FetchError != "" {
+		t.Fatalf("unrelated snapshot changed: %+v ok=%v", other, ok)
+	}
+}
+
+func TestMarkPluginSubscriptionSnapshotsStaleReportsCommittedPostRename(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	cipher := testCipher(t)
+	st, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "fresh", FetchedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	st.syncParentDir = func(string) error { return errors.New("forced mutation post-rename failure") }
+	committed, err := st.MarkPluginSubscriptionSnapshotsStale("p", time.Now())
+	if !committed || err == nil || !strings.Contains(err.Error(), "forced mutation post-rename failure") {
+		t.Fatalf("mark stale committed=%v err=%v", committed, err)
+	}
+	if snapshot, ok := st.SubscriptionSnapshot("p", "s"); !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" {
+		t.Fatalf("committed live mutation authority=%+v ok=%v", snapshot, ok)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if snapshot, ok := reopened.SubscriptionSnapshot("p", "s"); !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" {
+		t.Fatalf("reopened mutation authority=%+v ok=%v", snapshot, ok)
+	}
+}
+
+func TestUpsertSubscriptionSnapshotsUsesOneBoltUpdate(t *testing.T) {
+	bs, err := OpenBoltState(filepath.Join(t.TempDir(), "state.db"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+	snapshots := map[string]model.SubscriptionSnapshot{
+		"p/one": {SchemaVersion: model.SubscriptionSnapshotSchemaVersion, PluginID: "p", SubscriptionID: "one", Raw: "one", Stale: true, FetchError: "source_mutated"},
+		"p/two": {SchemaVersion: model.SubscriptionSnapshotSchemaVersion, PluginID: "p", SubscriptionID: "two", Raw: "two", Stale: true, FetchError: "source_mutated"},
+	}
+	bs.testUpdateCalls = 0
+	if err := bs.UpsertSubscriptionSnapshots(snapshots); err != nil {
+		t.Fatal(err)
+	}
+	if bs.testUpdateCalls != 1 {
+		t.Fatalf("bulk snapshot updates=%d want=1", bs.testUpdateCalls)
+	}
+	state, err := bs.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key := range snapshots {
+		if got := state.SubscriptionSnapshots[key]; !got.Stale || got.FetchError != "source_mutated" {
+			t.Fatalf("bulk snapshot %s=%+v", key, got)
+		}
+	}
+}
+
 func TestEncryptedV1SubscriptionSnapshotRewritesAndReopensWithEmptyProvenance(t *testing.T) {
 	dir := t.TempDir()
 	cipher := testCipher(t)

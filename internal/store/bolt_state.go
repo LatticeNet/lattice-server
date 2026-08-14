@@ -2690,6 +2690,36 @@ func (bs *BoltStateStore) UpsertSubscriptionSnapshot(key string, snap model.Subs
 	})
 }
 
+func (bs *BoltStateStore) UpsertSubscriptionSnapshots(snapshots map[string]model.SubscriptionSnapshot) error {
+	validated := make(map[string]model.SubscriptionSnapshot, len(snapshots))
+	for key, snapshot := range snapshots {
+		cloned, err := validateCloneSubscriptionSnapshot(snapshot)
+		if err != nil {
+			return err
+		}
+		if want := model.SnapshotKey(cloned.PluginID, cloned.SubscriptionID); key != want {
+			return fmt.Errorf("subscription snapshot key %q does not match identity %q", key, want)
+		}
+		validated[key] = cloned
+	}
+	bs.testUpdateCalls++
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		for key, snapshot := range validated {
+			enc, err := encryptSubscriptionSnapshotRecord(key, snapshot, bs.cipher)
+			if err != nil {
+				return err
+			}
+			if err := putRecord(tx, boltBucketSubSnapshots, key, enc); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (bs *BoltStateStore) DeleteSubscriptionSnapshot(key string) error {
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {

@@ -242,9 +242,48 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	err = nil
 	mutatingSubscriptionStore := req.Service == req.ID+"/subscription" &&
 		(req.Method == "save" || req.Method == "delete" || req.Method == "import" || req.Method == "migrate")
-	finishSubscriptionMutation := func(bool) {}
+	finishSubscriptionMutation := func() {}
 	if mutatingSubscriptionStore {
-		finishSubscriptionMutation = s.beginSubscriptionPluginMutation(req.ID)
+		mutationState, releaseMutation, acquireErr := s.acquireSubscriptionPluginGate(ctx, req.ID)
+		if acquireErr != nil {
+			s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", "subscription mutation canceled")
+			writeError(w, http.StatusGatewayTimeout, errors.New("subscription mutation canceled"))
+			return
+		}
+		finished := false
+		finishSubscriptionMutation = func() {
+			if finished {
+				return
+			}
+			finished = true
+			mutationState.mu.Lock()
+			mutationState.generation++
+			mutationState.mu.Unlock()
+			releaseMutation()
+		}
+		defer finishSubscriptionMutation()
+		persistMutation := s.store.MarkPluginSubscriptionSnapshotsStale
+		if s.subscriptionMutationPersist != nil {
+			persistMutation = s.subscriptionMutationPersist
+		}
+		committed, persistErr := persistMutation(req.ID, s.now())
+		if committed {
+			mutationState.mu.Lock()
+			mutationState.generation++
+			mutationState.mu.Unlock()
+			s.invalidateSharesForPlugin(req.ID)
+		}
+		if persistErr != nil {
+			finishSubscriptionMutation()
+			s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", "subscription mutation authority persistence failed")
+			writeError(w, http.StatusBadGateway, errors.New("subscription mutation authority persistence failed"))
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			finishSubscriptionMutation()
+			writeError(w, http.StatusGatewayTimeout, errors.New("subscription mutation canceled"))
+			return
+		}
 	}
 	switch {
 	case loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2:
@@ -257,7 +296,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil, nil)
 		}
 	}
-	finishSubscriptionMutation(err == nil)
+	finishSubscriptionMutation()
 	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
 		var operationErr *pluginOperationError

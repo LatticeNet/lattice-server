@@ -22,10 +22,18 @@ import (
 // not, and nothing depends on the difference except the moment a fetch happens.
 const subscriptionRefreshInterval = 30 * time.Minute
 
+// subscriptionStaleRetryInterval prevents a provider outage from turning
+// sequential client polls into one completed runtime invocation each. Force
+// bypasses it for explicit operator refresh; normal traffic retries promptly
+// enough to observe recovery without waiting for the freshness interval.
+const subscriptionStaleRetryInterval = 30 * time.Second
+const subscriptionRefreshTimeout = 30 * time.Second
+
 const auditActionSubscriptionFetch = "subscription.source.fetch"
 
 type subscriptionRefreshFlight struct {
 	done     chan struct{}
+	force    bool
 	snapshot model.SubscriptionSnapshot
 	err      error
 }
@@ -57,10 +65,24 @@ func (s *Server) persistSubscriptionSnapshot(snapshot model.SubscriptionSnapshot
 // recorded on it. A provider being down must not take a client's configuration
 // with it - that is the behaviour upstream implements as ignore-failed-remote-sub.
 func (s *Server) snapshotFor(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, error) {
+	for {
+		snapshot, joinedNonForce, err := s.snapshotForGeneration(ctx, pluginID, subscriptionID, force)
+		if err != nil || !joinedNonForce {
+			return snapshot, err
+		}
+		// A force request that joined a normal in-flight refresh still owns an
+		// explicit forced generation after that flight completes.
+	}
+}
+
+func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, bool, error) {
 	existing, has := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
 	fresh := has && !existing.Stale && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval
 	if fresh {
-		return existing, nil
+		return existing, false, nil
+	}
+	if has && existing.Stale && !force && !existing.LastAttemptAt.IsZero() && s.now().Sub(existing.LastAttemptAt) < subscriptionStaleRetryInterval {
+		return existing, false, nil
 	}
 	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
 	s.subscriptionRefreshMu.Lock()
@@ -68,24 +90,40 @@ func (s *Server) snapshotFor(ctx context.Context, pluginID, subscriptionID strin
 		s.subscriptionRefreshFlights = make(map[subscriptionRefreshKey]*subscriptionRefreshFlight)
 	}
 	if flight := s.subscriptionRefreshFlights[key]; flight != nil {
-		joined := s.subscriptionRefreshJoined
+		joinedNonForce := force && !flight.force
+		waiter := s.subscriptionRefreshWaiter
 		s.subscriptionRefreshMu.Unlock()
-		if joined != nil {
-			joined()
+		if waiter != nil {
+			select {
+			case waiter <- struct{}{}:
+			default:
+			}
 		}
-		<-flight.done
-		return flight.snapshot.Clone(), flight.err
+		select {
+		case <-flight.done:
+			return flight.snapshot.Clone(), joinedNonForce, flight.err
+		case <-ctx.Done():
+			return model.SubscriptionSnapshot{}, false, ctx.Err()
+		}
 	}
-	flight := &subscriptionRefreshFlight{done: make(chan struct{})}
+	flight := &subscriptionRefreshFlight{done: make(chan struct{}), force: force}
 	s.subscriptionRefreshFlights[key] = flight
 	s.subscriptionRefreshMu.Unlock()
-
-	flight.snapshot, flight.err = s.refreshSubscriptionSnapshot(ctx, pluginID, subscriptionID, force)
-	s.subscriptionRefreshMu.Lock()
-	delete(s.subscriptionRefreshFlights, key)
-	close(flight.done)
-	s.subscriptionRefreshMu.Unlock()
-	return flight.snapshot.Clone(), flight.err
+	go func() {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), subscriptionRefreshTimeout)
+		defer cancel()
+		flight.snapshot, flight.err = s.refreshSubscriptionSnapshot(refreshCtx, pluginID, subscriptionID, force)
+		s.subscriptionRefreshMu.Lock()
+		delete(s.subscriptionRefreshFlights, key)
+		close(flight.done)
+		s.subscriptionRefreshMu.Unlock()
+	}()
+	select {
+	case <-flight.done:
+		return flight.snapshot.Clone(), false, flight.err
+	case <-ctx.Done():
+		return model.SubscriptionSnapshot{}, false, ctx.Err()
+	}
 }
 
 func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, error) {
@@ -94,6 +132,9 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 	// behind another refresh cannot overwrite the newer result it just observed.
 	existing, has := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
 	if has && !existing.Stale && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval {
+		return existing, nil
+	}
+	if has && existing.Stale && !force && !existing.LastAttemptAt.IsZero() && s.now().Sub(existing.LastAttemptAt) < subscriptionStaleRetryInterval {
 		return existing, nil
 	}
 	fetch := s.fetchSubscriptionSource
@@ -105,14 +146,20 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 		if !has {
 			// Nothing to fall back to. Returning the error keeps the caller from
 			// serving an empty body, which is the response that wipes a client.
-			return model.SubscriptionSnapshot{}, fmt.Errorf("fetch subscription %s/%s: %w", pluginID, subscriptionID, err)
+			s.logger.Printf("subscription snapshot: provider fetch failed for %s/%s (%s)", pluginID, subscriptionID, subscriptionDiagnosticSummary(err))
+			return model.SubscriptionSnapshot{}, fmt.Errorf("subscription provider fetch failed for %s/%s", pluginID, subscriptionID)
 		}
-		existing.FetchError = err.Error()
+		s.logger.Printf("subscription snapshot: provider fetch failed for %s/%s; preserving last-good (%s)", pluginID, subscriptionID, subscriptionDiagnosticSummary(err))
+		existing.FetchError = "provider_fetch_failed"
 		existing.LastAttemptAt = s.now()
 		existing.Stale = true
+		s.subscriptionRefreshMu.Lock()
 		if storeErr := s.persistSubscriptionSnapshot(existing); storeErr != nil {
+			s.subscriptionRefreshMu.Unlock()
 			return model.SubscriptionSnapshot{}, fmt.Errorf("persist stale subscription %s/%s: %w", pluginID, subscriptionID, storeErr)
 		}
+		s.bumpSubscriptionSourceEpochLocked(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
+		s.subscriptionRefreshMu.Unlock()
 		// Stale is snapshot authority, not one render variant's cache metadata.
 		// Drop every share/format/UA entry sourcing this snapshot so no sibling
 		// cache can continue advertising a fresh response after the durable
@@ -140,9 +187,13 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 	fetched.LastAttemptAt = fetched.FetchedAt
 	fetched.FetchError = ""
 	fetched.Stale = false
+	s.subscriptionRefreshMu.Lock()
 	if err := s.persistSubscriptionSnapshot(fetched); err != nil {
+		s.subscriptionRefreshMu.Unlock()
 		return model.SubscriptionSnapshot{}, err
 	}
+	s.bumpSubscriptionSourceEpochLocked(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
+	s.subscriptionRefreshMu.Unlock()
 	// The content moved: any rendered body cached for a share sourcing this
 	// record is now stale, no matter how much TTL it had left. Without this the
 	// revalidation cadence, not the content, would decide what clients get.
@@ -161,6 +212,36 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 		Metadata: metadata,
 	})
 	return fetched, nil
+}
+
+func (s *Server) bumpSubscriptionSourceEpochLocked(key subscriptionRefreshKey) {
+	if s.subscriptionSourceEpochs == nil {
+		s.subscriptionSourceEpochs = make(map[subscriptionRefreshKey]uint64)
+	}
+	s.subscriptionSourceEpochs[key]++
+}
+
+func (s *Server) subscriptionSnapshotEpoch(pluginID, subscriptionID string, snapshot model.SubscriptionSnapshot) (uint64, bool) {
+	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
+	s.subscriptionRefreshMu.Lock()
+	defer s.subscriptionRefreshMu.Unlock()
+	current, ok := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
+	if !ok || current.Raw != snapshot.Raw || current.Userinfo != snapshot.Userinfo || current.SourceVersion != snapshot.SourceVersion ||
+		current.Stale != snapshot.Stale || current.FetchedAt != snapshot.FetchedAt || current.LastAttemptAt != snapshot.LastAttemptAt {
+		return 0, false
+	}
+	return s.subscriptionSourceEpochs[key], true
+}
+
+func (s *Server) putSubscriptionCacheForSource(key subscriptionCacheKey, pluginID, subscriptionID string, expectedEpoch uint64, entry subscriptionCacheEntry, now time.Time) bool {
+	sourceKey := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
+	s.subscriptionRefreshMu.Lock()
+	defer s.subscriptionRefreshMu.Unlock()
+	if s.subscriptionSourceEpochs[sourceKey] != expectedEpoch {
+		return false
+	}
+	s.subscriptionCache.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion, entry.publicSourceVersion, entry.stale, entry.fetchedAt, now)
+	return true
 }
 
 // fetchSubscriptionSource asks the plugin to retrieve the provider's current

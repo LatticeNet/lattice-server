@@ -206,12 +206,14 @@ type Server struct {
 	subscriptionCache *subscriptionCache
 	// subscriptionSnapshotPersist is a narrow persistence seam for exercising
 	// fail-closed last-good transitions. Production always falls back to Store.
-	subscriptionSnapshotPersist func(model.SubscriptionSnapshot) error
-	subscriptionFetch           func(context.Context, string, string) (model.SubscriptionSnapshot, error)
-	subscriptionRefreshMu       sync.Mutex
-	subscriptionRefreshFlights  map[subscriptionRefreshKey]*subscriptionRefreshFlight
-	subscriptionRefreshJoined   func()
-	subscriptionRender          func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
+	subscriptionSnapshotPersist   func(model.SubscriptionSnapshot) error
+	subscriptionFetch             func(context.Context, string, string) (model.SubscriptionSnapshot, error)
+	subscriptionRefreshMu         sync.Mutex
+	subscriptionRefreshFlights    map[subscriptionRefreshKey]*subscriptionRefreshFlight
+	subscriptionSourceEpochs      map[subscriptionRefreshKey]uint64
+	subscriptionRefreshWaiter     chan<- struct{}
+	subscriptionRender            func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
+	subscriptionBeforeCacheExtend func()
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First

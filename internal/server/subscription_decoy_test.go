@@ -93,9 +93,10 @@ func TestEverySubscriptionRejectionIsByteIdentical(t *testing.T) {
 	}
 }
 
-// The response says nothing, so the audit log has to say everything - otherwise
-// the operator has no way to find out why their own subscription stopped working.
-func TestRejectionsAreStillAuditedWithTheRealReason(t *testing.T) {
+// The response says nothing, so the audit log records a stable operational
+// class. It deliberately excludes the untrusted provider/plugin diagnostic,
+// which can contain subscription credentials.
+func TestRejectionsAreAuditedWithAStableSecretFreeReason(t *testing.T) {
 	s, st := newShareTestServer(t)
 	valid := strings.Repeat("a", 32)
 	mustUpsertShare(t, st, model.SubscriptionShare{
@@ -116,8 +117,8 @@ func TestRejectionsAreStillAuditedWithTheRealReason(t *testing.T) {
 		t.Fatal("a rejection was not audited; the operator would have no way to diagnose it")
 	}
 	joined := strings.Join(reasons, "|")
-	if !strings.Contains(joined, "render failed") && !strings.Contains(joined, "empty render") {
-		t.Fatalf("the audit does not name the real reason: %v", reasons)
+	if !strings.Contains(joined, "subscription_render_failed") && !strings.Contains(joined, "empty render") {
+		t.Fatalf("the audit does not name a stable operational class: %v", reasons)
 	}
 	for _, ev := range st.AuditEvents() {
 		for _, v := range ev.Metadata {

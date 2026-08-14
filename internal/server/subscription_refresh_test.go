@@ -128,7 +128,8 @@ func TestSnapshotForNeverAuditsLegacyRawDerivedVersion(t *testing.T) {
 
 func TestSnapshotForRetriesRecentStaleAndClearsOnRecovery(t *testing.T) {
 	s, st := newShareTestServer(t)
-	now := s.now()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	s.now = func() time.Time { return now }
 	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s1", Raw: "last-good", FetchedAt: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +145,11 @@ func TestSnapshotForRetriesRecentStaleAndClearsOnRecovery(t *testing.T) {
 		calls++
 		return model.SubscriptionSnapshot{Raw: "recovered"}, nil
 	}
+	withinWindow, err := s.snapshotFor(context.Background(), "p", "s1", false)
+	if err != nil || !withinWindow.Stale || withinWindow.Raw != "last-good" || calls != 0 {
+		t.Fatalf("within-window retry = %+v calls=%d err=%v", withinWindow, calls, err)
+	}
+	now = now.Add(subscriptionStaleRetryInterval + time.Second)
 	recovered, err := s.snapshotFor(context.Background(), "p", "s1", false)
 	if err != nil || recovered.Stale || recovered.Raw != "recovered" || calls != 1 {
 		t.Fatalf("recovery = %+v calls=%d err=%v", recovered, calls, err)
@@ -152,7 +158,8 @@ func TestSnapshotForRetriesRecentStaleAndClearsOnRecovery(t *testing.T) {
 
 func TestSnapshotForPropagatesStaleAndRecoveryAcrossSourceCaches(t *testing.T) {
 	s, st := newShareTestServer(t)
-	now := s.now()
+	now := time.Unix(1_700_000_000, 0).UTC()
+	s.now = func() time.Time { return now }
 	for _, share := range []model.SubscriptionShare{
 		{ID: "s1", Slug: "one", Token: strings.Repeat("a", 32), Enabled: true, Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}},
 		{ID: "s2", Slug: "two", Token: strings.Repeat("b", 32), Enabled: true, Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}},
@@ -193,6 +200,7 @@ func TestSnapshotForPropagatesStaleAndRecoveryAcrossSourceCaches(t *testing.T) {
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
 		return model.SubscriptionSnapshot{Raw: "last-good", Userinfo: "upload=2"}, nil
 	}
+	now = now.Add(subscriptionStaleRetryInterval + time.Second)
 	if got, err := s.snapshotFor(context.Background(), "p", "graph", false); err != nil || got.Stale {
 		t.Fatalf("recovery = %+v err=%v", got, err)
 	}
@@ -208,8 +216,9 @@ func TestSnapshotForCoalescesConcurrentStaleRequestsToOneExactResult(t *testing.
 	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "old", FetchedAt: s.now().Add(-time.Hour), Stale: true}); err != nil {
 		t.Fatal(err)
 	}
-	started, joined, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	s.subscriptionRefreshJoined = func() { close(joined) }
+	started, release := make(chan struct{}), make(chan struct{})
+	joined := make(chan struct{}, 1)
+	s.subscriptionRefreshWaiter = joined
 	calls := 0
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
 		calls++
@@ -245,8 +254,9 @@ func TestSnapshotForCoalescesConcurrentStaleRequestsToOneExactResult(t *testing.
 
 func TestSnapshotForCoalescesConcurrentColdFailureToOneExactError(t *testing.T) {
 	s, _ := newShareTestServer(t)
-	started, joined, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	s.subscriptionRefreshJoined = func() { close(joined) }
+	started, release := make(chan struct{}), make(chan struct{})
+	joined := make(chan struct{}, 1)
+	s.subscriptionRefreshWaiter = joined
 	calls := 0
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
 		calls++
@@ -266,13 +276,87 @@ func TestSnapshotForCoalescesConcurrentColdFailureToOneExactError(t *testing.T) 
 	}
 }
 
+func TestSnapshotForCanceledOwnerDoesNotCancelSharedRefreshOrPersistStale(t *testing.T) {
+	s, st := newShareTestServer(t)
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "old", FetchedAt: s.now().Add(-time.Hour), Stale: true}); err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	joined := make(chan struct{}, 1)
+	s.subscriptionRefreshWaiter = joined
+	s.subscriptionFetch = func(ctx context.Context, _, _ string) (model.SubscriptionSnapshot, error) {
+		close(started)
+		select {
+		case <-release:
+			return model.SubscriptionSnapshot{Raw: "healthy"}, nil
+		case <-ctx.Done():
+			return model.SubscriptionSnapshot{}, ctx.Err()
+		}
+	}
+	ownerCtx, cancelOwner := context.WithCancel(context.Background())
+	ownerResult := make(chan error, 1)
+	go func() { _, err := s.snapshotFor(ownerCtx, "p", "s", false); ownerResult <- err }()
+	<-started
+	healthyResult := make(chan error, 1)
+	go func() {
+		snap, err := s.snapshotFor(context.Background(), "p", "s", false)
+		if err == nil && snap.Raw != "healthy" {
+			err = fmt.Errorf("raw=%q", snap.Raw)
+		}
+		healthyResult <- err
+	}()
+	<-joined
+	cancelOwner()
+	if err := <-ownerResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("owner cancellation = %v", err)
+	}
+	close(release)
+	if err := <-healthyResult; err != nil {
+		t.Fatal(err)
+	}
+	stored, _ := st.SubscriptionSnapshot("p", "s")
+	if stored.Raw != "healthy" || stored.Stale || stored.FetchError != "" {
+		t.Fatalf("caller cancellation poisoned durable authority: %+v", stored)
+	}
+}
+
+func TestSnapshotForForceJoiningNormalStartsForcedGeneration(t *testing.T) {
+	s, _ := newShareTestServer(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	joined := make(chan struct{}, 1)
+	s.subscriptionRefreshWaiter = joined
+	calls := 0
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		calls++
+		if calls == 1 {
+			close(started)
+			<-release
+		}
+		return model.SubscriptionSnapshot{Raw: fmt.Sprintf("generation-%d", calls)}, nil
+	}
+	normal := make(chan error, 1)
+	go func() { _, err := s.snapshotFor(context.Background(), "p", "s", false); normal <- err }()
+	<-started
+	forced := make(chan model.SubscriptionSnapshot, 1)
+	go func() { snap, _ := s.snapshotFor(context.Background(), "p", "s", true); forced <- snap }()
+	<-joined
+	close(release)
+	if err := <-normal; err != nil {
+		t.Fatal(err)
+	}
+	if got := <-forced; calls != 2 || got.Raw != "generation-2" {
+		t.Fatalf("force joined without new generation: calls=%d snapshot=%+v", calls, got)
+	}
+}
+
 func TestSnapshotForRecoveredSuccessCannotBeOverwrittenByLateFailure(t *testing.T) {
 	s, st := newShareTestServer(t)
 	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "old", FetchedAt: s.now().Add(-time.Hour), Stale: true}); err != nil {
 		t.Fatal(err)
 	}
-	started, joined, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	s.subscriptionRefreshJoined = func() { close(joined) }
+	started, release := make(chan struct{}), make(chan struct{})
+	joined := make(chan struct{}, 1)
+	s.subscriptionRefreshWaiter = joined
 	var mu sync.Mutex
 	calls := 0
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {

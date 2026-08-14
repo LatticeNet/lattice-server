@@ -175,14 +175,12 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 				// attempt had been durably recorded.
 				cached = false
 			case subscriptionRevalidationVersion(snap) == stale.revalidationVersion:
+				if s.subscriptionBeforeCacheExtend != nil {
+					s.subscriptionBeforeCacheExtend()
+				}
 				if !s.subscriptionCache.ExtendSnapshot(key, stale.revision, snap.Userinfo, snap.SourceVersion, snap.Stale, snap.FetchedAt, s.now()) {
-					if _, replaced := s.subscriptionCache.GetStale(key); replaced {
-						cached = false
-						break
-					}
-					// A source-wide stale/recovery transition deliberately invalidates
-					// this entry. The captured body is still exact for the matching
-					// revalidation version; serve it once with current snapshot metadata.
+					cached = false
+					break
 				}
 				body, contentType, userinfo, cached = stale.body, stale.contentType, snap.Userinfo, true
 				staleResponse, sourceVersion, snapshotFetchedAt = snap.Stale, snap.SourceVersion, snap.FetchedAt
@@ -190,21 +188,50 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	if !cached {
-		rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass)
-		if renderErr != nil {
-			deny("render failed: "+renderErr.Error(), map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+		// Plugin rendering races durable source transitions. A rejected epoch is
+		// not merely a cache miss: its body was rendered from superseded authority
+		// and therefore must not escape in the current response either. Re-capture
+		// and render once more; sustained churn fails closed instead of serving a
+		// body whose source transition already committed.
+		attempts := 1
+		if share.Source.Kind == model.ShareSourcePlugin {
+			attempts = 2
+		}
+		accepted := false
+		for attempt := 0; attempt < attempts; attempt++ {
+			rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass)
+			if renderErr != nil {
+				s.logger.Printf("subscription share: render failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(renderErr))
+				deny("subscription_render_failed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+				return
+			}
+			// A client that receives an empty but successful subscription deletes
+			// every node it had. Answering with the decoy keeps that from happening
+			// AND keeps the emptiness from confirming that the token was real.
+			if len(rendered.Body) == 0 {
+				deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+				return
+			}
+			entry := subscriptionCacheEntry{body: rendered.Body, contentType: rendered.ContentType, userinfo: rendered.Userinfo,
+				revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
+				stale: rendered.Stale, fetchedAt: rendered.FetchedAt}
+			if share.Source.Kind == model.ShareSourcePlugin &&
+				!s.putSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, rendered.SourceEpoch, entry, s.now()) {
+				continue
+			}
+			if share.Source.Kind != model.ShareSourcePlugin {
+				s.subscriptionCache.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion,
+					entry.publicSourceVersion, entry.stale, entry.fetchedAt, s.now())
+			}
+			body, contentType, userinfo = rendered.Body, rendered.ContentType, rendered.Userinfo
+			staleResponse, sourceVersion, snapshotFetchedAt = rendered.Stale, rendered.SourceVersion, rendered.FetchedAt
+			accepted = true
+			break
+		}
+		if !accepted {
+			deny("subscription_source_changed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
-		body, contentType, userinfo = rendered.Body, rendered.ContentType, rendered.Userinfo
-		staleResponse, sourceVersion, snapshotFetchedAt = rendered.Stale, rendered.SourceVersion, rendered.FetchedAt
-		// A client that receives an empty but successful subscription deletes
-		// every node it had. Answering with the decoy keeps that from happening
-		// AND keeps the emptiness from confirming that the token was real.
-		if len(body) == 0 {
-			deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
-			return
-		}
-		s.subscriptionCache.PutSnapshot(key, body, contentType, userinfo, rendered.RevalidationVersion, sourceVersion, staleResponse, snapshotFetchedAt, s.now())
 	}
 
 	if contentType == "" {
@@ -231,6 +258,23 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
 		Metadata: metadata,
 	})
+}
+
+// subscriptionDiagnosticSummary gives protected runtime logs a bounded
+// classification without copying or deriving content from an untrusted
+// plugin/provider diagnostic (which can contain low-entropy credentials, URIs,
+// keys, or arbitrarily large text) into logs, durable state, or audit evidence.
+func subscriptionDiagnosticSummary(err error) string {
+	if err == nil {
+		return "class=nil bytes=0"
+	}
+	text := err.Error()
+	const maxReportedDiagnosticBytes = 1 << 20
+	bytes := len(text)
+	if bytes > maxReportedDiagnosticBytes {
+		bytes = maxReportedDiagnosticBytes
+	}
+	return fmt.Sprintf("class=%T bytes<=%d", err, bytes)
 }
 
 func snapshotAgeSeconds(now, fetchedAt time.Time) string {
@@ -293,8 +337,14 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		if err != nil {
 			return renderedSubscription{}, err
 		}
+		epoch, current := s.subscriptionSnapshotEpoch(share.Source.PluginID, share.Source.SubscriptionID, snap)
+		if !current {
+			return renderedSubscription{}, errors.New("subscription source changed during render capture")
+		}
 		if s.subscriptionRender != nil {
-			return s.subscriptionRender(ctx, share, format, uaClass, snap)
+			rendered, err := s.subscriptionRender(ctx, share, format, uaClass, snap)
+			rendered.SourceEpoch = epoch
+			return rendered, err
 		}
 		payload, err := json.Marshal(map[string]string{
 			"subscription_id": share.Source.SubscriptionID,
@@ -321,7 +371,7 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		// The provider's traffic figures are passed through verbatim so the
 		// client's remaining-quota display stays truthful.
 		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Userinfo: snap.Userinfo,
-			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, FetchedAt: snap.FetchedAt}, nil
+			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
@@ -336,5 +386,6 @@ type renderedSubscription struct {
 	Stale               bool
 	RevalidationVersion string
 	SourceVersion       string
+	SourceEpoch         uint64
 	FetchedAt           time.Time
 }

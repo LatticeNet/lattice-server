@@ -1,12 +1,35 @@
 package server
 
 import (
+	"context"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
+
+func TestManualSubscriptionRefreshInvalidatesEverySiblingShare(t *testing.T) {
+	s, st := newShareTestServer(t)
+	shares := []model.SubscriptionShare{
+		{ID: "s1", Slug: "one", Token: strings.Repeat("a", 32), Enabled: true, Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "shared"}},
+		{ID: "s2", Slug: "two", Token: strings.Repeat("b", 32), Enabled: true, Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "shared"}},
+	}
+	for _, share := range shares {
+		mustUpsertShare(t, st, share)
+		s.subscriptionCache.Put(shareCacheKey(share.ID), []byte("cached"), "text/plain", "", "v", s.now())
+	}
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		return model.SubscriptionSnapshot{Raw: "fresh"}, nil
+	}
+	rec := httptest.NewRecorder()
+	s.refreshSubscriptionShare(rec, httptest.NewRequest("POST", "/", nil), shares[0], principal{})
+	for _, share := range shares {
+		if _, ok := s.subscriptionCache.GetStale(shareCacheKey(share.ID)); ok {
+			t.Fatalf("manual refresh left sibling cache %s", share.ID)
+		}
+	}
+}
 
 func mustCreateShare(t *testing.T, s *Server) model.SubscriptionShare {
 	t.Helper()

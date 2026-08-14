@@ -211,6 +211,7 @@ type Server struct {
 	subscriptionRefreshMu         sync.Mutex
 	subscriptionRefreshFlights    map[subscriptionRefreshKey]*subscriptionRefreshFlight
 	subscriptionPublicationStates map[subscriptionRefreshKey]*subscriptionPublicationState
+	subscriptionPluginMutations   map[string]*subscriptionPluginMutationState
 	subscriptionRefreshWaiter     chan<- struct{}
 	subscriptionRender            func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
 	subscriptionBeforeCacheExtend func()

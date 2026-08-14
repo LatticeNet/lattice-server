@@ -618,6 +618,65 @@ func TestSubscriptionShareCacheHitCannotObservePartialSourcePublication(t *testi
 	}
 }
 
+func TestSubscriptionShareRefreshPersistenceErrorsAreTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		fetchErr  bool
+		committed bool
+		wantRaw   string
+		wantStale bool
+	}{
+		{name: "committed success durability error", committed: true, wantRaw: "new"},
+		{name: "committed stale durability error", fetchErr: true, committed: true, wantRaw: "old", wantStale: true},
+		{name: "uncommitted persistence error", wantRaw: "old"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, st := newShareTestServer(t)
+			token := strings.Repeat("a", 32)
+			share := model.SubscriptionShare{ID: "share", Slug: "share", Token: token, Enabled: true, DefaultFormat: "plain",
+				Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}
+			mustUpsertShare(t, st, share)
+			base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "old", FetchedAt: s.now().Add(-time.Hour)}
+			if err := st.UpsertSubscriptionSnapshot(base); err != nil {
+				t.Fatal(err)
+			}
+			key := subscriptionCacheKey{ShareID: "share", Format: "plain", UAClass: "surge"}
+			s.subscriptionCache.PutSnapshot(key, []byte("authoritative-body-must-not-escape"), "text/plain", "", subscriptionRevalidationVersion(base), "", false, base.FetchedAt, s.now().Add(-subscriptionCacheTTL-time.Second))
+			s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+				if tc.fetchErr {
+					return model.SubscriptionSnapshot{}, errors.New("provider secret must not escape")
+				}
+				return model.SubscriptionSnapshot{Raw: "new"}, nil
+			}
+			s.subscriptionSnapshotPersist = func(snapshot model.SubscriptionSnapshot) (bool, error) {
+				if tc.committed {
+					if err := st.UpsertSubscriptionSnapshot(snapshot); err != nil {
+						return false, err
+					}
+				}
+				return tc.committed, errors.New("durability secret must not escape")
+			}
+			rec := httptest.NewRecorder()
+			s.handleSubscriptionShare(rec, shareRequest("/sub/share/"+token+"?format=plain", "Surge/2000"))
+			if rec.Code == http.StatusOK || strings.Contains(rec.Body.String(), "authoritative-body-must-not-escape") || strings.Contains(rec.Body.String(), "secret") {
+				t.Fatalf("refresh error escaped as success code=%d body=%q", rec.Code, rec.Body.String())
+			}
+			if _, ok := s.subscriptionCache.GetStale(key); ok {
+				t.Fatal("refresh error left a response cache entry")
+			}
+			stored, ok := st.SubscriptionSnapshot("p", "graph")
+			if !ok || stored.Raw != tc.wantRaw || stored.Stale != tc.wantStale {
+				t.Fatalf("durable authority=%+v ok=%v", stored, ok)
+			}
+			for _, event := range st.AuditEvents() {
+				if strings.Contains(event.Reason+fmt.Sprint(event.Metadata), "secret") {
+					t.Fatalf("refresh diagnostic reached audit: %+v", event)
+				}
+			}
+		})
+	}
+}
+
 func TestSubscriptionShareRevalidationCannotExtendAcrossPartialSourcePublication(t *testing.T) {
 	s, st := newShareTestServer(t)
 	token := strings.Repeat("a", 32)

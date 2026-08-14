@@ -44,6 +44,16 @@ type subscriptionPublicationState struct {
 	epoch uint64
 }
 
+// subscriptionPluginMutationState brackets subscription-store mutations with
+// every provider fetch for the same plugin. A fetch runs without holding this
+// mutex, but must re-acquire it and prove the generation is unchanged before it
+// may publish. Mutation handlers hold it across the plugin operation, so a
+// fetch cannot publish in the post-mutation/pre-invalidation scheduling gap.
+type subscriptionPluginMutationState struct {
+	mu         sync.Mutex
+	generation uint64
+}
+
 type subscriptionRefreshKey struct {
 	pluginID       string
 	subscriptionID string
@@ -75,6 +85,36 @@ func (s *Server) subscriptionPublicationStateFor(key subscriptionRefreshKey) *su
 		s.subscriptionPublicationStates[key] = state
 	}
 	return state
+}
+
+func (s *Server) subscriptionPluginMutationStateFor(pluginID string) *subscriptionPluginMutationState {
+	s.subscriptionRefreshMu.Lock()
+	defer s.subscriptionRefreshMu.Unlock()
+	if s.subscriptionPluginMutations == nil {
+		s.subscriptionPluginMutations = make(map[string]*subscriptionPluginMutationState)
+	}
+	state := s.subscriptionPluginMutations[pluginID]
+	if state == nil {
+		state = &subscriptionPluginMutationState{}
+		s.subscriptionPluginMutations[pluginID] = state
+	}
+	return state
+}
+
+func (s *Server) beginSubscriptionPluginMutation(pluginID string) func(bool) {
+	state := s.subscriptionPluginMutationStateFor(pluginID)
+	state.mu.Lock()
+	// Advancing before the operation invalidates every fetch that captured the
+	// old plugin authority. The mutex stays held until the operation completes,
+	// preventing a new fetch from capturing a half-mutated plugin store.
+	state.generation++
+	return func(committed bool) {
+		state.generation++
+		state.mu.Unlock()
+		if committed {
+			s.invalidateSharesForPlugin(pluginID)
+		}
+	}
 }
 
 // snapshotFor returns the content to render, refreshing it first when it is
@@ -163,6 +203,10 @@ func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscripti
 func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, error) {
 	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
 	publication := s.subscriptionPublicationStateFor(key)
+	pluginMutation := s.subscriptionPluginMutationStateFor(pluginID)
+	pluginMutation.mu.Lock()
+	pluginGeneration := pluginMutation.generation
+	pluginMutation.mu.Unlock()
 	// Re-read only after owning the source flight. This is the current durable
 	// authority all fetch outcomes compare against, so a caller that queued
 	// behind another refresh cannot overwrite the newer result it just observed.
@@ -181,6 +225,11 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 		fetch = s.subscriptionFetch
 	}
 	fetched, err := fetch(ctx, pluginID, subscriptionID)
+	pluginMutation.mu.Lock()
+	defer pluginMutation.mu.Unlock()
+	if pluginMutation.generation != pluginGeneration {
+		return model.SubscriptionSnapshot{}, errors.New("subscription plugin changed during refresh")
+	}
 	publication.mu.Lock()
 	defer publication.mu.Unlock()
 	if publication.epoch != fetchEpoch {

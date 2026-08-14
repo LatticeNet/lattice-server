@@ -240,6 +240,12 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	loaded, loadedOK := s.loadedPlugin(req.ID)
 	var out []byte
 	err = nil
+	mutatingSubscriptionStore := req.Service == req.ID+"/subscription" &&
+		(req.Method == "save" || req.Method == "delete" || req.Method == "import" || req.Method == "migrate")
+	finishSubscriptionMutation := func(bool) {}
+	if mutatingSubscriptionStore {
+		finishSubscriptionMutation = s.beginSubscriptionPluginMutation(req.ID)
+	}
 	switch {
 	case loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2:
 		out, err = s.dispatchV2PluginCall(ctx, loaded, req.ID, req.Service, req.Method, payload, operatorTargets)
@@ -251,6 +257,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil, nil)
 		}
 	}
+	finishSubscriptionMutation(err == nil)
 	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
 		var operationErr *pluginOperationError
@@ -273,12 +280,6 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	// shares sourcing it render. Drop those cached bodies now — otherwise the
 	// edit would only take effect at the cache's revalidation cadence, and the
 	// content hash cannot see it (the record changed, not the content).
-	if req.Service == req.ID+"/subscription" {
-		switch req.Method {
-		case "save", "delete", "import", "migrate":
-			s.invalidateSharesForPlugin(req.ID)
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if len(out) == 0 {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
@@ -404,6 +405,89 @@ func TestPluginCallV2DoesNotDispatchCoreServiceForForeignPublisher(t *testing.T)
 	}
 	if called {
 		t.Fatal("foreign publisher reached an in-core RPC handler")
+	}
+}
+
+func TestPluginSubscriptionMutationRejectsFetchAfterLastShareDeletion(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem,
+		Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}},
+		}},
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	share := model.SubscriptionShare{ID: "share", Slug: "share", Token: strings.Repeat("a", 32), Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}
+	if err := st.UpsertSubscriptionShare(share); err != nil {
+		t.Fatal(err)
+	}
+	base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "base", FetchedAt: time.Now().UTC().Add(-time.Hour)}
+	if err := st.UpsertSubscriptionSnapshot(base); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(),
+		now: time.Now, subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	mutationStarted, releaseMutation := make(chan struct{}), make(chan struct{})
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"},
+		func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+			close(mutationStarted)
+			<-releaseMutation
+			return []byte(`{"ok":true}`), nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	fetchStarted, releaseFetch := make(chan struct{}), make(chan struct{})
+	fetchCalls := 0
+	srv.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		fetchCalls++
+		if fetchCalls == 1 {
+			close(fetchStarted)
+			<-releaseFetch
+			return model.SubscriptionSnapshot{Raw: "captured-before-mutation"}, nil
+		}
+		return model.SubscriptionSnapshot{Raw: "after-mutation"}, nil
+	}
+	fetchDone := make(chan error, 1)
+	go func() { _, err := srv.snapshotFor(context.Background(), "p", "graph", true); fetchDone <- err }()
+	<-fetchStarted
+	if err := st.DeleteSubscriptionShare("share"); err != nil {
+		t.Fatal(err)
+	}
+	callDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		callDone <- rec
+	}()
+	<-mutationStarted
+	close(releaseFetch)
+	close(releaseMutation)
+	if rec := <-callDone; rec.Code != http.StatusOK {
+		t.Fatalf("mutation response code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if err := <-fetchDone; err == nil || !strings.Contains(err.Error(), "plugin changed") {
+		t.Fatalf("pre-mutation fetch error=%v", err)
+	}
+	stored, _ := st.SubscriptionSnapshot("p", "graph")
+	if stored.Raw != "base" {
+		t.Fatalf("obsolete fetch became durable authority: %+v", stored)
+	}
+	if err := st.UpsertSubscriptionShare(share); err != nil {
+		t.Fatal(err)
+	}
+	got, err := srv.snapshotFor(context.Background(), "p", "graph", false)
+	if err != nil || got.Raw != "after-mutation" || fetchCalls != 2 {
+		t.Fatalf("recreated share snapshot=%+v calls=%d err=%v", got, fetchCalls, err)
 	}
 }
 

@@ -178,10 +178,13 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false)
 			switch {
 			case snapErr != nil:
-				// A persistence failure in snapshotFor is not a successful last-good
-				// transition. Do not serve a cached stale body as though the failed
-				// attempt had been durably recorded.
-				cached = false
+				// A refresh or persistence failure is terminal for this request. A
+				// second snapshotFor inside renderShare could observe the committed
+				// state and turn a durability-degraded transition into HTTP 200.
+				s.logger.Printf("subscription share: refresh failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(snapErr))
+				s.subscriptionCache.InvalidateShare(share.ID)
+				deny("subscription_refresh_failed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+				return
 			case subscriptionRevalidationVersion(snap) == stale.revalidationVersion:
 				if s.subscriptionBeforeCacheExtend != nil {
 					s.subscriptionBeforeCacheExtend()
@@ -320,12 +323,39 @@ func snapshotAgeSeconds(now, fetchedAt time.Time) string {
 // record, not the content, is what changed — so the edit path invalidates here.
 func (s *Server) invalidateSharesForPlugin(pluginID string) {
 	bySource := make(map[subscriptionRefreshKey][]string)
+	// Persisted snapshots remain authority even when their last share is deleted.
+	// Include them so a later recreated share cannot bypass the mutation epoch.
+	for _, snapshot := range s.store.SubscriptionSnapshots() {
+		if snapshot.PluginID == pluginID {
+			key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: snapshot.SubscriptionID}
+			bySource[key] = nil
+		}
+	}
 	for _, share := range s.store.SubscriptionShares() {
 		if share.Source.Kind == model.ShareSourcePlugin && share.Source.PluginID == pluginID {
 			key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: share.Source.SubscriptionID}
 			bySource[key] = append(bySource[key], share.ID)
 		}
 	}
+	// A source may currently have neither a share nor a durable snapshot while a
+	// fetch or render is in flight. Copy registry keys under the short global
+	// mutex so the mutation still advances those source epochs.
+	s.subscriptionRefreshMu.Lock()
+	for key := range s.subscriptionPublicationStates {
+		if key.pluginID == pluginID {
+			if _, ok := bySource[key]; !ok {
+				bySource[key] = nil
+			}
+		}
+	}
+	for key := range s.subscriptionRefreshFlights {
+		if key.pluginID == pluginID {
+			if _, ok := bySource[key]; !ok {
+				bySource[key] = nil
+			}
+		}
+	}
+	s.subscriptionRefreshMu.Unlock()
 	keys := make([]subscriptionRefreshKey, 0, len(bySource))
 	for key := range bySource {
 		keys = append(keys, key)

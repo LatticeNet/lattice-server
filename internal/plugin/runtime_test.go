@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -226,6 +228,183 @@ func TestRuntimeManagerStopDoesNotClobberNewStart(t *testing.T) {
 		t.Fatalf("stale stop must not clobber a newer start: ok=%v status=%+v", ok, got)
 	}
 }
+
+func TestRuntimeManagerPinsGenerationBeforeReplacementRetiresIt(t *testing.T) {
+	runner := newTransactionalTestRunner()
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: runner}})
+	loaded := testRuntimeLoaded("pin.bundle")
+	if _, err := m.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+	runner.blockAcquire = make(chan struct{})
+	runner.acquireEntered = make(chan struct{})
+	invokeDone := make(chan InvokeResponse, 1)
+	go func() {
+		resp, _ := m.Invoke(context.Background(), loaded.Manifest.ID, "old", nil)
+		invokeDone <- resp
+	}()
+	<-runner.acquireEntered
+	startDone := make(chan error, 1)
+	go func() { _, err := m.Start(context.Background(), loaded); startDone <- err }()
+	close(runner.blockAcquire)
+	if err := <-startDone; err != nil {
+		t.Fatal(err)
+	}
+	resp := <-invokeDone
+	if string(resp.Result) != `{"generation":1}` {
+		t.Fatalf("pinned invocation switched generations: %s", resp.Result)
+	}
+	resp, err := m.Invoke(context.Background(), loaded.Manifest.ID, "new", nil)
+	if err != nil || string(resp.Result) != `{"generation":2}` {
+		t.Fatalf("new invocation did not use committed generation: resp=%s err=%v", resp.Result, err)
+	}
+}
+
+func TestRuntimeManagerCloseWaitsPendingPrepareAndIsIdempotent(t *testing.T) {
+	runner := newTransactionalTestRunner()
+	runner.blockPrepare = make(chan struct{})
+	runner.prepareEntered = make(chan struct{})
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: runner}})
+	startDone := make(chan error, 1)
+	go func() { _, err := m.Start(context.Background(), testRuntimeLoaded("close.bundle")); startDone <- err }()
+	<-runner.prepareEntered
+	closeDone := make(chan error, 2)
+	go func() { closeDone <- m.Close(context.Background()) }()
+	go func() { closeDone <- m.Close(context.Background()) }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before pending Prepare exited: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(runner.blockPrepare)
+	_ = <-startDone
+	for range 2 {
+		if err := <-closeDone; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if runner.stopAllCalls != 1 {
+		t.Fatalf("StopAll calls=%d want 1", runner.stopAllCalls)
+	}
+	if _, err := m.Start(context.Background(), testRuntimeLoaded("after-close.bundle")); err == nil {
+		t.Fatal("Start succeeded after Close")
+	}
+}
+
+func testRuntimeLoaded(id string) Loaded {
+	return Loaded{Manifest: Manifest{ID: id, Name: id, Type: TypeSystem, Capabilities: []string{"node:read"}}, Capabilities: []string{"node:read"}}
+}
+
+type transactionalTestRunner struct {
+	mu             sync.Mutex
+	prepared       map[uint64]bool
+	active         map[uint64]bool
+	retired        map[uint64]bool
+	blockPrepare   chan struct{}
+	prepareEntered chan struct{}
+	blockAcquire   chan struct{}
+	acquireEntered chan struct{}
+	stopAllCalls   int
+}
+
+func newTransactionalTestRunner() *transactionalTestRunner {
+	return &transactionalTestRunner{prepared: map[uint64]bool{}, active: map[uint64]bool{}, retired: map[uint64]bool{}}
+}
+func (r *transactionalTestRunner) Name() string { return "transactional-test" }
+func (r *transactionalTestRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
+	result, err := r.Prepare(ctx, req)
+	if err == nil {
+		err = r.ActivateGeneration(req.PluginID, req.Generation)
+	}
+	return result, err
+}
+func (r *transactionalTestRunner) Prepare(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
+	if r.prepareEntered != nil {
+		select {
+		case <-r.prepareEntered:
+		default:
+			close(r.prepareEntered)
+		}
+	}
+	if r.blockPrepare != nil {
+		<-r.blockPrepare
+	}
+	r.mu.Lock()
+	r.prepared[req.Generation] = true
+	r.mu.Unlock()
+	return RunnerStartResult{Message: "prepared"}, ctx.Err()
+}
+func (r *transactionalTestRunner) ActivateGeneration(_ string, generation uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.prepared[generation] {
+		return errors.New("not prepared")
+	}
+	r.active[generation] = true
+	return nil
+}
+func (r *transactionalTestRunner) AbortGeneration(_ context.Context, _ string, generation uint64) error {
+	r.mu.Lock()
+	delete(r.prepared, generation)
+	delete(r.active, generation)
+	r.mu.Unlock()
+	return nil
+}
+func (r *transactionalTestRunner) RetireGeneration(_ context.Context, _ string, generation uint64) error {
+	r.mu.Lock()
+	r.active[generation] = false
+	r.retired[generation] = true
+	r.mu.Unlock()
+	return nil
+}
+func (r *transactionalTestRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
+	r.mu.Lock()
+	for gen := range r.active {
+		if req.Generation == 0 || gen <= req.Generation {
+			r.active[gen] = false
+		}
+	}
+	r.mu.Unlock()
+	return ctx.Err()
+}
+func (r *transactionalTestRunner) StopAll(context.Context) error {
+	r.mu.Lock()
+	r.stopAllCalls++
+	for gen := range r.active {
+		r.active[gen] = false
+	}
+	r.mu.Unlock()
+	return nil
+}
+func (r *transactionalTestRunner) Invoke(context.Context, InvokeRequest) (InvokeResponse, error) {
+	return InvokeResponse{}, errors.New("lease required")
+}
+func (r *transactionalTestRunner) AcquireInvocation(_ string, generation uint64) (InvocationGenerationLease, error) {
+	if r.acquireEntered != nil {
+		select {
+		case <-r.acquireEntered:
+		default:
+			close(r.acquireEntered)
+		}
+	}
+	if r.blockAcquire != nil {
+		<-r.blockAcquire
+	}
+	r.mu.Lock()
+	active := r.active[generation]
+	r.mu.Unlock()
+	if !active {
+		return nil, errors.New("not active")
+	}
+	return transactionalTestLease{generation: generation}, nil
+}
+
+type transactionalTestLease struct{ generation uint64 }
+
+func (l transactionalTestLease) Invoke(context.Context, InvokeRequest) (InvokeResponse, error) {
+	return InvokeResponse{OK: true, Result: json.RawMessage(fmt.Sprintf(`{"generation":%d}`, l.generation))}, nil
+}
+func (transactionalTestLease) Release() {}
 
 func TestRuntimeManagerPassesInvocationBudgetToRunner(t *testing.T) {
 	runner := &recordingInvokeRunner{}

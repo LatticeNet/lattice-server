@@ -540,10 +540,8 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: reason, Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
 				continue
 			}
-			s.applyPluginHostAccess(pl)
 			rt, err := s.pluginRuntime.Start(context.Background(), pl)
 			if err != nil {
-				s.revokePluginHostAccess(pl)
 				s.logger.Printf("plugin runtime: failed to arm %s: %v", pl.Manifest.ID, err)
 				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
 			} else {
@@ -732,12 +730,12 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 		}
 		if req.Status == model.PluginStatusActive {
 			loaded, _ := s.loadedPlugin(req.ID)
-			s.applyPluginHostAccess(loaded)
 			rt, err := s.pluginRuntime.Start(r.Context(), loaded)
 			if err != nil {
-				s.revokePluginHostAccess(loaded)
-				_, _ = s.pluginRuntime.Stop(req.ID, "activation failed")
-				_ = s.store.SetPluginStatus(req.ID, model.PluginStatusDisabled)
+				if !s.pluginRuntime.IsArmed(req.ID) {
+					_, _ = s.pluginRuntime.Stop(req.ID, "activation failed")
+					_ = s.store.SetPluginStatus(req.ID, model.PluginStatusDisabled)
+				}
 				s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": req.ID, "state": plugin.RuntimeStateFailed}})
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -745,8 +743,6 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "allow", Metadata: map[string]string{"plugin_id": req.ID, "state": rt.State}})
 		}
 		if req.Status == model.PluginStatusDisabled {
-			loaded, _ := s.loadedPlugin(req.ID)
-			s.revokePluginHostAccess(loaded)
 			rt, err := s.pluginRuntime.Stop(req.ID, "operator disabled plugin")
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
@@ -1076,6 +1072,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.Handle("/", s.staticHandler())
 	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
+}
+
+// Close stops runtime-owned subprocesses and waits for their transports to be
+// reaped before the server process exits.
+func (s *Server) Close(ctx context.Context) error {
+	if s == nil || s.pluginRuntime == nil {
+		return nil
+	}
+	return s.pluginRuntime.Close(ctx)
 }
 
 func (s *Server) ensureAdmin(username, password string) error {

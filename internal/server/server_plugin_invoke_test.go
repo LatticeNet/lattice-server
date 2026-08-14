@@ -91,6 +91,49 @@ func TestPluginInvokeExecutesArtifact(t *testing.T) {
 	}
 }
 
+func TestPluginInvokeDoesNotExposeOrAuditRawStderr(t *testing.T) {
+	const secret = "SECRET-STDERR-CANARY"
+	pluginRoot := t.TempDir()
+	bundle := filepath.Join(pluginRoot, "test.stderr")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "manifest.json"), []byte(`{"id":"test.stderr","name":"Stderr Test","type":"system","capabilities":["node:read"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "artifact"), []byte("#!/bin/sh\necho '"+secret+"' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PluginDir: pluginRoot, PluginRuntimeDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	for _, status := range []string{"installed", "active"} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle", `{"id":"test.stderr","status":"`+status+`"}`, cookies, csrf)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("lifecycle %s: %d", status, resp.StatusCode)
+		}
+	}
+	resp := doJSON(t, handler, http.MethodPost, "/api/plugins/invoke", `{"id":"test.stderr","action":"describe"}`, cookies, csrf)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if bytes.Contains(body, []byte(secret)) {
+		t.Fatalf("response leaked stderr: %s", body)
+	}
+	for _, event := range st.AuditEvents() {
+		if strings.Contains(event.Reason, secret) {
+			t.Fatalf("audit leaked stderr: %+v", event)
+		}
+	}
+}
+
 func TestPluginCallFallsBackToRuntimeArtifact(t *testing.T) {
 	pluginRoot := t.TempDir()
 	manifest := plugin.Manifest{

@@ -348,10 +348,12 @@ func (p *systemPool) replenishSupervisor() {
 				p.workers = append(p.workers, nw)
 				retired = p.wakeLocked(time.Now())
 			}
-			if err != nil && p.failureFn != nil && !errors.Is(err, context.Canceled) {
-				p.failureFn(generation)
-			}
+			failureFn := p.failureFn
+			recordFailure := err != nil && failureFn != nil && !errors.Is(err, context.Canceled)
 			p.mu.Unlock()
+			if recordFailure {
+				failureFn(generation)
+			}
 			abortTransports(retired)
 			if !valid && nw != nil && nw.transport != nil {
 				_ = nw.transport.abort()

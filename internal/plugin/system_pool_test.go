@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -197,4 +198,61 @@ func TestSystemPoolWaiterReceivesCloseError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("waiter not woken")
 	}
+}
+
+func TestSystemPoolReplenishFailuresOpenCircuitAndStopAttempts(t *testing.T) {
+	p := newSystemPool(8, time.Hour, 11)
+	p.backoffBase = time.Millisecond
+	var mu sync.Mutex
+	attempts := 0
+	p.replenishFn = func(context.Context, uint64) (*pooledWorker, error) {
+		mu.Lock()
+		attempts++
+		mu.Unlock()
+		return nil, errors.New("spawn failed")
+	}
+	p.failureFn = func(uint64) {
+		mu.Lock()
+		count := attempts
+		mu.Unlock()
+		if count >= 3 {
+			p.setCircuitOpen(true)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := p.checkout(ctx, time.Now()); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("checkout error=%v want ErrCircuitOpen", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	mu.Lock()
+	got := attempts
+	mu.Unlock()
+	if got != 3 {
+		t.Fatalf("replenish attempts=%d want exactly 3", got)
+	}
+	p.abortClose(11)
+}
+
+func TestSystemPoolCanceledAttemptDoesNotKillSupervisor(t *testing.T) {
+	p := newSystemPool(8, time.Hour, 12)
+	p.backoffBase = time.Millisecond
+	var attempts atomic.Int32
+	p.replenishFn = func(ctx context.Context, generation uint64) (*pooledWorker, error) {
+		if attempts.Add(1) == 1 {
+			return nil, context.Canceled
+		}
+		return &pooledWorker{generation: generation, started: time.Now()}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	w, err := p.checkout(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts=%d want 2", attempts.Load())
+	}
+	p.release(w, true, time.Now())
+	p.abortClose(12)
 }

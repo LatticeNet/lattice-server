@@ -4,6 +4,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -51,6 +52,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		t.Fatal(err)
+	}
+	pluginRuntimeRoot := filepath.Join(root, "plugin-runtime")
+	if processes := lifecycleRuntimeRootProcesses(t, pluginRuntimeRoot); len(processes) != 0 {
+		t.Fatalf("E5 plugin runtime root was not empty before start: %+v", processes)
 	}
 
 	origin := lifecycleEchoOrigin(t)
@@ -454,6 +459,16 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if !ok || lastGood.Stale || lastGood.SourceVersion != e5Graph.SourceVersion || lastGood.FetchedAt.IsZero() || lastGood.Raw == "" {
 		t.Fatalf("initial durable E5 snapshot mismatch: ok=%t stale=%t source=%s graph=%s fetched=%s bytes=%d", ok, lastGood.Stale, lastGood.SourceVersion, e5Graph.SourceVersion, lastGood.FetchedAt, len(lastGood.Raw))
 	}
+	secretCanaries := []string{
+		credential.UUID,
+		realityPrivate,
+		sourceRealityPrivate,
+		e5Graph.Share.Token,
+		nodeToken,
+		lastGood.Raw,
+		e5Graph.URI,
+		string(e5Graph.Published),
+	}
 	// Force an inventory drift while the physical chain remains configured.
 	driftSidecar, err := os.ReadFile(sidecar)
 	if err != nil {
@@ -487,9 +502,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		Stale bool   `json:"stale"`
 		Error string `json:"error"`
 	}
-	if json.Unmarshal(refreshRaw, &refreshView) != nil || refreshRes.StatusCode != http.StatusOK || !refreshView.Stale || refreshView.Error != "provider_fetch_failed" || bytes.Contains(refreshRaw, []byte(nodeToken)) || bytes.Contains(refreshRaw, []byte(credential.UUID)) || bytes.Contains(refreshRaw, []byte(e5Graph.URI)) {
+	if json.Unmarshal(refreshRaw, &refreshView) != nil || refreshRes.StatusCode != http.StatusOK || !refreshView.Stale || refreshView.Error != "provider_fetch_failed" {
 		t.Fatalf("drift refresh status=%d body_len=%d", refreshRes.StatusCode, len(refreshRaw))
 	}
+	assertNoE5SecretCanaries(t, refreshRaw, secretCanaries)
 	staleGET, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/sub/"+e5Graph.Share.Slug+"/"+e5Graph.Share.Token+"?format=plain", nil)
 	staleResp, err := httpServer.Client().Do(staleGET)
 	if err != nil {
@@ -507,6 +523,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if staleLastGood.FetchError != "provider_fetch_failed" {
 		t.Fatalf("unexpected stale fetch error: %q", staleLastGood.FetchError)
 	}
+	secretCanaries = append(secretCanaries, staleLastGood.Raw)
 	// Restore the converged observation and force refresh again; stale state
 	// must clear and the provider must publish the recovered snapshot.
 	recoveredSidecar := bytes.Replace(driftSidecar, []byte("33333333-3333-4333-8333-333333333333"), []byte(targetUUID), 1)
@@ -545,6 +562,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		recoveredSnapshot.Raw != lastGood.Raw || !recoveredSnapshot.FetchedAt.After(lastGood.FetchedAt) || !recoveredSnapshot.LastAttemptAt.Equal(recoveredSnapshot.FetchedAt) {
 		t.Fatalf("inventory recovery did not publish fresh durable authority: ok=%t stale=%t error=%q source=%s old_source=%s fetched=%s old_fetched=%s bytes=%d want_bytes=%d attempt=%s", ok, recoveredSnapshot.Stale, recoveredSnapshot.FetchError, recoveredSnapshot.SourceVersion, lastGood.SourceVersion, recoveredSnapshot.FetchedAt, lastGood.FetchedAt, len(recoveredSnapshot.Raw), len(lastGood.Raw), recoveredSnapshot.LastAttemptAt)
 	}
+	secretCanaries = append(secretCanaries, recoveredSnapshot.Raw)
 	freshGET, _ := http.NewRequest(http.MethodGet, httpServer.URL+"/sub/"+e5Graph.Share.Slug+"/"+e5Graph.Share.Token+"?format=plain", nil)
 	freshResp, err := httpServer.Client().Do(freshGET)
 	if err != nil {
@@ -555,24 +573,22 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatalf("fresh public share mismatch: status=%d header=%q body_len=%d", freshResp.StatusCode, freshResp.Header.Get("X-Lattice-Subscription-Stale"), len(freshBody))
 	}
 
-	// A real server restart must reap both persistent plugin workers before the
+	// A real server restart must reap the persistent SubStore worker before the
 	// encrypted JSON store and its hot Bolt sidecar are closed. Reopening the
 	// same durable files with the same cipher, bundles, runtime roots, and trust
-	// policy must restore active lifecycle state and arm fresh worker processes.
+	// policy must restore active lifecycle state and arm a fresh worker; the
+	// already-successful vpn-core calls cover its v1 fork/reap path.
+	oldPluginPGIDs := requirePersistentSubStoreWorker(t, e5Fixture.runtimeDir)
 	httpServer.Close()
-	oldPluginPGIDs := lifecyclePluginRuntimeProcessGroups(t, e5Fixture.runtimeDir)
-	if len(oldPluginPGIDs) < 1 {
-		t.Fatalf("expected live E5 plugin process groups before restart, got %v", oldPluginPGIDs)
-	}
 	beforeRestartKV := srv.store.KV("plugin:" + e5SubStorePluginID)
 	e5Fixture = e5Fixture.reopen(t, func() {
-		assertLifecycleProcessGroupsGone(t, oldPluginPGIDs, e5Fixture.runtimeDir)
+		assertLifecycleProcessGroupsGone(t, oldPluginPGIDs)
 		walResult, walEnabled, walErr := e5Fixture.store.AuditWALVerify()
 		if walErr != nil || !walEnabled || walResult.Count == 0 || walResult.Anchor == nil {
 			t.Fatalf("pre-close AuditWAL verification failed: enabled=%t count=%d anchor=%t err=%v", walEnabled, walResult.Count, walResult.Anchor != nil, walErr)
 		}
 	}, func() {
-		e5Fixture.assertNoPlaintextCanaries(t, credential.UUID, realityPrivate, sourceRealityPrivate, e5Graph.Share.Token, nodeToken, recoveredSnapshot.Raw, e5Graph.URI)
+		e5Fixture.assertNoPlaintextCanaries(t, secretCanaries...)
 	})
 	srv = e5Fixture.server
 	handler = srv.Handler()
@@ -585,15 +601,10 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 			t.Fatalf("plugin did not auto-rearm after restart: id=%s installed=%t status=%s armed=%t runtime=%s", pluginID, installed, installation.Status, armed, runtimeStatus.State)
 		}
 	}
-	newPluginPGIDs := lifecyclePluginRuntimeProcessGroups(t, e5Fixture.runtimeDir)
-	if len(newPluginPGIDs) < 1 {
-		t.Fatalf("expected fresh E5 plugin process groups after restart, got %v", newPluginPGIDs)
-	}
-	for _, pgid := range newPluginPGIDs {
-		for _, oldPGID := range oldPluginPGIDs {
-			if pgid == oldPGID {
-				t.Fatalf("plugin process group %d was reused across server restart", pgid)
-			}
+	newPluginPGIDs := requirePersistentSubStoreWorker(t, e5Fixture.runtimeDir)
+	for pluginID, pgid := range newPluginPGIDs {
+		if pgid == oldPluginPGIDs[pluginID] {
+			t.Fatalf("plugin process group %d was reused across server restart for %s", pgid, pluginID)
 		}
 	}
 	persistedShare, shareOK := srv.store.SubscriptionShare(e5Graph.Share.ID)
@@ -629,7 +640,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if walErr != nil || !walEnabled || walResult.Count == 0 || walResult.Anchor == nil {
 		t.Fatalf("reopened E5 AuditWAL verification failed: enabled=%t count=%d anchor=%t err=%v", walEnabled, walResult.Count, walResult.Anchor != nil, walErr)
 	}
-	e5Fixture.assertNoPlaintextCanaries(t, credential.UUID, realityPrivate, sourceRealityPrivate, e5Graph.Share.Token, nodeToken, recoveredSnapshot.Raw, e5Graph.URI)
+	e5Fixture.assertNoPlaintextCanaries(t, secretCanaries...)
 	// Reconnect the agent after restart so the ephemeral inventory projection is
 	// repopulated before ordinary metadata/remove assertions.
 	reconnectInventory := filepath.Join(root, "reconnect-inventory-result.json")
@@ -871,6 +882,25 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if observer.accepted() != beforeGTraffic {
 		t.Fatal("G direct client traversed observer/A")
 	}
+
+	// The reopened server is an explicit lifecycle phase, not cleanup-only state.
+	// Close its HTTP listener, require the freshly armed worker group to be
+	// extinct, then close the store. The registered cleanup remains idempotent.
+	httpServer.Close()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	e5Fixture.cleanup.closeServer(shutdownCtx)
+	shutdownCancel()
+	if e5Fixture.cleanup.serverErr != nil {
+		t.Fatalf("close reopened E5 server: %v", e5Fixture.cleanup.serverErr)
+	}
+	assertLifecycleProcessGroupsGone(t, newPluginPGIDs)
+	if processes := lifecycleRuntimeRootProcesses(t, e5Fixture.runtimeDir); len(processes) != 0 {
+		t.Fatalf("E5 plugin runtime root retained processes after close: %+v", processes)
+	}
+	e5Fixture.cleanup.closeStore()
+	if e5Fixture.cleanup.storeErr != nil {
+		t.Fatalf("close reopened E5 store: %v", e5Fixture.cleanup.storeErr)
+	}
 }
 
 func assertDeclaredE2EEdge(t *testing.T, groups []LineGroup, sourceUUID, targetUUID string, want bool) {
@@ -1021,36 +1051,142 @@ func persistentJSON(t *testing.T, client *http.Client, method, url, body string,
 	}
 }
 
-func lifecyclePluginRuntimeProcessGroups(t *testing.T, runtimeDir string) []int {
+type lifecycleRuntimeProcess struct {
+	PID     int
+	PGID    int
+	Command string
+}
+
+func lifecycleRuntimeRootProcesses(t *testing.T, runtimeDir string) []lifecycleRuntimeProcess {
 	t.Helper()
 	out, err := exec.Command("ps", "-axo", "pid=,pgid=,command=").CombinedOutput()
 	if err != nil {
 		t.Fatalf("scan plugin runtime processes: %v: %s", err, out)
 	}
+	return parseLifecycleRuntimeProcesses(string(out), runtimeDir)
+}
+
+func parseLifecycleRuntimeProcesses(output, runtimeDir string) []lifecycleRuntimeProcess {
 	want := filepath.Clean(runtimeDir) + string(filepath.Separator)
-	seen := map[int]bool{}
-	var pgids []int
-	for _, line := range strings.Split(string(out), "\n") {
+	var processes []lifecycleRuntimeProcess
+	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 3 || !strings.Contains(strings.Join(fields[2:], " "), want) {
 			continue
 		}
+		pid, pidErr := strconv.Atoi(fields[0])
 		pgid, err := strconv.Atoi(fields[1])
-		if err != nil || pgid <= 0 || seen[pgid] {
+		if pidErr != nil || err != nil || pid <= 0 || pgid <= 0 {
 			continue
 		}
-		seen[pgid] = true
-		pgids = append(pgids, pgid)
+		processes = append(processes, lifecycleRuntimeProcess{PID: pid, PGID: pgid, Command: strings.Join(fields[2:], " ")})
 	}
-	return pgids
+	return processes
 }
 
-func assertLifecycleProcessGroupsGone(t *testing.T, pgids []int, runtimeDir string) {
+func persistentSubStoreWorkerMap(processes []lifecycleRuntimeProcess, runtimeDir string) (map[string]int, error) {
+	if len(processes) != 1 {
+		return nil, fmt.Errorf("expected exactly one persistent SubStore worker and no other runtime-root processes, got %+v", processes)
+	}
+	process := processes[0]
+	marker := filepath.Clean(runtimeDir) + string(filepath.Separator) + "latticenet.sub-store" + string(filepath.Separator)
+	if !strings.Contains(process.Command, marker) {
+		return nil, fmt.Errorf("persistent runtime-root process is not SubStore: %+v", process)
+	}
+	if process.PGID <= 0 {
+		return nil, fmt.Errorf("persistent SubStore worker has invalid process group: %+v", process)
+	}
+	return map[string]int{"latticenet.sub-store": process.PGID}, nil
+}
+
+func requirePersistentSubStoreWorker(t *testing.T, runtimeDir string) map[string]int {
 	t.Helper()
-	for _, pgid := range pgids {
-		if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) && !(errors.Is(err, syscall.EPERM) && len(lifecyclePluginRuntimeProcessGroups(t, runtimeDir)) == 0) {
-			t.Fatalf("plugin process group %d survived Server.Close: %v", pgid, err)
+	workers, err := persistentSubStoreWorkerMap(lifecycleRuntimeRootProcesses(t, runtimeDir), runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return workers
+}
+
+func lifecycleProcessGroupMembers(t *testing.T, pgid int) []int {
+	t.Helper()
+	out, err := exec.Command("ps", "-axo", "pid=,pgid=").CombinedOutput()
+	if err != nil {
+		t.Fatalf("scan process group %d: %v: %s", pgid, err, out)
+	}
+	return parseLifecycleProcessGroupMembers(string(out), pgid)
+}
+
+func parseLifecycleProcessGroupMembers(output string, pgid int) []int {
+	var members []int
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
 		}
+		pid, pidErr := strconv.Atoi(fields[0])
+		candidatePGID, pgidErr := strconv.Atoi(fields[1])
+		if pidErr == nil && pgidErr == nil && pid > 0 && candidatePGID == pgid {
+			members = append(members, pid)
+		}
+	}
+	return members
+}
+
+func assertLifecycleProcessGroupsGone(t *testing.T, workers map[string]int) {
+	t.Helper()
+	for pluginID, pgid := range workers {
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			err := syscall.Kill(-pgid, 0)
+			members := lifecycleProcessGroupMembers(t, pgid)
+			// macOS can report EPERM for a group that has already lost every
+			// member. Empty enumeration is the portable extinction proof; EPERM
+			// with any member is never treated as extinct.
+			if len(members) == 0 {
+				break
+			}
+			if err != nil && !errors.Is(err, syscall.ESRCH) && !errors.Is(err, syscall.EPERM) {
+				t.Fatalf("probe process group for %s pgid=%d: %v members=%v", pluginID, pgid, err, members)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("plugin process group extinction unproved after Server.Close: plugin=%s pgid=%d probe=%v members=%v (EPERM is failure)", pluginID, pgid, err, members)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+}
+
+func assertNoE5SecretCanaries(t *testing.T, raw []byte, canaries []string) {
+	t.Helper()
+	for i, canary := range canaries {
+		if canary != "" && bytes.Contains(raw, []byte(canary)) {
+			t.Fatalf("secret canary %d exposed in response", i+1)
+		}
+	}
+}
+
+func TestParseLifecycleRuntimeProcessesMapsPluginIDs(t *testing.T) {
+	root := filepath.Join(string(filepath.Separator), "tmp", "e5", "plugin-runtime")
+	output := fmt.Sprintf("102 102 %s\n103 103 /bin/unrelated\n",
+		filepath.Join(root, "latticenet.sub-store", "generation-1", "artifact"))
+	processes := parseLifecycleRuntimeProcesses(output, root)
+	if len(processes) != 1 || processes[0].PID != 102 || processes[0].PGID != 102 {
+		t.Fatalf("runtime process parse mismatch: %+v", processes)
+	}
+	workers, err := persistentSubStoreWorkerMap(processes, root)
+	if err != nil || workers["latticenet.sub-store"] != 102 {
+		t.Fatalf("runtime plugin mapping mismatch: workers=%v err=%v", workers, err)
+	}
+	vpnCore := lifecycleRuntimeProcess{PID: 101, PGID: 101, Command: filepath.Join(root, "latticenet.vpn-core", "generation-1", "artifact")}
+	if _, err := persistentSubStoreWorkerMap(append(processes, vpnCore), root); err == nil {
+		t.Fatal("persistent worker mapping accepted a vpn-core v1 process")
+	}
+}
+
+func TestParseLifecycleProcessGroupMembers(t *testing.T) {
+	if members := parseLifecycleProcessGroupMembers("101 55\n102 77\n103 55\n", 55); len(members) != 2 || members[0] != 101 || members[1] != 103 {
+		t.Fatalf("process-group member parse mismatch: %v", members)
 	}
 }
 

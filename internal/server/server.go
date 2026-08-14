@@ -7027,9 +7027,18 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 			tag = "SLOW request"
 		}
 		s.logger.Printf("%s: %s %s -> %d %dB %s (ip=%s id=%s)",
-			tag, r.Method, r.URL.Path, lw.status, lw.bytes,
+			tag, r.Method, requestLogPath(r.URL.Path), lw.status, lw.bytes,
 			dur.Round(time.Millisecond), s.clientIP(r), requestIDFromRequest(r))
 	})
+}
+
+const redactedSubscriptionRequestLogPath = "/sub/:token"
+
+func requestLogPath(path string) string {
+	if strings.HasPrefix(path, "/sub/") {
+		return redactedSubscriptionRequestLogPath
+	}
+	return path
 }
 
 // recordAudit writes an audit event and, unlike a bare best-effort call, logs

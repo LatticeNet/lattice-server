@@ -595,10 +595,9 @@ func TestSubscriptionShareCacheHitCannotObservePartialSourcePublication(t *testi
 				responseDone <- rec
 			}()
 			<-lookupStarted
-			select {
-			case rec := <-responseDone:
-				t.Fatalf("cache lookup escaped partial publication: code=%d body=%q", rec.Code, rec.Body.String())
-			case <-time.After(20 * time.Millisecond):
+			if s.subscriptionRefreshMu.TryLock() {
+				s.subscriptionRefreshMu.Unlock()
+				t.Fatal("cache lookup did not contend with the source publication lock")
 			}
 			close(releasePublish)
 			if err := <-refreshDone; err != nil {

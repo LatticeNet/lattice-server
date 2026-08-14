@@ -57,6 +57,8 @@ type systemPool struct {
 	backoffBase time.Duration
 	jitterFn    func(time.Duration) time.Duration
 	waitBackoff func(context.Context, time.Duration) bool
+	closeErr    error
+	drainFuture *poolDrainFuture
 	// Test-only ownership boundary hook for cancellation-vs-wake reconciliation.
 	beforeCancelReconcile func()
 	// Test-only result-arm hook for cancellation after assignment but before the
@@ -70,6 +72,100 @@ type poolCheckoutResult struct {
 }
 
 var errSystemPoolClosed = errors.New("system pool closed")
+
+// PoolCleanupResult is the owned, generation-scoped teardown ledger.  A
+// future is returned so callers can broadcast abort requests first and join
+// all transports under their own deadline.
+type PoolCleanupResult struct {
+	Generation    uint64
+	Err           error
+	ResidualPGIDs []int
+	Stage         string
+}
+
+type poolDrainFuture struct {
+	done   chan struct{}
+	mu     sync.Mutex
+	result PoolCleanupResult
+	force  chan struct{}
+	once   sync.Once
+}
+
+func (f *poolDrainFuture) wait(ctx context.Context) PoolCleanupResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-f.done:
+		f.mu.Lock()
+		r := f.result
+		f.mu.Unlock()
+		return r
+	case <-ctx.Done():
+		return PoolCleanupResult{Err: &processGroupResidualError{Stage: "pool-drain", Err: ctx.Err()}, Stage: "pool-drain"}
+	}
+}
+func (f *poolDrainFuture) upgrade() { f.once.Do(func() { close(f.force) }) }
+
+func (p *systemPool) beginDrain(force bool, generation uint64) *poolDrainFuture {
+	p.mu.Lock()
+	if p.drainFuture != nil {
+		f := p.drainFuture
+		if force {
+			f.upgrade()
+		}
+		p.mu.Unlock()
+		return f
+	}
+	f := &poolDrainFuture{done: make(chan struct{}), force: make(chan struct{})}
+	p.drainFuture = f
+	p.closed = true
+	p.superCancel()
+	if p.attemptStop != nil {
+		p.attemptStop()
+	}
+	all := append([]*pooledWorker(nil), p.workers...)
+	for w := range p.leased {
+		all = append(all, w)
+	}
+	p.workers = nil
+	p.leased = map[*pooledWorker]struct{}{}
+	waiters := p.waiters
+	p.waiters = nil
+	p.mu.Unlock()
+	for _, ch := range waiters {
+		ch <- poolCheckoutResult{err: errSystemPoolClosed}
+	}
+	for _, w := range all {
+		if w.transport != nil {
+			w.transport.requestAbort()
+		}
+	}
+	go func() {
+		p.mu.Lock()
+		superStarted := p.superStart
+		p.mu.Unlock()
+		if superStarted {
+			<-p.superDone
+		}
+		var joined error
+		for _, w := range all {
+			if w.transport != nil {
+				joined = errors.Join(joined, w.transport.waitAbort(context.Background()))
+			}
+		}
+		p.mu.Lock()
+		p.active = 0
+		p.closeErr = errors.Join(p.closeErr, joined)
+		p.mu.Unlock()
+		p.closeDrained()
+		f.mu.Lock()
+		f.result = PoolCleanupResult{Generation: generation, Err: joined}
+		f.mu.Unlock()
+		close(f.done)
+	}()
+	return f
+}
 
 func (p *systemPool) invariantLocked() bool { return p.active == len(p.leased) }
 
@@ -345,11 +441,15 @@ func (p *systemPool) setCircuitOpen(open bool) {
 	for _, waiter := range waiters {
 		waiter <- poolCheckoutResult{err: ErrCircuitOpen}
 	}
+	var joined error
 	for _, w := range idle {
 		if w.transport != nil {
-			_ = w.transport.abort()
+			joined = errors.Join(joined, w.transport.abort())
 		}
 	}
+	p.mu.Lock()
+	p.closeErr = errors.Join(p.closeErr, joined)
+	p.mu.Unlock()
 }
 
 func (p *systemPool) requestReplenishLocked() {
@@ -486,11 +586,15 @@ func (p *systemPool) gracefulDrain(generation uint64) <-chan struct{} {
 	for _, ch := range waiters {
 		ch <- poolCheckoutResult{err: errSystemPoolClosed}
 	}
+	var joined error
 	for _, w := range idle {
 		if w.transport != nil {
-			_ = w.transport.abort()
+			joined = errors.Join(joined, w.transport.abort())
 		}
 	}
+	p.mu.Lock()
+	p.closeErr = errors.Join(p.closeErr, joined)
+	p.mu.Unlock()
 	p.mu.Lock()
 	closeNow := p.active == 0
 	p.mu.Unlock()
@@ -534,12 +638,22 @@ func (p *systemPool) abortClose(generation uint64) {
 	for _, ch := range waiters {
 		ch <- poolCheckoutResult{err: errSystemPoolClosed}
 	}
+	var joined error
 	for _, w := range all {
 		if w.transport != nil {
-			_ = w.transport.abort()
+			joined = errors.Join(joined, w.transport.abort())
 		}
 	}
+	p.mu.Lock()
+	p.closeErr = errors.Join(p.closeErr, joined)
+	p.mu.Unlock()
 	p.closeDrained()
+}
+
+func (p *systemPool) cleanupError() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closeErr
 }
 
 func (p *systemPool) closeDrained() {

@@ -132,13 +132,34 @@ func TestV2AbortKillsIgnoreTermDescendantProcessGroup(t *testing.T) {
 	}
 	descendant := waitForPIDFile(t, pidFile)
 	pgid := tr.pgid
-	if err := tr.abort(); err == nil {
-		// SIGTERM/SIGKILL commonly makes the leader's Wait report a signal. The
-		// important contract is extinction of the complete process group.
+	if err := tr.waitAbort(t.Context()); err != nil {
+		t.Fatalf("abort: %v", err)
 	}
 	assertPIDGone(t, descendant)
 	if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("v2 process group %d survived abort: %v", pgid, err)
+	}
+}
+
+func TestRequestAbortReturnsBeforeJoin(t *testing.T) {
+	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), append(os.Environ(), "LATTICE_TEST_V2_HELPER=1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	tr.beforeAbortFinish = func() { close(entered); <-release }
+	tr.requestAbort()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("abort finisher did not reach pre-join seam")
+	}
+	close(release)
+	if err := tr.waitAbort(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }
 

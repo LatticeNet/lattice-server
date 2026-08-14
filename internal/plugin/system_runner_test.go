@@ -358,6 +358,35 @@ func TestSystemRunnerV1ManualPipeOwnershipDoesNotLeakFDs(t *testing.T) {
 	}
 }
 
+func TestSystemRunnerRetireExposesGenerationCleanupResidual(t *testing.T) {
+	loaded := makeBundle(t, "p.cleanup-residual", "#!/bin/sh\nread line\nprintf '{\"ok\":true}'\n", "")
+	r := newRunner(t, SystemRunnerOptions{})
+	removeErr := errors.New("remove workdir failed")
+	r.removeAll = func(string) error { return removeErr }
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	err := r.RetireGeneration(t.Context(), loaded.Manifest.ID, 1)
+	var cleanupErr *GenerationCleanupError
+	if !errors.As(err, &cleanupErr) || !errors.Is(err, removeErr) || cleanupErr.PluginID != loaded.Manifest.ID || cleanupErr.Generation != 1 {
+		t.Fatalf("retirement residual=%v typed=%+v", err, cleanupErr)
+	}
+}
+
+func TestTransportWaitAbortReportsTypedResidual(t *testing.T) {
+	tm := &systemWorkerTransport{pgid: 4242, abortDone: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := tm.waitAbort(ctx)
+	var residual *processGroupResidualError
+	if !errors.As(err, &residual) || residual.PGID != 4242 || residual.Stage != "abort-pending" {
+		t.Fatalf("waitAbort error=%v residual=%#v", err, residual)
+	}
+}
+
 func countOpenFDs(t *testing.T) int {
 	t.Helper()
 	count := 0

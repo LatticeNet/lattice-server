@@ -231,27 +231,42 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 // systemWorkerTransport owns one persistent worker process and all descriptors.
 // It is intentionally independent of the evolving SDK session API.
 type systemWorkerTransport struct {
-	cmd            *exec.Cmd
-	stdin          *os.File
-	stdout         *os.File
-	hostResp       *os.File
-	stderr         *os.File
-	pgid           int
-	scanner        *bufio.Scanner
-	frames         chan transportFrame
-	done           chan struct{}
-	waitDone       chan struct{}
-	readDone       chan struct{}
-	waitMu         sync.Mutex
-	waitErr        error
-	abortOnce      sync.Once
-	abortErr       error
-	groupOnce      sync.Once
-	groupDone      chan struct{}
-	groupErr       error
-	stderrDone     chan struct{}
-	rawStderrBytes atomic.Int64
+	cmd               *exec.Cmd
+	stdin             *os.File
+	stdout            *os.File
+	hostResp          *os.File
+	stderr            *os.File
+	pgid              int
+	scanner           *bufio.Scanner
+	frames            chan transportFrame
+	done              chan struct{}
+	waitDone          chan struct{}
+	readDone          chan struct{}
+	waitMu            sync.Mutex
+	waitErr           error
+	abortOnce         sync.Once
+	requestOnce       sync.Once
+	abortDone         chan struct{}
+	abortErr          error
+	requestErr        error
+	groupOnce         sync.Once
+	groupDone         chan struct{}
+	groupErr          error
+	stderrDone        chan struct{}
+	rawStderrBytes    atomic.Int64
+	beforeAbortFinish func()
 }
+
+type processGroupResidualError struct {
+	PGID  int
+	Stage string
+	Err   error
+}
+
+func (e *processGroupResidualError) Error() string {
+	return fmt.Sprintf("process group %d %s: %v", e.PGID, e.Stage, e.Err)
+}
+func (e *processGroupResidualError) Unwrap() error { return e.Err }
 
 func (t *systemWorkerTransport) drainStderr() {
 	defer close(t.stderrDone)
@@ -418,7 +433,7 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 	_ = hostRead.Close()
-	t := &systemWorkerTransport{cmd: cmd, stdin: stdinW, stdout: stdoutR, hostResp: hostWrite, stderr: stderrR, pgid: cmd.Process.Pid, scanner: bufio.NewScanner(stdoutR), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{}), readDone: make(chan struct{}), stderrDone: make(chan struct{}), groupDone: make(chan struct{})}
+	t := &systemWorkerTransport{cmd: cmd, stdin: stdinW, stdout: stdoutR, hostResp: hostWrite, stderr: stderrR, pgid: cmd.Process.Pid, scanner: bufio.NewScanner(stdoutR), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{}), readDone: make(chan struct{}), stderrDone: make(chan struct{}), groupDone: make(chan struct{}), abortDone: make(chan struct{})}
 	go func() { err := cmd.Wait(); t.waitMu.Lock(); t.waitErr = err; t.waitMu.Unlock(); close(t.waitDone) }()
 	t.scanner.Buffer(make([]byte, 64*1024), maxV2WireFrameBytes)
 	go t.readPump()
@@ -431,17 +446,54 @@ func (t *systemWorkerTransport) abort() error {
 		return nil
 	}
 	t.abortOnce.Do(func() {
-		close(t.done)
+		defer close(t.abortDone)
+		t.requestOnce.Do(func() {
+			close(t.done)
+			if err := syscall.Kill(-t.pgid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+				t.waitMu.Lock()
+				t.requestErr = err
+				t.waitMu.Unlock()
+			}
+		})
+		if t.beforeAbortFinish != nil {
+			t.beforeAbortFinish()
+		}
 		groupErr := t.reapProcessGroup()
 		<-t.waitDone
 		t.waitMu.Lock()
-		t.abortErr = errors.Join(t.waitErr, groupErr)
+		if ee, ok := t.waitErr.(*exec.ExitError); ok && !processGroupExists(t.pgid) {
+			_ = ee
+			t.waitErr = nil
+		}
+		t.abortErr = errors.Join(t.requestErr, t.waitErr, groupErr)
 		t.waitMu.Unlock()
 		t.closePipes()
 		<-t.readDone
 		<-t.stderrDone
 	})
 	return t.abortErr
+}
+
+func (t *systemWorkerTransport) requestAbort() {
+	if t == nil || t.cmd == nil || t.cmd.Process == nil {
+		return
+	}
+	t.requestOnce.Do(func() { close(t.done); _ = syscall.Kill(-t.pgid, syscall.SIGTERM); go t.abort() })
+}
+
+func (t *systemWorkerTransport) waitAbort(ctx context.Context) error {
+	if t == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-t.abortDone:
+		return t.abort()
+	case <-ctx.Done():
+		return &processGroupResidualError{PGID: t.pgid, Stage: "abort-pending", Err: ctx.Err()}
+	}
 }
 
 func (t *systemWorkerTransport) reapProcessGroup() error {

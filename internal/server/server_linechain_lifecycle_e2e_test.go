@@ -447,6 +447,30 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if observer.accepted() <= beforeShareTraffic {
 		t.Fatal("public share URI client did not traverse B -> observer -> A")
 	}
+	// Force an inventory drift while the physical chain remains configured.
+	driftSidecar, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftSidecar = bytes.Replace(driftSidecar, []byte(targetUUID), []byte("33333333-3333-4333-8333-333333333333"), 1)
+	if err := os.WriteFile(sidecar, driftSidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, driftSidecar)))
+	refreshReq, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/subscription-shares/"+e5Graph.Share.ID+"/refresh", nil)
+	refreshReq.Header.Set("X-Lattice-CSRF", csrf)
+	for _, c := range cookies {
+		refreshReq.AddCookie(c)
+	}
+	refreshRes, err := httpServer.Client().Do(refreshReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshRaw, _ := io.ReadAll(refreshRes.Body)
+	refreshRes.Body.Close()
+	if refreshRes.StatusCode != http.StatusOK || !bytes.Contains(refreshRaw, []byte(`"stale":true`)) {
+		t.Fatalf("drift refresh status=%d body=%s", refreshRes.StatusCode, refreshRaw)
+	}
 
 	// An independent ordinary metadata writer may change unrelated fields. The
 	// subsequent server-issued remove must preserve that drift and only remove

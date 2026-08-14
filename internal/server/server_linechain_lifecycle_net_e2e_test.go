@@ -184,7 +184,8 @@ func lifecycleStopPGID(t *testing.T, pgid int, done <-chan error, name string) {
 			if done != nil {
 				select {
 				case <-done:
-				default:
+				case <-time.After(5 * time.Second):
+					t.Errorf("%s wait did not complete", name)
 				}
 			}
 			return

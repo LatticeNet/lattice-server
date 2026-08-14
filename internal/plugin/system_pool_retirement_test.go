@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -358,6 +359,143 @@ func TestSystemRunnerV2EnforcesCumulativeStdoutBudget(t *testing.T) {
 		t.Fatalf("cumulative stdout error=%v", err)
 	}
 	assertProcessGroupGone(t, tr.pgid)
+}
+
+func TestSystemRunnerV2ChargesFramedDiagnosticsToSignedBudget(t *testing.T) {
+	tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_STDERR="+strings.Repeat("d", 65))
+	pool := newSystemPool(256, time.Hour, 1)
+	if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pool.drain(1) })
+	resp, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{
+		PluginID: retirementTestPluginID, Generation: 1, Action: "diagnostics",
+		Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 1 << 20, StderrBytes: 64, HostCalls: 0}},
+	})
+	if err != nil || !resp.OK || len(resp.Warnings) != 1 || resp.Warnings[0] != "stderr truncated after 64 bytes" {
+		t.Fatalf("response=%+v err=%v", resp, err)
+	}
+}
+
+func TestSystemRunnerV2FramedDiagnosticsDoNotConsumeStdoutBudget(t *testing.T) {
+	tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_STDERR="+strings.Repeat("d", 64<<10))
+	pool := newSystemPool(256, time.Hour, 1)
+	if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pool.drain(1) })
+	resp, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{
+		PluginID: retirementTestPluginID, Generation: 1, Action: "diagnostics-large",
+		Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 1 << 10, StderrBytes: 64 << 10, HostCalls: 0}},
+	})
+	if err != nil || !resp.OK || len(resp.Warnings) != 0 {
+		t.Fatalf("response=%+v err=%v", resp, err)
+	}
+}
+
+func TestSystemRunnerV2RawStderrIsProcessTelemetryOnly(t *testing.T) {
+	tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_RAW_STDERR="+strings.Repeat("secret", 16<<10))
+	pool := newSystemPool(256, time.Hour, 1)
+	if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pool.drain(1) })
+	runner := runnerWithPool(pool, nil)
+	for i := 0; i < 2; i++ {
+		resp, err := runner.Invoke(t.Context(), InvokeRequest{
+			PluginID: retirementTestPluginID, Generation: 1, Action: "raw-stderr",
+			Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 1 << 20, StderrBytes: 64, HostCalls: 0}},
+		})
+		if err != nil || !resp.OK || len(resp.Warnings) != 0 {
+			t.Fatalf("invoke %d response=%+v err=%v", i, resp, err)
+		}
+	}
+	if got := tr.rawStderrBytes.Load(); got <= 0 || got > HostMaxInvokeStderrBytes {
+		t.Fatalf("bounded raw stderr counter=%d", got)
+	}
+}
+
+func TestSystemRunnerV2RejectsUnboundedDiagnosticFrames(t *testing.T) {
+	for _, env := range []string{"LATTICE_TEST_V2_STDERR_OVERSIZE=1", "LATTICE_TEST_V2_STDERR_TINY_FLOOD=1"} {
+		t.Run(env, func(t *testing.T) {
+			tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", env)
+			pool := newSystemPool(256, time.Hour, 1)
+			if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			runner := runnerWithPool(pool, nil)
+			_, err := runner.Invoke(t.Context(), InvokeRequest{
+				PluginID: retirementTestPluginID, Generation: 1, Action: "diagnostic-hostile",
+				Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 1 << 20, StderrBytes: HostMaxInvokeStderrBytes, HostCalls: 0}},
+			})
+			if err == nil {
+				t.Fatal("unbounded diagnostic frames were accepted")
+			}
+			assertProcessGroupGone(t, tr.pgid)
+			pool.abortClose(1)
+		})
+	}
+}
+
+func TestSystemRunnerV2EnforcesCumulativeDecodedDiagnosticCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		mode   string
+		wantOK bool
+	}{{mode: "exact", wantOK: true}, {mode: "over"}} {
+		t.Run(tc.mode, func(t *testing.T) {
+			tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_STDERR_MULTI="+tc.mode)
+			pool := newSystemPool(256, time.Hour, 1)
+			if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{
+				PluginID: retirementTestPluginID, Generation: 1, Action: tc.mode,
+				Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 1 << 20, StderrBytes: HostMaxInvokeStderrBytes, HostCalls: 0}},
+			})
+			if tc.wantOK {
+				if err != nil || !resp.OK || len(resp.Warnings) != 0 {
+					t.Fatalf("response=%+v err=%v", resp, err)
+				}
+				pool.abortClose(1)
+			} else {
+				if err == nil || !strings.Contains(err.Error(), "diagnostic decoded limit") {
+					t.Fatalf("response=%+v err=%v", resp, err)
+				}
+				assertProcessGroupGone(t, tr.pgid)
+				pool.abortClose(1)
+			}
+		})
+	}
+}
+
+func TestSystemRunnerV2EnforcesFramedDiagnosticOrdering(t *testing.T) {
+	for _, mode := range []string{"late_chunk", "duplicate_complete", "mismatch_complete"} {
+		t.Run(mode, func(t *testing.T) {
+			tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_STDERR_ORDER="+mode)
+			pool := newSystemPool(256, time.Hour, 1)
+			if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: mode})
+			if err != nil || !resp.OK || !jsonEqual(resp.Result, json.RawMessage(`{"helper":true,"pid":`+strconv.Itoa(tr.pgid)+`}`)) || !slices.Contains(resp.Warnings, "persistent worker retired after terminal protocol failure") {
+				t.Fatalf("response=%+v err=%v", resp, err)
+			}
+			assertProcessGroupGone(t, tr.pgid)
+			pool.abortClose(1)
+		})
+	}
+	t.Run("complete_before_result", func(t *testing.T) {
+		tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_STDERR_ORDER=complete_before_result")
+		pool := newSystemPool(256, time.Hour, 1)
+		if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: "complete-before-result"}); err == nil {
+			t.Fatal("stderr_complete before result was accepted")
+		}
+		assertProcessGroupGone(t, tr.pgid)
+		pool.abortClose(1)
+	})
 }
 
 func TestSystemRunnerV2RejectsHostileFramesOnProductionPath(t *testing.T) {

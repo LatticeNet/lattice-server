@@ -240,31 +240,48 @@ type generationAuthority struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	revoked bool
-	active  sync.WaitGroup
+	active  int
+	drained chan struct{}
 }
 
 func newGenerationAuthority() *generationAuthority {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &generationAuthority{ctx: ctx, cancel: cancel}
+	drained := make(chan struct{})
+	close(drained)
+	return &generationAuthority{ctx: ctx, cancel: cancel, drained: drained}
 }
 
 func (a *generationAuthority) acquire(parent context.Context) (context.Context, func(), error) {
 	if a == nil {
 		return parent, func() {}, nil
 	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := parent.Err(); err != nil {
+		return nil, nil, err
+	}
 	a.mu.Lock()
 	if a.revoked {
 		a.mu.Unlock()
 		return nil, nil, errGenerationRevoked
 	}
-	a.active.Add(1)
+	if a.active == 0 {
+		a.drained = make(chan struct{})
+	}
+	a.active++
 	ctx, cancel := context.WithCancel(parent)
 	stop := context.AfterFunc(a.ctx, cancel)
 	a.mu.Unlock()
 	return ctx, func() {
 		stop()
 		cancel()
-		a.active.Done()
+		a.mu.Lock()
+		a.active--
+		if a.active == 0 {
+			close(a.drained)
+		}
+		a.mu.Unlock()
 	}, nil
 }
 
@@ -281,8 +298,9 @@ func (a *generationAuthority) revoke() {
 }
 
 func (a *generationAuthority) wait(ctx context.Context) error {
-	done := make(chan struct{})
-	go func() { a.active.Wait(); close(done) }()
+	a.mu.Lock()
+	done := a.drained
+	a.mu.Unlock()
 	select {
 	case <-done:
 		return nil

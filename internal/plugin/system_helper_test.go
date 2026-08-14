@@ -3,6 +3,7 @@ package plugin
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -121,7 +122,7 @@ func runV2Helper() {
 		}
 		generation = parsed
 	}
-	if _, err := fmt.Fprintf(os.Stdout, `{"protocol":2,"kind":"runtime_ready","generation":%d,"invocation_id":"runtime"}
+	if _, err := fmt.Fprintf(os.Stdout, `{"protocol":2,"kind":"runtime_ready","generation":%d,"invocation_id":"runtime","features":["stderr_frames_v1"]}
 `, generation); err != nil {
 		os.Exit(2)
 	}
@@ -181,7 +182,6 @@ func runV2Helper() {
 			}
 		}
 		if os.Getenv("LATTICE_TEST_V2_NO_READY") == "1" {
-			fmt.Fprintf(os.Stderr, "%s%d %s\n", v2StderrCompleteMarkerPrefix, f.Generation, f.InvocationID)
 			resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID}
 			resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"once":true,"pid":%d}}`, os.Getpid()))
 			_ = enc.Encode(resp)
@@ -207,11 +207,60 @@ func runV2Helper() {
 				resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"helper":true,"pid":%d}}`, os.Getpid()))
 			}
 		}
-		fmt.Fprintf(os.Stderr, "%s%d %s\n", v2StderrCompleteMarkerPrefix, f.Generation, f.InvocationID)
+		complete := stdioJSONV2Frame{Protocol: 2, Kind: "stderr_complete", Generation: f.Generation, InvocationID: f.InvocationID}
+		ready := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_ready", Generation: f.Generation, InvocationID: f.InvocationID}
+		switch os.Getenv("LATTICE_TEST_V2_STDERR_ORDER") {
+		case "complete_before_result":
+			_ = enc.Encode(complete)
+			_ = enc.Encode(resp)
+			_ = enc.Encode(ready)
+			continue
+		case "late_chunk":
+			_ = enc.Encode(resp)
+			_ = enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_chunk", Generation: f.Generation, InvocationID: f.InvocationID, Data: "eA=="})
+			_ = enc.Encode(complete)
+			_ = enc.Encode(ready)
+			continue
+		case "duplicate_complete":
+			_ = enc.Encode(resp)
+			_ = enc.Encode(complete)
+			_ = enc.Encode(complete)
+			continue
+		case "mismatch_complete":
+			_ = enc.Encode(resp)
+			complete.InvocationID = "wrong"
+			_ = enc.Encode(complete)
+			_ = enc.Encode(ready)
+			continue
+		}
+		if raw := os.Getenv("LATTICE_TEST_V2_STDERR"); raw != "" {
+			_ = enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_chunk", Generation: f.Generation, InvocationID: f.InvocationID, Data: base64.StdEncoding.EncodeToString([]byte(raw))})
+		}
+		if os.Getenv("LATTICE_TEST_V2_STDERR_OVERSIZE") == "1" {
+			_ = enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_chunk", Generation: f.Generation, InvocationID: f.InvocationID, Data: strings.Repeat("A", base64.StdEncoding.EncodedLen(HostMaxInvokeStderrBytes)+4)})
+		}
+		if os.Getenv("LATTICE_TEST_V2_STDERR_TINY_FLOOD") == "1" {
+			for range maxV2DiagnosticChunks + 1 {
+				_ = enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_chunk", Generation: f.Generation, InvocationID: f.InvocationID, Data: "eA=="})
+			}
+		}
+		if mode := os.Getenv("LATTICE_TEST_V2_STDERR_MULTI"); mode != "" {
+			first := strings.Repeat("a", HostMaxInvokeStderrBytes/2)
+			secondLen := HostMaxInvokeStderrBytes - len(first)
+			if mode == "over" {
+				secondLen++
+			}
+			for _, chunk := range []string{first, strings.Repeat("b", secondLen)} {
+				_ = enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_chunk", Generation: f.Generation, InvocationID: f.InvocationID, Data: base64.StdEncoding.EncodeToString([]byte(chunk))})
+			}
+		}
+		if raw := os.Getenv("LATTICE_TEST_V2_RAW_STDERR"); raw != "" {
+			_, _ = io.WriteString(os.Stderr, raw)
+		}
 		if enc.Encode(resp) != nil {
 			os.Exit(4)
 		}
-		if enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_complete", Generation: f.Generation, InvocationID: f.InvocationID}) != nil {
+		if enc.Encode(complete) != nil {
 			os.Exit(4)
 		}
 		if os.Getenv("LATTICE_TEST_V2_NO_READY_AFTER_RESULT") == "1" {
@@ -229,7 +278,7 @@ func runV2Helper() {
 			fmt.Fprintln(os.Stdout, `{malformed`)
 			os.Exit(0)
 		}
-		if enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "invoke_ready", Generation: f.Generation, InvocationID: f.InvocationID}) != nil {
+		if enc.Encode(ready) != nil {
 			os.Exit(5)
 		}
 	}

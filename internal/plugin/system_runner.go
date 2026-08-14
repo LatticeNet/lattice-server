@@ -83,6 +83,8 @@ type systemPluginState struct {
 	forceAbort  bool
 	v1Active    map[uint64]context.CancelFunc
 	v1Next      uint64
+	rootCtx     context.Context
+	rootCancel  context.CancelFunc
 }
 
 // SystemRunner implements Runner and Invoker.
@@ -203,6 +205,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 
 	pool := newSystemPool(256, time.Hour, req.Generation)
 	pool.failureFn = func(generation uint64) { r.recordGenerationFailure(pluginID, generation) }
+	pool.successFn = func(generation uint64) { r.recordGenerationSuccess(pluginID, generation) }
 	if isV2 {
 		pool.replenishFn = func(parent context.Context, gen uint64) (*pooledWorker, error) {
 			ctx, cancel := context.WithTimeout(parent, 15*time.Second)
@@ -253,7 +256,8 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		byGeneration = map[uint64]*systemPluginState{}
 		r.st[pluginID] = byGeneration
 	}
-	byGeneration[req.Generation] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), v1Active: map[uint64]context.CancelFunc{}}
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	byGeneration[req.Generation] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel}
 	committed = true
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
@@ -320,7 +324,10 @@ func (r *SystemRunner) RetireGeneration(ctx context.Context, pluginID string, ge
 }
 
 func (r *SystemRunner) maybeStartCleanupLocked(st *systemPluginState) {
-	if !st.retiring || (st.refs != 0 && !st.forceAbort) {
+	// Forced retirement cancels/aborts the generation immediately, but cleanup
+	// ownership remains pinned until every acquired invocation releases. This
+	// keeps workdir removal and cleanupDone behind v1 Cmd.Wait/process reaping.
+	if !st.retiring || st.refs != 0 {
 		return
 	}
 	st.cleanupOnce.Do(func() {
@@ -470,6 +477,9 @@ func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 			st.admitted = false
 			st.retiring = true
 			st.forceAbort = true
+			if st.rootCancel != nil {
+				st.rootCancel()
+			}
 			states = append(states, st)
 			for _, cancel := range st.v1Active {
 				v1Cancels = append(v1Cancels, cancel)
@@ -485,6 +495,11 @@ func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 		if st.pool != nil {
 			st.pool.abortClose(st.generation)
 		}
+	}
+	for _, cancel := range v1Cancels {
+		cancel()
+	}
+	for _, st := range states {
 		if ctx == nil {
 			<-st.cleanupDone
 			continue
@@ -494,9 +509,6 @@ func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	}
-	for _, cancel := range v1Cancels {
-		cancel()
 	}
 	return nil
 }
@@ -513,6 +525,9 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 			st.admitted = false
 			st.retiring = true
 			st.forceAbort = true
+			if st.rootCancel != nil {
+				st.rootCancel()
+			}
 			states = append(states, st)
 			for _, cancel := range st.v1Active {
 				v1Cancels = append(v1Cancels, cancel)
@@ -528,6 +543,11 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 		if st.pool != nil {
 			st.pool.abortClose(st.generation)
 		}
+	}
+	for _, cancel := range v1Cancels {
+		cancel()
+	}
+	for _, st := range states {
 		if ctx == nil {
 			<-st.cleanupDone
 			continue
@@ -537,9 +557,6 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	}
-	for _, cancel := range v1Cancels {
-		cancel()
 	}
 	return nil
 }
@@ -553,6 +570,8 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 type systemInvocationLease struct {
 	runner *SystemRunner
 	state  *systemPluginState
+	ctx    context.Context
+	cancel context.CancelFunc
 	once   sync.Once
 }
 
@@ -564,16 +583,36 @@ func (r *SystemRunner) AcquireInvocation(pluginID string, generation uint64) (In
 		return nil, fmt.Errorf("plugin %q generation %d is not admitted", pluginID, generation)
 	}
 	st.refs++
+	if st.rootCtx == nil {
+		st.rootCtx, st.rootCancel = context.WithCancel(context.Background())
+	}
+	leaseCtx, leaseCancel := context.WithCancel(st.rootCtx)
 	r.mu.Unlock()
-	return &systemInvocationLease{runner: r, state: st}, nil
+	return &systemInvocationLease{runner: r, state: st, ctx: leaseCtx, cancel: leaseCancel}, nil
 }
 
 func (l *systemInvocationLease) Invoke(ctx context.Context, req InvokeRequest) (InvokeResponse, error) {
-	return l.runner.invokeState(ctx, req, l.state)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return InvokeResponse{}, err
+	}
+	if err := l.ctx.Err(); err != nil {
+		return InvokeResponse{}, err
+	}
+	invokeCtx, cancel := context.WithCancel(l.ctx)
+	stop := context.AfterFunc(ctx, cancel)
+	defer func() { stop(); cancel() }()
+	if err := invokeCtx.Err(); err != nil {
+		return InvokeResponse{}, err
+	}
+	return l.runner.invokeState(invokeCtx, req, l.state)
 }
 
 func (l *systemInvocationLease) Release() {
 	l.once.Do(func() {
+		l.cancel()
 		r := l.runner
 		r.mu.Lock()
 		l.state.refs--
@@ -1197,6 +1236,15 @@ func (r *SystemRunner) recordGenerationFailure(pluginID string, generation uint6
 	r.mu.Unlock()
 	if st != nil {
 		r.recordLifecycleFailure(pluginID, st)
+	}
+}
+
+func (r *SystemRunner) recordGenerationSuccess(pluginID string, generation uint64) {
+	r.mu.Lock()
+	st := r.st[pluginID][generation]
+	r.mu.Unlock()
+	if st != nil {
+		r.recordLifecycleSuccess(pluginID, st)
 	}
 }
 

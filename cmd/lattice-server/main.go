@@ -240,20 +240,30 @@ type runtimeCloser interface{ Close(context.Context) error }
 func serveUntilSignal(srv *http.Server, app runtimeCloser, serve func() error) error {
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	return serveUntilContext(signalCtx, 15*time.Second, srv, app, serve)
+}
+
+func serveUntilContext(signalCtx context.Context, shutdownTimeout time.Duration, srv *http.Server, app runtimeCloser, serve func() error) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- serve() }()
 	select {
 	case err := <-serveErr:
-		closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		closeCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		closeErr := app.Close(closeCtx)
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}
-		return errors.Join(err, closeErr)
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- app.Close(closeCtx) }()
+		select {
+		case closeErr := <-closeDone:
+			return errors.Join(err, closeErr)
+		case <-closeCtx.Done():
+			return errors.Join(err, closeCtx.Err(), srv.Close())
+		}
 	case <-signalCtx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	httpDone := make(chan error, 1)
 	runtimeDone := make(chan error, 1)
@@ -270,23 +280,35 @@ func serveUntilSignal(srv *http.Server, app runtimeCloser, serve func() error) e
 			completed++
 		case <-shutdownCtx.Done():
 			httpErr = errors.Join(httpErr, shutdownCtx.Err(), srv.Close())
-			if httpDone != nil {
-				httpErr = errors.Join(httpErr, <-httpDone)
-				httpDone = nil
-				completed++
+			select {
+			case err := <-httpDone:
+				httpErr = errors.Join(httpErr, err)
+			default:
 			}
-			if runtimeDone != nil {
-				runtimeErr = errors.Join(runtimeErr, <-runtimeDone)
-				runtimeDone = nil
-				completed++
+			select {
+			case err := <-runtimeDone:
+				runtimeErr = errors.Join(runtimeErr, err)
+			default:
 			}
+			select {
+			case err := <-serveErr:
+				if !errors.Is(err, http.ErrServerClosed) {
+					httpErr = errors.Join(httpErr, err)
+				}
+			default:
+			}
+			return errors.Join(httpErr, runtimeErr)
 		}
 	}
-	serveResult := <-serveErr
-	if errors.Is(serveResult, http.ErrServerClosed) {
-		serveResult = nil
+	select {
+	case serveResult := <-serveErr:
+		if errors.Is(serveResult, http.ErrServerClosed) {
+			serveResult = nil
+		}
+		return errors.Join(httpErr, runtimeErr, serveResult)
+	case <-shutdownCtx.Done():
+		return errors.Join(httpErr, runtimeErr, shutdownCtx.Err(), srv.Close())
 	}
-	return errors.Join(httpErr, runtimeErr, serveResult)
 }
 
 // defaultDataPath keeps persistent state out of world-writable /tmp by default,

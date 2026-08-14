@@ -184,11 +184,17 @@ func TestSystemPoolOverflowReservesSingleStartingWorker(t *testing.T) {
 
 func TestSystemPoolWaiterReceivesCloseError(t *testing.T) {
 	p := newSystemPool(2, time.Hour)
+	entered := make(chan struct{})
+	p.replenishFn = func(ctx context.Context, _ uint64) (*pooledWorker, error) {
+		close(entered)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { _, err := p.checkout(ctx, time.Now()); done <- err }()
-	time.Sleep(time.Millisecond)
+	<-entered
 	p.abortClose(1)
 	select {
 	case err := <-done:
@@ -202,13 +208,17 @@ func TestSystemPoolWaiterReceivesCloseError(t *testing.T) {
 
 func TestSystemPoolReplenishFailuresOpenCircuitAndStopAttempts(t *testing.T) {
 	p := newSystemPool(8, time.Hour, 11)
-	p.backoffBase = time.Millisecond
+	p.jitterFn = func(delay time.Duration) time.Duration { return delay }
+	p.waitBackoff = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
 	var mu sync.Mutex
 	attempts := 0
+	attempted := make(chan int, 4)
 	p.replenishFn = func(context.Context, uint64) (*pooledWorker, error) {
 		mu.Lock()
 		attempts++
+		attempt := attempts
 		mu.Unlock()
+		attempted <- attempt
 		return nil, errors.New("spawn failed")
 	}
 	p.failureFn = func(uint64) {
@@ -224,7 +234,16 @@ func TestSystemPoolReplenishFailuresOpenCircuitAndStopAttempts(t *testing.T) {
 	if _, err := p.checkout(ctx, time.Now()); !errors.Is(err, ErrCircuitOpen) {
 		t.Fatalf("checkout error=%v want ErrCircuitOpen", err)
 	}
-	time.Sleep(10 * time.Millisecond)
+	for want := 1; want <= 3; want++ {
+		select {
+		case got := <-attempted:
+			if got != want {
+				t.Fatalf("attempt=%d want %d", got, want)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
 	mu.Lock()
 	got := attempts
 	mu.Unlock()
@@ -232,6 +251,55 @@ func TestSystemPoolReplenishFailuresOpenCircuitAndStopAttempts(t *testing.T) {
 		t.Fatalf("replenish attempts=%d want exactly 3", got)
 	}
 	p.abortClose(11)
+}
+
+func TestSystemPoolSuccessfulReplenishmentResetsConsecutiveFailures(t *testing.T) {
+	p := newSystemPool(8, time.Hour, 13)
+	p.jitterFn = func(delay time.Duration) time.Duration { return delay }
+	p.waitBackoff = func(ctx context.Context, _ time.Duration) bool { return ctx.Err() == nil }
+	var mu sync.Mutex
+	consecutive := 0
+	attempts := 0
+	p.failureFn = func(uint64) {
+		mu.Lock()
+		defer mu.Unlock()
+		consecutive++
+		if consecutive >= 3 {
+			p.setCircuitOpen(true)
+		}
+	}
+	p.successFn = func(uint64) {
+		mu.Lock()
+		consecutive = 0
+		mu.Unlock()
+	}
+	p.replenishFn = func(context.Context, uint64) (*pooledWorker, error) {
+		mu.Lock()
+		attempts++
+		attempt := attempts
+		mu.Unlock()
+		if attempt == 3 {
+			return &pooledWorker{started: time.Now()}, nil
+		}
+		return nil, errors.New("spawn failed")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	w, err := p.checkout(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.poison(w)
+	if _, err := p.checkout(ctx, time.Now()); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("checkout error=%v want ErrCircuitOpen", err)
+	}
+	mu.Lock()
+	gotAttempts, gotConsecutive := attempts, consecutive
+	mu.Unlock()
+	if gotAttempts != 6 || gotConsecutive != 3 {
+		t.Fatalf("attempts=%d consecutive=%d want 6/3", gotAttempts, gotConsecutive)
+	}
+	p.abortClose(13)
 }
 
 func TestSystemPoolCanceledAttemptDoesNotKillSupervisor(t *testing.T) {

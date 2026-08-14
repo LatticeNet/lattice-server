@@ -127,7 +127,13 @@ func decodeStdioJSONV2Frame(data []byte, limits ...int) (stdioJSONV2Frame, error
 	allowed := map[string]bool{"protocol": true, "kind": true, "generation": true, "invocation_id": true}
 	required := []string(nil)
 	switch f.Kind {
-	case "runtime_ready", "stderr_complete", "invoke_ready":
+	case "runtime_ready":
+		allowed["features"] = true
+		required = append(required, "features")
+	case "stderr_complete", "invoke_ready":
+	case "stderr_chunk":
+		allowed["data"] = true
+		required = append(required, "data")
 	case "invoke_result":
 		allowed["response"] = true
 		required = append(required, "response")
@@ -241,6 +247,8 @@ type stdioJSONV2Frame struct {
 	Response     json.RawMessage `json:"response,omitempty"`
 	HostCall     json.RawMessage `json:"host_call,omitempty"`
 	HostResponse json.RawMessage `json:"host_response,omitempty"`
+	Features     []string        `json:"features,omitempty"`
+	Data         string          `json:"data,omitempty"`
 }
 
 func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationID, hostCallID string) error {
@@ -257,9 +265,15 @@ func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationI
 		return fmt.Errorf("stdio frame kind is required")
 	}
 	nonempty := func(b json.RawMessage) bool { return len(b) != 0 && string(b) != "null" }
+	if f.Kind != "runtime_ready" && len(f.Features) != 0 {
+		return fmt.Errorf("features are only valid on runtime_ready")
+	}
+	if f.Kind != "stderr_chunk" && f.Data != "" {
+		return fmt.Errorf("data is only valid on stderr_chunk")
+	}
 	switch f.Kind {
 	case "runtime_ready":
-		if f.InvocationID != "runtime" || f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
+		if f.InvocationID != "runtime" || len(f.Features) != 1 || f.Features[0] != "stderr_frames_v1" || f.Data != "" || f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
 			return fmt.Errorf("invalid runtime_ready schema")
 		}
 	case "invoke_result":
@@ -271,8 +285,12 @@ func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationI
 			return fmt.Errorf("invalid invoke_ready schema")
 		}
 	case "stderr_complete":
-		if f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
+		if len(f.Features) != 0 || f.Data != "" || f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
 			return fmt.Errorf("invalid stderr_complete schema")
+		}
+	case "stderr_chunk":
+		if f.Data == "" || len(f.Features) != 0 || f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
+			return fmt.Errorf("invalid stderr_chunk schema")
 		}
 	case "host_call":
 		if f.HostCallID == "" || !nonempty(f.HostCall) || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostResponse) {

@@ -210,6 +210,13 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 		broker.authority.revoke()
 		return RuntimeStatus{}, errors.New("runtime manager is closed")
 	}
+	if current, ok := m.instances[loaded.Manifest.ID]; ok && current.status.State == RuntimeStateArmed {
+		if _, transactional := runner.(TransactionalRunner); !transactional {
+			m.mu.Unlock()
+			broker.authority.revoke()
+			return current.status, errors.New("runtime replacement requires a transactional runner")
+		}
+	}
 	m.nextGen++
 	generation := m.nextGen
 	m.latestGen[loaded.Manifest.ID] = generation
@@ -290,6 +297,11 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 	}
 	if isTransactional {
 		if activateErr := transactional.ActivateGeneration(loaded.Manifest.ID, generation); activateErr != nil {
+			if !currentOK || current.status.State != RuntimeStateArmed {
+				status.State = RuntimeStateFailed
+				status.Message = activateErr.Error()
+				m.instances[loaded.Manifest.ID] = runtimeInstance{status: status, generation: generation}
+			}
 			m.mu.Unlock()
 			broker.authority.revoke()
 			abortCtx, abortCancel := context.WithTimeout(context.Background(), m.timeout)
@@ -298,8 +310,6 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 			if currentOK && current.status.State == RuntimeStateArmed {
 				return current.status, activateErr
 			}
-			status.State = RuntimeStateFailed
-			status.Message = activateErr.Error()
 			return status, activateErr
 		}
 	}
@@ -353,15 +363,23 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 
 	if ok && runner != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
-		var stopErr error
-		if oldBroker != nil && oldBroker.authority != nil {
-			stopErr = oldBroker.authority.wait(ctx)
-		}
 		stopGeneration := generation
 		if _, transactional := runner.(TransactionalRunner); transactional {
 			stopGeneration = tombstone
 		}
-		err := errors.Join(stopErr, runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message, Generation: stopGeneration}))
+		runnerDone := make(chan error, 1)
+		authorityDone := make(chan error, 1)
+		go func() {
+			runnerDone <- runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message, Generation: stopGeneration})
+		}()
+		go func() {
+			if oldBroker != nil && oldBroker.authority != nil {
+				authorityDone <- oldBroker.authority.wait(ctx)
+				return
+			}
+			authorityDone <- nil
+		}()
+		err := errors.Join(<-runnerDone, <-authorityDone)
 		cancel()
 		if err != nil {
 			m.mu.Lock()
@@ -436,24 +454,32 @@ func (m *RuntimeManager) Close(ctx context.Context) error {
 		m.instances[pluginID] = inst
 	}
 	m.mu.Unlock()
+	go m.finishClose(runners, pendingDone)
+	select {
+	case <-m.closeDone:
+		m.mu.Lock()
+		err := m.closeErr
+		m.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *RuntimeManager) finishClose(runners map[Runner]struct{}, pendingDone []<-chan struct{}) {
 	var joined error
 	for runner := range runners {
 		if closer, ok := runner.(RunnerCloser); ok {
-			joined = errors.Join(joined, closer.StopAll(ctx))
+			joined = errors.Join(joined, closer.StopAll(context.Background()))
 		}
 	}
 	for _, done := range pendingDone {
-		select {
-		case <-done:
-		case <-ctx.Done():
-			joined = errors.Join(joined, ctx.Err())
-		}
+		<-done
 	}
 	m.mu.Lock()
 	m.closeErr = joined
 	close(m.closeDone)
 	m.mu.Unlock()
-	return joined
 }
 
 func (m *RuntimeManager) Status(pluginID string) (RuntimeStatus, bool) {

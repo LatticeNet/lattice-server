@@ -38,7 +38,7 @@ func TestDecodeStrictV2RejectsDuplicateAndTrailing(t *testing.T) {
 }
 
 func TestRequireV2FieldsRejectsMissingAndNull(t *testing.T) {
-	valid := []byte(`{"protocol":2,"kind":"runtime_ready","generation":1,"invocation_id":"runtime"}`)
+	valid := []byte(`{"protocol":2,"kind":"runtime_ready","generation":1,"invocation_id":"runtime","features":["stderr_frames_v1"]}`)
 	if err := requireV2Fields(valid, "protocol", "kind", "generation", "invocation_id"); err != nil {
 		t.Fatal(err)
 	}

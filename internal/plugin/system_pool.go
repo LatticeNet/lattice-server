@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -40,6 +41,7 @@ type systemPool struct {
 	closed      bool
 	replenishFn func(context.Context, uint64) (*pooledWorker, error)
 	failureFn   func(uint64)
+	successFn   func(uint64)
 	active      int
 	starting    int
 	drained     chan struct{}
@@ -53,6 +55,8 @@ type systemPool struct {
 	superStart  bool
 	attemptStop context.CancelFunc
 	backoffBase time.Duration
+	jitterFn    func(time.Duration) time.Duration
+	waitBackoff func(context.Context, time.Duration) bool
 }
 
 type poolCheckoutResult struct {
@@ -87,7 +91,26 @@ func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *sy
 		generation = generations[0]
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1, leased: map[*pooledWorker]struct{}{}, drained: make(chan struct{}), superCtx: ctx, superCancel: cancel, superSignal: make(chan struct{}, 1), superDone: make(chan struct{}), backoffBase: 100 * time.Millisecond}
+	return &systemPool{
+		maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1,
+		leased: map[*pooledWorker]struct{}{}, drained: make(chan struct{}),
+		superCtx: ctx, superCancel: cancel, superSignal: make(chan struct{}, 1),
+		superDone: make(chan struct{}), backoffBase: 100 * time.Millisecond,
+		jitterFn: func(delay time.Duration) time.Duration {
+			jitter := time.Duration(rand.Uint64()%21) * delay / 100
+			return min(30*time.Second, delay+jitter)
+		},
+		waitBackoff: func(ctx context.Context, delay time.Duration) bool {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return false
+			case <-timer.C:
+				return true
+			}
+		},
+	}
 }
 
 func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error {
@@ -346,13 +369,21 @@ func (p *systemPool) replenishSupervisor() {
 				nw.state = workerIdle
 				nw.generation = generation
 				p.workers = append(p.workers, nw)
-				retired = p.wakeLocked(time.Now())
 			}
-			failureFn := p.failureFn
+			failureFn, successFn := p.failureFn, p.successFn
 			recordFailure := err != nil && failureFn != nil && !errors.Is(err, context.Canceled)
+			recordSuccess := valid && successFn != nil
 			p.mu.Unlock()
 			if recordFailure {
 				failureFn(generation)
+			}
+			if valid {
+				if recordSuccess {
+					successFn(generation)
+				}
+				p.mu.Lock()
+				retired = append(retired, p.wakeLocked(time.Now())...)
+				p.mu.Unlock()
 			}
 			abortTransports(retired)
 			if !valid && nw != nil && nw.transport != nil {
@@ -370,20 +401,11 @@ func (p *systemPool) replenishSupervisor() {
 			if delay > 30*time.Second {
 				delay = 30 * time.Second
 			}
-			// Deterministic per-generation jitter avoids synchronized restarts while
-			// keeping tests reproducible and bounded below the 30s cap.
-			jitter := time.Duration((p.generation+uint64(attempt*17))%21) * delay / 100
-			if delay+jitter > 30*time.Second {
-				delay = 30 * time.Second
-			} else {
-				delay += jitter
+			if p.jitterFn != nil {
+				delay = p.jitterFn(delay)
 			}
-			timer := time.NewTimer(delay)
-			select {
-			case <-p.superCtx.Done():
-				timer.Stop()
+			if !p.waitBackoff(p.superCtx, delay) {
 				return
-			case <-timer.C:
 			}
 		}
 	}
@@ -512,8 +534,7 @@ func (p *systemPool) pruneInvalidLocked(now time.Time) []*systemWorkerTransport 
 	kept := p.workers[:0]
 	var retired []*systemWorkerTransport
 	for _, w := range p.workers {
-		stderrViolation := w != nil && w.transport != nil && w.transport.stderrProtocolViolation()
-		if w == nil || w.state != workerIdle || w.generation != p.generation || w.uses >= p.maxUses || now.Sub(w.started) >= p.maxAge || stderrViolation {
+		if w == nil || w.state != workerIdle || w.generation != p.generation || w.uses >= p.maxUses || now.Sub(w.started) >= p.maxAge {
 			if w != nil {
 				w.state = workerDead
 				if w.transport != nil {

@@ -113,6 +113,23 @@ func TestRuntimeManagerUsesRegisteredRunnerWithBrokerAndTimeout(t *testing.T) {
 	}
 }
 
+func TestRuntimeManagerRejectsUnsafeNontransactionalReplacement(t *testing.T) {
+	runner := &recordingRunner{name: "legacy"}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: runner}})
+	loaded := testRuntimeLoaded("legacy-replace.bundle")
+	first, err := m.Start(context.Background(), loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Start(context.Background(), loaded)
+	if err == nil || !strings.Contains(err.Error(), "transactional") || got.State != RuntimeStateArmed || runner.startCalls != 1 {
+		t.Fatalf("status=%+v startCalls=%d err=%v", got, runner.startCalls, err)
+	}
+	if current, ok := m.Status(loaded.Manifest.ID); !ok || current.StartedAt != first.StartedAt {
+		t.Fatalf("old runtime was not preserved: current=%+v ok=%v first=%+v", current, ok, first)
+	}
+}
+
 func TestRuntimeManagerRecordsFailedHealthWhenRunnerStartFails(t *testing.T) {
 	runner := &recordingRunner{name: "broken", startErr: errors.New("runner refused")}
 	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{
@@ -236,27 +253,34 @@ func TestRuntimeManagerPinsGenerationBeforeReplacementRetiresIt(t *testing.T) {
 	if _, err := m.Start(context.Background(), loaded); err != nil {
 		t.Fatal(err)
 	}
-	runner.blockAcquire = make(chan struct{})
-	runner.acquireEntered = make(chan struct{})
+	runner.blockInvoke = make(chan struct{})
+	runner.invokeEntered = make(chan struct{})
+	runner.retireEntered = make(chan struct{})
 	invokeDone := make(chan InvokeResponse, 1)
 	go func() {
 		resp, _ := m.Invoke(context.Background(), loaded.Manifest.ID, "old", nil)
 		invokeDone <- resp
 	}()
-	<-runner.acquireEntered
+	<-runner.invokeEntered
 	startDone := make(chan error, 1)
 	go func() { _, err := m.Start(context.Background(), loaded); startDone <- err }()
-	close(runner.blockAcquire)
-	if err := <-startDone; err != nil {
-		t.Fatal(err)
-	}
-	resp := <-invokeDone
-	if string(resp.Result) != `{"generation":1}` {
-		t.Fatalf("pinned invocation switched generations: %s", resp.Result)
-	}
+	<-runner.retireEntered
 	resp, err := m.Invoke(context.Background(), loaded.Manifest.ID, "new", nil)
 	if err != nil || string(resp.Result) != `{"generation":2}` {
 		t.Fatalf("new invocation did not use committed generation: resp=%s err=%v", resp.Result, err)
+	}
+	select {
+	case err := <-startDone:
+		t.Fatalf("replacement returned before pinned old generation released: %v", err)
+	default:
+	}
+	close(runner.blockInvoke)
+	resp = <-invokeDone
+	if string(resp.Result) != `{"generation":1}` {
+		t.Fatalf("pinned invocation switched generations: %s", resp.Result)
+	}
+	if err := <-startDone; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -291,6 +315,73 @@ func TestRuntimeManagerCloseWaitsPendingPrepareAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestRuntimeManagerCloseTimeoutDoesNotPublishFalseCompletion(t *testing.T) {
+	runner := newTransactionalTestRunner()
+	runner.blockPrepare = make(chan struct{})
+	runner.prepareEntered = make(chan struct{})
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: runner}})
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := m.Start(context.Background(), testRuntimeLoaded("close-timeout.bundle"))
+		startDone <- err
+	}()
+	<-runner.prepareEntered
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.Close(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close error=%v want canceled", err)
+	}
+	select {
+	case <-m.closeDone:
+		t.Fatal("closeDone closed before pending Prepare completed")
+	default:
+	}
+	close(runner.blockPrepare)
+	_ = <-startDone
+	if err := m.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRuntimeManagerStopAbortsRunnerWithoutWaitingForAuthorityDrain(t *testing.T) {
+	runner := &blockingStopRunner{stopEntered: make(chan struct{}), releaseStop: make(chan struct{})}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: runner}, StartTimeout: 100 * time.Millisecond})
+	broker, err := NewBroker(testRuntimeLoaded("stop-authority.bundle"), HostServices{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := newGenerationAuthority()
+	broker.attachAuthority(authority)
+	_, release, err := authority.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.instances["stop-authority.bundle"] = runtimeInstance{
+		status: RuntimeStatus{PluginID: "stop-authority.bundle", State: RuntimeStateArmed},
+		broker: broker, runner: runner, generation: 1,
+	}
+	stopDone := make(chan error, 1)
+	go func() { _, err := m.Stop("stop-authority.bundle", "disable"); stopDone <- err }()
+	select {
+	case <-runner.stopEntered:
+		close(runner.releaseStop)
+	case <-time.After(time.Second):
+		t.Fatal("runner.Stop waited behind authority drain")
+	}
+	select {
+	case err := <-stopDone:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Stop error=%v want deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not return within its bound")
+	}
+	release()
+	if err := authority.wait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func testRuntimeLoaded(id string) Loaded {
 	return Loaded{Manifest: Manifest{ID: id, Name: id, Type: TypeSystem, Capabilities: []string{"node:read"}}, Capabilities: []string{"node:read"}}
 }
@@ -305,10 +396,16 @@ type transactionalTestRunner struct {
 	blockAcquire   chan struct{}
 	acquireEntered chan struct{}
 	stopAllCalls   int
+	activateErr    error
+	refs           map[uint64]int
+	retireDone     map[uint64]chan struct{}
+	blockInvoke    chan struct{}
+	invokeEntered  chan struct{}
+	retireEntered  chan struct{}
 }
 
 func newTransactionalTestRunner() *transactionalTestRunner {
-	return &transactionalTestRunner{prepared: map[uint64]bool{}, active: map[uint64]bool{}, retired: map[uint64]bool{}}
+	return &transactionalTestRunner{prepared: map[uint64]bool{}, active: map[uint64]bool{}, retired: map[uint64]bool{}, refs: map[uint64]int{}, retireDone: map[uint64]chan struct{}{}}
 }
 func (r *transactionalTestRunner) Name() string { return "transactional-test" }
 func (r *transactionalTestRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
@@ -337,11 +434,28 @@ func (r *transactionalTestRunner) Prepare(ctx context.Context, req RunnerStartRe
 func (r *transactionalTestRunner) ActivateGeneration(_ string, generation uint64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.activateErr != nil {
+		return r.activateErr
+	}
 	if !r.prepared[generation] {
 		return errors.New("not prepared")
 	}
 	r.active[generation] = true
 	return nil
+}
+
+func TestRuntimeManagerStoresInitialActivationFailure(t *testing.T) {
+	runner := newTransactionalTestRunner()
+	runner.activateErr = errors.New("activation rejected")
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: runner}})
+	status, err := m.Start(context.Background(), testRuntimeLoaded("activate-fail.bundle"))
+	if err == nil || status.State != RuntimeStateFailed || status.Message != "activation rejected" {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	stored, ok := m.Status("activate-fail.bundle")
+	if !ok || stored.State != RuntimeStateFailed || stored.Message != "activation rejected" {
+		t.Fatalf("stored=%+v ok=%v", stored, ok)
+	}
 }
 func (r *transactionalTestRunner) AbortGeneration(_ context.Context, _ string, generation uint64) error {
 	r.mu.Lock()
@@ -354,6 +468,20 @@ func (r *transactionalTestRunner) RetireGeneration(_ context.Context, _ string, 
 	r.mu.Lock()
 	r.active[generation] = false
 	r.retired[generation] = true
+	if r.retireEntered != nil {
+		select {
+		case <-r.retireEntered:
+		default:
+			close(r.retireEntered)
+		}
+	}
+	if r.refs[generation] > 0 {
+		done := make(chan struct{})
+		r.retireDone[generation] = done
+		r.mu.Unlock()
+		<-done
+		return nil
+	}
 	r.mu.Unlock()
 	return nil
 }
@@ -396,15 +524,41 @@ func (r *transactionalTestRunner) AcquireInvocation(_ string, generation uint64)
 	if !active {
 		return nil, errors.New("not active")
 	}
-	return transactionalTestLease{generation: generation}, nil
+	r.mu.Lock()
+	r.refs[generation]++
+	r.mu.Unlock()
+	return &transactionalTestLease{runner: r, generation: generation}, nil
 }
 
-type transactionalTestLease struct{ generation uint64 }
+type transactionalTestLease struct {
+	runner     *transactionalTestRunner
+	generation uint64
+}
 
-func (l transactionalTestLease) Invoke(context.Context, InvokeRequest) (InvokeResponse, error) {
+func (l *transactionalTestLease) Invoke(context.Context, InvokeRequest) (InvokeResponse, error) {
+	if l.generation == 1 && l.runner.invokeEntered != nil {
+		select {
+		case <-l.runner.invokeEntered:
+		default:
+			close(l.runner.invokeEntered)
+		}
+		if l.runner.blockInvoke != nil {
+			<-l.runner.blockInvoke
+		}
+	}
 	return InvokeResponse{OK: true, Result: json.RawMessage(fmt.Sprintf(`{"generation":%d}`, l.generation))}, nil
 }
-func (transactionalTestLease) Release() {}
+func (l *transactionalTestLease) Release() {
+	l.runner.mu.Lock()
+	l.runner.refs[l.generation]--
+	if l.runner.refs[l.generation] == 0 {
+		if done := l.runner.retireDone[l.generation]; done != nil {
+			delete(l.runner.retireDone, l.generation)
+			close(done)
+		}
+	}
+	l.runner.mu.Unlock()
+}
 
 func TestRuntimeManagerPassesInvocationBudgetToRunner(t *testing.T) {
 	runner := &recordingInvokeRunner{}

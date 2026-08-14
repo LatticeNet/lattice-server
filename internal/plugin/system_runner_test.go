@@ -61,6 +61,102 @@ func TestSystemRunnerHappyPath(t *testing.T) {
 	}
 }
 
+func TestSystemInvocationLeaseRejectsCanceledCallerBeforeDispatch(t *testing.T) {
+	canary := filepath.Join(t.TempDir(), "started")
+	loaded := makeBundle(t, "p.cancel-before-dispatch", "#!/bin/sh\ntouch "+canary+"\n", "")
+	r := newRunner(t, SystemRunnerOptions{})
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := r.AcquireInvocation(loaded.Manifest.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := lease.Invoke(ctx, InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Invoke error=%v want context.Canceled", err)
+	}
+	lease.Release()
+	if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled invocation dispatched: stat err=%v", err)
+	}
+}
+
+func TestSystemRunnerStopCancelsAcquiredV1BeforeDispatch(t *testing.T) {
+	canary := filepath.Join(t.TempDir(), "started")
+	loaded := makeBundle(t, "p.stop-before-dispatch", "#!/bin/sh\ntouch "+canary+"\n", "")
+	r := newRunner(t, SystemRunnerOptions{})
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := r.AcquireInvocation(loaded.Manifest.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- r.Stop(t.Context(), RunnerStopRequest{PluginID: loaded.Manifest.ID, Generation: 1})
+	}()
+	systemLease := lease.(*systemInvocationLease)
+	select {
+	case <-systemLease.ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("generation root was not canceled")
+	}
+	if _, err := lease.Invoke(context.Background(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Invoke error=%v want context.Canceled", err)
+	}
+	lease.Release()
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stopped invocation dispatched: stat err=%v", err)
+	}
+}
+
+func TestSystemRunnerStopWaitsForActiveV1ProcessReap(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	loaded := makeBundle(t, "p.stop-active-v1", "#!/bin/sh\nread line\necho $$ > '"+pidFile+"'\nsleep 30\n", "")
+	r := newRunner(t, SystemRunnerOptions{StopGrace: 10 * time.Millisecond})
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	invokeDone := make(chan error, 1)
+	go func() {
+		_, err := r.Invoke(context.Background(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Action: "block"})
+		invokeDone <- err
+	}()
+	var pid int
+	deadline := time.After(5 * time.Second)
+	for pid == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("v1 helper did not start")
+		default:
+			data, _ := os.ReadFile(pidFile)
+			_, _ = fmt.Sscanf(string(data), "%d", &pid)
+		}
+	}
+	if err := r.Stop(t.Context(), RunnerStopRequest{PluginID: loaded.Manifest.ID, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-invokeDone; err == nil {
+		t.Fatal("active v1 invocation unexpectedly succeeded")
+	}
+	assertProcessGroupGone(t, pid)
+}
+
 // Gate: arg-vector exec, no shell. Shell metacharacters in the payload reach the
 // plugin as literal data over stdin; they are never interpreted as a command.
 func TestSystemRunnerNoShellInjection(t *testing.T) {

@@ -69,6 +69,8 @@ func ObserveAuditAppend(err error) {
 	defaultRegistry.ObserveAuditAppend(err)
 }
 
+// ObserveHTTPRequest records a path already classified by
+// RequestPathForObservability; this string-only API cannot infer method semantics.
 func ObserveHTTPRequest(path string, status int, d time.Duration, slow bool) {
 	defaultRegistry.ObserveHTTPRequest(path, status, d, slow)
 }
@@ -98,22 +100,41 @@ func RedactSubscriptionPath(value string) string {
 }
 
 // RequestPathForObservability returns one request path safe for logs and
-// telemetry without modifying the URL used for routing. ServeMux cleans the
-// escaped path before matching, so an encoded slash can make URL.Path and the
-// effective redirect target resolve differently.
+// telemetry without modifying the URL used for routing. ServeMux unescapes
+// path segments individually, so escaped slashes must remain inside their
+// original segment while classifying the raw and effective first segments.
 func RequestPathForObservability(r *http.Request) string {
 	if r == nil || r.URL == nil {
 		return ""
 	}
-	if value := RedactSubscriptionPath(r.URL.Path); value == RedactedSubscriptionPath {
-		return value
-	}
 
-	effective, err := url.PathUnescape(pathpkg.Clean(r.URL.EscapedPath()))
-	if err == nil && isSubscriptionPath(effective) {
+	escapedPath := r.URL.EscapedPath()
+	if hasEscapedSubscriptionFirstSegment(escapedPath) {
 		return RedactedSubscriptionPath
 	}
+	effectivePath := escapedPath
+	if r.Method != http.MethodConnect {
+		effectivePath = pathpkg.Clean(effectivePath)
+	}
+	if hasEscapedSubscriptionFirstSegment(effectivePath) {
+		return RedactedSubscriptionPath
+	}
+	if RedactSubscriptionPath(r.URL.Path) == RedactedSubscriptionPath {
+		return escapedPath
+	}
 	return r.URL.Path
+}
+
+func hasEscapedSubscriptionFirstSegment(escapedPath string) bool {
+	if !strings.HasPrefix(escapedPath, "/") {
+		return false
+	}
+	firstSegment := escapedPath[1:]
+	if slash := strings.IndexByte(firstSegment, '/'); slash >= 0 {
+		firstSegment = firstSegment[:slash]
+	}
+	firstSegment, err := url.PathUnescape(firstSegment)
+	return err == nil && firstSegment == "sub"
 }
 
 func (r *Registry) ObserveStoreSave(d time.Duration, err error) {
@@ -147,6 +168,8 @@ func (r *Registry) ObserveAuditAppend(err error) {
 	r.audit[result]++
 }
 
+// ObserveHTTPRequest records a path already classified by
+// RequestPathForObservability; this string-only API cannot infer method semantics.
 func (r *Registry) ObserveHTTPRequest(path string, status int, d time.Duration, slow bool) {
 	path = normalizePath(path)
 	key := httpKey{Path: path, StatusClass: statusClass(status)}
@@ -322,7 +345,6 @@ func statusClass(status int) string {
 }
 
 func normalizePath(value string) string {
-	value = RedactSubscriptionPath(value)
 	switch {
 	case value == RedactedSubscriptionPath:
 		return RedactedSubscriptionPath

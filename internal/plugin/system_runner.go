@@ -896,10 +896,6 @@ type systemHostCall struct {
 	Params json.RawMessage `json:"params,omitempty"`
 }
 
-type systemHostResponseEnvelope struct {
-	HostResponse systemHostResponse `json:"host_response"`
-}
-
 type systemHostResponse struct {
 	ID     string          `json:"id,omitempty"`
 	OK     bool            `json:"ok"`
@@ -1019,7 +1015,6 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 	}()
 
 	enc := json.NewEncoder(stdin)
-	hostEnc := json.NewEncoder(hostRespW)
 	if err := enc.Encode(struct {
 		Action  string          `json:"action"`
 		Payload json.RawMessage `json:"payload,omitempty"`
@@ -1050,7 +1045,7 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 				return abort(fmt.Errorf("plugin exceeded host-call limit %d", budget.HostCalls))
 			}
 			resp := r.handleHostCall(ctx, broker, call)
-			if err := hostEnc.Encode(systemHostResponseEnvelope{HostResponse: resp}); err != nil {
+			if err := emitBoundedHostResponse(hostRespW, resp, buildLegacyHostResponseFrame); err != nil {
 				return abort(fmt.Errorf("write host response: %w", err))
 			}
 			continue
@@ -1340,7 +1335,8 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 			return nil, err
 		}
 		// The response rides one stdout-ish frame that the plugin scans with a
-		// 1 MiB cap (sdk DefaultMaxHostResponseBytes). Sending the value twice —
+		// The decoded result payload has a 4 MiB cap and the complete response
+		// frame has a separately bounded envelope. Sending the value twice —
 		// raw AND base64 — doubles the frame, and any value past ~430 KiB kills
 		// the plugin mid-invocation (runner sees a broken pipe). The SDK reader
 		// prefers value_base64 whenever it is present, so past a small debug

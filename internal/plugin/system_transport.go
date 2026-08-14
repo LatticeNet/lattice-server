@@ -50,6 +50,9 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 	if err := ctx.Err(); err != nil {
 		return outcome, err
 	}
+	if generation == 0 || !validSystemInvocationID(invocation) {
+		return outcome, fmt.Errorf("invalid stdio invocation correlation")
+	}
 	if t == nil || t.stdin == nil || t.scanner == nil {
 		return outcome, fmt.Errorf("worker transport unavailable")
 	}
@@ -135,10 +138,10 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 				return outcome, err
 			}
 			resp := host(call)
-			out := stdioJSONV2Frame{Protocol: 2, Kind: "host_response", Generation: generation, InvocationID: invocation, HostCallID: f.HostCallID}
-			out.HostResponse, _ = json.Marshal(resp)
 			writeResp := make(chan error, 1)
-			go func() { writeResp <- json.NewEncoder(t.hostResp).Encode(out) }()
+			go func() {
+				writeResp <- emitBoundedHostResponse(t.hostResp, resp, buildV2HostResponseFrame(generation, invocation, f.HostCallID))
+			}()
 			select {
 			case err := <-writeResp:
 				if err != nil {

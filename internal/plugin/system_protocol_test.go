@@ -6,17 +6,17 @@ import (
 )
 
 func TestValidateStdioJSONV2FrameCorrelation(t *testing.T) {
-	base := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: 7, InvocationID: "i-1", Response: []byte(`{"ok":true}`)}
+	base := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: 7, InvocationID: "1", Response: []byte(`{"ok":true}`)}
 	for name, frame := range map[string]stdioJSONV2Frame{
 		"valid":            base,
 		"wrong protocol":   func() stdioJSONV2Frame { f := base; f.Protocol = 1; return f }(),
 		"stale generation": func() stdioJSONV2Frame { f := base; f.Generation = 6; return f }(),
-		"wrong invocation": func() stdioJSONV2Frame { f := base; f.InvocationID = "i-2"; return f }(),
-		"wrong host call":  func() stdioJSONV2Frame { f := base; f.HostCallID = "h-2"; return f }(),
+		"wrong invocation": func() stdioJSONV2Frame { f := base; f.InvocationID = "2"; return f }(),
+		"wrong host call":  func() stdioJSONV2Frame { f := base; f.HostCallID = "h2"; return f }(),
 		"missing kind":     func() stdioJSONV2Frame { f := base; f.Kind = ""; return f }(),
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := validateStdioJSONV2Frame(frame, 7, "i-1", "")
+			err := validateStdioJSONV2Frame(frame, 7, "1", "")
 			if name == "valid" && err != nil {
 				t.Fatal(err)
 			}
@@ -24,6 +24,25 @@ func TestValidateStdioJSONV2FrameCorrelation(t *testing.T) {
 				t.Fatal("expected strict correlation failure")
 			}
 		})
+	}
+}
+
+func TestValidateStdioJSONV2FrameRejectsNonCanonicalIDs(t *testing.T) {
+	for _, id := range []string{"0", "01", "-1", "9223372036854775808", strings.Repeat("1", 128)} {
+		frame := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: 7, InvocationID: id, Response: []byte(`{"ok":true}`)}
+		if err := validateStdioJSONV2Frame(frame, 7, id, ""); err == nil {
+			t.Fatalf("accepted invocation id %q", id)
+		}
+	}
+	for _, id := range []string{"h0", "h01", "h-1", "h18446744073709551616", "h" + strings.Repeat("1", 128)} {
+		frame := stdioJSONV2Frame{Protocol: 2, Kind: "host_call", Generation: 7, InvocationID: "1", HostCallID: id, HostCall: []byte(`{"id":"h1","method":"log.write","params":{}}`)}
+		if err := validateStdioJSONV2Frame(frame, 7, "1", ""); err == nil {
+			t.Fatalf("accepted host call id %q", id)
+		}
+	}
+	runtimeReady := stdioJSONV2Frame{Protocol: 2, Kind: "runtime_ready", Generation: 7, InvocationID: "runtime", Features: []string{"stderr_frames_v1"}}
+	if err := validateStdioJSONV2Frame(runtimeReady, 7, "runtime", ""); err != nil {
+		t.Fatalf("runtime_ready must retain its reserved id: %v", err)
 	}
 }
 
@@ -50,16 +69,16 @@ func TestRequireV2FieldsRejectsMissingAndNull(t *testing.T) {
 }
 
 func TestDecodeStdioJSONV2FrameHostileMatrix(t *testing.T) {
-	valid := `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"i-1","host_call_id":"h-1","host_call":{"id":"h-1","method":"log.write","params":{}}}`
+	valid := `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"1","host_call_id":"h1","host_call":{"id":"h1","method":"log.write","params":{}}}`
 	cases := map[string]string{
-		"missing protocol":        `{"kind":"host_call","generation":7,"invocation_id":"i-1","host_call_id":"h-1","host_call":{"id":"h-1","method":"log.write","params":{}}}`,
-		"null generation":         `{"protocol":2,"kind":"host_call","generation":null,"invocation_id":"i-1","host_call_id":"h-1","host_call":{"id":"h-1","method":"log.write","params":{}}}`,
-		"unknown kind":            `{"protocol":2,"kind":"other","generation":7,"invocation_id":"i-1"}`,
-		"forbidden null response": `{"protocol":2,"kind":"invoke_ready","generation":7,"invocation_id":"i-1","response":null}`,
-		"missing host payload":    `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"i-1","host_call_id":"h-1"}`,
-		"null host payload":       `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"i-1","host_call_id":"h-1","host_call":null}`,
-		"duplicate root":          `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"i-1","host_call_id":"h-1","host_call_id":"h-2","host_call":{"id":"h-1","method":"log.write","params":{}}}`,
-		"unknown root":            `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"i-1","host_call_id":"h-1","host_call":{"id":"h-1","method":"log.write","params":{}},"x":1}`,
+		"missing protocol":        `{"kind":"host_call","generation":7,"invocation_id":"1","host_call_id":"h1","host_call":{"id":"h1","method":"log.write","params":{}}}`,
+		"null generation":         `{"protocol":2,"kind":"host_call","generation":null,"invocation_id":"1","host_call_id":"h1","host_call":{"id":"h1","method":"log.write","params":{}}}`,
+		"unknown kind":            `{"protocol":2,"kind":"other","generation":7,"invocation_id":"1"}`,
+		"forbidden null response": `{"protocol":2,"kind":"invoke_ready","generation":7,"invocation_id":"1","response":null}`,
+		"missing host payload":    `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"1","host_call_id":"h1"}`,
+		"null host payload":       `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"1","host_call_id":"h1","host_call":null}`,
+		"duplicate root":          `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"1","host_call_id":"h1","host_call_id":"h2","host_call":{"id":"h1","method":"log.write","params":{}}}`,
+		"unknown root":            `{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"1","host_call_id":"h1","host_call":{"id":"h1","method":"log.write","params":{}},"x":1}`,
 		"trailing garbage":        valid + ` trailing`,
 	}
 	if _, err := decodeStdioJSONV2Frame([]byte(valid)); err != nil {
@@ -75,20 +94,20 @@ func TestDecodeStdioJSONV2FrameHostileMatrix(t *testing.T) {
 }
 
 func TestDecodeSystemHostCallStrictNestedShape(t *testing.T) {
-	valid := `{"id":"h-1","method":"log.write","params":{}}`
-	if _, err := decodeStrictSystemHostCall([]byte(valid), "h-1"); err != nil {
+	valid := `{"id":"h1","method":"log.write","params":{}}`
+	if _, err := decodeStrictSystemHostCall([]byte(valid), "h1"); err != nil {
 		t.Fatal(err)
 	}
 	for name, raw := range map[string]string{
-		"missing params":   `{"id":"h-1","method":"log.write"}`,
-		"null params":      `{"id":"h-1","method":"log.write","params":null}`,
-		"wrong id":         `{"id":"h-2","method":"log.write","params":{}}`,
-		"duplicate nested": `{"id":"h-1","id":"h-1","method":"log.write","params":{}}`,
-		"unknown nested":   `{"id":"h-1","method":"log.write","params":{},"x":1}`,
+		"missing params":   `{"id":"h1","method":"log.write"}`,
+		"null params":      `{"id":"h1","method":"log.write","params":null}`,
+		"wrong id":         `{"id":"h2","method":"log.write","params":{}}`,
+		"duplicate nested": `{"id":"h1","id":"h1","method":"log.write","params":{}}`,
+		"unknown nested":   `{"id":"h1","method":"log.write","params":{},"x":1}`,
 		"trailing nested":  valid + `{}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := decodeStrictSystemHostCall([]byte(raw), "h-1"); err == nil {
+			if _, err := decodeStrictSystemHostCall([]byte(raw), "h1"); err == nil {
 				t.Fatalf("hostile host_call accepted: %s", raw)
 			}
 		})
@@ -120,8 +139,8 @@ func TestDecodeSystemRunnerReplyRequiresOKAndUnion(t *testing.T) {
 }
 
 func FuzzDecodeStdioJSONV2Frame(f *testing.F) {
-	f.Add([]byte(`{"protocol":2,"kind":"invoke_ready","generation":1,"invocation_id":"i"}`))
-	f.Add([]byte(`{"protocol":2,"kind":"host_call","generation":1,"invocation_id":"i","host_call_id":"h","host_call":{"id":"h","method":"m","params":{}}}`))
+	f.Add([]byte(`{"protocol":2,"kind":"invoke_ready","generation":1,"invocation_id":"1"}`))
+	f.Add([]byte(`{"protocol":2,"kind":"host_call","generation":1,"invocation_id":"1","host_call_id":"h1","host_call":{"id":"h1","method":"m","params":{}}}`))
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		frame, err := decodeStdioJSONV2Frame(raw)
 		if err == nil {

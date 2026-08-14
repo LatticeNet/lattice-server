@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -16,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	sdkplugin "github.com/LatticeNet/lattice-sdk/plugin"
 )
 
 func TestMain(m *testing.M) {
@@ -37,7 +40,7 @@ func TestRealV2ResultWithoutReadyPreservesReplyAndReaps(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	rsp, err := tr.invokeV2(ctx, 1, "nr", InvokeRequest{Action: "x"}, nil)
+	rsp, err := tr.invokeV2(ctx, 1, "1", InvokeRequest{Action: "x"}, nil)
 	if err != nil || rsp.Retirement == nil || (!errors.Is(rsp.Retirement, io.ErrUnexpectedEOF) && !errors.Is(rsp.Retirement, context.DeadlineExceeded)) || !rsp.Reply.OK {
 		t.Fatalf("reply=%+v err=%v", rsp, err)
 	}
@@ -47,7 +50,7 @@ func TestRealV2ResultWithoutReadyPreservesReplyAndReaps(t *testing.T) {
 	}
 	ctx2, cancel2 := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel2()
-	if _, err := tr.invokeV2(ctx2, 1, "nr2", InvokeRequest{Action: "x"}, nil); err == nil {
+	if _, err := tr.invokeV2(ctx2, 1, "2", InvokeRequest{Action: "x"}, nil); err == nil {
 		t.Fatal("retired worker reused")
 	}
 }
@@ -65,11 +68,11 @@ func TestRealV2CanceledBeforeDispatchDoesNotWriteOrRetireWorker(t *testing.T) {
 	pid := tr.pgid
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	outcome, err := tr.invokeV2(ctx, 1, "canceled", InvokeRequest{Action: "x"}, nil)
+	outcome, err := tr.invokeV2(ctx, 1, "1", InvokeRequest{Action: "x"}, nil)
 	if !errors.Is(err, context.Canceled) || outcome.DispatchStarted {
 		t.Fatalf("outcome=%+v error=%v", outcome, err)
 	}
-	outcome, err = tr.invokeV2(t.Context(), 1, "next", InvokeRequest{Action: "x"}, nil)
+	outcome, err = tr.invokeV2(t.Context(), 1, "2", InvokeRequest{Action: "x"}, nil)
 	if err != nil || !outcome.Reusable || !outcome.Reply.OK || tr.pgid != pid {
 		t.Fatalf("worker was not reusable after pre-dispatch cancel: outcome=%+v err=%v pid=%d want=%d", outcome, err, tr.pgid, pid)
 	}
@@ -86,7 +89,7 @@ func TestRealV2StalledHostCallCancellationReaps(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	_, err = tr.invokeV2(ctx, 1, "stall", InvokeRequest{Action: "x"}, func(systemHostCall) systemHostResponse { return systemHostResponse{ID: "h1", OK: true} })
+	_, err = tr.invokeV2(ctx, 1, "1", InvokeRequest{Action: "x"}, func(systemHostCall) systemHostResponse { return systemHostResponse{ID: "h1", OK: true} })
 	if err == nil {
 		t.Fatal("expected cancellation or transport termination")
 	}
@@ -132,6 +135,7 @@ func TestV2AbortKillsIgnoreTermDescendantProcessGroup(t *testing.T) {
 	}
 	descendant := waitForPIDFile(t, pidFile)
 	pgid := tr.pgid
+	tr.requestAbort()
 	if err := tr.waitAbort(t.Context()); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
@@ -172,7 +176,7 @@ func TestRealV2MalformedReadyPreservesReply(t *testing.T) {
 	if err := tr.awaitReady(1); err != nil {
 		t.Fatal(err)
 	}
-	rsp, err := tr.invokeV2(t.Context(), 1, "bad", InvokeRequest{Action: "x"}, nil)
+	rsp, err := tr.invokeV2(t.Context(), 1, "1", InvokeRequest{Action: "x"}, nil)
 	if err != nil || rsp.Retirement == nil || !rsp.Reply.OK {
 		t.Fatalf("reply=%+v err=%v", rsp, err)
 	}
@@ -211,6 +215,10 @@ func runV2Helper() {
 	}
 	s := bufio.NewScanner(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)
+	var hostResponseReader *bufio.Reader
+	if os.Getenv("LATTICE_TEST_V2_HOST") == "1" {
+		hostResponseReader = bufio.NewReader(os.NewFile(uintptr(3), "host-response"))
+	}
 	for s.Scan() {
 		var f stdioJSONV2Frame
 		if json.Unmarshal(s.Bytes(), &f) != nil {
@@ -246,7 +254,7 @@ func runV2Helper() {
 			if raw := os.Getenv("LATTICE_TEST_V2_HOST_CALLS"); raw != "" {
 				calls, _ = strconv.Atoi(raw)
 			}
-			br := bufio.NewReader(os.NewFile(uintptr(3), "host-response"))
+			hostResponsesOK := true
 			for i := 1; i <= calls; i++ {
 				id := fmt.Sprintf("h%d", i)
 				if os.Getenv("LATTICE_TEST_V2_DUPLICATE_HOST_CALL_ID") == "1" {
@@ -255,7 +263,24 @@ func runV2Helper() {
 				payload := json.RawMessage(fmt.Sprintf(`{"id":%q,"method":"log.write","params":{"level":"info","message":"observed"}}`, id))
 				b, _ := json.Marshal(stdioJSONV2Frame{Protocol: 2, Kind: "host_call", Generation: f.Generation, InvocationID: f.InvocationID, HostCallID: id, HostCall: payload})
 				fmt.Fprintln(os.Stdout, string(b))
-				_, _ = br.ReadBytes('\n')
+				responseLine, _ := hostResponseReader.ReadBytes('\n')
+				if os.Getenv("LATTICE_TEST_V2_VERIFY_HOST_RESPONSES") == "1" {
+					frame, err := decodeStdioJSONV2Frame(bytes.TrimSpace(responseLine), sdkplugin.DefaultMaxHostResponseFrameBytes)
+					if err != nil || frame.Kind != "host_response" || frame.InvocationID != f.InvocationID || frame.HostCallID != id {
+						hostResponsesOK = false
+					} else {
+						var response systemHostResponse
+						if json.Unmarshal(frame.HostResponse, &response) != nil || response.ID != id ||
+							(i == 1 && (!response.OK || len(response.Result) != sdkplugin.DefaultMaxHostResponsePayloadBytes)) ||
+							(i == 2 && (response.OK || response.Error != boundedHostResponseError)) ||
+							(i == 3 && (!response.OK || string(response.Result) != `{"small":true}`)) {
+							hostResponsesOK = false
+						}
+					}
+				}
+			}
+			if !hostResponsesOK {
+				os.Exit(9)
 			}
 			if os.Getenv("LATTICE_TEST_V2_STALL") == "1" {
 				time.Sleep(30 * time.Second)
@@ -373,7 +398,7 @@ func runV2Helper() {
 }
 
 func TestRealV2HelperTwoInvocations(t *testing.T) {
-	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_HOST=1")
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_HOST=1", "LATTICE_TEST_V2_HOST_CALLS=3", "LATTICE_TEST_V2_VERIFY_HOST_RESPONSES=1")
 	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
 	if err != nil {
 		t.Fatal(err)
@@ -384,7 +409,16 @@ func TestRealV2HelperTwoInvocations(t *testing.T) {
 	}
 	var pid int
 	for i := 0; i < 2; i++ {
-		r, err := tr.invokeV2(t.Context(), 1, fmt.Sprintf("i%d", i), InvokeRequest{Action: "x"}, func(systemHostCall) systemHostResponse { return systemHostResponse{ID: "h1", OK: true} })
+		r, err := tr.invokeV2(t.Context(), 1, strconv.Itoa(i+1), InvokeRequest{Action: "x"}, func(call systemHostCall) systemHostResponse {
+			switch call.ID {
+			case "h1":
+				return systemHostResponse{ID: call.ID, OK: true, Result: exactHostPayload(sdkplugin.DefaultMaxHostResponsePayloadBytes)}
+			case "h2":
+				return systemHostResponse{ID: call.ID, OK: true, Result: exactHostPayload(sdkplugin.DefaultMaxHostResponsePayloadBytes + 1)}
+			default:
+				return systemHostResponse{ID: call.ID, OK: true, Result: json.RawMessage(`{"small":true}`)}
+			}
+		})
 		if err != nil || !r.Reply.OK || !r.Reusable {
 			t.Fatalf("invoke %d: %+v %v", i, r, err)
 		}

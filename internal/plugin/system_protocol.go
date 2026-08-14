@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -162,6 +163,9 @@ func decodeStdioJSONV2Frame(data []byte, limits ...int) (stdioJSONV2Frame, error
 
 func decodeStrictSystemHostCall(data []byte, outerID string, limits ...int) (systemHostCall, error) {
 	var call systemHostCall
+	if !validSystemHostCallID(outerID) {
+		return call, fmt.Errorf("invalid host_call id")
+	}
 	if err := strictV2Bound(data, limits...); err != nil {
 		return call, err
 	}
@@ -171,7 +175,7 @@ func decodeStrictSystemHostCall(data []byte, outerID string, limits ...int) (sys
 	if err := requireV2Fields(data, "id", "method", "params"); err != nil {
 		return call, err
 	}
-	if call.ID == "" || call.ID != outerID || strings.TrimSpace(call.Method) == "" {
+	if !validSystemHostCallID(call.ID) || call.ID != outerID || strings.TrimSpace(call.Method) == "" {
 		return call, fmt.Errorf("invalid host_call payload")
 	}
 	return call, nil
@@ -258,8 +262,18 @@ func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationI
 	if f.Generation == 0 || f.InvocationID == "" || f.Generation != generation || f.InvocationID != invocationID {
 		return fmt.Errorf("stale stdio invocation correlation")
 	}
+	if f.Kind == "runtime_ready" {
+		if f.InvocationID != "runtime" {
+			return fmt.Errorf("invalid runtime invocation id")
+		}
+	} else if !validSystemInvocationID(f.InvocationID) {
+		return fmt.Errorf("invalid invocation id")
+	}
 	if hostCallID != "" && f.HostCallID != hostCallID {
 		return fmt.Errorf("wrong host call correlation")
+	}
+	if hostCallID != "" && !validSystemHostCallID(hostCallID) {
+		return fmt.Errorf("invalid host call correlation")
 	}
 	if f.Kind == "" {
 		return fmt.Errorf("stdio frame kind is required")
@@ -293,15 +307,28 @@ func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationI
 			return fmt.Errorf("invalid stderr_chunk schema")
 		}
 	case "host_call":
-		if f.HostCallID == "" || !nonempty(f.HostCall) || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostResponse) {
+		if !validSystemHostCallID(f.HostCallID) || !nonempty(f.HostCall) || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostResponse) {
 			return fmt.Errorf("invalid host_call schema")
 		}
 	case "host_response":
-		if f.HostCallID == "" || !nonempty(f.HostResponse) || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) {
+		if !validSystemHostCallID(f.HostCallID) || !nonempty(f.HostResponse) || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) {
 			return fmt.Errorf("invalid host_response schema")
 		}
 	default:
 		return fmt.Errorf("unknown stdio frame kind %q", f.Kind)
 	}
 	return nil
+}
+
+func validSystemInvocationID(id string) bool {
+	n, err := strconv.ParseInt(id, 10, 64)
+	return err == nil && n > 0 && strconv.FormatInt(n, 10) == id
+}
+
+func validSystemHostCallID(id string) bool {
+	if len(id) < 2 || id[0] != 'h' {
+		return false
+	}
+	n, err := strconv.ParseUint(id[1:], 10, 64)
+	return err == nil && n > 0 && "h"+strconv.FormatUint(n, 10) == id
 }

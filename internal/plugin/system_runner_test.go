@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	sdkplugin "github.com/LatticeNet/lattice-sdk/plugin"
 )
 
 // makeBundle writes a bundle dir containing a manifest.json and an artifact shell
@@ -401,7 +403,7 @@ func countOpenFDs(t *testing.T) int {
 
 func TestSystemRunnerV1EnforcesCumulativeStdoutAcrossHostCalls(t *testing.T) {
 	r := newRunner(t, SystemRunnerOptions{})
-	script := "#!/bin/sh\nread line\ni=0; while [ $i -lt 4 ]; do echo '{\"host_call\":{\"id\":\"h'$i'\",\"method\":\"log.write\",\"params\":{\"level\":\"info\",\"message\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}}'; read resp <&3; i=$((i+1)); done\necho '{\"ok\":true}'\n"
+	script := "#!/bin/sh\nread line\ni=1; while [ $i -le 4 ]; do echo '{\"host_call\":{\"id\":\"h'$i'\",\"method\":\"log.write\",\"params\":{\"level\":\"info\",\"message\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}}'; read resp <&3; i=$((i+1)); done\necho '{\"ok\":true}'\n"
 	loaded := makeBundle(t, "p.host-flood", script, "")
 	broker := newTestBroker(t, loaded.Manifest.ID, []string{"log:write"}, HostServices{Log: noopTestLog{}})
 	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded, Broker: broker}); err != nil {
@@ -726,7 +728,7 @@ func TestSystemRunnerHonorsZeroHostCallBudget(t *testing.T) {
 	r := newRunner(t, SystemRunnerOptions{})
 	script := `#!/bin/sh
 read req
-echo '{"host_call":{"id":"kv","method":"kv.get","params":{"key":"x"}}}'
+echo '{"host_call":{"id":"h1","method":"kv.get","params":{"key":"x"}}}'
 `
 	loaded := makeBundle(t, "p.nohostcalls", script, "")
 	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err != nil {
@@ -866,9 +868,9 @@ func TestSystemRunnerHostCallBridge(t *testing.T) {
 	r := newRunner(t, SystemRunnerOptions{})
 	script := `#!/bin/sh
 read req
-echo '{"host_call":{"id":"rpc","method":"rpc.call","params":{"service":"test.svc","method":"list","request":{"want":"nodes"}}}}'
+echo '{"host_call":{"id":"h1","method":"rpc.call","params":{"service":"test.svc","method":"list","request":{"want":"nodes"}}}}'
 read rpc <&3
-echo '{"host_call":{"id":"http","method":"http.do","params":{"method":"POST","url":"https://example.com/api","body":"payload"}}}'
+echo '{"host_call":{"id":"h2","method":"http.do","params":{"method":"POST","url":"https://example.com/api","body":"payload"}}}'
 read http <&3
 printf '{"ok":true,"result":{"rpc":%s,"http":%s}}\n' "$rpc" "$http"
 `
@@ -924,6 +926,61 @@ printf '{"ok":true,"result":{"rpc":%s,"http":%s}}\n' "$rpc" "$http"
 	}
 	if !got.HTTP.HostResponse.OK || got.HTTP.HostResponse.Result.StatusCode != 202 || services.httpCalls != 1 {
 		t.Fatalf("http host response wrong: %+v calls=%d", got.HTTP.HostResponse, services.httpCalls)
+	}
+}
+
+func TestSystemRunnerFreshHostResponseOversizeThenSmallStaysSynchronized(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{})
+	script := `#!/bin/sh
+read req
+echo '{"host_call":{"id":"h1","method":"rpc.call","params":{"service":"test.svc","method":"get","request":{"sequence":1}}}}'
+IFS= read -r exact <&3
+case "$exact" in *'"ok":true'*) exact_ok=true ;; *) exact_ok=false ;; esac
+echo '{"host_call":{"id":"h2","method":"rpc.call","params":{"service":"test.svc","method":"get","request":{"sequence":2}}}}'
+IFS= read -r over <&3
+case "$over" in *'"error":"host response exceeds protocol limits"'*) over_ok=true ;; *) over_ok=false ;; esac
+echo '{"host_call":{"id":"h3","method":"rpc.call","params":{"service":"test.svc","method":"get","request":{"sequence":3}}}}'
+IFS= read -r small <&3
+case "$small" in *'"small":true'*) small_ok=true ;; *) small_ok=false ;; esac
+printf '{"ok":true,"result":{"exact_ok":%s,"over_ok":%s,"small_ok":%s}}\n' "$exact_ok" "$over_ok" "$small_ok"
+`
+	loaded := makeBundle(t, "p.response-boundary", script, "")
+	loaded.Manifest.Capabilities = []string{"rpc:call"}
+	loaded.Capabilities = []string{"rpc:call"}
+	services := &fakeHostServices{kvValues: map[string][]byte{}}
+	callCount := 0
+	broker, err := NewBroker(loaded, HostServices{RPC: fakeRPCHost(func(_ context.Context, _, _, _ string, _ []byte) ([]byte, error) {
+		callCount++
+		switch callCount {
+		case 1:
+			return exactHostPayload(sdkplugin.DefaultMaxHostResponsePayloadBytes), nil
+		case 2:
+			return exactHostPayload(sdkplugin.DefaultMaxHostResponsePayloadBytes + 1), nil
+		default:
+			return []byte(`{"small":true}`), nil
+		}
+	}), Audit: services})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.rpcGrant = RPCGrant{"test.svc": {"get": {}}}
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded, Broker: broker}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Action: "call"})
+	if err != nil || !resp.OK || callCount != 3 {
+		t.Fatalf("response=%+v calls=%d error=%v", resp, callCount, err)
+	}
+	var result struct {
+		ExactOK bool `json:"exact_ok"`
+		OverOK  bool `json:"over_ok"`
+		SmallOK bool `json:"small_ok"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.ExactOK || !result.OverOK || !result.SmallOK {
+		t.Fatalf("host response sequence=%+v", result)
 	}
 }
 
@@ -1029,8 +1086,8 @@ func TestRuntimeManagerInvokeRoutesToSystemRunner(t *testing.T) {
 }
 
 func TestKVGetResponseDropsRawValueWhenLarge(t *testing.T) {
-	// The kv.get response rides one frame that the plugin scans with a 1 MiB
-	// cap. Carrying the value twice (raw + base64) doubles the frame; past
+	// The kv.get response rides one bounded response frame. Carrying the value
+	// twice (raw + base64) doubles the frame; past
 	// ~430 KiB of value the plugin dies mid-invocation and the runner sees a
 	// broken pipe. Base64-only past the small threshold keeps it inside.
 	big := make([]byte, 600<<10)

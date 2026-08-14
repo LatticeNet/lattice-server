@@ -349,6 +349,66 @@ func TestSnapshotForForceJoiningNormalStartsForcedGeneration(t *testing.T) {
 	}
 }
 
+func TestSnapshotForForceJoiningFailedNormalStillStartsForcedGeneration(t *testing.T) {
+	s, _ := newShareTestServer(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	joined := make(chan struct{}, 1)
+	s.subscriptionRefreshWaiter = joined
+	calls := 0
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		calls++
+		if calls == 1 {
+			close(started)
+			<-release
+			return model.SubscriptionSnapshot{}, errors.New("normal failed")
+		}
+		return model.SubscriptionSnapshot{Raw: "forced-success"}, nil
+	}
+	normal := make(chan error, 1)
+	go func() { _, err := s.snapshotFor(context.Background(), "p", "s", false); normal <- err }()
+	<-started
+	forced := make(chan struct {
+		snapshot model.SubscriptionSnapshot
+		err      error
+	}, 1)
+	go func() {
+		snapshot, err := s.snapshotFor(context.Background(), "p", "s", true)
+		forced <- struct {
+			snapshot model.SubscriptionSnapshot
+			err      error
+		}{snapshot, err}
+	}()
+	<-joined
+	close(release)
+	if err := <-normal; err == nil {
+		t.Fatal("normal generation unexpectedly succeeded")
+	}
+	result := <-forced
+	if result.err != nil || result.snapshot.Raw != "forced-success" || calls != 2 {
+		t.Fatalf("forced generation after joined error: calls=%d snapshot=%+v err=%v", calls, result.snapshot, result.err)
+	}
+}
+
+func TestSnapshotForCanceledCallerDoesNotStartBackgroundFlight(t *testing.T) {
+	s, _ := newShareTestServer(t)
+	calls := 0
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		calls++
+		return model.SubscriptionSnapshot{Raw: "unexpected"}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.snapshotFor(ctx, "p", "s", true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled snapshotFor error=%v", err)
+	}
+	s.subscriptionRefreshMu.Lock()
+	flights := len(s.subscriptionRefreshFlights)
+	s.subscriptionRefreshMu.Unlock()
+	if calls != 0 || flights != 0 {
+		t.Fatalf("canceled caller started background work: calls=%d flights=%d", calls, flights)
+	}
+}
+
 func TestSnapshotForRecoveredSuccessCannotBeOverwrittenByLateFailure(t *testing.T) {
 	s, st := newShareTestServer(t)
 	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "old", FetchedAt: s.now().Add(-time.Hour), Stale: true}); err != nil {

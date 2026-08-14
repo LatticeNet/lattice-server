@@ -153,8 +153,9 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 
 	var cacheEntry subscriptionCacheEntry
 	var cached bool
+	var cacheEpoch uint64
 	if share.Source.Kind == model.ShareSourcePlugin {
-		cacheEntry, cached = s.subscriptionCacheSnapshotForSource(key, false, s.now())
+		cacheEntry, cached, cacheEpoch = s.subscriptionCacheSnapshotForSource(share.Source.PluginID, share.Source.SubscriptionID, key, false, s.now())
 	} else {
 		cacheEntry, cached = s.subscriptionCache.GetSnapshot(key, s.now())
 	}
@@ -170,7 +171,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		// same rule the snapshot layer applies one step down.
 		stale, ok := cacheEntry, cached
 		if !ok {
-			stale, ok = s.subscriptionCacheSnapshotForSource(key, true, s.now())
+			stale, ok, cacheEpoch = s.subscriptionCacheSnapshotForSource(share.Source.PluginID, share.Source.SubscriptionID, key, true, s.now())
 		}
 		if ok {
 			snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false)
@@ -184,7 +185,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 				if s.subscriptionBeforeCacheExtend != nil {
 					s.subscriptionBeforeCacheExtend()
 				}
-				if !s.subscriptionCache.ExtendSnapshot(key, stale.revision, snap.Userinfo, snap.SourceVersion, snap.Stale, snap.FetchedAt, s.now()) {
+				if !s.extendSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, cacheEpoch, snap, stale.revision, s.now()) {
 					cached = false
 					break
 				}
@@ -269,7 +270,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 // subscriptionCacheSnapshotForSource linearizes plugin cache reads with source
 // publication. A lookup observes either the complete old authority or the
 // persisted+bumped+invalidated new authority, never the publication gap.
-func (s *Server) subscriptionCacheSnapshotForSource(key subscriptionCacheKey, stale bool, now time.Time) (subscriptionCacheEntry, bool) {
+func (s *Server) subscriptionCacheSnapshotForSource(pluginID, subscriptionID string, key subscriptionCacheKey, stale bool, now time.Time) (subscriptionCacheEntry, bool, uint64) {
 	if waiter := s.subscriptionCacheLookupWaiter; waiter != nil {
 		select {
 		case waiter <- struct{}{}:
@@ -278,10 +279,13 @@ func (s *Server) subscriptionCacheSnapshotForSource(key subscriptionCacheKey, st
 	}
 	s.subscriptionRefreshMu.Lock()
 	defer s.subscriptionRefreshMu.Unlock()
+	epoch := s.subscriptionSourceEpochs[subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}]
 	if stale {
-		return s.subscriptionCache.GetStale(key)
+		entry, ok := s.subscriptionCache.GetStale(key)
+		return entry, ok, epoch
 	}
-	return s.subscriptionCache.GetSnapshot(key, now)
+	entry, ok := s.subscriptionCache.GetSnapshot(key, now)
+	return entry, ok, epoch
 }
 
 // subscriptionDiagnosticSummary gives protected runtime logs a bounded
@@ -313,8 +317,16 @@ func snapshotAgeSeconds(now, fetchedAt time.Time) string {
 // what any of its records render to, and the content hash cannot see it — the
 // record, not the content, is what changed — so the edit path invalidates here.
 func (s *Server) invalidateSharesForPlugin(pluginID string) {
+	s.subscriptionRefreshMu.Lock()
+	defer s.subscriptionRefreshMu.Unlock()
+	seen := make(map[subscriptionRefreshKey]struct{})
 	for _, share := range s.store.SubscriptionShares() {
 		if share.Source.Kind == model.ShareSourcePlugin && share.Source.PluginID == pluginID {
+			key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: share.Source.SubscriptionID}
+			if _, ok := seen[key]; !ok {
+				s.bumpSubscriptionSourceEpochLocked(key)
+				seen[key] = struct{}{}
+			}
 			s.subscriptionCache.InvalidateShare(share.ID)
 		}
 	}

@@ -4,6 +4,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -35,11 +36,15 @@ const (
 )
 
 type e5PluginServerFixture struct {
-	server    *Server
-	store     *store.Store
-	statePath string
-	hotPath   string
-	cipher    secret.Cipher
+	server     *Server
+	store      *store.Store
+	statePath  string
+	hotPath    string
+	pluginDir  string
+	cacheDir   string
+	runtimeDir string
+	cipher     secret.Cipher
+	trust      plugin.TrustPolicy
 }
 
 func newE5PluginServerFixture(t *testing.T, root string) e5PluginServerFixture {
@@ -94,8 +99,12 @@ func newE5PluginServerFixture(t *testing.T, root string) e5PluginServerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
-	return e5PluginServerFixture{server: srv, store: st, statePath: statePath, hotPath: hotPath, cipher: cipher}
+	registerE5FixtureCleanup(t, srv, st)
+	return e5PluginServerFixture{
+		server: srv, store: st, statePath: statePath, hotPath: hotPath,
+		pluginDir: pluginDir, cacheDir: cacheDir, runtimeDir: runtimeDir,
+		cipher: cipher, trust: policy,
+	}
 }
 
 func requireE2EDir(t *testing.T, name string) string {
@@ -544,17 +553,39 @@ func (fixture e5PluginServerFixture) assertNoPlaintextCanaries(t *testing.T, can
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, canary := range canaries {
+			for i, canary := range canaries {
 				if canary != "" && bytes.Contains(raw, []byte(canary)) {
-					t.Fatalf("plaintext canary %q found in %s", canary, path)
+					t.Fatalf("plaintext secret canary %d found in %s", i+1, path)
 				}
 			}
 		}
 	}
 }
 
-func (fixture e5PluginServerFixture) reopen(t *testing.T, pluginDir, cacheDir, runtimeDir string, trust plugin.TrustPolicy) *Server {
+func registerE5FixtureCleanup(t *testing.T, srv *Server, st *store.Store) {
 	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Close(ctx); err != nil {
+			t.Errorf("close E5 server runtime: %v", err)
+		}
+		if err := st.Close(); err != nil {
+			t.Errorf("close E5 store: %v", err)
+		}
+	})
+}
+
+func (fixture e5PluginServerFixture) reopen(t *testing.T, afterServerClose func()) e5PluginServerFixture {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := fixture.server.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if afterServerClose != nil {
+		afterServerClose()
+	}
 	if err := fixture.store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -566,12 +597,15 @@ func (fixture e5PluginServerFixture) reopen(t *testing.T, pluginDir, cacheDir, r
 		t.Fatal(err)
 	}
 	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
-		PluginDir: pluginDir, PluginBundleCacheDir: cacheDir, PluginRuntimeDir: runtimeDir, PluginTrust: trust})
+		PluginDir: fixture.pluginDir, PluginBundleCacheDir: fixture.cacheDir, PluginRuntimeDir: fixture.runtimeDir, PluginTrust: fixture.trust,
+		PublicURL: "https://lattice.e5.invalid"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
-	return srv
+	registerE5FixtureCleanup(t, srv, st)
+	fixture.server = srv
+	fixture.store = st
+	return fixture
 }
 
 func describeE5Fixture(fixture e5PluginServerFixture) string {

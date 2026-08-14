@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -172,7 +173,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	handler := srv.Handler()
 	httpServer := httptest.NewServer(handler)
-	defer httpServer.Close()
+	t.Cleanup(func() { httpServer.Close() })
 	cookies, csrf := loginSession(t, handler)
 	activateE5Plugin(t, handler, cookies, csrf, "latticenet.vpn-core")
 	activateE5Plugin(t, handler, cookies, csrf, "latticenet.sub-store")
@@ -525,6 +526,54 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatalf("inventory recovery did not publish fresh durable authority: ok=%t stale=%t error=%q source=%s old_source=%s fetched=%s old_fetched=%s bytes=%d want_bytes=%d attempt=%s", ok, recoveredSnapshot.Stale, recoveredSnapshot.FetchError, recoveredSnapshot.SourceVersion, lastGood.SourceVersion, recoveredSnapshot.FetchedAt, lastGood.FetchedAt, len(recoveredSnapshot.Raw), len(lastGood.Raw), recoveredSnapshot.LastAttemptAt)
 	}
 
+	// A real server restart must reap both persistent plugin workers before the
+	// encrypted JSON store and its hot Bolt sidecar are closed. Reopening the
+	// same durable files with the same cipher, bundles, runtime roots, and trust
+	// policy must restore active lifecycle state and arm fresh worker processes.
+	httpServer.Close()
+	oldPluginPGIDs := lifecyclePluginRuntimeProcessGroups(t, e5Fixture.runtimeDir)
+	if len(oldPluginPGIDs) != 2 {
+		t.Fatalf("expected two live E5 plugin process groups before restart, got %v", oldPluginPGIDs)
+	}
+	e5Fixture = e5Fixture.reopen(t, func() {
+		assertLifecycleProcessGroupsGone(t, oldPluginPGIDs)
+	})
+	srv = e5Fixture.server
+	handler = srv.Handler()
+	httpServer = httptest.NewServer(handler)
+	cookies, csrf = loginSession(t, handler)
+	for _, pluginID := range []string{e5SubStorePluginID, vpnCorePluginID} {
+		installation, installed := srv.store.PluginInstallation(pluginID)
+		runtimeStatus, armed := srv.pluginRuntime.Status(pluginID)
+		if !installed || installation.Status != model.PluginStatusActive || !armed || runtimeStatus.State != "armed" {
+			t.Fatalf("plugin did not auto-rearm after restart: id=%s installed=%t status=%s armed=%t runtime=%s", pluginID, installed, installation.Status, armed, runtimeStatus.State)
+		}
+	}
+	newPluginPGIDs := lifecyclePluginRuntimeProcessGroups(t, e5Fixture.runtimeDir)
+	if len(newPluginPGIDs) != 2 {
+		t.Fatalf("expected two fresh E5 plugin process groups after restart, got %v", newPluginPGIDs)
+	}
+	for _, pgid := range newPluginPGIDs {
+		for _, oldPGID := range oldPluginPGIDs {
+			if pgid == oldPGID {
+				t.Fatalf("plugin process group %d was reused across server restart", pgid)
+			}
+		}
+	}
+	persistedShare, shareOK := srv.store.SubscriptionShare(e5Graph.Share.ID)
+	persistedSnapshot, snapshotOK := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
+	persistedDefinition := srv.store.LineChainSnapshot().Definitions[sourceUUID]
+	if !shareOK || persistedShare.Token != e5Graph.Share.Token || !snapshotOK || persistedSnapshot.SourceVersion != recoveredSnapshot.SourceVersion ||
+		persistedSnapshot.Raw != recoveredSnapshot.Raw || !persistedSnapshot.FetchedAt.Equal(recoveredSnapshot.FetchedAt) || persistedDefinition.TargetLineUUID != targetUUID ||
+		persistedDefinition.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != taskBaseline+2 {
+		t.Fatalf("E5 durable state did not survive restart: share=%t snapshot=%t source=%s want_source=%s fetched=%s want_fetched=%s target=%s status=%s tasks=%d", shareOK, snapshotOK, persistedSnapshot.SourceVersion, recoveredSnapshot.SourceVersion, persistedSnapshot.FetchedAt, recoveredSnapshot.FetchedAt, persistedDefinition.TargetLineUUID, persistedDefinition.Status, len(srv.store.Tasks()))
+	}
+	walResult, walEnabled, walErr := srv.store.AuditWALVerify()
+	if walErr != nil || !walEnabled || walResult.Count == 0 || walResult.Anchor == nil {
+		t.Fatalf("reopened E5 AuditWAL verification failed: enabled=%t count=%d anchor=%t err=%v", walEnabled, walResult.Count, walResult.Anchor != nil, walErr)
+	}
+	e5Fixture.assertNoPlaintextCanaries(t, credential.UUID, e5Graph.Share.Token, nodeToken, recoveredSnapshot.Raw)
+
 	// An independent ordinary metadata writer may change unrelated fields. The
 	// subsequent server-issued remove must preserve that drift and only remove
 	// the managed chain declaration.
@@ -736,6 +785,40 @@ func persistentJSON(t *testing.T, client *http.Client, method, url, body string,
 		t.Fatalf("decode %s", raw)
 	}
 }
+
+func lifecyclePluginRuntimeProcessGroups(t *testing.T, runtimeDir string) []int {
+	t.Helper()
+	out, err := exec.Command("ps", "-axo", "pid=,pgid=,command=").CombinedOutput()
+	if err != nil {
+		t.Fatalf("scan plugin runtime processes: %v: %s", err, out)
+	}
+	want := filepath.Clean(runtimeDir) + string(filepath.Separator)
+	seen := map[int]bool{}
+	var pgids []int
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || !strings.Contains(strings.Join(fields[2:], " "), want) {
+			continue
+		}
+		pgid, err := strconv.Atoi(fields[1])
+		if err != nil || pgid <= 0 || seen[pgid] {
+			continue
+		}
+		seen[pgid] = true
+		pgids = append(pgids, pgid)
+	}
+	return pgids
+}
+
+func assertLifecycleProcessGroupsGone(t *testing.T, pgids []int) {
+	t.Helper()
+	for _, pgid := range pgids {
+		if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("plugin process group %d survived Server.Close: %v", pgid, err)
+		}
+	}
+}
+
 func requireE2EFile(t *testing.T, name string) string {
 	t.Helper()
 	value := os.Getenv(name)

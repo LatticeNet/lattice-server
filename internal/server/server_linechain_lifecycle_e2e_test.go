@@ -130,6 +130,19 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		Name: sourceDef.Tag, Protocol: "vless", Network: "tcp", Address: "127.0.0.1",
 		Port: strconv.Itoa(bPort), SNI: sourceDef.SNI, LineUUID: sourceUUID, LineID: strings.TrimPrefix(sourceHash, "line_"),
 	}})
+	// Inventory seeding persists the fixture's default public address; restore
+	// loopback after every seed so the official E2E share endpoint reaches the
+	// local sing-box process rather than the documentation address.
+	nodeA, _ = srv.store.Node("node-a")
+	nodeA.PublicIP = "127.0.0.1"
+	if err := srv.store.UpsertNode(nodeA); err != nil {
+		t.Fatal(err)
+	}
+	nodeB, _ = srv.store.Node("node-b")
+	nodeB.PublicIP = "127.0.0.1"
+	if err := srv.store.UpsertNode(nodeB); err != nil {
+		t.Fatal(err)
+	}
 	_ = srv.buildLineGroups()
 	seedE5ConvergedTerminalDefinition(t, srv, target)
 	taskBaseline := len(srv.store.Tasks())

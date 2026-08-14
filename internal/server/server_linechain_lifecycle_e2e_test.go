@@ -447,6 +447,12 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if observer.accepted() <= beforeShareTraffic {
 		t.Fatal("public share URI client did not traverse B -> observer -> A")
 	}
+	const e5SubStorePluginID = "latticenet.sub-store"
+	const e5SubscriptionID = "e5-graph"
+	lastGood, ok := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
+	if !ok || lastGood.Stale || lastGood.SourceVersion != e5Graph.SourceVersion || lastGood.FetchedAt.IsZero() || lastGood.Raw == "" {
+		t.Fatalf("initial durable E5 snapshot mismatch: ok=%t stale=%t source=%s graph=%s fetched=%s bytes=%d", ok, lastGood.Stale, lastGood.SourceVersion, e5Graph.SourceVersion, lastGood.FetchedAt, len(lastGood.Raw))
+	}
 	// Force an inventory drift while the physical chain remains configured.
 	driftSidecar, err := os.ReadFile(sidecar)
 	if err != nil {
@@ -456,7 +462,15 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err := os.WriteFile(sidecar, driftSidecar, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, driftSidecar)))
+	driftInventory := filepath.Join(root, "drift-inventory-result.json")
+	driftInventoryCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
+	driftInventoryCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+driftInventory)
+	_ = runLifecycleAgentHelper(t, driftInventoryCmd)
+	driftInventoryRaw, err := os.ReadFile(driftInventory)
+	if err != nil || len(driftInventoryRaw) == 0 {
+		t.Fatalf("drift inventory helper result missing: %v", err)
+	}
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, driftInventoryRaw)))
 	refreshReq, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/subscription-shares/"+e5Graph.Share.ID+"/refresh", nil)
 	refreshReq.Header.Set("X-Lattice-CSRF", csrf)
 	for _, c := range cookies {
@@ -470,6 +484,45 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	refreshRes.Body.Close()
 	if refreshRes.StatusCode != http.StatusOK || !bytes.Contains(refreshRaw, []byte(`"stale":true`)) {
 		t.Fatalf("drift refresh status=%d body=%s", refreshRes.StatusCode, refreshRaw)
+	}
+	staleLastGood, ok := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
+	if !ok || !staleLastGood.Stale || staleLastGood.FetchError == "" || staleLastGood.SourceVersion != lastGood.SourceVersion ||
+		staleLastGood.Raw != lastGood.Raw || !staleLastGood.FetchedAt.Equal(lastGood.FetchedAt) || !staleLastGood.LastAttemptAt.After(lastGood.FetchedAt) {
+		t.Fatalf("inventory drift did not preserve durable last-good authority: ok=%t stale=%t error=%q source=%s want_source=%s fetched=%s want_fetched=%s bytes=%d want_bytes=%d attempt=%s", ok, staleLastGood.Stale, staleLastGood.FetchError, staleLastGood.SourceVersion, lastGood.SourceVersion, staleLastGood.FetchedAt, lastGood.FetchedAt, len(staleLastGood.Raw), len(lastGood.Raw), staleLastGood.LastAttemptAt)
+	}
+	// Restore the converged observation and force refresh again; stale state
+	// must clear and the provider must publish the recovered snapshot.
+	recoveredSidecar := bytes.Replace(driftSidecar, []byte("33333333-3333-4333-8333-333333333333"), []byte(targetUUID), 1)
+	if err := os.WriteFile(sidecar, recoveredSidecar, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recoveredInventory := filepath.Join(root, "recovered-inventory-result.json")
+	recoveredInventoryCmd := exec.Command(agentTest, "-test.run=^TestLinechainE2EInventoryHelper$", "--", root)
+	recoveredInventoryCmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_ROOT="+root, "LATTICE_LINECHAIN_E2E_CONFIG_DIR="+configDir, "LATTICE_LINECHAIN_E2E_SIDECAR="+sidecar, "LATTICE_LINECHAIN_E2E_INVENTORY_RESULT="+recoveredInventory)
+	_ = runLifecycleAgentHelper(t, recoveredInventoryCmd)
+	recoveredInventoryRaw, err := os.ReadFile(recoveredInventory)
+	if err != nil || len(recoveredInventoryRaw) == 0 {
+		t.Fatalf("recovered inventory helper result missing: %v", err)
+	}
+	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, recoveredInventoryRaw)))
+	recoverReq, _ := http.NewRequest(http.MethodPost, httpServer.URL+"/api/subscription-shares/"+e5Graph.Share.ID+"/refresh", nil)
+	recoverReq.Header.Set("X-Lattice-CSRF", csrf)
+	for _, c := range cookies {
+		recoverReq.AddCookie(c)
+	}
+	recoverRes, err := httpServer.Client().Do(recoverReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoverRaw, _ := io.ReadAll(recoverRes.Body)
+	recoverRes.Body.Close()
+	if recoverRes.StatusCode != http.StatusOK || bytes.Contains(recoverRaw, []byte(`"stale":true`)) {
+		t.Fatalf("recovery refresh status=%d body=%s", recoverRes.StatusCode, recoverRaw)
+	}
+	recoveredSnapshot, ok := srv.store.SubscriptionSnapshot(e5SubStorePluginID, e5SubscriptionID)
+	if !ok || recoveredSnapshot.Stale || recoveredSnapshot.FetchError != "" || recoveredSnapshot.SourceVersion == "" || recoveredSnapshot.SourceVersion == lastGood.SourceVersion ||
+		recoveredSnapshot.Raw != lastGood.Raw || !recoveredSnapshot.FetchedAt.After(lastGood.FetchedAt) || !recoveredSnapshot.LastAttemptAt.Equal(recoveredSnapshot.FetchedAt) {
+		t.Fatalf("inventory recovery did not publish fresh durable authority: ok=%t stale=%t error=%q source=%s old_source=%s fetched=%s old_fetched=%s bytes=%d want_bytes=%d attempt=%s", ok, recoveredSnapshot.Stale, recoveredSnapshot.FetchError, recoveredSnapshot.SourceVersion, lastGood.SourceVersion, recoveredSnapshot.FetchedAt, lastGood.FetchedAt, len(recoveredSnapshot.Raw), len(lastGood.Raw), recoveredSnapshot.LastAttemptAt)
 	}
 
 	// An independent ordinary metadata writer may change unrelated fields. The

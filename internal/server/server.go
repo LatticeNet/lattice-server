@@ -214,6 +214,7 @@ type Server struct {
 	subscriptionRefreshWaiter     chan<- struct{}
 	subscriptionRender            func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
 	subscriptionBeforeCacheExtend func()
+	subscriptionCacheLookupWaiter chan<- struct{}
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First

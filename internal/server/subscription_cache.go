@@ -189,7 +189,7 @@ func (c *subscriptionCache) PutSnapshot(key subscriptionCacheKey, body []byte, c
 		c.removeElement(el)
 	}
 	el := c.order.PushFront(entry)
-	c.entries[key] = el
+	c.entries[storedKey] = el
 	c.bytes += entry.size
 	for c.order.Len() > c.max || c.bytes > c.maxBytes {
 		if oldest := c.order.Back(); oldest != nil {

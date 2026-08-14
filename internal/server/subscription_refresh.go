@@ -159,12 +159,12 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 			return model.SubscriptionSnapshot{}, fmt.Errorf("persist stale subscription %s/%s: %w", pluginID, subscriptionID, storeErr)
 		}
 		s.bumpSubscriptionSourceEpochLocked(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
-		s.subscriptionRefreshMu.Unlock()
 		// Stale is snapshot authority, not one render variant's cache metadata.
 		// Drop every share/format/UA entry sourcing this snapshot so no sibling
 		// cache can continue advertising a fresh response after the durable
 		// failure transition.
 		s.invalidateSharesForSource(pluginID, subscriptionID)
+		s.subscriptionRefreshMu.Unlock()
 		metadata := map[string]string{
 			"plugin_id": pluginID, "subscription_id": subscriptionID,
 			"stale": "true", "snapshot_age_seconds": fmt.Sprintf("%.0f", s.now().Sub(existing.FetchedAt).Seconds()),
@@ -193,13 +193,13 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 		return model.SubscriptionSnapshot{}, err
 	}
 	s.bumpSubscriptionSourceEpochLocked(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
-	s.subscriptionRefreshMu.Unlock()
 	// The content moved: any rendered body cached for a share sourcing this
 	// record is now stale, no matter how much TTL it had left. Without this the
 	// revalidation cadence, not the content, would decide what clients get.
 	if has && (force || existing.Stale || existing.Userinfo != fetched.Userinfo || subscriptionRevalidationVersion(existing) != subscriptionRevalidationVersion(fetched)) {
 		s.invalidateSharesForSource(pluginID, subscriptionID)
 	}
+	s.subscriptionRefreshMu.Unlock()
 	metadata := map[string]string{
 		"plugin_id": pluginID, "subscription_id": subscriptionID,
 		"raw_bytes": fmt.Sprintf("%d", len(fetched.Raw)), "stale": "false", "snapshot_age_seconds": "0",

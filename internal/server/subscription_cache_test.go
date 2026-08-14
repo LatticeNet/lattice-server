@@ -1,8 +1,10 @@
 package server
 
 import (
+	"strings"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func shareCacheKey(id string) subscriptionCacheKey {
@@ -104,6 +106,33 @@ func TestSubscriptionCacheAccountsEveryVariableByteAtExactCap(t *testing.T) {
 				t.Fatalf("cached=%v bytes=%d cap=%d", ok, c.bytes, tc.cap)
 			}
 		})
+	}
+}
+
+func TestSubscriptionCacheIndexUsesTheAccountedStoredKeyBacking(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	backing := strings.Repeat("x", 4096)
+	key := subscriptionCacheKey{ShareID: backing[10:42], Format: backing[100:132], UAClass: backing[200:232]}
+	c := newSubscriptionCache(8, time.Minute)
+	c.PutSnapshot(key, []byte("body"), "text/plain", "userinfo", "private", "public", false, base, base)
+	if len(c.entries) != 1 {
+		t.Fatalf("entries=%d", len(c.entries))
+	}
+	for storedKey, el := range c.entries {
+		entry := el.Value.(*subscriptionCacheEntry)
+		if unsafe.StringData(storedKey.ShareID) != unsafe.StringData(entry.key.ShareID) ||
+			unsafe.StringData(storedKey.Format) != unsafe.StringData(entry.key.Format) ||
+			unsafe.StringData(storedKey.UAClass) != unsafe.StringData(entry.key.UAClass) {
+			t.Fatal("map index and accounted entry retain different key backing")
+		}
+		if unsafe.StringData(storedKey.ShareID) == unsafe.StringData(key.ShareID) ||
+			unsafe.StringData(storedKey.Format) == unsafe.StringData(key.Format) ||
+			unsafe.StringData(storedKey.UAClass) == unsafe.StringData(key.UAClass) {
+			t.Fatal("cache index retained caller key backing")
+		}
+		if c.bytes != entry.size || entry.size != subscriptionCacheEntrySize(*entry) {
+			t.Fatalf("stored key backing not exactly accounted: cache=%d entry=%d recomputed=%d", c.bytes, entry.size, subscriptionCacheEntrySize(*entry))
+		}
 	}
 }
 

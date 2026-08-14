@@ -151,7 +151,13 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	uaClass := classifyClientUA(r.Header.Get("User-Agent"))
 	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass}
 
-	cacheEntry, cached := s.subscriptionCache.GetSnapshot(key, s.now())
+	var cacheEntry subscriptionCacheEntry
+	var cached bool
+	if share.Source.Kind == model.ShareSourcePlugin {
+		cacheEntry, cached = s.subscriptionCacheSnapshotForSource(key, false, s.now())
+	} else {
+		cacheEntry, cached = s.subscriptionCache.GetSnapshot(key, s.now())
+	}
 	body, contentType, userinfo := cacheEntry.body, cacheEntry.contentType, cacheEntry.userinfo
 	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.publicSourceVersion, cacheEntry.fetchedAt
 	if (!cached || staleResponse) && share.Source.Kind == model.ShareSourcePlugin {
@@ -164,7 +170,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		// same rule the snapshot layer applies one step down.
 		stale, ok := cacheEntry, cached
 		if !ok {
-			stale, ok = s.subscriptionCache.GetStale(key)
+			stale, ok = s.subscriptionCacheSnapshotForSource(key, true, s.now())
 		}
 		if ok {
 			snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false)
@@ -258,6 +264,24 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
 		Metadata: metadata,
 	})
+}
+
+// subscriptionCacheSnapshotForSource linearizes plugin cache reads with source
+// publication. A lookup observes either the complete old authority or the
+// persisted+bumped+invalidated new authority, never the publication gap.
+func (s *Server) subscriptionCacheSnapshotForSource(key subscriptionCacheKey, stale bool, now time.Time) (subscriptionCacheEntry, bool) {
+	if waiter := s.subscriptionCacheLookupWaiter; waiter != nil {
+		select {
+		case waiter <- struct{}{}:
+		default:
+		}
+	}
+	s.subscriptionRefreshMu.Lock()
+	defer s.subscriptionRefreshMu.Unlock()
+	if stale {
+		return s.subscriptionCache.GetStale(key)
+	}
+	return s.subscriptionCache.GetSnapshot(key, now)
 }
 
 // subscriptionDiagnosticSummary gives protected runtime logs a bounded

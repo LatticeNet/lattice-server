@@ -538,6 +538,84 @@ func TestSubscriptionShareFailsClosedWhenSourceChangesDuringBothRenderAttempts(t
 	}
 }
 
+func TestSubscriptionShareCacheHitCannotObservePartialSourcePublication(t *testing.T) {
+	for _, transition := range []string{"stale", "version"} {
+		t.Run(transition, func(t *testing.T) {
+			s, st := newShareTestServer(t)
+			token := strings.Repeat("a", 32)
+			share := model.SubscriptionShare{ID: "s1", Slug: "one", Token: token, Enabled: true, DefaultFormat: "plain",
+				Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}
+			mustUpsertShare(t, st, share)
+			old := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "old", FetchedAt: s.now()}
+			if err := st.UpsertSubscriptionSnapshot(old); err != nil {
+				t.Fatal(err)
+			}
+			key := subscriptionCacheKey{ShareID: "s1", Format: "plain", UAClass: "surge"}
+			s.subscriptionCache.PutSnapshot(key, []byte("old-cache-hit"), "text/plain", "", subscriptionRevalidationVersion(old), "", false, old.FetchedAt, s.now())
+
+			persisted, releasePublish := make(chan struct{}), make(chan struct{})
+			var persistOnce sync.Once
+			s.subscriptionSnapshotPersist = func(snapshot model.SubscriptionSnapshot) error {
+				if err := st.UpsertSubscriptionSnapshot(snapshot); err != nil {
+					return err
+				}
+				persistOnce.Do(func() { close(persisted) })
+				<-releasePublish
+				return nil
+			}
+			if transition == "stale" {
+				s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+					return model.SubscriptionSnapshot{}, errors.New("down")
+				}
+			} else {
+				s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+					return model.SubscriptionSnapshot{Raw: "new"}, nil
+				}
+			}
+			s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+				body := "new-render"
+				if snap.Stale {
+					body = "stale-current"
+				}
+				return renderedSubscription{Body: []byte(body), ContentType: "text/plain", Stale: snap.Stale,
+					RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, FetchedAt: snap.FetchedAt}, nil
+			}
+			lookupStarted := make(chan struct{}, 1)
+			s.subscriptionCacheLookupWaiter = lookupStarted
+			refreshDone := make(chan error, 1)
+			go func() {
+				_, err := s.snapshotFor(context.Background(), "p", "graph", true)
+				refreshDone <- err
+			}()
+			<-persisted
+			responseDone := make(chan *httptest.ResponseRecorder, 1)
+			go func() {
+				rec := httptest.NewRecorder()
+				s.handleSubscriptionShare(rec, shareRequest("/sub/one/"+token+"?format=plain", "Surge/2000"))
+				responseDone <- rec
+			}()
+			<-lookupStarted
+			select {
+			case rec := <-responseDone:
+				t.Fatalf("cache lookup escaped partial publication: code=%d body=%q", rec.Code, rec.Body.String())
+			case <-time.After(20 * time.Millisecond):
+			}
+			close(releasePublish)
+			if err := <-refreshDone; err != nil {
+				t.Fatal(err)
+			}
+			rec := <-responseDone
+			want := "new-render"
+			if transition == "stale" {
+				want = "stale-current"
+			}
+			if rec.Code != http.StatusOK || rec.Body.String() != want || strings.Contains(rec.Body.String(), "old-cache-hit") {
+				t.Fatalf("published response code=%d body=%q want=%q", rec.Code, rec.Body.String(), want)
+			}
+		})
+	}
+}
+
 func TestSubscriptionFailureDiagnosticsAreSanitizedAtRestAndInAudit(t *testing.T) {
 	s, st := newShareTestServer(t)
 	canary := "vless://11111111-1111-4111-8111-111111111111:secret@example.com/private-key"

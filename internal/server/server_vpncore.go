@@ -64,12 +64,26 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProfilesService, "v1", []string{"query", "settings", "configure"}, s.vpnCoreProfilesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreProfilesService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionSourcesService, "v1", []string{"compose"}, s.vpnCoreSubscriptionSourcesRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionSourcesService, "v1", []string{"compose", "graph_options"}, s.vpnCoreSubscriptionSourcesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreSubscriptionSourcesService, err)
 	}
 }
 
 func (s *Server) vpnCoreSubscriptionSourcesRPC(_ context.Context, method string, request []byte) ([]byte, error) {
+	if method == "graph_options" {
+		response := graphSubscriptionOptionsResponse{SchemaVersion: 1}
+		if err := decodeStrictGraphOptionsRequest(request); err != nil {
+			response.Error = composeFailureView(composeFailure("invalid_request"))
+			return json.Marshal(response)
+		}
+		response, err := graphSubscriptionOptionsFromCapture(func() (lineChainCompileSnapshot, error) {
+			return s.captureLineChainCompileSnapshot()
+		}, s.now().UTC())
+		if err != nil {
+			response = graphSubscriptionOptionsResponse{SchemaVersion: 1, Error: composeFailureView(err)}
+		}
+		return json.Marshal(response)
+	}
 	response := graphSubscriptionResponse{SchemaVersion: 1}
 	if method != "compose" || len(request) > model.MaxSubscriptionResponseBytes {
 		response.Error = composeFailureView(composeFailure("invalid_request"))

@@ -191,7 +191,8 @@ func TestVPNCoreSubscriptionSourcesRPCRegisteredAndFailsAllOrNone(t *testing.T) 
 	found := false
 	for _, service := range srv.pluginRPC.Services() {
 		if service.Service == vpnCoreSubscriptionSourcesService {
-			found = service.Owner == vpnCorePluginID && service.Version == "v1" && len(service.Methods) == 1 && service.Methods[0] == "compose"
+			found = service.Owner == vpnCorePluginID && service.Version == "v1" && len(service.Methods) == 2 &&
+				service.Methods[0] == "compose" && service.Methods[1] == "graph_options"
 		}
 	}
 	if !found {
@@ -215,6 +216,38 @@ func TestVPNCoreSubscriptionSourcesRPCRegisteredAndFailsAllOrNone(t *testing.T) 
 		}
 		if strings.Contains(string(raw), composeRootUUID) || strings.Contains(string(raw), "missing") {
 			t.Fatalf("failure leaked request inputs: %s", raw)
+		}
+	}
+}
+
+func TestVPNCoreSubscriptionSourcesGraphOptionsRPCIsStrictAndSecretFree(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateCorePlugin(t, st, vpnCorePluginID)
+
+	for _, hostile := range []string{
+		``,
+		`null`,
+		`{"unknown":true}`,
+		`{"unknown":true,"unknown":false}`,
+		`{} {}`,
+	} {
+		raw, err := srv.pluginRPC.Call(context.Background(), vpnCorePluginID, vpnCoreSubscriptionSourcesService, "graph_options", []byte(hostile))
+		if err != nil {
+			t.Fatalf("graph_options(%q): %v", hostile, err)
+		}
+		var response graphSubscriptionOptionsResponse
+		if err := json.Unmarshal(raw, &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.OK || response.Error == nil || len(response.Identities) != 0 || len(response.Roots) != 0 || response.OptionsVersion != "" {
+			t.Fatalf("hostile request returned partial options: %s", raw)
 		}
 	}
 }

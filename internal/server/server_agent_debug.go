@@ -64,7 +64,7 @@ func (s *Server) handleNodeDebugPolicy(w http.ResponseWriter, r *http.Request, p
 		Collect:   collect,
 		UpdatedAt: s.now().UTC(),
 	}
-	if err := s.store.UpsertNode(node); err != nil {
+	if err := s.upsertGraphNode(node); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -172,7 +172,7 @@ func (s *Server) handleNodeTerminalTransport(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	node.TerminalTransport = transport
-	if err := s.store.UpsertNode(node); err != nil {
+	if err := s.upsertGraphNode(node); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -248,7 +248,7 @@ func (s *Server) handleNodeIPConfig(w http.ResponseWriter, r *http.Request, p pr
 		cfg.UpdatedAt = s.now().UTC()
 	}
 	node.IPConfig = cfg
-	if err := s.store.UpsertNode(node); err != nil {
+	if err := s.upsertGraphNode(node); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

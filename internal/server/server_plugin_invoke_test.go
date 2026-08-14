@@ -494,6 +494,271 @@ func TestPluginSubscriptionMutationRejectsFetchAfterLastShareDeletion(t *testing
 	}
 }
 
+func TestGraphSaveWaitsForPluginGateBeforeTakingAuthorityRead(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, releaseGate, err := srv.acquireSubscriptionPluginGate(context.Background(), "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter := make(chan struct{}, 1)
+	srv.subscriptionPluginGateWaiter = waiter
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		done <- rec
+	}()
+	<-waiter
+	state := srv.subscriptionGraphAuthorityFor(vpnCorePluginID)
+	if !state.mu.TryLock() {
+		releaseGate()
+		t.Fatal("graph save held R while waiting for the plugin mutation gate")
+	}
+	state.mu.Unlock()
+	releaseGate()
+	if rec := <-done; rec.Code != http.StatusOK {
+		t.Fatalf("save response code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func graphAuthorityPluginFixture(t *testing.T, methods []string) (*Server, string, string, VpnUser) {
+	t.Helper()
+	srv, sourceUUID, _, user, _ := seedLineChainFixture(t)
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{}}}}
+	for _, method := range methods {
+		manifest.Interfaces[0].MethodSpecs = append(manifest.Interfaces[0].MethodSpecs,
+			plugin.InterfaceMethod{Name: method, Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}})
+	}
+	if err := srv.store.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv.plugins = append(srv.plugins, plugin.Loaded{Manifest: manifest})
+	srv.pluginRPC = plugin.NewRPCRegistry()
+	options, err := srv.vpnCoreSubscriptionSourcesRPC(context.Background(), "graph_options", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded graphSubscriptionOptionsResponse
+	if err := json.Unmarshal(options, &decoded); err != nil || !decoded.OK {
+		t.Fatalf("initial graph options: %s err=%v", options, err)
+	}
+	return srv, decoded.OptionsVersion, sourceUUID, user
+}
+
+func invokeGraphPlugin(t *testing.T, srv *Server, method, payload string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(fmt.Sprintf(`{"id":"p","service":"p/subscription","method":%q,"payload":%s}`, method, payload)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	return rec
+}
+
+func TestGraphMutationFirstMakesLaterSaveObserveNewOptionsAndWriteNothing(t *testing.T) {
+	srv, expected, _, user := graphAuthorityPluginFixture(t, []string{"save"})
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		wire, err := srv.vpnCoreSubscriptionSourcesRPC(ctx, "graph_options", []byte(`{}`))
+		if err != nil {
+			return nil, err
+		}
+		var options graphSubscriptionOptionsResponse
+		if err := json.Unmarshal(wire, &options); err != nil || options.OptionsVersion != expected {
+			return nil, errors.New("graph options changed")
+		}
+		if err := srv.store.PutKV(model.KVEntry{Bucket: "plugin:p", Key: "saved", Value: `{"ok":true}`}); err != nil {
+			return nil, err
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state := srv.subscriptionGraphAuthorityFor(vpnCorePluginID)
+	state.mu.Lock()
+	public, private := splitVpnUserRecord(user)
+	public.Name = "changed after options review"
+	if err := srv.store.PutVpnUserRecord(public, private); err != nil {
+		state.mu.Unlock()
+		t.Fatal(err)
+	}
+	readWaiter := make(chan struct{}, 1)
+	srv.subscriptionGraphReadWaiter = readWaiter
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- invokeGraphPlugin(t, srv, "save", `{}`) }()
+	<-readWaiter
+	if _, ok := srv.store.KVEntry("plugin:p", "saved"); ok {
+		state.mu.Unlock()
+		t.Fatal("save wrote before mutation publication released")
+	}
+	state.mu.Unlock()
+	rec := <-done
+	if rec.Code == http.StatusOK {
+		t.Fatalf("stale save unexpectedly succeeded: %s", rec.Body.String())
+	}
+	if _, ok := srv.store.KVEntry("plugin:p", "saved"); ok {
+		t.Fatal("stale save published KV state")
+	}
+}
+
+func TestGraphSaveHoldsOneAuthorityReadThroughDurableCommit(t *testing.T) {
+	srv, _, _, _ := graphAuthorityPluginFixture(t, []string{"save"})
+	validated, allowCommit := make(chan struct{}), make(chan struct{})
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		if _, err := srv.vpnCoreSubscriptionSourcesRPC(ctx, "graph_options", []byte(`{}`)); err != nil {
+			return nil, err
+		}
+		close(validated)
+		<-allowCommit
+		if err := srv.store.PutKV(model.KVEntry{Bucket: "plugin:p", Key: "saved", Value: `{"ok":true}`}); err != nil {
+			return nil, err
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	saveDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { saveDone <- invokeGraphPlugin(t, srv, "save", `{}`) }()
+	<-validated
+	writeWaiter := make(chan struct{}, 1)
+	srv.subscriptionGraphWriteWaiter = writeWaiter
+	mutationDone := make(chan struct{})
+	go func() {
+		_ = srv.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return nil })
+		close(mutationDone)
+	}()
+	<-writeWaiter
+	close(allowCommit)
+	if rec := <-saveDone; rec.Code != http.StatusOK {
+		t.Fatalf("save failed: %d %s", rec.Code, rec.Body.String())
+	}
+	<-mutationDone
+	if _, ok := srv.store.KVEntry("plugin:p", "saved"); !ok {
+		t.Fatal("durable save commit missing")
+	}
+}
+
+func TestGraphPreviewOptionsAndComposeShareOuterAuthorityRead(t *testing.T) {
+	srv, _, sourceUUID, user := graphAuthorityPluginFixture(t, []string{"preview"})
+	between, continueCompose := make(chan struct{}), make(chan struct{})
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"preview"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		if _, err := srv.vpnCoreSubscriptionSourcesRPC(ctx, "graph_options", []byte(`{}`)); err != nil {
+			return nil, err
+		}
+		close(between)
+		<-continueCompose
+		return srv.vpnCoreSubscriptionSourcesRPC(ctx, "compose", []byte(fmt.Sprintf(`{"schema_version":1,"identity_id":%q,"entry_roots":[%q]}`, user.ID, sourceUUID)))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	previewDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { previewDone <- invokeGraphPlugin(t, srv, "preview", `{}`) }()
+	<-between
+	writeWaiter := make(chan struct{}, 1)
+	srv.subscriptionGraphWriteWaiter = writeWaiter
+	mutationDone := make(chan struct{})
+	go func() {
+		_ = srv.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return nil })
+		close(mutationDone)
+	}()
+	<-writeWaiter
+	close(continueCompose)
+	if rec := <-previewDone; rec.Code != http.StatusOK {
+		t.Fatalf("preview failed: %d %s", rec.Code, rec.Body.String())
+	}
+	<-mutationDone
+}
+
+func TestGraphSaveCommitFailurePublishesNoKVAndReleasesAuthority(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "state")
+	st, err := store.Open(filepath.Join(parent, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		singboxInv: map[string]model.SingBoxInventory{}, agentCapabilities: map[string]map[string]struct{}{}, logger: log.New(io.Discard, "", 0)}
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		if _, err := srv.vpnCoreSubscriptionSourcesRPC(ctx, "graph_options", []byte(`{}`)); err != nil {
+			return nil, err
+		}
+		if err := os.RemoveAll(parent); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(parent, []byte("blocks mkdir"), 0o600); err != nil {
+			return nil, err
+		}
+		return nil, srv.store.PutKV(model.KVEntry{Bucket: "plugin:p", Key: "saved", Value: `{"must_not_publish":true}`})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := invokeGraphPlugin(t, srv, "save", `{}`); rec.Code == http.StatusOK {
+		t.Fatalf("failed commit returned success: %s", rec.Body.String())
+	}
+	if _, ok := srv.store.KVEntry("plugin:p", "saved"); ok {
+		t.Fatal("failed commit published KV state")
+	}
+	state := srv.subscriptionGraphAuthorityFor(vpnCorePluginID)
+	if !state.mu.TryLock() {
+		t.Fatal("failed save retained graph authority read")
+	}
+	state.mu.Unlock()
+}
+
+func TestLegacyVPNCorePreviewDoesNotUpgradeGraphReadForStalePruning(t *testing.T) {
+	srv, _, _, _ := graphAuthorityPluginFixture(t, []string{"preview"})
+	const staleNode = "stale-preview-node"
+	if err := srv.store.UpsertNode(model.Node{ID: staleNode, Name: staleNode}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv[staleNode] = model.SingBoxInventory{NodeID: staleNode, At: srv.now().Add(-nodeOfflineThreshold - time.Minute), Status: "ok"}
+	srv.singboxInvMu.Unlock()
+	skipped := make(chan struct{}, 1)
+	srv.subscriptionGraphPruneSkipped = skipped
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"preview"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		return srv.vpnCoreNodesRPC(ctx, "export", []byte(`{"include_managed":false}`))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec := invokeGraphPlugin(t, srv, "preview", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy preview failed: %d %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-skipped:
+	default:
+		t.Fatal("nested nodes export did not skip the graph-authority prune upgrade")
+	}
+	if _, ok := srv.singBoxInventory(staleNode); !ok {
+		t.Fatal("optional stale prune ran while the outer graph read was held")
+	}
+}
+
 func TestPluginSubscriptionMutationPanicReleasesGate(t *testing.T) {
 	st, err := store.Open("")
 	if err != nil {

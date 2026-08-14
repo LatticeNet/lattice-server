@@ -69,9 +69,11 @@ func (s *Server) registerVPNCoreRPC() {
 	}
 }
 
-func (s *Server) vpnCoreSubscriptionSourcesRPC(_ context.Context, method string, request []byte) ([]byte, error) {
+func (s *Server) vpnCoreSubscriptionSourcesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
+	ctx, releaseGraph := s.acquireSubscriptionGraphRead(ctx, vpnCorePluginID)
+	defer releaseGraph()
 	if method == "graph_options" {
-		response := graphSubscriptionOptionsResponse{SchemaVersion: 1}
+		response := graphSubscriptionOptionsResponse{SchemaVersion: 1, Identities: []graphSubscriptionIdentityOption{}, Roots: []graphSubscriptionRootOption{}}
 		if err := decodeStrictGraphOptionsRequest(request); err != nil {
 			response.Error = composeFailureView(composeFailure("invalid_request"))
 			return json.Marshal(response)
@@ -80,7 +82,7 @@ func (s *Server) vpnCoreSubscriptionSourcesRPC(_ context.Context, method string,
 			return s.captureLineChainCompileSnapshot()
 		}, s.now().UTC())
 		if err != nil {
-			response = graphSubscriptionOptionsResponse{SchemaVersion: 1, Error: composeFailureView(err)}
+			response = graphSubscriptionOptionsResponse{SchemaVersion: 1, Identities: []graphSubscriptionIdentityOption{}, Roots: []graphSubscriptionRootOption{}, Error: composeFailureView(err)}
 		}
 		return json.Marshal(response)
 	}
@@ -238,7 +240,7 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 			return nil, fmt.Errorf("vpn-core/lines reattach: line_uuid is already assigned to %s", hash)
 		}
 	}
-	err := s.store.PutLineUUIDAuthority(req.LineHashID, req.LineUUID, line.NodeID)
+	err := s.putLineUUIDAuthority(req.LineHashID, req.LineUUID, line.NodeID)
 	s.lineUUIDMu.Unlock()
 	if err != nil {
 		return nil, err
@@ -250,7 +252,7 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 		if !hadPrevious {
 			previousUUID, previousOwner = "", ""
 		}
-		err = s.store.PutLineUUIDAuthority(req.LineHashID, previousUUID, previousOwner)
+		err = s.putLineUUIDAuthority(req.LineHashID, previousUUID, previousOwner)
 		s.lineUUIDMu.Unlock()
 		s.invalidateLineReadModel()
 		if err != nil {

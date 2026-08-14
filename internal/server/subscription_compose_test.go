@@ -96,6 +96,27 @@ func TestComposeGraphSubscriptionIsCanonicalSecretFreeAndStable(t *testing.T) {
 	}
 }
 
+func TestComposeGraphSubscriptionRejectsCredentialAsPublicRootWithoutLeak(t *testing.T) {
+	snapshot := testGraphComposeSnapshot()
+	identity := snapshot.Users["identity"]
+	identity.Credentials[0].UUID = composeRootUUID
+	snapshot.Users["identity"] = identity
+	response, err := composeGraphSubscription(snapshot, graphSubscriptionRequest{
+		SchemaVersion: 1, IdentityID: "identity", EntryRoots: []string{composeRootUUID},
+	}, time.Now())
+	if err == nil || response.OK || response.Raw != "" || response.SourceVersion != "" || len(response.Entries) != 0 || len(response.SourceManifest) != 0 {
+		t.Fatalf("credential/root collision did not fail closed: response=%+v err=%v", response, err)
+	}
+	public := composeFailureView(err)
+	wire, marshalErr := json.Marshal(public)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if strings.Contains(strings.ToLower(string(wire)), composeRootUUID) {
+		t.Fatalf("credential leaked through compose error: %s", wire)
+	}
+}
+
 func TestComposeGraphSubscriptionFailsAllOrNoneWithRedactedStableError(t *testing.T) {
 	snapshot := testGraphComposeSnapshot()
 	snapshot.Chains.Attempts["approval"] = store.LineChainAttempt{SourceLineUUID: composeRootUUID, Status: store.LineChainStatusApplying}

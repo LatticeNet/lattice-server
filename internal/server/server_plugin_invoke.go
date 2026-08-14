@@ -225,6 +225,13 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	ctx, cancel := context.WithTimeout(r.Context(), pluginCallTimeout(methodContract))
 	defer cancel()
 	ctx = context.WithValue(ctx, pluginOperatorPrincipalKey{}, p)
+	graphPreviewOperation := req.Service == req.ID+"/subscription" && req.Method == "preview"
+	graphSaveOperation := req.Service == req.ID+"/subscription" && req.Method == "save"
+	if graphPreviewOperation {
+		var releaseGraph func()
+		ctx, releaseGraph = s.acquireSubscriptionGraphRead(ctx, vpnCorePluginID)
+		defer releaseGraph()
+	}
 	payload, err := s.resolveSecretOperatorTargets(p, req.ID, req.Payload, methodContract.OperatorTargetFields)
 	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
@@ -284,6 +291,11 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			writeError(w, http.StatusGatewayTimeout, errors.New("subscription mutation canceled"))
 			return
 		}
+	}
+	if graphSaveOperation {
+		var releaseGraph func()
+		ctx, releaseGraph = s.acquireSubscriptionGraphRead(ctx, vpnCorePluginID)
+		defer releaseGraph()
 	}
 	dispatch := func() {
 		switch {

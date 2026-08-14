@@ -127,7 +127,7 @@ func vpnUserKey(id string) string { return vpnUserKeyPrefix + id }
 
 func (s *Server) putVpnUser(u VpnUser) error {
 	public, private := splitVpnUserRecord(u)
-	return s.store.PutVpnUserRecord(public, private)
+	return s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return s.store.PutVpnUserRecord(public, private) })
 }
 
 func (s *Server) getVpnUser(id string) (VpnUser, bool) {
@@ -157,7 +157,7 @@ func (s *Server) listVpnUsers() []VpnUser {
 }
 
 func (s *Server) deleteVpnUser(id string) error {
-	return s.store.DeleteVpnUserRecord(id)
+	return s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return s.store.DeleteVpnUserRecord(id) })
 }
 
 func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecretRecord) {

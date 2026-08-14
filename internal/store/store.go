@@ -2318,15 +2318,35 @@ func (s *Store) PutKV(entry model.KVEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry.UpdatedAt = time.Now().UTC()
-	s.state.KV[entry.Bucket+"/"+entry.Key] = entry
-	return s.Save()
+	staged := s.state
+	staged.KV = cloneKVEntries(s.state.KV)
+	staged.KV[entry.Bucket+"/"+entry.Key] = entry
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
 }
 
 func (s *Store) DeleteKV(bucket, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.state.KV, bucket+"/"+key)
-	return s.Save()
+	staged := s.state
+	staged.KV = cloneKVEntries(s.state.KV)
+	delete(staged.KV, bucket+"/"+key)
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
+}
+
+func cloneKVEntries(entries map[string]model.KVEntry) map[string]model.KVEntry {
+	cloned := make(map[string]model.KVEntry, len(entries))
+	for key, entry := range entries {
+		cloned[key] = entry
+	}
+	return cloned
 }
 
 func (s *Store) KV(bucket string) []model.KVEntry {

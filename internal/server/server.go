@@ -215,6 +215,11 @@ type Server struct {
 	subscriptionPluginMutations   map[string]*subscriptionPluginMutationState
 	subscriptionRefreshWaiter     chan<- struct{}
 	subscriptionPluginGateWaiter  chan<- struct{}
+	subscriptionGraphAuthorityMu  sync.Mutex
+	subscriptionGraphAuthorities  map[string]*subscriptionGraphAuthorityState
+	subscriptionGraphReadWaiter   chan<- struct{}
+	subscriptionGraphWriteWaiter  chan<- struct{}
+	subscriptionGraphPruneSkipped chan<- struct{}
 	subscriptionRender            func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
 	subscriptionBeforeCacheExtend func()
 	subscriptionCacheLookupWaiter chan<- struct{}
@@ -2114,7 +2119,7 @@ func (s *Server) ensureNodeIdentityUUID(nodeID string) (string, error) {
 	if err := ensureNodeIdentityUUIDInPlace(&n); err != nil {
 		return "", err
 	}
-	if err := s.store.UpsertNode(n); err != nil {
+	if err := s.upsertGraphNode(n); err != nil {
 		return "", err
 	}
 	s.invalidateLineReadModel()
@@ -2132,6 +2137,13 @@ func (s *Server) agentRuntimeSnapshot(nodeID string) *agentRuntimeConfig {
 }
 
 func (s *Server) replaceAgentCapabilities(nodeID string, capabilities []string) {
+	_ = s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error {
+		s.replaceAgentCapabilitiesUnlocked(nodeID, capabilities)
+		return nil
+	})
+}
+
+func (s *Server) replaceAgentCapabilitiesUnlocked(nodeID string, capabilities []string) {
 	known := make(map[string]struct{}, 2)
 	for _, capability := range capabilities {
 		switch strings.TrimSpace(capability) {
@@ -2393,7 +2405,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := s.store.UpsertNode(n); err != nil {
+	if err := s.upsertGraphNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2496,7 +2508,7 @@ func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Req
 	launch := normalizeAgentLaunchConfig(req.AgentLaunch)
 	launch.UpdatedAt = time.Now().UTC()
 	node.AgentLaunch = &launch
-	if err := s.store.UpsertNode(node); err != nil {
+	if err := s.upsertGraphNode(node); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -5735,7 +5747,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		if err != nil {
 			reason := "line chain inputs changed during approval; fresh plan required"
 			failedAudit := lineChainFailedAudit(p, approval, "", "line_chain_inputs_changed", reason)
-			committed, rejectErr := s.store.RejectLineChainApprovalStale(approval.ID, "line_chain_inputs_changed", reason, failedAudit)
+			var committed bool
+			_, rejectErr := s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+				var storeErr error
+				committed, storeErr = s.store.RejectLineChainApprovalStale(approval.ID, "line_chain_inputs_changed", reason, failedAudit)
+				return nil, storeErr
+			})
 			if rejectErr != nil {
 				if committed {
 					s.logger.Printf("line chain approval stale transition committed with degraded durability: %v", rejectErr)
@@ -5884,7 +5901,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		approveAudit := lineChainApproveAudit(p, approval, task.ID)
 		approveAudit.At = task.CreatedAt
 		failedAudit := lineChainFailedAudit(p, approval, task.ID, "line_chain_inputs_changed", "line chain inputs changed while queueing; fresh plan required")
-		_, committed, err := s.store.ApproveLineChain(approval, task, approveAudit, failedAudit)
+		var committed bool
+		_, err := s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+			var storeErr error
+			_, committed, storeErr = s.store.ApproveLineChain(approval, task, approveAudit, failedAudit)
+			return nil, storeErr
+		})
 		if committed && err != nil {
 			if errors.Is(err, store.ErrLineChainRevisionConflict) || errors.Is(err, store.ErrLineChainCycle) || errors.Is(err, store.ErrTaskTransitionConflict) {
 				if appendErr := s.appendRequiredLineChainAudit(failedAudit); appendErr != nil {
@@ -5961,7 +5983,12 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 		if isLineChainApproval(approval) {
 			reason := "line chain approval rejected by operator"
 			failedAudit := lineChainFailedAudit(p, approval, "", "approval_rejected", reason)
-			committed, err := s.store.RejectLineChainApproval(approval.ID, reason, failedAudit)
+			var committed bool
+			_, err := s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+				var storeErr error
+				committed, storeErr = s.store.RejectLineChainApproval(approval.ID, reason, failedAudit)
+				return nil, storeErr
+			})
 			if err != nil {
 				if committed {
 					s.logger.Printf("line chain rejection committed with degraded durability: %v", err)
@@ -6174,7 +6201,7 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	}
 	n.LastSeen = time.Now().UTC()
 	n.Online = true
-	if err := s.store.UpsertNode(n); err != nil {
+	if err := s.upsertGraphNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -6262,7 +6289,12 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	// approval and current plan-anchor checks atomically with the lease mutation.
 	netGuardCapable := requestHasAgentCapability(r, netGuardManagedSHACapability)
 	lineChainCapable := requestHasAgentCapability(r, lineChainDurableCapability)
-	deliveries, err := s.store.LeaseTaskDeliveriesWithLineChainValidator(nodeID, 3, netGuardCapable, lineChainCapable, s.validateLineChainFirstLease)
+	var deliveries []store.TaskDelivery
+	_, err := s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+		var leaseErr error
+		deliveries, leaseErr = s.store.LeaseTaskDeliveriesWithLineChainValidator(nodeID, 3, netGuardCapable, lineChainCapable, s.validateLineChainFirstLease)
+		return nil, leaseErr
+	})
 	if auditErr := s.repairLineChainAuditEvidence(); auditErr != nil {
 		writeError(w, http.StatusInternalServerError, auditErr)
 		return

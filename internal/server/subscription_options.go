@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -16,6 +17,8 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
+
+var graphOptionUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 type graphSubscriptionIdentityOption struct {
 	ID         string `json:"id"`
@@ -26,29 +29,33 @@ type graphSubscriptionIdentityOption struct {
 }
 
 type graphSubscriptionRootOption struct {
-	LineUUID    string `json:"line_uuid"`
-	Label       string `json:"label"`
-	SourceNode  string `json:"source_node_id"`
-	Source      string `json:"source"`
-	TargetLabel string `json:"target_label,omitempty"`
-	Status      string `json:"status"`
-	PathSummary string `json:"path_summary"`
-	Reason      string `json:"reason,omitempty"`
-	Selectable  bool   `json:"selectable"`
+	LineUUID            string   `json:"line_uuid"`
+	Label               string   `json:"label"`
+	SourceNode          string   `json:"source_node_id"`
+	Source              string   `json:"source"`
+	TargetLabel         string   `json:"target_label,omitempty"`
+	Status              string   `json:"status"`
+	PathSummary         string   `json:"path_summary"`
+	Reason              string   `json:"reason,omitempty"`
+	EligibleIdentityIDs []string `json:"eligible_identity_ids"`
+	Selectable          bool     `json:"selectable"`
 }
 
 type graphSubscriptionOptionsResponse struct {
 	SchemaVersion  int                               `json:"schema_version"`
 	OK             bool                              `json:"ok"`
 	OptionsVersion string                            `json:"options_version,omitempty"`
-	Identities     []graphSubscriptionIdentityOption `json:"identities,omitempty"`
-	Roots          []graphSubscriptionRootOption     `json:"roots,omitempty"`
+	Identities     []graphSubscriptionIdentityOption `json:"identities"`
+	Roots          []graphSubscriptionRootOption     `json:"roots"`
 	Error          *graphSubscriptionError           `json:"error,omitempty"`
 }
 
 func (response graphSubscriptionOptionsResponse) Clone() graphSubscriptionOptionsResponse {
 	response.Identities = append(make([]graphSubscriptionIdentityOption, 0, len(response.Identities)), response.Identities...)
 	response.Roots = append(make([]graphSubscriptionRootOption, 0, len(response.Roots)), response.Roots...)
+	for i := range response.Roots {
+		response.Roots[i].EligibleIdentityIDs = append(make([]string, 0, len(response.Roots[i].EligibleIdentityIDs)), response.Roots[i].EligibleIdentityIDs...)
+	}
 	if response.Error != nil {
 		cloned := *response.Error
 		response.Error = &cloned
@@ -85,6 +92,7 @@ func graphSubscriptionOptionsFromCapture(capture func() (lineChainCompileSnapsho
 }
 
 func graphSubscriptionOptions(snapshot lineChainCompileSnapshot, now time.Time) (graphSubscriptionOptionsResponse, error) {
+	denylist := graphOptionSecretDenylist(snapshot)
 	identityIDs := make([]string, 0, len(snapshot.Users))
 	for id := range snapshot.Users {
 		identityIDs = append(identityIDs, id)
@@ -95,10 +103,14 @@ func graphSubscriptionOptions(snapshot lineChainCompileSnapshot, now time.Time) 
 	}
 
 	identities := make([]graphSubscriptionIdentityOption, 0, len(identityIDs))
-	eligibleBindings := make(map[string]bool)
+	eligibleBindings := make(map[string][]string)
+	allCredentialUUIDs := make(map[string]bool)
 	for _, id := range identityIDs {
 		identity := snapshot.Users[id]
-		option := graphSubscriptionIdentityOption{ID: identity.ID, Label: safeGraphOptionLabel(firstNonEmpty(identity.Name, identity.Email, identity.ID)), Status: "eligible", Selectable: true}
+		if credential, ok := vpnCredentialForProtocol(identity.Credentials, "vless"); ok && credential.UUID != "" {
+			allCredentialUUIDs[strings.ToLower(credential.UUID)] = true
+		}
+		option := graphSubscriptionIdentityOption{ID: identity.ID, Label: safeGraphOptionText(firstNonEmpty(identity.Name, identity.Email), "VPN identity", false, denylist), Status: "eligible", Selectable: true}
 		switch {
 		case !identity.Enabled:
 			option.Status, option.Reason, option.Selectable = "disabled", "identity_disabled", false
@@ -115,7 +127,7 @@ func graphSubscriptionOptions(snapshot lineChainCompileSnapshot, now time.Time) 
 		if option.Selectable {
 			for _, binding := range identity.Bindings {
 				if binding.Enabled {
-					eligibleBindings[binding.LineHashID] = true
+					eligibleBindings[binding.LineHashID] = appendUniqueSorted(eligibleBindings[binding.LineHashID], identity.ID)
 				}
 			}
 		}
@@ -142,33 +154,39 @@ func graphSubscriptionOptions(snapshot lineChainCompileSnapshot, now time.Time) 
 	roots := make([]graphSubscriptionRootOption, 0, len(rootIDs))
 	totalTraversalVisits := 0
 	for _, uuid := range rootIDs {
+		if allCredentialUUIDs[uuid] {
+			continue
+		}
 		lines := snapshot.Lines[uuid]
-		option := graphSubscriptionRootOption{LineUUID: uuid, Status: "unresolved", Reason: "root_unavailable"}
+		option := graphSubscriptionRootOption{LineUUID: uuid, Status: "unresolved", Reason: "root_unavailable", EligibleIdentityIDs: []string{}}
 		if len(lines) == 1 {
 			line := lines[0]
-			option.Label = safeGraphOptionLabel(firstNonEmpty(line.Name, line.Tag, uuid))
-			option.SourceNode = line.NodeID
-			option.Source = line.Source
+			option.Label = safeGraphOptionText(firstNonEmpty(line.Name, line.Tag), "Managed line", false, denylist)
+			option.SourceNode = safeGraphOptionText(line.NodeID, "unknown node", true, denylist)
+			option.Source = safeGraphOptionText(line.Source, "unknown", false, denylist)
 			option.PathSummary = option.Label
 			if definition, ok := snapshot.Chains.Definitions[uuid]; ok {
-				option.Status = definition.Status
+				option.Status = safeGraphOptionText(definition.Status, "unresolved", false, denylist)
 				if targetLines := snapshot.Lines[strings.ToLower(definition.TargetLineUUID)]; len(targetLines) == 1 {
-					option.TargetLabel = safeGraphOptionLabel(firstNonEmpty(targetLines[0].Name, targetLines[0].Tag, definition.TargetLineUUID))
+					option.TargetLabel = safeGraphOptionText(firstNonEmpty(targetLines[0].Name, targetLines[0].Tag), "Managed line", false, denylist)
 				}
 			}
 			if _, _, err := composeLine(snapshot, uuid); err != nil {
 				option.Reason = composeFailureView(err).Code
+				option.Status = graphOptionFailureStatus(option.Reason)
 			} else if path, terminal, err := composeDeclaredPath(snapshot, uuid, activeSources, &totalTraversalVisits); err != nil {
 				option.Reason = composeFailureView(err).Code
-			} else if !eligibleBindings[line.LineHashID] {
+				option.Status = graphOptionFailureStatus(option.Reason)
+			} else if len(eligibleBindings[line.LineHashID]) == 0 {
 				option.Reason = "identity_unavailable"
 			} else {
+				option.EligibleIdentityIDs = append(option.EligibleIdentityIDs, eligibleBindings[line.LineHashID]...)
 				option.Selectable = true
 				option.Reason = ""
 				option.Status = store.LineChainStatusConverged
 				terminalLabel := option.TargetLabel
 				if terminalLines := snapshot.Lines[terminal.LineUUID]; len(terminalLines) == 1 {
-					terminalLabel = safeGraphOptionLabel(firstNonEmpty(terminalLines[0].Name, terminalLines[0].Tag, terminal.LineUUID))
+					terminalLabel = safeGraphOptionText(firstNonEmpty(terminalLines[0].Name, terminalLines[0].Tag), "Managed line", false, denylist)
 				}
 				if terminalLabel != "" && terminalLabel != option.Label {
 					option.PathSummary = option.Label + " → " + terminalLabel
@@ -184,6 +202,7 @@ func graphSubscriptionOptions(snapshot lineChainCompileSnapshot, now time.Time) 
 		if option.PathSummary == "" {
 			option.PathSummary = option.Label
 		}
+		option.PathSummary = safeGraphOptionText(option.PathSummary, option.Label, false, denylist)
 		roots = append(roots, option)
 	}
 
@@ -197,17 +216,28 @@ func graphSubscriptionOptions(snapshot lineChainCompileSnapshot, now time.Time) 
 		return graphSubscriptionOptionsResponse{}, composeFailure("bounds_exceeded")
 	}
 	sum := sha256.Sum256(canonical)
-	return graphSubscriptionOptionsResponse{SchemaVersion: 1, OK: true, OptionsVersion: "ov1:" + hex.EncodeToString(sum[:]), Identities: identities, Roots: roots}, nil
+	response := graphSubscriptionOptionsResponse{SchemaVersion: 1, OK: true, OptionsVersion: "ov1:" + hex.EncodeToString(sum[:]), Identities: identities, Roots: roots}
+	final, err := json.Marshal(response)
+	if err != nil || len(final) > model.MaxSubscriptionResponseBytes {
+		return graphSubscriptionOptionsResponse{}, composeFailure("bounds_exceeded")
+	}
+	return response, nil
 }
 
-func safeGraphOptionLabel(value string) string {
+func safeGraphOptionText(value, fallback string, allowUUID bool, denylist []string) string {
 	value = strings.TrimSpace(value)
-	value = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return -1
+	if strings.ContainsFunc(value, unicode.IsControl) {
+		return fallback
+	}
+	lower := strings.ToLower(value)
+	if value == "" || strings.Contains(lower, "://") || strings.Contains(lower, "private key") || strings.Contains(lower, "token") || strings.Contains(lower, "secret") || strings.HasPrefix(lower, "lat$") || (!allowUUID && graphOptionUUID.MatchString(lower)) {
+		return fallback
+	}
+	for _, secret := range denylist {
+		if secret != "" && strings.Contains(lower, strings.ToLower(secret)) {
+			return fallback
 		}
-		return r
-	}, value)
+	}
 	if len(value) > 128 {
 		for end := 128; end > 0; end-- {
 			if value[end]&0xc0 != 0x80 {
@@ -216,7 +246,48 @@ func safeGraphOptionLabel(value string) string {
 			}
 		}
 	}
+	if value == "" {
+		return fallback
+	}
 	return value
+}
+
+func graphOptionSecretDenylist(snapshot lineChainCompileSnapshot) []string {
+	secrets := make([]string, 0)
+	for _, identity := range snapshot.Users {
+		if identity.SubID != "" {
+			secrets = append(secrets, identity.SubID)
+		}
+		for _, credential := range identity.Credentials {
+			secrets = append(secrets, credential.UUID, credential.Password)
+		}
+	}
+	for _, definition := range snapshot.Definitions {
+		secrets = append(secrets, definition.RealityPrivateKey)
+	}
+	return secrets
+}
+
+func appendUniqueSorted(values []string, value string) []string {
+	i := sort.SearchStrings(values, value)
+	if i < len(values) && values[i] == value {
+		return values
+	}
+	values = append(values, "")
+	copy(values[i+1:], values[i:])
+	values[i] = value
+	return values
+}
+
+func graphOptionFailureStatus(reason string) string {
+	switch reason {
+	case "graph_busy":
+		return store.LineChainStatusApplying
+	case "graph_drifted", "source_missing", "target_missing", "inputs_changed":
+		return store.LineChainStatusDrifted
+	default:
+		return "unresolved"
+	}
 }
 
 func graphOptionHopCount(count int) string {

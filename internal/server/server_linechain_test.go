@@ -799,6 +799,44 @@ func TestLineChainTerminalConcurrentLiveMutationCommitsConsistentDrift(t *testin
 	}
 }
 
+func TestLineChainTerminalPublicationWaitsForGraphSelectionAuthority(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	}
+	result := model.TaskResult{TaskID: deliveries[0].Task.ID, NodeID: "node-b", LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
+	waiter := make(chan struct{}, 1)
+	srv.subscriptionGraphWriteWaiter = waiter
+	_, releaseRead := srv.acquireSubscriptionGraphRead(context.Background(), vpnCorePluginID)
+	done := make(chan error, 1)
+	go func() { done <- srv.handleLineChainTaskResult(approval, deliveries[0].Task, result) }()
+	<-waiter
+	if _, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || found {
+		t.Fatalf("terminal result published during graph selection: found=%v err=%v", found, err)
+	}
+	releaseRead()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if matches, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
+		t.Fatalf("terminal result did not publish after release: matches=%v found=%v err=%v", matches, found, err)
+	}
+}
+
 func TestLineChainFailedAndRemoveAuditsAreIdempotent(t *testing.T) {
 	srv := newManagedLineTestServer(t)
 	base := model.Approval{ID: "approval-audit", NodeID: "node-a", ActorID: "actor", Plugin: lineChainPlugin, Service: lineChainService,

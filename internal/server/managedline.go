@@ -210,7 +210,7 @@ func managedLinePlannedHash(nodeID, tag string, port int) string {
 
 func (s *Server) putManagedLineDef(def managedLineDef) error {
 	public, private := splitManagedLineRecord(def)
-	return s.store.PutManagedLineRecord(public, private)
+	return s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return s.store.PutManagedLineRecord(public, private) })
 }
 
 func (s *Server) managedLineDefByUUID(lineUUID string) (managedLineDef, bool, error) {

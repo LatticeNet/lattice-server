@@ -159,6 +159,9 @@ func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscr
 		if root != requestedRoot || root != strings.ToLower(root) || !validLineUUIDv4(root) || seenRoots[root] {
 			return graphSubscriptionResponse{}, composeFailure("invalid_request")
 		}
+		if strings.EqualFold(root, credential.UUID) {
+			return graphSubscriptionResponse{}, composeFailure("invalid_request")
+		}
 		seenRoots[root] = true
 		manifest.EntryRoots = append(manifest.EntryRoots, root)
 		rootLine, rootDefinition, err := composeLine(snapshot, root)

@@ -153,7 +153,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 
 	cacheEntry, cached := s.subscriptionCache.GetSnapshot(key, s.now())
 	body, contentType, userinfo := cacheEntry.body, cacheEntry.contentType, cacheEntry.userinfo
-	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.contentVersion, cacheEntry.fetchedAt
+	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.publicSourceVersion, cacheEntry.fetchedAt
 	if (!cached || staleResponse) && share.Source.Kind == model.ShareSourcePlugin {
 		// Revalidate before paying for a render. A render boots the plugin's
 		// JavaScript engine, which costs seconds; comparing the content digest
@@ -174,10 +174,18 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 				// transition. Do not serve a cached stale body as though the failed
 				// attempt had been durably recorded.
 				cached = false
-			case subscriptionSnapshotVersion(snap) == stale.contentVersion:
-				s.subscriptionCache.ExtendSnapshot(key, snap.Userinfo, snap.Stale, snap.FetchedAt, s.now())
+			case subscriptionRevalidationVersion(snap) == stale.revalidationVersion:
+				if !s.subscriptionCache.ExtendSnapshot(key, stale.revision, snap.Userinfo, snap.SourceVersion, snap.Stale, snap.FetchedAt, s.now()) {
+					if _, replaced := s.subscriptionCache.GetStale(key); replaced {
+						cached = false
+						break
+					}
+					// A source-wide stale/recovery transition deliberately invalidates
+					// this entry. The captured body is still exact for the matching
+					// revalidation version; serve it once with current snapshot metadata.
+				}
 				body, contentType, userinfo, cached = stale.body, stale.contentType, snap.Userinfo, true
-				staleResponse, sourceVersion, snapshotFetchedAt = snap.Stale, stale.contentVersion, snap.FetchedAt
+				staleResponse, sourceVersion, snapshotFetchedAt = snap.Stale, snap.SourceVersion, snap.FetchedAt
 			}
 		}
 	}
@@ -196,7 +204,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
-		s.subscriptionCache.PutSnapshot(key, body, contentType, userinfo, sourceVersion, staleResponse, snapshotFetchedAt, s.now())
+		s.subscriptionCache.PutSnapshot(key, body, contentType, userinfo, rendered.RevalidationVersion, sourceVersion, staleResponse, snapshotFetchedAt, s.now())
 	}
 
 	if contentType == "" {
@@ -212,19 +220,16 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+	metadata := map[string]string{
+		"share_id": share.ID, "slug": slug, "token_sha256": tokenHash, "format": format, "ua_class": uaClass,
+		"cache": strconv.FormatBool(cached), "stale": strconv.FormatBool(staleResponse), "snapshot_age_seconds": snapshotAgeSeconds(s.now(), snapshotFetchedAt),
+	}
+	if sourceVersion != "" {
+		metadata["source_version"] = sourceVersion
+	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
-		Metadata: map[string]string{
-			"share_id":             share.ID,
-			"slug":                 slug,
-			"token_sha256":         tokenHash,
-			"format":               format,
-			"ua_class":             uaClass,
-			"cache":                strconv.FormatBool(cached),
-			"stale":                strconv.FormatBool(staleResponse),
-			"source_version":       sourceVersion,
-			"snapshot_age_seconds": snapshotAgeSeconds(s.now(), snapshotFetchedAt),
-		},
+		Metadata: metadata,
 	})
 }
 
@@ -288,6 +293,9 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		if err != nil {
 			return renderedSubscription{}, err
 		}
+		if s.subscriptionRender != nil {
+			return s.subscriptionRender(ctx, share, format, uaClass, snap)
+		}
 		payload, err := json.Marshal(map[string]string{
 			"subscription_id": share.Source.SubscriptionID,
 			"format":          format,
@@ -313,7 +321,7 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		// The provider's traffic figures are passed through verbatim so the
 		// client's remaining-quota display stays truthful.
 		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Userinfo: snap.Userinfo,
-			Stale: snap.Stale, SourceVersion: subscriptionSnapshotVersion(snap), FetchedAt: snap.FetchedAt}, nil
+			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, FetchedAt: snap.FetchedAt}, nil
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
@@ -322,10 +330,11 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 // renderedSubscription is one produced body plus the metadata the core turns
 // into response headers. A source never sets a header itself.
 type renderedSubscription struct {
-	Body          []byte
-	ContentType   string
-	Userinfo      string
-	Stale         bool
-	SourceVersion string
-	FetchedAt     time.Time
+	Body                []byte
+	ContentType         string
+	Userinfo            string
+	Stale               bool
+	RevalidationVersion string
+	SourceVersion       string
+	FetchedAt           time.Time
 }

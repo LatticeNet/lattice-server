@@ -46,11 +46,15 @@ func TestSubscriptionCacheIsBounded(t *testing.T) {
 func TestSubscriptionCacheBoundsBytesAndAccountsForReplacement(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	c := newSubscriptionCache(8, time.Minute)
-	c.maxBytes = 5
-	c.Put(shareCacheKey("a"), []byte("123"), "text/plain", "", "", base)
-	c.Put(shareCacheKey("b"), []byte("45"), "text/plain", "", "", base)
-	c.Put(shareCacheKey("a"), []byte("1"), "text/plain", "", "", base)
-	if c.bytes != 3 || c.Len() != 2 {
+	keyA, keyB := shareCacheKey("a"), shareCacheKey("b")
+	sizeA := subscriptionCacheEntrySize(subscriptionCacheEntry{key: keyA, body: []byte("123"), contentType: "text/plain", userinfo: "ui", revalidationVersion: "private", publicSourceVersion: "sv1"})
+	sizeB := subscriptionCacheEntrySize(subscriptionCacheEntry{key: keyB, body: []byte("45"), contentType: "text/plain"})
+	c.maxBytes = sizeA + sizeB
+	c.PutSnapshot(keyA, []byte("123"), "text/plain", "ui", "private", "sv1", false, time.Time{}, base)
+	c.Put(keyB, []byte("45"), "text/plain", "", "", base)
+	c.PutSnapshot(keyA, []byte("1"), "text/plain", "ui", "private", "sv1", false, time.Time{}, base)
+	want := subscriptionCacheEntrySize(subscriptionCacheEntry{key: keyA, body: []byte("1"), contentType: "text/plain", userinfo: "ui", revalidationVersion: "private", publicSourceVersion: "sv1"}) + sizeB
+	if c.bytes != want || c.Len() != 2 {
 		t.Fatalf("replacement accounting bytes=%d entries=%d", c.bytes, c.Len())
 	}
 	c.Put(shareCacheKey("c"), []byte("678"), "text/plain", "", "", base)
@@ -65,17 +69,67 @@ func TestSubscriptionCacheBoundsBytesAndAccountsForReplacement(t *testing.T) {
 func TestSubscriptionCacheBypassesOversizedAndCopiesBodies(t *testing.T) {
 	base := time.Unix(1700000000, 0).UTC()
 	c := newSubscriptionCache(8, time.Minute)
-	c.maxBytes = 3
+	key := shareCacheKey("a")
+	capSize := subscriptionCacheEntrySize(subscriptionCacheEntry{key: key, body: []byte("abc"), contentType: "text/plain"})
+	c.maxBytes = capSize
 	body := []byte("abc")
-	c.Put(shareCacheKey("a"), body, "text/plain", "", "", base)
+	c.Put(key, body, "text/plain", "", "", base)
 	body[0] = 'x'
-	got, _, _, ok := c.Get(shareCacheKey("a"), base)
+	got, _, _, ok := c.Get(key, base)
 	if !ok || string(got) != "abc" {
 		t.Fatalf("cache retained caller alias: %q %v", got, ok)
 	}
-	c.Put(shareCacheKey("a"), []byte("oversized"), "text/plain", "", "", base)
-	if _, _, _, ok := c.Get(shareCacheKey("a"), base); ok || c.bytes != 0 {
+	c.Put(key, []byte("abcd"), "text/plain", "", "", base)
+	if _, _, _, ok := c.Get(key, base); ok || c.bytes != 0 {
 		t.Fatalf("oversized replacement remained cached: bytes=%d", c.bytes)
+	}
+}
+
+func TestSubscriptionCacheAccountsEveryVariableByteAtExactCap(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	key := subscriptionCacheKey{ShareID: "share", Format: "plain", UAClass: "surge"}
+	entry := subscriptionCacheEntry{key: key, body: []byte("body"), contentType: "application/json", userinfo: "upload=1", revalidationVersion: "private-hash", publicSourceVersion: "sv1:public"}
+	size := subscriptionCacheEntrySize(entry)
+	for _, tc := range []struct {
+		name string
+		cap  int
+		want bool
+	}{{"exact cap", size, true}, {"cap minus one", size - 1, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newSubscriptionCache(8, time.Minute)
+			c.maxBytes = tc.cap
+			c.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion, entry.publicSourceVersion, false, time.Time{}, base)
+			_, ok := c.GetStale(key)
+			if ok != tc.want || c.bytes > tc.cap {
+				t.Fatalf("cached=%v bytes=%d cap=%d", ok, c.bytes, tc.cap)
+			}
+		})
+	}
+}
+
+func TestSubscriptionCacheMetadataCannotBypassByteBudget(t *testing.T) {
+	c := newSubscriptionCache(8, time.Minute)
+	key := shareCacheKey("a")
+	c.maxBytes = subscriptionCacheEntrySize(subscriptionCacheEntry{key: key, body: []byte("x"), contentType: "text/plain"})
+	c.PutSnapshot(key, []byte("x"), "text/plain", "oversized-userinfo", "private", "public", false, time.Time{}, time.Now())
+	if c.Len() != 0 || c.bytes != 0 {
+		t.Fatalf("metadata-heavy entry bypassed cap: entries=%d bytes=%d", c.Len(), c.bytes)
+	}
+}
+
+func TestSubscriptionCacheExtendRejectsReplacedRevision(t *testing.T) {
+	base := time.Unix(1700000000, 0).UTC()
+	c := newSubscriptionCache(8, time.Minute)
+	key := shareCacheKey("a")
+	c.PutSnapshot(key, []byte("old"), "text/plain", "old-ui", "old-private", "old-public", true, base, base)
+	old, _ := c.GetStale(key)
+	c.PutSnapshot(key, []byte("new"), "text/plain", "new-ui", "new-private", "new-public", false, base.Add(time.Second), base)
+	if c.ExtendSnapshot(key, old.revision, "stale-ui", "stale-public", true, base, base.Add(time.Minute)) {
+		t.Fatal("stale revalidation mutated a replacement entry")
+	}
+	got, _ := c.GetStale(key)
+	if string(got.body) != "new" || got.userinfo != "new-ui" || got.publicSourceVersion != "new-public" || got.stale {
+		t.Fatalf("replacement was stamped with old metadata: %+v", got)
 	}
 }
 
@@ -172,8 +226,8 @@ func TestSubscriptionCacheRevalidationExtendsUnchangedBody(t *testing.T) {
 		t.Fatal("expired entry served without revalidation")
 	}
 	stale, ok := c.GetStale(key)
-	if !ok || string(stale.body) != "body-a" || stale.contentVersion != "hash-1" {
-		t.Fatalf("stale entry = %q %q %v", stale.body, stale.contentVersion, ok)
+	if !ok || string(stale.body) != "body-a" || stale.revalidationVersion != "hash-1" {
+		t.Fatalf("stale entry = %q %q %v", stale.body, stale.revalidationVersion, ok)
 	}
 
 	// The serve path's "hash still matches" branch: extend, and the entry
@@ -210,7 +264,7 @@ func TestSubscriptionCacheHashChangeForcesReplace(t *testing.T) {
 	// revalidation against the old hash must not resurrect the old body.
 	c.Put(key, []byte("new"), "text/plain", "", "hash-2", base.Add(2*time.Minute))
 	stale, ok := c.GetStale(key)
-	if !ok || string(stale.body) != "new" || stale.contentVersion != "hash-2" {
-		t.Fatalf("replaced entry = %q %q %v", stale.body, stale.contentVersion, ok)
+	if !ok || string(stale.body) != "new" || stale.revalidationVersion != "hash-2" {
+		t.Fatalf("replaced entry = %q %q %v", stale.body, stale.revalidationVersion, ok)
 	}
 }

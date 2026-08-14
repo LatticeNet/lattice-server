@@ -208,6 +208,10 @@ type Server struct {
 	// fail-closed last-good transitions. Production always falls back to Store.
 	subscriptionSnapshotPersist func(model.SubscriptionSnapshot) error
 	subscriptionFetch           func(context.Context, string, string) (model.SubscriptionSnapshot, error)
+	subscriptionRefreshMu       sync.Mutex
+	subscriptionRefreshFlights  map[subscriptionRefreshKey]*subscriptionRefreshFlight
+	subscriptionRefreshJoined   func()
+	subscriptionRender          func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First

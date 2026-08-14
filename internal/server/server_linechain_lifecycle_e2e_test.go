@@ -439,7 +439,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	// chain. The real signed vpn-core and SubStore runtimes must agree on one
 	// immutable graph projection, preview without writing, persist the explicit
 	// selection, publish the same bytes, and serve them through the public share.
-	e5Graph := exerciseE5GraphAtConvergence(t, srv, handler, cookies, csrf, user, sourceUUID)
+	e5Graph := exerciseE5GraphAtConvergence(t, srv, handler, httpServer, cookies, csrf, user, sourceUUID)
 	shareClientPort := lifecycleFreePort(t)
 	startE5ClientFromShareURI(t, singbox, root, e5Graph.URI, shareClientPort)
 	beforeShareTraffic := observer.accepted()

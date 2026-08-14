@@ -241,7 +241,7 @@ type e5GraphPhaseResult struct {
 	Published     []byte
 }
 
-func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handler, cookies []*http.Cookie, csrf string, user VpnUser, sourceUUID string) e5GraphPhaseResult {
+func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handler, httpServer *httptest.Server, cookies []*http.Cookie, csrf string, user VpnUser, sourceUUID string) e5GraphPhaseResult {
 	t.Helper()
 	var source Line
 	for _, group := range srv.buildLineGroups() {
@@ -364,14 +364,12 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 	if !ok || storedShare.Token != created.Token {
 		t.Fatal("HTTP-created E5 share missing from durable store")
 	}
-	routeServer := httptest.NewServer(handler)
-	defer routeServer.Close()
-	request, err := http.NewRequest(http.MethodGet, routeServer.URL+"/sub/"+storedShare.Slug+"/"+storedShare.Token+"?format=plain", nil)
+	request, err := http.NewRequest(http.MethodGet, httpServer.URL+"/sub/"+storedShare.Slug+"/"+storedShare.Token+"?format=plain", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request.Header.Set("User-Agent", "sing-box/1.13.18")
-	response, err := routeServer.Client().Do(request)
+	response, err := httpServer.Client().Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}

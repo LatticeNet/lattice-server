@@ -826,6 +826,63 @@ func TestSubscriptionSnapshotRawEncryptedRuntimeHotAndDeleteAuthoritative(t *tes
 	}
 }
 
+func TestMarkPluginSubscriptionSnapshotsStaleRuntimeHotIsAtomicAndAuthoritative(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath, boltPath := filepath.Join(dir, "state.json"), filepath.Join(dir, "hot.db")
+	cipher := testCipher(t)
+	st, err := OpenWithCipher(jsonPath, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnableRuntimeBoltHotStore(boltPath); err != nil {
+		t.Fatal(err)
+	}
+	for _, snapshot := range []model.SubscriptionSnapshot{
+		{PluginID: "p", SubscriptionID: "one", Raw: "one", FetchedAt: time.Now().UTC()},
+		{PluginID: "p", SubscriptionID: "two", Raw: "two", FetchedAt: time.Now().UTC()},
+		{PluginID: "other", SubscriptionID: "one", Raw: "other", FetchedAt: time.Now().UTC()},
+	} {
+		if err := st.UpsertSubscriptionSnapshot(snapshot); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.runtimeBoltHot.testUpdateCalls = 0
+	committed, err := st.MarkPluginSubscriptionSnapshotsStale("p", time.Now())
+	if err != nil || !committed {
+		t.Fatalf("runtime-hot mark committed=%v err=%v", committed, err)
+	}
+	if st.runtimeBoltHot.testUpdateCalls != 1 {
+		t.Fatalf("runtime-hot mutation updates=%d want=1", st.runtimeBoltHot.testUpdateCalls)
+	}
+	for _, id := range []string{"one", "two"} {
+		if snapshot, ok := st.SubscriptionSnapshot("p", id); !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" {
+			t.Fatalf("live runtime-hot snapshot %s=%+v ok=%v", id, snapshot, ok)
+		}
+	}
+	if snapshot, _ := st.SubscriptionSnapshot("other", "one"); snapshot.Stale {
+		t.Fatalf("unrelated runtime-hot snapshot changed: %+v", snapshot)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithCipher(jsonPath, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.EnableRuntimeBoltHotStore(boltPath); err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for _, id := range []string{"one", "two"} {
+		if snapshot, ok := reopened.SubscriptionSnapshot("p", id); !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" {
+			t.Fatalf("reopened runtime-hot snapshot %s=%+v ok=%v", id, snapshot, ok)
+		}
+	}
+	if snapshot, _ := reopened.SubscriptionSnapshot("other", "one"); snapshot.Stale {
+		t.Fatalf("reopened unrelated runtime-hot snapshot changed: %+v", snapshot)
+	}
+}
+
 func TestRuntimeHotSubscriptionAuthorityPreventsJSONSeedResurrectionAfterDeleteAndEmpty(t *testing.T) {
 	dir := t.TempDir()
 	jsonPath, boltPath := filepath.Join(dir, "state.json"), filepath.Join(dir, "hot.db")

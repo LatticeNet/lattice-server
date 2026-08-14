@@ -285,16 +285,36 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			return
 		}
 	}
-	switch {
-	case loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2:
-		out, err = s.dispatchV2PluginCall(ctx, loaded, req.ID, req.Service, req.Method, payload, operatorTargets)
-	case s.pluginRPC == nil:
-		err = errors.New("plugin rpc bus unavailable")
-	default:
-		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(payload))
-		if errors.Is(err, plugin.ErrRPCNoService) {
-			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil, nil)
+	dispatch := func() {
+		switch {
+		case loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2:
+			out, err = s.dispatchV2PluginCall(ctx, loaded, req.ID, req.Service, req.Method, payload, operatorTargets)
+		case s.pluginRPC == nil:
+			err = errors.New("plugin rpc bus unavailable")
+		default:
+			out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(payload))
+			if errors.Is(err, plugin.ErrRPCNoService) {
+				out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil, nil)
+			}
 		}
+	}
+	if mutatingSubscriptionStore {
+		func() {
+			defer func() {
+				if recover() != nil {
+					err = errors.New("subscription mutation execution failed")
+				}
+			}()
+			dispatch()
+		}()
+		if err != nil {
+			// Plugin diagnostics are untrusted and can contain provider URIs,
+			// credentials, or private keys. Mutation failures expose only one
+			// stable class to HTTP and durable audit evidence.
+			err = errors.New("subscription mutation execution failed")
+		}
+	} else {
+		dispatch()
 	}
 	finishSubscriptionMutation()
 	if err != nil {

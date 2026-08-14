@@ -255,6 +255,63 @@ func TestSubscriptionPluginGateHonorsCanceledWaiterAndRecovers(t *testing.T) {
 	releaseAgain()
 }
 
+func TestSnapshotForFreshFastPathWaitsForMutationAuthority(t *testing.T) {
+	s, st := newShareTestServer(t)
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "before-mutation", FetchedAt: s.now()}); err != nil {
+		t.Fatal(err)
+	}
+	_, release, err := s.acquireSubscriptionPluginGate(context.Background(), "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{}, 1)
+	s.subscriptionPluginGateWaiter = waiting
+	type outcome struct {
+		snapshot model.SubscriptionSnapshot
+		err      error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		snapshot, err := s.snapshotFor(context.Background(), "p", "s", false)
+		done <- outcome{snapshot: snapshot, err: err}
+	}()
+	select {
+	case escaped := <-done:
+		t.Fatalf("fresh fast path escaped mutation authority: snapshot=%+v err=%v", escaped.snapshot, escaped.err)
+	case <-waiting:
+	}
+	if _, err := st.MarkPluginSubscriptionSnapshotsStale("p", s.now()); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	result := <-done
+	if result.err != nil || !result.snapshot.Stale || result.snapshot.Raw != "before-mutation" {
+		t.Fatalf("post-mutation authority snapshot=%+v err=%v", result.snapshot, result.err)
+	}
+}
+
+func TestCaptureSubscriptionRefreshAuthorityPanicReleasesGate(t *testing.T) {
+	s, st := newShareTestServer(t)
+	stableNow := time.Now().UTC()
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "fresh", FetchedAt: stableNow}); err != nil {
+		t.Fatal(err)
+	}
+	s.now = func() time.Time { panic("clock panic canary") }
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("clock panic did not reach the test boundary")
+			}
+		}()
+		_, _ = s.snapshotFor(context.Background(), "p", "s", false)
+	}()
+	s.now = func() time.Time { return stableNow }
+	snapshot, err := s.snapshotFor(context.Background(), "p", "s", false)
+	if err != nil || snapshot.Raw != "fresh" {
+		t.Fatalf("plugin gate remained consumed after authority capture panic: %+v err=%v", snapshot, err)
+	}
+}
+
 func TestSubscriptionRevalidationVersionKeepsLegacyHashPrivate(t *testing.T) {
 	graphA := model.SubscriptionSnapshot{Raw: "first", SourceVersion: "sv1:same"}
 	graphB := model.SubscriptionSnapshot{Raw: "changed", SourceVersion: "sv1:same"}

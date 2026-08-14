@@ -60,6 +60,15 @@ type subscriptionRefreshKey struct {
 	subscriptionID string
 }
 
+type subscriptionRefreshAuthority struct {
+	existing         model.SubscriptionSnapshot
+	has              bool
+	fresh            bool
+	recentStale      bool
+	sourceEpoch      uint64
+	pluginGeneration uint64
+}
+
 func subscriptionRevalidationVersion(snapshot model.SubscriptionSnapshot) string {
 	if snapshot.SourceVersion != "" {
 		return snapshot.SourceVersion
@@ -123,6 +132,28 @@ func (s *Server) acquireSubscriptionPluginGate(ctx context.Context, pluginID str
 	return state, func() { state.gate <- struct{}{} }, nil
 }
 
+func (s *Server) captureSubscriptionRefreshAuthority(ctx context.Context, pluginID, subscriptionID string, force bool) (authority subscriptionRefreshAuthority, err error) {
+	pluginMutation, releasePlugin, err := s.acquireSubscriptionPluginGate(ctx, pluginID)
+	if err != nil {
+		return authority, err
+	}
+	// Install the release before clocks, stores, assertions, or test seams can
+	// panic. No panic may consume the keyed gate token permanently.
+	defer releasePlugin()
+	pluginMutation.mu.Lock()
+	authority.pluginGeneration = pluginMutation.generation
+	pluginMutation.mu.Unlock()
+	publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
+	publication.mu.Lock()
+	authority.existing, authority.has = s.store.SubscriptionSnapshot(pluginID, subscriptionID)
+	authority.sourceEpoch = publication.epoch
+	publication.mu.Unlock()
+	now := s.now()
+	authority.fresh = authority.has && !authority.existing.Stale && !force && now.Sub(authority.existing.FetchedAt) < subscriptionRefreshInterval
+	authority.recentStale = authority.has && authority.existing.Stale && !force && !authority.existing.LastAttemptAt.IsZero() && now.Sub(authority.existing.LastAttemptAt) < subscriptionStaleRetryInterval
+	return authority, nil
+}
+
 // snapshotFor returns the content to render, refreshing it first when it is
 // missing or stale.
 //
@@ -147,16 +178,15 @@ func (s *Server) snapshotFor(ctx context.Context, pluginID, subscriptionID strin
 
 func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, bool, error) {
 	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
-	publication := s.subscriptionPublicationStateFor(key)
-	publication.mu.Lock()
-	existing, has := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
-	publication.mu.Unlock()
-	fresh := has && !existing.Stale && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval
-	if fresh {
-		return existing, false, nil
+	authority, err := s.captureSubscriptionRefreshAuthority(ctx, pluginID, subscriptionID, force)
+	if err != nil {
+		return model.SubscriptionSnapshot{}, false, err
 	}
-	if has && existing.Stale && !force && !existing.LastAttemptAt.IsZero() && s.now().Sub(existing.LastAttemptAt) < subscriptionStaleRetryInterval {
-		return existing, false, nil
+	if authority.fresh {
+		return authority.existing, false, nil
+	}
+	if authority.recentStale {
+		return authority.existing, false, nil
 	}
 	if err := ctx.Err(); err != nil {
 		return model.SubscriptionSnapshot{}, false, err
@@ -209,29 +239,18 @@ func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscripti
 func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subscriptionID string, force bool) (model.SubscriptionSnapshot, error) {
 	key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID}
 	publication := s.subscriptionPublicationStateFor(key)
-	pluginMutation, releaseInitialPlugin, err := s.acquireSubscriptionPluginGate(ctx, pluginID)
+	authority, err := s.captureSubscriptionRefreshAuthority(ctx, pluginID, subscriptionID, force)
 	if err != nil {
 		return model.SubscriptionSnapshot{}, err
 	}
-	pluginMutation.mu.Lock()
-	pluginGeneration := pluginMutation.generation
-	pluginMutation.mu.Unlock()
-	// Re-read only after owning the source flight. This is the current durable
-	// authority all fetch outcomes compare against, so a caller that queued
-	// behind another refresh cannot overwrite the newer result it just observed.
-	publication.mu.Lock()
-	existing, has := s.store.SubscriptionSnapshot(pluginID, subscriptionID)
-	fetchEpoch := publication.epoch
-	publication.mu.Unlock()
-	if has && !existing.Stale && !force && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval {
-		releaseInitialPlugin()
+	existing, has := authority.existing, authority.has
+	if authority.fresh {
 		return existing, nil
 	}
-	if has && existing.Stale && !force && !existing.LastAttemptAt.IsZero() && s.now().Sub(existing.LastAttemptAt) < subscriptionStaleRetryInterval {
-		releaseInitialPlugin()
+	if authority.recentStale {
 		return existing, nil
 	}
-	releaseInitialPlugin()
+	pluginGeneration, fetchEpoch := authority.pluginGeneration, authority.sourceEpoch
 	fetch := s.fetchSubscriptionSource
 	if s.subscriptionFetch != nil {
 		fetch = s.subscriptionFetch

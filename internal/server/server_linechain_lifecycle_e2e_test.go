@@ -62,15 +62,39 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	decoyPort, _ := strconv.Atoi(decoyPortText)
 	realityPrivate, realityPublic := lifecycleRealityKeypair(t, singbox)
+	sourceRealityPrivate, sourceRealityPublic := lifecycleRealityKeypair(t, singbox)
 
-	srv, sourceUUID, targetUUID, user, target := seedLineChainFixture(t)
+	e5Fixture := newE5PluginServerFixture(t, root)
+	srv := e5Fixture.server
+	sourceUUID, targetUUID, user, target := seedLineChainFixtureIntoAtSourcePort(t, srv, bPort)
 	observerPort := lifecycleFreePort(t)
 	observer := newLifecycleObserverAtPort(t, net.JoinHostPort("127.0.0.1", strconv.Itoa(aPort)), observerPort)
 	credential, ok := vpnCredentialForProtocol(user.Credentials, model.ProxyProtocolVLESS)
 	if !ok {
 		t.Fatal("managed target credential missing")
 	}
+	sourceHash := ""
+	for _, group := range srv.buildLineGroups() {
+		for _, line := range group.Lines {
+			if line.LineUUID == sourceUUID {
+				sourceHash = line.LineHashID
+			}
+		}
+	}
+	if sourceHash == "" {
+		t.Fatal("source line hash authority missing")
+	}
+	sourceDef := managedLineDef{
+		LineUUID: sourceUUID, NodeID: "node-b", LineHashID: sourceHash, Tag: "source-b", Port: bPort,
+		SNI: "source.e5.lattice.invalid", HandshakeServer: decoyHost, HandshakePort: decoyPort,
+		RealityPrivateKey: sourceRealityPrivate, RealityPublicKey: sourceRealityPublic, ShortID: "fedcba9876543210",
+		UserID: user.ID, UserName: userLineName(user.ID, sourceUUID), Status: managedLineStatusApplied,
+	}
+	if err := srv.putManagedLineDef(sourceDef); err != nil {
+		t.Fatal(err)
+	}
 	target.SNI = "e2e.lattice.invalid"
+	target.Tag = "target-a"
 	target.Port = observerPort
 	target.HandshakeServer = decoyHost
 	target.HandshakePort = decoyPort
@@ -93,11 +117,22 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	if err := srv.store.UpsertNode(nodeA); err != nil {
 		t.Fatal(err)
 	}
+	nodeB, _ := srv.store.Node("node-b")
+	nodeB.PublicIP = "127.0.0.1"
+	if err := srv.store.UpsertNode(nodeB); err != nil {
+		t.Fatal(err)
+	}
 	seedManagedLineNode(t, srv, "node-a", []model.SingBoxNode{{
 		Name: target.Tag, Protocol: "vless", Network: "tcp", Address: "127.0.0.1",
 		Port: strconv.Itoa(observerPort), SNI: target.SNI, LineUUID: targetUUID, LineID: strings.TrimPrefix(target.LineHashID, "line_"),
 	}})
+	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{
+		Name: sourceDef.Tag, Protocol: "vless", Network: "tcp", Address: "127.0.0.1",
+		Port: strconv.Itoa(bPort), SNI: sourceDef.SNI, LineUUID: sourceUUID, LineID: strings.TrimPrefix(sourceHash, "line_"),
+	}})
 	_ = srv.buildLineGroups()
+	seedE5ConvergedTerminalDefinition(t, srv, target)
+	taskBaseline := len(srv.store.Tasks())
 
 	aDir := filepath.Join(root, "a")
 	configDir := filepath.Join(root, "conf")
@@ -111,9 +146,9 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	lifecycleWrite(t, filepath.Join(aDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"target-a","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":%q,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"e2e.lattice.invalid","reality":{"enabled":true,"handshake":{"server":%q,"server_port":%d},"private_key":%q,"short_id":["0123456789abcdef"]}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[{"inbound":["target-a"],"outbound":"direct"}]}}`, aPort, credential.UUID, decoyHost, decoyPort, realityPrivate))
-	lifecycleWrite(t, filepath.Join(configDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"source-b","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":"22222222-2222-4222-8222-222222222222"}]}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`, bPort))
-	lifecycleWrite(t, filepath.Join(clientDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"socks","tag":"client","listen":"127.0.0.1","listen_port":%d}],"outbounds":[{"type":"vless","tag":"to-b","server":"127.0.0.1","server_port":%d,"uuid":"22222222-2222-4222-8222-222222222222"}],"route":{"rules":[{"inbound":["client"],"outbound":"to-b"}]}}`, clientPort, bPort))
+	lifecycleWrite(t, filepath.Join(aDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"target-a","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":%q,"flow":"xtls-rprx-vision"}],"tls":{"enabled":true,"server_name":"e2e.lattice.invalid","reality":{"enabled":true,"handshake":{"server":%q,"server_port":%d},"private_key":%q,"short_id":["0123456789abcdef"]}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`, aPort, credential.UUID, decoyHost, decoyPort, realityPrivate))
+	lifecycleWrite(t, filepath.Join(configDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"vless","tag":"source-b","listen":"127.0.0.1","listen_port":%d,"users":[{"uuid":%q,"flow":%q}],"tls":{"enabled":true,"server_name":%q,"reality":{"enabled":true,"handshake":{"server":%q,"server_port":%d},"private_key":%q,"short_id":[%q]}}}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}}`, bPort, credential.UUID, credential.Flow, sourceDef.SNI, decoyHost, decoyPort, sourceRealityPrivate, sourceDef.ShortID))
+	lifecycleWrite(t, filepath.Join(clientDir, "config.json"), fmt.Sprintf(`{"log":{"level":"error"},"inbounds":[{"type":"socks","tag":"client","listen":"127.0.0.1","listen_port":%d}],"outbounds":[{"type":"vless","tag":"to-b","server":"127.0.0.1","server_port":%d,"uuid":%q,"flow":%q,"tls":{"enabled":true,"server_name":%q,"utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,"public_key":%q,"short_id":%q}}}],"route":{"rules":[{"inbound":["client"],"outbound":"to-b"}]}}`, clientPort, bPort, credential.UUID, credential.Flow, sourceDef.SNI, sourceRealityPublic, sourceDef.ShortID))
 	lifecycleStartProcess(t, singbox, root, "a", aDir, aPort)
 	lifecycleStartProcess(t, singbox, root, "b", configDir, bPort)
 	lifecycleStartProcess(t, singbox, root, "client", clientDir, clientPort)
@@ -126,6 +161,8 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	httpServer := httptest.NewServer(handler)
 	defer httpServer.Close()
 	cookies, csrf := loginSession(t, handler)
+	activateE5Plugin(t, handler, cookies, csrf, "latticenet.vpn-core")
+	activateE5Plugin(t, handler, cookies, csrf, "latticenet.sub-store")
 
 	planBody := fmt.Sprintf(`{"source_line_uuid":%q,"target_line_uuid":%q}`, sourceUUID, targetUUID)
 	t.Logf("lifecycle source=%s target=%s", sourceUUID, targetUUID)
@@ -361,7 +398,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	ack2Cmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+retryLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+retryLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_ACK_RESULT="+ack2)
 	_ = runLifecycleAgentHelper(t, ack2Cmd)
 	snapshot := srv.store.LineChainSnapshot()
-	if snapshot.Definitions[sourceUUID].Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 2 {
+	if snapshot.Definitions[sourceUUID].Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != taskBaseline+2 {
 		t.Fatalf("promotion/task mismatch: %+v tasks=%d", snapshot, len(srv.store.Tasks()))
 	}
 
@@ -378,13 +415,25 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	}
 	inventoryRaw := []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, actualInventory))
 	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, inventoryRaw)
-	if len(srv.store.Tasks()) != 2 {
+	if len(srv.store.Tasks()) != taskBaseline+2 {
 		t.Fatalf("inventory queued an extra E3 task: %d", len(srv.store.Tasks()))
 	}
-	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != 2 {
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != taskBaseline+2 {
 		t.Fatalf("observed apply did not converge: %+v", got)
 	}
 	assertDeclaredE2EEdge(t, srv.buildLineGroups(), sourceUUID, targetUUID, true)
+	// E5 Phase A-D runs only after the server has observed the exact issued
+	// chain. The real signed vpn-core and SubStore runtimes must agree on one
+	// immutable graph projection, preview without writing, persist the explicit
+	// selection, publish the same bytes, and serve them through the public share.
+	e5Graph := exerciseE5GraphAtConvergence(t, srv, handler, cookies, csrf, user, sourceUUID)
+	shareClientPort := lifecycleFreePort(t)
+	startE5ClientFromShareURI(t, singbox, root, e5Graph.URI, shareClientPort)
+	beforeShareTraffic := observer.accepted()
+	lifecycleSOCKSEcho(t, shareClientPort, origin)
+	if observer.accepted() <= beforeShareTraffic {
+		t.Fatal("public share URI client did not traverse B -> observer -> A")
+	}
 
 	// An independent ordinary metadata writer may change unrelated fields. The
 	// subsequent server-issued remove must preserve that drift and only remove
@@ -465,7 +514,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 	ack3Cmd.Env = append(os.Environ(), "LATTICE_LINECHAIN_E2E_OUTBOX="+outboxDir, "LATTICE_LINECHAIN_E2E_TASK="+removeLeased[0].ID, "LATTICE_LINECHAIN_E2E_LEASE="+removeLeased[0].LeaseID, "LATTICE_LINECHAIN_E2E_ACK_RESULT="+ack3)
 	_ = runLifecycleAgentHelper(t, ack3Cmd)
 	removed := srv.store.LineChainSnapshot().Definitions[sourceUUID]
-	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != 3 {
+	if removed.TargetLineUUID != "" || removed.Status != store.LineChainStatusAppliedUnobserved || len(srv.store.Tasks()) != taskBaseline+3 {
 		t.Fatalf("remove promotion/task mismatch: %+v tasks=%d", removed, len(srv.store.Tasks()))
 	}
 	beforeRemoveTraffic := observer.accepted()
@@ -484,7 +533,7 @@ func TestLineChainPersistentServerAgentLifecycleE2E(t *testing.T) {
 		t.Fatalf("remove inventory result missing: %v", err)
 	}
 	postAgentJSON(t, httpServer.Client(), httpServer.URL+"/api/agent/singbox-inventory", nodeToken, []byte(fmt.Sprintf(`{"node_id":"node-b","inventory":%s}`, removeInventoryRaw)))
-	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != 3 {
+	if got := srv.store.LineChainSnapshot().Definitions[sourceUUID]; got.Status != store.LineChainStatusConverged || len(srv.store.Tasks()) != taskBaseline+3 {
 		t.Fatalf("remove inventory did not converge: %+v tasks=%d", got, len(srv.store.Tasks()))
 	}
 	assertDeclaredE2EEdge(t, srv.buildLineGroups(), sourceUUID, targetUUID, false)

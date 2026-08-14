@@ -218,7 +218,7 @@ func composeLine(snapshot lineChainCompileSnapshot, uuid string) (Line, managedL
 		return Line{}, managedLineDef{}, composeFailure("root_unavailable")
 	}
 	line := lines[0]
-	if line.Status != "ok" || line.Core != "sing-box" || line.Type != "vless" || line.Transport != "tcp" ||
+	if line.Status != "ok" || line.Core != "sing-box" || line.Type != "vless" || (line.Transport != "tcp" && line.Transport != "reality") ||
 		!line.Overlay || line.OverlayStatus != managedLineStatusApplied || definition.Status != managedLineStatusApplied ||
 		definition.Port < 1 || definition.SNI == "" || definition.RealityPublicKey == "" || definition.ShortID == "" {
 		return Line{}, managedLineDef{}, composeFailure("unsupported_line")

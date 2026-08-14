@@ -96,6 +96,30 @@ func TestComposeGraphSubscriptionIsCanonicalSecretFreeAndStable(t *testing.T) {
 	}
 }
 
+func TestComposeLineAcceptsOnlyProductionRealityTCPInventoryTransports(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport string
+		ok        bool
+	}{
+		{name: "tcp", transport: model.ProxyTransportTCP, ok: true},
+		{name: "agent reality", transport: "reality", ok: true},
+		{name: "udp", transport: "udp"},
+		{name: "websocket", transport: model.ProxyTransportWS},
+		{name: "empty"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snapshot := testGraphComposeSnapshot()
+			snapshot.Lines[composeRootUUID][0].Transport = tt.transport
+			_, _, err := composeLine(snapshot, composeRootUUID)
+			if (err == nil) != tt.ok {
+				t.Fatalf("composeLine transport %q: err=%v, want ok=%v", tt.transport, err, tt.ok)
+			}
+		})
+	}
+}
+
 func TestComposeGraphSubscriptionRejectsCredentialAsPublicRootWithoutLeak(t *testing.T) {
 	snapshot := testGraphComposeSnapshot()
 	identity := snapshot.Users["identity"]

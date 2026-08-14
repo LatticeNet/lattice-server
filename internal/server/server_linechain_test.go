@@ -33,6 +33,20 @@ func (t *countingRejectTransport) RoundTrip(*http.Request) (*http.Response, erro
 func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, managedLineDef) {
 	t.Helper()
 	srv := newManagedLineTestServer(t)
+	sourceUUID, targetUUID, user, def := seedLineChainFixtureInto(t, srv)
+	return srv, sourceUUID, targetUUID, user, def
+}
+
+func seedLineChainFixtureInto(t *testing.T, srv *Server) (string, string, VpnUser, managedLineDef) {
+	return seedLineChainFixtureIntoAtSource(t, srv, "198.51.100.20", 1443)
+}
+
+func seedLineChainFixtureIntoAtSourcePort(t *testing.T, srv *Server, sourcePort int) (string, string, VpnUser, managedLineDef) {
+	return seedLineChainFixtureIntoAtSource(t, srv, "127.0.0.1", sourcePort)
+}
+
+func seedLineChainFixtureIntoAtSource(t *testing.T, srv *Server, sourceAddress string, sourcePort int) (string, string, VpnUser, managedLineDef) {
+	t.Helper()
 	seedManagedLineNode(t, srv, "node-a", realityInventoryLines())
 	user := seedManagedLineUser(t, srv)
 	_, def := compileApproval(t, srv)
@@ -46,7 +60,7 @@ func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, manag
 	}})
 	const sourceUUID = "22222222-2222-4222-8222-222222222222"
 	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{
-		Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443",
+		Name: "source-b", Protocol: "vless", Network: "tcp", Address: sourceAddress, Port: fmt.Sprint(sourcePort),
 		LineUUID: sourceUUID,
 	}})
 	_ = srv.buildLineGroups() // test setup establishes persistent UUID authority before pure compile
@@ -54,7 +68,7 @@ func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, manag
 	if !srv.agentHasCapability("node-b", lineChainDurableCapability) {
 		t.Fatal("fixture failed to record durable capability")
 	}
-	return srv, sourceUUID, def.LineUUID, user, def
+	return sourceUUID, def.LineUUID, user, def
 }
 
 func TestLineChainPublicViewsMatchHTTPAndRPCContract(t *testing.T) {

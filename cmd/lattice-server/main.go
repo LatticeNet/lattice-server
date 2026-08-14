@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/LatticeNet/lattice-server/internal/geoip"
@@ -215,16 +219,74 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
+	serve := srv.ListenAndServe
 	if tlsCert != "" && tlsKey != "" {
 		log.Printf("lattice-server listening on https://%s (data=%s, web=%s)", listen, dataPath, webRoot)
-		log.Fatal(srv.ListenAndServeTLS(tlsCert, tlsKey))
-		return
-	}
-	if !secureCookies {
+		serve = func() error { return srv.ListenAndServeTLS(tlsCert, tlsKey) }
+	} else if !secureCookies {
 		log.Printf("WARNING: serving plain HTTP without -secure-cookies; terminate TLS at a trusted proxy and bind to a private/WireGuard address")
 	}
-	log.Printf("lattice-server listening on http://%s (data=%s, web=%s)", listen, dataPath, webRoot)
-	log.Fatal(srv.ListenAndServe())
+	if tlsCert == "" || tlsKey == "" {
+		log.Printf("lattice-server listening on http://%s (data=%s, web=%s)", listen, dataPath, webRoot)
+	}
+	if err := serveUntilSignal(srv, app, serve); err != nil {
+		log.Printf("lattice-server shutdown failed: %v", err)
+		os.Exit(1)
+	}
+}
+
+type runtimeCloser interface{ Close(context.Context) error }
+
+func serveUntilSignal(srv *http.Server, app runtimeCloser, serve func() error) error {
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- serve() }()
+	select {
+	case err := <-serveErr:
+		closeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		closeErr := app.Close(closeCtx)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		return errors.Join(err, closeErr)
+	case <-signalCtx.Done():
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	httpDone := make(chan error, 1)
+	runtimeDone := make(chan error, 1)
+	go func() { httpDone <- srv.Shutdown(shutdownCtx) }()
+	go func() { runtimeDone <- app.Close(shutdownCtx) }()
+	var httpErr, runtimeErr error
+	for completed := 0; completed < 2; {
+		select {
+		case httpErr = <-httpDone:
+			httpDone = nil
+			completed++
+		case runtimeErr = <-runtimeDone:
+			runtimeDone = nil
+			completed++
+		case <-shutdownCtx.Done():
+			httpErr = errors.Join(httpErr, shutdownCtx.Err(), srv.Close())
+			if httpDone != nil {
+				httpErr = errors.Join(httpErr, <-httpDone)
+				httpDone = nil
+				completed++
+			}
+			if runtimeDone != nil {
+				runtimeErr = errors.Join(runtimeErr, <-runtimeDone)
+				runtimeDone = nil
+				completed++
+			}
+		}
+	}
+	serveResult := <-serveErr
+	if errors.Is(serveResult, http.ErrServerClosed) {
+		serveResult = nil
+	}
+	return errors.Join(httpErr, runtimeErr, serveResult)
 }
 
 // defaultDataPath keeps persistent state out of world-writable /tmp by default,

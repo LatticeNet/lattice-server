@@ -251,3 +251,30 @@ func (r *RPCRegistry) Call(ctx context.Context, caller, service, method string, 
 	}
 	return handler(ctx, method, request)
 }
+
+func (r *RPCRegistry) CallGranted(ctx context.Context, caller string, grant RPCGrant, service, method string, request []byte) ([]byte, error) {
+	methods := grant[service]
+	_, allowed := methods[method]
+	if !allowed {
+		_, allowed = methods["*"]
+	}
+	if !allowed {
+		return nil, fmt.Errorf("%w: %s -> %s", ErrRPCDenied, caller, service)
+	}
+	r.mu.RLock()
+	svc := r.services[service]
+	active := r.ownerActive
+	if svc == nil {
+		r.mu.RUnlock()
+		return nil, fmt.Errorf("%w: %s", ErrRPCNoService, service)
+	}
+	owner, exposed, handler := svc.owner, svc.methods, svc.handler
+	r.mu.RUnlock()
+	if active != nil && !active(owner) {
+		return nil, fmt.Errorf("%w: %s (owner %s)", ErrRPCOwnerInactive, service, owner)
+	}
+	if _, ok := exposed[method]; !ok {
+		return nil, fmt.Errorf("%w: %s/%s", ErrRPCNoMethod, service, method)
+	}
+	return handler(ctx, method, request)
+}

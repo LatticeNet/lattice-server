@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -66,21 +67,33 @@ type SystemRunnerOptions struct {
 }
 
 type systemPluginState struct {
-	execPath string
-	workDir  string
-	broker   *Broker
-	failures int
-	tripped  bool
-	pool     *systemPool
-	isV2     bool
+	execPath    string
+	workDir     string
+	broker      *Broker
+	failures    int
+	tripped     bool
+	pool        *systemPool
+	isV2        bool
+	generation  uint64
+	admitted    bool
+	retiring    bool
+	cleanupOnce sync.Once
+	cleanupDone chan struct{}
+	refs        int
+	forceAbort  bool
+	v1Active    map[uint64]context.CancelFunc
+	v1Next      uint64
 }
 
 // SystemRunner implements Runner and Invoker.
 type SystemRunner struct {
 	opts           SystemRunnerOptions
 	mu             sync.Mutex
-	st             map[string]*systemPluginState
+	st             map[string]map[uint64]*systemPluginState
 	budgetWarnings map[string]bool
+	startLocks     map[string]*sync.Mutex
+	draining       map[*systemPool]string
+	closing        bool
 }
 
 // NewSystemRunner returns a system runner with the given options and safe
@@ -101,7 +114,7 @@ func NewSystemRunner(opts SystemRunnerOptions) *SystemRunner {
 	if opts.MaxHostCalls <= 0 {
 		opts.MaxHostCalls = defaultMaxHostCalls
 	}
-	return &SystemRunner{opts: opts, st: map[string]*systemPluginState{}, budgetWarnings: map[string]bool{}}
+	return &SystemRunner{opts: opts, st: map[string]map[uint64]*systemPluginState{}, budgetWarnings: map[string]bool{}, startLocks: map[string]*sync.Mutex{}, draining: map[*systemPool]string{}}
 }
 
 func (r *SystemRunner) Name() string { return "system" }
@@ -112,6 +125,19 @@ func (r *SystemRunner) Name() string { return "system" }
 // always executes the staged 0700 copy, never the (possibly read-only or
 // swapped) bundle file, and never resolves a manifest-controlled path.
 func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
+	result, err := r.Prepare(ctx, req)
+	if err != nil {
+		return result, err
+	}
+	if err := r.ActivateGeneration(req.PluginID, req.Generation); err != nil {
+		_ = r.AbortGeneration(context.Background(), req.PluginID, req.Generation)
+		return RunnerStartResult{}, err
+	}
+	return result, nil
+}
+
+// Prepare stages and starts an exact generation without admitting invocations.
+func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
 	if err := ctx.Err(); err != nil {
 		return RunnerStartResult{}, err
 	}
@@ -128,6 +154,24 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	if !validPluginID(pluginID) {
 		return RunnerStartResult{}, fmt.Errorf("invalid plugin id %q", pluginID)
 	}
+	isV2 := req.Loaded.Manifest.Runtime != nil && req.Loaded.Manifest.Runtime.Protocol == RuntimeProtocolStdioJSONV2
+	if isV2 && req.Generation == 0 {
+		return RunnerStartResult{}, fmt.Errorf("invalid stdio-json-v2 generation 0")
+	}
+	startLock := r.startLock(pluginID)
+	startLock.Lock()
+	defer startLock.Unlock()
+	r.mu.Lock()
+	if r.closing {
+		r.mu.Unlock()
+		return RunnerStartResult{}, errors.New("system runner is closed")
+	}
+	oldAtPrepare := r.latestStateLocked(pluginID)
+	if req.Generation != 0 && oldAtPrepare != nil && req.Generation <= oldAtPrepare.generation {
+		r.mu.Unlock()
+		return RunnerStartResult{}, fmt.Errorf("stale system runner generation %d; current is %d", req.Generation, oldAtPrepare.generation)
+	}
+	r.mu.Unlock()
 
 	data, err := r.verifiedRuntimeBytes(req.Loaded)
 	if err != nil {
@@ -135,8 +179,16 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	}
 
 	workDir := filepath.Join(r.opts.RuntimeDir, pluginID, fmt.Sprintf("generation-%d", req.Generation))
-	if req.Loaded.Manifest.Runtime == nil || req.Loaded.Manifest.Runtime.Protocol != RuntimeProtocolStdioJSONV2 {
+	if req.Generation == 0 {
 		workDir = filepath.Join(r.opts.RuntimeDir, pluginID)
+	}
+	committed := false
+	if req.Generation != 0 {
+		defer func() {
+			if !committed {
+				_ = os.RemoveAll(workDir)
+			}
+		}()
 	}
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return RunnerStartResult{}, fmt.Errorf("create plugin runtime dir: %w", err)
@@ -150,11 +202,12 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 	}
 
 	pool := newSystemPool(256, time.Hour, req.Generation)
-	if req.Loaded.Manifest.Runtime != nil && req.Loaded.Manifest.Runtime.Protocol == RuntimeProtocolStdioJSONV2 {
-		pool.replenishFn = func(gen uint64) (*pooledWorker, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	pool.failureFn = func(generation uint64) { r.recordGenerationFailure(pluginID, generation) }
+	if isV2 {
+		pool.replenishFn = func(parent context.Context, gen uint64) (*pooledWorker, error) {
+			ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 			defer cancel()
-			t, err := startSystemWorker(ctx, execPath, workDir, r.childEnv())
+			t, err := startSystemWorker(ctx, execPath, workDir, r.v2ChildEnv(gen))
 			if err != nil {
 				return nil, err
 			}
@@ -165,7 +218,7 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 			return &pooledWorker{generation: gen, started: time.Now(), transport: t}, nil
 		}
 		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.childEnv())
+		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.v2ChildEnv(req.Generation))
 		if startErr == nil {
 			startErr = transport.awaitReadyContext(startupCtx, req.Generation)
 		}
@@ -182,15 +235,138 @@ func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (Runne
 		}
 	}
 	r.mu.Lock()
-	isV2 := req.Loaded.Manifest.Runtime != nil && req.Loaded.Manifest.Runtime.Protocol == RuntimeProtocolStdioJSONV2
-	old := r.st[pluginID]
-	r.st[pluginID] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2}
-	r.mu.Unlock()
-	if old != nil && old.pool != nil && old.pool != pool {
-		drained := old.pool.gracefulDrain(old.pool.generation)
-		go func(dir string) { <-drained; _ = os.RemoveAll(dir) }(old.workDir)
+	old := r.latestStateLocked(pluginID)
+	if r.closing {
+		r.mu.Unlock()
+		pool.abortClose(req.Generation)
+		_ = os.RemoveAll(workDir)
+		return RunnerStartResult{}, errors.New("system runner is closed")
 	}
+	if old != nil && (isV2 || req.Generation != 0) && req.Generation <= old.generation {
+		r.mu.Unlock()
+		pool.abortClose(req.Generation)
+		_ = os.RemoveAll(workDir)
+		return RunnerStartResult{}, fmt.Errorf("stale system runner generation %d; current is %d", req.Generation, old.generation)
+	}
+	byGeneration := r.st[pluginID]
+	if byGeneration == nil {
+		byGeneration = map[uint64]*systemPluginState{}
+		r.st[pluginID] = byGeneration
+	}
+	byGeneration[req.Generation] = &systemPluginState{execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), v1Active: map[uint64]context.CancelFunc{}}
+	committed = true
+	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
+}
+
+func (r *SystemRunner) latestStateLocked(pluginID string) *systemPluginState {
+	var latest *systemPluginState
+	for _, st := range r.st[pluginID] {
+		if latest == nil || st.generation > latest.generation {
+			latest = st
+		}
+	}
+	return latest
+}
+
+func (r *SystemRunner) ActivateGeneration(pluginID string, generation uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closing {
+		return errors.New("system runner is closed")
+	}
+	st := r.st[pluginID][generation]
+	if st == nil || st.retiring {
+		return fmt.Errorf("system runner generation %d is not prepared", generation)
+	}
+	st.admitted = true
+	return nil
+}
+
+func (r *SystemRunner) AbortGeneration(ctx context.Context, pluginID string, generation uint64) error {
+	r.mu.Lock()
+	st := r.st[pluginID][generation]
+	if st != nil {
+		delete(r.st[pluginID], generation)
+		if len(r.st[pluginID]) == 0 {
+			delete(r.st, pluginID)
+		}
+	}
+	r.mu.Unlock()
+	if st != nil {
+		if st.pool != nil {
+			st.pool.abortClose(st.generation)
+		}
+		_ = os.RemoveAll(st.workDir)
+	}
+	if ctx != nil {
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (r *SystemRunner) RetireGeneration(ctx context.Context, pluginID string, generation uint64) error {
+	r.mu.Lock()
+	st := r.st[pluginID][generation]
+	if st == nil {
+		r.mu.Unlock()
+		return nil
+	}
+	st.admitted = false
+	st.retiring = true
+	r.maybeStartCleanupLocked(st)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *SystemRunner) maybeStartCleanupLocked(st *systemPluginState) {
+	if !st.retiring || (st.refs != 0 && !st.forceAbort) {
+		return
+	}
+	st.cleanupOnce.Do(func() {
+		go r.cleanupGeneration("", st.generation, st)
+	})
+}
+
+func (r *SystemRunner) cleanupGeneration(pluginID string, generation uint64, st *systemPluginState) {
+	if st.broker != nil && st.broker.authority != nil {
+		st.broker.authority.revoke()
+		_ = st.broker.authority.wait(context.Background())
+	}
+	if st.pool != nil {
+		r.mu.Lock()
+		forceAbort := st.forceAbort
+		r.mu.Unlock()
+		if forceAbort {
+			st.pool.abortClose(st.generation)
+		} else {
+			<-st.pool.gracefulDrain(st.generation)
+		}
+	}
+	_ = os.RemoveAll(st.workDir)
+	r.mu.Lock()
+	for id, generations := range r.st {
+		if generations[generation] == st {
+			delete(generations, generation)
+			if len(generations) == 0 {
+				delete(r.st, id)
+			}
+			break
+		}
+	}
+	close(st.cleanupDone)
+	r.mu.Unlock()
+}
+
+func (r *SystemRunner) startLock(pluginID string) *sync.Mutex {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	lock := r.startLocks[pluginID]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		r.startLocks[pluginID] = lock
+	}
+	return lock
 }
 
 func (r *SystemRunner) verifiedRuntimeBytes(loaded Loaded) ([]byte, error) {
@@ -287,21 +463,40 @@ func validateRuntimePath(root, runtimePath string, wantMode os.FileMode) error {
 // invocations are bound to their own context and terminate independently.
 func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 	r.mu.Lock()
-	st := r.st[req.PluginID]
-	if st != nil && req.Generation != 0 && st.pool != nil && req.Generation != st.pool.generation {
-		r.mu.Unlock()
-		return nil
-	}
-	delete(r.st, req.PluginID)
-	r.mu.Unlock()
-	if st != nil {
-		if st.pool != nil {
-			st.pool.drain(st.pool.generation)
+	var states []*systemPluginState
+	var v1Cancels []context.CancelFunc
+	for generation, st := range r.st[req.PluginID] {
+		if req.Generation == 0 || generation <= req.Generation {
+			st.admitted = false
+			st.retiring = true
+			st.forceAbort = true
+			states = append(states, st)
+			for _, cancel := range st.v1Active {
+				v1Cancels = append(v1Cancels, cancel)
+			}
+			r.maybeStartCleanupLocked(st)
 		}
-		_ = os.RemoveAll(st.workDir)
 	}
-	if ctx != nil {
-		return ctx.Err()
+	r.mu.Unlock()
+	for _, st := range states {
+		if st.broker != nil && st.broker.authority != nil {
+			st.broker.authority.revoke()
+		}
+		if st.pool != nil {
+			st.pool.abortClose(st.generation)
+		}
+		if ctx == nil {
+			<-st.cleanupDone
+			continue
+		}
+		select {
+		case <-st.cleanupDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	for _, cancel := range v1Cancels {
+		cancel()
 	}
 	return nil
 }
@@ -310,22 +505,41 @@ func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 // graceful server shutdown.
 func (r *SystemRunner) StopAll(ctx context.Context) error {
 	r.mu.Lock()
-	states := make([]*systemPluginState, 0, len(r.st))
-	for _, st := range r.st {
-		states = append(states, st)
+	r.closing = true
+	var states []*systemPluginState
+	var v1Cancels []context.CancelFunc
+	for _, generations := range r.st {
+		for _, st := range generations {
+			st.admitted = false
+			st.retiring = true
+			st.forceAbort = true
+			states = append(states, st)
+			for _, cancel := range st.v1Active {
+				v1Cancels = append(v1Cancels, cancel)
+			}
+			r.maybeStartCleanupLocked(st)
+		}
 	}
-	r.st = map[string]*systemPluginState{}
 	r.mu.Unlock()
 	for _, st := range states {
-		if st.pool != nil {
-			st.pool.drain(st.pool.generation)
+		if st.broker != nil && st.broker.authority != nil {
+			st.broker.authority.revoke()
 		}
-		if st.workDir != "" {
-			_ = os.RemoveAll(st.workDir)
+		if st.pool != nil {
+			st.pool.abortClose(st.generation)
+		}
+		if ctx == nil {
+			<-st.cleanupDone
+			continue
+		}
+		select {
+		case <-st.cleanupDone:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-	if ctx != nil {
-		return ctx.Err()
+	for _, cancel := range v1Cancels {
+		cancel()
 	}
 	return nil
 }
@@ -336,9 +550,52 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 // environment, capped output, and a deadline that escalates SIGTERM->SIGKILL.
 // Repeated failures trip the circuit breaker. A crashing plugin yields an error,
 // never a host crash.
-func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeResponse, error) {
+type systemInvocationLease struct {
+	runner *SystemRunner
+	state  *systemPluginState
+	once   sync.Once
+}
+
+func (r *SystemRunner) AcquireInvocation(pluginID string, generation uint64) (InvocationGenerationLease, error) {
 	r.mu.Lock()
-	st := r.st[req.PluginID]
+	st := r.st[pluginID][generation]
+	if st == nil || !st.admitted || st.retiring || r.closing {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("plugin %q generation %d is not admitted", pluginID, generation)
+	}
+	st.refs++
+	r.mu.Unlock()
+	return &systemInvocationLease{runner: r, state: st}, nil
+}
+
+func (l *systemInvocationLease) Invoke(ctx context.Context, req InvokeRequest) (InvokeResponse, error) {
+	return l.runner.invokeState(ctx, req, l.state)
+}
+
+func (l *systemInvocationLease) Release() {
+	l.once.Do(func() {
+		r := l.runner
+		r.mu.Lock()
+		l.state.refs--
+		if l.state.refs < 0 {
+			panic("system runner invocation reference underflow")
+		}
+		r.maybeStartCleanupLocked(l.state)
+		r.mu.Unlock()
+	})
+}
+
+func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeResponse, error) {
+	lease, err := r.AcquireInvocation(req.PluginID, req.Generation)
+	if err != nil {
+		return InvokeResponse{}, err
+	}
+	defer lease.Release()
+	return lease.Invoke(ctx, req)
+}
+
+func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *systemPluginState) (InvokeResponse, error) {
+	r.mu.Lock()
 	tripped := st != nil && st.tripped
 	execPath, workDir := "", ""
 	var broker *Broker
@@ -347,8 +604,11 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 		broker = st.broker
 	}
 	r.mu.Unlock()
-	if st == nil {
-		return InvokeResponse{}, fmt.Errorf("plugin %q is not armed on the system runner", req.PluginID)
+	if st.isV2 && req.Generation == 0 {
+		return InvokeResponse{}, fmt.Errorf("invalid stdio-json-v2 generation 0")
+	}
+	if req.Generation != st.generation {
+		return InvokeResponse{}, fmt.Errorf("stale plugin generation: got %d want %d", req.Generation, st.generation)
 	}
 	if tripped {
 		return InvokeResponse{}, fmt.Errorf("%w: %s", ErrCircuitOpen, req.PluginID)
@@ -376,31 +636,60 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 			return InvokeResponse{}, err
 		}
 		invocation := fmt.Sprintf("%d", time.Now().UnixNano())
-		reply, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) })
+		outcome, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) }, budget)
 		if callErr != nil {
+			r.recordLifecycleFailure(req.PluginID, st)
 			st.pool.poison(w)
-			if reply.OK || reply.Result != nil || reply.Message != "" {
-				warning := "persistent worker retired after terminal protocol failure"
-				r.logf("plugin runtime: %s %s", warning, req.PluginID)
-				return InvokeResponse{OK: reply.OK, Message: reply.Message, Result: reply.Result, Warnings: []string{warning}}, nil
+			warnings := v2StderrWarnings(budget, outcome.StderrTruncated)
+			if len(outcome.Stderr) > 0 {
+				r.logf("plugin runtime: transport failure for %s stderr_bytes=%d stderr_truncated=%t", req.PluginID, len(outcome.Stderr), outcome.StderrTruncated)
 			}
-			return InvokeResponse{}, callErr
+			return InvokeResponse{Warnings: warnings}, fmt.Errorf("plugin %q transport failure: %w", req.PluginID, callErr)
 		}
-		st.pool.release(w, callErr == nil, time.Now())
-		if callErr != nil {
-			return InvokeResponse{}, callErr
+		reply := outcome.Reply
+		warnings := append([]string(nil), reply.Warnings...)
+		warnings = append(warnings, v2StderrWarnings(budget, outcome.StderrTruncated)...)
+		if outcome.Retirement != nil {
+			r.recordLifecycleFailure(req.PluginID, st)
+			st.pool.poison(w)
+			warning := "persistent worker retired after terminal protocol failure"
+			warnings = append(warnings, warning)
+			r.logf("plugin runtime: %s %s: %v", warning, req.PluginID, outcome.Retirement)
+		} else if outcome.Reusable {
+			st.pool.release(w, outcome.ResultSeen, time.Now())
+			r.recordLifecycleSuccess(req.PluginID, st)
+		} else {
+			st.pool.poison(w)
+			return InvokeResponse{}, fmt.Errorf("plugin %q invocation completed without reusable terminal state", req.PluginID)
+		}
+		result := reply.Result
+		if len(result) == 0 {
+			result = reply.Plan
 		}
 		if !reply.OK {
-			return InvokeResponse{OK: false, Message: reply.Message, Result: reply.Result}, fmt.Errorf("plugin reported failure: %s", reply.Message)
+			msg := reply.Message
+			if msg == "" {
+				msg = reply.Error
+			}
+			return InvokeResponse{OK: false, Message: msg, Result: result, Warnings: warnings}, fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
 		}
-		return InvokeResponse{OK: true, Message: reply.Message, Result: reply.Result}, nil
+		return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
 	}
 
 	// The approved operation's authority is bound before protocol selection.
-
-	reply, stderr, stderrTruncated, runErr := r.runInvocation(runCtx, req, execPath, workDir, broker, budget)
+	r.mu.Lock()
+	st.v1Next++
+	v1ID := st.v1Next
+	v1Ctx, v1Cancel := context.WithCancel(runCtx)
+	st.v1Active[v1ID] = v1Cancel
+	r.mu.Unlock()
+	reply, stderr, stderrTruncated, runErr := r.runInvocation(v1Ctx, req, execPath, workDir, broker, budget)
+	v1Cancel()
+	r.mu.Lock()
+	delete(st.v1Active, v1ID)
+	r.mu.Unlock()
 	if runErr != nil {
-		r.recordFailure(req.PluginID)
+		r.recordLifecycleFailure(req.PluginID, st)
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			return InvokeResponse{}, fmt.Errorf("plugin %q invocation timed out after %s", req.PluginID, budget.Timeout)
 		}
@@ -410,7 +699,7 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	if len(result) == 0 {
 		result = reply.Plan // tolerate the bootstrap template's {"plan":...} shape
 	}
-	r.recordSuccess(req.PluginID)
+	r.recordLifecycleSuccess(req.PluginID, st)
 	var warnings []string
 	if stderrTruncated {
 		warning := fmt.Sprintf("stderr truncated after %d bytes", budget.StderrBytes)
@@ -428,12 +717,20 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 	return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
 }
 
+func v2StderrWarnings(budget ResolvedInvokeBudget, truncated bool) []string {
+	if !truncated {
+		return nil
+	}
+	return []string{fmt.Sprintf("stderr truncated after %d bytes", budget.StderrBytes)}
+}
+
 type systemRunnerReply struct {
-	OK      bool            `json:"ok"`
-	Message string          `json:"message"`
-	Result  json.RawMessage `json:"result"`
-	Plan    json.RawMessage `json:"plan"`
-	Error   string          `json:"error"`
+	OK       bool            `json:"ok"`
+	Message  string          `json:"message"`
+	Result   json.RawMessage `json:"result"`
+	Plan     json.RawMessage `json:"plan"`
+	Error    string          `json:"error"`
+	Warnings []string        `json:"warnings"`
 }
 
 type systemHostCall struct {
@@ -677,6 +974,12 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 	if broker == nil {
 		return nil, errors.New("plugin broker unavailable")
 	}
+	authorityCtx, release, err := broker.acquireAuthority(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	ctx = authorityCtx
 	switch call.Method {
 	case "rpc.call":
 		var req struct {
@@ -870,23 +1173,37 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 	}
 }
 
-func (r *SystemRunner) recordFailure(pluginID string) {
+func (r *SystemRunner) recordLifecycleFailure(pluginID string, expected *systemPluginState) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	st := r.st[pluginID]
-	if st == nil {
+	st := r.st[pluginID][expected.generation]
+	if st == nil || st != expected {
+		r.mu.Unlock()
 		return
 	}
 	st.failures++
 	if st.failures >= r.opts.CrashThreshold {
 		st.tripped = true
 	}
+	tripped, pool := st.tripped, st.pool
+	r.mu.Unlock()
+	if tripped && pool != nil {
+		pool.setCircuitOpen(true)
+	}
 }
 
-func (r *SystemRunner) recordSuccess(pluginID string) {
+func (r *SystemRunner) recordGenerationFailure(pluginID string, generation uint64) {
+	r.mu.Lock()
+	st := r.st[pluginID][generation]
+	r.mu.Unlock()
+	if st != nil {
+		r.recordLifecycleFailure(pluginID, st)
+	}
+}
+
+func (r *SystemRunner) recordLifecycleSuccess(pluginID string, expected *systemPluginState) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if st := r.st[pluginID]; st != nil {
+	if st := r.st[pluginID][expected.generation]; st != nil && st == expected {
 		st.failures = 0
 	}
 }
@@ -908,6 +1225,14 @@ func (r *SystemRunner) childEnv() []string {
 		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
 	return env
+}
+
+func (r *SystemRunner) v2ChildEnv(generation uint64) []string {
+	return append(r.childEnv(),
+		"LATTICE_RUNTIME_PROTOCOL="+RuntimeProtocolStdioJSONV2,
+		"LATTICE_RUNTIME_GENERATION="+strconv.FormatUint(generation, 10),
+		"LATTICE_HOST_RESPONSE_FD=3",
+	)
 }
 
 // cappedBuffer stores at most limit bytes and silently discards the rest while

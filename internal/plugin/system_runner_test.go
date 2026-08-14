@@ -356,6 +356,46 @@ func TestSystemRunnerV2StagesVerifiedSelectedRuntime(t *testing.T) {
 	}
 }
 
+func TestSystemRunnerV2RejectsZeroGenerationBeforeStaging(t *testing.T) {
+	runtimeDir := t.TempDir()
+	r := NewSystemRunner(SystemRunnerOptions{RuntimeDir: runtimeDir})
+	loaded := makeBundle(t, "p.zero", "#!/bin/sh\nexit 0\n", "")
+	loaded.Manifest.Runtime = &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV2}
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err == nil || !strings.Contains(err.Error(), "generation 0") {
+		t.Fatalf("zero generation error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runtimeDir, loaded.Manifest.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("zero generation touched runtime path: %v", err)
+	}
+}
+
+func TestSystemRunnerV2PassesGenerationEnvironmentAboveOne(t *testing.T) {
+	t.Setenv("LATTICE_TEST_V2_HELPER", "1")
+	binary, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, artifactFileName), binary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	loaded := Loaded{
+		Manifest:   Manifest{ID: "p.genenv", Name: "generation env", Type: TypeSystem, Runtime: &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV2}},
+		BundlePath: dir,
+	}
+	r := NewSystemRunner(SystemRunnerOptions{RuntimeDir: t.TempDir(), EnvAllowlist: []string{"LATTICE_TEST_V2_HELPER"}})
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 7, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	rsp, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 7, Action: "generation"})
+	if err != nil || !rsp.OK {
+		t.Fatalf("generation 7 invoke response=%+v err=%v", rsp, err)
+	}
+	if err := r.Stop(t.Context(), RunnerStopRequest{PluginID: loaded.Manifest.ID, Generation: 7}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSystemRunnerV2RejectsSourceAndCacheTampering(t *testing.T) {
 	archive := makeTestArchive(t,
 		testArchiveEntry{name: "bin/linux-amd64/plugin", body: []byte("#!/bin/sh\necho '{\"ok\":true}'\n")},
@@ -433,6 +473,7 @@ printf '{"ok":true,"result":{"rpc":%s,"http":%s}}\n' "$rpc" "$http"
 	if err != nil {
 		t.Fatal(err)
 	}
+	broker.rpcGrant = RPCGrant{"test.svc": {"list": {}}}
 	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded, Broker: broker}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -523,6 +564,13 @@ func TestCappedBuffer(t *testing.T) {
 type fakeRPCHost func(ctx context.Context, caller, service, method string, request []byte) ([]byte, error)
 
 func (f fakeRPCHost) Call(ctx context.Context, caller, service, method string, request []byte) ([]byte, error) {
+	return f(ctx, caller, service, method, request)
+}
+
+func (f fakeRPCHost) CallGranted(ctx context.Context, caller string, grant RPCGrant, service, method string, request []byte) ([]byte, error) {
+	if _, ok := grant[service][method]; !ok {
+		return nil, ErrRPCDenied
+	}
 	return f(ctx, caller, service, method, request)
 }
 

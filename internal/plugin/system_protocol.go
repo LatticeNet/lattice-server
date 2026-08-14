@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 )
 
 func decodeStrictV2(data []byte, dst any) error {
+	if err := rejectDuplicateV2Keys(data); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	tok, err := dec.Token()
 	if err != nil {
@@ -15,29 +20,6 @@ func decodeStrictV2(data []byte, dst any) error {
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
 		return fmt.Errorf("v2 frame must be object")
-	}
-	seen := map[string]bool{}
-	for dec.More() {
-		k, err := dec.Token()
-		if err != nil {
-			return err
-		}
-		key, ok := k.(string)
-		if !ok {
-			return fmt.Errorf("invalid v2 key")
-		}
-		if seen[key] {
-			return fmt.Errorf("duplicate v2 key %q", key)
-		}
-		seen[key] = true
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			return err
-		}
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		return err
 	}
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.DisallowUnknownFields()
@@ -47,8 +29,59 @@ func decodeStrictV2(data []byte, dst any) error {
 	var extra any
 	if err := d.Decode(&extra); err == nil {
 		return fmt.Errorf("trailing v2 frame data")
+	} else if err != io.EOF {
+		return fmt.Errorf("trailing v2 frame data: %w", err)
 	}
 	return nil
+}
+
+func rejectDuplicateV2Keys(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var walk func() error
+	walk = func() error {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		delim, ok := tok.(json.Delim)
+		if !ok {
+			return nil
+		}
+		switch delim {
+		case '{':
+			seen := map[string]struct{}{}
+			for dec.More() {
+				keyToken, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return fmt.Errorf("invalid v2 object key")
+				}
+				if _, duplicate := seen[key]; duplicate {
+					return fmt.Errorf("duplicate v2 key %q", key)
+				}
+				seen[key] = struct{}{}
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, err = dec.Token()
+			return err
+		case '[':
+			for dec.More() {
+				if err := walk(); err != nil {
+					return err
+				}
+			}
+			_, err = dec.Token()
+			return err
+		default:
+			return fmt.Errorf("unexpected v2 delimiter %q", delim)
+		}
+	}
+	return walk()
 }
 
 func requireV2Fields(data []byte, fields ...string) error {
@@ -63,6 +96,113 @@ func requireV2Fields(data []byte, fields ...string) error {
 		}
 	}
 	return nil
+}
+
+func strictV2Bound(data []byte, limits ...int) error {
+	limit := HostMaxInvokeStdoutBytes
+	if len(limits) > 0 && limits[0] > 0 {
+		limit = limits[0]
+	}
+	if len(data) > limit {
+		return fmt.Errorf("v2 frame exceeds %d bytes", limit)
+	}
+	return nil
+}
+
+func decodeStdioJSONV2Frame(data []byte, limits ...int) (stdioJSONV2Frame, error) {
+	var f stdioJSONV2Frame
+	if err := strictV2Bound(data, limits...); err != nil {
+		return f, err
+	}
+	if err := decodeStrictV2(data, &f); err != nil {
+		return f, err
+	}
+	if err := requireV2Fields(data, "protocol", "kind", "generation", "invocation_id"); err != nil {
+		return f, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return f, err
+	}
+	allowed := map[string]bool{"protocol": true, "kind": true, "generation": true, "invocation_id": true}
+	required := []string(nil)
+	switch f.Kind {
+	case "runtime_ready", "stderr_complete", "invoke_ready":
+	case "invoke_result":
+		allowed["response"] = true
+		required = append(required, "response")
+	case "host_call":
+		allowed["host_call_id"], allowed["host_call"] = true, true
+		required = append(required, "host_call_id", "host_call")
+	case "host_response":
+		allowed["host_call_id"], allowed["host_response"] = true, true
+		required = append(required, "host_call_id", "host_response")
+	default:
+		return f, fmt.Errorf("unknown stdio frame kind %q", f.Kind)
+	}
+	for key := range fields {
+		if !allowed[key] {
+			return f, fmt.Errorf("field %q is invalid for %s", key, f.Kind)
+		}
+	}
+	if err := requireV2Fields(data, required...); err != nil {
+		return f, err
+	}
+	if err := validateStdioJSONV2Frame(f, f.Generation, f.InvocationID, ""); err != nil {
+		return f, err
+	}
+	return f, nil
+}
+
+func decodeStrictSystemHostCall(data []byte, outerID string, limits ...int) (systemHostCall, error) {
+	var call systemHostCall
+	if err := strictV2Bound(data, limits...); err != nil {
+		return call, err
+	}
+	if err := decodeStrictV2(data, &call); err != nil {
+		return call, err
+	}
+	if err := requireV2Fields(data, "id", "method", "params"); err != nil {
+		return call, err
+	}
+	if call.ID == "" || call.ID != outerID || strings.TrimSpace(call.Method) == "" {
+		return call, fmt.Errorf("invalid host_call payload")
+	}
+	return call, nil
+}
+
+func decodeSystemRunnerReply(data []byte, limits ...int) (systemRunnerReply, error) {
+	if err := strictV2Bound(data, limits...); err != nil {
+		return systemRunnerReply{}, err
+	}
+	var raw struct {
+		OK       json.RawMessage `json:"ok"`
+		Plan     json.RawMessage `json:"plan"`
+		Message  json.RawMessage `json:"message"`
+		Result   json.RawMessage `json:"result"`
+		Error    json.RawMessage `json:"error"`
+		Warnings json.RawMessage `json:"warnings"`
+	}
+	if err := decodeStrictV2(data, &raw); err != nil {
+		return systemRunnerReply{}, err
+	}
+	if len(raw.OK) == 0 || bytes.Equal(raw.OK, []byte("null")) {
+		return systemRunnerReply{}, fmt.Errorf("missing required v2 field %q", "ok")
+	}
+	var reply systemRunnerReply
+	if err := json.Unmarshal(data, &reply); err != nil {
+		return systemRunnerReply{}, err
+	}
+	if !reply.OK && strings.TrimSpace(reply.Error) == "" {
+		return systemRunnerReply{}, fmt.Errorf("failed response requires error")
+	}
+	if reply.OK && strings.TrimSpace(reply.Error) != "" {
+		return systemRunnerReply{}, fmt.Errorf("successful response cannot contain error")
+	}
+	if !reply.OK && len(reply.Result) != 0 && !bytes.Equal(reply.Result, []byte("null")) {
+		return systemRunnerReply{}, fmt.Errorf("failed response cannot contain result")
+	}
+	return reply, nil
 }
 
 type stdioV2Session struct {
@@ -107,7 +247,7 @@ func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationI
 	if f.Protocol != 2 {
 		return fmt.Errorf("unexpected stdio protocol %d", f.Protocol)
 	}
-	if f.Generation != generation || f.InvocationID != invocationID {
+	if f.Generation == 0 || f.InvocationID == "" || f.Generation != generation || f.InvocationID != invocationID {
 		return fmt.Errorf("stale stdio invocation correlation")
 	}
 	if hostCallID != "" && f.HostCallID != hostCallID {
@@ -129,6 +269,10 @@ func validateStdioJSONV2Frame(f stdioJSONV2Frame, generation uint64, invocationI
 	case "invoke_ready":
 		if f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
 			return fmt.Errorf("invalid invoke_ready schema")
+		}
+	case "stderr_complete":
+		if f.HostCallID != "" || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostCall) || nonempty(f.HostResponse) {
+			return fmt.Errorf("invalid stderr_complete schema")
 		}
 	case "host_call":
 		if f.HostCallID == "" || !nonempty(f.HostCall) || nonempty(f.Request) || nonempty(f.Response) || nonempty(f.HostResponse) {

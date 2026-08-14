@@ -53,6 +53,23 @@ type Runner interface {
 	Stop(ctx context.Context, req RunnerStopRequest) error
 }
 
+// TransactionalRunner separates candidate preparation from admission. A
+// prepared generation must not be invokable until ActivateGeneration succeeds;
+// failed/stale candidates are removed with AbortGeneration, while an old
+// committed generation is retired only after the manager publishes its
+// replacement.
+type TransactionalRunner interface {
+	Runner
+	Prepare(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error)
+	ActivateGeneration(pluginID string, generation uint64) error
+	AbortGeneration(ctx context.Context, pluginID string, generation uint64) error
+	RetireGeneration(ctx context.Context, pluginID string, generation uint64) error
+}
+
+type RunnerCloser interface {
+	StopAll(ctx context.Context) error
+}
+
 // InvokeRequest asks an armed plugin to perform one action. Payload is the raw
 // JSON body handed to the plugin; the runner frames {action,payload} as a single
 // stdin line and reads the reply from stdout.
@@ -97,11 +114,26 @@ type Invoker interface {
 	Invoke(ctx context.Context, req InvokeRequest) (InvokeResponse, error)
 }
 
+type InvocationGenerationLease interface {
+	Invoke(ctx context.Context, req InvokeRequest) (InvokeResponse, error)
+	Release()
+}
+
+type GenerationLeasingRunner interface {
+	AcquireInvocation(pluginID string, generation uint64) (InvocationGenerationLease, error)
+}
+
 type runtimeInstance struct {
 	status     RuntimeStatus
 	broker     *Broker
 	runner     Runner
 	generation uint64
+}
+
+type pendingRuntimeStart struct {
+	generation uint64
+	cancel     context.CancelFunc
+	done       chan struct{}
 }
 
 type RuntimeManagerOptions struct {
@@ -115,13 +147,18 @@ type RuntimeManagerOptions struct {
 // arms host-API access for a verified plugin but does not spawn processes, load
 // wasm, or invoke artifact code.
 type RuntimeManager struct {
-	mu        sync.Mutex
-	services  HostServices
-	runners   map[string]Runner
-	fallback  Runner
-	timeout   time.Duration
-	nextGen   uint64
-	instances map[string]runtimeInstance
+	mu            sync.Mutex
+	services      HostServices
+	runners       map[string]Runner
+	fallback      Runner
+	timeout       time.Duration
+	nextGen       uint64
+	latestGen     map[string]uint64
+	pendingStarts map[string]map[uint64]pendingRuntimeStart
+	instances     map[string]runtimeInstance
+	closing       bool
+	closeDone     chan struct{}
+	closeErr      error
 }
 
 func NewRuntimeManager(services HostServices) *RuntimeManager {
@@ -140,11 +177,14 @@ func NewRuntimeManagerWithOptions(opts RuntimeManagerOptions) *RuntimeManager {
 		}
 	}
 	return &RuntimeManager{
-		services:  opts.Services,
-		runners:   runners,
-		fallback:  noopRunner{},
-		timeout:   timeout,
-		instances: map[string]runtimeInstance{},
+		services:      opts.Services,
+		runners:       runners,
+		fallback:      noopRunner{},
+		timeout:       timeout,
+		latestGen:     map[string]uint64{},
+		pendingStarts: map[string]map[uint64]pendingRuntimeStart{},
+		instances:     map[string]runtimeInstance{},
+		closeDone:     make(chan struct{}),
 	}
 }
 
@@ -162,19 +202,49 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 	if err != nil {
 		return RuntimeStatus{}, err
 	}
+	broker.attachAuthority(newGenerationAuthority())
 	runner := m.runnerFor(loaded.Manifest.Type)
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		broker.authority.revoke()
+		return RuntimeStatus{}, errors.New("runtime manager is closed")
+	}
 	m.nextGen++
 	generation := m.nextGen
-	m.mu.Unlock()
+	m.latestGen[loaded.Manifest.ID] = generation
 	startCtx, cancel := context.WithTimeout(ctx, m.timeout)
-	defer cancel()
-	result, err := runner.Start(startCtx, RunnerStartRequest{
+	if m.pendingStarts[loaded.Manifest.ID] == nil {
+		m.pendingStarts[loaded.Manifest.ID] = map[uint64]pendingRuntimeStart{}
+	}
+	startDone := make(chan struct{})
+	m.pendingStarts[loaded.Manifest.ID][generation] = pendingRuntimeStart{generation: generation, cancel: cancel, done: startDone}
+	m.mu.Unlock()
+	defer func() {
+		cancel()
+		m.mu.Lock()
+		if pending := m.pendingStarts[loaded.Manifest.ID]; pending != nil {
+			delete(pending, generation)
+			if len(pending) == 0 {
+				delete(m.pendingStarts, loaded.Manifest.ID)
+			}
+		}
+		m.mu.Unlock()
+		close(startDone)
+	}()
+	req := RunnerStartRequest{
 		PluginID:   loaded.Manifest.ID,
 		Generation: generation,
 		Loaded:     loaded,
 		Broker:     broker,
-	})
+	}
+	transactional, isTransactional := runner.(TransactionalRunner)
+	var result RunnerStartResult
+	if isTransactional {
+		result, err = transactional.Prepare(startCtx, req)
+	} else {
+		result, err = runner.Start(startCtx, req)
+	}
 	now := time.Now().UTC()
 	status := RuntimeStatus{
 		PluginID:  loaded.Manifest.ID,
@@ -183,11 +253,34 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 		UpdatedAt: now,
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	current, currentOK := m.instances[loaded.Manifest.ID]
+	if m.closing || m.latestGen[loaded.Manifest.ID] != generation {
+		m.mu.Unlock()
+		broker.authority.revoke()
+		if err == nil {
+			stopCtx, stopCancel := context.WithTimeout(context.Background(), m.timeout)
+			if isTransactional {
+				_ = transactional.AbortGeneration(stopCtx, loaded.Manifest.ID, generation)
+			} else {
+				_ = runner.Stop(stopCtx, RunnerStopRequest{PluginID: loaded.Manifest.ID, Reason: "stale concurrent start", Generation: generation})
+			}
+			stopCancel()
+		}
+		if currentOK {
+			return current.status, fmt.Errorf("stale runtime generation %d", generation)
+		}
+		return RuntimeStatus{}, fmt.Errorf("stale runtime generation %d", generation)
+	}
 	if err != nil {
+		broker.authority.revoke()
+		if currentOK && current.status.State == RuntimeStateArmed {
+			m.mu.Unlock()
+			return current.status, err
+		}
 		status.State = RuntimeStateFailed
 		status.Message = err.Error()
 		m.instances[loaded.Manifest.ID] = runtimeInstance{status: status, generation: generation}
+		m.mu.Unlock()
 		return status, err
 	}
 	status.State = RuntimeStateArmed
@@ -195,7 +288,31 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 	if status.Message == "" {
 		status.Message = fmt.Sprintf("%s runner armed", runner.Name())
 	}
+	if isTransactional {
+		if activateErr := transactional.ActivateGeneration(loaded.Manifest.ID, generation); activateErr != nil {
+			m.mu.Unlock()
+			broker.authority.revoke()
+			abortCtx, abortCancel := context.WithTimeout(context.Background(), m.timeout)
+			_ = transactional.AbortGeneration(abortCtx, loaded.Manifest.ID, generation)
+			abortCancel()
+			if currentOK && current.status.State == RuntimeStateArmed {
+				return current.status, activateErr
+			}
+			status.State = RuntimeStateFailed
+			status.Message = activateErr.Error()
+			return status, activateErr
+		}
+	}
+	old := current
 	m.instances[loaded.Manifest.ID] = runtimeInstance{status: status, broker: broker, runner: runner, generation: generation}
+	m.mu.Unlock()
+	if currentOK && old.runner != nil && old.generation != generation {
+		if oldTransactional, ok := old.runner.(TransactionalRunner); ok {
+			retireCtx, retireCancel := context.WithTimeout(context.Background(), m.timeout)
+			_ = oldTransactional.RetireGeneration(retireCtx, loaded.Manifest.ID, old.generation)
+			retireCancel()
+		}
+	}
 	return status, nil
 }
 
@@ -203,51 +320,22 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 	if pluginID == "" {
 		return RuntimeStatus{}, errors.New("plugin id is required")
 	}
-	now := time.Now().UTC()
 	m.mu.Lock()
-	inst, ok := m.instances[pluginID]
-	runner := inst.runner
-	generation := inst.generation
-	m.mu.Unlock()
-
-	if ok && runner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
-		err := runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message, Generation: generation})
-		cancel()
-		if err != nil {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			inst, ok = m.instances[pluginID]
-			if ok && generation != 0 && inst.generation != generation {
-				return inst.status, nil
-			}
-			if !ok {
-				m.nextGen++
-				inst = runtimeInstance{generation: m.nextGen, status: RuntimeStatus{PluginID: pluginID, StartedAt: now}}
-			}
-			inst.status.PluginID = pluginID
-			inst.status.State = RuntimeStateFailed
-			inst.status.Message = err.Error()
-			inst.status.UpdatedAt = now
-			// A plugin being disabled is no longer trusted with host access,
-			// regardless of whether its Stop hook succeeded. Detach the broker and
-			// runner here just as the success path does, so a failed Stop cannot
-			// leave host-API access armed for a plugin we have decided to stop.
-			inst.broker = nil
-			inst.runner = nil
-			m.instances[pluginID] = inst
-			return inst.status, err
+	m.nextGen++
+	tombstone := m.nextGen
+	m.latestGen[pluginID] = tombstone
+	for _, pending := range m.pendingStarts[pluginID] {
+		if pending.cancel != nil {
+			pending.cancel()
 		}
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	inst, ok = m.instances[pluginID]
-	if ok && generation != 0 && inst.generation != generation {
-		return inst.status, nil
-	}
+	now := time.Now().UTC()
+	inst, ok := m.instances[pluginID]
+	runner := inst.runner
+	oldBroker := inst.broker
+	generation := inst.generation
 	if !ok {
-		m.nextGen++
-		inst = runtimeInstance{generation: m.nextGen, status: RuntimeStatus{PluginID: pluginID, StartedAt: now}}
+		inst = runtimeInstance{generation: tombstone, status: RuntimeStatus{PluginID: pluginID, StartedAt: now}}
 	}
 	inst.status.PluginID = pluginID
 	inst.status.State = RuntimeStateStopped
@@ -257,7 +345,115 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 	inst.broker = nil
 	inst.runner = nil
 	m.instances[pluginID] = inst
-	return inst.status, nil
+	if ok && oldBroker != nil && oldBroker.authority != nil {
+		oldBroker.authority.revoke()
+	}
+	stopped := inst.status
+	m.mu.Unlock()
+
+	if ok && runner != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
+		var stopErr error
+		if oldBroker != nil && oldBroker.authority != nil {
+			stopErr = oldBroker.authority.wait(ctx)
+		}
+		stopGeneration := generation
+		if _, transactional := runner.(TransactionalRunner); transactional {
+			stopGeneration = tombstone
+		}
+		err := errors.Join(stopErr, runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message, Generation: stopGeneration}))
+		cancel()
+		if err != nil {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			current := m.instances[pluginID]
+			if current.generation != generation && current.generation != tombstone {
+				return current.status, nil
+			}
+			current.status.State = RuntimeStateFailed
+			current.status.Message = err.Error()
+			current.status.UpdatedAt = now
+			m.instances[pluginID] = current
+			return current.status, err
+		}
+	}
+	return stopped, nil
+}
+
+// Close atomically closes runtime admission, invalidates every pending start,
+// and joins runner-owned generations before returning.
+func (m *RuntimeManager) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.Lock()
+	if m.closing {
+		done := m.closeDone
+		m.mu.Unlock()
+		select {
+		case <-done:
+			m.mu.Lock()
+			err := m.closeErr
+			m.mu.Unlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	m.closing = true
+	var pendingDone []<-chan struct{}
+	for pluginID, attempts := range m.pendingStarts {
+		m.nextGen++
+		m.latestGen[pluginID] = m.nextGen
+		for _, pending := range attempts {
+			if pending.cancel != nil {
+				pending.cancel()
+			}
+			if pending.done != nil {
+				pendingDone = append(pendingDone, pending.done)
+			}
+		}
+	}
+	runners := make(map[Runner]struct{})
+	for _, runner := range m.runners {
+		if runner != nil {
+			runners[runner] = struct{}{}
+		}
+	}
+	for pluginID, inst := range m.instances {
+		if inst.runner != nil {
+			runners[inst.runner] = struct{}{}
+		}
+		if inst.broker != nil && inst.broker.authority != nil {
+			inst.broker.authority.revoke()
+		}
+		inst.runner = nil
+		inst.broker = nil
+		inst.status.State = RuntimeStateStopped
+		inst.status.Message = "runtime manager closed"
+		inst.status.StoppedAt = time.Now().UTC()
+		inst.status.UpdatedAt = inst.status.StoppedAt
+		m.instances[pluginID] = inst
+	}
+	m.mu.Unlock()
+	var joined error
+	for runner := range runners {
+		if closer, ok := runner.(RunnerCloser); ok {
+			joined = errors.Join(joined, closer.StopAll(ctx))
+		}
+	}
+	for _, done := range pendingDone {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			joined = errors.Join(joined, ctx.Err())
+		}
+	}
+	m.mu.Lock()
+	m.closeErr = joined
+	close(m.closeDone)
+	m.mu.Unlock()
+	return joined
 }
 
 func (m *RuntimeManager) Status(pluginID string) (RuntimeStatus, bool) {
@@ -295,19 +491,36 @@ func (m *RuntimeManager) InvokeConstrained(ctx context.Context, pluginID, action
 		ctx = context.Background()
 	}
 	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return InvokeResponse{}, errors.New("runtime manager is closed")
+	}
 	inst, ok := m.instances[pluginID]
-	m.mu.Unlock()
 	if !ok {
+		m.mu.Unlock()
 		return InvokeResponse{}, fmt.Errorf("plugin %q has no runtime", pluginID)
 	}
 	if inst.status.State != RuntimeStateArmed || inst.runner == nil {
+		m.mu.Unlock()
 		return InvokeResponse{}, fmt.Errorf("plugin %q is not armed", pluginID)
 	}
 	inv, ok := inst.runner.(Invoker)
 	if !ok {
+		m.mu.Unlock()
 		return InvokeResponse{}, fmt.Errorf("plugin %q runner %q does not support invocation", pluginID, inst.runner.Name())
 	}
-	return inv.Invoke(ctx, InvokeRequest{PluginID: pluginID, Generation: inst.generation, Action: action, Payload: payload, Constraints: constraints})
+	req := InvokeRequest{PluginID: pluginID, Generation: inst.generation, Action: action, Payload: payload, Constraints: constraints}
+	if leasing, ok := inst.runner.(GenerationLeasingRunner); ok {
+		lease, err := leasing.AcquireInvocation(pluginID, inst.generation)
+		m.mu.Unlock()
+		if err != nil {
+			return InvokeResponse{}, err
+		}
+		defer lease.Release()
+		return lease.Invoke(ctx, req)
+	}
+	m.mu.Unlock()
+	return inv.Invoke(ctx, req)
 }
 
 func (m *RuntimeManager) runnerFor(pluginType string) Runner {

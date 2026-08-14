@@ -6,7 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -23,6 +28,7 @@ func TestSystemRunnerPoolRetiresPostResultReadyFailures(t *testing.T) {
 		{name: "NO_READY", flag: "LATTICE_TEST_V2_NO_READY=1", resultKey: "once"},
 		{name: "MALFORMED_READY", flag: "LATTICE_TEST_V2_MALFORMED_READY=1", resultKey: "helper"},
 		{name: "BAD_READY", flag: "LATTICE_TEST_V2_BAD_READY=1", resultKey: "helper"},
+		{name: "WRONG_INVOCATION_READY", flag: "LATTICE_TEST_V2_WRONG_INVOCATION_READY=1", resultKey: "helper"},
 	}
 
 	for _, tc := range cases {
@@ -35,8 +41,12 @@ func TestSystemRunnerPoolRetiresPostResultReadyFailures(t *testing.T) {
 			}
 			t.Cleanup(func() { pool.drain(1) })
 
-			pool.replenishFn = func(generation uint64) (*pooledWorker, error) {
-				good := startReadyTestWorker(t)
+			spawnGood := readyTestSpawner(t)
+			pool.replenishFn = func(ctx context.Context, generation uint64) (*pooledWorker, error) {
+				good, err := spawnGood(ctx)
+				if err != nil {
+					return nil, err
+				}
 				return &pooledWorker{
 					state:      workerIdle,
 					generation: generation,
@@ -72,6 +82,362 @@ func TestSystemRunnerPoolRetiresPostResultReadyFailures(t *testing.T) {
 			secondPID := resultPID(t, second.Result)
 			if !second.OK || secondPID == badPID {
 				t.Fatalf("replacement was not used: response=%+v old_pid=%d", second, badPID)
+			}
+		})
+	}
+}
+
+func TestSystemRunnerV2PreservesCanonicalResponseSemantics(t *testing.T) {
+	cases := []struct {
+		name        string
+		flags       []string
+		wantOK      bool
+		wantMessage string
+		wantResult  string
+		wantWarning []string
+		wantErr     bool
+	}{
+		{name: "error ready", flags: []string{"LATTICE_TEST_V2_ERROR_RESPONSE=1"}, wantMessage: "helper denied", wantWarning: []string{"plugin warning"}, wantErr: true},
+		{name: "error retirement", flags: []string{"LATTICE_TEST_V2_ERROR_RESPONSE=1", "LATTICE_TEST_V2_NO_READY_AFTER_RESULT=1"}, wantMessage: "helper denied", wantWarning: []string{"plugin warning", "persistent worker retired after terminal protocol failure"}, wantErr: true},
+		{name: "success warning retirement", flags: []string{"LATTICE_TEST_V2_WARN_RESPONSE=1", "LATTICE_TEST_V2_NO_READY_AFTER_RESULT=1"}, wantOK: true, wantWarning: []string{"plugin warning", "persistent worker retired after terminal protocol failure"}},
+		{name: "message only", flags: []string{"LATTICE_TEST_V2_MESSAGE_RESPONSE=1"}, wantOK: true, wantMessage: "done"},
+		{name: "plan only", flags: []string{"LATTICE_TEST_V2_PLAN_RESPONSE=1"}, wantOK: true, wantResult: `"plan text"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			worker := startReadyTestWorker(t, tc.flags...)
+			pool := newSystemPool(256, time.Hour, 1)
+			if err := pool.publishTransport(1, worker, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { pool.drain(1) })
+			rsp, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: "response"})
+			if (err != nil) != tc.wantErr || rsp.OK != tc.wantOK || rsp.Message != tc.wantMessage || (tc.wantResult != "" && string(rsp.Result) != tc.wantResult) || !reflect.DeepEqual(rsp.Warnings, tc.wantWarning) {
+				t.Fatalf("response=%+v err=%v", rsp, err)
+			}
+		})
+	}
+}
+
+func TestSystemRunnerV2CircuitTracksTransportHealth(t *testing.T) {
+	t.Run("ready retirement opens circuit", func(t *testing.T) {
+		pool := newSystemPool(256, time.Hour, 1)
+		spawnBad := readyTestSpawner(t, "LATTICE_TEST_V2_BAD_READY=1")
+		var starts atomic.Int64
+		pool.replenishFn = func(ctx context.Context, generation uint64) (*pooledWorker, error) {
+			starts.Add(1)
+			tr, err := spawnBad(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return &pooledWorker{state: workerIdle, generation: generation, started: time.Now(), transport: tr}, nil
+		}
+		first, err := pool.replenishFn(t.Context(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.publishTransport(1, first.transport, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { pool.drain(1) })
+		runner := runnerWithPool(pool, nil)
+		for i := 0; i < defaultCrashThreshold; i++ {
+			if rsp, err := runner.Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: "retire"}); err != nil || !rsp.OK {
+				t.Fatalf("retirement %d response=%+v err=%v", i, rsp, err)
+			}
+		}
+		if _, err := runner.Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: "blocked"}); !errors.Is(err, ErrCircuitOpen) {
+			t.Fatalf("circuit error=%v, want ErrCircuitOpen", err)
+		}
+		if got := starts.Load(); got != int64(defaultCrashThreshold) {
+			t.Fatalf("worker starts=%d, want %d with zero post-threshold spawn", got, defaultCrashThreshold)
+		}
+	})
+
+	t.Run("reusable business failures keep circuit closed", func(t *testing.T) {
+		tr := startReadyTestWorker(t, "LATTICE_TEST_V2_ERROR_RESPONSE=1")
+		pid := tr.pgid
+		pool := newSystemPool(256, time.Hour, 1)
+		if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { pool.drain(1) })
+		runner := runnerWithPool(pool, nil)
+		for i := 0; i < defaultCrashThreshold+1; i++ {
+			rsp, err := runner.Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: "deny"})
+			if err == nil || rsp.OK || rsp.Message != "helper denied" {
+				t.Fatalf("business failure %d response=%+v err=%v", i, rsp, err)
+			}
+		}
+		if err := syscall.Kill(-pid, 0); err != nil {
+			t.Fatalf("reusable worker was retired: %v", err)
+		}
+	})
+}
+
+func TestSystemPoolCircuitOpenRevokesQueuedAndReleasedWorkers(t *testing.T) {
+	p := newSystemPool(256, time.Hour, 1)
+	a, b := startReadyTestWorker(t), startReadyTestWorker(t)
+	for _, tr := range []*systemWorkerTransport{a, b} {
+		if err := p.publishTransport(1, tr, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	one, err := p.checkout(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := p.checkout(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := make(chan error, 1)
+	go func() { _, err := p.checkout(t.Context(), time.Now()); queued <- err }()
+	for {
+		p.mu.Lock()
+		n := len(p.waiters)
+		p.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		runtime.Gosched()
+	}
+	p.setCircuitOpen(true)
+	if err := <-queued; !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("queued checkout error=%v", err)
+	}
+	p.release(one, true, time.Now())
+	p.release(two, true, time.Now())
+	assertProcessGroupGone(t, a.pgid)
+	assertProcessGroupGone(t, b.pgid)
+	p.abortClose(1)
+}
+
+func TestSystemPoolDrainCancelsAndJoinsSupervisor(t *testing.T) {
+	p := newSystemPool(256, time.Hour, 1)
+	entered, exited := make(chan struct{}), make(chan struct{})
+	p.replenishFn = func(ctx context.Context, _ uint64) (*pooledWorker, error) {
+		close(entered)
+		<-ctx.Done()
+		close(exited)
+		return nil, ctx.Err()
+	}
+	checkout := make(chan error, 1)
+	go func() { _, err := p.checkout(t.Context(), time.Now()); checkout <- err }()
+	<-entered
+	p.abortClose(1)
+	<-exited
+	if err := <-checkout; !errors.Is(err, errSystemPoolClosed) {
+		t.Fatalf("checkout error=%v", err)
+	}
+	p.mu.Lock()
+	starting := p.starting
+	p.mu.Unlock()
+	if starting != 0 {
+		t.Fatalf("starting=%d after supervisor join", starting)
+	}
+}
+
+func TestSystemPoolGracefulDrainClosesAfterLeasedPoison(t *testing.T) {
+	p := newSystemPool(256, time.Hour, 1)
+	tr := startReadyTestWorker(t)
+	if err := p.publishTransport(1, tr, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	w, err := p.checkout(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	drained := p.gracefulDrain(1)
+	p.poison(w)
+	select {
+	case <-drained:
+	case <-time.After(2 * time.Second):
+		t.Fatal("drain did not close after leased poison")
+	}
+	assertProcessGroupGone(t, tr.pgid)
+}
+
+func TestSystemPoolPrunesInvalidIdleBeforeWake(t *testing.T) {
+	for _, mode := range []string{"max-age", "max-use", "stale-generation"} {
+		t.Run(mode, func(t *testing.T) {
+			p := newSystemPool(2, time.Hour, 1)
+			old := startReadyTestWorker(t)
+			if err := p.publishTransport(1, old, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			p.mu.Lock()
+			switch mode {
+			case "max-age":
+				p.workers[0].started = time.Now().Add(-2 * p.maxAge)
+			case "max-use":
+				p.workers[0].uses = p.maxUses
+			case "stale-generation":
+				p.workers[0].generation--
+			}
+			p.mu.Unlock()
+			spawn := readyTestSpawner(t)
+			p.replenishFn = func(ctx context.Context, generation uint64) (*pooledWorker, error) {
+				tr, err := spawn(ctx)
+				return &pooledWorker{generation: generation, started: time.Now(), transport: tr}, err
+			}
+			w, err := p.checkout(t.Context(), time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if w.transport == old {
+				t.Fatal("invalid idle worker was leased")
+			}
+			assertProcessGroupGone(t, old.pgid)
+			p.release(w, true, time.Now())
+			p.abortClose(1)
+		})
+	}
+}
+
+func TestSystemRunnerPostResultRetirementDoesNotWaitForReplenishment(t *testing.T) {
+	bad := startReadyTestWorker(t, "LATTICE_TEST_V2_NO_READY=1")
+	pool := newSystemPool(256, time.Hour, 1)
+	if err := pool.publishTransport(1, bad, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	gate := make(chan struct{})
+	pool.replenishFn = func(ctx context.Context, _ uint64) (*pooledWorker, error) {
+		close(entered)
+		select {
+		case <-gate:
+			return nil, errors.New("blocked replacement failed")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	t.Cleanup(func() { close(gate); pool.drain(1) })
+	done := make(chan struct {
+		rsp InvokeResponse
+		err error
+	}, 1)
+	go func() {
+		rsp, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: "retire"})
+		done <- struct {
+			rsp InvokeResponse
+			err error
+		}{rsp, err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replenishment did not start")
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || !got.rsp.OK || len(got.rsp.Warnings) != 1 {
+			t.Fatalf("terminal result blocked or changed: response=%+v err=%v", got.rsp, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal result waited for replacement startup")
+	}
+}
+
+func TestSystemRunnerV2EnforcesCumulativeStdoutBudget(t *testing.T) {
+	tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_HOST=1", "LATTICE_TEST_V2_HOST_CALLS=3")
+	pool := newSystemPool(256, time.Hour, 1)
+	if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pool.drain(1) })
+	broker := newTestBroker(t, retirementTestPluginID, []string{"log:write"}, HostServices{Log: noopTestLog{}})
+	runner := runnerWithPool(pool, broker)
+	_, err := runner.Invoke(t.Context(), InvokeRequest{
+		PluginID:    retirementTestPluginID,
+		Generation:  1,
+		Action:      "cumulative",
+		Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 300, StderrBytes: 1024, HostCalls: 10}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "stdout limit 300") {
+		t.Fatalf("cumulative stdout error=%v", err)
+	}
+	assertProcessGroupGone(t, tr.pgid)
+}
+
+func TestSystemRunnerV2RejectsHostileFramesOnProductionPath(t *testing.T) {
+	for _, mode := range []string{"missing", "duplicate", "unknown", "null", "trailing", "correlation", "nested_params_duplicate", "nested_result_duplicate", "nested_warnings_duplicate"} {
+		t.Run(mode, func(t *testing.T) {
+			tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HOSTILE_FRAME="+mode)
+			pool := newSystemPool(256, time.Hour, 1)
+			if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { pool.drain(1) })
+			if _, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: mode}); err == nil {
+				t.Fatal("hostile frame reached a successful result")
+			}
+			assertProcessGroupGone(t, tr.pgid)
+		})
+	}
+}
+
+func TestSystemRunnerV2RejectsDuplicateHostCallIDAndBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		flags  []string
+		budget int
+		want   string
+	}{
+		{name: "duplicate id", flags: []string{"LATTICE_TEST_V2_HOST=1", "LATTICE_TEST_V2_HOST_CALLS=2", "LATTICE_TEST_V2_DUPLICATE_HOST_CALL_ID=1"}, budget: 2, want: "duplicate host_call_id"},
+		{name: "host call budget", flags: []string{"LATTICE_TEST_V2_HOST=1", "LATTICE_TEST_V2_HOST_CALLS=2"}, budget: 1, want: "host-call limit 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := startReadyTestWorker(t, tc.flags...)
+			pool := newSystemPool(256, time.Hour, 1)
+			if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { pool.drain(1) })
+			broker := newTestBroker(t, retirementTestPluginID, []string{"log:write"}, HostServices{Log: noopTestLog{}})
+			_, err := runnerWithPool(pool, broker).Invoke(t.Context(), InvokeRequest{
+				PluginID:    retirementTestPluginID,
+				Generation:  1,
+				Action:      tc.name,
+				Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 1 << 20, StderrBytes: 1024, HostCalls: tc.budget}},
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v, want %q", err, tc.want)
+			}
+			assertProcessGroupGone(t, tr.pgid)
+		})
+	}
+}
+
+func TestSystemRunnerV2ScannerSupportsAuthorizedLargeFrame(t *testing.T) {
+	const payloadBytes = 5 << 20
+	for _, tc := range []struct {
+		name   string
+		budget int
+		wantOK bool
+	}{
+		{name: "authorized above old scanner ceiling", budget: 6 << 20, wantOK: true},
+		{name: "signed lower limit", budget: 1 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := startReadyTestWorker(t, "LATTICE_TEST_V2_RESULT_BYTES="+strconv.Itoa(payloadBytes))
+			pool := newSystemPool(256, time.Hour, 1)
+			if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { pool.drain(1) })
+			rsp, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{
+				PluginID:    retirementTestPluginID,
+				Generation:  1,
+				Action:      "large",
+				Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 10_000, StdoutBytes: tc.budget, StderrBytes: 1024, HostCalls: 0}},
+			})
+			if tc.wantOK {
+				if err != nil || !rsp.OK || len(rsp.Result) < payloadBytes {
+					t.Fatalf("large authorized response bytes=%d err=%v", len(rsp.Result), err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "stdout limit") {
+				t.Fatalf("lower signed budget response=%+v err=%v", rsp, err)
 			}
 		})
 	}
@@ -129,6 +495,10 @@ type cancelOnLog struct {
 	cancel context.CancelFunc
 }
 
+type noopTestLog struct{}
+
+func (noopTestLog) Write(context.Context, HostLogEntry) error { return nil }
+
 func (l cancelOnLog) Write(context.Context, HostLogEntry) error {
 	close(l.seen)
 	l.cancel()
@@ -137,22 +507,42 @@ func (l cancelOnLog) Write(context.Context, HostLogEntry) error {
 
 func startReadyTestWorker(t *testing.T, flags ...string) *systemWorkerTransport {
 	t.Helper()
-	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1")
-	env = append(env, flags...)
-	worker, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+	spawn := readyTestSpawner(t, flags...)
+	worker, err := spawn(t.Context())
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := worker.awaitReady(1); err != nil {
-		_ = worker.abort()
 		t.Fatal(err)
 	}
 	return worker
 }
 
+func readyTestSpawner(t *testing.T, flags ...string) func(context.Context) (*systemWorkerTransport, error) {
+	t.Helper()
+	root := t.TempDir()
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1")
+	env = append(env, flags...)
+	var sequence atomic.Uint64
+	return func(ctx context.Context) (*systemWorkerTransport, error) {
+		dir := filepath.Join(root, strconv.FormatUint(sequence.Add(1), 10))
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			return nil, err
+		}
+		worker, err := startSystemWorker(ctx, os.Args[0], dir, env)
+		if err != nil {
+			return nil, err
+		}
+		if err := worker.awaitReadyContext(ctx, 1); err != nil {
+			_ = worker.abort()
+			return nil, err
+		}
+		return worker, nil
+	}
+}
+
 func runnerWithPool(pool *systemPool, broker *Broker) *SystemRunner {
 	runner := NewSystemRunner(SystemRunnerOptions{})
-	runner.st[retirementTestPluginID] = &systemPluginState{pool: pool, isV2: true, broker: broker}
+	runner.st[retirementTestPluginID] = map[uint64]*systemPluginState{
+		pool.generation: {pool: pool, isV2: true, broker: broker, generation: pool.generation, admitted: true},
+	}
 	return runner
 }
 

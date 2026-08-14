@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -145,11 +146,15 @@ func TestSystemPoolOverflowReservesSingleStartingWorker(t *testing.T) {
 		t.Fatal(err)
 	}
 	gate := make(chan struct{})
-	var calls int
-	p.replenishFn = func(uint64) (*pooledWorker, error) {
-		calls++
-		<-gate
-		return &pooledWorker{generation: 1, started: time.Now()}, nil
+	var calls atomic.Int64
+	p.replenishFn = func(ctx context.Context, _ uint64) (*pooledWorker, error) {
+		calls.Add(1)
+		select {
+		case <-gate:
+			return &pooledWorker{generation: 1, started: time.Now()}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -171,8 +176,8 @@ func TestSystemPoolOverflowReservesSingleStartingWorker(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	p.release(w, false, time.Now())
-	if calls != 1 {
-		t.Fatalf("spawn calls=%d", calls)
+	if calls.Load() != 1 {
+		t.Fatalf("spawn calls=%d", calls.Load())
 	}
 }
 

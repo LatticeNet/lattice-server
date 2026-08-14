@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -33,7 +35,7 @@ func TestRealV2ResultWithoutReadyPreservesReplyAndReaps(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	rsp, err := tr.invokeV2(ctx, 1, "nr", InvokeRequest{Action: "x"}, nil)
-	if err == nil || (!errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, context.DeadlineExceeded)) || !rsp.OK {
+	if err != nil || rsp.Retirement == nil || (!errors.Is(rsp.Retirement, io.ErrUnexpectedEOF) && !errors.Is(rsp.Retirement, context.DeadlineExceeded)) || !rsp.Reply.OK {
 		t.Fatalf("reply=%+v err=%v", rsp, err)
 	}
 	_ = tr.abort()
@@ -101,7 +103,7 @@ func TestRealV2MalformedReadyPreservesReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	rsp, err := tr.invokeV2(t.Context(), 1, "bad", InvokeRequest{Action: "x"}, nil)
-	if err == nil || !rsp.OK {
+	if err != nil || rsp.Retirement == nil || !rsp.Reply.OK {
 		t.Fatalf("reply=%+v err=%v", rsp, err)
 	}
 	_ = tr.abort()
@@ -112,6 +114,13 @@ func TestRealV2MalformedReadyPreservesReply(t *testing.T) {
 
 func runV2Helper() {
 	generation := uint64(1)
+	if raw := os.Getenv("LATTICE_RUNTIME_GENERATION"); raw != "" {
+		parsed, err := strconv.ParseUint(raw, 10, 64)
+		if err != nil || parsed == 0 || os.Getenv("LATTICE_RUNTIME_PROTOCOL") != RuntimeProtocolStdioJSONV2 || os.Getenv("LATTICE_HOST_RESPONSE_FD") != "3" {
+			os.Exit(6)
+		}
+		generation = parsed
+	}
 	if _, err := fmt.Fprintf(os.Stdout, `{"protocol":2,"kind":"runtime_ready","generation":%d,"invocation_id":"runtime"}
 `, generation); err != nil {
 		os.Exit(2)
@@ -126,29 +135,94 @@ func runV2Helper() {
 		if json.Unmarshal(s.Bytes(), &f) != nil {
 			os.Exit(3)
 		}
+		if mode := os.Getenv("LATTICE_TEST_V2_HOSTILE_FRAME"); mode != "" {
+			var raw string
+			switch mode {
+			case "missing":
+				raw = fmt.Sprintf(`{"kind":"invoke_result","generation":%d,"invocation_id":%q,"response":{"ok":true}}`, f.Generation, f.InvocationID)
+			case "duplicate":
+				raw = fmt.Sprintf(`{"protocol":2,"protocol":2,"kind":"invoke_result","generation":%d,"invocation_id":%q,"response":{"ok":true}}`, f.Generation, f.InvocationID)
+			case "unknown":
+				raw = fmt.Sprintf(`{"protocol":2,"kind":"invoke_result","generation":%d,"invocation_id":%q,"response":{"ok":true},"x":1}`, f.Generation, f.InvocationID)
+			case "null":
+				raw = fmt.Sprintf(`{"protocol":2,"kind":"invoke_result","generation":%d,"invocation_id":%q,"response":null}`, f.Generation, f.InvocationID)
+			case "trailing":
+				raw = fmt.Sprintf(`{"protocol":2,"kind":"invoke_result","generation":%d,"invocation_id":%q,"response":{"ok":true}} trailing`, f.Generation, f.InvocationID)
+			case "correlation":
+				raw = fmt.Sprintf(`{"protocol":2,"kind":"invoke_result","generation":%d,"invocation_id":"wrong","response":{"ok":true}}`, f.Generation)
+			case "nested_params_duplicate":
+				raw = fmt.Sprintf(`{"protocol":2,"kind":"host_call","generation":%d,"invocation_id":%q,"host_call_id":"h1","host_call":{"id":"h1","method":"log.write","params":{"x":1,"x":2}}}`, f.Generation, f.InvocationID)
+			case "nested_result_duplicate":
+				raw = fmt.Sprintf(`{"protocol":2,"kind":"invoke_result","generation":%d,"invocation_id":%q,"response":{"ok":true,"result":{"x":1,"x":2}}}`, f.Generation, f.InvocationID)
+			case "nested_warnings_duplicate":
+				raw = fmt.Sprintf(`{"protocol":2,"kind":"invoke_result","generation":%d,"invocation_id":%q,"response":{"ok":true,"warnings":[{"x":1,"x":2}]}}`, f.Generation, f.InvocationID)
+			}
+			fmt.Fprintln(os.Stdout, raw)
+			os.Exit(0)
+		}
 		if os.Getenv("LATTICE_TEST_V2_HOST") == "1" {
-			b, _ := json.Marshal(stdioJSONV2Frame{Protocol: 2, Kind: "host_call", Generation: f.Generation, InvocationID: f.InvocationID, HostCallID: "h1", HostCall: json.RawMessage(`{"id":"h1","method":"log.write","params":{"level":"info","message":"observed"}}`)})
-			fmt.Fprintln(os.Stdout, string(b))
+			calls := 1
+			if raw := os.Getenv("LATTICE_TEST_V2_HOST_CALLS"); raw != "" {
+				calls, _ = strconv.Atoi(raw)
+			}
 			br := bufio.NewReader(os.NewFile(uintptr(3), "host-response"))
-			_, _ = br.ReadBytes('\n')
+			for i := 1; i <= calls; i++ {
+				id := fmt.Sprintf("h%d", i)
+				if os.Getenv("LATTICE_TEST_V2_DUPLICATE_HOST_CALL_ID") == "1" {
+					id = "h1"
+				}
+				payload := json.RawMessage(fmt.Sprintf(`{"id":%q,"method":"log.write","params":{"level":"info","message":"observed"}}`, id))
+				b, _ := json.Marshal(stdioJSONV2Frame{Protocol: 2, Kind: "host_call", Generation: f.Generation, InvocationID: f.InvocationID, HostCallID: id, HostCall: payload})
+				fmt.Fprintln(os.Stdout, string(b))
+				_, _ = br.ReadBytes('\n')
+			}
 			if os.Getenv("LATTICE_TEST_V2_STALL") == "1" {
 				select {}
 			}
 		}
 		if os.Getenv("LATTICE_TEST_V2_NO_READY") == "1" {
+			fmt.Fprintf(os.Stderr, "%s%d %s\n", v2StderrCompleteMarkerPrefix, f.Generation, f.InvocationID)
 			resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID}
 			resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"once":true,"pid":%d}}`, os.Getpid()))
 			_ = enc.Encode(resp)
+			_ = enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_complete", Generation: f.Generation, InvocationID: f.InvocationID})
 			os.Exit(0)
 			continue
 		}
 		resp := stdioJSONV2Frame{Protocol: 2, Kind: "invoke_result", Generation: f.Generation, InvocationID: f.InvocationID}
-		resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"helper":true,"pid":%d}}`, os.Getpid()))
+		switch {
+		case os.Getenv("LATTICE_TEST_V2_ERROR_RESPONSE") == "1":
+			resp.Response = json.RawMessage(`{"ok":false,"error":"helper denied","warnings":["plugin warning"]}`)
+		case os.Getenv("LATTICE_TEST_V2_MESSAGE_RESPONSE") == "1":
+			resp.Response = json.RawMessage(`{"ok":true,"message":"done"}`)
+		case os.Getenv("LATTICE_TEST_V2_PLAN_RESPONSE") == "1":
+			resp.Response = json.RawMessage(`{"ok":true,"plan":"plan text"}`)
+		case os.Getenv("LATTICE_TEST_V2_WARN_RESPONSE") == "1":
+			resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"helper":true,"pid":%d},"warnings":["plugin warning"]}`, os.Getpid()))
+		default:
+			if raw := os.Getenv("LATTICE_TEST_V2_RESULT_BYTES"); raw != "" {
+				n, _ := strconv.Atoi(raw)
+				resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"data":%q}}`, strings.Repeat("x", n)))
+			} else {
+				resp.Response = json.RawMessage(fmt.Sprintf(`{"ok":true,"result":{"helper":true,"pid":%d}}`, os.Getpid()))
+			}
+		}
+		fmt.Fprintf(os.Stderr, "%s%d %s\n", v2StderrCompleteMarkerPrefix, f.Generation, f.InvocationID)
 		if enc.Encode(resp) != nil {
 			os.Exit(4)
 		}
+		if enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_complete", Generation: f.Generation, InvocationID: f.InvocationID}) != nil {
+			os.Exit(4)
+		}
+		if os.Getenv("LATTICE_TEST_V2_NO_READY_AFTER_RESULT") == "1" {
+			os.Exit(0)
+		}
 		if os.Getenv("LATTICE_TEST_V2_BAD_READY") == "1" {
-			fmt.Fprintln(os.Stdout, `{"protocol":2,"kind":"invoke_ready","generation":999}`)
+			fmt.Fprintf(os.Stdout, `{"protocol":2,"kind":"invoke_ready","generation":999,"invocation_id":%q}`+"\n", f.InvocationID)
+			continue
+		}
+		if os.Getenv("LATTICE_TEST_V2_WRONG_INVOCATION_READY") == "1" {
+			fmt.Fprintf(os.Stdout, `{"protocol":2,"kind":"invoke_ready","generation":%d,"invocation_id":"wrong"}`+"\n", f.Generation)
 			continue
 		}
 		if os.Getenv("LATTICE_TEST_V2_MALFORMED_READY") == "1" {
@@ -175,14 +249,14 @@ func TestRealV2HelperTwoInvocations(t *testing.T) {
 	var pid int
 	for i := 0; i < 2; i++ {
 		r, err := tr.invokeV2(t.Context(), 1, fmt.Sprintf("i%d", i), InvokeRequest{Action: "x"}, func(systemHostCall) systemHostResponse { return systemHostResponse{ID: "h1", OK: true} })
-		if err != nil || !r.OK {
+		if err != nil || !r.Reply.OK || !r.Reusable {
 			t.Fatalf("invoke %d: %+v %v", i, r, err)
 		}
 		var body struct {
 			PID int `json:"pid"`
 		}
-		if err := json.Unmarshal(r.Result, &body); err != nil || body.PID <= 0 {
-			t.Fatalf("missing helper pid: %s", r.Result)
+		if err := json.Unmarshal(r.Reply.Result, &body); err != nil || body.PID <= 0 {
+			t.Fatalf("missing helper pid: %s", r.Reply.Result)
 		}
 		if i == 0 {
 			pid = body.PID

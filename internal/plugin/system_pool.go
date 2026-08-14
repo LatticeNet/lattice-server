@@ -38,11 +38,21 @@ type systemPool struct {
 	maxAge      time.Duration
 	maxOverflow int
 	closed      bool
-	replenishFn func(uint64) (*pooledWorker, error)
+	replenishFn func(context.Context, uint64) (*pooledWorker, error)
+	failureFn   func(uint64)
 	active      int
 	starting    int
 	drained     chan struct{}
+	drainOnce   sync.Once
 	leased      map[*pooledWorker]struct{}
+	circuitOpen bool
+	superCtx    context.Context
+	superCancel context.CancelFunc
+	superSignal chan struct{}
+	superDone   chan struct{}
+	superStart  bool
+	attemptStop context.CancelFunc
+	backoffBase time.Duration
 }
 
 type poolCheckoutResult struct {
@@ -76,23 +86,32 @@ func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *sy
 	if len(generations) > 0 && generations[0] != 0 {
 		generation = generations[0]
 	}
-	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1, leased: map[*pooledWorker]struct{}{}, drained: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &systemPool{maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1, leased: map[*pooledWorker]struct{}{}, drained: make(chan struct{}), superCtx: ctx, superCancel: cancel, superSignal: make(chan struct{}, 1), superDone: make(chan struct{}), backoffBase: 100 * time.Millisecond}
 }
 
 func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	retired := p.pruneInvalidLocked(now)
 	if p.closed || generation != p.generation {
+		p.mu.Unlock()
+		abortTransports(retired)
 		return errors.New("stale pool generation")
 	}
 	if len(p.workers)+p.active >= 1+p.maxOverflow {
+		p.mu.Unlock()
+		abortTransports(retired)
 		return errors.New("pool capacity exceeded")
 	}
 	if !ready {
+		p.mu.Unlock()
+		abortTransports(retired)
 		return errors.New("worker is not ready")
 	}
 	p.workers = append(p.workers, &pooledWorker{state: workerIdle, generation: generation, started: now})
-	p.wakeLocked()
+	retired = append(retired, p.wakeLocked(now)...)
+	p.mu.Unlock()
+	abortTransports(retired)
 	return nil
 }
 
@@ -101,43 +120,54 @@ func (p *systemPool) publishTransport(generation uint64, t *systemWorkerTranspor
 		return errors.New("nil worker transport")
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	retired := p.pruneInvalidLocked(now)
 	if p.closed || generation != p.generation {
+		p.mu.Unlock()
+		abortTransports(retired)
 		return errors.New("stale pool generation")
 	}
 	if len(p.workers)+p.active >= 1+p.maxOverflow {
+		p.mu.Unlock()
+		abortTransports(retired)
 		return errors.New("pool capacity exceeded")
 	}
 	p.workers = append(p.workers, &pooledWorker{state: workerIdle, generation: generation, started: now, transport: t})
-	p.wakeLocked()
+	retired = append(retired, p.wakeLocked(now)...)
+	p.mu.Unlock()
+	abortTransports(retired)
 	return nil
 }
 
 func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker, error) {
 	for {
 		p.mu.Lock()
+		retired := p.pruneInvalidLocked(now)
 		for i, w := range p.workers {
-			if w.state == workerIdle && w.generation == p.generation && now.Sub(w.started) < p.maxAge && w.uses < p.maxUses {
+			if w.state == workerIdle {
 				w.state = workerLeased
 				p.active++
 				p.leased[w] = struct{}{}
 				p.workers = append(p.workers[:i], p.workers[i+1:]...)
 				p.mu.Unlock()
+				abortTransports(retired)
 				return w, nil
 			}
 		}
 		if p.closed {
 			p.mu.Unlock()
+			abortTransports(retired)
 			return nil, errSystemPoolClosed
 		}
-		if p.replenishFn != nil && len(p.workers)+p.active+p.starting < 1+p.maxOverflow {
-			p.starting++
-			fn, gen := p.replenishFn, p.generation
-			go p.spawnOverflow(fn, gen)
+		if p.circuitOpen {
+			p.mu.Unlock()
+			abortTransports(retired)
+			return nil, ErrCircuitOpen
 		}
 		ch := make(chan poolCheckoutResult, 1)
 		p.waiters = append(p.waiters, ch)
+		p.requestReplenishLocked()
 		p.mu.Unlock()
+		abortTransports(retired)
 		select {
 		case res := <-ch:
 			return res.worker, res.err
@@ -165,26 +195,9 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 	}
 }
 
-func (p *systemPool) spawnOverflow(fn func(uint64) (*pooledWorker, error), gen uint64) {
-	nw, err := fn(gen)
-	p.mu.Lock()
-	if p.starting > 0 {
-		p.starting--
-	}
-	valid := err == nil && nw != nil && !p.closed && p.generation == gen && len(p.workers)+p.active < 1+p.maxOverflow
-	if valid {
-		nw.state = workerIdle
-		p.workers = append(p.workers, nw)
-		p.wakeLocked()
-	}
-	p.mu.Unlock()
-	if !valid && nw != nil && nw.transport != nil {
-		_ = nw.transport.abort()
-	}
-}
-
 func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 	var abort *systemWorkerTransport
+	closeDrained := false
 	p.mu.Lock()
 	w.uses++
 	if p.active > 0 {
@@ -192,41 +205,34 @@ func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
 	}
 	delete(p.leased, w)
 	if p.closed && p.active == 0 {
-		select {
-		case <-p.drained:
-		default:
-			close(p.drained)
-		}
+		closeDrained = true
 	}
 	if resultSeen {
 		w.state = workerResultSeen
 	}
-	if p.closed || w.generation != p.generation || w.uses >= p.maxUses || now.Sub(w.started) >= p.maxAge {
+	if p.closed || p.circuitOpen || w.generation != p.generation || w.uses >= p.maxUses || now.Sub(w.started) >= p.maxAge {
 		w.state = workerRetiring
 		abort = w.transport
 		w.state = workerDead
-		fn, gen := p.replenishFn, p.generation
-		canReplenish := !p.closed && w.generation == gen
+		canReplenish := !p.closed && w.generation == p.generation
+		if canReplenish {
+			p.requestReplenishLocked()
+		}
 		p.mu.Unlock()
 		if abort != nil {
 			_ = abort.abort()
 		}
-		if canReplenish && fn != nil {
-			go func(gen uint64) {
-				if nw, err := fn(gen); err == nil && nw != nil {
-					if err := p.publishTransport(gen, nw.transport, time.Now()); err != nil && nw.transport != nil {
-						_ = nw.transport.abort()
-					}
-				}
-			}(w.generation)
+		if closeDrained {
+			p.closeDrained()
 		}
 		return
 	}
 	w.state = workerResetting
 	w.state = workerIdle
 	p.workers = append(p.workers, w)
-	p.wakeLocked()
+	invalid := p.wakeLocked(now)
 	p.mu.Unlock()
+	abortTransports(invalid)
 }
 
 func (p *systemPool) poison(w *pooledWorker) {
@@ -239,16 +245,143 @@ func (p *systemPool) poison(w *pooledWorker) {
 	}
 	w.state = workerDead
 	delete(p.leased, w)
-	fn, gen := p.replenishFn, p.generation
-	canReplenish := !p.closed && w.generation == gen
+	closeDrained := p.closed && p.active == 0
+	canReplenish := !p.closed && w.generation == p.generation
+	if canReplenish {
+		p.requestReplenishLocked()
+	}
 	p.mu.Unlock()
 	if w.transport != nil {
 		_ = w.transport.abort()
 	}
-	if canReplenish && fn != nil {
-		if nw, err := fn(gen); err == nil && nw != nil {
-			if err := p.publishTransport(gen, nw.transport, time.Now()); err != nil && nw.transport != nil {
+	if closeDrained {
+		p.closeDrained()
+	}
+}
+
+func (p *systemPool) setCircuitOpen(open bool) {
+	p.mu.Lock()
+	p.circuitOpen = open
+	if open && p.attemptStop != nil {
+		p.attemptStop()
+	}
+	if !open {
+		p.requestReplenishLocked()
+	}
+	var idle []*pooledWorker
+	var waiters []chan poolCheckoutResult
+	if open {
+		idle = append(idle, p.workers...)
+		p.workers = nil
+		waiters = p.waiters
+		p.waiters = nil
+		for _, w := range idle {
+			w.state = workerDead
+		}
+	}
+	p.mu.Unlock()
+	for _, waiter := range waiters {
+		waiter <- poolCheckoutResult{err: ErrCircuitOpen}
+	}
+	for _, w := range idle {
+		if w.transport != nil {
+			_ = w.transport.abort()
+		}
+	}
+}
+
+func (p *systemPool) requestReplenishLocked() {
+	if p.closed || p.circuitOpen || p.replenishFn == nil {
+		return
+	}
+	if !p.superStart {
+		p.superStart = true
+		go p.replenishSupervisor()
+	}
+	select {
+	case p.superSignal <- struct{}{}:
+	default:
+	}
+}
+
+func (p *systemPool) replenishSupervisor() {
+	defer close(p.superDone)
+	attempt := 0
+	for {
+		select {
+		case <-p.superCtx.Done():
+			return
+		case <-p.superSignal:
+		}
+		for {
+			p.mu.Lock()
+			desired := 1
+			if len(p.waiters) > 0 {
+				desired += p.maxOverflow
+			}
+			retired := p.pruneInvalidLocked(time.Now())
+			owned := len(p.workers) + p.active + p.starting
+			if p.closed || p.circuitOpen || p.replenishFn == nil || owned >= desired {
+				p.mu.Unlock()
+				abortTransports(retired)
+				attempt = 0
+				break
+			}
+			fn, generation := p.replenishFn, p.generation
+			attemptCtx, attemptCancel := context.WithCancel(p.superCtx)
+			p.attemptStop = attemptCancel
+			p.starting++
+			p.mu.Unlock()
+			abortTransports(retired)
+
+			nw, err := fn(attemptCtx, generation)
+			attemptCancel()
+			p.mu.Lock()
+			p.attemptStop = nil
+			if p.starting > 0 {
+				p.starting--
+			}
+			valid := err == nil && nw != nil && !p.closed && !p.circuitOpen && p.generation == generation && len(p.workers)+p.active < 1+p.maxOverflow
+			if valid {
+				nw.state = workerIdle
+				nw.generation = generation
+				p.workers = append(p.workers, nw)
+				retired = p.wakeLocked(time.Now())
+			}
+			if err != nil && p.failureFn != nil && !errors.Is(err, context.Canceled) {
+				p.failureFn(generation)
+			}
+			p.mu.Unlock()
+			abortTransports(retired)
+			if !valid && nw != nil && nw.transport != nil {
 				_ = nw.transport.abort()
+			}
+			if valid {
+				attempt = 0
+				continue
+			}
+			if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && p.superCtx.Err() != nil {
+				return
+			}
+			attempt++
+			delay := p.backoffBase << min(attempt-1, 8)
+			if delay > 30*time.Second {
+				delay = 30 * time.Second
+			}
+			// Deterministic per-generation jitter avoids synchronized restarts while
+			// keeping tests reproducible and bounded below the 30s cap.
+			jitter := time.Duration((p.generation+uint64(attempt*17))%21) * delay / 100
+			if delay+jitter > 30*time.Second {
+				delay = 30 * time.Second
+			} else {
+				delay += jitter
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-p.superCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
 			}
 		}
 	}
@@ -268,6 +401,11 @@ func (p *systemPool) gracefulDrain(generation uint64) <-chan struct{} {
 		return done
 	}
 	p.closed = true
+	p.superCancel()
+	if p.attemptStop != nil {
+		p.attemptStop()
+	}
+	superStarted := p.superStart
 	idle := append([]*pooledWorker(nil), p.workers...)
 	for _, w := range idle {
 		w.state = workerDead
@@ -276,6 +414,9 @@ func (p *systemPool) gracefulDrain(generation uint64) <-chan struct{} {
 	waiters := p.waiters
 	p.waiters = nil
 	p.mu.Unlock()
+	if superStarted {
+		<-p.superDone
+	}
 	for _, ch := range waiters {
 		ch <- poolCheckoutResult{err: errSystemPoolClosed}
 	}
@@ -283,6 +424,12 @@ func (p *systemPool) gracefulDrain(generation uint64) <-chan struct{} {
 		if w.transport != nil {
 			_ = w.transport.abort()
 		}
+	}
+	p.mu.Lock()
+	closeNow := p.active == 0
+	p.mu.Unlock()
+	if closeNow {
+		p.closeDrained()
 	}
 	return p.drained
 }
@@ -296,6 +443,11 @@ func (p *systemPool) abortClose(generation uint64) {
 		return
 	}
 	p.closed = true
+	p.superCancel()
+	if p.attemptStop != nil {
+		p.attemptStop()
+	}
+	superStarted := p.superStart
 	all := append([]*pooledWorker(nil), p.workers...)
 	for w := range p.leased {
 		w.state = workerDead
@@ -310,6 +462,9 @@ func (p *systemPool) abortClose(generation uint64) {
 	waiters := p.waiters
 	p.waiters = nil
 	p.mu.Unlock()
+	if superStarted {
+		<-p.superDone
+	}
 	for _, ch := range waiters {
 		ch <- poolCheckoutResult{err: errSystemPoolClosed}
 	}
@@ -318,11 +473,27 @@ func (p *systemPool) abortClose(generation uint64) {
 			_ = w.transport.abort()
 		}
 	}
+	p.closeDrained()
 }
 
-func (p *systemPool) wakeLocked() {
+func (p *systemPool) closeDrained() {
+	p.drainOnce.Do(func() { close(p.drained) })
+}
+
+func (p *systemPool) wakeLocked(now time.Time) []*systemWorkerTransport {
+	retired := p.pruneInvalidLocked(now)
+	if p.circuitOpen {
+		for _, w := range p.workers {
+			w.state = workerDead
+			if w.transport != nil {
+				retired = append(retired, w.transport)
+			}
+		}
+		p.workers = nil
+		return retired
+	}
 	if len(p.waiters) == 0 || len(p.workers) == 0 {
-		return
+		return retired
 	}
 	w := p.workers[0]
 	p.workers = p.workers[1:]
@@ -332,4 +503,34 @@ func (p *systemPool) wakeLocked() {
 	ch := p.waiters[0]
 	p.waiters = p.waiters[1:]
 	ch <- poolCheckoutResult{worker: w}
+	return retired
+}
+
+func (p *systemPool) pruneInvalidLocked(now time.Time) []*systemWorkerTransport {
+	kept := p.workers[:0]
+	var retired []*systemWorkerTransport
+	for _, w := range p.workers {
+		stderrViolation := w != nil && w.transport != nil && w.transport.stderrProtocolViolation()
+		if w == nil || w.state != workerIdle || w.generation != p.generation || w.uses >= p.maxUses || now.Sub(w.started) >= p.maxAge || stderrViolation {
+			if w != nil {
+				w.state = workerDead
+				if w.transport != nil {
+					retired = append(retired, w.transport)
+				}
+			}
+			continue
+		}
+		kept = append(kept, w)
+	}
+	p.workers = kept
+	if len(retired) > 0 {
+		p.requestReplenishLocked()
+	}
+	return retired
+}
+
+func abortTransports(transports []*systemWorkerTransport) {
+	for _, transport := range transports {
+		_ = transport.abort()
+	}
 }

@@ -2,8 +2,10 @@ package plugin
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,51 +27,98 @@ func validateInvokeReady(f stdioJSONV2Frame, generation uint64, invocation strin
 	return nil
 }
 
-func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse) (systemRunnerReply, error) {
+type v2InvokeOutcome struct {
+	Reply           systemRunnerReply
+	ResultSeen      bool
+	Reusable        bool
+	Retirement      error
+	Stderr          []byte
+	StderrTruncated bool
+}
+
+const v2StderrCompleteMarkerPrefix = "\x1eLATTICE_STDERR_V2_COMPLETE "
+
+func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse, budgets ...ResolvedInvokeBudget) (outcome v2InvokeOutcome, callErr error) {
 	if t == nil || t.stdin == nil || t.scanner == nil {
-		return systemRunnerReply{}, fmt.Errorf("worker transport unavailable")
+		return v2InvokeOutcome{}, fmt.Errorf("worker transport unavailable")
 	}
 	frame := stdioJSONV2Frame{Protocol: 2, Kind: "invoke", Generation: generation, InvocationID: invocation}
 	frame.Request, _ = json.Marshal(struct {
 		Action  string          `json:"action"`
 		Payload json.RawMessage `json:"payload,omitempty"`
 	}{req.Action, req.Payload})
+	stdoutLimit, hostCallLimit := HostMaxInvokeStdoutBytes, HostMaxInvokeHostCalls
+	stderrLimit := HostMaxInvokeStderrBytes
+	if len(budgets) > 0 {
+		if budgets[0].StdoutBytes > 0 {
+			stdoutLimit = budgets[0].StdoutBytes
+		}
+		hostCallLimit = budgets[0].HostCalls
+		if budgets[0].StderrBytes > 0 {
+			stderrLimit = budgets[0].StderrBytes
+		}
+	}
+	if t.stderrProtocolViolation() {
+		return v2InvokeOutcome{}, errors.New("raw stderr after prior completion marker")
+	}
+	t.beginStderr(stderrLimit, generation, invocation)
+	defer func() {
+		outcome.Stderr, outcome.StderrTruncated = t.endStderr()
+	}()
 	write := make(chan error, 1)
 	go func() { write <- json.NewEncoder(t.stdin).Encode(frame) }()
 	select {
 	case err := <-write:
 		if err != nil {
-			return systemRunnerReply{}, err
+			return v2InvokeOutcome{}, err
 		}
 	case <-ctx.Done():
 		_ = t.abort()
-		return systemRunnerReply{}, ctx.Err()
+		return v2InvokeOutcome{}, ctx.Err()
+	}
+	seenHostCalls := make(map[string]struct{})
+	stdoutConsumed := 0
+	consumeFrame := func(line []byte) error {
+		// Scanner strips the newline delimiter; count one byte per JSONL frame so
+		// signed stdout_bytes enforcement matches bytes emitted on the wire.
+		stdoutConsumed += len(line) + 1
+		if stdoutConsumed > stdoutLimit {
+			return fmt.Errorf("plugin exceeded stdout limit %d", stdoutLimit)
+		}
+		return nil
 	}
 	for {
 		var line []byte
 		fr, err := t.nextFrame(ctx)
 		if err != nil {
 			_ = t.abort()
-			return systemRunnerReply{}, err
+			return v2InvokeOutcome{}, err
 		}
 		line = fr
-		var f stdioJSONV2Frame
-		if err := decodeStrictV2(line, &f); err != nil {
-			return systemRunnerReply{}, err
+		if err := consumeFrame(line); err != nil {
+			return v2InvokeOutcome{}, err
+		}
+		f, err := decodeStdioJSONV2Frame(line, HostMaxInvokeStdoutBytes)
+		if err != nil {
+			return v2InvokeOutcome{}, err
 		}
 		if err := validateStdioJSONV2Frame(f, generation, invocation, ""); err != nil {
-			return systemRunnerReply{}, err
+			return v2InvokeOutcome{}, err
 		}
 		if f.Kind == "host_call" {
 			if host == nil || f.HostCallID == "" {
-				return systemRunnerReply{}, fmt.Errorf("invalid host call")
+				return v2InvokeOutcome{}, fmt.Errorf("invalid host call")
 			}
-			var call systemHostCall
-			if err := decodeStrictV2(f.HostCall, &call); err != nil {
-				return systemRunnerReply{}, err
+			if _, duplicate := seenHostCalls[f.HostCallID]; duplicate {
+				return v2InvokeOutcome{}, fmt.Errorf("duplicate host_call_id %q", f.HostCallID)
 			}
-			if call.ID != "" && call.ID != f.HostCallID {
-				return systemRunnerReply{}, fmt.Errorf("host call id mismatch")
+			if len(seenHostCalls) >= hostCallLimit {
+				return v2InvokeOutcome{}, fmt.Errorf("plugin exceeded host-call limit %d", hostCallLimit)
+			}
+			seenHostCalls[f.HostCallID] = struct{}{}
+			call, err := decodeStrictSystemHostCall(f.HostCall, f.HostCallID, HostMaxInvokeStdoutBytes)
+			if err != nil {
+				return v2InvokeOutcome{}, err
 			}
 			resp := host(call)
 			out := stdioJSONV2Frame{Protocol: 2, Kind: "host_response", Generation: generation, InvocationID: invocation, HostCallID: f.HostCallID}
@@ -79,43 +128,72 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 			select {
 			case err := <-writeResp:
 				if err != nil {
-					return systemRunnerReply{}, err
+					return v2InvokeOutcome{}, err
 				}
 			case <-ctx.Done():
 				_ = t.abort()
-				return systemRunnerReply{}, ctx.Err()
+				return v2InvokeOutcome{}, ctx.Err()
 			}
 			continue
 		}
 		if f.Kind == "invoke_ready" {
-			return systemRunnerReply{}, fmt.Errorf("invoke_ready before result")
+			return v2InvokeOutcome{}, fmt.Errorf("invoke_ready before result")
 		}
 		if f.Kind != "invoke_result" {
-			return systemRunnerReply{}, fmt.Errorf("unexpected v2 frame %q", f.Kind)
+			return v2InvokeOutcome{}, fmt.Errorf("unexpected v2 frame %q", f.Kind)
 		}
-		var reply systemRunnerReply
-		if err := json.Unmarshal(f.Response, &reply); err != nil {
-			return systemRunnerReply{}, err
+		reply, err := decodeSystemRunnerReply(f.Response, HostMaxInvokeStdoutBytes)
+		if err != nil {
+			return v2InvokeOutcome{}, err
 		}
 		if f.Kind == "invoke_result" {
+			if err := t.waitStderrMarker(ctx); err != nil {
+				_ = t.abort()
+				return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: fmt.Errorf("stderr completion marker: %w", err)}, nil
+			}
 			for {
 				var err error
 				line, err = t.nextFrame(ctx)
 				if err != nil {
 					// A valid result is still delivered once; readiness failure
 					// retires the worker but must not erase the result.
-					return reply, err
+					return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: err}, nil
 				}
-				var ready stdioJSONV2Frame
-				if err := decodeStrictV2(line, &ready); err != nil {
+				if err := consumeFrame(line); err != nil {
 					_ = t.abort()
-					return reply, err
+					return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: err}, nil
 				}
-				if err := validateInvokeReady(ready, generation, invocation); err == nil {
-					return reply, nil
+				complete, err := decodeStdioJSONV2Frame(line, HostMaxInvokeStdoutBytes)
+				if err != nil {
+					_ = t.abort()
+					return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: err}, nil
 				}
-				_ = t.abort()
-				return reply, fmt.Errorf("invalid invoke_ready")
+				if complete.Kind != "stderr_complete" || complete.Protocol != 2 || complete.Generation != generation || complete.InvocationID != invocation {
+					_ = t.abort()
+					return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: fmt.Errorf("invalid stderr_complete")}, nil
+				}
+				line, err = t.nextFrame(ctx)
+				if err != nil {
+					_ = t.abort()
+					return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: err}, nil
+				}
+				if err := consumeFrame(line); err != nil {
+					_ = t.abort()
+					return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: err}, nil
+				}
+				ready, err := decodeStdioJSONV2Frame(line, HostMaxInvokeStdoutBytes)
+				if err == nil {
+					err = validateInvokeReady(ready, generation, invocation)
+				}
+				if err != nil {
+					_ = t.abort()
+					return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: err}, nil
+				}
+				if t.stderrProtocolViolation() {
+					_ = t.abort()
+					return v2InvokeOutcome{Reply: reply, ResultSeen: true, Retirement: errors.New("raw stderr after completion marker")}, nil
+				}
+				return v2InvokeOutcome{Reply: reply, ResultSeen: true, Reusable: true}, nil
 			}
 		}
 	}
@@ -124,20 +202,142 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 // systemWorkerTransport owns one persistent worker process and all descriptors.
 // It is intentionally independent of the evolving SDK session API.
 type systemWorkerTransport struct {
-	cmd       *exec.Cmd
-	stdin     *os.File
-	stdout    *os.File
-	hostResp  *os.File
-	stderr    *os.File
-	pgid      int
-	scanner   *bufio.Scanner
-	frames    chan transportFrame
-	done      chan struct{}
-	waitDone  chan struct{}
-	waitMu    sync.Mutex
-	waitErr   error
-	abortOnce sync.Once
-	abortErr  error
+	cmd              *exec.Cmd
+	stdin            *os.File
+	stdout           *os.File
+	hostResp         *os.File
+	stderr           *os.File
+	pgid             int
+	scanner          *bufio.Scanner
+	frames           chan transportFrame
+	done             chan struct{}
+	waitDone         chan struct{}
+	readDone         chan struct{}
+	waitMu           sync.Mutex
+	waitErr          error
+	abortOnce        sync.Once
+	abortErr         error
+	stderrMu         sync.Mutex
+	stderrData       []byte
+	stderrTruncated  bool
+	stderrActive     bool
+	stderrLimit      int
+	stderrDone       chan struct{}
+	stderrMarker     string
+	stderrMarkerSeen chan struct{}
+	stderrScan       []byte
+	stderrMatched    bool
+	stderrViolation  bool
+}
+
+func (t *systemWorkerTransport) drainStderr() {
+	defer close(t.stderrDone)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := t.stderr.Read(buf)
+		if n > 0 {
+			t.stderrMu.Lock()
+			t.stderrScan = append(t.stderrScan, buf[:n]...)
+			t.processStderrLocked()
+			t.stderrMu.Unlock()
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (t *systemWorkerTransport) processStderrLocked() {
+	if !t.stderrActive || t.stderrMatched {
+		if t.stderrMatched && len(t.stderrScan) > 0 {
+			t.stderrViolation = true
+		}
+		t.stderrScan = t.stderrScan[:0]
+		return
+	}
+	marker := []byte(t.stderrMarker)
+	if index := bytes.Index(t.stderrScan, marker); index >= 0 {
+		t.captureStderrLocked(t.stderrScan[:index])
+		if index+len(marker) < len(t.stderrScan) {
+			t.stderrViolation = true
+		}
+		t.stderrScan = t.stderrScan[:0]
+		t.stderrMatched = true
+		select {
+		case t.stderrMarkerSeen <- struct{}{}:
+		default:
+		}
+		return
+	}
+	keep := len(marker) - 1
+	if keep < 0 {
+		keep = 0
+	}
+	if len(t.stderrScan) > keep {
+		flush := len(t.stderrScan) - keep
+		t.captureStderrLocked(t.stderrScan[:flush])
+		t.stderrScan = append(t.stderrScan[:0], t.stderrScan[flush:]...)
+	}
+}
+
+func (t *systemWorkerTransport) captureStderrLocked(data []byte) {
+	if !t.stderrActive {
+		return
+	}
+	remaining := t.stderrLimit - len(t.stderrData)
+	if remaining > 0 {
+		take := min(remaining, len(data))
+		t.stderrData = append(t.stderrData, data[:take]...)
+	}
+	if len(data) > remaining {
+		t.stderrTruncated = true
+	}
+}
+
+func (t *systemWorkerTransport) beginStderr(limit int, generation uint64, invocation string) {
+	t.stderrMu.Lock()
+	t.stderrLimit = limit
+	t.stderrData = t.stderrData[:0]
+	t.stderrTruncated = false
+	t.stderrActive = true
+	t.stderrMarker = fmt.Sprintf("%s%d %s\n", v2StderrCompleteMarkerPrefix, generation, invocation)
+	t.stderrMarkerSeen = make(chan struct{}, 1)
+	t.stderrScan = t.stderrScan[:0]
+	t.stderrMatched = false
+	t.stderrMu.Unlock()
+}
+
+func (t *systemWorkerTransport) waitStderrMarker(ctx context.Context) error {
+	t.stderrMu.Lock()
+	markerSeen := t.stderrMarkerSeen
+	t.stderrMu.Unlock()
+	select {
+	case <-markerSeen:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.stderrDone:
+		t.stderrMu.Lock()
+		matched := t.stderrMatched
+		t.stderrMu.Unlock()
+		if matched {
+			return nil
+		}
+		return io.ErrUnexpectedEOF
+	}
+}
+
+func (t *systemWorkerTransport) endStderr() ([]byte, bool) {
+	t.stderrMu.Lock()
+	defer t.stderrMu.Unlock()
+	t.stderrActive = false
+	return append([]byte(nil), t.stderrData...), t.stderrTruncated
+}
+
+func (t *systemWorkerTransport) stderrProtocolViolation() bool {
+	t.stderrMu.Lock()
+	defer t.stderrMu.Unlock()
+	return t.stderrViolation
 }
 
 func (t *systemWorkerTransport) nextFrame(ctx context.Context) ([]byte, error) {
@@ -152,6 +352,7 @@ func (t *systemWorkerTransport) nextFrame(ctx context.Context) ([]byte, error) {
 	}
 }
 func (t *systemWorkerTransport) readPump() {
+	defer close(t.readDone)
 	for t.scanner.Scan() {
 		select {
 		case t.frames <- transportFrame{line: append([]byte(nil), t.scanner.Bytes()...)}:
@@ -198,8 +399,8 @@ func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 	if err != nil {
 		return fmt.Errorf("worker exited before runtime_ready")
 	}
-	var f stdioJSONV2Frame
-	if err := decodeStrictV2(line, &f); err != nil {
+	f, err := decodeStdioJSONV2Frame(line)
+	if err != nil {
 		return fmt.Errorf("decode runtime_ready: %w", err)
 	}
 	if f.Kind != "runtime_ready" {
@@ -217,8 +418,8 @@ func (t *systemWorkerTransport) awaitReadyContext(ctx context.Context, generatio
 		_ = t.abort()
 		return err
 	}
-	var f stdioJSONV2Frame
-	if err := decodeStrictV2(line, &f); err != nil {
+	f, err := decodeStdioJSONV2Frame(line)
+	if err != nil {
 		_ = t.abort()
 		return err
 	}
@@ -237,36 +438,58 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	in, err := cmd.StdinPipe()
+	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
-	out, err := cmd.StdoutPipe()
+	stdoutR, stdoutW, err := os.Pipe()
 	if err != nil {
-		_ = in.Close()
+		_ = stdinR.Close()
+		_ = stdinW.Close()
 		return nil, err
 	}
-	errout, err := cmd.StderrPipe()
+	stderrR, stderrW, err := os.Pipe()
 	if err != nil {
-		_ = in.Close()
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
 		return nil, err
 	}
+	cmd.Stdin = stdinR
+	cmd.Stdout = stdoutW
+	cmd.Stderr = stderrW
 	hostRead, hostWrite, err := os.Pipe()
 	if err != nil {
-		_ = in.Close()
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		return nil, err
 	}
 	cmd.ExtraFiles = []*os.File{hostRead}
 	if err := cmd.Start(); err != nil {
 		_ = hostRead.Close()
 		_ = hostWrite.Close()
+		_ = stdinR.Close()
+		_ = stdinW.Close()
+		_ = stdoutR.Close()
+		_ = stdoutW.Close()
+		_ = stderrR.Close()
+		_ = stderrW.Close()
 		return nil, err
 	}
+	_ = stdinR.Close()
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
 	_ = hostRead.Close()
-	t := &systemWorkerTransport{cmd: cmd, stdin: in.(*os.File), stdout: out.(*os.File), hostResp: hostWrite, stderr: errout.(*os.File), pgid: cmd.Process.Pid, scanner: bufio.NewScanner(out), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{})}
+	t := &systemWorkerTransport{cmd: cmd, stdin: stdinW, stdout: stdoutR, hostResp: hostWrite, stderr: stderrR, pgid: cmd.Process.Pid, scanner: bufio.NewScanner(stdoutR), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{}), readDone: make(chan struct{}), stderrDone: make(chan struct{})}
 	go func() { err := cmd.Wait(); t.waitMu.Lock(); t.waitErr = err; t.waitMu.Unlock(); close(t.waitDone) }()
-	t.scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	t.scanner.Buffer(make([]byte, 64*1024), HostMaxInvokeStdoutBytes+64*1024)
 	go t.readPump()
+	go t.drainStderr()
 	return t, nil
 }
 
@@ -291,6 +514,8 @@ func (t *systemWorkerTransport) abort() error {
 			t.waitMu.Unlock()
 		}
 		t.closePipes()
+		<-t.readDone
+		<-t.stderrDone
 	})
 	return t.abortErr
 }
@@ -300,6 +525,9 @@ func (t *systemWorkerTransport) wait() error {
 		return nil
 	}
 	<-t.waitDone
+	<-t.readDone
+	<-t.stderrDone
+	t.closePipes()
 	t.waitMu.Lock()
 	defer t.waitMu.Unlock()
 	return t.waitErr

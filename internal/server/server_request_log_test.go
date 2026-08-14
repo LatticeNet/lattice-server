@@ -52,6 +52,11 @@ func TestRequestLogRedactsPublicSubscriptionAuthority(t *testing.T) {
 			wantStatus: http.StatusTemporaryRedirect,
 		},
 		{
+			name:       "escaped segment before dot segments",
+			path:       "/x%2Fy/../sub/escaped-slug-canary/escaped-token-canary-0123456789",
+			wantStatus: http.StatusTemporaryRedirect,
+		},
+		{
 			name:       "repeated slashes",
 			path:       "//sub/slash-slug-canary/slash-token-canary-012345678901",
 			wantStatus: http.StatusTemporaryRedirect,
@@ -89,6 +94,7 @@ func TestRequestLogRedactsPublicSubscriptionAuthority(t *testing.T) {
 	for _, canary := range []string{
 		"canonical-slug-canary", "canonical-token-canary",
 		"dot-slug-canary", "dot-token-canary",
+		"escaped-slug-canary", "escaped-token-canary",
 		"slash-slug-canary", "slash-token-canary",
 		"raw-token-canary",
 	} {
@@ -100,8 +106,9 @@ func TestRequestLogRedactsPublicSubscriptionAuthority(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		`path="/sub/:token",status_class="3xx"} 3`,
-		`path="/sub/:token",status_class="4xx"} 1`,
+		`lattice_http_requests_total{path="/sub/:token",status_class="3xx"} 4`,
+		`lattice_http_requests_total{path="/sub/:token",status_class="4xx"} 1`,
+		`lattice_http_slow_requests_total{path="/sub/:token"} 5`,
 	} {
 		if !strings.Contains(metrics, want) {
 			t.Fatalf("subscription telemetry lost route/status observation %q: %s", want, metrics)

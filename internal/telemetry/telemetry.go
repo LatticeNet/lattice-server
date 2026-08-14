@@ -2,6 +2,8 @@ package telemetry
 
 import (
 	"fmt"
+	"net/http"
+	"net/url"
 	pathpkg "path"
 	"sort"
 	"strings"
@@ -10,6 +12,8 @@ import (
 )
 
 var defaultRegistry = NewRegistry()
+
+const RedactedSubscriptionPath = "/sub/:token"
 
 type Registry struct {
 	mu       sync.Mutex
@@ -88,9 +92,28 @@ func CurrentSnapshot() Snapshot {
 // receives.
 func RedactSubscriptionPath(value string) string {
 	if isSubscriptionPath(value) || isSubscriptionPath(pathpkg.Clean(value)) {
-		return "/sub/:token"
+		return RedactedSubscriptionPath
 	}
 	return value
+}
+
+// RequestPathForObservability returns one request path safe for logs and
+// telemetry without modifying the URL used for routing. ServeMux cleans the
+// escaped path before matching, so an encoded slash can make URL.Path and the
+// effective redirect target resolve differently.
+func RequestPathForObservability(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	if value := RedactSubscriptionPath(r.URL.Path); value == RedactedSubscriptionPath {
+		return value
+	}
+
+	effective, err := url.PathUnescape(pathpkg.Clean(r.URL.EscapedPath()))
+	if err == nil && isSubscriptionPath(effective) {
+		return RedactedSubscriptionPath
+	}
+	return r.URL.Path
 }
 
 func (r *Registry) ObserveStoreSave(d time.Duration, err error) {
@@ -301,8 +324,8 @@ func statusClass(status int) string {
 func normalizePath(value string) string {
 	value = RedactSubscriptionPath(value)
 	switch {
-	case value == "/sub/:token":
-		return "/sub/:token"
+	case value == RedactedSubscriptionPath:
+		return RedactedSubscriptionPath
 	case strings.HasPrefix(value, "/api/agent/terminal/sessions/"):
 		return "/api/agent/terminal/sessions/:id/:action"
 	case strings.HasPrefix(value, "/api/terminal/sessions/"):

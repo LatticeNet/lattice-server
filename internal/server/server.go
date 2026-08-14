@@ -7014,11 +7014,12 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 	slow := time.Duration(slowMS) * time.Millisecond
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		observabilityPath := telemetry.RequestPathForObservability(r)
 		lw := &logResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(lw, r)
 		dur := time.Since(start)
 		slowRequest := dur >= slow
-		telemetry.ObserveHTTPRequest(r.URL.Path, lw.status, dur, slowRequest)
+		telemetry.ObserveHTTPRequest(observabilityPath, lw.status, dur, slowRequest)
 		if !logAll && dur < slow && lw.status < 500 {
 			return
 		}
@@ -7027,16 +7028,12 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 			tag = "SLOW request"
 		}
 		s.logger.Printf("%s: %s %s -> %d %dB %s (ip=%s id=%s)",
-			tag, r.Method, requestLogPath(r.URL.Path), lw.status, lw.bytes,
+			tag, r.Method, observabilityPath, lw.status, lw.bytes,
 			dur.Round(time.Millisecond), s.clientIP(r), requestIDFromRequest(r))
 	})
 }
 
-const redactedSubscriptionRequestLogPath = "/sub/:token"
-
-func requestLogPath(path string) string {
-	return telemetry.RedactSubscriptionPath(path)
-}
+const redactedSubscriptionRequestLogPath = telemetry.RedactedSubscriptionPath
 
 // recordAudit writes an audit event and, unlike a bare best-effort call, logs
 // when the sink fails so audit gaps are visible instead of silent.

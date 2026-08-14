@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -150,12 +151,15 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 			if diagnosticChunks > maxV2DiagnosticChunks || diagnosticWireConsumed > maxV2DiagnosticWireBytes {
 				return v2InvokeOutcome{}, fmt.Errorf("plugin exceeded diagnostic frame limit")
 			}
-			if len(f.Data) > base64.StdEncoding.EncodedLen(HostMaxInvokeStderrBytes) || base64.StdEncoding.DecodedLen(len(f.Data)) > HostMaxInvokeStderrBytes {
+			if len(f.Data) > base64.StdEncoding.EncodedLen(HostMaxInvokeStderrBytes) {
 				return v2InvokeOutcome{}, fmt.Errorf("stderr_chunk exceeds host maximum")
 			}
 			chunk, err := base64.StdEncoding.DecodeString(f.Data)
 			if err != nil {
 				return v2InvokeOutcome{}, fmt.Errorf("invalid stderr_chunk data")
+			}
+			if base64.StdEncoding.EncodeToString(chunk) != f.Data {
+				return v2InvokeOutcome{}, fmt.Errorf("non-canonical stderr_chunk data")
 			}
 			if len(chunk) > HostMaxInvokeStderrBytes-diagnosticDecodedTotal {
 				return v2InvokeOutcome{}, fmt.Errorf("plugin exceeded diagnostic decoded limit %d", HostMaxInvokeStderrBytes)
@@ -237,6 +241,9 @@ type systemWorkerTransport struct {
 	waitErr        error
 	abortOnce      sync.Once
 	abortErr       error
+	groupOnce      sync.Once
+	groupDone      chan struct{}
+	groupErr       error
 	stderrDone     chan struct{}
 	rawStderrBytes atomic.Int64
 }
@@ -406,7 +413,7 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 	_ = hostRead.Close()
-	t := &systemWorkerTransport{cmd: cmd, stdin: stdinW, stdout: stdoutR, hostResp: hostWrite, stderr: stderrR, pgid: cmd.Process.Pid, scanner: bufio.NewScanner(stdoutR), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{}), readDone: make(chan struct{}), stderrDone: make(chan struct{})}
+	t := &systemWorkerTransport{cmd: cmd, stdin: stdinW, stdout: stdoutR, hostResp: hostWrite, stderr: stderrR, pgid: cmd.Process.Pid, scanner: bufio.NewScanner(stdoutR), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{}), readDone: make(chan struct{}), stderrDone: make(chan struct{}), groupDone: make(chan struct{})}
 	go func() { err := cmd.Wait(); t.waitMu.Lock(); t.waitErr = err; t.waitMu.Unlock(); close(t.waitDone) }()
 	t.scanner.Buffer(make([]byte, 64*1024), maxV2WireFrameBytes)
 	go t.readPump()
@@ -420,20 +427,11 @@ func (t *systemWorkerTransport) abort() error {
 	}
 	t.abortOnce.Do(func() {
 		close(t.done)
-		_ = syscall.Kill(-t.pgid, syscall.SIGTERM)
-		done := t.waitDone
-		select {
-		case <-done:
-			t.waitMu.Lock()
-			t.abortErr = t.waitErr
-			t.waitMu.Unlock()
-		case <-time.After(100 * time.Millisecond):
-			_ = syscall.Kill(-t.pgid, syscall.SIGKILL)
-			<-done
-			t.waitMu.Lock()
-			t.abortErr = t.waitErr
-			t.waitMu.Unlock()
-		}
+		groupErr := t.reapProcessGroup()
+		<-t.waitDone
+		t.waitMu.Lock()
+		t.abortErr = errors.Join(t.waitErr, groupErr)
+		t.waitMu.Unlock()
 		t.closePipes()
 		<-t.readDone
 		<-t.stderrDone
@@ -441,11 +439,23 @@ func (t *systemWorkerTransport) abort() error {
 	return t.abortErr
 }
 
+func (t *systemWorkerTransport) reapProcessGroup() error {
+	t.groupOnce.Do(func() {
+		t.groupErr = terminateProcessGroup(t.pgid, 100*time.Millisecond)
+		close(t.groupDone)
+	})
+	<-t.groupDone
+	return t.groupErr
+}
+
 func (t *systemWorkerTransport) wait() error {
 	if t == nil || t.cmd == nil {
 		return nil
 	}
 	<-t.waitDone
+	if processGroupExists(t.pgid) {
+		_ = t.reapProcessGroup()
+	}
 	<-t.readDone
 	<-t.stderrDone
 	t.closePipes()

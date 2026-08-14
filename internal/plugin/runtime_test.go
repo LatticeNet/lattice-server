@@ -130,6 +130,29 @@ func TestRuntimeManagerRejectsUnsafeNontransactionalReplacement(t *testing.T) {
 	}
 }
 
+func TestRuntimeManagerRejectsTransactionalCandidateOverNontransactionalOld(t *testing.T) {
+	oldRunner := &recordingRunner{name: "legacy-old"}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: oldRunner}})
+	loaded := testRuntimeLoaded("mixed-replace.bundle")
+	if _, err := m.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+	newRunner := newTransactionalTestRunner()
+	m.mu.Lock()
+	m.runners[TypeSystem] = newRunner
+	m.mu.Unlock()
+	status, err := m.Start(context.Background(), loaded)
+	if err == nil || status.State != RuntimeStateArmed {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	newRunner.mu.Lock()
+	prepared := len(newRunner.prepared)
+	newRunner.mu.Unlock()
+	if prepared != 0 {
+		t.Fatalf("candidate prepared before old-runner retirement safety check: %d", prepared)
+	}
+}
+
 func TestRuntimeManagerRecordsFailedHealthWhenRunnerStartFails(t *testing.T) {
 	runner := &recordingRunner{name: "broken", startErr: errors.New("runner refused")}
 	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{
@@ -284,6 +307,24 @@ func TestRuntimeManagerPinsGenerationBeforeReplacementRetiresIt(t *testing.T) {
 	}
 }
 
+func TestRuntimeManagerSurfacesPriorGenerationRetirementFailure(t *testing.T) {
+	runner := newTransactionalTestRunner()
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: runner}})
+	loaded := testRuntimeLoaded("retire-fail.bundle")
+	if _, err := m.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+	runner.retireErr = errors.New("old generation stuck")
+	status, err := m.Start(context.Background(), loaded)
+	if err == nil || status.State != RuntimeStateArmed || !strings.Contains(status.Message, "retirement degraded") {
+		t.Fatalf("status=%+v err=%v", status, err)
+	}
+	stored, ok := m.Status(loaded.Manifest.ID)
+	if !ok || stored.State != RuntimeStateArmed || !strings.Contains(stored.Message, "retirement degraded") {
+		t.Fatalf("stored=%+v ok=%v", stored, ok)
+	}
+}
+
 func TestRuntimeManagerCloseWaitsPendingPrepareAndIsIdempotent(t *testing.T) {
 	runner := newTransactionalTestRunner()
 	runner.blockPrepare = make(chan struct{})
@@ -402,6 +443,7 @@ type transactionalTestRunner struct {
 	blockInvoke    chan struct{}
 	invokeEntered  chan struct{}
 	retireEntered  chan struct{}
+	retireErr      error
 }
 
 func newTransactionalTestRunner() *transactionalTestRunner {
@@ -480,10 +522,10 @@ func (r *transactionalTestRunner) RetireGeneration(_ context.Context, _ string, 
 		r.retireDone[generation] = done
 		r.mu.Unlock()
 		<-done
-		return nil
+		return r.retireErr
 	}
 	r.mu.Unlock()
-	return nil
+	return r.retireErr
 }
 func (r *transactionalTestRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 	r.mu.Lock()
@@ -676,6 +718,37 @@ func (r *failStopRunner) Stop(ctx context.Context, req RunnerStopRequest) error 
 type blockingStopRunner struct {
 	stopEntered chan struct{}
 	releaseStop chan struct{}
+}
+
+type noncooperativeStopRunner struct{ release chan struct{} }
+
+func (r *noncooperativeStopRunner) Name() string { return "noncooperative" }
+func (r *noncooperativeStopRunner) Start(context.Context, RunnerStartRequest) (RunnerStartResult, error) {
+	return RunnerStartResult{Message: "armed"}, nil
+}
+func (r *noncooperativeStopRunner) Stop(context.Context, RunnerStopRequest) error {
+	<-r.release
+	return nil
+}
+
+func TestRuntimeManagerStopIsBoundedWhenRunnerIgnoresContext(t *testing.T) {
+	runner := &noncooperativeStopRunner{release: make(chan struct{})}
+	m := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: runner}, StartTimeout: 20 * time.Millisecond})
+	loaded := testRuntimeLoaded("noncooperative.bundle")
+	if _, err := m.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := m.Stop(loaded.Manifest.ID, "disable"); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Stop error=%v want deadline", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop waited for noncooperative runner")
+	}
+	close(runner.release)
 }
 
 func (r *blockingStopRunner) Name() string {

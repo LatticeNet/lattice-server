@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -94,6 +96,29 @@ func TestTransportWaitOrders(t *testing.T) {
 	_ = b.abort()
 }
 
+func TestV2AbortKillsIgnoreTermDescendantProcessGroup(t *testing.T) {
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "descendant.pid")
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_DESCENDANT_PID="+pidFile)
+	tr, err := startSystemWorker(t.Context(), os.Args[0], dir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	descendant := waitForPIDFile(t, pidFile)
+	pgid := tr.pgid
+	if err := tr.abort(); err == nil {
+		// SIGTERM/SIGKILL commonly makes the leader's Wait report a signal. The
+		// important contract is extinction of the complete process group.
+	}
+	assertPIDGone(t, descendant)
+	if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("v2 process group %d survived abort: %v", pgid, err)
+	}
+}
+
 func TestRealV2MalformedReadyPreservesReply(t *testing.T) {
 	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_BAD_READY=1")
 	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
@@ -121,6 +146,17 @@ func runV2Helper() {
 			os.Exit(6)
 		}
 		generation = parsed
+	}
+	if pidFile := os.Getenv("LATTICE_TEST_V2_DESCENDANT_PID"); pidFile != "" {
+		child := exec.Command("/bin/sh", "-c", `trap '' TERM; while :; do sleep 1; done`)
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(7)
+		}
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+			os.Exit(8)
+		}
 	}
 	if _, err := fmt.Fprintf(os.Stdout, `{"protocol":2,"kind":"runtime_ready","generation":%d,"invocation_id":"runtime","features":["stderr_frames_v1"]}
 `, generation); err != nil {
@@ -178,7 +214,7 @@ func runV2Helper() {
 				_, _ = br.ReadBytes('\n')
 			}
 			if os.Getenv("LATTICE_TEST_V2_STALL") == "1" {
-				select {}
+				time.Sleep(30 * time.Second)
 			}
 		}
 		if os.Getenv("LATTICE_TEST_V2_NO_READY") == "1" {
@@ -253,6 +289,13 @@ func runV2Helper() {
 			for _, chunk := range []string{first, strings.Repeat("b", secondLen)} {
 				_ = enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_chunk", Generation: f.Generation, InvocationID: f.InvocationID, Data: base64.StdEncoding.EncodeToString([]byte(chunk))})
 			}
+		}
+		if mode := os.Getenv("LATTICE_TEST_V2_STDERR_SINGLE"); mode != "" {
+			size := HostMaxInvokeStderrBytes
+			if mode == "over" {
+				size++
+			}
+			_ = enc.Encode(stdioJSONV2Frame{Protocol: 2, Kind: "stderr_chunk", Generation: f.Generation, InvocationID: f.InvocationID, Data: base64.StdEncoding.EncodeToString([]byte(strings.Repeat("s", size)))})
 		}
 		if raw := os.Getenv("LATTICE_TEST_V2_RAW_STDERR"); raw != "" {
 			_, _ = io.WriteString(os.Stderr, raw)

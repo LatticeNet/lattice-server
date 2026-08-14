@@ -94,3 +94,13 @@ func TestServeUntilContextDoesNotWaitForNonreturningServe(t *testing.T) {
 	}
 	close(release)
 }
+
+func TestParseEnvAllowlistRejectsReservedRuntimeVariables(t *testing.T) {
+	for _, name := range []string{"LATTICE_RUNTIME_PROTOCOL", "LATTICE_RUNTIME_GENERATION", "LATTICE_HOST_RESPONSE_FD"} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseEnvAllowlist(name); err == nil {
+				t.Fatalf("reserved variable %s was accepted", name)
+			}
+		})
+	}
+}

@@ -57,6 +57,11 @@ type systemPool struct {
 	backoffBase time.Duration
 	jitterFn    func(time.Duration) time.Duration
 	waitBackoff func(context.Context, time.Duration) bool
+	// Test-only ownership boundary hook for cancellation-vs-wake reconciliation.
+	beforeCancelReconcile func()
+	// Test-only result-arm hook for cancellation after assignment but before the
+	// lease is returned to a caller for dispatch.
+	beforeResultReturn func()
 }
 
 type poolCheckoutResult struct {
@@ -193,8 +198,20 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 		abortTransports(retired)
 		select {
 		case res := <-ch:
+			if p.beforeResultReturn != nil {
+				p.beforeResultReturn()
+			}
+			if err := ctx.Err(); err != nil {
+				if res.worker != nil {
+					p.returnUnused(res.worker, time.Now())
+				}
+				return nil, err
+			}
 			return res.worker, res.err
 		case <-ctx.Done():
+			if p.beforeCancelReconcile != nil {
+				p.beforeCancelReconcile()
+			}
 			p.mu.Lock()
 			removed := false
 			for i, waiter := range p.waiters {
@@ -210,7 +227,7 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 				// reconcile synchronously so a lease can never be lost.
 				res := <-ch
 				if res.worker != nil {
-					p.release(res.worker, false, time.Now())
+					p.returnUnused(res.worker, time.Now())
 				}
 			}
 			return nil, ctx.Err()
@@ -219,10 +236,20 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 }
 
 func (p *systemPool) release(w *pooledWorker, resultSeen bool, now time.Time) {
+	p.finishLease(w, resultSeen, true, now)
+}
+
+func (p *systemPool) returnUnused(w *pooledWorker, now time.Time) {
+	p.finishLease(w, false, false, now)
+}
+
+func (p *systemPool) finishLease(w *pooledWorker, resultSeen, used bool, now time.Time) {
 	var abort *systemWorkerTransport
 	closeDrained := false
 	p.mu.Lock()
-	w.uses++
+	if used {
+		w.uses++
+	}
 	if p.active > 0 {
 		p.active--
 	}
@@ -368,7 +395,6 @@ func (p *systemPool) replenishSupervisor() {
 			if valid {
 				nw.state = workerIdle
 				nw.generation = generation
-				p.workers = append(p.workers, nw)
 			}
 			failureFn, successFn := p.failureFn, p.successFn
 			recordFailure := err != nil && failureFn != nil && !errors.Is(err, context.Canceled)
@@ -382,7 +408,11 @@ func (p *systemPool) replenishSupervisor() {
 					successFn(generation)
 				}
 				p.mu.Lock()
-				retired = append(retired, p.wakeLocked(time.Now())...)
+				valid = !p.closed && !p.circuitOpen && p.generation == generation && len(p.workers)+p.active < 1+p.maxOverflow
+				if valid {
+					p.workers = append(p.workers, nw)
+					retired = append(retired, p.wakeLocked(time.Now())...)
+				}
 				p.mu.Unlock()
 			}
 			abortTransports(retired)

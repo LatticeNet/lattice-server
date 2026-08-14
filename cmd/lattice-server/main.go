@@ -357,6 +357,9 @@ func parseEnvAllowlist(raw string) ([]string, error) {
 		if !validEnvName(name) {
 			return nil, fmt.Errorf("invalid -plugin-runtime-env variable name %q", name)
 		}
+		if isReservedPluginRuntimeEnv(name) {
+			return nil, fmt.Errorf("reserved -plugin-runtime-env variable name %q", name)
+		}
 		if _, ok := seen[name]; ok {
 			continue
 		}
@@ -364,6 +367,15 @@ func parseEnvAllowlist(raw string) ([]string, error) {
 		out = append(out, name)
 	}
 	return out, nil
+}
+
+func isReservedPluginRuntimeEnv(name string) bool {
+	switch name {
+	case "LATTICE_RUNTIME_PROTOCOL", "LATTICE_RUNTIME_GENERATION", "LATTICE_HOST_RESPONSE_FD":
+		return true
+	default:
+		return false
+	}
 }
 
 func validEnvName(name string) bool {

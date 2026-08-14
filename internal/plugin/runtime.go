@@ -211,7 +211,9 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 		return RuntimeStatus{}, errors.New("runtime manager is closed")
 	}
 	if current, ok := m.instances[loaded.Manifest.ID]; ok && current.status.State == RuntimeStateArmed {
-		if _, transactional := runner.(TransactionalRunner); !transactional {
+		_, newTransactional := runner.(TransactionalRunner)
+		_, oldTransactional := current.runner.(TransactionalRunner)
+		if !newTransactional || !oldTransactional {
 			m.mu.Unlock()
 			broker.authority.revoke()
 			return current.status, errors.New("runtime replacement requires a transactional runner")
@@ -319,8 +321,20 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 	if currentOK && old.runner != nil && old.generation != generation {
 		if oldTransactional, ok := old.runner.(TransactionalRunner); ok {
 			retireCtx, retireCancel := context.WithTimeout(context.Background(), m.timeout)
-			_ = oldTransactional.RetireGeneration(retireCtx, loaded.Manifest.ID, old.generation)
+			retireErr := oldTransactional.RetireGeneration(retireCtx, loaded.Manifest.ID, old.generation)
 			retireCancel()
+			if retireErr != nil {
+				m.mu.Lock()
+				current := m.instances[loaded.Manifest.ID]
+				if current.generation == generation {
+					current.status.Message = fmt.Sprintf("%s; prior generation retirement degraded: %v", current.status.Message, retireErr)
+					current.status.UpdatedAt = time.Now().UTC()
+					m.instances[loaded.Manifest.ID] = current
+					status = current.status
+				}
+				m.mu.Unlock()
+				return status, fmt.Errorf("runtime generation %d armed but prior generation %d retirement failed: %w", generation, old.generation, retireErr)
+			}
 		}
 	}
 	return status, nil
@@ -379,7 +393,22 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 			}
 			authorityDone <- nil
 		}()
-		err := errors.Join(<-runnerDone, <-authorityDone)
+		var runnerErr, authorityErr error
+		remaining := 2
+		for remaining > 0 {
+			select {
+			case runnerErr = <-runnerDone:
+				runnerDone = nil
+				remaining--
+			case authorityErr = <-authorityDone:
+				authorityDone = nil
+				remaining--
+			case <-ctx.Done():
+				runnerErr = errors.Join(runnerErr, ctx.Err())
+				remaining = 0
+			}
+		}
+		err := errors.Join(runnerErr, authorityErr)
 		cancel()
 		if err != nil {
 			m.mu.Lock()

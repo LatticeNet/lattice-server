@@ -410,8 +410,9 @@ func TestSystemRunnerV2RawStderrIsProcessTelemetryOnly(t *testing.T) {
 			t.Fatalf("invoke %d response=%+v err=%v", i, resp, err)
 		}
 	}
-	if got := tr.rawStderrBytes.Load(); got <= 0 || got > HostMaxInvokeStderrBytes {
-		t.Fatalf("bounded raw stderr counter=%d", got)
+	pool.abortClose(1)
+	if got, want := tr.rawStderrBytes.Load(), int64(2*len(strings.Repeat("secret", 16<<10))); got != want {
+		t.Fatalf("bounded raw stderr counter=%d want=%d", got, want)
 	}
 }
 
@@ -464,6 +465,30 @@ func TestSystemRunnerV2EnforcesCumulativeDecodedDiagnosticCeiling(t *testing.T) 
 				assertProcessGroupGone(t, tr.pgid)
 				pool.abortClose(1)
 			}
+		})
+	}
+}
+
+func TestSystemRunnerV2EnforcesSingleDiagnosticChunkBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		mode   string
+		wantOK bool
+	}{{mode: "exact", wantOK: true}, {mode: "over"}} {
+		t.Run(tc.mode, func(t *testing.T) {
+			tr := startReadyTestWorker(t, "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_STDERR_SINGLE="+tc.mode)
+			pool := newSystemPool(256, time.Hour, 1)
+			if err := pool.publishTransport(1, tr, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := runnerWithPool(pool, nil).Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Action: tc.mode})
+			if tc.wantOK {
+				if err != nil || !resp.OK {
+					t.Fatalf("response=%+v err=%v", resp, err)
+				}
+			} else if err == nil {
+				t.Fatalf("response=%+v err=%v", resp, err)
+			}
+			pool.abortClose(1)
 		})
 	}
 }
@@ -628,6 +653,109 @@ func TestSystemRunnerPoolCancellationAtObservedHostCallReaps(t *testing.T) {
 	assertProcessGroupGone(t, badPID)
 }
 
+func TestSystemRunnerCallerCancellationDoesNotOpenCircuit(t *testing.T) {
+	pool := newSystemPool(256, time.Hour, 1)
+	spawn := readyTestSpawner(t, "LATTICE_TEST_V2_HOST=1", "LATTICE_TEST_V2_STALL=1")
+	pool.replenishFn = func(ctx context.Context, generation uint64) (*pooledWorker, error) {
+		tr, err := spawn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &pooledWorker{generation: generation, started: time.Now(), transport: tr}, nil
+	}
+	first, err := pool.replenishFn(t.Context(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.publishTransport(1, first.transport, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	cancels := make(chan context.CancelFunc, defaultCrashThreshold+1)
+	broker := newTestBroker(t, retirementTestPluginID, []string{"log:write"}, HostServices{Log: cancelQueueLog{cancels: cancels}})
+	runner := runnerWithPool(pool, broker)
+	for i := 0; i < defaultCrashThreshold+1; i++ {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancels <- cancel
+		if _, err := runner.Invoke(ctx, InvokeRequest{PluginID: retirementTestPluginID, Generation: 1}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel %d err=%v", i, err)
+		}
+	}
+	runner.mu.Lock()
+	tripped := runner.st[retirementTestPluginID][1].tripped
+	runner.mu.Unlock()
+	if tripped {
+		t.Fatal("caller cancellations opened circuit")
+	}
+	pool.abortClose(1)
+}
+
+type cancelQueueLog struct{ cancels <-chan context.CancelFunc }
+
+func (l cancelQueueLog) Write(context.Context, HostLogEntry) error {
+	(<-l.cancels)()
+	return nil
+}
+
+func TestSystemRunnerSignedTimeoutsOpenCircuit(t *testing.T) {
+	pool := newSystemPool(256, time.Hour, 1)
+	spawn := readyTestSpawner(t, "LATTICE_TEST_V2_HOST=1", "LATTICE_TEST_V2_STALL=1")
+	pool.replenishFn = func(ctx context.Context, generation uint64) (*pooledWorker, error) {
+		tr, err := spawn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &pooledWorker{generation: generation, started: time.Now(), transport: tr}, nil
+	}
+	first, err := pool.replenishFn(t.Context(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.publishTransport(1, first.transport, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	dispatched := make(chan struct{}, defaultCrashThreshold)
+	broker := newTestBroker(t, retirementTestPluginID, []string{"log:write"}, HostServices{Log: dispatchQueueLog{dispatched: dispatched}})
+	runner := runnerWithPool(pool, broker)
+	replenished := make(chan struct{}, defaultCrashThreshold)
+	pool.successFn = func(generation uint64) {
+		runner.recordGenerationSuccess(retirementTestPluginID, generation)
+		replenished <- struct{}{}
+	}
+	for i := 0; i < defaultCrashThreshold; i++ {
+		done := make(chan error, 1)
+		go func() {
+			_, err := runner.Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1, Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 200, StdoutBytes: 1024, StderrBytes: 1024, HostCalls: 1}}})
+			done <- err
+		}()
+		select {
+		case <-dispatched:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("attempt %d never dispatched", i)
+		}
+		if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("attempt %d error=%v", i, err)
+		}
+		if i < defaultCrashThreshold-1 {
+			select {
+			case <-replenished:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("attempt %d replacement not ready", i)
+			}
+		}
+	}
+	if _, err := runner.Invoke(t.Context(), InvokeRequest{PluginID: retirementTestPluginID, Generation: 1}); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("circuit error=%v", err)
+	}
+	pool.abortClose(1)
+}
+
+type dispatchQueueLog struct{ dispatched chan<- struct{} }
+
+func (l dispatchQueueLog) Write(context.Context, HostLogEntry) error {
+	l.dispatched <- struct{}{}
+	return nil
+}
+
 type cancelOnLog struct {
 	seen   chan struct{}
 	cancel context.CancelFunc
@@ -681,6 +809,8 @@ func runnerWithPool(pool *systemPool, broker *Broker) *SystemRunner {
 	runner.st[retirementTestPluginID] = map[uint64]*systemPluginState{
 		pool.generation: {pool: pool, isV2: true, broker: broker, generation: pool.generation, admitted: true},
 	}
+	pool.failureFn = func(generation uint64) { runner.recordGenerationFailure(retirementTestPluginID, generation) }
+	pool.successFn = func(generation uint64) { runner.recordGenerationSuccess(retirementTestPluginID, generation) }
 	return runner
 }
 

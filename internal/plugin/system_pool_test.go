@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -36,6 +37,91 @@ func TestSystemPoolGenerationAndExclusiveLease(t *testing.T) {
 	if _, err := p.checkout(ctx2, time.Now()); err == nil {
 		t.Fatal("drained pool leased worker")
 	}
+}
+
+func TestSystemPoolCanceledAssignedLeaseDoesNotConsumeMaxUses(t *testing.T) {
+	p := newSystemPool(1, time.Hour, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	selectedCancel := make(chan struct{})
+	reconcile := make(chan struct{})
+	p.beforeCancelReconcile = func() {
+		close(selectedCancel)
+		<-reconcile
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.checkout(ctx, time.Now())
+		done <- err
+	}()
+	for {
+		p.mu.Lock()
+		queued := len(p.waiters) == 1
+		p.mu.Unlock()
+		if queued {
+			break
+		}
+		runtime.Gosched()
+	}
+	cancel()
+	<-selectedCancel
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	close(reconcile)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkout error=%v", err)
+	}
+	w, err := p.checkout(t.Context(), time.Now())
+	if err != nil {
+		t.Fatalf("worker churned after unused lease: %v", err)
+	}
+	if w.uses != 0 {
+		t.Fatalf("unused assignment consumed maxUses: uses=%d", w.uses)
+	}
+	p.release(w, true, time.Now())
+}
+
+func TestSystemPoolResultArmRechecksCancellationBeforeDispatch(t *testing.T) {
+	p := newSystemPool(1, time.Hour, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	selectedResult := make(chan struct{})
+	returnGate := make(chan struct{})
+	p.beforeResultReturn = func() {
+		close(selectedResult)
+		<-returnGate
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.checkout(ctx, time.Now())
+		done <- err
+	}()
+	for {
+		p.mu.Lock()
+		queued := len(p.waiters) == 1
+		p.mu.Unlock()
+		if queued {
+			break
+		}
+		runtime.Gosched()
+	}
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	<-selectedResult
+	cancel()
+	close(returnGate)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkout error=%v", err)
+	}
+	p.beforeResultReturn = nil
+	w, err := p.checkout(t.Context(), time.Now())
+	if err != nil {
+		t.Fatalf("pre-dispatch cancellation churned worker: %v", err)
+	}
+	if w.uses != 0 {
+		t.Fatalf("pre-dispatch cancellation consumed maxUses: uses=%d", w.uses)
+	}
+	p.release(w, true, time.Now())
 }
 
 func TestSystemPoolConcurrentNoDoubleLease(t *testing.T) {
@@ -300,6 +386,42 @@ func TestSystemPoolSuccessfulReplenishmentResetsConsecutiveFailures(t *testing.T
 		t.Fatalf("attempts=%d consecutive=%d want 6/3", gotAttempts, gotConsecutive)
 	}
 	p.abortClose(13)
+}
+
+func TestSystemPoolCandidateIsInvisibleUntilSuccessAccountingCompletes(t *testing.T) {
+	p := newSystemPool(8, time.Hour, 14)
+	started := make(chan struct{})
+	successEntered := make(chan struct{})
+	releaseSuccess := make(chan struct{})
+	p.replenishFn = func(context.Context, uint64) (*pooledWorker, error) {
+		close(started)
+		return &pooledWorker{started: time.Now()}, nil
+	}
+	p.successFn = func(uint64) {
+		close(successEntered)
+		<-releaseSuccess
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan *pooledWorker, 1)
+	go func() {
+		w, _ := p.checkout(ctx, time.Now())
+		done <- w
+	}()
+	<-started
+	<-successEntered
+	select {
+	case w := <-done:
+		t.Fatalf("candidate leased before success accounting: %+v", w)
+	default:
+	}
+	close(releaseSuccess)
+	w := <-done
+	if w == nil {
+		t.Fatal("candidate was not published after success accounting")
+	}
+	p.release(w, true, time.Now())
+	p.abortClose(14)
 }
 
 func TestSystemPoolCanceledAttemptDoesNotKillSupervisor(t *testing.T) {

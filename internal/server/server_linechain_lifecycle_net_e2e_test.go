@@ -169,6 +169,17 @@ func lifecycleStartProcess(t *testing.T, bin, root, name, configDir string, port
 				t.Errorf("%s did not exit", name)
 			}
 		}
+		// A managed restart may replace the process recorded at startup; join
+		// the currently owned pidfile process group as well.
+		if raw, err := os.ReadFile(filepath.Join(root, name+".pid")); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 0 && pid != cmd.Process.Pid {
+				current := -pid
+				_ = syscall.Kill(current, syscall.SIGTERM)
+				time.Sleep(500 * time.Millisecond)
+				_ = syscall.Kill(current, syscall.SIGKILL)
+			}
+			_ = os.Remove(filepath.Join(root, name+".pid"))
+		}
 	})
 	if err := lifecycleWaitPort(port, 5*time.Second); err != nil {
 		raw, _ := os.ReadFile(logPath)

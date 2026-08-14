@@ -364,14 +364,23 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 	if !ok || storedShare.Token != created.Token {
 		t.Fatal("HTTP-created E5 share missing from durable store")
 	}
-	request := httptest.NewRequest(http.MethodGet, "/sub/"+storedShare.Slug+"/"+storedShare.Token+"?format=plain", nil)
-	request.Header.Set("User-Agent", "sing-box/1.13.18")
-	response := httptest.NewRecorder()
-	srv.handleSubscriptionShare(response, request)
-	if response.Code != http.StatusOK || response.Header().Get("X-Lattice-Subscription-Stale") != "" {
-		t.Fatalf("public graph share status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.Bytes())
+	routeServer := httptest.NewServer(handler)
+	defer routeServer.Close()
+	request, err := http.NewRequest(http.MethodGet, routeServer.URL+"/sub/"+storedShare.Slug+"/"+storedShare.Token+"?format=plain", nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	shareBody := strings.TrimSpace(response.Body.String())
+	request.Header.Set("User-Agent", "sing-box/1.13.18")
+	response, err := routeServer.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	responseRaw, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || response.Header.Get("X-Lattice-Subscription-Stale") != "" {
+		t.Fatalf("public graph share status=%d headers=%v body=%s", response.StatusCode, response.Header, responseRaw)
+	}
+	shareBody := strings.TrimSpace(string(responseRaw))
 	if shareBody != strings.TrimSpace(string(published)) {
 		t.Fatalf("preview/save/publish/share authority diverged: share=%q publish=%q compose=%q", shareBody, published, composed.Raw)
 	}

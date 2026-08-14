@@ -157,11 +157,17 @@ func lifecycleStartProcess(t *testing.T, bin, root, name, configDir string, port
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait(); _ = logFile.Close() }()
 	t.Cleanup(func() {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		pgid := -cmd.Process.Pid
+		_ = syscall.Kill(pgid, syscall.SIGTERM)
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Errorf("%s did not exit", name)
+		case <-time.After(2 * time.Second):
+			_ = syscall.Kill(pgid, syscall.SIGKILL)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Errorf("%s did not exit", name)
+			}
 		}
 	})
 	if err := lifecycleWaitPort(port, 5*time.Second); err != nil {

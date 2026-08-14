@@ -124,6 +124,60 @@ func TestSystemPoolResultArmRechecksCancellationBeforeDispatch(t *testing.T) {
 	p.release(w, true, time.Now())
 }
 
+func TestSystemPoolCanceledIdleCheckoutDoesNotLeaseOrConsumeUse(t *testing.T) {
+	p := newSystemPool(1, time.Hour, 1)
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if w, err := p.checkout(ctx, time.Now()); !errors.Is(err, context.Canceled) || w != nil {
+		t.Fatalf("canceled idle checkout worker=%v error=%v", w, err)
+	}
+	w, err := p.checkout(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.uses != 0 {
+		t.Fatalf("canceled idle checkout consumed use: %d", w.uses)
+	}
+	p.release(w, true, time.Now())
+}
+
+func TestSystemPoolIdleAssignmentCancellationReturnsUnused(t *testing.T) {
+	p := newSystemPool(1, time.Hour, 1)
+	if err := p.publish(1, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	assigned := make(chan struct{})
+	gate := make(chan struct{})
+	p.beforeResultReturn = func() {
+		close(assigned)
+		<-gate
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.checkout(ctx, time.Now())
+		done <- err
+	}()
+	<-assigned
+	cancel()
+	close(gate)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkout error=%v", err)
+	}
+	p.beforeResultReturn = nil
+	w, err := p.checkout(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.uses != 0 {
+		t.Fatalf("canceled idle assignment consumed use: %d", w.uses)
+	}
+	p.release(w, true, time.Now())
+}
+
 func TestSystemPoolConcurrentNoDoubleLease(t *testing.T) {
 	p := newSystemPool(1, time.Hour)
 	_ = p.publish(1, true, time.Now())

@@ -172,12 +172,24 @@ func (p *systemPool) checkout(ctx context.Context, now time.Time) (*pooledWorker
 		retired := p.pruneInvalidLocked(now)
 		for i, w := range p.workers {
 			if w.state == workerIdle {
+				if err := ctx.Err(); err != nil {
+					p.mu.Unlock()
+					abortTransports(retired)
+					return nil, err
+				}
 				w.state = workerLeased
 				p.active++
 				p.leased[w] = struct{}{}
 				p.workers = append(p.workers[:i], p.workers[i+1:]...)
 				p.mu.Unlock()
 				abortTransports(retired)
+				if p.beforeResultReturn != nil {
+					p.beforeResultReturn()
+				}
+				if err := ctx.Err(); err != nil {
+					p.returnUnused(w, time.Now())
+					return nil, err
+				}
 				return w, nil
 			}
 		}

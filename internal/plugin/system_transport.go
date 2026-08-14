@@ -43,11 +43,15 @@ type v2InvokeOutcome struct {
 	Retirement      error
 	Stderr          []byte
 	StderrTruncated bool
+	DispatchStarted bool
 }
 
 func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64, invocation string, req InvokeRequest, host func(systemHostCall) systemHostResponse, budgets ...ResolvedInvokeBudget) (outcome v2InvokeOutcome, callErr error) {
+	if err := ctx.Err(); err != nil {
+		return outcome, err
+	}
 	if t == nil || t.stdin == nil || t.scanner == nil {
-		return v2InvokeOutcome{}, fmt.Errorf("worker transport unavailable")
+		return outcome, fmt.Errorf("worker transport unavailable")
 	}
 	frame := stdioJSONV2Frame{Protocol: 2, Kind: "invoke", Generation: generation, InvocationID: invocation}
 	frame.Request, _ = json.Marshal(struct {
@@ -70,15 +74,16 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 		outcome.Stderr, outcome.StderrTruncated = append([]byte(nil), diagnostics.Bytes()...), diagnostics.Truncated()
 	}()
 	write := make(chan error, 1)
+	outcome.DispatchStarted = true
 	go func() { write <- json.NewEncoder(t.stdin).Encode(frame) }()
 	select {
 	case err := <-write:
 		if err != nil {
-			return v2InvokeOutcome{}, err
+			return outcome, err
 		}
 	case <-ctx.Done():
 		_ = t.abort()
-		return v2InvokeOutcome{}, ctx.Err()
+		return outcome, ctx.Err()
 	}
 	seenHostCalls := make(map[string]struct{})
 	stdoutConsumed := 0
@@ -99,35 +104,35 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 		fr, err := t.nextFrame(ctx)
 		if err != nil {
 			_ = t.abort()
-			return v2InvokeOutcome{}, err
+			return outcome, err
 		}
 		line = fr
 		f, err := decodeStdioJSONV2Frame(line, maxV2WireFrameBytes)
 		if err != nil {
-			return v2InvokeOutcome{}, err
+			return outcome, err
 		}
 		if err := validateStdioJSONV2Frame(f, generation, invocation, ""); err != nil {
-			return v2InvokeOutcome{}, err
+			return outcome, err
 		}
 		if f.Kind != "stderr_chunk" {
 			if err := consumeFrame(line); err != nil {
-				return v2InvokeOutcome{}, err
+				return outcome, err
 			}
 		}
 		if f.Kind == "host_call" {
 			if host == nil || f.HostCallID == "" {
-				return v2InvokeOutcome{}, fmt.Errorf("invalid host call")
+				return outcome, fmt.Errorf("invalid host call")
 			}
 			if _, duplicate := seenHostCalls[f.HostCallID]; duplicate {
-				return v2InvokeOutcome{}, fmt.Errorf("duplicate host_call_id %q", f.HostCallID)
+				return outcome, fmt.Errorf("duplicate host_call_id %q", f.HostCallID)
 			}
 			if len(seenHostCalls) >= hostCallLimit {
-				return v2InvokeOutcome{}, fmt.Errorf("plugin exceeded host-call limit %d", hostCallLimit)
+				return outcome, fmt.Errorf("plugin exceeded host-call limit %d", hostCallLimit)
 			}
 			seenHostCalls[f.HostCallID] = struct{}{}
 			call, err := decodeStrictSystemHostCall(f.HostCall, f.HostCallID, HostMaxInvokeStdoutBytes)
 			if err != nil {
-				return v2InvokeOutcome{}, err
+				return outcome, err
 			}
 			resp := host(call)
 			out := stdioJSONV2Frame{Protocol: 2, Kind: "host_response", Generation: generation, InvocationID: invocation, HostCallID: f.HostCallID}
@@ -137,11 +142,11 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 			select {
 			case err := <-writeResp:
 				if err != nil {
-					return v2InvokeOutcome{}, err
+					return outcome, err
 				}
 			case <-ctx.Done():
 				_ = t.abort()
-				return v2InvokeOutcome{}, ctx.Err()
+				return outcome, ctx.Err()
 			}
 			continue
 		}
@@ -149,34 +154,34 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 			diagnosticChunks++
 			diagnosticWireConsumed += len(line) + 1
 			if diagnosticChunks > maxV2DiagnosticChunks || diagnosticWireConsumed > maxV2DiagnosticWireBytes {
-				return v2InvokeOutcome{}, fmt.Errorf("plugin exceeded diagnostic frame limit")
+				return outcome, fmt.Errorf("plugin exceeded diagnostic frame limit")
 			}
 			if len(f.Data) > base64.StdEncoding.EncodedLen(HostMaxInvokeStderrBytes) {
-				return v2InvokeOutcome{}, fmt.Errorf("stderr_chunk exceeds host maximum")
+				return outcome, fmt.Errorf("stderr_chunk exceeds host maximum")
 			}
 			chunk, err := base64.StdEncoding.DecodeString(f.Data)
 			if err != nil {
-				return v2InvokeOutcome{}, fmt.Errorf("invalid stderr_chunk data")
+				return outcome, fmt.Errorf("invalid stderr_chunk data")
 			}
 			if base64.StdEncoding.EncodeToString(chunk) != f.Data {
-				return v2InvokeOutcome{}, fmt.Errorf("non-canonical stderr_chunk data")
+				return outcome, fmt.Errorf("non-canonical stderr_chunk data")
 			}
 			if len(chunk) > HostMaxInvokeStderrBytes-diagnosticDecodedTotal {
-				return v2InvokeOutcome{}, fmt.Errorf("plugin exceeded diagnostic decoded limit %d", HostMaxInvokeStderrBytes)
+				return outcome, fmt.Errorf("plugin exceeded diagnostic decoded limit %d", HostMaxInvokeStderrBytes)
 			}
 			diagnosticDecodedTotal += len(chunk)
 			_, _ = diagnostics.Write(chunk)
 			continue
 		}
 		if f.Kind == "invoke_ready" {
-			return v2InvokeOutcome{}, fmt.Errorf("invoke_ready before result")
+			return outcome, fmt.Errorf("invoke_ready before result")
 		}
 		if f.Kind != "invoke_result" {
-			return v2InvokeOutcome{}, fmt.Errorf("unexpected v2 frame %q", f.Kind)
+			return outcome, fmt.Errorf("unexpected v2 frame %q", f.Kind)
 		}
 		reply, err := decodeSystemRunnerReply(f.Response, HostMaxInvokeStdoutBytes)
 		if err != nil {
-			return v2InvokeOutcome{}, err
+			return outcome, err
 		}
 		if f.Kind == "invoke_result" {
 			for {

@@ -695,6 +695,10 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 		invocation := fmt.Sprintf("%d", time.Now().UnixNano())
 		outcome, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) }, budget)
 		if callErr != nil {
+			if !outcome.DispatchStarted && (errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded)) {
+				st.pool.returnUnused(w, time.Now())
+				return InvokeResponse{}, callErr
+			}
 			if ctx.Err() == nil {
 				r.recordLifecycleFailure(req.PluginID, st)
 			}

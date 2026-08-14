@@ -52,6 +52,29 @@ func TestRealV2ResultWithoutReadyPreservesReplyAndReaps(t *testing.T) {
 	}
 }
 
+func TestRealV2CanceledBeforeDispatchDoesNotWriteOrRetireWorker(t *testing.T) {
+	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1")
+	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.awaitReady(1); err != nil {
+		t.Fatal(err)
+	}
+	defer tr.abort()
+	pid := tr.pgid
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	outcome, err := tr.invokeV2(ctx, 1, "canceled", InvokeRequest{Action: "x"}, nil)
+	if !errors.Is(err, context.Canceled) || outcome.DispatchStarted {
+		t.Fatalf("outcome=%+v error=%v", outcome, err)
+	}
+	outcome, err = tr.invokeV2(t.Context(), 1, "next", InvokeRequest{Action: "x"}, nil)
+	if err != nil || !outcome.Reusable || !outcome.Reply.OK || tr.pgid != pid {
+		t.Fatalf("worker was not reusable after pre-dispatch cancel: outcome=%+v err=%v pid=%d want=%d", outcome, err, tr.pgid, pid)
+	}
+}
+
 func TestRealV2StalledHostCallCancellationReaps(t *testing.T) {
 	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_HOST=1", "LATTICE_TEST_V2_STALL=1")
 	tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)

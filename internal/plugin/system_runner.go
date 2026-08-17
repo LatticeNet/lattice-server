@@ -1150,16 +1150,17 @@ func processGroupExists(pgid int) bool {
 // runtime pipes and ignore TERM, so the group must become extinct before the
 // transport or one-shot invocation is considered reaped.
 func terminateProcessGroup(pgid int, grace time.Duration) error {
-	return terminateProcessGroupWithSignalRecord(pgid, grace, nil)
+	return terminateProcessGroupWithSignal(pgid, grace, nil)
 }
 
-func terminateProcessGroupWithSignalRecord(pgid int, grace time.Duration, record func(syscall.Signal)) error {
+func terminateProcessGroupWithSignal(pgid int, grace time.Duration, signalGroup func(syscall.Signal) error) error {
 	if !processGroupExists(pgid) {
 		return nil
 	}
-	if err := syscall.Kill(-pgid, syscall.SIGTERM); err == nil && record != nil {
-		record(syscall.SIGTERM)
+	if signalGroup == nil {
+		signalGroup = func(signal syscall.Signal) error { return syscall.Kill(-pgid, signal) }
 	}
+	_ = signalGroup(syscall.SIGTERM)
 	deadline := time.NewTimer(grace)
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer deadline.Stop()
@@ -1167,9 +1168,7 @@ func terminateProcessGroupWithSignalRecord(pgid int, grace time.Duration, record
 	for processGroupExists(pgid) {
 		select {
 		case <-deadline.C:
-			if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil && record != nil {
-				record(syscall.SIGKILL)
-			}
+			_ = signalGroup(syscall.SIGKILL)
 			// StopGrace controls only the cooperative TERM window. Kernel/process
 			// scheduler latency after SIGKILL is a separate concern and must not
 			// collapse to a test-sized (e.g. 10ms) grace, otherwise an extinct

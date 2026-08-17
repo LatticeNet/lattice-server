@@ -455,7 +455,13 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 	_ = stderrW.Close()
 	_ = hostRead.Close()
 	t := &systemWorkerTransport{cmd: cmd, stdin: stdinW, stdout: stdoutR, hostResp: hostWrite, stderr: stderrR, pgid: cmd.Process.Pid, scanner: bufio.NewScanner(stdoutR), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{}), readDone: make(chan struct{}), stderrDone: make(chan struct{}), groupDone: make(chan struct{}), abortDone: make(chan struct{})}
-	go func() { err := cmd.Wait(); t.waitMu.Lock(); t.waitErr = err; t.waitMu.Unlock(); close(t.waitDone) }()
+	go func() {
+		err := cmd.Wait()
+		t.waitMu.Lock()
+		t.waitErr = err
+		close(t.waitDone)
+		t.waitMu.Unlock()
+	}()
 	t.scanner.Buffer(make([]byte, 64*1024), maxV2WireFrameBytes)
 	go t.readPump()
 	go t.drainStderr()
@@ -478,14 +484,35 @@ func (t *systemWorkerTransport) requestAbort() {
 		close(t.done)
 		t.waitMu.Lock()
 		t.abortStage = "term-grace"
-		if err := syscall.Kill(-t.pgid, syscall.SIGTERM); err == nil {
-			t.ownedTerm = true
-		} else if err != syscall.ESRCH {
-			t.requestErr = &processGroupResidualError{PGID: t.pgid, Stage: "sigterm", Err: err}
-		}
 		t.waitMu.Unlock()
+		if err := t.signalProcessGroup(syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+			t.waitMu.Lock()
+			t.requestErr = &processGroupResidualError{PGID: t.pgid, Stage: "sigterm", Err: err}
+			t.waitMu.Unlock()
+		}
 		go t.finishAbort()
 	})
+}
+
+func (t *systemWorkerTransport) signalProcessGroup(signal syscall.Signal) error {
+	t.waitMu.Lock()
+	defer t.waitMu.Unlock()
+	leaderPending := true
+	select {
+	case <-t.waitDone:
+		leaderPending = false
+	default:
+	}
+	err := syscall.Kill(-t.pgid, signal)
+	if err == nil && leaderPending {
+		switch signal {
+		case syscall.SIGTERM:
+			t.ownedTerm = true
+		case syscall.SIGKILL:
+			t.ownedKill = true
+		}
+	}
+	return err
 }
 
 // finishAbort is the sole owner of persistent-process teardown. Callers may
@@ -588,14 +615,7 @@ func (t *systemWorkerTransport) waitAbort(ctx context.Context) error {
 
 func (t *systemWorkerTransport) reapProcessGroup() error {
 	t.groupOnce.Do(func() {
-		t.groupErr = terminateProcessGroupWithSignalRecord(t.pgid, 100*time.Millisecond, func(signal syscall.Signal) {
-			if signal != syscall.SIGKILL {
-				return
-			}
-			t.waitMu.Lock()
-			t.ownedKill = true
-			t.waitMu.Unlock()
-		})
+		t.groupErr = terminateProcessGroupWithSignal(t.pgid, 100*time.Millisecond, t.signalProcessGroup)
 		close(t.groupDone)
 	})
 	<-t.groupDone

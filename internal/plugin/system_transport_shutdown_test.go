@@ -3,6 +3,8 @@ package plugin
 import (
 	"errors"
 	"os"
+	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -41,6 +43,46 @@ func TestTransportAbortSuppressesOnlyOwnedSignals(t *testing.T) {
 			if tc.wantKill && !tr.ownedKill {
 				t.Fatal("owned SIGKILL escalation was not recorded")
 			}
+			assertProcessGroupGone(t, tr.pgid)
+		})
+	}
+}
+
+func TestTransportAbortRetainsCompletedLeaderSignalWithLiveDescendant(t *testing.T) {
+	tests := []struct {
+		name   string
+		signal syscall.Signal
+		flags  []string
+	}{
+		{name: "self SIGTERM", signal: syscall.SIGTERM, flags: []string{"LATTICE_TEST_V2_EXIT_AFTER_READY_SIGNAL=TERM"}},
+		{name: "external SIGKILL", signal: syscall.SIGKILL},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pidFile := filepath.Join(dir, "descendant.pid")
+			env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_DESCENDANT_PID="+pidFile)
+			env = append(env, tc.flags...)
+			tr, err := startSystemWorker(t.Context(), os.Args[0], dir, env)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tr.awaitReadyContext(t.Context(), 1); err != nil {
+				t.Fatal(err)
+			}
+			descendant := waitForPIDFile(t, pidFile)
+			if tc.signal == syscall.SIGKILL {
+				if err := syscall.Kill(tr.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+					t.Fatal(err)
+				}
+			}
+			<-tr.waitDone
+			tr.requestAbort()
+			err = tr.waitAbort(t.Context())
+			if signal, ok := transportExitSignal(err); !ok || signal != tc.signal {
+				t.Fatalf("abort error=%v signal=%v ok=%v want %v", err, signal, ok, tc.signal)
+			}
+			assertPIDGone(t, descendant)
 			assertProcessGroupGone(t, tr.pgid)
 		})
 	}

@@ -254,6 +254,14 @@ func TestSystemPoolFailedReadinessCandidateCleanupReachesLedger(t *testing.T) {
 	}()
 	candidatePGID := <-pgid
 	<-entered
+	select {
+	case err := <-checkout:
+		if !errors.Is(err, ErrCircuitOpen) {
+			t.Fatalf("checkout error=%v want ErrCircuitOpen before teardown release", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("circuit failure was not published before teardown join")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	future := p.beginDrain(true, 1)
@@ -265,9 +273,6 @@ func TestSystemPoolFailedReadinessCandidateCleanupReachesLedger(t *testing.T) {
 	result := future.wait(t.Context())
 	if !errors.Is(result.Err, injected) || len(result.ResidualPGIDs) != 0 {
 		t.Fatalf("cleanup result=%+v want injected error without residual process", result)
-	}
-	if err := <-checkout; err == nil {
-		t.Fatal("failed readiness produced caller-visible success")
 	}
 	assertProcessGroupGone(t, candidatePGID)
 }

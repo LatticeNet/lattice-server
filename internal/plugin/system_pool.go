@@ -321,6 +321,10 @@ func (p *systemPool) startTransportRetirements(transports []*systemWorkerTranspo
 
 func (p *systemPool) retireTransports(transports []*systemWorkerTransport) {
 	p.startTransportRetirements(transports)
+	p.waitTransportRetirements(transports)
+}
+
+func (p *systemPool) waitTransportRetirements(transports []*systemWorkerTransport) {
 	for _, transport := range transports {
 		if transport == nil {
 			continue
@@ -725,14 +729,16 @@ func (p *systemPool) replenishSupervisor() {
 			recordFailure := err != nil && failureFn != nil && !errors.Is(err, context.Canceled)
 			recordSuccess := valid && successFn != nil
 			p.mu.Unlock()
-			p.retireTransports(retired)
+			pendingRetirements := retired
 			retired = nil
 			if !valid && nw != nil && nw.transport != nil {
-				p.retireTransports([]*systemWorkerTransport{nw.transport})
+				pendingRetirements = append(pendingRetirements, nw.transport)
 			}
+			p.startTransportRetirements(pendingRetirements)
 			if recordFailure {
 				failureFn(generation)
 			}
+			p.waitTransportRetirements(pendingRetirements)
 			if valid {
 				if recordSuccess {
 					successFn(generation)

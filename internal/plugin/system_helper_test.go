@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -187,6 +188,9 @@ func TestRealV2MalformedReadyPreservesReply(t *testing.T) {
 }
 
 func runV2Helper() {
+	if os.Getenv("LATTICE_TEST_V2_IGNORE_TERM") == "1" {
+		signal.Ignore(syscall.SIGTERM)
+	}
 	generation := uint64(1)
 	if raw := os.Getenv("LATTICE_RUNTIME_GENERATION"); raw != "" {
 		parsed, err := strconv.ParseUint(raw, 10, 64)
@@ -212,6 +216,13 @@ func runV2Helper() {
 	}
 	if os.Getenv("LATTICE_TEST_V2_EXIT_AFTER_READY") == "1" {
 		os.Exit(0)
+	}
+	if os.Getenv("LATTICE_TEST_V2_EXIT_AFTER_READY_CODE") == "7" {
+		os.Exit(7)
+	}
+	if os.Getenv("LATTICE_TEST_V2_EXIT_AFTER_READY_SIGNAL") == "TERM" {
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		select {}
 	}
 	s := bufio.NewScanner(os.Stdin)
 	enc := json.NewEncoder(os.Stdout)

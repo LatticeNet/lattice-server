@@ -2,32 +2,46 @@ package plugin
 
 import (
 	"errors"
-	"os/exec"
-	"syscall"
+	"os"
 	"testing"
 )
 
-func TestTransportTeardownExitClassification(t *testing.T) {
+func TestTransportAbortSuppressesOnlyOwnedSignals(t *testing.T) {
 	tests := []struct {
-		name string
-		code string
-		want bool
+		name     string
+		flags    []string
+		prewait  bool
+		wantErr  bool
+		wantKill bool
 	}{
-		{name: "ordinary exit 7", code: "exit 7", want: false},
-		{name: "owned SIGTERM", code: "kill -TERM $$", want: true},
-		{name: "owned SIGKILL", code: "kill -KILL $$", want: true},
+		{name: "ordinary exit 7", flags: []string{"LATTICE_TEST_V2_EXIT_AFTER_READY_CODE=7"}, prewait: true, wantErr: true},
+		{name: "self SIGTERM", flags: []string{"LATTICE_TEST_V2_EXIT_AFTER_READY_SIGNAL=TERM"}, prewait: true, wantErr: true},
+		{name: "owned SIGTERM"},
+		{name: "owned SIGKILL", flags: []string{"LATTICE_TEST_V2_IGNORE_TERM=1"}, wantKill: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := exec.Command("/bin/sh", "-c", tc.code).Run()
-			var exitErr *exec.ExitError
-			if !errors.As(err, &exitErr) {
-				t.Fatalf("command error=%T %v, want *exec.ExitError", err, err)
+			env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1")
+			env = append(env, tc.flags...)
+			tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if got := isExpectedTransportTeardownExit(err); got != tc.want {
-				status, _ := exitErr.Sys().(syscall.WaitStatus)
-				t.Fatalf("classification=%v want=%v status=%v", got, tc.want, status)
+			if err := tr.awaitReadyContext(t.Context(), 1); err != nil {
+				t.Fatal(err)
 			}
+			if tc.prewait {
+				<-tr.waitDone
+			}
+			tr.requestAbort()
+			err = tr.waitAbort(t.Context())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("abort error=%v wantErr=%v", err, tc.wantErr)
+			}
+			if tc.wantKill && !tr.ownedKill {
+				t.Fatal("owned SIGKILL escalation was not recorded")
+			}
+			assertProcessGroupGone(t, tr.pgid)
 		})
 	}
 }

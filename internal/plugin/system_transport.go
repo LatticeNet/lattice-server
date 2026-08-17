@@ -252,6 +252,8 @@ type systemWorkerTransport struct {
 	abortErr           error
 	requestErr         error
 	abortStage         string
+	ownedTerm          bool
+	ownedKill          bool
 	groupOnce          sync.Once
 	groupDone          chan struct{}
 	groupErr           error
@@ -263,6 +265,7 @@ type systemWorkerTransport struct {
 	rawStderrBytes     atomic.Int64
 	beforeAbortFinish  func()
 	reapProcessGroupFn func() error
+	closePipesFn       func() error
 }
 
 type processGroupResidualError struct {
@@ -384,16 +387,13 @@ func (t *systemWorkerTransport) awaitReady(generation uint64) error {
 func (t *systemWorkerTransport) awaitReadyContext(ctx context.Context, generation uint64) error {
 	line, err := t.nextFrame(ctx)
 	if err != nil {
-		_ = t.abort()
 		return err
 	}
 	f, err := decodeStdioJSONV2Frame(line)
 	if err != nil {
-		_ = t.abort()
 		return err
 	}
 	if err := validateStdioJSONV2Frame(f, generation, "runtime", ""); err != nil || f.Kind != "runtime_ready" {
-		_ = t.abort()
 		return fmt.Errorf("invalid runtime_ready")
 	}
 	return nil
@@ -478,7 +478,9 @@ func (t *systemWorkerTransport) requestAbort() {
 		close(t.done)
 		t.waitMu.Lock()
 		t.abortStage = "term-grace"
-		if err := syscall.Kill(-t.pgid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+		if err := syscall.Kill(-t.pgid, syscall.SIGTERM); err == nil {
+			t.ownedTerm = true
+		} else if err != syscall.ESRCH {
 			t.requestErr = &processGroupResidualError{PGID: t.pgid, Stage: "sigterm", Err: err}
 		}
 		t.waitMu.Unlock()
@@ -509,6 +511,9 @@ func (t *systemWorkerTransport) finishAbort() {
 
 	t.setAbortStage("pipe-close")
 	pipeErr := t.closePipes()
+	if t.closePipesFn != nil {
+		pipeErr = errors.Join(pipeErr, t.closePipesFn())
+	}
 	if pipeErr != nil {
 		pipeErr = &processGroupResidualError{PGID: t.pgid, Stage: "pipe-close", Err: pipeErr}
 	}
@@ -519,7 +524,8 @@ func (t *systemWorkerTransport) finishAbort() {
 
 	t.waitMu.Lock()
 	waitErr := t.waitErr
-	if isExpectedTransportTeardownExit(waitErr) && groupErr == nil && !processGroupExists(t.pgid) {
+	if signal, ok := transportExitSignal(waitErr); ok && groupErr == nil && !processGroupExists(t.pgid) &&
+		((signal == syscall.SIGTERM && t.ownedTerm) || (signal == syscall.SIGKILL && t.ownedKill)) {
 		waitErr = nil
 	}
 	if waitErr != nil {
@@ -538,16 +544,16 @@ func (t *systemWorkerTransport) finishAbort() {
 	t.waitMu.Unlock()
 }
 
-func isExpectedTransportTeardownExit(err error) bool {
+func transportExitSignal(err error) (syscall.Signal, bool) {
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
-		return false
+		return 0, false
 	}
 	status, ok := exitErr.Sys().(syscall.WaitStatus)
 	if !ok || !status.Signaled() {
-		return false
+		return 0, false
 	}
-	return status.Signal() == syscall.SIGTERM || status.Signal() == syscall.SIGKILL
+	return status.Signal(), true
 }
 
 func (t *systemWorkerTransport) setAbortStage(stage string) {
@@ -582,7 +588,14 @@ func (t *systemWorkerTransport) waitAbort(ctx context.Context) error {
 
 func (t *systemWorkerTransport) reapProcessGroup() error {
 	t.groupOnce.Do(func() {
-		t.groupErr = terminateProcessGroup(t.pgid, 100*time.Millisecond)
+		t.groupErr = terminateProcessGroupWithSignalRecord(t.pgid, 100*time.Millisecond, func(signal syscall.Signal) {
+			if signal != syscall.SIGKILL {
+				return
+			}
+			t.waitMu.Lock()
+			t.ownedKill = true
+			t.waitMu.Unlock()
+		})
 		close(t.groupDone)
 	})
 	<-t.groupDone

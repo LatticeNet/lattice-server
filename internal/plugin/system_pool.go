@@ -725,6 +725,11 @@ func (p *systemPool) replenishSupervisor() {
 			recordFailure := err != nil && failureFn != nil && !errors.Is(err, context.Canceled)
 			recordSuccess := valid && successFn != nil
 			p.mu.Unlock()
+			p.retireTransports(retired)
+			retired = nil
+			if !valid && nw != nil && nw.transport != nil {
+				p.retireTransports([]*systemWorkerTransport{nw.transport})
+			}
 			if recordFailure {
 				failureFn(generation)
 			}
@@ -741,9 +746,6 @@ func (p *systemPool) replenishSupervisor() {
 				p.mu.Unlock()
 			}
 			p.retireTransports(retired)
-			if !valid && nw != nil && nw.transport != nil {
-				p.retireTransports([]*systemWorkerTransport{nw.transport})
-			}
 			if valid {
 				attempt = 0
 				continue

@@ -303,8 +303,8 @@ func readyPooledWorker(ctx context.Context, generation uint64, transport *system
 	worker := &pooledWorker{generation: generation, started: time.Now(), transport: transport}
 	if err := transport.awaitReadyContext(ctx, generation); err != nil {
 		// Return the failed candidate with the readiness error so the supervisor
-		// registers its owned teardown in the generation ledger. awaitReadyContext
-		// has already joined the abort; the ledger preserves any cleanup residual.
+		// registers its owned teardown in the generation ledger before the
+		// canonical retirement future requests and joins abort.
 		return worker, err
 	}
 	return worker, nil
@@ -1150,10 +1150,16 @@ func processGroupExists(pgid int) bool {
 // runtime pipes and ignore TERM, so the group must become extinct before the
 // transport or one-shot invocation is considered reaped.
 func terminateProcessGroup(pgid int, grace time.Duration) error {
+	return terminateProcessGroupWithSignalRecord(pgid, grace, nil)
+}
+
+func terminateProcessGroupWithSignalRecord(pgid int, grace time.Duration, record func(syscall.Signal)) error {
 	if !processGroupExists(pgid) {
 		return nil
 	}
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	if err := syscall.Kill(-pgid, syscall.SIGTERM); err == nil && record != nil {
+		record(syscall.SIGTERM)
+	}
 	deadline := time.NewTimer(grace)
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer deadline.Stop()
@@ -1161,7 +1167,9 @@ func terminateProcessGroup(pgid int, grace time.Duration) error {
 	for processGroupExists(pgid) {
 		select {
 		case <-deadline.C:
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil && record != nil {
+				record(syscall.SIGKILL)
+			}
 			// StopGrace controls only the cooperative TERM window. Kernel/process
 			// scheduler latency after SIGKILL is a separate concern and must not
 			// collapse to a test-sized (e.g. 10ms) grace, otherwise an extinct

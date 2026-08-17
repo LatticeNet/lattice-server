@@ -3,6 +3,8 @@ package plugin
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"slices"
 	"testing"
 	"time"
@@ -227,26 +229,47 @@ func TestSystemPoolRetirementPathsRegisterWithDrainLedger(t *testing.T) {
 func TestSystemPoolFailedReadinessCandidateCleanupReachesLedger(t *testing.T) {
 	p := newSystemPool(8, time.Hour, 1)
 	injected := errors.New("injected readiness cleanup failure")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	pgid := make(chan int, 1)
 	p.replenishFn = func(context.Context, uint64) (*pooledWorker, error) {
-		tr := startReadyTestWorker(t)
+		env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1", "LATTICE_TEST_V2_IGNORE_TERM=1")
+		tr, err := startSystemWorker(t.Context(), os.Args[0], t.TempDir(), env)
+		if err != nil {
+			return nil, err
+		}
+		pgid <- tr.pgid
+		tr.beforeAbortFinish = func() { close(entered); <-release }
 		tr.reapProcessGroupFn = func() error {
 			_ = tr.reapProcessGroup()
 			return injected
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-		defer cancel()
-		return readyPooledWorker(ctx, 1, tr)
+		return readyPooledWorker(t.Context(), 2, tr)
 	}
 	p.failureFn = func(uint64) { p.setCircuitOpen(true) }
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := p.checkout(ctx, time.Now()); !errors.Is(err, ErrCircuitOpen) {
-		t.Fatalf("checkout error=%v want circuit open", err)
+	checkout := make(chan error, 1)
+	go func() {
+		_, err := p.checkout(t.Context(), time.Now())
+		checkout <- err
+	}()
+	candidatePGID := <-pgid
+	<-entered
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	future := p.beginDrain(true, 1)
+	snapshot := future.wait(ctx)
+	if !slices.Contains(snapshot.ResidualPGIDs, candidatePGID) || !slices.Contains(snapshot.PendingStages, "joins") || !slices.Contains(snapshot.PendingStages, "supervisor") {
+		t.Fatalf("pending cleanup snapshot=%+v want candidate pgid=%d and join/supervisor stages", snapshot, candidatePGID)
 	}
-	result := p.beginDrain(true, 1).wait(ctx)
-	if !errors.Is(result.Err, injected) {
-		t.Fatalf("cleanup result=%+v want injected residual", result)
+	close(release)
+	result := future.wait(t.Context())
+	if !errors.Is(result.Err, injected) || len(result.ResidualPGIDs) != 0 {
+		t.Fatalf("cleanup result=%+v want injected error without residual process", result)
 	}
+	if err := <-checkout; err == nil {
+		t.Fatal("failed readiness produced caller-visible success")
+	}
+	assertProcessGroupGone(t, candidatePGID)
 }
 
 func TestSystemPoolLateRejectedPublishOwnsCleanupAfterFinalization(t *testing.T) {
@@ -308,26 +331,47 @@ func TestPoolCleanupResidualPGIDsRequirePositiveLiveness(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			p := newSystemPool(8, time.Hour, 1)
 			injected := errors.New("injected " + stage + " failure")
-			p.mu.Lock()
-			p.closed = true
-			p.drainFuture.started = true
-			p.drainFuture.ordered = append(p.drainFuture.ordered, &poolDrainEntry{
-				sequence: 1, pgid: 1 << 30, done: closedTestChannel(), terminal: true,
-				err: &processGroupResidualError{PGID: 1 << 30, Stage: stage, Err: injected},
-			})
-			p.finalizeDrainLocked()
-			p.mu.Unlock()
-			result := p.drainFuture.wait(t.Context())
+			flags := []string(nil)
+			if stage == "leader-wait" {
+				flags = append(flags, "LATTICE_TEST_V2_EXIT_AFTER_READY_CODE=7")
+			}
+			tr := startReadyTestWorker(t, flags...)
+			switch stage {
+			case "pipe-close":
+				tr.closePipesFn = func() error { return injected }
+			case "stdout-join":
+				tr.waitMu.Lock()
+				tr.readPumpErr = injected
+				tr.waitMu.Unlock()
+			case "stderr-join":
+				tr.waitMu.Lock()
+				tr.stderrPumpErr = injected
+				tr.waitMu.Unlock()
+			case "leader-wait":
+				<-tr.waitDone
+			}
+			if err := p.publishTransport(1, tr, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			worker, err := p.checkout(t.Context(), time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.poison(worker)
+			result := p.beginDrain(true, 1).wait(t.Context())
 			var affected *processGroupResidualError
-			if len(result.ResidualPGIDs) != 0 || !errors.As(result.Err, &affected) || affected.Stage != stage || !errors.Is(result.Err, injected) {
+			if len(result.ResidualPGIDs) != 0 || !errors.As(result.Err, &affected) || affected.Stage != stage {
 				t.Fatalf("result=%+v affected=%#v", result, affected)
 			}
+			if stage == "leader-wait" {
+				var exitErr *exec.ExitError
+				if !errors.As(result.Err, &exitErr) || exitErr.ExitCode() != 7 {
+					t.Fatalf("leader wait error=%v want exit 7", result.Err)
+				}
+			} else if !errors.Is(result.Err, injected) {
+				t.Fatalf("result=%+v want injected %s error", result, stage)
+			}
+			assertProcessGroupGone(t, tr.pgid)
 		})
 	}
-}
-
-func closedTestChannel() chan struct{} {
-	done := make(chan struct{})
-	close(done)
-	return done
 }

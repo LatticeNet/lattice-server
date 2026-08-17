@@ -101,9 +101,11 @@ type poolDrainFuture struct {
 type poolDrainEntry struct {
 	sequence  uint64
 	transport *systemWorkerTransport
+	pgid      int
 	done      chan struct{}
 	joinOnce  sync.Once
 	terminal  bool
+	residual  bool
 	err       error
 }
 
@@ -146,12 +148,19 @@ func (f *poolDrainFuture) snapshot(waitErr error) PoolCleanupResult {
 	for _, entry := range f.ordered {
 		if entry.terminal {
 			joined = errors.Join(joined, entry.err)
+			if entry.residual && entry.pgid != 0 {
+				r.ResidualPGIDs = append(r.ResidualPGIDs, entry.pgid)
+			}
 			continue
 		}
 		r.PendingStages = append(r.PendingStages, "joins")
-		if entry.transport != nil && entry.transport.pgid != 0 {
-			r.ResidualPGIDs = append(r.ResidualPGIDs, entry.transport.pgid)
-			joined = errors.Join(joined, &processGroupResidualError{PGID: entry.transport.pgid, Stage: "pool-join-pending", Err: waitErr})
+		if entry.pgid != 0 {
+			if processGroupExists(entry.pgid) {
+				r.ResidualPGIDs = append(r.ResidualPGIDs, entry.pgid)
+			}
+			if waitErr != nil {
+				joined = errors.Join(joined, &processGroupResidualError{PGID: entry.pgid, Stage: "pool-join-pending", Err: waitErr})
+			}
 		}
 	}
 	slices.Sort(r.ResidualPGIDs)
@@ -247,11 +256,14 @@ func (p *systemPool) registerTransportLocked(t *systemWorkerTransport) *poolDrai
 		return nil
 	}
 	f := p.drainFuture
+	if f.finalized {
+		return nil
+	}
 	if entry := f.entries[t]; entry != nil {
 		return entry
 	}
 	f.nextSequence++
-	entry := &poolDrainEntry{sequence: f.nextSequence, transport: t, done: make(chan struct{})}
+	entry := &poolDrainEntry{sequence: f.nextSequence, transport: t, pgid: t.pgid, done: make(chan struct{})}
 	f.entries[t] = entry
 	f.ordered = append(f.ordered, entry)
 	return entry
@@ -283,16 +295,26 @@ func (p *systemPool) startTransportRetirements(transports []*systemWorkerTranspo
 		p.mu.Lock()
 		entry := p.drainFuture.entries[transport]
 		p.mu.Unlock()
+		if entry == nil {
+			// Registration closes atomically with finalization. A transport that
+			// arrives after that fence still has an owned teardown, but cannot be
+			// appended to the already-completed generation future.
+			go func(transport *systemWorkerTransport) { _ = transport.waitAbort(context.Background()) }(transport)
+			continue
+		}
 		entry.joinOnce.Do(func() {
-			go func(entry *poolDrainEntry) {
-				err := entry.transport.waitAbort(context.Background())
+			go func(entry *poolDrainEntry, transport *systemWorkerTransport) {
+				err := transport.waitAbort(context.Background())
 				p.mu.Lock()
 				entry.err = err
+				entry.residual = processGroupExists(entry.pgid)
 				entry.terminal = true
+				entry.transport = nil
+				delete(p.drainFuture.entries, transport)
 				close(entry.done)
 				p.finalizeDrainLocked()
 				p.mu.Unlock()
-			}(entry)
+			}(entry, transport)
 		})
 	}
 }
@@ -324,8 +346,8 @@ func (p *systemPool) finalizeDrainLocked() {
 			return
 		}
 		joined = errors.Join(joined, entry.err)
-		if entry.err != nil && entry.transport != nil && entry.transport.pgid != 0 {
-			residualPGIDs = append(residualPGIDs, entry.transport.pgid)
+		if entry.residual && entry.pgid != 0 {
+			residualPGIDs = append(residualPGIDs, entry.pgid)
 		}
 	}
 	slices.Sort(residualPGIDs)
@@ -421,7 +443,12 @@ func (p *systemPool) publishTransport(generation uint64, t *systemWorkerTranspor
 	p.mu.Lock()
 	retired := p.pruneInvalidLocked(now)
 	if p.closed || generation != p.generation {
-		p.registerTransportLocked(t)
+		entry := p.registerTransportLocked(t)
+		if entry == nil {
+			p.mu.Unlock()
+			t.requestAbort()
+			return errors.Join(errors.New("stale pool generation"), t.waitAbort(context.Background()))
+		}
 		retired = append(retired, t)
 		p.mu.Unlock()
 		p.retireTransports(retired)

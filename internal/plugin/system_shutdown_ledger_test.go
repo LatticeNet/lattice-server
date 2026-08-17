@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -151,12 +152,13 @@ func TestPoolDrainFutureWaitReportsStablePendingSnapshot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	snapshot := future.wait(ctx)
-	wantPGIDs := []int{idle.pgid}
-	slices.Sort(wantPGIDs)
-	if snapshot.Generation != 1 || snapshot.Err == nil || !slices.Equal(snapshot.ResidualPGIDs, wantPGIDs) || !slices.Contains(snapshot.PendingStages, "joins") || !slices.Contains(snapshot.PendingStages, "leases") {
-		t.Fatalf("pending snapshot=%+v want pgids=%v", snapshot, wantPGIDs)
+	if snapshot.Generation != 1 || snapshot.Err == nil || !slices.Contains(snapshot.PendingStages, "joins") || !slices.Contains(snapshot.PendingStages, "leases") {
+		t.Fatalf("pending snapshot=%+v", snapshot)
 	}
-	snapshot.ResidualPGIDs[0] = -1
+	wantPGIDs := append([]int(nil), snapshot.ResidualPGIDs...)
+	if len(snapshot.ResidualPGIDs) > 0 {
+		snapshot.ResidualPGIDs[0] = -1
+	}
 	again := future.wait(ctx)
 	if !slices.Equal(again.ResidualPGIDs, wantPGIDs) {
 		t.Fatalf("snapshot was not deep/stable: %+v", again)
@@ -209,14 +211,123 @@ func TestSystemPoolRetirementPathsRegisterWithDrainLedger(t *testing.T) {
 			}
 			tc.act(p, worker)
 			p.mu.Lock()
-			entry := p.drainFuture.entries[tr]
+			entry := p.drainFuture.ordered[len(p.drainFuture.ordered)-1]
+			activeEntries := len(p.drainFuture.entries)
 			p.mu.Unlock()
-			if entry == nil || !entry.terminal {
-				t.Fatalf("retirement was not terminal in shared ledger: %#v", entry)
+			if entry == nil || !entry.terminal || entry.transport != nil || entry.pgid != tr.pgid || activeEntries != 0 {
+				t.Fatalf("retirement was not compacted in shared ledger: entry=%#v active=%d", entry, activeEntries)
 			}
 			if result := p.beginDrain(true, 1).wait(t.Context()); result.Err != nil {
 				t.Fatalf("drain result=%+v", result)
 			}
 		})
 	}
+}
+
+func TestSystemPoolFailedReadinessCandidateCleanupReachesLedger(t *testing.T) {
+	p := newSystemPool(8, time.Hour, 1)
+	injected := errors.New("injected readiness cleanup failure")
+	p.replenishFn = func(context.Context, uint64) (*pooledWorker, error) {
+		tr := startReadyTestWorker(t)
+		tr.reapProcessGroupFn = func() error {
+			_ = tr.reapProcessGroup()
+			return injected
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		defer cancel()
+		return readyPooledWorker(ctx, 1, tr)
+	}
+	p.failureFn = func(uint64) { p.setCircuitOpen(true) }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := p.checkout(ctx, time.Now()); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("checkout error=%v want circuit open", err)
+	}
+	result := p.beginDrain(true, 1).wait(ctx)
+	if !errors.Is(result.Err, injected) {
+		t.Fatalf("cleanup result=%+v want injected residual", result)
+	}
+}
+
+func TestSystemPoolLateRejectedPublishOwnsCleanupAfterFinalization(t *testing.T) {
+	p := newSystemPool(8, time.Hour, 1)
+	if result := p.beginDrain(true, 1).wait(t.Context()); result.Err != nil {
+		t.Fatalf("empty drain=%+v", result)
+	}
+	tr := startReadyTestWorker(t)
+	injected := errors.New("injected late-candidate cleanup failure")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	tr.beforeAbortFinish = func() { close(entered); <-release }
+	tr.reapProcessGroupFn = func() error {
+		_ = tr.reapProcessGroup()
+		return injected
+	}
+	published := make(chan error, 1)
+	go func() { published <- p.publishTransport(1, tr, time.Now()) }()
+	<-entered
+	select {
+	case err := <-published:
+		t.Fatalf("rejected publish returned before owned cleanup joined: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-published; !errors.Is(err, injected) {
+		t.Fatalf("rejected publish lost cleanup error: %v", err)
+	}
+}
+
+func TestSystemPoolTerminalRetirementsCompactTransportReferences(t *testing.T) {
+	p := newSystemPool(1, time.Hour, 1)
+	const churn = 32
+	for i := 0; i < churn; i++ {
+		tr := startReadyTestWorker(t)
+		if err := p.publishTransport(1, tr, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		worker, err := p.checkout(t.Context(), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.poison(worker)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.drainFuture.entries) != 0 || len(p.drainFuture.ordered) != churn {
+		t.Fatalf("active entries=%d summaries=%d want 0/%d", len(p.drainFuture.entries), len(p.drainFuture.ordered), churn)
+	}
+	for i, entry := range p.drainFuture.ordered {
+		if !entry.terminal || entry.transport != nil || entry.pgid == 0 {
+			t.Fatalf("summary %d retained terminal transport: %#v", i, entry)
+		}
+	}
+}
+
+func TestPoolCleanupResidualPGIDsRequirePositiveLiveness(t *testing.T) {
+	for _, stage := range []string{"pipe-close", "stdout-join", "stderr-join", "leader-wait"} {
+		t.Run(stage, func(t *testing.T) {
+			p := newSystemPool(8, time.Hour, 1)
+			injected := errors.New("injected " + stage + " failure")
+			p.mu.Lock()
+			p.closed = true
+			p.drainFuture.started = true
+			p.drainFuture.ordered = append(p.drainFuture.ordered, &poolDrainEntry{
+				sequence: 1, pgid: 1 << 30, done: closedTestChannel(), terminal: true,
+				err: &processGroupResidualError{PGID: 1 << 30, Stage: stage, Err: injected},
+			})
+			p.finalizeDrainLocked()
+			p.mu.Unlock()
+			result := p.drainFuture.wait(t.Context())
+			var affected *processGroupResidualError
+			if len(result.ResidualPGIDs) != 0 || !errors.As(result.Err, &affected) || affected.Stage != stage || !errors.Is(result.Err, injected) {
+				t.Fatalf("result=%+v affected=%#v", result, affected)
+			}
+		})
+	}
+}
+
+func closedTestChannel() chan struct{} {
+	done := make(chan struct{})
+	close(done)
+	return done
 }

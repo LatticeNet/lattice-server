@@ -519,7 +519,7 @@ func (t *systemWorkerTransport) finishAbort() {
 
 	t.waitMu.Lock()
 	waitErr := t.waitErr
-	if _, expectedSignalExit := waitErr.(*exec.ExitError); expectedSignalExit && groupErr == nil && !processGroupExists(t.pgid) {
+	if isExpectedTransportTeardownExit(waitErr) && groupErr == nil && !processGroupExists(t.pgid) {
 		waitErr = nil
 	}
 	if waitErr != nil {
@@ -536,6 +536,18 @@ func (t *systemWorkerTransport) finishAbort() {
 	t.abortErr = errors.Join(t.requestErr, groupErr, waitErr, pipeErr, readErr, stderrErr)
 	t.abortStage = "complete"
 	t.waitMu.Unlock()
+}
+
+func isExpectedTransportTeardownExit(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return false
+	}
+	return status.Signal() == syscall.SIGTERM || status.Signal() == syscall.SIGKILL
 }
 
 func (t *systemWorkerTransport) setAbortStage(stage string) {

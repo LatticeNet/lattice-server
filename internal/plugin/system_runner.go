@@ -248,11 +248,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 			if err != nil {
 				return nil, err
 			}
-			if err := t.awaitReadyContext(ctx, gen); err != nil {
-				_ = t.abort()
-				return nil, err
-			}
-			return &pooledWorker{generation: gen, started: time.Now(), transport: t}, nil
+			return readyPooledWorker(ctx, gen, t)
 		}
 		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.v2ChildEnv(req.Generation))
@@ -301,6 +297,17 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 	committed = true
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
+}
+
+func readyPooledWorker(ctx context.Context, generation uint64, transport *systemWorkerTransport) (*pooledWorker, error) {
+	worker := &pooledWorker{generation: generation, started: time.Now(), transport: transport}
+	if err := transport.awaitReadyContext(ctx, generation); err != nil {
+		// Return the failed candidate with the readiness error so the supervisor
+		// registers its owned teardown in the generation ledger. awaitReadyContext
+		// has already joined the abort; the ledger preserves any cleanup residual.
+		return worker, err
+	}
+	return worker, nil
 }
 
 func (r *SystemRunner) latestStateLocked(pluginID string) *systemPluginState {

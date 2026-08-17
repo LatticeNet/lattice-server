@@ -38,7 +38,9 @@ type systemPool struct {
 	waiters     []chan poolCheckoutResult
 	maxUses     int
 	maxAge      time.Duration
+	size        int
 	maxOverflow int
+	activated   bool
 	closed      bool
 	replenishFn func(context.Context, uint64) (*pooledWorker, error)
 	failureFn   func(uint64)
@@ -379,19 +381,26 @@ func (p *systemPool) hasTransport() bool {
 }
 
 func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *systemPool {
+	generation := uint64(1)
+	if len(generations) > 0 && generations[0] != 0 {
+		generation = generations[0]
+	}
+	return newConfiguredSystemPool(1, 1, maxUses, maxAge, generation)
+}
+
+func newConfiguredSystemPool(size, maxOverflow, maxUses int, maxAge time.Duration, generation uint64) *systemPool {
 	if maxUses <= 0 {
 		maxUses = 256
 	}
 	if maxAge <= 0 {
 		maxAge = time.Hour
 	}
-	generation := uint64(1)
-	if len(generations) > 0 && generations[0] != 0 {
-		generation = generations[0]
+	if generation == 0 {
+		generation = 1
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &systemPool{
-		maxUses: maxUses, maxAge: maxAge, generation: generation, maxOverflow: 1,
+		maxUses: maxUses, maxAge: maxAge, generation: generation, size: size, maxOverflow: maxOverflow,
 		leased:   map[*pooledWorker]struct{}{},
 		superCtx: ctx, superCancel: cancel, superSignal: make(chan struct{}, 1),
 		superDone: make(chan struct{}), backoffBase: 100 * time.Millisecond,
@@ -415,6 +424,15 @@ func newSystemPool(maxUses int, maxAge time.Duration, generations ...uint64) *sy
 	return p
 }
 
+func (p *systemPool) capacityLocked() int { return p.size + p.maxOverflow }
+
+func (p *systemPool) activate() {
+	p.mu.Lock()
+	p.activated = true
+	p.requestReplenishLocked()
+	p.mu.Unlock()
+}
+
 func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error {
 	p.mu.Lock()
 	retired := p.pruneInvalidLocked(now)
@@ -423,7 +441,7 @@ func (p *systemPool) publish(generation uint64, ready bool, now time.Time) error
 		p.retireTransports(retired)
 		return errors.New("stale pool generation")
 	}
-	if len(p.workers)+p.active >= 1+p.maxOverflow {
+	if len(p.workers)+p.active >= p.capacityLocked() {
 		p.mu.Unlock()
 		p.retireTransports(retired)
 		return errors.New("pool capacity exceeded")
@@ -458,7 +476,7 @@ func (p *systemPool) publishTransport(generation uint64, t *systemWorkerTranspor
 		p.retireTransports(retired)
 		return errors.New("stale pool generation")
 	}
-	if len(p.workers)+p.active >= 1+p.maxOverflow {
+	if len(p.workers)+p.active >= p.capacityLocked() {
 		p.registerTransportLocked(t)
 		retired = append(retired, t)
 		p.mu.Unlock()
@@ -693,8 +711,11 @@ func (p *systemPool) replenishSupervisor() {
 		for {
 			p.mu.Lock()
 			desired := 1
+			if p.activated {
+				desired = p.size
+			}
 			if len(p.waiters) > 0 {
-				desired += p.maxOverflow
+				desired = min(desired+p.maxOverflow, p.capacityLocked())
 			}
 			retired := p.pruneInvalidLocked(time.Now())
 			owned := len(p.workers) + p.active + p.starting
@@ -718,7 +739,7 @@ func (p *systemPool) replenishSupervisor() {
 			if p.starting > 0 {
 				p.starting--
 			}
-			valid := err == nil && nw != nil && !p.closed && !p.circuitOpen && p.generation == generation && len(p.workers)+p.active < 1+p.maxOverflow
+			valid := err == nil && nw != nil && !p.closed && !p.circuitOpen && p.generation == generation && len(p.workers)+p.active < p.capacityLocked()
 			if valid {
 				nw.state = workerIdle
 				nw.generation = generation
@@ -744,7 +765,7 @@ func (p *systemPool) replenishSupervisor() {
 					successFn(generation)
 				}
 				p.mu.Lock()
-				valid = !p.closed && !p.circuitOpen && p.generation == generation && len(p.workers)+p.active < 1+p.maxOverflow
+				valid = !p.closed && !p.circuitOpen && p.generation == generation && len(p.workers)+p.active < p.capacityLocked()
 				if valid {
 					p.workers = append(p.workers, nw)
 					retired = append(retired, p.wakeLocked(time.Now())...)

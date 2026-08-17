@@ -41,7 +41,11 @@ func newRunner(t *testing.T, opts SystemRunnerOptions) *SystemRunner {
 	if opts.RuntimeDir == "" {
 		opts.RuntimeDir = t.TempDir()
 	}
-	return NewSystemRunner(opts)
+	runner, err := NewSystemRunner(opts)
+	if err != nil {
+		t.Fatalf("NewSystemRunner: %v", err)
+	}
+	return runner
 }
 
 func startInvoke(t *testing.T, r *SystemRunner, loaded Loaded, action string, payload json.RawMessage) (InvokeResponse, error) {
@@ -777,7 +781,10 @@ func TestSystemRunnerV2StagesVerifiedSelectedRuntime(t *testing.T) {
 
 func TestSystemRunnerV2RejectsZeroGenerationBeforeStaging(t *testing.T) {
 	runtimeDir := t.TempDir()
-	r := NewSystemRunner(SystemRunnerOptions{RuntimeDir: runtimeDir})
+	r, err := NewSystemRunner(SystemRunnerOptions{RuntimeDir: runtimeDir})
+	if err != nil {
+		t.Fatal(err)
+	}
 	loaded := makeBundle(t, "p.zero", "#!/bin/sh\nexit 0\n", "")
 	loaded.Manifest.Runtime = &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV2}
 	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err == nil || !strings.Contains(err.Error(), "generation 0") {
@@ -802,7 +809,10 @@ func TestSystemRunnerV2PassesGenerationEnvironmentAboveOne(t *testing.T) {
 		Manifest:   Manifest{ID: "p.genenv", Name: "generation env", Type: TypeSystem, Runtime: &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV2}},
 		BundlePath: dir,
 	}
-	r := NewSystemRunner(SystemRunnerOptions{RuntimeDir: t.TempDir(), EnvAllowlist: []string{"LATTICE_TEST_V2_HELPER"}})
+	r, err := NewSystemRunner(SystemRunnerOptions{RuntimeDir: t.TempDir(), EnvAllowlist: []string{"LATTICE_TEST_V2_HELPER"}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 7, Loaded: loaded}); err != nil {
 		t.Fatal(err)
 	}
@@ -1052,7 +1062,10 @@ func (f fakeRPCHost) CallGranted(ctx context.Context, caller string, grant RPCGr
 // invoke a plugin backed by the noop runner.
 func TestRuntimeManagerInvokeRoutesToSystemRunner(t *testing.T) {
 	rtDir := t.TempDir()
-	sys := NewSystemRunner(SystemRunnerOptions{RuntimeDir: rtDir})
+	sys, err := NewSystemRunner(SystemRunnerOptions{RuntimeDir: rtDir})
+	if err != nil {
+		t.Fatal(err)
+	}
 	mgr := NewRuntimeManagerWithOptions(RuntimeManagerOptions{Runners: map[string]Runner{TypeSystem: sys}})
 	loaded := makeBundle(t, "p.mgr", "#!/bin/sh\nread line\necho '{\"ok\":true,\"result\":{\"ran\":true}}'\n", "")
 	if _, err := mgr.Start(context.Background(), loaded); err != nil {

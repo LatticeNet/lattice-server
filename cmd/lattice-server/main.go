@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -66,6 +67,10 @@ func main() {
 	var taskExecDisabled bool
 	var approvalAutoRules string
 	var printVersion bool
+	pluginRuntimePool, err := bindPluginRuntimePoolFlags(flag.CommandLine, os.LookupEnv)
+	if err != nil {
+		log.Fatal(err)
+	}
 	flag.StringVar(&listen, "listen", env("LATTICE_LISTEN", "127.0.0.1:8088"), "listen address")
 	flag.StringVar(&dataPath, "data", env("LATTICE_DATA", defaultDataPath()), "state file path")
 	flag.StringVar(&webRoot, "web", env("LATTICE_WEB_ROOT", "../lattice-dashboard"), "static dashboard root")
@@ -94,6 +99,9 @@ func main() {
 	flag.StringVar(&approvalAutoRules, "approval-auto-rules", env("LATTICE_APPROVAL_AUTO_RULES", ""), "JSON array of approval auto-approve rules (empty keeps approvals fully manual)")
 	flag.BoolVar(&printVersion, "version", false, "print lattice-server version and exit")
 	flag.Parse()
+	if err := plugin.ValidateSystemPoolConfig(*pluginRuntimePool); err != nil {
+		log.Fatal(err)
+	}
 	if printVersion {
 		fmt.Printf("lattice-server %s (%s, %s)\n", version, commit, date)
 		return
@@ -190,6 +198,7 @@ func main() {
 		PluginBundleCacheDir: pluginBundleCacheDir,
 		PluginRuntimeDir:     pluginRuntimeDir,
 		PluginRuntimeEnv:     pluginRuntimeEnvAllowlist,
+		PluginRuntimePool:    pluginRuntimePool,
 		PluginTrust:          trustPolicy,
 		PublicURL:            publicURL,
 		MetricsToken:         os.Getenv("LATTICE_METRICS_TOKEN"),
@@ -337,6 +346,73 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		log.Fatalf("invalid %s duration %q: %v", key, raw, err)
 	}
 	return d
+}
+
+func bindPluginRuntimePoolFlags(fs *flag.FlagSet, lookupEnv func(string) (string, bool)) (*plugin.SystemPoolConfig, error) {
+	cfg := plugin.SystemPoolConfig{
+		Size:         1,
+		MaxOverflow:  1,
+		StartTimeout: 15 * time.Second,
+		MaxUses:      256,
+		MaxAge:       time.Hour,
+	}
+	ints := []struct {
+		key string
+		dst *int
+	}{
+		{"LATTICE_PLUGIN_RUNTIME_POOL_SIZE", &cfg.Size},
+		{"LATTICE_PLUGIN_RUNTIME_POOL_MAX_OVERFLOW", &cfg.MaxOverflow},
+		{"LATTICE_PLUGIN_RUNTIME_WORKER_MAX_USES", &cfg.MaxUses},
+	}
+	for _, item := range ints {
+		if raw, ok := lookupEnv(item.key); ok {
+			value, err := strconv.Atoi(strings.TrimSpace(raw))
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s integer %q: %w", item.key, raw, err)
+			}
+			*item.dst = value
+		}
+	}
+	durations := []struct {
+		key string
+		dst *time.Duration
+	}{
+		{"LATTICE_PLUGIN_RUNTIME_WORKER_START_TIMEOUT", &cfg.StartTimeout},
+		{"LATTICE_PLUGIN_RUNTIME_WORKER_MAX_AGE", &cfg.MaxAge},
+	}
+	for _, item := range durations {
+		if raw, ok := lookupEnv(item.key); ok {
+			value, err := time.ParseDuration(strings.TrimSpace(raw))
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s duration %q: %w", item.key, raw, err)
+			}
+			*item.dst = value
+		}
+	}
+	fs.IntVar(&cfg.Size, "plugin-runtime-pool-size", cfg.Size, "persistent stdio-json-v2 workers per plugin")
+	fs.IntVar(&cfg.MaxOverflow, "plugin-runtime-pool-max-overflow", cfg.MaxOverflow, "additional stdio-json-v2 workers allowed while invocations wait")
+	fs.DurationVar(&cfg.StartTimeout, "plugin-runtime-worker-start-timeout", cfg.StartTimeout, "timeout for one stdio-json-v2 worker to become ready")
+	fs.IntVar(&cfg.MaxUses, "plugin-runtime-worker-max-uses", cfg.MaxUses, "maximum invocations before retiring a stdio-json-v2 worker")
+	fs.DurationVar(&cfg.MaxAge, "plugin-runtime-worker-max-age", cfg.MaxAge, "maximum age before retiring a stdio-json-v2 worker")
+	return &cfg, nil
+}
+
+func parsePluginRuntimePoolConfig(args []string, lookupEnv func(string) (string, bool)) (plugin.SystemPoolConfig, error) {
+	fs := flag.NewFlagSet("lattice-server pool", flag.ContinueOnError)
+	cfg, err := bindPluginRuntimePoolFlags(fs, lookupEnv)
+	if err != nil {
+		return plugin.SystemPoolConfig{}, err
+	}
+	if err := fs.Parse(args); err != nil {
+		return plugin.SystemPoolConfig{}, err
+	}
+	if fs.NArg() != 0 {
+		return plugin.SystemPoolConfig{}, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	if err := plugin.ValidateSystemPoolConfig(*cfg); err != nil {
+		return plugin.SystemPoolConfig{}, err
+	}
+	return *cfg, nil
 }
 
 func parseEnvAllowlist(raw string) ([]string, error) {

@@ -37,10 +37,48 @@ const (
 	defaultMaxHostCalls   = DefaultInvokeHostCalls
 )
 
+var defaultSystemPoolConfig = SystemPoolConfig{
+	Size:         1,
+	MaxOverflow:  1,
+	StartTimeout: 15 * time.Second,
+	MaxUses:      256,
+	MaxAge:       time.Hour,
+}
+
 // ErrCircuitOpen is returned once a plugin has failed CrashThreshold times in a
 // row. The operator must disable+re-enable (restart) the plugin to reset it; a
 // flapping plugin cannot keep consuming resources.
 var ErrCircuitOpen = errors.New("plugin circuit breaker open")
+
+// SystemPoolConfig configures the persistent stdio-json-v2 worker pool.
+type SystemPoolConfig struct {
+	Size         int
+	MaxOverflow  int
+	StartTimeout time.Duration
+	MaxUses      int
+	MaxAge       time.Duration
+}
+
+// ValidateSystemPoolConfig checks the host-side resource bounds without
+// creating runtime directories or starting plugin processes.
+func ValidateSystemPoolConfig(cfg SystemPoolConfig) error {
+	switch {
+	case cfg.Size < 1 || cfg.Size > 32:
+		return fmt.Errorf("plugin runtime pool size must be between 1 and 32 (got %d)", cfg.Size)
+	case cfg.MaxOverflow < 0 || cfg.MaxOverflow > 31:
+		return fmt.Errorf("plugin runtime pool max overflow must be between 0 and 31 (got %d)", cfg.MaxOverflow)
+	case cfg.Size+cfg.MaxOverflow > 32:
+		return fmt.Errorf("plugin runtime pool capacity must not exceed 32 (got %d)", cfg.Size+cfg.MaxOverflow)
+	case cfg.StartTimeout < time.Second || cfg.StartTimeout > 60*time.Second:
+		return fmt.Errorf("plugin runtime worker start timeout must be between 1s and 60s (got %s)", cfg.StartTimeout)
+	case cfg.MaxUses < 1 || cfg.MaxUses > 65536:
+		return fmt.Errorf("plugin runtime worker max uses must be between 1 and 65536 (got %d)", cfg.MaxUses)
+	case cfg.MaxAge < time.Minute || cfg.MaxAge > 24*time.Hour:
+		return fmt.Errorf("plugin runtime worker max age must be between 1m and 24h (got %s)", cfg.MaxAge)
+	default:
+		return nil
+	}
+}
 
 // SystemRunnerOptions configures the trusted-subprocess runner.
 type SystemRunnerOptions struct {
@@ -66,6 +104,9 @@ type SystemRunnerOptions struct {
 	MaxHostCalls int
 	// Logf receives host-visible runtime warnings. Nil disables warning logs.
 	Logf func(format string, args ...any)
+	// Pool controls stdio-json-v2 worker capacity and retirement. Nil uses safe
+	// host defaults; a non-nil value is validated exactly, including zero overflow.
+	Pool *SystemPoolConfig
 }
 
 type systemPluginState struct {
@@ -147,6 +188,7 @@ func generationCleanupError(result GenerationCleanupResult) *GenerationCleanupEr
 // SystemRunner implements Runner and Invoker.
 type SystemRunner struct {
 	opts            SystemRunnerOptions
+	poolConfig      SystemPoolConfig
 	mu              sync.Mutex
 	st              map[string]map[uint64]*systemPluginState
 	budgetWarnings  map[string]bool
@@ -157,9 +199,20 @@ type SystemRunner struct {
 	removeAll       func(string) error
 }
 
-// NewSystemRunner returns a system runner with the given options and safe
-// defaults for any zero-valued bound.
-func NewSystemRunner(opts SystemRunnerOptions) *SystemRunner {
+// NewSystemRunner returns a checked system runner with the given options and
+// safe defaults for any zero-valued legacy invocation bound.
+func NewSystemRunner(opts SystemRunnerOptions) (*SystemRunner, error) {
+	opts.RuntimeDir = strings.TrimSpace(opts.RuntimeDir)
+	if opts.RuntimeDir == "" {
+		return nil, errors.New("system runner requires a RuntimeDir")
+	}
+	poolConfig := defaultSystemPoolConfig
+	if opts.Pool != nil {
+		poolConfig = *opts.Pool
+	}
+	if err := ValidateSystemPoolConfig(poolConfig); err != nil {
+		return nil, err
+	}
 	if opts.InvokeTimeout <= 0 {
 		opts.InvokeTimeout = defaultInvokeTimeout
 	}
@@ -175,7 +228,7 @@ func NewSystemRunner(opts SystemRunnerOptions) *SystemRunner {
 	if opts.MaxHostCalls <= 0 {
 		opts.MaxHostCalls = defaultMaxHostCalls
 	}
-	return &SystemRunner{opts: opts, st: map[string]map[uint64]*systemPluginState{}, budgetWarnings: map[string]bool{}, startLocks: map[string]*sync.Mutex{}, draining: map[*systemPool]string{}}
+	return &SystemRunner{opts: opts, poolConfig: poolConfig, st: map[string]map[uint64]*systemPluginState{}, budgetWarnings: map[string]bool{}, startLocks: map[string]*sync.Mutex{}, draining: map[*systemPool]string{}}, nil
 }
 
 func (r *SystemRunner) Name() string { return "system" }
@@ -271,12 +324,12 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		return RunnerStartResult{}, fmt.Errorf("stage artifact: %w", err)
 	}
 
-	pool := newSystemPool(256, time.Hour, req.Generation)
+	pool := newConfiguredSystemPool(r.poolConfig.Size, r.poolConfig.MaxOverflow, r.poolConfig.MaxUses, r.poolConfig.MaxAge, req.Generation)
 	pool.failureFn = func(generation uint64) { r.recordGenerationFailure(pluginID, generation) }
 	pool.successFn = func(generation uint64) { r.recordGenerationSuccess(pluginID, generation) }
 	if isV2 {
 		pool.replenishFn = func(parent context.Context, gen uint64) (*pooledWorker, error) {
-			ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+			ctx, cancel := context.WithTimeout(parent, r.poolConfig.StartTimeout)
 			defer cancel()
 			t, err := startSystemWorker(ctx, execPath, workDir, r.v2ChildEnv(gen))
 			if err != nil {
@@ -284,7 +337,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 			}
 			return readyPooledWorker(ctx, gen, t)
 		}
-		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		startupCtx, cancel := context.WithTimeout(ctx, r.poolConfig.StartTimeout)
 		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.v2ChildEnv(req.Generation))
 		if startErr == nil {
 			startErr = transport.awaitReadyContext(startupCtx, req.Generation)
@@ -358,15 +411,19 @@ func (r *SystemRunner) latestStateLocked(pluginID string) *systemPluginState {
 
 func (r *SystemRunner) ActivateGeneration(pluginID string, generation uint64) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closing {
+		r.mu.Unlock()
 		return errors.New("system runner is closed")
 	}
 	st := r.st[pluginID][generation]
 	if st == nil || st.retiring {
+		r.mu.Unlock()
 		return fmt.Errorf("system runner generation %d is not prepared", generation)
 	}
 	st.admitted = true
+	pool := st.pool
+	r.mu.Unlock()
+	pool.activate()
 	return nil
 }
 

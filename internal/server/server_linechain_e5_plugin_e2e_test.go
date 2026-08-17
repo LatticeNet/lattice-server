@@ -33,7 +33,7 @@ import (
 
 const (
 	e5VPNCoreHead  = "e0af25babf99a90dc3f41701f6b232eadabe05cf"
-	e5SubStoreHead = "7434d7aee8fea649633aefafa96a9b5497e622a6"
+	e5SubStoreHead = "d32ed727b3778055dc9b6070da177ae308e5d49b"
 )
 
 type e5PluginServerFixture struct {

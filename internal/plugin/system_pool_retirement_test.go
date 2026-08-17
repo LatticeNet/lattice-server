@@ -805,7 +805,10 @@ func readyTestSpawner(t *testing.T, flags ...string) func(context.Context) (*sys
 }
 
 func runnerWithPool(pool *systemPool, broker *Broker) *SystemRunner {
-	runner := NewSystemRunner(SystemRunnerOptions{})
+	runner, err := NewSystemRunner(SystemRunnerOptions{RuntimeDir: "unused"})
+	if err != nil {
+		panic(err)
+	}
 	runner.st[retirementTestPluginID] = map[uint64]*systemPluginState{
 		pool.generation: {pool: pool, isV2: true, broker: broker, generation: pool.generation, admitted: true},
 	}

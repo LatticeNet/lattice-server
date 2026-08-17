@@ -207,20 +207,26 @@ func TestRuntimeManagerFailedStopDetachesHostAccess(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the failing stop hook to surface an error")
 	}
-	if rt.State != RuntimeStateFailed {
-		t.Fatalf("failed stop should mark state failed, got %+v", rt)
+	if rt.State != RuntimeStateDegraded || rt.StoppedAt.IsZero() == false {
+		t.Fatalf("failed physical stop should remain degraded, got %+v", rt)
 	}
 	if runner.stopCalls != 1 {
 		t.Fatalf("first stop should call the runner once, got %d", runner.stopCalls)
 	}
 
-	// Second stop must be a no-op on the runner: a failed stop already detached the
-	// runner handle, proving host access is no longer armed for this plugin.
-	if _, err := m.Stop("stuck.bundle", "operator disabled again"); err != nil {
-		t.Fatalf("second stop after a failed stop should succeed cleanly, got %v", err)
+	// The second observer joins the same immutable physical future. It must see
+	// the same terminal failure without invoking the runner again.
+	if _, err := m.Stop("stuck.bundle", "operator disabled again"); !errors.Is(err, runner.stopErr) {
+		t.Fatalf("second stop lost the terminal cleanup error, got %v", err)
 	}
 	if runner.stopCalls != 1 {
 		t.Fatalf("failed stop must detach the runner; runner re-invoked, stopCalls=%d", runner.stopCalls)
+	}
+	m.mu.Lock()
+	future := m.stopFutures[loaded.Manifest.ID][m.latestGen[loaded.Manifest.ID]]
+	m.mu.Unlock()
+	if future == nil || future.runner != runner || future.broker == nil {
+		t.Fatalf("degraded cleanup lost residual ownership: %+v", future)
 	}
 	if m.IsArmed("stuck.bundle") {
 		t.Fatal("plugin must not be armed after a failed stop")
@@ -248,10 +254,16 @@ func TestRuntimeManagerStopDoesNotClobberNewStart(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stopDone := make(chan error, 1)
+	stopDone := make(chan struct {
+		status RuntimeStatus
+		err    error
+	}, 1)
 	go func() {
-		_, err := m.Stop("ops.bundle", "old stop")
-		stopDone <- err
+		status, err := m.Stop("ops.bundle", "old stop")
+		stopDone <- struct {
+			status RuntimeStatus
+			err    error
+		}{status: status, err: err}
 	}()
 	<-runner.stopEntered
 
@@ -259,8 +271,9 @@ func TestRuntimeManagerStopDoesNotClobberNewStart(t *testing.T) {
 		t.Fatal(err)
 	}
 	close(runner.releaseStop)
-	if err := <-stopDone; err != nil {
-		t.Fatal(err)
+	result := <-stopDone
+	if result.err != nil || result.status.State != RuntimeStateStopped || result.status.StoppedAt.IsZero() {
+		t.Fatalf("old stop observer lost frozen terminal result: status=%+v err=%v", result.status, result.err)
 	}
 
 	got, ok := m.Status("ops.bundle")
@@ -658,7 +671,7 @@ func TestRuntimeManagerStopAndSnapshotAreSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stopped.State != RuntimeStateStopped || stopped.Message != "operator disabled plugin" || stopped.StoppedAt.IsZero() {
+	if stopped.State != RuntimeStateStopped || stopped.Message != runtimeStoppedMessage || stopped.StoppedAt.IsZero() {
 		t.Fatalf("unexpected stopped runtime: %+v", stopped)
 	}
 	if m.IsArmed("log.bundle") {

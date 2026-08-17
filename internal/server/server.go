@@ -96,6 +96,9 @@ type Options struct {
 	// to Tier-2 system plugins. Empty means plugins receive only the runner's
 	// fixed safe PATH/HOME/TMPDIR.
 	PluginRuntimeEnv []string
+	// PluginRuntimePool controls persistent stdio-json-v2 worker capacity and
+	// retirement. Nil uses the system runner's safe host defaults.
+	PluginRuntimePool *plugin.SystemPoolConfig
 	// PublicURL is the externally-reachable base URL of this server (scheme +
 	// host, no trailing slash), used to build the OIDC redirect URL. Required
 	// for SSO login; empty disables the OIDC start/callback flow. It is also the
@@ -384,6 +387,11 @@ func New(opts Options) (*Server, error) {
 	if opts.Store == nil {
 		return nil, errors.New("store is required")
 	}
+	if opts.PluginRuntimePool != nil {
+		if err := plugin.ValidateSystemPoolConfig(*opts.PluginRuntimePool); err != nil {
+			return nil, fmt.Errorf("configure plugin runtime: %w", err)
+		}
+	}
 	if opts.Logger == nil {
 		opts.Logger = log.Default()
 	}
@@ -486,11 +494,16 @@ func New(opts Options) (*Server, error) {
 		// plan->approve->apply pipeline; the runner only runs the artifact's
 		// request/response actions. EnvAllowlist is empty (a safe fixed PATH is
 		// always provided), so no host env leaks into a plugin.
-		sysRunner := plugin.NewSystemRunner(plugin.SystemRunnerOptions{
+		sysRunner, err := plugin.NewSystemRunner(plugin.SystemRunnerOptions{
 			RuntimeDir:   dir,
 			EnvAllowlist: opts.PluginRuntimeEnv,
 			Logf:         s.logger.Printf,
+			Pool:         opts.PluginRuntimePool,
+			PoolObserver: pluginPoolTelemetry{},
 		})
+		if err != nil {
+			return nil, fmt.Errorf("configure plugin runtime: %w", err)
+		}
 		s.pluginRuntime = plugin.NewRuntimeManagerWithOptions(plugin.RuntimeManagerOptions{
 			Services: s.pluginHostServices(),
 			Runners:  map[string]plugin.Runner{plugin.TypeSystem: sysRunner},

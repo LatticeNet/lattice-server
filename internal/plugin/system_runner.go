@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,10 +37,48 @@ const (
 	defaultMaxHostCalls   = DefaultInvokeHostCalls
 )
 
+var defaultSystemPoolConfig = SystemPoolConfig{
+	Size:         1,
+	MaxOverflow:  1,
+	StartTimeout: 15 * time.Second,
+	MaxUses:      256,
+	MaxAge:       time.Hour,
+}
+
 // ErrCircuitOpen is returned once a plugin has failed CrashThreshold times in a
 // row. The operator must disable+re-enable (restart) the plugin to reset it; a
 // flapping plugin cannot keep consuming resources.
 var ErrCircuitOpen = errors.New("plugin circuit breaker open")
+
+// SystemPoolConfig configures the persistent stdio-json-v2 worker pool.
+type SystemPoolConfig struct {
+	Size         int
+	MaxOverflow  int
+	StartTimeout time.Duration
+	MaxUses      int
+	MaxAge       time.Duration
+}
+
+// ValidateSystemPoolConfig checks the host-side resource bounds without
+// creating runtime directories or starting plugin processes.
+func ValidateSystemPoolConfig(cfg SystemPoolConfig) error {
+	switch {
+	case cfg.Size < 1 || cfg.Size > 32:
+		return fmt.Errorf("plugin runtime pool size must be between 1 and 32 (got %d)", cfg.Size)
+	case cfg.MaxOverflow < 0 || cfg.MaxOverflow > 31:
+		return fmt.Errorf("plugin runtime pool max overflow must be between 0 and 31 (got %d)", cfg.MaxOverflow)
+	case cfg.Size+cfg.MaxOverflow > 32:
+		return fmt.Errorf("plugin runtime pool capacity must not exceed 32 (got %d)", cfg.Size+cfg.MaxOverflow)
+	case cfg.StartTimeout < time.Second || cfg.StartTimeout > 60*time.Second:
+		return fmt.Errorf("plugin runtime worker start timeout must be between 1s and 60s (got %s)", cfg.StartTimeout)
+	case cfg.MaxUses < 1 || cfg.MaxUses > 65536:
+		return fmt.Errorf("plugin runtime worker max uses must be between 1 and 65536 (got %d)", cfg.MaxUses)
+	case cfg.MaxAge < time.Minute || cfg.MaxAge > 24*time.Hour:
+		return fmt.Errorf("plugin runtime worker max age must be between 1m and 24h (got %s)", cfg.MaxAge)
+	default:
+		return nil
+	}
+}
 
 // SystemRunnerOptions configures the trusted-subprocess runner.
 type SystemRunnerOptions struct {
@@ -65,54 +104,95 @@ type SystemRunnerOptions struct {
 	MaxHostCalls int
 	// Logf receives host-visible runtime warnings. Nil disables warning logs.
 	Logf func(format string, args ...any)
+	// Pool controls stdio-json-v2 worker capacity and retirement. Nil uses safe
+	// host defaults; a non-nil value is validated exactly, including zero overflow.
+	Pool *SystemPoolConfig
+	// PoolObserver receives warm-pool telemetry at the pool's decision points.
+	// Nil observes nothing. The observer must be cheap and must not call back
+	// into the runner.
+	PoolObserver SystemPoolObserver
 }
 
 type systemPluginState struct {
-	pluginID        string
-	execPath        string
-	workDir         string
-	broker          *Broker
-	failures        int
-	startupFailures int
-	tripped         bool
-	pool            *systemPool
-	isV2            bool
-	generation      uint64
-	admitted        bool
-	retiring        bool
-	cleanupOnce     sync.Once
-	cleanupDone     chan struct{}
-	refs            int
-	forceAbort      bool
-	v1Active        map[uint64]context.CancelFunc
-	v1Next          uint64
-	rootCtx         context.Context
-	rootCancel      context.CancelFunc
-	cleanupErr      error
+	pluginID         string
+	execPath         string
+	workDir          string
+	broker           *Broker
+	failures         int
+	startupFailures  int
+	tripped          bool
+	pool             *systemPool
+	isV2             bool
+	generation       uint64
+	admitted         bool
+	retiring         bool
+	cleanupOnce      sync.Once
+	cleanupDone      chan struct{}
+	cleanupRequested bool
+	cleanupArmed     bool
+	refs             int
+	refsDone         chan struct{}
+	forceAbort       bool
+	v1Active         map[uint64]context.CancelFunc
+	v1Next           uint64
+	rootCtx          context.Context
+	rootCancel       context.CancelFunc
+	cleanupErr       error
+	cleanupResult    GenerationCleanupResult
+	poolFuture       *poolDrainFuture
+}
+
+// GenerationCleanupResult is the stable, caller-bounded view of one physical
+// generation teardown. Pending snapshots and the immutable terminal result use
+// the same shape so callers never lose ownership detail on timeout.
+type GenerationCleanupResult struct {
+	PluginID      string
+	Generation    uint64
+	Stage         string
+	PendingStages []string
+	ResidualPGIDs []int
+	Transport     error
+	Authority     error
+	RemoveAll     error
+	Err           error
 }
 
 // GenerationCleanupError preserves every residual from one generation's
 // teardown instead of collapsing transport, authority, and filesystem failure
 // into an apparently successful retirement.
 type GenerationCleanupError struct {
-	PluginID   string
-	Generation uint64
-	Transport  error
-	Authority  error
-	RemoveAll  error
+	PluginID      string
+	Generation    uint64
+	Stage         string
+	PendingStages []string
+	ResidualPGIDs []int
+	Transport     error
+	Authority     error
+	RemoveAll     error
+	Err           error
 }
 
 func (e *GenerationCleanupError) Error() string {
-	return fmt.Sprintf("generation %s/%d cleanup residual: %v", e.PluginID, e.Generation, errors.Join(e.Transport, e.Authority, e.RemoveAll))
+	return fmt.Sprintf("generation %s/%d %s: %v", e.PluginID, e.Generation, e.Stage, e.Unwrap())
 }
 
 func (e *GenerationCleanupError) Unwrap() error {
-	return errors.Join(e.Transport, e.Authority, e.RemoveAll)
+	return errors.Join(e.Err, e.Transport, e.Authority, e.RemoveAll)
+}
+
+func generationCleanupError(result GenerationCleanupResult) *GenerationCleanupError {
+	return &GenerationCleanupError{
+		PluginID: result.PluginID, Generation: result.Generation, Stage: result.Stage,
+		PendingStages: append([]string(nil), result.PendingStages...),
+		ResidualPGIDs: append([]int(nil), result.ResidualPGIDs...),
+		Transport:     result.Transport, Authority: result.Authority, RemoveAll: result.RemoveAll, Err: result.Err,
+	}
 }
 
 // SystemRunner implements Runner and Invoker.
 type SystemRunner struct {
 	opts            SystemRunnerOptions
+	poolConfig      SystemPoolConfig
 	mu              sync.Mutex
 	st              map[string]map[uint64]*systemPluginState
 	budgetWarnings  map[string]bool
@@ -123,9 +203,20 @@ type SystemRunner struct {
 	removeAll       func(string) error
 }
 
-// NewSystemRunner returns a system runner with the given options and safe
-// defaults for any zero-valued bound.
-func NewSystemRunner(opts SystemRunnerOptions) *SystemRunner {
+// NewSystemRunner returns a checked system runner with the given options and
+// safe defaults for any zero-valued legacy invocation bound.
+func NewSystemRunner(opts SystemRunnerOptions) (*SystemRunner, error) {
+	opts.RuntimeDir = strings.TrimSpace(opts.RuntimeDir)
+	if opts.RuntimeDir == "" {
+		return nil, errors.New("system runner requires a RuntimeDir")
+	}
+	poolConfig := defaultSystemPoolConfig
+	if opts.Pool != nil {
+		poolConfig = *opts.Pool
+	}
+	if err := ValidateSystemPoolConfig(poolConfig); err != nil {
+		return nil, err
+	}
 	if opts.InvokeTimeout <= 0 {
 		opts.InvokeTimeout = defaultInvokeTimeout
 	}
@@ -141,7 +232,7 @@ func NewSystemRunner(opts SystemRunnerOptions) *SystemRunner {
 	if opts.MaxHostCalls <= 0 {
 		opts.MaxHostCalls = defaultMaxHostCalls
 	}
-	return &SystemRunner{opts: opts, st: map[string]map[uint64]*systemPluginState{}, budgetWarnings: map[string]bool{}, startLocks: map[string]*sync.Mutex{}, draining: map[*systemPool]string{}}
+	return &SystemRunner{opts: opts, poolConfig: poolConfig, st: map[string]map[uint64]*systemPluginState{}, budgetWarnings: map[string]bool{}, startLocks: map[string]*sync.Mutex{}, draining: map[*systemPool]string{}}, nil
 }
 
 func (r *SystemRunner) Name() string { return "system" }
@@ -237,36 +328,45 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		return RunnerStartResult{}, fmt.Errorf("stage artifact: %w", err)
 	}
 
-	pool := newSystemPool(256, time.Hour, req.Generation)
+	pool := newConfiguredSystemPool(r.poolConfig.Size, r.poolConfig.MaxOverflow, r.poolConfig.MaxUses, r.poolConfig.MaxAge, req.Generation)
+	pool.obs = r.opts.PoolObserver
 	pool.failureFn = func(generation uint64) { r.recordGenerationFailure(pluginID, generation) }
 	pool.successFn = func(generation uint64) { r.recordGenerationSuccess(pluginID, generation) }
 	if isV2 {
 		pool.replenishFn = func(parent context.Context, gen uint64) (*pooledWorker, error) {
-			ctx, cancel := context.WithTimeout(parent, 15*time.Second)
+			ctx, cancel := context.WithTimeout(parent, r.poolConfig.StartTimeout)
 			defer cancel()
 			t, err := startSystemWorker(ctx, execPath, workDir, r.v2ChildEnv(gen))
 			if err != nil {
 				return nil, err
 			}
-			if err := t.awaitReadyContext(ctx, gen); err != nil {
-				_ = t.abort()
-				return nil, err
-			}
-			return &pooledWorker{generation: gen, started: time.Now(), transport: t}, nil
+			return readyPooledWorker(ctx, gen, t)
 		}
-		startupCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		startupCtx, cancel := context.WithTimeout(ctx, r.poolConfig.StartTimeout)
+		startBegan := time.Now()
 		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.v2ChildEnv(req.Generation))
 		if startErr == nil {
 			startErr = transport.awaitReadyContext(startupCtx, req.Generation)
 		}
 		cancel()
+		// The prepare-time first worker is a start attempt like any the
+		// supervisor makes, and is observed identically.
+		observeSystemPoolDuration(r.opts.PoolObserver, SystemPoolDurationStart, time.Since(startBegan))
 		if startErr != nil {
+			// Only a failure the worker owns counts: when the caller's own
+			// context ended (canceled or deadline), the start was preempted,
+			// not failed.
+			if ctx.Err() == nil {
+				observeSystemPoolLifecycle(r.opts.PoolObserver, SystemPoolLifecycleWorkerStartFailure)
+			}
 			if transport != nil {
 				_ = transport.abort()
 			}
 			return RunnerStartResult{}, fmt.Errorf("start v2 worker: %w", startErr)
 		}
+		observeSystemPoolLifecycle(r.opts.PoolObserver, SystemPoolLifecycleWorkerStartSuccess)
 		if err := pool.publishTransport(req.Generation, transport, time.Now()); err != nil {
+			observeSystemPoolRetirements(r.opts.PoolObserver, SystemPoolRetirementRejected, 1)
 			_ = transport.abort()
 			return RunnerStartResult{}, err
 		}
@@ -297,10 +397,23 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		r.st[pluginID] = byGeneration
 	}
 	rootCtx, rootCancel := context.WithCancel(context.Background())
-	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel}
+	refsDone := make(chan struct{})
+	close(refsDone)
+	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), refsDone: refsDone, v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel}
 	committed = true
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
+}
+
+func readyPooledWorker(ctx context.Context, generation uint64, transport *systemWorkerTransport) (*pooledWorker, error) {
+	worker := &pooledWorker{generation: generation, started: time.Now(), transport: transport}
+	if err := transport.awaitReadyContext(ctx, generation); err != nil {
+		// Return the failed candidate with the readiness error so the supervisor
+		// registers its owned teardown in the generation ledger before the
+		// canonical retirement future requests and joins abort.
+		return worker, err
+	}
+	return worker, nil
 }
 
 func (r *SystemRunner) latestStateLocked(pluginID string) *systemPluginState {
@@ -315,51 +428,31 @@ func (r *SystemRunner) latestStateLocked(pluginID string) *systemPluginState {
 
 func (r *SystemRunner) ActivateGeneration(pluginID string, generation uint64) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.closing {
+		r.mu.Unlock()
 		return errors.New("system runner is closed")
 	}
 	st := r.st[pluginID][generation]
 	if st == nil || st.retiring {
+		r.mu.Unlock()
 		return fmt.Errorf("system runner generation %d is not prepared", generation)
 	}
 	st.admitted = true
+	pool := st.pool
+	r.mu.Unlock()
+	pool.activate()
 	return nil
 }
 
 func (r *SystemRunner) AbortGeneration(ctx context.Context, pluginID string, generation uint64) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	r.mu.Lock()
 	st := r.st[pluginID][generation]
-	if st != nil {
-		delete(r.st[pluginID], generation)
-		if len(r.st[pluginID]) == 0 {
-			delete(r.st, pluginID)
-		}
-	}
 	r.mu.Unlock()
-	var transportErr, authorityErr, removeErr error
-	if st != nil {
-		if st.broker != nil && st.broker.authority != nil {
-			st.broker.authority.revoke()
-			authorityErr = st.broker.authority.wait(ctx)
-		}
-		if st.pool != nil {
-			st.pool.abortClose(st.generation)
-			transportErr = st.pool.cleanupError()
-		}
-		removeAll := r.removeAll
-		if removeAll == nil {
-			removeAll = os.RemoveAll
-		}
-		removeErr = removeAll(st.workDir)
-	}
-	if transportErr == nil && authorityErr == nil && removeErr == nil {
+	if st == nil {
 		return nil
 	}
-	return &GenerationCleanupError{PluginID: pluginID, Generation: generation, Transport: transportErr, Authority: authorityErr, RemoveAll: removeErr}
+	r.broadcastCleanup([]*systemPluginState{st}, true)
+	return r.waitGenerationCleanup(ctx, st)
 }
 
 func (r *SystemRunner) RetireGeneration(ctx context.Context, pluginID string, generation uint64) error {
@@ -369,8 +462,11 @@ func (r *SystemRunner) RetireGeneration(ctx context.Context, pluginID string, ge
 		r.mu.Unlock()
 		return nil
 	}
+	r.initCleanupStateLocked(st)
 	st.admitted = false
 	st.retiring = true
+	st.cleanupRequested = true
+	st.cleanupArmed = true
 	r.maybeStartCleanupLocked(st)
 	r.mu.Unlock()
 	if ctx == nil {
@@ -378,12 +474,9 @@ func (r *SystemRunner) RetireGeneration(ctx context.Context, pluginID string, ge
 	}
 	select {
 	case <-st.cleanupDone:
-		r.mu.Lock()
-		err := st.cleanupErr
-		r.mu.Unlock()
-		return err
+		return r.waitGenerationCleanup(context.Background(), st)
 	case <-ctx.Done():
-		return ctx.Err()
+		return generationCleanupError(r.generationCleanupSnapshot(st, ctx.Err()))
 	}
 }
 
@@ -391,7 +484,7 @@ func (r *SystemRunner) maybeStartCleanupLocked(st *systemPluginState) {
 	// Forced retirement cancels/aborts the generation immediately, but cleanup
 	// ownership remains pinned until every acquired invocation releases. This
 	// keeps workdir removal and cleanupDone behind v1 Cmd.Wait/process reaping.
-	if !st.retiring || st.refs != 0 {
+	if !st.cleanupRequested || !st.cleanupArmed {
 		return
 	}
 	st.cleanupOnce.Do(func() {
@@ -400,28 +493,61 @@ func (r *SystemRunner) maybeStartCleanupLocked(st *systemPluginState) {
 }
 
 func (r *SystemRunner) cleanupGeneration(pluginID string, generation uint64, st *systemPluginState) {
+	r.mu.Lock()
+	refsDone := st.refsDone
+	r.mu.Unlock()
+	if refsDone != nil {
+		<-refsDone
+	}
+	r.mu.Lock()
+	forceAbort := st.forceAbort
+	poolFuture := st.poolFuture
+	r.mu.Unlock()
 	var transportErr, authorityErr, removeErr error
+	if st.broker != nil && st.broker.authority != nil {
+		// Forced callers normally revoke during broadcast, but cleanup must also
+		// be correct when it joins an already-marked generation. Revocation is
+		// idempotent and must precede authority wait and cleanupDone.
+		st.broker.authority.revoke()
+	}
 	if st.pool != nil {
+		// Always reacquire the pool-owned canonical future after invocation refs
+		// drain. A concurrent graceful-to-force upgrade can publish the future
+		// between the initial cleanup request and this point; beginDrain is
+		// idempotent and returns that same upgraded physical transaction.
+		poolFuture = st.pool.beginDrain(forceAbort, st.generation)
 		r.mu.Lock()
-		forceAbort := st.forceAbort
+		st.poolFuture = poolFuture
 		r.mu.Unlock()
-		transportErr = st.pool.beginDrain(forceAbort, st.generation).wait(context.Background()).Err
+	}
+	var poolResult PoolCleanupResult
+	if poolFuture != nil {
+		poolResult = poolFuture.wait(context.Background())
+		transportErr = poolResult.Err
 	}
 	if st.broker != nil && st.broker.authority != nil {
-		st.broker.authority.revoke()
 		authorityErr = st.broker.authority.wait(context.Background())
 	}
 	removeAll := r.removeAll
 	if removeAll == nil {
 		removeAll = os.RemoveAll
 	}
-	removeErr = removeAll(st.workDir)
+	if len(poolResult.ResidualPGIDs) == 0 {
+		removeErr = removeAll(st.workDir)
+	}
+	result := GenerationCleanupResult{PluginID: pluginID, Generation: generation, Stage: "complete", Transport: transportErr, Authority: authorityErr, RemoveAll: removeErr}
+	result.Err = errors.Join(transportErr, authorityErr, removeErr)
+	if result.Err != nil {
+		result.Stage = "cleanup-error"
+	}
+	result.ResidualPGIDs = append([]int(nil), poolResult.ResidualPGIDs...)
 	var joined error
-	if transportErr != nil || authorityErr != nil || removeErr != nil {
-		joined = &GenerationCleanupError{PluginID: pluginID, Generation: generation, Transport: transportErr, Authority: authorityErr, RemoveAll: removeErr}
+	if result.Err != nil {
+		joined = generationCleanupError(result)
 	}
 	r.mu.Lock()
 	st.cleanupErr = joined
+	st.cleanupResult = result
 	if joined != nil {
 		// Keep residual generations discoverable for bounded shutdown callers.
 		close(st.cleanupDone)
@@ -439,6 +565,126 @@ func (r *SystemRunner) cleanupGeneration(pluginID string, generation uint64, st 
 	}
 	close(st.cleanupDone)
 	r.mu.Unlock()
+}
+
+func (r *SystemRunner) broadcastCleanup(states []*systemPluginState, force bool) {
+	var rootCancels, v1Cancels []context.CancelFunc
+	r.mu.Lock()
+	for _, st := range states {
+		r.initCleanupStateLocked(st)
+		st.admitted = false
+		st.retiring = true
+		st.cleanupRequested = true
+		if force {
+			st.forceAbort = true
+			if st.rootCancel != nil {
+				rootCancels = append(rootCancels, st.rootCancel)
+			}
+			for _, cancel := range st.v1Active {
+				v1Cancels = append(v1Cancels, cancel)
+			}
+		}
+	}
+	r.mu.Unlock()
+	for _, cancel := range rootCancels {
+		cancel()
+	}
+	for _, cancel := range v1Cancels {
+		cancel()
+	}
+	for _, st := range states {
+		if st.broker != nil && st.broker.authority != nil {
+			st.broker.authority.revoke()
+		}
+	}
+	poolFutures := make(map[*systemPluginState]*poolDrainFuture, len(states))
+	for _, st := range states {
+		if st.pool != nil {
+			poolFutures[st] = st.pool.beginDrain(force, st.generation)
+		}
+	}
+	r.mu.Lock()
+	for _, st := range states {
+		if future := poolFutures[st]; future != nil {
+			st.poolFuture = future
+		}
+		st.cleanupArmed = true
+		r.maybeStartCleanupLocked(st)
+	}
+	r.mu.Unlock()
+}
+
+func (r *SystemRunner) initCleanupStateLocked(st *systemPluginState) {
+	if st.cleanupDone == nil {
+		st.cleanupDone = make(chan struct{})
+	}
+	if st.refsDone == nil {
+		st.refsDone = make(chan struct{})
+		if st.refs == 0 {
+			close(st.refsDone)
+		}
+	}
+}
+
+func (r *SystemRunner) generationCleanupSnapshot(st *systemPluginState, waitErr error) GenerationCleanupResult {
+	r.mu.Lock()
+	select {
+	case <-st.cleanupDone:
+		result := st.cleanupResult
+		result.PendingStages = append([]string(nil), result.PendingStages...)
+		result.ResidualPGIDs = append([]int(nil), result.ResidualPGIDs...)
+		r.mu.Unlock()
+		return result
+	default:
+	}
+	result := GenerationCleanupResult{PluginID: st.pluginID, Generation: st.generation, Stage: "cleanup-pending", Err: waitErr}
+	if st.refs != 0 {
+		result.PendingStages = append(result.PendingStages, "invocation-references")
+	}
+	poolFuture := st.poolFuture
+	broker := st.broker
+	r.mu.Unlock()
+	if poolFuture != nil {
+		poolResult := poolFuture.snapshot(nil)
+		result.Transport = poolResult.Err
+		result.ResidualPGIDs = append(result.ResidualPGIDs, poolResult.ResidualPGIDs...)
+		for _, stage := range poolResult.PendingStages {
+			result.PendingStages = append(result.PendingStages, "pool-"+stage)
+		}
+		if poolResult.Stage == "pool-drain-pending" && len(poolResult.PendingStages) == 0 {
+			result.PendingStages = append(result.PendingStages, "pool-drain")
+		}
+	}
+	if broker != nil && broker.authority != nil {
+		broker.authority.mu.Lock()
+		active := broker.authority.active
+		broker.authority.mu.Unlock()
+		if active != 0 {
+			result.PendingStages = append(result.PendingStages, "authority")
+		}
+	}
+	result.PendingStages = append(result.PendingStages, "workdir-removal")
+	slices.Sort(result.PendingStages)
+	result.PendingStages = slices.Compact(result.PendingStages)
+	slices.Sort(result.ResidualPGIDs)
+	result.ResidualPGIDs = slices.Compact(result.ResidualPGIDs)
+	result.Err = errors.Join(result.Err, result.Transport, result.Authority, result.RemoveAll)
+	return result
+}
+
+func (r *SystemRunner) waitGenerationCleanup(ctx context.Context, st *systemPluginState) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-st.cleanupDone:
+		r.mu.Lock()
+		err := st.cleanupErr
+		r.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return generationCleanupError(r.generationCleanupSnapshot(st, ctx.Err()))
+	}
 }
 
 func (r *SystemRunner) startLock(pluginID string) *sync.Mutex {
@@ -547,58 +793,35 @@ func validateRuntimePath(root, runtimePath string, wantMode os.FileMode) error {
 func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 	r.mu.Lock()
 	var states []*systemPluginState
-	var v1Cancels []context.CancelFunc
 	for generation, st := range r.st[req.PluginID] {
 		if req.Generation == 0 || generation <= req.Generation {
-			st.admitted = false
-			st.retiring = true
-			st.forceAbort = true
-			if st.rootCancel != nil {
-				st.rootCancel()
-			}
 			states = append(states, st)
-			for _, cancel := range st.v1Active {
-				v1Cancels = append(v1Cancels, cancel)
-			}
-			r.maybeStartCleanupLocked(st)
 		}
 	}
 	r.mu.Unlock()
-	kickDone := make(chan struct{})
-	var kickWG sync.WaitGroup
-	for _, st := range states {
-		kickWG.Add(1)
-		go func(st *systemPluginState) {
-			defer kickWG.Done()
-			if st.broker != nil && st.broker.authority != nil {
-				st.broker.authority.revoke()
-			}
-			if st.pool != nil {
-				st.pool.abortClose(st.generation)
-			}
-		}(st)
-	}
-	go func() { kickWG.Wait(); close(kickDone) }()
-	for _, cancel := range v1Cancels {
-		cancel()
-	}
-	for _, st := range states {
-		if ctx == nil {
-			<-st.cleanupDone
-			continue
-		}
-		select {
-		case <-st.cleanupDone:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	r.broadcastCleanup(states, true)
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	var joined error
 	for _, st := range states {
 		select {
 		case <-st.cleanupDone:
+			r.mu.Lock()
 			joined = errors.Join(joined, st.cleanupErr)
-		default:
+			r.mu.Unlock()
+		case <-ctx.Done():
+			for _, selected := range states {
+				select {
+				case <-selected.cleanupDone:
+					r.mu.Lock()
+					joined = errors.Join(joined, selected.cleanupErr)
+					r.mu.Unlock()
+				default:
+					joined = errors.Join(joined, generationCleanupError(r.generationCleanupSnapshot(selected, ctx.Err())))
+				}
+			}
+			return joined
 		}
 	}
 	return joined
@@ -610,41 +833,13 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 	r.mu.Lock()
 	r.closing = true
 	var states []*systemPluginState
-	var v1Cancels []context.CancelFunc
 	for _, generations := range r.st {
 		for _, st := range generations {
-			st.admitted = false
-			st.retiring = true
-			st.forceAbort = true
-			if st.rootCancel != nil {
-				st.rootCancel()
-			}
 			states = append(states, st)
-			for _, cancel := range st.v1Active {
-				v1Cancels = append(v1Cancels, cancel)
-			}
-			r.maybeStartCleanupLocked(st)
 		}
 	}
 	r.mu.Unlock()
-	kickDone := make(chan struct{})
-	var kickWG sync.WaitGroup
-	for _, st := range states {
-		kickWG.Add(1)
-		go func(st *systemPluginState) {
-			defer kickWG.Done()
-			if st.broker != nil && st.broker.authority != nil {
-				st.broker.authority.revoke()
-			}
-			if st.pool != nil {
-				st.pool.abortClose(st.generation)
-			}
-		}(st)
-	}
-	go func() { kickWG.Wait(); close(kickDone) }()
-	for _, cancel := range v1Cancels {
-		cancel()
-	}
+	r.broadcastCleanup(states, true)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -652,9 +847,21 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 	for _, st := range states {
 		select {
 		case <-st.cleanupDone:
+			r.mu.Lock()
 			joined = errors.Join(joined, st.cleanupErr)
+			r.mu.Unlock()
 		case <-ctx.Done():
-			return errors.Join(ctx.Err(), joined)
+			for _, selected := range states {
+				select {
+				case <-selected.cleanupDone:
+					r.mu.Lock()
+					joined = errors.Join(joined, selected.cleanupErr)
+					r.mu.Unlock()
+				default:
+					joined = errors.Join(joined, generationCleanupError(r.generationCleanupSnapshot(selected, ctx.Err())))
+				}
+			}
+			return joined
 		}
 	}
 	return joined
@@ -680,6 +887,9 @@ func (r *SystemRunner) AcquireInvocation(pluginID string, generation uint64) (In
 	if st == nil || !st.admitted || st.retiring || r.closing {
 		r.mu.Unlock()
 		return nil, fmt.Errorf("plugin %q generation %d is not admitted", pluginID, generation)
+	}
+	if st.refs == 0 {
+		st.refsDone = make(chan struct{})
 	}
 	st.refs++
 	if st.rootCtx == nil {
@@ -717,6 +927,9 @@ func (l *systemInvocationLease) Release() {
 		l.state.refs--
 		if l.state.refs < 0 {
 			panic("system runner invocation reference underflow")
+		}
+		if l.state.refs == 0 {
+			close(l.state.refsDone)
 		}
 		r.maybeStartCleanupLocked(l.state)
 		r.mu.Unlock()
@@ -769,57 +982,7 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 		return InvokeResponse{}, err
 	}
 	if st.isV2 {
-		w, err := st.pool.checkout(runCtx, time.Now())
-		if err != nil {
-			return InvokeResponse{}, err
-		}
-		invocation := fmt.Sprintf("%d", time.Now().UnixNano())
-		outcome, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) }, budget)
-		if callErr != nil {
-			if !outcome.DispatchStarted && (errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded)) {
-				st.pool.returnUnused(w, time.Now())
-				return InvokeResponse{}, callErr
-			}
-			if ctx.Err() == nil {
-				r.recordLifecycleFailure(req.PluginID, st)
-			}
-			st.pool.poison(w)
-			warnings := v2StderrWarnings(budget, outcome.StderrTruncated)
-			if len(outcome.Stderr) > 0 {
-				r.logf("plugin runtime: transport failure for %s stderr_bytes=%d stderr_truncated=%t", req.PluginID, len(outcome.Stderr), outcome.StderrTruncated)
-			}
-			return InvokeResponse{Warnings: warnings}, fmt.Errorf("plugin %q transport failure: %w", req.PluginID, callErr)
-		}
-		reply := outcome.Reply
-		warnings := append([]string(nil), reply.Warnings...)
-		warnings = append(warnings, v2StderrWarnings(budget, outcome.StderrTruncated)...)
-		if outcome.Retirement != nil {
-			if ctx.Err() == nil {
-				r.recordLifecycleFailure(req.PluginID, st)
-			}
-			st.pool.poison(w)
-			warning := "persistent worker retired after terminal protocol failure"
-			warnings = append(warnings, warning)
-			r.logf("plugin runtime: %s %s: %v", warning, req.PluginID, outcome.Retirement)
-		} else if outcome.Reusable {
-			st.pool.release(w, outcome.ResultSeen, time.Now())
-			r.recordLifecycleSuccess(req.PluginID, st)
-		} else {
-			st.pool.poison(w)
-			return InvokeResponse{}, fmt.Errorf("plugin %q invocation completed without reusable terminal state", req.PluginID)
-		}
-		result := reply.Result
-		if len(result) == 0 {
-			result = reply.Plan
-		}
-		if !reply.OK {
-			msg := reply.Message
-			if msg == "" {
-				msg = reply.Error
-			}
-			return InvokeResponse{OK: false, Message: msg, Result: result, Warnings: warnings}, fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
-		}
-		return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
+		return r.invokeV2Pooled(runCtx, ctx, req, st, broker, budget)
 	}
 
 	// The approved operation's authority is bound before protocol selection.
@@ -869,6 +1032,78 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 		}
 		return InvokeResponse{OK: false, Message: msg, Result: result, Warnings: warnings},
 			fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
+	}
+	return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
+}
+
+// invokeV2Pooled runs one invocation against the persistent worker pool. It is
+// the observation seam for the warm path: queue is the checkout wait whatever
+// its outcome, handler is the span the worker's transport was actually held,
+// and total is the whole pooled attempt as the caller experienced it. Worker
+// fates (reusable, poisoned) are counted here where they are decided;
+// retirement attribution stays inside the pool.
+func (r *SystemRunner) invokeV2Pooled(runCtx, ctx context.Context, req InvokeRequest, st *systemPluginState, broker *Broker, budget ResolvedInvokeBudget) (InvokeResponse, error) {
+	obs := r.opts.PoolObserver
+	totalBegan := time.Now()
+	defer func() {
+		observeSystemPoolDuration(obs, SystemPoolDurationTotal, time.Since(totalBegan))
+	}()
+	w, err := st.pool.checkout(runCtx, totalBegan)
+	observeSystemPoolDuration(obs, SystemPoolDurationQueue, time.Since(totalBegan))
+	if err != nil {
+		return InvokeResponse{}, err
+	}
+	invocation := fmt.Sprintf("%d", time.Now().UnixNano())
+	handlerBegan := time.Now()
+	outcome, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) }, budget)
+	observeSystemPoolDuration(obs, SystemPoolDurationHandler, time.Since(handlerBegan))
+	if callErr != nil {
+		if !outcome.DispatchStarted && (errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded)) {
+			st.pool.returnUnused(w, time.Now())
+			return InvokeResponse{}, callErr
+		}
+		if ctx.Err() == nil {
+			r.recordLifecycleFailure(req.PluginID, st)
+		}
+		observeSystemPoolLifecycle(obs, SystemPoolLifecycleInvocationFailure)
+		st.pool.poison(w)
+		warnings := v2StderrWarnings(budget, outcome.StderrTruncated)
+		if len(outcome.Stderr) > 0 {
+			r.logf("plugin runtime: transport failure for %s stderr_bytes=%d stderr_truncated=%t", req.PluginID, len(outcome.Stderr), outcome.StderrTruncated)
+		}
+		return InvokeResponse{Warnings: warnings}, fmt.Errorf("plugin %q transport failure: %w", req.PluginID, callErr)
+	}
+	reply := outcome.Reply
+	warnings := append([]string(nil), reply.Warnings...)
+	warnings = append(warnings, v2StderrWarnings(budget, outcome.StderrTruncated)...)
+	if outcome.Retirement != nil {
+		if ctx.Err() == nil {
+			r.recordLifecycleFailure(req.PluginID, st)
+		}
+		observeSystemPoolLifecycle(obs, SystemPoolLifecycleInvocationFailure)
+		st.pool.poison(w)
+		warning := "persistent worker retired after terminal protocol failure"
+		warnings = append(warnings, warning)
+		r.logf("plugin runtime: %s %s: %v", warning, req.PluginID, outcome.Retirement)
+	} else if outcome.Reusable {
+		st.pool.release(w, outcome.ResultSeen, time.Now())
+		r.recordLifecycleSuccess(req.PluginID, st)
+		observeSystemPoolLifecycle(obs, SystemPoolLifecycleInvocationReusable)
+	} else {
+		observeSystemPoolLifecycle(obs, SystemPoolLifecycleInvocationFailure)
+		st.pool.poison(w)
+		return InvokeResponse{}, fmt.Errorf("plugin %q invocation completed without reusable terminal state", req.PluginID)
+	}
+	result := reply.Result
+	if len(result) == 0 {
+		result = reply.Plan
+	}
+	if !reply.OK {
+		msg := reply.Message
+		if msg == "" {
+			msg = reply.Error
+		}
+		return InvokeResponse{OK: false, Message: msg, Result: result, Warnings: warnings}, fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
 	}
 	return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
 }
@@ -1143,10 +1378,17 @@ func processGroupExists(pgid int) bool {
 // runtime pipes and ignore TERM, so the group must become extinct before the
 // transport or one-shot invocation is considered reaped.
 func terminateProcessGroup(pgid int, grace time.Duration) error {
+	return terminateProcessGroupWithSignal(pgid, grace, nil)
+}
+
+func terminateProcessGroupWithSignal(pgid int, grace time.Duration, signalGroup func(syscall.Signal) error) error {
 	if !processGroupExists(pgid) {
 		return nil
 	}
-	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	if signalGroup == nil {
+		signalGroup = func(signal syscall.Signal) error { return syscall.Kill(-pgid, signal) }
+	}
+	_ = signalGroup(syscall.SIGTERM)
 	deadline := time.NewTimer(grace)
 	tick := time.NewTicker(5 * time.Millisecond)
 	defer deadline.Stop()
@@ -1154,7 +1396,7 @@ func terminateProcessGroup(pgid int, grace time.Duration) error {
 	for processGroupExists(pgid) {
 		select {
 		case <-deadline.C:
-			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			_ = signalGroup(syscall.SIGKILL)
 			// StopGrace controls only the cooperative TERM window. Kernel/process
 			// scheduler latency after SIGKILL is a separate concern and must not
 			// collapse to a test-sized (e.g. 10ms) grace, otherwise an extinct

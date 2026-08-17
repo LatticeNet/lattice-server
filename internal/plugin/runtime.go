@@ -5,15 +5,37 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	RuntimeStateArmed   = "armed"
-	RuntimeStateStopped = "stopped"
-	RuntimeStateFailed  = "failed"
+	RuntimeStateArmed    = "armed"
+	RuntimeStateStopping = "stopping"
+	RuntimeStateStopped  = "stopped"
+	RuntimeStateDegraded = "degraded"
+	RuntimeStateFailed   = "failed"
 )
+
+// RuntimeShutdownError reports a caller-bounded observation of physical
+// shutdown without transferring or abandoning manager ownership.
+type RuntimeShutdownError struct {
+	PluginID      string
+	Stage         string
+	PendingStages []string
+	Err           error
+}
+
+func (e *RuntimeShutdownError) Error() string {
+	if e.PluginID == "" {
+		return fmt.Sprintf("runtime shutdown %s: %v", e.Stage, e.Err)
+	}
+	return fmt.Sprintf("runtime %s shutdown %s: %v", e.PluginID, e.Stage, e.Err)
+}
+
+func (e *RuntimeShutdownError) Unwrap() error { return e.Err }
 
 // RuntimeStatus is the public, non-secret health view for one plugin runtime.
 // It deliberately excludes local bundle paths and the broker itself.
@@ -131,10 +153,89 @@ type runtimeInstance struct {
 }
 
 type pendingRuntimeStart struct {
-	generation uint64
-	cancel     context.CancelFunc
-	done       chan struct{}
+	generation  uint64
+	cancel      context.CancelFunc
+	prepareDone chan struct{}
+	runner      Runner
+	broker      *Broker
+	cleanup     *runtimePendingCleanup
 }
+
+type runtimePendingCleanup struct {
+	mu   sync.Mutex
+	once sync.Once
+	done chan struct{}
+	err  error
+}
+
+func newRuntimePendingCleanup() *runtimePendingCleanup {
+	return &runtimePendingCleanup{done: make(chan struct{})}
+}
+
+func (c *runtimePendingCleanup) finish(err error) {
+	if c == nil {
+		return
+	}
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.err = err
+		c.mu.Unlock()
+		close(c.done)
+	})
+}
+
+func (c *runtimePendingCleanup) result() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+type runtimeStopFuture struct {
+	pluginID       string
+	generation     uint64
+	tombstone      uint64
+	stopGeneration uint64
+	message        string
+	runner         Runner
+	broker         *Broker
+	pendingStarts  []pendingRuntimeStart
+	predecessors   []*runtimeStopFuture
+	pendingStages  map[string]int
+	startOnce      sync.Once
+	done           chan struct{}
+	status         RuntimeStatus
+	err            error
+}
+
+func (f *runtimeStopFuture) start(manager *RuntimeManager) {
+	if f == nil {
+		return
+	}
+	f.startOnce.Do(func() { go manager.finishRuntimeStop(f) })
+}
+
+type runtimeShutdownPart struct {
+	stage     string
+	pluginIDs []string
+	err       error
+}
+
+type runtimePendingClose struct {
+	pluginID string
+	stage    string
+	done     <-chan struct{}
+	cleanup  *runtimePendingCleanup
+}
+
+const (
+	runtimeStoppingMessage = "runtime shutdown in progress"
+	runtimePendingMessage  = "runtime shutdown pending"
+	runtimeStoppedMessage  = "runtime shutdown complete"
+	runtimeDegradedMessage = "runtime shutdown incomplete"
+)
 
 type RuntimeManagerOptions struct {
 	Services     HostServices
@@ -156,9 +257,12 @@ type RuntimeManager struct {
 	latestGen     map[string]uint64
 	pendingStarts map[string]map[uint64]pendingRuntimeStart
 	instances     map[string]runtimeInstance
+	stopFutures   map[string]map[uint64]*runtimeStopFuture
 	closing       bool
 	closeDone     chan struct{}
 	closeErr      error
+	closePending  map[string]int
+	closeEpochs   map[string]uint64
 }
 
 func NewRuntimeManager(services HostServices) *RuntimeManager {
@@ -184,6 +288,7 @@ func NewRuntimeManagerWithOptions(opts RuntimeManagerOptions) *RuntimeManager {
 		latestGen:     map[string]uint64{},
 		pendingStarts: map[string]map[uint64]pendingRuntimeStart{},
 		instances:     map[string]runtimeInstance{},
+		stopFutures:   map[string]map[uint64]*runtimeStopFuture{},
 		closeDone:     make(chan struct{}),
 	}
 }
@@ -226,11 +331,14 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 	if m.pendingStarts[loaded.Manifest.ID] == nil {
 		m.pendingStarts[loaded.Manifest.ID] = map[uint64]pendingRuntimeStart{}
 	}
-	startDone := make(chan struct{})
-	m.pendingStarts[loaded.Manifest.ID][generation] = pendingRuntimeStart{generation: generation, cancel: cancel, done: startDone}
+	prepareDone := make(chan struct{})
+	cleanup := newRuntimePendingCleanup()
+	m.pendingStarts[loaded.Manifest.ID][generation] = pendingRuntimeStart{
+		generation: generation, cancel: cancel, prepareDone: prepareDone, runner: runner, broker: broker, cleanup: cleanup,
+	}
 	m.mu.Unlock()
-	defer func() {
-		cancel()
+	cleanupOwned := false
+	removePending := func() {
 		m.mu.Lock()
 		if pending := m.pendingStarts[loaded.Manifest.ID]; pending != nil {
 			delete(pending, generation)
@@ -239,7 +347,25 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 			}
 		}
 		m.mu.Unlock()
-		close(startDone)
+	}
+	launchCleanup := func(cleanupFn func() error) {
+		cleanupOwned = true
+		cancel()
+		go func() {
+			cleanupErr := cleanupFn()
+			cleanup.finish(cleanupErr)
+			if cleanupErr == nil {
+				removePending()
+			}
+		}()
+	}
+	defer func() {
+		close(prepareDone)
+		if !cleanupOwned {
+			cancel()
+			cleanup.finish(nil)
+			removePending()
+		}
 	}()
 	req := RunnerStartRequest{
 		PluginID:   loaded.Manifest.ID,
@@ -267,13 +393,12 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 		m.mu.Unlock()
 		broker.authority.revoke()
 		if err == nil {
-			stopCtx, stopCancel := context.WithTimeout(context.Background(), m.timeout)
-			if isTransactional {
-				_ = transactional.AbortGeneration(stopCtx, loaded.Manifest.ID, generation)
-			} else {
-				_ = runner.Stop(stopCtx, RunnerStopRequest{PluginID: loaded.Manifest.ID, Reason: "stale concurrent start", Generation: generation})
-			}
-			stopCancel()
+			launchCleanup(func() error {
+				if isTransactional {
+					return transactional.AbortGeneration(context.Background(), loaded.Manifest.ID, generation)
+				}
+				return runner.Stop(context.Background(), RunnerStopRequest{PluginID: loaded.Manifest.ID, Reason: "stale concurrent start", Generation: generation})
+			})
 		}
 		if currentOK {
 			return current.status, fmt.Errorf("stale runtime generation %d", generation)
@@ -306,9 +431,9 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 			}
 			m.mu.Unlock()
 			broker.authority.revoke()
-			abortCtx, abortCancel := context.WithTimeout(context.Background(), m.timeout)
-			_ = transactional.AbortGeneration(abortCtx, loaded.Manifest.ID, generation)
-			abortCancel()
+			launchCleanup(func() error {
+				return transactional.AbortGeneration(context.Background(), loaded.Manifest.ID, generation)
+			})
 			if currentOK && current.status.State == RuntimeStateArmed {
 				return current.status, activateErr
 			}
@@ -327,7 +452,7 @@ func (m *RuntimeManager) Start(ctx context.Context, loaded Loaded) (RuntimeStatu
 				m.mu.Lock()
 				current := m.instances[loaded.Manifest.ID]
 				if current.generation == generation {
-					current.status.Message = fmt.Sprintf("%s; prior generation retirement degraded: %v", current.status.Message, retireErr)
+					current.status.Message = boundedRuntimeStatusMessage(current.status.Message + "; prior generation retirement degraded")
 					current.status.UpdatedAt = time.Now().UTC()
 					m.instances[loaded.Manifest.ID] = current
 					status = current.status
@@ -345,14 +470,57 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 		return RuntimeStatus{}, errors.New("plugin id is required")
 	}
 	m.mu.Lock()
+	if m.closing {
+		done := m.closeDone
+		status := m.instances[pluginID].status
+		m.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
+		defer cancel()
+		select {
+		case <-done:
+			m.mu.Lock()
+			status = m.instances[pluginID].status
+			err := m.closeErr
+			m.mu.Unlock()
+			return status, err
+		case <-ctx.Done():
+			return status, &RuntimeShutdownError{
+				PluginID: pluginID, Stage: "shutdown-pending", PendingStages: []string{"manager-close"}, Err: ctx.Err(),
+			}
+		}
+	}
+	if current, ok := m.instances[pluginID]; ok && m.latestGen[pluginID] == current.generation {
+		if future := m.stopFutures[pluginID][current.generation]; future != nil {
+			m.mu.Unlock()
+			return m.waitRuntimeStop(future)
+		}
+	}
+	var predecessors []*runtimeStopFuture
+	for epoch, future := range m.stopFutures[pluginID] {
+		select {
+		case <-future.done:
+			if future.err == nil {
+				delete(m.stopFutures[pluginID], epoch)
+				continue
+			}
+		default:
+		}
+		predecessors = append(predecessors, future)
+	}
 	m.nextGen++
 	tombstone := m.nextGen
 	m.latestGen[pluginID] = tombstone
+	var pendingStarts []pendingRuntimeStart
 	for _, pending := range m.pendingStarts[pluginID] {
 		if pending.cancel != nil {
 			pending.cancel()
 		}
+		if pending.broker != nil && pending.broker.authority != nil {
+			pending.broker.authority.revoke()
+		}
+		pendingStarts = append(pendingStarts, pending)
 	}
+	delete(m.pendingStarts, pluginID)
 	now := time.Now().UTC()
 	inst, ok := m.instances[pluginID]
 	runner := inst.runner
@@ -362,69 +530,235 @@ func (m *RuntimeManager) Stop(pluginID, message string) (RuntimeStatus, error) {
 		inst = runtimeInstance{generation: tombstone, status: RuntimeStatus{PluginID: pluginID, StartedAt: now}}
 	}
 	inst.status.PluginID = pluginID
-	inst.status.State = RuntimeStateStopped
-	inst.status.Message = message
-	inst.status.StoppedAt = now
+	inst.status.State = RuntimeStateStopping
+	inst.status.Message = runtimeStoppingMessage
+	inst.status.StoppedAt = time.Time{}
 	inst.status.UpdatedAt = now
+	inst.generation = tombstone
 	inst.broker = nil
 	inst.runner = nil
-	m.instances[pluginID] = inst
 	if ok && oldBroker != nil && oldBroker.authority != nil {
 		oldBroker.authority.revoke()
 	}
-	stopped := inst.status
-	m.mu.Unlock()
-
-	if ok && runner != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
-		stopGeneration := generation
-		if _, transactional := runner.(TransactionalRunner); transactional {
-			stopGeneration = tombstone
+	stopGeneration := generation
+	if _, transactional := runner.(TransactionalRunner); transactional {
+		stopGeneration = tombstone
+	}
+	future := &runtimeStopFuture{
+		pluginID: pluginID, generation: generation, tombstone: tombstone,
+		stopGeneration: stopGeneration, message: message, runner: runner, broker: oldBroker,
+		pendingStarts: append([]pendingRuntimeStart(nil), pendingStarts...),
+		predecessors:  append([]*runtimeStopFuture(nil), predecessors...),
+		pendingStages: map[string]int{}, done: make(chan struct{}), status: inst.status,
+	}
+	if runner != nil {
+		future.pendingStages["runner-cleanup"]++
+	}
+	if oldBroker != nil && oldBroker.authority != nil {
+		future.pendingStages["authority-drain"]++
+	}
+	for _, pending := range pendingStarts {
+		if pending.prepareDone != nil {
+			future.pendingStages["pending-starts"]++
 		}
-		runnerDone := make(chan error, 1)
-		authorityDone := make(chan error, 1)
-		go func() {
-			runnerDone <- runner.Stop(ctx, RunnerStopRequest{PluginID: pluginID, Reason: message, Generation: stopGeneration})
-		}()
-		go func() {
-			if oldBroker != nil && oldBroker.authority != nil {
-				authorityDone <- oldBroker.authority.wait(ctx)
-				return
-			}
-			authorityDone <- nil
-		}()
-		var runnerErr, authorityErr error
-		remaining := 2
-		for remaining > 0 {
-			select {
-			case runnerErr = <-runnerDone:
-				runnerDone = nil
-				remaining--
-			case authorityErr = <-authorityDone:
-				authorityDone = nil
-				remaining--
-			case <-ctx.Done():
-				runnerErr = errors.Join(runnerErr, ctx.Err())
-				remaining = 0
-			}
+		if pending.cleanup != nil && pending.cleanup.done != nil {
+			future.pendingStages["pending-cleanup"]++
 		}
-		err := errors.Join(runnerErr, authorityErr)
-		cancel()
-		if err != nil {
-			m.mu.Lock()
-			defer m.mu.Unlock()
-			current := m.instances[pluginID]
-			if current.generation != generation && current.generation != tombstone {
-				return current.status, nil
-			}
-			current.status.State = RuntimeStateFailed
-			current.status.Message = err.Error()
-			current.status.UpdatedAt = now
-			m.instances[pluginID] = current
-			return current.status, err
+		if pending.broker != nil && pending.broker.authority != nil {
+			future.pendingStages["authority-drain"]++
 		}
 	}
-	return stopped, nil
+	if len(predecessors) != 0 {
+		future.pendingStages["predecessor-stops"] = len(predecessors)
+	}
+	m.instances[pluginID] = inst
+	if m.stopFutures[pluginID] == nil {
+		m.stopFutures[pluginID] = map[uint64]*runtimeStopFuture{}
+	}
+	m.stopFutures[pluginID][tombstone] = future
+	m.mu.Unlock()
+	future.start(m)
+	return m.waitRuntimeStop(future)
+}
+
+func (m *RuntimeManager) finishRuntimeStop(future *runtimeStopFuture) {
+	results := make(chan runtimeShutdownPart, 2+3*len(future.pendingStarts)+len(future.predecessors))
+	remaining := 0
+	if future.runner != nil {
+		remaining++
+		go func() {
+			results <- runtimeShutdownPart{stage: "runner-cleanup", err: future.runner.Stop(context.Background(), RunnerStopRequest{
+				PluginID: future.pluginID, Reason: future.message, Generation: future.stopGeneration,
+			})}
+		}()
+	}
+	if future.broker != nil && future.broker.authority != nil {
+		remaining++
+		go func() {
+			results <- runtimeShutdownPart{stage: "authority-drain", err: future.broker.authority.wait(context.Background())}
+		}()
+	}
+	for _, pending := range future.pendingStarts {
+		if pending.prepareDone != nil {
+			remaining++
+			go func(pending pendingRuntimeStart) {
+				<-pending.prepareDone
+				results <- runtimeShutdownPart{stage: "pending-starts"}
+			}(pending)
+		}
+		if pending.cleanup != nil && pending.cleanup.done != nil {
+			remaining++
+			go func(cleanup *runtimePendingCleanup) {
+				<-cleanup.done
+				results <- runtimeShutdownPart{stage: "pending-cleanup", err: cleanup.result()}
+			}(pending.cleanup)
+		}
+		if pending.broker != nil && pending.broker.authority != nil {
+			remaining++
+			go func(authority *generationAuthority) {
+				results <- runtimeShutdownPart{stage: "authority-drain", err: authority.wait(context.Background())}
+			}(pending.broker.authority)
+		}
+	}
+	for _, predecessor := range future.predecessors {
+		remaining++
+		predecessor.start(m)
+		go func(predecessor *runtimeStopFuture) {
+			<-predecessor.done
+			results <- runtimeShutdownPart{stage: "predecessor-stops", err: predecessor.err}
+		}(predecessor)
+	}
+	var joined error
+	for range remaining {
+		result := <-results
+		joined = errors.Join(joined, result.err)
+		m.mu.Lock()
+		future.pendingStages[result.stage]--
+		if future.pendingStages[result.stage] == 0 {
+			delete(future.pendingStages, result.stage)
+		}
+		m.mu.Unlock()
+	}
+
+	m.mu.Lock()
+	future.err = joined
+	now := time.Now().UTC()
+	if joined != nil {
+		future.status.State = RuntimeStateDegraded
+		future.status.Message = runtimeDegradedMessage
+		future.status.StoppedAt = time.Time{}
+	} else {
+		future.status.State = RuntimeStateStopped
+		future.status.Message = runtimeStoppedMessage
+		future.status.StoppedAt = now
+	}
+	future.status.UpdatedAt = now
+	future.pendingStages = nil
+	current := m.instances[future.pluginID]
+	if current.generation == future.tombstone && m.latestGen[future.pluginID] == future.tombstone && !m.closing {
+		if joined != nil {
+			current.status.State = RuntimeStateDegraded
+			current.status.Message = runtimeDegradedMessage
+			current.status.StoppedAt = time.Time{}
+		} else {
+			current.status.State = RuntimeStateStopped
+			current.status.Message = runtimeStoppedMessage
+			current.status.StoppedAt = now
+		}
+		current.status.UpdatedAt = now
+		m.instances[future.pluginID] = current
+	}
+	if joined == nil {
+		future.runner = nil
+		future.broker = nil
+		future.pendingStarts = nil
+		future.predecessors = nil
+	}
+	close(future.done)
+	m.mu.Unlock()
+}
+
+func (m *RuntimeManager) waitRuntimeStop(future *runtimeStopFuture) (RuntimeStatus, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
+	defer cancel()
+	select {
+	case <-future.done:
+		m.mu.Lock()
+		status := future.status
+		err := future.err
+		m.mu.Unlock()
+		return status, err
+	case <-ctx.Done():
+		m.mu.Lock()
+		select {
+		case <-future.done:
+			status := future.status
+			err := future.err
+			m.mu.Unlock()
+			return status, err
+		default:
+		}
+		current := m.instances[future.pluginID]
+		future.status.State = RuntimeStateDegraded
+		future.status.Message = runtimePendingMessage
+		future.status.StoppedAt = time.Time{}
+		future.status.UpdatedAt = time.Now().UTC()
+		if current.generation == future.tombstone && m.latestGen[future.pluginID] == future.tombstone && !m.closing {
+			current.status.State = RuntimeStateDegraded
+			current.status.Message = runtimePendingMessage
+			current.status.StoppedAt = time.Time{}
+			current.status.UpdatedAt = time.Now().UTC()
+			m.instances[future.pluginID] = current
+		}
+		status := future.status
+		pending := runtimePendingStages(future.pendingStages)
+		if len(pending) == 0 {
+			pending = []string{"finalizing"}
+		}
+		m.mu.Unlock()
+		return status, &RuntimeShutdownError{
+			PluginID: future.pluginID, Stage: "shutdown-pending", PendingStages: pending, Err: ctx.Err(),
+		}
+	}
+}
+
+func runtimePendingStages(pending map[string]int) []string {
+	stages := make([]string, 0, len(pending))
+	for stage, count := range pending {
+		if count > 0 {
+			stages = append(stages, stage)
+		}
+	}
+	slices.Sort(stages)
+	return stages
+}
+
+func addRuntimeShutdownOwner[K comparable](owners map[K]map[string]struct{}, key K, pluginID string) {
+	if owners[key] == nil {
+		owners[key] = map[string]struct{}{}
+	}
+	owners[key][pluginID] = struct{}{}
+}
+
+func runtimeShutdownOwnerIDs(owners map[string]struct{}) []string {
+	pluginIDs := make([]string, 0, len(owners))
+	for pluginID := range owners {
+		pluginIDs = append(pluginIDs, pluginID)
+	}
+	slices.Sort(pluginIDs)
+	return pluginIDs
+}
+
+func boundedRuntimeStatusMessage(message string) string {
+	const maxStatusMessageBytes = 160
+	if len(message) <= maxStatusMessageBytes {
+		return message
+	}
+	end := maxStatusMessageBytes
+	for end > 0 && !utf8.ValidString(message[:end]) {
+		end--
+	}
+	return message[:end]
 }
 
 // Close atomically closes runtime admission, invalidates every pending start,
@@ -444,46 +778,141 @@ func (m *RuntimeManager) Close(ctx context.Context) error {
 			m.mu.Unlock()
 			return err
 		case <-ctx.Done():
-			return ctx.Err()
+			m.mu.Lock()
+			select {
+			case <-m.closeDone:
+				err := m.closeErr
+				m.mu.Unlock()
+				return err
+			default:
+			}
+			for id, epoch := range m.closeEpochs {
+				inst := m.instances[id]
+				if inst.generation == epoch && m.latestGen[id] == epoch && inst.status.State == RuntimeStateStopping {
+					inst.status.State = RuntimeStateDegraded
+					inst.status.Message = runtimePendingMessage
+					inst.status.UpdatedAt = time.Now().UTC()
+					m.instances[id] = inst
+				}
+			}
+			pending := runtimePendingStages(m.closePending)
+			if len(pending) == 0 {
+				pending = []string{"finalizing"}
+			}
+			m.mu.Unlock()
+			return &RuntimeShutdownError{Stage: "shutdown-pending", PendingStages: pending, Err: ctx.Err()}
 		}
 	}
 	m.closing = true
-	var pendingDone []<-chan struct{}
+	var pendingDone []runtimePendingClose
+	closers := make(map[RunnerCloser]map[string]struct{})
+	authorities := make(map[*generationAuthority]map[string]struct{})
+	affected := make(map[string]struct{})
 	for pluginID, attempts := range m.pendingStarts {
-		m.nextGen++
-		m.latestGen[pluginID] = m.nextGen
+		affected[pluginID] = struct{}{}
 		for _, pending := range attempts {
 			if pending.cancel != nil {
 				pending.cancel()
 			}
-			if pending.done != nil {
-				pendingDone = append(pendingDone, pending.done)
+			if pending.prepareDone != nil {
+				pendingDone = append(pendingDone, runtimePendingClose{
+					pluginID: pluginID, stage: "pending-starts", done: pending.prepareDone,
+				})
+			}
+			if pending.cleanup != nil && pending.cleanup.done != nil {
+				pendingDone = append(pendingDone, runtimePendingClose{
+					pluginID: pluginID, stage: "pending-cleanup", done: pending.cleanup.done, cleanup: pending.cleanup,
+				})
+			}
+			if closer, ok := pending.runner.(RunnerCloser); ok && closer != nil {
+				addRuntimeShutdownOwner(closers, closer, pluginID)
+			}
+			if pending.broker != nil && pending.broker.authority != nil {
+				pending.broker.authority.revoke()
+				addRuntimeShutdownOwner(authorities, pending.broker.authority, pluginID)
+			}
+		}
+		delete(m.pendingStarts, pluginID)
+	}
+	for _, runner := range m.runners {
+		if closer, ok := runner.(RunnerCloser); ok && closer != nil {
+			if _, exists := closers[closer]; !exists {
+				closers[closer] = map[string]struct{}{}
 			}
 		}
 	}
-	runners := make(map[Runner]struct{})
-	for _, runner := range m.runners {
-		if runner != nil {
-			runners[runner] = struct{}{}
-		}
-	}
 	for pluginID, inst := range m.instances {
-		if inst.runner != nil {
-			runners[inst.runner] = struct{}{}
+		affected[pluginID] = struct{}{}
+		if closer, ok := inst.runner.(RunnerCloser); ok && closer != nil {
+			addRuntimeShutdownOwner(closers, closer, pluginID)
 		}
 		if inst.broker != nil && inst.broker.authority != nil {
 			inst.broker.authority.revoke()
+			addRuntimeShutdownOwner(authorities, inst.broker.authority, pluginID)
 		}
+	}
+	var stopFutures []*runtimeStopFuture
+	for pluginID, generations := range m.stopFutures {
+		affected[pluginID] = struct{}{}
+		for _, future := range generations {
+			stopFutures = append(stopFutures, future)
+			if closer, ok := future.runner.(RunnerCloser); ok && closer != nil {
+				addRuntimeShutdownOwner(closers, closer, pluginID)
+			}
+			if future.broker != nil && future.broker.authority != nil {
+				future.broker.authority.revoke()
+				addRuntimeShutdownOwner(authorities, future.broker.authority, pluginID)
+			}
+			for _, pending := range future.pendingStarts {
+				if closer, ok := pending.runner.(RunnerCloser); ok && closer != nil {
+					addRuntimeShutdownOwner(closers, closer, pluginID)
+				}
+				if pending.broker != nil && pending.broker.authority != nil {
+					pending.broker.authority.revoke()
+					addRuntimeShutdownOwner(authorities, pending.broker.authority, pluginID)
+				}
+			}
+		}
+	}
+	m.closeEpochs = make(map[string]uint64, len(affected))
+	now := time.Now().UTC()
+	for pluginID := range affected {
+		m.nextGen++
+		tombstone := m.nextGen
+		m.latestGen[pluginID] = tombstone
+		m.closeEpochs[pluginID] = tombstone
+		inst, ok := m.instances[pluginID]
+		if !ok {
+			inst.status = RuntimeStatus{PluginID: pluginID}
+		}
+		inst.generation = tombstone
+		inst.status.PluginID = pluginID
+		inst.status.State = RuntimeStateStopping
+		inst.status.Message = runtimeStoppingMessage
+		inst.status.StoppedAt = time.Time{}
+		inst.status.UpdatedAt = now
 		inst.runner = nil
 		inst.broker = nil
-		inst.status.State = RuntimeStateStopped
-		inst.status.Message = "runtime manager closed"
-		inst.status.StoppedAt = time.Now().UTC()
-		inst.status.UpdatedAt = inst.status.StoppedAt
 		m.instances[pluginID] = inst
 	}
+	m.closePending = map[string]int{}
+	if len(closers) != 0 {
+		m.closePending["runner-cleanup"] = len(closers)
+	}
+	for _, pending := range pendingDone {
+		m.closePending[pending.stage]++
+	}
+	if len(stopFutures) != 0 {
+		m.closePending["plugin-stops"] = len(stopFutures)
+	}
+	if len(authorities) != 0 {
+		m.closePending["authority-drain"] = len(authorities)
+	}
 	m.mu.Unlock()
-	go m.finishClose(runners, pendingDone)
+	for _, future := range stopFutures {
+		future.start(m)
+	}
+	go m.finishClose(closers, pendingDone, stopFutures, authorities, m.closeEpochs)
 	select {
 	case <-m.closeDone:
 		m.mu.Lock()
@@ -491,22 +920,108 @@ func (m *RuntimeManager) Close(ctx context.Context) error {
 		m.mu.Unlock()
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
+		m.mu.Lock()
+		select {
+		case <-m.closeDone:
+			err := m.closeErr
+			m.mu.Unlock()
+			return err
+		default:
+		}
+		for id, epoch := range m.closeEpochs {
+			inst := m.instances[id]
+			if inst.generation == epoch && m.latestGen[id] == epoch && inst.status.State == RuntimeStateStopping {
+				inst.status.State = RuntimeStateDegraded
+				inst.status.Message = runtimePendingMessage
+				inst.status.UpdatedAt = time.Now().UTC()
+				m.instances[id] = inst
+			}
+		}
+		pending := runtimePendingStages(m.closePending)
+		if len(pending) == 0 {
+			pending = []string{"finalizing"}
+		}
+		m.mu.Unlock()
+		return &RuntimeShutdownError{Stage: "shutdown-pending", PendingStages: pending, Err: ctx.Err()}
 	}
 }
 
-func (m *RuntimeManager) finishClose(runners map[Runner]struct{}, pendingDone []<-chan struct{}) {
-	var joined error
-	for runner := range runners {
-		if closer, ok := runner.(RunnerCloser); ok {
-			joined = errors.Join(joined, closer.StopAll(context.Background()))
-		}
+func (m *RuntimeManager) finishClose(
+	closers map[RunnerCloser]map[string]struct{},
+	pendingDone []runtimePendingClose,
+	stopFutures []*runtimeStopFuture,
+	authorities map[*generationAuthority]map[string]struct{},
+	epochs map[string]uint64,
+) {
+	results := make(chan runtimeShutdownPart, len(closers)+len(pendingDone)+len(stopFutures)+len(authorities))
+	remaining := 0
+	for closer, owners := range closers {
+		remaining++
+		go func(closer RunnerCloser, pluginIDs []string) {
+			results <- runtimeShutdownPart{stage: "runner-cleanup", pluginIDs: pluginIDs, err: closer.StopAll(context.Background())}
+		}(closer, runtimeShutdownOwnerIDs(owners))
 	}
-	for _, done := range pendingDone {
-		<-done
+	for _, pending := range pendingDone {
+		remaining++
+		go func(pending runtimePendingClose) {
+			<-pending.done
+			var err error
+			if pending.cleanup != nil {
+				err = pending.cleanup.result()
+			}
+			results <- runtimeShutdownPart{
+				stage: pending.stage, pluginIDs: []string{pending.pluginID}, err: err,
+			}
+		}(pending)
+	}
+	for _, future := range stopFutures {
+		remaining++
+		go func(future *runtimeStopFuture) {
+			<-future.done
+			results <- runtimeShutdownPart{stage: "plugin-stops", pluginIDs: []string{future.pluginID}, err: future.err}
+		}(future)
+	}
+	for authority, owners := range authorities {
+		remaining++
+		go func(authority *generationAuthority, pluginIDs []string) {
+			results <- runtimeShutdownPart{stage: "authority-drain", pluginIDs: pluginIDs, err: authority.wait(context.Background())}
+		}(authority, runtimeShutdownOwnerIDs(owners))
+	}
+	var joined error
+	pluginErrors := make(map[string]error)
+	for range remaining {
+		result := <-results
+		joined = errors.Join(joined, result.err)
+		for _, pluginID := range result.pluginIDs {
+			pluginErrors[pluginID] = errors.Join(pluginErrors[pluginID], result.err)
+		}
+		m.mu.Lock()
+		m.closePending[result.stage]--
+		if m.closePending[result.stage] == 0 {
+			delete(m.closePending, result.stage)
+		}
+		m.mu.Unlock()
 	}
 	m.mu.Lock()
 	m.closeErr = joined
+	now := time.Now().UTC()
+	for pluginID, epoch := range epochs {
+		inst := m.instances[pluginID]
+		if inst.generation != epoch || m.latestGen[pluginID] != epoch {
+			continue
+		}
+		if pluginErrors[pluginID] != nil {
+			inst.status.State = RuntimeStateDegraded
+			inst.status.Message = runtimeDegradedMessage
+			inst.status.StoppedAt = time.Time{}
+		} else {
+			inst.status.State = RuntimeStateStopped
+			inst.status.Message = runtimeStoppedMessage
+			inst.status.StoppedAt = now
+		}
+		inst.status.UpdatedAt = now
+		m.instances[pluginID] = inst
+	}
 	close(m.closeDone)
 	m.mu.Unlock()
 }

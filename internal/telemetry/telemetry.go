@@ -16,13 +16,14 @@ var defaultRegistry = NewRegistry()
 const RedactedSubscriptionPath = "/sub/:token"
 
 type Registry struct {
-	mu       sync.Mutex
-	started  time.Time
-	store    map[string]*durationStats
-	audit    map[string]uint64
-	http     map[httpKey]*durationStats
-	httpSlow map[string]uint64
-	agent    map[httpKey]*durationStats
+	mu               sync.Mutex
+	started          time.Time
+	store            map[string]*durationStats
+	audit            map[string]uint64
+	http             map[httpKey]*durationStats
+	httpSlow         map[string]uint64
+	agent            map[httpKey]*durationStats
+	pluginSystemPool PluginSystemPoolSnapshot
 }
 
 type durationStats struct {
@@ -37,13 +38,14 @@ type httpKey struct {
 }
 
 type Snapshot struct {
-	StartedAt time.Time
-	Uptime    time.Duration
-	Store     map[string]durationStats
-	Audit     map[string]uint64
-	HTTP      map[httpKey]durationStats
-	HTTPSlow  map[string]uint64
-	Agent     map[httpKey]durationStats
+	StartedAt        time.Time
+	Uptime           time.Duration
+	Store            map[string]durationStats
+	Audit            map[string]uint64
+	HTTP             map[httpKey]durationStats
+	HTTPSlow         map[string]uint64
+	Agent            map[httpKey]durationStats
+	PluginSystemPool PluginSystemPoolSnapshot
 }
 
 func NewRegistry() *Registry {
@@ -77,6 +79,22 @@ func ObserveHTTPRequest(path string, status int, d time.Duration, slow bool) {
 
 func ObserveAgentRequest(path string, status int, d time.Duration) {
 	defaultRegistry.ObserveAgentRequest(path, status, d)
+}
+
+func ObservePluginSystemPoolDuration(phase PluginSystemPoolDurationPhase, d time.Duration) {
+	defaultRegistry.ObservePluginSystemPoolDuration(phase, d)
+}
+
+func ObservePluginSystemPoolLifecycle(event PluginSystemPoolLifecycleEvent) {
+	defaultRegistry.ObservePluginSystemPoolLifecycle(event)
+}
+
+func ObservePluginSystemPoolCircuit(transition PluginSystemPoolCircuitTransition) {
+	defaultRegistry.ObservePluginSystemPoolCircuit(transition)
+}
+
+func ObservePluginSystemPoolRetirement(reason PluginSystemPoolRetirementReason) {
+	defaultRegistry.ObservePluginSystemPoolRetirement(reason)
 }
 
 func Prometheus() string {
@@ -156,6 +174,7 @@ func (r *Registry) Reset() {
 	r.http = map[httpKey]*durationStats{}
 	r.httpSlow = map[string]uint64{}
 	r.agent = map[httpKey]*durationStats{}
+	r.pluginSystemPool = PluginSystemPoolSnapshot{}
 }
 
 func (r *Registry) ObserveAuditAppend(err error) {
@@ -193,13 +212,14 @@ func (r *Registry) Snapshot() Snapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Snapshot{
-		StartedAt: r.started,
-		Uptime:    time.Since(r.started),
-		Store:     copyDurationMap(r.store),
-		Audit:     copyCounterMap(r.audit),
-		HTTP:      copyHTTPMap(r.http),
-		HTTPSlow:  copyCounterMap(r.httpSlow),
-		Agent:     copyHTTPMap(r.agent),
+		StartedAt:        r.started,
+		Uptime:           time.Since(r.started),
+		Store:            copyDurationMap(r.store),
+		Audit:            copyCounterMap(r.audit),
+		HTTP:             copyHTTPMap(r.http),
+		HTTPSlow:         copyCounterMap(r.httpSlow),
+		Agent:            copyHTTPMap(r.agent),
+		PluginSystemPool: r.pluginSystemPool,
 	}
 }
 
@@ -237,6 +257,7 @@ func (r *Registry) Prometheus() string {
 	}
 
 	writeHTTPMetrics(&b, "lattice_agent", "Agent endpoint requests", snap.Agent)
+	writePluginSystemPoolMetrics(&b, snap.PluginSystemPool)
 	return b.String()
 }
 

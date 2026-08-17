@@ -107,6 +107,10 @@ type SystemRunnerOptions struct {
 	// Pool controls stdio-json-v2 worker capacity and retirement. Nil uses safe
 	// host defaults; a non-nil value is validated exactly, including zero overflow.
 	Pool *SystemPoolConfig
+	// PoolObserver receives warm-pool telemetry at the pool's decision points.
+	// Nil observes nothing. The observer must be cheap and must not call back
+	// into the runner.
+	PoolObserver SystemPoolObserver
 }
 
 type systemPluginState struct {
@@ -325,6 +329,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 	}
 
 	pool := newConfiguredSystemPool(r.poolConfig.Size, r.poolConfig.MaxOverflow, r.poolConfig.MaxUses, r.poolConfig.MaxAge, req.Generation)
+	pool.obs = r.opts.PoolObserver
 	pool.failureFn = func(generation uint64) { r.recordGenerationFailure(pluginID, generation) }
 	pool.successFn = func(generation uint64) { r.recordGenerationSuccess(pluginID, generation) }
 	if isV2 {
@@ -338,18 +343,30 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 			return readyPooledWorker(ctx, gen, t)
 		}
 		startupCtx, cancel := context.WithTimeout(ctx, r.poolConfig.StartTimeout)
+		startBegan := time.Now()
 		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.v2ChildEnv(req.Generation))
 		if startErr == nil {
 			startErr = transport.awaitReadyContext(startupCtx, req.Generation)
 		}
 		cancel()
+		// The prepare-time first worker is a start attempt like any the
+		// supervisor makes, and is observed identically.
+		observeSystemPoolDuration(r.opts.PoolObserver, SystemPoolDurationStart, time.Since(startBegan))
 		if startErr != nil {
+			// Only a failure the worker owns counts: when the caller's own
+			// context ended (canceled or deadline), the start was preempted,
+			// not failed.
+			if ctx.Err() == nil {
+				observeSystemPoolLifecycle(r.opts.PoolObserver, SystemPoolLifecycleWorkerStartFailure)
+			}
 			if transport != nil {
 				_ = transport.abort()
 			}
 			return RunnerStartResult{}, fmt.Errorf("start v2 worker: %w", startErr)
 		}
+		observeSystemPoolLifecycle(r.opts.PoolObserver, SystemPoolLifecycleWorkerStartSuccess)
 		if err := pool.publishTransport(req.Generation, transport, time.Now()); err != nil {
+			observeSystemPoolRetirements(r.opts.PoolObserver, SystemPoolRetirementRejected, 1)
 			_ = transport.abort()
 			return RunnerStartResult{}, err
 		}
@@ -965,57 +982,7 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 		return InvokeResponse{}, err
 	}
 	if st.isV2 {
-		w, err := st.pool.checkout(runCtx, time.Now())
-		if err != nil {
-			return InvokeResponse{}, err
-		}
-		invocation := fmt.Sprintf("%d", time.Now().UnixNano())
-		outcome, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) }, budget)
-		if callErr != nil {
-			if !outcome.DispatchStarted && (errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded)) {
-				st.pool.returnUnused(w, time.Now())
-				return InvokeResponse{}, callErr
-			}
-			if ctx.Err() == nil {
-				r.recordLifecycleFailure(req.PluginID, st)
-			}
-			st.pool.poison(w)
-			warnings := v2StderrWarnings(budget, outcome.StderrTruncated)
-			if len(outcome.Stderr) > 0 {
-				r.logf("plugin runtime: transport failure for %s stderr_bytes=%d stderr_truncated=%t", req.PluginID, len(outcome.Stderr), outcome.StderrTruncated)
-			}
-			return InvokeResponse{Warnings: warnings}, fmt.Errorf("plugin %q transport failure: %w", req.PluginID, callErr)
-		}
-		reply := outcome.Reply
-		warnings := append([]string(nil), reply.Warnings...)
-		warnings = append(warnings, v2StderrWarnings(budget, outcome.StderrTruncated)...)
-		if outcome.Retirement != nil {
-			if ctx.Err() == nil {
-				r.recordLifecycleFailure(req.PluginID, st)
-			}
-			st.pool.poison(w)
-			warning := "persistent worker retired after terminal protocol failure"
-			warnings = append(warnings, warning)
-			r.logf("plugin runtime: %s %s: %v", warning, req.PluginID, outcome.Retirement)
-		} else if outcome.Reusable {
-			st.pool.release(w, outcome.ResultSeen, time.Now())
-			r.recordLifecycleSuccess(req.PluginID, st)
-		} else {
-			st.pool.poison(w)
-			return InvokeResponse{}, fmt.Errorf("plugin %q invocation completed without reusable terminal state", req.PluginID)
-		}
-		result := reply.Result
-		if len(result) == 0 {
-			result = reply.Plan
-		}
-		if !reply.OK {
-			msg := reply.Message
-			if msg == "" {
-				msg = reply.Error
-			}
-			return InvokeResponse{OK: false, Message: msg, Result: result, Warnings: warnings}, fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
-		}
-		return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
+		return r.invokeV2Pooled(runCtx, ctx, req, st, broker, budget)
 	}
 
 	// The approved operation's authority is bound before protocol selection.
@@ -1065,6 +1032,78 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 		}
 		return InvokeResponse{OK: false, Message: msg, Result: result, Warnings: warnings},
 			fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
+	}
+	return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
+}
+
+// invokeV2Pooled runs one invocation against the persistent worker pool. It is
+// the observation seam for the warm path: queue is the checkout wait whatever
+// its outcome, handler is the span the worker's transport was actually held,
+// and total is the whole pooled attempt as the caller experienced it. Worker
+// fates (reusable, poisoned) are counted here where they are decided;
+// retirement attribution stays inside the pool.
+func (r *SystemRunner) invokeV2Pooled(runCtx, ctx context.Context, req InvokeRequest, st *systemPluginState, broker *Broker, budget ResolvedInvokeBudget) (InvokeResponse, error) {
+	obs := r.opts.PoolObserver
+	totalBegan := time.Now()
+	defer func() {
+		observeSystemPoolDuration(obs, SystemPoolDurationTotal, time.Since(totalBegan))
+	}()
+	w, err := st.pool.checkout(runCtx, totalBegan)
+	observeSystemPoolDuration(obs, SystemPoolDurationQueue, time.Since(totalBegan))
+	if err != nil {
+		return InvokeResponse{}, err
+	}
+	invocation := fmt.Sprintf("%d", time.Now().UnixNano())
+	handlerBegan := time.Now()
+	outcome, callErr := w.transport.invokeV2(runCtx, req.Generation, invocation, req, func(call systemHostCall) systemHostResponse { return r.handleHostCall(runCtx, broker, call) }, budget)
+	observeSystemPoolDuration(obs, SystemPoolDurationHandler, time.Since(handlerBegan))
+	if callErr != nil {
+		if !outcome.DispatchStarted && (errors.Is(callErr, context.Canceled) || errors.Is(callErr, context.DeadlineExceeded)) {
+			st.pool.returnUnused(w, time.Now())
+			return InvokeResponse{}, callErr
+		}
+		if ctx.Err() == nil {
+			r.recordLifecycleFailure(req.PluginID, st)
+		}
+		observeSystemPoolLifecycle(obs, SystemPoolLifecycleInvocationFailure)
+		st.pool.poison(w)
+		warnings := v2StderrWarnings(budget, outcome.StderrTruncated)
+		if len(outcome.Stderr) > 0 {
+			r.logf("plugin runtime: transport failure for %s stderr_bytes=%d stderr_truncated=%t", req.PluginID, len(outcome.Stderr), outcome.StderrTruncated)
+		}
+		return InvokeResponse{Warnings: warnings}, fmt.Errorf("plugin %q transport failure: %w", req.PluginID, callErr)
+	}
+	reply := outcome.Reply
+	warnings := append([]string(nil), reply.Warnings...)
+	warnings = append(warnings, v2StderrWarnings(budget, outcome.StderrTruncated)...)
+	if outcome.Retirement != nil {
+		if ctx.Err() == nil {
+			r.recordLifecycleFailure(req.PluginID, st)
+		}
+		observeSystemPoolLifecycle(obs, SystemPoolLifecycleInvocationFailure)
+		st.pool.poison(w)
+		warning := "persistent worker retired after terminal protocol failure"
+		warnings = append(warnings, warning)
+		r.logf("plugin runtime: %s %s: %v", warning, req.PluginID, outcome.Retirement)
+	} else if outcome.Reusable {
+		st.pool.release(w, outcome.ResultSeen, time.Now())
+		r.recordLifecycleSuccess(req.PluginID, st)
+		observeSystemPoolLifecycle(obs, SystemPoolLifecycleInvocationReusable)
+	} else {
+		observeSystemPoolLifecycle(obs, SystemPoolLifecycleInvocationFailure)
+		st.pool.poison(w)
+		return InvokeResponse{}, fmt.Errorf("plugin %q invocation completed without reusable terminal state", req.PluginID)
+	}
+	result := reply.Result
+	if len(result) == 0 {
+		result = reply.Plan
+	}
+	if !reply.OK {
+		msg := reply.Message
+		if msg == "" {
+			msg = reply.Error
+		}
+		return InvokeResponse{OK: false, Message: msg, Result: result, Warnings: warnings}, fmt.Errorf("plugin %q reported failure: %s", req.PluginID, msg)
 	}
 	return InvokeResponse{OK: true, Message: reply.Message, Result: result, Warnings: warnings}, nil
 }

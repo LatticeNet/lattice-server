@@ -499,6 +499,7 @@ func New(opts Options) (*Server, error) {
 			EnvAllowlist: opts.PluginRuntimeEnv,
 			Logf:         s.logger.Printf,
 			Pool:         opts.PluginRuntimePool,
+			PoolObserver: pluginPoolTelemetry{},
 		})
 		if err != nil {
 			return nil, fmt.Errorf("configure plugin runtime: %w", err)

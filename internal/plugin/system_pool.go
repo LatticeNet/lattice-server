@@ -60,6 +60,11 @@ type systemPool struct {
 	jitterFn    func(time.Duration) time.Duration
 	waitBackoff func(context.Context, time.Duration) bool
 	drainFuture *poolDrainFuture
+	// obs receives pool observations, attributed at the decision points. Calls
+	// may arrive while the pool lock is held, which is why the observer
+	// contract demands cheap, non-reentrant implementations. Nil observes
+	// nothing.
+	obs SystemPoolObserver
 	// Test-only ownership boundary hook for cancellation-vs-wake reconciliation.
 	beforeCancelReconcile func()
 	// Test-only result-arm hook for cancellation after assignment but before the
@@ -189,6 +194,7 @@ func (p *systemPool) beginDrain(force bool, generation uint64) *poolDrainFuture 
 	var retire []*systemWorkerTransport
 	var waiters []chan poolCheckoutResult
 	startSupervisorJoin := false
+	dropped := 0
 	if !f.started {
 		f.started = true
 		f.force = force
@@ -201,6 +207,7 @@ func (p *systemPool) beginDrain(force bool, generation uint64) *poolDrainFuture 
 		startSupervisorJoin = f.supervisorPending
 		for _, w := range p.workers {
 			w.state = workerDead
+			dropped++
 			if w.transport != nil {
 				p.registerTransportLocked(w.transport)
 				retire = append(retire, w.transport)
@@ -220,6 +227,7 @@ func (p *systemPool) beginDrain(force bool, generation uint64) *poolDrainFuture 
 				p.active--
 			}
 			w.state = workerDead
+			dropped++
 			if w.transport != nil {
 				p.registerTransportLocked(w.transport)
 				retire = append(retire, w.transport)
@@ -230,7 +238,11 @@ func (p *systemPool) beginDrain(force bool, generation uint64) *poolDrainFuture 
 		f.leasedPending = len(p.leased)
 	}
 	p.finalizeDrainLocked()
+	obs := p.obs
 	p.mu.Unlock()
+	// Every worker the drain drops is a shutdown retirement, whether or not it
+	// still had a live transport to tear down.
+	observeSystemPoolRetirements(obs, SystemPoolRetirementShutdown, dropped)
 	for _, ch := range waiters {
 		ch <- poolCheckoutResult{err: errSystemPoolClosed}
 	}
@@ -603,6 +615,22 @@ func (p *systemPool) finishLease(w *pooledWorker, resultSeen, used bool, now tim
 		w.state = workerResultSeen
 	}
 	if p.closed || p.circuitOpen || w.generation != p.generation || w.uses >= p.maxUses || now.Sub(w.started) >= p.maxAge {
+		// The reason is attributed here, at the decision, in the same priority
+		// order the condition evaluates: a closed pool retires as shutdown even
+		// if the worker is also past its use ceiling.
+		reason := SystemPoolRetirementShutdown
+		switch {
+		case p.closed:
+			reason = SystemPoolRetirementShutdown
+		case p.circuitOpen:
+			reason = SystemPoolRetirementCircuitOpen
+		case w.generation != p.generation:
+			reason = SystemPoolRetirementRejected
+		case w.uses >= p.maxUses:
+			reason = SystemPoolRetirementMaxUses
+		default:
+			reason = SystemPoolRetirementMaxAge
+		}
 		w.state = workerRetiring
 		abort = w.transport
 		w.state = workerDead
@@ -612,7 +640,9 @@ func (p *systemPool) finishLease(w *pooledWorker, resultSeen, used bool, now tim
 		}
 		p.registerTransportLocked(abort)
 		p.finalizeDrainLocked()
+		obs := p.obs
 		p.mu.Unlock()
+		observeSystemPoolRetirements(obs, reason, 1)
 		p.retireTransports([]*systemWorkerTransport{abort})
 		return
 	}
@@ -647,12 +677,15 @@ func (p *systemPool) poison(w *pooledWorker) {
 	}
 	p.registerTransportLocked(w.transport)
 	p.finalizeDrainLocked()
+	obs := p.obs
 	p.mu.Unlock()
+	observeSystemPoolRetirements(obs, SystemPoolRetirementPoisoned, 1)
 	p.retireTransports([]*systemWorkerTransport{w.transport})
 }
 
 func (p *systemPool) setCircuitOpen(open bool) {
 	p.mu.Lock()
+	opened := open && !p.circuitOpen
 	p.circuitOpen = open
 	if open && p.attemptStop != nil {
 		p.attemptStop()
@@ -672,7 +705,12 @@ func (p *systemPool) setCircuitOpen(open bool) {
 			p.registerTransportLocked(w.transport)
 		}
 	}
+	obs := p.obs
 	p.mu.Unlock()
+	if opened {
+		observeSystemPoolCircuit(obs, SystemPoolCircuitOpened)
+	}
+	observeSystemPoolRetirements(obs, SystemPoolRetirementCircuitOpen, len(idle))
 	for _, waiter := range waiters {
 		waiter <- poolCheckoutResult{err: ErrCircuitOpen}
 	}
@@ -732,7 +770,15 @@ func (p *systemPool) replenishSupervisor() {
 			p.mu.Unlock()
 			p.retireTransports(retired)
 
+			startBegan := time.Now()
 			nw, err := fn(attemptCtx, generation)
+			observeSystemPoolDuration(p.obs, SystemPoolDurationStart, time.Since(startBegan))
+			switch {
+			case err == nil && nw != nil:
+				observeSystemPoolLifecycle(p.obs, SystemPoolLifecycleWorkerStartSuccess)
+			case err != nil && !errors.Is(err, context.Canceled):
+				observeSystemPoolLifecycle(p.obs, SystemPoolLifecycleWorkerStartFailure)
+			}
 			attemptCancel()
 			p.mu.Lock()
 			p.attemptStop = nil
@@ -750,6 +796,12 @@ func (p *systemPool) replenishSupervisor() {
 			recordFailure := err != nil && failureFn != nil && !errors.Is(err, context.Canceled)
 			recordSuccess := valid && successFn != nil
 			p.mu.Unlock()
+			// A worker that started cleanly but has no place in the pool's
+			// current state is rejected; a failed start is already counted as
+			// such and never doubles as a rejection.
+			if err == nil && nw != nil && !valid {
+				observeSystemPoolRetirements(p.obs, SystemPoolRetirementRejected, 1)
+			}
 			pendingRetirements := retired
 			retired = nil
 			if !valid && nw != nil && nw.transport != nil {
@@ -818,6 +870,9 @@ func (p *systemPool) cleanupError() error {
 func (p *systemPool) wakeLocked(now time.Time) []*systemWorkerTransport {
 	retired := p.pruneInvalidLocked(now)
 	if p.circuitOpen {
+		// Idle workers found while the circuit is open are circuit
+		// retirements, exactly like the ones setCircuitOpen dumps.
+		observeSystemPoolRetirements(p.obs, SystemPoolRetirementCircuitOpen, len(p.workers))
 		for _, w := range p.workers {
 			w.state = workerDead
 			if w.transport != nil {
@@ -848,6 +903,19 @@ func (p *systemPool) pruneInvalidLocked(now time.Time) []*systemWorkerTransport 
 	for _, w := range p.workers {
 		if w == nil || w.state != workerIdle || w.generation != p.generation || w.uses >= p.maxUses || now.Sub(w.started) >= p.maxAge {
 			if w != nil {
+				// Idle-set prunes are retirements too, attributed by the same
+				// rule order the condition evaluates; anything the pool simply
+				// has no place for counts as rejected.
+				reason := SystemPoolRetirementRejected
+				switch {
+				case w.state != workerIdle || w.generation != p.generation:
+					reason = SystemPoolRetirementRejected
+				case w.uses >= p.maxUses:
+					reason = SystemPoolRetirementMaxUses
+				default:
+					reason = SystemPoolRetirementMaxAge
+				}
+				observeSystemPoolRetirements(p.obs, reason, 1)
 				w.state = workerDead
 				if w.transport != nil {
 					p.registerTransportLocked(w.transport)

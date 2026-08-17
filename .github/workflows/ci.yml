@@ -32,7 +32,10 @@ jobs:
         run: go vet ./...
       - name: test
         working-directory: lattice-server
-        run: go test -race -cover ./...
+        # The E5 line-chain and subscription suites push internal/server past
+        # go test's 10m default under -race -cover on shared runners; the run
+        # died as an aggregate timeout with the active test at 0s, not a hang.
+        run: go test -race -cover -timeout 25m ./...
       - name: gosec
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest

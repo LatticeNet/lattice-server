@@ -10,10 +10,30 @@ import (
 )
 
 const (
-	RuntimeStateArmed   = "armed"
-	RuntimeStateStopped = "stopped"
-	RuntimeStateFailed  = "failed"
+	RuntimeStateArmed    = "armed"
+	RuntimeStateStopping = "stopping"
+	RuntimeStateStopped  = "stopped"
+	RuntimeStateDegraded = "degraded"
+	RuntimeStateFailed   = "failed"
 )
+
+// RuntimeShutdownError reports a caller-bounded observation of physical
+// shutdown without transferring or abandoning manager ownership.
+type RuntimeShutdownError struct {
+	PluginID      string
+	Stage         string
+	PendingStages []string
+	Err           error
+}
+
+func (e *RuntimeShutdownError) Error() string {
+	if e.PluginID == "" {
+		return fmt.Sprintf("runtime shutdown %s: %v", e.Stage, e.Err)
+	}
+	return fmt.Sprintf("runtime %s shutdown %s: %v", e.PluginID, e.Stage, e.Err)
+}
+
+func (e *RuntimeShutdownError) Unwrap() error { return e.Err }
 
 // RuntimeStatus is the public, non-secret health view for one plugin runtime.
 // It deliberately excludes local bundle paths and the broker itself.
@@ -136,6 +156,15 @@ type pendingRuntimeStart struct {
 	done       chan struct{}
 }
 
+type runtimeStopFuture struct {
+	pluginID   string
+	generation uint64
+	tombstone  uint64
+	message    string
+	done       chan struct{}
+	err        error
+}
+
 type RuntimeManagerOptions struct {
 	Services     HostServices
 	Runners      map[string]Runner
@@ -156,6 +185,7 @@ type RuntimeManager struct {
 	latestGen     map[string]uint64
 	pendingStarts map[string]map[uint64]pendingRuntimeStart
 	instances     map[string]runtimeInstance
+	stopFutures   map[string]*runtimeStopFuture
 	closing       bool
 	closeDone     chan struct{}
 	closeErr      error
@@ -184,6 +214,7 @@ func NewRuntimeManagerWithOptions(opts RuntimeManagerOptions) *RuntimeManager {
 		latestGen:     map[string]uint64{},
 		pendingStarts: map[string]map[uint64]pendingRuntimeStart{},
 		instances:     map[string]runtimeInstance{},
+		stopFutures:   map[string]*runtimeStopFuture{},
 		closeDone:     make(chan struct{}),
 	}
 }
@@ -444,7 +475,17 @@ func (m *RuntimeManager) Close(ctx context.Context) error {
 			m.mu.Unlock()
 			return err
 		case <-ctx.Done():
-			return ctx.Err()
+			m.mu.Lock()
+			for id, inst := range m.instances {
+				if inst.status.State == RuntimeStateStopping {
+					inst.status.State = RuntimeStateDegraded
+					inst.status.Message = "runtime manager shutdown pending"
+					inst.status.UpdatedAt = time.Now().UTC()
+					m.instances[id] = inst
+				}
+			}
+			m.mu.Unlock()
+			return &RuntimeShutdownError{Stage: "shutdown-pending", PendingStages: []string{"runner-cleanup"}, Err: ctx.Err()}
 		}
 	}
 	m.closing = true
@@ -474,12 +515,10 @@ func (m *RuntimeManager) Close(ctx context.Context) error {
 		if inst.broker != nil && inst.broker.authority != nil {
 			inst.broker.authority.revoke()
 		}
-		inst.runner = nil
-		inst.broker = nil
-		inst.status.State = RuntimeStateStopped
-		inst.status.Message = "runtime manager closed"
-		inst.status.StoppedAt = time.Now().UTC()
-		inst.status.UpdatedAt = inst.status.StoppedAt
+		inst.status.State = RuntimeStateStopping
+		inst.status.Message = "runtime manager stopping"
+		inst.status.StoppedAt = time.Time{}
+		inst.status.UpdatedAt = time.Now().UTC()
 		m.instances[pluginID] = inst
 	}
 	m.mu.Unlock()
@@ -491,7 +530,17 @@ func (m *RuntimeManager) Close(ctx context.Context) error {
 		m.mu.Unlock()
 		return err
 	case <-ctx.Done():
-		return ctx.Err()
+		m.mu.Lock()
+		for id, inst := range m.instances {
+			if inst.status.State == RuntimeStateStopping {
+				inst.status.State = RuntimeStateDegraded
+				inst.status.Message = "runtime manager shutdown pending"
+				inst.status.UpdatedAt = time.Now().UTC()
+				m.instances[id] = inst
+			}
+		}
+		m.mu.Unlock()
+		return &RuntimeShutdownError{Stage: "shutdown-pending", PendingStages: []string{"runner-cleanup"}, Err: ctx.Err()}
 	}
 }
 
@@ -507,6 +556,19 @@ func (m *RuntimeManager) finishClose(runners map[Runner]struct{}, pendingDone []
 	}
 	m.mu.Lock()
 	m.closeErr = joined
+	now := time.Now().UTC()
+	for pluginID, inst := range m.instances {
+		if joined != nil {
+			inst.status.State = RuntimeStateDegraded
+			inst.status.Message = joined.Error()
+		} else {
+			inst.status.State = RuntimeStateStopped
+			inst.status.Message = "runtime manager closed"
+			inst.status.StoppedAt = now
+		}
+		inst.status.UpdatedAt = now
+		m.instances[pluginID] = inst
+	}
 	close(m.closeDone)
 	m.mu.Unlock()
 }

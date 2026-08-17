@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,46 +69,79 @@ type SystemRunnerOptions struct {
 }
 
 type systemPluginState struct {
-	pluginID        string
-	execPath        string
-	workDir         string
-	broker          *Broker
-	failures        int
-	startupFailures int
-	tripped         bool
-	pool            *systemPool
-	isV2            bool
-	generation      uint64
-	admitted        bool
-	retiring        bool
-	cleanupOnce     sync.Once
-	cleanupDone     chan struct{}
-	refs            int
-	forceAbort      bool
-	v1Active        map[uint64]context.CancelFunc
-	v1Next          uint64
-	rootCtx         context.Context
-	rootCancel      context.CancelFunc
-	cleanupErr      error
+	pluginID         string
+	execPath         string
+	workDir          string
+	broker           *Broker
+	failures         int
+	startupFailures  int
+	tripped          bool
+	pool             *systemPool
+	isV2             bool
+	generation       uint64
+	admitted         bool
+	retiring         bool
+	cleanupOnce      sync.Once
+	cleanupDone      chan struct{}
+	cleanupRequested bool
+	cleanupArmed     bool
+	refs             int
+	refsDone         chan struct{}
+	forceAbort       bool
+	v1Active         map[uint64]context.CancelFunc
+	v1Next           uint64
+	rootCtx          context.Context
+	rootCancel       context.CancelFunc
+	cleanupErr       error
+	cleanupResult    GenerationCleanupResult
+	poolFuture       *poolDrainFuture
+}
+
+// GenerationCleanupResult is the stable, caller-bounded view of one physical
+// generation teardown. Pending snapshots and the immutable terminal result use
+// the same shape so callers never lose ownership detail on timeout.
+type GenerationCleanupResult struct {
+	PluginID      string
+	Generation    uint64
+	Stage         string
+	PendingStages []string
+	ResidualPGIDs []int
+	Transport     error
+	Authority     error
+	RemoveAll     error
+	Err           error
 }
 
 // GenerationCleanupError preserves every residual from one generation's
 // teardown instead of collapsing transport, authority, and filesystem failure
 // into an apparently successful retirement.
 type GenerationCleanupError struct {
-	PluginID   string
-	Generation uint64
-	Transport  error
-	Authority  error
-	RemoveAll  error
+	PluginID      string
+	Generation    uint64
+	Stage         string
+	PendingStages []string
+	ResidualPGIDs []int
+	Transport     error
+	Authority     error
+	RemoveAll     error
+	Err           error
 }
 
 func (e *GenerationCleanupError) Error() string {
-	return fmt.Sprintf("generation %s/%d cleanup residual: %v", e.PluginID, e.Generation, errors.Join(e.Transport, e.Authority, e.RemoveAll))
+	return fmt.Sprintf("generation %s/%d %s: %v", e.PluginID, e.Generation, e.Stage, e.Unwrap())
 }
 
 func (e *GenerationCleanupError) Unwrap() error {
-	return errors.Join(e.Transport, e.Authority, e.RemoveAll)
+	return errors.Join(e.Err, e.Transport, e.Authority, e.RemoveAll)
+}
+
+func generationCleanupError(result GenerationCleanupResult) *GenerationCleanupError {
+	return &GenerationCleanupError{
+		PluginID: result.PluginID, Generation: result.Generation, Stage: result.Stage,
+		PendingStages: append([]string(nil), result.PendingStages...),
+		ResidualPGIDs: append([]int(nil), result.ResidualPGIDs...),
+		Transport:     result.Transport, Authority: result.Authority, RemoveAll: result.RemoveAll, Err: result.Err,
+	}
 }
 
 // SystemRunner implements Runner and Invoker.
@@ -293,7 +327,9 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		r.st[pluginID] = byGeneration
 	}
 	rootCtx, rootCancel := context.WithCancel(context.Background())
-	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel}
+	refsDone := make(chan struct{})
+	close(refsDone)
+	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), refsDone: refsDone, v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel}
 	committed = true
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
@@ -335,38 +371,14 @@ func (r *SystemRunner) ActivateGeneration(pluginID string, generation uint64) er
 }
 
 func (r *SystemRunner) AbortGeneration(ctx context.Context, pluginID string, generation uint64) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
 	r.mu.Lock()
 	st := r.st[pluginID][generation]
-	if st != nil {
-		delete(r.st[pluginID], generation)
-		if len(r.st[pluginID]) == 0 {
-			delete(r.st, pluginID)
-		}
-	}
 	r.mu.Unlock()
-	var transportErr, authorityErr, removeErr error
-	if st != nil {
-		if st.broker != nil && st.broker.authority != nil {
-			st.broker.authority.revoke()
-			authorityErr = st.broker.authority.wait(ctx)
-		}
-		if st.pool != nil {
-			st.pool.abortClose(st.generation)
-			transportErr = st.pool.cleanupError()
-		}
-		removeAll := r.removeAll
-		if removeAll == nil {
-			removeAll = os.RemoveAll
-		}
-		removeErr = removeAll(st.workDir)
-	}
-	if transportErr == nil && authorityErr == nil && removeErr == nil {
+	if st == nil {
 		return nil
 	}
-	return &GenerationCleanupError{PluginID: pluginID, Generation: generation, Transport: transportErr, Authority: authorityErr, RemoveAll: removeErr}
+	r.broadcastCleanup([]*systemPluginState{st}, true)
+	return r.waitGenerationCleanup(ctx, st)
 }
 
 func (r *SystemRunner) RetireGeneration(ctx context.Context, pluginID string, generation uint64) error {
@@ -376,8 +388,11 @@ func (r *SystemRunner) RetireGeneration(ctx context.Context, pluginID string, ge
 		r.mu.Unlock()
 		return nil
 	}
+	r.initCleanupStateLocked(st)
 	st.admitted = false
 	st.retiring = true
+	st.cleanupRequested = true
+	st.cleanupArmed = true
 	r.maybeStartCleanupLocked(st)
 	r.mu.Unlock()
 	if ctx == nil {
@@ -385,12 +400,9 @@ func (r *SystemRunner) RetireGeneration(ctx context.Context, pluginID string, ge
 	}
 	select {
 	case <-st.cleanupDone:
-		r.mu.Lock()
-		err := st.cleanupErr
-		r.mu.Unlock()
-		return err
+		return r.waitGenerationCleanup(context.Background(), st)
 	case <-ctx.Done():
-		return ctx.Err()
+		return generationCleanupError(r.generationCleanupSnapshot(st, ctx.Err()))
 	}
 }
 
@@ -398,7 +410,7 @@ func (r *SystemRunner) maybeStartCleanupLocked(st *systemPluginState) {
 	// Forced retirement cancels/aborts the generation immediately, but cleanup
 	// ownership remains pinned until every acquired invocation releases. This
 	// keeps workdir removal and cleanupDone behind v1 Cmd.Wait/process reaping.
-	if !st.retiring || st.refs != 0 {
+	if !st.cleanupRequested || !st.cleanupArmed {
 		return
 	}
 	st.cleanupOnce.Do(func() {
@@ -407,28 +419,54 @@ func (r *SystemRunner) maybeStartCleanupLocked(st *systemPluginState) {
 }
 
 func (r *SystemRunner) cleanupGeneration(pluginID string, generation uint64, st *systemPluginState) {
+	r.mu.Lock()
+	refsDone := st.refsDone
+	forceAbort := st.forceAbort
+	poolFuture := st.poolFuture
+	r.mu.Unlock()
+	if refsDone != nil {
+		<-refsDone
+	}
 	var transportErr, authorityErr, removeErr error
-	if st.pool != nil {
-		r.mu.Lock()
-		forceAbort := st.forceAbort
-		r.mu.Unlock()
-		transportErr = st.pool.beginDrain(forceAbort, st.generation).wait(context.Background()).Err
+	if !forceAbort {
+		if st.broker != nil && st.broker.authority != nil {
+			st.broker.authority.revoke()
+		}
+		if st.pool != nil {
+			poolFuture = st.pool.beginDrain(false, st.generation)
+			r.mu.Lock()
+			st.poolFuture = poolFuture
+			r.mu.Unlock()
+		}
+	}
+	var poolResult PoolCleanupResult
+	if poolFuture != nil {
+		poolResult = poolFuture.wait(context.Background())
+		transportErr = poolResult.Err
 	}
 	if st.broker != nil && st.broker.authority != nil {
-		st.broker.authority.revoke()
 		authorityErr = st.broker.authority.wait(context.Background())
 	}
 	removeAll := r.removeAll
 	if removeAll == nil {
 		removeAll = os.RemoveAll
 	}
-	removeErr = removeAll(st.workDir)
+	if len(poolResult.ResidualPGIDs) == 0 {
+		removeErr = removeAll(st.workDir)
+	}
+	result := GenerationCleanupResult{PluginID: pluginID, Generation: generation, Stage: "complete", Transport: transportErr, Authority: authorityErr, RemoveAll: removeErr}
+	result.Err = errors.Join(transportErr, authorityErr, removeErr)
+	if result.Err != nil {
+		result.Stage = "cleanup-error"
+	}
+	result.ResidualPGIDs = append([]int(nil), poolResult.ResidualPGIDs...)
 	var joined error
-	if transportErr != nil || authorityErr != nil || removeErr != nil {
-		joined = &GenerationCleanupError{PluginID: pluginID, Generation: generation, Transport: transportErr, Authority: authorityErr, RemoveAll: removeErr}
+	if result.Err != nil {
+		joined = generationCleanupError(result)
 	}
 	r.mu.Lock()
 	st.cleanupErr = joined
+	st.cleanupResult = result
 	if joined != nil {
 		// Keep residual generations discoverable for bounded shutdown callers.
 		close(st.cleanupDone)
@@ -446,6 +484,126 @@ func (r *SystemRunner) cleanupGeneration(pluginID string, generation uint64, st 
 	}
 	close(st.cleanupDone)
 	r.mu.Unlock()
+}
+
+func (r *SystemRunner) broadcastCleanup(states []*systemPluginState, force bool) {
+	var rootCancels, v1Cancels []context.CancelFunc
+	r.mu.Lock()
+	for _, st := range states {
+		r.initCleanupStateLocked(st)
+		st.admitted = false
+		st.retiring = true
+		st.cleanupRequested = true
+		if force {
+			st.forceAbort = true
+			if st.rootCancel != nil {
+				rootCancels = append(rootCancels, st.rootCancel)
+			}
+			for _, cancel := range st.v1Active {
+				v1Cancels = append(v1Cancels, cancel)
+			}
+		}
+	}
+	r.mu.Unlock()
+	for _, cancel := range rootCancels {
+		cancel()
+	}
+	for _, cancel := range v1Cancels {
+		cancel()
+	}
+	for _, st := range states {
+		if st.broker != nil && st.broker.authority != nil {
+			st.broker.authority.revoke()
+		}
+	}
+	poolFutures := make(map[*systemPluginState]*poolDrainFuture, len(states))
+	for _, st := range states {
+		if st.pool != nil {
+			poolFutures[st] = st.pool.beginDrain(force, st.generation)
+		}
+	}
+	r.mu.Lock()
+	for _, st := range states {
+		if future := poolFutures[st]; future != nil {
+			st.poolFuture = future
+		}
+		st.cleanupArmed = true
+		r.maybeStartCleanupLocked(st)
+	}
+	r.mu.Unlock()
+}
+
+func (r *SystemRunner) initCleanupStateLocked(st *systemPluginState) {
+	if st.cleanupDone == nil {
+		st.cleanupDone = make(chan struct{})
+	}
+	if st.refsDone == nil {
+		st.refsDone = make(chan struct{})
+		if st.refs == 0 {
+			close(st.refsDone)
+		}
+	}
+}
+
+func (r *SystemRunner) generationCleanupSnapshot(st *systemPluginState, waitErr error) GenerationCleanupResult {
+	r.mu.Lock()
+	select {
+	case <-st.cleanupDone:
+		result := st.cleanupResult
+		result.PendingStages = append([]string(nil), result.PendingStages...)
+		result.ResidualPGIDs = append([]int(nil), result.ResidualPGIDs...)
+		r.mu.Unlock()
+		return result
+	default:
+	}
+	result := GenerationCleanupResult{PluginID: st.pluginID, Generation: st.generation, Stage: "cleanup-pending", Err: waitErr}
+	if st.refs != 0 {
+		result.PendingStages = append(result.PendingStages, "invocation-references")
+	}
+	poolFuture := st.poolFuture
+	broker := st.broker
+	r.mu.Unlock()
+	if poolFuture != nil {
+		poolResult := poolFuture.snapshot(nil)
+		result.Transport = poolResult.Err
+		result.ResidualPGIDs = append(result.ResidualPGIDs, poolResult.ResidualPGIDs...)
+		for _, stage := range poolResult.PendingStages {
+			result.PendingStages = append(result.PendingStages, "pool-"+stage)
+		}
+		if poolResult.Stage == "pool-drain-pending" && len(poolResult.PendingStages) == 0 {
+			result.PendingStages = append(result.PendingStages, "pool-drain")
+		}
+	}
+	if broker != nil && broker.authority != nil {
+		broker.authority.mu.Lock()
+		active := broker.authority.active
+		broker.authority.mu.Unlock()
+		if active != 0 {
+			result.PendingStages = append(result.PendingStages, "authority")
+		}
+	}
+	result.PendingStages = append(result.PendingStages, "workdir-removal")
+	slices.Sort(result.PendingStages)
+	result.PendingStages = slices.Compact(result.PendingStages)
+	slices.Sort(result.ResidualPGIDs)
+	result.ResidualPGIDs = slices.Compact(result.ResidualPGIDs)
+	result.Err = errors.Join(result.Err, result.Transport, result.Authority, result.RemoveAll)
+	return result
+}
+
+func (r *SystemRunner) waitGenerationCleanup(ctx context.Context, st *systemPluginState) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-st.cleanupDone:
+		r.mu.Lock()
+		err := st.cleanupErr
+		r.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return generationCleanupError(r.generationCleanupSnapshot(st, ctx.Err()))
+	}
 }
 
 func (r *SystemRunner) startLock(pluginID string) *sync.Mutex {
@@ -554,58 +712,35 @@ func validateRuntimePath(root, runtimePath string, wantMode os.FileMode) error {
 func (r *SystemRunner) Stop(ctx context.Context, req RunnerStopRequest) error {
 	r.mu.Lock()
 	var states []*systemPluginState
-	var v1Cancels []context.CancelFunc
 	for generation, st := range r.st[req.PluginID] {
 		if req.Generation == 0 || generation <= req.Generation {
-			st.admitted = false
-			st.retiring = true
-			st.forceAbort = true
-			if st.rootCancel != nil {
-				st.rootCancel()
-			}
 			states = append(states, st)
-			for _, cancel := range st.v1Active {
-				v1Cancels = append(v1Cancels, cancel)
-			}
-			r.maybeStartCleanupLocked(st)
 		}
 	}
 	r.mu.Unlock()
-	kickDone := make(chan struct{})
-	var kickWG sync.WaitGroup
-	for _, st := range states {
-		kickWG.Add(1)
-		go func(st *systemPluginState) {
-			defer kickWG.Done()
-			if st.broker != nil && st.broker.authority != nil {
-				st.broker.authority.revoke()
-			}
-			if st.pool != nil {
-				st.pool.abortClose(st.generation)
-			}
-		}(st)
-	}
-	go func() { kickWG.Wait(); close(kickDone) }()
-	for _, cancel := range v1Cancels {
-		cancel()
-	}
-	for _, st := range states {
-		if ctx == nil {
-			<-st.cleanupDone
-			continue
-		}
-		select {
-		case <-st.cleanupDone:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+	r.broadcastCleanup(states, true)
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	var joined error
 	for _, st := range states {
 		select {
 		case <-st.cleanupDone:
+			r.mu.Lock()
 			joined = errors.Join(joined, st.cleanupErr)
-		default:
+			r.mu.Unlock()
+		case <-ctx.Done():
+			for _, selected := range states {
+				select {
+				case <-selected.cleanupDone:
+					r.mu.Lock()
+					joined = errors.Join(joined, selected.cleanupErr)
+					r.mu.Unlock()
+				default:
+					joined = errors.Join(joined, generationCleanupError(r.generationCleanupSnapshot(selected, ctx.Err())))
+				}
+			}
+			return joined
 		}
 	}
 	return joined
@@ -617,41 +752,13 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 	r.mu.Lock()
 	r.closing = true
 	var states []*systemPluginState
-	var v1Cancels []context.CancelFunc
 	for _, generations := range r.st {
 		for _, st := range generations {
-			st.admitted = false
-			st.retiring = true
-			st.forceAbort = true
-			if st.rootCancel != nil {
-				st.rootCancel()
-			}
 			states = append(states, st)
-			for _, cancel := range st.v1Active {
-				v1Cancels = append(v1Cancels, cancel)
-			}
-			r.maybeStartCleanupLocked(st)
 		}
 	}
 	r.mu.Unlock()
-	kickDone := make(chan struct{})
-	var kickWG sync.WaitGroup
-	for _, st := range states {
-		kickWG.Add(1)
-		go func(st *systemPluginState) {
-			defer kickWG.Done()
-			if st.broker != nil && st.broker.authority != nil {
-				st.broker.authority.revoke()
-			}
-			if st.pool != nil {
-				st.pool.abortClose(st.generation)
-			}
-		}(st)
-	}
-	go func() { kickWG.Wait(); close(kickDone) }()
-	for _, cancel := range v1Cancels {
-		cancel()
-	}
+	r.broadcastCleanup(states, true)
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -659,9 +766,21 @@ func (r *SystemRunner) StopAll(ctx context.Context) error {
 	for _, st := range states {
 		select {
 		case <-st.cleanupDone:
+			r.mu.Lock()
 			joined = errors.Join(joined, st.cleanupErr)
+			r.mu.Unlock()
 		case <-ctx.Done():
-			return errors.Join(ctx.Err(), joined)
+			for _, selected := range states {
+				select {
+				case <-selected.cleanupDone:
+					r.mu.Lock()
+					joined = errors.Join(joined, selected.cleanupErr)
+					r.mu.Unlock()
+				default:
+					joined = errors.Join(joined, generationCleanupError(r.generationCleanupSnapshot(selected, ctx.Err())))
+				}
+			}
+			return joined
 		}
 	}
 	return joined
@@ -687,6 +806,9 @@ func (r *SystemRunner) AcquireInvocation(pluginID string, generation uint64) (In
 	if st == nil || !st.admitted || st.retiring || r.closing {
 		r.mu.Unlock()
 		return nil, fmt.Errorf("plugin %q generation %d is not admitted", pluginID, generation)
+	}
+	if st.refs == 0 {
+		st.refsDone = make(chan struct{})
 	}
 	st.refs++
 	if st.rootCtx == nil {
@@ -724,6 +846,9 @@ func (l *systemInvocationLease) Release() {
 		l.state.refs--
 		if l.state.refs < 0 {
 			panic("system runner invocation reference underflow")
+		}
+		if l.state.refs == 0 {
+			close(l.state.refsDone)
 		}
 		r.maybeStartCleanupLocked(l.state)
 		r.mu.Unlock()

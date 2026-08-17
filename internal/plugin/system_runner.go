@@ -421,23 +421,30 @@ func (r *SystemRunner) maybeStartCleanupLocked(st *systemPluginState) {
 func (r *SystemRunner) cleanupGeneration(pluginID string, generation uint64, st *systemPluginState) {
 	r.mu.Lock()
 	refsDone := st.refsDone
-	forceAbort := st.forceAbort
-	poolFuture := st.poolFuture
 	r.mu.Unlock()
 	if refsDone != nil {
 		<-refsDone
 	}
+	r.mu.Lock()
+	forceAbort := st.forceAbort
+	poolFuture := st.poolFuture
+	r.mu.Unlock()
 	var transportErr, authorityErr, removeErr error
-	if !forceAbort {
-		if st.broker != nil && st.broker.authority != nil {
-			st.broker.authority.revoke()
-		}
-		if st.pool != nil {
-			poolFuture = st.pool.beginDrain(false, st.generation)
-			r.mu.Lock()
-			st.poolFuture = poolFuture
-			r.mu.Unlock()
-		}
+	if st.broker != nil && st.broker.authority != nil {
+		// Forced callers normally revoke during broadcast, but cleanup must also
+		// be correct when it joins an already-marked generation. Revocation is
+		// idempotent and must precede authority wait and cleanupDone.
+		st.broker.authority.revoke()
+	}
+	if st.pool != nil {
+		// Always reacquire the pool-owned canonical future after invocation refs
+		// drain. A concurrent graceful-to-force upgrade can publish the future
+		// between the initial cleanup request and this point; beginDrain is
+		// idempotent and returns that same upgraded physical transaction.
+		poolFuture = st.pool.beginDrain(forceAbort, st.generation)
+		r.mu.Lock()
+		st.poolFuture = poolFuture
+		r.mu.Unlock()
 	}
 	var poolResult PoolCleanupResult
 	if poolFuture != nil {

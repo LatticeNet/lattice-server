@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
@@ -84,6 +88,49 @@ func TestPluginInvokeExecutesArtifact(t *testing.T) {
 	}
 	if !out.OK || out.Message != "executed" || string(out.Result) != `{"ran":true}` {
 		t.Fatalf("artifact did not execute as expected: %+v (raw %s)", out, body)
+	}
+}
+
+func TestPluginInvokeDoesNotExposeOrAuditRawStderr(t *testing.T) {
+	const secret = "SECRET-STDERR-CANARY"
+	pluginRoot := t.TempDir()
+	bundle := filepath.Join(pluginRoot, "test.stderr")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "manifest.json"), []byte(`{"id":"test.stderr","name":"Stderr Test","type":"system","capabilities":["node:read"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "artifact"), []byte("#!/bin/sh\necho '"+secret+"' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PluginDir: pluginRoot, PluginRuntimeDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	for _, status := range []string{"installed", "active"} {
+		resp := doJSON(t, handler, http.MethodPost, "/api/plugins/lifecycle", `{"id":"test.stderr","status":"`+status+`"}`, cookies, csrf)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("lifecycle %s: %d", status, resp.StatusCode)
+		}
+	}
+	resp := doJSON(t, handler, http.MethodPost, "/api/plugins/invoke", `{"id":"test.stderr","action":"describe"}`, cookies, csrf)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if bytes.Contains(body, []byte(secret)) {
+		t.Fatalf("response leaked stderr: %s", body)
+	}
+	for _, event := range st.AuditEvents() {
+		if strings.Contains(event.Reason, secret) {
+			t.Fatalf("audit leaked stderr: %+v", event)
+		}
 	}
 }
 
@@ -404,6 +451,648 @@ func TestPluginCallV2DoesNotDispatchCoreServiceForForeignPublisher(t *testing.T)
 	}
 	if called {
 		t.Fatal("foreign publisher reached an in-core RPC handler")
+	}
+}
+
+func TestPluginSubscriptionMutationRejectsFetchAfterLastShareDeletion(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem,
+		Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{
+			Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}},
+		}},
+	}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	share := model.SubscriptionShare{ID: "share", Slug: "share", Token: strings.Repeat("a", 32), Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}
+	if err := st.UpsertSubscriptionShare(share); err != nil {
+		t.Fatal(err)
+	}
+	base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "base", FetchedAt: time.Now().UTC()}
+	if err := st.UpsertSubscriptionSnapshot(base); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(),
+		now: time.Now, subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	mutationStarted, releaseMutation := make(chan struct{}), make(chan struct{})
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"},
+		func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+			close(mutationStarted)
+			<-releaseMutation
+			return []byte(`{"ok":true}`), nil
+		}); err != nil {
+		t.Fatal(err)
+	}
+	fetchStarted, releaseFetch := make(chan struct{}), make(chan struct{})
+	fetchCalls := 0
+	srv.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		fetchCalls++
+		if fetchCalls == 1 {
+			close(fetchStarted)
+			<-releaseFetch
+			return model.SubscriptionSnapshot{Raw: "captured-before-mutation"}, nil
+		}
+		return model.SubscriptionSnapshot{Raw: "after-mutation"}, nil
+	}
+	fetchDone := make(chan error, 1)
+	go func() { _, err := srv.snapshotFor(context.Background(), "p", "graph", true); fetchDone <- err }()
+	<-fetchStarted
+	if err := st.DeleteSubscriptionShare("share"); err != nil {
+		t.Fatal(err)
+	}
+	callDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		callDone <- rec
+	}()
+	<-mutationStarted
+	close(releaseFetch)
+	close(releaseMutation)
+	if rec := <-callDone; rec.Code != http.StatusOK {
+		t.Fatalf("mutation response code=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if err := <-fetchDone; err == nil || !strings.Contains(err.Error(), "plugin changed") {
+		t.Fatalf("pre-mutation fetch error=%v", err)
+	}
+	stored, _ := st.SubscriptionSnapshot("p", "graph")
+	if stored.Raw != "base" {
+		t.Fatalf("obsolete fetch became durable authority: %+v", stored)
+	}
+	if err := st.UpsertSubscriptionShare(share); err != nil {
+		t.Fatal(err)
+	}
+	got, err := srv.snapshotFor(context.Background(), "p", "graph", false)
+	if err != nil || got.Raw != "after-mutation" || fetchCalls != 2 {
+		t.Fatalf("recreated share snapshot=%+v calls=%d err=%v", got, fetchCalls, err)
+	}
+}
+
+func TestGraphSaveWaitsForPluginGateBeforeTakingAuthorityRead(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, releaseGate, err := srv.acquireSubscriptionPluginGate(context.Background(), "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiter := make(chan struct{}, 1)
+	srv.subscriptionPluginGateWaiter = waiter
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		done <- rec
+	}()
+	<-waiter
+	state := srv.subscriptionGraphAuthorityFor(vpnCorePluginID)
+	if !state.mu.TryLock() {
+		releaseGate()
+		t.Fatal("graph save held R while waiting for the plugin mutation gate")
+	}
+	state.mu.Unlock()
+	releaseGate()
+	if rec := <-done; rec.Code != http.StatusOK {
+		t.Fatalf("save response code=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func graphAuthorityPluginFixture(t *testing.T, methods []string) (*Server, string, string, VpnUser) {
+	t.Helper()
+	srv, sourceUUID, _, user, _ := seedLineChainFixture(t)
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{}}}}
+	for _, method := range methods {
+		manifest.Interfaces[0].MethodSpecs = append(manifest.Interfaces[0].MethodSpecs,
+			plugin.InterfaceMethod{Name: method, Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}})
+	}
+	if err := srv.store.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv.plugins = append(srv.plugins, plugin.Loaded{Manifest: manifest})
+	srv.pluginRPC = plugin.NewRPCRegistry()
+	options, err := srv.vpnCoreSubscriptionSourcesRPC(context.Background(), "graph_options", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded graphSubscriptionOptionsResponse
+	if err := json.Unmarshal(options, &decoded); err != nil || !decoded.OK {
+		t.Fatalf("initial graph options: %s err=%v", options, err)
+	}
+	return srv, decoded.OptionsVersion, sourceUUID, user
+}
+
+func invokeGraphPlugin(t *testing.T, srv *Server, method, payload string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(fmt.Sprintf(`{"id":"p","service":"p/subscription","method":%q,"payload":%s}`, method, payload)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	return rec
+}
+
+func TestGraphMutationFirstMakesLaterSaveObserveNewOptionsAndWriteNothing(t *testing.T) {
+	srv, expected, _, user := graphAuthorityPluginFixture(t, []string{"save"})
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		wire, err := srv.vpnCoreSubscriptionSourcesRPC(ctx, "graph_options", []byte(`{}`))
+		if err != nil {
+			return nil, err
+		}
+		var options graphSubscriptionOptionsResponse
+		if err := json.Unmarshal(wire, &options); err != nil || options.OptionsVersion != expected {
+			return nil, errors.New("graph options changed")
+		}
+		if err := srv.store.PutKV(model.KVEntry{Bucket: "plugin:p", Key: "saved", Value: `{"ok":true}`}); err != nil {
+			return nil, err
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	state := srv.subscriptionGraphAuthorityFor(vpnCorePluginID)
+	state.mu.Lock()
+	public, private := splitVpnUserRecord(user)
+	public.Name = "changed after options review"
+	if err := srv.store.PutVpnUserRecord(public, private); err != nil {
+		state.mu.Unlock()
+		t.Fatal(err)
+	}
+	readWaiter := make(chan struct{}, 1)
+	srv.subscriptionGraphReadWaiter = readWaiter
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- invokeGraphPlugin(t, srv, "save", `{}`) }()
+	<-readWaiter
+	if _, ok := srv.store.KVEntry("plugin:p", "saved"); ok {
+		state.mu.Unlock()
+		t.Fatal("save wrote before mutation publication released")
+	}
+	state.mu.Unlock()
+	rec := <-done
+	if rec.Code == http.StatusOK {
+		t.Fatalf("stale save unexpectedly succeeded: %s", rec.Body.String())
+	}
+	if _, ok := srv.store.KVEntry("plugin:p", "saved"); ok {
+		t.Fatal("stale save published KV state")
+	}
+}
+
+func TestGraphSaveHoldsOneAuthorityReadThroughDurableCommit(t *testing.T) {
+	srv, _, _, _ := graphAuthorityPluginFixture(t, []string{"save"})
+	validated, allowCommit := make(chan struct{}), make(chan struct{})
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		if _, err := srv.vpnCoreSubscriptionSourcesRPC(ctx, "graph_options", []byte(`{}`)); err != nil {
+			return nil, err
+		}
+		close(validated)
+		<-allowCommit
+		if err := srv.store.PutKV(model.KVEntry{Bucket: "plugin:p", Key: "saved", Value: `{"ok":true}`}); err != nil {
+			return nil, err
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	saveDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { saveDone <- invokeGraphPlugin(t, srv, "save", `{}`) }()
+	<-validated
+	writeWaiter := make(chan struct{}, 1)
+	srv.subscriptionGraphWriteWaiter = writeWaiter
+	mutationDone := make(chan struct{})
+	go func() {
+		_ = srv.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return nil })
+		close(mutationDone)
+	}()
+	<-writeWaiter
+	close(allowCommit)
+	if rec := <-saveDone; rec.Code != http.StatusOK {
+		t.Fatalf("save failed: %d %s", rec.Code, rec.Body.String())
+	}
+	<-mutationDone
+	if _, ok := srv.store.KVEntry("plugin:p", "saved"); !ok {
+		t.Fatal("durable save commit missing")
+	}
+}
+
+func TestGraphPreviewOptionsAndComposeShareOuterAuthorityRead(t *testing.T) {
+	srv, _, sourceUUID, user := graphAuthorityPluginFixture(t, []string{"preview"})
+	between, continueCompose := make(chan struct{}), make(chan struct{})
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"preview"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		if _, err := srv.vpnCoreSubscriptionSourcesRPC(ctx, "graph_options", []byte(`{}`)); err != nil {
+			return nil, err
+		}
+		close(between)
+		<-continueCompose
+		return srv.vpnCoreSubscriptionSourcesRPC(ctx, "compose", []byte(fmt.Sprintf(`{"schema_version":1,"identity_id":%q,"entry_roots":[%q]}`, user.ID, sourceUUID)))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	previewDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { previewDone <- invokeGraphPlugin(t, srv, "preview", `{}`) }()
+	<-between
+	writeWaiter := make(chan struct{}, 1)
+	srv.subscriptionGraphWriteWaiter = writeWaiter
+	mutationDone := make(chan struct{})
+	go func() {
+		_ = srv.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return nil })
+		close(mutationDone)
+	}()
+	<-writeWaiter
+	close(continueCompose)
+	if rec := <-previewDone; rec.Code != http.StatusOK {
+		t.Fatalf("preview failed: %d %s", rec.Code, rec.Body.String())
+	}
+	<-mutationDone
+}
+
+func TestGraphSaveCommitFailurePublishesNoKVAndReleasesAuthority(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "state")
+	st, err := store.Open(filepath.Join(parent, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		singboxInv: map[string]model.SingBoxInventory{}, agentCapabilities: map[string]map[string]struct{}{}, logger: log.New(io.Discard, "", 0)}
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		if _, err := srv.vpnCoreSubscriptionSourcesRPC(ctx, "graph_options", []byte(`{}`)); err != nil {
+			return nil, err
+		}
+		if err := os.RemoveAll(parent); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(parent, []byte("blocks mkdir"), 0o600); err != nil {
+			return nil, err
+		}
+		return nil, srv.store.PutKV(model.KVEntry{Bucket: "plugin:p", Key: "saved", Value: `{"must_not_publish":true}`})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := invokeGraphPlugin(t, srv, "save", `{}`); rec.Code == http.StatusOK {
+		t.Fatalf("failed commit returned success: %s", rec.Body.String())
+	}
+	if _, ok := srv.store.KVEntry("plugin:p", "saved"); ok {
+		t.Fatal("failed commit published KV state")
+	}
+	state := srv.subscriptionGraphAuthorityFor(vpnCorePluginID)
+	if !state.mu.TryLock() {
+		t.Fatal("failed save retained graph authority read")
+	}
+	state.mu.Unlock()
+}
+
+func TestLegacyVPNCorePreviewDoesNotUpgradeGraphReadForStalePruning(t *testing.T) {
+	srv, _, _, _ := graphAuthorityPluginFixture(t, []string{"preview"})
+	const staleNode = "stale-preview-node"
+	if err := srv.store.UpsertNode(model.Node{ID: staleNode, Name: staleNode}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv[staleNode] = model.SingBoxInventory{NodeID: staleNode, At: srv.now().Add(-nodeOfflineThreshold - time.Minute), Status: "ok"}
+	srv.singboxInvMu.Unlock()
+	skipped := make(chan struct{}, 1)
+	srv.subscriptionGraphPruneSkipped = skipped
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"preview"}, func(ctx context.Context, _ string, _ []byte) ([]byte, error) {
+		return srv.vpnCoreNodesRPC(ctx, "export", []byte(`{"include_managed":false}`))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rec := invokeGraphPlugin(t, srv, "preview", `{}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy preview failed: %d %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-skipped:
+	default:
+		t.Fatal("nested nodes export did not skip the graph-authority prune upgrade")
+	}
+	if _, ok := srv.singBoxInventory(staleNode); !ok {
+		t.Fatal("optional stale prune ran while the outer graph read was held")
+	}
+}
+
+func TestPluginSubscriptionMutationPanicReleasesGate(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "before-panic", FetchedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSubscriptionShare(model.SubscriptionShare{ID: "active", Slug: "active", Token: strings.Repeat("a", 32), Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			panic("uncooperative plugin panic")
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invoke := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		return rec
+	}
+	panicResponse := invoke()
+	if panicResponse.Code == http.StatusOK || strings.Contains(panicResponse.Body.String(), "uncooperative plugin panic") {
+		t.Fatalf("plugin panic was not safely classified code=%d body=%q", panicResponse.Code, panicResponse.Body.String())
+	}
+	if snapshot, ok := st.SubscriptionSnapshot("p", "graph"); !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" {
+		t.Fatalf("failed plugin mutation did not retain conservative stale authority: %+v ok=%v", snapshot, ok)
+	}
+	recovered := invoke()
+	if recovered.Code != http.StatusOK || calls != 2 {
+		t.Fatalf("mutation gate stranded after panic code=%d calls=%d body=%q", recovered.Code, calls, recovered.Body.String())
+	}
+	srv.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		return model.SubscriptionSnapshot{Raw: "after-success"}, nil
+	}
+	refreshed, err := srv.snapshotFor(context.Background(), "p", "graph", false)
+	if err != nil || refreshed.Raw != "after-success" || refreshed.Stale {
+		t.Fatalf("fresh pre-mutation snapshot was reused after successful mutation: %+v err=%v", refreshed, err)
+	}
+}
+
+func TestPluginSubscriptionMutationPersistenceFailurePreventsDispatch(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache:           newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		subscriptionMutationPersist: func(string, time.Time) (bool, error) { return false, errors.New("disk secret") }}
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		called = true
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	if rec.Code == http.StatusOK || called || strings.Contains(rec.Body.String(), "secret") {
+		t.Fatalf("persistence failure dispatched=%v code=%d body=%q", called, rec.Code, rec.Body.String())
+	}
+}
+
+func TestPluginSubscriptionMutationCommittedPersistenceErrorPublishesStaleAuthority(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	share := model.SubscriptionShare{ID: "share", Slug: "share", Token: strings.Repeat("a", 32), Enabled: true, DefaultFormat: "plain",
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}
+	if err := st.UpsertSubscriptionShare(share); err != nil {
+		t.Fatal(err)
+	}
+	base := model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "fresh", FetchedAt: time.Now().UTC()}
+	if err := st.UpsertSubscriptionSnapshot(base); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	canary := "vless://11111111-1111-4111-8111-111111111111?private_key=durability-secret"
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	key := subscriptionCacheKey{ShareID: "share", Format: "plain", UAClass: "surge"}
+	srv.subscriptionCache.PutSnapshot(key, []byte("old-body"), "text/plain", "", subscriptionRevalidationVersion(base), "", false, base.FetchedAt, time.Now())
+	publication := srv.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "graph"})
+	publication.mu.Lock()
+	beforeEpoch := publication.epoch
+	publication.mu.Unlock()
+	srv.subscriptionMutationPersist = func(pluginID string, now time.Time) (bool, error) {
+		committed, err := st.MarkPluginSubscriptionSnapshotsStale(pluginID, now)
+		if err != nil {
+			return committed, err
+		}
+		return true, errors.New(canary)
+	}
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		called = true
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	if rec.Code == http.StatusOK || called || strings.Contains(rec.Body.String(), canary) {
+		t.Fatalf("committed persistence error dispatched=%v code=%d body=%q", called, rec.Code, rec.Body.String())
+	}
+	publication.mu.Lock()
+	afterEpoch := publication.epoch
+	publication.mu.Unlock()
+	if afterEpoch != beforeEpoch+1 {
+		t.Fatalf("committed mutation epoch=%d want=%d", afterEpoch, beforeEpoch+1)
+	}
+	if _, ok := srv.subscriptionCache.GetStale(key); ok {
+		t.Fatal("committed mutation durability error left old cache visible")
+	}
+	if snapshot, ok := st.SubscriptionSnapshot("p", "graph"); !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" {
+		t.Fatalf("committed stale authority=%+v ok=%v", snapshot, ok)
+	}
+	for _, event := range st.AuditEvents() {
+		if strings.Contains(event.Reason+fmt.Sprint(event.Metadata), canary) {
+			t.Fatalf("durability diagnostic reached audit: %+v", event)
+		}
+	}
+}
+
+func TestPluginSubscriptionMutationDiagnosticsAreContainedAtHTTPBoundary(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "last-good", FetchedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	panicCanary := "vless://11111111-1111-4111-8111-111111111111?private_key=panic-secret"
+	errorCanary := "lat$1$error-secret-private-key"
+	var runtimeLog bytes.Buffer
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		logger: log.New(&runtimeLog, "", 0), subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	calls := 0
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		calls++
+		switch calls {
+		case 1:
+			panic(panicCanary)
+		case 2:
+			return nil, errors.New(errorCanary)
+		default:
+			return []byte(`{"ok":true}`), nil
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var httpLog bytes.Buffer
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv.handlePluginCall(w, r, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+	})
+	ts := httptest.NewUnstartedServer(handler)
+	ts.Config.ErrorLog = log.New(&httpLog, "", 0)
+	ts.Start()
+	defer ts.Close()
+	invoke := func() (int, string, error) {
+		resp, err := http.Post(ts.URL, "application/json", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`))
+		if err != nil {
+			return 0, "", err
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body), err
+	}
+	for attempt := 1; attempt <= 3; attempt++ {
+		code, body, err := invoke()
+		if err != nil {
+			t.Fatalf("mutation attempt %d transport error: %v", attempt, err)
+		}
+		if attempt < 3 && code == http.StatusOK {
+			t.Fatalf("mutation diagnostic attempt %d returned success body=%q", attempt, body)
+		}
+		if attempt == 3 && code != http.StatusOK {
+			t.Fatalf("gate did not recover code=%d body=%q", code, body)
+		}
+		if strings.Contains(body, panicCanary) || strings.Contains(body, errorCanary) {
+			t.Fatalf("mutation diagnostic leaked in response: %q", body)
+		}
+	}
+	snapshot, ok := st.SubscriptionSnapshot("p", "graph")
+	if !ok || !snapshot.Stale || snapshot.FetchError != "source_mutated" {
+		t.Fatalf("mutation diagnostics lost stale authority: %+v ok=%v", snapshot, ok)
+	}
+	evidence, err := json.Marshal(struct {
+		Snapshots []model.SubscriptionSnapshot `json:"snapshots"`
+		Audits    []model.AuditEvent           `json:"audits"`
+	}{st.SubscriptionSnapshots(), st.AuditEvents()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := string(evidence) + runtimeLog.String() + httpLog.String()
+	if strings.Contains(all, panicCanary) || strings.Contains(all, errorCanary) {
+		t.Fatalf("mutation diagnostic leaked outside protected boundary: %s", all)
+	}
+}
+
+func TestPluginSubscriptionMutationCanceledWhileQueuedDoesNotDispatch(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := plugin.Manifest{Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "save", Effect: plugin.InterfaceEffectWrite, Scopes: []string{"proxy:read"}}}}}}
+	if err := st.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: manifest.Name, Type: manifest.Type, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{store: st, plugins: []plugin.Loaded{{Manifest: manifest}}, pluginRPC: plugin.NewRPCRegistry(), now: time.Now,
+		subscriptionCache: newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL)}
+	started, release := make(chan struct{}), make(chan struct{})
+	calls := 0
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"save"}, func(context.Context, string, []byte) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			close(started)
+			<-release // deliberately ignores the request context
+		}
+		return []byte(`{"ok":true}`), nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invoke := func(ctx context.Context) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(`{"id":"p","service":"p/subscription","method":"save","payload":{}}`)).WithContext(ctx)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{Scopes: []string{"proxy:read"}}})
+		return rec
+	}
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- invoke(context.Background()) }()
+	<-started
+	waiting := make(chan struct{}, 1)
+	srv.subscriptionPluginGateWaiter = waiting
+	canceled, cancel := context.WithCancel(context.Background())
+	secondDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { secondDone <- invoke(canceled) }()
+	<-waiting
+	cancel()
+	second := <-secondDone
+	if second.Code == http.StatusOK || calls != 1 {
+		t.Fatalf("canceled queued mutation code=%d calls=%d body=%q", second.Code, calls, second.Body.String())
+	}
+	close(release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first mutation code=%d body=%q", first.Code, first.Body.String())
+	}
+	third := invoke(context.Background())
+	if third.Code != http.StatusOK || calls != 2 {
+		t.Fatalf("gate did not recover code=%d calls=%d body=%q", third.Code, calls, third.Body.String())
 	}
 }
 

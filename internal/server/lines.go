@@ -352,7 +352,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 					continue
 				}
 				if owner == "" && provesLineUUIDAuthorityHash(lines[i]) {
-					if err := s.store.PutLineUUIDAuthority(lines[i].LineHashID, uuid, lines[i].NodeID); err == nil {
+					if err := s.putLineUUIDAuthority(lines[i].LineHashID, uuid, lines[i].NodeID); err == nil {
 						uuidResolver.ownerByHash[lines[i].LineHashID] = lines[i].NodeID
 						lines[i].LineUUID = uuid
 						continue
@@ -375,7 +375,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 					continue
 				}
 			}
-			if err := s.store.PutLineUUIDAuthority(lines[i].LineHashID, uuid, lines[i].NodeID); err != nil {
+			if err := s.putLineUUIDAuthority(lines[i].LineHashID, uuid, lines[i].NodeID); err != nil {
 				s.logger.Printf("linemeta: persist line_uuid for %s: %v", lines[i].LineHashID, err)
 				lines[i].LineUUID = ""
 				continue

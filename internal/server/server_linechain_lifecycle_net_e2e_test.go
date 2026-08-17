@@ -157,17 +157,50 @@ func lifecycleStartProcess(t *testing.T, bin, root, name, configDir string, port
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait(); _ = logFile.Close() }()
 	t.Cleanup(func() {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Errorf("%s did not exit", name)
+		pgid := -cmd.Process.Pid
+		lifecycleStopPGID(t, pgid, done, name)
+		// A managed restart may replace the process recorded at startup; join
+		// the currently owned pidfile process group as well.
+		if raw, err := os.ReadFile(filepath.Join(root, name+".pid")); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(raw))); err == nil && pid > 0 && pid != cmd.Process.Pid {
+				current := -pid
+				lifecycleStopPGID(t, current, nil, name+"-restarted")
+			}
+			_ = os.Remove(filepath.Join(root, name+".pid"))
 		}
 	})
 	if err := lifecycleWaitPort(port, 5*time.Second); err != nil {
 		raw, _ := os.ReadFile(logPath)
 		t.Fatalf("start %s: %v: %s", name, err, raw)
 	}
+}
+
+func lifecycleStopPGID(t *testing.T, pgid int, done <-chan error, name string) {
+	t.Helper()
+	_ = syscall.Kill(pgid, syscall.SIGTERM)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pgid, 0) != nil {
+			if done != nil {
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+					t.Errorf("%s wait did not complete", name)
+				}
+			}
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = syscall.Kill(pgid, syscall.SIGKILL)
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(pgid, 0) != nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("%s process group did not exit", name)
 }
 
 func lifecycleWaitPort(port int, timeout time.Duration) error {

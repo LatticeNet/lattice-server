@@ -145,7 +145,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 	}
 	name := node.Name
 
-	report, ok, err := s.store.DeleteNode(req.NodeID)
+	report, ok, err := s.deleteGraphNode(req.NodeID)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, store.ErrLineChainDeleteConflict) {

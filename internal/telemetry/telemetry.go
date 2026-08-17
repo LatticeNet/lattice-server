@@ -2,6 +2,9 @@ package telemetry
 
 import (
 	"fmt"
+	"net/http"
+	"net/url"
+	pathpkg "path"
 	"sort"
 	"strings"
 	"sync"
@@ -9,6 +12,8 @@ import (
 )
 
 var defaultRegistry = NewRegistry()
+
+const RedactedSubscriptionPath = "/sub/:token"
 
 type Registry struct {
 	mu       sync.Mutex
@@ -64,6 +69,8 @@ func ObserveAuditAppend(err error) {
 	defaultRegistry.ObserveAuditAppend(err)
 }
 
+// ObserveHTTPRequest records a path already classified by
+// RequestPathForObservability; this string-only API cannot infer method semantics.
 func ObserveHTTPRequest(path string, status int, d time.Duration, slow bool) {
 	defaultRegistry.ObserveHTTPRequest(path, status, d, slow)
 }
@@ -78,6 +85,56 @@ func Prometheus() string {
 
 func CurrentSnapshot() Snapshot {
 	return defaultRegistry.Snapshot()
+}
+
+// RedactSubscriptionPath removes public subscription authority before a
+// request path reaches any observability sink. ServeMux redirects
+// non-canonical paths after cleaning dot segments and repeated slashes, so
+// classify both the raw and effective paths without changing what routing
+// receives.
+func RedactSubscriptionPath(value string) string {
+	if isSubscriptionPath(value) || isSubscriptionPath(pathpkg.Clean(value)) {
+		return RedactedSubscriptionPath
+	}
+	return value
+}
+
+// RequestPathForObservability returns one request path safe for logs and
+// telemetry without modifying the URL used for routing. ServeMux unescapes
+// path segments individually, so escaped slashes must remain inside their
+// original segment while classifying the raw and effective first segments.
+func RequestPathForObservability(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+
+	escapedPath := r.URL.EscapedPath()
+	if hasEscapedSubscriptionFirstSegment(escapedPath) {
+		return RedactedSubscriptionPath
+	}
+	effectivePath := escapedPath
+	if r.Method != http.MethodConnect {
+		effectivePath = pathpkg.Clean(effectivePath)
+	}
+	if hasEscapedSubscriptionFirstSegment(effectivePath) {
+		return RedactedSubscriptionPath
+	}
+	if RedactSubscriptionPath(r.URL.Path) == RedactedSubscriptionPath {
+		return escapedPath
+	}
+	return r.URL.Path
+}
+
+func hasEscapedSubscriptionFirstSegment(escapedPath string) bool {
+	if !strings.HasPrefix(escapedPath, "/") {
+		return false
+	}
+	firstSegment := escapedPath[1:]
+	if slash := strings.IndexByte(firstSegment, '/'); slash >= 0 {
+		firstSegment = firstSegment[:slash]
+	}
+	firstSegment, err := url.PathUnescape(firstSegment)
+	return err == nil && firstSegment == "sub"
 }
 
 func (r *Registry) ObserveStoreSave(d time.Duration, err error) {
@@ -111,6 +168,8 @@ func (r *Registry) ObserveAuditAppend(err error) {
 	r.audit[result]++
 }
 
+// ObserveHTTPRequest records a path already classified by
+// RequestPathForObservability; this string-only API cannot infer method semantics.
 func (r *Registry) ObserveHTTPRequest(path string, status int, d time.Duration, slow bool) {
 	path = normalizePath(path)
 	key := httpKey{Path: path, StatusClass: statusClass(status)}
@@ -285,22 +344,26 @@ func statusClass(status int) string {
 	return fmt.Sprintf("%dxx", status/100)
 }
 
-func normalizePath(path string) string {
+func normalizePath(value string) string {
 	switch {
-	case strings.HasPrefix(path, "/api/agent/terminal/sessions/"):
+	case value == RedactedSubscriptionPath:
+		return RedactedSubscriptionPath
+	case strings.HasPrefix(value, "/api/agent/terminal/sessions/"):
 		return "/api/agent/terminal/sessions/:id/:action"
-	case strings.HasPrefix(path, "/api/terminal/sessions/"):
+	case strings.HasPrefix(value, "/api/terminal/sessions/"):
 		return "/api/terminal/sessions/:id/:action"
-	case strings.HasPrefix(path, "/sub/"):
-		return "/sub/:token"
-	case strings.HasPrefix(path, "/assets/"):
+	case strings.HasPrefix(value, "/assets/"):
 		return "/assets/:asset"
 	default:
-		if path == "" {
+		if value == "" {
 			return "/"
 		}
-		return path
+		return value
 	}
+}
+
+func isSubscriptionPath(value string) bool {
+	return value == "/sub" || strings.HasPrefix(value, "/sub/")
 }
 
 func escapeLabel(value string) string {

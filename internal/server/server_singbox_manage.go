@@ -671,12 +671,7 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 	}
 
 	if updateInventory {
-		s.singboxInvMu.Lock()
-		if s.singboxInv == nil {
-			s.singboxInv = map[string]model.SingBoxInventory{}
-		}
-		s.singboxInv[result.NodeID] = inv
-		s.singboxInvMu.Unlock()
+		s.publishSingBoxInventory(result.NodeID, inv)
 	}
 
 	// Intentionally does NOT touch pendingSingboxProbeNodeIDs here.

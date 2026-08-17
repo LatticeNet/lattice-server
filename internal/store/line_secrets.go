@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -82,19 +84,20 @@ const (
 // VpnUserPublicRecord is the non-secret half of a vpn-core identity. It is a
 // typed store collection so generic KV APIs cannot enumerate or overwrite it.
 type VpnUserPublicRecord struct {
-	ID                    string                    `json:"id"`
-	Email                 string                    `json:"email"`
-	Name                  string                    `json:"name,omitempty"`
-	Enabled               bool                      `json:"enabled"`
-	Credentials           []VpnUserCredentialPublic `json:"credentials"`
-	Bindings              []VpnUserLineBinding      `json:"bindings"`
-	QuotaBytes            int64                     `json:"quota_bytes,omitempty"`
-	ExpiresAt             time.Time                 `json:"expires_at,omitempty"`
-	Group                 string                    `json:"group,omitempty"`
-	Comment               string                    `json:"comment,omitempty"`
-	MigratedFromProxyUser string                    `json:"migrated_from_proxy_user,omitempty"`
-	CreatedAt             time.Time                 `json:"created_at"`
-	UpdatedAt             time.Time                 `json:"updated_at"`
+	ID                     string                    `json:"id"`
+	Email                  string                    `json:"email"`
+	Name                   string                    `json:"name,omitempty"`
+	Enabled                bool                      `json:"enabled"`
+	Credentials            []VpnUserCredentialPublic `json:"credentials"`
+	Bindings               []VpnUserLineBinding      `json:"bindings"`
+	QuotaBytes             int64                     `json:"quota_bytes,omitempty"`
+	ExpiresAt              time.Time                 `json:"expires_at,omitempty"`
+	Group                  string                    `json:"group,omitempty"`
+	Comment                string                    `json:"comment,omitempty"`
+	MigratedFromProxyUser  string                    `json:"migrated_from_proxy_user,omitempty"`
+	CreatedAt              time.Time                 `json:"created_at"`
+	UpdatedAt              time.Time                 `json:"updated_at"`
+	SubscriptionGeneration uint64                    `json:"subscription_generation"`
 }
 
 type VpnUserCredentialPublic struct {
@@ -378,15 +381,35 @@ func (s *Store) ReplaceLineSecretRecords(vpnPublic map[string]VpnUserPublicRecor
 }
 
 func (s *Store) replaceLineSecretRecordsLocked(public map[string]VpnUserPublicRecord, private map[string]VpnUserSecretRecord, managedPublic map[string]ManagedLinePublicRecord, managedPrivate map[string]ManagedLineSecretRecord, legacy []LegacyKVKey) error {
-	if err := validateVpnUserCollections(public, private); err != nil {
+	stagedPublic := cloneVpnUserPublicRecords(public)
+	stagedPrivate := cloneVpnUserSecretRecords(private)
+	for id, record := range stagedPublic {
+		current, exists := s.state.VpnUsers[id]
+		if !exists || current.SubscriptionGeneration == 0 {
+			if record.SubscriptionGeneration == 0 {
+				record.SubscriptionGeneration = 1
+			}
+		} else {
+			generation, err := nextSubscriptionGeneration(current, s.state.VpnUserSecrets[id], record, stagedPrivate[id])
+			if err != nil {
+				return fmt.Errorf("vpn user %q: %w", id, err)
+			}
+			record.SubscriptionGeneration = generation
+		}
+		if record.SubscriptionGeneration == 0 {
+			record.SubscriptionGeneration = 1
+		}
+		stagedPublic[id] = record
+	}
+	if err := validateVpnUserCollections(stagedPublic, stagedPrivate); err != nil {
 		return err
 	}
 	if err := validateManagedLineCollections(managedPublic, managedPrivate); err != nil {
 		return err
 	}
 	staged := s.state
-	staged.VpnUsers = cloneVpnUserPublicRecords(public)
-	staged.VpnUserSecrets = cloneVpnUserSecretRecords(private)
+	staged.VpnUsers = stagedPublic
+	staged.VpnUserSecrets = stagedPrivate
 	staged.ManagedLines = cloneManagedLinePublicRecords(managedPublic)
 	staged.ManagedLineSecrets = cloneManagedLineSecretRecords(managedPrivate)
 	staged.KV = make(map[string]model.KVEntry, len(s.state.KV))
@@ -436,11 +459,69 @@ func (s *Store) ManagedLineRecords() (map[string]ManagedLinePublicRecord, map[st
 func (s *Store) PutVpnUserRecord(public VpnUserPublicRecord, private VpnUserSecretRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	public.SubscriptionGeneration = 0
 	publicRecords := cloneVpnUserPublicRecords(s.state.VpnUsers)
 	privateRecords := cloneVpnUserSecretRecords(s.state.VpnUserSecrets)
 	publicRecords[public.ID] = public
 	privateRecords[public.ID] = private
 	return s.replaceVpnUserRecordsLocked(publicRecords, privateRecords, nil)
+}
+
+func nextSubscriptionGeneration(currentPublic VpnUserPublicRecord, currentPrivate VpnUserSecretRecord, nextPublic VpnUserPublicRecord, nextPrivate VpnUserSecretRecord) (uint64, error) {
+	if currentPublic.ID == "" || currentPublic.SubscriptionGeneration == 0 {
+		return 1, nil
+	}
+	if currentPublic.Enabled == nextPublic.Enabled && currentPublic.ExpiresAt.Equal(nextPublic.ExpiresAt) &&
+		sameVpnUserPublicCredentials(currentPublic.Credentials, nextPublic.Credentials) &&
+		sameVpnUserBindings(currentPublic.Bindings, nextPublic.Bindings) &&
+		currentPrivate.SubID == nextPrivate.SubID &&
+		sameVpnUserPrivateCredentials(currentPrivate.Credentials, nextPrivate.Credentials) {
+		return currentPublic.SubscriptionGeneration, nil
+	}
+	if currentPublic.SubscriptionGeneration == math.MaxUint64 {
+		return 0, errors.New("subscription generation exhausted")
+	}
+	return currentPublic.SubscriptionGeneration + 1, nil
+}
+
+func sameVpnUserPublicCredentials(a, b []VpnUserCredentialPublic) bool {
+	a = append([]VpnUserCredentialPublic(nil), a...)
+	b = append([]VpnUserCredentialPublic(nil), b...)
+	sort.Slice(a, func(i, j int) bool { return a[i].Protocol < a[j].Protocol })
+	sort.Slice(b, func(i, j int) bool { return b[i].Protocol < b[j].Protocol })
+	return slices.Equal(a, b)
+}
+
+func sameVpnUserPrivateCredentials(a, b []VpnUserCredentialSecret) bool {
+	a = append([]VpnUserCredentialSecret(nil), a...)
+	b = append([]VpnUserCredentialSecret(nil), b...)
+	sort.Slice(a, func(i, j int) bool { return a[i].Protocol < a[j].Protocol })
+	sort.Slice(b, func(i, j int) bool { return b[i].Protocol < b[j].Protocol })
+	return slices.Equal(a, b)
+}
+
+func sameVpnUserBindings(a, b []VpnUserLineBinding) bool {
+	a = append([]VpnUserLineBinding(nil), a...)
+	b = append([]VpnUserLineBinding(nil), b...)
+	sort.Slice(a, func(i, j int) bool {
+		if a[i].LineHashID != a[j].LineHashID {
+			return a[i].LineHashID < a[j].LineHashID
+		}
+		if a[i].Enabled != a[j].Enabled {
+			return !a[i].Enabled
+		}
+		return a[i].FlowOverride < a[j].FlowOverride
+	})
+	sort.Slice(b, func(i, j int) bool {
+		if b[i].LineHashID != b[j].LineHashID {
+			return b[i].LineHashID < b[j].LineHashID
+		}
+		if b[i].Enabled != b[j].Enabled {
+			return !b[i].Enabled
+		}
+		return b[i].FlowOverride < b[j].FlowOverride
+	})
+	return slices.Equal(a, b)
 }
 
 func (s *Store) DeleteVpnUserRecord(id string) error {

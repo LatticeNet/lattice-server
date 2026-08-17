@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -151,8 +152,17 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	uaClass := classifyClientUA(r.Header.Get("User-Agent"))
 	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass}
 
-	body, contentType, userinfo, cached := s.subscriptionCache.Get(key, s.now())
-	if !cached && share.Source.Kind == model.ShareSourcePlugin {
+	var cacheEntry subscriptionCacheEntry
+	var cached bool
+	var cacheEpoch uint64
+	if share.Source.Kind == model.ShareSourcePlugin {
+		cacheEntry, cached, cacheEpoch = s.subscriptionCacheSnapshotForSource(share.Source.PluginID, share.Source.SubscriptionID, key, false, s.now())
+	} else {
+		cacheEntry, cached = s.subscriptionCache.GetSnapshot(key, s.now())
+	}
+	body, contentType, userinfo := cacheEntry.body, cacheEntry.contentType, cacheEntry.userinfo
+	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.publicSourceVersion, cacheEntry.fetchedAt
+	if (!cached || staleResponse) && share.Source.Kind == model.ShareSourcePlugin {
 		// Revalidate before paying for a render. A render boots the plugin's
 		// JavaScript engine, which costs seconds; comparing the content digest
 		// costs a store read and, at most, one provider fetch. When the digest
@@ -160,40 +170,79 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		// source cannot be reached at all, the last good body is served — a
 		// provider outage must not take a client's configuration with it, the
 		// same rule the snapshot layer applies one step down.
-		if stale, ok := s.subscriptionCache.GetStale(key); ok {
+		stale, ok := cacheEntry, cached
+		if !ok {
+			stale, ok, cacheEpoch = s.subscriptionCacheSnapshotForSource(share.Source.PluginID, share.Source.SubscriptionID, key, true, s.now())
+		}
+		if ok {
 			snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false)
 			switch {
 			case snapErr != nil:
-				body, contentType, userinfo, cached = stale.body, stale.contentType, stale.userinfo, true
-			case subscriptionContentHash(snap.Raw) == stale.contentHash:
-				s.subscriptionCache.Extend(key, s.now())
-				body, contentType, userinfo, cached = stale.body, stale.contentType, stale.userinfo, true
+				// A refresh or persistence failure is terminal for this request. A
+				// second snapshotFor inside renderShare could observe the committed
+				// state and turn a durability-degraded transition into HTTP 200.
+				s.logger.Printf("subscription share: refresh failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(snapErr))
+				s.subscriptionCache.InvalidateShare(share.ID)
+				deny("subscription_refresh_failed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+				return
+			case subscriptionRevalidationVersion(snap) == stale.revalidationVersion:
+				if s.subscriptionBeforeCacheExtend != nil {
+					s.subscriptionBeforeCacheExtend()
+				}
+				if !s.extendSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, cacheEpoch, snap, stale.revision, s.now()) {
+					cached = false
+					break
+				}
+				body, contentType, userinfo, cached = stale.body, stale.contentType, snap.Userinfo, true
+				staleResponse, sourceVersion, snapshotFetchedAt = snap.Stale, snap.SourceVersion, snap.FetchedAt
 			}
 		}
 	}
 	if !cached {
-		rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass)
-		if renderErr != nil {
-			deny("render failed: "+renderErr.Error(), map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
-			return
-		}
-		body, contentType, userinfo = rendered.Body, rendered.ContentType, rendered.Userinfo
-		// A client that receives an empty but successful subscription deletes
-		// every node it had. Answering with the decoy keeps that from happening
-		// AND keeps the emptiness from confirming that the token was real.
-		if len(body) == 0 {
-			deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
-			return
-		}
-		contentHash := ""
+		// Plugin rendering races durable source transitions. A rejected epoch is
+		// not merely a cache miss: its body was rendered from superseded authority
+		// and therefore must not escape in the current response either. Re-capture
+		// and render once more; sustained churn fails closed instead of serving a
+		// body whose source transition already committed.
+		attempts := 1
 		if share.Source.Kind == model.ShareSourcePlugin {
-			// renderShare already refreshed the snapshot, so this read is the
-			// fresh record, never a second fetch.
-			if snap, snapErr := s.snapshotFor(r.Context(), share.Source.PluginID, share.Source.SubscriptionID, false); snapErr == nil {
-				contentHash = subscriptionContentHash(snap.Raw)
-			}
+			attempts = 2
 		}
-		s.subscriptionCache.Put(key, body, contentType, userinfo, contentHash, s.now())
+		accepted := false
+		for attempt := 0; attempt < attempts; attempt++ {
+			rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass)
+			if renderErr != nil {
+				s.logger.Printf("subscription share: render failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(renderErr))
+				deny("subscription_render_failed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+				return
+			}
+			// A client that receives an empty but successful subscription deletes
+			// every node it had. Answering with the decoy keeps that from happening
+			// AND keeps the emptiness from confirming that the token was real.
+			if len(rendered.Body) == 0 {
+				deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+				return
+			}
+			entry := subscriptionCacheEntry{body: rendered.Body, contentType: rendered.ContentType, userinfo: rendered.Userinfo,
+				revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
+				stale: rendered.Stale, fetchedAt: rendered.FetchedAt}
+			if share.Source.Kind == model.ShareSourcePlugin &&
+				!s.putSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, rendered.SourceEpoch, entry, s.now()) {
+				continue
+			}
+			if share.Source.Kind != model.ShareSourcePlugin {
+				s.subscriptionCache.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion,
+					entry.publicSourceVersion, entry.stale, entry.fetchedAt, s.now())
+			}
+			body, contentType, userinfo = rendered.Body, rendered.ContentType, rendered.Userinfo
+			staleResponse, sourceVersion, snapshotFetchedAt = rendered.Stale, rendered.SourceVersion, rendered.FetchedAt
+			accepted = true
+			break
+		}
+		if !accepted {
+			deny("subscription_source_changed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+			return
+		}
 	}
 
 	if contentType == "" {
@@ -204,19 +253,68 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	if userinfo != "" {
 		w.Header().Set("Subscription-Userinfo", userinfo)
 	}
+	if staleResponse {
+		w.Header().Set("X-Lattice-Subscription-Stale", "true")
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
+	metadata := map[string]string{
+		"share_id": share.ID, "slug": slug, "token_sha256": tokenHash, "format": format, "ua_class": uaClass,
+		"cache": strconv.FormatBool(cached), "stale": strconv.FormatBool(staleResponse), "snapshot_age_seconds": snapshotAgeSeconds(s.now(), snapshotFetchedAt),
+	}
+	if sourceVersion != "" {
+		metadata["source_version"] = sourceVersion
+	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
-		Metadata: map[string]string{
-			"share_id":     share.ID,
-			"slug":         slug,
-			"token_sha256": tokenHash,
-			"format":       format,
-			"ua_class":     uaClass,
-			"cache":        strconv.FormatBool(cached),
-		},
+		Metadata: metadata,
 	})
+}
+
+// subscriptionCacheSnapshotForSource linearizes plugin cache reads with source
+// publication. A lookup observes either the complete old authority or the
+// persisted+bumped+invalidated new authority, never the publication gap.
+func (s *Server) subscriptionCacheSnapshotForSource(pluginID, subscriptionID string, key subscriptionCacheKey, stale bool, now time.Time) (subscriptionCacheEntry, bool, uint64) {
+	if waiter := s.subscriptionCacheLookupWaiter; waiter != nil {
+		select {
+		case waiter <- struct{}{}:
+		default:
+		}
+	}
+	publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: pluginID, subscriptionID: subscriptionID})
+	publication.mu.Lock()
+	defer publication.mu.Unlock()
+	epoch := publication.epoch
+	if stale {
+		entry, ok := s.subscriptionCache.GetStale(key)
+		return entry, ok, epoch
+	}
+	entry, ok := s.subscriptionCache.GetSnapshot(key, now)
+	return entry, ok, epoch
+}
+
+// subscriptionDiagnosticSummary gives protected runtime logs a bounded
+// classification without copying or deriving content from an untrusted
+// plugin/provider diagnostic (which can contain low-entropy credentials, URIs,
+// keys, or arbitrarily large text) into logs, durable state, or audit evidence.
+func subscriptionDiagnosticSummary(err error) string {
+	if err == nil {
+		return "class=nil bytes=0"
+	}
+	text := err.Error()
+	const maxReportedDiagnosticBytes = 1 << 20
+	bytes := len(text)
+	if bytes > maxReportedDiagnosticBytes {
+		bytes = maxReportedDiagnosticBytes
+	}
+	return fmt.Sprintf("class=%T bytes<=%d", err, bytes)
+}
+
+func snapshotAgeSeconds(now, fetchedAt time.Time) string {
+	if fetchedAt.IsZero() || now.Before(fetchedAt) {
+		return "0"
+	}
+	return strconv.FormatInt(int64(now.Sub(fetchedAt)/time.Second), 10)
 }
 
 // invalidateSharesForPlugin drops every cached body rendered from one plugin's
@@ -224,10 +322,58 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 // what any of its records render to, and the content hash cannot see it — the
 // record, not the content, is what changed — so the edit path invalidates here.
 func (s *Server) invalidateSharesForPlugin(pluginID string) {
+	bySource := make(map[subscriptionRefreshKey][]string)
+	// Persisted snapshots remain authority even when their last share is deleted.
+	// Include them so a later recreated share cannot bypass the mutation epoch.
+	for _, snapshot := range s.store.SubscriptionSnapshots() {
+		if snapshot.PluginID == pluginID {
+			key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: snapshot.SubscriptionID}
+			bySource[key] = nil
+		}
+	}
 	for _, share := range s.store.SubscriptionShares() {
 		if share.Source.Kind == model.ShareSourcePlugin && share.Source.PluginID == pluginID {
-			s.subscriptionCache.InvalidateShare(share.ID)
+			key := subscriptionRefreshKey{pluginID: pluginID, subscriptionID: share.Source.SubscriptionID}
+			bySource[key] = append(bySource[key], share.ID)
 		}
+	}
+	// A source may currently have neither a share nor a durable snapshot while a
+	// fetch or render is in flight. Copy registry keys under the short global
+	// mutex so the mutation still advances those source epochs.
+	s.subscriptionRefreshMu.Lock()
+	for key := range s.subscriptionPublicationStates {
+		if key.pluginID == pluginID {
+			if _, ok := bySource[key]; !ok {
+				bySource[key] = nil
+			}
+		}
+	}
+	for key := range s.subscriptionRefreshFlights {
+		if key.pluginID == pluginID {
+			if _, ok := bySource[key]; !ok {
+				bySource[key] = nil
+			}
+		}
+	}
+	s.subscriptionRefreshMu.Unlock()
+	keys := make([]subscriptionRefreshKey, 0, len(bySource))
+	for key := range bySource {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].pluginID != keys[j].pluginID {
+			return keys[i].pluginID < keys[j].pluginID
+		}
+		return keys[i].subscriptionID < keys[j].subscriptionID
+	})
+	for _, key := range keys {
+		publication := s.subscriptionPublicationStateFor(key)
+		publication.mu.Lock()
+		publication.epoch++
+		for _, shareID := range bySource[key] {
+			s.subscriptionCache.InvalidateShare(shareID)
+		}
+		publication.mu.Unlock()
 	}
 }
 
@@ -272,6 +418,15 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		if err != nil {
 			return renderedSubscription{}, err
 		}
+		epoch, current := s.subscriptionSnapshotEpoch(share.Source.PluginID, share.Source.SubscriptionID, snap)
+		if !current {
+			return renderedSubscription{}, errors.New("subscription source changed during render capture")
+		}
+		if s.subscriptionRender != nil {
+			rendered, err := s.subscriptionRender(ctx, share, format, uaClass, snap)
+			rendered.SourceEpoch = epoch
+			return rendered, err
+		}
 		payload, err := json.Marshal(map[string]string{
 			"subscription_id": share.Source.SubscriptionID,
 			"format":          format,
@@ -296,7 +451,8 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		}
 		// The provider's traffic figures are passed through verbatim so the
 		// client's remaining-quota display stays truthful.
-		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Userinfo: snap.Userinfo}, nil
+		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Userinfo: snap.Userinfo,
+			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
@@ -305,7 +461,12 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 // renderedSubscription is one produced body plus the metadata the core turns
 // into response headers. A source never sets a header itself.
 type renderedSubscription struct {
-	Body        []byte
-	ContentType string
-	Userinfo    string
+	Body                []byte
+	ContentType         string
+	Userinfo            string
+	Stale               bool
+	RevalidationVersion string
+	SourceVersion       string
+	SourceEpoch         uint64
+	FetchedAt           time.Time
 }

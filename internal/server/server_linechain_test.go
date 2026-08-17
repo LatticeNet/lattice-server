@@ -33,6 +33,20 @@ func (t *countingRejectTransport) RoundTrip(*http.Request) (*http.Response, erro
 func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, managedLineDef) {
 	t.Helper()
 	srv := newManagedLineTestServer(t)
+	sourceUUID, targetUUID, user, def := seedLineChainFixtureInto(t, srv)
+	return srv, sourceUUID, targetUUID, user, def
+}
+
+func seedLineChainFixtureInto(t *testing.T, srv *Server) (string, string, VpnUser, managedLineDef) {
+	return seedLineChainFixtureIntoAtSource(t, srv, "198.51.100.20", 1443)
+}
+
+func seedLineChainFixtureIntoAtSourcePort(t *testing.T, srv *Server, sourcePort int) (string, string, VpnUser, managedLineDef) {
+	return seedLineChainFixtureIntoAtSource(t, srv, "127.0.0.1", sourcePort)
+}
+
+func seedLineChainFixtureIntoAtSource(t *testing.T, srv *Server, sourceAddress string, sourcePort int) (string, string, VpnUser, managedLineDef) {
+	t.Helper()
 	seedManagedLineNode(t, srv, "node-a", realityInventoryLines())
 	user := seedManagedLineUser(t, srv)
 	_, def := compileApproval(t, srv)
@@ -46,7 +60,7 @@ func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, manag
 	}})
 	const sourceUUID = "22222222-2222-4222-8222-222222222222"
 	seedManagedLineNode(t, srv, "node-b", []model.SingBoxNode{{
-		Name: "source-b", Protocol: "vless", Network: "tcp", Address: "198.51.100.20", Port: "1443",
+		Name: "source-b", Protocol: "vless", Network: "tcp", Address: sourceAddress, Port: fmt.Sprint(sourcePort),
 		LineUUID: sourceUUID,
 	}})
 	_ = srv.buildLineGroups() // test setup establishes persistent UUID authority before pure compile
@@ -54,7 +68,7 @@ func seedLineChainFixture(t *testing.T) (*Server, string, string, VpnUser, manag
 	if !srv.agentHasCapability("node-b", lineChainDurableCapability) {
 		t.Fatal("fixture failed to record durable capability")
 	}
-	return srv, sourceUUID, def.LineUUID, user, def
+	return sourceUUID, def.LineUUID, user, def
 }
 
 func TestLineChainPublicViewsMatchHTTPAndRPCContract(t *testing.T) {
@@ -796,6 +810,44 @@ func TestLineChainTerminalConcurrentLiveMutationCommitsConsistentDrift(t *testin
 	}
 	if matches, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
 		t.Fatalf("concurrent result was not exactly replayable: matches=%v found=%v err=%v", matches, found, err)
+	}
+}
+
+func TestLineChainTerminalPublicationWaitsForGraphSelectionAuthority(t *testing.T) {
+	srv, sourceUUID, targetUUID, _, _ := seedLineChainFixture(t)
+	compiled, err := srv.compileLineChain(lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.persistLineChainPlan(lineUserTestPrincipal(), compiled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	approval, err = srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator("node-b", 1, false, true, srv.validateLineChainFirstLease)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease=%+v err=%v", deliveries, err)
+	}
+	result := model.TaskResult{TaskID: deliveries[0].Task.ID, NodeID: "node-b", LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
+	waiter := make(chan struct{}, 1)
+	srv.subscriptionGraphWriteWaiter = waiter
+	_, releaseRead := srv.acquireSubscriptionGraphRead(context.Background(), vpnCorePluginID)
+	done := make(chan error, 1)
+	go func() { done <- srv.handleLineChainTaskResult(approval, deliveries[0].Task, result) }()
+	<-waiter
+	if _, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || found {
+		t.Fatalf("terminal result published during graph selection: found=%v err=%v", found, err)
+	}
+	releaseRead()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if matches, found, err := srv.store.ConfirmTaskResultReplay(result); err != nil || !found || !matches {
+		t.Fatalf("terminal result did not publish after release: matches=%v found=%v err=%v", matches, found, err)
 	}
 }
 

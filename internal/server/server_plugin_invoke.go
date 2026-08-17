@@ -225,6 +225,13 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	ctx, cancel := context.WithTimeout(r.Context(), pluginCallTimeout(methodContract))
 	defer cancel()
 	ctx = context.WithValue(ctx, pluginOperatorPrincipalKey{}, p)
+	graphPreviewOperation := req.Service == req.ID+"/subscription" && req.Method == "preview"
+	graphSaveOperation := req.Service == req.ID+"/subscription" && req.Method == "save"
+	if graphPreviewOperation {
+		var releaseGraph func()
+		ctx, releaseGraph = s.acquireSubscriptionGraphRead(ctx, vpnCorePluginID)
+		defer releaseGraph()
+	}
 	payload, err := s.resolveSecretOperatorTargets(p, req.ID, req.Payload, methodContract.OperatorTargetFields)
 	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
@@ -240,17 +247,88 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	loaded, loadedOK := s.loadedPlugin(req.ID)
 	var out []byte
 	err = nil
-	switch {
-	case loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2:
-		out, err = s.dispatchV2PluginCall(ctx, loaded, req.ID, req.Service, req.Method, payload, operatorTargets)
-	case s.pluginRPC == nil:
-		err = errors.New("plugin rpc bus unavailable")
-	default:
-		out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(payload))
-		if errors.Is(err, plugin.ErrRPCNoService) {
-			out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil, nil)
+	mutatingSubscriptionStore := req.Service == req.ID+"/subscription" &&
+		(req.Method == "save" || req.Method == "delete" || req.Method == "import" || req.Method == "migrate")
+	finishSubscriptionMutation := func() {}
+	if mutatingSubscriptionStore {
+		mutationState, releaseMutation, acquireErr := s.acquireSubscriptionPluginGate(ctx, req.ID)
+		if acquireErr != nil {
+			s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", "subscription mutation canceled")
+			writeError(w, http.StatusGatewayTimeout, errors.New("subscription mutation canceled"))
+			return
+		}
+		finished := false
+		finishSubscriptionMutation = func() {
+			if finished {
+				return
+			}
+			finished = true
+			mutationState.mu.Lock()
+			mutationState.generation++
+			mutationState.mu.Unlock()
+			releaseMutation()
+		}
+		defer finishSubscriptionMutation()
+		persistMutation := s.store.MarkPluginSubscriptionSnapshotsStale
+		if s.subscriptionMutationPersist != nil {
+			persistMutation = s.subscriptionMutationPersist
+		}
+		committed, persistErr := persistMutation(req.ID, s.now())
+		if committed {
+			mutationState.mu.Lock()
+			mutationState.generation++
+			mutationState.mu.Unlock()
+			s.invalidateSharesForPlugin(req.ID)
+		}
+		if persistErr != nil {
+			finishSubscriptionMutation()
+			s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", "subscription mutation authority persistence failed")
+			writeError(w, http.StatusBadGateway, errors.New("subscription mutation authority persistence failed"))
+			return
+		}
+		if err := ctx.Err(); err != nil {
+			finishSubscriptionMutation()
+			writeError(w, http.StatusGatewayTimeout, errors.New("subscription mutation canceled"))
+			return
 		}
 	}
+	if graphSaveOperation {
+		var releaseGraph func()
+		ctx, releaseGraph = s.acquireSubscriptionGraphRead(ctx, vpnCorePluginID)
+		defer releaseGraph()
+	}
+	dispatch := func() {
+		switch {
+		case loadedOK && loaded.Manifest.Schema == plugin.ManifestSchemaV2:
+			out, err = s.dispatchV2PluginCall(ctx, loaded, req.ID, req.Service, req.Method, payload, operatorTargets)
+		case s.pluginRPC == nil:
+			err = errors.New("plugin rpc bus unavailable")
+		default:
+			out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(payload))
+			if errors.Is(err, plugin.ErrRPCNoService) {
+				out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil, nil)
+			}
+		}
+	}
+	if mutatingSubscriptionStore {
+		func() {
+			defer func() {
+				if recover() != nil {
+					err = errors.New("subscription mutation execution failed")
+				}
+			}()
+			dispatch()
+		}()
+		if err != nil {
+			// Plugin diagnostics are untrusted and can contain provider URIs,
+			// credentials, or private keys. Mutation failures expose only one
+			// stable class to HTTP and durable audit evidence.
+			err = errors.New("subscription mutation execution failed")
+		}
+	} else {
+		dispatch()
+	}
+	finishSubscriptionMutation()
 	if err != nil {
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
 		var operationErr *pluginOperationError
@@ -273,12 +351,6 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	// shares sourcing it render. Drop those cached bodies now — otherwise the
 	// edit would only take effect at the cache's revalidation cadence, and the
 	// content hash cannot see it (the record changed, not the content).
-	if req.Service == req.ID+"/subscription" {
-		switch req.Method {
-		case "save", "delete", "import", "migrate":
-			s.invalidateSharesForPlugin(req.ID)
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if len(out) == 0 {

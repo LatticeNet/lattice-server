@@ -44,7 +44,7 @@ func (s *Server) ensureLineUUID(lineHashID, nodeID string) (string, error) {
 		if owner := strings.TrimSpace(ownerByHash[lineHashID]); owner != "" && owner != nodeID {
 			return "", fmt.Errorf("line_uuid authority belongs to node %s", owner)
 		}
-		if err := s.store.PutLineUUIDAuthority(lineHashID, uuid, nodeID); err != nil {
+		if err := s.putLineUUIDAuthority(lineHashID, uuid, nodeID); err != nil {
 			return "", err
 		}
 		return uuid, nil
@@ -53,7 +53,7 @@ func (s *Server) ensureLineUUID(lineHashID, nodeID string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := s.store.PutLineUUIDAuthority(lineHashID, uuid, nodeID); err != nil {
+	if err := s.putLineUUIDAuthority(lineHashID, uuid, nodeID); err != nil {
 		return "", err
 	}
 	return uuid, nil

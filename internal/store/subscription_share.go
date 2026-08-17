@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"sort"
 	"time"
 
@@ -13,6 +14,11 @@ import (
 func (s *Store) UpsertSubscriptionShare(share model.SubscriptionShare) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Pathless stores are explicitly ephemeral test/runtime views. Any disk-backed
+	// store must have a real cipher before accepting bearer material.
+	if s.path != "" && share.Token != "" && (s.cipher == nil || !s.cipher.Enabled()) {
+		return errors.New("subscription share token requires an enabled cipher")
+	}
 	s.ensureMaps()
 	now := time.Now().UTC()
 	share.UpdatedAt = now
@@ -22,11 +28,24 @@ func (s *Store) UpsertSubscriptionShare(share model.SubscriptionShare) error {
 	if share.SchemaVersion == 0 {
 		share.SchemaVersion = model.SubscriptionShareSchemaVersion
 	}
-	s.state.SubscriptionShares[share.ID] = share
 	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.UpsertSubscriptionShare(share)
+		if err := s.runtimeBoltHot.UpsertSubscriptionShare(share); err != nil {
+			return err
+		}
+		s.state.SubscriptionShares[share.ID] = share
+		return nil
 	}
-	return s.Save()
+	staged := s.state
+	staged.SubscriptionShares = make(map[string]model.SubscriptionShare, len(s.state.SubscriptionShares)+1)
+	for id, current := range s.state.SubscriptionShares {
+		staged.SubscriptionShares[id] = current
+	}
+	staged.SubscriptionShares[share.ID] = share
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
 }
 
 // SubscriptionShare returns a share by id.
@@ -79,9 +98,23 @@ func (s *Store) DeleteSubscriptionShare(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ensureMaps()
-	delete(s.state.SubscriptionShares, id)
 	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.DeleteSubscriptionShare(id)
+		if err := s.runtimeBoltHot.DeleteSubscriptionShare(id); err != nil {
+			return err
+		}
+		delete(s.state.SubscriptionShares, id)
+		return nil
 	}
-	return s.Save()
+	staged := s.state
+	staged.SubscriptionShares = make(map[string]model.SubscriptionShare, len(s.state.SubscriptionShares))
+	for currentID, current := range s.state.SubscriptionShares {
+		if currentID != id {
+			staged.SubscriptionShares[currentID] = current
+		}
+	}
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
 }

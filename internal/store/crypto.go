@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/auth"
@@ -197,6 +198,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.SubscriptionShares = subscriptionShares
 
+	subscriptionSnapshots := make(map[string]model.SubscriptionSnapshot, len(st.SubscriptionSnapshots))
+	for id, snapshot := range st.SubscriptionSnapshots {
+		enc, err := encryptSubscriptionSnapshotRecord(id, snapshot, c)
+		if err != nil {
+			return State{}, err
+		}
+		subscriptionSnapshots[id] = enc
+	}
+	out.SubscriptionSnapshots = subscriptionSnapshots
+
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
 		rid := recordID(id, authState.State)
@@ -232,6 +243,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 // encrypted under a key that is no longer configured; that is reported as an
 // error instead of corrupting the value into the raw envelope string.
 func decryptState(st *State, c secret.Cipher) error {
+	for id, snapshot := range st.SubscriptionSnapshots {
+		if err := rejectMalformedSecretEnvelope(snapshot.Raw); err != nil {
+			return fmt.Errorf("decrypt subscription snapshot %s raw: %w", id, err)
+		}
+	}
+	for id, share := range st.SubscriptionShares {
+		if err := rejectMalformedSecretEnvelope(share.Token); err != nil {
+			return fmt.Errorf("decrypt subscription share %s token: %w", id, err)
+		}
+	}
 	if !c.Enabled() {
 		if stateHasEnvelope(st) {
 			return fmt.Errorf("state contains encrypted secrets but no master key is configured (set %s or %s)",
@@ -389,6 +410,16 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.SubscriptionShares = subscriptionShares
 
+	subscriptionSnapshots := make(map[string]model.SubscriptionSnapshot, len(st.SubscriptionSnapshots))
+	for id, snapshot := range st.SubscriptionSnapshots {
+		dec, err := decryptSubscriptionSnapshotRecord(id, snapshot, c)
+		if err != nil {
+			return err
+		}
+		subscriptionSnapshots[id] = dec
+	}
+	st.SubscriptionSnapshots = subscriptionSnapshots
+
 	oidcAuthStates := make(map[string]auth.OIDCAuthState, len(st.OIDCAuthStates))
 	for id, authState := range st.OIDCAuthStates {
 		dec, err := decryptOIDCAuthStateRecord(id, authState, c)
@@ -485,6 +516,16 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, u := range st.ProxyUsers {
 		if secret.IsEnvelope(u.UUID) || secret.IsEnvelope(u.Password) || secret.IsEnvelope(u.SubToken) {
+			return true
+		}
+	}
+	for _, snapshot := range st.SubscriptionSnapshots {
+		if secret.IsEnvelope(snapshot.Raw) {
+			return true
+		}
+	}
+	for _, share := range st.SubscriptionShares {
+		if secret.IsEnvelope(share.Token) {
 			return true
 		}
 	}
@@ -889,6 +930,9 @@ func decryptVpnUserSecretRecord(id string, record VpnUserSecretRecord, c secret.
 // the clear: it is a label that already appears in reverse-proxy access logs, and
 // sealing it would imply a secrecy it does not have.
 func encryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c secret.Cipher) (model.SubscriptionShare, error) {
+	if share.Token != "" && (c == nil || !c.Enabled()) {
+		return model.SubscriptionShare{}, fmt.Errorf("encrypt subscription share %s token: enabled cipher is required", id)
+	}
 	token, err := c.Encrypt(share.Token)
 	if err != nil {
 		return model.SubscriptionShare{}, fmt.Errorf("encrypt subscription share %s token: %w", id, err)
@@ -898,6 +942,9 @@ func encryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c 
 }
 
 func decryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c secret.Cipher) (model.SubscriptionShare, error) {
+	if err := rejectMalformedSecretEnvelope(share.Token); err != nil {
+		return model.SubscriptionShare{}, fmt.Errorf("decrypt subscription share %s token: %w", id, err)
+	}
 	if !c.Enabled() && secret.IsEnvelope(share.Token) {
 		return model.SubscriptionShare{}, lostMasterKeyError()
 	}
@@ -907,6 +954,60 @@ func decryptSubscriptionShareRecord(id string, share model.SubscriptionShare, c 
 	}
 	share.Token = token
 	return share, nil
+}
+
+// Subscription Raw can contain bearer credentials and complete proxy URIs. It
+// is opaque to the store, but not public at rest, so every backend seals it at
+// this shared per-record boundary.
+func encryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSnapshot, c secret.Cipher) (model.SubscriptionSnapshot, error) {
+	if snapshot.Raw != "" && (c == nil || !c.Enabled()) {
+		return model.SubscriptionSnapshot{}, fmt.Errorf("encrypt subscription snapshot %s raw: enabled cipher is required", id)
+	}
+	raw, err := c.Encrypt(snapshot.Raw)
+	if err != nil {
+		return model.SubscriptionSnapshot{}, fmt.Errorf("encrypt subscription snapshot %s raw: %w", id, err)
+	}
+	snapshot.Raw = raw
+	return snapshot, nil
+}
+
+func rejectSubscriptionSecretsWithoutCipher(st State, c secret.Cipher) error {
+	if c != nil && c.Enabled() {
+		return nil
+	}
+	for id, share := range st.SubscriptionShares {
+		if share.Token != "" {
+			return fmt.Errorf("subscription share %s token requires an enabled cipher", id)
+		}
+	}
+	for id, snapshot := range st.SubscriptionSnapshots {
+		if snapshot.Raw != "" {
+			return fmt.Errorf("subscription snapshot %s raw requires an enabled cipher", id)
+		}
+	}
+	return nil
+}
+
+func decryptSubscriptionSnapshotRecord(id string, snapshot model.SubscriptionSnapshot, c secret.Cipher) (model.SubscriptionSnapshot, error) {
+	if err := rejectMalformedSecretEnvelope(snapshot.Raw); err != nil {
+		return model.SubscriptionSnapshot{}, fmt.Errorf("decrypt subscription snapshot %s raw: %w", id, err)
+	}
+	if !c.Enabled() && secret.IsEnvelope(snapshot.Raw) {
+		return model.SubscriptionSnapshot{}, lostMasterKeyError()
+	}
+	raw, err := c.Decrypt(snapshot.Raw)
+	if err != nil {
+		return model.SubscriptionSnapshot{}, fmt.Errorf("decrypt subscription snapshot %s raw: %w", id, err)
+	}
+	snapshot.Raw = raw
+	return snapshot, nil
+}
+
+func rejectMalformedSecretEnvelope(value string) error {
+	if strings.HasPrefix(value, "lat$") && !secret.IsEnvelope(value) {
+		return fmt.Errorf("malformed encrypted envelope")
+	}
+	return nil
 }
 
 func encryptOIDCAuthStateRecord(id string, authState auth.OIDCAuthState, c secret.Cipher) (auth.OIDCAuthState, error) {

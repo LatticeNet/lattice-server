@@ -55,14 +55,16 @@ func (s *Server) handleAgentSingBoxInventory(w http.ResponseWriter, r *http.Requ
 	if inv.Nodes == nil {
 		inv.Nodes = []model.SingBoxNode{}
 	}
-	s.singboxInvMu.Lock()
-	if s.singboxInv == nil {
-		s.singboxInv = map[string]model.SingBoxInventory{}
-	}
-	s.singboxInv[req.NodeID] = inv
-	s.singboxInvMu.Unlock()
-	s.invalidateLineReadModel()
-	if err := s.reconcileLineChainsForNode(req.NodeID); err != nil {
+	if err := s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error {
+		s.singboxInvMu.Lock()
+		if s.singboxInv == nil {
+			s.singboxInv = map[string]model.SingBoxInventory{}
+		}
+		s.singboxInv[req.NodeID] = inv
+		s.singboxInvMu.Unlock()
+		s.invalidateLineReadModel()
+		return s.reconcileLineChainsForNodeUnlocked(req.NodeID)
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -178,24 +180,35 @@ func (s *Server) liveSingBoxInventoriesWithNodeExists(now time.Time, nodeExists 
 		live[id] = inv
 	}
 
-	// Delete only the exact entry inspected above. A concurrent inventory report
-	// replaces the map value and must not be erased by a stale pruning decision.
-	s.singboxInvMu.Lock()
-	for id, inspected := range stale {
-		current, ok := s.singboxInv[id]
-		if !ok {
-			continue
+	// Delete only the exact entry inspected above. Pruning is optional read-path
+	// hygiene, so it must never attempt an R-to-W upgrade when a subscription
+	// preview/save already holds graph authority. If a writer cannot be acquired
+	// immediately, return the copied live view and let a later read prune.
+	graph := s.subscriptionGraphAuthorityFor(vpnCorePluginID)
+	if graph.mu.TryLock() {
+		s.singboxInvMu.Lock()
+		for id, inspected := range stale {
+			current, ok := s.singboxInv[id]
+			if !ok {
+				continue
+			}
+			if reflect.DeepEqual(current, inspected) {
+				delete(s.singboxInv, id)
+				continue
+			}
+			if staleNodeExists[id] && (current.At.IsZero() || now.Sub(current.At) <= nodeOfflineThreshold) {
+				current.Nodes = append([]model.SingBoxNode(nil), current.Nodes...)
+				live[id] = current
+			}
 		}
-		if reflect.DeepEqual(current, inspected) {
-			delete(s.singboxInv, id)
-			continue
-		}
-		if staleNodeExists[id] && (current.At.IsZero() || now.Sub(current.At) <= nodeOfflineThreshold) {
-			current.Nodes = append([]model.SingBoxNode(nil), current.Nodes...)
-			live[id] = current
+		s.singboxInvMu.Unlock()
+		graph.mu.Unlock()
+	} else if skipped := s.subscriptionGraphPruneSkipped; skipped != nil {
+		select {
+		case skipped <- struct{}{}:
+		default:
 		}
 	}
-	s.singboxInvMu.Unlock()
 
 	out := make([]model.SingBoxInventory, 0, len(live))
 	for _, inv := range live {
@@ -207,9 +220,12 @@ func (s *Server) liveSingBoxInventoriesWithNodeExists(now time.Time, nodeExists 
 
 // removeSingBoxInventory drops a node's discovered inventory (called on delete).
 func (s *Server) removeSingBoxInventory(nodeID string) {
-	s.singboxInvMu.Lock()
-	delete(s.singboxInv, nodeID)
-	s.singboxInvMu.Unlock()
+	_ = s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error {
+		s.singboxInvMu.Lock()
+		delete(s.singboxInv, nodeID)
+		s.singboxInvMu.Unlock()
+		return nil
+	})
 	s.singboxDiscoverAuditMu.Lock()
 	delete(s.singboxDiscoverAudit, nodeID)
 	s.singboxDiscoverAuditMu.Unlock()

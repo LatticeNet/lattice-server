@@ -204,6 +204,26 @@ type Server struct {
 	// time. It exists so a client poll does not re-enter a plugin - and boot a
 	// JavaScript VM - on every fetch.
 	subscriptionCache *subscriptionCache
+	// subscriptionSnapshotPersist is a narrow persistence seam for exercising
+	// fail-closed last-good transitions. Production always falls back to Store.
+	subscriptionSnapshotPersist   func(model.SubscriptionSnapshot) (bool, error)
+	subscriptionMutationPersist   func(string, time.Time) (bool, error)
+	subscriptionFetch             func(context.Context, string, string) (model.SubscriptionSnapshot, error)
+	subscriptionRefreshMu         sync.Mutex
+	subscriptionRefreshFlights    map[subscriptionRefreshKey]*subscriptionRefreshFlight
+	subscriptionPublicationStates map[subscriptionRefreshKey]*subscriptionPublicationState
+	subscriptionPluginMutations   map[string]*subscriptionPluginMutationState
+	subscriptionRefreshWaiter     chan<- struct{}
+	subscriptionPluginGateWaiter  chan<- struct{}
+	subscriptionGraphAuthorityMu  sync.Mutex
+	subscriptionGraphAuthorities  map[string]*subscriptionGraphAuthorityState
+	subscriptionGraphReadWaiter   chan<- struct{}
+	subscriptionGraphWriteWaiter  chan<- struct{}
+	subscriptionGraphPruneSkipped chan<- struct{}
+	subscriptionRender            func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
+	subscriptionBeforeCacheExtend func()
+	subscriptionCacheLookupWaiter chan<- struct{}
+	subscriptionCacheExtendWaiter chan<- struct{}
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First
@@ -520,10 +540,8 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: reason, Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
 				continue
 			}
-			s.applyPluginHostAccess(pl)
 			rt, err := s.pluginRuntime.Start(context.Background(), pl)
 			if err != nil {
-				s.revokePluginHostAccess(pl)
 				s.logger.Printf("plugin runtime: failed to arm %s: %v", pl.Manifest.ID, err)
 				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
 			} else {
@@ -712,12 +730,12 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 		}
 		if req.Status == model.PluginStatusActive {
 			loaded, _ := s.loadedPlugin(req.ID)
-			s.applyPluginHostAccess(loaded)
 			rt, err := s.pluginRuntime.Start(r.Context(), loaded)
 			if err != nil {
-				s.revokePluginHostAccess(loaded)
-				_, _ = s.pluginRuntime.Stop(req.ID, "activation failed")
-				_ = s.store.SetPluginStatus(req.ID, model.PluginStatusDisabled)
+				if !s.pluginRuntime.IsArmed(req.ID) {
+					_, _ = s.pluginRuntime.Stop(req.ID, "activation failed")
+					_ = s.store.SetPluginStatus(req.ID, model.PluginStatusDisabled)
+				}
 				s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": req.ID, "state": plugin.RuntimeStateFailed}})
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -725,8 +743,6 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Scope: "plugin:admin", Decision: "allow", Metadata: map[string]string{"plugin_id": req.ID, "state": rt.State}})
 		}
 		if req.Status == model.PluginStatusDisabled {
-			loaded, _ := s.loadedPlugin(req.ID)
-			s.revokePluginHostAccess(loaded)
 			rt, err := s.pluginRuntime.Stop(req.ID, "operator disabled plugin")
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, err)
@@ -1056,6 +1072,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/version", s.handleVersion)
 	mux.Handle("/", s.staticHandler())
 	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
+}
+
+// Close stops runtime-owned subprocesses and waits for their transports to be
+// reaped before the server process exits.
+func (s *Server) Close(ctx context.Context) error {
+	if s == nil || s.pluginRuntime == nil {
+		return nil
+	}
+	return s.pluginRuntime.Close(ctx)
 }
 
 func (s *Server) ensureAdmin(username, password string) error {
@@ -2099,7 +2124,7 @@ func (s *Server) ensureNodeIdentityUUID(nodeID string) (string, error) {
 	if err := ensureNodeIdentityUUIDInPlace(&n); err != nil {
 		return "", err
 	}
-	if err := s.store.UpsertNode(n); err != nil {
+	if err := s.upsertGraphNode(n); err != nil {
 		return "", err
 	}
 	s.invalidateLineReadModel()
@@ -2117,6 +2142,13 @@ func (s *Server) agentRuntimeSnapshot(nodeID string) *agentRuntimeConfig {
 }
 
 func (s *Server) replaceAgentCapabilities(nodeID string, capabilities []string) {
+	_ = s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error {
+		s.replaceAgentCapabilitiesUnlocked(nodeID, capabilities)
+		return nil
+	})
+}
+
+func (s *Server) replaceAgentCapabilitiesUnlocked(nodeID string, capabilities []string) {
 	known := make(map[string]struct{}, 2)
 	for _, capability := range capabilities {
 		switch strings.TrimSpace(capability) {
@@ -2378,7 +2410,7 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := s.store.UpsertNode(n); err != nil {
+	if err := s.upsertGraphNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -2481,7 +2513,7 @@ func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Req
 	launch := normalizeAgentLaunchConfig(req.AgentLaunch)
 	launch.UpdatedAt = time.Now().UTC()
 	node.AgentLaunch = &launch
-	if err := s.store.UpsertNode(node); err != nil {
+	if err := s.upsertGraphNode(node); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -5720,7 +5752,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		if err != nil {
 			reason := "line chain inputs changed during approval; fresh plan required"
 			failedAudit := lineChainFailedAudit(p, approval, "", "line_chain_inputs_changed", reason)
-			committed, rejectErr := s.store.RejectLineChainApprovalStale(approval.ID, "line_chain_inputs_changed", reason, failedAudit)
+			var committed bool
+			_, rejectErr := s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+				var storeErr error
+				committed, storeErr = s.store.RejectLineChainApprovalStale(approval.ID, "line_chain_inputs_changed", reason, failedAudit)
+				return nil, storeErr
+			})
 			if rejectErr != nil {
 				if committed {
 					s.logger.Printf("line chain approval stale transition committed with degraded durability: %v", rejectErr)
@@ -5869,7 +5906,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		approveAudit := lineChainApproveAudit(p, approval, task.ID)
 		approveAudit.At = task.CreatedAt
 		failedAudit := lineChainFailedAudit(p, approval, task.ID, "line_chain_inputs_changed", "line chain inputs changed while queueing; fresh plan required")
-		_, committed, err := s.store.ApproveLineChain(approval, task, approveAudit, failedAudit)
+		var committed bool
+		_, err := s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+			var storeErr error
+			_, committed, storeErr = s.store.ApproveLineChain(approval, task, approveAudit, failedAudit)
+			return nil, storeErr
+		})
 		if committed && err != nil {
 			if errors.Is(err, store.ErrLineChainRevisionConflict) || errors.Is(err, store.ErrLineChainCycle) || errors.Is(err, store.ErrTaskTransitionConflict) {
 				if appendErr := s.appendRequiredLineChainAudit(failedAudit); appendErr != nil {
@@ -5946,7 +5988,12 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 		if isLineChainApproval(approval) {
 			reason := "line chain approval rejected by operator"
 			failedAudit := lineChainFailedAudit(p, approval, "", "approval_rejected", reason)
-			committed, err := s.store.RejectLineChainApproval(approval.ID, reason, failedAudit)
+			var committed bool
+			_, err := s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+				var storeErr error
+				committed, storeErr = s.store.RejectLineChainApproval(approval.ID, reason, failedAudit)
+				return nil, storeErr
+			})
 			if err != nil {
 				if committed {
 					s.logger.Printf("line chain rejection committed with degraded durability: %v", err)
@@ -6159,7 +6206,7 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	}
 	n.LastSeen = time.Now().UTC()
 	n.Online = true
-	if err := s.store.UpsertNode(n); err != nil {
+	if err := s.upsertGraphNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -6247,7 +6294,12 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	// approval and current plan-anchor checks atomically with the lease mutation.
 	netGuardCapable := requestHasAgentCapability(r, netGuardManagedSHACapability)
 	lineChainCapable := requestHasAgentCapability(r, lineChainDurableCapability)
-	deliveries, err := s.store.LeaseTaskDeliveriesWithLineChainValidator(nodeID, 3, netGuardCapable, lineChainCapable, s.validateLineChainFirstLease)
+	var deliveries []store.TaskDelivery
+	_, err := s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+		var leaseErr error
+		deliveries, leaseErr = s.store.LeaseTaskDeliveriesWithLineChainValidator(nodeID, 3, netGuardCapable, lineChainCapable, s.validateLineChainFirstLease)
+		return nil, leaseErr
+	})
 	if auditErr := s.repairLineChainAuditEvidence(); auditErr != nil {
 		writeError(w, http.StatusInternalServerError, auditErr)
 		return
@@ -6962,11 +7014,12 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 	slow := time.Duration(slowMS) * time.Millisecond
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		observabilityPath := telemetry.RequestPathForObservability(r)
 		lw := &logResponseWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(lw, r)
 		dur := time.Since(start)
 		slowRequest := dur >= slow
-		telemetry.ObserveHTTPRequest(r.URL.Path, lw.status, dur, slowRequest)
+		telemetry.ObserveHTTPRequest(observabilityPath, lw.status, dur, slowRequest)
 		if !logAll && dur < slow && lw.status < 500 {
 			return
 		}
@@ -6975,10 +7028,12 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 			tag = "SLOW request"
 		}
 		s.logger.Printf("%s: %s %s -> %d %dB %s (ip=%s id=%s)",
-			tag, r.Method, r.URL.Path, lw.status, lw.bytes,
+			tag, r.Method, observabilityPath, lw.status, lw.bytes,
 			dur.Round(time.Millisecond), s.clientIP(r), requestIDFromRequest(r))
 	})
 }
+
+const redactedSubscriptionRequestLogPath = telemetry.RedactedSubscriptionPath
 
 // recordAudit writes an audit event and, unlike a bare best-effort call, logs
 // when the sink fails so audit gaps are visible instead of silent.

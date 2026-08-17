@@ -238,6 +238,20 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	if path == "" {
 		return s, nil
 	}
+	if !cph.Enabled() {
+		data, readErr := os.ReadFile(path)
+		if readErr == nil && len(data) != 0 {
+			var probe State
+			if err := json.Unmarshal(data, &probe); err != nil {
+				return nil, err
+			}
+			if err := rejectSubscriptionSecretsWithoutCipher(probe, cph); err != nil {
+				return nil, fmt.Errorf("store: %w", err)
+			}
+		} else if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return nil, readErr
+		}
+	}
 	walPath := path + ".audit-wal"
 	walAnchorPath := path + ".audit-anchor"
 	wal, err := audit.OpenAnchoredWAL(walPath, walAnchorPath)
@@ -261,20 +275,54 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	if err := json.Unmarshal(data, &s.state); err != nil {
 		return nil, err
 	}
+	migrateSubscriptionSecrets := subscriptionSecretsNeedMigration(s.state, s.cipher)
 	if err := decryptState(&s.state, s.cipher); err != nil {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	s.ensureMaps()
+	snapshots, err := validateCloneSubscriptionSnapshots(s.state.SubscriptionSnapshots)
+	if err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	s.state.SubscriptionSnapshots = snapshots
 	if err := validateVpnUserCollections(s.state.VpnUsers, s.state.VpnUserSecrets); err != nil {
 		return nil, fmt.Errorf("store: invalid vpn user secret collections: %w", err)
 	}
 	if err := validateManagedLineCollections(s.state.ManagedLines, s.state.ManagedLineSecrets); err != nil {
 		return nil, fmt.Errorf("store: invalid managed line secret collections: %w", err)
 	}
+	if migrateSubscriptionSecrets {
+		committed, err := s.persistState(s.jsonPersistState())
+		if err != nil || !committed {
+			return nil, fmt.Errorf("store: migrate subscription secrets: %w", err)
+		}
+	}
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	s.confirmParentDirDurability()
 	return s, nil
+}
+
+func subscriptionSecretsNeedMigration(st State, cph secret.Cipher) bool {
+	for _, snapshot := range st.SubscriptionSnapshots {
+		if snapshot.NeedsRewrite() {
+			return true
+		}
+	}
+	if cph == nil || !cph.Enabled() {
+		return false
+	}
+	for _, snapshot := range st.SubscriptionSnapshots {
+		if snapshot.Raw != "" && !secret.IsEnvelope(snapshot.Raw) {
+			return true
+		}
+	}
+	for _, share := range st.SubscriptionShares {
+		if share.Token != "" && !secret.IsEnvelope(share.Token) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) confirmParentDirDurability() {
@@ -307,6 +355,9 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 		}
 		return fmt.Errorf("runtime bbolt hot store already enabled at %s", s.runtimeBoltHotPath)
 	}
+	if err := rejectSubscriptionSecretsWithoutCipher(s.state, s.cipher); err != nil {
+		return err
+	}
 	bs, err := OpenBoltState(path, s.cipher)
 	if err != nil {
 		return err
@@ -330,6 +381,10 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 
 func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 	existing, err := bs.ExportState()
+	if err != nil {
+		return err
+	}
+	subscriptionAuthorityInitialized, err := bs.subscriptionHotAuthorityInitialized()
 	if err != nil {
 		return err
 	}
@@ -387,7 +442,44 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			return err
 		}
 	}
+	if !subscriptionAuthorityInitialized {
+		if err := bs.initializeSubscriptionHotAuthority(mergeSubscriptionHotSeed(st, existing)); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func mergeSubscriptionHotSeed(jsonState, unmarkedBolt State) State {
+	merged := jsonState
+	merged.SubscriptionShares = make(map[string]model.SubscriptionShare, len(jsonState.SubscriptionShares)+len(unmarkedBolt.SubscriptionShares))
+	for id, share := range unmarkedBolt.SubscriptionShares {
+		merged.SubscriptionShares[id] = share
+	}
+	for id, share := range jsonState.SubscriptionShares {
+		if existing, ok := merged.SubscriptionShares[id]; ok && !share.UpdatedAt.After(existing.UpdatedAt) {
+			continue
+		}
+		merged.SubscriptionShares[id] = share
+	}
+	merged.SubscriptionSnapshots = make(map[string]model.SubscriptionSnapshot, len(jsonState.SubscriptionSnapshots)+len(unmarkedBolt.SubscriptionSnapshots))
+	for key, snapshot := range unmarkedBolt.SubscriptionSnapshots {
+		merged.SubscriptionSnapshots[key] = snapshot
+	}
+	for key, snapshot := range jsonState.SubscriptionSnapshots {
+		if existing, ok := merged.SubscriptionSnapshots[key]; ok && !subscriptionSnapshotNewer(snapshot, existing) {
+			continue
+		}
+		merged.SubscriptionSnapshots[key] = snapshot
+	}
+	return merged
+}
+
+func subscriptionSnapshotNewer(candidate, current model.SubscriptionSnapshot) bool {
+	if !candidate.LastAttemptAt.Equal(current.LastAttemptAt) {
+		return candidate.LastAttemptAt.After(current.LastAttemptAt)
+	}
+	return candidate.FetchedAt.After(current.FetchedAt)
 }
 
 func mergeRuntimeBoltHotState(dst *State, hot State) {
@@ -418,6 +510,11 @@ func mergeRuntimeBoltHotState(dst *State, hot State) {
 	if len(hot.ProxyUsage) > 0 {
 		dst.ProxyUsage = hot.ProxyUsage
 	}
+	// Once enabled, Bolt is authoritative for these hot collections, including
+	// explicit empty/delete state. Conditional non-empty merge resurrects records
+	// from the stale JSON bootstrap after a valid hot deletion.
+	dst.SubscriptionShares = hot.SubscriptionShares
+	dst.SubscriptionSnapshots = hot.SubscriptionSnapshots
 	dst.ensureMaps()
 }
 
@@ -2221,15 +2318,35 @@ func (s *Store) PutKV(entry model.KVEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry.UpdatedAt = time.Now().UTC()
-	s.state.KV[entry.Bucket+"/"+entry.Key] = entry
-	return s.Save()
+	staged := s.state
+	staged.KV = cloneKVEntries(s.state.KV)
+	staged.KV[entry.Bucket+"/"+entry.Key] = entry
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
 }
 
 func (s *Store) DeleteKV(bucket, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.state.KV, bucket+"/"+key)
-	return s.Save()
+	staged := s.state
+	staged.KV = cloneKVEntries(s.state.KV)
+	delete(staged.KV, bucket+"/"+key)
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
+}
+
+func cloneKVEntries(entries map[string]model.KVEntry) map[string]model.KVEntry {
+	cloned := make(map[string]model.KVEntry, len(entries))
+	for key, entry := range entries {
+		cloned[key] = entry
+	}
+	return cloned
 }
 
 func (s *Store) KV(bucket string) []model.KVEntry {

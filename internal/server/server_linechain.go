@@ -738,7 +738,13 @@ func (s *Server) persistLineChainPlan(p principal, compiled lineChainCompiledArt
 		RequestSHA256: compiled.Plan.RequestSHA256, PlanGraphRevision: compiled.PlanGraphRevision, CandidateDefinition: compiled.CandidateDefinition,
 	}
 	planAudit := lineChainPlanAudit(p, approval)
-	planned, deduped, err := s.store.PlanLineChainApproval(attempt, approval, planAudit)
+	var planned store.LineChainAttempt
+	var deduped bool
+	_, err = s.withSubscriptionGraphWrite(vpnCorePluginID, func() ([]byte, error) {
+		var planErr error
+		planned, deduped, planErr = s.store.PlanLineChainApproval(attempt, approval, planAudit)
+		return nil, planErr
+	})
 	if err != nil {
 		return model.Approval{}, err
 	}
@@ -796,6 +802,12 @@ func (s *Server) validateLineChainFirstLease(persistent store.LineChainCompileSt
 }
 
 func (s *Server) handleLineChainTaskResult(approval model.Approval, task model.Task, result model.TaskResult) error {
+	return s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error {
+		return s.handleLineChainTaskResultUnlocked(approval, task, result)
+	})
+}
+
+func (s *Server) handleLineChainTaskResultUnlocked(approval model.Approval, task model.Task, result model.TaskResult) error {
 	terminalError := result.Error
 	if terminalError == "" && result.ExitCode != 0 {
 		terminalError = fmt.Sprintf("line chain task exited %d", result.ExitCode)
@@ -881,6 +893,12 @@ func sameLineChainCandidate(a, b store.LineChainDefinition) bool {
 }
 
 func (s *Server) reconcileLineChainsForNode(nodeID string) error {
+	return s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error {
+		return s.reconcileLineChainsForNodeUnlocked(nodeID)
+	})
+}
+
+func (s *Server) reconcileLineChainsForNodeUnlocked(nodeID string) error {
 	snapshot, err := s.captureLineChainCompileSnapshot()
 	if err != nil {
 		return err

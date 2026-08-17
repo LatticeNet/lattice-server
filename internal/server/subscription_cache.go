@@ -2,6 +2,7 @@ package server
 
 import (
 	"container/list"
+	"strings"
 	"sync"
 	"time"
 )
@@ -16,35 +17,46 @@ type subscriptionCacheKey struct {
 }
 
 type subscriptionCacheEntry struct {
-	key         subscriptionCacheKey
-	body        []byte
+	key      subscriptionCacheKey
+	body     []byte
+	revision uint64
+	size     int
+
 	contentType string
 	// userinfo is the provider's traffic header. It travels with the body rather
 	// than in a parallel map so a cache hit can never serve one client's body
 	// with another's remaining-quota figures.
 	userinfo string
-	// contentHash is the render input's digest. On expiry the serve path
+	// revalidationVersion is private cache authority. Graph snapshots use their
+	// source version; legacy snapshots use a content digest that never crosses a
+	// public response or audit boundary.
 	// re-fetches the (cheap) content and compares hashes: unchanged means the
 	// body is still exact and the entry is extended instead of re-rendered,
 	// which is what keeps a client poll from booting the plugin's JavaScript
 	// engine on every cycle.
-	contentHash string
-	expiresAt   time.Time
+	revalidationVersion string
+	publicSourceVersion string
+	stale               bool
+	fetchedAt           time.Time
+	expiresAt           time.Time
 }
 
 // subscriptionCache keeps rendered subscription bodies for a short time so a
 // client poll does not boot a JavaScript VM and parse a 1.24 MB engine every
 // time.
 //
-// It is bounded in entries rather than bytes because classifyClientUA already
-// bounds how many entries one share can produce; an unbounded map keyed on
-// caller-supplied data would be a memory amplifier.
+// It is bounded by both entries and exact body bytes. classifyClientUA bounds
+// variants per share, while the byte cap prevents a small number of large
+// renders from becoming a memory amplifier.
 type subscriptionCache struct {
-	mu      sync.Mutex
-	max     int
-	ttl     time.Duration
-	entries map[subscriptionCacheKey]*list.Element
-	order   *list.List
+	mu           sync.Mutex
+	max          int
+	maxBytes     int
+	bytes        int
+	ttl          time.Duration
+	entries      map[subscriptionCacheKey]*list.Element
+	order        *list.List
+	nextRevision uint64
 }
 
 func newSubscriptionCache(max int, ttl time.Duration) *subscriptionCache {
@@ -55,29 +67,37 @@ func newSubscriptionCache(max int, ttl time.Duration) *subscriptionCache {
 		ttl = time.Minute
 	}
 	return &subscriptionCache{
-		max:     max,
-		ttl:     ttl,
-		entries: map[subscriptionCacheKey]*list.Element{},
-		order:   list.New(),
+		max:      max,
+		maxBytes: 64 << 20,
+		ttl:      ttl,
+		entries:  map[subscriptionCacheKey]*list.Element{},
+		order:    list.New(),
 	}
 }
 
 func (c *subscriptionCache) Get(key subscriptionCacheKey, now time.Time) ([]byte, string, string, bool) {
+	entry, ok := c.GetSnapshot(key, now)
+	return entry.body, entry.contentType, entry.userinfo, ok
+}
+
+func (c *subscriptionCache) GetSnapshot(key subscriptionCacheKey, now time.Time) (subscriptionCacheEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	el, ok := c.entries[key]
 	if !ok {
-		return nil, "", "", false
+		return subscriptionCacheEntry{}, false
 	}
 	entry := el.Value.(*subscriptionCacheEntry)
 	if !now.Before(entry.expiresAt) {
 		// Expired is not deleted: the revalidation path may still extend this
 		// entry unchanged or serve it as the last good body. The LRU bound and
 		// the next Put are what reclaim it.
-		return nil, "", "", false
+		return subscriptionCacheEntry{}, false
 	}
 	c.order.MoveToFront(el)
-	return entry.body, entry.contentType, entry.userinfo, true
+	out := *entry
+	out.body = append([]byte(nil), entry.body...)
+	return out, true
 }
 
 // GetStale returns a copy of the entry whether or not it has expired. The
@@ -91,7 +111,9 @@ func (c *subscriptionCache) GetStale(key subscriptionCacheKey) (subscriptionCach
 	if !ok {
 		return subscriptionCacheEntry{}, false
 	}
-	return *el.Value.(*subscriptionCacheEntry), true
+	entry := *el.Value.(*subscriptionCacheEntry)
+	entry.body = append([]byte(nil), entry.body...)
+	return entry, true
 }
 
 // Extend re-stamps an entry the serve path has revalidated against the current
@@ -100,33 +122,76 @@ func (c *subscriptionCache) Extend(key subscriptionCacheKey, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.entries[key]; ok {
-		el.Value.(*subscriptionCacheEntry).expiresAt = now.Add(c.ttl)
+		entry := el.Value.(*subscriptionCacheEntry)
+		entry.expiresAt = now.Add(c.ttl)
 		c.order.MoveToFront(el)
 	}
+}
+
+func (c *subscriptionCache) ExtendSnapshot(key subscriptionCacheKey, expectedRevision uint64, userinfo, publicSourceVersion string, stale bool, fetchedAt, now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[key]; ok {
+		entry := el.Value.(*subscriptionCacheEntry)
+		if entry.revision != expectedRevision {
+			return false
+		}
+		oldSize := entry.size
+		entry.expiresAt = now.Add(c.ttl)
+		entry.userinfo = strings.Clone(userinfo)
+		entry.publicSourceVersion = strings.Clone(publicSourceVersion)
+		entry.stale = stale
+		entry.fetchedAt = fetchedAt
+		entry.size = subscriptionCacheEntrySize(*entry)
+		c.bytes += entry.size - oldSize
+		c.order.MoveToFront(el)
+		for c.bytes > c.maxBytes {
+			if oldest := c.order.Back(); oldest != nil {
+				c.removeElement(oldest)
+				continue
+			}
+			break
+		}
+		_, stillPresent := c.entries[key]
+		return stillPresent
+	}
+	return false
 }
 
 // Put ignores an empty body. The endpoint refuses to serve one, so letting it
 // into the cache would create a path back to the exact response that makes a
 // client delete every node it had.
 func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentType, userinfo, contentHash string, now time.Time) {
+	c.PutSnapshot(key, body, contentType, userinfo, contentHash, "", false, time.Time{}, now)
+}
+
+func (c *subscriptionCache) PutSnapshot(key subscriptionCacheKey, body []byte, contentType, userinfo, revalidationVersion, publicSourceVersion string, stale bool, fetchedAt, now time.Time) {
 	if len(body) == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.nextRevision++
+	storedKey := subscriptionCacheKey{ShareID: strings.Clone(key.ShareID), Format: strings.Clone(key.Format), UAClass: strings.Clone(key.UAClass)}
+	entry := &subscriptionCacheEntry{
+		key: storedKey, body: append([]byte(nil), body...), revision: c.nextRevision,
+		contentType: strings.Clone(contentType), userinfo: strings.Clone(userinfo), revalidationVersion: strings.Clone(revalidationVersion), publicSourceVersion: strings.Clone(publicSourceVersion),
+		stale: stale, fetchedAt: fetchedAt, expiresAt: now.Add(c.ttl),
+	}
+	entry.size = subscriptionCacheEntrySize(*entry)
+	if entry.size > c.maxBytes {
+		if el, ok := c.entries[key]; ok {
+			c.removeElement(el)
+		}
+		return
+	}
 	if el, ok := c.entries[key]; ok {
 		c.removeElement(el)
 	}
-	el := c.order.PushFront(&subscriptionCacheEntry{
-		key:         key,
-		body:        body,
-		contentType: contentType,
-		userinfo:    userinfo,
-		contentHash: contentHash,
-		expiresAt:   now.Add(c.ttl),
-	})
-	c.entries[key] = el
-	for c.order.Len() > c.max {
+	el := c.order.PushFront(entry)
+	c.entries[storedKey] = el
+	c.bytes += entry.size
+	for c.order.Len() > c.max || c.bytes > c.maxBytes {
 		if oldest := c.order.Back(); oldest != nil {
 			c.removeElement(oldest)
 			continue
@@ -158,6 +223,12 @@ func (c *subscriptionCache) Len() int {
 // removeElement drops one element from both the list and the index. Callers hold
 // the mutex.
 func (c *subscriptionCache) removeElement(el *list.Element) {
+	c.bytes -= el.Value.(*subscriptionCacheEntry).size
 	c.order.Remove(el)
 	delete(c.entries, el.Value.(*subscriptionCacheEntry).key)
+}
+
+func subscriptionCacheEntrySize(entry subscriptionCacheEntry) int {
+	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.contentType) +
+		len(entry.userinfo) + len(entry.revalidationVersion) + len(entry.publicSourceVersion)
 }

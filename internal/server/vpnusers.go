@@ -25,17 +25,18 @@ import (
 // Credential secrets (uuid/password) are NEVER returned through the read RPC; the
 // gateway-facing views are redacted (see vpnUserView).
 type VpnUser struct {
-	ID          string          `json:"id"`
-	Email       string          `json:"email"`
-	Name        string          `json:"name,omitempty"`
-	Enabled     bool            `json:"enabled"`
-	Credentials []VpnCredential `json:"credentials"`
-	Bindings    []LineBinding   `json:"bindings"`
-	SubID       string          `json:"sub_id,omitempty"`
-	QuotaBytes  int64           `json:"quota_bytes,omitempty"`
-	ExpiresAt   time.Time       `json:"expires_at,omitempty"`
-	Group       string          `json:"group,omitempty"`
-	Comment     string          `json:"comment,omitempty"`
+	ID                     string          `json:"id"`
+	Email                  string          `json:"email"`
+	Name                   string          `json:"name,omitempty"`
+	Enabled                bool            `json:"enabled"`
+	Credentials            []VpnCredential `json:"credentials"`
+	Bindings               []LineBinding   `json:"bindings"`
+	SubID                  string          `json:"sub_id,omitempty"`
+	QuotaBytes             int64           `json:"quota_bytes,omitempty"`
+	ExpiresAt              time.Time       `json:"expires_at,omitempty"`
+	Group                  string          `json:"group,omitempty"`
+	Comment                string          `json:"comment,omitempty"`
+	SubscriptionGeneration uint64          `json:"-"`
 
 	// MigratedFromProxyUser records the legacy ProxyUser this identity was derived
 	// from, so the migration is idempotent and the subscription substrate is traceable.
@@ -126,7 +127,7 @@ func vpnUserKey(id string) string { return vpnUserKeyPrefix + id }
 
 func (s *Server) putVpnUser(u VpnUser) error {
 	public, private := splitVpnUserRecord(u)
-	return s.store.PutVpnUserRecord(public, private)
+	return s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return s.store.PutVpnUserRecord(public, private) })
 }
 
 func (s *Server) getVpnUser(id string) (VpnUser, bool) {
@@ -156,7 +157,7 @@ func (s *Server) listVpnUsers() []VpnUser {
 }
 
 func (s *Server) deleteVpnUser(id string) error {
-	return s.store.DeleteVpnUserRecord(id)
+	return s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return s.store.DeleteVpnUserRecord(id) })
 }
 
 func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecretRecord) {
@@ -180,7 +181,8 @@ func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecr
 		ID: u.ID, Email: u.Email, Name: u.Name, Enabled: u.Enabled,
 		Credentials: publicCredentials, Bindings: bindings, QuotaBytes: u.QuotaBytes,
 		ExpiresAt: u.ExpiresAt, Group: u.Group, Comment: u.Comment,
-		MigratedFromProxyUser: u.MigratedFromProxyUser, CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
+		SubscriptionGeneration: u.SubscriptionGeneration,
+		MigratedFromProxyUser:  u.MigratedFromProxyUser, CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
 	}, store.VpnUserSecretRecord{Credentials: privateCredentials, SubID: u.SubID}
 }
 
@@ -207,7 +209,8 @@ func joinVpnUserRecord(public store.VpnUserPublicRecord, private store.VpnUserSe
 		ID: public.ID, Email: public.Email, Name: public.Name, Enabled: public.Enabled,
 		Credentials: credentials, Bindings: bindings, SubID: private.SubID, QuotaBytes: public.QuotaBytes,
 		ExpiresAt: public.ExpiresAt, Group: public.Group, Comment: public.Comment,
-		MigratedFromProxyUser: public.MigratedFromProxyUser, CreatedAt: public.CreatedAt, UpdatedAt: public.UpdatedAt,
+		SubscriptionGeneration: public.SubscriptionGeneration,
+		MigratedFromProxyUser:  public.MigratedFromProxyUser, CreatedAt: public.CreatedAt, UpdatedAt: public.UpdatedAt,
 	}
 }
 

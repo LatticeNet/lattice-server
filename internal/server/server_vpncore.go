@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
@@ -33,7 +34,8 @@ const (
 	// vpnCoreUsageService is the 3-D usage read-model (design-12 S3), proxy:read.
 	vpnCoreUsageService = "latticenet.vpn-core/usage"
 	// vpnCoreProfilesService is the per-node runtime read-model (design-12 S4), proxy:read.
-	vpnCoreProfilesService = "latticenet.vpn-core/profiles"
+	vpnCoreProfilesService            = "latticenet.vpn-core/profiles"
+	vpnCoreSubscriptionSourcesService = "latticenet.vpn-core/subscription-sources"
 )
 
 // registerVPNCoreRPC registers the in-core vpn-core services on the server's RPC
@@ -62,6 +64,56 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProfilesService, "v1", []string{"query", "settings", "configure"}, s.vpnCoreProfilesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreProfilesService, err)
 	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionSourcesService, "v1", []string{"compose", "graph_options"}, s.vpnCoreSubscriptionSourcesRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreSubscriptionSourcesService, err)
+	}
+}
+
+func (s *Server) vpnCoreSubscriptionSourcesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
+	ctx, releaseGraph := s.acquireSubscriptionGraphRead(ctx, vpnCorePluginID)
+	defer releaseGraph()
+	if method == "graph_options" {
+		response := graphSubscriptionOptionsResponse{SchemaVersion: 1, Identities: []graphSubscriptionIdentityOption{}, Roots: []graphSubscriptionRootOption{}}
+		if err := decodeStrictGraphOptionsRequest(request); err != nil {
+			response.Error = composeFailureView(composeFailure("invalid_request"))
+			return json.Marshal(response)
+		}
+		response, err := graphSubscriptionOptionsFromCapture(func() (lineChainCompileSnapshot, error) {
+			return s.captureLineChainCompileSnapshot()
+		}, s.now().UTC())
+		if err != nil {
+			response = graphSubscriptionOptionsResponse{SchemaVersion: 1, Identities: []graphSubscriptionIdentityOption{}, Roots: []graphSubscriptionRootOption{}, Error: composeFailureView(err)}
+		}
+		return json.Marshal(response)
+	}
+	response := graphSubscriptionResponse{SchemaVersion: 1}
+	if method != "compose" || len(request) > model.MaxSubscriptionResponseBytes {
+		response.Error = composeFailureView(composeFailure("invalid_request"))
+		return json.Marshal(response)
+	}
+	var req graphSubscriptionRequest
+	if err := decodeStrictGraphSubscriptionRequest(request, &req); err != nil {
+		response.Error = composeFailureView(composeFailure("invalid_request"))
+		return json.Marshal(response)
+	}
+	response, err := composeGraphSubscriptionFromCapture(func() (lineChainCompileSnapshot, error) {
+		// One persistent snapshot and one live projection are the complete
+		// authority for this call. The pure composer performs no later reads.
+		persistent := s.store.LineChainCompileStateSnapshot()
+		return s.captureLineChainCompileSnapshotFromState(persistent)
+	}, req, time.Now().UTC())
+	if err != nil {
+		response = graphSubscriptionResponse{SchemaVersion: 1, Error: composeFailureView(err)}
+	}
+	return json.Marshal(response)
+}
+
+func composeGraphSubscriptionFromCapture(capture func() (lineChainCompileSnapshot, error), req graphSubscriptionRequest, now time.Time) (graphSubscriptionResponse, error) {
+	snapshot, err := capture()
+	if err != nil {
+		return graphSubscriptionResponse{}, err
+	}
+	return composeGraphSubscription(snapshot, req, now)
 }
 
 // vpnCoreLinesRPC serves the vpn-core/lines read-model — the unified, node-grouped
@@ -188,7 +240,7 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 			return nil, fmt.Errorf("vpn-core/lines reattach: line_uuid is already assigned to %s", hash)
 		}
 	}
-	err := s.store.PutLineUUIDAuthority(req.LineHashID, req.LineUUID, line.NodeID)
+	err := s.putLineUUIDAuthority(req.LineHashID, req.LineUUID, line.NodeID)
 	s.lineUUIDMu.Unlock()
 	if err != nil {
 		return nil, err
@@ -200,7 +252,7 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 		if !hadPrevious {
 			previousUUID, previousOwner = "", ""
 		}
-		err = s.store.PutLineUUIDAuthority(req.LineHashID, previousUUID, previousOwner)
+		err = s.putLineUUIDAuthority(req.LineHashID, previousUUID, previousOwner)
 		s.lineUUIDMu.Unlock()
 		s.invalidateLineReadModel()
 		if err != nil {

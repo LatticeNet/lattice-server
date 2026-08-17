@@ -246,7 +246,7 @@ func (s *Server) vpnCoreProfilesRPC(ctx context.Context, method string, request 
 		launch = normalizeAgentLaunchConfig(launch)
 		launch.UpdatedAt = s.now().UTC()
 		node.AgentLaunch = &launch
-		if err := s.store.UpsertNode(node); err != nil {
+		if err := s.upsertGraphNode(node); err != nil {
 			return nil, err
 		}
 		s.invalidateLineReadModel()

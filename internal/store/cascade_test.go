@@ -1,6 +1,8 @@
 package store
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -388,4 +390,150 @@ func TestDeleteNodeUnknownIsIdempotent(t *testing.T) {
 	if report.NodeID != "ghost" {
 		t.Fatalf("report.NodeID = %q want ghost", report.NodeID)
 	}
+}
+
+const cascadeTargetLineUUID = "11111111-1111-4111-8111-111111111111"
+
+func seedLineChainCascade(t *testing.T, lease bool) (*Store, model.Approval, model.Task, string) {
+	t.Helper()
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range []string{"source-node", "target-node"} {
+		if err := s.UpsertNode(model.Node{ID: nodeID, Name: nodeID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.PutManagedLineRecord(ManagedLinePublicRecord{LineUUID: cascadeTargetLineUUID, NodeID: "target-node", RealityPublicKey: testRealityKey, Status: "applied"}, ManagedLineSecretRecord{RealityPrivateKey: testRealityKey}); err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{ID: "approval-chain-cascade", NodeID: "source-node", Plugin: "singbox-linechain", PluginVersion: "1", Service: "network/lines", Method: "chain_set_apply",
+		Action: "apply-line-chain:artifact", ArtifactDigest: "artifact", RequestSHA256: "request", Status: model.ApprovalPending, Targets: []string{"source-node"}}
+	attempt := LineChainAttempt{ApprovalID: approval.ID, Operation: LineChainOperationSet, SourceLineUUID: "source-line", SourceNodeID: "source-node",
+		CandidateTargetLineUUID: cascadeTargetLineUUID, CandidateTargetNodeID: "target-node", CandidateArtifactSHA256: "artifact", RequestSHA256: "request",
+		CandidateDefinition: LineChainDefinition{SourceLineUUID: "source-line", SourceNodeID: "source-node", TargetLineUUID: cascadeTargetLineUUID, TargetNodeID: "target-node", ArtifactSHA256: "artifact"}}
+	if _, _, err := s.PlanLineChainApproval(attempt, approval); err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	task := model.Task{ID: "task-chain-cascade", ApprovalID: approval.ID, Targets: []string{"source-node"}, Script: "script", Status: model.TaskQueued}
+	if _, committed, err := s.ApproveLineChain(approval, task); err != nil || !committed {
+		t.Fatalf("approve committed=%v err=%v", committed, err)
+	}
+	leaseID := ""
+	if lease {
+		deliveries, err := s.LeaseTaskDeliveriesWithLineChainValidator("source-node", 1, false, true, func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error { return nil })
+		if err != nil || len(deliveries) != 1 {
+			t.Fatalf("lease=%+v err=%v", deliveries, err)
+		}
+		leaseID = deliveries[0].Task.LeaseID
+	}
+	return s, approval, task, leaseID
+}
+
+func TestDeleteNodeCancelsUnissuedLineChainAndPlanMatches(t *testing.T) {
+	s, approval, task, _ := seedLineChainCascade(t, false)
+	plan, ok := s.PlanDeleteNode("source-node")
+	if !ok || plan.LineChainAttemptsReleased != 1 || plan.LineChainLeaseConflicts != 0 {
+		t.Fatalf("unexpected plan: %+v ok=%v", plan, ok)
+	}
+	report, ok, err := s.DeleteNode("source-node")
+	if err != nil || !ok || report.LineChainAttemptsReleased != plan.LineChainAttemptsReleased {
+		t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+	}
+	gotTask, _ := s.Task(task.ID)
+	gotApproval, _ := s.Approval(approval.ID)
+	snapshot := s.LineChainSnapshot()
+	if gotTask.Status != model.TaskCancelled || gotApproval.Status != model.ApprovalRejected || len(snapshot.Attempts) != 0 || snapshot.Revision != 2 {
+		t.Fatalf("cascade did not cancel/release atomically: task=%+v approval=%+v snapshot=%+v", gotTask, gotApproval, snapshot)
+	}
+}
+
+func TestDeleteSourceNodeConflictsWithIssuedLineChainLease(t *testing.T) {
+	s, _, _, _ := seedLineChainCascade(t, true)
+	before := s.LineChainSnapshot()
+	report, ok, err := s.DeleteNode("source-node")
+	if !ok || !errors.Is(err, ErrLineChainDeleteConflict) || report.LineChainLeaseConflicts != 1 {
+		t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+	}
+	if _, found := s.Node("source-node"); !found || !reflect.DeepEqual(before, s.LineChainSnapshot()) {
+		t.Fatalf("conflicting delete mutated state: before=%+v after=%+v", before, s.LineChainSnapshot())
+	}
+}
+
+func TestDeleteSourceNodeAfterTerminalFailureDoesNotRetainLeaseConflict(t *testing.T) {
+	s, approval, task, leaseID := seedLineChainCascade(t, true)
+	result := model.TaskResult{TaskID: task.ID, NodeID: "source-node", LeaseID: leaseID, ExitCode: 1, Error: "host failed", FinishedAt: time.Now().UTC()}
+	if committed, err := s.CompleteLineChainTaskResult(result, approval, LineChainStatusAppliedUnobserved, "host_apply_failed", "host failed"); err != nil || !committed {
+		t.Fatalf("complete failure committed=%v err=%v", committed, err)
+	}
+	plan, ok := s.PlanDeleteNode("source-node")
+	if !ok || plan.LineChainLeaseConflicts != 0 || plan.LineChainAttemptsReleased != 1 {
+		t.Fatalf("terminal failure still blocks dry-run: ok=%v plan=%+v", ok, plan)
+	}
+	report, ok, err := s.DeleteNode("source-node")
+	if err != nil || !ok || report.LineChainLeaseConflicts != 0 || report.LineChainAttemptsReleased != 1 {
+		t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+	}
+	if _, found := s.Node("source-node"); found || len(s.LineChainSnapshot().Attempts) != 0 {
+		t.Fatalf("terminal failed source authority survived deletion: %+v", s.LineChainSnapshot())
+	}
+}
+
+func TestDeleteTargetNodePreservesIssuedCandidateAndPromotesTargetMissing(t *testing.T) {
+	s, approval, task, leaseID := seedLineChainCascade(t, true)
+	report, ok, err := s.DeleteNode("target-node")
+	if err != nil || !ok || report.ManagedLines != 1 || report.LineChainTargetsDrifted != 1 {
+		t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+	}
+	if _, _, found := s.ManagedLineRecord(cascadeTargetLineUUID); found {
+		t.Fatal("target managed-line definition survived node deletion")
+	}
+	result := model.TaskResult{TaskID: task.ID, NodeID: "source-node", LeaseID: leaseID, ExitCode: 0, FinishedAt: time.Now().UTC()}
+	if committed, err := s.CompleteLineChainTaskResult(result, approval, LineChainStatusDrifted, "target_missing", ""); err != nil || !committed {
+		t.Fatalf("complete committed=%v err=%v", committed, err)
+	}
+	definition := s.LineChainSnapshot().Definitions["source-line"]
+	if definition.TargetLineUUID != cascadeTargetLineUUID || definition.Status != LineChainStatusDrifted || definition.DriftCode != "target_missing" || s.LineChainSnapshot().Revision != 3 {
+		t.Fatalf("frozen target authority was not retained: %+v snapshot=%+v", definition, s.LineChainSnapshot())
+	}
+}
+
+func TestDeleteNodeLineChainCascadePersistenceBoundaries(t *testing.T) {
+	t.Run("source_before_lease_pre_rename_failure_publishes_nothing", func(t *testing.T) {
+		s, approval, task, _ := seedLineChainCascade(t, false)
+		before := s.LineChainSnapshot()
+		if err := os.Mkdir(s.path+".tmp", 0o700); err != nil {
+			t.Fatal(err)
+		}
+		report, ok, err := s.DeleteNode("source-node")
+		if !ok || err == nil || report.LineChainAttemptsReleased != 1 {
+			t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+		}
+		gotApproval, _ := s.Approval(approval.ID)
+		gotTask, _ := s.Task(task.ID)
+		if _, found := s.Node("source-node"); !found || !reflect.DeepEqual(before, s.LineChainSnapshot()) || gotApproval.Status != model.ApprovalApproved || gotTask.Status != model.TaskQueued {
+			t.Fatalf("pre-rename cascade published state: approval=%+v task=%+v before=%+v after=%+v", gotApproval, gotTask, before, s.LineChainSnapshot())
+		}
+		if _, ok, err := s.DeleteNode("source-node"); err != nil || !ok {
+			t.Fatalf("retry did not commit cleanly: ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("target_after_lease_post_rename_failure_publishes_once", func(t *testing.T) {
+		s, _, _, _ := seedLineChainCascade(t, true)
+		s.syncParentDir = func(string) error { return errors.New("forced post-rename sync failure") }
+		report, ok, err := s.DeleteNode("target-node")
+		if !ok || err == nil || report.LineChainTargetsDrifted != 1 || report.ManagedLines != 1 {
+			t.Fatalf("delete report=%+v ok=%v err=%v", report, ok, err)
+		}
+		if _, found := s.Node("target-node"); found || s.LineChainSnapshot().Revision != 2 {
+			t.Fatalf("post-rename cascade was not published exactly once: %+v", s.LineChainSnapshot())
+		}
+		s.syncParentDir = syncDir
+		if retry, ok, err := s.DeleteNode("target-node"); err != nil || ok || retry.NodeID != "target-node" || s.LineChainSnapshot().Revision != 2 {
+			t.Fatalf("retry was not idempotent: report=%+v ok=%v err=%v snapshot=%+v", retry, ok, err, s.LineChainSnapshot())
+		}
+	})
 }

@@ -457,7 +457,9 @@ func New(opts Options) (*Server, error) {
 	// Derive vpn-core identities (VpnUser) from legacy ProxyUsers. Idempotent and
 	// additive — existing identities are untouched and ProxyUser stays the
 	// subscription-render substrate (design-12 S2).
-	s.migrateProxyUsersToVpnUsers()
+	if err := s.migrateProxyUsersToVpnUsers(); err != nil {
+		return nil, fmt.Errorf("migrate vpn user secrets: %w", err)
+	}
 	if dir := strings.TrimSpace(opts.PluginRuntimeDir); dir != "" {
 		// Tier-2 system runner: execute verified system-plugin artifacts in a
 		// confined per-plugin dir. Host mutation still flows through the in-core
@@ -512,6 +514,12 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 			s.logger.Printf("plugin lifecycle: failed to record %s: %v", pl.Manifest.ID, err)
 		}
 		if status == model.PluginStatusActive {
+			if unmet := s.unmetActiveDependencies(pl.Manifest); len(unmet) > 0 {
+				reason := "required dependencies not active: " + strings.Join(unmet, ", ")
+				s.logger.Printf("plugin runtime: %s stays unarmed: %s", pl.Manifest.ID, reason)
+				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: reason, Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
+				continue
+			}
 			s.applyPluginHostAccess(pl)
 			rt, err := s.pluginRuntime.Start(context.Background(), pl)
 			if err != nil {
@@ -533,6 +541,33 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 	if len(outcomes) > 0 {
 		s.logger.Printf("plugin loader: %d loaded, %d rejected (dir=%s)", len(loaded), len(outcomes)-len(loaded), dir)
 	}
+}
+
+// unmetActiveDependencies lists a manifest's REQUIRED dependencies that are
+// not satisfied by an active, in-range installation (design-18 E1). Load
+// refuses absent/out-of-range dependency plugins outright; this gate covers
+// the remaining gap: a dependency that is installed but not active cannot
+// serve rpc:calls, so activation must refuse until it is.
+func (s *Server) unmetActiveDependencies(manifest plugin.Manifest) []string {
+	var unmet []string
+	for _, dep := range manifest.Dependencies {
+		if dep.Optional {
+			continue
+		}
+		inst, ok := s.store.PluginInstallation(dep.ID)
+		if !ok {
+			unmet = append(unmet, dep.ID+" (not installed)")
+			continue
+		}
+		if inst.Status != model.PluginStatusActive {
+			unmet = append(unmet, dep.ID+" (not active)")
+			continue
+		}
+		if !plugin.VersionInRange(inst.Version, dep.Version) {
+			unmet = append(unmet, fmt.Sprintf("%s (installed %s, need %s)", dep.ID, inst.Version, dep.Version))
+		}
+	}
+	return unmet
 }
 
 func pluginInstallationFromLoaded(pl plugin.Loaded, status string) model.PluginInstallation {
@@ -661,6 +696,15 @@ func (s *Server) handlePluginLifecycle(w http.ResponseWriter, r *http.Request, p
 		if pluginStatusRequiresLoadedBundle(req.Status) && !s.pluginLoaded(req.ID) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("plugin bundle is not currently verified and loaded: %s", req.ID))
 			return
+		}
+		if req.Status == model.PluginStatusActive {
+			if loaded, ok := s.loadedPlugin(req.ID); ok {
+				if unmet := s.unmetActiveDependencies(loaded.Manifest); len(unmet) > 0 {
+					s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "plugin.status", Scope: "plugin:admin", Decision: "deny", Reason: "required dependencies not active: " + strings.Join(unmet, ", "), Metadata: map[string]string{"plugin_id": req.ID, "status": req.Status}})
+					writeError(w, http.StatusConflict, fmt.Errorf("required dependencies not active: %s", strings.Join(unmet, ", ")))
+					return
+				}
+			}
 		}
 		if err := s.store.SetPluginStatus(req.ID, req.Status); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -946,6 +990,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/network/nft/plan", s.withAuth("network:plan", s.handleNFTPlan))
 	mux.HandleFunc("/api/network/nft/inputs", s.withAuth("network:plan", s.handleNFTInputs))
 	mux.HandleFunc("/api/network/nft/inputs/delete", s.withAuth("network:plan", s.handleDeleteNFTInputs))
+	// design-17 S1: managed-line overlay rollout compiler + definition views.
+	mux.HandleFunc("/api/network/lines/managed-rollout", s.withAuth("network:plan", s.handleManagedLineRollout))
+	mux.HandleFunc("/api/network/lines/chains", s.withAuth("proxy:read", s.handleLineChains))
+	mux.HandleFunc("/api/network/lines/chains/plan", s.withAuth("network:plan", s.handleLineChainPlan))
+	mux.HandleFunc("/api/network/lines/chains/remove-plan", s.withAuth("network:plan", s.handleLineChainRemovePlan))
 	mux.HandleFunc("/api/netpolicy", s.withAuth("", s.handleNetPolicy))
 	mux.HandleFunc("/api/netpolicy/plan", s.withAuth("", s.handleNetPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/delete", s.withAuth("", s.handleDeleteNetPolicy))
@@ -2068,10 +2117,13 @@ func (s *Server) agentRuntimeSnapshot(nodeID string) *agentRuntimeConfig {
 }
 
 func (s *Server) replaceAgentCapabilities(nodeID string, capabilities []string) {
-	known := make(map[string]struct{}, 1)
+	known := make(map[string]struct{}, 2)
 	for _, capability := range capabilities {
-		if strings.TrimSpace(capability) == netGuardManagedSHACapability {
+		switch strings.TrimSpace(capability) {
+		case netGuardManagedSHACapability:
 			known[netGuardManagedSHACapability] = struct{}{}
+		case lineChainDurableCapability:
+			known[lineChainDurableCapability] = struct{}{}
 		}
 	}
 	s.agentCapabilitiesMu.Lock()
@@ -2952,6 +3004,10 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 	if !s.requireAllNodeScopes(w, p, "task:run", targets) {
 		return
 	}
+	if s.store.TaskUsesLineChainProtocol(src.ID) {
+		s.writeTaskStoreError(w, store.ErrTaskDurableProtected)
+		return
+	}
 	if err := validateTaskCreate(src.Interpreter, src.Script, src.TimeoutSec, src.OutputLimit); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -3010,6 +3066,8 @@ func (s *Server) writeTaskStoreError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
 	case errors.Is(err, store.ErrTaskNotCancelable):
 		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "only queued tasks can be cancelled"))
+	case errors.Is(err, store.ErrTaskDurableProtected):
+		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "durable protocol task must be managed through its domain lifecycle"))
 	default:
 		writeError(w, http.StatusInternalServerError, err)
 	}
@@ -3117,6 +3175,10 @@ func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, 
 	task, ok := s.store.Task(strings.TrimSpace(req.ID))
 	if !ok {
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "task not found"))
+		return
+	}
+	if approval, ok := s.store.Approval(task.ApprovalID); ok && isLineChainApproval(approval) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorForbidden, "line chain task scripts are available only to the targeted agent lease"))
 		return
 	}
 	if !s.requireAllNodeScopes(w, p, "task:read", task.Targets) {
@@ -3363,6 +3425,10 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 	if bucket == "" {
 		bucket = "default"
 	}
+	if reservedLineSecretKVBucket(bucket) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorForbidden, "bucket is reserved for typed private state"))
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if !s.requireScope(w, p, "kv:read") {
@@ -3383,6 +3449,10 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 		}
 		if req.Bucket == "" {
 			req.Bucket = bucket
+		}
+		if reservedLineSecretKVBucket(req.Bucket) {
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorForbidden, "bucket is reserved for typed private state"))
+			return
 		}
 		if req.Key == "" {
 			writeError(w, http.StatusBadRequest, errors.New("key is required"))
@@ -3406,6 +3476,13 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+func reservedLineSecretKVBucket(bucket string) bool {
+	bucket = strings.TrimSpace(bucket)
+	return bucket == vpnCoreKVBucket || bucket == "managedline/def" ||
+		bucket == "vpn_users" || bucket == "vpn_user_secrets" ||
+		bucket == "managed_line_secrets"
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principal) {
@@ -4747,7 +4824,10 @@ func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval
 func approvalApplyTaskTimeoutSec(plugin string) int {
 	switch plugin {
 	case agentUpdatePlugin:
-		return 300
+		// 900s: the download leg is github-release egress from the node's own
+		// network — a CN residential uplink can need minutes for ~7 MiB, and
+		// 300s produced "context deadline exceeded" on cd-hs-sh (2026-08-12).
+		return 900
 	case "nft", "nftpolicy", "selfdns":
 		return networkApplyTaskTimeoutSec
 	default:
@@ -5562,6 +5642,7 @@ func (e *approvalDecisionError) Error() string { return e.err.Error() }
 // ever transition for the exact stored plan bytes, whichever entry point
 // drove the decision.
 func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval model.Approval, queueApply bool, planSHA256 string) (model.Approval, error) {
+	lineChainScript := ""
 	if approval.Status != model.ApprovalPending {
 		// Already-decided approvals stay idempotent, matching the manual
 		// endpoint's retry semantics. A previous transition may have crossed the
@@ -5570,6 +5651,30 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		// explicitly re-confirmed.
 		if err := s.store.ConfirmDurability(); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+		}
+		if isLineChainApproval(approval) && approval.Status == model.ApprovalApproved {
+			taskID := ""
+			for _, task := range s.store.Tasks() {
+				if task.ApprovalID == approval.ID {
+					taskID = task.ID
+					break
+				}
+			}
+			if taskID == "" {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: errors.New("approved line chain task is missing")}
+			}
+			storedAudit, ok := s.store.AuditEventByID(lineChainAuditID("approve", approval.ID, taskID))
+			if !ok {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: errors.New("approved line chain audit is missing")}
+			}
+			if err := s.appendRequiredLineChainAudit(storedAudit); err != nil {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+			}
+		}
+		if isLineChainApproval(approval) && approval.Status == model.ApprovalRejected {
+			if err := s.repairLineChainAuditEvidence(); err != nil {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+			}
 		}
 		return approval, nil
 	}
@@ -5601,6 +5706,33 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		if _, _, _, _, _, err := s.validateLineUserApproval(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
+	}
+	if approval.Plugin == singBoxManagedLinePlugin {
+		if _, _, _, err := s.validateManagedLineApproval(approval); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+	}
+	if isLineChainApproval(approval) {
+		if !queueApply {
+			return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest, "line chain approvals must atomically queue their apply task")}
+		}
+		_, script, err := s.validateLineChainApprovalForQueue(approval)
+		if err != nil {
+			reason := "line chain inputs changed during approval; fresh plan required"
+			failedAudit := lineChainFailedAudit(p, approval, "", "line_chain_inputs_changed", reason)
+			committed, rejectErr := s.store.RejectLineChainApprovalStale(approval.ID, "line_chain_inputs_changed", reason, failedAudit)
+			if rejectErr != nil {
+				if committed {
+					s.logger.Printf("line chain approval stale transition committed with degraded durability: %v", rejectErr)
+				}
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: rejectErr}
+			}
+			if err := s.appendRequiredLineChainAudit(failedAudit); err != nil {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+			}
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+		lineChainScript = script
 	}
 	if approval.Plugin == agentUpdatePlugin {
 		if err := s.requireCurrentAgentUpdateApproval(approval); err != nil {
@@ -5638,7 +5770,7 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	// operator approved the exact bytes of it; the plugin now executes it under a
 	// one-time grant bound to that approval, and every task it enqueues is checked
 	// against the approved target set.
-	if isPluginOperationApproval(approval) {
+	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) && approval.Plugin != singBoxManagedLinePlugin {
 		approval.Status = model.ApprovalApproved
 		approval.ApprovedBy = p.ActorID
 		if err := s.store.UpsertApproval(approval); err != nil {
@@ -5685,6 +5817,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			if err != nil {
 				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 			}
+		case singBoxManagedLinePlugin:
+			// The script self-validates at render time; a stale plan yields a
+			// script that fails closed on the box instead of mutating it.
+			applyScript = s.managedLineApplyScript(approval)
+		case lineChainPlugin:
+			applyScript = lineChainScript
 		default:
 			applyScript = s.applyScriptFor(approval)
 		}
@@ -5727,6 +5865,31 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		} else {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
 		}
+	} else if isLineChainApproval(approval) {
+		approveAudit := lineChainApproveAudit(p, approval, task.ID)
+		approveAudit.At = task.CreatedAt
+		failedAudit := lineChainFailedAudit(p, approval, task.ID, "line_chain_inputs_changed", "line chain inputs changed while queueing; fresh plan required")
+		_, committed, err := s.store.ApproveLineChain(approval, task, approveAudit, failedAudit)
+		if committed && err != nil {
+			if errors.Is(err, store.ErrLineChainRevisionConflict) || errors.Is(err, store.ErrLineChainCycle) || errors.Is(err, store.ErrTaskTransitionConflict) {
+				if appendErr := s.appendRequiredLineChainAudit(failedAudit); appendErr != nil {
+					return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: appendErr}
+				}
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+			}
+			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+		}
+		if !committed {
+			status := http.StatusInternalServerError
+			if errors.Is(err, store.ErrLineChainRevisionConflict) || errors.Is(err, store.ErrLineChainCycle) || errors.Is(err, store.ErrTaskTransitionConflict) {
+				status = http.StatusConflict
+			}
+			return approval, &approvalDecisionError{status: status, err: apiError(model.APIErrorApprovalStale, "line chain inputs changed while queueing; re-plan before approving")}
+		}
+		approval, _ = s.store.Approval(approval.ID)
+		if err := s.appendRequiredLineChainAudit(approveAudit); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
+		}
 	} else {
 		if err := s.store.UpsertApproval(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
@@ -5754,7 +5917,9 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			}
 		}
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: approvalDecisionAuditScope(approval), Metadata: map[string]string{"approval_id": approval.ID}})
+	if !isLineChainApproval(approval) {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: approval.NodeID, Action: "network." + approval.Plugin + ".approve", Scope: approvalDecisionAuditScope(approval), Metadata: map[string]string{"approval_id": approval.ID}})
+	}
 	return approval, nil
 }
 
@@ -5778,6 +5943,25 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 		return
 	}
 	if approval.Status == model.ApprovalPending {
+		if isLineChainApproval(approval) {
+			reason := "line chain approval rejected by operator"
+			failedAudit := lineChainFailedAudit(p, approval, "", "approval_rejected", reason)
+			committed, err := s.store.RejectLineChainApproval(approval.ID, reason, failedAudit)
+			if err != nil {
+				if committed {
+					s.logger.Printf("line chain rejection committed with degraded durability: %v", err)
+				}
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			approval, _ = s.store.Approval(approval.ID)
+			if err := s.appendRequiredLineChainAudit(failedAudit); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, toApprovalView(approval))
+			return
+		}
 		approval.Status = model.ApprovalRejected
 		approval.UpdatedAt = s.now()
 		if err := s.store.UpsertApproval(approval); err != nil {
@@ -5792,6 +5976,11 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 			Decision: "deny",
 			Metadata: map[string]string{"approval_id": approval.ID},
 		})
+	} else if isLineChainApproval(approval) && approval.Status == model.ApprovalRejected {
+		if err := s.repairLineChainAuditEvidence(); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
 }
@@ -6057,10 +6246,12 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	// last heartbeat capability from server memory. The store still applies the
 	// approval and current plan-anchor checks atomically with the lease mutation.
 	netGuardCapable := requestHasAgentCapability(r, netGuardManagedSHACapability)
-	deliveries, err := s.store.LeaseTaskDeliveriesWithApprovalGate(
-		nodeID, 3, "nft", netGuardApprovalAction,
-		netGuardCapable,
-	)
+	lineChainCapable := requestHasAgentCapability(r, lineChainDurableCapability)
+	deliveries, err := s.store.LeaseTaskDeliveriesWithLineChainValidator(nodeID, 3, netGuardCapable, lineChainCapable, s.validateLineChainFirstLease)
+	if auditErr := s.repairLineChainAuditEvidence(); auditErr != nil {
+		writeError(w, http.StatusInternalServerError, auditErr)
+		return
+	}
 	if err != nil {
 		if !onlyGenericAgentTaskDeliveries(deliveries) {
 			writeError(w, http.StatusInternalServerError, err)
@@ -6074,7 +6265,7 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]agentTaskView, 0, len(deliveries))
 	for _, delivery := range deliveries {
-		views = append(views, toAgentTaskView(delivery.Task, delivery.DurableResult))
+		views = append(views, toAgentTaskView(delivery.Task, delivery.DurableResult, delivery.DurableProtocol))
 	}
 	writeJSON(w, http.StatusOK, views)
 }
@@ -6103,24 +6294,30 @@ func requestHasAgentCapability(r *http.Request, capability string) bool {
 }
 
 type agentTaskView struct {
-	ID            string `json:"id"`
-	LeaseID       string `json:"lease_id"`
-	Interpreter   string `json:"interpreter"`
-	Script        string `json:"script"`
-	TimeoutSec    int    `json:"timeout_sec"`
-	OutputLimit   int    `json:"output_limit"`
-	DurableResult bool   `json:"durable_result,omitempty"`
+	ID              string `json:"id"`
+	LeaseID         string `json:"lease_id"`
+	Interpreter     string `json:"interpreter"`
+	Script          string `json:"script"`
+	TimeoutSec      int    `json:"timeout_sec"`
+	OutputLimit     int    `json:"output_limit"`
+	DurableResult   bool   `json:"durable_result,omitempty"`
+	DurableProtocol string `json:"durable_protocol,omitempty"`
 }
 
-func toAgentTaskView(t model.Task, durableResult bool) agentTaskView {
+func toAgentTaskView(t model.Task, durableResult bool, durableProtocol ...string) agentTaskView {
+	protocol := ""
+	if len(durableProtocol) > 0 {
+		protocol = durableProtocol[0]
+	}
 	return agentTaskView{
-		ID:            t.ID,
-		LeaseID:       t.LeaseID,
-		Interpreter:   t.Interpreter,
-		Script:        t.Script,
-		TimeoutSec:    t.TimeoutSec,
-		OutputLimit:   t.OutputLimit,
-		DurableResult: durableResult,
+		ID:              t.ID,
+		LeaseID:         t.LeaseID,
+		Interpreter:     t.Interpreter,
+		Script:          t.Script,
+		TimeoutSec:      t.TimeoutSec,
+		OutputLimit:     t.OutputLimit,
+		DurableResult:   durableResult,
+		DurableProtocol: protocol,
 	}
 }
 
@@ -6140,15 +6337,16 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 	task, taskOK := s.store.Task(req.Result.TaskID)
 	approval, netGuardResult := s.store.Approval(task.ApprovalID)
 	netGuardResult = taskOK && netGuardResult && isNetGuardApproval(approval)
-	if netGuardResult && req.Result.FinishedAt.IsZero() {
-		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "netguard task result finished_at is required for durable replay identity"))
+	lineChainResult := taskOK && isLineChainApproval(approval)
+	if (netGuardResult || lineChainResult) && req.Result.FinishedAt.IsZero() {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "durable task result finished_at is required for replay identity"))
 		return
 	}
 	// Only NetGuard opts into the durable replay protocol: its task, approval,
 	// binding and receipt are one atomic store transition. Generic task follow-up
 	// handlers remain outside this protocol because they are heterogeneous and
 	// not all crash-idempotent.
-	if netGuardResult {
+	if netGuardResult || lineChainResult {
 		matches, found, err := s.store.ConfirmTaskResultReplay(req.Result)
 		if found {
 			if err != nil {
@@ -6158,6 +6356,12 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 			if !matches {
 				writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "task result conflicts with the recorded terminal result"))
 				return
+			}
+			if lineChainResult {
+				if err := s.ensureLineChainTerminalAudit(approval, task, req.Result); err != nil {
+					writeError(w, http.StatusInternalServerError, err)
+					return
+				}
 			}
 			writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 			return
@@ -6201,6 +6405,25 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
+	if lineChainResult {
+		if err := s.handleLineChainTaskResult(approval, task, req.Result); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, store.ErrTaskLeaseMismatch) {
+				status = http.StatusForbidden
+			}
+			if errors.Is(err, store.ErrTaskTransitionConflict) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, err)
+			return
+		}
+		if err := s.ensureLineChainTerminalAudit(approval, task, req.Result); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
 	if req.Result.FinishedAt.IsZero() {
 		req.Result.FinishedAt = time.Now().UTC()
 	}
@@ -6235,6 +6458,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if approval.Plugin == singBoxLineMetaPlugin {
 		return s.handleLineMetaTaskResult(r, approval, task, result)
+	}
+	if approval.Plugin == singBoxManagedLinePlugin {
+		return s.handleManagedLineTaskResult(r, approval, task, result)
 	}
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)

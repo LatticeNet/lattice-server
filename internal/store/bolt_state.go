@@ -31,6 +31,13 @@ var (
 	boltBucketAudit           = []byte("audit")
 	boltBucketKV              = []byte("kv")
 	boltBucketPluginSecrets   = []byte("plugin_secrets")
+	boltBucketVpnUsers        = []byte("vpn_users")
+	boltBucketVpnUserSecrets  = []byte("vpn_user_secrets")
+	boltBucketManagedLines    = []byte("managed_lines")
+	boltBucketManagedSecrets  = []byte("managed_line_secrets")
+	boltBucketLineChains      = []byte("line_chain_definitions")
+	boltBucketLineAttempts    = []byte("line_chain_attempts")
+	boltBucketLineAudit       = []byte("line_chain_audit_evidence")
 	boltBucketStatic          = []byte("static")
 	boltBucketStorageBuckets  = []byte("storage_buckets")
 	boltBucketStorageBindings = []byte("storage_bindings")
@@ -77,6 +84,13 @@ var boltStateBuckets = [][]byte{
 	boltBucketAudit,
 	boltBucketKV,
 	boltBucketPluginSecrets,
+	boltBucketVpnUsers,
+	boltBucketVpnUserSecrets,
+	boltBucketManagedLines,
+	boltBucketManagedSecrets,
+	boltBucketLineChains,
+	boltBucketLineAttempts,
+	boltBucketLineAudit,
 	boltBucketStatic,
 	boltBucketStorageBuckets,
 	boltBucketStorageBindings,
@@ -129,8 +143,9 @@ var boltStateBuckets = [][]byte{
 // drift from the JSON store, so changes here MUST be mirrored and tested against
 // internal/store/store.go.
 type BoltStateStore struct {
-	db     *bolt.DB
-	cipher secret.Cipher
+	db              *bolt.DB
+	cipher          secret.Cipher
+	testUpdateCalls int
 }
 
 func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
@@ -188,10 +203,18 @@ func (bs *BoltStateStore) ensureBuckets() error {
 // ImportState replaces the entire bbolt state atomically. Secret-bearing fields
 // are encrypted before they are written; the input State is not mutated.
 func (bs *BoltStateStore) ImportState(st State) error {
+	st.ensureMaps()
+	if err := validateVpnUserCollections(st.VpnUsers, st.VpnUserSecrets); err != nil {
+		return fmt.Errorf("invalid vpn user secret collections: %w", err)
+	}
+	if err := validateManagedLineCollections(st.ManagedLines, st.ManagedLineSecrets); err != nil {
+		return fmt.Errorf("invalid managed line secret collections: %w", err)
+	}
 	persist, err := encryptedState(st, bs.cipher)
 	if err != nil {
 		return err
 	}
+	bs.testUpdateCalls++
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := resetBoltBuckets(tx); err != nil {
 			return err
@@ -215,6 +238,30 @@ func (bs *BoltStateStore) ImportState(st State) error {
 			return err
 		}
 		if err := putMap(tx, boltBucketPluginSecrets, persist.PluginSecrets); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketVpnUsers, persist.VpnUsers); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketVpnUserSecrets, persist.VpnUserSecrets); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketManagedLines, persist.ManagedLines); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketManagedSecrets, persist.ManagedLineSecrets); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketLineChains, persist.LineChainDefinitions); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketLineAttempts, persist.LineChainAttempts); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketLineAudit, persist.LineChainAuditEvidence); err != nil {
+			return err
+		}
+		if err := tx.Bucket(boltBucketMeta).Put([]byte("line_chain_graph_revision"), []byte(strconv.FormatUint(persist.LineChainGraphRevision, 10))); err != nil {
 			return err
 		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
@@ -374,6 +421,34 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 		if err := readMap(tx, boltBucketPluginSecrets, st.PluginSecrets); err != nil {
 			return err
 		}
+		if err := readMap(tx, boltBucketVpnUsers, st.VpnUsers); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketVpnUserSecrets, st.VpnUserSecrets); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketManagedLines, st.ManagedLines); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketManagedSecrets, st.ManagedLineSecrets); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketLineChains, st.LineChainDefinitions); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketLineAttempts, st.LineChainAttempts); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketLineAudit, st.LineChainAuditEvidence); err != nil {
+			return err
+		}
+		if raw := tx.Bucket(boltBucketMeta).Get([]byte("line_chain_graph_revision")); len(raw) > 0 {
+			revision, err := strconv.ParseUint(string(raw), 10, 64)
+			if err != nil {
+				return fmt.Errorf("decode line chain graph revision: %w", err)
+			}
+			st.LineChainGraphRevision = revision
+		}
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {
 			return err
 		}
@@ -488,6 +563,12 @@ func (bs *BoltStateStore) ExportState() (State, error) {
 		return State{}, err
 	}
 	st.ensureMaps()
+	if err := validateVpnUserCollections(st.VpnUsers, st.VpnUserSecrets); err != nil {
+		return State{}, fmt.Errorf("invalid vpn user secret collections: %w", err)
+	}
+	if err := validateManagedLineCollections(st.ManagedLines, st.ManagedLineSecrets); err != nil {
+		return State{}, fmt.Errorf("invalid managed line secret collections: %w", err)
+	}
 	return st, nil
 }
 

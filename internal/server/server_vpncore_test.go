@@ -241,6 +241,10 @@ func TestVPNCoreLinesReattachAuditsAndRejectsCollisions(t *testing.T) {
 	if !ok || entry.Value != want {
 		t.Fatalf("reattach mapping: %+v ok=%v", entry, ok)
 	}
+	owner, ok := st.KVEntry(lineUUIDOwnerKVBucket, line.LineHashID)
+	if !ok || owner.Value != line.NodeID {
+		t.Fatalf("reattach owner: %+v ok=%v", owner, ok)
+	}
 	if !auditMetadataSeen(st, "line.uuid.reattach", "line_uuid", want) {
 		t.Fatalf("reattach audit missing: %+v", st.AuditEvents())
 	}
@@ -255,6 +259,17 @@ func TestVPNCoreLinesReattachAuditsAndRejectsCollisions(t *testing.T) {
 	if _, err := srv.vpnCoreLinesRPC(ctx, "reattach", mustJSON(t, map[string]string{
 		"line_hash_id": line.LineHashID, "line_uuid": "55555555-5555-4555-8555-555555555555",
 	})); err == nil {
-		t.Fatal("colliding reattach UUID must fail")
+		t.Fatal("admin reattach must reject a UUID owned by another hash")
+	}
+	const ambiguous = "66666666-6666-4666-8666-666666666666"
+	for _, hash := range []string{"line_ambiguous_one", "line_ambiguous_two"} {
+		if err := st.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hash, Value: ambiguous}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := srv.vpnCoreLinesRPC(ctx, "reattach", mustJSON(t, map[string]string{
+		"line_hash_id": line.LineHashID, "line_uuid": ambiguous,
+	})); err == nil {
+		t.Fatal("admin reattach accepted ambiguous UUID authority")
 	}
 }

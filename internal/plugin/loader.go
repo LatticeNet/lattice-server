@@ -107,8 +107,63 @@ func (l Loader) Load() ([]Loaded, []LoadOutcome, error) {
 		}
 		loaded = append(loaded, got)
 	}
+	loaded = filterUnmetDependencies(loaded, outcomes)
 	sort.Slice(loaded, func(i, j int) bool { return loaded[i].Manifest.ID < loaded[j].Manifest.ID })
 	return loaded, outcomes, nil
+}
+
+// filterUnmetDependencies removes verified plugins whose REQUIRED dependencies
+// are not satisfied by the final loaded set, recording the rejection in the
+// matching outcome. Optional dependencies never block. The pass runs to a
+// fixpoint so a chain (A requires B, B requires C, C missing) rejects both A
+// and B rather than loading A against a ghost. The reason names the first
+// unmet dependency and, when present, why the installed copy does not
+// satisfy.
+func filterUnmetDependencies(loaded []Loaded, outcomes []LoadOutcome) []Loaded {
+	outcomeByBundle := map[string]int{}
+	for i := range outcomes {
+		outcomeByBundle[outcomes[i].BundlePath] = i
+	}
+	for {
+		byID := map[string]Loaded{}
+		for _, pl := range loaded {
+			byID[pl.Manifest.ID] = pl
+		}
+		kept := loaded[:0]
+		removed := false
+		for _, pl := range loaded {
+			reason := firstUnmetDependency(pl, byID)
+			if reason == "" {
+				kept = append(kept, pl)
+				continue
+			}
+			if idx, ok := outcomeByBundle[pl.BundlePath]; ok {
+				outcomes[idx].Loaded = false
+				outcomes[idx].Reason = reason
+			}
+			removed = true
+		}
+		loaded = kept
+		if !removed {
+			return loaded
+		}
+	}
+}
+
+func firstUnmetDependency(pl Loaded, byID map[string]Loaded) string {
+	for _, dep := range pl.Manifest.Dependencies {
+		if dep.Optional {
+			continue
+		}
+		depPlugin, ok := byID[dep.ID]
+		if !ok {
+			return fmt.Sprintf("required dependency %q is not installed", dep.ID)
+		}
+		if !versionInRange(depPlugin.Manifest.Version, dep.Version) {
+			return fmt.Sprintf("required dependency %q version %s does not satisfy %q", dep.ID, depPlugin.Manifest.Version, dep.Version)
+		}
+	}
+	return ""
 }
 
 func (l Loader) loadBundle(bundle string) (Loaded, error) {

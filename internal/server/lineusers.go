@@ -423,8 +423,9 @@ func (s *Server) lineUserApplyScript(approval model.Approval) string {
 }
 
 // handleLineUserTaskResult reconciles a line-user approval once the agent
-// reports back. A failed task leaves the approval in place for re-approval. A
-// successful add creates the enabled binding; a successful remove drops it.
+// reports back. A failed task returns the approval to pending with the failure
+// reason (re-approval retries the same plan). A successful add creates the
+// enabled binding; a successful remove drops it.
 // Reconciliation is persisted before the approval is marked applied so the
 // control plane cannot report success while exposing stale subscription state.
 func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {
@@ -435,6 +436,16 @@ func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approv
 		reason := result.Error
 		if reason == "" {
 			reason = fmt.Sprintf("line-user task exited %d", result.ExitCode)
+		}
+		// Execution failure is not a decision: return the approval to pending
+		// with the reason so the operator can fix the cause and re-approve.
+		// Leaving it approved stranded the plan — the approve endpoint is a
+		// deliberate no-op on non-pending approvals.
+		approval.Status = model.ApprovalPending
+		approval.Reason = "execution failed: " + reason
+		approval.UpdatedAt = time.Now().UTC()
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return fmt.Errorf("return failed line-user approval to pending: %w", err)
 		}
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID: id.New("audit"), NodeID: approval.NodeID, Action: "vpnuser.line.failed",

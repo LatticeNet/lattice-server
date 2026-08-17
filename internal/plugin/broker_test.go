@@ -132,6 +132,30 @@ func TestBrokerOperatorTargetHTTPIsSeparateSystemOnlyCapability(t *testing.T) {
 	}
 }
 
+func TestGenerationAuthorityPreservesInvocationContextValues(t *testing.T) {
+	ctx, err := BindOperatorTargets(context.Background(), []string{"https://10.0.0.5/secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := &OperationGrant{ApprovalID: "approval-1", PlanSHA256: strings.Repeat("a", 64), Targets: []string{"node-1"}}
+	ctx, err = BindOperation(ctx, grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := newGenerationAuthority()
+	authorized, release, err := authority.acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := operatorTargetBound(authorized, "https://10.0.0.5/secret"); err != nil {
+		t.Fatalf("operator target binding lost: %v", err)
+	}
+	if got := boundOperation(authorized); got != grant {
+		t.Fatalf("operation binding lost: got=%p want=%p", got, grant)
+	}
+}
+
 func TestBrokerNamespacesKVToOwnBucketAndRejectsBucketSmuggling(t *testing.T) {
 	services := &fakeHostServices{kvValues: map[string][]byte{}}
 	newWritableKVBroker := func(id string) *Broker {

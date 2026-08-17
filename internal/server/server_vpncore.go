@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
@@ -32,7 +34,8 @@ const (
 	// vpnCoreUsageService is the 3-D usage read-model (design-12 S3), proxy:read.
 	vpnCoreUsageService = "latticenet.vpn-core/usage"
 	// vpnCoreProfilesService is the per-node runtime read-model (design-12 S4), proxy:read.
-	vpnCoreProfilesService = "latticenet.vpn-core/profiles"
+	vpnCoreProfilesService            = "latticenet.vpn-core/profiles"
+	vpnCoreSubscriptionSourcesService = "latticenet.vpn-core/subscription-sources"
 )
 
 // registerVPNCoreRPC registers the in-core vpn-core services on the server's RPC
@@ -46,7 +49,7 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export", "list"}, s.vpnCoreNodesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreNodesService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach"}, s.vpnCoreLinesRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach", "managed", "rollout", "chains", "plan_chain", "plan_remove_chain"}, s.vpnCoreLinesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreLinesService, err)
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersService, "v1", []string{"list", "get"}, s.vpnCoreUsersRPC); err != nil {
@@ -61,6 +64,56 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProfilesService, "v1", []string{"query", "settings", "configure"}, s.vpnCoreProfilesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreProfilesService, err)
 	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionSourcesService, "v1", []string{"compose", "graph_options"}, s.vpnCoreSubscriptionSourcesRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreSubscriptionSourcesService, err)
+	}
+}
+
+func (s *Server) vpnCoreSubscriptionSourcesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
+	ctx, releaseGraph := s.acquireSubscriptionGraphRead(ctx, vpnCorePluginID)
+	defer releaseGraph()
+	if method == "graph_options" {
+		response := graphSubscriptionOptionsResponse{SchemaVersion: 1, Identities: []graphSubscriptionIdentityOption{}, Roots: []graphSubscriptionRootOption{}}
+		if err := decodeStrictGraphOptionsRequest(request); err != nil {
+			response.Error = composeFailureView(composeFailure("invalid_request"))
+			return json.Marshal(response)
+		}
+		response, err := graphSubscriptionOptionsFromCapture(func() (lineChainCompileSnapshot, error) {
+			return s.captureLineChainCompileSnapshot()
+		}, s.now().UTC())
+		if err != nil {
+			response = graphSubscriptionOptionsResponse{SchemaVersion: 1, Identities: []graphSubscriptionIdentityOption{}, Roots: []graphSubscriptionRootOption{}, Error: composeFailureView(err)}
+		}
+		return json.Marshal(response)
+	}
+	response := graphSubscriptionResponse{SchemaVersion: 1}
+	if method != "compose" || len(request) > model.MaxSubscriptionResponseBytes {
+		response.Error = composeFailureView(composeFailure("invalid_request"))
+		return json.Marshal(response)
+	}
+	var req graphSubscriptionRequest
+	if err := decodeStrictGraphSubscriptionRequest(request, &req); err != nil {
+		response.Error = composeFailureView(composeFailure("invalid_request"))
+		return json.Marshal(response)
+	}
+	response, err := composeGraphSubscriptionFromCapture(func() (lineChainCompileSnapshot, error) {
+		// One persistent snapshot and one live projection are the complete
+		// authority for this call. The pure composer performs no later reads.
+		persistent := s.store.LineChainCompileStateSnapshot()
+		return s.captureLineChainCompileSnapshotFromState(persistent)
+	}, req, time.Now().UTC())
+	if err != nil {
+		response = graphSubscriptionResponse{SchemaVersion: 1, Error: composeFailureView(err)}
+	}
+	return json.Marshal(response)
+}
+
+func composeGraphSubscriptionFromCapture(capture func() (lineChainCompileSnapshot, error), req graphSubscriptionRequest, now time.Time) (graphSubscriptionResponse, error) {
+	snapshot, err := capture()
+	if err != nil {
+		return graphSubscriptionResponse{}, err
+	}
+	return composeGraphSubscription(snapshot, req, now)
 }
 
 // vpnCoreLinesRPC serves the vpn-core/lines read-model — the unified, node-grouped
@@ -70,6 +123,8 @@ func (s *Server) registerVPNCoreRPC() {
 //	get {line_hash_id} -> {"line": {...}}
 func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
+	case "chains", "plan_chain", "plan_remove_chain":
+		return s.vpnCoreLineChainsRPC(ctx, method, request)
 	case "list":
 		groups, _ := s.lineReadModel()
 		count := 0
@@ -92,6 +147,49 @@ func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []b
 			return nil, err
 		}
 		return s.vpnCoreLinesReattach(p, request)
+	case "managed":
+		// design-17 S3: the redacted managed-line definition listing the Lines
+		// view renders as per-node overlay status. Read-only.
+		defs, err := s.managedLineDefs()
+		if err != nil {
+			return nil, err
+		}
+		views := make([]managedLineDefView, 0, len(defs))
+		for _, def := range defs {
+			views = append(views, toManagedLineDefView(def))
+		}
+		return json.Marshal(struct {
+			ManagedLines []managedLineDefView `json:"managed_lines"`
+		}{ManagedLines: views})
+	case "rollout":
+		// design-17 S1 driven from the Lines view: compiles per-node plans and
+		// files them as one approval batch. Mutates nothing on any node.
+		p, err := pluginOperatorPrincipal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var req managedLineRolloutRequest
+		if len(bytes.TrimSpace(request)) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, fmt.Errorf("vpn-core/lines rollout: invalid request: %w", err)
+			}
+		}
+		planned, skipped, err := s.compileManagedLineRollout(ctx, p, req)
+		if err != nil {
+			return nil, err
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID: id.New("audit"), Action: "network.lines.managed_rollout", Scope: "network:plan",
+			Metadata: map[string]string{
+				"user_id": strings.TrimSpace(req.UserID), "via": "plugin-rpc",
+				"planned": strconv.Itoa(len(planned)), "skipped": strconv.Itoa(len(skipped)),
+			},
+		})
+		return json.Marshal(struct {
+			OK      bool                     `json:"ok"`
+			Planned []managedLinePlannedView `json:"planned"`
+			Skipped []managedLineSkippedView `json:"skipped"`
+		}{OK: true, Planned: planned, Skipped: skipped})
 	case "get":
 		var req struct {
 			LineHashID string `json:"line_hash_id"`
@@ -133,14 +231,16 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 		return nil, errors.New("vpn-core/lines reattach: line_uuid must be UUIDv4")
 	}
 	s.lineUUIDMu.Lock()
-	previous, hadPrevious := s.store.KVEntry(lineUUIDKVBucket, req.LineHashID)
-	for _, entry := range s.store.KV(lineUUIDKVBucket) {
-		if entry.Key != req.LineHashID && strings.EqualFold(strings.TrimSpace(entry.Value), req.LineUUID) {
+	uuidByHash, ownerByHash := s.store.LineUUIDAuthoritySnapshot()
+	previousUUID, hadPrevious := uuidByHash[req.LineHashID]
+	previousOwner := ownerByHash[req.LineHashID]
+	for hash, uuid := range uuidByHash {
+		if hash != req.LineHashID && strings.EqualFold(strings.TrimSpace(uuid), req.LineUUID) {
 			s.lineUUIDMu.Unlock()
-			return nil, fmt.Errorf("vpn-core/lines reattach: line_uuid is already assigned to %s", entry.Key)
+			return nil, fmt.Errorf("vpn-core/lines reattach: line_uuid is already assigned to %s", hash)
 		}
 	}
-	err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: req.LineHashID, Value: req.LineUUID})
+	err := s.putLineUUIDAuthority(req.LineHashID, req.LineUUID, line.NodeID)
 	s.lineUUIDMu.Unlock()
 	if err != nil {
 		return nil, err
@@ -149,11 +249,10 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 	metadataPlan, syncErr := s.queueLineMetaSync(p, line.NodeID)
 	if syncErr != nil {
 		s.lineUUIDMu.Lock()
-		if hadPrevious {
-			err = s.store.PutKV(previous)
-		} else {
-			err = s.store.DeleteKV(lineUUIDKVBucket, req.LineHashID)
+		if !hadPrevious {
+			previousUUID, previousOwner = "", ""
 		}
+		err = s.putLineUUIDAuthority(req.LineHashID, previousUUID, previousOwner)
 		s.lineUUIDMu.Unlock()
 		s.invalidateLineReadModel()
 		if err != nil {
@@ -163,7 +262,7 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), NodeID: line.NodeID, Action: "line.uuid.reattach", Scope: "vpncore:admin",
-		Metadata: map[string]string{"line_hash_id": req.LineHashID, "line_uuid": req.LineUUID},
+		Metadata: map[string]string{"line_hash_id": req.LineHashID, "line_uuid": req.LineUUID, "owner_node_id": line.NodeID},
 	})
 	return json.Marshal(struct {
 		LineHashID       string          `json:"line_hash_id"`

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-server/internal/outbound"
@@ -222,6 +223,107 @@ type Broker struct {
 	// convention.
 	guardURL         func(url string) error
 	guardOperatorURL func(url string) error
+	authority        *generationAuthority
+	rpcGrant         RPCGrant
+}
+
+type RPCGrant map[string]map[string]struct{}
+
+type RPCGrantedHost interface {
+	CallGranted(ctx context.Context, caller string, grant RPCGrant, service, method string, request []byte) ([]byte, error)
+}
+
+var errGenerationRevoked = errors.New("plugin generation authority revoked")
+
+type generationAuthority struct {
+	mu      sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	revoked bool
+	active  int
+	drained chan struct{}
+}
+
+func newGenerationAuthority() *generationAuthority {
+	ctx, cancel := context.WithCancel(context.Background())
+	drained := make(chan struct{})
+	close(drained)
+	return &generationAuthority{ctx: ctx, cancel: cancel, drained: drained}
+}
+
+func (a *generationAuthority) acquire(parent context.Context) (context.Context, func(), error) {
+	if a == nil {
+		return parent, func() {}, nil
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	if err := parent.Err(); err != nil {
+		return nil, nil, err
+	}
+	a.mu.Lock()
+	if a.revoked {
+		a.mu.Unlock()
+		return nil, nil, errGenerationRevoked
+	}
+	if a.active == 0 {
+		a.drained = make(chan struct{})
+	}
+	a.active++
+	ctx, cancel := context.WithCancel(parent)
+	stop := context.AfterFunc(a.ctx, cancel)
+	a.mu.Unlock()
+	return ctx, func() {
+		stop()
+		cancel()
+		a.mu.Lock()
+		a.active--
+		if a.active == 0 {
+			close(a.drained)
+		}
+		a.mu.Unlock()
+	}, nil
+}
+
+func (a *generationAuthority) revoke() {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	if !a.revoked {
+		a.revoked = true
+		a.cancel()
+	}
+	a.mu.Unlock()
+}
+
+func (a *generationAuthority) wait(ctx context.Context) error {
+	a.mu.Lock()
+	done := a.drained
+	a.mu.Unlock()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *Broker) attachAuthority(authority *generationAuthority) { b.authority = authority }
+
+func (b *Broker) revokeAuthority(ctx context.Context) error {
+	if b == nil || b.authority == nil {
+		return nil
+	}
+	b.authority.revoke()
+	return b.authority.wait(ctx)
+}
+
+func (b *Broker) acquireAuthority(ctx context.Context) (context.Context, func(), error) {
+	if b == nil || b.authority == nil {
+		return ctx, func() {}, nil
+	}
+	return b.authority.acquire(ctx)
 }
 
 type operatorTargetsContextKey struct{}
@@ -296,6 +398,16 @@ func NewBroker(loaded Loaded, services HostServices) (*Broker, error) {
 		secretBucket:     secretBucketPrefix + loaded.Manifest.ID,
 		guardURL:         guard,
 		guardOperatorURL: operatorGuard,
+		rpcGrant:         RPCGrant{},
+	}
+	if loaded.Manifest.HostAccess != nil {
+		for _, dependency := range loaded.Manifest.HostAccess.RPC {
+			methods := map[string]struct{}{}
+			for _, method := range dependency.Methods {
+				methods[method] = struct{}{}
+			}
+			out.rpcGrant[dependency.Service] = methods
+		}
 	}
 	for _, cap := range caps {
 		if _, ok := CapabilityRisk(cap); !ok {
@@ -626,7 +738,13 @@ func (b *Broker) RPCCall(ctx context.Context, service, method string, request []
 	if b.services.RPC == nil {
 		return nil, fmt.Errorf("%w: rpc", ErrHostServiceUnavailable)
 	}
-	resp, err := b.services.RPC.Call(ctx, b.pluginID, service, method, append([]byte(nil), request...))
+	var resp []byte
+	var err error
+	if granted, ok := b.services.RPC.(RPCGrantedHost); ok {
+		resp, err = granted.CallGranted(ctx, b.pluginID, b.rpcGrant, service, method, append([]byte(nil), request...))
+	} else {
+		return nil, fmt.Errorf("%w: generation-scoped rpc grants unsupported", ErrHostServiceUnavailable)
+	}
 	if err != nil {
 		if errors.Is(err, ErrRPCDenied) {
 			b.record(ctx, HostCallEvent{
@@ -690,6 +808,14 @@ func boundLogFields(fields map[string]string) map[string]string {
 }
 
 func (b *Broker) require(ctx context.Context, action, cap string) error {
+	if b.authority != nil {
+		b.authority.mu.Lock()
+		revoked := b.authority.revoked
+		b.authority.mu.Unlock()
+		if revoked {
+			return errGenerationRevoked
+		}
+	}
 	if b.HasCapability(cap) {
 		b.record(ctx, HostCallEvent{PluginID: b.pluginID, Action: action, Capability: cap, Decision: "allow"})
 		return nil

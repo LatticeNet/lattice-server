@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
@@ -177,6 +178,92 @@ func TestVPNCoreNodesRPCRegisteredAndExports(t *testing.T) {
 	}
 }
 
+func TestVPNCoreSubscriptionSourcesRPCRegisteredAndFailsAllOrNone(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateCorePlugin(t, st, vpnCorePluginID)
+	found := false
+	for _, service := range srv.pluginRPC.Services() {
+		if service.Service == vpnCoreSubscriptionSourcesService {
+			found = service.Owner == vpnCorePluginID && service.Version == "v1" && len(service.Methods) == 2 &&
+				service.Methods[0] == "compose" && service.Methods[1] == "graph_options"
+		}
+	}
+	if !found {
+		t.Fatalf("subscription sources service not registered: %+v", srv.pluginRPC.Services())
+	}
+	for _, request := range []string{
+		`{"schema_version":1,"identity_id":"missing","entry_roots":["` + composeRootUUID + `"]}`,
+		`{"schema_version":1,"schema_version":1,"identity_id":"missing","entry_roots":["` + composeRootUUID + `"]}`,
+		`{"schema_version":1,"identity_id":"missing","entry_roots":[],"unknown":true}`,
+	} {
+		raw, err := srv.pluginRPC.Call(context.Background(), vpnCorePluginID, vpnCoreSubscriptionSourcesService, "compose", []byte(request))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response graphSubscriptionResponse
+		if err := json.Unmarshal(raw, &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.OK || response.Error == nil || response.SourceVersion != "" || len(response.SourceManifest) != 0 || len(response.Entries) != 0 || response.Raw != "" {
+			t.Fatalf("failure was not all-or-none: %s", raw)
+		}
+		if strings.Contains(string(raw), composeRootUUID) || strings.Contains(string(raw), "missing") {
+			t.Fatalf("failure leaked request inputs: %s", raw)
+		}
+	}
+}
+
+func TestVPNCoreSubscriptionSourcesGraphOptionsRPCIsStrictAndSecretFree(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activateCorePlugin(t, st, vpnCorePluginID)
+
+	for _, hostile := range []string{
+		``,
+		`null`,
+		`{"unknown":true}`,
+		`{"unknown":true,"unknown":false}`,
+		`{} {}`,
+	} {
+		raw, err := srv.pluginRPC.Call(context.Background(), vpnCorePluginID, vpnCoreSubscriptionSourcesService, "graph_options", []byte(hostile))
+		if err != nil {
+			t.Fatalf("graph_options(%q): %v", hostile, err)
+		}
+		var response graphSubscriptionOptionsResponse
+		if err := json.Unmarshal(raw, &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.OK || response.Error == nil || len(response.Identities) != 0 || len(response.Roots) != 0 || response.OptionsVersion != "" {
+			t.Fatalf("hostile request returned partial options: %s", raw)
+		}
+	}
+}
+
+func TestVPNCoreSubscriptionSourcesComposeCapturesExactlyOneSnapshot(t *testing.T) {
+	calls := 0
+	snapshot := testGraphComposeSnapshot()
+	response, err := composeGraphSubscriptionFromCapture(func() (lineChainCompileSnapshot, error) {
+		calls++
+		return snapshot, nil
+	}, graphSubscriptionRequest{SchemaVersion: 1, IdentityID: "identity", EntryRoots: []string{composeRootUUID}}, time.Unix(1_700_000_000, 0))
+	if err != nil || !response.OK || calls != 1 {
+		t.Fatalf("compose capture calls=%d response=%+v err=%v", calls, response, err)
+	}
+}
+
 func TestVPNCoreDesign15MutationMethodsRegisteredAndReachable(t *testing.T) {
 	st, err := store.Open("")
 	if err != nil {
@@ -241,6 +328,10 @@ func TestVPNCoreLinesReattachAuditsAndRejectsCollisions(t *testing.T) {
 	if !ok || entry.Value != want {
 		t.Fatalf("reattach mapping: %+v ok=%v", entry, ok)
 	}
+	owner, ok := st.KVEntry(lineUUIDOwnerKVBucket, line.LineHashID)
+	if !ok || owner.Value != line.NodeID {
+		t.Fatalf("reattach owner: %+v ok=%v", owner, ok)
+	}
 	if !auditMetadataSeen(st, "line.uuid.reattach", "line_uuid", want) {
 		t.Fatalf("reattach audit missing: %+v", st.AuditEvents())
 	}
@@ -255,6 +346,17 @@ func TestVPNCoreLinesReattachAuditsAndRejectsCollisions(t *testing.T) {
 	if _, err := srv.vpnCoreLinesRPC(ctx, "reattach", mustJSON(t, map[string]string{
 		"line_hash_id": line.LineHashID, "line_uuid": "55555555-5555-4555-8555-555555555555",
 	})); err == nil {
-		t.Fatal("colliding reattach UUID must fail")
+		t.Fatal("admin reattach must reject a UUID owned by another hash")
+	}
+	const ambiguous = "66666666-6666-4666-8666-666666666666"
+	for _, hash := range []string{"line_ambiguous_one", "line_ambiguous_two"} {
+		if err := st.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: hash, Value: ambiguous}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := srv.vpnCoreLinesRPC(ctx, "reattach", mustJSON(t, map[string]string{
+		"line_hash_id": line.LineHashID, "line_uuid": ambiguous,
+	})); err == nil {
+		t.Fatal("admin reattach accepted ambiguous UUID authority")
 	}
 }

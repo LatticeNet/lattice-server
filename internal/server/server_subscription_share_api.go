@@ -171,7 +171,11 @@ func (s *Server) rotateSubscriptionShare(w http.ResponseWriter, share model.Subs
 	// Rotation is a lie if the old URL keeps working, and a cached body is served
 	// without ever consulting the token, so the cache must be dropped here rather
 	// than left to expire.
-	s.subscriptionCache.InvalidateShare(share.ID)
+	if share.Source.Kind == model.ShareSourcePlugin {
+		s.invalidateSharesForSource(share.Source.PluginID, share.Source.SubscriptionID)
+	} else {
+		s.subscriptionCache.InvalidateShare(share.ID)
+	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareRotate, Scope: "proxy:admin", Decision: "allow",
 		Metadata: map[string]string{
@@ -207,7 +211,7 @@ func (s *Server) refreshSubscriptionShare(w http.ResponseWriter, r *http.Request
 	}
 	// A forced refresh always invalidates: the whole point is to make the next
 	// fetch see new content, and a cached body would hide it.
-	s.subscriptionCache.InvalidateShare(share.ID)
+	s.invalidateSharesForSource(share.Source.PluginID, share.Source.SubscriptionID)
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionSubscriptionFetch, Scope: "proxy:admin", Decision: "allow",
 		Metadata: map[string]string{"share_id": share.ID, "slug": share.Slug, "stale": fmt.Sprintf("%t", snap.FetchError != "")},

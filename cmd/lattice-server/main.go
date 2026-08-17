@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/LatticeNet/lattice-server/internal/geoip"
@@ -215,16 +219,96 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
+	serve := srv.ListenAndServe
 	if tlsCert != "" && tlsKey != "" {
 		log.Printf("lattice-server listening on https://%s (data=%s, web=%s)", listen, dataPath, webRoot)
-		log.Fatal(srv.ListenAndServeTLS(tlsCert, tlsKey))
-		return
-	}
-	if !secureCookies {
+		serve = func() error { return srv.ListenAndServeTLS(tlsCert, tlsKey) }
+	} else if !secureCookies {
 		log.Printf("WARNING: serving plain HTTP without -secure-cookies; terminate TLS at a trusted proxy and bind to a private/WireGuard address")
 	}
-	log.Printf("lattice-server listening on http://%s (data=%s, web=%s)", listen, dataPath, webRoot)
-	log.Fatal(srv.ListenAndServe())
+	if tlsCert == "" || tlsKey == "" {
+		log.Printf("lattice-server listening on http://%s (data=%s, web=%s)", listen, dataPath, webRoot)
+	}
+	if err := serveUntilSignal(srv, app, serve); err != nil {
+		log.Printf("lattice-server shutdown failed: %v", err)
+		os.Exit(1)
+	}
+}
+
+type runtimeCloser interface{ Close(context.Context) error }
+
+func serveUntilSignal(srv *http.Server, app runtimeCloser, serve func() error) error {
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serveUntilContext(signalCtx, 15*time.Second, srv, app, serve)
+}
+
+func serveUntilContext(signalCtx context.Context, shutdownTimeout time.Duration, srv *http.Server, app runtimeCloser, serve func() error) error {
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- serve() }()
+	select {
+	case err := <-serveErr:
+		closeCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- app.Close(closeCtx) }()
+		select {
+		case closeErr := <-closeDone:
+			return errors.Join(err, closeErr)
+		case <-closeCtx.Done():
+			return errors.Join(err, closeCtx.Err(), srv.Close())
+		}
+	case <-signalCtx.Done():
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	httpDone := make(chan error, 1)
+	runtimeDone := make(chan error, 1)
+	go func() { httpDone <- srv.Shutdown(shutdownCtx) }()
+	go func() { runtimeDone <- app.Close(shutdownCtx) }()
+	var httpErr, runtimeErr error
+	for completed := 0; completed < 2; {
+		select {
+		case httpErr = <-httpDone:
+			httpDone = nil
+			completed++
+		case runtimeErr = <-runtimeDone:
+			runtimeDone = nil
+			completed++
+		case <-shutdownCtx.Done():
+			httpErr = errors.Join(httpErr, shutdownCtx.Err(), srv.Close())
+			select {
+			case err := <-httpDone:
+				httpErr = errors.Join(httpErr, err)
+			default:
+			}
+			select {
+			case err := <-runtimeDone:
+				runtimeErr = errors.Join(runtimeErr, err)
+			default:
+			}
+			select {
+			case err := <-serveErr:
+				if !errors.Is(err, http.ErrServerClosed) {
+					httpErr = errors.Join(httpErr, err)
+				}
+			default:
+			}
+			return errors.Join(httpErr, runtimeErr)
+		}
+	}
+	select {
+	case serveResult := <-serveErr:
+		if errors.Is(serveResult, http.ErrServerClosed) {
+			serveResult = nil
+		}
+		return errors.Join(httpErr, runtimeErr, serveResult)
+	case <-shutdownCtx.Done():
+		return errors.Join(httpErr, runtimeErr, shutdownCtx.Err(), srv.Close())
+	}
 }
 
 // defaultDataPath keeps persistent state out of world-writable /tmp by default,
@@ -273,6 +357,9 @@ func parseEnvAllowlist(raw string) ([]string, error) {
 		if !validEnvName(name) {
 			return nil, fmt.Errorf("invalid -plugin-runtime-env variable name %q", name)
 		}
+		if isReservedPluginRuntimeEnv(name) {
+			return nil, fmt.Errorf("reserved -plugin-runtime-env variable name %q", name)
+		}
 		if _, ok := seen[name]; ok {
 			continue
 		}
@@ -280,6 +367,15 @@ func parseEnvAllowlist(raw string) ([]string, error) {
 		out = append(out, name)
 	}
 	return out, nil
+}
+
+func isReservedPluginRuntimeEnv(name string) bool {
+	switch name {
+	case "LATTICE_RUNTIME_PROTOCOL", "LATTICE_RUNTIME_GENERATION", "LATTICE_HOST_RESPONSE_FD":
+		return true
+	default:
+		return false
+	}
 }
 
 func validEnvName(name string) bool {

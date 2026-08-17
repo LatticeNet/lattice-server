@@ -55,45 +55,53 @@ type State struct {
 	// distinct collection from KV on purpose: KV is plaintext at rest AND readable
 	// over GET /api/kv by any principal holding kv:read. A secret must have neither
 	// property, so it gets its own map, its own cipher pass, and no HTTP handler.
-	PluginSecrets         map[string]model.KVEntry              `json:"plugin_secrets"`
-	SubscriptionShares    map[string]model.SubscriptionShare    `json:"subscription_shares"`
-	SubscriptionSnapshots map[string]model.SubscriptionSnapshot `json:"subscription_snapshots"`
-	Static                map[string]model.StaticObject         `json:"static"`
-	StorageBuckets        map[string]model.StorageBucket        `json:"storage_buckets"`
-	StorageBindings       map[string]model.StorageBinding       `json:"storage_bindings"`
-	StorageTokens         map[string]model.StorageAccessToken   `json:"storage_tokens"`
-	Workers               map[string]model.WorkerScript         `json:"workers"`
-	Plugins               map[string]model.PluginInstallation   `json:"plugins"`
-	Approvals             map[string]model.Approval             `json:"approvals"`
-	Sessions              map[string]auth.Session               `json:"sessions"`
-	DDNS                  map[string]model.DDNSProfile          `json:"ddns"`
-	Monitors              map[string]model.Monitor              `json:"monitors"`
-	MonResults            map[string][]model.MonitorResult      `json:"monitor_results"`
-	LogSources            map[string]model.LogSource            `json:"log_sources"`
-	NotifyChannels        map[string]model.NotifyChannel        `json:"notify_channels"`
-	NotifyRules           map[string]model.NotifyRule           `json:"notify_rules"`
-	Tunnels               map[string]model.TunnelProfile        `json:"tunnels"`
-	MachineProfiles       map[string]model.MachineProfile       `json:"machine_profiles"`
-	MachineVendors        map[string]model.MachineVendor        `json:"machine_vendors"`
-	NFTInputs             map[string]model.NFTInputs            `json:"nft_inputs"`
-	SecurityGroups        map[string]model.SecurityGroup        `json:"security_groups"`
-	GuardZones            map[string]model.GuardZone            `json:"guard_zones"`
-	GuardBindings         map[string]model.NodeGuardBinding     `json:"guard_bindings"`
-	GuardRealitySnapshots map[string]GuardRealitySnapshot       `json:"guard_reality_snapshots"`
-	DNSDeployments        map[string]model.DNSDeployment        `json:"dns_deployments"`
-	NetPolicies           map[string]model.NetPolicy            `json:"net_policies"`
-	Groups                map[string]model.Group                `json:"groups"`
-	GroupPolicies         map[string]model.GroupNetPolicy       `json:"group_policies"`
-	GeoRouting            map[string]model.GeoRouting           `json:"geo_routing"`
-	AgentUpdates          map[string]model.AgentUpdatePolicy    `json:"agent_updates"`
-	ProxyInbounds         map[string]model.ProxyInbound         `json:"proxy_inbounds"`
-	ProxyUsers            map[string]model.ProxyUser            `json:"proxy_users"`
-	ProxyProfiles         map[string]model.ProxyNodeProfile     `json:"proxy_profiles"`
-	ProxyUsage            map[string]model.ProxyUsageSnapshot   `json:"proxy_usage"`
-	TOTPChallenges        map[string]auth.TOTPChallenge         `json:"totp_challenges"`
-	OIDCProviders         map[string]model.OIDCProvider         `json:"oidc_providers"`
-	OIDCIdentities        map[string]model.OIDCIdentity         `json:"oidc_identities"`
-	OIDCAuthStates        map[string]auth.OIDCAuthState         `json:"oidc_auth_states"`
+	PluginSecrets          map[string]model.KVEntry              `json:"plugin_secrets"`
+	VpnUsers               map[string]VpnUserPublicRecord        `json:"vpn_users"`
+	VpnUserSecrets         map[string]VpnUserSecretRecord        `json:"vpn_user_secrets"`
+	ManagedLines           map[string]ManagedLinePublicRecord    `json:"managed_lines"`
+	ManagedLineSecrets     map[string]ManagedLineSecretRecord    `json:"managed_line_secrets"`
+	LineChainDefinitions   map[string]LineChainDefinition        `json:"line_chain_definitions"`
+	LineChainAttempts      map[string]LineChainAttempt           `json:"line_chain_attempts"`
+	LineChainAuditEvidence map[string]model.AuditEvent           `json:"line_chain_audit_evidence,omitempty"`
+	LineChainGraphRevision uint64                                `json:"line_chain_graph_revision"`
+	SubscriptionShares     map[string]model.SubscriptionShare    `json:"subscription_shares"`
+	SubscriptionSnapshots  map[string]model.SubscriptionSnapshot `json:"subscription_snapshots"`
+	Static                 map[string]model.StaticObject         `json:"static"`
+	StorageBuckets         map[string]model.StorageBucket        `json:"storage_buckets"`
+	StorageBindings        map[string]model.StorageBinding       `json:"storage_bindings"`
+	StorageTokens          map[string]model.StorageAccessToken   `json:"storage_tokens"`
+	Workers                map[string]model.WorkerScript         `json:"workers"`
+	Plugins                map[string]model.PluginInstallation   `json:"plugins"`
+	Approvals              map[string]model.Approval             `json:"approvals"`
+	Sessions               map[string]auth.Session               `json:"sessions"`
+	DDNS                   map[string]model.DDNSProfile          `json:"ddns"`
+	Monitors               map[string]model.Monitor              `json:"monitors"`
+	MonResults             map[string][]model.MonitorResult      `json:"monitor_results"`
+	LogSources             map[string]model.LogSource            `json:"log_sources"`
+	NotifyChannels         map[string]model.NotifyChannel        `json:"notify_channels"`
+	NotifyRules            map[string]model.NotifyRule           `json:"notify_rules"`
+	Tunnels                map[string]model.TunnelProfile        `json:"tunnels"`
+	MachineProfiles        map[string]model.MachineProfile       `json:"machine_profiles"`
+	MachineVendors         map[string]model.MachineVendor        `json:"machine_vendors"`
+	NFTInputs              map[string]model.NFTInputs            `json:"nft_inputs"`
+	SecurityGroups         map[string]model.SecurityGroup        `json:"security_groups"`
+	GuardZones             map[string]model.GuardZone            `json:"guard_zones"`
+	GuardBindings          map[string]model.NodeGuardBinding     `json:"guard_bindings"`
+	GuardRealitySnapshots  map[string]GuardRealitySnapshot       `json:"guard_reality_snapshots"`
+	DNSDeployments         map[string]model.DNSDeployment        `json:"dns_deployments"`
+	NetPolicies            map[string]model.NetPolicy            `json:"net_policies"`
+	Groups                 map[string]model.Group                `json:"groups"`
+	GroupPolicies          map[string]model.GroupNetPolicy       `json:"group_policies"`
+	GeoRouting             map[string]model.GeoRouting           `json:"geo_routing"`
+	AgentUpdates           map[string]model.AgentUpdatePolicy    `json:"agent_updates"`
+	ProxyInbounds          map[string]model.ProxyInbound         `json:"proxy_inbounds"`
+	ProxyUsers             map[string]model.ProxyUser            `json:"proxy_users"`
+	ProxyProfiles          map[string]model.ProxyNodeProfile     `json:"proxy_profiles"`
+	ProxyUsage             map[string]model.ProxyUsageSnapshot   `json:"proxy_usage"`
+	TOTPChallenges         map[string]auth.TOTPChallenge         `json:"totp_challenges"`
+	OIDCProviders          map[string]model.OIDCProvider         `json:"oidc_providers"`
+	OIDCIdentities         map[string]model.OIDCIdentity         `json:"oidc_identities"`
+	OIDCAuthStates         map[string]auth.OIDCAuthState         `json:"oidc_auth_states"`
 	// WebAuthnCreds holds registered passkeys keyed by store record id. The public
 	// keys and credential ids are non-secret, so this map is persisted as-is (no
 	// at-rest envelope like Users/Sessions carry).
@@ -126,6 +134,7 @@ type Store struct {
 	runtimeBoltHotPath string
 	syncParentDir      func(string) error
 	durabilityDegraded bool // guarded by mu; only a confirmed parent sync clears it
+	testPersistCalls   int  // tests only: counts authoritative JSON persistence attempts
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every
@@ -229,6 +238,20 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	if path == "" {
 		return s, nil
 	}
+	if !cph.Enabled() {
+		data, readErr := os.ReadFile(path)
+		if readErr == nil && len(data) != 0 {
+			var probe State
+			if err := json.Unmarshal(data, &probe); err != nil {
+				return nil, err
+			}
+			if err := rejectSubscriptionSecretsWithoutCipher(probe, cph); err != nil {
+				return nil, fmt.Errorf("store: %w", err)
+			}
+		} else if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			return nil, readErr
+		}
+	}
 	walPath := path + ".audit-wal"
 	walAnchorPath := path + ".audit-anchor"
 	wal, err := audit.OpenAnchoredWAL(walPath, walAnchorPath)
@@ -252,14 +275,54 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	if err := json.Unmarshal(data, &s.state); err != nil {
 		return nil, err
 	}
+	migrateSubscriptionSecrets := subscriptionSecretsNeedMigration(s.state, s.cipher)
 	if err := decryptState(&s.state, s.cipher); err != nil {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	s.ensureMaps()
+	snapshots, err := validateCloneSubscriptionSnapshots(s.state.SubscriptionSnapshots)
+	if err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	s.state.SubscriptionSnapshots = snapshots
+	if err := validateVpnUserCollections(s.state.VpnUsers, s.state.VpnUserSecrets); err != nil {
+		return nil, fmt.Errorf("store: invalid vpn user secret collections: %w", err)
+	}
+	if err := validateManagedLineCollections(s.state.ManagedLines, s.state.ManagedLineSecrets); err != nil {
+		return nil, fmt.Errorf("store: invalid managed line secret collections: %w", err)
+	}
+	if migrateSubscriptionSecrets {
+		committed, err := s.persistState(s.jsonPersistState())
+		if err != nil || !committed {
+			return nil, fmt.Errorf("store: migrate subscription secrets: %w", err)
+		}
+	}
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	s.confirmParentDirDurability()
 	return s, nil
+}
+
+func subscriptionSecretsNeedMigration(st State, cph secret.Cipher) bool {
+	for _, snapshot := range st.SubscriptionSnapshots {
+		if snapshot.NeedsRewrite() {
+			return true
+		}
+	}
+	if cph == nil || !cph.Enabled() {
+		return false
+	}
+	for _, snapshot := range st.SubscriptionSnapshots {
+		if snapshot.Raw != "" && !secret.IsEnvelope(snapshot.Raw) {
+			return true
+		}
+	}
+	for _, share := range st.SubscriptionShares {
+		if share.Token != "" && !secret.IsEnvelope(share.Token) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) confirmParentDirDurability() {
@@ -292,6 +355,9 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 		}
 		return fmt.Errorf("runtime bbolt hot store already enabled at %s", s.runtimeBoltHotPath)
 	}
+	if err := rejectSubscriptionSecretsWithoutCipher(s.state, s.cipher); err != nil {
+		return err
+	}
 	bs, err := OpenBoltState(path, s.cipher)
 	if err != nil {
 		return err
@@ -318,6 +384,10 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 	if err != nil {
 		return err
 	}
+	subscriptionAuthorityInitialized, err := bs.subscriptionHotAuthorityInitialized()
+	if err != nil {
+		return err
+	}
 	seenAudit := map[string]struct{}{}
 	for _, ev := range existing.Audit {
 		seenAudit[auditEventStorageKey(ev)] = struct{}{}
@@ -329,6 +399,16 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 		if err := bs.AppendAudit(ev); err != nil {
 			return err
 		}
+		seenAudit[auditEventStorageKey(ev)] = struct{}{}
+	}
+	for _, ev := range st.LineChainAuditEvidence {
+		if _, ok := seenAudit[auditEventStorageKey(ev)]; ok {
+			continue
+		}
+		if err := bs.AppendAudit(ev); err != nil {
+			return err
+		}
+		seenAudit[auditEventStorageKey(ev)] = struct{}{}
 	}
 	now := time.Now().UTC()
 	for _, sess := range st.Sessions {
@@ -362,7 +442,44 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			return err
 		}
 	}
+	if !subscriptionAuthorityInitialized {
+		if err := bs.initializeSubscriptionHotAuthority(mergeSubscriptionHotSeed(st, existing)); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func mergeSubscriptionHotSeed(jsonState, unmarkedBolt State) State {
+	merged := jsonState
+	merged.SubscriptionShares = make(map[string]model.SubscriptionShare, len(jsonState.SubscriptionShares)+len(unmarkedBolt.SubscriptionShares))
+	for id, share := range unmarkedBolt.SubscriptionShares {
+		merged.SubscriptionShares[id] = share
+	}
+	for id, share := range jsonState.SubscriptionShares {
+		if existing, ok := merged.SubscriptionShares[id]; ok && !share.UpdatedAt.After(existing.UpdatedAt) {
+			continue
+		}
+		merged.SubscriptionShares[id] = share
+	}
+	merged.SubscriptionSnapshots = make(map[string]model.SubscriptionSnapshot, len(jsonState.SubscriptionSnapshots)+len(unmarkedBolt.SubscriptionSnapshots))
+	for key, snapshot := range unmarkedBolt.SubscriptionSnapshots {
+		merged.SubscriptionSnapshots[key] = snapshot
+	}
+	for key, snapshot := range jsonState.SubscriptionSnapshots {
+		if existing, ok := merged.SubscriptionSnapshots[key]; ok && !subscriptionSnapshotNewer(snapshot, existing) {
+			continue
+		}
+		merged.SubscriptionSnapshots[key] = snapshot
+	}
+	return merged
+}
+
+func subscriptionSnapshotNewer(candidate, current model.SubscriptionSnapshot) bool {
+	if !candidate.LastAttemptAt.Equal(current.LastAttemptAt) {
+		return candidate.LastAttemptAt.After(current.LastAttemptAt)
+	}
+	return candidate.FetchedAt.After(current.FetchedAt)
 }
 
 func mergeRuntimeBoltHotState(dst *State, hot State) {
@@ -393,6 +510,11 @@ func mergeRuntimeBoltHotState(dst *State, hot State) {
 	if len(hot.ProxyUsage) > 0 {
 		dst.ProxyUsage = hot.ProxyUsage
 	}
+	// Once enabled, Bolt is authoritative for these hot collections, including
+	// explicit empty/delete state. Conditional non-empty merge resurrects records
+	// from the stale JSON bootstrap after a valid hot deletion.
+	dst.SubscriptionShares = hot.SubscriptionShares
+	dst.SubscriptionSnapshots = hot.SubscriptionSnapshots
 	dst.ensureMaps()
 }
 
@@ -431,52 +553,59 @@ func monitorResultPersistenceKey(monitorID, nodeID string) string {
 
 func emptyState() State {
 	return State{
-		Users:                 map[string]model.User{},
-		Tokens:                map[string]model.Token{},
-		Nodes:                 map[string]model.Node{},
-		Tasks:                 map[string]model.Task{},
-		TaskResultReceipts:    map[string]TaskResultReceipt{},
-		KV:                    map[string]model.KVEntry{},
-		PluginSecrets:         map[string]model.KVEntry{},
-		SubscriptionShares:    map[string]model.SubscriptionShare{},
-		SubscriptionSnapshots: map[string]model.SubscriptionSnapshot{},
-		Static:                map[string]model.StaticObject{},
-		StorageBuckets:        map[string]model.StorageBucket{},
-		StorageBindings:       map[string]model.StorageBinding{},
-		StorageTokens:         map[string]model.StorageAccessToken{},
-		Workers:               map[string]model.WorkerScript{},
-		Plugins:               map[string]model.PluginInstallation{},
-		Approvals:             map[string]model.Approval{},
-		Sessions:              map[string]auth.Session{},
-		DDNS:                  map[string]model.DDNSProfile{},
-		Monitors:              map[string]model.Monitor{},
-		MonResults:            map[string][]model.MonitorResult{},
-		LogSources:            map[string]model.LogSource{},
-		NotifyChannels:        map[string]model.NotifyChannel{},
-		NotifyRules:           map[string]model.NotifyRule{},
-		Tunnels:               map[string]model.TunnelProfile{},
-		MachineProfiles:       map[string]model.MachineProfile{},
-		MachineVendors:        map[string]model.MachineVendor{},
-		NFTInputs:             map[string]model.NFTInputs{},
-		SecurityGroups:        map[string]model.SecurityGroup{},
-		GuardZones:            map[string]model.GuardZone{},
-		GuardBindings:         map[string]model.NodeGuardBinding{},
-		GuardRealitySnapshots: map[string]GuardRealitySnapshot{},
-		DNSDeployments:        map[string]model.DNSDeployment{},
-		NetPolicies:           map[string]model.NetPolicy{},
-		Groups:                map[string]model.Group{},
-		GroupPolicies:         map[string]model.GroupNetPolicy{},
-		GeoRouting:            map[string]model.GeoRouting{},
-		AgentUpdates:          map[string]model.AgentUpdatePolicy{},
-		ProxyInbounds:         map[string]model.ProxyInbound{},
-		ProxyUsers:            map[string]model.ProxyUser{},
-		ProxyProfiles:         map[string]model.ProxyNodeProfile{},
-		ProxyUsage:            map[string]model.ProxyUsageSnapshot{},
-		TOTPChallenges:        map[string]auth.TOTPChallenge{},
-		OIDCProviders:         map[string]model.OIDCProvider{},
-		OIDCIdentities:        map[string]model.OIDCIdentity{},
-		OIDCAuthStates:        map[string]auth.OIDCAuthState{},
-		WebAuthnCreds:         map[string]auth.WebAuthnCredential{},
+		Users:                  map[string]model.User{},
+		Tokens:                 map[string]model.Token{},
+		Nodes:                  map[string]model.Node{},
+		Tasks:                  map[string]model.Task{},
+		TaskResultReceipts:     map[string]TaskResultReceipt{},
+		KV:                     map[string]model.KVEntry{},
+		PluginSecrets:          map[string]model.KVEntry{},
+		VpnUsers:               map[string]VpnUserPublicRecord{},
+		VpnUserSecrets:         map[string]VpnUserSecretRecord{},
+		ManagedLines:           map[string]ManagedLinePublicRecord{},
+		ManagedLineSecrets:     map[string]ManagedLineSecretRecord{},
+		LineChainDefinitions:   map[string]LineChainDefinition{},
+		LineChainAttempts:      map[string]LineChainAttempt{},
+		LineChainAuditEvidence: map[string]model.AuditEvent{},
+		SubscriptionShares:     map[string]model.SubscriptionShare{},
+		SubscriptionSnapshots:  map[string]model.SubscriptionSnapshot{},
+		Static:                 map[string]model.StaticObject{},
+		StorageBuckets:         map[string]model.StorageBucket{},
+		StorageBindings:        map[string]model.StorageBinding{},
+		StorageTokens:          map[string]model.StorageAccessToken{},
+		Workers:                map[string]model.WorkerScript{},
+		Plugins:                map[string]model.PluginInstallation{},
+		Approvals:              map[string]model.Approval{},
+		Sessions:               map[string]auth.Session{},
+		DDNS:                   map[string]model.DDNSProfile{},
+		Monitors:               map[string]model.Monitor{},
+		MonResults:             map[string][]model.MonitorResult{},
+		LogSources:             map[string]model.LogSource{},
+		NotifyChannels:         map[string]model.NotifyChannel{},
+		NotifyRules:            map[string]model.NotifyRule{},
+		Tunnels:                map[string]model.TunnelProfile{},
+		MachineProfiles:        map[string]model.MachineProfile{},
+		MachineVendors:         map[string]model.MachineVendor{},
+		NFTInputs:              map[string]model.NFTInputs{},
+		SecurityGroups:         map[string]model.SecurityGroup{},
+		GuardZones:             map[string]model.GuardZone{},
+		GuardBindings:          map[string]model.NodeGuardBinding{},
+		GuardRealitySnapshots:  map[string]GuardRealitySnapshot{},
+		DNSDeployments:         map[string]model.DNSDeployment{},
+		NetPolicies:            map[string]model.NetPolicy{},
+		Groups:                 map[string]model.Group{},
+		GroupPolicies:          map[string]model.GroupNetPolicy{},
+		GeoRouting:             map[string]model.GeoRouting{},
+		AgentUpdates:           map[string]model.AgentUpdatePolicy{},
+		ProxyInbounds:          map[string]model.ProxyInbound{},
+		ProxyUsers:             map[string]model.ProxyUser{},
+		ProxyProfiles:          map[string]model.ProxyNodeProfile{},
+		ProxyUsage:             map[string]model.ProxyUsageSnapshot{},
+		TOTPChallenges:         map[string]auth.TOTPChallenge{},
+		OIDCProviders:          map[string]model.OIDCProvider{},
+		OIDCIdentities:         map[string]model.OIDCIdentity{},
+		OIDCAuthStates:         map[string]auth.OIDCAuthState{},
+		WebAuthnCreds:          map[string]auth.WebAuthnCredential{},
 
 		WebAuthnChallenges: map[string]auth.WebAuthnChallenge{},
 	}
@@ -503,6 +632,27 @@ func (st *State) ensureMaps() {
 	}
 	if st.PluginSecrets == nil {
 		st.PluginSecrets = map[string]model.KVEntry{}
+	}
+	if st.VpnUsers == nil {
+		st.VpnUsers = map[string]VpnUserPublicRecord{}
+	}
+	if st.VpnUserSecrets == nil {
+		st.VpnUserSecrets = map[string]VpnUserSecretRecord{}
+	}
+	if st.ManagedLines == nil {
+		st.ManagedLines = map[string]ManagedLinePublicRecord{}
+	}
+	if st.ManagedLineSecrets == nil {
+		st.ManagedLineSecrets = map[string]ManagedLineSecretRecord{}
+	}
+	if st.LineChainDefinitions == nil {
+		st.LineChainDefinitions = map[string]LineChainDefinition{}
+	}
+	if st.LineChainAttempts == nil {
+		st.LineChainAttempts = map[string]LineChainAttempt{}
+	}
+	if st.LineChainAuditEvidence == nil {
+		st.LineChainAuditEvidence = map[string]model.AuditEvent{}
 	}
 	if st.SubscriptionShares == nil {
 		st.SubscriptionShares = map[string]model.SubscriptionShare{}
@@ -645,6 +795,7 @@ func (s *Store) Save() error {
 // Callers that need commit-style publication can persist a staged copy and
 // install it in s.state only after this returns successfully.
 func (s *Store) persistState(st State) (committed bool, err error) {
+	s.testPersistCalls++
 	start := time.Now()
 	defer func() {
 		telemetry.ObserveStoreSave(time.Since(start), err)
@@ -1289,9 +1440,15 @@ func (s *Store) LeaseTasks(nodeID string, limit int) ([]model.Task, error) {
 // TaskDelivery carries protocol metadata decided under the same store lock as
 // the lease. DurableResult is true only for the exact gated NetGuard action.
 type TaskDelivery struct {
-	Task          model.Task
-	DurableResult bool
+	Task            model.Task
+	DurableResult   bool
+	DurableProtocol string
 }
+
+const (
+	DurableProtocolNetGuardV1  = "netguard-v1"
+	DurableProtocolLineChainV2 = "linechain-e3-v2"
+)
 
 // LeaseTasksWithApprovalGate leases the same task set as LeaseTasks while
 // gating one exact approval plugin/action pair. The approval lookup, current
@@ -1323,6 +1480,20 @@ func onlyGenericTaskDeliveries(deliveries []TaskDelivery) bool {
 }
 
 func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, plugin, action string, allowed bool) ([]TaskDelivery, error) {
+	return s.leaseTaskDeliveries(nodeID, limit, plugin, action, allowed, false)
+}
+
+func (s *Store) LeaseTaskDeliveriesWithDurableProtocols(nodeID string, limit int, netGuardAllowed, lineChainAllowed bool) ([]TaskDelivery, error) {
+	return s.LeaseTaskDeliveriesWithLineChainValidator(nodeID, limit, netGuardAllowed, lineChainAllowed, nil)
+}
+
+type LineChainFirstLeaseValidator func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error
+
+func (s *Store) LeaseTaskDeliveriesWithLineChainValidator(nodeID string, limit int, netGuardAllowed, lineChainAllowed bool, validate LineChainFirstLeaseValidator) ([]TaskDelivery, error) {
+	return s.leaseTaskDeliveries(nodeID, limit, "nft", "apply-ruleset:netguard-v1", netGuardAllowed, lineChainAllowed, validate)
+}
+
+func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action string, allowed, lineChainAllowed bool, validate ...LineChainFirstLeaseValidator) ([]TaskDelivery, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
@@ -1332,6 +1503,50 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 	staged.Tasks = make(map[string]model.Task, len(s.state.Tasks))
 	for id, task := range s.state.Tasks {
 		staged.Tasks[id] = task
+	}
+	staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+	for id, approval := range s.state.Approvals {
+		staged.Approvals[id] = approval
+	}
+	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+	var lineChainValidator LineChainFirstLeaseValidator
+	if len(validate) > 0 {
+		lineChainValidator = validate[0]
+	}
+	lineChainStaled := make(map[string]bool)
+	var lineChainAuditErr error
+	lineChainMapsCloned := true
+	staleLineChain := func(t model.Task, cause error) {
+		if lineChainMapsCloned == false {
+			staged.Approvals = make(map[string]model.Approval, len(s.state.Approvals))
+			for id, approval := range s.state.Approvals {
+				staged.Approvals[id] = approval
+			}
+			staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+			lineChainMapsCloned = true
+		}
+		approval := staged.Approvals[t.ApprovalID]
+		approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, true, "line_chain_inputs_changed"
+		approval.Reason, approval.UpdatedAt = "line chain inputs changed after approval", now
+		staged.Approvals[approval.ID] = approval
+		t.Status = model.TaskCancelled
+		staged.Tasks[t.ID] = t
+		attempt := staged.LineChainAttempts[t.ApprovalID]
+		attempt.Status, attempt.LastErrorCode, attempt.UpdatedAt = LineChainStatusFailed, "line_chain_inputs_changed", now
+		if cause != nil {
+			attempt.LastError = cause.Error()
+			if len(attempt.LastError) > 512 {
+				attempt.LastError = attempt.LastError[:512]
+			}
+		}
+		staged.LineChainAttempts[t.ApprovalID] = attempt
+		failureAudit := lineChainFirstLeaseFailureAudit(approval, t, now, attempt.LastError)
+		if err := stageLineChainAuditEvidence(&staged, staged, []model.AuditEvent{failureAudit}); err != nil {
+			lineChainAuditErr = err
+			return
+		}
+		staged.LineChainGraphRevision++
+		lineChainStaled[t.ID], stateChanged = true, true
 	}
 	ids := make([]string, 0, len(staged.Tasks))
 	for id := range staged.Tasks {
@@ -1344,20 +1559,26 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 		}
 		return a.CreatedAt.Before(b.CreatedAt)
 	})
-	gated := func(t model.Task) (isGated, eligible bool) {
+	gated := func(t model.Task) (protocol string, eligible bool) {
 		if plugin == "" || action == "" || t.ApprovalID == "" {
-			return false, true
+			return "", true
 		}
 		approval, ok := s.state.Approvals[t.ApprovalID]
 		if !ok {
-			return false, false
+			return "", false
+		}
+		if approval.Plugin == "singbox-linechain" && approval.Service == "network/lines" &&
+			(approval.Method == "chain_set_apply" || approval.Method == "chain_remove_apply") && strings.HasPrefix(approval.Action, "apply-line-chain:") {
+			attempt, attemptOK := s.state.LineChainAttempts[approval.ID]
+			return DurableProtocolLineChainV2, lineChainAllowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID &&
+				attemptOK && attempt.Status == LineChainStatusApplying && attempt.SourceNodeID == nodeID
 		}
 		if approval.Plugin != plugin || approval.Action != action {
-			return false, true
+			return "", true
 		}
 		binding, bindingOK := s.state.GuardBindings[nodeID]
 		planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
-		return true, allowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID && bindingOK && strings.EqualFold(binding.LastPlanSHA, planSHA)
+		return DurableProtocolNetGuardV1, allowed && approval.Status == model.ApprovalApproved && approval.NodeID == nodeID && bindingOK && strings.EqualFold(binding.LastPlanSHA, planSHA)
 	}
 
 	// Only the explicitly gated NetGuard action opts into durable same-lease
@@ -1369,8 +1590,8 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 			break
 		}
 		t := staged.Tasks[id]
-		isGated, current := gated(t)
-		if !isGated || !current || !taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts) {
+		protocol, current := gated(t)
+		if protocol == "" || !current || !taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts) {
 			continue
 		}
 		// A lease is a durable delivery token, not a one-shot HTTP response. If
@@ -1379,22 +1600,30 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 		// can execute, so this closes the lost-response hole without creating a
 		// second execution authority.
 		if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
+			if protocol == DurableProtocolLineChainV2 {
+				attempt := s.state.LineChainAttempts[t.ApprovalID]
+				scriptSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(t.Script)))
+				approval := s.state.Approvals[t.ApprovalID]
+				if attempt.IssuedTaskID != t.ID || attempt.IssuedLeaseID != lease.LeaseID || attempt.IssuedScriptSHA256 != scriptSHA || attempt.IssuedArtifactSHA256 != approval.ArtifactDigest {
+					return nil, ErrTaskTransitionConflict
+				}
+			}
 			redelivered := t
 			redelivered.Status = model.TaskLeased
 			redelivered.LeaseID = lease.LeaseID
 			redelivered.LeasedBy = nodeID
 			redelivered.StartedAt = lease.StartedAt
-			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true})
+			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true, DurableProtocol: protocol})
 			continue
 		}
 		if t.LeasedBy == nodeID && t.LeaseID != "" {
 			redelivered := t
 			redelivered.Status = model.TaskLeased
-			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true})
+			out = append(out, TaskDelivery{Task: redelivered, DurableResult: true, DurableProtocol: protocol})
 			continue
 		}
 	}
-	if len(out) > 0 {
+	if len(out) > 0 && !stateChanged {
 		if err := s.confirmDurabilityLocked(); err != nil {
 			return nil, err
 		}
@@ -1410,10 +1639,37 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 			if len(out) >= limit {
 				break
 			}
+			if lineChainStaled[id] {
+				continue
+			}
 			t := staged.Tasks[id]
-			isGated, current := gated(t)
+			protocol, current := gated(t)
+			isGated := protocol != ""
 			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results) {
 				continue
+			}
+			if protocol == DurableProtocolLineChainV2 {
+				attempt := staged.LineChainAttempts[t.ApprovalID]
+				currentDefinition := staged.LineChainDefinitions[attempt.SourceLineUUID]
+				var validationErr error
+				if currentDefinition.Generation != attempt.BaseGeneration || currentDefinition.ArtifactSHA256 != attempt.BaseArtifactSHA256 || lineChainGraphHasCycle(staged.LineChainDefinitions, staged.LineChainAttempts) {
+					validationErr = ErrLineChainRevisionConflict
+				} else if lineChainValidator == nil {
+					validationErr = errors.New("line chain first lease validator is required")
+				} else {
+					validationErr = lineChainValidator(s.lineChainCompileStateSnapshotLocked(), staged.Approvals[t.ApprovalID], attempt, t)
+				}
+				if validationErr != nil {
+					staleLineChain(t, validationErr)
+					continue
+				}
+				if !lineChainMapsCloned {
+					staged.LineChainAttempts = cloneLineChainAttempts(staged.LineChainAttempts)
+					lineChainMapsCloned = true
+				}
+				attempt.FirstLeaseGraphRevision = staged.LineChainGraphRevision
+				attempt.UpdatedAt = now
+				staged.LineChainAttempts[t.ApprovalID] = attempt
 			}
 			leaseSecret, err := auth.NewRandomToken(24)
 			if err != nil {
@@ -1437,24 +1693,36 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 				t.StartedAt = now
 			}
 			staged.Tasks[id] = t
+			if protocol == DurableProtocolLineChainV2 {
+				attempt := staged.LineChainAttempts[t.ApprovalID]
+				attempt.IssuedTaskID, attempt.IssuedLeaseID = t.ID, leaseID
+				attempt.IssuedScriptSHA256 = fmt.Sprintf("%x", sha256.Sum256([]byte(t.Script)))
+				attempt.IssuedArtifactSHA256 = staged.Approvals[t.ApprovalID].ArtifactDigest
+				staged.LineChainAttempts[t.ApprovalID] = attempt
+			}
 			stateChanged = true
 			leased := t
 			leased.LeaseID = leaseID
 			leased.LeasedBy = nodeID
 			leased.StartedAt = now
-			out = append(out, TaskDelivery{Task: leased, DurableResult: isGated})
+			out = append(out, TaskDelivery{Task: leased, DurableResult: isGated, DurableProtocol: protocol})
 		}
 		return nil
 	}
-	if err := leaseFresh(true); err != nil {
-		return nil, err
-	}
 	if len(out) == 0 {
+		if err := leaseFresh(true); err != nil {
+			return nil, err
+		}
+	}
+	if len(out) == 0 && !stateChanged {
 		if err := leaseFresh(false); err != nil {
 			return nil, err
 		}
 	}
-	if len(out) == 0 {
+	if lineChainAuditErr != nil {
+		return nil, lineChainAuditErr
+	}
+	if len(out) == 0 && !stateChanged {
 		return out, nil
 	}
 	if !stateChanged {
@@ -1481,6 +1749,14 @@ func (s *Store) LeaseTaskDeliveriesWithApprovalGate(nodeID string, limit int, pl
 		return nil, err
 	}
 	return out, nil
+}
+
+func lineChainFirstLeaseFailureAudit(approval model.Approval, task model.Task, at time.Time, reason string) model.AuditEvent {
+	code := "line_chain_inputs_changed"
+	digest := sha256.Sum256([]byte("failed\x00" + approval.ID + "\x00" + task.ID + "\x00" + code))
+	metadata := map[string]string{"approval_id": approval.ID, "task_id": task.ID, "artifact_sha256": approval.ArtifactDigest, "error_code": code}
+	return model.AuditEvent{ID: "audit_linechain_" + fmt.Sprintf("%x", digest[:16]), At: at, ActorID: task.ActorID, TokenID: task.TokenID,
+		NodeID: approval.NodeID, Action: "linechain.failed", Scope: "network:apply", Decision: "deny", Reason: reason, Metadata: metadata}
 }
 
 func (s *Store) AddTaskResult(r model.TaskResult) error {
@@ -1599,6 +1875,21 @@ func taskLeaseMatches(task model.Task, nodeID, leaseID string) bool {
 	return task.LeasedBy == nodeID && task.LeaseID != "" && task.LeaseID == leaseID
 }
 
+// taskLeaseSafetyMargin bounds how long a lease may outlive its task timeout
+// before it is treated as dead. A zero start remains non-expiring because
+// legacy rows do not provide enough evidence to authorize re-execution.
+const taskLeaseSafetyMargin = 5 * time.Minute
+
+func taskLeaseExpired(startedAt time.Time, timeoutSec int) bool {
+	if startedAt.IsZero() {
+		return false
+	}
+	if timeoutSec <= 0 {
+		timeoutSec = 900
+	}
+	return time.Since(startedAt) > time.Duration(timeoutSec)*time.Second+taskLeaseSafetyMargin
+}
+
 func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult) bool {
 	if !contains(t.Targets, nodeID) {
 		return false
@@ -1612,10 +1903,16 @@ func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult)
 		}
 	}
 	if lease, ok := t.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
-		return false
+		if !taskLeaseExpired(lease.StartedAt, t.TimeoutSec) {
+			return false
+		}
 	}
+	// Backward-compatible single-lease tasks created before TargetLeases existed
+	// may be re-leased only when their recorded lease is certainly dead.
 	if t.LeasedBy == nodeID && t.LeaseID != "" {
-		return false
+		if !taskLeaseExpired(t.StartedAt, t.TimeoutSec) {
+			return false
+		}
 	}
 	return true
 }
@@ -1770,6 +2067,7 @@ func cloneTaskResultReceipts(in map[string]TaskResultReceipt) map[string]TaskRes
 var (
 	ErrTaskNotFound           = errors.New("task not found")
 	ErrTaskNotCancelable      = errors.New("only queued tasks can be cancelled")
+	ErrTaskDurableProtected   = errors.New("durable protocol task cannot be mutated through generic task management")
 	ErrTaskLeaseMismatch      = errors.New("task lease mismatch")
 	ErrTaskTransitionConflict = errors.New("task approval transition conflict")
 )
@@ -1786,6 +2084,9 @@ func (s *Store) CancelTask(id string) (model.Task, error) {
 	if !ok {
 		return model.Task{}, ErrTaskNotFound
 	}
+	if s.lineChainTaskLocked(t) {
+		return model.Task{}, ErrTaskDurableProtected
+	}
 	if t.Status != model.TaskQueued {
 		return model.Task{}, ErrTaskNotCancelable
 	}
@@ -1800,8 +2101,12 @@ func (s *Store) CancelTask(id string) (model.Task, error) {
 func (s *Store) DeleteTask(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.state.Tasks[id]; !ok {
+	task, ok := s.state.Tasks[id]
+	if !ok {
 		return ErrTaskNotFound
+	}
+	if s.lineChainTaskLocked(task) {
+		return ErrTaskDurableProtected
 	}
 	delete(s.state.Tasks, id)
 	for key, receipt := range s.state.TaskResultReceipts {
@@ -1821,6 +2126,25 @@ func (s *Store) DeleteTask(id string) error {
 	return s.Save()
 }
 
+// TaskUsesLineChainProtocol reports whether task mutation belongs to the E3
+// domain lifecycle rather than the generic task-management API.
+func (s *Store) TaskUsesLineChainProtocol(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task, ok := s.state.Tasks[id]
+	return ok && s.lineChainTaskLocked(task)
+}
+
+func (s *Store) lineChainTaskLocked(task model.Task) bool {
+	if task.ApprovalID == "" {
+		return false
+	}
+	approval, ok := s.state.Approvals[task.ApprovalID]
+	return ok && approval.Plugin == "singbox-linechain" && approval.Service == "network/lines" &&
+		(approval.Method == "chain_set_apply" || approval.Method == "chain_remove_apply") &&
+		strings.HasPrefix(approval.Action, "apply-line-chain:")
+}
+
 func (s *Store) AppendAudit(ev model.AuditEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1834,6 +2158,110 @@ func (s *Store) AppendAudit(ev model.AuditEvent) error {
 		return s.runtimeBoltHot.AppendAudit(ev)
 	}
 	return s.Save()
+}
+
+// AppendAuditIdempotent records required domain evidence exactly once by ID.
+// External audit sinks deduplicate before the staged JSON authority is
+// persisted, so a retry after any partial failure safely repairs the gap.
+func (s *Store) AppendAuditIdempotent(ev model.AuditEvent) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ev.ID == "" || ev.At.IsZero() || ev.Decision == "" {
+		return false, errors.New("idempotent audit requires id, at, and decision")
+	}
+	equal := func(a, b model.AuditEvent) bool {
+		left, _ := json.Marshal(a)
+		right, _ := json.Marshal(b)
+		return string(left) == string(right)
+	}
+	if frozen, ok := s.state.LineChainAuditEvidence[ev.ID]; ok && !equal(frozen, ev) {
+		return false, fmt.Errorf("audit id %q conflicts with frozen line chain evidence", ev.ID)
+	}
+	exists := false
+	for _, current := range s.state.Audit {
+		if current.ID != ev.ID {
+			continue
+		}
+		if !equal(current, ev) {
+			return false, fmt.Errorf("audit id %q conflicts with existing evidence", ev.ID)
+		}
+		exists = true
+		break
+	}
+	if s.wal != nil {
+		if _, err := s.wal.AppendIdempotent(ev); err != nil {
+			return false, err
+		}
+	}
+	if s.runtimeBoltHot != nil {
+		hotEvents, err := s.runtimeBoltHot.AuditEvents()
+		if err != nil {
+			return false, err
+		}
+		hotExists := false
+		for _, current := range hotEvents {
+			if current.ID == ev.ID {
+				if !equal(current, ev) {
+					return false, fmt.Errorf("hot audit id %q conflicts with existing evidence", ev.ID)
+				}
+				hotExists = true
+				break
+			}
+		}
+		if !hotExists {
+			if err := s.runtimeBoltHot.AppendAudit(ev); err != nil {
+				return false, err
+			}
+		}
+	}
+	if exists {
+		return false, s.confirmDurabilityLocked()
+	}
+	staged := s.state
+	staged.Audit = append(append([]model.AuditEvent(nil), s.state.Audit...), ev)
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return committed, err
+}
+
+func (s *Store) AuditEventByID(id string) (model.AuditEvent, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if event, ok := s.state.LineChainAuditEvidence[id]; ok {
+		return event, true
+	}
+	for _, event := range s.state.Audit {
+		if event.ID == id {
+			return event, true
+		}
+	}
+	return model.AuditEvent{}, false
+}
+
+// PendingLineChainAuditEvidence returns transition-owned evidence that has not
+// yet been copied into the ordinary audit sink. Callers use it to repair a
+// committed transition after a lost response or sink failure.
+func (s *Store) PendingLineChainAuditEvidence() []model.AuditEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing := make(map[string]bool, len(s.state.Audit))
+	for _, event := range s.state.Audit {
+		existing[event.ID] = true
+	}
+	ids := make([]string, 0, len(s.state.LineChainAuditEvidence))
+	for id := range s.state.LineChainAuditEvidence {
+		if !existing[id] {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	out := make([]model.AuditEvent, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, s.state.LineChainAuditEvidence[id])
+	}
+	return out
 }
 
 // AuditWALVerify re-reads the append-only audit WAL and validates its hash chain.
@@ -1890,15 +2318,35 @@ func (s *Store) PutKV(entry model.KVEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry.UpdatedAt = time.Now().UTC()
-	s.state.KV[entry.Bucket+"/"+entry.Key] = entry
-	return s.Save()
+	staged := s.state
+	staged.KV = cloneKVEntries(s.state.KV)
+	staged.KV[entry.Bucket+"/"+entry.Key] = entry
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
 }
 
 func (s *Store) DeleteKV(bucket, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.state.KV, bucket+"/"+key)
-	return s.Save()
+	staged := s.state
+	staged.KV = cloneKVEntries(s.state.KV)
+	delete(staged.KV, bucket+"/"+key)
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
+}
+
+func cloneKVEntries(entries map[string]model.KVEntry) map[string]model.KVEntry {
+	cloned := make(map[string]model.KVEntry, len(entries))
+	for key, entry := range entries {
+		cloned[key] = entry
+	}
+	return cloned
 }
 
 func (s *Store) KV(bucket string) []model.KVEntry {

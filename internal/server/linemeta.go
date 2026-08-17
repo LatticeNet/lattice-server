@@ -18,9 +18,10 @@ import (
 // persisted in the KV bucket below, and the schema-v2 sidecar file rendered here
 // carries it onto each sing-box node.
 const (
-	lineUUIDKVBucket     = "vpnmeta/lineuuid"
-	lineMetadataSchemaV2 = "lattice.singbox-metadata.v2"
-	lineMetadataWriter   = "lattice-server"
+	lineUUIDKVBucket      = "vpnmeta/lineuuid"
+	lineUUIDOwnerKVBucket = "vpnmeta/lineuuid-owner"
+	lineMetadataSchemaV2  = "lattice.singbox-metadata.v2"
+	lineMetadataWriter    = "lattice-server"
 	// lineMetadataPath is the on-box sidecar location. It must stay OUTSIDE the
 	// sing-box -C directory's *.json glob — stock sing-box rejects unknown config
 	// keys, so the metadata file is never consumed by the core (design-15 §4.3).
@@ -30,21 +31,29 @@ const (
 // ensureLineUUID returns the persisted line_uuid for a line_hash_id, allocating
 // and persisting a fresh UUIDv4 on first sight. Idempotent; serialized by
 // s.lineUUIDMu so concurrent read-model builds cannot double-allocate.
-func (s *Server) ensureLineUUID(lineHashID string) (string, error) {
+func (s *Server) ensureLineUUID(lineHashID, nodeID string) (string, error) {
 	lineHashID = strings.TrimSpace(lineHashID)
-	if lineHashID == "" {
-		return "", errors.New("line_hash_id is required")
+	nodeID = strings.TrimSpace(nodeID)
+	if lineHashID == "" || nodeID == "" {
+		return "", errors.New("line_hash_id and node_id are required")
 	}
 	s.lineUUIDMu.Lock()
 	defer s.lineUUIDMu.Unlock()
-	if e, ok := s.store.KVEntry(lineUUIDKVBucket, lineHashID); ok && strings.TrimSpace(e.Value) != "" {
-		return e.Value, nil
+	uuidByHash, ownerByHash := s.store.LineUUIDAuthoritySnapshot()
+	if uuid := strings.TrimSpace(uuidByHash[lineHashID]); uuid != "" {
+		if owner := strings.TrimSpace(ownerByHash[lineHashID]); owner != "" && owner != nodeID {
+			return "", fmt.Errorf("line_uuid authority belongs to node %s", owner)
+		}
+		if err := s.putLineUUIDAuthority(lineHashID, uuid, nodeID); err != nil {
+			return "", err
+		}
+		return uuid, nil
 	}
 	uuid, err := newProxyUUID()
 	if err != nil {
 		return "", err
 	}
-	if err := s.store.PutKV(model.KVEntry{Bucket: lineUUIDKVBucket, Key: lineHashID, Value: uuid}); err != nil {
+	if err := s.putLineUUIDAuthority(lineHashID, uuid, nodeID); err != nil {
 		return "", err
 	}
 	return uuid, nil

@@ -226,8 +226,8 @@ func TestBrokerRPCCallRequiresCapability(t *testing.T) {
 		t.Fatalf("ungranted: want ErrRPCDenied, got %v", err)
 	}
 
-	// grant -> success, allow audited
-	reg.Allow("caller.plugin", "owner.plugin/nodes")
+	// immutable generation grant -> success, allow audited
+	caller.rpcGrant = RPCGrant{"owner.plugin/nodes": {"export": {}}}
 	out, err := caller.RPCCall(context.Background(), "owner.plugin/nodes", "export", nil)
 	if err != nil || string(out) != "data" {
 		t.Fatalf("granted call: out=%q err=%v", out, err)

@@ -9,8 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	sdkplugin "github.com/LatticeNet/lattice-sdk/plugin"
 )
 
 // makeBundle writes a bundle dir containing a manifest.json and an artifact shell
@@ -59,6 +62,142 @@ func TestSystemRunnerHappyPath(t *testing.T) {
 	if !resp.OK || resp.Message != "hi" || string(resp.Result) != `{"v":1}` {
 		t.Fatalf("unexpected response: %+v result=%s", resp, resp.Result)
 	}
+}
+
+func TestSystemInvocationLeaseRejectsCanceledCallerBeforeDispatch(t *testing.T) {
+	canary := filepath.Join(t.TempDir(), "started")
+	loaded := makeBundle(t, "p.cancel-before-dispatch", "#!/bin/sh\ntouch "+canary+"\n", "")
+	r := newRunner(t, SystemRunnerOptions{})
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := r.AcquireInvocation(loaded.Manifest.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := lease.Invoke(ctx, InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Invoke error=%v want context.Canceled", err)
+	}
+	lease.Release()
+	if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled invocation dispatched: stat err=%v", err)
+	}
+}
+
+func TestSystemRunnerStopCancelsAcquiredV1BeforeDispatch(t *testing.T) {
+	canary := filepath.Join(t.TempDir(), "started")
+	loaded := makeBundle(t, "p.stop-before-dispatch", "#!/bin/sh\ntouch "+canary+"\n", "")
+	r := newRunner(t, SystemRunnerOptions{})
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := r.AcquireInvocation(loaded.Manifest.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopDone := make(chan error, 1)
+	go func() {
+		stopDone <- r.Stop(t.Context(), RunnerStopRequest{PluginID: loaded.Manifest.ID, Generation: 1})
+	}()
+	systemLease := lease.(*systemInvocationLease)
+	select {
+	case <-systemLease.ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("generation root was not canceled")
+	}
+	if _, err := lease.Invoke(context.Background(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Invoke error=%v want context.Canceled", err)
+	}
+	lease.Release()
+	if err := <-stopDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stopped invocation dispatched: stat err=%v", err)
+	}
+}
+
+type leaseContextKey struct{}
+
+type contextObservingLog struct {
+	value    any
+	deadline bool
+}
+
+func (l *contextObservingLog) Write(ctx context.Context, _ HostLogEntry) error {
+	l.value = ctx.Value(leaseContextKey{})
+	_, l.deadline = ctx.Deadline()
+	return nil
+}
+
+func TestSystemInvocationLeasePreservesCallerValuesAndDeadline(t *testing.T) {
+	loaded := makeBundle(t, "p.lease-context", "#!/bin/sh\nread line\necho '{\"host_call\":{\"id\":\"h1\",\"method\":\"log.write\",\"params\":{\"level\":\"info\",\"message\":\"seen\"}}}'\nread response <&3\necho '{\"ok\":true}'\n", "")
+	observer := &contextObservingLog{}
+	broker := newTestBroker(t, loaded.Manifest.ID, []string{"log:write"}, HostServices{Log: observer})
+	r := newRunner(t, SystemRunnerOptions{})
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded, Broker: broker}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := r.AcquireInvocation(loaded.Manifest.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	ctx := context.WithValue(context.Background(), leaseContextKey{}, "bound")
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	if _, err := lease.Invoke(ctx, InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if observer.value != "bound" || !observer.deadline {
+		t.Fatalf("caller context lost: value=%v deadline=%v", observer.value, observer.deadline)
+	}
+}
+
+func TestSystemRunnerStopWaitsForActiveV1ProcessReap(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	loaded := makeBundle(t, "p.stop-active-v1", "#!/bin/sh\nread line\necho $$ > '"+pidFile+"'\nsleep 30\n", "")
+	r := newRunner(t, SystemRunnerOptions{StopGrace: 10 * time.Millisecond})
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	invokeDone := make(chan error, 1)
+	go func() {
+		_, err := r.Invoke(context.Background(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Action: "block"})
+		invokeDone <- err
+	}()
+	var pid int
+	deadline := time.After(5 * time.Second)
+	for pid == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("v1 helper did not start")
+		default:
+			data, _ := os.ReadFile(pidFile)
+			_, _ = fmt.Sscanf(string(data), "%d", &pid)
+		}
+	}
+	if err := r.Stop(t.Context(), RunnerStopRequest{PluginID: loaded.Manifest.ID, Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-invokeDone; err == nil {
+		t.Fatal("active v1 invocation unexpectedly succeeded")
+	}
+	assertProcessGroupGone(t, pid)
 }
 
 // Gate: arg-vector exec, no shell. Shell metacharacters in the payload reach the
@@ -119,6 +258,286 @@ func TestSystemRunnerEnvAllowlist(t *testing.T) {
 	}
 	if got.Secret != "" {
 		t.Fatalf("non-allowlisted var leaked: %q", got.Secret)
+	}
+}
+
+func TestSystemRunnerChildEnvDropsReservedRuntimeVariables(t *testing.T) {
+	for _, name := range []string{"LATTICE_RUNTIME_PROTOCOL", "LATTICE_RUNTIME_GENERATION", "LATTICE_HOST_RESPONSE_FD"} {
+		t.Setenv(name, "hostile")
+	}
+	r := newRunner(t, SystemRunnerOptions{EnvAllowlist: []string{"LATTICE_RUNTIME_PROTOCOL", "LATTICE_RUNTIME_GENERATION", "LATTICE_HOST_RESPONSE_FD"}})
+	for _, entry := range r.childEnv() {
+		if strings.HasPrefix(entry, "LATTICE_RUNTIME_") || strings.HasPrefix(entry, "LATTICE_HOST_RESPONSE_FD=") {
+			t.Fatalf("reserved environment escaped allowlist: %q", entry)
+		}
+	}
+}
+
+func TestSystemRunnerV1FailureNeverReturnsRawStderr(t *testing.T) {
+	const secret = "SECRET-CANARY-DO-NOT-PERSIST"
+	var logs []string
+	r := newRunner(t, SystemRunnerOptions{Logf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }})
+	loaded := makeBundle(t, "p.stderr-secret", "#!/bin/sh\necho '"+secret+"' >&2\nexit 1\n", "")
+	_, err := startInvoke(t, r, loaded, "fail", nil)
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("external error leaked stderr: %v", err)
+	}
+	if len(logs) == 0 || strings.Contains(strings.Join(logs, "\n"), secret) || !strings.Contains(strings.Join(logs, "\n"), "stderr_bytes=") {
+		t.Fatalf("metadata-only log contract violated: %v", logs)
+	}
+}
+
+func TestSystemRunnerV1EnforcesCumulativeStdoutAcrossBlankLines(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{})
+	loaded := makeBundle(t, "p.blank-flood", "#!/bin/sh\nread line\ni=0; while [ $i -lt 100 ]; do echo; i=$((i+1)); done\necho '{\"ok\":true}'\n", "")
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 64, StderrBytes: 64, HostCalls: 0}}})
+	if err == nil || !strings.Contains(err.Error(), "cumulative stdout limit") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestSystemRunnerV1CountsCRLFWireBytes(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{})
+	loaded := makeBundle(t, "p.crlf-flood", "#!/bin/sh\nread line\ni=0; while [ $i -lt 30 ]; do printf '\\r\\n'; i=$((i+1)); done\nprintf '{\"ok\":true}'\n", "")
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 64, StderrBytes: 64, HostCalls: 0}}})
+	if err == nil || !strings.Contains(err.Error(), "cumulative stdout limit") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestSystemRunnerV1UnterminatedFrameExactWireBudget(t *testing.T) {
+	const frame = `{"ok":true}`
+	for _, tc := range []struct {
+		name    string
+		budget  int
+		wantErr bool
+	}{
+		{name: "exact", budget: len(frame)},
+		{name: "one-over", budget: len(frame) - 1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t, SystemRunnerOptions{})
+			loaded := makeBundle(t, "p.unterminated-"+tc.name, "#!/bin/sh\nread line\nprintf '"+frame+"'\n", "")
+			if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+				t.Fatal(err)
+			}
+			resp, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: tc.budget, StderrBytes: 64, HostCalls: 0}}})
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "stdout") {
+					t.Fatalf("response=%+v error=%v", resp, err)
+				}
+			} else if err != nil || !resp.OK {
+				t.Fatalf("response=%+v error=%v", resp, err)
+			}
+		})
+	}
+}
+
+func TestSystemRunnerV1ManualPipeOwnershipDoesNotLeakFDs(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{CrashThreshold: 100})
+	loaded := makeBundle(t, "p.fd-ownership", "#!/bin/sh\nread line\ncase \"$line\" in *fail*) exit 1 ;; esac\nprintf '{\"ok\":true}'\n", "")
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	before := countOpenFDs(t)
+	for i := 0; i < 25; i++ {
+		if _, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Action: "ok"}); err != nil {
+			t.Fatalf("successful invocation %d: %v", i, err)
+		}
+		if _, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Action: "fail"}); err == nil {
+			t.Fatalf("failed invocation %d succeeded", i)
+		}
+	}
+	after := countOpenFDs(t)
+	if after > before+2 {
+		t.Fatalf("v1 invocations leaked descriptors: before=%d after=%d", before, after)
+	}
+}
+
+func TestSystemRunnerRetireExposesGenerationCleanupResidual(t *testing.T) {
+	loaded := makeBundle(t, "p.cleanup-residual", "#!/bin/sh\nread line\nprintf '{\"ok\":true}'\n", "")
+	r := newRunner(t, SystemRunnerOptions{})
+	removeErr := errors.New("remove workdir failed")
+	r.removeAll = func(string) error { return removeErr }
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 1); err != nil {
+		t.Fatal(err)
+	}
+	err := r.RetireGeneration(t.Context(), loaded.Manifest.ID, 1)
+	var cleanupErr *GenerationCleanupError
+	if !errors.As(err, &cleanupErr) || !errors.Is(err, removeErr) || cleanupErr.PluginID != loaded.Manifest.ID || cleanupErr.Generation != 1 {
+		t.Fatalf("retirement residual=%v typed=%+v", err, cleanupErr)
+	}
+}
+
+func TestTransportWaitAbortReportsTypedResidual(t *testing.T) {
+	tm := &systemWorkerTransport{pgid: 4242, abortDone: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := tm.waitAbort(ctx)
+	var residual *processGroupResidualError
+	if !errors.As(err, &residual) || residual.PGID != 4242 || residual.Stage != "abort-pending" {
+		t.Fatalf("waitAbort error=%v residual=%#v", err, residual)
+	}
+}
+
+func countOpenFDs(t *testing.T) int {
+	t.Helper()
+	count := 0
+	for fd := 0; fd < 1024; fd++ {
+		var stat syscall.Stat_t
+		if syscall.Fstat(fd, &stat) == nil {
+			count++
+		}
+	}
+	return count
+}
+
+func TestSystemRunnerV1EnforcesCumulativeStdoutAcrossHostCalls(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{})
+	script := "#!/bin/sh\nread line\ni=1; while [ $i -le 4 ]; do echo '{\"host_call\":{\"id\":\"h'$i'\",\"method\":\"log.write\",\"params\":{\"level\":\"info\",\"message\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}}}'; read resp <&3; i=$((i+1)); done\necho '{\"ok\":true}'\n"
+	loaded := makeBundle(t, "p.host-flood", script, "")
+	broker := newTestBroker(t, loaded.Manifest.ID, []string{"log:write"}, HostServices{Log: noopTestLog{}})
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded, Broker: broker}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 5_000, StdoutBytes: 300, StderrBytes: 64, HostCalls: 8}}})
+	if err == nil || !strings.Contains(err.Error(), "cumulative stdout limit") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestSystemRunnerV1NonzeroExitAfterResultReturnsWarning(t *testing.T) {
+	var logs []string
+	r := newRunner(t, SystemRunnerOptions{Logf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }})
+	loaded := makeBundle(t, "p.exit-after-result", "#!/bin/sh\nread line\necho '{\"ok\":true,\"result\":{\"done\":true}}'\nexit 7\n", "")
+	resp, err := startInvoke(t, r, loaded, "run", nil)
+	if err != nil || !resp.OK || len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], "exit status 7") {
+		t.Fatalf("response=%+v err=%v", resp, err)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "exit status 7") {
+		t.Fatalf("logs=%v", logs)
+	}
+}
+
+func TestSystemRunnerV1ReplyThenDeadlineIsFailureAndReaped(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	r := newRunner(t, SystemRunnerOptions{StopGrace: 10 * time.Millisecond})
+	loaded := makeBundle(t, "p.reply-hang", "#!/bin/sh\nread line\necho $$ > '"+pidFile+"'\necho '{\"ok\":true}'\nsleep 30\n", "")
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 50, StdoutBytes: 1024, StderrBytes: 1024, HostCalls: 0}}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v want deadline", err)
+	}
+	data, readErr := os.ReadFile(pidFile)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var pid int
+	_, _ = fmt.Sscanf(string(data), "%d", &pid)
+	assertProcessGroupGone(t, pid)
+}
+
+func TestSystemRunnerV1TimeoutKillsIgnoreTermDescendantHoldingPipes(t *testing.T) {
+	dir := t.TempDir()
+	pgidFile := filepath.Join(dir, "pgid")
+	childFile := filepath.Join(dir, "child")
+	r := newRunner(t, SystemRunnerOptions{StopGrace: 20 * time.Millisecond})
+	script := "#!/bin/sh\nread line\necho $$ > '" + pgidFile + "'\n(trap '' TERM; while :; do sleep 1; done) &\necho $! > '" + childFile + "'\nexit 0\n"
+	loaded := makeBundle(t, "p.descendant-timeout", script, "")
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Constraints: InvokeConstraints{Budget: &InvokeBudgetSpec{TimeoutMS: 100, StdoutBytes: 1024, StderrBytes: 1024, HostCalls: 0}}})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error=%v want deadline", err)
+	}
+	pgid := waitForPIDFile(t, pgidFile)
+	child := waitForPIDFile(t, childFile)
+	assertPIDGone(t, child)
+	if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("v1 process group %d survived timeout: %v", pgid, err)
+	}
+}
+
+func TestSystemRunnerV1ResultKillsIgnoreTermDescendantHoldingPipes(t *testing.T) {
+	dir := t.TempDir()
+	pgidFile := filepath.Join(dir, "pgid")
+	childFile := filepath.Join(dir, "child")
+	r := newRunner(t, SystemRunnerOptions{StopGrace: 20 * time.Millisecond})
+	script := "#!/bin/sh\nread line\necho $$ > '" + pgidFile + "'\n(trap '' TERM; while :; do sleep 1; done) &\necho $! > '" + childFile + "'\necho '{\"ok\":true,\"result\":{\"done\":true}}'\nexit 0\n"
+	loaded := makeBundle(t, "p.descendant-result", script, "")
+	resp, err := startInvoke(t, r, loaded, "run", nil)
+	if err != nil || !resp.OK {
+		t.Fatalf("response=%+v err=%v", resp, err)
+	}
+	pgid := waitForPIDFile(t, pgidFile)
+	child := waitForPIDFile(t, childFile)
+	assertPIDGone(t, child)
+	if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("v1 process group %d survived result teardown: %v", pgid, err)
+	}
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var pid int
+			if _, err := fmt.Sscanf(string(data), "%d", &pid); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("PID file %s was not populated", path)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func assertPIDGone(t *testing.T, pid int) {
+	t.Helper()
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("process %d survived: %v", pid, err)
+	}
+}
+
+func TestSystemRunnerPrepareCanceledWhileQueuedLeavesNoArtifacts(t *testing.T) {
+	runtimeDir := t.TempDir()
+	r := newRunner(t, SystemRunnerOptions{RuntimeDir: runtimeDir})
+	loaded := makeBundle(t, "p.queued-cancel", "#!/bin/sh\nexit 0\n", "")
+	lock := r.startLock(loaded.Manifest.ID)
+	lock.Lock()
+	waiting := make(chan struct{})
+	r.beforeStartLock = func() { close(waiting) }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Prepare(ctx, RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded})
+		done <- err
+	}()
+	<-waiting
+	cancel()
+	lock.Unlock()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Prepare error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runtimeDir, loaded.Manifest.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canceled queued Prepare left artifacts: %v", err)
 	}
 }
 
@@ -309,7 +728,7 @@ func TestSystemRunnerHonorsZeroHostCallBudget(t *testing.T) {
 	r := newRunner(t, SystemRunnerOptions{})
 	script := `#!/bin/sh
 read req
-echo '{"host_call":{"id":"kv","method":"kv.get","params":{"key":"x"}}}'
+echo '{"host_call":{"id":"h1","method":"kv.get","params":{"key":"x"}}}'
 `
 	loaded := makeBundle(t, "p.nohostcalls", script, "")
 	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err != nil {
@@ -353,6 +772,46 @@ func TestSystemRunnerV2StagesVerifiedSelectedRuntime(t *testing.T) {
 	resp, err := startInvoke(t, r, loaded, "call", nil)
 	if err != nil || !resp.OK || string(resp.Result) != `{"v2":true}` {
 		t.Fatalf("v2 runtime failed: resp=%+v err=%v", resp, err)
+	}
+}
+
+func TestSystemRunnerV2RejectsZeroGenerationBeforeStaging(t *testing.T) {
+	runtimeDir := t.TempDir()
+	r := NewSystemRunner(SystemRunnerOptions{RuntimeDir: runtimeDir})
+	loaded := makeBundle(t, "p.zero", "#!/bin/sh\nexit 0\n", "")
+	loaded.Manifest.Runtime = &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV2}
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded}); err == nil || !strings.Contains(err.Error(), "generation 0") {
+		t.Fatalf("zero generation error=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runtimeDir, loaded.Manifest.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("zero generation touched runtime path: %v", err)
+	}
+}
+
+func TestSystemRunnerV2PassesGenerationEnvironmentAboveOne(t *testing.T) {
+	t.Setenv("LATTICE_TEST_V2_HELPER", "1")
+	binary, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, artifactFileName), binary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	loaded := Loaded{
+		Manifest:   Manifest{ID: "p.genenv", Name: "generation env", Type: TypeSystem, Runtime: &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV2}},
+		BundlePath: dir,
+	}
+	r := NewSystemRunner(SystemRunnerOptions{RuntimeDir: t.TempDir(), EnvAllowlist: []string{"LATTICE_TEST_V2_HELPER"}})
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 7, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	rsp, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 7, Action: "generation"})
+	if err != nil || !rsp.OK {
+		t.Fatalf("generation 7 invoke response=%+v err=%v", rsp, err)
+	}
+	if err := r.Stop(t.Context(), RunnerStopRequest{PluginID: loaded.Manifest.ID, Generation: 7}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -409,9 +868,9 @@ func TestSystemRunnerHostCallBridge(t *testing.T) {
 	r := newRunner(t, SystemRunnerOptions{})
 	script := `#!/bin/sh
 read req
-echo '{"host_call":{"id":"rpc","method":"rpc.call","params":{"service":"test.svc","method":"list","request":{"want":"nodes"}}}}'
+echo '{"host_call":{"id":"h1","method":"rpc.call","params":{"service":"test.svc","method":"list","request":{"want":"nodes"}}}}'
 read rpc <&3
-echo '{"host_call":{"id":"http","method":"http.do","params":{"method":"POST","url":"https://example.com/api","body":"payload"}}}'
+echo '{"host_call":{"id":"h2","method":"http.do","params":{"method":"POST","url":"https://example.com/api","body":"payload"}}}'
 read http <&3
 printf '{"ok":true,"result":{"rpc":%s,"http":%s}}\n' "$rpc" "$http"
 `
@@ -433,6 +892,7 @@ printf '{"ok":true,"result":{"rpc":%s,"http":%s}}\n' "$rpc" "$http"
 	if err != nil {
 		t.Fatal(err)
 	}
+	broker.rpcGrant = RPCGrant{"test.svc": {"list": {}}}
 	if _, err := r.Start(context.Background(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Loaded: loaded, Broker: broker}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -466,6 +926,61 @@ printf '{"ok":true,"result":{"rpc":%s,"http":%s}}\n' "$rpc" "$http"
 	}
 	if !got.HTTP.HostResponse.OK || got.HTTP.HostResponse.Result.StatusCode != 202 || services.httpCalls != 1 {
 		t.Fatalf("http host response wrong: %+v calls=%d", got.HTTP.HostResponse, services.httpCalls)
+	}
+}
+
+func TestSystemRunnerFreshHostResponseOversizeThenSmallStaysSynchronized(t *testing.T) {
+	r := newRunner(t, SystemRunnerOptions{})
+	script := `#!/bin/sh
+read req
+echo '{"host_call":{"id":"h1","method":"rpc.call","params":{"service":"test.svc","method":"get","request":{"sequence":1}}}}'
+IFS= read -r exact <&3
+case "$exact" in *'"ok":true'*) exact_ok=true ;; *) exact_ok=false ;; esac
+echo '{"host_call":{"id":"h2","method":"rpc.call","params":{"service":"test.svc","method":"get","request":{"sequence":2}}}}'
+IFS= read -r over <&3
+case "$over" in *'"error":"host response exceeds protocol limits"'*) over_ok=true ;; *) over_ok=false ;; esac
+echo '{"host_call":{"id":"h3","method":"rpc.call","params":{"service":"test.svc","method":"get","request":{"sequence":3}}}}'
+IFS= read -r small <&3
+case "$small" in *'"small":true'*) small_ok=true ;; *) small_ok=false ;; esac
+printf '{"ok":true,"result":{"exact_ok":%s,"over_ok":%s,"small_ok":%s}}\n' "$exact_ok" "$over_ok" "$small_ok"
+`
+	loaded := makeBundle(t, "p.response-boundary", script, "")
+	loaded.Manifest.Capabilities = []string{"rpc:call"}
+	loaded.Capabilities = []string{"rpc:call"}
+	services := &fakeHostServices{kvValues: map[string][]byte{}}
+	callCount := 0
+	broker, err := NewBroker(loaded, HostServices{RPC: fakeRPCHost(func(_ context.Context, _, _, _ string, _ []byte) ([]byte, error) {
+		callCount++
+		switch callCount {
+		case 1:
+			return exactHostPayload(sdkplugin.DefaultMaxHostResponsePayloadBytes), nil
+		case 2:
+			return exactHostPayload(sdkplugin.DefaultMaxHostResponsePayloadBytes + 1), nil
+		default:
+			return []byte(`{"small":true}`), nil
+		}
+	}), Audit: services})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.rpcGrant = RPCGrant{"test.svc": {"get": {}}}
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 1, Loaded: loaded, Broker: broker}); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 1, Action: "call"})
+	if err != nil || !resp.OK || callCount != 3 {
+		t.Fatalf("response=%+v calls=%d error=%v", resp, callCount, err)
+	}
+	var result struct {
+		ExactOK bool `json:"exact_ok"`
+		OverOK  bool `json:"over_ok"`
+		SmallOK bool `json:"small_ok"`
+	}
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.ExactOK || !result.OverOK || !result.SmallOK {
+		t.Fatalf("host response sequence=%+v", result)
 	}
 }
 
@@ -526,6 +1041,13 @@ func (f fakeRPCHost) Call(ctx context.Context, caller, service, method string, r
 	return f(ctx, caller, service, method, request)
 }
 
+func (f fakeRPCHost) CallGranted(ctx context.Context, caller string, grant RPCGrant, service, method string, request []byte) ([]byte, error) {
+	if _, ok := grant[service][method]; !ok {
+		return nil, ErrRPCDenied
+	}
+	return f(ctx, caller, service, method, request)
+}
+
 // Integration: RuntimeManager routes Invoke to the system runner, and refuses to
 // invoke a plugin backed by the noop runner.
 func TestRuntimeManagerInvokeRoutesToSystemRunner(t *testing.T) {
@@ -564,8 +1086,8 @@ func TestRuntimeManagerInvokeRoutesToSystemRunner(t *testing.T) {
 }
 
 func TestKVGetResponseDropsRawValueWhenLarge(t *testing.T) {
-	// The kv.get response rides one frame that the plugin scans with a 1 MiB
-	// cap. Carrying the value twice (raw + base64) doubles the frame; past
+	// The kv.get response rides one bounded response frame. Carrying the value
+	// twice (raw + base64) doubles the frame; past
 	// ~430 KiB of value the plugin dies mid-invocation and the runner sees a
 	// broken pipe. Base64-only past the small threshold keeps it inside.
 	big := make([]byte, 600<<10)

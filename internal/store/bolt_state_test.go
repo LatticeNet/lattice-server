@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1181,16 +1182,21 @@ func TestBoltStateRecordLevelSecretBucketsEncryptedAndRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wrongKey, err := OpenBoltState(path, testCipher(t))
+	beforeWrongKey, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer wrongKey.Close()
-	if _, _, err := wrongKey.User("u1"); err == nil {
-		t.Fatal("expected wrong key to fail record-level user decrypt")
+	wantWrongKey := sha256.Sum256(beforeWrongKey)
+	if wrongKey, err := OpenBoltState(path, testCipher(t)); err == nil {
+		wrongKey.Close()
+		t.Fatal("expected wrong key to fail before Bolt store opens")
 	}
-	if _, err := wrongKey.ExportState(); err == nil {
-		t.Fatal("expected wrong key to fail full bbolt export")
+	afterWrongKey, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sha256.Sum256(afterWrongKey); got != wantWrongKey {
+		t.Fatalf("wrong-key open changed Bolt digest: %x != %x", got, wantWrongKey)
 	}
 }
 

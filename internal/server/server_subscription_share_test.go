@@ -1004,4 +1004,19 @@ func TestSubscriptionShareExplicitTargetParameter(t *testing.T) {
 	if recF.Header().Get("Subscription-Userinfo") != "" {
 		t.Fatalf("noFlow response still carried Subscription-Userinfo: %q", recF.Header().Get("Subscription-Userinfo"))
 	}
+
+	// ?platform= is upstream's alias for ?target= and normalizes into the same
+	// variant: an aliased repeat of recA's request is a cache hit, not a render.
+	recG := httptest.NewRecorder()
+	s.handleSubscriptionShare(recG, shareRequest("/sub/team/"+token+"?platform=Stash&includeUnsupportedProxy=1", "curl/8"))
+	if recG.Code != http.StatusOK || recG.Body.String() != "for-Stash" || len(variants) != 3 {
+		t.Fatalf("platform alias should share target's cache entry: code=%d body=%q renders=%d", recG.Code, recG.Body.String(), len(variants))
+	}
+
+	// When both are present, target wins.
+	recH := httptest.NewRecorder()
+	s.handleSubscriptionShare(recH, shareRequest("/sub/team/"+token+"?target=sing-box&platform=Stash", "curl/8"))
+	if recH.Code != http.StatusOK || recH.Body.String() != "for-sing-box" || len(variants) != 3 {
+		t.Fatalf("target must win over platform: code=%d body=%q renders=%d", recH.Code, recH.Body.String(), len(variants))
+	}
 }

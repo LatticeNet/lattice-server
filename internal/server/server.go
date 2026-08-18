@@ -492,6 +492,7 @@ func New(opts Options) (*Server, error) {
 	s.pluginRPC.SetOwnerActive(s.pluginIsActive)
 	s.registerVPNCoreRPC()
 	s.registerNetworkPluginRPC()
+	s.registerSubStorePluginRPC()
 	// Derive vpn-core identities (VpnUser) from legacy ProxyUsers. Idempotent and
 	// additive — existing identities are untouched and ProxyUser stays the
 	// subscription-render substrate (design-12 S2).

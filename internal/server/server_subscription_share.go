@@ -215,8 +215,15 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	// client outright (validated against the bounded target set — this string
 	// enters the cache key), and includeUnsupportedProxy rides through to
 	// produce() under upstream's own flag name.
+	// Upstream also accepts ?platform= as an alias for ?target=; when both are
+	// present, target wins. The alias normalizes into the same variant, so the
+	// two spellings share one cache entry.
+	explicitTarget := strings.TrimSpace(r.URL.Query().Get("target"))
+	if explicitTarget == "" {
+		explicitTarget = strings.TrimSpace(r.URL.Query().Get("platform"))
+	}
 	variant := shareRenderVariant{
-		Target:             strings.TrimSpace(r.URL.Query().Get("target")),
+		Target:             explicitTarget,
 		IncludeUnsupported: requestBool(r, "includeUnsupportedProxy"),
 		PrettyYAML:         requestBool(r, "prettyYaml") || requestBool(r, "pretty-yaml"),
 		NoFlow:             requestBool(r, "noFlow"),

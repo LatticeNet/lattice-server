@@ -302,7 +302,7 @@ func TestSubscriptionShareStaleCacheHitRevalidatesAndClearsHeaderOnRecovery(t *t
 		calls++
 		return model.SubscriptionSnapshot{Raw: "last-good", Userinfo: "upload=2"}, nil
 	}
-	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		epoch, ok := s.subscriptionSnapshotEpoch("p", "graph", snap)
 		if !ok {
 			return renderedSubscription{}, errors.New("snapshot changed")
@@ -372,7 +372,7 @@ func TestSubscriptionSharePropagatesStaleAndRecoveryAcrossSiblingShares(t *testi
 		fetchCalls++
 		return model.SubscriptionSnapshot{}, errors.New("provider down")
 	}
-	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		return renderedSubscription{Body: []byte("rendered-" + share.ID), ContentType: "text/plain", Userinfo: snap.Userinfo,
 			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, FetchedAt: snap.FetchedAt}, nil
 	}
@@ -428,7 +428,7 @@ func TestSubscriptionShareRevisionMismatchRendersInsteadOfStampingReplacement(t 
 		s.subscriptionCache.PutSnapshot(key, []byte("replacement"), "text/plain", "replacement-ui", "new-version", "", false, now, now)
 		s.subscriptionBeforeCacheExtend = nil
 	}
-	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		return renderedSubscription{Body: []byte("rerendered"), ContentType: "text/plain", Userinfo: snap.Userinfo,
 			RevalidationVersion: subscriptionRevalidationVersion(snap), FetchedAt: snap.FetchedAt}, nil
 	}
@@ -457,7 +457,7 @@ func TestSubscriptionShareRejectsLateRenderCachePutAfterSourceTransition(t *test
 			started, release := make(chan struct{}), make(chan struct{})
 			var first sync.Once
 			renderCalls := 0
-			s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+			s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 				renderCalls++
 				blocked := false
 				first.Do(func() {
@@ -521,7 +521,7 @@ func TestSubscriptionShareFailsClosedWhenSourceChangesDuringBothRenderAttempts(t
 		t.Fatal(err)
 	}
 	calls := 0
-	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		calls++
 		publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "graph"})
 		publication.mu.Lock()
@@ -574,7 +574,7 @@ func TestSubscriptionShareCacheHitCannotObservePartialSourcePublication(t *testi
 					return model.SubscriptionSnapshot{Raw: "new"}, nil
 				}
 			}
-			s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+			s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 				body := "new-render"
 				if snap.Stale {
 					body = "stale-current"
@@ -717,7 +717,7 @@ func TestSubscriptionShareRevalidationCannotExtendAcrossPartialSourcePublication
 	}
 	extendStarted := make(chan struct{}, 1)
 	s.subscriptionCacheExtendWaiter = extendStarted
-	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		return renderedSubscription{Body: []byte("render-" + snap.Raw), ContentType: "text/plain",
 			RevalidationVersion: subscriptionRevalidationVersion(snap), FetchedAt: snap.FetchedAt}, nil
 	}
@@ -755,7 +755,7 @@ func TestPluginInvalidationRejectsBlockedOldRender(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	var first sync.Once
 	calls := 0
-	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		calls++
 		blocked := false
 		first.Do(func() { blocked = true; close(started) })
@@ -809,7 +809,7 @@ func TestSubscriptionFailureDiagnosticsAreSanitizedAtRestAndInAudit(t *testing.T
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "s"}}
 	mustUpsertShare(t, st, share)
 	s.subscriptionFetch = nil
-	s.subscriptionRender = func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error) {
+	s.subscriptionRender = func(context.Context, model.SubscriptionShare, string, string, shareRenderVariant, model.SubscriptionSnapshot) (renderedSubscription, error) {
 		return renderedSubscription{}, errors.New(canary)
 	}
 	rec := httptest.NewRecorder()
@@ -923,4 +923,85 @@ var requestIDInBody = regexp.MustCompile(`"request_id":"[^"]*"`)
 
 func stripRequestID(body string) string {
 	return requestIDInBody.ReplaceAllString(body, `"request_id":"<normalized>"`)
+}
+
+// The Sub-Store URL parity contract on the serve path: ?target= names the
+// client explicitly and reaches the plugin render, distinct targets cache
+// separately, an unknown target is denied like any other bad input, and
+// includeUnsupportedProxy rides through as a produce flag.
+func TestSubscriptionShareExplicitTargetParameter(t *testing.T) {
+	s, st := newShareTestServer(t)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	s.now = func() time.Time { return now }
+	token := strings.Repeat("a", 32)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true, DefaultFormat: "plain",
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}})
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "nodes", FetchedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		return model.SubscriptionSnapshot{Raw: "nodes", FetchedAt: now}, nil
+	}
+	var variants []shareRenderVariant
+	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, variant shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+		variants = append(variants, variant)
+		epoch, _ := s.subscriptionSnapshotEpoch("p", "graph", snap)
+		return renderedSubscription{Body: []byte("for-" + variant.Target), ContentType: "text/plain",
+			RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
+	}
+
+	// Stash and sing-box render and cache independently.
+	recA := httptest.NewRecorder()
+	s.handleSubscriptionShare(recA, shareRequest("/sub/team/"+token+"?target=Stash&includeUnsupportedProxy=1", "curl/8"))
+	recB := httptest.NewRecorder()
+	s.handleSubscriptionShare(recB, shareRequest("/sub/team/"+token+"?target=sing-box", "curl/8"))
+	if recA.Code != http.StatusOK || recA.Body.String() != "for-Stash" {
+		t.Fatalf("target=Stash response = %d %q", recA.Code, recA.Body.String())
+	}
+	if recB.Code != http.StatusOK || recB.Body.String() != "for-sing-box" {
+		t.Fatalf("target=sing-box response = %d %q", recB.Code, recB.Body.String())
+	}
+	if len(variants) != 2 {
+		t.Fatalf("expected two renders (distinct cache keys), got %d", len(variants))
+	}
+	if variants[0].Target != "Stash" || !variants[0].IncludeUnsupported {
+		t.Fatalf("first render variant = %+v", variants[0])
+	}
+	if variants[1].Target != "sing-box" || variants[1].IncludeUnsupported {
+		t.Fatalf("second render variant = %+v", variants[1])
+	}
+
+	// A repeat hit with the same target is served from cache: no third render.
+	recC := httptest.NewRecorder()
+	s.handleSubscriptionShare(recC, shareRequest("/sub/team/"+token+"?target=Stash&includeUnsupportedProxy=1", "curl/8"))
+	if recC.Code != http.StatusOK || recC.Body.String() != "for-Stash" || len(variants) != 2 {
+		t.Fatalf("cache miss on identical variant: code=%d body=%q renders=%d", recC.Code, recC.Body.String(), len(variants))
+	}
+
+	// An unknown target is denied without reaching a render.
+	recD := httptest.NewRecorder()
+	s.handleSubscriptionShare(recD, shareRequest("/sub/team/"+token+"?target=EvilClient", "curl/8"))
+	if recD.Code == http.StatusOK || len(variants) != 2 {
+		t.Fatalf("unknown target must be denied before rendering: code=%d renders=%d", recD.Code, len(variants))
+	}
+
+	// prettyYaml is its own cache dimension and reaches produce as pretty-yaml.
+	recE := httptest.NewRecorder()
+	s.handleSubscriptionShare(recE, shareRequest("/sub/team/"+token+"?target=Stash&prettyYaml=1", "curl/8"))
+	if recE.Code != http.StatusOK || len(variants) != 3 {
+		t.Fatalf("prettyYaml variant should render separately: code=%d renders=%d", recE.Code, len(variants))
+	}
+	if !variants[2].PrettyYAML || variants[2].options()["pretty-yaml"] != true {
+		t.Fatalf("prettyYaml did not reach the produce options: %+v", variants[2])
+	}
+
+	// noFlow suppresses the quota header without splitting the cache.
+	recF := httptest.NewRecorder()
+	s.handleSubscriptionShare(recF, shareRequest("/sub/team/"+token+"?target=Stash&includeUnsupportedProxy=1&noFlow=1", "curl/8"))
+	if recF.Code != http.StatusOK || len(variants) != 3 {
+		t.Fatalf("noFlow must not add a cache dimension: code=%d renders=%d", recF.Code, len(variants))
+	}
+	if recF.Header().Get("Subscription-Userinfo") != "" {
+		t.Fatalf("noFlow response still carried Subscription-Userinfo: %q", recF.Header().Get("Subscription-Userinfo"))
+	}
 }

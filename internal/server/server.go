@@ -228,7 +228,7 @@ type Server struct {
 	subscriptionGraphReadWaiter   chan<- struct{}
 	subscriptionGraphWriteWaiter  chan<- struct{}
 	subscriptionGraphPruneSkipped chan<- struct{}
-	subscriptionRender            func(context.Context, model.SubscriptionShare, string, string, model.SubscriptionSnapshot) (renderedSubscription, error)
+	subscriptionRender            func(context.Context, model.SubscriptionShare, string, string, shareRenderVariant, model.SubscriptionSnapshot) (renderedSubscription, error)
 	subscriptionBeforeCacheExtend func()
 	subscriptionCacheLookupWaiter chan<- struct{}
 	subscriptionCacheExtendWaiter chan<- struct{}

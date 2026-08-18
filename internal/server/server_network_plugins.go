@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,6 +96,40 @@ func invokePluginOperation(
 	return body, nil
 }
 
+// invokePluginQuery is invokePluginOperation for the read handlers that take
+// their input from the URL query rather than a body. It shares the same
+// principal, authorization, and audit path as the REST route — the point of
+// routing plugin calls through the handlers is that there is exactly one
+// implementation of each operation's rules.
+func invokePluginQuery(
+	ctx context.Context,
+	query url.Values,
+	handler func(http.ResponseWriter, *http.Request, principal),
+) ([]byte, error) {
+	p, err := pluginOperatorPrincipal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	target := "http://plugin.operation/"
+	if encoded := query.Encode(); encoded != "" {
+		target += "?" + encoded
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	recorder := &pluginOperationRecorder{header: make(http.Header)}
+	handler(recorder, req, p)
+	if recorder.status == 0 {
+		recorder.status = http.StatusOK
+	}
+	body := append([]byte(nil), recorder.body.Bytes()...)
+	if recorder.status < 200 || recorder.status >= 300 {
+		return nil, &pluginOperationError{StatusCode: recorder.status, Body: body}
+	}
+	return body, nil
+}
+
 func (s *Server) registerNetworkPluginRPC() {
 	if s.pluginRPC == nil {
 		return
@@ -101,6 +137,13 @@ func (s *Server) registerNetworkPluginRPC() {
 	if err := s.pluginRPC.Register(netGuardPluginID, netGuardFirewallService, "v1", []string{
 		"overview", "upsert_group", "delete_group", "upsert_zone", "delete_zone",
 		"upsert_binding", "adopt", "plan",
+		// review and reality have existed on the REST API since the reality
+		// snapshots landed, but the plugin could not reach them: a plugin
+		// speaks only lattice.plugin.call, so an interface it does not name
+		// here is unreachable no matter what the REST surface offers. That is
+		// why the drift panel has never existed despite the backend for it
+		// being finished.
+		"review", "reality",
 	}, s.netGuardFirewallRPC); err != nil {
 		s.logger.Printf("netguard: register %s failed: %v", netGuardFirewallService, err)
 	}
@@ -155,6 +198,42 @@ func (s *Server) netGuardFirewallRPC(ctx context.Context, method string, request
 		return invokePluginOperation(ctx, http.MethodPost, request, s.handleNetGuardAdopt)
 	case "plan":
 		return invokePluginOperation(ctx, http.MethodPost, request, s.handleNetGuardPlan)
+	case "review":
+		// Both read paths take their parameters from the query string, so the
+		// request body is turned into one here rather than duplicating their
+		// logic. A missing node_id stays the handler's error to report.
+		var req struct {
+			NodeID string `json:"node_id"`
+		}
+		if len(request) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, fmt.Errorf("netguard/firewall review: %w", err)
+			}
+		}
+		return invokePluginQuery(ctx, url.Values{"node_id": {req.NodeID}}, s.handleNetGuardReview)
+	case "reality":
+		var req struct {
+			NodeID string `json:"node_id"`
+			Limit  int    `json:"limit,omitempty"`
+			Cursor string `json:"cursor,omitempty"`
+		}
+		if len(request) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, fmt.Errorf("netguard/firewall reality: %w", err)
+			}
+		}
+		query := url.Values{}
+		if strings.TrimSpace(req.NodeID) != "" {
+			query.Set("node_id", req.NodeID)
+		} else {
+			if req.Limit > 0 {
+				query.Set("limit", strconv.Itoa(req.Limit))
+			}
+			if strings.TrimSpace(req.Cursor) != "" {
+				query.Set("cursor", req.Cursor)
+			}
+		}
+		return invokePluginQuery(ctx, query, s.handleNetGuardReality)
 	default:
 		return nil, fmt.Errorf("netguard/firewall: unknown method %q", method)
 	}

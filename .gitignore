@@ -18,3 +18,6 @@ seed
 seed.*
 *_seed
 *.bin
+
+# local worktrees for parallel lanes
+.wt/

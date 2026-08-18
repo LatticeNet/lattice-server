@@ -127,3 +127,91 @@ func TestWireGuardRPCRequiresWireGuardScopes(t *testing.T) {
 		t.Fatalf("denied plan must not create approvals, got %+v", st.Approvals())
 	}
 }
+
+func TestNetGuardRPCExposesReviewAndReality(t *testing.T) {
+	srv, st, ctx := newNetworkPluginRPCServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// reality without a node id is the fleet-wide list; the node the test just
+	// created must appear in it even though it has never reported a snapshot,
+	// because "no snapshot yet" is the state an operator most needs to see.
+	list, err := srv.netGuardFirewallRPC(ctx, "reality", nil)
+	if err != nil {
+		t.Fatalf("reality list: %v", err)
+	}
+	var listed struct {
+		Nodes []struct {
+			NodeID         string `json:"node_id"`
+			SnapshotStatus string `json:"snapshot_status"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(list, &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Nodes) != 1 || listed.Nodes[0].NodeID != "node-a" {
+		t.Fatalf("unexpected reality list: %s", list)
+	}
+	if listed.Nodes[0].SnapshotStatus == "" {
+		t.Fatal("a node with no snapshot must still report a status")
+	}
+
+	// A node id narrows to the detail shape.
+	detail, err := srv.netGuardFirewallRPC(ctx, "reality", []byte(`{"node_id":"node-a"}`))
+	if err != nil {
+		t.Fatalf("reality detail: %v", err)
+	}
+	if !strings.Contains(string(detail), `"node_id":"node-a"`) {
+		t.Fatalf("unexpected reality detail: %s", detail)
+	}
+
+	// review compiles the node's intended state next to what it reports, so it
+	// needs a binding to compile — an unbound node is a conflict, which is the
+	// handler's own rule and stays that way through the RPC.
+	if _, err := srv.netGuardFirewallRPC(ctx, "review", []byte(`{"node_id":"node-a"}`)); err == nil {
+		t.Fatal("review of an unbound node must report the conflict")
+	}
+	if _, err := srv.netGuardFirewallRPC(ctx, "upsert_group", []byte(`{"id":"sg-web","name":"Web","rules":[]}`)); err != nil {
+		t.Fatalf("seed group: %v", err)
+	}
+	if _, err := srv.netGuardFirewallRPC(ctx, "upsert_binding", []byte(`{"node_id":"node-a","group_ids":["sg-web"]}`)); err != nil {
+		t.Fatalf("seed binding: %v", err)
+	}
+	review, err := srv.netGuardFirewallRPC(ctx, "review", []byte(`{"node_id":"node-a"}`))
+	if err != nil {
+		t.Fatalf("review: %v", err)
+	}
+	if len(review) == 0 {
+		t.Fatal("review returned nothing")
+	}
+
+	// A missing node id is the handler's own error, surfaced as an operation
+	// failure rather than silently reviewing some other node.
+	if _, err := srv.netGuardFirewallRPC(ctx, "review", []byte(`{}`)); err == nil {
+		t.Fatal("review without a node id must fail")
+	}
+
+	// An unknown node is not found, not a leak of whether it exists elsewhere.
+	if _, err := srv.netGuardFirewallRPC(ctx, "review", []byte(`{"node_id":"missing"}`)); err == nil {
+		t.Fatal("review of an unknown node must fail")
+	}
+}
+
+func TestNetGuardReadRPCRequiresTheReadScope(t *testing.T) {
+	srv, st, _ := newNetworkPluginRPCServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	// A principal with netguard:admin but not netguard:read must not reach the
+	// read paths: the gateway checks the manifest's declared scopes, and the
+	// handlers check their own, so a manifest mistake cannot widen either.
+	narrow := principal{Principal: rbac.Principal{ActorID: "narrow", Scopes: []string{"netguard:admin"}}}
+	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, narrow)
+	if _, err := srv.netGuardFirewallRPC(ctx, "reality", nil); err == nil {
+		t.Fatal("reality without netguard:read must be denied")
+	}
+	if _, err := srv.netGuardFirewallRPC(ctx, "review", []byte(`{"node_id":"node-a"}`)); err == nil {
+		t.Fatal("review without netguard:read must be denied")
+	}
+}

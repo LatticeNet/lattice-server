@@ -419,3 +419,59 @@ func TestVpnUserAdminRPCCRUDAndBind(t *testing.T) {
 		t.Fatal("user not deleted")
 	}
 }
+
+// A pre-E5 legacy KV user may declare protocol slots whose secrets were meant
+// to arrive through rotation. The boot migration must provision those slots
+// instead of refusing to start — this fixture mirrors the exact production
+// record that crash-looped alpha-0.2.2a20.
+func TestVpnUserMigrationProvisionsLegacyPlaceholderSlots(t *testing.T) {
+	srv := newLinesTestServer(t)
+	legacy := `{"id":"vpnuser_legacy1","email":"op@example.com","name":"op","enabled":true,` +
+		`"credentials":[{"protocol":"vless","uuid":"846a3605-eb55-4c79-93d1-53f38891e621"},` +
+		`{"protocol":"vmess","uuid":"13c3a44e-3032-4f5d-8af3-d4e151fe72c3"},` +
+		`{"protocol":"trojan"},{"protocol":"shadowsocks"},{"protocol":"hysteria2"},` +
+		`{"protocol":"tuic","uuid":"4ee99906-c61b-432b-ab30-da5dbaf21319"},{"protocol":"anytls"}]}`
+	if err := srv.store.PutKV(model.KVEntry{Bucket: vpnCoreKVBucket, Key: vpnUserKeyPrefix + "vpnuser_legacy1", Value: legacy}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.migrateProxyUsersToVpnUsers(); err != nil {
+		t.Fatalf("migration refused the legacy placeholder slots: %v", err)
+	}
+	u, ok := srv.getVpnUser("vpnuser_legacy1")
+	if !ok {
+		t.Fatal("legacy user did not migrate")
+	}
+	if len(u.Credentials) != 7 {
+		t.Fatalf("credential slots = %d, want 7", len(u.Credentials))
+	}
+	for _, credential := range u.Credentials {
+		if err := store.ValidateVpnUserCredentialSecret(store.VpnUserCredentialSecret{
+			Protocol: credential.Protocol, UUID: credential.UUID, Password: credential.Password,
+		}); err != nil {
+			t.Fatalf("credential %s still invalid after migration: %v", credential.Protocol, err)
+		}
+	}
+	// The pre-existing secrets must survive untouched.
+	for _, credential := range u.Credentials {
+		if credential.Protocol == "vless" && credential.UUID != "846a3605-eb55-4c79-93d1-53f38891e621" {
+			t.Fatalf("vless UUID was rotated by migration: %s", credential.UUID)
+		}
+		if credential.Protocol == "tuic" && credential.UUID != "4ee99906-c61b-432b-ab30-da5dbaf21319" {
+			t.Fatalf("tuic UUID was rotated by migration: %s", credential.UUID)
+		}
+	}
+	// Idempotent: a second boot leaves the provisioned secrets alone.
+	first := map[string]string{}
+	for _, credential := range u.Credentials {
+		first[credential.Protocol] = credential.UUID + "|" + credential.Password
+	}
+	if err := srv.migrateProxyUsersToVpnUsers(); err != nil {
+		t.Fatalf("second migration: %v", err)
+	}
+	u2, _ := srv.getVpnUser("vpnuser_legacy1")
+	for _, credential := range u2.Credentials {
+		if first[credential.Protocol] != credential.UUID+"|"+credential.Password {
+			t.Fatalf("second migration rotated %s", credential.Protocol)
+		}
+	}
+}

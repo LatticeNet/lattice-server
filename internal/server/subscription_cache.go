@@ -14,6 +14,12 @@ type subscriptionCacheKey struct {
 	ShareID string
 	Format  string
 	UAClass string
+	// Variant is the canonical token for explicit render parameters (?target=
+	// and produce flags). Empty for a parameterless request, so existing keys
+	// are byte-identical to before the parameters existed. The parameter space
+	// is bounded by an allowlist at the handler, which is what keeps this from
+	// becoming a cache-exhaustion lever.
+	Variant string
 }
 
 type subscriptionCacheEntry struct {
@@ -172,7 +178,7 @@ func (c *subscriptionCache) PutSnapshot(key subscriptionCacheKey, body []byte, c
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.nextRevision++
-	storedKey := subscriptionCacheKey{ShareID: strings.Clone(key.ShareID), Format: strings.Clone(key.Format), UAClass: strings.Clone(key.UAClass)}
+	storedKey := subscriptionCacheKey{ShareID: strings.Clone(key.ShareID), Format: strings.Clone(key.Format), UAClass: strings.Clone(key.UAClass), Variant: strings.Clone(key.Variant)}
 	entry := &subscriptionCacheEntry{
 		key: storedKey, body: append([]byte(nil), body...), revision: c.nextRevision,
 		contentType: strings.Clone(contentType), userinfo: strings.Clone(userinfo), revalidationVersion: strings.Clone(revalidationVersion), publicSourceVersion: strings.Clone(publicSourceVersion),

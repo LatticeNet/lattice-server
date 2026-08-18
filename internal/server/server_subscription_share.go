@@ -37,6 +37,66 @@ var shareSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 // client screenshots. Authorization rests entirely on the token, which is why
 // this function validates the slug's shape but never treats a correct slug as
 // evidence of anything.
+// subscriptionShareTargets is the bounded set of client targets a share URL
+// may name via ?target= — the Sub-Store URL-parity contract. Bounded on
+// purpose: the target participates in the render cache key, and an unbounded
+// caller-chosen string there is a cache-exhaustion lever on an
+// unauthenticated-by-design endpoint.
+var subscriptionShareTargets = map[string]bool{
+	"URI": true, "Stash": true, "ClashMeta": true, "Egern": true,
+	"Surfboard": true, "Surge": true, "SurgeMac": true, "Loon": true,
+	"Shadowrocket": true, "QX": true, "sing-box": true, "V2Ray": true,
+	"Clash": true, "JSON": true,
+}
+
+// shareRenderVariant carries the explicit render parameters of one request,
+// under Sub-Store's own query-parameter names (target, includeUnsupportedProxy,
+// prettyYaml, noFlow). The zero value means "no parameters", which renders and
+// caches exactly as requests did before the parameters existed.
+type shareRenderVariant struct {
+	Target             string
+	IncludeUnsupported bool
+	PrettyYAML         bool
+	// NoFlow suppresses the Subscription-Userinfo response header — upstream's
+	// "不查询订阅流量信息". It affects only the response envelope, never the
+	// rendered body, so it deliberately stays OUT of the cache key.
+	NoFlow bool
+}
+
+// cacheToken is the canonical cache-key fragment. Empty for the zero variant
+// so pre-existing cache keys are unchanged. NoFlow is absent by design: the
+// cached body is identical either way.
+func (v shareRenderVariant) cacheToken() string {
+	if v.Target == "" && !v.IncludeUnsupported && !v.PrettyYAML {
+		return ""
+	}
+	token := "t=" + v.Target
+	if v.IncludeUnsupported {
+		token += ";iup=1"
+	}
+	if v.PrettyYAML {
+		token += ";py=1"
+	}
+	return token
+}
+
+// options is the produce() flag map handed to the plugin, under the flag
+// names the embedded Sub-Store core reads. Nil when nothing is set, so old
+// plugins see the payload they always saw.
+func (v shareRenderVariant) options() map[string]bool {
+	if !v.IncludeUnsupported && !v.PrettyYAML {
+		return nil
+	}
+	opts := map[string]bool{}
+	if v.IncludeUnsupported {
+		opts["include-unsupported-proxy"] = true
+	}
+	if v.PrettyYAML {
+		opts["pretty-yaml"] = true
+	}
+	return opts
+}
+
 func sharePathFromRequest(value string) (string, string, bool) {
 	rest, ok := strings.CutPrefix(value, "/sub/")
 	if !ok {
@@ -150,7 +210,23 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	}
 
 	uaClass := classifyClientUA(r.Header.Get("User-Agent"))
-	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass}
+
+	// Explicit render parameters, Sub-Store URL style: ?target= names the
+	// client outright (validated against the bounded target set — this string
+	// enters the cache key), and includeUnsupportedProxy rides through to
+	// produce() under upstream's own flag name.
+	variant := shareRenderVariant{
+		Target:             strings.TrimSpace(r.URL.Query().Get("target")),
+		IncludeUnsupported: requestBool(r, "includeUnsupportedProxy"),
+		PrettyYAML:         requestBool(r, "prettyYaml") || requestBool(r, "pretty-yaml"),
+		NoFlow:             requestBool(r, "noFlow"),
+	}
+	if variant.Target != "" && !subscriptionShareTargets[variant.Target] {
+		deny("invalid subscription target", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+		return
+	}
+
+	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass, Variant: variant.cacheToken()}
 
 	var cacheEntry subscriptionCacheEntry
 	var cached bool
@@ -210,7 +286,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		}
 		accepted := false
 		for attempt := 0; attempt < attempts; attempt++ {
-			rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass)
+			rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass, variant)
 			if renderErr != nil {
 				s.logger.Printf("subscription share: render failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(renderErr))
 				deny("subscription_render_failed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
@@ -250,7 +326,9 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", contentType)
-	if userinfo != "" {
+	// ?noFlow=1 keeps quota headers off the wire (upstream's 不查询订阅流量) —
+	// some clients probe aggressively when they see one.
+	if userinfo != "" && !variant.NoFlow {
 		w.Header().Set("Subscription-Userinfo", userinfo)
 	}
 	if staleResponse {
@@ -392,7 +470,7 @@ func (s *Server) invalidateSharesForSource(pluginID, subscriptionID string) {
 // renderShare asks the share's source for content. It never shows the source the
 // token and never lets it influence the response beyond the bytes and a content
 // type.
-func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string) (renderedSubscription, error) {
+func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string, variant shareRenderVariant) (renderedSubscription, error) {
 	switch share.Source.Kind {
 	case model.ShareSourceCoreProxyUser:
 		user, ok := s.store.ProxyUser(share.Source.ProxyUserID)
@@ -423,16 +501,25 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 			return renderedSubscription{}, errors.New("subscription source changed during render capture")
 		}
 		if s.subscriptionRender != nil {
-			rendered, err := s.subscriptionRender(ctx, share, format, uaClass, snap)
+			rendered, err := s.subscriptionRender(ctx, share, format, uaClass, variant, snap)
 			rendered.SourceEpoch = epoch
 			return rendered, err
 		}
-		payload, err := json.Marshal(map[string]string{
+		payloadFields := map[string]any{
 			"subscription_id": share.Source.SubscriptionID,
 			"format":          format,
 			"ua_class":        uaClass,
 			"raw":             snap.Raw,
-		})
+		}
+		// Explicit render parameters ride only when set, so a plugin built
+		// before they existed receives the exact payload it always did.
+		if variant.Target != "" {
+			payloadFields["target"] = variant.Target
+		}
+		if opts := variant.options(); opts != nil {
+			payloadFields["options"] = opts
+		}
+		payload, err := json.Marshal(payloadFields)
 		if err != nil {
 			return renderedSubscription{}, err
 		}

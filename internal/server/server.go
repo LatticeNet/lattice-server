@@ -1043,12 +1043,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netguard/zones", s.withAuth("netguard:read", s.handleNetGuardZones))
 	mux.HandleFunc("/api/netguard/zones/delete", s.withAuth("netguard:admin", s.handleDeleteGuardZone))
 	mux.HandleFunc("/api/netguard/nodes", s.withAuth("netguard:read", s.handleNetGuardNodes))
+	// The POST netguard handlers below keep their fine-grained per-node checks
+	// (requireNodeScope with allowlist narrowing); the withAuth scope is the
+	// defense-in-depth outer gate, set to the scope every code path of the
+	// handler demands internally anyway. Their node_id travels in the body, so
+	// withAuth's query-param node check stays a flat scope check. /reality must
+	// stay unscoped here: it takes node_id as a query param, and an outer gate
+	// would turn the handler's deliberate 404 existence-hiding for out-of-
+	// allowlist nodes into a 403 (the handler does requireScope itself).
 	mux.HandleFunc("/api/netguard/reality", s.withAuth("", s.handleNetGuardReality))
 	mux.HandleFunc("/api/netguard/review", s.withAuth("netguard:read", s.handleNetGuardReview))
-	mux.HandleFunc("/api/netguard/bindings", s.withAuth("", s.handleNetGuardBindings))
-	mux.HandleFunc("/api/netguard/nodes/adopt", s.withAuth("", s.handleNetGuardAdopt))
-	mux.HandleFunc("/api/netguard/plan", s.withAuth("", s.handleNetGuardPlan))
-	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("network:plan", s.handleWireGuardPlan))
+	mux.HandleFunc("/api/netguard/bindings", s.withAuth("netguard:admin", s.handleNetGuardBindings))
+	mux.HandleFunc("/api/netguard/nodes/adopt", s.withAuth("netguard:admin", s.handleNetGuardAdopt))
+	mux.HandleFunc("/api/netguard/plan", s.withAuth("netguard:admin", s.handleNetGuardPlan))
+	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("wireguard:admin", s.handleWireGuardPlan))
 	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
 	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))
 	mux.HandleFunc("/api/tunnels/plan", s.withAuth("tunnel:admin", s.handleTunnelPlan))
@@ -5011,6 +5019,9 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusNotFound, errors.New("node not found"))
 		return
 	}
+	if !s.requireNodeScope(w, p, "wireguard:admin", req.NodeID) {
+		return
+	}
 	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
@@ -5039,7 +5050,7 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.wireguard.plan", Scope: "network:plan", Metadata: map[string]string{"approval_id": approval.ID, "peers": fmt.Sprintf("%d", len(peers))}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.wireguard.plan", Scope: "wireguard:admin,network:plan", Metadata: map[string]string{"approval_id": approval.ID, "peers": fmt.Sprintf("%d", len(peers))}})
 	writeJSON(w, http.StatusOK, approval)
 }
 

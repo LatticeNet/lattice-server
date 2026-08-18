@@ -24,7 +24,7 @@ func newNetworkPluginRPCServer(t *testing.T) (*Server, *store.Store, context.Con
 	}
 	p := principal{Principal: rbac.Principal{
 		ActorID: "operator-test",
-		Scopes:  []string{"node:read", "netguard:read", "netguard:admin", "network:plan"},
+		Scopes:  []string{"node:read", "netguard:read", "netguard:admin", "network:plan", "wireguard:read", "wireguard:admin"},
 	}}
 	return srv, st, context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, p)
 }
@@ -92,5 +92,38 @@ func TestWireGuardRPCOverviewIsSecretFreeAndPlanCreatesApproval(t *testing.T) {
 	}
 	if !strings.Contains(string(planned), `"plugin":"wireguard"`) || len(st.Approvals()) != 1 {
 		t.Fatalf("plan did not create one WireGuard approval: result=%s approvals=%+v", planned, st.Approvals())
+	}
+}
+
+// Design-13 D10: the WireGuard surface must not piggyback on fleet-wide
+// node:read / network:plan. A principal holding those broad scopes but not the
+// wireguard:* pair sees no nodes and cannot plan.
+func TestWireGuardRPCRequiresWireGuardScopes(t *testing.T) {
+	srv, st, _ := newNetworkPluginRPCServer(t)
+	if err := st.UpsertNode(model.Node{
+		ID: "node-a", Name: "Hong Kong", WireGuardIP: "10.66.0.1/32",
+		WireGuardPublicKey: wgKey(1), WireGuardPort: 51820,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	broad := principal{Principal: rbac.Principal{
+		ActorID: "operator-broad",
+		Scopes:  []string{"node:read", "network:plan"},
+	}}
+	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, broad)
+	overview, err := srv.wireGuardNetworksRPC(ctx, "overview", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(overview), `"count":0`) {
+		t.Fatalf("overview without wireguard:read must be empty, got %s", overview)
+	}
+	_, err = srv.wireGuardNetworksRPC(ctx, "plan", []byte(`{"node_id":"node-a","listen_port":51820}`))
+	var operationErr *pluginOperationError
+	if !errors.As(err, &operationErr) || operationErr.StatusCode != 403 {
+		t.Fatalf("plan without wireguard:admin must be 403, got %v", err)
+	}
+	if len(st.Approvals()) != 0 {
+		t.Fatalf("denied plan must not create approvals, got %+v", st.Approvals())
 	}
 }

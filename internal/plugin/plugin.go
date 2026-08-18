@@ -92,6 +92,7 @@ var capabilityRisk = map[string]string{
 	"node:read":            RiskRead,
 	"static:read":          RiskRead,
 	"task:read":            RiskRead,
+	"wireguard:read":       RiskRead,
 	"kv:write":             RiskWrite,
 	"log:write":            RiskWrite,
 	"notify:send":          RiskWrite,
@@ -115,6 +116,12 @@ var capabilityRisk = map[string]string{
 	"subscription:serve": RiskHost,
 	"task:run":           RiskHost,
 	"tunnel:admin":       RiskHost,
+	// wireguard:admin authorizes planning and administering WireGuard interface
+	// state on nodes (design-13 D10). Host-risk like netguard:admin: the rendered
+	// plan reshapes a node's network reachability, so it stays system-only and
+	// trusted-publisher signed. wireguard:read is the matching read-side scope so
+	// the WireGuard surface no longer piggybacks on fleet-wide node:read.
+	"wireguard:admin": RiskHost,
 	// Inter-plugin RPC (design-09 §F). rpc:expose lets a plugin register a
 	// callable service; rpc:call lets a plugin invoke another plugin's service
 	// through the broker. Both are host-risk (system-only, signed in prod): a

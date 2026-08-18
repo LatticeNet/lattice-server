@@ -737,7 +737,7 @@ func TestPrivilegedAllowAuditUsesRequestID(t *testing.T) {
 	if wireGuardRequestID == "" {
 		t.Fatal("wireguard plan response missing request id")
 	}
-	wireGuardAudit := auditByActionAndScope(t, st, "network.wireguard.plan", "network:plan")
+	wireGuardAudit := auditByActionAndScope(t, st, "network.wireguard.plan", "wireguard:admin,network:plan")
 	if wireGuardAudit.CorrelationID != wireGuardRequestID {
 		t.Fatalf("wireguard plan audit correlation_id %q != request id %q", wireGuardAudit.CorrelationID, wireGuardRequestID)
 	}
@@ -1222,7 +1222,7 @@ func TestPATServerAllowlistAppliesToWireGuardPlanBody(t *testing.T) {
 	st.UpsertNode(model.Node{ID: "node-a", Name: "allowed", WireGuardIP: "10.66.0.1", WireGuardPublicKey: wgKey(1)})
 	st.UpsertNode(model.Node{ID: "node-b", Name: "denied", WireGuardIP: "10.66.0.2", WireGuardPublicKey: wgKey(2)})
 	cookies, csrf := loginSession(t, handler)
-	token := createPAT(t, handler, cookies, csrf, []string{"network:plan"}, []string{"node-a"})
+	token := createPAT(t, handler, cookies, csrf, []string{"wireguard:admin", "network:plan"}, []string{"node-a"})
 
 	res := doBearerJSON(t, handler, http.MethodPost, "/api/network/wireguard/plan", `{"node_id":"node-b"}`, token)
 	defer res.Body.Close()

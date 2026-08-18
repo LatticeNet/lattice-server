@@ -144,6 +144,8 @@ var KnownScopes = map[string]struct{}{
 	"user:admin":      {},
 	"vpncore:admin":   {},
 	"vpncore:read":    {},
+	"wireguard:admin": {},
+	"wireguard:read":  {},
 	"worker:deploy":   {},
 }
 

@@ -183,7 +183,7 @@ func (s *Server) wireGuardNetworksRPC(ctx context.Context, method string, reques
 		}
 		rows := make([]wireGuardNetworkView, 0)
 		for _, node := range s.store.Nodes() {
-			if !rbac.Allows(p.Principal, "node:read", node.ID) {
+			if !rbac.Allows(p.Principal, "wireguard:read", node.ID) {
 				continue
 			}
 			configuration := "missing"

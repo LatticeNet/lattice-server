@@ -158,8 +158,13 @@ type Server struct {
 	loginLimiter  *ratelimit.Limiter
 	totpLimiter   *ratelimit.Limiter
 	agentLimiter  *ratelimit.Limiter
-	apiLimiter    *ratelimit.Limiter
-	subLimiter    *ratelimit.Limiter
+	// authFailAuditThrottle bounds audit emission for repeating authentication
+	// failures (failed logins and agent auth). A shared global token bucket
+	// caps the absolute emission rate so source-address rotation cannot turn
+	// failure auditing into a disk-growth / lock-contention DoS.
+	authFailAuditThrottle *auditFailureThrottle
+	apiLimiter            *ratelimit.Limiter
+	subLimiter            *ratelimit.Limiter
 	// logIngestLimiter brakes per-source log ingest (keyed by source id) in
 	// lines/sec so a chatty or hostile node cannot flood the store; over budget
 	// returns 429 + Retry-After. Disk is independently bounded by the store caps.
@@ -432,6 +437,11 @@ func New(opts Options) (*Server, error) {
 		totpLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 3600.0, Burst: 5}),
 		// Agents poll on an interval; allow generous but bounded throughput.
 		agentLimiter: ratelimit.New(ratelimit.Config{Rate: 10, Burst: 40}),
+		// Per-source failures dedup within a 1-minute window; a shared global
+		// bucket (burst 20, 1/sec sustained) caps total failure-audit writes
+		// so IP rotation cannot exceed a fixed rate. Both are generous for
+		// legitimate failures and bound an unauthenticated flood.
+		authFailAuditThrottle: newAuditFailureThrottle(time.Minute, 20, 1.0),
 		// General authenticated API surface.
 		apiLimiter: ratelimit.New(ratelimit.Config{Rate: 30, Burst: 60}),
 		// Public subscription URLs are token-authenticated, unauthenticated HTTP
@@ -1323,7 +1333,7 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 			return
 		}
 		if s.mfaRequiredForPrincipal(p) && !mfaSetupAllowedPath(r.URL.Path) {
-			s.recordAudit(model.AuditEvent{
+			s.recordRequestAudit(r, model.AuditEvent{
 				ID:            id.New("audit"),
 				ActorID:       p.ActorID,
 				Action:        r.Method + " " + r.URL.Path,
@@ -1336,7 +1346,7 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 			return
 		}
 		if scope != "" && !rbac.Allows(p.Principal, scope, r.URL.Query().Get("node_id")) {
-			s.recordAudit(model.AuditEvent{
+			s.recordRequestAudit(r, model.AuditEvent{
 				ID:            id.New("audit"),
 				ActorID:       p.ActorID,
 				TokenID:       p.TokenID,
@@ -1354,6 +1364,18 @@ func (s *Server) withAuth(scope string, next func(http.ResponseWriter, *http.Req
 			// token byte-by-byte via response timing. ConstantTimeCompare returns 0
 			// on any length mismatch, so an empty or wrong-length header is rejected.
 			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Lattice-CSRF")), []byte(p.CSRFToken)) != 1 {
+				// A CSRF failure needs a valid session cookie to reach this
+				// point, so it cannot be generated anonymously and needs no
+				// throttle - but it is exactly the trace of a cross-site
+				// attempt against a logged-in operator, so it must be audited.
+				s.recordRequestAudit(r, model.AuditEvent{
+					ID:       id.New("audit"),
+					ActorID:  p.ActorID,
+					Action:   r.Method + " " + r.URL.Path,
+					Scope:    "csrf",
+					Decision: "deny",
+					Reason:   "invalid csrf token",
+				})
 				writeError(w, http.StatusForbidden, errors.New("invalid csrf token"))
 				return
 			}
@@ -1558,6 +1580,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// locked out, an unknown one never could) and defeat the timing
 		// equalization.
 		auth.DummyVerify(req.Password)
+		// Credential stuffing across invented usernames must leave a trace;
+		// until now this branch returned before any audit call, so the whole
+		// campaign was invisible. The attempted name (truncated) is the signal
+		// that separates targeted probing from a typo. The known-user deny
+		// branch below also records one audit event, so timing parity holds.
+		s.auditLoginFailure(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "login",
+			Decision: "deny",
+			Reason:   "unknown username",
+			Metadata: map[string]string{"username": auditTruncate(req.Username, 64)},
+		})
 		writeError(w, http.StatusUnauthorized, errors.New("invalid credentials"))
 		return
 	}
@@ -1573,13 +1607,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// window refills — a wrong-guess flood cannot be rescued by slipping in the
 	// right password.
 	if s.userLoginLocked(user.ID) {
-		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "deny", Reason: "per-user login attempt limit exceeded"})
+		s.auditLoginFailure(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "deny", Reason: "per-user login attempt limit exceeded"})
 		writeError(w, http.StatusTooManyRequests, errors.New("too many login attempts; slow down"))
 		return
 	}
 	if !passwordOK {
+		// The per-account lockout counter must advance on every failure; only
+		// the audit write is throttled.
 		s.recordUserLoginFailure(user.ID)
-		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "deny", Reason: "invalid credentials"})
+		s.auditLoginFailure(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login", Decision: "deny", Reason: "invalid credentials"})
 		writeError(w, http.StatusUnauthorized, errors.New("invalid credentials"))
 		return
 	}
@@ -3282,6 +3318,14 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal
 	}
 	events := visibleAuditEvents(p, s.store.AuditEvents())
 	if !auditQueryRequested(r) {
+		// Bare mode keeps its array shape (pinned by tests and existing
+		// consumers) but no longer dumps the entire unbounded log in one
+		// response: it returns the newest defaultAuditLimit events
+		// (AuditEvents() sorts newest-first). Anything more goes through the
+		// query parameters and the enveloped response.
+		if len(events) > defaultAuditLimit {
+			events = events[:defaultAuditLimit]
+		}
 		writeJSON(w, http.StatusOK, events)
 		return
 	}
@@ -6908,9 +6952,11 @@ func (s *Server) authenticateNode(r *http.Request, nodeID, token string) (model.
 	}
 	n, ok := s.store.Node(nodeID)
 	if !ok {
+		s.auditAgentAuthFailure(r, nodeID, "unknown node")
 		return model.Node{}, false
 	}
 	if n.Disabled {
+		s.auditAgentAuthFailure(r, nodeID, "node disabled")
 		return model.Node{}, false
 	}
 	sourceIP := s.clientIP(r)
@@ -6927,6 +6973,7 @@ func (s *Server) authenticateNode(r *http.Request, nodeID, token string) (model.
 	}
 	touchedAt := s.now().UTC()
 	if !verifyAgentNodeSecret(nodeID, sourceIP, n.TokenHash, token, touchedAt) {
+		s.auditAgentAuthFailure(r, nodeID, "invalid node token")
 		return model.Node{}, false
 	}
 	if touched, err := s.store.TouchNodeToken(nodeID, touchedAt, nodeTokenTouchInterval); err != nil {
@@ -7086,7 +7133,97 @@ func (s *Server) recordRequestAudit(r *http.Request, ev model.AuditEvent) {
 	if ev.CorrelationID == "" {
 		ev.CorrelationID = requestIDFromRequest(r)
 	}
+	// Every request-scoped audit record carries the client address. Without
+	// it a lockout or denial is visible but not attributable ("locked out,
+	// but from where?"), which is the single most damaging omission for a
+	// security console. Proxy headers are honored only under TrustProxy
+	// (see clientIP), so the value is not spoofable in direct exposure.
+	if ev.Metadata == nil {
+		ev.Metadata = map[string]string{}
+	}
+	if _, ok := ev.Metadata["source_ip"]; !ok {
+		ev.Metadata["source_ip"] = s.clientIP(r)
+	}
 	s.recordAudit(ev)
+}
+
+// auditTruncate bounds attacker-controlled strings before they enter the
+// append-only audit store.
+func auditTruncate(v string, max int) string {
+	if len(v) <= max {
+		return v
+	}
+	return v[:max]
+}
+
+// auditBucketedIP collapses a client address to a throttle key that source
+// rotation cannot cheaply expand: IPv4 as-is, IPv6 to its /64 (a single
+// delegation), so an attacker cannot mint unbounded keys by hopping within one
+// prefix. Unparseable inputs fall back to the raw string.
+func auditBucketedIP(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		return v4.String()
+	}
+	return parsed.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
+// auditLoginFailure records a login-deny audit event through the shared
+// failure throttle, keyed by bucketed source address ALONE (never by username
+// or by whether the account exists). Because every login-deny branch - unknown
+// username, wrong password, account lockout - shares one key, they are always
+// in the same throttle state, so throttling cannot reintroduce a
+// username-existence timing oracle (a flood makes all branches skip the write
+// together, not the unknown-user one selectively). The caller must still
+// perform any unconditional state work (e.g. recordUserLoginFailure) outside
+// this call; only the audit write is gated.
+func (s *Server) auditLoginFailure(r *http.Request, ev model.AuditEvent) {
+	emit, suppressed, dropped := s.authFailAuditThrottle.Allow("login|"+auditBucketedIP(s.clientIP(r)), s.now())
+	if !emit {
+		return
+	}
+	if ev.Metadata == nil {
+		ev.Metadata = map[string]string{}
+	}
+	if suppressed > 0 {
+		ev.Metadata["suppressed_repeats"] = strconv.Itoa(suppressed)
+	}
+	if dropped > 0 {
+		ev.Metadata["global_suppressed"] = strconv.Itoa(dropped)
+	}
+	s.recordRequestAudit(r, ev)
+}
+
+// auditAgentAuthFailure records failed agent authentication. The throttle is
+// keyed by bucketed source address alone (not the reason): keying per reason
+// would let an attacker prime one reason slot and then probe node ids by
+// timing the throttled vs. audited paths. The reason still rides on the
+// emitted event; the node id never enters the key so a request-supplied id
+// cannot widen the budget.
+func (s *Server) auditAgentAuthFailure(r *http.Request, nodeID, reason string) {
+	sourceIP := s.clientIP(r)
+	emit, suppressed, dropped := s.authFailAuditThrottle.Allow("agentauth|"+auditBucketedIP(sourceIP), s.now())
+	if !emit {
+		return
+	}
+	meta := map[string]string{"source_ip": sourceIP}
+	if suppressed > 0 {
+		meta["suppressed_repeats"] = strconv.Itoa(suppressed)
+	}
+	if dropped > 0 {
+		meta["global_suppressed"] = strconv.Itoa(dropped)
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   auditTruncate(nodeID, 64),
+		Action:   "agent.auth",
+		Decision: "deny",
+		Reason:   reason,
+		Metadata: meta,
+	})
 }
 
 // clientIP resolves the address used as a rate-limit key. Proxy headers are

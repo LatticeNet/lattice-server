@@ -157,13 +157,16 @@ func TestNetGuardRealityAgentWriteAndReadContract(t *testing.T) {
 		if ev.NodeID != "node-a" {
 			t.Fatalf("reality audit node_id = %q, want node-a", ev.NodeID)
 		}
+		// Counts plus the request-path source_ip stamp; never raw reality
+		// payload fields.
 		wantMetadata := map[string]string{
 			"listener_count":      "1",
 			"interface_count":     "1",
 			"foreign_table_count": "1",
+			"source_ip":           "192.0.2.1",
 		}
 		if len(ev.Metadata) != len(wantMetadata) {
-			t.Fatalf("reality audit metadata = %+v, want counts only", ev.Metadata)
+			t.Fatalf("reality audit metadata = %+v, want counts and source_ip only", ev.Metadata)
 		}
 		for key, want := range wantMetadata {
 			if ev.Metadata[key] != want {

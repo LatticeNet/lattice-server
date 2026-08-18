@@ -219,6 +219,55 @@ func joinVpnUserRecord(public store.VpnUserPublicRecord, private store.VpnUserSe
 // migrateProxyUsersToVpnUsers derives a VpnUser for each legacy ProxyUser that has
 // not already been migrated. It is additive and idempotent: existing VpnUsers are
 // left untouched, and the ProxyUser remains the subscription-render substrate.
+// normalizeLegacyVpnUserCredentials provisions secrets for legacy placeholder
+// credential slots. Pre-E5 users could carry protocol-only entries — a
+// declared slot whose secret arrives later through rotation — and the typed
+// secret store's canonical contract rightly refuses to persist a secretless
+// credential. A placeholder was never usable for line derivation, so filling
+// it here is exactly what the rotate flow would have done, minus the wait:
+// the slot's declaration is honored and the migration stays fail-closed for
+// everything else (unknown protocols, malformed UUIDs, oversized secrets all
+// still abort the boot).
+func normalizeLegacyVpnUserCredentials(u VpnUser) (VpnUser, []string, error) {
+	var provisioned []string
+	for i := range u.Credentials {
+		credential := u.Credentials[i]
+		protocol := strings.ToLower(strings.TrimSpace(credential.Protocol))
+		if !vpnCredProtocols[protocol] {
+			continue // the canonical contract reports this better than we can
+		}
+		if vpnCredUUIDProtos[protocol] {
+			if strings.TrimSpace(credential.UUID) == "" {
+				fresh, err := newProxyUUID()
+				if err != nil {
+					return VpnUser{}, nil, err
+				}
+				credential.UUID = fresh
+				provisioned = append(provisioned, protocol)
+			}
+			if protocol == "tuic" && strings.TrimSpace(credential.Password) == "" {
+				password, err := newLineUserPassword()
+				if err != nil {
+					return VpnUser{}, nil, err
+				}
+				credential.Password = password
+				if len(provisioned) == 0 || provisioned[len(provisioned)-1] != protocol {
+					provisioned = append(provisioned, protocol)
+				}
+			}
+		} else if strings.TrimSpace(credential.Password) == "" {
+			password, err := newLineUserPassword()
+			if err != nil {
+				return VpnUser{}, nil, err
+			}
+			credential.Password = password
+			provisioned = append(provisioned, protocol)
+		}
+		u.Credentials[i] = credential
+	}
+	return u, provisioned, nil
+}
+
 func (s *Server) migrateProxyUsersToVpnUsers() error {
 	return s.store.MigrateLineSecrets(func(source store.LineSecretMigrationSource) (store.LineSecretMigrationBuild, error) {
 		publicRecords, privateRecords := source.VpnUsers, source.VpnUserSecrets
@@ -233,7 +282,14 @@ func (s *Server) migrateProxyUsersToVpnUsers() error {
 				return store.LineSecretMigrationBuild{}, fmt.Errorf("decode legacy vpn user %q: %w", entry.Key, err)
 			}
 			if _, exists := publicRecords[user.ID]; !exists {
-				publicRecords[user.ID], privateRecords[user.ID] = splitVpnUserRecord(user)
+				normalized, provisioned, err := normalizeLegacyVpnUserCredentials(user)
+				if err != nil {
+					return store.LineSecretMigrationBuild{}, fmt.Errorf("provision legacy vpn user %q credentials: %w", user.ID, err)
+				}
+				for _, protocol := range provisioned {
+					s.logger.Printf("migrate vpn user secrets: provisioned a fresh %s secret for legacy user %s (declared slot carried none)", protocol, user.ID)
+				}
+				publicRecords[user.ID], privateRecords[user.ID] = splitVpnUserRecord(normalized)
 			}
 			legacy = append(legacy, store.LegacyKVKey{Bucket: entry.Bucket, Key: entry.Key})
 		}

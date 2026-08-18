@@ -548,6 +548,16 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 		return
 	}
 	s.plugins = loaded
+	// Two passes, deliberately. The dependency gate below reads each plugin's
+	// installed version out of the store, so every plugin's CURRENT version
+	// must be recorded BEFORE any dependent's gate runs. Doing both in one loop
+	// makes arming order-dependent: Loader returns plugins in directory order
+	// (alphabetical), so a dependent like "sub-store" is processed before its
+	// dependency "vpn-core", and its gate reads vpn-core's STALE prior record.
+	// That is exactly how an in-place plugin upgrade left sub-store permanently
+	// unarmed (every /api/plugins/call returning 502 in ~3ms) until an unrelated
+	// restart happened to record the new version first. Record everything, then
+	// arm.
 	for _, pl := range loaded {
 		status := model.PluginStatusVerified
 		if existing, ok := s.store.PluginInstallation(pl.Manifest.ID); ok {
@@ -556,20 +566,24 @@ func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
 		if err := s.store.UpsertPluginInstallation(pluginInstallationFromLoaded(pl, status)); err != nil {
 			s.logger.Printf("plugin lifecycle: failed to record %s: %v", pl.Manifest.ID, err)
 		}
-		if status == model.PluginStatusActive {
-			if unmet := s.unmetActiveDependencies(pl.Manifest); len(unmet) > 0 {
-				reason := "required dependencies not active: " + strings.Join(unmet, ", ")
-				s.logger.Printf("plugin runtime: %s stays unarmed: %s", pl.Manifest.ID, reason)
-				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: reason, Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
-				continue
-			}
-			rt, err := s.pluginRuntime.Start(context.Background(), pl)
-			if err != nil {
-				s.logger.Printf("plugin runtime: failed to arm %s: %v", pl.Manifest.ID, err)
-				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
-			} else {
-				s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "allow", Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": rt.State, "reason": "startup"}})
-			}
+	}
+	for _, pl := range loaded {
+		inst, ok := s.store.PluginInstallation(pl.Manifest.ID)
+		if !ok || inst.Status != model.PluginStatusActive {
+			continue
+		}
+		if unmet := s.unmetActiveDependencies(pl.Manifest); len(unmet) > 0 {
+			reason := "required dependencies not active: " + strings.Join(unmet, ", ")
+			s.logger.Printf("plugin runtime: %s stays unarmed: %s", pl.Manifest.ID, reason)
+			s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: reason, Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
+			continue
+		}
+		rt, err := s.pluginRuntime.Start(context.Background(), pl)
+		if err != nil {
+			s.logger.Printf("plugin runtime: failed to arm %s: %v", pl.Manifest.ID, err)
+			s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": plugin.RuntimeStateFailed}})
+		} else {
+			s.recordAudit(model.AuditEvent{ID: id.New("audit"), Action: "plugin.runtime", Decision: "allow", Metadata: map[string]string{"plugin_id": pl.Manifest.ID, "state": rt.State, "reason": "startup"}})
 		}
 	}
 	for _, o := range outcomes {

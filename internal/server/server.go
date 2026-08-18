@@ -2933,14 +2933,46 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 		if !s.requireScope(w, p, "task:read") {
 			return
 		}
-		tasks := s.store.Tasks()
+		tasks := s.store.Tasks() // newest-first
 		visible := make([]taskView, 0, len(tasks))
 		for _, task := range tasks {
 			if taskTargetsAllowed(p, "task:read", task.Targets) {
 				visible = append(visible, toTaskView(task))
 			}
 		}
-		writeJSON(w, http.StatusOK, visible)
+		if !taskQueryRequested(r) {
+			writeJSON(w, http.StatusOK, visible)
+			return
+		}
+		q := r.URL.Query()
+		limit, err := boundedIntQuery(q.Get("limit"), defaultTaskQueryLimit, maxTaskQueryLimit, "limit")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		offset, err := boundedIntQuery(q.Get("offset"), 0, 0, "offset")
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		nodeID := strings.TrimSpace(q.Get("node_id"))
+		filtered := make([]taskView, 0, len(visible))
+		for _, view := range visible {
+			if nodeID != "" && !taskViewTargetsNode(view, nodeID) {
+				continue
+			}
+			filtered = append(filtered, view)
+		}
+		total := len(filtered)
+		if offset > total {
+			filtered = nil
+		} else {
+			filtered = filtered[offset:]
+		}
+		if len(filtered) > limit {
+			filtered = filtered[:limit]
+		}
+		writeJSON(w, http.StatusOK, tasksQueryResponse{Tasks: filtered, Total: total, Limit: limit, Offset: offset})
 	case http.MethodPost:
 		var req struct {
 			Targets     []string `json:"targets"`
@@ -3234,19 +3266,103 @@ func scriptSHA256(script string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// taskResultsQueryResponse is the enveloped, paginated shape returned when the
+// caller passes any filter/pagination parameter. Existing consumers that pass
+// none still receive the bare array (dashboard unwrap() already accepts both).
+type taskResultsQueryResponse struct {
+	Results []taskResultView `json:"results"`
+	Total   int              `json:"total"`
+	Limit   int              `json:"limit"`
+	Offset  int              `json:"offset"`
+}
+
+type tasksQueryResponse struct {
+	Tasks  []taskView `json:"tasks"`
+	Total  int        `json:"total"`
+	Limit  int        `json:"limit"`
+	Offset int        `json:"offset"`
+}
+
+func taskQueryRequested(r *http.Request) bool {
+	q := r.URL.Query()
+	for _, key := range []string{"node_id", "limit", "offset"} {
+		if _, ok := q[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func taskViewTargetsNode(view taskView, nodeID string) bool {
+	for _, target := range view.Targets {
+		if target == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func taskResultQueryRequested(r *http.Request) bool {
+	q := r.URL.Query()
+	for _, key := range []string{"task_id", "node_id", "limit", "offset"} {
+		if _, ok := q[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	results := s.store.Results()
+	results := s.store.Results() // newest-first
 	visible := make([]taskResultView, 0, len(results))
 	for _, result := range results {
 		if rbac.Allows(p.Principal, "task:read", result.NodeID) {
 			visible = append(visible, toTaskResultView(result))
 		}
 	}
-	writeJSON(w, http.StatusOK, visible)
+	if !taskResultQueryRequested(r) {
+		// Backward-compatible bare mode: the full visible array (bounded by the
+		// store's result cap). Filtering/pagination is opt-in below.
+		writeJSON(w, http.StatusOK, visible)
+		return
+	}
+	q := r.URL.Query()
+	limit, err := boundedIntQuery(q.Get("limit"), defaultTaskQueryLimit, maxTaskQueryLimit, "limit")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	offset, err := boundedIntQuery(q.Get("offset"), 0, 0, "offset")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	taskID := strings.TrimSpace(q.Get("task_id"))
+	nodeID := strings.TrimSpace(q.Get("node_id"))
+	filtered := make([]taskResultView, 0, len(visible))
+	for _, view := range visible {
+		if taskID != "" && view.TaskID != taskID {
+			continue
+		}
+		if nodeID != "" && view.NodeID != nodeID {
+			continue
+		}
+		filtered = append(filtered, view)
+	}
+	total := len(filtered)
+	if offset > total {
+		filtered = nil
+	} else {
+		filtered = filtered[offset:]
+	}
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+	writeJSON(w, http.StatusOK, taskResultsQueryResponse{Results: filtered, Total: total, Limit: limit, Offset: offset})
 }
 
 func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, p principal) {
@@ -3356,6 +3472,9 @@ func visibleAuditEvents(p principal, events []model.AuditEvent) []model.AuditEve
 const (
 	defaultAuditLimit = 100
 	maxAuditLimit     = 500
+	// Task list/result pagination defaults for the opt-in query mode.
+	defaultTaskQueryLimit = 100
+	maxTaskQueryLimit     = 500
 )
 
 type auditQueryResponse struct {
@@ -4883,7 +5002,69 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 			visible = append(visible, approval)
 		}
 	}
-	writeJSON(w, http.StatusOK, toApprovalViews(visible))
+	if !approvalQueryRequested(r) {
+		writeJSON(w, http.StatusOK, toApprovalViews(visible))
+		return
+	}
+	q := r.URL.Query()
+	limit, err := boundedIntQuery(q.Get("limit"), defaultTaskQueryLimit, maxTaskQueryLimit, "limit")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	offset, err := boundedIntQuery(q.Get("offset"), 0, 0, "offset")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	status := strings.TrimSpace(q.Get("status"))
+	nodeID := strings.TrimSpace(q.Get("node_id"))
+	plugin := strings.TrimSpace(q.Get("plugin"))
+	filtered := make([]model.Approval, 0, len(visible))
+	for _, approval := range visible {
+		if status != "" && approval.Status != status {
+			continue
+		}
+		if nodeID != "" && approval.NodeID != nodeID {
+			continue
+		}
+		if plugin != "" && approval.Plugin != plugin {
+			continue
+		}
+		filtered = append(filtered, approval)
+	}
+	total := len(filtered)
+	if offset > total {
+		filtered = nil
+	} else {
+		filtered = filtered[offset:]
+	}
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+	writeJSON(w, http.StatusOK, approvalsQueryResponse{
+		Approvals: toApprovalViews(filtered),
+		Total:     total,
+		Limit:     limit,
+		Offset:    offset,
+	})
+}
+
+type approvalsQueryResponse struct {
+	Approvals []approvalView `json:"approvals"`
+	Total     int            `json:"total"`
+	Limit     int            `json:"limit"`
+	Offset    int            `json:"offset"`
+}
+
+func approvalQueryRequested(r *http.Request) bool {
+	q := r.URL.Query()
+	for _, key := range []string{"status", "node_id", "plugin", "limit", "offset"} {
+		if _, ok := q[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 const approvalStatusDismissed = "dismissed"

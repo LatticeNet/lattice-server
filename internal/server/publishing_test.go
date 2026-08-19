@@ -66,7 +66,7 @@ func TestShareProjectsOntoTheReservedMountOnAnyHost(t *testing.T) {
 	if record.PathPrefix != "sub/cd-self" {
 		t.Errorf("path prefix = %q, want sub/cd-self", record.PathPrefix)
 	}
-	if record.Hostname != "" || !record.Reserved || record.ShareID != "share_1" {
+	if record.Hostname != "" || !record.AnyHost || !record.Reserved || record.ShareID != "share_1" {
 		t.Errorf("unexpected record: %+v", record)
 	}
 	for _, host := range []string{"lattice.example", "somewhere.else.example", ""} {
@@ -219,5 +219,33 @@ func TestPublishingLongestPrefixStillWins(t *testing.T) {
 	// A different host is not this binding's business.
 	if _, ok := s.publishingRecordForRequest(originStatic, "other.example", "/index.html"); ok {
 		t.Error("a static binding answered on a hostname it was not bound to")
+	}
+}
+
+// Answering on every host is a property a reserved mount is given, never one a
+// binding acquires by losing its hostname. The API refuses a blank host, but a
+// record written by an older build or by hand must fail closed rather than turn
+// into a wildcard that serves a bucket to every domain pointed at this server.
+func TestBlankHostnameIsNotAWildcard(t *testing.T) {
+	s, st := newShareTestServer(t)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	s.now = func() time.Time { return now }
+
+	if err := st.UpsertStorageBinding(model.StorageBinding{
+		ID: "bind_blank", Kind: originStatic, Bucket: "secret", Hostname: "", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"anything.example", "attacker.example"} {
+		if _, ok := s.publishingRecordForRequest(originStatic, host, "/index.html"); ok {
+			t.Errorf("a binding with no hostname answered on %q", host)
+		}
+	}
+	// A request that itself carries no Host still matches, because an exact
+	// comparison of two empty strings is what the pre-plane resolver did. That is
+	// left exactly as it was: tightening it is a behaviour change, not part of
+	// folding two schemes into one.
+	if _, ok := s.publishingRecordForRequest(originStatic, "", "/index.html"); !ok {
+		t.Error("blank-host matching changed; that is a behaviour change, not a refactor")
 	}
 }

@@ -57,10 +57,13 @@ type publishingRecord struct {
 	Origin string
 	// Bucket is the origin's target: a bucket name for kv and static, the
 	// owning share id for plugin.
-	Bucket string
-	// Hostname empty means the record answers on any host. Only reserved mounts
-	// use it; a stored binding always names a host.
-	Hostname   string
+	Bucket   string
+	Hostname string
+	// AnyHost makes the record answer on every hostname. It is a deliberate
+	// property of reserved mounts, never inferred from a blank Hostname: a
+	// stored binding that somehow lost its host must fail to match rather than
+	// widen into a wildcard.
+	AnyHost    bool
 	PathPrefix string
 	Enabled    bool
 	// ExpiresAt bounds the route in time. Nil means no bound.
@@ -112,9 +115,10 @@ func publishingRecordFromBinding(binding model.StorageBinding) publishingRecord 
 func publishingRecordFromShare(share model.SubscriptionShare) publishingRecord {
 	return publishingRecord{
 		ID: share.ID, Origin: originPlugin, Bucket: share.ID,
-		// Any host: the issued URL is used against whatever hostname the client
-		// was given, and this server has never restricted that.
+		// The issued URL is used against whatever hostname the client was given,
+		// and this server has never restricted that.
 		Hostname:   "",
+		AnyHost:    true,
 		PathPrefix: subscriptionMountPrefix + "/" + share.Slug,
 		Enabled:    share.Enabled,
 		ExpiresAt:  share.ExpiresAt,
@@ -166,10 +170,12 @@ func (r publishingRecord) servable(now time.Time) bool {
 	return true
 }
 
-// matchesHost reports whether the record answers on a hostname. An empty
-// Hostname answers on every host.
+// matchesHost reports whether the record answers on a hostname.
 func (r publishingRecord) matchesHost(hostname string) bool {
-	return r.Hostname == "" || strings.EqualFold(r.Hostname, hostname)
+	if r.AnyHost {
+		return true
+	}
+	return strings.EqualFold(r.Hostname, hostname)
 }
 
 // objectPath strips the record's prefix off a request path.
@@ -222,7 +228,7 @@ type publishingRecordView struct {
 func publishingRecordViewOf(record publishingRecord) publishingRecordView {
 	return publishingRecordView{
 		ID: record.ID, Origin: record.Origin, Bucket: record.Bucket,
-		Hostname: record.Hostname, AnyHost: record.Hostname == "",
+		Hostname: record.Hostname, AnyHost: record.AnyHost,
 		PathPrefix: record.PathPrefix, Enabled: record.Enabled, ExpiresAt: record.ExpiresAt,
 		Reserved: record.Reserved, ShareID: record.ShareID,
 		AdminScope: publishingAdminScope(record.Origin),

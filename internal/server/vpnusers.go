@@ -453,10 +453,23 @@ type vpnUserWriteReq struct {
 	Name        string          `json:"name"`
 	Enabled     *bool           `json:"enabled"`
 	Credentials []VpnCredential `json:"credentials"`
-	QuotaBytes  int64           `json:"quota_bytes"`
-	ExpiresAt   *time.Time      `json:"expires_at"`
-	Group       string          `json:"group"`
-	Comment     string          `json:"comment"`
+	// A pointer, like Enabled and ExpiresAt beside it, so "not supplied" is
+	// distinguishable from "set to zero". As a plain int64 an edit that never
+	// mentioned the quota still decoded as 0 here and the assignment below
+	// removed it, so renaming a quota'd account made it unlimited.
+	QuotaBytes *int64     `json:"quota_bytes"`
+	ExpiresAt  *time.Time `json:"expires_at"`
+	Group      string     `json:"group"`
+	Comment    string     `json:"comment"`
+}
+
+// quotaOrZero reads an optional quota. On create, "not supplied" and "no quota"
+// are the same thing: a new account without a stated limit is unlimited.
+func quotaOrZero(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func (s *Server) vpnUserCreate(request []byte) ([]byte, error) {
@@ -491,7 +504,7 @@ func (s *Server) vpnUserCreate(request []byte) ([]byte, error) {
 		Credentials: creds,
 		Bindings:    []LineBinding{},
 		SubID:       subID,
-		QuotaBytes:  req.QuotaBytes,
+		QuotaBytes:  quotaOrZero(req.QuotaBytes),
 		Group:       strings.TrimSpace(req.Group),
 		Comment:     strings.TrimSpace(req.Comment),
 		CreatedAt:   s.now(),
@@ -537,7 +550,9 @@ func (s *Server) vpnUserUpdate(request []byte) ([]byte, error) {
 		}
 		u.Credentials = creds
 	}
-	u.QuotaBytes = req.QuotaBytes
+	if req.QuotaBytes != nil {
+		u.QuotaBytes = *req.QuotaBytes
+	}
 	if req.ExpiresAt != nil {
 		u.ExpiresAt = *req.ExpiresAt
 	}

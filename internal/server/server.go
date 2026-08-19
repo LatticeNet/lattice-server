@@ -5265,7 +5265,31 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
-	iface, peers, err := wireguard.BuildMesh(s.store.Nodes(), target, req.ListenPort)
+	// A plan is compiled from every node in the store, and the config it
+	// returns carries each peer's public key, mesh IP and endpoint. `overview`
+	// meanwhile hides nodes this session cannot read, so without this check the
+	// same operator is refused that data by one endpoint and handed it by
+	// another, and the read filter is decoration rather than a boundary.
+	//
+	// Refused rather than filtered: a mesh config that silently omits peers is
+	// a broken config, and an asymmetric mesh is a worse outcome than a clear
+	// error. The count is reported, the identities are not.
+	nodes := s.store.Nodes()
+	unreadable := 0
+	for _, n := range nodes {
+		if n.ID == target.ID || n.WireGuardPublicKey == "" || n.WireGuardIP == "" {
+			continue
+		}
+		if !rbac.Allows(p.Principal, "wireguard:read", n.ID) {
+			unreadable++
+		}
+	}
+	if unreadable > 0 {
+		writeError(w, http.StatusForbidden, fmt.Errorf(
+			"planning this mesh would write %d peer(s) this session cannot read; wireguard:read is required on every mesh member", unreadable))
+		return
+	}
+	iface, peers, err := wireguard.BuildMesh(nodes, target, req.ListenPort)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

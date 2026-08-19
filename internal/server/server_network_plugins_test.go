@@ -215,3 +215,53 @@ func TestNetGuardReadRPCRequiresTheReadScope(t *testing.T) {
 		t.Fatal("review without netguard:read must be denied")
 	}
 }
+
+// An operator scoped to one node cannot plan a mesh whose config would carry
+// peers they are not allowed to see.
+//
+// overview filters its rows per node by wireguard:read, but a plan is compiled
+// from every node in the store and the config it returns names each peer's
+// public key, mesh IP and endpoint. So the same session was refused that data
+// by one endpoint and handed it by another, which made the read filter
+// decoration rather than a boundary.
+//
+// Refused rather than filtered on purpose: a mesh config that silently omits
+// peers is a broken config, and an asymmetric mesh is worse than a clear error.
+func TestWireGuardPlanRefusesPeersTheSessionCannotRead(t *testing.T) {
+	srv, st, _ := newNetworkPluginRPCServer(t)
+	for _, n := range []model.Node{
+		{ID: "node-a", Name: "target", WireGuardIP: "10.66.0.1/32", WireGuardPublicKey: wgKey(1), WireGuardPort: 51820},
+		{ID: "node-b", Name: "unreadable peer", WireGuardIP: "10.66.0.2/32", WireGuardPublicKey: wgKey(2), WireGuardPort: 51820},
+	} {
+		if err := st.UpsertNode(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scoped := principal{Principal: rbac.Principal{
+		ActorID:         "operator-scoped",
+		Scopes:          []string{"node:read", "network:plan", "wireguard:read", "wireguard:admin"},
+		ServerAllowlist: []string{"node-a"},
+	}}
+	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, scoped)
+
+	_, err := srv.wireGuardNetworksRPC(ctx, "plan", []byte(`{"node_id":"node-a","listen_port":51820}`))
+	var operationErr *pluginOperationError
+	if !errors.As(err, &operationErr) || operationErr.StatusCode != 403 {
+		t.Fatalf("planning a mesh containing an unreadable peer must be 403, got %v", err)
+	}
+	if strings.Contains(err.Error(), wgKey(2)) || strings.Contains(err.Error(), "node-b") {
+		t.Fatalf("the refusal must not name what it is protecting: %v", err)
+	}
+
+	// The same operator, once every mesh member is within its allowlist, plans
+	// normally. The check must gate on readability, not simply on being scoped.
+	full := principal{Principal: rbac.Principal{
+		ActorID:         "operator-full",
+		Scopes:          []string{"node:read", "network:plan", "wireguard:read", "wireguard:admin"},
+		ServerAllowlist: []string{"node-a", "node-b"},
+	}}
+	fullCtx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, full)
+	if _, err := srv.wireGuardNetworksRPC(fullCtx, "plan", []byte(`{"node_id":"node-a","listen_port":51820}`)); err != nil {
+		t.Fatalf("an operator who can read every mesh member must still be able to plan: %v", err)
+	}
+}

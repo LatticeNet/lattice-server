@@ -123,6 +123,36 @@ func (s *Server) handleNetPolicyPlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusNotFound, errors.New("netpolicy not found"))
 		return
 	}
+	// A rule may name another node as its remote, and compiling one embeds that
+	// node's WireGuard IP, public IPv4 and public IPv6 into the ruleset this
+	// endpoint returns. Authorization above covers the target node only, so
+	// without this an operator scoped to one node could name any node id and
+	// read its addresses back out of the plan: a lookup oracle wearing a
+	// policy's clothes. Group refs are an authoring-layer kind that normalize
+	// into node refs, so this runs after normalization to cover both.
+	normalized, err := netpolicy.NormalizePolicy(policy, s.resolveNode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	unreadable := 0
+	for _, rule := range normalized.Rules {
+		if rule.Remote.Kind != model.NetRefNode {
+			continue
+		}
+		remoteID := strings.TrimSpace(rule.Remote.NodeID)
+		if remoteID == "" || remoteID == normalized.TargetNodeID {
+			continue
+		}
+		if !rbac.Allows(p.Principal, "netpolicy:read", remoteID) {
+			unreadable++
+		}
+	}
+	if unreadable > 0 {
+		writeError(w, http.StatusForbidden, fmt.Errorf(
+			"planning this policy would embed the addresses of %d node(s) this session cannot read; netpolicy:read is required on every node a rule names", unreadable))
+		return
+	}
 	opts, err := s.netPolicyCompileOptions()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)

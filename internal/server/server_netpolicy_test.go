@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -673,4 +674,61 @@ func auditActionSeen(st *store.Store, action string) bool {
 		}
 	}
 	return false
+}
+
+// Planning a policy must not turn into a lookup oracle for nodes the session
+// cannot read.
+//
+// A rule can name another node as its remote, and compiling one embeds that
+// node's WireGuard IP, public IPv4 and public IPv6 into the ruleset the plan
+// endpoint returns. Authorization covers the target node only, so an operator
+// allowlisted to one node could name any node id and read its addresses back
+// out of the returned plan. Knowing an id is not entitlement to an address, and
+// ids in this fleet are guessable (node-a, dmit-1).
+func TestNetPolicyPlanRefusesRemotesTheSessionCannotRead(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	enrollNamedNode(t, handler, cookies, csrf, "node-b", "Node B")
+	setNodeIP(t, st, "node-a", "10.66.0.1/32", "203.0.113.10")
+	setNodeIP(t, st, "node-b", "10.66.0.2/32", "198.51.100.2")
+
+	// The admin authors a policy on node-a whose rule points at node-b.
+	create := doJSON(t, handler, http.MethodPost, "/api/netpolicy", `{
+		"target_node_id":"node-a",
+		"enabled":true,
+		"rules":[{
+			"id":"deny-b",
+			"action":"deny",
+			"direction":"egress",
+			"protocol":"tcp",
+			"ports":[1234],
+			"remote":{"kind":"node","node_id":"node-b"}
+		}]
+	}`, cookies, csrf)
+	create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create policy failed: %d", create.StatusCode)
+	}
+
+	// A token allowlisted to node-a alone must not be able to plan it, because
+	// the plan would carry node-b's addresses.
+	scoped := createPAT(t, handler, cookies, csrf,
+		[]string{"netpolicy:read", "netpolicy:admin", "network:plan"}, []string{"node-a"})
+	denied := doBearerJSON(t, handler, http.MethodPost, "/api/netpolicy/plan", `{"node_id":"node-a"}`, scoped)
+	defer denied.Body.Close()
+	if denied.StatusCode != http.StatusForbidden {
+		t.Fatalf("planning a policy naming an unreadable remote must be 403, got %d", denied.StatusCode)
+	}
+	body, _ := io.ReadAll(denied.Body)
+	if strings.Contains(string(body), "198.51.100.2") || strings.Contains(string(body), "node-b") {
+		t.Fatalf("the refusal must not disclose what it is protecting: %s", body)
+	}
+
+	// The unrestricted admin, who can read both nodes, still plans normally.
+	ok := doJSON(t, handler, http.MethodPost, "/api/netpolicy/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("an operator who can read every named node must still be able to plan: %d", ok.StatusCode)
+	}
 }

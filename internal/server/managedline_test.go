@@ -13,6 +13,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -60,9 +61,20 @@ func realityInventoryLines() []model.SingBoxNode {
 	}
 }
 
+// rolloutTestPrincipal is the operator these tests were always meant to model.
+// They previously passed lineUserTestPrincipal(), which holds no scopes at all,
+// and the compiler did not look. It does now: a rollout authorizes network:plan
+// on every node it touches, so a scopeless caller correctly plans nothing. The
+// tests encoded the unauthorized behaviour, so they are updated rather than the
+// check relaxed. TestManagedLineRolloutRefusesUnauthorizedNodes covers the
+// scopeless and partially-scoped cases directly.
+func rolloutTestPrincipal() principal {
+	return principal{Principal: rbac.Principal{ActorID: "op-1", Scopes: []string{"network:plan"}}}
+}
+
 func compileOne(t *testing.T, srv *Server, req managedLineRolloutRequest) ([]managedLinePlannedView, []managedLineSkippedView) {
 	t.Helper()
-	planned, skipped, err := srv.compileManagedLineRollout(context.Background(), lineUserTestPrincipal(), req)
+	planned, skipped, err := srv.compileManagedLineRollout(context.Background(), rolloutTestPrincipal(), req)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -457,7 +469,10 @@ func TestManagedLineRPCManagedAndRollout(t *testing.T) {
 	srv := newManagedLineTestServer(t)
 	seedManagedLineNode(t, srv, "node-a", realityInventoryLines())
 	seedManagedLineUser(t, srv)
-	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, lineUserTestPrincipal())
+	// rolloutTestPrincipal, not lineUserTestPrincipal: the rollout now
+	// authorizes network:plan on every node it touches, and the plugin RPC
+	// carries the same principal the REST path does.
+	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, rolloutTestPrincipal())
 
 	out, err := srv.vpnCoreLinesRPC(ctx, "rollout", []byte(`{"user_id":"vpnuser_cdcd"}`))
 	if err != nil {

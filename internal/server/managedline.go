@@ -17,6 +17,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -397,6 +398,10 @@ func (s *Server) handleManagedLineRollout(w http.ResponseWriter, r *http.Request
 		}
 		planned, skipped, err := s.compileManagedLineRollout(r.Context(), p, req)
 		if err != nil {
+			if errors.Is(err, errUnreadableNodes) {
+				writeError(w, http.StatusForbidden, err)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -440,11 +445,37 @@ func (s *Server) compileManagedLineRollout(ctx context.Context, p principal, req
 		inventories[inv.NodeID] = inv
 	}
 	nodeIDs := uniqueNonEmpty(req.NodeIDs)
-	if len(nodeIDs) == 0 {
+	explicit := len(nodeIDs) > 0
+	if !explicit {
 		for nodeID := range inventories {
 			nodeIDs = append(nodeIDs, nodeID)
 		}
 		sort.Strings(nodeIDs)
+	}
+	// node_ids is a body field, so withAuth's ?node_id check never fired and no
+	// target was ever authorized. Omitting it fanned the rollout across every
+	// node with a live sing-box inventory, returning each one's id, inherited
+	// REALITY SNI and allocated port, plus per-node health and existence in the
+	// skipped list, and writing a fresh REALITY keypair and a pending approval
+	// against each. Any network:plan holder reached the whole fleet.
+	//
+	// An explicit list is refused when it names a node the caller cannot plan
+	// for: asking for a node and silently not getting it is a wrong answer.
+	// The implicit list is narrowed instead, because "every node I can plan
+	// for" is what the caller meant and refusing the whole batch over one
+	// unreadable node would make the default unusable in any scoped fleet.
+	if explicit {
+		if denied := deniedNodeCount(p.Principal, "network:plan", nodeIDs); denied > 0 {
+			return nil, nil, unreadableNodesError(denied, "network:plan", "this rollout")
+		}
+	} else {
+		scoped := nodeIDs[:0]
+		for _, nodeID := range nodeIDs {
+			if rbac.Allows(p.Principal, "network:plan", nodeID) {
+				scoped = append(scoped, nodeID)
+			}
+		}
+		nodeIDs = scoped
 	}
 	defs, err := s.managedLineDefs()
 	if err != nil {

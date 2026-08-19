@@ -60,7 +60,20 @@ func (s *Server) handleNetPolicy(w http.ResponseWriter, r *http.Request, p princ
 		if !s.requireNodeScope(w, p, "netpolicy:admin", req.TargetNodeID) {
 			return
 		}
-		policy, err := netpolicy.NormalizePolicy(req, s.resolveNode)
+		// A rule may name another node as its remote. Resolving that through
+		// an unscoped lookup let an operator scoped to one node learn whether
+		// any guessable node id existed, because "node not found" and "outside
+		// your allowlist" were distinguishable answers. The scoped resolver
+		// returns not-found for both, so authoring cannot probe the fleet.
+		//
+		// Refused rather than filtered: silently dropping a rule whose remote
+		// the author cannot read would store a policy that does not say what
+		// they wrote, and they would find out at apply time.
+		resolver := s.nodeResolverFor(p, "netpolicy:read", "this policy", req.TargetNodeID)
+		policy, err := netpolicy.NormalizePolicy(req, resolver.Resolve)
+		if s.writeRefusal(w, p, resolver) {
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -128,29 +141,25 @@ func (s *Server) handleNetPolicyPlan(w http.ResponseWriter, r *http.Request, p p
 	// endpoint returns. Authorization above covers the target node only, so
 	// without this an operator scoped to one node could name any node id and
 	// read its addresses back out of the plan: a lookup oracle wearing a
-	// policy's clothes. Group refs are an authoring-layer kind that normalize
-	// into node refs, so this runs after normalization to cover both.
-	normalized, err := netpolicy.NormalizePolicy(policy, s.resolveNode)
-	if err != nil {
+	// policy's clothes. The resolver carries the principal, so every remote that
+	// reaches the compiler has been checked. Group refs are an authoring-layer
+	// kind that normalize into node refs, and normalization runs through the
+	// same resolver, so both kinds are covered.
+	//
+	// Refused rather than filtered: a ruleset silently missing the rules whose
+	// remotes the caller cannot read is a wrong firewall, not a shorter one.
+	resolver := s.nodeResolverFor(p, "netpolicy:read", "planning this policy", policy.TargetNodeID)
+	// The normalized form is discarded: it runs so group refs expand into node
+	// refs and pass through the resolver, which is where the check happens.
+	// The compile below deliberately uses the stored policy, as it did before.
+	if _, err := netpolicy.NormalizePolicy(policy, resolver.Resolve); err != nil {
+		if s.writeRefusal(w, p, resolver) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	unreadable := 0
-	for _, rule := range normalized.Rules {
-		if rule.Remote.Kind != model.NetRefNode {
-			continue
-		}
-		remoteID := strings.TrimSpace(rule.Remote.NodeID)
-		if remoteID == "" || remoteID == normalized.TargetNodeID {
-			continue
-		}
-		if !rbac.Allows(p.Principal, "netpolicy:read", remoteID) {
-			unreadable++
-		}
-	}
-	if unreadable > 0 {
-		writeError(w, http.StatusForbidden, fmt.Errorf(
-			"planning this policy would embed the addresses of %d node(s) this session cannot read; netpolicy:read is required on every node a rule names", unreadable))
+	if s.writeRefusal(w, p, resolver) {
 		return
 	}
 	opts, err := s.netPolicyCompileOptions()
@@ -158,7 +167,13 @@ func (s *Server) handleNetPolicyPlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	egressPlan, err := netpolicy.CompileEgressPlan(policy, s.resolveNode, opts)
+	egressPlan, err := netpolicy.CompileEgressPlan(policy, resolver.Resolve, opts)
+	// Checked before the compile error on purpose: a denied lookup makes the
+	// compiler fail with a message that names the node, and that message is
+	// exactly what the refusal exists to withhold.
+	if s.writeRefusal(w, p, resolver) {
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -337,10 +352,6 @@ func (s *Server) handleNetPolicyGraph(w http.ResponseWriter, r *http.Request, p 
 		}
 	}
 	writeJSON(w, http.StatusOK, netpolicy.BuildGraph(visibleNodes, visiblePolicies))
-}
-
-func (s *Server) resolveNode(nodeID string) (model.Node, bool) {
-	return s.store.Node(nodeID)
 }
 
 func (s *Server) toNetPolicyView(policy model.NetPolicy) netPolicyView {

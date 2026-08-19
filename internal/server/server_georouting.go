@@ -51,7 +51,17 @@ func (s *Server) handleGeoRoutings(w http.ResponseWriter, r *http.Request, p pri
 		if !s.requireScope(w, p, "geo:read") {
 			return
 		}
-		records := s.store.GeoRoutings()
+		// Filtered, not refused: this is a list, so a shorter list is a correct
+		// answer. A record is shown only when every node it names is readable,
+		// because the record IS its node id list, and showing a partial one
+		// would disclose the very ids the allowlist withholds.
+		records := make([]model.GeoRouting, 0)
+		for _, record := range s.store.GeoRoutings() {
+			if deniedNodeCount(p.Principal, "geo:read", append(append([]string{}, record.NodeIDs...), record.DNSNodeIDs...)) > 0 {
+				continue
+			}
+			records = append(records, record)
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"geo_routings": records})
 	case http.MethodPost:
 		if !s.requireScope(w, p, "geo:admin") {
@@ -59,6 +69,12 @@ func (s *Server) handleGeoRoutings(w http.ResponseWriter, r *http.Request, p pri
 		}
 		var req model.GeoRouting
 		if !decodeClientJSON(w, r, &req) {
+			return
+		}
+		// Authorize the node set before normalization, because normalization
+		// answers "node not found: X" and that was an existence oracle over any
+		// guessed node id for a caller holding flat geo:admin.
+		if !s.requireReadableNodes(w, p, "geo:admin", "this geo routing", append(append([]string{}, req.NodeIDs...), req.DNSNodeIDs...)) {
 			return
 		}
 		gr, err := s.normalizeGeoRouting(req)
@@ -150,6 +166,18 @@ func (s *Server) handleGeoRoutingPlan(w http.ResponseWriter, r *http.Request, p 
 	gr, ok := s.store.GeoRouting(req.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("geo routing not found"))
+		return
+	}
+	// The rendered config carries each named node's public IPv4 and IPv6, and
+	// the strategy selection carries its coordinates. Authorization above is a
+	// flat scope check with no node in it, so without this any geo:read holder
+	// could create a record naming any node and read that node's addresses out
+	// of the plan: the same lookup oracle the netpolicy plan endpoint had.
+	//
+	// Refused rather than filtered: a geo config rendered from a subset of its
+	// nodes would resolve traffic to the wrong place, which is worse than an
+	// error.
+	if !s.requireReadableNodes(w, p, "geo:read", "planning this geo routing", append(append([]string{}, gr.NodeIDs...), gr.DNSNodeIDs...)) {
 		return
 	}
 	res, err := georouting.Render(s.buildGeoInput(gr))

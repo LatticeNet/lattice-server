@@ -207,7 +207,7 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	}
 	ingressRules, err := s.composeNFTIngressPolicy(dep.NodeID, &planInput, p)
 	if err != nil {
-		if errors.Is(err, errNFTIngressPolicyReadRequired) {
+		if errors.Is(err, errNFTIngressPolicyReadRequired) || errors.Is(err, errUnreadableNodes) {
 			writeError(w, http.StatusForbidden, err)
 			return
 		}

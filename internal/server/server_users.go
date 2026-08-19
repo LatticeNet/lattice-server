@@ -64,11 +64,28 @@ func normalizeScopes(scopes []string) []string {
 	return out
 }
 
-// validateGrantScopes enforces two rules on a scope assignment: every scope is a
-// real catalog scope (no typos / made-up strings), and every scope is within the
-// acting admin's own grant (no privilege escalation, mirroring token creation).
+// validateGrantScopes enforces three rules on a scope assignment: the acting
+// admin is not itself confined to a node subset, every scope is a real catalog
+// scope (no typos / made-up strings), and every scope is within the acting
+// admin's own grant (no privilege escalation, mirroring token creation).
 // Returns (status, err) with status 0 on success.
 func (s *Server) validateGrantScopes(p principal, scopes []string) (int, error) {
+	// A user account has no server allowlist: model.User carries scopes only,
+	// and principalFromRequest builds a session principal with an empty
+	// allowlist, which rbac.Allows reads as "every node". So a token confined to
+	// one node that also held user:admin could mint an account with its own
+	// scopes and then log in as that account with the confinement gone. The
+	// allowlist was not bypassed, it was laundered through a second identity.
+	//
+	// Token creation already contains this with serverAllowlistSubset, and node
+	// enroll with principalHasNodeRestriction. This is the third door.
+	//
+	// Not widened to make anything work: an operator who genuinely needs to
+	// administer users needs an unrestricted allowlist, because the accounts
+	// they create are unrestricted by construction.
+	if principalHasNodeRestriction(p) {
+		return http.StatusForbidden, errors.New("administering users requires an unrestricted server allowlist, because a user account carries no allowlist of its own")
+	}
 	for _, sc := range scopes {
 		if !rbac.ValidScope(sc) {
 			return http.StatusBadRequest, fmt.Errorf("unknown scope %q", sc)

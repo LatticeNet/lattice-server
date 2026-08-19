@@ -4802,9 +4802,20 @@ func toTokenView(t model.Token) tokenView {
 func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
+		// tokenView carries ServerAllowlist, so listing every token handed a
+		// node-confined principal the node ids of the whole fleet out of other
+		// tokens' allowlists, plus who holds which scope. The route's node check
+		// keys on ?node_id, which this GET never carries, so nothing applied.
+		//
+		// Filtered, not refused: this is a list. A confined principal sees the
+		// tokens whose allowlist is a subset of its own, which is the same
+		// containment rule token creation already enforces on the write side.
 		tokens := s.store.Tokens()
 		views := make([]tokenView, 0, len(tokens))
 		for _, t := range tokens {
+			if principalHasNodeRestriction(p) && !serverAllowlistSubset(p.ServerAllowlist, t.ServerAllowlist) {
+				continue
+			}
 			views = append(views, toTokenView(t))
 		}
 		writeJSON(w, http.StatusOK, views)
@@ -4962,7 +4973,7 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	}
 	ingressRules, err := s.composeNFTIngressPolicy(req.NodeID, &planInput, p)
 	if err != nil {
-		if errors.Is(err, errNFTIngressPolicyReadRequired) {
+		if errors.Is(err, errNFTIngressPolicyReadRequired) || errors.Is(err, errUnreadableNodes) {
 			writeError(w, http.StatusForbidden, err)
 			return
 		}
@@ -5093,7 +5104,87 @@ func requestBool(r *http.Request, key string) bool {
 	}
 }
 
+// approvalPlanReach reports the nodes beyond approval.NodeID whose data the
+// stored plan bytes carry, and the scope required to read them.
+//
+// This exists because closing the plan endpoints was only half the job. A plan
+// endpoint now refuses to compile a mesh or a ruleset for a principal that
+// cannot read every node involved, and then stores those exact bytes in
+// approval.Plan, which GET /api/network/approvals hands back. Filtering the
+// read path on approval.NodeID alone meant the refusal could be walked around
+// by reading the approval a better-scoped operator had already created.
+//
+// The set is recomputed from current state rather than recorded at plan time,
+// because model.Approval has no field to record it in and that type lives in
+// another repository. The approximation is deliberate and errs toward refusing:
+// for a mesh the current membership is the same set the plan endpoint would use
+// now, and for a policy the current rules are. The residual is a plan whose
+// policy was edited after planning, where the stored bytes may still name a
+// node the current rules no longer do. Recording the set at plan time is the
+// real fix and needs an SDK field.
+func (s *Server) approvalPlanReach(approval model.Approval) (string, []string) {
+	switch {
+	case approval.Plugin == "wireguard" && approval.Action == "apply-config":
+		// The plan is a mesh config: every member's public key, mesh IP and
+		// endpoint is in the bytes.
+		members := make([]string, 0)
+		for _, n := range s.store.Nodes() {
+			if n.ID == approval.NodeID || n.WireGuardPublicKey == "" || n.WireGuardIP == "" {
+				continue
+			}
+			members = append(members, n.ID)
+		}
+		return "wireguard:read", members
+	case approval.Plugin == "nftpolicy":
+		// The plan is a compiled ruleset: every remote node named by a rule has
+		// its WireGuard IP and public addresses in the bytes.
+		policy, ok := s.store.NetPolicy(approval.NodeID)
+		if !ok {
+			return "", nil
+		}
+		remotes := make([]string, 0, len(policy.Rules))
+		for _, rule := range policy.Rules {
+			if rule.Remote.Kind != model.NetRefNode {
+				continue
+			}
+			remoteID := strings.TrimSpace(rule.Remote.NodeID)
+			if remoteID == "" || remoteID == approval.NodeID {
+				continue
+			}
+			remotes = append(remotes, remoteID)
+		}
+		return "netpolicy:read", remotes
+	}
+	return "", nil
+}
+
 func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval) bool {
+	if !s.approvalPrimaryScopeAllows(p, approval) {
+		return false
+	}
+	// A multi-target plugin operation records its first target in NodeID and
+	// the rest in Targets. Filtering on NodeID alone disclosed the identities
+	// of the other targets, and the plan compiled for them, to a principal
+	// scoped to the first one only.
+	for _, target := range approval.Targets {
+		if strings.TrimSpace(target) == "" || target == approval.NodeID {
+			continue
+		}
+		if !rbac.Allows(p.Principal, "network:plan", target) {
+			return false
+		}
+	}
+	// Filtered, not refused, and deliberately: this is a list. A caller who
+	// cannot read one approval sees a shorter list, which is a correct answer.
+	// The refuse-instead-of-filter rule applies to artefacts, not listings.
+	scope, reach := s.approvalPlanReach(approval)
+	if scope == "" {
+		return true
+	}
+	return deniedNodeCount(p.Principal, scope, reach) == 0
+}
+
+func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval) bool {
 	switch approval.Plugin {
 	case "nftpolicy":
 		return rbac.Allows(p.Principal, "netpolicy:admin", approval.NodeID)
@@ -5264,15 +5355,17 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
-	target, ok := s.store.Node(req.NodeID)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("node not found"))
-		return
-	}
+	// Scope first, then existence. The other order answered "does node X
+	// exist" with a 404-against-403 difference before any check ran.
 	if !s.requireNodeScope(w, p, "wireguard:admin", req.NodeID) {
 		return
 	}
 	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
+		return
+	}
+	target, ok := s.store.Node(req.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
 		return
 	}
 	// A plan is compiled from every node in the store, and the config it
@@ -5283,20 +5376,17 @@ func (s *Server) handleWireGuardPlan(w http.ResponseWriter, r *http.Request, p p
 	//
 	// Refused rather than filtered: a mesh config that silently omits peers is
 	// a broken config, and an asymmetric mesh is a worse outcome than a clear
-	// error. The count is reported, the identities are not.
+	// error. requireReadableNodes owns the count-only wording, so this handler
+	// cannot invent a message that names a peer.
 	nodes := s.store.Nodes()
-	unreadable := 0
+	meshMembers := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		if n.ID == target.ID || n.WireGuardPublicKey == "" || n.WireGuardIP == "" {
 			continue
 		}
-		if !rbac.Allows(p.Principal, "wireguard:read", n.ID) {
-			unreadable++
-		}
+		meshMembers = append(meshMembers, n.ID)
 	}
-	if unreadable > 0 {
-		writeError(w, http.StatusForbidden, fmt.Errorf(
-			"planning this mesh would write %d peer(s) this session cannot read; wireguard:read is required on every mesh member", unreadable))
+	if !s.requireReadableNodes(w, p, "wireguard:read", "planning this mesh", meshMembers) {
 		return
 	}
 	iface, peers, err := wireguard.BuildMesh(nodes, target, req.ListenPort)

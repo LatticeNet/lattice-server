@@ -133,3 +133,67 @@ func TestSubscriptionShareDelete(t *testing.T) {
 		t.Fatalf("list not empty after delete: %v", s.SubscriptionShares())
 	}
 }
+
+// The public token lookup is the one comparison an anonymous caller can drive,
+// so it compares in constant time and refuses a duplicate rather than serving
+// whichever share the map yielded first.
+//
+// The documentation claimed both properties before the code had either: it said
+// the route "uses a constant-time full scan" and "fails closed on duplicate
+// tokens" while the implementation was a plain == with an early return. These
+// pin the behaviour so the claim and the code cannot drift apart again.
+func TestSubscriptionShareByTokenResolvesExactlyOne(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sh := range []model.SubscriptionShare{
+		{ID: "sh1", Slug: "one", Token: "token-one", Enabled: true,
+			Source: model.ShareSource{Kind: model.ShareSourceCoreProxyUser, ProxyUserID: "u1"}},
+		{ID: "sh2", Slug: "two", Token: "token-two", Enabled: true,
+			Source: model.ShareSource{Kind: model.ShareSourceCoreProxyUser, ProxyUserID: "u2"}},
+	} {
+		if err := s.UpsertSubscriptionShare(sh); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, ok := s.SubscriptionShareByToken("token-two")
+	if !ok || got.ID != "sh2" {
+		t.Fatalf("exact token must resolve its own share: ok=%v id=%q", ok, got.ID)
+	}
+	if _, ok := s.SubscriptionShareByToken("token-thre"); ok {
+		t.Fatal("a token of the same length that does not match must not resolve")
+	}
+	// A prefix must never work: a partially guessed token stays useless.
+	if _, ok := s.SubscriptionShareByToken("token-tw"); ok {
+		t.Fatal("a prefix of a valid token resolved, which makes guessing incremental")
+	}
+	if _, ok := s.SubscriptionShareByToken(""); ok {
+		t.Fatal("the empty token resolved")
+	}
+}
+
+func TestSubscriptionShareByTokenFailsClosedOnDuplicateToken(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should be unreachable with CSPRNG tokens. If it ever happens, Go
+	// randomises map iteration, so serving the first hit would hand the same
+	// URL different subscriptions on different requests. Refusing is the only
+	// answer that is the same every time.
+	for _, sh := range []model.SubscriptionShare{
+		{ID: "sh1", Slug: "one", Token: "collided", Enabled: true,
+			Source: model.ShareSource{Kind: model.ShareSourceCoreProxyUser, ProxyUserID: "u1"}},
+		{ID: "sh2", Slug: "two", Token: "collided", Enabled: true,
+			Source: model.ShareSource{Kind: model.ShareSourceCoreProxyUser, ProxyUserID: "u2"}},
+	} {
+		if err := s.UpsertSubscriptionShare(sh); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, ok := s.SubscriptionShareByToken("collided"); ok {
+		t.Fatalf("a duplicated token must resolve to nothing, got %q", got.ID)
+	}
+}

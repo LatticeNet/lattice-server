@@ -2113,23 +2113,27 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request, p principal) {
 }
 
 type nodeView struct {
-	ID                   string                   `json:"id"`
-	LatticeIdentityUUID  string                   `json:"lattice_identity_uuid,omitempty"`
-	Name                 string                   `json:"name"`
-	Comment              string                   `json:"comment,omitempty"`
-	Tags                 []string                 `json:"tags"`
-	Role                 string                   `json:"role"`
-	Inventory            *model.NodeInventory     `json:"inventory,omitempty"`
-	WireGuardIP          string                   `json:"wireguard_ip"`
-	WireGuardPublicKey   string                   `json:"wireguard_public_key,omitempty"`
-	WireGuardEndpoint    string                   `json:"wireguard_endpoint,omitempty"`
-	WireGuardPort        int                      `json:"wireguard_port,omitempty"`
-	PublicIP             string                   `json:"public_ip"`
-	PublicIPv6           string                   `json:"public_ipv6,omitempty"`
-	InternalIP           string                   `json:"internal_ip,omitempty"`
-	InternalIPv6         string                   `json:"internal_ipv6,omitempty"`
-	AgentVersion         string                   `json:"agent_version"`
-	Online               bool                     `json:"online"`
+	ID                  string               `json:"id"`
+	LatticeIdentityUUID string               `json:"lattice_identity_uuid,omitempty"`
+	Name                string               `json:"name"`
+	Comment             string               `json:"comment,omitempty"`
+	Tags                []string             `json:"tags"`
+	Role                string               `json:"role"`
+	Inventory           *model.NodeInventory `json:"inventory,omitempty"`
+	WireGuardIP         string               `json:"wireguard_ip"`
+	WireGuardPublicKey  string               `json:"wireguard_public_key,omitempty"`
+	WireGuardEndpoint   string               `json:"wireguard_endpoint,omitempty"`
+	WireGuardPort       int                  `json:"wireguard_port,omitempty"`
+	PublicIP            string               `json:"public_ip"`
+	PublicIPv6          string               `json:"public_ipv6,omitempty"`
+	InternalIP          string               `json:"internal_ip,omitempty"`
+	InternalIPv6        string               `json:"internal_ipv6,omitempty"`
+	AgentVersion        string               `json:"agent_version"`
+	Online              bool                 `json:"online"`
+	// Reachability distinguishes a node that stopped reporting from one that
+	// never has. Online stays for existing consumers; both are derived from the
+	// same fields at view time, so they cannot disagree.
+	Reachability         string                   `json:"reachability"`
 	Disabled             bool                     `json:"disabled,omitempty"`
 	AgentSourceAllowlist []string                 `json:"agent_source_allowlist,omitempty"`
 	TokenLastUsedAt      time.Time                `json:"token_last_used_at,omitempty"`
@@ -2172,7 +2176,7 @@ func (s *Server) toNodeView(n model.Node) nodeView {
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
-		Online: n.Online, Disabled: n.Disabled, AgentSourceAllowlist: append([]string(nil), n.AgentSourceAllowlist...), TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
+		Online: n.Online, Reachability: nodeReachability(n), Disabled: n.Disabled, AgentSourceAllowlist: append([]string(nil), n.AgentSourceAllowlist...), TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
 		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }

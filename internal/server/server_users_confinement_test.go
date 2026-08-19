@@ -168,3 +168,45 @@ func TestRefusesToConfineTheLastUnrestrictedAdministrator(t *testing.T) {
 		t.Fatalf("confining an admin with a peer left returned %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// The trap in making update apply the field: every other reason to update a
+// user (a scope change, a password reset) sends no allowlist, and treating that
+// as "no confinement" would quietly widen the account back to the whole fleet.
+// Absent means unchanged; an explicit empty list is how you widen on purpose.
+func TestAnUpdateThatOmitsTheAllowlistLeavesConfinementAlone(t *testing.T) {
+	h, st := newTestServer(t)
+	seedNodes(t, st, "node-a", "node-b")
+	adminCookies, csrf := loginSession(t, h)
+
+	rec := authedPost(t, h, adminCookies, csrf, "/api/users",
+		`{"username":"scoped","password":"`+testAdminPass+`","scopes":["node:read"],"server_allowlist":["node-a"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	var created userView
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	// A password reset, carrying no allowlist at all.
+	rec = authedPost(t, h, adminCookies, csrf, "/api/users/update",
+		`{"id":"`+created.ID+`","scopes":["node:read"],"password":"another correct horse battery"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update: %d %s", rec.Code, rec.Body.String())
+	}
+	after, _ := st.User(created.ID)
+	if len(after.ServerAllowlist) != 1 || after.ServerAllowlist[0] != "node-a" {
+		t.Fatalf("a password reset changed the confinement to %v", after.ServerAllowlist)
+	}
+
+	// An explicit empty list widens on purpose.
+	rec = authedPost(t, h, adminCookies, csrf, "/api/users/update",
+		`{"id":"`+created.ID+`","scopes":["node:read"],"server_allowlist":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("widen: %d %s", rec.Code, rec.Body.String())
+	}
+	after, _ = st.User(created.ID)
+	if len(after.ServerAllowlist) != 0 {
+		t.Fatalf("an explicit empty list did not widen: %v", after.ServerAllowlist)
+	}
+}

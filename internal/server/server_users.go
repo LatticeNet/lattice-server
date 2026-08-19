@@ -225,10 +225,16 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		ID              string   `json:"id"`
-		Scopes          []string `json:"scopes"`
-		ServerAllowlist []string `json:"server_allowlist"`
-		Password        string   `json:"password"`
+		ID     string   `json:"id"`
+		Scopes []string `json:"scopes"`
+		// A pointer so an absent key can be told from an explicit empty list.
+		// Absent leaves the confinement untouched, the way an empty password
+		// leaves the existing one; sending [] is how you deliberately widen an
+		// account back to every node. Applying nil as "no confinement" would
+		// mean every scope edit and every password reset silently un-confined
+		// the account it touched.
+		ServerAllowlist *[]string `json:"server_allowlist"`
+		Password        string    `json:"password"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -245,7 +251,10 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, status, err)
 		return
 	}
-	newAllowlist := normalizeAllowlist(req.ServerAllowlist)
+	newAllowlist := target.ServerAllowlist
+	if req.ServerAllowlist != nil {
+		newAllowlist = normalizeAllowlist(*req.ServerAllowlist)
+	}
 	if status, err := s.validateGrantAllowlist(p, newAllowlist); err != nil {
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.update", Scope: "user:admin", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"target": target.ID}})
 		writeError(w, status, err)

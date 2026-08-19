@@ -2426,16 +2426,35 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	}
 	// Validate group assignments up front (before any mutation) so a bad group id
 	// rejects the whole enroll rather than leaving an orphaned node behind.
+	//
+	// group_ids appends the enrolled node to each group's explicit Members,
+	// which is the same canonical membership write handleGroupMembers guards.
+	// This route is gated on node:admin, so it used to perform that write with
+	// no group:admin at all: a node:admin holder joined its own node to
+	// whatever policy a group carried. The unknown-group 400 below was also a
+	// group existence oracle for a caller with no group:read, which is why the
+	// scope check comes first and the lookup second.
 	enrollGroupIDs := make([]string, 0, len(req.GroupIDs))
-	{
+	if len(req.GroupIDs) > 0 {
+		if !s.requireScope(w, p, "group:admin") {
+			return
+		}
 		seen := make(map[string]bool, len(req.GroupIDs))
 		for _, gid := range req.GroupIDs {
 			gid = strings.TrimSpace(gid)
 			if gid == "" || seen[gid] {
 				continue
 			}
-			if _, ok := s.store.Group(gid); !ok {
+			group, ok := s.store.Group(gid)
+			if !ok {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("group %q not found", gid))
+				return
+			}
+			// Reach, not just scope: joining a group makes the new node a
+			// concrete member of whatever policy that group carries, alongside
+			// members the caller may not administer. The same refusal
+			// handleGroupMembers writes for the same reason.
+			if !s.requireReadableNodes(w, p, "group:admin", "this group assignment", group.Members) {
 				return
 			}
 			seen[gid] = true
@@ -5191,6 +5210,22 @@ func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval
 	if !s.approvalPrimaryScopeAllows(p, approval) {
 		return false
 	}
+	return s.approvalNodeReachAllows(p, approval)
+}
+
+// approvalNodeReachAllows reports whether p may read every node an approval's
+// plan is built from: the targets beyond NodeID, and the plan's own reach.
+//
+// Split out of approvalVisibleToPrincipal so the listing and the three decision
+// verbs enforce one implementation. They had diverged, and the decision verbs
+// answer with the full plan text, so the divergence was a disclosure.
+//
+// The primary read scope is deliberately NOT part of this: which scope may read
+// a plugin's plans and which may decide them are different questions with
+// different answers, and the decision path spells its own authority as
+// network:apply plus approvalDecisionExtraScope. What both paths must agree on
+// is the set of nodes.
+func (s *Server) approvalNodeReachAllows(p principal, approval model.Approval) bool {
 	// A multi-target plugin operation records its first target in NodeID and
 	// the rest in Targets. Filtering on NodeID alone disclosed the identities
 	// of the other targets, and the plan compiled for them, to a principal
@@ -6508,10 +6543,72 @@ func (s *Server) requireApprovalDecisionScopes(w http.ResponseWriter, p principa
 		return false
 	}
 	extra := approvalDecisionExtraScope(approval)
-	if extra == "" {
+	if extra != "" && !s.requireNodeScope(w, p, extra, approval.NodeID) {
+		return false
+	}
+	// Deciding an approval also hands its full plan back: approve, reject and
+	// dismiss all answer with toApprovalView, whose Plan is the stored text. So
+	// the decision path has to clear the read gate the listing clears, and it
+	// did not: it authorized approval.NodeID alone while
+	// approvalVisibleToPrincipal additionally requires network:plan on every
+	// target and read scope over the whole plan reach.
+	//
+	// The gap made reject a read primitive for a plan the same principal is
+	// refused on the plan endpoint and in the listing. It is worse than a plain
+	// leak because rejecting an already-decided approval mutates nothing, so
+	// the disclosure carries no side effect to notice.
+	//
+	// The listing is the correct set and is not narrowed to match: it is the
+	// one that already reasons about targets and plan reach.
+	return s.requireApprovalNodeReach(w, p, approval)
+}
+
+// requireApprovalNodeReach refuses a decision on an approval whose plan covers
+// nodes the caller cannot read, counting them without naming any. Naming them
+// would reintroduce the oracle the count-only refusals close; see
+// unreadableNodesError.
+func (s *Server) requireApprovalNodeReach(w http.ResponseWriter, p principal, approval model.Approval) bool {
+	if s.approvalNodeReachAllows(p, approval) {
 		return true
 	}
-	return s.requireNodeScope(w, p, extra, approval.NodeID)
+	denied := s.deniedApprovalNodeCount(p, approval)
+	s.recordAudit(model.AuditEvent{
+		ID:            id.New("audit"),
+		ActorID:       p.ActorID,
+		TokenID:       p.TokenID,
+		NodeID:        approval.NodeID,
+		Action:        "authorize.approval",
+		Scope:         "network:plan",
+		Decision:      "deny",
+		Reason:        fmt.Sprintf("%d node(s) in the approval are outside the session server allowlist", denied),
+		CorrelationID: p.CorrelationID,
+	})
+	writeError(w, http.StatusForbidden, fmt.Errorf(
+		"deciding this approval would disclose a plan covering %d node(s) this session cannot read: %w",
+		denied, errUnreadableNodes))
+	return false
+}
+
+// deniedApprovalNodeCount counts the distinct nodes in an approval's targets and
+// plan reach that p cannot read. Used only for the refusal count and the audit
+// reason; it never reaches a caller as identities.
+func (s *Server) deniedApprovalNodeCount(p principal, approval model.Approval) int {
+	denied := 0
+	for _, target := range approval.Targets {
+		if strings.TrimSpace(target) == "" || target == approval.NodeID {
+			continue
+		}
+		if !rbac.Allows(p.Principal, "network:plan", target) {
+			denied++
+		}
+	}
+	if scope, reach := s.approvalPlanReach(approval); scope != "" {
+		denied += deniedNodeCount(p.Principal, scope, reach)
+	}
+	if denied == 0 {
+		return 1
+	}
+	return denied
 }
 
 func approvalDecisionExtraScope(approval model.Approval) string {

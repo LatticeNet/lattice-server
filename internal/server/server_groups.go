@@ -56,12 +56,102 @@ type groupRollup struct {
 }
 
 // groupView is a Group plus its server-resolved membership and a health rollup.
-// The embedded Group carries the explicit Members (for editing); ResolvedMembers
-// is Members ∪ selector matches (for display/counts).
+// Members is the explicit operator-pinned list (for editing); ResolvedMembers is
+// Members ∪ selector matches (for display/counts). Both are narrowed to the
+// nodes the reader may see.
+//
+// Every field is projected by hand, and model.Group is deliberately NOT
+// embedded. It used to be, and the embedded Members carried a json tag, so the
+// complete explicit membership of every group rode out inside the very response
+// whose resolved_members, rollup and ungrouped were being filtered. Embedding a
+// model struct in a view means the next field added to the model ships to the
+// caller too, and nobody adding that field will be reading this file.
+// server_users.go learned the same lesson; see the note above userView.
 type groupView struct {
-	model.Group
-	ResolvedMembers []string    `json:"resolved_members"`
-	Rollup          groupRollup `json:"rollup"`
+	ID              string               `json:"id"`
+	Name            string               `json:"name"`
+	Slug            string               `json:"slug"`
+	Description     string               `json:"description,omitempty"`
+	Color           string               `json:"color"`
+	Icon            string               `json:"icon,omitempty"`
+	ParentID        string               `json:"parent_id,omitempty"`
+	Order           int                  `json:"order"`
+	Members         []string             `json:"members"`
+	Selector        *model.GroupSelector `json:"selector,omitempty"`
+	LeaderID        string               `json:"leader_id,omitempty"`
+	System          bool                 `json:"system,omitempty"`
+	CreatedAt       time.Time            `json:"created_at"`
+	UpdatedAt       time.Time            `json:"updated_at"`
+	ResolvedMembers []string             `json:"resolved_members"`
+	Rollup          groupRollup          `json:"rollup"`
+}
+
+// toGroupView projects a stored group for one reader. It is the only place a
+// groupView is built, so the membership narrowing cannot be forgotten at one of
+// the four call sites.
+//
+// Members is filtered rather than refused: this is a listing, and a shorter
+// list is a correct answer. LeaderID is dropped when it names a node the reader
+// cannot see, for the same reason. upsertGroup preserves both on write, so a
+// confined operator editing a group does not delete what was filtered out of
+// their copy.
+func toGroupView(p principal, g model.Group, resolved []string, rollup groupRollup) groupView {
+	view := groupView{
+		ID:              g.ID,
+		Name:            g.Name,
+		Slug:            g.Slug,
+		Description:     g.Description,
+		Color:           g.Color,
+		Icon:            g.Icon,
+		ParentID:        g.ParentID,
+		Order:           g.Order,
+		Members:         readableNodeIDs(p, "group:read", g.Members),
+		Selector:        g.Selector,
+		System:          g.System,
+		CreatedAt:       g.CreatedAt,
+		UpdatedAt:       g.UpdatedAt,
+		ResolvedMembers: resolved,
+		Rollup:          rollup,
+	}
+	if g.LeaderID != "" && rbac.Allows(p.Principal, "group:read", g.LeaderID) {
+		view.LeaderID = g.LeaderID
+	}
+	return view
+}
+
+// unreadableNodeIDs is the complement of readableNodeIDs: the ids p may NOT
+// read. Used to carry hidden state across a read-modify-write.
+func unreadableNodeIDs(p principal, scope string, ids []string) []string {
+	out := make([]string, 0, len(ids))
+	for _, nodeID := range ids {
+		if !rbac.Allows(p.Principal, scope, nodeID) {
+			out = append(out, nodeID)
+		}
+	}
+	return out
+}
+
+// readableNodes is readableNodeIDs over whole nodes, for the resolve paths.
+func readableNodes(p principal, scope string, nodes []model.Node) []model.Node {
+	out := make([]model.Node, 0, len(nodes))
+	for _, n := range nodes {
+		if rbac.Allows(p.Principal, scope, n.ID) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// readableNodeIDs keeps the ids in the given order that p may read under scope.
+// Always returns a non-nil slice so the JSON is [] rather than null.
+func readableNodeIDs(p principal, scope string, ids []string) []string {
+	out := make([]string, 0, len(ids))
+	for _, nodeID := range ids {
+		if rbac.Allows(p.Principal, scope, nodeID) {
+			out = append(out, nodeID)
+		}
+	}
+	return out
 }
 
 func rollupFor(memberIDs []string, byID map[string]model.Node) (groupRollup, []string) {
@@ -119,7 +209,7 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, p principa
 			for _, nid := range rm {
 				grouped[nid] = true
 			}
-			views = append(views, groupView{Group: g, ResolvedMembers: rm, Rollup: rollup})
+			views = append(views, toGroupView(p, g, rm, rollup))
 		}
 		// Deterministic display order: by parent, then weight, then name.
 		sort.SliceStable(views, func(i, j int) bool {
@@ -152,6 +242,24 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, p principa
 		}
 		var req model.Group
 		if !decodeClientJSON(w, r, &req) {
+			return
+		}
+		// group:admin was a flat scope check here, so the allowlist never
+		// applied and a caller confined to one node could pin any node into
+		// any group. Membership drives ExpandGroupPolicies, so that decided
+		// which fleet firewall policy applied to nodes the caller cannot
+		// administer, and the echoed member list doubled as an existence
+		// oracle because dedupeExistingNodes silently drops ids that do not
+		// exist. handleGroupMembers already refuses this; the same helper and
+		// the same reasoning belong on the sibling that creates and updates.
+		//
+		// Refused rather than filtered, and for the reason written there:
+		// quietly dropping the members the caller may not touch would report
+		// success for an edit that did not happen.
+		if !s.requireReadableNodes(w, p, "group:admin", "this group", req.Members) {
+			return
+		}
+		if req.LeaderID != "" && !s.requireReadableNodes(w, p, "group:admin", "this leader", []string{req.LeaderID}) {
 			return
 		}
 		view, err := s.upsertGroup(req, p)
@@ -241,10 +349,32 @@ func (s *Server) upsertGroup(req model.Group, p principal) (groupView, error) {
 	// Explicit members: dedupe and drop references to non-existent nodes.
 	req.Members = dedupeExistingNodes(req.Members, byNode)
 
+	// A confined operator reads a filtered copy of this group (toGroupView
+	// narrows Members), so a plain read-modify-write would delete the members
+	// they were never shown. Carry the stored members they cannot see back in.
+	// The handler has already refused any member they named but may not touch,
+	// so what survives here is exactly: what they may edit, as they left it,
+	// plus what they may not edit, untouched.
+	if !creating {
+		if prior, ok := byGroup[req.ID]; ok {
+			req.Members = append(req.Members, unreadableNodeIDs(p, "group:admin", prior.Members)...)
+			req.Members = dedupeExistingNodes(req.Members, byNode)
+		}
+	}
+
 	// Leader: if set, it must be an explicit member of the group. Selectors are
 	// dynamic and can change as node facts change, so a leader must be pinned by
 	// the operator rather than inferred from selector membership.
 	req.LeaderID = strings.TrimSpace(req.LeaderID)
+	// Same preservation for the leader: it is filtered out of a confined
+	// operator's copy, so an empty submission from them means "unchanged", not
+	// "cleared". An operator who can see the leader can still clear it.
+	if req.LeaderID == "" && !creating {
+		if prior, ok := byGroup[req.ID]; ok && prior.LeaderID != "" &&
+			!rbac.Allows(p.Principal, "group:admin", prior.LeaderID) {
+			req.LeaderID = prior.LeaderID
+		}
+	}
 	if req.LeaderID != "" {
 		isMember := false
 		for _, m := range req.Members {
@@ -277,9 +407,14 @@ func (s *Server) upsertGroup(req model.Group, p principal) (groupView, error) {
 		Metadata: map[string]string{"group_id": stored.ID, "slug": stored.Slug},
 	})
 
-	resolved := groups.ResolveMembers(stored, nodes)
+	// Resolved over the caller's readable nodes, not the fleet. Resolving a
+	// caller-supplied selector over every node and echoing the matches is the
+	// query engine handleGroupPreview was rewritten to stop being: name a
+	// country or a tag, read back which nodes matched.
+	readable := readableNodes(p, "group:read", nodes)
+	resolved := groups.ResolveMembers(stored, readable)
 	rollup, rm := rollupFor(resolved, byNode)
-	return groupView{Group: stored, ResolvedMembers: rm, Rollup: rollup}, nil
+	return toGroupView(p, stored, rm, rollup), nil
 }
 
 func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request, p principal) {
@@ -458,7 +593,7 @@ func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request, p pr
 	})
 	resolved := groups.ResolveMembers(stored, nodes)
 	rollup, rm := rollupFor(resolved, byNode)
-	writeJSON(w, http.StatusOK, groupView{Group: stored, ResolvedMembers: rm, Rollup: rollup})
+	writeJSON(w, http.StatusOK, toGroupView(p, stored, rm, rollup))
 }
 
 // handleGroupPreview resolves a selector against the current fleet without

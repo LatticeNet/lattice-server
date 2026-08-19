@@ -117,6 +117,13 @@ func (s *Server) handleStorageBindings(w http.ResponseWriter, r *http.Request, p
 			writeError(w, http.StatusBadRequest, fmt.Errorf("%s bucket %q does not exist", kind, binding.Bucket))
 			return
 		}
+		// The console's own hostname is not available for publishing. A binding
+		// there is dispatched before the console fallback, so it does not add a
+		// route, it takes the operator's front door.
+		if s.ownsPublicHost(binding.Hostname) {
+			writeError(w, http.StatusConflict, errors.New("that hostname serves this server's own console and cannot be published to"))
+			return
+		}
 		for _, existing := range s.store.StorageBindings(kind) {
 			if existing.ID != binding.ID && sameStorageBindingRoute(existing, binding) {
 				writeError(w, http.StatusConflict, errors.New("storage binding route already exists"))

@@ -119,15 +119,14 @@ func TestStaticBindingCannotServeScriptOnTheConsoleOrigin(t *testing.T) {
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusOK {
-		return // not served at all is the outcome we want
-	}
-	// Served. The CSP shipped with every response is what decides whether it can
-	// then execute, and script-src 'self' admits it precisely because the
-	// binding put it on the console's own origin.
-	csp := rec.Header().Get("Content-Security-Policy")
-	if strings.Contains(csp, "script-src 'self'") {
-		t.Fatalf("a static binding served executable script on the console origin and the CSP admits it: body=%q csp=%q",
-			rec.Body.String(), csp)
+	// The console fallback answers 200 for any unmatched path, so the status says
+	// nothing. What matters is whose bytes came back.
+	//
+	// If they are the binding's, the CSP shipped with every response is no
+	// defence: script-src 'self' admits them precisely because the binding put
+	// them on the console's own origin.
+	if strings.Contains(rec.Body.String(), "act as the operator") {
+		t.Fatalf("a static binding served executable script on the console origin; CSP %q admits it because the bytes are same-origin",
+			rec.Header().Get("Content-Security-Policy"))
 	}
 }

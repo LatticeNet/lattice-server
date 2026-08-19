@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -97,6 +98,34 @@ func publishingReadScope(origin string) string {
 		return "proxy:admin"
 	}
 	return origin + ":read"
+}
+
+// ownsPublicHost reports whether a hostname is the one this server's own console
+// answers on.
+//
+// The console is served by the fallback at the end of staticHandler, after
+// publishing records have had their say, so a binding on that hostname does not
+// sit beside the console: it replaces it, for every visitor, under the real
+// certificate and at the URL operators have bookmarked.
+//
+// PublicURL is the only trustworthy source for this. The request's Host header
+// is chosen by the caller, so comparing against that would let an attacker
+// decide what counts as "ours". When PublicURL is not configured the server has
+// no way to recognise itself and this returns false; that is a real limitation
+// of running without it, not a silent pass.
+func (s *Server) ownsPublicHost(hostname string) bool {
+	if s.publicURL == "" || hostname == "" {
+		return false
+	}
+	parsed, err := url.Parse(s.publicURL)
+	if err != nil {
+		return false
+	}
+	own := requestHost(parsed.Host)
+	if own == "" {
+		return false
+	}
+	return strings.EqualFold(own, requestHost(hostname))
 }
 
 // publishingRecordFromBinding lifts a stored storage binding into the plane.
@@ -194,6 +223,13 @@ func (s *Server) publishingRecordForRequest(origin, hostname, urlPath string) (p
 	now := s.now()
 	for _, record := range s.publishingRecords(origin) {
 		if !record.servable(now) || !record.matchesHost(hostname) {
+			continue
+		}
+		// Refused at serve time as well as at creation time, because a record
+		// can predate the creation check: an older build wrote it, or a restore
+		// brought it back. The reserved subscription mount is unaffected, it
+		// answers on every host and names none.
+		if s.ownsPublicHost(record.Hostname) {
 			continue
 		}
 		if _, ok := record.objectPath(urlPath); !ok {

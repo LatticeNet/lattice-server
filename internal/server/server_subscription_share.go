@@ -156,6 +156,39 @@ func subscriptionContentHash(raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// subscriptionResponseContentType decides how the response describes itself,
+// from what the core negotiated and nothing else.
+//
+// The source used to choose this. That contradicted the rule stated at the top
+// of this file, that a source produces bytes and does not set headers, and it
+// was the one header worth taking: a source answering text/html gets markup
+// rendered on the control plane's own origin, which the shipped CSP then admits
+// because script-src 'self' is satisfied by anything same-origin.
+//
+// Both inputs here are already validated by the core before a render is even
+// attempted: target against subscriptionShareTargets, format against
+// normalizeProxySubscriptionFormat. The target decides the body's shape when the
+// caller names a client, otherwise the format does.
+func subscriptionResponseContentType(format, target string) string {
+	switch target {
+	case "":
+	case "sing-box", "JSON":
+		return "application/json; charset=utf-8"
+	case "Clash", "ClashMeta", "Stash":
+		return "text/yaml; charset=utf-8"
+	default:
+		return "text/plain; charset=utf-8"
+	}
+	switch format {
+	case proxycore.SubscriptionFormatSingBox:
+		return "application/json; charset=utf-8"
+	case proxycore.SubscriptionFormatClash, proxycore.SubscriptionFormatClashMeta:
+		return "text/yaml; charset=utf-8"
+	default:
+		return "text/plain; charset=utf-8"
+	}
+}
+
 // handleSubscriptionShare serves the public subscription endpoint.
 //
 // The core owns every part of this - routing, lookup, rate limiting, audit and
@@ -256,7 +289,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	} else {
 		cacheEntry, cached = s.subscriptionCache.GetSnapshot(key, s.now())
 	}
-	body, contentType, userinfo := cacheEntry.body, cacheEntry.contentType, cacheEntry.userinfo
+	body, userinfo := cacheEntry.body, cacheEntry.userinfo
 	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.publicSourceVersion, cacheEntry.fetchedAt
 	if (!cached || staleResponse) && share.Source.Kind == model.ShareSourcePlugin {
 		// Revalidate before paying for a render. A render boots the plugin's
@@ -289,7 +322,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 					cached = false
 					break
 				}
-				body, contentType, userinfo, cached = stale.body, stale.contentType, snap.Userinfo, true
+				body, userinfo, cached = stale.body, snap.Userinfo, true
 				staleResponse, sourceVersion, snapshotFetchedAt = snap.Stale, snap.SourceVersion, snap.FetchedAt
 			}
 		}
@@ -330,7 +363,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 				s.subscriptionCache.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion,
 					entry.publicSourceVersion, entry.stale, entry.fetchedAt, s.now())
 			}
-			body, contentType, userinfo = rendered.Body, rendered.ContentType, rendered.Userinfo
+			body, userinfo = rendered.Body, rendered.Userinfo
 			staleResponse, sourceVersion, snapshotFetchedAt = rendered.Stale, rendered.SourceVersion, rendered.FetchedAt
 			accepted = true
 			break
@@ -341,11 +374,10 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	if contentType == "" {
-		contentType = "text/plain; charset=utf-8"
-	}
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", contentType)
+	// Derived, never echoed. Whatever the source put in contentType stays where
+	// the core can see it and the client cannot.
+	w.Header().Set("Content-Type", subscriptionResponseContentType(format, variant.Target))
 	// ?noFlow=1 keeps quota headers off the wire (upstream's 不查询订阅流量) —
 	// some clients probe aggressively when they see one.
 	if userinfo != "" && !variant.NoFlow {
@@ -568,7 +600,10 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 // renderedSubscription is one produced body plus the metadata the core turns
 // into response headers. A source never sets a header itself.
 type renderedSubscription struct {
-	Body                []byte
+	Body []byte
+	// ContentType is what the source said the bytes are. It is kept for
+	// diagnostics and cache bookkeeping and deliberately never reaches the
+	// wire; the response type is derived by subscriptionResponseContentType.
 	ContentType         string
 	Userinfo            string
 	Stale               bool

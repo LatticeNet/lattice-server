@@ -84,19 +84,28 @@ type agentArtifactRef struct {
 }
 
 func (ref agentArtifactRef) validate() error {
-	if !agentVersionRe.MatchString(ref.Version) {
-		return errors.New("version must be an auditable version string")
-	}
-	if ref.OS != "linux" {
-		return fmt.Errorf("control-plane agent distribution supports linux nodes; got os %q", ref.OS)
-	}
-	switch ref.Arch {
-	case "amd64", "arm64":
-	default:
-		return fmt.Errorf("control-plane agent distribution supports amd64 and arm64; got arch %q", ref.Arch)
+	if err := validateAgentArtifactPlatform(ref.Version, ref.OS, ref.Arch); err != nil {
+		return err
 	}
 	if !agentSHA256Re.MatchString(ref.SHA256) {
 		return errors.New("sha256 must be a 64-character lowercase hex digest")
+	}
+	return nil
+}
+
+// validateAgentArtifactPlatform is the digest-free half, for callers that name
+// a version and platform before any digest is known.
+func validateAgentArtifactPlatform(version, osName, arch string) error {
+	if !agentVersionRe.MatchString(version) {
+		return errors.New("version must be an auditable version string")
+	}
+	if osName != "linux" {
+		return fmt.Errorf("control-plane agent distribution supports linux nodes; got os %q", osName)
+	}
+	switch arch {
+	case "amd64", "arm64":
+	default:
+		return fmt.Errorf("control-plane agent distribution supports amd64 and arm64; got arch %q", arch)
 	}
 	return nil
 }
@@ -488,8 +497,7 @@ func (s *Server) handleDeleteAgentArtifact(w http.ResponseWriter, r *http.Reques
 		osName = "linux"
 	}
 	arch := strings.ToLower(strings.TrimSpace(req.Arch))
-	probe := agentArtifactRef{Version: version, OS: osName, Arch: arch, SHA256: strings.Repeat("0", 64)}
-	if err := probe.validate(); err != nil {
+	if err := validateAgentArtifactPlatform(version, osName, arch); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}

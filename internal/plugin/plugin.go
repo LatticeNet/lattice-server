@@ -356,6 +356,15 @@ func SigningPayload(m Manifest) []byte {
 		ifJSON, _ := json.Marshal(m.Interfaces)
 		fields = append(fields, string(uiJSON), string(ifJSON))
 	}
+	// Same backward-compatible shape, for the same reason: dependencies gate a
+	// plugin's load and activation, and a v1 manifest is allowed to declare them,
+	// so leaving them out of the payload meant a signed manifest kept a valid
+	// signature after they were dropped. Only manifests that declare any extend
+	// the payload, so existing signed manifests keep verifying.
+	if len(m.Dependencies) > 0 {
+		depJSON, _ := json.Marshal(m.Dependencies)
+		fields = append(fields, string(depJSON))
+	}
 	return []byte(strings.Join(fields, "\n"))
 }
 

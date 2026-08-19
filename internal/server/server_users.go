@@ -18,22 +18,26 @@ import (
 // serializes PasswordHash/TOTPSecret/RecoveryCodeHashes by default, so user
 // endpoints MUST return this view and never a raw model.User.
 type userView struct {
-	ID          string    `json:"id"`
-	Username    string    `json:"username"`
-	Scopes      []string  `json:"scopes"`
-	TOTPEnabled bool      `json:"totp_enabled"`
-	HasPassword bool      `json:"has_password"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID       string   `json:"id"`
+	Username string   `json:"username"`
+	Scopes   []string `json:"scopes"`
+	// ServerAllowlist confines the account to a set of nodes. Empty means every
+	// node, which is what an account created before this field had.
+	ServerAllowlist []string  `json:"server_allowlist"`
+	TOTPEnabled     bool      `json:"totp_enabled"`
+	HasPassword     bool      `json:"has_password"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 func toUserView(u model.User) userView {
 	return userView{
-		ID:          u.ID,
-		Username:    u.Username,
-		Scopes:      u.Scopes,
-		TOTPEnabled: u.TOTPEnabled,
-		HasPassword: u.PasswordHash != "",
-		CreatedAt:   u.CreatedAt,
+		ID:              u.ID,
+		Username:        u.Username,
+		Scopes:          u.Scopes,
+		ServerAllowlist: u.ServerAllowlist,
+		TOTPEnabled:     u.TOTPEnabled,
+		HasPassword:     u.PasswordHash != "",
+		CreatedAt:       u.CreatedAt,
 	}
 }
 
@@ -62,6 +66,44 @@ func normalizeScopes(scopes []string) []string {
 		out = append(out, sc)
 	}
 	return out
+}
+
+// normalizeAllowlist applies the same trim, drop-empty and de-duplicate pass as
+// scopes. Kept under its own name because node ids and scopes are different
+// vocabularies even where the cleanup is identical.
+func normalizeAllowlist(nodeIDs []string) []string {
+	return normalizeScopes(nodeIDs)
+}
+
+// unrestrictedAdminsBesides counts accounts that hold "*" and are confined to no
+// node subset, ignoring one id. Confinement is what makes an administrator able
+// to administer users at all (see validateGrantScopes), so confining the last
+// unrestricted one would leave nobody who can undo it.
+func (s *Server) unrestrictedAdminsBesides(excludeID string) int {
+	n := 0
+	for _, u := range s.store.Users() {
+		if u.ID == excludeID || !hasWildcardScope(u.Scopes) {
+			continue
+		}
+		if !principalHasNodeRestriction(principal{Principal: rbac.Principal{ServerAllowlist: u.ServerAllowlist}}) {
+			n++
+		}
+	}
+	return n
+}
+
+// validateGrantAllowlist keeps an account's node confinement inside the granting
+// principal's own.
+//
+// validateGrantScopes already refuses any confined principal outright, so today
+// the parent set here is always unrestricted and this cannot reject. It is not
+// dead: it is the check that has to be correct before that refusal can ever be
+// relaxed, and leaving it out would make relaxing it look safe.
+func (s *Server) validateGrantAllowlist(p principal, allowlist []string) (int, error) {
+	if !serverAllowlistSubset(p.ServerAllowlist, allowlist) {
+		return http.StatusForbidden, errors.New("cannot grant access to nodes beyond your own server allowlist")
+	}
+	return 0, nil
 }
 
 // validateGrantScopes enforces three rules on a scope assignment: the acting
@@ -118,9 +160,10 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request, p principal
 		writeJSON(w, http.StatusOK, map[string]any{"users": out})
 	case http.MethodPost:
 		var req struct {
-			Username string   `json:"username"`
-			Scopes   []string `json:"scopes"`
-			Password string   `json:"password"`
+			Username        string   `json:"username"`
+			Scopes          []string `json:"scopes"`
+			ServerAllowlist []string `json:"server_allowlist"`
+			Password        string   `json:"password"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -140,11 +183,18 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request, p principal
 			writeError(w, status, err)
 			return
 		}
+		allowlist := normalizeAllowlist(req.ServerAllowlist)
+		if status, err := s.validateGrantAllowlist(p, allowlist); err != nil {
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.create", Scope: "user:admin", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"username": username}})
+			writeError(w, status, err)
+			return
+		}
 		u := model.User{
-			ID:        id.New("user"),
-			Username:  username,
-			Scopes:    scopes,
-			CreatedAt: s.now(),
+			ID:              id.New("user"),
+			Username:        username,
+			Scopes:          scopes,
+			ServerAllowlist: allowlist,
+			CreatedAt:       s.now(),
 		}
 		if req.Password != "" {
 			hash, err := auth.HashSecret(req.Password)
@@ -158,7 +208,7 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request, p principal
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.create", Scope: "user:admin", Decision: "allow", Metadata: map[string]string{"target": u.ID, "username": username, "scopes": strings.Join(u.Scopes, ","), "sso_only": fmt.Sprintf("%t", u.PasswordHash == "")}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.create", Scope: "user:admin", Decision: "allow", Metadata: map[string]string{"target": u.ID, "username": username, "scopes": strings.Join(u.Scopes, ","), "server_allowlist": strings.Join(u.ServerAllowlist, ","), "sso_only": fmt.Sprintf("%t", u.PasswordHash == "")}})
 		writeJSON(w, http.StatusOK, toUserView(u))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -175,9 +225,10 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	var req struct {
-		ID       string   `json:"id"`
-		Scopes   []string `json:"scopes"`
-		Password string   `json:"password"`
+		ID              string   `json:"id"`
+		Scopes          []string `json:"scopes"`
+		ServerAllowlist []string `json:"server_allowlist"`
+		Password        string   `json:"password"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -194,6 +245,27 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, status, err)
 		return
 	}
+	newAllowlist := normalizeAllowlist(req.ServerAllowlist)
+	if status, err := s.validateGrantAllowlist(p, newAllowlist); err != nil {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.update", Scope: "user:admin", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"target": target.ID}})
+		writeError(w, status, err)
+		return
+	}
+	// Confining an administrator takes away their ability to administer users,
+	// because validateGrantScopes refuses a confined principal. Do it to the
+	// last unconfined administrator and there is nobody left who can undo it,
+	// including them: the account keeps "*" and still cannot reach this
+	// endpoint. Same shape as the last-administrator guard below, and it has to
+	// run whether or not the scopes are changing in the same request.
+	confiningTarget := principalHasNodeRestriction(principal{Principal: rbac.Principal{ServerAllowlist: newAllowlist}})
+	keepsAdmin := hasWildcardScope(newScopes)
+	wasUnrestricted := !principalHasNodeRestriction(principal{Principal: rbac.Principal{ServerAllowlist: target.ServerAllowlist}})
+	if confiningTarget && keepsAdmin && wasUnrestricted && s.unrestrictedAdminsBesides(target.ID) == 0 {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.update", Scope: "user:admin", Decision: "deny", Reason: "would confine the last unrestricted admin", Metadata: map[string]string{"target": target.ID}})
+		writeError(w, http.StatusConflict, errors.New("refusing to confine the last unrestricted administrator: no one would be left who can administer users"))
+		return
+	}
+
 	losingAdmin := hasWildcardScope(target.Scopes) && !hasWildcardScope(newScopes)
 	if losingAdmin && target.ID == p.ActorID {
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.update", Scope: "user:admin", Decision: "deny", Reason: "cannot remove own admin access", Metadata: map[string]string{"target": target.ID}})
@@ -206,6 +278,7 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	target.Scopes = newScopes
+	target.ServerAllowlist = newAllowlist
 	if req.Password != "" {
 		hash, err := auth.HashSecret(req.Password)
 		if err != nil {
@@ -219,7 +292,7 @@ func (s *Server) handleUserUpdate(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.update", Scope: "user:admin", Decision: "allow", Metadata: map[string]string{"target": target.ID, "scopes": strings.Join(target.Scopes, ","), "password_reset": fmt.Sprintf("%t", req.Password != "")}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "user.update", Scope: "user:admin", Decision: "allow", Metadata: map[string]string{"target": target.ID, "scopes": strings.Join(target.Scopes, ","), "server_allowlist": strings.Join(target.ServerAllowlist, ","), "password_reset": fmt.Sprintf("%t", req.Password != "")}})
 	writeJSON(w, http.StatusOK, toUserView(target))
 }
 

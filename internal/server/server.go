@@ -1569,6 +1569,11 @@ func (s *Server) principalFromRequest(r *http.Request) (principal, error) {
 		Principal: rbac.Principal{
 			ActorID: user.ID,
 			Scopes:  user.Scopes,
+			// Carry the account's node confinement onto the session. Without
+			// this the field would be settable and stored and then ignored on
+			// every request a human makes, which is worse than not having it:
+			// the console would show a confined operator who is not confined.
+			ServerAllowlist: user.ServerAllowlist,
 		},
 		CSRFToken:     session.CSRFToken,
 		CorrelationID: requestIDFromRequest(r),

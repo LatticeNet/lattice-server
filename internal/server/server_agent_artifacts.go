@@ -315,10 +315,15 @@ func (s *Server) handleAgentArtifacts(w http.ResponseWriter, r *http.Request, p 
 		if !s.requireScope(w, p, "node:read") {
 			return
 		}
+		// serving_enabled is reported alongside the inventory because a stored
+		// artifact that cannot be served is not the same thing as one that can,
+		// and the difference is invisible otherwise: the plan quietly stays on
+		// the upstream URL and the operator sees a full shelf doing nothing.
 		writeJSON(w, http.StatusOK, map[string]any{
-			"artifacts":    s.agentArtifacts(),
-			"stored_bytes": s.agentArtifactStoreBytes(),
-			"limit_bytes":  maxAgentArtifactStoreBytes,
+			"artifacts":       s.agentArtifacts(),
+			"stored_bytes":    s.agentArtifactStoreBytes(),
+			"limit_bytes":     maxAgentArtifactStoreBytes,
+			"serving_enabled": s.agentBinaryBaseURL() != "",
 		})
 	case http.MethodPost:
 		s.handleAgentArtifactUpload(w, r, p)
@@ -362,7 +367,8 @@ func (s *Server) handleAgentArtifactUpload(w http.ResponseWriter, r *http.Reques
 			fmt.Errorf("agent binary exceeds the %d byte limit", maxAgentArtifactBytes))
 		return
 	}
-	if err := s.storeAgentArtifact(ref, data); err != nil {
+	view, err := s.storeAgentArtifact(ref, data)
+	if err != nil {
 		s.writeAgentArtifactStoreError(w, err)
 		return
 	}
@@ -379,10 +385,7 @@ func (s *Server) handleAgentArtifactUpload(w http.ResponseWriter, r *http.Reques
 			"source":  "upload",
 		},
 	})
-	writeJSON(w, http.StatusOK, agentArtifactView{
-		Version: ref.Version, OS: ref.OS, Arch: ref.Arch, SHA256: ref.SHA256,
-		SizeBytes: len(data), StoredSize: base64.StdEncoding.EncodedLen(len(data)),
-	})
+	writeJSON(w, http.StatusOK, view)
 }
 
 // handleAgentArtifactImport moves the third-party dependency from every node to
@@ -442,7 +445,8 @@ func (s *Server) handleAgentArtifactImport(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	if err := s.storeAgentArtifact(ref, data); err != nil {
+	view, err := s.storeAgentArtifact(ref, data)
+	if err != nil {
 		s.writeAgentArtifactStoreError(w, err)
 		return
 	}
@@ -459,10 +463,7 @@ func (s *Server) handleAgentArtifactImport(w http.ResponseWriter, r *http.Reques
 			"release": tag,
 		},
 	})
-	writeJSON(w, http.StatusOK, agentArtifactView{
-		Version: ref.Version, OS: ref.OS, Arch: ref.Arch, SHA256: ref.SHA256,
-		SizeBytes: len(data), StoredSize: base64.StdEncoding.EncodedLen(len(data)),
-	})
+	writeJSON(w, http.StatusOK, view)
 }
 
 func (s *Server) handleDeleteAgentArtifact(w http.ResponseWriter, r *http.Request, p principal) {
@@ -524,16 +525,16 @@ var (
 // digest before writing and refuses to grow the bucket past its cap, and it
 // replaces any earlier digest for the same version and platform so a version
 // never resolves to two different binaries.
-func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) error {
+func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) (agentArtifactView, error) {
 	if err := ref.validate(); err != nil {
-		return err
+		return agentArtifactView{}, err
 	}
 	if len(data) == 0 {
-		return errors.New("agent binary is empty")
+		return agentArtifactView{}, errors.New("agent binary is empty")
 	}
 	sum := sha256.Sum256(data)
 	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(ref.SHA256)) != 1 {
-		return fmt.Errorf("%w: computed %s", errAgentArtifactDigestMismatch, hex.EncodeToString(sum[:]))
+		return agentArtifactView{}, fmt.Errorf("%w: computed %s", errAgentArtifactDigestMismatch, hex.EncodeToString(sum[:]))
 	}
 	encoded := base64.StdEncoding.EncodeToString(data)
 	superseded := []string{}
@@ -547,7 +548,7 @@ func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) error {
 		used += len(obj.Content)
 	}
 	if used+len(encoded) > maxAgentArtifactStoreBytes {
-		return fmt.Errorf("%w: %d bytes stored plus %d new exceeds the %d byte cap; delete an older version first",
+		return agentArtifactView{}, fmt.Errorf("%w: %d bytes stored plus %d new exceeds the %d byte cap; delete an older version first",
 			errAgentArtifactStoreFull, used, len(encoded), maxAgentArtifactStoreBytes)
 	}
 	if err := s.store.PutStatic(model.StaticObject{
@@ -556,7 +557,7 @@ func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) error {
 		Content:     encoded,
 		ContentType: agentArtifactContentType,
 	}); err != nil {
-		return err
+		return agentArtifactView{}, err
 	}
 	// Superseded digests go only after the replacement is durable, so a failure
 	// here leaves the bucket with one extra object rather than none.
@@ -565,10 +566,19 @@ func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) error {
 			continue
 		}
 		if err := s.store.DeleteStatic(agentArtifactBucket, path); err != nil {
-			return fmt.Errorf("stored %s but could not remove superseded %s: %w", ref.objectPath(), path, err)
+			return agentArtifactView{}, fmt.Errorf("stored %s but could not remove superseded %s: %w", ref.objectPath(), path, err)
 		}
 	}
-	return nil
+	// Read the record back so the answer carries the timestamp the store
+	// actually stamped rather than a guess made before the write.
+	view := agentArtifactView{
+		Version: ref.Version, OS: ref.OS, Arch: ref.Arch, SHA256: ref.SHA256,
+		SizeBytes: len(data), StoredSize: len(encoded),
+	}
+	if stored, ok := s.store.StaticObject(agentArtifactBucket, ref.objectPath()); ok {
+		view.UpdatedAt = stored.UpdatedAt
+	}
+	return view, nil
 }
 
 func (s *Server) writeAgentArtifactStoreError(w http.ResponseWriter, err error) {

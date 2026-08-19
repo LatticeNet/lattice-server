@@ -64,7 +64,7 @@ func seedControlPlaneUpdate(t *testing.T, srv *Server, st *store.Store) ([]byte,
 	seedLinuxAgentNode(t, st)
 	data, digest := testAgentBinary()
 	ref := agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: digest}
-	if err := srv.storeAgentArtifact(ref, data); err != nil {
+	if _, err := srv.storeAgentArtifact(ref, data); err != nil {
 		t.Fatalf("store artifact: %v", err)
 	}
 	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
@@ -234,7 +234,7 @@ func TestStoreAgentArtifactRefusesBytesThatDoNotMatchTheDeclaredDigest(t *testin
 	data, digest := testAgentBinary()
 	ref := agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: digest}
 
-	if err := srv.storeAgentArtifact(ref, data[:len(data)-1]); err == nil {
+	if _, err := srv.storeAgentArtifact(ref, data[:len(data)-1]); err == nil {
 		t.Fatal("a truncated upload was accepted")
 	} else if !strings.Contains(err.Error(), "declared sha256") {
 		t.Fatalf("error %q does not name the digest mismatch", err)
@@ -435,7 +435,7 @@ func TestAgentArtifactListingReportsWhatIsAvailableWithoutTheContent(t *testing.
 	srv, handler, st := newAgentArtifactServer(t)
 	data, digest := testAgentBinary()
 	ref := agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: digest}
-	if err := srv.storeAgentArtifact(ref, data); err != nil {
+	if _, err := srv.storeAgentArtifact(ref, data); err != nil {
 		t.Fatal(err)
 	}
 	_ = st
@@ -447,9 +447,10 @@ func TestAgentArtifactListingReportsWhatIsAvailableWithoutTheContent(t *testing.
 		t.Fatalf("listing answered %d", res.StatusCode)
 	}
 	var out struct {
-		Artifacts   []agentArtifactView `json:"artifacts"`
-		StoredBytes int                 `json:"stored_bytes"`
-		LimitBytes  int                 `json:"limit_bytes"`
+		Artifacts      []agentArtifactView `json:"artifacts"`
+		StoredBytes    int                 `json:"stored_bytes"`
+		LimitBytes     int                 `json:"limit_bytes"`
+		ServingEnabled bool                `json:"serving_enabled"`
 	}
 	body, _ := io.ReadAll(res.Body)
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -468,8 +469,51 @@ func TestAgentArtifactListingReportsWhatIsAvailableWithoutTheContent(t *testing.
 	if out.LimitBytes != maxAgentArtifactStoreBytes || out.StoredBytes <= 0 {
 		t.Fatalf("listing must report the storage budget, got stored=%d limit=%d", out.StoredBytes, out.LimitBytes)
 	}
+	if !out.ServingEnabled {
+		t.Fatal("a server with an https public URL can serve, and the listing must say so")
+	}
 	if bytes.Contains(body, []byte(base64.StdEncoding.EncodeToString(data)[:64])) {
 		t.Fatal("the listing carried the binary content")
+	}
+}
+
+// A stored artifact is useless without a public HTTPS base to hand nodes, and
+// the plan quietly stays upstream in that case. The console has to be able to
+// tell the two situations apart.
+func TestAgentArtifactListingSaysWhenItCannotServeWhatItHolds(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	data, digest := testAgentBinary()
+	if _, err := srv.storeAgentArtifact(agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: digest}, data); err != nil {
+		t.Fatal(err)
+	}
+	seedLinuxAgentNode(t, st)
+	if _, ok := srv.controlPlaneAgentBinaryURL("0.3.4", "linux", "amd64", digest); ok {
+		t.Fatal("without an https public URL there is no address a node can be sent to")
+	}
+
+	cookies, csrf := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodGet, "/api/nodes/agent-updates/artifacts", "", cookies, csrf)
+	defer res.Body.Close()
+	var out struct {
+		Artifacts      []agentArtifactView `json:"artifacts"`
+		ServingEnabled bool                `json:"serving_enabled"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Artifacts) != 1 {
+		t.Fatalf("the artifact is stored and must still be listed, got %d", len(out.Artifacts))
+	}
+	if out.ServingEnabled {
+		t.Fatal("the listing claimed it can serve an artifact it has no address for")
 	}
 }
 
@@ -478,13 +522,13 @@ func TestAgentArtifactListingReportsWhatIsAvailableWithoutTheContent(t *testing.
 func TestStoreAgentArtifactReplacesAnEarlierDigestForTheSamePlatform(t *testing.T) {
 	srv, _, _ := newAgentArtifactServer(t)
 	first, firstDigest := testAgentBinary()
-	if err := srv.storeAgentArtifact(agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: firstDigest}, first); err != nil {
+	if _, err := srv.storeAgentArtifact(agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: firstDigest}, first); err != nil {
 		t.Fatal(err)
 	}
 	second := append(append([]byte(nil), first...), []byte("rebuilt")...)
 	secondSum := sha256.Sum256(second)
 	secondDigest := hex.EncodeToString(secondSum[:])
-	if err := srv.storeAgentArtifact(agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: secondDigest}, second); err != nil {
+	if _, err := srv.storeAgentArtifact(agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: secondDigest}, second); err != nil {
 		t.Fatal(err)
 	}
 	artifacts := srv.agentArtifacts()
@@ -512,7 +556,7 @@ func TestStoreAgentArtifactRefusesToGrowPastItsCap(t *testing.T) {
 	}
 	var lastErr error
 	for _, ref := range refs {
-		lastErr = srv.storeAgentArtifact(ref, filler)
+		_, lastErr = srv.storeAgentArtifact(ref, filler)
 		if lastErr != nil {
 			break
 		}

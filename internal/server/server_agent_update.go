@@ -52,6 +52,11 @@ type agentUpdatePayload struct {
 	SHA256         string `json:"sha256"`
 	InstallPath    string `json:"install_path"`
 	ServiceName    string `json:"service_name"`
+	// BinarySource records where the node was told to fetch the binary from, so
+	// the choice is visible in the plan an operator approves and is bound into
+	// the approval rather than decided silently at apply time. Approvals planned
+	// before this field existed decode as empty and normalize to upstream.
+	BinarySource string `json:"binary_source,omitempty"`
 }
 
 type agentReleaseInfoView struct {
@@ -578,7 +583,7 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 		if err != nil {
 			return agentUpdatePayload{}, err
 		}
-		return agentUpdatePayload{
+		return s.withControlPlaneBinarySource(node, agentUpdatePayload{
 			NodeID:         normalized.NodeID,
 			CurrentVersion: strings.TrimSpace(node.AgentVersion),
 			TargetVersion:  normalized.TargetVersion,
@@ -586,9 +591,27 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 			SHA256:         normalized.SHA256,
 			InstallPath:    normalized.InstallPath,
 			ServiceName:    normalized.ServiceName,
-		}, nil
+		}), nil
 	}
 	return s.resolveOfficialAgentUpdatePayload(node, policy)
+}
+
+// withControlPlaneBinarySource points a payload at the control plane when it
+// already holds exactly the pinned bytes for this node's platform. Preferring
+// the nearer copy is automatic, but it is never silent: the source is written
+// into the payload, shown in the rendered plan, and bound into the approval the
+// operator signs off on.
+func (s *Server) withControlPlaneBinarySource(node model.Node, payload agentUpdatePayload) agentUpdatePayload {
+	payload.BinarySource = agentBinarySourceUpstream
+	osName, arch, err := agentPlatformForNode(node)
+	if err != nil {
+		return payload
+	}
+	if binaryURL, ok := s.controlPlaneAgentBinaryURL(payload.TargetVersion, osName, arch, payload.SHA256); ok {
+		payload.BinaryURL = binaryURL
+		payload.BinarySource = agentBinarySourceControlPlane
+	}
+	return payload
 }
 
 func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model.AgentUpdatePolicy) (agentUpdatePayload, error) {
@@ -596,10 +619,31 @@ func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model
 	if err != nil {
 		return agentUpdatePayload{}, err
 	}
-	artifact, err := agentArtifactForNode(node)
+	osName, arch, err := agentPlatformForNode(node)
 	if err != nil {
 		return agentUpdatePayload{}, err
 	}
+	payload := agentUpdatePayload{
+		NodeID:         policy.NodeID,
+		CurrentVersion: strings.TrimSpace(node.AgentVersion),
+		TargetVersion:  target,
+		InstallPath:    policy.InstallPath,
+		ServiceName:    policy.ServiceName,
+	}
+	// When the control plane already holds this version for this platform, its
+	// stored digest is authoritative and no third-party request happens at all.
+	// Those bytes were verified against the release checksums on import, or
+	// against the digest the operator declared on upload, so the pin is no
+	// weaker than the one a SHA256SUMS fetch would produce.
+	if stored, ok := s.storedAgentArtifact(target, osName, arch); ok {
+		if binaryURL, ok := s.controlPlaneAgentBinaryURL(target, osName, arch, stored.SHA256); ok {
+			payload.SHA256 = stored.SHA256
+			payload.BinaryURL = binaryURL
+			payload.BinarySource = agentBinarySourceControlPlane
+			return payload, nil
+		}
+	}
+	artifact := agentArtifactName(osName, arch)
 	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", s.agentReleaseRepo, url.PathEscape(tag))
 	sums, err := s.fetchAgentReleaseText(base + "/SHA256SUMS")
 	if err != nil {
@@ -609,15 +653,10 @@ func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model
 	if !ok {
 		return agentUpdatePayload{}, fmt.Errorf("official release %s does not publish checksum for %s", tag, artifact)
 	}
-	return agentUpdatePayload{
-		NodeID:         policy.NodeID,
-		CurrentVersion: strings.TrimSpace(node.AgentVersion),
-		TargetVersion:  target,
-		BinaryURL:      base + "/" + url.PathEscape(artifact),
-		SHA256:         sha,
-		InstallPath:    policy.InstallPath,
-		ServiceName:    policy.ServiceName,
-	}, nil
+	payload.SHA256 = sha
+	payload.BinaryURL = base + "/" + url.PathEscape(artifact)
+	payload.BinarySource = agentBinarySourceUpstream
+	return payload, nil
 }
 
 func (s *Server) officialAgentTargetAndTag(raw string) (targetVersion string, tag string, err error) {
@@ -888,23 +927,11 @@ func shaFromSums(sums string, artifact string) (string, bool) {
 }
 
 func agentArtifactForNode(node model.Node) (string, error) {
-	osName, err := managedAgentUpdateOS(node)
+	osName, arch, err := agentPlatformForNode(node)
 	if err != nil {
 		return "", err
 	}
-	arch := strings.ToLower(strings.TrimSpace(node.HostFacts.Arch))
-	switch arch {
-	case "", "x86_64":
-		arch = "amd64"
-	case "aarch64":
-		arch = "arm64"
-	}
-	switch arch {
-	case "amd64", "arm64":
-	default:
-		return "", fmt.Errorf("official lattice-agent releases do not support arch %q", arch)
-	}
-	return "lattice-agent-" + osName + "-" + arch, nil
+	return agentArtifactName(osName, arch), nil
 }
 
 func managedAgentUpdateOS(node model.Node) (string, error) {
@@ -972,11 +999,19 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	}
 	fmt.Fprintf(&b, "current_version: %s\n", currentVersion)
 	fmt.Fprintf(&b, "target_version: %s\n", payload.TargetVersion)
+	fmt.Fprintf(&b, "binary_source: %s\n", normalizeAgentBinarySource(payload.BinarySource))
 	fmt.Fprintf(&b, "binary_url: %s\n", payload.BinaryURL)
 	fmt.Fprintf(&b, "sha256: %s\n", payload.SHA256)
 	fmt.Fprintf(&b, "install_path: %s\n", payload.InstallPath)
 	fmt.Fprintf(&b, "service_name: %s\n", payload.ServiceName)
 	fmt.Fprintf(&b, "\nSafety:\n")
+	if normalizeAgentBinarySource(payload.BinarySource) == agentBinarySourceControlPlane {
+		fmt.Fprintf(&b, "- the binary comes from this control plane, so the node needs no third-party egress\n")
+		fmt.Fprintf(&b, "- the control plane re-verifies the stored bytes against this digest before serving them\n")
+	} else {
+		fmt.Fprintf(&b, "- the binary comes from the upstream release, so this node needs egress to it\n")
+		fmt.Fprintf(&b, "- import this version under Agent updates to serve it from the control plane instead\n")
+	}
 	fmt.Fprintf(&b, "- download is HTTPS-only and verified against the pinned SHA-256 digest\n")
 	fmt.Fprintf(&b, "- binary is installed atomically with a timestamped backup\n")
 	fmt.Fprintf(&b, "- service restart is delayed so the current agent can post the task result\n")
@@ -1041,7 +1076,18 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 		SHA256:         normalized.SHA256,
 		InstallPath:    normalized.InstallPath,
 		ServiceName:    normalized.ServiceName,
+		BinarySource:   normalizeAgentBinarySource(payload.BinarySource),
 	}, nil
+}
+
+// normalizeAgentBinarySource keeps approvals planned before control-plane
+// distribution existed comparable with ones planned after it. They decode with
+// an empty source and have always meant the upstream release URL.
+func normalizeAgentBinarySource(raw string) string {
+	if strings.TrimSpace(raw) == agentBinarySourceControlPlane {
+		return agentBinarySourceControlPlane
+	}
+	return agentBinarySourceUpstream
 }
 
 func sNormalizeAgentUpdatePayload(policy model.AgentUpdatePolicy) (model.AgentUpdatePolicy, error) {
@@ -1107,6 +1153,10 @@ func agentUpdatePayloadChangeSummary(planned, current agentUpdatePayload) string
 	}
 	if planned.TargetVersion != current.TargetVersion {
 		changes = append(changes, fmt.Sprintf("target_version planned=%s current=%s", planned.TargetVersion, current.TargetVersion))
+	}
+	if normalizeAgentBinarySource(planned.BinarySource) != normalizeAgentBinarySource(current.BinarySource) {
+		changes = append(changes, fmt.Sprintf("binary_source planned=%s current=%s",
+			normalizeAgentBinarySource(planned.BinarySource), normalizeAgentBinarySource(current.BinarySource)))
 	}
 	if planned.BinaryURL != current.BinaryURL {
 		changes = append(changes, fmt.Sprintf("binary_url planned=%s current=%s", planned.BinaryURL, current.BinaryURL))
@@ -1300,10 +1350,22 @@ func (s *Server) agentUpdateApprovalLocalStaleness(approval model.Approval) (boo
 	return false, ""
 }
 
-func agentUpdateApplyScript(approval model.Approval) (string, error) {
+// agentUpdateApplyScript renders the shell the node runs. controlPlaneBase is
+// this server's own public base URL; a plan that says the bytes come from the
+// control plane must resolve to a URL under it, or the script is refused rather
+// than rendered, because that URL is the only place the script will present its
+// task lease.
+func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (string, error) {
 	payload, err := agentUpdatePayloadFromApproval(approval)
 	if err != nil {
 		return "", err
+	}
+	source := normalizeAgentBinarySource(payload.BinarySource)
+	if source == agentBinarySourceControlPlane {
+		base := normalizeAgentBinaryBaseURL(controlPlaneBase)
+		if base == "" || !strings.HasPrefix(payload.BinaryURL, base+agentBinaryPathPrefix) {
+			return "", errors.New("approval pins control-plane binary distribution but its binary_url is not served by this control plane; re-plan before approving")
+		}
 	}
 	return "set -e\n" +
 		"umask 077\n" +
@@ -1318,6 +1380,7 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"ulimit -Sf unlimited 2>/dev/null || true\n" +
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
 		"URL=" + shellQuote(payload.BinaryURL) + "\n" +
+		"BINARY_SOURCE=" + shellQuote(source) + "\n" +
 		"EXPECT_SHA=" + shellQuote(payload.SHA256) + "\n" +
 		"TARGET=" + shellQuote(payload.InstallPath) + "\n" +
 		"SERVICE=" + shellQuote(payload.ServiceName) + "\n" +
@@ -1343,7 +1406,7 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"  RUNNING_SERVICE=$(sed -n 's#.*system\\.slice/\\([^/]*\\.service\\).*#\\1#p' /proc/self/cgroup | head -n 1)\n" +
 		"fi\n" +
 		"if [ -n \"$RUNNING_SERVICE\" ] && [ \"$SERVICE\" = \"$DEFAULT_SERVICE\" ]; then SERVICE=\"$RUNNING_SERVICE\"; fi\n" +
-		"echo \"lattice agent update: effective target=$TARGET service=$SERVICE\"\n" +
+		"echo \"lattice agent update: effective target=$TARGET service=$SERVICE binary_source=$BINARY_SOURCE\"\n" +
 		"if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then\n" +
 		"  echo 'lattice agent update: systemd is required for managed agent updates; refusing to install without a restart manager' >&2\n" +
 		"  exit 1\n" +
@@ -1357,18 +1420,12 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"  echo \"lattice agent update: service $SERVICE not found before installing $TARGET\" >&2\n" +
 		"  exit 1\n" +
 		"fi\n" +
+		agentUpdateLeasePreflight(source) +
 		"WORK=$(mktemp -d \"${TMPDIR:-/tmp}/lattice-agent-update.XXXXXX\")\n" +
 		"cleanup() { rm -rf \"$WORK\"; }\n" +
 		"trap cleanup EXIT\n" +
 		"CANDIDATE=\"$WORK/lattice-agent\"\n" +
-		"if command -v curl >/dev/null 2>&1; then\n" +
-		"  curl -fsSL --proto '=https' --tlsv1.2 -o \"$CANDIDATE\" \"$URL\"\n" +
-		"elif command -v wget >/dev/null 2>&1; then\n" +
-		"  wget --https-only -qO \"$CANDIDATE\" \"$URL\"\n" +
-		"else\n" +
-		"  echo 'lattice agent update: curl or wget is required' >&2\n" +
-		"  exit 1\n" +
-		"fi\n" +
+		agentUpdateDownloadStep(source) +
 		"if command -v sha256sum >/dev/null 2>&1; then\n" +
 		"  ACTUAL_SHA=$(sha256sum \"$CANDIDATE\" | awk '{print $1}')\n" +
 		"elif command -v shasum >/dev/null 2>&1; then\n" +
@@ -1397,6 +1454,59 @@ func agentUpdateApplyScript(approval model.Approval) (string, error) {
 		"RESTART_UNIT=\"lattice-agent-delayed-restart-$(date +%Y%m%d%H%M%S)-$$\"\n" +
 		"systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n" +
 		"echo \"lattice agent update: installed $TARGET_VERSION and scheduled $SERVICE restart via $RESTART_UNIT\"\n", nil
+}
+
+// agentUpdateLeasePreflight stops a control-plane download before it starts on
+// an agent too old to prove which task it is running. The agent has exported
+// LATTICE_TASK_ID and LATTICE_TASK_LEASE_ID into every task environment since
+// v0.2.0, and nothing else on the node carries a credential this script may
+// use, so the honest failure is here with the reason named rather than later on
+// an unauthenticated fetch.
+func agentUpdateLeasePreflight(source string) string {
+	if source != agentBinarySourceControlPlane {
+		return ""
+	}
+	return "if [ -z \"${LATTICE_TASK_ID:-}\" ] || [ -z \"${LATTICE_TASK_LEASE_ID:-}\" ]; then\n" +
+		"  echo 'lattice agent update: this agent does not expose its task lease; control-plane binary distribution needs node-agent v0.2.0 or newer' >&2\n" +
+		"  exit 1\n" +
+		"fi\n"
+}
+
+// agentUpdateDownloadStep renders the one fetch the approved plan chose, rather
+// than both behind a runtime branch, so the script an operator reveals has a
+// single download command in it. The task lease is presented only on the
+// control-plane form: attaching it to an upstream release URL would hand a live
+// server credential to a third party.
+func agentUpdateDownloadStep(source string) string {
+	curl := "curl -fsSL --proto '=https' --tlsv1.2 -o \"$CANDIDATE\" \"$URL\""
+	wget := "wget --https-only -qO \"$CANDIDATE\" \"$URL\""
+	if source == agentBinarySourceControlPlane {
+		leaseHeaders := " -H \"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
+			" -H \"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\""
+		// No redirect following on the credentialed fetch. curl only strips the
+		// standard Authorization header across a cross-host redirect, never a
+		// custom -H, and wget strips nothing, so a 3xx from anything in front of
+		// the control plane would forward a live task lease to whatever it
+		// points at. A single self-hosted digest-pinned object never needs a
+		// redirect, so refusing them costs nothing and makes "the lease goes
+		// only to this control plane" a property of the script rather than of
+		// the current proxy configuration. The upstream branch keeps following
+		// redirects, because release assets legitimately land on CDN storage,
+		// and it carries no credential.
+		curl = "curl -fsS --proto '=https' --tlsv1.2" + leaseHeaders + " -o \"$CANDIDATE\" \"$URL\""
+		wget = "wget --https-only -q --max-redirect=0" +
+			" --header=\"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
+			" --header=\"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\"" +
+			" -O \"$CANDIDATE\" \"$URL\""
+	}
+	return "if command -v curl >/dev/null 2>&1; then\n" +
+		"  " + curl + "\n" +
+		"elif command -v wget >/dev/null 2>&1; then\n" +
+		"  " + wget + "\n" +
+		"else\n" +
+		"  echo 'lattice agent update: curl or wget is required' >&2\n" +
+		"  exit 1\n" +
+		"fi\n"
 }
 
 func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.Approval, result model.TaskResult) error {

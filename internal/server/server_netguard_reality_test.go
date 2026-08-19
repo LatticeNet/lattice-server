@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,7 +40,35 @@ type guardRealityDetailTest struct {
 	} `json:"node"`
 }
 
-func newGuardRealityServerForTest(t *testing.T, now *time.Time) (*Server, http.Handler, *store.Store, []*http.Cookie, string) {
+// guardRealityTestClock is the clock these tests install on the server.
+//
+// It is locked because the server under test is a running server: New starts
+// background goroutines, and the terminal reaper calls s.now() on a ticker.
+// Tests used to advance time by assigning to a shared time.Time and to
+// srv.now while those goroutines were reading both, which the race detector
+// caught intermittently. Set is the only safe way to move the clock.
+type guardRealityTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newGuardRealityTestClock(at time.Time) *guardRealityTestClock {
+	return &guardRealityTestClock{now: at}
+}
+
+func (c *guardRealityTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now.UTC()
+}
+
+func (c *guardRealityTestClock) Set(at time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = at
+}
+
+func newGuardRealityServerForTest(t *testing.T, clock *guardRealityTestClock) (*Server, http.Handler, *store.Store, []*http.Cookie, string) {
 	t.Helper()
 	st, err := store.Open("")
 	if err != nil {
@@ -53,7 +82,7 @@ func newGuardRealityServerForTest(t *testing.T, now *time.Time) (*Server, http.H
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
-	srv.now = func() time.Time { return now.UTC() }
+	srv.now = clock.Now
 	handler := srv.Handler()
 	cookies, csrf := loginSession(t, handler)
 	return srv, handler, st, cookies, csrf
@@ -114,7 +143,8 @@ func assertAPIErrorCodeFromBody(t *testing.T, body string, want string) {
 
 func TestNetGuardRealityAgentWriteAndReadContract(t *testing.T) {
 	now := time.Date(2026, 7, 31, 13, 0, 1, 0, time.UTC)
-	srv, handler, st, cookies, csrf := newGuardRealityServerForTest(t, &now)
+	clock := newGuardRealityTestClock(now)
+	_, handler, st, cookies, csrf := newGuardRealityServerForTest(t, clock)
 
 	tokenA := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
@@ -218,8 +248,7 @@ func TestNetGuardRealityAgentWriteAndReadContract(t *testing.T) {
 		t.Fatalf("unknown node exposed snapshot-derived fields: %+v", list.Nodes[1])
 	}
 
-	now = collectedAt.Add(30 * time.Hour)
-	srv.now = func() time.Time { return now.UTC() }
+	clock.Set(collectedAt.Add(30 * time.Hour))
 	detailRes := doJSON(t, handler, http.MethodGet, "/api/netguard/reality?node_id=node-a", "", cookies, csrf)
 	defer detailRes.Body.Close()
 	if detailRes.StatusCode != http.StatusOK {
@@ -242,7 +271,7 @@ func TestNetGuardRealityAgentWriteAndReadContract(t *testing.T) {
 
 func TestNetGuardRealityValidationAndStaleConflicts(t *testing.T) {
 	now := time.Date(2026, 7, 31, 13, 0, 0, 0, time.UTC)
-	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, &now)
+	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, newGuardRealityTestClock(now))
 	tokenA := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 	tokenB := enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
 	tokenC := enrollNamedNodeToken(t, handler, cookies, csrf, "node-c", "Node C")
@@ -354,7 +383,7 @@ func TestNetGuardRealityValidationAndStaleConflicts(t *testing.T) {
 
 func TestNetGuardRealityReadVisibilityAndPagination(t *testing.T) {
 	now := time.Date(2026, 7, 31, 13, 0, 0, 0, time.UTC)
-	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, &now)
+	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, newGuardRealityTestClock(now))
 	tokenA := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
 	tokenC := enrollNamedNodeToken(t, handler, cookies, csrf, "node-c", "Node C")

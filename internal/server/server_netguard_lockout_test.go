@@ -153,7 +153,7 @@ func TestNetGuardReviewPreviewsRulesetAndFindings(t *testing.T) {
 // in one request, or no UI will ask it.
 func TestNetGuardRealityListCarriesFleetPosture(t *testing.T) {
 	now := time.Now().UTC()
-	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, &now)
+	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, newGuardRealityTestClock(now))
 	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 	enrollNamedNode(t, handler, cookies, csrf, "node-b", "Node B")
 
@@ -195,7 +195,7 @@ func TestNetGuardRealityListCarriesFleetPosture(t *testing.T) {
 // matches what Lattice installed has to be visible from the fleet list.
 func TestNetGuardRealityListReportsDriftAndInSync(t *testing.T) {
 	now := time.Now().UTC()
-	srv, handler, _, cookies, csrf := newGuardRealityServerForTest(t, &now)
+	srv, handler, _, cookies, csrf := newGuardRealityServerForTest(t, newGuardRealityTestClock(now))
 	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 
 	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",

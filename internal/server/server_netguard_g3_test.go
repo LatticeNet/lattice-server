@@ -39,7 +39,7 @@ func setupAdoptedNetGuardNode(t *testing.T, handler http.Handler, st *store.Stor
 
 func TestNetGuardReviewProjection(t *testing.T) {
 	now := time.Date(2026, 8, 13, 6, 30, 0, 0, time.UTC)
-	_, handler, st, cookies, csrf := newGuardRealityServerForTest(t, &now)
+	_, handler, st, cookies, csrf := newGuardRealityServerForTest(t, newGuardRealityTestClock(now))
 	token := setupAdoptedNetGuardNode(t, handler, st, cookies, csrf)
 	if err := st.UpsertGuardZone(model.GuardZone{ID: "corp", Name: "corp", CIDRs: []string{"10.20.0.0/16"}}); err != nil {
 		t.Fatal(err)

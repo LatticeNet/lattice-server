@@ -114,8 +114,15 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("expected one update task, got %+v", tasks)
 	}
-	if tasks[0].TimeoutSec != 900 {
-		t.Fatalf("agent update should get the extended download timeout (900s), got %d", tasks[0].TimeoutSec)
+	// 600, not 900. This assertion used to demand 900 and was wrong in the way
+	// that matters: the agent's task executor treats anything above ten minutes
+	// as out of range and substitutes its 30 second default, so 900 gave slow
+	// nodes less time than asking for nothing would have. The test passed while
+	// the fleet could not update.
+	if tasks[0].TimeoutSec != 600 {
+		t.Fatalf("agent update should get the extended download timeout, at or under the agent's "+
+			"ten minute bound so it is honoured rather than replaced by the 30s default, got %d",
+			tasks[0].TimeoutSec)
 	}
 	script := tasks[0].Script
 	for _, want := range []string{

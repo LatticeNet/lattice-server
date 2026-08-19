@@ -40,13 +40,32 @@ type guardRealityResponse struct {
 	CollectedAtClamped bool      `json:"collected_at_clamped"`
 }
 
+// guardRealitySummary is one row of the fleet posture table.
+//
+// Every field an operator needs to triage a fleet is here on purpose. Drift
+// used to be computable only through the per-node review method, so a
+// fleet-wide "which of my nodes drifted" question cost one request per node
+// and no surface asked it. Answering it here makes the posture view a single
+// call and removes the incentive to render a green fleet nobody checked.
 type guardRealitySummary struct {
-	NodeID            string     `json:"node_id"`
-	SnapshotStatus    string     `json:"snapshot_status"`
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name,omitempty"`
+	// SnapshotStatus is unknown (never reported), fresh, or stale.
+	SnapshotStatus string `json:"snapshot_status"`
+	// DriftState is unknown, in_sync, or drift, computed exactly as the
+	// per-node review computes it. "unknown" covers both "never reported" and
+	// "never applied": calling either of those in_sync would be the most
+	// dangerous label in the product.
+	DriftState        string     `json:"drift_state"`
+	Managed           bool       `json:"managed"`
+	HasBinding        bool       `json:"has_binding"`
 	CollectedAt       *time.Time `json:"collected_at,omitempty"`
 	ReceivedAt        *time.Time `json:"received_at,omitempty"`
 	StaleAfter        *time.Time `json:"stale_after,omitempty"`
 	ManagedSHA        *string    `json:"managed_sha,omitempty"`
+	AppliedTableSHA   string     `json:"applied_table_sha,omitempty"`
+	LastAppliedAt     *time.Time `json:"last_applied_at,omitempty"`
+	LastError         string     `json:"last_error,omitempty"`
 	ListenerCount     *int       `json:"listener_count,omitempty"`
 	InterfaceCount    *int       `json:"interface_count,omitempty"`
 	ForeignTableCount *int       `json:"foreign_table_count,omitempty"`
@@ -195,7 +214,7 @@ func (s *Server) handleNetGuardReality(w http.ResponseWriter, r *http.Request, p
 	now := s.now().UTC()
 	out := make([]guardRealitySummary, 0, end-start)
 	for _, node := range nodes[start:end] {
-		out = append(out, s.guardRealitySummaryForNode(node.ID, now))
+		out = append(out, s.guardRealitySummaryForNode(node.ID, node.Name, now))
 	}
 	resp := guardRealityListResponse{Nodes: out}
 	if end < len(nodes) && len(out) > 0 {
@@ -215,10 +234,27 @@ func (s *Server) visibleGuardRealityNodes(p principal) []model.Node {
 	return out
 }
 
-func (s *Server) guardRealitySummaryForNode(nodeID string, now time.Time) guardRealitySummary {
+func (s *Server) guardRealitySummaryForNode(nodeID, nodeName string, now time.Time) guardRealitySummary {
+	out := guardRealitySummary{
+		NodeID:         nodeID,
+		NodeName:       nodeName,
+		SnapshotStatus: "unknown",
+		DriftState:     netGuardDriftUnknown,
+	}
+	binding, hasBinding := s.store.NodeGuardBinding(nodeID)
+	if hasBinding {
+		out.HasBinding = true
+		out.Managed = binding.Managed
+		out.AppliedTableSHA = binding.AppliedTableSHA
+		out.LastError = binding.LastError
+		if !binding.LastAppliedAt.IsZero() {
+			lastAppliedAt := binding.LastAppliedAt.UTC()
+			out.LastAppliedAt = &lastAppliedAt
+		}
+	}
 	snapshot, ok := s.store.GuardRealitySnapshot(nodeID)
 	if !ok {
-		return guardRealitySummary{NodeID: nodeID, SnapshotStatus: "unknown"}
+		return out
 	}
 	status, staleAfter := guardRealityFreshness(snapshot, now)
 	managedSHA := snapshot.Reality.ManagedSHA
@@ -227,17 +263,31 @@ func (s *Server) guardRealitySummaryForNode(nodeID string, now time.Time) guardR
 	foreignTableCount := len(snapshot.Reality.ForeignTables)
 	collectedAt := snapshot.Reality.CollectedAt.UTC()
 	receivedAt := snapshot.ReceivedAt.UTC()
-	return guardRealitySummary{
-		NodeID:            nodeID,
-		SnapshotStatus:    status,
-		CollectedAt:       &collectedAt,
-		ReceivedAt:        &receivedAt,
-		StaleAfter:        &staleAfter,
-		ManagedSHA:        &managedSHA,
-		ListenerCount:     &listenerCount,
-		InterfaceCount:    &interfaceCount,
-		ForeignTableCount: &foreignTableCount,
+	out.SnapshotStatus = status
+	out.CollectedAt = &collectedAt
+	out.ReceivedAt = &receivedAt
+	out.StaleAfter = &staleAfter
+	out.ManagedSHA = &managedSHA
+	out.ListenerCount = &listenerCount
+	out.InterfaceCount = &interfaceCount
+	out.ForeignTableCount = &foreignTableCount
+	if hasBinding {
+		out.DriftState = netGuardDriftState(binding, &snapshot.Reality)
 	}
+	return out
+}
+
+// guardRealityForLint hands the plan path the node's last reported reality, or
+// nil when the node has never reported one. nil is the honest input: the lint
+// then says out loud that it is assuming the management port rather than
+// silently checking the wrong one.
+func (s *Server) guardRealityForLint(nodeID string) *model.GuardNodeReality {
+	snapshot, ok := s.store.GuardRealitySnapshot(nodeID)
+	if !ok {
+		return nil
+	}
+	reality := snapshot.Reality
+	return &reality
 }
 
 func (s *Server) guardRealityDetailForNode(nodeID string, now time.Time) guardRealityDetail {

@@ -161,7 +161,10 @@ func TestScopedPrincipalWireGuardFamily(t *testing.T) {
 	if list.StatusCode != http.StatusOK {
 		t.Fatalf("approvals list: %d", list.StatusCode)
 	}
-	assertNoNodeNamed(t, "the approvals list for a node-a session", body, "node-b")
+	// Asserted on node-b's WireGuard public key, not on the string "node-b":
+	// the config identifies peers by key and address, not by node id, so
+	// checking the id would have passed against an unfiltered listing.
+	assertNoNodeNamed(t, "the approvals list for a node-a session", body, wgKey(2), "10.66.0.2")
 }
 
 func TestScopedPrincipalNodeAndGroupFamilies(t *testing.T) {

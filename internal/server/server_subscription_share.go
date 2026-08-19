@@ -156,6 +156,21 @@ func subscriptionContentHash(raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// maxSubscriptionUserinfoBytes bounds the quota header. Real values are a few
+// dozen bytes of "upload=...; download=...; total=...; expire=..."; anything
+// approaching a body is not a quota figure and is dropped rather than truncated,
+// because half a number is worse than none for a client parsing it.
+const maxSubscriptionUserinfoBytes = 512
+
+// subscriptionUserinfoForResponse returns the quota value a source supplied, or
+// nothing when it is too large to be one.
+func subscriptionUserinfoForResponse(userinfo string) string {
+	if len(userinfo) > maxSubscriptionUserinfoBytes {
+		return ""
+	}
+	return userinfo
+}
+
 // subscriptionResponseContentType decides how the response describes itself,
 // from what the core negotiated and nothing else.
 //
@@ -191,9 +206,17 @@ func subscriptionResponseContentType(format, target string) string {
 
 // handleSubscriptionShare serves the public subscription endpoint.
 //
-// The core owns every part of this - routing, lookup, rate limiting, audit and
-// response headers. A source only ever produces bytes; it cannot see the token,
-// set a header, or decide a status code.
+// The core owns the routing, the lookup, the rate limit, the audit trail, the
+// status code and the content type. A source never sees the token and cannot
+// decide how its bytes are interpreted.
+//
+// One response header does carry source data, and saying otherwise is what let
+// two defects live here: Subscription-Userinfo is the provider's own quota
+// figures, which only the provider knows, so it cannot be derived the way the
+// content type is. It is passed through under two limits instead. Go's header
+// serialiser neutralises CR and LF, so it cannot start a second header, and
+// subscriptionUserinfoForResponse bounds its length, so it cannot be used to
+// spend the response envelope. Nothing else a source returns reaches a header.
 func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request) {
 	// Every rejection below writes the same decoy and audits the real reason.
 	// The audit is where an operator finds out what happened; the response is
@@ -380,8 +403,8 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", subscriptionResponseContentType(format, variant.Target))
 	// ?noFlow=1 keeps quota headers off the wire (upstream's 不查询订阅流量) —
 	// some clients probe aggressively when they see one.
-	if userinfo != "" && !variant.NoFlow {
-		w.Header().Set("Subscription-Userinfo", userinfo)
+	if quota := subscriptionUserinfoForResponse(userinfo); quota != "" && !variant.NoFlow {
+		w.Header().Set("Subscription-Userinfo", quota)
 	}
 	if staleResponse {
 		w.Header().Set("X-Lattice-Subscription-Stale", "true")

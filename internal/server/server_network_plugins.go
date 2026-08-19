@@ -292,7 +292,31 @@ func (s *Server) wireGuardNetworksRPC(ctx context.Context, method string, reques
 				ready++
 			}
 		}
-		return json.Marshal(map[string]any{"nodes": rows, "count": len(rows), "ready": ready})
+		// The mesh totals, unfiltered, so a scope-limited operator is not shown
+		// a subset that looks like the whole thing.
+		//
+		// `rows` is filtered per node by wireguard:read, but a plan is compiled
+		// from every node in the store, so the config that gets written can
+		// contain peers these rows never mentioned. Reporting only len(rows)
+		// made the view claim a completeness it does not have. These two numbers
+		// let it say "showing 12 of 35" instead. They are counts, not identities:
+		// nothing here names a node the caller could not already list.
+		meshTotal, meshReady := 0, 0
+		for _, node := range s.store.Nodes() {
+			hasIP := strings.TrimSpace(node.WireGuardIP) != ""
+			hasKey := strings.TrimSpace(node.WireGuardPublicKey) != ""
+			if !hasIP && !hasKey {
+				continue
+			}
+			meshTotal++
+			if hasIP && hasKey {
+				meshReady++
+			}
+		}
+		return json.Marshal(map[string]any{
+			"nodes": rows, "count": len(rows), "ready": ready,
+			"mesh_total": meshTotal, "mesh_ready": meshReady,
+		})
 	case "plan":
 		return invokePluginOperation(ctx, http.MethodPost, request, s.handleWireGuardPlan)
 	default:

@@ -941,6 +941,20 @@ func (s *Server) handleLineChainPlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// Both node identities arrive inside the body, so withAuth's ?node_id check
+	// was a no-op and nothing here was ever authorized per node. The preview
+	// returned below carries the target node's id, public host, the managed
+	// line's port and SNI, and fingerprints of its REALITY public key and short
+	// id, and the approval filed below writes pending state against the source
+	// node. Any network:plan holder could name a target line uuid, which the
+	// chains listing hands out, and receive another node's connection material.
+	//
+	// Refused rather than filtered: a chain plan names exactly two nodes, and a
+	// plan with one of them dropped is not a plan.
+	if !s.requireReadableNodes(w, p, "network:plan", "planning this line chain",
+		[]string{compiled.Plan.SourceNodeID, compiled.Plan.TargetNodeID}) {
+		return
+	}
 	approval, err := s.persistLineChainPlan(p, compiled)
 	if err != nil {
 		writeError(w, http.StatusConflict, err)
@@ -965,6 +979,12 @@ func (s *Server) handleLineChainRemovePlan(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// Same shape as the plan path: the source line uuid is a body field, so
+	// nothing authorized the node it resolves to.
+	if !s.requireReadableNodes(w, p, "network:plan", "planning this line chain removal",
+		[]string{compiled.Plan.SourceNodeID, compiled.Plan.TargetNodeID}) {
+		return
+	}
 	approval, err := s.persistLineChainPlan(p, compiled)
 	if err != nil {
 		writeError(w, http.StatusConflict, err)
@@ -973,16 +993,38 @@ func (s *Server) handleLineChainRemovePlan(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{"approval": toApprovalView(approval), "preview": compiled.Plan})
 }
 
-func (s *Server) handleLineChains(w http.ResponseWriter, r *http.Request, _ principal) {
+func (s *Server) handleLineChains(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
+	// The principal used to be discarded outright, so a proxy:read holder
+	// confined to one node received every chain's source and target node ids
+	// and line uuids. That listing is what makes naming a target line uuid at
+	// the plan endpoint practical, so it is the enumeration half of the same
+	// defect.
+	//
+	// Filtered, not refused: this is a listing. A row survives only when both
+	// of its ends are readable, because a row IS its pair of node ids.
 	view, err := s.lineChainViews()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	visible := make([]lineChainView, 0, len(view.Chains))
+	for _, row := range view.Chains {
+		ends := []string{row.SourceNodeID}
+		if row.Current != nil {
+			ends = append(ends, row.Current.TargetNodeID)
+		}
+		// The attempt view carries no node id of its own, only the candidate
+		// target line uuid, so the pair above is the full node reach of a row.
+		if deniedNodeCount(p.Principal, "proxy:read", ends) > 0 {
+			continue
+		}
+		visible = append(visible, row)
+	}
+	view.Chains = visible
 	writeJSON(w, http.StatusOK, view)
 }
 

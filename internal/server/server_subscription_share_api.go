@@ -47,6 +47,20 @@ func shareViewOf(share model.SubscriptionShare) shareView {
 }
 
 func (s *Server) handleSubscriptionShares(w http.ResponseWriter, r *http.Request, p principal) {
+	// A share token renders endpoints from every node's proxy profile, so a
+	// share is a fleet-wide object and every sibling global proxy endpoint
+	// refuses a node-restricted principal through this same primitive. This
+	// REST path was the one door that did not, which let an operator confined
+	// to one node list the plaintext share tokens and then fetch the whole
+	// fleet's server addresses, REALITY public keys and short ids from the
+	// unauthenticated /sub/ delivery path.
+	//
+	// Not widened: the plugin gateway already applies this rule to the same
+	// material (subStoreSharesRPC), so this aligns the REST door with the rule
+	// the rest of the surface already enforces.
+	if !s.requireGlobalProxyScope(w, p, "proxy:admin") {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		out := make([]shareView, 0, len(s.store.SubscriptionShares()))

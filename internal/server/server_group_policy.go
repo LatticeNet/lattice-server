@@ -231,13 +231,35 @@ func (s *Server) handleGroupPolicyPlan(w http.ResponseWriter, r *http.Request, p
 			conflicts = append(conflicts, groupPlanConflict{NodeID: nodeID, Reason: "node has a manually-authored network policy; resolve before applying group policy"})
 			continue
 		}
-		normalized, err := netpolicy.NormalizePolicy(eff, s.resolveNode)
+		// netpolicy:admin is held on every target above, but a group rule can
+		// name a remote node that is not itself a target, and compiling one
+		// embeds that node's WireGuard IP and public addresses into the plan
+		// stored and returned here. Group expansion made this worse than the
+		// single-node case: one plan call fans out across many targets, so one
+		// unreadable remote leaks through every plan that names it.
+		//
+		// Refused rather than filtered, and refused per target rather than for
+		// the whole batch: a target whose rules are all readable still gets a
+		// correct plan, while a target that would need an unreadable remote
+		// gets no plan at all instead of a ruleset missing rules.
+		resolver := s.nodeResolverFor(p, "netpolicy:read", "planning this group policy", nodeID)
+		normalized, err := netpolicy.NormalizePolicy(eff, resolver.Resolve)
+		// Checked before err on purpose: the compiler names the node it could
+		// not resolve, and that name is what the refusal exists to withhold.
+		if refused := resolver.Refused(); refused != nil {
+			conflicts = append(conflicts, groupPlanConflict{NodeID: nodeID, Reason: refused.Error()})
+			continue
+		}
 		if err != nil {
 			conflicts = append(conflicts, groupPlanConflict{NodeID: nodeID, Reason: "expansion failed validation: " + err.Error()})
 			continue
 		}
 		normalized.GroupDerived = true
-		egressPlan, err := netpolicy.CompileEgressPlan(normalized, s.resolveNode, opts)
+		egressPlan, err := netpolicy.CompileEgressPlan(normalized, resolver.Resolve, opts)
+		if refused := resolver.Refused(); refused != nil {
+			conflicts = append(conflicts, groupPlanConflict{NodeID: nodeID, Reason: refused.Error()})
+			continue
+		}
 		if err != nil {
 			conflicts = append(conflicts, groupPlanConflict{NodeID: nodeID, Reason: "compile failed: " + err.Error()})
 			continue
@@ -400,6 +422,18 @@ func sortedNonEmptyUnique(in []string) []string {
 	return sortedSetKeys(set)
 }
 
+// currentGroupDerivedPolicyPlanSHA recompiles a group-derived policy so the
+// approve path can prove the stored plan still matches what the group model
+// produces now. It deliberately resolves without a principal.
+//
+// The reasoning, because this is the one place that looks like the defect and
+// is not: the recompile output is a hash compared in memory, never returned.
+// The auto-approve policy engine drives this path under a synthetic identity
+// that holds no scopes at all, so a scoped resolver would deny every remote and
+// silently stop auto-approving group policy, which is a correctness break for a
+// disclosure that does not happen. The error strings below are the only thing a
+// caller sees, and they are written to name the target node the caller already
+// asked about and nothing else.
 func (s *Server) currentGroupDerivedPolicyPlanSHA(nodeID string) (string, error) {
 	opts, err := s.netPolicyCompileOptions()
 	if err != nil {
@@ -412,13 +446,17 @@ func (s *Server) currentGroupDerivedPolicyPlanSHA(nodeID string) (string, error)
 	if !ok {
 		return "", fmt.Errorf("group-derived netpolicy %q is no longer covered by any enabled group policy; re-plan before approving", nodeID)
 	}
-	normalized, err := netpolicy.NormalizePolicy(eff, s.resolveNode)
+	resolver := s.systemNodeResolver("freshness hash only; never returned to the caller")
+	normalized, err := netpolicy.NormalizePolicy(eff, resolver.Resolve)
 	if err != nil {
-		return "", fmt.Errorf("group-derived netpolicy %q no longer validates; re-plan before approving: %w", nodeID, err)
+		// The wrapped compiler error names the remote node it could not
+		// resolve. An approver scoped to this target need not learn that name,
+		// so the cause is dropped and only the target is reported.
+		return "", fmt.Errorf("group-derived netpolicy %q no longer validates; re-plan before approving", nodeID)
 	}
-	plan, err := netpolicy.CompileEgressPlan(normalized, s.resolveNode, opts)
+	plan, err := netpolicy.CompileEgressPlan(normalized, resolver.Resolve, opts)
 	if err != nil {
-		return "", fmt.Errorf("group-derived netpolicy %q no longer compiles; re-plan before approving: %w", nodeID, err)
+		return "", fmt.Errorf("group-derived netpolicy %q no longer compiles; re-plan before approving", nodeID)
 	}
 	sum := sha256.Sum256([]byte(plan.Ruleset))
 	return hex.EncodeToString(sum[:]), nil

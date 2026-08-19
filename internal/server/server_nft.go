@@ -50,11 +50,13 @@ func (s *Server) handleNFTInputs(w http.ResponseWriter, r *http.Request, p princ
 			writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
 			return
 		}
-		if _, ok := s.store.Node(req.NodeID); !ok {
-			writeError(w, http.StatusNotFound, errors.New("node not found"))
+		// Scope first, then existence. The other order answered "does node X
+		// exist" with a 404-against-403 difference before any check ran.
+		if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 			return
 		}
-		if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
+		if _, ok := s.store.Node(req.NodeID); !ok {
+			writeError(w, http.StatusNotFound, errors.New("node not found"))
 			return
 		}
 		inputs, err := nftInputsFromPlan(req.NodeID, req.NFTPlan)
@@ -154,20 +156,37 @@ func nftPlanRequestHasInputs(plan network.NFTPlan) bool {
 		len(plan.WireGuardUDP) > 0
 }
 
+// composeNFTIngressPolicy folds a node's ingress policy into an nft plan.
+//
+// The read check used to cover nodeID alone, while the compiler resolved every
+// rule's remote node and put that node's addresses into plan.InputRules. That
+// is the same defect handleNetPolicyPlan carried on the egress side: authorized
+// on the target, then dereferencing the remotes. The scoped resolver closes it,
+// and the target check moved above the compile so a caller who may not read the
+// target never gets a compile attempted on their behalf.
+//
+// Refused rather than filtered: an ingress ruleset missing the sources the
+// caller cannot read would silently open or close the wrong ports.
 func (s *Server) composeNFTIngressPolicy(nodeID string, plan *network.NFTPlan, p principal) (int, error) {
 	policy, ok := s.store.NetPolicy(nodeID)
 	if !ok || !policy.Enabled {
 		return 0, nil
 	}
-	rules, err := netpolicy.CompileIngressInputRules(policy, s.resolveNode)
+	if !rbac.Allows(p.Principal, "netpolicy:read", nodeID) {
+		return 0, errNFTIngressPolicyReadRequired
+	}
+	resolver := s.nodeResolverFor(p, "netpolicy:read", "composing ingress policy", nodeID)
+	rules, err := netpolicy.CompileIngressInputRules(policy, resolver.Resolve)
+	// Checked before the compile error: a denial makes the compiler fail with a
+	// message naming the node, which is what the refusal exists to withhold.
+	if refused := resolver.Refused(); refused != nil {
+		return 0, refused
+	}
 	if err != nil {
 		return 0, err
 	}
 	if len(rules) == 0 {
 		return 0, nil
-	}
-	if !rbac.Allows(p.Principal, "netpolicy:read", nodeID) {
-		return 0, errNFTIngressPolicyReadRequired
 	}
 	plan.InputRules = append(plan.InputRules, rules...)
 	return len(rules), nil

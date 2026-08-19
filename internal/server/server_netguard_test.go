@@ -9,8 +9,21 @@ import (
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/netguard"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
+
+// hasFinding reports whether a lint code is present, which is what these tests
+// care about. Asserting an exact finding count instead would mean every new
+// safety check breaks unrelated tests.
+func hasFinding(findings []netguard.Finding, code string) bool {
+	for _, finding := range findings {
+		if finding.Code == code {
+			return true
+		}
+	}
+	return false
+}
 
 type netGuardGroupsResponse struct {
 	Groups []struct {
@@ -321,10 +334,8 @@ func TestNetGuardAdoptThenPlan(t *testing.T) {
 		t.Fatalf("netguard plan failed: %d", plan.StatusCode)
 	}
 	var planRes struct {
-		Approval model.Approval `json:"approval"`
-		Findings []struct {
-			Code string `json:"code"`
-		} `json:"findings"`
+		Approval model.Approval     `json:"approval"`
+		Findings []netguard.Finding `json:"findings"`
 	}
 	if err := json.NewDecoder(plan.Body).Decode(&planRes); err != nil {
 		t.Fatal(err)
@@ -341,8 +352,14 @@ func TestNetGuardAdoptThenPlan(t *testing.T) {
 			t.Fatalf("plan missing %q:\n%s", want, planRes.Approval.Plan)
 		}
 	}
-	if len(planRes.Findings) != 0 {
-		t.Fatalf("a plan allowing tcp/22 with a public url must be clean: %+v", planRes.Findings)
+	// This node has never reported its firewall reality, so the lockout check
+	// ran on the tcp/22 assumption. That is not "clean", and saying so is the
+	// point: nothing blocks, but the operator is told the check was a guess.
+	if netguard.Blocking(planRes.Findings) {
+		t.Fatalf("a plan allowing tcp/22 with a public url must not block: %+v", planRes.Findings)
+	}
+	if !hasFinding(planRes.Findings, netguard.FindingManagementPortAssumed) {
+		t.Fatalf("a plan for a node that never reported must say the port was assumed: %+v", planRes.Findings)
 	}
 }
 

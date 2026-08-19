@@ -403,7 +403,10 @@ func TestLintUnverifiedApplyWarnsButDoesNotBlock(t *testing.T) {
 	if Blocking(findings) {
 		t.Fatal("missing public url must warn, not block")
 	}
-	if len(findings) != 1 || findings[0].Code != FindingUnverifiedApply {
+	// This fixture has no reality snapshot, so the plan is also linted against
+	// an assumed management port. Assert the code is present rather than that
+	// it is the only finding, so a new safety check does not break this test.
+	if _, ok := codes(findings)[FindingUnverifiedApply]; !ok {
 		t.Fatalf("findings = %+v", findings)
 	}
 }

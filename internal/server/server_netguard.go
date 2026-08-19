@@ -55,6 +55,18 @@ type netGuardReview struct {
 	Suggestions []netguard.Suggestion `json:"suggestions"`
 	DriftState  string                `json:"drift_state"`
 	ReplanInput netGuardReplanInput   `json:"replan_input"`
+	// Findings is what Lint would say about the plan this node's current intent
+	// compiles to. Serving it from a read method is what lets an operator see a
+	// lockout risk before creating an approval instead of after.
+	Findings []netguard.Finding `json:"findings"`
+	// Ruleset is the nft text this intent renders to right now. It is the
+	// escape hatch behind the zone and group model, and the left side of the
+	// diff an operator reads before approving anything.
+	Ruleset string `json:"ruleset,omitempty"`
+	// CompileError explains why Ruleset is empty. An unmanaged or unresolvable
+	// node still gets its reality rendered; refusing the whole review because
+	// intent does not compile would hide the evidence the operator came for.
+	CompileError string `json:"compile_error,omitempty"`
 }
 
 type netGuardReviewResponse struct {
@@ -219,13 +231,21 @@ func (s *Server) handleNetGuardReview(w http.ResponseWriter, r *http.Request, p 
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, netGuardReviewResponse{Review: netGuardReview{
+	review := netGuardReview{
 		Node:        netGuardViewFromCompileInput(input, node.Name),
 		Reality:     reality,
 		Suggestions: suggestions,
 		DriftState:  netGuardDriftState(input.Binding, reality.Reality),
 		ReplanInput: netGuardReplanInput{NodeID: nodeID},
-	}})
+		Findings:    make([]netguard.Finding, 0),
+	}
+	if ruleset, findings, compileErr := s.netGuardPreview(input, reality.Reality); compileErr != nil {
+		review.CompileError = compileErr.Error()
+	} else {
+		review.Ruleset = ruleset
+		review.Findings = findings
+	}
+	writeJSON(w, http.StatusOK, netGuardReviewResponse{Review: review})
 }
 
 func netGuardViewFromCompileInput(input netguard.CompileInput, nodeName string) nodeGuardView {
@@ -270,6 +290,29 @@ func netGuardViewFromCompileInput(input netguard.CompileInput, nodeName string) 
 		Groups:   groups,
 		Zones:    zones,
 	}
+}
+
+// netGuardPreview renders the ruleset this intent compiles to and lints it,
+// without creating an approval or touching any node. It is the read-side twin
+// of the first half of handleNetGuardPlan, and the two must stay identical: a
+// preview that lints differently from the plan is worse than no preview.
+func (s *Server) netGuardPreview(input netguard.CompileInput, reality *model.GuardNodeReality) (string, []netguard.Finding, error) {
+	compiled, err := netguard.Compile(input)
+	if err != nil {
+		return "", nil, err
+	}
+	ruleset, err := network.GenerateNFTPlan(compiled)
+	if err != nil {
+		return "", nil, err
+	}
+	findings := netguard.Lint(compiled, netguard.LintOptions{
+		PublicURLConfigured: s.publicURL != "",
+		Reality:             reality,
+	})
+	if findings == nil {
+		findings = make([]netguard.Finding, 0)
+	}
+	return ruleset, findings, nil
 }
 
 func netGuardDriftState(binding model.NodeGuardBinding, reality *model.GuardNodeReality) string {
@@ -756,7 +799,13 @@ func (s *Server) handleNetGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	findings := netguard.Lint(compiled, netguard.LintOptions{PublicURLConfigured: s.publicURL != ""})
+	// The lockout lint is the only thing standing between a default-drop plan
+	// and a permanently unreachable node, so it gets the node's reported reality
+	// rather than the tcp/22 assumption whenever one exists.
+	findings := netguard.Lint(compiled, netguard.LintOptions{
+		PublicURLConfigured: s.publicURL != "",
+		Reality:             s.guardRealityForLint(req.NodeID),
+	})
 	if netguard.Blocking(findings) && !req.AcceptLockoutRisk {
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error":    "plan blocked by lint findings",

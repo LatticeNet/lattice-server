@@ -45,6 +45,7 @@ type NodeCascadeReport struct {
 	Approvals                   int `json:"approvals"` // NO existing primitive
 	Tunnels                     int `json:"tunnels"`
 	GuardRealitySnapshots       int `json:"guard_reality_snapshots"`
+	GuardBindings               int `json:"guard_bindings"`
 	ManagedLines                int `json:"managed_lines"`
 	LineChainAttemptsReleased   int `json:"line_chain_attempts_released"`
 	LineChainDefinitionsDeleted int `json:"line_chain_definitions_deleted"`
@@ -539,6 +540,20 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		report.GuardRealitySnapshots++
 		if mutate {
 			delete(s.state.GuardRealitySnapshots, nodeID)
+		}
+	}
+
+	// Step 17b: the node's own NetGuard binding (node-owned).
+	//
+	// Every other node-keyed map is purged above; this one was missed, and the
+	// consequence is worse than a stale row. A binding says "this node is under
+	// NetGuard authority with these groups, zones and overrides". Left behind,
+	// it outlives the node, and a later enrolment that reuses the same node id
+	// silently inherits a firewall posture nobody chose for it.
+	if _, ok := s.state.GuardBindings[nodeID]; ok {
+		report.GuardBindings++
+		if mutate {
+			delete(s.state.GuardBindings, nodeID)
 		}
 	}
 

@@ -537,3 +537,49 @@ func TestDeleteNodeLineChainCascadePersistenceBoundaries(t *testing.T) {
 		}
 	})
 }
+
+// Deleting a node must take its own NetGuard binding with it.
+//
+// Every other node-keyed map was purged by the cascade and this one was not.
+// A stale row would be untidy; this is worse. A binding declares that the node
+// is under NetGuard authority with a set of groups, zones and overrides, so
+// left behind it outlives the node, and a later enrolment reusing the same node
+// id silently inherits a firewall posture nobody chose for it.
+func TestDeleteNodeRemovesItsOwnGuardBinding(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNode(model.Node{ID: "n1", Name: "doomed"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "n1", Managed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.NodeGuardBinding("n1"); !ok {
+		t.Fatal("the fixture did not store a guard binding")
+	}
+
+	// The plan must account for it before the delete does anything.
+	plan, ok := s.PlanDeleteNode("n1")
+	if !ok {
+		t.Fatal("plan reported the node as absent")
+	}
+	if plan.GuardBindings != 1 {
+		t.Fatalf("the delete preview must tell the operator the binding goes, got %d", plan.GuardBindings)
+	}
+	if _, ok := s.NodeGuardBinding("n1"); !ok {
+		t.Fatal("planning is a dry run and must not have removed the binding")
+	}
+
+	report, ok, err := s.DeleteNode("n1")
+	if err != nil || !ok {
+		t.Fatalf("delete failed: ok=%v err=%v", ok, err)
+	}
+	if report.GuardBindings != 1 {
+		t.Fatalf("the delete must report removing the binding, got %d", report.GuardBindings)
+	}
+	if _, ok := s.NodeGuardBinding("n1"); ok {
+		t.Fatal("the node's guard binding outlived the node")
+	}
+}

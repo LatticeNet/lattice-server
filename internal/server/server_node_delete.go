@@ -41,6 +41,7 @@ type nodeDeleteSummary struct {
 	Approvals                   int    `json:"approvals"`
 	Tunnels                     int    `json:"tunnels"`
 	GuardRealitySnapshots       int    `json:"guard_reality_snapshots"`
+	GuardBindings               int    `json:"guard_bindings"`
 	ManagedLines                int    `json:"managed_lines"`
 	LineChainAttemptsReleased   int    `json:"line_chain_attempts_released"`
 	LineChainDefinitionsDeleted int    `json:"line_chain_definitions_deleted"`
@@ -64,7 +65,8 @@ func newNodeDeleteSummary(nodeID, name string, mutated bool, r store.NodeCascade
 		ProxyUsageSnapshots: r.ProxyUsageSnapshots, MonitorsStripped: r.MonitorsStripped,
 		MonitorResults: r.MonitorResults, LogSources: r.LogSources, Groups: r.Groups,
 		Approvals: r.Approvals, Tunnels: r.Tunnels, GuardRealitySnapshots: r.GuardRealitySnapshots,
-		ManagedLines: r.ManagedLines, LineChainAttemptsReleased: r.LineChainAttemptsReleased,
+		GuardBindings: r.GuardBindings,
+		ManagedLines:  r.ManagedLines, LineChainAttemptsReleased: r.LineChainAttemptsReleased,
 		LineChainDefinitionsDeleted: r.LineChainDefinitionsDeleted, LineChainTargetsDrifted: r.LineChainTargetsDrifted,
 		LineChainLeaseConflicts: r.LineChainLeaseConflicts,
 	}
@@ -227,6 +229,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 			"approvals":               strconv.Itoa(summary.Approvals),
 			"tunnels":                 strconv.Itoa(summary.Tunnels),
 			"guard_reality_snapshots": strconv.Itoa(summary.GuardRealitySnapshots),
+			"guard_bindings":          strconv.Itoa(summary.GuardBindings),
 			"terminal_sessions":       strconv.Itoa(summary.TerminalSessions),
 			"proxy_drift_cleared":     strconv.Itoa(summary.ProxyDriftCleared),
 			"log_purge_errors":        strconv.Itoa(summary.LogStorePurgeErrs),

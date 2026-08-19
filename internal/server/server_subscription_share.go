@@ -194,6 +194,19 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Reachability is the publishing plane's answer, not this handler's. The
+	// record says the URL is published, enabled and unexpired; the token check
+	// below says the caller may read it. Both must hold, and both failures are
+	// the same nothing on the wire.
+	//
+	// The record for a share is projected rather than stored. Nothing is
+	// migrated, so the URL that is already in a client's configuration cannot be
+	// broken by a migration that did not run. Stored route overrides are what
+	// let a share move off /sub/, and that is S3's job.
+	if _, ok := s.publishingRecordForRequest(originPlugin, requestHost(r.Host), r.URL.Path); !ok {
+		deny("subscription not found", map[string]string{"slug": slug, "token_sha256": tokenHash})
+		return
+	}
 	share, ok := s.resolveShare(slug, token, s.now())
 	if !ok {
 		deny("subscription not found", map[string]string{"slug": slug, "token_sha256": tokenHash})

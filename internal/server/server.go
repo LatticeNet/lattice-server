@@ -989,6 +989,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/storage/bindings/delete", s.withAuth("", s.handleDeleteStorageBinding))
 	mux.HandleFunc("/api/storage/tokens", s.withAuth("", s.handleStorageTokens))
 	mux.HandleFunc("/api/storage/tokens/revoke", s.withAuth("", s.handleRevokeStorageToken))
+	mux.HandleFunc("/api/publishing/records", s.withAuth("", s.handlePublishingRecords))
 	mux.HandleFunc("/api/workers", s.withAuth("worker:deploy", s.handleWorkers))
 	mux.HandleFunc("/api/workers/run", s.withAuth("worker:deploy", s.handleWorkerRun))
 	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
@@ -1263,12 +1264,12 @@ func (s *Server) staticHandler() http.Handler {
 			return
 		}
 		host := requestHost(r.Host)
-		if binding, ok := s.storageBindingForRequest(model.StorageKindKV, host, r.URL.Path); ok {
-			s.serveKVBinding(w, r, binding)
+		if record, ok := s.publishingRecordForRequest(originKV, host, r.URL.Path); ok {
+			s.serveKVBinding(w, r, record)
 			return
 		}
-		if binding, ok := s.storageBindingForRequest(model.StorageKindStatic, host, r.URL.Path); ok {
-			s.serveStaticBinding(w, r, binding)
+		if record, ok := s.publishingRecordForRequest(originStatic, host, r.URL.Path); ok {
+			s.serveStaticBinding(w, r, record)
 			return
 		}
 		if s.webFS == nil {

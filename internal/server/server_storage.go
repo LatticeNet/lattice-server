@@ -256,8 +256,8 @@ func (s *Server) handleRevokeStorageToken(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, toStorageTokenView(token))
 }
 
-func (s *Server) serveKVBinding(w http.ResponseWriter, r *http.Request, binding model.StorageBinding) {
-	key, ok := bindingObjectPath(binding, r.URL.Path)
+func (s *Server) serveKVBinding(w http.ResponseWriter, r *http.Request, record publishingRecord) {
+	key, ok := record.objectPath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -267,21 +267,21 @@ func (s *Server) serveKVBinding(w http.ResponseWriter, r *http.Request, binding 
 	}
 	switch r.Method {
 	case http.MethodGet:
-		if !s.authorizeStorageToken(w, r, model.StorageKindKV, binding.Bucket, model.StorageAccessRead) {
+		if !s.authorizeStorageToken(w, r, model.StorageKindKV, record.Bucket, model.StorageAccessRead) {
 			return
 		}
 		if key == "" {
-			writeJSON(w, http.StatusOK, map[string]any{"entries": s.store.KV(binding.Bucket)})
+			writeJSON(w, http.StatusOK, map[string]any{"entries": s.store.KV(record.Bucket)})
 			return
 		}
-		entry, found := s.store.KVEntry(binding.Bucket, key)
+		entry, found := s.store.KVEntry(record.Bucket, key)
 		if !found {
 			writeError(w, http.StatusNotFound, errors.New("kv key not found"))
 			return
 		}
 		writeJSON(w, http.StatusOK, entry)
 	case http.MethodPost, http.MethodPut:
-		if !s.authorizeStorageToken(w, r, model.StorageKindKV, binding.Bucket, model.StorageAccessWrite) {
+		if !s.authorizeStorageToken(w, r, model.StorageKindKV, record.Bucket, model.StorageAccessWrite) {
 			return
 		}
 		if key == "" {
@@ -297,7 +297,7 @@ func (s *Server) serveKVBinding(w http.ResponseWriter, r *http.Request, binding 
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		entry := model.KVEntry{Bucket: binding.Bucket, Key: key, Value: value}
+		entry := model.KVEntry{Bucket: record.Bucket, Key: key, Value: value}
 		if err := s.store.PutKV(entry); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -308,26 +308,26 @@ func (s *Server) serveKVBinding(w http.ResponseWriter, r *http.Request, binding 
 	}
 }
 
-func (s *Server) serveStaticBinding(w http.ResponseWriter, r *http.Request, binding model.StorageBinding) {
+func (s *Server) serveStaticBinding(w http.ResponseWriter, r *http.Request, record publishingRecord) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	objectPath, ok := bindingObjectPath(binding, r.URL.Path)
+	objectPath, ok := record.objectPath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	bucket, _ := s.store.StorageBucket(model.StorageKindStatic, binding.Bucket)
+	bucket, _ := s.store.StorageBucket(model.StorageKindStatic, record.Bucket)
 	index := firstNonEmpty(bucket.IndexDocument, "index.html")
 	notFound := bucket.NotFoundDocument
 	if objectPath == "" || strings.HasSuffix(r.URL.Path, "/") {
 		objectPath = index
 	}
-	obj, found := s.store.StaticObject(binding.Bucket, objectPath)
+	obj, found := s.store.StaticObject(record.Bucket, objectPath)
 	status := http.StatusOK
 	if !found && notFound != "" {
-		obj, found = s.store.StaticObject(binding.Bucket, notFound)
+		obj, found = s.store.StaticObject(record.Bucket, notFound)
 		status = http.StatusNotFound
 	}
 	if !found {
@@ -381,11 +381,11 @@ func normalizeStorageKind(kind string) (string, error) {
 }
 
 func storageReadScope(kind string) string {
-	return kind + ":read"
+	return publishingReadScope(kind)
 }
 
 func storageAdminScope(kind string) string {
-	return kind + ":admin"
+	return publishingAdminScope(kind)
 }
 
 func normalizeStorageBucket(kind, name, displayName, description, indexDocument, notFoundDocument string) (model.StorageBucket, error) {
@@ -594,25 +594,6 @@ func storageTokenAllows(token model.StorageAccessToken, bucket, required string)
 		return true
 	}
 	return token.Access == required
-}
-
-func (s *Server) storageBindingForRequest(kind, hostname, urlPath string) (model.StorageBinding, bool) {
-	var best model.StorageBinding
-	bestPrefixLen := -1
-	for _, binding := range s.store.StorageBindings(kind) {
-		if !binding.Enabled || !strings.EqualFold(binding.Hostname, hostname) {
-			continue
-		}
-		if _, ok := bindingObjectPath(binding, urlPath); !ok {
-			continue
-		}
-		prefixLen := len(strings.Trim(binding.PathPrefix, "/"))
-		if prefixLen > bestPrefixLen || (prefixLen == bestPrefixLen && binding.ID < best.ID) {
-			best = binding
-			bestPrefixLen = prefixLen
-		}
-	}
-	return best, bestPrefixLen >= 0
 }
 
 func sameStorageBindingRoute(a, b model.StorageBinding) bool {

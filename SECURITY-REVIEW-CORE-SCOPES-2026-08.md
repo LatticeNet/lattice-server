@@ -70,21 +70,21 @@ core-backed declaration is therefore a statement about one of the two paths.
 
 ## Findings
 
-### HIGH — `latticenet.vpn-core/nodes` hands subscriber credentials to a read-scoped principal
+### HIGH, FIXED ON THIS BRANCH — `latticenet.vpn-core/nodes` handed subscriber credentials to a read-scoped principal
 
-`export` is declared `vpncore:read`. `vpnCoreExportNodes`
-(`server_vpncore.go:322`) takes no principal, its caller discards the context
-(`server_vpncore.go:283`), and with no `user_id` it walks `s.store.ProxyUsers()`
-and renders `VLESSRealityLinks` for every one of them. A link is
+`export` and `list` are declared `vpncore:read`. On `75b9411`,
+`vpnCoreExportNodes` took no principal, its caller discarded the context, and
+with no `user_id` it walked `s.store.ProxyUsers()` and rendered
+`VLESSRealityLinks` for every one of them. A link is
 `"vless://" + UUID + "@" + host` (`internal/proxycore/links.go:245`), and for
-VLESS that UUID is the entire credential. `list` has the same shape for the
-other branch: it returns the `share_url` each agent reported, which carries the
-adopted machine's own credential.
+VLESS that UUID is the entire credential. `list` had the same shape for the
+other branch: it returned the `share_url` each agent reported, which carries the
+adopted machine's own credential, and that machine is somebody else's box.
 
-Failure scenario: a principal holding `vpncore:read`, or the legacy `proxy:read`
-that `rbac.compatibleScopes` maps onto it, posts
+Failure scenario, as it stood: a principal holding `vpncore:read`, or the legacy
+`proxy:read` that `rbac.compatibleScopes` maps onto it, posts
 `{"id":"latticenet.vpn-core","service":"latticenet.vpn-core/nodes","method":"export"}`
-to the plugin call gateway and receives one working credential per subscriber,
+to the plugin call gateway and received one working credential per subscriber,
 plus one per adopted on-box node.
 
 What makes this a finding rather than a design choice is that the same manifest
@@ -93,16 +93,46 @@ answers the same question the other way at the same scope. `users/list` and
 deliberately reduces every credential to `HasSecret bool`. Two methods at one
 scope cannot both be right about whether credentials cross it.
 
-Four failing tests in `internal/server/audit_core_scope_test.go`, driving the
-real gateway with a real principal:
+Four tests in `internal/server/audit_core_scope_test.go` failed on `75b9411`
+and pass on this branch, driving the real gateway with a real principal:
+`TestNodesExportWithholdsCredentialsFromAReadScopedPrincipal`,
+`TestNodesExportWithholdsCredentialsFromLegacyProxyRead`,
+`TestNodesListWithholdsDiscoveredShareCredentials` and
+`TestNodesExportWithholdsDiscoveredShareCredentials`.
+`TestUsersListWithholdsCredentialsFromTheSameScope` was the control and passed
+throughout, so the failures were the export path and not the harness.
 
-- `TestNodesExportWithholdsCredentialsFromAReadScopedPrincipal`
-- `TestNodesExportWithholdsCredentialsFromLegacyProxyRead`
-- `TestNodesListWithholdsDiscoveredShareCredentials`
-- `TestNodesExportWithholdsDiscoveredShareCredentials`
+**The fix.** The scope stays where it is; what changes is what crosses it.
+`vpnCoreNodesRPC` no longer discards the context, and
+`vpnCoreNodeCredentialsAllowed` decides in core whether this caller may receive
+the material that authenticates rather than only the endpoint that identifies.
+An operator principal must hold `vpncore:admin`; a caller with none is the
+subscription-serving path reached through a plugin's signed `host_access` grant,
+and it is left as it was on purpose, because narrowing it would stop every
+vpn-core-sourced subscription from serving. Both credential sources are covered:
+the rendered `VLESSRealityLinks` and the agent-reported `share_url` from adopted
+machines.
 
-`TestUsersListWithholdsCredentialsFromTheSameScope` is the control and passes,
-so the failures are the export path and not the harness.
+Reduction is `redactLinkCredential`, which strips the userinfo from the URL,
+which is where every scheme this fleet serves carries its secret. The endpoint,
+port, SNI and transport survive, so a read-scoped operator can still recognise
+an entry. The marker is a fixed string rather than a hash or a prefix, because a
+stable derivative of a secret still distinguishes one user from another across
+replies. A link that does not parse is dropped rather than passed through.
+
+Five further tests pin the result: the read tier still shows the endpoint
+(`TestReadScopedExportStillIdentifiesTheEndpoint`), an admin still gets the full
+link (`TestAdminScopedExportStillReturnsTheFullLink`), the subscription-serving
+path still gets it so shares keep working
+(`TestPluginPathStillReceivesFullLinksSoSubscriptionsServe`), redaction is not a
+distinguisher (`TestRedactionIsNotADistinguisher`), and malformed links fail
+closed (`TestUnparseableLinksAreDroppedNotPassedThrough`).
+
+Chosen over raising the scope because `export` and `list` have legitimate read
+uses, and over a new admin-only method because that would have required a
+matching `host_access` and code change in sub-store, turning a one-repo server
+fix into a cross-repo release. No shipped UI calls either method, so the reduced
+read view has no operator-facing consumer to break.
 
 ### MEDIUM — the plugin path reaches admin mutations with no principal, and can choose the credential
 
@@ -226,7 +256,9 @@ than fixing.
 
 ## What is on this branch
 
-`internal/server/audit_core_scope_test.go`, seven tests. Five fail and are the
-findings; two pass and are the controls that prove the harness and the contrast.
-No production code is changed. Running the package shows those five as the only
-failures.
+The HIGH fix in `internal/server/server_vpncore.go`, and
+`internal/server/audit_core_scope_test.go` with twelve tests. Eleven pass. The
+one that fails is `TestGrantedPluginPathReachesAdminMutationsWithNoPrincipal`,
+the MEDIUM, left failing deliberately so it cannot be forgotten: it is a
+scheduled architectural decision rather than something to fix quietly inside a
+release. `go test ./internal/...` is otherwise green.

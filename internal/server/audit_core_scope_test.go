@@ -301,3 +301,100 @@ func TestNodesExportWithholdsDiscoveredShareCredentials(t *testing.T) {
 		t.Fatalf("a vpncore:read principal received an on-box node credential from nodes/export: %s", rec.Body.String())
 	}
 }
+
+// ── after the fix ────────────────────────────────────────────────────────────
+
+// The reduction must not cost the read tier its actual job. An operator with
+// vpncore:read still has to be able to see that a node exists and where it is;
+// what they must not get is the material that authenticates as its owner.
+func TestReadScopedExportStillIdentifiesTheEndpoint(t *testing.T) {
+	srv, handler, st := newCoreScopeAuditServer(t)
+	seedRenderableProxyUser(t, handler, st)
+	seedDiscoveredInventory(t, srv, st)
+	activateCorePlugin(t, st, vpnCorePluginID)
+	srv.plugins = []plugin.Loaded{{Manifest: vpnCoreNodesManifest()}}
+
+	rec := callAsPrincipal(t, srv, []string{"vpncore:read"}, vpnCoreNodesService, "export")
+	body := rec.Body.String()
+	for _, want := range []string{"node-a.dns.example.com:443", "disc.example:17891"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("the reduced export lost the endpoint %q, which is what it exists to show: %s", want, body)
+		}
+	}
+	if !strings.Contains(body, vpnCoreRedactedCredential) {
+		t.Fatalf("the reduced export did not mark the credential as removed: %s", body)
+	}
+}
+
+// An admin still gets the real thing, so the fix is a split by scope and not a
+// removal of the capability.
+func TestAdminScopedExportStillReturnsTheFullLink(t *testing.T) {
+	srv, handler, st := newCoreScopeAuditServer(t)
+	seedRenderableProxyUser(t, handler, st)
+	seedDiscoveredInventory(t, srv, st)
+	activateCorePlugin(t, st, vpnCorePluginID)
+	srv.plugins = []plugin.Loaded{{Manifest: vpnCoreNodesManifest()}}
+
+	rec := callAsPrincipal(t, srv, []string{"vpncore:read", "vpncore:admin"}, vpnCoreNodesService, "export")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export as vpncore:admin: want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{aliceUUID, discoveredNodeUUID} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("an admin lost access to the credential-bearing link (%s): %s", want, rec.Body.String())
+		}
+	}
+}
+
+// The path that must not break. A vpn-core-sourced subscription is rendered by
+// sub-store through its signed host_access grant, on a chain that carries no
+// operator at all: a public share fetch, a background refresh, or the auto-sync.
+// If this reduces, every such subscription serves nodes a client cannot connect
+// with, which is worse than the leak it would be preventing.
+func TestPluginPathStillReceivesFullLinksSoSubscriptionsServe(t *testing.T) {
+	srv, handler, st := newCoreScopeAuditServer(t)
+	seedRenderableProxyUser(t, handler, st)
+	seedDiscoveredInventory(t, srv, st)
+	activateCorePlugin(t, st, vpnCorePluginID)
+	srv.pluginRPC.AllowMethods(subStorePluginID, vpnCoreNodesService, []string{"export"})
+
+	raw, err := srv.pluginRPC.Call(t.Context(), subStorePluginID, vpnCoreNodesService, "export", nil)
+	if err != nil {
+		t.Fatalf("export on the plugin path: %v", err)
+	}
+	for _, want := range []string{aliceUUID, discoveredNodeUUID} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("the subscription-serving path lost a credential it needs (%s): %s", want, raw)
+		}
+	}
+}
+
+// Redaction replaces the secret with a fixed marker rather than a hash or a
+// prefix. A stable derivative of a credential still distinguishes one user from
+// another across replies, and this is the reply a read-scoped caller receives.
+func TestRedactionIsNotADistinguisher(t *testing.T) {
+	first, ok := redactLinkCredential("vless://" + aliceUUID + "@h.example:443?sni=a#one")
+	if !ok {
+		t.Fatal("a well-formed link was dropped")
+	}
+	second, ok := redactLinkCredential("vless://" + discoveredNodeUUID + "@h.example:443?sni=a#one")
+	if !ok {
+		t.Fatal("a well-formed link was dropped")
+	}
+	if first != second {
+		t.Fatalf("two users' links stayed distinguishable after redaction: %q vs %q", first, second)
+	}
+	if strings.Contains(first, aliceUUID) || strings.Contains(second, discoveredNodeUUID) {
+		t.Fatalf("redaction left the credential in place: %q %q", first, second)
+	}
+}
+
+// A link that cannot be parsed is dropped, not passed through. Failing open here
+// would mean the one malformed entry in an inventory is the one that leaks.
+func TestUnparseableLinksAreDroppedNotPassedThrough(t *testing.T) {
+	for _, bad := range []string{"", "   ", "not-a-url", "://missing-scheme", "vless://"} {
+		if out, ok := redactLinkCredential(bad); ok {
+			t.Fatalf("redaction passed through an unparseable link %q as %q", bad, out)
+		}
+	}
+}

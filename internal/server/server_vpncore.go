@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -280,20 +281,78 @@ func (s *Server) vpnCoreLinesReattach(p principal, request []byte) ([]byte, erro
 // With user_id it returns that subscriber's per-node links; without it, every
 // subscriber's. Only APPLIED profiles and renderable inbounds contribute (others
 // surface as warnings), exactly like the public /sub/{token} path.
-func (s *Server) vpnCoreNodesRPC(_ context.Context, method string, request []byte) ([]byte, error) {
+func (s *Server) vpnCoreNodesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
+	// The context is load-bearing here and used to be discarded. Both methods
+	// return connection material, and whether the caller may see the part of it
+	// that AUTHENTICATES is decided from the principal it carries.
+	credentials := s.vpnCoreNodeCredentialsAllowed(ctx)
 	switch method {
 	case "export":
-		return s.vpnCoreExportNodes(request)
+		return s.vpnCoreExportNodes(request, credentials)
 	case "list":
-		return s.vpnCoreListNodes()
+		return s.vpnCoreListNodes(credentials)
 	default:
 		return nil, fmt.Errorf("vpn-core/nodes: unknown method %q", method)
 	}
 }
 
+// vpnCoreNodeCredentialsAllowed reports whether this caller may receive the
+// material that authenticates as a subscriber, rather than only the endpoint
+// that identifies one.
+//
+// This re-check exists for the reason subStoreSharesRPC states about share
+// tokens: the gateway already enforced the manifest scopes, but these methods
+// hand out material a mistake in a manifest must never be able to widen. The
+// vpn-core manifest declares export and list at vpncore:read, and it declares
+// users/list at the same scope while toVpnUserView reduces every credential to
+// HasSecret. Two methods at one scope cannot both be right about whether
+// credentials cross it, so this decides it in core where no manifest can move
+// it.
+//
+// A caller with no operator principal is the subscription-serving path: a
+// public share render, a background refresh, or the auto-sync, reached through
+// a plugin holding a signed host_access grant for exactly this service. Those
+// exist to produce these links and are authorized at the bus by plugin
+// identity. That authorization is weaker than a scope check and it is the
+// subject of a separate, tracked finding; it is deliberately NOT widened here,
+// because narrowing it would stop every vpn-core-sourced subscription from
+// serving.
+func (s *Server) vpnCoreNodeCredentialsAllowed(ctx context.Context) bool {
+	p, err := pluginOperatorPrincipal(ctx)
+	if err != nil {
+		return true
+	}
+	allowed, _ := pluginGatewayScopeAllowed(p, "vpncore:admin")
+	return allowed
+}
+
+// redactLinkCredential strips the userinfo from a connection URL, which is
+// where every scheme this fleet serves carries its secret: the UUID for VLESS
+// and TUIC, the password for the rest. What survives is the endpoint an
+// operator needs to recognise the entry, and nothing that authenticates as its
+// owner.
+//
+// A link that does not parse is dropped rather than passed through, because the
+// one thing worse than an unhelpful export is one that leaks by failing open.
+func redactLinkCredential(link string) (string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(link))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", false
+	}
+	if parsed.User != nil {
+		parsed.User = url.User(vpnCoreRedactedCredential)
+	}
+	return parsed.String(), true
+}
+
+// vpnCoreRedactedCredential is a fixed marker, not a hash or a prefix of the
+// real value: a stable derivative of a secret is still a distinguisher across
+// users, and this reply is the one a read-scoped caller receives.
+const vpnCoreRedactedCredential = "redacted"
+
 // vpnCoreListNodes returns the discovered on-box nodes flattened across all live
 // machines — the data source for the plugin-contributed "vpn-core Nodes" table.
-func (s *Server) vpnCoreListNodes() ([]byte, error) {
+func (s *Server) vpnCoreListNodes(credentials bool) ([]byte, error) {
 	type row struct {
 		NodeID   string `json:"node_id"`
 		Name     string `json:"name"`
@@ -309,9 +368,20 @@ func (s *Server) vpnCoreListNodes() ([]byte, error) {
 	}{Rows: []row{}}
 	for _, inv := range s.liveSingBoxInventories(s.now()) {
 		for _, n := range inv.Nodes {
+			// share_url is an adopted machine's own credential, and that machine
+			// is somebody else's box. It is the only field on this row that
+			// authenticates rather than identifies.
+			shareURL := n.ShareURL
+			if !credentials && shareURL != "" {
+				redacted, ok := redactLinkCredential(shareURL)
+				if !ok {
+					continue
+				}
+				shareURL = redacted
+			}
 			out.Rows = append(out.Rows, row{
 				NodeID: inv.NodeID, Name: n.Name, Protocol: n.Protocol, Network: n.Network,
-				Port: n.Port, Address: n.Address, ShareURL: n.ShareURL,
+				Port: n.Port, Address: n.Address, ShareURL: shareURL,
 			})
 		}
 	}
@@ -319,7 +389,7 @@ func (s *Server) vpnCoreListNodes() ([]byte, error) {
 	return json.Marshal(out)
 }
 
-func (s *Server) vpnCoreExportNodes(request []byte) ([]byte, error) {
+func (s *Server) vpnCoreExportNodes(request []byte, credentials bool) ([]byte, error) {
 	// IncludeDiscovered defaults to true (via a *bool so an omitted field still
 	// means "include"): an adoption-bridge consumer wants the on-box (233boy)
 	// nodes by default, not only Lattice-rendered ones.
@@ -343,7 +413,17 @@ func (s *Server) vpnCoreExportNodes(request []byte) ([]byte, error) {
 	}{Links: []string{}}
 	seen := map[string]bool{}
 	appendLink := func(link string) {
-		if link == "" || seen[link] {
+		if link == "" {
+			return
+		}
+		if !credentials {
+			redacted, ok := redactLinkCredential(link)
+			if !ok {
+				return
+			}
+			link = redacted
+		}
+		if seen[link] {
 			return
 		}
 		seen[link] = true

@@ -203,10 +203,23 @@ func transcribeAudit(events []model.AuditEvent) string {
 // It drives the real mux, so route registration and the subscription rate limit
 // are inside the boundary rather than bypassed, and it records the complete
 // response plus the audit trail for every request shape a client or a prober can
-// send. The golden file was recorded before the publishing plane existed. If
-// folding /sub/ onto that plane is genuinely a refactor, this file does not move
-// by one byte; if it moves, the already-issued subscription URL in someone's
-// proxy client is what moved.
+// send.
+//
+// The golden was first recorded before the publishing plane existed, and folding
+// /sub/ onto that plane moved it by zero bytes, which is what made that change a
+// refactor rather than a claim.
+//
+// It has been regenerated once since, deliberately. The response Content-Type is
+// now derived by subscriptionResponseContentType from the format and target the
+// core negotiated, rather than echoed from whatever the plugin returned, which
+// closed a hole where a source could serve markup on the control plane's own
+// origin. Five cases moved, every one of them a ?target= request, and all toward
+// a more accurate type: Stash and Clash to text/yaml, sing-box to
+// application/json. The issued subscription URL carries no query parameters and
+// did not move.
+//
+// Treat any future movement the same way: prove it was intended and name the
+// cases that changed, or the URL in someone's proxy client is what moved.
 func TestSubscriptionShareWireTranscriptIsGolden(t *testing.T) {
 	s, st := goldenSubServer(t)
 	handler := s.Handler()

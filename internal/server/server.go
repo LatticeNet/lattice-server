@@ -156,8 +156,12 @@ type Server struct {
 	requireTOTP   bool
 	logger        *log.Logger
 	loginLimiter  *ratelimit.Limiter
-	totpLimiter   *ratelimit.Limiter
-	agentLimiter  *ratelimit.Limiter
+	// storageAuthLimiter bounds anonymous storage-token attempts. It is separate
+	// from apiLimiter because the work it protects is key derivation, not a
+	// handler, and it is sized like loginLimiter for the same reason.
+	storageAuthLimiter *ratelimit.Limiter
+	totpLimiter        *ratelimit.Limiter
+	agentLimiter       *ratelimit.Limiter
 	// authFailAuditThrottle bounds audit emission for repeating authentication
 	// failures (failed logins and agent auth). A shared global token bucket
 	// caps the absolute emission rate so source-address rotation cannot turn
@@ -432,6 +436,9 @@ func New(opts Options) (*Server, error) {
 		// Login is intentionally strict: 5/min sustained, small burst, to slow
 		// password guessing without locking out legitimate retries.
 		loginLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
+		// Only failed and credential-less attempts are charged here, so a client
+		// holding a working token is never throttled by it.
+		storageAuthLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
 		// Second-factor guesses are throttled PER USER (keyed on user id, not IP)
 		// so the guess budget cannot be widened by rotating source addresses.
 		totpLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 3600.0, Burst: 5}),

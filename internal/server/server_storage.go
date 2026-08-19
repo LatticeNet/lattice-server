@@ -117,6 +117,13 @@ func (s *Server) handleStorageBindings(w http.ResponseWriter, r *http.Request, p
 			writeError(w, http.StatusBadRequest, fmt.Errorf("%s bucket %q does not exist", kind, binding.Bucket))
 			return
 		}
+		// The console's own hostname is not available for publishing. A binding
+		// there is dispatched before the console fallback, so it does not add a
+		// route, it takes the operator's front door.
+		if s.ownsPublicHost(binding.Hostname) {
+			writeError(w, http.StatusConflict, errors.New("that hostname serves this server's own console and cannot be published to"))
+			return
+		}
 		for _, existing := range s.store.StorageBindings(kind) {
 			if existing.ID != binding.ID && sameStorageBindingRoute(existing, binding) {
 				writeError(w, http.StatusConflict, errors.New("storage binding route already exists"))
@@ -561,14 +568,33 @@ func toStorageTokenView(token model.StorageAccessToken) storageTokenView {
 
 func (s *Server) authorizeStorageToken(w http.ResponseWriter, r *http.Request, kind, bucket, required string) bool {
 	presented := bearerToken(r)
+	// DummyVerify below is a full PBKDF2 at production cost, spent so that a
+	// wrong token takes as long as a right one. That is worth paying, but this
+	// route reaches it without a session, so the budget has to be bounded or an
+	// anonymous caller can buy server CPU one cheap request at a time. Only the
+	// paths that are about to spend it are charged, so a caller presenting a
+	// working token never meets this limiter.
+	spend := func() bool {
+		if s.storageAuthLimiter.Allow(s.clientIP(r)) {
+			return true
+		}
+		writeError(w, http.StatusTooManyRequests, errors.New("too many storage token attempts"))
+		return false
+	}
 	tokenID, secret, ok := auth.SplitToken(presented)
 	if !ok {
+		if !spend() {
+			return false
+		}
 		auth.DummyVerify(presented)
 		writeError(w, http.StatusUnauthorized, errors.New("missing or invalid storage token"))
 		return false
 	}
 	token, found := s.store.StorageAccessToken(tokenID)
 	if !found || !token.RevokedAt.IsZero() {
+		if !spend() {
+			return false
+		}
 		auth.DummyVerify(secret)
 		writeError(w, http.StatusUnauthorized, errors.New("missing or invalid storage token"))
 		return false

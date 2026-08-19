@@ -67,7 +67,7 @@ case target stash
   status: 200
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
-  header Content-Type: "text/plain; charset=utf-8"
+  header Content-Type: "text/yaml; charset=utf-8"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -80,7 +80,7 @@ case target singbox
   status: 200
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
-  header Content-Type: "text/plain; charset=utf-8"
+  header Content-Type: "application/json; charset=utf-8"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -93,7 +93,7 @@ case platform alias
   status: 200
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
-  header Content-Type: "text/plain; charset=utf-8"
+  header Content-Type: "text/yaml; charset=utf-8"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -106,7 +106,7 @@ case include unsupported
   status: 200
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
-  header Content-Type: "text/plain; charset=utf-8"
+  header Content-Type: "text/yaml; charset=utf-8"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -119,7 +119,7 @@ case pretty yaml
   status: 200
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
-  header Content-Type: "text/plain; charset=utf-8"
+  header Content-Type: "text/yaml; charset=utf-8"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"

@@ -210,3 +210,33 @@ func TestAnUpdateThatOmitsTheAllowlistLeavesConfinementAlone(t *testing.T) {
 		t.Fatalf("an explicit empty list did not widen: %v", after.ServerAllowlist)
 	}
 }
+
+// The console reads its own confinement from /api/me and uses it to decide what
+// a principal may grant. That worked for a token and silently reported "every
+// node" for a confined human, because the session principal had no allowlist to
+// report.
+func TestMeReportsAConfinedOperatorsOwnAllowlist(t *testing.T) {
+	h, st := newTestServer(t)
+	seedNodes(t, st, "node-a", "node-b")
+	adminCookies, csrf := loginSession(t, h)
+
+	rec := authedPost(t, h, adminCookies, csrf, "/api/users",
+		`{"username":"scoped","password":"`+testAdminPass+`","scopes":["node:read"],"server_allowlist":["node-a"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+
+	rec = authedGet(t, h, loginAs(t, h, "scoped", testAdminPass), "/api/me")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("me: %d %s", rec.Code, rec.Body.String())
+	}
+	var me struct {
+		ServerAllowlist []string `json:"server_allowlist"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &me); err != nil {
+		t.Fatal(err)
+	}
+	if len(me.ServerAllowlist) != 1 || me.ServerAllowlist[0] != "node-a" {
+		t.Fatalf("me reported allowlist %v, want [node-a]", me.ServerAllowlist)
+	}
+}

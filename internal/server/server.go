@@ -952,6 +952,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/agent-updates/releases", s.withAuth("node:read", s.handleAgentUpdateReleaseInfo))
 	mux.HandleFunc("/api/nodes/agent-updates/delete", s.withAuth("node:admin", s.handleDeleteAgentUpdatePolicy))
 	mux.HandleFunc("/api/nodes/agent-updates/plan", s.withAuth("", s.handleAgentUpdatePlan))
+	mux.HandleFunc("/api/nodes/agent-updates/artifacts", s.withAuth("", s.handleAgentArtifacts))
+	mux.HandleFunc("/api/nodes/agent-updates/artifacts/import", s.withAuth("node:admin", s.handleAgentArtifactImport))
+	mux.HandleFunc("/api/nodes/agent-updates/artifacts/delete", s.withAuth("node:admin", s.handleDeleteAgentArtifact))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
 	mux.HandleFunc("/api/nodes/reconfigure-command", s.withAuth("node:admin", s.handleNodeReconfigureCommand))
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
@@ -1110,6 +1113,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/logs", s.withAgentLimit(s.handleAgentLogs))
 	mux.HandleFunc("/api/agent/debug-events", s.withAgentLimit(s.handleAgentDebugEvents))
 	mux.HandleFunc("/api/agent/event", s.withAgentLimit(s.handleAgentEvent))
+	mux.HandleFunc(agentBinaryPathPrefix, s.withAgentLimit(s.handleAgentBinary))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -3721,6 +3725,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 	if bucket == "" {
 		bucket = "default"
 	}
+	if reservedAgentArtifactBucket(bucket) {
+		writeError(w, http.StatusForbidden, errReservedAgentArtifactBucket())
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if !s.requireScope(w, p, "static:read") {
@@ -3742,6 +3750,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 		}
 		if req.Bucket == "" {
 			req.Bucket = bucket
+		}
+		if reservedAgentArtifactBucket(req.Bucket) {
+			writeError(w, http.StatusForbidden, errReservedAgentArtifactBucket())
+			return
 		}
 		if err := validateStorageName(req.Bucket); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("bucket: %w", err))
@@ -5391,7 +5403,7 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 			"echo " + shellQuote("lattice proxycore: server-backed apply context required; re-approve through /api/network/approvals/approve") + " >&2\n" +
 			"exit 1\n"
 	case agentUpdatePlugin:
-		script, err := agentUpdateApplyScript(approval)
+		script, err := agentUpdateApplyScript(approval, serverURL)
 		if err != nil {
 			return "set -e\n" +
 				"echo " + shellQuote("lattice agentupdate: invalid approval payload: "+err.Error()) + " >&2\n" +
@@ -6148,7 +6160,7 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			}
 		case agentUpdatePlugin:
 			var err error
-			applyScript, err = agentUpdateApplyScript(approval)
+			applyScript, err = agentUpdateApplyScript(approval, s.publicURL)
 			if err != nil {
 				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 			}

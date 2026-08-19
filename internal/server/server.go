@@ -5117,10 +5117,20 @@ func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval
 func approvalApplyTaskTimeoutSec(plugin string) int {
 	switch plugin {
 	case agentUpdatePlugin:
-		// 900s: the download leg is github-release egress from the node's own
-		// network — a CN residential uplink can need minutes for ~7 MiB, and
-		// 300s produced "context deadline exceeded" on cd-hs-sh (2026-08-12).
-		return 900
+		// 600s, and it must stay at or under ten minutes. The download leg is
+		// github-release egress from the node's own network and a slow uplink
+		// needs minutes for ~12 MiB, so this wants to be generous. But the
+		// agent's task executor treats a timeout over ten minutes as
+		// out-of-range and falls back to its 30s DEFAULT rather than clamping
+		// to the maximum. The previous value here was 900, which is fifteen
+		// minutes, so every agent update ran with a 30 second deadline and
+		// every node slower than ~400 KiB/s failed with "context deadline
+		// exceeded". Raising 300 to 900 to rescue cd-hs-sh is what broke it.
+		//
+		// The agent-side clamp is fixed separately, but this has to hold the
+		// line regardless: a node cannot receive that fix until it completes
+		// an update, which is the thing the bug prevents.
+		return 600
 	case "nft", "nftpolicy", "selfdns":
 		return networkApplyTaskTimeoutSec
 	default:

@@ -1322,3 +1322,29 @@ func TestAgentUpdateApplyScriptLiftsFileSizeLimit(t *testing.T) {
 		t.Fatalf("apply script must lift RLIMIT_FSIZE before the binary download:\n%s", script[:400])
 	}
 }
+
+// The agent update timeout must stay within what the node will honour.
+//
+// The agent's task executor treats a timeout above ten minutes as out of range
+// and falls back to its 30 second DEFAULT rather than clamping to the maximum.
+// So a value chosen here to be generous silently becomes the least generous
+// one possible, and every node too slow to download the binary in 30 seconds
+// fails with "context deadline exceeded". That is not hypothetical: 900 was set
+// to rescue a slow node and is what broke it, along with every other slow node
+// in the fleet.
+func TestAgentUpdateTimeoutStaysWithinTheAgentsAcceptedRange(t *testing.T) {
+	const agentMaxAcceptedSec = 600 // ten minutes, the agent's upper bound
+
+	got := approvalApplyTaskTimeoutSec(agentUpdatePlugin)
+	if got > agentMaxAcceptedSec {
+		t.Fatalf("an agent update timeout above %ds is silently replaced by the agent's 30s default, "+
+			"so %ds gives slow nodes less time than asking for nothing: keep it at or under the bound",
+			agentMaxAcceptedSec, got)
+	}
+	// Generous enough to matter: a 12 MiB binary at a slow-but-real 227 KiB/s
+	// needs about a minute, and the leg before it is a TLS handshake over a
+	// lossy link.
+	if got < 300 {
+		t.Fatalf("agent update timeout %ds is too tight for a slow uplink to fetch the binary", got)
+	}
+}

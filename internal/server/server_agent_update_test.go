@@ -1321,7 +1321,7 @@ func TestAgentUpdateApplyScriptLiftsFileSizeLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script, err := agentUpdateApplyScript(approval)
+	script, err := agentUpdateApplyScript(approval, srv.publicURL)
 	if err != nil {
 		t.Fatal(err)
 	}

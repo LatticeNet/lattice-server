@@ -313,6 +313,13 @@ func (s *Server) serveStaticBinding(w http.ResponseWriter, r *http.Request, reco
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
+	// Static bindings are anonymous public hosting. Agent release binaries are
+	// authorized per task lease and must never leak out through one, including
+	// through a binding that predates the reservation.
+	if reservedAgentArtifactBucket(record.Bucket) {
+		http.NotFound(w, r)
+		return
+	}
 	objectPath, ok := record.objectPath(r.URL.Path)
 	if !ok {
 		http.NotFound(w, r)
@@ -425,6 +432,9 @@ func normalizeStorageBucket(kind, name, displayName, description, indexDocument,
 }
 
 func normalizeStorageBinding(kind, bindingID, bucket, hostname, prefix string, enabled *bool) (model.StorageBinding, error) {
+	if kind == model.StorageKindStatic && reservedAgentArtifactBucket(bucket) {
+		return model.StorageBinding{}, errReservedAgentArtifactBucket()
+	}
 	bucket = strings.TrimSpace(bucket)
 	if err := validateStorageName(bucket); err != nil {
 		return model.StorageBinding{}, fmt.Errorf("bucket: %w", err)

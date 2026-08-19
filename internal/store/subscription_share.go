@@ -1,6 +1,7 @@
 package store
 
 import (
+	"crypto/subtle"
 	"errors"
 	"sort"
 	"time"
@@ -57,21 +58,39 @@ func (s *Store) SubscriptionShare(id string) (model.SubscriptionShare, bool) {
 }
 
 // SubscriptionShareByToken resolves a share by its exact token. It is the only
-// lookup the public endpoint performs. The comparison is whole-string on purpose:
-// a prefix or substring match would turn a partially guessed token into a working
-// one.
+// lookup the public endpoint performs, and that endpoint is unauthenticated, so
+// this is the one comparison in the product an anonymous caller can drive.
+//
+// The comparison is whole-string on purpose: a prefix or substring match would
+// turn a partially guessed token into a working one. It is also constant-time,
+// and the scan does not stop at the first hit. Returning early leaks, through
+// timing, both how far a candidate token matched and where the matching share
+// sat in the iteration; neither is information the caller is entitled to. The
+// cost is a full pass over a map that holds one entry on a real deployment.
+//
+// A duplicate token fails closed. It should be unreachable, since tokens are
+// generated from a CSPRNG, but "unreachable" plus "silently serves whichever
+// share the map happened to yield first" is a bad pair: Go randomises map
+// iteration, so the same token would serve different subscriptions on different
+// requests. Refusing is the only answer that is the same every time.
 func (s *Store) SubscriptionShareByToken(token string) (model.SubscriptionShare, bool) {
 	if token == "" {
 		return model.SubscriptionShare{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var found model.SubscriptionShare
+	matches := 0
 	for _, share := range s.state.SubscriptionShares {
-		if share.Token == token {
-			return share, true
+		if subtle.ConstantTimeCompare([]byte(share.Token), []byte(token)) == 1 {
+			found = share
+			matches++
 		}
 	}
-	return model.SubscriptionShare{}, false
+	if matches != 1 {
+		return model.SubscriptionShare{}, false
+	}
+	return found, true
 }
 
 // SubscriptionShares returns every share sorted by creation time, then id, so the

@@ -635,20 +635,7 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	}
 	node, task, err := s.authorizeAgentBinaryRequest(r, ref)
 	if err != nil {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			NodeID:   node.ID,
-			Action:   "agent.binary.serve",
-			Decision: "deny",
-			Reason:   err.Error(),
-			Metadata: map[string]string{
-				"version": ref.Version,
-				"os":      ref.OS,
-				"arch":    ref.Arch,
-				"sha256":  ref.SHA256,
-				"task_id": strings.TrimSpace(r.Header.Get(agentTaskIDHeader)),
-			},
-		})
+		s.auditAgentBinaryDenied(r, node.ID, ref, err.Error())
 		writeError(w, http.StatusForbidden, errAgentBinaryDenied)
 		return
 	}
@@ -723,6 +710,43 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	if _, err := w.Write(data); err != nil {
 		s.logger.Printf("agent binary write failed: node_id=%s version=%s: %v", node.ID, ref.Version, err)
 	}
+}
+
+// auditAgentBinaryDenied records a download this route refused. The route is
+// unauthenticated by construction (the credential is inside the request), so an
+// anonymous caller can reach this path at will. It therefore shares the global
+// authentication-failure throttle: without it, rotating source addresses would
+// turn "record the refusal" into unbounded audit growth, which is the exact
+// abuse that throttle exists to stop. Refusals that require a valid lease to
+// reach, a missing artifact and a digest mismatch, are never throttled: those
+// are control-plane defects and every one of them must be recorded.
+func (s *Server) auditAgentBinaryDenied(r *http.Request, nodeID string, ref agentArtifactRef, reason string) {
+	sourceIP := s.clientIP(r)
+	emit, suppressed, dropped := s.authFailAuditThrottle.Allow("agentbinary|"+auditBucketedIP(sourceIP), s.now())
+	if !emit {
+		return
+	}
+	meta := map[string]string{
+		"version": ref.Version,
+		"os":      ref.OS,
+		"arch":    ref.Arch,
+		"sha256":  ref.SHA256,
+		"task_id": auditTruncate(strings.TrimSpace(r.Header.Get(agentTaskIDHeader)), 64),
+	}
+	if suppressed > 0 {
+		meta["suppressed_repeats"] = strconv.Itoa(suppressed)
+	}
+	if dropped > 0 {
+		meta["global_suppressed"] = strconv.Itoa(dropped)
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   auditTruncate(nodeID, 64),
+		Action:   "agent.binary.serve",
+		Decision: "deny",
+		Reason:   reason,
+		Metadata: meta,
+	})
 }
 
 // authorizeAgentBinaryRequest proves the caller is the node currently executing

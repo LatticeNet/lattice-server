@@ -282,6 +282,44 @@ func TestAgentBinaryRequiresTheLeaseOfTheTaskThatNamesIt(t *testing.T) {
 	}
 }
 
+// This route is unauthenticated by construction: the credential travels inside
+// the request, so anyone can reach it. Auditing every refusal one for one would
+// hand an anonymous caller an unbounded write amplifier against the audit store,
+// which is the abuse the shared failure throttle exists to stop.
+func TestAgentBinaryDenialsDoNotLetAnAnonymousCallerFloodTheAuditLog(t *testing.T) {
+	srv, handler, st := newAgentArtifactServer(t)
+	_, ref, _ := seedControlPlaneUpdate(t, srv, st)
+
+	before := len(st.AuditEvents())
+	refused := 0
+	for i := 0; i < 200; i++ {
+		res := getAgentBinary(t, handler, ref.urlPath(), "task-does-not-exist", "not-a-lease")
+		status := res.StatusCode
+		res.Body.Close()
+		if status == http.StatusTooManyRequests {
+			// The per-source limiter is the other half of this defense and cuts
+			// in first from one address. The throttle is what survives an
+			// attacker who rotates addresses past it.
+			break
+		}
+		if status != http.StatusForbidden {
+			t.Fatalf("attempt %d answered %d, want 403", i, status)
+		}
+		refused++
+	}
+	written := len(st.AuditEvents()) - before
+	if refused < 10 {
+		t.Fatalf("only %d refusals got through; the test cannot say anything about audit growth", refused)
+	}
+	if written == 0 {
+		t.Fatal("a refused download must leave a trace; the throttle emits the first one")
+	}
+	if written >= refused {
+		t.Fatalf("%d refusals wrote %d audit events; an anonymous caller must not drive audit growth one for one",
+			refused, written)
+	}
+}
+
 // A lease stops being a credential the moment the task stops being leased.
 func TestAgentBinaryRefusesALeaseOnATaskThatIsNoLongerRunning(t *testing.T) {
 	srv, handler, st := newAgentArtifactServer(t)

@@ -1,0 +1,283 @@
+case bare
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=surge target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.1 source_version=v-golden stale=false token_sha256=<redacted> ua_class=surge
+
+case no user agent
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.2 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case curl
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=true format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.3 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case clash ua
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=clash target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.4 source_version=v-golden stale=false token_sha256=<redacted> ua_class=clash
+
+case explicit format plain
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=plain ua=other target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=false format=plain share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.5 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case target stash
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target=Stash iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.6 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case target singbox
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target=sing-box iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.7 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case platform alias
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target=Stash iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=true format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.8 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case include unsupported
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target=Stash iup=true py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.9 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case pretty yaml
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target=Stash iup=false py=true raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.10 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case no flow
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=true format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.11 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case other host
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
+  header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=1; download=2; total=3"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "share=share_golden format=base64 ua=other target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow cache=true format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.12 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+
+case deny unknown token
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=subscription not found slug=cd-self source_ip=192.0.2.13 token_sha256=<redacted>
+
+case deny wrong slug
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=subscription not found slug=nope source_ip=192.0.2.14 token_sha256=<redacted>
+
+case deny disabled
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=subscription not found slug=off source_ip=192.0.2.15 token_sha256=<redacted>
+
+case deny expired
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=subscription not found slug=old source_ip=192.0.2.16 token_sha256=<redacted>
+
+case deny bad format
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=invalid subscription format slug=cd-self source_ip=192.0.2.17 token_sha256=<redacted>
+
+case deny bad target
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=invalid subscription target share_id=share_golden slug=cd-self source_ip=192.0.2.18 token_sha256=<redacted>
+
+case deny post
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=method not allowed method=POST source_ip=192.0.2.19
+
+case deny head
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=method not allowed method=HEAD source_ip=192.0.2.20
+
+case deny single segment
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=invalid subscription path source_ip=192.0.2.21 token_sha256=<redacted>
+
+case deny three segments
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=invalid subscription path source_ip=192.0.2.22 token_sha256=<redacted>
+
+case deny bare prefix
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=invalid subscription path source_ip=192.0.2.23 token_sha256=<redacted>
+
+case deny uppercase slug
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=invalid subscription path source_ip=192.0.2.24 token_sha256=<redacted>
+
+case deny traversal
+  status: 307
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/html; charset=utf-8"
+  header Location: "/gggggggggggggggggggggggggggggggg"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "<a href=\"/gggggggggggggggggggggggggggggggg\">Temporary Redirect</a>.\n\n"
+
+case deny empty render
+  status: 404
+  header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Referrer-Policy: "no-referrer"
+  header X-Content-Type-Options: "nosniff"
+  header X-Frame-Options: "DENY"
+  body: ""
+  audit subscription.share.fetch/deny reason=subscription_render_failed share_id=share_core slug=core source_ip=192.0.2.26 token_sha256=<redacted>
+

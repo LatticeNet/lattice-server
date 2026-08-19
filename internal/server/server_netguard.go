@@ -208,7 +208,7 @@ func (s *Server) handleNetGuardReview(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "not found"))
 		return
 	}
-	input, node, err := s.compileInputSnapshotFor(nodeID)
+	input, node, resolver, err := s.compileInputSnapshotFor(p, nodeID)
 	if err != nil {
 		if errors.Is(err, store.ErrNetGuardCompileNodeNotFound) {
 			writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "not found"))
@@ -239,7 +239,14 @@ func (s *Server) handleNetGuardReview(w http.ResponseWriter, r *http.Request, p 
 		ReplanInput: netGuardReplanInput{NodeID: nodeID},
 		Findings:    make([]netguard.Finding, 0),
 	}
-	if ruleset, findings, compileErr := s.netGuardPreview(input, reality.Reality); compileErr != nil {
+	ruleset, findings, compileErr := s.netGuardPreview(input, reality.Reality)
+	// Checked before compileErr: a denied remote makes the compiler fail with a
+	// message that names the node, which is what the refusal exists to withhold.
+	if refused := resolver.Refused(); refused != nil {
+		writeError(w, http.StatusForbidden, refused)
+		return
+	}
+	if compileErr != nil {
 		review.CompileError = compileErr.Error()
 	} else {
 		review.Ruleset = ruleset
@@ -422,26 +429,63 @@ func resolveNodeZonesFrom(guardZones []model.GuardZone, inputs model.NFTInputs, 
 	return zones
 }
 
-func (s *Server) compileInputFor(nodeID string) (netguard.CompileInput, error) {
-	input, _, err := s.compileInputSnapshotFor(nodeID)
-	return input, err
+func (s *Server) compileInputFor(p principal, nodeID string) (netguard.CompileInput, *scopedNodeResolver, error) {
+	input, _, resolver, err := s.compileInputSnapshotFor(p, nodeID)
+	return input, resolver, err
 }
 
-func (s *Server) compileInputSnapshotFor(nodeID string) (netguard.CompileInput, model.Node, error) {
+// compileInputSnapshotFor builds the netguard compile input for one node and
+// returns the resolver alongside it, so the caller can refuse before it looks
+// at the compiler's error.
+//
+// The snapshot's Nodes map holds every node in the fleet, so resolving straight
+// out of it was the unscoped lookup in another coat. That mattered: a per-node
+// override rule on a binding may name any node as its remote, and the compiler
+// turns that into the remote's WireGuard IP /32 and public IP /32 inside the
+// ruleset that /api/netguard/review and /api/netguard/plan return. An operator
+// with netguard:admin on one node could write such an override and read another
+// node's addresses straight back out.
+//
+// Refused rather than filtered: a firewall ruleset silently missing the rules
+// whose remotes the caller cannot read is a wrong firewall, not a shorter one,
+// and here it would silently drop a deny rule.
+func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.CompileInput, model.Node, *scopedNodeResolver, error) {
 	snapshot, err := s.store.NetGuardCompileSnapshot(nodeID)
 	if err != nil {
-		return netguard.CompileInput{}, model.Node{}, err
+		return netguard.CompileInput{}, model.Node{}, nil, err
 	}
 	nodes := snapshot.Nodes
+	resolver := s.nodeResolverOver(func(id string) (model.Node, bool) {
+		node, ok := nodes[id]
+		return node, ok
+	}, p, "netguard:read", "compiling this node's guard", nodeID)
 	return netguard.CompileInput{
 		Binding: snapshot.Binding,
 		Groups:  snapshot.Groups,
 		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
-		Resolve: func(id string) (model.Node, bool) {
-			node, ok := nodes[id]
-			return node, ok
-		},
-	}, snapshot.Node, nil
+		Resolve: resolver.Resolve,
+	}, snapshot.Node, resolver, nil
+}
+
+// compileInputForSystem is compileInputFor without a principal, for the
+// approve-time freshness recompute whose only output is a hash compared in
+// memory. See currentGroupDerivedPolicyPlanSHA for the same reasoning.
+func (s *Server) compileInputForSystem(nodeID string) (netguard.CompileInput, error) {
+	snapshot, err := s.store.NetGuardCompileSnapshot(nodeID)
+	if err != nil {
+		return netguard.CompileInput{}, err
+	}
+	nodes := snapshot.Nodes
+	resolver := s.systemNodeResolverOver(func(id string) (model.Node, bool) {
+		node, ok := nodes[id]
+		return node, ok
+	}, "freshness hash only; never returned to the caller")
+	return netguard.CompileInput{
+		Binding: snapshot.Binding,
+		Groups:  snapshot.Groups,
+		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
+		Resolve: resolver.Resolve,
+	}, nil
 }
 
 func (s *Server) handleUpsertSecurityGroup(w http.ResponseWriter, r *http.Request, p principal) {
@@ -471,7 +515,7 @@ func (s *Server) handleUpsertSecurityGroup(w http.ResponseWriter, r *http.Reques
 	}
 	// Validate rules by compiling them in isolation: an unrenderable rule must
 	// never reach the store, so a later plan cannot fail on stored garbage.
-	if err := s.validateGuardRules(req.Rules); err != nil {
+	if err := s.validateGuardRules(p, req.Rules); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -494,7 +538,15 @@ func (s *Server) handleUpsertSecurityGroup(w http.ResponseWriter, r *http.Reques
 // validateGuardRules compiles a candidate rule set against a permissive
 // synthetic node so unsupported or malformed shapes are rejected at write
 // time rather than at plan time.
-func (s *Server) validateGuardRules(rules []model.GuardRule) error {
+//
+// It takes the principal because a rule may name a remote node, and the
+// compiler's rejection message names it back: "remote node %q not found"
+// against "remote node %q has no resolvable address" against acceptance told a
+// caller whether a guessed node id existed and whether it had an address. The
+// node-binding path reaches this with only per-node netguard:admin, so that was
+// a live existence oracle for a node-restricted operator. Under the scoped
+// resolver an unreadable remote is indistinguishable from an absent one.
+func (s *Server) validateGuardRules(p principal, rules []model.GuardRule) error {
 	if len(rules) == 0 {
 		return nil
 	}
@@ -505,12 +557,17 @@ func (s *Server) validateGuardRules(rules []model.GuardRule) error {
 	for _, zone := range s.store.GuardZones() {
 		zones[zone.ID] = zone
 	}
+	resolver := s.nodeResolverFor(p, "netguard:read", "validating these rules")
 	_, err := netguard.Compile(netguard.CompileInput{
 		Binding: model.NodeGuardBinding{NodeID: "validate", Managed: true},
 		Groups:  []model.SecurityGroup{{ID: "validate", Rules: rules}},
 		Zones:   zones,
-		Resolve: s.resolveNode,
+		Resolve: resolver.Resolve,
 	})
+	// Checked before err: the compiler names the node it could not resolve.
+	if refused := resolver.Refused(); refused != nil {
+		return refused
+	}
 	return err
 }
 
@@ -577,7 +634,10 @@ func (s *Server) handleUpsertGuardZone(w http.ResponseWriter, r *http.Request, p
 	if _, err := netguard.Compile(netguard.CompileInput{
 		Binding: model.NodeGuardBinding{NodeID: "validate", Managed: true, ZoneIDs: []string{req.ID}},
 		Zones:   map[string]model.GuardZone{req.ID: req},
-		Resolve: s.resolveNode,
+		// No rules, so no remote is ever resolved; the compiler only requires a
+		// non-nil resolver. Scoped anyway so the guard test has nothing to
+		// carve an exception for.
+		Resolve: s.nodeResolverFor(p, "netguard:read", "validating this zone").Resolve,
 	}); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -641,11 +701,14 @@ func (s *Server) handleNetGuardBindings(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
 		return
 	}
-	if _, ok := s.store.Node(req.NodeID); !ok {
-		writeError(w, http.StatusNotFound, errors.New("node not found"))
+	// Scope first, then existence. The other order answered "does node X
+	// exist" with a 404-against-403 difference before any check ran, which is
+	// the same oracle the plan endpoints were closed against.
+	if !s.requireNodeScope(w, p, "netguard:admin", req.NodeID) {
 		return
 	}
-	if !s.requireNodeScope(w, p, "netguard:admin", req.NodeID) {
+	if _, ok := s.store.Node(req.NodeID); !ok {
+		writeError(w, http.StatusNotFound, errors.New("node not found"))
 		return
 	}
 	for _, groupID := range req.GroupIDs {
@@ -654,7 +717,7 @@ func (s *Server) handleNetGuardBindings(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 	}
-	if err := s.validateGuardRules(req.Overrides); err != nil {
+	if err := s.validateGuardRules(p, req.Overrides); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -789,12 +852,15 @@ func (s *Server) handleNetGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
-	input, err := s.compileInputFor(req.NodeID)
+	input, resolver, err := s.compileInputFor(p, req.NodeID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	compiled, err := netguard.Compile(input)
+	if s.writeRefusal(w, p, resolver) {
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -885,7 +951,7 @@ func isNetGuardApproval(approval model.Approval) bool {
 }
 
 func (s *Server) currentNetGuardPlanSHA(nodeID string) (string, error) {
-	input, err := s.compileInputFor(nodeID)
+	input, err := s.compileInputForSystem(nodeID)
 	if err != nil {
 		return "", err
 	}

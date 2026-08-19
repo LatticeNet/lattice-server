@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
 // Duplicate-node detection. The hard part (operator's note): a single public IP
@@ -133,7 +134,22 @@ func (s *Server) handleNodeDuplicates(w http.ResponseWriter, _ *http.Request, p 
 	if !s.requireScope(w, p, "node:read") {
 		return
 	}
-	groups := detectDuplicateNodes(s.store.Nodes())
+	// requireScope is a flat check, so the allowlist never applied and every
+	// caller got the whole fleet: each cluster's node ids plus the shared
+	// signal, which for public_internal_ip is the raw address pair and for
+	// wireguard_key is the key prefix. /api/nodes filters per row; this did not.
+	//
+	// Filtered at the input, not refused: duplicate detection is a report, and
+	// a report over the nodes you can read is a correct answer. Detecting over
+	// the whole fleet and then hiding rows would be worse, because the cluster
+	// sizes would still count nodes the caller cannot see.
+	visible := make([]model.Node, 0)
+	for _, n := range s.store.Nodes() {
+		if rbac.Allows(p.Principal, "node:read", n.ID) {
+			visible = append(visible, n)
+		}
+	}
+	groups := detectDuplicateNodes(visible)
 	if groups == nil {
 		groups = []duplicateGroup{}
 	}

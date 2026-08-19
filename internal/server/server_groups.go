@@ -12,6 +12,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
 // Grouping (iter-063, Phase 1). A Group is a first-class organizational entity.
@@ -91,7 +92,20 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, p principa
 		if !s.requireScope(w, p, "group:read") {
 			return
 		}
-		nodes := s.store.Nodes()
+		// group:read was a flat scope check, so the allowlist never applied and
+		// every caller received the fleet's complete node-id inventory: each
+		// group's resolved members plus ungrouped, which is by construction
+		// every node not in a group.
+		//
+		// Filtered at the input, not refused: groups are a listing and a
+		// shorter one is a correct answer. Resolving over the whole fleet and
+		// hiding rows afterwards would still leak through the rollup counts.
+		nodes := make([]model.Node, 0)
+		for _, n := range s.store.Nodes() {
+			if rbac.Allows(p.Principal, "group:read", n.ID) {
+				nodes = append(nodes, n)
+			}
+		}
 		byID := make(map[string]model.Node, len(nodes))
 		for _, n := range nodes {
 			byID[n.ID] = n
@@ -380,6 +394,18 @@ func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request, p pr
 		return
 	}
 	req.GroupID = strings.TrimSpace(req.GroupID)
+	// group_id arrives in the body, so withAuth's ?node_id check never fired
+	// and no node in add or remove was ever authorized. Group membership drives
+	// ExpandGroupPolicies, so an operator scoped to one node could move any
+	// node into or out of any group and thereby change which fleet-wide
+	// firewall policy applies to it. dedupeExistingNodes silently dropping ids
+	// that do not exist made the echoed member list an existence oracle too.
+	//
+	// Refused rather than filtered: silently ignoring the members the caller
+	// may not touch would report success for an edit that did not happen.
+	if !s.requireReadableNodes(w, p, "group:admin", "this membership change", append(append([]string{}, req.Add...), req.Remove...)) {
+		return
+	}
 	g, ok := s.store.Group(req.GroupID)
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("group not found"))
@@ -446,7 +472,17 @@ func (s *Server) handleGroupPreview(w http.ResponseWriter, r *http.Request, p pr
 	if !decodeClientJSON(w, r, &sel) {
 		return
 	}
-	nodes := s.store.Nodes()
+	// The selector comes from the caller, so resolving it against the whole
+	// fleet turned this into a query engine over it: match_country JP or
+	// match_tags_any prod enumerated the fleet by geo, role or tag. Resolving
+	// against the readable subset answers the editor's real question, which is
+	// "how many of the nodes I administer does this match".
+	nodes := make([]model.Node, 0)
+	for _, n := range s.store.Nodes() {
+		if rbac.Allows(p.Principal, "group:read", n.ID) {
+			nodes = append(nodes, n)
+		}
+	}
 	ids := groups.ResolveMembers(model.Group{Selector: normalizeGroupSelector(&sel)}, nodes)
 	writeJSON(w, http.StatusOK, map[string]any{"node_ids": ids, "count": len(ids)})
 }

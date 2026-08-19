@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -207,11 +208,29 @@ func TestNFTPlanRequiresNetPolicyReadWhenIngressIsComposed(t *testing.T) {
 		t.Fatalf("network-only token must not create policy-omitting guard plan, got %d", denied.StatusCode)
 	}
 
-	withRead := createPAT(t, handler, cookies, csrf, []string{"network:plan", "netpolicy:read"}, []string{"node-a"})
+	// This assertion used to grant netpolicy:read with the allowlist pinned to
+	// node-a and expect 200. That encoded the target-only rule, which is the
+	// defect: the policy's one rule names node-b as its remote, and compiling
+	// it writes node-b's WireGuard IP and public IP into the ruleset this
+	// endpoint returns. Reading node-a is not authority over node-b's
+	// addresses. The assertion is corrected rather than the check relaxed, and
+	// the target-only case is now asserted as a refusal directly below.
+	readTargetOnly := createPAT(t, handler, cookies, csrf, []string{"network:plan", "netpolicy:read"}, []string{"node-a"})
+	refused := doBearerJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, readTargetOnly)
+	refusedBody, _ := io.ReadAll(refused.Body)
+	refused.Body.Close()
+	if refused.StatusCode != http.StatusForbidden {
+		t.Fatalf("netpolicy:read on the target alone must not compile a rule naming node-b, got %d", refused.StatusCode)
+	}
+	if strings.Contains(string(refusedBody), "node-b") {
+		t.Fatalf("the refusal must report a count, never the node it protects: %s", refusedBody)
+	}
+
+	withRead := createPAT(t, handler, cookies, csrf, []string{"network:plan", "netpolicy:read"}, []string{"node-a", "node-b"})
 	allowed := doBearerJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, withRead)
 	allowed.Body.Close()
 	if allowed.StatusCode != http.StatusOK {
-		t.Fatalf("token with netpolicy:read should plan composed guard, got %d", allowed.StatusCode)
+		t.Fatalf("token that may read every node the rules name should plan composed guard, got %d", allowed.StatusCode)
 	}
 }
 

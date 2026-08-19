@@ -194,7 +194,13 @@ func (s *Server) handleRevealVPNUserCredentials(w http.ResponseWriter, r *http.R
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
-	if !s.requireScope(w, p, "proxy:admin") {
+	// requireScope passes an empty node id, which rbac.Allows reads as "any
+	// node", so the allowlist never applied to a credential reveal. A VPN user
+	// is a fleet-wide object bound to lines on many nodes, so the containment
+	// that fits is the one every other global proxy object uses: an
+	// unrestricted allowlist. Step-up proves identity, not scope, so it did not
+	// cover this.
+	if !s.requireGlobalProxyScope(w, p, "proxy:admin") {
 		return
 	}
 	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "vpn.user.credentials.reveal") {

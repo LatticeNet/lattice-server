@@ -474,7 +474,7 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			if _, ok := existing.KV[key]; ok {
 				continue
 			}
-			if err := bs.PutKV(entry); err != nil {
+			if err := bs.migrateKV(entry); err != nil {
 				return err
 			}
 		}
@@ -482,7 +482,7 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			if _, ok := existing.Static[key]; ok {
 				continue
 			}
-			if err := bs.PutStatic(obj); err != nil {
+			if err := bs.migrateStatic(obj); err != nil {
 				return err
 			}
 		}

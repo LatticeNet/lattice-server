@@ -923,6 +923,32 @@ func (bs *BoltStateStore) PutKV(entry model.KVEntry) error {
 
 // KVStaticMigrated reports whether the one-time move of KV and Static out of
 // the JSON state has already run against this store.
+// migrateKV and migrateStatic copy a record across without restamping it.
+//
+// PutKV and PutStatic set UpdatedAt to now, which is right for a write and
+// wrong for a move: the one-time migration out of the JSON state is not an
+// edit, and stamping it rewrites "when did this last change" for every entry
+// it touches. That field is rendered in the console, so the migration would
+// silently tell the operator that everything changed the moment the server
+// restarted.
+func (bs *BoltStateStore) migrateKV(entry model.KVEntry) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketKV, entry.Bucket+"/"+entry.Key, entry)
+	})
+}
+
+func (bs *BoltStateStore) migrateStatic(obj model.StaticObject) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return putRecord(tx, boltBucketStatic, obj.Bucket+"/"+obj.Path, obj)
+	})
+}
+
 func (bs *BoltStateStore) KVStaticMigrated() (bool, error) {
 	migrated := false
 	err := bs.db.View(func(tx *bolt.Tx) error {

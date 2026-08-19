@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -166,5 +167,67 @@ func TestStaticObjectsCanBeDeleted(t *testing.T) {
 	// a path they cannot always know is populated.
 	if err := s.DeleteStatic("scripts", "never.js"); err != nil {
 		t.Fatalf("deleting a missing object failed: %v", err)
+	}
+}
+
+// The move out of the JSON state must not restamp what it moves.
+//
+// PutKV and PutStatic set UpdatedAt to now, which is correct for a write and
+// wrong for a migration: it is not an edit. Found in production, where an entry
+// last changed in June came back reading as changed at the moment the upgraded
+// server started, because the migration wrote through the normal put.
+func TestMigrationPreservesUpdatedAt(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "state.json")
+	boltPath := filepath.Join(dir, "state-hot.db")
+	c := testCipher(t)
+
+	s, err := OpenWithCipher(jsonPath, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutKV(model.KVEntry{Bucket: "b", Key: "k", Value: "v"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutStatic(model.StaticObject{Bucket: "b", Path: "a.js", Content: "// x"}); err != nil {
+		t.Fatal(err)
+	}
+	entryBefore, ok := s.KVEntry("b", "k")
+	if !ok {
+		t.Fatal("the fixture did not store the entry")
+	}
+	objBefore, ok := s.StaticObject("b", "a.js")
+	if !ok {
+		t.Fatal("the fixture did not store the object")
+	}
+
+	// Backdate both so a restamp is unmistakable rather than a sub-second race.
+	entryBefore.UpdatedAt = entryBefore.UpdatedAt.Add(-72 * time.Hour)
+	objBefore.UpdatedAt = objBefore.UpdatedAt.Add(-72 * time.Hour)
+	s.state.KV["b/k"] = entryBefore
+	s.state.Static["b/a.js"] = objBefore
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.EnableRuntimeBoltHotStore(boltPath); err != nil {
+		t.Fatal(err)
+	}
+
+	entryAfter, ok := s.KVEntry("b", "k")
+	if !ok {
+		t.Fatal("the KV entry did not survive the migration")
+	}
+	if !entryAfter.UpdatedAt.Equal(entryBefore.UpdatedAt) {
+		t.Fatalf("the migration restamped the KV entry: was %s, now %s",
+			entryBefore.UpdatedAt, entryAfter.UpdatedAt)
+	}
+	objAfter, ok := s.StaticObject("b", "a.js")
+	if !ok {
+		t.Fatal("the static object did not survive the migration")
+	}
+	if !objAfter.UpdatedAt.Equal(objBefore.UpdatedAt) {
+		t.Fatalf("the migration restamped the static object: was %s, now %s",
+			objBefore.UpdatedAt, objAfter.UpdatedAt)
 	}
 }

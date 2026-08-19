@@ -1483,8 +1483,18 @@ func agentUpdateDownloadStep(source string) string {
 	if source == agentBinarySourceControlPlane {
 		leaseHeaders := " -H \"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
 			" -H \"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\""
-		curl = "curl -fsSL --proto '=https' --tlsv1.2" + leaseHeaders + " -o \"$CANDIDATE\" \"$URL\""
-		wget = "wget --https-only -q" +
+		// No redirect following on the credentialed fetch. curl only strips the
+		// standard Authorization header across a cross-host redirect, never a
+		// custom -H, and wget strips nothing, so a 3xx from anything in front of
+		// the control plane would forward a live task lease to whatever it
+		// points at. A single self-hosted digest-pinned object never needs a
+		// redirect, so refusing them costs nothing and makes "the lease goes
+		// only to this control plane" a property of the script rather than of
+		// the current proxy configuration. The upstream branch keeps following
+		// redirects, because release assets legitimately land on CDN storage,
+		// and it carries no credential.
+		curl = "curl -fsS --proto '=https' --tlsv1.2" + leaseHeaders + " -o \"$CANDIDATE\" \"$URL\""
+		wget = "wget --https-only -q --max-redirect=0" +
 			" --header=\"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
 			" --header=\"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\"" +
 			" -O \"$CANDIDATE\" \"$URL\""

@@ -390,6 +390,14 @@ func TestAgentUpdateApplyScriptSendsTheLeaseOnlyToTheControlPlane(t *testing.T) 
 	if !strings.Contains(script, "needs node-agent v0.2.0 or newer") {
 		t.Fatal("script must fail closed, with the reason named, on an agent that cannot prove its lease")
 	}
+	// A redirect would carry the lease headers onward: curl strips only the
+	// standard Authorization header across hosts, and wget strips nothing.
+	if strings.Contains(script, "curl -fsSL") {
+		t.Fatalf("the credentialed download must not follow redirects:\n%s", script)
+	}
+	if !strings.Contains(script, "--max-redirect=0") {
+		t.Fatalf("the credentialed wget fallback must not follow redirects:\n%s", script)
+	}
 
 	// Now flip the same approval back to the upstream release and confirm the
 	// lease headers disappear with it.
@@ -407,6 +415,11 @@ func TestAgentUpdateApplyScriptSendsTheLeaseOnlyToTheControlPlane(t *testing.T) 
 	if strings.Contains(upstreamScript, "-H \""+agentTaskLeaseHeader) ||
 		strings.Contains(upstreamScript, "--header=\""+agentTaskLeaseHeader) {
 		t.Fatalf("an upstream download must not carry the task lease:\n%s", upstreamScript)
+	}
+	// Upstream release assets legitimately redirect to CDN storage, and that
+	// request carries no credential, so it keeps following them.
+	if !strings.Contains(upstreamScript, "curl -fsSL") {
+		t.Fatalf("an uncredentialed upstream download still needs to follow release redirects:\n%s", upstreamScript)
 	}
 }
 

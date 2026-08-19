@@ -96,19 +96,6 @@ func publishingReadScope(origin string) string {
 	return origin + ":read"
 }
 
-func normalizePublishingOrigin(origin string) (string, error) {
-	switch strings.TrimSpace(strings.ToLower(origin)) {
-	case originKV:
-		return originKV, nil
-	case originStatic:
-		return originStatic, nil
-	case originPlugin:
-		return originPlugin, nil
-	default:
-		return "", errors.New("origin must be kv, static, or plugin")
-	}
-}
-
 // publishingRecordFromBinding lifts a stored storage binding into the plane.
 func publishingRecordFromBinding(binding model.StorageBinding) publishingRecord {
 	return publishingRecord{
@@ -139,6 +126,11 @@ func publishingRecordFromShare(share model.SubscriptionShare) publishingRecord {
 // publishingRecords returns every route for one origin, whatever it is stored
 // as. Callers that need all origins ask for each in turn, so the per-origin
 // authorization stays visible at the call site.
+//
+// The result is deliberately unsorted. This runs on the request path for every
+// static, kv and subscription hit, and the resolver below breaks ties on id
+// rather than on position, so ordering costs work without deciding anything.
+// The listing endpoint sorts for itself.
 func (s *Server) publishingRecords(origin string) []publishingRecord {
 	var out []publishingRecord
 	switch origin {
@@ -151,6 +143,12 @@ func (s *Server) publishingRecords(origin string) []publishingRecord {
 			out = append(out, publishingRecordFromBinding(binding))
 		}
 	}
+	return out
+}
+
+// sortedPublishingRecords is publishingRecords in a stable display order.
+func (s *Server) sortedPublishingRecords(origin string) []publishingRecord {
+	out := s.publishingRecords(origin)
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
@@ -248,7 +246,7 @@ func (s *Server) handlePublishingRecords(w http.ResponseWriter, r *http.Request,
 			continue
 		}
 		visible[origin] = true
-		for _, record := range s.publishingRecords(origin) {
+		for _, record := range s.sortedPublishingRecords(origin) {
 			records = append(records, publishingRecordViewOf(record))
 		}
 	}

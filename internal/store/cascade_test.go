@@ -583,3 +583,72 @@ func TestDeleteNodeRemovesItsOwnGuardBinding(t *testing.T) {
 		t.Fatal("the node's guard binding outlived the node")
 	}
 }
+
+// A task names a node in three places, not one: Targets, TargetLeases keyed by
+// the same id, and RerunOfNodeID. The cascade stripped Targets and left the
+// other two, so a deleted node stayed named by every task that had ever leased
+// to it. Found by auditing a real deletion: one production task still held
+// leases for both removed nodes.
+//
+// This is the shape step 17b was added for. A record carries the same
+// identifier twice, the obvious field gets handled, and the sibling is missed
+// because nothing enumerates them together. Worth a test that names all three
+// rather than only the one that was wrong today.
+func TestDeleteNodeClearsEveryTaskFieldThatNamesIt(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const gone, kept = "node-gone", "node-kept"
+	for _, id := range []string{gone, kept} {
+		if err := s.UpsertNode(model.Node{ID: id, Name: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Shared task: the node is one target of two, so the task survives.
+	shared := model.Task{
+		ID: "task-shared", Targets: []string{gone, kept},
+		TargetLeases: map[string]model.TaskLease{gone: {}, kept: {}},
+	}
+	// Leased-only task: the node was never in Targets but holds a lease, which
+	// is how the production residue actually looked.
+	leaseOnly := model.Task{
+		ID: "task-lease-only", Targets: []string{kept},
+		TargetLeases: map[string]model.TaskLease{gone: {}, kept: {}},
+	}
+	rerun := model.Task{ID: "task-rerun", Targets: []string{kept}, RerunOfNodeID: gone}
+	for _, task := range []model.Task{shared, leaseOnly, rerun} {
+		if err := s.CreateTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, ok, err := s.DeleteNode(gone); err != nil || !ok {
+		t.Fatalf("delete: ok=%v err=%v", ok, err)
+	}
+
+	for _, id := range []string{"task-shared", "task-lease-only"} {
+		got, ok := s.Task(id)
+		if !ok {
+			t.Fatalf("%s vanished; it still had a live target", id)
+		}
+		if _, leased := got.TargetLeases[gone]; leased {
+			t.Fatalf("%s still leases to the deleted node", id)
+		}
+		if _, leased := got.TargetLeases[kept]; !leased {
+			t.Fatalf("%s lost the lease for the node that stayed", id)
+		}
+		if contains(got.Targets, gone) {
+			t.Fatalf("%s still targets the deleted node", id)
+		}
+	}
+
+	got, ok := s.Task("task-rerun")
+	if !ok {
+		t.Fatal("task-rerun vanished")
+	}
+	if got.RerunOfNodeID == gone {
+		t.Fatal("task-rerun still names the deleted node as the rerun origin")
+	}
+}

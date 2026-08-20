@@ -131,6 +131,8 @@ var KnownScopes = map[string]struct{}{
 	"plugin:verify":   {},
 	"proxy:admin":     {},
 	"proxy:read":      {},
+	"sshguard:admin":  {},
+	"sshguard:read":   {},
 	"substore:admin":  {},
 	"substore:read":   {},
 	"static:admin":    {},

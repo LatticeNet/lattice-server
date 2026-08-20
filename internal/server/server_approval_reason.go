@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/LatticeNet/lattice-server/internal/sshguard"
+
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
@@ -24,6 +26,13 @@ func approvalDisplayReason(a model.Approval) string {
 		return agentUpdateDisplayReason(a.Plan)
 	case a.Plugin == "singbox-linemeta" && approvalActionIs(a.Action, "apply-metadata"):
 		return lineMetaDisplayReason(a.Plan)
+	case a.Plugin == sshGuardPlugin && a.Action == sshGuardArmAction:
+		return sshGuardArmDisplayReason(a.Plan)
+	case a.Plugin == sshGuardPlugin && a.Action == sshGuardConfirmAction:
+		// The wording matters more here than anywhere else in this list. This
+		// approval looks trivial and is the one that makes an SSH change
+		// permanent, so the label has to say what approving it asserts.
+		return "Confirm SSH Guard: you have opened a NEW connection and gotten a shell"
 	case a.Plugin == "nft" && a.Action == netGuardApprovalAction:
 		return "Apply NetGuard nftables ruleset"
 	case a.Plugin == "nft" && a.Action == "apply-ruleset":
@@ -131,4 +140,32 @@ func approvalFallbackReason(a model.Approval) string {
 		words[i] = strings.ToUpper(w[:1]) + w[1:]
 	}
 	return strings.Join(words, " ")
+}
+
+// sshGuardArmDisplayReason summarizes an arm plan in one line for the approvals
+// list. It reads the plan text rather than a stored profile so the summary and
+// the reviewed document cannot disagree.
+func sshGuardArmDisplayReason(plan string) string {
+	art, err := sshguard.ParseApprovalPlan(plan)
+	if err != nil {
+		return "Apply SSH Guard hardening"
+	}
+	knock := "no knock"
+	if art.KnockdConf != "" {
+		knock = "port knocking"
+	}
+	if art.SSHPort == 0 {
+		return fmt.Sprintf("Harden sshd and gate %s (%s, auto-revert in %ds)",
+			joinPortList(art.GatedPorts), knock, art.ConfirmWindowSec)
+	}
+	return fmt.Sprintf("Move sshd to tcp/%d and gate %s (%s, auto-revert in %ds)",
+		art.SSHPort, joinPortList(art.GatedPorts), knock, art.ConfirmWindowSec)
+}
+
+func joinPortList(ports []int) string {
+	parts := make([]string, 0, len(ports))
+	for _, port := range ports {
+		parts = append(parts, fmt.Sprintf("tcp/%d", port))
+	}
+	return strings.Join(parts, " and ")
 }

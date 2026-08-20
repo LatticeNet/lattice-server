@@ -44,6 +44,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/ratelimit"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
+	"github.com/LatticeNet/lattice-server/internal/sshguard"
 	"github.com/LatticeNet/lattice-server/internal/store"
 	"github.com/LatticeNet/lattice-server/internal/telemetry"
 	"github.com/LatticeNet/lattice-server/internal/wireguard"
@@ -1092,6 +1093,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netguard/bindings", s.withAuth("netguard:admin", s.handleNetGuardBindings))
 	mux.HandleFunc("/api/netguard/nodes/adopt", s.withAuth("netguard:admin", s.handleNetGuardAdopt))
 	mux.HandleFunc("/api/netguard/plan", s.withAuth("netguard:admin", s.handleNetGuardPlan))
+	mux.HandleFunc("/api/sshguard/plan", s.withAuth("sshguard:admin", s.handleSSHGuardPlan))
+	mux.HandleFunc("/api/sshguard/confirm", s.withAuth("sshguard:admin", s.handleSSHGuardConfirm))
 	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("wireguard:admin", s.handleWireGuardPlan))
 	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
 	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))
@@ -5532,6 +5535,14 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 			return netGuardApplyScript(approval.Plan, serverURL)
 		}
 		return nftGuardApplyScript(approval.Plan, serverURL)
+	case sshGuardPlugin:
+		script, err := sshguard.ApplyScriptFromPlan(approval.Plan)
+		if err != nil {
+			return "set -e\n" +
+				"echo " + shellQuote("lattice sshguard: invalid approval plan: "+err.Error()) + " >&2\n" +
+				"exit 1\n"
+		}
+		return script
 	case "selfdns":
 		script, err := selfdns.ApplyScriptFromPlan(approval.Plan)
 		if err != nil {
@@ -6612,6 +6623,26 @@ func (s *Server) deniedApprovalNodeCount(p principal, approval model.Approval) i
 }
 
 func approvalDecisionExtraScope(approval model.Approval) string {
+	// netguard is keyed on the action, not just the plugin, because plugin
+	// "nft" carries two different approvals with different authoring gates.
+	// handleNetGuardPlan requires netguard:admin to author a ruleset
+	// (server_netguard.go), so deciding one must require it too; without this
+	// case a holder of bare network:apply could dispatch a firewall change they
+	// were not allowed to write. The legacy handleNFTPlan action
+	// ("apply-ruleset") is deliberately NOT covered: it only requires
+	// network:plan to author, so demanding netguard:admin to decide would add a
+	// gate that path never had. Whether legacy nft apply should carry an admin
+	// scope of its own is a separate policy question.
+	if isNetGuardApproval(approval) {
+		return "netguard:admin"
+	}
+	// SSH Guard can take a node off the network for its operator, so deciding
+	// one requires the same scope that authoring it does. It is listed here
+	// rather than in the switch below for the same reason netguard is: the
+	// plugin alone is not the unit of authority, the action is.
+	if isSSHGuardApproval(approval) {
+		return "sshguard:admin"
+	}
 	switch approval.Plugin {
 	case "nftpolicy":
 		return "netpolicy:admin"
@@ -6639,7 +6670,7 @@ func approvalDecisionAuditScope(approval model.Approval) string {
 
 func approvalRequiresPlanHash(approval model.Approval) bool {
 	switch approval.Plugin {
-	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore", "agentupdate":
+	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore", "agentupdate", sshGuardPlugin:
 		return true
 	default:
 		// Approvals are the host-mutation gate. Unknown future plugins carrying a

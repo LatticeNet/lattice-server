@@ -12,9 +12,19 @@ import (
 
 func TestApprovalDecisionExtraScope(t *testing.T) {
 	cases := []struct {
+		name   string
 		plugin string
+		action string
 		want   string
 	}{
+		// Plugin "nft" carries two approvals with different authoring gates, so
+		// the mapping is keyed on the action for this plugin. Authoring a
+		// netguard ruleset requires netguard:admin; deciding one must too, or
+		// bare network:apply dispatches a firewall change it could not write.
+		{name: "netguard", plugin: "nft", action: netGuardApprovalAction, want: "netguard:admin"},
+		// The legacy nft path only requires network:plan to author, so it stays
+		// uncovered on purpose rather than gaining a gate it never had.
+		{name: "legacy nft", plugin: "nft", action: "apply-ruleset", want: ""},
 		{plugin: agentUpdatePlugin, want: "node:admin"},
 		{plugin: "selfdns", want: "dns:admin"},
 		{plugin: proxyCorePlugin, want: "proxy:admin"},
@@ -25,8 +35,12 @@ func TestApprovalDecisionExtraScope(t *testing.T) {
 		{plugin: "wireguard", want: ""},
 	}
 	for _, tc := range cases {
-		t.Run(tc.plugin, func(t *testing.T) {
-			got := approvalDecisionExtraScope(model.Approval{Plugin: tc.plugin})
+		name := tc.name
+		if name == "" {
+			name = tc.plugin
+		}
+		t.Run(name, func(t *testing.T) {
+			got := approvalDecisionExtraScope(model.Approval{Plugin: tc.plugin, Action: tc.action})
 			if got != tc.want {
 				t.Fatalf("extra scope = %q, want %q", got, tc.want)
 			}
@@ -227,4 +241,78 @@ func decodeApprovalViews(t *testing.T, res *http.Response) []approvalView {
 		t.Fatal(err)
 	}
 	return views
+}
+
+// TestNetGuardApprovalDecisionRequiresNetGuardAdmin is the end-to-end half of
+// the mapping table above. The unit case proves approvalDecisionExtraScope
+// returns the right string; this proves the string is actually enforced at the
+// approve endpoint, which is where the gap lived: authoring a netguard ruleset
+// requires netguard:admin (handleNetGuardPlan), but deciding one used to need
+// only network:apply, so a bare network:apply holder could dispatch a firewall
+// change they were never allowed to write.
+//
+// The assertions are deliberately about the SCOPE GATE and nothing further. A
+// principal that clears the gate still meets the plan-hash and
+// current-plan-binding checks, which depend on stored guard state this test
+// does not seed, so "cleared the gate" is asserted as "not 403" rather than a
+// specific success code. Asserting 200 would couple this test to machinery it
+// is not exercising.
+func TestNetGuardApprovalDecisionRequiresNetGuardAdmin(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	_ = srv
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+
+	const plan = "table inet lattice_guard {\n}\n"
+	seed := func(t *testing.T, id, action string) model.Approval {
+		t.Helper()
+		a := model.Approval{
+			ID: id, NodeID: "node-a", Plugin: "nft", Action: action,
+			Plan: plan, Status: model.ApprovalPending, ActorID: "admin",
+			CreatedAt: time.Now().UTC(),
+		}
+		if err := st.UpsertApproval(a); err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	approve := func(t *testing.T, a model.Approval, token string) int {
+		t.Helper()
+		resp := doBearerJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+			string(mustJSON(t, map[string]any{
+				"approval_id": a.ID, "queue_apply": false, "plan_sha256": planSHA256(a.Plan),
+			})), token)
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	networkOnly := createPAT(t, handler, cookies, csrf, []string{"network:apply"}, []string{"node-a"})
+	guardAdmin := createPAT(t, handler, cookies, csrf, []string{"network:apply", "netguard:admin"}, []string{"node-a"})
+
+	t.Run("network-only is refused", func(t *testing.T) {
+		a := seed(t, "approval_ng_denied", netGuardApprovalAction)
+		if got := approve(t, a, networkOnly); got != http.StatusForbidden {
+			t.Fatalf("network-only must fail closed on a netguard approval, got %d", got)
+		}
+		if stored, ok := st.Approval(a.ID); !ok || stored.Status != model.ApprovalPending {
+			t.Fatalf("refused decision must not mutate the approval: ok=%v approval=%+v", ok, stored)
+		}
+	})
+
+	t.Run("netguard admin clears the gate", func(t *testing.T) {
+		a := seed(t, "approval_ng_allowed", netGuardApprovalAction)
+		if got := approve(t, a, guardAdmin); got == http.StatusForbidden {
+			t.Fatal("netguard:admin must clear the decision scope gate, got 403")
+		}
+	})
+
+	// The legacy nft path only requires network:plan to author, so demanding
+	// netguard:admin to decide would add a gate it never had. This pins the
+	// exclusion: widening the mapping to the whole "nft" plugin breaks here.
+	t.Run("legacy apply-ruleset is not tightened", func(t *testing.T) {
+		a := seed(t, "approval_ng_legacy", "apply-ruleset")
+		if got := approve(t, a, networkOnly); got == http.StatusForbidden {
+			t.Fatal("legacy apply-ruleset must not gain a netguard:admin gate, got 403")
+		}
+	})
 }

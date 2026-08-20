@@ -19,15 +19,18 @@ var ErrLineChainDeleteConflict = errors.New("node deletion conflicts with an iss
 // rather than deleted, because deleting them would also affect other still-live
 // nodes. Node-owned resources are deleted outright.
 type NodeCascadeReport struct {
-	NodeID          string `json:"node_id"`
-	TasksStripped   int    `json:"tasks_stripped"` // nodeID removed from Targets, task kept
-	TasksDeleted    int    `json:"tasks_deleted"`  // task deleted (sole target)
-	TaskResults     int    `json:"task_results"`
-	DDNSProfiles    int    `json:"ddns_profiles"`
-	MachineProfiles int    `json:"machine_profiles"`
-	NFTInputs       int    `json:"nft_inputs"`
-	DNSDeployments  int    `json:"dns_deployments"`
-	NetPolicies     int    `json:"net_policies"`
+	NodeID        string `json:"node_id"`
+	TasksStripped int    `json:"tasks_stripped"` // nodeID removed from Targets, task kept
+	// TaskNodeRefsCleared counts tasks that still named the node through
+	// TargetLeases or RerunOfNodeID after Targets no longer did.
+	TaskNodeRefsCleared int `json:"task_node_refs_cleared"`
+	TasksDeleted        int `json:"tasks_deleted"` // task deleted (sole target)
+	TaskResults         int `json:"task_results"`
+	DDNSProfiles        int `json:"ddns_profiles"`
+	MachineProfiles     int `json:"machine_profiles"`
+	NFTInputs           int `json:"nft_inputs"`
+	DNSDeployments      int `json:"dns_deployments"`
+	NetPolicies         int `json:"net_policies"`
 	// NetPeerRulesStripped / GroupPolicyRulesStripped count node-reference rules
 	// removed from OTHER nodes' net policies and from group policies (SHARED:
 	// strip the dangling Remote.NodeID rule, keep the owner's policy).
@@ -258,8 +261,38 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 			report.TasksStripped++
 			if mutate {
 				t.Targets = remaining
+				// Targets is not the only place a task names a node. TargetLeases
+				// is keyed by the same id, and RerunOfNodeID holds one directly;
+				// stripping Targets alone leaves the task still naming a node
+				// that no longer exists. This is the shape step 17b was added
+				// for: a second field carrying the same identifier, missed
+				// because the first one was handled.
+				delete(t.TargetLeases, nodeID)
+				if t.RerunOfNodeID == nodeID {
+					t.RerunOfNodeID = ""
+				}
 				s.state.Tasks[tid] = t
 			}
+		}
+	}
+
+	// The same two fields on tasks this node was never a target of: a lease or a
+	// rerun pointer can outlive the target list it came from.
+	for tid, t := range s.state.Tasks {
+		if preserveTasks[tid] || deletedTasks[tid] {
+			continue
+		}
+		_, leased := t.TargetLeases[nodeID]
+		if !leased && t.RerunOfNodeID != nodeID {
+			continue
+		}
+		report.TaskNodeRefsCleared++
+		if mutate {
+			delete(t.TargetLeases, nodeID)
+			if t.RerunOfNodeID == nodeID {
+				t.RerunOfNodeID = ""
+			}
+			s.state.Tasks[tid] = t
 		}
 	}
 

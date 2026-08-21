@@ -233,9 +233,15 @@ func (p Profile) Validate() error {
 		if err := p.Knock.validate(); err != nil {
 			return err
 		}
-		if p.SSHPort == 0 {
-			return fmt.Errorf("a knock policy requires an explicit ssh_port to gate")
-		}
+		// No ssh_port requirement. Knocking gates whatever ports the profile
+		// gates, and for most of this fleet that is 22 exactly where it is.
+		//
+		// Requiring a move was a mistake with a sharp edge: a node reachable
+		// only through a provider's port forward loses SSH the moment sshd
+		// binds a port nobody forwards, and roughly a third of this fleet is
+		// behind NAT. Gating the port that already works is both safer and the
+		// larger share of the benefit, because it is the port the brute force
+		// is using.
 	}
 	if p.ConfirmWindowSec != 0 {
 		if p.ConfirmWindowSec < MinConfirmWindowSec || p.ConfirmWindowSec > MaxConfirmWindowSec {

@@ -26,8 +26,7 @@ func TestValidateRefusesProfilesThatCanStrandTheOperator(t *testing.T) {
 	}{
 		{"knock with no second path at all", "out-of-band fallback",
 			func(p *Profile) { p.MgmtSources = nil }},
-		{"knock with no port to gate", "explicit ssh_port",
-			func(p *Profile) { p.SSHPort = 0 }},
+
 		{"ssh_port 22 is not a move", "legacy port",
 			func(p *Profile) { p.SSHPort = 22 }},
 		{"repeated knock port shortens the secret", "appears twice",
@@ -851,5 +850,53 @@ func TestKnockMayLeanOnAnOutOfBandFallbackInsteadOfAnAddress(t *testing.T) {
 	q := hkProfile()
 	if Blocking(LintProfile(q, NodeReality{Reported: true, TerminalAvailable: false})) {
 		t.Fatal("a profile with an address allowlist must not depend on the terminal")
+	}
+}
+
+// Knocking without moving the port is the shape most of this fleet needs.
+// About a third of it is reachable only through a provider's port forward, and
+// binding sshd to a port nobody forwards takes SSH away entirely.
+func TestKnockCanGateTheExistingPortWithoutMovingIt(t *testing.T) {
+	p := hkProfile()
+	p.SSHPort = 0
+	if err := p.Validate(); err != nil {
+		t.Fatalf("gating port 22 in place is a legitimate knock profile: %v", err)
+	}
+	if got := p.GatedPorts(); len(got) != 1 || got[0] != 22 {
+		t.Fatalf("the gated port should be 22 exactly where it is, got %v", got)
+	}
+	ruleset, err := p.RenderKnockRuleset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"tcp dport 22 ip saddr @allowed counter accept",
+		"tcp dport 22 counter drop",
+	} {
+		if !strings.Contains(ruleset, want) {
+			t.Fatalf("missing %q", want)
+		}
+	}
+	if strings.Contains(ruleset, "dport 58394") {
+		t.Fatal("no port was requested, so none should be gated")
+	}
+	dropIn, err := p.RenderSSHDDropIn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(dropIn, "\nPort ") {
+		t.Fatal("a profile that moves no port must not write a Port directive at all")
+	}
+	// The apply must still install knockd and the gate.
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := ApplyScriptFromPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(script, "restart knockd") || !strings.Contains(script, "$NFT\" -f") {
+		t.Fatal("knocking without a port move still needs knockd and the ruleset")
 	}
 }

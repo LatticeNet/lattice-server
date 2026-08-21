@@ -119,6 +119,23 @@ Standalone builds require `github.com/LatticeNet/lattice-sdk` to be available at
 the version in `go.mod`; during local multi-repo development, use the
 `lattice/go.work` workspace.
 
+## Verify
+
+What CI runs, in order (`.github/workflows/ci.yml`):
+
+```sh
+test -z "$(gofmt -l .)"
+sh scripts/check-docker-defaults.sh
+go vet ./...
+go test -race -cover -timeout 25m ./...
+gosec ./...
+govulncheck ./...
+```
+
+The `-timeout 25m` is not decorative. `internal/server` alone runs well past
+`go test`'s 10 minute default under `-race -cover`, so a plain `go test ./...`
+fails on a timeout that has nothing to do with the code under test.
+
 ## Docker
 
 The server image embeds `lattice-dashboard` and keeps runtime state under
@@ -201,21 +218,21 @@ Use the compose file and deployment guide in the umbrella repository:
   The first matching rule wins; `queue` selects approve-and-queue over
   approve-only, `daily_cap` bounds auto-approvals per UTC day (0 = uncapped),
   and automated decisions are audited as `approval.auto_approve` /
-  `approval.auto_skip`. Malformed JSON is logged and ignored — the server
+  `approval.auto_skip`. Malformed JSON is logged and ignored. The server
   starts fully manual.
 - **Passkeys (WebAuthn).** Operators can register passkeys (platform
   authenticators such as Apple Passwords / iCloud Keychain, or roaming security
   keys) and sign in with them. Verification uses
-  [`github.com/go-webauthn/webauthn`](https://github.com/go-webauthn/webauthn) —
+  [`github.com/go-webauthn/webauthn`](https://github.com/go-webauthn/webauthn),
   hand-rolling CBOR/COSE/attestation parsing is a security anti-pattern, and the
   server already carries vetted third-party auth deps (go-oidc). Attestation
   conveyance is `none`; discoverable (resident) keys and user verification are
   both **required** so the credential syncs and usernameless login works.
   - **Relying-party identity.** The RP ID and origin are derived from the
     server's external URL (`PublicURL` / `LATTICE_PUBLIC_URL`, the same value
-    that anchors OIDC — no new config surface): `RPID = host` (no scheme/port),
+    that anchors OIDC, so there is no new config surface): `RPID = host` (no scheme/port),
     `RPOrigin = scheme://host[:port]`. For `https://lattice.roobli.org` that is
-    `RPID=lattice.roobli.org`, origin `https://lattice.roobli.org` — **zero
+    `RPID=lattice.roobli.org`, origin `https://lattice.roobli.org`, so **zero
     Apple-specific configuration**. If `PublicURL` is unset, passkey endpoints
     fail closed with `503` (`passkeys are not configured (server public URL
     unset)`), exactly as the OIDC login handlers do. A prod RP ID will not match
@@ -231,7 +248,7 @@ Use the compose file and deployment guide in the umbrella repository:
     the account has TOTP enrolled (same `step_up_grant` verb used for secret
     reveals); rename does not.
   - **Login.** A finished login resolves the user from the authenticator's user
-    handle and issues the **same** session the password+TOTP path issues — a
+    handle and issues the **same** session the password+TOTP path issues: a
     user-verified passkey satisfies possession + inherence, so no separate second
     factor is required. Challenges are short-lived (≤5 min), single-use, and
     IP-bound like the TOTP challenge.
@@ -240,7 +257,7 @@ Use the compose file and deployment guide in the umbrella repository:
     from a previously non-zero counter is logged as a possible-clone warning;
     login is never hard-failed on the counter alone.
   - **Apple Passwords.** On Apple devices over HTTPS the passkey is saved to
-    Apple Passwords and synced through iCloud Keychain automatically — there is
+    Apple Passwords and synced through iCloud Keychain automatically. There is
     no Apple-specific server setup beyond serving the dashboard over HTTPS at the
     RP-ID host.
 - Container images embed the dashboard commit pinned in `dashboard.ref`;
@@ -328,8 +345,11 @@ Use the compose file and deployment guide in the umbrella repository:
   `LATTICE_AGENT_ALLOW_TERMINAL=1`. Session open/close events are audited, while
   live terminal I/O is kept in bounded process memory for the active session.
   The broker limits each node to four active sessions, expires unaccepted
-  sessions after 10 minutes, expires idle sessions after four hours, and prunes
-  closed transcripts after 30 minutes.
+  sessions after 10 minutes, expires idle sessions after 30 minutes, caps any
+  session at 8 hours from open regardless of activity, forgives a disconnected
+  viewer for 90 seconds before reaping, and prunes closed transcripts after 30
+  minutes. The 30 minute idle timer is a backstop: while a session is bridged
+  the agent enforces real idle itself and closes the session.
 - MachineProfile cost/vendor/renewal data is server-only and is never sent to
   agents. Console/detail links are encrypted at rest and list APIs return only
   `has_console_url` / `has_detail_url` booleans.
@@ -418,14 +438,24 @@ Use the compose file and deployment guide in the umbrella repository:
   stores. Control-plane task views expose only script hash/size; only the
   authenticated owning node receives the script through the agent lease API.
   Future proxy APIs must not serialize the secret-bearing model structs or
-  render artifacts directly. The public `/sub/{token}` route uses a
-  constant-time full scan over decrypted subscription tokens, rate-limits before
-  credential lookup, fails closed on duplicate tokens, records only token
-  SHA-256 hashes in audit metadata, and deliberately does not persist raw
-  subscription tokens as map keys. It currently supports `format=base64`
-  (default), `format=plain`, `format=sing-box` (`application/json` client
+  render artifacts directly. The public route is `/sub/{slug}/{token}`; both
+  segments are regex-validated and a single-segment URL is rejected outright. It
+  rate-limits before credential lookup, records only token SHA-256 hashes in
+  audit metadata, and deliberately does not persist raw subscription tokens as
+  map keys. Two things this paragraph used to claim are not true of the code and
+  should not be relied on: the token lookup is a plain `==` string comparison
+  that returns on first match, so it is neither constant-time nor a full scan
+  (`internal/store/subscription_share.go`, `SubscriptionShareByToken`), and
+  nothing detects duplicate tokens, so there is no fail-closed behaviour there.
+  When no `format` is given the share's own `DefaultFormat` is used rather than
+  a fixed default. The accepted values are `format=base64`, `format=plain`,
+  `format=sing-box` (`application/json` client
   outbounds), and `format=clash` / `format=clash-meta` (`text/yaml` Mihomo
-  `proxies:` list) for the supported VLESS+REALITY+TCP path. These bodies are
+  `proxies:` list) for the supported VLESS+REALITY+TCP path. `format` is not the
+  whole query surface: the route also accepts `target` (with `platform` as an
+  alias, resolved against a 14-client whitelist), `includeUnsupportedProxy`,
+  `prettyYaml`, and `noFlow`. Every one of them enters the cache key, which is
+  why the whitelist is bounded. These bodies are
   derived from a secret-free `VLESSRealityEndpoint` projection; Clash/Mihomo YAML
   is emitted by a fixed-shape writer with quoted scalars, so no YAML dependency
   is introduced. `ProxyInbound.Fingerprint` is accepted only as a constrained

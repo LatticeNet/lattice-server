@@ -207,6 +207,11 @@ type Server struct {
 	ddnsProvider func(model.DDNSProfile) (ddns.Provider, error)
 	// emitNotify dispatches an event notification; overridable in tests.
 	emitNotify func(title, body string)
+	// emitNotifyTyped is the same seam with the event type stated rather than
+	// guessed. classifyNotifyEvent below infers the type from the TITLE, so a
+	// reworded notification silently changes who receives it; new callers say
+	// what the event is and are unaffected by prose.
+	emitNotifyTyped func(eventType, title, body string)
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
 	// subscriptionDecoy shapes the answer every non-servable subscription request
@@ -492,6 +497,7 @@ func New(opts Options) (*Server, error) {
 		s.logger.Printf("approval auto-approve: %d rule(s) active", len(s.approvalAutoRules))
 	}
 	s.emitNotify = s.notifyEvent
+	s.emitNotifyTyped = s.notifyEventTyped
 	s.pluginRPC = plugin.NewRPCRegistry()
 	// In-core providers are wired once at boot and never unregistered, so without a
 	// lifecycle predicate a disabled plugin's backend kept serving — disable would only
@@ -4302,8 +4308,14 @@ func (s *Server) handleDeleteNotifyRule(w http.ResponseWriter, r *http.Request, 
 // notifyEvent fans a message out to every enabled notification channel,
 // asynchronously so it never blocks the triggering request.
 func (s *Server) notifyEvent(title, body string) {
+	s.notifyEventTyped(classifyNotifyEvent(title), title, body)
+}
+
+// notifyEventTyped is notifyEvent with the event type supplied instead of
+// inferred. Callers that know what happened should use it.
+func (s *Server) notifyEventTyped(eventType, title, body string) {
 	channels := s.store.EnabledNotifyChannels()
-	deliveries := s.planNotifyDeliveries(classifyNotifyEvent(title), title, body, channels, s.store.EnabledNotifyRules())
+	deliveries := s.planNotifyDeliveries(eventType, title, body, channels, s.store.EnabledNotifyRules())
 	if len(deliveries) == 0 {
 		return
 	}
@@ -4417,6 +4429,8 @@ func classifyNotifyEvent(title string) string {
 		return "monitor.recovered"
 	case strings.Contains(title, "Monitor down"):
 		return "monitor.down"
+	case strings.Contains(title, "SSH login after repeated failures"):
+		return EventSSHCompromiseSuspected
 	case strings.Contains(title, "SSH login"):
 		return "ssh.login"
 	case strings.HasPrefix(title, "Lattice proxy quota"):
@@ -4567,6 +4581,10 @@ func (s *Server) handleAgentEvent(w http.ResponseWriter, r *http.Request) {
 		Address string `json:"address"`
 		Method  string `json:"method"`
 		Message string `json:"message"`
+		// Pressure carries an aggregated authentication-pressure window. The
+		// agent bounds it; the server clamps it again on receipt, because the
+		// host reporting is the one this feature exists to watch.
+		Pressure *sshPressurePayload `json:"pressure"`
 	}
 	if !decodeAgentJSON(w, r, &req) {
 		return
@@ -4576,6 +4594,8 @@ func (s *Server) handleAgentEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.Kind {
+	case "ssh_pressure":
+		s.handleSSHPressure(req.NodeID, req.Pressure)
 	case "ssh_login":
 		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "ssh.login", Decision: "observe", Metadata: map[string]string{"user": req.User, "address": req.Address, "method": req.Method}})
 		s.emitNotify("🔐 SSH login", fmt.Sprintf("node %s: %s logged in from %s (%s)", req.NodeID, req.User, req.Address, req.Method))

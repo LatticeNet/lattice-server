@@ -338,7 +338,7 @@ func TestConfirmRefusesANodeThatIsNotArmed(t *testing.T) {
 	if !strings.Contains(script, "admitted=") {
 		t.Fatal("confirm must require evidence that the gate admitted something, not just an operator's word")
 	}
-	if !strings.Contains(script, RevertUnit+"-boot") {
+	if !strings.Contains(script, FirewallUnit) {
 		t.Fatal("confirm is where boot persistence is installed")
 	}
 }
@@ -693,7 +693,7 @@ func TestARebootInsideTheWindowLosesTheGateNotTheRevert(t *testing.T) {
 	// If arm also enabled boot persistence, a node restarted inside the window
 	// would come back with the gate rebuilt and no revert left: permanently
 	// gated, never confirmed, and unreachable if the sources were wrong.
-	if strings.Contains(arm, "enable "+RevertUnit+"-boot") {
+	if strings.Contains(arm, "enable "+FirewallUnit) {
 		t.Fatal("arm must not make the gate survive a reboot; that belongs to confirm")
 	}
 	if !strings.Contains(arm, "NOT yet persistent across reboot") {
@@ -705,7 +705,7 @@ func TestARebootInsideTheWindowLosesTheGateNotTheRevert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(confirm, "enable "+RevertUnit+"-boot") {
+	if !strings.Contains(confirm, "enable "+FirewallUnit) {
 		t.Fatal("confirm must install boot persistence")
 	}
 }
@@ -983,5 +983,140 @@ func TestAnExplicitPortListIsTakenAsStated(t *testing.T) {
 	bad.GatePorts = []int{70000}
 	if err := bad.Validate(); err == nil {
 		t.Fatal("an out-of-range port must be refused rather than rendered")
+	}
+}
+
+// The plan used to list the knock sequence and stop there. That is enough to
+// know which ports to hit and not enough to hit them: the obvious command,
+// `nc -u -z`, sends an empty datagram, which advances knockd to stage 1 and
+// then never again, with no error on either side. A rollout was lost to it.
+// These assertions exist so the document cannot regress to listing ports alone.
+func TestKnockPlanTellsTheOperatorHowToActuallySendIt(t *testing.T) {
+	p := Profile{
+		NodeID: "n1", KeepLegacyPort: true, Hardening: DefaultHardening(),
+		ConfirmWindowSec:  900,
+		Address:           "203.0.113.9",
+		ExistingSSHPorts:  []int{22},
+		OutOfBandFallback: true,
+		Knock:             &KnockPolicy{Ports: []int{31537, 27292, 29094}, SeqTimeoutSec: 15, OpenFor: "12h"},
+	}
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(plan, "payload") {
+		t.Fatal("the plan must state that each datagram carries a payload; without it the obvious command silently does nothing")
+	}
+	if !strings.Contains(plan, "printf k | nc -u -w1") {
+		t.Fatal("the plan must give a command that actually sends a datagram")
+	}
+	// Naming the broken form is the point: an operator who already typed it
+	// needs to recognise it here, not merely be shown a different one.
+	if !strings.Contains(plan, "nc -u -z") {
+		t.Fatal("the plan must name the command that looks right and does nothing")
+	}
+	for _, port := range []string{"31537", "27292", "29094"} {
+		if !strings.Contains(plan, port) {
+			t.Fatalf("knock command is missing port %s", port)
+		}
+	}
+	if i, j, k := strings.Index(plan, "31537"), strings.Index(plan, "27292"), strings.Index(plan, "29094"); !(i < j && j < k) {
+		t.Fatal("the ports must appear in sequence order; a knock sent out of order is a knock that fails")
+	}
+	if !strings.Contains(plan, "203.0.113.9") {
+		t.Fatal("the reported address should make the command copyable")
+	}
+	if !strings.Contains(plan, "same address") {
+		t.Fatal("the plan must warn that the knock and the login share a source address")
+	}
+}
+
+// The address reaches the document from the node's own report, and the document
+// is what a human reads to decide whether to approve. Anything that is not an
+// IP literal becomes a placeholder rather than text a peer chose.
+func TestKnockPlanRefusesAnAddressThatIsNotAnIP(t *testing.T) {
+	base := Profile{
+		NodeID: "n1", KeepLegacyPort: true, Hardening: DefaultHardening(),
+		ConfirmWindowSec: 900, ExistingSSHPorts: []int{22}, OutOfBandFallback: true,
+		Knock: &KnockPolicy{Ports: []int{20001, 20002, 20003}, SeqTimeoutSec: 15, OpenFor: "12h"},
+	}
+	for _, bad := range []string{
+		"evil.example.com",
+		"1.2.3.4; rm -rf /",
+		"$(id)",
+		"`id`",
+		"",
+	} {
+		p := base
+		p.Address = bad
+		plan, err := RenderArmPlan(p, "")
+		if err != nil {
+			t.Fatalf("address %q: %v", bad, err)
+		}
+		if !strings.Contains(plan, "<node-address>") {
+			t.Fatalf("address %q should have been rejected into a placeholder", bad)
+		}
+		if bad != "" && strings.Contains(plan, bad) {
+			t.Fatalf("address %q reached the document verbatim", bad)
+		}
+	}
+}
+
+// A hardening-only profile installs no gate, so a knock section would describe
+// a door that is not there.
+func TestPlanWithoutKnockHasNoKnockInstructions(t *testing.T) {
+	p := Profile{NodeID: "n1", KeepLegacyPort: true, Hardening: DefaultHardening(), ConfirmWindowSec: 900}
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plan, "How to knock") {
+		t.Fatal("a profile with no knock policy must not tell the operator to knock")
+	}
+}
+
+// The boot unit was called lattice-sshguard-revert-boot while doing the exact
+// opposite of reverting. Renaming it is only half the fix: nodes confirmed
+// under the old name still have it enabled, so both the installer and the
+// revert path have to account for it or a re-armed node carries two units that
+// load the same ruleset and disagree about what they are for.
+func TestBootUnitIsNamedForWhatItDoesAndClearsTheOldName(t *testing.T) {
+	if strings.Contains(FirewallUnit, "revert") {
+		t.Fatalf("the unit that restores the gate must not be named %q", FirewallUnit)
+	}
+
+	confirmPlan, _ := RenderConfirmPlan("n1", "")
+	confirm, err := ApplyScriptFromPlan(confirmPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(confirm, "enable "+FirewallUnit) {
+		t.Fatal("confirm must enable the boot unit under its new name")
+	}
+	if !strings.Contains(confirm, "rm -f /etc/systemd/system/"+LegacyBootUnit+".service") {
+		t.Fatal("confirm must remove the pre-rename unit, or a node ends up with both")
+	}
+
+	p := Profile{
+		NodeID: "n1", KeepLegacyPort: true, Hardening: DefaultHardening(),
+		ConfirmWindowSec: 900, ExistingSSHPorts: []int{22}, OutOfBandFallback: true,
+		Knock: &KnockPolicy{Ports: []int{20001, 20002, 20003}, SeqTimeoutSec: 15, OpenFor: "12h"},
+	}
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	arm, err := ApplyScriptFromPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The revert has to disable both, including on a node that predates the
+	// rename: leaving the legacy unit enabled means the gate it just tore down
+	// comes back at the next boot.
+	for _, unit := range []string{FirewallUnit, LegacyBootUnit} {
+		if !strings.Contains(arm, "disable "+unit) {
+			t.Fatalf("revert must disable %s", unit)
+		}
 	}
 }

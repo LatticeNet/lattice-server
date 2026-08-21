@@ -41,7 +41,23 @@ const (
 	KnockNFTPath = "/etc/lattice/sshguard/knock.nft"
 	KnockdConf   = "/etc/knockd.conf"
 	StateDir     = "/etc/lattice/sshguard"
-	RevertUnit   = "lattice-sshguard-revert"
+	// RevertUnit is the transient timer that undoes an unconfirmed change. It
+	// really does revert, so the name is accurate.
+	RevertUnit = "lattice-sshguard-revert"
+
+	// FirewallUnit restores the gate at boot after a confirm. It is a separate
+	// name from RevertUnit because it does the opposite thing: an operator
+	// reading `systemctl list-unit-files` on a confirmed node should not find
+	// something called "revert" enabled and have to read its ExecStart to learn
+	// that it actually reinstalls the firewall.
+	FirewallUnit = "lattice-sshguard-firewall"
+
+	// LegacyBootUnit is the name FirewallUnit shipped under before it was
+	// separated from RevertUnit. Nodes confirmed under the old name still have
+	// it enabled, so every path that installs or removes the boot unit also
+	// removes this one; otherwise a re-armed node ends up with two units
+	// loading the same ruleset and only one of them documented.
+	LegacyBootUnit = "lattice-sshguard-revert-boot"
 
 	// KnockHookPriority puts the knock chain ahead of the ordinary filter
 	// chains so its verdict is reached first. It does NOT let an accepted
@@ -175,6 +191,13 @@ type Profile struct {
 
 	// MgmtSources are CIDRs that reach SSH without knocking, forever.
 	MgmtSources []string
+
+	// Address is the node's public address, used only to print a knock command
+	// an operator can copy. It is reported by the agent, so it is validated as
+	// an IP literal before it reaches the document and dropped if it is not
+	// one: a plan is read by a human deciding whether to approve, and text a
+	// peer chose has no business shaping it.
+	Address string
 
 	// OutOfBandFallback says the operator's fallback is a path that does not
 	// use SSH at all, which on this fleet means the node's Lattice terminal.

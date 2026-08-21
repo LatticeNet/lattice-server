@@ -280,6 +280,9 @@ func (s *Server) handleSSHGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// Only so the plan can print a knock command that is copyable. The value is
+	// agent-reported, and the renderer accepts it only if it parses as an IP.
+	profile.Address = node.PublicIP
 	findings := sshguard.LintProfile(profile, s.sshGuardNodeReality(req.NodeID))
 	if sshguard.Blocking(findings) && !req.AcceptFindings {
 		writeJSON(w, http.StatusConflict, map[string]any{

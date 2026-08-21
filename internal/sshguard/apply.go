@@ -316,8 +316,13 @@ func revertScriptHeredoc(touchesKnockd, touchesFirewall bool) string {
 		s.WriteString("fi\n")
 	}
 	if touchesFirewall {
-		fmt.Fprintf(&s, "\"$SYSTEMCTL\" disable %s-boot 2>/dev/null\n", RevertUnit)
-		fmt.Fprintf(&s, "rm -f /etc/systemd/system/%s-boot.service\n", RevertUnit)
+		// Both names. A node confirmed before the rename still carries the
+		// legacy unit, and a revert that leaves it enabled would reinstate the
+		// gate at the next boot after having just torn it down.
+		for _, unit := range []string{FirewallUnit, LegacyBootUnit} {
+			fmt.Fprintf(&s, "\"$SYSTEMCTL\" disable %s 2>/dev/null\n", unit)
+			fmt.Fprintf(&s, "rm -f /etc/systemd/system/%s.service\n", unit)
+		}
 	}
 	s.WriteString("\"$SYSTEMCTL\" daemon-reload 2>/dev/null\n")
 	s.WriteString("echo 'lattice sshguard: revert complete' >&2\n")
@@ -357,9 +362,14 @@ func bootPersistenceSnippet(touchesKnockd bool) string {
 	s.WriteString("# Make the gate survive a reboot. The allow set is intentionally not\n")
 	s.WriteString("# persisted: after a reboot everyone knocks again, which is the right\n")
 	s.WriteString("# default for a membership that already expires on a timer.\n")
-	fmt.Fprintf(&s, "cat > /etc/systemd/system/%s-boot.service <<'LATTICE_SSHGUARD_UNIT'\n", RevertUnit)
+	// Remove the pre-rename unit first. Leaving it enabled alongside the new
+	// one means two units loading the same ruleset, and the one an operator
+	// finds first is called "revert" while doing the opposite.
+	fmt.Fprintf(&s, "\"$SYSTEMCTL\" disable %s 2>/dev/null || true\n", LegacyBootUnit)
+	fmt.Fprintf(&s, "rm -f /etc/systemd/system/%s.service\n", LegacyBootUnit)
+	fmt.Fprintf(&s, "cat > /etc/systemd/system/%s.service <<'LATTICE_SSHGUARD_UNIT'\n", FirewallUnit)
 	s.WriteString("[Unit]\n")
-	s.WriteString("Description=Lattice SSH Guard firewall\n")
+	s.WriteString("Description=Lattice SSH Guard firewall (restores the knock gate at boot)\n")
 	if touchesKnockd {
 		// The gate must exist before the thing that opens it starts, or knockd
 		// spends its first moments adding elements to a set that is not there.
@@ -375,7 +385,7 @@ func bootPersistenceSnippet(touchesKnockd bool) string {
 	s.WriteString("WantedBy=multi-user.target\n")
 	s.WriteString("LATTICE_SSHGUARD_UNIT\n")
 	s.WriteString("\"$SYSTEMCTL\" daemon-reload\n")
-	fmt.Fprintf(&s, "\"$SYSTEMCTL\" enable %s-boot >/dev/null 2>&1 || true\n", RevertUnit)
+	fmt.Fprintf(&s, "\"$SYSTEMCTL\" enable %s >/dev/null 2>&1 || true\n", FirewallUnit)
 	return s.String()
 }
 

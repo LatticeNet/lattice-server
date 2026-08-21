@@ -2,6 +2,8 @@ package sshguard
 
 import (
 	"fmt"
+	"net/netip"
+	"strconv"
 	"strings"
 )
 
@@ -114,6 +116,10 @@ func RenderArmPlan(p Profile, nodeName string) (string, error) {
 			return "", fmt.Errorf("mgmt_source %q: %w", src, nErr)
 		}
 		fmt.Fprintf(&b, "- %s\n", norm)
+	}
+
+	if p.Knock != nil {
+		b.WriteString(knockInstructions(p))
 	}
 
 	fmt.Fprintf(&b, "\n## sshd drop-in: %s\n\n", DropInPath)
@@ -332,4 +338,69 @@ func parseInts(value string) ([]int, error) {
 		out = append(out, n)
 	}
 	return out, nil
+}
+
+// knockInstructions is the section that was missing, and its absence cost a
+// rollout. The document listed the sequence and nothing else, so the obvious
+// way to send it is `nc -u -z` -- which sends an empty datagram that advances
+// knockd to stage 1 and then silently never advances again. The failure has no
+// error anywhere: the knock "succeeds", the port stays shut, and the only
+// evidence is a repeated "Stage 1" line in the node's own knockd log, which is
+// behind the port that will not open. Stating the payload requirement here is
+// the difference between a two-minute step and an hour of misattribution.
+func knockInstructions(p Profile) string {
+	var b strings.Builder
+	b.WriteString("\n## How to knock\n\n")
+	b.WriteString("The sequence is UDP and each datagram must carry a payload. An empty\n")
+	b.WriteString("datagram advances knockd to stage 1 and no further, with no error on\n")
+	b.WriteString("either side, so `nc -u -z` and anything else that sends nothing will\n")
+	b.WriteString("look like it worked and leave the port shut.\n\n")
+
+	addr := p.knockDisplayAddress()
+	ports := make([]string, 0, len(p.Knock.Ports))
+	for _, port := range p.Knock.Ports {
+		ports = append(ports, strconv.Itoa(port))
+	}
+	sshPort := p.loginPort()
+
+	b.WriteString("```sh\n")
+	fmt.Fprintf(&b, "for p in %s; do printf k | nc -u -w1 %s $p; sleep 1; done\n",
+		strings.Join(ports, " "), addr)
+	fmt.Fprintf(&b, "ssh -p %d root@%s\n", sshPort, addr)
+	b.WriteString("```\n\n")
+
+	b.WriteString("The knock and the login must leave from the same address. The gate opens\n")
+	b.WriteString("for the source the knock arrived from, so sending one through a proxy and\n")
+	b.WriteString("the other direct opens a door you are not standing at.\n")
+	fmt.Fprintf(&b, "Membership lasts %s and then expires on its own.\n", p.Knock.OpenFor)
+	if p.Knock.SeqTimeoutSec > 0 {
+		fmt.Fprintf(&b, "The whole sequence must arrive within %d seconds.\n", p.Knock.SeqTimeoutSec)
+	}
+	return b.String()
+}
+
+// knockDisplayAddress returns an address safe to paste into the document. The
+// value is reported by the agent, so it is accepted only if it parses as an IP
+// literal; anything else becomes a placeholder rather than reaching a document
+// a human reads to decide whether to approve.
+func (p Profile) knockDisplayAddress() string {
+	if a, err := netip.ParseAddr(strings.TrimSpace(p.Address)); err == nil {
+		if a.Is6() {
+			return "[" + a.String() + "]"
+		}
+		return a.String()
+	}
+	return "<node-address>"
+}
+
+// loginPort is the port the operator should actually connect to after knocking:
+// the new port when the profile moves sshd, otherwise the lowest gated port.
+func (p Profile) loginPort() int {
+	if p.SSHPort != 0 {
+		return p.SSHPort
+	}
+	if gated := p.GatedPorts(); len(gated) > 0 {
+		return gated[0]
+	}
+	return 22
 }

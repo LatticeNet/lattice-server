@@ -3,6 +3,8 @@ package server
 import (
 	"errors"
 	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -58,6 +60,7 @@ func (s *Server) sshGuardNodeReality(nodeID string) sshguard.NodeReality {
 				out.ListeningTCPPorts = append(out.ListeningTCPPorts, listener.Port)
 			}
 		}
+		out.SSHPorts = sshListeningPorts(snapshot)
 	}
 	binding, ok := s.store.NodeGuardBinding(nodeID)
 	if !ok || binding.NodeID == "" {
@@ -126,6 +129,21 @@ type sshGuardPlanRequest struct {
 	// rather than letting the operator edit the lint away.
 	AcceptFindings bool `json:"accept_findings"`
 
+	// Advanced. Everything above covers an ordinary host; these exist so an
+	// unusual one can be described instead of the product being taught about
+	// it. All of them are omissible and all of them override rather than merge.
+	//
+	// GatePorts replaces the ports the gate covers, which are otherwise derived
+	// from what sshd reports. KnockPorts replaces the drawn sequence, which is
+	// otherwise crypto/rand: supply one only if something outside Lattice has
+	// to agree on it, because a chosen sequence is only as secret as wherever
+	// it was chosen. KnockOpenForSec and KnockSeqTimeoutSec tune the two
+	// timings.
+	GatePorts          []int  `json:"gate_ports"`
+	KnockPorts         []int  `json:"knock_ports"`
+	KnockOpenFor       string `json:"knock_open_for"`
+	KnockSeqTimeoutSec int    `json:"knock_seq_timeout_sec"`
+
 	// Hardening overrides. Zero values mean "use the verified default", so a
 	// caller that sends only node_id and ssh_port gets the configuration that
 	// was tested on the reference host.
@@ -135,7 +153,41 @@ type sshGuardPlanRequest struct {
 	PermitRootLogin   string `json:"permit_root_login"`
 }
 
-func (req sshGuardPlanRequest) profile() (sshguard.Profile, error) {
+// sshListeningPorts picks out the ports a shell daemon is actually bound to.
+//
+// It reuses the daemon names netguard's lockout lint already uses, and for the
+// same reason: assuming tcp/22 is an assumption, and measuring this fleet found
+// it wrong on three machines of thirteen, where sshd runs on 3434. Gating 22
+// there protects nothing and still reports success. A loopback binding is
+// skipped because gating it would guard nothing reachable.
+func sshListeningPorts(reality *model.GuardNodeReality) []int {
+	if reality == nil {
+		return nil
+	}
+	seen := map[int]bool{}
+	ports := []int{}
+	for _, l := range reality.Listeners {
+		if l.Protocol != "tcp" || l.Port <= 0 {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(l.Process))
+		if !strings.HasPrefix(name, "sshd") && !strings.HasPrefix(name, "dropbear") {
+			continue
+		}
+		if strings.HasPrefix(l.Address, "127.") || l.Address == "::1" {
+			continue
+		}
+		if seen[l.Port] {
+			continue
+		}
+		seen[l.Port] = true
+		ports = append(ports, l.Port)
+	}
+	sort.Ints(ports)
+	return ports
+}
+
+func (req sshGuardPlanRequest) profile(existingSSHPorts []int) (sshguard.Profile, error) {
 	hardening := sshguard.DefaultHardening()
 	if req.LoginGraceTimeSec != 0 {
 		hardening.LoginGraceTimeSec = req.LoginGraceTimeSec
@@ -155,6 +207,8 @@ func (req sshGuardPlanRequest) profile() (sshguard.Profile, error) {
 	}
 	profile := sshguard.Profile{
 		NodeID:            req.NodeID,
+		GatePorts:         req.GatePorts,
+		ExistingSSHPorts:  existingSSHPorts,
 		SSHPort:           req.SSHPort,
 		KeepLegacyPort:    keepLegacy,
 		Hardening:         hardening,
@@ -167,11 +221,26 @@ func (req sshGuardPlanRequest) profile() (sshguard.Profile, error) {
 		enableKnock = *req.EnableKnock
 	}
 	if enableKnock {
-		ports, err := sshguard.NewKnockSequence()
-		if err != nil {
-			return sshguard.Profile{}, err
+		ports := req.KnockPorts
+		if len(ports) == 0 {
+			// Drawn, not derived. A sequence derived from the node id is only
+			// as secret as the derivation, and the derivation lives in a
+			// repository.
+			drawn, err := sshguard.NewKnockSequence()
+			if err != nil {
+				return sshguard.Profile{}, err
+			}
+			ports = drawn
 		}
-		profile.Knock = &sshguard.KnockPolicy{Ports: ports, SeqTimeoutSec: 15, OpenFor: "12h"}
+		seqTimeout := req.KnockSeqTimeoutSec
+		if seqTimeout == 0 {
+			seqTimeout = 15
+		}
+		openFor := strings.TrimSpace(req.KnockOpenFor)
+		if openFor == "" {
+			openFor = "12h"
+		}
+		profile.Knock = &sshguard.KnockPolicy{Ports: ports, SeqTimeoutSec: seqTimeout, OpenFor: openFor}
 	}
 	if profile.ConfirmWindowSec == 0 {
 		profile.ConfirmWindowSec = sshguard.DefaultConfirmWindowSec
@@ -206,7 +275,7 @@ func (s *Server) handleSSHGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusNotFound, errors.New("node not found"))
 		return
 	}
-	profile, err := req.profile()
+	profile, err := req.profile(s.sshGuardNodeReality(req.NodeID).SSHPorts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

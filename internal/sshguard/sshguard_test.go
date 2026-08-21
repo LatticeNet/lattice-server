@@ -900,3 +900,88 @@ func TestKnockCanGateTheExistingPortWithoutMovingIt(t *testing.T) {
 		t.Fatal("knocking without a port move still needs knockd and the ruleset")
 	}
 }
+
+// Assuming sshd is on 22 was wrong on this fleet. Measuring it found three
+// machines running sshd on 3434, where a profile that gates 22 installs a door
+// nobody uses, leaves the real one open, and reports success. Same failure as
+// writing a config and not checking it took effect, one layer up.
+func TestTheGateCoversThePortSSHDIsActuallyOn(t *testing.T) {
+	p := hkProfile()
+	p.SSHPort = 0
+	p.ExistingSSHPorts = []int{3434}
+	got := p.GatedPorts()
+	if len(got) != 1 || got[0] != 3434 {
+		t.Fatalf("the gate must cover the port sshd is on, got %v", got)
+	}
+	ruleset, err := p.RenderKnockRuleset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ruleset, "tcp dport 3434 counter drop") {
+		t.Fatal("the real SSH port must be gated")
+	}
+	if strings.Contains(ruleset, "dport 22") {
+		t.Fatal("gating a port nothing listens on is noise that reads as protection")
+	}
+
+	// A node that reports several is gated on all of them: an ungated listener
+	// makes the rest cosmetic.
+	p.ExistingSSHPorts = []int{22, 3434}
+	if got := p.GatedPorts(); len(got) != 2 || got[0] != 22 || got[1] != 3434 {
+		t.Fatalf("every listening port must be gated, got %v", got)
+	}
+
+	// Moving the port: the old one is gated only while sshd is kept there.
+	moved := hkProfile()
+	moved.ExistingSSHPorts = []int{22}
+	moved.KeepLegacyPort = false
+	if got := moved.GatedPorts(); len(got) != 1 || got[0] != 58394 {
+		t.Fatalf("a port sshd is leaving must not be gated, got %v", got)
+	}
+	moved.KeepLegacyPort = true
+	if got := moved.GatedPorts(); len(got) != 2 {
+		t.Fatalf("a port sshd keeps must stay gated, got %v", got)
+	}
+
+	// No report and no request falls back to 22, which the lint flags as a
+	// guess rather than presenting as fact.
+	bare := Profile{NodeID: "n1", Hardening: DefaultHardening(), MgmtSources: []string{"203.0.113.5"}}
+	if got := bare.GatedPorts(); len(got) != 1 || got[0] != 22 {
+		t.Fatalf("the fallback is 22, got %v", got)
+	}
+}
+
+// The escape hatch. The ordinary path derives the gate from what sshd reports,
+// which is right for a normal host; this is for the ones that are not, so the
+// product does not have to learn about each of them.
+func TestAnExplicitPortListIsTakenAsStated(t *testing.T) {
+	p := hkProfile()
+	p.SSHPort = 0
+	p.ExistingSSHPorts = []int{22, 3434}
+	p.GatePorts = []int{2222}
+	got := p.GatePorts
+	if len(got) != 1 || got[0] != 2222 {
+		t.Fatalf("an explicit list must be taken as stated, got %v", p.GatedPorts())
+	}
+	if gated := p.GatedPorts(); len(gated) != 1 || gated[0] != 2222 {
+		t.Fatalf("the derivation must be skipped entirely, including its fallback, got %v", gated)
+	}
+	ruleset, err := p.RenderKnockRuleset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ruleset, "tcp dport 2222 counter drop") {
+		t.Fatal("the stated port must be gated")
+	}
+	for _, unwanted := range []string{"dport 22 ", "dport 3434"} {
+		if strings.Contains(ruleset, unwanted) {
+			t.Fatalf("a derived port must not survive an explicit list: %q", unwanted)
+		}
+	}
+
+	bad := hkProfile()
+	bad.GatePorts = []int{70000}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("an out-of-range port must be refused rather than rendered")
+	}
+}

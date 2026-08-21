@@ -47,6 +47,12 @@ const (
 	// that does not exist is worse than an admitted absence, because it is the
 	// reason the profile was allowed to gate SSH in the first place.
 	FindingFallbackUnavailable = "sshguard_fallback_unavailable"
+
+	// FindingAssumedSSHPort fires when the profile had to fall back to tcp/22
+	// because the node never reported where sshd listens. Three machines in
+	// this fleet run it on 3434, so the assumption is not safe to make
+	// silently: gating the wrong port protects nothing and looks like success.
+	FindingAssumedSSHPort = "sshguard_assumed_ssh_port"
 )
 
 type Severity string
@@ -85,6 +91,11 @@ type NodeReality struct {
 	// with an accept policy cannot override this table's accepts, so the
 	// override check does not apply.
 	GuardPolicyDrop bool
+
+	// SSHPorts are the ports a shell daemon is observed bound to. The caller
+	// copies these into the profile so the gate covers where sshd is rather
+	// than where it is assumed to be.
+	SSHPorts []int
 
 	// TerminalAvailable is true when this node can currently give an operator a
 	// shell without SSH: it is online and its agent reports the terminal
@@ -138,6 +149,13 @@ func LintProfile(p Profile, r NodeReality) []Finding {
 				})
 			}
 		}
+	}
+
+	if p.SSHPort == 0 && len(p.ExistingSSHPorts) == 0 {
+		findings = append(findings, Finding{
+			Code: FindingAssumedSSHPort, Severity: SeverityWarn,
+			Message: "this node has not reported where sshd listens, so the gate falls back to tcp/22. Three machines in this fleet run sshd on 3434, where gating 22 protects nothing and still reports success. Check the port before confirming.",
+		})
 	}
 
 	if p.OutOfBandFallback && !r.TerminalAvailable {

@@ -155,6 +155,24 @@ type Profile struct {
 	// ports to MgmtSources.
 	Knock *KnockPolicy
 
+	// GatePorts overrides what the gate covers.
+	//
+	// The escape hatch, and deliberately a small one. The ordinary path derives
+	// the ports from what sshd reports, which is right for a normal host; this
+	// exists for the ones that are not, without teaching the product about each
+	// of them. Set it and the derivation is skipped entirely, including the
+	// fallback to 22.
+	GatePorts []int
+
+	// ExistingSSHPorts are the ports sshd is observed listening on, from the
+	// node's own report. The gate covers these rather than a guess: three
+	// machines in this fleet run sshd on 3434, and a profile that gates 22 on
+	// one of them protects nothing while reporting success.
+	//
+	// Empty means the node has not reported, and the profile falls back to 22
+	// with a warning rather than silently gating the wrong thing.
+	ExistingSSHPorts []int
+
 	// MgmtSources are CIDRs that reach SSH without knocking, forever.
 	MgmtSources []string
 
@@ -219,6 +237,11 @@ func (p Profile) Validate() error {
 			return fmt.Errorf("mgmt_source %q is listed twice", raw)
 		}
 		seen[norm] = true
+	}
+	for _, port := range p.GatePorts {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("gate_port %d is out of range", port)
+		}
 	}
 	if p.Knock != nil {
 		if len(p.MgmtSources) == 0 && !p.OutOfBandFallback {

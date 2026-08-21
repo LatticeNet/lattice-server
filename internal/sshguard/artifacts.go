@@ -19,15 +19,58 @@ const (
 )
 
 // GatedPorts is the set of TCP ports the knock table guards, in rule order.
-// Port 22 is included whenever it stays open, because leaving it ungated would
-// make every other control cosmetic: the brute force simply keeps using 22.
+//
+// ExistingSSHPorts is where the ports sshd is ACTUALLY on come from, and it
+// matters more than it looks. Assuming 22 was wrong on this fleet: measuring it
+// found three machines whose sshd listens on 3434, where gating 22 installs a
+// door nobody uses and leaves the real one open while reporting success. That
+// is the same failure as writing a drop-in and not checking it took effect,
+// one layer up.
+//
+// The ports sshd is on are always gated, whether or not the profile moves it,
+// because an ungated listening port makes every other control cosmetic: the
+// brute force simply keeps using whatever is open.
 func (p Profile) GatedPorts() []int {
-	ports := make([]int, 0, 2)
-	if p.SSHPort != 0 {
-		ports = append(ports, p.SSHPort)
+	seen := map[int]bool{}
+	ports := []int{}
+	add := func(port int) {
+		if port <= 0 || port > 65535 || seen[port] {
+			return
+		}
+		seen[port] = true
+		ports = append(ports, port)
 	}
-	if p.KeepLegacyPort || p.SSHPort == 0 {
-		ports = append(ports, 22)
+	if len(p.GatePorts) > 0 {
+		// An explicit list is taken as stated, including its omissions. The
+		// operator who sets it has looked at the host; the derivation below has
+		// only looked at a report.
+		for _, port := range p.GatePorts {
+			add(port)
+		}
+		sort.Ints(ports)
+		return ports
+	}
+	if p.SSHPort != 0 {
+		add(p.SSHPort)
+		if p.KeepLegacyPort {
+			// The drop-in keeps sshd on 22, so 22 is a live listening port and
+			// must be gated whether or not the node reported it.
+			add(22)
+		}
+	}
+	for _, port := range p.ExistingSSHPorts {
+		// A port the profile moves away from is only gated when the profile
+		// keeps sshd there; otherwise nothing will be listening and gating it
+		// is noise.
+		if p.SSHPort != 0 && port == 22 && !p.KeepLegacyPort {
+			continue
+		}
+		add(port)
+	}
+	if len(ports) == 0 {
+		// Nothing reported and no port requested. 22 is the right guess, and
+		// the lint says out loud that it is a guess.
+		add(22)
 	}
 	sort.Ints(ports)
 	return ports

@@ -5308,6 +5308,20 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case "cftunnel":
 		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
+	case sshGuardPlugin:
+		// An SSH Guard plan carries the node's knock sequence in plaintext,
+		// inside the knockd block a reviewer is meant to read. The sequence is
+		// a credential: it is drawn from crypto/rand precisely so that knowing
+		// a node id tells you nothing about it.
+		//
+		// Authoring one requires sshguard:admin and deciding one requires it
+		// too, so reading one must require the domain as well. Without this it
+		// fell to the default below and bare network:plan on the node was
+		// enough to read the secret, which is the same asymmetry that let
+		// network:apply dispatch a netguard change it could not write, except
+		// that this one leaks rather than acts.
+		return rbac.Allows(p.Principal, "sshguard:read", approval.NodeID) &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	default:
 		return rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	}
@@ -5329,6 +5343,17 @@ func approvalApplyTaskTimeoutSec(plugin string) int {
 		// The agent-side clamp is fixed separately, but this has to hold the
 		// line regardless: a node cannot receive that fix until it completes
 		// an update, which is the thing the bug prevents.
+		return 600
+	case sshGuardPlugin:
+		// An arm may install knockd, which means an apt-get update plus an
+		// install on whatever uplink the node has, and it waits up to ten
+		// seconds for sshd to bind the new port before it will gate anything.
+		// The default of 30s cannot cover that: the hardening-only profiles
+		// fit inside it only because they do neither.
+		//
+		// 600 and not more, for the reason spelled out above: the agent treats
+		// a timeout over ten minutes as out-of-range and falls back to 30s
+		// rather than clamping, so asking for more would ask for less.
 		return 600
 	case "nft", "nftpolicy", "selfdns":
 		return networkApplyTaskTimeoutSec

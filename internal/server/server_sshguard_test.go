@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -276,5 +277,72 @@ func TestKnockOnOutOfBandFallbackIsCheckedAgainstTheNode(t *testing.T) {
 	}
 	if _, err := srv.store.Node("node-a"); err == false {
 		t.Fatal("node vanished")
+	}
+}
+
+// The knock sequence is a credential and it lives in the plan text, so reading
+// the approval must require the domain the way authoring and deciding do.
+// Without this, bare network:plan on the node was enough to read the secret.
+func TestReadingAnSSHGuardPlanRequiresTheDomainScope(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+
+	plan, err := sshguard.RenderArmPlan(sshguard.Profile{
+		NodeID: "node-a", SSHPort: 58394, KeepLegacyPort: true,
+		Hardening: sshguard.DefaultHardening(), MgmtSources: []string{"203.0.113.5"},
+		Knock:            &sshguard.KnockPolicy{Ports: []int{23853, 36932, 24556}, SeqTimeoutSec: 15, OpenFor: "12h"},
+		ConfirmWindowSec: 900,
+	}, "Node A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plan, "23853:udp") {
+		t.Fatal("this test is only meaningful if the plan really carries the sequence")
+	}
+	if err := st.UpsertApproval(model.Approval{
+		ID: "approval_sshguard_secret", NodeID: "node-a",
+		Plugin: sshGuardPlugin, Action: sshGuardArmAction,
+		Plan: plan, Status: model.ApprovalPending, ActorID: "admin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	planOnly := createPAT(t, handler, cookies, csrf, []string{"network:plan"}, []string{"node-a"})
+	resp := doBearerJSON(t, handler, http.MethodGet, "/api/network/approvals", "", planOnly)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "23853") {
+		t.Fatal("bare network:plan must not be able to read a node's knock sequence")
+	}
+
+	// The domain scope sees it, and sshguard:admin implies sshguard:read so an
+	// operator who can author a plan can list the approval they just created.
+	for _, scopes := range [][]string{
+		{"network:plan", "sshguard:read"},
+		{"network:plan", "sshguard:admin"},
+	} {
+		token := createPAT(t, handler, cookies, csrf, scopes, []string{"node-a"})
+		ok := doBearerJSON(t, handler, http.MethodGet, "/api/network/approvals", "", token)
+		raw, _ := io.ReadAll(ok.Body)
+		ok.Body.Close()
+		if !strings.Contains(string(raw), "23853") {
+			t.Fatalf("%v must be able to read the plan it is entitled to", scopes)
+		}
+	}
+}
+
+// An arm may install knockd, which is an apt-get on the node's own uplink, and
+// it waits for sshd to bind the new port before gating anything. The 30 second
+// default cannot cover that.
+func TestSSHGuardApplyGetsATimeoutThatCoversInstallingKnockd(t *testing.T) {
+	got := approvalApplyTaskTimeoutSec(sshGuardPlugin)
+	if got <= networkApplyTaskTimeoutSec {
+		t.Fatalf("an apply that may run apt needs more than the network default, got %ds", got)
+	}
+	// The agent treats a timeout over ten minutes as out of range and falls
+	// back to 30 seconds rather than clamping, so asking for more asks for less.
+	if got > 600 {
+		t.Fatalf("over ten minutes silently becomes 30 seconds on the agent, got %ds", got)
 	}
 }

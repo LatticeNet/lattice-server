@@ -57,6 +57,11 @@ func directlyAllows(scopes []string, required string) bool {
 // checks. Sub-store scopes deliberately do not grant proxy or vpn-core access.
 func compatibleScopes(required string) []string {
 	switch required {
+	case "sshguard:read":
+		// Administering the domain implies reading it. Without this a holder of
+		// sshguard:admin could author and decide an SSH Guard plan and not be
+		// able to list the approval they just created.
+		return []string{"sshguard:admin"}
 	case "proxy:read":
 		return []string{"vpncore:read"}
 	case "proxy:admin":

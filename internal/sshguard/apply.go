@@ -139,6 +139,7 @@ func armScript(art Artifacts) (string, error) {
 	b.WriteString("# the staged rollout depends on.\n")
 	b.WriteString("\"$SYSTEMCTL\" reload sshd 2>/dev/null || \"$SYSTEMCTL\" reload ssh\n")
 	b.WriteString("echo 'lattice sshguard: sshd reloaded'\n\n")
+	b.WriteString(effectiveConfigCheck(art.SSHDDropIn))
 
 	if art.SSHPort != 0 {
 		b.WriteString("# Step 2: prove the new port is actually listening before gating anything.\n")
@@ -420,4 +421,93 @@ func indentLines(snippet, prefix string) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// effectiveConfigCheck compares what the drop-in asked for against what sshd
+// actually resolved, and fails the apply on any disagreement.
+//
+// Writing a drop-in does not mean it takes effect. sshd reads
+// /etc/ssh/sshd_config.d/*.conf in lexical order and keeps the FIRST value it
+// sees for each keyword, so any file sorting before ours wins. Most of the time
+// that is harmless because the earlier file says the same thing; sometimes it
+// is a file named 00-permit-root-password-auth.conf that says the opposite.
+//
+// Without this check the apply writes the file, reloads, reports success, and
+// leaves password authentication on. Half-applied while claiming success is
+// the worst outcome available here, because the operator then believes a
+// hardening is in place that is not. Observed on a real node on 2026-08-20.
+//
+// The check names the file that won, because "it did not take effect" is not
+// actionable and "this file declares it before yours" is.
+func effectiveConfigCheck(dropIn string) string {
+	// Keywords sshd -T renames or spells differently from sshd_config.
+	alias := map[string]string{"prohibit-password": "without-password"}
+	watched := map[string]bool{
+		"LoginGraceTime": true, "MaxAuthTries": true, "PasswordAuthentication": true,
+		"PermitRootLogin": true, "X11Forwarding": true, "AllowAgentForwarding": true,
+		"KbdInteractiveAuthentication": true, "PermitEmptyPasswords": true,
+	}
+	type want struct{ key, value string }
+	wants := []want{}
+	for _, line := range strings.Split(dropIn, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 || !watched[fields[0]] {
+			continue
+		}
+		value := fields[1]
+		if mapped, ok := alias[value]; ok {
+			value = mapped
+		}
+		wants = append(wants, want{strings.ToLower(fields[0]), value})
+	}
+	if len(wants) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("# Verify what sshd actually resolved. Writing a drop-in is not the same as\n")
+	b.WriteString("# it taking effect: sshd keeps the FIRST value it sees for each keyword and\n")
+	b.WriteString("# reads /etc/ssh/sshd_config.d/*.conf in lexical order, so an earlier file\n")
+	b.WriteString("# silently wins. Reporting success on a half-applied hardening is worse than\n")
+	b.WriteString("# failing, because it leaves the operator believing in a control that is off.\n")
+	b.WriteString("sshguard_mismatch=0\n")
+	b.WriteString("sshguard_check() {\n")
+	b.WriteString("  got=$(\"$SSHD\" -T 2>/dev/null | awk -v k=\"$1\" '$1==k{print $2; exit}')\n")
+	b.WriteString("  [ \"$got\" = \"$2\" ] && return 0\n")
+	b.WriteString("  echo \"lattice sshguard: $1 is effectively '${got:-unset}', not '$2'\" >&2\n")
+	// Only files sorting BEFORE ours can win, plus whatever the main config
+	// declares above its Include. Naming our own file would be noise.
+	fmt.Fprintf(&b, "  for f in $(ls /etc/ssh/sshd_config.d/ 2>/dev/null | awk '$0 < \"%s\"'); do\n", dropInBasename())
+	b.WriteString("    grep -qiE \"^[[:space:]]*$1\" \"/etc/ssh/sshd_config.d/$f\" 2>/dev/null && echo \"  declared earlier in /etc/ssh/sshd_config.d/$f\" >&2\n")
+	b.WriteString("  done\n")
+	b.WriteString("  grep -qiE \"^[[:space:]]*$1\" /etc/ssh/sshd_config 2>/dev/null && echo \"  also declared in /etc/ssh/sshd_config\" >&2\n")
+	b.WriteString("  sshguard_mismatch=1\n")
+	b.WriteString("}\n")
+	for _, w := range wants {
+		fmt.Fprintf(&b, "sshguard_check %s %s\n", shellSingleQuote(w.key), shellSingleQuote(w.value))
+	}
+	b.WriteString("if [ \"$sshguard_mismatch\" = 1 ]; then\n")
+	b.WriteString("  echo 'lattice sshguard: the drop-in did not fully take effect; reverting rather than reporting a hardening that is not in place' >&2\n")
+	b.WriteString("  exit 1\n")
+	b.WriteString("fi\n")
+	b.WriteString("echo 'lattice sshguard: every setting verified effective'\n\n")
+	return b.String()
+}
+
+// shellSingleQuote quotes a value for a single-quoted shell word. The values
+// come from a rendered config this package produced, so this is belt and
+// braces rather than untrusted input handling.
+func shellSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+// dropInBasename is the filename sshd sees, used to reason about which other
+// drop-ins sort before it.
+func dropInBasename() string {
+	i := strings.LastIndexByte(DropInPath, '/')
+	return DropInPath[i+1:]
 }

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
@@ -41,9 +42,28 @@ func detectDuplicateNodes(nodes []model.Node) []duplicateGroup {
 	byWG := map[string][]string{}
 	byIPPair := map[string][]string{}
 	byFP := map[string][]string{}
+	byName := map[string][]string{}
+	nameSignal := map[string]string{}
 	fpSignal := map[string]string{}
 
 	for _, n := range nodes {
+		// The name is checked before the disabled skip, and on every node.
+		//
+		// A rebuilt machine re-enrolled under a new record changes its
+		// hostname, its address, its agent identity and often its hardware
+		// fingerprint all at once, so none of the signals below fire. The name
+		// is the only thing that survives, because an operator types it. That
+		// is exactly how [cd]-xuezhang-ca-NAT came to exist twice on
+		// 2026-08-20, with one record silently never reporting again.
+		//
+		// A disabled node still holds its name, and reusing the name of a
+		// retired node is the case where a warning is most useful, so the
+		// retirement skip does not apply here.
+		if name := strings.TrimSpace(n.Name); name != "" {
+			key := strings.ToLower(name)
+			byName[key] = append(byName[key], n.ID)
+			nameSignal[key] = name
+		}
 		if n.Disabled {
 			continue // a disabled node is intentionally retired; don't flag it
 		}
@@ -81,6 +101,11 @@ func detectDuplicateNodes(nodes []model.Node) []duplicateGroup {
 		}
 	}
 
+	// certain, not high: the signals below are heuristics that identical images
+	// or shared NAT can trip, which is why this file reports rather than
+	// blocks. A name is operator-assigned and unique by intent, so a collision
+	// is never a coincidence and never a false positive.
+	emit("name", "certain", byName, func(k string) string { return nameSignal[k] })
 	emit("wireguard_key", "high", byWG, shortSignal)
 	emit("public_internal_ip", "high", byIPPair, func(k string) string { return k })
 	emit("host_fingerprint", "medium", byFP, func(k string) string { return fpSignal[k] })
@@ -154,4 +179,43 @@ func (s *Server) handleNodeDuplicates(w http.ResponseWriter, _ *http.Request, p 
 		groups = []duplicateGroup{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"groups": groups})
+}
+
+// nodeNameConflict reports the node already holding this name, if any. It is
+// separate from detectDuplicateNodes because it answers a different question:
+// that one asks "which records look like the same machine", this one asks
+// "would creating this record collide with something that exists".
+//
+// It skips the node being re-enrolled by id, because supplying an existing id
+// is a deliberate replace and its own thing.
+func (s *Server) nodeNameConflict(nodeID, name string) map[string]any {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	for _, n := range s.store.Nodes() {
+		if n.ID == nodeID || !strings.EqualFold(strings.TrimSpace(n.Name), name) {
+			continue
+		}
+		last := "never"
+		if !n.LastSeen.IsZero() {
+			last = n.LastSeen.UTC().Format(time.RFC3339)
+		}
+		return map[string]any{
+			"error": "a node already uses this name",
+			"conflict": map[string]any{
+				"field":              "name",
+				"value":              name,
+				"existing_node_id":   n.ID,
+				"existing_node_name": n.Name,
+				"existing_online":    n.Online,
+				"existing_last_seen": last,
+				"remedy": "If this is the same machine rebuilt, rotate its token instead of enrolling again: " +
+					"POST /api/nodes/rotate-token with node_id=" + n.ID + ". That keeps its history, groups, " +
+					"lines and approvals. If it really is a second machine, give it a different name. To create " +
+					"a second record under the same name anyway, resend with allow_duplicate_name=true.",
+			},
+		}
+	}
+	return nil
 }

@@ -2420,6 +2420,10 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 		// membership). It is optional and idempotent; unknown group ids are
 		// rejected before the node is created so enrollment has no partial effect.
 		GroupIDs []string `json:"group_ids"`
+		// AllowDuplicateName enrolls a second node under a name that is already
+		// in use. It exists so the refusal below is a speed bump for the common
+		// mistake rather than a wall, and it is recorded in the audit trail.
+		AllowDuplicateName bool `json:"allow_duplicate_name"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -2485,6 +2489,23 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	}
 	if req.Name == "" {
 		req.Name = req.NodeID
+	}
+	// Refuse a name that is already taken, unless the caller says it means it.
+	//
+	// internal/server/server_nodes_dup.go deliberately reports rather than
+	// blocks, because its other signals are heuristics that identical images
+	// and shared NAT can trip. A name is different in kind: it is
+	// operator-assigned and unique by intent, so a collision is never a
+	// coincidence, and the thing an operator almost always wants instead
+	// already exists.
+	//
+	// The failure this closes: a rebuilt machine gets re-enrolled as a NEW
+	// record beside the old one, which then never reports again. Every count,
+	// list and bulk action afterwards quietly means something other than what
+	// the operator reads. It happened to [cd]-xuezhang-ca-NAT on 2026-08-20.
+	if conflict := s.nodeNameConflict(req.NodeID, req.Name); conflict != nil && !req.AllowDuplicateName {
+		writeJSON(w, http.StatusConflict, conflict)
+		return
 	}
 	agentSourceAllowlist, err := normalizeAgentSourceAllowlist(req.AgentSourceAllowlist)
 	if err != nil {

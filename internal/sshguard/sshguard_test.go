@@ -735,3 +735,79 @@ func TestConfirmRequiresTheGateToHaveAdmittedSomething(t *testing.T) {
 		t.Fatal("the refusal must explain why the operator's current session does not count")
 	}
 }
+
+// Writing a drop-in is not the same as it taking effect. sshd keeps the FIRST
+// value it sees for each keyword and reads /etc/ssh/sshd_config.d/*.conf in
+// lexical order, so any file sorting before ours wins. Most of the time that is
+// harmless because the earlier file agrees; on one real node it was a file
+// named 00-permit-root-password-auth.conf that said the opposite, and the apply
+// reported success with password authentication still on.
+func TestApplyVerifiesEverySettingActuallyTookEffect(t *testing.T) {
+	p := hkProfile()
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := ApplyScriptFromPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every keyword the drop-in sets and that sshd -T reports must be checked.
+	for _, want := range []string{
+		"sshguard_check 'logingracetime' '20'",
+		"sshguard_check 'maxauthtries' '3'",
+		"sshguard_check 'passwordauthentication' 'no'",
+		"sshguard_check 'permitrootlogin' 'without-password'",
+		"sshguard_check 'x11forwarding' 'no'",
+		"sshguard_check 'allowagentforwarding' 'no'",
+		"sshguard_check 'kbdinteractiveauthentication' 'no'",
+		"sshguard_check 'permitemptypasswords' 'no'",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("the apply must verify %q against sshd -T", want)
+		}
+	}
+	// sshd_config spells prohibit-password; sshd -T reports without-password.
+	// Comparing the two literally would fail on every node.
+	if strings.Contains(script, "sshguard_check 'permitrootlogin' 'prohibit-password'") {
+		t.Fatal("the check must compare against the value sshd -T actually prints")
+	}
+	// A mismatch has to fail, not warn: reporting success on a half-applied
+	// hardening leaves the operator believing in a control that is off.
+	if !strings.Contains(script, "did not fully take effect") || !strings.Contains(script, "sshguard_mismatch\" = 1 ]; then\n  echo") {
+		t.Fatal("a mismatch must abort the apply so the revert runs")
+	}
+	// "It did not take effect" is not actionable; "this file declares it before
+	// yours" is.
+	if !strings.Contains(script, "declared earlier in /etc/ssh/sshd_config.d/$f") {
+		t.Fatal("the failure must name the file that won")
+	}
+	// Only files sorting before ours can win, so naming our own would be noise.
+	if !strings.Contains(script, `awk '$0 < "60-lattice-guard.conf"'`) {
+		t.Fatal("the search must be limited to drop-ins that sort before ours")
+	}
+	// The verification must sit after the reload; checking before it would read
+	// the previous configuration and pass for the wrong reason.
+	reload := strings.Index(script, "reload sshd")
+	check := strings.Index(script, "sshguard_mismatch=0")
+	if reload < 0 || check < 0 || check < reload {
+		t.Fatal("the verification must run after the reload, not before it")
+	}
+}
+
+// A hardening-only profile is exactly the one whose settings are most likely to
+// be shadowed, so it must carry the check too.
+func TestHardeningOnlyAlsoVerifiesEffectiveSettings(t *testing.T) {
+	p := Profile{NodeID: "n1", KeepLegacyPort: true, Hardening: DefaultHardening(), ConfirmWindowSec: 900}
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := ApplyScriptFromPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(script, "sshguard_check 'logingracetime' '20'") {
+		t.Fatal("hardening-only must verify its settings; it has no firewall to fall back on")
+	}
+}

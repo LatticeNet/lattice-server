@@ -6703,10 +6703,15 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 		return "netguard:admin"
 	}
 	// SSH Guard can take a node off the network for its operator, so deciding
-	// one requires the same scope that authoring it does. It is listed here
-	// rather than in the switch below for the same reason netguard is: the
-	// plugin alone is not the unit of authority, the action is.
-	if isSSHGuardApproval(approval) {
+	// one requires the same scope that authoring it does.
+	//
+	// Keyed on the PLUGIN, unlike netguard above. netguard has to look at the
+	// action because plugin "nft" carries two approvals with genuinely
+	// different authoring gates. Nothing under sshguard is meant to be cheaper
+	// to decide than to write, so an action this function does not recognise is
+	// a future action nobody has classified yet, and the safe answer for that
+	// is the domain scope rather than the bare apply scope.
+	if approval.Plugin == sshGuardPlugin {
 		return "sshguard:admin"
 	}
 	switch approval.Plugin {

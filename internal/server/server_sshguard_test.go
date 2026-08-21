@@ -224,3 +224,57 @@ func firstLines(s string, n int) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// A knock profile may stand on the node's Lattice terminal instead of an
+// address allowlist, and the claim is checked against the node rather than
+// believed. An address allowlist goes stale silently; a terminal that is
+// switched off is visible at plan time.
+func TestKnockOnOutOfBandFallbackIsCheckedAgainstTheNode(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"network:plan", "sshguard:admin"}, []string{"node-a"})
+
+	body := func() string {
+		return sshGuardPlanBody("node-a", map[string]any{
+			"mgmt_sources": []string{}, "out_of_band_fallback": true,
+		})
+	}
+
+	// The seeded node is not online, so it cannot give a shell without SSH.
+	// Gating it now would leave nothing but knocking.
+	blocked := doBearerJSON(t, handler, http.MethodPost, "/api/sshguard/plan", body(), token)
+	defer blocked.Body.Close()
+	if blocked.StatusCode != http.StatusConflict {
+		t.Fatalf("a fallback the node cannot provide must block, got %d", blocked.StatusCode)
+	}
+	var out struct {
+		Findings []sshguard.Finding `json:"findings"`
+	}
+	_ = json.NewDecoder(blocked.Body).Decode(&out)
+	found := false
+	for _, f := range out.Findings {
+		if f.Code == sshguard.FindingFallbackUnavailable {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected %s, got %+v", sshguard.FindingFallbackUnavailable, out.Findings)
+	}
+
+	// Bring the node online with the terminal reported and the same plan is fine.
+	node, _ := st.Node("node-a")
+	node.Online = true
+	node.AgentLaunch = &model.AgentLaunchConfig{AllowTerminal: true}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	ok := doBearerJSON(t, handler, http.MethodPost, "/api/sshguard/plan", body(), token)
+	defer ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("a node that can give a shell without SSH must be plannable, got %d", ok.StatusCode)
+	}
+	if _, err := srv.store.Node("node-a"); err == false {
+		t.Fatal("node vanished")
+	}
+}

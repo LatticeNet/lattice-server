@@ -24,7 +24,7 @@ func TestValidateRefusesProfilesThatCanStrandTheOperator(t *testing.T) {
 		want string
 		mut  func(*Profile)
 	}{
-		{"knock with no non-knock fallback", "non-knock fallback",
+		{"knock with no second path at all", "out-of-band fallback",
 			func(p *Profile) { p.MgmtSources = nil }},
 		{"knock with no port to gate", "explicit ssh_port",
 			func(p *Profile) { p.SSHPort = 0 }},
@@ -809,5 +809,47 @@ func TestHardeningOnlyAlsoVerifiesEffectiveSettings(t *testing.T) {
 	}
 	if !strings.Contains(script, "sshguard_check 'logingracetime' '20'") {
 		t.Fatal("hardening-only must verify its settings; it has no firewall to fall back on")
+	}
+}
+
+// An address allowlist looks like a safety net and is only as good as the
+// address staying put. The one written into the reference node's allowlist went
+// stale within hours, and a node reached through a proxy sees a source that
+// changes with the route. So a knock profile may instead lean on a path that
+// does not use SSH at all, and the claim is checked rather than believed.
+func TestKnockMayLeanOnAnOutOfBandFallbackInsteadOfAnAddress(t *testing.T) {
+	p := hkProfile()
+	p.MgmtSources = nil
+	p.OutOfBandFallback = true
+	if err := p.Validate(); err != nil {
+		t.Fatalf("an out-of-band fallback is a legitimate second path: %v", err)
+	}
+
+	// Claimed and available: fine.
+	if Blocking(LintProfile(p, NodeReality{Reported: true, TerminalAvailable: true})) {
+		t.Fatal("a node that can give a shell without SSH must not block")
+	}
+
+	// Claimed and NOT available: this is the case the check exists for. A
+	// fallback on paper is worse than an admitted absence, because it is the
+	// reason the profile was allowed to gate SSH at all.
+	findings := LintProfile(p, NodeReality{Reported: true, TerminalAvailable: false})
+	if !Blocking(findings) {
+		t.Fatal("a claimed fallback that the node cannot provide must block the plan")
+	}
+	var got *Finding
+	for i := range findings {
+		if findings[i].Code == FindingFallbackUnavailable {
+			got = &findings[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("expected %s, got %+v", FindingFallbackUnavailable, findings)
+	}
+
+	// A profile that does not claim it is unaffected by the node's capability.
+	q := hkProfile()
+	if Blocking(LintProfile(q, NodeReality{Reported: true, TerminalAvailable: false})) {
+		t.Fatal("a profile with an address allowlist must not depend on the terminal")
 	}
 }

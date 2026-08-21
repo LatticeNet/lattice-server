@@ -155,11 +155,24 @@ type Profile struct {
 	// ports to MgmtSources.
 	Knock *KnockPolicy
 
-	// MgmtSources are CIDRs that reach SSH without knocking, forever. At least
-	// one is required whenever Knock is set: it is the fallback for the case
-	// where knockd itself is broken, and a profile without it has exactly one
-	// way in whose failure mode is total.
+	// MgmtSources are CIDRs that reach SSH without knocking, forever.
 	MgmtSources []string
+
+	// OutOfBandFallback says the operator's fallback is a path that does not
+	// use SSH at all, which on this fleet means the node's Lattice terminal.
+	//
+	// It exists because the obvious alternative turned out to be worse. An IP
+	// allowlist looks like a safety net and is only as good as the address
+	// staying put: the address written into the reference node's allowlist went
+	// stale within hours of being written, and a node behind a proxy sees a
+	// source that changes with the route. A fallback that silently expires is
+	// more dangerous than no fallback, because nobody re-checks it.
+	//
+	// The Lattice terminal does not care where the operator is. It is verified
+	// against the node's reported capability at plan time rather than trusted,
+	// because a profile claiming a fallback that is switched off is exactly the
+	// failure this field is supposed to prevent.
+	OutOfBandFallback bool
 
 	ConfirmWindowSec int
 }
@@ -208,12 +221,14 @@ func (p Profile) Validate() error {
 		seen[norm] = true
 	}
 	if p.Knock != nil {
-		if len(p.MgmtSources) == 0 {
-			// Refusing here rather than warning is deliberate. A knock-only
-			// profile has a single way in, and its failure mode (knockd dead,
-			// sequence wrong, UDP dropped by a middlebox) is unrecoverable
-			// without console access.
-			return fmt.Errorf("a knock policy requires at least one mgmt_source as a non-knock fallback")
+		if len(p.MgmtSources) == 0 && !p.OutOfBandFallback {
+			// Refusing rather than warning is deliberate. A knock-only profile
+			// with no second path has one way in, and its failure mode (knockd
+			// dead, sequence wrong, UDP dropped by a middlebox) is
+			// unrecoverable without console access. The second path may be an
+			// address allowlist or an out-of-band channel, but there has to be
+			// one and the caller has to say which.
+			return fmt.Errorf("a knock policy requires either a mgmt_source or an out-of-band fallback")
 		}
 		if err := p.Knock.validate(); err != nil {
 			return err

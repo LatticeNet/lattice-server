@@ -41,6 +41,12 @@ const (
 	// warning: it is often exactly what an operator wants, but it should be a
 	// decision rather than an accident.
 	FindingSingleWayIn = "sshguard_narrow_fallback"
+
+	// FindingFallbackUnavailable fires when a profile claims an out-of-band
+	// fallback and the node cannot actually provide one. A claimed fallback
+	// that does not exist is worse than an admitted absence, because it is the
+	// reason the profile was allowed to gate SSH in the first place.
+	FindingFallbackUnavailable = "sshguard_fallback_unavailable"
 )
 
 type Severity string
@@ -79,6 +85,12 @@ type NodeReality struct {
 	// with an accept policy cannot override this table's accepts, so the
 	// override check does not apply.
 	GuardPolicyDrop bool
+
+	// TerminalAvailable is true when this node can currently give an operator a
+	// shell without SSH: it is online and its agent reports the terminal
+	// capability. Both halves matter. A capability flag on a node that stopped
+	// reporting is a fallback on paper.
+	TerminalAvailable bool
 }
 
 // Blocking reports whether any finding must stop the plan.
@@ -126,6 +138,13 @@ func LintProfile(p Profile, r NodeReality) []Finding {
 				})
 			}
 		}
+	}
+
+	if p.OutOfBandFallback && !r.TerminalAvailable {
+		findings = append(findings, Finding{
+			Code: FindingFallbackUnavailable, Severity: SeverityBlock,
+			Message: "this profile gates SSH on the grounds that the node's Lattice terminal is the fallback, and that node is either offline or not reporting the terminal capability. Gating SSH now would leave no way in that does not depend on knocking working.",
+		})
 	}
 
 	if p.Knock != nil && len(p.MgmtSources) > 0 {

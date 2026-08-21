@@ -38,6 +38,19 @@ func isSSHGuardApproval(approval model.Approval) bool {
 // would put in front of it.
 func (s *Server) sshGuardNodeReality(nodeID string) sshguard.NodeReality {
 	out := sshguard.NodeReality{}
+	// Both halves matter. A terminal capability on a node that stopped
+	// reporting is a fallback on paper, and this is the field a profile leans
+	// on when it gates SSH with no address allowlist.
+	if node, ok := s.store.Node(nodeID); ok && node.Online {
+		// Prefer what the agent actually reports over what the installer was
+		// told to configure: the launch profile is intent, the runtime snapshot
+		// is fact, and only the second one is a fallback you can use.
+		if runtime := s.agentRuntimeSnapshot(nodeID); runtime != nil {
+			out.TerminalAvailable = runtime.AllowTerminal
+		} else if node.AgentLaunch != nil {
+			out.TerminalAvailable = node.AgentLaunch.AllowTerminal
+		}
+	}
 	if snapshot := s.guardRealityForLint(nodeID); snapshot != nil {
 		out.Reported = true
 		for _, listener := range snapshot.Listeners {
@@ -98,6 +111,10 @@ type sshGuardPlanRequest struct {
 	SSHPort        int      `json:"ssh_port"`
 	KeepLegacyPort *bool    `json:"keep_legacy_port"`
 	MgmtSources    []string `json:"mgmt_sources"`
+	// OutOfBandFallback lets a knock profile stand on the node's Lattice
+	// terminal instead of an address allowlist. It is checked against the
+	// node's reported capability, not believed.
+	OutOfBandFallback bool `json:"out_of_band_fallback"`
 	// EnableKnock defaults to true when ssh_port is set. Turning it off yields a
 	// profile that hardens sshd and shrinks the ports to the management
 	// sources, which is a legitimate and materially safer configuration.
@@ -137,12 +154,13 @@ func (req sshGuardPlanRequest) profile() (sshguard.Profile, error) {
 		keepLegacy = *req.KeepLegacyPort
 	}
 	profile := sshguard.Profile{
-		NodeID:           req.NodeID,
-		SSHPort:          req.SSHPort,
-		KeepLegacyPort:   keepLegacy,
-		Hardening:        hardening,
-		MgmtSources:      req.MgmtSources,
-		ConfirmWindowSec: req.ConfirmWindowSec,
+		NodeID:            req.NodeID,
+		SSHPort:           req.SSHPort,
+		KeepLegacyPort:    keepLegacy,
+		Hardening:         hardening,
+		MgmtSources:       req.MgmtSources,
+		OutOfBandFallback: req.OutOfBandFallback,
+		ConfirmWindowSec:  req.ConfirmWindowSec,
 	}
 	enableKnock := req.SSHPort != 0
 	if req.EnableKnock != nil {

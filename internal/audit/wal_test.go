@@ -1,10 +1,12 @@
 package audit
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -296,5 +298,109 @@ func TestOpenAnchoredWALFinalizesPendingAfterCrash(t *testing.T) {
 	}
 	if anchor.Count != 2 || anchor.Head != second.Hash || anchor.Pending != nil {
 		t.Fatalf("pending anchor was not finalized: %+v", anchor)
+	}
+}
+
+// buildWAL writes a valid chain of events directly, without paying one fsync
+// per record. The open path is what this file is testing; how the bytes got
+// there is not.
+func buildWAL(t *testing.T, path string, count int, metadata string) int64 {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := bufio.NewWriter(f)
+	prev := genesisHash
+	for seq := 1; seq <= count; seq++ {
+		e := ev(fmt.Sprintf("audit_%08d", seq), "node.update")
+		e.Metadata = map[string]string{"payload": metadata}
+		hash, err := ChainHash(prev, seq, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		line, err := json.Marshal(Entry{Seq: seq, PrevHash: prev, Hash: hash, Event: e})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write(append(line, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		prev = hash
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
+}
+
+// The WAL is opened on every server boot, and the duplicate-id index it builds
+// there is retained for the life of the process. Holding whole decoded events
+// made that index cost several times the file on disk: a 510 MB production WAL
+// put the server at 3.5 GB resident before it could listen, on a 3.8 GB host,
+// which OOM-killed it in a loop. The index only ever decides "same id, same
+// bytes?", so a fingerprint per id answers it without keeping the bytes.
+func TestOpenWALIndexDoesNotGrowWithEventBodies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.wal")
+	size := buildWAL(t, path, 1000, strings.Repeat("x", 4096))
+
+	runtime.GC()
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	w, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	runtime.GC()
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(w)
+
+	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	limit := size / 4
+	if retained > limit {
+		t.Fatalf("opening a %d byte WAL retained %d bytes of heap, over the %d byte limit; the duplicate-id index is holding event bodies", size, retained, limit)
+	}
+}
+
+// Fingerprinting must not weaken the contract the index exists for: a replayed
+// event is still skipped, and a different event reusing a durable id is still
+// refused.
+func TestAppendIdempotentStillSeparatesReplayFromConflict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.wal")
+	buildWAL(t, path, 3, "small")
+
+	w, err := OpenWAL(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	replay := ev("audit_00000002", "node.update")
+	replay.Metadata = map[string]string{"payload": "small"}
+	appended, err := w.AppendIdempotent(replay)
+	if err != nil {
+		t.Fatalf("replaying a durable event must not error: %v", err)
+	}
+	if appended {
+		t.Fatal("replaying a durable event must not append a second copy")
+	}
+
+	conflict := replay
+	conflict.Metadata = map[string]string{"payload": "tampered"}
+	if _, err := w.AppendIdempotent(conflict); err == nil {
+		t.Fatal("a different event reusing a durable id must be refused")
 	}
 }

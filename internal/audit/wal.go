@@ -117,13 +117,17 @@ func Verify(r io.Reader) (Result, error) {
 // of the main JSON state cannot silently erase audit history, and any edit,
 // reorder, or truncation of the WAL itself is detectable by Verify.
 type WAL struct {
-	mu          sync.Mutex
-	f           *os.File
-	seq         int
-	head        string
-	anchorPath  string
-	eventsByID  map[string]model.AuditEvent
-	writeAnchor func(string, Anchor) error
+	mu         sync.Mutex
+	f          *os.File
+	seq        int
+	head       string
+	anchorPath string
+	// fingerprintByID answers one question: has this id already been written,
+	// and with these exact bytes? It holds a digest rather than the event
+	// because it is built for every record at open and kept for the life of
+	// the process, so its cost per record is paid on every boot forever.
+	fingerprintByID map[string][32]byte
+	writeAnchor     func(string, Anchor) error
 }
 
 // OpenWAL opens (creating if needed) the append-only audit WAL at path and
@@ -159,24 +163,35 @@ func openWAL(path, anchorPath string) (*WAL, error) {
 	if err != nil {
 		return nil, err
 	}
-	eventsByID, err := readWALEventsByID(path)
+	fingerprints, err := readWALFingerprints(path)
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	return &WAL{f: f, seq: res.Count, head: res.Head, anchorPath: anchorPath, eventsByID: eventsByID, writeAnchor: writeAnchor}, nil
+	return &WAL{f: f, seq: res.Count, head: res.Head, anchorPath: anchorPath, fingerprintByID: fingerprints, writeAnchor: writeAnchor}, nil
 }
 
-func readWALEventsByID(path string) (map[string]model.AuditEvent, error) {
+// eventFingerprint identifies an event by its canonical bytes, which is what
+// the idempotency check compares. json.Marshal is deterministic for
+// AuditEvent, the same property ChainHash already relies on.
+func eventFingerprint(ev model.AuditEvent) ([32]byte, error) {
+	body, err := json.Marshal(ev)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(body), nil
+}
+
+func readWALFingerprints(path string) (map[string][32]byte, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return map[string]model.AuditEvent{}, nil
+		return map[string][32]byte{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	events := map[string]model.AuditEvent{}
+	fingerprints := map[string][32]byte{}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 	for scanner.Scan() {
@@ -184,14 +199,19 @@ func readWALEventsByID(path string) (map[string]model.AuditEvent, error) {
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			return nil, err
 		}
-		if entry.Event.ID != "" {
-			if _, exists := events[entry.Event.ID]; exists {
-				return nil, fmt.Errorf("audit wal contains duplicate event id %q", entry.Event.ID)
-			}
-			events[entry.Event.ID] = entry.Event
+		if entry.Event.ID == "" {
+			continue
 		}
+		if _, exists := fingerprints[entry.Event.ID]; exists {
+			return nil, fmt.Errorf("audit wal contains duplicate event id %q", entry.Event.ID)
+		}
+		fingerprint, err := eventFingerprint(entry.Event)
+		if err != nil {
+			return nil, err
+		}
+		fingerprints[entry.Event.ID] = fingerprint
 	}
-	return events, scanner.Err()
+	return fingerprints, scanner.Err()
 }
 
 // Append writes ev as the next chained record and fsyncs before returning.
@@ -205,10 +225,12 @@ func (w *WAL) AppendIdempotent(ev model.AuditEvent) (bool, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if ev.ID != "" {
-		if current, ok := w.eventsByID[ev.ID]; ok {
-			left, _ := json.Marshal(current)
-			right, _ := json.Marshal(ev)
-			if string(left) != string(right) {
+		if durable, ok := w.fingerprintByID[ev.ID]; ok {
+			incoming, err := eventFingerprint(ev)
+			if err != nil {
+				return false, err
+			}
+			if durable != incoming {
 				return false, fmt.Errorf("audit wal id %q conflicts with durable event", ev.ID)
 			}
 			if w.anchorPath != "" {
@@ -250,7 +272,11 @@ func (w *WAL) appendLocked(ev model.AuditEvent) error {
 	w.seq = seq
 	w.head = hash
 	if ev.ID != "" {
-		w.eventsByID[ev.ID] = ev
+		fingerprint, err := eventFingerprint(ev)
+		if err != nil {
+			return err
+		}
+		w.fingerprintByID[ev.ID] = fingerprint
 	}
 	if w.anchorPath != "" {
 		if err := w.writeAnchor(w.anchorPath, anchorCommitted(seq, hash)); err != nil {

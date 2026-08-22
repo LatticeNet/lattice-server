@@ -320,6 +320,10 @@ type Server struct {
 	// therefore rewrite the encrypted JSON store, on every agent poll.
 	singboxDiscoverAuditMu sync.Mutex
 	singboxDiscoverAudit   map[string]singBoxDiscoveryAuditState
+	// guardRealityAudit does the same for netguard reality reports, which
+	// arrive on the same kind of unattended poll and had the same effect.
+	guardRealityAuditMu sync.Mutex
+	guardRealityAudit   map[string]guardRealityAuditState
 
 	// agentRuntime is live proof of the startup flags reported by node-agent
 	// heartbeats. It is intentionally in-memory: old agents omit it, new agents

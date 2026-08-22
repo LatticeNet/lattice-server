@@ -197,6 +197,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 
 	// Step 22: drop the in-memory on-box sing-box discovery mirror for the node.
 	s.removeSingBoxInventory(req.NodeID)
+	s.removeGuardRealityAudit(req.NodeID)
 
 	// Exactly one node.delete audit event, AFTER all cleanups so counts are
 	// final. Audit rows are append-only and never deleted.

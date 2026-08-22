@@ -1,7 +1,10 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -143,17 +146,19 @@ func (s *Server) handleAgentGuardReality(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordRequestAudit(r, model.AuditEvent{
-		ID:       id.New("audit"),
-		Action:   "netguard.reality.report",
-		Decision: "allow",
-		NodeID:   node.ID,
-		Metadata: map[string]string{
-			"listener_count":      strconv.Itoa(len(reality.Listeners)),
-			"interface_count":     strconv.Itoa(len(reality.Interfaces)),
-			"foreign_table_count": strconv.Itoa(len(reality.ForeignTables)),
-		},
-	})
+	if s.shouldAuditGuardReality(node.ID, stored.Reality, s.now()) {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "netguard.reality.report",
+			Decision: "allow",
+			NodeID:   node.ID,
+			Metadata: map[string]string{
+				"listener_count":      strconv.Itoa(len(stored.Reality.Listeners)),
+				"interface_count":     strconv.Itoa(len(stored.Reality.Interfaces)),
+				"foreign_table_count": strconv.Itoa(len(stored.Reality.ForeignTables)),
+			},
+		})
+	}
 	writeJSON(w, http.StatusOK, guardRealityResponse{
 		OK:                 true,
 		NodeID:             node.ID,
@@ -508,4 +513,63 @@ func isLowerHex64(value string) bool {
 		return false
 	}
 	return true
+}
+
+// A node re-reports its firewall reality on every poll, and auditing each
+// accepted report turned the audit log into a telemetry stream: on the
+// production control plane 29,958 of the last 30,000 audit events were this
+// one action, roughly 250k rows a day from 33 nodes. Every one of them is held
+// in memory for the life of the process, which is how a 3.8 GB host ended up
+// unable to boot the server it had been running for weeks.
+//
+// Audit the security event rather than the poll: the reported reality changed,
+// or enough time passed that the trail should still show this node reporting.
+// This mirrors shouldAuditSingBoxDiscovery, which already solved exactly this
+// for the sing-box discovery report.
+const guardRealityAuditInterval = 6 * time.Hour
+
+type guardRealityAuditState struct {
+	fingerprint string
+	auditedAt   time.Time
+}
+
+func (s *Server) shouldAuditGuardReality(nodeID string, reality model.GuardNodeReality, now time.Time) bool {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	fingerprint := guardRealityFingerprint(reality)
+	s.guardRealityAuditMu.Lock()
+	defer s.guardRealityAuditMu.Unlock()
+	if s.guardRealityAudit == nil {
+		s.guardRealityAudit = map[string]guardRealityAuditState{}
+	}
+	prev, ok := s.guardRealityAudit[nodeID]
+	if !ok || prev.fingerprint != fingerprint || now.Sub(prev.auditedAt) >= guardRealityAuditInterval {
+		s.guardRealityAudit[nodeID] = guardRealityAuditState{fingerprint: fingerprint, auditedAt: now}
+		return true
+	}
+	return false
+}
+
+// guardRealityFingerprint identifies the reported state, not the report. The
+// snapshot is canonicalized by the store before it comes back here, so the only
+// fields that differ between two reports of an unchanged firewall are the two
+// cleared below.
+func guardRealityFingerprint(reality model.GuardNodeReality) string {
+	reality.NodeID = ""
+	reality.CollectedAt = time.Time{}
+	data, _ := json.Marshal(reality)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// removeGuardRealityAudit drops a node's audit gate state (called on delete),
+// so a re-enrolled node with the same id starts by recording its reality again
+// instead of inheriting a stale fingerprint.
+func (s *Server) removeGuardRealityAudit(nodeID string) {
+	s.guardRealityAuditMu.Lock()
+	delete(s.guardRealityAudit, nodeID)
+	s.guardRealityAuditMu.Unlock()
 }

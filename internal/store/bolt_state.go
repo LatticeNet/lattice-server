@@ -248,7 +248,14 @@ func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
 	}
 	bs := &BoltStateStore{db: db, cipher: cph}
 	if preexisting {
-		if _, err := bs.exportState(false); err != nil {
+		if _, err := bs.exportState(false, false); err != nil {
+			db.Close()
+			return nil, err
+		}
+		// Audit is checked here and only here: it is the one domain the export
+		// deliberately skips, and open is the one moment when checking it is
+		// both meaningful and paid once.
+		if err := bs.ValidateAuditLog(); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -258,7 +265,12 @@ func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
 		return nil, err
 	}
 	if preexisting {
-		if _, err := bs.ExportState(); err != nil {
+		// Skipping audit here is the point: readSlice would build the whole log
+		// in one slice, and the peak that produces is what a memory-bound host
+		// dies on, whether or not the copy is then thrown away. ValidateAuditLog
+		// above already read every record, decoding and discarding one at a
+		// time, so the records are checked without a peak.
+		if _, err := bs.exportState(true, false); err != nil {
 			db.Close()
 			return nil, err
 		}
@@ -509,10 +521,39 @@ func resetBoltBuckets(tx *bolt.Tx) error {
 // ExportState reads every bbolt bucket and returns a decrypted, initialized
 // State. Values returned by bbolt are decoded inside the transaction.
 func (bs *BoltStateStore) ExportState() (State, error) {
-	return bs.exportState(true)
+	return bs.exportState(true, true)
 }
 
-func (bs *BoltStateStore) exportState(migrate bool) (State, error) {
+// ExportStateWithoutAudit is ExportState with the audit log left alone
+// entirely: not held, not even decoded.
+//
+// The audit log is append-only and unbounded. On this control plane it reached
+// a million events, and every caller that only needed "the rest of the state"
+// was paying gigabytes to hold a log it then threw away. Worse, the readiness
+// probe asked the same question on every call, so a bounded health check was
+// doing an unbounded read while holding the store lock.
+//
+// Callers that need the events walk them with ScanAuditEventsDesc. The one
+// caller that needs the records checked, the open-time integrity probe, calls
+// ValidateAuditLog explicitly, once.
+func (bs *BoltStateStore) ExportStateWithoutAudit() (State, error) {
+	return bs.exportState(true, false)
+}
+
+// ValidateAuditLog decodes every audit record and keeps none, so a corrupt
+// record is found without the log being materialised. This is an open-time
+// check: the log is append-only, so records already read cannot change under
+// a running process, and repeating the walk on a health probe buys nothing.
+func (bs *BoltStateStore) ValidateAuditLog() error {
+	return bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		return validateAuditDecodable(tx)
+	})
+}
+
+func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error) {
 	st := emptyState()
 	err := bs.db.View(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
@@ -533,8 +574,10 @@ func (bs *BoltStateStore) exportState(migrate bool) (State, error) {
 		if err := readSlice(tx, boltBucketResults, &st.Results); err != nil {
 			return err
 		}
-		if err := readSlice(tx, boltBucketAudit, &st.Audit); err != nil {
-			return err
+		if includeAudit {
+			if err := readSlice(tx, boltBucketAudit, &st.Audit); err != nil {
+				return err
+			}
 		}
 		if err := readMap(tx, boltBucketPluginSecrets, st.PluginSecrets); err != nil {
 			return err
@@ -1030,6 +1073,124 @@ func (bs *BoltStateStore) AppendAudit(ev model.AuditEvent) error {
 	})
 }
 
+// ScanAuditEventsDesc walks the audit bucket newest-first and hands each event
+// to visit, stopping as soon as visit returns false. It holds one event at a
+// time, so a page of at most a few hundred rows costs a page, not the log.
+//
+// The order is the bucket's insertion order reversed. That is the order the
+// events were appended and therefore the order the audit chain records them.
+// It is deliberately not a re-sort by the event's own timestamp field: sorting
+// requires holding every event at once, which is the cost this exists to
+// remove. The two orders differ only for an event appended with a timestamp
+// older than the one before it, which is repair, not ordinary recording.
+func (bs *BoltStateStore) ScanAuditEventsDesc(visit func(model.AuditEvent) bool) error {
+	return bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		b := tx.Bucket(boltBucketAudit)
+		if b == nil {
+			return nil
+		}
+		cursor := b.Cursor()
+		for k, v := cursor.Last(); k != nil; k, v = cursor.Prev() {
+			var event model.AuditEvent
+			if err := json.Unmarshal(v, &event); err != nil {
+				return fmt.Errorf("decode %s[%s]: %w", boltBucketAudit, string(k), err)
+			}
+			if !visit(event) {
+				return nil
+			}
+		}
+		return nil
+	})
+}
+
+// AuditEventKeysPresent reports which of want already exist in the audit log.
+// It reads the log once and holds only the answer, so the caller can dedupe a
+// handful of candidates against a million durable events without materialising
+// them. It stops early once every wanted key has been found.
+func (bs *BoltStateStore) AuditEventKeysPresent(want map[string]struct{}) (map[string]struct{}, error) {
+	found := map[string]struct{}{}
+	if len(want) == 0 {
+		return found, nil
+	}
+	err := bs.ScanAuditEventsDesc(func(event model.AuditEvent) bool {
+		key := auditEventStorageKey(event)
+		if _, ok := want[key]; ok {
+			found[key] = struct{}{}
+		}
+		return len(found) < len(want)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return found, nil
+}
+
+// AuditEventByID returns the newest durable event with this id. The audit
+// bucket is keyed by append sequence, not by id, so this is a scan; it exits at
+// the first hit and holds one event at a time. Its callers are the line-chain
+// evidence paths, which run on operator transitions, not on every request.
+func (bs *BoltStateStore) AuditEventByID(id string) (model.AuditEvent, bool, error) {
+	var out model.AuditEvent
+	found := false
+	if id == "" {
+		return out, false, nil
+	}
+	err := bs.ScanAuditEventsDesc(func(event model.AuditEvent) bool {
+		if event.ID != id {
+			return true
+		}
+		out = event
+		found = true
+		return false
+	})
+	if err != nil {
+		return model.AuditEvent{}, false, err
+	}
+	return out, found, nil
+}
+
+// writeRawAuditRecordForTest appends bytes to the audit bucket without going
+// through the encoder, so a test can produce the corruption the open-time check
+// exists to catch.
+func (bs *BoltStateStore) writeRawAuditRecordForTest(raw string) error {
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(boltBucketAudit)
+		if b == nil {
+			return fmt.Errorf("missing bucket %q", string(boltBucketAudit))
+		}
+		next, err := nextSequenceIndex(boltBucketAudit, b)
+		if err != nil {
+			return err
+		}
+		return b.Put(sequenceKey(next), []byte(raw))
+	})
+}
+
+// validateAuditDecodable answers "does every audit record still decode" while
+// keeping none of them. The probes that ask this question ran through
+// ExportState, which answers it by building the whole log in memory.
+func validateAuditDecodable(tx *bolt.Tx) error {
+	b := tx.Bucket(boltBucketAudit)
+	if b == nil {
+		return nil
+	}
+	return b.ForEach(func(k, v []byte) error {
+		var event model.AuditEvent
+		if err := json.Unmarshal(v, &event); err != nil {
+			return fmt.Errorf("decode %s[%s]: %w", boltBucketAudit, string(k), err)
+		}
+		return nil
+	})
+}
+
+// AuditEvents materialises the entire audit log, sorted newest-first.
+//
+// This is the expensive read and it has no bound: it is kept for the JSON-only
+// store and for tests, whose logs are small. Production read paths use
+// ScanAuditEventsDesc.
 func (bs *BoltStateStore) AuditEvents() ([]model.AuditEvent, error) {
 	events := []model.AuditEvent{}
 	err := bs.db.View(func(tx *bolt.Tx) error {

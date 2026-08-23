@@ -960,7 +960,11 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 			if event, ok := srv.store.AuditEventByID(lineChainAuditID("failed", approval.ID, "\x00line_chain_inputs_changed")); !ok || event.Action != "linechain.failed" || event.Decision != "deny" {
 				t.Fatalf("stale approval missing frozen failure audit: ok=%v event=%+v", ok, event)
 			}
-			if pending := srv.store.PendingLineChainAuditEvidence(); len(pending) != 0 {
+			pending, err := srv.store.PendingLineChainAuditEvidence()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(pending) != 0 {
 				t.Fatalf("stale approval did not repair audit sink: %+v", pending)
 			}
 		})
@@ -997,8 +1001,13 @@ func TestLineChainApprovalAndFirstLeaseRejectBoundDependencyMutationsAtomically(
 			if err := srv.repairLineChainAuditEvidence(); err != nil {
 				t.Fatal(err)
 			}
-			if err := srv.repairLineChainAuditEvidence(); err != nil || len(srv.store.PendingLineChainAuditEvidence()) != 0 {
-				t.Fatalf("first-lease audit repair was not idempotent: err=%v pending=%+v", err, srv.store.PendingLineChainAuditEvidence())
+			repairErr := srv.repairLineChainAuditEvidence()
+			stillPending, err := srv.store.PendingLineChainAuditEvidence()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if repairErr != nil || len(stillPending) != 0 {
+				t.Fatalf("first-lease audit repair was not idempotent: err=%v pending=%+v", repairErr, stillPending)
 			}
 		})
 	}

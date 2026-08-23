@@ -366,7 +366,10 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 		bs.Close()
 		return err
 	}
-	hot, err := bs.ExportState()
+	// Audit is deliberately excluded: from here on bolt owns the log and reads
+	// walk it with a cursor. Pulling it into State was what made a boot cost
+	// gigabytes and, on a 3.8 GB host, eventually cost the boot itself.
+	hot, err := bs.ExportStateWithoutAudit()
 	if err != nil {
 		bs.Close()
 		return err
@@ -376,6 +379,10 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 	// which only takes effect once the stale copy is actually dropped.
 	staleInJSON := len(s.state.KV) > 0 || len(s.state.Static) > 0
 	mergeRuntimeBoltHotState(&s.state, hot)
+	// syncRuntimeBoltHotState has just copied any JSON-side events into bolt,
+	// so the in-memory copy is now a duplicate of durable state that nothing
+	// reads. Dropping it is the point of the move.
+	s.state.Audit = nil
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	s.runtimeBoltHot = bs
@@ -391,7 +398,7 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 }
 
 func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
-	existing, err := bs.ExportState()
+	existing, err := bs.ExportStateWithoutAudit()
 	if err != nil {
 		return err
 	}
@@ -399,9 +406,19 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 	if err != nil {
 		return err
 	}
-	seenAudit := map[string]struct{}{}
-	for _, ev := range existing.Audit {
-		seenAudit[auditEventStorageKey(ev)] = struct{}{}
+	// Dedupe the candidates against bolt, not bolt against the candidates. The
+	// candidate set is whatever the JSON state still carries; the durable log
+	// is unbounded, so it is read once and only the answer is kept.
+	candidates := map[string]struct{}{}
+	for _, ev := range st.Audit {
+		candidates[auditEventStorageKey(ev)] = struct{}{}
+	}
+	for _, ev := range st.LineChainAuditEvidence {
+		candidates[auditEventStorageKey(ev)] = struct{}{}
+	}
+	seenAudit, err := bs.AuditEventKeysPresent(candidates)
+	if err != nil {
+		return err
 	}
 	for _, ev := range st.Audit {
 		if _, ok := seenAudit[auditEventStorageKey(ev)]; ok {
@@ -526,21 +543,10 @@ func subscriptionSnapshotNewer(candidate, current model.SubscriptionSnapshot) bo
 }
 
 func mergeRuntimeBoltHotState(dst *State, hot State) {
-	if len(hot.Audit) > 0 {
-		merged := append([]model.AuditEvent(nil), dst.Audit...)
-		seen := make(map[string]struct{}, len(merged))
-		for _, ev := range merged {
-			seen[auditEventStorageKey(ev)] = struct{}{}
-		}
-		for _, ev := range hot.Audit {
-			if _, ok := seen[auditEventStorageKey(ev)]; ok {
-				continue
-			}
-			merged = append(merged, ev)
-		}
-		sort.Slice(merged, func(i, j int) bool { return merged[i].At.After(merged[j].At) })
-		dst.Audit = merged
-	}
+	// Audit is not merged. Its caller passes a State exported without the log
+	// precisely so it is never held; the merge that used to happen here built a
+	// second copy and then sorted it, which on a real deployment was the single
+	// largest allocation the process ever made.
 	if len(hot.Sessions) > 0 {
 		dst.Sessions = hot.Sessions
 	}
@@ -929,7 +935,12 @@ func (s *Store) ReadyCheck() error {
 		}
 	}
 	if s.runtimeBoltHot != nil {
-		if _, err := s.runtimeBoltHot.ExportState(); err != nil {
+		// Readiness is a bounded question. It used to be answered by exporting
+		// the whole hot store, audit log included, while holding this lock, so
+		// every probe re-read a million immutable records and blocked the
+		// requests it was meant to reassure anyone about. The log is validated
+		// once, at open.
+		if _, err := s.runtimeBoltHot.ExportStateWithoutAudit(); err != nil {
 			return fmt.Errorf("runtime bbolt hot store: %w", err)
 		}
 	}
@@ -2206,7 +2217,12 @@ func (s *Store) lineChainTaskLocked(task model.Task) bool {
 func (s *Store) AppendAudit(ev model.AuditEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.state.Audit = append(s.state.Audit, ev)
+	// With the hot store on, bolt is the audit log and reads walk it. Keeping a
+	// parallel in-memory copy is what turned an append-only log into a resident
+	// one that grew until the process could not start.
+	if s.runtimeBoltHot == nil {
+		s.state.Audit = append(s.state.Audit, ev)
+	}
 	if s.wal != nil {
 		if err := s.wal.Append(ev); err != nil {
 			return err
@@ -2236,15 +2252,30 @@ func (s *Store) AppendAuditIdempotent(ev model.AuditEvent) (bool, error) {
 		return false, fmt.Errorf("audit id %q conflicts with frozen line chain evidence", ev.ID)
 	}
 	exists := false
-	for _, current := range s.state.Audit {
-		if current.ID != ev.ID {
-			continue
+	if s.runtimeBoltHot != nil {
+		// One indexed-by-sequence scan that exits at the first hit, in place of
+		// decoding the whole durable log to look for one id.
+		durable, ok, err := s.runtimeBoltHot.AuditEventByID(ev.ID)
+		if err != nil {
+			return false, err
 		}
-		if !equal(current, ev) {
-			return false, fmt.Errorf("audit id %q conflicts with existing evidence", ev.ID)
+		if ok {
+			if !equal(durable, ev) {
+				return false, fmt.Errorf("audit id %q conflicts with existing evidence", ev.ID)
+			}
+			exists = true
 		}
-		exists = true
-		break
+	} else {
+		for _, current := range s.state.Audit {
+			if current.ID != ev.ID {
+				continue
+			}
+			if !equal(current, ev) {
+				return false, fmt.Errorf("audit id %q conflicts with existing evidence", ev.ID)
+			}
+			exists = true
+			break
+		}
 	}
 	if s.wal != nil {
 		if _, err := s.wal.AppendIdempotent(ev); err != nil {
@@ -2252,25 +2283,16 @@ func (s *Store) AppendAuditIdempotent(ev model.AuditEvent) (bool, error) {
 		}
 	}
 	if s.runtimeBoltHot != nil {
-		hotEvents, err := s.runtimeBoltHot.AuditEvents()
-		if err != nil {
+		if exists {
+			return false, s.confirmDurabilityLocked()
+		}
+		if err := s.runtimeBoltHot.AppendAudit(ev); err != nil {
 			return false, err
 		}
-		hotExists := false
-		for _, current := range hotEvents {
-			if current.ID == ev.ID {
-				if !equal(current, ev) {
-					return false, fmt.Errorf("hot audit id %q conflicts with existing evidence", ev.ID)
-				}
-				hotExists = true
-				break
-			}
-		}
-		if !hotExists {
-			if err := s.runtimeBoltHot.AppendAudit(ev); err != nil {
-				return false, err
-			}
-		}
+		// Nothing is staged into the JSON state: with the hot store on,
+		// jsonPersistStateFrom drops Audit anyway, so the staged copy of the
+		// whole log was written to nothing.
+		return true, s.confirmDurabilityLocked()
 	}
 	if exists {
 		return false, s.confirmDurabilityLocked()
@@ -2290,6 +2312,13 @@ func (s *Store) AuditEventByID(id string) (model.AuditEvent, bool) {
 	if event, ok := s.state.LineChainAuditEvidence[id]; ok {
 		return event, true
 	}
+	if s.runtimeBoltHot != nil {
+		event, ok, err := s.runtimeBoltHot.AuditEventByID(id)
+		if err != nil {
+			return model.AuditEvent{}, false
+		}
+		return event, ok
+	}
 	for _, event := range s.state.Audit {
 		if event.ID == id {
 			return event, true
@@ -2301,16 +2330,32 @@ func (s *Store) AuditEventByID(id string) (model.AuditEvent, bool) {
 // PendingLineChainAuditEvidence returns transition-owned evidence that has not
 // yet been copied into the ordinary audit sink. Callers use it to repair a
 // committed transition after a lost response or sink failure.
-func (s *Store) PendingLineChainAuditEvidence() []model.AuditEvent {
+func (s *Store) PendingLineChainAuditEvidence() ([]model.AuditEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existing := make(map[string]bool, len(s.state.Audit))
-	for _, event := range s.state.Audit {
-		existing[event.ID] = true
+	// Ask only about the evidence ids at hand. The old shape built a set of
+	// every id in the log to answer a question about a handful of them.
+	existing := map[string]struct{}{}
+	if s.runtimeBoltHot != nil {
+		want := make(map[string]struct{}, len(s.state.LineChainAuditEvidence))
+		for id := range s.state.LineChainAuditEvidence {
+			want[id] = struct{}{}
+		}
+		found, err := s.runtimeBoltHot.AuditEventKeysPresent(want)
+		if err != nil {
+			// Reporting "nothing pending" on a read failure would turn a broken
+			// read into a silent decision not to repair evidence.
+			return nil, err
+		}
+		existing = found
+	} else {
+		for _, event := range s.state.Audit {
+			existing[event.ID] = struct{}{}
+		}
 	}
 	ids := make([]string, 0, len(s.state.LineChainAuditEvidence))
 	for id := range s.state.LineChainAuditEvidence {
-		if !existing[id] {
+		if _, ok := existing[id]; !ok {
 			ids = append(ids, id)
 		}
 	}
@@ -2319,7 +2364,7 @@ func (s *Store) PendingLineChainAuditEvidence() []model.AuditEvent {
 	for _, id := range ids {
 		out = append(out, s.state.LineChainAuditEvidence[id])
 	}
-	return out
+	return out, nil
 }
 
 // AuditWALVerify re-reads the append-only audit WAL and validates its hash chain.
@@ -2364,12 +2409,53 @@ func (s *Store) Close() error {
 	return closeErr
 }
 
+// AuditEvents materialises the whole audit log, newest-first.
+//
+// It is unbounded by construction, which is why no production read path uses it
+// any more: the API pages through ScanAuditEventsDesc. It stays for the
+// JSON-only store and for tests, whose logs are small.
 func (s *Store) AuditEvents() []model.AuditEvent {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := append([]model.AuditEvent(nil), s.state.Audit...)
+	hot := s.runtimeBoltHot
+	var out []model.AuditEvent
+	if hot == nil {
+		out = append(out, s.state.Audit...)
+	}
+	s.mu.Unlock()
+	if hot != nil {
+		events, err := hot.AuditEvents()
+		if err != nil {
+			return nil
+		}
+		return events
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].At.After(out[j].At) })
 	return out
+}
+
+// ScanAuditEventsDesc hands each audit event to visit, newest first, stopping
+// as soon as visit returns false. One event is held at a time, so a caller that
+// wants a page of a few hundred rows out of a million pays for the page.
+//
+// Order is the order the events were appended, which is the order the audit
+// chain records them; see BoltStateStore.ScanAuditEventsDesc.
+func (s *Store) ScanAuditEventsDesc(visit func(model.AuditEvent) bool) error {
+	s.mu.Lock()
+	hot := s.runtimeBoltHot
+	var snapshot []model.AuditEvent
+	if hot == nil {
+		snapshot = append([]model.AuditEvent(nil), s.state.Audit...)
+	}
+	s.mu.Unlock()
+	if hot != nil {
+		return hot.ScanAuditEventsDesc(visit)
+	}
+	for i := len(snapshot) - 1; i >= 0; i-- {
+		if !visit(snapshot[i]) {
+			return nil
+		}
+	}
+	return nil
 }
 
 func (s *Store) PutKV(entry model.KVEntry) error {

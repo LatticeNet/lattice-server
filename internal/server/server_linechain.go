@@ -310,7 +310,11 @@ func (s *Server) appendRequiredLineChainAudit(event model.AuditEvent) error {
 }
 
 func (s *Server) repairLineChainAuditEvidence() error {
-	for _, event := range s.store.PendingLineChainAuditEvidence() {
+	pending, err := s.store.PendingLineChainAuditEvidence()
+	if err != nil {
+		return err
+	}
+	for _, event := range pending {
 		if err := s.appendRequiredLineChainAudit(event); err != nil {
 			return err
 		}

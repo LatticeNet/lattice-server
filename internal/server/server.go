@@ -3521,46 +3521,63 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	events := visibleAuditEvents(p, s.store.AuditEvents())
+	visible := auditVisibility(p)
 	if !auditQueryRequested(r) {
 		// Bare mode keeps its array shape (pinned by tests and existing
-		// consumers) but no longer dumps the entire unbounded log in one
-		// response: it returns the newest defaultAuditLimit events
-		// (AuditEvents() sorts newest-first). Anything more goes through the
-		// query parameters and the enveloped response.
-		if len(events) > defaultAuditLimit {
-			events = events[:defaultAuditLimit]
+		// consumers): the newest defaultAuditLimit events. It stops the walk as
+		// soon as it has them, so it costs a page no matter how long the log is.
+		events := make([]model.AuditEvent, 0, defaultAuditLimit)
+		scanned := 0
+		if err := s.store.ScanAuditEventsDesc(func(ev model.AuditEvent) bool {
+			scanned++
+			if visible(ev) {
+				events = append(events, ev)
+			}
+			// A principal confined to a few nodes may see nothing for a long
+			// stretch of the log, so the walk is bounded by records examined as
+			// well as by rows collected.
+			return len(events) < defaultAuditLimit && scanned < auditScanCap
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
 		}
 		writeJSON(w, http.StatusOK, events)
 		return
 	}
-	out, err := queryAuditEvents(r, events)
+	query, err := parseAuditQuery(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := collectAuditPage(s.store.ScanAuditEventsDesc, visible, query)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
 }
 
-func visibleAuditEvents(p principal, events []model.AuditEvent) []model.AuditEvent {
+// auditVisibility turns the RBAC rule into a per-event predicate so it can be
+// applied during the walk instead of over a materialised copy of the log.
+func auditVisibility(p principal) func(model.AuditEvent) bool {
 	if !principalHasNodeRestriction(p) {
-		return events
+		return func(model.AuditEvent) bool { return true }
 	}
-	visible := make([]model.AuditEvent, 0, len(events))
-	for _, ev := range events {
+	return func(ev model.AuditEvent) bool {
 		if ev.NodeID == "" {
-			continue
+			return false
 		}
-		if rbac.Allows(p.Principal, "audit:read", ev.NodeID) {
-			visible = append(visible, ev)
-		}
+		return rbac.Allows(p.Principal, "audit:read", ev.NodeID)
 	}
-	return visible
 }
 
 const (
 	defaultAuditLimit = 100
 	maxAuditLimit     = 500
+	// auditScanCap bounds how many records one query may examine. The log is
+	// append-only and unbounded; without a bound a single unfiltered page view
+	// walks every event ever recorded.
+	auditScanCap = 200_000
 	// Task list/result pagination defaults for the opt-in query mode.
 	defaultTaskQueryLimit = 100
 	maxTaskQueryLimit     = 500
@@ -3571,6 +3588,12 @@ type auditQueryResponse struct {
 	Total  int                `json:"total"`
 	Limit  int                `json:"limit"`
 	Offset int                `json:"offset"`
+	// Scanned and Complete describe the walk behind Total. Complete is false
+	// when the scan cap stopped it early, which makes Total a count over the
+	// newest Scanned events rather than the whole log. Narrowing with at_from
+	// makes it exact again.
+	Scanned  int  `json:"scanned"`
+	Complete bool `json:"complete"`
 }
 
 func auditQueryRequested(r *http.Request) bool {
@@ -3583,51 +3606,116 @@ func auditQueryRequested(r *http.Request) bool {
 	return false
 }
 
-func queryAuditEvents(r *http.Request, events []model.AuditEvent) (auditQueryResponse, error) {
+type auditQuerySpec struct {
+	action        string
+	decision      string
+	nodeID        string
+	actorID       string
+	tokenID       string
+	scope         string
+	correlationID string
+	atFrom        time.Time
+	atTo          time.Time
+	text          string
+	limit         int
+	offset        int
+}
+
+func parseAuditQuery(r *http.Request) (auditQuerySpec, error) {
 	q := r.URL.Query()
 	limit, err := boundedIntQuery(q.Get("limit"), defaultAuditLimit, maxAuditLimit, "limit")
 	if err != nil {
-		return auditQueryResponse{}, err
+		return auditQuerySpec{}, err
 	}
 	offset, err := boundedIntQuery(q.Get("offset"), 0, 0, "offset")
 	if err != nil {
-		return auditQueryResponse{}, err
+		return auditQuerySpec{}, err
 	}
 	atFrom, err := parseAuditTime(q.Get("at_from"), "at_from")
 	if err != nil {
-		return auditQueryResponse{}, err
+		return auditQuerySpec{}, err
 	}
 	atTo, err := parseAuditTime(q.Get("at_to"), "at_to")
 	if err != nil {
+		return auditQuerySpec{}, err
+	}
+	return auditQuerySpec{
+		action:        q.Get("action"),
+		decision:      q.Get("decision"),
+		nodeID:        q.Get("node_id"),
+		actorID:       q.Get("actor_id"),
+		tokenID:       q.Get("token_id"),
+		scope:         q.Get("scope"),
+		correlationID: q.Get("correlation_id"),
+		atFrom:        atFrom,
+		atTo:          atTo,
+		text:          strings.ToLower(strings.TrimSpace(q.Get("q"))),
+		limit:         limit,
+		offset:        offset,
+	}, nil
+}
+
+func (q auditQuerySpec) matches(ev model.AuditEvent) bool {
+	if !auditEventMatches(ev, q.action, q.decision, q.nodeID, q.actorID, q.tokenID, q.scope, q.correlationID) {
+		return false
+	}
+	if !q.atFrom.IsZero() && ev.At.Before(q.atFrom) {
+		return false
+	}
+	if !q.atTo.IsZero() && ev.At.After(q.atTo) {
+		return false
+	}
+	if q.text != "" && !auditTextMatch(ev, q.text) {
+		return false
+	}
+	return true
+}
+
+// collectAuditPage walks the log newest-first and keeps only the requested
+// window, counting the rest. Total stays exact while memory stays at one page,
+// which is the whole point: the previous shape filtered a materialised copy of
+// every event ever recorded to return at most maxAuditLimit of them.
+//
+// Two bounds keep an unbounded log from turning a page view into a long scan.
+// at_from stops the walk once it reaches events older than the window, which is
+// exact because the log is walked in append order. Failing that, auditScanCap
+// bounds the records examined, and the response says so rather than reporting a
+// partial count as if it were the whole.
+func collectAuditPage(scan func(func(model.AuditEvent) bool) error, visible func(model.AuditEvent) bool, q auditQuerySpec) (auditQueryResponse, error) {
+	events := make([]model.AuditEvent, 0, q.limit)
+	total := 0
+	scanned := 0
+	complete := true
+	err := scan(func(ev model.AuditEvent) bool {
+		if !q.atFrom.IsZero() && ev.At.Before(q.atFrom) {
+			// Append order is time order, so everything past here is older
+			// still. Stopping is exact, not an approximation.
+			return false
+		}
+		scanned++
+		if visible(ev) && q.matches(ev) {
+			if total >= q.offset && len(events) < q.limit {
+				events = append(events, ev)
+			}
+			total++
+		}
+		if scanned >= auditScanCap {
+			complete = false
+			return false
+		}
+		return true
+	})
+	if err != nil {
 		return auditQueryResponse{}, err
 	}
-	text := strings.ToLower(strings.TrimSpace(q.Get("q")))
-	filtered := make([]model.AuditEvent, 0, len(events))
-	for _, ev := range events {
-		if !auditEventMatches(ev, q.Get("action"), q.Get("decision"), q.Get("node_id"), q.Get("actor_id"), q.Get("token_id"), q.Get("scope"), q.Get("correlation_id")) {
-			continue
-		}
-		if !atFrom.IsZero() && ev.At.Before(atFrom) {
-			continue
-		}
-		if !atTo.IsZero() && ev.At.After(atTo) {
-			continue
-		}
-		if text != "" && !auditTextMatch(ev, text) {
-			continue
-		}
-		filtered = append(filtered, ev)
-	}
-	total := len(filtered)
-	if offset > total {
-		filtered = nil
-	} else {
-		filtered = filtered[offset:]
-	}
-	if len(filtered) > limit {
-		filtered = filtered[:limit]
-	}
-	return auditQueryResponse{Events: filtered, Total: total, Limit: limit, Offset: offset}, nil
+	return auditQueryResponse{
+		Events:   events,
+		Total:    total,
+		Limit:    q.limit,
+		Offset:   q.offset,
+		Scanned:  scanned,
+		Complete: complete,
+	}, nil
 }
 
 func boundedIntQuery(raw string, fallback, max int, name string) (int, error) {

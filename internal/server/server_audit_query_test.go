@@ -1,12 +1,36 @@
 package server
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
+
+// queryAuditEvents runs a query over events already in hand. Production pages
+// through the store's cursor; this keeps the shape for callers and tests that
+// hold a slice. The slice is walked newest-first, the order collectAuditPage
+// requires for its at_from short-circuit to be exact.
+func queryAuditEvents(r *http.Request, events []model.AuditEvent) (auditQueryResponse, error) {
+	q, err := parseAuditQuery(r)
+	if err != nil {
+		return auditQueryResponse{}, err
+	}
+	ordered := append([]model.AuditEvent(nil), events...)
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].At.After(ordered[j].At) })
+	scan := func(visit func(model.AuditEvent) bool) error {
+		for _, ev := range ordered {
+			if !visit(ev) {
+				return nil
+			}
+		}
+		return nil
+	}
+	return collectAuditPage(scan, func(model.AuditEvent) bool { return true }, q)
+}
 
 func auditQuery(t *testing.T, rawQuery string, events []model.AuditEvent) auditQueryResponse {
 	t.Helper()

@@ -57,16 +57,28 @@ func makeServerPluginV2Archive(t *testing.T, files map[string][]byte) []byte {
 
 func newPluginAssetTestServer(t *testing.T) (*Server, http.Handler, []*http.Cookie, string, string) {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	archive := makeServerPluginV2Archive(t, map[string][]byte{
-		"bin/" + runtime.GOOS + "-" + runtime.GOARCH + "/plugin": []byte("#!/bin/sh\nread line\necho '{\"ok\":true,\"result\":{\"source\":\"runtime\"}}'\n"),
+	return newPluginAssetTestServerWithUI(t, map[string][]byte{
 		"ui/index.html":                  []byte("<!doctype html><main>Plugin UI</main>"),
 		"ui/assets/app.0123456789ab.css": []byte("main { display: block; }"),
 		"ui/assets/app.0123456789ab.js":  []byte("globalThis.pluginLoaded = true"),
 	})
+}
+
+// newPluginAssetTestServerWithUI lets a test choose the bundled UI files, which
+// is how the style-nonce cases put the placeholder where they need it.
+func newPluginAssetTestServerWithUI(t *testing.T, ui map[string][]byte) (*Server, http.Handler, []*http.Cookie, string, string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := map[string][]byte{
+		"bin/" + runtime.GOOS + "-" + runtime.GOARCH + "/plugin": []byte("#!/bin/sh\nread line\necho '{\"ok\":true,\"result\":{\"source\":\"runtime\"}}'\n"),
+	}
+	for name, body := range ui {
+		files[name] = body
+	}
+	archive := makeServerPluginV2Archive(t, files)
 	m := plugin.Manifest{
 		Schema: plugin.ManifestSchemaV2,
 		ID:     "test.assets", Name: "Asset Test", Type: plugin.TypeSystem, Version: "0.2.1-alpha.1",
@@ -318,7 +330,7 @@ func TestPluginAssetHeadersCacheAndPathValidation(t *testing.T) {
 }
 
 func TestPluginAssetCSPOnlyAcceptsCanonicalHTTPOrigins(t *testing.T) {
-	valid := pluginAssetCSP("https://lattice.example.test:8443")
+	valid := pluginAssetCSP("https://lattice.example.test:8443", "")
 	if !strings.Contains(valid, "script-src 'self' https://lattice.example.test:8443") ||
 		!strings.Contains(valid, "img-src 'self' https://lattice.example.test:8443 data:") {
 		t.Fatalf("valid public origin missing from CSP: %q", valid)
@@ -331,7 +343,7 @@ func TestPluginAssetCSPOnlyAcceptsCanonicalHTTPOrigins(t *testing.T) {
 		"https://lattice.example.test/#fragment",
 		"https://lattice.example.test;script-src.example",
 	} {
-		csp := pluginAssetCSP(invalid)
+		csp := pluginAssetCSP(invalid, "")
 		if strings.Contains(csp, invalid) || !strings.Contains(csp, "script-src 'self';") {
 			t.Fatalf("invalid public URL %q affected CSP: %q", invalid, csp)
 		}
@@ -343,7 +355,7 @@ func TestPluginAssetCSPOnlyAcceptsCanonicalHTTPOrigins(t *testing.T) {
 // Asset serving fails closed when the public URL is unset, so no request-derived
 // origin can reach the CSP.
 func TestPluginAssetCSPIgnoresRequestOrigin(t *testing.T) {
-	csp := pluginAssetCSP("")
+	csp := pluginAssetCSP("", "")
 	if !strings.Contains(csp, "script-src 'self';") {
 		t.Fatalf("unset public URL must yield a bare 'self' script-src: %q", csp)
 	}

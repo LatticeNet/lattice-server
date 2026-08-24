@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"net"
 	"net/http"
@@ -98,9 +100,30 @@ func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset 
 		return
 	}
 
+	// A plugin document may ask for a style nonce by carrying the placeholder in
+	// the bytes it was signed with. Substituting it is the only way a frame can
+	// learn a value the server minted for this one response: a frame cannot read
+	// its own response headers, and putting a security nonce in the URL would
+	// leak it into history, logs and referrers.
+	//
+	// The substitution is deliberately narrow. It happens only in the manifest's
+	// declared UI entrypoint, only for an exact token that the publisher signed
+	// into the document, and the policy gains the nonce only when the document
+	// actually took one. A bundle without the placeholder is served byte for byte
+	// under exactly the policy it got before.
+	styleNonce := ""
+	if asset.isEntrypoint {
+		if substituted, nonce, err := injectPluginStyleNonce(data); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		} else if nonce != "" {
+			data, styleNonce = substituted, nonce
+		}
+	}
+
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", pluginAssetCSP(s.publicURL))
+	w.Header().Set("Content-Security-Policy", pluginAssetCSP(s.publicURL, styleNonce))
 	if !asset.isEntrypoint {
 		// The sandboxed entrypoint has an opaque origin, so its external scripts
 		// and styles use credentialless CORS. These resources remain bound to an
@@ -109,7 +132,15 @@ func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset 
 	}
 	if strings.EqualFold(filepath.Ext(assetPath), ".html") {
 		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
-		w.Header().Set("Cache-Control", "private, no-cache, max-age=0, must-revalidate")
+		if styleNonce != "" {
+			// The body is unique to this response. Revalidation would let a
+			// browser pair a stored body carrying the old nonce with a fresh
+			// policy naming a new one, which is the one way this can fail
+			// closed into a blank editor.
+			w.Header().Set("Cache-Control", "private, no-store")
+		} else {
+			w.Header().Set("Cache-Control", "private, no-cache, max-age=0, must-revalidate")
+		}
 	} else if contentHashedAsset.MatchString(filepath.Base(assetPath)) {
 		w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	} else {
@@ -124,7 +155,7 @@ func (s *Server) servePluginAsset(w http.ResponseWriter, r *http.Request, asset 
 // the policy that confines plugin code depend on the request it is confining.
 // Serving is refused outright when the public URL is unset (see servePluginAsset),
 // so there is no request-derived fallback to reach.
-func pluginAssetCSP(publicURL string) string {
+func pluginAssetCSP(publicURL, styleNonce string) string {
 	assetSources := "'self'"
 	if origin := canonicalPluginAssetOrigin(publicURL); origin != "" {
 		// Sandboxed plugin documents intentionally have an opaque origin. Their
@@ -132,9 +163,38 @@ func pluginAssetCSP(publicURL string) string {
 		// origin in addition to 'self', which does not match from an opaque origin.
 		assetSources += " " + origin
 	}
+	styleSources := assetSources
+	if styleNonce != "" {
+		// Only styles carrying this exact value are allowed in, which is what
+		// separates an editor mounting its own layout rules from an injection
+		// that reached the document some other way. It is never 'unsafe-inline'.
+		styleSources += " 'nonce-" + styleNonce + "'"
+	}
 	return "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'; " +
-		"object-src 'none'; frame-src 'none'; style-src " + assetSources + "; script-src " + assetSources + "; " +
+		"object-src 'none'; frame-src 'none'; style-src " + styleSources + "; script-src " + assetSources + "; " +
 		"img-src " + assetSources + " data:; font-src " + assetSources + "; connect-src 'none'"
+}
+
+// pluginStyleNoncePlaceholder is the exact token a plugin document signs into
+// its entrypoint to say it wants a per-response style nonce. It is a token
+// rather than an attribute the server adds, so what the publisher signed still
+// describes every place the value can land.
+const pluginStyleNoncePlaceholder = "__LATTICE_CSP_NONCE__"
+
+// injectPluginStyleNonce replaces every placeholder in the document with one
+// freshly minted nonce. It reports an empty nonce, and leaves the bytes alone,
+// when the document did not ask for one.
+func injectPluginStyleNonce(document []byte) ([]byte, string, error) {
+	placeholder := []byte(pluginStyleNoncePlaceholder)
+	if !bytes.Contains(document, placeholder) {
+		return document, "", nil
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, "", errors.New("plugin asset: cannot mint a style nonce")
+	}
+	nonce := base64.RawStdEncoding.EncodeToString(raw)
+	return bytes.ReplaceAll(document, placeholder, []byte(nonce)), nonce, nil
 }
 
 func canonicalPluginAssetOrigin(raw string) string {

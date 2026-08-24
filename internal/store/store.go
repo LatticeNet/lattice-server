@@ -130,6 +130,10 @@ type Store struct {
 	wal                *audit.WAL    // append-only tamper-evident audit log; nil for in-memory stores
 	walPath            string
 	walAnchorPath      string
+	// The last chain walk, guarded separately so a readiness probe reading it
+	// never queues behind a long write holding mu.
+	auditVerifyMu      sync.Mutex
+	lastAuditVerify    AuditWALVerification
 	runtimeBoltHot     *BoltStateStore // optional record-level sidecar for high-churn runtime domains
 	runtimeBoltHotPath string
 	syncParentDir      func(string) error
@@ -236,6 +240,9 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 		syncParentDir:      syncParentDir,
 	}
 	if path == "" {
+		// No file, no WAL, nothing to verify. Recording that explicitly keeps
+		// "there is nothing to check" distinct from "the check never ran".
+		s.recordDisabledAuditWAL(time.Now())
 		return s, nil
 	}
 	if !cph.Enabled() {
@@ -261,6 +268,12 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	s.wal = wal
 	s.walPath = walPath
 	s.walAnchorPath = walAnchorPath
+	// OpenAnchoredWAL refuses to open a chain that does not verify, so reaching
+	// here is itself a successful verification. Seeding it means a probe that
+	// arrives before the first background walk reports what is true rather than
+	// "never checked".
+	openHead, openCount := wal.Head()
+	s.recordAuditWALVerification(audit.Result{Count: openCount, Head: openHead}, walAnchorPath != "", nil, time.Now())
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -2367,15 +2380,97 @@ func (s *Store) PendingLineChainAuditEvidence() ([]model.AuditEvent, error) {
 	return out, nil
 }
 
+// AuditWALVerification is the outcome of one chain walk, kept so a readiness
+// probe can report what the last walk found instead of paying for its own.
+type AuditWALVerification struct {
+	// Enabled is false for a store with no WAL at all, which is not a failure:
+	// an in-memory store has nothing to verify.
+	Enabled  bool
+	At       time.Time
+	OK       bool
+	Err      string
+	Count    int
+	Head     string
+	Anchored bool
+}
+
+// LastAuditWALVerification returns the most recent chain walk, and whether one
+// has happened at all. Opening the store counts as one: OpenAnchoredWAL
+// verifies the chain before it will append to it.
+func (s *Store) LastAuditWALVerification() (AuditWALVerification, bool) {
+	s.auditVerifyMu.Lock()
+	defer s.auditVerifyMu.Unlock()
+	if s.lastAuditVerify.At.IsZero() {
+		return AuditWALVerification{}, false
+	}
+	return s.lastAuditVerify, true
+}
+
+func (s *Store) recordDisabledAuditWAL(at time.Time) {
+	s.auditVerifyMu.Lock()
+	s.lastAuditVerify = AuditWALVerification{Enabled: false, At: at.UTC(), OK: true}
+	s.auditVerifyMu.Unlock()
+}
+
+func (s *Store) recordAuditWALVerification(res audit.Result, anchored bool, err error, at time.Time) {
+	record := AuditWALVerification{
+		Enabled:  true,
+		At:       at.UTC(),
+		OK:       err == nil,
+		Count:    res.Count,
+		Head:     res.Head,
+		Anchored: anchored,
+	}
+	if err != nil {
+		record.Err = err.Error()
+	}
+	s.auditVerifyMu.Lock()
+	s.lastAuditVerify = record
+	s.auditVerifyMu.Unlock()
+}
+
 // AuditWALVerify re-reads the append-only audit WAL and validates its hash chain.
 // The second return is false when no WAL is configured (in-memory store).
+// The walk itself runs with the store lock released. Holding it for the length
+// of the walk is what made a readiness probe block every write for six seconds
+// on a log of a million records; the file is append-only, so the length and the
+// anchor captured together under the lock describe a prefix that cannot change
+// underneath the walk.
 func (s *Store) AuditWALVerify() (audit.Result, bool, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.walPath == "" {
+	walPath := s.walPath
+	anchorPath := s.walAnchorPath
+	if walPath == "" {
+		s.mu.Unlock()
 		return audit.Result{}, false, nil
 	}
-	res, err := audit.VerifyAnchoredFile(s.walPath, s.walAnchorPath)
+	var limit int64
+	if info, err := os.Stat(walPath); err == nil {
+		limit = info.Size()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.mu.Unlock()
+		return audit.Result{}, true, err
+	}
+	var (
+		anchor   audit.Anchor
+		anchored bool
+	)
+	if anchorPath != "" {
+		var err error
+		anchor, anchored, err = audit.ReadAnchor(anchorPath)
+		if err != nil {
+			s.mu.Unlock()
+			return audit.Result{}, true, fmt.Errorf("audit wal anchor read: %w", err)
+		}
+		if !anchored {
+			s.mu.Unlock()
+			return audit.Result{}, true, fmt.Errorf("audit wal anchor missing: %s", anchorPath)
+		}
+	}
+	s.mu.Unlock()
+
+	res, err := audit.VerifyPrefixAgainstAnchor(walPath, limit, anchor, anchored)
+	s.recordAuditWALVerification(res, anchored, err, time.Now())
 	return res, true, err
 }
 

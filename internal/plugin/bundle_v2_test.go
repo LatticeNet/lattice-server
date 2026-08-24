@@ -242,3 +242,60 @@ func TestExtractBundleV2RejectsTruncatedFileBody(t *testing.T) {
 		t.Fatal("expected truncated archive rejection")
 	}
 }
+
+// The extraction cache is derived data, and operational practice now depends on
+// that: it is pruned to the installed set on a timer and left out of deploy
+// snapshots, on the grounds that the loader rebuilds whatever it needs from the
+// signed artifact sitting next to the manifest. That grounds has to be a test,
+// not a reading of the code, because the cost of it being wrong is a control
+// plane that comes back from a snapshot with no plugins.
+func TestExtractBundleV2RebuildsAnErasedCache(t *testing.T) {
+	archive := makeTestArchive(t,
+		testArchiveEntry{name: "bin/linux-amd64/plugin", body: []byte("#!/bin/sh\necho ok\n")},
+		testArchiveEntry{name: "ui/index.html", body: []byte("<main>Example</main>")},
+	)
+	m := testManifestForArchive(archive)
+	cache := t.TempDir()
+
+	first, err := ExtractBundleV2(cache, m, archive, "linux/amd64", DefaultBundleLimits(), testV2TrustPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(first.UIEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Everything the cache held is gone, exactly as it would be after a prune
+	// or a restore from a snapshot that did not carry it.
+	entries, err := os.ReadDir(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(cache, entry.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(first.Root); !os.IsNotExist(err) {
+		t.Fatalf("the fixture is wrong: %s should be gone, stat error was %v", first.Root, err)
+	}
+
+	rebuilt, err := ExtractBundleV2(cache, m, archive, "linux/amd64", DefaultBundleLimits(), testV2TrustPolicy())
+	if err != nil {
+		t.Fatalf("the artifact alone must be enough to rebuild the cache: %v", err)
+	}
+	if rebuilt.Root != first.Root {
+		t.Fatalf("the rebuilt bundle landed somewhere else: %q != %q", rebuilt.Root, first.Root)
+	}
+	if rebuilt.Digest != m.Bundle.DigestSHA256 {
+		t.Fatalf("rebuilt digest %q does not match the manifest", rebuilt.Digest)
+	}
+	rebuiltBody, err := os.ReadFile(rebuilt.UIEntry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rebuiltBody) != string(body) {
+		t.Fatal("the rebuilt bundle does not hold what the first extraction did")
+	}
+}

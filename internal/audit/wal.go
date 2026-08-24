@@ -330,6 +330,45 @@ func VerifyAnchoredFile(walPath, anchorPath string) (Result, error) {
 	return res, nil
 }
 
+// ReadAnchor returns the durable sidecar head, and whether one has been
+// written yet.
+func ReadAnchor(path string) (Anchor, bool, error) {
+	return readAnchor(path)
+}
+
+// VerifyPrefixAgainstAnchor verifies the first limit bytes of the WAL against an
+// anchor captured at the moment limit was measured.
+//
+// VerifyAnchoredFile reads to the end of the file, so it can only run while
+// appends are held off, which meant taking the store lock for the length of a
+// walk over the whole log. The file is append-only, so a prefix of it never
+// changes: capture the length and the anchor together under the lock, then walk
+// the prefix with the lock released. Records appended after the capture lie
+// beyond limit and cannot make a sound chain look broken.
+func VerifyPrefixAgainstAnchor(walPath string, limit int64, anchor Anchor, anchored bool) (Result, error) {
+	res := Result{Count: 0, Head: genesisHash}
+	f, err := os.Open(walPath)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return Result{}, err
+	default:
+		defer f.Close()
+		res, err = Verify(io.LimitReader(f, limit))
+		if err != nil {
+			return res, err
+		}
+	}
+	if !anchored {
+		return res, nil
+	}
+	res.Anchor = &anchor
+	if !anchorMatchesResult(anchor, res) {
+		return res, anchorMismatchError(anchor, res)
+	}
+	return res, nil
+}
+
 func verifyWALPath(path string) (Result, error) {
 	existing, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {

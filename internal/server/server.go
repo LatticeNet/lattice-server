@@ -552,6 +552,11 @@ func New(opts Options) (*Server, error) {
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
 	}
+	if !opts.DisableRenewalScheduler {
+		// Grouped with the other background loops so a test server does not
+		// grow a goroutine walking a WAL it never wrote.
+		newAuditWALVerifier(opts.Store, opts.Logger, auditWALVerifyInterval).start()
+	}
 	s.startTerminalReaper()
 	return s, nil
 }
@@ -1265,16 +1270,48 @@ func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	} else {
 		checks["store"] = "ok"
 	}
-	if _, enabled, err := s.store.AuditWALVerify(); err != nil {
+	// Readiness reports what the last chain walk found. It used to run its own,
+	// which meant every probe read the whole append-only log, holding the store
+	// lock for six seconds on a million records. The walk now happens on a
+	// timer; a probe that outran it, or a verifier that has stopped running,
+	// says so instead of reporting a stale "ok".
+	if walCheck, ok := s.auditWALReadiness(s.now()); !ok {
 		status = "error"
 		code = http.StatusServiceUnavailable
-		checks["audit_wal"] = err.Error()
-	} else if enabled {
-		checks["audit_wal"] = "ok"
+		checks["audit_wal"] = walCheck
 	} else {
-		checks["audit_wal"] = "disabled"
+		checks["audit_wal"] = walCheck
 	}
 	writeJSON(w, code, map[string]any{"status": status, "checks": checks})
+}
+
+// auditWALReadiness turns the last chain walk into a readiness line, and says
+// whether it counts as ready.
+func (s *Server) auditWALReadiness(now time.Time) (string, bool) {
+	last, ok := s.store.LastAuditWALVerification()
+	if !ok {
+		return "never verified", false
+	}
+	if !last.Enabled {
+		return "disabled", true
+	}
+	if !last.OK {
+		return last.Err, false
+	}
+	age := now.Sub(last.At)
+	if age < 0 {
+		// The record is stamped from the wall clock and the caller may be a
+		// test clock or a machine mid-adjustment. A negative age is not a
+		// finding; reporting "verified -3h ago" would be.
+		age = 0
+	}
+	if age >= auditWALVerifyStaleAfter {
+		// A verifier that has stopped is indistinguishable from a healthy one
+		// unless the age is checked, and "ok" from a dead check is worse than
+		// no check at all.
+		return fmt.Sprintf("stale: last verified %s ago", age.Round(time.Second)), false
+	}
+	return fmt.Sprintf("ok (verified %s ago, %d records)", age.Round(time.Second), last.Count), true
 }
 
 func (s *Server) staticHandler() http.Handler {

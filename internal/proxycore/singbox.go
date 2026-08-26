@@ -57,15 +57,97 @@ type Artifact struct {
 type SingBoxArtifact = Artifact
 
 type singBoxConfig struct {
-	Log       singBoxLog        `json:"log"`
-	Inbounds  []singBoxInbound  `json:"inbounds"`
-	Outbounds []singBoxOutbound `json:"outbounds"`
-	Route     singBoxRoute      `json:"route"`
+	Log          singBoxLog           `json:"log"`
+	Inbounds     []singBoxInbound     `json:"inbounds"`
+	Outbounds    []singBoxOutbound    `json:"outbounds"`
+	Route        singBoxRoute         `json:"route"`
+	Experimental *singBoxExperimental `json:"experimental,omitempty"`
 }
 
 type singBoxLog struct {
 	Level     string `json:"level"`
 	Timestamp bool   `json:"timestamp"`
+}
+
+type singBoxExperimental struct {
+	ClashAPI *singBoxClashAPI `json:"clash_api,omitempty"`
+}
+
+// singBoxClashAPI is the loopback control endpoint the trace collector reads.
+// It is what makes per-node log verbosity changeable without restarting the
+// core, because sing-box delivers to Clash API subscribers without applying
+// log.level. Restarting is what drops every live connection, so the whole
+// feature depends on this block being present.
+type singBoxClashAPI struct {
+	ExternalController string `json:"external_controller"`
+	Secret             string `json:"secret,omitempty"`
+}
+
+// defaultSingBoxLogLevel is what a managed node gets when its profile does not
+// say. It is "info" rather than "warn" because the connection lifecycle lines
+// that a trace record is assembled from are logged at info; at warn a node is
+// silent about every connection it serves.
+const defaultSingBoxLogLevel = "info"
+
+// allowedSingBoxLogLevels are the levels a profile may ask for. Anything else
+// is rejected rather than silently corrected, because a typo that quietly
+// downgrades a node to "no connection logging" is exactly the kind of silent
+// failure this subsystem exists to remove.
+var allowedSingBoxLogLevels = map[string]bool{
+	"trace": true, "debug": true, "info": true,
+	"warn": true, "error": true, "fatal": true, "panic": true,
+}
+
+// renderLogAndExperimental builds the log block and, when the profile asks for
+// it, the Clash API block. The address must be loopback: this endpoint serves
+// live connection metadata and log lines, so binding it anywhere reachable
+// would hand that to the network.
+func renderLogAndExperimental(profile model.ProxyNodeProfile) (singBoxLog, *singBoxExperimental, error) {
+	level := strings.TrimSpace(profile.LogLevel)
+	if level == "" {
+		level = defaultSingBoxLogLevel
+	}
+	if !allowedSingBoxLogLevels[level] {
+		return singBoxLog{}, nil, fmt.Errorf("log_level %q is not a valid sing-box level", profile.LogLevel)
+	}
+	log := singBoxLog{Level: level, Timestamp: true}
+
+	addr := strings.TrimSpace(profile.ClashAPI)
+	if addr == "" {
+		return log, nil, nil
+	}
+	if err := validateLoopbackAddr(addr); err != nil {
+		return singBoxLog{}, nil, fmt.Errorf("clash_api: %w", err)
+	}
+	return log, &singBoxExperimental{ClashAPI: &singBoxClashAPI{
+		ExternalController: addr,
+		Secret:             strings.TrimSpace(profile.ClashAPISecret),
+	}}, nil
+}
+
+// validateLoopbackAddr accepts only host:port where host is a loopback literal
+// or "localhost". A hostname that merely resolves to loopback today is refused,
+// because resolution is not a property the renderer can pin.
+func validateLoopbackAddr(addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%q must be host:port", addr)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("port %q is out of range", portStr)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return fmt.Errorf("host %q must be a loopback literal or localhost", host)
+	}
+	if !ip.IsLoopback() {
+		return fmt.Errorf("host %q is not a loopback address", host)
+	}
+	return nil
 }
 
 type singBoxInbound struct {
@@ -187,11 +269,16 @@ func RenderSingBoxConfig(profile model.ProxyNodeProfile, inbounds []model.ProxyI
 		warnings = append(warnings, skipped...)
 		rendered = append(rendered, sbInbound)
 	}
+	logBlock, experimental, err := renderLogAndExperimental(profile)
+	if err != nil {
+		return singBoxConfig{}, nil, err
+	}
 	return singBoxConfig{
-		Log:       singBoxLog{Level: "warn", Timestamp: true},
-		Inbounds:  rendered,
-		Outbounds: []singBoxOutbound{{Type: "direct", Tag: defaultOutboundTag}},
-		Route:     singBoxRoute{Final: defaultOutboundTag},
+		Log:          logBlock,
+		Inbounds:     rendered,
+		Outbounds:    []singBoxOutbound{{Type: "direct", Tag: defaultOutboundTag}},
+		Route:        singBoxRoute{Final: defaultOutboundTag},
+		Experimental: experimental,
 	}, warnings, nil
 }
 

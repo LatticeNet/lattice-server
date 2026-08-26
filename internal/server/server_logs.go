@@ -177,6 +177,10 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p prin
 				writeError(w, http.StatusBadRequest, errors.New("agent debug sources are managed by node debug policy"))
 				return
 			}
+			if had && isSingBoxLogSource(existing) {
+				writeError(w, http.StatusBadRequest, errors.New("sing-box sources are managed by the node trace policy"))
+				return
+			}
 		}
 		ls := existing
 		if !had {
@@ -422,7 +426,18 @@ func (s *Server) handleAgentLogSources(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"sources": []model.LogSource{}})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sources": s.store.LogSourcesForNode(nodeID)})
+	// Virtual sources are fed by the subsystem that owns them, not tailed from
+	// disk. Handing one to the file tailer makes it chase a path that cannot
+	// exist and log the failure forever.
+	all := s.store.LogSourcesForNode(nodeID)
+	tailable := make([]model.LogSource, 0, len(all))
+	for _, ls := range all {
+		if strings.Contains(ls.Path, "://") {
+			continue
+		}
+		tailable = append(tailable, ls)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sources": tailable})
 }
 
 func (s *Server) handleAgentLogs(w http.ResponseWriter, r *http.Request) {

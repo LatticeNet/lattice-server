@@ -47,6 +47,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/sshguard"
 	"github.com/LatticeNet/lattice-server/internal/store"
 	"github.com/LatticeNet/lattice-server/internal/telemetry"
+	"github.com/LatticeNet/lattice-server/internal/tracestore"
 	"github.com/LatticeNet/lattice-server/internal/wireguard"
 	"github.com/LatticeNet/lattice-server/internal/worker"
 )
@@ -63,7 +64,11 @@ type Options struct {
 	// the log-ingestion feature: its endpoints return 503 and agents are told to
 	// tail nothing. Injected by main (opened beside the state file with the same
 	// cipher), mirroring Store.
-	LogStore      *logstore.Store
+	LogStore *logstore.Store
+	// TraceStore is the sing-box connection trace database (trace.db). Nil
+	// disables tracing: its endpoints return 503 and agents are told to collect
+	// nothing. Injected by main beside LogStore with the same cipher.
+	TraceStore    *tracestore.Store
 	AdminUsername string
 	AdminPassword string
 	Build         BuildInfo
@@ -150,7 +155,8 @@ type BuildInfo struct {
 
 type Server struct {
 	store         *store.Store
-	logStore      *logstore.Store // bounded log-line db (logs.db); nil disables log ingestion
+	logStore      *logstore.Store   // bounded log-line db (logs.db); nil disables log ingestion
+	traceStore    *tracestore.Store // sing-box connection trace db (trace.db); nil disables tracing
 	webFS         fs.FS
 	secureCookies bool
 	trustProxy    bool
@@ -438,6 +444,7 @@ func New(opts Options) (*Server, error) {
 	s := &Server{
 		store:         opts.Store,
 		logStore:      opts.LogStore,
+		traceStore:    opts.TraceStore,
 		webFS:         opts.WebFS,
 		secureCookies: opts.SecureCookies,
 		trustProxy:    opts.TrustProxy,
@@ -548,6 +555,8 @@ func New(opts Options) (*Server, error) {
 	if !opts.DisableRenewalScheduler {
 		s.startRenewalScheduler()
 		s.startNodeLivenessSweeper()
+		s.startTraceRetention()
+		s.startTraceReattribution()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1065,6 +1074,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/logs/sources/delete", s.withAuth("log:admin", s.handleDeleteLogSource))
 	mux.HandleFunc("/api/logs/query", s.withAuth("log:read", s.handleLogQuery))
 	mux.HandleFunc("/api/logs/stats", s.withAuth("log:read", s.handleLogStats))
+	mux.HandleFunc("/api/trace/connections", s.withAuth("log:read", s.handleTraceConnections))
+	mux.HandleFunc("/api/trace/lines", s.withAuth("log:read", s.handleTraceLines))
+	mux.HandleFunc("/api/trace/sessions", s.withAuth("", s.handleTraceSessions))
+	mux.HandleFunc("/api/trace/sessions/stop", s.withAuth("log:admin", s.handleTraceSessionStop))
+	mux.HandleFunc("/api/trace/policy", s.withAuth("", s.handleTracePolicy))
+	mux.HandleFunc("/api/trace/markers", s.withAuth("log:read", s.handleTraceMarkers))
+	mux.HandleFunc("/api/trace/hops", s.withAuth("log:read", s.handleTraceHops))
+	mux.HandleFunc("/api/trace/stats", s.withAuth("log:read", s.handleTraceStats))
 	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/tokens/delete", s.withAuth("token:admin", s.handleDeleteToken))
@@ -1137,6 +1154,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
 	mux.HandleFunc("/api/agent/log-sources", s.withAgentLimit(s.handleAgentLogSources))
 	mux.HandleFunc("/api/agent/logs", s.withAgentLimit(s.handleAgentLogs))
+	mux.HandleFunc("/api/agent/trace-config", s.withAgentLimit(s.handleAgentTraceConfig))
+	mux.HandleFunc("/api/agent/trace", s.withAgentLimit(s.handleAgentTrace))
 	mux.HandleFunc("/api/agent/debug-events", s.withAgentLimit(s.handleAgentDebugEvents))
 	mux.HandleFunc("/api/agent/event", s.withAgentLimit(s.handleAgentEvent))
 	mux.HandleFunc(agentBinaryPathPrefix, s.withAgentLimit(s.handleAgentBinary))

@@ -1,9 +1,12 @@
 package tracestore
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -335,8 +338,34 @@ func (s *Store) AppendLines(ls []model.TraceLine) (int, error) {
 	}
 	defer tx.Rollback()
 
+	// Seq is assigned HERE, not by the agent.
+	//
+	// It is the tail cursor: QueryLines pages with "seq > afterSeq", and the
+	// primary key is (session_id, seq, node_id). An agent cannot know a global
+	// order across its own batches, let alone across several nodes feeding one
+	// session, so if it were left to set Seq every line would arrive as zero,
+	// they would all collapse onto a single primary key, and a tail starting at
+	// zero could never return any of them. Assigning it under the write lock
+	// inside the transaction makes it monotonic per session across every node.
+	next := map[string]uint64{}
+	for i := range ls {
+		sessionID := ls[i].SessionID
+		if _, ok := next[sessionID]; ok {
+			continue
+		}
+		var maxSeq sql.NullInt64
+		if err := tx.QueryRow(`SELECT MAX(seq) FROM trace_lines WHERE session_id = ?`, sessionID).Scan(&maxSeq); err != nil {
+			return 0, fmt.Errorf("tracestore: append lines: read sequence: %w", err)
+		}
+		if maxSeq.Valid && maxSeq.Int64 > 0 {
+			next[sessionID] = uint64(maxSeq.Int64)
+		}
+	}
+
 	for i := range ls {
 		l := ls[i]
+		next[l.SessionID]++
+		l.Seq = next[l.SessionID]
 		// Both message and raw are free-text log body and are sealed. Neither is
 		// an index column, so unlike dst_host there is no reason not to.
 		message, err := s.seal(l.Message)
@@ -353,18 +382,26 @@ func (s *Store) AppendLines(ls []model.TraceLine) (int, error) {
 			// deletes by age, so it is stamped on arrival instead.
 			at = time.Now().UTC()
 		}
-		if _, err := tx.Exec(`INSERT INTO trace_lines
-			(session_id, node_id, seq, at, level, log_id, tag, message, raw)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (session_id, seq, node_id) DO UPDATE SET
-				at = excluded.at,
-				level = excluded.level,
-				log_id = excluded.log_id,
-				tag = excluded.tag,
-				message = excluded.message,
-				raw = excluded.raw`,
-			l.SessionID, l.NodeID, int64(l.Seq), nanos(at), l.Level, int64(l.LogID), l.Tag, message, raw); err != nil {
+		// The dedupe key is computed from the line's own content, before
+		// sealing, so it stays stable whether or not a cipher is configured.
+		sum := sha256.Sum256([]byte(strings.Join([]string{
+			l.NodeID, strconv.FormatUint(uint64(l.LogID), 10),
+			strconv.FormatInt(nanos(at), 10), l.Level, l.Tag, l.Message, l.Raw,
+		}, "\x00")))
+		dedupe := hex.EncodeToString(sum[:])
+
+		res, err := tx.Exec(`INSERT INTO trace_lines
+			(session_id, node_id, seq, at, level, log_id, tag, message, raw, dedupe_key)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (session_id, dedupe_key) DO NOTHING`,
+			l.SessionID, l.NodeID, int64(l.Seq), nanos(at), l.Level, int64(l.LogID), l.Tag, message, raw, dedupe)
+		if err != nil {
 			return 0, fmt.Errorf("tracestore: append lines: %w", err)
+		}
+		// A conflict means this exact line is already stored, so the sequence it
+		// was about to consume is handed back rather than leaving a hole.
+		if n, err := res.RowsAffected(); err == nil && n == 0 {
+			next[l.SessionID]--
 		}
 	}
 	if err := tx.Commit(); err != nil {

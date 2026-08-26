@@ -185,17 +185,26 @@ var schemaV1 = []string{
 	// one session, ascending sequence, so QueryLines is an index range scan and
 	// a re-delivered line replaces itself instead of duplicating.
 	`CREATE TABLE IF NOT EXISTS trace_lines (
-		session_id TEXT    NOT NULL,
-		node_id    TEXT    NOT NULL,
-		seq        INTEGER NOT NULL,
-		at         INTEGER NOT NULL,
-		level      TEXT    NOT NULL DEFAULT '',
-		log_id     INTEGER NOT NULL DEFAULT 0,
-		tag        TEXT    NOT NULL DEFAULT '',
-		message    TEXT    NOT NULL DEFAULT '',
-		raw        TEXT    NOT NULL DEFAULT '',
+		session_id  TEXT    NOT NULL,
+		node_id     TEXT    NOT NULL,
+		seq         INTEGER NOT NULL,
+		at          INTEGER NOT NULL,
+		level       TEXT    NOT NULL DEFAULT '',
+		log_id      INTEGER NOT NULL DEFAULT 0,
+		tag         TEXT    NOT NULL DEFAULT '',
+		message     TEXT    NOT NULL DEFAULT '',
+		raw         TEXT    NOT NULL DEFAULT '',
+		dedupe_key  TEXT    NOT NULL DEFAULT '',
 		PRIMARY KEY (session_id, seq, node_id)
 	) STRICT`,
+	// Two different jobs, two different keys. seq is the tail cursor and is
+	// assigned by the store, because no agent can order its lines against
+	// another node feeding the same session. dedupe_key is content derived, so
+	// a batch re-delivered after a lost response is recognised and ignored
+	// rather than appearing twice under fresh sequence numbers. Using seq for
+	// both would force the agent to invent the cursor, which is what collapsed
+	// every line onto one row.
+	`CREATE UNIQUE INDEX IF NOT EXISTS idx_trace_lines_dedupe ON trace_lines(session_id, dedupe_key)`,
 	// Retention deletes lines by age across all sessions, which the primary key
 	// cannot serve.
 	`CREATE INDEX IF NOT EXISTS idx_trace_lines_at ON trace_lines(at)`,

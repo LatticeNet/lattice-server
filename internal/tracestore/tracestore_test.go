@@ -710,3 +710,60 @@ func TestConcurrentAppendAndQuery(t *testing.T) {
 		t.Errorf("records = %d, want %d", st.Records, writers*perW)
 	}
 }
+
+// Line sequence is assigned by the store, not by the agent.
+//
+// This is the cursor the live tail pages on, and the primary key includes it.
+// If it stayed zero every line would collapse onto one row and a tail starting
+// at zero could never return any of them, which is exactly what happened before
+// it was assigned here.
+func TestAppendLinesAssignsMonotonicSeq(t *testing.T) {
+	s := newStore(t, Options{})
+
+	batch := func(n int, node string) []model.TraceLine {
+		out := make([]model.TraceLine, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, model.TraceLine{
+				SessionID: "sess-1",
+				NodeID:    node,
+				At:        time.Date(2026, 8, 26, 12, 0, i, 0, time.UTC),
+				Level:     "trace",
+				Message:   fmt.Sprintf("%s line %d", node, i),
+			})
+		}
+		return out
+	}
+
+	if _, err := s.AppendLines(batch(3, "node-a")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AppendLines(batch(2, "node-b")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.QueryLines("sess-1", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("stored %d lines, want 5; a zero sequence collapses them onto one primary key", len(got))
+	}
+	for i, l := range got {
+		if l.Seq != uint64(i+1) {
+			t.Fatalf("line %d has seq %d, want %d", i, l.Seq, i+1)
+		}
+	}
+
+	// The tail must advance: asking for everything after the third line returns
+	// exactly the last two.
+	tail, err := s.QueryLines("sess-1", 3, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tail) != 2 {
+		t.Fatalf("tail after seq 3 returned %d lines, want 2", len(tail))
+	}
+	if tail[0].Seq != 4 {
+		t.Fatalf("tail starts at seq %d, want 4", tail[0].Seq)
+	}
+}

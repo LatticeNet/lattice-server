@@ -555,6 +555,7 @@ func New(opts Options) (*Server, error) {
 	if !opts.DisableRenewalScheduler {
 		s.startRenewalScheduler()
 		s.startNodeLivenessSweeper()
+		s.startTraceRetention()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()

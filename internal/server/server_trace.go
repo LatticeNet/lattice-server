@@ -326,10 +326,21 @@ func (s *Server) createTraceSession(w http.ResponseWriter, r *http.Request, p pr
 		ttl = traceSessionMaxTTL
 	}
 	now := s.now()
+	// Persist the RESOLVED target set, never the request's empty node list.
+	//
+	// An empty Filter.NodeIDs means "every node" everywhere it is later read:
+	// traceAgentConfig ships the session to any node that polls, and
+	// traceSessionVisible and the stop path both treat it as fleet scope. An
+	// operator confined to one node who leaves the node filter blank, which is
+	// the dashboard default, would otherwise have authorised a capture of one
+	// node and started a capture of the fleet. Freezing the authorised set here
+	// makes every later read agree with what was actually permitted.
+	filter := req.Filter
+	filter.NodeIDs = append([]string(nil), targets...)
 	sess := model.TraceSession{
 		ID:            id.New("trace"),
 		Name:          req.Name,
-		Filter:        req.Filter,
+		Filter:        filter,
 		Level:         req.Level,
 		StartedAt:     now,
 		ExpiresAt:     now.Add(ttl),
@@ -721,3 +732,40 @@ func correlationOrNew(p principal) string {
 	}
 	return id.New("corr")
 }
+
+// traceRetentionInterval is how often the trace store is swept. The TTLs are
+// measured in days and the size cap in gigabytes, so sweeping hourly is ample
+// and keeps each pass small enough not to hold a long write lock.
+const traceRetentionInterval = time.Hour
+
+// startTraceRetention runs the trace store's retention sweep on an interval.
+//
+// Without it the TTLs and the size cap are inert: Open honours them as
+// configuration and nothing ever enforces them, so trace.db grows until the
+// disk fills. Connection records accumulate on every node at the always-on
+// info floor, so this is not a slow leak on a busy fleet.
+//
+// A sweep that reports it could not get under the cap is retried promptly
+// rather than waiting a full interval, because at that point the store is
+// already over budget.
+func (s *Server) startTraceRetention() {
+	if s.traceStore == nil {
+		return
+	}
+	go func() {
+		for {
+			res, err := s.traceStore.Retain(s.now())
+			if err != nil {
+				s.logger.Printf("trace retention: %v", err)
+			} else if res.Truncated {
+				// Still above the cap after a bounded pass. Come back sooner.
+				s.logger.Printf("trace retention: still above the size cap after a pass; sweeping again shortly")
+				time.Sleep(traceRetentionRetryDelay)
+				continue
+			}
+			time.Sleep(traceRetentionInterval)
+		}
+	}()
+}
+
+const traceRetentionRetryDelay = time.Minute

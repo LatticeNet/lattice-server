@@ -6,12 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/secret"
 	"github.com/LatticeNet/lattice-server/internal/store"
 	"github.com/LatticeNet/lattice-server/internal/tracestore"
@@ -428,5 +430,147 @@ func TestProfileViewNeverCarriesTheClashAPISecret(t *testing.T) {
 	}
 	if bytes.Contains(body, []byte("clash_api_secret")) {
 		t.Fatal("the profile view exposes a clash_api_secret field")
+	}
+}
+
+// A node-confined operator cannot start a fleet-wide capture.
+//
+// The dashboard default leaves the node filter blank, and an empty
+// Filter.NodeIDs means "every node" to traceAgentConfig, traceSessionVisible
+// and the stop path. Storing the request's empty list would let an operator
+// authorised for one node start a capture that every node in the fleet picks
+// up: a privacy widening, and trace-level load on machines outside their scope.
+func TestNodeConfinedOperatorCannotStartAFleetWideCapture(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, err := tracestore.Open(filepath.Join(t.TempDir(), "trace.db"), secret.Disabled(), tracestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ts.Close() })
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	traceNode(t, st, "node-a")
+	traceNode(t, st, "node-b")
+
+	confined := principal{Principal: rbac.Principal{
+		ActorID:         "confined-operator",
+		Scopes:          []string{"log:read", "log:admin"},
+		ServerAllowlist: []string{"node-a"},
+	}}
+
+	body := bytes.NewBufferString(`{"name":"blank node filter","level":"debug","filter":{}}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/trace/sessions", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.createTraceSession(rec, req, confined)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("confined operator could not create a session: %d %s", rec.Code, rec.Body.String())
+	}
+
+	var sess model.TraceSession
+	if err := json.NewDecoder(rec.Body).Decode(&sess); err != nil {
+		t.Fatal(err)
+	}
+	if len(sess.Filter.NodeIDs) == 0 {
+		t.Fatal("the stored session has an empty node filter, which every reader treats as the whole fleet")
+	}
+	for _, n := range sess.Filter.NodeIDs {
+		if n != "node-a" {
+			t.Fatalf("session targets %q, outside the operator's allowlist", n)
+		}
+	}
+
+	// The decisive check: node-b must not be handed this session when it polls.
+	cfg, err := srv.traceAgentConfig("node-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, as := range cfg.Sessions {
+		if as.ID == sess.ID {
+			t.Fatal("node-b was handed a session it is not a target of")
+		}
+	}
+	// And node-a must still get it, or the fix broke the feature.
+	cfgA, err := srv.traceAgentConfig("node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, as := range cfgA.Sessions {
+		if as.ID == sess.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("node-a did not receive the session it is the target of")
+	}
+}
+
+// Retention must actually run, not merely be configured.
+//
+// Open honours the TTLs and the size cap as configuration and enforces nothing.
+// Without a worker calling Retain, trace.db grows until the disk fills, and at
+// the always-on info floor every node contributes records continuously. This
+// pins the wiring, because the failure mode is invisible until it is an outage.
+func TestTraceRetentionIsStartedAndActuallyDeletes(t *testing.T) {
+	dir := t.TempDir()
+	ts, err := tracestore.Open(filepath.Join(dir, "trace.db"), secret.Disabled(), tracestore.Options{
+		RecordTTL: time.Hour,
+		LineTTL:   time.Hour,
+		RollupTTL: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ts.Close()
+
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	if _, err := ts.AppendRecords([]model.ConnRecord{{
+		NodeID: "node-a", LogID: 1, CoreGeneration: 1,
+		StartedAt: old, EndedAt: old.Add(time.Second),
+		CloseReason: model.CloseEOF,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := ts.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Records != 1 {
+		t.Fatalf("expected the seeded record, got %d", before.Records)
+	}
+
+	res, err := ts.Retain(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RecordsExpired != 1 {
+		t.Fatalf("Retain expired %d records, want 1", res.RecordsExpired)
+	}
+
+	after, err := ts.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Records != 0 {
+		t.Fatalf("%d records survived their TTL", after.Records)
+	}
+}
+
+// The server must call it. A store that enforces nothing is the same as no
+// retention at all, and that is exactly the state this feature shipped in.
+func TestServerStartsTheTraceRetentionWorker(t *testing.T) {
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(src, []byte("s.startTraceRetention()")) {
+		t.Fatal("server startup does not call startTraceRetention; the TTLs and size cap are inert")
 	}
 }

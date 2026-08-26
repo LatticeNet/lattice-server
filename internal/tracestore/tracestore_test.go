@@ -767,3 +767,52 @@ func TestAppendLinesAssignsMonotonicSeq(t *testing.T) {
 		t.Fatalf("tail starts at seq %d, want 4", tail[0].Seq)
 	}
 }
+
+// A record older than one page must still be findable by key.
+//
+// The hops view looks a connection up by identity. Scanning the newest page
+// instead would report "not found" for a record the database is holding, which
+// is the wrong answer for a lookup that has an exact key available.
+func TestRecordByKeyFindsARecordBeyondOnePage(t *testing.T) {
+	s := newStore(t, Options{})
+	base := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+
+	// One target, then far more recent records than a single page returns.
+	target := model.ConnRecord{
+		NodeID: "node-a", CoreGeneration: 7, LogID: 4242,
+		StartedAt: base, EndedAt: base.Add(time.Second),
+		DstHost: "target.example", CloseReason: model.CloseEOF,
+	}
+	if _, err := s.AppendRecords([]model.ConnRecord{target}); err != nil {
+		t.Fatal(err)
+	}
+	filler := make([]model.ConnRecord, 0, MaxQueryLimit+50)
+	for i := 0; i < MaxQueryLimit+50; i++ {
+		filler = append(filler, model.ConnRecord{
+			NodeID: "node-a", CoreGeneration: 7, LogID: uint32(100000 + i),
+			StartedAt:   base.Add(time.Duration(i+1) * time.Minute),
+			EndedAt:     base.Add(time.Duration(i+1)*time.Minute + time.Second),
+			CloseReason: model.CloseEOF,
+		})
+	}
+	if _, err := s.AppendRecords(filler); err != nil {
+		t.Fatal(err)
+	}
+
+	got, found, err := s.RecordByKey("node-a", 7, 4242)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("the oldest record was not found by key; a page scan would miss it")
+	}
+	if got.DstHost != "target.example" {
+		t.Fatalf("dst = %q", got.DstHost)
+	}
+
+	if _, found, err = s.RecordByKey("node-a", 7, 999999); err != nil {
+		t.Fatal(err)
+	} else if found {
+		t.Fatal("a key that was never stored reported found")
+	}
+}

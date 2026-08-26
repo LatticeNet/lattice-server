@@ -197,6 +197,29 @@ func (s *Store) QueryRecords(f Filter) (RecordPage, error) {
 // QueryLines returns the raw lines of one session with seq greater than
 // afterSeq, oldest first. That is the tail shape the dashboard polls with: pass
 // back the last seq you saw and you get only what is new.
+// RecordByKey returns one record by its identity. It exists because a scan of
+// the newest page cannot answer this: a record older than that page is present
+// in the database and absent from the scan, so a caller looking one up by key
+// would report "not found" for something it is storing.
+func (s *Store) RecordByKey(nodeID string, coreGeneration uint64, logID uint32) (model.ConnRecord, bool, error) {
+	rows, err := s.db.Query(`SELECT `+recordColumns+` FROM conn_records
+		WHERE node_id = ? AND core_generation = ? AND log_id = ?
+		ORDER BY started_at DESC LIMIT 1`,
+		nodeID, int64(coreGeneration), int64(logID))
+	if err != nil {
+		return model.ConnRecord{}, false, fmt.Errorf("tracestore: record by key: %w", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return model.ConnRecord{}, false, rows.Err()
+	}
+	rec, err := s.scanRecord(rows)
+	if err != nil {
+		return model.ConnRecord{}, false, err
+	}
+	return rec, true, nil
+}
+
 func (s *Store) QueryLines(sessionID string, afterSeq uint64, limit int) ([]model.TraceLine, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return nil, fmt.Errorf("tracestore: query lines: session id is required")

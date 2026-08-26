@@ -225,24 +225,12 @@ func (s *Server) handleTraceHops(w http.ResponseWriter, r *http.Request, p princ
 		return
 	}
 
-	// Find the anchor record first so the stitch window can be centred on it.
-	anchorPage, err := s.traceStore.QueryRecords(tracestore.Filter{
-		NodeIDs:     []string{nodeID},
-		IncludeOpen: true,
-		Limit:       tracestore.MaxQueryLimit,
-	})
+	// Point lookup, not a scan of the newest page: a record older than that page
+	// is stored and would be reported as missing.
+	anchor, found, err := s.traceStore.RecordByKey(nodeID, gen, uint32(logID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
-	}
-	var anchor model.ConnRecord
-	found := false
-	for _, rec := range anchorPage.Records {
-		if rec.CoreGeneration == gen && uint64(rec.LogID) == logID {
-			anchor = rec
-			found = true
-			break
-		}
 	}
 	if !found {
 		writeError(w, http.StatusNotFound, errors.New("connection record not found"))

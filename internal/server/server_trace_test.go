@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -386,5 +387,46 @@ func TestAgentTraceRejectsABareBatch(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("a bare batch was accepted with %d (%s); the wrong shape must never read as success", rec.Code, rec.Body.String())
+	}
+}
+
+// The Clash API secret must never leave the server except inside the rendered
+// node config, which is already handled as a node-scoped secret-bearing
+// artifact.
+//
+// proxyNodeProfileView is an allowlist, so the secret is excluded today only
+// because nobody copied it across. That is the right shape and a fragile
+// guarantee: this pins it, so adding the field to the view later fails here
+// rather than quietly publishing a bearer token to every profile reader.
+func TestProfileViewNeverCarriesTheClashAPISecret(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	const secret = "clash-api-bearer-do-not-publish"
+
+	if err := st.UpsertProxyNodeProfile(model.ProxyNodeProfile{
+		ID:             "prof-1",
+		NodeID:         "node-a",
+		Core:           model.ProxyCoreSingbox,
+		ClashAPI:       "127.0.0.1:9090",
+		ClashAPISecret: secret,
+	}); err != nil {
+		t.Skipf("profile store shape differs; adjust this guard: %v", err)
+	}
+
+	cookies, csrf := loginSession(t, handler)
+	res := doTrace(t, handler, http.MethodGet, "/api/proxy/profiles", cookies, csrf, nil)
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK {
+		t.Skipf("profiles endpoint returned %d; adjust this guard", res.StatusCode)
+	}
+	if bytes.Contains(body, []byte(secret)) {
+		t.Fatalf("the Clash API secret was served by /api/proxy/profiles:\n%s", body)
+	}
+	if bytes.Contains(body, []byte("clash_api_secret")) {
+		t.Fatal("the profile view exposes a clash_api_secret field")
 	}
 }

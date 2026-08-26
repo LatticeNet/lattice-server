@@ -217,7 +217,10 @@ func (s *Server) handleTraceLines(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	var next uint64
+	// The cursor never goes backwards. A quiet interval returns no lines, and
+	// reporting next_seq=0 there would send the client back to the beginning
+	// and re-deliver everything it already has. Floor it at what was asked for.
+	next := uint64(afterSeq)
 	for _, l := range lines {
 		if l.Seq > next {
 			next = l.Seq
@@ -559,6 +562,18 @@ func (s *Server) handleTraceStats(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// Server-local diagnostics are for whoever administers the server, not for
+	// anyone holding log:read on one node. The path, size, schema version and
+	// cipher state say nothing about that node, and the counts cover the whole
+	// fleet, which is activity outside the caller's allowlist.
+	if !rbac.Allows(p.Principal, "log:read", "") || !s.principalSeesEveryNode(p) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"scoped":         true,
+			"schema_version": stats.SchemaVersion,
+			"cipher_enabled": stats.CipherEnabled,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, stats)
 }
 
@@ -769,3 +784,15 @@ func (s *Server) startTraceRetention() {
 }
 
 const traceRetentionRetryDelay = time.Minute
+
+// principalSeesEveryNode reports whether this principal is unrestricted across
+// the fleet. Fleet-wide aggregates are only honest to show to someone who may
+// see every node that contributed to them.
+func (s *Server) principalSeesEveryNode(p principal) bool {
+	for _, n := range s.store.Nodes() {
+		if !rbac.Allows(p.Principal, "log:read", n.ID) {
+			return false
+		}
+	}
+	return true
+}

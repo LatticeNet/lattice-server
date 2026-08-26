@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -572,5 +573,60 @@ func TestServerStartsTheTraceRetentionWorker(t *testing.T) {
 	}
 	if !bytes.Contains(src, []byte("s.startTraceRetention()")) {
 		t.Fatal("server startup does not call startTraceRetention; the TTLs and size cap are inert")
+	}
+}
+
+// A quiet tail interval must not rewind the cursor.
+//
+// Returning next_seq=0 when a poll finds nothing sends the client back to the
+// start, so every quiet moment re-delivers the whole tail and the view fills
+// with duplicates of the evidence the operator is reading.
+func TestTailCursorNeverGoesBackwards(t *testing.T) {
+	handler, st, ts := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	sess := model.TraceSession{
+		ID: "trace-x", Name: "x", Level: model.TraceLevelTrace,
+		StartedAt: time.Now().UTC().Add(-time.Minute),
+		ExpiresAt: time.Now().UTC().Add(time.Hour),
+		State:     model.TraceSessionRunning,
+		Filter:    model.TraceFilter{NodeIDs: []string{"node-a"}},
+	}
+	if err := st.UpsertTraceSession(sess); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ts.AppendLines([]model.TraceLine{
+		{SessionID: "trace-x", NodeID: "node-a", At: time.Now().UTC(), Level: "info", Message: "one"},
+		{SessionID: "trace-x", NodeID: "node-a", At: time.Now().UTC(), Level: "info", Message: "two"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	read := func(after int) (int, uint64) {
+		res := doTrace(t, handler, http.MethodGet,
+			"/api/trace/lines?session_id=trace-x&after_seq="+strconv.Itoa(after), cookies, csrf, nil)
+		defer res.Body.Close()
+		var out struct {
+			Lines   []model.TraceLine `json:"lines"`
+			NextSeq uint64            `json:"next_seq"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		return len(out.Lines), out.NextSeq
+	}
+
+	n, next := read(0)
+	if n != 2 || next != 2 {
+		t.Fatalf("first page: %d lines, next_seq %d; want 2 and 2", n, next)
+	}
+	// Nothing new since. The cursor must hold, not reset.
+	n, next = read(int(next))
+	if n != 0 {
+		t.Fatalf("quiet poll returned %d lines, want 0", n)
+	}
+	if next != 2 {
+		t.Fatalf("quiet poll reported next_seq %d; a value below the request rewinds the tail and duplicates evidence", next)
 	}
 }

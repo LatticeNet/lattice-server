@@ -2,6 +2,8 @@ module github.com/LatticeNet/lattice-server
 
 go 1.26
 
+toolchain go1.26.6
+
 require (
 	github.com/LatticeNet/lattice-sdk v0.2.19-0.20260819134534-9ddc0d4e9490
 	github.com/coreos/go-oidc/v3 v3.18.0

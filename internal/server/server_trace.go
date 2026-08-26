@@ -639,6 +639,16 @@ func (s *Server) handleAgentTrace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, apiError(model.APIErrorInternal, "connection tracing is not enabled"))
 		return
 	}
+	// Reject a bare TraceBatch sent where the {node_id, batch} envelope belongs.
+	// TraceBatch carries its own node_id, so the wrong shape authenticates
+	// cleanly and then decodes to an EMPTY batch, and the node is told 200 OK
+	// with zero records accepted. A collector could ship into that void
+	// indefinitely. Detecting it costs one check; not detecting it cost a live
+	// debugging round.
+	if req.Batch.SourceLooksBare() {
+		writeError(w, http.StatusBadRequest, errors.New(`trace batch must be sent as {"node_id":...,"batch":{...}}; a bare batch was received`))
+		return
+	}
 	// Fail closed on cross-node writes: a node may only report its own traffic.
 	for i := range req.Batch.Records {
 		if req.Batch.Records[i].NodeID != "" && req.Batch.Records[i].NodeID != req.NodeID {

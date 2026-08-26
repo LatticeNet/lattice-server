@@ -358,3 +358,33 @@ func TestAgentTraceConfigWithoutStoreReportsDisabled(t *testing.T) {
 		t.Fatal("tracing is not enabled on this server; the policy must say so")
 	}
 }
+
+// A bare TraceBatch posted where the envelope belongs must be refused. It
+// authenticates cleanly, because TraceBatch carries its own node_id, and then
+// decodes to an empty batch. Without this guard the node is told 200 OK with
+// zero records accepted and can ship into that void indefinitely.
+func TestAgentTraceRejectsABareBatch(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	token := traceNode(t, st, "node-a")
+
+	// A realistic bare batch: exactly what a collector that forgot the envelope
+	// would send. node_id is present at the top level, so authentication
+	// succeeds and only the shape is wrong.
+	bare, _ := json.Marshal(model.TraceBatch{
+		NodeID:     "node-a",
+		CapturedAt: time.Now().UTC(),
+		Records: []model.ConnRecord{{
+			NodeID:    "node-a",
+			LogID:     42,
+			StartedAt: time.Now().UTC(),
+		}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/trace", bytes.NewBuffer(bare))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a bare batch was accepted with %d (%s); the wrong shape must never read as success", rec.Code, rec.Body.String())
+	}
+}

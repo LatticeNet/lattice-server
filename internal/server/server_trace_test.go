@@ -1,0 +1,360 @@
+package server
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/secret"
+	"github.com/LatticeNet/lattice-server/internal/store"
+	"github.com/LatticeNet/lattice-server/internal/tracestore"
+)
+
+// Trace endpoint tests.
+//
+// The cases that matter most here are the ones about refusing things: a node
+// reporting another node's traffic, a session outliving its ceiling, and an
+// unknown log level being accepted. Each of those failing quietly would produce
+// data that looks correct and is not.
+
+func newTraceTestServer(t *testing.T) (http.Handler, *store.Store, *tracestore.Store) {
+	t.Helper()
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts, err := tracestore.Open(filepath.Join(t.TempDir(), "trace.db"), secret.Disabled(), tracestore.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ts.Close() })
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return srv.Handler(), st, ts
+}
+
+// traceNode creates a node whose bearer token is derivable in tests, so the
+// agent endpoints can be exercised through real authentication rather than by
+// bypassing it.
+func traceNode(t *testing.T, st *store.Store, id string) string {
+	t.Helper()
+	token := "node-token-" + id
+	hash, err := auth.HashSecret(token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNode(model.Node{ID: id, Name: id, TokenHash: hash}); err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
+func doTrace(t *testing.T, handler http.Handler, method, path string, cookies []*http.Cookie, csrf string, body any) *http.Response {
+	t.Helper()
+	var rdr *bytes.Buffer
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rdr = bytes.NewBuffer(b)
+	} else {
+		rdr = bytes.NewBuffer(nil)
+	}
+	req := httptest.NewRequest(method, path, rdr)
+	req.Header.Set("Content-Type", "application/json")
+	if csrf != "" {
+		req.Header.Set("X-Lattice-CSRF", csrf)
+	}
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec.Result()
+}
+
+func TestTraceSessionTTLIsClampedToTheCeiling(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	res := doTrace(t, handler, http.MethodPost, "/api/trace/sessions", cookies, csrf, map[string]any{
+		"name":        "too long",
+		"level":       "debug",
+		"ttl_seconds": 86400,
+		"filter":      map[string]any{"node_ids": []string{"node-a"}},
+	})
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("create session: %d", res.StatusCode)
+	}
+	var sess model.TraceSession
+	if err := json.NewDecoder(res.Body).Decode(&sess); err != nil {
+		t.Fatal(err)
+	}
+	got := sess.ExpiresAt.Sub(sess.StartedAt)
+	if got > traceSessionMaxTTL {
+		t.Fatalf("ttl %s exceeds the ceiling %s", got, traceSessionMaxTTL)
+	}
+	if got != traceSessionMaxTTL {
+		t.Fatalf("a 24h request should clamp to exactly the ceiling, got %s", got)
+	}
+}
+
+func TestTraceSessionDefaultsTTLWhenUnset(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	res := doTrace(t, handler, http.MethodPost, "/api/trace/sessions", cookies, csrf, map[string]any{
+		"name":   "default ttl",
+		"filter": map[string]any{"node_ids": []string{"node-a"}},
+	})
+	defer res.Body.Close()
+	var sess model.TraceSession
+	if err := json.NewDecoder(res.Body).Decode(&sess); err != nil {
+		t.Fatal(err)
+	}
+	if d := sess.ExpiresAt.Sub(sess.StartedAt); d != traceSessionDefaultTTL {
+		t.Fatalf("default ttl = %s, want %s", d, traceSessionDefaultTTL)
+	}
+	if sess.State != model.TraceSessionRunning {
+		t.Fatalf("state = %q", sess.State)
+	}
+}
+
+func TestTraceSessionRejectsUnknownLevel(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	res := doTrace(t, handler, http.MethodPost, "/api/trace/sessions", cookies, csrf, map[string]any{
+		"name":   "bad level",
+		"level":  "verbose",
+		"filter": map[string]any{"node_ids": []string{"node-a"}},
+	})
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown level, got %d", res.StatusCode)
+	}
+}
+
+func TestTracePolicyRejectsNonLoopbackClashAddr(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	for _, addr := range []string{"0.0.0.0:9090", "10.1.2.3:9090", "example.com:9090", "127.0.0.1:0"} {
+		res := doTrace(t, handler, http.MethodPost, "/api/trace/policy", cookies, csrf, map[string]any{
+			"node_id":        "node-a",
+			"enabled":        true,
+			"clash_api_addr": addr,
+		})
+		res.Body.Close()
+		if res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("address %q accepted with status %d; the Clash API must be loopback only", addr, res.StatusCode)
+		}
+	}
+}
+
+func TestTracePolicyRoundTrips(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	res := doTrace(t, handler, http.MethodPost, "/api/trace/policy", cookies, csrf, map[string]any{
+		"node_id":              "node-a",
+		"enabled":              true,
+		"level":                "debug",
+		"budget_lines_per_sec": 1234,
+		"clash_api_addr":       "127.0.0.1:9090",
+	})
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("set policy: %d", res.StatusCode)
+	}
+	var pol model.TracePolicy
+	if err := json.NewDecoder(res.Body).Decode(&pol); err != nil {
+		t.Fatal(err)
+	}
+	if !pol.Enabled || pol.Level != model.TraceLevelDebug || pol.BudgetLinesPerSec != 1234 {
+		t.Fatalf("policy did not round trip: %+v", pol)
+	}
+	node, _ := st.Node("node-a")
+	if node.Trace.Level != model.TraceLevelDebug {
+		t.Fatalf("policy was not persisted on the node: %+v", node.Trace)
+	}
+}
+
+// A node may report only its own traffic. Without this an agent token, which is
+// per node and carried in the clear to the node, would be enough to write
+// records attributed to any other node in the fleet.
+func TestAgentTraceRefusesCrossNodeRecords(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	token := traceNode(t, st, "node-a")
+	traceNode(t, st, "node-b")
+
+	body, _ := json.Marshal(map[string]any{
+		"node_id": "node-a",
+		"batch": map[string]any{
+			"node_id":     "node-a",
+			"captured_at": time.Now().UTC(),
+			"records": []map[string]any{{
+				"node_id":    "node-b",
+				"log_id":     7,
+				"started_at": time.Now().UTC(),
+			}},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/trace", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-node record accepted with status %d", rec.Code)
+	}
+}
+
+func TestAgentTraceAcceptsOwnRecordsAndStampsNodeID(t *testing.T) {
+	handler, st, ts := newTraceTestServer(t)
+	token := traceNode(t, st, "node-a")
+
+	started := time.Now().UTC().Add(-time.Minute)
+	body, _ := json.Marshal(map[string]any{
+		"node_id": "node-a",
+		"batch": map[string]any{
+			"node_id":     "node-a",
+			"captured_at": time.Now().UTC(),
+			"records": []map[string]any{{
+				"log_id":          99,
+				"core_generation": 1,
+				"started_at":      started,
+				"ended_at":        started.Add(time.Second),
+				"dst_host":        "example.com",
+				"dst_port":        443,
+				"close_reason":    model.CloseEOF,
+				"user_name":       "u_a1b2c3d4e5f60718",
+				// bytes_known deliberately absent: an unsampled connection must
+				// stay unknown rather than becoming a measured zero.
+			}},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/trace", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("own record rejected: %d %s", rec.Code, rec.Body.String())
+	}
+
+	page, err := ts.QueryRecords(tracestore.Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Records) != 1 {
+		t.Fatalf("stored %d records, want 1", len(page.Records))
+	}
+	got := page.Records[0]
+	if got.NodeID != "node-a" {
+		t.Fatalf("node_id = %q, want it stamped from the authenticated node", got.NodeID)
+	}
+	if got.BytesKnown {
+		t.Fatal("bytes_known must stay false when the agent did not report it")
+	}
+	if got.Upload != 0 || got.Download != 0 {
+		t.Fatal("unsampled bytes must not be invented")
+	}
+}
+
+func TestTraceEndpointsRequireLogScopes(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+
+	// No session at all: every operator endpoint must refuse.
+	for _, path := range []string{
+		"/api/trace/connections",
+		"/api/trace/sessions",
+		"/api/trace/policy",
+		"/api/trace/stats",
+		"/api/trace/markers",
+	} {
+		res := doTrace(t, handler, http.MethodGet, path, nil, "", nil)
+		res.Body.Close()
+		if res.StatusCode != http.StatusUnauthorized && res.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s served an unauthenticated request with %d", path, res.StatusCode)
+		}
+	}
+}
+
+func TestTraceConnectionsRejectsMalformedCursor(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	res := doTrace(t, handler, http.MethodGet, "/api/trace/connections?cursor=not-a-real-cursor", cookies, csrf, nil)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed cursor produced %d, want 400", res.StatusCode)
+	}
+}
+
+func TestTraceStoreDisabledReportsUnavailable(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+
+	res := doTrace(t, handler, http.MethodGet, "/api/trace/connections", cookies, csrf, nil)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("with no trace store the endpoint returned %d, want 503", res.StatusCode)
+	}
+}
+
+// With tracing off the agent is told to collect nothing rather than handed an
+// error, so an agent behaves identically whether the feature is off or the
+// server is older than the feature.
+func TestAgentTraceConfigWithoutStoreReportsDisabled(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	token := traceNode(t, st, "node-a")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/trace-config?node_id=node-a", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want 200", rec.Code)
+	}
+	var cfg model.TraceAgentConfig
+	if err := json.NewDecoder(rec.Body).Decode(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Policy.Enabled {
+		t.Fatal("tracing is not enabled on this server; the policy must say so")
+	}
+}

@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/logstore"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/secret"
 	"github.com/LatticeNet/lattice-server/internal/store"
@@ -38,7 +40,15 @@ func newTraceTestServer(t *testing.T) (http.Handler, *store.Store, *tracestore.S
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ts.Close() })
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts})
+	// The raw log path needs the ordinary log store, so the harness has one.
+	// Without it the agent is correctly told there is nowhere to send raw
+	// lines, which is not what these tests are exercising.
+	lstore, err := logstore.Open(filepath.Join(t.TempDir(), "logs.db"), secret.Disabled(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { lstore.Close() })
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, LogStore: lstore})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,4 +639,76 @@ func TestTailCursorNeverGoesBackwards(t *testing.T) {
 	if next != 2 {
 		t.Fatalf("quiet poll reported next_seq %d; a value below the request rewinds the tail and duplicates evidence", next)
 	}
+}
+
+// The always-on raw log path must exist, and must not be tailed as a file.
+//
+// S1 promised ordinary sing-box lines keep flowing into the existing bounded
+// log store so the Logs view still works on a traced node and there is parser
+// evidence to look at afterwards. Without it, the only thing that survives
+// outside an active capture is the assembled record, which is a summary.
+func TestTracePolicyProvisionsTheRawLogSource(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	res := doTrace(t, handler, http.MethodPost, "/api/trace/policy", cookies, csrf, map[string]any{
+		"node_id": "node-a", "enabled": true, "level": "info",
+		"clash_api_addr": "127.0.0.1:9090",
+	})
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("set policy: %d", res.StatusCode)
+	}
+
+	cfgRes := doTraceAgent(t, handler, "node-a")
+	if cfgRes.RawSourceID == "" {
+		t.Fatal("the agent was given no raw source id; ordinary sing-box lines have nowhere to go")
+	}
+	ls, ok := st.LogSource(cfgRes.RawSourceID)
+	if !ok {
+		t.Fatal("the raw log source was advertised but not created")
+	}
+	if !strings.HasPrefix(ls.Path, "singbox://") || ls.NodeID != "node-a" || !ls.Enabled {
+		t.Fatalf("raw source is wrong: %+v", ls)
+	}
+
+	// It is virtual, so the file tailer must never be handed it.
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/log-sources?node_id=node-a", nil)
+	req.Header.Set("Authorization", "Bearer node-token-node-a")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var listed struct {
+		Sources []model.LogSource `json:"sources"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range listed.Sources {
+		if strings.Contains(s.Path, "://") {
+			t.Fatalf("the tail list includes the virtual source %q; the agent would chase a path that cannot exist", s.Path)
+		}
+	}
+
+	// And an operator must not be able to edit it out from under the policy.
+	edit := doTrace(t, handler, http.MethodPost, "/api/logs/sources", cookies, csrf, map[string]any{
+		"id": ls.ID, "name": "hijacked", "node_id": "node-a", "path": "/var/log/anything.log",
+	})
+	edit.Body.Close()
+	if edit.StatusCode != http.StatusBadRequest {
+		t.Fatalf("operator CRUD accepted an edit to a managed source: %d", edit.StatusCode)
+	}
+}
+
+func doTraceAgent(t *testing.T, handler http.Handler, nodeID string) model.TraceAgentConfig {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/trace-config?node_id="+nodeID, nil)
+	req.Header.Set("Authorization", "Bearer node-token-"+nodeID)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var cfg model.TraceAgentConfig
+	if err := json.NewDecoder(rec.Body).Decode(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
 }

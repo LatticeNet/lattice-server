@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -34,6 +36,15 @@ const (
 	// traceDefaultBudgetLines is the per-node ingest ceiling applied when a
 	// policy does not set one.
 	traceDefaultBudgetLines = 500
+
+	// singBoxLogPathPrefix marks the virtual log source that carries a node's
+	// ordinary sing-box lines. Like agent-debug://, it is managed here rather
+	// than through operator CRUD and is never a real file on the node.
+	singBoxLogPathPrefix = "singbox://"
+	// The raw path is where volume lives, so its per-line and per-batch caps
+	// are the general log defaults rather than the smaller debug ones.
+	singBoxLogMaxLineBytes  = 8192
+	singBoxLogMaxBatchLines = 500
 )
 
 func (s *Server) traceStoreReady(w http.ResponseWriter) bool {
@@ -597,6 +608,13 @@ func (s *Server) traceAgentConfig(nodeID string) (model.TraceAgentConfig, error)
 	}
 	now := s.now()
 	cfg := model.TraceAgentConfig{Policy: pol, ServerTime: now}
+	if pol.Enabled && s.logStore != nil {
+		if ls, err := s.ensureSingBoxLogSource(node); err != nil {
+			s.logger.Printf("trace: raw log source for %s: %v", nodeID, err)
+		} else {
+			cfg.RawSourceID = ls.ID
+		}
+	}
 	for _, sess := range s.store.ActiveTraceSessions(now) {
 		if len(sess.Filter.NodeIDs) > 0 && !containsString(sess.Filter.NodeIDs, nodeID) {
 			continue
@@ -795,4 +813,65 @@ func (s *Server) principalSeesEveryNode(p principal) bool {
 		}
 	}
 	return true
+}
+
+// singBoxLogSourceID is the stable id of a node's raw sing-box log source.
+func singBoxLogSourceID(nodeID string) string {
+	sum := sha256.Sum256([]byte("singbox|" + nodeID))
+	return "singbox-" + hex.EncodeToString(sum[:8])
+}
+
+func isSingBoxLogSource(ls model.LogSource) bool {
+	return strings.HasPrefix(ls.Path, singBoxLogPathPrefix)
+}
+
+// ensureSingBoxLogSource creates or repairs the virtual source that receives a
+// node's ordinary sing-box lines.
+//
+// Without it the only thing that survives outside an active capture session is
+// the assembled record, so there is no parser evidence to go back to and the
+// existing Logs view shows nothing for a traced node. It mirrors the
+// agent-debug source: managed here, invisible to operator CRUD, and never a
+// path anyone tails.
+func (s *Server) ensureSingBoxLogSource(node model.Node) (model.LogSource, error) {
+	if strings.TrimSpace(node.ID) == "" {
+		return model.LogSource{}, errors.New("node id is required")
+	}
+	now := s.now().UTC()
+	sourceID := singBoxLogSourceID(node.ID)
+	ls, ok := s.store.LogSource(sourceID)
+	changed := !ok
+	if !ok {
+		ls = model.LogSource{ID: sourceID, CreatedAt: now}
+	}
+	name := "sing-box"
+	if nodeName := strings.TrimSpace(node.Name); nodeName != "" {
+		name = "sing-box - " + nodeName
+	}
+	if ls.Name != name {
+		ls.Name, changed = name, true
+	}
+	if ls.NodeID != node.ID {
+		ls.NodeID, changed = node.ID, true
+	}
+	if path := singBoxLogPathPrefix + node.ID; ls.Path != path {
+		ls.Path, changed = path, true
+	}
+	if !ls.Enabled {
+		ls.Enabled, changed = true, true
+	}
+	if ls.MaxLineBytes != singBoxLogMaxLineBytes {
+		ls.MaxLineBytes, changed = singBoxLogMaxLineBytes, true
+	}
+	if ls.MaxBatchLines != singBoxLogMaxBatchLines {
+		ls.MaxBatchLines, changed = singBoxLogMaxBatchLines, true
+	}
+	if !changed {
+		return ls, nil
+	}
+	ls.UpdatedAt = now
+	if err := s.store.UpsertLogSource(ls); err != nil {
+		return model.LogSource{}, err
+	}
+	return ls, nil
 }

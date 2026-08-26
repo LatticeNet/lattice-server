@@ -712,3 +712,38 @@ func doTraceAgent(t *testing.T, handler http.Handler, nodeID string) model.Trace
 	}
 	return cfg
 }
+
+// The default collection level must be one at which a connection can finish.
+//
+// sing-box logs every close line at debug or trace and none at info:
+// "connection download finished" and "connection closed: <err>" are debug,
+// "connection upload closed" is trace. A node left at info can open a
+// connection and never complete it from its logs, so records only settle via
+// the connection table or the orphan sweep, ten minutes later, as unknown.
+func TestDefaultCollectionLevelCanCompleteAConnection(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	// A policy set without naming a level.
+	res := doTrace(t, handler, http.MethodPost, "/api/trace/policy", cookies, csrf, map[string]any{
+		"node_id": "node-a", "enabled": true,
+	})
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("set policy: %d", res.StatusCode)
+	}
+	var pol model.TracePolicy
+	if err := json.NewDecoder(res.Body).Decode(&pol); err != nil {
+		t.Fatal(err)
+	}
+	if !model.TraceLevelAtLeast(pol.Level, model.TraceLevelDebug) {
+		t.Fatalf("default level %q cannot deliver a close line, so connections never finish", pol.Level)
+	}
+
+	// And the agent must be told the same.
+	cfg := doTraceAgent(t, handler, "node-a")
+	if !model.TraceLevelAtLeast(cfg.Policy.Level, model.TraceLevelDebug) {
+		t.Fatalf("agent floor %q cannot deliver a close line", cfg.Policy.Level)
+	}
+}

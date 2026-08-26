@@ -45,6 +45,20 @@ const (
 	// are the general log defaults rather than the smaller debug ones.
 	singBoxLogMaxLineBytes  = 8192
 	singBoxLogMaxBatchLines = 500
+
+	// traceDefaultLevel is the floor a node gets when its policy does not say.
+	//
+	// It is debug, not info, and that is a correctness requirement rather than
+	// a preference. sing-box logs EVERY close line at debug or trace and none
+	// at info: "connection download finished" and "connection closed: <err>"
+	// are debug, "connection upload closed" is trace. At an info subscription a
+	// connection can therefore be opened but never completed from its log
+	// lines, so records only settle when the connection table drops them
+	// (sampled connections only) or the orphan sweep publishes them as unknown
+	// ten minutes later. info still feeds the raw log path, which is why it
+	// stays selectable, but it cannot be the default for a feature whose unit
+	// of work is a finished connection.
+	traceDefaultLevel = model.TraceLevelDebug
 )
 
 func (s *Server) traceStoreReady(w http.ResponseWriter) bool {
@@ -515,7 +529,7 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 			pol.Level = req.Level
 		}
 		if pol.Level == "" {
-			pol.Level = model.TraceLevelInfo
+			pol.Level = traceDefaultLevel
 		}
 		if req.Enabled != nil {
 			pol.Enabled = *req.Enabled
@@ -601,7 +615,7 @@ func (s *Server) traceAgentConfig(nodeID string) (model.TraceAgentConfig, error)
 	pol := node.Trace
 	pol.NodeID = nodeID
 	if pol.Level == "" {
-		pol.Level = model.TraceLevelInfo
+		pol.Level = traceDefaultLevel
 	}
 	if pol.BudgetLinesPerSec <= 0 {
 		pol.BudgetLinesPerSec = traceDefaultBudgetLines

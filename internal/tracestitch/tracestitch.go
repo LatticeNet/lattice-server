@@ -213,13 +213,13 @@ func Stitch(records []model.ConnRecord, edges []Edge, opts Options) []model.HopP
 //
 // Two tests, in order of strength:
 //
-// Identity carried through the chain. Once carry_identity ships (design section
-// 4.5 step two) the downstream line issues a credential per upstream user, so
-// hop 2 logs the end user directly. A matching non-empty UserID over a declared
-// edge is direct evidence rather than an inference, so it promotes the join to
-// exact and the heuristic is not consulted at all. The time window still
-// applies: it is not part of the identity test, it is the causal bound that
-// stops one user's morning connection from joining their afternoon one.
+// A shared user id narrows the search; it never proves the flow. The same
+// credential is on every connection that user opens, so identity alone would
+// join a parallel connection headed somewhere else. Exact is therefore not
+// reachable from equal user ids and is reserved for a per-flow correlation the
+// record does not carry yet (design section 4.5 step two, carry_identity). The
+// time window is the causal bound that stops one user's morning connection from
+// joining their afternoon one.
 //
 // Otherwise the heuristic from the rig: the downstream record started inside
 // the window, its SrcIP is one of the upstream node's public addresses, and the
@@ -243,7 +243,15 @@ func candidatesFor(
 		return nil, model.HopConfidenceNone
 	}
 
-	var exact []int
+	// A shared user id narrows the candidates; it does not identify the flow.
+	//
+	// The same credential appears on every connection that user opens, so
+	// "same user, declared edge, inside the window" is satisfied by a parallel
+	// connection to somewhere else entirely. Treating that as exact published
+	// a guess as a proven join. Exact is reserved for a per-flow correlation,
+	// which nothing in the record carries yet, so identity is used to narrow
+	// and the flow evidence still has to hold.
+	var sameUser []int
 	for _, q := range byUser[strings.TrimSpace(up.UserID)] {
 		if q == p {
 			continue
@@ -252,11 +260,17 @@ func candidatesFor(
 		if !edgeAllows(edgeSet, up, down) || !withinWindow(up, down, window) {
 			continue
 		}
-		exact = append(exact, q)
+		if !flowEvidence(up, down, nodeIPs) {
+			continue
+		}
+		sameUser = append(sameUser, q)
 	}
-	if len(exact) > 0 {
-		slices.Sort(exact)
-		return exact, model.HopConfidenceExact
+	if len(sameUser) == 1 {
+		return sameUser, model.HopConfidenceInferred
+	}
+	if len(sameUser) > 1 {
+		slices.Sort(sameUser)
+		return sameUser, model.HopConfidenceAmbiguous
 	}
 
 	key, ok := dstKeyOf(up)
@@ -428,7 +442,7 @@ func confidenceRank(c string) int {
 }
 
 func recordKey(r model.ConnRecord) model.ConnRecordKey {
-	return model.ConnRecordKey{NodeID: r.NodeID, CoreGeneration: r.CoreGeneration, LogID: r.LogID}
+	return model.KeyOf(r)
 }
 
 // hopPathID derives a stable id from the ordered record keys, so re-stitching
@@ -470,4 +484,23 @@ func compareKey(a, b model.ConnRecordKey) int {
 		return 1
 	}
 	return 0
+}
+
+// flowEvidence is the physical part of the join, independent of who the user
+// is: the downstream connection was dialled from the upstream node and is
+// headed to the same destination. A shared credential says which user; only
+// this says which connection.
+func flowEvidence(up, down model.ConnRecord, nodeIPs map[string]map[string]struct{}) bool {
+	if !dialedFrom(nodeIPs, up.NodeID, down.SrcIP) {
+		return false
+	}
+	upKey, ok := dstKeyOf(up)
+	if !ok {
+		return false
+	}
+	downKey, ok := dstKeyOf(down)
+	if !ok {
+		return false
+	}
+	return upKey == downKey
 }

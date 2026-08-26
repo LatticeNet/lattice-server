@@ -24,6 +24,15 @@ import (
 // traceConfigApplyActions are the audit actions that mean "a node's proxy
 // configuration changed". A restart usually follows one of these, and the pair
 // is what turns "connections all died at 01:38" into "because of this apply".
+const (
+	// traceHopMaxPages and traceMarkerMaxPages bound the paging loops so a
+	// pathological window cannot turn one request into an unbounded scan. When
+	// a loop hits its ceiling the caller is told the set is incomplete rather
+	// than handed a truncated answer that looks whole.
+	traceHopMaxPages    = 20
+	traceMarkerMaxPages = 50
+)
+
 var traceConfigApplyActions = map[string]bool{
 	"proxy.apply":           true,
 	"proxy.plan.execute":    true,
@@ -88,17 +97,29 @@ func (s *Server) handleTraceMarkers(w http.ResponseWriter, r *http.Request, p pr
 // incident this feature came from, where establishing it cost seventeen probes
 // and three failed hunts through log directories.
 func (s *Server) coreRestartMarkers(since, until time.Time, nodes []string) []model.TraceMarker {
-	page, err := s.traceStore.QueryRecords(tracestore.Filter{
+	// Page to the end. A restart that closed 2500 connections must not be
+	// reported as exactly 1000 because that is where the page stopped: a capped
+	// count presented as a blast radius is worse than no number.
+	filter := tracestore.Filter{
 		Since:        since,
 		Until:        until,
 		NodeIDs:      nodes,
 		CloseReasons: []string{model.CloseCoreRestart},
 		IncludeOpen:  true,
 		Limit:        tracestore.MaxQueryLimit,
-	})
-	if err != nil {
-		s.logger.Printf("trace: core restart markers: %v", err)
-		return nil
+	}
+	var page tracestore.RecordPage
+	for i := 0; i < traceMarkerMaxPages; i++ {
+		got, err := s.traceStore.QueryRecords(filter)
+		if err != nil {
+			s.logger.Printf("trace: core restart markers: %v", err)
+			return nil
+		}
+		page.Records = append(page.Records, got.Records...)
+		if got.NextCursor == "" {
+			break
+		}
+		filter.Cursor = got.NextCursor
 	}
 	type key struct {
 		node string
@@ -224,10 +245,18 @@ func (s *Server) handleTraceHops(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusBadRequest, errors.New("log_id must be a uint32"))
 		return
 	}
+	// started_at completes the identity. Without it a reused log id resolves to
+	// whichever connection the query ordered first, and the hop view can walk
+	// into a different connection than the one that was clicked.
+	startedAt, err := rfc3339Param(q, "started_at")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 
 	// Point lookup, not a scan of the newest page: a record older than that page
 	// is stored and would be reported as missing.
-	anchor, found, err := s.traceStore.RecordByKey(nodeID, gen, uint32(logID))
+	anchor, found, err := s.traceStore.RecordByKey(nodeID, gen, uint32(logID), startedAt)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -238,23 +267,44 @@ func (s *Server) handleTraceHops(w http.ResponseWriter, r *http.Request, p princ
 	}
 
 	window := tracestitch.DefaultWindow
-	candidates, err := s.traceStore.QueryRecords(tracestore.Filter{
+	// Page the candidate window to completion.
+	//
+	// Reading one page and stitching it changes the ANSWER when the window is
+	// busy: a second valid candidate that fell onto the next page turns a
+	// genuinely ambiguous join into a confident one, and a valid join into
+	// none. Confidence has to be a statement about the whole candidate set, so
+	// either enumerate it or say the set could not be proven complete.
+	filter := tracestore.Filter{
 		Since:       anchor.StartedAt.Add(-window),
 		Until:       anchor.StartedAt.Add(window),
 		NodeIDs:     s.visibleNodeIDs(p, "log:read", nil),
 		IncludeOpen: true,
 		Limit:       tracestore.MaxQueryLimit,
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
 	}
+	var (
+		candidateRecordsAll []model.ConnRecord
+		complete            bool
+	)
+	for page := 0; page < traceHopMaxPages; page++ {
+		got, err := s.traceStore.QueryRecords(filter)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		candidateRecordsAll = append(candidateRecordsAll, got.Records...)
+		if got.NextCursor == "" {
+			complete = true
+			break
+		}
+		filter.Cursor = got.NextCursor
+	}
+	candidates := tracestore.RecordPage{Records: candidateRecordsAll}
 	paths := tracestitch.Stitch(candidates.Records, s.traceChainEdges(), tracestitch.Options{
 		Window:        window,
 		NodePublicIPs: s.traceNodePublicIPs(),
 	})
 
-	anchorKey := model.ConnRecordKey{NodeID: anchor.NodeID, CoreGeneration: anchor.CoreGeneration, LogID: anchor.LogID}
+	anchorKey := model.KeyOf(anchor)
 	var path model.HopPath
 	for _, candidate := range paths {
 		for _, k := range candidate.RecordKeys {
@@ -273,7 +323,7 @@ func (s *Server) handleTraceHops(w http.ResponseWriter, r *http.Request, p princ
 
 	byKey := map[model.ConnRecordKey]model.ConnRecord{}
 	for _, rec := range candidates.Records {
-		byKey[model.ConnRecordKey{NodeID: rec.NodeID, CoreGeneration: rec.CoreGeneration, LogID: rec.LogID}] = rec
+		byKey[model.KeyOf(rec)] = rec
 	}
 	ordered := make([]model.ConnRecord, 0, len(path.RecordKeys))
 	for _, k := range path.RecordKeys {
@@ -287,10 +337,17 @@ func (s *Server) handleTraceHops(w http.ResponseWriter, r *http.Request, p princ
 			candidateRecords = append(candidateRecords, rec)
 		}
 	}
+	if !complete {
+		// The candidate universe could not be enumerated, so no confidence
+		// claim about it is honest. Say that rather than publish one derived
+		// from a truncated set.
+		path.Confidence = model.HopConfidenceAmbiguous
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"path":       path,
-		"records":    ordered,
-		"candidates": candidateRecords,
+		"path":                path,
+		"records":             ordered,
+		"candidates":          candidateRecords,
+		"candidates_complete": complete,
 	})
 }
 

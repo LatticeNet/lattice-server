@@ -799,7 +799,7 @@ func TestRecordByKeyFindsARecordBeyondOnePage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, found, err := s.RecordByKey("node-a", 7, 4242)
+	got, found, err := s.RecordByKey("node-a", 7, 4242, base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,9 +810,113 @@ func TestRecordByKeyFindsARecordBeyondOnePage(t *testing.T) {
 		t.Fatalf("dst = %q", got.DstHost)
 	}
 
-	if _, found, err = s.RecordByKey("node-a", 7, 999999); err != nil {
+	if _, found, err = s.RecordByKey("node-a", 7, 999999, time.Time{}); err != nil {
 		t.Fatal(err)
 	} else if found {
 		t.Fatal("a key that was never stored reported found")
+	}
+}
+
+// Repairing a record's identity must move its aggregate too.
+//
+// A record ingested while the topology was cold is stored unresolved. Fixing
+// the row alone would leave the rollup counted under the empty user and line,
+// so the aggregate and the record would disagree permanently.
+func TestReattributeMovesTheRollupContribution(t *testing.T) {
+	s := newStore(t, Options{})
+	at := time.Date(2026, 8, 26, 12, 3, 0, 0, time.UTC)
+
+	rec := model.ConnRecord{
+		NodeID: "node-a", CoreGeneration: 1, LogID: 77,
+		StartedAt: at, EndedAt: at.Add(time.Second),
+		CloseReason: model.CloseEOF,
+		UserKind:    model.UserKindUnresolved,
+		BytesKnown:  true, Upload: 100, Download: 400,
+	}
+	if _, err := s.AppendRecords([]model.ConnRecord{rec}); err != nil {
+		t.Fatal(err)
+	}
+
+	before, err := s.Rollups(RollupFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(before) != 1 || before[0].UserID != "" {
+		t.Fatalf("expected one unattributed bucket, got %+v", before)
+	}
+
+	fixed := rec
+	fixed.UserID = "usr_alice"
+	fixed.UserKind = model.UserKindManaged
+	fixed.LineUUID = "line-1"
+	fixed.LineHashID = "hash-1"
+	if err := s.Reattribute(model.ConnRecordKey{NodeID: "node-a", CoreGeneration: 1, LogID: 77}, at, fixed); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := s.QueryRecords(Filter{UserIDs: []string{"usr_alice"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Records) != 1 || page.Records[0].LineUUID != "line-1" {
+		t.Fatalf("the record was not repaired: %+v", page.Records)
+	}
+
+	after, err := s.Rollups(RollupFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var moved, stale *Rollup
+	for i := range after {
+		switch after[i].UserID {
+		case "usr_alice":
+			moved = &after[i]
+		case "":
+			stale = &after[i]
+		}
+	}
+	if moved == nil || moved.Connections != 1 || moved.Upload != 100 || moved.Download != 400 {
+		t.Fatalf("the contribution did not move to the resolved grain: %+v", after)
+	}
+	if stale != nil && stale.Connections != 0 {
+		t.Fatalf("the old grain still counts %d connections; the aggregate disagrees with the record", stale.Connections)
+	}
+}
+
+// A reused log id must not collapse two connections.
+//
+// sing-box's log id is rand.Uint32, so one core generation on one node can
+// issue it twice. The assembler splits them and the store keeps both, but a
+// lookup without the start time returns whichever the query ordered first, and
+// a hop view would walk into the wrong connection.
+func TestRecordByKeyDistinguishesAReusedLogID(t *testing.T) {
+	s := newStore(t, Options{})
+	base := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	first := model.ConnRecord{
+		NodeID: "node-a", CoreGeneration: 3, LogID: 42,
+		StartedAt: base, EndedAt: base.Add(time.Second),
+		DstHost: "first.example", CloseReason: model.CloseEOF,
+	}
+	second := first
+	second.StartedAt = base.Add(10 * time.Minute)
+	second.EndedAt = second.StartedAt.Add(time.Second)
+	second.DstHost = "second.example"
+	if _, err := s.AppendRecords([]model.ConnRecord{first, second}); err != nil {
+		t.Fatal(err)
+	}
+
+	gotFirst, ok, err := s.RecordByKey("node-a", 3, 42, first.StartedAt)
+	if err != nil || !ok {
+		t.Fatalf("first not found: %v %v", ok, err)
+	}
+	if gotFirst.DstHost != "first.example" {
+		t.Fatalf("asked for the earlier connection, got %q", gotFirst.DstHost)
+	}
+	gotSecond, ok, err := s.RecordByKey("node-a", 3, 42, second.StartedAt)
+	if err != nil || !ok {
+		t.Fatalf("second not found: %v %v", ok, err)
+	}
+	if gotSecond.DstHost != "second.example" {
+		t.Fatalf("asked for the later connection, got %q", gotSecond.DstHost)
 	}
 }

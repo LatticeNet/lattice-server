@@ -37,6 +37,12 @@ const (
 	// policy does not set one.
 	traceDefaultBudgetLines = 500
 
+	// traceMaxActiveSessions and traceMaxSessionsPerNode bound concurrency.
+	// One operator should not be able to multiply a node's collection cost by
+	// starting captures that all match everything.
+	traceMaxActiveSessions  = 16
+	traceMaxSessionsPerNode = 8
+
 	// singBoxLogPathPrefix marks the virtual log source that carries a node's
 	// ordinary sing-box lines. Like agent-debug://, it is managed here rather
 	// than through operator CRUD and is never a real file on the node.
@@ -242,6 +248,16 @@ func (s *Server) handleTraceLines(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// Second boundary: authorising the session is not the same as authorising
+	// every node whose lines ended up in it. Filter by the line's own node so a
+	// session-scoped reader cannot receive data from a node outside its reach.
+	visible := lines[:0]
+	for _, l := range lines {
+		if l.NodeID == "" || rbac.Allows(p.Principal, "log:read", l.NodeID) {
+			visible = append(visible, l)
+		}
+	}
+	lines = visible
 	// The cursor never goes backwards. A quiet interval returns no lines, and
 	// reporting next_seq=0 there would send the client back to the beginning
 	// and re-deliver everything it already has. Floor it at what was asked for.
@@ -344,6 +360,31 @@ func (s *Server) createTraceSession(w http.ResponseWriter, r *http.Request, p pr
 	}
 	if len(req.Filter.NodeIDs) == 0 && !s.requireScope(w, p, "log:admin") {
 		return
+	}
+
+	// Cap concurrent sessions. Matching is per session per line and each match
+	// stores the line again, so N overlapping unfiltered sessions multiply CPU,
+	// storage and network by N on the node without ever exceeding the per-second
+	// line budget. The TTL bounds how long one capture runs, not how many run.
+	active := s.store.ActiveTraceSessions(s.now())
+	if len(active) >= traceMaxActiveSessions {
+		writeError(w, http.StatusConflict, fmt.Errorf(
+			"%d capture sessions are already running, which is the limit; stop one before starting another",
+			len(active)))
+		return
+	}
+	perNode := map[string]int{}
+	for _, sess := range active {
+		for _, n := range sess.Filter.NodeIDs {
+			perNode[n]++
+		}
+	}
+	for _, n := range targets {
+		if perNode[n] >= traceMaxSessionsPerNode {
+			writeError(w, http.StatusConflict, fmt.Errorf(
+				"node %s already has %d capture sessions, which is the limit", n, perNode[n]))
+			return
+		}
 	}
 
 	ttl := time.Duration(req.TTLSeconds) * time.Second
@@ -722,7 +763,49 @@ func (s *Server) handleAgentTrace(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Batch.Lines[i].NodeID = req.NodeID
 	}
-	if !s.logIngestLimiter.AllowN("trace:"+req.NodeID, float64(len(req.Batch.Records)+len(req.Batch.Lines))) {
+	// A line may only join a session that actually targeted this node.
+	//
+	// The handler verified the reporting node, and AppendLines checked only
+	// that a session id was non-empty. A compromised node could therefore post
+	// lines carrying another node's session id: fabricated evidence inside
+	// someone else's capture, readable by an operator authorised for that
+	// session but not for this node. Unknown ids also created durable rows
+	// until retention.
+	for i := range req.Batch.Lines {
+		sessionID := strings.TrimSpace(req.Batch.Lines[i].SessionID)
+		if sessionID == "" {
+			writeError(w, http.StatusBadRequest, errors.New("trace line is missing its session id"))
+			return
+		}
+		sess, ok := s.store.TraceSession(sessionID)
+		if !ok || !containsString(sess.Filter.NodeIDs, req.NodeID) {
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied,
+				"trace line references a session this node is not a target of"))
+			return
+		}
+	}
+	for i := range req.Batch.Records {
+		kept := req.Batch.Records[i].SessionIDs[:0]
+		for _, sessionID := range req.Batch.Records[i].SessionIDs {
+			sess, ok := s.store.TraceSession(strings.TrimSpace(sessionID))
+			if ok && containsString(sess.Filter.NodeIDs, req.NodeID) {
+				kept = append(kept, sessionID)
+			}
+		}
+		// A record whose membership does not check out keeps the record and
+		// drops the claim, because the connection itself was still observed.
+		req.Batch.Records[i].SessionIDs = kept
+	}
+
+	// Charge by size as well as by count. A limiter that counts items lets one
+	// nearly-body-sized record cost the same as one tiny one, so a node can
+	// spend encryption CPU, database space and audit fsync far more cheaply
+	// than the budget implies. Each 4 KiB is charged as one more item.
+	weight := float64(len(req.Batch.Records) + len(req.Batch.Lines))
+	if n := approximateBatchBytes(req.Batch); n > 0 {
+		weight += float64(n) / 4096
+	}
+	if !s.logIngestLimiter.AllowN("trace:"+req.NodeID, weight) {
 		w.Header().Set("Retry-After", logIngestRetryAfter)
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
@@ -734,6 +817,11 @@ func (s *Server) handleAgentTrace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusTooManyRequests, apiError(model.APIErrorRateLimited, "ingest rate exceeded"))
 		return
 	}
+
+	// A restart that swept nothing still happened. Recording the generation
+	// transition means an idle node's restart is not invisible just because it
+	// had no live connections to kill.
+	s.noteTraceCoreGeneration(req.NodeID, req.Batch)
 
 	s.attributeTraceRecords(req.Batch.Records)
 
@@ -747,6 +835,11 @@ func (s *Server) handleAgentTrace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// Session counters are rendered by the interface and nothing was updating
+	// them, so every capture reported zero evidence and zero loss no matter
+	// what it stored. Attribute what this batch actually delivered.
+	s.updateTraceSessionCounters(req.Batch, records, lines)
+
 	if req.Batch.Dropped > 0 || req.Batch.Unparsed > 0 {
 		// Both numbers are evidence of a gap, and a gap that is not recorded
 		// reads later as a quiet network. Unparsed in particular means sing-box
@@ -888,4 +981,106 @@ func (s *Server) ensureSingBoxLogSource(node model.Node) (model.LogSource, error
 		return model.LogSource{}, err
 	}
 	return ls, nil
+}
+
+// approximateBatchBytes sizes a batch without re-encoding it. It is a charge
+// basis for the rate limiter, not an accounting figure, so a close estimate
+// from the fields that actually carry bulk is enough.
+func approximateBatchBytes(b model.TraceBatch) int {
+	n := 0
+	for _, r := range b.Records {
+		n += len(r.DstHost) + len(r.CloseError) + len(r.RuleText) + len(r.UserName) + 128
+	}
+	for _, l := range b.Lines {
+		n += len(l.Message) + len(l.Raw) + len(l.Tag) + 64
+	}
+	return n
+}
+
+// updateTraceSessionCounters credits a batch to the sessions it belongs to.
+//
+// Loss is charged to every session the batch touched rather than split between
+// them: the agent drops lines before it knows which session wanted them, so
+// dividing the number would invent a precision that does not exist. An
+// operator needs to know a capture lost data, not to reconcile two figures.
+func (s *Server) updateTraceSessionCounters(batch model.TraceBatch, records, lines int) {
+	touched := map[string]struct{}{}
+	for _, l := range batch.Lines {
+		if id := strings.TrimSpace(l.SessionID); id != "" {
+			touched[id] = struct{}{}
+		}
+	}
+	for _, r := range batch.Records {
+		for _, id := range r.SessionIDs {
+			if id = strings.TrimSpace(id); id != "" {
+				touched[id] = struct{}{}
+			}
+		}
+	}
+	if len(touched) == 0 {
+		return
+	}
+	perSessionLines := map[string]uint64{}
+	for _, l := range batch.Lines {
+		perSessionLines[strings.TrimSpace(l.SessionID)]++
+	}
+	perSessionRecords := map[string]uint64{}
+	for _, r := range batch.Records {
+		if r.Open {
+			// An open snapshot is the same connection reported again; counting
+			// it would inflate the total every minute the connection lives.
+			continue
+		}
+		for _, id := range r.SessionIDs {
+			perSessionRecords[strings.TrimSpace(id)]++
+		}
+	}
+	for id := range touched {
+		sess, ok := s.store.TraceSession(id)
+		if !ok {
+			continue
+		}
+		sess.Lines += perSessionLines[id]
+		sess.Records += perSessionRecords[id]
+		sess.Dropped += batch.Dropped
+		if err := s.store.UpsertTraceSession(sess); err != nil {
+			s.logger.Printf("trace: session counters for %s: %v", id, err)
+		}
+	}
+}
+
+// noteTraceCoreGeneration audits a change in a node's reported core generation.
+func (s *Server) noteTraceCoreGeneration(nodeID string, batch model.TraceBatch) {
+	if batch.CoreGeneration == 0 {
+		return
+	}
+	node, ok := s.store.Node(nodeID)
+	if !ok {
+		return
+	}
+	if node.Trace.LastCoreGeneration == batch.CoreGeneration {
+		return
+	}
+	previous := node.Trace.LastCoreGeneration
+	node.Trace.LastCoreGeneration = batch.CoreGeneration
+	node.Trace.LastCoreStartedAt = batch.CoreStartedAt
+	if err := s.store.UpsertNode(node); err != nil {
+		s.logger.Printf("trace: recording core generation for %s: %v", nodeID, err)
+		return
+	}
+	if previous == 0 {
+		// First sighting is not a restart, it is the agent introducing itself.
+		return
+	}
+	s.recordAudit(model.AuditEvent{
+		ID:     id.New("audit"),
+		NodeID: nodeID,
+		Action: "trace.core.restart",
+		Scope:  "log:read",
+		Reason: "the node reported a new sing-box process generation",
+		Metadata: map[string]string{
+			"previous_generation": strconv.FormatUint(previous, 10),
+			"generation":          strconv.FormatUint(batch.CoreGeneration, 10),
+		},
+	})
 }

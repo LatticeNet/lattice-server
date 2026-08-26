@@ -556,6 +556,7 @@ func New(opts Options) (*Server, error) {
 		s.startRenewalScheduler()
 		s.startNodeLivenessSweeper()
 		s.startTraceRetention()
+		s.startTraceReattribution()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()

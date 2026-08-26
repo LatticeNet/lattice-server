@@ -59,7 +59,10 @@ func exitRecord() model.ConnRecord {
 func edgesAB() []Edge { return []Edge{{SourceLineUUID: lineA, TargetLineUUID: lineB}} }
 
 func key(r model.ConnRecord) model.ConnRecordKey {
-	return model.ConnRecordKey{NodeID: r.NodeID, CoreGeneration: r.CoreGeneration, LogID: r.LogID}
+	// The canonical constructor, so the tests cannot drift from the identity
+	// the code uses. StartedAt is part of it: one core generation can reuse a
+	// log id, and a key without it collapses two distinct connections.
+	return model.KeyOf(r)
 }
 
 // findPath returns the path whose first record key is head.
@@ -254,11 +257,12 @@ func assertNoJoin(t *testing.T, records []model.ConnRecord, edges []Edge, opts O
 	}
 }
 
-func TestStitchExactPromotionByCarriedIdentity(t *testing.T) {
-	// carry_identity gives the downstream line its own credential per upstream
-	// user, so hop 2 logs the end user. That is evidence, not inference: it
-	// promotes to exact even though the src-ip and destination tests would both
-	// fail here.
+func TestSharedUserIDIsNotProofOfTheSameFlow(t *testing.T) {
+	// The same credential is on every connection a user opens, so identity
+	// alone would join a parallel connection headed somewhere else. This is
+	// exactly that case: same user, declared edge, inside the window, but a
+	// different destination and a source that is not the upstream node. It must
+	// not join, and it certainly must not be called exact.
 	entry := entryRecord()
 	entry.UserID = "usr_alice"
 	exit := exitRecord()
@@ -270,11 +274,34 @@ func TestStitchExactPromotionByCarriedIdentity(t *testing.T) {
 	paths := Stitch(records, edgesAB(), chainOptions())
 
 	assertCoversEveryRecordOnce(t, records, paths)
+	if len(paths) != 2 {
+		t.Fatalf("got %d paths, want the two records unjoined: %+v", len(paths), paths)
+	}
+	for _, p := range paths {
+		if p.Confidence != model.HopConfidenceNone {
+			t.Fatalf("confidence = %q, want none: a shared user id is not flow evidence", p.Confidence)
+		}
+	}
+}
+
+func TestSharedUserIDNarrowsButStillNeedsFlowEvidence(t *testing.T) {
+	// Same user AND the physical evidence: dialled from the upstream node, same
+	// destination, inside the window. That joins, and it is inferred rather
+	// than exact, because nothing in the record carries a per-flow correlation.
+	entry := entryRecord()
+	entry.UserID = "usr_alice"
+	exit := exitRecord()
+	exit.UserID = "usr_alice"
+	records := []model.ConnRecord{entry, exit}
+
+	paths := Stitch(records, edgesAB(), chainOptions())
+
+	assertCoversEveryRecordOnce(t, records, paths)
 	if len(paths) != 1 {
 		t.Fatalf("got %d paths, want 1: %+v", len(paths), paths)
 	}
-	if paths[0].Confidence != model.HopConfidenceExact {
-		t.Fatalf("confidence = %q, want %q", paths[0].Confidence, model.HopConfidenceExact)
+	if paths[0].Confidence != model.HopConfidenceInferred {
+		t.Fatalf("confidence = %q, want inferred", paths[0].Confidence)
 	}
 	want := []model.ConnRecordKey{key(entry), key(exit)}
 	if !reflect.DeepEqual(paths[0].RecordKeys, want) {
@@ -525,15 +552,17 @@ func TestStitchIDIsStableAndPerPath(t *testing.T) {
 		t.Fatal("distinct paths share an id")
 	}
 
-	// The id survives a confidence change: same records, same path.
-	promoted := []model.ConnRecord{entry, exit}
-	promoted[0].UserID, promoted[1].UserID = "usr_alice", "usr_alice"
-	upgraded := Stitch(promoted, edgesAB(), chainOptions())
-	if upgraded[0].Confidence != model.HopConfidenceExact {
-		t.Fatalf("expected the promoted run to be exact, got %q", upgraded[0].Confidence)
+	// The id is derived from the records, so adding user identity to the same
+	// pair must not change it. The join is still inferred: a shared user id
+	// narrows the candidates but carries no per-flow correlation.
+	withUser := []model.ConnRecord{entry, exit}
+	withUser[0].UserID, withUser[1].UserID = "usr_alice", "usr_alice"
+	again2 := Stitch(withUser, edgesAB(), chainOptions())
+	if again2[0].Confidence != model.HopConfidenceInferred {
+		t.Fatalf("confidence = %q, want inferred", again2[0].Confidence)
 	}
-	if upgraded[0].ID != paths[0].ID {
-		t.Fatalf("id changed when confidence improved: %q vs %q", upgraded[0].ID, paths[0].ID)
+	if again2[0].ID != paths[0].ID {
+		t.Fatalf("id changed when user identity was added: %q vs %q", again2[0].ID, paths[0].ID)
 	}
 }
 

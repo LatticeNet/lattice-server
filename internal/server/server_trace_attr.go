@@ -8,6 +8,8 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/traceattr"
+	"github.com/LatticeNet/lattice-server/internal/tracestore"
+	"time"
 )
 
 // Server-side attribution glue: it builds the immutable topology snapshot that
@@ -166,4 +168,70 @@ func validateLoopbackHostPort(addr string) error {
 		return fmt.Errorf("host %q is not a loopback address", host)
 	}
 	return nil
+}
+
+// traceReattributeInterval is how often unresolved records are retried, and
+// traceReattributeWindow is how far back a retry looks. The topology it waits
+// for is a 60 second cache and an inventory that is rebuilt after a restart, so
+// minutes is the right scale; looking back further would re-walk records whose
+// identity was never going to arrive.
+const (
+	traceReattributeInterval = 5 * time.Minute
+	traceReattributeWindow   = 24 * time.Hour
+	traceReattributeBatch    = 500
+)
+
+// startTraceReattribution repairs records that were stored unresolved.
+//
+// A record ingested while the line read model was cold has no line and no user,
+// and nothing ever looked at it again: the documented five minute self-heal did
+// not exist, so a cold window at startup left records permanently unattributed
+// and invisible to every user or line filter. This is that sweep.
+func (s *Server) startTraceReattribution() {
+	if s.traceStore == nil {
+		return
+	}
+	go func() {
+		for {
+			time.Sleep(traceReattributeInterval)
+			if n, err := s.reattributeUnresolved(); err != nil {
+				s.logger.Printf("trace reattribution: %v", err)
+			} else if n > 0 {
+				s.logger.Printf("trace reattribution: resolved %d record(s) that arrived before their topology", n)
+			}
+		}
+	}()
+}
+
+// reattributeUnresolved runs one pass and reports how many records it repaired.
+func (s *Server) reattributeUnresolved() (int, error) {
+	now := s.now()
+	page, err := s.traceStore.QueryRecords(tracestore.Filter{
+		Since:       now.Add(-traceReattributeWindow),
+		Until:       now,
+		UserKinds:   []string{model.UserKindUnresolved, model.UserKindUnnamed},
+		IncludeOpen: false,
+		Limit:       traceReattributeBatch,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(page.Records) == 0 {
+		return 0, nil
+	}
+	attributor := traceattr.New(s.traceTopology())
+	repaired := 0
+	for _, rec := range page.Records {
+		before := rec
+		attributor.Attribute(&rec)
+		if rec.UserID == before.UserID && rec.LineUUID == before.LineUUID && rec.UserKind == before.UserKind {
+			continue
+		}
+		key := model.KeyOf(rec)
+		if err := s.traceStore.Reattribute(key, rec.StartedAt, rec); err != nil {
+			return repaired, err
+		}
+		repaired++
+	}
+	return repaired, nil
 }

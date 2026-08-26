@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -448,4 +449,92 @@ func boolToInt(b bool) int64 {
 		return 1
 	}
 	return 0
+}
+
+// Reattribute moves a record's identity and its aggregate contribution from the
+// grain it was stored under to the one it now resolves to.
+//
+// A record that arrived while the line read model was cold is stored
+// unresolved. Repairing the row alone would leave the rollup counted under the
+// empty user and line, so the aggregate would disagree with the record forever.
+// Both moves happen in one transaction, or neither does.
+func (s *Store) Reattribute(key model.ConnRecordKey, startedAt time.Time, to model.ConnRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("tracestore: reattribute: %w", err)
+	}
+	defer tx.Rollback()
+
+	var (
+		open        int
+		bytesKnown  int
+		upload      int64
+		download    int64
+		closeReason sql.NullString
+		oldUser     sql.NullString
+		oldLine     sql.NullString
+	)
+	row := tx.QueryRow(`SELECT open, bytes_known, upload, download, close_reason, user_id, line_uuid
+		FROM conn_records WHERE node_id = ? AND core_generation = ? AND log_id = ? AND started_at = ?`,
+		key.NodeID, int64(key.CoreGeneration), int64(key.LogID), nanos(startedAt))
+	if err := row.Scan(&open, &bytesKnown, &upload, &download, &closeReason, &oldUser, &oldLine); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("tracestore: reattribute: %w", err)
+	}
+
+	if _, err := tx.Exec(`UPDATE conn_records
+		SET user_id = ?, user_kind = ?, line_uuid = ?, line_hash_id = ?
+		WHERE node_id = ? AND core_generation = ? AND log_id = ? AND started_at = ?`,
+		to.UserID, to.UserKind, to.LineUUID, to.LineHashID,
+		key.NodeID, int64(key.CoreGeneration), int64(key.LogID), nanos(startedAt)); err != nil {
+		return fmt.Errorf("tracestore: reattribute: %w", err)
+	}
+
+	// Only a final record ever contributed to a rollup, so only a final record
+	// has a contribution to move.
+	if open == 0 {
+		reason := closeReason.String
+		if reason == "" {
+			reason = model.CloseUnknown
+		}
+		base := model.ConnRecord{
+			StartedAt: startedAt, NodeID: key.NodeID,
+			BytesKnown: bytesKnown == 1, Upload: upload, Download: download,
+			CloseReason: reason,
+		}
+		deltas := map[rollupKey]*rollupDelta{}
+		removed := base
+		removed.UserID, removed.LineUUID = oldUser.String, oldLine.String
+		addRollupDelta(deltas, removed)
+		negate(deltas)
+		added := base
+		added.UserID, added.LineUUID = to.UserID, to.LineUUID
+		addRollupDelta(deltas, added)
+		if err := applyRollupDeltas(tx, deltas); err != nil {
+			return fmt.Errorf("tracestore: reattribute: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("tracestore: reattribute: %w", err)
+	}
+	return nil
+}
+
+// negate flips the sign of every accumulated delta, so the same accumulator
+// that adds a contribution can also remove one.
+func negate(deltas map[rollupKey]*rollupDelta) {
+	for _, d := range deltas {
+		d.connections = -d.connections
+		d.bytesKnownCount = -d.bytesKnownCount
+		d.upload = -d.upload
+		d.download = -d.download
+		for reason, n := range d.reasons {
+			d.reasons[reason] = -n
+		}
+	}
 }

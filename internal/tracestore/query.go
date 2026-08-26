@@ -201,11 +201,20 @@ func (s *Store) QueryRecords(f Filter) (RecordPage, error) {
 // the newest page cannot answer this: a record older than that page is present
 // in the database and absent from the scan, so a caller looking one up by key
 // would report "not found" for something it is storing.
-func (s *Store) RecordByKey(nodeID string, coreGeneration uint64, logID uint32) (model.ConnRecord, bool, error) {
-	rows, err := s.db.Query(`SELECT `+recordColumns+` FROM conn_records
-		WHERE node_id = ? AND core_generation = ? AND log_id = ?
-		ORDER BY started_at DESC LIMIT 1`,
-		nodeID, int64(coreGeneration), int64(logID))
+// startedAt completes the identity: one core generation can reuse a log id, and
+// the store keeps both rows because its primary key includes the start time.
+// A zero startedAt asks for the newest, which is the best a caller that does not
+// know the exact connection can be given.
+func (s *Store) RecordByKey(nodeID string, coreGeneration uint64, logID uint32, startedAt time.Time) (model.ConnRecord, bool, error) {
+	query := `SELECT ` + recordColumns + ` FROM conn_records
+		WHERE node_id = ? AND core_generation = ? AND log_id = ?`
+	args := []any{nodeID, int64(coreGeneration), int64(logID)}
+	if !startedAt.IsZero() {
+		query += ` AND started_at = ?`
+		args = append(args, nanos(startedAt))
+	}
+	query += ` ORDER BY started_at DESC LIMIT 1`
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return model.ConnRecord{}, false, fmt.Errorf("tracestore: record by key: %w", err)
 	}

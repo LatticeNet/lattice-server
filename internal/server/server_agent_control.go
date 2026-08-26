@@ -19,9 +19,17 @@ const (
 	agentControlPongWait     = 75 * time.Second
 )
 
+// agentControlMessage is the server to agent push envelope. Type discriminates;
+// the payload fields are mutually exclusive and an older agent that does not
+// know a Type ignores the message, which is why every push must also be
+// recoverable from the agent's ordinary poll loop.
 type agentControlMessage struct {
 	Type    string                `json:"type"`
 	Session model.TerminalSession `json:"session,omitempty"`
+	// Trace carries a trace policy change. It is a latency optimisation only:
+	// the agent re-reads the same state from /api/agent/trace-config on its
+	// normal tick, so a dropped push costs seconds, never correctness.
+	Trace *model.TraceAgentConfig `json:"trace,omitempty"`
 }
 
 type agentControlHub struct {
@@ -71,6 +79,13 @@ func (h *agentControlHub) notifyTerminalOpen(session model.TerminalSession) bool
 		Type:    "terminal.open",
 		Session: session,
 	})
+}
+
+// notifyTraceConfig pushes a trace policy change to one node. A false return
+// means no control connection was listening; the caller does not retry, because
+// the agent's poll loop picks the same change up on its next tick.
+func (h *agentControlHub) notifyTraceConfig(nodeID string, cfg model.TraceAgentConfig) bool {
+	return h.notify(nodeID, agentControlMessage{Type: "trace.config", Trace: &cfg})
 }
 
 func (h *agentControlHub) notify(nodeID string, msg agentControlMessage) bool {

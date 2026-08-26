@@ -78,6 +78,7 @@ type State struct {
 	Monitors               map[string]model.Monitor              `json:"monitors"`
 	MonResults             map[string][]model.MonitorResult      `json:"monitor_results"`
 	LogSources             map[string]model.LogSource            `json:"log_sources"`
+	TraceSessions          map[string]model.TraceSession         `json:"trace_sessions"`
 	NotifyChannels         map[string]model.NotifyChannel        `json:"notify_channels"`
 	NotifyRules            map[string]model.NotifyRule           `json:"notify_rules"`
 	Tunnels                map[string]model.TunnelProfile        `json:"tunnels"`
@@ -649,6 +650,7 @@ func emptyState() State {
 		Monitors:               map[string]model.Monitor{},
 		MonResults:             map[string][]model.MonitorResult{},
 		LogSources:             map[string]model.LogSource{},
+		TraceSessions:          map[string]model.TraceSession{},
 		NotifyChannels:         map[string]model.NotifyChannel{},
 		NotifyRules:            map[string]model.NotifyRule{},
 		Tunnels:                map[string]model.TunnelProfile{},
@@ -763,6 +765,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.LogSources == nil {
 		st.LogSources = map[string]model.LogSource{}
+	}
+	if st.TraceSessions == nil {
+		st.TraceSessions = map[string]model.TraceSession{}
 	}
 	if st.NotifyChannels == nil {
 		st.NotifyChannels = map[string]model.NotifyChannel{}
@@ -4655,6 +4660,91 @@ func (s *Store) DeleteLogSource(id string) error {
 		return nil
 	}
 	delete(s.state.LogSources, id)
+	return s.Save()
+}
+
+// UpsertTraceSession creates or updates a trace session.
+func (s *Store) UpsertTraceSession(ts model.TraceSession) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ts.StartedAt.IsZero() {
+		ts.StartedAt = time.Now().UTC()
+	}
+	s.state.TraceSessions[ts.ID] = ts
+	return s.Save()
+}
+
+// TraceSession returns one trace session by id.
+func (s *Store) TraceSession(id string) (model.TraceSession, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ts, ok := s.state.TraceSessions[id]
+	return ts, ok
+}
+
+// TraceSessions returns every trace session, newest first.
+func (s *Store) TraceSessions() []model.TraceSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.TraceSession, 0, len(s.state.TraceSessions))
+	for _, ts := range s.state.TraceSessions {
+		out = append(out, ts)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].StartedAt.Equal(out[j].StartedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].StartedAt.After(out[j].StartedAt)
+	})
+	return out
+}
+
+// ActiveTraceSessions returns sessions still capturing at now. Expiry is
+// evaluated on read rather than by a sweeper so that a session cannot outlive
+// its TTL just because a background job did not run; the agent enforces the
+// same deadline independently.
+func (s *Store) ActiveTraceSessions(now time.Time) []model.TraceSession {
+	out := []model.TraceSession{}
+	for _, ts := range s.TraceSessions() {
+		if ts.Active(now) {
+			out = append(out, ts)
+		}
+	}
+	return out
+}
+
+// ExpireTraceSessions marks running sessions whose deadline has passed as
+// expired and returns them. It is idempotent.
+func (s *Store) ExpireTraceSessions(now time.Time) ([]model.TraceSession, error) {
+	s.mu.Lock()
+	changed := []model.TraceSession{}
+	for id, ts := range s.state.TraceSessions {
+		if ts.State != model.TraceSessionRunning || now.Before(ts.ExpiresAt) {
+			continue
+		}
+		ts.State = model.TraceSessionExpired
+		ts.EndedAt = now
+		s.state.TraceSessions[id] = ts
+		changed = append(changed, ts)
+	}
+	if len(changed) == 0 {
+		s.mu.Unlock()
+		return nil, nil
+	}
+	err := s.Save()
+	s.mu.Unlock()
+	return changed, err
+}
+
+// DeleteTraceSession removes a session record. Captured lines are purged
+// separately through the trace store.
+func (s *Store) DeleteTraceSession(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.state.TraceSessions[id]; !ok {
+		return nil
+	}
+	delete(s.state.TraceSessions, id)
 	return s.Save()
 }
 

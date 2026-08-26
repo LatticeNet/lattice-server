@@ -23,6 +23,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/server"
 	"github.com/LatticeNet/lattice-server/internal/store"
+	"github.com/LatticeNet/lattice-server/internal/tracestore"
 )
 
 var (
@@ -169,6 +170,23 @@ func main() {
 			log.Printf("log store: %s (PLAINTEXT — logs may contain secrets; set a master key to encrypt)", logsPath)
 		}
 	}
+	// Open the sing-box connection trace store (trace.db) beside the log store,
+	// with the same at-rest cipher. In-memory mode disables tracing entirely,
+	// which the endpoints report as 503 rather than as an empty result.
+	var traceStore *tracestore.Store
+	if dataPath != "" {
+		tracePath := filepath.Join(dataDir, "trace.db")
+		traceStore, err = tracestore.Open(tracePath, keyRes.Cipher, tracestore.Options{})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer traceStore.Close()
+		if keyRes.Cipher.Enabled() {
+			log.Printf("trace store: %s (sealed columns encrypted at rest)", tracePath)
+		} else {
+			log.Printf("trace store: %s (PLAINTEXT — connection metadata includes destination hosts; set a master key to encrypt)", tracePath)
+		}
+	}
 	geoResolver, err := geoip.NewHTTPResolver(geoIPLookupURL)
 	if err != nil {
 		log.Fatal(err)
@@ -181,6 +199,7 @@ func main() {
 	app, err := server.New(server.Options{
 		Store:         st,
 		LogStore:      logStore,
+		TraceStore:    traceStore,
 		WebFS:         os.DirFS(webRoot),
 		AdminUsername: os.Getenv("LATTICE_ADMIN_USERNAME"),
 		AdminPassword: os.Getenv("LATTICE_ADMIN_PASSWORD"),

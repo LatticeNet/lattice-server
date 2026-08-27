@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
@@ -240,6 +241,11 @@ func TestDDNSSweepPublishesOnlyChanges(t *testing.T) {
 	}
 	fake := &fakeProvider{}
 	srv.ddnsProvider = func(model.DDNSProfile) (ddns.Provider, error) { return fake, nil }
+	// Sweeps are spaced by each profile's interval, so drive the clock rather
+	// than calling back to back.
+	clock := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return clock }
+	tick := func() { clock = clock.Add(10 * time.Minute) }
 
 	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
 		`{"name":"cf","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true}`, cookies, csrf)
@@ -257,6 +263,7 @@ func TestDDNSSweepPublishesOnlyChanges(t *testing.T) {
 	}
 
 	// Nothing moved, so nothing is written.
+	tick()
 	if n := srv.sweepDDNSOnce(); n != 0 {
 		t.Fatalf("steady sweep wrote %d, want 0", n)
 	}
@@ -268,6 +275,7 @@ func TestDDNSSweepPublishesOnlyChanges(t *testing.T) {
 	if err := st.UpsertNode(model.Node{ID: "n1", PublicIP: "203.0.113.11"}); err != nil {
 		t.Fatal(err)
 	}
+	tick()
 	if n := srv.sweepDDNSOnce(); n != 1 {
 		t.Fatalf("changed sweep wrote %d, want 1", n)
 	}
@@ -282,6 +290,7 @@ func TestDDNSSweepPublishesOnlyChanges(t *testing.T) {
 	if err := st.UpsertDDNSProfile(stored); err != nil {
 		t.Fatal(err)
 	}
+	tick()
 	if n := srv.sweepDDNSOnce(); n != 1 {
 		t.Fatalf("failed profile was not retried: wrote %d, want 1", n)
 	}
@@ -311,6 +320,8 @@ func TestDDNSFailedRunKeepsPreviousIP(t *testing.T) {
 	}
 	fake := &failingProvider{}
 	srv.ddnsProvider = func(model.DDNSProfile) (ddns.Provider, error) { return fake, nil }
+	clock := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return clock }
 
 	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
 		`{"name":"x","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true}`, cookies, csrf)
@@ -338,8 +349,10 @@ func TestDDNSFailedRunKeepsPreviousIP(t *testing.T) {
 		t.Fatal("failed publish recorded no error")
 	}
 
-	// Once the provider recovers, the sweep retries and records for real.
+	// Once the provider recovers and the interval has passed, the sweep
+	// retries and records for real.
 	fake.ok = true
+	clock = clock.Add(10 * time.Minute)
 	if n := srv.sweepDDNSOnce(); n != 1 {
 		t.Fatalf("recovered profile was not retried: %d", n)
 	}
@@ -356,4 +369,83 @@ func (f *failingProvider) SetRecord(context.Context, ddns.Record) error {
 		return nil
 	}
 	return errors.New("provider refused")
+}
+
+// TestDDNSIntervalSpacesRetries covers the per-profile interval.
+//
+// The interval matters most for a profile the provider keeps rejecting: it is
+// attempted on every sweep, so without a per-profile cadence a datacenter
+// machine that will not change its address for a year still retried a failing
+// write every five minutes.
+func TestDDNSIntervalSpacesRetries(t *testing.T) {
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	base := model.DDNSProfile{}
+
+	if !ddnsDue(base, now) {
+		t.Fatal("a profile that never ran must be due")
+	}
+
+	base.LastRunAt = now.Add(-2 * time.Minute)
+	if ddnsDue(base, now) {
+		t.Fatal("default interval is five minutes, two is not due yet")
+	}
+	base.LastRunAt = now.Add(-6 * time.Minute)
+	if !ddnsDue(base, now) {
+		t.Fatal("past the default interval and still not due")
+	}
+
+	// Twelve hours for a datacenter profile.
+	slow := model.DDNSProfile{IntervalSeconds: 12 * 3600, LastRunAt: now.Add(-6 * time.Hour)}
+	if ddnsDue(slow, now) {
+		t.Fatal("six hours into a twelve hour interval must not be due")
+	}
+	slow.LastRunAt = now.Add(-13 * time.Hour)
+	if !ddnsDue(slow, now) {
+		t.Fatal("past a twelve hour interval and still not due")
+	}
+
+	// Minutes for a residential one.
+	fast := model.DDNSProfile{IntervalSeconds: 300, LastRunAt: now.Add(-6 * time.Minute)}
+	if !ddnsDue(fast, now) {
+		t.Fatal("past a five minute interval and still not due")
+	}
+
+	// A negative or zero value falls back rather than running every tick.
+	odd := model.DDNSProfile{IntervalSeconds: -1, LastRunAt: now.Add(-1 * time.Minute)}
+	if ddnsDue(odd, now) {
+		t.Fatal("a nonsense interval must fall back to the default, not to always-due")
+	}
+}
+
+// TestDDNSSweepHonoursInterval checks the gate is actually wired into the sweep.
+func TestDDNSSweepHonoursInterval(t *testing.T) {
+	srv, handler, st := newDDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	if err := st.UpsertNode(model.Node{ID: "n1", PublicIP: "203.0.113.30"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{}
+	srv.ddnsProvider = func(model.DDNSProfile) (ddns.Provider, error) { return fake, nil }
+
+	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
+		`{"name":"slow","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true,"interval_seconds":43200}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create: %d", create.StatusCode)
+	}
+
+	// Never run, so the first sweep publishes.
+	if n := srv.sweepDDNSOnce(); n != 1 {
+		t.Fatalf("first sweep wrote %d, want 1", n)
+	}
+	// The address moves, but the profile asked for twelve hours.
+	if err := st.UpsertNode(model.Node{ID: "n1", PublicIP: "203.0.113.31"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := srv.sweepDDNSOnce(); n != 0 {
+		t.Fatalf("sweep ignored the interval: wrote %d", n)
+	}
+	if len(fake.records) != 1 {
+		t.Fatalf("provider hit inside the interval: %+v", fake.records)
+	}
 }

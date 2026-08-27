@@ -4892,10 +4892,34 @@ func (s *Server) handleDeleteDDNS(w http.ResponseWriter, r *http.Request, p prin
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// ddnsSweepInterval is how often bound profiles are re-checked. Node public
-// addresses arrive with the agent's own report, so anything faster than that
-// only re-reads the store.
-const ddnsSweepInterval = 5 * time.Minute
+const (
+	// ddnsSweepTick is how often the sweep wakes up. It is deliberately finer
+	// than any profile's own interval so that a profile asking for five
+	// minutes actually gets five, rather than five rounded up to whatever the
+	// slowest profile wanted.
+	ddnsSweepTick = time.Minute
+	// ddnsDefaultInterval applies to a profile that does not set its own.
+	ddnsDefaultInterval = 5 * time.Minute
+)
+
+// ddnsDue reports whether a profile may be attempted again.
+//
+// The clock is LastRunAt, which only advances on an actual attempt, so a
+// profile the sweep skips because nothing changed stays due and costs one
+// comparison per tick. What the interval really spaces out is retries: a
+// profile whose provider is rejecting the write records an attempt each time,
+// and a datacenter machine set to twelve hours then retries twice a day
+// instead of nearly three hundred times.
+func ddnsDue(p model.DDNSProfile, now time.Time) bool {
+	if p.LastRunAt.IsZero() {
+		return true
+	}
+	interval := time.Duration(p.IntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = ddnsDefaultInterval
+	}
+	return !now.Before(p.LastRunAt.Add(interval))
+}
 
 // startDDNSSweep republishes profiles whose node address moved.
 //
@@ -4905,7 +4929,7 @@ const ddnsSweepInterval = 5 * time.Minute
 func (s *Server) startDDNSSweep() {
 	go func() {
 		for {
-			time.Sleep(ddnsSweepInterval)
+			time.Sleep(ddnsSweepTick)
 			s.sweepDDNSOnce()
 		}
 	}()
@@ -4914,7 +4938,11 @@ func (s *Server) startDDNSSweep() {
 // sweepDDNSOnce publishes one round and reports how many profiles it wrote.
 func (s *Server) sweepDDNSOnce() int {
 	written := 0
+	now := s.now()
 	for _, profile := range s.store.DDNSProfiles() {
+		if !ddnsDue(profile, now) {
+			continue
+		}
 		node, ok := s.store.Node(profile.NodeID)
 		if !ok {
 			continue
@@ -5074,7 +5102,10 @@ func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, reco
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	applyErr := ddns.Apply(ctx, prov, profile, v4, v6)
-	profile.LastRunAt = time.Now().UTC()
+	// One clock. The sweep gates the next attempt on LastRunAt, so recording it
+	// from a different source than the gate reads makes the interval behave
+	// unpredictably and the behaviour untestable.
+	profile.LastRunAt = s.now().UTC()
 	if applyErr != nil {
 		// Record the failure and keep the previous addresses. Writing the
 		// attempted value here would claim a publish that never landed: the

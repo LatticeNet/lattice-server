@@ -893,3 +893,110 @@ func TestLineCarriesNodeDeclaredPublicPort(t *testing.T) {
 		t.Fatalf("unmapped line invented a public port: %d", plain.PublicPort)
 	}
 }
+
+// (e) A Reality inbound must never render a chain block just because the sing-box
+// helper script parked the public key in a dummy `direct` outbound and `sb
+// inspect` reported that tag as the line's outbound. Rendering one there produced
+// a bogus chain for most of the fleet, and because the per-line inspect
+// enrichment is best-effort, the tag came and went and the plan flipped shape on
+// every sweep, re-queueing a metadata approval each time.
+func TestRenderLineMetadataChainIgnoresRealityPublicKeyOutbound(t *testing.T) {
+	const pubKeyTag = "public_key_69bcoKtJXBYDQzqMtjt55HsXzxJg4_TdUPy0F9-RZk0"
+
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	srv.now = func() time.Time { return time.Date(2026, 8, 27, 4, 0, 0, 0, time.UTC) }
+	if err := srv.store.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "node-uuid-a", Name: "Node A", PublicIP: "203.0.113.5"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// One terminal Reality inbound on one node, rendered twice off the same store.
+	// The line carries the line_uuid every real box has in its sidecar, so its
+	// identity is anchored and only the outbound the agent reported differs.
+	render := func(t *testing.T, outboundRef string) []byte {
+		t.Helper()
+		srv.singboxInvMu.Lock()
+		srv.singboxInv = map[string]model.SingBoxInventory{
+			"node-a": {
+				NodeID: "node-a", At: srv.now(), Status: "ok",
+				Nodes: []model.SingBoxNode{
+					{Name: "VLESS-REALITY-443.json", LineUUID: "f408d159-bf80-42c2-bec2-4dea988761a1", Protocol: "vless", Network: "tcp", Address: "203.0.113.5", Port: "443", OutboundRef: outboundRef},
+				},
+			},
+		}
+		srv.singboxInvMu.Unlock()
+		raw, err := srv.renderLineMetadataJSON("node-a")
+		if err != nil {
+			t.Fatalf("render(%q): %v", outboundRef, err)
+		}
+		return raw
+	}
+
+	chainOf := func(t *testing.T, raw []byte) json.RawMessage {
+		t.Helper()
+		var doc struct {
+			Inbounds []map[string]json.RawMessage `json:"inbounds"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(doc.Inbounds) != 1 {
+			t.Fatalf("want 1 inbound, got %d: %s", len(doc.Inbounds), raw)
+		}
+		return doc.Inbounds[0]["chain"]
+	}
+
+	withKey := render(t, pubKeyTag)
+	if c := chainOf(t, withKey); c != nil {
+		t.Fatalf("public-key storage outbound must not render a chain, got %s in %s", c, withKey)
+	}
+
+	// The same line on a cycle where the best-effort inspect enrichment did not
+	// land must render identically. That equality is what stops the churn: an
+	// unstable plan re-queued a metadata approval on every sweep.
+	withoutRef := render(t, "")
+	if c := chainOf(t, withoutRef); c != nil {
+		t.Fatalf("missing outbound_ref must not render a chain, got %s", c)
+	}
+	if lineMetaSemanticSHA(withKey) != lineMetaSemanticSHA(withoutRef) {
+		t.Fatalf("plan must be semantically identical across the inspect flap:\n%s\n%s", withKey, withoutRef)
+	}
+	if c := chainOf(t, render(t, "direct")); c != nil {
+		t.Fatalf("direct outbound must not render a chain, got %s", c)
+	}
+}
+
+// A real relay keeps its chain block: the guard must key off a resolved
+// downstream server, not merely reject the public-key tag.
+func TestRenderLineMetadataChainKeptForResolvedRelay(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	srv.now = func() time.Time { return time.Date(2026, 8, 27, 4, 0, 0, 0, time.UTC) }
+	seedLinemetaNodes(t, srv)
+	raw, err := srv.renderLineMetadataJSON("node-a")
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	var doc struct {
+		Inbounds []struct {
+			Tag   string          `json:"tag"`
+			Chain json.RawMessage `json:"chain"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := map[string]bool{}
+	for _, ib := range doc.Inbounds {
+		got[ib.Tag] = ib.Chain != nil
+	}
+	if !got["hub-a"] || !got["orphan-relay"] || got["direct-a"] {
+		t.Fatalf("chain presence wrong (hub/orphan want true, direct want false): %v\n%s", got, raw)
+	}
+}

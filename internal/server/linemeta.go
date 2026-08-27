@@ -26,6 +26,10 @@ const (
 	// sing-box -C directory's *.json glob — stock sing-box rejects unknown config
 	// keys, so the metadata file is never consumed by the core (design-15 §4.3).
 	lineMetadataPath = "/etc/sing-box/lattice-metadata.json"
+	// realityPublicKeyOutboundPrefix is the tag prefix the sing-box helper script
+	// uses to park a Reality public key in a dummy `direct` outbound. It is a
+	// storage slot, never a routing target.
+	realityPublicKeyOutboundPrefix = "public_key_"
 )
 
 // ensureLineUUID returns the persisted line_uuid for a line_hash_id, allocating
@@ -99,6 +103,33 @@ type lineMetadataReservedFields struct {
 	LineHashID string `json:"line_hash_id"`
 }
 
+// lineOutboundLeavesBox reports whether a line's outbound actually forwards to a
+// remote endpoint, which is the only honest trigger for a chain block.
+//
+// A non-empty outbound_ref is not evidence on its own. The sing-box helper
+// script stores a Reality public key by parking it in a second `direct` outbound
+// and reusing that outbound's tag as the storage slot ("public_key_<key>"), and
+// `sb inspect` reports that tag as the line's outbound. Gating the chain block on
+// the tag alone therefore rendered a chain for every Reality inbound in the
+// fleet, and flipped it on and off as the per-line inspect enrichment came and
+// went, re-queueing a metadata approval on every sweep.
+//
+// The downstream server is read from this node's own config, so it is stable.
+// Deliberately not keyed off JumpEdges: those resolve against other nodes' live
+// inventories, so a downstream going quiet would flip the block back off and
+// reintroduce exactly the churn this replaces.
+func lineOutboundLeavesBox(ln Line) bool {
+	ref := strings.TrimSpace(ln.OutboundRef)
+	switch strings.ToLower(ref) {
+	case "", "direct", "block", "dns":
+		return false
+	}
+	if strings.HasPrefix(ref, realityPublicKeyOutboundPrefix) {
+		return false
+	}
+	return strings.TrimSpace(ln.OutboundServer) != ""
+}
+
 // renderLineMetadataJSON renders the schema-v2 sidecar for one node from the
 // current line read model. Output is deterministic (inbounds sorted by tag, fixed
 // field order) so re-renders of unchanged state are byte-identical. A line whose
@@ -130,8 +161,7 @@ func (s *Server) renderLineMetadataJSON(nodeID string) ([]byte, error) {
 		}
 		ib := lineMetadataInboundV2{Tag: tag, LineUUID: ln.LineUUID, LineHashID: ln.LineHashID}
 		ds := strings.TrimSpace(ln.DownstreamLineUUID)
-		ref := strings.ToLower(strings.TrimSpace(ln.OutboundRef))
-		if ds != "" || (ref != "" && ref != "direct") {
+		if ds != "" || lineOutboundLeavesBox(ln) {
 			chain := &lineMetadataChainV2{}
 			if ds != "" {
 				chain.DownstreamLineUUID = &ds

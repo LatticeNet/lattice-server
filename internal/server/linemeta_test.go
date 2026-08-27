@@ -850,3 +850,46 @@ func TestLineMetadataApplyWithoutExistingTarget(t *testing.T) {
 		t.Fatalf("new target unexpectedly has backup, stat err=%v", err)
 	}
 }
+
+// TestLineCarriesNodeDeclaredPublicPort pins that the node's endpoint
+// declaration reaches the line read model.
+//
+// A NAT line listens on one port and is reached on another. If the read model
+// drops that, every consumer downstream - the chain renderer above all - builds
+// an address that dials a closed door, and nothing looks wrong until traffic
+// fails.
+func TestLineCarriesNodeDeclaredPublicPort(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	if err := srv.store.UpsertNode(model.Node{ID: "nat-1", Name: "NAT One", PublicIP: "203.0.113.9"}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"nat-1": {NodeID: "nat-1", At: srv.now(), Status: "ok", Network: "nat", Nodes: []model.SingBoxNode{
+			{Name: "VLESS-REALITY-488.json", Protocol: "vless", Network: "tcp",
+				Address: "jp.nat.example.org", Port: "488", PublicPort: "50100"},
+			{Name: "Plain-9000.json", Protocol: "vless", Network: "tcp",
+				Address: "203.0.113.9", Port: "9000"},
+		}},
+	}
+	srv.singboxInvMu.Unlock()
+
+	groups, _ := srv.lineReadModel()
+	mapped := findLine(t, groups, "nat-1", "VLESS-REALITY-488.json")
+	if mapped.ListenPort != 488 || mapped.PublicPort != 50100 {
+		t.Fatalf("mapped line: listen=%d public=%d, want 488/50100", mapped.ListenPort, mapped.PublicPort)
+	}
+	if mapped.PublicHost != "jp.nat.example.org" {
+		t.Fatalf("public host = %q, want the node-declared name", mapped.PublicHost)
+	}
+	// A line the node did not map keeps a zero public port, which reads as
+	// "reached where it listens" rather than as a second, wrong number.
+	plain := findLine(t, groups, "nat-1", "Plain-9000.json")
+	if plain.PublicPort != 0 {
+		t.Fatalf("unmapped line invented a public port: %d", plain.PublicPort)
+	}
+}

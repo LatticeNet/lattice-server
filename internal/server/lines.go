@@ -19,29 +19,34 @@ import (
 // the server package, not the shared SDK). Secret-free: it carries only
 // connection-shape metadata, never private keys or passwords.
 type Line struct {
-	ID                 string   `json:"id"`           // == LineHashID (stable handle)
-	LineHashID         string   `json:"line_hash_id"` // stable across re-probes; see lineHash / stableLineHandle
-	LineID             string   `json:"line_id,omitempty"`
-	NodeID             string   `json:"node_id"`
-	NodeIdentityUUID   string   `json:"node_identity_uuid,omitempty"`
-	LineUUID           string   `json:"line_uuid,omitempty"`            // design-15 D1: durable control-plane identity (vpnmeta/lineuuid)
-	DownstreamLineUUID string   `json:"downstream_line_uuid,omitempty"` // design-15 §6: declared chain edge target
-	Core               string   `json:"core"`                           // sing-box | xray | mihomo
-	Source             string   `json:"source"`                         // managed | discovered | imported
-	Managed            bool     `json:"managed"`                        // under Lattice config management
-	Name               string   `json:"name"`
-	Tag                string   `json:"tag,omitempty"`
-	Type               string   `json:"type,omitempty"` // protocol
-	Transport          string   `json:"transport,omitempty"`
-	Security           string   `json:"security,omitempty"`
-	ListenHost         string   `json:"listen_host,omitempty"`
-	ListenPort         int      `json:"listen_port,omitempty"`
-	PublicHost         string   `json:"public_host,omitempty"`
-	Domain             string   `json:"domain,omitempty"`
-	OutboundRef        string   `json:"outbound_ref,omitempty"`    // direct | <host/tag> | "" unknown
-	OutboundServer     string   `json:"outbound_server,omitempty"` // downstream server host the outbound routes to
-	OutboundPort       int      `json:"outbound_port,omitempty"`   // downstream server port the outbound routes to
-	JumpEdges          []string `json:"jump_edges,omitempty"`      // line_hash_ids this line relays to
+	ID                 string `json:"id"`           // == LineHashID (stable handle)
+	LineHashID         string `json:"line_hash_id"` // stable across re-probes; see lineHash / stableLineHandle
+	LineID             string `json:"line_id,omitempty"`
+	NodeID             string `json:"node_id"`
+	NodeIdentityUUID   string `json:"node_identity_uuid,omitempty"`
+	LineUUID           string `json:"line_uuid,omitempty"`            // design-15 D1: durable control-plane identity (vpnmeta/lineuuid)
+	DownstreamLineUUID string `json:"downstream_line_uuid,omitempty"` // design-15 §6: declared chain edge target
+	Core               string `json:"core"`                           // sing-box | xray | mihomo
+	Source             string `json:"source"`                         // managed | discovered | imported
+	Managed            bool   `json:"managed"`                        // under Lattice config management
+	Name               string `json:"name"`
+	Tag                string `json:"tag,omitempty"`
+	Type               string `json:"type,omitempty"` // protocol
+	Transport          string `json:"transport,omitempty"`
+	Security           string `json:"security,omitempty"`
+	ListenHost         string `json:"listen_host,omitempty"`
+	ListenPort         int    `json:"listen_port,omitempty"`
+	PublicHost         string `json:"public_host,omitempty"`
+	// PublicPort is where the outside actually reaches this line, when that
+	// differs from ListenPort. Declared by the node, because a mapping that
+	// lives in a provider's router cannot be read from the config here. Zero
+	// means the listen port is also the public one.
+	PublicPort     int      `json:"public_port,omitempty"`
+	Domain         string   `json:"domain,omitempty"`
+	OutboundRef    string   `json:"outbound_ref,omitempty"`    // direct | <host/tag> | "" unknown
+	OutboundServer string   `json:"outbound_server,omitempty"` // downstream server host the outbound routes to
+	OutboundPort   int      `json:"outbound_port,omitempty"`   // downstream server port the outbound routes to
+	JumpEdges      []string `json:"jump_edges,omitempty"`      // line_hash_ids this line relays to
 	// DeclaredJumpEdges is the subset of JumpEdges resolved from the sidecar's
 	// declared downstream_line_uuid (design-15 §6), not inferred from outbound
 	// host/port — the UI badges these as orchestrated edges.
@@ -285,6 +290,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				ListenHost:         n.ListenHost,
 				ListenPort:         port,
 				PublicHost:         n.Address,
+				PublicPort:         atoiSafe(n.PublicPort),
 				Domain:             firstNonEmpty(n.SNI, n.Host),
 				OutboundRef:        n.OutboundRef,
 				OutboundServer:     n.OutboundServer,

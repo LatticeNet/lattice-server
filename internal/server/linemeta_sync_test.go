@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -306,5 +307,120 @@ func TestDiscoveryRetriesAfterApprovalPersistenceFailure(t *testing.T) {
 	}
 	if persisted != 1 {
 		t.Fatalf("retry did not durably persist one pending approval: %d", persisted)
+	}
+}
+
+// TestLineMetaNoRequeueAfterApplyWhenUnchanged pins the behaviour that kept
+// twenty-three approvals coming back after every deploy.
+//
+// The dedup guard only ever compared a fresh render against a PENDING approval.
+// Once the operator applied that approval there was nothing left to compare
+// against, so the next render queued a brand new approval whose plan differed
+// from the applied one by its updated_at line alone. Discovery would normally
+// suppress the re-render, but its fingerprint map lives in memory, so every
+// server restart cleared it and re-queued one no-op approval per node.
+func TestLineMetaNoRequeueAfterApplyWhenUnchanged(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	now := time.Date(2026, 8, 27, 3, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return now }
+	seedLinemetaNodes(t, srv)
+
+	decode := func(out []byte) (model.Approval, bool) {
+		t.Helper()
+		var resp struct {
+			Approval model.Approval `json:"approval"`
+			Queued   bool           `json:"queued"`
+		}
+		if err := json.Unmarshal(out, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp.Approval, resp.Queued
+	}
+
+	out, err := srv.vpnCoreLinesSyncMetadata(lineUserTestPrincipal(), json.RawMessage(`{"node_id":"node-a"}`))
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	first, queued := decode(out)
+	if !queued {
+		t.Fatal("first sync must queue a review")
+	}
+
+	// The operator approves and the node applies it.
+	first.Status = model.ApprovalApplied
+	first.UpdatedAt = now
+	if err := st.UpsertApproval(first); err != nil {
+		t.Fatal(err)
+	}
+
+	// Time moves on, so a fresh render carries a new updated_at, and the
+	// in-memory discovery fingerprint is gone as it would be after a restart.
+	// The fleet keeps reporting across that restart, so the inventory stays
+	// current; without refreshing it the seeded report ages out and the render
+	// would collapse to an empty inbound list, which is a different change.
+	now = now.Add(2 * time.Hour)
+	srv.linemetaSyncFP = nil
+	srv.singboxInvMu.Lock()
+	for nodeID, inv := range srv.singboxInv {
+		inv.At = now
+		srv.singboxInv[nodeID] = inv
+	}
+	srv.singboxInvMu.Unlock()
+
+	// Discovery re-runs after the restart. It must find nothing worth reviewing.
+	srv.maybeQueueLineMetaSyncOnDiscovery("node-a", srv.singboxInv["node-a"])
+	for _, ap := range st.Approvals() {
+		if ap.Plugin == singBoxLineMetaPlugin && ap.Status == model.ApprovalPending {
+			t.Fatalf("discovery re-queued a no-op approval after restart: %s", ap.ID)
+		}
+	}
+
+	systemPrincipal := principal{Principal: rbac.Principal{ActorID: systemActorID}}
+	out2, err := srv.vpnCoreLinesSyncMetadata(systemPrincipal, json.RawMessage(`{"node_id":"node-a"}`))
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	second, queued2 := decode(out2)
+	if queued2 {
+		t.Fatal("a render matching what the node already applied must not queue a review")
+	}
+	if second.ID != first.ID {
+		t.Fatalf("want the applied approval back, got a new one: %s vs %s", second.ID, first.ID)
+	}
+	for _, ap := range st.Approvals() {
+		if ap.Plugin == singBoxLineMetaPlugin && ap.Status == model.ApprovalPending {
+			t.Fatalf("no-op render created a pending approval: %s", ap.ID)
+		}
+	}
+
+	// An operator asking for the sync by hand still gets one, because that is
+	// how a box whose sidecar drifted gets re-pushed.
+	out2b, err := srv.vpnCoreLinesSyncMetadata(lineUserTestPrincipal(), json.RawMessage(`{"node_id":"node-a"}`))
+	if err != nil {
+		t.Fatalf("operator sync: %v", err)
+	}
+	if _, queuedOp := decode(out2b); !queuedOp {
+		t.Fatal("an explicit operator sync must still queue a review")
+	}
+
+	// A real change must still open a review.
+	srv.singboxInvMu.Lock()
+	inv := srv.singboxInv["node-a"]
+	inv.Nodes = append(inv.Nodes, model.SingBoxNode{
+		Name: "new-relay", Protocol: "trojan", Network: "tcp",
+		Address: "203.0.113.5", Port: "9443", OutboundRef: "direct",
+	})
+	srv.singboxInv["node-a"] = inv
+	srv.singboxInvMu.Unlock()
+	out3, err := srv.vpnCoreLinesSyncMetadata(lineUserTestPrincipal(), json.RawMessage(`{"node_id":"node-a"}`))
+	if err != nil {
+		t.Fatalf("third sync: %v", err)
+	}
+	if _, queued3 := decode(out3); !queued3 {
+		t.Fatal("a genuine metadata change must still queue a review")
 	}
 }

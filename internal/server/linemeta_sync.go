@@ -51,8 +51,9 @@ func lineMetaSemanticSHA(payload []byte) string {
 }
 
 // vpnCoreLinesSyncMetadata queues one sidecar apply for review. It is
-// idempotent: an identical pending approval (same node, same metadata bytes)
-// is returned instead of duplicated.
+// idempotent in both directions: an identical pending approval (same node, same
+// metadata bytes) is returned instead of duplicated, and a render that matches
+// what the node already has applied queues nothing at all.
 func (s *Server) vpnCoreLinesSyncMetadata(p principal, request []byte) ([]byte, error) {
 	var req struct {
 		NodeID string `json:"node_id"`
@@ -87,8 +88,21 @@ func (s *Server) queueLineMetaSyncLocked(p principal, nodeID string) ([]byte, er
 	action := lineMetaApplyActionPrefix + lineMetaSHA(payload)
 	semanticSHA := lineMetaSemanticSHA(payload)
 	var pending *model.Approval
+	// The newest plan this node actually has on disk. It is what decides whether
+	// a fresh render is worth an operator's attention at all.
+	var applied *model.Approval
 	for _, ap := range s.store.Approvals() {
-		if ap.Plugin != singBoxLineMetaPlugin || ap.NodeID != nodeID || ap.Status != model.ApprovalPending {
+		if ap.Plugin != singBoxLineMetaPlugin || ap.NodeID != nodeID {
+			continue
+		}
+		if ap.Status == model.ApprovalApplied {
+			if applied == nil || ap.UpdatedAt.After(applied.UpdatedAt) {
+				candidate := ap
+				applied = &candidate
+			}
+			continue
+		}
+		if ap.Status != model.ApprovalPending {
 			continue
 		}
 		if pending == nil {
@@ -124,6 +138,28 @@ func (s *Server) queueLineMetaSyncLocked(p principal, nodeID string) ([]byte, er
 			Approval model.Approval `json:"approval"`
 			Queued   bool           `json:"queued"`
 		}{Approval: *pending, Queued: queued})
+	}
+	// Nothing is pending, so this render would open a fresh review. Only do that
+	// when it would actually change the box.
+	//
+	// The semantic hash already exists to ignore updated_at, but it was only
+	// consulted against a PENDING approval. Once that approval was applied the
+	// comparison had nothing left to compare against, so the next render queued
+	// a brand new approval whose plan differed from the applied one by the
+	// updated_at line alone. The discovery fingerprint that would have
+	// suppressed the re-render lives in memory, so every server restart cleared
+	// it and re-queued one no-op approval per node. Twenty-three nodes meant
+	// twenty-three approvals reappearing after every deploy, none of which
+	// described a real change.
+	// Only the automatic path is suppressed. An operator who explicitly asks for
+	// a sync may be repairing a box whose sidecar drifted from what the control
+	// plane believes it applied, and answering "nothing to do" would take that
+	// repair away.
+	if p.ActorID == systemActorID && applied != nil && lineMetaSemanticSHA([]byte(applied.Plan)) == semanticSHA {
+		return json.Marshal(struct {
+			Approval model.Approval `json:"approval"`
+			Queued   bool           `json:"queued"`
+		}{Approval: *applied, Queued: false})
 	}
 	now := s.now().UTC()
 	approval := model.Approval{

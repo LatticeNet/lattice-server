@@ -4757,32 +4757,37 @@ func (s *Server) handleAgentEvent(w http.ResponseWriter, r *http.Request) {
 // ddnsView is the secret-free projection of a DDNS profile returned to clients.
 // Credentials (Cloudflare token, webhook headers) are never serialized.
 type ddnsView struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	NodeID        string    `json:"node_id"`
-	Provider      string    `json:"provider"`
-	Domains       []string  `json:"domains"`
-	EnableIPv4    bool      `json:"enable_ipv4"`
-	EnableIPv6    bool      `json:"enable_ipv6"`
-	MaxRetries    int       `json:"max_retries"`
-	TTL           int       `json:"ttl"`
-	HasCredential bool      `json:"has_credential"`
-	WebhookURL    string    `json:"webhook_url,omitempty"`
-	WebhookMethod string    `json:"webhook_method,omitempty"`
-	LastIPv4      string    `json:"last_ipv4,omitempty"`
-	LastIPv6      string    `json:"last_ipv6,omitempty"`
-	LastRunAt     time.Time `json:"last_run_at,omitempty"`
-	LastError     string    `json:"last_error,omitempty"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	NodeID     string   `json:"node_id"`
+	Provider   string   `json:"provider"`
+	Domains    []string `json:"domains"`
+	EnableIPv4 bool     `json:"enable_ipv4"`
+	EnableIPv6 bool     `json:"enable_ipv6"`
+	MaxRetries int      `json:"max_retries"`
+	TTL        int      `json:"ttl"`
+	// IntervalSeconds must be returned, not just stored: the edit form reads
+	// the profile back to prefill itself, so a field the view withholds is a
+	// field every edit silently resets.
+	IntervalSeconds int       `json:"interval_seconds,omitempty"`
+	HasCredential   bool      `json:"has_credential"`
+	WebhookURL      string    `json:"webhook_url,omitempty"`
+	WebhookMethod   string    `json:"webhook_method,omitempty"`
+	LastIPv4        string    `json:"last_ipv4,omitempty"`
+	LastIPv6        string    `json:"last_ipv6,omitempty"`
+	LastRunAt       time.Time `json:"last_run_at,omitempty"`
+	LastError       string    `json:"last_error,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 func toDDNSView(p model.DDNSProfile) ddnsView {
 	return ddnsView{
 		ID: p.ID, Name: p.Name, NodeID: p.NodeID, Provider: p.Provider, Domains: p.Domains,
 		EnableIPv4: p.EnableIPv4, EnableIPv6: p.EnableIPv6, MaxRetries: p.MaxRetries, TTL: p.TTL,
-		HasCredential: p.CFAPIToken != "" || p.WebhookHeaders != "",
-		WebhookURL:    p.WebhookURL, WebhookMethod: p.WebhookMethod,
+		IntervalSeconds: p.IntervalSeconds,
+		HasCredential:   p.CFAPIToken != "" || p.WebhookHeaders != "",
+		WebhookURL:      p.WebhookURL, WebhookMethod: p.WebhookMethod,
 		LastIPv4: p.LastIPv4, LastIPv6: p.LastIPv6, LastRunAt: p.LastRunAt, LastError: p.LastError,
 		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 	}

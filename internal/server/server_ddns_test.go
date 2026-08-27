@@ -434,6 +434,24 @@ func TestDDNSSweepHonoursInterval(t *testing.T) {
 		t.Fatalf("create: %d", create.StatusCode)
 	}
 
+	// The interval must survive the round trip, or the edit form silently
+	// resets it on every save.
+	var madeSlow struct {
+		IntervalSeconds int `json:"interval_seconds"`
+	}
+	list := doJSON(t, handler, http.MethodGet, "/api/ddns", "", cookies, "")
+	defer list.Body.Close()
+	var views []struct {
+		IntervalSeconds int `json:"interval_seconds"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 || views[0].IntervalSeconds != 43200 {
+		t.Fatalf("interval not returned by the list view: %+v", views)
+	}
+	_ = madeSlow
+
 	// Never run, so the first sweep publishes.
 	if n := srv.sweepDDNSOnce(); n != 1 {
 		t.Fatalf("first sweep wrote %d, want 1", n)

@@ -223,3 +223,77 @@ func TestDDNSUpdateKeepsIDAndCredential(t *testing.T) {
 		t.Fatalf("unknown id created a profile: %d", len(all))
 	}
 }
+
+// TestDDNSSweepPublishesOnlyChanges covers the periodic republish.
+//
+// Profiles used to run only on an operator's button press, so a record went
+// stale the moment a residential address changed. The sweep closes that, but it
+// must not turn into a rewrite loop: a fleet whose addresses are steady should
+// cost nothing at the provider.
+func TestDDNSSweepPublishesOnlyChanges(t *testing.T) {
+	srv, handler, st := newDDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+
+	if err := st.UpsertNode(model.Node{ID: "n1", PublicIP: "203.0.113.10"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeProvider{}
+	srv.ddnsProvider = func(model.DDNSProfile) (ddns.Provider, error) { return fake, nil }
+
+	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
+		`{"name":"cf","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create: %d", create.StatusCode)
+	}
+
+	// First sweep publishes, because nothing has been published yet.
+	if n := srv.sweepDDNSOnce(); n != 1 {
+		t.Fatalf("first sweep wrote %d, want 1", n)
+	}
+	if len(fake.records) != 1 || fake.records[0].IP != "203.0.113.10" {
+		t.Fatalf("provider saw %+v", fake.records)
+	}
+
+	// Nothing moved, so nothing is written.
+	if n := srv.sweepDDNSOnce(); n != 0 {
+		t.Fatalf("steady sweep wrote %d, want 0", n)
+	}
+	if len(fake.records) != 1 {
+		t.Fatalf("steady sweep hit the provider: %+v", fake.records)
+	}
+
+	// The address moves: the record follows it.
+	if err := st.UpsertNode(model.Node{ID: "n1", PublicIP: "203.0.113.11"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := srv.sweepDDNSOnce(); n != 1 {
+		t.Fatalf("changed sweep wrote %d, want 1", n)
+	}
+	if len(fake.records) != 2 || fake.records[1].IP != "203.0.113.11" {
+		t.Fatalf("provider did not follow the address: %+v", fake.records)
+	}
+
+	// A profile whose last run failed is retried even though nothing moved,
+	// so a corrected credential is picked up without another address change.
+	stored, _ := st.DDNSProfile(fake4ProfileID(t, st))
+	stored.LastError = "cloudflare: api error (status 403)"
+	if err := st.UpsertDDNSProfile(stored); err != nil {
+		t.Fatal(err)
+	}
+	if n := srv.sweepDDNSOnce(); n != 1 {
+		t.Fatalf("failed profile was not retried: wrote %d, want 1", n)
+	}
+	if got, _ := st.DDNSProfile(stored.ID); got.LastError != "" {
+		t.Fatalf("retry did not clear the error: %q", got.LastError)
+	}
+}
+
+func fake4ProfileID(t *testing.T, st *store.Store) string {
+	t.Helper()
+	all := st.DDNSProfiles()
+	if len(all) != 1 {
+		t.Fatalf("want exactly one profile, got %d", len(all))
+	}
+	return all[0].ID
+}

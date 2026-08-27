@@ -557,6 +557,7 @@ func New(opts Options) (*Server, error) {
 		s.startNodeLivenessSweeper()
 		s.startTraceRetention()
 		s.startTraceReattribution()
+		s.startDDNSSweep()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -4889,6 +4890,64 @@ func (s *Server) handleDeleteDDNS(w http.ResponseWriter, r *http.Request, p prin
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: nodeID, Action: "ddns.delete", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// ddnsSweepInterval is how often bound profiles are re-checked. Node public
+// addresses arrive with the agent's own report, so anything faster than that
+// only re-reads the store.
+const ddnsSweepInterval = 5 * time.Minute
+
+// startDDNSSweep republishes profiles whose node address moved.
+//
+// Profiles used to run only when an operator pressed the button, which made
+// them useless for the case DDNS exists for: a residential address changes on
+// its own schedule and the record silently went stale until somebody noticed.
+func (s *Server) startDDNSSweep() {
+	go func() {
+		for {
+			time.Sleep(ddnsSweepInterval)
+			s.sweepDDNSOnce()
+		}
+	}()
+}
+
+// sweepDDNSOnce publishes one round and reports how many profiles it wrote.
+func (s *Server) sweepDDNSOnce() int {
+	written := 0
+	for _, profile := range s.store.DDNSProfiles() {
+		node, ok := s.store.Node(profile.NodeID)
+		if !ok {
+			continue
+		}
+		v4, v6 := "", ""
+		if profile.EnableIPv4 {
+			v4 = strings.TrimSpace(node.PublicIP)
+		}
+		if profile.EnableIPv6 {
+			v6 = strings.TrimSpace(node.PublicIPv6)
+		}
+		if v4 == "" && v6 == "" {
+			continue
+		}
+		// Publish only what changed. Comparing against what this profile last
+		// published keeps a stable fleet from spending provider rate limit on
+		// rewrites of values that are already correct.
+		//
+		// A profile whose last run failed is always retried, because the
+		// address is unchanged in exactly the case that matters: a credential
+		// was wrong and has since been fixed, and nothing else would ever
+		// prompt another attempt.
+		unchanged := (v4 == "" || v4 == profile.LastIPv4) && (v6 == "" || v6 == profile.LastIPv6)
+		if unchanged && profile.LastError == "" {
+			continue
+		}
+		if err := s.runDDNSWithAudit(profile, v4, v6, s.recordAudit); err != nil {
+			s.logger.Printf("ddns sweep: %s (%s): %v", profile.Name, profile.NodeID, err)
+			continue
+		}
+		written++
+	}
+	return written
 }
 
 // handleRunDDNS manually triggers a profile using its bound node's current

@@ -5075,15 +5075,22 @@ func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, reco
 	defer cancel()
 	applyErr := ddns.Apply(ctx, prov, profile, v4, v6)
 	profile.LastRunAt = time.Now().UTC()
-	if v4 != "" {
-		profile.LastIPv4 = v4
-	}
-	if v6 != "" {
-		profile.LastIPv6 = v6
-	}
 	if applyErr != nil {
+		// Record the failure and keep the previous addresses. Writing the
+		// attempted value here would claim a publish that never landed: the
+		// column reads as "what is in DNS now", and the sweep compares against
+		// it to decide whether anything needs writing, so a failed attempt
+		// recorded as published is both a lie to the operator and a way to skip
+		// the retry. Apply joins per-record errors, so a partial success cannot
+		// be told apart from a total one; the whole profile is retried instead.
 		profile.LastError = applyErr.Error()
 	} else {
+		if v4 != "" {
+			profile.LastIPv4 = v4
+		}
+		if v6 != "" {
+			profile.LastIPv6 = v6
+		}
 		profile.LastError = ""
 	}
 	if err := s.store.UpsertDDNSProfile(profile); err != nil {

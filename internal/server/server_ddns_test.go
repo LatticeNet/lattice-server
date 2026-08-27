@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -296,4 +297,63 @@ func fake4ProfileID(t *testing.T, st *store.Store) string {
 		t.Fatalf("want exactly one profile, got %d", len(all))
 	}
 	return all[0].ID
+}
+
+// TestDDNSFailedRunKeepsPreviousIP pins that a failed publish is not recorded
+// as one. The column reads as "what is in DNS now" and the sweep compares
+// against it, so an attempted-but-unwritten value both misleads the operator
+// and lets the retry be skipped.
+func TestDDNSFailedRunKeepsPreviousIP(t *testing.T) {
+	srv, handler, st := newDDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	if err := st.UpsertNode(model.Node{ID: "n1", PublicIP: "203.0.113.20"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &failingProvider{}
+	srv.ddnsProvider = func(model.DDNSProfile) (ddns.Provider, error) { return fake, nil }
+
+	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
+		`{"name":"x","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true}`, cookies, csrf)
+	defer create.Body.Close()
+	var made struct {
+		ID string `json:"id"`
+	}
+	json.NewDecoder(create.Body).Decode(&made)
+
+	// Seed a previously published address.
+	seed, _ := st.DDNSProfile(made.ID)
+	seed.LastIPv4 = "203.0.113.1"
+	if err := st.UpsertDDNSProfile(seed); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := srv.sweepDDNSOnce(); n != 0 {
+		t.Fatalf("a failed publish counted as written: %d", n)
+	}
+	got, _ := st.DDNSProfile(made.ID)
+	if got.LastIPv4 != "203.0.113.1" {
+		t.Fatalf("failed publish overwrote the last known address: %q", got.LastIPv4)
+	}
+	if got.LastError == "" {
+		t.Fatal("failed publish recorded no error")
+	}
+
+	// Once the provider recovers, the sweep retries and records for real.
+	fake.ok = true
+	if n := srv.sweepDDNSOnce(); n != 1 {
+		t.Fatalf("recovered profile was not retried: %d", n)
+	}
+	if got, _ := st.DDNSProfile(made.ID); got.LastIPv4 != "203.0.113.20" || got.LastError != "" {
+		t.Fatalf("recovery not recorded: ip=%q err=%q", got.LastIPv4, got.LastError)
+	}
+}
+
+type failingProvider struct{ ok bool }
+
+func (f *failingProvider) Kind() string { return "failing" }
+func (f *failingProvider) SetRecord(context.Context, ddns.Record) error {
+	if f.ok {
+		return nil
+	}
+	return errors.New("provider refused")
 }

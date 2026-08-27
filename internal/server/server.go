@@ -4813,7 +4813,42 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 		if !req.EnableIPv4 && !req.EnableIPv6 {
 			req.EnableIPv4 = true
 		}
-		req.ID = id.New("ddns")
+		// An id in the body means "edit this profile". Without this the handler
+		// minted a fresh id on every POST, so a profile could be created and
+		// then never changed: re-submitting it produced a duplicate instead of
+		// an update, and the only way to fix a typo or rotate a token was to
+		// delete and recreate.
+		action := "ddns.create"
+		if existingID := strings.TrimSpace(req.ID); existingID != "" {
+			existing, ok := s.store.DDNSProfile(existingID)
+			if !ok {
+				writeError(w, http.StatusNotFound, errors.New("ddns profile not found"))
+				return
+			}
+			// Re-pointing a profile at another node needs authority over the
+			// node it is leaving as well as the one it is joining.
+			if existing.NodeID != req.NodeID && !s.requireNodeScope(w, p, "ddns:admin", existing.NodeID) {
+				return
+			}
+			req.ID = existing.ID
+			req.CreatedAt = existing.CreatedAt
+			// Credentials are redacted by toDDNSView, so an edit that leaves
+			// them blank cannot mean "clear it" - the client never had the
+			// value to send back. Blank keeps what is stored; a non-empty
+			// value replaces it.
+			if strings.TrimSpace(req.CFAPIToken) == "" {
+				req.CFAPIToken = existing.CFAPIToken
+			}
+			if strings.TrimSpace(req.WebhookHeaders) == "" {
+				req.WebhookHeaders = existing.WebhookHeaders
+			}
+			// Run status belongs to the runner, not to whoever is editing.
+			req.LastIPv4, req.LastIPv6 = existing.LastIPv4, existing.LastIPv6
+			req.LastRunAt, req.LastError = existing.LastRunAt, existing.LastError
+			action = "ddns.update"
+		} else {
+			req.ID = id.New("ddns")
+		}
 		// Validate the provider configuration eagerly by constructing it.
 		if _, err := s.ddnsProvider(req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -4823,7 +4858,7 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "ddns.create", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider}})
 		writeJSON(w, http.StatusOK, toDDNSView(req))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

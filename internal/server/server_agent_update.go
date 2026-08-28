@@ -440,6 +440,19 @@ func (s *Server) evaluateAgentUpdatePolicies(now time.Time) {
 		if !policy.Enabled || !policy.AutoPlan {
 			continue
 		}
+		// A plan for a node that cannot receive it is noise that outlives the
+		// release it was cut for. It sits pending, an operator has to read and
+		// triage it, and by the time the node is back the version it names may
+		// already be superseded. A machine that has been switched off collects
+		// one of these per release and there is nothing to approve them onto.
+		//
+		// Waiting costs nothing, because this sweep runs continuously: the plan
+		// is cut on the first pass after the node is heard from again. An
+		// operator asking for a plan explicitly still gets one either way; only
+		// the automatic path defers.
+		if node, ok := s.store.Node(policy.NodeID); ok && nodeReachability(node) != ReachabilityOnline {
+			continue
+		}
 		if _, err := s.createAgentUpdateApproval(context.Background(), policy.NodeID, systemActorID, false, "auto", now); err != nil && !errors.Is(err, errAgentUpdateNoop) {
 			s.logger.Printf("agent update policy %s: %v", policy.NodeID, err)
 		}

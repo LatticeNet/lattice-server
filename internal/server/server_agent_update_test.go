@@ -19,8 +19,71 @@ func seedAgentUpdateNode(t *testing.T, st interface {
 	UpsertNode(model.Node) error
 }) {
 	t.Helper()
-	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.1.0"}); err != nil {
+	// Beating: auto-planning is for a node that can actually receive the plan,
+	// and the sweep now skips ones that cannot.
+	if err := st.UpsertNode(model.Node{
+		ID: "node-a", Name: "Node A", AgentVersion: "0.1.0",
+		Online: true, LastSeen: time.Now().UTC(),
+	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A machine that is switched off would otherwise collect one auto plan per
+// release, each pending against a node with nothing to apply it, and each
+// naming a version that may be superseded before the node returns.
+func TestAgentUpdateAutoPlanSkipsANodeThatCannotReceiveIt(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		node model.Node
+		want int
+	}{
+		{"beating", model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.1.0", Online: true, LastSeen: time.Now().UTC()}, 1},
+		{"went quiet", model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.1.0", LastSeen: time.Now().UTC().Add(-30 * 24 * time.Hour)}, 0},
+		{"never reported", model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.1.0"}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, st := newInventoryServer(t)
+			if err := st.UpsertNode(tc.node); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+				NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+				BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+				SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			srv.evaluateAgentUpdatePolicies(time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC))
+			if got := len(st.Approvals()); got != tc.want {
+				t.Fatalf("%s: auto plans = %d, want %d", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// Deferring is the automatic path only. An operator who asks for a plan on a
+// node that is down still gets one: they may be about to bring it up.
+func TestAgentUpdateManualPlanStillWorksForAQuietNode(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	if err := st.UpsertNode(model.Node{
+		ID: "node-a", Name: "Node A", AgentVersion: "0.1.0",
+		LastSeen: time.Now().UTC().Add(-30 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "operator", false, "manual", time.Now().UTC()); err != nil {
+		t.Fatalf("manual plan for a quiet node must still be allowed: %v", err)
+	}
+	if got := len(st.Approvals()); got != 1 {
+		t.Fatalf("manual plans = %d, want 1", got)
 	}
 }
 

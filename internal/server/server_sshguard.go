@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -384,4 +385,65 @@ func (s *Server) handleSSHGuardConfirm(w http.ResponseWriter, r *http.Request, p
 		Metadata: map[string]string{"approval_id": approval.ID, "stage": string(sshguard.StageConfirm)},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"approval": approval})
+}
+
+// handleSSHGuardTaskResult advances an SSH Guard approval once its apply task
+// reports.
+//
+// Without this the approval stopped at `approved` forever. The work ran, the
+// task result was stored, and nothing carried that back: 60 approvals across 24
+// nodes sat looking un-applied a week after their tasks had finished. Every
+// other plugin here does this; sshguard was wired for planning and approving
+// and never for the result.
+//
+// It is not only cosmetic. `applied` on the arm is what says the revert timer
+// is now running, which is the one state on this capability with a deadline. A
+// status that never advances makes that state unreachable and leaves an
+// operator with no way to tell, from the control plane, whether the hardening
+// is live.
+func (s *Server) handleSSHGuardTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {
+	if result.FinishedAt.IsZero() {
+		result.FinishedAt = time.Now().UTC()
+	}
+	stage := "arm"
+	if approval.Action == sshGuardConfirmAction {
+		stage = "confirm"
+	}
+	metadata := map[string]string{
+		"approval_id": approval.ID,
+		"task_id":     task.ID,
+		"stage":       stage,
+		"plan_sha":    approvalPlanSHA(approval),
+	}
+	if result.Error == "" && result.ExitCode == 0 {
+		approval.Status = model.ApprovalApplied
+		approval.Reason = ""
+		approval.UpdatedAt = time.Now().UTC()
+		if err := s.store.UpsertApproval(approval); err != nil {
+			return fmt.Errorf("mark sshguard approval applied: %w", err)
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   approval.NodeID,
+			Action:   "sshguard." + stage + ".applied",
+			Decision: "allow",
+			Metadata: metadata,
+		})
+		return nil
+	}
+	// A failed arm is the case the automatic revert exists for: the node is
+	// restoring itself, and the approval must not keep claiming it is armed.
+	reason := taskFailureSummary(result)
+	if err := s.rejectApprovalWithReason(approval, reason); err != nil {
+		return fmt.Errorf("mark sshguard approval rejected: %w", err)
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   "sshguard." + stage + ".failed",
+		Decision: "deny",
+		Reason:   reason,
+		Metadata: metadata,
+	})
+	return nil
 }

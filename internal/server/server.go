@@ -7421,6 +7421,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	if approval.Plugin == agentUpdatePlugin {
 		return s.handleAgentUpdateTaskResult(r, approval, result)
 	}
+	if isSSHGuardApproval(approval) {
+		return s.handleSSHGuardTaskResult(r, approval, task, result)
+	}
 	if isPluginOperationApproval(approval) {
 		return s.handlePluginOperationTaskResult(r, approval, task, result)
 	}

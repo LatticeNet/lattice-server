@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/sshguard"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -344,5 +346,72 @@ func TestSSHGuardApplyGetsATimeoutThatCoversInstallingKnockd(t *testing.T) {
 	// back to 30 seconds rather than clamping, so asking for more asks for less.
 	if got > 600 {
 		t.Fatalf("over ten minutes silently becomes 30 seconds on the agent, got %ds", got)
+	}
+}
+
+// The approval has to advance when its apply task reports, and it did not.
+// Sixty approvals across twenty-four nodes sat at `approved` a week after their
+// tasks had finished, so the control plane could not say whether the hardening
+// was live. `applied` on the arm is also what marks the revert timer as
+// running, which is the one state on this capability with a deadline.
+func TestSSHGuardApprovalAdvancesOnItsTaskResult(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result model.TaskResult
+		want   string
+	}{
+		{"applied on success", model.TaskResult{ExitCode: 0}, model.ApprovalApplied},
+		{"rejected on a non-zero exit", model.TaskResult{ExitCode: 1, Stderr: "nft: syntax error"}, model.ApprovalRejected},
+		{"rejected when the agent reports an error", model.TaskResult{Error: "timed out"}, model.ApprovalRejected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _, st := newInventoryServer(t)
+			seedAgentUpdateNode(t, st)
+			approval := model.Approval{
+				ID: id.New("approval"), NodeID: "node-a", Plugin: sshGuardPlugin,
+				Action: sshGuardArmAction, Plan: "plugin: sshguard\n", Status: model.ApprovalApproved,
+				CreatedAt: time.Now().UTC(),
+			}
+			if err := st.UpsertApproval(approval); err != nil {
+				t.Fatal(err)
+			}
+			task := model.Task{ID: id.New("task"), ApprovalID: approval.ID, Targets: []string{"node-a"}}
+			if err := srv.handleSSHGuardTaskResult(httptest.NewRequest(http.MethodPost, "/api/agent/task-results", nil), approval, task, tc.result); err != nil {
+				t.Fatalf("result handling: %v", err)
+			}
+			got, ok := st.Approval(approval.ID)
+			if !ok {
+				t.Fatal("approval vanished")
+			}
+			if got.Status != tc.want {
+				t.Fatalf("status = %q, want %q", got.Status, tc.want)
+			}
+			if tc.want == model.ApprovalRejected && got.Reason == "" {
+				t.Fatal("a failed apply must say why, so the operator is not left guessing")
+			}
+		})
+	}
+}
+
+// The confirm stage goes through the same path: its whole effect is cancelling
+// the revert, and an approval stuck at `approved` cannot express that it did.
+func TestSSHGuardConfirmApprovalAlsoAdvances(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	approval := model.Approval{
+		ID: id.New("approval"), NodeID: "node-a", Plugin: sshGuardPlugin,
+		Action: sshGuardConfirmAction, Plan: "plugin: sshguard\n", Status: model.ApprovalApproved,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	task := model.Task{ID: id.New("task"), ApprovalID: approval.ID, Targets: []string{"node-a"}}
+	if err := srv.handleSSHGuardTaskResult(httptest.NewRequest(http.MethodPost, "/api/agent/task-results", nil), approval, task, model.TaskResult{ExitCode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Approval(approval.ID)
+	if got.Status != model.ApprovalApplied {
+		t.Fatalf("confirm status = %q, want applied", got.Status)
 	}
 }

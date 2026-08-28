@@ -1120,3 +1120,69 @@ func TestBootUnitIsNamedForWhatItDoesAndClearsTheOldName(t *testing.T) {
 		}
 	}
 }
+
+// The plan is the reviewed artifact, so a claim it makes about what the apply
+// does is part of the contract, not commentary. A hardening-only profile used
+// to render the narrowing paragraph anyway: it told the reviewer that port 22
+// was being restricted to the management sources listed below, and then listed
+// "(none)". Thirty-one approved plans on this fleet carry that text while
+// installing no firewall at all.
+func TestAHardeningOnlyPlanDoesNotClaimToNarrowAnything(t *testing.T) {
+	p := Profile{
+		NodeID: "n1", KeepLegacyPort: true, Hardening: DefaultHardening(),
+		ConfirmWindowSec: 900,
+	}
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"narrowed to the management sources",
+		"narrows who may reach",
+		"brute force stops reaching sshd",
+		"The firewall rules below",
+		"## Management sources",
+		"- (none)",
+	} {
+		if strings.Contains(plan, forbidden) {
+			t.Fatalf("a plan that installs no firewall must not say %q:\n%s", forbidden, plan)
+		}
+	}
+	if !strings.Contains(plan, "installs no firewall") {
+		t.Fatalf("the plan must say plainly that reachability does not change:\n%s", plan)
+	}
+	// Changing the prose must not change what the apply derives from it.
+	if _, err := ParseApprovalPlan(plan); err != nil {
+		t.Fatalf("plan must still parse: %v", err)
+	}
+
+	findings := LintProfile(p, NodeReality{Reported: true, ListeningTCPPorts: []int{22}})
+	var found bool
+	for _, f := range findings {
+		if f.Code == FindingHardeningOnly {
+			found = true
+			if f.Severity != SeverityWarn {
+				t.Fatalf("hardening-only is a choice, not a refusal: got severity %q", f.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("hardening-only must be reported, got %+v", findings)
+	}
+
+	// A profile that does gate keeps the paragraph it earned.
+	gated := p
+	gated.MgmtSources = []string{"203.0.113.5/32"}
+	gatedPlan, err := RenderArmPlan(gated, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gatedPlan, "## Management sources") {
+		t.Fatal("a gating profile must still list its sources")
+	}
+	for _, f := range LintProfile(gated, NodeReality{Reported: true}) {
+		if f.Code == FindingHardeningOnly {
+			t.Fatal("a profile with a management source is not hardening-only")
+		}
+	}
+}

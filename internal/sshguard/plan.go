@@ -78,44 +78,72 @@ func RenderArmPlan(p Profile, nodeName string) (string, error) {
 	}
 	fmt.Fprintf(&b, "confirm_window_sec: %d\n", window)
 
+	// Every sentence below has to describe the artifacts this same function is
+	// about to render, not the shape of a profile in general. A profile with no
+	// management sources and no knock policy renders no firewall at all
+	// (Profile.GatesFirewall), and the prose used to claim otherwise: it told
+	// the reviewer that port 22 was being narrowed to the sources listed below
+	// and then listed "(none)". Both readings of that were wrong, and the
+	// dangerous one is the reassuring one, because it says brute force stops
+	// reaching sshd when nothing about reachability changed.
+	gates := p.GatesFirewall()
+
 	b.WriteString("\n## What this does, and why it cannot strand you\n\n")
-	if p.SSHPort != 0 {
+	switch {
+	case p.SSHPort != 0:
 		b.WriteString("The apply adds a port before it takes anything away, so at every instant\n")
 		b.WriteString("during the change every path that worked before still works. It then arms a\n")
-	} else {
+	case gates:
 		b.WriteString("The apply changes no port: it hardens sshd and narrows who may reach the\n")
 		b.WriteString("existing one. It arms a\n")
+	default:
+		b.WriteString("The apply changes no port and installs no firewall: it edits sshd's\n")
+		b.WriteString("configuration and nothing else. Who can reach SSH is exactly what it was.\n")
+		b.WriteString("It arms a\n")
 	}
 	fmt.Fprintf(&b, "systemd timer that undoes all of it in %d seconds unless a second, separate\n", window)
 	b.WriteString("approval confirms. That second approval is the point: it is how you say you\n")
 	b.WriteString("logged in over the new path and got a shell. If you cannot, do nothing and\n")
-	b.WriteString("the node returns to its previous state on its own.\n\n")
-	b.WriteString("The firewall rules below start with `ct state established,related accept`,\n")
-	b.WriteString("so applying them does not cut the session watching the apply.\n")
-	if p.KeepLegacyPort && p.SSHPort != 0 {
-		b.WriteString("\nPort 22 is not closed. It is shrunk to the management sources and to\n")
-		b.WriteString("knocked-open sources, which stops the brute force from reaching sshd while\n")
-		b.WriteString("keeping a way in that does not depend on knocking working.\n")
-	} else if p.Knock == nil {
-		b.WriteString("\nPort 22 is not closed. It is narrowed to the management sources listed\n")
-		b.WriteString("below, so brute force stops reaching sshd. There is no knock sequence in\n")
-		b.WriteString("this profile, which means those sources are the only way in: check them.\n")
+	b.WriteString("the node returns to its previous state on its own.\n")
+	if gates {
+		b.WriteString("\nThe firewall rules below start with `ct state established,related accept`,\n")
+		b.WriteString("so applying them does not cut the session watching the apply.\n")
+		if p.KeepLegacyPort && p.SSHPort != 0 {
+			b.WriteString("\nPort 22 is not closed. It is shrunk to the management sources and to\n")
+			b.WriteString("knocked-open sources, which stops the brute force from reaching sshd while\n")
+			b.WriteString("keeping a way in that does not depend on knocking working.\n")
+		} else if p.Knock == nil {
+			b.WriteString("\nPort 22 is not closed. It is narrowed to the management sources listed\n")
+			b.WriteString("below, so brute force stops reaching sshd. There is no knock sequence in\n")
+			b.WriteString("this profile, which means those sources are the only way in: check them.\n")
+		}
+	} else {
+		b.WriteString("\nThe settings below stop password and keyboard-interactive login and shrink\n")
+		b.WriteString("the login grace window. They do not stop anyone from reaching sshd, so the\n")
+		b.WriteString("brute force in the auth log continues, failing sooner. Narrowing the source\n")
+		b.WriteString("addresses needs a management source or a knock policy; this profile has\n")
+		b.WriteString("neither.\n")
+		b.WriteString("\nThe lockout risk here is the sshd settings themselves: an account that\n")
+		b.WriteString("logs in by password, or a root login that uses one, stops working at the\n")
+		b.WriteString("reload. That is what the revert timer is for.\n")
 	}
 
-	if p.Knock != nil {
-		b.WriteString("\n## Management sources (reach SSH without knocking, no expiry)\n\n")
-	} else {
-		b.WriteString("\n## Management sources (the only sources that may reach SSH)\n\n")
-	}
-	if len(p.MgmtSources) == 0 {
-		b.WriteString("- (none)\n")
-	}
-	for _, src := range p.MgmtSources {
-		norm, nErr := normalizeCIDR(src)
-		if nErr != nil {
-			return "", fmt.Errorf("mgmt_source %q: %w", src, nErr)
+	if gates {
+		if p.Knock != nil {
+			b.WriteString("\n## Management sources (reach SSH without knocking, no expiry)\n\n")
+		} else {
+			b.WriteString("\n## Management sources (the only sources that may reach SSH)\n\n")
 		}
-		fmt.Fprintf(&b, "- %s\n", norm)
+		if len(p.MgmtSources) == 0 {
+			b.WriteString("- (none)\n")
+		}
+		for _, src := range p.MgmtSources {
+			norm, nErr := normalizeCIDR(src)
+			if nErr != nil {
+				return "", fmt.Errorf("mgmt_source %q: %w", src, nErr)
+			}
+			fmt.Fprintf(&b, "- %s\n", norm)
+		}
 	}
 
 	if p.Knock != nil {

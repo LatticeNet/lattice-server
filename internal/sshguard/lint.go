@@ -53,6 +53,16 @@ const (
 	// this fleet run it on 3434, so the assumption is not safe to make
 	// silently: gating the wrong port protects nothing and looks like success.
 	FindingAssumedSSHPort = "sshguard_assumed_ssh_port"
+
+	// FindingHardeningOnly fires when the profile has neither a management
+	// source nor a knock policy, so Profile.GatesFirewall is false and the
+	// apply renders no firewall at all.
+	//
+	// That is a legitimate profile and the safest one to apply, but it is not
+	// what "SSH Guard" sounds like, and a fleet of them reads as protected on
+	// the rollout screen while every one of those nodes is still reachable
+	// from the whole internet. Say it, so it is a choice.
+	FindingHardeningOnly = "sshguard_hardening_only"
 )
 
 type Severity string
@@ -162,6 +172,13 @@ func LintProfile(p Profile, r NodeReality) []Finding {
 		findings = append(findings, Finding{
 			Code: FindingFallbackUnavailable, Severity: SeverityBlock,
 			Message: "this profile gates SSH on the grounds that the node's Lattice terminal is the fallback, and that node is either offline or not reporting the terminal capability. Gating SSH now would leave no way in that does not depend on knocking working.",
+		})
+	}
+
+	if !p.GatesFirewall() {
+		findings = append(findings, Finding{
+			Code: FindingHardeningOnly, Severity: SeverityWarn,
+			Message: "this profile has no management source and no knock sequence, so it installs no firewall: it changes sshd's settings and leaves who can reach the port exactly as it is. Password login stops, the brute force does not. Add a management source if the intent was to narrow access.",
 		})
 	}
 

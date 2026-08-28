@@ -55,9 +55,12 @@ func armScript(art Artifacts) (string, error) {
 	if art.KnockNFT != "" {
 		fmt.Fprintf(&b, "KNOCK_NFT=%s\n", KnockNFTPath)
 	}
+	fmt.Fprintf(&b, "LEGACY_DROPIN=%s\n", LegacyDropInPath)
 	b.WriteString("REVERT=\"$STATE/revert.sh\"\n")
 	b.WriteString("DROPIN_BACKUP=\"$STATE/sshd-dropin.rollback\"\n")
 	b.WriteString("DROPIN_ABSENT=\"$STATE/sshd-dropin.was-absent\"\n")
+	b.WriteString("LEGACY_BACKUP=\"$STATE/sshd-dropin-legacy.rollback\"\n")
+	b.WriteString("LEGACY_ABSENT=\"$STATE/sshd-dropin-legacy.was-absent\"\n")
 	if art.KnockdConf != "" {
 		fmt.Fprintf(&b, "KNOCKD_CONF=%s\n", KnockdConf)
 		b.WriteString("KNOCKD_BACKUP=\"$STATE/knockd.rollback\"\n")
@@ -84,6 +87,11 @@ func armScript(art Artifacts) (string, error) {
 	b.WriteString("# than a guess about what used to be here.\n")
 	b.WriteString("rm -f \"$DROPIN_BACKUP\" \"$DROPIN_ABSENT\"\n")
 	b.WriteString("if [ -f \"$DROPIN\" ]; then cp -a \"$DROPIN\" \"$DROPIN_BACKUP\"; else : > \"$DROPIN_ABSENT\"; fi\n")
+	// The file this package used to write is snapshotted the same way. A node
+	// hardened under the old name gets migrated by this apply, and the revert
+	// has to be able to put it back exactly.
+	b.WriteString("rm -f \"$LEGACY_BACKUP\" \"$LEGACY_ABSENT\"\n")
+	b.WriteString("if [ -f \"$LEGACY_DROPIN\" ]; then cp -a \"$LEGACY_DROPIN\" \"$LEGACY_BACKUP\"; else : > \"$LEGACY_ABSENT\"; fi\n")
 	touchesKnockd := art.KnockdConf != ""
 	if touchesKnockd {
 		b.WriteString("rm -f \"$KNOCKD_BACKUP\" \"$KNOCKD_ABSENT\"\n")
@@ -130,6 +138,9 @@ func armScript(art Artifacts) (string, error) {
 	b.WriteString("# Step 1: sshd gains a port; it loses nothing.\n")
 	b.WriteString(heredoc("\"$DROPIN\"", "LATTICE_SSHGUARD_SSHD", art.SSHDDropIn))
 	b.WriteString("chmod 0644 \"$DROPIN\"\n")
+	// Both files carry the same settings, so dropping the old name here takes
+	// nothing away; it only stops two files from claiming the same keywords.
+	b.WriteString("rm -f \"$LEGACY_DROPIN\"\n")
 	b.WriteString("if ! \"$SSHD\" -t; then\n")
 	b.WriteString("  echo 'lattice sshguard: sshd rejected the candidate config; nothing was reloaded' >&2\n")
 	b.WriteString("  exit 1\n")
@@ -286,6 +297,7 @@ func revertScriptHeredoc(touchesKnockd, touchesFirewall bool) string {
 	s.WriteString("set +e\n")
 	fmt.Fprintf(&s, "STATE=%s\n", StateDir)
 	fmt.Fprintf(&s, "DROPIN=%s\n", DropInPath)
+	fmt.Fprintf(&s, "LEGACY_DROPIN=%s\n", LegacyDropInPath)
 	if touchesKnockd {
 		fmt.Fprintf(&s, "KNOCKD_CONF=%s\n", KnockdConf)
 	}
@@ -298,6 +310,11 @@ func revertScriptHeredoc(touchesKnockd, touchesFirewall bool) string {
 	s.WriteString("  cp -a \"$STATE/sshd-dropin.rollback\" \"$DROPIN\"\n")
 	s.WriteString("elif [ -f \"$STATE/sshd-dropin.was-absent\" ]; then\n")
 	s.WriteString("  rm -f \"$DROPIN\"\n")
+	s.WriteString("fi\n")
+	s.WriteString("if [ -f \"$STATE/sshd-dropin-legacy.rollback\" ]; then\n")
+	s.WriteString("  cp -a \"$STATE/sshd-dropin-legacy.rollback\" \"$LEGACY_DROPIN\"\n")
+	s.WriteString("elif [ -f \"$STATE/sshd-dropin-legacy.was-absent\" ]; then\n")
+	s.WriteString("  rm -f \"$LEGACY_DROPIN\"\n")
 	s.WriteString("fi\n")
 	s.WriteString("# Only reload if the restored config parses. A revert that reloads a broken\n")
 	s.WriteString("# sshd is worse than one that leaves the running daemon alone.\n")

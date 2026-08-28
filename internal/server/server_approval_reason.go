@@ -154,6 +154,16 @@ func sshGuardArmDisplayReason(plan string) string {
 	if art.KnockdConf != "" {
 		knock = "port knocking"
 	}
+	// No gated ports means the plan carries no firewall, so saying it gates
+	// something is the same lie the plan body used to tell. Whether it gates is
+	// what an operator scanning this list most needs to know.
+	if len(art.GatedPorts) == 0 {
+		if art.SSHPort == 0 {
+			return fmt.Sprintf("Harden sshd only, no firewall (auto-revert in %ds)", art.ConfirmWindowSec)
+		}
+		return fmt.Sprintf("Move sshd to tcp/%d, harden only, no firewall (auto-revert in %ds)",
+			art.SSHPort, art.ConfirmWindowSec)
+	}
 	if art.SSHPort == 0 {
 		return fmt.Sprintf("Harden sshd and gate %s (%s, auto-revert in %ds)",
 			joinPortList(art.GatedPorts), knock, art.ConfirmWindowSec)

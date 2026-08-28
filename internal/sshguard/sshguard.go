@@ -34,7 +34,29 @@ const (
 	// DropInPath is the only sshd file this package writes. Writing a drop-in
 	// rather than editing sshd_config means a rollback is a file removal, and
 	// an operator reading the host can see exactly which lines Lattice owns.
-	DropInPath = "/etc/ssh/sshd_config.d/60-lattice-guard.conf"
+	//
+	// The name sorts first on purpose. sshd takes the FIRST value it reads for
+	// a keyword, and Include comes near the top of sshd_config, so a drop-in
+	// that sorts earlier wins outright. At the old `60-` this file lost to the
+	// two files nearly every cloud image ships: `50-cloud-init.conf`, which
+	// carries whatever `ssh_pwauth` was set to and is rewritten whenever
+	// cloud-init re-runs, and `50-redhat.conf`. Eighteen of this fleet's
+	// thirty-three nodes have one of those declaring an auth keyword; today
+	// they all happen to say `no`, which is the only reason the loss was
+	// invisible. One provider image also ships
+	// `00-permit-root-password-auth.conf`, which turns root password login
+	// back on and beat the guard outright.
+	//
+	// A guard that can be silently overruled by a file the platform rewrites
+	// is not a guard, so it goes first and the apply's effectiveness check
+	// stays as the proof.
+	DropInPath = "/etc/ssh/sshd_config.d/00-lattice-guard.conf"
+
+	// LegacyDropInPath is where this package wrote before the ordering fix.
+	// Every arm removes it, and every revert puts it back, so a node that was
+	// hardened under the old name is migrated by the next apply rather than
+	// left with two files that both claim to own the same settings.
+	LegacyDropInPath = "/etc/ssh/sshd_config.d/60-lattice-guard.conf"
 
 	// KnockTable is deliberately not lattice_guard. See the package comment.
 	KnockTable   = "lattice_knock"

@@ -782,7 +782,7 @@ func TestApplyVerifiesEverySettingActuallyTookEffect(t *testing.T) {
 		t.Fatal("the failure must name the file that won")
 	}
 	// Only files sorting before ours can win, so naming our own would be noise.
-	if !strings.Contains(script, `awk '$0 < "60-lattice-guard.conf"'`) {
+	if !strings.Contains(script, `awk '$0 < "`+dropInBasename()+`"'`) {
 		t.Fatal("the search must be limited to drop-ins that sort before ours")
 	}
 	// The verification must sit after the reload; checking before it would read
@@ -1183,6 +1183,79 @@ func TestAHardeningOnlyPlanDoesNotClaimToNarrowAnything(t *testing.T) {
 	for _, f := range LintProfile(gated, NodeReality{Reported: true}) {
 		if f.Code == FindingHardeningOnly {
 			t.Fatal("a profile with a management source is not hardening-only")
+		}
+	}
+}
+
+// sshd takes the FIRST value it reads for a keyword and Include sits near the
+// top of sshd_config, so a drop-in that sorts earlier wins outright. At the old
+// `60-` name this package lost to `50-cloud-init.conf` (rewritten by cloud-init
+// from ssh_pwauth on every re-run) and to `50-redhat.conf`, and on one provider
+// image to `00-permit-root-password-auth.conf`, which exists specifically to
+// turn root password login back on. Eighteen of thirty-three fleet nodes have
+// such a file; they happen to agree today, which is the only reason it was
+// invisible.
+func TestTheGuardDropInSortsBeforeTheFilesThatWouldOverruleIt(t *testing.T) {
+	name := dropInBasename()
+	for _, loser := range []string{
+		"00-permit-root-password-auth.conf",
+		"50-cloud-init.conf",
+		"50-redhat.conf",
+		"60-lattice-guard.conf",
+		"99-template-ipv4-only.conf",
+	} {
+		if name >= loser {
+			t.Fatalf("%q must sort before %q or sshd ignores it", name, loser)
+		}
+	}
+	if LegacyDropInPath == DropInPath {
+		t.Fatal("the legacy path must stay distinct so the migration can remove it")
+	}
+}
+
+// A node hardened under the old name must end up with one file, not two that
+// both claim the same keywords, and a revert must put the old one back.
+func TestArmMigratesTheLegacyDropInAndTheRevertRestoresIt(t *testing.T) {
+	p := Profile{
+		NodeID: "n1", KeepLegacyPort: true, Hardening: DefaultHardening(),
+		ConfirmWindowSec: 900,
+	}
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := ApplyScriptFromPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`LEGACY_DROPIN=` + LegacyDropInPath,
+		`if [ -f "$LEGACY_DROPIN" ]; then cp -a "$LEGACY_DROPIN" "$LEGACY_BACKUP"; else : > "$LEGACY_ABSENT"; fi`,
+		`rm -f "$LEGACY_DROPIN"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("arm must migrate the legacy drop-in, missing %q", want)
+		}
+	}
+	// Snapshot before removal, or the revert restores nothing.
+	snap := strings.Index(script, `cp -a "$LEGACY_DROPIN" "$LEGACY_BACKUP"`)
+	del := strings.Index(script, "\nrm -f \"$LEGACY_DROPIN\"\n")
+	if snap < 0 || del < 0 || snap > del {
+		t.Fatal("the legacy file must be snapshotted before it is removed")
+	}
+	// And removed only after the replacement is on disk.
+	write := strings.Index(script, `chmod 0644 "$DROPIN"`)
+	if write < 0 || write > del {
+		t.Fatal("the new drop-in must be written before the old one is removed")
+	}
+
+	revert := revertScriptHeredoc(false, false)
+	for _, want := range []string{
+		`cp -a "$STATE/sshd-dropin-legacy.rollback" "$LEGACY_DROPIN"`,
+		`rm -f "$LEGACY_DROPIN"`,
+	} {
+		if !strings.Contains(revert, want) {
+			t.Fatalf("revert must restore the legacy drop-in, missing %q", want)
 		}
 	}
 }

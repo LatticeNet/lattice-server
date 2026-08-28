@@ -1166,6 +1166,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/api/version", s.handleVersion)
+	// Public on purpose: it is an updater for a node that already runs the
+	// agent, so it neither takes a credential nor hands one out.
+	mux.HandleFunc(agentInstallScriptPath, s.handleAgentInstallScript)
 	mux.Handle("/", s.staticHandler())
 	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
 }

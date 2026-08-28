@@ -329,6 +329,25 @@ func (s *Server) buildLineGroups() []LineGroup {
 			}
 		}
 	}
+	// A name a node answers to is not always a name it reports. A DDNS profile
+	// publishes a record for a node, and a relay elsewhere names that record as
+	// its outbound server, but the node itself may only ever report its bare
+	// address, so the endpoint had no key and the edge was lost. The control
+	// plane owns these records, so it can supply the missing names rather than
+	// resolving anything.
+	ddnsHosts := map[string][]string{} // node_id -> record names
+	for _, profile := range s.store.DDNSProfiles() {
+		node := strings.TrimSpace(profile.NodeID)
+		if node == "" {
+			continue
+		}
+		for _, d := range profile.Domains {
+			if d = strings.TrimSpace(d); d != "" {
+				ddnsHosts[node] = append(ddnsHosts[node], d)
+			}
+		}
+	}
+
 	// A node behind a provider is reached at the provider's edge hostname on a
 	// forwarded port, and neither half of that pair is what the node listens on:
 	// the relay names <provider edge>:<public port> while the loop above filed
@@ -345,13 +364,19 @@ func (s *Server) buildLineGroups() []LineGroup {
 			if port <= 0 {
 				continue
 			}
-			for _, host := range []string{ln.ProviderEdge, ln.PublicHost, ln.Domain} {
+			hosts := append([]string{ln.ProviderEdge, ln.PublicHost, ln.Domain}, ddnsHosts[ln.NodeID]...)
+			for _, host := range hosts {
 				if strings.TrimSpace(host) == "" {
 					continue
 				}
-				key := normHostPort(host, port)
-				if _, taken := index[key]; !taken {
-					index[key] = ln.LineHashID
+				for _, p := range []int{port, ln.ListenPort} {
+					if p <= 0 {
+						continue
+					}
+					key := normHostPort(host, p)
+					if _, taken := index[key]; !taken {
+						index[key] = ln.LineHashID
+					}
 				}
 			}
 		}

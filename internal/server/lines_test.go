@@ -358,3 +358,62 @@ func TestProviderEdgeIndexDoesNotStealADirectEndpoint(t *testing.T) {
 		t.Fatalf("the listening line must keep its endpoint: %v, want [%s]", hub.JumpEdges, direct.LineHashID)
 	}
 }
+
+// A relay can name a node by a DDNS record the node itself never reports: the
+// node knows only its bare address, while the record exists because Lattice
+// publishes it. Two real relays pointed at att.aaitr.roobli.org and
+// eb-wee.dmit.roobli.org and resolved to nothing for exactly that reason.
+func TestBuildLineGroupsResolvesJumpEdgesThroughDDNSRecord(t *testing.T) {
+	srv := newLinesTestServer(t)
+	for _, n := range []model.Node{
+		{ID: "hub", Name: "Hub", PublicIP: "203.0.113.5"},
+		{ID: "exit", Name: "Exit", PublicIP: "108.195.128.236"},
+	} {
+		if err := srv.store.UpsertNode(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := srv.store.UpsertDDNSProfile(model.DDNSProfile{
+		ID: "ddns_exit", Name: "exit", NodeID: "exit", Provider: "cloudflare",
+		Domains: []string{"att.aaitr.roobli.org"}, EnableIPv4: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"hub": {
+			NodeID: "hub", At: srv.now(), Status: "ok",
+			Nodes: []model.SingBoxNode{
+				{Name: "hub-out", Protocol: "vless", Network: "tcp", Address: "203.0.113.5", Port: "443",
+					OutboundRef: "to-exit", OutboundServer: "att.aaitr.roobli.org", OutboundPort: "57289", OutboundType: "vless"},
+			},
+		},
+		// Reports only its bare address; the record name is Lattice's to know.
+		"exit": {
+			NodeID: "exit", At: srv.now(), Status: "ok",
+			Nodes: []model.SingBoxNode{
+				{Name: "exit-in", Protocol: "vless", Network: "tcp", Address: "108.195.128.236", Port: "57289"},
+			},
+		},
+	}
+	srv.singboxInvMu.Unlock()
+
+	groups := srv.buildLineGroups()
+	var hub, exit *Line
+	for gi := range groups {
+		for li := range groups[gi].Lines {
+			switch groups[gi].Lines[li].Tag {
+			case "hub-out":
+				hub = &groups[gi].Lines[li]
+			case "exit-in":
+				exit = &groups[gi].Lines[li]
+			}
+		}
+	}
+	if hub == nil || exit == nil {
+		t.Fatalf("expected both lines: %+v", groups)
+	}
+	if len(hub.JumpEdges) != 1 || hub.JumpEdges[0] != exit.LineHashID {
+		t.Fatalf("relay named by DDNS record unresolved: %v, want [%s]", hub.JumpEdges, exit.LineHashID)
+	}
+}

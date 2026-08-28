@@ -41,7 +41,11 @@ type Line struct {
 	// differs from ListenPort. Declared by the node, because a mapping that
 	// lives in a provider's router cannot be read from the config here. Zero
 	// means the listen port is also the public one.
-	PublicPort     int      `json:"public_port,omitempty"`
+	PublicPort int `json:"public_port,omitempty"`
+	// ProviderEdge is the hostname a provider forwards into this node from. A
+	// relay names it as its outbound server, so it is the only host under which
+	// a chain into a NAT node can be matched back to the line that ends it.
+	ProviderEdge   string   `json:"provider_edge,omitempty"`
 	Domain         string   `json:"domain,omitempty"`
 	OutboundRef    string   `json:"outbound_ref,omitempty"`    // direct | <host/tag> | "" unknown
 	OutboundServer string   `json:"outbound_server,omitempty"` // downstream server host the outbound routes to
@@ -291,6 +295,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				ListenPort:         port,
 				PublicHost:         n.Address,
 				PublicPort:         atoiSafe(n.PublicPort),
+				ProviderEdge:       strings.TrimSpace(inv.ProviderEdge),
 				Domain:             firstNonEmpty(n.SNI, n.Host),
 				OutboundRef:        n.OutboundRef,
 				OutboundServer:     n.OutboundServer,
@@ -321,6 +326,33 @@ func (s *Server) buildLineGroups() []LineGroup {
 					continue
 				}
 				index[normHostPort(host, ln.ListenPort)] = ln.LineHashID
+			}
+		}
+	}
+	// A node behind a provider is reached at the provider's edge hostname on a
+	// forwarded port, and neither half of that pair is what the node listens on:
+	// the relay names <provider edge>:<public port> while the loop above filed
+	// the line under <own host>:<listen port>. Both have to be in the index or
+	// the edge into a NAT node is lost outright, which is what hid four of one
+	// hub's twenty-four relays. Filed second and without clobbering, so a line
+	// reached directly always keeps the key it already owns.
+	for _, lines := range byNode {
+		for _, ln := range lines {
+			port := ln.PublicPort
+			if port <= 0 {
+				port = ln.ListenPort
+			}
+			if port <= 0 {
+				continue
+			}
+			for _, host := range []string{ln.ProviderEdge, ln.PublicHost, ln.Domain} {
+				if strings.TrimSpace(host) == "" {
+					continue
+				}
+				key := normHostPort(host, port)
+				if _, taken := index[key]; !taken {
+					index[key] = ln.LineHashID
+				}
 			}
 		}
 	}

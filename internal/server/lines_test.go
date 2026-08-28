@@ -238,3 +238,123 @@ func TestVPNCoreLinesRPC(t *testing.T) {
 		t.Fatal("bogus method: want error")
 	}
 }
+
+// A relay into a NAT node names the provider's edge hostname and the forwarded
+// port. Neither half is what that node listens on, so indexing only
+// <own host>:<listen port> lost the edge outright: on one hub four of its
+// twenty-four relays resolved to nothing while the twenty pointing at directly
+// reachable nodes were fine.
+func TestBuildLineGroupsResolvesJumpEdgesThroughProviderEdge(t *testing.T) {
+	srv := newLinesTestServer(t)
+	for _, n := range []model.Node{
+		{ID: "hub", Name: "Hub", PublicIP: "203.0.113.5"},
+		{ID: "nat", Name: "NAT exit", PublicIP: "47.148.209.221"},
+	} {
+		if err := srv.store.UpsertNode(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"hub": {
+			NodeID: "hub", At: srv.now(), Status: "ok",
+			Nodes: []model.SingBoxNode{
+				{Name: "hub-out", Protocol: "vless", Network: "tcp", Address: "203.0.113.5", Port: "443",
+					OutboundRef: "to-nat", OutboundServer: "nat-us-28tz.aproxy.top", OutboundPort: "27944", OutboundType: "vless"},
+			},
+		},
+		"nat": {
+			NodeID: "nat", At: srv.now(), Status: "ok",
+			// Listens on 22918; the provider forwards 27944 from its own edge
+			// hostname, and the node declares both.
+			Network:      "nat",
+			ProviderEdge: "nat-us-28tz.aproxy.top",
+			Nodes: []model.SingBoxNode{
+				{Name: "nat-in", Protocol: "vless", Network: "tcp", Address: "frontier.nat.example.org", Port: "22918", PublicPort: "27944"},
+			},
+		},
+	}
+	srv.singboxInvMu.Unlock()
+
+	groups := srv.buildLineGroups()
+	var hub, exit *Line
+	for gi := range groups {
+		for li := range groups[gi].Lines {
+			switch groups[gi].Lines[li].Tag {
+			case "hub-out":
+				hub = &groups[gi].Lines[li]
+			case "nat-in":
+				exit = &groups[gi].Lines[li]
+			}
+		}
+	}
+	if hub == nil || exit == nil {
+		t.Fatalf("expected both lines: %+v", groups)
+	}
+	if exit.ProviderEdge != "nat-us-28tz.aproxy.top" {
+		t.Fatalf("provider edge must reach the read model, got %q", exit.ProviderEdge)
+	}
+	if len(hub.JumpEdges) != 1 || hub.JumpEdges[0] != exit.LineHashID {
+		t.Fatalf("relay through the provider edge unresolved: %v, want [%s]", hub.JumpEdges, exit.LineHashID)
+	}
+}
+
+// The provider-edge keys are filed second and must never take a key a directly
+// reachable line already owns.
+func TestProviderEdgeIndexDoesNotStealADirectEndpoint(t *testing.T) {
+	srv := newLinesTestServer(t)
+	for _, n := range []model.Node{
+		{ID: "hub", Name: "Hub", PublicIP: "203.0.113.5"},
+		{ID: "direct", Name: "Direct", PublicIP: "198.51.100.9"},
+		{ID: "nat", Name: "NAT", PublicIP: "47.148.209.221"},
+	} {
+		if err := srv.store.UpsertNode(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{
+		"hub": {
+			NodeID: "hub", At: srv.now(), Status: "ok",
+			Nodes: []model.SingBoxNode{
+				{Name: "hub-out", Protocol: "vless", Network: "tcp", Address: "203.0.113.5", Port: "443",
+					OutboundRef: "to-shared", OutboundServer: "shared.example.org", OutboundPort: "8443", OutboundType: "vless"},
+			},
+		},
+		// Listens on the contested endpoint: it owns the key.
+		"direct": {
+			NodeID: "direct", At: srv.now(), Status: "ok",
+			Nodes: []model.SingBoxNode{
+				{Name: "direct-in", Protocol: "vless", Network: "tcp", Address: "shared.example.org", Port: "8443"},
+			},
+		},
+		// Would claim the same host:port only through its forwarded port.
+		"nat": {
+			NodeID: "nat", At: srv.now(), Status: "ok",
+			Network: "nat", ProviderEdge: "shared.example.org",
+			Nodes: []model.SingBoxNode{
+				{Name: "nat-in", Protocol: "vless", Network: "tcp", Address: "nat.example.org", Port: "1080", PublicPort: "8443"},
+			},
+		},
+	}
+	srv.singboxInvMu.Unlock()
+
+	groups := srv.buildLineGroups()
+	var hub, direct *Line
+	for gi := range groups {
+		for li := range groups[gi].Lines {
+			switch groups[gi].Lines[li].Tag {
+			case "hub-out":
+				hub = &groups[gi].Lines[li]
+			case "direct-in":
+				direct = &groups[gi].Lines[li]
+			}
+		}
+	}
+	if hub == nil || direct == nil {
+		t.Fatalf("expected both lines: %+v", groups)
+	}
+	if len(hub.JumpEdges) != 1 || hub.JumpEdges[0] != direct.LineHashID {
+		t.Fatalf("the listening line must keep its endpoint: %v, want [%s]", hub.JumpEdges, direct.LineHashID)
+	}
+}

@@ -6856,12 +6856,16 @@ func (s *Server) handleDismissApproval(w http.ResponseWriter, r *http.Request, p
 	}
 	var req struct {
 		ApprovalID string `json:"approval_id"`
+		// Note is the operator's reason, kept on the approval and in the audit
+		// event. A dismissal without one is a record that says something was
+		// retired and not why, which is the state this endpoint exists to end.
+		Note string `json:"note,omitempty"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
-	approval, ok := s.store.Approval(strings.TrimSpace(req.ApprovalID))
-	if !ok {
+	approval, found := s.store.Approval(strings.TrimSpace(req.ApprovalID))
+	if !found {
 		writeError(w, http.StatusNotFound, errors.New("approval not found"))
 		return
 	}
@@ -6872,15 +6876,23 @@ func (s *Server) handleDismissApproval(w http.ResponseWriter, r *http.Request, p
 		writeJSON(w, http.StatusOK, toApprovalView(approval))
 		return
 	}
-	if approval.Plugin != agentUpdatePlugin {
-		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "only stale agent update approvals can be dismissed"))
+	if approval.Plugin != agentUpdatePlugin && !isSSHGuardApproval(approval) {
+		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, "only stale agent update or SSH Guard approvals can be dismissed"))
 		return
 	}
 	if s.hasActiveTaskForApproval(approval.ID) {
 		writeError(w, http.StatusConflict, apiError(model.APIErrorBadRequest, "approval has an active apply task and cannot be dismissed"))
 		return
 	}
-	reason, ok := s.dismissibleAgentUpdateApprovalReason(approval)
+	staleCode := agentUpdateApprovalStaleCode
+	var reason string
+	var ok bool
+	if isSSHGuardApproval(approval) {
+		staleCode = sshGuardApprovalStaleCode
+		reason, ok = s.dismissibleSSHGuardApprovalReason(approval, strings.TrimSpace(req.Note))
+	} else {
+		reason, ok = s.dismissibleAgentUpdateApprovalReason(approval)
+	}
 	if !ok {
 		writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, "approval is not stale; reject or approve it explicitly"))
 		return
@@ -6898,7 +6910,7 @@ func (s *Server) handleDismissApproval(w http.ResponseWriter, r *http.Request, p
 		Action:   "network." + approval.Plugin + ".dismiss",
 		Scope:    approvalDecisionAuditScope(approval),
 		Decision: "dismiss",
-		Metadata: map[string]string{"approval_id": approval.ID, "stale_code": agentUpdateApprovalStaleCode},
+		Metadata: map[string]string{"approval_id": approval.ID, "stale_code": staleCode, "note": approval.Reason},
 	})
 	writeJSON(w, http.StatusOK, toApprovalView(approval))
 }

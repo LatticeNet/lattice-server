@@ -415,3 +415,45 @@ func TestSSHGuardConfirmApprovalAlsoAdvances(t *testing.T) {
 		t.Fatalf("confirm status = %q, want applied", got.Status)
 	}
 }
+
+// An SSH Guard approval that was approved but never applied is a dead end:
+// approve is idempotent so it dispatches nothing, and reject only acts on a
+// pending approval. Sixty such records sat on this fleet looking like pending
+// work with no way to clear them. Dismiss is that way, and it has to stay
+// narrow enough that it cannot be used to skip a real decision.
+func TestSSHGuardApprovalsCanBeRetiredOnlyWhenTheyAreADeadEnd(t *testing.T) {
+	s := &Server{}
+	base := model.Approval{Plugin: sshGuardPlugin, Action: sshGuardArmAction, NodeID: "n1"}
+
+	for _, status := range []string{model.ApprovalPending, model.ApprovalRejected, model.ApprovalApplied} {
+		a := base
+		a.Status = status
+		if _, ok := s.dismissibleSSHGuardApprovalReason(a, ""); ok {
+			t.Fatalf("status %q must not be dismissible", status)
+		}
+	}
+
+	a := base
+	a.Status = model.ApprovalApproved
+	reason, ok := s.dismissibleSSHGuardApprovalReason(a, "")
+	if !ok {
+		t.Fatal("an approved, never-applied approval must be dismissible")
+	}
+	if !strings.Contains(reason, "never applied") || !strings.Contains(reason, "arm") {
+		t.Fatalf("the record must say what was retired and why: %q", reason)
+	}
+
+	confirm := base
+	confirm.Action = sshGuardConfirmAction
+	confirm.Status = model.ApprovalApproved
+	reason, ok = s.dismissibleSSHGuardApprovalReason(confirm, "fleet re-armed under the new drop-in path")
+	if !ok {
+		t.Fatal("a confirm approval must be dismissible on the same terms")
+	}
+	if !strings.Contains(reason, "confirm") {
+		t.Fatalf("the stage must be named: %q", reason)
+	}
+	if !strings.Contains(reason, "fleet re-armed under the new drop-in path") {
+		t.Fatalf("the operator's note must survive into the record: %q", reason)
+	}
+}

@@ -36,6 +36,39 @@ func isSSHGuardApproval(approval model.Approval) bool {
 		(approval.Action == sshGuardArmAction || approval.Action == sshGuardConfirmAction)
 }
 
+// sshGuardApprovalStaleCode labels a dismissal in the audit trail.
+const sshGuardApprovalStaleCode = "sshguard_approval_superseded"
+
+// dismissibleSSHGuardApprovalReason decides whether an SSH Guard approval can
+// be retired without being applied, and what the record should say.
+//
+// An approval that was approved but never reached `applied` is a dead end: the
+// approve endpoint is idempotent, so re-approving it dispatches nothing, and
+// nothing else will ever move it. Before the task result was wired back into
+// the approval, this was every SSH Guard approval on this fleet, including the
+// ones whose apply had failed: sixty records sitting in a state that looked
+// like pending work and could not be cleared. Rejecting is not available
+// either, because reject only acts on a pending approval.
+//
+// The bar is deliberately narrow. A pending approval must be approved or
+// rejected on its merits, an applied one is history, and an approval with an
+// apply in flight is refused by the caller. What is left is exactly the dead
+// end.
+func (s *Server) dismissibleSSHGuardApprovalReason(approval model.Approval, note string) (string, bool) {
+	if approval.Status != model.ApprovalApproved {
+		return "", false
+	}
+	stage := "arm"
+	if approval.Action == sshGuardConfirmAction {
+		stage = "confirm"
+	}
+	reason := fmt.Sprintf("SSH Guard %s approval superseded: approved but never applied, and an approval cannot be re-dispatched. Re-plan if this node still needs the change.", stage)
+	if note != "" {
+		reason = reason + " " + note
+	}
+	return reason, true
+}
+
 // sshGuardNodeReality assembles what the lint reasons about from two
 // independent sources: what the node says it is running, and what netguard
 // would put in front of it.

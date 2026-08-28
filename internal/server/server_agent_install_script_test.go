@@ -37,6 +37,24 @@ func TestRenderAgentInstallScript(t *testing.T) {
 	if strings.Contains(out, "systemctl stop") {
 		t.Fatalf("must never stop the unit separately from restarting it")
 	}
+	// The service name is discovered, not assumed. Guessing it is what made the
+	// first version fail on the one machine it was written for: the launchd
+	// label there is net.lattice.agent, not the obvious org.latticenet.agent.
+	if strings.Contains(out, "org.latticenet.agent") || strings.Contains(out, "net.lattice.agent") {
+		t.Fatalf("the launchd label must be read from the installed plist, not hardcoded")
+	}
+	if !strings.Contains(out, "PlistBuddy") || !strings.Contains(out, "/proc/$PID/cgroup") {
+		t.Fatalf("missing service discovery for one of the platforms")
+	}
+	// The short-circuit keys off a marker written after a successful restart.
+	// Keying it off the binary made "replaced but never restarted" look done,
+	// which is exactly the state a failed restart leaves behind.
+	if !strings.Contains(out, "STATE=/opt/lattice/.installed-version") {
+		t.Fatalf("missing the post-restart state marker")
+	}
+	if strings.Index(out, `printf '%s\n' "$VERSION" >"$STATE"`) < strings.Index(out, "kickstart") {
+		t.Fatalf("the marker must be written after the restart, not before")
+	}
 }
 
 // The script is what runs on the boxes; a syntax error there is not caught by

@@ -1141,6 +1141,7 @@ func TestAHardeningOnlyPlanDoesNotClaimToNarrowAnything(t *testing.T) {
 		"narrows who may reach",
 		"brute force stops reaching sshd",
 		"The firewall rules below",
+		"The firewall shrinks it to the",
 		"## Management sources",
 		"- (none)",
 	} {
@@ -1344,5 +1345,42 @@ func TestSSHDOnTheTargetPortIsNotAPortConflict(t *testing.T) {
 	}
 	if !blocked {
 		t.Fatal("something else on the target port must still block the plan")
+	}
+}
+
+// The drop-in's own comments are read on the host, long after the plan is
+// gone, so they carry the same obligation the plan body does: describe what
+// this profile installs. A hardening-only profile that keeps port 22 used to
+// explain that the firewall shrinks it to the management sources, which is a
+// control it does not install.
+func TestTheDropInCommentsDoNotDescribeAFirewallItDoesNotInstall(t *testing.T) {
+	hardeningOnly := Profile{
+		NodeID: "n1", SSHPort: 58394, KeepLegacyPort: true,
+		Hardening: DefaultHardening(), ConfirmWindowSec: 900,
+	}
+	dropIn, err := hardeningOnly.RenderSSHDDropIn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(dropIn, "The firewall shrinks it to the") {
+		t.Fatalf("a profile that installs no firewall must not describe one:\n%s", dropIn)
+	}
+	if !strings.Contains(dropIn, "installs no firewall") {
+		t.Fatalf("the comment must say what is actually true:\n%s", dropIn)
+	}
+	for _, want := range []string{"Port 22", "Port 58394"} {
+		if !strings.Contains(dropIn, want) {
+			t.Fatalf("both listeners must be declared, missing %q", want)
+		}
+	}
+
+	gating := hardeningOnly
+	gating.MgmtSources = []string{"203.0.113.5/32"}
+	gated, err := gating.RenderSSHDDropIn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gated, "The firewall shrinks it to the") {
+		t.Fatalf("a gating profile keeps the explanation it earned:\n%s", gated)
 	}
 }

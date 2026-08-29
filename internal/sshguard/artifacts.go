@@ -94,9 +94,18 @@ func (p Profile) RenderSSHDDropIn() (string, error) {
 
 	if p.SSHPort != 0 {
 		if p.KeepLegacyPort {
-			b.WriteString("# 22 stays listening on purpose. The firewall shrinks it to the\n")
-			b.WriteString("# management sources instead of closing it, so brute force stops\n")
-			b.WriteString("# reaching sshd without removing a way back in when knocking breaks.\n")
+			// The comment has to match what this profile actually installs. A
+			// hardening-only profile renders no firewall, so telling the reader
+			// that one shrinks port 22 describes a control that is not there.
+			if p.GatesFirewall() {
+				b.WriteString("# 22 stays listening on purpose. The firewall shrinks it to the\n")
+				b.WriteString("# management sources instead of closing it, so brute force stops\n")
+				b.WriteString("# reaching sshd without removing a way back in when knocking breaks.\n")
+			} else {
+				b.WriteString("# 22 stays listening. This profile installs no firewall, so both\n")
+				b.WriteString("# ports are reachable from anywhere; the port below is listed so\n")
+				b.WriteString("# that replacing an older drop-in does not take the listener away.\n")
+			}
 			b.WriteString("Port 22\n")
 		}
 		fmt.Fprintf(&b, "Port %d\n", p.SSHPort)

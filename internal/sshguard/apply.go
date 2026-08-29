@@ -83,6 +83,15 @@ func armScript(art Artifacts) (string, error) {
 		b.WriteString("mkdir -p \"$STATE\" \"$(dirname \"$DROPIN\")\"\n\n")
 	}
 
+	// Captured before the first change, checked after the reload. An apply may
+	// add a port; it must never take one away. The drop-in this package
+	// replaces can itself carry a Port, so removing the old file removes that
+	// listener, and every keyword check would still pass because none of them
+	// looks at ports. That is exactly what happened on gomami-hkg on
+	// 2026-08-29: the migration off 60-lattice-guard.conf dropped tcp/58394,
+	// the operator's only path in, and the apply reported success.
+	b.WriteString("SSHGUARD_PORTS_BEFORE=$(\"$SSHD\" -T 2>/dev/null | awk '$1==\"port\"{print $2}' | sort -u | tr '\\n' ' ')\n\n")
+
 	b.WriteString("# Snapshot BEFORE anything changes, so the revert below is exact rather\n")
 	b.WriteString("# than a guess about what used to be here.\n")
 	b.WriteString("rm -f \"$DROPIN_BACKUP\" \"$DROPIN_ABSENT\"\n")
@@ -517,11 +526,20 @@ func effectiveConfigCheck(dropIn string) string {
 	for _, w := range wants {
 		fmt.Fprintf(&b, "sshguard_check %s %s\n", shellSingleQuote(w.key), shellSingleQuote(w.value))
 	}
+	// An apply may add a port; it must never take one away. The keyword checks
+	// above cannot see this, because a lost port is not a wrong value, it is an
+	// absent one.
+	b.WriteString("for sshguard_port in ${SSHGUARD_PORTS_BEFORE:-}; do\n")
+	b.WriteString("  \"$SSHD\" -T 2>/dev/null | awk '$1==\"port\"{print $2}' | grep -qx \"$sshguard_port\" && continue\n")
+	b.WriteString("  echo \"lattice sshguard: sshd no longer listens on tcp/$sshguard_port, which it did before this apply\" >&2\n")
+	b.WriteString("  echo '  a drop-in this apply replaced was supplying that port; the profile has to declare it' >&2\n")
+	b.WriteString("  sshguard_mismatch=1\n")
+	b.WriteString("done\n")
 	b.WriteString("if [ \"$sshguard_mismatch\" = 1 ]; then\n")
 	b.WriteString("  echo 'lattice sshguard: the drop-in did not fully take effect; reverting rather than reporting a hardening that is not in place' >&2\n")
 	b.WriteString("  exit 1\n")
 	b.WriteString("fi\n")
-	b.WriteString("echo 'lattice sshguard: every setting verified effective'\n\n")
+	b.WriteString("echo 'lattice sshguard: every setting verified effective, no listener lost'\n\n")
 	return b.String()
 }
 

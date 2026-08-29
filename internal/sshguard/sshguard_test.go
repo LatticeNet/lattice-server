@@ -1259,3 +1259,50 @@ func TestArmMigratesTheLegacyDropInAndTheRevertRestoresIt(t *testing.T) {
 		}
 	}
 }
+
+// An apply may add a port; it must never take one away. The keyword checks
+// cannot see this, because a lost port is not a wrong value, it is an absent
+// one. gomami-hkg carried Port 58394 inside the drop-in this package used to
+// write, so migrating off that file removed the operator's only path in while
+// every keyword check passed and the apply reported success.
+func TestApplyRefusesToLoseAListeningPort(t *testing.T) {
+	p := Profile{
+		NodeID: "n1", KeepLegacyPort: true, Hardening: DefaultHardening(),
+		ConfirmWindowSec: 900,
+	}
+	plan, err := RenderArmPlan(p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script, err := ApplyScriptFromPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := strings.Index(script, "SSHGUARD_PORTS_BEFORE=$(")
+	if capture < 0 {
+		t.Fatal("the apply must record the ports sshd resolved before it changes anything")
+	}
+	// Captured before the drop-in is written, or it records the new state and
+	// compares it with itself.
+	write := strings.Index(script, `chmod 0644 "$DROPIN"`)
+	if write < 0 || capture > write {
+		t.Fatal("the port capture must happen before the drop-in is written")
+	}
+	compare := strings.Index(script, "for sshguard_port in ${SSHGUARD_PORTS_BEFORE:-}")
+	reload := strings.Index(script, "reload sshd")
+	if compare < 0 || reload < 0 || compare < reload {
+		t.Fatal("the comparison must run after the reload")
+	}
+	if !strings.Contains(script, "no longer listens on tcp/$sshguard_port") {
+		t.Fatal("the failure must name the port that was lost")
+	}
+	// A lost port has to abort so the revert runs, exactly like a wrong value.
+	abort := strings.Index(script, `if [ "$sshguard_mismatch" = 1 ]; then`)
+	if abort < 0 || abort < compare {
+		t.Fatal("a lost port must feed the same abort path as a mismatched setting")
+	}
+	// Same for the hardening-only shape, which is the one that hit this.
+	if !strings.Contains(script, "hardening only, firewall untouched") {
+		t.Fatal("expected the hardening-only script under test")
+	}
+}

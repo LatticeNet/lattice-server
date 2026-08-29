@@ -1306,3 +1306,43 @@ func TestApplyRefusesToLoseAListeningPort(t *testing.T) {
 		t.Fatal("expected the hardening-only script under test")
 	}
 }
+
+// sshd holding the target port is the node already being where the profile
+// wants it, not a conflict. Treating it as one made a node unplannable onto
+// its own port, which is exactly the plan needed to re-arm a node whose
+// current port is supplied by the drop-in the apply replaces.
+func TestSSHDOnTheTargetPortIsNotAPortConflict(t *testing.T) {
+	p := Profile{
+		NodeID: "n1", SSHPort: 58394, KeepLegacyPort: true,
+		Hardening: DefaultHardening(), ConfirmWindowSec: 900,
+	}
+	onItself := NodeReality{
+		Reported:          true,
+		ListeningTCPPorts: []int{22, 58394, 443},
+		SSHPorts:          []int{22, 58394},
+	}
+	for _, f := range LintProfile(p, onItself) {
+		if f.Code == FindingPortInUse {
+			t.Fatalf("sshd already on tcp/58394 is not a conflict: %s", f.Message)
+		}
+	}
+
+	// A different service on the port is still a block.
+	taken := NodeReality{
+		Reported:          true,
+		ListeningTCPPorts: []int{22, 58394},
+		SSHPorts:          []int{22},
+	}
+	var blocked bool
+	for _, f := range LintProfile(p, taken) {
+		if f.Code == FindingPortInUse {
+			blocked = true
+			if f.Severity != SeverityBlock {
+				t.Fatalf("a real port conflict must block, got %q", f.Severity)
+			}
+		}
+	}
+	if !blocked {
+		t.Fatal("something else on the target port must still block the plan")
+	}
+}

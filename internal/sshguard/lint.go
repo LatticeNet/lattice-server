@@ -135,13 +135,27 @@ func LintProfile(p Profile, r NodeReality) []Finding {
 			Message: "this node has never reported its listeners, so the port-conflict and firewall-override checks could not run. The apply verifies the port is listening before it gates anything, but that is a later and more expensive place to find out.",
 		})
 	} else if p.SSHPort != 0 {
-		for _, port := range r.ListeningTCPPorts {
+		// sshd holding the port is not a conflict, it is the node already being
+		// where the profile wants it. Counting it as one made a node
+		// unplannable onto its own port, which is exactly the plan you need
+		// when re-arming a node whose current port came from the drop-in this
+		// apply replaces.
+		alreadySSH := false
+		for _, port := range r.SSHPorts {
 			if port == p.SSHPort {
-				findings = append(findings, Finding{
-					Code: FindingPortInUse, Severity: SeverityBlock,
-					Message: fmt.Sprintf("something already listens on tcp/%d. sshd -t does not catch this because binding happens at reload, so the apply would gate a port sshd never got.", p.SSHPort),
-				})
+				alreadySSH = true
 				break
+			}
+		}
+		if !alreadySSH {
+			for _, port := range r.ListeningTCPPorts {
+				if port == p.SSHPort {
+					findings = append(findings, Finding{
+						Code: FindingPortInUse, Severity: SeverityBlock,
+						Message: fmt.Sprintf("something already listens on tcp/%d. sshd -t does not catch this because binding happens at reload, so the apply would gate a port sshd never got.", p.SSHPort),
+					})
+					break
+				}
 			}
 		}
 	}

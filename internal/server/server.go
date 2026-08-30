@@ -7847,6 +7847,27 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'")
+		// Sever window.opener both ways. Every window.open in the console
+		// already passes noopener, and the OIDC hand-off is a top-level
+		// navigation rather than a popup, so nothing here depends on a cross-
+		// origin window reference. What this buys is that a page the operator
+		// reaches from the console - or one that reaches the console - cannot
+		// hold a handle to this browsing context, which is the precondition for
+		// several cross-window attacks the CSP does not address.
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+		// The console needs no powerful browser features. Denying them outright
+		// means a future view (or a plugin's iframe, which inherits this) cannot
+		// quietly start asking an operator for their camera or location.
+		w.Header().Set("Permissions-Policy",
+			"accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), "+
+				"fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), "+
+				"midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()")
+		// Deliberately no Cross-Origin-Resource-Policy. Plugin UIs run in a
+		// sandbox without allow-same-origin, so their documents carry an opaque
+		// origin; a `same-origin` CORP would fail the check for their own
+		// scripts and styles and break every plugin UI. The isolation those
+		// frames need already comes from the sandbox.
+		//
 		// HSTS is only meaningful (and only safe) over HTTPS, which we proxy
 		// for via secure cookies being enabled.
 		if s.secureCookies {

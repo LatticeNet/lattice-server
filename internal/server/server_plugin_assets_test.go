@@ -365,3 +365,42 @@ func TestPluginAssetCSPIgnoresRequestOrigin(t *testing.T) {
 		}
 	}
 }
+
+// The console asks the browser for two protections the CSP cannot express:
+// a browsing context nothing else can hold a handle to, and a hard no on every
+// powerful device feature. Both are cheap and both are easy to lose silently in
+// a middleware edit, so they are pinned here.
+func TestTheConsoleShipsCrossOriginIsolationAndDeniesDeviceFeatures(t *testing.T) {
+	_, handler, cookies, csrf, _ := newPluginAssetTestServer(t)
+	res := doJSON(t, handler, http.MethodGet, "/api/me", "", cookies, csrf)
+	res.Body.Close()
+
+	if got := res.Header.Get("Cross-Origin-Opener-Policy"); got != "same-origin" {
+		t.Errorf("Cross-Origin-Opener-Policy=%q, want same-origin", got)
+	}
+	pp := res.Header.Get("Permissions-Policy")
+	if pp == "" {
+		t.Fatal("Permissions-Policy is not set")
+	}
+	// Denied outright: nothing in an operator console needs these, and a
+	// plugin frame inherits the top document's policy.
+	for _, feature := range []string{"camera=()", "microphone=()", "geolocation=()", "payment=()", "usb=()", "display-capture=()"} {
+		if !strings.Contains(pp, feature) {
+			t.Errorf("Permissions-Policy does not deny %s: %q", feature, pp)
+		}
+	}
+	// Kept for the console itself: passkey sign-in needs the credentials API and
+	// the terminal needs fullscreen. Denying these would break working features,
+	// so the test states the intent rather than leaving it to a future edit.
+	for _, feature := range []string{"publickey-credentials-get=(self)", "fullscreen=(self)"} {
+		if !strings.Contains(pp, feature) {
+			t.Errorf("Permissions-Policy revoked %s, which the console uses: %q", feature, pp)
+		}
+	}
+	// A Cross-Origin-Resource-Policy would break plugin UIs, whose sandboxed
+	// documents have an opaque origin and so fail a same-origin check when they
+	// load their own scripts. Its absence is a decision, not an omission.
+	if got := res.Header.Get("Cross-Origin-Resource-Policy"); got != "" {
+		t.Errorf("Cross-Origin-Resource-Policy=%q; it breaks opaque-origin plugin frames", got)
+	}
+}

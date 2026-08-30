@@ -3,6 +3,8 @@ case bare
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -16,6 +18,8 @@ case no user agent
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -29,6 +33,8 @@ case curl
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -42,6 +48,8 @@ case clash ua
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -55,6 +63,8 @@ case explicit format plain
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -68,6 +78,8 @@ case target stash
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/yaml; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -81,6 +93,8 @@ case target singbox
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "application/json; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -94,6 +108,8 @@ case platform alias
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/yaml; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -107,6 +123,8 @@ case include unsupported
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/yaml; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -120,6 +138,8 @@ case pretty yaml
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/yaml; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -133,6 +153,8 @@ case no flow
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -145,6 +167,8 @@ case other host
   header Cache-Control: "no-store"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
@@ -156,6 +180,8 @@ case other host
 case deny unknown token
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -165,6 +191,8 @@ case deny unknown token
 case deny wrong slug
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -174,6 +202,8 @@ case deny wrong slug
 case deny disabled
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -183,6 +213,8 @@ case deny disabled
 case deny expired
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -192,6 +224,8 @@ case deny expired
 case deny bad format
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -201,6 +235,8 @@ case deny bad format
 case deny bad target
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -210,6 +246,8 @@ case deny bad target
 case deny post
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -219,6 +257,8 @@ case deny post
 case deny head
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -228,6 +268,8 @@ case deny head
 case deny single segment
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -237,6 +279,8 @@ case deny single segment
 case deny three segments
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -246,6 +290,8 @@ case deny three segments
 case deny bare prefix
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -255,6 +301,8 @@ case deny bare prefix
 case deny uppercase slug
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -265,7 +313,9 @@ case deny traversal
   status: 307
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/html; charset=utf-8"
+  header Cross-Origin-Opener-Policy: "same-origin"
   header Location: "/gggggggggggggggggggggggggggggggg"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
@@ -275,6 +325,8 @@ case deny traversal
 case deny empty render
   status: 404
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Cross-Origin-Opener-Policy: "same-origin"
+  header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"

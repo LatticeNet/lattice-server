@@ -24,6 +24,33 @@ var blockedSpecialUsePrefixes = []netip.Prefix{
 	netip.MustParsePrefix("2001:db8::/32"),
 }
 
+// nat64WellKnownPrefix is RFC 6052's 64:ff9b::/96, which carries an IPv4
+// address in its low 32 bits. On a host behind a NAT64 gateway - which is what
+// an IPv6-only network gives you, and this is a control plane that runs in
+// exactly those - dialling 64:ff9b::7f00:1 reaches 127.0.0.1 and
+// 64:ff9b::a00:1 reaches 10.0.0.1. Every check below operates on the IPv6
+// address as written, where none of the private/loopback predicates fire, so
+// the embedded address has to be pulled out and judged on its own.
+//
+// The IPv4-mapped form (::ffff:10.0.0.1) was already handled, by To4() inside
+// the standard predicates. This is the same bypass wearing a different prefix.
+var nat64WellKnownPrefix = netip.MustParsePrefix("64:ff9b::/96")
+
+// embeddedNAT64IPv4 returns the IPv4 address a NAT64 address translates to,
+// or nil when this is not a NAT64 address.
+func embeddedNAT64IPv4(ip net.IP) net.IP {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return nil
+	}
+	addr = addr.Unmap()
+	if !addr.Is6() || !nat64WellKnownPrefix.Contains(addr) {
+		return nil
+	}
+	b := addr.As16()
+	return net.IPv4(b[12], b[13], b[14], b[15])
+}
+
 // NewClient returns an HTTP client for operator-configured outbound webhooks.
 // It validates both the requested URL and the actual dial target so DNS rebinding
 // and redirects cannot turn an allowed hostname into an internal-address request.
@@ -74,8 +101,19 @@ func NewTransport() http.RoundTripper {
 }
 
 // NewOperatorTransport allows private and loopback HTTPS destinations, and
-// loopback-only HTTP, while still rejecting metadata/link-local and special
-// address classes at both URL validation and dial time.
+// loopback-only HTTP, while still rejecting the unspecified address, every
+// link-local and multicast class, the broadcast address, and the cloud metadata
+// address at both URL validation and dial time.
+//
+// It does NOT apply blockedSpecialUsePrefixes, and that is deliberate rather
+// than an oversight: this client exists to reach an endpoint an operator named
+// on purpose, and 100.64.0.0/10 is a real address range for a service behind
+// carrier NAT. The documentation and benchmarking ranges in that list are not
+// blocked here either, because nothing sensitive answers on them - blocking
+// them would only cost a confusing failure for someone testing against
+// TEST-NET. The confinement that matters for this client is elsewhere: the
+// caller needs a system-only capability, and the target must sit under a base
+// URL bound to the invocation (see GuardOperatorTargetBinding).
 func NewOperatorTransport() http.RoundTripper {
 	return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		if err := GuardOperatorURL(req.URL.String()); err != nil {
@@ -294,6 +332,12 @@ func parseOperatorURL(raw string) (*url.URL, error) {
 }
 
 func isBlockedOperatorIP(ip net.IP) bool {
+	// A NAT64 address is judged as the IPv4 address it reaches. Without this an
+	// operator target of 64:ff9b::a9fe:a9fe would pass every check below and
+	// still land on the metadata service.
+	if v4 := embeddedNAT64IPv4(ip); v4 != nil {
+		return isBlockedOperatorIP(v4)
+	}
 	if ip == nil || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
 		return true
@@ -319,6 +363,11 @@ func effectivePort(u *url.URL) string {
 func isBlockedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
+	}
+	// Judge a NAT64 address as the IPv4 address it actually reaches, so
+	// 64:ff9b::7f00:1 is blocked for the same reason 127.0.0.1 is.
+	if v4 := embeddedNAT64IPv4(ip); v4 != nil {
+		return isBlockedIP(v4)
 	}
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsPrivate() {

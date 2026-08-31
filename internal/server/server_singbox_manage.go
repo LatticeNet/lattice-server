@@ -202,6 +202,12 @@ func (s *Server) handleSingBoxManageProbe(w http.ResponseWriter, r *http.Request
 	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
 		return
 	}
+	// Scope says the caller may run tasks here; this says sing-box may act on
+	// this node at all. A node that was never configured for sing-box has no
+	// business receiving sing-box management, and scope alone never said so.
+	if !s.requireNodeCapability(w, req.NodeID, capabilitySingBox) {
+		return
+	}
 	s.pendingSingboxProbeMu.Lock()
 	if s.pendingSingboxProbeNodeIDs == nil {
 		s.pendingSingboxProbeNodeIDs = map[string]string{}
@@ -268,6 +274,12 @@ func (s *Server) handleSingBoxManageAdd(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
+		return
+	}
+	// Scope says the caller may run tasks here; this says sing-box may act on
+	// this node at all. A node that was never configured for sing-box has no
+	// business receiving sing-box management, and scope alone never said so.
+	if !s.requireNodeCapability(w, req.NodeID, capabilitySingBox) {
 		return
 	}
 	identityUUID, err := s.ensureNodeIdentityUUID(req.NodeID)
@@ -356,6 +368,12 @@ func (s *Server) handleSingBoxManageDelete(w http.ResponseWriter, r *http.Reques
 	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
 		return
 	}
+	// Scope says the caller may run tasks here; this says sing-box may act on
+	// this node at all. A node that was never configured for sing-box has no
+	// business receiving sing-box management, and scope alone never said so.
+	if !s.requireNodeCapability(w, req.NodeID, capabilitySingBox) {
+		return
+	}
 	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "singbox.manage.delete") {
 		return
 	}
@@ -399,6 +417,12 @@ func (s *Server) handleSingBoxManageUsers(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if !s.requireNodeScope(w, p, "proxy:admin", req.NodeID) || !s.requireNodeScope(w, p, "task:run", req.NodeID) {
+		return
+	}
+	// Scope says the caller may run tasks here; this says sing-box may act on
+	// this node at all. A node that was never configured for sing-box has no
+	// business receiving sing-box management, and scope alone never said so.
+	if !s.requireNodeCapability(w, req.NodeID, capabilitySingBox) {
 		return
 	}
 	line, ok := s.findLine(req.NodeID, req.LineHashID)
@@ -580,6 +604,12 @@ func (s *Server) handleSingBoxManageConncheck(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
+		return
+	}
+	// Scope says the caller may run tasks here; this says sing-box may act on
+	// this node at all. A node that was never configured for sing-box has no
+	// business receiving sing-box management, and scope alone never said so.
+	if !s.requireNodeCapability(w, req.NodeID, capabilitySingBox) {
 		return
 	}
 	parts := []string{"sb"}

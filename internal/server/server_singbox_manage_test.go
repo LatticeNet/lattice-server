@@ -14,6 +14,30 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
+// enableSingBox marks a node as one that runs sing-box, which the management
+// endpoints now require.
+//
+// Sending "add a reality inbound" to a machine that has no sing-box on it was
+// never meaningful; it just produced a task that failed on the node. The gate
+// reads the operator's own configuration - the discover switch on the agent
+// launch config - so these tests state the same thing the fleet states.
+func enableSingBox(t *testing.T, srv *Server, nodeID string) {
+	t.Helper()
+	node, ok := srv.store.Node(nodeID)
+	if !ok {
+		t.Fatalf("node %s not found", nodeID)
+	}
+	launch := model.AgentLaunchConfig{}
+	if node.AgentLaunch != nil {
+		launch = *node.AgentLaunch
+	}
+	launch.SingBoxDiscover = true
+	node.AgentLaunch = &launch
+	if err := srv.store.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newManageTestServer(t *testing.T) (*Server, http.Handler) {
 	t.Helper()
 	st, err := store.Open("")
@@ -73,6 +97,7 @@ func TestSingBoxManageAddValidatesAndQueues(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	// Valid add -> 200 + a queued task.
 	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/add",
@@ -126,6 +151,7 @@ func TestSingBoxManageProbeQueuesReadOnlyTask(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
 		`{"node_id":"node-a"}`, cookies, csrf)
@@ -165,9 +191,10 @@ func TestSingBoxManageProbeQueuesReadOnlyTask(t *testing.T) {
 }
 
 func TestSingBoxProbeTaskResultRefreshesInventory(t *testing.T) {
-	_, handler := newManageTestServer(t)
+	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
 		`{"node_id":"node-a"}`, cookies, csrf)
@@ -222,9 +249,10 @@ func TestSingBoxProbeTaskResultRefreshesInventory(t *testing.T) {
 }
 
 func TestSingBoxProbeTaskResultAcceptsRuntimeFallbackList(t *testing.T) {
-	_, handler := newManageTestServer(t)
+	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-runtime", "Node Runtime")
+	enableSingBox(t, srv, "node-runtime")
 
 	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
 		`{"node_id":"node-runtime"}`, cookies, csrf)
@@ -279,9 +307,10 @@ ERROR: unknown flag --addr; use sing-box help
 }
 
 func TestSingBoxManageProbeDeduplicates(t *testing.T) {
-	_, handler := newManageTestServer(t)
+	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	// First probe: must be accepted.
 	r1 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
@@ -336,6 +365,7 @@ func TestSingBoxManageProbeEvictsStaleEntry(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	// Probe 1: accepted normally; capture the generated task ID.
 	r1 := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
@@ -422,9 +452,10 @@ func TestSingBoxProbeTaskResultErrorPaths(t *testing.T) {
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			_, handler := newManageTestServer(t)
+			srv, handler := newManageTestServer(t)
 			cookies, csrf := loginSession(t, handler)
 			nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+			enableSingBox(t, srv, "node-a")
 
 			resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
 				`{"node_id":"node-a"}`, cookies, csrf)
@@ -484,6 +515,7 @@ func TestSingBoxProbeExecDisabledDoesNotEraseReadOnlyInventory(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-noexec", "Node NoExec")
+	enableSingBox(t, srv, "node-noexec")
 	srv.singboxInvMu.Lock()
 	srv.singboxInv = map[string]model.SingBoxInventory{
 		"node-noexec": {
@@ -544,6 +576,7 @@ func TestSingBoxManageDeleteRequiresDiscoveredName(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	// Undiscovered name -> 400.
 	r := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/delete",
@@ -588,6 +621,7 @@ func TestSingBoxManageUsersQueuesRuntimeSyncAndUpdatesBindings(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	srv.singboxInvMu.Lock()
 	srv.singboxInv = map[string]model.SingBoxInventory{
@@ -689,6 +723,7 @@ func TestSensitiveLineAndCredentialRevealRequireStepUp(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	srv.singboxInvMu.Lock()
 	srv.singboxInv = map[string]model.SingBoxInventory{
@@ -781,9 +816,10 @@ func TestSensitiveLineAndCredentialRevealRequireStepUp(t *testing.T) {
 }
 
 func TestTaskScriptRevealRequiresStepUp(t *testing.T) {
-	_, handler := newManageTestServer(t)
+	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe",
 		`{"node_id":"node-a"}`, cookies, csrf)
@@ -841,6 +877,7 @@ func TestSingBoxManageConncheckQueuesValidatedTask(t *testing.T) {
 	srv, handler := newManageTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
 
 	// Unknown name cannot be used as an arbitrary sb argument.
 	unknown := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/conncheck",

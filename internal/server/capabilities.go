@@ -33,6 +33,12 @@ import (
 // decoded from a client body, so it is safe to make an authorization decision
 // on. Reusing it also means no second vocabulary to keep in sync.
 
+// capabilitySingBox gates the sing-box management surface: adding, removing and
+// reconfiguring lines on a node. Named apart from the read-only
+// "singbox:discover" because they default differently - looking at a node's
+// sing-box needs no paperwork, changing it does.
+const capabilitySingBox = "singbox"
+
 // capabilitySpec declares how one capability is defaulted and whether the
 // enrolment gate is live for it yet.
 type capabilitySpec struct {
@@ -51,6 +57,71 @@ type capabilitySpec struct {
 	// decisions and shows them in the console without refusing anything, which
 	// is what makes it safe to populate the table before flipping the switch.
 	Enforced bool
+
+	// Derive reads the per-node record this capability already had, for nodes
+	// with no explicit enrolment. This is what makes a capability safe to turn
+	// on: without it, flipping Enforced would refuse every node in the fleet,
+	// because nothing has a new-style enrolment yet.
+	//
+	// It returns (enrolled, known). known=false means the old record says
+	// nothing about this node either, and the capability default decides.
+	// Only consulted when there is no explicit record, so an operator decision
+	// always wins over an inferred one.
+	Derive func(s *Server, nodeID string) (enrolled bool, known bool)
+}
+
+// launchIntent is the operator's configured intent for a node's agent, which
+// is the right input for these derivations: what the agent currently reports is
+// evidence about the machine, but what may act on it is a decision, and the
+// decision lives in AgentLaunch.
+func launchIntent(s *Server, nodeID string) (model.AgentLaunchConfig, bool) {
+	node, ok := s.store.Node(nodeID)
+	if !ok || node.AgentLaunch == nil {
+		return model.AgentLaunchConfig{}, false
+	}
+	return *node.AgentLaunch, true
+}
+
+// deriveSingBox answers "does this node run sing-box" the way the operator
+// already told us: the discover switch on the node's agent launch config. A
+// node that was never set up for sing-box has no business receiving sing-box
+// management tasks, which is the whole point.
+func deriveSingBox(s *Server, nodeID string) (bool, bool) {
+	launch, ok := launchIntent(s, nodeID)
+	if !ok {
+		return false, false
+	}
+	return launch.SingBoxDiscover, true
+}
+
+func deriveTerminal(s *Server, nodeID string) (bool, bool) {
+	launch, ok := launchIntent(s, nodeID)
+	if !ok {
+		return false, false
+	}
+	return launch.AllowTerminal, true
+}
+
+// deriveAgentUpdate reads the per-node update policy. Absent policy is not
+// "disabled": it is "nobody has configured updates here", which is exactly the
+// undecided case the capability default is for.
+func deriveAgentUpdate(s *Server, nodeID string) (bool, bool) {
+	policy, ok := s.store.AgentUpdatePolicy(nodeID)
+	if !ok {
+		return false, false
+	}
+	return policy.Enabled, true
+}
+
+// deriveNetGuard reads the netguard adoption record, which is the closest thing
+// the control plane already had to an enrolment: Managed means an operator
+// adopted this node into firewall management.
+func deriveNetGuard(s *Server, nodeID string) (bool, bool) {
+	binding, ok := s.store.NodeGuardBinding(nodeID)
+	if !ok {
+		return false, false
+	}
+	return binding.Managed, true
 }
 
 // capabilitySpecs is keyed by the approval Plugin value, except where one
@@ -61,20 +132,28 @@ var capabilitySpecs = map[string]capabilitySpec{
 	// radius is an operator locked out of SSH.
 	sshGuardPlugin: {Mutates: true, Enforced: true},
 
+	// Live. Sending sing-box management to a node that does not run sing-box
+	// was the other half of the original complaint. Safe to enforce because the
+	// derivation answers for every node that was ever configured for sing-box:
+	// only nodes whose agent launch has singbox_discover off are refused, and
+	// those are exactly the ones that should be.
+	capabilitySingBox: {Mutates: true, Enforced: true, Derive: deriveSingBox},
+
 	// Declared, not yet enforced. Each of these already has a per-node record
 	// of its own; turning one on means teaching resolveNodeCapability to read
 	// that record, then flipping Enforced. Until then they behave exactly as
 	// they do today.
-	"nft":              {Mutates: true},
+	"nft":              {Mutates: true, Derive: deriveNetGuard},
 	"nftpolicy":        {Mutates: true},
 	"wireguard":        {Mutates: true},
 	"selfdns":          {Mutates: true},
-	"agentupdate":      {Mutates: true},
+	"agentupdate":      {Mutates: true, Derive: deriveAgentUpdate},
 	"proxycore":        {Mutates: true},
 	"cftunnel":         {Mutates: true},
 	"acme-dns":         {Mutates: true},
 	"singbox-linemeta": {Mutates: true},
-	"singbox:discover": {Mutates: false},
+	"singbox:discover": {Mutates: false, Derive: deriveSingBox},
+	"terminal":         {Mutates: true, Derive: deriveTerminal},
 	"metrics":          {Mutates: false},
 	"inventory":        {Mutates: false},
 	"trace":            {Mutates: false},
@@ -112,7 +191,19 @@ type capabilityDecision struct {
 	Allowed bool
 	// Reason is empty when allowed by default and there is nothing to say.
 	Reason string
+	// Source is where the answer came from: an operator's explicit record, the
+	// node's own older configuration, or the capability default. The console
+	// needs this to avoid showing "not decided" for a node that is in fact
+	// allowed because of how it was already set up - which reads as blocked
+	// when it is not.
+	Source string
 }
+
+const (
+	capabilitySourceRecord  = "record"
+	capabilitySourceDerived = "derived"
+	capabilitySourceDefault = "default"
+)
 
 // resolveNodeCapability answers whether one capability may act on one node.
 //
@@ -125,21 +216,39 @@ func (s *Server) resolveNodeCapability(nodeID, capability string) capabilityDeci
 		// An undeclared capability is not gated. Refusing here would break every
 		// flow that has not been onboarded yet, which is the opposite of a
 		// staged rollout.
-		return capabilityDecision{Allowed: true}
+		return capabilityDecision{Allowed: true, Source: capabilitySourceDefault}
 	}
 	if record, ok := s.store.NodeCapability(nodeID, capability); ok {
 		switch record.State {
 		case store.CapabilityExcluded:
-			return capabilityDecision{Allowed: false, Reason: excludedReason(record)}
+			return capabilityDecision{Allowed: false, Reason: excludedReason(record), Source: capabilitySourceRecord}
 		case store.CapabilityEnrolled:
-			return capabilityDecision{Allowed: true}
+			return capabilityDecision{Allowed: true, Source: capabilitySourceRecord}
+		}
+	}
+	// No explicit decision. Fall back to whatever record this capability
+	// already kept for the node, so turning a capability on does not refuse a
+	// fleet that has been correctly configured for years under the old shape.
+	if spec.Derive != nil {
+		if enrolled, known := spec.Derive(s, nodeID); known {
+			if enrolled {
+				return capabilityDecision{Allowed: true, Source: capabilitySourceDerived}
+			}
+			return capabilityDecision{
+				Allowed: false,
+				Source:  capabilitySourceDerived,
+				Reason: fmt.Sprintf(
+					"node is not configured for %q; enable it on the node, or enrol the node explicitly",
+					capability),
+			}
 		}
 	}
 	if !spec.Mutates {
-		return capabilityDecision{Allowed: true}
+		return capabilityDecision{Allowed: true, Source: capabilitySourceDefault}
 	}
 	return capabilityDecision{
 		Allowed: false,
+		Source:  capabilitySourceDefault,
 		Reason: fmt.Sprintf(
 			"node is not enrolled in %q, which changes the node and is opt-in; enrol it or pick a different target",
 			capability),
@@ -174,6 +283,24 @@ func (s *Server) requireNodeCapability(w http.ResponseWriter, nodeID, capability
 	return false
 }
 
+// nodeCapabilityEffectiveView is one capability's answer for one node: what
+// the gate would decide right now, and why. State/RecordReason describe the
+// explicit record when there is one; Allowed/Source describe the decision,
+// which may come from the node's older configuration instead.
+type nodeCapabilityEffectiveView struct {
+	Capability string `json:"capability"`
+	Enforced   bool   `json:"enforced"`
+	Mutates    bool   `json:"mutates"`
+	Allowed    bool   `json:"allowed"`
+	Source     string `json:"source"`
+	Reason     string `json:"reason,omitempty"`
+
+	State        string    `json:"state,omitempty"`
+	RecordReason string    `json:"record_reason,omitempty"`
+	ActorID      string    `json:"actor_id,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at,omitempty"`
+}
+
 type nodeCapabilityView struct {
 	NodeID     string    `json:"node_id"`
 	Capability string    `json:"capability"`
@@ -194,6 +321,38 @@ func (s *Server) handleNodeCapabilities(w http.ResponseWriter, r *http.Request, 
 	switch r.Method {
 	case http.MethodGet:
 		if !s.requireScope(w, p, "node:read") {
+			return
+		}
+		// ?node_id= asks the question the node page actually has: for this one
+		// node, what is the effective answer for each capability, and where did
+		// it come from. Listing only stored records would show "not decided"
+		// for a node that is allowed because of how it was already configured,
+		// which reads as blocked when it is not.
+		if nodeID := strings.TrimSpace(r.URL.Query().Get("node_id")); nodeID != "" {
+			if !rbac.Allows(p.Principal, "node:read", nodeID) {
+				writeError(w, http.StatusForbidden, errors.New("forbidden"))
+				return
+			}
+			effective := make([]nodeCapabilityEffectiveView, 0, len(capabilitySpecs))
+			for _, known := range KnownCapabilities() {
+				decision := s.resolveNodeCapability(nodeID, known.ID)
+				view := nodeCapabilityEffectiveView{
+					Capability: known.ID,
+					Enforced:   known.Enforced,
+					Mutates:    known.Mutates,
+					Allowed:    decision.Allowed,
+					Source:     decision.Source,
+					Reason:     decision.Reason,
+				}
+				if record, ok := s.store.NodeCapability(nodeID, known.ID); ok {
+					view.State = record.State
+					view.RecordReason = record.Reason
+					view.ActorID = record.ActorID
+					view.UpdatedAt = record.UpdatedAt
+				}
+				effective = append(effective, view)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"node_id": nodeID, "effective": effective})
 			return
 		}
 		records := s.store.NodeCapabilities()

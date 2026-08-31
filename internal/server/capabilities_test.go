@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -103,21 +104,115 @@ func TestClearingARecordReturnsTheNodeToTheDefault(t *testing.T) {
 	}
 }
 
-// Only sshguard is live in this phase. If a future edit flips one of the others
-// on without wiring its existing per-node record, that capability would start
-// refusing every node that has no new-style enrolment - which for something
-// like nft means refusing the whole fleet.
-func TestOnlySSHGuardIsEnforcedInThisPhase(t *testing.T) {
+// A capability may only be enforced once it can answer for a node that has no
+// new-style enrolment. Without a Derive, flipping Enforced refuses the entire
+// fleet on the first request, because nothing has an explicit record yet - and
+// for something like nft that is every firewall in the estate.
+//
+// sshguard is the deliberate exception: it never had a per-node record of any
+// kind, which is why its scope was decided by whoever was selecting rows, and
+// there is nothing to derive from.
+func TestACapabilityIsOnlyEnforcedOnceItCanAnswerForAnUnenrolledNode(t *testing.T) {
+	enforced := map[string]bool{}
 	for _, known := range KnownCapabilities() {
 		if known.Enforced != capabilityEnforced(known.ID) {
 			t.Errorf("%s reports Enforced=%v to the console but resolves as %v",
 				known.ID, known.Enforced, capabilityEnforced(known.ID))
 		}
-		if known.ID == sshGuardPlugin && !known.Enforced {
-			t.Error("sshguard is not enforced; it is the capability this was built for")
+		if !known.Enforced {
+			continue
 		}
-		if known.ID != sshGuardPlugin && known.Enforced {
-			t.Errorf("%s became enforced without its existing per-node record being wired in", known.ID)
+		enforced[known.ID] = true
+		if known.ID == sshGuardPlugin {
+			continue
 		}
+		if capabilitySpecs[known.ID].Derive == nil {
+			t.Errorf("%s is enforced with no Derive: it will refuse every node that has no explicit enrolment", known.ID)
+		}
+	}
+	// The two the operator asked for by name.
+	for _, id := range []string{sshGuardPlugin, capabilitySingBox} {
+		if !enforced[id] {
+			t.Errorf("%s is not enforced", id)
+		}
+	}
+}
+
+// Turning a capability on must not refuse a fleet that has been correctly
+// configured for years under the old shape. sing-box is the case: the operator
+// already said which nodes run it, via the discover switch, and that answer has
+// to carry over or enabling the gate breaks every working node at once.
+func TestSingBoxScopeComesFromTheNodesOwnConfigurationWhenNobodyHasEnrolledIt(t *testing.T) {
+	s := capServer(t)
+	mk := func(id string, discover bool) {
+		if err := s.store.UpsertNode(model.Node{
+			ID: id, Name: id,
+			AgentLaunch: &model.AgentLaunchConfig{SingBoxDiscover: discover},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("node-runs-it", true)
+	mk("node-does-not", false)
+	if err := s.store.UpsertNode(model.Node{ID: "node-unconfigured", Name: "node-unconfigured"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if d := s.resolveNodeCapability("node-runs-it", capabilitySingBox); !d.Allowed {
+		t.Errorf("a node configured for sing-box was refused: %s", d.Reason)
+	}
+	d := s.resolveNodeCapability("node-does-not", capabilitySingBox)
+	if d.Allowed {
+		t.Error("sing-box management was allowed on a node that does not run sing-box")
+	}
+	if !strings.Contains(d.Reason, "not configured") {
+		t.Errorf("refusal should point at the node's own configuration, got %q", d.Reason)
+	}
+	// A node with no agent launch config at all says nothing either way, so the
+	// capability default decides - and sing-box management mutates, so it is
+	// opt-in.
+	if s.resolveNodeCapability("node-unconfigured", capabilitySingBox).Allowed {
+		t.Error("a node with no configuration defaulted to allowed for a mutating capability")
+	}
+}
+
+// An operator decision always beats an inferred one, in both directions.
+// Otherwise "I know this box runs sing-box, let it through" would be impossible
+// to express, and so would "it does, but leave it alone".
+func TestAnExplicitDecisionOverridesWhatTheNodesConfigurationImplies(t *testing.T) {
+	s := capServer(t)
+	if err := s.store.UpsertNode(model.Node{
+		ID: "node-a", Name: "node-a",
+		AgentLaunch: &model.AgentLaunchConfig{SingBoxDiscover: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.SetNodeCapability(store.NodeCapability{
+		NodeID: "node-a", Capability: capabilitySingBox, State: store.CapabilityEnrolled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.resolveNodeCapability("node-a", capabilitySingBox).Allowed {
+		t.Error("an explicit enrolment lost to the derived answer")
+	}
+
+	if err := s.store.UpsertNode(model.Node{
+		ID: "node-b", Name: "node-b",
+		AgentLaunch: &model.AgentLaunchConfig{SingBoxDiscover: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.SetNodeCapability(store.NodeCapability{
+		NodeID: "node-b", Capability: capabilitySingBox, State: store.CapabilityExcluded,
+		Reason: "customer box, hands off",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d := s.resolveNodeCapability("node-b", capabilitySingBox)
+	if d.Allowed {
+		t.Error("an explicit exclusion lost to the derived answer")
+	}
+	if !strings.Contains(d.Reason, "hands off") {
+		t.Errorf("the exclusion reason was lost: %q", d.Reason)
 	}
 }

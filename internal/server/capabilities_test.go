@@ -11,6 +11,18 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
+// enforceGate turns a capability's gate on, the way an operator would from the
+// Capability Gates page. Nothing ships enforced, so any test about refusal has
+// to say which gate it is testing.
+func enforceGate(t *testing.T, s *Server, capability string) {
+	t.Helper()
+	if err := s.store.SetCapabilityPolicy(store.CapabilityPolicy{
+		Capability: capability, Enforced: true, UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func capServer(t *testing.T) *Server {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/state.json")
@@ -27,15 +39,15 @@ func capServer(t *testing.T) *Server {
 // machines nobody meant to include.
 func TestChangingANodeIsOptInWhileReadingItIsNot(t *testing.T) {
 	s := capServer(t)
-	if d := s.resolveNodeCapability("node-a", sshGuardPlugin); d.Allowed {
+	if d := s.resolveCapabilityScope("node-a", sshGuardPlugin); d.Allowed {
 		t.Error("a mutating capability defaulted to allowed")
 	}
-	if d := s.resolveNodeCapability("node-a", "metrics"); !d.Allowed {
+	if d := s.resolveCapabilityScope("node-a", "metrics"); !d.Allowed {
 		t.Error("a read-only capability defaulted to denied")
 	}
 	// An undeclared capability is not gated, or every flow not yet onboarded
 	// would break the moment this shipped.
-	if d := s.resolveNodeCapability("node-a", "something-not-declared"); !d.Allowed {
+	if d := s.resolveCapabilityScope("node-a", "something-not-declared"); !d.Allowed {
 		t.Error("an undeclared capability was gated")
 	}
 }
@@ -47,7 +59,7 @@ func TestEnrolmentAllowsAndExclusionRefusesWithItsReason(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if d := s.resolveNodeCapability("node-a", sshGuardPlugin); !d.Allowed {
+	if d := s.resolveCapabilityScope("node-a", sshGuardPlugin); !d.Allowed {
 		t.Fatalf("an enrolled node was refused: %s", d.Reason)
 	}
 
@@ -59,7 +71,7 @@ func TestEnrolmentAllowsAndExclusionRefusesWithItsReason(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	d := s.resolveNodeCapability("node-b", sshGuardPlugin)
+	d := s.resolveCapabilityScope("node-b", sshGuardPlugin)
 	if d.Allowed {
 		t.Fatal("an excluded node was allowed")
 	}
@@ -78,8 +90,8 @@ func TestAMissingEnrolmentAndAnExclusionDoNotSayTheSameThing(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	missing := s.resolveNodeCapability("node-a", sshGuardPlugin).Reason
-	excluded := s.resolveNodeCapability("node-b", sshGuardPlugin).Reason
+	missing := s.resolveCapabilityScope("node-a", sshGuardPlugin).Reason
+	excluded := s.resolveCapabilityScope("node-b", sshGuardPlugin).Reason
 	if missing == excluded {
 		t.Fatal("a node nobody has decided about reads the same as one deliberately excluded")
 	}
@@ -101,7 +113,7 @@ func TestClearingARecordReturnsTheNodeToTheDefault(t *testing.T) {
 	if _, ok := s.store.NodeCapability("node-a", sshGuardPlugin); ok {
 		t.Fatal("clearing left a record behind")
 	}
-	if d := s.resolveNodeCapability("node-a", sshGuardPlugin); d.Allowed {
+	if d := s.resolveCapabilityScope("node-a", sshGuardPlugin); d.Allowed {
 		t.Error("a cleared node stayed allowed instead of returning to opt-in")
 	}
 }
@@ -133,11 +145,13 @@ func TestACapabilityIsOnlyEnforcedOnceItCanAnswerForAnUnenrolledNode(t *testing.
 			t.Errorf("%s is enforced with no Derive: it will refuse every node that has no explicit enrolment", known.ID)
 		}
 	}
-	// The two the operator asked for by name.
-	for _, id := range []string{sshGuardPlugin, capabilitySingBox} {
-		if !enforced[id] {
-			t.Errorf("%s is not enforced", id)
-		}
+	// Nothing ships enforced, deliberately: a compiled default decides what a
+	// fleet does the moment a version starts, and on that morning no node has an
+	// enrolment. Enforcement is stored policy, set against a real fleet once the
+	// operator can see what each gate would refuse.
+	if len(enforced) != 0 {
+		t.Errorf("a capability ships enforced: %v. A fresh install has an empty "+
+			"enrolment table, so this refuses work on first boot", enforced)
 	}
 }
 
@@ -161,10 +175,10 @@ func TestSingBoxScopeComesFromTheNodesOwnConfigurationWhenNobodyHasEnrolledIt(t 
 		t.Fatal(err)
 	}
 
-	if d := s.resolveNodeCapability("node-runs-it", capabilitySingBox); !d.Allowed {
+	if d := s.resolveCapabilityScope("node-runs-it", capabilitySingBox); !d.Allowed {
 		t.Errorf("a node configured for sing-box was refused: %s", d.Reason)
 	}
-	d := s.resolveNodeCapability("node-does-not", capabilitySingBox)
+	d := s.resolveCapabilityScope("node-does-not", capabilitySingBox)
 	if d.Allowed {
 		t.Error("sing-box management was allowed on a node that does not run sing-box")
 	}
@@ -174,7 +188,7 @@ func TestSingBoxScopeComesFromTheNodesOwnConfigurationWhenNobodyHasEnrolledIt(t 
 	// A node with no agent launch config at all says nothing either way, so the
 	// capability default decides - and sing-box management mutates, so it is
 	// opt-in.
-	if s.resolveNodeCapability("node-unconfigured", capabilitySingBox).Allowed {
+	if s.resolveCapabilityScope("node-unconfigured", capabilitySingBox).Allowed {
 		t.Error("a node with no configuration defaulted to allowed for a mutating capability")
 	}
 }
@@ -195,7 +209,7 @@ func TestAnExplicitDecisionOverridesWhatTheNodesConfigurationImplies(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if !s.resolveNodeCapability("node-a", capabilitySingBox).Allowed {
+	if !s.resolveCapabilityScope("node-a", capabilitySingBox).Allowed {
 		t.Error("an explicit enrolment lost to the derived answer")
 	}
 
@@ -211,7 +225,7 @@ func TestAnExplicitDecisionOverridesWhatTheNodesConfigurationImplies(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	d := s.resolveNodeCapability("node-b", capabilitySingBox)
+	d := s.resolveCapabilityScope("node-b", capabilitySingBox)
 	if d.Allowed {
 		t.Error("an explicit exclusion lost to the derived answer")
 	}
@@ -225,6 +239,7 @@ func TestAnExplicitDecisionOverridesWhatTheNodesConfigurationImplies(t *testing.
 // that never heard of capabilities still cannot dispatch out of scope.
 func TestQueueTaskRefusesAnOutOfScopeTargetEvenWithNoHandlerCheck(t *testing.T) {
 	s := capServer(t)
+	enforceGate(t, s, capabilitySingBox)
 	if err := s.store.UpsertNode(model.Node{
 		ID: "node-a", Name: "node-a",
 		AgentLaunch: &model.AgentLaunchConfig{SingBoxDiscover: false},
@@ -249,6 +264,7 @@ func TestQueueTaskRefusesAnOutOfScopeTargetEvenWithNoHandlerCheck(t *testing.T) 
 // gated without any caller cooperation at all.
 func TestQueueTaskTakesItsCapabilityFromTheApproval(t *testing.T) {
 	s := capServer(t)
+	enforceGate(t, s, sshGuardPlugin)
 	if err := s.store.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
 		t.Fatal(err)
 	}
@@ -281,11 +297,12 @@ func TestQueueTaskTakesItsCapabilityFromTheApproval(t *testing.T) {
 // in both directions, without a release.
 func TestTheOperatorsPolicyBeatsTheCompiledDefault(t *testing.T) {
 	s := capServer(t)
-	if !s.capabilityEnforced(sshGuardPlugin) {
-		t.Fatal("sshguard should be enforced by default")
-	}
-	if s.capabilityEnforced("nft") {
-		t.Fatal("nft should not be enforced by default")
+	// Nothing ships enforced; the operator turns gates on against their own
+	// fleet once they can see what each would refuse.
+	for _, id := range []string{sshGuardPlugin, capabilitySingBox, "nft"} {
+		if s.capabilityEnforced(id) {
+			t.Fatalf("%s ships enforced", id)
+		}
 	}
 	set := func(capability string, enforced bool) {
 		if err := s.store.SetCapabilityPolicy(store.CapabilityPolicy{
@@ -298,9 +315,14 @@ func TestTheOperatorsPolicyBeatsTheCompiledDefault(t *testing.T) {
 	if !s.capabilityEnforced("nft") {
 		t.Error("enabling a gate did not take effect")
 	}
+	// With the gate on, the decision follows the scope answer again.
+	if s.resolveNodeCapability("node-nobody-enrolled", "nft").Allowed {
+		t.Error("an enabled gate allowed a node with no enrolment")
+	}
 	// Turning one off has to work too. An operator who needs the lever during an
 	// incident will otherwise reach for something worse than a recorded, audited
 	// setting.
+	set(sshGuardPlugin, true)
 	set(sshGuardPlugin, false)
 	if s.capabilityEnforced(sshGuardPlugin) {
 		t.Error("disabling a gate did not take effect")
@@ -371,6 +393,7 @@ func TestAnInstalledPluginIsACapability(t *testing.T) {
 // restriction, worthless as a grant.
 func TestADeclaredCapabilityOnlyNarrowsAFreeTextTask(t *testing.T) {
 	s := capServer(t)
+	enforceGate(t, s, capabilitySingBox)
 	if err := s.store.UpsertNode(model.Node{
 		ID: "node-runs-it", Name: "node-runs-it",
 		AgentLaunch: &model.AgentLaunchConfig{SingBoxDiscover: true},

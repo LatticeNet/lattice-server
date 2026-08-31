@@ -134,16 +134,23 @@ func deriveNetGuard(s *Server, nodeID string) (bool, bool) {
 // plugin spans both a read and a write surface and therefore needs two entries
 // (sing-box discovery is a read; sing-box apply changes the machine).
 var capabilitySpecs = map[string]capabilitySpec{
-	// Live. This is the capability that had no record, and the one whose blast
-	// radius is an operator locked out of SSH.
-	sshGuardPlugin: {Mutates: true, Enforced: true},
-
-	// Live. Sending sing-box management to a node that does not run sing-box
-	// was the other half of the original complaint. Safe to enforce because the
-	// derivation answers for every node that was ever configured for sing-box:
-	// only nodes whose agent launch has singbox_discover off are refused, and
-	// those are exactly the ones that should be.
-	capabilitySingBox: {Mutates: true, Enforced: true, Derive: deriveSingBox},
+	// The two the operator asked for, and the two that ship OFF.
+	//
+	// Not a retreat from enforcing them: a compiled default decides what a fleet
+	// does the moment this version starts, and on that morning the enrolment
+	// table is empty. sshguard has nothing to derive from, so enforcing it on
+	// arrival would refuse hardening for every node until someone enrolled them
+	// - and the API to do the enrolling arrives in the same release. sing-box
+	// derives, but from a switch that may be off on nodes an operator has been
+	// managing by hand for a year.
+	//
+	// So the mechanism ships, the gates page shows what turning each one on
+	// would refuse against the real fleet, and the operator flips them when the
+	// numbers look right. That is the whole reason enforcement became stored
+	// policy rather than a constant; using it here is the point, not a
+	// concession.
+	sshGuardPlugin:    {Mutates: true},
+	capabilitySingBox: {Mutates: true, Derive: deriveSingBox},
 
 	// Declared, not yet enforced. Each of these already has a per-node record
 	// of its own; turning one on means teaching resolveNodeCapability to read

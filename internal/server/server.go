@@ -3086,7 +3086,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 		visible := make([]taskView, 0, len(tasks))
 		for _, task := range tasks {
 			if taskTargetsAllowed(p, "task:read", task.Targets) {
-				visible = append(visible, toTaskView(task))
+				visible = append(visible, s.toTaskView(task))
 			}
 		}
 		if !taskQueryRequested(r) {
@@ -3175,7 +3175,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.create", Scope: "task:run", Metadata: map[string]string{"task_id": task.ID}})
-		writeJSON(w, http.StatusOK, toTaskView(task))
+		writeJSON(w, http.StatusOK, s.toTaskView(task))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -3209,7 +3209,7 @@ func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.cancel", Scope: "task:run", Metadata: map[string]string{"task_id": req.ID}})
-	writeJSON(w, http.StatusOK, toTaskView(updated))
+	writeJSON(w, http.StatusOK, s.toTaskView(updated))
 }
 
 // handleDeleteTask removes a task and its stored results from history.
@@ -3310,7 +3310,7 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 		metadata["node_id"] = rerunOfNode
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.rerun", Scope: "task:run", Metadata: metadata})
-	writeJSON(w, http.StatusOK, toTaskView(task))
+	writeJSON(w, http.StatusOK, s.toTaskView(task))
 }
 
 func rootTaskID(t model.Task) string {
@@ -3389,7 +3389,25 @@ type taskView struct {
 	FinishedAt      time.Time `json:"finished_at,omitempty"`
 }
 
-func toTaskView(t model.Task) taskView {
+// toTaskView presents a task the way an operator has to read it.
+//
+// The stored status stays what it is: a task nobody has answered really is
+// still queued, and until the deadline passes the agent really will still be
+// handed it. What the store cannot say is "we have stopped waiting" - so once
+// the queue deadline has passed, and the store has therefore withdrawn
+// delivery, this reports the task as expired rather than leaving it looking
+// identical to one that is still doing work.
+//
+// Derived rather than persisted, so the answer here and the delivery gate in
+// the store are the same rule (store.TaskPastQueueDeadline) rather than two
+// that drift, and so nothing has to migrate rows written before the deadline
+// existed.
+func (s *Server) toTaskView(t model.Task) taskView {
+	status := t.Status
+	if (status == model.TaskQueued || status == model.TaskLeased) &&
+		store.TaskPastQueueDeadline(t, s.now(), s.store.TaskQueueDeadline()) {
+		status = store.TaskExpired
+	}
 	return taskView{
 		ID:              t.ID,
 		ActorID:         t.ActorID,
@@ -3400,7 +3418,7 @@ func toTaskView(t model.Task) taskView {
 		ScriptSizeBytes: len([]byte(t.Script)),
 		TimeoutSec:      t.TimeoutSec,
 		OutputLimit:     t.OutputLimit,
-		Status:          t.Status,
+		Status:          status,
 		LeasedBy:        t.LeasedBy,
 		RerunOfTaskID:   t.RerunOfTaskID,
 		RerunOfNodeID:   t.RerunOfNodeID,

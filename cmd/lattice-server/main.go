@@ -47,6 +47,7 @@ func main() {
 	var secureCookies bool
 	var trustProxy bool
 	var requireTOTP bool
+	var taskQueueDeadline string
 	var tlsCert string
 	var tlsKey string
 	var pluginDir string
@@ -78,6 +79,8 @@ func main() {
 	flag.BoolVar(&secureCookies, "secure-cookies", env("LATTICE_SECURE_COOKIES", "") == "1", "set Secure on session cookies (enables HSTS)")
 	flag.BoolVar(&trustProxy, "trust-proxy", env("LATTICE_TRUST_PROXY", "") == "1", "trust CF-Connecting-IP / X-Forwarded-For for client IP (only behind a trusted proxy)")
 	flag.BoolVar(&requireTOTP, "require-totp", env("LATTICE_REQUIRE_TOTP", "") == "1", "require interactive users to enable TOTP before using non-setup APIs")
+	flag.StringVar(&taskQueueDeadline, "task-queue-deadline", env("LATTICE_TASK_QUEUE_DEADLINE", ""),
+		"how long a task may sit undelivered before the control plane stops offering it (Go duration, e.g. 24h). Empty or 0 never expires.")
 	flag.StringVar(&tlsCert, "tls-cert", os.Getenv("LATTICE_TLS_CERT"), "TLS certificate file; enables HTTPS when set with -tls-key")
 	flag.StringVar(&tlsKey, "tls-key", os.Getenv("LATTICE_TLS_KEY"), "TLS private key file")
 	flag.StringVar(&pluginDir, "plugin-dir", env("LATTICE_PLUGIN_DIR", ""), "directory of installed plugin bundles (empty disables plugins)")
@@ -146,6 +149,20 @@ func main() {
 	st, err := store.OpenWithCipher(dataPath, keyRes.Cipher)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	// Task queue deadline. Empty or 0 keeps store-and-forward exactly as it has
+	// always behaved: a task waits for its node indefinitely. Set it and the
+	// control plane stops offering a task once it has been outstanding this
+	// long, and the console reports it expired rather than leaving it looking
+	// like work still in progress.
+	if d := strings.TrimSpace(taskQueueDeadline); d != "" && d != "0" {
+		parsed, err := time.ParseDuration(d)
+		if err != nil || parsed < 0 {
+			log.Fatalf("invalid -task-queue-deadline %q: want a non-negative Go duration such as 24h", d)
+		}
+		st.SetTaskQueueDeadline(parsed)
+		log.Printf("task queue deadline: %s (undelivered tasks older than this are withdrawn)", parsed)
 	}
 	defer st.Close()
 	if runtimeBoltHotStore != "" {

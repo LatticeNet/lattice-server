@@ -138,6 +138,11 @@ type Store struct {
 	runtimeBoltHot     *BoltStateStore // optional record-level sidecar for high-churn runtime domains
 	runtimeBoltHotPath string
 	syncParentDir      func(string) error
+	// taskQueueDeadline is how long a task may sit undelivered before the
+	// control plane stops offering it. Zero (the default) never expires, so
+	// store-and-forward behaves exactly as it always has until an operator
+	// opts in. Guarded by mu.
+	taskQueueDeadline  time.Duration
 	durabilityDegraded bool // guarded by mu; only a confirmed parent sync clears it
 	testPersistCalls   int  // tests only: counts authoritative JSON persistence attempts
 }
@@ -1489,6 +1494,25 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string
 	return cloneNode(n), true, nil
 }
 
+// SetTaskQueueDeadline sets how long a task may sit undelivered before the
+// control plane withdraws it. Zero disables expiry.
+func (s *Store) SetTaskQueueDeadline(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if d < 0 {
+		d = 0
+	}
+	s.taskQueueDeadline = d
+}
+
+// TaskQueueDeadline reports the configured deadline, so the API layer can
+// describe a task with the same rule the lease gate enforces.
+func (s *Store) TaskQueueDeadline() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.taskQueueDeadline
+}
+
 func (s *Store) CreateTask(t model.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1678,7 +1702,8 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		}
 		t := staged.Tasks[id]
 		protocol, current := gated(t)
-		if protocol == "" || !current || !taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts) {
+		if protocol == "" || !current ||
+			!taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts, now, s.taskQueueDeadline) {
 			continue
 		}
 		// A lease is a durable delivery token, not a one-shot HTTP response. If
@@ -1732,7 +1757,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			t := staged.Tasks[id]
 			protocol, current := gated(t)
 			isGated := protocol != ""
-			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results) {
+			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results, now, s.taskQueueDeadline) {
 				continue
 			}
 			if protocol == DurableProtocolLineChainV2 {
@@ -1977,11 +2002,20 @@ func taskLeaseExpired(startedAt time.Time, timeoutSec int) bool {
 	return time.Since(startedAt) > time.Duration(timeoutSec)*time.Second+taskLeaseSafetyMargin
 }
 
-func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult) bool {
+// taskCanLeaseTarget gates a FRESH lease, where taskTargetAwaitingResult gates
+// redelivery of one already issued. Both have to honour the queue deadline, and
+// for the same reason: the console calls a task expired only because delivery
+// was withdrawn, so a path that still hands it out turns that into a lie the
+// operator acts on. Enforcing it in one of the two is worse than enforcing it
+// in neither, because it looks correct from the console.
+func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult, now time.Time, deadline time.Duration) bool {
 	if !contains(t.Targets, nodeID) {
 		return false
 	}
 	if t.Status != model.TaskQueued && t.Status != model.TaskLeased {
+		return false
+	}
+	if taskPastQueueDeadline(t, now, deadline) {
 		return false
 	}
 	for _, r := range results {
@@ -2004,8 +2038,34 @@ func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult)
 	return true
 }
 
-func taskTargetAwaitingResult(t model.Task, nodeID string, results []model.TaskResult, receipts map[string]TaskResultReceipt) bool {
+// TaskExpired marks a task the control plane has stopped waiting for: a target
+// never leased it before the queue deadline, so delivery was withdrawn.
+//
+// Deliberately NOT model.TaskFailed. A node that was switched off is not a
+// script that went wrong, and folding the two together would put offline
+// machines in the failed count - the same conflation the task copy already
+// avoids by leaving an unanswered target unreported rather than done.
+//
+// It lives here rather than beside model.TaskQueued because model is the SDK,
+// pinned by sdk.ref and consumed by plugins; adding a status value there is a
+// coordinated two-repo release and a change to a contract others read. The
+// string is what goes over the wire either way. Move it when the SDK next ships.
+const TaskExpired = "expired"
+
+// taskTargetAwaitingResult reports whether this node still owes a result.
+//
+// deadline is how long a task may sit undelivered before the control plane
+// gives up on it; zero means never, which is the default and preserves
+// store-and-forward exactly as it was. Past the deadline a target stops being
+// "awaiting", which is what withdraws delivery: this predicate is the only gate
+// leaseTaskDeliveries consults, so a task the console calls expired is one the
+// agent genuinely will not be handed. Presenting it as terminal while the queue
+// would still run it a week later would be a lie the operator acts on.
+func taskTargetAwaitingResult(t model.Task, nodeID string, results []model.TaskResult, receipts map[string]TaskResultReceipt, now time.Time, deadline time.Duration) bool {
 	if !contains(t.Targets, nodeID) || (t.Status != model.TaskQueued && t.Status != model.TaskLeased) {
+		return false
+	}
+	if taskPastQueueDeadline(t, now, deadline) {
 		return false
 	}
 	for _, result := range results {
@@ -2015,6 +2075,24 @@ func taskTargetAwaitingResult(t model.Task, nodeID string, results []model.TaskR
 	}
 	_, complete := receipts[taskResultReceiptKey(t.ID, nodeID)]
 	return !complete
+}
+
+// taskPastQueueDeadline measures from CreatedAt, not from the last lease.
+// The question an operator asks is "how long has this been outstanding", and a
+// node that reconnects briefly every hour without ever running the task would
+// otherwise keep renewing its own reprieve forever.
+func taskPastQueueDeadline(t model.Task, now time.Time, deadline time.Duration) bool {
+	if deadline <= 0 || t.CreatedAt.IsZero() {
+		return false
+	}
+	return now.Sub(t.CreatedAt) > deadline
+}
+
+// TaskPastQueueDeadline exposes the same judgement to the API layer, so the
+// status the console shows and the delivery the agent gets are decided by one
+// rule rather than two that can drift.
+func TaskPastQueueDeadline(t model.Task, now time.Time, deadline time.Duration) bool {
+	return taskPastQueueDeadline(t, now, deadline)
 }
 
 func taskAggregateStatus(t model.Task, results []model.TaskResult) (string, time.Time) {

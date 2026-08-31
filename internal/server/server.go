@@ -2297,6 +2297,33 @@ func (s *Server) ensureNodeIdentityUUID(nodeID string) (string, error) {
 	return n.LatticeIdentityUUID, nil
 }
 
+// taskExecContext snapshots the agent posture to pin against one result.
+// Returns nil when the node has not reported a posture, so a missing context
+// stays distinguishable from a reported unprivileged one - guessing here would
+// recreate the ambiguity this is meant to remove.
+func (s *Server) taskExecContext(taskID, nodeID string) *store.TaskExecContext {
+	runtime := s.agentRuntimeSnapshot(nodeID)
+	if runtime == nil || runtime.ReportedAt.IsZero() {
+		return nil
+	}
+	ctx := store.TaskExecContext{
+		TaskID:       taskID,
+		NodeID:       nodeID,
+		Sandbox:      runtime.TaskSandbox,
+		RootExec:     runtime.AllowRootExec,
+		ExecDisabled: runtime.NoExec || !runtime.AllowExec,
+		ReportedAt:   runtime.ReportedAt,
+		RecordedAt:   s.now(),
+	}
+	for _, feature := range runtime.TaskSandboxFeatures {
+		if feature == "non-root-agent" {
+			ctx.NonRoot = true
+			break
+		}
+	}
+	return &ctx
+}
+
 func (s *Server) agentRuntimeSnapshot(nodeID string) *agentRuntimeConfig {
 	s.agentRuntimeMu.RLock()
 	defer s.agentRuntimeMu.RUnlock()
@@ -3488,7 +3515,7 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 	visible := make([]taskResultView, 0, len(results))
 	for _, result := range results {
 		if rbac.Allows(p.Principal, "task:read", result.NodeID) {
-			visible = append(visible, toTaskResultView(result))
+			visible = append(visible, s.withExecContext(toTaskResultView(result)))
 		}
 	}
 	if !taskResultQueryRequested(r) {
@@ -3570,6 +3597,17 @@ func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, 
 	})
 }
 
+// taskExecContextView is the agent posture pinned when this result was
+// recorded. Absent for results predating the pin, and the console must treat
+// absence as "unknown" rather than as any particular posture.
+type taskExecContextView struct {
+	Sandbox      string    `json:"sandbox,omitempty"`
+	NonRoot      bool      `json:"non_root,omitempty"`
+	RootExec     bool      `json:"root_exec,omitempty"`
+	ExecDisabled bool      `json:"exec_disabled,omitempty"`
+	ReportedAt   time.Time `json:"reported_at,omitempty"`
+}
+
 type taskResultView struct {
 	TaskID     string    `json:"task_id"`
 	NodeID     string    `json:"node_id"`
@@ -3579,6 +3617,26 @@ type taskResultView struct {
 	Error      string    `json:"error"`
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at"`
+
+	ExecContext *taskExecContextView `json:"exec_context,omitempty"`
+}
+
+// withExecContext attaches the posture pinned for this result, if one was.
+// Kept out of toTaskResultView because that is a pure mapping used where no
+// store is at hand; this is the lookup.
+func (s *Server) withExecContext(v taskResultView) taskResultView {
+	ctx, ok := s.store.TaskExecContext(v.TaskID, v.NodeID)
+	if !ok {
+		return v
+	}
+	v.ExecContext = &taskExecContextView{
+		Sandbox:      ctx.Sandbox,
+		NonRoot:      ctx.NonRoot,
+		RootExec:     ctx.RootExec,
+		ExecDisabled: ctx.ExecDisabled,
+		ReportedAt:   ctx.ReportedAt,
+	}
+	return v
 }
 
 func toTaskResultView(r model.TaskResult) taskResultView {
@@ -7413,7 +7471,12 @@ func (s *Server) handleAgentTaskResult(w http.ResponseWriter, r *http.Request) {
 	if req.Result.FinishedAt.IsZero() {
 		req.Result.FinishedAt = time.Now().UTC()
 	}
-	if err := s.store.AddTaskResult(req.Result); err != nil {
+	// Pin how this agent was configured, alongside the result it produced. The
+	// live posture map is in-memory and moves with every agent restart, so it is
+	// no basis for reading a result from last week - and the difference decides
+	// whether an empty field in that output means "measured nothing" or "could
+	// not measure".
+	if err := s.store.AddTaskResultWithContext(req.Result, s.taskExecContext(req.Result.TaskID, req.NodeID)); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

@@ -49,6 +49,7 @@ type State struct {
 	Tasks              map[string]model.Task        `json:"tasks"`
 	Results            []model.TaskResult           `json:"results"`
 	TaskResultReceipts map[string]TaskResultReceipt `json:"task_result_receipts,omitempty"`
+	TaskExecContexts   map[string]TaskExecContext   `json:"task_exec_contexts,omitempty"`
 	Audit              []model.AuditEvent           `json:"audit"`
 	KV                 map[string]model.KVEntry     `json:"kv"`
 	// PluginSecrets is the encrypted, namespaced plugin vault (spec §9.4). It is a
@@ -119,6 +120,33 @@ type TaskResultReceipt struct {
 	NodeID  string `json:"node_id"`
 	LeaseID string `json:"lease_id"`
 	Digest  string `json:"digest"`
+}
+
+// TaskExecContext is the agent's execution posture as of the moment a result
+// was recorded, pinned so a later reader is not told about a configuration the
+// run never had.
+//
+// The live posture lives in Server.agentRuntime, which is an in-memory map: it
+// is empty after a restart until each node reports again, and it moves whenever
+// an agent is restarted with different flags. Neither is a good basis for
+// reading a result from last week. What decides whether a run could see
+// privileged state is what was true when it ran.
+type TaskExecContext struct {
+	TaskID string `json:"task_id"`
+	NodeID string `json:"node_id"`
+	// Sandbox is the agent's reported hardening level, e.g.
+	// "linux-rlimit-process-group". Empty when the node had not reported one.
+	Sandbox string `json:"sandbox,omitempty"`
+	// NonRoot is the fact that matters most: an unprivileged agent reads nothing
+	// for any probe that needs root, and a script that hides stderr reports that
+	// as a clean exit.
+	NonRoot      bool `json:"non_root,omitempty"`
+	RootExec     bool `json:"root_exec,omitempty"`
+	ExecDisabled bool `json:"exec_disabled,omitempty"`
+	// ReportedAt is when the AGENT reported this posture; RecordedAt is when the
+	// result arrived. A wide gap means the posture is stale relative to the run.
+	ReportedAt time.Time `json:"reported_at,omitempty"`
+	RecordedAt time.Time `json:"recorded_at"`
 }
 
 type Store struct {
@@ -1494,6 +1522,16 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string
 	return cloneNode(n), true, nil
 }
 
+// TaskExecContext returns the posture pinned for one result, if one was pinned.
+// Results recorded before this existed have none, and the caller must fall back
+// rather than assume a missing context means an unprivileged agent.
+func (s *Store) TaskExecContext(taskID, nodeID string) (TaskExecContext, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.state.TaskExecContexts[taskResultReceiptKey(taskID, nodeID)]
+	return c, ok
+}
+
 // SetTaskQueueDeadline sets how long a task may sit undelivered before the
 // control plane withdraws it. Zero disables expiry.
 func (s *Store) SetTaskQueueDeadline(d time.Duration) {
@@ -1872,6 +1910,16 @@ func lineChainFirstLeaseFailureAudit(approval model.Approval, task model.Task, a
 }
 
 func (s *Store) AddTaskResult(r model.TaskResult) error {
+	return s.AddTaskResultWithContext(r, nil)
+}
+
+// AddTaskResultWithContext records a result together with the agent posture it
+// ran under. The two are staged into one snapshot on purpose: a result that
+// persisted without its context would be exactly the ambiguous row this exists
+// to remove, and a context without its result would outlive what it describes.
+// A nil context records the result alone, which is what every caller predating
+// this did and what the tests still exercise.
+func (s *Store) AddTaskResultWithContext(r model.TaskResult, ctx *TaskExecContext) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	staged := s.state
@@ -1888,6 +1936,29 @@ func (s *Store) AddTaskResult(r model.TaskResult) error {
 	if t, ok := staged.Tasks[r.TaskID]; ok {
 		t.Status, t.FinishedAt = taskAggregateStatus(t, staged.Results)
 		staged.Tasks[t.ID] = t
+	}
+	// Copy before touching: staged starts out sharing this map with live state,
+	// and both the insert and the prune below would otherwise mutate committed
+	// state before persistState has decided whether the write survives.
+	addCtx := ctx != nil && ctx.TaskID != "" && ctx.NodeID != ""
+	if addCtx || len(s.state.TaskExecContexts) > 0 {
+		// Contexts describe results, so they are bounded by the results: once a
+		// result has aged past maxTaskResults its context is dead weight, and
+		// without this the map is the one collection here that only grows.
+		live := make(map[string]bool, len(staged.Results))
+		for _, res := range staged.Results {
+			live[taskResultReceiptKey(res.TaskID, res.NodeID)] = true
+		}
+		next := make(map[string]TaskExecContext, len(s.state.TaskExecContexts)+1)
+		for k, v := range s.state.TaskExecContexts {
+			if live[k] {
+				next[k] = v
+			}
+		}
+		if addCtx {
+			next[taskResultReceiptKey(ctx.TaskID, ctx.NodeID)] = *ctx
+		}
+		staged.TaskExecContexts = next
 	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {

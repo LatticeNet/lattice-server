@@ -994,6 +994,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/disable", s.withAuth("node:admin", s.handleNodeDisable))
 	mux.HandleFunc("/api/nodes/update", s.withAuth("node:admin", s.handleUpdateNode))
 	mux.HandleFunc("/api/nodes/duplicates", s.withAuth("node:read", s.handleNodeDuplicates))
+	// Which capabilities may act on which nodes. Scope is checked per method
+	// inside the handler: reading needs node:read, changing scope needs node:admin.
+	mux.HandleFunc("/api/nodes/capabilities", s.withAuth("", s.handleNodeCapabilities))
 	mux.HandleFunc("/api/nodes/delete", s.withAuth("node:admin", s.handleDeleteNode))
 	mux.HandleFunc("/api/nodes/delete/plan", s.withAuth("node:admin", s.handleDeleteNodePlan))
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))

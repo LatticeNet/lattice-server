@@ -309,6 +309,22 @@ func (s *Server) handleSSHGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusNotFound, errors.New("node not found"))
 		return
 	}
+	// Enrolment gate, on the arm path only.
+	//
+	// SSH Guard decides who can reach a machine over SSH, so which machines are
+	// in scope is a decision an operator makes per node, not a consequence of
+	// which rows they selected. Checked before the plan is rendered, so an
+	// out-of-scope node never produces an approval that someone could later wave
+	// through without noticing where it came from.
+	//
+	// Deliberately not on handleSSHGuardConfirm: confirm cancels the revert timer
+	// on an already-armed node. Refusing it because the node was excluded after
+	// arming would strand that node mid-operation, waiting on a timer to undo
+	// work an operator was trying to finish. A gate belongs on the step that
+	// starts something, not on the one that completes it.
+	if !s.requireNodeCapability(w, req.NodeID, sshGuardPlugin) {
+		return
+	}
 	profile, err := req.profile(s.sshGuardNodeReality(req.NodeID).SSHPorts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)

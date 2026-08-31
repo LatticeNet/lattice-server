@@ -50,6 +50,7 @@ type State struct {
 	Results            []model.TaskResult           `json:"results"`
 	TaskResultReceipts map[string]TaskResultReceipt `json:"task_result_receipts,omitempty"`
 	TaskExecContexts   map[string]TaskExecContext   `json:"task_exec_contexts,omitempty"`
+	NodeCapabilities   map[string]NodeCapability    `json:"node_capabilities,omitempty"`
 	Audit              []model.AuditEvent           `json:"audit"`
 	KV                 map[string]model.KVEntry     `json:"kv"`
 	// PluginSecrets is the encrypted, namespaced plugin vault (spec §9.4). It is a
@@ -147,6 +148,36 @@ type TaskExecContext struct {
 	// result arrived. A wide gap means the posture is stale relative to the run.
 	ReportedAt time.Time `json:"reported_at,omitempty"`
 	RecordedAt time.Time `json:"recorded_at"`
+}
+
+// Node capability enrolment: which capabilities an operator has allowed to act
+// on one node. Deliberately separate from role/tags/groups, which say what a
+// node IS, and from agent_runtime, which says what the agent can do right now.
+// Those are three different questions, and dispatch needs all three: a node can
+// be perfectly capable and still be one an operator has decided to leave alone.
+const (
+	// CapabilityEnrolled allows the capability to act on this node.
+	CapabilityEnrolled = "enrolled"
+	// CapabilityExcluded refuses it, and records why. Distinct from having no
+	// record at all: a NAT box with no exposed port is not "not got to yet",
+	// it is "deliberately out, until port forwarding exists". Losing that
+	// distinction is what makes an exclusion list decay into a backlog.
+	CapabilityExcluded = "excluded"
+)
+
+type NodeCapability struct {
+	NodeID     string `json:"node_id"`
+	Capability string `json:"capability"`
+	State      string `json:"state"`
+	// Reason is required for excluded, so a decision keeps its justification
+	// where the decision lives rather than in a chat log.
+	Reason    string    `json:"reason,omitempty"`
+	ActorID   string    `json:"actor_id,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func nodeCapabilityKey(nodeID, capability string) string {
+	return nodeID + "\x00" + capability
 }
 
 type Store struct {
@@ -1530,6 +1561,60 @@ func (s *Store) TaskExecContext(taskID, nodeID string) (TaskExecContext, bool) {
 	defer s.mu.Unlock()
 	c, ok := s.state.TaskExecContexts[taskResultReceiptKey(taskID, nodeID)]
 	return c, ok
+}
+
+// SetNodeCapability records an enrolment decision. An empty state clears the
+// record, which returns the node to the capability's default rather than
+// asserting anything about it.
+func (s *Store) SetNodeCapability(c NodeCapability) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c.NodeID == "" || c.Capability == "" {
+		return errors.New("node id and capability are required")
+	}
+	staged := s.state
+	staged.NodeCapabilities = make(map[string]NodeCapability, len(s.state.NodeCapabilities)+1)
+	for k, v := range s.state.NodeCapabilities {
+		staged.NodeCapabilities[k] = v
+	}
+	key := nodeCapabilityKey(c.NodeID, c.Capability)
+	if c.State == "" {
+		delete(staged.NodeCapabilities, key)
+	} else {
+		staged.NodeCapabilities[key] = c
+	}
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
+}
+
+// NodeCapability returns the recorded decision for one (node, capability), if
+// any. No record is not a decision: the caller applies the capability default.
+func (s *Store) NodeCapability(nodeID, capability string) (NodeCapability, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.state.NodeCapabilities[nodeCapabilityKey(nodeID, capability)]
+	return c, ok
+}
+
+// NodeCapabilities lists every recorded decision, for the console's per-node
+// and per-capability views.
+func (s *Store) NodeCapabilities() []NodeCapability {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]NodeCapability, 0, len(s.state.NodeCapabilities))
+	for _, c := range s.state.NodeCapabilities {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].NodeID != out[j].NodeID {
+			return out[i].NodeID < out[j].NodeID
+		}
+		return out[i].Capability < out[j].Capability
+	})
+	return out
 }
 
 // SetTaskQueueDeadline sets how long a task may sit undelivered before the

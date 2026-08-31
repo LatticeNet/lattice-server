@@ -1,0 +1,280 @@
+package server
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
+)
+
+// Node capability enrolment: which capabilities may act on which nodes.
+//
+// The control plane already answered this question in four different shapes
+// before this file existed - AgentLaunchConfig's switches, NodeGuardBinding's
+// Managed flag, AgentUpdatePolicy's Enabled flag, and StorageBinding - each
+// with its own endpoint and its own default, and none of them consulted by task
+// dispatch. SSH Guard had no record at all, which is why "which nodes are in
+// scope for hardening" was answered by whoever happened to be selecting rows.
+//
+// This is the fifth shape only in the sense that it is meant to absorb the
+// other four: they stay authoritative for their own area and become inputs to
+// resolveNodeCapability, so each can be folded in independently instead of
+// migrating anything.
+//
+// The identity of a capability is the Plugin field already carried on
+// approvals. That field is always set from a server-side constant and never
+// decoded from a client body, so it is safe to make an authorization decision
+// on. Reusing it also means no second vocabulary to keep in sync.
+
+// capabilitySpec declares how one capability is defaulted and whether the
+// enrolment gate is live for it yet.
+type capabilitySpec struct {
+	// Mutates decides the default, and it is the only axis that does.
+	//
+	// Reading a node needs no paperwork; changing one does. Defaulting
+	// everything to deny would mean a freshly enrolled node reports no metrics
+	// until someone grants it, which nobody would accept and which would push
+	// operators toward granting everything up front. Defaulting everything to
+	// allow is the behaviour that produced a fleet-wide SSH hardening run
+	// against machines that were never meant to be in it.
+	Mutates bool
+
+	// Enforced turns the gate on for this capability. It exists so capabilities
+	// can be adopted one at a time: an unenforced capability records enrolment
+	// decisions and shows them in the console without refusing anything, which
+	// is what makes it safe to populate the table before flipping the switch.
+	Enforced bool
+}
+
+// capabilitySpecs is keyed by the approval Plugin value, except where one
+// plugin spans both a read and a write surface and therefore needs two entries
+// (sing-box discovery is a read; sing-box apply changes the machine).
+var capabilitySpecs = map[string]capabilitySpec{
+	// Live. This is the capability that had no record, and the one whose blast
+	// radius is an operator locked out of SSH.
+	sshGuardPlugin: {Mutates: true, Enforced: true},
+
+	// Declared, not yet enforced. Each of these already has a per-node record
+	// of its own; turning one on means teaching resolveNodeCapability to read
+	// that record, then flipping Enforced. Until then they behave exactly as
+	// they do today.
+	"nft":              {Mutates: true},
+	"nftpolicy":        {Mutates: true},
+	"wireguard":        {Mutates: true},
+	"selfdns":          {Mutates: true},
+	"agentupdate":      {Mutates: true},
+	"proxycore":        {Mutates: true},
+	"cftunnel":         {Mutates: true},
+	"acme-dns":         {Mutates: true},
+	"singbox-linemeta": {Mutates: true},
+	"singbox:discover": {Mutates: false},
+	"metrics":          {Mutates: false},
+	"inventory":        {Mutates: false},
+	"trace":            {Mutates: false},
+	"logs":             {Mutates: false},
+}
+
+// KnownCapabilities lists the declared capability ids, for the console.
+func KnownCapabilities() []string {
+	out := make([]string, 0, len(capabilitySpecs))
+	for id := range capabilitySpecs {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// capabilityDecision is why a node was allowed or refused, in words an operator
+// can act on. An exclusion and a missing enrolment are both refusals, but they
+// call for opposite actions, so they never collapse into one message.
+type capabilityDecision struct {
+	Allowed bool
+	// Reason is empty when allowed by default and there is nothing to say.
+	Reason string
+}
+
+// resolveNodeCapability answers whether one capability may act on one node.
+//
+// Order matters: an explicit decision always beats a derived one, and an
+// exclusion beats an enrolment, so that revoking is never ambiguous when both
+// records somehow exist.
+func (s *Server) resolveNodeCapability(nodeID, capability string) capabilityDecision {
+	spec, declared := capabilitySpecs[capability]
+	if !declared {
+		// An undeclared capability is not gated. Refusing here would break every
+		// flow that has not been onboarded yet, which is the opposite of a
+		// staged rollout.
+		return capabilityDecision{Allowed: true}
+	}
+	if record, ok := s.store.NodeCapability(nodeID, capability); ok {
+		switch record.State {
+		case store.CapabilityExcluded:
+			return capabilityDecision{Allowed: false, Reason: excludedReason(record)}
+		case store.CapabilityEnrolled:
+			return capabilityDecision{Allowed: true}
+		}
+	}
+	if !spec.Mutates {
+		return capabilityDecision{Allowed: true}
+	}
+	return capabilityDecision{
+		Allowed: false,
+		Reason: fmt.Sprintf(
+			"node is not enrolled in %q, which changes the node and is opt-in; enrol it or pick a different target",
+			capability),
+	}
+}
+
+func excludedReason(record store.NodeCapability) string {
+	if record.Reason == "" {
+		return fmt.Sprintf("node is excluded from %q", record.Capability)
+	}
+	return fmt.Sprintf("node is excluded from %q: %s", record.Capability, record.Reason)
+}
+
+// capabilityEnforced reports whether the gate is live, so callers can record an
+// enrolment decision without it taking effect yet.
+func capabilityEnforced(capability string) bool {
+	spec, ok := capabilitySpecs[capability]
+	return ok && spec.Enforced
+}
+
+// requireNodeCapability refuses the request when the capability may not act on
+// the node, and reports whether the caller should continue.
+func (s *Server) requireNodeCapability(w http.ResponseWriter, nodeID, capability string) bool {
+	if !capabilityEnforced(capability) {
+		return true
+	}
+	decision := s.resolveNodeCapability(nodeID, capability)
+	if decision.Allowed {
+		return true
+	}
+	writeError(w, http.StatusForbidden, fmt.Errorf("%s", decision.Reason))
+	return false
+}
+
+type nodeCapabilityView struct {
+	NodeID     string    `json:"node_id"`
+	Capability string    `json:"capability"`
+	State      string    `json:"state"`
+	Reason     string    `json:"reason,omitempty"`
+	ActorID    string    `json:"actor_id,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	// Enforced tells the console whether this decision currently bites, so a
+	// recorded-but-not-yet-live capability cannot be mistaken for a guarantee.
+	Enforced bool `json:"enforced"`
+}
+
+// handleNodeCapabilities lists enrolment decisions (GET) and records one
+// (POST). Reading needs node:read; changing scope is an administrative act on
+// the node, so it needs node:admin and the node must be one the caller may
+// actually administer.
+func (s *Server) handleNodeCapabilities(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		if !s.requireScope(w, p, "node:read") {
+			return
+		}
+		records := s.store.NodeCapabilities()
+		out := make([]nodeCapabilityView, 0, len(records))
+		for _, record := range records {
+			if !rbac.Allows(p.Principal, "node:read", record.NodeID) {
+				continue
+			}
+			out = append(out, nodeCapabilityView{
+				NodeID: record.NodeID, Capability: record.Capability, State: record.State,
+				Reason: record.Reason, ActorID: record.ActorID, UpdatedAt: record.UpdatedAt,
+				Enforced: capabilityEnforced(record.Capability),
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"capabilities": out,
+			"known":        KnownCapabilities(),
+		})
+	case http.MethodPost:
+		if !s.requireScope(w, p, "node:admin") {
+			return
+		}
+		var req struct {
+			NodeID     string `json:"node_id"`
+			Capability string `json:"capability"`
+			State      string `json:"state"`
+			Reason     string `json:"reason"`
+		}
+		if !decodeClientJSON(w, r, &req) {
+			return
+		}
+		req.NodeID = strings.TrimSpace(req.NodeID)
+		req.Capability = strings.TrimSpace(req.Capability)
+		req.State = strings.TrimSpace(req.State)
+		req.Reason = strings.TrimSpace(req.Reason)
+		if req.NodeID == "" || req.Capability == "" {
+			writeError(w, http.StatusBadRequest, errors.New("node_id and capability are required"))
+			return
+		}
+		// Scope is not enough: changing what may act on a node is a change to
+		// that node, so the caller has to be able to reach it.
+		if !s.requireReadableNodes(w, p, "node:admin", "this node", []string{req.NodeID}) {
+			return
+		}
+		if _, ok := s.store.Node(req.NodeID); !ok {
+			writeError(w, http.StatusNotFound, errors.New("node not found"))
+			return
+		}
+		if _, ok := capabilitySpecs[req.Capability]; !ok {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("unknown capability %q", req.Capability))
+			return
+		}
+		switch req.State {
+		case store.CapabilityEnrolled:
+		case store.CapabilityExcluded:
+			// The reason is the whole point of excluded: without it the record
+			// says "not this one" and nothing about why, which is exactly the
+			// state this was built to replace.
+			if req.Reason == "" {
+				writeError(w, http.StatusBadRequest, errors.New("a reason is required to exclude a node"))
+				return
+			}
+		case "":
+			// Clears the record, returning the node to the capability default.
+		default:
+			writeError(w, http.StatusBadRequest, fmt.Errorf("state must be %q, %q, or empty to clear",
+				store.CapabilityEnrolled, store.CapabilityExcluded))
+			return
+		}
+		record := store.NodeCapability{
+			NodeID: req.NodeID, Capability: req.Capability, State: req.State,
+			Reason: req.Reason, ActorID: p.ActorID, UpdatedAt: s.now(),
+		}
+		if err := s.store.SetNodeCapability(record); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:      id.New("audit"),
+			ActorID: p.ActorID,
+			NodeID:  req.NodeID,
+			Action:  "node.capability." + firstNonEmpty(req.State, "cleared"),
+			Scope:   "node:admin",
+			Reason:  req.Reason,
+			Metadata: map[string]string{
+				"capability": req.Capability,
+				"state":      req.State,
+			},
+		})
+		writeJSON(w, http.StatusOK, nodeCapabilityView{
+			NodeID: record.NodeID, Capability: record.Capability, State: record.State,
+			Reason: record.Reason, ActorID: record.ActorID, UpdatedAt: record.UpdatedAt,
+			Enforced: capabilityEnforced(record.Capability),
+		})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}

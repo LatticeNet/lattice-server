@@ -15,6 +15,24 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
+// enrolSSHGuard opts a node into SSH Guard, which planning now requires.
+//
+// Hardening decides who can reach a machine over SSH, so it is opt-in per node
+// rather than available to whatever id a caller passes. Every plan test states
+// that precondition explicitly instead of inheriting it from a shared fixture,
+// because "this node is in scope" is exactly the thing the gate exists to make
+// deliberate.
+func enrolSSHGuard(t *testing.T, st interface {
+	SetNodeCapability(store.NodeCapability) error
+}, nodeID string) {
+	t.Helper()
+	if err := st.SetNodeCapability(store.NodeCapability{
+		NodeID: nodeID, Capability: sshGuardPlugin, State: store.CapabilityEnrolled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func sshGuardPlanBody(nodeID string, extra map[string]any) string {
 	body := map[string]any{
 		"node_id":      nodeID,
@@ -34,6 +52,7 @@ func sshGuardPlanBody(nodeID string, extra map[string]any) string {
 func TestSSHGuardPlanRequiresItsOwnAdminScope(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	cookies, csrf := loginSession(t, handler)
 
 	planOnly := createPAT(t, handler, cookies, csrf, []string{"network:plan"}, []string{"node-a"})
@@ -57,6 +76,7 @@ func TestSSHGuardPlanRequiresItsOwnAdminScope(t *testing.T) {
 func TestSSHGuardPlanProducesAnApplicableApproval(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	cookies, csrf := loginSession(t, handler)
 	token := createPAT(t, handler, cookies, csrf, []string{"network:plan", "sshguard:admin"}, []string{"node-a"})
 
@@ -105,6 +125,7 @@ func TestSSHGuardPlanProducesAnApplicableApproval(t *testing.T) {
 func TestSSHGuardPlanBlocksAPortThatIsAlreadyBound(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	if _, _, err := st.UpsertGuardRealitySnapshot("", store.GuardRealitySnapshot{
 		Reality: model.GuardNodeReality{
 			NodeID:      "node-a",
@@ -137,6 +158,7 @@ func TestSSHGuardPlanBlocksAPortThatIsAlreadyBound(t *testing.T) {
 func TestSSHGuardPlanRefusesAProfileWithNoFallback(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	cookies, csrf := loginSession(t, handler)
 	token := createPAT(t, handler, cookies, csrf, []string{"network:plan", "sshguard:admin"}, []string{"node-a"})
 
@@ -154,6 +176,7 @@ func TestSSHGuardPlanRefusesAProfileWithNoFallback(t *testing.T) {
 func TestSSHGuardApprovalDecisionRequiresItsOwnAdminScope(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	cookies, csrf := loginSession(t, handler)
 
 	plan, err := sshguard.RenderConfirmPlan("node-a", "Node A")
@@ -188,6 +211,7 @@ func TestSSHGuardApprovalDecisionRequiresItsOwnAdminScope(t *testing.T) {
 func TestKnockSequencesAreNotSharedBetweenPlans(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	cookies, csrf := loginSession(t, handler)
 	token := createPAT(t, handler, cookies, csrf, []string{"network:plan", "sshguard:admin"}, []string{"node-a"})
 
@@ -235,6 +259,7 @@ func firstLines(s string, n int) string {
 func TestKnockOnOutOfBandFallbackIsCheckedAgainstTheNode(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	cookies, csrf := loginSession(t, handler)
 	token := createPAT(t, handler, cookies, csrf, []string{"network:plan", "sshguard:admin"}, []string{"node-a"})
 
@@ -288,6 +313,7 @@ func TestKnockOnOutOfBandFallbackIsCheckedAgainstTheNode(t *testing.T) {
 func TestReadingAnSSHGuardPlanRequiresTheDomainScope(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	cookies, csrf := loginSession(t, handler)
 
 	plan, err := sshguard.RenderArmPlan(sshguard.Profile{
@@ -367,6 +393,7 @@ func TestSSHGuardApprovalAdvancesOnItsTaskResult(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			srv, _, st := newInventoryServer(t)
 			seedAgentUpdateNode(t, st)
+			enrolSSHGuard(t, st, "node-a")
 			approval := model.Approval{
 				ID: id.New("approval"), NodeID: "node-a", Plugin: sshGuardPlugin,
 				Action: sshGuardArmAction, Plan: "plugin: sshguard\n", Status: model.ApprovalApproved,
@@ -398,6 +425,7 @@ func TestSSHGuardApprovalAdvancesOnItsTaskResult(t *testing.T) {
 func TestSSHGuardConfirmApprovalAlsoAdvances(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
 	approval := model.Approval{
 		ID: id.New("approval"), NodeID: "node-a", Plugin: sshGuardPlugin,
 		Action: sshGuardConfirmAction, Plan: "plugin: sshguard\n", Status: model.ApprovalApproved,

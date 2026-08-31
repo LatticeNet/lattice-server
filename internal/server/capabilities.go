@@ -178,13 +178,32 @@ type KnownCapability struct {
 	ID       string `json:"id"`
 	Enforced bool   `json:"enforced"`
 	Mutates  bool   `json:"mutates"`
+	// Derived is whether this capability can answer for a node that has no
+	// explicit enrolment. Enforcing one that cannot refuses the whole fleet on
+	// the first request, so the console has to be able to say so.
+	Derived bool `json:"derived"`
 }
 
-// KnownCapabilities lists the declared capabilities, for the console.
-func KnownCapabilities() []KnownCapability {
-	out := make([]KnownCapability, 0, len(capabilitySpecs))
+// KnownCapabilities lists every capability this fleet has, compiled-in and
+// plugin-provided, with the enforcement each one currently has.
+func (s *Server) KnownCapabilities() []KnownCapability {
+	seen := map[string]capabilitySpec{}
 	for id, spec := range capabilitySpecs {
-		out = append(out, KnownCapability{ID: id, Enforced: spec.Enforced, Mutates: spec.Mutates})
+		seen[id] = spec
+	}
+	for _, loaded := range s.plugins {
+		if _, ok := seen[loaded.Manifest.ID]; !ok {
+			seen[loaded.Manifest.ID] = capabilitySpec{Mutates: true}
+		}
+	}
+	out := make([]KnownCapability, 0, len(seen))
+	for id, spec := range seen {
+		out = append(out, KnownCapability{
+			ID:       id,
+			Enforced: s.capabilityEnforced(id),
+			Mutates:  spec.Mutates,
+			Derived:  spec.Derive != nil,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -209,15 +228,35 @@ const (
 	capabilitySourceRecord  = "record"
 	capabilitySourceDerived = "derived"
 	capabilitySourceDefault = "default"
+	// capabilitySourceNotEnforced means the gate is off for this fleet, so the
+	// scope answer, whatever it is, did not apply.
+	capabilitySourceNotEnforced = "not-enforced"
 )
 
-// resolveNodeCapability answers whether one capability may act on one node.
+// resolveNodeCapability is the decision: may this capability act on this node,
+// right now, on this fleet.
 //
-// Order matters: an explicit decision always beats a derived one, and an
-// exclusion beats an enrolment, so that revoking is never ambiguous when both
-// records somehow exist.
+// It includes whether the gate is even live. An earlier version answered only
+// the scope question and left every caller to check enforcement separately,
+// which meant the same answer meant different things depending on who asked and
+// put the burden on each new call site to remember. Three sites remembered; the
+// tests written against it did not, which is the tell.
+//
+// The scope question on its own is still available as resolveCapabilityScope,
+// for the impact preview and for showing an operator what a gate would do.
 func (s *Server) resolveNodeCapability(nodeID, capability string) capabilityDecision {
-	spec, declared := capabilitySpecs[capability]
+	if !s.capabilityEnforced(capability) {
+		return capabilityDecision{Allowed: true, Source: capabilitySourceNotEnforced}
+	}
+	return s.resolveCapabilityScope(nodeID, capability)
+}
+
+// resolveCapabilityScope answers the scope question alone, as if the gate were
+// live. Order matters: an explicit decision always beats a derived one, and an
+// exclusion beats an enrolment, so revoking is never ambiguous when both
+// records somehow exist.
+func (s *Server) resolveCapabilityScope(nodeID, capability string) capabilityDecision {
+	spec, declared := s.capabilitySpecFor(capability)
 	if !declared {
 		// An undeclared capability is not gated. Refusing here would break every
 		// flow that has not been onboarded yet, which is the opposite of a
@@ -268,19 +307,46 @@ func excludedReason(record store.NodeCapability) string {
 	return fmt.Sprintf("node is excluded from %q: %s", record.Capability, record.Reason)
 }
 
-// capabilityEnforced reports whether the gate is live, so callers can record an
-// enrolment decision without it taking effect yet.
-func capabilityEnforced(capability string) bool {
-	spec, ok := capabilitySpecs[capability]
+// capabilitySpecFor resolves a capability's declaration, including ones that
+// are not compiled in.
+//
+// Every installed plugin is a capability. A plugin operation mints an approval
+// carrying the plugin's manifest id and queues a task against a node, which is
+// the same shape as any built-in capability and deserves the same gate - and
+// until this existed, third-party plugins were the one family that could act on
+// any node in the fleet unscoped, which is backwards. They are declared as
+// mutating with nothing to derive from, and start unenforced so an operator
+// turns them on deliberately after seeing what it would refuse.
+func (s *Server) capabilitySpecFor(capability string) (capabilitySpec, bool) {
+	if spec, ok := capabilitySpecs[capability]; ok {
+		return spec, true
+	}
+	if capability == "" {
+		return capabilitySpec{}, false
+	}
+	if _, ok := s.loadedPlugin(capability); ok {
+		return capabilitySpec{Mutates: true}, true
+	}
+	return capabilitySpec{}, false
+}
+
+// capabilityEnforced reports whether the gate is live.
+//
+// The operator's stored policy wins over the compiled default. The default is
+// what a fresh install should do; the policy is what this fleet has decided,
+// and only the operator knows when their nodes have been curated enough for a
+// capability to start refusing work.
+func (s *Server) capabilityEnforced(capability string) bool {
+	if policy, ok := s.store.CapabilityPolicy(capability); ok {
+		return policy.Enforced
+	}
+	spec, ok := s.capabilitySpecFor(capability)
 	return ok && spec.Enforced
 }
 
 // requireNodeCapability refuses the request when the capability may not act on
 // the node, and reports whether the caller should continue.
 func (s *Server) requireNodeCapability(w http.ResponseWriter, nodeID, capability string) bool {
-	if !capabilityEnforced(capability) {
-		return true
-	}
 	decision := s.resolveNodeCapability(nodeID, capability)
 	if decision.Allowed {
 		return true
@@ -340,8 +406,8 @@ func (s *Server) handleNodeCapabilities(w http.ResponseWriter, r *http.Request, 
 				return
 			}
 			effective := make([]nodeCapabilityEffectiveView, 0, len(capabilitySpecs))
-			for _, known := range KnownCapabilities() {
-				decision := s.resolveNodeCapability(nodeID, known.ID)
+			for _, known := range s.KnownCapabilities() {
+				decision := s.resolveCapabilityScope(nodeID, known.ID)
 				view := nodeCapabilityEffectiveView{
 					Capability: known.ID,
 					Enforced:   known.Enforced,
@@ -370,12 +436,12 @@ func (s *Server) handleNodeCapabilities(w http.ResponseWriter, r *http.Request, 
 			out = append(out, nodeCapabilityView{
 				NodeID: record.NodeID, Capability: record.Capability, State: record.State,
 				Reason: record.Reason, ActorID: record.ActorID, UpdatedAt: record.UpdatedAt,
-				Enforced: capabilityEnforced(record.Capability),
+				Enforced: s.capabilityEnforced(record.Capability),
 			})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"capabilities": out,
-			"known":        KnownCapabilities(),
+			"known":        s.KnownCapabilities(),
 		})
 	case http.MethodPost:
 		if !s.requireScope(w, p, "node:admin") {
@@ -451,8 +517,132 @@ func (s *Server) handleNodeCapabilities(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusOK, nodeCapabilityView{
 			NodeID: record.NodeID, Capability: record.Capability, State: record.State,
 			Reason: record.Reason, ActorID: record.ActorID, UpdatedAt: record.UpdatedAt,
-			Enforced: capabilityEnforced(record.Capability),
+			Enforced: s.capabilityEnforced(record.Capability),
 		})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+// capabilityImpactView is what turning one capability's gate on would do to
+// this fleet right now.
+//
+// Enforcement is the one setting here that can break working operations: a
+// capability with nothing to derive from refuses every node that has no
+// explicit enrolment, which on a fresh table is the entire fleet. Nobody should
+// have to discover that by flipping it and watching the failures, so the answer
+// is available before the decision.
+type capabilityImpactView struct {
+	Capability  string `json:"capability"`
+	Enforced    bool   `json:"enforced"`
+	Mutates     bool   `json:"mutates"`
+	Derived     bool   `json:"derived"`
+	AllowCount  int    `json:"allow_count"`
+	RefuseCount int    `json:"refuse_count"`
+	// Refused names the first few, because a count alone does not tell an
+	// operator whether the answer is "the three I excluded" or "everything".
+	Refused []capabilityImpactNode `json:"refused,omitempty"`
+}
+
+type capabilityImpactNode struct {
+	NodeID string `json:"node_id"`
+	Name   string `json:"name,omitempty"`
+	Reason string `json:"reason,omitempty"`
+}
+
+const capabilityImpactSample = 10
+
+// capabilityImpact resolves the capability against every node the caller can
+// see, as if it were enforced.
+func (s *Server) capabilityImpact(p principal, capability string) capabilityImpactView {
+	spec, _ := s.capabilitySpecFor(capability)
+	out := capabilityImpactView{
+		Capability: capability,
+		Enforced:   s.capabilityEnforced(capability),
+		Mutates:    spec.Mutates,
+		Derived:    spec.Derive != nil,
+	}
+	for _, node := range s.store.Nodes() {
+		if !rbac.Allows(p.Principal, "node:read", node.ID) {
+			continue
+		}
+		decision := s.resolveCapabilityScope(node.ID, capability)
+		if decision.Allowed {
+			out.AllowCount++
+			continue
+		}
+		out.RefuseCount++
+		if len(out.Refused) < capabilityImpactSample {
+			out.Refused = append(out.Refused, capabilityImpactNode{
+				NodeID: node.ID, Name: node.Name, Reason: decision.Reason,
+			})
+		}
+	}
+	return out
+}
+
+// handleCapabilityPolicies lists every capability with the impact of its gate
+// (GET), and turns one on or off (POST).
+func (s *Server) handleCapabilityPolicies(w http.ResponseWriter, r *http.Request, p principal) {
+	switch r.Method {
+	case http.MethodGet:
+		if !s.requireScope(w, p, "node:read") {
+			return
+		}
+		known := s.KnownCapabilities()
+		out := make([]capabilityImpactView, 0, len(known))
+		for _, k := range known {
+			out = append(out, s.capabilityImpact(p, k.ID))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"capabilities": out})
+	case http.MethodPost:
+		// Turning a gate off is a security downgrade, so it needs the scope that
+		// administers nodes rather than the one that reads them. It is offered
+		// at all because an operator who needs the lever during an incident will
+		// otherwise reach for something worse, and because the audit trail
+		// records who did it and when.
+		if !s.requireScope(w, p, "node:admin") {
+			return
+		}
+		var req struct {
+			Capability string `json:"capability"`
+			Enforced   bool   `json:"enforced"`
+		}
+		if !decodeClientJSON(w, r, &req) {
+			return
+		}
+		req.Capability = strings.TrimSpace(req.Capability)
+		if req.Capability == "" {
+			writeError(w, http.StatusBadRequest, errors.New("capability is required"))
+			return
+		}
+		if _, ok := s.capabilitySpecFor(req.Capability); !ok {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("unknown capability %q", req.Capability))
+			return
+		}
+		policy := store.CapabilityPolicy{
+			Capability: req.Capability, Enforced: req.Enforced,
+			ActorID: p.ActorID, UpdatedAt: s.now(),
+		}
+		if err := s.store.SetCapabilityPolicy(policy); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		decision := "allow"
+		if !req.Enforced {
+			// A gate being switched off is the event worth finding later.
+			decision = "warn"
+		}
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			ActorID:  p.ActorID,
+			Action:   "capability.policy",
+			Scope:    "node:admin",
+			Decision: decision,
+			Reason:   fmt.Sprintf("enforcement %v for %q", req.Enforced, req.Capability),
+			Metadata: map[string]string{"capability": req.Capability},
+		})
+		writeJSON(w, http.StatusOK, s.capabilityImpact(p, req.Capability))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}

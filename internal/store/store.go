@@ -51,6 +51,7 @@ type State struct {
 	TaskResultReceipts map[string]TaskResultReceipt `json:"task_result_receipts,omitempty"`
 	TaskExecContexts   map[string]TaskExecContext   `json:"task_exec_contexts,omitempty"`
 	NodeCapabilities   map[string]NodeCapability    `json:"node_capabilities,omitempty"`
+	CapabilityPolicies map[string]CapabilityPolicy  `json:"capability_policies,omitempty"`
 	Audit              []model.AuditEvent           `json:"audit"`
 	KV                 map[string]model.KVEntry     `json:"kv"`
 	// PluginSecrets is the encrypted, namespaced plugin vault (spec §9.4). It is a
@@ -164,6 +165,21 @@ const (
 	// distinction is what makes an exclusion list decay into a backlog.
 	CapabilityExcluded = "excluded"
 )
+
+// CapabilityPolicy is the operator's decision about whether one capability's
+// gate is live on this fleet.
+//
+// Whether a gate is enforced is policy, not mechanism: the code knows how to
+// resolve scope and what a sensible default is, but only the operator knows
+// when their fleet has been curated enough to switch a capability on without
+// refusing work that should succeed. Baking that into a compile-time constant
+// meant a release per capability, on a product people self-host.
+type CapabilityPolicy struct {
+	Capability string    `json:"capability"`
+	Enforced   bool      `json:"enforced"`
+	ActorID    string    `json:"actor_id,omitempty"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
 
 type NodeCapability struct {
 	NodeID     string `json:"node_id"`
@@ -1561,6 +1577,35 @@ func (s *Store) TaskExecContext(taskID, nodeID string) (TaskExecContext, bool) {
 	defer s.mu.Unlock()
 	c, ok := s.state.TaskExecContexts[taskResultReceiptKey(taskID, nodeID)]
 	return c, ok
+}
+
+// SetCapabilityPolicy turns one capability's gate on or off for this fleet.
+func (s *Store) SetCapabilityPolicy(policy CapabilityPolicy) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if policy.Capability == "" {
+		return errors.New("capability is required")
+	}
+	staged := s.state
+	staged.CapabilityPolicies = make(map[string]CapabilityPolicy, len(s.state.CapabilityPolicies)+1)
+	for k, v := range s.state.CapabilityPolicies {
+		staged.CapabilityPolicies[k] = v
+	}
+	staged.CapabilityPolicies[policy.Capability] = policy
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
+}
+
+// CapabilityPolicy returns the operator's decision for one capability, if they
+// have made one. No policy means the compiled default applies.
+func (s *Store) CapabilityPolicy(capability string) (CapabilityPolicy, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	policy, ok := s.state.CapabilityPolicies[capability]
+	return policy, ok
 }
 
 // SetNodeCapability records an enrolment decision. An empty state clears the

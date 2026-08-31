@@ -997,6 +997,9 @@ func (s *Server) Handler() http.Handler {
 	// Which capabilities may act on which nodes. Scope is checked per method
 	// inside the handler: reading needs node:read, changing scope needs node:admin.
 	mux.HandleFunc("/api/nodes/capabilities", s.withAuth("", s.handleNodeCapabilities))
+	// Fleet-wide: which capability gates are live, and what turning one on
+	// would refuse. Scope is checked per method inside the handler.
+	mux.HandleFunc("/api/capabilities", s.withAuth("", s.handleCapabilityPolicies))
 	mux.HandleFunc("/api/nodes/delete", s.withAuth("node:admin", s.handleDeleteNode))
 	mux.HandleFunc("/api/nodes/delete/plan", s.withAuth("node:admin", s.handleDeleteNodePlan))
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
@@ -3418,7 +3421,7 @@ func (s *Server) queueTaskFor(capability string, task model.Task) error {
 			capability = approval.Plugin
 		}
 	}
-	if capability != "" && capabilityEnforced(capability) {
+	if capability != "" {
 		for _, nodeID := range task.Targets {
 			if decision := s.resolveNodeCapability(nodeID, capability); !decision.Allowed {
 				return fmt.Errorf("%s: %s", nodeID, decision.Reason)
@@ -6612,7 +6615,7 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	// It also covers the two paths that never reach queueTask: netguard and
 	// line chain commit their task inside a store transaction, so this is the
 	// only place their scope can be enforced.
-	if approval.Status == model.ApprovalPending && approval.NodeID != "" && capabilityEnforced(approval.Plugin) {
+	if approval.Status == model.ApprovalPending && approval.NodeID != "" {
 		if decision := s.resolveNodeCapability(approval.NodeID, approval.Plugin); !decision.Allowed {
 			return approval, &approvalDecisionError{
 				status: http.StatusForbidden,

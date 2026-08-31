@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/plugin"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -113,11 +115,12 @@ func TestClearingARecordReturnsTheNodeToTheDefault(t *testing.T) {
 // kind, which is why its scope was decided by whoever was selecting rows, and
 // there is nothing to derive from.
 func TestACapabilityIsOnlyEnforcedOnceItCanAnswerForAnUnenrolledNode(t *testing.T) {
+	s := capServer(t)
 	enforced := map[string]bool{}
-	for _, known := range KnownCapabilities() {
-		if known.Enforced != capabilityEnforced(known.ID) {
+	for _, known := range s.KnownCapabilities() {
+		if known.Enforced != s.capabilityEnforced(known.ID) {
 			t.Errorf("%s reports Enforced=%v to the console but resolves as %v",
-				known.ID, known.Enforced, capabilityEnforced(known.ID))
+				known.ID, known.Enforced, s.capabilityEnforced(known.ID))
 		}
 		if !known.Enforced {
 			continue
@@ -270,5 +273,94 @@ func TestQueueTaskTakesItsCapabilityFromTheApproval(t *testing.T) {
 	}
 	if err := s.queueTask(task); err != nil {
 		t.Fatalf("an enrolled node was refused: %v", err)
+	}
+}
+
+// Whether a gate is live is policy, and policy belongs to the operator. The
+// compiled value is what a fresh install does; a stored decision replaces it,
+// in both directions, without a release.
+func TestTheOperatorsPolicyBeatsTheCompiledDefault(t *testing.T) {
+	s := capServer(t)
+	if !s.capabilityEnforced(sshGuardPlugin) {
+		t.Fatal("sshguard should be enforced by default")
+	}
+	if s.capabilityEnforced("nft") {
+		t.Fatal("nft should not be enforced by default")
+	}
+	set := func(capability string, enforced bool) {
+		if err := s.store.SetCapabilityPolicy(store.CapabilityPolicy{
+			Capability: capability, Enforced: enforced, UpdatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set("nft", true)
+	if !s.capabilityEnforced("nft") {
+		t.Error("enabling a gate did not take effect")
+	}
+	// Turning one off has to work too. An operator who needs the lever during an
+	// incident will otherwise reach for something worse than a recorded, audited
+	// setting.
+	set(sshGuardPlugin, false)
+	if s.capabilityEnforced(sshGuardPlugin) {
+		t.Error("disabling a gate did not take effect")
+	}
+	if !s.resolveNodeCapability("node-nobody-enrolled", sshGuardPlugin).Allowed {
+		t.Error("a disabled gate still refused")
+	}
+}
+
+// Enforcing a capability that cannot derive an answer refuses every node with
+// no explicit enrolment, which on a fresh table is the whole fleet. The impact
+// preview exists so that is visible before the switch, not after.
+func TestTheImpactPreviewSaysWhatEnforcingWouldRefuse(t *testing.T) {
+	s := capServer(t)
+	for _, id := range []string{"node-a", "node-b", "node-c"} {
+		if err := s.store.UpsertNode(model.Node{ID: id, Name: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.store.SetNodeCapability(store.NodeCapability{
+		NodeID: "node-a", Capability: sshGuardPlugin, State: store.CapabilityEnrolled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	admin := principal{Principal: rbac.Principal{Scopes: []string{"*"}}}
+	impact := s.capabilityImpact(admin, sshGuardPlugin)
+	if impact.AllowCount != 1 || impact.RefuseCount != 2 {
+		t.Fatalf("want 1 allowed / 2 refused, got %d / %d", impact.AllowCount, impact.RefuseCount)
+	}
+	// A count alone does not tell an operator whether the answer is "the two I
+	// excluded" or "everything", so the names come with it.
+	if len(impact.Refused) != 2 {
+		t.Fatalf("want the refused nodes named, got %+v", impact.Refused)
+	}
+	if impact.Refused[0].Reason == "" {
+		t.Error("a refused node came back with no reason")
+	}
+}
+
+// A third-party plugin acts on nodes exactly like a built-in capability: it
+// mints an approval carrying its manifest id and queues a task. It was the one
+// family that could reach any node unscoped.
+func TestAnInstalledPluginIsACapability(t *testing.T) {
+	s := capServer(t)
+	if _, ok := s.capabilitySpecFor("some.unknown.thing"); ok {
+		t.Error("an unknown id resolved to a capability")
+	}
+	s.plugins = []plugin.Loaded{{Manifest: plugin.Manifest{ID: "acme.firewall"}}}
+	spec, ok := s.capabilitySpecFor("acme.firewall")
+	if !ok {
+		t.Fatal("an installed plugin is not a capability")
+	}
+	if !spec.Mutates {
+		t.Error("a plugin capability should default to opt-in; it queues tasks against nodes")
+	}
+	// Declared but not enforced: an operator turns it on after seeing the impact.
+	if s.capabilityEnforced("acme.firewall") {
+		t.Error("a newly installed plugin started enforcing on its own")
+	}
+	if !s.resolveNodeCapability("node-a", "acme.firewall").Allowed {
+		t.Error("an unenforced plugin capability refused a node")
 	}
 }

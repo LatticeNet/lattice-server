@@ -108,13 +108,16 @@ func TestClearingARecordReturnsTheNodeToTheDefault(t *testing.T) {
 // refusing every node that has no new-style enrolment - which for something
 // like nft means refusing the whole fleet.
 func TestOnlySSHGuardIsEnforcedInThisPhase(t *testing.T) {
-	for _, id := range KnownCapabilities() {
-		enforced := capabilityEnforced(id)
-		if id == sshGuardPlugin && !enforced {
+	for _, known := range KnownCapabilities() {
+		if known.Enforced != capabilityEnforced(known.ID) {
+			t.Errorf("%s reports Enforced=%v to the console but resolves as %v",
+				known.ID, known.Enforced, capabilityEnforced(known.ID))
+		}
+		if known.ID == sshGuardPlugin && !known.Enforced {
 			t.Error("sshguard is not enforced; it is the capability this was built for")
 		}
-		if id != sshGuardPlugin && enforced {
-			t.Errorf("%s became enforced without its existing per-node record being wired in", id)
+		if known.ID != sshGuardPlugin && known.Enforced {
+			t.Errorf("%s became enforced without its existing per-node record being wired in", known.ID)
 		}
 	}
 }

@@ -81,13 +81,27 @@ var capabilitySpecs = map[string]capabilitySpec{
 	"logs":             {Mutates: false},
 }
 
-// KnownCapabilities lists the declared capability ids, for the console.
-func KnownCapabilities() []string {
-	out := make([]string, 0, len(capabilitySpecs))
-	for id := range capabilitySpecs {
-		out = append(out, id)
+// KnownCapability describes one declared capability to the console.
+//
+// Enforced and Mutates are both exported because they answer different
+// questions an operator asks: whether a decision here currently bites, and
+// whether this capability is one that changes the machine (which is what makes
+// it opt-in in the first place). Without Enforced the console would render
+// fourteen inert capabilities beside the one live one and imply they all matter
+// equally.
+type KnownCapability struct {
+	ID       string `json:"id"`
+	Enforced bool   `json:"enforced"`
+	Mutates  bool   `json:"mutates"`
+}
+
+// KnownCapabilities lists the declared capabilities, for the console.
+func KnownCapabilities() []KnownCapability {
+	out := make([]KnownCapability, 0, len(capabilitySpecs))
+	for id, spec := range capabilitySpecs {
+		out = append(out, KnownCapability{ID: id, Enforced: spec.Enforced, Mutates: spec.Mutates})
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 

@@ -3389,9 +3389,41 @@ func validateTaskCreate(interpreter, script string, timeoutSec, outputLimit int)
 	return nil
 }
 
+// queueTask is the sole enforcement point for fleet-wide task policy: the exec
+// kill-switch, and capability scope.
+//
+// Scope is checked here rather than only in each capability's handler because
+// handlers are where a check gets forgotten. The per-handler checks upstream
+// still earn their keep - they fail early, before any work, with a message
+// aimed at what the operator was doing - but this is the one that cannot be
+// skipped by a new caller who did not know to add it.
+//
+// The capability comes from the approval when the task has one, so
+// approval-backed work needs no caller cooperation at all. Direct queues name
+// themselves through queueTaskFor.
 func (s *Server) queueTask(task model.Task) error {
+	return s.queueTaskFor("", task)
+}
+
+// queueTaskFor queues a task on behalf of a named capability. An empty
+// capability means "not a capability-scoped task", which is how everything
+// behaved before this existed, so an un-migrated caller keeps working rather
+// than silently losing its gate.
+func (s *Server) queueTaskFor(capability string, task model.Task) error {
 	if s.taskExecutionDisabled {
 		return errTaskExecutionDisabled
+	}
+	if capability == "" && task.ApprovalID != "" {
+		if approval, ok := s.store.Approval(task.ApprovalID); ok {
+			capability = approval.Plugin
+		}
+	}
+	if capability != "" && capabilityEnforced(capability) {
+		for _, nodeID := range task.Targets {
+			if decision := s.resolveNodeCapability(nodeID, capability); !decision.Allowed {
+				return fmt.Errorf("%s: %s", nodeID, decision.Reason)
+			}
+		}
 	}
 	return s.store.CreateTask(task)
 }
@@ -6570,6 +6602,24 @@ func (e *approvalDecisionError) Error() string { return e.err.Error() }
 // ever transition for the exact stored plan bytes, whichever entry point
 // drove the decision.
 func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval model.Approval, queueApply bool, planSHA256 string) (model.Approval, error) {
+	// Scope is re-checked at the decision, not only when the plan was written.
+	//
+	// A plan can outlive the decision that produced it: a node excluded from a
+	// capability last week may still have a pending approval from before, and
+	// approving it would apply exactly the change the exclusion exists to
+	// prevent. The plan-time gate cannot see that, because it ran before.
+	//
+	// It also covers the two paths that never reach queueTask: netguard and
+	// line chain commit their task inside a store transaction, so this is the
+	// only place their scope can be enforced.
+	if approval.Status == model.ApprovalPending && approval.NodeID != "" && capabilityEnforced(approval.Plugin) {
+		if decision := s.resolveNodeCapability(approval.NodeID, approval.Plugin); !decision.Allowed {
+			return approval, &approvalDecisionError{
+				status: http.StatusForbidden,
+				err:    fmt.Errorf("%s: %s", approval.NodeID, decision.Reason),
+			}
+		}
+	}
 	lineChainScript := ""
 	if approval.Status != model.ApprovalPending {
 		// Already-decided approvals stay idempotent, matching the manual

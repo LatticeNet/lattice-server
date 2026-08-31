@@ -216,3 +216,59 @@ func TestAnExplicitDecisionOverridesWhatTheNodesConfigurationImplies(t *testing.
 		t.Errorf("the exclusion reason was lost: %q", d.Reason)
 	}
 }
+
+// Handlers are where a check gets forgotten. queueTask is the one path every
+// directly-queued task takes, so the guarantee lives there and a new caller
+// that never heard of capabilities still cannot dispatch out of scope.
+func TestQueueTaskRefusesAnOutOfScopeTargetEvenWithNoHandlerCheck(t *testing.T) {
+	s := capServer(t)
+	if err := s.store.UpsertNode(model.Node{
+		ID: "node-a", Name: "node-a",
+		AgentLaunch: &model.AgentLaunchConfig{SingBoxDiscover: false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	task := model.Task{
+		ID: "task_x", Targets: []string{"node-a"}, Interpreter: "sh", Script: "true",
+		Status: model.TaskQueued, CreatedAt: time.Now().UTC(),
+	}
+	if err := s.queueTaskFor(capabilitySingBox, task); err == nil {
+		t.Fatal("queueTask accepted a task for a node out of scope for its capability")
+	}
+	// The same task with no capability named keeps working, so a path that has
+	// not been migrated does not silently lose its ability to queue.
+	if err := s.queueTask(task); err != nil {
+		t.Fatalf("an unscoped task was refused: %v", err)
+	}
+}
+
+// A task inherits its capability from its approval, so approval-backed work is
+// gated without any caller cooperation at all.
+func TestQueueTaskTakesItsCapabilityFromTheApproval(t *testing.T) {
+	s := capServer(t)
+	if err := s.store.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	approval := model.Approval{
+		ID: "approval_x", NodeID: "node-a", Plugin: sshGuardPlugin,
+		Action: "arm", Status: model.ApprovalPending, CreatedAt: time.Now().UTC(),
+	}
+	if err := s.store.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	task := model.Task{
+		ID: "task_y", ApprovalID: approval.ID, Targets: []string{"node-a"},
+		Interpreter: "sh", Script: "true", Status: model.TaskQueued, CreatedAt: time.Now().UTC(),
+	}
+	if err := s.queueTask(task); err == nil {
+		t.Fatal("an approval-backed task was queued for a node not enrolled in the approval's capability")
+	}
+	if err := s.store.SetNodeCapability(store.NodeCapability{
+		NodeID: "node-a", Capability: sshGuardPlugin, State: store.CapabilityEnrolled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.queueTask(task); err != nil {
+		t.Fatalf("an enrolled node was refused: %v", err)
+	}
+}

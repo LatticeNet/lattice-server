@@ -72,7 +72,7 @@ func (s *Server) queueSingBoxTask(p principal, nodeID, script string) (model.Tas
 		Status:      model.TaskQueued,
 		CreatedAt:   s.now(),
 	}
-	if err := s.queueTask(task); err != nil {
+	if err := s.queueTaskFor(capabilitySingBox, task); err != nil {
 		return model.Task{}, err
 	}
 	return task, nil
@@ -91,7 +91,12 @@ func (s *Server) queueSingBoxProbeTask(p principal, nodeID string) (model.Task, 
 		CreatedAt:   s.now(),
 	}
 	task.Script = buildSingBoxProbeScript(task.ID, s.nodeSBAddr(nodeID))
-	if err := s.queueTask(task); err != nil {
+	// The probe reads: it re-inventories what sing-box is already running. It is
+	// scoped as a read for that reason, and because it also runs as the
+	// rediscovery that follows a successful apply - gating it as a mutation
+	// would leave the control plane's picture of a node stale exactly when it
+	// had just changed.
+	if err := s.queueTaskFor(capabilitySingBoxDiscover, task); err != nil {
 		return model.Task{}, err
 	}
 	return task, nil
@@ -202,10 +207,12 @@ func (s *Server) handleSingBoxManageProbe(w http.ResponseWriter, r *http.Request
 	if !s.requireNodeScope(w, p, "task:run", req.NodeID) {
 		return
 	}
-	// Scope says the caller may run tasks here; this says sing-box may act on
-	// this node at all. A node that was never configured for sing-box has no
-	// business receiving sing-box management, and scope alone never said so.
-	if !s.requireNodeCapability(w, req.NodeID, capabilitySingBox) {
+
+	// Probing is how you find out whether a node runs sing-box at all, so it
+	// has to work on a node nobody has configured yet. Gating it on the
+	// management capability would make the answer unobtainable for exactly
+	// the nodes the question is about.
+	if !s.requireNodeCapability(w, req.NodeID, capabilitySingBoxDiscover) {
 		return
 	}
 	s.pendingSingboxProbeMu.Lock()

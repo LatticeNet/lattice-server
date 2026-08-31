@@ -39,6 +39,12 @@ import (
 // sing-box needs no paperwork, changing it does.
 const capabilitySingBox = "singbox"
 
+// capabilitySingBoxDiscover is the read half: inventorying what a node already
+// runs. Split from the write half because they default differently, and because
+// a rediscovery follows every successful apply - blocking the read would leave
+// the control plane's picture stale exactly when it had just changed.
+const capabilitySingBoxDiscover = "singbox:discover"
+
 // capabilitySpec declares how one capability is defaulted and whether the
 // enrolment gate is live for it yet.
 type capabilitySpec struct {

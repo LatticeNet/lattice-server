@@ -3162,6 +3162,12 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			Script      string   `json:"script"`
 			TimeoutSec  int      `json:"timeout_sec"`
 			OutputLimit int      `json:"output_limit"`
+			// Capability confines this task to nodes in scope for it. It can only
+			// ever narrow the target set, never widen it: nothing can verify that
+			// a free-text script "is" a sing-box script, so an operator declaring
+			// one is making a promise about their own intent, which is safe to
+			// honour as a restriction and worthless as a grant.
+			Capability string `json:"capability,omitempty"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -3186,6 +3192,13 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		req.Capability = strings.TrimSpace(req.Capability)
+		if req.Capability != "" {
+			if _, ok := s.capabilitySpecFor(req.Capability); !ok {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("unknown capability %q", req.Capability))
+				return
+			}
+		}
 		task := model.Task{
 			ID:          id.New("task"),
 			ActorID:     p.ActorID,
@@ -3198,16 +3211,32 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			Status:      model.TaskQueued,
 			CreatedAt:   time.Now().UTC(),
 		}
-		if err := s.queueTask(task); err != nil {
+		if err := s.queueTaskFor(req.Capability, task); err != nil {
 			if errors.Is(err, errTaskExecutionDisabled) {
 				s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.create", Scope: "task:run", Decision: "deny", Reason: err.Error()})
 				writeTaskExecutionDisabled(w)
 				return
 			}
+			// A declared capability that refuses a target is the operator's own
+			// restriction doing its job, not a server fault: 403 with the node
+			// and the reason, so they can drop it or enrol it.
+			if req.Capability != "" {
+				s.recordPrincipalAudit(p, model.AuditEvent{
+					ID: id.New("audit"), Action: "task.create", Scope: "task:run",
+					Decision: "deny", Reason: err.Error(),
+					Metadata: map[string]string{"capability": req.Capability},
+				})
+				writeError(w, http.StatusForbidden, err)
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.create", Scope: "task:run", Metadata: map[string]string{"task_id": task.ID}})
+		auditMeta := map[string]string{"task_id": task.ID}
+		if req.Capability != "" {
+			auditMeta["capability"] = req.Capability
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.create", Scope: "task:run", Metadata: auditMeta})
 		writeJSON(w, http.StatusOK, s.toTaskView(task))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

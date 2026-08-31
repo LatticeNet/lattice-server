@@ -364,3 +364,51 @@ func TestAnInstalledPluginIsACapability(t *testing.T) {
 		t.Error("an unenforced plugin capability refused a node")
 	}
 }
+
+// A declared capability narrows a free-text task's targets and can never widen
+// them. Nothing can verify that a script "is" a sing-box script, so the
+// declaration is a promise about the operator's own intent: safe to honour as a
+// restriction, worthless as a grant.
+func TestADeclaredCapabilityOnlyNarrowsAFreeTextTask(t *testing.T) {
+	s := capServer(t)
+	if err := s.store.UpsertNode(model.Node{
+		ID: "node-runs-it", Name: "node-runs-it",
+		AgentLaunch: &model.AgentLaunchConfig{SingBoxDiscover: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertNode(model.Node{ID: "node-plain", Name: "node-plain"}); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(id string, targets ...string) model.Task {
+		return model.Task{
+			ID: id, Targets: targets, Interpreter: "sh", Script: "true",
+			Status: model.TaskQueued, CreatedAt: time.Now().UTC(),
+		}
+	}
+
+	// Undeclared: today's behaviour, both targets accepted.
+	if err := s.queueTaskFor("", mk("task_none", "node-runs-it", "node-plain")); err != nil {
+		t.Fatalf("an undeclared task was refused: %v", err)
+	}
+	// Declared: the target that is out of scope refuses the whole task, rather
+	// than the task silently running on a subset the operator did not choose.
+	if err := s.queueTaskFor(capabilitySingBox, mk("task_mixed", "node-runs-it", "node-plain")); err == nil {
+		t.Error("a declared capability let through a target that is out of scope for it")
+	}
+	if err := s.queueTaskFor(capabilitySingBox, mk("task_ok", "node-runs-it")); err != nil {
+		t.Errorf("a declared capability refused a target that is in scope: %v", err)
+	}
+
+	// Declaring a capability cannot grant reach the operator did not have: an
+	// excluded node stays refused however it is declared.
+	if err := s.store.SetNodeCapability(store.NodeCapability{
+		NodeID: "node-runs-it", Capability: capabilitySingBox,
+		State: store.CapabilityExcluded, Reason: "hands off",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.queueTaskFor(capabilitySingBox, mk("task_after", "node-runs-it")); err == nil {
+		t.Error("declaring a capability got past an explicit exclusion")
+	}
+}

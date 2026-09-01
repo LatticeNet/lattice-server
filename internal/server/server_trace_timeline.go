@@ -153,21 +153,26 @@ func (s *Server) coreRestartMarkers(since, until time.Time, nodes []string) []mo
 	return out
 }
 
-// auditMarkers pulls config applies out of the existing audit log. It reads the
-// tail rather than the whole log because AuditEvents copies and sorts the full
-// slice on every call, a known cost documented in the product design.
+// auditMarkers pulls config applies out of the existing audit log. It scans
+// newest-first and stops at the window's lower edge: the previous version
+// called AuditEvents(), which materializes and sorts the ENTIRE log on every
+// request (its own comment claimed "reads the tail" while doing no such
+// thing), and production's audit chain is past a million entries. The cost is
+// now bounded by how far back the window reaches, not by history.
 func (s *Server) auditMarkers(since, until time.Time, visible map[string]bool) []model.TraceMarker {
-	events := s.store.AuditEvents()
 	out := []model.TraceMarker{}
-	for _, ev := range events {
-		if ev.At.Before(since) || ev.At.After(until) {
-			continue
+	_ = s.store.ScanAuditEventsDesc(func(ev model.AuditEvent) bool {
+		if ev.At.After(until) {
+			return true // newer than the window; keep descending
+		}
+		if ev.At.Before(since) {
+			return false // below the window; everything further is older
 		}
 		if !traceConfigApplyActions[ev.Action] {
-			continue
+			return true
 		}
 		if ev.NodeID != "" && !visible[ev.NodeID] {
-			continue
+			return true
 		}
 		detail := ev.Action
 		if ev.Decision != "" {
@@ -181,7 +186,8 @@ func (s *Server) auditMarkers(since, until time.Time, visible map[string]bool) [
 			Detail:        detail,
 			CorrelationID: ev.CorrelationID,
 		})
-	}
+		return true
+	})
 	return out
 }
 

@@ -177,3 +177,43 @@ func TestEnrollTokenCannotJoinAGroupWithoutGroupAdmin(t *testing.T) {
 			res.StatusCode, body.String())
 	}
 }
+
+// TestRerunNodeAuthorizesBeforeMembership pins Finding C of the 2026-09-01
+// multi-operator audit: /api/tasks/rerun-node checked task-target membership
+// (400) before the scope check, so a caller without task:run on a node could
+// tell a foreign task's target set apart from a generic refusal and probe task
+// ids. Authorization now runs first, so a caller lacking the node sees the
+// same refusal whether or not the task targets it.
+func TestRerunNodeAuthorizesBeforeMembership(t *testing.T) {
+	handler, st := newTestServer(t)
+	st.UpsertNode(model.Node{ID: "node-a", Name: "allowed"})
+	st.UpsertNode(model.Node{ID: "node-b", Name: "denied"})
+	if err := st.CreateTask(model.Task{
+		ID: "task-foreign", Targets: []string{"node-b"}, Interpreter: "sh",
+		Script: "echo hi", Status: model.TaskFinished,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	// Token confined to node-a: no scope on node-b, where the task lives.
+	token := createPAT(t, handler, cookies, csrf, []string{"task:run"}, []string{"node-a"})
+
+	// Probe with a node the caller does NOT hold and that the task does NOT
+	// target. Old order: taskTargetContains is false, so 400 "not a target"
+	// fired before any scope check, distinguishing this from an in-target node
+	// (which fell through to 403). New order: the scope check runs first and
+	// refuses with 403 regardless of membership, so the two are indistinguishable.
+	nonTarget := doBearerJSON(t, handler, http.MethodPost, "/api/tasks/rerun-node",
+		`{"id":"task-foreign","node_id":"node-c"}`, token)
+	nonTarget.Body.Close()
+	if nonTarget.StatusCode != http.StatusForbidden {
+		t.Fatalf("an unauthorized non-target node must 403, not leak membership via 400; got %d", nonTarget.StatusCode)
+	}
+	// An in-target but unauthorized node is also 403: same answer, no oracle.
+	inTarget := doBearerJSON(t, handler, http.MethodPost, "/api/tasks/rerun-node",
+		`{"id":"task-foreign","node_id":"node-b"}`, token)
+	inTarget.Body.Close()
+	if inTarget.StatusCode != http.StatusForbidden {
+		t.Fatalf("an unauthorized in-target node must 403, got %d", inTarget.StatusCode)
+	}
+}

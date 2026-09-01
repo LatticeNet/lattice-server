@@ -1,6 +1,8 @@
 package server
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -574,5 +576,44 @@ func TestDeriveReadsExistingRecords(t *testing.T) {
 		if decided {
 			t.Errorf("%s: bare node must be undecided, not denied or allowed", capability)
 		}
+	}
+}
+
+// TestCapabilityPolicyRefusesConfinedPrincipal pins Finding A from the
+// 2026-09-01 multi-operator audit: capability enforcement is fleet-wide and
+// this route carries no node id, so a node-restricted node:admin token would
+// short-circuit past its allowlist and flip a gate for the whole fleet. An
+// unrestricted admin still sets it; a confined one is refused, matching the
+// user-admin and enroll-node confinement rules.
+func TestCapabilityPolicyRefusesConfinedPrincipal(t *testing.T) {
+	s := capServer(t)
+
+	post := func(p principal) int {
+		body := `{"capability":"nft","enforced":true}`
+		r := httptest.NewRequest(http.MethodPost, "/api/capabilities", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		s.handleCapabilityPolicies(w, r, p)
+		return w.Code
+	}
+
+	confined := principal{Principal: rbac.Principal{
+		ActorID: "confined-admin", Scopes: []string{"node:admin"},
+		ServerAllowlist: []string{"node-a"},
+	}}
+	if code := post(confined); code != http.StatusForbidden {
+		t.Fatalf("confined node:admin must be refused, got %d", code)
+	}
+	if s.capabilityEnforced("nft") {
+		t.Fatal("a confined principal flipped a fleet-wide gate")
+	}
+
+	unrestricted := principal{Principal: rbac.Principal{
+		ActorID: "root-admin", Scopes: []string{"node:admin"},
+	}}
+	if code := post(unrestricted); code != http.StatusOK {
+		t.Fatalf("unrestricted admin must set policy, got %d", code)
+	}
+	if !s.capabilityEnforced("nft") {
+		t.Fatal("unrestricted admin's enforcement did not take effect")
 	}
 }

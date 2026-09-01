@@ -676,6 +676,25 @@ func (s *Server) handleCapabilityPolicies(w http.ResponseWriter, r *http.Request
 		if !s.requireScope(w, p, "node:admin") {
 			return
 		}
+		// Capability enforcement is fleet-wide: this route carries no node id,
+		// so withAuth's allowlist check never fires (rbac.Allows skips the
+		// allowlist when nodeID is empty), and a RESTRICTED node:admin token
+		// would otherwise flip a gate for every node including ones outside
+		// its allowlist. There is no node dimension to confine the action to,
+		// so a confined principal is refused outright, the same rule user
+		// administration uses (server_users.go) and the mirror of the
+		// enroll-node guard for the per-node case.
+		if principalHasNodeRestriction(p) {
+			s.recordPrincipalAudit(p, model.AuditEvent{
+				ID:       id.New("audit"),
+				Action:   "capability.policy",
+				Scope:    "node:admin",
+				Decision: "deny",
+				Reason:   "capability enforcement is fleet-wide; a node-restricted token cannot set it",
+			})
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "setting capability enforcement requires an unrestricted server allowlist; it is a fleet-wide policy with no node to confine it to"))
+			return
+		}
 		var req struct {
 			Capability string `json:"capability"`
 			Enforced   bool   `json:"enforced"`

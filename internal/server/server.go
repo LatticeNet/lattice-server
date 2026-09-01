@@ -3218,16 +3218,18 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 				writeTaskExecutionDisabled(w)
 				return
 			}
-			// A declared capability that refuses a target is the operator's own
-			// restriction doing its job, not a server fault: 403 with the node
-			// and the reason, so they can drop it or enrol it.
-			if req.Capability != "" {
+			// A refusal is the operator's own restriction doing its job, not a
+			// server fault: 403 with every refused node and reason, so they can
+			// drop targets or enrol them. Typed, so it also catches refusals
+			// derived from the task's persisted confinement.
+			var refusal *capabilityRefusalError
+			if errors.As(err, &refusal) {
 				s.recordPrincipalAudit(p, model.AuditEvent{
 					ID: id.New("audit"), Action: "task.create", Scope: "task:run",
 					Decision: "deny", Reason: err.Error(),
-					Metadata: map[string]string{"capability": req.Capability},
+					Metadata: map[string]string{"capability": refusal.capability},
 				})
-				writeError(w, http.StatusForbidden, err)
+				writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, err.Error()))
 				return
 			}
 			writeError(w, http.StatusInternalServerError, err)
@@ -3380,6 +3382,16 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 			writeTaskExecutionDisabled(w)
 			return
 		}
+		var refusal *capabilityRefusalError
+		if errors.As(err, &refusal) {
+			s.recordPrincipalAudit(p, model.AuditEvent{
+				ID: id.New("audit"), Action: "task.rerun", Scope: "task:run",
+				Decision: "deny", Reason: err.Error(),
+				Metadata: map[string]string{"rerun_of": src.ID, "capability": refusal.capability},
+			})
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, err.Error()))
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -3480,10 +3492,23 @@ func (s *Server) queueTaskFor(capability string, task model.Task) error {
 			}
 		}
 		if len(refused) > 0 {
-			return errors.New(strings.Join(refused, "; "))
+			return &capabilityRefusalError{capability: capability, refused: refused}
 		}
 	}
 	return s.store.CreateTask(task)
+}
+
+// capabilityRefusalError is a typed refusal so every dispatch path can answer
+// 403 with the full node list instead of collapsing into a generic 500. The
+// admission gate saying no is the operator's own restriction doing its job,
+// never a server fault.
+type capabilityRefusalError struct {
+	capability string
+	refused    []string
+}
+
+func (e *capabilityRefusalError) Error() string {
+	return strings.Join(e.refused, "; ")
 }
 
 func writeTaskExecutionDisabled(w http.ResponseWriter) {

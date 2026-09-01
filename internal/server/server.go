@@ -3331,13 +3331,22 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 	rerunOfNode := ""
 	if strings.TrimSpace(req.NodeID) != "" {
 		rerunOfNode = strings.TrimSpace(req.NodeID)
+		// Authorize on the requested node BEFORE testing membership. The old
+		// order returned 400 "not a target" ahead of the scope check, so a
+		// caller without task:run on that node could tell a foreign task's
+		// target set (400) apart from a generic refusal (403) and probe task
+		// ids. Authorizing first makes the 400 reachable only by a caller who
+		// already holds the node, matching the check-first order that cancel
+		// and delete use.
+		if !s.requireAllNodeScopes(w, p, "task:run", []string{rerunOfNode}) {
+			return
+		}
 		if !taskTargetContains(src.Targets, rerunOfNode) {
 			writeError(w, http.StatusBadRequest, errors.New("node_id is not a target of the source task"))
 			return
 		}
 		targets = []string{rerunOfNode}
-	}
-	if !s.requireAllNodeScopes(w, p, "task:run", targets) {
+	} else if !s.requireAllNodeScopes(w, p, "task:run", targets) {
 		return
 	}
 	if s.store.TaskUsesLineChainProtocol(src.ID) {

@@ -250,3 +250,43 @@ func TestVLESSRealityLinksRejectUnsafePublicSubscriptionInputs(t *testing.T) {
 		t.Fatalf("missing public key error = %v", err)
 	}
 }
+
+func TestVLESSRealityLinksOmitDownNodesAndKeepUnknown(t *testing.T) {
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	profile := baseProfile()
+	profile.AppliedSHA256 = strings.Repeat("a", 64)
+	user := baseUser("alice", "Alice", "11111111-1111-4111-8111-111111111111", now.Add(-time.Hour))
+	profiles := []SubscriptionProfile{{Profile: profile, NodeName: "Node A"}}
+	inbounds := []model.ProxyInbound{baseInbound()}
+
+	// design-19: a positively down node vanishes from the render, with the
+	// reason in the warnings so the operator can see why.
+	links, warnings, err := VLESSRealityLinks(user, profiles, inbounds, SubscriptionOptions{
+		Now:               now,
+		NodeServiceStates: map[string]string{profile.NodeID: "down"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(links) != 0 {
+		t.Fatalf("down node must not render: %v", links)
+	}
+	joined := strings.Join(warnings, "\n")
+	if !strings.Contains(joined, "service is down") {
+		t.Fatalf("omission must be explained: %v", warnings)
+	}
+
+	// Unknown and restarting fail open: a probe outage is not a fleet outage.
+	for _, state := range []string{"unknown", "restarting", ""} {
+		links, _, err := VLESSRealityLinks(user, profiles, inbounds, SubscriptionOptions{
+			Now:               now,
+			NodeServiceStates: map[string]string{profile.NodeID: state},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(links) != 1 {
+			t.Fatalf("state %q must keep serving, got %d links", state, len(links))
+		}
+	}
+}

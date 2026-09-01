@@ -10,7 +10,10 @@ import (
 	"strings"
 	"testing"
 
+	"time"
+
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -1269,5 +1272,43 @@ func TestLoginRateLimited(t *testing.T) {
 	}
 	if !limited {
 		t.Fatal("expected login to be rate limited after repeated attempts")
+	}
+}
+
+// TestAgentAuthUnknownNodeCostsLikeAWrongToken pins the equal-cost refusal on
+// the node-auth path: an unknown node id must burn comparable key-derivation
+// work to a known id with a wrong token, or response timing enumerates the
+// fleet's node ids. The 4x margin absorbs CI jitter; without the dummy the
+// unknown path is thousands of times faster, so the assertion cannot flap.
+func TestAgentAuthUnknownNodeCostsLikeAWrongToken(t *testing.T) {
+	handler, st := newTestServer(t)
+	hash, err := auth.HashSecret("correct-node-token-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNode(model.Node{ID: "node-known", Name: "known", TokenHash: hash}); err != nil {
+		t.Fatal(err)
+	}
+
+	timeAuth := func(nodeID string) time.Duration {
+		req := httptest.NewRequest(http.MethodPost, "/api/agent/metrics", strings.NewReader(`{"node_id":"`+nodeID+`"}`))
+		req.Header.Set("Authorization", "Bearer wrong-token-guess")
+		req.Header.Set("Content-Type", "application/json")
+		start := time.Now()
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("auth with wrong token must 401, got %d", rec.Code)
+		}
+		return time.Since(start)
+	}
+
+	// Warm both paths once (dummy hash init, caches), then measure.
+	timeAuth("node-known")
+	timeAuth("node-does-not-exist")
+	known := timeAuth("node-known")
+	unknown := timeAuth("node-does-not-exist")
+	if unknown*4 < known {
+		t.Fatalf("unknown-node auth answered too fast: unknown=%v known=%v", unknown, known)
 	}
 }

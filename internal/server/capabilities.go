@@ -130,6 +130,60 @@ func deriveNetGuard(s *Server, nodeID string) (bool, bool) {
 	return binding.Managed, true
 }
 
+// deriveNetPolicy: a node with its own network policy record has been
+// adopted into policy management; that record is the enrolment.
+func deriveNetPolicy(s *Server, nodeID string) (bool, bool) {
+	if _, ok := s.store.NetPolicy(nodeID); !ok {
+		return false, false
+	}
+	return true, true
+}
+
+// deriveWireGuard reads mesh membership off the node record itself: a node
+// that was given a WireGuard identity is in the mesh, one without never
+// joined. Both facts are decisions an operator already made.
+func deriveWireGuard(s *Server, nodeID string) (bool, bool) {
+	node, ok := s.store.Node(nodeID)
+	if !ok {
+		return false, false
+	}
+	if strings.TrimSpace(node.WireGuardPublicKey) == "" && strings.TrimSpace(node.WireGuardIP) == "" {
+		// No identity was ever assigned: nobody decided anything about this
+		// node and the mesh, which is the undecided default, not a denial.
+		return false, false
+	}
+	return true, true
+}
+
+// deriveSelfDNS: a node carrying at least one DNS deployment record is one
+// the operator deployed a resolver onto.
+func deriveSelfDNS(s *Server, nodeID string) (bool, bool) {
+	if len(s.store.DNSDeploymentsForNode(nodeID)) == 0 {
+		return false, false
+	}
+	return true, true
+}
+
+// deriveProxyCore: the per-node proxy profile is the adoption record for
+// proxy-core management.
+func deriveProxyCore(s *Server, nodeID string) (bool, bool) {
+	if _, ok := s.store.ProxyNodeProfile(nodeID); !ok {
+		return false, false
+	}
+	return true, true
+}
+
+// deriveCFTunnel: any tunnel profile bound to this node means the operator
+// put a tunnel here.
+func deriveCFTunnel(s *Server, nodeID string) (bool, bool) {
+	for _, tunnel := range s.store.Tunnels() {
+		if tunnel.NodeID == nodeID {
+			return true, true
+		}
+	}
+	return false, false
+}
+
 // capabilitySpecs is keyed by the approval Plugin value, except where one
 // plugin spans both a read and a write surface and therefore needs two entries
 // (sing-box discovery is a read; sing-box apply changes the machine).
@@ -152,28 +206,30 @@ var capabilitySpecs = map[string]capabilitySpec{
 	sshGuardPlugin:    {Mutates: true},
 	capabilitySingBox: {Mutates: true, Derive: deriveSingBox},
 
-	// Declared, not yet enforced. Each of these already has a per-node record
-	// of its own; turning one on means teaching resolveNodeCapability to read
-	// that record, then flipping Enforced. Until then they behave exactly as
-	// they do today.
+	// Declared and derivable, not yet enforced. Each reads the per-node
+	// record its domain already keeps (policy row, mesh identity, DNS
+	// deployment, proxy profile, tunnel binding), so flipping Enforced
+	// refuses only nodes with neither a record nor an explicit enrolment,
+	// instead of the whole fleet. Until an operator flips a gate they behave
+	// exactly as they do today.
 	"nft":              {Mutates: true, Derive: deriveNetGuard},
-	"nftpolicy":        {Mutates: true},
-	"wireguard":        {Mutates: true},
-	"selfdns":          {Mutates: true},
+	"nftpolicy":        {Mutates: true, Derive: deriveNetPolicy},
+	"wireguard":        {Mutates: true, Derive: deriveWireGuard},
+	"selfdns":          {Mutates: true, Derive: deriveSelfDNS},
 	"agentupdate":      {Mutates: true, Derive: deriveAgentUpdate},
-	"proxycore":        {Mutates: true},
-	"cftunnel":         {Mutates: true},
+	"proxycore":        {Mutates: true, Derive: deriveProxyCore},
+	"cftunnel":         {Mutates: true, Derive: deriveCFTunnel},
 	"acme-dns":         {Mutates: true},
-	"singbox-linemeta": {Mutates: true},
+	"singbox-linemeta": {Mutates: true, Derive: deriveSingBox},
 	// The three core-backed line surfaces below mint approvals with these ids
 	// but were never declared, and capabilitySpecFor's undeclared-means-allowed
 	// fallback made them permanently ungateable. Declared with no Derive:
 	// behavior is unchanged until an operator enforces them, but they now
 	// exist to the console and to policy. singbox-managedline is the bulk
 	// fan-out path, the most fleet-shaped of the three.
-	"singbox-lineuser":    {Mutates: true},
-	"singbox-managedline": {Mutates: true},
-	"singbox-linechain":   {Mutates: true},
+	"singbox-lineuser":    {Mutates: true, Derive: deriveSingBox},
+	"singbox-managedline": {Mutates: true, Derive: deriveSingBox},
+	"singbox-linechain":   {Mutates: true, Derive: deriveSingBox},
 	"singbox:discover":    {Mutates: false, Derive: deriveSingBox},
 	"terminal":            {Mutates: true, Derive: deriveTerminal},
 	"metrics":             {Mutates: false},

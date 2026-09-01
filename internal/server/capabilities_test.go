@@ -522,3 +522,57 @@ func TestRerunReanswersAdmission(t *testing.T) {
 		}
 	}
 }
+
+// TestDeriveCoversEveryMutatingCapability pins the usability rule from the
+// gate audit: every mutating capability must derive from an existing per-node
+// record, or flipping Enforced refuses the entire fleet on the first request.
+// acme-dns is the sole allowed exception until its producer exists anywhere.
+func TestDeriveCoversEveryMutatingCapability(t *testing.T) {
+	for id, spec := range capabilitySpecs {
+		// acme-dns has no producer anywhere in this repo yet; sshguard is
+		// explicitly-enrolled by design (admission design 2026-08-31: the
+		// operator fills its registry from the survey), so an implicit
+		// derive would defeat the decision that capability exists to record.
+		if !spec.Mutates || id == "acme-dns" || id == sshGuardPlugin {
+			continue
+		}
+		if spec.Derive == nil {
+			t.Errorf("mutating capability %q has no Derive: enforcement would refuse the whole fleet", id)
+		}
+	}
+}
+
+// TestDeriveReadsExistingRecords exercises each new Derive against its
+// source record: absent record means undecided, present record enrols.
+func TestDeriveReadsExistingRecords(t *testing.T) {
+	s := capServer(t)
+	if err := s.store.UpsertNode(model.Node{ID: "node-w", WireGuardIP: "10.0.0.7"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertNode(model.Node{ID: "node-bare"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertNetPolicy(model.NetPolicy{ID: "np-1", TargetNodeID: "node-w"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertDNSDeployment(model.DNSDeployment{ID: "dns-1", NodeID: "node-w"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertProxyNodeProfile(model.ProxyNodeProfile{NodeID: "node-w"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertTunnel(model.TunnelProfile{ID: "tun-1", NodeID: "node-w", TunnelID: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	cases := []string{"nftpolicy", "wireguard", "selfdns", "proxycore", "cftunnel"}
+	for _, capability := range cases {
+		allowed, decided := capabilitySpecs[capability].Derive(s, "node-w")
+		if !decided || !allowed {
+			t.Errorf("%s: enrolled node must derive allowed, got allowed=%v decided=%v", capability, allowed, decided)
+		}
+		_, decided = capabilitySpecs[capability].Derive(s, "node-bare")
+		if decided {
+			t.Errorf("%s: bare node must be undecided, not denied or allowed", capability)
+		}
+	}
+}

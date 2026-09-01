@@ -3565,7 +3565,7 @@ func taskViewTargetsNode(view taskView, nodeID string) bool {
 
 func taskResultQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"task_id", "node_id", "limit", "offset"} {
+	for _, key := range []string{"task_id", "node_id", "limit", "offset", "omit_output"} {
 		if _, ok := q[key]; ok {
 			return true
 		}
@@ -3602,6 +3602,10 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// omit_output strips stdout/stderr bodies from every row and reports their
+	// sizes instead. It exists for pollers: a status subscription needs exit
+	// codes and timing, not megabytes of probe output on every tick.
+	omitOutput := q.Get("omit_output") == "1" || q.Get("omit_output") == "true"
 	taskID := strings.TrimSpace(q.Get("task_id"))
 	nodeID := strings.TrimSpace(q.Get("node_id"))
 	filtered := make([]taskResultView, 0, len(visible))
@@ -3615,6 +3619,12 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		filtered = append(filtered, view)
 	}
 	total := len(filtered)
+	if omitOutput && strings.TrimSpace(q.Get("limit")) == "" {
+		// Bodyless rows are light enough to return in full; forcing the
+		// default page size here would silently hide older rollups from the
+		// screens this mode was built for. An explicit limit still wins.
+		limit = total
+	}
 	if offset > total {
 		filtered = nil
 	} else {
@@ -3622,6 +3632,14 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 	}
 	if len(filtered) > limit {
 		filtered = filtered[:limit]
+	}
+	if omitOutput {
+		for i := range filtered {
+			filtered[i].StdoutBytes = len(filtered[i].Stdout)
+			filtered[i].StderrBytes = len(filtered[i].Stderr)
+			filtered[i].Stdout = ""
+			filtered[i].Stderr = ""
+		}
 	}
 	writeJSON(w, http.StatusOK, taskResultsQueryResponse{Results: filtered, Total: total, Limit: limit, Offset: offset})
 }
@@ -3676,14 +3694,18 @@ type taskExecContextView struct {
 }
 
 type taskResultView struct {
-	TaskID     string    `json:"task_id"`
-	NodeID     string    `json:"node_id"`
-	ExitCode   int       `json:"exit_code"`
-	Stdout     string    `json:"stdout"`
-	Stderr     string    `json:"stderr"`
-	Error      string    `json:"error"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at"`
+	TaskID   string `json:"task_id"`
+	NodeID   string `json:"node_id"`
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+	// Set only on omit_output rows: the size of the body that was not sent,
+	// so a list can still say "12 KB of output" without carrying it.
+	StdoutBytes int       `json:"stdout_bytes,omitempty"`
+	StderrBytes int       `json:"stderr_bytes,omitempty"`
+	Error       string    `json:"error"`
+	StartedAt   time.Time `json:"started_at"`
+	FinishedAt  time.Time `json:"finished_at"`
 
 	ExecContext *taskExecContextView `json:"exec_context,omitempty"`
 }

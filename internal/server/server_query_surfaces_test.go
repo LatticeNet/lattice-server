@@ -33,6 +33,46 @@ func seedTaskAndResults(t *testing.T, st interface {
 	}
 }
 
+func TestTaskViewReportsStalledLease(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, _ := loginSession(t, handler)
+
+	dead := time.Now().Add(-2 * time.Hour)
+	if err := st.CreateTask(model.Task{
+		ID: "task-stalled", Targets: []string{"node-a"}, Interpreter: "sh",
+		Script: "echo hi", Status: model.TaskLeased, TimeoutSec: 60,
+		TargetLeases: map[string]model.TaskLease{"node-a": {LeaseID: "l1", StartedAt: dead}},
+		CreatedAt:    dead,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(model.Task{
+		ID: "task-running", Targets: []string{"node-a"}, Interpreter: "sh",
+		Script: "echo hi", Status: model.TaskLeased, TimeoutSec: 3600,
+		TargetLeases: map[string]model.TaskLease{"node-a": {LeaseID: "l2", StartedAt: time.Now()}},
+		CreatedAt:    time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	res := doJSON(t, handler, http.MethodGet, "/api/tasks", "", cookies, "")
+	defer res.Body.Close()
+	var tasks []taskView
+	if err := json.NewDecoder(res.Body).Decode(&tasks); err != nil {
+		t.Fatalf("tasks list: %v", err)
+	}
+	byID := map[string]string{}
+	for _, v := range tasks {
+		byID[v.ID] = v.Status
+	}
+	if byID["task-stalled"] != "stalled" {
+		t.Fatalf("dead-leased task status = %q want stalled", byID["task-stalled"])
+	}
+	if byID["task-running"] != "leased" {
+		t.Fatalf("live-leased task status = %q want leased", byID["task-running"])
+	}
+}
+
 func TestTaskResultsBareModeStaysArrayQueryModeEnvelopes(t *testing.T) {
 	handler, st := newTestServer(t)
 	seedTaskAndResults(t, st)

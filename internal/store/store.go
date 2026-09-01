@@ -2194,13 +2194,17 @@ func taskLeaseMatches(task model.Task, nodeID, leaseID string) bool {
 const taskLeaseSafetyMargin = 5 * time.Minute
 
 func taskLeaseExpired(startedAt time.Time, timeoutSec int) bool {
+	return taskLeaseExpiredAt(startedAt, timeoutSec, time.Now())
+}
+
+func taskLeaseExpiredAt(startedAt time.Time, timeoutSec int, now time.Time) bool {
 	if startedAt.IsZero() {
 		return false
 	}
 	if timeoutSec <= 0 {
 		timeoutSec = 900
 	}
-	return time.Since(startedAt) > time.Duration(timeoutSec)*time.Second+taskLeaseSafetyMargin
+	return now.Sub(startedAt) > time.Duration(timeoutSec)*time.Second+taskLeaseSafetyMargin
 }
 
 // taskCanLeaseTarget gates a FRESH lease, where taskTargetAwaitingResult gates
@@ -2252,6 +2256,51 @@ func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult,
 // coordinated two-repo release and a change to a contract others read. The
 // string is what goes over the wire either way. Move it when the SDK next ships.
 const TaskExpired = "expired"
+
+// TaskStalled marks a leased task that has stopped making progress: at least
+// one target still owes a result and no resultless target holds a live lease,
+// so nothing is running and nothing has answered. Saying "leased" there reads
+// as "Running" on the console, which is a lie the operator waits on for days.
+// Like TaskExpired it is a view-level status (derived, never persisted) and
+// lives here rather than in the SDK for the same release-coordination reason.
+const TaskStalled = "stalled"
+
+// TaskProgressStalled reports whether this leased task has stopped making
+// progress (see TaskStalled). A lease whose StartedAt is zero counts as not
+// live here: for re-execution safety taskLeaseExpired treats it as never
+// expiring, but as evidence of progress it proves nothing, and this method
+// answers the honesty question, not the redelivery one.
+func (s *Store) TaskProgressStalled(id string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.state.Tasks[id]
+	if !ok || t.Status != model.TaskLeased {
+		return false
+	}
+	answered := map[string]bool{}
+	for _, r := range s.state.Results {
+		if r.TaskID == t.ID {
+			answered[r.NodeID] = true
+		}
+	}
+	leaseLive := func(startedAt time.Time) bool {
+		return !startedAt.IsZero() && !taskLeaseExpiredAt(startedAt, t.TimeoutSec, now)
+	}
+	owing := false
+	for _, target := range uniqueStrings(t.Targets) {
+		if answered[target] {
+			continue
+		}
+		owing = true
+		if lease, ok := t.TargetLeases[target]; ok && lease.LeaseID != "" && leaseLive(lease.StartedAt) {
+			return false
+		}
+		if t.LeasedBy == target && t.LeaseID != "" && leaseLive(t.StartedAt) {
+			return false
+		}
+	}
+	return owing
+}
 
 // taskTargetAwaitingResult reports whether this node still owes a result.
 //
@@ -2438,11 +2487,15 @@ var (
 	ErrTaskTransitionConflict = errors.New("task approval transition conflict")
 )
 
-// CancelTask marks a queued task as cancelled so agents will not lease it. A
-// task that is already leased is running on the agent and cannot be reliably
-// stopped from the server, so this refuses it with ErrTaskNotCancelable. The
-// check and the mutation happen under one lock, so concurrent lease/cancel
-// cannot race.
+// CancelTask marks a queued or leased task as cancelled. For a queued task
+// that withdraws delivery. For a leased task it means "stop waiting": the
+// server stops offering redelivery and the lease gate refuses any late
+// result, while whatever already started on a node runs to completion there;
+// cancelling cannot reach into the machine, and does not pretend to. Without
+// this, a task whose result was lost (or whose target died) was stuck
+// "Running" with no operator way out. Terminal tasks stay refused with
+// ErrTaskNotCancelable. The check and the mutation happen under one lock, so
+// concurrent lease/cancel cannot race.
 func (s *Store) CancelTask(id string) (model.Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2453,7 +2506,7 @@ func (s *Store) CancelTask(id string) (model.Task, error) {
 	if s.lineChainTaskLocked(t) {
 		return model.Task{}, ErrTaskDurableProtected
 	}
-	if t.Status != model.TaskQueued {
+	if t.Status != model.TaskQueued && t.Status != model.TaskLeased {
 		return model.Task{}, ErrTaskNotCancelable
 	}
 	t.Status = model.TaskCancelled

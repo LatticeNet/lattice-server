@@ -316,8 +316,9 @@ func TestGuardPlanInvalidatesOnMetricsAndNFTCompileInputChanges(t *testing.T) {
 	})
 }
 
-// TestCancelTask verifies only queued tasks are cancelable and the sentinel
-// errors are returned for leased and missing tasks.
+// TestCancelTask verifies queued and leased tasks are cancelable ("stop
+// waiting" is an operator right), terminal tasks return the sentinel, and a
+// missing id is distinguished.
 func TestCancelTask(t *testing.T) {
 	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
 	if err != nil {
@@ -329,23 +330,75 @@ func TestCancelTask(t *testing.T) {
 	if err := s.CreateTask(model.Task{ID: "task-l", Targets: []string{"n1"}, Status: model.TaskLeased}); err != nil {
 		t.Fatalf("create leased: %v", err)
 	}
-
-	got, err := s.CancelTask("task-q")
-	if err != nil {
-		t.Fatalf("cancel queued: %v", err)
-	}
-	if got.Status != model.TaskCancelled {
-		t.Fatalf("status = %q want cancelled", got.Status)
-	}
-	if got.FinishedAt.IsZero() {
-		t.Fatalf("FinishedAt not stamped on cancel")
+	if err := s.CreateTask(model.Task{ID: "task-f", Targets: []string{"n1"}, Status: model.TaskFinished}); err != nil {
+		t.Fatalf("create finished: %v", err)
 	}
 
-	if _, err := s.CancelTask("task-l"); !errors.Is(err, ErrTaskNotCancelable) {
-		t.Fatalf("cancel leased err = %v want ErrTaskNotCancelable", err)
+	for _, id := range []string{"task-q", "task-l"} {
+		got, err := s.CancelTask(id)
+		if err != nil {
+			t.Fatalf("cancel %s: %v", id, err)
+		}
+		if got.Status != model.TaskCancelled {
+			t.Fatalf("%s status = %q want cancelled", id, got.Status)
+		}
+		if got.FinishedAt.IsZero() {
+			t.Fatalf("%s FinishedAt not stamped on cancel", id)
+		}
+	}
+
+	if _, err := s.CancelTask("task-f"); !errors.Is(err, ErrTaskNotCancelable) {
+		t.Fatalf("cancel finished err = %v want ErrTaskNotCancelable", err)
 	}
 	if _, err := s.CancelTask("missing"); !errors.Is(err, ErrTaskNotFound) {
 		t.Fatalf("cancel missing err = %v want ErrTaskNotFound", err)
+	}
+}
+
+// TestTaskProgressStalled pins the honesty rule: a leased task is stalled
+// exactly when some target still owes a result and no resultless target holds
+// a live lease. Zero-start leases count as not live: they never expire for
+// redelivery safety, but they prove nothing is running.
+func TestTaskProgressStalled(t *testing.T) {
+	s, err := OpenWithCipher(filepath.Join(t.TempDir(), "state.json"), testCipher(t))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	now := time.Now().UTC()
+	live := now.Add(-time.Minute)
+	dead := now.Add(-2 * time.Hour)
+
+	create := func(id string, task model.Task) {
+		task.ID = id
+		if err := s.CreateTask(task); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+	}
+	create("live", model.Task{Targets: []string{"n1"}, Status: model.TaskLeased, TimeoutSec: 60,
+		TargetLeases: map[string]model.TaskLease{"n1": {LeaseID: "l1", StartedAt: live}}})
+	create("dead", model.Task{Targets: []string{"n1"}, Status: model.TaskLeased, TimeoutSec: 60,
+		TargetLeases: map[string]model.TaskLease{"n1": {LeaseID: "l1", StartedAt: dead}}})
+	create("zero", model.Task{Targets: []string{"n1"}, Status: model.TaskLeased, TimeoutSec: 60,
+		TargetLeases: map[string]model.TaskLease{"n1": {LeaseID: "l1"}}})
+	create("mixed", model.Task{Targets: []string{"n1", "n2"}, Status: model.TaskLeased, TimeoutSec: 60,
+		TargetLeases: map[string]model.TaskLease{"n1": {LeaseID: "l1", StartedAt: dead}}})
+	if err := s.AddTaskResult(model.TaskResult{TaskID: "mixed", NodeID: "n2", FinishedAt: now}); err != nil {
+		t.Fatalf("add result: %v", err)
+	}
+	create("queued", model.Task{Targets: []string{"n1"}, Status: model.TaskQueued})
+
+	cases := map[string]bool{
+		"live":    false, // something is genuinely running
+		"dead":    true,  // lease expired, nothing answered
+		"zero":    true,  // legacy lease proves nothing
+		"mixed":   true,  // sibling answered, the dead one still owes
+		"queued":  false, // not leased at all
+		"missing": false,
+	}
+	for id, want := range cases {
+		if got := s.TaskProgressStalled(id, now); got != want {
+			t.Fatalf("TaskProgressStalled(%s) = %v want %v", id, got, want)
+		}
 	}
 }
 

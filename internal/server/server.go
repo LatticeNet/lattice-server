@@ -3243,8 +3243,9 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 	}
 }
 
-// handleCancelTask cancels a queued task so it is never leased. Leased/finished
-// tasks are rejected (a leased task is already running on the agent).
+// handleCancelTask cancels a queued or leased task. For a queued task that
+// withdraws delivery; for a leased one it stops the wait (the lease gate
+// refuses any late result). Terminal tasks are rejected.
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -3501,6 +3502,11 @@ func (s *Server) toTaskView(t model.Task) taskView {
 	if (status == model.TaskQueued || status == model.TaskLeased) &&
 		store.TaskPastQueueDeadline(t, s.now(), s.store.TaskQueueDeadline()) {
 		status = store.TaskExpired
+	}
+	// A leased task with no live lease on any resultless target is not
+	// running anywhere; "Running" would be a lie the operator waits on.
+	if status == model.TaskLeased && s.store.TaskProgressStalled(t.ID, s.now()) {
+		status = store.TaskStalled
 	}
 	return taskView{
 		ID:              t.ID,

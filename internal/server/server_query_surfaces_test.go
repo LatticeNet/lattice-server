@@ -87,6 +87,58 @@ func TestTaskResultsBareModeStaysArrayQueryModeEnvelopes(t *testing.T) {
 	}
 }
 
+func TestTaskResultsOmitOutputStripsBodiesAndReturnsAll(t *testing.T) {
+	handler, st := newTestServer(t)
+	seedTaskAndResults(t, st)
+	cookies, _ := loginSession(t, handler)
+
+	// omit_output alone: enveloped, every visible row, bodies stripped, sizes kept.
+	res := doJSON(t, handler, http.MethodGet, "/api/task-results?omit_output=1", "", cookies, "")
+	defer res.Body.Close()
+	var env taskResultsQueryResponse
+	if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
+		t.Fatalf("omit_output must be enveloped: %v", err)
+	}
+	if env.Total != 4 || len(env.Results) != 4 {
+		t.Fatalf("omit_output without limit must return every row: total=%d len=%d", env.Total, len(env.Results))
+	}
+	for _, r := range env.Results {
+		if r.Stdout != "" || r.Stderr != "" {
+			t.Fatalf("omit_output leaked a body: %+v", r)
+		}
+		if r.StdoutBytes == 0 {
+			t.Fatalf("omit_output must report the withheld size: %+v", r)
+		}
+	}
+
+	// An explicit limit still paginates bodyless rows.
+	page := doJSON(t, handler, http.MethodGet, "/api/task-results?omit_output=1&limit=1", "", cookies, "")
+	defer page.Body.Close()
+	var penv taskResultsQueryResponse
+	if err := json.NewDecoder(page.Body).Decode(&penv); err != nil {
+		t.Fatal(err)
+	}
+	if penv.Total != 4 || len(penv.Results) != 1 || penv.Limit != 1 {
+		t.Fatalf("omit_output with limit wrong: %+v", penv)
+	}
+
+	// Plain query mode keeps its bodies: stripping is opt-in.
+	full := doJSON(t, handler, http.MethodGet, "/api/task-results?task_id=task-a", "", cookies, "")
+	defer full.Body.Close()
+	var fenv taskResultsQueryResponse
+	if err := json.NewDecoder(full.Body).Decode(&fenv); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range fenv.Results {
+		if r.Stdout == "" {
+			t.Fatalf("plain query mode must keep bodies: %+v", r)
+		}
+		if r.StdoutBytes != 0 {
+			t.Fatalf("byte counts belong to omit_output rows only: %+v", r)
+		}
+	}
+}
+
 func TestTasksQueryModeFiltersAndPaginates(t *testing.T) {
 	handler, st := newTestServer(t)
 	seedTaskAndResults(t, st)

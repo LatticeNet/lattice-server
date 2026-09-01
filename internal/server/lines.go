@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -59,14 +60,21 @@ type Line struct {
 	// overlay) carries the definition's state. The join is by line_hash_id —
 	// the compiler pre-computes the hash discovery will assign, so a
 	// rediscovered applied line lands on its definition exactly.
-	Overlay       bool              `json:"overlay,omitempty"`
-	OverlayStatus string            `json:"overlay_status,omitempty"` // planned | applied | failed
-	OverlayUser   string            `json:"overlay_user,omitempty"`
-	UserCount     int               `json:"user_count"`
-	UserKnown     bool              `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
-	Status        string            `json:"status,omitempty"` // ok | pending | error | stale
-	LastError     string            `json:"last_error,omitempty"`
-	Metadata      map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
+	Overlay       bool   `json:"overlay,omitempty"`
+	OverlayStatus string `json:"overlay_status,omitempty"` // planned | applied | failed
+	OverlayUser   string `json:"overlay_user,omitempty"`
+	UserCount     int    `json:"user_count"`
+	UserKnown     bool   `json:"user_known"`       // false ⇒ discovered line, count not yet inspected
+	Status        string `json:"status,omitempty"` // ok | pending | error | stale
+	LastError     string `json:"last_error,omitempty"`
+	// design-19: what the service is doing, as opposed to what the config
+	// says. Status above answers "does the configuration check out";
+	// ServiceState answers "is anything actually running and holding this
+	// line's port". They must never be merged back into one field: their
+	// disagreement is exactly the incident signal.
+	ServiceState     string            `json:"service_state,omitempty"` // running | down | restarting | unknown
+	ServiceCheckedAt time.Time         `json:"service_checked_at,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
 }
 
 // LineGroup is the set of lines on one node — the unit the dashboard renders.
@@ -253,6 +261,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Status:           status,
 				LastError:        prof.LastError,
 			}
+			ln.ServiceState, ln.ServiceCheckedAt = s.singBoxServiceState(prof.NodeID)
 			ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, outbound)
 			ln.ID = ln.LineHashID
 			byNode[ln.NodeID] = append(byNode[ln.NodeID], ln)
@@ -265,6 +274,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// user_count from runtime config inspection; older agents leave them empty
 	// and UserKnown=false.
 	for _, inv := range s.liveSingBoxInventories(s.now()) {
+		nodeSvcState, nodeSvcAt := s.singBoxServiceState(inv.NodeID)
 		for _, n := range inv.Nodes {
 			port, _ := strconv.Atoi(strings.TrimSpace(n.Port))
 			if managedKey[managedDedupKey(inv.NodeID, n.Protocol, port)] {
@@ -305,6 +315,8 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Status:             status,
 				LastError:          lastErr,
 				Metadata:           n.Metadata,
+				ServiceState:       refineLineServiceState(nodeSvcState, n.PortBound),
+				ServiceCheckedAt:   nodeSvcAt,
 			}
 			ln.LineHashID = uuidResolver.resolve(ln.NodeID, ln.LineID, ln.LineUUID, func() string {
 				return lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)

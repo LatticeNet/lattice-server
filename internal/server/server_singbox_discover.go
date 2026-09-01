@@ -69,6 +69,10 @@ func (s *Server) handleAgentSingBoxInventory(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// design-19: the liveness half of the report is derived, persisted, and
+	// debounce-notified separately from the volatile inventory mirror.
+	s.noteSingBoxLiveness(req.NodeID, inv.Runtime)
+
 	// design-15 D2: a changed line set queues a sidecar sync (pending approval —
 	// discovery still never mutates the node by itself).
 	s.maybeQueueLineMetaSyncOnDiscovery(req.NodeID, inv)

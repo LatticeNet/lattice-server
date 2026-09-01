@@ -33,6 +33,11 @@ type SubscriptionProfile struct {
 
 type SubscriptionOptions struct {
 	Now time.Time
+	// NodeServiceStates carries the design-19 liveness verdict per node id.
+	// Only "down" excludes a profile; unknown and restarting serve as before,
+	// because a probe outage must never empty a subscription and a flapping
+	// service must not churn the rendered set.
+	NodeServiceStates map[string]string
 }
 
 // VLESSRealityEndpoint is a validated, secret-free client subscription endpoint
@@ -167,6 +172,12 @@ func VLESSRealityEndpoints(user model.ProxyUser, profiles []SubscriptionProfile,
 		}
 		if profile.LastError != "" {
 			warnings = append(warnings, fmt.Sprintf("profile %s omitted: last apply error is not clear", profile.NodeID))
+			continue
+		}
+		if opts.NodeServiceStates[profile.NodeID] == "down" {
+			// design-19: an applied config on a dead service is exactly the
+			// state that once served a six-day-dead endpoint to every client.
+			warnings = append(warnings, fmt.Sprintf("profile %s omitted: sing-box service is down", profile.NodeID))
 			continue
 		}
 		host := strings.TrimSpace(profile.Hostname)

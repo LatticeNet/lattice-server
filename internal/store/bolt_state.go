@@ -63,6 +63,7 @@ var (
 	boltBucketMachineVendors  = []byte("machine_vendors")
 	boltBucketNFTInputs       = []byte("nft_inputs")
 	boltBucketGuardReality    = []byte("guard_reality_snapshots")
+	boltBucketSingBoxLiveness = []byte("singbox_liveness")
 	boltBucketDNSDeployments  = []byte("dns_deployments")
 	boltBucketNetPolicies     = []byte("net_policies")
 	boltBucketGroups          = []byte("groups")
@@ -131,6 +132,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketMachineVendors,
 	boltBucketNFTInputs,
 	boltBucketGuardReality,
+	boltBucketSingBoxLiveness,
 	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
 	boltBucketGroups,
@@ -441,6 +443,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putMap(tx, boltBucketNFTInputs, persist.NFTInputs); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketSingBoxLiveness, persist.SingBoxLiveness); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketGuardReality, persist.GuardRealitySnapshots); err != nil {
 			return err
 		}
@@ -669,6 +674,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		if err := readMap(tx, boltBucketNFTInputs, st.NFTInputs); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketSingBoxLiveness, st.SingBoxLiveness); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketGuardReality, st.GuardRealitySnapshots); err != nil {

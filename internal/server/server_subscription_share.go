@@ -552,7 +552,7 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		if !ok {
 			return renderedSubscription{}, errors.New("share source user not found")
 		}
-		endpoints, _, err := proxycore.VLESSRealityEndpoints(user, s.proxySubscriptionProfiles(), s.store.ProxyInbounds(), proxycore.SubscriptionOptions{Now: s.now()})
+		endpoints, _, err := proxycore.VLESSRealityEndpoints(user, s.proxySubscriptionProfiles(), s.store.ProxyInbounds(), proxycore.SubscriptionOptions{Now: s.now(), NodeServiceStates: s.singBoxDownNodes()})
 		if err != nil {
 			return renderedSubscription{}, err
 		}

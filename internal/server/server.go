@@ -7997,15 +7997,24 @@ func (s *Server) authenticateNode(r *http.Request, nodeID, token string) (model.
 	}
 	n, ok := s.store.Node(nodeID)
 	if !ok {
+		// Equal-cost refusal, matching the PAT and login paths: without it an
+		// unknown id answers in microseconds while a known id with a wrong
+		// token pays the full key derivation, and response timing enumerates
+		// which node ids exist.
+		auth.DummyVerify(token)
 		s.auditAgentAuthFailure(r, nodeID, "unknown node")
 		return model.Node{}, false
 	}
 	if n.Disabled {
+		// Same equal-cost rule as the unknown branch: a caller holding a valid
+		// id should not learn the node's operational state from timing.
+		auth.DummyVerify(token)
 		s.auditAgentAuthFailure(r, nodeID, "node disabled")
 		return model.Node{}, false
 	}
 	sourceIP := s.clientIP(r)
 	if !agentSourceAllowed(n.AgentSourceAllowlist, sourceIP) {
+		auth.DummyVerify(token)
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   nodeID,

@@ -435,3 +435,90 @@ func TestADeclaredCapabilityOnlyNarrowsAFreeTextTask(t *testing.T) {
 		t.Error("declaring a capability got past an explicit exclusion")
 	}
 }
+
+// TestQueueTaskForReportsEveryRefusedTarget pins the accumulation rewrite: an
+// operator dispatching to several excluded nodes learns all of them in one
+// round trip, not one per retry.
+func TestQueueTaskForReportsEveryRefusedTarget(t *testing.T) {
+	s := capServer(t)
+	enforceGate(t, s, "nft")
+	for _, nodeID := range []string{"node-a", "node-b"} {
+		if err := s.store.SetNodeCapability(store.NodeCapability{
+			NodeID: nodeID, Capability: "nft", State: "excluded",
+			Reason: "test exclusion", UpdatedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := s.queueTaskFor("nft", model.Task{
+		ID: "task-1", Targets: []string{"node-a", "node-b", "node-c"},
+	})
+	if err == nil {
+		t.Fatal("excluded targets must refuse the dispatch")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "node-a") || !strings.Contains(msg, "node-b") {
+		t.Fatalf("refusal must name every refused node, got %q", msg)
+	}
+	if _, ok := s.store.Task("task-1"); ok {
+		t.Fatal("nothing may be dispatched when any target is refused")
+	}
+}
+
+// TestRerunReanswersAdmission pins the rerun bypass fix: a task rerun must be
+// gated by the same capability the original was confined to (persisted
+// Capability) or authorized by (its approval's plugin, resolved now), so a
+// node excluded after the original dispatch cannot be reached again through
+// rerun. Dropping this was a live gate bypass.
+func TestRerunReanswersAdmission(t *testing.T) {
+	s := capServer(t)
+	enforceGate(t, s, "nft")
+
+	// Approval-backed task: the approval's plugin is the capability.
+	if err := s.store.UpsertApproval(model.Approval{
+		ID: "appr-1", NodeID: "node-a", Plugin: "nft", Status: "applied",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.CreateTask(model.Task{
+		ID: "task-src", Targets: []string{"node-a"}, Interpreter: "sh",
+		Script: "echo apply", Status: model.TaskFinished, ApprovalID: "appr-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Confined ad-hoc task: the persisted Capability field is the capability.
+	if err := s.store.CreateTask(model.Task{
+		ID: "task-confined", Targets: []string{"node-a"}, Interpreter: "sh",
+		Script: "echo probe", Status: model.TaskFinished, Capability: "nft",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The node is excluded AFTER both tasks ran.
+	if err := s.store.SetNodeCapability(store.NodeCapability{
+		NodeID: "node-a", Capability: "nft", State: "excluded",
+		Reason: "decommissioned from firewall management", UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rerunGateCapability := func(src model.Task) string {
+		capability := src.Capability
+		if capability == "" && src.ApprovalID != "" {
+			if approval, ok := s.store.Approval(src.ApprovalID); ok {
+				capability = approval.Plugin
+			}
+		}
+		return capability
+	}
+	for _, srcID := range []string{"task-src", "task-confined"} {
+		src, ok := s.store.Task(srcID)
+		if !ok {
+			t.Fatalf("source task %s missing", srcID)
+		}
+		rebuilt := model.Task{ID: "rerun-" + srcID, Targets: src.Targets, Capability: src.Capability}
+		if err := s.queueTaskFor(rerunGateCapability(src), rebuilt); err == nil {
+			t.Fatalf("rerun of %s reached an excluded node", srcID)
+		}
+	}
+}

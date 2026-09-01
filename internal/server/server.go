@@ -3208,6 +3208,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			Script:      req.Script,
 			TimeoutSec:  req.TimeoutSec,
 			OutputLimit: req.OutputLimit,
+			Capability:  req.Capability,
 			Status:      model.TaskQueued,
 			CreatedAt:   time.Now().UTC(),
 		}
@@ -3345,6 +3346,19 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// The rerun re-answers admission with the same capability the original
+	// was gated by: the persisted confinement when it has one, otherwise the
+	// approval that authorized it, resolved now rather than copied, because
+	// the whole point of gating at decision time is that a plan can outlive
+	// the decision that produced it. Dropping this was a live gate bypass:
+	// an approval-backed apply script could be re-dispatched to a node after
+	// the node was excluded from the capability.
+	capability := src.Capability
+	if capability == "" && src.ApprovalID != "" {
+		if approval, ok := s.store.Approval(src.ApprovalID); ok {
+			capability = approval.Plugin
+		}
+	}
 	task := model.Task{
 		ID:            id.New("task"),
 		ActorID:       p.ActorID,
@@ -3354,12 +3368,13 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 		Script:        src.Script,
 		TimeoutSec:    src.TimeoutSec,
 		OutputLimit:   src.OutputLimit,
+		Capability:    src.Capability,
 		Status:        model.TaskQueued,
 		RerunOfTaskID: rootTaskID(src),
 		RerunOfNodeID: rerunOfNode,
 		CreatedAt:     time.Now().UTC(),
 	}
-	if err := s.queueTask(task); err != nil {
+	if err := s.queueTaskFor(capability, task); err != nil {
 		if errors.Is(err, errTaskExecutionDisabled) {
 			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.rerun", Scope: "task:run", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"rerun_of": src.ID}})
 			writeTaskExecutionDisabled(w)
@@ -3446,16 +3461,26 @@ func (s *Server) queueTaskFor(capability string, task model.Task) error {
 	if s.taskExecutionDisabled {
 		return errTaskExecutionDisabled
 	}
+	if capability == "" {
+		// The task's own persisted confinement (a rerun carries it forward).
+		capability = task.Capability
+	}
 	if capability == "" && task.ApprovalID != "" {
 		if approval, ok := s.store.Approval(task.ApprovalID); ok {
 			capability = approval.Plugin
 		}
 	}
 	if capability != "" {
+		// Every refusal is collected: an operator dispatching to a dozen nodes
+		// learns all the refused ones in one round trip, not one per retry.
+		var refused []string
 		for _, nodeID := range task.Targets {
 			if decision := s.resolveNodeCapability(nodeID, capability); !decision.Allowed {
-				return fmt.Errorf("%s: %s", nodeID, decision.Reason)
+				refused = append(refused, fmt.Sprintf("%s: %s", nodeID, decision.Reason))
 			}
+		}
+		if len(refused) > 0 {
+			return errors.New(strings.Join(refused, "; "))
 		}
 	}
 	return s.store.CreateTask(task)

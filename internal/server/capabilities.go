@@ -165,12 +165,21 @@ var capabilitySpecs = map[string]capabilitySpec{
 	"cftunnel":         {Mutates: true},
 	"acme-dns":         {Mutates: true},
 	"singbox-linemeta": {Mutates: true},
-	"singbox:discover": {Mutates: false, Derive: deriveSingBox},
-	"terminal":         {Mutates: true, Derive: deriveTerminal},
-	"metrics":          {Mutates: false},
-	"inventory":        {Mutates: false},
-	"trace":            {Mutates: false},
-	"logs":             {Mutates: false},
+	// The three core-backed line surfaces below mint approvals with these ids
+	// but were never declared, and capabilitySpecFor's undeclared-means-allowed
+	// fallback made them permanently ungateable. Declared with no Derive:
+	// behavior is unchanged until an operator enforces them, but they now
+	// exist to the console and to policy. singbox-managedline is the bulk
+	// fan-out path, the most fleet-shaped of the three.
+	"singbox-lineuser":    {Mutates: true},
+	"singbox-managedline": {Mutates: true},
+	"singbox-linechain":   {Mutates: true},
+	"singbox:discover":    {Mutates: false, Derive: deriveSingBox},
+	"terminal":            {Mutates: true, Derive: deriveTerminal},
+	"metrics":             {Mutates: false},
+	"inventory":           {Mutates: false},
+	"trace":               {Mutates: false},
+	"logs":                {Mutates: false},
 }
 
 // KnownCapability describes one declared capability to the console.

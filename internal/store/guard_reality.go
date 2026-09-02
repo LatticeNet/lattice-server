@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -120,6 +121,12 @@ func cloneGuardRealitySnapshot(snapshot GuardRealitySnapshot) GuardRealitySnapsh
 		snapshot.Reality.Interfaces = interfaces
 	}
 	snapshot.Reality.ForeignTables = append([]string(nil), snapshot.Reality.ForeignTables...)
+	if snapshot.Reality.SSHD != nil {
+		sshd := *snapshot.Reality.SSHD
+		sshd.Ports = append([]int(nil), sshd.Ports...)
+		sshd.ListenAddresses = append([]string(nil), sshd.ListenAddresses...)
+		snapshot.Reality.SSHD = &sshd
+	}
 	return snapshot
 }
 
@@ -167,6 +174,19 @@ func canonicalizeGuardRealitySnapshot(snapshot GuardRealitySnapshot) GuardRealit
 		snapshot.Reality.ForeignTables = nil
 	} else {
 		sort.Strings(snapshot.Reality.ForeignTables)
+	}
+	if sshd := snapshot.Reality.SSHD; sshd != nil {
+		// Ports and listen addresses are sets: sshd prints them in
+		// configuration order, and two reports of one unchanged sshd must
+		// compare equal for the idempotent-write and audit-gate checks.
+		sort.Ints(sshd.Ports)
+		sshd.Ports = slices.Compact(sshd.Ports)
+		if len(sshd.ListenAddresses) == 0 {
+			sshd.ListenAddresses = nil
+		} else {
+			sort.Strings(sshd.ListenAddresses)
+			sshd.ListenAddresses = slices.Compact(sshd.ListenAddresses)
+		}
 	}
 	return snapshot
 }

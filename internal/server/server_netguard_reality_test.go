@@ -469,3 +469,171 @@ func TestNetGuardRealityReadVisibilityAndPagination(t *testing.T) {
 		assertAPIErrorCodeFromBody(t, string(body), model.APIErrorBadRequest)
 	}
 }
+
+// The SSH Guard page prints PASSWORD and PORTS from these facts, so the
+// contract is: a current agent's facts come back on the per-node detail
+// canonicalized, a current agent's refusal comes back as the note alone, and
+// an agent that predates the field keeps reporting exactly as before.
+func TestNetGuardRealitySSHDFactsRoundTrip(t *testing.T) {
+	now := time.Date(2026, 9, 2, 7, 0, 1, 0, time.UTC)
+	clock := newGuardRealityTestClock(now)
+	_, handler, st, cookies, csrf := newGuardRealityServerForTest(t, clock)
+	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	readDetail := func() (model.GuardNodeReality, map[string]any) {
+		t.Helper()
+		res := doJSON(t, handler, http.MethodGet, "/api/netguard/reality?node_id=node-a", "", cookies, csrf)
+		defer res.Body.Close()
+		raw, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatalf("read detail body: %v", err)
+		}
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("detail status = %d: %s", res.StatusCode, raw)
+		}
+		var typed guardRealityDetailTest
+		if err := json.Unmarshal(raw, &typed); err != nil {
+			t.Fatalf("decode detail: %v", err)
+		}
+		var generic struct {
+			Node struct {
+				Reality map[string]any `json:"reality"`
+			} `json:"node"`
+		}
+		if err := json.Unmarshal(raw, &generic); err != nil {
+			t.Fatalf("decode generic detail: %v", err)
+		}
+		if typed.Node.Reality == nil {
+			t.Fatalf("detail has no reality: %s", raw)
+		}
+		return *typed.Node.Reality, generic.Node.Reality
+	}
+	asJSON := func(v any) string {
+		t.Helper()
+		data, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(data)
+	}
+
+	collectedAt := now.Add(-time.Second)
+	observedAt := now.Add(-2 * time.Second)
+	withFacts := guardRealityFixture("node-a", collectedAt)
+	withFacts.SSHD = &model.GuardSSHDFacts{
+		PubkeyAuthentication: true,
+		PermitRootLogin:      "prohibit-password",
+		MaxAuthTries:         3,
+		// Configuration order with a duplicate, as a node with two Port
+		// lines and an Include could produce; the read side must be a set.
+		Ports:           []int{58394, 22, 58394},
+		ListenAddresses: []string{"[::]:58394", "0.0.0.0:58394"},
+		ObservedAt:      observedAt,
+	}
+	if resp := postGuardRealityForTest(t, handler, token, "node-a", withFacts); resp.code != http.StatusOK {
+		t.Fatalf("post with sshd facts = %d: %s", resp.code, resp.body)
+	}
+	reality, generic := readDetail()
+	if reality.SSHD == nil {
+		t.Fatalf("sshd facts missing from detail: %v", generic)
+	}
+	got := *reality.SSHD
+	if got.PasswordAuthentication || !got.PubkeyAuthentication || got.PermitRootLogin != "prohibit-password" || got.MaxAuthTries != 3 || !got.ObservedAt.Equal(observedAt) {
+		t.Fatalf("sshd facts = %+v", got)
+	}
+	if asJSON(got.Ports) != "[22,58394]" || asJSON(got.ListenAddresses) != `["0.0.0.0:58394","[::]:58394"]` {
+		t.Fatalf("sshd ports/listen addresses not canonical: %+v", got)
+	}
+	if _, ok := generic["sshd_note"]; ok || reality.SSHDNote != "" {
+		t.Fatalf("sshd_note must be absent when the facts were read: %v", generic)
+	}
+	if len(reality.Listeners) != 1 || reality.Listeners[0].Process != "sshd" {
+		t.Fatalf("listeners changed alongside sshd facts: %+v", reality.Listeners)
+	}
+
+	refused := guardRealityFixture("node-a", collectedAt.Add(time.Second))
+	refused.SSHDNote = "sshd -T needs root to read the effective configuration; agent runs as uid 1000"
+	if resp := postGuardRealityForTest(t, handler, token, "node-a", refused); resp.code != http.StatusOK {
+		t.Fatalf("post refusal = %d: %s", resp.code, resp.body)
+	}
+	reality, generic = readDetail()
+	if _, ok := generic["sshd"]; ok || reality.SSHD != nil {
+		t.Fatalf("a refusal must not carry facts: %v", generic)
+	}
+	if reality.SSHDNote != refused.SSHDNote {
+		t.Fatalf("sshd_note = %q, want the agent's reason", reality.SSHDNote)
+	}
+
+	older := guardRealityFixture("node-a", collectedAt.Add(2*time.Second))
+	if resp := postGuardRealityForTest(t, handler, token, "node-a", older); resp.code != http.StatusOK {
+		t.Fatalf("post from an older agent = %d: %s", resp.code, resp.body)
+	}
+	reality, generic = readDetail()
+	for _, key := range []string{"sshd", "sshd_note"} {
+		if _, ok := generic[key]; ok {
+			t.Fatalf("older agent report must not grow %q: %v", key, generic)
+		}
+	}
+	if asJSON(reality) != asJSON(older) {
+		t.Fatalf("older agent report changed on the way through:\n got %s\nwant %s", asJSON(reality), asJSON(older))
+	}
+
+	// The audit gate fires on a changed reality. observed_at changes on every
+	// poll, so it must be invisible to the fingerprint while a real change
+	// (password authentication turned on) must not be.
+	same := withFacts
+	sameSSHD := *withFacts.SSHD
+	sameSSHD.ObservedAt = observedAt.Add(time.Hour)
+	same.SSHD = &sameSSHD
+	if guardRealityFingerprint(withFacts) != guardRealityFingerprint(same) {
+		t.Fatal("sshd observed_at must not change the audit fingerprint")
+	}
+	changed := withFacts
+	changedSSHD := *withFacts.SSHD
+	changedSSHD.PasswordAuthentication = true
+	changed.SSHD = &changedSSHD
+	if guardRealityFingerprint(withFacts) == guardRealityFingerprint(changed) {
+		t.Fatal("password authentication flipping must change the audit fingerprint")
+	}
+
+	stored, ok := st.GuardRealitySnapshot("node-a")
+	if !ok {
+		t.Fatal("snapshot missing before validation cases")
+	}
+	invalid := []struct {
+		name   string
+		mutate func(*model.GuardNodeReality)
+	}{
+		{"port out of range", func(r *model.GuardNodeReality) {
+			r.SSHD = &model.GuardSSHDFacts{Ports: []int{70000}, PermitRootLogin: "no", ObservedAt: now}
+		}},
+		{"no ports", func(r *model.GuardNodeReality) {
+			r.SSHD = &model.GuardSSHDFacts{PermitRootLogin: "no", ObservedAt: now}
+		}},
+		{"missing observed_at", func(r *model.GuardNodeReality) {
+			r.SSHD = &model.GuardSSHDFacts{Ports: []int{22}, PermitRootLogin: "no"}
+		}},
+		{"empty permit_root_login", func(r *model.GuardNodeReality) {
+			r.SSHD = &model.GuardSSHDFacts{Ports: []int{22}, ObservedAt: now}
+		}},
+		{"control characters in the note", func(r *model.GuardNodeReality) {
+			r.SSHDNote = "refused\x1b[31m"
+		}},
+		{"note over the byte bound", func(r *model.GuardNodeReality) {
+			r.SSHDNote = strings.Repeat("x", guardRealityMaxSSHDNoteBytes+1)
+		}},
+	}
+	for _, tc := range invalid {
+		bad := guardRealityFixture("node-a", collectedAt.Add(time.Hour))
+		tc.mutate(&bad)
+		resp := postGuardRealityForTest(t, handler, token, "node-a", bad)
+		if resp.code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400: %s", tc.name, resp.code, resp.body)
+		}
+		assertAPIErrorCodeFromBody(t, resp.body, model.APIErrorBadRequest)
+	}
+	after, _ := st.GuardRealitySnapshot("node-a")
+	if !after.Reality.CollectedAt.Equal(stored.Reality.CollectedAt) {
+		t.Fatal("a rejected sshd report must not replace the stored snapshot")
+	}
+}

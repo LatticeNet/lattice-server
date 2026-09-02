@@ -2247,7 +2247,14 @@ type nodeView struct {
 	// Reachability distinguishes a node that stopped reporting from one that
 	// never has. Online stays for existing consumers; both are derived from the
 	// same fields at view time, so they cannot disagree.
-	Reachability         string                   `json:"reachability"`
+	Reachability string `json:"reachability"`
+	// Status is the one word every console surface renders for this node, with
+	// the instant it entered that state and one sentence saying why. The rule
+	// lives in node_status.go; Online and Reachability stay for consumers that
+	// have not moved and are derived from the same fields.
+	Status               string                   `json:"status"`
+	StatusSince          time.Time                `json:"status_since,omitzero"`
+	StatusReason         string                   `json:"status_reason"`
 	Disabled             bool                     `json:"disabled,omitempty"`
 	AgentSourceAllowlist []string                 `json:"agent_source_allowlist,omitempty"`
 	TokenLastUsedAt      time.Time                `json:"token_last_used_at,omitempty"`
@@ -2285,7 +2292,9 @@ type agentRuntimeConfig struct {
 }
 
 func (s *Server) toNodeView(n model.Node) nodeView {
+	st := s.nodeStatusFor(n, s.now())
 	return nodeView{
+		Status: st.Status, StatusSince: st.Since, StatusReason: st.Reason,
 		ID: n.ID, LatticeIdentityUUID: n.LatticeIdentityUUID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role, Inventory: n.Inventory,
 		WireGuardIP: n.WireGuardIP, WireGuardPublicKey: n.WireGuardPublicKey,
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
@@ -7407,6 +7416,9 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		n.HostFacts = hostFacts
 	}
 	n.LastSeen = time.Now().UTC()
+	if !n.Online {
+		n.OnlineSince = n.LastSeen
+	}
 	n.Online = true
 	if err := s.upsertGraphNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)

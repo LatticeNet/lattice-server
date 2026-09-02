@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -564,5 +566,121 @@ func TestUsageWireShapes(t *testing.T) {
 	limited := principal{Principal: rbac.Principal{ActorID: "op2", Scopes: []string{"vpncore:admin"}}}
 	if _, err := srv.vpnCoreUsersAdminRPC(context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, limited), "usage_query", []byte(`{"node_id":"node-a"}`)); err == nil {
 		t.Fatal("usage_query without node:read must be denied")
+	}
+}
+
+// A known node whose sing-box is discovered but that has no proxy profile
+// (every sb-managed node in the fleet) gets a discovered profile registered
+// on its first usage report instead of a 400 every ten seconds, the snapshot
+// is stored with the counter maps, and /api/proxy/usage shows both.
+func TestUsageIngestRegistersDiscoveredProfile(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	inventory := doAgentRaw(t, handler, http.MethodPost, "/api/agent/singbox-inventory", `{
+		"node_id":"node-a",
+		"inventory":{"core_version":"1.13.12","status":"ok","nodes":[
+			{"name":"hub-a","protocol":"vless","network":"tcp","address":"203.0.113.5","port":"443","outbound_ref":"direct","share_url":"vless://x@203.0.113.5:443"}
+		]}
+	}`, nodeToken)
+	if inventory.Code != http.StatusOK {
+		t.Fatalf("inventory: %d %s", inventory.Code, inventory.Body.String())
+	}
+	if _, ok := st.ProxyNodeProfile("node-a"); ok {
+		t.Fatal("fixture must start without a profile")
+	}
+	post := func(body string) *httptest.ResponseRecorder {
+		t.Helper()
+		return doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", body, nodeToken)
+	}
+	first := post(`{"node_id":"node-a","snapshot":{"core_uptime_sec":100,"collector_source":"singbox-stats","collector_status":"ok",
+		"inbound_traffic":{"hub-a":{"uplink":100,"downlink":200}},"user_traffic":{"3b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d":{"uplink":1,"downlink":1}},
+		"outbound_traffic":{"direct":{"uplink":100,"downlink":200}},"ignored_counters":2}}`)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first report: %d %s", first.Code, first.Body.String())
+	}
+	var firstOut proxyUsageApplyResult
+	if err := json.NewDecoder(first.Body).Decode(&firstOut); err != nil {
+		t.Fatal(err)
+	}
+	if !firstOut.ProfileRegistered || firstOut.CollectorStatus != "ok" {
+		t.Fatalf("first result: %+v", firstOut)
+	}
+	profile, ok := st.ProxyNodeProfile("node-a")
+	if !ok || profile.Core != model.ProxyCoreSingbox || len(profile.InboundIDs) != 0 || proxyProfileOrigin(profile) != proxyProfileOriginDiscovered || profile.UsageCollectorStatus != "ok" {
+		t.Fatalf("registered profile: ok=%v %+v", ok, profile)
+	}
+	audited := false
+	for _, ev := range st.AuditEvents() {
+		audited = audited || (ev.Action == "proxy.profile.discovered" && ev.NodeID == "node-a")
+	}
+	if !audited {
+		t.Fatal("registration must be audited as proxy.profile.discovered")
+	}
+	second := post(`{"node_id":"node-a","snapshot":{"core_uptime_sec":110,"collector_source":"singbox-stats","collector_status":"ok",
+		"inbound_traffic":{"hub-a":{"uplink":150,"downlink":260}},"outbound_traffic":{"direct":{"uplink":150,"downlink":260}},"ignored_counters":2}}`)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second report: %d %s", second.Code, second.Body.String())
+	}
+	var secondOut proxyUsageApplyResult
+	if err := json.NewDecoder(second.Body).Decode(&secondOut); err != nil {
+		t.Fatal(err)
+	}
+	if secondOut.ProfileRegistered {
+		t.Fatalf("second report must reuse the profile: %+v", secondOut)
+	}
+
+	usage := doJSON(t, handler, http.MethodGet, "/api/proxy/usage?period=today", "", cookies, csrf)
+	defer usage.Body.Close()
+	if usage.StatusCode != http.StatusOK {
+		t.Fatalf("usage: %d", usage.StatusCode)
+	}
+	var out struct {
+		Snapshots []proxyUsageSnapshotView `json:"snapshots"`
+		Lines     []usageLineRow           `json:"lines"`
+	}
+	if err := json.NewDecoder(usage.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Snapshots) != 1 {
+		t.Fatalf("snapshots: %+v", out.Snapshots)
+	}
+	snap := out.Snapshots[0]
+	if snap.InboundTraffic["hub-a"].Uplink != 150 || snap.OutboundTraffic["direct"].Downlink != 260 || snap.IgnoredCounters != 2 || snap.CollectorStatus != "ok" {
+		t.Fatalf("snapshot view: %+v", snap)
+	}
+	if len(snap.UserTraffic) != 0 {
+		t.Fatalf("an unplaced user counter name must never be echoed: %+v", snap.UserTraffic)
+	}
+	var hub *usageLineRow
+	for i := range out.Lines {
+		if out.Lines[i].NodeID == "node-a" && out.Lines[i].Tag == "hub-a" {
+			hub = &out.Lines[i]
+		}
+	}
+	if hub == nil || hub.Uplink != 50 || hub.Downlink != 60 || hub.LineHashID == "" || hub.Role != usageRoleDirect || hub.Attribution != usageAttributionNone {
+		t.Fatalf("hub-a line row: %+v", hub)
+	}
+	profiles := doJSON(t, handler, http.MethodGet, "/api/proxy/profiles", "", cookies, csrf)
+	defer profiles.Body.Close()
+	var profilesOut struct {
+		Profiles []proxyNodeProfileView `json:"profiles"`
+	}
+	if err := json.NewDecoder(profiles.Body).Decode(&profilesOut); err != nil {
+		t.Fatal(err)
+	}
+	if len(profilesOut.Profiles) != 1 || profilesOut.Profiles[0].Origin != proxyProfileOriginDiscovered {
+		t.Fatalf("profile view: %+v", profilesOut.Profiles)
+	}
+
+	// A known node with neither an inventory nor collector evidence keeps the
+	// old answer: nothing is registered on an empty report.
+	otherToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
+	empty := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage", `{"node_id":"node-b","snapshot":{"core_uptime_sec":1}}`, otherToken)
+	if empty.Code != http.StatusBadRequest {
+		t.Fatalf("empty report from an unprofiled node without inventory: %d %s", empty.Code, empty.Body.String())
+	}
+	if _, ok := st.ProxyNodeProfile("node-b"); ok {
+		t.Fatal("no profile must be registered on an empty report")
 	}
 }

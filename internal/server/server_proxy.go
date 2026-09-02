@@ -90,9 +90,12 @@ type proxyUserView struct {
 }
 
 type proxyNodeProfileView struct {
-	ID            string    `json:"id"`
-	NodeID        string    `json:"node_id"`
-	NodeName      string    `json:"node_name,omitempty"`
+	ID       string `json:"id"`
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name,omitempty"`
+	// Origin is managed for a Lattice-rendered profile and discovered for one
+	// registered from a usage report of an sb-managed node.
+	Origin        string    `json:"origin"`
 	Core          string    `json:"core"`
 	InboundIDs    []string  `json:"inbound_ids"`
 	Hostname      string    `json:"hostname,omitempty"`
@@ -124,11 +127,22 @@ type proxyNodeProfileView struct {
 }
 
 type proxyUsageSnapshotView struct {
-	NodeID        string           `json:"node_id"`
-	NodeName      string           `json:"node_name,omitempty"`
-	At            time.Time        `json:"at"`
-	CoreUptimeSec uint64           `json:"core_uptime_sec"`
-	UserBytes     map[string]int64 `json:"user_bytes"`
+	NodeID        string                      `json:"node_id"`
+	NodeName      string                      `json:"node_name,omitempty"`
+	At            time.Time                   `json:"at"`
+	CoreUptimeSec uint64                      `json:"core_uptime_sec"`
+	UserBytes     map[string]int64            `json:"user_bytes"`
+	LineUserBytes map[string]map[string]int64 `json:"line_user_bytes,omitempty"`
+	// The direction-split counter families as stored: user_traffic carries
+	// only the u_<hash> names the server could place, never a raw credential.
+	InboundTraffic     map[string]model.ProxyTrafficCounter `json:"inbound_traffic,omitempty"`
+	UserTraffic        map[string]model.ProxyTrafficCounter `json:"user_traffic,omitempty"`
+	OutboundTraffic    map[string]model.ProxyTrafficCounter `json:"outbound_traffic,omitempty"`
+	IgnoredCounters    int                                  `json:"ignored_counters,omitempty"`
+	CollectorSource    string                               `json:"collector_source,omitempty"`
+	CollectorStatus    string                               `json:"collector_status,omitempty"`
+	CollectorError     string                               `json:"collector_error,omitempty"`
+	CollectorCheckedAt time.Time                            `json:"collector_checked_at,omitempty"`
 }
 
 type proxyUsageUserView struct {
@@ -147,10 +161,13 @@ type proxyUsageApplyResult struct {
 	UsersIgnored int   `json:"users_ignored"`
 	// UnknownLines counts inbound tags this report carried that no line on
 	// the node matches; their bytes are kept as unknown_line rows.
-	UnknownLines    int    `json:"unknown_lines,omitempty"`
-	AlertsFired     int    `json:"alerts_fired"`
-	CollectorSource string `json:"collector_source,omitempty"`
-	CollectorStatus string `json:"collector_status,omitempty"`
+	UnknownLines int `json:"unknown_lines,omitempty"`
+	// ProfileRegistered says this report created the node's discovered
+	// profile (see registerDiscoveredProxyProfile).
+	ProfileRegistered bool   `json:"profile_registered,omitempty"`
+	AlertsFired       int    `json:"alerts_fired"`
+	CollectorSource   string `json:"collector_source,omitempty"`
+	CollectorStatus   string `json:"collector_status,omitempty"`
 }
 
 func proxySubscriptionBody(format string, endpoints []proxycore.VLESSRealityEndpoint) ([]byte, string, error) {
@@ -211,6 +228,9 @@ func (s *Server) proxySubscriptionProfiles() []proxycore.SubscriptionProfile {
 	profiles := s.store.ProxyNodeProfiles()
 	out := make([]proxycore.SubscriptionProfile, 0, len(profiles))
 	for _, profile := range profiles {
+		if proxyProfileOrigin(profile) == proxyProfileOriginDiscovered {
+			continue // nothing to render: the lines are sb-managed, not Lattice inbounds
+		}
 		name := ""
 		if node, ok := s.store.Node(profile.NodeID); ok {
 			name = node.Name
@@ -553,6 +573,9 @@ func (s *Server) handleAgentProxyUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	if result.UnknownLines > 0 {
 		auditMeta["unknown_lines"] = strconv.Itoa(result.UnknownLines)
+	}
+	if result.ProfileRegistered {
+		auditMeta["profile_registered"] = "true"
 	}
 	if result.CollectorSource != "" {
 		auditMeta["collector_source"] = result.CollectorSource
@@ -1246,6 +1269,7 @@ func (s *Server) toProxyNodeProfileView(profile model.ProxyNodeProfile) proxyNod
 		ID:            profile.ID,
 		NodeID:        profile.NodeID,
 		NodeName:      nodeName,
+		Origin:        proxyProfileOrigin(profile),
 		Core:          profile.Core,
 		InboundIDs:    append([]string(nil), profile.InboundIDs...),
 		Hostname:      profile.Hostname,
@@ -1281,13 +1305,39 @@ func (s *Server) toProxyUsageSnapshotView(snapshot model.ProxyUsageSnapshot) pro
 	if node, ok := s.store.Node(snapshot.NodeID); ok {
 		nodeName = node.Name
 	}
-	return proxyUsageSnapshotView{
-		NodeID:        snapshot.NodeID,
-		NodeName:      nodeName,
-		At:            snapshot.At,
-		CoreUptimeSec: snapshot.CoreUptimeSec,
-		UserBytes:     cloneProxyUserBytes(snapshot.UserBytes),
+	view := proxyUsageSnapshotView{
+		NodeID:             snapshot.NodeID,
+		NodeName:           nodeName,
+		At:                 snapshot.At,
+		CoreUptimeSec:      snapshot.CoreUptimeSec,
+		UserBytes:          cloneProxyUserBytes(snapshot.UserBytes),
+		InboundTraffic:     cloneTrafficCounters(snapshot.InboundTraffic),
+		UserTraffic:        cloneTrafficCounters(snapshot.UserTraffic),
+		OutboundTraffic:    cloneTrafficCounters(snapshot.OutboundTraffic),
+		IgnoredCounters:    snapshot.IgnoredCounters,
+		CollectorSource:    snapshot.CollectorSource,
+		CollectorStatus:    snapshot.CollectorStatus,
+		CollectorError:     snapshot.CollectorError,
+		CollectorCheckedAt: snapshot.CollectorCheckedAt,
 	}
+	if len(snapshot.LineUserBytes) > 0 {
+		view.LineUserBytes = make(map[string]map[string]int64, len(snapshot.LineUserBytes))
+		for line, byUser := range snapshot.LineUserBytes {
+			view.LineUserBytes[line] = cloneProxyUserBytes(byUser)
+		}
+	}
+	return view
+}
+
+func cloneTrafficCounters(in map[string]model.ProxyTrafficCounter) map[string]model.ProxyTrafficCounter {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]model.ProxyTrafficCounter, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func toProxyUsageUserView(user model.ProxyUser) proxyUsageUserView {
@@ -1388,14 +1438,19 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	if snapshot.NodeID == "" {
 		return proxyUsageApplyResult{}, errors.New("node_id is required")
 	}
+	result := proxyUsageApplyResult{}
 	profile, ok := s.store.ProxyNodeProfile(snapshot.NodeID)
 	if !ok {
-		return proxyUsageApplyResult{}, fmt.Errorf("proxy node profile %s not found", snapshot.NodeID)
+		registered, err := s.registerDiscoveredProxyProfile(snapshot)
+		if err != nil {
+			return proxyUsageApplyResult{}, err
+		}
+		profile = registered
+		result.ProfileRegistered = true
 	}
 	if snapshot.At.IsZero() {
 		snapshot.At = s.now()
 	}
-	result := proxyUsageApplyResult{}
 	collectorUpdated := false
 	if updatedProfile, updated, err := applyProxyUsageCollectorHealth(profile, snapshot, s.now()); err != nil {
 		return proxyUsageApplyResult{}, err
@@ -1586,6 +1641,59 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	s.maybePruneUsageDays(now)
 	s.emitProxyUserNotifications(alertsToEmit)
 	return result, nil
+}
+
+// registerDiscoveredProxyProfile gives a node that reports usage without a
+// proxy profile one of origin "discovered": core sing-box, no managed
+// inbounds. Every sb-managed node in the fleet is in this position, and the
+// alternative was an agent posting every ten seconds into a 400. The node
+// must be known, and either its sing-box inventory must be on record or the
+// snapshot itself must prove a collector; an empty report from a node with
+// no inventory still gets the old error, so nothing is registered on noise.
+func (s *Server) registerDiscoveredProxyProfile(snapshot model.ProxyUsageSnapshot) (model.ProxyNodeProfile, error) {
+	if _, ok := s.store.Node(snapshot.NodeID); !ok {
+		return model.ProxyNodeProfile{}, fmt.Errorf("proxy node profile %s not found", snapshot.NodeID)
+	}
+	_, discovered := s.singBoxInventory(snapshot.NodeID)
+	proves := snapshot.CollectorSource != "" || snapshot.CollectorStatus != "" ||
+		len(snapshot.UserBytes) > 0 || len(snapshot.LineUserBytes) > 0 ||
+		len(snapshot.InboundTraffic) > 0 || len(snapshot.UserTraffic) > 0 || len(snapshot.OutboundTraffic) > 0
+	if !discovered && !proves {
+		return model.ProxyNodeProfile{}, fmt.Errorf("proxy node profile %s not found and the report carries no collector evidence", snapshot.NodeID)
+	}
+	now := s.now()
+	profile := model.ProxyNodeProfile{ID: snapshot.NodeID, NodeID: snapshot.NodeID, Core: model.ProxyCoreSingbox, InboundIDs: []string{}, CreatedAt: now, UpdatedAt: now}
+	if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
+		return model.ProxyNodeProfile{}, err
+	}
+	s.invalidateLineReadModel()
+	reason := "usage report from a node with discovered sing-box lines"
+	if !discovered {
+		reason = "usage report carrying collector evidence"
+	}
+	s.recordAudit(model.AuditEvent{
+		ID: id.New("audit"), NodeID: snapshot.NodeID, Action: "proxy.profile.discovered", Scope: "proxy:admin", Decision: "allow", ActorID: "system",
+		Metadata: map[string]string{"profile_id": profile.ID, "core": profile.Core, "reason": reason},
+	})
+	if stored, ok := s.store.ProxyNodeProfile(snapshot.NodeID); ok {
+		profile = stored
+	}
+	return profile, nil
+}
+
+const (
+	proxyProfileOriginManaged    = "managed"
+	proxyProfileOriginDiscovered = "discovered"
+)
+
+// proxyProfileOrigin is derived, not stored: a profile with no managed
+// inbound and no applied config is by construction one the server never
+// rendered, which is exactly the discovered case.
+func proxyProfileOrigin(profile model.ProxyNodeProfile) string {
+	if len(profile.InboundIDs) == 0 && strings.TrimSpace(profile.AppliedSHA256) == "" {
+		return proxyProfileOriginDiscovered
+	}
+	return proxyProfileOriginManaged
 }
 
 // monotonicDelta is the per-counter rule shared by every family: a core

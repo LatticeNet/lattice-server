@@ -243,3 +243,100 @@ func TestTerminalBrokerBridgedExemptFromIdle(t *testing.T) {
 		t.Fatalf("max-life cap should fail even a bridged session, got %s", s.Status)
 	}
 }
+
+// A second operator with terminal scope on the same node used to be able to
+// list, read, type into and close the first operator's shell: every per-session
+// route checked the node, none checked whose session it was.
+func TestTerminalSessionsBelongToTheActorWhoOpenedThem(t *testing.T) {
+	handler, _ := newTestServer(t)
+	adminCookies, adminCSRF := loginSession(t, handler)
+	enrollNamedNode(t, handler, adminCookies, adminCSRF, "node-a", "Node A")
+
+	create := doJSON(t, handler, http.MethodPost, "/api/terminal/sessions", `{"node_id":"node-a","shell":"sh"}`, adminCookies, adminCSRF)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create terminal failed: %d", create.StatusCode)
+	}
+	var session model.TerminalSession
+	if err := json.NewDecoder(create.Body).Decode(&session); err != nil {
+		t.Fatal(err)
+	}
+
+	other := doJSON(t, handler, http.MethodPost, "/api/users",
+		`{"username":"other","password":"`+testAdminPass+`","scopes":["terminal:open","node:read"],"server_allowlist":["node-a"]}`, adminCookies, adminCSRF)
+	other.Body.Close()
+	if other.StatusCode != http.StatusOK {
+		t.Fatalf("create second operator: %d", other.StatusCode)
+	}
+	otherCookies := loginAs(t, handler, "other", testAdminPass)
+	me := doJSON(t, handler, http.MethodGet, "/api/me", "", otherCookies, "")
+	var meBody struct {
+		CSRF string `json:"csrf_token"`
+	}
+	json.NewDecoder(me.Body).Decode(&meBody)
+	me.Body.Close()
+	otherCSRF := meBody.CSRF
+
+	list := doJSON(t, handler, http.MethodGet, "/api/terminal/sessions", "", otherCookies, otherCSRF)
+	defer list.Body.Close()
+	var listBody struct {
+		Sessions []model.TerminalSession `json:"sessions"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&listBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(listBody.Sessions) != 0 {
+		t.Fatalf("the other operator must not see the admin's session, got %+v", listBody.Sessions)
+	}
+	for _, probe := range []struct{ method, action, body string }{
+		{http.MethodGet, "events", ""},
+		{http.MethodPost, "input", `{"data":"id\n"}`},
+		{http.MethodPost, "resize", `{"cols":80,"rows":24}`},
+		{http.MethodPost, "close", ""},
+	} {
+		res := doJSON(t, handler, probe.method, "/api/terminal/sessions/"+session.ID+"/"+probe.action, probe.body, otherCookies, otherCSRF)
+		res.Body.Close()
+		if res.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s on another operator's session should be forbidden, got %d", probe.action, res.StatusCode)
+		}
+	}
+
+	// The owner still sees and drives it, including through a token of their own.
+	mine := doJSON(t, handler, http.MethodGet, "/api/terminal/sessions", "", adminCookies, adminCSRF)
+	defer mine.Body.Close()
+	var mineBody struct {
+		Sessions []model.TerminalSession `json:"sessions"`
+	}
+	json.NewDecoder(mine.Body).Decode(&mineBody)
+	if len(mineBody.Sessions) != 1 || mineBody.Sessions[0].ID != session.ID {
+		t.Fatalf("owner must list their own session, got %+v", mineBody.Sessions)
+	}
+	token := createPAT(t, handler, adminCookies, adminCSRF, []string{"terminal:open"}, []string{"node-a"})
+	viaToken := doBearerJSON(t, handler, http.MethodPost, "/api/terminal/sessions/"+session.ID+"/input", `{"data":"id\n"}`, token)
+	viaToken.Body.Close()
+	if viaToken.StatusCode != http.StatusOK {
+		t.Fatalf("the owner's own token should drive the session, got %d", viaToken.StatusCode)
+	}
+}
+
+// The reaper used to end sessions with nothing written anywhere but an
+// in-memory error that vanished with the session; the broker now hands each
+// reaped session back so the server can audit it.
+func TestTerminalReapReturnsTheSessionsItFailed(t *testing.T) {
+	broker := newTerminalBroker()
+	now := time.Date(2026, 9, 2, 6, 0, 0, 0, time.UTC)
+	session, err := broker.create("node-a", "admin", "", "sh", 0, 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reaped := broker.reap(now.Add(time.Minute)); len(reaped) != 0 {
+		t.Fatalf("nothing should be reaped inside the pending TTL, got %+v", reaped)
+	}
+	reaped := broker.reap(now.Add(terminalPendingTTL + time.Second))
+	if len(reaped) != 1 || reaped[0].ID != session.ID || reaped[0].Status != model.TerminalFailed || reaped[0].Error == "" {
+		t.Fatalf("the expired pending session must come back once with its reason, got %+v", reaped)
+	}
+	if again := broker.reap(now.Add(terminalPendingTTL + 2*time.Second)); len(again) != 0 {
+		t.Fatalf("a reaped session must not be reported twice, got %+v", again)
+	}
+}

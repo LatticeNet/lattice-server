@@ -109,6 +109,20 @@ func logSourceVisibleToPrincipal(p principal, scope string, ls model.LogSource) 
 	return rbac.Allows(p.Principal, scope, ls.NodeID)
 }
 
+// logSourceView is a log source as the list hands it to an operator. The
+// server owns the agent-debug and sing-box sources (it mints them, repairs
+// them, and refuses to edit or delete them on request), and a list that did
+// not say so showed them with the same controls as a source the operator
+// created, controls that failed on click.
+type logSourceView struct {
+	model.LogSource
+	Managed bool `json:"managed,omitempty"`
+}
+
+func isManagedLogSource(ls model.LogSource) bool {
+	return isSingBoxLogSource(ls) || isAgentDebugLogSource(ls)
+}
+
 // --- operator endpoints --------------------------------------------------
 
 func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p principal) {
@@ -121,10 +135,10 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p prin
 			return
 		}
 		sources := s.store.LogSources()
-		visible := make([]model.LogSource, 0, len(sources))
+		visible := make([]logSourceView, 0, len(sources))
 		for _, ls := range sources {
 			if logSourceVisibleToPrincipal(p, "log:read", ls) {
-				visible = append(visible, ls)
+				visible = append(visible, logSourceView{LogSource: ls, Managed: isManagedLogSource(ls)})
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"sources": visible})

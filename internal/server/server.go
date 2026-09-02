@@ -3500,8 +3500,11 @@ var agentKillingCommands = []string{
 // scriptFirstCommandKillsAgent returns the script's first command and whether
 // it is one of agentKillingCommands. Comments and blank lines (the shebang
 // included) are skipped; the first command line is cut at the first shell
-// separator and its whitespace normalised, so "systemctl restart
-// lattice-agent; sleep 8; …" is judged on its first segment. The unit may be
+// separator, redirection or trailing comment, so "systemctl restart
+// lattice-agent; sleep 8; …" and "systemctl stop lattice-agent >/tmp/log
+// 2>&1" are both judged on the command that actually runs. The pattern has
+// to match the leading words; anything after them (a flag such as
+// --no-block, a second unit) leaves the agent just as dead. The unit may be
 // written with or without its .service suffix, which systemd treats alike.
 func scriptFirstCommandKillsAgent(script string) (string, bool) {
 	first := ""
@@ -3516,13 +3519,28 @@ func scriptFirstCommandKillsAgent(script string) (string, bool) {
 	if first == "" {
 		return "", false
 	}
-	if cut := strings.IndexAny(first, ";&|"); cut >= 0 {
+	if cut := strings.IndexAny(first, ";&|#<>"); cut >= 0 {
 		first = first[:cut]
 	}
-	command := strings.Join(strings.Fields(first), " ")
-	normalised := strings.TrimSuffix(command, ".service")
+	fields := strings.Fields(first)
+	command := strings.Join(fields, " ")
 	for _, pattern := range agentKillingCommands {
-		if normalised == pattern {
+		want := strings.Fields(pattern)
+		if len(fields) < len(want) {
+			continue
+		}
+		matched := true
+		for i, token := range want {
+			got := fields[i]
+			if i == len(want)-1 {
+				got = strings.TrimSuffix(got, ".service")
+			}
+			if got != token {
+				matched = false
+				break
+			}
+		}
+		if matched {
 			return command, true
 		}
 	}
@@ -3655,7 +3673,9 @@ func (s *Server) toTaskView(t model.Task) taskView {
 	// running anywhere; "Running" would be a lie the operator waits on.
 	var targetStates map[string]taskTargetView
 	attempts, leaseAge, stalledReason := 0, int64(0), ""
-	if progress, ok := s.store.TaskProgress(t.ID, s.now()); status == model.TaskLeased && ok {
+	// Only a leased task has progress to read; asking the store for the
+	// others would take its lock once per row of task history for nothing.
+	if progress, ok := s.taskProgressIfLeased(t, status); ok {
 		if progress.Stalled {
 			status = store.TaskStalled
 		}
@@ -3708,6 +3728,13 @@ func (s *Server) toTaskView(t model.Task) taskView {
 		StartedAt:       t.StartedAt,
 		FinishedAt:      t.FinishedAt,
 	}
+}
+
+func (s *Server) taskProgressIfLeased(t model.Task, status string) (store.TaskProgress, bool) {
+	if status != model.TaskLeased {
+		return store.TaskProgress{}, false
+	}
+	return s.store.TaskProgress(t.ID, s.now())
 }
 
 func scriptSHA256(script string) string {

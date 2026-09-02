@@ -72,9 +72,14 @@ type Line struct {
 	// ServiceState answers "is anything actually running and holding this
 	// line's port". They must never be merged back into one field: their
 	// disagreement is exactly the incident signal.
-	ServiceState     string            `json:"service_state,omitempty"` // running | down | restarting | unknown
-	ServiceCheckedAt time.Time         `json:"service_checked_at,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
+	ServiceState     string    `json:"service_state,omitempty"` // running | down | restarting | unknown
+	ServiceCheckedAt time.Time `json:"service_checked_at,omitempty"`
+	// ServiceNote is the probe's own account of why the state is not
+	// "running": the refused candidate and the rule it failed, or the command
+	// that could not run. Empty when the service is proven running, so a
+	// consumer that prints it prints only what needs a hand.
+	ServiceNote string            `json:"service_note,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"` // sing-box `_lattice` block (future enrich)
 }
 
 // LineGroup is the set of lines on one node — the unit the dashboard renders.
@@ -261,7 +266,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Status:           status,
 				LastError:        prof.LastError,
 			}
-			ln.ServiceState, ln.ServiceCheckedAt = s.singBoxServiceState(prof.NodeID)
+			ln.ServiceState, ln.ServiceCheckedAt, ln.ServiceNote = s.singBoxServiceState(prof.NodeID)
 			ln.LineHashID = lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, outbound)
 			ln.ID = ln.LineHashID
 			byNode[ln.NodeID] = append(byNode[ln.NodeID], ln)
@@ -274,7 +279,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 	// user_count from runtime config inspection; older agents leave them empty
 	// and UserKnown=false.
 	for _, inv := range s.liveSingBoxInventories(s.now()) {
-		nodeSvcState, nodeSvcAt := s.singBoxServiceState(inv.NodeID)
+		nodeSvcState, nodeSvcAt, nodeSvcNote := s.singBoxServiceState(inv.NodeID)
 		for _, n := range inv.Nodes {
 			port, _ := strconv.Atoi(strings.TrimSpace(n.Port))
 			if managedKey[managedDedupKey(inv.NodeID, n.Protocol, port)] {
@@ -317,6 +322,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Metadata:           n.Metadata,
 				ServiceState:       refineLineServiceState(nodeSvcState, n.PortBound),
 				ServiceCheckedAt:   nodeSvcAt,
+				ServiceNote:        nodeSvcNote,
 			}
 			ln.LineHashID = uuidResolver.resolve(ln.NodeID, ln.LineID, ln.LineUUID, func() string {
 				return lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)

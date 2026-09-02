@@ -57,6 +57,11 @@ const (
 type terminalBroker struct {
 	mu       sync.Mutex
 	sessions map[string]*terminalSessionState
+	// reaped holds every session the reaper failed since the last drain. The
+	// broker has no audit store; the server drains this on its reaper tick and
+	// writes one audit event per entry, so a session that ended by timeout
+	// leaves the same durable trace as one an operator or the agent closed.
+	reaped []model.TerminalSession
 }
 
 type terminalSessionState struct {
@@ -89,9 +94,30 @@ func (s *Server) startTerminalReaper() {
 		ticker := time.NewTicker(terminalReaperTick)
 		defer ticker.Stop()
 		for range ticker.C {
-			s.terminalBroker.reap(s.now())
+			for _, session := range s.terminalBroker.reap(s.now()) {
+				s.recordAudit(model.AuditEvent{
+					ID:       id.New("audit"),
+					NodeID:   session.NodeID,
+					Action:   "terminal.reaper.close",
+					Decision: "observe",
+					Metadata: map[string]string{
+						"session_id": session.ID,
+						"actor_id":   session.ActorID,
+						"reason":     session.Error,
+					},
+				})
+			}
 		}
 	}()
+}
+
+// terminalSessionOwnedBy says whether a principal may act on a session. Node
+// scope says who may open a shell on a node; it does not say who may read or
+// type into a shell someone else opened there. Ownership is the actor, so an
+// operator's own token and browser session share their sessions and two
+// operators on the same node do not.
+func terminalSessionOwnedBy(session model.TerminalSession, p principal) bool {
+	return session.ActorID != "" && session.ActorID == p.ActorID
 }
 
 func (b *terminalBroker) create(nodeID, actorID, tokenID, shell string, cols, rows int, now time.Time) (model.TerminalSession, error) {
@@ -396,10 +422,15 @@ func (b *terminalBroker) markDetached(sessionID string, now time.Time) {
 // and explicit close, so without a periodic sweep a detached/idle/over-age
 // session could linger until the next unrelated access. The reaper bounds that
 // to terminalReaperTick.
-func (b *terminalBroker) reap(now time.Time) {
+// reap runs the lifecycle pass and hands back the sessions it failed since the
+// last call, in the order they were failed.
+func (b *terminalBroker) reap(now time.Time) []model.TerminalSession {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.pruneLocked(now.UTC())
+	reaped := b.reaped
+	b.reaped = nil
+	return reaped
 }
 
 func (b *terminalBroker) pruneLocked(now time.Time) {
@@ -407,15 +438,15 @@ func (b *terminalBroker) pruneLocked(now time.Time) {
 		session := &state.session
 		switch {
 		case session.Status == model.TerminalPending && now.Sub(session.CreatedAt) > terminalPendingTTL:
-			failTerminalSession(state, "terminal session expired before node accepted it", now)
+			b.failLocked(state, "terminal session expired before node accepted it", now)
 		case terminalActiveStatus(session.Status):
 			switch {
 			case !session.OpenedAt.IsZero() && now.Sub(session.OpenedAt) > terminalMaxLifeTTL:
-				failTerminalSession(state, "terminal session reached maximum duration", now)
+				b.failLocked(state, "terminal session reached maximum duration", now)
 			case !state.bridged && !state.detachedAt.IsZero() && now.Sub(state.detachedAt) > terminalDetachGrace:
-				failTerminalSession(state, "terminal viewer disconnected and did not return", now)
+				b.failLocked(state, "terminal viewer disconnected and did not return", now)
 			case !state.bridged && !session.LastSeen.IsZero() && now.Sub(session.LastSeen) > terminalIdleTTL:
-				failTerminalSession(state, "terminal session expired after inactivity", now)
+				b.failLocked(state, "terminal session expired after inactivity", now)
 			}
 		}
 		if terminalClosedStatus(session.Status) && now.Sub(terminalClosedAt(*session)) >= terminalClosedTTL {
@@ -429,6 +460,11 @@ func (b *terminalBroker) pruneLocked(now time.Time) {
 // failTerminalSession transitions a state to failed with a reason, recording the
 // close time once. It also clears the bridge/detach bookkeeping so the closed
 // session is inert.
+func (b *terminalBroker) failLocked(state *terminalSessionState, reason string, now time.Time) {
+	failTerminalSession(state, reason, now)
+	b.reaped = append(b.reaped, state.session)
+}
+
 func failTerminalSession(state *terminalSessionState, reason string, now time.Time) {
 	state.session.Status = model.TerminalFailed
 	state.session.Error = reason
@@ -570,7 +606,7 @@ func (s *Server) handleTerminalSessions(w http.ResponseWriter, r *http.Request, 
 		sessions := s.terminalBroker.list(s.now())
 		visible := make([]model.TerminalSession, 0, len(sessions))
 		for _, session := range sessions {
-			if rbac.Allows(p.Principal, "terminal:open", session.NodeID) {
+			if rbac.Allows(p.Principal, "terminal:open", session.NodeID) && terminalSessionOwnedBy(session, p) {
 				visible = append(visible, session)
 			}
 		}
@@ -631,6 +667,18 @@ func (s *Server) handleTerminalSessionPath(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if !s.requireNodeScope(w, p, "terminal:open", session.NodeID) {
+		return
+	}
+	if !terminalSessionOwnedBy(session, p) {
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   session.NodeID,
+			Action:   "terminal." + action,
+			Scope:    "terminal:open",
+			Decision: "deny",
+			Metadata: map[string]string{"session_id": session.ID, "reason": "session belongs to another operator"},
+		})
+		writeError(w, http.StatusForbidden, errors.New("terminal session belongs to another operator"))
 		return
 	}
 	switch action {
@@ -702,9 +750,9 @@ func (s *Server) handleTerminalSessionPath(w http.ResponseWriter, r *http.Reques
 		})
 		writeJSON(w, http.StatusOK, session)
 	case "attach":
-		// Live WebSocket attach (dark-launched; no client uses it yet). The RBAC
-		// gate above (requireNodeScope terminal:open) has already run, so the
-		// upgrade is reached only for an authorized principal on this node.
+		// Live WebSocket attach. The gates above have already run: node scope,
+		// then ownership, so the upgrade is reached only by the operator whose
+		// session this is.
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 			return

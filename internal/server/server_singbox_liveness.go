@@ -171,13 +171,25 @@ func boundSingBoxRuntime(rt *model.SingBoxRuntime) {
 }
 
 // singBoxServiceState answers for the line read model: the node's derived
-// state and when it was last checked. Unknown when no record exists.
-func (s *Server) singBoxServiceState(nodeID string) (string, time.Time) {
+// state, when it was last checked, and the probe's note when the state is
+// anything but running. Unknown with no note when no record exists.
+func (s *Server) singBoxServiceState(nodeID string) (string, time.Time, string) {
 	rec, ok := s.store.SingBoxLivenessRecord(nodeID)
 	if !ok || rec.State == "" {
-		return serviceStateUnknown, time.Time{}
+		return serviceStateUnknown, time.Time{}, ""
 	}
-	return rec.State, rec.Runtime.ProbedAt
+	return rec.State, rec.Runtime.ProbedAt, serviceNoteFor(rec.State, rec.Runtime.ProbeError)
+}
+
+// serviceNoteFor keeps the probe error only where it explains something. A
+// running service with a failed `ss` still runs; the note would be noise
+// beside a green state. Unknown, down and restarting are the states the
+// operator has to act on, and the probe's account is the first clue.
+func serviceNoteFor(state, probeError string) string {
+	if state == serviceStateRunning {
+		return ""
+	}
+	return strings.TrimSpace(probeError)
 }
 
 // refineLineServiceState folds a line's own port evidence into the node

@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"time"
@@ -1290,6 +1292,17 @@ func TestAgentAuthUnknownNodeCostsLikeAWrongToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Count the equal-cost refusals so the check does not rest on the clock
+	// alone: a loaded CI runner can stretch either path, but it cannot make a
+	// dummy verification that never ran look like one that did.
+	var dummyCalls atomic.Int64
+	previous := dummyVerifyNodeToken
+	dummyVerifyNodeToken = func(token string) {
+		dummyCalls.Add(1)
+		previous(token)
+	}
+	t.Cleanup(func() { dummyVerifyNodeToken = previous })
+
 	timeAuth := func(nodeID string) time.Duration {
 		req := httptest.NewRequest(http.MethodPost, "/api/agent/metrics", strings.NewReader(`{"node_id":"`+nodeID+`"}`))
 		req.Header.Set("Authorization", "Bearer wrong-token-guess")
@@ -1302,13 +1315,39 @@ func TestAgentAuthUnknownNodeCostsLikeAWrongToken(t *testing.T) {
 		}
 		return time.Since(start)
 	}
+	median := func(samples []time.Duration) time.Duration {
+		sorted := slices.Clone(samples)
+		slices.Sort(sorted)
+		return sorted[len(sorted)/2]
+	}
 
 	// Warm both paths once (dummy hash init, caches), then measure.
 	timeAuth("node-known")
 	timeAuth("node-does-not-exist")
-	known := timeAuth("node-known")
-	unknown := timeAuth("node-does-not-exist")
-	if unknown*4 < known {
-		t.Fatalf("unknown-node auth answered too fast: unknown=%v known=%v", unknown, known)
+	dummyCalls.Store(0)
+
+	const rounds = 5
+	known := make([]time.Duration, 0, rounds)
+	for i := 0; i < rounds; i++ {
+		known = append(known, timeAuth("node-known"))
 	}
+	if got := dummyCalls.Load(); got != 0 {
+		t.Fatalf("a known node with a wrong token ran the dummy verification %d times; it must pay the real one", got)
+	}
+	unknown := make([]time.Duration, 0, rounds)
+	for i := 0; i < rounds; i++ {
+		unknown = append(unknown, timeAuth("node-does-not-exist"))
+	}
+	if got := dummyCalls.Load(); got != rounds {
+		t.Fatalf("unknown-node refusals ran the dummy verification %d times, want %d", got, rounds)
+	}
+
+	knownMedian, unknownMedian := median(known), median(unknown)
+	// Generous on purpose: both paths run one PBKDF2 derivation and land
+	// within noise of each other. The bound only has to catch the original
+	// microsecond answer, which is thousands of times faster than either.
+	if unknownMedian*3 < knownMedian {
+		t.Fatalf("unknown-node auth answered too fast: unknown=%v known=%v", unknownMedian, knownMedian)
+	}
+	t.Logf("median auth latency: known-wrong-token=%v unknown-node=%v", knownMedian, unknownMedian)
 }

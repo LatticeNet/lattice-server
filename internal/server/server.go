@@ -8088,6 +8088,11 @@ func validateWireGuardIP(value string) error {
 	return nil
 }
 
+// dummyVerifyNodeToken is the equal-cost refusal authenticateNode spends on a
+// node id it will not verify for real. It is a variable so the timing test can
+// count the calls instead of trusting a wall-clock comparison alone.
+var dummyVerifyNodeToken = auth.DummyVerify
+
 func (s *Server) authenticateNode(r *http.Request, nodeID, token string) (model.Node, bool) {
 	if nodeID == "" || token == "" {
 		return model.Node{}, false
@@ -8098,20 +8103,20 @@ func (s *Server) authenticateNode(r *http.Request, nodeID, token string) (model.
 		// unknown id answers in microseconds while a known id with a wrong
 		// token pays the full key derivation, and response timing enumerates
 		// which node ids exist.
-		auth.DummyVerify(token)
+		dummyVerifyNodeToken(token)
 		s.auditAgentAuthFailure(r, nodeID, "unknown node")
 		return model.Node{}, false
 	}
 	if n.Disabled {
 		// Same equal-cost rule as the unknown branch: a caller holding a valid
 		// id should not learn the node's operational state from timing.
-		auth.DummyVerify(token)
+		dummyVerifyNodeToken(token)
 		s.auditAgentAuthFailure(r, nodeID, "node disabled")
 		return model.Node{}, false
 	}
 	sourceIP := s.clientIP(r)
 	if !agentSourceAllowed(n.AgentSourceAllowlist, sourceIP) {
-		auth.DummyVerify(token)
+		dummyVerifyNodeToken(token)
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   nodeID,

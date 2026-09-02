@@ -103,10 +103,15 @@ type State struct {
 	ProxyUsers             map[string]model.ProxyUser            `json:"proxy_users"`
 	ProxyProfiles          map[string]model.ProxyNodeProfile     `json:"proxy_profiles"`
 	ProxyUsage             map[string]model.ProxyUsageSnapshot   `json:"proxy_usage"`
-	TOTPChallenges         map[string]auth.TOTPChallenge         `json:"totp_challenges"`
-	OIDCProviders          map[string]model.OIDCProvider         `json:"oidc_providers"`
-	OIDCIdentities         map[string]model.OIDCIdentity         `json:"oidc_identities"`
-	OIDCAuthStates         map[string]auth.OIDCAuthState         `json:"oidc_auth_states"`
+	// UsageDayNodes and UsageDayUsers are the daily rollups (usage_days.go),
+	// keyed "<id>/<yyyymmdd>". With the bolt hot store enabled they live only
+	// in bolt and are read with a prefix seek, never held here.
+	UsageDayNodes  map[string]UsageDayNode       `json:"usage_day_node"`
+	UsageDayUsers  map[string]UsageDayUser       `json:"usage_day_user"`
+	TOTPChallenges map[string]auth.TOTPChallenge `json:"totp_challenges"`
+	OIDCProviders  map[string]model.OIDCProvider `json:"oidc_providers"`
+	OIDCIdentities map[string]model.OIDCIdentity `json:"oidc_identities"`
+	OIDCAuthStates map[string]auth.OIDCAuthState `json:"oidc_auth_states"`
 	// WebAuthnCreds holds registered passkeys keyed by store record id. The public
 	// keys and credential ids are non-secret, so this map is persisted as-is (no
 	// at-rest envelope like Users/Sessions carry).
@@ -565,6 +570,9 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			return err
 		}
 	}
+	if err := bs.SeedUsageDays(st.UsageDayNodes, st.UsageDayUsers); err != nil {
+		return err
+	}
 	if !subscriptionAuthorityInitialized {
 		if err := bs.initializeSubscriptionHotAuthority(mergeSubscriptionHotSeed(st, existing)); err != nil {
 			return err
@@ -654,6 +662,11 @@ func mergeRuntimeBoltHotState(dst *State, hot State) {
 	if len(hot.ProxyUsage) > 0 {
 		dst.ProxyUsage = hot.ProxyUsage
 	}
+	// Day rollups are bolt-only once the hot store is on: the seed copied any
+	// JSON-side rows across, and reads go to bolt, so a copy here would only
+	// be a stale duplicate that jsonPersistState drops on the next write.
+	dst.UsageDayNodes = map[string]UsageDayNode{}
+	dst.UsageDayUsers = map[string]UsageDayUser{}
 	// Once enabled, Bolt is authoritative for these hot collections, including
 	// explicit empty/delete state. Conditional non-empty merge resurrects records
 	// from the stale JSON bootstrap after a valid hot deletion.
@@ -753,6 +766,8 @@ func emptyState() State {
 		ProxyUsers:             map[string]model.ProxyUser{},
 		ProxyProfiles:          map[string]model.ProxyNodeProfile{},
 		ProxyUsage:             map[string]model.ProxyUsageSnapshot{},
+		UsageDayNodes:          map[string]UsageDayNode{},
+		UsageDayUsers:          map[string]UsageDayUser{},
 		TOTPChallenges:         map[string]auth.TOTPChallenge{},
 		OIDCProviders:          map[string]model.OIDCProvider{},
 		OIDCIdentities:         map[string]model.OIDCIdentity{},
@@ -918,6 +933,12 @@ func (st *State) ensureMaps() {
 	if st.ProxyUsage == nil {
 		st.ProxyUsage = map[string]model.ProxyUsageSnapshot{}
 	}
+	if st.UsageDayNodes == nil {
+		st.UsageDayNodes = map[string]UsageDayNode{}
+	}
+	if st.UsageDayUsers == nil {
+		st.UsageDayUsers = map[string]UsageDayUser{}
+	}
 	if st.TOTPChallenges == nil {
 		st.TOTPChallenges = map[string]auth.TOTPChallenge{}
 	}
@@ -1000,6 +1021,8 @@ func (s *Store) jsonPersistStateFrom(st State) State {
 	st.ProxyUsers = map[string]model.ProxyUser{}
 	st.ProxyProfiles = map[string]model.ProxyNodeProfile{}
 	st.ProxyUsage = map[string]model.ProxyUsageSnapshot{}
+	st.UsageDayNodes = map[string]UsageDayNode{}
+	st.UsageDayUsers = map[string]UsageDayUser{}
 	// Shares are read on every public subscription fetch and written whenever one
 	// is created or rotated. They belong on the record-level path for the same
 	// reason proxy users do: keeping them here would put a hot read behind a file
@@ -4764,34 +4787,7 @@ func normalizeProxyUsageSnapshotForStore(snapshot model.ProxyUsageSnapshot, now 
 }
 
 func (s *Store) ApplyProxyUsageUpdate(users []model.ProxyUser, profile *model.ProxyNodeProfile, snapshot *model.ProxyUsageSnapshot) error {
-	if len(users) == 0 && profile == nil && snapshot == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	for _, user := range users {
-		user = normalizeProxyUserForStore(user, now)
-		s.state.ProxyUsers[user.ID] = user
-	}
-	if profile != nil {
-		normalized := normalizeProxyNodeProfileForStore(*profile, now)
-		s.state.ProxyProfiles[normalized.NodeID] = normalized
-		profile = &normalized
-	}
-	if snapshot != nil {
-		normalized := normalizeProxyUsageSnapshotForStore(*snapshot, now)
-		s.state.ProxyUsage[normalized.NodeID] = normalized
-		snapshot = &normalized
-	}
-	if s.runtimeBoltHot != nil {
-		normalizedUsers := make([]model.ProxyUser, 0, len(users))
-		for _, user := range users {
-			normalizedUsers = append(normalizedUsers, normalizeProxyUserForStore(user, now))
-		}
-		return s.runtimeBoltHot.ApplyProxyUsageUpdate(normalizedUsers, profile, snapshot)
-	}
-	return s.Save()
+	return s.ApplyProxyUsage(ProxyUsageUpdate{Users: users, Profile: profile, Snapshot: snapshot})
 }
 
 // ProxyUsageSnapshot returns the last accounting snapshot for a node.

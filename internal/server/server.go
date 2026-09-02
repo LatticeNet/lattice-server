@@ -1561,6 +1561,29 @@ func (s *Server) requireAllNodeScopes(w http.ResponseWriter, p principal, scope 
 	return true
 }
 
+// refuseConfinedFleetWrite refuses a node-restricted principal from a write
+// whose blast radius is the whole fleet: no node id appears anywhere in the
+// request, so rbac.Allows never consults the allowlist, and without this
+// refusal the confinement quietly fails to apply on exactly the widest
+// writes (multi-operator audit 2026-09-01: capability gates were finding A,
+// notification routing B, SSO providers D, group policy definitions E).
+// Reads stay open; per-node actions keep their per-node checks. Reports true
+// when the request was refused and answered.
+func (s *Server) refuseConfinedFleetWrite(w http.ResponseWriter, p principal, action, scope string) bool {
+	if !principalHasNodeRestriction(p) {
+		return false
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:       id.New("audit"),
+		Action:   action,
+		Scope:    scope,
+		Decision: "deny",
+		Reason:   "fleet-wide write refused for a node-restricted token",
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "this is a fleet-wide change with no node to confine it to; it requires a token without a server allowlist restriction"))
+	return true
+}
+
 func principalHasNodeRestriction(p principal) bool {
 	if len(p.ServerAllowlist) == 0 {
 		return false
@@ -4550,6 +4573,12 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		}
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
+		// Channels route fleet-wide security telemetry to external endpoints;
+		// a confined token registering its own webhook is a cross-node exfil
+		// path, not channel administration.
+		if s.refuseConfinedFleetWrite(w, p, "notify.channel.upsert", "notify:send") {
+			return
+		}
 		var req struct {
 			ID      string            `json:"id"`
 			Name    string            `json:"name"`
@@ -4609,6 +4638,9 @@ func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
+	if s.refuseConfinedFleetWrite(w, p, "notify.channel.delete", "notify:send") {
+		return
+	}
 	var req struct {
 		ID string `json:"id"`
 	}
@@ -4628,6 +4660,9 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"rules": s.store.NotifyRules()})
 	case http.MethodPost:
+		if s.refuseConfinedFleetWrite(w, p, "notify.rule.upsert", "notify:send") {
+			return
+		}
 		var req struct {
 			ID            string   `json:"id"`
 			Name          string   `json:"name"`
@@ -4667,6 +4702,9 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 func (s *Server) handleDeleteNotifyRule(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if s.refuseConfinedFleetWrite(w, p, "notify.rule.delete", "notify:send") {
 		return
 	}
 	var req struct {

@@ -217,3 +217,41 @@ func TestRerunNodeAuthorizesBeforeMembership(t *testing.T) {
 		t.Fatalf("an unauthorized in-target node must 403, got %d", inTarget.StatusCode)
 	}
 }
+
+// TestFleetWideWritesRefuseConfinedTokens pins findings B, D, and E of the
+// 2026-09-01 multi-operator audit: writes whose blast radius is the whole
+// fleet carry no node id, so rbac.Allows never consults the allowlist, and a
+// node-restricted token reached past its confinement. Every such write now
+// refuses a confined principal BEFORE decoding the body: the confined token
+// sees 403 where an unrestricted one proceeds to ordinary validation.
+func TestFleetWideWritesRefuseConfinedTokens(t *testing.T) {
+	handler, st := newTestServer(t)
+	st.UpsertNode(model.Node{ID: "node-a", Name: "allowed"})
+	cookies, csrf := loginSession(t, handler)
+	scopes := []string{"notify:send", "oidc:admin", "netpolicy:admin"}
+	confined := createPAT(t, handler, cookies, csrf, scopes, []string{"node-a"})
+	unrestricted := createPAT(t, handler, cookies, csrf, scopes, nil)
+
+	endpoints := []string{
+		"/api/notify/channels",
+		"/api/notify/channels/delete",
+		"/api/notify/rules",
+		"/api/notify/rules/delete",
+		"/api/auth/oidc/providers",
+		"/api/auth/oidc/providers/delete",
+		"/api/group-policies",
+		"/api/group-policies/delete",
+	}
+	for _, path := range endpoints {
+		res := doBearerJSON(t, handler, http.MethodPost, path, `{}`, confined)
+		res.Body.Close()
+		if res.StatusCode != http.StatusForbidden {
+			t.Errorf("%s: confined token must be refused with 403, got %d", path, res.StatusCode)
+		}
+		res = doBearerJSON(t, handler, http.MethodPost, path, `{}`, unrestricted)
+		res.Body.Close()
+		if res.StatusCode == http.StatusForbidden {
+			t.Errorf("%s: unrestricted token must pass the gate (any non-403), got 403", path)
+		}
+	}
+}

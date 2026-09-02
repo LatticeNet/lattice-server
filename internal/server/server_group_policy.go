@@ -51,6 +51,12 @@ func (s *Server) handleGroupPolicy(w http.ResponseWriter, r *http.Request, p pri
 		if !s.requireScope(w, p, "netpolicy:admin") {
 			return
 		}
+		// A group policy definition expands across its group's nodes at plan
+		// time; the per-node apply is gated, but a confined token defining or
+		// deleting fleet policy is the definition-layer half of the same hole.
+		if s.refuseConfinedFleetWrite(w, p, "grouppolicy.upsert", "netpolicy:admin") {
+			return
+		}
 		var req model.GroupNetPolicy
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -135,6 +141,9 @@ func (s *Server) validateGroupRule(r model.GroupNetRule) error {
 func (s *Server) handleDeleteGroupPolicy(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if s.refuseConfinedFleetWrite(w, p, "grouppolicy.delete", "netpolicy:admin") {
 		return
 	}
 	var req struct {

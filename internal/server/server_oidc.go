@@ -327,6 +327,11 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"providers": out})
 	case http.MethodPost:
+		// Rewriting an SSO provider is fleet-wide authentication surgery, the
+		// widest blast radius a confined token could reach past its allowlist.
+		if s.refuseConfinedFleetWrite(w, p, "oidc.provider.upsert", "oidc:admin") {
+			return
+		}
 		var req model.OIDCProvider
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -382,6 +387,9 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 func (s *Server) handleDeleteOIDCProvider(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if s.refuseConfinedFleetWrite(w, p, "oidc.provider.delete", "oidc:admin") {
 		return
 	}
 	var req struct {

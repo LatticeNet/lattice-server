@@ -575,3 +575,74 @@ func TestGuardRealitySnapshotCanonicalizesEmptyAndSetOrder(t *testing.T) {
 		t.Fatalf("reordered retry changed=%v err=%v", changed, err)
 	}
 }
+
+func TestGuardRealitySnapshotCanonicalizesAndCopiesSSHDFacts(t *testing.T) {
+	st, err := Open("")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	if err := st.UpsertNode(model.Node{ID: "node-sshd", LatticeIdentityUUID: "node-sshd-generation"}); err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+	collectedAt := time.Date(2026, 9, 2, 7, 0, 0, 0, time.UTC)
+	snapshot := GuardRealitySnapshot{
+		Reality: model.GuardNodeReality{
+			NodeID:      "node-sshd",
+			CollectedAt: collectedAt,
+			SSHD: &model.GuardSSHDFacts{
+				PubkeyAuthentication: true,
+				PermitRootLogin:      "no",
+				Ports:                []int{58394, 22, 22},
+				ListenAddresses:      []string{"[::]:58394", "0.0.0.0:58394", "0.0.0.0:58394"},
+				ObservedAt:           collectedAt,
+			},
+		},
+		ReceivedAt: collectedAt.Add(time.Second),
+	}
+	stored, changed, err := st.UpsertGuardRealitySnapshot("node-sshd-generation", snapshot)
+	if err != nil || !changed {
+		t.Fatalf("upsert sshd facts changed=%v err=%v", changed, err)
+	}
+	ports, listen := stored.Reality.SSHD.Ports, stored.Reality.SSHD.ListenAddresses
+	if len(ports) != 2 || ports[0] != 22 || ports[1] != 58394 {
+		t.Fatalf("ports not a sorted set: %v", ports)
+	}
+	if len(listen) != 2 || listen[0] != "0.0.0.0:58394" || listen[1] != "[::]:58394" {
+		t.Fatalf("listen addresses not a sorted set: %v", listen)
+	}
+
+	// Neither the caller's input nor the returned copy may share memory with
+	// what the store holds.
+	snapshot.Reality.SSHD.Ports[0] = 1
+	snapshot.Reality.SSHD.PermitRootLogin = "mutated"
+	stored.Reality.SSHD.ListenAddresses[0] = "mutated"
+	again, ok := st.GuardRealitySnapshot("node-sshd")
+	if !ok || again.Reality.SSHD.PermitRootLogin != "no" || again.Reality.SSHD.Ports[0] != 22 || again.Reality.SSHD.ListenAddresses[0] != "0.0.0.0:58394" {
+		t.Fatalf("store shares sshd facts memory with callers: %+v", again.Reality.SSHD)
+	}
+
+	// The same facts in configuration order are the idempotent retry, not a
+	// conflict.
+	retry := snapshot
+	retry.Reality.SSHD = &model.GuardSSHDFacts{
+		PubkeyAuthentication: true,
+		PermitRootLogin:      "no",
+		Ports:                []int{22, 58394},
+		ListenAddresses:      []string{"0.0.0.0:58394", "[::]:58394"},
+		ObservedAt:           collectedAt,
+	}
+	if _, changed, err := st.UpsertGuardRealitySnapshot("node-sshd-generation", retry); err != nil || changed {
+		t.Fatalf("reordered sshd retry changed=%v err=%v", changed, err)
+	}
+
+	// A later report without the block (an older agent, or a refusal) stores
+	// exactly that: no facts, and no note invented on the server.
+	plain := GuardRealitySnapshot{
+		Reality:    model.GuardNodeReality{NodeID: "node-sshd", CollectedAt: collectedAt.Add(time.Minute)},
+		ReceivedAt: collectedAt.Add(time.Minute + time.Second),
+	}
+	stored, _, err = st.UpsertGuardRealitySnapshot("node-sshd-generation", plain)
+	if err != nil || stored.Reality.SSHD != nil || stored.Reality.SSHDNote != "" {
+		t.Fatalf("plain report stored with sshd data: err=%v sshd=%+v note=%q", err, stored.Reality.SSHD, stored.Reality.SSHDNote)
+	}
+}

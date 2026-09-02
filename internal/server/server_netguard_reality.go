@@ -33,6 +33,14 @@ const (
 	guardRealityMaxForeignTables  = 512
 	guardRealityMaxStringBytes    = 256
 	guardRealityMaxIfaceNameBytes = 64
+	// sshd accepts any number of Port and ListenAddress lines; a report
+	// carrying more than this says something is wrong on the node, and the
+	// SSH Guard columns could not print it anyway.
+	guardRealityMaxSSHDPorts           = 64
+	guardRealityMaxSSHDListenAddresses = 64
+	// The agent's refusal note quotes the failed rule and, for a command
+	// failure, the bounded stderr; 512 bytes holds that with room to spare.
+	guardRealityMaxSSHDNoteBytes = 512
 )
 
 type guardRealityResponse struct {
@@ -399,7 +407,65 @@ func normalizeGuardReality(reality model.GuardNodeReality, receivedAt time.Time)
 	}
 	reality.ManagedSHA = managedSHA
 	reality.NFTVersion = nftVersion
+	// sshd facts are optional on the wire: an agent that predates them sends
+	// neither key and must keep reporting exactly as before, and a current
+	// agent that refused sends only the note.
+	sshdNote, err := normalizePrintableString(reality.SSHDNote, "sshd_note", guardRealityMaxSSHDNoteBytes, false)
+	if err != nil {
+		return model.GuardNodeReality{}, false, err
+	}
+	reality.SSHDNote = sshdNote
+	if reality.SSHD != nil {
+		sshd, err := normalizeGuardRealitySSHD(*reality.SSHD, receivedAt)
+		if err != nil {
+			return model.GuardNodeReality{}, false, err
+		}
+		reality.SSHD = &sshd
+	}
 	return reality, collectedAtClamped, nil
+}
+
+// normalizeGuardRealitySSHD bounds the sshd facts the way the listeners are
+// bounded. observed_at is clamped like collected_at, so an agent clock in the
+// future cannot make a fact look fresher than the report that carried it.
+func normalizeGuardRealitySSHD(sshd model.GuardSSHDFacts, receivedAt time.Time) (model.GuardSSHDFacts, error) {
+	if sshd.ObservedAt.IsZero() {
+		return model.GuardSSHDFacts{}, errors.New("sshd.observed_at is required")
+	}
+	sshd.ObservedAt = sshd.ObservedAt.UTC()
+	if sshd.ObservedAt.After(receivedAt.UTC().Add(guardRealityFutureSlack)) {
+		sshd.ObservedAt = receivedAt.UTC()
+	}
+	if len(sshd.Ports) == 0 {
+		return model.GuardSSHDFacts{}, errors.New("sshd.ports must contain at least one port")
+	}
+	if len(sshd.Ports) > guardRealityMaxSSHDPorts {
+		return model.GuardSSHDFacts{}, fmt.Errorf("sshd.ports must contain at most %d entries", guardRealityMaxSSHDPorts)
+	}
+	for _, port := range sshd.Ports {
+		if port < 1 || port > 65535 {
+			return model.GuardSSHDFacts{}, errors.New("sshd.ports must be 1-65535")
+		}
+	}
+	permitRootLogin, err := normalizePrintableString(sshd.PermitRootLogin, "sshd.permit_root_login", guardRealityMaxStringBytes, true)
+	if err != nil {
+		return model.GuardSSHDFacts{}, err
+	}
+	sshd.PermitRootLogin = permitRootLogin
+	if sshd.MaxAuthTries < 0 {
+		return model.GuardSSHDFacts{}, errors.New("sshd.max_auth_tries must not be negative")
+	}
+	if len(sshd.ListenAddresses) > guardRealityMaxSSHDListenAddresses {
+		return model.GuardSSHDFacts{}, fmt.Errorf("sshd.listen_addresses must contain at most %d entries", guardRealityMaxSSHDListenAddresses)
+	}
+	for i := range sshd.ListenAddresses {
+		address, err := normalizePrintableString(sshd.ListenAddresses[i], "sshd.listen_addresses", guardRealityMaxStringBytes, true)
+		if err != nil {
+			return model.GuardSSHDFacts{}, err
+		}
+		sshd.ListenAddresses[i] = address
+	}
+	return sshd, nil
 }
 
 func normalizeGuardRealityListeners(listeners []model.GuardListener) error {
@@ -560,6 +626,13 @@ func (s *Server) shouldAuditGuardReality(nodeID string, reality model.GuardNodeR
 func guardRealityFingerprint(reality model.GuardNodeReality) string {
 	reality.NodeID = ""
 	reality.CollectedAt = time.Time{}
+	// The sshd observation time moves with every poll exactly like
+	// collected_at; leaving it in would audit every report again.
+	if reality.SSHD != nil {
+		sshd := *reality.SSHD
+		sshd.ObservedAt = time.Time{}
+		reality.SSHD = &sshd
+	}
 	data, _ := json.Marshal(reality)
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])

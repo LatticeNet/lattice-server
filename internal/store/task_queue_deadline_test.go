@@ -20,7 +20,7 @@ func TestWithNoDeadlineATaskWaitsForeverAsItAlwaysHas(t *testing.T) {
 	created := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	task := queuedTask(created)
 	now := created.Add(365 * 24 * time.Hour)
-	if !taskTargetAwaitingResult(task, "node-a", nil, nil, now, 0) {
+	if !taskTargetAwaitingResult(task, "node-a", nil, nil, nil, now, 0) {
 		t.Error("a task with no deadline stopped being deliverable")
 	}
 	if TaskPastQueueDeadline(task, now, 0) {
@@ -37,7 +37,7 @@ func TestPastTheDeadlineDeliveryIsWithdrawn(t *testing.T) {
 	deadline := 24 * time.Hour
 
 	justInside := created.Add(deadline - time.Minute)
-	if !taskTargetAwaitingResult(task, "node-a", nil, nil, justInside, deadline) {
+	if !taskTargetAwaitingResult(task, "node-a", nil, nil, nil, justInside, deadline) {
 		t.Error("a task inside its deadline was withdrawn early")
 	}
 	if TaskPastQueueDeadline(task, justInside, deadline) {
@@ -45,7 +45,7 @@ func TestPastTheDeadlineDeliveryIsWithdrawn(t *testing.T) {
 	}
 
 	justOutside := created.Add(deadline + time.Minute)
-	if taskTargetAwaitingResult(task, "node-a", nil, nil, justOutside, deadline) {
+	if taskTargetAwaitingResult(task, "node-a", nil, nil, nil, justOutside, deadline) {
 		t.Error("an expired task is still being offered to its agent")
 	}
 	if !TaskPastQueueDeadline(task, justOutside, deadline) {

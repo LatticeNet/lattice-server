@@ -11,19 +11,21 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 const (
-	agentUpdatePlugin         = "agentupdate"
+	// The plugin id and action prefix are shared with the store, which has
+	// to recognise an update task at re-lease time to refuse a downgrade.
+	agentUpdatePlugin         = store.AgentUpdatePlugin
 	agentUpdateAction         = "update-agent"
-	agentUpdateActionPrefix   = agentUpdateAction + ":"
+	agentUpdateActionPrefix   = store.AgentUpdateActionPrefix
 	agentUpdateAwaitingPrefix = "awaiting agent version confirmation"
 
 	defaultAgentInstallPath         = "/opt/lattice/node-agent/lattice-agent"
@@ -325,61 +327,11 @@ func isAgentVersionDowngrade(current, target string) bool {
 	return ok && cmp > 0
 }
 
+// compareAgentVersions is the store's ordering: the re-lease gate has to make
+// the same downgrade call this package makes at plan time, so there is one
+// implementation and it lives where the lock is held.
 func compareAgentVersions(a, b string) (int, bool) {
-	left, okLeft := parseAgentVersionParts(a)
-	right, okRight := parseAgentVersionParts(b)
-	if !okLeft || !okRight {
-		return 0, false
-	}
-	for i := 0; i < 3; i++ {
-		lv, rv := left[i], right[i]
-		if lv > rv {
-			return 1, true
-		}
-		if lv < rv {
-			return -1, true
-		}
-	}
-	if left[3] > right[3] {
-		return 1, true
-	}
-	if left[3] < right[3] {
-		return -1, true
-	}
-	if left[4] > right[4] {
-		return 1, true
-	}
-	if left[4] < right[4] {
-		return -1, true
-	}
-	return 0, true
-}
-
-var agentVersionPattern = regexp.MustCompile(`^v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-(alpha|beta|rc)\.([0-9]+))?$`)
-
-func parseAgentVersionParts(raw string) ([]int, bool) {
-	match := agentVersionPattern.FindStringSubmatch(raw)
-	if match == nil {
-		return nil, false
-	}
-	out := make([]int, 5)
-	for i := 1; i <= 3; i++ {
-		value, err := strconv.Atoi(match[i])
-		if err != nil {
-			return nil, false
-		}
-		out[i-1] = value
-	}
-	ranks := map[string]int{"alpha": 0, "beta": 1, "rc": 2, "": 3}
-	out[3] = ranks[match[4]]
-	if match[5] != "" {
-		value, err := strconv.Atoi(match[5])
-		if err != nil {
-			return nil, false
-		}
-		out[4] = value
-	}
-	return out, true
+	return store.CompareAgentVersions(a, b)
 }
 
 func normalizeAgentReleaseRepo(raw string) (string, error) {

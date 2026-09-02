@@ -50,6 +50,7 @@ type State struct {
 	Results            []model.TaskResult           `json:"results"`
 	TaskResultReceipts map[string]TaskResultReceipt `json:"task_result_receipts,omitempty"`
 	TaskExecContexts   map[string]TaskExecContext   `json:"task_exec_contexts,omitempty"`
+	TaskTargetStates   map[string]TaskTargetState   `json:"task_target_states,omitempty"`
 	NodeCapabilities   map[string]NodeCapability    `json:"node_capabilities,omitempty"`
 	CapabilityPolicies map[string]CapabilityPolicy  `json:"capability_policies,omitempty"`
 	Audit              []model.AuditEvent           `json:"audit"`
@@ -708,6 +709,7 @@ func emptyState() State {
 		Nodes:                  map[string]model.Node{},
 		Tasks:                  map[string]model.Task{},
 		TaskResultReceipts:     map[string]TaskResultReceipt{},
+		TaskTargetStates:       map[string]TaskTargetState{},
 		KV:                     map[string]model.KVEntry{},
 		PluginSecrets:          map[string]model.KVEntry{},
 		VpnUsers:               map[string]VpnUserPublicRecord{},
@@ -778,6 +780,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.TaskResultReceipts == nil {
 		st.TaskResultReceipts = map[string]TaskResultReceipt{}
+	}
+	if st.TaskTargetStates == nil {
+		st.TaskTargetStates = map[string]TaskTargetState{}
 	}
 	if st.KV == nil {
 		st.KV = map[string]model.KVEntry{}
@@ -1793,6 +1798,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		staged.Approvals[id] = approval
 	}
 	staged.LineChainAttempts = cloneLineChainAttempts(s.state.LineChainAttempts)
+	staged.TaskTargetStates = cloneTaskTargetStates(s.state.TaskTargetStates)
 	var lineChainValidator LineChainFirstLeaseValidator
 	if len(validate) > 0 {
 		lineChainValidator = validate[0]
@@ -1876,7 +1882,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		t := staged.Tasks[id]
 		protocol, current := gated(t)
 		if protocol == "" || !current ||
-			!taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts, now, s.taskQueueDeadline) {
+			!taskTargetAwaitingResult(t, nodeID, s.state.Results, s.state.TaskResultReceipts, s.state.TaskTargetStates, now, s.taskQueueDeadline) {
 			continue
 		}
 		// A lease is a durable delivery token, not a one-shot HTTP response. If
@@ -1930,9 +1936,36 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			t := staged.Tasks[id]
 			protocol, current := gated(t)
 			isGated := protocol != ""
-			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results, now, s.taskQueueDeadline) {
+			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results, staged.TaskTargetStates, now, s.taskQueueDeadline) {
 				continue
 			}
+			// Past the gate with a lease already recorded means that lease died
+			// without a result and this poll would hand the task out again. That
+			// is the moment to count, and the moment to stop: a script that
+			// kills its own agent re-leases forever otherwise (KI-20), and an
+			// update task re-run after a newer update landed is a downgrade.
+			targetKey := taskResultReceiptKey(t.ID, nodeID)
+			target := staged.TaskTargetStates[targetKey]
+			target.TaskID, target.NodeID = t.ID, nodeID
+			if _, releasing := taskTargetLeaseStart(t, nodeID); releasing {
+				if target.Attempts == 0 {
+					target.Attempts = 1
+				}
+				stallReason := ""
+				if reason, superseded := agentUpdateSuperseded(staged, t, nodeID); superseded {
+					stallReason = reason
+				} else if target.Attempts >= MaxTaskLeaseAttempts {
+					stallReason = TaskStalledAgentLostReason
+				}
+				if stallReason != "" {
+					target.StalledReason, target.StalledAt = stallReason, now
+					staged.TaskTargetStates[targetKey] = target
+					stateChanged = true
+					continue
+				}
+			}
+			target.Attempts++
+			staged.TaskTargetStates[targetKey] = target
 			if protocol == DurableProtocolLineChainV2 {
 				attempt := staged.LineChainAttempts[t.ApprovalID]
 				currentDefinition := staged.LineChainDefinitions[attempt.SourceLineUUID]
@@ -2218,14 +2251,14 @@ func taskLeaseExpiredAt(startedAt time.Time, timeoutSec int, now time.Time) bool
 // was withdrawn, so a path that still hands it out turns that into a lie the
 // operator acts on. Enforcing it in one of the two is worse than enforcing it
 // in neither, because it looks correct from the console.
-func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult, now time.Time, deadline time.Duration) bool {
+func taskCanLeaseTarget(t model.Task, nodeID string, results []model.TaskResult, targets map[string]TaskTargetState, now time.Time, deadline time.Duration) bool {
 	if !contains(t.Targets, nodeID) {
 		return false
 	}
 	if t.Status != model.TaskQueued && t.Status != model.TaskLeased {
 		return false
 	}
-	if taskPastQueueDeadline(t, now, deadline) {
+	if taskPastQueueDeadline(t, now, deadline) || taskTargetStalled(targets, t.ID, nodeID) {
 		return false
 	}
 	for _, r := range results {
@@ -2276,35 +2309,8 @@ const TaskStalled = "stalled"
 // expiring, but as evidence of progress it proves nothing, and this method
 // answers the honesty question, not the redelivery one.
 func (s *Store) TaskProgressStalled(id string, now time.Time) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t, ok := s.state.Tasks[id]
-	if !ok || t.Status != model.TaskLeased {
-		return false
-	}
-	answered := map[string]bool{}
-	for _, r := range s.state.Results {
-		if r.TaskID == t.ID {
-			answered[r.NodeID] = true
-		}
-	}
-	leaseLive := func(startedAt time.Time) bool {
-		return !startedAt.IsZero() && !taskLeaseExpiredAt(startedAt, t.TimeoutSec, now)
-	}
-	owing := false
-	for _, target := range uniqueStrings(t.Targets) {
-		if answered[target] {
-			continue
-		}
-		owing = true
-		if lease, ok := t.TargetLeases[target]; ok && lease.LeaseID != "" && leaseLive(lease.StartedAt) {
-			return false
-		}
-		if t.LeasedBy == target && t.LeaseID != "" && leaseLive(t.StartedAt) {
-			return false
-		}
-	}
-	return owing
+	progress, ok := s.TaskProgress(id, now)
+	return ok && progress.Stalled
 }
 
 // taskTargetAwaitingResult reports whether this node still owes a result.
@@ -2316,11 +2322,13 @@ func (s *Store) TaskProgressStalled(id string, now time.Time) bool {
 // leaseTaskDeliveries consults, so a task the console calls expired is one the
 // agent genuinely will not be handed. Presenting it as terminal while the queue
 // would still run it a week later would be a lie the operator acts on.
-func taskTargetAwaitingResult(t model.Task, nodeID string, results []model.TaskResult, receipts map[string]TaskResultReceipt, now time.Time, deadline time.Duration) bool {
+func taskTargetAwaitingResult(t model.Task, nodeID string, results []model.TaskResult, receipts map[string]TaskResultReceipt, targets map[string]TaskTargetState, now time.Time, deadline time.Duration) bool {
 	if !contains(t.Targets, nodeID) || (t.Status != model.TaskQueued && t.Status != model.TaskLeased) {
 		return false
 	}
-	if taskPastQueueDeadline(t, now, deadline) {
+	// A stalled target is one the store has stopped waiting for, so it no
+	// longer owes anything: redelivering it would undo the stall.
+	if taskPastQueueDeadline(t, now, deadline) || taskTargetStalled(targets, t.ID, nodeID) {
 		return false
 	}
 	for _, result := range results {
@@ -2536,6 +2544,11 @@ func (s *Store) DeleteTask(id string) error {
 	for key, receipt := range s.state.TaskResultReceipts {
 		if receipt.TaskID == id {
 			delete(s.state.TaskResultReceipts, key)
+		}
+	}
+	for key, target := range s.state.TaskTargetStates {
+		if target.TaskID == id {
+			delete(s.state.TaskTargetStates, key)
 		}
 	}
 	if len(s.state.Results) > 0 {

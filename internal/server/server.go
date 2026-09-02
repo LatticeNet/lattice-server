@@ -3478,7 +3478,73 @@ func validateTaskCreate(interpreter, script string, timeoutSec, outputLimit int)
 	if len([]byte(script)) > maxTaskScriptBytes {
 		return fmt.Errorf("script exceeds %d bytes", maxTaskScriptBytes)
 	}
+	if command, kills := scriptFirstCommandKillsAgent(script); kills {
+		return fmt.Errorf("script's first command %q stops the agent before it can report a result, so the task would be re-leased until it stalls; schedule the restart through a transient unit after the result is posted (systemd-run --on-active=3s systemctl restart lattice-agent), the way the agent update script does", command)
+	}
 	return nil
+}
+
+// agentKillingCommands are the exact commands that take the agent down on the
+// two service managers the fleet runs. A task that opens with one of them can
+// never post its result: the agent dies, the lease expires, the store hands
+// the task back to the same node, and the node restarts every poll interval
+// until someone notices (KI-20: 1,400 restarts in six days). Only the first
+// command is judged, and only these spellings; a restart placed after the
+// output, or deferred through systemd-run, is still allowed.
+var agentKillingCommands = []string{
+	"systemctl stop lattice-agent",
+	"systemctl restart lattice-agent",
+	"launchctl kickstart -k system/net.lattice.agent",
+}
+
+// scriptFirstCommandKillsAgent returns the script's first command and whether
+// it is one of agentKillingCommands. Comments and blank lines (the shebang
+// included) are skipped; the first command line is cut at the first shell
+// separator, redirection or trailing comment, so "systemctl restart
+// lattice-agent; sleep 8; …" and "systemctl stop lattice-agent >/tmp/log
+// 2>&1" are both judged on the command that actually runs. The pattern has
+// to match the leading words; anything after them (a flag such as
+// --no-block, a second unit) leaves the agent just as dead. The unit may be
+// written with or without its .service suffix, which systemd treats alike.
+func scriptFirstCommandKillsAgent(script string) (string, bool) {
+	first := ""
+	for _, line := range strings.Split(script, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		first = line
+		break
+	}
+	if first == "" {
+		return "", false
+	}
+	if cut := strings.IndexAny(first, ";&|#<>"); cut >= 0 {
+		first = first[:cut]
+	}
+	fields := strings.Fields(first)
+	command := strings.Join(fields, " ")
+	for _, pattern := range agentKillingCommands {
+		want := strings.Fields(pattern)
+		if len(fields) < len(want) {
+			continue
+		}
+		matched := true
+		for i, token := range want {
+			got := fields[i]
+			if i == len(want)-1 {
+				got = strings.TrimSuffix(got, ".service")
+			}
+			if got != token {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			return command, true
+		}
+	}
+	return command, false
 }
 
 // queueTask is the sole enforcement point for fleet-wide task policy: the exec
@@ -3564,6 +3630,24 @@ type taskView struct {
 	CreatedAt       time.Time `json:"created_at"`
 	StartedAt       time.Time `json:"started_at,omitempty"`
 	FinishedAt      time.Time `json:"finished_at,omitempty"`
+	// Attempts, LeaseAgeSeconds and StalledReason summarise a single-target
+	// task; TargetStates carries the same per node for every leased task, so
+	// a fan-out row can say which node is on its third try. All omitted when
+	// nothing has been leased, so older consumers see the shape they had.
+	Attempts        int                       `json:"attempts,omitempty"`
+	MaxAttempts     int                       `json:"max_attempts,omitempty"`
+	LeaseAgeSeconds int64                     `json:"lease_age_seconds,omitempty"`
+	StalledReason   string                    `json:"stalled_reason,omitempty"`
+	TargetStates    map[string]taskTargetView `json:"target_states,omitempty"`
+}
+
+// taskTargetView is one target's progress inside a leased task.
+type taskTargetView struct {
+	Status          string `json:"status"`
+	Attempts        int    `json:"attempts,omitempty"`
+	MaxAttempts     int    `json:"max_attempts,omitempty"`
+	LeaseAgeSeconds int64  `json:"lease_age_seconds,omitempty"`
+	StalledReason   string `json:"stalled_reason,omitempty"`
 }
 
 // toTaskView presents a task the way an operator has to read it.
@@ -3587,10 +3671,46 @@ func (s *Server) toTaskView(t model.Task) taskView {
 	}
 	// A leased task with no live lease on any resultless target is not
 	// running anywhere; "Running" would be a lie the operator waits on.
-	if status == model.TaskLeased && s.store.TaskProgressStalled(t.ID, s.now()) {
-		status = store.TaskStalled
+	var targetStates map[string]taskTargetView
+	attempts, leaseAge, stalledReason := 0, int64(0), ""
+	// Only a leased task has progress to read; asking the store for the
+	// others would take its lock once per row of task history for nothing.
+	if progress, ok := s.taskProgressIfLeased(t, status); ok {
+		if progress.Stalled {
+			status = store.TaskStalled
+		}
+		targetStates = make(map[string]taskTargetView, len(progress.Targets))
+		for _, target := range uniqueStrings(t.Targets) {
+			entry := progress.Targets[target]
+			view := taskTargetView{Status: entry.Status, Attempts: entry.Attempts, StalledReason: entry.StalledReason}
+			if entry.Attempts > 0 {
+				view.MaxAttempts = store.MaxTaskLeaseAttempts
+				view.LeaseAgeSeconds = int64(entry.LeaseAge / time.Second)
+			}
+			targetStates[target] = view
+			// The first stalled reason in target order names the task's
+			// problem; a fan-out with one dead node reads the same as a
+			// single-target task with that node.
+			if stalledReason == "" && entry.StalledReason != "" {
+				stalledReason = entry.StalledReason
+			}
+		}
+		if len(targetStates) == 1 {
+			for _, view := range targetStates {
+				attempts, leaseAge = view.Attempts, view.LeaseAgeSeconds
+			}
+		}
+	}
+	maxAttempts := 0
+	if attempts > 0 {
+		maxAttempts = store.MaxTaskLeaseAttempts
 	}
 	return taskView{
+		Attempts:        attempts,
+		MaxAttempts:     maxAttempts,
+		LeaseAgeSeconds: leaseAge,
+		StalledReason:   stalledReason,
+		TargetStates:    targetStates,
 		ID:              t.ID,
 		ActorID:         t.ActorID,
 		TokenID:         t.TokenID,
@@ -3608,6 +3728,13 @@ func (s *Server) toTaskView(t model.Task) taskView {
 		StartedAt:       t.StartedAt,
 		FinishedAt:      t.FinishedAt,
 	}
+}
+
+func (s *Server) taskProgressIfLeased(t model.Task, status string) (store.TaskProgress, bool) {
+	if status != model.TaskLeased {
+		return store.TaskProgress{}, false
+	}
+	return s.store.TaskProgress(t.ID, s.now())
 }
 
 func scriptSHA256(script string) string {

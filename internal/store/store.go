@@ -2879,16 +2879,21 @@ func (s *Store) AuditEvents() []model.AuditEvent {
 func (s *Store) ScanAuditEventsDesc(visit func(model.AuditEvent) bool) error {
 	s.mu.Lock()
 	hot := s.runtimeBoltHot
-	var snapshot []model.AuditEvent
-	if hot == nil {
-		snapshot = append([]model.AuditEvent(nil), s.state.Audit...)
-	}
+	events := s.state.Audit
 	s.mu.Unlock()
 	if hot != nil {
 		return hot.ScanAuditEventsDesc(visit)
 	}
-	for i := len(snapshot) - 1; i >= 0; i-- {
-		if !visit(snapshot[i]) {
+	// The slice header taken under the lock is a stable snapshot without a
+	// copy. Audit events are only ever appended (AppendAudit) or the slice is
+	// replaced wholesale (AppendAuditIdempotent, the hot store migration); no
+	// path edits an element in place, and an append that fits the backing array
+	// writes past this header's length. So the walk can run outside the lock
+	// over the elements as they were at capture time. The copy this replaces
+	// cost the whole log per call: about 170 MB of allocation per page view at
+	// a million events, on a read path that only ever wants the newest page.
+	for i := len(events) - 1; i >= 0; i-- {
+		if !visit(events[i]) {
 			return nil
 		}
 	}

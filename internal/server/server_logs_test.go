@@ -248,3 +248,46 @@ func TestLogBatchCapArithmeticFitsDecodeLimit(t *testing.T) {
 		t.Fatal("retry-after must be set")
 	}
 }
+
+func TestLogSourceListMarksServerOwnedSourcesManaged(t *testing.T) {
+	handler, st := newLogServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, _ := enrollNode(t, handler, cookies, csrf)
+
+	create := doJSON(t, handler, http.MethodPost, "/api/logs/sources",
+		`{"name":"mine","node_id":"`+nodeID+`","path":"/var/log/mine.log"}`, cookies, csrf)
+	create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create log source: %d", create.StatusCode)
+	}
+	if err := st.UpsertLogSource(model.LogSource{
+		ID: singBoxLogSourceID(nodeID), Name: "sing-box", NodeID: nodeID,
+		Path: singBoxLogPathPrefix + nodeID, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/logs/sources", "", cookies, csrf)
+	defer list.Body.Close()
+	var body struct {
+		Sources []struct {
+			ID      string `json:"id"`
+			Managed bool   `json:"managed"`
+		} `json:"sources"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	managed := map[string]bool{}
+	for _, src := range body.Sources {
+		managed[src.ID] = src.Managed
+	}
+	if !managed[singBoxLogSourceID(nodeID)] {
+		t.Fatalf("the sing-box source must be marked managed, got %+v", body.Sources)
+	}
+	for id, m := range managed {
+		if id != singBoxLogSourceID(nodeID) && m {
+			t.Fatalf("operator source %s must not be marked managed", id)
+		}
+	}
+}

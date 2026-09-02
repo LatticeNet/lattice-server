@@ -30,6 +30,7 @@ type proxyUserNotificationFire struct {
 
 func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([]proxyUserNotificationFire, error) {
 	users := s.store.ProxyUsers()
+	identities := s.vpnUsersByAccounting()
 	fired := []proxyUserNotificationFire{}
 	found := onlyID == ""
 	changed := false
@@ -39,8 +40,11 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 		}
 		found = true
 		originalStatus := user.Status
-		user.Status = derivedProxyUserStatusAt(user, now)
-		updated, alerts := nextProxyUserNotifications(user, now)
+		var identity *VpnUser
+		if vu, ok := identities[user.ID]; ok {
+			identity = &vu
+		}
+		updated, alerts := s.quotaEvaluate(user, identity, now, usageCounter{})
 		if len(alerts) == 0 {
 			if updated.Status != originalStatus {
 				if err := s.store.UpsertProxyUser(updated); err != nil {
@@ -67,11 +71,19 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 }
 
 func nextProxyUserNotifications(user model.ProxyUser, now time.Time) (model.ProxyUser, []proxyUserNotificationFire) {
+	return nextProxyUserNotificationsForPeriod(user, now, "")
+}
+
+// nextProxyUserNotificationsForPeriod is the period-aware form: period is the
+// yyyymmdd the current quota period started, or empty for a lifetime quota.
+// The period is part of the notification key, so the 80 and 100 percent
+// alerts fire again in every period.
+func nextProxyUserNotificationsForPeriod(user model.ProxyUser, now time.Time, period string) (model.ProxyUser, []proxyUserNotificationFire) {
 	if !user.Enabled {
 		return user, nil
 	}
 	alerts := []proxyUserNotificationFire{}
-	if alert, ok := nextProxyQuotaNotification(user); ok {
+	if alert, ok := nextProxyQuotaNotification(user, period); ok {
 		user.LastQuotaNotifiedKey = alert.Key
 		alerts = append(alerts, alert)
 	}
@@ -82,13 +94,13 @@ func nextProxyUserNotifications(user model.ProxyUser, now time.Time) (model.Prox
 	return user, alerts
 }
 
-func nextProxyQuotaNotification(user model.ProxyUser) (proxyUserNotificationFire, bool) {
+func nextProxyQuotaNotification(user model.ProxyUser, period string) (proxyUserNotificationFire, bool) {
 	threshold, ok := proxyQuotaThreshold(user.UsedBytes, user.TrafficLimitBytes)
 	if !ok {
 		return proxyUserNotificationFire{}, false
 	}
-	key := proxyQuotaNotificationKey(user.TrafficLimitBytes, threshold)
-	if proxyQuotaNotificationAlreadySent(user.LastQuotaNotifiedKey, user.TrafficLimitBytes, threshold) {
+	key := proxyQuotaNotificationKey(user.TrafficLimitBytes, period, threshold)
+	if proxyQuotaNotificationAlreadySent(user.LastQuotaNotifiedKey, user.TrafficLimitBytes, period, threshold) {
 		return proxyUserNotificationFire{}, false
 	}
 	return proxyUserNotificationFire{
@@ -136,12 +148,22 @@ func proxyQuotaThreshold(used, limit int64) (int, bool) {
 	return 0, false
 }
 
-func proxyQuotaNotificationKey(limit int64, threshold int) string {
-	return fmt.Sprintf("quota:%d:%d", limit, threshold)
+func proxyQuotaNotificationKey(limit int64, period string, threshold int) string {
+	return proxyQuotaNotificationPrefix(limit, period) + strconv.Itoa(threshold)
 }
 
-func proxyQuotaNotificationAlreadySent(last string, limit int64, threshold int) bool {
-	prefix := fmt.Sprintf("quota:%d:", limit)
+// proxyQuotaNotificationPrefix is "quota:<limit>:" for a lifetime quota and
+// "quota:<limit>:<period>:" for a period one, so a cursor written under the
+// old shape keeps suppressing the lifetime alert it was written for.
+func proxyQuotaNotificationPrefix(limit int64, period string) string {
+	if period == "" {
+		return fmt.Sprintf("quota:%d:", limit)
+	}
+	return fmt.Sprintf("quota:%d:%s:", limit, period)
+}
+
+func proxyQuotaNotificationAlreadySent(last string, limit int64, period string, threshold int) bool {
+	prefix := proxyQuotaNotificationPrefix(limit, period)
 	if !strings.HasPrefix(last, prefix) {
 		return false
 	}

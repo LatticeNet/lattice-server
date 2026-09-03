@@ -3,6 +3,8 @@ package server
 import (
 	"testing"
 	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // Every node posts usage every ten seconds. Auditing each report wrote about
@@ -76,5 +78,44 @@ func TestProxyUsageAuditIsPerNode(t *testing.T) {
 	}
 	if !s.shouldAuditProxyUsage("node-b", meta, base) {
 		t.Fatal("node-b is a different node and its first report must be audited")
+	}
+}
+
+// The sing-box discovery gate was written to stop exactly this flood and did
+// not work: Runtime.ProbedAt moves on every probe, so the fingerprint differed
+// every time and no report was ever suppressed. 25 nodes reporting every ten
+// seconds wrote 217,000 audit events a day, two thirds of the entire log.
+func TestSingBoxDiscoveryFingerprintIgnoresTheProbeClock(t *testing.T) {
+	probedAt := time.Date(2026, 9, 3, 6, 0, 0, 0, time.UTC)
+	inv := func(probe time.Time) model.SingBoxInventory {
+		return model.SingBoxInventory{
+			NodeID: "node-a",
+			At:     probe,
+			Nodes:  []model.SingBoxNode{{Name: "line-a", Protocol: "vless", Port: "443"}},
+			Runtime: &model.SingBoxRuntime{
+				Running: true, PID: 1234, ActiveState: "active", ProbedAt: probe,
+			},
+		}
+	}
+
+	first := inv(probedAt)
+	second := inv(probedAt.Add(10 * time.Second))
+	if singBoxDiscoveryFingerprint(first) != singBoxDiscoveryFingerprint(second) {
+		t.Fatal("two identical inventories probed ten seconds apart hashed differently, which defeats the gate")
+	}
+	if first.Runtime.ProbedAt != probedAt {
+		t.Fatal("fingerprinting mutated the caller's runtime, which is shared state")
+	}
+
+	restarted := inv(probedAt.Add(10 * time.Second))
+	restarted.Runtime.RestartCount = 1
+	if singBoxDiscoveryFingerprint(first) == singBoxDiscoveryFingerprint(restarted) {
+		t.Fatal("a restart count that moved is a real change and must still be audited")
+	}
+
+	failing := inv(probedAt.Add(10 * time.Second))
+	failing.Runtime.ProbeError = "connection refused"
+	if singBoxDiscoveryFingerprint(first) == singBoxDiscoveryFingerprint(failing) {
+		t.Fatal("a probe error is a state, not a clock, and must still be audited")
 	}
 }

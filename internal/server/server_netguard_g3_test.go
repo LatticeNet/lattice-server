@@ -480,15 +480,15 @@ func TestLegacyNFTApplyOnAdoptedNodeRemainsCompatible(t *testing.T) {
 	token := setupAdoptedNetGuardNode(t, handler, st, cookies, csrf)
 	before, _ := st.NodeGuardBinding("node-a")
 
+	// No accept_lockout_risk: setupAdoptedNetGuardNode stores public_tcp [22],
+	// so the legacy plan keeps a path to the shell and clears the lockout lint
+	// on its own merits.
 	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
 		t.Fatalf("legacy nft plan: %d", plan.StatusCode)
 	}
-	var approval model.Approval
-	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
-		t.Fatal(err)
-	}
+	approval := decodeNFTPlan(t, plan)
 	if isNetGuardApproval(approval) || approval.Action != "apply-ruleset" {
 		t.Fatalf("legacy plan was misclassified: %+v", approval)
 	}

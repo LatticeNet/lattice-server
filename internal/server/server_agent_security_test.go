@@ -675,18 +675,14 @@ func TestAgentSecurityFailuresUseStableErrorCodes(t *testing.T) {
 func TestApproveIsIdempotentWhenQueueingApply(t *testing.T) {
 	handler, _ := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
-	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a","public_tcp":[443]}`, cookies, csrf)
+	// node-a has no stored baseline, so a tcp/443-only plan drops the shell.
+	// This test is about approve idempotency, so it accepts that risk out loud.
+	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a","public_tcp":[443],"accept_lockout_risk":true}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
 		t.Fatalf("plan failed: %d", plan.StatusCode)
 	}
-	var approval struct {
-		ID   string `json:"id"`
-		Plan string `json:"plan"`
-	}
-	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
-		t.Fatal(err)
-	}
+	approval := decodeNFTPlan(t, plan)
 	bodies := []string{
 		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})),
 		`{"approval_id":"` + approval.ID + `","queue_apply":true}`,

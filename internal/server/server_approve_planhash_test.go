@@ -25,17 +25,17 @@ func TestApprovePlanHashBinding(t *testing.T) {
 	cookies, csrf := loginSession(t, handler)
 
 	// Create an approval via an nft plan.
+	// pn1 has no stored Network Guard baseline, so this plan's composed chain
+	// accepts tcp/443 and drops everything else including the shell. The test
+	// is about the approval plan hash, not about lockout, so it accepts the
+	// risk explicitly rather than planning an unsafe ruleset silently.
 	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
-		`{"node_id":"pn1","public_tcp":[443]}`, cookies, csrf)
+		`{"node_id":"pn1","public_tcp":[443],"accept_lockout_risk":true}`, cookies, csrf)
 	if plan.StatusCode != http.StatusOK {
 		plan.Body.Close()
 		t.Fatalf("nft plan: %d", plan.StatusCode)
 	}
-	var created struct {
-		ID   string `json:"id"`
-		Plan string `json:"plan"`
-	}
-	json.NewDecoder(plan.Body).Decode(&created)
+	created := decodeNFTPlan(t, plan)
 	plan.Body.Close()
 	if created.ID == "" || created.Plan == "" {
 		t.Fatalf("expected approval id+plan, got %+v", created)
@@ -79,16 +79,17 @@ func TestRejectApprovalClosesPendingPlan(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 
+	// pn1 has no stored Network Guard baseline, so this plan's composed chain
+	// accepts tcp/443 and drops everything else including the shell. The test
+	// is about the reject path, not about lockout, so it accepts the
+	// risk explicitly rather than planning an unsafe ruleset silently.
 	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
-		`{"node_id":"pn1","public_tcp":[443]}`, cookies, csrf)
+		`{"node_id":"pn1","public_tcp":[443],"accept_lockout_risk":true}`, cookies, csrf)
 	if plan.StatusCode != http.StatusOK {
 		plan.Body.Close()
 		t.Fatalf("nft plan: %d", plan.StatusCode)
 	}
-	var created approvalView
-	if err := json.NewDecoder(plan.Body).Decode(&created); err != nil {
-		t.Fatal(err)
-	}
+	created := decodeNFTPlan(t, plan)
 	plan.Body.Close()
 	if created.ID == "" {
 		t.Fatalf("expected approval id, got %+v", created)

@@ -37,6 +37,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/logstore"
+	"github.com/LatticeNet/lattice-server/internal/netguard"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/notify"
 	"github.com/LatticeNet/lattice-server/internal/oidc"
@@ -5688,6 +5689,11 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	}
 	var req struct {
 		NodeID string `json:"node_id"`
+		// AcceptLockoutRisk mirrors the Network Guard and DNS plan contract.
+		// This endpoint composes and commits the same single lattice_guard
+		// input chain, so it carries the same lockout risk and gets the same
+		// explicit, audited override.
+		AcceptLockoutRisk bool `json:"accept_lockout_risk"`
 		network.NFTPlan
 	}
 	if !decodeClientJSON(w, r, &req) {
@@ -5718,6 +5724,30 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// This endpoint replaces the node's whole lattice_guard input chain, and
+	// that chain is policy drop. Whatever the composed plan does not accept is
+	// dropped, so a plan that lists no management port severs the operator's
+	// shell the moment it commits. That is true of every source this handler
+	// accepts: a caller-supplied ruleset accepts only the ports the request
+	// listed, and a node with no stored inputs falls through to an empty plan
+	// that accepts nothing at all.
+	//
+	// netguard.Lint is the only check that catches it. The node-side apply
+	// verifies with an outbound control-plane selfcheck, which a default-drop
+	// input ruleset still permits, so the selfcheck passes, the dead-man
+	// watchdog is disarmed, and the ruleset commits permanently. Run it here
+	// for the same reason the Network Guard and DNS plan paths run it.
+	findings := netguard.Lint(planInput, netguard.LintOptions{
+		PublicURLConfigured: s.publicURL != "",
+		Reality:             s.guardRealityForLint(req.NodeID),
+	})
+	if netguard.Blocking(findings) && !req.AcceptLockoutRisk {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":    "plan blocked by lint findings",
+			"findings": findings,
+		})
+		return
+	}
 	plan, err := network.GenerateNFTPlan(planInput)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -5742,8 +5772,15 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	if ingressRules > 0 {
 		metadata["ingress_rules"] = strconv.Itoa(ingressRules)
 	}
+	if netguard.Blocking(findings) {
+		metadata["lockout_risk_accepted"] = "true"
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID: id.New("audit"), NodeID: req.NodeID, Action: "network.nft.lockout_risk.accepted", Scope: "network:plan",
+			Metadata: map[string]string{"node_id": req.NodeID, "approval_id": approval.ID},
+		})
+	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "network.nft.plan", Scope: "network:plan", Metadata: metadata})
-	writeJSON(w, http.StatusOK, approval)
+	writeJSON(w, http.StatusOK, map[string]any{"approval": approval, "findings": findings})
 }
 
 func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p principal) {

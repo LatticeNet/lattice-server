@@ -571,20 +571,16 @@ func TestRemainingPrivilegedAllowAuditsUseRequestID(t *testing.T) {
 	}
 	assertResponseAuditCorrelation(t, st, tunnelDelete, "tunnel.delete", "tunnel:admin")
 
+	// audit-node has no stored baseline, so this tcp/443-only plan would drop
+	// the shell. The test is about audit correlation ids, so it accepts the
+	// lockout risk explicitly instead of quietly planning an unsafe ruleset.
 	nftPlan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
-		`{"node_id":"audit-node","public_tcp":[443]}`, cookies, csrf)
+		`{"node_id":"audit-node","public_tcp":[443],"accept_lockout_risk":true}`, cookies, csrf)
 	if nftPlan.StatusCode != http.StatusOK {
 		nftPlan.Body.Close()
 		t.Fatalf("nft plan failed: %d", nftPlan.StatusCode)
 	}
-	var approvalOut struct {
-		ID   string `json:"id"`
-		Plan string `json:"plan"`
-	}
-	if err := json.NewDecoder(nftPlan.Body).Decode(&approvalOut); err != nil {
-		nftPlan.Body.Close()
-		t.Fatal(err)
-	}
+	approvalOut := decodeNFTPlan(t, nftPlan)
 	nftPlan.Body.Close()
 
 	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
@@ -657,7 +653,7 @@ func TestPrivilegedAllowAuditUsesRequestID(t *testing.T) {
 	}
 
 	nftPlan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
-		`{"node_id":"audit-node","public_tcp":[443]}`, cookies, csrf)
+		`{"node_id":"audit-node","public_tcp":[443],"accept_lockout_risk":true}`, cookies, csrf)
 	nftPlan.Body.Close()
 	if nftPlan.StatusCode != http.StatusOK {
 		t.Fatalf("nft plan failed: %d", nftPlan.StatusCode)

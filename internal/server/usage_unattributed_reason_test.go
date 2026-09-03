@@ -165,3 +165,44 @@ func TestUnattributedReasonFromAReportedNode(t *testing.T) {
 		t.Fatalf("row: %+v", rows)
 	}
 }
+
+// A line can carry both an unnamed credential and a named one that resolves to
+// nothing. Reported by a switch returning on first match, only the unnamed note
+// appeared, and that is the less actionable of the two: an unnamed credential
+// is a permanent property of the config, while a named credential the server
+// cannot place means a real counter is being discarded.
+//
+// The defect is not the missing clause. It is that the clause shown reads as a
+// complete explanation, so an operator addresses it and stops looking.
+func TestUnattributedReasonReportsBothCausesWhenBothApply(t *testing.T) {
+	f := &usageLineFacts{Line: Line{NamedUsers: 2, UnnamedUsers: 1}, Named: map[string]string{}}
+	got := unattributedLineReason(f)
+
+	if !strings.Contains(got, "carries no name") {
+		t.Errorf("the unnamed-credential cause is missing: %q", got)
+	}
+	if !strings.Contains(got, "resolve to no identity the server knows") {
+		t.Errorf("the named-but-unresolved cause is missing, which is the actionable one: %q", got)
+	}
+	// Subject-verb agreement holds independently on each clause: one unnamed
+	// credential and two named ones, so "carries" and "resolve".
+	if strings.Contains(got, "1 credentials") || strings.Contains(got, "2 named credential ") {
+		t.Errorf("agreement is wrong on a combined reason: %q", got)
+	}
+}
+
+// The single-cause reasons must not gain a stray separator or a second clause
+// now that they are assembled rather than returned whole.
+func TestUnattributedReasonKeepsSingleCauseWordingIntact(t *testing.T) {
+	onlyUnnamed := unattributedLineReason(&usageLineFacts{Line: Line{UnnamedUsers: 2}, Named: map[string]string{}})
+	if want := "line usage, no user; 2 credentials on this line carry no name, so the node cannot count them individually"; onlyUnnamed != want {
+		t.Errorf("unnamed-only reason changed:\n got %q\nwant %q", onlyUnnamed, want)
+	}
+	onlyUnresolved := unattributedLineReason(&usageLineFacts{Line: Line{NamedUsers: 1}, Named: map[string]string{}})
+	if want := "line usage, no user; 1 named credential on this line resolves to no identity the server knows"; onlyUnresolved != want {
+		t.Errorf("unresolved-only reason changed:\n got %q\nwant %q", onlyUnresolved, want)
+	}
+	if bare := unattributedLineReason(&usageLineFacts{Line: Line{}, Named: map[string]string{}}); bare != "line usage, no user" {
+		t.Errorf("the bare reason gained a separator: %q", bare)
+	}
+}

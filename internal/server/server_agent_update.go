@@ -980,6 +980,7 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "- download is HTTPS-only and verified against the pinned SHA-256 digest\n")
 	fmt.Fprintf(&b, "- binary is installed atomically with a timestamped backup\n")
 	fmt.Fprintf(&b, "- service restart is delayed so the current agent can post the task result\n")
+	fmt.Fprintf(&b, "- the download gives up after 20 s without a connection or 300 s in total, so a node without egress to the source fails the task instead of hanging it\n")
 	fmt.Fprintf(&b, "- default/legacy install targets follow the running lattice-agent path and default service may follow the running systemd unit\n")
 	fmt.Fprintf(&b, "- execution still requires node-agent -allow-exec and root updates require -allow-root-exec\n")
 	return b.String()
@@ -1437,14 +1438,25 @@ func agentUpdateLeasePreflight(source string) string {
 		"fi\n"
 }
 
+// Fetch timeouts for the update download. Without them a node that cannot
+// reach the source (a CN node and github.com, observed 2026-09-02) sits in a
+// TCP connect that never completes, the task runs to its lease timeout, and
+// because the agent runs tasks on its report loop the node reads as offline
+// for the whole time. 20 s to connect and 300 s in total fit inside the
+// largest task timeout the server allows and leave the failure explicit.
+const (
+	agentFetchCurlTimeouts = " --connect-timeout 20 --max-time 300"
+	agentFetchWgetTimeouts = " --timeout=20 --tries=2"
+)
+
 // agentUpdateDownloadStep renders the one fetch the approved plan chose, rather
 // than both behind a runtime branch, so the script an operator reveals has a
 // single download command in it. The task lease is presented only on the
 // control-plane form: attaching it to an upstream release URL would hand a live
 // server credential to a third party.
 func agentUpdateDownloadStep(source string) string {
-	curl := "curl -fsSL --proto '=https' --tlsv1.2 -o \"$CANDIDATE\" \"$URL\""
-	wget := "wget --https-only -qO \"$CANDIDATE\" \"$URL\""
+	curl := "curl -fsSL --proto '=https' --tlsv1.2" + agentFetchCurlTimeouts + " -o \"$CANDIDATE\" \"$URL\""
+	wget := "wget --https-only -q" + agentFetchWgetTimeouts + " -O \"$CANDIDATE\" \"$URL\""
 	if source == agentBinarySourceControlPlane {
 		leaseHeaders := " -H \"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
 			" -H \"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\""
@@ -1458,8 +1470,8 @@ func agentUpdateDownloadStep(source string) string {
 		// the current proxy configuration. The upstream branch keeps following
 		// redirects, because release assets legitimately land on CDN storage,
 		// and it carries no credential.
-		curl = "curl -fsS --proto '=https' --tlsv1.2" + leaseHeaders + " -o \"$CANDIDATE\" \"$URL\""
-		wget = "wget --https-only -q --max-redirect=0" +
+		curl = "curl -fsS --proto '=https' --tlsv1.2" + agentFetchCurlTimeouts + leaseHeaders + " -o \"$CANDIDATE\" \"$URL\""
+		wget = "wget --https-only -q --max-redirect=0" + agentFetchWgetTimeouts +
 			" --header=\"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
 			" --header=\"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\"" +
 			" -O \"$CANDIDATE\" \"$URL\""

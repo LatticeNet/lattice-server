@@ -1142,6 +1142,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netguard/plan", s.withAuth("netguard:admin", s.handleNetGuardPlan))
 	mux.HandleFunc("/api/sshguard/plan", s.withAuth("sshguard:admin", s.handleSSHGuardPlan))
 	mux.HandleFunc("/api/sshguard/confirm", s.withAuth("sshguard:admin", s.handleSSHGuardConfirm))
+	// knock is the non-secret half: does the control plane know this node's
+	// sequence. Reachable with a bearer token so a plan can ask. knock/reveal is
+	// the secret half and is refused to anything that is not an interactive
+	// session; both check sshguard:read plus network:plan per node, which is what
+	// reading the arm plan already costs.
+	mux.HandleFunc("/api/sshguard/knock", s.withAuth("", s.handleSSHGuardKnockState))
+	mux.HandleFunc("/api/sshguard/knock/reveal", s.withAuth("", s.handleSSHGuardRevealKnock))
 	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("wireguard:admin", s.handleWireGuardPlan))
 	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
 	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))

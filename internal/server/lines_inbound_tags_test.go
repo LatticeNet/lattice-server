@@ -238,6 +238,19 @@ func TestLineInboundTagIndexDoesNotCaptureALiveTagWithAFileName(t *testing.T) {
 		t.Fatalf("line_named lost its own reported tag: %q", got.LineHashID)
 	}
 
+	// The same collision on a node that reports nothing resolves to the
+	// file-named line, which is what every join did before reported tags
+	// existed. This capture therefore predates the reported-tag join rather
+	// than being opened by it: pass 2 is what supplies the evidence to detect
+	// it, not what makes it reachable.
+	blind := live
+	blind.InboundTags = nil
+	index = lineInboundTagIndex([]LineGroup{{NodeID: "n1", Lines: []Line{named, blind}}})
+	if got := index[nodeTagKey{NodeID: "n1", Tag: "VLESS-REALITY-17893.json"}]; got.LineHashID != "line_named" {
+		t.Fatalf("pre-report behaviour = %q, want line_named: with no reported tags there is nothing "+
+			"to distinguish a file name from a live tag, which is the state this change improves on", got.LineHashID)
+	}
+
 	// A node that reports nothing has no evidence either way, so the convention
 	// stands and nothing about the old behaviour moves.
 	silent := Line{NodeID: "n1", LineHashID: "line_silent", Tag: "VLESS-REALITY-17893.json"}

@@ -1,13 +1,5 @@
-github.com/LatticeNet/lattice-sdk v0.2.23 h1:dxeO/n/StFq2A/E6eHYQy0R5lM/nmqQHm9D/nnmO77g=
-github.com/LatticeNet/lattice-sdk v0.2.23/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20260901093327-74bc00a34288 h1:V86Ljt6GqXBpVlU0o4j66JSK6jcEMr6+U5Dgkoq4wzw=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20260901093327-74bc00a34288/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20260901120913-92de80a280ea h1:2Rvpf1CScmriqJDUpn96ifhKR7cS44nuGLHyv9KkbpY=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20260901120913-92de80a280ea/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902071941-558e2ed7ef2a h1:YXo2EqwrYiT3jYqf6uY9LPKVs26zEpXobpNJunws4yo=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902071941-558e2ed7ef2a/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902145701-045d8e7d7938 h1:JWzT00ugFj6r7GlS3L43qfgFyEUjmKAa0lMhN2UbzHk=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902145701-045d8e7d7938/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
+github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902155107-ef6205899f1d h1:S9YIKUsuErPepIQ+v0hG9LJ+lgAXwkUyPnoozFuY4HA=
+github.com/LatticeNet/lattice-sdk v0.2.24-0.20260902155107-ef6205899f1d/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
 github.com/coreos/go-oidc/v3 v3.18.0 h1:V9orjXynvu5wiC9SemFTWnG4F45v403aIcjWo0d41+A=
 github.com/coreos/go-oidc/v3 v3.18.0/go.mod h1:DYCf24+ncYi+XkIH97GY1+dqoRlbaSI26KVTCI9SrY4=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

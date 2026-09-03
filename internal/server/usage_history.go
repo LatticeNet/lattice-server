@@ -357,19 +357,23 @@ func (s *Server) loadUsageWindow(w usageWindow, nodeIDs []string) usageWindow {
 	return w
 }
 
-// usageDayLineAttributed reports whether ingestion resolved this stored day row
-// to a line. It is one question with two callers who ask it for different
-// reasons, so it is one predicate rather than two that agree by coincidence:
-// sumWindow carries the hash forward so the read path can re-resolve a line the
-// live index has lost, and holdUnresolvableInboundTags reads it as proof that a
-// tag naming no line right now has named one before and will again.
+// usageDayLineEverAttributed reports whether ingestion ever recorded a line for
+// this stored day row. EVER is the whole of it: this decides nothing about
+// whether that line still exists, still resolves, or is still on that node.
 //
-// Those two uses are not interchangeable. The read path needs the hash to still
-// resolve in the current read model; the hold needs only that a hash was ever
-// recorded, because during a cold window nothing resolves and requiring it to
-// would defeat the hold. What they share is the evidence and the test on it,
-// which is what this keeps in one place.
-func usageDayLineAttributed(line store.UsageDayLine) bool {
+// It is deliberately the exact common subset of what its two callers need, and
+// nothing more. sumWindow carries the hash forward so the read path can
+// re-resolve a line the live index has lost; holdUnresolvableInboundTags reads
+// it as proof that a tag naming no line right now has named one before and will
+// again. The read path's stronger requirement, that the hash still resolves,
+// lives in attributeWindow as its own lookup and must stay there: the hold
+// cannot survive that check, because during a cold window nothing resolves.
+//
+// The rule that makes sharing safe, and the one to apply before adding a third
+// caller: a shared predicate is safe only when every caller's real requirement
+// is a subset of what it checks. Widening this to answer "does it still
+// resolve" would silently break the hold, so widen a caller instead.
+func usageDayLineEverAttributed(line store.UsageDayLine) bool {
 	return line.LineHashID != ""
 }
 
@@ -399,7 +403,7 @@ func (w usageWindow) sumWindow(from, to string) map[string]map[string]*usageWind
 					wl = &usageWindowLine{NodeID: nodeID, Tag: tag, Users: map[string]usageCounter{}}
 					out[nodeID][tag] = wl
 				}
-				if usageDayLineAttributed(line) {
+				if usageDayLineEverAttributed(line) {
 					wl.LineHashID = line.LineHashID
 				}
 				wl.Inbound.add(usageCounter{Uplink: line.Uplink, Downlink: line.Downlink})

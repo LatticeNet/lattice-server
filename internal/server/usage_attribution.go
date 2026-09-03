@@ -634,23 +634,45 @@ func (ctx *usageAttributionContext) attributeLine(nodeID, tag string, f *usageLi
 //
 // A node that reports neither count says nothing here, which is every node
 // until the helper script carrying the report is rolled.
+// Every applicable cause is reported, not the first one matched. A line can
+// carry unnamed credentials and named-but-unresolved ones at the same time, and
+// a switch returning on first match reported only one of them.
+//
+// The ordering also picked the less actionable one. An unnamed credential is a
+// permanent property of the config and nothing in the control plane fixes it; a
+// named credential resolving to no identity means the node is counting
+// something the server discards, which someone can act on.
+//
+// The failure that matters is not the missing half, it is that the half shown
+// reads as a complete explanation. An operator would address the unnamed note,
+// take the line as explained, and never learn a real counter was being thrown
+// away underneath it.
 func unattributedLineReason(f *usageLineFacts) string {
 	const base = "line usage, no user"
+	clauses := make([]string, 0, 2)
+	// Actionable first. A named credential the server cannot place means the
+	// node is counting something that is being discarded, which someone can do
+	// something about; an unnamed credential is a permanent property of the
+	// config. Order was an accident of the switch before, and an operator reads
+	// a diagnostic to find the part they can act on.
+	if f.Line.NamedUsers > 0 && len(f.Named) == 0 {
+		clauses = append(clauses, countedNoun(f.Line.NamedUsers, "named credential")+" on this line "+
+			agrees(f.Line.NamedUsers, "resolves", "resolve")+" to no identity the server knows")
+	}
 	switch {
 	case f.Line.UnnamedUsers > 0 && f.Line.NamedUsers == 0:
-		return base + "; " + countedNoun(f.Line.UnnamedUsers, "credential") + " on this line " +
-			agrees(f.Line.UnnamedUsers, "carries", "carry") +
-			" no name, so the node cannot count them individually"
+		clauses = append(clauses, countedNoun(f.Line.UnnamedUsers, "credential")+" on this line "+
+			agrees(f.Line.UnnamedUsers, "carries", "carry")+
+			" no name, so the node cannot count them individually")
 	case f.Line.UnnamedUsers > 0:
-		return base + "; " + countedNoun(f.Line.UnnamedUsers, "credential") + " on this line " +
-			agrees(f.Line.UnnamedUsers, "carries", "carry") +
-			" no name and " + agrees(f.Line.UnnamedUsers, "is", "are") + " counted only in the line total"
-	case f.Line.NamedUsers > 0 && len(f.Named) == 0:
-		return base + "; " + countedNoun(f.Line.NamedUsers, "named credential") + " on this line " +
-			agrees(f.Line.NamedUsers, "resolves", "resolve") + " to no identity the server knows"
-	default:
+		clauses = append(clauses, countedNoun(f.Line.UnnamedUsers, "credential")+" on this line "+
+			agrees(f.Line.UnnamedUsers, "carries", "carry")+
+			" no name and "+agrees(f.Line.UnnamedUsers, "is", "are")+" counted only in the line total")
+	}
+	if len(clauses) == 0 {
 		return base
 	}
+	return base + "; " + strings.Join(clauses, "; ")
 }
 
 // countedNoun and agrees keep these reasons readable as sentences. They are for

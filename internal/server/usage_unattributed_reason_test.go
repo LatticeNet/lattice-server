@@ -189,6 +189,12 @@ func TestUnattributedReasonReportsBothCausesWhenBothApply(t *testing.T) {
 	if strings.Contains(got, "1 credentials") || strings.Contains(got, "2 named credential ") {
 		t.Errorf("agreement is wrong on a combined reason: %q", got)
 	}
+	// The actionable cause leads. A reader skims a diagnostic for the part they
+	// can act on, and burying it behind a permanent property of the config is
+	// the wrong emphasis even when nothing is cut.
+	if strings.Index(got, "resolve to no identity") > strings.Index(got, "carries no name") {
+		t.Errorf("the unactionable cause leads the sentence: %q", got)
+	}
 }
 
 // The single-cause reasons must not gain a stray separator or a second clause

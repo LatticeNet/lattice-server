@@ -650,6 +650,15 @@ func (ctx *usageAttributionContext) attributeLine(nodeID, tag string, f *usageLi
 func unattributedLineReason(f *usageLineFacts) string {
 	const base = "line usage, no user"
 	clauses := make([]string, 0, 2)
+	// Actionable first. A named credential the server cannot place means the
+	// node is counting something that is being discarded, which someone can do
+	// something about; an unnamed credential is a permanent property of the
+	// config. Order was an accident of the switch before, and an operator reads
+	// a diagnostic to find the part they can act on.
+	if f.Line.NamedUsers > 0 && len(f.Named) == 0 {
+		clauses = append(clauses, countedNoun(f.Line.NamedUsers, "named credential")+" on this line "+
+			agrees(f.Line.NamedUsers, "resolves", "resolve")+" to no identity the server knows")
+	}
 	switch {
 	case f.Line.UnnamedUsers > 0 && f.Line.NamedUsers == 0:
 		clauses = append(clauses, countedNoun(f.Line.UnnamedUsers, "credential")+" on this line "+
@@ -659,10 +668,6 @@ func unattributedLineReason(f *usageLineFacts) string {
 		clauses = append(clauses, countedNoun(f.Line.UnnamedUsers, "credential")+" on this line "+
 			agrees(f.Line.UnnamedUsers, "carries", "carry")+
 			" no name and "+agrees(f.Line.UnnamedUsers, "is", "are")+" counted only in the line total")
-	}
-	if f.Line.NamedUsers > 0 && len(f.Named) == 0 {
-		clauses = append(clauses, countedNoun(f.Line.NamedUsers, "named credential")+" on this line "+
-			agrees(f.Line.NamedUsers, "resolves", "resolve")+" to no identity the server knows")
 	}
 	if len(clauses) == 0 {
 		return base

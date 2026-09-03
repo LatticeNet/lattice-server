@@ -168,53 +168,80 @@ type nodeTagKey struct {
 	Tag    string
 }
 
+// lineTagClaim ranks the evidence behind one line's claim on an inbound tag. A
+// tag resolves to the line holding the strongest claim on it; two lines tied at
+// that strength resolve to neither.
+type lineTagClaim int
+
+const (
+	// claimFileName is a line's own name, standing on nothing but the helper
+	// script's convention that create() writes the file name into the inbound's
+	// tag field. It is what every join assumed before this index existed. A
+	// conventional line's name is also a reported tag and is recorded again at
+	// the stronger level, so what is left at this level alone is a name the node
+	// either did not confirm or positively did not list.
+	claimFileName lineTagClaim = iota
+	// claimReported is a tag the node stated sing-box actually loaded. Counters
+	// and connection records are keyed by these, so this is the only kind of
+	// claim that is evidence about the thing being joined.
+	claimReported
+)
+
 // lineInboundTagIndex maps every inbound tag the read model can vouch for to the
 // line that owns it, for one fleet-wide set of groups. Both tag-keyed joins in
 // the server (usage counters and connection records) run off this, so the rules
 // live in one place.
 //
-// A line's own tag always wins: it is the file name the rest of the read model,
-// the line hash and the sidecar are all keyed by, and a second line's reported
-// tag must never displace it. A reported tag two lines both claim resolves to
-// neither. Attribution is allowed to say it does not know; it is not allowed to
-// guess, because a wrong attribution written once is indistinguishable from a
-// right one forever after.
+// Claims are ranked, not ordered by pass. A line's own name used to win
+// unconditionally, which is wrong in exactly the case this index was built for:
+// when a line's name is not a tag sing-box loaded, and another line reports that
+// same string as one it did load, the bytes are the second line's and were being
+// credited to the first with nothing flagged. Silence is the problem there.
+// An unattributed row is visible in the usage view; a misattributed one reads
+// like a fact.
+//
+// Two lines tied at the strongest claim resolve to neither. Attribution is
+// allowed to say it does not know; it is not allowed to guess, because a wrong
+// attribution written once is indistinguishable from a right one forever after.
 func lineInboundTagIndex(groups []LineGroup) map[nodeTagKey]Line {
-	index := map[nodeTagKey]Line{}
-	own := map[nodeTagKey]bool{}
-	for _, g := range groups {
-		for _, ln := range g.Lines {
-			if tag := strings.TrimSpace(ln.Tag); tag != "" {
-				key := nodeTagKey{NodeID: ln.NodeID, Tag: tag}
-				index[key] = ln
-				own[key] = true
-			}
+	type claim struct {
+		line      Line
+		strength  lineTagClaim
+		contested bool
+	}
+	claims := map[nodeTagKey]*claim{}
+	record := func(nodeID, tag string, ln Line, strength lineTagClaim) {
+		if tag = strings.TrimSpace(tag); tag == "" {
+			return
+		}
+		key := nodeTagKey{NodeID: nodeID, Tag: tag}
+		switch cur, ok := claims[key]; {
+		case !ok, strength > cur.strength:
+			// A stronger claim also clears any contest among weaker ones: those
+			// were only tied with each other.
+			claims[key] = &claim{line: ln, strength: strength}
+		case strength == cur.strength && cur.line.LineHashID != ln.LineHashID:
+			cur.contested = true
 		}
 	}
-	claimed := map[nodeTagKey]string{} // key -> the one line_hash_id claiming it
-	ambiguous := map[nodeTagKey]bool{}
 	for _, g := range groups {
 		for _, ln := range g.Lines {
+			// The line's own name, on the helper script's convention. A
+			// conventional line also reports that same string below, which
+			// records it again at the stronger level; nothing here needs to
+			// special-case that, because the strongest claim on a key wins.
+			record(ln.NodeID, ln.Tag, ln, claimFileName)
 			for _, tag := range ln.InboundTags {
-				tag = strings.TrimSpace(tag)
-				if tag == "" {
-					continue
-				}
-				key := nodeTagKey{NodeID: ln.NodeID, Tag: tag}
-				if own[key] {
-					continue
-				}
-				if prior, seen := claimed[key]; seen && prior != ln.LineHashID {
-					ambiguous[key] = true
-					continue
-				}
-				claimed[key] = ln.LineHashID
-				index[key] = ln
+				record(ln.NodeID, tag, ln, claimReported)
 			}
 		}
 	}
-	for key := range ambiguous {
-		delete(index, key)
+	index := make(map[nodeTagKey]Line, len(claims))
+	for key, c := range claims {
+		if c.contested {
+			continue
+		}
+		index[key] = c.line
 	}
 	return index
 }

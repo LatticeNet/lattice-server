@@ -163,41 +163,106 @@ func TestTraceTopologyRelayPairInboundTags(t *testing.T) {
 	}
 }
 
-// The index rules, stated directly: a line's own tag outranks any tag another
-// line reports, and a tag two lines both claim resolves to neither.
+// The index rules, stated directly. A tag goes to the line with the strongest
+// evidence behind its claim, and a tie at that strength goes to no one.
 func TestLineInboundTagIndexPrecedence(t *testing.T) {
 	groups := []LineGroup{{NodeID: "n1", Lines: []Line{
-		{NodeID: "n1", LineHashID: "line_a", Tag: "a.json", InboundTags: []string{"shared", "only-a"}},
-		{NodeID: "n1", LineHashID: "line_b", Tag: "b.json", InboundTags: []string{"shared", "a.json"}},
+		// Reported tags that do not include its own name: a relay pair or a
+		// hand-written file. Its name is known NOT to be a live sing-box tag.
+		{NodeID: "n1", LineHashID: "line_a", Tag: "a.json", InboundTags: []string{"only-a", "shared"}},
+		// Reports "a.json" as a tag sing-box actually loaded.
+		{NodeID: "n1", LineHashID: "line_b", Tag: "b.json", InboundTags: []string{"a.json", "shared"}},
+		// Reports nothing, the way a node whose helper predates the field does.
 		{NodeID: "n1", LineHashID: "line_c", Tag: "c.json"},
+		// Conventional: its name is among the tags it loaded.
+		{NodeID: "n1", LineHashID: "line_e", Tag: "e.json", InboundTags: []string{"e.json"}},
 	}}, {NodeID: "n2", Lines: []Line{
 		{NodeID: "n2", LineHashID: "line_d", Tag: "d.json", InboundTags: []string{"only-a"}},
 	}}}
 	index := lineInboundTagIndex(groups)
 	for _, tc := range []struct {
-		node, tag, want string
+		node, tag, want, why string
 	}{
-		{"n1", "a.json", "line_a"}, // own tag beats line_b's claim on it
-		{"n1", "b.json", "line_b"},
-		{"n1", "c.json", "line_c"},
-		{"n1", "only-a", "line_a"},
-		{"n2", "only-a", "line_d"}, // a tag is unique per node, not per fleet
+		{"n1", "a.json", "line_b",
+			"a live tag beats another line's file name, which that line's own report shows is not a tag"},
+		{"n1", "b.json", "line_b", "uncontested, so the file name still resolves"},
+		{"n1", "c.json", "line_c", "a node that reports nothing keeps the convention"},
+		{"n1", "e.json", "line_e", "its own name is among the tags it loaded"},
+		{"n1", "only-a", "line_a", "the only claim on it"},
+		{"n2", "d.json", "line_d", "uncontested on its own node"},
+		{"n2", "only-a", "line_d", "a tag is unique per node, not per fleet"},
 	} {
 		got, ok := index[nodeTagKey{NodeID: tc.node, Tag: tc.tag}]
 		if !ok || got.LineHashID != tc.want {
-			t.Fatalf("%s/%s = %q (found %v), want %q", tc.node, tc.tag, got.LineHashID, ok, tc.want)
+			t.Fatalf("%s/%s = %q (found %v), want %q: %s", tc.node, tc.tag, got.LineHashID, ok, tc.want, tc.why)
 		}
 	}
 	if got, ok := index[nodeTagKey{NodeID: "n1", Tag: "shared"}]; ok {
-		t.Fatalf("a tag two lines both claim resolved to %q; it must resolve to neither", got.LineHashID)
+		t.Fatalf("a tag two lines both report as live resolved to %q; it must resolve to neither", got.LineHashID)
 	}
-	if len(index) != 6 {
+	if len(index) != 7 {
 		keys := make([]string, 0, len(index))
 		for key, ln := range index {
 			keys = append(keys, key.NodeID+"/"+key.Tag+"="+ln.LineHashID)
 		}
 		sort.Strings(keys)
-		t.Fatalf("index keys = %v, want exactly the six resolvable ones", keys)
+		t.Fatalf("index keys = %v, want exactly the seven resolvable ones", keys)
+	}
+}
+
+// The failure this ranking exists to stop, on its own. One line's conf file is
+// named the same string as another line's real sing-box inbound tag. sing-box
+// enforces tag uniqueness within a config, so for a conventional line this
+// cannot happen: no second inbound could truthfully carry that tag. It opens
+// only for a line whose name was never a live tag, a relay or a hand-written
+// file, which is exactly the category this index was added to serve.
+//
+// Crediting those bytes to the file-named line is worse than dropping them. An
+// unattributed row is visible in the usage view and an operator can chase it; a
+// misattributed one reads like a fact and is never questioned.
+func TestLineInboundTagIndexDoesNotCaptureALiveTagWithAFileName(t *testing.T) {
+	live := Line{NodeID: "n1", LineHashID: "line_live", Tag: "relay.json",
+		InboundTags: []string{"VLESS-REALITY-17893.json"}}
+	named := Line{NodeID: "n1", LineHashID: "line_named", Tag: "VLESS-REALITY-17893.json",
+		InboundTags: []string{"inbound-for-aaitr-frontier-nat-vless-7899"}}
+	index := lineInboundTagIndex([]LineGroup{{NodeID: "n1", Lines: []Line{named, live}}})
+
+	got, ok := index[nodeTagKey{NodeID: "n1", Tag: "VLESS-REALITY-17893.json"}]
+	if !ok || got.LineHashID != "line_live" {
+		t.Fatalf("the tag resolved to %q (found %v), want line_live: sing-box reports counters under the "+
+			"tag it loaded, and only line_live loaded this one", got.LineHashID, ok)
+	}
+	// The file-named line keeps its own reported tag; it loses only the string
+	// it never loaded.
+	if got := index[nodeTagKey{NodeID: "n1", Tag: "inbound-for-aaitr-frontier-nat-vless-7899"}]; got.LineHashID != "line_named" {
+		t.Fatalf("line_named lost its own reported tag: %q", got.LineHashID)
+	}
+
+	// A node that reports nothing has no evidence either way, so the convention
+	// stands and nothing about the old behaviour moves.
+	silent := Line{NodeID: "n1", LineHashID: "line_silent", Tag: "VLESS-REALITY-17893.json"}
+	index = lineInboundTagIndex([]LineGroup{{NodeID: "n1", Lines: []Line{silent, live}}})
+	if got := index[nodeTagKey{NodeID: "n1", Tag: "VLESS-REALITY-17893.json"}]; got.LineHashID != "line_live" {
+		t.Fatalf("a reported tag lost to an unreported file name: %q", got.LineHashID)
+	}
+	// A stronger claim also settles a key two weaker ones had tied on: they were
+	// only ever tied with each other.
+	dupA := Line{NodeID: "n1", LineHashID: "line_dup_a", Tag: "dup.json"}
+	dupB := Line{NodeID: "n1", LineHashID: "line_dup_b", Tag: "dup.json"}
+	loader := Line{NodeID: "n1", LineHashID: "line_loader", Tag: "loader.json", InboundTags: []string{"dup.json"}}
+	index = lineInboundTagIndex([]LineGroup{{NodeID: "n1", Lines: []Line{dupA, dupB, loader}}})
+	if got, ok := index[nodeTagKey{NodeID: "n1", Tag: "dup.json"}]; !ok || got.LineHashID != "line_loader" {
+		t.Fatalf("a tag two file names tied on stayed unresolved after a live claim arrived: %q (found %v)",
+			got.LineHashID, ok)
+	}
+	index = lineInboundTagIndex([]LineGroup{{NodeID: "n1", Lines: []Line{dupA, dupB}}})
+	if got, ok := index[nodeTagKey{NodeID: "n1", Tag: "dup.json"}]; ok {
+		t.Fatalf("two file names tied on one tag resolved to %q; it must resolve to neither", got.LineHashID)
+	}
+
+	index = lineInboundTagIndex([]LineGroup{{NodeID: "n1", Lines: []Line{silent}}})
+	if got, ok := index[nodeTagKey{NodeID: "n1", Tag: "VLESS-REALITY-17893.json"}]; !ok || got.LineHashID != "line_silent" {
+		t.Fatalf("an unchallenged file name stopped resolving: %q (found %v)", got.LineHashID, ok)
 	}
 }
 

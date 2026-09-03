@@ -1442,10 +1442,23 @@ func agentUpdateLeasePreflight(source string) string {
 // reach the source (a CN node and github.com, observed 2026-09-02) sits in a
 // TCP connect that never completes, the task runs to its lease timeout, and
 // because the agent runs tasks on its report loop the node reads as offline
-// for the whole time. 20 s to connect and 300 s in total fit inside the
-// largest task timeout the server allows and leave the failure explicit.
+// for the whole time. 20 s to connect keeps an unreachable source explicit.
+//
+// The total was 300 s, which left half the task's own budget unused and failed
+// every node too slow to finish inside it. xuezhang-jp fetches at about 34 KiB/s
+// from both github.com and the control plane, so a 13 MiB agent needs roughly
+// 385 s and died at 300 s having pulled 10 MiB, from the control-plane source
+// as well as the upstream one. It is not an egress problem, it is an uplink.
+//
+// approvalApplyTaskTimeoutSec gives an agent update 600 s, and the steps after
+// the download (digest check, install, restart, health wait) are seconds on any
+// node. 480 s spends the download budget that already exists and still leaves
+// two minutes of headroom, so a hung source fails inside the task rather than
+// at the lease. Raising it further means raising the task timeout, which cannot
+// go past ten minutes: the agent treats a larger value as out of range and
+// falls back to 30 s rather than clamping.
 const (
-	agentFetchCurlTimeouts = " --connect-timeout 20 --max-time 300"
+	agentFetchCurlTimeouts = " --connect-timeout 20 --max-time 480"
 	agentFetchWgetTimeouts = " --timeout=20 --tries=2"
 )
 

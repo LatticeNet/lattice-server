@@ -42,12 +42,21 @@ type Line struct {
 	// helper predates the field, which leaves the convention in force and every
 	// existing join unchanged.
 	InboundTags []string `json:"inbound_tags,omitempty"`
-	Type        string   `json:"type,omitempty"` // protocol
-	Transport   string   `json:"transport,omitempty"`
-	Security    string   `json:"security,omitempty"`
-	ListenHost  string   `json:"listen_host,omitempty"`
-	ListenPort  int      `json:"listen_port,omitempty"`
-	PublicHost  string   `json:"public_host,omitempty"`
+	// NamedUsers and UnnamedUsers count the credentials on this line's conf file
+	// that the node can and cannot count individually. sing-box builds its stats
+	// user allowlist by name, so an unnamed credential never gets a per-user
+	// counter and its traffic stays inside the inbound total. That is a
+	// permanent property of the config rather than a failed attribution, and the
+	// two are worth telling apart on screen. Both zero means the node did not
+	// report, which is not the same as a line with no credentials.
+	NamedUsers   int    `json:"named_users,omitempty"`
+	UnnamedUsers int    `json:"unnamed_users,omitempty"`
+	Type         string `json:"type,omitempty"` // protocol
+	Transport    string `json:"transport,omitempty"`
+	Security     string `json:"security,omitempty"`
+	ListenHost   string `json:"listen_host,omitempty"`
+	ListenPort   int    `json:"listen_port,omitempty"`
+	PublicHost   string `json:"public_host,omitempty"`
 	// PublicPort is where the outside actually reaches this line, when that
 	// differs from ListenPort. Declared by the node, because a mapping that
 	// lives in a provider's router cannot be read from the config here. Zero
@@ -139,6 +148,35 @@ const singBoxInboundTagsKey = "inbound_tags"
 // holding more inbounds than this is not a line, and the cap keeps a malformed
 // or hostile report from turning the tag index into a scan.
 const maxDiscoveredInboundTags = 64
+
+// singBoxNamedUsersKey and singBoxUnnamedUsersKey are the node-reported counts
+// of credentials sing-box can and cannot count on their own, across every
+// inbound in the conf file. Absent when the node reports nothing or the file
+// holds no credentials at all; those two are indistinguishable here and neither
+// supports a claim, so both read as zero and no claim is made.
+const (
+	singBoxNamedUsersKey   = "named_users"
+	singBoxUnnamedUsersKey = "unnamed_users"
+)
+
+// discoveredUserNaming decodes the reported credential-naming counts. A value
+// it cannot read, or one past what a conf file could plausibly hold, yields
+// zero, which simply leaves the line saying nothing about its credentials.
+func discoveredUserNaming(node model.SingBoxNode) (named, unnamed int) {
+	read := func(key string) int {
+		v, err := strconv.Atoi(strings.TrimSpace(node.Metadata[key]))
+		if err != nil || v < 0 || v > maxDiscoveredCredentials {
+			return 0
+		}
+		return v
+	}
+	return read(singBoxNamedUsersKey), read(singBoxUnnamedUsersKey)
+}
+
+// maxDiscoveredCredentials bounds a reported credential count. It only has to
+// be past anything a real conf file carries; the cap exists so a malformed or
+// hostile report cannot put an absurd number on an operator's screen.
+const maxDiscoveredCredentials = 100000
 
 // discoveredInboundTags decodes the reported inbound tags of one discovered line.
 // Anything it cannot read yields nothing, which simply leaves the line joined by
@@ -453,6 +491,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				ServiceCheckedAt:   nodeSvcAt,
 				ServiceNote:        nodeSvcNote,
 			}
+			ln.NamedUsers, ln.UnnamedUsers = discoveredUserNaming(n)
 			ln.LineHashID = uuidResolver.resolve(ln.NodeID, ln.LineID, ln.LineUUID, func() string {
 				return lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
 			})

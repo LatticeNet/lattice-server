@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -604,7 +605,7 @@ func (ctx *usageAttributionContext) attributeLine(nodeID, tag string, f *usageLi
 		row.AttributionReason = "only Sub-Store record selecting this line (" + f.SubStore[0].RecordID + ")"
 		row.UserID, row.Email = f.SubStore[0].IdentityID, ctx.email(f.SubStore[0].IdentityID)
 	default:
-		row.Attribution, row.AttributionReason = usageAttributionNone, "line usage, no user"
+		row.Attribution, row.AttributionReason = usageAttributionNone, unattributedLineReason(f)
 		candidates := append([]string(nil), f.Bound...)
 		for _, ref := range f.SubStore {
 			candidates = appendUniqueSorted(candidates, ref.IdentityID)
@@ -612,6 +613,61 @@ func (ctx *usageAttributionContext) attributeLine(nodeID, tag string, f *usageLi
 		row.Candidates = candidates
 	}
 	return append(rows, row)
+}
+
+// unattributedLineReason says why no rule claimed a line, distinguishing an
+// attribution that failed from one that was never possible.
+//
+// sing-box builds its stats user allowlist by name, so a credential with no
+// name has no per-user counter and its bytes stay inside the inbound total for
+// as long as the config says so. No binding, no Sub-Store record and no future
+// discovery changes that; only naming the credential on the box does. Reporting
+// it as "no user" describes the symptom and leaves an operator unable to tell
+// whether anything is theirs to fix. On this fleet it is also the ordinary case
+// rather than the exception: 140 of 141 credentials carry no name.
+//
+// A named credential the server cannot place is the opposite and is worth
+// naming separately. The node is counting it and the counter is being
+// discarded, because only a u_<hash> name derived from an identity and a
+// line_uuid reverses to a user; a name an operator set by hand does not, and
+// guessing which identity it means is the one thing attribution must not do.
+//
+// A node that reports neither count says nothing here, which is every node
+// until the helper script carrying the report is rolled.
+func unattributedLineReason(f *usageLineFacts) string {
+	const base = "line usage, no user"
+	switch {
+	case f.Line.UnnamedUsers > 0 && f.Line.NamedUsers == 0:
+		return base + "; " + countedNoun(f.Line.UnnamedUsers, "credential") + " on this line " +
+			agrees(f.Line.UnnamedUsers, "carries", "carry") +
+			" no name, so the node cannot count them individually"
+	case f.Line.UnnamedUsers > 0:
+		return base + "; " + countedNoun(f.Line.UnnamedUsers, "credential") + " on this line " +
+			agrees(f.Line.UnnamedUsers, "carries", "carry") +
+			" no name and " + agrees(f.Line.UnnamedUsers, "is", "are") + " counted only in the line total"
+	case f.Line.NamedUsers > 0 && len(f.Named) == 0:
+		return base + "; " + countedNoun(f.Line.NamedUsers, "named credential") + " on this line " +
+			agrees(f.Line.NamedUsers, "resolves", "resolve") + " to no identity the server knows"
+	default:
+		return base
+	}
+}
+
+// countedNoun and agrees keep these reasons readable as sentences. They are for
+// operator-facing text, where "1 credentials carry no name" reads as a bug in
+// the thing reporting it and undermines the number next to it.
+func countedNoun(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return strconv.Itoa(n) + " " + noun + "s"
+}
+
+func agrees(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 
 // diffTrafficCounters applies the monotonic rule to a counter family: a core

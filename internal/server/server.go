@@ -166,6 +166,16 @@ type Server struct {
 	// from apiLimiter because the work it protects is key derivation, not a
 	// handler, and it is sized like loginLimiter for the same reason.
 	storageAuthLimiter *ratelimit.Limiter
+	// webhookAuthLimiter bounds anonymous inbound-webhook attempts, for the same
+	// reason storageAuthLimiter exists: the work being protected is key
+	// derivation on a route that has no session in front of it.
+	webhookAuthLimiter *ratelimit.Limiter
+	// webhookFireLimiter bounds *authenticated* webhook fires, keyed by webhook
+	// id rather than by address. What it protects is not server CPU but the
+	// operator's attention: a looping caller with a valid secret floods a phone
+	// just as effectively as a hostile one, and it would sail past a per-IP
+	// budget sized for brute force.
+	webhookFireLimiter *ratelimit.Limiter
 	totpLimiter        *ratelimit.Limiter
 	agentLimiter       *ratelimit.Limiter
 	// authFailAuditThrottle bounds audit emission for repeating authentication
@@ -466,6 +476,13 @@ func New(opts Options) (*Server, error) {
 		// Only failed and credential-less attempts are charged here, so a client
 		// holding a working token is never throttled by it.
 		storageAuthLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
+		// Sized like storageAuthLimiter: five failures a minute is far more than a
+		// correctly configured caller ever needs and far less than a brute force
+		// against 256 bits of entropy would require.
+		webhookAuthLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
+		// Ten fires a minute sustained, with a burst of ten to absorb a genuine
+		// cluster of events without dropping any.
+		webhookFireLimiter: ratelimit.New(ratelimit.Config{Rate: 10.0 / 60.0, Burst: 10}),
 		// Second-factor guesses are throttled PER USER (keyed on user id, not IP)
 		// so the guess budget cannot be widened by rotating source addresses.
 		totpLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 3600.0, Burst: 5}),
@@ -1047,6 +1064,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:send", s.handleDeleteNotifyChannel))
 	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:send", s.handleNotifyRules))
 	mux.HandleFunc("/api/notify/rules/delete", s.withAuth("notify:send", s.handleDeleteNotifyRule))
+	mux.HandleFunc("/api/notify/webhooks", s.withAuth("notify:send", s.handleNotifyWebhooks))
+	mux.HandleFunc("/api/notify/webhooks/delete", s.withAuth("notify:send", s.handleDeleteNotifyWebhook))
+	mux.HandleFunc("/api/notify/webhooks/rotate", s.withAuth("notify:send", s.handleRotateNotifyWebhookSecret))
+	mux.HandleFunc("/api/notify/webhooks/deliveries", s.withAuth("notify:send", s.handleNotifyWebhookDeliveries))
+	mux.HandleFunc("/api/notify/webhooks/test", s.withAuth("notify:send", s.handleNotifyWebhookTest))
+	// Public by design: the caller of an inbound webhook is a script or an
+	// appliance holding one webhook secret, not a Lattice principal. It
+	// authenticates itself against that secret inside the handler
+	// (server_notify_webhook.go), which also carries the rate limiting and the
+	// audit record that withAuth would otherwise have provided.
+	mux.HandleFunc("/api/hooks/", s.handleInboundWebhook)
 	mux.HandleFunc("/api/ddns", s.withAuth("ddns:admin", s.handleDDNS))
 	mux.HandleFunc("/api/ddns/delete", s.withAuth("ddns:admin", s.handleDeleteDDNS))
 	mux.HandleFunc("/api/ddns/run", s.withAuth("ddns:admin", s.handleRunDDNS))

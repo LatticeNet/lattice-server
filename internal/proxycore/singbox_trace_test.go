@@ -154,9 +154,24 @@ func TestRenderStatsAPIAllowlistNamesWhatItRendered(t *testing.T) {
 	p := baseProfile()
 	p.StatsAPI = "127.0.0.1:8080"
 	now := time.Now()
+	// The fixture has to contain a user the renderer will drop, or the test
+	// cannot tell "the allowlist names what was rendered" from "the allowlist
+	// names what it was asked to render". With only eligible users both
+	// derivations produce the same list and a regression to the intent source
+	// ships undetected, which is the node-side bug this whole change exists to
+	// stop: a name in the allowlist that no longer matches a user in the config
+	// reads as healthy collection while under-counting.
+	expired := baseUser("carol", "u_c3d4e5f607182930", "33333333-3333-3333-3333-333333333333", now)
+	expired.ExpiresAt = now.Add(-time.Hour)
+	overQuota := baseUser("dave", "u_d4e5f60718293041", "44444444-4444-4444-4444-444444444444", now)
+	overQuota.TrafficLimitBytes = 1024
+	overQuota.UsedBytes = 4096
+	disabled := baseUser("erin", "u_e5f6071829304152", "55555555-5555-5555-5555-555555555555", now)
+	disabled.Enabled = false
 	users := []model.ProxyUser{
 		baseUser("alice", "u_a1b2c3d4e5f60718", "11111111-1111-1111-1111-111111111111", now),
 		baseUser("bob", "u_b2c3d4e5f6071829", "22222222-2222-2222-2222-222222222222", now),
+		expired, overQuota, disabled,
 	}
 	cfg, _, err := RenderSingBoxConfig(p, []model.ProxyInbound{baseInbound()}, users, RenderOptions{})
 	if err != nil {
@@ -200,7 +215,25 @@ func TestRenderStatsAPIAllowlistNamesWhatItRendered(t *testing.T) {
 		}
 	}
 	if len(api.Stats.Users) != 2 {
-		t.Fatalf("users = %v, want both rendered users", api.Stats.Users)
+		t.Fatalf("users = %v, want exactly the two the renderer kept", api.Stats.Users)
+	}
+	// The three ineligible users must not appear. Naming one would mean the
+	// allowlist was derived from the intent rather than from the output.
+	for _, name := range []string{"u_c3d4e5f607182930", "u_d4e5f60718293041", "u_e5f6071829304152"} {
+		if containsString(api.Stats.Users, name) {
+			t.Fatalf("user %q was dropped from the config but is still counted: %v", name, api.Stats.Users)
+		}
+	}
+	// And the ones it did drop really were dropped, so the assertion above is
+	// about the allowlist rather than about a fixture that renders everything.
+	rendered := map[string]bool{}
+	for _, in := range cfg.Inbounds {
+		for _, u := range in.Users {
+			rendered[u.Name] = true
+		}
+	}
+	if len(rendered) != 2 {
+		t.Fatalf("the fixture rendered %d users; it must drop three for this test to mean anything", len(rendered))
 	}
 }
 

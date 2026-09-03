@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func TestGroupCycleOK(t *testing.T) {
@@ -86,17 +88,48 @@ func TestNormalizeGroupSelector(t *testing.T) {
 	}
 }
 
-func TestRollupFor(t *testing.T) {
-	byID := map[string]model.Node{
-		"n1": {ID: "n1", Online: true},
-		"n2": {ID: "n2", Online: false},
-		"n3": {ID: "n3", Online: false, Disabled: true},
+// The rollup counts each member once, under the status the same response shows
+// on that member's own row. Counting the raw Online bool instead put a disabled
+// node that was still beating into disabled and online at once, and trusted a
+// flag the liveness sweep had not caught up with yet.
+func TestRollupForCountsEachNodeOnceUnderItsDerivedStatus(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
 	}
-	r, resolved := rollupFor([]string{"n1", "n2", "n3", "ghost"}, byID)
-	if r.Total != 3 || r.Online != 1 || r.Offline != 2 || r.Disabled != 1 {
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	enrolled := now.Add(-48 * time.Hour)
+	fresh := now.Add(-3 * time.Second)
+	nodes := []model.Node{
+		{ID: "n1", Online: true, LastSeen: fresh, OnlineSince: now.Add(-time.Hour), CreatedAt: enrolled},
+		// Disabled, and the agent has not noticed: disabled only, never online.
+		{ID: "n2", Online: true, LastSeen: fresh, Disabled: true, DisabledAt: now.Add(-time.Hour), CreatedAt: enrolled},
+		// The beat went stale before the liveness sweep flipped Online.
+		{ID: "n3", Online: true, LastSeen: now.Add(-nodeOfflineThreshold - time.Second), CreatedAt: enrolled},
+		// Swept, and never in contact at all: both count as not in contact.
+		{ID: "n4", Online: false, LastSeen: now.Add(-6 * time.Hour), CreatedAt: enrolled},
+		{ID: "n5", CreatedAt: enrolled},
+	}
+	byStatus := srv.nodeStatusIndex(nodes, now)
+	if got := byStatus["n2"].Status; got != NodeStatusDisabled {
+		t.Fatalf("n2 derived %q, want %q", got, NodeStatusDisabled)
+	}
+	if got := byStatus["n3"].Status; got != NodeStatusOffline {
+		t.Fatalf("n3 derived %q, want %q", got, NodeStatusOffline)
+	}
+
+	r, resolved := rollupFor([]string{"n1", "n2", "n3", "n4", "n5", "ghost"}, byStatus)
+	if r.Total != 5 || r.Online != 1 || r.Offline != 3 || r.Disabled != 1 {
 		t.Fatalf("unexpected rollup: %+v", r)
 	}
-	if len(resolved) != 3 {
+	if r.Online+r.Offline+r.Disabled != r.Total {
+		t.Fatalf("the buckets do not add up to total: %+v", r)
+	}
+	if len(resolved) != 5 {
 		t.Fatalf("expected ghost dropped from resolved, got %v", resolved)
 	}
 }

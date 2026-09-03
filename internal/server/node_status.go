@@ -17,8 +17,11 @@ import (
 // because each page derived its own word from Online, LastSeen and metrics.
 //
 // Online and Reachability stay on the wire for consumers that have not moved.
-// All three come from the same fields, so they cannot contradict Status about
-// whether the node is in contact; they only say less.
+// Both read the stored Online flag as it is, so in the window described below,
+// between a beat going stale and the liveness sweep flipping that flag, they
+// still say online while Status has already moved to offline. Status is the
+// derived answer and the one to trust; anything that counts, groups or filters
+// nodes derives from it rather than from Online.
 //
 // Precedence, first match wins:
 //

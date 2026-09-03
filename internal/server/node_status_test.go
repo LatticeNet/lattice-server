@@ -170,6 +170,15 @@ func TestGuardRealityDegradationOnlyWhenStale(t *testing.T) {
 	if _, ok := guardRealityDegradation(snap(guardRealityStaleAfter-time.Second), now); ok {
 		t.Fatal("a snapshot one second short of stale degraded the node")
 	}
+	// The boundary itself is stale: guardRealityFreshness compares with
+	// !now.Before(staleAfter), so exactly 30h old already counts.
+	boundary, ok := guardRealityDegradation(snap(guardRealityStaleAfter), now)
+	if !ok {
+		t.Fatalf("a snapshot exactly %s old must be stale", guardRealityStaleAfter)
+	}
+	if !boundary.since.Equal(now) {
+		t.Fatalf("since = %s, want the stale-after instant %s", boundary.since, now)
+	}
 	d, ok := guardRealityDegradation(snap(guardRealityStaleAfter+time.Hour), now)
 	if !ok {
 		t.Fatal("a stale snapshot must degrade the node")

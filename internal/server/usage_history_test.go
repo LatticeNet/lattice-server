@@ -295,8 +295,16 @@ func TestUsageSubStoreSelection(t *testing.T) {
 }
 
 // A named counter is proof on its own: when discovery is stale and the read
-// model has no line for it, the user-day row is still written, and the
-// inbound bytes are kept as an unknown_line node row until the line is back.
+// model has no line for it, the user-day row is still written.
+//
+// The inbound half of the same report is now held rather than recorded as an
+// unknown_line node row. This test used to assert that row, on the stated
+// intent that the bytes were kept "until the line is back". They were not: an
+// unknown_line row carries no user, so no per-identity row was written for it,
+// while the cumulative delta was consumed and the baseline advanced. The bytes
+// never came back, and quota reads exactly the rows that were never written.
+// Holding the inbound family instead is what delivers the intent the assertion
+// was reaching for, and the named half below is unchanged.
 func TestUsageNamedCounterSurvivesStaleDiscovery(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	srv := usageTestServer(t, now)
@@ -309,17 +317,23 @@ func TestUsageNamedCounterSurvivesStaleDiscovery(t *testing.T) {
 	srv.invalidateLineReadModel()
 	result := mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 2,
 		InboundTraffic: map[string]model.ProxyTrafficCounter{"hub-a": counter(30, 40)}, UserTraffic: map[string]model.ProxyTrafficCounter{f.aliceName: counter(15, 25)}})
-	if result.UnknownLines != 1 {
-		t.Fatalf("result: %+v", result)
+	if result.UnknownLines != 0 || !result.InboundDeferred {
+		t.Fatalf("the inbound family should be held, not recorded as unknown: %+v", result)
 	}
 	day := store.UsageDay(now)
 	users, _ := srv.store.UsageDayUserRows(f.alice.ID, day, day)
 	if len(users) != 1 || users[0].Uplink != 10 || users[0].Downlink != 20 || users[0].ByLine[f.hub.LineHashID].Downlink != 20 {
 		t.Fatalf("alice row with stale discovery: %+v", users)
 	}
+	// The held inbound delta advances no node-level bytes, so this report writes
+	// no node-day row at all. The bytes are not lost: the baseline still holds
+	// the pre-gap inbound values, so the next warm report's delta covers the gap
+	// and lands on the node row then, attributed.
 	nodes, _ := srv.store.UsageDayNodeRows("node-a", day, day)
-	if hub := nodes[0].Lines["hub-a"]; hub.Uplink != 20 || hub.Downlink != 30 || hub.LineHashID != "" {
-		t.Fatalf("hub-a bytes must be kept as an unknown line: %+v", hub)
+	for _, row := range nodes {
+		if hub, ok := row.Lines["hub-a"]; ok && (hub.Uplink != 0 || hub.Downlink != 0) {
+			t.Fatalf("held inbound bytes leaked into the node row: %+v", hub)
+		}
 	}
 	if pu, _ := srv.store.ProxyUser(f.alice.ID); pu.UsedBytes != 30 {
 		t.Fatalf("alice total: %+v", pu)

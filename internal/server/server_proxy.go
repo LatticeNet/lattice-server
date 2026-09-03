@@ -168,7 +168,20 @@ type proxyUsageApplyResult struct {
 	AlertsFired       int    `json:"alerts_fired"`
 	CollectorSource   string `json:"collector_source,omitempty"`
 	CollectorStatus   string `json:"collector_status,omitempty"`
+	// InboundDeferred says the report was held rather than recorded because
+	// the node's line read model was empty. Nothing was consumed: the stored
+	// baseline is unchanged and the next report covers the gap.
+	InboundDeferred bool `json:"inbound_deferred,omitempty"`
 }
+
+// usageColdTopologyDeferMax bounds how long a node's usage may be held back
+// while its topology is missing. Deferring is safe because the counters are
+// cumulative, but a node whose discovery never comes back would otherwise stop
+// accounting silently and forever. Past this age the report is recorded the way
+// it is today, as unknown_line bytes at node level: worse than attributing it,
+// better than dropping it, and the behaviour this replaces rather than a new
+// failure mode.
+const usageColdTopologyDeferMax = 15 * time.Minute
 
 func proxySubscriptionBody(format string, endpoints []proxycore.VLESSRealityEndpoint) ([]byte, string, error) {
 	links := make([]string, 0, len(endpoints))
@@ -1495,6 +1508,45 @@ func sanitizeProxyUsageCollectorError(value string) string {
 	return truncateMetadataValue(value, 512)
 }
 
+// deferUsageForColdTopology reports whether this snapshot's inbound counters
+// should be held rather than recorded. It fires only when every condition for
+// silent, permanent loss holds at once: there is a baseline to diff against,
+// the core did not restart, the report carries inbound counters, the node has
+// no lines at all in the read model, and this process has not already been
+// holding that node for longer than the bound.
+//
+// The bound is measured from when holding started, not from the stored
+// baseline's age. A held report still advances everything except the inbound
+// family, so the baseline's own timestamp refreshes on every report and a node
+// that keeps reporting would extend the window forever.
+//
+// Only the inbound family is held. Named counters are proof on their own and
+// are already attributed while discovery is stale, which is a decision this
+// must not undo.
+//
+// A first report is never held. Nothing is consumed without a baseline, so the
+// honest move is to establish one; deferring instead would leave the next
+// report diffing against nothing and counting the core's whole lifetime.
+//
+// A restart is never held either. With the uptime gone backwards the current
+// value IS the delta, and the core's own counters have already lost everything
+// before the restart. Holding would store a pre-restart baseline against which
+// the next report's smaller cumulative value diffs to nothing, losing the
+// post-restart traffic as well.
+func (s *Server) deferUsageForColdTopology(ctx *usageAttributionContext, snapshot, previous model.ProxyUsageSnapshot, hadPrevious, reset bool, now time.Time) bool {
+	if !hadPrevious || reset || len(snapshot.InboundTraffic) == 0 {
+		return false
+	}
+	if len(ctx.byNodeTag[snapshot.NodeID]) > 0 {
+		return false
+	}
+	held, ok := s.usageInboundHeldSince[snapshot.NodeID]
+	if !ok {
+		return true
+	}
+	return now.Sub(held) <= usageColdTopologyDeferMax
+}
+
 func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (proxyUsageApplyResult, error) {
 	s.proxyUsageMu.Lock()
 	defer s.proxyUsageMu.Unlock()
@@ -1626,6 +1678,47 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	result.UsersIgnored = ignored
 	now := s.now()
 	reset := hadPrevious && snapshot.CoreUptimeSec < previous.CoreUptimeSec
+	// Inbound counters can only be attributed against the line read model, and
+	// that model is fed by an in-memory discovery mirror evicted after
+	// nodeOfflineThreshold. A node whose agent misses a couple of inventory
+	// posts therefore reports real counters into an empty topology, and every
+	// one of them lands as an unknown_line row carrying no user: no
+	// UsageDayUser row is written, the cumulative delta is consumed anyway, and
+	// quota, which reads exactly those rows, stays short by that traffic
+	// permanently while the per-line view re-derives the full number at read.
+	// Two surfaces then disagree forever over a gap that lasted seconds.
+	//
+	// The counters are cumulative, so declining to record the report costs
+	// nothing. Leaving the stored baseline untouched means the next report that
+	// lands with a warm read model produces one delta covering the whole gap,
+	// attributed correctly. This finishes a decision already made one screen up
+	// for named counters, which are held eligible while discovery is stale
+	// rather than dropped; the inbound family never got the same treatment, and
+	// it is the only usage signal for lines whose users carry no name.
+	//
+	// The trigger is deliberately the whole node having no lines, not a single
+	// tag missing one. A tag with no line while the node's other lines resolve
+	// is a genuine unknown tag and must still be recorded as one.
+	if s.deferUsageForColdTopology(attribution, snapshot, previous, hadPrevious, reset, now) {
+		// Hold the inbound family by carrying the previous report's values into
+		// the stored baseline. Every counter then diffs to zero, so no row is
+		// written and nothing is consumed, and the next report that lands with a
+		// warm read model produces one delta covering the whole gap. Named
+		// counters below are untouched and keep being attributed.
+		result.InboundDeferred = true
+		if s.usageInboundHeldSince == nil {
+			s.usageInboundHeldSince = map[string]time.Time{}
+		}
+		if _, ok := s.usageInboundHeldSince[snapshot.NodeID]; !ok {
+			s.usageInboundHeldSince[snapshot.NodeID] = now
+		}
+		s.logger.Printf("usage: node %s reported %d inbound counters while its line read model is empty; holding them so the delta is not consumed (baseline %s old)",
+			snapshot.NodeID, len(snapshot.InboundTraffic), now.Sub(previous.At).Truncate(time.Second))
+		snapshot.InboundTraffic = previous.InboundTraffic
+	} else {
+		// Recorded, so the next hold on this node starts a fresh window.
+		delete(s.usageInboundHeldSince, snapshot.NodeID)
+	}
 	// Per-user deltas from the legacy total path. A counter that decreased
 	// without an uptime reset is a new baseline for that user and advances
 	// nothing.

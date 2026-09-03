@@ -325,6 +325,10 @@ func TestWebhookPayloadLimits(t *testing.T) {
 		{"bad field name", `{"data":{"has space":"v"}}`},
 		{"unknown envelope key", `{"event_type":"attacker.chosen"}`},
 		{"oversized body", `{"data":{"k":"` + strings.Repeat("y", maxWebhookBodyBytes+16) + `"}}`},
+		// Two documents in one body: the second must be refused, not silently
+		// dropped, so a caller is told its request was not what it thought.
+		{"trailing document", `{"data":{"a":"1"}}{"data":{"b":"2"}}`},
+		{"trailing garbage", `{"data":{"a":"1"}} nonsense`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -336,14 +340,54 @@ func TestWebhookPayloadLimits(t *testing.T) {
 		})
 	}
 
+	// A second webhook for the accepted cases. The fire limiter is keyed by
+	// webhook id and the refusals above have spent that webhook's budget, which
+	// is the limiter working: an authenticated caller sending garbage in a loop
+	// is throttled like any other. Reusing it here would test the limiter
+	// instead of the payload rules.
+	okID, okSecret := createTestWebhook(t, handler, cookies, csrf,
+		`{"name":"Limits accepted","event_type":"limits.accepted","title_template":"t"}`)
+
 	// Scalars other than string are accepted and stringified, and an empty body
 	// is a valid ping.
-	for _, ok := range []string{`{"data":{"count":42,"ok":true,"note":null}}`, ``, `{}`} {
-		res := fireWebhook(t, handler, id, secret, ok)
+	for _, body := range []string{`{"data":{"count":42,"ok":true,"note":null}}`, ``, `{}`} {
+		res := fireWebhook(t, handler, okID, okSecret, body)
 		if res.StatusCode != http.StatusAccepted {
-			t.Fatalf("body %q should be accepted, got %d", ok, res.StatusCode)
+			t.Fatalf("body %q should be accepted, got %d", body, res.StatusCode)
 		}
 		res.Body.Close()
+	}
+}
+
+// TestInboundWebhookFireLimitIsPerWebhook pins the second limiter: an
+// authenticated caller cannot flood the operator, and exhausting one webhook's
+// budget does not disarm another's.
+func TestInboundWebhookFireLimitIsPerWebhook(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	noisyID, noisySecret := createTestWebhook(t, handler, cookies, csrf,
+		`{"name":"Noisy","event_type":"noisy.event","title_template":"t"}`)
+	quietID, quietSecret := createTestWebhook(t, handler, cookies, csrf,
+		`{"name":"Quiet","event_type":"quiet.event","title_template":"t"}`)
+
+	throttled := false
+	for i := 0; i < 40; i++ {
+		res := fireWebhook(t, handler, noisyID, noisySecret, "")
+		code := res.StatusCode
+		res.Body.Close()
+		if code == http.StatusTooManyRequests {
+			throttled = true
+			break
+		}
+	}
+	if !throttled {
+		t.Fatal("an authenticated caller must eventually be throttled")
+	}
+	// The quiet webhook has its own bucket and must be unaffected.
+	res := fireWebhook(t, handler, quietID, quietSecret, "")
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("one webhook's flood must not throttle another, got %d", res.StatusCode)
 	}
 }
 

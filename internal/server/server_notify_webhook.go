@@ -1,10 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -585,32 +587,37 @@ func (s *Server) fireNotifyWebhook(hook store.NotifyWebhook, data map[string]str
 // caller that only needs to say "this happened".
 func decodeWebhookPayload(w http.ResponseWriter, r *http.Request) (map[string]string, int, error) {
 	defer r.Body.Close()
-	limited := http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes)
-	buf := make([]byte, 0, 1024)
-	chunk := make([]byte, 1024)
-	for {
-		n, err := limited.Read(chunk)
-		buf = append(buf, chunk[:n]...)
-		if err != nil {
-			// MaxBytesReader reports its own overflow error; anything else at this
-			// point is a truncated or aborted body.
-			if err.Error() == "http: request body too large" {
-				return nil, len(buf), fmt.Errorf("payload exceeds %d bytes", maxWebhookBodyBytes)
-			}
-			break
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes))
+	size := len(body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return nil, size, fmt.Errorf("payload exceeds %d bytes", maxWebhookBodyBytes)
 		}
+		// A read that failed for any other reason is a truncated or aborted
+		// request, not an intentionally empty one. Returning what arrived so far
+		// would let a caller fire the webhook by opening a request and dropping
+		// it, so it is refused instead.
+		return nil, size, errors.New("could not read the request body")
 	}
-	size := len(buf)
-	if strings.TrimSpace(string(buf)) == "" {
+	if len(bytes.TrimSpace(body)) == 0 {
+		// An empty body is a valid ping: the webhook fires with no data, and the
+		// operator's templates render from the platform variables alone.
 		return map[string]string{}, size, nil
 	}
 	var envelope struct {
 		Data map[string]any `json:"data"`
 	}
-	dec := json.NewDecoder(strings.NewReader(string(buf)))
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&envelope); err != nil {
 		return nil, size, errors.New(`body must be JSON of the form {"data":{"key":"value"}}`)
+	}
+	// Trailing content is refused rather than ignored, matching decodeJSONBody:
+	// a caller that sends two documents must be told, not silently have the
+	// second one dropped.
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return nil, size, errors.New("body must be a single JSON object")
 	}
 	data, err := normalizeWebhookData(envelope.Data)
 	if err != nil {

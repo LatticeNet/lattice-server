@@ -26,17 +26,14 @@ import (
 func (s *Server) traceTopology() traceattr.Topology {
 	groups, _ := s.lineReadModel()
 	lines := map[traceattr.NodeTag]traceattr.LineRef{}
-	// tagsByLineUUID is kept here rather than recomputed by callers because it
-	// falls out of the same walk.
-	for _, g := range groups {
-		for _, ln := range g.Lines {
-			if ln.Tag == "" {
-				continue
-			}
-			lines[traceattr.NodeTag{NodeID: ln.NodeID, Tag: ln.Tag}] = traceattr.LineRef{
-				LineUUID:   ln.LineUUID,
-				LineHashID: ln.LineHashID,
-			}
+	// Keyed by every inbound tag a line can be shown to own, not by its name
+	// alone. sing-box logs the tag the core loaded, and a conf file whose
+	// inbound tags differ from its file name would otherwise have none of its
+	// connections placed. lineInboundTagIndex owns the precedence rules.
+	for key, ln := range lineInboundTagIndex(groups) {
+		lines[traceattr.NodeTag{NodeID: key.NodeID, Tag: key.Tag}] = traceattr.LineRef{
+			LineUUID:   ln.LineUUID,
+			LineHashID: ln.LineHashID,
 		}
 	}
 	users := map[string]string{}

@@ -76,6 +76,15 @@ type lineMetadataDocV2 struct {
 }
 
 type lineMetadataInboundV2 struct {
+	// Tag is the conf file's name, not a sing-box inbound tag, despite the
+	// word. The helper script's create() writes the file name into the
+	// inbound's own tag field, so on a line it created the two are the same
+	// string and the difference is invisible; a hand-written file, or one
+	// holding a relay pair, carries tags of its own. This slot is the sidecar's
+	// line identity key, unique per document and paired with one line_uuid, so
+	// it has to stay the file name. The tags sing-box actually loaded, which
+	// its stats counters and its connection log are keyed by, are carried by
+	// Line.InboundTags instead.
 	Tag        string               `json:"tag"`
 	LineUUID   string               `json:"line_uuid"`
 	LineHashID string               `json:"line_hash_id,omitempty"`

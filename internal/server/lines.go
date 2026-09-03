@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,12 +33,21 @@ type Line struct {
 	Managed            bool   `json:"managed"`                        // under Lattice config management
 	Name               string `json:"name"`
 	Tag                string `json:"tag,omitempty"`
-	Type               string `json:"type,omitempty"` // protocol
-	Transport          string `json:"transport,omitempty"`
-	Security           string `json:"security,omitempty"`
-	ListenHost         string `json:"listen_host,omitempty"`
-	ListenPort         int    `json:"listen_port,omitempty"`
-	PublicHost         string `json:"public_host,omitempty"`
+	// InboundTags is every sing-box inbound tag the node reported for the conf
+	// file this line stands for. Tag above is that file's name, which equals the
+	// inbound tag only by the helper script's convention; a hand-written file, or
+	// one holding a relay pair, carries tags of its own. Traffic counters and
+	// connection records arrive keyed by the core's real inbound tags, so these
+	// are what those joins have to run against. Empty when the node's sing-box
+	// helper predates the field, which leaves the convention in force and every
+	// existing join unchanged.
+	InboundTags []string `json:"inbound_tags,omitempty"`
+	Type        string   `json:"type,omitempty"` // protocol
+	Transport   string   `json:"transport,omitempty"`
+	Security    string   `json:"security,omitempty"`
+	ListenHost  string   `json:"listen_host,omitempty"`
+	ListenPort  int      `json:"listen_port,omitempty"`
+	PublicHost  string   `json:"public_host,omitempty"`
 	// PublicPort is where the outside actually reaches this line, when that
 	// differs from ListenPort. Declared by the node, because a mapping that
 	// lives in a provider's router cannot be read from the config here. Zero
@@ -116,6 +126,124 @@ func stableLineHandle(lineID string) string {
 
 func effectiveDiscoveredLineID(node model.SingBoxNode) string {
 	return firstNonEmpty(node.LineID, node.Metadata["line_id"])
+}
+
+// singBoxInboundTagsKey is the node-reported metadata entry carrying the sing-box
+// inbound tags a conf file actually defines, JSON-encoded so a tag holding any
+// character survives the trip. The helper script emits it from the config file
+// itself, which is the only place the real tags exist: the discovery record names
+// a line by its file name, and nothing else on the box states the difference.
+const singBoxInboundTagsKey = "inbound_tags"
+
+// maxDiscoveredInboundTags bounds what one reported line can claim. A conf file
+// holding more inbounds than this is not a line, and the cap keeps a malformed
+// or hostile report from turning the tag index into a scan.
+const maxDiscoveredInboundTags = 64
+
+// discoveredInboundTags decodes the reported inbound tags of one discovered line.
+// Anything it cannot read yields nothing, which simply leaves the line joined by
+// its file name exactly as before.
+func discoveredInboundTags(node model.SingBoxNode) []string {
+	raw := strings.TrimSpace(node.Metadata[singBoxInboundTagsKey])
+	if raw == "" {
+		return nil
+	}
+	var decoded []string
+	if json.Unmarshal([]byte(raw), &decoded) != nil || len(decoded) > maxDiscoveredInboundTags {
+		return nil
+	}
+	var out []string
+	for _, tag := range decoded {
+		if tag = strings.TrimSpace(tag); tag != "" {
+			out = appendUniqueSorted(out, tag)
+		}
+	}
+	return out
+}
+
+// nodeTagKey is one (node, inbound tag) join key. A sing-box tag is unique only
+// within one node, so the node id is half of the key everywhere.
+type nodeTagKey struct {
+	NodeID string
+	Tag    string
+}
+
+// lineTagClaim ranks the evidence behind one line's claim on an inbound tag. A
+// tag resolves to the line holding the strongest claim on it; two lines tied at
+// that strength resolve to neither.
+type lineTagClaim int
+
+const (
+	// claimFileName is a line's own name, standing on nothing but the helper
+	// script's convention that create() writes the file name into the inbound's
+	// tag field. It is what every join assumed before this index existed. A
+	// conventional line's name is also a reported tag and is recorded again at
+	// the stronger level, so what is left at this level alone is a name the node
+	// either did not confirm or positively did not list.
+	claimFileName lineTagClaim = iota
+	// claimReported is a tag the node stated sing-box actually loaded. Counters
+	// and connection records are keyed by these, so this is the only kind of
+	// claim that is evidence about the thing being joined.
+	claimReported
+)
+
+// lineInboundTagIndex maps every inbound tag the read model can vouch for to the
+// line that owns it, for one fleet-wide set of groups. Both tag-keyed joins in
+// the server (usage counters and connection records) run off this, so the rules
+// live in one place.
+//
+// Claims are ranked, not ordered by pass. A line's own name used to win
+// unconditionally, which is wrong in exactly the case this index was built for:
+// when a line's name is not a tag sing-box loaded, and another line reports that
+// same string as one it did load, the bytes are the second line's and were being
+// credited to the first with nothing flagged. Silence is the problem there.
+// An unattributed row is visible in the usage view; a misattributed one reads
+// like a fact.
+//
+// Two lines tied at the strongest claim resolve to neither. Attribution is
+// allowed to say it does not know; it is not allowed to guess, because a wrong
+// attribution written once is indistinguishable from a right one forever after.
+func lineInboundTagIndex(groups []LineGroup) map[nodeTagKey]Line {
+	type claim struct {
+		line      Line
+		strength  lineTagClaim
+		contested bool
+	}
+	claims := map[nodeTagKey]*claim{}
+	record := func(nodeID, tag string, ln Line, strength lineTagClaim) {
+		if tag = strings.TrimSpace(tag); tag == "" {
+			return
+		}
+		key := nodeTagKey{NodeID: nodeID, Tag: tag}
+		switch cur, ok := claims[key]; {
+		case !ok, strength > cur.strength:
+			// A stronger claim also clears any contest among weaker ones: those
+			// were only tied with each other.
+			claims[key] = &claim{line: ln, strength: strength}
+		case strength == cur.strength && cur.line.LineHashID != ln.LineHashID:
+			cur.contested = true
+		}
+	}
+	for _, g := range groups {
+		for _, ln := range g.Lines {
+			// The line's own name, on the helper script's convention. A
+			// conventional line also reports that same string below, which
+			// records it again at the stronger level; nothing here needs to
+			// special-case that, because the strongest claim on a key wins.
+			record(ln.NodeID, ln.Tag, ln, claimFileName)
+			for _, tag := range ln.InboundTags {
+				record(ln.NodeID, tag, ln, claimReported)
+			}
+		}
+	}
+	index := make(map[nodeTagKey]Line, len(claims))
+	for key, c := range claims {
+		if c.contested {
+			continue
+		}
+		index[key] = c.line
+	}
+	return index
 }
 
 func provesLineUUIDAuthorityHash(line Line) bool {
@@ -304,6 +432,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Managed:            false,
 				Name:               n.Name,
 				Tag:                n.Name,
+				InboundTags:        discoveredInboundTags(n),
 				Type:               n.Protocol,
 				Transport:          n.Network,
 				ListenHost:         n.ListenHost,

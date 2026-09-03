@@ -207,12 +207,18 @@ func (s *Server) usageAttributionContext() *usageAttributionContext {
 			if ctx.byNodeTag[ln.NodeID] == nil {
 				ctx.byNodeTag[ln.NodeID] = map[string]*usageLineFacts{}
 			}
-			if tag := strings.TrimSpace(ln.Tag); tag != "" {
-				ctx.byNodeTag[ln.NodeID][tag] = f
-			}
 			if uuid := strings.ToLower(strings.TrimSpace(ln.LineUUID)); uuid != "" {
 				ctx.byUUID[uuid] = f
 			}
+		}
+	}
+	// The counters arrive keyed by the tag the core loaded, which is the conf
+	// file's name only by the helper script's convention. Index every tag a line
+	// can be shown to own, not its name alone: a file holding a relay pair
+	// carries two tags, and its name is not either of them.
+	for key, ln := range lineInboundTagIndex(groups) {
+		if f, ok := ctx.byHash[ln.LineHashID]; ok {
+			ctx.byNodeTag[key.NodeID][key.Tag] = f
 		}
 	}
 

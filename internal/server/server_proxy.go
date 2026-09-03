@@ -1548,7 +1548,7 @@ func usageHoldKey(nodeID, tag string) string { return nodeID + "\x00" + tag }
 // holding it would stall its bytes for the whole bound and then record them
 // anyway.
 //
-// The test is usageDayLineAttributed, shared with the read path's own fallback
+// The test is usageDayLineEverAttributed, shared with the read path's own fallback
 // rather than restated here. The two ask it for different reasons and are not
 // interchangeable, but they must agree about what counts as evidence, and two
 // predicates that must agree should be one predicate.
@@ -1565,7 +1565,7 @@ func (s *Server) usageAttributedTagsForNode(nodeID string, now time.Time) map[st
 	out := map[string]bool{}
 	for _, row := range rows {
 		for tag, line := range row.Lines {
-			if usageDayLineAttributed(line) {
+			if usageDayLineEverAttributed(line) {
 				out[tag] = true
 			}
 		}

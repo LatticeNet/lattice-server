@@ -583,14 +583,68 @@ func (s *Server) handleAgentProxyUsage(w http.ResponseWriter, r *http.Request) {
 	if result.CollectorStatus != "" {
 		auditMeta["collector_status"] = result.CollectorStatus
 	}
-	s.recordRequestAudit(r, model.AuditEvent{
-		ID:       id.New("audit"),
-		Action:   "proxy.usage.report",
-		Decision: "allow",
-		NodeID:   req.NodeID,
-		Metadata: auditMeta,
-	})
+	if s.shouldAuditProxyUsage(req.NodeID, auditMeta, s.now()) {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   "proxy.usage.report",
+			Decision: "allow",
+			NodeID:   req.NodeID,
+			Metadata: auditMeta,
+		})
+	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// proxyUsageAuditState remembers what the last audited report from a node
+// said, so an unchanged heartbeat is not written again.
+type proxyUsageAuditState struct {
+	fingerprint string
+	auditedAt   time.Time
+}
+
+// proxyUsageAuditInterval is the longest a node can report unchanged without
+// an audit line. Long enough that a quiet fleet costs almost nothing, short
+// enough that "this node was reporting" stays answerable.
+const proxyUsageAuditInterval = 6 * time.Hour
+
+// shouldAuditProxyUsage decides whether this usage report is worth an audit
+// event. Every node posts every ten seconds, so auditing all of them wrote
+// about 285,000 events a day across 33 nodes: 95 percent of the audit log was
+// heartbeats, every query hit its scan cap inside a day, and an incident from
+// the previous week became unreachable. A report is audited when something it
+// says has changed, and otherwise at most once per interval. The same shape
+// as shouldAuditSingBoxDiscovery, for the same reason.
+func (s *Server) shouldAuditProxyUsage(nodeID string, meta map[string]string, now time.Time) bool {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	fingerprint := proxyUsageAuditFingerprint(meta)
+	s.proxyUsageAuditMu.Lock()
+	defer s.proxyUsageAuditMu.Unlock()
+	if s.proxyUsageAudit == nil {
+		s.proxyUsageAudit = map[string]proxyUsageAuditState{}
+	}
+	prev, ok := s.proxyUsageAudit[nodeID]
+	if !ok || prev.fingerprint != fingerprint || now.Sub(prev.auditedAt) >= proxyUsageAuditInterval {
+		s.proxyUsageAudit[nodeID] = proxyUsageAuditState{fingerprint: fingerprint, auditedAt: now}
+		return true
+	}
+	return false
+}
+
+// proxyUsageAuditFingerprint covers what an operator would want an event for:
+// a profile being registered, the collector's source or state changing, or
+// counters being dropped. Byte counts are deliberately excluded, since those
+// change on every report by design and are already recorded as usage.
+func proxyUsageAuditFingerprint(meta map[string]string) string {
+	keys := []string{"profile_registered", "collector_source", "collector_status", "ignored_counters", "error"}
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+"="+meta[k])
+	}
+	return strings.Join(parts, "|")
 }
 
 func (s *Server) handleProxyProfiles(w http.ResponseWriter, r *http.Request, p principal) {

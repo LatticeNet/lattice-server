@@ -3161,6 +3161,29 @@ func (s *Store) StorageBucket(kind, name string) (model.StorageBucket, bool) {
 	return b, ok
 }
 
+// StorageBucketInventory counts what each bucket of a kind actually holds.
+// StorageBuckets returns only the bucket records an operator registered, so a
+// bucket a plugin wrote into without registering is invisible: the console
+// listed nothing while the sub-store plugin kept its whole database, tens of
+// kilobytes per subscription script, in plugin:latticenet.sub-store. A store
+// that holds data must never read as empty.
+func (s *Store) StorageBucketInventory(kind string) map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]int{}
+	switch kind {
+	case model.StorageKindKV:
+		for _, e := range s.state.KV {
+			out[e.Bucket]++
+		}
+	case model.StorageKindStatic:
+		for _, o := range s.state.Static {
+			out[o.Bucket]++
+		}
+	}
+	return out
+}
+
 func (s *Store) StorageBuckets(kind string) []model.StorageBucket {
 	s.mu.Lock()
 	defer s.mu.Unlock()

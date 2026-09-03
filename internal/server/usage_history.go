@@ -503,15 +503,26 @@ type allocatedNodeView struct {
 }
 
 // vpnUserUsageView is the users list row: the identity plus its usage facts.
+//
+// UsedTotalBytes and UsedPeriodBytes are both summed from the identity's
+// user-day rows, so they carry the same attribution decisions and the total
+// can never be smaller than the period inside it. The total covers the
+// retained day rows only: they are pruned at store.UsageDayRetentionDays, so
+// UsedTotalFrom names the first day it accounts for, and UsedTotalTruncated
+// says the identity is older than that day and traffic before it is gone.
+// The total is then a floor, not a true lifetime, and the field says so
+// rather than presenting a truncated number as complete.
 type vpnUserUsageView struct {
 	vpnUserView
-	UsedTotalBytes  int64               `json:"used_total_bytes"`
-	UsedPeriodBytes int64               `json:"used_period_bytes"`
-	PeriodStart     string              `json:"period_start,omitempty"`
-	PeriodEnd       string              `json:"period_end,omitempty"`
-	Last7d          []int64             `json:"last_7d"`
-	LastSeenAt      string              `json:"last_seen_at,omitempty"`
-	AllocatedNodes  []allocatedNodeView `json:"allocated_nodes"`
+	UsedTotalBytes     int64               `json:"used_total_bytes"`
+	UsedTotalFrom      string              `json:"used_total_from,omitempty"`
+	UsedTotalTruncated bool                `json:"used_total_truncated,omitempty"`
+	UsedPeriodBytes    int64               `json:"used_period_bytes"`
+	PeriodStart        string              `json:"period_start,omitempty"`
+	PeriodEnd          string              `json:"period_end,omitempty"`
+	Last7d             []int64             `json:"last_7d"`
+	LastSeenAt         string              `json:"last_seen_at,omitempty"`
+	AllocatedNodes     []allocatedNodeView `json:"allocated_nodes"`
 }
 
 // vpnUserUsageViews enriches identities with their usage. One context, one
@@ -538,6 +549,18 @@ func (s *Server) vpnUserUsageViews(users []VpnUser, now time.Time) []vpnUserUsag
 	if sevenDays := today.AddDate(0, 0, -6); sevenDays.Before(earliest) {
 		earliest = sevenDays
 	}
+	// The user-day read runs from the retention floor so the lifetime total
+	// and the period sum come out of one scan of one set of rows. earliest is
+	// the widest window any listed period needs, so taking the older of the
+	// two keeps every period row inside the read and makes "the total is at
+	// least the period" hold by construction rather than by coincidence. The
+	// node-day window below stays at earliest: it feeds last_7d and the
+	// per-line report, neither of which reaches past it.
+	retained := today.AddDate(0, 0, -store.UsageDayRetentionDays)
+	if earliest.Before(retained) {
+		retained = earliest
+	}
+	retainedDay := store.UsageDay(retained)
 	window := usageWindow{From: earliest, To: today, Label: "list"}
 	nodeIDs := make([]string, 0, len(ctx.byNodeTag))
 	for nodeID := range ctx.byNodeTag {
@@ -575,19 +598,24 @@ func (s *Server) vpnUserUsageViews(users []VpnUser, now time.Time) []vpnUserUsag
 			acct = u.ID
 		}
 		var lastSeen time.Time
+		// The legacy ProxyUser projection still carries last_seen_at, and it
+		// sees reports the day rows do not. Its UsedBytes is the other
+		// accounting path and is deliberately not read here: it is written
+		// per report from the node's own deltas and diverges from the day
+		// rows, which is what put a total below its own period on this screen.
 		if pu, ok := s.store.ProxyUser(acct); ok {
-			view.UsedTotalBytes = pu.UsedBytes
 			lastSeen = pu.LastSeenAt
 		}
 		p := periods[i]
-		rows, err := s.store.UsageDayUserRows(u.ID, store.UsageDay(earliest), store.UsageDay(today))
+		rows, err := s.store.UsageDayUserRows(u.ID, retainedDay, store.UsageDay(today))
 		if err != nil {
 			s.logger.Printf("usage: read day rows for %s: %v", u.ID, err)
 		}
 		periodFrom, periodTo := store.UsageDay(p.start), store.UsageDay(today)
 		byLine := map[string]store.UsageDayUserLine{}
-		periodUsed := usageCounter{}
+		periodUsed, totalUsed := usageCounter{}, usageCounter{}
 		for _, row := range rows {
+			totalUsed.add(usageCounter{Uplink: row.Uplink, Downlink: row.Downlink})
 			if row.LastSeenAt.After(lastSeen) {
 				lastSeen = row.LastSeenAt
 			}
@@ -610,6 +638,9 @@ func (s *Server) vpnUserUsageViews(users []VpnUser, now time.Time) []vpnUserUsag
 				byLine[hash] = cur
 			}
 		}
+		view.UsedTotalBytes = totalUsed.total()
+		view.UsedTotalFrom = retained.UTC().Format(usageWireTimeFmt)
+		view.UsedTotalTruncated = u.CreatedAt.Before(retained)
 		if p.set {
 			view.UsedPeriodBytes = periodUsed.total()
 			view.PeriodStart = p.start.UTC().Format(usageWireTimeFmt)

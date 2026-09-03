@@ -325,3 +325,152 @@ func TestUsageNamedCounterSurvivesStaleDiscovery(t *testing.T) {
 		t.Fatalf("alice total: %+v", pu)
 	}
 }
+
+// used_total_bytes and used_period_bytes come out of one scan of one set of
+// user-day rows, so the total is never below the period it contains, whatever
+// mix of attribution rules produced the traffic. The cases are the ones that
+// took different paths through ingestion: an identity credited only by an
+// inferred binding, one credited only by its named counter, one credited both
+// ways in the same report, one with nothing at all, and one whose oldest rows
+// sit outside the retention window and so cannot be part of the total.
+func TestVpnUserUsageViewTotalCoversPeriod(t *testing.T) {
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	today := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	retained := today.AddDate(0, 0, -store.UsageDayRetentionDays)
+	srv := usageTestServer(t, now)
+	f := seedUsageFleet(t, srv)
+
+	// Monthly quotas so the period is a strict subset of the total, and an
+	// explicit CreatedAt so the truncation flag is not read off a zero time.
+	withPeriod := func(u VpnUser, created time.Time) VpnUser {
+		u.QuotaPeriod, u.QuotaResetDay, u.QuotaBytes = vpnQuotaPeriodMonthly, 1, 1<<30
+		u.CreatedAt = created
+		return u
+	}
+	erin := withPeriod(VpnUser{ID: "vpnuser_erin", Email: "erin@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "5b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"}},
+		Bindings:    []LineBinding{{LineHashID: f.hub.LineHashID, Enabled: true}, {LineHashID: f.hub2.LineHashID, Enabled: true}}}, now)
+	frank := withPeriod(VpnUser{ID: "vpnuser_frank", Email: "frank@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "6b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"}}}, now)
+	// grace predates the retention window, so her total is a floor.
+	grace := withPeriod(VpnUser{ID: "vpnuser_grace", Email: "grace@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "7b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"}}}, time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
+	for _, u := range []VpnUser{withPeriod(f.alice, now), withPeriod(f.bob, now), erin, frank, grace} {
+		if err := srv.putVpnUser(u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	erinHubName := userLineName(erin.ID, f.hub.LineUUID)
+
+	// One baseline and one delta on node-a. alice and erin are named on
+	// hub-a; erin is also the only binding on hub2-a and bob the only one on
+	// direct-a, so those two lines are credited by inference.
+	mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 100,
+		InboundTraffic: map[string]model.ProxyTrafficCounter{"hub-a": counter(1000, 2000), "hub2-a": counter(100, 100), "direct-a": counter(10, 20)},
+		UserTraffic:    map[string]model.ProxyTrafficCounter{f.aliceName: counter(300, 600), erinHubName: counter(50, 50)},
+	})
+	mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 200,
+		InboundTraffic: map[string]model.ProxyTrafficCounter{"hub-a": counter(1500, 2600), "hub2-a": counter(160, 240), "direct-a": counter(40, 70)},
+		UserTraffic:    map[string]model.ProxyTrafficCounter{f.aliceName: counter(400, 800), erinHubName: counter(80, 110)},
+	})
+	// A third report, so a day holds more than one round. The legacy
+	// projection keeps only this last round and falls below the period.
+	mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 300,
+		InboundTraffic: map[string]model.ProxyTrafficCounter{"hub-a": counter(1600, 2700), "hub2-a": counter(200, 300), "direct-a": counter(60, 110)},
+		UserTraffic:    map[string]model.ProxyTrafficCounter{f.aliceName: counter(450, 900), erinHubName: counter(100, 130)},
+	})
+
+	// Rows before this period but inside retention, and one day older than
+	// the window, which no total may include.
+	seed := func(userID, day string, up, down int64) {
+		t.Helper()
+		if err := srv.store.ApplyProxyUsage(store.ProxyUsageUpdate{DayUsers: []store.UsageDayUser{
+			{UserID: userID, Day: day, Uplink: up, Downlink: down}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const beforePeriod = "20260810"
+	seed(f.alice.ID, beforePeriod, 300, 400)
+	seed(f.bob.ID, beforePeriod, 200, 300)
+	seed(erin.ID, beforePeriod, 100, 150)
+	seed(grace.ID, beforePeriod, 150, 250)
+	seed(grace.ID, store.UsageDay(retained.AddDate(0, 0, -1)), 5000, 4999)
+
+	views := map[string]vpnUserUsageView{}
+	for _, v := range srv.vpnUserUsageViews(srv.listVpnUsers(), now) {
+		views[v.ID] = v
+	}
+	cases := []struct {
+		name          string
+		userID        string
+		total, period int64
+		wantTruncated bool
+	}{
+		{name: "inferred binding only", userID: f.bob.ID, total: 640, period: 140},
+		{name: "named counter only", userID: f.alice.ID, total: 1150, period: 450},
+		{name: "named and inferred in one report", userID: erin.ID, total: 680, period: 430},
+		{name: "no traffic at all", userID: frank.ID, total: 0, period: 0},
+		{name: "rows older than retention are not lifetime", userID: grace.ID, total: 400, period: 0, wantTruncated: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, ok := views[tc.userID]
+			if !ok {
+				t.Fatalf("%s missing from the users list", tc.userID)
+			}
+			if v.UsedTotalBytes < v.UsedPeriodBytes {
+				t.Fatalf("total %d is below the period %d it contains", v.UsedTotalBytes, v.UsedPeriodBytes)
+			}
+			if v.UsedTotalBytes != tc.total || v.UsedPeriodBytes != tc.period {
+				t.Fatalf("total/period = %d/%d, want %d/%d", v.UsedTotalBytes, v.UsedPeriodBytes, tc.total, tc.period)
+			}
+			if v.UsedTotalFrom != retained.Format(usageWireTimeFmt) {
+				t.Fatalf("used_total_from = %q, want %q", v.UsedTotalFrom, retained.Format(usageWireTimeFmt))
+			}
+			if v.UsedTotalTruncated != tc.wantTruncated {
+				t.Fatalf("used_total_truncated = %v, want %v", v.UsedTotalTruncated, tc.wantTruncated)
+			}
+		})
+	}
+}
+
+// The regression this fixes. The legacy ProxyUser projection is rebuilt from
+// the identity on every report, so it holds the last delta rather than a
+// lifetime, and production showed a total of 534 beside a period of 1602 for
+// the same user at the same instant. The users list must read the day rows,
+// which carry the same attribution decisions as the period.
+func TestVpnUserUsageViewIgnoresStaleProxyUserProjection(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	srv := usageTestServer(t, now)
+	f := seedUsageFleet(t, srv)
+	reportUsageFleet(t, srv, f)
+	// Two further reports, which is all it takes: the projection drops what
+	// it held and keeps only this round's delta.
+	mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 300,
+		InboundTraffic: map[string]model.ProxyTrafficCounter{"direct-a": counter(50, 90)}})
+	mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 400,
+		InboundTraffic: map[string]model.ProxyTrafficCounter{"direct-a": counter(60, 110)}})
+
+	day := store.UsageDay(now)
+	rows, err := srv.store.UsageDayUserRows(f.bob.ID, day, day)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("bob day rows: %v %+v", err, rows)
+	}
+	counted := rows[0].Uplink + rows[0].Downlink
+	pu, ok := srv.store.ProxyUser(f.bob.ID)
+	if !ok || pu.UsedBytes >= counted {
+		t.Fatalf("fixture no longer reproduces the stale projection: projection=%d counted=%d", pu.UsedBytes, counted)
+	}
+
+	bob, ok := srv.getVpnUser(f.bob.ID)
+	if !ok {
+		t.Fatal("bob missing")
+	}
+	v := srv.vpnUserUsageViews([]VpnUser{bob}, now)[0]
+	if v.UsedTotalBytes != counted {
+		t.Fatalf("used_total_bytes = %d, want the counted day rows %d", v.UsedTotalBytes, counted)
+	}
+	if v.UsedTotalBytes < v.UsedPeriodBytes {
+		t.Fatalf("total %d is below the period %d", v.UsedTotalBytes, v.UsedPeriodBytes)
+	}
+}

@@ -84,25 +84,33 @@ type State struct {
 	TraceSessions          map[string]model.TraceSession         `json:"trace_sessions"`
 	NotifyChannels         map[string]model.NotifyChannel        `json:"notify_channels"`
 	NotifyRules            map[string]model.NotifyRule           `json:"notify_rules"`
-	Tunnels                map[string]model.TunnelProfile        `json:"tunnels"`
-	MachineProfiles        map[string]model.MachineProfile       `json:"machine_profiles"`
-	MachineVendors         map[string]model.MachineVendor        `json:"machine_vendors"`
-	NFTInputs              map[string]model.NFTInputs            `json:"nft_inputs"`
-	SecurityGroups         map[string]model.SecurityGroup        `json:"security_groups"`
-	GuardZones             map[string]model.GuardZone            `json:"guard_zones"`
-	GuardBindings          map[string]model.NodeGuardBinding     `json:"guard_bindings"`
-	GuardRealitySnapshots  map[string]GuardRealitySnapshot       `json:"guard_reality_snapshots"`
-	SingBoxLiveness        map[string]SingBoxLiveness            `json:"singbox_liveness"`
-	DNSDeployments         map[string]model.DNSDeployment        `json:"dns_deployments"`
-	NetPolicies            map[string]model.NetPolicy            `json:"net_policies"`
-	Groups                 map[string]model.Group                `json:"groups"`
-	GroupPolicies          map[string]model.GroupNetPolicy       `json:"group_policies"`
-	GeoRouting             map[string]model.GeoRouting           `json:"geo_routing"`
-	AgentUpdates           map[string]model.AgentUpdatePolicy    `json:"agent_updates"`
-	ProxyInbounds          map[string]model.ProxyInbound         `json:"proxy_inbounds"`
-	ProxyUsers             map[string]model.ProxyUser            `json:"proxy_users"`
-	ProxyProfiles          map[string]model.ProxyNodeProfile     `json:"proxy_profiles"`
-	ProxyUsage             map[string]model.ProxyUsageSnapshot   `json:"proxy_usage"`
+	// NotifyWebhooks are operator-authored inbound entry points (notify_webhook.go).
+	// They hold a PBKDF2 secret hash, not a reversible secret, so unlike
+	// NotifyChannels they need no pass in crypto.go.
+	NotifyWebhooks map[string]NotifyWebhook `json:"notify_webhooks"`
+	// NotifyWebhookDeliveries is the bounded per-webhook attempt history keyed by
+	// webhook id, retained for the console. The durable security record is the
+	// audit stream, not this.
+	NotifyWebhookDeliveries map[string][]NotifyWebhookDelivery  `json:"notify_webhook_deliveries,omitempty"`
+	Tunnels                 map[string]model.TunnelProfile      `json:"tunnels"`
+	MachineProfiles         map[string]model.MachineProfile     `json:"machine_profiles"`
+	MachineVendors          map[string]model.MachineVendor      `json:"machine_vendors"`
+	NFTInputs               map[string]model.NFTInputs          `json:"nft_inputs"`
+	SecurityGroups          map[string]model.SecurityGroup      `json:"security_groups"`
+	GuardZones              map[string]model.GuardZone          `json:"guard_zones"`
+	GuardBindings           map[string]model.NodeGuardBinding   `json:"guard_bindings"`
+	GuardRealitySnapshots   map[string]GuardRealitySnapshot     `json:"guard_reality_snapshots"`
+	SingBoxLiveness         map[string]SingBoxLiveness          `json:"singbox_liveness"`
+	DNSDeployments          map[string]model.DNSDeployment      `json:"dns_deployments"`
+	NetPolicies             map[string]model.NetPolicy          `json:"net_policies"`
+	Groups                  map[string]model.Group              `json:"groups"`
+	GroupPolicies           map[string]model.GroupNetPolicy     `json:"group_policies"`
+	GeoRouting              map[string]model.GeoRouting         `json:"geo_routing"`
+	AgentUpdates            map[string]model.AgentUpdatePolicy  `json:"agent_updates"`
+	ProxyInbounds           map[string]model.ProxyInbound       `json:"proxy_inbounds"`
+	ProxyUsers              map[string]model.ProxyUser          `json:"proxy_users"`
+	ProxyProfiles           map[string]model.ProxyNodeProfile   `json:"proxy_profiles"`
+	ProxyUsage              map[string]model.ProxyUsageSnapshot `json:"proxy_usage"`
 	// UsageDayNodes and UsageDayUsers are the daily rollups (usage_days.go),
 	// keyed "<id>/<yyyymmdd>". With the bolt hot store enabled they live only
 	// in bolt and are read with a prefix seek, never held here.
@@ -716,63 +724,65 @@ func monitorResultPersistenceKey(monitorID, nodeID string) string {
 
 func emptyState() State {
 	return State{
-		Users:                  map[string]model.User{},
-		Tokens:                 map[string]model.Token{},
-		Nodes:                  map[string]model.Node{},
-		Tasks:                  map[string]model.Task{},
-		TaskResultReceipts:     map[string]TaskResultReceipt{},
-		TaskTargetStates:       map[string]TaskTargetState{},
-		KV:                     map[string]model.KVEntry{},
-		PluginSecrets:          map[string]model.KVEntry{},
-		VpnUsers:               map[string]VpnUserPublicRecord{},
-		VpnUserSecrets:         map[string]VpnUserSecretRecord{},
-		ManagedLines:           map[string]ManagedLinePublicRecord{},
-		ManagedLineSecrets:     map[string]ManagedLineSecretRecord{},
-		LineChainDefinitions:   map[string]LineChainDefinition{},
-		LineChainAttempts:      map[string]LineChainAttempt{},
-		LineChainAuditEvidence: map[string]model.AuditEvent{},
-		SubscriptionShares:     map[string]model.SubscriptionShare{},
-		SubscriptionSnapshots:  map[string]model.SubscriptionSnapshot{},
-		Static:                 map[string]model.StaticObject{},
-		StorageBuckets:         map[string]model.StorageBucket{},
-		StorageBindings:        map[string]model.StorageBinding{},
-		StorageTokens:          map[string]model.StorageAccessToken{},
-		Plugins:                map[string]model.PluginInstallation{},
-		Approvals:              map[string]model.Approval{},
-		Sessions:               map[string]auth.Session{},
-		DDNS:                   map[string]model.DDNSProfile{},
-		Monitors:               map[string]model.Monitor{},
-		MonResults:             map[string][]model.MonitorResult{},
-		LogSources:             map[string]model.LogSource{},
-		TraceSessions:          map[string]model.TraceSession{},
-		NotifyChannels:         map[string]model.NotifyChannel{},
-		NotifyRules:            map[string]model.NotifyRule{},
-		Tunnels:                map[string]model.TunnelProfile{},
-		MachineProfiles:        map[string]model.MachineProfile{},
-		MachineVendors:         map[string]model.MachineVendor{},
-		NFTInputs:              map[string]model.NFTInputs{},
-		SecurityGroups:         map[string]model.SecurityGroup{},
-		GuardZones:             map[string]model.GuardZone{},
-		GuardBindings:          map[string]model.NodeGuardBinding{},
-		GuardRealitySnapshots:  map[string]GuardRealitySnapshot{},
-		SingBoxLiveness:        map[string]SingBoxLiveness{},
-		DNSDeployments:         map[string]model.DNSDeployment{},
-		NetPolicies:            map[string]model.NetPolicy{},
-		Groups:                 map[string]model.Group{},
-		GroupPolicies:          map[string]model.GroupNetPolicy{},
-		GeoRouting:             map[string]model.GeoRouting{},
-		AgentUpdates:           map[string]model.AgentUpdatePolicy{},
-		ProxyInbounds:          map[string]model.ProxyInbound{},
-		ProxyUsers:             map[string]model.ProxyUser{},
-		ProxyProfiles:          map[string]model.ProxyNodeProfile{},
-		ProxyUsage:             map[string]model.ProxyUsageSnapshot{},
-		UsageDayNodes:          map[string]UsageDayNode{},
-		UsageDayUsers:          map[string]UsageDayUser{},
-		TOTPChallenges:         map[string]auth.TOTPChallenge{},
-		OIDCProviders:          map[string]model.OIDCProvider{},
-		OIDCIdentities:         map[string]model.OIDCIdentity{},
-		OIDCAuthStates:         map[string]auth.OIDCAuthState{},
-		WebAuthnCreds:          map[string]auth.WebAuthnCredential{},
+		Users:                   map[string]model.User{},
+		Tokens:                  map[string]model.Token{},
+		Nodes:                   map[string]model.Node{},
+		Tasks:                   map[string]model.Task{},
+		TaskResultReceipts:      map[string]TaskResultReceipt{},
+		TaskTargetStates:        map[string]TaskTargetState{},
+		KV:                      map[string]model.KVEntry{},
+		PluginSecrets:           map[string]model.KVEntry{},
+		VpnUsers:                map[string]VpnUserPublicRecord{},
+		VpnUserSecrets:          map[string]VpnUserSecretRecord{},
+		ManagedLines:            map[string]ManagedLinePublicRecord{},
+		ManagedLineSecrets:      map[string]ManagedLineSecretRecord{},
+		LineChainDefinitions:    map[string]LineChainDefinition{},
+		LineChainAttempts:       map[string]LineChainAttempt{},
+		LineChainAuditEvidence:  map[string]model.AuditEvent{},
+		SubscriptionShares:      map[string]model.SubscriptionShare{},
+		SubscriptionSnapshots:   map[string]model.SubscriptionSnapshot{},
+		Static:                  map[string]model.StaticObject{},
+		StorageBuckets:          map[string]model.StorageBucket{},
+		StorageBindings:         map[string]model.StorageBinding{},
+		StorageTokens:           map[string]model.StorageAccessToken{},
+		Plugins:                 map[string]model.PluginInstallation{},
+		Approvals:               map[string]model.Approval{},
+		Sessions:                map[string]auth.Session{},
+		DDNS:                    map[string]model.DDNSProfile{},
+		Monitors:                map[string]model.Monitor{},
+		MonResults:              map[string][]model.MonitorResult{},
+		LogSources:              map[string]model.LogSource{},
+		TraceSessions:           map[string]model.TraceSession{},
+		NotifyChannels:          map[string]model.NotifyChannel{},
+		NotifyRules:             map[string]model.NotifyRule{},
+		NotifyWebhooks:          map[string]NotifyWebhook{},
+		NotifyWebhookDeliveries: map[string][]NotifyWebhookDelivery{},
+		Tunnels:                 map[string]model.TunnelProfile{},
+		MachineProfiles:         map[string]model.MachineProfile{},
+		MachineVendors:          map[string]model.MachineVendor{},
+		NFTInputs:               map[string]model.NFTInputs{},
+		SecurityGroups:          map[string]model.SecurityGroup{},
+		GuardZones:              map[string]model.GuardZone{},
+		GuardBindings:           map[string]model.NodeGuardBinding{},
+		GuardRealitySnapshots:   map[string]GuardRealitySnapshot{},
+		SingBoxLiveness:         map[string]SingBoxLiveness{},
+		DNSDeployments:          map[string]model.DNSDeployment{},
+		NetPolicies:             map[string]model.NetPolicy{},
+		Groups:                  map[string]model.Group{},
+		GroupPolicies:           map[string]model.GroupNetPolicy{},
+		GeoRouting:              map[string]model.GeoRouting{},
+		AgentUpdates:            map[string]model.AgentUpdatePolicy{},
+		ProxyInbounds:           map[string]model.ProxyInbound{},
+		ProxyUsers:              map[string]model.ProxyUser{},
+		ProxyProfiles:           map[string]model.ProxyNodeProfile{},
+		ProxyUsage:              map[string]model.ProxyUsageSnapshot{},
+		UsageDayNodes:           map[string]UsageDayNode{},
+		UsageDayUsers:           map[string]UsageDayUser{},
+		TOTPChallenges:          map[string]auth.TOTPChallenge{},
+		OIDCProviders:           map[string]model.OIDCProvider{},
+		OIDCIdentities:          map[string]model.OIDCIdentity{},
+		OIDCAuthStates:          map[string]auth.OIDCAuthState{},
+		WebAuthnCreds:           map[string]auth.WebAuthnCredential{},
 
 		WebAuthnChallenges: map[string]auth.WebAuthnChallenge{},
 	}
@@ -871,6 +881,12 @@ func (st *State) ensureMaps() {
 	}
 	if st.NotifyRules == nil {
 		st.NotifyRules = map[string]model.NotifyRule{}
+	}
+	if st.NotifyWebhooks == nil {
+		st.NotifyWebhooks = map[string]NotifyWebhook{}
+	}
+	if st.NotifyWebhookDeliveries == nil {
+		st.NotifyWebhookDeliveries = map[string][]NotifyWebhookDelivery{}
 	}
 	if st.Tunnels == nil {
 		st.Tunnels = map[string]model.TunnelProfile{}

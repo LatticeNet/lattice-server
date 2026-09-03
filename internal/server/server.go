@@ -177,9 +177,12 @@ type Server struct {
 	// It bounds guesses, not CPU. A request-rate budget cannot bound CPU: the
 	// cost of one PBKDF2 derivation varies by more than an order of magnitude
 	// across machines, so any rate that is harmless on a fast host is a saturated
-	// core on a slow one. webhookVerifySlots is what bounds the CPU.
+	// core on a slow one. secretVerifySlots is what bounds the CPU.
 	webhookVerifyLimiter *ratelimit.Limiter
-	// webhookVerifySlots caps how many derivations may run AT ONCE, machine-wide.
+	// secretVerifySlots caps how many password derivations may run AT ONCE,
+	// machine-wide, across every route that derives for a caller who has proved
+	// nothing yet. Today that is the inbound-webhook route and the
+	// storage-token route.
 	//
 	// This is a semaphore rather than another rate limiter on purpose. CPU is
 	// consumed by concurrent work, not by arrival rate, so a concurrency cap is
@@ -188,7 +191,16 @@ type Server struct {
 	// 20ms or 500ms. It also survives the thing a per-address budget cannot,
 	// namely address rotation, which under TrustProxy is a header the caller
 	// writes.
-	webhookVerifySlots chan struct{}
+	//
+	// One semaphore for all such routes, not one each. The quantity being
+	// bounded is how much of this machine may go to derivation for callers who
+	// have proved nothing, and that is a property of the machine. Two
+	// semaphores sized at half the cores each would add up to every core, which
+	// is the bound this exists to prevent.
+	secretVerifySlots chan struct{}
+	// storageVerify keeps key derivation off the storage route's hot path. A
+	// permit alone could not do that job: see storage_verify_cache.go.
+	storageVerify *storageVerifyCache
 	// webhookFireLimiter bounds *authenticated* webhook fires, keyed by webhook
 	// id rather than by address. What it protects is not server CPU but the
 	// operator's attention: a looping caller with a valid secret floods a phone
@@ -501,7 +513,8 @@ func New(opts Options) (*Server, error) {
 		// webhooks stays under it, while 120 guesses a minute against 256 bits of
 		// entropy is nothing.
 		webhookVerifyLimiter: ratelimit.New(ratelimit.Config{Rate: 2, Burst: 40}),
-		webhookVerifySlots:   make(chan struct{}, webhookVerifyConcurrency()),
+		secretVerifySlots:    make(chan struct{}, secretVerifyConcurrency()),
+		storageVerify:        newStorageVerifyCache(nil),
 		// Ten fires a minute sustained, with a burst of ten to absorb a genuine
 		// cluster of events without dropping any.
 		webhookFireLimiter: ratelimit.New(ratelimit.Config{Rate: 10.0 / 60.0, Burst: 10}),
@@ -8610,11 +8623,28 @@ func (s *Server) auditAgentAuthFailure(r *http.Request, nodeID, reason string) {
 // degrades webhook latency instead of starving the rest of the control plane.
 // Deriving it from GOMAXPROCS is what makes the bound hold on a two-core VM and
 // on a sixteen-core host without retuning a constant per deployment.
-func webhookVerifyConcurrency() int {
+func secretVerifyConcurrency() int {
 	if n := runtime.GOMAXPROCS(0) / 2; n > 2 {
 		return n
 	}
 	return 2
+}
+
+// acquireSecretVerify takes a derivation permit, or reports that the machine is
+// already spending all it is willing to spend on unauthenticated derivation.
+//
+// Non-blocking on purpose: a caller arriving while every permit is held is
+// refused rather than queued, because queueing here is how a flood turns into
+// unbounded goroutines. The returned function releases the permit and must wrap
+// the derivation alone; holding it across the rest of a request would cap
+// concurrent requests instead of concurrent derivation.
+func (s *Server) acquireSecretVerify() (func(), bool) {
+	select {
+	case s.secretVerifySlots <- struct{}{}:
+		return func() { <-s.secretVerifySlots }, true
+	default:
+		return nil, false
+	}
 }
 
 func (s *Server) clientIP(r *http.Request) string {

@@ -506,8 +506,8 @@ func (s *Server) authenticateInboundWebhook(w http.ResponseWriter, r *http.Reque
 	// busy verifying is refused immediately rather than queued, because queueing
 	// here is how a flood turns into unbounded goroutines and memory.
 	select {
-	case s.webhookVerifySlots <- struct{}{}:
-		defer func() { <-s.webhookVerifySlots }()
+	case s.secretVerifySlots <- struct{}{}:
+		defer func() { <-s.secretVerifySlots }()
 	default:
 		s.refuseInboundWebhook(w, r, webhookID, http.StatusTooManyRequests, "rate limited", errors.New("too many webhook attempts"))
 		return store.NotifyWebhook{}, false

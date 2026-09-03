@@ -35,6 +35,12 @@ type approvalView struct {
 	Service        string   `json:"service,omitempty"`
 	Method         string   `json:"method,omitempty"`
 	Targets        []string `json:"targets,omitempty"`
+
+	// Waiting explains why an approved approval has not applied. Additive and
+	// omitted for every other status, so a client that predates it sees the
+	// shape it already had. Only the listing endpoint fills it in; see
+	// server_approval_waiting.go for why the console cannot derive it.
+	Waiting *approvalWaitView `json:"waiting,omitempty"`
 }
 
 // systemActorID is the recorded creator for approvals the server proposed

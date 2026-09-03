@@ -437,14 +437,6 @@ func TestRemainingPrivilegedAllowAuditsUseRequestID(t *testing.T) {
 	}
 	assertResponseAuditCorrelation(t, st, staticPut, "static.put", "static:write")
 
-	workerUpsert := doJSON(t, handler, http.MethodPost, "/api/workers",
-		`{"name":"audit-worker","source":"hello {{path}}","capabilities":["worker:route"],"public":false}`, cookies, csrf)
-	workerUpsert.Body.Close()
-	if workerUpsert.StatusCode != http.StatusOK {
-		t.Fatalf("worker upsert failed: %d", workerUpsert.StatusCode)
-	}
-	assertResponseAuditCorrelation(t, st, workerUpsert, "worker.upsert", "worker:deploy")
-
 	notifyTest := doJSON(t, handler, http.MethodPost, "/api/notify/test",
 		`{"channel":"webhook","config":{"url":"http://127.0.0.1:1/blocked"},"title":"audit","body":"test"}`, cookies, csrf)
 	notifyTest.Body.Close()

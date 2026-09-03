@@ -96,7 +96,6 @@ var capabilityRisk = map[string]string{
 	"kv:write":             RiskWrite,
 	"log:write":            RiskWrite,
 	"notify:send":          RiskWrite,
-	"worker:route":         RiskWrite,
 	"ddns:admin":           RiskHost,
 	"monitor:admin":        RiskHost,
 	"netguard:admin":       RiskHost,
@@ -153,9 +152,8 @@ var hostRiskExemptForNonSystem = map[string]bool{
 }
 
 var workerCapabilities = map[string]bool{
-	"kv:read":      true,
-	"static:read":  true,
-	"worker:route": true,
+	"kv:read":     true,
+	"static:read": true,
 }
 
 func ValidateManifest(m Manifest) error {

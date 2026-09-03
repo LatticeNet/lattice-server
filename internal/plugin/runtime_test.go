@@ -651,9 +651,9 @@ func TestRuntimeManagerStopAndSnapshotAreSafe(t *testing.T) {
 			ID:           "log.bundle",
 			Name:         "Log",
 			Type:         TypeSystem,
-			Capabilities: []string{"log:write", "worker:route"},
+			Capabilities: []string{"log:write", "kv:read"},
 		},
-		Capabilities: []string{"log:write", "worker:route"},
+		Capabilities: []string{"log:write", "kv:read"},
 	}
 	if _, err := m.Start(context.Background(), loaded); err != nil {
 		t.Fatal(err)

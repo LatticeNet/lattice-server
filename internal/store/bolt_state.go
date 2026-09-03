@@ -48,7 +48,6 @@ var (
 	boltBucketStorageBuckets  = []byte("storage_buckets")
 	boltBucketStorageBindings = []byte("storage_bindings")
 	boltBucketStorageTokens   = []byte("storage_tokens")
-	boltBucketWorkers         = []byte("workers")
 	boltBucketPlugins         = []byte("plugins")
 	boltBucketApprovals       = []byte("approvals")
 	boltBucketSessions        = []byte("sessions")
@@ -119,7 +118,6 @@ var boltStateBuckets = [][]byte{
 	boltBucketStorageBuckets,
 	boltBucketStorageBindings,
 	boltBucketStorageTokens,
-	boltBucketWorkers,
 	boltBucketPlugins,
 	boltBucketApprovals,
 	boltBucketSessions,
@@ -405,9 +403,6 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putMap(tx, boltBucketStorageTokens, persist.StorageTokens); err != nil {
 			return err
 		}
-		if err := putMap(tx, boltBucketWorkers, persist.Workers); err != nil {
-			return err
-		}
 		if err := putMap(tx, boltBucketPlugins, persist.Plugins); err != nil {
 			return err
 		}
@@ -642,9 +637,6 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		if err := readMap(tx, boltBucketStorageTokens, st.StorageTokens); err != nil {
-			return err
-		}
-		if err := readMap(tx, boltBucketWorkers, st.Workers); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketPlugins, st.Plugins); err != nil {
@@ -1284,33 +1276,6 @@ func (bs *BoltStateStore) Static(bucket string) ([]model.StaticObject, error) {
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Path < objects[j].Path })
 	return objects, nil
-}
-
-func (bs *BoltStateStore) UpsertWorker(w model.WorkerScript) error {
-	w.UpdatedAt = time.Now().UTC()
-	return bs.db.Update(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		return putRecord(tx, boltBucketWorkers, w.ID, w)
-	})
-}
-
-func (bs *BoltStateStore) Workers() ([]model.WorkerScript, error) {
-	workers := []model.WorkerScript{}
-	err := bs.db.View(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		var err error
-		workers, err = listMapValues[model.WorkerScript](tx, boltBucketWorkers)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
-	return workers, nil
 }
 
 func (bs *BoltStateStore) UpsertPluginInstallation(p model.PluginInstallation) error {

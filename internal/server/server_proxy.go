@@ -587,6 +587,14 @@ func (s *Server) handleAgentProxyUsage(w http.ResponseWriter, r *http.Request) {
 	if result.UnknownLines > 0 {
 		auditMeta["unknown_lines"] = strconv.Itoa(result.UnknownLines)
 	}
+	// A held report is the state that replaces a burst of unknown_line rows,
+	// and unknown_lines is the channel the original incident was found on. Held
+	// reports keep UnknownLines at zero by design, so without this a node can
+	// sit in a hold for the whole bound and signal nothing here: the fix would
+	// be invisible to the surface that detected the problem it fixes.
+	if result.InboundDeferred {
+		auditMeta["inbound_deferred"] = "true"
+	}
 	if result.ProfileRegistered {
 		auditMeta["profile_registered"] = "true"
 	}
@@ -651,8 +659,19 @@ func (s *Server) shouldAuditProxyUsage(nodeID string, meta map[string]string, no
 // a profile being registered, the collector's source or state changing, or
 // counters being dropped. Byte counts are deliberately excluded, since those
 // change on every report by design and are already recorded as usage.
+//
+// inbound_deferred belongs here rather than only in the metadata. Adding it to
+// auditMeta alone was necessary and not sufficient: the gate below writes an
+// event only when this fingerprint changes or six hours pass, so a hold on a
+// node with nothing else changing could run its whole 15-minute course without
+// producing a single stored event carrying the key, which is the silence the
+// key exists to break.
+//
+// It is safe to include for the reason byte counts are not. It is a boolean
+// that is stable across an episode, so it yields exactly two events per hold,
+// one when it starts and one when it ends, rather than one per report.
 func proxyUsageAuditFingerprint(meta map[string]string) string {
-	keys := []string{"profile_registered", "collector_source", "collector_status", "ignored_counters", "error"}
+	keys := []string{"profile_registered", "collector_source", "collector_status", "ignored_counters", "error", "inbound_deferred"}
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
 		parts = append(parts, k+"="+meta[k])

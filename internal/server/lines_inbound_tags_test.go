@@ -43,8 +43,11 @@ func seedRelayPairNode(t *testing.T, srv *Server, inboundTags string) (relay Lin
 	srv.singboxInvMu.Lock()
 	srv.singboxInv = map[string]model.SingBoxInventory{
 		"dmit-eb-wee": {NodeID: "dmit-eb-wee", At: srv.now(), Status: "ok", Nodes: []model.SingBoxNode{
-			{Name: plainFile, Protocol: "hysteria2", Network: "hy2", Address: "203.0.113.7", Port: "17892", OutboundRef: "direct",
-				Metadata: map[string]string{singBoxInboundTagsKey: `["` + plainFile + `"]`}},
+			// Reports nothing, the way a node whose sing-box helper predates the
+			// field does. Its tag is reachable only through the line's own name,
+			// so the primary pass stays load-bearing in this fixture rather than
+			// being shadowed by a reported tag that happens to equal the name.
+			{Name: plainFile, Protocol: "hysteria2", Network: "hy2", Address: "203.0.113.7", Port: "17892", OutboundRef: "direct"},
 			{Name: relayFile, Protocol: "vless", Network: "reality", Address: "203.0.113.7", Port: "7899",
 				OutboundRef: "out-to-aaitr-frontier-nat-vless-7899", OutboundServer: "nat-us-28tz.aproxy.top", OutboundPort: "25499",
 				Metadata: metadata},

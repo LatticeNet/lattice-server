@@ -117,6 +117,28 @@ func (s *Server) queueLineMetaSyncLocked(p principal, nodeID string) ([]byte, er
 			return nil, fmt.Errorf("reject superseded linemeta approval %s: %w", ap.ID, err)
 		}
 	}
+	// A plan that would erase something the box already has is never worth
+	// filing, whatever produced it. The render resolves downstream_node from a
+	// fleet-wide walk of every node's lines, so a render that runs before the
+	// other nodes have posted their inventory names no downstream at all, and
+	// the resulting plan is strictly worse than the one already applied.
+	// Approving it would write the loss to the box.
+	//
+	// The guard is deliberately here rather than at the render. "Is the fleet
+	// view complete" cannot be decided: no node can be proven to have finished
+	// posting. "Is this plan strictly worse than what is on the box" is decided
+	// from the applied approval already loaded above, and it holds against every
+	// cause of loss rather than the one cause we happen to have diagnosed.
+	//
+	// Refusing is safe on both call sites. The discovery path logs and leaves
+	// its fingerprint uncommitted, so the next inventory post retries with a
+	// warmer view; the operator path gets told which field would have gone.
+	if applied != nil {
+		if lost := lineMetaPlanRegression([]byte(applied.Plan), payload); lost != "" {
+			return nil, fmt.Errorf("linemeta sync for %s would drop %s from the applied plan; "+
+				"refusing to queue a sidecar that is worse than the one on the box", nodeID, lost)
+		}
+	}
 	if pending != nil {
 		queued := lineMetaSemanticSHA([]byte(pending.Plan)) != semanticSHA
 		if !queued {
@@ -186,6 +208,63 @@ func (s *Server) queueLineMetaSyncLocked(p principal, nodeID string) ([]byte, er
 		Approval model.Approval `json:"approval"`
 		Queued   bool           `json:"queued"`
 	}{Approval: approval, Queued: true})
+}
+
+// lineMetaPlanRegression reports what a fresh plan would take away from the
+// plan a node has already applied, or "" when it takes nothing away. It is a
+// one-way test: a plan that adds or changes a value is fine, and only a value
+// going from present to absent is refused.
+//
+// An entry disappearing entirely is NOT a regression, because removing a line
+// is a legitimate thing to do and an operator must be able to. Every entry
+// disappearing at once is, since that is a node with no lines in the read model
+// rather than a node whose lines were all deleted; requiring a manual sync for
+// the rare real case is the right trade.
+//
+// An applied plan that cannot be parsed yields "": there is nothing to compare
+// against, and refusing every sync on a node with one corrupt approval would be
+// worse than the loss this prevents.
+func lineMetaPlanRegression(applied, fresh []byte) string {
+	var was, now lineMetadataDocV2
+	if json.Unmarshal(applied, &was) != nil || json.Unmarshal(fresh, &now) != nil {
+		return ""
+	}
+	if len(was.Inbounds) > 0 && len(now.Inbounds) == 0 {
+		return fmt.Sprintf("all %d inbound entries", len(was.Inbounds))
+	}
+	if was.NodeUUID != "" && now.NodeUUID == "" {
+		return "node_uuid"
+	}
+	byTag := make(map[string]lineMetadataInboundV2, len(now.Inbounds))
+	for _, ib := range now.Inbounds {
+		byTag[ib.Tag] = ib
+	}
+	for _, before := range was.Inbounds {
+		after, ok := byTag[before.Tag]
+		if !ok {
+			continue // the line is gone, which is a removal and not a loss
+		}
+		switch {
+		case before.LineUUID != "" && after.LineUUID == "":
+			return "line_uuid on " + before.Tag
+		case before.LineHashID != "" && after.LineHashID == "":
+			return "line_hash_id on " + before.Tag
+		case before.Chain != nil && after.Chain == nil:
+			return "the chain block on " + before.Tag
+		}
+		if before.Chain == nil || after.Chain == nil {
+			continue
+		}
+		if before.Chain.DownstreamNode != "" && after.Chain.DownstreamNode == "" {
+			return "chain.downstream_node on " + before.Tag
+		}
+		if hadDS := before.Chain.DownstreamLineUUID != nil && *before.Chain.DownstreamLineUUID != ""; hadDS {
+			if after.Chain.DownstreamLineUUID == nil || *after.Chain.DownstreamLineUUID == "" {
+				return "chain.downstream_line_uuid on " + before.Tag
+			}
+		}
+	}
+	return ""
 }
 
 // maybeQueueLineMetaSyncOnDiscovery queues a metadata sync when the node's

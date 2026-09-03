@@ -173,6 +173,26 @@ func (s *Server) subStoreGraphRecords() []usageSubStoreRecord {
 	return out
 }
 
+// nodeNameIndex narrows the fleet-wide u_<hash> reverse index to the names one
+// node can speak for. A counter is that node's own statement only when the line
+// the name resolves to sits on that node; a name for a line the read model
+// places elsewhere is another node's business. A name whose line the read model
+// does not carry at all stays in, which is the stale-discovery degradation
+// usageIngest's namedOnly loop already allows.
+func (ctx *usageAttributionContext) nodeNameIndex(nodeID string) map[string]userLineNameTarget {
+	if len(ctx.nameIndex) == 0 {
+		return nil
+	}
+	out := make(map[string]userLineNameTarget, len(ctx.nameIndex))
+	for name, target := range ctx.nameIndex {
+		if f, ok := ctx.byHash[target.LineHashID]; ok && f.Line.NodeID != nodeID {
+			continue
+		}
+		out[name] = target
+	}
+	return out
+}
+
 func (s *Server) usageAttributionContext() *usageAttributionContext {
 	groups, _ := s.lineReadModel()
 	ctx := &usageAttributionContext{
@@ -622,8 +642,7 @@ func diffTrafficCounters(current, previous map[string]model.ProxyTrafficCounter,
 // usageCollectorState folds a profile's collector fields into one of four
 // states: a node that never reported a collector is no_collector, not "ok".
 func usageCollectorState(profile model.ProxyNodeProfile) string {
-	switch profile.UsageCollectorStatus {
-	case model.ProxyUsageCollectorStatusOK, model.ProxyUsageCollectorStatusError, proxyUsageCollectorStatusStatsOff:
+	if validProxyUsageCollectorStatus(profile.UsageCollectorStatus) {
 		return profile.UsageCollectorStatus
 	}
 	if profile.UsageCollectorSource != "" || profile.UsageCollectorLastError != "" {

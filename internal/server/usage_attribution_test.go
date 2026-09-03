@@ -683,4 +683,98 @@ func TestUsageIngestRegistersDiscoveredProfile(t *testing.T) {
 	if _, ok := st.ProxyNodeProfile("node-b"); ok {
 		t.Fatal("no profile must be registered on an empty report")
 	}
+
+	// Collector evidence has to be evidence: an arbitrary collector_status is
+	// not one, so it registers nothing and audits nothing.
+	garbageToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-c", "Node C")
+	garbage := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage",
+		`{"node_id":"node-c","snapshot":{"core_uptime_sec":1,"collector_source":"whatever","collector_status":"garbage"}}`, garbageToken)
+	if garbage.Code != http.StatusBadRequest {
+		t.Fatalf("unknown collector_status from a node without inventory: %d %s", garbage.Code, garbage.Body.String())
+	}
+	if _, ok := st.ProxyNodeProfile("node-c"); ok {
+		t.Fatal("an unknown collector_status must not register a profile")
+	}
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "proxy.profile.discovered" && ev.NodeID == "node-c" {
+			t.Fatalf("an unknown collector_status must not be audited: %+v", ev)
+		}
+	}
+
+	// A status the contract defines still registers a node with no inventory.
+	validToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-d", "Node D")
+	valid := doAgentRaw(t, handler, http.MethodPost, "/api/agent/proxy-usage",
+		`{"node_id":"node-d","snapshot":{"core_uptime_sec":1,"collector_source":"singbox-stats","collector_status":"ok"}}`, validToken)
+	if valid.Code != http.StatusOK {
+		t.Fatalf("valid collector_status without inventory: %d %s", valid.Code, valid.Body.String())
+	}
+	var validOut proxyUsageApplyResult
+	if err := json.NewDecoder(valid.Body).Decode(&validOut); err != nil {
+		t.Fatal(err)
+	}
+	if !validOut.ProfileRegistered {
+		t.Fatalf("valid collector evidence must register: %+v", validOut)
+	}
+	if _, ok := st.ProxyNodeProfile("node-d"); !ok {
+		t.Fatal("valid collector evidence must register a profile")
+	}
+}
+
+// A u_<hash> name is only the reporting node's statement about its own lines.
+// node-a naming dave on node-b's shared-b line, and pointing line_user_bytes
+// straight at that line, attributes nothing to dave; the rest of the report is
+// still accepted and node-a's own line still counts.
+func TestUsageIngestRejectsForeignLineAttribution(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	srv := usageTestServer(t, now)
+	f := seedUsageFleet(t, srv)
+	daveName := userLineName(f.dave.ID, f.shared.LineUUID)
+	ctx := srv.usageAttributionContext()
+	if _, ok := ctx.nameIndex[daveName]; !ok {
+		t.Fatal("fixture must index dave's name on shared-b")
+	}
+	if ctx.byHash[f.shared.LineHashID].Line.NodeID != "node-b" {
+		t.Fatalf("shared-b must belong to node-b: %+v", ctx.byHash[f.shared.LineHashID].Line)
+	}
+	report := func(uptime uint64, alice, dave int64) proxyUsageApplyResult {
+		t.Helper()
+		return mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: uptime,
+			InboundTraffic: map[string]model.ProxyTrafficCounter{"hub-a": counter(int64(uptime), int64(uptime))},
+			UserBytes:      map[string]int64{f.aliceName: alice, daveName: dave},
+			LineUserBytes:  map[string]map[string]int64{f.shared.LineHashID: {f.dave.ID: dave}},
+		})
+	}
+	report(100, 10, 1000)
+	result := report(200, 30, 5000)
+
+	if _, ok := srv.store.ProxyUser(f.dave.ID); ok {
+		t.Fatal("a foreign line's counter must not make dave eligible")
+	}
+	day := store.UsageDay(now)
+	if rows, _ := srv.store.UsageDayUserRows(f.dave.ID, day, day); len(rows) != 0 {
+		t.Fatalf("dave must have no counted bytes: %+v", rows)
+	}
+	snap, ok := srv.store.ProxyUsageSnapshot("node-a")
+	if !ok {
+		t.Fatal("node-a snapshot must be stored")
+	}
+	if _, kept := snap.LineUserBytes[f.shared.LineHashID]; kept {
+		t.Fatalf("a foreign line must not be stored on node-a: %+v", snap.LineUserBytes)
+	}
+	if _, kept := snap.UserBytes[f.dave.ID]; kept {
+		t.Fatalf("a foreign line's user must not be stored on node-a: %+v", snap.UserBytes)
+	}
+	if result.UsersIgnored == 0 {
+		t.Fatalf("the dropped foreign counter must be reported as ignored: %+v", result)
+	}
+	// node-a's own line is untouched by the scoping.
+	if snap.UserBytes[f.alice.ID] != 30 || snap.LineUserBytes[f.hub.LineHashID][f.alice.ID] != 30 {
+		t.Fatalf("alice must still fold onto hub-a: %+v %+v", snap.UserBytes, snap.LineUserBytes)
+	}
+	// 20 from her folded total plus hub-a's 200 inbound delta, which the
+	// binding rule gives her because this report carries no named counter.
+	pu, ok := srv.store.ProxyUser(f.alice.ID)
+	if !ok || pu.UsedBytes != 220 {
+		t.Fatalf("alice UsedBytes = %d ok=%v, want 220", pu.UsedBytes, ok)
+	}
 }

@@ -1360,6 +1360,17 @@ func cloneProxyUserBytes(in map[string]int64) map[string]int64 {
 	return out
 }
 
+// validProxyUsageCollectorStatus reports whether a status is one of the three
+// the agent wire contract defines. Every other value is an arbitrary string and
+// carries no meaning, whether it arrives as health or as discovery evidence.
+func validProxyUsageCollectorStatus(status string) bool {
+	switch status {
+	case model.ProxyUsageCollectorStatusOK, model.ProxyUsageCollectorStatusError, proxyUsageCollectorStatusStatsOff:
+		return true
+	}
+	return false
+}
+
 func applyProxyUsageCollectorHealth(profile model.ProxyNodeProfile, snapshot model.ProxyUsageSnapshot, now time.Time) (model.ProxyNodeProfile, bool, error) {
 	source := strings.TrimSpace(snapshot.CollectorSource)
 	status := strings.TrimSpace(snapshot.CollectorStatus)
@@ -1378,7 +1389,7 @@ func applyProxyUsageCollectorHealth(profile model.ProxyNodeProfile, snapshot mod
 			status = model.ProxyUsageCollectorStatusOK
 		}
 	}
-	if status != model.ProxyUsageCollectorStatusOK && status != model.ProxyUsageCollectorStatusError && status != proxyUsageCollectorStatusStatsOff {
+	if !validProxyUsageCollectorStatus(status) {
 		return model.ProxyNodeProfile{}, false, fmt.Errorf("invalid collector_status %q", status)
 	}
 	checkedAt := snapshot.CollectorCheckedAt
@@ -1489,18 +1500,31 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	// design-15 §8: reverse on-box u_<hash> stat names into (line, proxy user)
 	// accounting rows before eligibility checks and monotonic diffing. The
 	// attribution context carries the same index, computed once.
+	//
+	// The index is fleet-wide, so it is narrowed to the reporting node first: a
+	// name only proves anything about a line that node serves. A valid name for
+	// another node's line is dropped and counted as ignored, never folded and
+	// never used to widen eligibility, which is what kept one node from
+	// attributing bytes to any (line, user) pair in the fleet.
 	attribution := s.usageAttributionContext()
+	nameIndex := attribution.nodeNameIndex(snapshot.NodeID)
 	folded := map[string]bool{}
+	foreignNames := 0
 	for name := range snapshot.UserBytes {
-		if target, ok := attribution.nameIndex[name]; ok {
+		if target, ok := nameIndex[name]; ok {
 			folded[target.ProxyUserID] = true
+			continue
+		}
+		if _, ok := attribution.nameIndex[name]; ok {
+			delete(snapshot.UserBytes, name)
+			foreignNames++
 		}
 	}
-	foldUserLineUsage(&snapshot, attribution.nameIndex)
+	foldUserLineUsage(&snapshot, nameIndex)
 	// Direction-split user counters are kept by name, but only the names the
 	// index can place: on an sb-managed node an unnamed user's key is the
 	// credential itself, and that must never be stored or echoed.
-	snapshot.UserTraffic = keepIndexedUserTraffic(snapshot.UserTraffic, attribution.nameIndex)
+	snapshot.UserTraffic = keepIndexedUserTraffic(snapshot.UserTraffic, nameIndex)
 	eligible := s.proxyUsageEligibleUsers(profile)
 	ensureEligible := func(acct string) {
 		if _, ok := eligible[acct]; ok {
@@ -1518,7 +1542,7 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	for acct := range folded {
 		ensureEligible(acct)
 	}
-	lineUserBytes, lineUserTotals, lineUsersIgnored, err := s.sanitizeProxyUsageLineUserBytes(snapshot.LineUserBytes, eligible)
+	lineUserBytes, lineUserTotals, lineUsersIgnored, err := s.sanitizeProxyUsageLineUserBytes(snapshot.NodeID, snapshot.LineUserBytes, eligible)
 	if err != nil {
 		return proxyUsageApplyResult{}, err
 	}
@@ -1527,7 +1551,7 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		snapshot.UserBytes = lineUserTotals
 	}
 	sanitized := map[string]int64{}
-	ignored := lineUsersIgnored
+	ignored := lineUsersIgnored + foreignNames
 	for userID, value := range snapshot.UserBytes {
 		userID = strings.TrimSpace(userID)
 		if !proxyIDRe.MatchString(userID) {
@@ -1655,7 +1679,12 @@ func (s *Server) registerDiscoveredProxyProfile(snapshot model.ProxyUsageSnapsho
 		return model.ProxyNodeProfile{}, fmt.Errorf("proxy node profile %s not found", snapshot.NodeID)
 	}
 	_, discovered := s.singBoxInventory(snapshot.NodeID)
-	proves := snapshot.CollectorSource != "" || snapshot.CollectorStatus != "" ||
+	// Evidence has to be evidence. A collector_source or a collector_status the
+	// contract does not define is one arbitrary string, and registering on it
+	// let any authenticated node mint a profile and an audit row out of noise.
+	// Either the status is one the agent actually reports, or the snapshot
+	// carries a counter map.
+	proves := validProxyUsageCollectorStatus(strings.TrimSpace(snapshot.CollectorStatus)) ||
 		len(snapshot.UserBytes) > 0 || len(snapshot.LineUserBytes) > 0 ||
 		len(snapshot.InboundTraffic) > 0 || len(snapshot.UserTraffic) > 0 || len(snapshot.OutboundTraffic) > 0
 	if !discovered && !proves {
@@ -1741,7 +1770,11 @@ func keepIndexedUserTraffic(counters map[string]model.ProxyTrafficCounter, index
 	return out
 }
 
-func (s *Server) sanitizeProxyUsageLineUserBytes(input map[string]map[string]int64, eligible map[string]model.ProxyUser) (map[string]map[string]int64, map[string]int64, int, error) {
+// sanitizeProxyUsageLineUserBytes keeps the (line, user) pairs nodeID is
+// entitled to report: the counters live on the box that owns the inbound, so a
+// line the read model places on another node is ignored the same way an unknown
+// line is, not attributed.
+func (s *Server) sanitizeProxyUsageLineUserBytes(nodeID string, input map[string]map[string]int64, eligible map[string]model.ProxyUser) (map[string]map[string]int64, map[string]int64, int, error) {
 	if len(input) == 0 {
 		return nil, nil, 0, nil
 	}
@@ -1752,7 +1785,7 @@ func (s *Server) sanitizeProxyUsageLineUserBytes(input map[string]map[string]int
 	groups, _ := s.lineReadModel()
 	for _, group := range groups {
 		for _, line := range group.Lines {
-			if line.LineHashID != "" {
+			if line.LineHashID != "" && line.NodeID == nodeID {
 				knownLines[line.LineHashID] = true
 			}
 		}

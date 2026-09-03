@@ -12,6 +12,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
+	"github.com/LatticeNet/lattice-server/internal/netguard"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -54,6 +55,25 @@ func newDNSServerWithOptions(t *testing.T, opts Options) (*Server, http.Handler,
 		t.Fatal(err)
 	}
 	return srv, srv.Handler(), st
+}
+
+// dnsPlanResponse is the shape /api/dns/plan returns since the lockout lint was
+// wired in: the approval plus the lint findings the operator has to read.
+type dnsPlanResponse struct {
+	Approval model.Approval     `json:"approval"`
+	Findings []netguard.Finding `json:"findings"`
+}
+
+// decodeDNSPlan unwraps a successful plan response. Tests that are not about
+// lockout still have to pass the lint, so they either seed a baseline that
+// keeps the management port open or send accept_lockout_risk.
+func decodeDNSPlan(t *testing.T, res *http.Response) model.Approval {
+	t.Helper()
+	var out dnsPlanResponse
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out.Approval
 }
 
 func TestDNSDeploymentCreateListHidesSecret(t *testing.T) {
@@ -269,7 +289,7 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 		"node_id":"n1",
 		"interface_name":"ens3",
 		"wireguard_cidr":"10.66.0.0/24",
-		"public_tcp":[443]
+		"public_tcp":[22,443]
 	}`, cookies, csrf)
 	saveInputs.Body.Close()
 	if saveInputs.StatusCode != http.StatusOK {
@@ -290,15 +310,14 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 	}
 	create.Body.Close()
 
+	// No accept_lockout_risk here on purpose: the seeded baseline keeps tcp/22
+	// open, so this plan has to clear the lockout lint on its own merits.
 	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
 	defer planRes.Body.Close()
 	if planRes.StatusCode != http.StatusOK {
 		t.Fatalf("dns plan failed: %d", planRes.StatusCode)
 	}
-	var approval model.Approval
-	if err := json.NewDecoder(planRes.Body).Decode(&approval); err != nil {
-		t.Fatal(err)
-	}
+	approval := decodeDNSPlan(t, planRes)
 	if approval.Plugin != "selfdns" || selfDNSApprovalDisplayAction(approval.Action) != selfDNSApplyAction || approval.NodeID != "n1" {
 		t.Fatalf("bad approval: %+v", approval)
 	}
@@ -309,7 +328,7 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 		"bind 10.66.0.1",
 		"forward . 1.1.1.1 9.9.9.9",
 		"nft inputs source: stored",
-		`iifname "ens3" tcp dport { 443 }`,
+		`iifname "ens3" tcp dport { 22, 443 }`,
 		`ip saddr @wg_peers4 udp dport { 53 }`,
 		`ip saddr @wg_peers4 tcp dport { 53 }`,
 		"publish n1.dns.example.com",
@@ -390,15 +409,12 @@ func TestDNSPlanBindsPinnedCoreDNSBinaryIntoReviewedPlan(t *testing.T) {
 	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
-	plan := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	plan := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`","accept_lockout_risk":true}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
 		t.Fatalf("plan failed: %d", plan.StatusCode)
 	}
-	var approval model.Approval
-	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
-		t.Fatal(err)
-	}
+	approval := decodeDNSPlan(t, plan)
 	for _, want := range []string{
 		"## CoreDNS binary",
 		"version: 1.12.4",
@@ -448,15 +464,12 @@ func TestDNSApproveRejectsStaleDeletedDeployment(t *testing.T) {
 	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
-	plan := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
+	plan := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`","accept_lockout_risk":true}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
 		t.Fatalf("plan failed: %d", plan.StatusCode)
 	}
-	var approval model.Approval
-	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
-		t.Fatal(err)
-	}
+	approval := decodeDNSPlan(t, plan)
 	if err := st.DeleteDNSDeployment(created.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -488,14 +501,14 @@ func TestDNSPlanRequiresNetworkPlanScope(t *testing.T) {
 	create.Body.Close()
 
 	dnsOnly := createPAT(t, handler, cookies, csrf, []string{"dns:admin"}, []string{"n1"})
-	denied := doBearerJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, dnsOnly)
+	denied := doBearerJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`","accept_lockout_risk":true}`, dnsOnly)
 	denied.Body.Close()
 	if denied.StatusCode != http.StatusForbidden {
 		t.Fatalf("dns-only token must not view firewall-bearing plan, got %d", denied.StatusCode)
 	}
 
 	withNetwork := createPAT(t, handler, cookies, csrf, []string{"dns:admin", "network:plan"}, []string{"n1"})
-	allowed := doBearerJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, withNetwork)
+	allowed := doBearerJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`","accept_lockout_risk":true}`, withNetwork)
 	allowed.Body.Close()
 	if allowed.StatusCode != http.StatusOK {
 		t.Fatalf("dns+network token should create plan, got %d", allowed.StatusCode)
@@ -757,11 +770,8 @@ func TestDNSApplyResultUpdatesDeploymentStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	create.Body.Close()
-	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
-	var approval model.Approval
-	if err := json.NewDecoder(planRes.Body).Decode(&approval); err != nil {
-		t.Fatal(err)
-	}
+	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`","accept_lockout_risk":true}`, cookies, csrf)
+	approval := decodeDNSPlan(t, planRes)
 	planRes.Body.Close()
 	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
 		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
@@ -808,4 +818,130 @@ func TestDNSApplyResultUpdatesDeploymentStatus(t *testing.T) {
 	if !auditMetadataSeen(st, "dns.apply.applied", "dns_id", created.ID) {
 		t.Fatalf("missing dns.apply.applied audit: %+v", st.AuditEvents())
 	}
+}
+
+// A DNS plan commits the node's whole lattice_guard input chain, and that chain
+// is policy drop. On a node with no stored Network Guard baseline the composed
+// ruleset accepts the DNS listener and nothing else, so approving it would cut
+// the operator's shell, the resolver's own DoH listener, and every other
+// service on the box. The node-side apply cannot notice: its post-commit
+// selfcheck is an outbound connection, which a default-drop input ruleset still
+// permits. The lint is the only thing that catches it, so the plan path has to
+// run it. Reality drives the port, which is why sshd here is on 2222: a check
+// hardcoded to tcp/22 would pass this plan and lock the node out for good.
+func TestDNSPlanBlocksLockoutRiskFromReportedReality(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	seedDNSNodeReality(t, st, "n1", 2222)
+	cookies, csrf := loginSession(t, handler)
+	created := createDNSDeployment(t, handler, cookies, csrf)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created+`"}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("lockout-risk dns plan should be refused, got %d", res.StatusCode)
+	}
+	var out struct {
+		Error    string             `json:"error"`
+		Findings []netguard.Finding `json:"findings"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	var blocked *netguard.Finding
+	for i, f := range out.Findings {
+		if f.Code == netguard.FindingLockoutRiskSSH {
+			blocked = &out.Findings[i]
+		}
+	}
+	if blocked == nil {
+		t.Fatalf("expected a %s finding, got %+v", netguard.FindingLockoutRiskSSH, out.Findings)
+	}
+	if blocked.Severity != netguard.SeverityBlock {
+		t.Fatalf("lockout finding severity = %q want %q", blocked.Severity, netguard.SeverityBlock)
+	}
+	if !strings.Contains(blocked.Message, "tcp/2222") {
+		t.Fatalf("finding should name the reported shell port, got %q", blocked.Message)
+	}
+	// A refused plan must not leave a pending approval behind for someone to
+	// approve later.
+	for _, a := range st.Approvals() {
+		if a.Plugin == "selfdns" {
+			t.Fatalf("refused dns plan still created approval %+v", a)
+		}
+	}
+}
+
+// The block is an override, not a wall: an operator who knows the node is
+// reachable another way can still plan, and the override is audited so the
+// decision is attributable afterwards.
+func TestDNSPlanLockoutRiskOverrideIsAudited(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	seedDNSNodeReality(t, st, "n1", 2222)
+	cookies, csrf := loginSession(t, handler)
+	created := createDNSDeployment(t, handler, cookies, csrf)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created+`","accept_lockout_risk":true}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("accepted lockout risk should still plan, got %d", res.StatusCode)
+	}
+	var out dnsPlanResponse
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Approval.ID == "" {
+		t.Fatalf("expected an approval, got %+v", out)
+	}
+	// The findings ride along with the approval so the reviewer reads the same
+	// risk the planner accepted.
+	if len(out.Findings) == 0 {
+		t.Fatalf("accepted plan should still report its findings")
+	}
+	if !auditMetadataSeen(st, "dns.lockout_risk.accepted", "approval_id", out.Approval.ID) {
+		t.Fatalf("override should be audited: %+v", st.AuditEvents())
+	}
+	if !auditMetadataSeen(st, "dns.plan", "lockout_risk_accepted", "true") {
+		t.Fatalf("dns.plan audit should record the override: %+v", st.AuditEvents())
+	}
+}
+
+// seedDNSNodeReality gives a node a reported firewall reality whose only shell
+// daemon listens on shellPort, so the lockout lint has evidence instead of the
+// tcp/22 fallback.
+func seedDNSNodeReality(t *testing.T, st *store.Store, nodeID string, shellPort int) {
+	t.Helper()
+	now := time.Now().UTC()
+	if _, _, err := st.UpsertGuardRealitySnapshot("", store.GuardRealitySnapshot{
+		Reality: model.GuardNodeReality{
+			NodeID: nodeID,
+			Listeners: []model.GuardListener{
+				{Protocol: "tcp", Port: shellPort, Address: "0.0.0.0", Process: "sshd"},
+			},
+			CollectedAt: now,
+		},
+		ReceivedAt: now,
+	}); err != nil {
+		t.Fatalf("seed reality: %v", err)
+	}
+}
+
+// createDNSDeployment creates a minimal mesh deployment on n1 and returns its id.
+func createDNSDeployment(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf string) string {
+	t.Helper()
+	create := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"private dns",
+		"node_id":"n1",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	defer create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create deployment failed: %d", create.StatusCode)
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(create.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	return created.ID
 }

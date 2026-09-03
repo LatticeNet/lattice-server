@@ -5760,7 +5760,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		}
 	}
 	if !approvalQueryRequested(r) {
-		writeJSON(w, http.StatusOK, toApprovalViews(visible))
+		writeJSON(w, http.StatusOK, s.annotateApprovalWaiting(toApprovalViews(visible), visible))
 		return
 	}
 	q := r.URL.Query()
@@ -5800,7 +5800,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		filtered = filtered[:limit]
 	}
 	writeJSON(w, http.StatusOK, approvalsQueryResponse{
-		Approvals: toApprovalViews(filtered),
+		Approvals: s.annotateApprovalWaiting(toApprovalViews(filtered), filtered),
 		Total:     total,
 		Limit:     limit,
 		Offset:    offset,
@@ -7261,6 +7261,18 @@ func (s *Server) handleDismissApproval(w http.ResponseWriter, r *http.Request, p
 		reason, ok = s.dismissibleSSHGuardApprovalReason(approval, strings.TrimSpace(req.Note))
 	} else {
 		reason, ok = s.dismissibleAgentUpdateApprovalReason(approval)
+	}
+	if !ok {
+		// Staleness is not the only dead end. An approval that was approved and
+		// never queued, whose node is gone or switched off, or whose plan a newer
+		// one replaced, will also never apply, and rejecting an already-approved
+		// approval is a no-op, so dismissal is its only exit. The console offers
+		// that exit exactly where approvalWaitView.Dismissible says yes, and this
+		// is the rule that field reports.
+		if wait, waiting := s.approvalWaitReasonFor(approval); waiting && wait.Dismissible {
+			staleCode = wait.Code
+			reason, ok = approvalWaitDismissalReason(wait, strings.TrimSpace(req.Note)), true
+		}
 	}
 	if !ok {
 		writeError(w, http.StatusConflict, apiError(model.APIErrorApprovalStale, "approval is not stale; reject or approve it explicitly"))

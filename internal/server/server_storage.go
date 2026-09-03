@@ -611,12 +611,25 @@ func toStorageTokenView(token model.StorageAccessToken) storageTokenView {
 
 func (s *Server) authorizeStorageToken(w http.ResponseWriter, r *http.Request, kind, bucket, required string) bool {
 	presented := bearerToken(r)
-	// DummyVerify below is a full PBKDF2 at production cost, spent so that a
+	// Every branch below reaches a full PBKDF2 at production cost, spent so a
 	// wrong token takes as long as a right one. That is worth paying, but this
-	// route reaches it without a session, so the budget has to be bounded or an
-	// anonymous caller can buy server CPU one cheap request at a time. Only the
-	// paths that are about to spend it are charged, so a caller presenting a
-	// working token never meets this limiter.
+	// route is reachable anonymously through the storage catch-all with no
+	// session in front of it, so the spending has to be bounded.
+	//
+	// Charged only on the failing paths, so a caller presenting a working token
+	// never meets this limiter: at five attempts a minute it would throttle
+	// legitimate storage traffic within seconds.
+	//
+	// KNOWN GAP, tracked separately: this bounds guesses per address and
+	// therefore does not bound CPU, because an attacker who rotates source
+	// addresses gets a fresh budget each time and one derivation costs about
+	// 20ms here and around 500ms on a slower host. Bounding the CPU needs the
+	// hot path to stop deriving at all for credentials it has already seen,
+	// because the obvious fix, a concurrency permit, caps this route at the
+	// size of the permit pool: measured at 4 permits, 16 simultaneous callers
+	// holding a valid credential got 4 served and 12 refused. A route serving
+	// public content cannot have that ceiling, so the permit needs a
+	// single-flight cache in front of it rather than being dropped in alone.
 	spend := func() bool {
 		if s.storageAuthLimiter.Allow(s.clientIP(r)) {
 			return true
@@ -643,6 +656,16 @@ func (s *Server) authorizeStorageToken(w http.ResponseWriter, r *http.Request, k
 		return false
 	}
 	if token.Kind != kind || !auth.VerifySecret(token.TokenHash, secret) {
+		// This branch had no budget at all. It is the one an attacker holding a
+		// token id reaches, and the id is not a secret: it is the left half of
+		// the credential the operator hands out, it appears in the console and
+		// in the token list, and the caller sends it in the clear. So a wrong
+		// secret against a known id bought an unmetered derivation, repeatable
+		// as fast as the caller liked.
+		//
+		// Charged after the derivation rather than before, because a legitimate
+		// caller reaches this line too and must not be metered for succeeding.
+		spend()
 		writeError(w, http.StatusUnauthorized, errors.New("missing or invalid storage token"))
 		return false
 	}

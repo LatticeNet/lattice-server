@@ -49,7 +49,6 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/telemetry"
 	"github.com/LatticeNet/lattice-server/internal/tracestore"
 	"github.com/LatticeNet/lattice-server/internal/wireguard"
-	"github.com/LatticeNet/lattice-server/internal/worker"
 )
 
 type Options struct {
@@ -1035,8 +1034,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/storage/tokens", s.withAuth("", s.handleStorageTokens))
 	mux.HandleFunc("/api/storage/tokens/revoke", s.withAuth("", s.handleRevokeStorageToken))
 	mux.HandleFunc("/api/publishing/records", s.withAuth("", s.handlePublishingRecords))
-	mux.HandleFunc("/api/workers", s.withAuth("worker:deploy", s.handleWorkers))
-	mux.HandleFunc("/api/workers/run", s.withAuth("worker:deploy", s.handleWorkerRun))
 	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
 	mux.HandleFunc("/api/notify/channels", s.withAuth("notify:send", s.handleNotifyChannels))
 	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:send", s.handleDeleteNotifyChannel))
@@ -4384,67 +4381,6 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
-}
-
-func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request, p principal) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.store.Workers())
-	case http.MethodPost:
-		var req struct {
-			Name         string   `json:"name"`
-			Source       string   `json:"source"`
-			Capabilities []string `json:"capabilities"`
-			Public       bool     `json:"public"`
-		}
-		if !decodeClientJSON(w, r, &req) {
-			return
-		}
-		if req.Name == "" || req.Source == "" {
-			writeError(w, http.StatusBadRequest, errors.New("name and source are required"))
-			return
-		}
-		if err := worker.ValidateSource(req.Source); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		wk := model.WorkerScript{ID: id.New("worker"), Name: req.Name, Source: req.Source, Capabilities: req.Capabilities, Public: req.Public}
-		if err := s.store.UpsertWorker(wk); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "worker.upsert", Scope: "worker:deploy", Metadata: map[string]string{"worker_id": wk.ID}})
-		writeJSON(w, http.StatusOK, wk)
-	default:
-		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
-	}
-}
-
-func (s *Server) handleWorkerRun(w http.ResponseWriter, r *http.Request, p principal) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
-		return
-	}
-	var req struct {
-		WorkerID string `json:"worker_id"`
-		Path     string `json:"path"`
-	}
-	if !decodeClientJSON(w, r, &req) {
-		return
-	}
-	for _, wk := range s.store.Workers() {
-		if wk.ID != req.WorkerID {
-			continue
-		}
-		resp, err := worker.Runtime{KV: s.store}.Run(wk, worker.Request{Path: req.Path})
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, resp)
-		return
-	}
-	writeError(w, http.StatusNotFound, errors.New("worker not found"))
 }
 
 // handleNotifyTest delivers a one-off test notification through a channel whose

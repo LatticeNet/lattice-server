@@ -153,7 +153,6 @@ var KnownScopes = map[string]struct{}{
 	"vpncore:read":    {},
 	"wireguard:admin": {},
 	"wireguard:read":  {},
-	"worker:deploy":   {},
 }
 
 // ValidScope reports whether s is a grantable scope: the global superuser "*", a

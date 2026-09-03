@@ -74,7 +74,6 @@ type State struct {
 	StorageBuckets         map[string]model.StorageBucket        `json:"storage_buckets"`
 	StorageBindings        map[string]model.StorageBinding       `json:"storage_bindings"`
 	StorageTokens          map[string]model.StorageAccessToken   `json:"storage_tokens"`
-	Workers                map[string]model.WorkerScript         `json:"workers"`
 	Plugins                map[string]model.PluginInstallation   `json:"plugins"`
 	Approvals              map[string]model.Approval             `json:"approvals"`
 	Sessions               map[string]auth.Session               `json:"sessions"`
@@ -738,7 +737,6 @@ func emptyState() State {
 		StorageBuckets:         map[string]model.StorageBucket{},
 		StorageBindings:        map[string]model.StorageBinding{},
 		StorageTokens:          map[string]model.StorageAccessToken{},
-		Workers:                map[string]model.WorkerScript{},
 		Plugins:                map[string]model.PluginInstallation{},
 		Approvals:              map[string]model.Approval{},
 		Sessions:               map[string]auth.Session{},
@@ -843,9 +841,6 @@ func (st *State) ensureMaps() {
 	}
 	if st.StorageTokens == nil {
 		st.StorageTokens = map[string]model.StorageAccessToken{}
-	}
-	if st.Workers == nil {
-		st.Workers = map[string]model.WorkerScript{}
 	}
 	if st.Plugins == nil {
 		st.Plugins = map[string]model.PluginInstallation{}
@@ -3315,25 +3310,6 @@ func (s *Store) TouchStorageAccessToken(id string) error {
 	t.LastUsedAt = time.Now().UTC()
 	s.state.StorageTokens[id] = t
 	return s.Save()
-}
-
-func (s *Store) UpsertWorker(w model.WorkerScript) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	w.UpdatedAt = time.Now().UTC()
-	s.state.Workers[w.ID] = w
-	return s.Save()
-}
-
-func (s *Store) Workers() []model.WorkerScript {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]model.WorkerScript, 0, len(s.state.Workers))
-	for _, w := range s.state.Workers {
-		out = append(out, w)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }
 
 func (s *Store) UpsertPluginInstallation(p model.PluginInstallation) error {

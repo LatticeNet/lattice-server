@@ -476,20 +476,6 @@ func TestBoltStateRecordLevelStaticWorkerPluginAndApproval(t *testing.T) {
 		t.Fatalf("static entries not sorted/sized/timestamped: %+v", static)
 	}
 
-	if err := bs.UpsertWorker(model.WorkerScript{ID: "w2", Name: "Zulu", Source: "return 2"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := bs.UpsertWorker(model.WorkerScript{ID: "w1", Name: "Alpha", Source: "return 1"}); err != nil {
-		t.Fatal(err)
-	}
-	workers, err := bs.Workers()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(workers) != 2 || workers[0].Name != "Alpha" || workers[0].UpdatedAt.IsZero() || workers[1].Name != "Zulu" {
-		t.Fatalf("workers not sorted/timestamped: %+v", workers)
-	}
-
 	plugin := model.PluginInstallation{ID: "plug.b", Name: "Plugin B", Capabilities: []string{"kv:read"}}
 	if err := bs.UpsertPluginInstallation(plugin); err != nil {
 		t.Fatal(err)

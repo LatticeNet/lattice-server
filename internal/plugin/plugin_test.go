@@ -107,7 +107,7 @@ func TestValidateManifestRejectsHostRiskForWorker(t *testing.T) {
 		ID:           "worker-shell",
 		Name:         "Worker Shell",
 		Type:         "worker",
-		Capabilities: []string{"worker:route", "task:run"},
+		Capabilities: []string{"kv:read", "task:run"},
 	})
 	if err == nil {
 		t.Fatal("expected worker plugin to be denied host-risk capability")
@@ -119,7 +119,7 @@ func TestValidateManifestAcceptsRestrictedWorker(t *testing.T) {
 		ID:           "status-card",
 		Name:         "Status Card",
 		Type:         "worker",
-		Capabilities: []string{"worker:route", "kv:read"},
+		Capabilities: []string{"static:read", "kv:read"},
 	})
 	if err != nil {
 		t.Fatal(err)

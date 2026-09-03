@@ -15,6 +15,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/netguard"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
@@ -166,6 +167,10 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	}
 	var req struct {
 		ID string `json:"id"`
+		// AcceptLockoutRisk mirrors the Network Guard plan contract. A DNS plan
+		// commits the same single lattice_guard input chain, so it carries the
+		// same lockout risk and gets the same explicit, audited override.
+		AcceptLockoutRisk bool `json:"accept_lockout_risk"`
 	}
 	if !decodeClientJSON(w, r, &req) {
 		return
@@ -223,6 +228,25 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	if ingressRules > 0 {
 		firewallSummary = append(firewallSummary, "ingress netpolicy rules composed: "+strconv.Itoa(ingressRules))
 	}
+	// The DNS plan replaces the node's whole lattice_guard input chain, which is
+	// policy drop. Composed from an empty baseline (the "default" input source
+	// above) it accepts the DNS listener and nothing else, so committing it
+	// severs every other inbound path including the operator's shell.
+	// netguard.Lint is the only check that catches this: the node-side apply
+	// verifies with an outbound control-plane selfcheck, which a default-drop
+	// input ruleset does not block. Run it here for the same reason the Network
+	// Guard plan path runs it.
+	findings := netguard.Lint(composed, netguard.LintOptions{
+		PublicURLConfigured: s.publicURL != "",
+		Reality:             s.guardRealityForLint(dep.NodeID),
+	})
+	if netguard.Blocking(findings) && !req.AcceptLockoutRisk {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":    "plan blocked by lint findings",
+			"findings": findings,
+		})
+		return
+	}
 	nftRuleset, err := network.GenerateNFTPlan(composed)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -258,8 +282,15 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	if ingressRules > 0 {
 		metadata["ingress_rules"] = strconv.Itoa(ingressRules)
 	}
+	if netguard.Blocking(findings) {
+		metadata["lockout_risk_accepted"] = "true"
+		s.recordPrincipalAudit(p, model.AuditEvent{
+			ID: id.New("audit"), NodeID: dep.NodeID, Action: "dns.lockout_risk.accepted", Scope: "dns:admin",
+			Metadata: map[string]string{"node_id": dep.NodeID, "dns_id": dep.ID, "approval_id": approval.ID},
+		})
+	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: dep.NodeID, Action: "dns.plan", Scope: "dns:admin", Metadata: metadata})
-	writeJSON(w, http.StatusOK, approval)
+	writeJSON(w, http.StatusOK, map[string]any{"approval": approval, "findings": findings})
 }
 
 func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p principal) {

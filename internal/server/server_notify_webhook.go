@@ -115,6 +115,36 @@ func toNotifyWebhookView(h store.NotifyWebhook) notifyWebhookView {
 	}
 }
 
+// refuseConfinedWebhookRead refuses a node-restricted principal on the webhook
+// read surface.
+//
+// The write side already refuses these principals, on the grounds that a webhook
+// routes fleet-wide events outward and a node-confined token minting one is a
+// cross-node escape. The read side has the same problem and cannot be solved the
+// usual way: a webhook has no node field, so unlike a monitor or a log source
+// there is nothing to filter on. A confined principal reading this surface gets
+// every webhook in the fleet, and from the delivery history the rendered message
+// content and the external caller addresses too.
+//
+// Since such a principal cannot author, edit, rotate or delete a webhook anyway,
+// a read-only window onto all of them is exposure with no workflow behind it.
+// This matches the reasoning requireGlobalProxyScope already applies to
+// subscription shares, which are fleet-wide objects for the same reason.
+func (s *Server) refuseConfinedWebhookRead(w http.ResponseWriter, p principal, action string) bool {
+	if !principalHasNodeRestriction(p) {
+		return false
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:       id.New("audit"),
+		Action:   action,
+		Scope:    "notify:send",
+		Decision: "deny",
+		Reason:   "fleet-wide read refused for a node-restricted token",
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "a webhook is a fleet-wide object with no node to confine it to; it requires a token without a server allowlist restriction"))
+	return true
+}
+
 // handleNotifyWebhooks lists and upserts webhooks. It is gated on notify:send,
 // the scope that already governs channel and rule administration: a webhook is
 // a third object in the same notification system, and splitting it into its own
@@ -123,6 +153,9 @@ func toNotifyWebhookView(h store.NotifyWebhook) notifyWebhookView {
 func (s *Server) handleNotifyWebhooks(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
+		if s.refuseConfinedWebhookRead(w, p, "notify.webhook.list") {
+			return
+		}
 		hooks := s.store.NotifyWebhooks()
 		views := make([]notifyWebhookView, 0, len(hooks))
 		for _, h := range hooks {
@@ -271,6 +304,9 @@ func (s *Server) handleNotifyWebhookDeliveries(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
+	if s.refuseConfinedWebhookRead(w, p, "notify.webhook.deliveries") {
+		return
+	}
 	webhookID := strings.TrimSpace(r.URL.Query().Get("id"))
 	if webhookID == "" {
 		writeError(w, http.StatusBadRequest, errors.New("id is required"))
@@ -368,27 +404,41 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	sourceIP := s.clientIP(r)
 
-	// A failed attempt is charged against a per-IP budget before it is allowed to
-	// spend a PBKDF2 derivation, exactly as authorizeStorageToken does: this route
-	// has no session in front of it, so an anonymous caller must not be able to
-	// buy server CPU one cheap request at a time. A caller presenting a working
-	// secret never meets this limiter.
-	spend := func() bool {
-		if s.webhookAuthLimiter.Allow(sourceIP) {
-			return true
-		}
-		s.denyInboundWebhook(w, r, webhookID, sourceIP, http.StatusTooManyRequests, "rate limited", errors.New("too many webhook attempts"))
-		return false
+	// Every authentication path below reaches a PBKDF2 derivation at production
+	// cost, so the budget that bounds that CPU is spent HERE, before the work,
+	// not on the way out of a failure.
+	//
+	// The storage-token pattern this otherwise follows charges only failed
+	// attempts, so a caller with a working token never meets its limiter. That
+	// shape has a hole: the branch where the id is real and the secret is wrong
+	// runs the derivation as part of evaluating its own condition, so the check
+	// that comes after it only decides the status code. An attacker who knows a
+	// webhook id, which is deliberately not secret, could then buy an unbounded
+	// number of 210k-iteration derivations. The same hole exists in
+	// authorizeStorageToken and is reported separately; it is not fixed here
+	// because that endpoint needs its own change and its own tests.
+	//
+	// So this limiter is checked up front and sized for real traffic instead:
+	// generous enough that no legitimate caller meets it (the per-webhook fire
+	// budget caps accepted traffic well below it), tight enough that the CPU an
+	// anonymous caller can spend is bounded.
+	if !s.webhookVerifyLimiter.Allow(sourceIP) {
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusTooManyRequests, "rate limited", errors.New("too many webhook attempts"))
+		return
+	}
+	// A per-address budget bounds one attacker's share, not the machine's: under
+	// TrustProxy the address is a header the caller writes, so rotating it mints a
+	// fresh bucket per request. The global ceiling is what actually caps the CPU.
+	if !s.webhookVerifyGlobal.Allow("webhook-verify") {
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusTooManyRequests, "rate limited", errors.New("too many webhook attempts"))
+		return
 	}
 
 	presented := bearerToken(r)
 	tokenID, secret, ok := auth.SplitToken(presented)
 	if !ok {
-		if !spend() {
-			return
-		}
 		auth.DummyVerify(presented)
-		s.denyInboundWebhook(w, r, webhookID, sourceIP, http.StatusUnauthorized, "missing or malformed secret", errors.New("missing or invalid webhook secret"))
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "missing or malformed secret", errors.New("missing or invalid webhook secret"))
 		return
 	}
 	hook, found := s.store.NotifyWebhook(webhookID)
@@ -396,33 +446,31 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	// nothing and removes a class of confusion where a caller holding a valid
 	// secret for webhook A fires webhook B by editing the URL.
 	if !found || tokenID != webhookID {
-		if !spend() {
-			return
-		}
 		auth.DummyVerify(secret)
-		s.denyInboundWebhook(w, r, webhookID, sourceIP, http.StatusUnauthorized, "unknown webhook or mismatched secret", errors.New("missing or invalid webhook secret"))
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "unknown webhook or mismatched secret", errors.New("missing or invalid webhook secret"))
 		return
 	}
 	if !auth.VerifySecret(hook.SecretHash, secret) {
-		if !spend() {
-			return
-		}
-		s.denyInboundWebhook(w, r, webhookID, sourceIP, http.StatusUnauthorized, "secret verification failed", errors.New("missing or invalid webhook secret"))
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "secret verification failed", errors.New("missing or invalid webhook secret"))
 		return
 	}
-	// Authentication succeeded past this point, so failures below are the
-	// operator's or the caller's mistake rather than an attack, and are reported
-	// plainly instead of being flattened into 401.
+
+	// Authenticated. A verified caller still cannot fire without limit: this
+	// bucket is keyed by webhook rather than by address, because the thing being
+	// protected is the operator's attention, and a legitimate-but-looping caller
+	// floods it just as effectively as a hostile one.
+	//
+	// Everything past this line may write a delivery record, and a delivery
+	// record costs a full state-file rewrite, so this budget is what bounds that
+	// cost. Refusals above it are audited and nothing more.
+	if !s.webhookFireLimiter.Allow(hook.ID) {
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusTooManyRequests, "webhook rate limited", errors.New("webhook is firing too often"))
+		return
+	}
+	// Checked after the fire budget rather than before it, so a caller holding a
+	// valid secret for a disabled webhook cannot spend delivery records freely.
 	if !hook.Enabled {
 		s.denyInboundWebhook(w, r, webhookID, sourceIP, http.StatusForbidden, "webhook disabled", errors.New("webhook is disabled"))
-		return
-	}
-	// A verified caller still cannot fire without limit. This bucket is keyed by
-	// webhook rather than by IP: the thing being protected is the operator's
-	// attention, and a legitimate-but-looping caller floods it just as
-	// effectively as a hostile one.
-	if !s.webhookFireLimiter.Allow(hook.ID) {
-		s.denyInboundWebhook(w, r, webhookID, sourceIP, http.StatusTooManyRequests, "webhook rate limited", errors.New("webhook is firing too often"))
 		return
 	}
 
@@ -462,11 +510,21 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// denyInboundWebhook writes the error and records the refusal. Every rejected
-// attempt is audited, not just the interesting ones: the audit stream is where
-// an operator answers "is someone probing my webhook", and that question is
-// unanswerable if only successes are recorded.
-func (s *Server) denyInboundWebhook(w http.ResponseWriter, r *http.Request, webhookID, sourceIP string, status int, reason string, err error) {
+// refuseInboundWebhook writes the error and audits the refusal, and does not
+// touch the store.
+//
+// Every rejected attempt is audited, not just the interesting ones: the audit
+// stream is where an operator answers "is someone probing my webhook", and that
+// question is unanswerable if only successes are recorded. Audit has a WAL-backed
+// append path, so this stays cheap.
+//
+// What it deliberately does NOT do is write a delivery record. That costs a full
+// encrypted state-file rewrite with an fsync, taken under the store's global
+// mutex, which would block unrelated API traffic. Reachable by an anonymous
+// caller who knows only a webhook id, that is a control-plane availability hit,
+// so refusals an unauthenticated caller can trigger leave the audit trail and
+// nothing else.
+func (s *Server) refuseInboundWebhook(w http.ResponseWriter, r *http.Request, webhookID string, status int, reason string, err error) {
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "notify.webhook.receive",
@@ -475,20 +533,24 @@ func (s *Server) denyInboundWebhook(w http.ResponseWriter, r *http.Request, webh
 		Reason:   reason,
 		Metadata: map[string]string{"webhook_id": webhookID, "status": strconv.Itoa(status)},
 	})
-	// A rejection is recorded against the webhook only when the webhook exists,
-	// so a caller guessing ids cannot grow state by naming ones that do not.
-	if _, found := s.store.NotifyWebhook(webhookID); found {
-		if recErr := s.store.RecordNotifyWebhookDelivery(store.NotifyWebhookDelivery{
-			ID:        id.New("nwd"),
-			WebhookID: webhookID,
-			Outcome:   store.NotifyWebhookRejected,
-			Reason:    reason,
-			SourceIP:  sourceIP,
-		}); recErr != nil {
-			s.logger.Printf("notify webhook delivery record: %v", recErr)
-		}
-	}
 	writeError(w, status, err)
+}
+
+// denyInboundWebhook is refuseInboundWebhook plus a delivery record, for the
+// refusals that happen after authentication and after the per-webhook fire
+// budget. Those require a valid secret and are capped by that budget, so the
+// cost of persisting them is bounded.
+func (s *Server) denyInboundWebhook(w http.ResponseWriter, r *http.Request, webhookID, sourceIP string, status int, reason string, err error) {
+	if recErr := s.store.RecordNotifyWebhookDelivery(store.NotifyWebhookDelivery{
+		ID:        id.New("nwd"),
+		WebhookID: webhookID,
+		Outcome:   store.NotifyWebhookRejected,
+		Reason:    reason,
+		SourceIP:  sourceIP,
+	}); recErr != nil {
+		s.logger.Printf("notify webhook delivery record: %v", recErr)
+	}
+	s.refuseInboundWebhook(w, r, webhookID, status, reason, err)
 }
 
 // fireNotifyWebhook renders the operator's templates and hands the result to

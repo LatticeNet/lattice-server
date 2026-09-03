@@ -506,3 +506,147 @@ func TestNotifyWebhookNeverCalledOmitsTimestamp(t *testing.T) {
 		t.Fatalf("last_used_at should carry the call time after a fire, got: %s", raw)
 	}
 }
+
+// TestInboundWebhookRefusalDoesNotWriteState pins the fix for an availability
+// hole: a delivery record costs a full encrypted state-file rewrite under the
+// store's global mutex, and the refusal path used to write one for every
+// attempt. A caller who knows only a webhook id, which is deliberately not
+// secret, could drive unbounded fsync'd writes with no credential at all.
+//
+// Refusals an unauthenticated caller can trigger must now leave an audit record
+// and nothing else.
+func TestInboundWebhookRefusalDoesNotWriteState(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	id, _ := createTestWebhook(t, handler, cookies, csrf,
+		`{"name":"Probed","event_type":"probed.event","title_template":"t"}`)
+
+	for i := 0; i < 5; i++ {
+		res := fireWebhook(t, handler, id, id+".wrongsecretwrongsecret", "")
+		res.Body.Close()
+	}
+	res := fireWebhook(t, handler, id, "", "")
+	res.Body.Close()
+
+	if got := st.NotifyWebhookDeliveries(id, 50); len(got) != 0 {
+		t.Fatalf("an unauthenticated refusal must not persist a delivery record, got %d: %+v", len(got), got)
+	}
+	// The audit trail still carries every one of them, which is where the
+	// security record belongs.
+	denies := 0
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "notify.webhook.receive" && ev.Decision == "deny" {
+			denies++
+		}
+	}
+	if denies < 6 {
+		t.Fatalf("every refused attempt must be audited, got %d", denies)
+	}
+}
+
+// TestInboundWebhookVerifyBudgetGatesDerivation pins the fix for the other half:
+// the budget is spent before the PBKDF2 derivation, not after it, so the branch
+// where the id is real and the secret is wrong cannot buy unbounded CPU. Once
+// the budget is gone the endpoint refuses without deriving anything.
+func TestInboundWebhookVerifyBudgetGatesDerivation(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	id, secret := createTestWebhook(t, handler, cookies, csrf,
+		`{"name":"Budgeted","event_type":"budgeted.event","title_template":"t"}`)
+
+	throttled := false
+	for i := 0; i < 200; i++ {
+		res := fireWebhook(t, handler, id, id+".wrongsecretwrongsecret", "")
+		code := res.StatusCode
+		res.Body.Close()
+		if code == http.StatusTooManyRequests {
+			throttled = true
+			break
+		}
+	}
+	if !throttled {
+		t.Fatal("wrong-secret attempts against a known id must exhaust a budget")
+	}
+	// Rotating the source address does mint a fresh per-address budget, which is
+	// the honest behaviour and the reason the global ceiling exists behind it.
+	// That ceiling is not asserted here: at 50 derivations a second it cannot be
+	// exhausted by a serial caller, because one derivation costs more than the
+	// bucket takes to refill a token. It bites on concurrent floods, which is the
+	// case a per-address budget cannot see.
+	rotated := httptest.NewRequest(http.MethodPost, "/api/hooks/"+id, strings.NewReader(""))
+	rotated.Header.Set("Authorization", "Bearer "+id+".wrongsecretwrongsecret")
+	rotated.RemoteAddr = "198.51.100.77:5555"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, rotated)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("a fresh address gets a fresh per-address budget, got %d", rec.Code)
+	}
+	// The budget is per address and covers the valid path too, so a caller that
+	// spent it is refused even with the right secret. That is the cost of gating
+	// the derivation up front, and it is bounded well above real traffic.
+	res := fireWebhook(t, handler, id, secret, "")
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("the verify budget must gate every derivation, got %d", res.StatusCode)
+	}
+}
+
+// TestNotifyWebhookReadsRefuseConfinedPrincipal pins the read-side confinement
+// gap. A webhook has no node field, so a node-restricted principal cannot be
+// filtered down to a subset; it would otherwise read every webhook in the fleet
+// plus the rendered delivery content and external caller addresses, while being
+// refused every write.
+func TestNotifyWebhookReadsRefuseConfinedPrincipal(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	hookID, _ := createTestWebhook(t, handler, cookies, csrf,
+		`{"name":"Fleetwide","event_type":"fleetwide.event","title_template":"t"}`)
+
+	confined := createPAT(t, handler, cookies, csrf, []string{"notify:send"}, []string{"node-a"})
+	for _, path := range []string{"/api/notify/webhooks", "/api/notify/webhooks/deliveries?id=" + hookID} {
+		res := doBearerJSON(t, handler, http.MethodGet, path, "", confined)
+		code := res.StatusCode
+		res.Body.Close()
+		if code != http.StatusForbidden {
+			t.Fatalf("%s must refuse a node-restricted principal, got %d", path, code)
+		}
+	}
+	// An unrestricted token with the same scope still reads it.
+	unconfined := createPAT(t, handler, cookies, csrf, []string{"notify:send"}, nil)
+	res := doBearerJSON(t, handler, http.MethodGet, "/api/notify/webhooks", "", unconfined)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("an unrestricted notify:send token must still read webhooks, got %d", res.StatusCode)
+	}
+}
+
+// TestNotifyTemplateSinglePassAcrossFields pins the cross-field reconstruction
+// the rule renderer used to expand.
+//
+// Caller values are stripped of "{{" and "}}" one field at a time, so three
+// fields that are individually clean ("x{", "{event_type}", "}y") pass through
+// and then reconstruct a literal "{{event_type}}" where they meet in the
+// operator's template. The old rule renderer looped ReplaceAll over its variable
+// map, scanning its own output, and expanded it, nondeterministically because Go
+// randomises map iteration.
+func TestNotifyTemplateSinglePassAcrossFields(t *testing.T) {
+	title := renderWebhookTemplate("{{data.a}}{{data.b}}{{data.c}}", "", map[string]string{
+		"data.a": sanitizeWebhookValue("x{"),
+		"data.b": sanitizeWebhookValue("{event_type}"),
+		"data.c": sanitizeWebhookValue("}y"),
+	})
+	if !strings.Contains(title, "{{event_type}}") {
+		t.Fatalf("expected the reconstruction to survive into the title, got %q", title)
+	}
+	// Run it repeatedly: the old failure appeared only on some map orderings.
+	for i := 0; i < 50; i++ {
+		out := renderNotifyTemplate("{{title}}", "", map[string]string{
+			"event_type": "SHOULD-NOT-APPEAR",
+			"title":      title,
+			"body":       "b",
+		})
+		if strings.Contains(out, "SHOULD-NOT-APPEAR") {
+			t.Fatalf("a reconstructed placeholder was expanded by the rule renderer: %q", out)
+		}
+	}
+}

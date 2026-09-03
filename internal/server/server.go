@@ -166,10 +166,18 @@ type Server struct {
 	// from apiLimiter because the work it protects is key derivation, not a
 	// handler, and it is sized like loginLimiter for the same reason.
 	storageAuthLimiter *ratelimit.Limiter
-	// webhookAuthLimiter bounds anonymous inbound-webhook attempts, for the same
-	// reason storageAuthLimiter exists: the work being protected is key
-	// derivation on a route that has no session in front of it.
-	webhookAuthLimiter *ratelimit.Limiter
+	// webhookVerifyLimiter bounds the PBKDF2 derivations an anonymous caller can
+	// buy on the inbound-webhook route, which has no session in front of it. It is
+	// checked BEFORE the derivation, unlike storageAuthLimiter, which is charged
+	// only on failure and so never gates the wrong-secret branch that runs the
+	// derivation inside its own condition.
+	webhookVerifyLimiter *ratelimit.Limiter
+	// webhookVerifyGlobal caps total derivations across all callers. A per-address
+	// budget is defeated by rotating the address, which under TrustProxy is a
+	// header the caller writes, so the per-IP bucket alone bounds one attacker's
+	// share and not the machine's. Same reasoning as authFailAuditThrottle's
+	// shared global bucket.
+	webhookVerifyGlobal *ratelimit.Limiter
 	// webhookFireLimiter bounds *authenticated* webhook fires, keyed by webhook
 	// id rather than by address. What it protects is not server CPU but the
 	// operator's attention: a looping caller with a valid secret floods a phone
@@ -476,10 +484,16 @@ func New(opts Options) (*Server, error) {
 		// Only failed and credential-less attempts are charged here, so a client
 		// holding a working token is never throttled by it.
 		storageAuthLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
-		// Sized like storageAuthLimiter: five failures a minute is far more than a
-		// correctly configured caller ever needs and far less than a brute force
-		// against 256 bits of entropy would require.
-		webhookAuthLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
+		// Charged on every attempt rather than only on failures, so it has to clear
+		// real traffic: 120 a minute with a burst of 40. The per-webhook fire budget
+		// caps accepted traffic at 10 a minute each, so even a host driving a dozen
+		// webhooks stays under it, while one address's CPU spend stays bounded and a
+		// brute force at that rate against 256 bits of entropy is nothing.
+		webhookVerifyLimiter: ratelimit.New(ratelimit.Config{Rate: 2, Burst: 40}),
+		// The machine-wide ceiling: 50 derivations a second, burst 100. Far above
+		// any real inbound-webhook load and far below what it takes to saturate the
+		// cores with 210k-iteration PBKDF2.
+		webhookVerifyGlobal: ratelimit.New(ratelimit.Config{Rate: 50, Burst: 100}),
 		// Ten fires a minute sustained, with a burst of ten to absorb a genuine
 		// cluster of events without dropping any.
 		webhookFireLimiter: ratelimit.New(ratelimit.Config{Rate: 10.0 / 60.0, Burst: 10}),
@@ -4942,16 +4956,21 @@ func notifyRuleMatches(rule model.NotifyRule, eventType string) bool {
 	return false
 }
 
+// renderNotifyTemplate expands a rule's template.
+//
+// It delegates to the single-pass renderer rather than looping ReplaceAll over
+// the variable map, which was both order-dependent (Go randomises map iteration,
+// so identical inputs could render differently between runs) and self-feeding:
+// each replacement scanned the output of the previous one, so a value that
+// contained a placeholder was expanded as if the operator had written it.
+//
+// That began to matter once webhook data reached this renderer. Caller values
+// are stripped of "{{" and "}}" individually, but two adjacent fields can still
+// reconstruct a delimiter across the join, and the old loop would then expand
+// it. Scanning the template once and never rescanning a substituted value
+// removes the class rather than relying on every producer upstream.
 func renderNotifyTemplate(tmpl, fallback string, vars map[string]string) string {
-	tmpl = strings.TrimSpace(tmpl)
-	if tmpl == "" {
-		return fallback
-	}
-	out := tmpl
-	for key, value := range vars {
-		out = strings.ReplaceAll(out, "{{"+key+"}}", value)
-	}
-	return out
+	return renderWebhookTemplate(tmpl, fallback, vars)
 }
 
 func classifyNotifyEvent(title string) string {

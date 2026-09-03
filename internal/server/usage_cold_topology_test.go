@@ -139,8 +139,10 @@ func TestUsageIngestDefersWhileTopologyIsColdAndRecoversTheWholeGap(t *testing.T
 	if got, want := after.InboundTraffic["direct-a"], before.InboundTraffic["direct-a"]; got != want {
 		t.Fatalf("baseline advanced during the gap: %+v, want %+v", got, want)
 	}
-	if after.CoreUptimeSec != before.CoreUptimeSec {
-		t.Fatalf("baseline uptime advanced during the gap: %d, want %d", after.CoreUptimeSec, before.CoreUptimeSec)
+	// Only the inbound family is held. Everything else advances, which is what
+	// keeps named counters flowing and keeps restart detection honest.
+	if after.CoreUptimeSec != 300 {
+		t.Fatalf("baseline uptime = %d, want the held report's 300: only the inbound family is frozen", after.CoreUptimeSec)
 	}
 	if got := f.bobBytes(t); got != 200 {
 		t.Fatalf("bob moved during the gap: %d, want 200", got)
@@ -172,9 +174,10 @@ func TestUsageColdTopologyLossIsWhatTheDeferralPrevents(t *testing.T) {
 	f.report(t, 200, 100, 100)
 
 	f.goCold(t)
-	// Past the bound, the report is recorded the way it is today.
+	// Exhaust the hold window, then the report is recorded the way it is today.
+	f.report(t, 300, 600, 600)
 	f.advance(usageColdTopologyDeferMax + time.Minute)
-	res := f.report(t, 300, 600, 600)
+	res := f.report(t, 400, 600, 600)
 	if res.InboundDeferred {
 		t.Fatalf("held a report whose baseline is older than the bound: %+v", res)
 	}
@@ -211,16 +214,33 @@ func TestUsageColdTopologyDeferralIsBounded(t *testing.T) {
 	f.report(t, 200, 100, 100)
 	f.goCold(t)
 
-	f.advance(usageColdTopologyDeferMax - time.Minute)
-	if res := f.report(t, 300, 200, 200); !res.InboundDeferred {
-		t.Fatalf("inside the bound the report should be held: %+v", res)
+	if res := f.report(t, 300, 150, 150); !res.InboundDeferred {
+		t.Fatalf("the first cold report should be held: %+v", res)
 	}
-	// The held report did not advance At either, so the baseline keeps ageing
-	// from the last recorded one and the bound cannot be extended indefinitely
-	// by a node that keeps reporting.
+	// A held report still advances the stored baseline's timestamp, so the bound
+	// cannot be measured from it: a node that keeps reporting would refresh it
+	// on every poll and hold forever. It is measured from when holding started.
+	f.advance(usageColdTopologyDeferMax - time.Minute)
+	if res := f.report(t, 400, 200, 200); !res.InboundDeferred {
+		t.Fatalf("inside the bound the report should still be held: %+v", res)
+	}
 	f.advance(2 * time.Minute)
-	if res := f.report(t, 400, 300, 300); res.InboundDeferred {
+	res := f.report(t, 500, 300, 300)
+	if res.InboundDeferred {
 		t.Fatalf("past the bound the report must be recorded: %+v", res)
+	}
+	if res.UnknownLines != 1 {
+		t.Fatalf("unknown lines = %d, want 1: past the bound the bytes are recorded, not dropped", res.UnknownLines)
+	}
+	// And once a report is recorded, the next hold starts a fresh window rather
+	// than inheriting the exhausted one.
+	f.goWarm(t)
+	f.advance(time.Minute)
+	f.report(t, 600, 400, 400)
+	f.goCold(t)
+	f.advance(time.Minute)
+	if res := f.report(t, 700, 500, 500); !res.InboundDeferred {
+		t.Fatalf("a fresh gap after a recorded report should be held: %+v", res)
 	}
 }
 
@@ -292,22 +312,36 @@ func TestDeferUsageForColdTopologyGuards(t *testing.T) {
 		InboundTraffic: map[string]model.ProxyTrafficCounter{"direct-a": counter(5, 5)}}
 	recent := model.ProxyUsageSnapshot{NodeID: "node-a", At: f.now.Add(-time.Minute)}
 
-	if !f.srv.deferUsageForColdTopology(ctx, snapshot, recent, true, *f.now) {
+	if !f.srv.deferUsageForColdTopology(ctx, snapshot, recent, true, false, *f.now) {
 		t.Fatal("a report with a recent baseline and no topology should be held")
 	}
-	if f.srv.deferUsageForColdTopology(ctx, snapshot, recent, false, *f.now) {
+	if f.srv.deferUsageForColdTopology(ctx, snapshot, recent, false, false, *f.now) {
 		t.Fatal("a first report was held: with no baseline nothing is consumed, so " +
 			"establishing one is right and holding would leave the next report " +
 			"diffing against nothing")
 	}
 	empty := model.ProxyUsageSnapshot{NodeID: "node-a"}
-	if f.srv.deferUsageForColdTopology(ctx, empty, recent, true, *f.now) {
+	if f.srv.deferUsageForColdTopology(ctx, empty, recent, true, false, *f.now) {
 		t.Fatal("a report carrying no inbound counters was held; there is nothing to lose")
 	}
-	stale := model.ProxyUsageSnapshot{NodeID: "node-a", At: f.now.Add(-usageColdTopologyDeferMax - time.Second)}
-	if f.srv.deferUsageForColdTopology(ctx, snapshot, stale, true, *f.now) {
-		t.Fatal("a report whose baseline is past the bound was held")
+	if f.srv.deferUsageForColdTopology(ctx, snapshot, recent, true, true, *f.now) {
+		t.Fatal("a report after a core restart was held: the current value is the delta, " +
+			"and holding it stores a pre-restart baseline the next report diffs to nothing")
 	}
+	// The bound reads the hold's own start, not the baseline's age. A stale
+	// baseline on a node that has never been held is still holdable: that is
+	// exactly a node coming back after a long quiet period.
+	stale := model.ProxyUsageSnapshot{NodeID: "node-a", At: f.now.Add(-24 * time.Hour)}
+	if !f.srv.deferUsageForColdTopology(ctx, snapshot, stale, true, false, *f.now) {
+		t.Fatal("a node that has not been held was refused on baseline age alone")
+	}
+	f.srv.usageInboundHeldSince = map[string]time.Time{
+		"node-a": f.now.Add(-usageColdTopologyDeferMax - time.Second),
+	}
+	if f.srv.deferUsageForColdTopology(ctx, snapshot, recent, true, false, *f.now) {
+		t.Fatal("a node held for longer than the bound was held again")
+	}
+	f.srv.usageInboundHeldSince = nil
 }
 
 // An operator reading the usage surface during a gap should be told the line is
@@ -341,5 +375,46 @@ func TestUsageReadNamesAKnownLineWithNoLiveTopology(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no direct-a row in the report")
+	}
+}
+
+// Only the inbound family is held. A named counter is proof on its own and is
+// already attributed while discovery is stale, which this must not undo: that
+// decision is what server_proxy.go's folded-counter comment records, and
+// TestUsageNamedCounterSurvivesStaleDiscovery holds the line on it.
+func TestUsageColdTopologyHoldsOnlyTheInboundFamily(t *testing.T) {
+	f := newColdTopologyFixture(t)
+	name := userLineName(f.fleet.alice.ID, f.fleet.hub.LineUUID)
+	send := func(uptime uint64, inbound, named int64) proxyUsageApplyResult {
+		return mustApplyUsage(t, f.srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: uptime,
+			InboundTraffic: map[string]model.ProxyTrafficCounter{"hub-a": counter(inbound, inbound)},
+			UserTraffic:    map[string]model.ProxyTrafficCounter{name: counter(named, named)}})
+	}
+	send(100, 10, 5)
+	f.goCold(t)
+	f.advance(time.Minute)
+	res := send(200, 100, 50)
+	if !res.InboundDeferred {
+		t.Fatalf("the inbound family should be held: %+v", res)
+	}
+	if res.UsersUpdated != 1 {
+		t.Fatalf("users updated = %d, want 1: the named counter is proof and must still be attributed", res.UsersUpdated)
+	}
+	day := store.UsageDay(*f.now)
+	rows, _ := f.srv.store.UsageDayUserRows(f.fleet.alice.ID, day, day)
+	total := int64(0)
+	for _, row := range rows {
+		total += row.Uplink + row.Downlink
+	}
+	if total != 90 {
+		t.Fatalf("alice = %d, want 90 (the named delta of 45 each way)", total)
+	}
+	// The named baseline advanced with the report; only the inbound one did not.
+	baseline := f.baseline(t)
+	if got := baseline.UserTraffic[name]; got != counter(50, 50) {
+		t.Fatalf("named baseline = %+v, want 50/50", got)
+	}
+	if got := baseline.InboundTraffic["hub-a"]; got != counter(10, 10) {
+		t.Fatalf("inbound baseline = %+v, want the pre-gap 10/10", got)
 	}
 }

@@ -224,6 +224,15 @@ type Server struct {
 	// usageDayLast is the UTC day the last ingestion ran the retention sweep
 	// for; guarded by proxyUsageMu.
 	usageDayLast string
+	// usageInboundHeldSince records, per node, when this process first held a
+	// node's inbound counters back for want of a line read model. It bounds the
+	// hold: the stored baseline's own timestamp cannot, because a held report
+	// still advances it and a node that keeps reporting would extend the window
+	// forever. Guarded by proxyUsageMu, and memory-only on purpose. Losing it on
+	// restart costs at most one more bounded window, and discovery warms within
+	// seconds of a restart anyway; persisting it would put a recording decision
+	// behind a value no operator can see or correct.
+	usageInboundHeldSince map[string]time.Time
 	// lineUUIDMu serializes the line_hash_id -> line_uuid check-and-set so
 	// concurrent read-model builds cannot allocate two UUIDs for one line
 	// (design-15 D1).

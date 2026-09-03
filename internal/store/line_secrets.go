@@ -91,6 +91,8 @@ type VpnUserPublicRecord struct {
 	Credentials            []VpnUserCredentialPublic `json:"credentials"`
 	Bindings               []VpnUserLineBinding      `json:"bindings"`
 	QuotaBytes             int64                     `json:"quota_bytes,omitempty"`
+	QuotaPeriod            string                    `json:"quota_period,omitempty"`
+	QuotaResetDay          int                       `json:"quota_reset_day,omitempty"`
 	ExpiresAt              time.Time                 `json:"expires_at,omitempty"`
 	Group                  string                    `json:"group,omitempty"`
 	Comment                string                    `json:"comment,omitempty"`

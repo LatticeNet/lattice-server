@@ -76,6 +76,8 @@ var (
 	boltBucketSubSnapshots    = []byte("subscription_snapshots")
 	boltBucketProxyProfiles   = []byte("proxy_profiles")
 	boltBucketProxyUsage      = []byte("proxy_usage")
+	boltBucketUsageDayNode    = []byte("usage_day_node")
+	boltBucketUsageDayUser    = []byte("usage_day_user")
 	boltBucketTOTPChallenges  = []byte("totp_challenges")
 	boltBucketOIDCProviders   = []byte("oidc_providers")
 	boltBucketOIDCIdentities  = []byte("oidc_identities")
@@ -145,6 +147,8 @@ var boltStateBuckets = [][]byte{
 	boltBucketSubSnapshots,
 	boltBucketProxyProfiles,
 	boltBucketProxyUsage,
+	boltBucketUsageDayNode,
+	boltBucketUsageDayUser,
 	boltBucketTOTPChallenges,
 	boltBucketOIDCProviders,
 	boltBucketOIDCIdentities,
@@ -485,6 +489,12 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putMap(tx, boltBucketProxyUsage, persist.ProxyUsage); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketUsageDayNode, persist.UsageDayNodes); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketUsageDayUser, persist.UsageDayUsers); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketTOTPChallenges, persist.TOTPChallenges); err != nil {
 			return err
 		}
@@ -717,6 +727,18 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 		}
 		if err := readMap(tx, boltBucketProxyUsage, st.ProxyUsage); err != nil {
 			return err
+		}
+		// Day rollups are bounded only by retention, so the hot path (which
+		// exports without the audit log for the same reason) leaves them in
+		// bolt and reads them with a prefix seek. The full export used by
+		// migration and backup carries them.
+		if includeAudit {
+			if err := readMap(tx, boltBucketUsageDayNode, st.UsageDayNodes); err != nil {
+				return err
+			}
+			if err := readMap(tx, boltBucketUsageDayUser, st.UsageDayUsers); err != nil {
+				return err
+			}
 		}
 		if err := readMap(tx, boltBucketTOTPChallenges, st.TOTPChallenges); err != nil {
 			return err
@@ -3045,41 +3067,6 @@ func (bs *BoltStateStore) UpsertProxyUsageSnapshot(snapshot model.ProxyUsageSnap
 			return err
 		}
 		return putRecord(tx, boltBucketProxyUsage, snapshot.NodeID, snapshot)
-	})
-}
-
-func (bs *BoltStateStore) ApplyProxyUsageUpdate(users []model.ProxyUser, profile *model.ProxyNodeProfile, snapshot *model.ProxyUsageSnapshot) error {
-	if len(users) == 0 && profile == nil && snapshot == nil {
-		return nil
-	}
-	now := time.Now().UTC()
-	return bs.db.Update(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		for _, user := range users {
-			user = normalizeProxyUserForStore(user, now)
-			enc, err := encryptProxyUserRecord(user.ID, user, bs.cipher)
-			if err != nil {
-				return err
-			}
-			if err := putRecord(tx, boltBucketProxyUsers, user.ID, enc); err != nil {
-				return err
-			}
-		}
-		if profile != nil {
-			normalized := normalizeProxyNodeProfileForStore(*profile, now)
-			if err := putRecord(tx, boltBucketProxyProfiles, normalized.NodeID, normalized); err != nil {
-				return err
-			}
-		}
-		if snapshot != nil {
-			normalized := normalizeProxyUsageSnapshotForStore(*snapshot, now)
-			if err := putRecord(tx, boltBucketProxyUsage, normalized.NodeID, normalized); err != nil {
-				return err
-			}
-		}
-		return nil
 	})
 }
 

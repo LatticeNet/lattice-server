@@ -181,6 +181,9 @@ type Server struct {
 	// returns 429 + Retry-After. Disk is independently bounded by the store caps.
 	logIngestLimiter *ratelimit.Limiter
 	proxyUsageMu     sync.Mutex
+	// usageDayLast is the UTC day the last ingestion ran the retention sweep
+	// for; guarded by proxyUsageMu.
+	usageDayLast string
 	// lineUUIDMu serializes the line_hash_id -> line_uuid check-and-set so
 	// concurrent read-model builds cannot allocate two UUIDs for one line
 	// (design-15 D1).

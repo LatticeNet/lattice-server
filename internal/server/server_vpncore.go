@@ -56,7 +56,7 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersService, "v1", []string{"list", "get"}, s.vpnCoreUsersRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersAdminService, "v1", []string{"create", "update", "delete", "bind", "unbind", "plan_add", "plan_update", "plan_remove", "rotate"}, s.vpnCoreUsersAdminRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersAdminService, "v1", []string{"create", "update", "delete", "bind", "unbind", "plan_add", "plan_update", "plan_remove", "rotate", "usage_query"}, s.vpnCoreUsersAdminRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersAdminService, err)
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsageService, "v1", []string{"query"}, s.vpnCoreUsageRPC); err != nil {

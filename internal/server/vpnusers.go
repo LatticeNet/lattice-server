@@ -25,18 +25,23 @@ import (
 // Credential secrets (uuid/password) are NEVER returned through the read RPC; the
 // gateway-facing views are redacted (see vpnUserView).
 type VpnUser struct {
-	ID                     string          `json:"id"`
-	Email                  string          `json:"email"`
-	Name                   string          `json:"name,omitempty"`
-	Enabled                bool            `json:"enabled"`
-	Credentials            []VpnCredential `json:"credentials"`
-	Bindings               []LineBinding   `json:"bindings"`
-	SubID                  string          `json:"sub_id,omitempty"`
-	QuotaBytes             int64           `json:"quota_bytes,omitempty"`
-	ExpiresAt              time.Time       `json:"expires_at,omitempty"`
-	Group                  string          `json:"group,omitempty"`
-	Comment                string          `json:"comment,omitempty"`
-	SubscriptionGeneration uint64          `json:"-"`
+	ID          string          `json:"id"`
+	Email       string          `json:"email"`
+	Name        string          `json:"name,omitempty"`
+	Enabled     bool            `json:"enabled"`
+	Credentials []VpnCredential `json:"credentials"`
+	Bindings    []LineBinding   `json:"bindings"`
+	SubID       string          `json:"sub_id,omitempty"`
+	QuotaBytes  int64           `json:"quota_bytes,omitempty"`
+	// QuotaPeriod is none (lifetime, the default) or monthly; QuotaResetDay is
+	// the day of month (1..28) a monthly period starts. Period usage is summed
+	// from the user-day rows, never stored.
+	QuotaPeriod            string    `json:"quota_period,omitempty"`
+	QuotaResetDay          int       `json:"quota_reset_day,omitempty"`
+	ExpiresAt              time.Time `json:"expires_at,omitempty"`
+	Group                  string    `json:"group,omitempty"`
+	Comment                string    `json:"comment,omitempty"`
+	SubscriptionGeneration uint64    `json:"-"`
 
 	// MigratedFromProxyUser records the legacy ProxyUser this identity was derived
 	// from, so the migration is idempotent and the subscription substrate is traceable.
@@ -86,19 +91,21 @@ type vpnCredentialView struct {
 }
 
 type vpnUserView struct {
-	ID          string              `json:"id"`
-	Email       string              `json:"email"`
-	Name        string              `json:"name,omitempty"`
-	Enabled     bool                `json:"enabled"`
-	Credentials []vpnCredentialView `json:"credentials"`
-	Bindings    []LineBinding       `json:"bindings"`
-	QuotaBytes  int64               `json:"quota_bytes,omitempty"`
-	ExpiresAt   time.Time           `json:"expires_at,omitempty"`
-	Group       string              `json:"group,omitempty"`
-	Comment     string              `json:"comment,omitempty"`
-	Migrated    bool                `json:"migrated"`
-	CreatedAt   time.Time           `json:"created_at"`
-	UpdatedAt   time.Time           `json:"updated_at"`
+	ID            string              `json:"id"`
+	Email         string              `json:"email"`
+	Name          string              `json:"name,omitempty"`
+	Enabled       bool                `json:"enabled"`
+	Credentials   []vpnCredentialView `json:"credentials"`
+	Bindings      []LineBinding       `json:"bindings"`
+	QuotaBytes    int64               `json:"quota_bytes,omitempty"`
+	QuotaPeriod   string              `json:"quota_period,omitempty"`
+	QuotaResetDay int                 `json:"quota_reset_day,omitempty"`
+	ExpiresAt     time.Time           `json:"expires_at,omitempty"`
+	Group         string              `json:"group,omitempty"`
+	Comment       string              `json:"comment,omitempty"`
+	Migrated      bool                `json:"migrated"`
+	CreatedAt     time.Time           `json:"created_at"`
+	UpdatedAt     time.Time           `json:"updated_at"`
 }
 
 func toVpnUserView(u VpnUser) vpnUserView {
@@ -116,6 +123,7 @@ func toVpnUserView(u VpnUser) vpnUserView {
 	return vpnUserView{
 		ID: u.ID, Email: u.Email, Name: u.Name, Enabled: u.Enabled,
 		Credentials: creds, Bindings: binds, QuotaBytes: u.QuotaBytes, ExpiresAt: u.ExpiresAt,
+		QuotaPeriod: u.QuotaPeriod, QuotaResetDay: u.QuotaResetDay,
 		Group: u.Group, Comment: u.Comment, Migrated: u.MigratedFromProxyUser != "",
 		CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
 	}
@@ -180,6 +188,7 @@ func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecr
 	return store.VpnUserPublicRecord{
 		ID: u.ID, Email: u.Email, Name: u.Name, Enabled: u.Enabled,
 		Credentials: publicCredentials, Bindings: bindings, QuotaBytes: u.QuotaBytes,
+		QuotaPeriod: u.QuotaPeriod, QuotaResetDay: u.QuotaResetDay,
 		ExpiresAt: u.ExpiresAt, Group: u.Group, Comment: u.Comment,
 		SubscriptionGeneration: u.SubscriptionGeneration,
 		MigratedFromProxyUser:  u.MigratedFromProxyUser, CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
@@ -208,6 +217,7 @@ func joinVpnUserRecord(public store.VpnUserPublicRecord, private store.VpnUserSe
 	return VpnUser{
 		ID: public.ID, Email: public.Email, Name: public.Name, Enabled: public.Enabled,
 		Credentials: credentials, Bindings: bindings, SubID: private.SubID, QuotaBytes: public.QuotaBytes,
+		QuotaPeriod: public.QuotaPeriod, QuotaResetDay: public.QuotaResetDay,
 		ExpiresAt: public.ExpiresAt, Group: public.Group, Comment: public.Comment,
 		SubscriptionGeneration: public.SubscriptionGeneration,
 		MigratedFromProxyUser:  public.MigratedFromProxyUser, CreatedAt: public.CreatedAt, UpdatedAt: public.UpdatedAt,
@@ -353,14 +363,10 @@ func (s *Server) migrateProxyUsersToVpnUsers() error {
 func (s *Server) vpnCoreUsersRPC(_ context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "list":
-		users := s.listVpnUsers()
-		views := make([]vpnUserView, 0, len(users))
-		for _, u := range users {
-			views = append(views, toVpnUserView(u))
-		}
+		views := s.vpnUserUsageViews(s.listVpnUsers(), s.now())
 		return json.Marshal(struct {
-			Users []vpnUserView `json:"users"`
-			Count int           `json:"count"`
+			Users []vpnUserUsageView `json:"users"`
+			Count int                `json:"count"`
 		}{Users: views, Count: len(views)})
 	case "get":
 		id, err := decodeIDRequest(request)
@@ -372,8 +378,8 @@ func (s *Server) vpnCoreUsersRPC(_ context.Context, method string, request []byt
 			return nil, fmt.Errorf("vpn-core/users get: user %q not found", id)
 		}
 		return json.Marshal(struct {
-			User vpnUserView `json:"user"`
-		}{User: toVpnUserView(u)})
+			User vpnUserUsageView `json:"user"`
+		}{User: s.vpnUserUsageViews([]VpnUser{u}, s.now())[0]})
 	default:
 		return nil, fmt.Errorf("vpn-core/users: unknown method %q", method)
 	}
@@ -442,6 +448,18 @@ func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, r
 			return nil, err
 		}
 		return s.vpnUserRotateCredential(p, request)
+	case "usage_query":
+		// A read on the admin service: the gateway enforced the manifest
+		// scopes, and node:read is re-checked here so the method can never be
+		// wider than the usage it reports on.
+		p, err := pluginOperatorPrincipal(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if ok, reason := pluginGatewayScopeAllowed(p, "node:read"); !ok {
+			return nil, errors.New(reason)
+		}
+		return s.vpnUsageQuery(request)
 	default:
 		return nil, fmt.Errorf("vpn-core/users-admin: unknown method %q", method)
 	}
@@ -457,10 +475,42 @@ type vpnUserWriteReq struct {
 	// distinguishable from "set to zero". As a plain int64 an edit that never
 	// mentioned the quota still decoded as 0 here and the assignment below
 	// removed it, so renaming a quota'd account made it unlimited.
-	QuotaBytes *int64     `json:"quota_bytes"`
-	ExpiresAt  *time.Time `json:"expires_at"`
-	Group      string     `json:"group"`
-	Comment    string     `json:"comment"`
+	QuotaBytes *int64 `json:"quota_bytes"`
+	// QuotaPeriod and QuotaResetDay follow the same pointer convention.
+	QuotaPeriod   *string    `json:"quota_period"`
+	QuotaResetDay *int       `json:"quota_reset_day"`
+	ExpiresAt     *time.Time `json:"expires_at"`
+	Group         string     `json:"group"`
+	Comment       string     `json:"comment"`
+}
+
+// applyQuotaPeriod validates and applies the optional period fields. The
+// period is stored as "" for none so old records and new ones compare equal;
+// monthly without a stated reset day starts on the 1st.
+func applyQuotaPeriod(u *VpnUser, period *string, resetDay *int) error {
+	if period != nil {
+		switch p := strings.ToLower(strings.TrimSpace(*period)); p {
+		case "", vpnQuotaPeriodNone:
+			u.QuotaPeriod = ""
+		case vpnQuotaPeriodMonthly:
+			u.QuotaPeriod = vpnQuotaPeriodMonthly
+		default:
+			return fmt.Errorf("quota_period must be none or monthly, got %q", *period)
+		}
+	}
+	if resetDay != nil {
+		if *resetDay < 1 || *resetDay > 28 {
+			return errors.New("quota_reset_day must be between 1 and 28")
+		}
+		u.QuotaResetDay = *resetDay
+	}
+	if u.QuotaPeriod == vpnQuotaPeriodMonthly && u.QuotaResetDay == 0 {
+		u.QuotaResetDay = 1
+	}
+	if u.QuotaPeriod == "" {
+		u.QuotaResetDay = 0
+	}
+	return nil
 }
 
 // quotaOrZero reads an optional quota. On create, "not supplied" and "no quota"
@@ -513,6 +563,9 @@ func (s *Server) vpnUserCreate(request []byte) ([]byte, error) {
 	if req.ExpiresAt != nil {
 		u.ExpiresAt = *req.ExpiresAt
 	}
+	if err := applyQuotaPeriod(&u, req.QuotaPeriod, req.QuotaResetDay); err != nil {
+		return nil, err
+	}
 	if err := s.putVpnUser(u); err != nil {
 		return nil, err
 	}
@@ -555,6 +608,9 @@ func (s *Server) vpnUserUpdate(request []byte) ([]byte, error) {
 	}
 	if req.ExpiresAt != nil {
 		u.ExpiresAt = *req.ExpiresAt
+	}
+	if err := applyQuotaPeriod(&u, req.QuotaPeriod, req.QuotaResetDay); err != nil {
+		return nil, err
 	}
 	u.Group = strings.TrimSpace(req.Group)
 	u.Comment = strings.TrimSpace(req.Comment)

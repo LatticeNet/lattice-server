@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -222,6 +223,13 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	var req struct {
 		UserID     string `json:"user_id"`
 		LineHashID string `json:"line_hash_id"`
+		// The quota is server-side policy, not on-box state: plan_add and
+		// plan_update accept it so one operator action allocates the line and
+		// sets the allowance, and it is written before the approval is queued
+		// because nothing on the node depends on it.
+		QuotaBytes    *int64  `json:"quota_bytes"`
+		QuotaPeriod   *string `json:"quota_period"`
+		QuotaResetDay *int    `json:"quota_reset_day"`
 	}
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, fmt.Errorf("vpn-core/users-admin plan_%s: invalid request: %w", op, err)
@@ -232,6 +240,23 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	}
 	if (op == lineUserOpAdd || op == lineUserOpUpdate) && !u.Enabled {
 		return nil, fmt.Errorf("user %q is disabled", u.ID)
+	}
+	quotaChanged := false
+	if op != lineUserOpRemove && (req.QuotaBytes != nil || req.QuotaPeriod != nil || req.QuotaResetDay != nil) {
+		if req.QuotaBytes != nil {
+			if *req.QuotaBytes < 0 {
+				return nil, errors.New("quota_bytes cannot be negative")
+			}
+			u.QuotaBytes = *req.QuotaBytes
+		}
+		if err := applyQuotaPeriod(&u, req.QuotaPeriod, req.QuotaResetDay); err != nil {
+			return nil, err
+		}
+		u.UpdatedAt = s.now()
+		if err := s.putVpnUser(u); err != nil {
+			return nil, err
+		}
+		quotaChanged = true
 	}
 	ln, err := s.resolveLineUserTarget(strings.TrimSpace(req.LineHashID))
 	if err != nil {
@@ -308,6 +333,7 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 		Metadata: map[string]string{
 			"approval_id": approval.ID, "op": op, "user_id": u.ID,
 			"line_hash_id": ln.LineHashID, "credential_sha256": sha,
+			"quota_changed": strconv.FormatBool(quotaChanged),
 		},
 	})
 	return json.Marshal(struct {

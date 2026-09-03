@@ -97,6 +97,7 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 	sort.Slice(byUser, func(i, j int) bool { return byUser[i].UsedBytes > byUser[j].UsedBytes })
 
 	// by-node + per-(node,user) rows from the latest snapshot per node.
+	collectorSeen := map[string]bool{}
 	for _, snap := range s.store.ProxyUsageSnapshots() {
 		nodeName := s.nodeDisplayName(snap.NodeID)
 		nodeTotal := int64(0)
@@ -147,7 +148,21 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 				c.CheckedAt = snap.CollectorCheckedAt.UTC().Format("2006-01-02T15:04:05Z07:00")
 			}
 			collectors = append(collectors, c)
+			collectorSeen[snap.NodeID] = true
 		}
+	}
+	// Nodes with a proxy profile but no counters: a stats_off report stores
+	// no snapshot, and a node that never reported a collector is no_collector,
+	// so both come from the profile.
+	for _, prof := range s.store.ProxyNodeProfiles() {
+		if collectorSeen[prof.NodeID] {
+			continue
+		}
+		c := UsageCollector{NodeID: prof.NodeID, NodeName: s.nodeDisplayName(prof.NodeID), Source: prof.UsageCollectorSource, Status: usageCollectorState(prof), Error: prof.UsageCollectorLastError}
+		if !prof.UsageCollectorCheckedAt.IsZero() {
+			c.CheckedAt = prof.UsageCollectorCheckedAt.UTC().Format("2006-01-02T15:04:05Z07:00")
+		}
+		collectors = append(collectors, c)
 	}
 	sort.Slice(byNode, func(i, j int) bool { return byNode[i].UsedBytes > byNode[j].UsedBytes })
 	sort.Slice(rows, func(i, j int) bool {
@@ -165,10 +180,28 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 
 // vpnCoreUsageRPC serves latticenet.vpn-core/usage (design-12 S3), proxy:read.
 //
-//	query -> {by_user, by_node, rows, collectors, per_line}
-func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, _ []byte) ([]byte, error) {
+//	query {period?} -> {by_user, by_node, rows, collectors, per_line,
+//	                    lines, double_counted_via_chains_bytes, period, from, to}
+//
+// lines are the per-line attributed rows over the period (today, 7d, 30d,
+// all, or yyyymmdd..yyyymmdd; 30d by default); the older fields keep their
+// snapshot-based shape for existing clients.
+func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "query":
+		var req struct {
+			Period string `json:"period"`
+		}
+		if len(strings.TrimSpace(string(request))) > 0 {
+			if err := json.Unmarshal(request, &req); err != nil {
+				return nil, fmt.Errorf("vpn-core/usage query: invalid request: %w", err)
+			}
+		}
+		window, err := parseUsagePeriod(req.Period, s.now())
+		if err != nil {
+			return nil, err
+		}
+		report, window := s.buildUsageLines(s.usageAttributionContext(), window)
 		byUser, byNode, rows, collectors, perLine := s.buildUsage()
 		if byUser == nil {
 			byUser = []UsageByUser{}
@@ -183,12 +216,19 @@ func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, _ []byte) ([]
 			collectors = []UsageCollector{}
 		}
 		return json.Marshal(struct {
-			ByUser     []UsageByUser    `json:"by_user"`
-			ByNode     []UsageByNode    `json:"by_node"`
-			Rows       []UsageRow       `json:"rows"`
-			Collectors []UsageCollector `json:"collectors"`
-			PerLine    bool             `json:"per_line"`
-		}{ByUser: byUser, ByNode: byNode, Rows: rows, Collectors: collectors, PerLine: perLine})
+			ByUser                      []UsageByUser    `json:"by_user"`
+			ByNode                      []UsageByNode    `json:"by_node"`
+			Rows                        []UsageRow       `json:"rows"`
+			Collectors                  []UsageCollector `json:"collectors"`
+			PerLine                     bool             `json:"per_line"`
+			Lines                       []usageLineRow   `json:"lines"`
+			DoubleCountedViaChainsBytes int64            `json:"double_counted_via_chains_bytes"`
+			Period                      string           `json:"period"`
+			From                        string           `json:"from"`
+			To                          string           `json:"to"`
+		}{ByUser: byUser, ByNode: byNode, Rows: rows, Collectors: collectors, PerLine: perLine,
+			Lines: report.Rows, DoubleCountedViaChainsBytes: report.DoubleCountedViaChainsBytes,
+			Period: window.Label, From: window.fromDay(), To: window.toDay()})
 	default:
 		return nil, fmt.Errorf("vpn-core/usage: unknown method %q", method)
 	}

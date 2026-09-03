@@ -26,6 +26,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 var (
@@ -89,9 +90,12 @@ type proxyUserView struct {
 }
 
 type proxyNodeProfileView struct {
-	ID            string    `json:"id"`
-	NodeID        string    `json:"node_id"`
-	NodeName      string    `json:"node_name,omitempty"`
+	ID       string `json:"id"`
+	NodeID   string `json:"node_id"`
+	NodeName string `json:"node_name,omitempty"`
+	// Origin is managed for a Lattice-rendered profile and discovered for one
+	// registered from a usage report of an sb-managed node.
+	Origin        string    `json:"origin"`
 	Core          string    `json:"core"`
 	InboundIDs    []string  `json:"inbound_ids"`
 	Hostname      string    `json:"hostname,omitempty"`
@@ -123,11 +127,22 @@ type proxyNodeProfileView struct {
 }
 
 type proxyUsageSnapshotView struct {
-	NodeID        string           `json:"node_id"`
-	NodeName      string           `json:"node_name,omitempty"`
-	At            time.Time        `json:"at"`
-	CoreUptimeSec uint64           `json:"core_uptime_sec"`
-	UserBytes     map[string]int64 `json:"user_bytes"`
+	NodeID        string                      `json:"node_id"`
+	NodeName      string                      `json:"node_name,omitempty"`
+	At            time.Time                   `json:"at"`
+	CoreUptimeSec uint64                      `json:"core_uptime_sec"`
+	UserBytes     map[string]int64            `json:"user_bytes"`
+	LineUserBytes map[string]map[string]int64 `json:"line_user_bytes,omitempty"`
+	// The direction-split counter families as stored: user_traffic carries
+	// only the u_<hash> names the server could place, never a raw credential.
+	InboundTraffic     map[string]model.ProxyTrafficCounter `json:"inbound_traffic,omitempty"`
+	UserTraffic        map[string]model.ProxyTrafficCounter `json:"user_traffic,omitempty"`
+	OutboundTraffic    map[string]model.ProxyTrafficCounter `json:"outbound_traffic,omitempty"`
+	IgnoredCounters    int                                  `json:"ignored_counters,omitempty"`
+	CollectorSource    string                               `json:"collector_source,omitempty"`
+	CollectorStatus    string                               `json:"collector_status,omitempty"`
+	CollectorError     string                               `json:"collector_error,omitempty"`
+	CollectorCheckedAt time.Time                            `json:"collector_checked_at,omitempty"`
 }
 
 type proxyUsageUserView struct {
@@ -141,12 +156,18 @@ type proxyUsageUserView struct {
 }
 
 type proxyUsageApplyResult struct {
-	BytesDelta      int64  `json:"bytes_delta"`
-	UsersUpdated    int    `json:"users_updated"`
-	UsersIgnored    int    `json:"users_ignored"`
-	AlertsFired     int    `json:"alerts_fired"`
-	CollectorSource string `json:"collector_source,omitempty"`
-	CollectorStatus string `json:"collector_status,omitempty"`
+	BytesDelta   int64 `json:"bytes_delta"`
+	UsersUpdated int   `json:"users_updated"`
+	UsersIgnored int   `json:"users_ignored"`
+	// UnknownLines counts inbound tags this report carried that no line on
+	// the node matches; their bytes are kept as unknown_line rows.
+	UnknownLines int `json:"unknown_lines,omitempty"`
+	// ProfileRegistered says this report created the node's discovered
+	// profile (see registerDiscoveredProxyProfile).
+	ProfileRegistered bool   `json:"profile_registered,omitempty"`
+	AlertsFired       int    `json:"alerts_fired"`
+	CollectorSource   string `json:"collector_source,omitempty"`
+	CollectorStatus   string `json:"collector_status,omitempty"`
 }
 
 func proxySubscriptionBody(format string, endpoints []proxycore.VLESSRealityEndpoint) ([]byte, string, error) {
@@ -207,6 +228,9 @@ func (s *Server) proxySubscriptionProfiles() []proxycore.SubscriptionProfile {
 	profiles := s.store.ProxyNodeProfiles()
 	out := make([]proxycore.SubscriptionProfile, 0, len(profiles))
 	for _, profile := range profiles {
+		if proxyProfileOrigin(profile) == proxyProfileOriginDiscovered {
+			continue // nothing to render: the lines are sb-managed, not Lattice inbounds
+		}
 		name := ""
 		if node, ok := s.store.Node(profile.NodeID); ok {
 			name = node.Name
@@ -503,9 +527,20 @@ func (s *Server) handleProxyUsage(w http.ResponseWriter, r *http.Request, p prin
 	for _, user := range users {
 		userViews = append(userViews, toProxyUsageUserView(user))
 	}
+	window, err := parseUsagePeriod(r.URL.Query().Get("period"), s.now())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	report, window := s.buildUsageLines(s.usageAttributionContext(), window)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"snapshots": snapshotViews,
-		"users":     userViews,
+		"snapshots":                       snapshotViews,
+		"users":                           userViews,
+		"lines":                           report.Rows,
+		"double_counted_via_chains_bytes": report.DoubleCountedViaChainsBytes,
+		"period":                          window.Label,
+		"from":                            window.fromDay(),
+		"to":                              window.toDay(),
 	})
 }
 
@@ -535,6 +570,12 @@ func (s *Server) handleAgentProxyUsage(w http.ResponseWriter, r *http.Request) {
 		"bytes_delta":   strconv.FormatInt(result.BytesDelta, 10),
 		"users_updated": strconv.Itoa(result.UsersUpdated),
 		"users_ignored": strconv.Itoa(result.UsersIgnored),
+	}
+	if result.UnknownLines > 0 {
+		auditMeta["unknown_lines"] = strconv.Itoa(result.UnknownLines)
+	}
+	if result.ProfileRegistered {
+		auditMeta["profile_registered"] = "true"
 	}
 	if result.CollectorSource != "" {
 		auditMeta["collector_source"] = result.CollectorSource
@@ -1228,6 +1269,7 @@ func (s *Server) toProxyNodeProfileView(profile model.ProxyNodeProfile) proxyNod
 		ID:            profile.ID,
 		NodeID:        profile.NodeID,
 		NodeName:      nodeName,
+		Origin:        proxyProfileOrigin(profile),
 		Core:          profile.Core,
 		InboundIDs:    append([]string(nil), profile.InboundIDs...),
 		Hostname:      profile.Hostname,
@@ -1263,13 +1305,39 @@ func (s *Server) toProxyUsageSnapshotView(snapshot model.ProxyUsageSnapshot) pro
 	if node, ok := s.store.Node(snapshot.NodeID); ok {
 		nodeName = node.Name
 	}
-	return proxyUsageSnapshotView{
-		NodeID:        snapshot.NodeID,
-		NodeName:      nodeName,
-		At:            snapshot.At,
-		CoreUptimeSec: snapshot.CoreUptimeSec,
-		UserBytes:     cloneProxyUserBytes(snapshot.UserBytes),
+	view := proxyUsageSnapshotView{
+		NodeID:             snapshot.NodeID,
+		NodeName:           nodeName,
+		At:                 snapshot.At,
+		CoreUptimeSec:      snapshot.CoreUptimeSec,
+		UserBytes:          cloneProxyUserBytes(snapshot.UserBytes),
+		InboundTraffic:     cloneTrafficCounters(snapshot.InboundTraffic),
+		UserTraffic:        cloneTrafficCounters(snapshot.UserTraffic),
+		OutboundTraffic:    cloneTrafficCounters(snapshot.OutboundTraffic),
+		IgnoredCounters:    snapshot.IgnoredCounters,
+		CollectorSource:    snapshot.CollectorSource,
+		CollectorStatus:    snapshot.CollectorStatus,
+		CollectorError:     snapshot.CollectorError,
+		CollectorCheckedAt: snapshot.CollectorCheckedAt,
 	}
+	if len(snapshot.LineUserBytes) > 0 {
+		view.LineUserBytes = make(map[string]map[string]int64, len(snapshot.LineUserBytes))
+		for line, byUser := range snapshot.LineUserBytes {
+			view.LineUserBytes[line] = cloneProxyUserBytes(byUser)
+		}
+	}
+	return view
+}
+
+func cloneTrafficCounters(in map[string]model.ProxyTrafficCounter) map[string]model.ProxyTrafficCounter {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]model.ProxyTrafficCounter, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func toProxyUsageUserView(user model.ProxyUser) proxyUsageUserView {
@@ -1292,6 +1360,17 @@ func cloneProxyUserBytes(in map[string]int64) map[string]int64 {
 	return out
 }
 
+// validProxyUsageCollectorStatus reports whether a status is one of the three
+// the agent wire contract defines. Every other value is an arbitrary string and
+// carries no meaning, whether it arrives as health or as discovery evidence.
+func validProxyUsageCollectorStatus(status string) bool {
+	switch status {
+	case model.ProxyUsageCollectorStatusOK, model.ProxyUsageCollectorStatusError, proxyUsageCollectorStatusStatsOff:
+		return true
+	}
+	return false
+}
+
 func applyProxyUsageCollectorHealth(profile model.ProxyNodeProfile, snapshot model.ProxyUsageSnapshot, now time.Time) (model.ProxyNodeProfile, bool, error) {
 	source := strings.TrimSpace(snapshot.CollectorSource)
 	status := strings.TrimSpace(snapshot.CollectorStatus)
@@ -1310,7 +1389,7 @@ func applyProxyUsageCollectorHealth(profile model.ProxyNodeProfile, snapshot mod
 			status = model.ProxyUsageCollectorStatusOK
 		}
 	}
-	if status != model.ProxyUsageCollectorStatusOK && status != model.ProxyUsageCollectorStatusError {
+	if !validProxyUsageCollectorStatus(status) {
 		return model.ProxyNodeProfile{}, false, fmt.Errorf("invalid collector_status %q", status)
 	}
 	checkedAt := snapshot.CollectorCheckedAt
@@ -1336,6 +1415,18 @@ func applyProxyUsageCollectorHealth(profile model.ProxyNodeProfile, snapshot mod
 		}
 		profile.UsageCollectorLastError = errText
 		profile.UsageCollectorLastErrorAt = checkedAt
+	case proxyUsageCollectorStatusStatsOff:
+		// The node runs a sing-box config without experimental.v2ray_api. A
+		// configuration state, kept apart from a collector fault, and it can
+		// carry no counters because there are none.
+		if len(snapshot.UserBytes) > 0 || len(snapshot.InboundTraffic) > 0 || len(snapshot.UserTraffic) > 0 {
+			return model.ProxyNodeProfile{}, false, errors.New("stats_off reports must not include counters")
+		}
+		if errText == "" {
+			errText = "sing-box config has no experimental.v2ray_api"
+		}
+		profile.UsageCollectorLastError = errText
+		profile.UsageCollectorLastErrorAt = checkedAt
 	}
 	return profile, true, nil
 }
@@ -1358,14 +1449,19 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	if snapshot.NodeID == "" {
 		return proxyUsageApplyResult{}, errors.New("node_id is required")
 	}
+	result := proxyUsageApplyResult{}
 	profile, ok := s.store.ProxyNodeProfile(snapshot.NodeID)
 	if !ok {
-		return proxyUsageApplyResult{}, fmt.Errorf("proxy node profile %s not found", snapshot.NodeID)
+		registered, err := s.registerDiscoveredProxyProfile(snapshot)
+		if err != nil {
+			return proxyUsageApplyResult{}, err
+		}
+		profile = registered
+		result.ProfileRegistered = true
 	}
 	if snapshot.At.IsZero() {
 		snapshot.At = s.now()
 	}
-	result := proxyUsageApplyResult{}
 	collectorUpdated := false
 	if updatedProfile, updated, err := applyProxyUsageCollectorHealth(profile, snapshot, s.now()); err != nil {
 		return proxyUsageApplyResult{}, err
@@ -1374,21 +1470,79 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		collectorUpdated = true
 		result.CollectorSource = profile.UsageCollectorSource
 		result.CollectorStatus = profile.UsageCollectorStatus
-		if profile.UsageCollectorStatus == model.ProxyUsageCollectorStatusError {
+		if profile.UsageCollectorStatus == model.ProxyUsageCollectorStatusError || profile.UsageCollectorStatus == proxyUsageCollectorStatusStatsOff {
 			if err := s.store.ApplyProxyUsageUpdate(nil, &profile, nil); err != nil {
 				return proxyUsageApplyResult{}, err
 			}
 			return result, nil
 		}
 	}
-	if len(snapshot.UserBytes) > 4096 {
-		return proxyUsageApplyResult{}, errors.New("user_bytes has too many entries")
+	if len(snapshot.UserBytes) > 4096 || len(snapshot.UserTraffic) > 4096 || len(snapshot.InboundTraffic) > 4096 || len(snapshot.OutboundTraffic) > 4096 {
+		return proxyUsageApplyResult{}, errors.New("usage snapshot has too many entries")
+	}
+	if err := validateProxyTrafficCounters(snapshot.InboundTraffic, "inbound_traffic"); err != nil {
+		return proxyUsageApplyResult{}, err
+	}
+	if err := validateProxyTrafficCounters(snapshot.OutboundTraffic, "outbound_traffic"); err != nil {
+		return proxyUsageApplyResult{}, err
+	}
+	if err := validateProxyTrafficCounters(snapshot.UserTraffic, "user_traffic"); err != nil {
+		return proxyUsageApplyResult{}, err
+	}
+	// A collector that reports the direction split may leave user_bytes out;
+	// the per-user sum is what the monotonic path has always diffed.
+	if len(snapshot.UserBytes) == 0 && len(snapshot.UserTraffic) > 0 {
+		snapshot.UserBytes = make(map[string]int64, len(snapshot.UserTraffic))
+		for name, c := range snapshot.UserTraffic {
+			snapshot.UserBytes[name] = c.Uplink + c.Downlink
+		}
 	}
 	// design-15 §8: reverse on-box u_<hash> stat names into (line, proxy user)
-	// accounting rows before eligibility checks and monotonic diffing.
-	foldUserLineUsage(&snapshot, s.userLineNameIndex())
+	// accounting rows before eligibility checks and monotonic diffing. The
+	// attribution context carries the same index, computed once.
+	//
+	// The index is fleet-wide, so it is narrowed to the reporting node first: a
+	// name only proves anything about a line that node serves. A valid name for
+	// another node's line is dropped and counted as ignored, never folded and
+	// never used to widen eligibility, which is what kept one node from
+	// attributing bytes to any (line, user) pair in the fleet.
+	attribution := s.usageAttributionContext()
+	nameIndex := attribution.nodeNameIndex(snapshot.NodeID)
+	folded := map[string]bool{}
+	foreignNames := 0
+	for name := range snapshot.UserBytes {
+		if target, ok := nameIndex[name]; ok {
+			folded[target.ProxyUserID] = true
+			continue
+		}
+		if _, ok := attribution.nameIndex[name]; ok {
+			delete(snapshot.UserBytes, name)
+			foreignNames++
+		}
+	}
+	foldUserLineUsage(&snapshot, nameIndex)
+	// Direction-split user counters are kept by name, but only the names the
+	// index can place: on an sb-managed node an unnamed user's key is the
+	// credential itself, and that must never be stored or echoed.
+	snapshot.UserTraffic = keepIndexedUserTraffic(snapshot.UserTraffic, nameIndex)
 	eligible := s.proxyUsageEligibleUsers(profile)
-	lineUserBytes, lineUserTotals, lineUsersIgnored, err := s.sanitizeProxyUsageLineUserBytes(snapshot.LineUserBytes, eligible)
+	ensureEligible := func(acct string) {
+		if _, ok := eligible[acct]; ok {
+			return
+		}
+		if stored, ok := s.store.ProxyUser(acct); ok {
+			eligible[acct] = stored
+		} else if vu, ok := attribution.users[attribution.vpnByAcct[acct]]; ok {
+			eligible[acct] = vpnUserUsageProjection(vu)
+		}
+	}
+	// A folded u_<hash> counter is the node's own statement that it serves
+	// that identity, so the identity is eligible here even while discovery
+	// is stale and the binding's line is missing from the read model.
+	for acct := range folded {
+		ensureEligible(acct)
+	}
+	lineUserBytes, lineUserTotals, lineUsersIgnored, err := s.sanitizeProxyUsageLineUserBytes(snapshot.NodeID, snapshot.LineUserBytes, eligible)
 	if err != nil {
 		return proxyUsageApplyResult{}, err
 	}
@@ -1397,7 +1551,7 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		snapshot.UserBytes = lineUserTotals
 	}
 	sanitized := map[string]int64{}
-	ignored := lineUsersIgnored
+	ignored := lineUsersIgnored + foreignNames
 	for userID, value := range snapshot.UserBytes {
 		userID = strings.TrimSpace(userID)
 		if !proxyIDRe.MatchString(userID) {
@@ -1417,31 +1571,68 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	previous, hadPrevious := s.store.ProxyUsageSnapshot(snapshot.NodeID)
 	result.UsersIgnored = ignored
 	now := s.now()
+	reset := hadPrevious && snapshot.CoreUptimeSec < previous.CoreUptimeSec
+	// Per-user deltas from the legacy total path. A counter that decreased
+	// without an uptime reset is a new baseline for that user and advances
+	// nothing.
+	legacyDelta := map[string]int64{}
+	lineUserDelta := map[string]map[string]int64{}
+	if hadPrevious {
+		for userID, current := range snapshot.UserBytes {
+			if delta := monotonicDelta(current, previous.UserBytes[userID], reset); delta > 0 {
+				legacyDelta[userID] = delta
+			}
+		}
+		for lineHash, byUser := range snapshot.LineUserBytes {
+			for userID, current := range byUser {
+				if delta := monotonicDelta(current, previous.LineUserBytes[lineHash][userID], reset); delta > 0 {
+					if lineUserDelta[lineHash] == nil {
+						lineUserDelta[lineHash] = map[string]int64{}
+					}
+					lineUserDelta[lineHash][userID] = delta
+				}
+			}
+		}
+	}
+	deltas := s.usageIngest(attribution, snapshot, previous, hadPrevious, reset, now, legacyDelta, lineUserDelta)
+	result.UnknownLines = deltas.UnknownLines
+	userDelta := map[string]int64{}
+	for acct, delta := range legacyDelta {
+		userDelta[acct] = delta
+	}
+	// Inbound bytes the credential and binding rules assigned to identities
+	// join the per-user delta. Those identities may have no binding on this
+	// node, so they are made eligible from their stored projection.
+	for acct, c := range deltas.Attributed {
+		userDelta[acct] += c.total()
+		ensureEligible(acct)
+	}
 	usersToSave := []model.ProxyUser{}
 	alertsToEmit := []proxyUserNotificationFire{}
 	if hadPrevious {
-		reset := snapshot.CoreUptimeSec < previous.CoreUptimeSec
-		for userID, current := range snapshot.UserBytes {
-			prior := previous.UserBytes[userID]
-			delta := int64(0)
-			switch {
-			case reset:
-				delta = current
-			case current >= prior:
-				delta = current - prior
-			default:
-				// Counter decreased without an uptime reset. Treat this report as
-				// a new baseline for that user, but don't advance billing/limits.
-				delta = 0
-			}
-			if delta <= 0 {
+		accts := make([]string, 0, len(userDelta))
+		for acct := range userDelta {
+			accts = append(accts, acct)
+		}
+		sort.Strings(accts)
+		for _, acct := range accts {
+			delta := userDelta[acct]
+			user, ok := eligible[acct]
+			if delta <= 0 || !ok {
 				continue
 			}
-			user := eligible[userID]
 			user.UsedBytes += delta
 			user.LastSeenAt = snapshot.At
-			user.Status = derivedProxyUserStatusAt(user, now)
-			user, alerts := nextProxyUserNotifications(user, now)
+			pending := usageCounter{Downlink: delta}
+			vpnID := attribution.vpnByAcct[acct]
+			if row, ok := deltas.DayUsers[vpnID]; ok {
+				pending = usageCounter{Uplink: row.Uplink, Downlink: row.Downlink}
+			}
+			var vpnUser *VpnUser
+			if vu, ok := attribution.users[vpnID]; ok {
+				vpnUser = &vu
+			}
+			user, alerts := s.quotaEvaluate(user, vpnUser, now, pending)
 			usersToSave = append(usersToSave, user)
 			alertsToEmit = append(alertsToEmit, alerts...)
 			result.BytesDelta += delta
@@ -1452,8 +1643,7 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		for userID := range snapshot.UserBytes {
 			user := eligible[userID]
 			user.LastSeenAt = snapshot.At
-			user.Status = derivedProxyUserStatusAt(user, now)
-			user, alerts := nextProxyUserNotifications(user, now)
+			user, alerts := s.quotaEvaluate(user, s.vpnUserForAccounting(userID), now, usageCounter{})
 			usersToSave = append(usersToSave, user)
 			alertsToEmit = append(alertsToEmit, alerts...)
 			result.UsersUpdated++
@@ -1464,14 +1654,127 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	if collectorUpdated {
 		profileToSave = &profile
 	}
-	if err := s.store.ApplyProxyUsageUpdate(usersToSave, profileToSave, &snapshot); err != nil {
+	update := store.ProxyUsageUpdate{Users: usersToSave, Profile: profileToSave, Snapshot: &snapshot, DayNode: deltas.DayNode}
+	for _, row := range deltas.DayUsers {
+		update.DayUsers = append(update.DayUsers, *row)
+	}
+	sort.Slice(update.DayUsers, func(i, j int) bool { return update.DayUsers[i].UserID < update.DayUsers[j].UserID })
+	if err := s.store.ApplyProxyUsage(update); err != nil {
 		return proxyUsageApplyResult{}, err
 	}
+	s.maybePruneUsageDays(now)
 	s.emitProxyUserNotifications(alertsToEmit)
 	return result, nil
 }
 
-func (s *Server) sanitizeProxyUsageLineUserBytes(input map[string]map[string]int64, eligible map[string]model.ProxyUser) (map[string]map[string]int64, map[string]int64, int, error) {
+// registerDiscoveredProxyProfile gives a node that reports usage without a
+// proxy profile one of origin "discovered": core sing-box, no managed
+// inbounds. Every sb-managed node in the fleet is in this position, and the
+// alternative was an agent posting every ten seconds into a 400. The node
+// must be known, and either its sing-box inventory must be on record or the
+// snapshot itself must prove a collector; an empty report from a node with
+// no inventory still gets the old error, so nothing is registered on noise.
+func (s *Server) registerDiscoveredProxyProfile(snapshot model.ProxyUsageSnapshot) (model.ProxyNodeProfile, error) {
+	if _, ok := s.store.Node(snapshot.NodeID); !ok {
+		return model.ProxyNodeProfile{}, fmt.Errorf("proxy node profile %s not found", snapshot.NodeID)
+	}
+	_, discovered := s.singBoxInventory(snapshot.NodeID)
+	// Evidence has to be evidence. A collector_source or a collector_status the
+	// contract does not define is one arbitrary string, and registering on it
+	// let any authenticated node mint a profile and an audit row out of noise.
+	// Either the status is one the agent actually reports, or the snapshot
+	// carries a counter map.
+	proves := validProxyUsageCollectorStatus(strings.TrimSpace(snapshot.CollectorStatus)) ||
+		len(snapshot.UserBytes) > 0 || len(snapshot.LineUserBytes) > 0 ||
+		len(snapshot.InboundTraffic) > 0 || len(snapshot.UserTraffic) > 0 || len(snapshot.OutboundTraffic) > 0
+	if !discovered && !proves {
+		return model.ProxyNodeProfile{}, fmt.Errorf("proxy node profile %s not found and the report carries no collector evidence", snapshot.NodeID)
+	}
+	now := s.now()
+	profile := model.ProxyNodeProfile{ID: snapshot.NodeID, NodeID: snapshot.NodeID, Core: model.ProxyCoreSingbox, InboundIDs: []string{}, CreatedAt: now, UpdatedAt: now}
+	if err := s.store.UpsertProxyNodeProfile(profile); err != nil {
+		return model.ProxyNodeProfile{}, err
+	}
+	s.invalidateLineReadModel()
+	reason := "usage report from a node with discovered sing-box lines"
+	if !discovered {
+		reason = "usage report carrying collector evidence"
+	}
+	s.recordAudit(model.AuditEvent{
+		ID: id.New("audit"), NodeID: snapshot.NodeID, Action: "proxy.profile.discovered", Scope: "proxy:admin", Decision: "allow", ActorID: "system",
+		Metadata: map[string]string{"profile_id": profile.ID, "core": profile.Core, "reason": reason},
+	})
+	if stored, ok := s.store.ProxyNodeProfile(snapshot.NodeID); ok {
+		profile = stored
+	}
+	return profile, nil
+}
+
+const (
+	proxyProfileOriginManaged    = "managed"
+	proxyProfileOriginDiscovered = "discovered"
+)
+
+// proxyProfileOrigin is derived, not stored: a profile with no managed
+// inbound and no applied config is by construction one the server never
+// rendered, which is exactly the discovered case.
+func proxyProfileOrigin(profile model.ProxyNodeProfile) string {
+	if len(profile.InboundIDs) == 0 && strings.TrimSpace(profile.AppliedSHA256) == "" {
+		return proxyProfileOriginDiscovered
+	}
+	return proxyProfileOriginManaged
+}
+
+// monotonicDelta is the per-counter rule shared by every family: a core
+// restart makes the current value the delta; a decrease without one is a new
+// baseline that advances nothing.
+func monotonicDelta(current, prior int64, reset bool) int64 {
+	switch {
+	case reset:
+		return current
+	case current >= prior:
+		return current - prior
+	default:
+		return 0
+	}
+}
+
+func validateProxyTrafficCounters(counters map[string]model.ProxyTrafficCounter, field string) error {
+	for key, c := range counters {
+		if strings.TrimSpace(key) == "" || len(key) > 256 || strings.ContainsFunc(key, proxyUnsafeControl) {
+			return fmt.Errorf("%s has an invalid counter name", field)
+		}
+		if c.Uplink < 0 || c.Downlink < 0 {
+			return fmt.Errorf("%s counter %q cannot be negative", field, key)
+		}
+	}
+	return nil
+}
+
+// keepIndexedUserTraffic drops every user counter whose name the design-15
+// index cannot place. Unmatched names degrade to "ignored" on the total path
+// already; here they must not even be persisted.
+func keepIndexedUserTraffic(counters map[string]model.ProxyTrafficCounter, index map[string]userLineNameTarget) map[string]model.ProxyTrafficCounter {
+	if len(counters) == 0 {
+		return nil
+	}
+	out := map[string]model.ProxyTrafficCounter{}
+	for name, c := range counters {
+		if _, ok := index[name]; ok {
+			out[name] = c
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// sanitizeProxyUsageLineUserBytes keeps the (line, user) pairs nodeID is
+// entitled to report: the counters live on the box that owns the inbound, so a
+// line the read model places on another node is ignored the same way an unknown
+// line is, not attributed.
+func (s *Server) sanitizeProxyUsageLineUserBytes(nodeID string, input map[string]map[string]int64, eligible map[string]model.ProxyUser) (map[string]map[string]int64, map[string]int64, int, error) {
 	if len(input) == 0 {
 		return nil, nil, 0, nil
 	}
@@ -1482,7 +1785,7 @@ func (s *Server) sanitizeProxyUsageLineUserBytes(input map[string]map[string]int
 	groups, _ := s.lineReadModel()
 	for _, group := range groups {
 		for _, line := range group.Lines {
-			if line.LineHashID != "" {
+			if line.LineHashID != "" && line.NodeID == nodeID {
 				knownLines[line.LineHashID] = true
 			}
 		}

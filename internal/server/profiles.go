@@ -25,7 +25,8 @@ import (
 type NodeProfileRuntime struct {
 	NodeID          string                 `json:"node_id"`
 	NodeName        string                 `json:"node_name,omitempty"`
-	Managed         bool                   `json:"managed"` // a Lattice ProxyNodeProfile exists
+	Managed         bool                   `json:"managed"`          // a Lattice ProxyNodeProfile exists
+	Origin          string                 `json:"origin,omitempty"` // managed | discovered, when a profile exists
 	Core            string                 `json:"core,omitempty"`
 	CoreVersion     string                 `json:"core_version,omitempty"`
 	ConfigPath      string                 `json:"config_path,omitempty"`
@@ -67,6 +68,7 @@ func (s *Server) buildNodeProfileRuntimes() []NodeProfileRuntime {
 	for _, prof := range s.store.ProxyNodeProfiles() {
 		rt := get(prof.NodeID)
 		rt.Managed = true
+		rt.Origin = proxyProfileOrigin(prof)
 		rt.Core = prof.Core
 		rt.ConfigPath = prof.ConfigPath
 		rt.StatsAPI = prof.StatsAPI
@@ -118,7 +120,7 @@ func (s *Server) buildNodeProfileRuntimes() []NodeProfileRuntime {
 // listed. inspect/stats/add_user are reserved for S1b/S3b and intentionally absent.
 func runtimeCapabilities(rt *NodeProfileRuntime) []string {
 	caps := []string{"probe"} // node-driven `sb --json list/provision` probe is shipped
-	if rt.Managed {
+	if rt.Managed && rt.Origin != proxyProfileOriginDiscovered {
 		caps = append(caps, "apply") // plan->approve->apply pipeline exists for managed profiles
 	}
 	if rt.DiscoveredCount > 0 || rt.DiscoveryStatus != "" {

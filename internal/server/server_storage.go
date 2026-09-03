@@ -38,6 +38,40 @@ type storageTokenCreateResponse struct {
 	Token string `json:"token"`
 }
 
+// storageBucketInventoryEntry is what the console needs to list a store
+// honestly: the name, how it came to exist, whether its contents are
+// readable, and how much is in it.
+type storageBucketInventoryEntry struct {
+	Name       string `json:"name"`
+	Kind       string `json:"kind"`
+	Entries    int    `json:"entries"`
+	Registered bool   `json:"registered"`
+	Reserved   bool   `json:"reserved"`
+}
+
+func (s *Server) storageBucketInventory(kind string) []storageBucketInventoryEntry {
+	counts := s.store.StorageBucketInventory(kind)
+	registered := map[string]bool{}
+	for _, b := range s.store.StorageBuckets(kind) {
+		registered[b.Name] = true
+		if _, ok := counts[b.Name]; !ok {
+			counts[b.Name] = 0
+		}
+	}
+	out := make([]storageBucketInventoryEntry, 0, len(counts))
+	for name, n := range counts {
+		out = append(out, storageBucketInventoryEntry{
+			Name:       name,
+			Kind:       kind,
+			Entries:    n,
+			Registered: registered[name],
+			Reserved:   kind == model.StorageKindKV && reservedLineSecretKVBucket(name),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
 func (s *Server) handleStorageBuckets(w http.ResponseWriter, r *http.Request, p principal) {
 	kind, ok := requireStorageKind(w, r)
 	if !ok {
@@ -48,7 +82,16 @@ func (s *Server) handleStorageBuckets(w http.ResponseWriter, r *http.Request, p 
 		if !s.requireScope(w, p, storageReadScope(kind)) {
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"buckets": s.store.StorageBuckets(kind)})
+		// "buckets" stays the registered records so existing callers are
+		// unchanged. "inventory" is every bucket that exists, registered or
+		// not, with what it holds, because a bucket a plugin wrote into
+		// without registering it was invisible and made a full store read as
+		// empty. Reserved buckets are named but not offered: the operator
+		// should know the space is taken, and still be refused the contents.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"buckets":   s.store.StorageBuckets(kind),
+			"inventory": s.storageBucketInventory(kind),
+		})
 	case http.MethodPost:
 		if !s.requireScope(w, p, storageAdminScope(kind)) {
 			return

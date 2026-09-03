@@ -302,6 +302,10 @@ func (s *Server) handleRevokeStorageToken(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusNotFound, errors.New("storage token not found"))
 		return
 	}
+	// Purge rather than waiting the TTL out. A revoke is a deliberate act, so
+	// "stops working now" is the guarantee to give; expiry is the fallback for
+	// a replica or a path that never sees this call.
+	s.storageVerify.purgeToken(req.TokenID)
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "storage.token.revoke", Scope: storageAdminScope(kind), Metadata: map[string]string{"kind": kind, "token_id": req.TokenID}})
 	writeJSON(w, http.StatusOK, toStorageTokenView(token))
 }
@@ -646,6 +650,10 @@ func (s *Server) authorizeStorageToken(w http.ResponseWriter, r *http.Request, k
 		writeError(w, http.StatusUnauthorized, errors.New("missing or invalid storage token"))
 		return false
 	}
+	// Read fresh on every request, cache hit or not. Revocation and the kind
+	// match are in-memory checks that cost nothing, and a cache that covered
+	// them would keep authorizing a token after it was revoked, or let a hit
+	// for one kind stand in for another. Only the derivation below is cached.
 	token, found := s.store.StorageAccessToken(tokenID)
 	if !found || !token.RevokedAt.IsZero() {
 		if !spend() {
@@ -655,7 +663,38 @@ func (s *Server) authorizeStorageToken(w http.ResponseWriter, r *http.Request, k
 		writeError(w, http.StatusUnauthorized, errors.New("missing or invalid storage token"))
 		return false
 	}
-	if token.Kind != kind || !auth.VerifySecret(token.TokenHash, secret) {
+	if token.Kind != kind {
+		if !spend() {
+			return false
+		}
+		auth.DummyVerify(secret)
+		writeError(w, http.StatusUnauthorized, errors.New("missing or invalid storage token"))
+		return false
+	}
+	// The derivation, and the only part of this function that is cached.
+	//
+	// A credential proven within the TTL costs a map lookup. Simultaneous
+	// first-time requests for the same credential collapse into one derivation
+	// rather than one each, which is what keeps a burst on a public bucket from
+	// meeting the permit at all. An attacker's distinct wrong secrets each miss
+	// and each pay full price, which is the bound this preserves.
+	verified, permitted := s.storageVerify.verifyOnce(storageVerifyKey(presented), tokenID, func() (bool, bool) {
+		// The permit is taken only when a derivation is about to run, and
+		// covers the derivation alone. It bounds how many may run at once
+		// machine-wide, across every route that derives for a caller who has
+		// proved nothing yet.
+		release, allowed := s.acquireSecretVerify()
+		if !allowed {
+			return false, false
+		}
+		defer release()
+		return auth.VerifySecret(token.TokenHash, secret), true
+	})
+	if !permitted {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many storage token attempts"))
+		return false
+	}
+	if !verified {
 		// This branch had no budget at all. It is the one an attacker holding a
 		// token id reaches, and the id is not a secret: it is the left half of
 		// the credential the operator hands out, it appears in the console and

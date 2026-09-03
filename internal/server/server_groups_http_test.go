@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
@@ -54,7 +55,10 @@ func TestGroupCRUDHTTP(t *testing.T) {
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 	enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
-	setNodeMeta(t, st, "node-a", func(n *model.Node) { n.Online = true })
+	setNodeMeta(t, st, "node-a", func(n *model.Node) {
+		n.Online = true
+		n.LastSeen = time.Now().UTC()
+	})
 
 	// Create a group with one explicit member.
 	created := decodeGroup(t, doJSON(t, handler, http.MethodPost, "/api/groups",

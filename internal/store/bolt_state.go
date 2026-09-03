@@ -936,6 +936,9 @@ func (bs *BoltStateStore) UpdateMetrics(nodeID string, metrics model.Metrics, ve
 		}
 		n.Metrics = metrics
 		n.LastSeen = time.Now().UTC()
+		if !n.Online {
+			n.OnlineSince = n.LastSeen
+		}
 		n.Online = true
 		if version != "" {
 			n.AgentVersion = version

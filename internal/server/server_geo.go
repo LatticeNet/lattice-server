@@ -17,11 +17,16 @@ import (
 var countryCodePattern = regexp.MustCompile(`^[A-Z]{2}$`)
 
 type nodeGeoView struct {
-	ID           string              `json:"id"`
-	Name         string              `json:"name"`
-	Role         string              `json:"role,omitempty"`
-	Tags         []string            `json:"tags,omitempty"`
-	Online       bool                `json:"online"`
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	Role   string   `json:"role,omitempty"`
+	Tags   []string `json:"tags,omitempty"`
+	Online bool     `json:"online"`
+	// The same derived status the node view carries, so the map colours a
+	// marker by the word the nodes list prints. See node_status.go.
+	Status       string              `json:"status"`
+	StatusSince  time.Time           `json:"status_since,omitzero"`
+	StatusReason string              `json:"status_reason"`
 	Disabled     bool                `json:"disabled,omitempty"`
 	PublicIP     string              `json:"public_ip,omitempty"`
 	PublicIPv6   string              `json:"public_ipv6,omitempty"`
@@ -128,7 +133,11 @@ func (s *Server) handleNodesGeo(w http.ResponseWriter, r *http.Request, p princi
 }
 
 func (s *Server) toNodeGeoView(node model.Node) nodeGeoView {
+	st := s.nodeStatusFor(node, s.now())
 	return nodeGeoView{
+		Status:       st.Status,
+		StatusSince:  st.Since,
+		StatusReason: st.Reason,
 		ID:           node.ID,
 		Name:         node.Name,
 		Role:         node.Role,

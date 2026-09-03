@@ -154,22 +154,52 @@ func readableNodeIDs(p principal, scope string, ids []string) []string {
 	return out
 }
 
-func rollupFor(memberIDs []string, byID map[string]model.Node) (groupRollup, []string) {
+// nodeStatusIndex derives the status of each node once, keyed by id. A node
+// belongs to any number of groups and the listing rolls up every one of them,
+// so deriving per membership would repeat the store lookups behind
+// nodeDegradations for the same node several times in one response.
+func (s *Server) nodeStatusIndex(nodes []model.Node, now time.Time) map[string]nodeStatus {
+	out := make(map[string]nodeStatus, len(nodes))
+	for _, n := range nodes {
+		out[n.ID] = s.nodeStatusFor(n, now)
+	}
+	return out
+}
+
+// rollupFor counts the members of one group under the same derived status the
+// node rows in the same response carry, so the two cannot disagree.
+//
+// It used to count the raw Online bool and add Disabled on top of it, which
+// counted a node twice: a disabled node whose agent kept beating landed in
+// disabled and in online, and online+offline could exceed total-disabled. It
+// also missed the staleness clause, so a node whose beat had gone stale before
+// the liveness sweep flipped the flag was counted online while its own row
+// already said offline.
+//
+// The wire fields are unchanged, so the five statuses map onto the four counts
+// and every node is counted exactly once:
+//
+//	disabled                 -> Disabled
+//	online, degraded         -> Online, the node is in contact
+//	offline, never_reported  -> Offline, the node is not in contact
+//
+// Total is therefore always Online + Offline + Disabled.
+func rollupFor(memberIDs []string, byStatus map[string]nodeStatus) (groupRollup, []string) {
 	var r groupRollup
 	resolved := make([]string, 0, len(memberIDs))
 	for _, nid := range memberIDs {
-		n, ok := byID[nid]
+		st, ok := byStatus[nid]
 		if !ok {
 			continue // membership referencing a deleted node is skipped, not counted
 		}
 		resolved = append(resolved, nid)
 		r.Total++
-		if n.Disabled {
+		switch st.Status {
+		case NodeStatusDisabled:
 			r.Disabled++
-		}
-		if n.Online {
+		case NodeStatusOnline, NodeStatusDegraded:
 			r.Online++
-		} else {
+		default: // offline, never_reported
 			r.Offline++
 		}
 	}
@@ -196,16 +226,13 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, p principa
 				nodes = append(nodes, n)
 			}
 		}
-		byID := make(map[string]model.Node, len(nodes))
-		for _, n := range nodes {
-			byID[n.ID] = n
-		}
+		byStatus := s.nodeStatusIndex(nodes, s.now())
 		gs := s.store.Groups()
 		resolved := groups.ResolveAll(gs, nodes)
 		views := make([]groupView, 0, len(gs))
 		grouped := make(map[string]bool, len(nodes))
 		for _, g := range gs {
-			rollup, rm := rollupFor(resolved[g.ID], byID)
+			rollup, rm := rollupFor(resolved[g.ID], byStatus)
 			for _, nid := range rm {
 				grouped[nid] = true
 			}
@@ -228,7 +255,7 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, p principa
 			}
 		}
 		sort.Strings(ungroupedIDs)
-		ur, _ := rollupFor(ungroupedIDs, byID)
+		ur, _ := rollupFor(ungroupedIDs, byStatus)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"groups": views,
 			"ungrouped": map[string]any{
@@ -413,7 +440,7 @@ func (s *Server) upsertGroup(req model.Group, p principal) (groupView, error) {
 	// country or a tag, read back which nodes matched.
 	readable := readableNodes(p, "group:read", nodes)
 	resolved := groups.ResolveMembers(stored, readable)
-	rollup, rm := rollupFor(resolved, byNode)
+	rollup, rm := rollupFor(resolved, s.nodeStatusIndex(nodes, s.now()))
 	return toGroupView(p, stored, rm, rollup), nil
 }
 
@@ -592,7 +619,7 @@ func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request, p pr
 		Metadata: map[string]string{"group_id": stored.ID},
 	})
 	resolved := groups.ResolveMembers(stored, nodes)
-	rollup, rm := rollupFor(resolved, byNode)
+	rollup, rm := rollupFor(resolved, s.nodeStatusIndex(nodes, s.now()))
 	writeJSON(w, http.StatusOK, toGroupView(p, stored, rm, rollup))
 }
 

@@ -1387,6 +1387,14 @@ func (s *Store) SetNodeDisabled(nodeID string, disabled bool) (bool, error) {
 	if !ok {
 		return false, nil
 	}
+	// DisabledAt is the "since" of the disabled state: stamped on the flip to
+	// disabled, kept across repeated disables, cleared on enable.
+	switch {
+	case disabled && !n.Disabled:
+		n.DisabledAt = time.Now().UTC()
+	case !disabled:
+		n.DisabledAt = time.Time{}
+	}
 	n.Disabled = disabled
 	s.state.Nodes[nodeID] = n
 	return true, s.Save()
@@ -1442,6 +1450,11 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	previousPublicIP, previousWireGuardIP := n.PublicIP, n.WireGuardIP
 	n.Metrics = metrics
 	n.LastSeen = now
+	// The first beat of a run is the instant the node came online; later beats
+	// keep it, so the console can say how long the node has been reporting.
+	if !n.Online {
+		n.OnlineSince = now
+	}
 	n.Online = true
 	if version != "" {
 		durableChanged = durableChanged || n.AgentVersion != version

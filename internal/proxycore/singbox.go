@@ -71,6 +71,28 @@ type singBoxLog struct {
 
 type singBoxExperimental struct {
 	ClashAPI *singBoxClashAPI `json:"clash_api,omitempty"`
+	V2RayAPI *singBoxV2RayAPI `json:"v2ray_api,omitempty"`
+}
+
+// singBoxV2RayAPI is the loopback stats endpoint the usage collector reads.
+// Like the Clash API it must never bind a routable address: it reports the
+// traffic of every user on the node.
+type singBoxV2RayAPI struct {
+	Listen string            `json:"listen"`
+	Stats  singBoxV2RayStats `json:"stats"`
+}
+
+// singBoxV2RayStats is the counter allowlist, and it is not optional
+// decoration. sing-box builds its inbound, outbound and user match sets from
+// these three lists when the service starts, and returns a connection matching
+// none of them uncounted. Enabled with empty lists is a stats API that reports
+// zero for everything, which reads as "usage collection is on" while nothing
+// is measured, so the renderer always fills them from what it just rendered.
+type singBoxV2RayStats struct {
+	Enabled   bool     `json:"enabled"`
+	Inbounds  []string `json:"inbounds"`
+	Outbounds []string `json:"outbounds"`
+	Users     []string `json:"users"`
 }
 
 // singBoxClashAPI is the loopback control endpoint the trace collector reads.
@@ -99,10 +121,16 @@ var allowedSingBoxLogLevels = map[string]bool{
 }
 
 // renderLogAndExperimental builds the log block and, when the profile asks for
-// it, the Clash API block. The address must be loopback: this endpoint serves
-// live connection metadata and log lines, so binding it anywhere reachable
-// would hand that to the network.
-func renderLogAndExperimental(profile model.ProxyNodeProfile) (singBoxLog, *singBoxExperimental, error) {
+// them, the Clash API and stats API blocks. Both addresses must be loopback:
+// one serves live connection metadata and log lines, the other every user's
+// traffic totals, so binding either anywhere reachable would hand that to the
+// network.
+//
+// inbounds and outbounds are the tags this render produced and users the names
+// it wrote, which is what the stats allowlist has to name for the counters to
+// exist. Passing them in rather than deriving them later is what keeps the
+// allowlist from drifting away from the config it describes.
+func renderLogAndExperimental(profile model.ProxyNodeProfile, inbounds, outbounds, users []string) (singBoxLog, *singBoxExperimental, error) {
 	level := strings.TrimSpace(profile.LogLevel)
 	if level == "" {
 		level = defaultSingBoxLogLevel
@@ -112,17 +140,52 @@ func renderLogAndExperimental(profile model.ProxyNodeProfile) (singBoxLog, *sing
 	}
 	log := singBoxLog{Level: level, Timestamp: true}
 
-	addr := strings.TrimSpace(profile.ClashAPI)
-	if addr == "" {
+	experimental := &singBoxExperimental{}
+	if addr := strings.TrimSpace(profile.ClashAPI); addr != "" {
+		if err := validateLoopbackAddr(addr); err != nil {
+			return singBoxLog{}, nil, fmt.Errorf("clash_api: %w", err)
+		}
+		experimental.ClashAPI = &singBoxClashAPI{
+			ExternalController: addr,
+			Secret:             strings.TrimSpace(profile.ClashAPISecret),
+		}
+	}
+	if addr := strings.TrimSpace(profile.StatsAPI); addr != "" {
+		if err := validateLoopbackAddr(addr); err != nil {
+			return singBoxLog{}, nil, fmt.Errorf("stats_api: %w", err)
+		}
+		experimental.V2RayAPI = &singBoxV2RayAPI{
+			Listen: addr,
+			Stats: singBoxV2RayStats{
+				Enabled:   true,
+				Inbounds:  sortedUnique(inbounds),
+				Outbounds: sortedUnique(outbounds),
+				Users:     sortedUnique(users),
+			},
+		}
+	}
+	if experimental.ClashAPI == nil && experimental.V2RayAPI == nil {
 		return log, nil, nil
 	}
-	if err := validateLoopbackAddr(addr); err != nil {
-		return singBoxLog{}, nil, fmt.Errorf("clash_api: %w", err)
+	return log, experimental, nil
+}
+
+// sortedUnique returns the non-empty values of in, deduplicated and ordered, so
+// two renders of the same intent produce byte-identical allowlists. The result
+// is never nil: an empty JSON list is a meaningful value here, and omitting the
+// key would leave sing-box matching on nothing.
+func sortedUnique(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
 	}
-	return log, &singBoxExperimental{ClashAPI: &singBoxClashAPI{
-		ExternalController: addr,
-		Secret:             strings.TrimSpace(profile.ClashAPISecret),
-	}}, nil
+	sort.Strings(out)
+	return out
 }
 
 // validateLoopbackAddr accepts only host:port where host is a loopback literal
@@ -269,14 +332,34 @@ func RenderSingBoxConfig(profile model.ProxyNodeProfile, inbounds []model.ProxyI
 		warnings = append(warnings, skipped...)
 		rendered = append(rendered, sbInbound)
 	}
-	logBlock, experimental, err := renderLogAndExperimental(profile)
+	outbounds := []singBoxOutbound{{Type: "direct", Tag: defaultOutboundTag}}
+	// The names the stats allowlist has to carry, taken from what was just
+	// rendered rather than from the intent, so a user dropped as expired or an
+	// inbound skipped as invalid is not claimed to be counted.
+	inboundTags := make([]string, 0, len(rendered))
+	userNames := []string{}
+	for _, in := range rendered {
+		inboundTags = append(inboundTags, in.Tag)
+		for _, u := range in.Users {
+			// Only a named user can be counted individually: the allowlist
+			// matches on name, so an unnamed one stays in the inbound total.
+			if u.Name != "" {
+				userNames = append(userNames, u.Name)
+			}
+		}
+	}
+	outboundTags := make([]string, 0, len(outbounds))
+	for _, out := range outbounds {
+		outboundTags = append(outboundTags, out.Tag)
+	}
+	logBlock, experimental, err := renderLogAndExperimental(profile, inboundTags, outboundTags, userNames)
 	if err != nil {
 		return singBoxConfig{}, nil, err
 	}
 	return singBoxConfig{
 		Log:          logBlock,
 		Inbounds:     rendered,
-		Outbounds:    []singBoxOutbound{{Type: "direct", Tag: defaultOutboundTag}},
+		Outbounds:    outbounds,
 		Route:        singBoxRoute{Final: defaultOutboundTag},
 		Experimental: experimental,
 	}, warnings, nil

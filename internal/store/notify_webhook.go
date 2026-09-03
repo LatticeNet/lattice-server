@@ -40,7 +40,7 @@ type NotifyWebhook struct {
 	// position than the reversible envelope NotifyChannel.Config carries.
 	SecretHash string    `json:"secret_hash,omitempty"`
 	Enabled    bool      `json:"enabled"`
-	LastUsedAt time.Time `json:"last_used_at,omitempty"`
+	LastUsedAt time.Time `json:"last_used_at,omitzero"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }

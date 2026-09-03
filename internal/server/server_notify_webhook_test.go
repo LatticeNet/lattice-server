@@ -425,3 +425,40 @@ func TestNotifyWebhookRejectsWildcardEventType(t *testing.T) {
 		t.Fatalf("expected 400 for a wildcard event type, got %d", res.StatusCode)
 	}
 }
+
+// TestNotifyWebhookNeverCalledOmitsTimestamp pins a bug the console found: a
+// zero time.Time is not "empty" to encoding/json, so `omitempty` shipped
+// "0001-01-01T00:00:00Z" and a webhook nothing had ever called rendered as
+// having been called in year one. The tag has to be omitzero.
+func TestNotifyWebhookNeverCalledOmitsTimestamp(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	id, secret := createTestWebhook(t, handler, cookies, csrf,
+		`{"name":"Untouched","event_type":"untouched.event","title_template":"t"}`)
+
+	read := func() string {
+		t.Helper()
+		res := doJSON(t, handler, http.MethodGet, "/api/notify/webhooks", "", cookies, "")
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	if raw := read(); strings.Contains(raw, "0001-01-01") {
+		t.Fatalf("a never-called webhook must omit last_used_at, got: %s", raw)
+	} else if strings.Contains(raw, "last_used_at") {
+		t.Fatalf("last_used_at should be absent before the first call, got: %s", raw)
+	}
+
+	if res := fireWebhook(t, handler, id, secret, ""); res.StatusCode != http.StatusAccepted {
+		t.Fatalf("fire returned %d", res.StatusCode)
+	}
+	// After a real call it must be present and not the zero value.
+	raw := read()
+	if !strings.Contains(raw, "last_used_at") || strings.Contains(raw, "0001-01-01") {
+		t.Fatalf("last_used_at should carry the call time after a fire, got: %s", raw)
+	}
+}

@@ -79,8 +79,11 @@ type notifyWebhookView struct {
 	// than an absolute URL because the server does not reliably know its own
 	// external origin (it sits behind a proxy whose hostname it is never told);
 	// the console joins it to the origin the operator is already browsing.
-	Path       string    `json:"path"`
-	LastUsedAt time.Time `json:"last_used_at,omitempty"`
+	Path string `json:"path"`
+	// omitzero, not omitempty: encoding/json does not treat a zero time.Time as
+	// empty, so omitempty ships "0001-01-01T00:00:00Z" and the console renders a
+	// never-called webhook as having been called in year one.
+	LastUsedAt time.Time `json:"last_used_at,omitzero"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }

@@ -505,17 +505,16 @@ func (s *Server) authenticateInboundWebhook(w http.ResponseWriter, r *http.Reque
 	// Acquired without blocking: a caller arriving while the machine is already
 	// busy verifying is refused immediately rather than queued, because queueing
 	// here is how a flood turns into unbounded goroutines and memory.
-	select {
-	case s.webhookVerifySlots <- struct{}{}:
-		defer func() { <-s.webhookVerifySlots }()
-	default:
+	release, ok := s.acquireSecretVerify()
+	if !ok {
 		s.refuseInboundWebhook(w, r, webhookID, http.StatusTooManyRequests, "rate limited", errors.New("too many webhook attempts"))
 		return store.NotifyWebhook{}, false
 	}
+	defer release()
 
 	presented := bearerToken(r)
-	tokenID, secret, ok := auth.SplitToken(presented)
-	if !ok {
+	tokenID, secret, split := auth.SplitToken(presented)
+	if !split {
 		auth.DummyVerify(presented)
 		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "missing or malformed secret", errors.New("missing or invalid webhook secret"))
 		return store.NotifyWebhook{}, false

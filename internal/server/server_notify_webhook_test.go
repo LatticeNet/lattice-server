@@ -557,7 +557,7 @@ func TestInboundWebhookRefusalDoesNotWriteState(t *testing.T) {
 // window: at 20ms a derivation the bucket drains, at 480ms on a shared runner
 // the refill keeps pace and it never does. That is a real property of the rate
 // limiter, and it is exactly why a rate limiter is no longer what bounds the
-// CPU here (see webhookVerifySlots), but it is not something a test should
+// CPU here (see secretVerifySlots), but it is not something a test should
 // discover by racing the hardware. With no time passing there is no refill, so
 // the budget rule is what is under test.
 func TestInboundWebhookVerifyBudgetGatesDerivation(t *testing.T) {
@@ -670,12 +670,12 @@ func TestInboundWebhookVerifyConcurrencyIsBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if cap(srv.webhookVerifySlots) < 2 {
-		t.Fatalf("the semaphore must leave room for real traffic, got %d", cap(srv.webhookVerifySlots))
+	if cap(srv.secretVerifySlots) < 2 {
+		t.Fatalf("the semaphore must leave room for real traffic, got %d", cap(srv.secretVerifySlots))
 	}
 	// Occupy every permit, as a flood of concurrent callers would.
-	for i := 0; i < cap(srv.webhookVerifySlots); i++ {
-		srv.webhookVerifySlots <- struct{}{}
+	for i := 0; i < cap(srv.secretVerifySlots); i++ {
+		srv.secretVerifySlots <- struct{}{}
 	}
 	res := fireWebhook(t, handler, hook.ID, auth.FormatToken(hook.ID, secret), "")
 	code := res.StatusCode
@@ -686,7 +686,7 @@ func TestInboundWebhookVerifyConcurrencyIsBounded(t *testing.T) {
 
 	// Releasing one lets the very next caller through, so the cap throttles and
 	// does not deadlock.
-	<-srv.webhookVerifySlots
+	<-srv.secretVerifySlots
 	res = fireWebhook(t, handler, hook.ID, auth.FormatToken(hook.ID, secret), "")
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusAccepted {

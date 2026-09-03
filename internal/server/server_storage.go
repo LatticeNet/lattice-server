@@ -611,12 +611,38 @@ func toStorageTokenView(token model.StorageAccessToken) storageTokenView {
 
 func (s *Server) authorizeStorageToken(w http.ResponseWriter, r *http.Request, kind, bucket, required string) bool {
 	presented := bearerToken(r)
-	// DummyVerify below is a full PBKDF2 at production cost, spent so that a
-	// wrong token takes as long as a right one. That is worth paying, but this
-	// route reaches it without a session, so the budget has to be bounded or an
-	// anonymous caller can buy server CPU one cheap request at a time. Only the
-	// paths that are about to spend it are charged, so a caller presenting a
-	// working token never meets this limiter.
+	// Every branch below reaches a full PBKDF2 at production cost, spent so that
+	// a wrong token takes as long as a right one. This route has no session in
+	// front of it, so that cost has to be bounded twice over, because the two
+	// bounds do different jobs.
+	//
+	// The permit bounds CPU. A requests-per-second budget cannot: one derivation
+	// costs about 20ms on a fast host and around 500ms on a slow one, so any rate
+	// that is harmless on the first is a saturated core on the second. N permits
+	// is at most N cores of demand at any speed, and it is shared with every
+	// other unauthenticated derivation route so the machine-wide total holds.
+	//
+	// The limiter bounds guesses per address, which is what stops a brute force
+	// and is the one thing a concurrency cap does not do.
+	//
+	// The permit is taken on every branch, before any derivation runs, and is
+	// what actually bounds the CPU. The limiter is still charged only on
+	// failure, so a caller presenting a working token never meets it: at five
+	// attempts a minute it would otherwise throttle legitimate storage traffic
+	// within seconds.
+	//
+	// What was wrong was not the charge-on-failure rule but its coverage. The
+	// limiter was charged on the two branches that call DummyVerify and the real
+	// verification at the bottom was left with nothing at all, so a caller
+	// holding any valid token id, which is not a secret and appears in the
+	// credential the operator hands out, could spend derivations without limit by
+	// presenting a wrong secret for it.
+	release, permitted := s.acquireSecretVerify()
+	if !permitted {
+		writeError(w, http.StatusTooManyRequests, errors.New("too many storage token attempts"))
+		return false
+	}
+	defer release()
 	spend := func() bool {
 		if s.storageAuthLimiter.Allow(s.clientIP(r)) {
 			return true
@@ -624,8 +650,8 @@ func (s *Server) authorizeStorageToken(w http.ResponseWriter, r *http.Request, k
 		writeError(w, http.StatusTooManyRequests, errors.New("too many storage token attempts"))
 		return false
 	}
-	tokenID, secret, ok := auth.SplitToken(presented)
-	if !ok {
+	tokenID, secret, split := auth.SplitToken(presented)
+	if !split {
 		if !spend() {
 			return false
 		}
@@ -643,6 +669,11 @@ func (s *Server) authorizeStorageToken(w http.ResponseWriter, r *http.Request, k
 		return false
 	}
 	if token.Kind != kind || !auth.VerifySecret(token.TokenHash, secret) {
+		// Charged after the derivation rather than before, because a legitimate
+		// caller reaches this line too and must not be metered for succeeding.
+		// The permit above is what bounds the derivation itself; this bounds how
+		// many guesses one address gets.
+		spend()
 		writeError(w, http.StatusUnauthorized, errors.New("missing or invalid storage token"))
 		return false
 	}

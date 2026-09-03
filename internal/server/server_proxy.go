@@ -587,6 +587,14 @@ func (s *Server) handleAgentProxyUsage(w http.ResponseWriter, r *http.Request) {
 	if result.UnknownLines > 0 {
 		auditMeta["unknown_lines"] = strconv.Itoa(result.UnknownLines)
 	}
+	// A held report is the state that replaces a burst of unknown_line rows,
+	// and unknown_lines is the channel the original incident was found on. Held
+	// reports keep UnknownLines at zero by design, so without this a node can
+	// sit in a hold for the whole bound and signal nothing here: the fix would
+	// be invisible to the surface that detected the problem it fixes.
+	if result.InboundDeferred {
+		auditMeta["inbound_deferred"] = "true"
+	}
 	if result.ProfileRegistered {
 		auditMeta["profile_registered"] = "true"
 	}

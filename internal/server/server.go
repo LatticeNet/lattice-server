@@ -328,7 +328,15 @@ type Server struct {
 	// node so automatic inventory reports do not append an audit row, and
 	// therefore rewrite the encrypted JSON store, on every agent poll.
 	singboxDiscoverAuditMu sync.Mutex
-	singboxDiscoverAudit   map[string]singBoxDiscoveryAuditState
+
+	// Same rate gate as sing-box discovery, for usage reports. Every node
+	// posts usage every ten seconds; auditing each one wrote roughly 285,000
+	// events a day across the fleet, which pushed every audit query past its
+	// scan cap and left less than a day of history reachable. A heartbeat is
+	// not an event.
+	proxyUsageAuditMu    sync.Mutex
+	proxyUsageAudit      map[string]proxyUsageAuditState
+	singboxDiscoverAudit map[string]singBoxDiscoveryAuditState
 	// guardRealityAudit does the same for netguard reality reports, which
 	// arrive on the same kind of unattended poll and had the same effect.
 	guardRealityAuditMu sync.Mutex

@@ -118,6 +118,16 @@ func (s *Server) shouldAuditSingBoxDiscovery(nodeID string, inv model.SingBoxInv
 func singBoxDiscoveryFingerprint(inv model.SingBoxInventory) string {
 	inv.NodeID = ""
 	inv.At = time.Time{}
+	// Runtime.ProbedAt moves on every probe, so leaving it in the hash made
+	// every report look new and this whole gate a no-op: 25 nodes reporting
+	// every ten seconds wrote 217,000 audit events a day, two thirds of the
+	// log. Copy before clearing, since Runtime is a pointer into the caller's
+	// inventory. ProbeError stays: it is a state, not a clock.
+	if inv.Runtime != nil {
+		runtime := *inv.Runtime
+		runtime.ProbedAt = time.Time{}
+		inv.Runtime = &runtime
+	}
 	inv.Nodes = append([]model.SingBoxNode(nil), inv.Nodes...)
 	sort.Slice(inv.Nodes, func(i, j int) bool {
 		a, b := inv.Nodes[i], inv.Nodes[j]

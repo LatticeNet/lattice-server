@@ -168,10 +168,13 @@ type proxyUsageApplyResult struct {
 	AlertsFired       int    `json:"alerts_fired"`
 	CollectorSource   string `json:"collector_source,omitempty"`
 	CollectorStatus   string `json:"collector_status,omitempty"`
-	// InboundDeferred says the report was held rather than recorded because
-	// the node's line read model was empty. Nothing was consumed: the stored
-	// baseline is unchanged and the next report covers the gap.
-	InboundDeferred bool `json:"inbound_deferred,omitempty"`
+	// InboundDeferred says at least one inbound counter was held rather than
+	// recorded, because the read model has no line for it right now and the
+	// stored day rows say it had one before. Nothing was consumed for those
+	// tags: their stored baseline is unchanged and the next report covers the
+	// gap. InboundHeldTags names them, sorted.
+	InboundDeferred bool     `json:"inbound_deferred,omitempty"`
+	InboundHeldTags []string `json:"inbound_held_tags,omitempty"`
 }
 
 // usageColdTopologyDeferMax bounds how long a node's usage may be held back
@@ -1508,43 +1511,139 @@ func sanitizeProxyUsageCollectorError(value string) string {
 	return truncateMetadataValue(value, 512)
 }
 
-// deferUsageForColdTopology reports whether this snapshot's inbound counters
-// should be held rather than recorded. It fires only when every condition for
-// silent, permanent loss holds at once: there is a baseline to diff against,
-// the core did not restart, the report carries inbound counters, the node has
-// no lines at all in the read model, and this process has not already been
-// holding that node for longer than the bound.
+// usageHoldKey addresses one node's hold window for one inbound tag. Holding is
+// tracked per tag rather than per node because the two reasons a tag stops
+// resolving expire differently: a line the mirror dropped comes back on its own,
+// while a line that was genuinely deleted never does. A shared window would let
+// the second exhaust the budget of the first.
+func usageHoldKey(nodeID, tag string) string { return nodeID + "\x00" + tag }
+
+// usageAttributedTagsForNode returns the inbound tags this node has previously
+// had attributed to a line, read from the stored day rows.
 //
-// The bound is measured from when holding started, not from the stored
-// baseline's age. A held report still advances everything except the inbound
-// family, so the baseline's own timestamp refreshes on every report and a node
-// that keeps reporting would extend the window forever.
+// This is the discriminator that separates a line the read model has lost from
+// a tag that never named one. Ingestion records the line it resolved into
+// UsageDayLine.LineHashID, so a tag carrying one is a line the server has
+// attributed before and can attribute again once discovery catches up. A tag
+// that has never carried one is a ghost: no amount of waiting resolves it, and
+// holding it would stall its bytes for the whole bound and then record them
+// anyway.
 //
-// Only the inbound family is held. Named counters are proof on their own and
-// are already attributed while discovery is stale, which is a decision this
-// must not undo.
+// Two days rather than one, so a report arriving just after midnight still sees
+// yesterday's evidence.
+func (s *Server) usageAttributedTagsForNode(nodeID string, now time.Time) map[string]bool {
+	from := store.UsageDay(now.AddDate(0, 0, -1))
+	rows, err := s.store.UsageDayNodeRows(nodeID, from, store.UsageDay(now))
+	if err != nil {
+		s.logger.Printf("usage: read day rows for %s: %v", nodeID, err)
+		return nil
+	}
+	out := map[string]bool{}
+	for _, row := range rows {
+		for tag, line := range row.Lines {
+			if line.LineHashID != "" {
+				out[tag] = true
+			}
+		}
+	}
+	return out
+}
+
+// holdUnresolvableInboundTags carries the previous report's value for every
+// inbound counter that cannot be attributed right now but has been attributed
+// before, and reports how many it held.
 //
-// A first report is never held. Nothing is consumed without a baseline, so the
-// honest move is to establish one; deferring instead would leave the next
-// report diffing against nothing and counting the core's whole lifetime.
+// A counter that lands with no line to attribute it to becomes an unknown_line
+// row carrying no identity. No UsageDayUser row is written for it, the
+// cumulative delta is consumed anyway, and quota reads exactly the rows that
+// were never written, so that traffic is missing from quota permanently while
+// the per-line view re-derives the full number as soon as discovery returns.
+// Because the counters are cumulative, holding one costs nothing: the next
+// report that lands with the line back produces one delta covering the gap.
 //
-// A restart is never held either. With the uptime gone backwards the current
-// value IS the delta, and the core's own counters have already lost everything
-// before the restart. Holding would store a pre-restart baseline against which
-// the next report's smaller cumulative value diffs to nothing, losing the
-// post-restart traffic as well.
-func (s *Server) deferUsageForColdTopology(ctx *usageAttributionContext, snapshot, previous model.ProxyUsageSnapshot, hadPrevious, reset bool, now time.Time) bool {
+// Held per tag, not per node. An earlier version held only when the node had no
+// lines at all, on the reasoning that a single missing tag is a genuine unknown
+// tag. That is true of a tag with no history and false of one with history, and
+// the difference is decidable from the stored day rows rather than guessable
+// from the shape of the report. A node whose mirror drops one line of thirteen
+// still loses that line's traffic permanently, which is the same defect wearing
+// a smaller hat, and it was reproduced rather than argued.
+//
+// Never on a first report, because nothing is consumed without a baseline and
+// holding would leave the next report diffing against nothing. Never after a
+// core restart, because the current value IS the delta and holding would store
+// a pre-restart baseline the next report diffs to nothing.
+func (s *Server) holdUnresolvableInboundTags(ctx *usageAttributionContext, snapshot *model.ProxyUsageSnapshot, previous model.ProxyUsageSnapshot, hadPrevious, reset bool, now time.Time) []string {
 	if !hadPrevious || reset || len(snapshot.InboundTraffic) == 0 {
-		return false
+		s.clearUsageHolds(snapshot.NodeID, snapshot.InboundTraffic)
+		return nil
 	}
-	if len(ctx.byNodeTag[snapshot.NodeID]) > 0 {
-		return false
+	lines := ctx.byNodeTag[snapshot.NodeID]
+	// Two independent reasons to believe a tag names a real line the read model
+	// has merely lost, and either is enough.
+	//
+	// The node having no lines at all is the whole-node signature: a mirror that
+	// went cold cannot speak for any tag, so nothing this node reports can be
+	// called a ghost on its evidence. That is the case an eviction produces.
+	//
+	// Otherwise the tag has to prove itself, and the stored day rows are where
+	// it does: ingestion records the line it resolved into UsageDayLine, so a
+	// tag carrying one has been attributed before and will be again once the
+	// line is back. A tag on a node whose other lines resolve, with no such
+	// history, is a ghost. Waiting cannot resolve it and holding would stall its
+	// bytes for the whole bound before recording them anyway.
+	nodeIsBlind := len(lines) == 0
+	var attributedBefore map[string]bool
+	var held []string
+	for tag := range snapshot.InboundTraffic {
+		if lines[tag] != nil {
+			delete(s.usageInboundHeldSince, usageHoldKey(snapshot.NodeID, tag))
+			continue
+		}
+		if !nodeIsBlind {
+			if attributedBefore == nil {
+				attributedBefore = s.usageAttributedTagsForNode(snapshot.NodeID, now)
+			}
+			if !attributedBefore[tag] {
+				continue
+			}
+		}
+		key := usageHoldKey(snapshot.NodeID, tag)
+		since, ok := s.usageInboundHeldSince[key]
+		if ok && now.Sub(since) > usageColdTopologyDeferMax {
+			continue // held long enough; record it the way it would be today
+		}
+		if !ok {
+			if s.usageInboundHeldSince == nil {
+				s.usageInboundHeldSince = map[string]time.Time{}
+			}
+			s.usageInboundHeldSince[key] = now
+		}
+		held = append(held, tag)
 	}
-	held, ok := s.usageInboundHeldSince[snapshot.NodeID]
-	if !ok {
-		return true
+	if len(held) == 0 {
+		return nil
 	}
-	return now.Sub(held) <= usageColdTopologyDeferMax
+	sort.Strings(held)
+	// Carry the previous value forward so the counter diffs to zero. A tag with
+	// no previous value is dropped instead, which is the same thing: nothing to
+	// diff against means nothing is consumed.
+	for _, tag := range held {
+		if prior, ok := previous.InboundTraffic[tag]; ok {
+			snapshot.InboundTraffic[tag] = prior
+			continue
+		}
+		delete(snapshot.InboundTraffic, tag)
+	}
+	return held
+}
+
+// clearUsageHolds forgets the hold windows for tags this report carries, so a
+// node that recovers starts from a fresh budget rather than an exhausted one.
+func (s *Server) clearUsageHolds(nodeID string, tags map[string]model.ProxyTrafficCounter) {
+	for tag := range tags {
+		delete(s.usageInboundHeldSince, usageHoldKey(nodeID, tag))
+	}
 }
 
 func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (proxyUsageApplyResult, error) {
@@ -1699,25 +1798,11 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 	// The trigger is deliberately the whole node having no lines, not a single
 	// tag missing one. A tag with no line while the node's other lines resolve
 	// is a genuine unknown tag and must still be recorded as one.
-	if s.deferUsageForColdTopology(attribution, snapshot, previous, hadPrevious, reset, now) {
-		// Hold the inbound family by carrying the previous report's values into
-		// the stored baseline. Every counter then diffs to zero, so no row is
-		// written and nothing is consumed, and the next report that lands with a
-		// warm read model produces one delta covering the whole gap. Named
-		// counters below are untouched and keep being attributed.
+	if held := s.holdUnresolvableInboundTags(attribution, &snapshot, previous, hadPrevious, reset, now); len(held) > 0 {
 		result.InboundDeferred = true
-		if s.usageInboundHeldSince == nil {
-			s.usageInboundHeldSince = map[string]time.Time{}
-		}
-		if _, ok := s.usageInboundHeldSince[snapshot.NodeID]; !ok {
-			s.usageInboundHeldSince[snapshot.NodeID] = now
-		}
-		s.logger.Printf("usage: node %s reported %d inbound counters while its line read model is empty; holding them so the delta is not consumed (baseline %s old)",
-			snapshot.NodeID, len(snapshot.InboundTraffic), now.Sub(previous.At).Truncate(time.Second))
-		snapshot.InboundTraffic = previous.InboundTraffic
-	} else {
-		// Recorded, so the next hold on this node starts a fresh window.
-		delete(s.usageInboundHeldSince, snapshot.NodeID)
+		result.InboundHeldTags = held
+		s.logger.Printf("usage: node %s reported %d inbound counters this server cannot attribute but has attributed before (%s); holding them so the delta is not consumed",
+			snapshot.NodeID, len(held), strings.Join(held, ", "))
 	}
 	// Per-user deltas from the legacy total path. A counter that decreased
 	// without an uptime reset is a new baseline for that user and advances

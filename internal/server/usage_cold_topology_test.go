@@ -298,48 +298,56 @@ func TestUsageColdTopologyDoesNotDeferAGenuineUnknownTag(t *testing.T) {
 	}
 }
 
-// The first-report guard, stated directly. It cannot be reached through the
-// apply path, because a node with no baseline also has a zero-valued previous
-// whose age is past any bound, so the bound masks it. That accident is exactly
-// why the guard is worth pinning on its own: the two conditions must each hold
-// alone, or a later change to the bound silently changes what happens to a
-// node's very first report.
-func TestDeferUsageForColdTopologyGuards(t *testing.T) {
+// The guards, stated directly on the predicate rather than through the apply
+// path, because two of them cannot be reached from it: a node with no baseline
+// also has a zero-valued previous, and a restart needs a snapshot pair the
+// fixture would have to fake anyway. Each must hold alone.
+func TestHoldUnresolvableInboundTagsGuards(t *testing.T) {
 	f := newColdTopologyFixture(t)
+	f.report(t, 100, 0, 0)
+	f.advance(time.Minute)
+	f.report(t, 200, 100, 100) // gives direct-a a stored line hash to look up
 	f.goCold(t)
 	ctx := f.srv.usageAttributionContext()
-	snapshot := model.ProxyUsageSnapshot{NodeID: "node-a",
-		InboundTraffic: map[string]model.ProxyTrafficCounter{"direct-a": counter(5, 5)}}
-	recent := model.ProxyUsageSnapshot{NodeID: "node-a", At: f.now.Add(-time.Minute)}
+	recent := model.ProxyUsageSnapshot{NodeID: "node-a", At: f.now.Add(-time.Minute),
+		InboundTraffic: map[string]model.ProxyTrafficCounter{"direct-a": counter(100, 100)}}
+	fresh := func() model.ProxyUsageSnapshot {
+		return model.ProxyUsageSnapshot{NodeID: "node-a",
+			InboundTraffic: map[string]model.ProxyTrafficCounter{"direct-a": counter(500, 500)}}
+	}
+	hold := func(snap model.ProxyUsageSnapshot, hadPrevious, reset bool) []string {
+		f.srv.usageInboundHeldSince = nil
+		return f.srv.holdUnresolvableInboundTags(ctx, &snap, recent, hadPrevious, reset, *f.now)
+	}
 
-	if !f.srv.deferUsageForColdTopology(ctx, snapshot, recent, true, false, *f.now) {
-		t.Fatal("a report with a recent baseline and no topology should be held")
+	if got := hold(fresh(), true, false); len(got) != 1 || got[0] != "direct-a" {
+		t.Fatalf("a tag with a stored line hash and no live line should be held: %v", got)
 	}
-	if f.srv.deferUsageForColdTopology(ctx, snapshot, recent, false, false, *f.now) {
-		t.Fatal("a first report was held: with no baseline nothing is consumed, so " +
-			"establishing one is right and holding would leave the next report " +
-			"diffing against nothing")
+	if got := hold(fresh(), false, false); len(got) != 0 {
+		t.Fatalf("a first report was held: with no baseline nothing is consumed, so establishing one "+
+			"is right and holding would leave the next report diffing against nothing: %v", got)
 	}
-	empty := model.ProxyUsageSnapshot{NodeID: "node-a"}
-	if f.srv.deferUsageForColdTopology(ctx, empty, recent, true, false, *f.now) {
-		t.Fatal("a report carrying no inbound counters was held; there is nothing to lose")
+	if got := hold(fresh(), true, true); len(got) != 0 {
+		t.Fatalf("a report after a core restart was held: the current value is the delta, and holding "+
+			"stores a pre-restart baseline the next report diffs to nothing: %v", got)
 	}
-	if f.srv.deferUsageForColdTopology(ctx, snapshot, recent, true, true, *f.now) {
-		t.Fatal("a report after a core restart was held: the current value is the delta, " +
-			"and holding it stores a pre-restart baseline the next report diffs to nothing")
+	if got := hold(model.ProxyUsageSnapshot{NodeID: "node-a"}, true, false); len(got) != 0 {
+		t.Fatalf("a report carrying no inbound counters was held; there is nothing to lose: %v", got)
 	}
-	// The bound reads the hold's own start, not the baseline's age. A stale
-	// baseline on a node that has never been held is still holdable: that is
-	// exactly a node coming back after a long quiet period.
-	stale := model.ProxyUsageSnapshot{NodeID: "node-a", At: f.now.Add(-24 * time.Hour)}
-	if !f.srv.deferUsageForColdTopology(ctx, snapshot, stale, true, false, *f.now) {
-		t.Fatal("a node that has not been held was refused on baseline age alone")
-	}
+
+	// Past the bound the tag is recorded the way it would be today.
+	snap := fresh()
 	f.srv.usageInboundHeldSince = map[string]time.Time{
-		"node-a": f.now.Add(-usageColdTopologyDeferMax - time.Second),
+		usageHoldKey("node-a", "direct-a"): f.now.Add(-usageColdTopologyDeferMax - time.Second),
 	}
-	if f.srv.deferUsageForColdTopology(ctx, snapshot, recent, true, false, *f.now) {
-		t.Fatal("a node held for longer than the bound was held again")
+	if got := f.srv.holdUnresolvableInboundTags(ctx, &snap, recent, true, false, *f.now); len(got) != 0 {
+		t.Fatalf("a tag held for longer than the bound was held again: %v", got)
+	}
+	// And one node-and-tag exhausting its window does not spend another's.
+	snap = model.ProxyUsageSnapshot{NodeID: "node-a",
+		InboundTraffic: map[string]model.ProxyTrafficCounter{"direct-a": counter(500, 500), "cred-a": counter(9, 9)}}
+	if got := f.srv.holdUnresolvableInboundTags(ctx, &snap, recent, true, false, *f.now); len(got) != 1 || got[0] != "cred-a" {
+		t.Fatalf("an exhausted window on one tag spent another tag's: %v", got)
 	}
 	f.srv.usageInboundHeldSince = nil
 }
@@ -416,5 +424,112 @@ func TestUsageColdTopologyHoldsOnlyTheInboundFamily(t *testing.T) {
 	}
 	if got := baseline.InboundTraffic["hub-a"]; got != counter(10, 10) {
 		t.Fatalf("inbound baseline = %+v, want the pre-gap 10/10", got)
+	}
+}
+
+// The case PR 96 left open, reproduced by review rather than argued: a node
+// whose mirror drops ONE line of several. The node still has lines, so the
+// whole-node signature does not fire, and before this the missing line's
+// traffic was consumed into the baseline as an unknown_line row exactly like
+// pre-fix behaviour. Permanent loss for that line, on a node that looks healthy.
+func TestUsageHoldsOneMissingLineWhileTheRestOfTheNodeReports(t *testing.T) {
+	f := newColdTopologyFixture(t)
+	report := func(uptime uint64, direct, cred int64) proxyUsageApplyResult {
+		t.Helper()
+		return mustApplyUsage(t, f.srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: uptime,
+			InboundTraffic: map[string]model.ProxyTrafficCounter{
+				"direct-a": counter(direct, direct), "cred-a": counter(cred, cred),
+			}})
+	}
+	report(100, 0, 0)
+	f.advance(time.Minute)
+	f.goWarm(t)
+	report(200, 50, 50) // both lines attributed once, so both have a stored hash
+	if got := f.bobBytes(t); got != 100 {
+		t.Fatalf("bob after the healthy delta = %d, want 100", got)
+	}
+
+	// One line vanishes from a single round's discovery snapshot. The node is
+	// otherwise healthy and cred-a keeps resolving.
+	f.advance(time.Minute)
+	f.srv.singboxInvMu.Lock()
+	inv := f.saved["node-a"]
+	inv.At = *f.now
+	kept := make([]model.SingBoxNode, 0, len(inv.Nodes))
+	for _, n := range inv.Nodes {
+		if n.Name != "direct-a" {
+			kept = append(kept, n)
+		}
+	}
+	inv.Nodes = kept
+	f.srv.singboxInv = map[string]model.SingBoxInventory{"node-a": inv}
+	f.srv.singboxInvMu.Unlock()
+	f.srv.invalidateLineReadModel()
+	ctx := f.srv.usageAttributionContext()
+	if len(ctx.byNodeTag["node-a"]) == 0 || ctx.byNodeTag["node-a"]["direct-a"] != nil {
+		t.Fatal("fixture: the node must still have lines, with direct-a the one missing")
+	}
+
+	before, _ := f.srv.store.ProxyUsageSnapshot("node-a")
+	res := report(300, 400, 400)
+	if !res.InboundDeferred || len(res.InboundHeldTags) != 1 || res.InboundHeldTags[0] != "direct-a" {
+		t.Fatalf("only the missing line should be held: %+v", res)
+	}
+	if res.UnknownLines != 0 {
+		t.Fatalf("the held tag was also recorded as unknown: %+v", res)
+	}
+	after, _ := f.srv.store.ProxyUsageSnapshot("node-a")
+	if after.InboundTraffic["direct-a"] != before.InboundTraffic["direct-a"] {
+		t.Fatalf("the missing line's baseline advanced: %+v want %+v",
+			after.InboundTraffic["direct-a"], before.InboundTraffic["direct-a"])
+	}
+	// The line that never went away is recorded as normal. Holding one tag must
+	// not stall the rest of the node.
+	if after.InboundTraffic["cred-a"] != counter(400, 400) {
+		t.Fatalf("the healthy line was held too: %+v", after.InboundTraffic["cred-a"])
+	}
+
+	// The line comes back and its whole gap arrives in one delta, attributed.
+	f.advance(time.Minute)
+	f.goWarm(t)
+	res = report(400, 400, 400)
+	if res.InboundDeferred {
+		t.Fatalf("still holding after the line came back: %+v", res)
+	}
+	if got := f.bobBytes(t); got != 800 {
+		t.Fatalf("bob after recovery = %d, want 800: the node counted 400 each way on that line, "+
+			"and quota must see what the node counted rather than what survived the gap", got)
+	}
+}
+
+// A tag with no line on a node whose other lines resolve, and no record of ever
+// having had one, is a ghost. Holding it would stall its bytes for the whole
+// bound and then record them anyway, and no rediscovery can change the answer.
+func TestUsageDoesNotHoldATagThatNeverNamedALine(t *testing.T) {
+	f := newColdTopologyFixture(t)
+	f.report(t, 100, 0, 0)
+	f.advance(time.Minute)
+	f.goWarm(t)
+	res := mustApplyUsage(t, f.srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 200,
+		InboundTraffic: map[string]model.ProxyTrafficCounter{
+			"direct-a": counter(100, 100), "ghost": counter(7, 7),
+		}})
+	if res.InboundDeferred {
+		t.Fatalf("a ghost tag was held: %+v", res)
+	}
+	if res.UnknownLines != 1 {
+		t.Fatalf("unknown lines = %d, want 1 for the ghost tag", res.UnknownLines)
+	}
+	// Its bytes are recorded, which is the whole point of not holding it.
+	day := store.UsageDay(*f.now)
+	rows, _ := f.srv.store.UsageDayNodeRows("node-a", day, day)
+	found := false
+	for _, row := range rows {
+		if line, ok := row.Lines["ghost"]; ok && line.Uplink == 7 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the ghost tag's bytes were neither held nor recorded")
 	}
 }

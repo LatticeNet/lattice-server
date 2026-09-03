@@ -357,6 +357,22 @@ func (s *Server) loadUsageWindow(w usageWindow, nodeIDs []string) usageWindow {
 	return w
 }
 
+// usageDayLineAttributed reports whether ingestion resolved this stored day row
+// to a line. It is one question with two callers who ask it for different
+// reasons, so it is one predicate rather than two that agree by coincidence:
+// sumWindow carries the hash forward so the read path can re-resolve a line the
+// live index has lost, and holdUnresolvableInboundTags reads it as proof that a
+// tag naming no line right now has named one before and will again.
+//
+// Those two uses are not interchangeable. The read path needs the hash to still
+// resolve in the current read model; the hold needs only that a hash was ever
+// recorded, because during a cold window nothing resolves and requiring it to
+// would defeat the hold. What they share is the evidence and the test on it,
+// which is what this keeps in one place.
+func usageDayLineAttributed(line store.UsageDayLine) bool {
+	return line.LineHashID != ""
+}
+
 // usageWindowLine is one line's summed traffic over a window.
 type usageWindowLine struct {
 	NodeID, Tag, LineHashID string
@@ -383,7 +399,7 @@ func (w usageWindow) sumWindow(from, to string) map[string]map[string]*usageWind
 					wl = &usageWindowLine{NodeID: nodeID, Tag: tag, Users: map[string]usageCounter{}}
 					out[nodeID][tag] = wl
 				}
-				if line.LineHashID != "" {
+				if usageDayLineAttributed(line) {
 					wl.LineHashID = line.LineHashID
 				}
 				wl.Inbound.add(usageCounter{Uplink: line.Uplink, Downlink: line.Downlink})

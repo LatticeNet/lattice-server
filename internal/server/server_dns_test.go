@@ -831,7 +831,7 @@ func TestDNSApplyResultUpdatesDeploymentStatus(t *testing.T) {
 // hardcoded to tcp/22 would pass this plan and lock the node out for good.
 func TestDNSPlanBlocksLockoutRiskFromReportedReality(t *testing.T) {
 	_, handler, st := newDNSServer(t)
-	seedDNSNodeReality(t, st, "n1", 2222)
+	seedNodeShellReality(t, st, "n1", 2222)
 	cookies, csrf := loginSession(t, handler)
 	created := createDNSDeployment(t, handler, cookies, csrf)
 
@@ -876,7 +876,7 @@ func TestDNSPlanBlocksLockoutRiskFromReportedReality(t *testing.T) {
 // decision is attributable afterwards.
 func TestDNSPlanLockoutRiskOverrideIsAudited(t *testing.T) {
 	_, handler, st := newDNSServer(t)
-	seedDNSNodeReality(t, st, "n1", 2222)
+	seedNodeShellReality(t, st, "n1", 2222)
 	cookies, csrf := loginSession(t, handler)
 	created := createDNSDeployment(t, handler, cookies, csrf)
 
@@ -905,13 +905,20 @@ func TestDNSPlanLockoutRiskOverrideIsAudited(t *testing.T) {
 	}
 }
 
-// seedDNSNodeReality gives a node a reported firewall reality whose only shell
-// daemon listens on shellPort, so the lockout lint has evidence instead of the
-// tcp/22 fallback.
-func seedDNSNodeReality(t *testing.T, st *store.Store, nodeID string, shellPort int) {
+// seedNodeShellReality gives a node a reported firewall reality whose only
+// shell daemon listens on shellPort, so the lockout lint has evidence instead
+// of the tcp/22 fallback. Shared with the raw nft plan tests: the lint reads
+// the same node-scoped reality whatever endpoint composed the plan.
+func seedNodeShellReality(t *testing.T, st *store.Store, nodeID string, shellPort int) {
 	t.Helper()
 	now := time.Now().UTC()
-	if _, _, err := st.UpsertGuardRealitySnapshot("", store.GuardRealitySnapshot{
+	// The store binds a reality snapshot to the node's enrolment identity, so
+	// the seed reads it rather than assuming the node has none.
+	node, ok := st.Node(nodeID)
+	if !ok {
+		t.Fatalf("seed reality: missing node %s", nodeID)
+	}
+	if _, _, err := st.UpsertGuardRealitySnapshot(node.LatticeIdentityUUID, store.GuardRealitySnapshot{
 		Reality: model.GuardNodeReality{
 			NodeID: nodeID,
 			Listeners: []model.GuardListener{

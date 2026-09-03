@@ -9,7 +9,28 @@ import (
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/netguard"
 )
+
+// nftPlanResponse is the shape /api/network/nft/plan returns since the lockout
+// lint was wired in: the approval plus the lint findings the operator has to
+// read before approving a default-drop ruleset.
+type nftPlanResponse struct {
+	Approval model.Approval     `json:"approval"`
+	Findings []netguard.Finding `json:"findings"`
+}
+
+// decodeNFTPlan unwraps a successful plan response. Tests that are not about
+// lockout still have to pass the lint, so they either keep the node's
+// management port in the plan or send accept_lockout_risk.
+func decodeNFTPlan(t *testing.T, res *http.Response) model.Approval {
+	t.Helper()
+	var out nftPlanResponse
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out.Approval
+}
 
 func enrollNamedNode(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf, nodeID, name string) {
 	t.Helper()
@@ -65,15 +86,15 @@ func TestNFTInputsPersistAndPlanFromStoredState(t *testing.T) {
 		t.Fatalf("bad stored inputs: %+v", stored)
 	}
 
+	// No accept_lockout_risk here on purpose: the stored inputs above list
+	// tcp/22 in wireguard_tcp, so the composed chain still has a path to the
+	// shell and this plan clears the lockout lint on its own merits.
 	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
 		t.Fatalf("plan from stored inputs failed: %d", plan.StatusCode)
 	}
-	var approval model.Approval
-	if err := json.NewDecoder(plan.Body).Decode(&approval); err != nil {
-		t.Fatal(err)
-	}
+	approval := decodeNFTPlan(t, plan)
 	for _, want := range []string{
 		`destroy table inet lattice_guard`,
 		`iifname "ens3" tcp dport { 80, 443 }`,
@@ -120,15 +141,17 @@ func TestNFTPlanComposesIngressNetPolicyIntoGuard(t *testing.T) {
 		t.Fatalf("create ingress policy failed: %d", policy.StatusCode)
 	}
 
-	planRes := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	// The stored inputs above open tcp/1234 to the wireguard peers and nothing
+	// else, so this really is a plan that would cut the node's shell. The test
+	// is about ingress composition, not about lockout, so it accepts the risk
+	// explicitly rather than pretending the plan is safe.
+	planRes := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
+		`{"node_id":"node-a","accept_lockout_risk":true}`, cookies, csrf)
 	defer planRes.Body.Close()
 	if planRes.StatusCode != http.StatusOK {
 		t.Fatalf("plan failed: %d", planRes.StatusCode)
 	}
-	var approval model.Approval
-	if err := json.NewDecoder(planRes.Body).Decode(&approval); err != nil {
-		t.Fatal(err)
-	}
+	approval := decodeNFTPlan(t, planRes)
 	if approval.Plugin != "nft" || !strings.Contains(approval.Plan, "table inet lattice_guard") || strings.Contains(approval.Plan, "table inet lattice_policy") {
 		t.Fatalf("bad guard approval: %+v", approval)
 	}
@@ -226,11 +249,140 @@ func TestNFTPlanRequiresNetPolicyReadWhenIngressIsComposed(t *testing.T) {
 		t.Fatalf("the refusal must report a count, never the node it protects: %s", refusedBody)
 	}
 
+	// accept_lockout_risk only on the case that has to reach 200: this node has
+	// no stored inputs, so the composed chain accepts nothing. The two refusals
+	// above deliberately omit it, which also pins the order: authorization is
+	// decided before the lint, so a caller who may not read node-b gets 403
+	// rather than a 409 that would leak that the plan compiled at all.
 	withRead := createPAT(t, handler, cookies, csrf, []string{"network:plan", "netpolicy:read"}, []string{"node-a", "node-b"})
-	allowed := doBearerJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, withRead)
+	allowed := doBearerJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a","accept_lockout_risk":true}`, withRead)
 	allowed.Body.Close()
 	if allowed.StatusCode != http.StatusOK {
 		t.Fatalf("token that may read every node the rules name should plan composed guard, got %d", allowed.StatusCode)
+	}
+}
+
+// This endpoint replaces the node's entire lattice_guard input chain, and that
+// chain is policy drop, so whatever the plan does not accept is dropped. A
+// caller-supplied ruleset that lists tcp/443 and nothing else severs the
+// operator's shell the moment it is approved, and nothing downstream notices:
+// the node-side apply verifies with an outbound control-plane selfcheck, which
+// a default-drop input ruleset still permits, so the selfcheck passes, the
+// dead-man watchdog is disarmed, and the ruleset commits permanently. The lint
+// is the only check that catches it, and the port it protects comes from the
+// node's reported reality, which is why sshd here is on 2222: a check pinned to
+// tcp/22 would wave this plan through and lock the node out for good.
+func TestNFTPlanBlocksLockoutRiskFromReportedReality(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	seedNodeShellReality(t, st, "node-a", 2222)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[443]}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("lockout-risk nft plan should be refused, got %d", res.StatusCode)
+	}
+	var out struct {
+		Error    string             `json:"error"`
+		Findings []netguard.Finding `json:"findings"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	var blocked *netguard.Finding
+	for i, f := range out.Findings {
+		if f.Code == netguard.FindingLockoutRiskSSH {
+			blocked = &out.Findings[i]
+		}
+	}
+	if blocked == nil {
+		t.Fatalf("expected a %s finding, got %+v", netguard.FindingLockoutRiskSSH, out.Findings)
+	}
+	if blocked.Severity != netguard.SeverityBlock {
+		t.Fatalf("lockout finding severity = %q want %q", blocked.Severity, netguard.SeverityBlock)
+	}
+	if !strings.Contains(blocked.Message, "tcp/2222") {
+		t.Fatalf("finding should name the reported shell port, got %q", blocked.Message)
+	}
+	// A refused plan must not leave a pending approval behind for someone to
+	// approve later.
+	for _, a := range st.Approvals() {
+		if a.Plugin == "nft" {
+			t.Fatalf("refused nft plan still created approval %+v", a)
+		}
+	}
+}
+
+// The block is an override, not a wall: an operator who knows the node is
+// reachable another way can still plan, and the override is audited so the
+// decision is attributable afterwards.
+func TestNFTPlanLockoutRiskOverrideIsAudited(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	seedNodeShellReality(t, st, "node-a", 2222)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[443],"accept_lockout_risk":true}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("accepted lockout risk should still plan, got %d", res.StatusCode)
+	}
+	var out nftPlanResponse
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Approval.ID == "" || out.Approval.Action != "apply-ruleset" {
+		t.Fatalf("expected an apply-ruleset approval, got %+v", out.Approval)
+	}
+	// The findings ride along with the approval so the reviewer reads the same
+	// risk the planner accepted.
+	if len(out.Findings) == 0 {
+		t.Fatalf("accepted plan should still report its findings")
+	}
+	if !auditMetadataSeen(st, "network.nft.lockout_risk.accepted", "approval_id", out.Approval.ID) {
+		t.Fatalf("override should be audited: %+v", st.AuditEvents())
+	}
+	if !auditMetadataSeen(st, "network.nft.plan", "lockout_risk_accepted", "true") {
+		t.Fatalf("network.nft.plan audit should record the override: %+v", st.AuditEvents())
+	}
+}
+
+// The question this path raises that the Network Guard path does not: here the
+// caller supplies the ruleset rather than deriving it from a stored baseline.
+// The lint still reads the management port from the node's reported reality,
+// never from the plan's provenance, so a request that opens the port the node
+// actually runs sshd on plans with no override at all. Without this the gate
+// would be a toll booth every raw caller learns to pay, which is worse than no
+// gate.
+func TestNFTPlanAcceptsCallerSuppliedManagementPort(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	seedNodeShellReality(t, st, "node-a", 2222)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[443,2222]}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("plan that keeps the reported shell port open should not be refused, got %d", res.StatusCode)
+	}
+	var out nftPlanResponse
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range out.Findings {
+		if f.Code == netguard.FindingLockoutRiskSSH {
+			t.Fatalf("tcp/2222 is open in this plan, lockout must not fire: %+v", f)
+		}
+		if f.Code == netguard.FindingManagementPortAssumed {
+			t.Fatalf("the node reported sshd on 2222, the port must not be assumed: %+v", f)
+		}
+	}
+	if auditMetadataSeen(st, "network.nft.plan", "lockout_risk_accepted", "true") {
+		t.Fatalf("a plan that passed the lint must not be audited as an override: %+v", st.AuditEvents())
 	}
 }
 

@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,12 +33,21 @@ type Line struct {
 	Managed            bool   `json:"managed"`                        // under Lattice config management
 	Name               string `json:"name"`
 	Tag                string `json:"tag,omitempty"`
-	Type               string `json:"type,omitempty"` // protocol
-	Transport          string `json:"transport,omitempty"`
-	Security           string `json:"security,omitempty"`
-	ListenHost         string `json:"listen_host,omitempty"`
-	ListenPort         int    `json:"listen_port,omitempty"`
-	PublicHost         string `json:"public_host,omitempty"`
+	// InboundTags is every sing-box inbound tag the node reported for the conf
+	// file this line stands for. Tag above is that file's name, which equals the
+	// inbound tag only by the helper script's convention; a hand-written file, or
+	// one holding a relay pair, carries tags of its own. Traffic counters and
+	// connection records arrive keyed by the core's real inbound tags, so these
+	// are what those joins have to run against. Empty when the node's sing-box
+	// helper predates the field, which leaves the convention in force and every
+	// existing join unchanged.
+	InboundTags []string `json:"inbound_tags,omitempty"`
+	Type        string   `json:"type,omitempty"` // protocol
+	Transport   string   `json:"transport,omitempty"`
+	Security    string   `json:"security,omitempty"`
+	ListenHost  string   `json:"listen_host,omitempty"`
+	ListenPort  int      `json:"listen_port,omitempty"`
+	PublicHost  string   `json:"public_host,omitempty"`
 	// PublicPort is where the outside actually reaches this line, when that
 	// differs from ListenPort. Declared by the node, because a mapping that
 	// lives in a provider's router cannot be read from the config here. Zero
@@ -116,6 +126,97 @@ func stableLineHandle(lineID string) string {
 
 func effectiveDiscoveredLineID(node model.SingBoxNode) string {
 	return firstNonEmpty(node.LineID, node.Metadata["line_id"])
+}
+
+// singBoxInboundTagsKey is the node-reported metadata entry carrying the sing-box
+// inbound tags a conf file actually defines, JSON-encoded so a tag holding any
+// character survives the trip. The helper script emits it from the config file
+// itself, which is the only place the real tags exist: the discovery record names
+// a line by its file name, and nothing else on the box states the difference.
+const singBoxInboundTagsKey = "inbound_tags"
+
+// maxDiscoveredInboundTags bounds what one reported line can claim. A conf file
+// holding more inbounds than this is not a line, and the cap keeps a malformed
+// or hostile report from turning the tag index into a scan.
+const maxDiscoveredInboundTags = 64
+
+// discoveredInboundTags decodes the reported inbound tags of one discovered line.
+// Anything it cannot read yields nothing, which simply leaves the line joined by
+// its file name exactly as before.
+func discoveredInboundTags(node model.SingBoxNode) []string {
+	raw := strings.TrimSpace(node.Metadata[singBoxInboundTagsKey])
+	if raw == "" {
+		return nil
+	}
+	var decoded []string
+	if json.Unmarshal([]byte(raw), &decoded) != nil || len(decoded) > maxDiscoveredInboundTags {
+		return nil
+	}
+	var out []string
+	for _, tag := range decoded {
+		if tag = strings.TrimSpace(tag); tag != "" {
+			out = appendUniqueSorted(out, tag)
+		}
+	}
+	return out
+}
+
+// nodeTagKey is one (node, inbound tag) join key. A sing-box tag is unique only
+// within one node, so the node id is half of the key everywhere.
+type nodeTagKey struct {
+	NodeID string
+	Tag    string
+}
+
+// lineInboundTagIndex maps every inbound tag the read model can vouch for to the
+// line that owns it, for one fleet-wide set of groups. Both tag-keyed joins in
+// the server (usage counters and connection records) run off this, so the rules
+// live in one place.
+//
+// A line's own tag always wins: it is the file name the rest of the read model,
+// the line hash and the sidecar are all keyed by, and a second line's reported
+// tag must never displace it. A reported tag two lines both claim resolves to
+// neither. Attribution is allowed to say it does not know; it is not allowed to
+// guess, because a wrong attribution written once is indistinguishable from a
+// right one forever after.
+func lineInboundTagIndex(groups []LineGroup) map[nodeTagKey]Line {
+	index := map[nodeTagKey]Line{}
+	own := map[nodeTagKey]bool{}
+	for _, g := range groups {
+		for _, ln := range g.Lines {
+			if tag := strings.TrimSpace(ln.Tag); tag != "" {
+				key := nodeTagKey{NodeID: ln.NodeID, Tag: tag}
+				index[key] = ln
+				own[key] = true
+			}
+		}
+	}
+	claimed := map[nodeTagKey]string{} // key -> the one line_hash_id claiming it
+	ambiguous := map[nodeTagKey]bool{}
+	for _, g := range groups {
+		for _, ln := range g.Lines {
+			for _, tag := range ln.InboundTags {
+				tag = strings.TrimSpace(tag)
+				if tag == "" {
+					continue
+				}
+				key := nodeTagKey{NodeID: ln.NodeID, Tag: tag}
+				if own[key] {
+					continue
+				}
+				if prior, seen := claimed[key]; seen && prior != ln.LineHashID {
+					ambiguous[key] = true
+					continue
+				}
+				claimed[key] = ln.LineHashID
+				index[key] = ln
+			}
+		}
+	}
+	for key := range ambiguous {
+		delete(index, key)
+	}
+	return index
 }
 
 func provesLineUUIDAuthorityHash(line Line) bool {
@@ -304,6 +405,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				Managed:            false,
 				Name:               n.Name,
 				Tag:                n.Name,
+				InboundTags:        discoveredInboundTags(n),
 				Type:               n.Protocol,
 				Transport:          n.Network,
 				ListenHost:         n.ListenHost,

@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -166,18 +167,27 @@ type Server struct {
 	// from apiLimiter because the work it protects is key derivation, not a
 	// handler, and it is sized like loginLimiter for the same reason.
 	storageAuthLimiter *ratelimit.Limiter
-	// webhookVerifyLimiter bounds the PBKDF2 derivations an anonymous caller can
-	// buy on the inbound-webhook route, which has no session in front of it. It is
+	// webhookVerifyLimiter bounds how many secret GUESSES one address may make on
+	// the inbound-webhook route, which has no session in front of it. It is
 	// checked BEFORE the derivation, unlike storageAuthLimiter, which is charged
 	// only on failure and so never gates the wrong-secret branch that runs the
 	// derivation inside its own condition.
+	//
+	// It bounds guesses, not CPU. A request-rate budget cannot bound CPU: the
+	// cost of one PBKDF2 derivation varies by more than an order of magnitude
+	// across machines, so any rate that is harmless on a fast host is a saturated
+	// core on a slow one. webhookVerifySlots is what bounds the CPU.
 	webhookVerifyLimiter *ratelimit.Limiter
-	// webhookVerifyGlobal caps total derivations across all callers. A per-address
-	// budget is defeated by rotating the address, which under TrustProxy is a
-	// header the caller writes, so the per-IP bucket alone bounds one attacker's
-	// share and not the machine's. Same reasoning as authFailAuditThrottle's
-	// shared global bucket.
-	webhookVerifyGlobal *ratelimit.Limiter
+	// webhookVerifySlots caps how many derivations may run AT ONCE, machine-wide.
+	//
+	// This is a semaphore rather than another rate limiter on purpose. CPU is
+	// consumed by concurrent work, not by arrival rate, so a concurrency cap is
+	// the only bound that holds regardless of how slow a derivation is on the
+	// host: N permits is at most N cores of demand whether a derivation takes
+	// 20ms or 500ms. It also survives the thing a per-address budget cannot,
+	// namely address rotation, which under TrustProxy is a header the caller
+	// writes.
+	webhookVerifySlots chan struct{}
 	// webhookFireLimiter bounds *authenticated* webhook fires, keyed by webhook
 	// id rather than by address. What it protects is not server CPU but the
 	// operator's attention: a looping caller with a valid secret floods a phone
@@ -487,13 +497,10 @@ func New(opts Options) (*Server, error) {
 		// Charged on every attempt rather than only on failures, so it has to clear
 		// real traffic: 120 a minute with a burst of 40. The per-webhook fire budget
 		// caps accepted traffic at 10 a minute each, so even a host driving a dozen
-		// webhooks stays under it, while one address's CPU spend stays bounded and a
-		// brute force at that rate against 256 bits of entropy is nothing.
+		// webhooks stays under it, while 120 guesses a minute against 256 bits of
+		// entropy is nothing.
 		webhookVerifyLimiter: ratelimit.New(ratelimit.Config{Rate: 2, Burst: 40}),
-		// The machine-wide ceiling: 50 derivations a second, burst 100. Far above
-		// any real inbound-webhook load and far below what it takes to saturate the
-		// cores with 210k-iteration PBKDF2.
-		webhookVerifyGlobal: ratelimit.New(ratelimit.Config{Rate: 50, Burst: 100}),
+		webhookVerifySlots:   make(chan struct{}, webhookVerifyConcurrency()),
 		// Ten fires a minute sustained, with a burst of ten to absorb a genuine
 		// cluster of events without dropping any.
 		webhookFireLimiter: ratelimit.New(ratelimit.Config{Rate: 10.0 / 60.0, Burst: 10}),
@@ -8551,6 +8558,21 @@ func (s *Server) auditAgentAuthFailure(r *http.Request, nodeID, reason string) {
 // clientIP resolves the address used as a rate-limit key. Proxy headers are
 // only honored when TrustProxy is set, preventing key spoofing in the direct
 // exposure case.
+// webhookVerifyConcurrency sizes the derivation semaphore from the machine
+// rather than from a guessed request rate.
+//
+// Half the available parallelism, floor of two: webhook authentication is
+// allowed to use some of the box under load but never all of it, so a flood
+// degrades webhook latency instead of starving the rest of the control plane.
+// Deriving it from GOMAXPROCS is what makes the bound hold on a two-core VM and
+// on a sixteen-core host without retuning a constant per deployment.
+func webhookVerifyConcurrency() int {
+	if n := runtime.GOMAXPROCS(0) / 2; n > 2 {
+		return n
+	}
+	return 2
+}
+
 func (s *Server) clientIP(r *http.Request) string {
 	if s.trustProxy {
 		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {

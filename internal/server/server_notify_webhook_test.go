@@ -7,8 +7,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/ratelimit"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -544,50 +547,150 @@ func TestInboundWebhookRefusalDoesNotWriteState(t *testing.T) {
 	}
 }
 
-// TestInboundWebhookVerifyBudgetGatesDerivation pins the fix for the other half:
-// the budget is spent before the PBKDF2 derivation, not after it, so the branch
-// where the id is real and the secret is wrong cannot buy unbounded CPU. Once
-// the budget is gone the endpoint refuses without deriving anything.
+// TestInboundWebhookVerifyBudgetGatesDerivation pins the ordering that matters:
+// the budget is spent BEFORE the PBKDF2 derivation, so the branch where the id
+// is real and the secret is wrong cannot buy unbounded CPU.
+//
+// The clock is frozen rather than left to the wall. The first version of this
+// test fired attempts in a loop until one came back 429, which made the
+// assertion depend on how many derivations fit inside the bucket's refill
+// window: at 20ms a derivation the bucket drains, at 480ms on a shared runner
+// the refill keeps pace and it never does. That is a real property of the rate
+// limiter, and it is exactly why a rate limiter is no longer what bounds the
+// CPU here (see webhookVerifySlots), but it is not something a test should
+// discover by racing the hardware. With no time passing there is no refill, so
+// the budget rule is what is under test.
 func TestInboundWebhookVerifyBudgetGatesDerivation(t *testing.T) {
-	handler, _ := newTestServer(t)
-	cookies, csrf := loginSession(t, handler)
-	id, secret := createTestWebhook(t, handler, cookies, csrf,
-		`{"name":"Budgeted","event_type":"budgeted.event","title_template":"t"}`)
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := time.Unix(0, 0)
+	const budget = 3
+	srv.webhookVerifyLimiter = ratelimit.New(ratelimit.Config{
+		Rate:  2,
+		Burst: budget,
+		Now:   func() time.Time { return frozen },
+	})
+	handler := srv.Handler()
 
-	throttled := false
-	for i := 0; i < 200; i++ {
-		res := fireWebhook(t, handler, id, id+".wrongsecretwrongsecret", "")
+	secret, err := auth.NewRandomToken(webhookSecretBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := auth.HashSecret(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := store.NotifyWebhook{
+		ID: "nwh_budget", Name: "Budget", EventType: "budget.event",
+		TitleTemplate: "t", SecretHash: hash, Enabled: true,
+	}
+	if err := st.UpsertNotifyWebhook(hook); err != nil {
+		t.Fatal(err)
+	}
+	good := auth.FormatToken(hook.ID, secret)
+
+	// Exactly the burst is allowed through, and each one really is refused on the
+	// secret rather than on the budget.
+	for i := 0; i < budget; i++ {
+		res := fireWebhook(t, handler, hook.ID, hook.ID+".wrongsecretwrongsecret", "")
 		code := res.StatusCode
 		res.Body.Close()
-		if code == http.StatusTooManyRequests {
-			throttled = true
-			break
+		if code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d should be refused on the secret, got %d", i, code)
 		}
 	}
-	if !throttled {
-		t.Fatal("wrong-secret attempts against a known id must exhaust a budget")
+	// The next one is refused on the budget instead.
+	res := fireWebhook(t, handler, hook.ID, hook.ID+".wrongsecretwrongsecret", "")
+	code := res.StatusCode
+	res.Body.Close()
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("attempt past the budget must be rate limited, got %d", code)
 	}
-	// Rotating the source address does mint a fresh per-address budget, which is
-	// the honest behaviour and the reason the global ceiling exists behind it.
-	// That ceiling is not asserted here: at 50 derivations a second it cannot be
-	// exhausted by a serial caller, because one derivation costs more than the
-	// bucket takes to refill a token. It bites on concurrent floods, which is the
-	// case a per-address budget cannot see.
-	rotated := httptest.NewRequest(http.MethodPost, "/api/hooks/"+id, strings.NewReader(""))
-	rotated.Header.Set("Authorization", "Bearer "+id+".wrongsecretwrongsecret")
-	rotated.RemoteAddr = "198.51.100.77:5555"
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, rotated)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("a fresh address gets a fresh per-address budget, got %d", rec.Code)
+
+	// The claim this test exists for. With the budget gone, even a CORRECT secret
+	// is refused, which can only be true if the budget is consulted before the
+	// derivation. If it were consulted after, this would authenticate and return
+	// 202, and an attacker who knows a webhook id could spend derivations freely.
+	res = fireWebhook(t, handler, hook.ID, good, "")
+	code = res.StatusCode
+	res.Body.Close()
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("the budget must gate the derivation, not just the status code: got %d", code)
 	}
-	// The budget is per address and covers the valid path too, so a caller that
-	// spent it is refused even with the right secret. That is the cost of gating
-	// the derivation up front, and it is bounded well above real traffic.
-	res := fireWebhook(t, handler, id, secret, "")
+
+	// Let the clock move and the same correct secret works, proving the refusal
+	// above was the budget and not a broken credential.
+	frozen = frozen.Add(10 * time.Second)
+	res = fireWebhook(t, handler, hook.ID, good, "")
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("the verify budget must gate every derivation, got %d", res.StatusCode)
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("a refilled budget must admit a correct secret, got %d", res.StatusCode)
+	}
+}
+
+// TestInboundWebhookVerifyConcurrencyIsBounded pins what actually bounds the
+// CPU: the number of derivations allowed to run at once.
+//
+// A requests-per-second ceiling cannot do this job, because the cost of one
+// derivation varies by more than an order of magnitude across machines, so the
+// same rate is a rounding error on one host and a saturated core on another. A
+// permit count is hardware-independent by construction, which is also what makes
+// it testable without racing the clock: hold every permit and the next caller is
+// refused, on any machine, at any speed.
+func TestInboundWebhookVerifyConcurrencyIsBounded(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+
+	secret, err := auth.NewRandomToken(webhookSecretBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := auth.HashSecret(secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := store.NotifyWebhook{
+		ID: "nwh_slots", Name: "Slots", EventType: "slots.event",
+		TitleTemplate: "t", SecretHash: hash, Enabled: true,
+	}
+	if err := st.UpsertNotifyWebhook(hook); err != nil {
+		t.Fatal(err)
+	}
+
+	if cap(srv.webhookVerifySlots) < 2 {
+		t.Fatalf("the semaphore must leave room for real traffic, got %d", cap(srv.webhookVerifySlots))
+	}
+	// Occupy every permit, as a flood of concurrent callers would.
+	for i := 0; i < cap(srv.webhookVerifySlots); i++ {
+		srv.webhookVerifySlots <- struct{}{}
+	}
+	res := fireWebhook(t, handler, hook.ID, auth.FormatToken(hook.ID, secret), "")
+	code := res.StatusCode
+	res.Body.Close()
+	if code != http.StatusTooManyRequests {
+		t.Fatalf("with every derivation permit held, the next caller must be refused, got %d", code)
+	}
+
+	// Releasing one lets the very next caller through, so the cap throttles and
+	// does not deadlock.
+	<-srv.webhookVerifySlots
+	res = fireWebhook(t, handler, hook.ID, auth.FormatToken(hook.ID, secret), "")
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("a freed permit must admit the next caller, got %d", res.StatusCode)
 	}
 }
 

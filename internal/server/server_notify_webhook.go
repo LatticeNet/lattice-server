@@ -405,8 +405,8 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	sourceIP := s.clientIP(r)
 
 	// Every authentication path below reaches a PBKDF2 derivation at production
-	// cost, so the budget that bounds that CPU is spent HERE, before the work,
-	// not on the way out of a failure.
+	// cost, so the budget is spent HERE, before the work, not on the way out of a
+	// failure.
 	//
 	// The storage-token pattern this otherwise follows charges only failed
 	// attempts, so a caller with a working token never meets its limiter. That
@@ -418,40 +418,14 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 	// authorizeStorageToken and is reported separately; it is not fixed here
 	// because that endpoint needs its own change and its own tests.
 	//
-	// So this limiter is checked up front and sized for real traffic instead:
-	// generous enough that no legitimate caller meets it (the per-webhook fire
-	// budget caps accepted traffic well below it), tight enough that the CPU an
-	// anonymous caller can spend is bounded.
+	// So this limiter is checked up front and sized for real traffic instead. It
+	// bounds GUESSES per address, which is what stops a brute force.
 	if !s.webhookVerifyLimiter.Allow(sourceIP) {
 		s.refuseInboundWebhook(w, r, webhookID, http.StatusTooManyRequests, "rate limited", errors.New("too many webhook attempts"))
 		return
 	}
-	// A per-address budget bounds one attacker's share, not the machine's: under
-	// TrustProxy the address is a header the caller writes, so rotating it mints a
-	// fresh bucket per request. The global ceiling is what actually caps the CPU.
-	if !s.webhookVerifyGlobal.Allow("webhook-verify") {
-		s.refuseInboundWebhook(w, r, webhookID, http.StatusTooManyRequests, "rate limited", errors.New("too many webhook attempts"))
-		return
-	}
-
-	presented := bearerToken(r)
-	tokenID, secret, ok := auth.SplitToken(presented)
+	hook, ok := s.authenticateInboundWebhook(w, r, webhookID)
 	if !ok {
-		auth.DummyVerify(presented)
-		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "missing or malformed secret", errors.New("missing or invalid webhook secret"))
-		return
-	}
-	hook, found := s.store.NotifyWebhook(webhookID)
-	// The token must name the same webhook the path does. Comparing them costs
-	// nothing and removes a class of confusion where a caller holding a valid
-	// secret for webhook A fires webhook B by editing the URL.
-	if !found || tokenID != webhookID {
-		auth.DummyVerify(secret)
-		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "unknown webhook or mismatched secret", errors.New("missing or invalid webhook secret"))
-		return
-	}
-	if !auth.VerifySecret(hook.SecretHash, secret) {
-		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "secret verification failed", errors.New("missing or invalid webhook secret"))
 		return
 	}
 
@@ -508,6 +482,58 @@ func (s *Server) handleInboundWebhook(w http.ResponseWriter, r *http.Request) {
 		"outcome":  outcome.Outcome,
 		"channels": outcome.Channels,
 	})
+}
+
+// authenticateInboundWebhook verifies the caller's secret and returns the
+// webhook it names.
+//
+// It exists as its own function so the derivation permit is held for exactly the
+// derivation. Taking it in the handler and releasing it on handler return would
+// make the semaphore cap concurrent *requests* rather than concurrent
+// verification, which on a small host would refuse legitimate fires while they
+// waited on template rendering and channel dispatch, work that costs nothing
+// like a PBKDF2 pass.
+func (s *Server) authenticateInboundWebhook(w http.ResponseWriter, r *http.Request, webhookID string) (store.NotifyWebhook, bool) {
+	// What bounds the CPU is this, and it has to be a concurrency cap rather than
+	// a second rate limit. One derivation costs about 20ms on a fast development
+	// machine and around 500ms on a shared CI runner, so any requests-per-second
+	// ceiling that is harmless on the first is a saturated core on the second: at
+	// two guesses a second, a 500ms derivation is 100% of a core from a single
+	// address, forever. Permits do not have that problem. N in flight is at most
+	// N cores of demand whatever a derivation costs, on any host.
+	//
+	// Acquired without blocking: a caller arriving while the machine is already
+	// busy verifying is refused immediately rather than queued, because queueing
+	// here is how a flood turns into unbounded goroutines and memory.
+	select {
+	case s.webhookVerifySlots <- struct{}{}:
+		defer func() { <-s.webhookVerifySlots }()
+	default:
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusTooManyRequests, "rate limited", errors.New("too many webhook attempts"))
+		return store.NotifyWebhook{}, false
+	}
+
+	presented := bearerToken(r)
+	tokenID, secret, ok := auth.SplitToken(presented)
+	if !ok {
+		auth.DummyVerify(presented)
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "missing or malformed secret", errors.New("missing or invalid webhook secret"))
+		return store.NotifyWebhook{}, false
+	}
+	hook, found := s.store.NotifyWebhook(webhookID)
+	// The token must name the same webhook the path does. Comparing them costs
+	// nothing and removes a class of confusion where a caller holding a valid
+	// secret for webhook A fires webhook B by editing the URL.
+	if !found || tokenID != webhookID {
+		auth.DummyVerify(secret)
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "unknown webhook or mismatched secret", errors.New("missing or invalid webhook secret"))
+		return store.NotifyWebhook{}, false
+	}
+	if !auth.VerifySecret(hook.SecretHash, secret) {
+		s.refuseInboundWebhook(w, r, webhookID, http.StatusUnauthorized, "secret verification failed", errors.New("missing or invalid webhook secret"))
+		return store.NotifyWebhook{}, false
+	}
+	return hook, true
 }
 
 // refuseInboundWebhook writes the error and audits the refusal, and does not

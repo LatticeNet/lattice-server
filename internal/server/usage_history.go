@@ -454,6 +454,21 @@ func (ctx *usageAttributionContext) attributeWindow(sums map[string]map[string]*
 				}
 			}
 			rows := ctx.attributeLine(nodeID, tag, f, traffic)
+			if f == nil && wl.LineHashID != "" {
+				// The tag is not unknown. Ingestion recorded which line it
+				// belonged to and the day rows still carry that hash; what is
+				// missing is live topology for the line, which is a node
+				// reachability problem and recovers on its own. Reporting it as
+				// "no line carries this tag" sends an operator hunting for a
+				// config change that never happened.
+				for i := range rows {
+					if rows[i].Attribution != usageAttributionUnknownLine {
+						continue
+					}
+					rows[i].LineHashID = wl.LineHashID
+					rows[i].AttributionReason = "this tag's line is known but the node reports no live topology"
+				}
+			}
 			for _, row := range rows {
 				if row.CountedAt != "" {
 					report.DoubleCountedViaChainsBytes += row.UsedBytes

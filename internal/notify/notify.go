@@ -60,19 +60,27 @@ func defaultClient() *http.Client { return outbound.NewClient(10 * time.Second) 
 
 // postForm/postJSON helpers share consistent timeout and status handling.
 func doRequest(ctx context.Context, client *http.Client, req *http.Request) error {
+	_, err := doRequestStatus(ctx, client, req)
+	return err
+}
+
+// doRequestStatus is doRequest that also reports the upstream status code so a
+// caller can react to a specific refusal (for example a missing endpoint).
+// The status is 0 when the request never produced a response.
+func doRequestStatus(ctx context.Context, client *http.Client, req *http.Request) (int, error) {
 	if client == nil {
 		client = defaultClient()
 	}
 	resp, err := client.Do(req.WithContext(ctx))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("notify: upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return resp.StatusCode, fmt.Errorf("notify: upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // Telegram posts via the Bot API sendMessage method.
@@ -105,12 +113,26 @@ func (t Telegram) Send(ctx context.Context, m Message) error {
 	return doRequest(ctx, t.Client, req)
 }
 
-// Bark posts to a Bark server (iOS push). URL form: <base>/<key>/<title>/<body>.
+// Bark pushes to a Bark server (iOS push). It sends the v2 JSON form,
+// POST <base>/push {device_key, title, body, level, group, url}, and falls
+// back to the legacy path form GET <base>/<key>/<title>/<body> when the
+// server answers 404 or 405 (bark-server 1.x has no /push route).
 type Bark struct {
 	BaseURL string // e.g. https://api.day.app
 	Key     string
+	Level   string // Bark interruption level; defaults to BarkDefaultLevel
+	Group   string // Bark notification group; defaults to BarkDefaultGroup
+	URL     string // optional URL opened when the notification is tapped
 	Client  *http.Client
 }
+
+const (
+	BarkDefaultLevel = "active"
+	BarkDefaultGroup = "lattice"
+)
+
+// BarkLevels lists the interruption levels bark-server accepts.
+var BarkLevels = []string{"active", "timeSensitive", "passive", "critical"}
 
 func (b Bark) Kind() string { return "bark" }
 
@@ -118,10 +140,38 @@ func (b Bark) Send(ctx context.Context, m Message) error {
 	if b.BaseURL == "" || b.Key == "" {
 		return fmt.Errorf("bark: base_url and key are required")
 	}
-	endpoint := fmt.Sprintf("%s/%s/%s/%s",
-		strings.TrimRight(b.BaseURL, "/"), b.Key,
-		url.PathEscape(orDefault(m.Title, "Lattice")), url.PathEscape(m.Body))
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	base := strings.TrimRight(b.BaseURL, "/")
+	title := orDefault(m.Title, "Lattice")
+	level := orDefault(b.Level, BarkDefaultLevel)
+	group := orDefault(b.Group, BarkDefaultGroup)
+
+	payload, _ := json.Marshal(struct {
+		DeviceKey string `json:"device_key"`
+		Title     string `json:"title"`
+		Body      string `json:"body"`
+		Level     string `json:"level"`
+		Group     string `json:"group"`
+		URL       string `json:"url,omitempty"`
+	}{b.Key, title, m.Body, level, group, b.URL})
+	req, err := http.NewRequest(http.MethodPost, base+"/push", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	status, err := doRequestStatus(ctx, b.Client, req)
+	if err == nil || (status != http.StatusNotFound && status != http.StatusMethodNotAllowed) {
+		return err
+	}
+
+	query := url.Values{}
+	query.Set("level", level)
+	query.Set("group", group)
+	if b.URL != "" {
+		query.Set("url", b.URL)
+	}
+	endpoint := fmt.Sprintf("%s/%s/%s/%s?%s", base, b.Key,
+		url.PathEscape(title), url.PathEscape(m.Body), query.Encode())
+	req, err = http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
 		return err
 	}

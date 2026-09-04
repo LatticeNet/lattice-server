@@ -21,6 +21,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -4538,7 +4539,11 @@ func buildChannel(kind string, cfg map[string]string) (notify.Channel, error) {
 		if cfg["base_url"] == "" || cfg["key"] == "" {
 			return nil, errors.New("bark requires config.base_url and config.key")
 		}
-		return notify.Bark{BaseURL: cfg["base_url"], Key: cfg["key"]}, nil
+		level := cfg["level"]
+		if level != "" && !slices.Contains(notify.BarkLevels, level) {
+			return nil, fmt.Errorf("bark config.level must be one of %s", strings.Join(notify.BarkLevels, ", "))
+		}
+		return notify.Bark{BaseURL: cfg["base_url"], Key: cfg["key"], Level: level, Group: cfg["group"], URL: cfg["url"]}, nil
 	case "discord":
 		if cfg["webhook_url"] == "" {
 			return nil, errors.New("discord requires config.webhook_url")

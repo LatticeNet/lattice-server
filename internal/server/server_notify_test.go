@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/notify"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -237,4 +238,41 @@ func boolStr(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+func TestBuildChannelBarkLevelAndGroup(t *testing.T) {
+	ch, err := buildChannel("bark", map[string]string{"base_url": "https://bark.example", "key": "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := ch.(notify.Bark); b.Level != "" || b.Group != "" {
+		t.Fatalf("level and group must stay optional (defaults applied at send), got %+v", b)
+	}
+	ch, err = buildChannel("bark", map[string]string{"base_url": "https://bark.example", "key": "k", "level": "critical", "group": "ops", "url": "https://lattice.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := ch.(notify.Bark); b.Level != "critical" || b.Group != "ops" || b.URL != "https://lattice.example" {
+		t.Fatalf("optional fields not carried into the channel: %+v", b)
+	}
+	if _, err := buildChannel("bark", map[string]string{"base_url": "https://bark.example", "key": "k", "level": "loud"}); err == nil {
+		t.Fatal("expected unknown bark level to be rejected")
+	}
+}
+
+func TestNotifyChannelBarkRejectsUnknownLevel(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodPost, "/api/notify/channels",
+		`{"name":"phone","kind":"bark","config":{"base_url":"https://bark.example","key":"k","level":"loud"}}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown bark level, got %d", res.StatusCode)
+	}
+	ok := doJSON(t, handler, http.MethodPost, "/api/notify/channels",
+		`{"name":"phone","kind":"bark","config":{"base_url":"https://bark.example","key":"k"}}`, cookies, csrf)
+	defer ok.Body.Close()
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("bark channel without level/group must still be accepted, got %d", ok.StatusCode)
+	}
 }

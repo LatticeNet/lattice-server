@@ -47,6 +47,7 @@ func TestCompileEgressRulesetRendersDeterministicPolicy(t *testing.T) {
 		"add table inet lattice_policy\ndelete table inet lattice_policy\ntable inet lattice_policy {",
 		"ct state established,related accept",
 		"oifname \"lo\" accept",
+		"meta l4proto ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, nd-redirect, echo-request, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept comment \"lattice icmpv6 neighbour discovery\"",
 		"ip daddr 203.0.113.99 tcp dport 443 accept comment \"lattice control-plane\"",
 		"udp dport 53 accept comment \"lattice dns udp\"",
 		"tcp dport 53 accept comment \"lattice dns tcp\"",
@@ -65,6 +66,11 @@ func TestCompileEgressRulesetRendersDeterministicPolicy(t *testing.T) {
 	}
 	if strings.Index(got, "lattice control-plane") > strings.Index(got, "deny-db") {
 		t.Fatalf("control-plane allow must be emitted before operator rules:\n%s", got)
+	}
+	// Outbound neighbour discovery must sit ahead of every operator rule: a
+	// deny that could shadow it would take the node off the v6 network.
+	if strings.Index(got, "lattice icmpv6 neighbour discovery") > strings.Index(got, "deny-db") {
+		t.Fatalf("icmpv6 accept must be emitted before operator rules:\n%s", got)
 	}
 }
 

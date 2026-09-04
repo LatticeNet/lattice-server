@@ -527,6 +527,98 @@ func TestNetGuardWriteValidationAndConflicts(t *testing.T) {
 	}
 }
 
+// The undo for an observe-only binding written by mistake. Mirrors the
+// zone/group delete tests: a record the node still depends on (here, one that
+// is managed) cannot be deleted out from under it.
+func TestNetGuardBindingDelete(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	enrollNamedNode(t, handler, cookies, csrf, "node-b", "Node B")
+
+	// No binding yet: 404, and nothing audited as deleted.
+	missing := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings/delete", `{"node_id":"node-a"}`, cookies, csrf)
+	defer missing.Body.Close()
+	if missing.StatusCode != http.StatusNotFound {
+		t.Fatalf("delete without binding = %d, want 404", missing.StatusCode)
+	}
+
+	bind := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings",
+		`{"node_id":"node-a","managed":true}`, cookies, csrf)
+	defer bind.Body.Close()
+	if bind.StatusCode != http.StatusOK {
+		t.Fatalf("bind: %d", bind.StatusCode)
+	}
+
+	// A managed binding is refused: the operator must unmanage first.
+	managed := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings/delete", `{"node_id":"node-a"}`, cookies, csrf)
+	defer managed.Body.Close()
+	if managed.StatusCode != http.StatusConflict {
+		t.Fatalf("delete managed binding = %d, want 409", managed.StatusCode)
+	}
+	if _, ok := st.NodeGuardBinding("node-a"); !ok {
+		t.Fatal("a refused delete must leave the binding in place")
+	}
+
+	binding, _ := st.NodeGuardBinding("node-a")
+	unmanage := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings",
+		`{"node_id":"node-a","managed":false,"version":`+strconv.FormatInt(binding.Version, 10)+`}`, cookies, csrf)
+	defer unmanage.Body.Close()
+	if unmanage.StatusCode != http.StatusOK {
+		t.Fatalf("unmanage: %d", unmanage.StatusCode)
+	}
+	binding, _ = st.NodeGuardBinding("node-a")
+
+	del := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings/delete", `{"node_id":"node-a"}`, cookies, csrf)
+	defer del.Body.Close()
+	if del.StatusCode != http.StatusOK {
+		t.Fatalf("delete unmanaged binding = %d, want 200", del.StatusCode)
+	}
+	var deleted model.NodeGuardBinding
+	if err := json.NewDecoder(del.Body).Decode(&deleted); err != nil {
+		t.Fatal(err)
+	}
+	if deleted.NodeID != "node-a" || deleted.Managed || deleted.Version != binding.Version {
+		t.Fatalf("delete must return the removed record, got %+v want %+v", deleted, binding)
+	}
+	if _, ok := st.NodeGuardBinding("node-a"); ok {
+		t.Fatal("binding still stored after delete")
+	}
+	audited := false
+	for _, event := range st.AuditEvents() {
+		if event.Action == "netguard.binding.delete" && event.NodeID == "node-a" {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatalf("binding delete must be audited: %+v", st.AuditEvents())
+	}
+
+	again := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings/delete", `{"node_id":"node-a"}`, cookies, csrf)
+	defer again.Body.Close()
+	if again.StatusCode != http.StatusNotFound {
+		t.Fatalf("second delete = %d, want 404", again.StatusCode)
+	}
+
+	// A token restricted to node-a cannot delete node-b's binding, and the
+	// refusal is a 403 whether or not node-b has one.
+	bindB := doJSON(t, handler, http.MethodPost, "/api/netguard/bindings",
+		`{"node_id":"node-b","managed":false}`, cookies, csrf)
+	defer bindB.Body.Close()
+	if bindB.StatusCode != http.StatusOK {
+		t.Fatalf("bind node-b: %d", bindB.StatusCode)
+	}
+	token := createPAT(t, handler, cookies, csrf, []string{"netguard:read", "netguard:admin"}, []string{"node-a"})
+	foreign := doBearerJSON(t, handler, http.MethodPost, "/api/netguard/bindings/delete", `{"node_id":"node-b"}`, token)
+	defer foreign.Body.Close()
+	if foreign.StatusCode != http.StatusForbidden {
+		t.Fatalf("restricted token deleting node-b binding = %d, want 403", foreign.StatusCode)
+	}
+	if _, ok := st.NodeGuardBinding("node-b"); !ok {
+		t.Fatal("node-b binding must survive a forbidden delete")
+	}
+}
+
 func TestNetGuardStoreVersionConflicts(t *testing.T) {
 	_, st := newTestServer(t)
 

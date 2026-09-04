@@ -48,6 +48,31 @@ type NFTInputRule struct {
 	Comment     string
 }
 
+// The guard chain is policy drop, so anything the scaffold does not accept is
+// gone, and that includes the control traffic the node's own stack depends on.
+// IPv6 neighbour discovery (solicit/advert) and router advertisements arrive
+// as ICMPv6 on the input hook: drop them and a SLAAC node's global address and
+// default route expire with the RA lifetime, and a static-address node stops
+// resolving its neighbours. The path-MTU and unreachable errors are what keep
+// TCP from hanging on black-holed paths, and echo-request is what an operator
+// pings. The scaffold therefore accepts the standard workstation set below on
+// every rendered plan. The set is fixed by the renderer and is not
+// operator-editable: the compiler refuses icmp/icmpv6 rules rather than
+// letting a deny land in front of it, because a node whose neighbour discovery
+// an operator can turn off is a node an operator can silently take off the
+// v6 network. Grammar: `meta l4proto icmp icmp type { ... }` and `meta l4proto
+// ipv6-icmp icmpv6 type { ... }`, which nftables 1.0.6 (Debian 12) parses.
+const (
+	ScaffoldICMPv4Types = "echo-request, destination-unreachable, time-exceeded, parameter-problem"
+	ScaffoldICMPv6Types = "nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, nd-redirect, echo-request, destination-unreachable, packet-too-big, time-exceeded, parameter-problem"
+
+	// ScaffoldICMPv4Match and ScaffoldICMPv6Match are the match halves of the
+	// fixed accepts; each renderer appends its own verdict and comment so the
+	// guard input chain and the policy output chain share one definition.
+	ScaffoldICMPv4Match = "meta l4proto icmp icmp type { " + ScaffoldICMPv4Types + " }"
+	ScaffoldICMPv6Match = "meta l4proto ipv6-icmp icmpv6 type { " + ScaffoldICMPv6Types + " }"
+)
+
 // ifaceNameRe matches Linux network interface names: up to 15 chars (IFNAMSIZ-1)
 // drawn from a conservative set. This boundary stops attacker input from
 // breaking out of the nft statement it is interpolated into.
@@ -73,6 +98,11 @@ func GenerateNFTPlan(p NFTPlan) (string, error) {
 	fmt.Fprintf(&b, "    type filter hook input priority 0; policy drop;\n")
 	fmt.Fprintf(&b, "    ct state established,related accept\n")
 	fmt.Fprintf(&b, "    iif lo accept\n")
+	// Fixed control-traffic accepts, ahead of every operator rule and the
+	// broad allows. See the ScaffoldICMP* comment for why they are not
+	// operator-editable.
+	fmt.Fprintf(&b, "    %s accept comment \"icmp control\"\n", ScaffoldICMPv4Match)
+	fmt.Fprintf(&b, "    %s accept comment \"icmpv6 control and neighbour discovery\"\n", ScaffoldICMPv6Match)
 	for _, rule := range p.InputRules {
 		for _, line := range renderInputRule(rule) {
 			fmt.Fprintf(&b, "    %s\n", line)

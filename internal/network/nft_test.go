@@ -52,6 +52,47 @@ func TestNormalizeNFTPlanDefaultsAndDedupes(t *testing.T) {
 	}
 }
 
+// The scaffold must accept the ICMP control set on every plan, after the
+// established/related and loopback accepts and before any operator rule, so
+// that neither a composed deny nor the default drop can sit in front of it.
+// Without this a policy-drop input chain silently kills IPv6 neighbour
+// discovery and router advertisements: the five SLAAC nodes lose their global
+// address and default route when the RA lifetime runs out, and ping dies on
+// every node. Grammar checked read-only with `nft -c -f -` on dmit-3
+// (Debian 12, nftables v1.0.6) on 2026-09-04: rc 0, no stderr.
+func TestGenerateNFTPlanAcceptsFixedICMPControlSet(t *testing.T) {
+	plan, err := GenerateNFTPlan(NFTPlan{
+		PublicTCP: []int{22},
+		InputRules: []NFTInputRule{{
+			Protocol: NFTProtoAny,
+			Action:   NFTActionDrop,
+			Comment:  "operator deny-all",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4 := `meta l4proto icmp icmp type { echo-request, destination-unreachable, time-exceeded, parameter-problem } accept comment "icmp control"`
+	v6 := `meta l4proto ipv6-icmp icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, nd-redirect, echo-request, destination-unreachable, packet-too-big, time-exceeded, parameter-problem } accept comment "icmpv6 control and neighbour discovery"`
+	lines := strings.Split(plan, "\n")
+	index := func(want string) int {
+		for i, line := range lines {
+			if strings.TrimSpace(line) == want {
+				return i
+			}
+		}
+		t.Fatalf("plan missing line %q:\n%s", want, plan)
+		return -1
+	}
+	lo := index("iif lo accept")
+	i4 := index(v4)
+	i6 := index(v6)
+	deny := index(`drop comment "operator deny-all"`)
+	if !(lo < i4 && i4 < i6 && i6 < deny) {
+		t.Fatalf("icmp accepts must follow the loopback accept and precede operator rules (lo=%d v4=%d v6=%d deny=%d):\n%s", lo, i4, i6, deny, plan)
+	}
+}
+
 func TestGenerateNFTPlanRejectsBadPort(t *testing.T) {
 	if _, err := GenerateNFTPlan(NFTPlan{PublicTCP: []int{70000}}); err == nil {
 		t.Fatal("expected invalid port rejection")

@@ -104,6 +104,11 @@ func CompileEgressPlan(policy model.NetPolicy, resolve NodeResolver, opts Compil
 	b.WriteString("\t\ttype filter hook output priority 0; policy drop;\n")
 	b.WriteString("\t\tct state established,related accept comment \"lattice established\"\n")
 	b.WriteString("\t\toifname \"lo\" accept comment \"lattice loopback\"\n")
+	// The output hook is policy drop too, and outbound neighbour/router
+	// solicitations and neighbour advertisements are what keep a node's IPv6
+	// neighbours and default route alive. Same fixed set as the guard input
+	// scaffold; see network.ScaffoldICMPv6Match.
+	b.WriteString("\t\t" + network.ScaffoldICMPv6Match + " accept comment \"lattice icmpv6 neighbour discovery\"\n")
 	b.WriteString(controlPlaneAllowLine(opts))
 	b.WriteString("\t\tudp dport 53 accept comment \"lattice dns udp\"\n")
 	b.WriteString("\t\ttcp dport 53 accept comment \"lattice dns tcp\"\n")

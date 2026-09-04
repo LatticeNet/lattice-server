@@ -1218,6 +1218,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netguard/reality", s.withAuth("", s.handleNetGuardReality))
 	mux.HandleFunc("/api/netguard/review", s.withAuth("netguard:read", s.handleNetGuardReview))
 	mux.HandleFunc("/api/netguard/bindings", s.withAuth("netguard:admin", s.handleNetGuardBindings))
+	mux.HandleFunc("/api/netguard/bindings/delete", s.withAuth("netguard:admin", s.handleDeleteNodeGuardBinding))
 	mux.HandleFunc("/api/netguard/nodes/adopt", s.withAuth("netguard:admin", s.handleNetGuardAdopt))
 	mux.HandleFunc("/api/netguard/plan", s.withAuth("netguard:admin", s.handleNetGuardPlan))
 	mux.HandleFunc("/api/sshguard/plan", s.withAuth("sshguard:admin", s.handleSSHGuardPlan))

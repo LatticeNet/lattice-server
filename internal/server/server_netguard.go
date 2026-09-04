@@ -744,6 +744,59 @@ func (s *Server) handleNetGuardBindings(w http.ResponseWriter, r *http.Request, 
 	writeJSON(w, http.StatusOK, s.storedNodeGuardView(saved))
 }
 
+// handleDeleteNodeGuardBinding is the undo for an observe-only binding
+// written by mistake; until it existed such a record could only be parked at
+// managed=false. A managed binding is refused with 409: managed means the
+// guard table this binding compiled may be live on the node, and dropping the
+// record would leave that table with no owner. The operator unmanages first
+// (a binding upsert with managed=false, which touches nothing on the node: the
+// applied table stays until a new plan replaces it), and only then can the
+// record go. Deleting a binding likewise changes nothing on the node.
+func (s *Server) handleDeleteNodeGuardBinding(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		NodeID string `json:"node_id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if req.NodeID == "" {
+		writeError(w, http.StatusBadRequest, errors.New("node_id is required"))
+		return
+	}
+	// Scope before existence, as in the binding upsert: a 404-against-403
+	// difference must not tell a restricted token which nodes have bindings.
+	if !s.requireNodeScope(w, p, "netguard:admin", req.NodeID) {
+		return
+	}
+	binding, ok := s.store.NodeGuardBinding(req.NodeID)
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node has no guard binding"))
+		return
+	}
+	if binding.Managed {
+		writeError(w, http.StatusConflict, errors.New("guard binding is managed; set managed=false before deleting it"))
+		return
+	}
+	deleted, ok, err := s.store.DeleteNodeGuardBinding(req.NodeID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, errors.New("node has no guard binding"))
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID: id.New("audit"), NodeID: req.NodeID, Action: "netguard.binding.delete", Scope: "netguard:admin",
+		Metadata: map[string]string{"node_id": req.NodeID},
+	})
+	writeJSON(w, http.StatusOK, deleted)
+}
+
 func (s *Server) serverAuthoritativeGuardBinding(req model.NodeGuardBinding) model.NodeGuardBinding {
 	existing, ok := s.store.NodeGuardBinding(req.NodeID)
 	if !ok {

@@ -4412,15 +4412,24 @@ func (s *Store) NodeGuardBindings() []model.NodeGuardBinding {
 	return out
 }
 
-// DeleteNodeGuardBinding removes a node's guard binding.
-func (s *Store) DeleteNodeGuardBinding(nodeID string) error {
+// DeleteNodeGuardBinding removes a node's guard binding and returns the record
+// it removed, or ok=false when the node had none. It is the undo for an
+// observe-only binding written by mistake. The managed/unmanaged policy lives
+// with the caller: the server refuses to delete a managed binding because the
+// table that binding applied stays on the node and would be left with no
+// owning record.
+func (s *Store) DeleteNodeGuardBinding(nodeID string) (model.NodeGuardBinding, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.state.GuardBindings[nodeID]; !ok {
-		return nil
+	binding, ok := s.state.GuardBindings[nodeID]
+	if !ok {
+		return model.NodeGuardBinding{}, false, nil
 	}
 	delete(s.state.GuardBindings, nodeID)
-	return s.Save()
+	if err := s.Save(); err != nil {
+		return model.NodeGuardBinding{}, false, err
+	}
+	return cloneNodeGuardBinding(binding), true, nil
 }
 
 // UpsertGroup creates or updates a fleet group. The group's own ID is the key;

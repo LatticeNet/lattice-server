@@ -2660,6 +2660,13 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	if req.NodeID == "" {
 		req.NodeID = id.New("node")
 	}
+	// The underscore namespace belongs to the control plane: a node enrolled
+	// as "_server" would write its own flaps over the server's start and
+	// stop marks and turn the whole fleet's history unknown.
+	if store.ReservedNodeID(req.NodeID) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("node id %q is reserved", req.NodeID))
+		return
+	}
 	// Validate group assignments up front (before any mutation) so a bad group id
 	// rejects the whole enroll rather than leaving an orphaned node behind.
 	//

@@ -35,7 +35,8 @@ const (
 	nodeStatusEventLayout = "2006-01-02T15:04:05.000000000Z"
 
 	// NodeStatusServerID keys the control plane's own rows. Node ids come from
-	// id.New and never start with an underscore.
+	// id.New and never start with an underscore; ReservedNodeID holds the line
+	// for ids a caller supplies.
 	NodeStatusServerID = "_server"
 
 	NodeStatusOnline  = "online"
@@ -66,8 +67,15 @@ func nodeStatusEventKey(id string, at time.Time) string {
 	return id + "/" + at.UTC().Format(nodeStatusEventLayout)
 }
 
+// ReservedNodeID reports whether an id is in the underscore namespace the
+// control plane keeps for its own rows. Enrolment refuses such an id so a
+// node can never write over the server's start and stop marks.
+func ReservedNodeID(id string) bool {
+	return strings.HasPrefix(id, "_")
+}
+
 func validNodeStatusID(id string) error {
-	if id == "" || strings.ContainsAny(id, "/\x00") {
+	if id == "" || strings.ContainsAny(id, "/\x00") || ReservedNodeID(id) {
 		return fmt.Errorf("invalid node status id %q", id)
 	}
 	return nil

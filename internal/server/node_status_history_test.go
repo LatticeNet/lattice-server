@@ -85,6 +85,18 @@ func TestSummarizeNodeStatusArithmetic(t *testing.T) {
 			node: model.Node{},
 			want: nodeStatusHistory{Initial: unk, Events: []store.NodeStatusEvent{}, UnknownSeconds: int64(week / time.Second)},
 		},
+		{
+			// The window opens inside a control-plane gap: nobody observed the
+			// node then, so it opens unknown, and the stretch the restart
+			// reveals was already under way, not an episode that opened here.
+			name:    "window opens inside a control-plane gap on an offline node",
+			node:    model.Node{Online: false, OnlineSince: at(-2 * day), LastSeen: at(-day)},
+			control: []store.NodeStatusEvent{ev(-time.Hour, off, stop), ev(30*time.Minute, on, start)},
+			want: nodeStatusHistory{
+				Initial: unk, Events: []store.NodeStatusEvent{ev(30*time.Minute, off, start)},
+				OfflineSeconds: int64(week/time.Second) - 1800, UnknownSeconds: 1800, LongestOfflineSeconds: int64(week/time.Second) - 1800,
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -110,26 +122,29 @@ func TestNodeStatusHistoryEndpoint(t *testing.T) {
 	handler := srv.Handler()
 	cookies, csrf := loginSession(t, handler)
 
+	// Both nodes last beat a day ago when the control plane restarted 35s
+	// later, so the start mark closes a 35s gap; then both beat again now.
 	const day = 24 * time.Hour
-	for _, id := range []string{"node-a", "node-b"} {
-		if err := st.UpsertNode(model.Node{ID: id, Name: id, Online: true, OnlineSince: now.Add(-10 * day), LastSeen: now}); err != nil {
+	upsert := func(lastSeen time.Time) {
+		for _, id := range []string{"node-a", "node-b"} {
+			if err := st.UpsertNode(model.Node{ID: id, Name: id, Online: true, OnlineSince: now.Add(-10 * day), LastSeen: lastSeen}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	upsert(now.Add(-day))
+	for _, ev := range []store.NodeStatusEvent{
+		{At: now.Add(-2 * day), To: store.NodeStatusOffline, Cause: store.NodeStatusCauseLivenessSweep},
+		{At: now.Add(-2*day + 10*time.Minute), To: store.NodeStatusOnline, Cause: store.NodeStatusCauseBeat},
+	} {
+		if err := st.AppendNodeStatusEvent("node-a", ev); err != nil {
 			t.Fatal(err)
 		}
 	}
-	appends := []struct {
-		id string
-		ev store.NodeStatusEvent
-	}{
-		{"node-a", store.NodeStatusEvent{At: now.Add(-2 * day), To: store.NodeStatusOffline, Cause: store.NodeStatusCauseLivenessSweep}},
-		{"node-a", store.NodeStatusEvent{At: now.Add(-2*day + 10*time.Minute), To: store.NodeStatusOnline, Cause: store.NodeStatusCauseBeat}},
-		{store.NodeStatusServerID, store.NodeStatusEvent{At: now.Add(-day), To: store.NodeStatusOffline, Cause: store.NodeStatusCauseServerStop}},
-		{store.NodeStatusServerID, store.NodeStatusEvent{At: now.Add(-day + 35*time.Second), To: store.NodeStatusOnline, Cause: store.NodeStatusCauseServerStart}},
+	if err := st.RecordServerStart(now.Add(-day + 35*time.Second)); err != nil {
+		t.Fatal(err)
 	}
-	for _, a := range appends {
-		if err := st.AppendNodeStatusEvent(a.id, a.ev); err != nil {
-			t.Fatal(err)
-		}
-	}
+	upsert(now)
 
 	get := func(path string, token string) (int, nodeStatusHistoryResponse, string) {
 		t.Helper()
@@ -192,6 +207,25 @@ func TestNodeStatusHistoryEndpoint(t *testing.T) {
 	status, _, body = get("/api/nodes/status-history?node_id=node-a", token)
 	if status == http.StatusOK || strings.Contains(body, "node-a") {
 		t.Fatalf("confined token must not read node-a: %d %s", status, body)
+	}
+}
+
+// The control plane keys its own rows under the reserved id, so a node may
+// not take it, or any other id in the underscore namespace the convention
+// sets aside.
+func TestEnrollRejectsReservedNodeID(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	for _, id := range []string{store.NodeStatusServerID, "_anything"} {
+		res := doJSON(t, handler, http.MethodPost, "/api/nodes/enroll-token", `{"node_id":"`+id+`","name":"n"}`, cookies, csrf)
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("enroll %q: %d %s", id, res.StatusCode, body)
+		}
+		if _, ok := st.Node(id); ok {
+			t.Fatalf("enroll %q must not create the node", id)
+		}
 	}
 }
 

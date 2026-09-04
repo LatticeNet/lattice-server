@@ -30,6 +30,9 @@ import (
 // Episodes count offline stretches that begin in the window plus one for a
 // window that opens offline. A control-plane gap pauses a stretch rather than
 // ending it: the node was offline on both sides, and the gap says nothing.
+// The opening state is the observed one, so a window that opens inside a gap
+// opens unknown, and the stretch the restart then reveals was already under
+// way rather than one that opened here.
 const (
 	nodeStatusHistoryDefaultDays = 7
 	nodeStatusHistoryMaxDays     = int(store.NodeStatusEventRetention / (24 * time.Hour))
@@ -146,7 +149,7 @@ func summarizeNodeStatus(n model.Node, rows, control []store.NodeStatusEvent, si
 		return nodeState
 	}
 	out := nodeStatusHistory{Initial: effective(), Events: []store.NodeStatusEvent{}}
-	if nodeState == store.NodeStatusOffline {
+	if out.Initial == store.NodeStatusOffline {
 		out.Episodes = 1
 	}
 	var online, offline, unknown, run, longest time.Duration

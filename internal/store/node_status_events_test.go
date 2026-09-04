@@ -78,6 +78,21 @@ func TestNodeStatusEventsRecordTransitionsOnly(t *testing.T) {
 	}
 }
 
+// The underscore namespace is the control plane's: a caller may not write a
+// node's rows under the reserved id, or under any id shaped like it.
+func TestAppendNodeStatusEventRejectsReservedID(t *testing.T) {
+	s := openUsageDayStore(t, "json")
+	ev := NodeStatusEvent{At: time.Now().UTC(), To: NodeStatusOnline, Cause: NodeStatusCauseBeat}
+	for _, id := range []string{NodeStatusServerID, "_anything", "", "a/b"} {
+		if err := s.AppendNodeStatusEvent(id, ev); err == nil {
+			t.Fatalf("append under %q must be refused", id)
+		}
+	}
+	if err := s.AppendNodeStatusEvent("node-a", ev); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The per-id cap drops the oldest rows, and the prune drops every row older
 // than the cutoff across ids while leaving newer ones alone.
 func TestNodeStatusEventsCapAndPrune(t *testing.T) {

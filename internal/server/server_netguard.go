@@ -850,7 +850,12 @@ func (s *Server) handleNetGuardAdopt(w http.ResponseWriter, r *http.Request, p p
 	if !s.requireNodeScope(w, p, "netguard:admin", req.NodeID) {
 		return
 	}
-	if _, ok := s.store.NodeGuardBinding(req.NodeID); ok {
+	// Only a managed binding means the node is adopted. An observe-only
+	// binding is the display record the port plan writes for a node it merely
+	// looked at; adoption is how that record becomes real, so it is replaced
+	// (at its current version) rather than reported as a conflict.
+	existing, hasBinding := s.store.NodeGuardBinding(req.NodeID)
+	if hasBinding && existing.Managed {
 		writeError(w, http.StatusConflict, errors.New("node is already adopted"))
 		return
 	}
@@ -869,6 +874,9 @@ func (s *Server) handleNetGuardAdopt(w http.ResponseWriter, r *http.Request, p p
 	}
 	binding := view.Binding
 	binding.Version = 0
+	if hasBinding {
+		binding.Version = existing.Version
+	}
 	binding.Managed = true
 	binding.GroupIDs = []string{saved.ID}
 	storedBinding, err := s.store.UpsertNodeGuardBinding(binding)

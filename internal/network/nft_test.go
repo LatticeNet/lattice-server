@@ -124,12 +124,14 @@ func TestGenerateNFTPlanRejectsBadInputRule(t *testing.T) {
 
 // The plan has to be accepted by every nftables the fleet runs. `destroy
 // table` was added in nftables 1.0.7; sixteen of the fleet's nft-capable nodes
-// run Debian 12's 1.0.6, where `nft -c 'destroy table inet X'` fails with
-// "syntax error, unexpected table, expecting string" while
-// `nft -c 'add table inet X; delete table inet X'` returns 0 (verified on two
-// Debian 12 nodes, 2026-09-03). The renderer therefore opens with the add/delete
-// pair, which every version parses and which replaces the table whether or
-// not it already exists.
+// run Debian 12's 1.0.6. Checked read-only with `nft -c` on two Debian 12
+// nodes running nftables 1.0.6 on 2026-09-03: `destroy table inet X` fails
+// with "syntax error, unexpected table, expecting string", and
+// `add table inet X` followed by `delete table inet X` in one script returns
+// rc 0. The renderer therefore opens with the add/delete pair, which every
+// version parses and which replaces the table whether or not it already
+// exists. TestGenerateNFTPlanPassesNFTCheck below repeats that check against
+// a real binary wherever one is available.
 func TestGenerateNFTPlanReplacesTheTableWithoutDestroy(t *testing.T) {
 	plan, err := GenerateNFTPlan(NFTPlan{PublicTCP: []int{22}})
 	if err != nil {

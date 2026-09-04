@@ -5940,10 +5940,14 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		return
 	}
 	includeDismissed := requestBool(r, "include_dismissed")
+	// Both flags are constant for the request, so they are read once here
+	// rather than inside the loop: requestBool re-parses the whole query
+	// string, and this listing exists to stay cheap at thousands of rows.
+	countRequested := requestBool(r, "count")
 	approvals := s.store.Approvals()
 	visible := make([]model.Approval, 0, len(approvals))
 	for _, approval := range approvals {
-		if approval.Status == approvalStatusDismissed && !includeDismissed && !requestBool(r, "count") {
+		if approval.Status == approvalStatusDismissed && !includeDismissed && !countRequested {
 			continue
 		}
 		if !s.approvalVisibleToPrincipal(p, approval) {
@@ -5954,7 +5958,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		}
 		visible = append(visible, approval)
 	}
-	if requestBool(r, "count") {
+	if countRequested {
 		writeJSON(w, http.StatusOK, map[string]any{"counts": countApprovals(visible)})
 		return
 	}

@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -454,5 +456,51 @@ func TestDismissWorksFromPlanlessListing(t *testing.T) {
 	}
 	if got, _ := st.Approval(approval.ID); got.Status != approvalStatusDismissed {
 		t.Fatalf("dismiss did not persist: %+v", got)
+	}
+}
+
+// TestApprovalsListParsesQueryOncePerRequest pins the cost the listing was
+// rewritten to remove: nothing in the per-row filter loop may re-parse the
+// request query. It seeds a fleet of dismissed rows (the branch that reads
+// the count flag) behind a padded query string, so a parse per row shows up
+// as allocations that scale with rows times parameters, while a hoisted parse
+// stays a small constant on top of the response.
+func TestApprovalsListParsesQueryOncePerRequest(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, _ := loginSession(t, handler)
+	const rows = 300
+	for i := 0; i < rows; i++ {
+		if err := st.UpsertApproval(model.Approval{
+			ID: fmt.Sprintf("ap-tomb-%03d", i), NodeID: "node-a", Plugin: "nftpolicy", Action: "apply",
+			Status: approvalStatusDismissed, Plan: "plan", CreatedAt: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var padding strings.Builder
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&padding, "&pad%02d=%d", i, i)
+	}
+	path := "/api/network/approvals?limit=10" + padding.String()
+	serve := func() {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET approvals = %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	allocs := testing.AllocsPerRun(5, serve)
+	// The two regimes are far apart, so the bound sits between them rather
+	// than near either. Measured on 2026-09-04 with 300 hidden rows and 101
+	// query parameters: about 500 allocations when the flags are read once
+	// before the loop, about 34,000 when the loop re-parses the query per
+	// row (a parse allocates per parameter). Anything of that second order
+	// is the defect, whatever the response costs on the day.
+	if limit := rows * 10; allocs >= float64(limit) {
+		t.Fatalf("listing allocated %.0f times for %d hidden rows (limit %d); the per-row loop must not re-parse the query", allocs, rows, limit)
 	}
 }

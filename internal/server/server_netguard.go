@@ -866,9 +866,21 @@ func (s *Server) handleNetGuardAdopt(w http.ResponseWriter, r *http.Request, p p
 	}
 	view := netguard.LegacyBaseline(inputs)
 	group := view.Group
+	// The legacy group is node-private and derived from NFTInputs, so an
+	// existing copy (left by an adoption whose binding upsert failed, or by a
+	// release that deleted the binding but not the group) is replaced at its
+	// current version. A fresh Version 0 against it would be a conflict no
+	// retry could clear.
 	group.Version = 0
+	if stored, ok := s.store.SecurityGroup(group.ID); ok {
+		group.Version = stored.Version
+	}
 	saved, err := s.store.UpsertSecurityGroup(group)
 	if err != nil {
+		if errors.Is(err, store.ErrGuardVersionConflict) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

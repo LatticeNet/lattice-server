@@ -78,9 +78,14 @@ func (n *notifyRecorder) all() []string {
 
 // newTLSMonitorServer builds a server whose tls probe reaches addr whatever
 // host the monitor names, with a clock the test drives.
+//
+// The background loops stay off. Every field below is installed after New()
+// returns, so a sweeper goroutine started inside New() would read s.now while
+// the test writes it and the race detector would (correctly) fail the test.
+// These tests drive sweepTLSMonitorsOnce themselves and need no loop running.
 func newTLSMonitorServer(t *testing.T, addr *string, now *time.Time) (*Server, http.Handler, *notifyRecorder) {
 	t.Helper()
-	srv, handler, _ := newDNSServer(t)
+	srv, handler, _ := newDNSServerWithOptions(t, Options{DisableRenewalScheduler: true})
 	srv.now = func() time.Time { return *now }
 	srv.tlsMonitorTargets = func(ctx context.Context, host, port string) ([]string, error) {
 		if *addr == "" {

@@ -321,3 +321,75 @@ func TestNetGuardPlanBlocksWhenThePublicInterfaceIsNotOnTheNode(t *testing.T) {
 		t.Fatalf("review findings = %+v", out.Review.Findings)
 	}
 }
+
+// Review used to demand a stored binding, so every one of the fleet's 33 nodes
+// answered "adopt it first" and server-side suggestions never ran for anyone.
+// An unbound node now compiles as an empty observe-only binding: the review
+// says intent cannot be compiled, suggestions still say which listeners have
+// no allow, nothing is written, and planning stays impossible.
+func TestNetGuardReviewRunsForUnboundAndLegacyNodes(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	reality := model.GuardNodeReality{
+		NodeID:      "node-a",
+		CollectedAt: time.Now().UTC().Add(-time.Minute),
+		Listeners:   []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd(701)"}},
+		Interfaces:  []model.GuardInterface{{Name: "ens17", Addresses: []string{"203.0.113.10/24"}, Up: true}},
+	}
+	if posted := postGuardRealityForTest(t, handler, token, "node-a", reality); posted.code != http.StatusOK {
+		t.Fatalf("post guard reality = %d: %s", posted.code, posted.body)
+	}
+
+	res := doJSON(t, handler, http.MethodGet, "/api/netguard/review?node_id=node-a", "", cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("review of an unbound node = %d, want 200", res.StatusCode)
+	}
+	var out netGuardReviewResponse
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Review.Node.Source != netGuardSourceUnbound || out.Review.Node.Binding.Managed {
+		t.Fatalf("an unbound node must review as an unbound observe-only intent: %+v", out.Review.Node)
+	}
+	if !strings.Contains(out.Review.CompileError, "observe-only") || out.Review.Ruleset != "" {
+		t.Fatalf("no intent means no ruleset: error=%q ruleset=%q", out.Review.CompileError, out.Review.Ruleset)
+	}
+	var missingAllow bool
+	for _, suggestion := range out.Review.Suggestions {
+		if suggestion.Code == netguard.SuggestionListenerMissingAllow && suggestion.Port == 22 {
+			missingAllow = true
+		}
+	}
+	if !missingAllow {
+		t.Fatalf("suggestions must run against reality with no intent: %+v", out.Review.Suggestions)
+	}
+	if _, ok := st.NodeGuardBinding("node-a"); ok {
+		t.Fatal("review must not create a binding record")
+	}
+
+	// Planning from the synthesised binding stays impossible.
+	plan := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusBadRequest {
+		t.Fatalf("plan for an unbound node = %d, want 400", plan.StatusCode)
+	}
+	if _, ok := st.NodeGuardBinding("node-a"); ok || len(st.Approvals()) != 0 {
+		t.Fatal("a refused plan must leave no binding and no approval behind")
+	}
+
+	// A legacy node (NFT inputs, never adopted) is the same case.
+	enrollNamedNode(t, handler, cookies, csrf, "node-b", "Node B")
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-b","interface_name":"ens3","public_tcp":[22]}`, cookies, csrf)
+	defer save.Body.Close()
+	legacy := doJSON(t, handler, http.MethodGet, "/api/netguard/review?node_id=node-b", "", cookies, csrf)
+	defer legacy.Body.Close()
+	if legacy.StatusCode != http.StatusOK {
+		t.Fatalf("review of a legacy node = %d, want 200", legacy.StatusCode)
+	}
+	if _, ok := st.NodeGuardBinding("node-b"); ok {
+		t.Fatal("review of a legacy node must not adopt it")
+	}
+}

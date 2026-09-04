@@ -239,8 +239,12 @@ type Store struct {
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every
 // store record that can affect compilation for a node.
 type NetGuardCompileSnapshot struct {
-	Node        model.Node
-	Binding     model.NodeGuardBinding
+	Node    model.Node
+	Binding model.NodeGuardBinding
+	// HasBinding is false when Binding was synthesised for a node with no
+	// stored binding: an empty, observe-only intent that lets review and
+	// suggestions run without creating a record.
+	HasBinding  bool
 	Groups      []model.SecurityGroup
 	GuardZones  []model.GuardZone
 	NFTInputs   model.NFTInputs
@@ -260,13 +264,19 @@ func (s *Store) NetGuardCompileSnapshot(nodeID string) (NetGuardCompileSnapshot,
 	if !ok {
 		return NetGuardCompileSnapshot{}, fmt.Errorf("%w: %q", ErrNetGuardCompileNodeNotFound, nodeID)
 	}
-	binding, ok := s.state.GuardBindings[nodeID]
-	if !ok {
-		return NetGuardCompileSnapshot{}, fmt.Errorf("node %q has no guard binding; adopt it first", nodeID)
+	// An unbound or legacy node compiles as an empty observe-only binding.
+	// Compile refuses it with ErrNodeUnmanaged, so nothing can be planned from
+	// it, but review can still lint reality against no intent and Suggest can
+	// say which listeners have no allow. Nothing is written: the binding lives
+	// only in this snapshot.
+	binding, hasBinding := s.state.GuardBindings[nodeID]
+	if !hasBinding {
+		binding = model.NodeGuardBinding{NodeID: nodeID}
 	}
 	snapshot := NetGuardCompileSnapshot{
 		Node:       cloneNode(node),
 		Binding:    cloneNodeGuardBinding(binding),
+		HasBinding: hasBinding,
 		Groups:     make([]model.SecurityGroup, 0, len(binding.GroupIDs)),
 		GuardZones: make([]model.GuardZone, 0, len(s.state.GuardZones)),
 		Nodes:      make(map[string]model.Node, len(s.state.Nodes)),

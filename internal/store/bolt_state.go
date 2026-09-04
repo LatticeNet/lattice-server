@@ -28,59 +28,60 @@ var (
 	// non-empty: a store whose entries were all deleted looks identical to one
 	// that never migrated, and re-running the migration against the stale JSON
 	// copy would resurrect exactly those deletions.
-	boltKeyKVStaticMigrated   = []byte("kv_static_migrated")
-	boltBucketUsers           = []byte("users")
-	boltBucketTokens          = []byte("tokens")
-	boltBucketNodes           = []byte("nodes")
-	boltBucketTasks           = []byte("tasks")
-	boltBucketResults         = []byte("results")
-	boltBucketAudit           = []byte("audit")
-	boltBucketKV              = []byte("kv")
-	boltBucketPluginSecrets   = []byte("plugin_secrets")
-	boltBucketVpnUsers        = []byte("vpn_users")
-	boltBucketVpnUserSecrets  = []byte("vpn_user_secrets")
-	boltBucketManagedLines    = []byte("managed_lines")
-	boltBucketManagedSecrets  = []byte("managed_line_secrets")
-	boltBucketLineChains      = []byte("line_chain_definitions")
-	boltBucketLineAttempts    = []byte("line_chain_attempts")
-	boltBucketLineAudit       = []byte("line_chain_audit_evidence")
-	boltBucketStatic          = []byte("static")
-	boltBucketStorageBuckets  = []byte("storage_buckets")
-	boltBucketStorageBindings = []byte("storage_bindings")
-	boltBucketStorageTokens   = []byte("storage_tokens")
-	boltBucketPlugins         = []byte("plugins")
-	boltBucketApprovals       = []byte("approvals")
-	boltBucketSessions        = []byte("sessions")
-	boltBucketDDNS            = []byte("ddns")
-	boltBucketMonitors        = []byte("monitors")
-	boltBucketMonResults      = []byte("monitor_results")
-	boltBucketLogSources      = []byte("log_sources")
-	boltBucketNotifyChannels  = []byte("notify_channels")
-	boltBucketNotifyRules     = []byte("notify_rules")
-	boltBucketTunnels         = []byte("tunnels")
-	boltBucketMachineProfiles = []byte("machine_profiles")
-	boltBucketMachineVendors  = []byte("machine_vendors")
-	boltBucketNFTInputs       = []byte("nft_inputs")
-	boltBucketGuardReality    = []byte("guard_reality_snapshots")
-	boltBucketSingBoxLiveness = []byte("singbox_liveness")
-	boltBucketDNSDeployments  = []byte("dns_deployments")
-	boltBucketNetPolicies     = []byte("net_policies")
-	boltBucketGroups          = []byte("groups")
-	boltBucketGroupPolicies   = []byte("group_policies")
-	boltBucketGeoRouting      = []byte("geo_routing")
-	boltBucketAgentUpdates    = []byte("agent_updates")
-	boltBucketProxyInbounds   = []byte("proxy_inbounds")
-	boltBucketProxyUsers      = []byte("proxy_users")
-	boltBucketSubShares       = []byte("subscription_shares")
-	boltBucketSubSnapshots    = []byte("subscription_snapshots")
-	boltBucketProxyProfiles   = []byte("proxy_profiles")
-	boltBucketProxyUsage      = []byte("proxy_usage")
-	boltBucketUsageDayNode    = []byte("usage_day_node")
-	boltBucketUsageDayUser    = []byte("usage_day_user")
-	boltBucketTOTPChallenges  = []byte("totp_challenges")
-	boltBucketOIDCProviders   = []byte("oidc_providers")
-	boltBucketOIDCIdentities  = []byte("oidc_identities")
-	boltBucketOIDCAuthStates  = []byte("oidc_auth_states")
+	boltKeyKVStaticMigrated    = []byte("kv_static_migrated")
+	boltBucketUsers            = []byte("users")
+	boltBucketTokens           = []byte("tokens")
+	boltBucketNodes            = []byte("nodes")
+	boltBucketTasks            = []byte("tasks")
+	boltBucketResults          = []byte("results")
+	boltBucketAudit            = []byte("audit")
+	boltBucketKV               = []byte("kv")
+	boltBucketPluginSecrets    = []byte("plugin_secrets")
+	boltBucketVpnUsers         = []byte("vpn_users")
+	boltBucketVpnUserSecrets   = []byte("vpn_user_secrets")
+	boltBucketManagedLines     = []byte("managed_lines")
+	boltBucketManagedSecrets   = []byte("managed_line_secrets")
+	boltBucketLineChains       = []byte("line_chain_definitions")
+	boltBucketLineAttempts     = []byte("line_chain_attempts")
+	boltBucketLineAudit        = []byte("line_chain_audit_evidence")
+	boltBucketStatic           = []byte("static")
+	boltBucketStorageBuckets   = []byte("storage_buckets")
+	boltBucketStorageBindings  = []byte("storage_bindings")
+	boltBucketStorageTokens    = []byte("storage_tokens")
+	boltBucketPlugins          = []byte("plugins")
+	boltBucketApprovals        = []byte("approvals")
+	boltBucketSessions         = []byte("sessions")
+	boltBucketDDNS             = []byte("ddns")
+	boltBucketMonitors         = []byte("monitors")
+	boltBucketMonResults       = []byte("monitor_results")
+	boltBucketLogSources       = []byte("log_sources")
+	boltBucketNotifyChannels   = []byte("notify_channels")
+	boltBucketNotifyRules      = []byte("notify_rules")
+	boltBucketTunnels          = []byte("tunnels")
+	boltBucketMachineProfiles  = []byte("machine_profiles")
+	boltBucketMachineVendors   = []byte("machine_vendors")
+	boltBucketNFTInputs        = []byte("nft_inputs")
+	boltBucketGuardReality     = []byte("guard_reality_snapshots")
+	boltBucketSingBoxLiveness  = []byte("singbox_liveness")
+	boltBucketDNSDeployments   = []byte("dns_deployments")
+	boltBucketNetPolicies      = []byte("net_policies")
+	boltBucketGroups           = []byte("groups")
+	boltBucketGroupPolicies    = []byte("group_policies")
+	boltBucketGeoRouting       = []byte("geo_routing")
+	boltBucketAgentUpdates     = []byte("agent_updates")
+	boltBucketProxyInbounds    = []byte("proxy_inbounds")
+	boltBucketProxyUsers       = []byte("proxy_users")
+	boltBucketSubShares        = []byte("subscription_shares")
+	boltBucketSubSnapshots     = []byte("subscription_snapshots")
+	boltBucketProxyProfiles    = []byte("proxy_profiles")
+	boltBucketProxyUsage       = []byte("proxy_usage")
+	boltBucketUsageDayNode     = []byte("usage_day_node")
+	boltBucketUsageDayUser     = []byte("usage_day_user")
+	boltBucketNodeStatusEvents = []byte("node_status_events")
+	boltBucketTOTPChallenges   = []byte("totp_challenges")
+	boltBucketOIDCProviders    = []byte("oidc_providers")
+	boltBucketOIDCIdentities   = []byte("oidc_identities")
+	boltBucketOIDCAuthStates   = []byte("oidc_auth_states")
 )
 
 var boltKeySubscriptionHotAuthority = []byte("subscription_hot_authority_v1")
@@ -147,6 +148,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketProxyUsage,
 	boltBucketUsageDayNode,
 	boltBucketUsageDayUser,
+	boltBucketNodeStatusEvents,
 	boltBucketTOTPChallenges,
 	boltBucketOIDCProviders,
 	boltBucketOIDCIdentities,
@@ -490,6 +492,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putMap(tx, boltBucketUsageDayUser, persist.UsageDayUsers); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketNodeStatusEvents, persist.NodeStatusEvents); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketTOTPChallenges, persist.TOTPChallenges); err != nil {
 			return err
 		}
@@ -731,6 +736,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			if err := readMap(tx, boltBucketUsageDayUser, st.UsageDayUsers); err != nil {
 				return err
 			}
+			if err := readMap(tx, boltBucketNodeStatusEvents, st.NodeStatusEvents); err != nil {
+				return err
+			}
 		}
 		if err := readMap(tx, boltBucketTOTPChallenges, st.TOTPChallenges); err != nil {
 			return err
@@ -952,6 +960,10 @@ func (bs *BoltStateStore) UpdateMetrics(nodeID string, metrics model.Metrics, ve
 		n.LastSeen = time.Now().UTC()
 		if !n.Online {
 			n.OnlineSince = n.LastSeen
+			ev := NodeStatusEvent{At: n.LastSeen, To: NodeStatusOnline, Cause: NodeStatusCauseBeat}
+			if err := appendNodeStatusEventsTx(tx, []nodeStatusAppend{{id: nodeID, event: ev}}); err != nil {
+				return err
+			}
 		}
 		n.Online = true
 		if version != "" {

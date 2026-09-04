@@ -25,7 +25,7 @@ func TestMarkStaleNodesOffline(t *testing.T) {
 	seed("never", false, time.Time{})            // never online -> untouched
 	seed("down", false, now.Add(-9*time.Minute)) // already offline -> not a transition
 
-	flipped, err := s.MarkStaleNodesOffline(90*time.Second, now)
+	flipped, err := s.MarkStaleNodesOffline(90*time.Second, now, NodeStatusCauseLivenessSweep)
 	if err != nil {
 		t.Fatalf("MarkStaleNodesOffline: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestMarkStaleNodesOffline(t *testing.T) {
 	}
 
 	// Idempotent: a second sweep at the same instant flips nothing new.
-	flipped2, err := s.MarkStaleNodesOffline(90*time.Second, now)
+	flipped2, err := s.MarkStaleNodesOffline(90*time.Second, now, NodeStatusCauseLivenessSweep)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestUpdateMetricsThrottlesPureHeartbeatPersistence(t *testing.T) {
 	}
 
 	first := model.Metrics{CPUPercent: 10, Load1: 0.25, NetRxBytes: 100, CollectedAt: time.Unix(100, 0).UTC()}
-	if err := s.UpdateMetrics("node-a", first, "0.2.7", "203.0.113.10", "", "10.0.0.10", "", "10.44.0.10", model.HostFacts{}); err != nil {
+	if _, err := s.UpdateMetrics("node-a", first, "0.2.7", "203.0.113.10", "", "10.0.0.10", "", "10.44.0.10", model.HostFacts{}); err != nil {
 		t.Fatalf("first metrics update: %v", err)
 	}
 	before, err := os.ReadFile(path)
@@ -133,7 +133,7 @@ func TestUpdateMetricsThrottlesPureHeartbeatPersistence(t *testing.T) {
 
 	time.Sleep(time.Millisecond)
 	second := model.Metrics{CPUPercent: 42, Load1: 1.5, NetRxBytes: 250, CollectedAt: time.Unix(110, 0).UTC()}
-	if err := s.UpdateMetrics("node-a", second, "0.2.7", "203.0.113.10", "", "10.0.0.10", "", "10.44.0.10", model.HostFacts{}); err != nil {
+	if _, err := s.UpdateMetrics("node-a", second, "0.2.7", "203.0.113.10", "", "10.0.0.10", "", "10.44.0.10", model.HostFacts{}); err != nil {
 		t.Fatalf("second metrics update: %v", err)
 	}
 	after, err := os.ReadFile(path)
@@ -165,7 +165,7 @@ func TestUpdateMetricsPersistsSlowChangingAgentFieldsImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := model.Metrics{CPUPercent: 10, CollectedAt: time.Unix(100, 0).UTC()}
-	if err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
+	if _, err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatalf("first metrics update: %v", err)
 	}
 	before, err := os.ReadFile(path)
@@ -173,7 +173,7 @@ func TestUpdateMetricsPersistsSlowChangingAgentFieldsImmediately(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := s.UpdateMetrics("node-a", metrics, "0.2.8", "203.0.113.11", "", "", "", "", model.HostFacts{}); err != nil {
+	if _, err := s.UpdateMetrics("node-a", metrics, "0.2.8", "203.0.113.11", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatalf("slow field metrics update: %v", err)
 	}
 	after, err := os.ReadFile(path)
@@ -214,7 +214,7 @@ func TestUpdateMetricsIgnoresVolatileHostFactsForDurableWrites(t *testing.T) {
 		BootTime:      boot,
 		ReportedAt:    time.Unix(1_700_000_000, 0).UTC(),
 	}
-	if err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", firstFacts); err != nil {
+	if _, err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", firstFacts); err != nil {
 		t.Fatalf("first metrics update: %v", err)
 	}
 	before, err := os.ReadFile(path)
@@ -225,7 +225,7 @@ func TestUpdateMetricsIgnoresVolatileHostFactsForDurableWrites(t *testing.T) {
 	secondFacts := firstFacts
 	secondFacts.ReportedAt = secondFacts.ReportedAt.Add(30 * time.Second)
 	secondFacts.BootTime = secondFacts.BootTime.Add(30 * time.Second)
-	if err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", secondFacts); err != nil {
+	if _, err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", secondFacts); err != nil {
 		t.Fatalf("volatile host facts metrics update: %v", err)
 	}
 	after, err := os.ReadFile(path)
@@ -245,7 +245,7 @@ func TestUpdateMetricsIgnoresVolatileHostFactsForDurableWrites(t *testing.T) {
 
 	changedFacts := secondFacts
 	changedFacts.KernelVersion = "6.8.0"
-	if err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", changedFacts); err != nil {
+	if _, err := s.UpdateMetrics("node-a", metrics, "0.2.7", "203.0.113.10", "", "", "", "", changedFacts); err != nil {
 		t.Fatalf("durable host facts metrics update: %v", err)
 	}
 	changed, err := os.ReadFile(path)
@@ -268,7 +268,7 @@ func TestUpdateMetricsPersistsPeriodicHeartbeatSnapshot(t *testing.T) {
 	}
 
 	first := model.Metrics{CPUPercent: 10, NetRxBytes: 100, CollectedAt: time.Unix(100, 0).UTC()}
-	if err := s.UpdateMetrics("node-a", first, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
+	if _, err := s.UpdateMetrics("node-a", first, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatalf("first metrics update: %v", err)
 	}
 	before, err := os.ReadFile(path)
@@ -278,7 +278,7 @@ func TestUpdateMetricsPersistsPeriodicHeartbeatSnapshot(t *testing.T) {
 
 	s.metricsPersistedAt["node-a"] = time.Now().UTC().Add(-metricsPersistenceInterval - time.Second)
 	second := model.Metrics{CPUPercent: 42, NetRxBytes: 250, CollectedAt: time.Unix(200, 0).UTC()}
-	if err := s.UpdateMetrics("node-a", second, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
+	if _, err := s.UpdateMetrics("node-a", second, "0.2.7", "203.0.113.10", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatalf("periodic metrics update: %v", err)
 	}
 	after, err := os.ReadFile(path)

@@ -19,7 +19,7 @@ func TestUpdateMetricsStampsOnlineSinceOncePerRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	beat := func() model.Node {
-		if err := s.UpdateMetrics("n1", model.Metrics{}, "", "", "", "", "", "", model.HostFacts{}); err != nil {
+		if _, err := s.UpdateMetrics("n1", model.Metrics{}, "", "", "", "", "", "", model.HostFacts{}); err != nil {
 			t.Fatal(err)
 		}
 		n, _ := s.Node("n1")
@@ -40,7 +40,7 @@ func TestUpdateMetricsStampsOnlineSinceOncePerRun(t *testing.T) {
 	}
 
 	// Silence, then recovery: a new run.
-	if _, err := s.MarkStaleNodesOffline(0, second.LastSeen.Add(time.Hour)); err != nil {
+	if _, err := s.MarkStaleNodesOffline(0, second.LastSeen.Add(time.Hour), NodeStatusCauseLivenessSweep); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := s.Node("n1"); n.Online {

@@ -114,12 +114,15 @@ type State struct {
 	// UsageDayNodes and UsageDayUsers are the daily rollups (usage_days.go),
 	// keyed "<id>/<yyyymmdd>". With the bolt hot store enabled they live only
 	// in bolt and are read with a prefix seek, never held here.
-	UsageDayNodes  map[string]UsageDayNode       `json:"usage_day_node"`
-	UsageDayUsers  map[string]UsageDayUser       `json:"usage_day_user"`
-	TOTPChallenges map[string]auth.TOTPChallenge `json:"totp_challenges"`
-	OIDCProviders  map[string]model.OIDCProvider `json:"oidc_providers"`
-	OIDCIdentities map[string]model.OIDCIdentity `json:"oidc_identities"`
-	OIDCAuthStates map[string]auth.OIDCAuthState `json:"oidc_auth_states"`
+	UsageDayNodes map[string]UsageDayNode `json:"usage_day_node"`
+	UsageDayUsers map[string]UsageDayUser `json:"usage_day_user"`
+	// NodeStatusEvents is the node status history (node_status_events.go),
+	// keyed "<id>/<instant>" and placed like the day rollups.
+	NodeStatusEvents map[string]NodeStatusEvent    `json:"node_status_events"`
+	TOTPChallenges   map[string]auth.TOTPChallenge `json:"totp_challenges"`
+	OIDCProviders    map[string]model.OIDCProvider `json:"oidc_providers"`
+	OIDCIdentities   map[string]model.OIDCIdentity `json:"oidc_identities"`
+	OIDCAuthStates   map[string]auth.OIDCAuthState `json:"oidc_auth_states"`
 	// WebAuthnCreds holds registered passkeys keyed by store record id. The public
 	// keys and credential ids are non-secret, so this map is persisted as-is (no
 	// at-rest envelope like Users/Sessions carry).
@@ -581,6 +584,9 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 	if err := bs.SeedUsageDays(st.UsageDayNodes, st.UsageDayUsers); err != nil {
 		return err
 	}
+	if err := bs.SeedNodeStatusEvents(st.NodeStatusEvents); err != nil {
+		return err
+	}
 	if !subscriptionAuthorityInitialized {
 		if err := bs.initializeSubscriptionHotAuthority(mergeSubscriptionHotSeed(st, existing)); err != nil {
 			return err
@@ -675,6 +681,7 @@ func mergeRuntimeBoltHotState(dst *State, hot State) {
 	// be a stale duplicate that jsonPersistState drops on the next write.
 	dst.UsageDayNodes = map[string]UsageDayNode{}
 	dst.UsageDayUsers = map[string]UsageDayUser{}
+	dst.NodeStatusEvents = map[string]NodeStatusEvent{}
 	// Once enabled, Bolt is authoritative for these hot collections, including
 	// explicit empty/delete state. Conditional non-empty merge resurrects records
 	// from the stale JSON bootstrap after a valid hot deletion.
@@ -778,6 +785,7 @@ func emptyState() State {
 		ProxyUsage:              map[string]model.ProxyUsageSnapshot{},
 		UsageDayNodes:           map[string]UsageDayNode{},
 		UsageDayUsers:           map[string]UsageDayUser{},
+		NodeStatusEvents:        map[string]NodeStatusEvent{},
 		TOTPChallenges:          map[string]auth.TOTPChallenge{},
 		OIDCProviders:           map[string]model.OIDCProvider{},
 		OIDCIdentities:          map[string]model.OIDCIdentity{},
@@ -955,6 +963,9 @@ func (st *State) ensureMaps() {
 	if st.UsageDayUsers == nil {
 		st.UsageDayUsers = map[string]UsageDayUser{}
 	}
+	if st.NodeStatusEvents == nil {
+		st.NodeStatusEvents = map[string]NodeStatusEvent{}
+	}
 	if st.TOTPChallenges == nil {
 		st.TOTPChallenges = map[string]auth.TOTPChallenge{}
 	}
@@ -1039,6 +1050,7 @@ func (s *Store) jsonPersistStateFrom(st State) State {
 	st.ProxyUsage = map[string]model.ProxyUsageSnapshot{}
 	st.UsageDayNodes = map[string]UsageDayNode{}
 	st.UsageDayUsers = map[string]UsageDayUser{}
+	st.NodeStatusEvents = map[string]NodeStatusEvent{}
 	// Shares are read on every public subscription fetch and written whenever one
 	// is created or rotated. They belong on the record-level path for the same
 	// reason proxy users do: keeping them here would put a hot read behind a file
@@ -1469,18 +1481,22 @@ func (s *Store) Nodes() []model.Node {
 	return out
 }
 
-func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, publicIPv6, internalIP, internalIPv6, wgIP string, hostFacts model.HostFacts) error {
+// UpdateMetrics applies one heartbeat. It reports whether the beat turned the
+// node from offline to online, so the caller can audit the edge the way the
+// liveness sweep audits the other one.
+func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, publicIP, publicIPv6, internalIP, internalIPv6, wgIP string, hostFacts model.HostFacts) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n, ok := s.state.Nodes[nodeID]
 	if !ok {
-		return fmt.Errorf("node %q not found", nodeID)
+		return false, fmt.Errorf("node %q not found", nodeID)
 	}
 	if s.metricsPersistedAt == nil {
 		s.metricsPersistedAt = map[string]time.Time{}
 	}
 	now := time.Now().UTC()
-	durableChanged := !n.Online
+	cameOnline := !n.Online
+	durableChanged := cameOnline
 	previousPublicIP, previousWireGuardIP := n.PublicIP, n.WireGuardIP
 	n.Metrics = metrics
 	n.LastSeen = now
@@ -1523,15 +1539,23 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 		s.invalidateGuardBindingsForNodeLocked(nodeID)
 		durableChanged = true
 	}
+	if cameOnline {
+		// Inside the write this beat forces anyway: durableChanged is set, so
+		// the Save below always runs and the row rides along with it.
+		ev := NodeStatusEvent{At: now, To: NodeStatusOnline, Cause: NodeStatusCauseBeat}
+		if err := s.appendNodeStatusEventsLocked([]nodeStatusAppend{{id: nodeID, event: ev}}); err != nil {
+			return true, err
+		}
+	}
 	lastPersisted, persisted := s.metricsPersistedAt[nodeID]
 	if persisted && !durableChanged && now.Sub(lastPersisted) < metricsPersistenceInterval {
-		return nil
+		return false, nil
 	}
 	if err := s.Save(); err != nil {
-		return err
+		return cameOnline, err
 	}
 	s.metricsPersistedAt[nodeID] = now
-	return nil
+	return cameOnline, nil
 }
 
 func hostFactsDurableChanged(prev, next model.HostFacts) bool {
@@ -1561,20 +1585,26 @@ func absDuration(d time.Duration) time.Duration {
 // liveness sweep that corrects the otherwise-sticky Online flag (which was only
 // ever set true on a beat and never reset, so a dead node kept showing online
 // forever). It returns the nodes that transitioned online->offline so the caller
-// can audit/notify, and persists once if anything changed.
-func (s *Store) MarkStaleNodesOffline(threshold time.Duration, now time.Time) ([]model.Node, error) {
+// can audit/notify, and persists once if anything changed. cause names the
+// sweep in each flipped node's status history.
+func (s *Store) MarkStaleNodesOffline(threshold time.Duration, now time.Time, cause string) ([]model.Node, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var flipped []model.Node
+	var events []nodeStatusAppend
 	for nodeID, n := range s.state.Nodes {
 		if n.Online && !n.LastSeen.IsZero() && now.Sub(n.LastSeen) > threshold {
 			n.Online = false
 			s.state.Nodes[nodeID] = n
 			flipped = append(flipped, n)
+			events = append(events, nodeStatusAppend{id: nodeID, event: NodeStatusEvent{At: now.UTC(), To: NodeStatusOffline, Cause: cause}})
 		}
 	}
 	if len(flipped) == 0 {
 		return nil, nil
+	}
+	if err := s.appendNodeStatusEventsLocked(events); err != nil {
+		return flipped, err
 	}
 	if err := s.Save(); err != nil {
 		return flipped, err

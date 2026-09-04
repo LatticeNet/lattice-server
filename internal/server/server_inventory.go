@@ -14,6 +14,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 const (
@@ -798,19 +799,24 @@ const (
 // dead nodes as online and geo-routing kept treating them as healthy.
 func (s *Server) startNodeLivenessSweeper() {
 	go func() {
-		s.sweepNodeLiveness(s.now())
+		s.sweepNodeLiveness(s.now(), store.NodeStatusCauseServerStart)
 		ticker := time.NewTicker(nodeLivenessSweepInterval)
 		defer ticker.Stop()
 		for range ticker.C {
-			s.sweepNodeLiveness(s.now())
+			s.sweepNodeLiveness(s.now(), store.NodeStatusCauseLivenessSweep)
 		}
 	}()
 }
 
-func (s *Server) sweepNodeLiveness(now time.Time) {
-	flipped, err := s.store.MarkStaleNodesOffline(nodeOfflineThreshold, now)
+// cause names the sweep in each flipped node's status history: the one at
+// start reads a fleet the previous process last saw, a tick reads live silence.
+func (s *Server) sweepNodeLiveness(now time.Time, cause string) {
+	flipped, err := s.store.MarkStaleNodesOffline(nodeOfflineThreshold, now, cause)
 	if err != nil {
 		s.logger.Printf("node liveness sweep: %v", err)
+	}
+	if _, err := s.store.PruneNodeStatusEvents(now.Add(-store.NodeStatusEventRetention)); err != nil {
+		s.logger.Printf("node status history prune: %v", err)
 	}
 	for _, n := range flipped {
 		name := n.Name
@@ -826,6 +832,18 @@ func (s *Server) sweepNodeLiveness(now time.Time) {
 		})
 		s.emitNotify("🔌 节点离线", fmt.Sprintf("节点 %s (%s) 超过 %s 未上报心跳，已标记为离线。", name, n.ID, nodeOfflineThreshold))
 	}
+}
+
+// recordNodeOnline is the audit twin of the sweep's node.offline, written on
+// the beat that ends an offline episode.
+func (s *Server) recordNodeOnline(nodeID string) {
+	s.recordAudit(model.AuditEvent{
+		ID:     id.New("audit"),
+		NodeID: nodeID,
+		Action: "node.online",
+		Scope:  "node:read",
+		Reason: "heartbeat resumed",
+	})
 }
 
 func (s *Server) evaluateReminders(now time.Time) {

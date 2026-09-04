@@ -881,6 +881,15 @@ func (s *Server) handleNetGuardAdopt(w http.ResponseWriter, r *http.Request, p p
 	binding.GroupIDs = []string{saved.ID}
 	storedBinding, err := s.store.UpsertNodeGuardBinding(binding)
 	if err != nil {
+		// Reusing the observe-only record's version makes this an optimistic
+		// write: a bump between the read above and this upsert (a racing
+		// adopt, a binding edit, or the group upsert above invalidating a
+		// record that already referenced the legacy group) is the same
+		// retryable 409 every other binding upsert in this file reports.
+		if errors.Is(err, store.ErrGuardVersionConflict) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

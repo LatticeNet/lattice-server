@@ -144,6 +144,44 @@ func TestNetGuardAdoptReplacesAnObserveOnlyBinding(t *testing.T) {
 	}
 }
 
+// Adoption reuses the observe-only record's version for its upsert, so it is
+// now an optimistic-concurrency write like every other binding upsert in the
+// file. A version bump between the read and the write must surface as the
+// same 409 the sibling handlers return, not as a raw 500. The handler produces
+// that bump itself when the record references the legacy group and carries a
+// plan sha: storing the group invalidates the binding.
+func TestNetGuardAdoptReportsBindingVersionConflictAs409(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[22,443]}`, cookies, csrf)
+	defer save.Body.Close()
+	_, err := st.UpsertNodeGuardBinding(model.NodeGuardBinding{
+		NodeID:      "node-a",
+		Managed:     false,
+		GroupIDs:    []string{netguard.LegacyGroupPrefix + "node-a"},
+		LastPlanSHA: "sha256:stale-observe-only-plan",
+	})
+	if err != nil {
+		t.Fatalf("seed observe-only binding: %v", err)
+	}
+
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusConflict {
+		t.Fatalf("adopt over a binding whose version moved = %d, want 409", adopt.StatusCode)
+	}
+	var body model.APIErrorResponse
+	if err := json.NewDecoder(adopt.Body).Decode(&body); err != nil {
+		t.Fatalf("decode adopt error: %v", err)
+	}
+	if !strings.Contains(body.Error.Message, "version conflict") {
+		t.Fatalf("adopt conflict message = %q, want the store's version conflict message", body.Error.Message)
+	}
+}
+
 func TestNetGuardReviewPreviewsRulesetAndFindings(t *testing.T) {
 	handler, _ := newTestServerWithPublicURL(t, "https://203.0.113.99")
 	cookies, csrf := loginSession(t, handler)

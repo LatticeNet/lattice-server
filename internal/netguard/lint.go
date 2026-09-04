@@ -42,6 +42,13 @@ const (
 	// that interface matches nothing, the default drop takes over, and the
 	// lockout check above still counts those accepts as a way in.
 	FindingInterfaceMissing = "interface_missing"
+	// FindingInterfaceUnverified fires when a rule matches an inbound interface
+	// but the node has never reported which interfaces it has, so the lint
+	// cannot tell a right name from a wrong one. It blocks rather than warns
+	// because the wrong name is the lockout above, and a node that has not
+	// reported is exactly the node most likely to be running an agent old
+	// enough to have been enrolled with the eth0 guess.
+	FindingInterfaceUnverified = "interface_unverified"
 
 	SeverityBlock = "block"
 	SeverityWarn  = "warn"
@@ -93,14 +100,28 @@ func Lint(plan network.NFTPlan, opts LintOptions) []Finding {
 				pluralPort(len(ports)), joinManagementPorts(ports)),
 		})
 	}
-	for _, name := range missingInterfaces(plan, opts.Reality) {
+	if named := planInterfaces(plan); len(named) > 0 && !reportsInterfaces(opts.Reality) {
+		// Fail closed. With nothing to compare against the lint cannot say the
+		// interface exists, and "cannot confirm" has to read as a block: the
+		// plan that names eth0 on an ens17 box is indistinguishable from a
+		// correct one until the node reports.
 		findings = append(findings, Finding{
-			Code:     FindingInterfaceMissing,
+			Code:     FindingInterfaceUnverified,
 			Severity: SeverityBlock,
 			Message: fmt.Sprintf(
-				"rules in this plan match inbound interface %q, but the node reports %s. They match nothing on this box, so every accept they carry is dead and the default drop applies in its place; the management-port check still counts them, which is how a wrong interface name becomes a lockout. Point the zone at an interface the node actually has.",
-				name, joinInterfaceNames(opts.Reality)),
+				"rules in this plan match inbound %s %s, but the node has never reported its interfaces, so the lint cannot confirm %s. An accept on an interface the node does not have matches nothing, the default drop applies in its place, and the management-port check still counts it, which is how a wrong interface name becomes a lockout. Upgrade the node agent so interfaces are reported, or explicitly accept the lockout risk.",
+				pluralInterface(len(named)), joinQuoted(named), existsPhrase(len(named))),
 		})
+	} else {
+		for _, name := range missingInterfaces(named, opts.Reality) {
+			findings = append(findings, Finding{
+				Code:     FindingInterfaceMissing,
+				Severity: SeverityBlock,
+				Message: fmt.Sprintf(
+					"rules in this plan match inbound interface %q, but the node reports %s. They match nothing on this box, so every accept they carry is dead and the default drop applies in its place; the management-port check still counts them, which is how a wrong interface name becomes a lockout. Point the zone at an interface the node actually has.",
+					name, joinInterfaceNames(opts.Reality)),
+			})
+		}
 	}
 	if !evidence {
 		findings = append(findings, Finding{
@@ -248,36 +269,54 @@ func acceptsAnyPort(plan network.NFTPlan, ports []int) bool {
 	return false
 }
 
-// missingInterfaces returns, sorted, every interface name the plan renders an
-// iifname match for that the node's reported interfaces do not include. The
-// public interface counts only when a public port list renders it; a plan with
-// no public rules never emits it, so its name cannot hurt anyone. With no
-// reported interfaces there is nothing to compare against, and the answer is
-// empty rather than a guess.
-func missingInterfaces(plan network.NFTPlan, reality *model.GuardNodeReality) []string {
-	if reality == nil || len(reality.Interfaces) == 0 {
+// planInterfaces returns, sorted and unique, every interface name the plan
+// renders an iifname match for. The public interface counts only when a public
+// port list renders it; a plan with no public rules never emits it, so its name
+// cannot hurt anyone.
+func planInterfaces(plan network.NFTPlan) []string {
+	seen := map[string]bool{}
+	var names []string
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	if len(plan.PublicTCP) > 0 || len(plan.PublicUDP) > 0 {
+		add(plan.InterfaceName)
+	}
+	for _, rule := range plan.InputRules {
+		add(rule.Interface)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// reportsInterfaces reports whether the node has told us which interfaces it
+// has. Nil reality and an interface-less snapshot from an older agent are the
+// same answer: no evidence.
+func reportsInterfaces(reality *model.GuardNodeReality) bool {
+	return reality != nil && len(reality.Interfaces) > 0
+}
+
+// missingInterfaces returns, sorted, the named interfaces the node's reported
+// interfaces do not include. Only meaningful once reportsInterfaces is true.
+func missingInterfaces(named []string, reality *model.GuardNodeReality) []string {
+	if !reportsInterfaces(reality) {
 		return nil
 	}
 	reported := make(map[string]bool, len(reality.Interfaces))
 	for _, iface := range reality.Interfaces {
 		reported[strings.TrimSpace(iface.Name)] = true
 	}
-	seen := map[string]bool{}
 	var missing []string
-	check := func(name string) {
-		if name == "" || reported[name] || seen[name] {
-			return
+	for _, name := range named {
+		if !reported[name] {
+			missing = append(missing, name)
 		}
-		seen[name] = true
-		missing = append(missing, name)
 	}
-	if len(plan.PublicTCP) > 0 || len(plan.PublicUDP) > 0 {
-		check(plan.InterfaceName)
-	}
-	for _, rule := range plan.InputRules {
-		check(rule.Interface)
-	}
-	sort.Strings(missing)
 	return missing
 }
 
@@ -296,6 +335,28 @@ func joinManagementPorts(ports []int) string {
 		parts = append(parts, fmt.Sprintf("tcp/%d", port))
 	}
 	return strings.Join(parts, ", ")
+}
+
+func joinQuoted(names []string) string {
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%q", name))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func pluralInterface(n int) string {
+	if n == 1 {
+		return "interface"
+	}
+	return "interfaces"
+}
+
+func existsPhrase(n int) string {
+	if n == 1 {
+		return "it exists"
+	}
+	return "they exist"
 }
 
 func pluralPort(n int) string {

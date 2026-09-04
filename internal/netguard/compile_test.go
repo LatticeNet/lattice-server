@@ -366,13 +366,21 @@ func TestLintLockoutRisk(t *testing.T) {
 		return plan
 	}
 
+	// The node reports the interfaces the zones name, so the interface check
+	// stays out of the way and this test exercises only the management port.
+	// (The interface checks have their own tests in lint_reality_test.go.)
+	opts := LintOptions{PublicURLConfigured: true, Reality: &model.GuardNodeReality{
+		NodeID:     "n1",
+		Interfaces: []model.GuardInterface{{Name: "eth0", Up: true}, {Name: "tailscale0", Up: true}},
+	}}
+
 	// The dmit-eb-wee shape: 15 public ports, none of them 22.
 	risky := compile(model.NodeGuardBinding{NodeID: "n1"}, []model.GuardRule{{
 		ID: "svc", Action: model.NetRuleAllow, Direction: model.NetDirIngress,
 		Protocol: model.NetProtoTCP, Ports: []model.GuardPortRange{{From: 7443, To: 7443}},
 		Remote: pub,
 	}})
-	findings := Lint(risky, LintOptions{PublicURLConfigured: true})
+	findings := Lint(risky, opts)
 	if !Blocking(findings) {
 		t.Fatalf("a plan with no tcp/22 accept must block: %+v", findings)
 	}
@@ -386,13 +394,13 @@ func TestLintLockoutRisk(t *testing.T) {
 		Protocol: model.NetProtoTCP, Ports: []model.GuardPortRange{{From: 22, To: 22}},
 		Remote: pub,
 	}})
-	if Blocking(Lint(safe, LintOptions{PublicURLConfigured: true})) {
+	if Blocking(Lint(safe, opts)) {
 		t.Fatal("a plan that accepts tcp/22 must not block")
 	}
 
 	// So does trusting an overlay zone that still reaches the node.
 	viaOverlay := compile(model.NodeGuardBinding{NodeID: "n1", ZoneIDs: []string{model.GuardZoneTailscale}}, nil)
-	if Blocking(Lint(viaOverlay, LintOptions{PublicURLConfigured: true})) {
+	if Blocking(Lint(viaOverlay, opts)) {
 		t.Fatal("a trusted overlay zone must satisfy the management-path lint")
 	}
 }

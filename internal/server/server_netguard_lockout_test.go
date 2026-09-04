@@ -322,6 +322,70 @@ func TestNetGuardPlanBlocksWhenThePublicInterfaceIsNotOnTheNode(t *testing.T) {
 	}
 }
 
+// The same hole with no evidence at all: a freshly enrolled node, or one on an
+// agent too old to report interfaces, has never said what interfaces it has.
+// The public zone still resolves to eth0. The lint cannot confirm eth0 exists,
+// and "cannot confirm" fails closed: 409, no approval, until the operator
+// accepts the lockout risk on purpose.
+func TestNetGuardPlanBlocksWhenTheNodeHasNeverReportedInterfaces(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","public_tcp":[22]}`, cookies, csrf)
+	defer save.Body.Close()
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusOK {
+		t.Fatalf("adopt: %d", adopt.StatusCode)
+	}
+
+	// No reality posted: nil reality on the lint side.
+	blocked := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer blocked.Body.Close()
+	if blocked.StatusCode != http.StatusConflict {
+		t.Fatalf("a plan on eth0 for a node that never reported = %d, want 409", blocked.StatusCode)
+	}
+	var blockedRes struct {
+		Findings []netguard.Finding `json:"findings"`
+	}
+	if err := json.NewDecoder(blocked.Body).Decode(&blockedRes); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(blockedRes.Findings, netguard.FindingInterfaceUnverified) {
+		t.Fatalf("findings = %+v", blockedRes.Findings)
+	}
+	if hasFinding(blockedRes.Findings, netguard.FindingInterfaceMissing) || hasFinding(blockedRes.Findings, netguard.FindingLockoutRiskSSH) {
+		t.Fatalf("only the unverified interface may block here: %+v", blockedRes.Findings)
+	}
+	if len(st.Approvals()) != 0 {
+		t.Fatalf("a blocked plan must not file an approval: %+v", st.Approvals())
+	}
+
+	// The review preview says the same thing.
+	review := doJSON(t, handler, http.MethodGet, "/api/netguard/review?node_id=node-a", "", cookies, csrf)
+	defer review.Body.Close()
+	var out netGuardReviewResponse
+	if err := json.NewDecoder(review.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(out.Review.Findings, netguard.FindingInterfaceUnverified) {
+		t.Fatalf("review findings = %+v", out.Review.Findings)
+	}
+
+	// The only way past is the same explicit, audited flag as every other
+	// lockout finding.
+	accepted := doJSON(t, handler, http.MethodPost, "/api/netguard/plan",
+		`{"node_id":"node-a","accept_lockout_risk":true}`, cookies, csrf)
+	defer accepted.Body.Close()
+	if accepted.StatusCode != http.StatusOK {
+		t.Fatalf("accepting the lockout risk = %d, want 200", accepted.StatusCode)
+	}
+	if len(st.Approvals()) != 1 {
+		t.Fatalf("an accepted plan must file exactly one approval: %+v", st.Approvals())
+	}
+}
+
 // Review used to demand a stored binding, so every one of the fleet's 33 nodes
 // answered "adopt it first" and server-side suggestions never ran for anyone.
 // An unbound node now compiles as an empty observe-only binding: the review

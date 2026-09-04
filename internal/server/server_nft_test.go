@@ -87,8 +87,10 @@ func TestNFTInputsPersistAndPlanFromStoredState(t *testing.T) {
 	}
 
 	// No accept_lockout_risk here on purpose: the stored inputs above list
-	// tcp/22 in wireguard_tcp, so the composed chain still has a path to the
-	// shell and this plan clears the lockout lint on its own merits.
+	// tcp/22 in wireguard_tcp and the node reports ens3, so the composed chain
+	// still has a path to the shell and this plan clears the lockout lint on
+	// its own merits.
+	seedNodeReality(t, st, "node-a", 22, "ens3")
 	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
@@ -375,7 +377,7 @@ func TestNFTPlanAcceptsCallerSuppliedManagementPort(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
-	seedNodeShellReality(t, st, "node-a", 2222)
+	seedNodeReality(t, st, "node-a", 2222, "ens3")
 
 	res := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
 		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[443,2222]}`, cookies, csrf)

@@ -195,16 +195,44 @@ func TestLintBlocksWhenThePlanNamesAnInterfaceTheNodeDoesNotHave(t *testing.T) {
 	}
 }
 
-func TestLintCannotJudgeInterfacesWithoutReportedOnes(t *testing.T) {
-	// An older agent reports listeners but no interfaces. There is nothing to
-	// compare eth0 against, and inventing a verdict either way would be a
-	// guess dressed as a check.
-	reality := realityWithSSH(22, "sshd(701)", "0.0.0.0")
+// No reported interfaces is not a pass. A freshly enrolled node or one on an
+// agent too old to report interfaces is exactly the node still carrying the
+// eth0 guess, and "cannot confirm" has to block the same way "confirmed
+// wrong" does; the operator can accept the lockout risk, but only on purpose.
+func TestLintBlocksWhenTheNodeHasNotReportedInterfaces(t *testing.T) {
 	plan := network.NFTPlan{InterfaceName: "eth0", PublicTCP: []int{22}}
-	if _, ok := codes(Lint(plan, LintOptions{PublicURLConfigured: true, Reality: reality}))[FindingInterfaceMissing]; ok {
-		t.Fatal("no reported interfaces means no interface verdict")
+	cases := map[string]*model.GuardNodeReality{
+		"nil reality":              nil,
+		"listeners, no interfaces": realityWithSSH(22, "sshd(701)", "0.0.0.0"),
 	}
-	if _, ok := codes(Lint(plan, LintOptions{PublicURLConfigured: true}))[FindingInterfaceMissing]; ok {
-		t.Fatal("no reality at all means no interface verdict")
+	for name, reality := range cases {
+		findings := Lint(plan, LintOptions{PublicURLConfigured: true, Reality: reality})
+		if !Blocking(findings) {
+			t.Fatalf("%s: a plan that names an interface nobody can verify must block: %+v", name, findings)
+		}
+		found := codes(findings)
+		unverified, ok := found[FindingInterfaceUnverified]
+		if !ok {
+			t.Fatalf("%s: expected %s: %+v", name, FindingInterfaceUnverified, findings)
+		}
+		if unverified.Severity != SeverityBlock || !strings.Contains(unverified.Message, `"eth0"`) {
+			t.Fatalf("%s: finding must block and name the interface: %+v", name, unverified)
+		}
+		if _, ok := found[FindingInterfaceMissing]; ok {
+			t.Fatalf("%s: with no reported interfaces there is nothing to call missing: %+v", name, findings)
+		}
+		if _, ok := found[FindingLockoutRiskSSH]; ok {
+			t.Fatalf("%s: the port check is satisfied here; only the interface may block: %+v", name, findings)
+		}
+	}
+
+	// A plan that renders no interface has nothing to verify, so it stays clean
+	// even with no reality at all: the tcp/22 assumption is still only a warning.
+	unrendered := network.NFTPlan{
+		InterfaceName: "eth0",
+		InputRules:    []network.NFTInputRule{{Protocol: network.NFTProtoTCP, Ports: []int{22}, Action: network.NFTActionAccept}},
+	}
+	if findings := Lint(unrendered, LintOptions{PublicURLConfigured: true}); Blocking(findings) {
+		t.Fatalf("a plan that never renders an interface has nothing to verify: %+v", findings)
 	}
 }

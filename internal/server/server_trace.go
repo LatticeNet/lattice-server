@@ -179,6 +179,20 @@ func (s *Server) handleTraceConnections(w http.ResponseWriter, r *http.Request, 
 		writeJSON(w, http.StatusOK, tracestore.RecordPage{Records: []model.ConnRecord{}})
 		return
 	}
+	// What the store holds for everything this caller may see, before the
+	// operator's own filter narrows it. The page carries it so an empty result
+	// can say whether anything was ever collected.
+	visible := s.visibleNodeIDs(p, "log:read", nil)
+	if len(visible) == 0 {
+		// A requested node the store no longer lists still passed the scope
+		// check; count for those rather than for the whole store.
+		visible = nodes
+	}
+	collected, newest, err := s.traceStore.Collected(visible)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	page, err := s.traceStore.QueryRecords(tracestore.Filter{
 		Since:        since,
 		Until:        until,
@@ -204,6 +218,8 @@ func (s *Server) handleTraceConnections(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	page.CollectedTotal = collected
+	page.CollectedNewestAt = newest
 	writeJSON(w, http.StatusOK, page)
 }
 

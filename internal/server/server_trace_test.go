@@ -747,3 +747,55 @@ func TestDefaultCollectionLevelCanCompleteAConnection(t *testing.T) {
 		t.Fatalf("agent floor %q cannot deliver a close line", cfg.Policy.Level)
 	}
 }
+
+// An empty connections page has two meanings: the filter matched nothing, or
+// nothing was ever collected (every policy off). The page must say which.
+func TestTraceConnectionsSaysWhetherAnythingWasCollected(t *testing.T) {
+	handler, st, ts := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	readPage := func(path string) tracestore.RecordPage {
+		t.Helper()
+		res := doTrace(t, handler, http.MethodGet, path, cookies, csrf, nil)
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("%s answered %d", path, res.StatusCode)
+		}
+		var page tracestore.RecordPage
+		if err := json.NewDecoder(res.Body).Decode(&page); err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+
+	empty := readPage("/api/trace/connections")
+	if len(empty.Records) != 0 || empty.CollectedTotal != 0 || !empty.CollectedNewestAt.IsZero() {
+		t.Fatalf("nothing collected must read as total 0, got %+v", empty)
+	}
+
+	started := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	if _, err := ts.AppendRecords([]model.ConnRecord{{
+		NodeID: "node-a", LogID: 7, CoreGeneration: 1,
+		StartedAt: started, EndedAt: started.Add(time.Second),
+		DstHost: "example.org", CloseReason: model.CloseEOF,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	unmatched := readPage("/api/trace/connections?dst=nothing-like-this")
+	if len(unmatched.Records) != 0 {
+		t.Fatalf("the filter must match nothing, got %d records", len(unmatched.Records))
+	}
+	if unmatched.CollectedTotal != 1 {
+		t.Fatalf("collected_total = %d, want 1 so the console can tell filter-miss from empty store", unmatched.CollectedTotal)
+	}
+	if !unmatched.CollectedNewestAt.Equal(started) {
+		t.Fatalf("collected_newest_at = %s, want %s", unmatched.CollectedNewestAt, started)
+	}
+
+	matched := readPage("/api/trace/connections?dst=example")
+	if len(matched.Records) != 1 || matched.CollectedTotal != 1 {
+		t.Fatalf("a matching filter keeps the total, got %d records total %d", len(matched.Records), matched.CollectedTotal)
+	}
+}

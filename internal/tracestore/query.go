@@ -40,9 +40,37 @@ type Filter struct {
 
 // RecordPage is a newest-first page of records. An empty NextCursor means the
 // result was exhausted.
+//
+// CollectedTotal and CollectedNewestAt describe what the store holds for the
+// nodes the caller may see, before any operator filter. An empty Records with
+// CollectedTotal 0 means nothing has been collected (every policy off, or no
+// agent has reported yet); an empty Records with CollectedTotal above zero
+// means the filter matched nothing. Without the distinction both cases were
+// one empty list, and the console told an operator with tracing switched off
+// that "nothing matched these filters".
 type RecordPage struct {
-	Records    []model.ConnRecord `json:"records"`
-	NextCursor string             `json:"next_cursor,omitempty"`
+	Records           []model.ConnRecord `json:"records"`
+	NextCursor        string             `json:"next_cursor,omitempty"`
+	CollectedTotal    int64              `json:"collected_total"`
+	CollectedNewestAt time.Time          `json:"collected_newest_at,omitzero"`
+}
+
+// Collected counts every record the store holds for the given nodes, open or
+// final, and the start time of the newest one. An empty nodeIDs counts the
+// whole store.
+func (s *Store) Collected(nodeIDs []string) (int64, time.Time, error) {
+	query := "SELECT COUNT(*), MAX(started_at) FROM conn_records"
+	args := []any{}
+	if clause, in := inClause("node_id", nodeIDs); clause != "" {
+		query += " WHERE " + clause
+		args = append(args, in...)
+	}
+	var total int64
+	var newest sql.NullInt64
+	if err := s.db.QueryRow(query, args...).Scan(&total, &newest); err != nil {
+		return 0, time.Time{}, fmt.Errorf("tracestore: collected: %w", err)
+	}
+	return total, timeFromNanos(newest), nil
 }
 
 // RollupFilter mirrors the rollup grain: time, user, line, node.

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -298,5 +299,105 @@ func TestStorageBindingRejectsDuplicateRoute(t *testing.T) {
 	duplicate.Body.Close()
 	if duplicate.StatusCode != http.StatusConflict {
 		t.Fatalf("expected duplicate binding route to be rejected, got %d", duplicate.StatusCode)
+	}
+}
+
+// A demo written through the console surface must be removable through the
+// same surface, or every demo is a permanent write into production.
+func TestKVAndStaticEntriesDeleteThroughTheConsoleSurface(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+
+	put := doJSON(t, handler, http.MethodPost, "/api/kv",
+		`{"bucket":"demo","key":"greeting","value":"hello"}`, cookies, csrf)
+	put.Body.Close()
+	if put.StatusCode != http.StatusOK {
+		t.Fatalf("kv put failed: %d", put.StatusCode)
+	}
+	del := doJSON(t, handler, http.MethodPost, "/api/kv/delete", `{"bucket":"demo","key":"greeting"}`, cookies, csrf)
+	del.Body.Close()
+	if del.StatusCode != http.StatusOK {
+		t.Fatalf("kv delete answered %d, want 200", del.StatusCode)
+	}
+	list := doJSON(t, handler, http.MethodGet, "/api/kv?bucket=demo", "", cookies, csrf)
+	defer list.Body.Close()
+	body, _ := io.ReadAll(list.Body)
+	if strings.Contains(string(body), "greeting") {
+		t.Fatalf("kv entry still listed after delete: %s", body)
+	}
+	again := doJSON(t, handler, http.MethodPost, "/api/kv/delete", `{"bucket":"demo","key":"greeting"}`, cookies, csrf)
+	again.Body.Close()
+	if again.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleting a missing kv entry answered %d, want 404", again.StatusCode)
+	}
+	reserved := doJSON(t, handler, http.MethodPost, "/api/kv/delete", `{"bucket":"vpn_users","key":"x"}`, cookies, csrf)
+	reserved.Body.Close()
+	if reserved.StatusCode != http.StatusForbidden {
+		t.Fatalf("deleting from a reserved kv bucket answered %d, want 403", reserved.StatusCode)
+	}
+
+	putObj := doJSON(t, handler, http.MethodPost, "/api/static",
+		`{"bucket":"demo","path":"index.html","content":"<h1>hi</h1>","content_type":"text/html"}`, cookies, csrf)
+	putObj.Body.Close()
+	if putObj.StatusCode != http.StatusOK {
+		t.Fatalf("static put failed: %d", putObj.StatusCode)
+	}
+	delObj := doJSON(t, handler, http.MethodPost, "/api/static/delete", `{"bucket":"demo","path":"/index.html"}`, cookies, csrf)
+	delObj.Body.Close()
+	if delObj.StatusCode != http.StatusOK {
+		t.Fatalf("static delete answered %d, want 200", delObj.StatusCode)
+	}
+	listObj := doJSON(t, handler, http.MethodGet, "/api/static?bucket=demo", "", cookies, csrf)
+	defer listObj.Body.Close()
+	body, _ = io.ReadAll(listObj.Body)
+	if strings.Contains(string(body), "index.html") {
+		t.Fatalf("static object still listed after delete: %s", body)
+	}
+	againObj := doJSON(t, handler, http.MethodPost, "/api/static/delete", `{"bucket":"demo","path":"index.html"}`, cookies, csrf)
+	againObj.Body.Close()
+	if againObj.StatusCode != http.StatusNotFound {
+		t.Fatalf("deleting a missing static object answered %d, want 404", againObj.StatusCode)
+	}
+}
+
+// Deleting is a write. A reader must be refused by the scope gate before the
+// handler looks at the body.
+func TestKVAndStaticDeleteNeedTheWriteScope(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	put := doJSON(t, handler, http.MethodPost, "/api/kv",
+		`{"bucket":"demo","key":"greeting","value":"hello"}`, cookies, csrf)
+	put.Body.Close()
+	if put.StatusCode != http.StatusOK {
+		t.Fatalf("kv put failed: %d", put.StatusCode)
+	}
+	putObj := doJSON(t, handler, http.MethodPost, "/api/static",
+		`{"bucket":"demo","path":"index.html","content":"<h1>hi</h1>","content_type":"text/html"}`, cookies, csrf)
+	putObj.Body.Close()
+	if putObj.StatusCode != http.StatusOK {
+		t.Fatalf("static put failed: %d", putObj.StatusCode)
+	}
+	reader := createPAT(t, handler, cookies, csrf, []string{"kv:read", "static:read"}, nil)
+	for _, tc := range []struct{ path, body string }{
+		{"/api/kv/delete", `{"bucket":"demo","key":"greeting"}`},
+		{"/api/static/delete", `{"bucket":"demo","path":"index.html"}`},
+	} {
+		res := doBearerJSON(t, handler, http.MethodPost, tc.path, tc.body, reader)
+		res.Body.Close()
+		if res.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s with a read-only token answered %d, want 403", tc.path, res.StatusCode)
+		}
+	}
+	list := doJSON(t, handler, http.MethodGet, "/api/kv?bucket=demo", "", cookies, csrf)
+	defer list.Body.Close()
+	body, _ := io.ReadAll(list.Body)
+	if !strings.Contains(string(body), "greeting") {
+		t.Fatal("a refused kv delete must leave the entry in place")
+	}
+	listObj := doJSON(t, handler, http.MethodGet, "/api/static?bucket=demo", "", cookies, csrf)
+	defer listObj.Body.Close()
+	body, _ = io.ReadAll(listObj.Body)
+	if !strings.Contains(string(body), "index.html") {
+		t.Fatal("a refused static delete must leave the object in place")
 	}
 }

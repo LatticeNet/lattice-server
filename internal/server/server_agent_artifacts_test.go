@@ -453,15 +453,42 @@ func controlPlaneApprovalFor(st *store.Store, nodeID string) (model.Approval, bo
 }
 
 // Agent binaries are installed as root on every node. A static storage scope is
-// not the authority that decides what they are.
+// not the authority that decides what they are: static:read may see what the
+// bucket holds, never the bytes, and static:write may not replace, delete or
+// publish them.
 func TestGenericStaticSurfaceRefusesTheAgentReleaseBucket(t *testing.T) {
-	_, handler, _ := newAgentArtifactServer(t)
+	srv, handler, _ := newAgentArtifactServer(t)
+	data, digest := testAgentBinary()
+	ref := agentArtifactRef{Version: "0.3.4", OS: "linux", Arch: "amd64", SHA256: digest}
+	if _, err := srv.storeAgentArtifact(ref, data); err != nil {
+		t.Fatal(err)
+	}
 	cookies, csrf := loginSession(t, handler)
 
 	read := doJSON(t, handler, http.MethodGet, "/api/static?bucket="+agentArtifactBucket, "", cookies, csrf)
 	defer read.Body.Close()
-	if read.StatusCode != http.StatusForbidden {
-		t.Fatalf("reading the reserved bucket answered %d, want 403", read.StatusCode)
+	if read.StatusCode != http.StatusOK {
+		t.Fatalf("listing the reserved bucket answered %d, want 200 for static:read", read.StatusCode)
+	}
+	var listed []model.StaticObject
+	if err := json.NewDecoder(read.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].Path != ref.objectPath() {
+		t.Fatalf("listing = %+v, want the one stored release", listed)
+	}
+	if listed[0].Content != "" {
+		t.Fatal("the generic listing carried the agent binary")
+	}
+	if listed[0].Size != len(base64.StdEncoding.EncodeToString(data)) {
+		t.Fatalf("listed size %d must still say how much is stored", listed[0].Size)
+	}
+
+	del := doJSON(t, handler, http.MethodPost, "/api/static/delete",
+		`{"bucket":"`+agentArtifactBucket+`","path":"`+ref.objectPath()+`"}`, cookies, csrf)
+	defer del.Body.Close()
+	if del.StatusCode != http.StatusForbidden {
+		t.Fatalf("deleting from the reserved bucket answered %d, want 403", del.StatusCode)
 	}
 
 	write := doJSON(t, handler, http.MethodPost, "/api/static",

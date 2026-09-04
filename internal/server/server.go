@@ -1103,9 +1103,32 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/plugins/invoke", s.withAuth("plugin:admin", s.handlePluginInvoke))
 	mux.HandleFunc("/api/plugins/call", s.withAuth("", s.handlePluginCall))
 	mux.HandleFunc("/api/plugins/assets/", s.handlePluginAsset)
+	// Platform ruling (2026-09): the console has two platform capabilities and
+	// one evidence surface, matched to jobs rather than to API families.
+	//
+	// Store is the job "see what the control plane holds and for whom". One
+	// store with two kinds, KV and Static, under /api/kv and /api/static for
+	// entries and /api/storage/buckets for the inventory. Who writes: the
+	// console (audited kv.put, static.put, kv.delete, static.delete), plugins
+	// through the host call pinned to their own plugin:<id> bucket, the server
+	// itself for line identity (vpnmeta/*), the agent release upload into the
+	// reserved static bucket agent-releases, and a public KV binding holding a
+	// write token. Reserved buckets are named in the inventory and refused for
+	// writes through here; agent-releases lists its objects without the bytes.
 	mux.HandleFunc("/api/kv", s.withAuth("", s.handleKV))
+	mux.HandleFunc("/api/kv/delete", s.withAuth("kv:write", s.handleDeleteKV))
 	mux.HandleFunc("/api/static", s.withAuth("", s.handleStatic))
+	mux.HandleFunc("/api/static/delete", s.withAuth("static:write", s.handleDeleteStatic))
 	mux.HandleFunc("/api/storage/buckets", s.withAuth("", s.handleStorageBuckets))
+	// Publishing is the job "make these bytes reachable at a URL and say who
+	// may fetch them", for three origins: kv (a route that still demands a
+	// storage token on GET), static (anonymous public hosting of a bucket) and
+	// plugin (a subscription share, bearer token in the URL, under the reserved
+	// sub/ mount). The bindings and tokens below are the kv and static origins'
+	// write path; /api/publishing/records is the one read across all origins
+	// (see publishing.go). Workers was a fourth origin candidate and stays
+	// deleted (a87, d52674a): nothing routes to a worker, and a scripted origin
+	// returns only once a non-console caller for it is named.
 	mux.HandleFunc("/api/storage/bindings", s.withAuth("", s.handleStorageBindings))
 	mux.HandleFunc("/api/storage/bindings/delete", s.withAuth("", s.handleDeleteStorageBinding))
 	mux.HandleFunc("/api/storage/tokens", s.withAuth("", s.handleStorageTokens))
@@ -1165,6 +1188,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors", s.withAuth("", s.handleMonitors))
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
+	// Evidence is the job "show me what the nodes actually did": the log store
+	// (raw lines and file tails) and the trace store (sing-box connection
+	// records and captured sessions), both host-owned and both gated by the
+	// same log:read and log:admin scopes on purpose. Only node agents write,
+	// through /api/agent/logs, /api/agent/debug-events and /api/agent/trace;
+	// the plugin capability catalogue has no log scope, so a plugin cannot
+	// forge a line into an audit-grade store. Plugins contribute links into
+	// this surface, not data. A connections page that comes back empty says
+	// whether anything was collected at all (collected_total on the page)
+	// so the console can tell "nothing matched" from "nothing collected".
 	mux.HandleFunc("/api/logs/sources", s.withAuth("", s.handleLogSources))
 	mux.HandleFunc("/api/logs/sources/delete", s.withAuth("log:admin", s.handleDeleteLogSource))
 	mux.HandleFunc("/api/logs/query", s.withAuth("log:read", s.handleLogQuery))
@@ -4435,16 +4468,25 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 	if bucket == "" {
 		bucket = "default"
 	}
-	if reservedAgentArtifactBucket(bucket) {
-		writeError(w, http.StatusForbidden, errReservedAgentArtifactBucket())
-		return
-	}
 	switch r.Method {
 	case http.MethodGet:
 		if !s.requireScope(w, p, "static:read") {
 			return
 		}
-		writeJSON(w, http.StatusOK, s.store.Static(bucket))
+		objects := s.store.Static(bucket)
+		if reservedAgentArtifactBucket(bucket) {
+			// The reserved bucket is still part of the store, and a reader who
+			// may see every other bucket may see what this one holds. What
+			// stays out of reach is the bytes: nodes install them as root and
+			// fetch them under a task lease, so the listing carries the path,
+			// type, size and time and nothing else. The console asked for
+			// this bucket and was refused outright, which read as a fault
+			// rather than as a policy.
+			for i := range objects {
+				objects[i].Content = ""
+			}
+		}
+		writeJSON(w, http.StatusOK, objects)
 	case http.MethodPost:
 		if !s.requireScope(w, p, "static:write") {
 			return
@@ -4484,6 +4526,83 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+// handleDeleteKV removes one entry. Reserved buckets are refused for the same
+// reason writes into them are: the entry is typed private state owned by the
+// server or a plugin, and the generic surface is not its authority.
+func (s *Server) handleDeleteKV(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		Bucket string `json:"bucket"`
+		Key    string `json:"key"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if req.Bucket == "" {
+		req.Bucket = "default"
+	}
+	if reservedLineSecretKVBucket(req.Bucket) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorForbidden, "bucket is reserved for typed private state"))
+		return
+	}
+	if req.Key == "" {
+		writeError(w, http.StatusBadRequest, errors.New("key is required"))
+		return
+	}
+	if _, ok := s.store.KVEntry(req.Bucket, req.Key); !ok {
+		writeError(w, http.StatusNotFound, errors.New("kv entry not found"))
+		return
+	}
+	if err := s.store.DeleteKV(req.Bucket, req.Key); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "kv.delete", Scope: "kv:write", Metadata: map[string]string{"bucket": req.Bucket, "key": req.Key}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "bucket": req.Bucket, "key": req.Key})
+}
+
+// handleDeleteStatic removes one object. The agent release bucket is refused
+// here as it is for writes: deleting a release is an agent-update decision and
+// goes through /api/nodes/agent-updates/artifacts.
+func (s *Server) handleDeleteStatic(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		Bucket string `json:"bucket"`
+		Path   string `json:"path"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if req.Bucket == "" {
+		req.Bucket = "default"
+	}
+	if reservedAgentArtifactBucket(req.Bucket) {
+		writeError(w, http.StatusForbidden, errReservedAgentArtifactBucket())
+		return
+	}
+	clean, err := cleanObjectPath(req.Path)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, ok := s.store.StaticObject(req.Bucket, clean); !ok {
+		writeError(w, http.StatusNotFound, errors.New("static object not found"))
+		return
+	}
+	if err := s.store.DeleteStatic(req.Bucket, clean); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "static.delete", Scope: "static:write", Metadata: map[string]string{"bucket": req.Bucket, "path": clean}})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "bucket": req.Bucket, "path": clean})
 }
 
 // handleNotifyTest delivers a one-off test notification through a channel whose

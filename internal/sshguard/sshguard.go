@@ -59,10 +59,20 @@ const (
 	LegacyDropInPath = "/etc/ssh/sshd_config.d/60-lattice-guard.conf"
 
 	// KnockTable is deliberately not lattice_guard. See the package comment.
-	KnockTable   = "lattice_knock"
-	KnockNFTPath = "/etc/lattice/sshguard/knock.nft"
-	KnockdConf   = "/etc/knockd.conf"
-	StateDir     = "/etc/lattice/sshguard"
+	KnockTable = "lattice_knock"
+	// KnockdSection and KnockdPreviousSection name the two stanzas knockd.conf
+	// can carry: the sequence in force, and during a rotation the one being
+	// retired. The confirm script removes the second by name.
+	KnockdSection         = "openSSH"
+	KnockdPreviousSection = "openSSH-previous"
+	// KnockAllowedSet is where a knock opens the gate; KnockPreviousSet is
+	// where the sequence being rotated out opens it. Two sets, not one, so
+	// the confirm can tell which sequence admitted the operator.
+	KnockAllowedSet  = "allowed"
+	KnockPreviousSet = "allowed_previous"
+	KnockNFTPath     = "/etc/lattice/sshguard/knock.nft"
+	KnockdConf       = "/etc/knockd.conf"
+	StateDir         = "/etc/lattice/sshguard"
 	// RevertUnit is the transient timer that undoes an unconfirmed change. It
 	// really does revert, so the name is accurate.
 	RevertUnit = "lattice-sshguard-revert"
@@ -172,6 +182,15 @@ type KnockPolicy struct {
 	// on its own, which is why there is no close sequence: forgetting to close
 	// the door is a failure mode this design does not have.
 	OpenFor string
+
+	// PreviousPorts is the sequence being rotated out, when this arm is a
+	// rotation. It is rendered as a second knockd stanza that opens its own
+	// nftables set, so the sequence the operator already holds keeps opening
+	// the gate until the confirm approval retires it. Without this a rotation
+	// cut over the moment knockd restarted, and an operator who could not
+	// produce confirm evidence from a source the node sees had nothing but
+	// the revert timer between him and a lockout.
+	PreviousPorts []int
 }
 
 // Profile is one node's complete SSH guard intent.
@@ -357,11 +376,35 @@ func validateMaxStartups(value string) error {
 }
 
 func (k KnockPolicy) validate() error {
-	if len(k.Ports) != KnockSequenceLen {
-		return fmt.Errorf("knock sequence must be exactly %d ports, got %d", KnockSequenceLen, len(k.Ports))
+	if err := validateKnockPorts(k.Ports); err != nil {
+		return err
 	}
-	seen := make(map[int]bool, len(k.Ports))
-	for _, port := range k.Ports {
+	if len(k.PreviousPorts) > 0 {
+		if err := validateKnockPorts(k.PreviousPorts); err != nil {
+			return fmt.Errorf("previous %w", err)
+		}
+		if joinInts(k.PreviousPorts) == joinInts(k.Ports) {
+			// Keeping a sequence alive beside itself is not a rotation, and a
+			// plan that says it rotates while changing nothing is the kind of
+			// document that gets approved without being read.
+			return fmt.Errorf("previous knock sequence is the same as the new one; a rotation needs a fresh sequence")
+		}
+	}
+	if k.SeqTimeoutSec < 3 || k.SeqTimeoutSec > 120 {
+		return fmt.Errorf("knock seq_timeout %d is outside [3, 120]", k.SeqTimeoutSec)
+	}
+	if err := validateNFTTimeout(k.OpenFor); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateKnockPorts(ports []int) error {
+	if len(ports) != KnockSequenceLen {
+		return fmt.Errorf("knock sequence must be exactly %d ports, got %d", KnockSequenceLen, len(ports))
+	}
+	seen := make(map[int]bool, len(ports))
+	for _, port := range ports {
 		if port < knockPortMin || port > knockPortMax {
 			return fmt.Errorf("knock port %d is outside [%d, %d]", port, knockPortMin, knockPortMax)
 		}
@@ -372,12 +415,6 @@ func (k KnockPolicy) validate() error {
 			return fmt.Errorf("knock port %d appears twice in the sequence", port)
 		}
 		seen[port] = true
-	}
-	if k.SeqTimeoutSec < 3 || k.SeqTimeoutSec > 120 {
-		return fmt.Errorf("knock seq_timeout %d is outside [3, 120]", k.SeqTimeoutSec)
-	}
-	if err := validateNFTTimeout(k.OpenFor); err != nil {
-		return err
 	}
 	return nil
 }

@@ -378,6 +378,11 @@ func (s *Server) handleSSHGuardKnockState(w http.ResponseWriter, r *http.Request
 	if state.SSHPort > 0 {
 		out["ssh_port"] = state.SSHPort
 	}
+	// Mid-rotation: the arm kept the previous sequence alive and no confirm
+	// has retired it yet, so the knock the operator already holds still works.
+	if len(state.Sequence.PreviousPorts) > 0 && !state.Confirmed {
+		out["previous_honoured"] = true
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -445,7 +450,7 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 			"confirmed":   strconv.FormatBool(state.Confirmed),
 		},
 	})
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"ok":          true,
 		"node_id":     req.NodeID,
 		"knowledge":   string(state.Knowledge),
@@ -461,5 +466,13 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 		"ssh_port":        state.SSHPort,
 		"address":         state.Address,
 		"command":         state.Sequence.KnockCommand(state.Address, state.SSHPort),
-	})
+		// What a rotation request hands back as rotate_from_sha256. Returned
+		// here and nowhere else: the ports are already in this response, and
+		// a digest of three ports is not a secret on its own.
+		"sequence_sha256": sshguard.KnockSequenceDigest(state.Sequence.Ports),
+	}
+	if len(state.Sequence.PreviousPorts) > 0 && !state.Confirmed {
+		out["previous_ports"] = state.Sequence.PreviousPorts
+	}
+	writeJSON(w, http.StatusOK, out)
 }

@@ -267,14 +267,25 @@ func confirmScript(_ Artifacts) string {
 	// cannot be mistaken for evidence. That is the exact case this check exists
 	// to catch: the operator's current session is established and proves
 	// nothing about new ones.
-	fmt.Fprintf(&b, "  admitted=$(\"$NFT\" list chain inet %s input 2>/dev/null | grep -cE 'counter packets [1-9][0-9]* bytes [0-9]+ accept' || true)\n", KnockTable)
+	//
+	// During a rotation the sequence being retired opens its own set, and an
+	// entry there is excluded from the count: it proves the old sequence
+	// still works, which is not what confirming asserts.
+	fmt.Fprintf(&b, "  admitted=$(\"$NFT\" list chain inet %s input 2>/dev/null | grep -E 'counter packets [1-9][0-9]* bytes [0-9]+ accept' | grep -vc '@%s' || true)\n", KnockTable, KnockPreviousSet)
 	fmt.Fprintf(&b, "  if [ \"${admitted:-0}\" = 0 ]; then\n")
 	b.WriteString("    echo 'lattice sshguard: the gate has admitted nothing since it went up.' >&2\n")
 	b.WriteString("    echo 'Open a NEW connection over the new path first; the session you are' >&2\n")
-	b.WriteString("    echo 'reading this from is already established and proves nothing.' >&2\n")
+	b.WriteString("    echo 'reading this from is already established and proves nothing, and' >&2\n")
+	b.WriteString("    echo 'neither does an entry the previous knock sequence opened.' >&2\n")
 	b.WriteString("    exit 1\n")
 	b.WriteString("  fi\n")
 	b.WriteString("fi\n")
+	// Before the timer is cancelled, on purpose. If knockd does not come back
+	// after the stanza is removed, this exits non-zero with the revert still
+	// armed, and the node returns to the pre-rotation conf on its own. The
+	// other order would leave a permanent node with a dead knockd.
+	fmt.Fprintf(&b, "KNOCKD_CONF=%s\n", KnockdConf)
+	b.WriteString(retirePreviousKnockSnippet())
 	fmt.Fprintf(&b, "\"$SYSTEMCTL\" stop %s.timer 2>/dev/null || true\n", RevertUnit)
 	fmt.Fprintf(&b, "\"$SYSTEMCTL\" reset-failed %s.timer 2>/dev/null || true\n", RevertUnit)
 	fmt.Fprintf(&b, "if \"$SYSTEMCTL\" list-timers %s --no-pager 2>/dev/null | grep -q %s; then\n", RevertUnit, RevertUnit)
@@ -286,6 +297,29 @@ func confirmScript(_ Artifacts) string {
 	b.WriteString("fi\n")
 	b.WriteString("echo 'lattice sshguard: confirmed, configuration is now permanent and survives reboot'\n")
 	return b.String()
+}
+
+// retirePreviousKnockSnippet removes the rotation stanza from knockd.conf and
+// empties the set it opened. It reads $KNOCKD_CONF, $SYSTEMCTL and $NFT so a
+// test can point it at a file of its own; on a node that is not mid-rotation
+// it finds no stanza and does nothing.
+//
+// The rewrite goes through cat rather than mv so the file keeps its 0600 mode
+// and owner. awk drops lines from the stanza header up to the next header,
+// which is exactly the stanza and its comments, and nothing else.
+func retirePreviousKnockSnippet() string {
+	var s strings.Builder
+	fmt.Fprintf(&s, "if [ -f \"$KNOCKD_CONF\" ] && grep -q '^\\[%s\\]' \"$KNOCKD_CONF\"; then\n", KnockdPreviousSection)
+	fmt.Fprintf(&s, "  /usr/bin/awk '/^\\[%s\\]/{skip=1; next} /^\\[/{skip=0} !skip' \"$KNOCKD_CONF\" > \"$KNOCKD_CONF.confirm\"\n", KnockdPreviousSection)
+	s.WriteString("  cat \"$KNOCKD_CONF.confirm\" > \"$KNOCKD_CONF\" && rm -f \"$KNOCKD_CONF.confirm\"\n")
+	s.WriteString("  \"$SYSTEMCTL\" restart knockd\n")
+	s.WriteString("  \"$SYSTEMCTL\" is-active --quiet knockd || { echo 'lattice sshguard: knockd did not come back after retiring the previous sequence; leaving the revert armed' >&2; exit 1; }\n")
+	// Entries the old sequence opened stop working now rather than at their
+	// own timeout; anyone sitting on one is established and stays connected.
+	fmt.Fprintf(&s, "  \"$NFT\" flush set inet %s %s 2>/dev/null || true\n", KnockTable, KnockPreviousSet)
+	s.WriteString("  echo 'lattice sshguard: previous knock sequence retired; only the new one opens the gate now'\n")
+	s.WriteString("fi\n")
+	return s.String()
 }
 
 // revertScriptHeredoc writes the undo as a standalone file rather than a shell

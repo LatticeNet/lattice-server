@@ -527,3 +527,97 @@ func TestAHardenOnlyArmLeavesTheKnockUnknownRatherThanOff(t *testing.T) {
 		t.Fatalf("the note must say why the knock is unknown on a hardened node, got %q", note)
 	}
 }
+
+// A rotation must keep the sequence the node runs alive beside the new one,
+// and must refuse to retire a sequence other than the one the control plane
+// holds as installed: the operator names it by the digest the reveal returned.
+func TestRotationPlanKeepsTheInstalledSequenceUntilConfirm(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	base := time.Now().UTC().Add(-time.Hour)
+	seedArmApproval(t, st, "approval_arm", "node-a", model.ApprovalApplied, knockTestPorts, base)
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "approval_confirm", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: base.Add(5 * time.Minute), UpdatedAt: base.Add(6 * time.Minute)})
+	cookies, csrf := loginSession(t, handler)
+
+	grant := issueStepUpGrant(t, handler, cookies, csrf)
+	reveal := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock/reveal",
+		`{"node_id":"node-a","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	revealed := knockBody(t, reveal)
+	reveal.Body.Close()
+	digest, _ := revealed["sequence_sha256"].(string)
+	if digest != sshguard.KnockSequenceDigest(knockTestPorts) {
+		t.Fatalf("the reveal must hand over the digest a rotation names the sequence by, got %q", digest)
+	}
+
+	wrong := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan",
+		sshGuardPlanBody("node-a", map[string]any{"enable_knock": true, "rotate_from_sha256": sshguard.KnockSequenceDigest([]int{20001, 20002, 20003})}), cookies, csrf)
+	raw, _ := io.ReadAll(wrong.Body)
+	wrong.Body.Close()
+	if wrong.StatusCode != http.StatusConflict || !strings.Contains(string(raw), "approval_arm") {
+		t.Fatalf("rotating from a sequence the control plane does not hold must be refused and name the record it does hold: %d %s", wrong.StatusCode, raw)
+	}
+
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan",
+		sshGuardPlanBody("node-a", map[string]any{"enable_knock": true, "rotate_from_sha256": digest}), cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(res.Body)
+		t.Fatalf("rotation plan: want 200, got %d (%s)", res.StatusCode, raw)
+	}
+	var out struct {
+		Approval struct {
+			ID   string `json:"id"`
+			Plan string `json:"plan"`
+		} `json:"approval"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	art, err := sshguard.ParseApprovalPlan(out.Approval.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := sshguard.ParseKnockdConf(art.KnockdConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strconvJoin(seq.PreviousPorts) != strconvJoin(knockTestPorts) {
+		t.Fatalf("the plan must keep the installed sequence as the previous stanza, got %v", seq.PreviousPorts)
+	}
+	if strconvJoin(seq.Ports) == strconvJoin(knockTestPorts) {
+		t.Fatal("a rotation must draw a fresh sequence")
+	}
+	if !strings.Contains(out.Approval.Plan, "## Rotation") {
+		t.Fatal("the reviewer must be told the arm is a rotation")
+	}
+
+	// A node whose sequence Lattice never installed cannot resolve a digest,
+	// and says so; the explicit path exists for exactly that node.
+	enrolSSHGuard(t, st, "node-b")
+	if err := st.UpsertNode(model.Node{ID: "node-b", Name: "Node B", Online: true, LastSeen: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	unknown := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan",
+		sshGuardPlanBody("node-b", map[string]any{"enable_knock": true, "rotate_from_sha256": digest}), cookies, csrf)
+	raw, _ = io.ReadAll(unknown.Body)
+	unknown.Body.Close()
+	if unknown.StatusCode != http.StatusConflict || !strings.Contains(string(raw), "previous_knock_ports") {
+		t.Fatalf("a digest against an unknown sequence must be refused and point at the explicit path: %d %s", unknown.StatusCode, raw)
+	}
+	explicit := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan",
+		sshGuardPlanBody("node-b", map[string]any{"enable_knock": true, "previous_knock_ports": []int{27431, 45902, 38117}}), cookies, csrf)
+	defer explicit.Body.Close()
+	if explicit.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(explicit.Body)
+		t.Fatalf("an explicit previous sequence must plan: %d %s", explicit.StatusCode, raw)
+	}
+}
+
+func strconvJoin(ports []int) string {
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		parts = append(parts, strconv.Itoa(p))
+	}
+	return strings.Join(parts, ",")
+}

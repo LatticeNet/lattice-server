@@ -102,7 +102,8 @@ func (s *Server) sshGuardNodeReality(nodeID string) sshguard.NodeReality {
 			out.TerminalAvailable = node.AgentLaunch.AllowTerminal
 		}
 	}
-	if snapshot := s.guardRealityForLint(nodeID); snapshot != nil {
+	snapshot := s.guardRealityForLint(nodeID)
+	if snapshot != nil {
 		out.Reported = true
 		for _, listener := range snapshot.Listeners {
 			if listener.Protocol == "tcp" {
@@ -112,14 +113,14 @@ func (s *Server) sshGuardNodeReality(nodeID string) sshguard.NodeReality {
 		out.SSHPorts = sshListeningPorts(snapshot)
 	}
 	binding, ok := s.store.NodeGuardBinding(nodeID)
-	if !ok || binding.NodeID == "" {
+	if !ok || binding.NodeID == "" || !guardBindingGuardsNode(binding, snapshot) {
 		return out
 	}
 	out.ManagedByNetGuard = true
-	// GenerateNFTPlan emits `policy drop` unconditionally, so any node with a
-	// guard binding has a default-deny chain waiting at a higher priority than
-	// the knock table. That is precisely the case the override finding exists
-	// for.
+	// GenerateNFTPlan emits `policy drop` unconditionally, so a node whose
+	// guard table is in place has a default-deny chain at a higher priority
+	// than the knock table. That is precisely the case the override finding
+	// exists for.
 	out.GuardPolicyDrop = true
 	input, err := s.compileInputForSystem(nodeID)
 	if err != nil {
@@ -131,6 +132,39 @@ func (s *Server) sshGuardNodeReality(nodeID string) sshguard.NodeReality {
 	}
 	out.GuardAcceptedTCPPorts, out.GuardAcceptsAllTCP = guardAcceptedTCPPorts(plan)
 	return out
+}
+
+// guardBindingGuardsNode reports whether a guard binding stands for a
+// lattice_guard table that is actually in front of this node, which is the
+// only case in which it can override a knock table's accept.
+//
+// A binding record is not a firewall. The port plan writes an observe-only
+// binding (managed=false) for every node it looks at, purely so the netguard
+// view has something to display, and nothing is ever applied from one: Compile
+// refuses it with ErrNodeUnmanaged. Treating that record as "guarded" is what
+// blocked every knock rotation on the fleet the day twenty-four of them were
+// written, with a message about a table that did not exist on any of the
+// nodes. A managed binding is intent, and intent only becomes a table once an
+// apply has landed.
+//
+// Two signals say the table is there. The apply path stamps AppliedTableSHA
+// and LastAppliedAt on the binding when the node's task result reports the
+// managed_sha it installed. The node's own reality report carries ManagedSHA,
+// the hash of the lattice_guard table nft currently lists, which is the
+// stronger of the two because it is what the node says rather than what the
+// control plane remembers, and it also covers a table applied before the
+// result was wired back into the binding. Either is enough, but only under a
+// managed binding: a lattice_guard table on a node nobody adopted is not
+// netguard's to describe, and its accept list cannot be compiled from a
+// binding that Compile refuses.
+func guardBindingGuardsNode(binding model.NodeGuardBinding, reality *model.GuardNodeReality) bool {
+	if !binding.Managed {
+		return false
+	}
+	if strings.TrimSpace(binding.AppliedTableSHA) != "" || !binding.LastAppliedAt.IsZero() {
+		return true
+	}
+	return reality != nil && strings.TrimSpace(reality.ManagedSHA) != ""
 }
 
 // guardAcceptedTCPPorts collects every TCP port a compiled guard plan can

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -175,6 +176,109 @@ func TestSSHGuardPlanBlocksAPortThatIsAlreadyBound(t *testing.T) {
 	defer accepted.Body.Close()
 	if accepted.StatusCode != http.StatusOK {
 		t.Fatalf("an explicit override must be allowed and recorded, got %d", accepted.StatusCode)
+	}
+}
+
+// sshGuardPlanFindings posts a knock plan for node-a and returns the status
+// and the finding codes the response carried, on either the 200 or the 409
+// shape.
+func sshGuardPlanFindings(t *testing.T, handler http.Handler, token string) (int, []string) {
+	t.Helper()
+	resp := doBearerJSON(t, handler, http.MethodPost, "/api/sshguard/plan", sshGuardPlanBody("node-a", nil), token)
+	defer resp.Body.Close()
+	var out struct {
+		Findings []sshguard.Finding `json:"findings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode plan response: %v", err)
+	}
+	codes := make([]string, 0, len(out.Findings))
+	for _, finding := range out.Findings {
+		codes = append(codes, finding.Code)
+	}
+	return resp.StatusCode, codes
+}
+
+// An observe-only guard binding is a display record: managed=false, nothing
+// ever applied, and Compile refuses to plan from it. On 2026-09-04 the port
+// plan wrote twenty-four of them and every knock rotation on the fleet was
+// refused for a lattice_guard table that existed on none of the nodes. A
+// binding that manages nothing cannot override anything.
+func TestSSHGuardPlanIgnoresAnObserveOnlyGuardBinding(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	if _, err := st.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "node-a", Managed: false}); err != nil {
+		t.Fatalf("seed observe-only binding: %v", err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"network:plan", "sshguard:admin"}, []string{"node-a"})
+
+	status, codes := sshGuardPlanFindings(t, handler, token)
+	if slices.Contains(codes, sshguard.FindingOverriddenByGuard) {
+		t.Fatalf("an observe-only binding must not raise the override finding, got %v", codes)
+	}
+	if status != http.StatusOK {
+		t.Fatalf("a knock plan on a node with an observe-only binding must go through, got %d with %v", status, codes)
+	}
+}
+
+// The other half of the same rule: a managed binding whose table has landed
+// on the node, and whose ruleset does not accept the gate port, is exactly the
+// override the finding exists for, and it keeps blocking.
+func TestSSHGuardPlanStaysBlockedByAnAppliedGuardThatDropsTheGatePort(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	// Managed and applied, with no groups: the compiled plan is policy drop
+	// and accepts nothing, so neither the legacy port nor the gate port gets
+	// through lattice_guard.
+	if _, err := st.UpsertNodeGuardBinding(model.NodeGuardBinding{
+		NodeID: "node-a", Managed: true,
+		AppliedTableSHA: "3f0c2a1d", LastAppliedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed managed binding: %v", err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	token := createPAT(t, handler, cookies, csrf, []string{"network:plan", "sshguard:admin"}, []string{"node-a"})
+
+	status, codes := sshGuardPlanFindings(t, handler, token)
+	if !slices.Contains(codes, sshguard.FindingOverriddenByGuard) {
+		t.Fatalf("an applied guard that drops the gate port must raise the override finding, got %v", codes)
+	}
+	if status != http.StatusConflict {
+		t.Fatalf("the override finding blocks the plan, got %d", status)
+	}
+}
+
+// guardBindingGuardsNode is the single predicate behind the two tests above.
+// Its edges: managed is necessary, and then either the apply record or the
+// node's own report of the table is sufficient.
+func TestGuardBindingGuardsNodeNeedsManagedAndATable(t *testing.T) {
+	applied := time.Now().UTC()
+	reported := &model.GuardNodeReality{NodeID: "node-a", ManagedSHA: "9b1e"}
+	unreported := &model.GuardNodeReality{NodeID: "node-a"}
+	cases := []struct {
+		name    string
+		binding model.NodeGuardBinding
+		reality *model.GuardNodeReality
+		want    bool
+	}{
+		{"observe-only, nothing on the node", model.NodeGuardBinding{NodeID: "node-a"}, nil, false},
+		{"observe-only, node reports a table", model.NodeGuardBinding{NodeID: "node-a"}, reported, false},
+		{"observe-only with a stale applied sha", model.NodeGuardBinding{NodeID: "node-a", AppliedTableSHA: "9b1e"}, nil, false},
+		{"managed, never applied, no report", model.NodeGuardBinding{NodeID: "node-a", Managed: true}, nil, false},
+		{"managed, never applied, node reports no table", model.NodeGuardBinding{NodeID: "node-a", Managed: true}, unreported, false},
+		{"managed, applied sha recorded", model.NodeGuardBinding{NodeID: "node-a", Managed: true, AppliedTableSHA: "9b1e"}, nil, true},
+		{"managed, applied timestamp only", model.NodeGuardBinding{NodeID: "node-a", Managed: true, LastAppliedAt: applied}, nil, true},
+		{"managed, node reports the table", model.NodeGuardBinding{NodeID: "node-a", Managed: true}, reported, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := guardBindingGuardsNode(tc.binding, tc.reality); got != tc.want {
+				t.Fatalf("guardBindingGuardsNode = %v want %v", got, tc.want)
+			}
+		})
 	}
 }
 

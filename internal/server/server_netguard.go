@@ -850,7 +850,12 @@ func (s *Server) handleNetGuardAdopt(w http.ResponseWriter, r *http.Request, p p
 	if !s.requireNodeScope(w, p, "netguard:admin", req.NodeID) {
 		return
 	}
-	if _, ok := s.store.NodeGuardBinding(req.NodeID); ok {
+	// Only a managed binding means the node is adopted. An observe-only
+	// binding is the display record the port plan writes for a node it merely
+	// looked at; adoption is how that record becomes real, so it is replaced
+	// (at its current version) rather than reported as a conflict.
+	existing, hasBinding := s.store.NodeGuardBinding(req.NodeID)
+	if hasBinding && existing.Managed {
 		writeError(w, http.StatusConflict, errors.New("node is already adopted"))
 		return
 	}
@@ -861,18 +866,42 @@ func (s *Server) handleNetGuardAdopt(w http.ResponseWriter, r *http.Request, p p
 	}
 	view := netguard.LegacyBaseline(inputs)
 	group := view.Group
+	// The legacy group is node-private and derived from NFTInputs, so an
+	// existing copy (left by an adoption whose binding upsert failed, or by a
+	// release that deleted the binding but not the group) is replaced at its
+	// current version. A fresh Version 0 against it would be a conflict no
+	// retry could clear.
 	group.Version = 0
+	if stored, ok := s.store.SecurityGroup(group.ID); ok {
+		group.Version = stored.Version
+	}
 	saved, err := s.store.UpsertSecurityGroup(group)
 	if err != nil {
+		if errors.Is(err, store.ErrGuardVersionConflict) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	binding := view.Binding
 	binding.Version = 0
+	if hasBinding {
+		binding.Version = existing.Version
+	}
 	binding.Managed = true
 	binding.GroupIDs = []string{saved.ID}
 	storedBinding, err := s.store.UpsertNodeGuardBinding(binding)
 	if err != nil {
+		// Reusing the observe-only record's version makes this an optimistic
+		// write: a bump between the read above and this upsert (a racing
+		// adopt, a binding edit, or the group upsert above invalidating a
+		// record that already referenced the legacy group) is the same
+		// retryable 409 every other binding upsert in this file reports.
+		if errors.Is(err, store.ErrGuardVersionConflict) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

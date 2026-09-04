@@ -106,6 +106,148 @@ func TestNetGuardPlanBlocksWhenRealitySaysSSHMoved(t *testing.T) {
 
 // The review method is the read-side preview: an operator has to be able to see
 // the ruleset and its lockout verdict without creating an approval first.
+// An observe-only binding is not an adoption. The port plan writes one for
+// every node it looks at, so "already adopted" on its mere existence would
+// force an operator to delete the record before adopting the node it
+// describes. Adoption replaces it with the managed legacy baseline; a second
+// adoption of a managed node is still the conflict it always was.
+func TestNetGuardAdoptReplacesAnObserveOnlyBinding(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[22,443]}`, cookies, csrf)
+	defer save.Body.Close()
+	observe, err := st.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "node-a", Managed: false})
+	if err != nil {
+		t.Fatalf("seed observe-only binding: %v", err)
+	}
+
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusOK {
+		t.Fatalf("adopting over an observe-only binding = %d, want 200", adopt.StatusCode)
+	}
+	managed, ok := st.NodeGuardBinding("node-a")
+	if !ok || !managed.Managed || len(managed.GroupIDs) != 1 {
+		t.Fatalf("adoption must leave a managed binding on the legacy group, got ok=%v %+v", ok, managed)
+	}
+	if managed.Version != observe.Version+1 {
+		t.Fatalf("adoption replaces the record in place: version %d want %d", managed.Version, observe.Version+1)
+	}
+
+	again := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer again.Body.Close()
+	if again.StatusCode != http.StatusConflict {
+		t.Fatalf("adopting a managed node = %d, want 409", again.StatusCode)
+	}
+}
+
+// Adoption reuses the observe-only record's version for its upsert, so it is
+// now an optimistic-concurrency write like every other binding upsert in the
+// file. A version bump between the read and the write must surface as the
+// same 409 the sibling handlers return, not as a raw 500. The handler produces
+// that bump itself when the record references the legacy group and carries a
+// plan sha: storing the group invalidates the binding.
+func TestNetGuardAdoptReportsBindingVersionConflictAs409(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[22,443]}`, cookies, csrf)
+	defer save.Body.Close()
+	_, err := st.UpsertNodeGuardBinding(model.NodeGuardBinding{
+		NodeID:      "node-a",
+		Managed:     false,
+		GroupIDs:    []string{netguard.LegacyGroupPrefix + "node-a"},
+		LastPlanSHA: "sha256:stale-observe-only-plan",
+	})
+	if err != nil {
+		t.Fatalf("seed observe-only binding: %v", err)
+	}
+
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusConflict {
+		t.Fatalf("adopt over a binding whose version moved = %d, want 409", adopt.StatusCode)
+	}
+	var body model.APIErrorResponse
+	if err := json.NewDecoder(adopt.Body).Decode(&body); err != nil {
+		t.Fatalf("decode adopt error: %v", err)
+	}
+	if !strings.Contains(body.Error.Message, "version conflict") {
+		t.Fatalf("adopt conflict message = %q, want the store's version conflict message", body.Error.Message)
+	}
+
+	// The 409 is only honest if the retry it asks for can succeed. The first
+	// attempt stored the legacy group before the binding upsert failed, so the
+	// retry finds the group already in the store and must replace it at its
+	// current version instead of tripping the same version check on it.
+	retry := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer retry.Body.Close()
+	if retry.StatusCode != http.StatusOK {
+		t.Fatalf("retrying the adoption = %d, want 200", retry.StatusCode)
+	}
+	managed, ok := st.NodeGuardBinding("node-a")
+	if !ok || !managed.Managed {
+		t.Fatalf("retry must leave a managed binding, got ok=%v %+v", ok, managed)
+	}
+}
+
+// An operator releases a node by flipping its binding to observe-only and
+// deleting it (the delete refuses a managed record). The node-private legacy
+// group stays behind. Adopting the node again has to reuse that group at its
+// current version; a fresh Version 0 upsert against it is a conflict the
+// operator cannot resolve from the API.
+func TestNetGuardAdoptReadoptsAfterBindingDelete(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[22,443]}`, cookies, csrf)
+	defer save.Body.Close()
+
+	first := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer first.Body.Close()
+	if first.StatusCode != http.StatusOK {
+		t.Fatalf("first adoption = %d, want 200", first.StatusCode)
+	}
+	groupID := netguard.LegacyGroupPrefix + "node-a"
+	groupBefore, ok := st.SecurityGroup(groupID)
+	if !ok {
+		t.Fatalf("adoption must store the legacy group %q", groupID)
+	}
+
+	binding, _ := st.NodeGuardBinding("node-a")
+	binding.Managed = false
+	if _, err := st.UpsertNodeGuardBinding(binding); err != nil {
+		t.Fatalf("release binding: %v", err)
+	}
+	if _, _, err := st.DeleteNodeGuardBinding("node-a"); err != nil {
+		t.Fatalf("delete released binding: %v", err)
+	}
+	if _, ok := st.SecurityGroup(groupID); !ok {
+		t.Fatalf("the legacy group outlives its binding; this test needs it present")
+	}
+
+	again := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer again.Body.Close()
+	if again.StatusCode != http.StatusOK {
+		t.Fatalf("re-adopting a released node = %d, want 200", again.StatusCode)
+	}
+	managed, ok := st.NodeGuardBinding("node-a")
+	if !ok || !managed.Managed || len(managed.GroupIDs) != 1 || managed.GroupIDs[0] != groupID {
+		t.Fatalf("re-adoption must bind the managed node to its legacy group, got ok=%v %+v", ok, managed)
+	}
+	groupAfter, _ := st.SecurityGroup(groupID)
+	if groupAfter.Version != groupBefore.Version+1 {
+		t.Fatalf("re-adoption replaces the legacy group in place: version %d want %d", groupAfter.Version, groupBefore.Version+1)
+	}
+}
+
 func TestNetGuardReviewPreviewsRulesetAndFindings(t *testing.T) {
 	handler, _ := newTestServerWithPublicURL(t, "https://203.0.113.99")
 	cookies, csrf := loginSession(t, handler)

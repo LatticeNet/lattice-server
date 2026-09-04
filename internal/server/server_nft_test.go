@@ -190,10 +190,22 @@ func TestNFTPlanComposesIngressNetPolicyIntoGuard(t *testing.T) {
 		"assert_watchdog_clean",
 		"refusing to mark apply verified",
 		"--selfcheck-controlplane -server 'https://203.0.113.99'",
+		// A reboot used to drop the table while the store still said applied:
+		// the committed file must be reloaded at boot, before the uplink is up
+		// and after Debian's nftables.service has done its flush ruleset.
+		"cat > /etc/systemd/system/lattice-guard-firewall.service <<'LATTICE_GUARD_UNIT_",
+		"DefaultDependencies=no\nAfter=nftables.service\nWants=network-pre.target\nBefore=network-pre.target shutdown.target\n",
+		"Type=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/lattice/guard.nft\n",
+		"systemctl enable lattice-guard-firewall.service",
 	} {
 		if !strings.Contains(task.Script, needle) {
 			t.Fatalf("guard apply script missing %q:\n%s", needle, task.Script)
 		}
+	}
+	// The unit is installed only once the ruleset is committed and the file
+	// is in place; enabling it before that would persist a candidate.
+	if strings.Index(task.Script, "mv \"$CANDIDATE\" \"$ACTIVE\"") > strings.Index(task.Script, "systemctl enable lattice-guard-firewall.service") {
+		t.Fatalf("boot unit must be installed after the ruleset is committed:\n%s", task.Script)
 	}
 	// Five fleet nodes carry Docker's iptables-nft tables and seven carry
 	// lattice_knock; a rollback that flushes the ruleset takes them all down.

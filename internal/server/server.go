@@ -625,6 +625,12 @@ func New(opts Options) (*Server, error) {
 	s.loadPlugins(opts.PluginDir, opts.PluginBundleCacheDir, opts.PluginTrust)
 	if !opts.DisableRenewalScheduler {
 		s.startRenewalScheduler()
+		// Before the sweeper and before serving: the mark reads the fleet's
+		// LastSeen as the previous process left it, and the first beat that
+		// lands after this would move it.
+		if err := s.store.RecordServerStart(s.now()); err != nil {
+			s.logger.Printf("node status history: record server start: %v", err)
+		}
 		s.startNodeLivenessSweeper()
 		s.startTraceRetention()
 		s.startTraceReattribution()
@@ -1050,6 +1056,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/auth/webauthn/login/begin", s.handleWebAuthnLoginBegin)
 	mux.HandleFunc("/api/auth/webauthn/login/finish", s.handleWebAuthnLoginFinish)
 	mux.HandleFunc("/api/nodes", s.withAuth("node:read", s.handleNodes))
+	mux.HandleFunc("/api/nodes/status-history", s.withAuth("node:read", s.handleNodeStatusHistory))
 	mux.HandleFunc("/api/nodes/geo", s.withAuth("", s.handleNodesGeo))
 	mux.HandleFunc("/api/nodes/geo/resolve", s.withAuth("", s.handleNodesGeoResolve))
 	mux.HandleFunc("/api/nodes/agent-updates", s.withAuth("", s.handleAgentUpdatePolicies))
@@ -2652,6 +2659,13 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	}
 	if req.NodeID == "" {
 		req.NodeID = id.New("node")
+	}
+	// The underscore namespace belongs to the control plane: a node enrolled
+	// as "_server" would write its own flaps over the server's start and
+	// stop marks and turn the whole fleet's history unknown.
+	if store.ReservedNodeID(req.NodeID) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("node id %q is reserved", req.NodeID))
+		return
 	}
 	// Validate group assignments up front (before any mutation) so a bad group id
 	// rejects the whole enroll rather than leaving an orphaned node behind.
@@ -7680,13 +7694,22 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		n.HostFacts = hostFacts
 	}
 	n.LastSeen = time.Now().UTC()
-	if !n.Online {
+	cameOnline := !n.Online
+	if cameOnline {
 		n.OnlineSince = n.LastSeen
 	}
 	n.Online = true
 	if err := s.upsertGraphNode(n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if cameOnline {
+		ev := store.NodeStatusEvent{At: n.LastSeen, To: store.NodeStatusOnline, Cause: store.NodeStatusCauseBeat}
+		if err := s.store.AppendNodeStatusEvent(req.NodeID, ev); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		s.recordNodeOnline(req.NodeID)
 	}
 	s.replaceAgentCapabilities(req.NodeID, req.Capabilities)
 	if oldV4 != n.PublicIP || oldV6 != n.PublicIPv6 || oldNodeIdentity != n.LatticeIdentityUUID {
@@ -7727,9 +7750,13 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		inV6 = ip
 	}
 	hostFacts, _ := normalizeHostFacts(req.HostFacts, s.now())
-	if err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, inV4, inV6, req.WireGuardIP, hostFacts); err != nil {
+	cameOnline, err := s.store.UpdateMetrics(req.NodeID, req.Metrics, req.Version, v4, v6, inV4, inV6, req.WireGuardIP, hostFacts)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if cameOnline {
+		s.recordNodeOnline(req.NodeID)
 	}
 	s.replaceAgentCapabilities(req.NodeID, req.Capabilities)
 	if old.PublicIP != v4 || old.PublicIPv6 != v6 {

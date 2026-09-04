@@ -278,14 +278,14 @@ func TestGuardPlanInvalidatesOnMetricsAndNFTCompileInputChanges(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := s.UpdateMetrics("peer", model.Metrics{}, "", "192.0.2.10", "", "", "", "", model.HostFacts{}); err != nil {
+		if _, err := s.UpdateMetrics("peer", model.Metrics{}, "", "192.0.2.10", "", "", "", "", model.HostFacts{}); err != nil {
 			t.Fatal(err)
 		}
 		unchanged, _ := s.NodeGuardBinding("n1")
 		if unchanged.LastPlanSHA != before.LastPlanSHA || unchanged.Version != before.Version {
 			t.Fatalf("unchanged heartbeat address invalidated plan: before=%+v after=%+v", before, unchanged)
 		}
-		if err := s.UpdateMetrics("peer", model.Metrics{}, "", "198.51.100.10", "", "", "", "", model.HostFacts{}); err != nil {
+		if _, err := s.UpdateMetrics("peer", model.Metrics{}, "", "198.51.100.10", "", "", "", "", model.HostFacts{}); err != nil {
 			t.Fatal(err)
 		}
 		after, _ := s.NodeGuardBinding("n1")

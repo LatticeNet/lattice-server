@@ -621,3 +621,52 @@ func strconvJoin(ports []int) string {
 	}
 	return strings.Join(parts, ",")
 }
+
+// "Rejected" used to mean two different things on one row: a person said no,
+// or the node's task died. The console told them apart by ApprovedBy being
+// empty, which is a guess. The view now says who rejected and when, from a
+// record written only on the person's path.
+func TestRejectRecordsTheActorAndTaskFailuresDoNot(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	now := time.Now().UTC()
+	seedArmApproval(t, st, "approval_by_person", "node-a", model.ApprovalPending, knockTestPorts, now)
+	seedArmApproval(t, st, "approval_by_task", "node-a", model.ApprovalApproved, knockTestPorts, now)
+	cookies, csrf := loginSession(t, handler)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/network/approvals/reject", `{"approval_id":"approval_by_person"}`, cookies, csrf)
+	out := knockBody(t, res)
+	res.Body.Close()
+	if out["status"] != model.ApprovalRejected || out["rejected_by"] != "user_admin" || out["rejected_at"] == nil {
+		t.Fatalf("the reject response must name the actor and time: %v", out)
+	}
+
+	// The node's task failing the other approval leaves no actor.
+	failed, _ := srv.store.Approval("approval_by_task")
+	if err := srv.rejectApprovalWithReason(failed, "lattice sshguard: knockd did not come up"); err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/network/approvals?plugin=sshguard&limit=10", "", cookies, csrf)
+	defer list.Body.Close()
+	var page struct {
+		Approvals []map[string]any `json:"approvals"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]map[string]any{}
+	for _, row := range page.Approvals {
+		seen[row["id"].(string)] = row
+	}
+	if seen["approval_by_person"]["rejected_by"] != "user_admin" {
+		t.Fatalf("the listing must carry the rejecting actor: %v", seen["approval_by_person"])
+	}
+	if _, ok := seen["approval_by_task"]["rejected_by"]; ok {
+		t.Fatalf("a task failure is not a person's rejection: %v", seen["approval_by_task"])
+	}
+	if seen["approval_by_task"]["status"] != model.ApprovalRejected {
+		t.Fatalf("the task-failed approval must still read rejected: %v", seen["approval_by_task"])
+	}
+}

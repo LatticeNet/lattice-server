@@ -53,6 +53,7 @@ type State struct {
 	TaskTargetStates   map[string]TaskTargetState   `json:"task_target_states,omitempty"`
 	NodeCapabilities   map[string]NodeCapability    `json:"node_capabilities,omitempty"`
 	CapabilityPolicies map[string]CapabilityPolicy  `json:"capability_policies,omitempty"`
+	ApprovalRejections map[string]ApprovalRejection `json:"approval_rejections,omitempty"`
 	Audit              []model.AuditEvent           `json:"audit"`
 	KV                 map[string]model.KVEntry     `json:"kv"`
 	// PluginSecrets is the encrypted, namespaced plugin vault (spec §9.4). It is a
@@ -204,6 +205,21 @@ type NodeCapability struct {
 	Reason    string    `json:"reason,omitempty"`
 	ActorID   string    `json:"actor_id,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// ApprovalRejection records who rejected an approval and when.
+//
+// The approval row itself cannot say: its model lives in the SDK and carries
+// ApprovedBy but no rejecting actor, and an approval that a node's task
+// failed is also marked rejected, with the approver still in ApprovedBy. So a
+// console reading "rejected" had to guess whether a person said no or a task
+// died, and it guessed from ApprovedBy being empty. This is the signal that
+// guess stood in for: written only when a principal rejects, absent when the
+// node did.
+type ApprovalRejection struct {
+	ApprovalID string    `json:"approval_id"`
+	ActorID    string    `json:"actor_id"`
+	At         time.Time `json:"at"`
 }
 
 func nodeCapabilityKey(nodeID, capability string) string {
@@ -1663,6 +1679,35 @@ func (s *Store) CapabilityPolicy(capability string) (CapabilityPolicy, bool) {
 	defer s.mu.Unlock()
 	policy, ok := s.state.CapabilityPolicies[capability]
 	return policy, ok
+}
+
+// SetApprovalRejection records a principal's rejection of an approval.
+func (s *Store) SetApprovalRejection(r ApprovalRejection) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r.ApprovalID == "" || r.ActorID == "" {
+		return errors.New("approval id and actor are required")
+	}
+	staged := s.state
+	staged.ApprovalRejections = make(map[string]ApprovalRejection, len(s.state.ApprovalRejections)+1)
+	for k, v := range s.state.ApprovalRejections {
+		staged.ApprovalRejections[k] = v
+	}
+	staged.ApprovalRejections[r.ApprovalID] = r
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
+}
+
+// ApprovalRejection returns who rejected an approval, if a principal did. No
+// record on a rejected approval means the node's task failed it.
+func (s *Store) ApprovalRejection(approvalID string) (ApprovalRejection, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.state.ApprovalRejections[approvalID]
+	return r, ok
 }
 
 // SetNodeCapability records an enrolment decision. An empty state clears the

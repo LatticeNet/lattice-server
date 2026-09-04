@@ -166,11 +166,16 @@ func TestNetGuardRPCExposesReviewAndReality(t *testing.T) {
 		t.Fatalf("unexpected reality detail: %s", detail)
 	}
 
-	// review compiles the node's intended state next to what it reports, so it
-	// needs a binding to compile — an unbound node is a conflict, which is the
-	// handler's own rule and stays that way through the RPC.
-	if _, err := srv.netGuardFirewallRPC(ctx, "review", []byte(`{"node_id":"node-a"}`)); err == nil {
-		t.Fatal("review of an unbound node must report the conflict")
+	// review compiles the node's intended state next to what it reports. An
+	// unbound node compiles as an empty observe-only intent: the review runs,
+	// says the intent cannot be compiled, and labels itself unbound, so the
+	// plugin can show reality and suggestions before anyone adopts the node.
+	unbound, err := srv.netGuardFirewallRPC(ctx, "review", []byte(`{"node_id":"node-a"}`))
+	if err != nil {
+		t.Fatalf("review of an unbound node: %v", err)
+	}
+	if !strings.Contains(string(unbound), `"source":"unbound"`) || !strings.Contains(string(unbound), `"compile_error":`) {
+		t.Fatalf("unbound review must be labelled and carry the compile error: %s", unbound)
 	}
 	if _, err := srv.netGuardFirewallRPC(ctx, "upsert_group", []byte(`{"id":"sg-web","name":"Web","rules":[]}`)); err != nil {
 		t.Fatalf("seed group: %v", err)

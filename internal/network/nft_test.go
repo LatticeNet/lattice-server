@@ -1,6 +1,9 @@
 package network
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -116,5 +119,52 @@ func TestGenerateNFTPlanRejectsBadInputRule(t *testing.T) {
 		if _, err := GenerateNFTPlan(NFTPlan{InputRules: []NFTInputRule{rule}}); err == nil {
 			t.Fatalf("expected bad input rule to be rejected: %+v", rule)
 		}
+	}
+}
+
+// The plan has to be accepted by every nftables the fleet runs. `destroy
+// table` was added in nftables 1.0.7; sixteen of the fleet's nft-capable nodes
+// run Debian 12's 1.0.6. Checked read-only with `nft -c` on two Debian 12
+// nodes running nftables 1.0.6 on 2026-09-03: `destroy table inet X` fails
+// with "syntax error, unexpected table, expecting string", and
+// `add table inet X` followed by `delete table inet X` in one script returns
+// rc 0. The renderer therefore opens with the add/delete pair, which every
+// version parses and which replaces the table whether or not it already
+// exists. TestGenerateNFTPlanPassesNFTCheck below repeats that check against
+// a real binary wherever one is available.
+func TestGenerateNFTPlanReplacesTheTableWithoutDestroy(t *testing.T) {
+	plan, err := GenerateNFTPlan(NFTPlan{PublicTCP: []int{22}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(plan, "destroy") {
+		t.Fatalf("plan uses a command nftables 1.0.6 does not parse:\n%s", plan)
+	}
+	if !strings.HasPrefix(plan, "add table inet lattice_guard\ndelete table inet lattice_guard\ntable inet lattice_guard {\n") {
+		t.Fatalf("plan must replace the table with the version-independent add/delete pair:\n%s", plan)
+	}
+}
+
+// The same fact checked against a real nft binary when one is available. On a
+// developer machine without nftables, or without the privilege `nft -c` needs
+// to evaluate a ruleset, this skips rather than pretending it ran.
+func TestGenerateNFTPlanPassesNFTCheck(t *testing.T) {
+	nft, err := exec.LookPath("nft")
+	if err != nil {
+		t.Skip("nft not installed; the rendered plan cannot be checked here")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("nft -c needs root to evaluate a ruleset")
+	}
+	plan, err := GenerateNFTPlan(NFTPlan{PublicTCP: []int{22, 443}, PublicUDP: []int{53}, WireGuardTCP: []int{9100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "guard.nft")
+	if err := os.WriteFile(path, []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(nft, "-c", "-f", path).CombinedOutput(); err != nil {
+		t.Fatalf("nft -c rejected the rendered plan: %v\n%s\n%s", err, out, plan)
 	}
 }

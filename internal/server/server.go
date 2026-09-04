@@ -6526,6 +6526,60 @@ func validateNftPolicyDomainSetBindings(domainSets []nftPolicyDomainSetBinding) 
 	return out, nil
 }
 
+// nftTableRollbackSnapshot writes a rollback file that restores exactly one
+// table. It replays as `add table; delete table; <table as it was listed>`,
+// so a rollback removes whatever the apply created and puts back the table
+// that was there before, or leaves none if there was none. The add/delete pair
+// rather than `destroy` because nftables 1.0.6 does not parse destroy.
+//
+// It deliberately does not snapshot the whole ruleset. A `flush ruleset`
+// replay would drop and re-create Docker's iptables-nft tables, SSH Guard's
+// lattice_knock and dns_hijack_local on the nodes that carry them, and reset
+// the knock allow set's timeouts, all for a failure in a table none of them
+// share.
+func nftTableRollbackSnapshot(table, dst string) string {
+	return "{ echo 'add table inet " + table + "'; echo 'delete table inet " + table + "'; nft list table inet " + table + " 2>/dev/null || true; } > " + dst + "\n"
+}
+
+// guardBootUnit reloads /etc/lattice/guard.nft at boot. Without it a reboot
+// silently drops table inet lattice_guard while the binding still says
+// applied and the node reports no managed table.
+const guardBootUnit = "lattice-guard-firewall"
+
+// guardBootPersistenceScript installs and enables guardBootUnit. The unit is
+// ordered the way Debian's own nftables.service is: DefaultDependencies=no
+// and Before=network-pre.target, so the table exists before any interface
+// comes up and long before network-online. It is also After=nftables.service,
+// because Debian's stock /etc/nftables.conf opens with `flush ruleset` and
+// would wipe the guard table if it loaded second; the four fleet nodes that
+// carry an `inet filter` table are running exactly that file.
+//
+// SSH Guard's boot unit is the model for the oneshot shape; the ordering here
+// is stricter because the guard chain is policy drop and must be in place
+// before the uplink is.
+func guardBootPersistenceScript() string {
+	unit := "[Unit]\n" +
+		"Description=Lattice guard firewall (restores table inet lattice_guard at boot)\n" +
+		"DefaultDependencies=no\n" +
+		"After=nftables.service\n" +
+		"Wants=network-pre.target\n" +
+		"Before=network-pre.target shutdown.target\n" +
+		"Conflicts=shutdown.target\n\n" +
+		"[Service]\n" +
+		"Type=oneshot\n" +
+		"RemainAfterExit=yes\n" +
+		"ExecStart=/usr/sbin/nft -f /etc/lattice/guard.nft\n\n" +
+		"[Install]\n" +
+		"WantedBy=multi-user.target\n"
+	return "if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then\n" +
+		heredocWrite("/etc/systemd/system/"+guardBootUnit+".service", "LATTICE_GUARD_UNIT", unit) +
+		"  systemctl daemon-reload\n" +
+		"  systemctl enable " + guardBootUnit + ".service >/dev/null\n" +
+		"else\n" +
+		"  echo 'lattice nft: systemd not found; the guard table will not survive a reboot' >&2\n" +
+		"fi\n"
+}
+
 func nftGuardApplyScript(plan, serverURL string) string {
 	return nftGuardApplyScriptWithManagedSHA(plan, serverURL, false)
 }
@@ -6557,7 +6611,7 @@ func nftGuardApplyScriptWithManagedSHA(plan, serverURL string, reportManagedSHA 
 		"ROLLBACK=/etc/lattice/guard.rollback.nft\n" +
 		heredocWrite("$CANDIDATE", "LATTICE_NFT_GUARD_EOF", plan) +
 		"nft -c -f \"$CANDIDATE\"\n" +
-		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"\n" +
+		nftTableRollbackSnapshot("lattice_guard", "\"$ROLLBACK\"") +
 		nftRollbackWatchdogScript("nft", "lattice nft: watchdog rollback fired", "lattice nft: rolling back guard ruleset") +
 		"trap 'rollback; cleanup_watchdog' ERR\n" +
 		"start_watchdog\n" +
@@ -6568,6 +6622,7 @@ func nftGuardApplyScriptWithManagedSHA(plan, serverURL string, reportManagedSHA 
 		"trap - ERR\n" +
 		"cleanup_watchdog\n" +
 		"mv \"$CANDIDATE\" \"$ACTIVE\"\n" +
+		guardBootPersistenceScript() +
 		done
 }
 
@@ -6589,7 +6644,7 @@ func nftPolicyApplyScript(plan, serverURL string, domainSets []nftPolicyDomainSe
 		"ROLLBACK=/etc/lattice/policy.rollback.nft\n" +
 		heredocWrite("$CANDIDATE", "LATTICE_NFT_POLICY_EOF", plan) +
 		"nft -c -f \"$CANDIDATE\"\n" +
-		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"\n" +
+		nftTableRollbackSnapshot("lattice_policy", "\"$ROLLBACK\"") +
 		nftRollbackWatchdogScript("nftpolicy", "lattice nftpolicy: watchdog rollback fired", "lattice nftpolicy: rolling back ruleset") +
 		"trap 'rollback; cleanup_watchdog' ERR\n" +
 		"start_watchdog\n" +
@@ -6727,6 +6782,9 @@ func restoreShiftedBody(restore string) string {
 	return strings.ReplaceAll(shifted, "\"$1\"", "\"$2\"")
 }
 
+// nftRollbackWatchdogScript arms the dead-man rollback. Both the trap and the
+// detached watchdog replay $ROLLBACK verbatim, so the file decides the blast
+// radius: it is written by nftTableRollbackSnapshot and touches one table.
 func nftRollbackWatchdogScript(name, firedMessage, rollbackMessage string) string {
 	return "WATCHDOG=\n" +
 		"WATCHDOG_FIRED=/tmp/lattice-" + name + "-watchdog.$$\n" +

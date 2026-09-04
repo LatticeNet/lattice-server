@@ -371,7 +371,9 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString("\"$COREDNS_BIN\" -conf " + shellQuote(CorefilePath) + " -plugins >/dev/null\n")
 	b.WriteString(heredocWrite(NFTGuardPath+".new", "LATTICE_SELF_DNS_NFT_EOF", artifacts.NFTRuleset))
 	b.WriteString("nft -c -f \"$NFT_CANDIDATE\"\n")
-	b.WriteString("{ echo 'flush ruleset'; nft list ruleset; } > \"$NFT_ROLLBACK\"\n")
+	// One table only: a `flush ruleset` snapshot would take Docker's tables,
+	// SSH Guard's lattice_knock and every other tenant with it on rollback.
+	b.WriteString("{ echo 'add table inet lattice_guard'; echo 'delete table inet lattice_guard'; nft list table inet lattice_guard 2>/dev/null || true; } > \"$NFT_ROLLBACK\"\n")
 	b.WriteString("start_watchdog\n")
 	b.WriteString("nft -f \"$NFT_CANDIDATE\"\n")
 	b.WriteString("mv \"$NFT_CANDIDATE\" " + shellQuote(NFTGuardPath) + "\n")

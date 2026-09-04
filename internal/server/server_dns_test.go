@@ -311,7 +311,9 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 	create.Body.Close()
 
 	// No accept_lockout_risk here on purpose: the seeded baseline keeps tcp/22
-	// open, so this plan has to clear the lockout lint on its own merits.
+	// open and the node reports ens3, so this plan has to clear the lockout
+	// lint on its own merits.
+	seedNodeReality(t, st, "n1", 22, "ens3")
 	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+created.ID+`"}`, cookies, csrf)
 	defer planRes.Body.Close()
 	if planRes.StatusCode != http.StatusOK {
@@ -368,7 +370,7 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 	for _, want := range []string{
 		"command -v coredns",
 		"nft -c -f \"$NFT_CANDIDATE\"",
-		"{ echo 'flush ruleset'; nft list ruleset; } > \"$NFT_ROLLBACK\"",
+		"{ echo 'add table inet lattice_guard'; echo 'delete table inet lattice_guard'; nft list table inet lattice_guard 2>/dev/null || true; } > \"$NFT_ROLLBACK\"",
 		"nft -f \"$NFT_CANDIDATE\"",
 		"CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$",
 		"WATCHDOG_FIRED=/tmp/lattice-selfdns-watchdog.$$",
@@ -382,8 +384,8 @@ func TestDNSPlanCreatesSecretFreeReviewApproval(t *testing.T) {
 			t.Fatalf("queued selfdns script missing %q:\n%s", want, task.Script)
 		}
 	}
-	if strings.Contains(task.Script, "nft list ruleset > \"$NFT_ROLLBACK\"") {
-		t.Fatalf("selfdns rollback snapshot must flush before replay:\n%s", task.Script)
+	if strings.Contains(task.Script, "flush ruleset") || strings.Contains(task.Script, "nft list ruleset") {
+		t.Fatalf("selfdns rollback must touch only table inet lattice_guard:\n%s", task.Script)
 	}
 }
 
@@ -911,7 +913,25 @@ func TestDNSPlanLockoutRiskOverrideIsAudited(t *testing.T) {
 // the same node-scoped reality whatever endpoint composed the plan.
 func seedNodeShellReality(t *testing.T, st *store.Store, nodeID string, shellPort int) {
 	t.Helper()
+	seedNodeReality(t, st, nodeID, shellPort)
+}
+
+// seedNodeReality stores a reality snapshot that reports sshd on shellPort
+// (none when shellPort is 0) and the given interfaces. The interface lint
+// fails closed when a node has never reported its interfaces, so a test whose
+// plan renders an iifname match and whose subject is something else names the
+// interfaces here to stay on topic.
+func seedNodeReality(t *testing.T, st *store.Store, nodeID string, shellPort int, interfaces ...string) {
+	t.Helper()
 	now := time.Now().UTC()
+	ifaces := make([]model.GuardInterface, 0, len(interfaces))
+	for _, name := range interfaces {
+		ifaces = append(ifaces, model.GuardInterface{Name: name, Up: true})
+	}
+	var listeners []model.GuardListener
+	if shellPort > 0 {
+		listeners = []model.GuardListener{{Protocol: "tcp", Port: shellPort, Address: "0.0.0.0", Process: "sshd"}}
+	}
 	// The store binds a reality snapshot to the node's enrolment identity, so
 	// the seed reads it rather than assuming the node has none.
 	node, ok := st.Node(nodeID)
@@ -920,10 +940,9 @@ func seedNodeShellReality(t *testing.T, st *store.Store, nodeID string, shellPor
 	}
 	if _, _, err := st.UpsertGuardRealitySnapshot(node.LatticeIdentityUUID, store.GuardRealitySnapshot{
 		Reality: model.GuardNodeReality{
-			NodeID: nodeID,
-			Listeners: []model.GuardListener{
-				{Protocol: "tcp", Port: shellPort, Address: "0.0.0.0", Process: "sshd"},
-			},
+			NodeID:      nodeID,
+			Listeners:   listeners,
+			Interfaces:  ifaces,
 			CollectedAt: now,
 		},
 		ReceivedAt: now,

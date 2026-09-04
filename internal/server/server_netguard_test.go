@@ -328,6 +328,10 @@ func TestNetGuardAdoptThenPlan(t *testing.T) {
 		t.Fatalf("re-adopt = %d, want 409", again.StatusCode)
 	}
 
+	// The node reports the interface the public zone names (without that the
+	// interface lint fails closed, which is not what this test is about) but
+	// no listener the lint can identify as a shell daemon.
+	seedNodeReality(t, st, "node-a", 0, "ens3")
 	plan := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
@@ -344,7 +348,7 @@ func TestNetGuardAdoptThenPlan(t *testing.T) {
 		t.Fatalf("plan must ride the existing nft apply path: %+v", planRes.Approval)
 	}
 	for _, want := range []string{
-		`destroy table inet lattice_guard`,
+		`delete table inet lattice_guard`,
 		`iifname "ens3" tcp dport { 22, 443 }`,
 		`counter drop`,
 	} {
@@ -352,7 +356,7 @@ func TestNetGuardAdoptThenPlan(t *testing.T) {
 			t.Fatalf("plan missing %q:\n%s", want, planRes.Approval.Plan)
 		}
 	}
-	// This node has never reported its firewall reality, so the lockout check
+	// This node reported no identifiable shell daemon, so the lockout check
 	// ran on the tcp/22 assumption. That is not "clean", and saying so is the
 	// point: nothing blocks, but the operator is told the check was a guess.
 	if netguard.Blocking(planRes.Findings) {
@@ -437,6 +441,9 @@ func TestNetGuardTrustedZoneClearsLockoutAndRendersIifname(t *testing.T) {
 		t.Fatalf("bind zone: %d", bind.StatusCode)
 	}
 
+	// The node has eth0 (the public default) and tailscale0, so the interface
+	// lint is satisfied and only the management-path question remains.
+	seedNodeReality(t, st, "node-a", 22, "eth0", "tailscale0")
 	plan := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {

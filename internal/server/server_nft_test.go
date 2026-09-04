@@ -87,8 +87,10 @@ func TestNFTInputsPersistAndPlanFromStoredState(t *testing.T) {
 	}
 
 	// No accept_lockout_risk here on purpose: the stored inputs above list
-	// tcp/22 in wireguard_tcp, so the composed chain still has a path to the
-	// shell and this plan clears the lockout lint on its own merits.
+	// tcp/22 in wireguard_tcp and the node reports ens3, so the composed chain
+	// still has a path to the shell and this plan clears the lockout lint on
+	// its own merits.
+	seedNodeReality(t, st, "node-a", 22, "ens3")
 	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
@@ -96,7 +98,7 @@ func TestNFTInputsPersistAndPlanFromStoredState(t *testing.T) {
 	}
 	approval := decodeNFTPlan(t, plan)
 	for _, want := range []string{
-		`destroy table inet lattice_guard`,
+		`delete table inet lattice_guard`,
 		`iifname "ens3" tcp dport { 80, 443 }`,
 		`iifname "ens3" udp dport { 53 }`,
 		`elements = { 10.66.0.0/24 }`,
@@ -184,19 +186,33 @@ func TestNFTPlanComposesIngressNetPolicyIntoGuard(t *testing.T) {
 	for _, needle := range []string{
 		"guard.rollback.nft",
 		"nft -f \"$CANDIDATE\"",
-		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"",
+		"{ echo 'add table inet lattice_guard'; echo 'delete table inet lattice_guard'; nft list table inet lattice_guard 2>/dev/null || true; } > \"$ROLLBACK\"",
 		"WATCHDOG_FIRED=/tmp/lattice-nft-watchdog.$$",
 		"setsid sh -c",
 		"assert_watchdog_clean",
 		"refusing to mark apply verified",
 		"--selfcheck-controlplane -server 'https://203.0.113.99'",
+		// A reboot used to drop the table while the store still said applied:
+		// the committed file must be reloaded at boot, before the uplink is up
+		// and after Debian's nftables.service has done its flush ruleset.
+		"cat > /etc/systemd/system/lattice-guard-firewall.service <<'LATTICE_GUARD_UNIT_",
+		"DefaultDependencies=no\nAfter=nftables.service\nWants=network-pre.target\nBefore=network-pre.target shutdown.target\n",
+		"Type=oneshot\nRemainAfterExit=yes\nExecStart=/usr/sbin/nft -f /etc/lattice/guard.nft\n",
+		"systemctl enable lattice-guard-firewall.service",
 	} {
 		if !strings.Contains(task.Script, needle) {
 			t.Fatalf("guard apply script missing %q:\n%s", needle, task.Script)
 		}
 	}
-	if strings.Contains(task.Script, "nft list ruleset > \"$ROLLBACK\"") {
-		t.Fatalf("guard rollback snapshot must flush before replay:\n%s", task.Script)
+	// The unit is installed only once the ruleset is committed and the file
+	// is in place; enabling it before that would persist a candidate.
+	if strings.Index(task.Script, "mv \"$CANDIDATE\" \"$ACTIVE\"") > strings.Index(task.Script, "systemctl enable lattice-guard-firewall.service") {
+		t.Fatalf("boot unit must be installed after the ruleset is committed:\n%s", task.Script)
+	}
+	// Five fleet nodes carry Docker's iptables-nft tables and seven carry
+	// lattice_knock; a rollback that flushes the ruleset takes them all down.
+	if strings.Contains(task.Script, "flush ruleset") || strings.Contains(task.Script, "nft list ruleset") {
+		t.Fatalf("guard rollback must touch only table inet lattice_guard:\n%s", task.Script)
 	}
 }
 
@@ -361,7 +377,7 @@ func TestNFTPlanAcceptsCallerSuppliedManagementPort(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
-	seedNodeShellReality(t, st, "node-a", 2222)
+	seedNodeReality(t, st, "node-a", 2222, "ens3")
 
 	res := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan",
 		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[443,2222]}`, cookies, csrf)

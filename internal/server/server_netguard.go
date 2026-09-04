@@ -27,6 +27,9 @@ import (
 const (
 	netGuardSourceStored = "stored"
 	netGuardSourceLegacy = "legacy"
+	// netGuardSourceUnbound marks a review compiled from the empty observe-only
+	// binding the store synthesises for a node with no stored binding.
+	netGuardSourceUnbound = "unbound"
 )
 
 type securityGroupView struct {
@@ -208,7 +211,7 @@ func (s *Server) handleNetGuardReview(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "not found"))
 		return
 	}
-	input, node, resolver, err := s.compileInputSnapshotFor(p, nodeID)
+	input, snapshot, resolver, err := s.compileInputSnapshotFor(p, nodeID)
 	if err != nil {
 		if errors.Is(err, store.ErrNetGuardCompileNodeNotFound) {
 			writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "not found"))
@@ -232,12 +235,15 @@ func (s *Server) handleNetGuardReview(w http.ResponseWriter, r *http.Request, p 
 		}
 	}
 	review := netGuardReview{
-		Node:        netGuardViewFromCompileInput(input, node.Name),
+		Node:        netGuardViewFromCompileInput(input, snapshot.Node.Name),
 		Reality:     reality,
 		Suggestions: suggestions,
 		DriftState:  netGuardDriftState(input.Binding, reality.Reality),
 		ReplanInput: netGuardReplanInput{NodeID: nodeID},
 		Findings:    make([]netguard.Finding, 0),
+	}
+	if !snapshot.HasBinding {
+		review.Node.Source = netGuardSourceUnbound
 	}
 	ruleset, findings, compileErr := s.netGuardPreview(input, reality.Reality)
 	// Checked before compileErr: a denied remote makes the compiler fail with a
@@ -449,10 +455,10 @@ func (s *Server) compileInputFor(p principal, nodeID string) (netguard.CompileIn
 // Refused rather than filtered: a firewall ruleset silently missing the rules
 // whose remotes the caller cannot read is a wrong firewall, not a shorter one,
 // and here it would silently drop a deny rule.
-func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.CompileInput, model.Node, *scopedNodeResolver, error) {
+func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.CompileInput, store.NetGuardCompileSnapshot, *scopedNodeResolver, error) {
 	snapshot, err := s.store.NetGuardCompileSnapshot(nodeID)
 	if err != nil {
-		return netguard.CompileInput{}, model.Node{}, nil, err
+		return netguard.CompileInput{}, store.NetGuardCompileSnapshot{}, nil, err
 	}
 	nodes := snapshot.Nodes
 	resolver := s.nodeResolverOver(func(id string) (model.Node, bool) {
@@ -464,7 +470,7 @@ func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.C
 		Groups:  snapshot.Groups,
 		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
 		Resolve: resolver.Resolve,
-	}, snapshot.Node, resolver, nil
+	}, snapshot, resolver, nil
 }
 
 // compileInputForSystem is compileInputFor without a principal, for the

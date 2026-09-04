@@ -24,7 +24,7 @@ func TestNetGuardPlanBlocksWhenRealitySaysSSHMoved(t *testing.T) {
 	// A baseline that opens 22 and 443. On a node whose sshd is on 22 this is
 	// safe, and the lint must keep saying so.
 	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
-		`{"node_id":"node-a","public_tcp":[22,443]}`, cookies, csrf)
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[22,443]}`, cookies, csrf)
 	defer save.Body.Close()
 	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
 	defer adopt.Body.Close()
@@ -76,7 +76,7 @@ func TestNetGuardPlanBlocksWhenRealitySaysSSHMoved(t *testing.T) {
 	// lint clears, and with evidence in hand it emits nothing at all.
 	tokenB := enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
 	saveB := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
-		`{"node_id":"node-b","public_tcp":[2222,443]}`, cookies, csrf)
+		`{"node_id":"node-b","interface_name":"ens3","public_tcp":[2222,443]}`, cookies, csrf)
 	defer saveB.Body.Close()
 	adoptB := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-b"}`, cookies, csrf)
 	defer adoptB.Body.Close()
@@ -257,4 +257,203 @@ func fetchRealityRows(t *testing.T, handler http.Handler, cookies []*http.Cookie
 		rows[node.NodeID] = node
 	}
 	return rows
+}
+
+// The eth0 assumption end to end: no NFTInputs interface, so the public zone
+// resolves to eth0, on a node that reports ens17. Twelve fleet nodes look like
+// this. The plan opens the real sshd port, so the port check is happy; the
+// interface check is what has to refuse it.
+func TestNetGuardPlanBlocksWhenThePublicInterfaceIsNotOnTheNode(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","public_tcp":[22]}`, cookies, csrf)
+	defer save.Body.Close()
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusOK {
+		t.Fatalf("adopt: %d", adopt.StatusCode)
+	}
+	reality := model.GuardNodeReality{
+		NodeID:      "node-a",
+		CollectedAt: time.Now().UTC().Add(-time.Minute),
+		Listeners:   []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd(701)"}},
+		Interfaces: []model.GuardInterface{
+			{Name: "lo", Up: true},
+			{Name: "ens17", Addresses: []string{"203.0.113.10/24"}, Up: true},
+		},
+	}
+	if posted := postGuardRealityForTest(t, handler, token, "node-a", reality); posted.code != http.StatusOK {
+		t.Fatalf("post guard reality = %d: %s", posted.code, posted.body)
+	}
+
+	blocked := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer blocked.Body.Close()
+	if blocked.StatusCode != http.StatusConflict {
+		t.Fatalf("a plan on an interface the node does not have = %d, want 409", blocked.StatusCode)
+	}
+	var blockedRes struct {
+		Findings []netguard.Finding `json:"findings"`
+	}
+	if err := json.NewDecoder(blocked.Body).Decode(&blockedRes); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(blockedRes.Findings, netguard.FindingInterfaceMissing) {
+		t.Fatalf("findings = %+v", blockedRes.Findings)
+	}
+	if hasFinding(blockedRes.Findings, netguard.FindingLockoutRiskSSH) {
+		t.Fatalf("the port check is satisfied here; only the interface may block: %+v", blockedRes.Findings)
+	}
+	if len(st.Approvals()) != 0 {
+		t.Fatalf("a blocked plan must not file an approval: %+v", st.Approvals())
+	}
+
+	// The review preview must say the same thing, or an operator reads a clean
+	// preview and then watches the plan refuse.
+	review := doJSON(t, handler, http.MethodGet, "/api/netguard/review?node_id=node-a", "", cookies, csrf)
+	defer review.Body.Close()
+	var out netGuardReviewResponse
+	if err := json.NewDecoder(review.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(out.Review.Findings, netguard.FindingInterfaceMissing) {
+		t.Fatalf("review findings = %+v", out.Review.Findings)
+	}
+}
+
+// The same hole with no evidence at all: a freshly enrolled node, or one on an
+// agent too old to report interfaces, has never said what interfaces it has.
+// The public zone still resolves to eth0. The lint cannot confirm eth0 exists,
+// and "cannot confirm" fails closed: 409, no approval, until the operator
+// accepts the lockout risk on purpose.
+func TestNetGuardPlanBlocksWhenTheNodeHasNeverReportedInterfaces(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","public_tcp":[22]}`, cookies, csrf)
+	defer save.Body.Close()
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusOK {
+		t.Fatalf("adopt: %d", adopt.StatusCode)
+	}
+
+	// No reality posted: nil reality on the lint side.
+	blocked := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer blocked.Body.Close()
+	if blocked.StatusCode != http.StatusConflict {
+		t.Fatalf("a plan on eth0 for a node that never reported = %d, want 409", blocked.StatusCode)
+	}
+	var blockedRes struct {
+		Findings []netguard.Finding `json:"findings"`
+	}
+	if err := json.NewDecoder(blocked.Body).Decode(&blockedRes); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(blockedRes.Findings, netguard.FindingInterfaceUnverified) {
+		t.Fatalf("findings = %+v", blockedRes.Findings)
+	}
+	if hasFinding(blockedRes.Findings, netguard.FindingInterfaceMissing) || hasFinding(blockedRes.Findings, netguard.FindingLockoutRiskSSH) {
+		t.Fatalf("only the unverified interface may block here: %+v", blockedRes.Findings)
+	}
+	if len(st.Approvals()) != 0 {
+		t.Fatalf("a blocked plan must not file an approval: %+v", st.Approvals())
+	}
+
+	// The review preview says the same thing.
+	review := doJSON(t, handler, http.MethodGet, "/api/netguard/review?node_id=node-a", "", cookies, csrf)
+	defer review.Body.Close()
+	var out netGuardReviewResponse
+	if err := json.NewDecoder(review.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(out.Review.Findings, netguard.FindingInterfaceUnverified) {
+		t.Fatalf("review findings = %+v", out.Review.Findings)
+	}
+
+	// The only way past is the same explicit, audited flag as every other
+	// lockout finding.
+	accepted := doJSON(t, handler, http.MethodPost, "/api/netguard/plan",
+		`{"node_id":"node-a","accept_lockout_risk":true}`, cookies, csrf)
+	defer accepted.Body.Close()
+	if accepted.StatusCode != http.StatusOK {
+		t.Fatalf("accepting the lockout risk = %d, want 200", accepted.StatusCode)
+	}
+	if len(st.Approvals()) != 1 {
+		t.Fatalf("an accepted plan must file exactly one approval: %+v", st.Approvals())
+	}
+}
+
+// Review used to demand a stored binding, so every one of the fleet's 33 nodes
+// answered "adopt it first" and server-side suggestions never ran for anyone.
+// An unbound node now compiles as an empty observe-only binding: the review
+// says intent cannot be compiled, suggestions still say which listeners have
+// no allow, nothing is written, and planning stays impossible.
+func TestNetGuardReviewRunsForUnboundAndLegacyNodes(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	reality := model.GuardNodeReality{
+		NodeID:      "node-a",
+		CollectedAt: time.Now().UTC().Add(-time.Minute),
+		Listeners:   []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd(701)"}},
+		Interfaces:  []model.GuardInterface{{Name: "ens17", Addresses: []string{"203.0.113.10/24"}, Up: true}},
+	}
+	if posted := postGuardRealityForTest(t, handler, token, "node-a", reality); posted.code != http.StatusOK {
+		t.Fatalf("post guard reality = %d: %s", posted.code, posted.body)
+	}
+
+	res := doJSON(t, handler, http.MethodGet, "/api/netguard/review?node_id=node-a", "", cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("review of an unbound node = %d, want 200", res.StatusCode)
+	}
+	var out netGuardReviewResponse
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Review.Node.Source != netGuardSourceUnbound || out.Review.Node.Binding.Managed {
+		t.Fatalf("an unbound node must review as an unbound observe-only intent: %+v", out.Review.Node)
+	}
+	if !strings.Contains(out.Review.CompileError, "observe-only") || out.Review.Ruleset != "" {
+		t.Fatalf("no intent means no ruleset: error=%q ruleset=%q", out.Review.CompileError, out.Review.Ruleset)
+	}
+	var missingAllow bool
+	for _, suggestion := range out.Review.Suggestions {
+		if suggestion.Code == netguard.SuggestionListenerMissingAllow && suggestion.Port == 22 {
+			missingAllow = true
+		}
+	}
+	if !missingAllow {
+		t.Fatalf("suggestions must run against reality with no intent: %+v", out.Review.Suggestions)
+	}
+	if _, ok := st.NodeGuardBinding("node-a"); ok {
+		t.Fatal("review must not create a binding record")
+	}
+
+	// Planning from the synthesised binding stays impossible.
+	plan := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer plan.Body.Close()
+	if plan.StatusCode != http.StatusBadRequest {
+		t.Fatalf("plan for an unbound node = %d, want 400", plan.StatusCode)
+	}
+	if _, ok := st.NodeGuardBinding("node-a"); ok || len(st.Approvals()) != 0 {
+		t.Fatal("a refused plan must leave no binding and no approval behind")
+	}
+
+	// A legacy node (NFT inputs, never adopted) is the same case.
+	enrollNamedNode(t, handler, cookies, csrf, "node-b", "Node B")
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-b","interface_name":"ens3","public_tcp":[22]}`, cookies, csrf)
+	defer save.Body.Close()
+	legacy := doJSON(t, handler, http.MethodGet, "/api/netguard/review?node_id=node-b", "", cookies, csrf)
+	defer legacy.Body.Close()
+	if legacy.StatusCode != http.StatusOK {
+		t.Fatalf("review of a legacy node = %d, want 200", legacy.StatusCode)
+	}
+	if _, ok := st.NodeGuardBinding("node-b"); ok {
+		t.Fatal("review of a legacy node must not adopt it")
+	}
 }

@@ -5014,6 +5014,13 @@ func (s *Store) MonitorsForNode(nodeID string) []model.Monitor {
 		if !m.Enabled {
 			continue
 		}
+		// A tls monitor is evaluated by the server, so it must never reach an
+		// agent: an agent handed one would probe it as an unknown type and
+		// report results the server would then treat as a node's verdict on a
+		// certificate it never read.
+		if m.Type == model.MonitorTypeTLS {
+			continue
+		}
 		if m.AssignAll || contains(m.NodeIDs, nodeID) {
 			out = append(out, m)
 		}

@@ -5901,6 +5901,11 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 // narrow the counts too; status does not, since the breakdown is the answer.
 // Every row carries plan_sha256, so a client that listed without plans can
 // still bind an approve call to the plan it reviewed.
+//
+// The waiting explanation on an approved row is indexed across every approval
+// the caller may read, not across the rows the query selected. Supersession is
+// a relation between siblings, and both a filtered page and the id read can
+// hold a retired approval without the newer one that replaced it.
 func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -5919,10 +5924,15 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 			writeError(w, http.StatusNotFound, errors.New("approval not found"))
 			return
 		}
-		one := []model.Approval{approval}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"approval": s.annotateApprovalRejections(s.annotateApprovalWaiting(toApprovalViews(one), one))[0],
-		})
+		view := s.approvalViewFor(approval)
+		// The waiting explanation is a statement about this approval's place
+		// among its siblings: a newer plan for the same node, plugin and
+		// action retires it. Indexed from this row alone the relation cannot
+		// exist, so a superseded approval read by id was reported as merely
+		// unqueued, telling an operator to queue an apply for a plan that is
+		// dead. Build the index from every approval the caller may read.
+		view.Waiting = s.approvalWaitFor(p, approval)
+		writeJSON(w, http.StatusOK, map[string]any{"approval": view})
 		return
 	}
 	includePlan := false
@@ -5946,12 +5956,23 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 	countRequested := requestBool(r, "count")
 	approvals := s.store.Approvals()
 	visible := make([]model.Approval, 0, len(approvals))
+	// scoped is every live approval this caller may read, before any query
+	// filter. The waiting index is built from it rather than from the rows the
+	// query selected, because supersession is a relation between siblings: a
+	// page narrowed by status, plugin or limit can hold a superseded approval
+	// without the newer one that replaced it. Dismissed rows are left out
+	// because a tombstone supersedes nothing and explains nothing.
+	scoped := make([]model.Approval, 0, len(approvals))
 	for _, approval := range approvals {
-		if approval.Status == approvalStatusDismissed && !includeDismissed && !countRequested {
+		dismissed := approval.Status == approvalStatusDismissed
+		if dismissed && !includeDismissed && !countRequested {
 			continue
 		}
 		if !s.approvalVisibleToPrincipal(p, approval) {
 			continue
+		}
+		if !dismissed {
+			scoped = append(scoped, approval)
 		}
 		if !filter.matchesRecord(approval) {
 			continue
@@ -5963,7 +5984,13 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		return
 	}
 	project := func(rows []model.Approval) []approvalView {
-		views := s.annotateApprovalRejections(s.annotateApprovalWaiting(toApprovalViews(rows), rows))
+		views := toApprovalViews(rows)
+		// Only an approved row has a wait to explain, and the index costs a
+		// walk of every node and task. A page with none of them pays nothing.
+		if approvalsIncludeApproved(rows) {
+			views = s.annotateApprovalWaitingWith(views, rows, s.newApprovalWaitContext(scoped))
+		}
+		views = s.annotateApprovalRejections(views)
 		if !includePlan {
 			views = withoutPlans(views)
 		}

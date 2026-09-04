@@ -504,3 +504,101 @@ func TestApprovalsListParsesQueryOncePerRequest(t *testing.T) {
 		t.Fatalf("listing allocated %.0f times for %d hidden rows (limit %d); the per-row loop must not re-parse the query", allocs, rows, limit)
 	}
 }
+
+// seedSupersededPair is an approved plan and the newer plan that replaced it:
+// same node, same plugin, same action, created a minute later and still live.
+// The older row is dead whatever the node does, and every read path has to say
+// so.
+func seedSupersededPair(t *testing.T, st *store.Store) {
+	t.Helper()
+	if err := st.UpsertNode(model.Node{ID: "node-s", Name: "edge-s", Online: true, LastSeen: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Hour)
+	rows := []model.Approval{
+		{ID: "ap-superseded", NodeID: "node-s", Plugin: "nftpolicy", Action: "apply-ruleset",
+			Status: model.ApprovalApproved, Plan: "old plan", ActorID: "operator", CreatedAt: base},
+		{ID: "ap-newer", NodeID: "node-s", Plugin: "nftpolicy", Action: "apply-ruleset",
+			Status: model.ApprovalPending, Plan: "new plan", ActorID: "operator", CreatedAt: base.Add(time.Minute)},
+	}
+	for _, row := range rows {
+		if err := st.UpsertApproval(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func readApprovalByID(t *testing.T, handler http.Handler, cookies []*http.Cookie, id string) approvalView {
+	t.Helper()
+	res := doJSON(t, handler, http.MethodGet, "/api/network/approvals?id="+id, "", cookies, "")
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		t.Fatalf("GET approvals?id=%s = %d: %s", id, res.StatusCode, body)
+	}
+	var out struct {
+		Approval approvalView `json:"approval"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out.Approval
+}
+
+// The id path is what the console calls when an operator opens a row to act on
+// it, so it must not describe a retired plan as one that merely needs
+// queueing. Built from the single fetched row the supersession index had no
+// sibling to find and answered not_queued, which reads as "queue an apply" for
+// a plan that will never be dispatched.
+func TestApprovalsReadByIDReportsSupersession(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, _ := loginSession(t, handler)
+	seedSupersededPair(t, st)
+
+	view := readApprovalByID(t, handler, cookies, "ap-superseded")
+	if view.Waiting == nil {
+		t.Fatal("an approved row read by id must carry its waiting explanation")
+	}
+	if view.Waiting.Code != ApprovalWaitPlanSuperseded || view.Waiting.SupersededBy != "ap-newer" {
+		t.Fatalf("read by id must see the sibling that retired this plan: code=%q superseded_by=%q reason=%q",
+			view.Waiting.Code, view.Waiting.SupersededBy, view.Waiting.Reason)
+	}
+
+	// The two read paths must agree about the same approval.
+	listed := getApprovalsEnvelope(t, handler, cookies, "status=approved,pending")
+	var fromList *approvalWaitView
+	for _, row := range listed.Approvals {
+		if row.ID == "ap-superseded" {
+			fromList = row.Waiting
+		}
+	}
+	if fromList == nil || fromList.Code != view.Waiting.Code || fromList.SupersededBy != view.Waiting.SupersededBy {
+		t.Fatalf("listing and id read disagree: %+v vs %+v", fromList, view.Waiting)
+	}
+
+	// A pending row explains itself and carries no waiting field on either path.
+	if newer := readApprovalByID(t, handler, cookies, "ap-newer"); newer.Waiting != nil {
+		t.Fatalf("a pending row read by id must not carry a waiting reason: %+v", newer.Waiting)
+	}
+}
+
+// The same relation seen from a filtered page: the newer plan is pending, so a
+// listing narrowed to approved rows does not contain it. Indexing the page
+// instead of the whole set in scope loses the sibling exactly as the id path
+// did.
+func TestApprovalsFilteredListingReportsSupersession(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, _ := loginSession(t, handler)
+	seedSupersededPair(t, st)
+
+	for _, query := range []string{"status=approved", "status=approved&plugin=nftpolicy", "status=approved&node_id=node-s"} {
+		env := getApprovalsEnvelope(t, handler, cookies, query)
+		if !sameIDs(approvalIDs(env.Approvals), []string{"ap-superseded"}) {
+			t.Fatalf("%q should select the approved row alone, got %v", query, approvalIDs(env.Approvals))
+		}
+		wait := env.Approvals[0].Waiting
+		if wait == nil || wait.Code != ApprovalWaitPlanSuperseded || wait.SupersededBy != "ap-newer" {
+			t.Fatalf("%q lost the superseding sibling: %+v", query, wait)
+		}
+	}
+}

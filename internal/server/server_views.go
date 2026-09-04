@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"time"
 
@@ -13,11 +15,17 @@ import (
 // later does not auto-serialize to clients until it is deliberately exposed. [D4]
 
 type approvalView struct {
-	ID         string    `json:"id"`
-	NodeID     string    `json:"node_id"`
-	Plugin     string    `json:"plugin"`
-	Action     string    `json:"action"`
-	Plan       string    `json:"plan"`
+	ID     string `json:"id"`
+	NodeID string `json:"node_id"`
+	Plugin string `json:"plugin"`
+	Action string `json:"action"`
+	// Plan is the reviewable plan text. The listing omits it unless asked
+	// (include=plan) because on a fleet with a thousand applied approvals it
+	// is nearly all of the bytes; the per-id read and the decision responses
+	// always carry it. PlanSHA256 is always present so a client can tell a
+	// plan changed, and can bind an approve call to it, without the body.
+	Plan       string    `json:"plan,omitempty"`
+	PlanSHA256 string    `json:"plan_sha256"`
 	Status     string    `json:"status"`
 	Reason     string    `json:"reason,omitempty"`
 	Stale      bool      `json:"stale,omitempty"`
@@ -84,11 +92,26 @@ func toApprovalView(a model.Approval) approvalView {
 		ID: a.ID, NodeID: a.NodeID, Plugin: a.Plugin, Action: action,
 		// Reason is derived at read time (never migrated into stored rows) so
 		// pre-reason approvals also answer a human-readable sentence.
-		Plan: a.Plan, Status: a.Status, Reason: approvalDisplayReason(a), Stale: stale, StaleCode: staleCode, ActorID: approvalActorView(a.ActorID),
+		Plan: a.Plan, PlanSHA256: approvalPlanSHA256(a.Plan), Status: a.Status, Reason: approvalDisplayReason(a), Stale: stale, StaleCode: staleCode, ActorID: approvalActorView(a.ActorID),
 		ApprovedBy: a.ApprovedBy, CreatedAt: a.CreatedAt, UpdatedAt: a.UpdatedAt,
 		PluginVersion: a.PluginVersion, ArtifactDigest: a.ArtifactDigest,
 		Service: a.Service, Method: a.Method, Targets: a.Targets,
 	}
+}
+
+// approvalPlanSHA256 is the hex sha256 of the plan text, the same value the
+// approve endpoint checks plan_sha256 against.
+func approvalPlanSHA256(plan string) string {
+	sum := sha256.Sum256([]byte(plan))
+	return hex.EncodeToString(sum[:])
+}
+
+// withoutPlans strips the plan body from listing rows. The hash stays.
+func withoutPlans(views []approvalView) []approvalView {
+	for i := range views {
+		views[i].Plan = ""
+	}
+	return views
 }
 
 func approvalStaleMetadata(a model.Approval) (bool, string) {

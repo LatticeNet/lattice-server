@@ -466,7 +466,9 @@ func TestReadingAnSSHGuardPlanRequiresTheDomainScope(t *testing.T) {
 	}
 
 	planOnly := createPAT(t, handler, cookies, csrf, []string{"network:plan"}, []string{"node-a"})
-	resp := doBearerJSON(t, handler, http.MethodGet, "/api/network/approvals", "", planOnly)
+	// include=plan asks for the body; without it the listing omits every plan
+	// and this check would pass for the wrong reason.
+	resp := doBearerJSON(t, handler, http.MethodGet, "/api/network/approvals?include=plan", "", planOnly)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if strings.Contains(string(body), "23853") {
@@ -480,7 +482,7 @@ func TestReadingAnSSHGuardPlanRequiresTheDomainScope(t *testing.T) {
 		{"network:plan", "sshguard:admin"},
 	} {
 		token := createPAT(t, handler, cookies, csrf, scopes, []string{"node-a"})
-		ok := doBearerJSON(t, handler, http.MethodGet, "/api/network/approvals", "", token)
+		ok := doBearerJSON(t, handler, http.MethodGet, "/api/network/approvals?include=plan", "", token)
 		raw, _ := io.ReadAll(ok.Body)
 		ok.Body.Close()
 		if !strings.Contains(string(raw), "23853") {

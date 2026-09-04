@@ -5879,6 +5879,28 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	writeJSON(w, http.StatusOK, map[string]any{"approval": approval, "findings": findings})
 }
 
+// handleApprovals serves GET /api/network/approvals.
+//
+// Query parameters, all optional and ignored when empty:
+//
+//	include_dismissed=1   include dismissed tombstones (hidden by default)
+//	include=plan          carry the plan body on every row; omitted otherwise
+//	id=<approval id>      read one approval: {"approval": {...}} with the plan,
+//	                      404 when unknown or outside the caller's scope
+//	count=1               answer {"counts": {pending, approved, stale, applied,
+//	                      rejected, dismissed, total}} and no records
+//	status=a,b            keep rows whose status is in the comma list
+//	plugin=<id>           keep rows for one plugin
+//	node_id=<id>          keep rows for one node
+//	since=<RFC3339>       keep rows whose updated_at is at or after the instant
+//	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
+//
+// Without any of status, plugin, node_id, since, limit or offset the response
+// is the bare array clients have always read. With any of them it is the
+// {"approvals","total","limit","offset"} envelope. plugin, node_id and since
+// narrow the counts too; status does not, since the breakdown is the answer.
+// Every row carries plan_sha256, so a client that listed without plans can
+// still bind an approve call to the plan it reviewed.
 func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -5888,22 +5910,65 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	q := r.URL.Query()
+	if approvalID := strings.TrimSpace(q.Get("id")); approvalID != "" {
+		approval, ok := s.store.Approval(approvalID)
+		if !ok || !s.approvalVisibleToPrincipal(p, approval) {
+			// One answer for missing and out of scope: the id path must not
+			// confirm that a plan the caller cannot read exists.
+			writeError(w, http.StatusNotFound, errors.New("approval not found"))
+			return
+		}
+		one := []model.Approval{approval}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"approval": s.annotateApprovalRejections(s.annotateApprovalWaiting(toApprovalViews(one), one))[0],
+		})
+		return
+	}
+	includePlan := false
+	switch include := strings.TrimSpace(q.Get("include")); include {
+	case "":
+	case "plan":
+		includePlan = true
+	default:
+		writeError(w, http.StatusBadRequest, fmt.Errorf("include must be plan, got %q", include))
+		return
+	}
+	filter, err := parseApprovalListFilter(q)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	includeDismissed := requestBool(r, "include_dismissed")
 	approvals := s.store.Approvals()
 	visible := make([]model.Approval, 0, len(approvals))
 	for _, approval := range approvals {
-		if approval.Status == approvalStatusDismissed && !includeDismissed {
+		if approval.Status == approvalStatusDismissed && !includeDismissed && !requestBool(r, "count") {
 			continue
 		}
-		if s.approvalVisibleToPrincipal(p, approval) {
-			visible = append(visible, approval)
+		if !s.approvalVisibleToPrincipal(p, approval) {
+			continue
 		}
+		if !filter.matchesRecord(approval) {
+			continue
+		}
+		visible = append(visible, approval)
 	}
-	if !approvalQueryRequested(r) {
-		writeJSON(w, http.StatusOK, s.annotateApprovalRejections(s.annotateApprovalWaiting(toApprovalViews(visible), visible)))
+	if requestBool(r, "count") {
+		writeJSON(w, http.StatusOK, map[string]any{"counts": countApprovals(visible)})
 		return
 	}
-	q := r.URL.Query()
+	project := func(rows []model.Approval) []approvalView {
+		views := s.annotateApprovalRejections(s.annotateApprovalWaiting(toApprovalViews(rows), rows))
+		if !includePlan {
+			views = withoutPlans(views)
+		}
+		return views
+	}
+	if !approvalQueryRequested(r) {
+		writeJSON(w, http.StatusOK, project(visible))
+		return
+	}
 	limit, err := boundedIntQuery(q.Get("limit"), defaultTaskQueryLimit, maxTaskQueryLimit, "limit")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -5914,21 +5979,11 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	status := strings.TrimSpace(q.Get("status"))
-	nodeID := strings.TrimSpace(q.Get("node_id"))
-	plugin := strings.TrimSpace(q.Get("plugin"))
 	filtered := make([]model.Approval, 0, len(visible))
 	for _, approval := range visible {
-		if status != "" && approval.Status != status {
-			continue
+		if filter.matchesStatus(approval) {
+			filtered = append(filtered, approval)
 		}
-		if nodeID != "" && approval.NodeID != nodeID {
-			continue
-		}
-		if plugin != "" && approval.Plugin != plugin {
-			continue
-		}
-		filtered = append(filtered, approval)
 	}
 	total := len(filtered)
 	if offset > total {
@@ -5940,7 +5995,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		filtered = filtered[:limit]
 	}
 	writeJSON(w, http.StatusOK, approvalsQueryResponse{
-		Approvals: s.annotateApprovalRejections(s.annotateApprovalWaiting(toApprovalViews(filtered), filtered)),
+		Approvals: project(filtered),
 		Total:     total,
 		Limit:     limit,
 		Offset:    offset,
@@ -5954,9 +6009,81 @@ type approvalsQueryResponse struct {
 	Offset    int            `json:"offset"`
 }
 
+// approvalListFilter is the parsed row filter of GET /api/network/approvals.
+// The status list is kept apart from the record filters because the count
+// mode reports a status breakdown and must not be narrowed by one.
+type approvalListFilter struct {
+	statuses map[string]bool
+	plugin   string
+	nodeID   string
+	since    time.Time
+}
+
+func parseApprovalListFilter(q url.Values) (approvalListFilter, error) {
+	f := approvalListFilter{
+		plugin: strings.TrimSpace(q.Get("plugin")),
+		nodeID: strings.TrimSpace(q.Get("node_id")),
+	}
+	for _, status := range strings.Split(q.Get("status"), ",") {
+		status = strings.TrimSpace(status)
+		if status == "" {
+			continue
+		}
+		if f.statuses == nil {
+			f.statuses = map[string]bool{}
+		}
+		f.statuses[status] = true
+	}
+	if raw := strings.TrimSpace(q.Get("since")); raw != "" {
+		since, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return f, fmt.Errorf("since must be an RFC3339 timestamp")
+		}
+		f.since = since
+	}
+	return f, nil
+}
+
+// matchesRecord applies plugin, node_id and since; since is inclusive on
+// updated_at and compares instants, so the caller's zone does not matter.
+func (f approvalListFilter) matchesRecord(a model.Approval) bool {
+	if f.plugin != "" && a.Plugin != f.plugin {
+		return false
+	}
+	if f.nodeID != "" && a.NodeID != f.nodeID {
+		return false
+	}
+	if !f.since.IsZero() && a.UpdatedAt.Before(f.since) {
+		return false
+	}
+	return true
+}
+
+func (f approvalListFilter) matchesStatus(a model.Approval) bool {
+	return f.statuses == nil || f.statuses[a.Status]
+}
+
+// countApprovals is the overview's breakdown: one bucket per status plus
+// stale, which is a flag rather than a status and so overlaps the buckets.
+// total is the number of rows, not the sum of every key.
+func countApprovals(approvals []model.Approval) map[string]int {
+	counts := map[string]int{
+		model.ApprovalPending: 0, model.ApprovalApproved: 0, "stale": 0,
+		model.ApprovalApplied: 0, model.ApprovalRejected: 0, approvalStatusDismissed: 0,
+		"total": len(approvals),
+	}
+	for _, a := range approvals {
+		counts[a.Status]++
+		if stale, _ := approvalStaleMetadata(a); stale {
+			counts["stale"]++
+		}
+	}
+	return counts
+}
+
 func approvalQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"status", "node_id", "plugin", "limit", "offset"} {
+	for _, key := range []string{"status", "node_id", "plugin", "since", "limit", "offset"} {
 		if _, ok := q[key]; ok {
 			return true
 		}

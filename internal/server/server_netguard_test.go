@@ -344,7 +344,7 @@ func TestNetGuardAdoptThenPlan(t *testing.T) {
 		t.Fatalf("plan must ride the existing nft apply path: %+v", planRes.Approval)
 	}
 	for _, want := range []string{
-		`destroy table inet lattice_guard`,
+		`delete table inet lattice_guard`,
 		`iifname "ens3" tcp dport { 22, 443 }`,
 		`counter drop`,
 	} {

@@ -96,7 +96,7 @@ func TestNFTInputsPersistAndPlanFromStoredState(t *testing.T) {
 	}
 	approval := decodeNFTPlan(t, plan)
 	for _, want := range []string{
-		`destroy table inet lattice_guard`,
+		`delete table inet lattice_guard`,
 		`iifname "ens3" tcp dport { 80, 443 }`,
 		`iifname "ens3" udp dport { 53 }`,
 		`elements = { 10.66.0.0/24 }`,

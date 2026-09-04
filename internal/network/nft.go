@@ -59,7 +59,14 @@ func GenerateNFTPlan(p NFTPlan) (string, error) {
 		return "", err
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "destroy table inet lattice_guard\n")
+	// `add table` then `delete table` replaces the table on every nftables
+	// version and is a no-op pair when it does not exist yet. `destroy table`
+	// would read better, but it arrived in nftables 1.0.7: on the 1.0.6 build
+	// Debian 12 ships, `nft -c 'destroy table inet X'` fails with "syntax
+	// error, unexpected table, expecting string", and the apply script's
+	// `nft -c -f` refuses the whole plan before anything changes.
+	fmt.Fprintf(&b, "add table inet lattice_guard\n")
+	fmt.Fprintf(&b, "delete table inet lattice_guard\n")
 	fmt.Fprintf(&b, "table inet lattice_guard {\n")
 	fmt.Fprintf(&b, "  set wg_peers4 {\n    type ipv4_addr\n    flags interval\n    elements = { %s }\n  }\n\n", p.WireGuardCIDR)
 	fmt.Fprintf(&b, "  chain input {\n")

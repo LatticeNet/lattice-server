@@ -39,6 +39,21 @@ func isSSHGuardApproval(approval model.Approval) bool {
 // sshGuardApprovalStaleCode labels a dismissal in the audit trail.
 const sshGuardApprovalStaleCode = "sshguard_approval_superseded"
 
+// sshGuardSupersededMark is the phrase dismissibleSSHGuardApprovalReason writes
+// and sshGuardApprovalSuperseded reads back. The dismissal keeps its stale code
+// only in the audit row, so the reason text is the record's own memory of why
+// it was retired, and the one thing a later reader can key on.
+const sshGuardSupersededMark = "approval superseded: approved but never applied"
+
+// sshGuardApprovalSuperseded reports whether a dismissed SSH Guard approval was
+// retired as superseded: approved, dispatched, its task run, and the record left
+// at approved because nothing carried the result back at the time. The
+// dismissal retired the record. It did not touch the node, so what the arm
+// wrote there is still what the node runs unless a later arm replaced it.
+func sshGuardApprovalSuperseded(a model.Approval) bool {
+	return isSSHGuardApproval(a) && a.Status == approvalStatusDismissed && strings.Contains(a.Reason, sshGuardSupersededMark)
+}
+
 // dismissibleSSHGuardApprovalReason decides whether an SSH Guard approval can
 // be retired without being applied, and what the record should say.
 //
@@ -62,7 +77,7 @@ func (s *Server) dismissibleSSHGuardApprovalReason(approval model.Approval, note
 	if approval.Action == sshGuardConfirmAction {
 		stage = "confirm"
 	}
-	reason := fmt.Sprintf("SSH Guard %s approval superseded: approved but never applied, and an approval cannot be re-dispatched. Re-plan if this node still needs the change.", stage)
+	reason := fmt.Sprintf("SSH Guard %s %s, and an approval cannot be re-dispatched. Re-plan if this node still needs the change.", stage, sshGuardSupersededMark)
 	if note != "" {
 		reason = reason + " " + note
 	}

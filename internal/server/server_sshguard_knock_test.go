@@ -22,9 +22,22 @@ func seedArmApproval(t *testing.T, st interface {
 	UpsertApproval(model.Approval) error
 }, id, nodeID, status string, ports []int, updatedAt time.Time) {
 	t.Helper()
+	seedSSHGuardArm(t, st, model.Approval{
+		ID: id, NodeID: nodeID, Status: status, CreatedAt: updatedAt, UpdatedAt: updatedAt,
+	}, ports, []string{"203.0.113.5"})
+}
+
+// seedSSHGuardArm stores an arm approval whose plan is rendered from ports and
+// mgmt: no ports means knocking off, no mgmt means hardening only with no
+// firewall at all. Status, reason and timestamps come from the caller so a
+// test can lay down a node's real history record by record.
+func seedSSHGuardArm(t *testing.T, st interface {
+	UpsertApproval(model.Approval) error
+}, a model.Approval, ports []int, mgmt []string) {
+	t.Helper()
 	profile := sshguard.Profile{
-		NodeID: nodeID, SSHPort: 58394, KeepLegacyPort: true,
-		Hardening: sshguard.DefaultHardening(), MgmtSources: []string{"203.0.113.5"},
+		NodeID: a.NodeID, SSHPort: 58394, KeepLegacyPort: true,
+		Hardening: sshguard.DefaultHardening(), MgmtSources: mgmt,
 		ConfirmWindowSec: 900,
 	}
 	if len(ports) > 0 {
@@ -34,12 +47,47 @@ func seedArmApproval(t *testing.T, st interface {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertApproval(model.Approval{
-		ID: id, NodeID: nodeID, Plugin: sshGuardPlugin, Action: sshGuardArmAction,
-		Plan: plan, Status: status, ActorID: "admin",
-		CreatedAt: updatedAt, UpdatedAt: updatedAt,
-	}); err != nil {
+	a.Plugin, a.Action, a.Plan = sshGuardPlugin, sshGuardArmAction, plan
+	if a.ActorID == "" {
+		a.ActorID = "admin"
+	}
+	if err := st.UpsertApproval(a); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func seedSSHGuardConfirm(t *testing.T, st interface {
+	UpsertApproval(model.Approval) error
+}, a model.Approval) {
+	t.Helper()
+	plan, err := sshguard.RenderConfirmPlan(a.NodeID, "Node A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Plugin, a.Action, a.Plan = sshGuardPlugin, sshGuardConfirmAction, plan
+	if a.ActorID == "" {
+		a.ActorID = "admin"
+	}
+	if err := st.UpsertApproval(a); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// dismissAsSuperseded retires an approved-but-never-applied record through the
+// real dismiss endpoint, so the fixture carries the exact reason text the
+// 2026-08-28 cleanup wrote rather than a hand-typed imitation of it.
+func dismissAsSuperseded(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf, approvalID string) {
+	t.Helper()
+	res := doJSON(t, handler, http.MethodPost, "/api/network/approvals/dismiss",
+		`{"approval_id":"`+approvalID+`"}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(res.Body)
+		t.Fatalf("dismiss %s: want 200, got %d (%s)", approvalID, res.StatusCode, raw)
+	}
+	out := knockBody(t, res)
+	if out["status"] != approvalStatusDismissed || out["stale_code"] != sshGuardApprovalStaleCode {
+		t.Fatalf("dismissal must record the superseded code on the view, got status=%v stale_code=%v", out["status"], out["stale_code"])
 	}
 }
 
@@ -352,5 +400,130 @@ func TestKnockRevealAuditNeverCarriesTheSequence(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("a reveal must leave an audit row")
+	}
+}
+
+// The sequence a node still runs can sit in a record the cleanup dismissed. This
+// fixture mirrors one real node's history: a hardening-only arm and its confirm
+// in the morning, a knock arm rejected at midday, then the knock arm that was
+// actually approved, dispatched and confirmed, all four retired a week later as
+// superseded because the task result never reached the approval. None of the
+// ports here are that node's.
+func TestKnockKnowledgeSurvivesTheSupersededCleanup(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	day := time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+	at := func(h, m int) time.Time { return day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute) }
+	rejected := []int{31111, 32222, 33333}
+	installed := []int{51111, 52222, 53333}
+
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_harden", NodeID: "node-a", Status: model.ApprovalApproved, CreatedAt: at(3, 8), UpdatedAt: at(3, 8)}, nil, nil)
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "confirm_harden", NodeID: "node-a", Status: model.ApprovalApproved, CreatedAt: at(3, 9), UpdatedAt: at(3, 9)})
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_rejected", NodeID: "node-a", Status: model.ApprovalRejected, CreatedAt: at(6, 37), UpdatedAt: at(10, 35)}, rejected, []string{"203.0.113.5"})
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_knock", NodeID: "node-a", Status: model.ApprovalApproved, CreatedAt: at(8, 37), UpdatedAt: at(8, 37)}, installed, []string{"203.0.113.5"})
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "confirm_knock", NodeID: "node-a", Status: model.ApprovalApproved, CreatedAt: at(10, 47), UpdatedAt: at(10, 47)})
+	for _, id := range []string{"arm_harden", "confirm_harden", "arm_knock", "confirm_knock"} {
+		dismissAsSuperseded(t, handler, cookies, csrf, id)
+	}
+	if a, _ := srv.store.Approval("arm_knock"); !sshGuardApprovalSuperseded(a) {
+		t.Fatalf("the fixture must produce a superseded record, got status=%q reason=%q", a.Status, a.Reason)
+	}
+
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock", `{"node_id":"node-a"}`, cookies, csrf)
+	defer res.Body.Close()
+	out := knockBody(t, res)
+	if out["knowledge"] != string(knockInstalledSuperseded) {
+		t.Fatalf("the dispatched and confirmed knock arm governs even though its record was dismissed, got %v (%v)", out["knowledge"], out["note"])
+	}
+	if out["approval_id"] != "arm_knock" {
+		t.Fatalf("the governing record must be the knock arm, got %v", out["approval_id"])
+	}
+	if out["revealable"] != true {
+		t.Fatal("a sequence the control plane holds must be revealable")
+	}
+	note, _ := out["note"].(string)
+	if !strings.Contains(note, "superseded") {
+		t.Fatalf("the note must say the sequence comes from a superseded record, got %q", note)
+	}
+
+	grant := issueStepUpGrant(t, handler, cookies, csrf)
+	reveal := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock/reveal",
+		`{"node_id":"node-a","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	defer reveal.Body.Close()
+	raw, _ := io.ReadAll(reveal.Body)
+	if reveal.StatusCode != http.StatusOK {
+		t.Fatalf("reveal from a superseded record: want 200, got %d (%s)", reveal.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "51111") || strings.Contains(string(raw), "31111") {
+		t.Fatalf("the reveal must hand over the dispatched sequence and never the rejected one: %s", raw)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(raw, &body)
+	if n, _ := body["note"].(string); !strings.Contains(n, "superseded") {
+		t.Fatalf("the reveal must carry the superseded caveat with the ports, got %q", n)
+	}
+}
+
+// A hardening-only re-arm writes the sshd drop-in and touches neither knockd
+// nor the knock table, so it must not retire the sequence an earlier arm
+// installed. A firewall re-arm with knocking off does retire it: the table it
+// installs has no allowed set for knockd to add to.
+func TestAHardenOnlyRearmDoesNotRetireTheKnock(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	base := time.Now().UTC().Add(-48 * time.Hour)
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_knock", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: base, UpdatedAt: base.Add(time.Minute)}, knockTestPorts, []string{"203.0.113.5"})
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "confirm_knock", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: base.Add(5 * time.Minute), UpdatedAt: base.Add(6 * time.Minute)})
+	later := base.Add(24 * time.Hour)
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_harden", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: later, UpdatedAt: later.Add(time.Minute)}, nil, nil)
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "confirm_harden", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: later.Add(5 * time.Minute), UpdatedAt: later.Add(6 * time.Minute)})
+
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock", `{"node_id":"node-a"}`, cookies, csrf)
+	defer res.Body.Close()
+	out := knockBody(t, res)
+	if out["knowledge"] != string(knockInstalled) || out["approval_id"] != "arm_knock" {
+		t.Fatalf("the knock arm still governs after a hardening-only re-arm, got knowledge=%v approval=%v", out["knowledge"], out["approval_id"])
+	}
+	if out["confirmed"] != true {
+		t.Fatal("the confirm that followed the knock arm must count for it")
+	}
+
+	// A firewall without knocking replaces the table and retires the knock.
+	nokKnock := later.Add(24 * time.Hour)
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_firewall", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: nokKnock, UpdatedAt: nokKnock.Add(time.Minute)}, nil, []string{"203.0.113.5"})
+	res2 := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock", `{"node_id":"node-a"}`, cookies, csrf)
+	defer res2.Body.Close()
+	out2 := knockBody(t, res2)
+	if out2["knowledge"] != string(knockNoKnock) {
+		t.Fatalf("a firewall arm with knocking off retires the sequence, got %v", out2["knowledge"])
+	}
+}
+
+// A node that was only ever hardened has had no plan touch its knock either
+// way. Reporting "no knock" there was wrong for the one node in the fleet whose
+// knock was installed by hand: the honest answer is that Lattice does not know.
+func TestAHardenOnlyArmLeavesTheKnockUnknownRatherThanOff(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_harden", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}, nil, nil)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock", `{"node_id":"node-a"}`, cookies, csrf)
+	defer res.Body.Close()
+	out := knockBody(t, res)
+	if out["knowledge"] != string(knockUnknown) {
+		t.Fatalf("hardening only says nothing about knocking, got %v", out["knowledge"])
+	}
+	if out["revealable"] != false {
+		t.Fatal("nothing to reveal")
+	}
+	note, _ := out["note"].(string)
+	if !strings.Contains(note, "without installing a firewall") || !strings.Contains(note, "configured outside Lattice") {
+		t.Fatalf("the note must say why the knock is unknown on a hardened node, got %q", note)
 	}
 }

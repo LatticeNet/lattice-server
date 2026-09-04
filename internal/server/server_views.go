@@ -87,6 +87,13 @@ func approvalStaleMetadata(a model.Approval) (bool, string) {
 	if a.Plugin == agentUpdatePlugin && strings.HasPrefix(a.Reason, errAgentUpdateApprovalStale.Error()) {
 		return true, agentUpdateApprovalStaleCode
 	}
+	if sshGuardApprovalSuperseded(a) {
+		// The code names why the row was retired, which the reason prose only
+		// implies. Stale stays false: the console lights its freshness marker
+		// on that flag, and a dismissed record is history, not a pending
+		// decision gone stale.
+		return false, sshGuardApprovalStaleCode
+	}
 	return false, ""
 }
 

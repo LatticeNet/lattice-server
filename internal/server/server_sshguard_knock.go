@@ -51,12 +51,18 @@ type knockKnowledge string
 const (
 	// knockInstalled: an arm plan carrying a sequence reached applied.
 	knockInstalled knockKnowledge = "installed"
+	// knockInstalledSuperseded: the arm that carried the sequence to the node
+	// was approved and dispatched, and its record was later dismissed as
+	// superseded because nothing had carried the task result back at the
+	// time. The dismissal retired the record, not the change on the node.
+	knockInstalledSuperseded knockKnowledge = "installed_superseded"
 	// knockPlanned: an arm plan carrying a sequence exists but has not applied.
 	knockPlanned knockKnowledge = "planned"
-	// knockNoKnock: SSH Guard was applied here with knocking turned off.
+	// knockNoKnock: SSH Guard installed a firewall here with knocking turned
+	// off, which retires any sequence an earlier arm had installed.
 	knockNoKnock knockKnowledge = "no_knock"
-	// knockUnknown: the control plane has no SSH Guard arm plan for this node,
-	// so if the node is knocking, it was not this system that told it to.
+	// knockUnknown: no SSH Guard plan ever carried a knock to this node, so if
+	// the node is knocking, it was not this system that told it to.
 	knockUnknown knockKnowledge = "unknown"
 )
 
@@ -67,7 +73,7 @@ type sshGuardKnockState struct {
 	Knowledge  knockKnowledge
 	ApprovalID string
 	AppliedAt  time.Time
-	// Confirmed reports whether a confirm approval for this node also
+	// Confirmed reports whether the confirm approval that followed this arm
 	// applied. An arm that applied and was never confirmed may have been
 	// undone by its own revert timer, which the control plane does not
 	// observe, so the page must not claim the sequence is in force.
@@ -81,6 +87,11 @@ type sshGuardKnockState struct {
 	// plan" and "the plans there were all died" are different things to tell
 	// someone who cannot get in.
 	Rejected bool
+	// HardenedOnly is set when SSH Guard reached this node but every arm that
+	// did was hardening only: an sshd drop-in, no firewall, no knockd. Those
+	// arms say nothing about knocking either way, so the knowledge is unknown
+	// for a different reason than "no plan".
+	HardenedOnly bool
 	// ParseError records a plan this code could not read. Reported rather than
 	// swallowed: a plan that will not parse is a sequence an operator is going
 	// to go looking for in the note, and silence would send him there without
@@ -91,15 +102,30 @@ type sshGuardKnockState struct {
 // sshGuardKnockStateFor picks the arm plan that describes the node's current
 // knock configuration and reads the sequence out of it.
 //
-// Newest-applied wins. A node can be re-armed, and each arm draws a fresh
-// sequence, so the plan that matters is the last one that reached the host,
-// not the last one authored. An arm still pending is reported as planned
-// rather than installed, because knocking a sequence that was never applied
-// fails silently and looks like the sequence is wrong.
+// The knowledge is layered, because the node is. Each arm writes only what its
+// plan carries: a hardening-only arm writes the sshd drop-in and leaves knockd
+// and the knock table exactly as they were, so it cannot retire a sequence an
+// earlier arm installed. The arm that governs the knock is therefore the newest
+// one that carried a firewall AND reached the node, not the newest one that
+// applied. Reading it the other way reported "no knock" for five nodes that
+// were still gating SSH on a sequence from three weeks earlier.
+//
+// Reaching the node means one of two things. Applied is the plain case. The
+// other is a record dismissed as superseded: approved and dispatched before
+// task results were wired back into approvals, then retired by a cleanup that
+// could not move it out of approved. That dismissal touched the record, not
+// the host, so such an arm counts as reached when a confirm was dispatched
+// after it: the confirm is the operator saying he got in over the new path,
+// which is the evidence the arm's own status never recorded. A superseded arm
+// with nothing after it may have failed and reverted, and is not counted.
+//
+// An arm still pending is reported as planned rather than installed, because
+// knocking a sequence that was never applied fails silently and looks like
+// the sequence is wrong.
 func (s *Server) sshGuardKnockStateFor(nodeID string) sshGuardKnockState {
 	approvals := s.store.Approvals()
 	arms := make([]model.Approval, 0, 4)
-	confirmedAt := time.Time{}
+	confirms := make([]model.Approval, 0, 4)
 	for _, a := range approvals {
 		if a.NodeID != nodeID || a.Plugin != sshGuardPlugin {
 			continue
@@ -108,33 +134,25 @@ func (s *Server) sshGuardKnockStateFor(nodeID string) sshGuardKnockState {
 		case sshGuardArmAction:
 			arms = append(arms, a)
 		case sshGuardConfirmAction:
-			if a.Status == model.ApprovalApplied && a.UpdatedAt.After(confirmedAt) {
-				confirmedAt = a.UpdatedAt
-			}
+			confirms = append(confirms, a)
 		}
 	}
 	if len(arms) == 0 {
 		return sshGuardKnockState{Knowledge: knockUnknown}
 	}
-	// Newest first, by the time the record last moved. UpdatedAt is when an
-	// approval reached applied; CreatedAt breaks ties for records that never
-	// moved.
+	// Authoring order, newest first. CreatedAt is the one timestamp that means
+	// the same thing on every record: UpdatedAt is when an applied arm applied,
+	// but on a dismissed one it is the day of the cleanup, which says nothing
+	// about the node.
 	sort.SliceStable(arms, func(i, j int) bool {
-		ti, tj := arms[i].UpdatedAt, arms[j].UpdatedAt
-		if ti.IsZero() {
-			ti = arms[i].CreatedAt
-		}
-		if tj.IsZero() {
-			tj = arms[j].CreatedAt
-		}
-		return ti.After(tj)
+		return arms[i].CreatedAt.After(arms[j].CreatedAt)
 	})
 
 	node, _ := s.store.Node(nodeID)
-	read := func(a model.Approval) (sshGuardKnockState, bool) {
+	read := func(a model.Approval) (sshGuardKnockState, sshguard.Artifacts, bool) {
 		art, err := sshguard.ParseApprovalPlan(a.Plan)
 		if err != nil {
-			return sshGuardKnockState{ApprovalID: a.ID, ParseError: err.Error()}, false
+			return sshGuardKnockState{ApprovalID: a.ID, ParseError: err.Error()}, art, false
 		}
 		out := sshGuardKnockState{
 			ApprovalID: a.ID,
@@ -144,46 +162,94 @@ func (s *Server) sshGuardKnockStateFor(nodeID string) sshGuardKnockState {
 		}
 		if strings.TrimSpace(art.KnockdConf) == "" {
 			out.Knowledge = knockNoKnock
-			return out, true
+			return out, art, true
 		}
 		seq, err := sshguard.ParseKnockdConf(art.KnockdConf)
 		if err != nil {
 			out.ParseError = err.Error()
-			return out, false
+			return out, art, false
 		}
 		out.Sequence = seq
-		return out, true
+		return out, art, true
+	}
+	// confirmsFor reports the confirms filed for one arm: authored after it and
+	// before the next arm that was dispatched. A confirm belongs to the arm
+	// it followed, so the confirm of a later hardening-only re-arm must not
+	// be read as proof that an older knock arm was confirmed.
+	confirmsFor := func(arm model.Approval, until time.Time) (dispatched, applied bool) {
+		for _, c := range confirms {
+			if !c.CreatedAt.After(arm.CreatedAt) {
+				continue
+			}
+			if !until.IsZero() && !c.CreatedAt.Before(until) {
+				continue
+			}
+			switch {
+			case c.Status == model.ApprovalApplied:
+				dispatched, applied = true, true
+			case sshGuardApprovalSuperseded(c):
+				dispatched = true
+			}
+		}
+		return dispatched, applied
 	}
 
-	// An applied arm is what the node is actually running.
+	hardenedOnly := false
+	until := time.Time{}
 	for _, a := range arms {
-		if a.Status != model.ApprovalApplied {
+		applied := a.Status == model.ApprovalApplied
+		if !applied && !sshGuardApprovalSuperseded(a) {
+			// Pending, approved, rejected: nothing this arm carried is on the
+			// node yet, or ever.
 			continue
 		}
-		state, ok := read(a)
+		window := until
+		until = a.CreatedAt
+		state, art, ok := read(a)
 		if !ok {
 			return state
 		}
+		if strings.TrimSpace(art.KnockNFT) == "" {
+			// Hardening only. This arm wrote the drop-in and nothing else, so
+			// it neither supplies a knock nor retires one.
+			hardenedOnly = true
+			continue
+		}
+		dispatched, confirmed := confirmsFor(a, window)
+		if !applied && !dispatched {
+			continue
+		}
 		if state.Knowledge == knockNoKnock {
+			// A firewall without a sequence. The table it installs has no
+			// allowed set for knockd to add to, so whatever knocked before
+			// this arm no longer opens anything.
 			return state
 		}
-		state.Knowledge = knockInstalled
-		state.Confirmed = !confirmedAt.IsZero() && !confirmedAt.Before(a.UpdatedAt)
+		state.Confirmed = confirmed
+		if applied {
+			state.Knowledge = knockInstalled
+			return state
+		}
+		// The record's UpdatedAt is the dismissal, not the apply, and the
+		// apply time was never written anywhere. Zero is more honest than
+		// either.
+		state.Knowledge = knockInstalledSuperseded
+		state.AppliedAt = time.Time{}
 		return state
 	}
-	// Nothing applied. A plan still waiting on a decision says what was asked
-	// for, which is worth reporting so the page can distinguish "not set up
-	// yet" from "this system has never touched SSH Guard here".
+	// Nothing that reached the node carried a firewall. A plan still waiting on
+	// a decision says what was asked for, which is worth reporting so the page
+	// can distinguish "not set up yet" from "this system has never touched SSH
+	// Guard here".
 	//
 	// A rejected or dismissed arm is not that. Its sequence was never written
 	// to the node and never will be, so reporting it as planned would tell an
-	// operator to knock ports nothing is listening for. Those nodes are
-	// unknown: the control plane holds no sequence that governs them.
+	// operator to knock ports nothing is listening for.
 	for _, a := range arms {
 		if a.Status != model.ApprovalPending && a.Status != model.ApprovalApproved {
 			continue
 		}
-		state, ok := read(a)
+		state, _, ok := read(a)
 		if !ok {
 			return state
 		}
@@ -192,6 +258,9 @@ func (s *Server) sshGuardKnockStateFor(nodeID string) sshGuardKnockState {
 		}
 		state.AppliedAt = time.Time{}
 		return state
+	}
+	if hardenedOnly {
+		return sshGuardKnockState{Knowledge: knockUnknown, HardenedOnly: true}
 	}
 	return sshGuardKnockState{Knowledge: knockUnknown, Rejected: true}
 }
@@ -210,16 +279,31 @@ func knockStateNote(state sshGuardKnockState) string {
 			return "The control plane knows this node's knock sequence. It was applied and confirmed, so it is the sequence the node is running."
 		}
 		return "The control plane knows the knock sequence from the arm that was applied. That arm was never confirmed, so its automatic revert may have removed it from the node since."
+	case knockInstalledSuperseded:
+		if state.Confirmed {
+			return "The control plane knows this node's knock sequence from an arm record that was later dismissed as superseded. The dismissal retired the record, not the change: the arm was approved and dispatched, its confirm applied, and no later plan has replaced the knock since. This is the sequence the node was last told to run."
+		}
+		return "The control plane knows this node's knock sequence from an arm record that was later dismissed as superseded. The dismissal retired the record, not the change: the arm and a confirm after it were both approved and dispatched before apply results were recorded on approvals, so neither outcome was written back. No later plan has replaced the knock since. Treat this as the sequence the node was last told to run, and prove it with a knock before relying on it."
 	case knockPlanned:
 		return "An SSH Guard plan for this node carries a knock sequence, but it has not been applied. The node is not knocking on it yet."
 	case knockNoKnock:
 		return "SSH Guard is set up on this node without port knocking. There is no sequence to show; reach SSH from a management source."
 	default:
+		if state.HardenedOnly {
+			return "SSH Guard hardened sshd on this node without installing a firewall, so no plan here ever carried a knock sequence. If this node knocks, it was configured outside Lattice and the sequence is only wherever that was recorded."
+		}
 		if state.Rejected {
 			return "Every SSH Guard plan for this node was rejected or dismissed, so none of their sequences ever reached it. The control plane knows no sequence that opens this node."
 		}
 		return "The control plane has no SSH Guard plan for this node, so it does not know a knock sequence. If this node knocks, it was configured outside Lattice and the sequence is only wherever that was recorded."
 	}
+}
+
+// knockRevealable says whether a reveal would return anything for this
+// knowledge, so the page can decide between offering the button and
+// explaining its absence.
+func knockRevealable(k knockKnowledge) bool {
+	return k == knockInstalled || k == knockInstalledSuperseded || k == knockPlanned
 }
 
 func (s *Server) sshGuardKnockScopes(w http.ResponseWriter, p principal, nodeID string) bool {
@@ -266,7 +350,7 @@ func (s *Server) handleSSHGuardKnockState(w http.ResponseWriter, r *http.Request
 		"note":      knockStateNote(state),
 		// Whether a reveal would return anything, so the page can decide
 		// between offering the button and explaining its absence.
-		"revealable": state.Knowledge == knockInstalled || state.Knowledge == knockPlanned,
+		"revealable": knockRevealable(state.Knowledge),
 		// Named so the console never has to hardcode the fact that the reveal
 		// needs a second factor.
 		"requires_step_up": true,
@@ -278,7 +362,7 @@ func (s *Server) handleSSHGuardKnockState(w http.ResponseWriter, r *http.Request
 	if !state.AppliedAt.IsZero() {
 		out["applied_at"] = state.AppliedAt
 	}
-	if state.Knowledge == knockInstalled {
+	if state.Knowledge == knockInstalled || state.Knowledge == knockInstalledSuperseded {
 		out["confirmed"] = state.Confirmed
 	}
 	if state.ParseError != "" {
@@ -341,7 +425,7 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	switch state.Knowledge {
-	case knockInstalled, knockPlanned:
+	case knockInstalled, knockInstalledSuperseded, knockPlanned:
 	case knockNoKnock:
 		writeError(w, http.StatusNotFound, errors.New("SSH Guard is applied on this node without port knocking, so there is no sequence"))
 		return
@@ -362,10 +446,15 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 		},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":              true,
-		"node_id":         req.NodeID,
-		"knowledge":       string(state.Knowledge),
-		"approval_id":     state.ApprovalID,
+		"ok":          true,
+		"node_id":     req.NodeID,
+		"knowledge":   string(state.Knowledge),
+		"approval_id": state.ApprovalID,
+		// The same sentence the state endpoint shows, so a sequence read out
+		// of a superseded record arrives with the caveat attached rather than
+		// looking like one the control plane watched apply.
+		"note":            knockStateNote(state),
+		"confirmed":       state.Confirmed,
 		"ports":           state.Sequence.Ports,
 		"seq_timeout_sec": state.Sequence.SeqTimeoutSec,
 		"open_for":        state.Sequence.OpenFor,

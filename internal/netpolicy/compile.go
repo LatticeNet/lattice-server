@@ -71,7 +71,10 @@ func CompileEgressPlan(policy model.NetPolicy, resolve NodeResolver, opts Compil
 	}
 
 	var b strings.Builder
-	b.WriteString("destroy table inet lattice_policy\n")
+	// add then delete rather than destroy: nftables 1.0.6 (Debian 12) does
+	// not parse destroy, and the pair replaces the table on every version.
+	b.WriteString("add table inet lattice_policy\n")
+	b.WriteString("delete table inet lattice_policy\n")
 	b.WriteString("table inet lattice_policy {\n")
 	if opts.ControlPlaneHost != "" {
 		b.WriteString("\tset lattice_control4 {\n")

@@ -6644,7 +6644,7 @@ func nftPolicyApplyScript(plan, serverURL string, domainSets []nftPolicyDomainSe
 		"ROLLBACK=/etc/lattice/policy.rollback.nft\n" +
 		heredocWrite("$CANDIDATE", "LATTICE_NFT_POLICY_EOF", plan) +
 		"nft -c -f \"$CANDIDATE\"\n" +
-		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"\n" +
+		nftTableRollbackSnapshot("lattice_policy", "\"$ROLLBACK\"") +
 		nftRollbackWatchdogScript("nftpolicy", "lattice nftpolicy: watchdog rollback fired", "lattice nftpolicy: rolling back ruleset") +
 		"trap 'rollback; cleanup_watchdog' ERR\n" +
 		"start_watchdog\n" +

@@ -44,8 +44,7 @@ func TestCompileEgressRulesetRendersDeterministicPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, needle := range []string{
-		"destroy table inet lattice_policy",
-		"table inet lattice_policy",
+		"add table inet lattice_policy\ndelete table inet lattice_policy\ntable inet lattice_policy {",
 		"ct state established,related accept",
 		"oifname \"lo\" accept",
 		"ip daddr 203.0.113.99 tcp dport 443 accept comment \"lattice control-plane\"",
@@ -58,6 +57,11 @@ func TestCompileEgressRulesetRendersDeterministicPolicy(t *testing.T) {
 		if !strings.Contains(got, needle) {
 			t.Fatalf("compiled ruleset missing %q:\n%s", needle, got)
 		}
+	}
+	// destroy arrived in nftables 1.0.7; sixteen fleet nodes run 1.0.6, where
+	// nft -c fails on it with "syntax error, unexpected table, expecting string".
+	if strings.Contains(got, "destroy") {
+		t.Fatalf("compiled ruleset uses a command nftables 1.0.6 does not parse:\n%s", got)
 	}
 	if strings.Index(got, "lattice control-plane") > strings.Index(got, "deny-db") {
 		t.Fatalf("control-plane allow must be emitted before operator rules:\n%s", got)

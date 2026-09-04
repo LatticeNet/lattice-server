@@ -209,7 +209,7 @@ func TestNetPolicyPlanApproveAndResultUpdatesPolicy(t *testing.T) {
 	}
 	for _, needle := range []string{
 		"policy.rollback.nft",
-		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"",
+		"{ echo 'add table inet lattice_policy'; echo 'delete table inet lattice_policy'; nft list table inet lattice_policy 2>/dev/null || true; } > \"$ROLLBACK\"",
 		"WATCHDOG_FIRED=/tmp/lattice-nftpolicy-watchdog.$$",
 		"setsid sh -c",
 		"assert_watchdog_clean",
@@ -221,8 +221,8 @@ func TestNetPolicyPlanApproveAndResultUpdatesPolicy(t *testing.T) {
 			t.Fatalf("apply script missing %q:\n%s", needle, task.Script)
 		}
 	}
-	if strings.Contains(task.Script, "nft list ruleset > \"$ROLLBACK\"") {
-		t.Fatalf("netpolicy rollback snapshot must flush before replay:\n%s", task.Script)
+	if strings.Contains(task.Script, "flush ruleset") || strings.Contains(task.Script, "nft list ruleset") {
+		t.Fatalf("netpolicy rollback must touch only table inet lattice_policy:\n%s", task.Script)
 	}
 	for _, needle := range []string{
 		"systemctl disable --now lattice-nftpolicy-domain-refresh.timer",

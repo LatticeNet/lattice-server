@@ -118,14 +118,7 @@ type approvalWaitContext struct {
 // approvals in one listing. Returns nil when nothing in the listing is
 // approved, so the ordinary read of a history of applied rows costs nothing.
 func (s *Server) newApprovalWaitContext(approvals []model.Approval) *approvalWaitContext {
-	anyApproved := false
-	for _, a := range approvals {
-		if a.Status == model.ApprovalApproved {
-			anyApproved = true
-			break
-		}
-	}
-	if !anyApproved {
+	if !approvalsIncludeApproved(approvals) {
 		return nil
 	}
 	ctx := &approvalWaitContext{
@@ -149,6 +142,17 @@ func (s *Server) newApprovalWaitContext(approvals []model.Approval) *approvalWai
 	}
 	ctx.indexSupersession(approvals)
 	return ctx
+}
+
+// approvalsIncludeApproved reports whether any row is approved, the only
+// status the waiting explanation exists for.
+func approvalsIncludeApproved(approvals []model.Approval) bool {
+	for _, a := range approvals {
+		if a.Status == model.ApprovalApproved {
+			return true
+		}
+	}
+	return false
 }
 
 // indexSupersession maps each approved approval to the newest live approval
@@ -344,10 +348,18 @@ func (s *Server) approvalWaitReasonFor(a model.Approval) (*approvalWaitView, boo
 	return wait, true
 }
 
-// annotateApprovalWaiting attaches the explanation to a listing. Views and
-// approvals are order-aligned, which toApprovalViews guarantees.
+// annotateApprovalWaiting attaches the explanation to a listing, indexing the
+// listing itself. Correct only when the listing is the whole set in scope; a
+// filtered page must build the index from that whole set and pass it to
+// annotateApprovalWaitingWith instead, or a superseded row loses its sibling.
 func (s *Server) annotateApprovalWaiting(views []approvalView, approvals []model.Approval) []approvalView {
-	ctx := s.newApprovalWaitContext(approvals)
+	return s.annotateApprovalWaitingWith(views, approvals, s.newApprovalWaitContext(approvals))
+}
+
+// annotateApprovalWaitingWith attaches the explanation using an index the
+// caller built. Views and approvals are order-aligned, which toApprovalViews
+// guarantees; the index is independent of both.
+func (s *Server) annotateApprovalWaitingWith(views []approvalView, approvals []model.Approval, ctx *approvalWaitContext) []approvalView {
 	if ctx == nil {
 		return views
 	}
@@ -358,6 +370,26 @@ func (s *Server) annotateApprovalWaiting(views []approvalView, approvals []model
 		views[i].Waiting = s.approvalWait(approvals[i], ctx)
 	}
 	return views
+}
+
+// approvalWaitFor explains one approval read on its own, for the single-row
+// read path. The index is built from every approval the principal may read,
+// so supersession is visible; scoping it to the principal keeps the answer
+// from naming an approval the caller is not allowed to see.
+func (s *Server) approvalWaitFor(p principal, a model.Approval) *approvalWaitView {
+	if a.Status != model.ApprovalApproved {
+		// Nothing else carries the field, and the index costs a walk of every
+		// approval, node and task. Only the row that needs it pays for it.
+		return nil
+	}
+	all := s.store.Approvals()
+	scoped := make([]model.Approval, 0, len(all))
+	for _, candidate := range all {
+		if s.approvalVisibleToPrincipal(p, candidate) {
+			scoped = append(scoped, candidate)
+		}
+	}
+	return s.approvalWait(a, s.newApprovalWaitContext(scoped))
 }
 
 // approvalWaitDismissalReason is what the dismissed row records: the sentence

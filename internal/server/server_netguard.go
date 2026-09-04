@@ -772,16 +772,15 @@ func (s *Server) handleDeleteNodeGuardBinding(w http.ResponseWriter, r *http.Req
 	if !s.requireNodeScope(w, p, "netguard:admin", req.NodeID) {
 		return
 	}
-	binding, ok := s.store.NodeGuardBinding(req.NodeID)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("node has no guard binding"))
-		return
-	}
-	if binding.Managed {
+	// The managed check lives in the store, under the lock that performs the
+	// delete: checking here and deleting in a second lock acquisition would
+	// let a concurrent upsert flip the binding to managed=true in between and
+	// the delete would then drop the owner of a live table.
+	deleted, ok, err := s.store.DeleteNodeGuardBinding(req.NodeID)
+	if errors.Is(err, store.ErrGuardBindingManaged) {
 		writeError(w, http.StatusConflict, errors.New("guard binding is managed; set managed=false before deleting it"))
 		return
 	}
-	deleted, ok, err := s.store.DeleteNodeGuardBinding(req.NodeID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

@@ -86,8 +86,10 @@ type NodeReality struct {
 	Reported bool
 	// ListeningTCPPorts is what the node currently has bound.
 	ListeningTCPPorts []int
-	// ManagedByNetGuard is true when a guard binding exists for this node, so
-	// a lattice_guard table is or will be present.
+	// ManagedByNetGuard is true when netguard has a lattice_guard table in
+	// front of this node: the binding is managed and a table has been applied
+	// from it, or the node reports one. A binding record on its own is not
+	// enough; an observe-only binding describes nothing on the node.
 	ManagedByNetGuard bool
 	// GuardAcceptedTCPPorts is what that guard ruleset would accept. Only
 	// meaningful when ManagedByNetGuard is true.

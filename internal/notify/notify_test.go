@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -111,5 +112,111 @@ func TestMissingConfigErrors(t *testing.T) {
 	}
 	if err := (Bark{}).Send(context.Background(), Message{}); err == nil {
 		t.Fatal("bark without base/key should error")
+	}
+}
+
+func TestBarkSendPostsJSONPush(t *testing.T) {
+	var gotPath, gotType string
+	var got map[string]string
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.Method + " " + r.URL.Path
+		gotType = r.Header.Get("Content-Type")
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	b := Bark{BaseURL: srv.URL + "/", Key: "devkey", Level: "timeSensitive", URL: "https://lattice.example/alerts", Client: srv.Client()}
+	if err := b.Send(context.Background(), Message{Title: "service down", Body: "sing-box on hkg"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "POST /push" {
+		t.Fatalf("expected POST /push, got %q", gotPath)
+	}
+	if gotType != "application/json" {
+		t.Fatalf("expected JSON content type, got %q", gotType)
+	}
+	want := map[string]string{
+		"device_key": "devkey",
+		"title":      "service down",
+		"body":       "sing-box on hkg",
+		"level":      "timeSensitive",
+		"group":      BarkDefaultGroup,
+		"url":        "https://lattice.example/alerts",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Fatalf("push body %s = %q, want %q (full: %v)", k, got[k], v, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("unexpected extra push fields: %v", got)
+	}
+}
+
+func TestBarkDefaultsLevelGroupAndTitle(t *testing.T) {
+	var got map[string]string
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	b := Bark{BaseURL: srv.URL, Key: "devkey", Client: srv.Client()}
+	if err := b.Send(context.Background(), Message{Body: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	if got["level"] != BarkDefaultLevel || got["group"] != BarkDefaultGroup || got["title"] != "Lattice" {
+		t.Fatalf("expected defaults active/lattice/Lattice, got %v", got)
+	}
+	if _, present := got["url"]; present {
+		t.Fatalf("empty url must be omitted, got %v", got)
+	}
+}
+
+func TestBarkFallsBackToPathFormOnMethodNotAllowed(t *testing.T) {
+	var requests []string
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.RequestURI())
+		if r.URL.Path == "/push" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	b := Bark{BaseURL: srv.URL, Key: "devkey", Group: "ops", Client: srv.Client()}
+	if err := b.Send(context.Background(), Message{Title: "a b", Body: "c/d"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 2 || requests[0] != "POST /push" {
+		t.Fatalf("expected POST then GET fallback, got %v", requests)
+	}
+	if requests[1] != "GET /devkey/a%20b/c%2Fd?group=ops&level=active" {
+		t.Fatalf("unexpected fallback request %q", requests[1])
+	}
+}
+
+func TestBarkDoesNotFallBackOnOtherErrors(t *testing.T) {
+	hits := 0
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		http.Error(w, `{"code":400,"message":"failed to get device token"}`, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	b := Bark{BaseURL: srv.URL, Key: "bogus", Client: srv.Client()}
+	err := b.Send(context.Background(), Message{Body: "x"})
+	if err == nil || !strings.Contains(err.Error(), "status 400") {
+		t.Fatalf("expected 400 to surface, got %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("400 must not trigger the GET fallback, got %d requests", hits)
+	}
+}
+
+func TestBarkBlocksPrivateBaseURLByPolicy(t *testing.T) {
+	for _, base := range []string{"http://10.0.0.5:7001", "http://100.64.0.9", "http://127.0.0.1:1"} {
+		err := (Bark{BaseURL: base, Key: "devkey"}).Send(context.Background(), Message{Body: "x"})
+		if err == nil || !strings.Contains(err.Error(), "blocked address") {
+			t.Fatalf("%s: expected policy block for private bark base_url, got %v", base, err)
+		}
 	}
 }

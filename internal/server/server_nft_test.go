@@ -184,7 +184,7 @@ func TestNFTPlanComposesIngressNetPolicyIntoGuard(t *testing.T) {
 	for _, needle := range []string{
 		"guard.rollback.nft",
 		"nft -f \"$CANDIDATE\"",
-		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"",
+		"{ echo 'add table inet lattice_guard'; echo 'delete table inet lattice_guard'; nft list table inet lattice_guard 2>/dev/null || true; } > \"$ROLLBACK\"",
 		"WATCHDOG_FIRED=/tmp/lattice-nft-watchdog.$$",
 		"setsid sh -c",
 		"assert_watchdog_clean",
@@ -195,8 +195,10 @@ func TestNFTPlanComposesIngressNetPolicyIntoGuard(t *testing.T) {
 			t.Fatalf("guard apply script missing %q:\n%s", needle, task.Script)
 		}
 	}
-	if strings.Contains(task.Script, "nft list ruleset > \"$ROLLBACK\"") {
-		t.Fatalf("guard rollback snapshot must flush before replay:\n%s", task.Script)
+	// Five fleet nodes carry Docker's iptables-nft tables and seven carry
+	// lattice_knock; a rollback that flushes the ruleset takes them all down.
+	if strings.Contains(task.Script, "flush ruleset") || strings.Contains(task.Script, "nft list ruleset") {
+		t.Fatalf("guard rollback must touch only table inet lattice_guard:\n%s", task.Script)
 	}
 }
 

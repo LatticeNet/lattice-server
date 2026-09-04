@@ -6526,6 +6526,21 @@ func validateNftPolicyDomainSetBindings(domainSets []nftPolicyDomainSetBinding) 
 	return out, nil
 }
 
+// nftTableRollbackSnapshot writes a rollback file that restores exactly one
+// table. It replays as `add table; delete table; <table as it was listed>`,
+// so a rollback removes whatever the apply created and puts back the table
+// that was there before, or leaves none if there was none. The add/delete pair
+// rather than `destroy` because nftables 1.0.6 does not parse destroy.
+//
+// It deliberately does not snapshot the whole ruleset. A `flush ruleset`
+// replay would drop and re-create Docker's iptables-nft tables, SSH Guard's
+// lattice_knock and dns_hijack_local on the nodes that carry them, and reset
+// the knock allow set's timeouts, all for a failure in a table none of them
+// share.
+func nftTableRollbackSnapshot(table, dst string) string {
+	return "{ echo 'add table inet " + table + "'; echo 'delete table inet " + table + "'; nft list table inet " + table + " 2>/dev/null || true; } > " + dst + "\n"
+}
+
 func nftGuardApplyScript(plan, serverURL string) string {
 	return nftGuardApplyScriptWithManagedSHA(plan, serverURL, false)
 }
@@ -6557,7 +6572,7 @@ func nftGuardApplyScriptWithManagedSHA(plan, serverURL string, reportManagedSHA 
 		"ROLLBACK=/etc/lattice/guard.rollback.nft\n" +
 		heredocWrite("$CANDIDATE", "LATTICE_NFT_GUARD_EOF", plan) +
 		"nft -c -f \"$CANDIDATE\"\n" +
-		"{ echo 'flush ruleset'; nft list ruleset; } > \"$ROLLBACK\"\n" +
+		nftTableRollbackSnapshot("lattice_guard", "\"$ROLLBACK\"") +
 		nftRollbackWatchdogScript("nft", "lattice nft: watchdog rollback fired", "lattice nft: rolling back guard ruleset") +
 		"trap 'rollback; cleanup_watchdog' ERR\n" +
 		"start_watchdog\n" +
@@ -6727,6 +6742,9 @@ func restoreShiftedBody(restore string) string {
 	return strings.ReplaceAll(shifted, "\"$1\"", "\"$2\"")
 }
 
+// nftRollbackWatchdogScript arms the dead-man rollback. Both the trap and the
+// detached watchdog replay $ROLLBACK verbatim, so the file decides the blast
+// radius: it is written by nftTableRollbackSnapshot and touches one table.
 func nftRollbackWatchdogScript(name, firedMessage, rollbackMessage string) string {
 	return "WATCHDOG=\n" +
 		"WATCHDOG_FIRED=/tmp/lattice-" + name + "-watchdog.$$\n" +

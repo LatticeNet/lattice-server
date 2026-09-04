@@ -264,6 +264,11 @@ type Server struct {
 	now func() time.Time
 	// ddnsProvider builds a DNS provider from a profile; overridable in tests.
 	ddnsProvider func(model.DDNSProfile) (ddns.Provider, error)
+	// tlsMonitorTargets resolves a tls monitor target to the addresses the
+	// probe may dial. Production uses the outbound address policy; a test
+	// replaces it to reach its own loopback listener, which that policy
+	// refuses by design.
+	tlsMonitorTargets func(ctx context.Context, host, port string) ([]string, error)
 	// emitNotify dispatches an event notification; overridable in tests.
 	emitNotify func(title, body string)
 	// emitNotifyTyped is the same seam with the event type stated rather than
@@ -567,6 +572,7 @@ func New(opts Options) (*Server, error) {
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
 		subscriptionDecoy:     opts.SubscriptionDecoy,
 		now:                   func() time.Time { return time.Now().UTC() },
+		tlsMonitorTargets:     defaultTLSMonitorTargets,
 		userLoginFail:         make(map[string]*loginFailBucket),
 		proxyDrift:            make(map[string]proxyDriftState),
 	}
@@ -636,6 +642,7 @@ func New(opts Options) (*Server, error) {
 		s.startTraceRetention()
 		s.startTraceReattribution()
 		s.startDDNSSweep()
+		s.startTLSMonitorSweep()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -4586,26 +4593,42 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusBadRequest, errors.New("name and target are required"))
 			return
 		}
-		if req.Type != model.MonitorTypeTCP && req.Type != model.MonitorTypeHTTP {
-			writeError(w, http.StatusBadRequest, errors.New("only tcp and http monitors are supported (icmp pending)"))
+		switch req.Type {
+		case model.MonitorTypeTCP, model.MonitorTypeHTTP:
+			if !req.AssignAll && len(req.NodeIDs) == 0 {
+				writeError(w, http.StatusBadRequest, errors.New("set assign_all or provide node_ids"))
+				return
+			}
+			if req.AssignAll && principalHasNodeRestriction(p) {
+				writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "restricted token cannot assign monitor to all nodes"))
+				return
+			}
+			if !req.AssignAll && !s.requireAllNodeScopes(w, p, "monitor:admin", req.NodeIDs) {
+				return
+			}
+			req.ThresholdDays = 0
+			if req.IntervalSec <= 0 {
+				req.IntervalSec = 30
+			}
+			if req.TimeoutSec <= 0 {
+				req.TimeoutSec = 5
+			}
+		case model.MonitorTypeTLS:
+			// A tls monitor has no node to be restricted to, so a token that
+			// may only touch some nodes may not create one.
+			if principalHasNodeRestriction(p) {
+				writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "restricted token cannot create a server-evaluated monitor"))
+				return
+			}
+			normalized, err := normalizeTLSMonitor(req)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			req = normalized
+		default:
+			writeError(w, http.StatusBadRequest, errors.New("only tcp, http and tls monitors are supported (icmp pending)"))
 			return
-		}
-		if !req.AssignAll && len(req.NodeIDs) == 0 {
-			writeError(w, http.StatusBadRequest, errors.New("set assign_all or provide node_ids"))
-			return
-		}
-		if req.AssignAll && principalHasNodeRestriction(p) {
-			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "restricted token cannot assign monitor to all nodes"))
-			return
-		}
-		if !req.AssignAll && !s.requireAllNodeScopes(w, p, "monitor:admin", req.NodeIDs) {
-			return
-		}
-		if req.IntervalSec <= 0 {
-			req.IntervalSec = 30
-		}
-		if req.TimeoutSec <= 0 {
-			req.TimeoutSec = 5
 		}
 		req.ID = id.New("mon")
 		req.Enabled = true
@@ -4685,6 +4708,12 @@ func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) boo
 
 func monitorManageableByPrincipal(p principal, mon model.Monitor) bool {
 	if mon.AssignAll {
+		return !principalHasNodeRestriction(p) && rbac.Allows(p.Principal, "monitor:admin", "")
+	}
+	// A monitor with no node assignment is server-evaluated (tls): there is no
+	// node scope to check, so it takes the same unrestricted-admin rule the
+	// read path applies. Without this it could be created and never deleted.
+	if len(mon.NodeIDs) == 0 {
 		return !principalHasNodeRestriction(p) && rbac.Allows(p.Principal, "monitor:admin", "")
 	}
 	return taskTargetsAllowed(p, "monitor:admin", mon.NodeIDs)
@@ -5166,14 +5195,23 @@ func (s *Server) notifyMonitorTransition(nodeID string, current, prior model.Mon
 	if name == "" {
 		name = current.MonitorID
 	}
+	// A server-evaluated monitor (tls) has no node, so it names the target it
+	// dialled instead. Node monitors keep their exact wording.
+	where := "node " + nodeID
+	if nodeID == "" {
+		where = mon.Target
+		if strings.TrimSpace(where) == "" {
+			where = "the control plane"
+		}
+	}
 	if current.Success {
-		s.emitNotify("✅ Monitor recovered", fmt.Sprintf("%s on node %s is back up (%.1fms)", name, nodeID, current.LatencyMs))
+		s.emitNotify("✅ Monitor recovered", fmt.Sprintf("%s on %s is back up (%.1fms)", name, where, current.LatencyMs))
 	} else {
 		detail := current.Error
 		if detail == "" {
 			detail = "probe failed"
 		}
-		s.emitNotify("🔴 Monitor down", fmt.Sprintf("%s on node %s failed: %s", name, nodeID, detail))
+		s.emitNotify("🔴 Monitor down", fmt.Sprintf("%s on %s failed: %s", name, where, detail))
 	}
 }
 
@@ -5532,6 +5570,11 @@ func (s *Server) maybeTriggerDDNS(nodeID, oldV4, oldV6, newV4, newV6 string) {
 	for _, dep := range s.store.DNSDeploymentsForNode(nodeID) {
 		dep := dep
 		if dep.Hostname == "" || dep.Disabled {
+			continue
+		}
+		// An external engine's hostname belongs to the operator's own DNS,
+		// not to Lattice: a node-IP change must never rewrite it.
+		if dep.Engine == model.DNSEngineExternal {
 			continue
 		}
 		go func() {

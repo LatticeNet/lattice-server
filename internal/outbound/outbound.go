@@ -263,6 +263,14 @@ func resolveAllowed(ctx context.Context, host, port string) ([]string, error) {
 	return resolveWithPolicy(ctx, host, port, func(ip net.IP) bool { return !isBlockedIP(ip) })
 }
 
+// ResolveAllowed resolves host to the host:port addresses a raw dial may use,
+// refusing the same address classes GuardURL refuses (loopback, private,
+// link-local, multicast, the metadata endpoint). It is the policy for any
+// server-side dial that is not an HTTP request through NewClient.
+func ResolveAllowed(ctx context.Context, host, port string) ([]string, error) {
+	return resolveAllowed(ctx, host, port)
+}
+
 func resolveOperatorTargetForScheme(ctx context.Context, host, port, scheme string) ([]string, error) {
 	return resolveWithPolicy(ctx, host, port, func(ip net.IP) bool {
 		if isBlockedOperatorIP(ip) {

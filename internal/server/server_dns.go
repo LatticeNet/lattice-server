@@ -29,33 +29,38 @@ const (
 )
 
 type dnsDeploymentView struct {
-	ID               string          `json:"id"`
-	Name             string          `json:"name"`
-	NodeID           string          `json:"node_id"`
-	NodeName         string          `json:"node_name,omitempty"`
-	Engine           string          `json:"engine"`
-	ListenPort       int             `json:"listen_port"`
-	EnableUDP        bool            `json:"enable_udp"`
-	EnableTCP        bool            `json:"enable_tcp"`
-	Exposure         string          `json:"exposure"`
-	Zones            []model.DNSZone `json:"zones"`
-	Hostname         string          `json:"hostname,omitempty"`
-	PublishIPv4      bool            `json:"publish_ipv4"`
-	PublishIPv6      bool            `json:"publish_ipv6"`
-	RecordTTL        int             `json:"record_ttl,omitempty"`
-	DDNSProfileID    string          `json:"ddns_profile_id,omitempty"`
-	HasCredential    bool            `json:"has_credential"`
-	Status           string          `json:"status"`
-	EngineVersion    string          `json:"engine_version,omitempty"`
-	LastIPv4         string          `json:"last_ipv4,omitempty"`
-	LastIPv6         string          `json:"last_ipv6,omitempty"`
-	LastAppliedAt    time.Time       `json:"last_applied_at,omitempty"`
-	LastError        string          `json:"last_error,omitempty"`
-	LastPublishedAt  time.Time       `json:"last_published_at,omitempty"`
-	LastPublishError string          `json:"last_publish_error,omitempty"`
-	Disabled         bool            `json:"disabled,omitempty"`
-	CreatedAt        time.Time       `json:"created_at"`
-	UpdatedAt        time.Time       `json:"updated_at"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	NodeID     string          `json:"node_id"`
+	NodeName   string          `json:"node_name,omitempty"`
+	Engine     string          `json:"engine"`
+	ListenPort int             `json:"listen_port"`
+	EnableUDP  bool            `json:"enable_udp"`
+	EnableTCP  bool            `json:"enable_tcp"`
+	Exposure   string          `json:"exposure"`
+	Zones      []model.DNSZone `json:"zones"`
+	// Listeners, CertNotAfter and Drift describe an external (observed) engine
+	// and stay empty for engines Lattice deploys itself.
+	Listeners        []model.DNSListener `json:"listeners,omitempty"`
+	CertNotAfter     time.Time           `json:"cert_not_after,omitempty"`
+	Drift            *dnsDriftView       `json:"drift,omitempty"`
+	Hostname         string              `json:"hostname,omitempty"`
+	PublishIPv4      bool                `json:"publish_ipv4"`
+	PublishIPv6      bool                `json:"publish_ipv6"`
+	RecordTTL        int                 `json:"record_ttl,omitempty"`
+	DDNSProfileID    string              `json:"ddns_profile_id,omitempty"`
+	HasCredential    bool                `json:"has_credential"`
+	Status           string              `json:"status"`
+	EngineVersion    string              `json:"engine_version,omitempty"`
+	LastIPv4         string              `json:"last_ipv4,omitempty"`
+	LastIPv6         string              `json:"last_ipv6,omitempty"`
+	LastAppliedAt    time.Time           `json:"last_applied_at,omitempty"`
+	LastError        string              `json:"last_error,omitempty"`
+	LastPublishedAt  time.Time           `json:"last_published_at,omitempty"`
+	LastPublishError string              `json:"last_publish_error,omitempty"`
+	Disabled         bool                `json:"disabled,omitempty"`
+	CreatedAt        time.Time           `json:"created_at"`
+	UpdatedAt        time.Time           `json:"updated_at"`
 }
 
 func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p principal) {
@@ -183,6 +188,10 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	dep, ok := s.store.DNSDeployment(req.ID)
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("dns deployment not found"))
+		return
+	}
+	if dep.Engine == model.DNSEngineExternal {
+		writeError(w, http.StatusBadRequest, errDNSExternalObservedOnly)
 		return
 	}
 	node, ok := s.store.Node(dep.NodeID)
@@ -315,6 +324,10 @@ func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	if !s.requireNodeScope(w, p, "dns:admin", dep.NodeID) {
+		return
+	}
+	if dep.Engine == model.DNSEngineExternal {
+		writeError(w, http.StatusBadRequest, errDNSExternalObservedOnly)
 		return
 	}
 	if dep.Disabled {
@@ -616,6 +629,9 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 	if req.Engine == "" {
 		req.Engine = model.DNSEngineCoreDNS
 	}
+	if req.Engine == model.DNSEngineExternal {
+		return s.normalizeExternalDNSDeployment(req, existing, hadExisting)
+	}
 	if req.Engine != model.DNSEngineCoreDNS {
 		return model.DNSDeployment{}, fmt.Errorf("unsupported dns engine %q", req.Engine)
 	}
@@ -866,7 +882,7 @@ func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView 
 	if n, ok := s.store.Node(dep.NodeID); ok {
 		nodeName = n.Name
 	}
-	return dnsDeploymentView{
+	v := dnsDeploymentView{
 		ID: dep.ID, Name: dep.Name, NodeID: dep.NodeID, NodeName: nodeName, Engine: dep.Engine,
 		ListenPort: dep.ListenPort, EnableUDP: dep.EnableUDP, EnableTCP: dep.EnableTCP, Exposure: dep.Exposure,
 		Zones: dep.Zones, Hostname: dep.Hostname, PublishIPv4: dep.PublishIPv4, PublishIPv6: dep.PublishIPv6,
@@ -876,4 +892,10 @@ func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView 
 		LastPublishedAt: dep.LastPublishedAt, LastPublishError: dep.LastPublishError, Disabled: dep.Disabled,
 		CreatedAt: dep.CreatedAt, UpdatedAt: dep.UpdatedAt,
 	}
+	if dep.Engine == model.DNSEngineExternal {
+		v.Listeners = dep.Listeners
+		v.CertNotAfter = dep.CertNotAfter
+		v.Drift = s.dnsExternalDrift(dep, s.now())
+	}
+	return v
 }

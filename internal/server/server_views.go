@@ -161,17 +161,20 @@ func (s *Server) approvalViewFor(a model.Approval) approvalView {
 }
 
 type monitorView struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Type        string    `json:"type"`
-	Target      string    `json:"target"`
-	IntervalSec int       `json:"interval_sec"`
-	TimeoutSec  int       `json:"timeout_sec"`
-	AssignAll   bool      `json:"assign_all"`
-	NodeIDs     []string  `json:"node_ids,omitempty"`
-	Enabled     bool      `json:"enabled"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	Target      string   `json:"target"`
+	IntervalSec int      `json:"interval_sec"`
+	TimeoutSec  int      `json:"timeout_sec"`
+	AssignAll   bool     `json:"assign_all"`
+	NodeIDs     []string `json:"node_ids,omitempty"`
+	// ThresholdDays is the tls certificate warning window in days; zero for
+	// every other monitor type.
+	ThresholdDays int       `json:"threshold_days,omitempty"`
+	Enabled       bool      `json:"enabled"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 func toMonitorViews(in []model.Monitor) []monitorView {
@@ -180,7 +183,8 @@ func toMonitorViews(in []model.Monitor) []monitorView {
 		out = append(out, monitorView{
 			ID: m.ID, Name: m.Name, Type: m.Type, Target: m.Target,
 			IntervalSec: m.IntervalSec, TimeoutSec: m.TimeoutSec, AssignAll: m.AssignAll,
-			NodeIDs: m.NodeIDs, Enabled: m.Enabled, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
+			NodeIDs: m.NodeIDs, ThresholdDays: m.ThresholdDays,
+			Enabled: m.Enabled, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 		})
 	}
 	return out

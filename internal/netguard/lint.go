@@ -36,6 +36,12 @@ const (
 	// It is a warning rather than a block because tcp/22 is usually right; it
 	// exists so an operator can tell a checked plan from a guessed one.
 	FindingManagementPortAssumed = "management_port_assumed"
+	// FindingInterfaceMissing fires when a rule matches an inbound interface
+	// the node does not report. The public zone defaults to eth0, and twelve
+	// fleet nodes have no eth0 (ens17, ens5, enp2s0, wlo1): every accept on
+	// that interface matches nothing, the default drop takes over, and the
+	// lockout check above still counts those accepts as a way in.
+	FindingInterfaceMissing = "interface_missing"
 
 	SeverityBlock = "block"
 	SeverityWarn  = "warn"
@@ -85,6 +91,15 @@ func Lint(plan network.NFTPlan, opts LintOptions) []Finding {
 			Message: fmt.Sprintf(
 				"no rule accepts inbound tcp on the management %s (%s): committing this default-drop ruleset would cut the operator's shell path, and the node-side apply cannot detect it because its selfcheck is an outbound connection. Add a management-port allow, trust an overlay zone, or explicitly accept the lockout risk.",
 				pluralPort(len(ports)), joinManagementPorts(ports)),
+		})
+	}
+	for _, name := range missingInterfaces(plan, opts.Reality) {
+		findings = append(findings, Finding{
+			Code:     FindingInterfaceMissing,
+			Severity: SeverityBlock,
+			Message: fmt.Sprintf(
+				"rules in this plan match inbound interface %q, but the node reports %s. They match nothing on this box, so every accept they carry is dead and the default drop applies in its place; the management-port check still counts them, which is how a wrong interface name becomes a lockout. Point the zone at an interface the node actually has.",
+				name, joinInterfaceNames(opts.Reality)),
 		})
 	}
 	if !evidence {
@@ -231,6 +246,48 @@ func acceptsAnyPort(plan network.NFTPlan, ports []int) bool {
 		}
 	}
 	return false
+}
+
+// missingInterfaces returns, sorted, every interface name the plan renders an
+// iifname match for that the node's reported interfaces do not include. The
+// public interface counts only when a public port list renders it; a plan with
+// no public rules never emits it, so its name cannot hurt anyone. With no
+// reported interfaces there is nothing to compare against, and the answer is
+// empty rather than a guess.
+func missingInterfaces(plan network.NFTPlan, reality *model.GuardNodeReality) []string {
+	if reality == nil || len(reality.Interfaces) == 0 {
+		return nil
+	}
+	reported := make(map[string]bool, len(reality.Interfaces))
+	for _, iface := range reality.Interfaces {
+		reported[strings.TrimSpace(iface.Name)] = true
+	}
+	seen := map[string]bool{}
+	var missing []string
+	check := func(name string) {
+		if name == "" || reported[name] || seen[name] {
+			return
+		}
+		seen[name] = true
+		missing = append(missing, name)
+	}
+	if len(plan.PublicTCP) > 0 || len(plan.PublicUDP) > 0 {
+		check(plan.InterfaceName)
+	}
+	for _, rule := range plan.InputRules {
+		check(rule.Interface)
+	}
+	sort.Strings(missing)
+	return missing
+}
+
+func joinInterfaceNames(reality *model.GuardNodeReality) string {
+	names := make([]string, 0, len(reality.Interfaces))
+	for _, iface := range reality.Interfaces {
+		names = append(names, iface.Name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func joinManagementPorts(ports []int) string {

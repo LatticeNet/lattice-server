@@ -24,7 +24,7 @@ func TestNetGuardPlanBlocksWhenRealitySaysSSHMoved(t *testing.T) {
 	// A baseline that opens 22 and 443. On a node whose sshd is on 22 this is
 	// safe, and the lint must keep saying so.
 	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
-		`{"node_id":"node-a","public_tcp":[22,443]}`, cookies, csrf)
+		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[22,443]}`, cookies, csrf)
 	defer save.Body.Close()
 	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
 	defer adopt.Body.Close()
@@ -76,7 +76,7 @@ func TestNetGuardPlanBlocksWhenRealitySaysSSHMoved(t *testing.T) {
 	// lint clears, and with evidence in hand it emits nothing at all.
 	tokenB := enrollNamedNodeToken(t, handler, cookies, csrf, "node-b", "Node B")
 	saveB := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
-		`{"node_id":"node-b","public_tcp":[2222,443]}`, cookies, csrf)
+		`{"node_id":"node-b","interface_name":"ens3","public_tcp":[2222,443]}`, cookies, csrf)
 	defer saveB.Body.Close()
 	adoptB := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-b"}`, cookies, csrf)
 	defer adoptB.Body.Close()
@@ -257,4 +257,67 @@ func fetchRealityRows(t *testing.T, handler http.Handler, cookies []*http.Cookie
 		rows[node.NodeID] = node
 	}
 	return rows
+}
+
+// The eth0 assumption end to end: no NFTInputs interface, so the public zone
+// resolves to eth0, on a node that reports ens17. Twelve fleet nodes look like
+// this. The plan opens the real sshd port, so the port check is happy; the
+// interface check is what has to refuse it.
+func TestNetGuardPlanBlocksWhenThePublicInterfaceIsNotOnTheNode(t *testing.T) {
+	handler, st := newTestServerWithPublicURL(t, "https://203.0.113.99")
+	cookies, csrf := loginSession(t, handler)
+	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
+		`{"node_id":"node-a","public_tcp":[22]}`, cookies, csrf)
+	defer save.Body.Close()
+	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
+	defer adopt.Body.Close()
+	if adopt.StatusCode != http.StatusOK {
+		t.Fatalf("adopt: %d", adopt.StatusCode)
+	}
+	reality := model.GuardNodeReality{
+		NodeID:      "node-a",
+		CollectedAt: time.Now().UTC().Add(-time.Minute),
+		Listeners:   []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd(701)"}},
+		Interfaces: []model.GuardInterface{
+			{Name: "lo", Up: true},
+			{Name: "ens17", Addresses: []string{"203.0.113.10/24"}, Up: true},
+		},
+	}
+	if posted := postGuardRealityForTest(t, handler, token, "node-a", reality); posted.code != http.StatusOK {
+		t.Fatalf("post guard reality = %d: %s", posted.code, posted.body)
+	}
+
+	blocked := doJSON(t, handler, http.MethodPost, "/api/netguard/plan", `{"node_id":"node-a"}`, cookies, csrf)
+	defer blocked.Body.Close()
+	if blocked.StatusCode != http.StatusConflict {
+		t.Fatalf("a plan on an interface the node does not have = %d, want 409", blocked.StatusCode)
+	}
+	var blockedRes struct {
+		Findings []netguard.Finding `json:"findings"`
+	}
+	if err := json.NewDecoder(blocked.Body).Decode(&blockedRes); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(blockedRes.Findings, netguard.FindingInterfaceMissing) {
+		t.Fatalf("findings = %+v", blockedRes.Findings)
+	}
+	if hasFinding(blockedRes.Findings, netguard.FindingLockoutRiskSSH) {
+		t.Fatalf("the port check is satisfied here; only the interface may block: %+v", blockedRes.Findings)
+	}
+	if len(st.Approvals()) != 0 {
+		t.Fatalf("a blocked plan must not file an approval: %+v", st.Approvals())
+	}
+
+	// The review preview must say the same thing, or an operator reads a clean
+	// preview and then watches the plan refuse.
+	review := doJSON(t, handler, http.MethodGet, "/api/netguard/review?node_id=node-a", "", cookies, csrf)
+	defer review.Body.Close()
+	var out netGuardReviewResponse
+	if err := json.NewDecoder(review.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !hasFinding(out.Review.Findings, netguard.FindingInterfaceMissing) {
+		t.Fatalf("review findings = %+v", out.Review.Findings)
+	}
 }

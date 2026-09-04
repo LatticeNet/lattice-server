@@ -22,9 +22,22 @@ func seedArmApproval(t *testing.T, st interface {
 	UpsertApproval(model.Approval) error
 }, id, nodeID, status string, ports []int, updatedAt time.Time) {
 	t.Helper()
+	seedSSHGuardArm(t, st, model.Approval{
+		ID: id, NodeID: nodeID, Status: status, CreatedAt: updatedAt, UpdatedAt: updatedAt,
+	}, ports, []string{"203.0.113.5"})
+}
+
+// seedSSHGuardArm stores an arm approval whose plan is rendered from ports and
+// mgmt: no ports means knocking off, no mgmt means hardening only with no
+// firewall at all. Status, reason and timestamps come from the caller so a
+// test can lay down a node's real history record by record.
+func seedSSHGuardArm(t *testing.T, st interface {
+	UpsertApproval(model.Approval) error
+}, a model.Approval, ports []int, mgmt []string) {
+	t.Helper()
 	profile := sshguard.Profile{
-		NodeID: nodeID, SSHPort: 58394, KeepLegacyPort: true,
-		Hardening: sshguard.DefaultHardening(), MgmtSources: []string{"203.0.113.5"},
+		NodeID: a.NodeID, SSHPort: 58394, KeepLegacyPort: true,
+		Hardening: sshguard.DefaultHardening(), MgmtSources: mgmt,
 		ConfirmWindowSec: 900,
 	}
 	if len(ports) > 0 {
@@ -34,12 +47,47 @@ func seedArmApproval(t *testing.T, st interface {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertApproval(model.Approval{
-		ID: id, NodeID: nodeID, Plugin: sshGuardPlugin, Action: sshGuardArmAction,
-		Plan: plan, Status: status, ActorID: "admin",
-		CreatedAt: updatedAt, UpdatedAt: updatedAt,
-	}); err != nil {
+	a.Plugin, a.Action, a.Plan = sshGuardPlugin, sshGuardArmAction, plan
+	if a.ActorID == "" {
+		a.ActorID = "admin"
+	}
+	if err := st.UpsertApproval(a); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func seedSSHGuardConfirm(t *testing.T, st interface {
+	UpsertApproval(model.Approval) error
+}, a model.Approval) {
+	t.Helper()
+	plan, err := sshguard.RenderConfirmPlan(a.NodeID, "Node A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Plugin, a.Action, a.Plan = sshGuardPlugin, sshGuardConfirmAction, plan
+	if a.ActorID == "" {
+		a.ActorID = "admin"
+	}
+	if err := st.UpsertApproval(a); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// dismissAsSuperseded retires an approved-but-never-applied record through the
+// real dismiss endpoint, so the fixture carries the exact reason text the
+// 2026-08-28 cleanup wrote rather than a hand-typed imitation of it.
+func dismissAsSuperseded(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf, approvalID string) {
+	t.Helper()
+	res := doJSON(t, handler, http.MethodPost, "/api/network/approvals/dismiss",
+		`{"approval_id":"`+approvalID+`"}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(res.Body)
+		t.Fatalf("dismiss %s: want 200, got %d (%s)", approvalID, res.StatusCode, raw)
+	}
+	out := knockBody(t, res)
+	if out["status"] != approvalStatusDismissed || out["stale_code"] != sshGuardApprovalStaleCode {
+		t.Fatalf("dismissal must record the superseded code on the view, got status=%v stale_code=%v", out["status"], out["stale_code"])
 	}
 }
 
@@ -352,5 +400,273 @@ func TestKnockRevealAuditNeverCarriesTheSequence(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("a reveal must leave an audit row")
+	}
+}
+
+// The sequence a node still runs can sit in a record the cleanup dismissed. This
+// fixture mirrors one real node's history: a hardening-only arm and its confirm
+// in the morning, a knock arm rejected at midday, then the knock arm that was
+// actually approved, dispatched and confirmed, all four retired a week later as
+// superseded because the task result never reached the approval. None of the
+// ports here are that node's.
+func TestKnockKnowledgeSurvivesTheSupersededCleanup(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	day := time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+	at := func(h, m int) time.Time { return day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute) }
+	rejected := []int{31111, 32222, 33333}
+	installed := []int{51111, 52222, 53333}
+
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_harden", NodeID: "node-a", Status: model.ApprovalApproved, CreatedAt: at(3, 8), UpdatedAt: at(3, 8)}, nil, nil)
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "confirm_harden", NodeID: "node-a", Status: model.ApprovalApproved, CreatedAt: at(3, 9), UpdatedAt: at(3, 9)})
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_rejected", NodeID: "node-a", Status: model.ApprovalRejected, CreatedAt: at(6, 37), UpdatedAt: at(10, 35)}, rejected, []string{"203.0.113.5"})
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_knock", NodeID: "node-a", Status: model.ApprovalApproved, CreatedAt: at(8, 37), UpdatedAt: at(8, 37)}, installed, []string{"203.0.113.5"})
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "confirm_knock", NodeID: "node-a", Status: model.ApprovalApproved, CreatedAt: at(10, 47), UpdatedAt: at(10, 47)})
+	for _, id := range []string{"arm_harden", "confirm_harden", "arm_knock", "confirm_knock"} {
+		dismissAsSuperseded(t, handler, cookies, csrf, id)
+	}
+	if a, _ := srv.store.Approval("arm_knock"); !sshGuardApprovalSuperseded(a) {
+		t.Fatalf("the fixture must produce a superseded record, got status=%q reason=%q", a.Status, a.Reason)
+	}
+
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock", `{"node_id":"node-a"}`, cookies, csrf)
+	defer res.Body.Close()
+	out := knockBody(t, res)
+	if out["knowledge"] != string(knockInstalledSuperseded) {
+		t.Fatalf("the dispatched and confirmed knock arm governs even though its record was dismissed, got %v (%v)", out["knowledge"], out["note"])
+	}
+	if out["approval_id"] != "arm_knock" {
+		t.Fatalf("the governing record must be the knock arm, got %v", out["approval_id"])
+	}
+	if out["revealable"] != true {
+		t.Fatal("a sequence the control plane holds must be revealable")
+	}
+	note, _ := out["note"].(string)
+	if !strings.Contains(note, "superseded") {
+		t.Fatalf("the note must say the sequence comes from a superseded record, got %q", note)
+	}
+
+	grant := issueStepUpGrant(t, handler, cookies, csrf)
+	reveal := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock/reveal",
+		`{"node_id":"node-a","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	defer reveal.Body.Close()
+	raw, _ := io.ReadAll(reveal.Body)
+	if reveal.StatusCode != http.StatusOK {
+		t.Fatalf("reveal from a superseded record: want 200, got %d (%s)", reveal.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "51111") || strings.Contains(string(raw), "31111") {
+		t.Fatalf("the reveal must hand over the dispatched sequence and never the rejected one: %s", raw)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(raw, &body)
+	if n, _ := body["note"].(string); !strings.Contains(n, "superseded") {
+		t.Fatalf("the reveal must carry the superseded caveat with the ports, got %q", n)
+	}
+}
+
+// A hardening-only re-arm writes the sshd drop-in and touches neither knockd
+// nor the knock table, so it must not retire the sequence an earlier arm
+// installed. A firewall re-arm with knocking off does retire it: the table it
+// installs has no allowed set for knockd to add to.
+func TestAHardenOnlyRearmDoesNotRetireTheKnock(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	base := time.Now().UTC().Add(-48 * time.Hour)
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_knock", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: base, UpdatedAt: base.Add(time.Minute)}, knockTestPorts, []string{"203.0.113.5"})
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "confirm_knock", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: base.Add(5 * time.Minute), UpdatedAt: base.Add(6 * time.Minute)})
+	later := base.Add(24 * time.Hour)
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_harden", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: later, UpdatedAt: later.Add(time.Minute)}, nil, nil)
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "confirm_harden", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: later.Add(5 * time.Minute), UpdatedAt: later.Add(6 * time.Minute)})
+
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock", `{"node_id":"node-a"}`, cookies, csrf)
+	defer res.Body.Close()
+	out := knockBody(t, res)
+	if out["knowledge"] != string(knockInstalled) || out["approval_id"] != "arm_knock" {
+		t.Fatalf("the knock arm still governs after a hardening-only re-arm, got knowledge=%v approval=%v", out["knowledge"], out["approval_id"])
+	}
+	if out["confirmed"] != true {
+		t.Fatal("the confirm that followed the knock arm must count for it")
+	}
+
+	// A firewall without knocking replaces the table and retires the knock.
+	nokKnock := later.Add(24 * time.Hour)
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_firewall", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: nokKnock, UpdatedAt: nokKnock.Add(time.Minute)}, nil, []string{"203.0.113.5"})
+	res2 := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock", `{"node_id":"node-a"}`, cookies, csrf)
+	defer res2.Body.Close()
+	out2 := knockBody(t, res2)
+	if out2["knowledge"] != string(knockNoKnock) {
+		t.Fatalf("a firewall arm with knocking off retires the sequence, got %v", out2["knowledge"])
+	}
+}
+
+// A node that was only ever hardened has had no plan touch its knock either
+// way. Reporting "no knock" there was wrong for the one node in the fleet whose
+// knock was installed by hand: the honest answer is that Lattice does not know.
+func TestAHardenOnlyArmLeavesTheKnockUnknownRatherThanOff(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	seedSSHGuardArm(t, st, model.Approval{ID: "arm_harden", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}, nil, nil)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock", `{"node_id":"node-a"}`, cookies, csrf)
+	defer res.Body.Close()
+	out := knockBody(t, res)
+	if out["knowledge"] != string(knockUnknown) {
+		t.Fatalf("hardening only says nothing about knocking, got %v", out["knowledge"])
+	}
+	if out["revealable"] != false {
+		t.Fatal("nothing to reveal")
+	}
+	note, _ := out["note"].(string)
+	if !strings.Contains(note, "without installing a firewall") || !strings.Contains(note, "configured outside Lattice") {
+		t.Fatalf("the note must say why the knock is unknown on a hardened node, got %q", note)
+	}
+}
+
+// A rotation must keep the sequence the node runs alive beside the new one,
+// and must refuse to retire a sequence other than the one the control plane
+// holds as installed: the operator names it by the digest the reveal returned.
+func TestRotationPlanKeepsTheInstalledSequenceUntilConfirm(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	base := time.Now().UTC().Add(-time.Hour)
+	seedArmApproval(t, st, "approval_arm", "node-a", model.ApprovalApplied, knockTestPorts, base)
+	seedSSHGuardConfirm(t, st, model.Approval{ID: "approval_confirm", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: base.Add(5 * time.Minute), UpdatedAt: base.Add(6 * time.Minute)})
+	cookies, csrf := loginSession(t, handler)
+
+	grant := issueStepUpGrant(t, handler, cookies, csrf)
+	reveal := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock/reveal",
+		`{"node_id":"node-a","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	revealed := knockBody(t, reveal)
+	reveal.Body.Close()
+	digest, _ := revealed["sequence_sha256"].(string)
+	if digest != sshguard.KnockSequenceDigest(knockTestPorts) {
+		t.Fatalf("the reveal must hand over the digest a rotation names the sequence by, got %q", digest)
+	}
+
+	wrong := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan",
+		sshGuardPlanBody("node-a", map[string]any{"enable_knock": true, "rotate_from_sha256": sshguard.KnockSequenceDigest([]int{20001, 20002, 20003})}), cookies, csrf)
+	raw, _ := io.ReadAll(wrong.Body)
+	wrong.Body.Close()
+	if wrong.StatusCode != http.StatusConflict || !strings.Contains(string(raw), "approval_arm") {
+		t.Fatalf("rotating from a sequence the control plane does not hold must be refused and name the record it does hold: %d %s", wrong.StatusCode, raw)
+	}
+
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan",
+		sshGuardPlanBody("node-a", map[string]any{"enable_knock": true, "rotate_from_sha256": digest}), cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(res.Body)
+		t.Fatalf("rotation plan: want 200, got %d (%s)", res.StatusCode, raw)
+	}
+	var out struct {
+		Approval struct {
+			ID   string `json:"id"`
+			Plan string `json:"plan"`
+		} `json:"approval"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	art, err := sshguard.ParseApprovalPlan(out.Approval.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, err := sshguard.ParseKnockdConf(art.KnockdConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strconvJoin(seq.PreviousPorts) != strconvJoin(knockTestPorts) {
+		t.Fatalf("the plan must keep the installed sequence as the previous stanza, got %v", seq.PreviousPorts)
+	}
+	if strconvJoin(seq.Ports) == strconvJoin(knockTestPorts) {
+		t.Fatal("a rotation must draw a fresh sequence")
+	}
+	if !strings.Contains(out.Approval.Plan, "## Rotation") {
+		t.Fatal("the reviewer must be told the arm is a rotation")
+	}
+
+	// A node whose sequence Lattice never installed cannot resolve a digest,
+	// and says so; the explicit path exists for exactly that node.
+	enrolSSHGuard(t, st, "node-b")
+	if err := st.UpsertNode(model.Node{ID: "node-b", Name: "Node B", Online: true, LastSeen: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	unknown := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan",
+		sshGuardPlanBody("node-b", map[string]any{"enable_knock": true, "rotate_from_sha256": digest}), cookies, csrf)
+	raw, _ = io.ReadAll(unknown.Body)
+	unknown.Body.Close()
+	if unknown.StatusCode != http.StatusConflict || !strings.Contains(string(raw), "previous_knock_ports") {
+		t.Fatalf("a digest against an unknown sequence must be refused and point at the explicit path: %d %s", unknown.StatusCode, raw)
+	}
+	explicit := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan",
+		sshGuardPlanBody("node-b", map[string]any{"enable_knock": true, "previous_knock_ports": []int{27431, 45902, 38117}}), cookies, csrf)
+	defer explicit.Body.Close()
+	if explicit.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(explicit.Body)
+		t.Fatalf("an explicit previous sequence must plan: %d %s", explicit.StatusCode, raw)
+	}
+}
+
+func strconvJoin(ports []int) string {
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		parts = append(parts, strconv.Itoa(p))
+	}
+	return strings.Join(parts, ",")
+}
+
+// "Rejected" used to mean two different things on one row: a person said no,
+// or the node's task died. The console told them apart by ApprovedBy being
+// empty, which is a guess. The view now says who rejected and when, from a
+// record written only on the person's path.
+func TestRejectRecordsTheActorAndTaskFailuresDoNot(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	now := time.Now().UTC()
+	seedArmApproval(t, st, "approval_by_person", "node-a", model.ApprovalPending, knockTestPorts, now)
+	seedArmApproval(t, st, "approval_by_task", "node-a", model.ApprovalApproved, knockTestPorts, now)
+	cookies, csrf := loginSession(t, handler)
+
+	res := doJSON(t, handler, http.MethodPost, "/api/network/approvals/reject", `{"approval_id":"approval_by_person"}`, cookies, csrf)
+	out := knockBody(t, res)
+	res.Body.Close()
+	if out["status"] != model.ApprovalRejected || out["rejected_by"] != "user_admin" || out["rejected_at"] == nil {
+		t.Fatalf("the reject response must name the actor and time: %v", out)
+	}
+
+	// The node's task failing the other approval leaves no actor.
+	failed, _ := srv.store.Approval("approval_by_task")
+	if err := srv.rejectApprovalWithReason(failed, "lattice sshguard: knockd did not come up"); err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/network/approvals?plugin=sshguard&limit=10", "", cookies, csrf)
+	defer list.Body.Close()
+	var page struct {
+		Approvals []map[string]any `json:"approvals"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&page); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]map[string]any{}
+	for _, row := range page.Approvals {
+		seen[row["id"].(string)] = row
+	}
+	if seen["approval_by_person"]["rejected_by"] != "user_admin" {
+		t.Fatalf("the listing must carry the rejecting actor: %v", seen["approval_by_person"])
+	}
+	if _, ok := seen["approval_by_task"]["rejected_by"]; ok {
+		t.Fatalf("a task failure is not a person's rejection: %v", seen["approval_by_task"])
+	}
+	if seen["approval_by_task"]["status"] != model.ApprovalRejected {
+		t.Fatalf("the task-failed approval must still read rejected: %v", seen["approval_by_task"])
 	}
 }

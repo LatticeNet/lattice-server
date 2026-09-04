@@ -327,12 +327,15 @@ func TestConfirmRefusesANodeThatIsNotArmed(t *testing.T) {
 	if !strings.Contains(script, "stop "+RevertUnit+".timer") {
 		t.Fatal("confirm must cancel the revert timer")
 	}
-	// Confirm writes exactly one thing: the boot unit that makes the gate
-	// survive a reboot. That is deliberately part of confirming rather than of
-	// arming, because the revert timer is transient and does not survive a
-	// reboot; enabling persistence at arm would mean a node restarted inside
-	// the window came back with the gate rebuilt and nothing left to undo it.
-	if strings.Contains(script, "$DROPIN") || strings.Contains(script, "KNOCKD_CONF") {
+	// Confirm writes the boot unit that makes the gate survive a reboot, and
+	// nothing the arm reviewed: no drop-in, no knockd.conf from a heredoc.
+	// Persistence is deliberately part of confirming rather than of arming,
+	// because the revert timer is transient and does not survive a reboot;
+	// enabling it at arm would mean a node restarted inside the window came
+	// back with the gate rebuilt and nothing left to undo it. The one edit
+	// confirm makes to knockd.conf is removing a rotation's previous stanza,
+	// which TestRotationKeepsThePreviousSequenceUntilConfirm covers.
+	if strings.Contains(script, "$DROPIN") || strings.Contains(script, "cat > \"$KNOCKD_CONF\"") || strings.Contains(script, "LATTICE_SSHGUARD_KNOCKD") {
 		t.Fatal("confirm must not rewrite the sshd or knockd configuration")
 	}
 	if !strings.Contains(script, "admitted=") {

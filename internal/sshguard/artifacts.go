@@ -174,12 +174,26 @@ func (p Profile) RenderKnockRuleset() (string, error) {
 	fmt.Fprintf(&b, "table inet %s {\n", KnockTable)
 
 	if p.Knock != nil {
-		b.WriteString("  set allowed {\n")
+		fmt.Fprintf(&b, "  set %s {\n", KnockAllowedSet)
 		b.WriteString("    type ipv4_addr\n")
 		b.WriteString("    flags timeout\n")
 		fmt.Fprintf(&b, "    timeout %s\n", strings.TrimSpace(p.Knock.OpenFor))
 		b.WriteString("    comment \"knock-opened sources; entries expire on their own, so a forgotten close leaves nothing open\"\n")
 		b.WriteString("  }\n")
+		if len(p.Knock.PreviousPorts) > 0 {
+			// Its own set rather than a second writer into `allowed`, so the
+			// confirm can require evidence from the NEW sequence: an entry
+			// opened by the old one proves only that the old one still works,
+			// which the operator already knew. The set outlives the confirm in
+			// this file, empty and unwritten, until the next arm re-renders
+			// without it.
+			fmt.Fprintf(&b, "  set %s {\n", KnockPreviousSet)
+			b.WriteString("    type ipv4_addr\n")
+			b.WriteString("    flags timeout\n")
+			fmt.Fprintf(&b, "    timeout %s\n", strings.TrimSpace(p.Knock.OpenFor))
+			b.WriteString("    comment \"sources opened by the sequence being rotated out; retired at confirm\"\n")
+			b.WriteString("  }\n")
+		}
 	}
 	if len(v4) > 0 {
 		b.WriteString("  set mgmt {\n    type ipv4_addr\n    flags interval\n")
@@ -204,7 +218,10 @@ func (p Profile) RenderKnockRuleset() (string, error) {
 			fmt.Fprintf(&b, "    tcp dport %d ip6 saddr @mgmt6 counter accept\n", port)
 		}
 		if p.Knock != nil {
-			fmt.Fprintf(&b, "    tcp dport %d ip saddr @allowed counter accept\n", port)
+			fmt.Fprintf(&b, "    tcp dport %d ip saddr @%s counter accept\n", port, KnockAllowedSet)
+			if len(p.Knock.PreviousPorts) > 0 {
+				fmt.Fprintf(&b, "    tcp dport %d ip saddr @%s counter accept\n", port, KnockPreviousSet)
+			}
 		}
 		fmt.Fprintf(&b, "    tcp dport %d counter drop\n", port)
 	}
@@ -229,26 +246,45 @@ func (p Profile) RenderKnockdConf() (string, error) {
 	if err := p.Validate(); err != nil {
 		return "", err
 	}
-	seq := make([]string, 0, len(p.Knock.Ports))
-	for _, port := range p.Knock.Ports {
-		seq = append(seq, fmt.Sprintf("%d:udp", port))
-	}
 	var b strings.Builder
 	b.WriteString("# Managed by Lattice SSH Guard. Do not edit by hand.\n")
 	fmt.Fprintf(&b, "# node: %s\n\n", p.NodeID)
 	b.WriteString("[options]\n    UseSyslog\n\n")
-	b.WriteString("[openSSH]\n")
+	fmt.Fprintf(&b, "[%s]\n", KnockdSection)
 	b.WriteString("    # UDP, not TCP. Knocking an unanswered TCP port makes the kernel\n")
 	b.WriteString("    # retransmit the SYN, which replays the same port into the state\n")
 	b.WriteString("    # machine and never advances it. One UDP datagram is one datagram.\n")
-	fmt.Fprintf(&b, "    sequence      = %s\n", strings.Join(seq, ","))
+	fmt.Fprintf(&b, "    sequence      = %s\n", udpSequence(p.Knock.Ports))
 	fmt.Fprintf(&b, "    seq_timeout   = %d\n", p.Knock.SeqTimeoutSec)
 	b.WriteString("    # No stop_command and no closing sequence: the set entry expires by\n")
 	b.WriteString("    # itself, so there is nothing to forget to close.\n")
-	fmt.Fprintf(&b, "    start_command = %s add element inet %s allowed { %%IP%% timeout %s }\n",
-		BinNFT, KnockTable, strings.TrimSpace(p.Knock.OpenFor))
+	fmt.Fprintf(&b, "    start_command = %s add element inet %s %s { %%IP%% timeout %s }\n",
+		BinNFT, KnockTable, KnockAllowedSet, strings.TrimSpace(p.Knock.OpenFor))
 	b.WriteString("    cmd_timeout   = 10\n")
+	if len(p.Knock.PreviousPorts) > 0 {
+		// The stanza the confirm removes. Until then both sequences open the
+		// gate, into different sets, so the operator's existing knock keeps
+		// working through the whole window and the confirm can still tell
+		// which one admitted him.
+		fmt.Fprintf(&b, "\n[%s]\n", KnockdPreviousSection)
+		b.WriteString("    # The sequence being rotated out. It keeps opening the gate until the\n")
+		b.WriteString("    # confirm approval removes this stanza, so an operator holding the\n")
+		b.WriteString("    # old sequence is never locked out by the arm.\n")
+		fmt.Fprintf(&b, "    sequence      = %s\n", udpSequence(p.Knock.PreviousPorts))
+		fmt.Fprintf(&b, "    seq_timeout   = %d\n", p.Knock.SeqTimeoutSec)
+		fmt.Fprintf(&b, "    start_command = %s add element inet %s %s { %%IP%% timeout %s }\n",
+			BinNFT, KnockTable, KnockPreviousSet, strings.TrimSpace(p.Knock.OpenFor))
+		b.WriteString("    cmd_timeout   = 10\n")
+	}
 	return b.String(), nil
+}
+
+func udpSequence(ports []int) string {
+	seq := make([]string, 0, len(ports))
+	for _, port := range ports {
+		seq = append(seq, fmt.Sprintf("%d:udp", port))
+	}
+	return strings.Join(seq, ",")
 }
 
 func yesNo(v bool) string {

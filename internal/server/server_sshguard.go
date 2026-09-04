@@ -39,6 +39,21 @@ func isSSHGuardApproval(approval model.Approval) bool {
 // sshGuardApprovalStaleCode labels a dismissal in the audit trail.
 const sshGuardApprovalStaleCode = "sshguard_approval_superseded"
 
+// sshGuardSupersededMark is the phrase dismissibleSSHGuardApprovalReason writes
+// and sshGuardApprovalSuperseded reads back. The dismissal keeps its stale code
+// only in the audit row, so the reason text is the record's own memory of why
+// it was retired, and the one thing a later reader can key on.
+const sshGuardSupersededMark = "approval superseded: approved but never applied"
+
+// sshGuardApprovalSuperseded reports whether a dismissed SSH Guard approval was
+// retired as superseded: approved, dispatched, its task run, and the record left
+// at approved because nothing carried the result back at the time. The
+// dismissal retired the record. It did not touch the node, so what the arm
+// wrote there is still what the node runs unless a later arm replaced it.
+func sshGuardApprovalSuperseded(a model.Approval) bool {
+	return isSSHGuardApproval(a) && a.Status == approvalStatusDismissed && strings.Contains(a.Reason, sshGuardSupersededMark)
+}
+
 // dismissibleSSHGuardApprovalReason decides whether an SSH Guard approval can
 // be retired without being applied, and what the record should say.
 //
@@ -62,7 +77,7 @@ func (s *Server) dismissibleSSHGuardApprovalReason(approval model.Approval, note
 	if approval.Action == sshGuardConfirmAction {
 		stage = "confirm"
 	}
-	reason := fmt.Sprintf("SSH Guard %s approval superseded: approved but never applied, and an approval cannot be re-dispatched. Re-plan if this node still needs the change.", stage)
+	reason := fmt.Sprintf("SSH Guard %s %s, and an approval cannot be re-dispatched. Re-plan if this node still needs the change.", stage, sshGuardSupersededMark)
 	if note != "" {
 		reason = reason + " " + note
 	}
@@ -178,6 +193,21 @@ type sshGuardPlanRequest struct {
 	KnockOpenFor       string `json:"knock_open_for"`
 	KnockSeqTimeoutSec int    `json:"knock_seq_timeout_sec"`
 
+	// Rotation. Either field makes the arm keep the sequence the node runs
+	// today alive beside the new one until confirm, so nobody is locked out
+	// between the two.
+	//
+	// RotateFromSHA256 names the installed sequence by the digest the reveal
+	// returns with it, without carrying the ports in a request that is hashed
+	// into the approval. The server resolves the sequence from what it holds
+	// as installed and refuses if the digest names anything else: the
+	// operator's picture of the node and the control plane's must agree
+	// before one of them is retired. PreviousKnockPorts is for a node whose
+	// sequence Lattice never installed and so cannot resolve; it is the
+	// advanced path, for the same reason KnockPorts is.
+	RotateFromSHA256   string `json:"rotate_from_sha256"`
+	PreviousKnockPorts []int  `json:"previous_knock_ports"`
+
 	// Hardening overrides. Zero values mean "use the verified default", so a
 	// caller that sends only node_id and ssh_port gets the configuration that
 	// was tested on the reference host.
@@ -282,6 +312,46 @@ func (req sshGuardPlanRequest) profile(existingSSHPorts []int) (sshguard.Profile
 	return profile, profile.Validate()
 }
 
+// sshGuardRotation fills in the sequence a rotation keeps alive, from the
+// request or from what the control plane holds as installed, and refuses when
+// the two disagree. It returns the HTTP status for the refusal.
+func (s *Server) sshGuardRotation(req sshGuardPlanRequest, profile *sshguard.Profile) (int, error) {
+	digest := strings.TrimSpace(req.RotateFromSHA256)
+	if digest == "" && len(req.PreviousKnockPorts) == 0 {
+		return 0, nil
+	}
+	if profile.Knock == nil {
+		return http.StatusBadRequest, errors.New("a rotation keeps the previous sequence alive beside a new one, so it needs knocking on")
+	}
+	if len(req.PreviousKnockPorts) > 0 {
+		if digest != "" && digest != sshguard.KnockSequenceDigest(req.PreviousKnockPorts) {
+			return http.StatusBadRequest, errors.New("rotate_from_sha256 does not match previous_knock_ports; send one or the other, or make them agree")
+		}
+		profile.Knock.PreviousPorts = req.PreviousKnockPorts
+		if err := profile.Validate(); err != nil {
+			return http.StatusBadRequest, err
+		}
+		return 0, nil
+	}
+	state := s.sshGuardKnockStateFor(profile.NodeID)
+	if state.ParseError != "" {
+		return http.StatusConflict, errors.New("the plan that installed this node's sequence could not be read: " + state.ParseError)
+	}
+	switch state.Knowledge {
+	case knockInstalled, knockInstalledSuperseded:
+	default:
+		return http.StatusConflict, errors.New("the control plane holds no installed knock sequence for this node to rotate from; if the node knocks on a sequence Lattice never installed, pass previous_knock_ports")
+	}
+	if digest != sshguard.KnockSequenceDigest(state.Sequence.Ports) {
+		return http.StatusConflict, fmt.Errorf("rotate_from_sha256 does not name the sequence the control plane holds as installed (from %s); reveal it again, or pass previous_knock_ports if the node runs something else", state.ApprovalID)
+	}
+	profile.Knock.PreviousPorts = state.Sequence.Ports
+	if err := profile.Validate(); err != nil {
+		return http.StatusBadRequest, err
+	}
+	return 0, nil
+}
+
 func (s *Server) handleSSHGuardPlan(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -328,6 +398,10 @@ func (s *Server) handleSSHGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 	profile, err := req.profile(s.sshGuardNodeReality(req.NodeID).SSHPorts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if status, err := s.sshGuardRotation(req, &profile); err != nil {
+		writeError(w, status, err)
 		return
 	}
 	// Only so the plan can print a knock command that is copyable. The value is

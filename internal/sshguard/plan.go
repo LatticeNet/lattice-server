@@ -183,7 +183,11 @@ func RenderConfirmPlan(nodeID, nodeName string) (string, error) {
 	b.WriteString("Approve this only after you have opened a NEW connection over the new path\n")
 	b.WriteString("and gotten a shell. The session you already have does not prove anything:\n")
 	b.WriteString("established connections are accepted by the first firewall rule regardless\n")
-	b.WriteString("of whether new ones can get in.\n")
+	b.WriteString("of whether new ones can get in.\n\n")
+	b.WriteString("If the arm was a knock rotation, knockd.conf still carries the previous\n")
+	b.WriteString("sequence as a second stanza. Confirming removes that stanza, restarts knockd\n")
+	b.WriteString("and empties the set it opened, so from then on only the new sequence opens\n")
+	b.WriteString("the gate. On a node that is not mid-rotation this step finds nothing to do.\n")
 	return b.String(), nil
 }
 
@@ -403,6 +407,14 @@ func knockInstructions(p Profile) string {
 	fmt.Fprintf(&b, "Membership lasts %s and then expires on its own.\n", p.Knock.OpenFor)
 	if p.Knock.SeqTimeoutSec > 0 {
 		fmt.Fprintf(&b, "The whole sequence must arrive within %d seconds.\n", p.Knock.SeqTimeoutSec)
+	}
+	if len(p.Knock.PreviousPorts) > 0 {
+		b.WriteString("\n## Rotation\n\n")
+		b.WriteString("This arm rotates the sequence. The previous one stays in knockd.conf as a\n")
+		b.WriteString("second stanza and keeps opening the gate until the confirm approval removes\n")
+		b.WriteString("it, so the knock you already have works through the whole window. The\n")
+		b.WriteString("confirm counts only entries the NEW sequence admitted as evidence: prove\n")
+		b.WriteString("the new one from a source this node sees before confirming.\n")
 	}
 	return b.String()
 }

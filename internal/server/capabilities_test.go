@@ -157,6 +157,32 @@ func TestACapabilityIsOnlyEnforcedOnceItCanAnswerForAnUnenrolledNode(t *testing.
 	}
 }
 
+// An exclusion is a decision with a reason, and it holds whether or not the
+// gate is on. Enforcement only decides the fate of nodes nobody decided about.
+func TestAnExclusionRefusesEvenWhileTheGateIsOff(t *testing.T) {
+	s := capServer(t)
+	if s.capabilityEnforced(sshGuardPlugin) {
+		t.Fatal("this test needs the gate off")
+	}
+	if err := s.store.SetNodeCapability(store.NodeCapability{
+		NodeID: "node-nat", Capability: sshGuardPlugin, State: store.CapabilityExcluded,
+		Reason: "NAT, port forwarding first",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	d := s.resolveNodeCapability("node-nat", sshGuardPlugin)
+	if d.Allowed {
+		t.Fatal("an excluded node was allowed because the gate was off")
+	}
+	if !strings.Contains(d.Reason, "port forwarding first") {
+		t.Errorf("the exclusion reason was lost: %q", d.Reason)
+	}
+	// The gate being off still means an undecided node is allowed.
+	if !s.resolveNodeCapability("node-undecided", sshGuardPlugin).Allowed {
+		t.Error("an undecided node was refused with the gate off")
+	}
+}
+
 // Turning a capability on must not refuse a fleet that has been correctly
 // configured for years under the old shape. sing-box is the case: the operator
 // already said which nodes run it, via the discover switch, and that answer has

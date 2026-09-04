@@ -70,6 +70,31 @@ func TestSSHGuardPlanRequiresItsOwnAdminScope(t *testing.T) {
 	}
 }
 
+// The standing decision that NAT nodes get no SSH Guard until port forwarding
+// exists lived in a note. Recorded as an exclusion, it has to refuse the plan
+// with that reason, gate on or off; otherwise the console files the refusal
+// under "arm failed" and the decision stays folklore.
+func TestSSHGuardPlanRefusesAnExcludedNodeWithItsReason(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	if err := st.SetNodeCapability(store.NodeCapability{
+		NodeID: "node-a", Capability: sshGuardPlugin, State: store.CapabilityExcluded,
+		Reason: "NAT, port forwarding first",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/plan", sshGuardPlanBody("node-a", nil), cookies, csrf)
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("a plan on an excluded node must be refused, got %d (%s)", res.StatusCode, raw)
+	}
+	if !strings.Contains(string(raw), "port forwarding first") {
+		t.Fatalf("the refusal must carry the exclusion reason: %s", raw)
+	}
+}
+
 // The whole document is the contract, so what comes back must parse into the
 // artifacts the apply will write, and the apply must dispatch to this plugin
 // rather than falling through to the generic nft branch.

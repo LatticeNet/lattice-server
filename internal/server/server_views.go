@@ -27,6 +27,14 @@ type approvalView struct {
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 
+	// RejectedBy and RejectedAt name the principal who rejected this approval
+	// and when. Present only when a person or token said no; a rejected
+	// approval without them was failed by its own task on the node, and Reason
+	// carries that failure. The console used to infer the same split from
+	// ApprovedBy being empty, which was a guess dressed as a fact.
+	RejectedBy string     `json:"rejected_by,omitempty"`
+	RejectedAt *time.Time `json:"rejected_at,omitempty"`
+
 	// Operation binding (§9.3), surfaced so an operator reviews what will actually run:
 	// which plugin version, which artifact, which nodes. Non-secret by construction —
 	// the plan preview is where the plugin redacts anything sensitive.
@@ -87,6 +95,13 @@ func approvalStaleMetadata(a model.Approval) (bool, string) {
 	if a.Plugin == agentUpdatePlugin && strings.HasPrefix(a.Reason, errAgentUpdateApprovalStale.Error()) {
 		return true, agentUpdateApprovalStaleCode
 	}
+	if sshGuardApprovalSuperseded(a) {
+		// The code names why the row was retired, which the reason prose only
+		// implies. Stale stays false: the console lights its freshness marker
+		// on that flag, and a dismissed record is history, not a pending
+		// decision gone stale.
+		return false, sshGuardApprovalStaleCode
+	}
 	return false, ""
 }
 
@@ -96,6 +111,30 @@ func toApprovalViews(in []model.Approval) []approvalView {
 		out = append(out, toApprovalView(a))
 	}
 	return out
+}
+
+// annotateApprovalRejections fills RejectedBy and RejectedAt from the store's
+// rejection records. Only rejected rows are looked up: a record can exist for
+// a row whose status write failed after it, and must not surface there.
+func (s *Server) annotateApprovalRejections(views []approvalView) []approvalView {
+	for i := range views {
+		if views[i].Status != model.ApprovalRejected {
+			continue
+		}
+		record, ok := s.store.ApprovalRejection(views[i].ID)
+		if !ok {
+			continue
+		}
+		at := record.At
+		views[i].RejectedBy = record.ActorID
+		views[i].RejectedAt = &at
+	}
+	return views
+}
+
+// approvalViewFor is the single-row form of the listing's projection.
+func (s *Server) approvalViewFor(a model.Approval) approvalView {
+	return s.annotateApprovalRejections([]approvalView{toApprovalView(a)})[0]
 }
 
 type monitorView struct {

@@ -317,6 +317,15 @@ const (
 // The scope question on its own is still available as resolveCapabilityScope,
 // for the impact preview and for showing an operator what a gate would do.
 func (s *Server) resolveNodeCapability(nodeID, capability string) capabilityDecision {
+	// An explicit exclusion bites whether or not the gate is live. Enforcement
+	// decides what happens to nodes nobody has decided about; an exclusion is
+	// a decision, written with a reason, and a product that keeps acting on a
+	// node its operator excluded has thrown that reason away. This is how two
+	// NAT nodes that must not be hardened until port forwarding exists kept
+	// collecting SSH Guard plans while their exclusion lived only in a note.
+	if record, ok := s.store.NodeCapability(nodeID, capability); ok && record.State == store.CapabilityExcluded {
+		return capabilityDecision{Allowed: false, Reason: excludedReason(record), Source: capabilitySourceRecord}
+	}
 	if !s.capabilityEnforced(capability) {
 		return capabilityDecision{Allowed: true, Source: capabilitySourceNotEnforced}
 	}
@@ -452,8 +461,10 @@ type nodeCapabilityView struct {
 	Reason     string    `json:"reason,omitempty"`
 	ActorID    string    `json:"actor_id,omitempty"`
 	UpdatedAt  time.Time `json:"updated_at"`
-	// Enforced tells the console whether this decision currently bites, so a
-	// recorded-but-not-yet-live capability cannot be mistaken for a guarantee.
+	// Enforced tells the console whether the gate is live, so an enrolment on
+	// a not-yet-enforced capability is not mistaken for a guarantee: with the
+	// gate off, an unenrolled node is allowed too. An exclusion is different
+	// and refuses regardless; see resolveNodeCapability.
 	Enforced bool `json:"enforced"`
 }
 

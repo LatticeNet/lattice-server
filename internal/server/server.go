@@ -5899,7 +5899,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		}
 	}
 	if !approvalQueryRequested(r) {
-		writeJSON(w, http.StatusOK, s.annotateApprovalWaiting(toApprovalViews(visible), visible))
+		writeJSON(w, http.StatusOK, s.annotateApprovalRejections(s.annotateApprovalWaiting(toApprovalViews(visible), visible)))
 		return
 	}
 	q := r.URL.Query()
@@ -5939,7 +5939,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		filtered = filtered[:limit]
 	}
 	writeJSON(w, http.StatusOK, approvalsQueryResponse{
-		Approvals: s.annotateApprovalWaiting(toApprovalViews(filtered), filtered),
+		Approvals: s.annotateApprovalRejections(s.annotateApprovalWaiting(toApprovalViews(filtered), filtered)),
 		Total:     total,
 		Limit:     limit,
 		Offset:    offset,
@@ -7368,6 +7368,15 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 		return
 	}
 	if approval.Status == model.ApprovalPending {
+		// Written before the status flips, so a failure here leaves the
+		// approval pending and retryable, while a failure after it leaves a
+		// record the view ignores on a non-rejected row.
+		if err := s.store.SetApprovalRejection(store.ApprovalRejection{
+			ApprovalID: approval.ID, ActorID: p.ActorID, At: s.now(),
+		}); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 		if isLineChainApproval(approval) {
 			reason := "line chain approval rejected by operator"
 			failedAudit := lineChainFailedAudit(p, approval, "", "approval_rejected", reason)
@@ -7389,7 +7398,7 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-			writeJSON(w, http.StatusOK, toApprovalView(approval))
+			writeJSON(w, http.StatusOK, s.approvalViewFor(approval))
 			return
 		}
 		approval.Status = model.ApprovalRejected
@@ -7412,7 +7421,7 @@ func (s *Server) handleRejectApproval(w http.ResponseWriter, r *http.Request, p 
 			return
 		}
 	}
-	writeJSON(w, http.StatusOK, toApprovalView(approval))
+	writeJSON(w, http.StatusOK, s.approvalViewFor(approval))
 }
 
 func (s *Server) handleDismissApproval(w http.ResponseWriter, r *http.Request, p principal) {

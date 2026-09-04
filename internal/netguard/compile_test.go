@@ -250,7 +250,8 @@ func TestCompileFailsClosedOnUnsupportedShapes(t *testing.T) {
 		want string
 	}{
 		{"egress direction", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirEgress, Protocol: model.NetProtoTCP, Ports: p80, Remote: pub}, "not compiled into the guard table"},
-		{"icmp", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.GuardProtoICMP, Remote: pub}, "not supported by the current guard renderer"},
+		{"icmp", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.GuardProtoICMP, Remote: pub}, "not supported by the current guard renderer: the scaffold accepts a fixed icmp control set (v4: echo-request, destination-unreachable, time-exceeded, parameter-problem; v6: nd-neighbor-solicit"},
+		{"icmpv6", model.GuardRule{ID: "r", Action: model.NetRuleDeny, Direction: model.NetDirIngress, Protocol: model.GuardProtoICMPv6, Remote: pub}, "not operator-editable"},
 		{"log", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: pub, Log: true}, "log is not supported"},
 		{"domain remote", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: model.NetEndpoint{Kind: model.NetRefDomain, Domain: "x.example"}}, "egress-only"},
 		{"group remote", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: model.NetEndpoint{Kind: model.NetRefGroup, GroupID: "g"}}, "expanded to node refs"},

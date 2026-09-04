@@ -156,6 +156,9 @@ func Blocking(findings []Finding) bool {
 // Only listeners owned by an identifiable shell daemon count. Loopback-only
 // listeners are skipped: the compiled scaffold always emits `iif lo accept`, so
 // no plan can drop them and treating them as a lockout risk would be noise.
+// The scaffold's fixed ICMP/ICMPv6 control accepts (network.ScaffoldICMP*)
+// are likewise never a lockout question: they are rendered on every plan ahead
+// of every rule, cannot be edited away, and open no port a shell listens on.
 // When nothing qualifies the answer falls back to tcp/22 with evidence=false,
 // which is what drives FindingManagementPortAssumed.
 func managementPorts(reality *model.GuardNodeReality) ([]int, bool) {

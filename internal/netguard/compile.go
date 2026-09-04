@@ -124,7 +124,11 @@ func lowerRule(plan *network.NFTPlan, rule model.GuardRule, in CompileInput) err
 	switch rule.Protocol {
 	case model.NetProtoTCP, model.NetProtoUDP, model.NetProtoAny:
 	case model.GuardProtoICMP, model.GuardProtoICMPv6:
-		return fmt.Errorf("protocol %q is not supported by the current guard renderer", rule.Protocol)
+		// Deliberate, not a gap: the renderer scaffold already accepts the
+		// fixed control set (network.ScaffoldICMPv4Types / ScaffoldICMPv6Types)
+		// ahead of every operator rule, and an operator rule that could deny
+		// neighbour discovery would be a lockout with extra steps.
+		return fmt.Errorf("protocol %q is not supported by the current guard renderer: the scaffold accepts a fixed icmp control set (v4: %s; v6: %s) ahead of every rule and it is not operator-editable", rule.Protocol, network.ScaffoldICMPv4Types, network.ScaffoldICMPv6Types)
 	default:
 		return fmt.Errorf("invalid protocol %q", rule.Protocol)
 	}

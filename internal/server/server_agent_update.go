@@ -1623,11 +1623,17 @@ func agentUpdateConfirmedReason(plan, version string) string {
 // control plane may never get. The node's report is evidence it always gets.
 // Two shapes count. An approval already awaiting confirmation needs only the
 // target version to arrive. One with no result at all is confirmed by the
-// version change itself: the plan froze the version the node ran when it was
-// made, and the node now runs the target. A plan whose current and target are
-// the same (a forced reinstall) cannot be told apart from nothing having
-// happened, so it keeps waiting for its task result.
-func agentUpdateConfirmedByReport(approval model.Approval, payload agentUpdatePayload, reported string) bool {
+// version change itself, but only when this approval's apply task was
+// dispatched to the node: the plan froze the version the node ran when it was
+// made, the node took the task, and it now runs the target. Without a
+// dispatched task the version proves nothing about this approval. An operator
+// can approve without queuing the apply, and the node can reach the target
+// through another approval or a manual upgrade; marking that approval applied
+// would assert in the store and the audit log that something it authorized
+// ran when nothing did. A plan whose current and target are the same (a
+// forced reinstall) cannot be told apart from nothing having happened, so it
+// keeps waiting for its task result.
+func agentUpdateConfirmedByReport(approval model.Approval, payload agentUpdatePayload, reported string, taskDispatched bool) bool {
 	if approval.Plugin != agentUpdatePlugin || approval.Status != model.ApprovalApproved {
 		return false
 	}
@@ -1638,14 +1644,45 @@ func agentUpdateConfirmedByReport(approval model.Approval, payload agentUpdatePa
 	if isAgentUpdateAwaitingConfirmation(approval) {
 		return true
 	}
-	return strings.TrimSpace(payload.CurrentVersion) != payload.TargetVersion
+	return taskDispatched && strings.TrimSpace(payload.CurrentVersion) != payload.TargetVersion
+}
+
+// agentUpdateTaskDispatched reports whether an apply task for this approval
+// was handed to the node: a task row bound to the approval that the node
+// leased, or that has already left the queue. A task still queued was never
+// delivered, and no task at all means the approval was approved without
+// queuing its apply, so neither counts as the node having run this plan.
+func (s *Server) agentUpdateTaskDispatched(approvalID, nodeID string) bool {
+	approvalID = strings.TrimSpace(approvalID)
+	if approvalID == "" {
+		return false
+	}
+	for _, task := range s.store.Tasks() {
+		if task.ApprovalID != approvalID {
+			continue
+		}
+		if lease, ok := task.TargetLeases[nodeID]; ok && lease.LeaseID != "" {
+			return true
+		}
+		if task.LeasedBy == nodeID && task.LeaseID != "" {
+			return true
+		}
+		switch task.Status {
+		case model.TaskLeased, model.TaskFinished, model.TaskFailed:
+			return true
+		}
+	}
+	return false
 }
 
 // confirmAgentUpdateApproval marks one approved update applied when the node's
 // reported version proves it. It reports whether it did.
 func (s *Server) confirmAgentUpdateApproval(r *http.Request, approval model.Approval, reported string, seenAt time.Time) (bool, error) {
 	payload, err := agentUpdatePayloadFromApproval(approval)
-	if err != nil || !agentUpdateConfirmedByReport(approval, payload, reported) {
+	if err != nil {
+		return false, nil
+	}
+	if !agentUpdateConfirmedByReport(approval, payload, reported, s.agentUpdateTaskDispatched(approval.ID, approval.NodeID)) {
 		return false, nil
 	}
 	if seenAt.IsZero() {

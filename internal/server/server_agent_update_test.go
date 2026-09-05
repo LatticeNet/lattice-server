@@ -1641,3 +1641,92 @@ func TestAgentUpdateApplyScriptDetachesTheRestartAfterInstall(t *testing.T) {
 		t.Fatalf("after scheduling the restart the script may only report and exit, got %q", last)
 	}
 }
+
+// An approval the operator approved without queuing its apply has no task, so
+// nothing it authorized has run. If the node then reaches the target version
+// by some other route (another approval, a manual upgrade), that version is
+// not this approval's doing: the report must not mark it applied, and neither
+// heartbeat nor listing may write an agent.update.applied audit event for it.
+// A task that was queued but never leased proves as little. Only a task the
+// node actually took makes the version change this approval's evidence.
+func TestAgentUpdateReportDoesNotConfirmApprovalWhoseTaskNeverRan(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	approval := seedAgentUpdateApproved(t, srv, st)
+	req := httptest.NewRequest(http.MethodPost, "/api/agent/hello", nil)
+	appliedAudits := func() int {
+		n := 0
+		for _, ev := range st.AuditEvents() {
+			if ev.Action == "agent.update.applied" && ev.Metadata["approval_id"] == approval.ID {
+				n++
+			}
+		}
+		return n
+	}
+
+	// No task at all: the "approve without queuing" shape.
+	if err := srv.reconcileAgentUpdateHeartbeat(req, "node-a", "0.2.0", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if stored, ok := st.Approval(approval.ID); !ok || stored.Status != model.ApprovalApproved {
+		t.Fatalf("a version match with no apply task must not confirm the approval: ok=%v approval=%+v", ok, stored)
+	}
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.0", Online: true, LastSeen: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.rejectLocallyStaleAgentUpdateApprovals(httptest.NewRequest(http.MethodGet, "/api/network/approvals", nil), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if stored, ok := st.Approval(approval.ID); !ok || stored.Status == model.ApprovalApplied {
+		t.Fatalf("the listing sweep must not confirm an approval whose task never ran: ok=%v approval=%+v", ok, stored)
+	}
+	if n := appliedAudits(); n != 0 {
+		t.Fatalf("no agent.update.applied audit event may name an approval nothing executed, got %d", n)
+	}
+	if policy, ok := st.AgentUpdatePolicy("node-a"); !ok || policy.LastAppliedVersion != "" {
+		t.Fatalf("policy must not record an applied version for an approval that never ran: ok=%v policy=%+v", ok, policy)
+	}
+
+	// Queued but never leased: the node never received the script.
+	approval.Status = model.ApprovalApproved
+	approval.Reason = ""
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(model.Task{ID: "task-queued", ApprovalID: approval.ID, Targets: []string{"node-a"}, Status: model.TaskQueued, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.reconcileAgentUpdateHeartbeat(req, "node-a", "0.2.0", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if stored, ok := st.Approval(approval.ID); !ok || stored.Status != model.ApprovalApproved {
+		t.Fatalf("a queued task the node never took must not confirm the approval: ok=%v approval=%+v", ok, stored)
+	}
+	if n := appliedAudits(); n != 0 {
+		t.Fatalf("no agent.update.applied audit event for a task that never ran, got %d", n)
+	}
+
+	// Leased by the node: the task ran and its result was lost to the restart.
+	task, ok := st.Task("task-queued")
+	if !ok {
+		t.Fatal("task-queued missing")
+	}
+	task.Status = model.TaskLeased
+	task.LeasedBy = "node-a"
+	task.LeaseID = "lease-1"
+	task.StartedAt = time.Now().UTC()
+	task.TargetLeases = map[string]model.TaskLease{"node-a": {LeaseID: "lease-1", StartedAt: task.StartedAt}}
+	// CreateTask writes the row by id, so this replaces the queued one.
+	if err := st.CreateTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.reconcileAgentUpdateHeartbeat(req, "node-a", "0.2.0", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalApplied || !strings.Contains(stored.Reason, "confirmed by the node's report: agent version 0.2.0") {
+		t.Fatalf("once the node took the task, its report confirms the approval: ok=%v approval=%+v", ok, stored)
+	}
+	if n := appliedAudits(); n != 1 {
+		t.Fatalf("exactly one agent.update.applied audit event for the confirmed approval, got %d", n)
+	}
+}

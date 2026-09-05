@@ -343,11 +343,16 @@ func (s *Server) handleSSHGuardKnockState(w http.ResponseWriter, r *http.Request
 		return
 	}
 	state := s.sshGuardKnockStateFor(req.NodeID)
+	gate := sshGuardKnockGate(s.guardRealityForLint(req.NodeID))
 	out := map[string]any{
 		"ok":        true,
 		"node_id":   req.NodeID,
 		"knowledge": string(state.Knowledge),
-		"note":      knockStateNote(state),
+		"note":      knockStateNoteWithGate(state, gate),
+		// What the node itself reports: the inet lattice_knock table is on
+		// it right now. Independent of the approvals, so a gate the timer
+		// was supposed to remove and did not still shows as present.
+		"gate_present": gate,
 		// Whether a reveal would return anything, so the page can decide
 		// between offering the button and explaining its absence.
 		"revealable": knockRevealable(state.Knowledge),
@@ -450,6 +455,7 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 			"confirmed":   strconv.FormatBool(state.Confirmed),
 		},
 	})
+	gate := sshGuardKnockGate(s.guardRealityForLint(req.NodeID))
 	out := map[string]any{
 		"ok":          true,
 		"node_id":     req.NodeID,
@@ -458,7 +464,8 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 		// The same sentence the state endpoint shows, so a sequence read out
 		// of a superseded record arrives with the caveat attached rather than
 		// looking like one the control plane watched apply.
-		"note":            knockStateNote(state),
+		"note":            knockStateNoteWithGate(state, gate),
+		"gate_present":    gate,
 		"confirmed":       state.Confirmed,
 		"ports":           state.Sequence.Ports,
 		"seq_timeout_sec": state.Sequence.SeqTimeoutSec,

@@ -34,6 +34,15 @@ import (
 //
 //	task_failed         An apply task ran and ended failed or cancelled.
 //	task_running        An apply task is leased right now. Nothing is wrong.
+//	awaiting_confirmation  The apply task of an agent update finished and the
+//	                    node has not reported the target version yet. The
+//	                    approval is applied the moment it does; nothing is
+//	                    wrong. Only while the node is reporting: a silent node
+//	                    falls through to the codes below.
+//	version_mismatch    The apply task of an agent update finished, the node
+//	                    has been reporting since well past the scheduled
+//	                    restart, and it still runs a version that is not the
+//	                    target. The restart did not take.
 //	task_finished       An apply task finished and the approval was never
 //	                    marked applied. The control plane does not know why;
 //	                    it says so rather than picking a story.
@@ -53,6 +62,8 @@ import (
 const (
 	ApprovalWaitTaskFailed            = "task_failed"
 	ApprovalWaitTaskRunning           = "task_running"
+	ApprovalWaitAwaitingConfirmation  = "awaiting_confirmation"
+	ApprovalWaitVersionMismatch       = "version_mismatch"
 	ApprovalWaitTaskFinished          = "task_finished"
 	ApprovalWaitPlanSuperseded        = "plan_superseded"
 	ApprovalWaitNodeUnknown           = "node_unknown"
@@ -233,6 +244,16 @@ func (s *Server) approvalWait(a model.Approval, ctx *approvalWaitContext) *appro
 		out.Code = ApprovalWaitTaskRunning
 		out.Blocked = false
 		out.Reason = fmt.Sprintf("The apply task %s is running on %s right now.", task.ID, nodeLabel)
+	case hasTask && task.Status == model.TaskFinished && isAgentUpdateAwaitingConfirmation(a) && nodeKnown && nodeStatusReporting(status.Status):
+		target := agentUpdateTargetVersion(a)
+		if node.AgentVersion != target && node.LastSeen.After(a.UpdatedAt.Add(agentUpdateRestartGrace)) {
+			out.Code = ApprovalWaitVersionMismatch
+			out.Reason = fmt.Sprintf("The apply task %s finished on %s, but the node still reports agent version %s rather than %s%s. The scheduled restart did not bring up the new agent.", task.ID, nodeLabel, node.AgentVersion, target, sinceClause(node.LastSeen))
+		} else {
+			out.Code = ApprovalWaitAwaitingConfirmation
+			out.Blocked = false
+			out.Reason = fmt.Sprintf("The apply task %s finished on %s; waiting for the node to report agent version %s after its restart.", task.ID, nodeLabel, target)
+		}
 	case hasTask && task.Status == model.TaskFinished:
 		out.Code = ApprovalWaitTaskFinished
 		out.Reason = fmt.Sprintf("The apply task %s on %s finished, but this approval was never recorded as applied. The control plane cannot say whether the change took.", task.ID, nodeLabel)
@@ -280,6 +301,28 @@ func approvalNodeLabel(nodeID string, node model.Node, known bool) string {
 		return node.Name
 	}
 	return nodeID
+}
+
+// agentUpdateRestartGrace is how long after the apply task's result the node
+// may still be heard from on its old version before that counts as evidence.
+// The script schedules the restart 3 s after it exits, and the old agent can
+// send one more report in that gap; the new agent then discovers its public
+// IPs before its first hello. Two minutes is well past both.
+const agentUpdateRestartGrace = 2 * time.Minute
+
+// nodeStatusReporting is true for a node the control plane is hearing from.
+func nodeStatusReporting(status string) bool {
+	return status == NodeStatusOnline || status == NodeStatusDegraded
+}
+
+// agentUpdateTargetVersion reads the target out of an update approval's plan,
+// empty when the plan does not parse.
+func agentUpdateTargetVersion(a model.Approval) string {
+	payload, err := agentUpdatePayloadFromApproval(a)
+	if err != nil {
+		return ""
+	}
+	return payload.TargetVersion
 }
 
 func sinceClause(since time.Time) string {

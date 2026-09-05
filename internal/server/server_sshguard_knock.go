@@ -81,6 +81,8 @@ type sshGuardKnockState struct {
 	SSHPort   int
 	Address   string
 	Sequence  sshguard.KnockSequence
+	// GatedPorts are the tcp ports the governing arm's knock table covers.
+	GatedPorts []int
 	// Rejected is set when this node has SSH Guard arm plans but none that
 	// govern it: every one was rejected or dismissed. The knowledge is still
 	// unknown, because no sequence reached the node, but "there was never a
@@ -159,6 +161,7 @@ func (s *Server) sshGuardKnockStateFor(nodeID string) sshGuardKnockState {
 			AppliedAt:  a.UpdatedAt,
 			SSHPort:    art.SSHPort,
 			Address:    node.PublicIP,
+			GatedPorts: art.GatedPorts,
 		}
 		if strings.TrimSpace(art.KnockdConf) == "" {
 			out.Knowledge = knockNoKnock

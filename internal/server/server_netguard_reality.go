@@ -97,6 +97,19 @@ type guardRealityDetail struct {
 	Reality        *model.GuardNodeReality `json:"reality"`
 	ReceivedAt     *time.Time              `json:"received_at"`
 	StaleAfter     *time.Time              `json:"stale_after"`
+	// KnockGate is true when the report lists the inet lattice_knock table:
+	// SSH Guard's gate is on the node right now, whoever put it there. It is
+	// the same fact the SSH Guard posture row prints, repeated here because
+	// the exposure view is built from this record and a gated sshd port that
+	// it rendered as open to the internet was the most visible lie in the
+	// product.
+	KnockGate bool `json:"knock_gate"`
+	// KnockGatedPorts are the tcp ports the gate covers: the ports the arm
+	// plan that reached the node gated, or, when no plan of ours put the
+	// table there, the ports sshd reports, which is what the gate is built
+	// for. Empty with KnockGate set means the table is there and its scope
+	// is not known.
+	KnockGatedPorts []int `json:"knock_gated_ports,omitempty"`
 }
 
 func (s *Server) handleAgentGuardReality(w http.ResponseWriter, r *http.Request) {
@@ -317,13 +330,39 @@ func (s *Server) guardRealityDetailForNode(nodeID string, now time.Time) guardRe
 	status, staleAfter := guardRealityFreshness(snapshot, now)
 	reality := snapshot.Reality
 	receivedAt := snapshot.ReceivedAt.UTC()
-	return guardRealityDetail{
+	detail := guardRealityDetail{
 		NodeID:         nodeID,
 		SnapshotStatus: status,
 		Reality:        &reality,
 		ReceivedAt:     &receivedAt,
 		StaleAfter:     &staleAfter,
+		KnockGate:      sshGuardKnockGate(&reality),
 	}
+	if detail.KnockGate {
+		detail.KnockGatedPorts = s.sshGuardGatedPorts(nodeID, &reality)
+	}
+	return detail
+}
+
+// sshGuardGatedPorts reports which tcp ports the node's knock table covers.
+//
+// The table's rules are not in the report, only its name, so the scope comes
+// from the arm plan that governs the node's knock (the one that carried a
+// firewall and reached the node, exactly as the SSH Guard status picks it).
+// A table this system never installed is read the way SSH Guard builds one:
+// it gates what sshd listens on. No sshd facts means no claim.
+func (s *Server) sshGuardGatedPorts(nodeID string, reality *model.GuardNodeReality) []int {
+	ks := s.sshGuardKnockStateFor(nodeID)
+	switch ks.Knowledge {
+	case knockInstalled, knockInstalledSuperseded, knockNoKnock:
+		if len(ks.GatedPorts) > 0 {
+			return append([]int(nil), ks.GatedPorts...)
+		}
+	}
+	if reality == nil || reality.SSHD == nil || len(reality.SSHD.Ports) == 0 {
+		return nil
+	}
+	return append([]int(nil), reality.SSHD.Ports...)
 }
 
 func guardRealityFreshness(snapshot store.GuardRealitySnapshot, now time.Time) (string, time.Time) {

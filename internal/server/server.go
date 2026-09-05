@@ -6733,7 +6733,14 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 		}
 		return script
 	default:
-		return heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
+		// The task runner narrows PATH to /usr/bin:/bin:/usr/local/bin, which
+		// has no sbin directory, so a bare `nft` is "command not found" on a
+		// node whose /usr/sbin is not merged into /usr/bin (legend-sg,
+		// nftables 1.0.6, 2026-09-04). Widen it here rather than spelling
+		// out one path: the sshguard package hard-codes /usr/sbin/nft, and
+		// the watchdog's `sh -c` child needs the same PATH.
+		return "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
+			heredocWrite("/tmp/lattice-nft-plan.nft", "LATTICE_NFT_EOF", approval.Plan) +
 			"nft -c -f /tmp/lattice-nft-plan.nft\n"
 	}
 }
@@ -6928,6 +6935,14 @@ func nftGuardApplyScript(plan, serverURL string) string {
 	return nftGuardApplyScriptWithManagedSHA(plan, serverURL, false)
 }
 
+// nftApplyPathLine puts the sbin directories on PATH before the apply script
+// runs its first `nft`. The task runner hands scripts
+// PATH=/usr/bin:/bin:/usr/local/bin, so on a node without usr-merge the
+// script died at `nft -c -f "$CANDIDATE"` with "command not found" (exit 127)
+// before it changed anything; safe, but no apply could ever succeed there.
+// Exported so the watchdog's `setsid sh -c` rollback finds nft too.
+const nftApplyPathLine = "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+
 func netGuardApplyScript(plan, serverURL string) string {
 	return nftGuardApplyScriptWithManagedSHA(plan, serverURL, true)
 }
@@ -6948,6 +6963,7 @@ func nftGuardApplyScriptWithManagedSHA(plan, serverURL string, reportManagedSHA 
 			"echo \"lattice netguard: managed_sha=$MANAGED_SHA\"\n"
 	}
 	return "set -e\n" +
+		nftApplyPathLine +
 		"umask 077\n" +
 		"mkdir -p /etc/lattice\n" +
 		"CANDIDATE=/etc/lattice/guard.nft.new\n" +
@@ -6981,6 +6997,7 @@ func nftPolicyApplyScript(plan, serverURL string, domainSets []nftPolicyDomainSe
 		domainRefresh = nftPolicyDomainRefreshInstallScript(domainSetUpdate)
 	}
 	return "set -e\n" +
+		nftApplyPathLine +
 		"umask 077\n" +
 		"mkdir -p /etc/lattice\n" +
 		"CANDIDATE=/etc/lattice/policy.nft.new\n" +

@@ -132,8 +132,9 @@ func armScript(art Artifacts) (string, error) {
 	fmt.Fprintf(&b, "\"$SYSTEMCTL\" reset-failed %s.timer 2>/dev/null || true\n", RevertUnit)
 	b.WriteString("LATTICE_SSHGUARD_DURABLE=0\n")
 	if art.Durable {
-		b.WriteString("# The plan says this arm is durable: no firewall, and the node showed a\n")
-		b.WriteString("# key path in. That claim was made from a report; the host is asked now.\n")
+		b.WriteString("# The plan says this arm is durable: no firewall, no port change, and the\n")
+		b.WriteString("# node showed a key path in. That claim was made from a report; the host\n")
+		b.WriteString("# is asked now.\n")
 		b.WriteString("# An authorized key in a file sshd actually reads means turning passwords\n")
 		b.WriteString("# off takes nothing from whoever holds it, so no timer is armed and no\n")
 		b.WriteString("# confirm follows. No key found means the report was wrong or stale, and\n")

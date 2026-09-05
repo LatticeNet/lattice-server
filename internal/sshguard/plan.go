@@ -30,8 +30,10 @@ type Artifacts struct {
 	KeepLegacyPort   bool
 	ConfirmWindowSec int
 	// Durable is the plan's claim that this arm needs no confirm: it installs
-	// no firewall and the node showed a key path in at plan time. The arm
-	// script re-checks the key on the host before it honours the claim.
+	// no firewall, changes no port, and the node showed a key path in at plan
+	// time. The arm script re-checks the key on the host before it honours
+	// the claim, and ParseApprovalPlan refuses the claim on any plan that
+	// carries a firewall or a port.
 	Durable bool
 
 	SSHDDropIn string
@@ -317,6 +319,12 @@ func ParseApprovalPlan(plan string) (Artifacts, error) {
 		// installs one and also claims to need no confirm is not a plan this
 		// renderer wrote, and it must not become a script that skips the timer.
 		return Artifacts{}, fmt.Errorf("plan installs a firewall and claims to be durable; a firewall arm always keeps its revert timer")
+	}
+	if out.Durable && out.SSHPort != 0 {
+		// Same reasoning, other path in: a port change is only proven by a
+		// login over the new port from outside, and the timer is what
+		// undoes it when that login never comes.
+		return Artifacts{}, fmt.Errorf("plan changes the ssh port and claims to be durable; a port change always keeps its revert timer")
 	}
 	if out.ConfirmWindowSec < MinConfirmWindowSec || out.ConfirmWindowSec > MaxConfirmWindowSec {
 		return Artifacts{}, fmt.Errorf("confirm_window_sec %d is outside [%d, %d]",

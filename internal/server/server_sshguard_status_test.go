@@ -396,6 +396,15 @@ func TestSSHGuardPlanKeepsTheTimerWithoutAKeyOrWithAFirewall(t *testing.T) {
 	if art := plan(sshGuardPlanBody("node-a", map[string]any{"enable_knock": false})); art.Durable || art.KnockNFT == "" {
 		t.Fatal("a management-source gate is a firewall too, and is never durable")
 	}
+	// A port migration with no firewall on the same key-only node. The key
+	// proves nothing about the new port being reachable from outside, and
+	// with 22 dropped a wrong guess has no way back but the timer.
+	if art := plan(`{"node_id":"node-a","ssh_port":2222,"keep_legacy_port":false,"enable_knock":false}`); art.Durable || art.KnockNFT != "" || art.SSHPort != 2222 {
+		t.Fatalf("a port migration keeps the timer even on a key-only node: durable=%v nft=%q port=%d", art.Durable, art.KnockNFT, art.SSHPort)
+	}
+	if art := plan(`{"node_id":"node-a","ssh_port":2222,"keep_legacy_port":true,"enable_knock":false}`); art.Durable || art.KnockNFT != "" {
+		t.Fatalf("adding a port is still a port change and keeps the timer: durable=%v nft=%q", art.Durable, art.KnockNFT)
+	}
 }
 
 // When the host disagreed with the plan about the key, the script armed the

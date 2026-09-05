@@ -227,3 +227,78 @@ func shellSyntaxCheck(t *testing.T, script string) {
 		t.Fatalf("sh -n rejected the script: %v\n%s", err, out)
 	}
 }
+
+// A port change is a change to how the node is reached, and that is the one
+// risk the timer exists for. The observed key says nothing about whether the
+// new port is reachable from outside: a security group, a NAT that only
+// forwards 22, or a middlebox can leave sshd listening locally on a port
+// nobody can get to. The script's own listen check passes in that case, so
+// without the timer a migration that drops 22 is a permanent lockout with
+// no path back. Every port change therefore keeps the confirm-or-revert
+// path, whether or not 22 is kept.
+func TestPortMigrationIsNeverDurable(t *testing.T) {
+	for _, keep := range []bool{false, true} {
+		p := hardeningOnlyProfile(true)
+		p.SSHPort = 2222
+		p.KeepLegacyPort = keep
+		if err := p.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if p.Durable() {
+			t.Fatalf("keep_legacy_port=%t: a port change is never durable, key or no key", keep)
+		}
+		plan, err := RenderArmPlan(p, "nat-node")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(plan, "durable:") {
+			t.Fatalf("keep_legacy_port=%t: the plan must not claim durability:\n%s", keep, plan)
+		}
+		if strings.Contains(plan, "changes no port") || strings.Contains(plan, "no revert timer is armed") {
+			t.Fatalf("keep_legacy_port=%t: the prose describes a port change as no change:\n%s", keep, plan)
+		}
+		if !strings.Contains(plan, "adds a port before it takes anything away") || !strings.Contains(plan, "systemd timer that undoes all of it") {
+			t.Fatalf("keep_legacy_port=%t: the reviewer must be told about the port change and the revert:\n%s", keep, plan)
+		}
+		art, err := ParseApprovalPlan(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if art.Durable {
+			t.Fatal("durable must not survive the round trip on a port change")
+		}
+		script, err := ApplyScriptFromPlan(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// LATTICE_SSHGUARD_DURABLE is set to 0 and only the key check can
+		// raise it, so no key check means the timer branch always runs.
+		if strings.Contains(script, "sshguard_key_found") || strings.Contains(script, "LATTICE_SSHGUARD_DURABLE=1") {
+			t.Fatal("a port change must not consult the host about keys; the timer is unconditional")
+		}
+		if !strings.Contains(script, "\"$SYSTEMD_RUN\" --on-active=") {
+			t.Fatalf("the timer must be armed on a port change:\n%s", script)
+		}
+		shellSyntaxCheck(t, script)
+	}
+}
+
+// The parser is the last line: a plan that changes the port and claims
+// durability did not come from this renderer, and must not become a script
+// that migrates sshd with no revert behind it.
+func TestParserRefusesADurableClaimOnAPortChange(t *testing.T) {
+	p := hardeningOnlyProfile(true)
+	p.SSHPort = 2222
+	p.KeepLegacyPort = false
+	plan, err := RenderArmPlan(p, "nat-node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := strings.Replace(plan, "confirm_window_sec: 900\n", "confirm_window_sec: 900\ndurable: true\n", 1)
+	if forged == plan {
+		t.Fatal("test setup: the durable line was not inserted")
+	}
+	if _, err := ParseApprovalPlan(forged); err == nil || !strings.Contains(err.Error(), "durable") {
+		t.Fatalf("want a refusal naming the durable claim, got %v", err)
+	}
+}

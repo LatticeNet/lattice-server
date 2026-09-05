@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 const agentUpdateTestSHA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -303,7 +304,7 @@ func TestAgentUpdateApplyRequiresHeartbeatConfirmation(t *testing.T) {
 		t.Fatalf("target-version heartbeat failed: %d %s", hello.Code, hello.Body.String())
 	}
 	confirmed, ok := st.Approval(approval.ID)
-	if !ok || confirmed.Status != model.ApprovalApplied || confirmed.Reason != "" {
+	if !ok || confirmed.Status != model.ApprovalApplied || !strings.HasPrefix(confirmed.Reason, "Node agent upgrade") || !strings.HasSuffix(confirmed.Reason, "confirmed by the node's report: agent version 0.2.0") {
 		t.Fatalf("target-version heartbeat should confirm update approval: ok=%v approval=%+v", ok, confirmed)
 	}
 	policy, ok = st.AgentUpdatePolicy("node-a")
@@ -1416,5 +1417,227 @@ func TestAgentUpdateTimeoutStaysWithinTheAgentsAcceptedRange(t *testing.T) {
 	// lossy link.
 	if got < 300 {
 		t.Fatalf("agent update timeout %ds is too tight for a slow uplink to fetch the binary", got)
+	}
+}
+
+// seedAgentUpdateApproved plans an update for node-a (running 0.1.0, target
+// 0.2.0), approves it, and returns the approval. Callers add the task and the
+// node state the case needs.
+func seedAgentUpdateApproved(t *testing.T, srv *Server, st *store.Store) model.Approval {
+	t.Helper()
+	seedAgentUpdateNode(t, st)
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "manual", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	return approval
+}
+
+// The 2026-09-05 rollout: the apply task finished and the approval was
+// awaiting confirmation; the new agent's hello set the node's version to the
+// target, and the console's next listing judged the approval stale ("policy
+// changed: current_version") and rejected it before the heartbeat could
+// confirm it. The listing must read that version as the confirmation it is.
+func TestAgentUpdateApprovalsListConfirmsAwaitingApprovalFromNodeVersion(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	cookies, csrf := loginSession(t, handler)
+	approval := seedAgentUpdateApproved(t, srv, st)
+	approval.Reason = agentUpdateAwaitingConfirmationReason("0.2.0")
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(model.Task{ID: "task-done", ApprovalID: approval.ID, Targets: []string{"node-a"}, Status: model.TaskFinished, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.0", Online: true, LastSeen: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
+	list := doJSON(t, handler, http.MethodGet, "/api/network/approvals", "", cookies, csrf)
+	defer list.Body.Close()
+	if list.StatusCode != http.StatusOK {
+		t.Fatalf("list approvals failed: %d", list.StatusCode)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalApplied {
+		t.Fatalf("node at target version should confirm the update, not reject it: ok=%v approval=%+v", ok, stored)
+	}
+	if !strings.Contains(stored.Reason, "confirmed by the node's report") || !strings.Contains(stored.Reason, "0.2.0") {
+		t.Fatalf("confirmed reason should name the node's report and version, got %q", stored.Reason)
+	}
+	policy, ok := st.AgentUpdatePolicy("node-a")
+	if !ok || policy.LastAppliedVersion != "0.2.0" || policy.LastAppliedAt.IsZero() || policy.LastError != "" {
+		t.Fatalf("listing confirmation should settle the policy too: ok=%v policy=%+v", ok, policy)
+	}
+}
+
+// The result the old agent posts can be lost to the restart. The node's next
+// report proves the update anyway: the plan froze current_version 0.1.0 and the
+// node now runs 0.2.0.
+func TestAgentUpdateReportConfirmsApprovedUpdateWithoutTaskResult(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	// The enrolled node keeps its token; the version the plan freezes comes
+	// from a real hello rather than a node rewrite.
+	if hello := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello", `{"node_id":"node-a","version":"0.1.0"}`, nodeToken); hello.Code != http.StatusOK {
+		t.Fatalf("hello failed: %d %s", hello.Code, hello.Body.String())
+	}
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, AutoPlan: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", false, "manual", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(model.Task{ID: "task-lost", ApprovalID: approval.ID, Targets: []string{"node-a"}, Status: model.TaskLeased, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Not yet: the node still runs what the plan saw.
+	hello := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello", `{"node_id":"node-a","version":"0.1.0"}`, nodeToken)
+	if hello.Code != http.StatusOK {
+		t.Fatalf("hello failed: %d %s", hello.Code, hello.Body.String())
+	}
+	if stored, ok := st.Approval(approval.ID); !ok || stored.Status != model.ApprovalApproved {
+		t.Fatalf("old version must not confirm anything: ok=%v approval=%+v", ok, stored)
+	}
+	// Not yet: some other version is not the target either.
+	hello = doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello", `{"node_id":"node-a","version":"0.1.5"}`, nodeToken)
+	if hello.Code != http.StatusOK {
+		t.Fatalf("hello failed: %d %s", hello.Code, hello.Body.String())
+	}
+	if stored, ok := st.Approval(approval.ID); !ok || stored.Status != model.ApprovalApproved {
+		t.Fatalf("a version that is not the target must not confirm: ok=%v approval=%+v", ok, stored)
+	}
+
+	hello = doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello", `{"node_id":"node-a","version":"0.2.0"}`, nodeToken)
+	if hello.Code != http.StatusOK {
+		t.Fatalf("hello failed: %d %s", hello.Code, hello.Body.String())
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalApplied || !strings.Contains(stored.Reason, "confirmed by the node's report: agent version 0.2.0") {
+		t.Fatalf("target version should confirm the approval without a task result: ok=%v approval=%+v", ok, stored)
+	}
+	policy, ok := st.AgentUpdatePolicy("node-a")
+	if !ok || policy.LastAppliedVersion != "0.2.0" || policy.LastError != "" {
+		t.Fatalf("policy should record the confirmed version: ok=%v policy=%+v", ok, policy)
+	}
+
+	// The lost result arrives late (a re-run, or a slow post). It must not pull
+	// the approval back to "awaiting confirmation".
+	result := `{"node_id":"node-a","result":{"task_id":"task-lost","lease_id":"","exit_code":0,"stdout":"installed"}}`
+	resultRec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", result, nodeToken)
+	if resultRec.Code != http.StatusOK && resultRec.Code != http.StatusForbidden && resultRec.Code != http.StatusConflict {
+		t.Fatalf("late task result: %d %s", resultRec.Code, resultRec.Body.String())
+	}
+	if again, ok := st.Approval(approval.ID); !ok || again.Status != model.ApprovalApplied {
+		t.Fatalf("a late result must not regress an applied approval: ok=%v approval=%+v", ok, again)
+	}
+}
+
+// A forced reinstall plans the version the node already runs, so the node
+// reporting that version proves nothing; only its task result can.
+func TestAgentUpdateReportDoesNotConfirmSameVersionReinstall(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", AgentVersion: "0.2.0", Online: true, LastSeen: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: "node-a", Enabled: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval(context.Background(), "node-a", "admin", true, "manual", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.reconcileAgentUpdateHeartbeat(httptest.NewRequest(http.MethodPost, "/api/agent/hello", nil), "node-a", "0.2.0", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalApproved {
+		t.Fatalf("same-version reinstall must wait for its task result: ok=%v approval=%+v", ok, stored)
+	}
+	approval.Reason = agentUpdateAwaitingConfirmationReason("0.2.0")
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.reconcileAgentUpdateHeartbeat(httptest.NewRequest(http.MethodPost, "/api/agent/hello", nil), "node-a", "0.2.0", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if stored, ok := st.Approval(approval.ID); !ok || stored.Status != model.ApprovalApplied {
+		t.Fatalf("once the task result is in, the report confirms the reinstall: ok=%v approval=%+v", ok, stored)
+	}
+}
+
+// The staleness sweep decides on a snapshot; the write must re-check the live
+// row so it cannot overwrite a transition committed in between.
+func TestRejectStaleAgentUpdateApprovalSkipsRowAppliedMeanwhile(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	approval := seedAgentUpdateApproved(t, srv, st)
+	snapshot := approval
+	applied := approval
+	applied.Status = model.ApprovalApplied
+	applied.Reason = agentUpdateConfirmedReason(approval.Plan, "0.2.0")
+	if err := st.UpsertApproval(applied); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.rejectAgentUpdateApprovalWithReason(snapshot, "policy changed", time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok || stored.Status != model.ApprovalApplied || stored.Reason != applied.Reason {
+		t.Fatalf("a stale snapshot must not reject an applied approval: ok=%v approval=%+v", ok, stored)
+	}
+}
+
+// The restart is what makes the result post racy, so the script has to post
+// first: it must hand the restart to a transient systemd unit that fires after
+// the script has exited, install before scheduling it, and do nothing after.
+func TestAgentUpdateApplyScriptDetachesTheRestartAfterInstall(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	approval := seedAgentUpdateApproved(t, srv, st)
+	script, err := agentUpdateApplyScript(approval, srv.publicURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	install := strings.Index(script, "mv \"$TARGET.new\" \"$TARGET\"")
+	schedule := strings.Index(script, "systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\"")
+	if install < 0 || schedule < 0 || schedule < install {
+		t.Fatalf("the restart must be scheduled through systemd-run after the binary is in place:\n%s", script)
+	}
+	if strings.Contains(script, "\nsystemctl restart") || strings.Contains(script, "\nsystemctl stop") {
+		t.Fatalf("the script must never restart the service in its own cgroup; it would kill the agent before the result is posted:\n%s", script)
+	}
+	lines := strings.Split(strings.TrimRight(script, "\n"), "\n")
+	last := lines[len(lines)-1]
+	if !strings.HasPrefix(last, "echo ") || !strings.Contains(last, "scheduled $SERVICE restart") {
+		t.Fatalf("after scheduling the restart the script may only report and exit, got %q", last)
 	}
 }

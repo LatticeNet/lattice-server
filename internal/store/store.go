@@ -3628,6 +3628,33 @@ func (s *Store) UpsertApproval(a model.Approval) error {
 	return s.Save()
 }
 
+// MutateApproval applies mutate to the stored row under the store lock and
+// persists it only when mutate returns true. The row mutate sees is the current
+// one, so a caller that decided on a snapshot (a listing, a heartbeat) re-checks
+// the status it is about to leave before writing, rather than overwriting a
+// transition another request committed in between. An UpdatedAt the callback
+// leaves at zero is set to now. The second result is false when the row does
+// not exist or mutate declined.
+func (s *Store) MutateApproval(id string, mutate func(a *model.Approval) bool) (model.Approval, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.state.Approvals[id]
+	if !ok {
+		return model.Approval{}, false, nil
+	}
+	if !mutate(&a) {
+		return a, false, nil
+	}
+	if a.UpdatedAt.IsZero() {
+		a.UpdatedAt = time.Now().UTC()
+	}
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = a.UpdatedAt
+	}
+	s.state.Approvals[a.ID] = a
+	return a, true, s.Save()
+}
+
 // ApproveNetGuard atomically transitions the reviewed NetGuard approval and,
 // when task is non-nil, queues its one host task while the reviewed binding plan
 // anchor is still current. This closes the approval-check-to-decision window: a group,

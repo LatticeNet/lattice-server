@@ -459,3 +459,111 @@ func TestQueuedApprovalIsNotDismissible(t *testing.T) {
 		t.Fatal("an approval with a live apply task must not be dismissible")
 	}
 }
+
+// awaitingUpdateApproval is an agent update whose apply task finished and
+// whose approval is waiting for the node to report the target version. The
+// plan is the real one, so the target can be read back out of it.
+func awaitingUpdateApproval(t *testing.T, srv *Server, st *store.Store, nodeID string, updatedAt time.Time) model.Approval {
+	t.Helper()
+	if err := st.UpsertAgentUpdatePolicy(model.AgentUpdatePolicy{
+		NodeID: nodeID, Enabled: true, TargetVersion: "0.2.0",
+		BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64",
+		SHA256:    agentUpdateTestSHA, InstallPath: defaultAgentInstallPath, ServiceName: defaultAgentServiceName,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := srv.createAgentUpdateApproval(context.Background(), nodeID, "operator", false, "manual", updatedAt.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	approval.Reason = agentUpdateAwaitingConfirmationReason("0.2.0")
+	approval.UpdatedAt = updatedAt
+	if _, _, err := st.MutateApproval(approval.ID, func(a *model.Approval) bool { *a = approval; return true }); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateTask(model.Task{ID: "task-" + nodeID, ApprovalID: approval.ID, Targets: []string{nodeID}, Interpreter: "sh", Script: "true", Status: model.TaskFinished, CreatedAt: updatedAt.Add(-30 * time.Second), FinishedAt: updatedAt}); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := st.Approval(approval.ID)
+	if !ok {
+		t.Fatal("approval vanished")
+	}
+	return stored
+}
+
+// The window the operator saw as "approved and stuck": the apply task has
+// finished, the node is restarting onto the new binary, and its report has
+// not arrived yet. Nothing is wrong and the console must not say it is.
+func TestApprovalWaitAgentUpdateAwaitingConfirmationIsNotBlocked(t *testing.T) {
+	srv, st := newWaitingTestServer(t)
+	now := time.Now().UTC()
+	if err := st.UpsertNode(model.Node{ID: "node-u1", Name: "edge-u1", AgentVersion: "0.1.0", Online: true, LastSeen: now.Add(-5 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	approval := awaitingUpdateApproval(t, srv, st, "node-u1", now.Add(-10*time.Second))
+	wait := waitFor(t, srv, approval)
+	if wait.Code != ApprovalWaitAwaitingConfirmation {
+		t.Fatalf("code = %q, want %q (reason %q)", wait.Code, ApprovalWaitAwaitingConfirmation, wait.Reason)
+	}
+	if wait.Blocked {
+		t.Fatal("an update waiting for the node's version report is proceeding, not stuck")
+	}
+	if !strings.Contains(wait.Reason, "0.2.0") || !strings.Contains(wait.Reason, "task-node-u1") {
+		t.Fatalf("reason should name the task and the version awaited: %q", wait.Reason)
+	}
+	if wait.Dismissible {
+		t.Fatal("an update about to confirm must not offer dismissal")
+	}
+}
+
+// The old agent may report once more in the 3 s before its restart. That is
+// not evidence the restart failed.
+func TestApprovalWaitAgentUpdateToleratesOneLateOldVersionReport(t *testing.T) {
+	srv, st := newWaitingTestServer(t)
+	now := time.Now().UTC()
+	if err := st.UpsertNode(model.Node{ID: "node-u2", Name: "edge-u2", AgentVersion: "0.1.0", Online: true, LastSeen: now.Add(-8 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	approval := awaitingUpdateApproval(t, srv, st, "node-u2", now.Add(-10*time.Second))
+	wait := waitFor(t, srv, approval)
+	if wait.Code != ApprovalWaitAwaitingConfirmation || wait.Blocked {
+		t.Fatalf("a report inside the restart grace is still awaiting: %+v", wait)
+	}
+}
+
+// Past the grace the node is still reporting and still on the old version:
+// the restart did not bring up the new agent, and that is a real block.
+func TestApprovalWaitAgentUpdateVersionMismatchIsBlocked(t *testing.T) {
+	srv, st := newWaitingTestServer(t)
+	now := time.Now().UTC()
+	if err := st.UpsertNode(model.Node{ID: "node-u3", Name: "edge-u3", AgentVersion: "0.1.0", Online: true, LastSeen: now.Add(-10 * time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	approval := awaitingUpdateApproval(t, srv, st, "node-u3", now.Add(-10*time.Minute))
+	wait := waitFor(t, srv, approval)
+	if wait.Code != ApprovalWaitVersionMismatch {
+		t.Fatalf("code = %q, want %q (reason %q)", wait.Code, ApprovalWaitVersionMismatch, wait.Reason)
+	}
+	if !wait.Blocked {
+		t.Fatal("a node that keeps reporting the old version after the restart window is stuck")
+	}
+	if !strings.Contains(wait.Reason, "0.1.0") || !strings.Contains(wait.Reason, "0.2.0") {
+		t.Fatalf("reason should name both versions: %q", wait.Reason)
+	}
+}
+
+// A node that went silent after the task is not "awaiting"; the existing
+// precedence keeps its honest answer.
+func TestApprovalWaitAgentUpdateAwaitingOnOfflineNodeFallsThrough(t *testing.T) {
+	srv, st := newWaitingTestServer(t)
+	now := time.Now().UTC()
+	if err := st.UpsertNode(model.Node{ID: "node-u4", Name: "edge-u4", AgentVersion: "0.1.0", LastSeen: now.Add(-48 * time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	approval := awaitingUpdateApproval(t, srv, st, "node-u4", now.Add(-47*time.Hour))
+	wait := waitFor(t, srv, approval)
+	if wait.Code != ApprovalWaitTaskFinished || !wait.Blocked {
+		t.Fatalf("offline node after a finished task keeps the task_finished answer: %+v", wait)
+	}
+}

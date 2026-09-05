@@ -1176,23 +1176,52 @@ func (s *Server) rejectAgentUpdateApproval(approval model.Approval, now time.Tim
 }
 
 func (s *Server) rejectAgentUpdateApprovalWithReason(approval model.Approval, reason string, now time.Time) error {
-	if !agentUpdateApprovalCanAutoReject(approval, s.activeTaskApprovalIDs()) {
+	active := s.activeTaskApprovalIDs()
+	if !agentUpdateApprovalCanAutoReject(approval, active) {
 		return nil
 	}
-	approval.Status = model.ApprovalRejected
-	approval.Reason = strings.TrimSpace(reason)
-	if approval.Reason == "" {
-		approval.Reason = agentUpdateApprovalStaleReason
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = agentUpdateApprovalStaleReason
 	}
-	approval.UpdatedAt = now
-	return s.store.UpsertApproval(approval)
+	// The decision was made on a snapshot. The 2026-09-05 rollout lost three
+	// confirmed updates this way: the listing judged an approval stale while
+	// the node's heartbeat was marking it applied, then wrote "rejected" over
+	// "applied" a few seconds later. Re-check the live row before leaving it.
+	_, _, err := s.store.MutateApproval(approval.ID, func(current *model.Approval) bool {
+		if !agentUpdateApprovalCanAutoReject(*current, active) {
+			return false
+		}
+		current.Status = model.ApprovalRejected
+		current.Reason = reason
+		current.UpdatedAt = now
+		return true
+	})
+	return err
 }
 
-func (s *Server) rejectLocallyStaleAgentUpdateApprovals(now time.Time) error {
+// rejectLocallyStaleAgentUpdateApprovals retires plans the current policy no
+// longer describes. An approved plan whose node already reports the target
+// version is not stale, it is done: a successful update changes exactly the
+// field (current_version) that the staleness check compares, so the check has
+// to yield to the node's report first or it rejects every update it did not
+// see confirmed.
+func (s *Server) rejectLocallyStaleAgentUpdateApprovals(r *http.Request, now time.Time) error {
 	activeApprovals := s.activeTaskApprovalIDs()
 	for _, approval := range s.store.Approvals() {
 		if !agentUpdateApprovalCanAutoReject(approval, activeApprovals) {
 			continue
+		}
+		if approval.Status == model.ApprovalApproved {
+			if node, ok := s.store.Node(approval.NodeID); ok {
+				confirmed, err := s.confirmAgentUpdateApproval(r, approval, node.AgentVersion, node.LastSeen)
+				if err != nil {
+					return err
+				}
+				if confirmed {
+					continue
+				}
+			}
 		}
 		if stale, reason := s.agentUpdateApprovalLocalStaleness(approval); stale {
 			if err := s.rejectAgentUpdateApprovalWithReason(approval, reason, now); err != nil {
@@ -1504,22 +1533,23 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	if err != nil {
 		return err
 	}
+	// The node's own report may already have confirmed this update: the
+	// result is posted by the agent the update replaces, and when that post
+	// loses the race against the new agent's first hello the approval is
+	// applied before its task result lands. A result cannot un-apply what the
+	// node has proven, so it is recorded as a task result and nothing else.
+	if approval.Status == model.ApprovalApplied {
+		return nil
+	}
 	policy, ok := s.store.AgentUpdatePolicy(payload.NodeID)
 	if !ok {
 		policy = model.AgentUpdatePolicy{NodeID: payload.NodeID}
 	}
+	var status, reason, action, decision string
 	if result.Error == "" && result.ExitCode == 0 {
-		reason := agentUpdateAwaitingConfirmationReason(payload.TargetVersion)
+		reason = agentUpdateAwaitingConfirmationReason(payload.TargetVersion)
 		policy.LastError = reason
-		approval.Status = model.ApprovalApproved
-		approval.Reason = reason
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			NodeID:   approval.NodeID,
-			Action:   "agent.update.awaiting_confirmation",
-			Decision: "allow",
-			Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
-		})
+		status, action, decision = model.ApprovalApproved, "agent.update.awaiting_confirmation", "allow"
 	} else {
 		policy.LastError = taskFailureSummary(result)
 		// An execution failure is not a decision: return the approval to
@@ -1527,22 +1557,41 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		// cause and re-approve the exact same plan. Marking it rejected burned
 		// the review and left no retry path (2026-08-12 fleet rollout: 20
 		// nodes failed on the rlimit and read as "rejected" in the UI).
-		approval.Status = model.ApprovalPending
-		approval.Reason = "execution failed: " + policy.LastError
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			NodeID:   approval.NodeID,
-			Action:   "agent.update.failed",
-			Decision: "deny",
-			Reason:   policy.LastError,
-			Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
-		})
+		reason = "execution failed: " + policy.LastError
+		status, action, decision = model.ApprovalPending, "agent.update.failed", "deny"
+	}
+	// Same race, other order: the heartbeat can apply the approval between
+	// the read above and this write. Leave an applied row alone.
+	_, written, err := s.store.MutateApproval(approval.ID, func(current *model.Approval) bool {
+		if current.Status == model.ApprovalApplied {
+			return false
+		}
+		current.Status = status
+		current.Reason = reason
+		current.UpdatedAt = time.Now().UTC()
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if !written {
+		return nil
 	}
 	if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
 		return err
 	}
-	approval.UpdatedAt = time.Now().UTC()
-	return s.store.UpsertApproval(approval)
+	ev := model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   action,
+		Decision: decision,
+		Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
+	}
+	if decision == "deny" {
+		ev.Reason = policy.LastError
+	}
+	s.recordRequestAudit(r, ev)
+	return nil
 }
 
 func agentUpdateAwaitingConfirmationReason(targetVersion string) string {
@@ -1559,46 +1608,102 @@ func isAgentUpdateAwaitingConfirmation(approval model.Approval) bool {
 		strings.HasPrefix(strings.TrimSpace(approval.Reason), agentUpdateAwaitingPrefix)
 }
 
+// agentUpdateConfirmedReason is what an approval carries once the node's own
+// report, not the apply task, proved the update took. It keeps the upgrade
+// title in front so the applied list still reads "from -> to (node)".
+func agentUpdateConfirmedReason(plan, version string) string {
+	return agentUpdateDisplayReason(plan) + "; confirmed by the node's report: agent version " + strings.TrimSpace(version)
+}
+
+// agentUpdateConfirmedByReport decides whether a version the node reported
+// proves that an approved update took.
+//
+// The apply task's result is posted by the agent the update replaces, and the
+// restart that follows can cut that post short, so the result is evidence the
+// control plane may never get. The node's report is evidence it always gets.
+// Two shapes count. An approval already awaiting confirmation needs only the
+// target version to arrive. One with no result at all is confirmed by the
+// version change itself: the plan froze the version the node ran when it was
+// made, and the node now runs the target. A plan whose current and target are
+// the same (a forced reinstall) cannot be told apart from nothing having
+// happened, so it keeps waiting for its task result.
+func agentUpdateConfirmedByReport(approval model.Approval, payload agentUpdatePayload, reported string) bool {
+	if approval.Plugin != agentUpdatePlugin || approval.Status != model.ApprovalApproved {
+		return false
+	}
+	reported = strings.TrimSpace(reported)
+	if reported == "" || payload.TargetVersion != reported {
+		return false
+	}
+	if isAgentUpdateAwaitingConfirmation(approval) {
+		return true
+	}
+	return strings.TrimSpace(payload.CurrentVersion) != payload.TargetVersion
+}
+
+// confirmAgentUpdateApproval marks one approved update applied when the node's
+// reported version proves it. It reports whether it did.
+func (s *Server) confirmAgentUpdateApproval(r *http.Request, approval model.Approval, reported string, seenAt time.Time) (bool, error) {
+	payload, err := agentUpdatePayloadFromApproval(approval)
+	if err != nil || !agentUpdateConfirmedByReport(approval, payload, reported) {
+		return false, nil
+	}
+	if seenAt.IsZero() {
+		seenAt = s.now()
+	}
+	seenAt = seenAt.UTC()
+	reason := agentUpdateConfirmedReason(approval.Plan, payload.TargetVersion)
+	// Re-check under the store lock: the listing's staleness sweep and both
+	// agent report handlers can reach this row at the same time, and only the
+	// first transition out of "approved" may win.
+	_, written, err := s.store.MutateApproval(approval.ID, func(current *model.Approval) bool {
+		if current.Status != model.ApprovalApproved {
+			return false
+		}
+		current.Status = model.ApprovalApplied
+		current.Reason = reason
+		current.UpdatedAt = seenAt
+		return true
+	})
+	if err != nil || !written {
+		return false, err
+	}
+	policy, ok := s.store.AgentUpdatePolicy(approval.NodeID)
+	if !ok {
+		policy = model.AgentUpdatePolicy{NodeID: approval.NodeID}
+	}
+	policy.LastAppliedVersion = payload.TargetVersion
+	policy.LastAppliedAt = seenAt
+	policy.LastError = ""
+	if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
+		return true, err
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   "agent.update.applied",
+		Decision: "allow",
+		Reason:   reason,
+		Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
+	})
+	return true, nil
+}
+
+// reconcileAgentUpdateHeartbeat runs on every hello and metrics report and
+// confirms the node's approved updates from the version it reports.
 func (s *Server) reconcileAgentUpdateHeartbeat(r *http.Request, nodeID, version string, seenAt time.Time) error {
 	nodeID = strings.TrimSpace(nodeID)
 	version = strings.TrimSpace(version)
 	if nodeID == "" || version == "" {
 		return nil
 	}
-	if seenAt.IsZero() {
-		seenAt = s.now().UTC()
-	}
 	for _, approval := range s.store.Approvals() {
-		if approval.NodeID != nodeID || !isAgentUpdateAwaitingConfirmation(approval) {
+		if approval.NodeID != nodeID || approval.Plugin != agentUpdatePlugin || approval.Status != model.ApprovalApproved {
 			continue
 		}
-		payload, err := agentUpdatePayloadFromApproval(approval)
-		if err != nil || payload.TargetVersion != version {
-			continue
-		}
-		policy, ok := s.store.AgentUpdatePolicy(nodeID)
-		if !ok {
-			policy = model.AgentUpdatePolicy{NodeID: nodeID}
-		}
-		policy.LastAppliedVersion = payload.TargetVersion
-		policy.LastAppliedAt = seenAt.UTC()
-		policy.LastError = ""
-		approval.Status = model.ApprovalApplied
-		approval.Reason = ""
-		approval.UpdatedAt = seenAt.UTC()
-		if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
+		if _, err := s.confirmAgentUpdateApproval(r, approval, version, seenAt); err != nil {
 			return err
 		}
-		if err := s.store.UpsertApproval(approval); err != nil {
-			return err
-		}
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID:       id.New("audit"),
-			NodeID:   nodeID,
-			Action:   "agent.update.applied",
-			Decision: "allow",
-			Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
-		})
 	}
 	return nil
 }

@@ -6077,7 +6077,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if err := s.rejectLocallyStaleAgentUpdateApprovals(s.now()); err != nil {
+	if err := s.rejectLocallyStaleAgentUpdateApprovals(r, s.now()); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

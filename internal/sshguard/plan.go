@@ -29,6 +29,12 @@ type Artifacts struct {
 	SSHPort          int
 	KeepLegacyPort   bool
 	ConfirmWindowSec int
+	// Durable is the plan's claim that this arm needs no confirm: it installs
+	// no firewall, changes no port, and the node showed a key path in at plan
+	// time. The arm script re-checks the key on the host before it honours
+	// the claim, and ParseApprovalPlan refuses the claim on any plan that
+	// carries a firewall or a port.
+	Durable bool
 
 	SSHDDropIn string
 	KnockNFT   string
@@ -77,6 +83,10 @@ func RenderArmPlan(p Profile, nodeName string) (string, error) {
 		fmt.Fprintf(&b, "gated_ports: %s\n", joinInts(p.GatedPorts()))
 	}
 	fmt.Fprintf(&b, "confirm_window_sec: %d\n", window)
+	durable := p.Durable()
+	if durable {
+		fmt.Fprintf(&b, "durable: %t\n", durable)
+	}
 
 	// Every sentence below has to describe the artifacts this same function is
 	// about to render, not the shape of a profile in general. A profile with no
@@ -89,22 +99,36 @@ func RenderArmPlan(p Profile, nodeName string) (string, error) {
 	gates := p.GatesFirewall()
 
 	b.WriteString("\n## What this does, and why it cannot strand you\n\n")
-	switch {
-	case p.SSHPort != 0:
-		b.WriteString("The apply adds a port before it takes anything away, so at every instant\n")
-		b.WriteString("during the change every path that worked before still works. It then arms a\n")
-	case gates:
-		b.WriteString("The apply changes no port: it hardens sshd and narrows who may reach the\n")
-		b.WriteString("existing one. It arms a\n")
-	default:
+	if durable {
 		b.WriteString("The apply changes no port and installs no firewall: it edits sshd's\n")
 		b.WriteString("configuration and nothing else. Who can reach SSH is exactly what it was.\n")
-		b.WriteString("It arms a\n")
+		b.WriteString("\nThis node already reports a key path in, and the settings below take\n")
+		b.WriteString("nothing away from anyone holding that key. There is therefore no lockout\n")
+		b.WriteString("risk to prove against, and no revert timer is armed: the change is\n")
+		b.WriteString("permanent as soon as sshd verifies it, and no confirm approval follows.\n")
+		b.WriteString("The apply checks for an authorized key on the host before it trusts this;\n")
+		b.WriteString("if it finds none it arms the usual timer after all and says so.\n")
+		b.WriteString("\nThe settings below stop password and keyboard-interactive login and shrink\n")
+		b.WriteString("the login grace window. They do not stop anyone from reaching sshd, so the\n")
+		b.WriteString("brute force in the auth log continues, failing sooner.\n")
+	} else {
+		switch {
+		case p.SSHPort != 0:
+			b.WriteString("The apply adds a port before it takes anything away, so at every instant\n")
+			b.WriteString("during the change every path that worked before still works. It then arms a\n")
+		case gates:
+			b.WriteString("The apply changes no port: it hardens sshd and narrows who may reach the\n")
+			b.WriteString("existing one. It arms a\n")
+		default:
+			b.WriteString("The apply changes no port and installs no firewall: it edits sshd's\n")
+			b.WriteString("configuration and nothing else. Who can reach SSH is exactly what it was.\n")
+			b.WriteString("It arms a\n")
+		}
+		fmt.Fprintf(&b, "systemd timer that undoes all of it in %d seconds unless a second, separate\n", window)
+		b.WriteString("approval confirms. That second approval is the point: it is how you say you\n")
+		b.WriteString("logged in over the new path and got a shell. If you cannot, do nothing and\n")
+		b.WriteString("the node returns to its previous state on its own.\n")
 	}
-	fmt.Fprintf(&b, "systemd timer that undoes all of it in %d seconds unless a second, separate\n", window)
-	b.WriteString("approval confirms. That second approval is the point: it is how you say you\n")
-	b.WriteString("logged in over the new path and got a shell. If you cannot, do nothing and\n")
-	b.WriteString("the node returns to its previous state on its own.\n")
 	if gates {
 		b.WriteString("\nThe firewall rules below start with `ct state established,related accept`,\n")
 		b.WriteString("so applying them does not cut the session watching the apply.\n")
@@ -117,7 +141,7 @@ func RenderArmPlan(p Profile, nodeName string) (string, error) {
 			b.WriteString("below, so brute force stops reaching sshd. There is no knock sequence in\n")
 			b.WriteString("this profile, which means those sources are the only way in: check them.\n")
 		}
-	} else {
+	} else if !durable {
 		b.WriteString("\nThe settings below stop password and keyboard-interactive login and shrink\n")
 		b.WriteString("the login grace window. They do not stop anyone from reaching sshd, so the\n")
 		b.WriteString("brute force in the auth log continues, failing sooner. Narrowing the source\n")
@@ -238,6 +262,8 @@ func ParseApprovalPlan(plan string) (Artifacts, error) {
 			out.SSHPort = n
 		case "keep_legacy_port":
 			out.KeepLegacyPort = strings.TrimSpace(value) == "true"
+		case "durable":
+			out.Durable = strings.TrimSpace(value) == "true"
 		case "confirm_window_sec":
 			n, err := parseUint(value)
 			if err != nil {
@@ -287,6 +313,18 @@ func ParseApprovalPlan(plan string) (Artifacts, error) {
 	}
 	if out.KnockdConf != "" && out.KnockNFT == "" {
 		return Artifacts{}, fmt.Errorf("plan carries a knock sequence with no firewall for it to open")
+	}
+	if out.Durable && out.KnockNFT != "" {
+		// A firewall is the lockout risk the timer exists for. A plan that
+		// installs one and also claims to need no confirm is not a plan this
+		// renderer wrote, and it must not become a script that skips the timer.
+		return Artifacts{}, fmt.Errorf("plan installs a firewall and claims to be durable; a firewall arm always keeps its revert timer")
+	}
+	if out.Durable && out.SSHPort != 0 {
+		// Same reasoning, other path in: a port change is only proven by a
+		// login over the new port from outside, and the timer is what
+		// undoes it when that login never comes.
+		return Artifacts{}, fmt.Errorf("plan changes the ssh port and claims to be durable; a port change always keeps its revert timer")
 	}
 	if out.ConfirmWindowSec < MinConfirmWindowSec || out.ConfirmWindowSec > MaxConfirmWindowSec {
 		return Artifacts{}, fmt.Errorf("confirm_window_sec %d is outside [%d, %d]",

@@ -434,6 +434,10 @@ func (s *Server) handleSSHGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// From the node's report, never from the request: this field decides
+	// whether a hardening-only arm gets a revert timer (Profile.Durable), and
+	// a caller must not be able to claim a key the node has not shown.
+	profile.KeyAccessObserved = s.sshGuardPostureFor(req.NodeID).KeyAccess
 	if status, err := s.sshGuardRotation(req, &profile); err != nil {
 		writeError(w, status, err)
 		return
@@ -517,6 +521,13 @@ func (s *Server) handleSSHGuardConfirm(w http.ResponseWriter, r *http.Request, p
 		writeError(w, http.StatusNotFound, errors.New("node not found"))
 		return
 	}
+	// A durable arm armed no timer, so a confirm would be dispatched to a
+	// node with nothing pending and fail there with "nothing to confirm".
+	// Refusing here says why before an approval is minted for it.
+	if status := s.sshGuardNodeStatusFor(req.NodeID, time.Now().UTC()); status.Stage == sshGuardStageHardened {
+		writeError(w, http.StatusConflict, errors.New("this node's last arm was durable: it installed no firewall and the node already had a key path in, so no revert timer was armed and there is nothing to confirm"))
+		return
+	}
 	plan, err := sshguard.RenderConfirmPlan(req.NodeID, node.Name)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -575,6 +586,14 @@ func (s *Server) handleSSHGuardTaskResult(r *http.Request, approval model.Approv
 	if result.Error == "" && result.ExitCode == 0 {
 		approval.Status = model.ApprovalApplied
 		approval.Reason = ""
+		// A durable plan asks the host about the key before it skips the
+		// timer. When the host said no, the script armed the timer after all
+		// and printed so; the record has to carry that, or the view reports
+		// a permanent change on a node that is counting down.
+		if stage == "arm" && sshGuardArmFellBackToTimer(approval, result) {
+			approval.Reason = sshGuardTimerArmedMark
+			metadata["timer_armed_after_all"] = "true"
+		}
 		approval.UpdatedAt = time.Now().UTC()
 		if err := s.store.UpsertApproval(approval); err != nil {
 			return fmt.Errorf("mark sshguard approval applied: %w", err)
@@ -603,4 +622,17 @@ func (s *Server) handleSSHGuardTaskResult(r *http.Request, approval model.Approv
 		Metadata: metadata,
 	})
 	return nil
+}
+
+// sshGuardArmFellBackToTimer reads the arm's output for the line the script
+// prints when a durable plan found no key on the host and armed the revert
+// timer anyway. Only a durable plan can produce it; for any other plan the
+// answer is false without reading the output.
+func sshGuardArmFellBackToTimer(approval model.Approval, result model.TaskResult) bool {
+	art, err := sshguard.ParseApprovalPlan(approval.Plan)
+	if err != nil || !art.Durable {
+		return false
+	}
+	return strings.Contains(result.Stdout, sshguard.TimerArmedAfterAllLine) ||
+		strings.Contains(result.Stderr, sshguard.TimerArmedAfterAllLine)
 }

@@ -36,6 +36,11 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	}
 }
 
+// TimerArmedAfterAllLine is what a durable arm prints when the host showed
+// no authorized key and the script armed the revert timer anyway. The server
+// matches it in the task output, so it is a constant rather than prose.
+const TimerArmedAfterAllLine = "lattice sshguard: no authorized key found in a file sshd reads; arming the automatic revert after all"
+
 func armScript(art Artifacts) (string, error) {
 	var b strings.Builder
 	b.WriteString("set -e\n")
@@ -119,13 +124,36 @@ func armScript(art Artifacts) (string, error) {
 	b.WriteString("# watchdog the other apply paths use, for two reasons: the window has to\n")
 	b.WriteString("# outlive the task so a human can try to log in, and a task cgroup teardown\n")
 	b.WriteString("# kills a setsid child but not a systemd unit.\n")
+	// Any timer a previous arm left behind is stopped first, in every mode.
+	// Its unit would run the revert script this arm is about to overwrite,
+	// which on a durable arm means undoing a permanent change on a schedule
+	// nobody can see from the control plane.
 	fmt.Fprintf(&b, "\"$SYSTEMCTL\" stop %s.timer 2>/dev/null || true\n", RevertUnit)
 	fmt.Fprintf(&b, "\"$SYSTEMCTL\" reset-failed %s.timer 2>/dev/null || true\n", RevertUnit)
-	fmt.Fprintf(&b, "\"$SYSTEMD_RUN\" --on-active=%d --unit=%s --description='Lattice SSH Guard automatic revert' /bin/sh \"$REVERT\" >/dev/null 2>&1\n",
+	b.WriteString("LATTICE_SSHGUARD_DURABLE=0\n")
+	if art.Durable {
+		b.WriteString("# The plan says this arm is durable: no firewall, no port change, and the\n")
+		b.WriteString("# node showed a key path in. That claim was made from a report; the host\n")
+		b.WriteString("# is asked now.\n")
+		b.WriteString("# An authorized key in a file sshd actually reads means turning passwords\n")
+		b.WriteString("# off takes nothing from whoever holds it, so no timer is armed and no\n")
+		b.WriteString("# confirm follows. No key found means the report was wrong or stale, and\n")
+		b.WriteString("# the ordinary timer is armed after all.\n")
+		b.WriteString(authorizedKeyCheckSnippet())
+		b.WriteString("if [ \"$sshguard_key_found\" = 1 ]; then\n")
+		b.WriteString("  LATTICE_SSHGUARD_DURABLE=1\n")
+		b.WriteString("  echo 'lattice sshguard: authorized key present and no firewall in this plan; the change is durable, no revert timer armed'\n")
+		b.WriteString("else\n")
+		fmt.Fprintf(&b, "  echo '%s' >&2\n", TimerArmedAfterAllLine)
+		b.WriteString("fi\n")
+	}
+	b.WriteString("if [ \"$LATTICE_SSHGUARD_DURABLE\" = 0 ]; then\n")
+	fmt.Fprintf(&b, "  \"$SYSTEMD_RUN\" --on-active=%d --unit=%s --description='Lattice SSH Guard automatic revert' /bin/sh \"$REVERT\" >/dev/null 2>&1\n",
 		art.ConfirmWindowSec, RevertUnit)
-	fmt.Fprintf(&b, "\"$SYSTEMCTL\" list-timers %s --no-pager 2>/dev/null | grep -q %s || { echo 'lattice sshguard: revert timer did not arm; refusing to change anything' >&2; exit 1; }\n",
+	fmt.Fprintf(&b, "  \"$SYSTEMCTL\" list-timers %s --no-pager 2>/dev/null | grep -q %s || { echo 'lattice sshguard: revert timer did not arm; refusing to change anything' >&2; exit 1; }\n",
 		RevertUnit, RevertUnit)
-	b.WriteString("echo 'lattice sshguard: automatic revert armed'\n\n")
+	b.WriteString("  echo 'lattice sshguard: automatic revert armed'\n")
+	b.WriteString("fi\n\n")
 
 	b.WriteString("# From here on, any failure reverts immediately instead of waiting out the\n")
 	b.WriteString("# timer. The timer stays as the backstop for the case where this shell dies\n")
@@ -219,9 +247,13 @@ func armScript(art Artifacts) (string, error) {
 	}
 
 	b.WriteString("LATTICE_SSHGUARD_OK=1\n")
-	b.WriteString("echo '--- lattice sshguard: armed, NOT yet permanent ---'\n")
-	fmt.Fprintf(&b, "echo 'An automatic revert runs in %d seconds unless a confirm approval cancels it.'\n", art.ConfirmWindowSec)
-	b.WriteString("echo 'Open a NEW connection over the new path and get a shell before confirming.'\n")
+	b.WriteString("if [ \"$LATTICE_SSHGUARD_DURABLE\" = 1 ]; then\n")
+	b.WriteString("  echo '--- lattice sshguard: hardening applied and permanent; no confirm is needed ---'\n")
+	b.WriteString("else\n")
+	b.WriteString("  echo '--- lattice sshguard: armed, NOT yet permanent ---'\n")
+	fmt.Fprintf(&b, "  echo 'An automatic revert runs in %d seconds unless a confirm approval cancels it.'\n", art.ConfirmWindowSec)
+	b.WriteString("  echo 'Open a NEW connection over the new path and get a shell before confirming.'\n")
+	b.WriteString("fi\n")
 	if art.KnockNFT != "" {
 		// Print the counters so the operator reading the task output sees the
 		// gate's own account of what it admitted and dropped, rather than
@@ -589,4 +621,40 @@ func shellSingleQuote(value string) string {
 func dropInBasename() string {
 	i := strings.LastIndexByte(DropInPath, '/')
 	return DropInPath[i+1:]
+}
+
+// authorizedKeyCheckSnippet asks the host, not the report, whether a key can
+// open it. It sets sshguard_key_found to 1 when at least one key line sits in
+// a file sshd reads for root or for any account under /home.
+//
+// The files come from sshd's own AuthorizedKeysFile, expanded per account
+// with %h and %u the way sshd expands them; a pattern using any other token
+// is skipped rather than guessed. A key line is one whose type field is an
+// OpenSSH key type, with or without leading options, and comment lines do not
+// count. The check is read-only and never fails the script: its only effect
+// is whether the revert timer is armed.
+func authorizedKeyCheckSnippet() string {
+	var s strings.Builder
+	s.WriteString("sshguard_key_found=0\n")
+	s.WriteString("sshguard_akf=$(\"$SSHD\" -T 2>/dev/null | awk '$1==\"authorizedkeysfile\"{$1=\"\"; print; exit}')\n")
+	s.WriteString("[ -n \"$sshguard_akf\" ] || sshguard_akf='.ssh/authorized_keys'\n")
+	s.WriteString("for sshguard_home in /root /home/*; do\n")
+	s.WriteString("  [ -d \"$sshguard_home\" ] || continue\n")
+	s.WriteString("  sshguard_user=$(basename \"$sshguard_home\")\n")
+	s.WriteString("  if [ \"$sshguard_home\" = /root ]; then sshguard_user=root; fi\n")
+	s.WriteString("  for sshguard_akf_one in $sshguard_akf; do\n")
+	s.WriteString("    case \"$sshguard_akf_one\" in\n")
+	s.WriteString("      /*) sshguard_path=$sshguard_akf_one ;;\n")
+	s.WriteString("      *) sshguard_path=\"$sshguard_home/$sshguard_akf_one\" ;;\n")
+	s.WriteString("    esac\n")
+	s.WriteString("    sshguard_path=$(printf '%s' \"$sshguard_path\" | sed \"s|%h|$sshguard_home|g; s|%u|$sshguard_user|g\")\n")
+	s.WriteString("    case \"$sshguard_path\" in *%*) continue ;; esac\n")
+	s.WriteString("    [ -r \"$sshguard_path\" ] || continue\n")
+	s.WriteString("    if grep -vE '^[[:space:]]*#' \"$sshguard_path\" 2>/dev/null | grep -qE '(^|[[:space:]])(ssh-(rsa|dss|ed25519)|ecdsa-sha2-nistp[0-9]+|sk-(ssh-ed25519|ecdsa-sha2-nistp256))(@openssh\\.com)?[[:space:]]+[A-Za-z0-9+/]+=*'; then\n")
+	s.WriteString("      sshguard_key_found=1\n")
+	s.WriteString("      echo \"lattice sshguard: authorized key found in $sshguard_path\"\n")
+	s.WriteString("    fi\n")
+	s.WriteString("  done\n")
+	s.WriteString("done\n")
+	return s.String()
 }

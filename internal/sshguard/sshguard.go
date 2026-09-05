@@ -256,7 +256,38 @@ type Profile struct {
 	// failure this field is supposed to prevent.
 	OutOfBandFallback bool
 
+	// KeyAccessObserved says the node's own sshd facts show a key path in
+	// (see DerivePosture). The server sets it from the last reality report;
+	// it is never taken from the request, because it decides whether the
+	// arm gets a revert timer at all.
+	KeyAccessObserved bool
+
 	ConfirmWindowSec int
+}
+
+// Durable reports whether this profile's arm is permanent on its own, with no
+// confirm and no automatic revert.
+//
+// The revert exists for one risk: the operator changes how the node is
+// reached and cannot get back in. A hardening-only profile changes no path
+// in or out (GatesFirewall is false and SSHPort is zero), and on a node whose
+// sshd already shows a key path in, turning password authentication off takes
+// nothing away from anyone holding that key. Arming a timer there produced
+// the fleet's worst state: an arm that applied, a window nobody was watching,
+// and a revert that undid a correct change and left the row red. The apply
+// still verifies the key on the host before it skips the timer, so this is
+// the plan's claim and the host's check together, never the plan alone.
+//
+// Anything that installs the knock firewall keeps the confirm-or-revert
+// dance, because that is the genuine lockout risk. So does any change to the
+// port sshd listens on, with or without 22 kept: the observed key says the
+// holder can authenticate, not that the new port is reachable from outside.
+// A security group, a NAT that forwards only 22, or a middlebox leaves sshd
+// listening locally on a port nobody can get to, the script's own listen
+// check passes, and a migration that dropped 22 has no way back. The confirm
+// is how the operator proves the new path from where they actually sit.
+func (p Profile) Durable() bool {
+	return !p.GatesFirewall() && p.SSHPort == 0 && p.KeyAccessObserved
 }
 
 // GatesFirewall reports whether this profile installs an nftables gate at all.

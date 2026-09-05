@@ -1270,6 +1270,10 @@ func (s *Server) Handler() http.Handler {
 	// reading the arm plan already costs.
 	mux.HandleFunc("/api/sshguard/knock", s.withAuth("", s.handleSSHGuardKnockState))
 	mux.HandleFunc("/api/sshguard/knock/reveal", s.withAuth("", s.handleSSHGuardRevealKnock))
+	// status is the board's row: posture from the node's own sshd facts,
+	// the knock gate from its reality report, and the arm/confirm history
+	// as history. Same per-node scope pair as knock.
+	mux.HandleFunc("/api/sshguard/status", s.withAuth("", s.handleSSHGuardStatus))
 	mux.HandleFunc("/api/network/wireguard/plan", s.withAuth("wireguard:admin", s.handleWireGuardPlan))
 	mux.HandleFunc("/api/tunnels", s.withAuth("tunnel:admin", s.handleTunnels))
 	mux.HandleFunc("/api/tunnels/delete", s.withAuth("tunnel:admin", s.handleDeleteTunnel))

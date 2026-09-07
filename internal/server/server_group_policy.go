@@ -51,14 +51,24 @@ func (s *Server) handleGroupPolicy(w http.ResponseWriter, r *http.Request, p pri
 		if !s.requireScope(w, p, "netpolicy:admin") {
 			return
 		}
-		// A group policy definition expands across its group's nodes at plan
-		// time; the per-node apply is gated, but a confined token defining or
-		// deleting fleet policy is the definition-layer half of the same hole.
-		if s.refuseConfinedFleetWrite(w, p, "grouppolicy.upsert", "netpolicy:admin") {
-			return
-		}
 		var req model.GroupNetPolicy
 		if !decodeClientJSON(w, r, &req) {
+			return
+		}
+		// A group policy definition expands across its group's nodes at plan
+		// time; the per-node apply is gated, but a confined token defining
+		// fleet policy is the definition-layer half of the same hole (finding
+		// E, 2026-09-01 multi-operator audit). Unlike a capability gate or an
+		// SSO provider this write HAS a node dimension, the scope group's
+		// membership, so it is confined along it rather than refused outright
+		// (the first fix): the caller must hold netpolicy:admin on every node
+		// the group resolves to, the reach rule the enroll-time group join
+		// already applies. Selector-resolved members count the same as
+		// explicit ones, because they are the nodes the definition expands
+		// onto at plan time. Membership drift after this check is mediated by
+		// writes that carry their own reach checks: group edits take
+		// requireReadableNodes, and plan re-authorizes every target node.
+		if !s.requireReadableNodes(w, p, "netpolicy:admin", "this group policy", s.groupPolicyReach(req.ScopeGroupID)) {
 			return
 		}
 		view, err := s.upsertGroupPolicy(req, p)
@@ -70,6 +80,16 @@ func (s *Server) handleGroupPolicy(w http.ResponseWriter, r *http.Request, p pri
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+// groupPolicyReach is the node set a group policy write touches: the scope
+// group's resolved membership, explicit and selector alike, at the time of the
+// write. An unknown or empty group id resolves to no nodes; the upsert's own
+// validation answers for those, so the reach check never becomes a second
+// existence probe with different wording.
+func (s *Server) groupPolicyReach(groupID string) []string {
+	resolved := groups.ResolveAll(s.store.Groups(), s.store.Nodes())
+	return resolved[strings.TrimSpace(groupID)]
 }
 
 func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, p principal) (groupPolicyView, error) {
@@ -143,9 +163,6 @@ func (s *Server) handleDeleteGroupPolicy(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if s.refuseConfinedFleetWrite(w, p, "grouppolicy.delete", "netpolicy:admin") {
-		return
-	}
 	var req struct {
 		ID string `json:"id"`
 	}
@@ -156,6 +173,16 @@ func (s *Server) handleDeleteGroupPolicy(w http.ResponseWriter, r *http.Request,
 	if req.ID == "" {
 		writeError(w, http.StatusBadRequest, errors.New("id is required"))
 		return
+	}
+	// Same reach rule as the upsert above: deleting a definition withdraws
+	// policy from every node its group resolves to, so the caller must reach
+	// them all. A policy id that does not resolve falls through to the store's
+	// own not-found answer; group policies are listable under netpolicy:read,
+	// so the id is not a secret this check could turn into an oracle.
+	if gp, ok := s.store.GroupPolicy(req.ID); ok {
+		if !s.requireReadableNodes(w, p, "netpolicy:admin", "deleting this group policy", s.groupPolicyReach(gp.ScopeGroupID)) {
+			return
+		}
 	}
 	if err := s.store.DeleteGroupPolicy(req.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)

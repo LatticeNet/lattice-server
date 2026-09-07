@@ -218,17 +218,22 @@ func TestRerunNodeAuthorizesBeforeMembership(t *testing.T) {
 	}
 }
 
-// TestFleetWideWritesRefuseConfinedTokens pins findings B, D, and E of the
+// TestFleetWideWritesRefuseConfinedTokens pins findings B and D of the
 // 2026-09-01 multi-operator audit: writes whose blast radius is the whole
 // fleet carry no node id, so rbac.Allows never consults the allowlist, and a
 // node-restricted token reached past its confinement. Every such write now
 // refuses a confined principal BEFORE decoding the body: the confined token
 // sees 403 where an unrestricted one proceeds to ordinary validation.
+//
+// Finding E (group policy definitions) started in this table and moved out:
+// unlike these objects a group policy has a node dimension, its group's
+// membership, so its writes are confined by reach instead of refused outright.
+// authz_group_policy_reach_test.go pins that behaviour.
 func TestFleetWideWritesRefuseConfinedTokens(t *testing.T) {
 	handler, st := newTestServer(t)
 	st.UpsertNode(model.Node{ID: "node-a", Name: "allowed"})
 	cookies, csrf := loginSession(t, handler)
-	scopes := []string{"notify:send", "oidc:admin", "netpolicy:admin"}
+	scopes := []string{"notify:send", "oidc:admin"}
 	confined := createPAT(t, handler, cookies, csrf, scopes, []string{"node-a"})
 	unrestricted := createPAT(t, handler, cookies, csrf, scopes, nil)
 
@@ -239,8 +244,6 @@ func TestFleetWideWritesRefuseConfinedTokens(t *testing.T) {
 		"/api/notify/rules/delete",
 		"/api/auth/oidc/providers",
 		"/api/auth/oidc/providers/delete",
-		"/api/group-policies",
-		"/api/group-policies/delete",
 	}
 	for _, path := range endpoints {
 		res := doBearerJSON(t, handler, http.MethodPost, path, `{}`, confined)

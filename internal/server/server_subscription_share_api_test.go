@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -118,6 +120,76 @@ func TestRotateInvalidatesTheCachedBody(t *testing.T) {
 
 	if _, _, _, ok := s.subscriptionCache.Get(key, s.now()); ok {
 		t.Fatal("the pre-rotation body is still cached")
+	}
+}
+
+func postShare(t *testing.T, s *Server, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/subscription-shares", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.createSubscriptionShare(rec, req, principal{})
+	return rec
+}
+
+// The public URL answers a share whose user is missing exactly like a wrong
+// token, so a share created for a user that never existed would be listed as
+// live and hand out a dead link with no layer saying so. Creation is the one
+// place the operator can be told.
+func TestCreatingAShareForAMissingProxyUserIsRefused(t *testing.T) {
+	s, st := newShareTestServer(t)
+	rec := postShare(t, s, `{"slug":"openjobs-mobile","source":{"kind":"core.proxy_user","proxy_user_id":"openjobs-mobile-team"}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("create returned %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	var reply model.APIErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &reply); err != nil {
+		t.Fatalf("decode reply: %v", err)
+	}
+	if reply.Error.Code != model.APIErrorBadRequest {
+		t.Fatalf("error code %q, want %q", reply.Error.Code, model.APIErrorBadRequest)
+	}
+	if reply.Error.Message != "proxy user openjobs-mobile-team does not exist" {
+		t.Fatalf("error message %q", reply.Error.Message)
+	}
+	if shares := st.SubscriptionShares(); len(shares) != 0 {
+		t.Fatalf("a refused share was stored: %+v", shares)
+	}
+}
+
+func TestCreatingAShareForAnExistingProxyUserSucceeds(t *testing.T) {
+	s, st := newShareTestServer(t)
+	if err := st.UpsertProxyUser(model.ProxyUser{ID: "u1", Name: "u1", UUID: "uuid", SubToken: "unused"}); err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	rec := postShare(t, s, `{"slug":"team","source":{"kind":"core.proxy_user","proxy_user_id":"u1"}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create returned %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	shares := st.SubscriptionShares()
+	if len(shares) != 1 {
+		t.Fatalf("stored %d shares, want 1", len(shares))
+	}
+	if shares[0].Source.ProxyUserID != "u1" || !shares[0].Enabled {
+		t.Fatalf("stored share = %+v", shares[0])
+	}
+}
+
+// The check and the stored value must agree on normalisation. A padded id that
+// passed the check but was stored raw would be looked up raw at render time and
+// fail there, which is the same dead link this check exists to prevent.
+func TestCreatingAShareStoresTheTrimmedProxyUserID(t *testing.T) {
+	s, st := newShareTestServer(t)
+	if err := st.UpsertProxyUser(model.ProxyUser{ID: "u1", Name: "u1", UUID: "uuid", SubToken: "unused"}); err != nil {
+		t.Fatalf("upsert user: %v", err)
+	}
+	rec := postShare(t, s, `{"slug":"team","source":{"kind":"core.proxy_user","proxy_user_id":" u1 "}}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create returned %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	shares := st.SubscriptionShares()
+	if len(shares) != 1 || shares[0].Source.ProxyUserID != "u1" {
+		t.Fatalf("stored shares = %+v, want one share pointing at u1", shares)
 	}
 }
 

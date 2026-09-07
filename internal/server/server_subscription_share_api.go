@@ -102,6 +102,18 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if req.Source.Kind == model.ShareSourceCoreProxyUser {
+		// The public URL answers a share whose user is missing with the same
+		// empty 404 as a wrong token, so a share created for a user that never
+		// existed would be listed as live and hand out a dead link with no layer
+		// saying so. The id is trimmed before the lookup and before storage so
+		// the value checked here is the value the render path will look up.
+		req.Source.ProxyUserID = strings.TrimSpace(req.Source.ProxyUserID)
+		if _, ok := s.store.ProxyUser(req.Source.ProxyUserID); !ok {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("proxy user %s does not exist", req.Source.ProxyUserID))
+			return
+		}
+	}
 	if req.DefaultFormat != "" {
 		if _, err := normalizeProxySubscriptionFormat(req.DefaultFormat); err != nil {
 			writeError(w, http.StatusBadRequest, err)

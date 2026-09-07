@@ -233,7 +233,7 @@ func TestFleetWideWritesRefuseConfinedTokens(t *testing.T) {
 	handler, st := newTestServer(t)
 	st.UpsertNode(model.Node{ID: "node-a", Name: "allowed"})
 	cookies, csrf := loginSession(t, handler)
-	scopes := []string{"notify:send", "oidc:admin"}
+	scopes := []string{"notify:admin", "oidc:admin"}
 	confined := createPAT(t, handler, cookies, csrf, scopes, []string{"node-a"})
 	unrestricted := createPAT(t, handler, cookies, csrf, scopes, nil)
 

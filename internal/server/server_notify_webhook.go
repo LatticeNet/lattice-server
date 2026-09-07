@@ -36,7 +36,7 @@ import (
 //	The operator authors the webhook. The caller supplies data.
 //
 // The operator picks the event type and both templates, and only an operator
-// holding notify:send can change them. The caller supplies a bounded bag of
+// holding notify:admin can change them. The caller supplies a bounded bag of
 // scalar fields that the operator's templates may interpolate. A caller can
 // therefore influence the *words inside a message the operator already chose to
 // allow*, and nothing else: not which event fires, not which channels receive
@@ -137,7 +137,7 @@ func (s *Server) refuseConfinedWebhookRead(w http.ResponseWriter, p principal, a
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   action,
-		Scope:    "notify:send",
+		Scope:    "notify:admin",
 		Decision: "deny",
 		Reason:   "fleet-wide read refused for a node-restricted token",
 	})
@@ -145,11 +145,12 @@ func (s *Server) refuseConfinedWebhookRead(w http.ResponseWriter, p principal, a
 	return true
 }
 
-// handleNotifyWebhooks lists and upserts webhooks. It is gated on notify:send,
-// the scope that already governs channel and rule administration: a webhook is
-// a third object in the same notification system, and splitting it into its own
-// scope would mean an operator who can already route any event to any channel
-// needs a second grant to author a source for one.
+// handleNotifyWebhooks lists and upserts webhooks. It is gated on
+// notify:admin, the scope that governs channel and rule administration: a
+// webhook is a third object in the same notification system, and splitting it
+// into its own scope would mean an operator who can already route any event to
+// any channel needs a second grant to author a source for one. (Before the
+// 2026-09 split all three rode notify:send; dispatch alone stays there.)
 func (s *Server) handleNotifyWebhooks(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
@@ -166,7 +167,7 @@ func (s *Server) handleNotifyWebhooks(w http.ResponseWriter, r *http.Request, p 
 		// Same reasoning as notify channels: a webhook routes fleet-wide events
 		// outward, so a node-confined token minting one is a cross-node escape,
 		// not webhook administration.
-		if s.refuseConfinedFleetWrite(w, p, "notify.webhook.upsert", "notify:send") {
+		if s.refuseConfinedFleetWrite(w, p, "notify.webhook.upsert", "notify:admin") {
 			return
 		}
 		var req struct {
@@ -201,7 +202,7 @@ func (s *Server) handleNotifyWebhooks(w http.ResponseWriter, r *http.Request, p 
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
-			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.update", Scope: "notify:send", Metadata: map[string]string{"webhook_id": hook.ID, "event_type": hook.EventType}})
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.update", Scope: "notify:admin", Metadata: map[string]string{"webhook_id": hook.ID, "event_type": hook.EventType}})
 			writeJSON(w, http.StatusOK, toNotifyWebhookView(hook))
 			return
 		}
@@ -220,7 +221,7 @@ func (s *Server) handleNotifyWebhooks(w http.ResponseWriter, r *http.Request, p 
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.create", Scope: "notify:send", Metadata: map[string]string{"webhook_id": hook.ID, "event_type": hook.EventType}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.create", Scope: "notify:admin", Metadata: map[string]string{"webhook_id": hook.ID, "event_type": hook.EventType}})
 		writeJSON(w, http.StatusOK, notifyWebhookSecretResponse{
 			notifyWebhookView: toNotifyWebhookView(hook),
 			Secret:            auth.FormatToken(hook.ID, secret),
@@ -235,7 +236,7 @@ func (s *Server) handleDeleteNotifyWebhook(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if s.refuseConfinedFleetWrite(w, p, "notify.webhook.delete", "notify:send") {
+	if s.refuseConfinedFleetWrite(w, p, "notify.webhook.delete", "notify:admin") {
 		return
 	}
 	var req struct {
@@ -248,7 +249,7 @@ func (s *Server) handleDeleteNotifyWebhook(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.delete", Scope: "notify:send", Metadata: map[string]string{"webhook_id": req.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.delete", Scope: "notify:admin", Metadata: map[string]string{"webhook_id": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -261,7 +262,7 @@ func (s *Server) handleRotateNotifyWebhookSecret(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if s.refuseConfinedFleetWrite(w, p, "notify.webhook.rotate", "notify:send") {
+	if s.refuseConfinedFleetWrite(w, p, "notify.webhook.rotate", "notify:admin") {
 		return
 	}
 	var req struct {
@@ -290,7 +291,7 @@ func (s *Server) handleRotateNotifyWebhookSecret(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.rotate", Scope: "notify:send", Metadata: map[string]string{"webhook_id": hook.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.rotate", Scope: "notify:admin", Metadata: map[string]string{"webhook_id": hook.ID}})
 	writeJSON(w, http.StatusOK, notifyWebhookSecretResponse{
 		notifyWebhookView: toNotifyWebhookView(hook),
 		Secret:            auth.FormatToken(hook.ID, secret),
@@ -335,7 +336,7 @@ func (s *Server) handleNotifyWebhookTest(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if s.refuseConfinedFleetWrite(w, p, "notify.webhook.test", "notify:send") {
+	if s.refuseConfinedFleetWrite(w, p, "notify.webhook.test", "notify:admin") {
 		return
 	}
 	var req struct {
@@ -363,7 +364,7 @@ func (s *Server) handleNotifyWebhookTest(w http.ResponseWriter, r *http.Request,
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "notify.webhook.test",
-		Scope:    "notify:send",
+		Scope:    "notify:admin",
 		Decision: "allow",
 		Metadata: map[string]string{"webhook_id": hook.ID, "event_type": hook.EventType, "outcome": outcome.Outcome, "channels": strconv.Itoa(outcome.Channels)},
 	})

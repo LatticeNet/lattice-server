@@ -459,7 +459,7 @@ func TestRemainingPrivilegedAllowAuditsUseRequestID(t *testing.T) {
 		t.Fatal(err)
 	}
 	notifyCreate.Body.Close()
-	assertResponseAuditCorrelation(t, st, notifyCreate, "notify.channel.create", "notify:send")
+	assertResponseAuditCorrelation(t, st, notifyCreate, "notify.channel.create", "notify:admin")
 
 	notifyDelete := doJSON(t, handler, http.MethodPost, "/api/notify/channels/delete",
 		string(mustJSON(t, map[string]string{"id": notifyOut.ID})), cookies, csrf)
@@ -467,7 +467,7 @@ func TestRemainingPrivilegedAllowAuditsUseRequestID(t *testing.T) {
 	if notifyDelete.StatusCode != http.StatusOK {
 		t.Fatalf("notify channel delete failed: %d", notifyDelete.StatusCode)
 	}
-	assertResponseAuditCorrelation(t, st, notifyDelete, "notify.channel.delete", "notify:send")
+	assertResponseAuditCorrelation(t, st, notifyDelete, "notify.channel.delete", "notify:admin")
 
 	monitorCreate := doJSON(t, handler, http.MethodPost, "/api/monitors",
 		`{"name":"audit-monitor","type":"tcp","target":"example.com:443","assign_all":true}`, cookies, csrf)

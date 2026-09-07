@@ -130,6 +130,14 @@ var KnownScopes = map[string]struct{}{
 	"network:plan":    {},
 	"node:admin":      {},
 	"node:read":       {},
+	// notify split (2026-09): notify:send authorizes dispatch only (the
+	// test-send endpoint and the plugin notify capability); notify:admin
+	// governs the routing fabric, channels, rules and inbound webhooks.
+	// One flat notify:send let a dispatch-only token re-route fleet-wide
+	// security telemetry. Compat: a token holding only notify:send keeps
+	// dispatch and loses management; "*" and "notify:*" grants (the
+	// bootstrap admin holds "*") satisfy both sides of the split.
+	"notify:admin":    {},
 	"notify:send":     {},
 	"oidc:admin":      {},
 	"plugin:admin":    {},

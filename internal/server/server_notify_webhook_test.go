@@ -439,7 +439,7 @@ func TestInboundWebhookRoutesThroughExistingRules(t *testing.T) {
 	}
 }
 
-// TestNotifyWebhookRequiresScope pins the admin surface to notify:send. A
+// TestNotifyWebhookRequiresScope pins the admin surface to notify:admin. A
 // principal without it may neither read the definitions nor author one.
 func TestNotifyWebhookRequiresScope(t *testing.T) {
 	handler, _ := newTestServer(t)
@@ -454,7 +454,7 @@ func TestNotifyWebhookRequiresScope(t *testing.T) {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusForbidden {
-			t.Fatalf("%s should be forbidden without notify:send, got %d", path, rec.Code)
+			t.Fatalf("%s should be forbidden without notify:admin, got %d", path, rec.Code)
 		}
 	}
 }
@@ -705,7 +705,7 @@ func TestNotifyWebhookReadsRefuseConfinedPrincipal(t *testing.T) {
 	hookID, _ := createTestWebhook(t, handler, cookies, csrf,
 		`{"name":"Fleetwide","event_type":"fleetwide.event","title_template":"t"}`)
 
-	confined := createPAT(t, handler, cookies, csrf, []string{"notify:send"}, []string{"node-a"})
+	confined := createPAT(t, handler, cookies, csrf, []string{"notify:admin"}, []string{"node-a"})
 	for _, path := range []string{"/api/notify/webhooks", "/api/notify/webhooks/deliveries?id=" + hookID} {
 		res := doBearerJSON(t, handler, http.MethodGet, path, "", confined)
 		code := res.StatusCode
@@ -715,11 +715,11 @@ func TestNotifyWebhookReadsRefuseConfinedPrincipal(t *testing.T) {
 		}
 	}
 	// An unrestricted token with the same scope still reads it.
-	unconfined := createPAT(t, handler, cookies, csrf, []string{"notify:send"}, nil)
+	unconfined := createPAT(t, handler, cookies, csrf, []string{"notify:admin"}, nil)
 	res := doBearerJSON(t, handler, http.MethodGet, "/api/notify/webhooks", "", unconfined)
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		t.Fatalf("an unrestricted notify:send token must still read webhooks, got %d", res.StatusCode)
+		t.Fatalf("an unrestricted notify:admin token must still read webhooks, got %d", res.StatusCode)
 	}
 }
 

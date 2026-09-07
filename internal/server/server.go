@@ -1141,16 +1141,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/storage/tokens", s.withAuth("", s.handleStorageTokens))
 	mux.HandleFunc("/api/storage/tokens/revoke", s.withAuth("", s.handleRevokeStorageToken))
 	mux.HandleFunc("/api/publishing/records", s.withAuth("", s.handlePublishingRecords))
+	// The notify scope split (2026-09): notify:send is dispatch only, so it
+	// gates exactly one route here, the test-send. Everything that shapes
+	// where fleet telemetry goes, channels, rules, and the inbound webhooks
+	// that raise events, is notify:admin. Before the split one flat
+	// notify:send covered both, so a token minted to send a message could
+	// also register a channel to itself with a wildcard rule and receive
+	// fleet-wide security telemetry (finding B's sibling by scope rather than
+	// confinement). Compat is one-directional on purpose: notify:send-only
+	// tokens keep dispatch and lose management, while "*" and "notify:*"
+	// grants hold both, so the bootstrap admin and wildcard tokens are
+	// unchanged.
 	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
-	mux.HandleFunc("/api/notify/channels", s.withAuth("notify:send", s.handleNotifyChannels))
-	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:send", s.handleDeleteNotifyChannel))
-	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:send", s.handleNotifyRules))
-	mux.HandleFunc("/api/notify/rules/delete", s.withAuth("notify:send", s.handleDeleteNotifyRule))
-	mux.HandleFunc("/api/notify/webhooks", s.withAuth("notify:send", s.handleNotifyWebhooks))
-	mux.HandleFunc("/api/notify/webhooks/delete", s.withAuth("notify:send", s.handleDeleteNotifyWebhook))
-	mux.HandleFunc("/api/notify/webhooks/rotate", s.withAuth("notify:send", s.handleRotateNotifyWebhookSecret))
-	mux.HandleFunc("/api/notify/webhooks/deliveries", s.withAuth("notify:send", s.handleNotifyWebhookDeliveries))
-	mux.HandleFunc("/api/notify/webhooks/test", s.withAuth("notify:send", s.handleNotifyWebhookTest))
+	mux.HandleFunc("/api/notify/channels", s.withAuth("notify:admin", s.handleNotifyChannels))
+	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:admin", s.handleDeleteNotifyChannel))
+	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:admin", s.handleNotifyRules))
+	mux.HandleFunc("/api/notify/rules/delete", s.withAuth("notify:admin", s.handleDeleteNotifyRule))
+	mux.HandleFunc("/api/notify/webhooks", s.withAuth("notify:admin", s.handleNotifyWebhooks))
+	mux.HandleFunc("/api/notify/webhooks/delete", s.withAuth("notify:admin", s.handleDeleteNotifyWebhook))
+	mux.HandleFunc("/api/notify/webhooks/rotate", s.withAuth("notify:admin", s.handleRotateNotifyWebhookSecret))
+	mux.HandleFunc("/api/notify/webhooks/deliveries", s.withAuth("notify:admin", s.handleNotifyWebhookDeliveries))
+	mux.HandleFunc("/api/notify/webhooks/test", s.withAuth("notify:admin", s.handleNotifyWebhookTest))
 	// Public by design: the caller of an inbound webhook is a script or an
 	// appliance holding one webhook secret, not a Lattice principal. It
 	// authenticates itself against that secret inside the handler
@@ -4617,8 +4628,9 @@ func (s *Server) handleDeleteStatic(w http.ResponseWriter, r *http.Request, p pr
 }
 
 // handleNotifyTest delivers a one-off test notification through a channel whose
-// config is supplied inline. Gated by notify:send (admin in practice) because it
-// makes an outbound request to a caller-specified destination.
+// config is supplied inline. Gated by notify:send, the dispatch half of the
+// notify split, because it makes an outbound request to a caller-specified
+// destination without touching any stored channel or rule.
 func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -4910,7 +4922,7 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		// Channels route fleet-wide security telemetry to external endpoints;
 		// a confined token registering its own webhook is a cross-node exfil
 		// path, not channel administration.
-		if s.refuseConfinedFleetWrite(w, p, "notify.channel.upsert", "notify:send") {
+		if s.refuseConfinedFleetWrite(w, p, "notify.channel.upsert", "notify:admin") {
 			return
 		}
 		var req struct {
@@ -4960,7 +4972,7 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		if req.ID != "" {
 			action = "notify.channel.update"
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:send", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
 		writeJSON(w, http.StatusOK, toNotifyChannelView(channel))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -4972,7 +4984,7 @@ func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if s.refuseConfinedFleetWrite(w, p, "notify.channel.delete", "notify:send") {
+	if s.refuseConfinedFleetWrite(w, p, "notify.channel.delete", "notify:admin") {
 		return
 	}
 	var req struct {
@@ -4985,7 +4997,7 @@ func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.channel.delete", Scope: "notify:send", Metadata: map[string]string{"channel_id": req.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.channel.delete", Scope: "notify:admin", Metadata: map[string]string{"channel_id": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -4994,7 +5006,7 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"rules": s.store.NotifyRules()})
 	case http.MethodPost:
-		if s.refuseConfinedFleetWrite(w, p, "notify.rule.upsert", "notify:send") {
+		if s.refuseConfinedFleetWrite(w, p, "notify.rule.upsert", "notify:admin") {
 			return
 		}
 		var req struct {
@@ -5026,7 +5038,7 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:send", Metadata: map[string]string{"rule_id": rule.ID}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: map[string]string{"rule_id": rule.ID}})
 		writeJSON(w, http.StatusOK, rule)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -5038,7 +5050,7 @@ func (s *Server) handleDeleteNotifyRule(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if s.refuseConfinedFleetWrite(w, p, "notify.rule.delete", "notify:send") {
+	if s.refuseConfinedFleetWrite(w, p, "notify.rule.delete", "notify:admin") {
 		return
 	}
 	var req struct {
@@ -5055,7 +5067,7 @@ func (s *Server) handleDeleteNotifyRule(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.delete", Scope: "notify:send", Metadata: map[string]string{"rule_id": req.ID}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.delete", Scope: "notify:admin", Metadata: map[string]string{"rule_id": req.ID}})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

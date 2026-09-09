@@ -22,6 +22,10 @@ import (
 type Message struct {
 	Title string
 	Body  string
+	// URL is an optional click target. Bark copies it into the push `url`
+	// field when set; otherwise the channel's configured URL is used. Other
+	// channels ignore it.
+	URL string
 }
 
 // Channel delivers a Message to a single destination.
@@ -144,6 +148,10 @@ func (b Bark) Send(ctx context.Context, m Message) error {
 	title := orDefault(m.Title, "Lattice")
 	level := orDefault(b.Level, BarkDefaultLevel)
 	group := orDefault(b.Group, BarkDefaultGroup)
+	clickURL := m.URL
+	if clickURL == "" {
+		clickURL = b.URL
+	}
 
 	payload, _ := json.Marshal(struct {
 		DeviceKey string `json:"device_key"`
@@ -152,7 +160,7 @@ func (b Bark) Send(ctx context.Context, m Message) error {
 		Level     string `json:"level"`
 		Group     string `json:"group"`
 		URL       string `json:"url,omitempty"`
-	}{b.Key, title, m.Body, level, group, b.URL})
+	}{b.Key, title, m.Body, level, group, clickURL})
 	req, err := http.NewRequest(http.MethodPost, base+"/push", bytes.NewReader(payload))
 	if err != nil {
 		return err
@@ -166,8 +174,8 @@ func (b Bark) Send(ctx context.Context, m Message) error {
 	query := url.Values{}
 	query.Set("level", level)
 	query.Set("group", group)
-	if b.URL != "" {
-		query.Set("url", b.URL)
+	if clickURL != "" {
+		query.Set("url", clickURL)
 	}
 	endpoint := fmt.Sprintf("%s/%s/%s/%s?%s", base, b.Key,
 		url.PathEscape(title), url.PathEscape(m.Body), query.Encode())

@@ -172,6 +172,22 @@ func TestBarkDefaultsLevelGroupAndTitle(t *testing.T) {
 	}
 }
 
+func TestBarkPrefersMessageURLOverChannelURL(t *testing.T) {
+	var got map[string]string
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	b := Bark{BaseURL: srv.URL, Key: "devkey", URL: "https://lattice.example/alerts", Client: srv.Client()}
+	if err := b.Send(context.Background(), Message{Title: "Approval pending", Body: "needs review", URL: "/approvals/ap-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got["url"] != "/approvals/ap-1" {
+		t.Fatalf("message url must win over channel url, got %v", got)
+	}
+}
+
 func TestBarkFallsBackToPathFormOnMethodNotAllowed(t *testing.T) {
 	var requests []string
 	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

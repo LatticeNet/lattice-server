@@ -276,6 +276,10 @@ type Server struct {
 	// reworded notification silently changes who receives it; new callers say
 	// what the event is and are unaffected by prose.
 	emitNotifyTyped func(eventType, title, body string)
+	// emitNotifyMessage is the typed seam that can carry a click URL (Bark's
+	// `url` field). Production points at sendNotifyMessage. Title-only callers
+	// keep using emitNotifyTyped.
+	emitNotifyMessage func(eventType string, m notify.Message)
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
 	// subscriptionDecoy shapes the answer every non-servable subscription request
@@ -587,6 +591,7 @@ func New(opts Options) (*Server, error) {
 	}
 	s.emitNotify = s.notifyEvent
 	s.emitNotifyTyped = s.notifyEventTyped
+	s.emitNotifyMessage = s.sendNotifyMessage
 	s.pluginRPC = plugin.NewRPCRegistry()
 	// In-core providers are wired once at boot and never unregistered, so without a
 	// lifecycle predicate a disabled plugin's backend kept serving — disable would only
@@ -5080,8 +5085,15 @@ func (s *Server) notifyEvent(title, body string) {
 // notifyEventTyped is notifyEvent with the event type supplied instead of
 // inferred. Callers that know what happened should use it.
 func (s *Server) notifyEventTyped(eventType, title, body string) {
+	s.sendNotifyMessage(eventType, notify.Message{Title: title, Body: body})
+}
+
+// sendNotifyMessage fans a typed message out to matching channels. Callers
+// that have a click URL (approval.pending) pass it on Message.URL so Bark
+// can put it in the push `url` field.
+func (s *Server) sendNotifyMessage(eventType string, m notify.Message) {
 	channels := s.store.EnabledNotifyChannels()
-	deliveries := s.planNotifyDeliveries(eventType, title, body, channels, s.store.EnabledNotifyRules())
+	deliveries := s.planNotifyDeliveriesMsg(eventType, m, channels, s.store.EnabledNotifyRules())
 	if len(deliveries) == 0 {
 		return
 	}
@@ -5107,6 +5119,10 @@ type notifyDelivery struct {
 }
 
 func (s *Server) planNotifyDeliveries(eventType, title, body string, channels []model.NotifyChannel, rules []model.NotifyRule) []notifyDelivery {
+	return s.planNotifyDeliveriesMsg(eventType, notify.Message{Title: title, Body: body}, channels, rules)
+}
+
+func (s *Server) planNotifyDeliveriesMsg(eventType string, msg notify.Message, channels []model.NotifyChannel, rules []model.NotifyRule) []notifyDelivery {
 	if len(channels) == 0 {
 		return nil
 	}
@@ -5115,7 +5131,7 @@ func (s *Server) planNotifyDeliveries(eventType, title, body string, channels []
 		if len(built) == 0 {
 			return nil
 		}
-		return []notifyDelivery{{Channels: built, Message: notify.Message{Title: title, Body: body}}}
+		return []notifyDelivery{{Channels: built, Message: msg}}
 	}
 	channelsByID := make(map[string]model.NotifyChannel, len(channels))
 	for _, channel := range channels {
@@ -5144,10 +5160,13 @@ func (s *Server) planNotifyDeliveries(eventType, title, body string, channels []
 		if len(built) == 0 {
 			continue
 		}
-		vars := map[string]string{"event_type": eventType, "title": title, "body": body}
-		outTitle := renderNotifyTemplate(rule.TitleTemplate, title, vars)
-		outBody := renderNotifyTemplate(rule.BodyTemplate, body, vars)
-		deliveries = append(deliveries, notifyDelivery{Channels: built, Message: notify.Message{Title: outTitle, Body: outBody}})
+		vars := map[string]string{"event_type": eventType, "title": msg.Title, "body": msg.Body}
+		if msg.URL != "" {
+			vars["url"] = msg.URL
+		}
+		outTitle := renderNotifyTemplate(rule.TitleTemplate, msg.Title, vars)
+		outBody := renderNotifyTemplate(rule.BodyTemplate, msg.Body, vars)
+		deliveries = append(deliveries, notifyDelivery{Channels: built, Message: notify.Message{Title: outTitle, Body: outBody, URL: msg.URL}})
 	}
 	return deliveries
 }

@@ -89,12 +89,15 @@ func (r approvalAutoRule) matches(a model.Approval) bool {
 // answer the terminal state (e.g. already auto-approved) instead of the
 // pre-evaluation pending one. Status transitions of existing approvals
 // (approve/reject/dismiss/apply) keep calling store.UpsertApproval directly —
-// policies only ever act on fresh pending submissions.
+// policies only ever act on fresh pending submissions. A typed
+// approval.pending notify fires only when the stored row still needs a human.
 func (s *Server) submitApproval(ctx context.Context, a model.Approval) (model.Approval, error) {
 	if err := s.store.UpsertApproval(a); err != nil {
 		return model.Approval{}, err
 	}
-	return s.evaluateApprovalAutoRules(ctx, a), nil
+	stored := s.evaluateApprovalAutoRules(ctx, a)
+	s.notifyApprovalPending(stored)
+	return stored, nil
 }
 
 // evaluateApprovalAutoRules runs the first matching auto-approve rule against

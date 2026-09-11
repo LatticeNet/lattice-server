@@ -1011,8 +1011,8 @@ func TestKnockPlanTellsTheOperatorHowToActuallySendIt(t *testing.T) {
 	if !strings.Contains(plan, "payload") {
 		t.Fatal("the plan must state that each datagram carries a payload; without it the obvious command silently does nothing")
 	}
-	if !strings.Contains(plan, "printf k | nc -u -w1") {
-		t.Fatal("the plan must give a command that actually sends a datagram")
+	if !strings.Contains(plan, "printf k >/dev/udp/") || !strings.Contains(plan, "knock -u -d 500") {
+		t.Fatal("the plan must give commands that actually send a datagram")
 	}
 	// Naming the broken form is the point: an operator who already typed it
 	// needs to recognise it here, not merely be shown a different one.

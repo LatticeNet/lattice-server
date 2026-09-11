@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 )
@@ -158,25 +159,79 @@ func KnockSequenceDigest(ports []int) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// KnockCommand renders the shell an operator runs to open the port.
-//
-// It is the same command the arm plan prints, kept in one place so the console
-// and the plan cannot disagree about how to knock. The payload byte is not
-// decoration: an empty datagram advances knockd to stage one and no further,
-// so `nc -u -z` looks like it worked and leaves the port shut.
-func (k KnockSequence) KnockCommand(address string, sshPort int) string {
-	addr := strings.TrimSpace(address)
-	if addr == "" {
-		addr = "HOST"
+// KnockInstall is how to get the knock client on one platform.
+type KnockInstall struct {
+	Platform string `json:"platform"`
+	Command  string `json:"command"`
+}
+
+// KnockCommand is one way to open the gate and log in.
+type KnockCommand struct {
+	// ID is what a client keys on: "knock" for the packaged client, "bash"
+	// for the form that needs nothing installed.
+	ID string `json:"id"`
+	// Install lists how to get the tool the command runs. Empty when the
+	// command needs only bash.
+	Install []KnockInstall `json:"install,omitempty"`
+	// Command is one line: the knock, then ssh, joined by && so a knock that
+	// could not run does not fall through to a login that hangs on a shut port.
+	Command string `json:"command"`
+}
+
+// knockAddressPlaceholder stands in for an address the node did not report,
+// or reported as something other than an IP literal. Pasted into a shell it is
+// a redirection error, so an incomplete command fails before it sends anything.
+const knockAddressPlaceholder = "<node-address>"
+
+// knockAddress returns the address a command may carry. The value comes from
+// the node's own report and ends up in text a person pastes into a shell, so
+// it is accepted only if it parses as an IP literal.
+func knockAddress(raw string) string {
+	a, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil {
+		return knockAddressPlaceholder
 	}
+	return a.String()
+}
+
+// KnockCommands renders the ways an operator opens the port and logs in.
+//
+// They are the commands the arm plan prints, kept in one place so the console
+// and the plan cannot disagree about how to knock. The first is the knock
+// client from the knockd package: -u sends every hit as UDP, which is all the
+// gate listens for, and -d 500 spaces the hits so they still arrive in order
+// through a proxy. The second needs nothing but bash, whose /dev/udp
+// redirection sends the byte printf writes. Both carry a payload (the client
+// sends one byte per hit), and that is not decoration: an empty datagram
+// advances knockd to stage one and no further, so `nc -u -z` looks like it
+// worked and leaves the port shut.
+//
+// -4 is left off on purpose. knock 0.7, still what Ubuntu 22.04 ships, does
+// not know the flag, and the address is already a literal.
+func (k KnockSequence) KnockCommands(address string, sshPort int) []KnockCommand {
+	addr := knockAddress(address)
 	ports := make([]string, 0, len(k.Ports))
 	for _, port := range k.Ports {
 		ports = append(ports, strconv.Itoa(port))
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "for p in %s; do printf k | nc -u -w1 %s $p; sleep 1; done", strings.Join(ports, " "), addr)
+	seq := strings.Join(ports, " ")
+	login := ""
 	if sshPort > 0 {
-		fmt.Fprintf(&b, "\nssh -p %d root@%s", sshPort, addr)
+		login = fmt.Sprintf(" && ssh -p %d root@%s", sshPort, addr)
 	}
-	return b.String()
+	return []KnockCommand{
+		{
+			ID: "knock",
+			Install: []KnockInstall{
+				{Platform: "macOS", Command: "brew install knock"},
+				{Platform: "Debian, Ubuntu", Command: "sudo apt install knockd"},
+				{Platform: "Fedora", Command: "sudo dnf install knock"},
+			},
+			Command: fmt.Sprintf("knock -u -d 500 %s %s%s", addr, seq, login),
+		},
+		{
+			ID:      "bash",
+			Command: fmt.Sprintf("bash -c 'for p in %s; do printf k >/dev/udp/%s/$p; sleep 0.5; done'%s", seq, addr, login),
+		},
+	}
 }

@@ -137,9 +137,16 @@ func TestKnockRevealRequiresStepUp(t *testing.T) {
 			t.Fatalf("port %d: want %d, got %v (order is part of the secret)", i, want, ports[i])
 		}
 	}
-	cmd, _ := out["command"].(string)
-	if !strings.Contains(cmd, "printf k") {
-		t.Fatalf("the reveal must hand over a command that actually opens the gate: %q", cmd)
+	commands, _ := out["commands"].([]any)
+	if len(commands) != 2 {
+		t.Fatalf("the reveal must hand over the knock client and the bash form: %v", out["commands"])
+	}
+	for _, raw := range commands {
+		c, _ := raw.(map[string]any)
+		cmd, _ := c["command"].(string)
+		if !strings.Contains(cmd, "23853") {
+			t.Fatalf("the reveal must hand over commands that actually knock the sequence: %q", cmd)
+		}
 	}
 }
 

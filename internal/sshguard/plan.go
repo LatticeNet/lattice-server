@@ -2,8 +2,6 @@ package sshguard
 
 import (
 	"fmt"
-	"net/netip"
-	"strconv"
 	"strings"
 )
 
@@ -424,20 +422,26 @@ func knockInstructions(p Profile) string {
 	b.WriteString("The sequence is UDP and each datagram must carry a payload. An empty\n")
 	b.WriteString("datagram advances knockd to stage 1 and no further, with no error on\n")
 	b.WriteString("either side, so `nc -u -z` and anything else that sends nothing will\n")
-	b.WriteString("look like it worked and leave the port shut.\n\n")
+	b.WriteString("look like it worked and leave the port shut. Both commands below send a\n")
+	b.WriteString("payload; use whichever the machine you connect from has.\n\n")
 
-	addr := p.knockDisplayAddress()
-	ports := make([]string, 0, len(p.Knock.Ports))
-	for _, port := range p.Knock.Ports {
-		ports = append(ports, strconv.Itoa(port))
+	// The same renderer the console's reveal uses, so the plan and the page
+	// cannot spell the knock two ways.
+	for _, c := range (KnockSequence{Ports: p.Knock.Ports}).KnockCommands(p.Address, p.loginPort()) {
+		switch c.ID {
+		case "knock":
+			b.WriteString("With the knock client from the knockd package:\n\n")
+			for _, in := range c.Install {
+				fmt.Fprintf(&b, "- %s: `%s`\n", in.Platform, in.Command)
+			}
+			if len(c.Install) > 0 {
+				b.WriteString("\n")
+			}
+		case "bash":
+			b.WriteString("With nothing installed but bash:\n\n")
+		}
+		fmt.Fprintf(&b, "```sh\n%s\n```\n\n", c.Command)
 	}
-	sshPort := p.loginPort()
-
-	b.WriteString("```sh\n")
-	fmt.Fprintf(&b, "for p in %s; do printf k | nc -u -w1 %s $p; sleep 1; done\n",
-		strings.Join(ports, " "), addr)
-	fmt.Fprintf(&b, "ssh -p %d root@%s\n", sshPort, addr)
-	b.WriteString("```\n\n")
 
 	b.WriteString("The knock and the login must leave from the same address. The gate opens\n")
 	b.WriteString("for the source the knock arrived from, so sending one through a proxy and\n")
@@ -455,20 +459,6 @@ func knockInstructions(p Profile) string {
 		b.WriteString("the new one from a source this node sees before confirming.\n")
 	}
 	return b.String()
-}
-
-// knockDisplayAddress returns an address safe to paste into the document. The
-// value is reported by the agent, so it is accepted only if it parses as an IP
-// literal; anything else becomes a placeholder rather than reaching a document
-// a human reads to decide whether to approve.
-func (p Profile) knockDisplayAddress() string {
-	if a, err := netip.ParseAddr(strings.TrimSpace(p.Address)); err == nil {
-		if a.Is6() {
-			return "[" + a.String() + "]"
-		}
-		return a.String()
-	}
-	return "<node-address>"
 }
 
 // loginPort is the port the operator should actually connect to after knocking:

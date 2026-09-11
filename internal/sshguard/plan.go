@@ -430,7 +430,7 @@ func knockInstructions(p Profile) string {
 	for _, c := range (KnockSequence{Ports: p.Knock.Ports}).KnockCommands(p.Address, p.loginPort()) {
 		switch c.ID {
 		case "knock":
-			b.WriteString("With the knock client from the knockd package:\n\n")
+			b.WriteString("With the knock client (package knock, or knockd on Debian and Ubuntu):\n\n")
 			for _, in := range c.Install {
 				fmt.Fprintf(&b, "- %s: `%s`\n", in.Platform, in.Command)
 			}

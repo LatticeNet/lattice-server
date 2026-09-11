@@ -477,7 +477,7 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 		"address":         state.Address,
 		// The knock client first, then the form that needs only bash. Both
 		// are the plan's own commands, rendered by the same function.
-		"commands": state.Sequence.KnockCommands(state.Address, state.SSHPort),
+		"commands": state.Sequence.KnockCommands(state.Address, sshguard.LoginPort(state.SSHPort, state.GatedPorts)),
 		// What a rotation request hands back as rotate_from_sha256. Returned
 		// here and nowhere else: the ports are already in this response, and
 		// a digest of three ports is not a secret on its own.

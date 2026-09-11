@@ -461,14 +461,28 @@ func knockInstructions(p Profile) string {
 	return b.String()
 }
 
-// loginPort is the port the operator should actually connect to after knocking:
-// the new port when the profile moves sshd, otherwise the lowest gated port.
+// loginPort is the port the operator should actually connect to after knocking.
 func (p Profile) loginPort() int {
-	if p.SSHPort != 0 {
-		return p.SSHPort
+	return LoginPort(p.SSHPort, p.GatedPorts())
+}
+
+// LoginPort is the port to log in on after knocking: the port an arm moved
+// sshd to, otherwise the lowest port it gates, otherwise 22. An arm that gates
+// sshd where it already listens records ssh_port 0, and the reveal reads that
+// header back; resolving it here is what lets the reveal print the same login
+// line the plan printed instead of dropping it.
+func LoginPort(sshPort int, gated []int) int {
+	if sshPort > 0 {
+		return sshPort
 	}
-	if gated := p.GatedPorts(); len(gated) > 0 {
-		return gated[0]
+	lowest := 0
+	for _, port := range gated {
+		if port > 0 && (lowest == 0 || port < lowest) {
+			lowest = port
+		}
+	}
+	if lowest > 0 {
+		return lowest
 	}
 	return 22
 }

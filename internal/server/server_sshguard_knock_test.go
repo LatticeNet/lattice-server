@@ -150,6 +150,52 @@ func TestKnockRevealRequiresStepUp(t *testing.T) {
 	}
 }
 
+// An arm can gate sshd where it already listens instead of moving it, and its
+// plan header then records ssh_port 0. The plan's own instructions log in on
+// the gated port; the reveal has to say the same instead of dropping the login.
+func TestKnockRevealLogsInOnTheGatedPortWhenTheArmKeptSSHD(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	enrolSSHGuard(t, st, "node-a")
+	plan, err := sshguard.RenderArmPlan(sshguard.Profile{
+		NodeID: "node-a", GatePorts: []int{22},
+		Hardening: sshguard.DefaultHardening(), MgmtSources: []string{"203.0.113.5"},
+		ConfirmWindowSec: 900,
+		Knock:            &sshguard.KnockPolicy{Ports: knockTestPorts, SeqTimeoutSec: 15, OpenFor: "12h"},
+	}, "Node A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := st.UpsertApproval(model.Approval{
+		ID: "approval_arm", NodeID: "node-a", Status: model.ApprovalApplied, CreatedAt: now, UpdatedAt: now,
+		Plugin: sshGuardPlugin, Action: sshGuardArmAction, Plan: plan, ActorID: "admin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	grant := issueStepUpGrant(t, handler, cookies, csrf)
+	res := doJSON(t, handler, http.MethodPost, "/api/sshguard/knock/reveal",
+		`{"node_id":"node-a","step_up_grant":"`+grant+`"}`, cookies, csrf)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(res.Body)
+		t.Fatalf("reveal: want 200, got %d (%s)", res.StatusCode, raw)
+	}
+	out := knockBody(t, res)
+	commands, _ := out["commands"].([]any)
+	if len(commands) != 2 {
+		t.Fatalf("want two commands, got %v", out["commands"])
+	}
+	for _, raw := range commands {
+		c, _ := raw.(map[string]any)
+		cmd, _ := c["command"].(string)
+		if !strings.Contains(cmd, "&& ssh -p 22 root@") {
+			t.Fatalf("an arm that kept sshd on 22 must still print the login on 22: %q", cmd)
+		}
+	}
+}
+
 // The fourth axiom says a person's reach is an agent's reach. This is the
 // deliberate exception, so the refusal has to name itself rather than read as
 // a generic authorization failure an agent would retry.

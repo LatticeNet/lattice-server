@@ -138,6 +138,40 @@ func TestKnockCommandsSendAPayloadOverUDP(t *testing.T) {
 	}
 }
 
+// The login port is the one the arm moved sshd to, else the lowest gated port,
+// else 22; the plan and the reveal both resolve it here.
+func TestLoginPortFallsBackToTheLowestGatedPort(t *testing.T) {
+	for _, c := range []struct {
+		ssh   int
+		gated []int
+		want  int
+	}{
+		{58394, []int{22, 58394}, 58394},
+		{0, []int{2222, 22}, 22},
+		{0, []int{0, 2200}, 2200},
+		{0, nil, 22},
+	} {
+		if got := LoginPort(c.ssh, c.gated); got != c.want {
+			t.Fatalf("LoginPort(%d, %v) = %d, want %d", c.ssh, c.gated, got, c.want)
+		}
+	}
+}
+
+// An IPv6 literal goes in bare. knock, bash's /dev/udp and ssh user@host all
+// take it that way; brackets are scp and URL syntax and break all three. (The
+// gate's allow set is IPv4 only, so the knock itself will not open anything
+// for an IPv6 source; the rendering still has to be right.)
+func TestKnockCommandsPrintIPv6Bare(t *testing.T) {
+	for _, c := range (KnockSequence{Ports: []int{20001, 20002, 20003}}).KnockCommands("2001:db8::7", 2222) {
+		if strings.Contains(c.Command, "[") {
+			t.Fatalf("%s: an IPv6 literal must not be bracketed: %s", c.ID, c.Command)
+		}
+		if !strings.Contains(c.Command, "root@2001:db8::7") {
+			t.Fatalf("%s: the login must carry the bare address: %s", c.ID, c.Command)
+		}
+	}
+}
+
 // The address comes from the node's own report and lands in text a person
 // pastes into a shell. Anything that is not an IP literal, including nothing
 // at all, becomes a placeholder, and an unknown ssh port renders no login.

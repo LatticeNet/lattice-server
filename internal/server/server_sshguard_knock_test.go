@@ -39,6 +39,9 @@ func seedSSHGuardArm(t *testing.T, st interface {
 		NodeID: a.NodeID, SSHPort: 58394, KeepLegacyPort: true,
 		Hardening: sshguard.DefaultHardening(), MgmtSources: mgmt,
 		ConfirmWindowSec: 900,
+		// Set so every reveal test reads a plan that carries the control plane
+		// install line, the way a server with a public URL writes it.
+		ControlPlane: "https://lattice.example.com",
 	}
 	if len(ports) > 0 {
 		profile.Knock = &sshguard.KnockPolicy{Ports: ports, SeqTimeoutSec: 15, OpenFor: "12h"}

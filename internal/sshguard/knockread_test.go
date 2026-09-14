@@ -100,7 +100,7 @@ func TestKnockCommandsMatchThePlanInstructions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commands := seq.KnockCommands("203.0.113.9", profile.SSHPort)
+	commands := seq.KnockCommands("203.0.113.9", profile.SSHPort, "")
 	if len(commands) != 2 {
 		t.Fatalf("want the knock client and the bash form, got %d commands", len(commands))
 	}
@@ -122,7 +122,7 @@ func TestKnockCommandsMatchThePlanInstructions(t *testing.T) {
 // are pinned because every flag is a compatibility claim: knock 0.7, still the
 // Ubuntu 22.04 package, rejects -4.
 func TestKnockCommandsSendAPayloadOverUDP(t *testing.T) {
-	commands := KnockSequence{Ports: []int{20001, 20002, 20003}}.KnockCommands("198.51.100.4", 22)
+	commands := KnockSequence{Ports: []int{20001, 20002, 20003}}.KnockCommands("198.51.100.4", 22, "")
 	byID := map[string]string{}
 	for _, c := range commands {
 		byID[c.ID] = c.Command
@@ -162,7 +162,7 @@ func TestLoginPortFallsBackToTheLowestGatedPort(t *testing.T) {
 // gate's allow set is IPv4 only, so the knock itself will not open anything
 // for an IPv6 source; the rendering still has to be right.)
 func TestKnockCommandsPrintIPv6Bare(t *testing.T) {
-	for _, c := range (KnockSequence{Ports: []int{20001, 20002, 20003}}).KnockCommands("2001:db8::7", 2222) {
+	for _, c := range (KnockSequence{Ports: []int{20001, 20002, 20003}}).KnockCommands("2001:db8::7", 2222, "") {
 		if strings.Contains(c.Command, "[") {
 			t.Fatalf("%s: an IPv6 literal must not be bracketed: %s", c.ID, c.Command)
 		}
@@ -177,7 +177,7 @@ func TestKnockCommandsPrintIPv6Bare(t *testing.T) {
 // at all, becomes a placeholder, and an unknown ssh port renders no login.
 func TestKnockCommandsRefuseAnAddressThatIsNotAnIP(t *testing.T) {
 	for _, bad := range []string{"", "  ", "evil.example.com", "1.2.3.4; rm -rf /", "$(id)", "`id`"} {
-		for _, c := range (KnockSequence{Ports: []int{20001, 20002, 20003}}).KnockCommands(bad, 0) {
+		for _, c := range (KnockSequence{Ports: []int{20001, 20002, 20003}}).KnockCommands(bad, 0, "") {
 			if !strings.Contains(c.Command, "<node-address>") {
 				t.Fatalf("address %q: a missing address must be visible in the command: %s", bad, c.Command)
 			}

@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# lattice-knock: open a port-knock gate with a UDP sequence.
+#
+# Usage:
+#   knock [-u] [-d MS] [-v] HOST PORT PORT PORT
+#   knock [-d MS] HOST PORT,PORT,PORT
+#   knock HOST                     sequence from the config file
+#   knock --version | --help
+#
+# The first form is the argument shape of the packaged knock client (the
+# `knock` in the knockd package), so a command copied from the Lattice
+# console works whichever of the two PATH finds first.
+#
+# Things this client does on purpose, each learned from a knock that looked
+# like it worked and opened nothing, or that left the sequence behind:
+#
+# - It sends UDP only, with a one-byte payload per port. An unanswered TCP
+#   knock makes the kernel retransmit the SYN, so knockd sees the same port
+#   again before the next one and never advances; an empty UDP datagram
+#   advances knockd one stage at most.
+# - It resolves the host itself, to IPv4, before sending. An ssh alias is not
+#   a DNS name, and nc fails silently on a name it cannot resolve. The gate
+#   admits IPv4 sources only.
+# - It never prints the sequence, and by default it sends from inside bash
+#   through /dev/udp, so no child process carries a port in its argv where ps,
+#   /proc or execve auditing could read it. The sequence is a credential.
+set -u
+
+KNOCK_VERSION="0.1.0-alpha.1"
+
+CONF="${KNOCK_CONF:-$HOME/.config/lattice/knock.conf}"
+WANT="${KNOCK_PORTS:-3}"
+DELAY_MS="${KNOCK_DELAY_MS:-500}"
+SETTLE_MS="${KNOCK_SETTLE_MS:-1000}"
+SENDER="${KNOCK_SENDER:-auto}"
+QUIET="${KNOCK_QUIET:-0}"
+VERBOSE=0
+
+die() {
+  printf 'knock: %s\n' "$1" >&2
+  exit "${2:-1}"
+}
+
+say() {
+  [ "$VERBOSE" -eq 1 ] && printf 'knock: %s\n' "$*" >&2
+  return 0
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  knock [-u] [-d MS] [-v] HOST PORT PORT PORT
+  knock [-d MS] HOST PORT,PORT,PORT
+  knock HOST                   sequence looked up in the config file
+
+Options:
+  -u, --udp        accepted for the packaged client's syntax; knocks are always UDP
+  -d, --delay MS   milliseconds between knocks (default 500)
+  -v, --verbose    say which address and sender are used (never the ports)
+  -4, --ipv4       accepted; knocks are always IPv4
+  -V, --version    print the version
+  -h, --help       this help
+
+Environment:
+  KNOCK_CONF       config file, default ~/.config/lattice/knock.conf
+                   one line per host: "<host-or-alias> <port>,<port>,<port>"
+  KNOCK_PORTS      how many ports a sequence has, default 3 (Lattice SSH Guard)
+  KNOCK_DELAY_MS   default for -d
+  KNOCK_SETTLE_MS  wait after the last knock before returning, default 1000
+  KNOCK_SENDER     bash (/dev/udp, the default) or nc; nc shows each port in ps
+  KNOCK_BEFORE     command run before any packet leaves, with the host and the
+                   resolved address as arguments; a non-zero exit stops the knock
+  KNOCK_QUIET      1 to drop the note about ports on the command line
+
+Ports typed on the command line stay in your shell history. The config file
+keeps them out of it; so does a leading space, in shells set to ignore such
+lines. Knock from the address you will connect from: the gate opens for the
+source the knock arrived from.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) printf 'knock %s\n' "$KNOCK_VERSION"; exit 0 ;;
+    -u|--udp|-4|--ipv4) shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    -d|--delay)
+      [ $# -ge 2 ] || die "$1 needs a number of milliseconds" 2
+      DELAY_MS="$2"; shift 2 ;;
+    --delay=*) DELAY_MS="${1#--delay=}"; shift ;;
+    -d[0-9]*) DELAY_MS="${1#-d}"; shift ;;
+    -6|--ipv6) die "the knock gate admits IPv4 sources only; -6 cannot open it" 2 ;;
+    --) shift; break ;;
+    -*) die "unknown option $1 (see knock --help)" 2 ;;
+    *) break ;;
+  esac
+done
+
+case "$DELAY_MS" in ''|*[!0-9]*) die "-d takes whole milliseconds, got '$DELAY_MS'" 2 ;; esac
+case "$SETTLE_MS" in ''|*[!0-9]*) die "KNOCK_SETTLE_MS takes whole milliseconds" 2 ;; esac
+case "$WANT" in ''|*[!0-9]*|0) die "KNOCK_PORTS must be a positive whole number" 2 ;; esac
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+
+HOST="$1"
+shift
+# Everything below hands HOST to ssh, getent, dig or host, which would read a
+# leading dash as an option.
+case "$HOST" in -*) die "a host cannot start with '-': $HOST" 2 ;; esac
+
+# The ssh alias first: `ssh -G` expands ~/.ssh/config, so `knock prod` knocks
+# the machine `ssh prod` would reach.
+TARGET=""
+if command -v ssh >/dev/null 2>&1; then
+  TARGET=$(ssh -G "$HOST" 2>/dev/null | awk '/^hostname /{print $2; exit}')
+fi
+[ -n "$TARGET" ] || TARGET="$HOST"
+case "$TARGET" in -*) die "ssh resolves $HOST to a name starting with '-'" 2 ;; esac
+
+lookup() {
+  if [ -z "$1" ] || [ ! -r "$CONF" ]; then
+    return 1
+  fi
+  awk -v h="$1" '$1 !~ /^#/ && $1 == h { print $2; found = 1; exit } END { exit !found }' "$CONF"
+}
+
+FROM_ARGS=0
+if [ $# -gt 0 ]; then
+  # Ports given apart and ports given as one comma list are the same sequence.
+  SEQ=$(IFS=,; printf '%s' "$*")
+  FROM_ARGS=1
+else
+  SEQ=$(lookup "$HOST") || SEQ=$(lookup "$TARGET") ||
+    die "no sequence on the command line, and none for $HOST in $CONF"
+fi
+
+PORTS=()
+IFS=',' read -r -a RAW <<< "$SEQ"
+for p in "${RAW[@]}"; do
+  case "$p" in
+    *:udp) p="${p%:udp}" ;;
+    *:*) die "the gate takes UDP only; the sequence has another protocol suffix (not printed)" ;;
+  esac
+  case "$p" in ''|*[!0-9]*) die "the sequence has an entry that is not a port (not printed)" ;; esac
+  if [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
+    die "the sequence has a port outside 1-65535 (not printed)"
+  fi
+  PORTS+=("$p")
+done
+# A sequence one port short never completes, yet the knock still reports
+# success and the ssh after it hangs on a closed port. A trailing comma drops
+# a port exactly like that, so the length is checked, not assumed.
+[ "${#PORTS[@]}" -eq "$WANT" ] || die "a sequence has $WANT ports, this one has ${#PORTS[@]} (not printed)"
+
+if [ "$FROM_ARGS" -eq 1 ] && [ "$QUIET" != 1 ]; then
+  printf 'knock: note: ports on the command line stay in shell history; %s keeps them out (KNOCK_QUIET=1 hides this)\n' "$CONF" >&2
+fi
+
+is_ipv4() {
+  printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+resolve_ipv4() {
+  if is_ipv4 "$1"; then printf '%s\n' "$1"; return 0; fi
+  if command -v getent >/dev/null 2>&1; then
+    getent ahostsv4 "$1" 2>/dev/null | awk 'NR == 1 { print $1; exit }'
+  elif command -v dscacheutil >/dev/null 2>&1; then
+    dscacheutil -q host -a name "$1" 2>/dev/null | awk '/^ip_address:/ && $2 ~ /\./ { print $2; exit }'
+  elif command -v dig >/dev/null 2>&1; then
+    dig +short A "$1" 2>/dev/null | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -1
+  elif command -v host >/dev/null 2>&1; then
+    host -t A "$1" 2>/dev/null | awk '/has address/ { print $4; exit }'
+  fi
+}
+
+ADDR=$(resolve_ipv4 "$TARGET")
+is_ipv4 "${ADDR:-}" || die "cannot resolve $TARGET to an IPv4 address"
+
+# Opening /dev/udp without writing sends nothing; it only proves this bash was
+# built with network redirections.
+bash_udp_works() {
+  (printf '' > /dev/udp/127.0.0.1/9) 2>/dev/null
+}
+if [ "$SENDER" = auto ]; then
+  if bash_udp_works; then
+    SENDER=bash
+  elif command -v nc >/dev/null 2>&1; then
+    SENDER=nc
+  else
+    die "this bash cannot send through /dev/udp and nc is not installed"
+  fi
+fi
+case "$SENDER" in
+  bash) bash_udp_works || die "KNOCK_SENDER=bash, but this bash cannot send through /dev/udp" ;;
+  nc) command -v nc >/dev/null 2>&1 || die "KNOCK_SENDER=nc, but nc is not installed" ;;
+  *) die "KNOCK_SENDER must be bash or nc" 2 ;;
+esac
+say "host $HOST, address $ADDR, sender $SENDER, ${#PORTS[@]} ports, ${DELAY_MS}ms apart"
+
+if [ -n "${KNOCK_BEFORE:-}" ]; then
+  sh -c "$KNOCK_BEFORE" knock-before "$HOST" "$ADDR" || die "KNOCK_BEFORE stopped the knock" 3
+fi
+
+send() {
+  # The payload byte is the point: an empty datagram opens nothing.
+  if [ "$SENDER" = nc ]; then
+    printf 'k' | nc -u -w1 "$ADDR" "$1" >/dev/null 2>&1
+  else
+    printf 'k' > "/dev/udp/$ADDR/$1"
+  fi
+}
+
+gap=$(awk -v ms="$DELAY_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
+settle=$(awk -v ms="$SETTLE_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
+last=$(( ${#PORTS[@]} - 1 ))
+for i in "${!PORTS[@]}"; do
+  # In the background so nc's one-second wait does not stretch the spacing;
+  # each datagram leaves when its sender starts, so the order holds.
+  send "${PORTS[$i]}" &
+  [ "$i" -lt "$last" ] && sleep "$gap"
+done
+wait
+sleep "$settle"
+printf 'knocked %s (%s)\n' "$HOST" "$ADDR"

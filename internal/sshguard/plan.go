@@ -427,10 +427,11 @@ func knockInstructions(p Profile) string {
 
 	// The same renderer the console's reveal uses, so the plan and the page
 	// cannot spell the knock two ways.
-	for _, c := range (KnockSequence{Ports: p.Knock.Ports}).KnockCommands(p.Address, p.loginPort()) {
+	for _, c := range (KnockSequence{Ports: p.Knock.Ports}).KnockCommands(p.Address, p.loginPort(), p.ControlPlane) {
 		switch c.ID {
 		case "knock":
-			b.WriteString("With the knock client (package knock, or knockd on Debian and Ubuntu):\n\n")
+			b.WriteString("With a knock client, lattice-knock or the packaged knock (knockd on Debian\n")
+			b.WriteString("and Ubuntu), which take the same arguments:\n\n")
 			for _, in := range c.Install {
 				fmt.Fprintf(&b, "- %s: `%s`\n", in.Platform, in.Command)
 			}

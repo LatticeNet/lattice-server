@@ -1326,6 +1326,9 @@ func (s *Server) Handler() http.Handler {
 	// Public on purpose: it is an updater for a node that already runs the
 	// agent, so it neither takes a credential nor hands one out.
 	mux.HandleFunc(agentInstallScriptPath, s.handleAgentInstallScript)
+	// Public on purpose as well: the lattice-knock client for operators whose
+	// network cannot reach GitHub. No credential goes in or comes out.
+	mux.HandleFunc(knockToolPathPrefix, s.handleKnockTool)
 	mux.Handle("/", s.staticHandler())
 	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
 }

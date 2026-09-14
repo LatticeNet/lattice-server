@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+
+	"github.com/LatticeNet/lattice-server/internal/knocktool"
 )
 
 // Reading a knock sequence back out of an approval plan.
@@ -197,18 +199,25 @@ func knockAddress(raw string) string {
 // KnockCommands renders the ways an operator opens the port and logs in.
 //
 // They are the commands the arm plan prints, kept in one place so the console
-// and the plan cannot disagree about how to knock. The first is the knock
-// client from the knockd package: -u sends every hit as UDP, which is all the
-// gate listens for, and -d 500 spaces the hits so they still arrive in order
-// through a proxy. The second needs nothing but bash, whose /dev/udp
-// redirection sends the byte printf writes. Both carry a payload (the client
-// sends one byte per hit), and that is not decoration: an empty datagram
-// advances knockd to stage one and no further, so `nc -u -z` looks like it
-// worked and leaves the port shut.
+// and the plan cannot disagree about how to knock. The first runs a knock
+// client: -u sends every hit as UDP, which is all the gate listens for, and
+// -d 500 spaces the hits so they still arrive in order through a proxy. That
+// is the argument shape of the packaged knock from the knockd project, and
+// lattice-knock takes the same arguments, so the line works with either. The
+// second needs nothing but bash, whose /dev/udp redirection sends the byte
+// printf writes. Both carry a payload (the clients send one byte per hit), and
+// that is not decoration: an empty datagram advances knockd to stage one and
+// no further, so `nc -u -z` looks like it worked and leaves the port shut.
 //
 // -4 is left off on purpose. knock 0.7, still what Ubuntu 22.04 ships, does
 // not know the flag, and the address is already a literal.
-func (k KnockSequence) KnockCommands(address string, sshPort int) []KnockCommand {
+//
+// The install lines lead with lattice-knock. controlPlane is this server's
+// public URL: given one, the first line installs from the control plane, for
+// networks that cannot reach GitHub; the GitHub line is pinned to the sha256
+// the server carries. The arm plan passes the URL the server set on the
+// profile, so the plan and the console offer the same sources.
+func (k KnockSequence) KnockCommands(address string, sshPort int, controlPlane string) []KnockCommand {
 	addr := knockAddress(address)
 	ports := make([]string, 0, len(k.Ports))
 	for _, port := range k.Ports {
@@ -219,14 +228,20 @@ func (k KnockSequence) KnockCommands(address string, sshPort int) []KnockCommand
 	if sshPort > 0 {
 		login = fmt.Sprintf(" && ssh -p %d root@%s", sshPort, addr)
 	}
+	install := make([]KnockInstall, 0, 5)
+	if cmd, ok := knocktool.ControlPlaneInstallCommand(controlPlane); ok {
+		install = append(install, KnockInstall{Platform: "This control plane", Command: cmd})
+	}
+	install = append(install,
+		KnockInstall{Platform: "GitHub", Command: knocktool.GitHubInstallCommand()},
+		KnockInstall{Platform: "macOS (Homebrew)", Command: "brew install knock"},
+		KnockInstall{Platform: "Debian, Ubuntu", Command: "sudo apt install knockd"},
+		KnockInstall{Platform: "Fedora", Command: "sudo dnf install knock"},
+	)
 	return []KnockCommand{
 		{
-			ID: "knock",
-			Install: []KnockInstall{
-				{Platform: "macOS", Command: "brew install knock"},
-				{Platform: "Debian, Ubuntu", Command: "sudo apt install knockd"},
-				{Platform: "Fedora", Command: "sudo dnf install knock"},
-			},
+			ID:      "knock",
+			Install: install,
 			Command: fmt.Sprintf("knock -u -d 500 %s %s%s", addr, seq, login),
 		},
 		{

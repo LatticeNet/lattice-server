@@ -240,6 +240,12 @@ type Profile struct {
 	// peer chose has no business shaping it.
 	Address string
 
+	// ControlPlane is this server's public URL, used only so the plan can offer
+	// the control plane as a place to install the knock client, for networks
+	// that cannot reach GitHub. It is server configuration, and the renderer
+	// drops it unless it is a plain https URL that is inert in a shell.
+	ControlPlane string
+
 	// OutOfBandFallback says the operator's fallback is a path that does not
 	// use SSH at all, which on this fleet means the node's Lattice terminal.
 	//

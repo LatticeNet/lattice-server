@@ -84,11 +84,11 @@ func TestExpiringListsEveryKindInDateOrder(t *testing.T) {
 		days                  int
 	}
 	want := []row{
-		{expiringKindMachine, "mp-c", expiringStateOverdue, "/inventory?node=node-b", -4},
+		{expiringKindMachine, "mp-c", expiringStateOverdue, "/inventory?machine=mp-c", -4},
 		{expiringKindVPNUser, "vpnuser_alice", expiringStateDue, "/plugins/latticenet.vpn-core/users", 2},
-		{expiringKindMachine, "mp-a", expiringStateDue, "/inventory?node=node-a", 7},
+		{expiringKindMachine, "mp-a", expiringStateDue, "/inventory?machine=mp-a", 7},
 		{expiringKindTLS, "mon_doh", expiringStateUpcoming, "/monitoring/mon_doh", 11},
-		{expiringKindMachine, "mp-b", expiringStateAuto, "/inventory?node=node-b", 21},
+		{expiringKindMachine, "mp-b", expiringStateAuto, "/inventory?machine=mp-b", 21},
 		{expiringKindShare, "share_cdcd", expiringStateUpcoming, "/platform/publishing?origin=share&share=share_cdcd", 47},
 	}
 	if len(out.Items) != len(want) {

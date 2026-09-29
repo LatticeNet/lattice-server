@@ -225,7 +225,7 @@ func machineExpiringItem(profile model.MachineProfile, node model.Node, now time
 		Days:     days,
 		State:    state,
 		Reminder: &expiringReminder{Enabled: profile.RemindersEnabled},
-		Href:     "/inventory?node=" + url.QueryEscape(profile.NodeID),
+		Href:     "/inventory?machine=" + url.QueryEscape(profile.ID),
 	}
 	if profile.PriceCents > 0 && profile.Currency != "" {
 		item.CostCents, item.Currency = profile.PriceCents, profile.Currency

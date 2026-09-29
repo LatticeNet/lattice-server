@@ -165,8 +165,10 @@ func TestExpiringNamesKindsTheSessionCannotRead(t *testing.T) {
 		hidden    []string
 	}{
 		// Node-confined: its own node's machine only, node-b's are simply not
-		// there, and the fleet-wide kinds cannot be read at all.
-		{"inventory on node-a", []string{"inventory:read", "proxy:read", "proxy:admin", "monitor:read"}, []string{"node-a"}, []string{"mp-a"}, []string{expiringKindVPNUser, expiringKindShare, expiringKindTLS}},
+		// there, and the fleet-wide kinds cannot be read at all. Certificates
+		// are readable as a kind; the server-evaluated one belongs to no node,
+		// so, as in the monitors list, it is outside this session's domain.
+		{"inventory on node-a", []string{"inventory:read", "proxy:read", "proxy:admin", "monitor:read"}, []string{"node-a"}, []string{"mp-a"}, []string{expiringKindVPNUser, expiringKindShare}},
 		{"monitor reader", []string{"monitor:read"}, nil, []string{"mon_doh"}, []string{expiringKindMachine, expiringKindVPNUser, expiringKindShare}},
 		{"vpn-core reader", []string{"vpncore:read"}, nil, []string{"vpnuser_alice"}, []string{expiringKindMachine, expiringKindShare, expiringKindTLS}},
 		// proxy:admin does not imply proxy:read here, exactly as /api/proxy/users.
@@ -202,5 +204,45 @@ func TestExpiringNamesKindsTheSessionCannotRead(t *testing.T) {
 				t.Fatalf("ids=%v hidden_kinds=%v, want %v %v", ids, out.HiddenKinds, tc.ids, tc.hidden)
 			}
 		})
+	}
+}
+
+// Certificate rows follow the monitors list: a node-confined session with
+// monitor:read reads the kind, sees a certificate watched from its own node,
+// and sees nothing of the server-evaluated one, which belongs to no node.
+// tls_certificate is a hidden kind only without monitor:read.
+func TestExpiringCertificatesFollowMonitorVisibility(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return now }
+	seedExpiring(t, srv, st)
+	// The API creates certificate monitors without nodes today; this one is
+	// stored directly to pin the row rule to the monitors list's predicate.
+	if err := st.UpsertMonitor(model.Monitor{ID: "mon_node_a", Name: "node-a panel", Type: model.MonitorTypeTLS, Target: "panel.example.org:443", Enabled: true, NodeIDs: []string{"node-a"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddMonitorResult(model.MonitorResult{MonitorID: "mon_node_a", At: now, Success: true, CertNotAfter: time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)}); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+	get := func(scopes, allowlist []string) expiringResponse {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/api/expiring", nil)
+		req.Header.Set("Authorization", "Bearer "+createPAT(t, handler, cookies, csrf, scopes, allowlist))
+		return getExpiring(t, handler, req)
+	}
+	confined := get([]string{"monitor:read"}, []string{"node-a"})
+	if len(confined.Items) != 1 || confined.Items[0].ID != "mon_node_a" {
+		t.Fatalf("confined monitor reader: %+v", confined.Items)
+	}
+	if !reflect.DeepEqual(confined.HiddenKinds, []string{expiringKindMachine, expiringKindVPNUser, expiringKindShare}) {
+		t.Fatalf("confined hidden_kinds = %v", confined.HiddenKinds)
+	}
+	fleet := get([]string{"monitor:read"}, nil)
+	if len(fleet.Items) != 2 || fleet.Items[0].ID != "mon_doh" || fleet.Items[1].ID != "mon_node_a" {
+		t.Fatalf("unrestricted monitor reader: %+v", fleet.Items)
+	}
+	if none := get([]string{"inventory:read"}, nil); !reflect.DeepEqual(none.HiddenKinds, []string{expiringKindVPNUser, expiringKindShare, expiringKindTLS}) {
+		t.Fatalf("without monitor:read: %v", none.HiddenKinds)
 	}
 }

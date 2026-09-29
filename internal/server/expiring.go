@@ -19,8 +19,9 @@ import (
 // under the scope its own list endpoint requires. A kind the session cannot
 // read at all is named in hidden_kinds so the console can say so; nothing is
 // counted, because a count would tell a confined session how large the rest of
-// the fleet is. A node-confined session gets its own nodes' machines, and the
-// other nodes are outside its domain rather than hidden from it.
+// the fleet is. A node-confined session gets its own nodes' machines and
+// monitors, and the other nodes are outside its domain rather than hidden
+// from it.
 const (
 	expiringKindMachine = "machine_renewal"
 	expiringKindVPNUser = "vpn_user"
@@ -100,15 +101,18 @@ func parseExpiringWithin(raw string) (int, error) {
 
 func (s *Server) expiringFor(p principal, now time.Time, within int) expiringResponse {
 	out := expiringResponse{GeneratedAt: now.UTC(), WithinDays: within, Items: []expiringItem{}, Totals: []expiringTotal{}, HiddenKinds: []string{}}
-	// Which kinds the session can read at all. VPN users, shares and TLS
-	// certificates are fleet-wide objects: their list endpoints refuse a
-	// node-restricted session, and so does this.
+	// Which kinds the session can read at all. VPN users and shares are
+	// fleet-wide objects: their list endpoints refuse a node-restricted
+	// session, and so does this. Machines and certificates follow their list
+	// endpoints too: the scope admits the kind, and each row is then checked
+	// the way that list checks it, so a node-confined session sees its own
+	// nodes' rows.
 	unrestricted := !principalHasNodeRestriction(p)
 	readable := map[string]bool{
 		expiringKindMachine: rbac.Allows(p.Principal, "inventory:read", ""),
 		expiringKindVPNUser: unrestricted && rbac.Allows(p.Principal, "proxy:read", ""),
 		expiringKindShare:   unrestricted && rbac.Allows(p.Principal, "proxy:admin", ""),
-		expiringKindTLS:     unrestricted && rbac.Allows(p.Principal, "monitor:read", ""),
+		expiringKindTLS:     rbac.Allows(p.Principal, "monitor:read", ""),
 	}
 	for _, kind := range []string{expiringKindMachine, expiringKindVPNUser, expiringKindShare, expiringKindTLS} {
 		if !readable[kind] {

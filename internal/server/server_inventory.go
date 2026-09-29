@@ -959,6 +959,7 @@ func (s *Server) evaluateMachineReminders(now time.Time, onlyID string, allow fu
 			rolledFrom string
 			fire       renewalReminderFire
 			fires      bool
+			written    model.MachineProfile
 		)
 		profile, ok, err := s.store.UpdateMachineProfile(snapshot.ID, func(p *model.MachineProfile) bool {
 			changed := false
@@ -971,12 +972,19 @@ func (s *Server) evaluateMachineReminders(now time.Time, onlyID string, allow fu
 				p.LastRemindedKey = reminderKey(p.NextRenewal, f.OffsetDays)
 				fire, fires, changed = f, true, true
 			}
+			written = *p
 			return changed
 		})
 		if err != nil {
-			// Whatever was already recorded is still delivered.
-			s.emitRenewalReminders(due, now)
-			return fired, err
+			// A write can commit and then fail to sync its directory. The
+			// store then holds what was written, so the reminder it records
+			// is still sent; only a write that did not land stops the run.
+			if !ok || profile.LastRemindedKey != written.LastRemindedKey || !profile.NextRenewal.Equal(written.NextRenewal) {
+				// Whatever was already recorded is still delivered.
+				s.emitRenewalReminders(due, now)
+				return fired, err
+			}
+			s.logger.Printf("inventory reminders: %s written but not durable: %v", profile.ID, err)
 		}
 		if !ok {
 			continue // deleted since the list was read

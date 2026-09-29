@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -452,5 +454,46 @@ func TestReminderDayWalkWithServerDownGaps(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("walk:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// A write that commits and then fails to sync its directory still holds the
+// new cursor, so the reminder it recorded is sent, not lost. A directory the
+// process may write and enter but not read lets the rename land and fails
+// the fsync that follows it, which is exactly that case.
+func TestReminderSentWhenItsWriteCommitsWithoutDurability(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not bind root")
+	}
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustUpsertNodes(t, st, "node-a")
+	mustUpsertProfiles(t, st, model.MachineProfile{ID: "mp-a", NodeID: "node-a", Label: "gmami-jp1", NextRenewal: day(2026, 10, 6), RemindDaysBefore: []int{7}, RemindersEnabled: true})
+	sent := captureRenewalNotifications(t, srv)
+
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if f, err := os.Open(dir); err == nil {
+		f.Close()
+		t.Skip("this platform lets the directory be read without the read bit")
+	}
+	fired, err := srv.evaluateMachineReminders(time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC), "", nil)
+	if err != nil {
+		t.Fatalf("a committed write must not fail the run: %v", err)
+	}
+	if len(fired) != 1 || len(*sent) != 1 || (*sent)[0].title != "Lattice renewal due in 7d: gmami-jp1" {
+		t.Fatalf("the recorded reminder was not sent: fired=%+v sent=%+v", fired, *sent)
+	}
+	if stored, _ := st.MachineProfile("mp-a"); stored.LastRemindedKey != "2026-10-06:7" {
+		t.Fatalf("cursor = %q", stored.LastRemindedKey)
 	}
 }

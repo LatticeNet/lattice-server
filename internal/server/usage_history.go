@@ -255,20 +255,29 @@ func (s *Server) periodUsage(userID string, from, to time.Time) (usageCounter, [
 // period sum from the day rows plus whatever this report is about to add.
 // Only the status and notification cursors flow back: UsedBytes stays the
 // lifetime total.
+//
+// When the projection belongs to an identity, the identity owns whether it is
+// enabled, when it expires and its quota: the vpn-core editor writes those to
+// the identity, and a migrated identity's legacy record keeps whatever it held
+// at migration. They are read from the identity so its edits drive status and
+// alerts, the same values /api/expiring and the Users page show.
 func (s *Server) quotaEvaluate(user model.ProxyUser, vpnUser *VpnUser, now time.Time, pending usageCounter) (model.ProxyUser, []proxyUserNotificationFire) {
-	user.Status = derivedProxyUserStatusAt(user, now)
 	if vpnUser == nil {
+		user.Status = derivedProxyUserStatusAt(user, now)
 		return nextProxyUserNotifications(user, now)
 	}
-	start, _, ok := vpnUserQuotaPeriod(*vpnUser, now)
-	if !ok {
-		return nextProxyUserNotifications(user, now)
-	}
-	used, _ := s.periodUsage(vpnUser.ID, start, now)
 	projection := user
-	projection.UsedBytes = used.total() + pending.total()
+	projection.Enabled = vpnUser.Enabled
+	projection.ExpiresAt = vpnUser.ExpiresAt
+	projection.TrafficLimitBytes = vpnUser.QuotaBytes
+	period := ""
+	if start, _, ok := vpnUserQuotaPeriod(*vpnUser, now); ok {
+		used, _ := s.periodUsage(vpnUser.ID, start, now)
+		projection.UsedBytes = used.total() + pending.total()
+		period = store.UsageDay(start)
+	}
 	projection.Status = derivedProxyUserStatusAt(projection, now)
-	projection, alerts := nextProxyUserNotificationsForPeriod(projection, now, store.UsageDay(start))
+	projection, alerts := nextProxyUserNotificationsForPeriod(projection, now, period)
 	user.Status = projection.Status
 	user.LastQuotaNotifiedKey = projection.LastQuotaNotifiedKey
 	user.LastExpiryNotifiedKey = projection.LastExpiryNotifiedKey

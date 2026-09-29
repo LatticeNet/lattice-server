@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,25 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 	fired := []proxyUserNotificationFire{}
 	found := onlyID == ""
 	changed := false
+	stored := make(map[string]bool, len(users))
+	for _, user := range users {
+		stored[user.ID] = true
+	}
+	// An identity whose lines have reported no traffic has no stored
+	// projection yet. It is evaluated from the identity all the same, and its
+	// projection is written only when an alert fires, to hold the cursor.
+	accts := make([]string, 0, len(identities))
+	for acct := range identities {
+		if !stored[acct] {
+			accts = append(accts, acct)
+		}
+	}
+	sort.Strings(accts)
+	for _, acct := range accts {
+		projection := vpnUserUsageProjection(identities[acct])
+		projection.ID = acct
+		users = append(users, projection)
+	}
 	for _, user := range users {
 		if onlyID != "" && user.ID != onlyID {
 			continue
@@ -46,7 +66,7 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 		}
 		updated, alerts := s.quotaEvaluate(user, identity, now, usageCounter{})
 		if len(alerts) == 0 {
-			if updated.Status != originalStatus {
+			if stored[user.ID] && updated.Status != originalStatus {
 				if err := s.store.UpsertProxyUser(updated); err != nil {
 					return nil, err
 				}

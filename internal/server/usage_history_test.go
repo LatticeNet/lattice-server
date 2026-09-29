@@ -167,11 +167,17 @@ func TestQuotaPeriodSumsAndAlerts(t *testing.T) {
 		t.Fatalf("new period alert: %+v", alerts)
 	}
 	// A lifetime quota keeps the old key shape and the old cursor semantics.
-	// The limit is the identity's, which owns the quota.
+	// The limit and the usage are the identity's: 900 of 1000 from its day rows.
 	alice := f.alice
 	alice.QuotaBytes = 1000
+	if err := srv.store.ApplyProxyUsage(store.ProxyUsageUpdate{DayUsers: []store.UsageDayUser{{UserID: alice.ID, Day: "20260901", Uplink: 400, Downlink: 500}}}); err != nil {
+		t.Fatal(err)
+	}
 	lifetime := vpnUserUsageProjection(alice)
-	lifetime.UsedBytes, lifetime.LastQuotaNotifiedKey = 900, "quota:1000:80"
+	if _, alerts := srv.quotaEvaluate(lifetime, &alice, now, usageCounter{}); len(alerts) != 1 || alerts[0].Key != "quota:1000:80" {
+		t.Fatalf("without a cursor 900 of 1000 alerts: %+v", alerts)
+	}
+	lifetime.LastQuotaNotifiedKey = "quota:1000:80"
 	if _, alerts := srv.quotaEvaluate(lifetime, &alice, now, usageCounter{}); len(alerts) != 0 {
 		t.Fatalf("lifetime cursor must still suppress: %+v", alerts)
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // proxyNotifyCapture records the untyped notifications the proxy user alerts
@@ -206,5 +207,41 @@ func TestProxyExpiryDigestIsOneMessagePerRun(t *testing.T) {
 	}
 	if again, _ := srv.evaluateProxyUserNotifications(now.Add(time.Hour), ""); len(again) != 0 {
 		t.Fatalf("repeated: %+v", again)
+	}
+}
+
+// A lifetime quota on an identity is measured with the identity's retained
+// day rows, the figure the Users page draws its quota bar from, not the
+// legacy record's running total: a stale total above the limit does not
+// alert, and the day rows crossing 80 percent do.
+func TestProxyQuotaLifetimeReadsIdentityUsage(t *testing.T) {
+	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
+	srv := usageTestServer(t, now)
+	erin := VpnUser{ID: "vpnuser_erin", Email: "erin@example.com", Enabled: true, QuotaBytes: 1000,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "5b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"}}}
+	if err := srv.putVpnUser(erin); err != nil {
+		t.Fatal(err)
+	}
+	seed := func(day string, up, down int64) {
+		t.Helper()
+		if err := srv.store.ApplyProxyUsage(store.ProxyUsageUpdate{DayUsers: []store.UsageDayUser{{UserID: erin.ID, Day: day, Uplink: up, Downlink: down}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("20260601", 100, 100)
+	seed("20260928", 50, 50)
+	projection := vpnUserUsageProjection(erin)
+	projection.UsedBytes = 5000 // the legacy running total, far above the limit
+	updated, alerts := srv.quotaEvaluate(projection, &erin, now, usageCounter{})
+	if len(alerts) != 0 || updated.Status != model.ProxyUserStatusActive || updated.UsedBytes != 5000 {
+		t.Fatalf("300 of 1000 must not alert: alerts=%+v status=%q used=%d", alerts, updated.Status, updated.UsedBytes)
+	}
+	if views := srv.vpnUserUsageViews([]VpnUser{erin}, now); views[0].UsedPeriodBytes != 300 {
+		t.Fatalf("the Users page figure is %d, the evaluator read 300", views[0].UsedPeriodBytes)
+	}
+	// This report's 550 not yet written lands the identity at 850 of 1000.
+	_, alerts = srv.quotaEvaluate(updated, &erin, now, usageCounter{Downlink: 550})
+	if len(alerts) != 1 || alerts[0].ThresholdPercent != 80 || alerts[0].UsedBytes != 850 || alerts[0].Key != "quota:1000:80" {
+		t.Fatalf("80 percent from the day rows: %+v", alerts)
 	}
 }

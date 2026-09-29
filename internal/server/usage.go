@@ -188,7 +188,9 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 // all, or yyyymmdd..yyyymmdd; 30d by default); the older fields keep their
 // snapshot-based shape for existing clients. series is the same day rows per
 // node and role per day, and previous is the egress of the equal-length
-// period before (today, 7d and 30d only).
+// period before (today, 7d and 30d only). Egress is the bytes on exit, direct
+// and shared lines: those leave the fleet where they are counted, while entry
+// and relay lines hand them to another node.
 func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "query":

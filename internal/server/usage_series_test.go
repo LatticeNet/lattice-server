@@ -34,11 +34,16 @@ func queryUsage(t *testing.T, srv *Server, period string) usageQueryWire {
 	return out
 }
 
-func isEgressRole(role string) bool { return role == usageRoleExit || role == usageRoleDirect }
+// isEgressRole is the contract's definition, stated here rather than taken
+// from the code under test: exit, direct and shared lines leave the fleet.
+func isEgressRole(role string) bool {
+	return role == usageRoleExit || role == usageRoleDirect || role == usageRoleShared
+}
 
 // The daily series is the lines' own day rows per node and role: summed over
-// the window, its exit and direct bytes are exactly the used_bytes of the
-// exit and direct lines rows. previous is the same egress one period back.
+// the window, its exit, direct and shared bytes are exactly the used_bytes of
+// the exit, direct and shared lines rows. previous is the same egress one
+// period back.
 func TestUsageSeriesEgressMatchesLines(t *testing.T) {
 	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	srv := usageTestServer(t, now)
@@ -105,12 +110,13 @@ func TestUsageSeriesEgressMatchesLines(t *testing.T) {
 			t.Fatalf("series is missing role %s: %+v", role, out.Series.Rows)
 		}
 	}
-	// 09-28: direct-a 300, the unknown tag 10 (direct, as its lines row), exit 1500.
-	if daily[5] != 1810 || daily[4] != 0 {
+	// 09-28: direct-a 300, the unknown tag 10 (direct, as its lines row), exit
+	// 1500, shared 24. The entry lines' 3000 forward inside the fleet.
+	if daily[5] != 1834 || daily[4] != 0 {
 		t.Fatalf("daily egress = %v", daily)
 	}
-	// 09-16..09-22 holds -7, -10 and -13: 12610 + 18010 + 23410.
-	if out.Previous == nil || out.Previous.From != "20260916" || out.Previous.To != "20260922" || out.Previous.EgressBytes != 54030 {
+	// 09-16..09-22 holds -7, -10 and -13: 12634 + 18034 + 23434.
+	if out.Previous == nil || out.Previous.From != "20260916" || out.Previous.To != "20260922" || out.Previous.EgressBytes != 54102 {
 		t.Fatalf("previous = %+v", out.Previous)
 	}
 
@@ -125,7 +131,7 @@ func TestUsageSeriesEgressMatchesLines(t *testing.T) {
 		t.Fatalf("range: days=%v previous=%+v", ranged.Series.Days, ranged.Previous)
 	}
 	today := queryUsage(t, srv, "today")
-	if len(today.Series.Days) != 1 || today.Previous == nil || today.Previous.From != "20260928" || today.Previous.To != "20260928" || today.Previous.EgressBytes != 1810 {
+	if len(today.Series.Days) != 1 || today.Previous == nil || today.Previous.From != "20260928" || today.Previous.To != "20260928" || today.Previous.EgressBytes != 1834 {
 		t.Fatalf("today: days=%v previous=%+v", today.Series.Days, today.Previous)
 	}
 }

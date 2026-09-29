@@ -578,7 +578,7 @@ func (ctx *usageAttributionContext) windowRoles(w usageWindow) map[string]map[st
 
 // usageSeries sums the loaded day rows per node and role for each UTC day of
 // the window, oldest first. It reads the same rows and roles as the lines
-// report, so a day's exit plus direct bytes are that day's egress.
+// report, so a day's egress-role bytes are that day's egress.
 func (ctx *usageAttributionContext) usageSeries(w usageWindow) usageSeries {
 	out := usageSeries{Days: []string{}, Rows: []usageSeriesRow{}}
 	from := w.From
@@ -636,14 +636,24 @@ func (ctx *usageAttributionContext) usageSeries(w usageWindow) usageSeries {
 	return out
 }
 
-// usageEgress is what left the fleet over a loaded window: bytes on exit and
-// direct lines.
+// usageEgressRole reports whether a line's bytes leave the fleet where they
+// are counted: exit, direct and shared lines. Entry and relay lines forward
+// to another node inside the fleet, which counts the same bytes again.
+func usageEgressRole(role string) bool {
+	switch role {
+	case usageRoleExit, usageRoleDirect, usageRoleShared:
+		return true
+	default:
+		return false
+	}
+}
+
+// usageEgress is what left the fleet over a loaded window.
 func (ctx *usageAttributionContext) usageEgress(w usageWindow) int64 {
 	var egress int64
 	for nodeID, byTag := range w.sumWindow(w.fromDay(), w.toDay()) {
 		for tag, wl := range byTag {
-			switch lineRole(ctx.lineFacts(nodeID, tag, wl.LineHashID)) {
-			case usageRoleExit, usageRoleDirect:
+			if usageEgressRole(lineRole(ctx.lineFacts(nodeID, tag, wl.LineHashID))) {
 				egress += wl.Inbound.total()
 			}
 		}

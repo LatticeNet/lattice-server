@@ -270,18 +270,21 @@ func (s *Server) quotaEvaluate(user model.ProxyUser, vpnUser *VpnUser, now time.
 	projection.Enabled = vpnUser.Enabled
 	projection.ExpiresAt = vpnUser.ExpiresAt
 	projection.TrafficLimitBytes = vpnUser.QuotaBytes
+	// Which usage figure a quota is measured with:
+	//   - a monthly quota: the identity's day rows for the current period plus
+	//     this report, which the rows do not hold yet. The read is bounded by
+	//     one period and matches the Users page's used_period_bytes.
+	//   - a lifetime quota: UsedBytes on the identity's accounting record (the
+	//     legacy record for a migrated identity), a running total ingestion
+	//     advances on every report, this one included, and never prunes. Day
+	//     rows are kept for UsageDayRetentionDays only, so summing them would
+	//     turn a lifetime quota into "the last 400 days" and read up to 400
+	//     rows per user on every usage report.
 	period := ""
-	if projection.TrafficLimitBytes > 0 {
-		// Usage against the identity's limit is the identity's own day rows,
-		// the figure its quota bar on the Users page shows: the current period
-		// for a monthly quota, everything retained for a lifetime one. The
-		// legacy record's running total diverges from them and is not mixed in.
-		from := dateOnlyUTC(now).AddDate(0, 0, -store.UsageDayRetentionDays)
-		if start, _, ok := vpnUserQuotaPeriod(*vpnUser, now); ok {
-			from, period = start, store.UsageDay(start)
-		}
-		used, _ := s.periodUsage(vpnUser.ID, from, now)
+	if start, _, ok := vpnUserQuotaPeriod(*vpnUser, now); ok && projection.TrafficLimitBytes > 0 {
+		used, _ := s.periodUsage(vpnUser.ID, start, now)
 		projection.UsedBytes = used.total() + pending.total()
+		period = store.UsageDay(start)
 	}
 	projection.Status = derivedProxyUserStatusAt(projection, now)
 	projection, alerts := nextProxyUserNotificationsForPeriod(projection, now, period)

@@ -210,11 +210,11 @@ func TestProxyExpiryDigestIsOneMessagePerRun(t *testing.T) {
 	}
 }
 
-// A lifetime quota on an identity is measured with the identity's retained
-// day rows, the figure the Users page draws its quota bar from, not the
-// legacy record's running total: a stale total above the limit does not
-// alert, and the day rows crossing 80 percent do.
-func TestProxyQuotaLifetimeReadsIdentityUsage(t *testing.T) {
+// A lifetime quota is measured with the running total on the identity's
+// accounting record, not the day rows: those are retained for 400 days only
+// and are not read at all for a lifetime quota. A monthly quota is measured
+// with its period's day rows plus the report being ingested.
+func TestProxyQuotaLifetimeUsesTheRunningTotal(t *testing.T) {
 	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
 	srv := usageTestServer(t, now)
 	erin := VpnUser{ID: "vpnuser_erin", Email: "erin@example.com", Enabled: true, QuotaBytes: 1000,
@@ -228,20 +228,30 @@ func TestProxyQuotaLifetimeReadsIdentityUsage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	seed("20260601", 100, 100)
-	seed("20260928", 50, 50)
+	// Day rows far above the limit, one of them older than retention would keep.
+	seed("20250101", 2500, 2500)
+	seed("20260928", 2500, 2500)
 	projection := vpnUserUsageProjection(erin)
-	projection.UsedBytes = 5000 // the legacy running total, far above the limit
-	updated, alerts := srv.quotaEvaluate(projection, &erin, now, usageCounter{})
-	if len(alerts) != 0 || updated.Status != model.ProxyUserStatusActive || updated.UsedBytes != 5000 {
-		t.Fatalf("300 of 1000 must not alert: alerts=%+v status=%q used=%d", alerts, updated.Status, updated.UsedBytes)
+	projection.UsedBytes = 300
+	updated, alerts := srv.quotaEvaluate(projection, &erin, now, usageCounter{Downlink: 9999})
+	if len(alerts) != 0 || updated.Status != model.ProxyUserStatusActive || updated.UsedBytes != 300 {
+		t.Fatalf("a running total of 300 of 1000 must not alert: alerts=%+v status=%q used=%d", alerts, updated.Status, updated.UsedBytes)
 	}
-	if views := srv.vpnUserUsageViews([]VpnUser{erin}, now); views[0].UsedPeriodBytes != 300 {
-		t.Fatalf("the Users page figure is %d, the evaluator read 300", views[0].UsedPeriodBytes)
-	}
-	// This report's 550 not yet written lands the identity at 850 of 1000.
+	// Ingestion has already added this report to the running total.
+	updated.UsedBytes = 850
 	_, alerts = srv.quotaEvaluate(updated, &erin, now, usageCounter{Downlink: 550})
 	if len(alerts) != 1 || alerts[0].ThresholdPercent != 80 || alerts[0].UsedBytes != 850 || alerts[0].Key != "quota:1000:80" {
-		t.Fatalf("80 percent from the day rows: %+v", alerts)
+		t.Fatalf("80 percent from the running total: %+v", alerts)
+	}
+
+	// Monthly: this period's rows (the 09-28 row, 5000) against a 10000 limit,
+	// plus 3500 pending, is 85 percent; the running total plays no part.
+	monthly := erin
+	monthly.QuotaBytes, monthly.QuotaPeriod, monthly.QuotaResetDay = 10000, vpnQuotaPeriodMonthly, 1
+	period := vpnUserUsageProjection(monthly)
+	period.UsedBytes = 1
+	_, alerts = srv.quotaEvaluate(period, &monthly, now, usageCounter{Downlink: 3500})
+	if len(alerts) != 1 || alerts[0].UsedBytes != 8500 || alerts[0].Key != "quota:10000:20260901:80" {
+		t.Fatalf("period quota from the day rows: %+v", alerts)
 	}
 }

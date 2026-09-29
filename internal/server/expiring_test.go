@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 
@@ -100,8 +101,8 @@ func TestExpiringListsEveryKindInDateOrder(t *testing.T) {
 			t.Fatalf("item %d = %+v, want %+v", i, got, w)
 		}
 	}
-	if out.WithinDays != 60 || out.Hidden != 0 || !out.GeneratedAt.Equal(now) {
-		t.Fatalf("envelope: within=%d hidden=%d generated_at=%v", out.WithinDays, out.Hidden, out.GeneratedAt)
+	if out.WithinDays != 60 || out.HiddenKinds == nil || len(out.HiddenKinds) != 0 || !out.GeneratedAt.Equal(now) {
+		t.Fatalf("envelope: within=%d hidden_kinds=%v generated_at=%v", out.WithinDays, out.HiddenKinds, out.GeneratedAt)
 	}
 	overdue, alice, dmit, cert, auto := out.Items[0], out.Items[1], out.Items[2], out.Items[3], out.Items[4]
 	if overdue.Title != "cd-xuezhang-jp-nat" || overdue.Subtitle != "Xuezhang · Tokyo" || overdue.CostCents != 3000 || overdue.Currency != "CNY" ||
@@ -145,49 +146,60 @@ func TestExpiringListsEveryKindInDateOrder(t *testing.T) {
 	}
 }
 
-// Each kind is read under its own list endpoint's scope, and every row the
-// session cannot read is counted, not dropped.
-func TestExpiringCountsRowsTheSessionCannotRead(t *testing.T) {
+// Each kind is read under its own list endpoint's scope. A kind the session
+// cannot read at all is named, never counted; a node-confined session sees its
+// own nodes' machines and nothing about the others.
+func TestExpiringNamesKindsTheSessionCannotRead(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
 	srv.now = func() time.Time { return now }
 	seedExpiring(t, srv, st)
 	cookies, csrf := loginSession(t, handler)
+	all := []string{expiringKindMachine, expiringKindVPNUser, expiringKindShare, expiringKindTLS}
 
 	cases := []struct {
 		name      string
 		scopes    []string
 		allowlist []string
 		ids       []string
-		hidden    int
+		hidden    []string
 	}{
-		// Node-restricted inventory reader: its own node's machine only; the
-		// fleet-wide kinds refuse a restricted session.
-		{"inventory on node-a", []string{"inventory:read", "proxy:admin", "monitor:read"}, []string{"node-a"}, []string{"mp-a"}, 5},
-		{"monitor reader", []string{"monitor:read"}, nil, []string{"mon_doh"}, 5},
-		{"vpn-core reader", []string{"vpncore:read"}, nil, []string{"vpnuser_alice"}, 5},
+		// Node-confined: its own node's machine only, node-b's are simply not
+		// there, and the fleet-wide kinds cannot be read at all.
+		{"inventory on node-a", []string{"inventory:read", "proxy:read", "proxy:admin", "monitor:read"}, []string{"node-a"}, []string{"mp-a"}, []string{expiringKindVPNUser, expiringKindShare, expiringKindTLS}},
+		{"monitor reader", []string{"monitor:read"}, nil, []string{"mon_doh"}, []string{expiringKindMachine, expiringKindVPNUser, expiringKindShare}},
+		{"vpn-core reader", []string{"vpncore:read"}, nil, []string{"vpnuser_alice"}, []string{expiringKindMachine, expiringKindShare, expiringKindTLS}},
 		// proxy:admin does not imply proxy:read here, exactly as /api/proxy/users.
-		{"proxy admin", []string{"proxy:admin"}, nil, []string{"share_cdcd"}, 5},
-		{"proxy reader and admin", []string{"proxy:read", "proxy:admin"}, nil, []string{"vpnuser_alice", "share_cdcd"}, 4},
-		{"nothing readable", []string{"audit:read"}, nil, nil, 6},
+		{"proxy admin", []string{"proxy:admin"}, nil, []string{"share_cdcd"}, []string{expiringKindMachine, expiringKindVPNUser, expiringKindTLS}},
+		{"proxy reader and admin", []string{"proxy:read", "proxy:admin"}, nil, []string{"vpnuser_alice", "share_cdcd"}, []string{expiringKindMachine, expiringKindTLS}},
+		{"nothing readable", []string{"audit:read"}, nil, []string{}, all},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			token := createPAT(t, handler, cookies, csrf, tc.scopes, tc.allowlist)
 			req := httptest.NewRequest(http.MethodGet, "/api/expiring", nil)
 			req.Header.Set("Authorization", "Bearer "+token)
-			out := getExpiring(t, handler, req)
+			rec := serveReq(handler, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET: %d %s", rec.Code, rec.Body.String())
+			}
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+				t.Fatal(err)
+			}
+			if _, leaked := raw["hidden"]; leaked {
+				t.Fatalf("a row count is still reported: %s", rec.Body.String())
+			}
+			var out expiringResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatal(err)
+			}
 			ids := []string{}
 			for _, item := range out.Items {
 				ids = append(ids, item.ID)
 			}
-			if len(ids) != len(tc.ids) || out.Hidden != tc.hidden {
-				t.Fatalf("ids=%v hidden=%d, want %v hidden=%d", ids, out.Hidden, tc.ids, tc.hidden)
-			}
-			for i := range ids {
-				if ids[i] != tc.ids[i] {
-					t.Fatalf("ids=%v, want %v", ids, tc.ids)
-				}
+			if !reflect.DeepEqual(ids, tc.ids) || !reflect.DeepEqual(out.HiddenKinds, tc.hidden) {
+				t.Fatalf("ids=%v hidden_kinds=%v, want %v %v", ids, out.HiddenKinds, tc.ids, tc.hidden)
 			}
 		})
 	}

@@ -16,8 +16,11 @@ import (
 // GET /api/expiring is one list of what runs out across the areas that keep a
 // date: machine renewals (inventory), VPN users (vpn-core), subscription shares
 // (publishing) and watched TLS certificates (monitoring). Each kind is read
-// under the scope its own list endpoint requires; rows the session may not read
-// are counted in hidden, never dropped silently.
+// under the scope its own list endpoint requires. A kind the session cannot
+// read at all is named in hidden_kinds so the console can say so; nothing is
+// counted, because a count would tell a confined session how large the rest of
+// the fleet is. A node-confined session gets its own nodes' machines, and the
+// other nodes are outside its domain rather than hidden from it.
 const (
 	expiringKindMachine = "machine_renewal"
 	expiringKindVPNUser = "vpn_user"
@@ -65,7 +68,7 @@ type expiringResponse struct {
 	WithinDays  int             `json:"within_days"`
 	Items       []expiringItem  `json:"items"`
 	Totals      []expiringTotal `json:"totals"`
-	Hidden      int             `json:"hidden"`
+	HiddenKinds []string        `json:"hidden_kinds"`
 }
 
 func (s *Server) handleExpiring(w http.ResponseWriter, r *http.Request, p principal) {
@@ -96,72 +99,82 @@ func parseExpiringWithin(raw string) (int, error) {
 }
 
 func (s *Server) expiringFor(p principal, now time.Time, within int) expiringResponse {
-	out := expiringResponse{GeneratedAt: now.UTC(), WithinDays: within, Items: []expiringItem{}, Totals: []expiringTotal{}}
-	// add keeps a row inside the window (anything past due always is) and
-	// counts it as hidden when the session cannot read its kind.
-	add := func(item expiringItem, readable bool) {
-		if item.Days > within {
-			return
-		}
-		if !readable {
-			out.Hidden++
-			return
-		}
-		out.Items = append(out.Items, item)
-	}
-
-	nodes := map[string]model.Node{}
-	for _, node := range s.store.Nodes() {
-		nodes[node.ID] = node
-	}
-	for _, profile := range s.store.MachineProfiles() {
-		if profile.NextRenewal.IsZero() {
-			continue
-		}
-		add(machineExpiringItem(profile, nodes[profile.NodeID], now), rbac.Allows(p.Principal, "inventory:read", profile.NodeID))
-	}
-
-	// VPN users and shares are fleet-wide objects: their list endpoints refuse
-	// a node-restricted session, and so does this.
+	out := expiringResponse{GeneratedAt: now.UTC(), WithinDays: within, Items: []expiringItem{}, Totals: []expiringTotal{}, HiddenKinds: []string{}}
+	// Which kinds the session can read at all. VPN users, shares and TLS
+	// certificates are fleet-wide objects: their list endpoints refuse a
+	// node-restricted session, and so does this.
 	unrestricted := !principalHasNodeRestriction(p)
-	readUsers := unrestricted && rbac.Allows(p.Principal, "proxy:read", "")
-	for _, user := range s.listVpnUsers() {
-		if !user.Enabled || user.ExpiresAt.IsZero() {
-			continue
+	readable := map[string]bool{
+		expiringKindMachine: rbac.Allows(p.Principal, "inventory:read", ""),
+		expiringKindVPNUser: unrestricted && rbac.Allows(p.Principal, "proxy:read", ""),
+		expiringKindShare:   unrestricted && rbac.Allows(p.Principal, "proxy:admin", ""),
+		expiringKindTLS:     unrestricted && rbac.Allows(p.Principal, "monitor:read", ""),
+	}
+	for _, kind := range []string{expiringKindMachine, expiringKindVPNUser, expiringKindShare, expiringKindTLS} {
+		if !readable[kind] {
+			out.HiddenKinds = append(out.HiddenKinds, kind)
 		}
-		days := daysUntilRenewal(now, user.ExpiresAt)
-		add(expiringItem{
-			Kind:     expiringKindVPNUser,
-			ID:       user.ID,
-			Title:    firstNonEmpty(user.Email, user.Name, user.ID),
-			Subtitle: joinNonEmpty(" · ", user.Name, user.Group),
-			DueAt:    user.ExpiresAt.UTC(),
-			Days:     days,
-			State:    expiringState(days),
-			Href:     "/plugins/" + vpnCorePluginID + "/users",
-		}, readUsers)
+	}
+	// add keeps a row inside the window; anything past due always is.
+	add := func(item expiringItem) {
+		if item.Days <= within {
+			out.Items = append(out.Items, item)
+		}
 	}
 
-	readShares := unrestricted && rbac.Allows(p.Principal, "proxy:admin", "")
-	for _, share := range s.store.SubscriptionShares() {
-		if !share.Enabled || share.ExpiresAt == nil || share.ExpiresAt.IsZero() {
-			continue
+	if readable[expiringKindMachine] {
+		nodes := map[string]model.Node{}
+		for _, node := range s.store.Nodes() {
+			nodes[node.ID] = node
 		}
-		days := daysUntilRenewal(now, *share.ExpiresAt)
-		add(expiringItem{
-			Kind:     expiringKindShare,
-			ID:       share.ID,
-			Title:    firstNonEmpty(share.Slug, share.ID),
-			Subtitle: joinNonEmpty(" · ", share.Source.PluginID, share.Source.SubscriptionID, share.Source.ProxyUserID),
-			DueAt:    share.ExpiresAt.UTC(),
-			Days:     days,
-			State:    expiringState(days),
-			Href:     "/platform/publishing?origin=share&share=" + url.QueryEscape(share.ID),
-		}, readShares)
+		for _, profile := range s.store.MachineProfiles() {
+			if profile.NextRenewal.IsZero() || !rbac.Allows(p.Principal, "inventory:read", profile.NodeID) {
+				continue
+			}
+			add(machineExpiringItem(profile, nodes[profile.NodeID], now))
+		}
+	}
+
+	if readable[expiringKindVPNUser] {
+		for _, user := range s.listVpnUsers() {
+			if !user.Enabled || user.ExpiresAt.IsZero() {
+				continue
+			}
+			days := daysUntilRenewal(now, user.ExpiresAt)
+			add(expiringItem{
+				Kind:     expiringKindVPNUser,
+				ID:       user.ID,
+				Title:    firstNonEmpty(user.Email, user.Name, user.ID),
+				Subtitle: joinNonEmpty(" · ", user.Name, user.Group),
+				DueAt:    user.ExpiresAt.UTC(),
+				Days:     days,
+				State:    expiringState(days),
+				Href:     "/plugins/" + vpnCorePluginID + "/users",
+			})
+		}
+	}
+
+	if readable[expiringKindShare] {
+		for _, share := range s.store.SubscriptionShares() {
+			if !share.Enabled || share.ExpiresAt == nil || share.ExpiresAt.IsZero() {
+				continue
+			}
+			days := daysUntilRenewal(now, *share.ExpiresAt)
+			add(expiringItem{
+				Kind:     expiringKindShare,
+				ID:       share.ID,
+				Title:    firstNonEmpty(share.Slug, share.ID),
+				Subtitle: joinNonEmpty(" · ", share.Source.PluginID, share.Source.SubscriptionID, share.Source.ProxyUserID),
+				DueAt:    share.ExpiresAt.UTC(),
+				Days:     days,
+				State:    expiringState(days),
+				Href:     "/platform/publishing?origin=share&share=" + url.QueryEscape(share.ID),
+			})
+		}
 	}
 
 	for _, mon := range s.store.Monitors() {
-		if mon.Type != model.MonitorTypeTLS || !mon.Enabled {
+		if !readable[expiringKindTLS] || mon.Type != model.MonitorTypeTLS || !mon.Enabled || !monitorVisibleToPrincipal(p, "monitor:read", mon) {
 			continue
 		}
 		notAfter, ok := s.latestCertNotAfter(mon.ID)
@@ -178,7 +191,7 @@ func (s *Server) expiringFor(p principal, now time.Time, within int) expiringRes
 			Days:     days,
 			State:    expiringState(days),
 			Href:     "/monitoring/" + url.PathEscape(mon.ID),
-		}, rbac.Allows(p.Principal, "monitor:read", "") && monitorVisibleToPrincipal(p, "monitor:read", mon))
+		})
 	}
 
 	sort.SliceStable(out.Items, func(i, j int) bool {

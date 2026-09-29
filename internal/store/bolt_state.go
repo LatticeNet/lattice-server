@@ -99,6 +99,37 @@ func (bs *BoltStateStore) subscriptionHotAuthorityInitialized() (bool, error) {
 	return initialized, err
 }
 
+// boltKeyMigrations holds State.Migrations in the meta bucket, so a store
+// carried through bbolt and back keeps the one-time migrations it already ran.
+var boltKeyMigrations = []byte("migrations")
+
+func putBoltMigrations(tx *bolt.Tx, migrations map[string]time.Time) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if len(migrations) == 0 {
+		return meta.Delete(boltKeyMigrations)
+	}
+	raw, err := json.Marshal(migrations)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyMigrations, raw)
+}
+
+func readBoltMigrations(tx *bolt.Tx, into map[string]time.Time) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil
+	}
+	raw := meta.Get(boltKeyMigrations)
+	if len(raw) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(raw, &into); err != nil {
+		return fmt.Errorf("decode migrations: %w", err)
+	}
+	return nil
+}
+
 var boltStateBuckets = [][]byte{
 	boltBucketUsers,
 	boltBucketTokens,
@@ -390,6 +421,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := tx.Bucket(boltBucketMeta).Put([]byte("line_chain_graph_revision"), []byte(strconv.FormatUint(persist.LineChainGraphRevision, 10))); err != nil {
 			return err
 		}
+		if err := putBoltMigrations(tx, persist.Migrations); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
 			return err
 		}
@@ -628,6 +662,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 				return fmt.Errorf("decode line chain graph revision: %w", err)
 			}
 			st.LineChainGraphRevision = revision
+		}
+		if err := readBoltMigrations(tx, st.Migrations); err != nil {
+			return err
 		}
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {
 			return err

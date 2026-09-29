@@ -131,6 +131,10 @@ type State struct {
 	// WebAuthnChallenges holds pending, short-lived passkey ceremony challenges,
 	// mirroring TOTPChallenges.
 	WebAuthnChallenges map[string]auth.WebAuthnChallenge `json:"webauthn_challenges"`
+	// Migrations names the one-time data migrations this store has already
+	// run, with when each ran. A name present here never runs again, so an
+	// operator's later edits to the data it touched stay as they left them.
+	Migrations map[string]time.Time `json:"migrations,omitempty"`
 }
 
 // TaskResultReceipt is the compact, durable idempotency record retained for a
@@ -819,6 +823,7 @@ func emptyState() State {
 		WebAuthnCreds:           map[string]auth.WebAuthnCredential{},
 
 		WebAuthnChallenges: map[string]auth.WebAuthnChallenge{},
+		Migrations:         map[string]time.Time{},
 	}
 }
 
@@ -1011,6 +1016,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.WebAuthnChallenges == nil {
 		st.WebAuthnChallenges = map[string]auth.WebAuthnChallenge{}
+	}
+	if st.Migrations == nil {
+		st.Migrations = map[string]time.Time{}
 	}
 }
 
@@ -4026,6 +4034,45 @@ func (s *Store) MachineProfiles() []model.MachineProfile {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out
+}
+
+// MigrateMachineProfilesOnce runs fn over every machine profile the first time
+// it is called with name on this store, and never again. fn returns the
+// rewritten profile and true to change it. The changed profiles and the marker
+// commit in one write, so a failed write leaves neither behind and the next
+// start tries again. ran is false when the marker was already present; changed
+// lists the rewritten profile ids, sorted.
+func (s *Store) MigrateMachineProfilesOnce(name string, fn func(model.MachineProfile) (model.MachineProfile, bool)) (changed []string, ran bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, done := s.state.Migrations[name]; done {
+		return nil, false, nil
+	}
+	now := time.Now().UTC()
+	profiles := make(map[string]model.MachineProfile, len(s.state.MachineProfiles))
+	for id, p := range s.state.MachineProfiles {
+		if next, ok := fn(p); ok {
+			next.UpdatedAt = now
+			p = next
+			changed = append(changed, id)
+		}
+		profiles[id] = p
+	}
+	sort.Strings(changed)
+	migrations := make(map[string]time.Time, len(s.state.Migrations)+1)
+	for k, v := range s.state.Migrations {
+		migrations[k] = v
+	}
+	migrations[name] = now
+	staged := s.state
+	staged.MachineProfiles = profiles
+	staged.Migrations = migrations
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if !committed {
+		return nil, false, err
+	}
+	s.state = staged
+	return changed, true, err
 }
 
 // DeleteMachineProfile removes a machine profile.

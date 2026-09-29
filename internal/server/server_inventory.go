@@ -941,27 +941,47 @@ type renewalReminder struct {
 // evaluateMachineReminders rolls auto_roll dates that have passed, records the
 // reminders that are due, and sends them as one message for the whole run.
 func (s *Server) evaluateMachineReminders(now time.Time, onlyID string, allow func(model.MachineProfile) bool) ([]renewalReminderFire, error) {
-	profiles := s.store.MachineProfiles()
 	fired := []renewalReminderFire{}
 	due := []renewalReminder{}
 	found := onlyID == ""
-	for _, profile := range profiles {
-		if onlyID != "" && profile.ID != onlyID {
+	for _, snapshot := range s.store.MachineProfiles() {
+		if onlyID != "" && snapshot.ID != onlyID {
 			continue
 		}
 		found = true
-		if allow != nil && !allow(profile) {
+		if allow != nil && !allow(snapshot) {
 			continue
 		}
-		if rolled, ok := rollAutoRenewal(profile, now); ok {
-			from := dateOnlyUTC(profile.NextRenewal).Format("2006-01-02")
-			profile.NextRenewal = rolled
-			profile.LastRemindedKey = ""
-			if err := s.store.UpsertMachineProfile(profile); err != nil {
-				// Whatever was already recorded is still delivered.
-				s.emitRenewalReminders(due, now)
-				return fired, err
+		// The roll and the cursor are decided under the store lock against the
+		// profile as it is now, so an operator's edit that landed after the
+		// list was read is neither overwritten nor rolled over.
+		var (
+			rolledFrom string
+			fire       renewalReminderFire
+			fires      bool
+		)
+		profile, ok, err := s.store.UpdateMachineProfile(snapshot.ID, func(p *model.MachineProfile) bool {
+			changed := false
+			if rolled, ok := rollAutoRenewal(*p, now); ok {
+				rolledFrom = dateOnlyUTC(p.NextRenewal).Format("2006-01-02")
+				p.NextRenewal, p.LastRemindedKey = rolled, ""
+				changed = true
 			}
+			if f, ok := nextReminderFire(*p, now); ok {
+				p.LastRemindedKey = reminderKey(p.NextRenewal, f.OffsetDays)
+				fire, fires, changed = f, true, true
+			}
+			return changed
+		})
+		if err != nil {
+			// Whatever was already recorded is still delivered.
+			s.emitRenewalReminders(due, now)
+			return fired, err
+		}
+		if !ok {
+			continue // deleted since the list was read
+		}
+		if rolledFrom != "" {
 			s.recordAudit(model.AuditEvent{
 				ID:     id.New("audit"),
 				NodeID: profile.NodeID,
@@ -969,26 +989,13 @@ func (s *Server) evaluateMachineReminders(now time.Time, onlyID string, allow fu
 				Scope:  "inventory:admin",
 				Metadata: map[string]string{
 					"machine_id":   profile.ID,
-					"from":         from,
-					"next_renewal": rolled.Format("2006-01-02"),
+					"from":         rolledFrom,
+					"next_renewal": dateOnlyUTC(profile.NextRenewal).Format("2006-01-02"),
 				},
 			})
 		}
-		fire, ok := nextReminderFire(profile, now)
-		if !ok {
+		if !fires {
 			continue
-		}
-		days := daysUntilRenewal(now, profile.NextRenewal)
-		cursor := fire.OffsetDays
-		if days < 0 {
-			// Past the date the cursor is the day, so one overdue message a
-			// day goes out whether this fire caught up a missed offset or not.
-			cursor = days
-		}
-		profile.LastRemindedKey = reminderKey(profile.NextRenewal, cursor)
-		if err := s.store.UpsertMachineProfile(profile); err != nil {
-			s.emitRenewalReminders(due, now)
-			return fired, err
 		}
 		node, _ := s.store.Node(profile.NodeID)
 		fire.MachineID = profile.ID
@@ -996,7 +1003,7 @@ func (s *Server) evaluateMachineReminders(now time.Time, onlyID string, allow fu
 		fire.NodeName = firstNonEmpty(node.Name, profile.Label, profile.NodeID)
 		fire.NextRenewal = dateOnlyUTC(profile.NextRenewal).Format("2006-01-02")
 		fired = append(fired, fire)
-		due = append(due, renewalReminder{profile: profile, name: firstNonEmpty(profile.Label, node.Name, profile.NodeID), days: days})
+		due = append(due, renewalReminder{profile: profile, name: firstNonEmpty(profile.Label, node.Name, profile.NodeID), days: daysUntilRenewal(now, profile.NextRenewal)})
 	}
 	if !found {
 		return nil, errors.New("machine profile not found")
@@ -1005,14 +1012,17 @@ func (s *Server) evaluateMachineReminders(now time.Time, onlyID string, allow fu
 	return fired, nil
 }
 
+// nextReminderFire is the reminder due for a profile now, if any. Its
+// OffsetDays is also the cursor the caller stores: a positive offset before
+// the date, and the (negative) day count after it.
 func nextReminderFire(profile model.MachineProfile, now time.Time) (renewalReminderFire, bool) {
 	if !profile.RemindersEnabled || profile.NextRenewal.IsZero() {
 		return renewalReminderFire{}, false
 	}
 	days := daysUntilRenewal(now, profile.NextRenewal)
-	offsets := append([]int(nil), profile.RemindDaysBefore...)
-	sort.Ints(offsets)
 	if days >= 0 {
+		offsets := append([]int(nil), profile.RemindDaysBefore...)
+		sort.Ints(offsets)
 		for _, offset := range offsets {
 			if days <= offset && reminderOffsetCanFire(profile.LastRemindedKey, profile.NextRenewal, offset) {
 				return renewalReminderFire{OffsetDays: offset}, true
@@ -1026,16 +1036,10 @@ func nextReminderFire(profile model.MachineProfile, now time.Time) (renewalRemin
 	if profile.AutoRoll || days < -overdueReminderDays {
 		return renewalReminderFire{}, false
 	}
-	for _, offset := range offsets {
-		if reminderOffsetCanFire(profile.LastRemindedKey, profile.NextRenewal, offset) {
-			// Catch up with the closest missed positive reminder before the
-			// overdue ones. This avoids skipping the final warning when a
-			// server was down at the exact threshold.
-			return renewalReminderFire{OffsetDays: offset}, true
-		}
-	}
 	// Past the date a manual machine is reminded once per UTC day, keyed by
-	// how many days overdue it is.
+	// how many days overdue it is. The first of these also stands in for a
+	// final warning missed while the server was down: any cursor a positive
+	// offset left for this date is above the overdue day, so it always fires.
 	if reminderOffsetCanFire(profile.LastRemindedKey, profile.NextRenewal, days) {
 		return renewalReminderFire{OffsetDays: days}, true
 	}

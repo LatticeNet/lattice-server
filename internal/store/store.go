@@ -4003,6 +4003,39 @@ func (s *Store) UpsertMachineProfile(p model.MachineProfile) error {
 	return s.Save()
 }
 
+// UpdateMachineProfile applies fn to the current copy of one profile under the
+// store lock and persists it when fn returns true, so a background writer
+// decides against what is stored now rather than a snapshot an operator's edit
+// may have replaced. fn must not call back into the store. ok is false when
+// the profile no longer exists; the returned profile is the stored one.
+func (s *Store) UpdateMachineProfile(id string, fn func(*model.MachineProfile) bool) (profile model.MachineProfile, ok bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.state.MachineProfiles[id]
+	if !ok {
+		return model.MachineProfile{}, false, nil
+	}
+	next := current
+	next.RemindDaysBefore = append([]int(nil), current.RemindDaysBefore...)
+	if !fn(&next) {
+		return current, true, nil
+	}
+	next.UpdatedAt = time.Now().UTC()
+	profiles := make(map[string]model.MachineProfile, len(s.state.MachineProfiles))
+	for k, v := range s.state.MachineProfiles {
+		profiles[k] = v
+	}
+	profiles[id] = next
+	staged := s.state
+	staged.MachineProfiles = profiles
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if !committed {
+		return current, true, err
+	}
+	s.state.MachineProfiles = profiles
+	return next, true, err
+}
+
 // MachineProfile returns a profile by id.
 func (s *Store) MachineProfile(id string) (model.MachineProfile, bool) {
 	s.mu.Lock()

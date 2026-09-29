@@ -311,8 +311,13 @@ func TestOverdueCatchUpIsTheDaysOneMessage(t *testing.T) {
 	sent := captureRenewalNotifications(t, srv)
 	morning := time.Date(2026, 9, 22, 8, 0, 0, 0, time.UTC)
 	fired, err := srv.evaluateMachineReminders(morning, "", nil)
-	if err != nil || len(fired) != 1 || fired[0].OffsetDays != 1 {
+	// The missed 1-day warning is covered by the day's overdue message, and the
+	// fire reports the cursor it stored.
+	if err != nil || len(fired) != 1 || fired[0].OffsetDays != -2 {
 		t.Fatalf("catch-up of the 1-day warning: fired=%+v err=%v", fired, err)
+	}
+	if stored, _ := st.MachineProfile("mp-a"); stored.LastRemindedKey != "2026-09-20:-2" {
+		t.Fatalf("cursor %q disagrees with the fire", stored.LastRemindedKey)
 	}
 	if fired, _ := srv.evaluateMachineReminders(morning.Add(6*time.Hour), "", nil); len(fired) != 0 {
 		t.Fatalf("second message on the same day: %+v", fired)
@@ -350,5 +355,102 @@ func TestMachineRenewEndsOverdueReminders(t *testing.T) {
 	}
 	if len(*sent) != 1 {
 		t.Fatalf("messages: %+v", *sent)
+	}
+}
+
+// The evaluator decides the roll and the cursor against the profile as stored
+// when it writes, not the list it read first. allow runs between the two, so
+// an edit made there stands in for an operator saving the editor mid-run.
+func TestReminderRunKeepsAnEditMadeAfterItReadTheList(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	mustUpsertNodes(t, st, "node-a", "node-b")
+	mustUpsertProfiles(t, st,
+		model.MachineProfile{ID: "mp-auto", NodeID: "node-a", Label: "legend-sg", AutoRoll: true, RenewalCycle: model.RenewalCycleMonthly, NextRenewal: day(2026, 9, 20), RemindDaysBefore: []int{7}, RemindersEnabled: true},
+		model.MachineProfile{ID: "mp-manual", NodeID: "node-b", Label: "old label", NextRenewal: day(2026, 10, 6), RemindDaysBefore: []int{7}, RemindersEnabled: true},
+	)
+	captureRenewalNotifications(t, srv)
+	edit := func(p model.MachineProfile) bool {
+		current, _ := st.MachineProfile(p.ID)
+		switch p.ID {
+		case "mp-auto":
+			// The operator moves the date forward by hand before the roll lands.
+			current.NextRenewal = day(2026, 11, 5)
+		case "mp-manual":
+			current.Label = "new label"
+		}
+		mustUpsertProfiles(t, st, current)
+		return true
+	}
+	fired, err := srv.evaluateMachineReminders(time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC), "", edit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auto, _ := st.MachineProfile("mp-auto")
+	if !auto.NextRenewal.Equal(day(2026, 11, 5)) || len(auditEventsWithAction(st, "inventory.auto_roll")) != 0 {
+		t.Fatalf("the roll overwrote the operator's date: %+v", auto)
+	}
+	manual, _ := st.MachineProfile("mp-manual")
+	if manual.Label != "new label" || manual.LastRemindedKey != "2026-10-06:7" {
+		t.Fatalf("the cursor write lost the operator's edit: %+v", manual)
+	}
+	if len(fired) != 1 || fired[0].MachineID != "mp-manual" {
+		t.Fatalf("fired = %+v", fired)
+	}
+}
+
+// One manual and one auto_roll machine walked from 8 days before their date to
+// 15 days after, twice a day, with the server down on some days. Nothing
+// repeats; a positive offset missed while down fires late; overdue days missed
+// while down are not replayed; and the documented auto_roll case: a date that
+// passes while the server is down rolls without its last reminders.
+func TestReminderDayWalkWithServerDownGaps(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	mustUpsertNodes(t, st, "node-m", "node-a")
+	renewal := day(2026, 10, 10)
+	mustUpsertProfiles(t, st,
+		model.MachineProfile{ID: "manual", NodeID: "node-m", Label: "manual", NextRenewal: renewal, RemindDaysBefore: []int{14, 7, 3, 1, 0}, RemindersEnabled: true},
+		model.MachineProfile{ID: "auto", NodeID: "node-a", Label: "auto", NextRenewal: renewal, AutoRoll: true, RenewalCycle: model.RenewalCycleCustomDays, CycleDays: 10, RemindDaysBefore: []int{7, 1, 0}, RemindersEnabled: true},
+	)
+	captureRenewalNotifications(t, srv)
+	down := map[int]bool{-5: true, -4: true, -3: true, -1: true, 0: true, 1: true, 3: true, 4: true}
+	type fireAt struct {
+		day, offset int
+		renewal     string
+	}
+	got := map[string][]fireAt{}
+	for k := -8; k <= 15; k++ {
+		if down[k] {
+			continue
+		}
+		for _, at := range []time.Duration{30 * time.Minute, 18 * time.Hour} {
+			fired, err := srv.evaluateMachineReminders(renewal.AddDate(0, 0, k).Add(at), "", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range fired {
+				got[f.MachineID] = append(got[f.MachineID], fireAt{k, f.OffsetDays, f.NextRenewal})
+			}
+		}
+	}
+	want := map[string][]fireAt{
+		"manual": {
+			{-8, 14, "2026-10-10"}, // the walk starts inside the 14-day window
+			{-7, 7, "2026-10-10"},
+			{-2, 3, "2026-10-10"}, // down on -3: the 3-day warning fires late
+			{2, -2, "2026-10-10"}, // down -1..1: the first overdue day covers the missed warnings
+			{5, -5, "2026-10-10"}, // down 3 and 4: those overdue days are not replayed
+			{6, -6, "2026-10-10"},
+			{7, -7, "2026-10-10"}, // then silence
+		},
+		"auto": {
+			{-7, 7, "2026-10-10"},
+			{5, 7, "2026-10-20"}, // rolled on day 2 without the old date's 1 and 0 reminders
+			{9, 1, "2026-10-20"},
+			{10, 0, "2026-10-20"},
+			{13, 7, "2026-10-30"},
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("walk:\n got %+v\nwant %+v", got, want)
 	}
 }

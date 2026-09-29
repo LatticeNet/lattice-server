@@ -86,3 +86,33 @@ func TestMigrationMarkersSurviveBoltRoundTrip(t *testing.T) {
 		t.Fatalf("marker after round trip = %v, want %v (all: %v)", got, now, back.Migrations)
 	}
 }
+
+// UpdateMachineProfile works on the stored copy: no write when fn declines,
+// nothing for a missing id, and the change persists across a reopen.
+func TestUpdateMachineProfileMutatesTheStoredCopy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertMachineProfile(model.MachineProfile{ID: "mp-a", NodeID: "node-a", Label: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := s.MachineProfile("mp-a")
+	if _, ok, err := s.UpdateMachineProfile("missing", func(*model.MachineProfile) bool { return true }); ok || err != nil {
+		t.Fatalf("missing profile: ok=%v err=%v", ok, err)
+	}
+	if got, ok, err := s.UpdateMachineProfile("mp-a", func(p *model.MachineProfile) bool { p.Label = "discarded"; return false }); !ok || err != nil || got.Label != "a" || !got.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("declined update wrote: %+v ok=%v err=%v", got, ok, err)
+	}
+	if got, ok, err := s.UpdateMachineProfile("mp-a", func(p *model.MachineProfile) bool { p.LastRemindedKey = "2026-10-06:7"; return true }); !ok || err != nil || got.LastRemindedKey != "2026-10-06:7" || got.Label != "a" {
+		t.Fatalf("update: %+v ok=%v err=%v", got, ok, err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := reopened.MachineProfile("mp-a"); p.LastRemindedKey != "2026-10-06:7" || p.Label != "a" {
+		t.Fatalf("after reopen: %+v", p)
+	}
+}

@@ -1204,6 +1204,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/machines/renew", s.withAuth("inventory:admin", s.handleMachineRenew))
 	mux.HandleFunc("/api/machines/reminders/run", s.withAuth("inventory:admin", s.handleMachineRemindersRun))
 	mux.HandleFunc("/api/machines/reveal-link", s.withAuth("inventory:admin", s.handleMachineLinkReveal))
+	// Every kind carries its own scope check, so any session may ask and sees
+	// the rows it can read plus a count of the ones it cannot.
+	mux.HandleFunc("/api/expiring", s.withAuth("", s.handleExpiring))
 	mux.HandleFunc("/api/machine-vendors", s.withAuth("", s.handleMachineVendors))
 	mux.HandleFunc("/api/machine-vendors/delete", s.withAuth("inventory:admin", s.handleDeleteMachineVendor))
 	mux.HandleFunc("/api/monitors", s.withAuth("", s.handleMonitors))

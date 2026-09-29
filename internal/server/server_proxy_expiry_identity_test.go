@@ -128,3 +128,83 @@ func TestProxyExpiryForVPNCoreUserWithoutTraffic(t *testing.T) {
 		t.Fatalf("repeated: %+v", again)
 	}
 }
+
+// Evaluating every identity must not announce expiries that are long gone. An
+// identity expired 30 days ago with no stored record stays silent and writes
+// nothing; a migrated identity whose vpn-core date is long past (and differs
+// from its legacy record's) stays silent and has the cursor seeded instead.
+func TestProxyExpiryLongPastIsSilent(t *testing.T) {
+	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
+	srv := usageTestServer(t, now)
+	sent := proxyNotifyCapture(srv)
+	if err := srv.store.UpsertProxyUser(model.ProxyUser{ID: "pu-legacy", Name: "bob@example.com", Enabled: true, UUID: "2b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+		ExpiresAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), LastExpiryNotifiedKey: "expiry:2026-01-01:expired"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.migrateProxyUsersToVpnUsers(); err != nil {
+		t.Fatal(err)
+	}
+	bob := srv.vpnUsersByAccounting()["pu-legacy"]
+	if _, err := srv.vpnCoreUsersAdminRPC(context.Background(), "update", []byte(`{"id":"`+bob.ID+`","email":"bob@example.com","expires_at":"2026-08-01T00:00:00Z"}`)); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := srv.vpnCoreUsersAdminRPC(context.Background(), "create", []byte(`{"email":"old@example.com","credentials":[{"protocol":"vless"}],"expires_at":"2026-08-30T00:00:00Z"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created struct {
+		User vpnUserView `json:"user"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatal(err)
+	}
+
+	fired, err := srv.evaluateProxyUserNotifications(now, "")
+	if err != nil || len(fired) != 0 || len(*sent) != 0 {
+		t.Fatalf("long-past expiries announced: fired=%+v sent=%v err=%v", fired, *sent, err)
+	}
+	if _, ok := srv.store.ProxyUser(created.User.ID); ok {
+		t.Fatal("a silent identity without a record must not get one")
+	}
+	if legacy, _ := srv.store.ProxyUser("pu-legacy"); legacy.LastExpiryNotifiedKey != "expiry:2026-08-01:expired" {
+		t.Fatalf("cursor not seeded for the identity's date: %q", legacy.LastExpiryNotifiedKey)
+	}
+}
+
+// Several users reaching an expiry threshold in one run arrive as one
+// message, still routed as proxy.expiry.
+func TestProxyExpiryDigestIsOneMessagePerRun(t *testing.T) {
+	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
+	srv := usageTestServer(t, now)
+	var sent []sentNotification
+	srv.emitNotify = func(title, body string) {
+		sent = append(sent, sentNotification{eventType: classifyNotifyEvent(title), title: title, body: body})
+	}
+	for _, u := range []struct{ email, expires string }{
+		{"carol@example.com", "2026-10-04T00:00:00Z"},
+		{"alice@example.com", "2026-09-30T00:00:00Z"},
+		{"dave@example.com", "2026-09-25T00:00:00Z"},
+	} {
+		if _, err := srv.vpnCoreUsersAdminRPC(context.Background(), "create", []byte(`{"email":"`+u.email+`","credentials":[{"protocol":"vless"}],"expires_at":"`+u.expires+`"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fired, err := srv.evaluateProxyUserNotifications(now, "")
+	if err != nil || len(fired) != 3 {
+		t.Fatalf("fired=%+v err=%v", fired, err)
+	}
+	if len(sent) != 1 {
+		t.Fatalf("one run must send one message, sent %d: %+v", len(sent), sent)
+	}
+	want := sentNotification{
+		eventType: "proxy.expiry",
+		title:     "Lattice proxy expiry digest: 3 users",
+		body:      "09-25  dave@example.com  expired\n09-30  alice@example.com  within 1d\n10-04  carol@example.com  within 7d",
+	}
+	if sent[0] != want {
+		t.Fatalf("digest:\n got %+v\nwant %+v", sent[0], want)
+	}
+	if again, _ := srv.evaluateProxyUserNotifications(now.Add(time.Hour), ""); len(again) != 0 {
+		t.Fatalf("repeated: %+v", again)
+	}
+}

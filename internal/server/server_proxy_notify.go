@@ -64,10 +64,15 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 		if vu, ok := identities[user.ID]; ok {
 			identity = &vu
 		}
+		originalExpiryKey := user.LastExpiryNotifiedKey
 		updated, alerts := s.quotaEvaluate(user, identity, now, usageCounter{})
 		if len(alerts) == 0 {
-			if stored[user.ID] && updated.Status != originalStatus {
+			// A status change, or a cursor seeded silently for a long-past
+			// expiry, is kept on a stored record. An identity without one
+			// needs nothing written: it did not alert.
+			if stored[user.ID] && (updated.Status != originalStatus || updated.LastExpiryNotifiedKey != originalExpiryKey) {
 				if err := s.store.UpsertProxyUser(updated); err != nil {
+					s.emitProxyUserNotifications(fired, now)
 					return nil, err
 				}
 				changed = true
@@ -75,10 +80,11 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 			continue
 		}
 		if err := s.store.UpsertProxyUser(updated); err != nil {
+			// Whatever was already recorded is still delivered.
+			s.emitProxyUserNotifications(fired, now)
 			return nil, err
 		}
 		changed = true
-		s.emitProxyUserNotifications(alerts)
 		fired = append(fired, alerts...)
 	}
 	if changed {
@@ -87,6 +93,7 @@ func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([
 	if !found {
 		return nil, fmt.Errorf("proxy user not found")
 	}
+	s.emitProxyUserNotifications(fired, now)
 	return fired, nil
 }
 
@@ -110,8 +117,22 @@ func nextProxyUserNotificationsForPeriod(user model.ProxyUser, now time.Time, pe
 	if alert, ok := nextProxyExpiryNotification(user, now); ok {
 		user.LastExpiryNotifiedKey = alert.Key
 		alerts = append(alerts, alert)
+	} else if proxyExpiryLongPast(user.ExpiresAt, now) {
+		// Too old to announce: record it as announced, so the state says so
+		// and no later evaluation reconsiders it.
+		user.LastExpiryNotifiedKey = proxyExpiryNotificationKey(user.ExpiresAt, -1)
 	}
 	return user, alerts
+}
+
+// proxyExpiredAlertDays is how many UTC days after an expiry the expired
+// alert may still fire, the same window a manual machine renewal is reminded
+// in. An older expiry is recorded silently, so evaluating identities that
+// expired long ago cannot flood the channels.
+const proxyExpiredAlertDays = overdueReminderDays
+
+func proxyExpiryLongPast(expiresAt, now time.Time) bool {
+	return !expiresAt.IsZero() && daysUntilRenewal(now, expiresAt) < -proxyExpiredAlertDays
 }
 
 func nextProxyQuotaNotification(user model.ProxyUser, period string) (proxyUserNotificationFire, bool) {
@@ -136,6 +157,9 @@ func nextProxyQuotaNotification(user model.ProxyUser, period string) (proxyUserN
 }
 
 func nextProxyExpiryNotification(user model.ProxyUser, now time.Time) (proxyUserNotificationFire, bool) {
+	if proxyExpiryLongPast(user.ExpiresAt, now) {
+		return proxyUserNotificationFire{}, false
+	}
 	offset, ok := proxyExpiryOffset(user.ExpiresAt, now)
 	if !ok {
 		return proxyUserNotificationFire{}, false
@@ -241,7 +265,12 @@ func proxyExpiryOffsetRank(label string) int {
 	}
 }
 
-func (s *Server) emitProxyUserNotifications(alerts []proxyUserNotificationFire) {
+// emitProxyUserNotifications audits every alert of one run and sends one
+// message per kind: a single alert keeps its own message, several of a kind
+// become one digest whose title keeps the kind's prefix, so rules routing
+// proxy.expiry or proxy.quota still match it.
+func (s *Server) emitProxyUserNotifications(alerts []proxyUserNotificationFire, now time.Time) {
+	byKind := map[string][]proxyUserNotificationFire{}
 	for _, alert := range alerts {
 		s.recordAudit(model.AuditEvent{
 			ID:       id.New("audit"),
@@ -254,8 +283,55 @@ func (s *Server) emitProxyUserNotifications(alerts []proxyUserNotificationFire) 
 				"key":     alert.Key,
 			},
 		})
-		s.emitProxyUserNotification(alert)
+		byKind[alert.Kind] = append(byKind[alert.Kind], alert)
 	}
+	for _, kind := range []string{proxyUserAlertExpiry, proxyUserAlertQuota} {
+		switch group := byKind[kind]; len(group) {
+		case 0:
+		case 1:
+			s.emitProxyUserNotification(group[0])
+		default:
+			title, body := proxyUserDigestMessage(kind, group, now)
+			s.emitNotify(title, body)
+		}
+	}
+}
+
+// proxyUserDigestMessage is one line per user: expiries soonest first, quota
+// alerts fullest first.
+func proxyUserDigestMessage(kind string, alerts []proxyUserNotificationFire, now time.Time) (string, string) {
+	sorted := append([]proxyUserNotificationFire(nil), alerts...)
+	name := func(a proxyUserNotificationFire) string { return firstNonEmpty(a.UserName, a.UserID) }
+	lines := make([]string, 0, len(sorted))
+	if kind == proxyUserAlertExpiry {
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if !sorted[i].ExpiresAt.Equal(sorted[j].ExpiresAt) {
+				return sorted[i].ExpiresAt.Before(sorted[j].ExpiresAt)
+			}
+			return name(sorted[i]) < name(sorted[j])
+		})
+		for _, a := range sorted {
+			when := "expired"
+			if a.ExpiryOffsetDays >= 0 {
+				when = fmt.Sprintf("within %dd", a.ExpiryOffsetDays)
+			}
+			lines = append(lines, strings.Join([]string{renewalShortDate(a.ExpiresAt, now), name(a), when}, "  "))
+		}
+		return fmt.Sprintf("Lattice proxy expiry digest: %d users", len(sorted)), strings.Join(lines, "\n")
+	}
+	share := func(a proxyUserNotificationFire) float64 {
+		return float64(a.UsedBytes) / float64(a.TrafficLimitBytes)
+	}
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if share(sorted[i]) != share(sorted[j]) {
+			return share(sorted[i]) > share(sorted[j])
+		}
+		return name(sorted[i]) < name(sorted[j])
+	})
+	for _, a := range sorted {
+		lines = append(lines, fmt.Sprintf("%s  %s of %s (%.1f%%)", name(a), formatProxyBytes(a.UsedBytes), formatProxyBytes(a.TrafficLimitBytes), share(a)*100))
+	}
+	return fmt.Sprintf("Lattice proxy quota digest: %d users", len(sorted)), strings.Join(lines, "\n")
 }
 
 func (s *Server) emitProxyUserNotification(alert proxyUserNotificationFire) {

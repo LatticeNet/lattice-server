@@ -451,10 +451,7 @@ func (ctx *usageAttributionContext) attributeWindow(sums map[string]map[string]*
 		sort.Strings(tags)
 		for _, tag := range tags {
 			wl := sums[nodeID][tag]
-			f := ctx.byNodeTag[nodeID][tag]
-			if f == nil && wl.LineHashID != "" {
-				f = ctx.byHash[wl.LineHashID]
-			}
+			f := ctx.lineFacts(nodeID, tag, wl.LineHashID)
 			traffic := usageLineTraffic{Inbound: wl.Inbound}
 			if f != nil {
 				traffic.Named = map[string]usageCounter{}
@@ -500,9 +497,27 @@ func (ctx *usageAttributionContext) attributeWindow(sums map[string]map[string]*
 	return report
 }
 
-// buildUsageLines is the per-line read model for a period: every node's day
-// rows summed and attributed with the current facts.
-func (s *Server) buildUsageLines(ctx *usageAttributionContext, w usageWindow) (usageLinesReport, usageWindow) {
+// lineFacts joins a (node, tag) to its line: by tag first, then by the hash
+// ingestion recorded for it. nil is a tag no line carries.
+func (ctx *usageAttributionContext) lineFacts(nodeID, tag, hash string) *usageLineFacts {
+	f := ctx.byNodeTag[nodeID][tag]
+	if f == nil && hash != "" {
+		f = ctx.byHash[hash]
+	}
+	return f
+}
+
+// lineRole is the role attributeLine gives a line's rows: a tag no line
+// carries reads as direct.
+func lineRole(f *usageLineFacts) string {
+	if f == nil {
+		return usageRoleDirect
+	}
+	return f.Role
+}
+
+// usageNodeIDs is every node whose day rows a usage read loads.
+func (s *Server) usageNodeIDs(ctx *usageAttributionContext) []string {
 	nodeIDs := make([]string, 0, len(ctx.byNodeTag))
 	for nodeID := range ctx.byNodeTag {
 		nodeIDs = append(nodeIDs, nodeID)
@@ -510,9 +525,153 @@ func (s *Server) buildUsageLines(ctx *usageAttributionContext, w usageWindow) (u
 	for _, snap := range s.store.ProxyUsageSnapshots() {
 		nodeIDs = appendUniqueSorted(nodeIDs, snap.NodeID)
 	}
-	w = s.loadUsageWindow(w, nodeIDs)
+	return nodeIDs
+}
+
+// buildUsageLines is the per-line read model for a period: every node's day
+// rows summed and attributed with the current facts.
+func (s *Server) buildUsageLines(ctx *usageAttributionContext, w usageWindow) (usageLinesReport, usageWindow) {
+	w = s.loadUsageWindow(w, s.usageNodeIDs(ctx))
 	report := ctx.attributeWindow(w.sumWindow(w.fromDay(), w.toDay()))
 	return report, w
+}
+
+// ── daily series and the previous period ─────────────────────────────────────
+
+// usageSeriesMaxDays bounds the daily series; a longer window keeps its
+// latest days and says so.
+const usageSeriesMaxDays = 90
+
+// usageSeriesRow is one node and role's bytes per day, uplink plus downlink,
+// aligned with usageSeries.Days.
+type usageSeriesRow struct {
+	NodeID   string  `json:"node_id"`
+	NodeName string  `json:"node_name,omitempty"`
+	Role     string  `json:"role"`
+	Bytes    []int64 `json:"bytes"`
+}
+
+type usageSeries struct {
+	Days      []string         `json:"days"`
+	Rows      []usageSeriesRow `json:"rows"`
+	Truncated bool             `json:"truncated"`
+}
+
+type usagePrevious struct {
+	From        string `json:"from"`
+	To          string `json:"to"`
+	EgressBytes int64  `json:"egress_bytes"`
+}
+
+// windowRoles gives every (node, tag) in the window the role its lines rows
+// carry, found through the same join attributeWindow uses.
+func (ctx *usageAttributionContext) windowRoles(w usageWindow) map[string]map[string]string {
+	roles := map[string]map[string]string{}
+	for nodeID, byTag := range w.sumWindow(w.fromDay(), w.toDay()) {
+		roles[nodeID] = map[string]string{}
+		for tag, wl := range byTag {
+			roles[nodeID][tag] = lineRole(ctx.lineFacts(nodeID, tag, wl.LineHashID))
+		}
+	}
+	return roles
+}
+
+// usageSeries sums the loaded day rows per node and role for each UTC day of
+// the window, oldest first. It reads the same rows and roles as the lines
+// report, so a day's exit plus direct bytes are that day's egress.
+func (ctx *usageAttributionContext) usageSeries(w usageWindow) usageSeries {
+	out := usageSeries{Days: []string{}, Rows: []usageSeriesRow{}}
+	from := w.From
+	if !w.To.Before(from.AddDate(0, 0, usageSeriesMaxDays)) {
+		from = w.To.AddDate(0, 0, -(usageSeriesMaxDays - 1))
+		out.Truncated = true
+	}
+	index := map[string]int{}
+	for d := from; !d.After(w.To); d = d.AddDate(0, 0, 1) {
+		index[store.UsageDay(d)] = len(out.Days)
+		out.Days = append(out.Days, store.UsageDay(d))
+	}
+	roles := ctx.windowRoles(w)
+	rows := map[[2]string]*usageSeriesRow{}
+	for nodeID, dayRows := range w.nodes {
+		for _, row := range dayRows {
+			i, ok := index[row.Day]
+			if !ok {
+				continue
+			}
+			for tag, line := range row.Lines {
+				bytes := line.Uplink + line.Downlink
+				if bytes == 0 {
+					continue
+				}
+				role := roles[nodeID][tag]
+				key := [2]string{nodeID, role}
+				r := rows[key]
+				if r == nil {
+					r = &usageSeriesRow{NodeID: nodeID, NodeName: ctx.nodeName[nodeID], Role: role, Bytes: make([]int64, len(out.Days))}
+					rows[key] = r
+				}
+				r.Bytes[i] += bytes
+			}
+		}
+	}
+	totals := map[[2]string]int64{}
+	for key, r := range rows {
+		for _, b := range r.Bytes {
+			totals[key] += b
+		}
+		out.Rows = append(out.Rows, *r)
+	}
+	sort.Slice(out.Rows, func(i, j int) bool {
+		a, b := out.Rows[i], out.Rows[j]
+		ta, tb := totals[[2]string{a.NodeID, a.Role}], totals[[2]string{b.NodeID, b.Role}]
+		if ta != tb {
+			return ta > tb
+		}
+		if a.NodeID != b.NodeID {
+			return a.NodeID < b.NodeID
+		}
+		return a.Role < b.Role
+	})
+	return out
+}
+
+// usageEgress is what left the fleet over a loaded window: bytes on exit and
+// direct lines.
+func (ctx *usageAttributionContext) usageEgress(w usageWindow) int64 {
+	var egress int64
+	for nodeID, byTag := range w.sumWindow(w.fromDay(), w.toDay()) {
+		for tag, wl := range byTag {
+			switch lineRole(ctx.lineFacts(nodeID, tag, wl.LineHashID)) {
+			case usageRoleExit, usageRoleDirect:
+				egress += wl.Inbound.total()
+			}
+		}
+	}
+	return egress
+}
+
+// previousUsageWindow is the equal-length window just before a rolling
+// period. Only today, 7d and 30d have one.
+func previousUsageWindow(w usageWindow) (usageWindow, bool) {
+	switch w.Label {
+	case "today", "7d", "30d":
+	default:
+		return usageWindow{}, false
+	}
+	days := int(w.To.Sub(w.From).Hours()/24) + 1
+	return usageWindow{From: w.From.AddDate(0, 0, -days), To: w.From.AddDate(0, 0, -1), Label: "previous"}, true
+}
+
+// previousUsage is the previous period's egress, read with today's facts like
+// every other window.
+func (s *Server) previousUsage(ctx *usageAttributionContext, w usageWindow) *usagePrevious {
+	prev, ok := previousUsageWindow(w)
+	if !ok {
+		return nil
+	}
+	prev = s.loadUsageWindow(prev, s.usageNodeIDs(ctx))
+	return &usagePrevious{From: prev.fromDay(), To: prev.toDay(), EgressBytes: ctx.usageEgress(prev)}
 }
 
 // ── users list enrichment ────────────────────────────────────────────────────

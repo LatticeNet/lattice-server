@@ -181,11 +181,14 @@ func (s *Server) buildUsage() (byUser []UsageByUser, byNode []UsageByNode, rows 
 // vpnCoreUsageRPC serves latticenet.vpn-core/usage (design-12 S3), proxy:read.
 //
 //	query {period?} -> {by_user, by_node, rows, collectors, per_line,
-//	                    lines, double_counted_via_chains_bytes, period, from, to}
+//	                    lines, double_counted_via_chains_bytes, period, from, to,
+//	                    series, previous?}
 //
 // lines are the per-line attributed rows over the period (today, 7d, 30d,
 // all, or yyyymmdd..yyyymmdd; 30d by default); the older fields keep their
-// snapshot-based shape for existing clients.
+// snapshot-based shape for existing clients. series is the same day rows per
+// node and role per day, and previous is the egress of the equal-length
+// period before (today, 7d and 30d only).
 func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "query":
@@ -201,7 +204,8 @@ func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, request []byt
 		if err != nil {
 			return nil, err
 		}
-		report, window := s.buildUsageLines(s.usageAttributionContext(), window)
+		ctx := s.usageAttributionContext()
+		report, window := s.buildUsageLines(ctx, window)
 		byUser, byNode, rows, collectors, perLine := s.buildUsage()
 		if byUser == nil {
 			byUser = []UsageByUser{}
@@ -226,9 +230,12 @@ func (s *Server) vpnCoreUsageRPC(_ context.Context, method string, request []byt
 			Period                      string           `json:"period"`
 			From                        string           `json:"from"`
 			To                          string           `json:"to"`
+			Series                      usageSeries      `json:"series"`
+			Previous                    *usagePrevious   `json:"previous,omitempty"`
 		}{ByUser: byUser, ByNode: byNode, Rows: rows, Collectors: collectors, PerLine: perLine,
 			Lines: report.Rows, DoubleCountedViaChainsBytes: report.DoubleCountedViaChainsBytes,
-			Period: window.Label, From: window.fromDay(), To: window.toDay()})
+			Period: window.Label, From: window.fromDay(), To: window.toDay(),
+			Series: ctx.usageSeries(window), Previous: s.previousUsage(ctx, window)})
 	default:
 		return nil, fmt.Errorf("vpn-core/usage: unknown method %q", method)
 	}

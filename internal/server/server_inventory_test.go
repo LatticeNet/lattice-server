@@ -361,23 +361,26 @@ func TestMachineReminderFiresOncePerOffset(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var sent []string
-	srv.emitNotify = func(title, body string) { sent = append(sent, title+"|"+body) }
+	sent := captureRenewalNotifications(t, srv)
 
 	now := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
 	fired, err := srv.evaluateMachineReminders(now, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(fired) != 1 || fired[0].OffsetDays != 7 || len(sent) != 1 {
-		t.Fatalf("expected exactly the 7-day reminder once, fired=%+v sent=%+v", fired, sent)
+	if len(fired) != 1 || fired[0].OffsetDays != 7 || len(*sent) != 1 {
+		t.Fatalf("expected exactly the 7-day reminder once, fired=%+v sent=%+v", fired, *sent)
+	}
+	if got := (*sent)[0]; got.title != "Lattice renewal due in 7d: gmami-jp1" ||
+		got.body != "gmami-jp1 (DMIT, JP-Tokyo) renews 2026-07-01, USD 9.90. Mark renewed in the dashboard." {
+		t.Fatalf("single reminder should keep its shape: %+v", got)
 	}
 	again, err := srv.evaluateMachineReminders(now, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(again) != 0 || len(sent) != 1 {
-		t.Fatalf("same reminder should not fire twice, fired=%+v sent=%+v", again, sent)
+	if len(again) != 0 || len(*sent) != 1 {
+		t.Fatalf("same reminder should not fire twice, fired=%+v sent=%+v", again, *sent)
 	}
 }
 

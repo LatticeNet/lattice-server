@@ -602,6 +602,9 @@ func New(opts Options) (*Server, error) {
 	if err := s.migrateProxyUsersToVpnUsers(); err != nil {
 		return nil, fmt.Errorf("migrate vpn user secrets: %w", err)
 	}
+	// Before the scheduler's first run, so machines that already carry a
+	// renewal date are reminded from the first evaluation.
+	s.applyReminderDefaults()
 	if dir := strings.TrimSpace(opts.PluginRuntimeDir); dir != "" {
 		// Tier-2 system runner: execute verified system-plugin artifacts in a
 		// confined per-plugin dir. Host mutation still flows through the in-core

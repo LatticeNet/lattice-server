@@ -270,21 +270,9 @@ func (s *Server) quotaEvaluate(user model.ProxyUser, vpnUser *VpnUser, now time.
 	projection.Enabled = vpnUser.Enabled
 	projection.ExpiresAt = vpnUser.ExpiresAt
 	projection.TrafficLimitBytes = vpnUser.QuotaBytes
-	// Which usage figure a quota is measured with:
-	//   - a monthly quota: the identity's day rows for the current period plus
-	//     this report, which the rows do not hold yet. The read is bounded by
-	//     one period and matches the Users page's used_period_bytes.
-	//   - a lifetime quota: UsedBytes on the identity's accounting record (the
-	//     legacy record for a migrated identity), a running total ingestion
-	//     advances on every report, this one included, and never prunes. Day
-	//     rows are kept for UsageDayRetentionDays only, so summing them would
-	//     turn a lifetime quota into "the last 400 days" and read up to 400
-	//     rows per user on every usage report.
 	period := ""
-	if start, _, ok := vpnUserQuotaPeriod(*vpnUser, now); ok && projection.TrafficLimitBytes > 0 {
-		used, _ := s.periodUsage(vpnUser.ID, start, now)
-		projection.UsedBytes = used.total() + pending.total()
-		period = store.UsageDay(start)
+	if projection.TrafficLimitBytes > 0 {
+		projection.UsedBytes, period = s.quotaUsedBytes(*vpnUser, projection.UsedBytes, now, pending)
 	}
 	projection.Status = derivedProxyUserStatusAt(projection, now)
 	projection, alerts := nextProxyUserNotificationsForPeriod(projection, now, period)
@@ -292,6 +280,26 @@ func (s *Server) quotaEvaluate(user model.ProxyUser, vpnUser *VpnUser, now time.
 	user.LastQuotaNotifiedKey = projection.LastQuotaNotifiedKey
 	user.LastExpiryNotifiedKey = projection.LastExpiryNotifiedKey
 	return user, alerts
+}
+
+// quotaUsedBytes is the usage an identity's quota is measured with, and the
+// period key its alerts carry (empty for a lifetime quota):
+//   - a monthly quota: the identity's day rows for the current period plus
+//     pending, the report being ingested, which the rows do not hold yet. The
+//     read is bounded by one period and matches the Users page's
+//     used_period_bytes.
+//   - a lifetime quota: accountTotal, UsedBytes on the identity's accounting
+//     record (the legacy record for a migrated identity), a running total
+//     ingestion advances on every report, this one included, and never
+//     prunes. Day rows are kept for UsageDayRetentionDays only, so summing
+//     them would turn a lifetime quota into "the last 400 days" and read up to
+//     400 rows per user on every usage report.
+func (s *Server) quotaUsedBytes(vpnUser VpnUser, accountTotal int64, now time.Time, pending usageCounter) (int64, string) {
+	if start, _, ok := vpnUserQuotaPeriod(vpnUser, now); ok {
+		used, _ := s.periodUsage(vpnUser.ID, start, now)
+		return used.total() + pending.total(), store.UsageDay(start)
+	}
+	return accountTotal, ""
 }
 
 // vpnUsersByAccounting indexes identities by the ProxyUser projection id that

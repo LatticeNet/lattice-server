@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -45,9 +46,11 @@ type expiringReminder struct {
 }
 
 type expiringItem struct {
-	Kind      string            `json:"kind"`
-	ID        string            `json:"id"`
-	Title     string            `json:"title"`
+	Kind  string `json:"kind"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// Subtitle is data only, never English words, so the console can
+	// localise the row around it.
 	Subtitle  string            `json:"subtitle,omitempty"`
 	DueAt     time.Time         `json:"due_at"`
 	Days      int               `json:"days"`
@@ -55,7 +58,11 @@ type expiringItem struct {
 	CostCents int64             `json:"cost_cents"`
 	Currency  string            `json:"currency"`
 	Reminder  *expiringReminder `json:"reminder,omitempty"`
-	Href      string            `json:"href"`
+	// UsedBytes and QuotaBytes are VPN user rows with a quota only: the
+	// figure the quota alerts measure, so the console writes the phrase.
+	UsedBytes  *int64 `json:"used_bytes,omitempty"`
+	QuotaBytes *int64 `json:"quota_bytes,omitempty"`
+	Href       string `json:"href"`
 }
 
 type expiringTotal struct {
@@ -145,20 +152,31 @@ func (s *Server) expiringFor(p principal, now time.Time, within int) expiringRes
 				continue
 			}
 			days := daysUntilRenewal(now, user.ExpiresAt)
-			add(expiringItem{
-				Kind:     expiringKindVPNUser,
-				ID:       user.ID,
-				Title:    firstNonEmpty(user.Email, user.Name, user.ID),
-				Subtitle: joinNonEmpty(" · ", user.Name, user.Group),
-				DueAt:    user.ExpiresAt.UTC(),
-				Days:     days,
-				State:    expiringState(days),
-				Href:     "/plugins/" + vpnCorePluginID + "/users",
-			})
+			item := expiringItem{
+				Kind:  expiringKindVPNUser,
+				ID:    user.ID,
+				Title: firstNonEmpty(user.Email, user.Name, user.ID),
+				DueAt: user.ExpiresAt.UTC(),
+				Days:  days,
+				State: expiringState(days),
+				Href:  "/plugins/" + vpnCorePluginID + "/users",
+			}
+			if user.Name != item.Title {
+				item.Subtitle = strings.TrimSpace(user.Name)
+			}
+			if user.QuotaBytes > 0 {
+				acct := firstNonEmpty(strings.TrimSpace(user.MigratedFromProxyUser), user.ID)
+				record, _ := s.store.ProxyUser(acct)
+				used, _ := s.quotaUsedBytes(user, record.UsedBytes, now, usageCounter{})
+				quota := user.QuotaBytes
+				item.UsedBytes, item.QuotaBytes = &used, &quota
+			}
+			add(item)
 		}
 	}
 
 	if readable[expiringKindShare] {
+		recordNames := s.subStoreRecordNames()
 		for _, share := range s.store.SubscriptionShares() {
 			if !share.Enabled || share.ExpiresAt == nil || share.ExpiresAt.IsZero() {
 				continue
@@ -168,7 +186,7 @@ func (s *Server) expiringFor(p principal, now time.Time, within int) expiringRes
 				Kind:     expiringKindShare,
 				ID:       share.ID,
 				Title:    firstNonEmpty(share.Slug, share.ID),
-				Subtitle: joinNonEmpty(" · ", share.Source.PluginID, share.Source.SubscriptionID, share.Source.ProxyUserID),
+				Subtitle: s.shareRecordName(share.Source, recordNames),
 				DueAt:    share.ExpiresAt.UTC(),
 				Days:     days,
 				State:    expiringState(days),
@@ -286,6 +304,44 @@ func nextReminderOffset(profile model.MachineProfile, now time.Time) (int, bool)
 		}
 	}
 	return 0, false
+}
+
+// subStoreRecordNames maps Sub-Store record ids to the names the operator
+// gave them, read from the plugin's document the same way the plugin does.
+func (s *Server) subStoreRecordNames() map[string]string {
+	out := map[string]string{}
+	entry, ok := s.store.KVEntry(usageSubStoreKVBucket, usageSubStoreRecordsKey)
+	if !ok || len(entry.Value) == 0 || len(entry.Value) > usageMaxSubStoreRecordsLen {
+		return out
+	}
+	var doc struct {
+		Records []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			DisplayName string `json:"display_name"`
+		} `json:"records"`
+	}
+	if err := json.Unmarshal([]byte(entry.Value), &doc); err != nil {
+		return out
+	}
+	for _, rec := range doc.Records {
+		if name := firstNonEmpty(rec.DisplayName, rec.Name); rec.ID != "" && name != "" {
+			out[rec.ID] = strings.TrimSpace(name)
+		}
+	}
+	return out
+}
+
+// shareRecordName names what a share publishes: the Sub-Store record's name,
+// or the proxy user's, falling back to the id when the record is gone.
+func (s *Server) shareRecordName(source model.ShareSource, recordNames map[string]string) string {
+	if source.Kind == model.ShareSourceCoreProxyUser {
+		if user, ok := s.store.ProxyUser(source.ProxyUserID); ok && strings.TrimSpace(user.Name) != "" {
+			return strings.TrimSpace(user.Name)
+		}
+		return source.ProxyUserID
+	}
+	return firstNonEmpty(recordNames[source.SubscriptionID], source.SubscriptionID)
 }
 
 // latestCertNotAfter is the certificate expiry from the newest result that

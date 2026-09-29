@@ -246,3 +246,88 @@ func TestExpiringCertificatesFollowMonitorVisibility(t *testing.T) {
 		t.Fatalf("without monitor:read: %v", none.HiddenKinds)
 	}
 }
+
+// Subtitles carry data only, so the console can write the words in its own
+// language: a machine's vendor and region, a VPN user's name, a share's
+// record name, a certificate's target (the probe records no issuer). VPN user
+// rows with a quota carry the figure the quota alerts measure and the limit;
+// a user without a quota carries neither.
+func TestExpiringSubtitlesAreDataAndUsersCarryQuota(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return now }
+	seedExpiring(t, srv, st)
+	expires := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
+	for _, u := range []VpnUser{
+		{ID: "vpnuser_life", Email: "life@example.com", Name: "Life", Enabled: true, QuotaBytes: 50_000, ExpiresAt: expires},
+		{ID: "vpnuser_month", Email: "month@example.com", Enabled: true, QuotaBytes: 10_000, QuotaPeriod: vpnQuotaPeriodMonthly, QuotaResetDay: 1, ExpiresAt: expires},
+	} {
+		if err := srv.putVpnUser(u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The lifetime quota reads the accounting record's running total; the
+	// monthly one reads this period's day rows (the August row is outside it).
+	if err := st.UpsertProxyUser(model.ProxyUser{ID: "vpnuser_life", Name: "life@example.com", Enabled: true, UsedBytes: 20_500}); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []store.UsageDayUser{
+		{UserID: "vpnuser_month", Day: "20260830", Uplink: 9000},
+		{UserID: "vpnuser_month", Day: "20260915", Uplink: 1000, Downlink: 3100},
+	} {
+		if err := st.ApplyProxyUsage(store.ProxyUsageUpdate{DayUsers: []store.UsageDayUser{row}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	doc := `{"records":[{"id":"for-cdcd-loon","name":"for-cdcd-loon","display_name":"cdcd Loon"}]}`
+	if err := st.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: usageSubStoreRecordsKey, Value: doc}); err != nil {
+		t.Fatal(err)
+	}
+
+	cookies, _ := loginSession(t, handler)
+	req := httptest.NewRequest(http.MethodGet, "/api/expiring", nil)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := serveReq(handler, req)
+	var raw struct {
+		Items []map[string]json.RawMessage `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	type row struct {
+		subtitle          string
+		used, quota       int64
+		hasUsed, hasQuota bool
+	}
+	got := map[string]row{}
+	for _, item := range raw.Items {
+		var id, subtitle string
+		json.Unmarshal(item["id"], &id)
+		json.Unmarshal(item["subtitle"], &subtitle)
+		r := row{subtitle: subtitle}
+		if v, ok := item["used_bytes"]; ok {
+			r.hasUsed = true
+			json.Unmarshal(v, &r.used)
+		}
+		if v, ok := item["quota_bytes"]; ok {
+			r.hasQuota = true
+			json.Unmarshal(v, &r.quota)
+		}
+		got[id] = r
+	}
+	want := map[string]row{
+		"mp-a":          {subtitle: "DMIT · LAX"},
+		"mp-c":          {subtitle: "Xuezhang · Tokyo"},
+		"mp-b":          {},
+		"vpnuser_alice": {subtitle: "Alice"},
+		"vpnuser_life":  {subtitle: "Life", used: 20_500, quota: 50_000, hasUsed: true, hasQuota: true},
+		"vpnuser_month": {used: 4100, quota: 10_000, hasUsed: true, hasQuota: true},
+		"share_cdcd":    {subtitle: "cdcd Loon"},
+		"mon_doh":       {subtitle: "dns.example.org:8443"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rows:\n got %+v\nwant %+v", got, want)
+	}
+}

@@ -931,9 +931,8 @@ func (s *Server) applyReminderDefaults() {
 	})
 }
 
-// renewalReminder is one fire plus what its message needs.
+// renewalReminder is what one fire's message needs.
 type renewalReminder struct {
-	fire    renewalReminderFire
 	profile model.MachineProfile
 	name    string
 	days    int
@@ -997,7 +996,7 @@ func (s *Server) evaluateMachineReminders(now time.Time, onlyID string, allow fu
 		fire.NodeName = firstNonEmpty(node.Name, profile.Label, profile.NodeID)
 		fire.NextRenewal = dateOnlyUTC(profile.NextRenewal).Format("2006-01-02")
 		fired = append(fired, fire)
-		due = append(due, renewalReminder{fire: fire, profile: profile, name: firstNonEmpty(profile.Label, node.Name, profile.NodeID), days: days})
+		due = append(due, renewalReminder{profile: profile, name: firstNonEmpty(profile.Label, node.Name, profile.NodeID), days: days})
 	}
 	if !found {
 		return nil, errors.New("machine profile not found")

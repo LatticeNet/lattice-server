@@ -4055,7 +4055,9 @@ func parseTaskIDList(raw string) (map[string]bool, error) {
 //	                      (maxTaskResultIDs); more is a 400, never truncated
 //	node_id=<id>          keep results from one node
 //	omit_output=1         send stdout_bytes and stderr_bytes instead of the
-//	                      bodies
+//	                      bodies, plus stderr_head: the first non-blank line
+//	                      of stderr, at most 200 bytes, omitted when stderr
+//	                      is empty (taskStderrHead)
 //	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
 //
 // Without any of them the response is the bare array of every visible result.
@@ -4074,7 +4076,7 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		// store's result cap). Filtering/pagination is opt-in below.
 		visible := make([]taskResultView, 0, len(results))
 		for _, result := range results {
-			if rbac.Allows(p.Principal, "task:read", result.NodeID) {
+			if taskResultReadable(p, result) {
 				visible = append(visible, s.withExecContext(toTaskResultView(result)))
 			}
 		}
@@ -4104,7 +4106,7 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 	nodeID := strings.TrimSpace(q.Get("node_id"))
 	matched := make([]model.TaskResult, 0, len(results))
 	for _, result := range results {
-		if !rbac.Allows(p.Principal, "task:read", result.NodeID) {
+		if !taskResultReadable(p, result) {
 			continue
 		}
 		if taskIDs != nil && !taskIDs[result.TaskID] {
@@ -4134,6 +4136,10 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		for i := range filtered {
 			filtered[i].StdoutBytes = len(filtered[i].Stdout)
 			filtered[i].StderrBytes = len(filtered[i].Stderr)
+			// Every row here passed taskResultReadable, the check that lets
+			// this caller read the full stderr without omit_output, so the
+			// head reveals nothing the caller could not already read.
+			filtered[i].StderrHead = taskStderrHead(filtered[i].Stderr)
 			filtered[i].Stdout = ""
 			filtered[i].Stderr = ""
 		}
@@ -4197,9 +4203,12 @@ type taskResultView struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	// Set only on omit_output rows: the size of the body that was not sent,
-	// so a list can still say "12 KB of output" without carrying it.
+	// so a list can still say "12 KB of output" without carrying it, and
+	// the first line of stderr (taskStderrHead) so a failed run can say why
+	// in one line.
 	StdoutBytes int       `json:"stdout_bytes,omitempty"`
 	StderrBytes int       `json:"stderr_bytes,omitempty"`
+	StderrHead  string    `json:"stderr_head,omitempty"`
 	Error       string    `json:"error"`
 	StartedAt   time.Time `json:"started_at"`
 	FinishedAt  time.Time `json:"finished_at"`

@@ -8,8 +8,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -43,6 +45,50 @@ var taskOrigins = []string{taskOriginApproval, taskOriginRerun, taskOriginDirect
 
 // taskCountsWindow is the window failed_24h and finished_24h look back over.
 const taskCountsWindow = 24 * time.Hour
+
+// maxStderrHeadBytes bounds stderr_head: one line a table cell can show.
+const maxStderrHeadBytes = 200
+
+// taskResultReadable is the check that admits a task result to a caller,
+// and with it the full stdout and stderr: task:read on the node that ran
+// it. Every result read (the bare array, the query page, and stderr_head on
+// a bodyless row) goes through it, so none can show more than another.
+func taskResultReadable(p principal, result model.TaskResult) bool {
+	return rbac.Allows(p.Principal, "task:read", result.NodeID)
+}
+
+// taskStderrHead is the first non-blank line of stderr, so a failed run can
+// say why in one line ("sh: curl: not found") without the body. A carriage
+// return ends a line as a newline does (progress meters rewrite a line with
+// it), control characters are dropped, invalid UTF-8 becomes U+FFFD, and the
+// line is trimmed and cut to at most maxStderrHeadBytes on a UTF-8
+// boundary. It is empty when stderr holds nothing but blank lines.
+func taskStderrHead(stderr string) string {
+	for _, line := range strings.FieldsFunc(stderr, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		line = strings.Map(func(r rune) rune {
+			switch {
+			case r == '\t':
+				return ' '
+			case r < 0x20 || r == 0x7f:
+				return -1
+			}
+			return r
+		}, strings.ToValidUTF8(line, "�"))
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > maxStderrHeadBytes {
+			cut := maxStderrHeadBytes
+			for cut > 0 && !utf8.RuneStart(line[cut]) {
+				cut--
+			}
+			line = strings.TrimSpace(line[:cut])
+		}
+		return line
+	}
+	return ""
+}
 
 func taskOrigin(t model.Task) string {
 	switch {

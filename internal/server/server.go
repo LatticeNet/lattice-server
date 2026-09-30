@@ -276,6 +276,9 @@ type Server struct {
 	// reworded notification silently changes who receives it; new callers say
 	// what the event is and are unaffected by prose.
 	emitNotifyTyped func(eventType, title, body string)
+	// nodeAlerts holds which offline spell each node was alerted for; see
+	// notifyNodeLiveness.
+	nodeAlerts nodeOfflineAlerts
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
 	// subscriptionDecoy shapes the answer every non-servable subscription request
@@ -5219,6 +5222,8 @@ func classifyNotifyEvent(title string) string {
 		return "proxy.expiry"
 	case strings.HasPrefix(title, "Lattice renewal"):
 		return "inventory.renewal"
+	case strings.Contains(title, "2FA attempt limit"):
+		return "auth.2fa_limit"
 	default:
 		return "generic"
 	}

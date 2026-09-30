@@ -1098,6 +1098,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/terminal-transport", s.withAuth("", s.handleNodeTerminalTransport))
 	mux.HandleFunc("/api/nodes/ip-config", s.withAuth("", s.handleNodeIPConfig))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
+	mux.HandleFunc("/api/tasks/counts", s.withAuth("", s.handleTaskCounts))
 	mux.HandleFunc("/api/tasks/cancel", s.withAuth("", s.handleCancelTask))
 	mux.HandleFunc("/api/tasks/delete", s.withAuth("", s.handleDeleteTask))
 	mux.HandleFunc("/api/tasks/rerun", s.withAuth("", s.handleRerunTask))
@@ -3311,21 +3312,42 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "comment": node.Comment, "tags": node.Tags, "agent_source_allowlist": append([]string{}, node.AgentSourceAllowlist...), "inventory": node.Inventory})
 }
 
+// handleTasks serves GET and POST /api/tasks.
+//
+// GET needs task:read and lists the tasks whose every target the caller may
+// read, newest first. Each row's status is the view status (toTaskView):
+// queued, leased, stalled, expired, finished, failed or cancelled.
+//
+// Query parameters, all optional:
+//
+//	status=a,b            keep rows whose status is in the comma list; a value
+//	                      outside the seven above is a 400, never ignored
+//	since=<RFC3339>       keep rows that last changed at or after the instant
+//	                      (taskLastChangedAt: the latest of created, started,
+//	                      finished and lease start, or the expiry instant of
+//	                      an expired row)
+//	node_id=<id>          keep rows that target the node
+//	origin=a,b            keep rows queued by approval, rerun or direct (see
+//	                      taskOrigin); anything else is a 400
+//	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
+//
+// Without any of them the response is the bare array clients have always
+// read. With any of them it is the {"tasks","total","limit","offset"}
+// envelope, total counting the filtered rows before paging, so the Tasks page
+// can ask for one page of what the operator filtered for instead of every
+// task in the store. Filters only narrow the visible set: a node_id outside
+// the caller's scope answers an empty page, exactly like a node with no
+// tasks.
+//
+// POST queues a task, which needs task:run on every target.
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
 		if !s.requireScope(w, p, "task:read") {
 			return
 		}
-		tasks := s.store.Tasks() // newest-first
-		visible := make([]taskView, 0, len(tasks))
-		for _, task := range tasks {
-			if taskTargetsAllowed(p, "task:read", task.Targets) {
-				visible = append(visible, s.toTaskView(task))
-			}
-		}
 		if !taskQueryRequested(r) {
-			writeJSON(w, http.StatusOK, visible)
+			writeJSON(w, http.StatusOK, taskRowViews(s.visibleTaskRows(p)))
 			return
 		}
 		q := r.URL.Query()
@@ -3339,13 +3361,18 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		nodeID := strings.TrimSpace(q.Get("node_id"))
-		filtered := make([]taskView, 0, len(visible))
-		for _, view := range visible {
-			if nodeID != "" && !taskViewTargetsNode(view, nodeID) {
-				continue
+		filter, err := parseTaskListFilter(q)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		deadline := s.store.TaskQueueDeadline()
+		rows := s.visibleTaskRows(p)
+		filtered := make([]taskRow, 0, len(rows))
+		for _, row := range rows {
+			if filter.matches(row, deadline) {
+				filtered = append(filtered, row)
 			}
-			filtered = append(filtered, view)
 		}
 		total := len(filtered)
 		if offset > total {
@@ -3356,7 +3383,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 		if len(filtered) > limit {
 			filtered = filtered[:limit]
 		}
-		writeJSON(w, http.StatusOK, tasksQueryResponse{Tasks: filtered, Total: total, Limit: limit, Offset: offset})
+		writeJSON(w, http.StatusOK, tasksQueryResponse{Tasks: taskRowViews(filtered), Total: total, Limit: limit, Offset: offset})
 	case http.MethodPost:
 		var req struct {
 			Targets     []string `json:"targets"`
@@ -3843,6 +3870,15 @@ type taskTargetView struct {
 // that drift, and so nothing has to migrate rows written before the deadline
 // existed.
 func (s *Server) toTaskView(t model.Task) taskView {
+	view := s.taskStateView(t)
+	view.ScriptSHA256 = scriptSHA256(t.Script)
+	return view
+}
+
+// taskStateView is toTaskView without the script digest. Hashing every
+// script is most of the cost of reading the whole task list, so reads that
+// only count or filter rows use this and hash just the rows they return.
+func (s *Server) taskStateView(t model.Task) taskView {
 	status := t.Status
 	if (status == model.TaskQueued || status == model.TaskLeased) &&
 		store.TaskPastQueueDeadline(t, s.now(), s.store.TaskQueueDeadline()) {
@@ -3895,7 +3931,6 @@ func (s *Server) toTaskView(t model.Task) taskView {
 		TokenID:         t.TokenID,
 		Targets:         t.Targets,
 		Interpreter:     t.Interpreter,
-		ScriptSHA256:    scriptSHA256(t.Script),
 		ScriptSizeBytes: len([]byte(t.Script)),
 		TimeoutSec:      t.TimeoutSec,
 		OutputLimit:     t.OutputLimit,
@@ -3940,7 +3975,7 @@ type tasksQueryResponse struct {
 
 func taskQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"node_id", "limit", "offset"} {
+	for _, key := range []string{"status", "since", "node_id", "origin", "limit", "offset"} {
 		if _, ok := q[key]; ok {
 			return true
 		}

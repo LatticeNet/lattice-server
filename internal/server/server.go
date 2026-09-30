@@ -4002,21 +4002,67 @@ func taskResultQueryRequested(r *http.Request) bool {
 	return false
 }
 
+// maxTaskResultIDs caps the task_id list on GET /api/task-results. One page of
+// runs with their reruns fits well inside it, and 100 ids of 21 bytes keep the
+// request line far below the 8 KB an nginx edge accepts by default.
+const maxTaskResultIDs = 100
+
+// parseTaskIDList reads the task_id comma list of GET /api/task-results.
+// Blank entries are skipped, duplicates collapse, and more than
+// maxTaskResultIDs distinct ids is an error rather than a silent truncation.
+func parseTaskIDList(raw string) (map[string]bool, error) {
+	var ids map[string]bool
+	for _, taskID := range strings.Split(raw, ",") {
+		taskID = strings.TrimSpace(taskID)
+		if taskID == "" {
+			continue
+		}
+		if ids == nil {
+			ids = map[string]bool{}
+		}
+		ids[taskID] = true
+		if len(ids) > maxTaskResultIDs {
+			return nil, fmt.Errorf("task_id takes at most %d ids", maxTaskResultIDs)
+		}
+	}
+	return ids, nil
+}
+
+// handleTaskResults serves GET /api/task-results: per-node execution results,
+// newest finish first, for the nodes the caller holds task:read on. The store
+// keeps the newest 2,000 results; older ones are gone from here and the task
+// row's own status is what remains.
+//
+// Query parameters, all optional:
+//
+//	task_id=a,b           keep results of these tasks, at most 100 distinct ids
+//	                      (maxTaskResultIDs); more is a 400, never truncated
+//	node_id=<id>          keep results from one node
+//	omit_output=1         send stdout_bytes and stderr_bytes instead of the
+//	                      bodies
+//	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
+//
+// Without any of them the response is the bare array of every visible result.
+// With any of them it is the {"results","total","limit","offset"} envelope.
+// An explicit limit always pages. omit_output without a limit still returns
+// every match, because the Tasks page polls that way and builds each node's
+// row from all of them; design 23 wave 2 moves that poll to task_id=<the ids
+// on screen> and applies the default page here in the same release.
 func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
 	results := s.store.Results() // newest-first
-	visible := make([]taskResultView, 0, len(results))
-	for _, result := range results {
-		if rbac.Allows(p.Principal, "task:read", result.NodeID) {
-			visible = append(visible, s.withExecContext(toTaskResultView(result)))
-		}
-	}
 	if !taskResultQueryRequested(r) {
 		// Backward-compatible bare mode: the full visible array (bounded by the
 		// store's result cap). Filtering/pagination is opt-in below.
+		visible := make([]taskResultView, 0, len(results))
+		for _, result := range results {
+			if rbac.Allows(p.Principal, "task:read", result.NodeID) {
+				visible = append(visible, s.withExecContext(toTaskResultView(result)))
+			}
+		}
 		writeJSON(w, http.StatusOK, visible)
 		return
 	}
@@ -4031,36 +4077,49 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	taskIDs, err := parseTaskIDList(q.Get("task_id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	// omit_output strips stdout/stderr bodies from every row and reports their
 	// sizes instead. It exists for pollers: a status subscription needs exit
 	// codes and timing, not megabytes of probe output on every tick.
 	omitOutput := q.Get("omit_output") == "1" || q.Get("omit_output") == "true"
-	taskID := strings.TrimSpace(q.Get("task_id"))
 	nodeID := strings.TrimSpace(q.Get("node_id"))
-	filtered := make([]taskResultView, 0, len(visible))
-	for _, view := range visible {
-		if taskID != "" && view.TaskID != taskID {
+	matched := make([]model.TaskResult, 0, len(results))
+	for _, result := range results {
+		if !rbac.Allows(p.Principal, "task:read", result.NodeID) {
 			continue
 		}
-		if nodeID != "" && view.NodeID != nodeID {
+		if taskIDs != nil && !taskIDs[result.TaskID] {
 			continue
 		}
-		filtered = append(filtered, view)
+		if nodeID != "" && result.NodeID != nodeID {
+			continue
+		}
+		matched = append(matched, result)
 	}
-	total := len(filtered)
+	total := len(matched)
 	if omitOutput && strings.TrimSpace(q.Get("limit")) == "" {
-		// Bodyless rows are light enough to return in full; forcing the
-		// default page size here would silently hide older rollups from the
-		// screens this mode was built for. An explicit limit still wins.
+		// yagni: unbounded until design 23 wave 2 switches the Tasks poll to
+		// task_id; the store caps results at 2,000, which bounds this. Then
+		// drop this override so the default page applies.
 		limit = total
 	}
 	if offset > total {
-		filtered = nil
+		matched = nil
 	} else {
-		filtered = filtered[offset:]
+		matched = matched[offset:]
 	}
-	if len(filtered) > limit {
-		filtered = filtered[:limit]
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	// The pinned execution context is a store read per row, so only the page
+	// being returned pays for it.
+	filtered := make([]taskResultView, 0, len(matched))
+	for _, result := range matched {
+		filtered = append(filtered, s.withExecContext(toTaskResultView(result)))
 	}
 	if omitOutput {
 		for i := range filtered {

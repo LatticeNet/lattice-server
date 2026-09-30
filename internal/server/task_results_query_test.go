@@ -115,7 +115,9 @@ func TestTaskStderrHead(t *testing.T) {
 		{"one line", "sh: curl: not found\n", "sh: curl: not found"},
 		{"first non-blank line, trimmed", "\n\n   warn: disk 91% full  \nsecond line", "warn: disk 91% full"},
 		{"carriage returns end a line", "\r\n  \r100  5120\rcurl: (22) 404\n", "100  5120"},
-		{"tabs become spaces, control characters go", "\x1b[31mfailed\x1b[0m\tcode\x07 7", "[31mfailed[0m code 7"},
+		{"tabs become spaces, escapes and control characters go", "\x1b[31mfailed\x1b[0m\tcode\x07 7", "failed code 7"},
+		{"a line of only escapes is blank", "\x1b[0m\x1b[?25l\nreal error", "real error"},
+		{"an erase-line CSI before a progress update", "\x1b[2Kdownloading 45%", "downloading 45%"},
 		{"invalid UTF-8 is replaced", "bad \xff byte", "bad � byte"},
 		{"long ASCII is cut at 200 bytes", strings.Repeat("a", 300), strings.Repeat("a", 200)},
 		// 199 bytes then a 3-byte rune: the cut must not split it.
@@ -203,5 +205,39 @@ func TestTaskResultsStderrHeadFollowsTheFullReadCheck(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusForbidden {
 		t.Fatalf("results without task:read = %d, want 403", res.StatusCode)
+	}
+}
+
+func TestStripANSI(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"no escapes", "plain text 中文", "plain text 中文"},
+		{"SGR colour", "\x1b[31mfailed\x1b[0m", "failed"},
+		{"SGR with several parameters", "\x1b[1;38;5;196mbold red\x1b[m", "bold red"},
+		{"erase line", "\x1b[2Kdone", "done"},
+		{"private mode", "\x1b[?25lcursor hidden\x1b[?25h", "cursor hidden"},
+		{"OSC title ended by BEL", "\x1b]0;build: main\x07error: boom", "error: boom"},
+		{"OSC title with UTF-8 ended by ST", "\x1b]2;标题\x1b\\ok", "ok"},
+		{"OSC 8 hyperlink", "see \x1b]8;;https://example.com\x1b\\the docs\x1b]8;;\x1b\\ now", "see the docs now"},
+		{"unterminated OSC runs to the end", "before\x1b]0;title never ends", "before"},
+		{"DCS ended by ST", "a\x1bPq#0;2;0;0;0\x1b\\b", "ab"},
+		{"charset designation", "\x1b(Bplain\x1b)0", "plain"},
+		{"two-byte escape", "\x1b7saved\x1b8", "saved"},
+		{"lone ESC at the end", "abc\x1b", "abc"},
+		// A CSI cut short by a byte outside its grammar ends at that byte.
+		{"malformed CSI keeps what follows", "\x1b[12中文", "中文"},
+		{"text on both sides keeps its UTF-8", "中\x1b[31m文\x1b[0m字", "中文字"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripANSI(tc.in)
+			if got != tc.want {
+				t.Fatalf("stripANSI(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("stripANSI(%q) returned invalid UTF-8 %q", tc.in, got)
+			}
+		})
 	}
 }

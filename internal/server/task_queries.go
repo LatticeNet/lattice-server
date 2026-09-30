@@ -60,9 +60,10 @@ func taskResultReadable(p principal, result model.TaskResult) bool {
 // taskStderrHead is the first non-blank line of stderr, so a failed run can
 // say why in one line ("sh: curl: not found") without the body. A carriage
 // return ends a line as a newline does (progress meters rewrite a line with
-// it), control characters are dropped, invalid UTF-8 becomes U+FFFD, and the
-// line is trimmed and cut to at most maxStderrHeadBytes on a UTF-8
-// boundary. It is empty when stderr holds nothing but blank lines.
+// it), invalid UTF-8 becomes U+FFFD, ANSI escape sequences are removed whole
+// (stripANSI), remaining control characters are dropped, and the line is
+// trimmed and cut to at most maxStderrHeadBytes on a UTF-8 boundary. It is
+// empty when stderr holds nothing but blank lines.
 func taskStderrHead(stderr string) string {
 	for _, line := range strings.FieldsFunc(stderr, func(r rune) bool { return r == '\n' || r == '\r' }) {
 		line = strings.Map(func(r rune) rune {
@@ -73,7 +74,7 @@ func taskStderrHead(stderr string) string {
 				return -1
 			}
 			return r
-		}, strings.ToValidUTF8(line, "�"))
+		}, stripANSI(strings.ToValidUTF8(line, "�")))
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -88,6 +89,73 @@ func taskStderrHead(stderr string) string {
 		return line
 	}
 	return ""
+}
+
+// stripANSI removes ANSI escape sequences whole, so "\x1b[31mfailed\x1b[0m"
+// reads "failed" rather than "[31mfailed[0m":
+//   - CSI: ESC [ then parameter bytes 0x30-0x3F, intermediate bytes 0x20-0x2F
+//     and one final byte 0x40-0x7E (colours, ESC [ 2 K, ESC [ ? 25 l);
+//   - OSC, DCS, SOS, PM and APC: ESC ] (or P, X, ^, _) up to BEL or ST
+//     (ESC \), such as a window title or an OSC 8 hyperlink; an unterminated
+//     one runs to the end of the text;
+//   - any other escape: ESC, intermediate bytes 0x20-0x2F, one final byte
+//     0x30-0x7E (ESC ( B, ESC 7).
+//
+// A sequence cut short by a byte outside its grammar ends there and scanning
+// resumes at that byte. Every byte that starts, delimits or ends a sequence is
+// ASCII, and no UTF-8 multibyte character contains an ASCII byte, so the text
+// around a sequence keeps its UTF-8 intact.
+func stripANSI(s string) string {
+	if strings.IndexByte(s, 0x1b) < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != 0x1b {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		i++ // ESC
+		if i >= len(s) {
+			break
+		}
+		switch c := s[i]; {
+		case c == '[':
+			i++
+			for i < len(s) && s[i] >= 0x30 && s[i] <= 0x3f {
+				i++
+			}
+			for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
+				i++
+			}
+			if i < len(s) && s[i] >= 0x40 && s[i] <= 0x7e {
+				i++
+			}
+		case c == ']' || c == 'P' || c == 'X' || c == '^' || c == '_':
+			i++
+			for i < len(s) {
+				if s[i] == 0x07 {
+					i++
+					break
+				}
+				if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+					i += 2
+					break
+				}
+				i++
+			}
+		default:
+			for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
+				i++
+			}
+			if i < len(s) && s[i] >= 0x30 && s[i] <= 0x7e {
+				i++
+			}
+		}
+	}
+	return b.String()
 }
 
 func taskOrigin(t model.Task) string {

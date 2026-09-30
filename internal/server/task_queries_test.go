@@ -233,7 +233,7 @@ func TestTaskCountsWireNamesAndScope(t *testing.T) {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"queued", "running", "stalled", "failed_24h", "finished_24h", "total", "generated_at"}
+	want := []string{"queued", "running", "stalled", "pending", "failed_24h", "finished_24h", "total", "generated_at"}
 	if len(raw) != len(want) {
 		t.Fatalf("counts carries %d fields, want exactly %v: %s", len(raw), want, body)
 	}
@@ -456,5 +456,57 @@ func TestTaskRowsCarryOriginAndOnlyReadableApprovalIDs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Rows the plugin task host stored as "pending" before its fix were never
+// delivered. They are not migrated or delivered late; the list finds them,
+// the counts name them, and cancel closes them.
+func TestPendingRowsAreFoundCountedAndCancellable(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	admin := taskQueryReader{handler: handler, cookies: cookies}
+	now := time.Now().UTC()
+	for _, task := range []model.Task{
+		{ID: "t-pending", Targets: []string{"node-a"}, ApprovalID: "ap-x", ActorID: "plugin:demo", Status: store.TaskPending, CreatedAt: now.Add(-30 * 24 * time.Hour)},
+		{ID: "t-queued", Targets: []string{"node-a"}, Status: model.TaskQueued, CreatedAt: now.Add(-time.Minute)},
+	} {
+		task.Interpreter, task.Script = "sh", "echo "+task.ID
+		if err := st.CreateTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := admin.counts(t)
+	if got.Pending != 1 || got.Queued != 1 || got.Total != 2 {
+		t.Fatalf("counts = %+v, want pending 1, queued 1, total 2", got)
+	}
+	if ids := sortedTaskIDs(admin.tasks(t, "status=pending").Tasks); strings.Join(ids, ",") != "t-pending" {
+		t.Fatalf("status=pending = %v", ids)
+	}
+	// Still never delivered: only the queued task reaches the agent.
+	leased, err := st.LeaseTasks("node-a", 10)
+	if err != nil || len(leased) != 1 || leased[0].ID != "t-queued" {
+		t.Fatalf("node-a leased %d tasks (err %v), want only t-queued", len(leased), err)
+	}
+
+	res := doJSON(t, handler, http.MethodPost, "/api/tasks/cancel", `{"id":"t-pending"}`, cookies, csrf)
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("cancel pending = %d: %s", res.StatusCode, body)
+	}
+	var view taskView
+	if err := json.Unmarshal(body, &view); err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != model.TaskCancelled || view.FinishedAt.IsZero() {
+		t.Fatalf("cancelled view = status %q finished_at %v", view.Status, view.FinishedAt)
+	}
+	if got := admin.counts(t); got.Pending != 0 {
+		t.Fatalf("pending after cancel = %d, want 0", got.Pending)
+	}
+	if total := admin.tasks(t, "status=cancelled").Total; total != 1 {
+		t.Fatalf("status=cancelled total = %d, want the closed row", total)
 	}
 }

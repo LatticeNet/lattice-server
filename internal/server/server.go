@@ -3316,15 +3316,16 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 //
 // GET needs task:read and lists the tasks whose every target the caller may
 // read, newest first. Each row's status is the view status (toTaskView):
-// queued, leased, stalled, expired, finished, failed or cancelled. Each row
-// also says how it was queued (origin) and, when the caller may read that
-// approval, which approval queued it (approval_id), so the console can link a
-// task to its plan.
+// queued, leased, stalled, expired, finished, failed or cancelled, or pending
+// on a row the plugin task host stored before its fix and never delivered
+// (store.TaskPending). Each row also says how it was queued (origin) and,
+// when the caller may read that approval, which approval queued it
+// (approval_id), so the console can link a task to its plan.
 //
 // Query parameters, all optional:
 //
 //	status=a,b            keep rows whose status is in the comma list; a value
-//	                      outside the seven above is a 400, never ignored
+//	                      outside the eight above is a 400, never ignored
 //	since=<RFC3339>       keep rows that last changed at or after the instant
 //	                      (taskLastChangedAt: the latest of created, started,
 //	                      finished and lease start, or the expiry instant of
@@ -3480,9 +3481,10 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 	}
 }
 
-// handleCancelTask cancels a queued or leased task. For a queued task that
-// withdraws delivery; for a leased one it stops the wait (the lease gate
-// refuses any late result). Terminal tasks are rejected.
+// handleCancelTask cancels a queued, leased or pending task. For a queued task
+// that withdraws delivery; for a leased one it stops the wait (the lease gate
+// refuses any late result); a pending one (store.TaskPending) was never
+// delivered and is closed as cancelled. Terminal tasks are rejected.
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

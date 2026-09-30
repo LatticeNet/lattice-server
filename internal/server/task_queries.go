@@ -14,12 +14,13 @@ import (
 )
 
 // taskListStatuses are the values a task row's status takes on the wire: the
-// stored statuses plus the two the view derives, expired and stalled. The
-// status filter accepts exactly these, so a filter can only ask for something
-// a row can say.
+// stored statuses plus the two the view derives, expired and stalled, plus
+// pending, which only rows the plugin task host stored before its fix carry
+// (store.TaskPending: never delivered). The status filter accepts exactly
+// these, so a filter can only ask for something a row can say.
 var taskListStatuses = []string{
 	model.TaskQueued, model.TaskLeased, store.TaskStalled, store.TaskExpired,
-	model.TaskFinished, model.TaskFailed, model.TaskCancelled,
+	model.TaskFinished, model.TaskFailed, model.TaskCancelled, store.TaskPending,
 }
 
 // Task origins partition every task by how it was queued. They are derived
@@ -228,6 +229,7 @@ type taskCountsResponse struct {
 	Queued      int       `json:"queued"`
 	Running     int       `json:"running"`
 	Stalled     int       `json:"stalled"`
+	Pending     int       `json:"pending"`
 	Failed24h   int       `json:"failed_24h"`
 	Finished24h int       `json:"finished_24h"`
 	Total       int       `json:"total"`
@@ -238,7 +240,7 @@ type taskCountsResponse struct {
 // numbers, so the home tile and the Tasks head stop reading every task (1,771
 // rows on 2026-09-30) to count them.
 //
-//	{"queued","running","stalled","failed_24h","finished_24h","total","generated_at"}
+//	{"queued","running","stalled","pending","failed_24h","finished_24h","total","generated_at"}
 //
 // It needs task:read and counts only the tasks GET /api/tasks would list for
 // the same caller: a task counts when the caller may read every one of its
@@ -251,6 +253,12 @@ type taskCountsResponse struct {
 // result and no target holds a live lease). A rerun is its own row and counts
 // here while it waits or runs, so each of these equals the total of GET
 // /api/tasks?status=<the same status>. total is every row the caller may read.
+//
+// pending counts rows stored before the fix, never delivered: tasks the
+// plugin task host wrote with status "pending" (store.TaskPending), which no
+// agent is ever handed. They are not in queued, because nothing will run
+// them; POST /api/tasks/cancel closes one. Production held none on
+// 2026-09-30, so this is 0 there.
 //
 // failed_24h and finished_24h count runs, not rows. A run is a root task
 // (one that is not a rerun, or whose original the caller cannot see) together
@@ -282,6 +290,8 @@ func (s *Server) handleTaskCounts(w http.ResponseWriter, r *http.Request, p prin
 			out.Running++
 		case store.TaskStalled:
 			out.Stalled++
+		case store.TaskPending:
+			out.Pending++
 		}
 	}
 	out.Failed24h, out.Finished24h = s.countTaskRunOutcomes(rows, now.Add(-taskCountsWindow))

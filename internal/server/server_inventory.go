@@ -820,6 +820,7 @@ const (
 // never reset) stayed sticky-true after an agent died, so the fleet kept showing
 // dead nodes as online and geo-routing kept treating them as healthy.
 func (s *Server) startNodeLivenessSweeper() {
+	s.nodeAlerts.start(s.now())
 	go func() {
 		s.sweepNodeLiveness(s.now(), store.NodeStatusCauseServerStart)
 		ticker := time.NewTicker(nodeLivenessSweepInterval)
@@ -841,10 +842,6 @@ func (s *Server) sweepNodeLiveness(now time.Time, cause string) {
 		s.logger.Printf("node status history prune: %v", err)
 	}
 	for _, n := range flipped {
-		name := n.Name
-		if name == "" {
-			name = n.ID
-		}
 		s.recordAudit(model.AuditEvent{
 			ID:     id.New("audit"),
 			NodeID: n.ID,
@@ -852,8 +849,8 @@ func (s *Server) sweepNodeLiveness(now time.Time, cause string) {
 			Scope:  "node:read",
 			Reason: "no heartbeat within liveness threshold",
 		})
-		s.emitNotify("🔌 节点离线", fmt.Sprintf("节点 %s (%s) 超过 %s 未上报心跳，已标记为离线。", name, n.ID, nodeOfflineThreshold))
 	}
+	s.notifyNodeLiveness(now)
 }
 
 // recordNodeOnline is the audit twin of the sweep's node.offline, written on
@@ -866,6 +863,7 @@ func (s *Server) recordNodeOnline(nodeID string) {
 		Scope:  "node:read",
 		Reason: "heartbeat resumed",
 	})
+	s.noteNodeOnline(nodeID, s.now())
 }
 
 func (s *Server) evaluateReminders(now time.Time) {

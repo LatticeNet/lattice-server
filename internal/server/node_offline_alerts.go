@@ -26,11 +26,19 @@ const (
 	// recorded between 2026-09-07 and 2026-09-30, 75% ended within five minutes.
 	nodeOfflineAlertAfter = 10 * time.Minute
 	// nodeQuietOfflineTag keeps a node out of node.offline and node.online.
-	// Laptops and machines that sleep go offline by design.
-	// yagni: a reserved tag, not a per-node alert policy. The ceiling is one
-	// on/off word per node; a policy with per-node delays is the upgrade if an
-	// operator needs more than that.
 	nodeQuietOfflineTag = "no-offline-alert"
+	// nodeOfflineAfterTagPrefix sets a node's own delay, as
+	// "offline-alert-after:3h" or ":45m". Machines that sleep or roam go
+	// offline all the time; the operator still wants to hear when one stays
+	// gone for hours. The silence is recorded either way (audit and status
+	// history); only the page waits.
+	// yagni: policy lives in tags, which the console already edits and both
+	// store runtimes already persist. The ceiling is one delay per node with
+	// no schedule; a stored per-node policy with its own editor is the
+	// upgrade if that stops being enough.
+	nodeOfflineAfterTagPrefix = "offline-alert-after:"
+	minNodeOfflineAlertAfter  = 2 * time.Minute
+	maxNodeOfflineAlertAfter  = 7 * 24 * time.Hour
 )
 
 // nodeOfflineAlerts is the in-memory half of node.offline: which offline spell
@@ -81,7 +89,7 @@ func (s *Server) noteNodeOnline(nodeID string, now time.Time) {
 }
 
 // notifyNodeLiveness sends node.offline for nodes silent past
-// nodeOfflineAlertAfter and node.online for alerted nodes that came back since
+// their delay and node.online for alerted nodes that came back since
 // the previous sweep. Each kind is one message per sweep, so a network blip on
 // the control plane's side cannot page once per node.
 func (s *Server) notifyNodeLiveness(now time.Time) {
@@ -101,10 +109,11 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 	var down []nodeLivenessChange
 	for _, n := range nodes {
 		present[n.ID] = true
-		if n.Online || n.LastSeen.IsZero() || nodeQuietOffline(n) {
+		delay, pages := nodeOfflineDelay(n)
+		if n.Online || n.LastSeen.IsZero() || !pages {
 			continue
 		}
-		if !a.since.IsZero() && n.LastSeen.Before(a.since.Add(-nodeOfflineAlertAfter)) {
+		if !a.since.IsZero() && n.LastSeen.Before(a.since.Add(-delay)) {
 			// Already silent past the delay when this process started. The
 			// previous process had the spell; alerting it here would repeat
 			// on every restart for a node that is simply gone.
@@ -114,7 +123,7 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 		if silentFrom.Before(a.since) {
 			silentFrom = a.since
 		}
-		if now.Sub(silentFrom) < nodeOfflineAlertAfter {
+		if now.Sub(silentFrom) < delay {
 			continue
 		}
 		if spell, ok := a.alerted[n.ID]; ok && spell.Equal(n.LastSeen) {
@@ -142,13 +151,56 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 	}
 }
 
-func nodeQuietOffline(n model.Node) bool {
+// nodeOfflineDelay is how long n must stay silent before node.offline, and
+// false when it never pages. The quiet tag wins over any delay; of several
+// valid delay tags the longest wins; a tag that does not parse is ignored
+// here and shown as invalid by the console, so a typo falls back to the
+// default rather than to silence.
+func nodeOfflineDelay(n model.Node) (time.Duration, bool) {
+	var custom time.Duration
 	for _, tag := range n.Tags {
-		if strings.EqualFold(strings.TrimSpace(tag), nodeQuietOfflineTag) {
-			return true
+		tag = strings.ToLower(strings.TrimSpace(tag))
+		if tag == nodeQuietOfflineTag {
+			return 0, false
+		}
+		if d, ok := parseNodeOfflineAfterTag(tag); ok && d > custom {
+			custom = d
 		}
 	}
-	return false
+	if custom > 0 {
+		return custom, true
+	}
+	return nodeOfflineAlertAfter, true
+}
+
+// parseNodeOfflineAfterTag reads "offline-alert-after:<digits><m|h>" within
+// minNodeOfflineAlertAfter and maxNodeOfflineAlertAfter.
+func parseNodeOfflineAfterTag(tag string) (time.Duration, bool) {
+	value, ok := strings.CutPrefix(tag, nodeOfflineAfterTagPrefix)
+	if !ok || len(value) < 2 || len(value) > 6 {
+		return 0, false
+	}
+	digits, unit := value[:len(value)-1], value[len(value)-1]
+	var n int64
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(r-'0')
+	}
+	var d time.Duration
+	switch unit {
+	case 'm':
+		d = time.Duration(n) * time.Minute
+	case 'h':
+		d = time.Duration(n) * time.Hour
+	default:
+		return 0, false
+	}
+	if d < minNodeOfflineAlertAfter || d > maxNodeOfflineAlertAfter {
+		return 0, false
+	}
+	return d, true
 }
 
 func nodeLabel(n model.Node) string {

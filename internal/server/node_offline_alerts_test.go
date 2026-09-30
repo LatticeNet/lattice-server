@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -236,5 +237,72 @@ func TestNodeOfflineAlertCountsOnlySilenceThisProcessSaw(t *testing.T) {
 func TestTwoFactorLimitAlertHasItsOwnEventType(t *testing.T) {
 	if got := classifyNotifyEvent("🔐 2FA attempt limit"); got != "auth.2fa_limit" {
 		t.Fatalf("classifyNotifyEvent: got %q", got)
+	}
+}
+
+// A node with its own delay is recorded offline at 90s like any other, pages
+// only after its delay, and its return still pages at the next sweep.
+func TestNodeOfflineDelayTagWaitsItsOwnTime(t *testing.T) {
+	l := newLivenessAlertServer(t)
+	srv, handler, st := l.srv, l.handler, l.st
+	cookies, csrf := loginSession(t, handler)
+	token := enrollAndBeat(t, handler, cookies, csrf, "n-roam", "roam")
+	res := doJSON(t, handler, http.MethodPost, "/api/nodes/update",
+		`{"node_id":"n-roam","name":"roam","tags":["cd","offline-alert-after:3h"]}`, cookies, csrf)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("tag update: %d", res.StatusCode)
+	}
+	res.Body.Close()
+	ls := lastSeenOf(t, st, "n-roam")
+
+	srv.sweepNodeLiveness(ls.Add(11*time.Minute), sweepCause)
+	if n, _ := st.Node("n-roam"); n.Online {
+		t.Fatal("a delayed node is still marked offline at the liveness threshold")
+	}
+	expectNoNotice(t, l, "past the default delay")
+	srv.sweepNodeLiveness(ls.Add(3*time.Hour-time.Minute), sweepCause)
+	expectNoNotice(t, l, "a minute before its own delay")
+	srv.sweepNodeLiveness(ls.Add(3*time.Hour+time.Second), sweepCause)
+	got := expectOneNotice(t, l, EventNodeOffline, "Lattice node offline: roam")
+	if !strings.Contains(got.body, "has not reported for 3 h") {
+		t.Fatalf("offline body: %q", got.body)
+	}
+
+	beat(t, handler, "n-roam", token)
+	srv.sweepNodeLiveness(lastSeenOf(t, st, "n-roam"), sweepCause)
+	expectOneNotice(t, l, EventNodeOnline, "Lattice node online: roam")
+}
+
+func TestNodeOfflineDelayReadsTags(t *testing.T) {
+	cases := []struct {
+		tags  []string
+		delay time.Duration
+		pages bool
+	}{
+		{nil, nodeOfflineAlertAfter, true},
+		{[]string{"cd", "Mac"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after:3h"}, 3 * time.Hour, true},
+		{[]string{" Offline-Alert-After:45m "}, 45 * time.Minute, true},
+		{[]string{"offline-alert-after:2m"}, 2 * time.Minute, true},
+		{[]string{"offline-alert-after:168h"}, 168 * time.Hour, true},
+		{[]string{"offline-alert-after:30m", "offline-alert-after:3h"}, 3 * time.Hour, true},
+		{[]string{"offline-alert-after:3h", "no-offline-alert"}, 0, false},
+		{[]string{"NO-OFFLINE-ALERT"}, 0, false},
+		// Anything that does not parse falls back to the default, never to silence.
+		{[]string{"offline-alert-after:3d"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after:0h"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after:1m"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after:169h"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after:3"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after:h"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after:+3h"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after: 3h"}, nodeOfflineAlertAfter, true},
+		{[]string{"offline-alert-after:99999999h"}, nodeOfflineAlertAfter, true},
+	}
+	for _, c := range cases {
+		delay, pages := nodeOfflineDelay(model.Node{Tags: c.tags})
+		if delay != c.delay || pages != c.pages {
+			t.Errorf("tags %q: got (%v, %v), want (%v, %v)", c.tags, delay, pages, c.delay, c.pages)
+		}
 	}
 }

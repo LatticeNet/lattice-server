@@ -4229,6 +4229,25 @@ func toTaskResultView(r model.TaskResult) taskResultView {
 	}
 }
 
+// handleAudit serves GET /api/audit: the audit log newest first, limited to
+// the events the caller may read (a node-confined principal sees only events
+// on its nodes, never node-less ones; see auditVisibility).
+//
+// Without query parameters the response is the bare array of the newest 100
+// visible events. With any of action, decision, node_id, actor_id, token_id,
+// scope, correlation_id, q, at_from, at_to, exclude_action, limit or offset it
+// is the auditQueryResponse envelope: one page of matching events plus total,
+// scanned and complete, so a client can say "412 of 412 scanned" or "at least
+// 50,000" instead of printing a partial count as the whole.
+//
+// exclude_action is a comma list of up to 16 action prefixes (an optional
+// trailing "*" means the same prefix), each 1 to 128 characters from
+// [A-Za-z0-9._:/-]. An event whose action starts with any of them is dropped
+// inside the scan, before it is counted or paged, so total and the pages stay
+// true to the question asked and scanned still counts every record examined.
+// The Changes layer uses it to hide node.online and node.offline flips, which
+// arrived about 44 a day on the 34-node fleet of 2026-09-30 and bury the
+// changes an operator is looking for.
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -4311,7 +4330,7 @@ type auditQueryResponse struct {
 
 func auditQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset", "q", "at_from", "at_to"} {
+	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset", "q", "at_from", "at_to", "exclude_action"} {
 		if _, ok := q[key]; ok {
 			return true
 		}
@@ -4330,6 +4349,7 @@ type auditQuerySpec struct {
 	atFrom        time.Time
 	atTo          time.Time
 	text          string
+	exclude       []string // action prefixes whose events the query drops
 	limit         int
 	offset        int
 }
@@ -4352,6 +4372,10 @@ func parseAuditQuery(r *http.Request) (auditQuerySpec, error) {
 	if err != nil {
 		return auditQuerySpec{}, err
 	}
+	exclude, err := parseAuditExcludeActions(q.Get("exclude_action"))
+	if err != nil {
+		return auditQuerySpec{}, err
+	}
 	return auditQuerySpec{
 		action:        q.Get("action"),
 		decision:      q.Get("decision"),
@@ -4363,6 +4387,7 @@ func parseAuditQuery(r *http.Request) (auditQuerySpec, error) {
 		atFrom:        atFrom,
 		atTo:          atTo,
 		text:          strings.ToLower(strings.TrimSpace(q.Get("q"))),
+		exclude:       exclude,
 		limit:         limit,
 		offset:        offset,
 	}, nil
@@ -4381,7 +4406,56 @@ func (q auditQuerySpec) matches(ev model.AuditEvent) bool {
 	if q.text != "" && !auditTextMatch(ev, q.text) {
 		return false
 	}
+	for _, prefix := range q.exclude {
+		if strings.HasPrefix(ev.Action, prefix) {
+			return false
+		}
+	}
 	return true
+}
+
+const (
+	// maxAuditExcludeActions bounds exclude_action: every entry is a prefix
+	// test on every scanned record, up to auditScanCap of them.
+	maxAuditExcludeActions   = 16
+	maxAuditActionPrefixSize = 128
+)
+
+// parseAuditExcludeActions reads exclude_action. Blank entries are skipped
+// and duplicates collapse; an entry that is empty after its optional trailing
+// "*", too long, or outside [A-Za-z0-9._:/-] is an error, as is a list of more
+// than maxAuditExcludeActions distinct prefixes. A lone "*" is refused rather
+// than read as "exclude everything".
+func parseAuditExcludeActions(raw string) ([]string, error) {
+	var prefixes []string
+	seen := map[string]bool{}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		prefix := strings.TrimSuffix(entry, "*")
+		if prefix == "" {
+			return nil, errors.New("exclude_action entries must name an action prefix")
+		}
+		if len(prefix) > maxAuditActionPrefixSize {
+			return nil, fmt.Errorf("exclude_action entries must be at most %d characters", maxAuditActionPrefixSize)
+		}
+		for _, c := range prefix {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._:/-", c)) {
+				return nil, fmt.Errorf("exclude_action entry %q may use only letters, digits and . _ : / -", entry)
+			}
+		}
+		if seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		prefixes = append(prefixes, prefix)
+		if len(prefixes) > maxAuditExcludeActions {
+			return nil, fmt.Errorf("exclude_action takes at most %d prefixes", maxAuditExcludeActions)
+		}
+	}
+	return prefixes, nil
 }
 
 // collectAuditPage walks the log newest-first and keeps only the requested

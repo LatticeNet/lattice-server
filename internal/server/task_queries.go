@@ -80,12 +80,20 @@ func (s *Server) visibleTaskRows(p principal) []taskRow {
 }
 
 // taskRowViews is the response form of rows: each view completed with its
-// script digest, exactly what toTaskView returns.
-func taskRowViews(rows []taskRow) []taskView {
+// script digest, as toTaskView returns it, and with the approval id when p may
+// read that approval. The approval read answers 404 alike for a missing plan
+// and one outside the caller's scope, so a row must not name an approval the
+// caller could not open; origin still says the task came from one.
+func (s *Server) taskRowViews(p principal, rows []taskRow) []taskView {
 	views := make([]taskView, 0, len(rows))
 	for _, row := range rows {
 		view := row.view
 		view.ScriptSHA256 = scriptSHA256(row.task.Script)
+		if approvalID := row.task.ApprovalID; approvalID != "" {
+			if approval, ok := s.store.Approval(approvalID); ok && s.approvalVisibleToPrincipal(p, approval) {
+				view.ApprovalID = approvalID
+			}
+		}
 		views = append(views, view)
 	}
 	return views

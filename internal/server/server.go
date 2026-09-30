@@ -3316,7 +3316,10 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 //
 // GET needs task:read and lists the tasks whose every target the caller may
 // read, newest first. Each row's status is the view status (toTaskView):
-// queued, leased, stalled, expired, finished, failed or cancelled.
+// queued, leased, stalled, expired, finished, failed or cancelled. Each row
+// also says how it was queued (origin) and, when the caller may read that
+// approval, which approval queued it (approval_id), so the console can link a
+// task to its plan.
 //
 // Query parameters, all optional:
 //
@@ -3347,7 +3350,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			return
 		}
 		if !taskQueryRequested(r) {
-			writeJSON(w, http.StatusOK, taskRowViews(s.visibleTaskRows(p)))
+			writeJSON(w, http.StatusOK, s.taskRowViews(p, s.visibleTaskRows(p)))
 			return
 		}
 		q := r.URL.Query()
@@ -3383,7 +3386,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 		if len(filtered) > limit {
 			filtered = filtered[:limit]
 		}
-		writeJSON(w, http.StatusOK, tasksQueryResponse{Tasks: taskRowViews(filtered), Total: total, Limit: limit, Offset: offset})
+		writeJSON(w, http.StatusOK, tasksQueryResponse{Tasks: s.taskRowViews(p, filtered), Total: total, Limit: limit, Offset: offset})
 	case http.MethodPost:
 		var req struct {
 			Targets     []string `json:"targets"`
@@ -3845,6 +3848,14 @@ type taskView struct {
 	LeaseAgeSeconds int64                     `json:"lease_age_seconds,omitempty"`
 	StalledReason   string                    `json:"stalled_reason,omitempty"`
 	TargetStates    map[string]taskTargetView `json:"target_states,omitempty"`
+	// Origin is how the task was queued: approval, rerun or direct
+	// (taskOrigin). The origin filter on GET /api/tasks matches it.
+	Origin string `json:"origin"`
+	// ApprovalID names the approval that queued the task. Only list rows
+	// carry it, and only when the caller may read that approval
+	// (taskRowViews), because the approvals read never confirms that a plan
+	// the caller cannot read exists.
+	ApprovalID string `json:"approval_id,omitempty"`
 }
 
 // taskTargetView is one target's progress inside a leased task.
@@ -3929,6 +3940,7 @@ func (s *Server) taskStateView(t model.Task) taskView {
 		ID:              t.ID,
 		ActorID:         t.ActorID,
 		TokenID:         t.TokenID,
+		Origin:          taskOrigin(t),
 		Targets:         t.Targets,
 		Interpreter:     t.Interpreter,
 		ScriptSizeBytes: len([]byte(t.Script)),

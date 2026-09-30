@@ -388,3 +388,68 @@ func TestTaskRunStatusFollowsTheTasksPage(t *testing.T) {
 		})
 	}
 }
+
+func TestTaskRowsCarryOriginAndOnlyReadableApprovalIDs(t *testing.T) {
+	admin, confined, st, _ := newTaskQueryFixture(t)
+	cookies, csrf := loginSession(t, admin.handler)
+	planReader := taskQueryReader{handler: admin.handler, token: createPAT(t, admin.handler, cookies, csrf,
+		[]string{"task:read", "netpolicy:admin"}, []string{"node-a", "node-b"})}
+
+	rowsByID := func(r taskQueryReader) map[string]taskView {
+		t.Helper()
+		code, body := r.get(t, "/api/tasks")
+		if code != http.StatusOK {
+			t.Fatalf("GET /api/tasks = %d: %s", code, body)
+		}
+		var rows []taskView
+		if err := json.Unmarshal(body, &rows); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]taskView{}
+		for _, row := range rows {
+			out[row.ID] = row
+		}
+		// The enveloped form builds its rows the same way.
+		for _, row := range r.tasks(t, "origin=approval").Tasks {
+			if row.ApprovalID != out[row.ID].ApprovalID {
+				t.Fatalf("envelope row %s approval_id %q, bare row %q", row.ID, row.ApprovalID, out[row.ID].ApprovalID)
+			}
+		}
+		return out
+	}
+
+	// ap-1 is not in the store yet: a row names no approval nobody can open.
+	if got := rowsByID(admin)["t-finished"]; got.Origin != taskOriginApproval || got.ApprovalID != "" {
+		t.Fatalf("task of a missing approval = origin %q approval_id %q", got.Origin, got.ApprovalID)
+	}
+	if err := st.UpsertApproval(model.Approval{
+		ID: "ap-1", NodeID: "node-a", Plugin: "nftpolicy", Action: "apply", Status: model.ApprovalApplied, Plan: "plan",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name         string
+		reader       taskQueryReader
+		wantApproval string
+	}{
+		{"admin", admin, "ap-1"},
+		// task:read on node-a but no netpolicy:admin: the approval read would
+		// answer 404, so the row must not confirm the approval exists.
+		{"task reader without the plan's scope", confined, ""},
+		{"task reader who may read the plan", planReader, "ap-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := rowsByID(tc.reader)
+			if got := rows["t-finished"]; got.Origin != taskOriginApproval || got.ApprovalID != tc.wantApproval {
+				t.Fatalf("t-finished = origin %q approval_id %q, want approval and %q", got.Origin, got.ApprovalID, tc.wantApproval)
+			}
+			for id, want := range map[string]string{"t-fixed-rerun": taskOriginRerun, "t-queued": taskOriginDirect} {
+				if got := rows[id]; got.Origin != want || got.ApprovalID != "" {
+					t.Fatalf("%s = origin %q approval_id %q, want %q and none", id, got.Origin, got.ApprovalID, want)
+				}
+			}
+		})
+	}
+}

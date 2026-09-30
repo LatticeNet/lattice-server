@@ -3335,6 +3335,11 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 //	node_id=<id>          keep rows that target the node
 //	origin=a,b            keep rows queued by approval, rerun or direct (see
 //	                      taskOrigin); anything else is a 400
+//	approval_id=<id>      keep rows the approval queued, when the caller may
+//	                      read that approval (the rule behind a row's
+//	                      approval_id); an unreadable or unknown approval
+//	                      answers an empty page; one id of at most 128
+//	                      characters from A-Z, a-z, 0-9, _ and -, else a 400
 //	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
 //
 // Without any of them the response is the bare array clients have always
@@ -3373,7 +3378,15 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			return
 		}
 		deadline := s.store.TaskQueueDeadline()
-		rows := s.visibleTaskRows(p)
+		var rows []taskRow
+		// approval_id matches only an approval the caller may read, by the
+		// same rule that decides whether a row shows approval_id. An
+		// unreadable or unknown approval answers the empty page a real
+		// approval with no tasks answers, so the filter cannot probe the
+		// task-to-approval link the rows hide.
+		if filter.approvalID == "" || s.readableApprovalIDs(p, []string{filter.approvalID})[filter.approvalID] {
+			rows = s.visibleTaskRows(p)
+		}
 		filtered := make([]taskRow, 0, len(rows))
 		for _, row := range rows {
 			if filter.matches(row, deadline) {
@@ -3991,7 +4004,7 @@ type tasksQueryResponse struct {
 
 func taskQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"status", "since", "node_id", "origin", "limit", "offset"} {
+	for _, key := range []string{"status", "since", "node_id", "origin", "approval_id", "limit", "offset"} {
 		if _, ok := q[key]; ok {
 			return true
 		}

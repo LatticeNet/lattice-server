@@ -510,3 +510,70 @@ func TestPendingRowsAreFoundCountedAndCancellable(t *testing.T) {
 		t.Fatalf("status=cancelled total = %d, want the closed row", total)
 	}
 }
+
+func TestTaskListApprovalIDFilterOnlyMatchesReadableApprovals(t *testing.T) {
+	admin, confined, st, _ := newTaskQueryFixture(t)
+	cookies, csrf := loginSession(t, admin.handler)
+	planReader := taskQueryReader{handler: admin.handler, token: createPAT(t, admin.handler, cookies, csrf,
+		[]string{"task:read", "netpolicy:admin"}, []string{"node-a", "node-b"})}
+	// t-finished was queued by ap-1, an nftpolicy plan on node-a. ap-2 is a
+	// readable approval that queued nothing.
+	for _, id := range []string{"ap-1", "ap-2"} {
+		if err := st.UpsertApproval(model.Approval{
+			ID: id, NodeID: "node-a", Plugin: "nftpolicy", Action: "apply", Status: model.ApprovalApplied, Plan: "plan",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cases := []struct {
+		name   string
+		reader taskQueryReader
+		query  string
+		want   []string
+	}{
+		{"admin", admin, "approval_id=ap-1", []string{"t-finished"}},
+		{"with a matching status", admin, "approval_id=ap-1&status=finished&origin=approval", []string{"t-finished"}},
+		{"with a status that excludes it", admin, "approval_id=ap-1&status=failed", []string{}},
+		{"with a node it does not target", admin, "approval_id=ap-1&node_id=node-b", []string{}},
+		{"a readable approval with no tasks", admin, "approval_id=ap-2", []string{}},
+		{"an unknown approval", admin, "approval_id=approval_aaaaaaaaaaaaaaaa", []string{}},
+		// task:read on node-a but no netpolicy:admin: the row hides ap-1, so
+		// the filter must not reveal that t-finished belongs to it.
+		{"a reader without the plan's scope", confined, "approval_id=ap-1", []string{}},
+		{"a reader who may read the plan", planReader, "approval_id=ap-1", []string{"t-finished"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.reader.tasks(t, tc.query)
+			ids := sortedTaskIDs(got.Tasks)
+			if strings.Join(ids, ",") != strings.Join(tc.want, ",") || got.Total != len(tc.want) {
+				t.Fatalf("GET /api/tasks?%s = %v (total %d), want %v", tc.query, ids, got.Total, tc.want)
+			}
+			for _, row := range got.Tasks {
+				if row.ApprovalID != "ap-1" {
+					t.Fatalf("row %s approval_id %q, want ap-1 on every matched row", row.ID, row.ApprovalID)
+				}
+			}
+		})
+	}
+
+	// For a reader who may not read ap-1, a real approval with a task and an
+	// id that does not exist give the same bytes back.
+	_, hidden := confined.get(t, "/api/tasks?approval_id=ap-1")
+	_, unknown := confined.get(t, "/api/tasks?approval_id=approval_aaaaaaaaaaaaaaaa")
+	if string(hidden) != string(unknown) {
+		t.Fatalf("an unreadable approval answered %s, an unknown one %s", hidden, unknown)
+	}
+
+	for _, query := range []string{
+		"approval_id=ap-1,ap-2",
+		"approval_id=ap-*",
+		"approval_id=ap%201",
+		"approval_id=" + strings.Repeat("a", maxApprovalIDParam+1),
+	} {
+		if code, body := admin.get(t, "/api/tasks?"+query); code != http.StatusBadRequest {
+			t.Fatalf("GET /api/tasks?%s = %d, want 400: %s", query, code, body)
+		}
+	}
+}

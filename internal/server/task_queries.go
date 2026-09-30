@@ -132,7 +132,13 @@ func (s *Server) visibleTaskRows(p principal) []taskRow {
 // and one outside the caller's scope, so a row must not name an approval the
 // caller could not open; origin still says the task came from one.
 func (s *Server) taskRowViews(p principal, rows []taskRow) []taskView {
-	readable := s.readableApprovalIDs(p, rows)
+	var named []string
+	for _, row := range rows {
+		if id := row.task.ApprovalID; id != "" {
+			named = append(named, id)
+		}
+	}
+	readable := s.readableApprovalIDs(p, named)
 	views := make([]taskView, 0, len(rows))
 	for _, row := range rows {
 		view := row.view
@@ -145,19 +151,14 @@ func (s *Server) taskRowViews(p principal, rows []taskRow) []taskView {
 	return views
 }
 
-// readableApprovalIDs resolves, once per response, which of the approvals
-// named by rows p may read. The approvals come from one store read, and each
-// distinct approval is judged once by approvalVisibleToPrincipal, the rule
-// the approvals read applies, so the two cannot drift. That rule still reads
-// the store for the plan reach of an nftpolicy or WireGuard mesh approval
-// whose primary scope the caller holds.
-func (s *Server) readableApprovalIDs(p principal, rows []taskRow) map[string]bool {
-	var named []string
-	for _, row := range rows {
-		if id := row.task.ApprovalID; id != "" {
-			named = append(named, id)
-		}
-	}
+// readableApprovalIDs resolves, once per response, which of the named
+// approvals p may read. The approvals come from one store read, and each is
+// judged by approvalVisibleToPrincipal, the rule the approvals read applies,
+// so the two cannot drift. Both the approval_id a row shows and the
+// approval_id filter go through here. That rule still reads the store for
+// the plan reach of an nftpolicy or WireGuard mesh approval whose primary
+// scope the caller holds. An unknown id is not readable.
+func (s *Server) readableApprovalIDs(p principal, named []string) map[string]bool {
 	if len(named) == 0 {
 		return nil
 	}
@@ -199,14 +200,25 @@ func taskLastChangedAt(t model.Task, status string, deadline time.Duration) time
 // taskListFilter is the parsed row filter of GET /api/tasks. Every field
 // matches something the row itself says, so a URL maps to one question.
 type taskListFilter struct {
-	statuses map[string]bool
-	origins  map[string]bool
-	nodeID   string
-	since    time.Time
+	statuses   map[string]bool
+	origins    map[string]bool
+	nodeID     string
+	since      time.Time
+	approvalID string
 }
 
+// maxApprovalIDParam bounds approval_id. Approval ids are "approval_" plus
+// 16 base32 characters (id.New), so 128 leaves room for any older shape.
+const maxApprovalIDParam = 128
+
 func parseTaskListFilter(q url.Values) (taskListFilter, error) {
-	f := taskListFilter{nodeID: strings.TrimSpace(q.Get("node_id"))}
+	f := taskListFilter{
+		nodeID:     strings.TrimSpace(q.Get("node_id")),
+		approvalID: strings.TrimSpace(q.Get("approval_id")),
+	}
+	if !validApprovalIDParam(f.approvalID) {
+		return f, fmt.Errorf("approval_id must be one id of at most %d characters from A-Z, a-z, 0-9, _ and -", maxApprovalIDParam)
+	}
 	var err error
 	if f.statuses, err = parseEnumList(q.Get("status"), "status", taskListStatuses); err != nil {
 		return f, err
@@ -222,6 +234,21 @@ func parseTaskListFilter(q url.Values) (taskListFilter, error) {
 		f.since = since
 	}
 	return f, nil
+}
+
+// validApprovalIDParam accepts an empty value (no filter) or one id in the
+// character set id.New produces. A comma list, a wildcard or anything longer
+// than maxApprovalIDParam is refused rather than matched against nothing.
+func validApprovalIDParam(raw string) bool {
+	if len(raw) > maxApprovalIDParam {
+		return false
+	}
+	for _, c := range raw {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // parseEnumList reads a comma list whose every entry must be one of allowed.
@@ -266,6 +293,11 @@ func (f taskListFilter) matches(row taskRow, deadline time.Duration) bool {
 		return false
 	}
 	if !f.since.IsZero() && taskLastChangedAt(row.task, row.view.Status, deadline).Before(f.since) {
+		return false
+	}
+	// The caller must also be able to read the approval; handleTasks checks
+	// that once before any row is matched.
+	if f.approvalID != "" && row.task.ApprovalID != f.approvalID {
 		return false
 	}
 	return true

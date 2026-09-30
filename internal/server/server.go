@@ -4059,11 +4059,10 @@ func parseTaskIDList(raw string) (map[string]bool, error) {
 //	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
 //
 // Without any of them the response is the bare array of every visible result.
-// With any of them it is the {"results","total","limit","offset"} envelope.
-// An explicit limit always pages. omit_output without a limit still returns
-// every match, because the Tasks page polls that way and builds each node's
-// row from all of them; design 23 wave 2 moves that poll to task_id=<the ids
-// on screen> and applies the default page here in the same release.
+// With any of them it is the {"results","total","limit","offset"} envelope,
+// paged by limit whether or not omit_output is set: a poll asks for the
+// results of the tasks on screen with task_id, or for a page, and total
+// still counts every match.
 func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -4117,12 +4116,6 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		matched = append(matched, result)
 	}
 	total := len(matched)
-	if omitOutput && strings.TrimSpace(q.Get("limit")) == "" {
-		// yagni: unbounded until design 23 wave 2 switches the Tasks poll to
-		// task_id; the store caps results at 2,000, which bounds this. Then
-		// drop this override so the default page applies.
-		limit = total
-	}
 	if offset > total {
 		matched = nil
 	} else {

@@ -72,12 +72,10 @@ func TestTaskResultsTaskIDListAndPaging(t *testing.T) {
 		t.Fatalf("101 ids = %d, want 400: %s", code, body)
 	}
 
-	// Wave 1 behaviour, pinned on purpose: an explicit limit pages bodyless
-	// rows, and omit_output without a limit returns every match (more than
-	// the default page of 100 here), because today's Tasks page builds its
-	// node rows from all of them. Design 23 wave 2 moves that poll to
-	// task_id and applies the default page in the same release; this case
-	// changes then.
+	// Since design 23 wave 2 the Tasks page always sends task_id or a limit,
+	// so omit_output no longer lifts the page size: without a limit it
+	// returns the default page of 100 (the fixture holds more), with one it
+	// returns that many, and total still counts every match.
 	for i := 0; i < 130; i++ {
 		if err := st.AddTaskResult(model.TaskResult{
 			TaskID: "t-bulk", NodeID: "node-a", Stdout: "bulk", FinishedAt: now.Add(-time.Duration(i) * time.Second),
@@ -87,10 +85,10 @@ func TestTaskResultsTaskIDListAndPaging(t *testing.T) {
 	}
 	all := len(st.Results())
 	if all <= defaultTaskQueryLimit {
-		t.Fatalf("fixture holds %d results; it must exceed the default page to pin anything", all)
+		t.Fatalf("fixture holds %d results; it must exceed the default page to test paging", all)
 	}
 	for query, wantRows := range map[string]int{
-		"omit_output=1":           all,
+		"omit_output=1":           defaultTaskQueryLimit,
 		"omit_output=1&limit=7":   7,
 		"omit_output=1&limit=500": all,
 	} {

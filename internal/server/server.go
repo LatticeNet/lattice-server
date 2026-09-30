@@ -602,6 +602,9 @@ func New(opts Options) (*Server, error) {
 	if err := s.migrateProxyUsersToVpnUsers(); err != nil {
 		return nil, fmt.Errorf("migrate vpn user secrets: %w", err)
 	}
+	// Before the scheduler's first run, so machines that already carry a
+	// renewal date are reminded from the first evaluation.
+	s.applyReminderDefaults()
 	if dir := strings.TrimSpace(opts.PluginRuntimeDir); dir != "" {
 		// Tier-2 system runner: execute verified system-plugin artifacts in a
 		// confined per-plugin dir. Host mutation still flows through the in-core
@@ -1201,6 +1204,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/machines/renew", s.withAuth("inventory:admin", s.handleMachineRenew))
 	mux.HandleFunc("/api/machines/reminders/run", s.withAuth("inventory:admin", s.handleMachineRemindersRun))
 	mux.HandleFunc("/api/machines/reveal-link", s.withAuth("inventory:admin", s.handleMachineLinkReveal))
+	// Every kind carries its own scope check, so any session may ask and sees
+	// the rows it can read plus a count of the ones it cannot.
+	mux.HandleFunc("/api/expiring", s.withAuth("", s.handleExpiring))
 	mux.HandleFunc("/api/machine-vendors", s.withAuth("", s.handleMachineVendors))
 	mux.HandleFunc("/api/machine-vendors/delete", s.withAuth("inventory:admin", s.handleDeleteMachineVendor))
 	mux.HandleFunc("/api/monitors", s.withAuth("", s.handleMonitors))

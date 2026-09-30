@@ -1919,7 +1919,7 @@ func (s *Server) applyProxyUsageSnapshot(snapshot model.ProxyUsageSnapshot) (pro
 		return proxyUsageApplyResult{}, err
 	}
 	s.maybePruneUsageDays(now)
-	s.emitProxyUserNotifications(alertsToEmit)
+	s.emitProxyUserNotifications(alertsToEmit, now)
 	return result, nil
 }
 

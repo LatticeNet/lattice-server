@@ -255,24 +255,51 @@ func (s *Server) periodUsage(userID string, from, to time.Time) (usageCounter, [
 // period sum from the day rows plus whatever this report is about to add.
 // Only the status and notification cursors flow back: UsedBytes stays the
 // lifetime total.
+//
+// When the projection belongs to an identity, the identity owns whether it is
+// enabled, when it expires and its quota: the vpn-core editor writes those to
+// the identity, and a migrated identity's legacy record keeps whatever it held
+// at migration. They are read from the identity so its edits drive status and
+// alerts, the same values /api/expiring and the Users page show.
 func (s *Server) quotaEvaluate(user model.ProxyUser, vpnUser *VpnUser, now time.Time, pending usageCounter) (model.ProxyUser, []proxyUserNotificationFire) {
-	user.Status = derivedProxyUserStatusAt(user, now)
 	if vpnUser == nil {
+		user.Status = derivedProxyUserStatusAt(user, now)
 		return nextProxyUserNotifications(user, now)
 	}
-	start, _, ok := vpnUserQuotaPeriod(*vpnUser, now)
-	if !ok {
-		return nextProxyUserNotifications(user, now)
-	}
-	used, _ := s.periodUsage(vpnUser.ID, start, now)
 	projection := user
-	projection.UsedBytes = used.total() + pending.total()
+	projection.Enabled = vpnUser.Enabled
+	projection.ExpiresAt = vpnUser.ExpiresAt
+	projection.TrafficLimitBytes = vpnUser.QuotaBytes
+	period := ""
+	if projection.TrafficLimitBytes > 0 {
+		projection.UsedBytes, period = s.quotaUsedBytes(*vpnUser, projection.UsedBytes, now, pending)
+	}
 	projection.Status = derivedProxyUserStatusAt(projection, now)
-	projection, alerts := nextProxyUserNotificationsForPeriod(projection, now, store.UsageDay(start))
+	projection, alerts := nextProxyUserNotificationsForPeriod(projection, now, period)
 	user.Status = projection.Status
 	user.LastQuotaNotifiedKey = projection.LastQuotaNotifiedKey
 	user.LastExpiryNotifiedKey = projection.LastExpiryNotifiedKey
 	return user, alerts
+}
+
+// quotaUsedBytes is the usage an identity's quota is measured with, and the
+// period key its alerts carry (empty for a lifetime quota):
+//   - a monthly quota: the identity's day rows for the current period plus
+//     pending, the report being ingested, which the rows do not hold yet. The
+//     read is bounded by one period and matches the Users page's
+//     used_period_bytes.
+//   - a lifetime quota: accountTotal, UsedBytes on the identity's accounting
+//     record (the legacy record for a migrated identity), a running total
+//     ingestion advances on every report, this one included, and never
+//     prunes. Day rows are kept for UsageDayRetentionDays only, so summing
+//     them would turn a lifetime quota into "the last 400 days" and read up to
+//     400 rows per user on every usage report.
+func (s *Server) quotaUsedBytes(vpnUser VpnUser, accountTotal int64, now time.Time, pending usageCounter) (int64, string) {
+	if start, _, ok := vpnUserQuotaPeriod(vpnUser, now); ok {
+		used, _ := s.periodUsage(vpnUser.ID, start, now)
+		return used.total() + pending.total(), store.UsageDay(start)
+	}
+	return accountTotal, ""
 }
 
 // vpnUsersByAccounting indexes identities by the ProxyUser projection id that
@@ -451,10 +478,7 @@ func (ctx *usageAttributionContext) attributeWindow(sums map[string]map[string]*
 		sort.Strings(tags)
 		for _, tag := range tags {
 			wl := sums[nodeID][tag]
-			f := ctx.byNodeTag[nodeID][tag]
-			if f == nil && wl.LineHashID != "" {
-				f = ctx.byHash[wl.LineHashID]
-			}
+			f := ctx.lineFacts(nodeID, tag, wl.LineHashID)
 			traffic := usageLineTraffic{Inbound: wl.Inbound}
 			if f != nil {
 				traffic.Named = map[string]usageCounter{}
@@ -500,9 +524,27 @@ func (ctx *usageAttributionContext) attributeWindow(sums map[string]map[string]*
 	return report
 }
 
-// buildUsageLines is the per-line read model for a period: every node's day
-// rows summed and attributed with the current facts.
-func (s *Server) buildUsageLines(ctx *usageAttributionContext, w usageWindow) (usageLinesReport, usageWindow) {
+// lineFacts joins a (node, tag) to its line: by tag first, then by the hash
+// ingestion recorded for it. nil is a tag no line carries.
+func (ctx *usageAttributionContext) lineFacts(nodeID, tag, hash string) *usageLineFacts {
+	f := ctx.byNodeTag[nodeID][tag]
+	if f == nil && hash != "" {
+		f = ctx.byHash[hash]
+	}
+	return f
+}
+
+// lineRole is the role attributeLine gives a line's rows: a tag no line
+// carries reads as direct.
+func lineRole(f *usageLineFacts) string {
+	if f == nil {
+		return usageRoleDirect
+	}
+	return f.Role
+}
+
+// usageNodeIDs is every node whose day rows a usage read loads.
+func (s *Server) usageNodeIDs(ctx *usageAttributionContext) []string {
 	nodeIDs := make([]string, 0, len(ctx.byNodeTag))
 	for nodeID := range ctx.byNodeTag {
 		nodeIDs = append(nodeIDs, nodeID)
@@ -510,9 +552,163 @@ func (s *Server) buildUsageLines(ctx *usageAttributionContext, w usageWindow) (u
 	for _, snap := range s.store.ProxyUsageSnapshots() {
 		nodeIDs = appendUniqueSorted(nodeIDs, snap.NodeID)
 	}
-	w = s.loadUsageWindow(w, nodeIDs)
+	return nodeIDs
+}
+
+// buildUsageLines is the per-line read model for a period: every node's day
+// rows summed and attributed with the current facts.
+func (s *Server) buildUsageLines(ctx *usageAttributionContext, w usageWindow) (usageLinesReport, usageWindow) {
+	w = s.loadUsageWindow(w, s.usageNodeIDs(ctx))
 	report := ctx.attributeWindow(w.sumWindow(w.fromDay(), w.toDay()))
 	return report, w
+}
+
+// ── daily series and the previous period ─────────────────────────────────────
+
+// usageSeriesMaxDays bounds the daily series; a longer window keeps its
+// latest days and says so.
+const usageSeriesMaxDays = 90
+
+// usageSeriesRow is one node and role's bytes per day, uplink plus downlink,
+// aligned with usageSeries.Days.
+type usageSeriesRow struct {
+	NodeID   string  `json:"node_id"`
+	NodeName string  `json:"node_name,omitempty"`
+	Role     string  `json:"role"`
+	Bytes    []int64 `json:"bytes"`
+}
+
+type usageSeries struct {
+	Days      []string         `json:"days"`
+	Rows      []usageSeriesRow `json:"rows"`
+	Truncated bool             `json:"truncated"`
+}
+
+type usagePrevious struct {
+	From        string `json:"from"`
+	To          string `json:"to"`
+	EgressBytes int64  `json:"egress_bytes"`
+}
+
+// windowRoles gives every (node, tag) in the window the role its lines rows
+// carry, found through the same join attributeWindow uses.
+func (ctx *usageAttributionContext) windowRoles(w usageWindow) map[string]map[string]string {
+	roles := map[string]map[string]string{}
+	for nodeID, byTag := range w.sumWindow(w.fromDay(), w.toDay()) {
+		roles[nodeID] = map[string]string{}
+		for tag, wl := range byTag {
+			roles[nodeID][tag] = lineRole(ctx.lineFacts(nodeID, tag, wl.LineHashID))
+		}
+	}
+	return roles
+}
+
+// usageSeries sums the loaded day rows per node and role for each UTC day of
+// the window, oldest first. It reads the same rows and roles as the lines
+// report, so a day's egress-role bytes are that day's egress.
+func (ctx *usageAttributionContext) usageSeries(w usageWindow) usageSeries {
+	out := usageSeries{Days: []string{}, Rows: []usageSeriesRow{}}
+	from := w.From
+	if !w.To.Before(from.AddDate(0, 0, usageSeriesMaxDays)) {
+		from = w.To.AddDate(0, 0, -(usageSeriesMaxDays - 1))
+		out.Truncated = true
+	}
+	index := map[string]int{}
+	for d := from; !d.After(w.To); d = d.AddDate(0, 0, 1) {
+		index[store.UsageDay(d)] = len(out.Days)
+		out.Days = append(out.Days, store.UsageDay(d))
+	}
+	roles := ctx.windowRoles(w)
+	rows := map[[2]string]*usageSeriesRow{}
+	for nodeID, dayRows := range w.nodes {
+		for _, row := range dayRows {
+			i, ok := index[row.Day]
+			if !ok {
+				continue
+			}
+			for tag, line := range row.Lines {
+				bytes := line.Uplink + line.Downlink
+				if bytes == 0 {
+					continue
+				}
+				role := roles[nodeID][tag]
+				key := [2]string{nodeID, role}
+				r := rows[key]
+				if r == nil {
+					r = &usageSeriesRow{NodeID: nodeID, NodeName: ctx.nodeName[nodeID], Role: role, Bytes: make([]int64, len(out.Days))}
+					rows[key] = r
+				}
+				r.Bytes[i] += bytes
+			}
+		}
+	}
+	totals := map[[2]string]int64{}
+	for key, r := range rows {
+		for _, b := range r.Bytes {
+			totals[key] += b
+		}
+		out.Rows = append(out.Rows, *r)
+	}
+	sort.Slice(out.Rows, func(i, j int) bool {
+		a, b := out.Rows[i], out.Rows[j]
+		ta, tb := totals[[2]string{a.NodeID, a.Role}], totals[[2]string{b.NodeID, b.Role}]
+		if ta != tb {
+			return ta > tb
+		}
+		if a.NodeID != b.NodeID {
+			return a.NodeID < b.NodeID
+		}
+		return a.Role < b.Role
+	})
+	return out
+}
+
+// usageEgressRole reports whether a line's bytes leave the fleet where they
+// are counted: exit, direct and shared lines. Entry and relay lines forward
+// to another node inside the fleet, which counts the same bytes again.
+func usageEgressRole(role string) bool {
+	switch role {
+	case usageRoleExit, usageRoleDirect, usageRoleShared:
+		return true
+	default:
+		return false
+	}
+}
+
+// usageEgress is what left the fleet over a loaded window.
+func (ctx *usageAttributionContext) usageEgress(w usageWindow) int64 {
+	var egress int64
+	for nodeID, byTag := range w.sumWindow(w.fromDay(), w.toDay()) {
+		for tag, wl := range byTag {
+			if usageEgressRole(lineRole(ctx.lineFacts(nodeID, tag, wl.LineHashID))) {
+				egress += wl.Inbound.total()
+			}
+		}
+	}
+	return egress
+}
+
+// previousUsageWindow is the equal-length window just before a rolling
+// period. Only today, 7d and 30d have one.
+func previousUsageWindow(w usageWindow) (usageWindow, bool) {
+	switch w.Label {
+	case "today", "7d", "30d":
+	default:
+		return usageWindow{}, false
+	}
+	days := int(w.To.Sub(w.From).Hours()/24) + 1
+	return usageWindow{From: w.From.AddDate(0, 0, -days), To: w.From.AddDate(0, 0, -1), Label: "previous"}, true
+}
+
+// previousUsage is the previous period's egress, read with today's facts like
+// every other window.
+func (s *Server) previousUsage(ctx *usageAttributionContext, w usageWindow) *usagePrevious {
+	prev, ok := previousUsageWindow(w)
+	if !ok {
+		return nil
+	}
+	prev = s.loadUsageWindow(prev, s.usageNodeIDs(ctx))
+	return &usagePrevious{From: prev.fromDay(), To: prev.toDay(), EgressBytes: ctx.usageEgress(prev)}
 }
 
 // ── users list enrichment ────────────────────────────────────────────────────

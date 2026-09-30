@@ -117,6 +117,25 @@ func TestNodeOfflineAlertWaitsAndSendsOncePerSpell(t *testing.T) {
 	expectNoNotice(t, l, "after the recovery was sent")
 }
 
+// The metrics beat is the other path that ends a spell, and it queues the
+// recovery the same way the hello beat does.
+func TestNodeOnlineFollowsAMetricsBeat(t *testing.T) {
+	l := newLivenessAlertServer(t)
+	srv, handler, st := l.srv, l.handler, l.st
+	cookies, csrf := loginSession(t, handler)
+	token := enrollAndBeat(t, handler, cookies, csrf, "n-metrics", "metrics")
+	ls := lastSeenOf(t, st, "n-metrics")
+
+	srv.sweepNodeLiveness(ls.Add(11*time.Minute), sweepCause)
+	expectOneNotice(t, l, EventNodeOffline, "Lattice node offline: metrics")
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/metrics", `{"node_id":"n-metrics","version":"test","metrics":{}}`, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics: %d %s", rec.Code, rec.Body.String())
+	}
+	srv.sweepNodeLiveness(lastSeenOf(t, st, "n-metrics"), sweepCause)
+	expectOneNotice(t, l, EventNodeOnline, "Lattice node online: metrics")
+}
+
 // A gap shorter than the delay sends nothing in either direction.
 func TestNodeOfflineBlipSendsNothing(t *testing.T) {
 	l := newLivenessAlertServer(t)

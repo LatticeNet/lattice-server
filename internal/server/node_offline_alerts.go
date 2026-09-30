@@ -85,9 +85,15 @@ func (s *Server) noteNodeOnline(nodeID string, now time.Time) {
 // the previous sweep. Each kind is one message per sweep, so a network blip on
 // the control plane's side cannot page once per node.
 func (s *Server) notifyNodeLiveness(now time.Time) {
-	nodes := s.store.Nodes()
 	a := &s.nodeAlerts
+	// Read the fleet under a.mu. A beat stores Online before noteNodeOnline
+	// takes a.mu, so a node that returns during this sweep is either online in
+	// the read below, or has its recovery queued after the alert is recorded.
+	// Reading first would let a beat land in between and leave an alert that
+	// no node.online ever follows. Nothing takes a.mu while holding a store
+	// lock, so the order a.mu then store is safe.
 	a.mu.Lock()
+	nodes := s.store.Nodes()
 	if a.alerted == nil {
 		a.alerted = map[string]time.Time{}
 	}

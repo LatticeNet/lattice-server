@@ -262,6 +262,8 @@ func TestTaskCountsWireNamesAndScope(t *testing.T) {
 func TestTaskListFilters(t *testing.T) {
 	admin, confined, _, now := newTaskQueryFixture(t)
 	since := url.QueryEscape(now.Add(-90 * time.Minute).Format(time.RFC3339))
+	// The same instant written with a +08:00 offset, its plus sign sent as %2B.
+	sinceOffset := strings.Replace(now.Add(-90*time.Minute).In(time.FixedZone("UTC+8", 8*3600)).Format(time.RFC3339), "+", "%2B", 1)
 
 	cases := []struct {
 		name   string
@@ -279,6 +281,7 @@ func TestTaskListFilters(t *testing.T) {
 		// Changed within 90 minutes: created, leased, finished or cancelled
 		// since then. t-stalled's lease began two hours ago.
 		{"since", admin, "since=" + since, []string{"t-c-failed", "t-c-queued", "t-cancelled", "t-fixed-rerun", "t-queued", "t-retrying-rerun", "t-running"}},
+		{"since with an encoded offset", admin, "since=" + sinceOffset, []string{"t-c-failed", "t-c-queued", "t-cancelled", "t-fixed-rerun", "t-queued", "t-retrying-rerun", "t-running"}},
 		{"since and node", admin, "since=" + since + "&node_id=node-b", []string{"t-fixed-rerun"}},
 		{"node", admin, "node_id=node-c", []string{"t-ac-failed", "t-c-failed", "t-c-queued"}},
 		// A confined reader asking about a node outside its scope gets the
@@ -307,6 +310,8 @@ func TestTaskListFiltersRejectUnknownValues(t *testing.T) {
 		"origin=plugin",
 		"since=yesterday",
 		"since=2026-09-30",
+		// A bare "+" decodes to a space, so an unencoded offset is refused.
+		"since=2026-09-30T10:00:00+08:00",
 		"limit=0",
 		"limit=501",
 		"offset=-1",

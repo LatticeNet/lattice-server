@@ -3328,7 +3328,9 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 //	since=<RFC3339>       keep rows that last changed at or after the instant
 //	                      (taskLastChangedAt: the latest of created, started,
 //	                      finished and lease start, or the expiry instant of
-//	                      an expired row)
+//	                      an expired row); send UTC with Z, or encode an
+//	                      offset's plus sign as %2B, since a bare "+" in a
+//	                      query string decodes to a space and is a 400
 //	node_id=<id>          keep rows that target the node
 //	origin=a,b            keep rows queued by approval, rerun or direct (see
 //	                      taskOrigin); anything else is a 400

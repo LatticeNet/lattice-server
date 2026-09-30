@@ -256,8 +256,8 @@ func TestNodeOfflineDelayTagWaitsItsOwnTime(t *testing.T) {
 	ls := lastSeenOf(t, st, "n-roam")
 
 	srv.sweepNodeLiveness(ls.Add(11*time.Minute), sweepCause)
-	if n, _ := st.Node("n-roam"); n.Online {
-		t.Fatal("a delayed node is still marked offline at the liveness threshold")
+	if n, ok := st.Node("n-roam"); !ok || n.Online {
+		t.Fatalf("a delayed node must still be marked offline at the liveness threshold (found %v, online %v)", ok, n.Online)
 	}
 	expectNoNotice(t, l, "past the default delay")
 	srv.sweepNodeLiveness(ls.Add(3*time.Hour-time.Minute), sweepCause)

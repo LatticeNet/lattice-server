@@ -4247,10 +4247,11 @@ func toTaskResultView(r model.TaskResult) taskResultView {
 //
 // Without query parameters the response is the bare array of the newest 100
 // visible events. With any of action, decision, node_id, actor_id, token_id,
-// scope, correlation_id, q, at_from, at_to, exclude_action, limit or offset it
-// is the auditQueryResponse envelope: one page of matching events plus total,
-// scanned and complete, so a client can say "412 of 412 scanned" or "at least
-// 50,000" instead of printing a partial count as the whole.
+// scope, correlation_id, q, at_from, at_to, exclude_action, exclude_decision,
+// limit or offset it is the auditQueryResponse envelope: one page of matching
+// events plus total, scanned and complete, so a client can say "412 of 412
+// scanned" or "at least 50,000" instead of printing a partial count as the
+// whole.
 //
 // exclude_action is a comma list of up to 16 action prefixes (an optional
 // trailing "*" means the same prefix), each 1 to 128 characters from
@@ -4260,6 +4261,12 @@ func toTaskResultView(r model.TaskResult) taskResultView {
 // The Changes layer uses it to hide node.online and node.offline flips, which
 // arrived about 44 a day on the 34-node fleet of 2026-09-30 and bury the
 // changes an operator is looking for.
+//
+// exclude_decision is a comma list of decisions from auditDecisions (allow,
+// deny, observe, warn, dismiss); any other value is a 400. It drops matching
+// events inside the same scan, so the Changes layer can hide observe events
+// (SSH logins, agent events, sing-box state, login prompts) without naming
+// every action that records one.
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -4342,7 +4349,7 @@ type auditQueryResponse struct {
 
 func auditQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset", "q", "at_from", "at_to", "exclude_action"} {
+	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset", "q", "at_from", "at_to", "exclude_action", "exclude_decision"} {
 		if _, ok := q[key]; ok {
 			return true
 		}
@@ -4362,6 +4369,8 @@ type auditQuerySpec struct {
 	atTo          time.Time
 	text          string
 	exclude       []string // action prefixes whose events the query drops
+	// skipDecisions are the decisions whose events the query drops.
+	skipDecisions map[string]bool
 	limit         int
 	offset        int
 }
@@ -4388,6 +4397,10 @@ func parseAuditQuery(r *http.Request) (auditQuerySpec, error) {
 	if err != nil {
 		return auditQuerySpec{}, err
 	}
+	skipDecisions, err := parseEnumList(q.Get("exclude_decision"), "exclude_decision", auditDecisions)
+	if err != nil {
+		return auditQuerySpec{}, err
+	}
 	return auditQuerySpec{
 		action:        q.Get("action"),
 		decision:      q.Get("decision"),
@@ -4400,6 +4413,7 @@ func parseAuditQuery(r *http.Request) (auditQuerySpec, error) {
 		atTo:          atTo,
 		text:          strings.ToLower(strings.TrimSpace(q.Get("q"))),
 		exclude:       exclude,
+		skipDecisions: skipDecisions,
 		limit:         limit,
 		offset:        offset,
 	}, nil
@@ -4423,8 +4437,19 @@ func (q auditQuerySpec) matches(ev model.AuditEvent) bool {
 			return false
 		}
 	}
+	if q.skipDecisions[ev.Decision] {
+		return false
+	}
 	return true
 }
+
+// auditDecisions are the decisions the audit log records, which
+// exclude_decision accepts: allow and deny on nearly every event, observe for
+// events that report rather than decide (ssh.login, agent.event,
+// singbox.service.state, the login and 2FA prompts), warn when a capability
+// gate is switched off, and dismiss when an approval is dismissed.
+// audit.Record writes an empty decision as allow.
+var auditDecisions = []string{"allow", "deny", "observe", "warn", "dismiss"}
 
 const (
 	// maxAuditExcludeActions bounds exclude_action: every entry is a prefix

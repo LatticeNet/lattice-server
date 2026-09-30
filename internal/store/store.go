@@ -3733,6 +3733,22 @@ func (s *Store) Approval(id string) (model.Approval, bool) {
 	return a, ok
 }
 
+// ApprovalsByID returns the stored approvals among ids, in the order of ids,
+// under one lock. A caller resolving the approvals behind a page of tasks
+// takes the lock once instead of once per row. Unknown and empty ids are
+// skipped; a repeated id is returned each time it is named.
+func (s *Store) ApprovalsByID(ids []string) []model.Approval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Approval, 0, len(ids))
+	for _, id := range ids {
+		if a, ok := s.state.Approvals[id]; ok {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 func (s *Store) Approvals() []model.Approval {
 	s.mu.Lock()
 	defer s.mu.Unlock()

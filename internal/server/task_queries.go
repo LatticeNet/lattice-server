@@ -85,18 +85,43 @@ func (s *Server) visibleTaskRows(p principal) []taskRow {
 // and one outside the caller's scope, so a row must not name an approval the
 // caller could not open; origin still says the task came from one.
 func (s *Server) taskRowViews(p principal, rows []taskRow) []taskView {
+	readable := s.readableApprovalIDs(p, rows)
 	views := make([]taskView, 0, len(rows))
 	for _, row := range rows {
 		view := row.view
 		view.ScriptSHA256 = scriptSHA256(row.task.Script)
-		if approvalID := row.task.ApprovalID; approvalID != "" {
-			if approval, ok := s.store.Approval(approvalID); ok && s.approvalVisibleToPrincipal(p, approval) {
-				view.ApprovalID = approvalID
-			}
+		if readable[row.task.ApprovalID] {
+			view.ApprovalID = row.task.ApprovalID
 		}
 		views = append(views, view)
 	}
 	return views
+}
+
+// readableApprovalIDs resolves, once per response, which of the approvals
+// named by rows p may read. The approvals come from one store read, and each
+// distinct approval is judged once by approvalVisibleToPrincipal, the rule
+// the approvals read applies, so the two cannot drift. That rule still reads
+// the store for the plan reach of an nftpolicy or WireGuard mesh approval
+// whose primary scope the caller holds.
+func (s *Server) readableApprovalIDs(p principal, rows []taskRow) map[string]bool {
+	var named []string
+	for _, row := range rows {
+		if id := row.task.ApprovalID; id != "" {
+			named = append(named, id)
+		}
+	}
+	if len(named) == 0 {
+		return nil
+	}
+	approvals := s.store.ApprovalsByID(named)
+	readable := make(map[string]bool, len(approvals))
+	for _, approval := range approvals {
+		if s.approvalVisibleToPrincipal(p, approval) {
+			readable[approval.ID] = true
+		}
+	}
+	return readable
 }
 
 // taskLastChangedAt is the last time a task row changed, as far as the record

@@ -206,3 +206,53 @@ func TestLineUserPlanIsListedOnlyToPrincipalsWhoReadIdentities(t *testing.T) {
 		})
 	}
 }
+
+// Both plans say that another user crossing its policy before approval makes
+// them stale, and the approval path holds them to it: the render drops that
+// user's row, so the config hash each plan pinned no longer matches.
+func TestPlansGoStaleWhenAnotherUserCrossesItsPolicy(t *testing.T) {
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	srv := usageTestServer(t, now)
+	line, identity := seedManagedLineUserFixture(t, srv)
+	identity.Bindings = []LineBinding{{LineHashID: line.LineHashID, Enabled: true}}
+	identity.QuotaBytes, identity.QuotaPeriod, identity.QuotaResetDay = 1000, vpnQuotaPeriodMonthly, 15
+	if err := srv.putVpnUser(identity); err != nil {
+		t.Fatal(err)
+	}
+	second := VpnUser{
+		ID: "vpnuser_second", Email: "second@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "55555555-5555-4555-8555-555555555555", Flow: "xtls-rprx-vision"}},
+	}
+	if err := srv.putVpnUser(second); err != nil {
+		t.Fatal(err)
+	}
+	lineUser := filePlan(t, srv, lineUserOpAdd, second.ID, line.LineHashID)
+	proxyNodePlanText(t, srv, "managed-a")
+	var proxy model.Approval
+	for _, approval := range srv.store.Approvals() {
+		if approval.Plugin == proxyCorePlugin {
+			proxy = approval
+		}
+	}
+	if proxy.ID == "" {
+		t.Fatal("no proxycore approval was filed")
+	}
+	if err := srv.requireCurrentProxyCoreApproval(proxy); err != nil {
+		t.Fatalf("proxycore plan before the crossing: %v", err)
+	}
+	if _, _, _, _, _, err := srv.validateLineUserApproval(lineUser, true); err != nil {
+		t.Fatalf("line-user plan before the crossing: %v", err)
+	}
+
+	if err := srv.store.ApplyProxyUsage(store.ProxyUsageUpdate{DayUsers: []store.UsageDayUser{
+		{UserID: identity.ID, Day: "20260916", Uplink: 600, Downlink: 500},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.requireCurrentProxyCoreApproval(proxy); err == nil || !strings.Contains(err.Error(), "proxycore config changed since this plan was created") {
+		t.Fatalf("proxycore plan after another user crossed its quota: %v", err)
+	}
+	if _, _, _, _, _, err := srv.validateLineUserApproval(lineUser, true); err == nil || !strings.Contains(err.Error(), "managed config changed since approval") {
+		t.Fatalf("line-user plan after another user crossed its quota: %v", err)
+	}
+}

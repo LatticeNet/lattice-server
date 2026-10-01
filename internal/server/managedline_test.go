@@ -311,7 +311,7 @@ func TestManagedLineValidateAndApplyScript(t *testing.T) {
 	u := seedManagedLineUser(t, srv)
 	approval, def := compileApproval(t, srv)
 
-	if _, _, _, err := srv.validateManagedLineApproval(approval); err != nil {
+	if _, _, _, err := srv.validateManagedLineApproval(approval, true); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	script := srv.managedLineApplyScript(approval)
@@ -358,7 +358,7 @@ func TestManagedLineValidateFailClosed(t *testing.T) {
 	if err := srv.putVpnUser(u); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := srv.validateManagedLineApproval(approval); err == nil ||
+	if _, _, _, err := srv.validateManagedLineApproval(approval, true); err == nil ||
 		!strings.Contains(err.Error(), "re-plan") {
 		t.Fatalf("rotated credential must fail validation, got %v", err)
 	}
@@ -375,7 +375,7 @@ func TestManagedLineValidateFailClosed(t *testing.T) {
 	seedManagedLineNode(t, srv, "node-a", append(realityInventoryLines(), model.SingBoxNode{
 		Name: "squatter", Protocol: "vless", Network: "tcp", Address: "203.0.113.10", Port: strconv.Itoa(def.Port),
 	}))
-	if _, _, _, err := srv.validateManagedLineApproval(approval); err == nil ||
+	if _, _, _, err := srv.validateManagedLineApproval(approval, true); err == nil ||
 		!strings.Contains(err.Error(), "port") {
 		t.Fatalf("port conflict must fail validation, got %v", err)
 	}

@@ -7725,12 +7725,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		}
 	}
 	if approval.Plugin == singBoxLineUserPlugin {
-		if _, _, _, _, _, err := s.validateLineUserApproval(approval); err != nil {
+		if _, _, _, _, _, err := s.validateLineUserApproval(approval, true); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
 	if approval.Plugin == singBoxManagedLinePlugin {
-		if _, _, _, err := s.validateManagedLineApproval(approval); err != nil {
+		if _, _, _, err := s.validateManagedLineApproval(approval, true); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}

@@ -407,11 +407,38 @@ func (s *Server) vpnUserPolicyRefusal(u VpnUser, now time.Time) (reason, remedy 
 	return "", ""
 }
 
-// lineUserApplyScript renders the on-box `sb user add|del` invocation for an
-// approved plan, re-deriving the credential from the write-only store and
-// failing closed when the bytes no longer match the approved hash. The script
-// never embeds a credential that was not exactly the reviewed one.
-func (s *Server) validateLineUserApproval(approval model.Approval) (lineUserPlan, VpnUser, Line, lineUserCredentialPayload, *proxycore.Artifact, error) {
+// lineUserGrantRefusal re-checks the gates vpnUserLinePlan applied when the
+// plan was made, against the user as it is now: a disabled user may not be
+// added or updated, and an expired or over-quota user may not be added. An
+// approval can wait for days, and the adopted track has no config hash to
+// catch such a change, so without this sb would add a user its own alerts
+// deny. On the managed track the render would leave the user out and the
+// hash would fail too; this says why. The plan itself stays valid: once the
+// user is enabled, renewed or given room, the same approval can be approved.
+func (s *Server) lineUserGrantRefusal(op string, u VpnUser) error {
+	if op != lineUserOpAdd && op != lineUserOpUpdate {
+		return nil
+	}
+	if !u.Enabled {
+		return fmt.Errorf("user %q is disabled, so this plan would grant a disabled user; enable it before approving", u.ID)
+	}
+	if op != lineUserOpAdd {
+		return nil
+	}
+	if reason, remedy := s.vpnUserPolicyRefusal(u, s.now()); reason != "" {
+		return fmt.Errorf("%s, so this plan would add a user its policy denies; %s before approving", reason, remedy)
+	}
+	return nil
+}
+
+// validateLineUserApproval checks that an approval still describes the
+// current user, line and credential, failing closed when the credential bytes
+// no longer match the approved hash, so a script never embeds a credential
+// that was not exactly the reviewed one. checkGrant also re-runs the plan-time
+// gates (lineUserGrantRefusal); it is set when the approval is approved and
+// when its script is rendered, the two points before anything reaches the
+// node.
+func (s *Server) validateLineUserApproval(approval model.Approval, checkGrant bool) (lineUserPlan, VpnUser, Line, lineUserCredentialPayload, *proxycore.Artifact, error) {
 	var zeroPlan lineUserPlan
 	var zeroUser VpnUser
 	var zeroLine Line
@@ -438,6 +465,11 @@ func (s *Server) validateLineUserApproval(approval model.Approval) (lineUserPlan
 	user, ok := s.getVpnUser(plan.UserID)
 	if !ok {
 		return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, fmt.Errorf("user %q no longer exists; re-plan", plan.UserID)
+	}
+	if checkGrant {
+		if err := s.lineUserGrantRefusal(plan.Op, user); err != nil {
+			return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, err
+		}
 	}
 	line, err := s.resolveLineUserTarget(plan.LineHashID)
 	if err != nil {
@@ -479,13 +511,15 @@ func (s *Server) validateLineUserApproval(approval model.Approval) (lineUserPlan
 	return plan, user, line, payload, nil, nil
 }
 
+// lineUserApplyScript renders the on-box `sb user add|del` invocation for an
+// approved plan, re-deriving the credential from the write-only store.
 func (s *Server) lineUserApplyScript(approval model.Approval) string {
 	fail := func(err error) string {
 		return "set -e\n" +
 			"echo " + shellQuote("lattice lineuser: "+err.Error()) + " >&2\n" +
 			"exit 1\n"
 	}
-	plan, _, _, payload, artifact, err := s.validateLineUserApproval(approval)
+	plan, _, _, payload, artifact, err := s.validateLineUserApproval(approval, true)
 	if err != nil {
 		return fail(err)
 	}
@@ -545,7 +579,12 @@ func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approv
 		})
 		return nil
 	}
-	plan, u, _, _, artifact, err := s.validateLineUserApproval(approval)
+	// checkGrant is off here. The task has already run sb on the node, so
+	// the result records what the node now holds; refusing to record it
+	// because the user crossed its policy during the run would leave a user
+	// on the node with no binding behind it. The policy's alerts cover that
+	// user from here on.
+	plan, u, _, _, artifact, err := s.validateLineUserApproval(approval, false)
 	if err != nil {
 		reason := "successful task belongs to stale line-user plan; runtime rediscovery required"
 		if rejectErr := s.rejectApprovalWithReason(approval, reason); rejectErr != nil {

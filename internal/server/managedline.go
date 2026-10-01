@@ -655,10 +655,14 @@ func managedLineRequestSHA(userID, nodeID string, port int) string {
 }
 
 // validateManagedLineApproval re-derives everything an approved plan depends
-// on and fails closed on any drift — the same discipline as
+// on and fails closed on any drift, with the same discipline as
 // validateLineUserApproval. It runs at approve time, at apply-script render
-// time, and again when the task result arrives.
-func (s *Server) validateManagedLineApproval(approval model.Approval) (managedLinePlan, managedLineDef, lineUserCredentialPayload, error) {
+// time, and again when the task result arrives. checkGrant re-runs the
+// rollout's policy gate (lineUserGrantRefusal) at the first two: the
+// fragment adds the user, and an approval can wait past an expiry or a
+// quota. The task result leaves it off, since the node already holds what
+// the task wrote.
+func (s *Server) validateManagedLineApproval(approval model.Approval, checkGrant bool) (managedLinePlan, managedLineDef, lineUserCredentialPayload, error) {
 	var zeroPlan managedLinePlan
 	var zeroDef managedLineDef
 	var zeroCred lineUserCredentialPayload
@@ -702,6 +706,11 @@ func (s *Server) validateManagedLineApproval(approval model.Approval) (managedLi
 	u, ok := s.getVpnUser(plan.UserID)
 	if !ok || !u.Enabled {
 		return zeroPlan, zeroDef, zeroCred, fmt.Errorf("vpn user %q no longer exists or is disabled; re-plan", plan.UserID)
+	}
+	if checkGrant {
+		if err := s.lineUserGrantRefusal(lineUserOpAdd, u); err != nil {
+			return zeroPlan, zeroDef, zeroCred, err
+		}
 	}
 	cred, err := lineUserCredential(u, model.ProxyProtocolVLESS, plan.UserName)
 	if err != nil {
@@ -747,7 +756,7 @@ func (s *Server) managedLineApplyScript(approval model.Approval) string {
 			"echo " + shellQuote("lattice managed-line: "+err.Error()) + " >&2\n" +
 			"exit 1\n"
 	}
-	_, def, cred, err := s.validateManagedLineApproval(approval)
+	_, def, cred, err := s.validateManagedLineApproval(approval, true)
 	if err != nil {
 		return fail(err)
 	}
@@ -813,7 +822,7 @@ func (s *Server) handleManagedLineTaskResult(r *http.Request, approval model.App
 	metadata := map[string]string{
 		"approval_id": approval.ID, "task_id": task.ID, "plugin_id": approval.Plugin,
 	}
-	plan, def, _, validateErr := s.validateManagedLineApproval(approval)
+	plan, def, _, validateErr := s.validateManagedLineApproval(approval, false)
 	if result.Error != "" || result.ExitCode != 0 {
 		reason := result.Error
 		if reason == "" {

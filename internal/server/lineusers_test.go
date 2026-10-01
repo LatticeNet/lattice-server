@@ -1,7 +1,10 @@
 package server
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -89,6 +92,86 @@ func seedManagedLineUserFixture(t *testing.T, srv *Server) (Line, VpnUser) {
 		t.Fatal(err)
 	}
 	return line, user
+}
+
+// filePlan files a line-user plan and returns its approval.
+func filePlan(t *testing.T, srv *Server, op, userID, lineHashID string) model.Approval {
+	t.Helper()
+	out, err := srv.vpnUserLinePlan(lineUserTestPrincipal(), mustJSON(t, map[string]string{"user_id": userID, "line_hash_id": lineHashID}), op)
+	if err != nil {
+		t.Fatalf("plan_%s: %v", op, err)
+	}
+	var response struct {
+		Approval model.Approval `json:"approval"`
+	}
+	if err := json.Unmarshal(out, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response.Approval
+}
+
+func approvePlan(t *testing.T, srv *Server, approval model.Approval) error {
+	t.Helper()
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	_, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	return err
+}
+
+func tasksFor(srv *Server, approvalID string) []model.Task {
+	var out []model.Task
+	for _, task := range srv.store.Tasks() {
+		if task.ApprovalID == approvalID {
+			out = append(out, task)
+		}
+	}
+	return out
+}
+
+// Approving a line-user plan queues the apply task core renders for it, on
+// both tracks. The plan fills Service and Method to bind its typed columns,
+// and the approve path used to take that for a plugin operation: it marked
+// the approval approved, found no loaded plugin "singbox-lineuser", and
+// queued nothing.
+func TestApprovingALineUserPlanQueuesItsApply(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	line, u := seedLineUserFixture(t, srv)
+	u.Bindings = nil
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	add := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
+	if err := approvePlan(t, srv, add); err != nil {
+		t.Fatalf("approve adopted add: %v", err)
+	}
+	if stored, _ := srv.store.Approval(add.ID); stored.Status != model.ApprovalApproved {
+		t.Fatalf("adopted add status = %q, want approved", stored.Status)
+	}
+	if tasks := tasksFor(srv, add.ID); len(tasks) != 1 || !strings.Contains(tasks[0].Script, "user add "+shellQuote(line.Tag)) {
+		t.Fatalf("approved adopted add must queue sb user add: %+v", tasks)
+	}
+
+	managedSrv := newLinemetaTestServer(t, mustOpenStore(t))
+	managedLine, identity := seedManagedLineUserFixture(t, managedSrv)
+	managedAdd := filePlan(t, managedSrv, lineUserOpAdd, identity.ID, managedLine.LineHashID)
+	if err := approvePlan(t, managedSrv, managedAdd); err != nil {
+		t.Fatalf("approve managed add: %v", err)
+	}
+	if tasks := tasksFor(managedSrv, managedAdd.ID); len(tasks) != 1 || !strings.Contains(tasks[0].Script, "/etc/sing-box/config.json") {
+		t.Fatalf("approved managed add must queue the full config apply: %+v", tasks)
+	}
+}
+
+func mustOpenStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
 }
 
 func TestUserLineName(t *testing.T) {

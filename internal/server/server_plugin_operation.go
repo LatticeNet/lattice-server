@@ -248,9 +248,10 @@ func (s *Server) handlePluginOperationTaskResult(r *http.Request, approval model
 }
 
 // isPluginOperationApproval reports whether an approval carries a plugin operation, so
-// the generic approval flow can route it without a per-plugin ladder. A plugin operation
-// is the only kind that sets Service and Method; nft, dns, and agent-update approvals
-// never do, so this cannot mistake one of those for an operation.
+// the generic approval flow can route it without a per-plugin ladder. nft, dns, and
+// agent-update approvals never set Service and Method, so this cannot mistake one of
+// those for an operation. The line-user, managed-line and line-chain plans do set
+// both, to bind their typed columns, so each router checks those plugins first.
 func isPluginOperationApproval(approval model.Approval) bool {
 	return approval.Service != "" && approval.Method != ""
 }

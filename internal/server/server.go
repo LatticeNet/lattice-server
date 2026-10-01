@@ -7796,8 +7796,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	// script the server had to know how to write. The plugin compiled the plan; the
 	// operator approved the exact bytes of it; the plugin now executes it under a
 	// one-time grant bound to that approval, and every task it enqueues is checked
-	// against the approved target set.
-	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) && approval.Plugin != singBoxManagedLinePlugin {
+	// against the approved target set. The line chain, managed line and line-user
+	// plans fill Service and Method too, to bind their typed columns, but core
+	// writes their apply scripts below and no loaded plugin carries their ids, so
+	// the plugin executor would only refuse them.
+	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) &&
+		approval.Plugin != singBoxManagedLinePlugin && approval.Plugin != singBoxLineUserPlugin {
 		approval.Status = model.ApprovalApproved
 		approval.ApprovedBy = p.ActorID
 		if err := s.store.UpsertApproval(approval); err != nil {

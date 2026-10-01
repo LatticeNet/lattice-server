@@ -37,6 +37,13 @@ var ErrGuardRealityDurabilityDegraded = errors.New("guard reality committed with
 // UpsertGuardRealitySnapshot stores the latest normalized reality snapshot for
 // a node. Same collected_at plus identical content is idempotent and does not
 // rewrite received_at; same collected_at plus different content is a conflict.
+//
+// A newer snapshot that reports the same facts as the stored one, differing
+// only in collected_at and the sshd observation time, replaces it in memory
+// without a write until the copy on disk is reportClockPersistInterval old.
+// Agents report every ten seconds and the facts rarely move; freshness is
+// judged against guardRealityStaleAfter, which is hours, so a restart that
+// resumes from a copy a few minutes old reads the same.
 func (s *Store) UpsertGuardRealitySnapshot(nodeIdentityUUID string, snapshot GuardRealitySnapshot) (GuardRealitySnapshot, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -64,6 +71,11 @@ func (s *Store) UpsertGuardRealitySnapshot(nodeIdentityUUID string, snapshot Gua
 			}
 			return existing, false, ErrGuardRealityStale
 		}
+		if guardRealityFactsEqual(snapshot.Reality, existing.Reality) &&
+			!reportClockDue(s.guardRealityOnDisk, snapshot.Reality.NodeID, snapshot.ReceivedAt) {
+			s.state.GuardRealitySnapshots[snapshot.Reality.NodeID] = snapshot
+			return cloneGuardRealitySnapshot(snapshot), true, nil
+		}
 	}
 	next := make(map[string]GuardRealitySnapshot, len(s.state.GuardRealitySnapshots)+1)
 	for nodeID, existing := range s.state.GuardRealitySnapshots {
@@ -81,6 +93,23 @@ func (s *Store) UpsertGuardRealitySnapshot(nodeIdentityUUID string, snapshot Gua
 		return cloneGuardRealitySnapshot(snapshot), true, fmt.Errorf("%w: %v", ErrGuardRealityDurabilityDegraded, err)
 	}
 	return cloneGuardRealitySnapshot(snapshot), true, nil
+}
+
+// guardRealityFactsEqual compares two canonical snapshots with their clocks
+// cleared: collected_at and the sshd observation time move on every poll.
+func guardRealityFactsEqual(a, b model.GuardNodeReality) bool {
+	a.CollectedAt, b.CollectedAt = time.Time{}, time.Time{}
+	if a.SSHD != nil {
+		sshd := *a.SSHD
+		sshd.ObservedAt = time.Time{}
+		a.SSHD = &sshd
+	}
+	if b.SSHD != nil {
+		sshd := *b.SSHD
+		sshd.ObservedAt = time.Time{}
+		b.SSHD = &sshd
+	}
+	return reflect.DeepEqual(a, b)
 }
 
 // GuardRealitySnapshot returns a deep copy of one node's latest reality report.

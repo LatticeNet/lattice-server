@@ -201,7 +201,7 @@ func TestProxyExpiryDigestIsOneMessagePerRun(t *testing.T) {
 		eventType: "proxy.expiry",
 		title:     "Lattice proxy expiry digest: 3 users",
 		// None of them is on a line, let alone a managed one.
-		body: "09-25  dave@example.com  expired\n09-30  alice@example.com  within 1d\n10-04  carol@example.com  within 7d\n" + proxyAlertOnlyNote,
+		body: "09-25  dave@example.com  expired\n09-30  alice@example.com  within 1d\n10-04  carol@example.com  within 7d\n" + proxyDigestAlertOnlyNote,
 	}
 	if sent[0] != want {
 		t.Fatalf("digest:\n got %+v\nwant %+v", sent[0], want)

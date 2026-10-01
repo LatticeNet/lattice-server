@@ -1043,9 +1043,10 @@ func (s *Server) renderOmissions(profile model.ProxyNodeProfile, users []model.P
 // migrated identity with no enabled managed binding, its legacy record on
 // every managed line whose inbound that record covers. Only there can a quota
 // or an expiry take a user off a node, through drift and a reviewed apply.
-// Adopted lines are outside it: Lattice does not remove users from them
-// (design 15 D6, design 17), so an alert about an identity outside the
-// managed render is an alert only.
+// Outside it are identities on adopted lines only, which Lattice does not
+// remove users from (design 15 D6, design 17), identities on managed lines
+// without a VLESS credential, and identities on no line at all; for each of
+// them an alert is an alert only.
 func (s *Server) vpnUserInManagedRender(u VpnUser) bool {
 	_, lines := s.lineReadModel()
 	credential, ok := vpnCredentialForProtocol(u.Credentials, model.ProxyProtocolVLESS)

@@ -17,9 +17,16 @@ const (
 )
 
 // proxyAlertOnlyNote ends the text of a quota or expiry alert about an
-// identity no managed render carries (vpnUserInManagedRender). Its lines, if
-// it has any, are adopted, and nothing on them follows the alert.
-const proxyAlertOnlyNote = "Lattice does not remove users from adopted lines, so this message is an alert only."
+// identity no managed render carries (vpnUserInManagedRender): it may be on
+// adopted lines only, on lines of another protocol, or on none, and in every
+// case nothing Lattice renders follows the alert. A digest, which always
+// covers two or more users, ends with proxyDigestAlertOnlyNote or
+// proxyDigestMixedAlertOnlyNote instead.
+const (
+	proxyAlertOnlyNote            = "No managed line carries this user, so Lattice will not remove it and this message is an alert only."
+	proxyDigestAlertOnlyNote      = "No managed line carries these users, so Lattice will not remove them and this message is an alert only."
+	proxyDigestMixedAlertOnlyNote = "No managed line carries the users marked alert only, so Lattice will not remove them and for them this message is an alert only."
+)
 
 type proxyUserNotificationFire struct {
 	UserID            string
@@ -33,7 +40,7 @@ type proxyUserNotificationFire struct {
 	ExpiresAt         time.Time
 	Status            string
 	// AlertOnly marks an alert about an identity outside the managed render:
-	// Lattice takes nobody off an adopted line, so the text says so.
+	// nothing Lattice renders removes it, so the text says so.
 	AlertOnly bool
 }
 
@@ -356,7 +363,7 @@ func proxyDigestBody(alerts []proxyUserNotificationFire, lines []string) string 
 	case 0:
 		return strings.Join(lines, "\n")
 	case len(alerts):
-		return strings.Join(lines, "\n") + "\n" + proxyAlertOnlyNote
+		return strings.Join(lines, "\n") + "\n" + proxyDigestAlertOnlyNote
 	}
 	marked := make([]string, len(lines))
 	for i, line := range lines {
@@ -365,7 +372,7 @@ func proxyDigestBody(alerts []proxyUserNotificationFire, lines []string) string 
 			marked[i] += "  alert only"
 		}
 	}
-	return strings.Join(marked, "\n") + "\nLattice does not remove users from adopted lines, so for the users marked alert only this message is an alert only."
+	return strings.Join(marked, "\n") + "\n" + proxyDigestMixedAlertOnlyNote
 }
 
 // withAlertOnlyNote ends a single alert's text with proxyAlertOnlyNote when

@@ -35,11 +35,12 @@ func emitQuotaAlert(t *testing.T, srv *Server, u VpnUser, now time.Time) (proxyU
 	return alerts[0], (*sent)[0]
 }
 
-// A quota or expiry alert about an identity outside the managed render says
-// that Lattice does not remove users from adopted lines and that the message
-// is an alert only. An identity the managed render carries, through a
-// managed binding or through its legacy record, keeps the plain text.
-func TestProxyAlertTextSaysAdoptedLinesAreAlertOnly(t *testing.T) {
+// A quota or expiry alert about an identity outside the managed render, one
+// on adopted lines only or on no line at all, says that no managed line
+// carries the user and that the message is an alert only. An identity the
+// managed render carries, through a managed binding or through its legacy
+// record, keeps the plain text.
+func TestProxyAlertTextSaysWhenItIsAlertOnly(t *testing.T) {
 	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
 
 	t.Run("expiry, no lines", func(t *testing.T) {
@@ -54,7 +55,7 @@ func TestProxyAlertTextSaysAdoptedLinesAreAlertOnly(t *testing.T) {
 		}
 		want := sentProxyAlert{
 			title: "Lattice proxy expiry due in 7d: frank@example.com",
-			body:  "frank@example.com subscription expires on 2026-10-04. Status: active. Lattice does not remove users from adopted lines, so this message is an alert only.",
+			body:  "frank@example.com subscription expires on 2026-10-04. Status: active. No managed line carries this user, so Lattice will not remove it and this message is an alert only.",
 		}
 		if len(*sent) != 1 || (*sent)[0] != want {
 			t.Fatalf("sent %+v\nwant %+v", *sent, want)
@@ -70,7 +71,7 @@ func TestProxyAlertTextSaysAdoptedLinesAreAlertOnly(t *testing.T) {
 		alert, msg := emitQuotaAlert(t, srv, user, now)
 		want := sentProxyAlert{
 			title: "Lattice proxy quota 100%: alice@example.com",
-			body:  "alice@example.com used 1000 B of 1000 B (100.0%). Status: over_quota. Lattice does not remove users from adopted lines, so this message is an alert only.",
+			body:  "alice@example.com used 1000 B of 1000 B (100.0%). Status: over_quota. No managed line carries this user, so Lattice will not remove it and this message is an alert only.",
 		}
 		if !alert.AlertOnly || msg != want {
 			t.Fatalf("alert=%+v sent %+v\nwant %+v", alert, msg, want)
@@ -148,12 +149,12 @@ func TestProxyDigestMarksAlertOnlyUsers(t *testing.T) {
 	_, mixed := proxyUserDigestMessage(proxyUserAlertQuota, []proxyUserNotificationFire{quota("bob", 900, true), quota("amy", 1000, false)}, now)
 	wantMixed := "amy  1000 B of 1000 B (100.0%)\n" +
 		"bob  900 B of 1000 B (90.0%)  alert only\n" +
-		"Lattice does not remove users from adopted lines, so for the users marked alert only this message is an alert only."
+		"No managed line carries the users marked alert only, so Lattice will not remove them and for them this message is an alert only."
 	if mixed != wantMixed {
 		t.Fatalf("mixed digest:\n got %q\nwant %q", mixed, wantMixed)
 	}
 	_, all := proxyUserDigestMessage(proxyUserAlertQuota, []proxyUserNotificationFire{quota("bob", 900, true), quota("amy", 1000, true)}, now)
-	if want := "amy  1000 B of 1000 B (100.0%)\nbob  900 B of 1000 B (90.0%)\n" + proxyAlertOnlyNote; all != want {
+	if want := "amy  1000 B of 1000 B (100.0%)\nbob  900 B of 1000 B (90.0%)\nNo managed line carries these users, so Lattice will not remove them and this message is an alert only."; all != want {
 		t.Fatalf("all alert only:\n got %q\nwant %q", all, want)
 	}
 	_, none := proxyUserDigestMessage(proxyUserAlertQuota, []proxyUserNotificationFire{quota("bob", 900, false), quota("amy", 1000, false)}, now)

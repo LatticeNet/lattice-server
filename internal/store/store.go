@@ -270,6 +270,10 @@ type Store struct {
 	// Guarded by mu.
 	livenessOnDisk     map[string]time.Time
 	guardRealityOnDisk map[string]time.Time
+	// closed is set by the first Close. A later Close does nothing: the bolt
+	// sidecar is gone by then, so a write would put its domains in the JSON
+	// file. Guarded by mu.
+	closed bool
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every
@@ -3049,6 +3053,10 @@ func (s *Store) AuditWALHead() (string, int, bool) {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	var closeErr error
 	// Reports that only moved their clocks wait in memory for the next write.
 	// A clean shutdown writes them, so a restart resumes from the newest

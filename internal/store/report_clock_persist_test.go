@@ -588,3 +588,45 @@ func TestFailedReportWriteLeavesMarkersAndRetries(t *testing.T) {
 		t.Fatalf("the retried transition wrote %d times, want 1", calls)
 	}
 }
+
+// A Close whose flush fails leaves clocks unflushed and the bolt sidecar
+// closed. A second Close must not try again: without the sidecar, the write
+// would carry the bolt-owned domains into the JSON file.
+func TestSecondCloseAfterFailedFlushWritesNothing(t *testing.T) {
+	s, path := openReportClockStore(t)
+	if err := s.EnableRuntimeBoltHotStore(filepath.Join(t.TempDir(), "hot.db")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "generation-a"}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	rec := runningLiveness("node-a", base)
+	if _, _, err := s.UpsertSingBoxLiveness(rec); err != nil {
+		t.Fatal(err)
+	}
+	next := rec
+	next.ReceivedAt, next.Runtime.ProbedAt = base.Add(time.Minute), base.Add(time.Minute)
+	if _, _, err := s.UpsertSingBoxLiveness(next); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path+".tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path+".tmp", "keep"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err == nil {
+		t.Fatal("a close whose flush could not be written reported success")
+	}
+	if err := os.RemoveAll(path + ".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	before := s.testPersistCalls
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls := s.testPersistCalls - before; calls != 0 {
+		t.Fatalf("a second close persisted %d times, want 0", calls)
+	}
+}

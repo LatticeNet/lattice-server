@@ -584,6 +584,59 @@ func TestDeleteNodeRemovesItsOwnGuardBinding(t *testing.T) {
 	}
 }
 
+// The liveness record carries the open incident. A node enrolled again under
+// the same id must start without it, so the cascade removes it like the other
+// node-owned records, and the plan says so first.
+func TestDeleteNodeRemovesItsSingBoxLiveness(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := OpenWithCipher(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"n1", "n2"} {
+		if err := s.UpsertNode(model.Node{ID: id, Name: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	for _, id := range []string{"n1", "n2"} {
+		if _, _, err := s.UpsertSingBoxLiveness(SingBoxLiveness{NodeID: id, State: "down", StateSince: at,
+			ProblemSince: at, NotifiedDownAt: at.Add(2 * time.Minute), ReceivedAt: at.Add(3 * time.Minute)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan, ok := s.PlanDeleteNode("n1")
+	if !ok || plan.SingBoxLiveness != 1 {
+		t.Fatalf("the delete preview must count the liveness record: ok=%v count=%d", ok, plan.SingBoxLiveness)
+	}
+	if _, ok := s.SingBoxLivenessRecord("n1"); !ok {
+		t.Fatal("planning is a dry run and must not have removed the record")
+	}
+	report, ok, err := s.DeleteNode("n1")
+	if err != nil || !ok || report.SingBoxLiveness != 1 {
+		t.Fatalf("delete: ok=%v err=%v count=%d", ok, err, report.SingBoxLiveness)
+	}
+	if _, ok := s.SingBoxLivenessRecord("n1"); ok {
+		t.Fatal("the node's liveness record outlived the node")
+	}
+	cipher := s.cipher
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, ok := reopened.SingBoxLivenessRecord("n1"); ok {
+		t.Fatal("the deleted node's liveness record is still on disk")
+	}
+	if rec, ok := reopened.SingBoxLivenessRecord("n2"); !ok || rec.State != "down" {
+		t.Fatalf("the bystander's record must survive: %+v", rec)
+	}
+}
+
 // A task names a node in three places, not one: Targets, TargetLeases keyed by
 // the same id, and RerunOfNodeID. The cascade stripped Targets and left the
 // other two, so a deleted node stayed named by every task that had ever leased

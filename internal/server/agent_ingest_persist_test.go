@@ -314,3 +314,69 @@ func copyStateFiles(t *testing.T, from, to string) {
 		}
 	}
 }
+
+// postLiveness sends one inventory report carrying only the liveness probe.
+func postLiveness(t *testing.T, handler http.Handler, token string, running bool, at time.Time) {
+	t.Helper()
+	runtime := `"running":true,"pid":4242,"active_state":"active","sub_state":"running"`
+	if !running {
+		runtime = `"running":false,"active_state":"failed","sub_state":"failed"`
+	}
+	body := fmt.Sprintf(`{"node_id":"node-a","inventory":{"status":"ok","nodes":[],"runtime":{%s,"restart_count":3,"probed_at":%q}}}`,
+		runtime, at.Format(time.RFC3339Nano))
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/singbox-inventory", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("inventory at %s: %d %s", at, rec.Code, rec.Body.String())
+	}
+}
+
+// A node deleted mid-incident and enrolled again under the same id starts a
+// fresh episode: its first outage is announced after the hold, and its first
+// healthy report announces no recovery from the deleted node's incident.
+func TestReenrolledNodeDoesNotInheritLivenessEpisode(t *testing.T) {
+	f := openIngestFixture(t, t.TempDir())
+	defer f.st.Close()
+	cookies, csrf := loginSession(t, f.handler)
+	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
+	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	at := base
+	f.srv.now = func() time.Time { return at }
+	notices := captureTypedNotices(f.srv)
+
+	postLiveness(t, f.handler, token, true, at)
+	at = base.Add(10 * time.Second)
+	postLiveness(t, f.handler, token, false, at)
+	at = base.Add(10*time.Second + serviceDownHold)
+	postLiveness(t, f.handler, token, false, at)
+	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceDown {
+		t.Fatalf("setup: want one down notice, got %+v", *notices)
+	}
+	*notices = nil
+
+	if _, ok, err := f.st.DeleteNode("node-a"); err != nil || !ok {
+		t.Fatalf("delete: ok=%v err=%v", ok, err)
+	}
+	token = enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A again")
+
+	reenrolledAt := base.Add(time.Hour)
+	at = reenrolledAt
+	postLiveness(t, f.handler, token, false, at)
+	rec, ok := f.st.SingBoxLivenessRecord("node-a")
+	if !ok || !rec.StateSince.Equal(reenrolledAt) || !rec.ProblemSince.Equal(reenrolledAt) || !rec.NotifiedDownAt.IsZero() {
+		t.Fatalf("the re-enrolled node inherited the deleted episode: %+v", rec)
+	}
+	if len(*notices) != 0 {
+		t.Fatalf("a fresh outage was announced before the hold: %+v", *notices)
+	}
+	at = reenrolledAt.Add(serviceDownHold)
+	postLiveness(t, f.handler, token, false, at)
+	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceDown {
+		t.Fatalf("the re-enrolled node's outage was not announced once after the hold: %+v", *notices)
+	}
+	*notices = nil
+	at = at.Add(10 * time.Second)
+	postLiveness(t, f.handler, token, true, at)
+	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceRecovered {
+		t.Fatalf("recovery from the new episode: %+v", *notices)
+	}
+}

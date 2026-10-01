@@ -163,8 +163,20 @@ func TestSteadyAgentReportsDoNotRewriteState(t *testing.T) {
 // steady stream of identical reports writes nothing, every transition and the
 // notification bookkeeping are written at once, the down notice fires once
 // after serviceDownHold, and a restarted server resumes the episode from disk
-// without notifying it again.
+// without notifying it again. Both restarts are covered: a clean shutdown,
+// which flushes clocks still held in memory, and a crash, which resumes from
+// whatever the last write left.
 func TestSingBoxLivenessWritesOnlyTransitionsAndSurvivesRestart(t *testing.T) {
+	for _, crash := range []bool{false, true} {
+		name := "clean_shutdown"
+		if crash {
+			name = "crash"
+		}
+		t.Run(name, func(t *testing.T) { singBoxLivenessEpisodeAcrossRestart(t, crash) })
+	}
+}
+
+func singBoxLivenessEpisodeAcrossRestart(t *testing.T, crash bool) {
 	dir := t.TempDir()
 	f := openIngestFixture(t, dir)
 	cookies, csrf := loginSession(t, f.handler)
@@ -243,18 +255,24 @@ func TestSingBoxLivenessWritesOnlyTransitionsAndSurvivesRestart(t *testing.T) {
 	expectNotices("still down after the notice")
 	lastSeenDown := at
 
-	// Restart: a new store and server over the same files.
-	if err := f.st.Close(); err != nil {
+	// Restart. A clean shutdown closes the store; a crash is the files as
+	// they stand, copied while the old store is still open.
+	restartDir, wantReceivedAt := dir, lastSeenDown
+	if crash {
+		restartDir, wantReceivedAt = t.TempDir(), notifiedAt
+		copyStateFiles(t, dir, restartDir)
+		t.Cleanup(func() { _ = f.st.Close() })
+	} else if err := f.st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	restarted := openIngestFixture(t, dir)
+	restarted := openIngestFixture(t, restartDir)
 	defer restarted.st.Close()
 	rec, ok := restarted.st.SingBoxLivenessRecord("node-a")
 	if !ok || rec.State != "down" || !rec.StateSince.Equal(downAt) || !rec.ProblemSince.Equal(downAt) || !rec.NotifiedDownAt.Equal(notifiedAt) {
 		t.Fatalf("restart lost the episode: %+v", rec)
 	}
-	if rec.ReceivedAt.After(lastSeenDown) || lastSeenDown.Sub(rec.ReceivedAt) >= 15*time.Minute {
-		t.Fatalf("received_at on disk %s is not within the flush interval of %s", rec.ReceivedAt, lastSeenDown)
+	if !rec.ReceivedAt.Equal(wantReceivedAt) {
+		t.Fatalf("received_at after restart is %s, want %s", rec.ReceivedAt, wantReceivedAt)
 	}
 	at = lastSeenDown.Add(10 * time.Second)
 	restarted.srv.now = func() time.Time { return at }
@@ -272,5 +290,27 @@ func TestSingBoxLivenessWritesOnlyTransitionsAndSurvivesRestart(t *testing.T) {
 	rec, _ = restarted.st.SingBoxLivenessRecord("node-a")
 	if rec.State != "running" || !rec.ProblemSince.IsZero() || !rec.NotifiedDownAt.IsZero() {
 		t.Fatalf("recovery did not close the episode: %+v", rec)
+	}
+}
+
+// copyStateFiles copies every regular file in one storage directory to
+// another: what a crashed server leaves behind, without closing anything.
+func copyStateFiles(t *testing.T, from, to string) {
+	t.Helper()
+	entries, err := os.ReadDir(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(from, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(to, entry.Name()), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

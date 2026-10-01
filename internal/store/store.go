@@ -1101,6 +1101,22 @@ func (s *Store) noteReportClocksOnDisk(st State) {
 	}
 }
 
+// reportClocksUnflushedLocked reports whether memory holds a liveness record
+// or guard reality snapshot newer than the copy on disk.
+func (s *Store) reportClocksUnflushedLocked() bool {
+	for nodeID, rec := range s.state.SingBoxLiveness {
+		if written, ok := s.livenessOnDisk[nodeID]; !ok || !written.Equal(rec.ReceivedAt) {
+			return true
+		}
+	}
+	for nodeID, snapshot := range s.state.GuardRealitySnapshots {
+		if written, ok := s.guardRealityOnDisk[nodeID]; !ok || !written.Equal(snapshot.ReceivedAt) {
+			return true
+		}
+	}
+	return false
+}
+
 // reportClockDue reports whether a clock-only update must still be written
 // because the copy on disk is older than reportClockPersistInterval, or there
 // is no copy on disk at all.
@@ -3034,8 +3050,16 @@ func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var closeErr error
+	// Reports that only moved their clocks wait in memory for the next write.
+	// A clean shutdown writes them, so a restart resumes from the newest
+	// report rather than from one up to reportClockPersistInterval old.
+	if s.reportClocksUnflushedLocked() {
+		closeErr = s.Save()
+	}
 	if s.wal != nil {
-		closeErr = s.wal.Close()
+		if err := s.wal.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
 		s.wal = nil
 	}
 	if s.runtimeBoltHot != nil {

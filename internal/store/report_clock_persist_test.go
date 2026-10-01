@@ -168,7 +168,7 @@ func TestSingBoxLivenessClockFlushesOnInterval(t *testing.T) {
 	if _, _, err := s.UpsertSingBoxLiveness(rec); err != nil {
 		t.Fatal(err)
 	}
-	report := func(at time.Time) {
+	report := func(s *Store, at time.Time) {
 		t.Helper()
 		next := rec
 		next.ReceivedAt, next.Runtime.ProbedAt = at, at
@@ -178,30 +178,131 @@ func TestSingBoxLivenessClockFlushesOnInterval(t *testing.T) {
 	}
 
 	before := s.testPersistCalls
-	report(base.Add(reportClockPersistInterval - time.Second))
+	report(s, base.Add(reportClockPersistInterval-time.Second))
 	if calls := s.testPersistCalls - before; calls != 0 {
 		t.Fatalf("clock-only report inside the interval persisted %d times", calls)
 	}
-	report(base.Add(reportClockPersistInterval))
+	due := base.Add(reportClockPersistInterval)
+	report(s, due)
 	if calls := s.testPersistCalls - before; calls != 1 {
 		t.Fatalf("report at the interval persisted %d times, want 1", calls)
 	}
+	// Nothing is left unflushed, so the reopened store reads exactly what
+	// the interval write put on disk.
+	s = reopenReportClockStore(t, s, path)
+	got, _ := s.SingBoxLivenessRecord("node-a")
+	if !got.ReceivedAt.Equal(due) || !got.Runtime.ProbedAt.Equal(due) {
+		t.Fatalf("disk holds received_at %s probed_at %s, want %s", got.ReceivedAt, got.Runtime.ProbedAt, due)
+	}
 
 	// An unrelated write carries the newest clock with it.
-	flushedAt := base.Add(reportClockPersistInterval + 5*time.Minute)
-	report(flushedAt)
+	flushedAt := due.Add(5 * time.Minute)
+	report(s, flushedAt)
 	if err := s.UpsertNode(model.Node{ID: "node-b", Name: "node-b"}); err != nil {
 		t.Fatal(err)
 	}
+	if written := s.livenessOnDisk["node-a"]; !written.Equal(flushedAt) {
+		t.Fatalf("the unrelated write put received_at %s on disk, want %s", written, flushedAt)
+	}
 	before = s.testPersistCalls
-	report(flushedAt.Add(reportClockPersistInterval - time.Second))
+	report(s, flushedAt.Add(reportClockPersistInterval-time.Second))
 	if calls := s.testPersistCalls - before; calls != 0 {
 		t.Fatalf("the unrelated write did not restart the interval: %d writes", calls)
 	}
+}
 
-	got, _ := reopenReportClockStore(t, s, path).SingBoxLivenessRecord("node-a")
-	if !got.ReceivedAt.Equal(flushedAt) || !got.Runtime.ProbedAt.Equal(flushedAt) {
-		t.Fatalf("disk holds received_at %s probed_at %s, want %s", got.ReceivedAt, got.Runtime.ProbedAt, flushedAt)
+// A clean shutdown writes what is still only in memory, and writes nothing
+// when memory and disk already agree.
+func TestCloseFlushesClockOnlyReports(t *testing.T) {
+	s, path := openReportClockStore(t)
+	if err := s.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "generation-a"}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	rec := runningLiveness("node-a", base)
+	reality := guardRealityFixture("node-a", base)
+	if _, _, err := s.UpsertSingBoxLiveness(rec); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", reality); err != nil {
+		t.Fatal(err)
+	}
+	latest := base.Add(5 * time.Minute)
+	next := rec
+	next.ReceivedAt, next.Runtime.ProbedAt = latest, latest
+	if _, _, err := s.UpsertSingBoxLiveness(next); err != nil {
+		t.Fatal(err)
+	}
+	latestReality := steadyGuardReality(reality, latest)
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", latestReality); err != nil {
+		t.Fatal(err)
+	}
+	before := s.testPersistCalls
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls := s.testPersistCalls - before; calls != 1 {
+		t.Fatalf("close with unflushed clocks persisted %d times, want 1", calls)
+	}
+	reopened, err := OpenWithCipher(path, s.cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotLiveness, _ := reopened.SingBoxLivenessRecord("node-a")
+	gotReality, _ := reopened.GuardRealitySnapshot("node-a")
+	if !gotLiveness.ReceivedAt.Equal(latest) || !gotReality.Reality.CollectedAt.Equal(latest) {
+		t.Fatalf("close did not flush: liveness %s reality %s, want %s", gotLiveness.ReceivedAt, gotReality.Reality.CollectedAt, latest)
+	}
+	before = reopened.testPersistCalls
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls := reopened.testPersistCalls - before; calls != 0 {
+		t.Fatalf("close with nothing unflushed persisted %d times", calls)
+	}
+}
+
+// The inventory route reconciles the node's line chains on every report. A
+// chain whose observation has not changed must not be written again, and its
+// reconciliation audit, already recorded, must not be appended again.
+func TestSteadyLineChainObservationsDoNotPersist(t *testing.T) {
+	for _, hot := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bolt_hot_%v", hot), func(t *testing.T) {
+			s, _ := openReportClockStore(t)
+			defer s.Close()
+			if hot {
+				if err := s.EnableRuntimeBoltHotStore(filepath.Join(t.TempDir(), "hot.db")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			at := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+			definition := LineChainDefinition{
+				SourceLineUUID: "line-src", SourceNodeID: "node-a", TargetLineUUID: "line-dst", TargetNodeID: "node-b",
+				OutboundTag: "chain-out", ApprovalID: "approval-1", TaskID: "task-1",
+				Status: LineChainStatusConverged, Generation: 1, CreatedAt: at, UpdatedAt: at,
+			}
+			s.mu.Lock()
+			s.state.LineChainDefinitions[definition.SourceLineUUID] = definition
+			s.mu.Unlock()
+			observations := map[string]LineChainObservation{"line-src": {OutboundTag: "chain-out", DownstreamLineUUID: "line-dst"}}
+			audit := model.AuditEvent{ID: "audit-linechain-1", At: at, NodeID: "node-a", Action: "linechain.apply", Decision: "allow"}
+			if _, err := s.AppendAuditIdempotent(audit); err != nil {
+				t.Fatal(err)
+			}
+			before := s.testPersistCalls
+			for i := 0; i < 30; i++ {
+				changed, err := s.ReconcileLineChainsWithAudits(observations, func(LineChainDefinition) (model.AuditEvent, bool) { return audit, true })
+				if err != nil || changed {
+					t.Fatalf("report %d: changed=%v err=%v", i, changed, err)
+				}
+				if appended, err := s.AppendAuditIdempotent(audit); err != nil || appended {
+					t.Fatalf("report %d: audit appended=%v err=%v", i, appended, err)
+				}
+			}
+			if calls := s.testPersistCalls - before; calls != 0 {
+				t.Fatalf("30 unchanged chain observations persisted %d times", calls)
+			}
+		})
 	}
 }
 

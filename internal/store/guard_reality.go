@@ -73,6 +73,9 @@ func (s *Store) UpsertGuardRealitySnapshot(nodeIdentityUUID string, snapshot Gua
 		}
 		if guardRealityFactsEqual(snapshot.Reality, existing.Reality) &&
 			!reportClockDue(s.guardRealityOnDisk, snapshot.Reality.NodeID, snapshot.ReceivedAt) {
+			// In place, unlike the copy-on-write below. Safe because this map
+			// is only ever read or written under mu and never handed out:
+			// every reader clones the snapshot it returns. Keep it that way.
 			s.state.GuardRealitySnapshots[snapshot.Reality.NodeID] = snapshot
 			return cloneGuardRealitySnapshot(snapshot), true, nil
 		}

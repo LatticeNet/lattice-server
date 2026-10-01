@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -378,5 +379,56 @@ func TestReenrolledNodeDoesNotInheritLivenessEpisode(t *testing.T) {
 	postLiveness(t, f.handler, token, true, at)
 	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceRecovered {
 		t.Fatalf("recovery from the new episode: %+v", *notices)
+	}
+}
+
+// node_status hides a down service when the liveness record is more than
+// nodeStatusEvidenceStaleAfter older than the node's last beat. Clock-only
+// liveness reports stay in memory between writes, so a crash must not leave a
+// beat on disk that is much newer than the liveness record: any write that
+// carries the beat carries the liveness clock from the same moment.
+func TestCrashRestartKeepsLivenessAsFreshAsTheLastBeat(t *testing.T) {
+	dir := t.TempDir()
+	f := openIngestFixture(t, dir)
+	t.Cleanup(func() { _ = f.st.Close() })
+	cookies, csrf := loginSession(t, f.handler)
+	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
+	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	at := base
+	f.srv.now = func() time.Time { return at }
+
+	postLiveness(t, f.handler, token, false, at)
+	// Twelve minutes of down reports: past the evidence window, inside the
+	// flush interval. The only one written on its own is the notification
+	// once the hold elapses; everything after it stays in memory.
+	writes := watchStateFile(t, f.statePath())
+	for at = base.Add(10 * time.Second); at.Sub(base) <= 12*time.Minute; at = at.Add(10 * time.Second) {
+		postLiveness(t, f.handler, token, false, at)
+		writes.check()
+	}
+	if n := writes.take(); n != 1 {
+		t.Fatalf("twelve minutes of down reports wrote the state %d times, want 1 (the notification)", n)
+	}
+	lastReport := at.Add(-10 * time.Second)
+	// The beat reaches disk the way UpdateMetrics persists it: a node write
+	// carrying the newest LastSeen.
+	node, _ := f.st.Node("node-a")
+	node.LastSeen, node.Online = lastReport, true
+	if err := f.st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+
+	crashDir := t.TempDir()
+	copyStateFiles(t, dir, crashDir)
+	restarted := openIngestFixture(t, crashDir)
+	defer restarted.st.Close()
+	rec, _ := restarted.st.SingBoxLivenessRecord("node-a")
+	beat, _ := restarted.st.Node("node-a")
+	if !rec.ReceivedAt.Equal(lastReport) || !beat.LastSeen.Equal(lastReport) {
+		t.Fatalf("after a crash the liveness record is from %s and the beat from %s, want both %s", rec.ReceivedAt, beat.LastSeen, lastReport)
+	}
+	degradations := restarted.srv.nodeDegradations(beat, lastReport.Add(10*time.Second))
+	if len(degradations) != 1 || !strings.Contains(degradations[0].reason, "sing-box has been down") {
+		t.Fatalf("the incident is hidden after the crash: %+v", degradations)
 	}
 }

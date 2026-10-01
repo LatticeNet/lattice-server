@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -502,5 +503,88 @@ func TestReportClockUpdatesInterleaveWithWritesAndReads(t *testing.T) {
 		if !ok || !rec.ReceivedAt.Equal(base.Add(99*10*time.Second)) {
 			t.Fatalf("%s: newest liveness report lost: %+v", nodeID, rec)
 		}
+	}
+}
+
+// A write that does not commit leaves the on-disk markers where they were, so
+// the next report is still due and retries it; memory is not published either,
+// as for every other commit-style write in the store.
+func TestFailedReportWriteLeavesMarkersAndRetries(t *testing.T) {
+	s, path := openReportClockStore(t)
+	defer s.Close()
+	if err := s.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "generation-a"}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	running := runningLiveness("node-a", base)
+	reality := guardRealityFixture("node-a", base)
+	if _, _, err := s.UpsertSingBoxLiveness(running); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", reality); err != nil {
+		t.Fatal(err)
+	}
+	livenessMark, realityMark := s.livenessOnDisk["node-a"], s.guardRealityOnDisk["node-a"]
+
+	// A directory where the temp file goes makes every write fail before
+	// the rename, so nothing commits. It holds a file so the writer's cleanup
+	// cannot remove it after the first failure.
+	if err := os.Mkdir(path+".tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path+".tmp", "keep"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	down := running
+	down.Runtime.Running, down.Runtime.ActiveState, down.Runtime.SubState = false, "failed", "failed"
+	down.State, down.StateSince, down.ProblemSince = "down", base.Add(10*time.Second), base.Add(10*time.Second)
+	down.ReceivedAt, down.Runtime.ProbedAt = down.StateSince, down.StateSince
+	if _, _, err := s.UpsertSingBoxLiveness(down); err == nil {
+		t.Fatal("a durable change that could not be written reported success")
+	}
+	due := running
+	due.ReceivedAt, due.Runtime.ProbedAt = base.Add(reportClockPersistInterval), base.Add(reportClockPersistInterval)
+	if _, _, err := s.UpsertSingBoxLiveness(due); err == nil {
+		t.Fatal("a due clock flush that could not be written reported success")
+	}
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", steadyGuardReality(reality, base.Add(reportClockPersistInterval))); err == nil {
+		t.Fatal("a due guard reality flush that could not be written reported success")
+	}
+	if got := s.livenessOnDisk["node-a"]; !got.Equal(livenessMark) {
+		t.Fatalf("a failed write moved the liveness marker to %s", got)
+	}
+	if got := s.guardRealityOnDisk["node-a"]; !got.Equal(realityMark) {
+		t.Fatalf("a failed write moved the guard reality marker to %s", got)
+	}
+	if rec, _ := s.SingBoxLivenessRecord("node-a"); rec.State != "running" || !rec.ReceivedAt.Equal(base) {
+		t.Fatalf("an uncommitted write was published: %+v", rec)
+	}
+
+	if err := os.RemoveAll(path + ".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	retryAt := base.Add(reportClockPersistInterval + 10*time.Second)
+	before := s.testPersistCalls
+	retry := running
+	retry.ReceivedAt, retry.Runtime.ProbedAt = retryAt, retryAt
+	if _, _, err := s.UpsertSingBoxLiveness(retry); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", steadyGuardReality(reality, retryAt)); err != nil {
+		t.Fatal(err)
+	}
+	if calls := s.testPersistCalls - before; calls != 2 {
+		t.Fatalf("the reports after the failure wrote %d times, want 2 (both still due)", calls)
+	}
+	if got := s.livenessOnDisk["node-a"]; !got.Equal(retryAt) {
+		t.Fatalf("liveness marker after the retry is %s, want %s", got, retryAt)
+	}
+	down.ReceivedAt, down.Runtime.ProbedAt = retryAt.Add(10*time.Second), retryAt.Add(10*time.Second)
+	before = s.testPersistCalls
+	if _, _, err := s.UpsertSingBoxLiveness(down); err != nil {
+		t.Fatal(err)
+	}
+	if calls := s.testPersistCalls - before; calls != 1 {
+		t.Fatalf("the retried transition wrote %d times, want 1", calls)
 	}
 }

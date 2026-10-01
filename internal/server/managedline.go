@@ -432,6 +432,11 @@ func (s *Server) compileManagedLineRollout(ctx context.Context, p principal, req
 	if !ok || !u.Enabled {
 		return nil, nil, fmt.Errorf("vpn user %q not found or disabled", userID)
 	}
+	// The fragment carries the user, so a rollout grants access the same way
+	// a plan_add does and is refused for the same reasons.
+	if err := s.requireVpnUserWithinPolicy(u, s.now()); err != nil {
+		return nil, nil, err
+	}
 	candidate := req.CandidatePort
 	if candidate == 0 {
 		candidate = managedLineDefaultCandidatePort

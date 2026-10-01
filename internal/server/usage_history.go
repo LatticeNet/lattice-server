@@ -300,6 +300,18 @@ func (s *Server) vpnUserQuotaProjection(row model.ProxyUser, vpnUser VpnUser, no
 	return row, period
 }
 
+// vpnUserPolicyRow is the identity's policy at now as a row of its own: what
+// vpnUserQuotaProjection gives over the lifetime total on the identity's
+// accounting record, the legacy record for a migrated identity and the
+// canonical projection otherwise. Every managed render row of the identity
+// carries these figures, and a line plan refuses an identity whose Status
+// here is not active.
+func (s *Server) vpnUserPolicyRow(u VpnUser, now time.Time) model.ProxyUser {
+	acct, _ := s.store.ProxyUser(firstNonEmpty(strings.TrimSpace(u.MigratedFromProxyUser), u.ID))
+	row, _ := s.vpnUserQuotaProjection(model.ProxyUser{UsedBytes: acct.UsedBytes}, u, now, usageCounter{})
+	return row
+}
+
 // quotaUsedBytes is the usage an identity's quota is measured with, and the
 // period key its alerts carry (empty for a lifetime quota):
 //   - a monthly quota: the identity's day rows for the current period plus

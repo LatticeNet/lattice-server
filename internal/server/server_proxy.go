@@ -954,10 +954,6 @@ func (s *Server) proxyUsersForManagedRender(override *VpnUser, now time.Time) []
 		}
 	}
 	stored := s.store.ProxyUsers()
-	storedByID := make(map[string]model.ProxyUser, len(stored))
-	for _, user := range stored {
-		storedByID[user.ID] = user
-	}
 	identityByLegacy := map[string]VpnUser{}
 	for _, user := range vpnUsers {
 		if user.MigratedFromProxyUser != "" {
@@ -987,12 +983,7 @@ func (s *Server) proxyUsersForManagedRender(override *VpnUser, now time.Time) []
 				continue
 			}
 			if !projected {
-				// The lifetime total lives on the identity's accounting
-				// record: the legacy record for a migrated identity, the
-				// canonical projection otherwise.
-				acct := firstNonEmpty(strings.TrimSpace(user.MigratedFromProxyUser), user.ID)
-				policy, _ = s.vpnUserQuotaProjection(model.ProxyUser{UsedBytes: storedByID[acct].UsedBytes}, user, now, usageCounter{})
-				projected = true
+				policy, projected = s.vpnUserPolicyRow(user, now), true
 			}
 			name := userLineName(user.ID, line.LineUUID)
 			out = append(out, model.ProxyUser{

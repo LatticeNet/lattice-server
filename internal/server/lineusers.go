@@ -252,11 +252,18 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 		if err := applyQuotaPeriod(&u, req.QuotaPeriod, req.QuotaResetDay); err != nil {
 			return nil, err
 		}
+		quotaChanged = true
+	}
+	if op != lineUserOpRemove {
+		if err := s.requireVpnUserWithinPolicy(u, s.now()); err != nil {
+			return nil, err
+		}
+	}
+	if quotaChanged {
 		u.UpdatedAt = s.now()
 		if err := s.putVpnUser(u); err != nil {
 			return nil, err
 		}
-		quotaChanged = true
 	}
 	ln, err := s.resolveLineUserTarget(strings.TrimSpace(req.LineHashID))
 	if err != nil {
@@ -339,6 +346,29 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	return json.Marshal(struct {
 		Approval model.Approval `json:"approval"`
 	}{Approval: approval})
+}
+
+// requireVpnUserWithinPolicy refuses a plan_add or plan_update for an
+// identity that is expired or over its quota at now, the way it refuses a
+// disabled one. Such a plan would grant what the policy denies: on a managed
+// line the render leaves the identity out while the task result marks the
+// binding enabled, and on an adopted line sb would add a user its own alerts
+// call expired or over quota. The quota is read with the request's changes
+// applied, so raising it in the same call is enough.
+func (s *Server) requireVpnUserWithinPolicy(u VpnUser, now time.Time) error {
+	policy := s.vpnUserPolicyRow(u, now)
+	switch policy.Status {
+	case model.ProxyUserStatusExpired:
+		return fmt.Errorf("user %q expired on %s; renew it before planning a line", u.ID, dateOnlyUTC(u.ExpiresAt).Format("2006-01-02"))
+	case model.ProxyUserStatusOverQuota:
+		next := "raise the quota"
+		if u.QuotaPeriod == vpnQuotaPeriodMonthly {
+			next = "raise the quota or wait for the next period"
+		}
+		return fmt.Errorf("user %q has used %s of its %s quota; %s before planning a line",
+			u.ID, formatProxyBytes(policy.UsedBytes), formatProxyBytes(policy.TrafficLimitBytes), next)
+	}
+	return nil
 }
 
 // lineUserApplyScript renders the on-box `sb user add|del` invocation for an

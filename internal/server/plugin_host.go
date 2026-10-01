@@ -127,8 +127,11 @@ func (h *pluginTaskHost) Enqueue(_ context.Context, req plugin.HostTaskRequest) 
 		Script:      req.Script,
 		TimeoutSec:  req.TimeoutSec,
 		OutputLimit: pluginTaskOutputLimit,
-		Status:      "pending",
-		CreatedAt:   time.Now().UTC(),
+		// Queued, like every task an operator queues. The operator already
+		// approved this work before execute ran; a task stored as "pending"
+		// is not a status the store delivers, so it would sit unleased forever.
+		Status:    model.TaskQueued,
+		CreatedAt: time.Now().UTC(),
 	}
 	if task.TimeoutSec <= 0 {
 		task.TimeoutSec = pluginTaskDefaultTimeoutSec

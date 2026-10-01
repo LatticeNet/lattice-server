@@ -2443,6 +2443,14 @@ const TaskExpired = "expired"
 // lives here rather than in the SDK for the same release-coordination reason.
 const TaskStalled = "stalled"
 
+// TaskPending is the status the plugin task host stored before a plugin's
+// approved task was queued like any other. No delivery path hands a task in
+// this status to an agent, so a row stored with it never ran. Such rows are
+// neither migrated nor delivered, since running an approved task weeks late
+// would surprise the operator; the task list filters and counts them and
+// CancelTask accepts them, so an operator can find and close them.
+const TaskPending = "pending"
+
 // TaskProgressStalled reports whether this leased task has stopped making
 // progress (see TaskStalled). A lease whose StartedAt is zero counts as not
 // live here: for re-execution safety taskLeaseExpired treats it as never
@@ -2659,7 +2667,7 @@ func (s *Store) CancelTask(id string) (model.Task, error) {
 	if s.lineChainTaskLocked(t) {
 		return model.Task{}, ErrTaskDurableProtected
 	}
-	if t.Status != model.TaskQueued && t.Status != model.TaskLeased {
+	if t.Status != model.TaskQueued && t.Status != model.TaskLeased && t.Status != TaskPending {
 		return model.Task{}, ErrTaskNotCancelable
 	}
 	t.Status = model.TaskCancelled
@@ -3731,6 +3739,22 @@ func (s *Store) Approval(id string) (model.Approval, bool) {
 	defer s.mu.Unlock()
 	a, ok := s.state.Approvals[id]
 	return a, ok
+}
+
+// ApprovalsByID returns the stored approvals among ids, in the order of ids,
+// under one lock. A caller resolving the approvals behind a page of tasks
+// takes the lock once instead of once per row. Unknown and empty ids are
+// skipped; a repeated id is returned each time it is named.
+func (s *Store) ApprovalsByID(ids []string) []model.Approval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.Approval, 0, len(ids))
+	for _, id := range ids {
+		if a, ok := s.state.Approvals[id]; ok {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func (s *Store) Approvals() []model.Approval {

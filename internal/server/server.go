@@ -1098,6 +1098,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/terminal-transport", s.withAuth("", s.handleNodeTerminalTransport))
 	mux.HandleFunc("/api/nodes/ip-config", s.withAuth("", s.handleNodeIPConfig))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
+	mux.HandleFunc("/api/tasks/counts", s.withAuth("", s.handleTaskCounts))
 	mux.HandleFunc("/api/tasks/cancel", s.withAuth("", s.handleCancelTask))
 	mux.HandleFunc("/api/tasks/delete", s.withAuth("", s.handleDeleteTask))
 	mux.HandleFunc("/api/tasks/rerun", s.withAuth("", s.handleRerunTask))
@@ -3311,21 +3312,48 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "comment": node.Comment, "tags": node.Tags, "agent_source_allowlist": append([]string{}, node.AgentSourceAllowlist...), "inventory": node.Inventory})
 }
 
+// handleTasks serves GET and POST /api/tasks.
+//
+// GET needs task:read and lists the tasks whose every target the caller may
+// read, newest first. Each row's status is the view status (toTaskView):
+// queued, leased, stalled, expired, finished, failed or cancelled, or pending
+// on a row the plugin task host stored before its fix and never delivered
+// (store.TaskPending). Each row also says how it was queued (origin) and,
+// when the caller may read that approval, which approval queued it
+// (approval_id), so the console can link a task to its plan.
+//
+// Query parameters, all optional:
+//
+//	status=a,b            keep rows whose status is in the comma list; a value
+//	                      outside the eight above is a 400, never ignored
+//	since=<RFC3339>       keep rows that last changed at or after the instant
+//	                      (taskLastChangedAt: the latest of created, started,
+//	                      finished and lease start, or the expiry instant of
+//	                      an expired row); send UTC with Z, or encode an
+//	                      offset's plus sign as %2B, since a bare "+" in a
+//	                      query string decodes to a space and is a 400
+//	node_id=<id>          keep rows that target the node
+//	origin=a,b            keep rows queued by approval, rerun or direct (see
+//	                      taskOrigin); anything else is a 400
+//	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
+//
+// Without any of them the response is the bare array clients have always
+// read. With any of them it is the {"tasks","total","limit","offset"}
+// envelope, total counting the filtered rows before paging, so the Tasks page
+// can ask for one page of what the operator filtered for instead of every
+// task in the store. Filters only narrow the visible set: a node_id outside
+// the caller's scope answers an empty page, exactly like a node with no
+// tasks.
+//
+// POST queues a task, which needs task:run on every target.
 func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
 		if !s.requireScope(w, p, "task:read") {
 			return
 		}
-		tasks := s.store.Tasks() // newest-first
-		visible := make([]taskView, 0, len(tasks))
-		for _, task := range tasks {
-			if taskTargetsAllowed(p, "task:read", task.Targets) {
-				visible = append(visible, s.toTaskView(task))
-			}
-		}
 		if !taskQueryRequested(r) {
-			writeJSON(w, http.StatusOK, visible)
+			writeJSON(w, http.StatusOK, s.taskRowViews(p, s.visibleTaskRows(p)))
 			return
 		}
 		q := r.URL.Query()
@@ -3339,13 +3367,18 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		nodeID := strings.TrimSpace(q.Get("node_id"))
-		filtered := make([]taskView, 0, len(visible))
-		for _, view := range visible {
-			if nodeID != "" && !taskViewTargetsNode(view, nodeID) {
-				continue
+		filter, err := parseTaskListFilter(q)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		deadline := s.store.TaskQueueDeadline()
+		rows := s.visibleTaskRows(p)
+		filtered := make([]taskRow, 0, len(rows))
+		for _, row := range rows {
+			if filter.matches(row, deadline) {
+				filtered = append(filtered, row)
 			}
-			filtered = append(filtered, view)
 		}
 		total := len(filtered)
 		if offset > total {
@@ -3356,7 +3389,7 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 		if len(filtered) > limit {
 			filtered = filtered[:limit]
 		}
-		writeJSON(w, http.StatusOK, tasksQueryResponse{Tasks: filtered, Total: total, Limit: limit, Offset: offset})
+		writeJSON(w, http.StatusOK, tasksQueryResponse{Tasks: s.taskRowViews(p, filtered), Total: total, Limit: limit, Offset: offset})
 	case http.MethodPost:
 		var req struct {
 			Targets     []string `json:"targets"`
@@ -3448,9 +3481,10 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 	}
 }
 
-// handleCancelTask cancels a queued or leased task. For a queued task that
-// withdraws delivery; for a leased one it stops the wait (the lease gate
-// refuses any late result). Terminal tasks are rejected.
+// handleCancelTask cancels a queued, leased or pending task. For a queued task
+// that withdraws delivery; for a leased one it stops the wait (the lease gate
+// refuses any late result); a pending one (store.TaskPending) was never
+// delivered and is closed as cancelled. Terminal tasks are rejected.
 func (s *Server) handleCancelTask(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -3818,6 +3852,14 @@ type taskView struct {
 	LeaseAgeSeconds int64                     `json:"lease_age_seconds,omitempty"`
 	StalledReason   string                    `json:"stalled_reason,omitempty"`
 	TargetStates    map[string]taskTargetView `json:"target_states,omitempty"`
+	// Origin is how the task was queued: approval, rerun or direct
+	// (taskOrigin). The origin filter on GET /api/tasks matches it.
+	Origin string `json:"origin"`
+	// ApprovalID names the approval that queued the task. Only list rows
+	// carry it, and only when the caller may read that approval
+	// (taskRowViews), because the approvals read never confirms that a plan
+	// the caller cannot read exists.
+	ApprovalID string `json:"approval_id,omitempty"`
 }
 
 // taskTargetView is one target's progress inside a leased task.
@@ -3843,6 +3885,15 @@ type taskTargetView struct {
 // that drift, and so nothing has to migrate rows written before the deadline
 // existed.
 func (s *Server) toTaskView(t model.Task) taskView {
+	view := s.taskStateView(t)
+	view.ScriptSHA256 = scriptSHA256(t.Script)
+	return view
+}
+
+// taskStateView is toTaskView without the script digest. Hashing every
+// script is most of the cost of reading the whole task list, so reads that
+// only count or filter rows use this and hash just the rows they return.
+func (s *Server) taskStateView(t model.Task) taskView {
 	status := t.Status
 	if (status == model.TaskQueued || status == model.TaskLeased) &&
 		store.TaskPastQueueDeadline(t, s.now(), s.store.TaskQueueDeadline()) {
@@ -3893,9 +3944,9 @@ func (s *Server) toTaskView(t model.Task) taskView {
 		ID:              t.ID,
 		ActorID:         t.ActorID,
 		TokenID:         t.TokenID,
+		Origin:          taskOrigin(t),
 		Targets:         t.Targets,
 		Interpreter:     t.Interpreter,
-		ScriptSHA256:    scriptSHA256(t.Script),
 		ScriptSizeBytes: len([]byte(t.Script)),
 		TimeoutSec:      t.TimeoutSec,
 		OutputLimit:     t.OutputLimit,
@@ -3940,7 +3991,7 @@ type tasksQueryResponse struct {
 
 func taskQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"node_id", "limit", "offset"} {
+	for _, key := range []string{"status", "since", "node_id", "origin", "limit", "offset"} {
 		if _, ok := q[key]; ok {
 			return true
 		}
@@ -3967,21 +4018,67 @@ func taskResultQueryRequested(r *http.Request) bool {
 	return false
 }
 
+// maxTaskResultIDs caps the task_id list on GET /api/task-results. One page of
+// runs with their reruns fits well inside it, and 100 ids of 21 bytes keep the
+// request line far below the 8 KB an nginx edge accepts by default.
+const maxTaskResultIDs = 100
+
+// parseTaskIDList reads the task_id comma list of GET /api/task-results.
+// Blank entries are skipped, duplicates collapse, and more than
+// maxTaskResultIDs distinct ids is an error rather than a silent truncation.
+func parseTaskIDList(raw string) (map[string]bool, error) {
+	var ids map[string]bool
+	for _, taskID := range strings.Split(raw, ",") {
+		taskID = strings.TrimSpace(taskID)
+		if taskID == "" {
+			continue
+		}
+		if ids == nil {
+			ids = map[string]bool{}
+		}
+		ids[taskID] = true
+		if len(ids) > maxTaskResultIDs {
+			return nil, fmt.Errorf("task_id takes at most %d ids", maxTaskResultIDs)
+		}
+	}
+	return ids, nil
+}
+
+// handleTaskResults serves GET /api/task-results: per-node execution results,
+// newest finish first, for the nodes the caller holds task:read on. The store
+// keeps the newest 2,000 results; older ones are gone from here and the task
+// row's own status is what remains.
+//
+// Query parameters, all optional:
+//
+//	task_id=a,b           keep results of these tasks, at most 100 distinct ids
+//	                      (maxTaskResultIDs); more is a 400, never truncated
+//	node_id=<id>          keep results from one node
+//	omit_output=1         send stdout_bytes and stderr_bytes instead of the
+//	                      bodies
+//	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
+//
+// Without any of them the response is the bare array of every visible result.
+// With any of them it is the {"results","total","limit","offset"} envelope.
+// An explicit limit always pages. omit_output without a limit still returns
+// every match, because the Tasks page polls that way and builds each node's
+// row from all of them; design 23 wave 2 moves that poll to task_id=<the ids
+// on screen> and applies the default page here in the same release.
 func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
 	results := s.store.Results() // newest-first
-	visible := make([]taskResultView, 0, len(results))
-	for _, result := range results {
-		if rbac.Allows(p.Principal, "task:read", result.NodeID) {
-			visible = append(visible, s.withExecContext(toTaskResultView(result)))
-		}
-	}
 	if !taskResultQueryRequested(r) {
 		// Backward-compatible bare mode: the full visible array (bounded by the
 		// store's result cap). Filtering/pagination is opt-in below.
+		visible := make([]taskResultView, 0, len(results))
+		for _, result := range results {
+			if rbac.Allows(p.Principal, "task:read", result.NodeID) {
+				visible = append(visible, s.withExecContext(toTaskResultView(result)))
+			}
+		}
 		writeJSON(w, http.StatusOK, visible)
 		return
 	}
@@ -3996,36 +4093,49 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	taskIDs, err := parseTaskIDList(q.Get("task_id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	// omit_output strips stdout/stderr bodies from every row and reports their
 	// sizes instead. It exists for pollers: a status subscription needs exit
 	// codes and timing, not megabytes of probe output on every tick.
 	omitOutput := q.Get("omit_output") == "1" || q.Get("omit_output") == "true"
-	taskID := strings.TrimSpace(q.Get("task_id"))
 	nodeID := strings.TrimSpace(q.Get("node_id"))
-	filtered := make([]taskResultView, 0, len(visible))
-	for _, view := range visible {
-		if taskID != "" && view.TaskID != taskID {
+	matched := make([]model.TaskResult, 0, len(results))
+	for _, result := range results {
+		if !rbac.Allows(p.Principal, "task:read", result.NodeID) {
 			continue
 		}
-		if nodeID != "" && view.NodeID != nodeID {
+		if taskIDs != nil && !taskIDs[result.TaskID] {
 			continue
 		}
-		filtered = append(filtered, view)
+		if nodeID != "" && result.NodeID != nodeID {
+			continue
+		}
+		matched = append(matched, result)
 	}
-	total := len(filtered)
+	total := len(matched)
 	if omitOutput && strings.TrimSpace(q.Get("limit")) == "" {
-		// Bodyless rows are light enough to return in full; forcing the
-		// default page size here would silently hide older rollups from the
-		// screens this mode was built for. An explicit limit still wins.
+		// yagni: unbounded until design 23 wave 2 switches the Tasks poll to
+		// task_id; the store caps results at 2,000, which bounds this. Then
+		// drop this override so the default page applies.
 		limit = total
 	}
 	if offset > total {
-		filtered = nil
+		matched = nil
 	} else {
-		filtered = filtered[offset:]
+		matched = matched[offset:]
 	}
-	if len(filtered) > limit {
-		filtered = filtered[:limit]
+	if len(matched) > limit {
+		matched = matched[:limit]
+	}
+	// The pinned execution context is a store read per row, so only the page
+	// being returned pays for it.
+	filtered := make([]taskResultView, 0, len(matched))
+	for _, result := range matched {
+		filtered = append(filtered, s.withExecContext(toTaskResultView(result)))
 	}
 	if omitOutput {
 		for i := range filtered {
@@ -4135,6 +4245,32 @@ func toTaskResultView(r model.TaskResult) taskResultView {
 	}
 }
 
+// handleAudit serves GET /api/audit: the audit log newest first, limited to
+// the events the caller may read (a node-confined principal sees only events
+// on its nodes, never node-less ones; see auditVisibility).
+//
+// Without query parameters the response is the bare array of the newest 100
+// visible events. With any of action, decision, node_id, actor_id, token_id,
+// scope, correlation_id, q, at_from, at_to, exclude_action, exclude_decision,
+// limit or offset it is the auditQueryResponse envelope: one page of matching
+// events plus total, scanned and complete, so a client can say "412 of 412
+// scanned" or "at least 50,000" instead of printing a partial count as the
+// whole.
+//
+// exclude_action is a comma list of up to 16 action prefixes (an optional
+// trailing "*" means the same prefix), each 1 to 128 characters from
+// [A-Za-z0-9._:/-]. An event whose action starts with any of them is dropped
+// inside the scan, before it is counted or paged, so total and the pages stay
+// true to the question asked and scanned still counts every record examined.
+// The Changes layer uses it to hide node.online and node.offline flips, which
+// arrived about 44 a day on the 34-node fleet of 2026-09-30 and bury the
+// changes an operator is looking for.
+//
+// exclude_decision is a comma list of decisions from auditDecisions (allow,
+// deny, observe, warn, dismiss); any other value is a 400. It drops matching
+// events inside the same scan, so the Changes layer can hide observe events
+// (SSH logins, agent events, sing-box state, login prompts) without naming
+// every action that records one.
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -4217,7 +4353,7 @@ type auditQueryResponse struct {
 
 func auditQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset", "q", "at_from", "at_to"} {
+	for _, key := range []string{"action", "decision", "node_id", "actor_id", "token_id", "scope", "correlation_id", "limit", "offset", "q", "at_from", "at_to", "exclude_action", "exclude_decision"} {
 		if _, ok := q[key]; ok {
 			return true
 		}
@@ -4236,6 +4372,9 @@ type auditQuerySpec struct {
 	atFrom        time.Time
 	atTo          time.Time
 	text          string
+	exclude       []string // action prefixes whose events the query drops
+	// skipDecisions are the decisions whose events the query drops.
+	skipDecisions map[string]bool
 	limit         int
 	offset        int
 }
@@ -4258,6 +4397,14 @@ func parseAuditQuery(r *http.Request) (auditQuerySpec, error) {
 	if err != nil {
 		return auditQuerySpec{}, err
 	}
+	exclude, err := parseAuditExcludeActions(q.Get("exclude_action"))
+	if err != nil {
+		return auditQuerySpec{}, err
+	}
+	skipDecisions, err := parseEnumList(q.Get("exclude_decision"), "exclude_decision", auditDecisions)
+	if err != nil {
+		return auditQuerySpec{}, err
+	}
 	return auditQuerySpec{
 		action:        q.Get("action"),
 		decision:      q.Get("decision"),
@@ -4269,6 +4416,8 @@ func parseAuditQuery(r *http.Request) (auditQuerySpec, error) {
 		atFrom:        atFrom,
 		atTo:          atTo,
 		text:          strings.ToLower(strings.TrimSpace(q.Get("q"))),
+		exclude:       exclude,
+		skipDecisions: skipDecisions,
 		limit:         limit,
 		offset:        offset,
 	}, nil
@@ -4287,7 +4436,67 @@ func (q auditQuerySpec) matches(ev model.AuditEvent) bool {
 	if q.text != "" && !auditTextMatch(ev, q.text) {
 		return false
 	}
+	for _, prefix := range q.exclude {
+		if strings.HasPrefix(ev.Action, prefix) {
+			return false
+		}
+	}
+	if q.skipDecisions[ev.Decision] {
+		return false
+	}
 	return true
+}
+
+// auditDecisions are the decisions the audit log records, which
+// exclude_decision accepts: allow and deny on nearly every event, observe for
+// events that report rather than decide (ssh.login, agent.event,
+// singbox.service.state, the login and 2FA prompts), warn when a capability
+// gate is switched off, and dismiss when an approval is dismissed.
+// audit.Record writes an empty decision as allow.
+var auditDecisions = []string{"allow", "deny", "observe", "warn", "dismiss"}
+
+const (
+	// maxAuditExcludeActions bounds exclude_action: every entry is a prefix
+	// test on every scanned record, up to auditScanCap of them.
+	maxAuditExcludeActions   = 16
+	maxAuditActionPrefixSize = 128
+)
+
+// parseAuditExcludeActions reads exclude_action. Blank entries are skipped
+// and duplicates collapse; an entry that is empty after its optional trailing
+// "*", too long, or outside [A-Za-z0-9._:/-] is an error, as is a list of more
+// than maxAuditExcludeActions distinct prefixes. A lone "*" is refused rather
+// than read as "exclude everything".
+func parseAuditExcludeActions(raw string) ([]string, error) {
+	var prefixes []string
+	seen := map[string]bool{}
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		prefix := strings.TrimSuffix(entry, "*")
+		if prefix == "" {
+			return nil, errors.New("exclude_action entries must name an action prefix")
+		}
+		if len(prefix) > maxAuditActionPrefixSize {
+			return nil, fmt.Errorf("exclude_action entries must be at most %d characters", maxAuditActionPrefixSize)
+		}
+		for _, c := range prefix {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("._:/-", c)) {
+				return nil, fmt.Errorf("exclude_action entry %q may use only letters, digits and . _ : / -", entry)
+			}
+		}
+		if seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		prefixes = append(prefixes, prefix)
+		if len(prefixes) > maxAuditExcludeActions {
+			return nil, fmt.Errorf("exclude_action takes at most %d prefixes", maxAuditExcludeActions)
+		}
+	}
+	return prefixes, nil
 }
 
 // collectAuditPage walks the log newest-first and keeps only the requested

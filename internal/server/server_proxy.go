@@ -783,7 +783,9 @@ func (s *Server) handleProxyNodePlan(w http.ResponseWriter, r *http.Request, p p
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
-	node, profile, artifact, err := s.renderProxyCoreArtifact(nodeID)
+	now := s.now()
+	users := s.proxyUsersForManagedRender(nil, now)
+	node, profile, artifact, err := s.renderProxyCoreArtifactForUsers(nodeID, users, now)
 	if err != nil {
 		writeError(w, statusForProxyPlanError(err), err)
 		return
@@ -793,7 +795,7 @@ func (s *Server) handleProxyNodePlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	plan := renderProxyCoreApprovalPlan(node, profile, artifact, redactedConfig)
+	plan := renderProxyCoreApprovalPlan(node, profile, artifact, redactedConfig, s.renderOmissions(profile, users, now))
 	approval := model.Approval{
 		ID:        id.New("approval"),
 		NodeID:    nodeID,
@@ -994,6 +996,44 @@ func (s *Server) proxyUsersForManagedRender(override *VpnUser, now time.Time) []
 			})
 		}
 	}
+	return out
+}
+
+// renderOmissions names the users a render of profile from users leaves out
+// by policy, one "label (status)" per user, sorted. The label is the
+// identity's email for an identity's rows and for a migrated identity's
+// legacy record, and the stored name for any other record. A plan lists them
+// so the operator sees who the config already leaves out; when another user
+// is disabled, expires or reaches its quota before approval, the rendered
+// config changes and the plan goes stale.
+func (s *Server) renderOmissions(profile model.ProxyNodeProfile, users []model.ProxyUser, now time.Time) []string {
+	rows := ineligibleProfileUsers(profile, users, now)
+	if len(rows) == 0 {
+		return nil
+	}
+	labels := map[string]string{}
+	_, lines := s.lineReadModel()
+	for _, u := range s.listVpnUsers() {
+		label := firstNonEmpty(strings.TrimSpace(u.Email), strings.TrimSpace(u.Name), u.ID)
+		if u.MigratedFromProxyUser != "" {
+			labels[u.MigratedFromProxyUser] = label
+		}
+		for _, binding := range u.Bindings {
+			if line, ok := lines[binding.LineHashID]; ok {
+				labels[userLineName(u.ID, line.LineUUID)] = label
+			}
+		}
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		entry := firstNonEmpty(labels[row.ID], strings.TrimSpace(row.Name), row.ID) + " (" + derivedProxyUserStatusAt(row, now) + ")"
+		if !seen[entry] {
+			seen[entry] = true
+			out = append(out, entry)
+		}
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -1321,7 +1361,11 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 	return nil
 }
 
-func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile, artifact proxycore.Artifact, redactedConfig string) string {
+// renderProxyCoreApprovalPlan writes the review text for a proxycore apply.
+// omitted is renderOmissions for the same render: the users the config leaves
+// out by policy, listed by name because the renderer's warnings name their
+// rows by derived ids.
+func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile, artifact proxycore.Artifact, redactedConfig string, omitted []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Lattice proxycore review plan\n\n")
 	fmt.Fprintf(&b, "node_id: %s\n", profile.NodeID)
@@ -1338,6 +1382,13 @@ func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile
 	}
 	if profile.ListenIP != "" {
 		fmt.Fprintf(&b, "listen_ip: %s\n", profile.ListenIP)
+	}
+	if len(omitted) > 0 {
+		fmt.Fprintf(&b, "\nomitted_users: %d\n", len(omitted))
+		for _, entry := range omitted {
+			fmt.Fprintf(&b, "- %s\n", entry)
+		}
+		b.WriteString("Their policy leaves these users out of this config. If another user is disabled, expires or reaches its quota before approval, the config changes and this plan must be made again.\n")
 	}
 	if len(artifact.Warnings) > 0 {
 		b.WriteString("\nwarnings:\n")

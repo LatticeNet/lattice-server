@@ -76,6 +76,9 @@ type lineUserPlan struct {
 	CredentialSHA256 string `json:"credential_sha256"`
 	ConfigSHA256     string `json:"config_sha256,omitempty"`
 	Summary          string `json:"summary"`
+	// Omitted is renderOmissions for a managed plan's render: the users the
+	// config already leaves out by policy, each as "label (status)".
+	Omitted []string `json:"omitted,omitempty"`
 }
 
 // lineUserCredentialPayload is the exact JSON object passed to
@@ -287,26 +290,34 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	}
 	track := lineUserTrackAdopted
 	configSHA := ""
+	var omitted []string
 	if ln.Managed {
 		track = lineUserTrackManaged
+		now := s.now()
 		planned := vpnUserWithPlannedBinding(u, ln.LineHashID, op)
-		_, _, artifact, err := s.renderProxyCoreArtifactWithVpnUser(ln.NodeID, &planned)
+		users := s.proxyUsersForManagedRender(&planned, now)
+		_, profile, artifact, err := s.renderProxyCoreArtifactForUsers(ln.NodeID, users, now)
 		if err != nil {
 			return nil, fmt.Errorf("render managed line-user plan: %w", err)
 		}
 		configSHA = artifact.ConfigSHA256
+		omitted = s.renderOmissions(profile, users, now)
 	}
 	summary := fmt.Sprintf("sb user %s %s on node %s (user %s as %s, credential sha %s…)",
 		op, ln.Tag, ln.NodeID, u.Email, name, sha[:12])
 	if track == lineUserTrackManaged {
 		summary = fmt.Sprintf("render full sing-box config for %s on node %s (%s user %s as %s, config sha %s…)",
 			ln.Tag, ln.NodeID, op, u.Email, name, configSHA[:12])
+		if len(omitted) > 0 {
+			summary += "; already left out by policy: " + omittedSummary(omitted)
+		}
 	}
 	plan := lineUserPlan{
 		Op: op, Track: track, NodeID: ln.NodeID, Line: ln.Tag, LineHashID: ln.LineHashID, LineUUID: ln.LineUUID,
 		UserID: u.ID, UserName: name, Protocol: ln.Type, CredentialSHA256: sha,
 		ConfigSHA256: configSHA,
 		Summary:      summary,
+		Omitted:      omitted,
 	}
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
@@ -346,6 +357,16 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	return json.Marshal(struct {
 		Approval model.Approval `json:"approval"`
 	}{Approval: approval})
+}
+
+// omittedSummary names the first five omitted users for a one-line summary
+// and counts the rest; the plan's Omitted field carries every one.
+func omittedSummary(omitted []string) string {
+	const shown = 5
+	if len(omitted) <= shown {
+		return strings.Join(omitted, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(omitted[:shown], ", "), len(omitted)-shown)
 }
 
 // requireVpnUserWithinPolicy refuses a plan_add or plan_update for an

@@ -158,16 +158,23 @@ func (s *Server) proxyDriftFor(nodeID string) (proxyDriftState, bool) {
 // reads (proxyUsersForManagedRender), whose identity rows carry live policy;
 // the stored ProxyUser records would miss every identity on a managed line.
 func countIneligibleProfileUsers(profile model.ProxyNodeProfile, users []model.ProxyUser, now time.Time) int {
-	count := 0
+	return len(ineligibleProfileUsers(profile, users, now))
+}
+
+// ineligibleProfileUsers is the rows countIneligibleProfileUsers counts: the
+// rows of a render user list that apply to the profile and whose status at
+// now is not active.
+func ineligibleProfileUsers(profile model.ProxyNodeProfile, users []model.ProxyUser, now time.Time) []model.ProxyUser {
+	var out []model.ProxyUser
 	for _, user := range users {
 		if !proxyUserAppliesToProfile(user, profile) {
 			continue
 		}
 		if derivedProxyUserStatusAt(user, now) != model.ProxyUserStatusActive {
-			count++
+			out = append(out, user)
 		}
 	}
-	return count
+	return out
 }
 
 func proxyDriftReason(ineligible int, detail string) string {

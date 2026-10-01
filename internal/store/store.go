@@ -40,6 +40,14 @@ const metricsPersistenceInterval = 5 * time.Minute
 // avoiding a full snapshot rewrite for every unchanged probe cycle.
 const monitorResultPersistenceInterval = 5 * time.Minute
 
+// reportClockPersistInterval bounds how stale the received clocks of the
+// per-node agent reports (sing-box liveness, guard reality) may get on disk.
+// A report that only moves its clocks updates memory; it is written when
+// something durable changes, or when the copy on disk is this old. Every node
+// reports every ten seconds, and writing each report rewrote the whole state
+// file several times a second on a 34-node fleet.
+const reportClockPersistInterval = 15 * time.Minute
+
 var errStoreDurabilityDegraded = errors.New("store durability degraded: parent directory sync not confirmed")
 
 type State struct {
@@ -257,6 +265,15 @@ type Store struct {
 	taskQueueDeadline  time.Duration
 	durabilityDegraded bool // guarded by mu; only a confirmed parent sync clears it
 	testPersistCalls   int  // tests only: counts authoritative JSON persistence attempts
+	// The received_at of each node's liveness record and guard reality snapshot
+	// as the state file holds them, refreshed from every committed JSON write.
+	// Guarded by mu.
+	livenessOnDisk     map[string]time.Time
+	guardRealityOnDisk map[string]time.Time
+	// closed is set by the first Close. A later Close does nothing: the bolt
+	// sidecar is gone by then, so a write would put its domains in the JSON
+	// file. Guarded by mu.
+	closed bool
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every
@@ -440,6 +457,7 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	}
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
+	s.noteReportClocksOnDisk(s.state)
 	s.confirmParentDirDurability()
 	return s, nil
 }
@@ -1039,6 +1057,9 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 	start := time.Now()
 	defer func() {
 		telemetry.ObserveStoreSave(time.Since(start), err)
+		if committed {
+			s.noteReportClocksOnDisk(st)
+		}
 	}()
 	if s.path == "" {
 		return true, nil
@@ -1067,6 +1088,45 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 		s.durabilityDegraded = err != nil
 	}
 	return committed, err
+}
+
+// noteReportClocksOnDisk records what a committed write put on disk for the
+// clock-throttled report domains. Every JSON write carries the whole in-memory
+// copy of both, so a write made for any reason also flushes their clocks and
+// restarts reportClockPersistInterval for every node.
+func (s *Store) noteReportClocksOnDisk(st State) {
+	s.livenessOnDisk = make(map[string]time.Time, len(st.SingBoxLiveness))
+	for nodeID, rec := range st.SingBoxLiveness {
+		s.livenessOnDisk[nodeID] = rec.ReceivedAt
+	}
+	s.guardRealityOnDisk = make(map[string]time.Time, len(st.GuardRealitySnapshots))
+	for nodeID, snapshot := range st.GuardRealitySnapshots {
+		s.guardRealityOnDisk[nodeID] = snapshot.ReceivedAt
+	}
+}
+
+// reportClocksUnflushedLocked reports whether memory holds a liveness record
+// or guard reality snapshot newer than the copy on disk.
+func (s *Store) reportClocksUnflushedLocked() bool {
+	for nodeID, rec := range s.state.SingBoxLiveness {
+		if written, ok := s.livenessOnDisk[nodeID]; !ok || !written.Equal(rec.ReceivedAt) {
+			return true
+		}
+	}
+	for nodeID, snapshot := range s.state.GuardRealitySnapshots {
+		if written, ok := s.guardRealityOnDisk[nodeID]; !ok || !written.Equal(snapshot.ReceivedAt) {
+			return true
+		}
+	}
+	return false
+}
+
+// reportClockDue reports whether a clock-only update must still be written
+// because the copy on disk is older than reportClockPersistInterval, or there
+// is no copy on disk at all.
+func reportClockDue(onDisk map[string]time.Time, nodeID string, receivedAt time.Time) bool {
+	written, ok := onDisk[nodeID]
+	return !ok || receivedAt.Sub(written) >= reportClockPersistInterval
 }
 
 func (s *Store) jsonPersistState() State {
@@ -2993,9 +3053,21 @@ func (s *Store) AuditWALHead() (string, int, bool) {
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	var closeErr error
+	// Reports that only moved their clocks wait in memory for the next write.
+	// A clean shutdown writes them, so a restart resumes from the newest
+	// report rather than from one up to reportClockPersistInterval old.
+	if s.reportClocksUnflushedLocked() {
+		closeErr = s.Save()
+	}
 	if s.wal != nil {
-		closeErr = s.wal.Close()
+		if err := s.wal.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
 		s.wal = nil
 	}
 	if s.runtimeBoltHot != nil {

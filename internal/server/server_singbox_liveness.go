@@ -68,6 +68,11 @@ func deriveSingBoxServiceState(rt *model.SingBoxRuntime, prevRestarts int, hadPr
 // record, and handles the transition side effects (audit trail, debounced
 // notifications). Called from the inventory ingest path with the
 // authenticated node id.
+//
+// prev is the store's in-memory record, which may be newer than the copy on
+// disk: the store writes a report that only moves the clocks when the disk
+// copy is stale, and everything this function derives from (state, restart
+// count, the episode's start and whether it was notified) whenever it changes.
 func (s *Server) noteSingBoxLiveness(nodeID string, rt *model.SingBoxRuntime) {
 	if rt == nil {
 		// An agent without the probe reports nothing; recording an unknown
@@ -132,14 +137,16 @@ func (s *Server) noteSingBoxLiveness(nodeID string, rt *model.SingBoxRuntime) {
 	}
 
 	name := s.nodeDisplayName(nodeID)
+	// Sent through the seam rather than the dispatcher, like every other typed
+	// emitter, so the once-per-episode rule can be observed in a test.
 	if notifyDown {
-		s.notifyEventTyped(EventServiceDown,
+		s.emitNotifyTyped(EventServiceDown,
 			fmt.Sprintf("sing-box %s on %s", state, name),
 			fmt.Sprintf("node %s: sing-box has been %s since %s (unit %s/%s, restarts %d). Config state is reported separately; this is the service.",
 				nodeID, state, rec.ProblemSince.Format(time.RFC3339), rt.ActiveState, rt.SubState, rt.RestartCount))
 	}
 	if notifyRecovered {
-		s.notifyEventTyped(EventServiceRecovered,
+		s.emitNotifyTyped(EventServiceRecovered,
 			fmt.Sprintf("sing-box recovered on %s", name),
 			fmt.Sprintf("node %s: sing-box is running again (pid %d).", nodeID, rt.PID))
 	}

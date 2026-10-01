@@ -164,7 +164,13 @@ func main() {
 		st.SetTaskQueueDeadline(parsed)
 		log.Printf("task queue deadline: %s (undelivered tasks older than this are withdrawn)", parsed)
 	}
-	defer st.Close()
+	defer func() {
+		// Close writes report clocks still held in memory; a failure loses only
+		// their freshness, but it should not pass silently.
+		if err := st.Close(); err != nil {
+			log.Printf("store close: %v", err)
+		}
+	}()
 	if runtimeBoltHotStore != "" {
 		if err := st.EnableRuntimeBoltHotStore(runtimeBoltHotStore); err != nil {
 			log.Fatal(err)

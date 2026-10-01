@@ -30,11 +30,12 @@ func storedQuota(t *testing.T, srv *Server, userID string) int64 {
 	return u.QuotaBytes
 }
 
-// plan_add and plan_update refuse an identity over its quota or past its
-// expiry, as they refuse a disabled one: the managed render would leave it
-// out while the task result marked the binding enabled. The quota in the
-// request counts, a refused call writes nothing and files no approval, and
-// plan_remove is always allowed.
+// plan_add refuses an identity over its quota or past its expiry, as it
+// refuses a disabled one: the managed render would leave it out while the
+// task result marked the binding enabled. The quota in the request counts,
+// a refused call writes nothing and files no approval, and the usage is
+// written in the quota's unit. plan_update and plan_remove stay open: the
+// first adds nobody and is how a leaked credential is rotated.
 func TestLinePlanRefusesIdentityOutsideItsPolicy(t *testing.T) {
 	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
 	srv := usageTestServer(t, now)
@@ -51,7 +52,7 @@ func TestLinePlanRefusesIdentityOutsideItsPolicy(t *testing.T) {
 	approvals := len(srv.store.Approvals())
 
 	err := planLineUser(t, srv, lineUserOpAdd, identity.ID, line.LineHashID, nil)
-	if err == nil || !strings.Contains(err.Error(), "has used 1.1 KiB of its 1000 B quota; raise the quota or wait for the next period") {
+	if err == nil || !strings.Contains(err.Error(), "has used 1100 B of its 1000 B quota; raise the quota or wait for the next period before planning a line") {
 		t.Fatalf("over quota: %v", err)
 	}
 	short := int64(1050)
@@ -82,13 +83,13 @@ func TestLinePlanRefusesIdentityOutsideItsPolicy(t *testing.T) {
 		t.Fatalf("expired: %v", err)
 	}
 
-	// Bound already: plan_update is refused, plan_remove is not.
+	// Bound already: plan_update and plan_remove are both accepted.
 	identity.Bindings = []LineBinding{{LineHashID: line.LineHashID, Enabled: true}}
 	if err := srv.putVpnUser(identity); err != nil {
 		t.Fatal(err)
 	}
-	if err := planLineUser(t, srv, lineUserOpUpdate, identity.ID, line.LineHashID, nil); err == nil || !strings.Contains(err.Error(), "expired") {
-		t.Fatalf("plan_update for an expired identity: %v", err)
+	if err := planLineUser(t, srv, lineUserOpUpdate, identity.ID, line.LineHashID, nil); err != nil {
+		t.Fatalf("plan_update must stay open to an expired identity: %v", err)
 	}
 	if err := planLineUser(t, srv, lineUserOpRemove, identity.ID, line.LineHashID, nil); err != nil {
 		t.Fatalf("plan_remove must stay open to an expired identity: %v", err)
@@ -96,7 +97,8 @@ func TestLinePlanRefusesIdentityOutsideItsPolicy(t *testing.T) {
 }
 
 // The refusal is not limited to managed lines: on an adopted line sb would
-// add a user Lattice's own alerts call expired.
+// add a user Lattice's own alerts call expired. A bound user's credential
+// can still be rotated there, since Lattice does not remove it.
 func TestAdoptedLinePlanRefusesExpiredIdentity(t *testing.T) {
 	st, err := store.Open("")
 	if err != nil {
@@ -108,11 +110,18 @@ func TestAdoptedLinePlanRefusesExpiredIdentity(t *testing.T) {
 	if err := srv.putVpnUser(u); err != nil {
 		t.Fatal(err)
 	}
-	if err := planLineUser(t, srv, lineUserOpUpdate, u.ID, line.LineHashID, nil); err == nil || !strings.Contains(err.Error(), "expired") {
-		t.Fatalf("adopted plan_update for an expired identity: %v", err)
+	if err := planLineUser(t, srv, lineUserOpUpdate, u.ID, line.LineHashID, nil); err != nil {
+		t.Fatalf("adopted plan_update for an expired identity must rotate: %v", err)
 	}
 	if err := planLineUser(t, srv, lineUserOpRemove, u.ID, line.LineHashID, nil); err != nil {
 		t.Fatalf("adopted plan_remove: %v", err)
+	}
+	u.Bindings = nil
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	if err := planLineUser(t, srv, lineUserOpAdd, u.ID, line.LineHashID, nil); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("adopted plan_add for an expired identity: %v", err)
 	}
 }
 
@@ -132,5 +141,31 @@ func TestManagedLineRolloutRefusesIdentityOutsideItsPolicy(t *testing.T) {
 	}
 	if defs, _ := srv.managedLineDefs(); len(defs) != 0 {
 		t.Fatalf("a refused rollout stored definitions: %+v", defs)
+	}
+}
+
+// A refusal compares the usage with the quota, so both are written in the
+// quota's unit; formatProxyBytes alone still picks each figure's own unit.
+func TestFormatProxyBytesInUsesTheReferenceUnit(t *testing.T) {
+	const gib = int64(1) << 30
+	cases := []struct {
+		v, ref int64
+		want   string
+	}{
+		{v: 1100, ref: 1000, want: "1100 B"},
+		{v: 1536, ref: 1536, want: "1.5 KiB"},
+		{v: 11 * gib, ref: 10 * gib, want: "11.0 GiB"},
+		{v: 2048 * gib, ref: 10 * gib, want: "2048.0 GiB"},
+	}
+	for _, tc := range cases {
+		if got := formatProxyBytesIn(tc.v, tc.ref); got != tc.want {
+			t.Fatalf("formatProxyBytesIn(%d, %d) = %q, want %q", tc.v, tc.ref, got, tc.want)
+		}
+	}
+	if got := formatProxyBytes(1000); got != "1000 B" {
+		t.Fatalf("formatProxyBytes(1000) = %q", got)
+	}
+	if got := formatProxyBytes(1100); got != "1.1 KiB" {
+		t.Fatalf("formatProxyBytes(1100) = %q", got)
 	}
 }

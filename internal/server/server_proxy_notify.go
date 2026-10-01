@@ -407,14 +407,22 @@ func (s *Server) emitProxyUserNotification(alert proxyUserNotificationFire) {
 }
 
 func formatProxyBytes(v int64) string {
+	return formatProxyBytesIn(v, v)
+}
+
+// formatProxyBytesIn formats v in the unit formatProxyBytes picks for ref, so
+// two figures meant to be compared read in one unit: "1100 B of its 1000 B
+// quota", not "1.1 KiB of its 1000 B quota".
+func formatProxyBytesIn(v, ref int64) string {
 	const unit = 1024
-	if v < unit {
+	if ref < unit {
 		return fmt.Sprintf("%d B", v)
 	}
-	value := float64(v)
+	value, scale := float64(v), float64(ref)
 	for _, suffix := range []string{"KiB", "MiB", "GiB", "TiB", "PiB"} {
 		value /= unit
-		if value < unit {
+		scale /= unit
+		if scale < unit {
 			return fmt.Sprintf("%.1f %s", value, suffix)
 		}
 	}

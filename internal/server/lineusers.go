@@ -257,7 +257,11 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 		}
 		quotaChanged = true
 	}
-	if op != lineUserOpRemove {
+	// Only plan_add is held to the policy. plan_update re-sends the current
+	// credential for a user already bound to the line, so it adds nobody,
+	// and it is how a leaked credential of an expired or over-quota user is
+	// rotated on an adopted line, where Lattice does not remove the user.
+	if op == lineUserOpAdd {
 		if err := s.requireVpnUserWithinPolicy(u, s.now()); err != nil {
 			return nil, err
 		}
@@ -369,27 +373,38 @@ func omittedSummary(omitted []string) string {
 	return fmt.Sprintf("%s and %d more", strings.Join(omitted[:shown], ", "), len(omitted)-shown)
 }
 
-// requireVpnUserWithinPolicy refuses a plan_add or plan_update for an
-// identity that is expired or over its quota at now, the way it refuses a
-// disabled one. Such a plan would grant what the policy denies: on a managed
-// line the render leaves the identity out while the task result marks the
-// binding enabled, and on an adopted line sb would add a user its own alerts
-// call expired or over quota. The quota is read with the request's changes
-// applied, so raising it in the same call is enough.
+// requireVpnUserWithinPolicy refuses a plan_add, or a managed-line rollout,
+// for an identity that is expired or over its quota at now, the way
+// plan_add refuses a disabled one. Such a plan would grant what the policy
+// denies: on a managed line the render leaves the identity out while the
+// task result marks the binding enabled, and on an adopted line sb would add
+// a user its own alerts call expired or over quota. The quota is read with
+// the request's changes applied, so raising it in the same call is enough.
 func (s *Server) requireVpnUserWithinPolicy(u VpnUser, now time.Time) error {
+	if reason, remedy := s.vpnUserPolicyRefusal(u, now); reason != "" {
+		return fmt.Errorf("%s; %s before planning a line", reason, remedy)
+	}
+	return nil
+}
+
+// vpnUserPolicyRefusal says why the policy denies u a line at now, and what
+// the operator can do about it. Both are empty when the policy allows it.
+// The usage and the quota are written in the quota's unit, so they compare.
+func (s *Server) vpnUserPolicyRefusal(u VpnUser, now time.Time) (reason, remedy string) {
 	policy := s.vpnUserPolicyRow(u, now)
 	switch policy.Status {
 	case model.ProxyUserStatusExpired:
-		return fmt.Errorf("user %q expired on %s; renew it before planning a line", u.ID, dateOnlyUTC(u.ExpiresAt).Format("2006-01-02"))
+		return fmt.Sprintf("user %q expired on %s", u.ID, dateOnlyUTC(u.ExpiresAt).Format("2006-01-02")), "renew it"
 	case model.ProxyUserStatusOverQuota:
-		next := "raise the quota"
+		remedy = "raise the quota"
 		if u.QuotaPeriod == vpnQuotaPeriodMonthly {
-			next = "raise the quota or wait for the next period"
+			remedy = "raise the quota or wait for the next period"
 		}
-		return fmt.Errorf("user %q has used %s of its %s quota; %s before planning a line",
-			u.ID, formatProxyBytes(policy.UsedBytes), formatProxyBytes(policy.TrafficLimitBytes), next)
+		return fmt.Sprintf("user %q has used %s of its %s quota", u.ID,
+			formatProxyBytesIn(policy.UsedBytes, policy.TrafficLimitBytes),
+			formatProxyBytes(policy.TrafficLimitBytes)), remedy
 	}
-	return nil
+	return "", ""
 }
 
 // lineUserApplyScript renders the on-box `sb user add|del` invocation for an

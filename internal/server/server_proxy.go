@@ -78,7 +78,7 @@ type proxyUserView struct {
 	Enabled           bool      `json:"enabled"`
 	HasUUID           bool      `json:"has_uuid"`
 	HasPassword       bool      `json:"has_password"`
-	HasSubToken       bool      `json:"has_sub_token"` // kept for clients; nothing reads SubToken since cff5b9c
+	HasSubToken       bool      `json:"has_sub_token"` // kept for clients; no subscription is served from SubToken since cff5b9c
 	InboundIDs        []string  `json:"inbound_ids,omitempty"`
 	TrafficLimitBytes int64     `json:"traffic_limit_bytes,omitempty"`
 	ExpiresAt         time.Time `json:"expires_at,omitempty"`
@@ -447,9 +447,13 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-// handleRotateProxyUserSubToken still rotates and audits the token, but
-// nothing has read SubToken since cff5b9c (subscriptions are served through
-// shares), so a rotation changes what no client uses.
+// handleRotateProxyUserSubToken still rotates and audits the token, but no
+// subscription has been served from SubToken since cff5b9c removed the
+// per-user subscription endpoint (handleProxySubscription; subscriptions are
+// served through shares), so a rotation revokes no URL: the old one stopped
+// working then. The only other reader is the vpn-core migration, which
+// copies the token into the new identity's SubID, and SubID is only
+// returned by the step-up credential reveal.
 func (s *Server) handleRotateProxyUserSubToken(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

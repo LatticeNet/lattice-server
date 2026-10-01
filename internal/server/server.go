@@ -6659,6 +6659,21 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 		return !principalHasNodeRestriction(p) &&
 			rbac.Allows(p.Principal, "proxy:read", "") &&
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	case singBoxLineUserPlugin:
+		// A line-user plan names identities by email: the user it adds,
+		// updates or removes, and on a managed line every user its render
+		// already leaves out by policy. Identities are global proxy objects
+		// that only an unrestricted principal holding the vpn-core read scope
+		// may list (requireGlobalProxyScope, and the gateway for vpncore:read),
+		// so reading the plan asks for the same, as a proxycore plan does.
+		// Under the default below, bare network:plan on the node was enough.
+		//
+		// The admin scope counts too. Authoring and deciding a line-user plan
+		// require it, and a holder must be able to list the approval it filed,
+		// for the reason sshguard:admin implies sshguard:read.
+		return !principalHasNodeRestriction(p) &&
+			(rbac.Allows(p.Principal, "proxy:read", "") || rbac.Allows(p.Principal, "proxy:admin", "")) &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case "cftunnel":
 		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
 	case sshGuardPlugin:

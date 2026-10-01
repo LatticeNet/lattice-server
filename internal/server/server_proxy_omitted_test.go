@@ -139,3 +139,70 @@ func TestOmittedSummaryCountsPastFive(t *testing.T) {
 		t.Fatalf("seven: %q", got)
 	}
 }
+
+// A line-user plan names identities by email, the users its render leaves
+// out included, so it is listed only to a principal that may read
+// identities: unrestricted, holding the vpn-core read or admin scope, and
+// network:plan on the node. Bare network:plan read it before, with or
+// without an allowlist; deciding still asks for vpncore:admin.
+func TestLineUserPlanIsListedOnlyToPrincipalsWhoReadIdentities(t *testing.T) {
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	srv := usageTestServer(t, now)
+	line, identity := seedManagedLineUserFixture(t, srv)
+	identity.Bindings = []LineBinding{{LineHashID: line.LineHashID, Enabled: true}}
+	identity.QuotaBytes, identity.QuotaPeriod, identity.QuotaResetDay = 1000, vpnQuotaPeriodMonthly, 15
+	if err := srv.putVpnUser(identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.ApplyProxyUsage(store.ProxyUsageUpdate{DayUsers: []store.UsageDayUser{
+		{UserID: identity.ID, Day: "20260916", Uplink: 600, Downlink: 500},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	second := VpnUser{
+		ID: "vpnuser_second", Email: "second@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "55555555-5555-4555-8555-555555555555", Flow: "xtls-rprx-vision"}},
+	}
+	if err := srv.putVpnUser(second); err != nil {
+		t.Fatal(err)
+	}
+	if plan := planAddOnLine(t, srv, second.ID, line.LineHashID); len(plan.Omitted) == 0 {
+		t.Fatalf("the fixture must leave a user out: %+v", plan)
+	}
+
+	cases := []struct {
+		name      string
+		scopes    []string
+		allowlist []string
+		listed    bool
+	}{
+		{name: "network:plan", scopes: []string{"network:plan"}},
+		{name: "network:plan on the node", scopes: []string{"network:plan"}, allowlist: []string{"managed-a"}},
+		{name: "proxy:read confined to the node", scopes: []string{"network:plan", "proxy:read"}, allowlist: []string{"managed-a"}},
+		{name: "vpncore:read without network:plan", scopes: []string{"vpncore:read"}},
+		{name: "vpncore:read", scopes: []string{"network:plan", "vpncore:read"}, listed: true},
+		{name: "proxy:read", scopes: []string{"network:plan", "proxy:read"}, listed: true},
+		{name: "vpncore:admin", scopes: []string{"network:plan", "vpncore:admin"}, listed: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := principal{Principal: rbac.Principal{ActorID: "reader", Scopes: tc.scopes, ServerAllowlist: tc.allowlist}}
+			rec := httptest.NewRecorder()
+			srv.handleApprovals(rec, httptest.NewRequest(http.MethodGet, "/api/network/approvals?include=plan", nil), p)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			listed := strings.Contains(body, `"plugin":"`+singBoxLineUserPlugin+`"`)
+			if listed != tc.listed {
+				t.Fatalf("line-user approval listed = %v, want %v: %s", listed, tc.listed, body)
+			}
+			if !tc.listed && strings.Contains(body, "@example.com") {
+				t.Fatalf("an identity email reached a principal that cannot read identities: %s", body)
+			}
+			if tc.listed && !strings.Contains(body, "managed@example.com (over_quota)") {
+				t.Fatalf("the listed plan must keep the omitted user: %s", body)
+			}
+		})
+	}
+}

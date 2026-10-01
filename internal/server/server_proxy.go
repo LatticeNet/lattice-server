@@ -78,7 +78,7 @@ type proxyUserView struct {
 	Enabled           bool      `json:"enabled"`
 	HasUUID           bool      `json:"has_uuid"`
 	HasPassword       bool      `json:"has_password"`
-	HasSubToken       bool      `json:"has_sub_token"`
+	HasSubToken       bool      `json:"has_sub_token"` // kept for clients; nothing reads SubToken since cff5b9c
 	InboundIDs        []string  `json:"inbound_ids,omitempty"`
 	TrafficLimitBytes int64     `json:"traffic_limit_bytes,omitempty"`
 	ExpiresAt         time.Time `json:"expires_at,omitempty"`
@@ -222,22 +222,6 @@ func normalizeProxySubscriptionFormat(value string) (string, error) {
 	default:
 		return "", errors.New("unsupported subscription format")
 	}
-}
-
-func (s *Server) proxyUserBySubToken(token string) (model.ProxyUser, bool, bool) {
-	want := sha256.Sum256([]byte(token))
-	var found model.ProxyUser
-	matches := 0
-	for _, user := range s.store.ProxyUsers() {
-		got := sha256.Sum256([]byte(user.SubToken))
-		if user.SubToken != "" && subtle.ConstantTimeCompare(want[:], got[:]) == 1 {
-			matches++
-			if matches == 1 {
-				found = user
-			}
-		}
-	}
-	return found, matches == 1, matches > 1
 }
 
 func (s *Server) proxySubscriptionProfiles() []proxycore.SubscriptionProfile {
@@ -463,6 +447,9 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handleRotateProxyUserSubToken still rotates and audits the token, but
+// nothing has read SubToken since cff5b9c (subscriptions are served through
+// shares), so a rotation changes what no client uses.
 func (s *Server) handleRotateProxyUserSubToken(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

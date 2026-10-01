@@ -269,6 +269,11 @@ func (s *Server) quotaEvaluate(user model.ProxyUser, vpnUser *VpnUser, now time.
 	}
 	projection, period := s.vpnUserQuotaProjection(user, *vpnUser, now, pending)
 	projection, alerts := nextProxyUserNotificationsForPeriod(projection, now, period)
+	if len(alerts) > 0 && !s.vpnUserInManagedRender(*vpnUser) {
+		for i := range alerts {
+			alerts[i].AlertOnly = true
+		}
+	}
 	user.Status = projection.Status
 	user.LastQuotaNotifiedKey = projection.LastQuotaNotifiedKey
 	user.LastExpiryNotifiedKey = projection.LastExpiryNotifiedKey

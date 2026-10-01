@@ -1019,6 +1019,45 @@ func (s *Server) proxyUsersForManagedRender(override *VpnUser, now time.Time) []
 	return out
 }
 
+// vpnUserInManagedRender reports whether proxyUsersForManagedRender gives the
+// identity a row on any managed line, by the same rules: a row per enabled
+// binding on a managed VLESS line when it has a VLESS credential, or, for a
+// migrated identity with no enabled managed binding, its legacy record on
+// every managed line whose inbound that record covers. Only there can a quota
+// or an expiry take a user off a node, through drift and a reviewed apply.
+// Adopted lines are outside it: Lattice does not remove users from them
+// (design 15 D6, design 17), so an alert about an identity outside the
+// managed render is an alert only.
+func (s *Server) vpnUserInManagedRender(u VpnUser) bool {
+	_, lines := s.lineReadModel()
+	credential, ok := vpnCredentialForProtocol(u.Credentials, model.ProxyProtocolVLESS)
+	hasVLESS := ok && credential.UUID != ""
+	managedBinding := false
+	for _, binding := range u.Bindings {
+		line := lines[binding.LineHashID]
+		if !binding.Enabled || !line.Managed {
+			continue
+		}
+		managedBinding = true
+		if hasVLESS && line.Type == model.ProxyProtocolVLESS {
+			return true
+		}
+	}
+	if managedBinding || u.MigratedFromProxyUser == "" {
+		return false // no legacy record, or one the managed binding replaced
+	}
+	legacy, ok := s.store.ProxyUser(u.MigratedFromProxyUser)
+	if !ok {
+		return false
+	}
+	for _, line := range lines {
+		if line.Managed && (len(legacy.InboundIDs) == 0 || proxyStringSliceContains(legacy.InboundIDs, line.Tag)) {
+			return true
+		}
+	}
+	return false
+}
+
 var (
 	errProxyPlanNodeNotFound    = errors.New("node not found")
 	errProxyPlanProfileNotFound = errors.New("proxy node profile not found")

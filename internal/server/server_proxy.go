@@ -884,6 +884,14 @@ func (s *Server) renderProxyCoreArtifact(nodeID string) (model.Node, model.Proxy
 }
 
 func (s *Server) renderProxyCoreArtifactWithVpnUser(nodeID string, override *VpnUser) (model.Node, model.ProxyNodeProfile, proxycore.Artifact, error) {
+	now := s.now()
+	return s.renderProxyCoreArtifactForUsers(nodeID, s.proxyUsersForManagedRender(override, now), now)
+}
+
+// renderProxyCoreArtifactForUsers renders one node's config from a user list
+// proxyUsersForManagedRender built at now, so a caller that renders several
+// profiles, or also counts who the render drops, reads one list.
+func (s *Server) renderProxyCoreArtifactForUsers(nodeID string, users []model.ProxyUser, now time.Time) (model.Node, model.ProxyNodeProfile, proxycore.Artifact, error) {
 	node, ok := s.store.Node(nodeID)
 	if !ok {
 		return model.Node{}, model.ProxyNodeProfile{}, proxycore.Artifact{}, errProxyPlanNodeNotFound
@@ -896,12 +904,12 @@ func (s *Server) renderProxyCoreArtifactWithVpnUser(nodeID string, override *Vpn
 		artifact proxycore.Artifact
 		err      error
 	)
-	users := s.proxyUsersForManagedRender(override)
+	opts := proxycore.RenderOptions{Now: now}
 	switch profile.Core {
 	case model.ProxyCoreSingbox:
-		artifact, err = proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), users, proxycore.RenderOptions{})
+		artifact, err = proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), users, opts)
 	case model.ProxyCoreXray:
-		artifact, err = proxycore.RenderXrayConfigJSON(profile, s.store.ProxyInbounds(), users, proxycore.RenderOptions{})
+		artifact, err = proxycore.RenderXrayConfigJSON(profile, s.store.ProxyInbounds(), users, opts)
 	default:
 		err = fmt.Errorf("unsupported proxy core %q", profile.Core)
 	}
@@ -911,7 +919,16 @@ func (s *Server) renderProxyCoreArtifactWithVpnUser(nodeID string, override *Vpn
 	return node, profile, artifact, nil
 }
 
-func (s *Server) proxyUsersForManagedRender(override *VpnUser) []model.ProxyUser {
+// proxyUsersForManagedRender is every user row the managed render sees at
+// now: the legacy records no identity has taken over, then one row per
+// identity per enabled binding on a managed VLESS line. A row that belongs to
+// an identity carries the identity's live policy (vpnUserQuotaProjection):
+// whether it is enabled, its expiry, its quota and the usage that quota is
+// measured with, and the status those give, so an identity over its quota or
+// past its expiry is dropped here just as quotaEvaluate alerts on it. A
+// migrated identity's legacy record gets the same overlay; a legacy record
+// with no identity behind it is passed through as stored.
+func (s *Server) proxyUsersForManagedRender(override *VpnUser, now time.Time) []model.ProxyUser {
 	vpnUsers := s.listVpnUsers()
 	if override != nil {
 		replaced := false
@@ -949,27 +966,53 @@ func (s *Server) proxyUsersForManagedRender(override *VpnUser) []model.ProxyUser
 			}
 		}
 	}
-	out := make([]model.ProxyUser, 0, len(s.store.ProxyUsers())+len(vpnUsers))
-	for _, user := range s.store.ProxyUsers() {
-		if !replacedProxyUser[user.ID] {
-			out = append(out, user)
+	stored := s.store.ProxyUsers()
+	storedByID := make(map[string]model.ProxyUser, len(stored))
+	for _, user := range stored {
+		storedByID[user.ID] = user
+	}
+	identityByLegacy := map[string]VpnUser{}
+	for _, user := range vpnUsers {
+		if user.MigratedFromProxyUser != "" {
+			identityByLegacy[user.MigratedFromProxyUser] = user
 		}
+	}
+	out := make([]model.ProxyUser, 0, len(stored)+len(vpnUsers))
+	for _, user := range stored {
+		if replacedProxyUser[user.ID] {
+			continue
+		}
+		if identity, ok := identityByLegacy[user.ID]; ok {
+			user, _ = s.vpnUserQuotaProjection(user, identity, now, usageCounter{})
+		}
+		out = append(out, user)
 	}
 	for _, user := range vpnUsers {
 		credential, ok := vpnCredentialForProtocol(user.Credentials, model.ProxyProtocolVLESS)
 		if !ok || credential.UUID == "" {
 			continue
 		}
+		var policy model.ProxyUser
+		projected := false
 		for _, binding := range user.Bindings {
 			line := lineByHash[binding.LineHashID]
 			if !binding.Enabled || !line.Managed || line.Type != model.ProxyProtocolVLESS {
 				continue
 			}
+			if !projected {
+				// The lifetime total lives on the identity's accounting
+				// record: the legacy record for a migrated identity, the
+				// canonical projection otherwise.
+				acct := firstNonEmpty(strings.TrimSpace(user.MigratedFromProxyUser), user.ID)
+				policy, _ = s.vpnUserQuotaProjection(model.ProxyUser{UsedBytes: storedByID[acct].UsedBytes}, user, now, usageCounter{})
+				projected = true
+			}
 			name := userLineName(user.ID, line.LineUUID)
 			out = append(out, model.ProxyUser{
-				ID: name, Name: name, Enabled: user.Enabled,
-				UUID: credential.UUID, InboundIDs: []string{line.Tag}, TrafficLimitBytes: user.QuotaBytes,
-				ExpiresAt: user.ExpiresAt, Status: model.ProxyUserStatusActive, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
+				ID: name, Name: name, Enabled: policy.Enabled,
+				UUID: credential.UUID, InboundIDs: []string{line.Tag}, TrafficLimitBytes: policy.TrafficLimitBytes,
+				UsedBytes: policy.UsedBytes, ExpiresAt: policy.ExpiresAt, Status: policy.Status,
+				CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
 			})
 		}
 	}

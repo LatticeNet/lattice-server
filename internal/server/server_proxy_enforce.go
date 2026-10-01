@@ -32,7 +32,11 @@ type proxyDriftState struct {
 // from the scheduler tick and is safe to call concurrently with reads.
 func (s *Server) evaluateProxyConfigDrift(now time.Time) {
 	profiles := s.store.ProxyNodeProfiles()
-	users := s.store.ProxyUsers()
+	// One render user list serves every profile of the tick: it reads each
+	// rendered identity's quota usage, so it is built once, and only when a
+	// profile has been applied.
+	var users []model.ProxyUser
+	built := false
 
 	type transition struct {
 		nodeID string
@@ -46,6 +50,9 @@ func (s *Server) evaluateProxyConfigDrift(now time.Time) {
 	for _, profile := range profiles {
 		if strings.TrimSpace(profile.AppliedSHA256) == "" {
 			continue // never applied — nothing to enforce against yet
+		}
+		if !built {
+			users, built = s.proxyUsersForManagedRender(nil, now), true
 		}
 		state := s.computeProxyDrift(profile, users, now)
 		prior, had := prev[profile.NodeID]
@@ -83,14 +90,17 @@ func (s *Server) evaluateProxyConfigDrift(now time.Time) {
 // computeProxyDrift renders the current authoritative config for a profile and
 // compares it against the applied SHA. A render failure (most commonly an
 // inbound left with zero eligible users) is itself drift: the applied config
-// still serves the now-ineligible users.
+// still serves the now-ineligible users. users is the render user list
+// (proxyUsersForManagedRender at now); the render and the ineligible count
+// both read it, so the banner counts exactly the users the render drops,
+// identities over their quota or past their expiry included.
 func (s *Server) computeProxyDrift(profile model.ProxyNodeProfile, users []model.ProxyUser, now time.Time) proxyDriftState {
 	state := proxyDriftState{
 		AppliedSHA256: profile.AppliedSHA256,
 		CheckedAt:     now,
 	}
 	ineligible := countIneligibleProfileUsers(profile, users, now)
-	_, _, artifact, err := s.renderProxyCoreArtifact(profile.NodeID)
+	_, _, artifact, err := s.renderProxyCoreArtifactForUsers(profile.NodeID, users, now)
 	if err != nil {
 		state.Stale = true
 		state.IneligibleUsers = ineligible
@@ -123,7 +133,7 @@ func (s *Server) refreshProxyDriftFor(nodeID string, now time.Time) {
 		s.proxyDriftMu.Unlock()
 		return
 	}
-	state := s.computeProxyDrift(profile, s.store.ProxyUsers(), now)
+	state := s.computeProxyDrift(profile, s.proxyUsersForManagedRender(nil, now), now)
 	s.proxyDriftMu.Lock()
 	if state.Stale {
 		if prior, had := s.proxyDrift[nodeID]; had && prior.Stale && !prior.Since.IsZero() {
@@ -143,6 +153,10 @@ func (s *Server) proxyDriftFor(nodeID string) (proxyDriftState, bool) {
 	return state, ok
 }
 
+// countIneligibleProfileUsers counts the rows of a render user list that apply
+// to the profile and that the render leaves out. Pass it the list the render
+// reads (proxyUsersForManagedRender), whose identity rows carry live policy;
+// the stored ProxyUser records would miss every identity on a managed line.
 func countIneligibleProfileUsers(profile model.ProxyNodeProfile, users []model.ProxyUser, now time.Time) int {
 	count := 0
 	for _, user := range users {

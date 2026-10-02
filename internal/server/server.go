@@ -294,6 +294,9 @@ type Server struct {
 	// nodeAlerts holds which offline spell each node was alerted for; see
 	// notifyNodeLiveness.
 	nodeAlerts nodeOfflineAlerts
+	// alertDigest batches service and monitor alerts decided one node at a
+	// time into one message per kind per sweep; see alert_digest.go.
+	alertDigest alertDigest
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
 	// subscriptionDecoy shapes the answer every non-servable subscription request
@@ -5135,12 +5138,12 @@ func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request
 		return
 	}
 	req.Result.NodeID = req.NodeID
-	prior, hadPrior := s.store.LastMonitorResultForNode(req.Result.MonitorID, req.NodeID)
+	history := s.store.LastMonitorResultsForNode(req.Result.MonitorID, req.NodeID, 2)
 	if err := s.store.AddMonitorResult(req.Result); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.notifyMonitorTransition(req.NodeID, req.Result, prior, hadPrior)
+	s.notifyMonitorTransition(req.NodeID, req.Result, history)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -5454,9 +5457,9 @@ func renderNotifyTemplate(tmpl, fallback string, vars map[string]string) string 
 func classifyNotifyEvent(title string) string {
 	switch {
 	case strings.Contains(title, "Monitor recovered"):
-		return "monitor.recovered"
+		return EventMonitorRecovered
 	case strings.Contains(title, "Monitor down"):
-		return "monitor.down"
+		return EventMonitorDown
 	case strings.Contains(title, "SSH login after repeated failures"):
 		return EventSSHCompromiseSuspected
 	case strings.Contains(title, "SSH login"):
@@ -5577,36 +5580,69 @@ func validateNotifyID(value string) error {
 	return nil
 }
 
-// notifyMonitorTransition emits an alert when a monitor's success state flips
-// (or on the first observed failure), so flapping does not spam every result.
-func (s *Server) notifyMonitorTransition(nodeID string, current, prior model.MonitorResult, hadPrior bool) {
-	transitioned := (!hadPrior && !current.Success) || (hadPrior && prior.Success != current.Success)
-	if !transitioned {
+// Typed notification kinds for monitors, declared beside their emitter. They
+// used to be inferred from an emoji title by classifyNotifyEvent, which still
+// maps those titles for anything that sends them untyped.
+const (
+	EventMonitorDown      = "monitor.down"
+	EventMonitorRecovered = "monitor.recovered"
+)
+
+// notifyMonitorTransition decides monitor.down and monitor.recovered for one
+// (monitor, node) pair. history is the pair's results before current, newest
+// first (LastMonitorResultsForNode with n=2, read before current was stored).
+//
+// monitor.down waits for two failures in a row: a single failed probe is a
+// dropped packet or a busy target as often as an outage, and paging on it
+// teaches the operator to ignore the page. monitor.recovered follows only a
+// run that paged, so the phone's last message is always true. Both are read
+// off the stored history rather than kept in memory, and the store writes the
+// second failure at once, so a restart neither repeats a page nor loses the
+// recovery it owes.
+//
+// The notice is queued for the sweep's digest, so an all-nodes monitor whose
+// target goes down pages once, naming every node.
+func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, history []model.MonitorResult) {
+	failed := func(i int) bool { return i < len(history) && !history[i].Success }
+	succeededOrAbsent := func(i int) bool { return i >= len(history) || history[i].Success }
+	var kind string
+	switch {
+	case !current.Success && failed(0) && succeededOrAbsent(1):
+		kind = EventMonitorDown
+	case current.Success && failed(0) && failed(1):
+		kind = EventMonitorRecovered
+	default:
 		return
 	}
 	mon, _ := s.store.Monitor(current.MonitorID)
-	name := mon.Name
+	name := strings.TrimSpace(mon.Name)
 	if name == "" {
 		name = current.MonitorID
 	}
-	// A server-evaluated monitor (tls) has no node, so it names the target it
-	// dialled instead. Node monitors keep their exact wording.
-	where := "node " + nodeID
+	// A node monitor names the node by its name. A server-evaluated monitor
+	// (tls) has no node, so it names the target it dialled.
+	where := s.nodeDisplayName(nodeID)
 	if nodeID == "" {
-		where = mon.Target
-		if strings.TrimSpace(where) == "" {
+		where = strings.TrimSpace(mon.Target)
+		if where == "" {
 			where = "the control plane"
 		}
 	}
-	if current.Success {
-		s.emitNotify("✅ Monitor recovered", fmt.Sprintf("%s on %s is back up (%.1fms)", name, where, current.LatencyMs))
+	line := alertDigestLine{sortKey: name + "\x00" + where}
+	if kind == EventMonitorRecovered {
+		line.title = fmt.Sprintf("Monitor recovered: %s on %s", name, where)
+		line.body = fmt.Sprintf("%s on %s is back up (%.1fms).", name, where, current.LatencyMs)
+		line.line = fmt.Sprintf("%s on %s: back up (%.1fms)", name, where, current.LatencyMs)
 	} else {
-		detail := current.Error
+		detail := strings.TrimSpace(current.Error)
 		if detail == "" {
 			detail = "probe failed"
 		}
-		s.emitNotify("🔴 Monitor down", fmt.Sprintf("%s on %s failed: %s", name, where, detail))
+		line.title = fmt.Sprintf("Monitor down: %s on %s", name, where)
+		line.body = fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail)
+		line.line = fmt.Sprintf("%s on %s: %s", name, where, detail)
 	}
+	s.queueAlertDigest(kind, line)
 }
 
 // handleAgentEvent ingests an out-of-band event from an authenticated agent

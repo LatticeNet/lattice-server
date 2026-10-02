@@ -95,7 +95,16 @@ func newTLSMonitorServer(t *testing.T, addr *string, now *time.Time) (*Server, h
 	}
 	rec := &notifyRecorder{}
 	srv.emitNotify = rec.record
+	srv.emitNotifyTyped = func(eventType, title, body string) { rec.record("["+eventType+"] "+title, body) }
 	return srv, handler, rec
+}
+
+// sweepAndFlush runs one tls sweep and then the liveness sweep's digest flush,
+// which is where queued monitor notices are sent.
+func sweepAndFlush(srv *Server) int {
+	probed := srv.sweepTLSMonitorsOnce(context.Background())
+	srv.flushAlertDigests()
+	return probed
 }
 
 func createTLSMonitor(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf, body string) monitorView {
@@ -148,7 +157,7 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 		t.Fatalf("tls monitor was handed to an agent: %s", arec.Body.String())
 	}
 
-	if probed := srv.sweepTLSMonitorsOnce(context.Background()); probed != 1 {
+	if probed := sweepAndFlush(srv); probed != 1 {
 		t.Fatalf("probed = %d, want 1", probed)
 	}
 	results := srv.store.MonitorResults(mon.ID)
@@ -169,11 +178,11 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 		t.Fatalf("a first passing probe should not notify: %+v", rec.all())
 	}
 
-	// The certificate is replaced by one inside the threshold: the watch fails
-	// and the existing monitor.down notification fires.
+	// The certificate is replaced by one inside the threshold: the watch fails.
+	// One failure is held; the second in a row sends monitor.down.
 	now = now.Add(2 * time.Hour)
 	addr = tlsTestListener(t, now.Add(5*24*time.Hour))
-	if probed := srv.sweepTLSMonitorsOnce(context.Background()); probed != 1 {
+	if probed := sweepAndFlush(srv); probed != 1 {
 		t.Fatalf("second sweep probed = %d, want 1", probed)
 	}
 	results = srv.store.MonitorResults(mon.ID)
@@ -190,23 +199,30 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 	if second.CertNotAfter.IsZero() {
 		t.Fatalf("a completed handshake always records the expiry: %+v", second)
 	}
-	sent := rec.all()
-	if len(sent) != 1 || !strings.Contains(sent[0], "Monitor down") {
-		t.Fatalf("expected one monitor.down notification, got %+v", sent)
+	if sent := rec.all(); len(sent) != 0 {
+		t.Fatalf("a single failed probe must not page: %+v", sent)
 	}
-	if !strings.Contains(sent[0], "dns.test.invalid:8443") {
-		t.Fatalf("a server-evaluated alert names its target: %q", sent[0])
+	now = now.Add(2 * time.Hour)
+	if probed := sweepAndFlush(srv); probed != 1 {
+		t.Fatalf("third sweep probed = %d, want 1", probed)
+	}
+	sent := rec.all()
+	if len(sent) != 1 || !strings.HasPrefix(sent[0], "[monitor.down] Monitor down: dns doh cert on dns.test.invalid:8443") {
+		t.Fatalf("expected one typed monitor.down naming its target, got %+v", sent)
+	}
+	if strings.ContainsAny(sent[0], "\U0001F534\u2705") {
+		t.Fatalf("monitor titles carry no emoji: %q", sent[0])
 	}
 
 	// Back to a healthy certificate: the recovery notification fires.
 	now = now.Add(2 * time.Hour)
 	addr = tlsTestListener(t, now.Add(90*24*time.Hour))
-	if probed := srv.sweepTLSMonitorsOnce(context.Background()); probed != 1 {
-		t.Fatalf("third sweep probed = %d, want 1", probed)
+	if probed := sweepAndFlush(srv); probed != 1 {
+		t.Fatalf("fourth sweep probed = %d, want 1", probed)
 	}
 	sent = rec.all()
-	if len(sent) != 2 || !strings.Contains(sent[1], "Monitor recovered") {
-		t.Fatalf("expected a monitor.recovered notification, got %+v", sent)
+	if len(sent) != 2 || !strings.HasPrefix(sent[1], "[monitor.recovered] Monitor recovered: dns doh cert on dns.test.invalid:8443") {
+		t.Fatalf("expected a typed monitor.recovered notification, got %+v", sent)
 	}
 }
 
@@ -254,9 +270,15 @@ func TestTLSMonitorUnreachableTargetFails(t *testing.T) {
 	if !results[0].CertNotAfter.IsZero() {
 		t.Fatalf("no handshake means no expiry: %+v", results[0])
 	}
+	srv.flushAlertDigests()
+	if sent := rec.all(); len(sent) != 0 {
+		t.Fatalf("a first failing probe is held: %+v", sent)
+	}
+	now = now.Add(tlsMonitorDefaultInterval)
+	sweepAndFlush(srv)
 	sent := rec.all()
-	if len(sent) != 1 || !strings.Contains(sent[0], "Monitor down") {
-		t.Fatalf("a first failing probe notifies: %+v", sent)
+	if len(sent) != 1 || !strings.HasPrefix(sent[0], "[monitor.down] Monitor down: cert on dns.test.invalid:8443") {
+		t.Fatalf("the second failing probe pages: %+v", sent)
 	}
 }
 

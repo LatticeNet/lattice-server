@@ -1401,8 +1401,18 @@ func (s *Server) Close(ctx context.Context) error {
 		return nil
 	}
 	s.flushAlertDigests()
-	// The open hour's link fetch counts would otherwise be lost.
+	// The open hour's link fetch counts would otherwise be lost, and a
+	// first-seen audit already handed to its goroutine should land too.
 	s.flushShareFetchStats(s.now(), true)
+	fetchAuditsDone := make(chan struct{})
+	go func() {
+		s.shareFetchAudits.Wait()
+		close(fetchAuditsDone)
+	}()
+	select {
+	case <-fetchAuditsDone:
+	case <-ctx.Done():
+	}
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)

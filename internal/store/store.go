@@ -275,6 +275,11 @@ type Store struct {
 	// sidecar is gone by then, so a write would put its domains in the JSON
 	// file. Guarded by mu.
 	closed bool
+	// linkIndex resolves link tokens without a scan, and shareGen counts
+	// share writes so the index knows when it is out of date; see
+	// link_token_index.go. Guarded by mu.
+	linkIndex *linkTokenIndex
+	shareGen  uint64
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every

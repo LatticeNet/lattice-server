@@ -168,7 +168,7 @@ func (s *Server) publishingRecords(origin string) []publishingRecord {
 	var out []publishingRecord
 	switch origin {
 	case originPlugin:
-		for _, share := range s.store.SubscriptionShares() {
+		for _, share := range s.store.SubscriptionSharesUnordered() {
 			out = append(out, publishingRecordFromShare(share))
 		}
 	default:

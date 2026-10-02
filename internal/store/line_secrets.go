@@ -34,6 +34,18 @@ func validSecretUUIDv4(value string) bool {
 	return true
 }
 
+func validLowerHexSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return false
+		}
+	}
+	return true
+}
+
 func validRealityKey(value string) bool {
 	raw, err := base64.RawURLEncoding.DecodeString(value)
 	return err == nil && len(raw) == 32 && base64.RawURLEncoding.EncodeToString(raw) == value
@@ -130,6 +142,11 @@ type VpnUserLineBinding struct {
 	LineHashID   string `json:"line_hash_id"`
 	Enabled      bool   `json:"enabled"`
 	FlowOverride string `json:"flow_override,omitempty"`
+	// AppliedCredentialSHA256 is the credential_sha256 of the last applied
+	// line-user plan that put this identity's credential on the node, empty
+	// when none did or the last one took it off. It is a hash of the payload,
+	// never the credential.
+	AppliedCredentialSHA256 string `json:"applied_credential_sha256,omitempty"`
 }
 
 // VpnUserSecretRecord is the independently encrypted private half. It has no
@@ -242,6 +259,11 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 	for id, record := range public {
 		if strings.TrimSpace(id) == "" || record.ID != id {
 			return fmt.Errorf("vpn user public record %q has mismatched id %q", id, record.ID)
+		}
+		for _, binding := range record.Bindings {
+			if sha := binding.AppliedCredentialSHA256; sha != "" && !validLowerHexSHA256(sha) {
+				return fmt.Errorf("vpn user %q binding %q has an invalid applied credential hash", id, binding.LineHashID)
+			}
 		}
 		if suspension := record.Suspension; suspension != nil {
 			if !VpnUserSuspensionReasons[suspension.Reason] {
@@ -412,6 +434,59 @@ func (s *Store) ReplaceLineSecretRecords(vpnPublic map[string]VpnUserPublicRecor
 }
 
 func (s *Store) replaceLineSecretRecordsLocked(public map[string]VpnUserPublicRecord, private map[string]VpnUserSecretRecord, managedPublic map[string]ManagedLinePublicRecord, managedPrivate map[string]ManagedLineSecretRecord, legacy []LegacyKVKey) error {
+	staged, err := s.stageLineSecretRecordsLocked(public, private, managedPublic, managedPrivate, legacy)
+	if err != nil {
+		return err
+	}
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	return err
+}
+
+// MigrateVpnUserPublicRecordsOnce runs fn over every identity's public record
+// the first time it is called with name on this store, and never again. fn
+// returns the rewritten record and true to change it. The changed records and
+// the marker commit in one write, validated like any identity write, so a
+// failed write leaves neither behind and the next start tries again. ran is
+// false when the marker was already present; changed lists the rewritten ids,
+// sorted.
+func (s *Store) MigrateVpnUserPublicRecordsOnce(name string, fn func(VpnUserPublicRecord) (VpnUserPublicRecord, bool)) (changed []string, ran bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, done := s.state.Migrations[name]; done {
+		return nil, false, nil
+	}
+	public := cloneVpnUserPublicRecords(s.state.VpnUsers)
+	for id, record := range public {
+		if next, ok := fn(record); ok {
+			public[id] = next
+			changed = append(changed, id)
+		}
+	}
+	sort.Strings(changed)
+	staged, err := s.stageLineSecretRecordsLocked(public, s.state.VpnUserSecrets, s.state.ManagedLines, s.state.ManagedLineSecrets, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	migrations := make(map[string]time.Time, len(s.state.Migrations)+1)
+	for k, v := range s.state.Migrations {
+		migrations[k] = v
+	}
+	migrations[name] = time.Now().UTC()
+	staged.Migrations = migrations
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if !committed {
+		return nil, false, err
+	}
+	s.state = staged
+	return changed, true, err
+}
+
+// stageLineSecretRecordsLocked validates the line-secret domains and returns
+// the state they would commit, without writing it.
+func (s *Store) stageLineSecretRecordsLocked(public map[string]VpnUserPublicRecord, private map[string]VpnUserSecretRecord, managedPublic map[string]ManagedLinePublicRecord, managedPrivate map[string]ManagedLineSecretRecord, legacy []LegacyKVKey) (State, error) {
 	stagedPublic := cloneVpnUserPublicRecords(public)
 	stagedPrivate := cloneVpnUserSecretRecords(private)
 	for id, record := range stagedPublic {
@@ -423,7 +498,7 @@ func (s *Store) replaceLineSecretRecordsLocked(public map[string]VpnUserPublicRe
 		} else {
 			generation, err := nextSubscriptionGeneration(current, s.state.VpnUserSecrets[id], record, stagedPrivate[id])
 			if err != nil {
-				return fmt.Errorf("vpn user %q: %w", id, err)
+				return State{}, fmt.Errorf("vpn user %q: %w", id, err)
 			}
 			record.SubscriptionGeneration = generation
 		}
@@ -433,10 +508,10 @@ func (s *Store) replaceLineSecretRecordsLocked(public map[string]VpnUserPublicRe
 		stagedPublic[id] = record
 	}
 	if err := validateVpnUserCollections(stagedPublic, stagedPrivate); err != nil {
-		return err
+		return State{}, err
 	}
 	if err := validateManagedLineCollections(managedPublic, managedPrivate); err != nil {
-		return err
+		return State{}, err
 	}
 	staged := s.state
 	staged.VpnUsers = stagedPublic
@@ -450,11 +525,7 @@ func (s *Store) replaceLineSecretRecordsLocked(public map[string]VpnUserPublicRe
 	for _, key := range legacy {
 		delete(staged.KV, key.Bucket+"/"+key.Key)
 	}
-	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
-	if committed {
-		s.state = staged
-	}
-	return err
+	return staged, nil
 }
 
 func (s *Store) PutManagedLineRecord(public ManagedLinePublicRecord, private ManagedLineSecretRecord) error {
@@ -544,24 +615,22 @@ func sameVpnUserPrivateCredentials(a, b []VpnUserCredentialSecret) bool {
 func sameVpnUserBindings(a, b []VpnUserLineBinding) bool {
 	a = append([]VpnUserLineBinding(nil), a...)
 	b = append([]VpnUserLineBinding(nil), b...)
-	sort.Slice(a, func(i, j int) bool {
-		if a[i].LineHashID != a[j].LineHashID {
-			return a[i].LineHashID < a[j].LineHashID
+	less := func(x, y VpnUserLineBinding) bool {
+		if x.LineHashID != y.LineHashID {
+			return x.LineHashID < y.LineHashID
 		}
-		if a[i].Enabled != a[j].Enabled {
-			return !a[i].Enabled
+		if x.Enabled != y.Enabled {
+			return !x.Enabled
 		}
-		return a[i].FlowOverride < a[j].FlowOverride
-	})
-	sort.Slice(b, func(i, j int) bool {
-		if b[i].LineHashID != b[j].LineHashID {
-			return b[i].LineHashID < b[j].LineHashID
+		if x.FlowOverride != y.FlowOverride {
+			return x.FlowOverride < y.FlowOverride
 		}
-		if b[i].Enabled != b[j].Enabled {
-			return !b[i].Enabled
-		}
-		return b[i].FlowOverride < b[j].FlowOverride
-	})
+		return x.AppliedCredentialSHA256 < y.AppliedCredentialSHA256
+	}
+	sort.Slice(a, func(i, j int) bool { return less(a[i], a[j]) })
+	sort.Slice(b, func(i, j int) bool { return less(b[i], b[j]) })
+	// The applied credential is part of the comparison: what the node holds
+	// decides which lines an identity's subscription may serve.
 	return slices.Equal(a, b)
 }
 

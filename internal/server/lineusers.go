@@ -19,6 +19,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // design-15 D3: per-line user management for adopted (233boy-script) sing-box
@@ -41,6 +42,14 @@ const (
 	lineUserOpAdd    = "add"
 	lineUserOpUpdate = "update"
 	lineUserOpRemove = "remove"
+	// lineUserOpSuspend and lineUserOpResume are the suspension reconciler's
+	// ops (adopted-suspend P4): take the identity's credential off an adopted
+	// line and put the same credential back, keeping the binding. No plan
+	// carries them yet; vpnUserLinePlan refuses them. reconcileLineUserBinding
+	// already knows what each does to the binding, so the reconciler adds the
+	// plans and scripts, not a second owner of the applied credential.
+	lineUserOpSuspend = "suspend"
+	lineUserOpResume  = "resume"
 
 	lineUserTrackAdopted = "adopted"
 	lineUserTrackManaged = "managed"
@@ -1042,35 +1051,12 @@ func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approv
 		u.MigratedFromProxyUser = ""
 		changed = true
 	}
-	switch plan.Op {
-	case lineUserOpAdd, lineUserOpUpdate:
-		found := false
-		for i := range u.Bindings {
-			if u.Bindings[i].LineHashID == plan.LineHashID {
-				if !u.Bindings[i].Enabled {
-					u.Bindings[i].Enabled = true
-					changed = true
-				}
-				found = true
-				break
-			}
-		}
-		if !found {
-			u.Bindings = append(u.Bindings, LineBinding{LineHashID: plan.LineHashID, Enabled: true})
-			changed = true
-		}
-	case lineUserOpRemove:
-		kept := u.Bindings[:0]
-		for _, b := range u.Bindings {
-			if b.LineHashID != plan.LineHashID {
-				kept = append(kept, b)
-			}
-		}
-		changed = len(kept) != len(u.Bindings)
-		u.Bindings = kept
-	default:
-		return fmt.Errorf("reconcile line-user approval: invalid op %q", plan.Op)
+	var bindingChanged bool
+	u, bindingChanged, err = reconcileLineUserBinding(u, plan)
+	if err != nil {
+		return err
 	}
+	changed = changed || bindingChanged
 	if changed {
 		u.UpdatedAt = s.now()
 		if err := s.putVpnUser(u); err != nil {
@@ -1142,6 +1128,151 @@ func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approv
 	// and drop what core shares cached.
 	s.triggerVPNCoreMutation()
 	s.invalidateCoreSourceShares()
+	return nil
+}
+
+// reconcileLineUserBinding records on the identity what an applied line-user
+// plan did on the node. It is the one owner of a binding's applied credential
+// (r1-critic X-5), for every op:
+//
+//	add, update  the binding is enabled and carries the plan's credential hash
+//	resume       the same: the node holds the identity's credential again
+//	suspend      the binding stays, with no applied credential
+//	remove       the binding goes, and its applied credential with it
+//
+// A rotation changes only the stored credential, so the applied hash stops
+// matching until a plan_update, or a resume, applies the new one; a rotation
+// while suspended is therefore picked up by the resume. The credential hash
+// is the plan's, which the result path has just checked against the
+// identity's current credential (validateLineUserApproval).
+func reconcileLineUserBinding(u VpnUser, plan lineUserPlan) (VpnUser, bool, error) {
+	applied := lineUserAppliedCredential(plan.Op, plan.CredentialSHA256)
+	bindings := append([]LineBinding(nil), u.Bindings...)
+	changed := false
+	switch plan.Op {
+	case lineUserOpAdd, lineUserOpUpdate, lineUserOpResume, lineUserOpSuspend:
+		found := false
+		for i := range bindings {
+			if bindings[i].LineHashID != plan.LineHashID {
+				continue
+			}
+			found = true
+			if plan.Op != lineUserOpSuspend && !bindings[i].Enabled {
+				bindings[i].Enabled, changed = true, true
+			}
+			if bindings[i].AppliedCredentialSHA256 != applied {
+				bindings[i].AppliedCredentialSHA256, changed = applied, true
+			}
+			break
+		}
+		if !found && plan.Op != lineUserOpSuspend {
+			bindings = append(bindings, LineBinding{LineHashID: plan.LineHashID, Enabled: true, AppliedCredentialSHA256: applied})
+			changed = true
+		}
+	case lineUserOpRemove:
+		kept := bindings[:0]
+		for _, b := range bindings {
+			if b.LineHashID != plan.LineHashID {
+				kept = append(kept, b)
+			}
+		}
+		changed = len(kept) != len(bindings)
+		bindings = kept
+	default:
+		return u, false, fmt.Errorf("reconcile line-user approval: invalid op %q", plan.Op)
+	}
+	u.Bindings = bindings
+	return u, changed, nil
+}
+
+// lineUserAppliedCredential is the applied-credential hash a binding carries
+// after op ran on the node: the plan's hash when the op leaves the
+// identity's credential on the node, empty when it takes it off.
+func lineUserAppliedCredential(op, credentialSHA256 string) string {
+	switch op {
+	case lineUserOpAdd, lineUserOpUpdate, lineUserOpResume:
+		return credentialSHA256
+	default:
+		return ""
+	}
+}
+
+const (
+	// lineCredentialCurrent: the node holds the identity's current credential.
+	lineCredentialCurrent = "current"
+	// lineCredentialStale: an applied plan put a credential there, but the
+	// identity's credential has been rotated since.
+	lineCredentialStale = "stale"
+	// lineCredentialNone: no applied plan put the identity's credential on
+	// the node (bind, the runtime path, a hand edit), or the last one took it
+	// off.
+	lineCredentialNone = "none"
+	// lineCredentialUnknown: the line is not in the read model, so the
+	// current credential's hash cannot be computed.
+	lineCredentialUnknown = "unknown"
+)
+
+// lineBindingCredentialState says whether the node behind a binding holds
+// the identity's current credential: the binding's applied hash against the
+// hash of the payload the identity's credential gives on that line now. This
+// is the test a per-identity link applies before serving a line
+// (identity-sub 4.2 rule 3).
+func lineBindingCredentialState(u VpnUser, b LineBinding, ln Line, lineKnown bool) string {
+	if b.AppliedCredentialSHA256 == "" {
+		return lineCredentialNone
+	}
+	if !lineKnown || ln.LineUUID == "" {
+		return lineCredentialUnknown
+	}
+	payload, err := lineUserCredential(u, strings.ToLower(strings.TrimSpace(ln.Type)), userLineName(u.ID, ln.LineUUID))
+	if err != nil {
+		return lineCredentialStale
+	}
+	sha, err := lineUserCredentialSHA(payload)
+	if err != nil || sha != b.AppliedCredentialSHA256 {
+		return lineCredentialStale
+	}
+	return lineCredentialCurrent
+}
+
+// lineUserAppliedCredentialBackfill names the one-time migration that fills
+// the applied credential of bindings made before the field existed.
+const lineUserAppliedCredentialBackfill = "vpnuser-applied-credential-v1"
+
+// backfillLineUserAppliedCredentials fills each binding that has no applied
+// credential from approval history, once per store: the credential hash of
+// the last applied plan for the (identity, line) pair, when that plan was an
+// add or an update. A pair whose last applied plan was a removal, or that no
+// plan ever touched (bind, the runtime path, a hand edit), stays empty. A
+// credential rotated since that plan leaves a hash that no longer matches,
+// which is the truth: the node still holds the old one. Approvals are never
+// pruned, so the history is complete.
+func (s *Server) backfillLineUserAppliedCredentials() error {
+	last := map[[2]string]lineUserPlan{}
+	for _, plan := range s.lineUserLastApplied(func(lineUserPlan) bool { return true }) {
+		last[[2]string{plan.UserID, plan.LineHashID}] = plan
+	}
+	changed, ran, err := s.store.MigrateVpnUserPublicRecordsOnce(lineUserAppliedCredentialBackfill, func(record store.VpnUserPublicRecord) (store.VpnUserPublicRecord, bool) {
+		touched := false
+		for i, binding := range record.Bindings {
+			if binding.AppliedCredentialSHA256 != "" {
+				continue
+			}
+			plan, ok := last[[2]string{record.ID, binding.LineHashID}]
+			if !ok || lineUserAppliedCredential(plan.Op, plan.CredentialSHA256) == "" {
+				continue
+			}
+			record.Bindings[i].AppliedCredentialSHA256 = plan.CredentialSHA256
+			touched = true
+		}
+		return record, touched
+	})
+	if err != nil {
+		return fmt.Errorf("backfill applied line credentials: %w", err)
+	}
+	if ran && len(changed) > 0 {
+		s.logger.Printf("vpn-core: recorded the applied line credential for the bindings of %d identities from approval history", len(changed))
+	}
 	return nil
 }
 

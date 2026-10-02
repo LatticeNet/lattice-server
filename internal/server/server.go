@@ -636,6 +636,11 @@ func New(opts Options) (*Server, error) {
 	if err := s.migrateProxyUsersToVpnUsers(); err != nil {
 		return nil, fmt.Errorf("migrate vpn user secrets: %w", err)
 	}
+	// Once per store, after the identities exist: what approval history says
+	// each binding's node holds (identity-sub P3).
+	if err := s.backfillLineUserAppliedCredentials(); err != nil {
+		return nil, err
+	}
 	// Before the scheduler's first run, so machines that already carry a
 	// renewal date are reminded from the first evaluation.
 	s.applyReminderDefaults()

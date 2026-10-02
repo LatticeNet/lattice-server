@@ -72,6 +72,15 @@ type LineBinding struct {
 	LineHashID   string `json:"line_hash_id"`
 	Enabled      bool   `json:"enabled"`
 	FlowOverride string `json:"flow_override,omitempty"`
+	// AppliedCredentialSHA256 is the credential_sha256 of the last applied
+	// line-user plan that put the identity's credential on the line's node,
+	// and empty when no applied plan did or the last one took it off
+	// (lineUserAppliedCredential). A binding made by bind, or by the runtime
+	// path, has none: nothing proves the node holds the credential. It is
+	// compared with the identity's current credential to tell whether the
+	// node still holds that one (lineBindingCredentialState). It is a hash of
+	// the payload, never the credential, and views do not carry it.
+	AppliedCredentialSHA256 string `json:"applied_credential_sha256,omitempty"`
 }
 
 const (
@@ -95,13 +104,24 @@ type vpnCredentialView struct {
 	HasSecret bool   `json:"has_secret"`
 }
 
+// vpnBindingView is a binding as views carry it: the applied credential is
+// reduced to what it says about the node.
+type vpnBindingView struct {
+	LineHashID   string `json:"line_hash_id"`
+	Enabled      bool   `json:"enabled"`
+	FlowOverride string `json:"flow_override,omitempty"`
+	// Credential is lineBindingCredentialState: current, stale, none or
+	// unknown. Views that do not resolve lines leave it out.
+	Credential string `json:"credential,omitempty"`
+}
+
 type vpnUserView struct {
 	ID            string              `json:"id"`
 	Email         string              `json:"email"`
 	Name          string              `json:"name,omitempty"`
 	Enabled       bool                `json:"enabled"`
 	Credentials   []vpnCredentialView `json:"credentials"`
-	Bindings      []LineBinding       `json:"bindings"`
+	Bindings      []vpnBindingView    `json:"bindings"`
 	QuotaBytes    int64               `json:"quota_bytes,omitempty"`
 	QuotaPeriod   string              `json:"quota_period,omitempty"`
 	QuotaResetDay int                 `json:"quota_reset_day,omitempty"`
@@ -121,9 +141,9 @@ func toVpnUserView(u VpnUser) vpnUserView {
 			HasSecret: c.UUID != "" || c.Password != "",
 		})
 	}
-	binds := u.Bindings
-	if binds == nil {
-		binds = []LineBinding{}
+	binds := make([]vpnBindingView, 0, len(u.Bindings))
+	for _, b := range u.Bindings {
+		binds = append(binds, vpnBindingView{LineHashID: b.LineHashID, Enabled: b.Enabled, FlowOverride: b.FlowOverride})
 	}
 	return vpnUserView{
 		ID: u.ID, Email: u.Email, Name: u.Name, Enabled: u.Enabled,
@@ -188,6 +208,7 @@ func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecr
 	for _, binding := range u.Bindings {
 		bindings = append(bindings, store.VpnUserLineBinding{
 			LineHashID: binding.LineHashID, Enabled: binding.Enabled, FlowOverride: binding.FlowOverride,
+			AppliedCredentialSHA256: binding.AppliedCredentialSHA256,
 		})
 	}
 	return store.VpnUserPublicRecord{
@@ -218,6 +239,7 @@ func joinVpnUserRecord(public store.VpnUserPublicRecord, private store.VpnUserSe
 	for _, binding := range public.Bindings {
 		bindings = append(bindings, LineBinding{
 			LineHashID: binding.LineHashID, Enabled: binding.Enabled, FlowOverride: binding.FlowOverride,
+			AppliedCredentialSHA256: binding.AppliedCredentialSHA256,
 		})
 	}
 	return VpnUser{

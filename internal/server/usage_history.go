@@ -864,6 +864,16 @@ func (s *Server) vpnUserUsageViews(users []VpnUser, now time.Time) []vpnUserUsag
 	out := make([]vpnUserUsageView, 0, len(users))
 	for i, u := range users {
 		view := vpnUserUsageView{vpnUserView: toVpnUserView(u), Last7d: make([]int64, 7), AllocatedNodes: []allocatedNodeView{}}
+		// toVpnUserView keeps the bindings' order, so each view row is its
+		// binding's.
+		for i, b := range u.Bindings {
+			f, known := ctx.byHash[b.LineHashID]
+			var ln Line
+			if known && f != nil {
+				ln = f.Line
+			}
+			view.Bindings[i].Credential = lineBindingCredentialState(u, b, ln, known && f != nil)
+		}
 		acct := ctx.accounting[u.ID]
 		if acct == "" {
 			acct = u.ID

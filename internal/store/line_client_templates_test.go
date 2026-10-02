@@ -73,6 +73,17 @@ func TestLineClientTemplatesWriteOnlyOnChange(t *testing.T) {
 	if all := reopened.LineClientTemplates(); len(all) != 2 || all[0].LineHashID != "line_a1" || all[1].LineHashID != "line_b1" {
 		t.Fatalf("templates after reopen: %+v", all)
 	}
+
+	// What a template dropped is part of it: the same parameters with a
+	// different dropped set are a change, and the set survives a reopen.
+	lossy := lineTemplateFixture("node-b", "line_b1", "b.example.com")
+	lossy.Dropped = []string{"obfs", "obfs-password"}
+	if written, err := reopened.SyncLineClientTemplates(map[string][]LineClientTemplate{"node-b": {lossy}}, t1); err != nil || !written {
+		t.Fatalf("a newly lossy template must be written: written=%v err=%v", written, err)
+	}
+	if got, _ := reopened.LineClientTemplate("line_b1"); !got.Lossy() || len(got.Dropped) != 2 {
+		t.Fatalf("lossy template = %+v", got)
+	}
 }
 
 // A template the store cannot keep is refused with the whole sync, so a bad
@@ -89,6 +100,9 @@ func TestLineClientTemplatesRefuseABadRecord(t *testing.T) {
 		"host with a path":  func(t *LineClientTemplate) { t.Host = "evil/x" },
 		"control character": func(t *LineClientTemplate) { t.Params["path"] = "/x\n" },
 		"wrong node":        func(t *LineClientTemplate) { t.NodeID = "node-b" },
+		"reserved id":       func(t *LineClientTemplate) { t.Params["id"] = "5b2c7d1e-3f4a-4b5c-8d6e-7f8091a2b3c4" },
+		"reserved flow":     func(t *LineClientTemplate) { t.Params["flow"] = "xtls-rprx-vision" },
+		"empty dropped":     func(t *LineClientTemplate) { t.Dropped = []string{""} },
 	} {
 		t.Run(name, func(tt *testing.T) {
 			bad := lineTemplateFixture("node-a", "line_a2", "a.example.com")

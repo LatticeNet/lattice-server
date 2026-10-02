@@ -35,7 +35,10 @@ const lineClientTemplateSyncInterval = time.Minute
 // shape, never a credential. flow is left out on purpose: it is part of the
 // identity's own credential payload, which fills it back in. obfs-password,
 // and anything unknown, is dropped, so a parameter the fork adds later stays
-// out until someone decides it is not a secret.
+// out until someone decides it is not a secret. A dropped parameter is named
+// in the template's Dropped, and lineClientURI builds nothing from such a
+// template: an entry without the parameter may not connect, and a client
+// shown an entry that cannot connect has no way to tell.
 var lineClientURIParams = map[string]bool{
 	"security": true, "type": true, "sni": true, "pbk": true, "sid": true, "fp": true, "spx": true,
 	"host": true, "path": true, "encryption": true, "alpn": true, "insecure": true, "allowInsecure": true,
@@ -46,6 +49,25 @@ var lineClientURIParams = map[string]bool{
 // id is the credential and ps the owner's label; neither is kept.
 var lineClientVMessFields = map[string]bool{
 	"aid": true, "net": true, "type": true, "host": true, "path": true, "tls": true, "sni": true, "alpn": true, "fp": true,
+}
+
+// lineClientVMessOwnFields are the vmess JSON fields a client entry builds
+// from the template's own fields or the identity's payload: dropping them
+// loses nothing.
+var lineClientVMessOwnFields = map[string]bool{"v": true, "ps": true, "add": true, "port": true, "id": true}
+
+// lineClientDroppedNames sorts the names of the parameters a template did not
+// keep. Values never reach it.
+func lineClientDroppedNames(names map[string]bool) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	for name := range names {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // lineClientSchemes maps a share URI scheme to the protocol it carries.
@@ -130,16 +152,24 @@ func lineClientURITemplate(shareURL, protocol string) (store.LineClientTemplate,
 		return store.LineClientTemplate{}, nil, errors.New("share url has no port")
 	}
 	t := store.LineClientTemplate{Host: parsed.Hostname(), Port: port}
-	if protocol != "socks" {
-		for key, values := range parsed.Query() {
-			if lineClientURIParams[key] && len(values) > 0 && values[0] != "" {
-				if t.Params == nil {
-					t.Params = map[string]string{}
-				}
-				t.Params[key] = values[0]
+	dropped := map[string]bool{}
+	for key, values := range parsed.Query() {
+		if len(values) == 0 || values[0] == "" {
+			continue
+		}
+		switch {
+		case protocol != "socks" && lineClientURIParams[key]:
+			if t.Params == nil {
+				t.Params = map[string]string{}
 			}
+			t.Params[key] = values[0]
+		case protocol != "socks" && key == "flow":
+			// The identity's payload carries its own flow.
+		default:
+			dropped[key] = true
 		}
 	}
+	t.Dropped = lineClientDroppedNames(dropped)
 	return t, secrets, nil
 }
 
@@ -170,14 +200,22 @@ func lineClientVMessTemplate(body string) (store.LineClientTemplate, []string, e
 		return store.LineClientTemplate{}, nil, errors.New("vmess share url has no port")
 	}
 	t := store.LineClientTemplate{Host: strings.Trim(text("add"), "[]"), Port: port}
-	for key := range lineClientVMessFields {
-		if value := text(key); value != "" {
+	dropped := map[string]bool{}
+	for key, raw := range document {
+		switch {
+		case lineClientVMessOwnFields[key]:
+		case lineClientVMessFields[key] && text(key) != "":
 			if t.Params == nil {
 				t.Params = map[string]string{}
 			}
-			t.Params[key] = value
+			t.Params[key] = text(key)
+		case raw != nil && raw != "" && raw != false:
+			// A field outside the allowlist, or a kept field whose value is
+			// not a string or a number.
+			dropped[key] = true
 		}
 	}
+	t.Dropped = lineClientDroppedNames(dropped)
 	return t, []string{text("id")}, nil
 }
 
@@ -186,11 +224,21 @@ func lineClientVMessTemplate(body string) (store.LineClientTemplate, []string, e
 // (lineUserCredential) filled in, labelled with label. It builds a fresh URI
 // from the template's parts and the payload's, the way the template was
 // built, and checks that the credential it parses back is the payload's.
+//
+// It refuses a lossy template (store.LineClientTemplate.Lossy), whose entry
+// may not connect, and one that carries a reserved key, which would put a
+// template value where the identity's credential or the endpoint belongs.
 func lineClientURI(t store.LineClientTemplate, payload lineUserCredentialPayload, label string) (string, error) {
+	if t.Lossy() {
+		return "", fmt.Errorf("the line's share url set parameters its template does not keep: %s", strings.Join(t.Dropped, ", "))
+	}
 	hostPort := net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
 	query := url.Values{}
 	keys := make([]string, 0, len(t.Params))
 	for key := range t.Params {
+		if store.LineClientTemplateReservedParams[key] {
+			return "", fmt.Errorf("template carries the reserved param %q", key)
+		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)

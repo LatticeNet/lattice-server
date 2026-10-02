@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -46,14 +47,35 @@ type LineClientTemplate struct {
 	Port int    `json:"port"`
 	// Params are the allowlisted connection parameters, never a credential.
 	Params map[string]string `json:"params,omitempty"`
+	// Dropped names, sorted, the parameters the share URL set that the
+	// template does not keep: anything outside the allowlist, such as a
+	// hysteria2 obfs-password. Names only, never values. A template that
+	// dropped something may be missing what a client needs to connect, so
+	// no client entry is built from it (Lossy).
+	Dropped []string `json:"dropped,omitempty"`
 	// UpdatedAt is when this template last changed.
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
 const (
 	maxLineClientTemplateParams     = 24
+	maxLineClientTemplateDropped    = 32
 	maxLineClientTemplateValueBytes = 512
 )
+
+// LineClientTemplateReservedParams are the keys a client entry takes from the
+// identity's credential payload or from the template's own fields, never
+// from Params: the vmess document's id, add, port, ps and v, and the
+// identity's flow. The builder never keeps them; the store refuses a template
+// that carries one, so an imported or hand-made record cannot override an
+// identity's credential or endpoint either.
+var LineClientTemplateReservedParams = map[string]bool{
+	"id": true, "add": true, "port": true, "ps": true, "v": true, "flow": true,
+}
+
+// Lossy reports whether the share URL set a parameter the template dropped,
+// so an entry built from it may not connect.
+func (t LineClientTemplate) Lossy() bool { return len(t.Dropped) > 0 }
 
 // LineClientTemplateProtocols are the protocols a template may carry: the
 // ones the per-line user CLI can put an identity's credential on.
@@ -84,23 +106,35 @@ func ValidateLineClientTemplate(t LineClientTemplate) error {
 		return fmt.Errorf("line client template %q has an invalid tag or line uuid", t.LineHashID)
 	case len(t.Params) > maxLineClientTemplateParams:
 		return fmt.Errorf("line client template %q has more than %d params", t.LineHashID, maxLineClientTemplateParams)
+	case len(t.Dropped) > maxLineClientTemplateDropped:
+		return fmt.Errorf("line client template %q names more than %d dropped params", t.LineHashID, maxLineClientTemplateDropped)
 	}
 	for key, value := range t.Params {
 		if key == "" || !validLineClientTemplateText(key, 64) || !validLineClientTemplateText(value, maxLineClientTemplateValueBytes) {
 			return fmt.Errorf("line client template %q has an invalid param %q", t.LineHashID, key)
 		}
+		if LineClientTemplateReservedParams[key] {
+			return fmt.Errorf("line client template %q carries the reserved param %q", t.LineHashID, key)
+		}
+	}
+	for _, name := range t.Dropped {
+		if name == "" || !validLineClientTemplateText(name, 64) {
+			return fmt.Errorf("line client template %q names an invalid dropped param", t.LineHashID)
+		}
 	}
 	return nil
 }
 
-// lineClientTemplateDurablyEqual compares two templates without UpdatedAt.
-func lineClientTemplateDurablyEqual(a, b LineClientTemplate) bool {
+// LineClientTemplateDurablyEqual compares two templates without UpdatedAt.
+func LineClientTemplateDurablyEqual(a, b LineClientTemplate) bool {
 	return a.LineHashID == b.LineHashID && a.NodeID == b.NodeID && a.Tag == b.Tag && a.LineUUID == b.LineUUID &&
-		a.Protocol == b.Protocol && a.Host == b.Host && a.Port == b.Port && maps.Equal(a.Params, b.Params)
+		a.Protocol == b.Protocol && a.Host == b.Host && a.Port == b.Port && maps.Equal(a.Params, b.Params) &&
+		slices.Equal(a.Dropped, b.Dropped)
 }
 
 func cloneLineClientTemplate(t LineClientTemplate) LineClientTemplate {
 	t.Params = maps.Clone(t.Params)
+	t.Dropped = slices.Clone(t.Dropped)
 	return t
 }
 
@@ -134,7 +168,7 @@ func (s *Store) SyncLineClientTemplates(byNode map[string][]LineClientTemplate, 
 			}
 			seen[t.LineHashID] = true
 			t = cloneLineClientTemplate(t)
-			if current, ok := s.state.LineClientTemplates[t.LineHashID]; ok && lineClientTemplateDurablyEqual(current, t) {
+			if current, ok := s.state.LineClientTemplates[t.LineHashID]; ok && LineClientTemplateDurablyEqual(current, t) {
 				t.UpdatedAt = current.UpdatedAt
 			} else {
 				t.UpdatedAt = now.UTC()
@@ -146,7 +180,7 @@ func (s *Store) SyncLineClientTemplates(byNode map[string][]LineClientTemplate, 
 		same := true
 		for hash, t := range next {
 			current, ok := s.state.LineClientTemplates[hash]
-			if !ok || !lineClientTemplateDurablyEqual(current, t) {
+			if !ok || !LineClientTemplateDurablyEqual(current, t) {
 				same = false
 				break
 			}

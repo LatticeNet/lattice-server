@@ -202,14 +202,66 @@ func TestLineClientTemplateRefusals(t *testing.T) {
 			}
 		})
 	}
-	// Unknown parameters, the owner's flow and the hysteria2 obfuscation
-	// password are dropped, not kept.
-	tmpl, err := lineClientTemplateFromShareURL("hysteria2://"+tmplOwnerPass+"@203.0.113.5:8443?alpn=h3&obfs=salamander&obfs-password=hidden&flow=x&future=1", "hysteria2")
+}
+
+// A parameter the template does not keep is dropped, and named, so the
+// template says it is lossy: a hysteria2 line with salamander obfuscation
+// needs obfs and obfs-password, and an entry built without them connects to
+// nothing. lineClientURI refuses such a template instead of building that
+// entry. The owner's flow is not a loss, since the identity's payload carries
+// its own; the values of what was dropped are never kept.
+func TestLineClientTemplateNamesWhatItDropped(t *testing.T) {
+	const obfsPassword = "salamanderSecret42"
+	tmpl, err := lineClientTemplateFromShareURL("hysteria2://"+tmplOwnerPass+"@203.0.113.5:8443?alpn=h3&obfs=salamander&obfs-password="+obfsPassword+"&flow=x&future=1", "hysteria2")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(tmpl.Params, map[string]string{"alpn": "h3"}) {
 		t.Fatalf("params = %v", tmpl.Params)
+	}
+	if !reflect.DeepEqual(tmpl.Dropped, []string{"future", "obfs", "obfs-password"}) || !tmpl.Lossy() {
+		t.Fatalf("dropped = %v", tmpl.Dropped)
+	}
+	if raw, _ := json.Marshal(tmpl); strings.Contains(string(raw), obfsPassword) || strings.Contains(string(raw), "salamander") {
+		t.Fatalf("a dropped parameter's value is kept: %s", raw)
+	}
+	if entry, err := lineClientURI(tmpl, lineUserCredentialPayload{Password: tmplOtherPass}, "x"); err == nil {
+		t.Fatalf("a lossy template must not give an entry, got %s", entry)
+	}
+
+	// vmess: a field outside the allowlist is named the same way.
+	vm, err := lineClientTemplateFromShareURL(vmessShareURL(t, map[string]any{"v": "2", "ps": "x", "add": "203.0.113.5", "port": "443", "id": tmplOwnerUUID, "aid": "0", "net": "tcp", "scy": "auto", "tls": ""}), "vmess")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(vm.Dropped, []string{"scy"}) {
+		t.Fatalf("vmess dropped = %v", vm.Dropped)
+	}
+
+	// Every shape the fork builds keeps everything it set.
+	for _, shareURL := range []string{
+		"vless://" + tmplOwnerUUID + "@203.0.113.5:443?encryption=none&security=reality&flow=&type=h2&sni=www.example.com&pbk=Zm9v&fp=chrome#lr00rl",
+		"tuic://" + tmplOwnerUUID + ":" + tmplOwnerPass + "@203.0.113.5:9443?alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#lr00rl",
+	} {
+		scheme, _, _ := strings.Cut(shareURL, "://")
+		got, err := lineClientTemplateFromShareURL(shareURL, scheme)
+		if err != nil || got.Lossy() {
+			t.Fatalf("%s: template %+v err %v", scheme, got, err)
+		}
+	}
+}
+
+// A template value never takes the place of the identity's credential or the
+// endpoint: lineClientURI refuses a reserved key, which the builder never
+// keeps but a record from somewhere else could carry.
+func TestLineClientURIRefusesReservedParams(t *testing.T) {
+	for _, tc := range []struct {
+		protocol, key string
+	}{{"vmess", "id"}, {"vmess", "add"}, {"vmess", "port"}, {"vmess", "ps"}, {"vless", "flow"}} {
+		tmpl := store.LineClientTemplate{Protocol: tc.protocol, Host: "203.0.113.5", Port: 443, Params: map[string]string{"net": "tcp", tc.key: tmplOwnerUUID}}
+		if entry, err := lineClientURI(tmpl, lineUserCredentialPayload{UUID: tmplOtherUUID}, "x"); err == nil {
+			t.Fatalf("%s %s: want a refusal, got %s", tc.protocol, tc.key, entry)
+		}
 	}
 }
 

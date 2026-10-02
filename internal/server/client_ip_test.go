@@ -20,12 +20,17 @@ func TestResolveClientIP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	withLoopback, err := parseTrustedProxies([]string{"127.0.0.1", "::1", "172.18.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	cases := []struct {
 		name    string
 		remote  string
 		trust   bool
 		trusted []netip.Prefix
 		cf      string
+		xri     string
 		xff     []string
 		want    string
 	}{
@@ -44,6 +49,27 @@ func TestResolveClientIP(t *testing.T) {
 		{name: "hkg bridge CF", remote: "172.18.0.1:40000", trust: true, cf: "198.51.100.10", xff: []string{"198.51.100.10"}, want: "198.51.100.10"},
 		{name: "hkg bridge CF beats forged XFF", remote: "172.18.0.1:40000", trust: true, cf: "198.51.100.10", xff: []string{"6.6.6.6, 198.51.100.10"}, want: "198.51.100.10"},
 		{name: "hkg bridge client-sent CF is overwritten by nginx", remote: "172.18.0.1:40000", trust: true, cf: "198.51.100.10", xff: []string{"6.6.6.6, 198.51.100.10"}, want: "198.51.100.10"},
+
+		// hkg nginx as deployed: the peer is the compose network gateway
+		// 172.18.0.1; nginx sets CF-Connecting-IP and X-Real-IP to the client
+		// and appends the client to X-Forwarded-For. X-Real-IP is never read,
+		// so its value cannot move the answer.
+		{name: "nginx 172.18.0.1 fresh request", remote: "172.18.0.1:40000", trust: true, cf: "198.51.100.10", xri: "198.51.100.10", xff: []string{"198.51.100.10"}, want: "198.51.100.10"},
+		{name: "nginx 172.18.0.1 v6 client", remote: "172.18.0.1:40000", trust: true, cf: "2001:db8:1::7", xri: "2001:db8:1::7", xff: []string{"2001:db8:1::7"}, want: "2001:db8:1::7"},
+		{name: "nginx 172.18.0.1 client forged XFF is appended to", remote: "172.18.0.1:40000", trust: true, cf: "198.51.100.10", xri: "198.51.100.10", xff: []string{"6.6.6.6, 10.0.0.9, 198.51.100.10"}, want: "198.51.100.10"},
+		{name: "nginx 172.18.0.1 without CF reads XFF from the right", remote: "172.18.0.1:40000", trust: true, xri: "198.51.100.10", xff: []string{"6.6.6.6, 198.51.100.10"}, want: "198.51.100.10"},
+		{name: "nginx 172.18.0.1 X-Real-IP alone is not read", remote: "172.18.0.1:40000", trust: true, xri: "198.51.100.10", want: "172.18.0.1"},
+		{name: "nginx 172.18.0.1 trust off keeps the gateway", remote: "172.18.0.1:40000", cf: "198.51.100.10", xri: "198.51.100.10", xff: []string{"198.51.100.10"}, want: "172.18.0.1"},
+
+		// A public peer that reaches the server directly and sends the same
+		// headers nginx would: every one is a spoof, including values that
+		// claim a trusted or loopback origin.
+		{name: "public peer spoofs all three", remote: "203.0.113.20:5000", trust: true, cf: "198.51.100.7", xri: "198.51.100.7", xff: []string{"198.51.100.7"}, want: "203.0.113.20"},
+		{name: "public peer claims the gateway", remote: "203.0.113.20:5000", trust: true, cf: "172.18.0.1", xri: "172.18.0.1", xff: []string{"6.6.6.6, 172.18.0.1"}, want: "203.0.113.20"},
+		{name: "public peer claims loopback", remote: "203.0.113.20:5000", trust: true, cf: "127.0.0.1", xri: "127.0.0.1", xff: []string{"127.0.0.1"}, want: "203.0.113.20"},
+		{name: "public v6 peer spoofs all three", remote: "[2001:db8::5]:443", trust: true, cf: "198.51.100.7", xri: "198.51.100.7", xff: []string{"198.51.100.7, 10.0.0.1"}, want: "2001:db8::5"},
+		{name: "public peer spoof under narrow list", remote: "203.0.113.20:5000", trust: true, trusted: narrow, cf: "198.51.100.7", xri: "198.51.100.7", xff: []string{"198.51.100.7, 172.18.0.1"}, want: "203.0.113.20"},
+
 		// The same proxy reached over loopback (host networking).
 		{name: "loopback nginx CF", remote: "127.0.0.1:40000", trust: true, cf: "198.51.100.10", want: "198.51.100.10"},
 		{name: "loopback v6 nginx CF", remote: "[::1]:40000", trust: true, cf: "198.51.100.10", want: "198.51.100.10"},
@@ -65,11 +91,15 @@ func TestResolveClientIP(t *testing.T) {
 		{name: "invalid CF falls through to XFF", remote: "127.0.0.1:1", trust: true, cf: "garbage", xff: []string{"198.51.100.10"}, want: "198.51.100.10"},
 		{name: "trusted peer no headers", remote: "172.18.0.1:9", trust: true, want: "172.18.0.1"},
 
-		// An explicit list replaces the private ranges; loopback stays.
+		// An explicit list replaces the whole default, loopback included.
 		{name: "narrow list trusts named gateway", remote: "172.18.0.1:9", trust: true, trusted: narrow, cf: "198.51.100.10", want: "198.51.100.10"},
 		{name: "narrow list refuses other private peer", remote: "10.9.9.9:9", trust: true, trusted: narrow, cf: "198.51.100.10", want: "10.9.9.9"},
-		{name: "narrow list keeps loopback", remote: "127.0.0.1:9", trust: true, trusted: narrow, cf: "198.51.100.10", want: "198.51.100.10"},
-		{name: "narrow list XFF private client not skipped", remote: "127.0.0.1:9", trust: true, trusted: narrow, xff: []string{"6.6.6.6, 10.0.0.5, 172.18.0.1"}, want: "10.0.0.5"},
+		{name: "narrow list refuses loopback", remote: "127.0.0.1:9", trust: true, trusted: narrow, cf: "198.51.100.10", want: "127.0.0.1"},
+		{name: "narrow list refuses v6 loopback", remote: "[::1]:9", trust: true, trusted: narrow, cf: "198.51.100.10", want: "::1"},
+		{name: "narrow list XFF private client not skipped", remote: "172.18.0.1:9", trust: true, trusted: narrow, xff: []string{"6.6.6.6, 10.0.0.5, 172.18.0.1"}, want: "10.0.0.5"},
+		{name: "listed loopback is trusted", remote: "127.0.0.1:9", trust: true, trusted: withLoopback, cf: "198.51.100.10", want: "198.51.100.10"},
+		{name: "listed v6 loopback is trusted", remote: "[::1]:9", trust: true, trusted: withLoopback, cf: "198.51.100.10", want: "198.51.100.10"},
+		{name: "listed loopback still refuses other private peer", remote: "10.9.9.9:9", trust: true, trusted: withLoopback, cf: "198.51.100.10", want: "10.9.9.9"},
 
 		// Malformed RemoteAddr keeps today's raw fallback and trusts nothing.
 		{name: "remote without port", remote: "203.0.113.20", trust: true, cf: "198.51.100.7", want: "203.0.113.20"},
@@ -80,6 +110,9 @@ func TestResolveClientIP(t *testing.T) {
 			if tc.cf != "" {
 				h.Set("CF-Connecting-IP", tc.cf)
 			}
+			if tc.xri != "" {
+				h.Set("X-Real-IP", tc.xri)
+			}
 			for _, v := range tc.xff {
 				h.Add("X-Forwarded-For", v)
 			}
@@ -88,9 +121,34 @@ func TestResolveClientIP(t *testing.T) {
 				trusted = defaults
 			}
 			if got := resolveClientIP(tc.remote, h, tc.trust, trusted); got != tc.want {
-				t.Fatalf("resolveClientIP(%q, cf=%q, xff=%q) = %q, want %q", tc.remote, tc.cf, tc.xff, got, tc.want)
+				t.Fatalf("resolveClientIP(%q, cf=%q, xri=%q, xff=%q) = %q, want %q", tc.remote, tc.cf, tc.xri, tc.xff, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestDefaultTrustedProxiesAreLoopbackAndPrivateRanges(t *testing.T) {
+	want := []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"}
+	for _, entries := range [][]string{nil, {}, {" ", ""}, SplitTrustedProxies(" , \n")} {
+		got, err := EffectiveTrustedProxies(entries)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("entries %q: got %v, want %v", entries, got, want)
+		}
+		for i := range want {
+			if got[i].String() != want[i] {
+				t.Fatalf("entries %q: entry %d = %s, want %s", entries, i, got[i], want[i])
+			}
+		}
+	}
+	// The returned slice is a copy: a caller that edits it cannot widen
+	// the default for the next server.
+	got, _ := EffectiveTrustedProxies(nil)
+	got[0] = netip.MustParsePrefix("0.0.0.0/0")
+	if again, _ := EffectiveTrustedProxies(nil); again[0].String() != "127.0.0.0/8" {
+		t.Fatalf("default trusted set was mutated through a returned slice: %v", again)
 	}
 }
 

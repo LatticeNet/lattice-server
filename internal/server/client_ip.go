@@ -15,18 +15,22 @@ import (
 // the server runs in a Docker bridge network and the port is published on the
 // host's loopback, so a reverse proxy on the same host reaches the server
 // through docker-proxy and the server sees the bridge gateway (a 172.16/12
-// address by default), not 127.0.0.1. A loopback-only default would collapse
-// every client into that one gateway address, and with it every per-address
-// limiter: the agent limiter alone (10 rps, burst 40) would throttle a fleet of
-// a few dozen agents into looking offline.
+// address by default, 172.18.0.1 on hkg), not 127.0.0.1. A loopback-only
+// default would collapse every client into that one gateway address, and with
+// it every per-address limiter and every audit source address: the agent
+// limiter alone (10 rps, burst 40) would throttle a fleet of a few dozen agents
+// into looking offline.
 //
 // So the default is loopback plus the private-use and unique-local ranges,
 // the same shape as Express's "loopback, uniquelocal" preset. It still refuses
 // the case that matters most: a public peer that reaches the server directly
-// can no longer choose its own address with a header. Operators who know their
-// proxy's address narrow this with LATTICE_TRUSTED_PROXIES, which replaces the
-// private ranges (loopback stays trusted).
+// can no longer choose its own address with a header. LATTICE_TRUSTED_PROXIES
+// replaces this whole set, loopback included, so the logged set is exactly the
+// set the resolver checks; an operator whose proxy connects over loopback
+// lists 127.0.0.1 or ::1 there.
 var defaultTrustedProxies = []netip.Prefix{
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("::1/128"),
 	netip.MustParsePrefix("10.0.0.0/8"),
 	netip.MustParsePrefix("172.16.0.0/12"),
 	netip.MustParsePrefix("192.168.0.0/16"),
@@ -34,8 +38,9 @@ var defaultTrustedProxies = []netip.Prefix{
 }
 
 // parseTrustedProxies turns operator-supplied CIDRs or bare addresses into
-// prefixes. An empty list yields the default set. A malformed entry is an
-// error: guessing at a trust boundary is worse than refusing to start.
+// prefixes. An empty list yields the default set; a non-empty list is the
+// whole set. A malformed entry is an error: guessing at a trust boundary is
+// worse than refusing to start.
 func parseTrustedProxies(entries []string) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for _, raw := range entries {
@@ -64,6 +69,14 @@ func parseTrustedProxies(entries []string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
+// EffectiveTrustedProxies returns the set of peers whose forwarding headers
+// TrustProxy believes for the given LATTICE_TRUSTED_PROXIES entries: the
+// default set when the entries are empty, otherwise exactly the entries. The
+// server checks the same set, so the startup log can print it verbatim.
+func EffectiveTrustedProxies(entries []string) ([]netip.Prefix, error) {
+	return parseTrustedProxies(entries)
+}
+
 // SplitTrustedProxies splits the LATTICE_TRUSTED_PROXIES value, which may be
 // separated by commas or whitespace.
 func SplitTrustedProxies(v string) []string {
@@ -74,9 +87,6 @@ func SplitTrustedProxies(v string) []string {
 
 func isTrustedProxy(a netip.Addr, trusted []netip.Prefix) bool {
 	a = a.Unmap().WithZone("")
-	if a.IsLoopback() {
-		return true
-	}
 	for _, p := range trusted {
 		if p.Contains(a) {
 			return true

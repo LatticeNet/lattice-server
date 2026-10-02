@@ -81,10 +81,10 @@ type Options struct {
 	// that reaches the server directly cannot choose its own address.
 	TrustProxy bool
 	// TrustedProxies lists the CIDRs or addresses of the reverse proxies whose
-	// forwarding headers are believed under TrustProxy. Loopback is always
-	// trusted. Empty means loopback plus the private-use and unique-local
-	// ranges, which covers a proxy reaching the server through a Docker
-	// bridge. A malformed entry fails New.
+	// forwarding headers are believed under TrustProxy. Empty means loopback
+	// plus the private-use and unique-local ranges, which covers a proxy
+	// reaching the server through a Docker bridge. A non-empty list replaces
+	// that default entirely, loopback included. A malformed entry fails New.
 	TrustedProxies []string
 	// RequireTOTP forces interactive user sessions to enable TOTP before they can
 	// use non-setup APIs. Existing password/SSO login still issues a session so
@@ -168,7 +168,7 @@ type Server struct {
 	webFS         fs.FS
 	secureCookies bool
 	trustProxy    bool
-	// trustedProxies is the parsed TrustedProxies set (loopback is implied).
+	// trustedProxies is the effective set parsed from TrustedProxies.
 	trustedProxies []netip.Prefix
 	requireTOTP    bool
 	logger         *log.Logger

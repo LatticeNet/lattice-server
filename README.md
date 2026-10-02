@@ -274,12 +274,15 @@ Use the compose file and deployment guide in the umbrella repository:
   deployments use the socket remote address, while `CF-Connecting-IP` /
   `X-Forwarded-For` are honored only when the server is explicitly configured
   with `TrustProxy` (`LATTICE_TRUST_PROXY=1`) and the immediate peer is a
-  trusted proxy. Loopback is always trusted; `LATTICE_TRUSTED_PROXIES` (CIDRs
-  or addresses) names the rest, and when it is empty the private-use and
-  unique-local ranges are trusted so a proxy reaching the server through a
-  Docker bridge keeps working. `X-Forwarded-For` is read from the right,
-  skipping trusted hops, so a client-supplied leftmost entry cannot choose the
-  address.
+  trusted proxy. By default the trusted set is loopback plus the private-use
+  and unique-local ranges (`127.0.0.0/8`, `::1`, `10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), so a reverse proxy that
+  reaches a containerized server through the Docker bridge gateway keeps
+  per-client limits and audit source addresses. `LATTICE_TRUSTED_PROXIES`
+  (CIDRs or addresses) replaces that set entirely, loopback included, and the
+  server logs the effective set once at startup. `X-Forwarded-For` is read
+  from the right, skipping trusted hops, so a client-supplied leftmost entry
+  cannot choose the address; `X-Real-IP` is not read.
 - Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
   advisory telemetry only. They are sanitized and clamped server-side and must
   not be used for authorization or policy decisions.

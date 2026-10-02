@@ -433,33 +433,59 @@ func (s *Server) requireLineUserOnLine(userID, lineHashID string) error {
 	}
 }
 
-// openLineUserRemove finds a removal of userID from lineHashID that is still
-// open: pending, or approved with its task not yet reported (approve-only is
-// refused for line-user plans, and a failed task returns the approval to
-// pending). The "not bound" refusal used to stop a second removal once the
-// first applied; a removal no longer needs a binding, so a second one filed
-// while the first is open is refused here, so the operator decides the open
-// one. An applied removal is covered by requireLineUserOnLine.
-func (s *Server) openLineUserRemove(userID, lineHashID string) (model.Approval, bool) {
+// openLineUserRemove finds a removal of userID from lineHashID that can still
+// act, and says why: pending, so an operator can still approve or reject it,
+// or approved with a live task (queued or leased) for it. The "not bound"
+// refusal used to stop a second removal once the first applied; a removal no
+// longer needs a binding, so a second one filed while the first can still
+// act is refused here. An applied removal is covered by requireLineUserOnLine.
+//
+// An approved removal with no live task is not open. It can never be decided
+// again (reject acts only on pending, approve is a no-op past pending, and
+// dismiss refuses line-user plans), so counting it would block every later
+// removal of the user from the line for good, a bound user's included. That
+// covers a cancelled task, and a task that finished with a result nobody
+// recorded. A task that stays queued because its node never reports is live
+// until an operator cancels it.
+func (s *Server) openLineUserRemove(userID, lineHashID string) (string, bool) {
 	requestSHA := lineUserRequestSHA(userID, lineHashID)
+	var live map[string]model.Task
 	for _, a := range s.store.Approvals() {
 		if a.Plugin != singBoxLineUserPlugin || a.Method != "apply_"+lineUserOpRemove || a.RequestSHA256 != requestSHA {
 			continue
 		}
-		if a.Status == model.ApprovalPending || a.Status == model.ApprovalApproved {
-			return a, true
+		switch a.Status {
+		case model.ApprovalPending:
+			return fmt.Sprintf("pending as approval %s; approve or reject it before filing another", a.ID), true
+		case model.ApprovalApproved:
+			if live == nil {
+				live = map[string]model.Task{}
+				for _, task := range s.store.Tasks() {
+					if task.ApprovalID != "" && (task.Status == model.TaskQueued || task.Status == model.TaskLeased) {
+						live[task.ApprovalID] = task
+					}
+				}
+			}
+			if task, ok := live[a.ID]; ok {
+				return fmt.Sprintf("approved as approval %s, and its task %s is %s; wait for its result, or cancel the task while it is queued, before filing another", a.ID, task.ID, task.Status), true
+			}
 		}
 	}
-	return model.Approval{}, false
+	return "", false
 }
 
 // fileLineUserPlan stores plan as a pending line-user approval, records the
 // plan audit event with extra metadata, and answers the approval.
 func (s *Server) fileLineUserPlan(ctxPrincipal principal, plan lineUserPlan, extra map[string]string) ([]byte, error) {
+	// No lock covers the check and the store write below, and plan filing has
+	// none to reuse, so two concurrent removals of the same user from the same
+	// line can both pass it. The cost is bounded: both name the same derived
+	// on-box user, so the second can remove nothing the first did not, and at
+	// worst its task fails and returns it to pending for an operator to reject.
 	if plan.Op == lineUserOpRemove {
 		if open, ok := s.openLineUserRemove(plan.UserID, plan.LineHashID); ok {
-			return nil, fmt.Errorf("a removal of user %q from line %q is already %s as approval %s; decide that one before filing another",
-				plan.UserID, plan.LineHashID, open.Status, open.ID)
+			return nil, fmt.Errorf("a removal of user %q from line %q is already %s",
+				plan.UserID, plan.LineHashID, open)
 		}
 	}
 	planJSON, err := json.Marshal(plan)

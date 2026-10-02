@@ -401,9 +401,11 @@ func TestADeletedUserIsPlannedOnlyForRemovalFromAnAdoptedLine(t *testing.T) {
 }
 
 // A second removal of the same user from the same line is refused while the
-// first is open, pending or approved with its task in flight, and again
-// after a failed run returns it to pending. Once the first is rejected a new
-// one can be filed. The same holds for a user that has been deleted.
+// first can still act: pending, approved with a live task, and pending again
+// after a failed run. Once the first is rejected a new one can be filed, and
+// an approved removal whose task was cancelled, which nothing can decide
+// again, does not block the next one. The same holds for a user that has
+// been deleted.
 func TestASecondRemovalWaitsForTheOpenOne(t *testing.T) {
 	srv := newLinemetaTestServer(t, mustOpenStore(t))
 	line, u := seedLineUserFixture(t, srv)
@@ -441,8 +443,33 @@ func TestASecondRemovalWaitsForTheOpenOne(t *testing.T) {
 	if rec := decideApproval(srv, "reject", `{"approval_id":"`+first.ID+`"}`, decider); rec.Code != 200 {
 		t.Fatalf("reject: %d %s", rec.Code, rec.Body.String())
 	}
+	second := filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+
+	// Approved with a live task, it is still open, and the refusal names the
+	// task and its status.
+	if err := approvePlan(t, srv, second); err != nil {
+		t.Fatalf("approve the second removal: %v", err)
+	}
+	secondTasks := tasksFor(srv, second.ID)
+	if len(secondTasks) != 1 || secondTasks[0].Status != model.TaskQueued {
+		t.Fatalf("the second removal's tasks = %+v, want one queued", secondTasks)
+	}
+	refused(t, u.ID, second, "approved")
+	if err := plan(u.ID); err == nil || !strings.Contains(err.Error(), "its task "+secondTasks[0].ID+" is queued") {
+		t.Fatalf("the refusal must name the live task: %v", err)
+	}
+
+	// Approved with no live task it can never act or be decided again, so it
+	// must not block the next removal. Cancelling the queued task leaves the
+	// approval approved.
+	if _, err := srv.store.CancelTask(secondTasks[0].ID); err != nil {
+		t.Fatalf("cancel the queued task: %v", err)
+	}
+	if stored, _ := srv.store.Approval(second.ID); stored.Status != model.ApprovalApproved {
+		t.Fatalf("after the cancel the approval is %q, want it still approved", stored.Status)
+	}
 	if err := plan(u.ID); err != nil {
-		t.Fatalf("a removal after the open one was rejected: %v", err)
+		t.Fatalf("a removal after the approved one lost its task: %v", err)
 	}
 
 	deleted := seedMintedLineUser(t, srv)

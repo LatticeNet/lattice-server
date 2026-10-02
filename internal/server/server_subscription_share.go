@@ -218,8 +218,28 @@ func subscriptionResponseContentType(format, target string) string {
 // figures, which only the provider knows, so it cannot be derived the way the
 // content type is. It is passed through under two limits instead. Go's header
 // serialiser neutralises CR and LF, so it cannot start a second header, and
-// subscriptionUserinfoForResponse bounds its length, so it cannot be used to
-// spend the response envelope. Nothing else a source returns reaches a header.
+// subscriptionUserinfoForResponse bounds its length and keeps only the fields
+// clients read, so it cannot be used to spend the response envelope. Nothing
+// else a source returns reaches a header.
+//
+// This is the one serving core for every link kind. Share links pass through
+// it today, and identity links are meant to pass through the same stages as
+// one more source kind rather than a second handler:
+//
+//   - resolve the token through the store's HMAC index, one rule for every
+//     kind (exactly one match, or the decoy);
+//   - decide reachability (enabled, unexpired; for an identity, its policy
+//     state) and refuse with the decoy, audited through the refusal throttle;
+//   - plan the render (planShareRender): the client target, the envelope, and
+//     a cache key that holds only what changes the bytes;
+//   - look the body up against the source's current content version
+//     (GetVersioned), so a body the source moved past is never served; the
+//     only stale body ever served is a plugin source's last good one during a
+//     provider outage;
+//   - on a miss, render once per key (renderShareShared) within the link's
+//     render budget;
+//   - answer first (writeShareBody: length, validator, 304, gzip, and the
+//     client headers), then count the fetch (noteShareFetch).
 func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request) {
 	// Every rejection below writes the same decoy and audits the real reason.
 	// The audit is where an operator finds out what happened; the response is

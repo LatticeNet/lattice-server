@@ -2956,11 +2956,12 @@ func (s *Server) agentEnrollCommands(serverURL, nodeID, token string, launch mod
 		shellQuote(token),
 		manualFlags,
 	)
-	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s ./lattice-agent-install.sh",
+	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s%s ./lattice-agent-install.sh",
 		agentInstallScriptDownloadCommand(),
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		shellQuote(token),
+		agentInstallVersionEnv(),
 		env,
 	)
 	return map[string]string{
@@ -3015,10 +3016,11 @@ func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Req
 
 func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model.AgentLaunchConfig) map[string]string {
 	env := agentLaunchEnv(launch)
-	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s ./lattice-agent-install.sh",
+	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s%s ./lattice-agent-install.sh",
 		agentInstallScriptDownloadCommand(),
 		shellQuote(serverURL),
 		shellQuote(nodeID),
+		agentInstallVersionEnv(),
 		env,
 	)
 	manual := fmt.Sprintf("lattice-agent -server %s -node-id %s%s",
@@ -3029,9 +3031,26 @@ func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model
 	return map[string]string{"linux": linux, "manual": manual}
 }
 
+// agentInstallerRef is the stable lattice-node-agent release that enroll and
+// reconfigure commands install from. The installer is fetched at this tag and
+// told to download the binary of the same tag, so the script and the binary
+// it installs always come from one release. A branch ref here (main) once
+// paired a July installer with whatever binary was latest. Move it with each
+// stable agent cut; the site's release-pin check fails on a stale ref.
+const agentInstallerRef = "v0.3.9"
+
+func agentInstallScriptURL() string {
+	return "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/" + agentInstallerRef + "/scripts/install.sh"
+}
+
 func agentInstallScriptDownloadCommand() string {
-	const installURL = "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
-	return fmt.Sprintf("curl -fsSL --proto '=https' --tlsv1.2 %s -o lattice-agent-install.sh", shellQuote(installURL))
+	return fmt.Sprintf("curl -fsSL --proto '=https' --tlsv1.2 %s -o lattice-agent-install.sh", shellQuote(agentInstallScriptURL()))
+}
+
+// agentInstallVersionEnv pins the binary the installer downloads to the
+// installer's own release instead of the installer's "latest" default.
+func agentInstallVersionEnv() string {
+	return " LATTICE_AGENT_VERSION=" + shellQuote(agentInstallerRef)
 }
 
 func normalizeAgentLaunchConfig(in model.AgentLaunchConfig) model.AgentLaunchConfig {

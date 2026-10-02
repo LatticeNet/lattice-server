@@ -49,6 +49,7 @@ type NodeCascadeReport struct {
 	Tunnels                     int `json:"tunnels"`
 	GuardRealitySnapshots       int `json:"guard_reality_snapshots"`
 	GuardBindings               int `json:"guard_bindings"`
+	SingBoxLiveness             int `json:"singbox_liveness"`
 	ManagedLines                int `json:"managed_lines"`
 	LineChainAttemptsReleased   int `json:"line_chain_attempts_released"`
 	LineChainDefinitionsDeleted int `json:"line_chain_definitions_deleted"`
@@ -587,6 +588,19 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		report.GuardBindings++
 		if mutate {
 			delete(s.state.GuardBindings, nodeID)
+		}
+	}
+
+	// Step 17c: the node's sing-box liveness record (node-owned).
+	//
+	// It carries the open incident: when the problem started and whether it
+	// was already notified. Left behind, a node enrolled again under the same
+	// id inherits that episode, so its first real outage can go unannounced
+	// and its first healthy report can announce a recovery from nothing.
+	if _, ok := s.state.SingBoxLiveness[nodeID]; ok {
+		report.SingBoxLiveness++
+		if mutate {
+			delete(s.state.SingBoxLiveness, nodeID)
 		}
 	}
 

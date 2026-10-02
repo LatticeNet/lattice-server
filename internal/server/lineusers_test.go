@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -162,6 +163,208 @@ func TestApprovingALineUserPlanQueuesItsApply(t *testing.T) {
 	}
 	if tasks := tasksFor(managedSrv, managedAdd.ID); len(tasks) != 1 || !strings.Contains(tasks[0].Script, "/etc/sing-box/config.json") {
 		t.Fatalf("approved managed add must queue the full config apply: %+v", tasks)
+	}
+}
+
+// lineUserAudit returns the audit events with action that name approvalID.
+func lineUserAudit(srv *Server, action, approvalID string) []model.AuditEvent {
+	var out []model.AuditEvent
+	for _, ev := range srv.store.AuditEvents() {
+		if ev.Action == action && ev.Metadata["approval_id"] == approvalID {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// lineUserBoundTo reports whether userID holds an enabled binding to lineHashID.
+func lineUserBoundTo(t *testing.T, srv *Server, userID, lineHashID string) bool {
+	t.Helper()
+	u, ok := srv.getVpnUser(userID)
+	if !ok {
+		t.Fatalf("user %q disappeared", userID)
+	}
+	return vpnUserHasEnabledBinding(u, lineHashID)
+}
+
+// From a102 an approved line-user plan runs sb user add or sb user del on an
+// adopted node, which production has never done. Each op is pinned end to
+// end: the one task approval queues, the node it targets, the exact argv it
+// runs, the approve audit event, and what the task result then does to the
+// binding and the approval, on a failed run and on a successful retry.
+func TestApprovedAdoptedLineUserPlanRunsTheReviewedArgv(t *testing.T) {
+	const prelude = "set -e\n" +
+		"SB_BIN=\"${LATTICE_SINGBOX_BIN:-sb}\"\n" +
+		"command -v \"$SB_BIN\" >/dev/null 2>&1 || { echo 'lattice lineuser: sb binary not found' >&2; exit 1; }\n"
+	// The payload is spelled out rather than re-derived, so a change to the
+	// credential bytes that reach sb fails here.
+	userAdd := func(name string) string {
+		return `"$SB_BIN" --json user add 'hub-a' '{"name":"` + name +
+			`","uuid":"9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d","flow":"xtls-rprx-vision"}'` + "\n"
+	}
+	userDel := func(name string) string {
+		return `"$SB_BIN" user del 'hub-a' '` + name + `'` + "\n"
+	}
+	cases := []struct {
+		op         string
+		boundFirst bool
+		argv       func(name string) string
+		boundAfter bool
+	}{
+		{op: lineUserOpAdd, boundFirst: false, argv: userAdd, boundAfter: true},
+		{op: lineUserOpUpdate, boundFirst: true, argv: userAdd, boundAfter: true},
+		{op: lineUserOpRemove, boundFirst: true, argv: userDel, boundAfter: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.op, func(t *testing.T) {
+			srv := newLinemetaTestServer(t, mustOpenStore(t))
+			line, u := seedLineUserFixture(t, srv)
+			if !tc.boundFirst {
+				u.Bindings = nil
+				if err := srv.putVpnUser(u); err != nil {
+					t.Fatal(err)
+				}
+			}
+			approval := filePlan(t, srv, tc.op, u.ID, line.LineHashID)
+			if err := approvePlan(t, srv, approval); err != nil {
+				t.Fatalf("approve: %v", err)
+			}
+			tasks := tasksFor(srv, approval.ID)
+			if len(tasks) != 1 {
+				t.Fatalf("approval queued %d tasks, want 1: %+v", len(tasks), tasks)
+			}
+			first := tasks[0]
+			if len(first.Targets) != 1 || first.Targets[0] != "node-a" {
+				t.Fatalf("task targets = %q, want exactly [node-a]", first.Targets)
+			}
+			want := prelude + tc.argv(userLineName(u.ID, line.LineUUID))
+			if first.Script != want {
+				t.Fatalf("task script:\n%s\nwant:\n%s", first.Script, want)
+			}
+			approves := lineUserAudit(srv, "network.singbox-lineuser.approve", approval.ID)
+			if len(approves) != 1 || approves[0].Scope != "network:apply,vpncore:admin" ||
+				approves[0].ActorID != "op-1" || approves[0].NodeID != "node-a" {
+				t.Fatalf("approve audit = %+v, want one event by op-1 on node-a under network:apply,vpncore:admin", approves)
+			}
+
+			request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
+			if err := srv.handleApprovalTaskResult(request, first, model.TaskResult{
+				TaskID: first.ID, NodeID: "node-a", ExitCode: 1, Error: "sb: inbound hub-a not found",
+			}); err != nil {
+				t.Fatalf("failed result: %v", err)
+			}
+			stored, _ := srv.store.Approval(approval.ID)
+			if stored.Status != model.ApprovalPending || stored.Reason != "execution failed: sb: inbound hub-a not found" {
+				t.Fatalf("after a failed run: status %q reason %q, want pending with the failure", stored.Status, stored.Reason)
+			}
+			if got := lineUserBoundTo(t, srv, u.ID, line.LineHashID); got != tc.boundFirst {
+				t.Fatalf("after a failed run bound = %v, want it unchanged at %v", got, tc.boundFirst)
+			}
+			if failed := lineUserAudit(srv, "vpnuser.line.failed", approval.ID); len(failed) != 1 {
+				t.Fatalf("failed-run audit = %+v, want one event", failed)
+			}
+
+			// The failure returned the approval to pending, so the same plan
+			// approves again and its second run reconciles.
+			if err := approvePlan(t, srv, stored); err != nil {
+				t.Fatalf("re-approve after a failed run: %v", err)
+			}
+			tasks = tasksFor(srv, approval.ID)
+			if len(tasks) != 2 {
+				t.Fatalf("re-approval left %d tasks, want 2: %+v", len(tasks), tasks)
+			}
+			retry := tasks[0]
+			if retry.ID == first.ID {
+				retry = tasks[1]
+			}
+			if retry.Script != want || len(retry.Targets) != 1 || retry.Targets[0] != "node-a" {
+				t.Fatalf("retry task = %+v, want the same argv on node-a", retry)
+			}
+			if err := srv.handleApprovalTaskResult(request, retry, model.TaskResult{TaskID: retry.ID, NodeID: "node-a"}); err != nil {
+				t.Fatalf("successful result: %v", err)
+			}
+			stored, _ = srv.store.Approval(approval.ID)
+			if stored.Status != model.ApprovalApplied || stored.Reason != "" {
+				t.Fatalf("after a successful run: status %q reason %q, want applied", stored.Status, stored.Reason)
+			}
+			if got := lineUserBoundTo(t, srv, u.ID, line.LineHashID); got != tc.boundAfter {
+				t.Fatalf("after a successful run bound = %v, want %v", got, tc.boundAfter)
+			}
+			if applied := lineUserAudit(srv, "vpnuser.line.applied", approval.ID); len(applied) != 1 {
+				t.Fatalf("applied audit = %+v, want one event", applied)
+			}
+		})
+	}
+}
+
+// queue_apply=false approves the plan and queues nothing.
+func TestApprovingALineUserPlanWithoutQueueApplyQueuesNothing(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	u.Bindings = nil
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	approval := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
+	tasksBefore := len(srv.store.Tasks())
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	if _, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, false, planSHA); err != nil {
+		t.Fatalf("approve without queue_apply: %v", err)
+	}
+	if got := len(srv.store.Tasks()); got != tasksBefore {
+		t.Fatalf("approve without queue_apply queued %d task(s)", got-tasksBefore)
+	}
+	if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalApproved {
+		t.Fatalf("status = %q, want approved", stored.Status)
+	}
+	if lineUserBoundTo(t, srv, u.ID, line.LineHashID) {
+		t.Fatal("approving without queue_apply must not bind the user")
+	}
+}
+
+// From 86422a1 until dd75324 approving a line-user plan with queue_apply
+// stored it approved with no task. Approving such an approval again must stay
+// the no-op the approve path promises any decided approval, with or without
+// queue_apply: no task, no audit event, no change to the approval or the
+// user, so nothing can run a plan nobody re-reviewed.
+func TestApprovingAStrandedLineUserApprovalChangesNothing(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	u.Bindings = nil
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	approval := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
+	approval.Status = model.ApprovalApproved
+	approval.ApprovedBy = "op-1"
+	if err := srv.store.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := srv.store.Approval(approval.ID)
+	userBefore, _ := srv.getVpnUser(u.ID)
+	tasksBefore := len(srv.store.Tasks())
+	auditsBefore := len(srv.store.AuditEvents())
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	for _, queueApply := range []bool{true, false} {
+		got, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), before, queueApply, planSHA)
+		if err != nil {
+			t.Fatalf("approve an approved approval (queue_apply=%v): %v", queueApply, err)
+		}
+		if !reflect.DeepEqual(got, before) {
+			t.Fatalf("approve returned a changed approval (queue_apply=%v):\n%+v\nwant\n%+v", queueApply, got, before)
+		}
+	}
+	if after, _ := srv.store.Approval(approval.ID); !reflect.DeepEqual(after, before) {
+		t.Fatalf("stored approval changed:\n%+v\nwant\n%+v", after, before)
+	}
+	if got := len(srv.store.Tasks()); got != tasksBefore {
+		t.Fatalf("approving an approved approval queued %d task(s)", got-tasksBefore)
+	}
+	if got := len(srv.store.AuditEvents()); got != auditsBefore {
+		t.Fatalf("approving an approved approval wrote %d audit event(s)", got-auditsBefore)
+	}
+	if userAfter, _ := srv.getVpnUser(u.ID); !reflect.DeepEqual(userAfter, userBefore) {
+		t.Fatalf("user changed:\n%+v\nwant\n%+v", userAfter, userBefore)
 	}
 }
 

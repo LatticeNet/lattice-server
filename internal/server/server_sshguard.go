@@ -11,7 +11,6 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/netguard"
-	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/sshguard"
 )
 
@@ -130,7 +129,9 @@ func (s *Server) sshGuardNodeReality(nodeID string) sshguard.NodeReality {
 	if err != nil {
 		return out
 	}
-	out.GuardAcceptedTCPPorts, out.GuardAcceptsAllTCP = guardAcceptedTCPPorts(plan)
+	// First match wins: a drop on a gate port rendered ahead of its allow
+	// leaves the port closed, which a list of accepted ports cannot show.
+	out.GuardAcceptsTCP = func(port int) bool { return netguard.AcceptsTCPPort(plan, port) }
 	return out
 }
 
@@ -165,31 +166,6 @@ func guardBindingGuardsNode(binding model.NodeGuardBinding, reality *model.Guard
 		return true
 	}
 	return reality != nil && strings.TrimSpace(reality.ManagedSHA) != ""
-}
-
-// guardAcceptedTCPPorts collects every TCP port a compiled guard plan can
-// accept. It is deliberately generous in the same direction netguard's own
-// lint is: a rule with no port list accepts all ports, and an any-protocol
-// accept covers TCP. Being generous here means the override finding fires only
-// when there is genuinely no acceptance, which keeps it a signal.
-func guardAcceptedTCPPorts(plan network.NFTPlan) ([]int, bool) {
-	ports := append([]int{}, plan.PublicTCP...)
-	ports = append(ports, plan.WireGuardTCP...)
-	for _, rule := range plan.InputRules {
-		if rule.Action != network.NFTActionAccept {
-			continue
-		}
-		switch rule.Protocol {
-		case network.NFTProtoAny:
-			return ports, true
-		case network.NFTProtoTCP:
-			if len(rule.Ports) == 0 {
-				return ports, true
-			}
-			ports = append(ports, rule.Ports...)
-		}
-	}
-	return ports, false
 }
 
 type sshGuardPlanRequest struct {

@@ -18,10 +18,14 @@ import (
 // competing default-drop input hook can appear.
 //
 // Rule shapes that exactly match the legacy broad-port allows take a fast path
-// into the plan's Public*/WireGuard* port lists. Everything else compiles to
-// typed network.NFTInputRule values, which the renderer emits BEFORE those
-// broad allows — that ordering is what lets a targeted deny override an
-// otherwise-open service port. (design-13 §4.4)
+// into the plan's Public*/WireGuard* port lists, which the renderer emits after
+// every typed network.NFTInputRule. That keeps a converted legacy baseline
+// byte-identical, but it also moves those allows behind every other rule, so
+// it is only taken while the binding has no enabled deny. With a deny present
+// every rule lowers to an InputRule in authored order (trusted zones, node
+// overrides, then groups in binding order), and the chain's first-match
+// evaluation follows what the operator wrote. (design-13 §4.4; the NetGuard
+// security-groups design, section 2.4)
 
 // MaxExpandedPortsPerRule bounds range expansion. The current renderer emits
 // explicit port lists, so a very wide range would produce an unreadable,
@@ -88,11 +92,22 @@ func Compile(in CompileInput) (network.NFTPlan, error) {
 		ordered = append(ordered, group.Rules...)
 	}
 
+	// The fast path is safe only while nothing can be shadowed by moving an
+	// allow to the end of the chain, which is true exactly when no enabled
+	// rule drops. All converted legacy baselines are allow-only.
+	fastPath := true
+	for _, rule := range ordered {
+		if !rule.Disabled && rule.Action == model.NetRuleDeny {
+			fastPath = false
+			break
+		}
+	}
+
 	for _, rule := range ordered {
 		if rule.Disabled {
 			continue
 		}
-		if err := lowerRule(&plan, rule, in); err != nil {
+		if err := lowerRule(&plan, rule, in, fastPath); err != nil {
 			return network.NFTPlan{}, fmt.Errorf("rule %q: %w", rule.ID, err)
 		}
 	}
@@ -112,7 +127,7 @@ func CompileRuleset(in CompileInput) (string, error) {
 	return network.GenerateNFTPlan(plan)
 }
 
-func lowerRule(plan *network.NFTPlan, rule model.GuardRule, in CompileInput) error {
+func lowerRule(plan *network.NFTPlan, rule model.GuardRule, in CompileInput, fastPath bool) error {
 	if rule.Direction != model.NetDirIngress {
 		return fmt.Errorf("direction %q is not compiled into the guard table (egress stays with netpolicy)", rule.Direction)
 	}
@@ -145,9 +160,23 @@ func lowerRule(plan *network.NFTPlan, rule model.GuardRule, in CompileInput) err
 	}
 
 	// Fast path: exactly the legacy broad-allow shape. Preserving it is what
-	// makes converted legacy baselines render byte-identically.
+	// makes converted legacy baselines render byte-identically. With the fast
+	// path off the same rule keeps the broad list's exact match, the public
+	// interface or the wireguard range, but renders in its authored position.
 	if fast := fastPathBucket(plan, rule, ports); fast != nil {
-		*fast = append(*fast, ports...)
+		if fastPath {
+			*fast = append(*fast, ports...)
+			return nil
+		}
+		ordered := network.NFTInputRule{
+			Protocol: rule.Protocol, Ports: ports, Action: network.NFTActionAccept, Comment: ruleComment(rule),
+		}
+		if rule.Remote.ZoneID == model.GuardZonePublic {
+			ordered.Interface = plan.InterfaceName
+		} else {
+			ordered.SourceCIDRs = []string{plan.WireGuardCIDR}
+		}
+		plan.InputRules = append(plan.InputRules, ordered)
 		return nil
 	}
 

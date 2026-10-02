@@ -350,6 +350,10 @@ func (s *Server) migrateProxyUsersToVpnUsers() error {
 				UpdatedAt:             s.now(),
 			}
 			publicRecords[vid], privateRecords[vid] = splitVpnUserRecord(u)
+			// Named because this is also how an identity deleted before its
+			// delete removed the legacy proxy user comes back: nothing else
+			// records that it was deleted, so the operator finds it here.
+			s.logger.Printf("migrate vpn users: derived identity %s from proxy user %s, which had no identity", vid, pu.ID)
 		}
 		return store.LineSecretMigrationBuild{
 			VpnUsers: publicRecords, VpnUserSecrets: privateRecords,
@@ -416,9 +420,24 @@ func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, r
 		if !ok {
 			return nil, fmt.Errorf("vpn-core/users-admin delete: user %q not found", id)
 		}
-		if user.MigratedFromProxyUser == "" {
-			if err := s.store.DeleteProxyUser(id); err != nil {
-				return nil, fmt.Errorf("delete canonical usage projection: %w", err)
+		if err := s.vpnUserDeleteRefusal(id); err != nil {
+			return nil, fmt.Errorf("vpn-core/users-admin delete: %w", err)
+		}
+		// Every boot runs migrateProxyUsersToVpnUsers, which derives vu_<id>
+		// for any proxy user that has no identity, copying its sub token into
+		// SubID. A proxy user left behind here is therefore the deleted
+		// identity, token included, at the next restart: the legacy user a
+		// migrated identity came from, and the usage projection stored under
+		// the identity's own id. Both go before the identity record, so a
+		// failure in between leaves an identity that a second delete
+		// finishes, never a legacy user with no identity.
+		legacy := []string{id}
+		if user.MigratedFromProxyUser != "" {
+			legacy = append(legacy, user.MigratedFromProxyUser)
+		}
+		for _, proxyUserID := range legacy {
+			if err := s.store.DeleteProxyUser(proxyUserID); err != nil {
+				return nil, fmt.Errorf("delete proxy user %q behind identity %q: %w", proxyUserID, id, err)
 			}
 		}
 		if err := s.deleteVpnUser(id); err != nil {

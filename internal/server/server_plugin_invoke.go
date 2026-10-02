@@ -304,7 +304,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		case s.pluginRPC == nil:
 			err = errors.New("plugin rpc bus unavailable")
 		default:
-			out, err = s.pluginRPC.CallOperator(ctx, req.Service, req.Method, []byte(payload))
+			out, err = s.callCoreServiceForOperator(ctx, req.Service, req.Method, []byte(payload))
 			if errors.Is(err, plugin.ErrRPCNoService) {
 				out, err = s.callRuntimePluginService(ctx, req.ID, req.Service, req.Method, payload, nil, nil)
 			}
@@ -399,7 +399,7 @@ func (s *Server) dispatchV2PluginCall(
 			return nil, fmt.Errorf("plugin %q declares service %q as core-backed, but no core provider owns it",
 				pluginID, service)
 		}
-		return s.pluginRPC.CallOperator(ctx, service, method, []byte(payload))
+		return s.callCoreServiceForOperator(ctx, service, method, []byte(payload))
 	default:
 		if coreOwns {
 			// A runtime-backed service shadowed by a core provider is exactly the
@@ -418,6 +418,27 @@ func (s *Server) dispatchV2PluginCall(
 		}
 		return s.callRuntimePluginService(ctx, pluginID, service, method, payload, operatorTargets, methodContract.Budget)
 	}
+}
+
+// operatorCoreCallKey marks a context as the operator's own gateway call to
+// one core-owned service, and carries that service's name. A core provider
+// reads it with operatorCalledCoreService to tell the operator's direct call
+// from the same service reached by a plugin's rpc:call while that plugin
+// serves the operator: both contexts carry the operator principal, and only
+// the first answers the operator verbatim.
+type operatorCoreCallKey struct{}
+
+// callCoreServiceForOperator is the gateway's call into a core provider on
+// the operator's behalf, marked with the service called.
+func (s *Server) callCoreServiceForOperator(ctx context.Context, service, method string, payload []byte) ([]byte, error) {
+	return s.pluginRPC.CallOperator(context.WithValue(ctx, operatorCoreCallKey{}, service), service, method, payload)
+}
+
+// operatorCalledCoreService returns the core service the operator called
+// directly through the plugin gateway, or "" when ctx carries no such mark.
+func operatorCalledCoreService(ctx context.Context) string {
+	service, _ := ctx.Value(operatorCoreCallKey{}).(string)
+	return service
 }
 
 // principalFromContext recovers the operator the gateway stamped onto the invocation

@@ -159,35 +159,84 @@ func TestCompileRefusesTrustingPublicZone(t *testing.T) {
 	}
 }
 
-// A targeted deny must beat an otherwise-open broad service port, which is
-// only true because InputRules render before the fast-path allows.
-func TestDenyRuleRendersBeforeBroadAllow(t *testing.T) {
-	ruleset, err := CompileRuleset(CompileInput{
-		Binding: model.NodeGuardBinding{NodeID: "n1", Managed: true},
-		Groups: []model.SecurityGroup{{ID: "sg", Rules: []model.GuardRule{
-			{
-				ID: "open-1234", Action: model.NetRuleAllow, Direction: model.NetDirIngress,
-				Protocol: model.NetProtoTCP, Ports: []model.GuardPortRange{{From: 1234, To: 1234}},
-				Remote: model.NetEndpoint{Kind: model.NetRefZone, ZoneID: model.GuardZonePublic},
-			},
-			{
-				ID: "deny-bad-peer", Action: model.NetRuleDeny, Direction: model.NetDirIngress,
-				Protocol: model.NetProtoTCP, Ports: []model.GuardPortRange{{From: 1234, To: 1234}},
-				Remote: model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "198.51.100.7/32"},
-			},
-		}}},
-		Zones:   ZoneMap([]model.GuardZone{{ID: model.GuardZonePublic, Interfaces: []string{"eth0"}}}),
-		Resolve: noNodes,
+// Once a binding carries an enabled deny, every rule renders where it was
+// authored: node overrides, then groups in binding order, then each group's
+// own order. The fast path used to divert a public or wireguard allow into the
+// broad port lists, which render after every InputRule, so a deny always beat
+// an allow wherever either sat, and a node override allowing a port lost to a
+// fleet group denying it. The allow now renders in its own position with the
+// broad list's exact match.
+func TestADenyRendersEveryRuleInAuthoredOrder(t *testing.T) {
+	allow := model.GuardRule{
+		ID: "open-1234", Action: model.NetRuleAllow, Direction: model.NetDirIngress,
+		Protocol: model.NetProtoTCP, Ports: []model.GuardPortRange{{From: 1234, To: 1234}},
+		Remote: model.NetEndpoint{Kind: model.NetRefZone, ZoneID: model.GuardZonePublic},
+	}
+	wgAllow := model.GuardRule{
+		ID: "wg-5678", Action: model.NetRuleAllow, Direction: model.NetDirIngress,
+		Protocol: model.NetProtoUDP, Ports: []model.GuardPortRange{{From: 5678, To: 5678}},
+		Remote: model.NetEndpoint{Kind: model.NetRefZone, ZoneID: model.GuardZoneWireGuard},
+	}
+	deny := model.GuardRule{
+		ID: "deny-bad-peer", Action: model.NetRuleDeny, Direction: model.NetDirIngress,
+		Protocol: model.NetProtoTCP, Ports: []model.GuardPortRange{{From: 1234, To: 1234}},
+		Remote: model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "198.51.100.7/32"},
+	}
+	zones := ZoneMap([]model.GuardZone{
+		{ID: model.GuardZonePublic, Interfaces: []string{"ens17"}},
+		{ID: model.GuardZoneWireGuard, CIDRs: []string{"10.77.0.0/24"}},
 	})
-	if err != nil {
-		t.Fatal(err)
+	render := func(t *testing.T, binding model.NodeGuardBinding, rules ...model.GuardRule) (network.NFTPlan, string) {
+		t.Helper()
+		binding.NodeID, binding.Managed = "n1", true
+		in := CompileInput{Binding: binding, Groups: []model.SecurityGroup{{ID: "sg", Rules: rules}}, Zones: zones, Resolve: noNodes}
+		plan, err := Compile(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ruleset, err := CompileRuleset(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return plan, ruleset
 	}
-	deny := `ip saddr 198.51.100.7 tcp dport { 1234 } drop`
-	allow := `iifname "eth0" tcp dport { 1234 } accept`
-	di, ai := strings.Index(ruleset, deny), strings.Index(ruleset, allow)
-	if di < 0 || ai < 0 || di > ai {
-		t.Fatalf("deny must render before the broad allow:\n%s", ruleset)
-	}
+	denyLine := `ip saddr 198.51.100.7 tcp dport { 1234 } drop comment "deny-bad-peer"`
+	allowLine := `iifname "ens17" tcp dport { 1234 } accept comment "open-1234"`
+	wgLine := `ip saddr 10.77.0.0/24 udp dport { 5678 } accept comment "wg-5678"`
+
+	t.Run("allow authored first renders first", func(t *testing.T) {
+		plan, ruleset := render(t, model.NodeGuardBinding{}, allow, wgAllow, deny)
+		if len(plan.PublicTCP) != 0 || len(plan.WireGuardUDP) != 0 {
+			t.Fatalf("a binding with a deny must not use the broad port lists: %+v", plan)
+		}
+		ai, wi, di := strings.Index(ruleset, allowLine), strings.Index(ruleset, wgLine), strings.Index(ruleset, denyLine)
+		if ai < 0 || wi < 0 || di < 0 || !(ai < wi && wi < di) {
+			t.Fatalf("rules must render in authored order:\n%s", ruleset)
+		}
+	})
+	t.Run("deny authored first renders first", func(t *testing.T) {
+		_, ruleset := render(t, model.NodeGuardBinding{}, deny, allow)
+		if di, ai := strings.Index(ruleset, denyLine), strings.Index(ruleset, allowLine); di < 0 || ai < 0 || di > ai {
+			t.Fatalf("a deny authored above the allow must render above it:\n%s", ruleset)
+		}
+	})
+	t.Run("a node override allow beats a group deny", func(t *testing.T) {
+		groupDeny := deny
+		groupDeny.Remote = model.NetEndpoint{Kind: model.NetRefAny}
+		_, ruleset := render(t, model.NodeGuardBinding{Overrides: []model.GuardRule{allow}}, groupDeny)
+		groupDenyLine := `tcp dport { 1234 } drop comment "deny-bad-peer"`
+		if ai, di := strings.Index(ruleset, allowLine), strings.Index(ruleset, groupDenyLine); ai < 0 || di < 0 || ai > di {
+			t.Fatalf("the node override must render ahead of the fleet group deny:\n%s", ruleset)
+		}
+	})
+	t.Run("a disabled deny keeps the fast path", func(t *testing.T) {
+		off := deny
+		off.Disabled = true
+		plan, _ := render(t, model.NodeGuardBinding{}, allow, off)
+		if len(plan.InputRules) != 0 || len(plan.PublicTCP) != 1 {
+			t.Fatalf("a disabled deny renders nothing and must not change the allow's shape: %+v", plan)
+		}
+	})
 }
 
 func TestNodeRemoteResolvesToNodeAddresses(t *testing.T) {

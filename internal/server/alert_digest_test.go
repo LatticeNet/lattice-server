@@ -1,14 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -245,5 +248,98 @@ func TestLivenessSweepFlushesQueuedAlerts(t *testing.T) {
 	srv.sweepNodeLiveness(time.Now(), store.NodeStatusCauseLivenessSweep)
 	if len(*sent) != 1 || (*sent)[0].eventType != EventServiceDown {
 		t.Fatalf("the sweep did not flush: %+v", *sent)
+	}
+}
+
+// A restart through SIGTERM ends in Server.Close. What the digest holds was
+// decided and recorded already, so Close sends it rather than dropping it.
+func TestCloseSendsQueuedAlerts(t *testing.T) {
+	srv, _, _ := newInventoryServer(t)
+	sent := captureTypedNotices(srv)
+	srv.queueAlertDigest(EventServiceDown, alertDigestLine{title: "sing-box down on alpha", body: "b", line: "l"})
+	if err := srv.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(*sent) != 1 || (*sent)[0].eventType != EventServiceDown || (*sent)[0].title != "sing-box down on alpha" {
+		t.Fatalf("Close did not send the queued alert: %+v", *sent)
+	}
+}
+
+// Close waits for a delivery that is still running, within its context, so a
+// page handed to a slow channel is not cut off by the exit that follows. The
+// held count stands in for a delivery stuck on a slow channel; the real
+// sender refuses the loopback listener a test could hold it on.
+func TestCloseWaitsForRunningDeliveries(t *testing.T) {
+	srv, _, _ := newInventoryServer(t)
+	srv.notifyDeliveries.begin()
+
+	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := srv.Close(short); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(start); waited > 5*time.Second {
+		t.Fatalf("Close outlived its context: %s", waited)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		_ = srv.Close(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("Close returned while a delivery was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	srv.notifyDeliveries.end()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after the delivery finished")
+	}
+}
+
+// logLines is a log destination a test can read while the server writes.
+type logLines chan string
+
+func (l logLines) Write(p []byte) (int, error) {
+	l <- string(p)
+	return len(p), nil
+}
+
+// A real delivery is counted while it runs and released when it ends, so the
+// wait above covers every typed notification.
+func TestNotifyDeliveryIsCountedUntilItEnds(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	lines := make(logLines, 16)
+	srv.logger = log.New(lines, "", 0)
+	if err := st.UpsertNotifyChannel(model.NotifyChannel{ID: "nc-hook", Name: "hook", Kind: "webhook", Enabled: true, Config: map[string]string{"url": "http://127.0.0.1:9/hook"}}); err != nil {
+		t.Fatal(err)
+	}
+	srv.notifyEventTyped(EventServiceDown, "sing-box down on alpha", "b")
+	deadline := time.After(5 * time.Second)
+	for delivered := false; !delivered; {
+		select {
+		case line := <-lines:
+			delivered = strings.Contains(line, "webhook delivery failed")
+		case <-deadline:
+			t.Fatal("the delivery never ran")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if left := srv.notifyDeliveries.wait(ctx); left != 0 {
+		t.Fatalf("a finished delivery is still counted: %d", left)
+	}
+	// The goroutine may still be unwinding after the log line; give it a
+	// moment, then the count must be exactly zero, not below it.
+	time.Sleep(100 * time.Millisecond)
+	srv.notifyDeliveries.mu.Lock()
+	n := srv.notifyDeliveries.n
+	srv.notifyDeliveries.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("delivery count after the delivery ended = %d, want 0", n)
 	}
 }

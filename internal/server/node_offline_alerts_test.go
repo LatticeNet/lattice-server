@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -430,6 +431,52 @@ func TestNodeOnlineFollowsAPageAcrossARestart(t *testing.T) {
 	}
 	srv2.sweepNodeLiveness(lastSeenOf(t, st2, "n-restart").Add(time.Second), sweepCause)
 	expectNoNotice(t, l, "after the recovery")
+}
+
+// A page whose record failed to write is written again by the next sweep once
+// the disk takes writes, without a second page, so a restart after that still
+// owes the node.online.
+func TestFailedOfflineAlertWriteIsRetriedBySweep(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("directory permissions do not bind root")
+	}
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := liveness{srv: srv, handler: srv.Handler(), st: st, sent: captureTypedNotices(srv)}
+	cookies, csrf := loginSession(t, l.handler)
+	enrollAndBeat(t, l.handler, cookies, csrf, "n-disk", "disk")
+	ls := lastSeenOf(t, st, "n-disk")
+	srv.sweepNodeLiveness(ls.Add(2*time.Minute), sweepCause)
+	expectNoNotice(t, l, "offline for 2 minutes")
+
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	srv.sweepNodeLiveness(ls.Add(11*time.Minute), sweepCause)
+	expectOneNotice(t, l, EventNodeOffline, "Lattice node offline: disk")
+	if got := st.NodeOfflineAlerts(); len(got) != 0 {
+		t.Skipf("the write landed in a read-only directory on this platform: %v", got)
+	}
+	srv.sweepNodeLiveness(ls.Add(11*time.Minute+20*time.Second), sweepCause)
+	expectNoNotice(t, l, "a sweep while the disk still refuses writes")
+
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	srv.sweepNodeLiveness(ls.Add(11*time.Minute+40*time.Second), sweepCause)
+	expectNoNotice(t, l, "the sweep that retries the write")
+	if got := st.NodeOfflineAlerts(); !got["n-disk"].Equal(ls) {
+		t.Fatalf("the paged spell was not written once the disk recovered: %v (want LastSeen %s)", got, ls)
+	}
 }
 
 // Deleting a paged node drops its spell from disk, so a node enrolled again

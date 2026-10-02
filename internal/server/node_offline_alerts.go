@@ -48,6 +48,14 @@ const (
 // answered by node.online after it. A spell that was already longer than the
 // alert delay when this process started stays silent: the process that saw it
 // begin owned the page.
+//
+// The spell is recorded before the page is handed to the sender, and delivery
+// runs in the background. A restart through SIGTERM waits for that delivery
+// in Server.Close. A process killed between the record and the delivery has
+// recorded a page that never arrived, and the node.online that follows is the
+// first the operator hears of the spell; recording after the hand-off would
+// not narrow that, since the hand-off returns before delivery starts. A
+// stored notification outbox is what closes it.
 type nodeOfflineAlerts struct {
 	mu sync.Mutex
 	// since is when this process began watching. Silence before it was not
@@ -65,6 +73,10 @@ type nodeOfflineAlerts struct {
 	// that may be days old.
 	disabled  map[string]bool
 	watchFrom map[string]time.Time
+	// unsaved is set when the last write of alerted failed. The next sweep
+	// writes again even if nothing changed, so a disk that recovers catches
+	// up without a page being sent twice.
+	unsaved bool
 }
 
 // loadLocked reads the persisted alerted spells the first time they are
@@ -78,15 +90,19 @@ func (a *nodeOfflineAlerts) loadLocked(s *Server) {
 
 // persistLocked writes the alerted spells. Called with a.mu held, so two
 // writers cannot persist their copies out of order. A failed write is logged
-// and retried by the next change; memory stays authoritative for this process.
+// and retried on every sweep until one lands; memory stays authoritative for
+// this process, so a failing disk never re-sends a page.
 func (a *nodeOfflineAlerts) persistLocked(s *Server) {
 	snapshot := make(map[string]time.Time, len(a.alerted))
 	for nodeID, at := range a.alerted {
 		snapshot[nodeID] = at
 	}
 	if err := s.store.SetNodeOfflineAlerts(snapshot); err != nil {
-		s.logger.Printf("node offline alerts: persist failed: %v", err)
+		a.unsaved = true
+		s.logger.Printf("node offline alerts: persist failed, retrying on the next sweep: %v", err)
+		return
 	}
+	a.unsaved = false
 }
 
 // nodeLivenessChange is one line of a node.offline or node.online message.
@@ -219,7 +235,7 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 			delete(a.watchFrom, nodeID)
 		}
 	}
-	if changed {
+	if changed || a.unsaved {
 		a.persistLocked(s)
 	}
 	up := a.recovered

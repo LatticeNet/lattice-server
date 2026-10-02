@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -23,6 +24,13 @@ import (
 // Event types do not change, so operator rules and templates route exactly as
 // before. A queued line waits at most one sweep interval (20 s), on top of
 // holds that are already 90 s or two probe intervals long.
+//
+// The decision behind a queued line is already on disk (the sing-box episode,
+// the monitor history), so a line dropped by a restart is a page that is never
+// sent. Server.Close sends what is queued and waits for deliveries already
+// running, which covers a restart through SIGTERM. A process that dies without
+// Close still loses what is queued or in flight; closing that needs a stored
+// notification outbox.
 type alertDigest struct {
 	mu      sync.Mutex
 	pending map[string][]alertDigestLine
@@ -89,5 +97,53 @@ func alertDigestTitle(kind string, n int) string {
 		return fmt.Sprintf("Monitor recovered digest: %d", n)
 	default:
 		return fmt.Sprintf("%s digest: %d", kind, n)
+	}
+}
+
+// notifyInflight counts notification deliveries still running so shutdown can
+// wait for them. It is not a sync.WaitGroup because a sweep may start a
+// delivery from zero while Close is waiting, which a WaitGroup forbids.
+type notifyInflight struct {
+	mu   sync.Mutex
+	n    int
+	idle chan struct{}
+}
+
+func (f *notifyInflight) begin() {
+	f.mu.Lock()
+	f.n++
+	f.mu.Unlock()
+}
+
+func (f *notifyInflight) end() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.n--
+	if f.n == 0 && f.idle != nil {
+		close(f.idle)
+		f.idle = nil
+	}
+}
+
+// wait returns 0 once no delivery is running, or the number still running
+// when ctx ends first.
+func (f *notifyInflight) wait(ctx context.Context) int {
+	f.mu.Lock()
+	if f.n == 0 {
+		f.mu.Unlock()
+		return 0
+	}
+	if f.idle == nil {
+		f.idle = make(chan struct{})
+	}
+	idle := f.idle
+	f.mu.Unlock()
+	select {
+	case <-idle:
+		return 0
+	case <-ctx.Done():
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.n
 	}
 }

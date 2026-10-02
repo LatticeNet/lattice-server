@@ -300,6 +300,9 @@ type Server struct {
 	// alertDigest batches service and monitor alerts decided one node at a
 	// time into one message per kind per sweep; see alert_digest.go.
 	alertDigest alertDigest
+	// notifyDeliveries counts deliveries still running, so Close can wait
+	// for them.
+	notifyDeliveries notifyInflight
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
 	// subscriptionDecoy shapes the answer every non-servable subscription request
@@ -1372,13 +1375,24 @@ func (s *Server) Handler() http.Handler {
 	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
 }
 
-// Close stops runtime-owned subprocesses and waits for their transports to be
-// reaped before the server process exits.
+// Close sends the alerts still queued for the next sweep, stops
+// runtime-owned subprocesses and waits for their transports to be reaped, and
+// waits for notification deliveries already running, all within ctx, before
+// the server process exits. Without the first and last steps a restart
+// dropped pages whose decision was already on disk (see alertDigest).
 func (s *Server) Close(ctx context.Context) error {
-	if s == nil || s.pluginRuntime == nil {
+	if s == nil {
 		return nil
 	}
-	return s.pluginRuntime.Close(ctx)
+	s.flushAlertDigests()
+	var err error
+	if s.pluginRuntime != nil {
+		err = s.pluginRuntime.Close(ctx)
+	}
+	if left := s.notifyDeliveries.wait(ctx); left > 0 {
+		s.logger.Printf("notify: %d deliveries still running at shutdown", left)
+	}
+	return err
 }
 
 func (s *Server) ensureAdmin(username, password string) error {
@@ -5349,7 +5363,9 @@ func (s *Server) notifyEventTyped(eventType, title, body string) {
 	if len(deliveries) == 0 {
 		return
 	}
+	s.notifyDeliveries.begin()
 	go func() {
+		defer s.notifyDeliveries.end()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		for _, delivery := range deliveries {

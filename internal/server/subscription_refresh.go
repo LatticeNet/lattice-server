@@ -283,11 +283,16 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 			return model.SubscriptionSnapshot{}, fmt.Errorf("subscription provider fetch failed for %s/%s", pluginID, subscriptionID)
 		}
 		s.logger.Printf("subscription snapshot: provider fetch failed for %s/%s; preserving last-good (%s)", pluginID, subscriptionID, subscriptionDiagnosticSummary(err))
+		// Only the first failure moves what a share serves: the body becomes the
+		// last good one, marked stale. A retry during the same outage changes
+		// nothing but the retry timestamp, so it publishes nothing and the
+		// bodies already rendered from the stale snapshot stay served.
+		becameStale := !existing.Stale
 		existing.FetchError = "provider_fetch_failed"
 		existing.LastAttemptAt = s.now()
 		existing.Stale = true
 		committed, storeErr := s.persistSubscriptionSnapshot(existing)
-		if committed {
+		if committed && (becameStale || force) {
 			publication.epoch++
 			s.invalidateSharesForSource(pluginID, subscriptionID)
 		}
@@ -317,11 +322,19 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 	fetched.FetchError = ""
 	fetched.Stale = false
 	committed, persistErr := s.persistSubscriptionSnapshot(fetched)
-	if committed {
+	// A refresh that brought back what was already served publishes nothing.
+	// Bumping the epoch for it is what made the extend path refuse, so every
+	// poll after the refresh interval paid a full render of identical bytes,
+	// against the design note on subscriptionCacheTTL ("zero renders in the
+	// steady state"). A forced refresh is the operator asking for a re-render
+	// and still publishes.
+	moved := !has || force || existing.Stale || existing.Userinfo != fetched.Userinfo ||
+		subscriptionRevalidationVersion(existing) != subscriptionRevalidationVersion(fetched)
+	if committed && moved {
 		publication.epoch++
 		// The content moved: any rendered body cached for a share sourcing this
 		// record is now stale, no matter how much TTL it had left.
-		if has && (force || existing.Stale || existing.Userinfo != fetched.Userinfo || subscriptionRevalidationVersion(existing) != subscriptionRevalidationVersion(fetched)) {
+		if has {
 			s.invalidateSharesForSource(pluginID, subscriptionID)
 		}
 	}

@@ -190,3 +190,81 @@ func TestCoreShareReflectsASuspensionOnTheNextFetch(t *testing.T) {
 		t.Fatalf("suspended user answered %d on the next fetch, want the decoy", code)
 	}
 }
+
+// A refresh that brings back the bytes already served must not cost a render.
+// Before, every committed refresh bumped the publication epoch, the extend
+// path refused the new epoch, and each poll after the refresh interval paid a
+// provider fetch plus a full render of identical bytes.
+func TestAnUnchangedRefreshExtendsInsteadOfRendering(t *testing.T) {
+	s, _, path := flightShareServer(t)
+	now := s.now()
+	s.now = func() time.Time { return now }
+	var renders, fetches atomic.Int64
+	s.subscriptionRender = flightRender(s, &renders, nil)
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		fetches.Add(1)
+		return model.SubscriptionSnapshot{Raw: "nodes"}, nil
+	}
+	fetch := func() string {
+		rec := httptest.NewRecorder()
+		s.handleSubscriptionShare(rec, shareRequest(path, "curl/8"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d", rec.Code)
+		}
+		return rec.Body.String()
+	}
+	first := fetch()
+	now = now.Add(subscriptionCacheTTL + time.Minute)
+	if got := fetch(); got != first {
+		t.Fatalf("body changed across an identical refresh: %q then %q", first, got)
+	}
+	if fetches.Load() != 1 || renders.Load() != 1 {
+		t.Fatalf("fetches = %d, renders = %d, want one refresh and no second render", fetches.Load(), renders.Load())
+	}
+	publication := s.subscriptionPublicationStateFor(subscriptionRefreshKey{pluginID: "p", subscriptionID: "rec"})
+	publication.mu.Lock()
+	epoch := publication.epoch
+	publication.mu.Unlock()
+	if epoch != 0 {
+		t.Fatalf("an unchanged refresh published epoch %d", epoch)
+	}
+}
+
+// During an outage only the first failure publishes (the body turns into the
+// last good one, marked stale). Later retries change only the retry time and
+// must not throw away the stale body each time.
+func TestOutageRetriesDoNotRepublishTheStaleBody(t *testing.T) {
+	s, _, path := flightShareServer(t)
+	now := s.now()
+	s.now = func() time.Time { return now }
+	var renders, fetches atomic.Int64
+	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+		renders.Add(1)
+		epoch, _ := s.subscriptionSnapshotEpoch(share.Source.PluginID, share.Source.SubscriptionID, snap)
+		return renderedSubscription{Body: []byte("last good"), Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap),
+			SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
+	}
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		fetches.Add(1)
+		return model.SubscriptionSnapshot{}, context.DeadlineExceeded
+	}
+	fetch := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		s.handleSubscriptionShare(rec, shareRequest(path, "curl/8"))
+		return rec
+	}
+	now = now.Add(subscriptionRefreshInterval + time.Minute)
+	if rec := fetch(); rec.Code != http.StatusOK || rec.Header().Get("X-Lattice-Subscription-Stale") != "true" {
+		t.Fatalf("first outage fetch answered %d stale=%q", rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"))
+	}
+	rendersAfterFirst := renders.Load()
+	for i := 0; i < 3; i++ {
+		now = now.Add(subscriptionStaleRetryInterval + time.Second)
+		if rec := fetch(); rec.Code != http.StatusOK || rec.Header().Get("X-Lattice-Subscription-Stale") != "true" {
+			t.Fatalf("retry %d answered %d stale=%q", i, rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"))
+		}
+	}
+	if fetches.Load() != 4 || renders.Load() != rendersAfterFirst {
+		t.Fatalf("fetches = %d, renders = %d (after first %d); retries must not re-render", fetches.Load(), renders.Load(), rendersAfterFirst)
+	}
+}

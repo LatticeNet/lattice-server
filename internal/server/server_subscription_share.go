@@ -579,21 +579,7 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 			rendered.SourceEpoch = epoch
 			return rendered, err
 		}
-		payloadFields := map[string]any{
-			"subscription_id": share.Source.SubscriptionID,
-			"format":          format,
-			"ua_class":        uaClass,
-			"raw":             snap.Raw,
-		}
-		// Explicit render parameters ride only when set, so a plugin built
-		// before they existed receives the exact payload it always did.
-		if variant.Target != "" {
-			payloadFields["target"] = variant.Target
-		}
-		if opts := variant.options(); opts != nil {
-			payloadFields["options"] = opts
-		}
-		payload, err := json.Marshal(payloadFields)
+		payload, err := subscriptionRenderPayload(share.Source.SubscriptionID, format, uaClass, variant, snap.Raw)
 		if err != nil {
 			return renderedSubscription{}, err
 		}
@@ -617,6 +603,25 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
+}
+
+// subscriptionRenderPayload is the plugin's render request. Explicit render
+// parameters ride only when set, so a plugin built before they existed
+// receives the exact payload it always did.
+func subscriptionRenderPayload(subscriptionID, format, uaClass string, variant shareRenderVariant, raw string) ([]byte, error) {
+	fields := map[string]any{
+		"subscription_id": subscriptionID,
+		"format":          format,
+		"ua_class":        pluginUAClass(uaClass),
+		"raw":             raw,
+	}
+	if variant.Target != "" {
+		fields["target"] = variant.Target
+	}
+	if opts := variant.options(); opts != nil {
+		fields["options"] = opts
+	}
+	return json.Marshal(fields)
 }
 
 // renderedSubscription is one produced body plus the metadata the core turns

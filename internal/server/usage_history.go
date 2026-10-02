@@ -325,18 +325,6 @@ func (s *Server) vpnUserPolicyRow(u VpnUser, now time.Time) model.ProxyUser {
 	return s.vpnUserPolicyAt(u, now).applyTo(model.ProxyUser{UsedBytes: s.vpnUserAccountTotal(u)})
 }
 
-// How the quota is measured (vpnUserQuotaMeasure):
-//   - a monthly quota: the identity's day rows for the current period plus
-//     pending, the report being ingested, which the rows do not hold yet. The
-//     read is bounded by one period and matches the Users page's
-//     used_period_bytes.
-//   - a lifetime quota: UsedBytes on the identity's accounting record (the
-//     legacy record for a migrated identity), a running total ingestion
-//     advances on every report, this one included, and never prunes. Day
-//     rows are kept for UsageDayRetentionDays only, so summing them would
-//     turn a lifetime quota into "the last 400 days" and read up to 400 rows
-//     per user on every usage report.
-
 // vpnUsersByAccounting indexes identities by the ProxyUser projection id that
 // carries their total (the legacy id for a migrated identity).
 func (s *Server) vpnUsersByAccounting() map[string]VpnUser {

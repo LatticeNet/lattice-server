@@ -62,7 +62,7 @@ type VpnSuspension = store.VpnUserSuspension
 type vpnUserQuotaUsage struct {
 	// Used is the figure compared with the quota: the current period's day
 	// rows for a monthly quota, the accounting record's running total for a
-	// lifetime one (quotaUsedBytes says why).
+	// lifetime one (vpnUserQuotaMeasure says why).
 	Used int64
 	// Proof is the part of Used a proof rule counted, valid when ProofKnown.
 	// For a lifetime quota it is summed from the retained day rows, so it is
@@ -170,12 +170,19 @@ func (p vpnUserPolicy) applyTo(row model.ProxyUser) model.ProxyUser {
 	return row
 }
 
-// vpnUserQuotaMeasure is the usage an identity's quota is measured with, from
-// its day rows. rows must cover the current period for a monthly quota (older
-// rows are ignored). For a lifetime quota, accountTotal is the figure, and
-// rows, when they cover retention, give its proven part. pending is a report
-// being ingested that the rows do not hold yet; its proof split is not known,
-// so a measure with pending traffic leaves the proof unknown.
+// vpnUserQuotaMeasure is the usage an identity's quota is measured with:
+//   - a monthly quota: the identity's day rows for the current period plus
+//     pending, the report being ingested, which the rows do not hold yet. rows
+//     must cover the period (older rows are ignored), and the figure matches
+//     the Users page's used_period_bytes. The proof split of pending is not
+//     known, so a measure with pending traffic leaves the proof unknown.
+//   - a lifetime quota: accountTotal, UsedBytes on the identity's accounting
+//     record (the legacy record for a migrated identity), a running total
+//     ingestion advances on every report and never prunes. Day rows are kept
+//     for UsageDayRetentionDays only, so summing them would turn a lifetime
+//     quota into "the last 400 days" and read up to 400 rows per user on every
+//     usage report. rows, when they cover retention, give only its proven
+//     part.
 func vpnUserQuotaMeasure(u VpnUser, accountTotal int64, rows []store.UsageDayUser, rowsCoverRetention bool, now time.Time, pending usageCounter) vpnUserQuotaUsage {
 	if start, end, ok := vpnUserQuotaPeriod(u, now); ok {
 		from, to := store.UsageDay(start), store.UsageDay(now)

@@ -241,7 +241,7 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	u, ok := s.getVpnUser(strings.TrimSpace(req.UserID))
 	if !ok {
 		if op == lineUserOpRemove {
-			return s.deletedUserLineRemovePlan(ctxPrincipal, strings.TrimSpace(req.UserID), strings.TrimSpace(req.LineHashID))
+			return s.deletedUserLineRemovePlan(strings.TrimSpace(req.UserID), strings.TrimSpace(req.LineHashID))
 		}
 		return nil, fmt.Errorf("vpn-core/users-admin plan_%s: user %q not found", op, req.UserID)
 	}
@@ -287,10 +287,10 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	// A remove on an adopted line does not need a binding. unbind drops only
 	// the server's record, so a user that plan_add put on the node keeps its
 	// credential there after an unbind, and plan_remove is the only way
-	// Lattice can take it off. sb user del names only this user's derived
-	// name, so the plan cannot touch anyone else. A managed line's render
-	// already leaves an unbound user out, so a remove there would change
-	// nothing and still needs the binding.
+	// Lattice can take it off. sb user del removes the entry by the derived
+	// name and by the credential, the same payload the add sent. A managed
+	// line's render already leaves an unbound user out, so a remove there
+	// would change nothing and still needs the binding.
 	if (op == lineUserOpUpdate || (op == lineUserOpRemove && ln.Managed)) && !bound {
 		return nil, fmt.Errorf("user %q is not bound to line %q", u.ID, ln.LineHashID)
 	}
@@ -348,25 +348,27 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	return s.fileLineUserPlan(ctxPrincipal, plan, map[string]string{"quota_changed": strconv.FormatBool(quotaChanged)})
 }
 
-// deletedUserLineRemovePlan files plan_remove for a user that no longer
+// deletedUserLineRemovePlan answers plan_remove for a user that no longer
 // exists. Deleting a user does not take its credential off an adopted line,
-// where Lattice added it with sb user add, and plan_remove used to need the
-// user record, so nothing in Lattice could take it off. sb user del needs
-// only the line's tag and the on-box name, and the name is derived from the
-// user id and the line UUID alone (userLineName), so the plan removes that
-// one credential and nothing else.
+// where Lattice added it with sb user add, but the removal cannot be filed
+// either. The node script deletes by credential: lr00rl/sing-box alpha.7
+// (cmd_json_user, the script on every adopted node) refuses a payload that
+// carries no uuid or password with invalid_user, and refuses a bare name with
+// invalid_payload. Deleting the user deleted the only copy of its credential,
+// so every task such a plan queued failed on the node and went back to
+// pending. Until the fork ships a name-only delete (planned for alpha.8),
+// the plan is refused here with the reason, rather than filed as a task that
+// always fails.
 //
-// The id comes from the operator with no record left to check it against,
-// so it is held to two things before it is filed or echoed. It must have the
-// shape Lattice mints (vpnUserIDRe), and the approvals, which are never
-// pruned, must show an applied plan that put this user on this line with no
-// applied removal since (requireLineUserOnLine). A typo, or an id that never
-// reached the line, is refused here rather than filed as a task that fails.
-// The node reports a user count but no names, so this is the closest
-// Lattice can come to confirming the node holds the name. A managed line
-// needs no such plan: its render already leaves a deleted user out, and the
-// line's next config apply removes it.
-func (s *Server) deletedUserLineRemovePlan(ctxPrincipal principal, userID, lineHashID string) ([]byte, error) {
+// The id is still held to what a102 checked, so the refusal is accurate: it
+// must have the shape Lattice mints (vpnUserIDRe), the line must be adopted,
+// and the approvals, which are never pruned, must show an applied plan that
+// put this user on this line with no applied removal since
+// (requireLineUserOnLine). A typo, or an id that never reached the line,
+// gets the narrower refusal. A managed line needs no such plan: its render
+// already leaves a deleted user out, and the line's next config apply
+// removes it.
+func (s *Server) deletedUserLineRemovePlan(userID, lineHashID string) ([]byte, error) {
 	if !vpnUserIDRe.MatchString(userID) {
 		return nil, errors.New("vpn-core/users-admin plan_remove: user_id is neither an existing user nor a VpnUser id Lattice mints (vpnuser_ and 16 base32 characters, or vu_ and a proxy user id)")
 	}
@@ -380,19 +382,17 @@ func (s *Server) deletedUserLineRemovePlan(ctxPrincipal principal, userID, lineH
 	if err := s.requireLineUserOnLine(userID, ln.LineHashID); err != nil {
 		return nil, err
 	}
-	name := userLineName(userID, ln.LineUUID)
-	sha, err := lineUserCredentialSHA(lineUserCredentialPayload{Name: name})
-	if err != nil {
-		return nil, err
-	}
-	plan := lineUserPlan{
-		Op: lineUserOpRemove, Track: lineUserTrackAdopted, NodeID: ln.NodeID, Line: ln.Tag,
-		LineHashID: ln.LineHashID, LineUUID: ln.LineUUID,
-		UserID: userID, UserName: name, Protocol: ln.Type, CredentialSHA256: sha,
-		Summary: fmt.Sprintf("sb user remove %s on node %s (deleted user %s as %s, credential sha %s…)",
-			ln.Tag, ln.NodeID, userID, name, sha[:12]),
-	}
-	return s.fileLineUserPlan(ctxPrincipal, plan, map[string]string{"user_deleted": "true"})
+	return nil, deletedUserRemovalUnsupported(userID, ln)
+}
+
+// deletedUserRemovalUnsupported is the refusal for removing a deleted user
+// from an adopted line, at plan time and when an approval filed before this
+// refusal existed is approved or rendered.
+func deletedUserRemovalUnsupported(userID string, ln Line) error {
+	return fmt.Errorf("user %q no longer exists, so Lattice no longer holds the credential the node script needs to remove it: "+
+		"sb user del on adopted nodes (lr00rl/sing-box v1.24.3-alpha.7) matches entries by credential and refuses a name alone, "+
+		"and deleting by name needs the fork's alpha.8; on-box user %s stays on line %s on node %s until then",
+		userID, userLineName(userID, ln.LineUUID), ln.Tag, ln.NodeID)
 }
 
 // vpnUserIDRe matches the VpnUser ids Lattice mints: id.New("vpnuser"),
@@ -633,7 +633,7 @@ func (s *Server) validateLineUserApproval(approval model.Approval, checkGrant bo
 	user, ok := s.getVpnUser(plan.UserID)
 	if !ok {
 		if plan.Op == lineUserOpRemove {
-			return s.validateDeletedUserLineRemove(approval, plan)
+			return s.validateDeletedUserLineRemove(approval, plan, checkGrant)
 		}
 		return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, fmt.Errorf("user %q no longer exists; re-plan", plan.UserID)
 	}
@@ -688,13 +688,15 @@ func (s *Server) validateLineUserApproval(approval model.Approval, checkGrant bo
 }
 
 // validateDeletedUserLineRemove checks an adopted plan_remove whose user no
-// longer exists, whether it was filed before the deletion or after it
-// (deletedUserLineRemovePlan). Its script needs only the line's tag and the
-// on-box name, so this checks those against the line as it is now and
-// against the plan's own bindings, and skips the credential and binding
-// checks, which need the user record. A managed remove for a deleted user
-// stays refused: the render already leaves the user out.
-func (s *Server) validateDeletedUserLineRemove(approval model.Approval, plan lineUserPlan) (lineUserPlan, VpnUser, Line, lineUserCredentialPayload, *proxycore.Artifact, error) {
+// longer exists: one filed before the deletion, or one a102 filed after it.
+// When checkGrant is set, at approval and at script render, it is refused:
+// the node script deletes by credential and the credential went with the
+// user (deletedUserRemovalUnsupported), so the task could only fail. Without
+// checkGrant, when a task result is recorded, it checks the line's tag and
+// the on-box name against the line as it is now, since that result records
+// what the node already did. A managed remove for a deleted user stays
+// refused: the render already leaves the user out.
+func (s *Server) validateDeletedUserLineRemove(approval model.Approval, plan lineUserPlan, checkGrant bool) (lineUserPlan, VpnUser, Line, lineUserCredentialPayload, *proxycore.Artifact, error) {
 	fail := func(err error) (lineUserPlan, VpnUser, Line, lineUserCredentialPayload, *proxycore.Artifact, error) {
 		return lineUserPlan{}, VpnUser{}, Line{}, lineUserCredentialPayload{}, nil, err
 	}
@@ -712,6 +714,9 @@ func (s *Server) validateDeletedUserLineRemove(approval model.Approval, plan lin
 	if plan.ConfigSHA256 != "" || plan.CredentialSHA256 == "" || approval.ArtifactDigest != plan.CredentialSHA256 ||
 		strings.TrimPrefix(approval.Action, lineUserActionPrefix) != plan.CredentialSHA256 {
 		return fail(errors.New("adopted artifact binding changed; re-plan"))
+	}
+	if checkGrant {
+		return fail(deletedUserRemovalUnsupported(plan.UserID, line))
 	}
 	return plan, VpnUser{}, line, lineUserCredentialPayload{Name: plan.UserName}, nil, nil
 }
@@ -731,19 +736,22 @@ func (s *Server) lineUserApplyScript(approval model.Approval) string {
 	if artifact != nil {
 		return proxyCoreApplyScript(*artifact)
 	}
+	// Both ops pass the same JSON payload the approval hashed. The fork routes
+	// every `user` subcommand to cmd_json_user, which refuses anything that is
+	// not a JSON object carrying the credential the line's protocol needs: a
+	// bare name fails with invalid_payload and exit 2, which is what every
+	// removal a102 rendered did. The task view exposes only the script's
+	// digest and size, so the credential is no more visible than an add's.
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return fail(fmt.Errorf("encode payload: %v", err))
+	}
 	var argv string
 	switch plan.Op {
 	case lineUserOpAdd, lineUserOpUpdate:
-		payloadJSON, err := json.Marshal(payload)
-		if err != nil {
-			return fail(fmt.Errorf("encode payload: %v", err))
-		}
 		argv = " --json user add " + shellQuote(plan.Line) + " " + shellQuote(string(payloadJSON))
 	case lineUserOpRemove:
-		// The adopted script contract deletes by the stable users[].name join
-		// key. Sending the credential object here is both the wrong argv shape
-		// and needlessly exposes write-only credential material to the task.
-		argv = " user del " + shellQuote(plan.Line) + " " + shellQuote(plan.UserName)
+		argv = " --json user del " + shellQuote(plan.Line) + " " + shellQuote(string(payloadJSON))
 	default:
 		return fail(fmt.Errorf("invalid line-user op %q", plan.Op))
 	}

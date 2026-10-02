@@ -41,11 +41,21 @@ const (
 	maxNodeOfflineAlertAfter  = 7 * 24 * time.Hour
 )
 
-// nodeOfflineAlerts is the in-memory half of node.offline: which offline spell
+// nodeOfflineAlerts is the state behind node.offline: which offline spell
 // each node was alerted for, and recoveries of alerted spells waiting for the
-// next sweep. It is not persisted. After a restart, a spell that was already
-// longer than the alert delay when this process started stays silent, and the
-// recovery of a spell the previous process alerted sends nothing.
+// next sweep. The alerted spells are persisted (store.NodeOfflineAlerts) and
+// written only when they change, so a page sent before a restart is still
+// answered by node.online after it. A spell that was already longer than the
+// alert delay when this process started stays silent: the process that saw it
+// begin owned the page.
+//
+// The spell is recorded before the page is handed to the sender, and delivery
+// runs in the background. A restart through SIGTERM waits for that delivery
+// in Server.Close. A process killed between the record and the delivery has
+// recorded a page that never arrived, and the node.online that follows is the
+// first the operator hears of the spell; recording after the hand-off would
+// not narrow that, since the hand-off returns before delivery starts. A
+// stored notification outbox is what closes it.
 type nodeOfflineAlerts struct {
 	mu sync.Mutex
 	// since is when this process began watching. Silence before it was not
@@ -53,8 +63,46 @@ type nodeOfflineAlerts struct {
 	since time.Time
 	// alerted maps a node id to the LastSeen of the spell it was alerted for.
 	// LastSeen does not move while a node is silent, so it names the spell.
+	// Nil until loaded from the store on first use.
 	alerted   map[string]time.Time
 	recovered []nodeLivenessChange
+	// disabled holds the nodes the last sweep saw disabled, and watchFrom
+	// when a sweep first saw each of them enabled again. A disabled node's
+	// token is refused, so its silence is the operator's doing and never
+	// pages; once enabled, its silence counts from then, not from a LastSeen
+	// that may be days old.
+	disabled  map[string]bool
+	watchFrom map[string]time.Time
+	// unsaved is set when the last write of alerted failed. The next sweep
+	// writes again even if nothing changed, so a disk that recovers catches
+	// up without a page being sent twice.
+	unsaved bool
+}
+
+// loadLocked reads the persisted alerted spells the first time they are
+// needed. Called with a.mu held.
+func (a *nodeOfflineAlerts) loadLocked(s *Server) {
+	if a.alerted != nil {
+		return
+	}
+	a.alerted = s.store.NodeOfflineAlerts()
+}
+
+// persistLocked writes the alerted spells. Called with a.mu held, so two
+// writers cannot persist their copies out of order. A failed write is logged
+// and retried on every sweep until one lands; memory stays authoritative for
+// this process, so a failing disk never re-sends a page.
+func (a *nodeOfflineAlerts) persistLocked(s *Server) {
+	snapshot := make(map[string]time.Time, len(a.alerted))
+	for nodeID, at := range a.alerted {
+		snapshot[nodeID] = at
+	}
+	if err := s.store.SetNodeOfflineAlerts(snapshot); err != nil {
+		a.unsaved = true
+		s.logger.Printf("node offline alerts: persist failed, retrying on the next sweep: %v", err)
+		return
+	}
+	a.unsaved = false
 }
 
 // nodeLivenessChange is one line of a node.offline or node.online message.
@@ -80,12 +128,28 @@ func (s *Server) noteNodeOnline(nodeID string, now time.Time) {
 	a := &s.nodeAlerts
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.loadLocked(s)
 	lastSeen, ok := a.alerted[nodeID]
 	if !ok {
 		return
 	}
 	delete(a.alerted, nodeID)
+	a.persistLocked(s)
 	a.recovered = append(a.recovered, nodeLivenessChange{id: nodeID, name: name, span: now.Sub(lastSeen), lastSeen: lastSeen})
+}
+
+// forgetNodeOfflineAlert drops a deleted node's alert state from memory. The
+// store's delete cascade has already removed the persisted spell; without this
+// the copy here would outlive it until the next sweep, and a node enrolled
+// again under the same id in that window would announce a recovery from a
+// page it never got. A recovery already queued is kept: that node did return.
+func (s *Server) forgetNodeOfflineAlert(nodeID string) {
+	a := &s.nodeAlerts
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.alerted, nodeID)
+	delete(a.disabled, nodeID)
+	delete(a.watchFrom, nodeID)
 }
 
 // notifyNodeLiveness sends node.offline for nodes silent past
@@ -102,13 +166,32 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 	// lock, so the order a.mu then store is safe.
 	a.mu.Lock()
 	nodes := s.store.Nodes()
-	if a.alerted == nil {
-		a.alerted = map[string]time.Time{}
+	a.loadLocked(s)
+	if a.disabled == nil {
+		a.disabled = map[string]bool{}
+		a.watchFrom = map[string]time.Time{}
 	}
+	changed := false
 	present := make(map[string]bool, len(nodes))
 	var down []nodeLivenessChange
 	for _, n := range nodes {
 		present[n.ID] = true
+		if n.Disabled {
+			// Disabling refuses the token and leaves Online alone, so the
+			// sweep flips the node offline like any silent one. That silence
+			// is the operator's own action, never a page. A spell paged
+			// before the node was disabled stays owed its node.online.
+			a.disabled[n.ID] = true
+			delete(a.watchFrom, n.ID)
+			continue
+		}
+		if a.disabled[n.ID] {
+			delete(a.disabled, n.ID)
+			a.watchFrom[n.ID] = now
+		}
+		if n.Online {
+			delete(a.watchFrom, n.ID)
+		}
 		delay, pages := nodeOfflineDelay(n)
 		if n.Online || n.LastSeen.IsZero() || !pages {
 			continue
@@ -123,6 +206,9 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 		if silentFrom.Before(a.since) {
 			silentFrom = a.since
 		}
+		if from, ok := a.watchFrom[n.ID]; ok && silentFrom.Before(from) {
+			silentFrom = from
+		}
 		if now.Sub(silentFrom) < delay {
 			continue
 		}
@@ -130,12 +216,27 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 			continue
 		}
 		a.alerted[n.ID] = n.LastSeen
+		changed = true
 		down = append(down, nodeLivenessChange{id: n.ID, name: nodeLabel(n), span: now.Sub(n.LastSeen), lastSeen: n.LastSeen})
 	}
 	for nodeID := range a.alerted {
 		if !present[nodeID] {
 			delete(a.alerted, nodeID)
+			changed = true
 		}
+	}
+	for nodeID := range a.disabled {
+		if !present[nodeID] {
+			delete(a.disabled, nodeID)
+		}
+	}
+	for nodeID := range a.watchFrom {
+		if !present[nodeID] {
+			delete(a.watchFrom, nodeID)
+		}
+	}
+	if changed || a.unsaved {
+		a.persistLocked(s)
 	}
 	up := a.recovered
 	a.recovered = nil

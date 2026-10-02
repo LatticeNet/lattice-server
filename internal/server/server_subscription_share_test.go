@@ -225,6 +225,7 @@ func TestSubscriptionShareAuditNeverCarriesTheRawToken(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	s.handleSubscriptionShare(rec, shareRequest("/sub/team/"+token, "Surge/2000"))
+	s.shareRefusalAudits.Wait()
 
 	events := st.AuditEvents()
 	if len(events) == 0 {

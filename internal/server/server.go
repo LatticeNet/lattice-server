@@ -76,10 +76,16 @@ type Options struct {
 	Build         BuildInfo
 	SecureCookies bool
 	// TrustProxy enables reading the client address from proxy headers
-	// (CF-Connecting-IP, then X-Forwarded-For). Only enable when the server
-	// sits behind a trusted reverse proxy / Cloudflare; otherwise clients can
-	// spoof the header and evade per-IP rate limiting.
+	// (CF-Connecting-IP, then X-Forwarded-For read from the right). Headers
+	// are believed only from an immediate peer in TrustedProxies, so a client
+	// that reaches the server directly cannot choose its own address.
 	TrustProxy bool
+	// TrustedProxies lists the CIDRs or addresses of the reverse proxies whose
+	// forwarding headers are believed under TrustProxy. Empty means loopback
+	// plus the private-use and unique-local ranges, which covers a proxy
+	// reaching the server through a Docker bridge. A non-empty list replaces
+	// that default entirely, loopback included. A malformed entry fails New.
+	TrustedProxies []string
 	// RequireTOTP forces interactive user sessions to enable TOTP before they can
 	// use non-setup APIs. Existing password/SSO login still issues a session so
 	// the operator can enroll, but withAuth gates every other route until TOTP is
@@ -162,9 +168,11 @@ type Server struct {
 	webFS         fs.FS
 	secureCookies bool
 	trustProxy    bool
-	requireTOTP   bool
-	logger        *log.Logger
-	loginLimiter  *ratelimit.Limiter
+	// trustedProxies is the effective set parsed from TrustedProxies.
+	trustedProxies []netip.Prefix
+	requireTOTP    bool
+	logger         *log.Logger
+	loginLimiter   *ratelimit.Limiter
 	// storageAuthLimiter bounds anonymous storage-token attempts. It is separate
 	// from apiLimiter because the work it protects is key derivation, not a
 	// handler, and it is sized like loginLimiter for the same reason.
@@ -215,8 +223,18 @@ type Server struct {
 	// caps the absolute emission rate so source-address rotation cannot turn
 	// failure auditing into a disk-growth / lock-contention DoS.
 	authFailAuditThrottle *auditFailureThrottle
-	apiLimiter            *ratelimit.Limiter
-	subLimiter            *ratelimit.Limiter
+	// shareRefusalAudit bounds audit emission for refused /sub/ requests,
+	// which anyone can send; see share_refusal_audit.go.
+	// shareResolvedRefusalAudit is the same bound for refusals after a token
+	// resolved, on its own global bucket so free probes cannot spend it.
+	// shareRefusalAudits counts the writes still in flight so a test can wait
+	// for them, and shareRefusalAuditHook (tests only) runs before each write.
+	shareRefusalAudit         *auditFailureThrottle
+	shareResolvedRefusalAudit *auditFailureThrottle
+	shareRefusalAudits        sync.WaitGroup
+	shareRefusalAuditHook     func()
+	apiLimiter                *ratelimit.Limiter
+	subLimiter                *ratelimit.Limiter
 	// logIngestLimiter brakes per-source log ingest (keyed by source id) in
 	// lines/sec so a chatty or hostile node cannot flood the store; over budget
 	// returns 429 + Retry-After. Disk is independently bounded by the store caps.
@@ -279,6 +297,12 @@ type Server struct {
 	// nodeAlerts holds which offline spell each node was alerted for; see
 	// notifyNodeLiveness.
 	nodeAlerts nodeOfflineAlerts
+	// alertDigest batches service and monitor alerts decided one node at a
+	// time into one message per kind per sweep; see alert_digest.go.
+	alertDigest alertDigest
+	// notifyDeliveries counts deliveries still running, so Close can wait
+	// for them.
+	notifyDeliveries notifyInflight
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
 	// subscriptionDecoy shapes the answer every non-servable subscription request
@@ -501,6 +525,10 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	trustedProxies, err := parseTrustedProxies(opts.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
 	build := normalizeBuildInfo(opts.Build)
 	build.TaskExecutionDisabled = opts.TaskExecutionDisabled
 	approvalAutoRules, err := parseApprovalAutoRules(opts.ApprovalAutoRules)
@@ -511,14 +539,15 @@ func New(opts Options) (*Server, error) {
 		approvalAutoRules = nil
 	}
 	s := &Server{
-		store:         opts.Store,
-		logStore:      opts.LogStore,
-		traceStore:    opts.TraceStore,
-		webFS:         opts.WebFS,
-		secureCookies: opts.SecureCookies,
-		trustProxy:    opts.TrustProxy,
-		requireTOTP:   opts.RequireTOTP,
-		logger:        opts.Logger,
+		store:          opts.Store,
+		logStore:       opts.LogStore,
+		traceStore:     opts.TraceStore,
+		webFS:          opts.WebFS,
+		secureCookies:  opts.SecureCookies,
+		trustProxy:     opts.TrustProxy,
+		trustedProxies: trustedProxies,
+		requireTOTP:    opts.RequireTOTP,
+		logger:         opts.Logger,
 		// Login is intentionally strict: 5/min sustained, small burst, to slow
 		// password guessing without locking out legitimate retries.
 		loginLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
@@ -545,7 +574,9 @@ func New(opts Options) (*Server, error) {
 		// bucket (burst 20, 1/sec sustained) caps total failure-audit writes
 		// so IP rotation cannot exceed a fixed rate. Both are generous for
 		// legitimate failures and bound an unauthenticated flood.
-		authFailAuditThrottle: newAuditFailureThrottle(time.Minute, 20, 1.0),
+		authFailAuditThrottle:     newAuditFailureThrottle(time.Minute, 20, 1.0),
+		shareRefusalAudit:         newShareRefusalAuditThrottle(),
+		shareResolvedRefusalAudit: newShareRefusalAuditThrottle(),
 		// General authenticated API surface.
 		apiLimiter: ratelimit.New(ratelimit.Config{Rate: 30, Burst: 60}),
 		// Public subscription URLs are token-authenticated, unauthenticated HTTP
@@ -649,6 +680,7 @@ func New(opts Options) (*Server, error) {
 		s.startTraceReattribution()
 		s.startDDNSSweep()
 		s.startTLSMonitorSweep()
+		s.startShareRefusalAuditFlush()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1343,13 +1375,24 @@ func (s *Server) Handler() http.Handler {
 	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
 }
 
-// Close stops runtime-owned subprocesses and waits for their transports to be
-// reaped before the server process exits.
+// Close sends the alerts still queued for the next sweep, stops
+// runtime-owned subprocesses and waits for their transports to be reaped, and
+// waits for notification deliveries already running, all within ctx, before
+// the server process exits. Without the first and last steps a restart
+// dropped pages whose decision was already on disk (see alertDigest).
 func (s *Server) Close(ctx context.Context) error {
-	if s == nil || s.pluginRuntime == nil {
+	if s == nil {
 		return nil
 	}
-	return s.pluginRuntime.Close(ctx)
+	s.flushAlertDigests()
+	var err error
+	if s.pluginRuntime != nil {
+		err = s.pluginRuntime.Close(ctx)
+	}
+	if left := s.notifyDeliveries.wait(ctx); left > 0 {
+		s.logger.Printf("notify: %d deliveries still running at shutdown", left)
+	}
+	return err
 }
 
 func (s *Server) ensureAdmin(username, password string) error {
@@ -1580,11 +1623,10 @@ func (s *Server) withSubscriptionLimit(next http.HandlerFunc) http.HandlerFunc {
 			// A 429 here would tell a prober that this path is specially rate
 			// limited, which is itself evidence that it exists. The limit still
 			// applies; it just refuses in the same voice as everything else.
-			s.recordRequestAudit(r, model.AuditEvent{
-				ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
-				Reason: "rate limited",
-			})
+			// The audit is throttled and written after the answer, so a flood
+			// neither buys a durable write per request nor waits on one.
 			s.writeSubscriptionDecoy(w)
+			s.auditShareRefusal(r, "rate limited", nil)
 			return
 		}
 		next(w, r)
@@ -5114,12 +5156,12 @@ func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request
 		return
 	}
 	req.Result.NodeID = req.NodeID
-	prior, hadPrior := s.store.LastMonitorResultForNode(req.Result.MonitorID, req.NodeID)
+	history := s.store.LastMonitorResultsForNode(req.Result.MonitorID, req.NodeID, 2)
 	if err := s.store.AddMonitorResult(req.Result); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	s.notifyMonitorTransition(req.NodeID, req.Result, prior, hadPrior)
+	s.notifyMonitorTransition(req.NodeID, req.Result, history)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -5321,7 +5363,9 @@ func (s *Server) notifyEventTyped(eventType, title, body string) {
 	if len(deliveries) == 0 {
 		return
 	}
+	s.notifyDeliveries.begin()
 	go func() {
+		defer s.notifyDeliveries.end()
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		for _, delivery := range deliveries {
@@ -5433,9 +5477,9 @@ func renderNotifyTemplate(tmpl, fallback string, vars map[string]string) string 
 func classifyNotifyEvent(title string) string {
 	switch {
 	case strings.Contains(title, "Monitor recovered"):
-		return "monitor.recovered"
+		return EventMonitorRecovered
 	case strings.Contains(title, "Monitor down"):
-		return "monitor.down"
+		return EventMonitorDown
 	case strings.Contains(title, "SSH login after repeated failures"):
 		return EventSSHCompromiseSuspected
 	case strings.Contains(title, "SSH login"):
@@ -5556,36 +5600,69 @@ func validateNotifyID(value string) error {
 	return nil
 }
 
-// notifyMonitorTransition emits an alert when a monitor's success state flips
-// (or on the first observed failure), so flapping does not spam every result.
-func (s *Server) notifyMonitorTransition(nodeID string, current, prior model.MonitorResult, hadPrior bool) {
-	transitioned := (!hadPrior && !current.Success) || (hadPrior && prior.Success != current.Success)
-	if !transitioned {
+// Typed notification kinds for monitors, declared beside their emitter. They
+// used to be inferred from an emoji title by classifyNotifyEvent, which still
+// maps those titles for anything that sends them untyped.
+const (
+	EventMonitorDown      = "monitor.down"
+	EventMonitorRecovered = "monitor.recovered"
+)
+
+// notifyMonitorTransition decides monitor.down and monitor.recovered for one
+// (monitor, node) pair. history is the pair's results before current, newest
+// first (LastMonitorResultsForNode with n=2, read before current was stored).
+//
+// monitor.down waits for two failures in a row: a single failed probe is a
+// dropped packet or a busy target as often as an outage, and paging on it
+// teaches the operator to ignore the page. monitor.recovered follows only a
+// run that paged, so the phone's last message is always true. Both are read
+// off the stored history rather than kept in memory, and the store writes the
+// second failure at once, so a restart neither repeats a page nor loses the
+// recovery it owes.
+//
+// The notice is queued for the sweep's digest, so an all-nodes monitor whose
+// target goes down pages once, naming every node.
+func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, history []model.MonitorResult) {
+	failed := func(i int) bool { return i < len(history) && !history[i].Success }
+	succeededOrAbsent := func(i int) bool { return i >= len(history) || history[i].Success }
+	var kind string
+	switch {
+	case !current.Success && failed(0) && succeededOrAbsent(1):
+		kind = EventMonitorDown
+	case current.Success && failed(0) && failed(1):
+		kind = EventMonitorRecovered
+	default:
 		return
 	}
 	mon, _ := s.store.Monitor(current.MonitorID)
-	name := mon.Name
+	name := strings.TrimSpace(mon.Name)
 	if name == "" {
 		name = current.MonitorID
 	}
-	// A server-evaluated monitor (tls) has no node, so it names the target it
-	// dialled instead. Node monitors keep their exact wording.
-	where := "node " + nodeID
+	// A node monitor names the node by its name. A server-evaluated monitor
+	// (tls) has no node, so it names the target it dialled.
+	where := s.nodeDisplayName(nodeID)
 	if nodeID == "" {
-		where = mon.Target
-		if strings.TrimSpace(where) == "" {
+		where = strings.TrimSpace(mon.Target)
+		if where == "" {
 			where = "the control plane"
 		}
 	}
-	if current.Success {
-		s.emitNotify("✅ Monitor recovered", fmt.Sprintf("%s on %s is back up (%.1fms)", name, where, current.LatencyMs))
+	line := alertDigestLine{sortKey: name + "\x00" + where}
+	if kind == EventMonitorRecovered {
+		line.title = fmt.Sprintf("Monitor recovered: %s on %s", name, where)
+		line.body = fmt.Sprintf("%s on %s is back up (%.1fms).", name, where, current.LatencyMs)
+		line.line = fmt.Sprintf("%s on %s: back up (%.1fms)", name, where, current.LatencyMs)
 	} else {
-		detail := current.Error
+		detail := strings.TrimSpace(current.Error)
 		if detail == "" {
 			detail = "probe failed"
 		}
-		s.emitNotify("🔴 Monitor down", fmt.Sprintf("%s on %s failed: %s", name, where, detail))
+		line.title = fmt.Sprintf("Monitor down: %s on %s", name, where)
+		line.body = fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail)
+		line.line = fmt.Sprintf("%s on %s: %s", name, where, detail)
 	}
+	s.queueAlertDigest(kind, line)
 }
 
 // handleAgentEvent ingests an out-of-band event from an authenticated agent
@@ -9424,9 +9501,6 @@ func (s *Server) auditAgentAuthFailure(r *http.Request, nodeID, reason string) {
 	})
 }
 
-// clientIP resolves the address used as a rate-limit key. Proxy headers are
-// only honored when TrustProxy is set, preventing key spoofing in the direct
-// exposure case.
 // webhookVerifyConcurrency sizes the derivation semaphore from the machine
 // rather than from a guessed request rate.
 //
@@ -9459,25 +9533,12 @@ func (s *Server) acquireSecretVerify() (func(), bool) {
 	}
 }
 
+// clientIP resolves the address used as a rate-limit key, for audit
+// attribution, and for challenge and allowlist binding. Proxy headers are
+// honored only when TrustProxy is set and the immediate peer is a trusted
+// proxy; see resolveClientIP.
 func (s *Server) clientIP(r *http.Request) string {
-	if s.trustProxy {
-		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
-			return cf
-		}
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if comma := strings.IndexByte(xff, ','); comma >= 0 {
-				xff = xff[:comma]
-			}
-			if xff = strings.TrimSpace(xff); xff != "" {
-				return xff
-			}
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return resolveClientIP(r.RemoteAddr, r.Header, s.trustProxy, s.trustedProxies)
 }
 
 func unsafeMethod(method string) bool {

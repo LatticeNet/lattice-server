@@ -173,38 +173,6 @@ func (c *captureNotify) hook() func(string, string) {
 	}
 }
 
-func TestMonitorDownAndRecoveryAlerts(t *testing.T) {
-	srv, handler, _ := newDDNSServer(t) // reuses *Server accessor
-	cap := &captureNotify{}
-	srv.emitNotify = cap.hook()
-	cookies, csrf := loginSession(t, handler)
-	nodeID, nodeToken := enrollNode(t, handler, cookies, csrf)
-	create := doJSON(t, handler, http.MethodPost, "/api/monitors",
-		`{"name":"web","type":"tcp","target":"x:443","assign_all":true}`, cookies, csrf)
-	var mon struct {
-		ID string `json:"id"`
-	}
-	json.NewDecoder(create.Body).Decode(&mon)
-	create.Body.Close()
-
-	report := func(success bool, errMsg string) {
-		body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + mon.ID + `","success":` + boolStr(success) + `,"error":"` + errMsg + `"}}`
-		doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body, nodeToken)
-	}
-	report(true, "")              // first success: no transition
-	report(false, "conn refused") // down alert
-	report(true, "")              // recovery alert
-
-	cap.mu.Lock()
-	defer cap.mu.Unlock()
-	if len(cap.titles) != 2 {
-		t.Fatalf("expected 2 alerts (down, recovery), got %v", cap.titles)
-	}
-	if cap.titles[0] != "🔴 Monitor down" || cap.titles[1] != "✅ Monitor recovered" {
-		t.Fatalf("unexpected alert sequence: %v", cap.titles)
-	}
-}
-
 func TestAgentEventSSHLogin(t *testing.T) {
 	srv, handler, st := newDDNSServer(t)
 	cap := &captureNotify{}

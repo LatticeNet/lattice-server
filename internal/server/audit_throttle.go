@@ -132,3 +132,28 @@ func (t *auditFailureThrottle) evictOldestLocked() {
 		delete(t.entries, oldestKey)
 	}
 }
+
+// Flush removes every key whose window has closed and reports what those keys
+// folded since their last emission (sources with at least one fold, the total
+// folds) plus the global drops not yet carried by an emitted event. Without it
+// a burst that stops inside its window leaves only its first event behind and
+// the count of the rest is lost; a periodic caller turns those counts into one
+// summary record. Removing a closed key changes nothing for Allow, which
+// already treats it as a fresh candidate.
+func (t *auditFailureThrottle) Flush(now time.Time) (sources, suppressed, globalDropped int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for k, entry := range t.entries {
+		if now.Sub(entry.windowStart) < t.window {
+			continue
+		}
+		if entry.suppressed > 0 {
+			sources++
+			suppressed += entry.suppressed
+		}
+		delete(t.entries, k)
+	}
+	globalDropped = t.globalDropped
+	t.globalDropped = 0
+	return sources, suppressed, globalDropped
+}

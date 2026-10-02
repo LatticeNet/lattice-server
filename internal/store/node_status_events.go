@@ -25,9 +25,9 @@ import (
 // down; the sweep at start then flips whatever really died.
 //
 // Bounds: rows older than NodeStatusEventRetention go on the sweep tick, and
-// each id keeps at most maxNodeStatusEvents rows (the maxMonitorResults
-// pattern). Thirty-three nodes at the observed flap rate write about thirty
-// rows a day, well under both.
+// each id keeps at most maxNodeStatusEvents rows, as each monitor result pair
+// keeps at most MonitorResultsPerPair. Thirty-three nodes at the observed flap
+// rate write about thirty rows a day, well under both.
 const (
 	NodeStatusEventRetention = 30 * 24 * time.Hour
 	maxNodeStatusEvents      = 500

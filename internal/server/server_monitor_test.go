@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // enrollNode logs in as admin and enrolls a node, returning its id and token.
@@ -111,6 +113,16 @@ func TestMonitorRejectsICMP(t *testing.T) {
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("icmp should be rejected for now, got %d", res.StatusCode)
 	}
+}
+
+// storedMonitorResults is every stored result of a monitor, oldest first.
+func storedMonitorResults(t *testing.T, st *store.Store, monitorID string) []store.MonitorResultRecord {
+	t.Helper()
+	rows, err := st.RecentMonitorResults(monitorID, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
 }
 
 func serveReq(handler http.Handler, req *http.Request) *httptest.ResponseRecorder {

@@ -25,9 +25,6 @@ import (
 // sessions are evicted.
 const maxSessions = 4096
 
-// maxMonitorResults caps the retained history per monitor to bound state growth.
-const maxMonitorResults = 500
-
 // maxTaskResults bounds total retained task-execution results. On-disk state grew
 // unbounded otherwise; results are historical, so the oldest are evicted first.
 const maxTaskResults = 2000
@@ -37,7 +34,8 @@ const maxTaskResults = 2000
 const metricsPersistenceInterval = 5 * time.Minute
 
 // monitorResultPersistenceInterval keeps monitor history live in memory while
-// avoiding a full snapshot rewrite for every unchanged probe cycle.
+// avoiding a full snapshot rewrite for every unchanged probe cycle. It applies
+// only without the hot store, which writes every result at record level.
 const monitorResultPersistenceInterval = 5 * time.Minute
 
 // reportClockPersistInterval bounds how stale the received clocks of the
@@ -88,7 +86,7 @@ type State struct {
 	Sessions               map[string]auth.Session               `json:"sessions"`
 	DDNS                   map[string]model.DDNSProfile          `json:"ddns"`
 	Monitors               map[string]model.Monitor              `json:"monitors"`
-	MonResults             map[string][]model.MonitorResult      `json:"monitor_results"`
+	MonResults             map[string][]MonitorResultRecord      `json:"monitor_results"`
 	LogSources             map[string]model.LogSource            `json:"log_sources"`
 	TraceSessions          map[string]model.TraceSession         `json:"trace_sessions"`
 	NotifyChannels         map[string]model.NotifyChannel        `json:"notify_channels"`
@@ -537,14 +535,16 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 	// Whether the file still carries the two domains that just moved. The point
 	// of moving them is that state.json stops being rewritten with them in it,
 	// which only takes effect once the stale copy is actually dropped.
-	staleInJSON := len(s.state.KV) > 0 || len(s.state.Static) > 0
+	staleInJSON := len(s.state.KV) > 0 || len(s.state.Static) > 0 || len(s.state.MonResults) > 0
 	mergeRuntimeBoltHotState(&s.state, hot)
 	// syncRuntimeBoltHotState has just copied any JSON-side events into bolt,
 	// so the in-memory copy is now a duplicate of durable state that nothing
 	// reads. Dropping it is the point of the move.
 	s.state.Audit = nil
 	s.seedMetricsPersistence()
-	s.seedMonitorResultPersistence()
+	// Every result is a record-level write from here on, so the JSON
+	// throttle's bookkeeping has nothing left to describe.
+	s.monitorPersistedAt = map[string]time.Time{}
 	s.runtimeBoltHot = bs
 	s.runtimeBoltHotPath = path
 	if staleInJSON {
@@ -673,7 +673,11 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 			return err
 		}
 	}
-	return nil
+	// Monitor results leave the JSON state the same way, exactly once and
+	// behind their own flag. Production had no monitors when this moved, but
+	// a self-hosted store may carry history, and the latest records and
+	// failure streaks the alert hold reads are rebuilt from it.
+	return bs.MigrateMonitorResults(st.MonResults, MonitorResultsPerPair)
 }
 
 func mergeSubscriptionHotSeed(jsonState, unmarkedBolt State) State {
@@ -731,6 +735,7 @@ func mergeRuntimeBoltHotState(dst *State, hot State) {
 	dst.UsageDayNodes = map[string]UsageDayNode{}
 	dst.UsageDayUsers = map[string]UsageDayUser{}
 	dst.NodeStatusEvents = map[string]NodeStatusEvent{}
+	dst.MonResults = map[string][]MonitorResultRecord{}
 	// Once enabled, Bolt is authoritative for these hot collections, including
 	// explicit empty/delete state. Conditional non-empty merge resurrects records
 	// from the stale JSON bootstrap after a valid hot deletion.
@@ -806,7 +811,7 @@ func emptyState() State {
 		Sessions:                map[string]auth.Session{},
 		DDNS:                    map[string]model.DDNSProfile{},
 		Monitors:                map[string]model.Monitor{},
-		MonResults:              map[string][]model.MonitorResult{},
+		MonResults:              map[string][]MonitorResultRecord{},
 		LogSources:              map[string]model.LogSource{},
 		TraceSessions:           map[string]model.TraceSession{},
 		NotifyChannels:          map[string]model.NotifyChannel{},
@@ -927,7 +932,7 @@ func (st *State) ensureMaps() {
 		st.Monitors = map[string]model.Monitor{}
 	}
 	if st.MonResults == nil {
-		st.MonResults = map[string][]model.MonitorResult{}
+		st.MonResults = map[string][]MonitorResultRecord{}
 	}
 	if st.LogSources == nil {
 		st.LogSources = map[string]model.LogSource{}
@@ -1150,6 +1155,10 @@ func (s *Store) jsonPersistStateFrom(st State) State {
 	st.UsageDayNodes = map[string]UsageDayNode{}
 	st.UsageDayUsers = map[string]UsageDayUser{}
 	st.NodeStatusEvents = map[string]NodeStatusEvent{}
+	// Monitor results arrive from every node on every probe interval. Kept
+	// here, a fleet-wide monitor rewrote this file on every flip and every
+	// five minutes per node, the a101 write storm again.
+	st.MonResults = map[string][]MonitorResultRecord{}
 	// Shares are read on every public subscription fetch and written whenever one
 	// is created or rotated. They belong on the record-level path for the same
 	// reason proxy users do: keeping them here would put a hot read behind a file
@@ -5237,12 +5246,20 @@ func (s *Store) MonitorsForNode(nodeID string) []model.Monitor {
 	return out
 }
 
-// DeleteMonitor removes a monitor and its result history.
+// DeleteMonitor removes a monitor and its result history. The hot store's
+// rows go first: if that fails nothing has changed, and if the state write
+// fails after it the monitor survives with an empty history, which a retry
+// finishes deleting.
 func (s *Store) DeleteMonitor(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.state.Monitors[id]; !ok {
 		return nil
+	}
+	if s.runtimeBoltHot != nil {
+		if err := s.runtimeBoltHot.DeleteMonitorResults(id); err != nil {
+			return err
+		}
 	}
 	delete(s.state.Monitors, id)
 	delete(s.state.MonResults, id)
@@ -5252,64 +5269,6 @@ func (s *Store) DeleteMonitor(id string) error {
 		}
 	}
 	return s.Save()
-}
-
-// AddMonitorResult appends a probe result, keeping only the most recent
-// maxMonitorResults entries per monitor.
-func (s *Store) AddMonitorResult(r model.MonitorResult) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.monitorPersistedAt == nil {
-		s.monitorPersistedAt = map[string]time.Time{}
-	}
-	now := time.Now().UTC()
-	if r.At.IsZero() {
-		r.At = now
-	}
-	series := s.state.MonResults[r.MonitorID]
-	var prior, prior2 model.MonitorResult
-	hadPrior, hadPrior2 := false, false
-	for i := len(series) - 1; i >= 0; i-- {
-		if series[i].NodeID != r.NodeID {
-			continue
-		}
-		if !hadPrior {
-			prior, hadPrior = series[i], true
-			continue
-		}
-		prior2, hadPrior2 = series[i], true
-		break
-	}
-	series = append(series, r)
-	if len(series) > maxMonitorResults {
-		series = series[len(series)-maxMonitorResults:]
-	}
-	s.state.MonResults[r.MonitorID] = series
-
-	key := monitorResultPersistenceKey(r.MonitorID, r.NodeID)
-	transitioned := !hadPrior || prior.Success != r.Success || prior.Error != r.Error
-	// The second failure in a row is when monitor.down pages, and the alert
-	// rule reads it back from this history. Writing it at once keeps that
-	// decision true across a restart: without it the run could reload as a
-	// single failure, and the next success would owe no recovery for a page
-	// that was sent.
-	secondFailure := hadPrior && !r.Success && !prior.Success && (!hadPrior2 || prior2.Success)
-	lastPersisted, persisted := s.monitorPersistedAt[key]
-	if persisted && !transitioned && !secondFailure && now.Sub(lastPersisted) < monitorResultPersistenceInterval {
-		return nil
-	}
-	if err := s.Save(); err != nil {
-		return err
-	}
-	s.monitorPersistedAt[key] = now
-	return nil
-}
-
-// MonitorResults returns the result history for a monitor (oldest first).
-func (s *Store) MonitorResults(monitorID string) []model.MonitorResult {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]model.MonitorResult(nil), s.state.MonResults[monitorID]...)
 }
 
 // UpsertLogSource creates or updates a log source definition.
@@ -5566,34 +5525,6 @@ func (s *Store) DeleteNotifyChannel(id string) error {
 		}
 	}
 	return s.Save()
-}
-
-// LastMonitorResultsForNode returns up to n of a node's most recent results
-// for a monitor, newest first.
-func (s *Store) LastMonitorResultsForNode(monitorID, nodeID string, n int) []model.MonitorResult {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	series := s.state.MonResults[monitorID]
-	var out []model.MonitorResult
-	for i := len(series) - 1; i >= 0 && len(out) < n; i-- {
-		if series[i].NodeID == nodeID {
-			out = append(out, series[i])
-		}
-	}
-	return out
-}
-
-// LastMonitorResultForNode returns a node's most recent result for a monitor.
-func (s *Store) LastMonitorResultForNode(monitorID, nodeID string) (model.MonitorResult, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	series := s.state.MonResults[monitorID]
-	for i := len(series) - 1; i >= 0; i-- {
-		if series[i].NodeID == nodeID {
-			return series[i], true
-		}
-	}
-	return model.MonitorResult{}, false
 }
 
 // UpsertTunnel creates or updates a tunnel profile.

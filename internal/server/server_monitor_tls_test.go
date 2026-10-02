@@ -160,7 +160,7 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 	if probed := sweepAndFlush(srv); probed != 1 {
 		t.Fatalf("probed = %d, want 1", probed)
 	}
-	results := srv.store.MonitorResults(mon.ID)
+	results := storedMonitorResults(t, srv.store, mon.ID)
 	if len(results) != 1 {
 		t.Fatalf("results = %+v, want one", results)
 	}
@@ -185,7 +185,7 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 	if probed := sweepAndFlush(srv); probed != 1 {
 		t.Fatalf("second sweep probed = %d, want 1", probed)
 	}
-	results = srv.store.MonitorResults(mon.ID)
+	results = storedMonitorResults(t, srv.store, mon.ID)
 	if len(results) != 2 {
 		t.Fatalf("results = %+v, want two", results)
 	}
@@ -242,7 +242,7 @@ func TestTLSMonitorSkipsUntilIntervalElapses(t *testing.T) {
 	if probed := srv.sweepTLSMonitorsOnce(context.Background()); probed != 0 {
 		t.Fatalf("probed = %d before the interval elapsed, want 0", probed)
 	}
-	if got := len(srv.store.MonitorResults(mon.ID)); got != 1 {
+	if got := len(storedMonitorResults(t, srv.store, mon.ID)); got != 1 {
 		t.Fatalf("results = %d, want the single first probe", got)
 	}
 }
@@ -263,7 +263,7 @@ func TestTLSMonitorUnreachableTargetFails(t *testing.T) {
 	mon := createTLSMonitor(t, handler, cookies, csrf,
 		`{"name":"cert","type":"tls","target":"dns.test.invalid:8443","threshold_days":14}`)
 	srv.sweepTLSMonitorsOnce(context.Background())
-	results := srv.store.MonitorResults(mon.ID)
+	results := storedMonitorResults(t, srv.store, mon.ID)
 	if len(results) != 1 || results[0].Success {
 		t.Fatalf("an unreachable target must fail: %+v", results)
 	}

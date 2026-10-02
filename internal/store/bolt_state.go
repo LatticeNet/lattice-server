@@ -54,6 +54,8 @@ var (
 	boltBucketDDNS             = []byte("ddns")
 	boltBucketMonitors         = []byte("monitors")
 	boltBucketMonResults       = []byte("monitor_results")
+	boltBucketMonResultRows    = []byte("monitor_result_rows")
+	boltBucketMonResultLatest  = []byte("monitor_result_latest")
 	boltBucketLogSources       = []byte("log_sources")
 	boltBucketNotifyChannels   = []byte("notify_channels")
 	boltBucketNotifyRules      = []byte("notify_rules")
@@ -157,6 +159,8 @@ var boltStateBuckets = [][]byte{
 	boltBucketDDNS,
 	boltBucketMonitors,
 	boltBucketMonResults,
+	boltBucketMonResultRows,
+	boltBucketMonResultLatest,
 	boltBucketLogSources,
 	boltBucketNotifyChannels,
 	boltBucketNotifyRules,
@@ -456,7 +460,7 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putMap(tx, boltBucketMonitors, persist.Monitors); err != nil {
 			return err
 		}
-		if err := putMap(tx, boltBucketMonResults, persist.MonResults); err != nil {
+		if err := importMonitorResultSeriesTx(tx, persist.MonResults, MonitorResultsPerPair); err != nil {
 			return err
 		}
 		if err := putMap(tx, boltBucketLogSources, persist.LogSources); err != nil {
@@ -701,9 +705,6 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 		if err := readMap(tx, boltBucketMonitors, st.Monitors); err != nil {
 			return err
 		}
-		if err := readMap(tx, boltBucketMonResults, st.MonResults); err != nil {
-			return err
-		}
 		if err := readMap(tx, boltBucketLogSources, st.LogSources); err != nil {
 			return err
 		}
@@ -782,6 +783,15 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 				return err
 			}
 			if err := readMap(tx, boltBucketNodeStatusEvents, st.NodeStatusEvents); err != nil {
+				return err
+			}
+			// Monitor results take the same placement. A state.db written
+			// before the rows existed still carries its series in the legacy
+			// bucket, so the export reads both.
+			if err := readMap(tx, boltBucketMonResults, st.MonResults); err != nil {
+				return err
+			}
+			if err := readMonitorResultRowsTx(tx, st.MonResults); err != nil {
 				return err
 			}
 		}
@@ -1767,79 +1777,8 @@ func (bs *BoltStateStore) DeleteMonitor(id string) error {
 		if err := deleteRecord(tx, boltBucketMonitors, id); err != nil {
 			return err
 		}
-		return deleteRecord(tx, boltBucketMonResults, id)
+		return deleteMonitorResultsTx(tx, id)
 	})
-}
-
-func (bs *BoltStateStore) AddMonitorResult(r model.MonitorResult) error {
-	if r.At.IsZero() {
-		r.At = time.Now().UTC()
-	}
-	return bs.db.Update(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		series := []model.MonitorResult{}
-		ok, err := getRecord(tx, boltBucketMonResults, r.MonitorID, &series)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			series = []model.MonitorResult{}
-		}
-		series = append(series, r)
-		if len(series) > maxMonitorResults {
-			series = series[len(series)-maxMonitorResults:]
-		}
-		return putRecord(tx, boltBucketMonResults, r.MonitorID, series)
-	})
-}
-
-func (bs *BoltStateStore) MonitorResults(monitorID string) ([]model.MonitorResult, error) {
-	series := []model.MonitorResult{}
-	err := bs.db.View(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		ok, err := getRecord(tx, boltBucketMonResults, monitorID, &series)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			series = []model.MonitorResult{}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return append([]model.MonitorResult(nil), series...), nil
-}
-
-func (bs *BoltStateStore) LastMonitorResultForNode(monitorID, nodeID string) (model.MonitorResult, bool, error) {
-	var series []model.MonitorResult
-	err := bs.db.View(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		ok, err := getRecord(tx, boltBucketMonResults, monitorID, &series)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			series = nil
-		}
-		return nil
-	})
-	if err != nil {
-		return model.MonitorResult{}, false, err
-	}
-	for i := len(series) - 1; i >= 0; i-- {
-		if series[i].NodeID == nodeID {
-			return series[i], true, nil
-		}
-	}
-	return model.MonitorResult{}, false, nil
 }
 
 func (bs *BoltStateStore) UpsertTunnel(t model.TunnelProfile) error {

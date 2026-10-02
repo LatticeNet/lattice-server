@@ -115,10 +115,10 @@ func seedNodeCascade(t *testing.T) *Store {
 	if err := s.UpsertMonitor(model.Monitor{ID: "mon-1", Type: model.MonitorTypeTCP, NodeIDs: []string{node, other}}); err != nil {
 		t.Fatalf("monitor: %v", err)
 	}
-	if err := s.AddMonitorResult(model.MonitorResult{MonitorID: "mon-1", NodeID: node}); err != nil {
+	if _, err := s.AddMonitorResult(model.MonitorResult{MonitorID: "mon-1", NodeID: node}); err != nil {
 		t.Fatalf("mon result node: %v", err)
 	}
-	if err := s.AddMonitorResult(model.MonitorResult{MonitorID: "mon-1", NodeID: other}); err != nil {
+	if _, err := s.AddMonitorResult(model.MonitorResult{MonitorID: "mon-1", NodeID: other}); err != nil {
 		t.Fatalf("mon result other: %v", err)
 	}
 	// Step 13: log source.
@@ -293,7 +293,10 @@ func TestDeleteNodeCascade(t *testing.T) {
 	} else if contains(mon.NodeIDs, "node-target") {
 		t.Fatalf("monitor still assigned to node: %v", mon.NodeIDs)
 	}
-	monResults := s.MonitorResults("mon-1")
+	monResults, err := s.RecentMonitorResults("mon-1", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(monResults) != 1 || monResults[0].NodeID != "node-other" {
 		t.Fatalf("monitor results = %+v want one for node-other", monResults)
 	}

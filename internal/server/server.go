@@ -5094,12 +5094,12 @@ func (s *Server) handleMonitorResults(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 		return
 	}
-	results := s.store.MonitorResults(monitorID)
-	visible := make([]model.MonitorResult, 0, len(results))
-	for _, result := range results {
-		if rbac.Allows(p.Principal, "monitor:read", result.NodeID) {
-			visible = append(visible, result)
-		}
+	visible, err := s.store.RecentMonitorResults(monitorID, defaultMonitorResultsLimit, func(nodeID string) bool {
+		return rbac.Allows(p.Principal, "monitor:read", nodeID)
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, visible)
 }
@@ -5140,29 +5140,6 @@ func (s *Server) handleAgentMonitors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.store.MonitorsForNode(nodeID))
-}
-
-// handleAgentMonitorResult ingests a probe outcome from an authenticated agent.
-func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		agentAuthRequest
-		Result model.MonitorResult `json:"result"`
-	}
-	if !decodeAgentJSON(w, r, &req) {
-		return
-	}
-	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
-		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
-		return
-	}
-	req.Result.NodeID = req.NodeID
-	history := s.store.LastMonitorResultsForNode(req.Result.MonitorID, req.NodeID, 2)
-	if err := s.store.AddMonitorResult(req.Result); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	s.notifyMonitorTransition(req.NodeID, req.Result, history)
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // notifyChannelView is the secret-free projection of a notification channel.
@@ -5609,27 +5586,27 @@ const (
 )
 
 // notifyMonitorTransition decides monitor.down and monitor.recovered for one
-// (monitor, node) pair. history is the pair's results before current, newest
-// first (LastMonitorResultsForNode with n=2, read before current was stored).
+// (monitor, node) pair. priorFailStreak is the pair's failures in a row
+// before current, as the store recorded it with current.
 //
 // monitor.down waits for two failures in a row: a single failed probe is a
 // dropped packet or a busy target as often as an outage, and paging on it
 // teaches the operator to ignore the page. monitor.recovered follows only a
-// run that paged, so the phone's last message is always true. Both are read
-// off the stored history rather than kept in memory, and the store writes the
-// second failure at once, so a restart neither repeats a page nor loses the
-// recovery it owes.
+// run that paged, so the phone's last message is always true. Both read the
+// failure streak the store keeps per pair. The hot store writes it in the same
+// transaction as the result, and the JSON fallback writes the second failure
+// of a run at once, so a restart neither repeats a page nor loses the
+// recovery it owes. A result the store held already (a retried batch) is
+// never passed here.
 //
 // The notice is queued for the sweep's digest, so an all-nodes monitor whose
 // target goes down pages once, naming every node.
-func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, history []model.MonitorResult) {
-	failed := func(i int) bool { return i < len(history) && !history[i].Success }
-	succeededOrAbsent := func(i int) bool { return i >= len(history) || history[i].Success }
+func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, priorFailStreak int) {
 	var kind string
 	switch {
-	case !current.Success && failed(0) && succeededOrAbsent(1):
+	case !current.Success && priorFailStreak == 1:
 		kind = EventMonitorDown
-	case current.Success && failed(0) && failed(1):
+	case current.Success && priorFailStreak >= 2:
 		kind = EventMonitorRecovered
 	default:
 		return

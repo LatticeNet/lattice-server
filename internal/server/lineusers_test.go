@@ -166,6 +166,87 @@ func TestApprovingALineUserPlanQueuesItsApply(t *testing.T) {
 	}
 }
 
+// lineUserScriptPrelude is the start of every adopted line-user apply script.
+const lineUserScriptPrelude = "set -e\n" +
+	"SB_BIN=\"${LATTICE_SINGBOX_BIN:-sb}\"\n" +
+	"command -v \"$SB_BIN\" >/dev/null 2>&1 || { echo 'lattice lineuser: sb binary not found' >&2; exit 1; }\n"
+
+// Deleting a user does not take its credential off an adopted line, and
+// plan_remove needed the user record: a removal filed before the deletion
+// failed with "no longer exists", and none could be filed after it. Both now
+// complete. The script deletes the one name derived from the deleted user's
+// id and the line, and no user record comes back.
+func TestRemovingADeletedUsersCredentialFromAnAdoptedLine(t *testing.T) {
+	for _, filed := range []string{"before the deletion", "after the deletion"} {
+		t.Run(filed, func(t *testing.T) {
+			srv := newLinemetaTestServer(t, mustOpenStore(t))
+			line, u := seedLineUserFixture(t, srv)
+			var approval model.Approval
+			if filed == "before the deletion" {
+				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+			}
+			if err := srv.deleteVpnUser(u.ID); err != nil {
+				t.Fatal(err)
+			}
+			if filed == "after the deletion" {
+				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+				if !strings.Contains(approval.Plan, "deleted user "+u.ID) {
+					t.Fatalf("the plan must say the user is deleted: %s", approval.Plan)
+				}
+			}
+			if err := approvePlan(t, srv, approval); err != nil {
+				t.Fatalf("approve: %v", err)
+			}
+			tasks := tasksFor(srv, approval.ID)
+			if len(tasks) != 1 || len(tasks[0].Targets) != 1 || tasks[0].Targets[0] != "node-a" {
+				t.Fatalf("approval queued %+v, want one task on node-a", tasks)
+			}
+			want := lineUserScriptPrelude + `"$SB_BIN" user del 'hub-a' '` + userLineName(u.ID, line.LineUUID) + `'` + "\n"
+			if tasks[0].Script != want {
+				t.Fatalf("task script:\n%s\nwant:\n%s", tasks[0].Script, want)
+			}
+			request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
+			if err := srv.handleApprovalTaskResult(request, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: "node-a"}); err != nil {
+				t.Fatalf("successful result: %v", err)
+			}
+			if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalApplied {
+				t.Fatalf("status = %q reason %q, want applied", stored.Status, stored.Reason)
+			}
+			if _, ok := srv.getVpnUser(u.ID); ok {
+				t.Fatal("reconciling the removal recreated the deleted user")
+			}
+		})
+	}
+}
+
+// A deleted user still cannot be added or updated, and a managed line's
+// removal is left to its config apply, since its render already leaves the
+// user out.
+func TestADeletedUserIsPlannedOnlyForRemovalFromAnAdoptedLine(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	if err := srv.deleteVpnUser(u.ID); err != nil {
+		t.Fatal(err)
+	}
+	request := mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID})
+	for _, op := range []string{lineUserOpAdd, lineUserOpUpdate} {
+		if _, err := srv.vpnUserLinePlan(lineUserTestPrincipal(), request, op); err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("plan_%s for a deleted user: %v, want not found", op, err)
+		}
+	}
+
+	managedSrv := newLinemetaTestServer(t, mustOpenStore(t))
+	managedLine, identity := seedManagedLineUserFixture(t, managedSrv)
+	if err := managedSrv.deleteVpnUser(identity.ID); err != nil {
+		t.Fatal(err)
+	}
+	_, err := managedSrv.vpnUserLinePlan(lineUserTestPrincipal(),
+		mustJSON(t, map[string]string{"user_id": identity.ID, "line_hash_id": managedLine.LineHashID}), lineUserOpRemove)
+	if err == nil || !strings.Contains(err.Error(), "already leaves it out of its render") {
+		t.Fatalf("plan_remove on a managed line for a deleted user: %v, want the render refusal", err)
+	}
+}
+
 // lineUserAudit returns the audit events with action that name approvalID.
 func lineUserAudit(srv *Server, action, approvalID string) []model.AuditEvent {
 	var out []model.AuditEvent
@@ -193,9 +274,6 @@ func lineUserBoundTo(t *testing.T, srv *Server, userID, lineHashID string) bool 
 // runs, the approve audit event, and what the task result then does to the
 // binding and the approval, on a failed run and on a successful retry.
 func TestApprovedAdoptedLineUserPlanRunsTheReviewedArgv(t *testing.T) {
-	const prelude = "set -e\n" +
-		"SB_BIN=\"${LATTICE_SINGBOX_BIN:-sb}\"\n" +
-		"command -v \"$SB_BIN\" >/dev/null 2>&1 || { echo 'lattice lineuser: sb binary not found' >&2; exit 1; }\n"
 	// The payload is spelled out rather than re-derived, so a change to the
 	// credential bytes that reach sb fails here.
 	userAdd := func(name string) string {
@@ -237,7 +315,7 @@ func TestApprovedAdoptedLineUserPlanRunsTheReviewedArgv(t *testing.T) {
 			if len(first.Targets) != 1 || first.Targets[0] != "node-a" {
 				t.Fatalf("task targets = %q, want exactly [node-a]", first.Targets)
 			}
-			want := prelude + tc.argv(userLineName(u.ID, line.LineUUID))
+			want := lineUserScriptPrelude + tc.argv(userLineName(u.ID, line.LineUUID))
 			if first.Script != want {
 				t.Fatalf("task script:\n%s\nwant:\n%s", first.Script, want)
 			}

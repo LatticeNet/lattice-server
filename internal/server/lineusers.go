@@ -239,6 +239,9 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	}
 	u, ok := s.getVpnUser(strings.TrimSpace(req.UserID))
 	if !ok {
+		if op == lineUserOpRemove {
+			return s.deletedUserLineRemovePlan(ctxPrincipal, strings.TrimSpace(req.UserID), strings.TrimSpace(req.LineHashID))
+		}
 		return nil, fmt.Errorf("vpn-core/users-admin plan_%s: user %q not found", op, req.UserID)
 	}
 	if (op == lineUserOpAdd || op == lineUserOpUpdate) && !u.Enabled {
@@ -323,40 +326,87 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 		Summary:      summary,
 		Omitted:      omitted,
 	}
+	return s.fileLineUserPlan(ctxPrincipal, plan, map[string]string{"quota_changed": strconv.FormatBool(quotaChanged)})
+}
+
+// deletedUserLineRemovePlan files plan_remove for a user that no longer
+// exists. Deleting a user does not take its credential off an adopted line,
+// where Lattice added it with sb user add, and plan_remove used to need the
+// user record, so nothing in Lattice could take it off. sb user del needs
+// only the line's tag and the on-box name, and the name is derived from the
+// user id and the line UUID alone (userLineName), so the plan removes that
+// one credential and nothing else. There is no record left to check a
+// binding against, and the node reports a user count but no names, so the
+// operator supplies the id and Lattice cannot confirm before the task runs
+// that the node holds that name. A managed line needs no such plan: its render
+// already leaves a deleted user out, and the line's next config apply
+// removes it.
+func (s *Server) deletedUserLineRemovePlan(ctxPrincipal principal, userID, lineHashID string) ([]byte, error) {
+	if userID == "" {
+		return nil, errors.New("vpn-core/users-admin plan_remove: user_id is required")
+	}
+	ln, err := s.resolveLineUserTarget(lineHashID)
+	if err != nil {
+		return nil, err
+	}
+	if ln.Managed {
+		return nil, fmt.Errorf("user %q no longer exists, and managed line %q already leaves it out of its render; apply the line's config to remove it", userID, ln.LineHashID)
+	}
+	name := userLineName(userID, ln.LineUUID)
+	sha, err := lineUserCredentialSHA(lineUserCredentialPayload{Name: name})
+	if err != nil {
+		return nil, err
+	}
+	plan := lineUserPlan{
+		Op: lineUserOpRemove, Track: lineUserTrackAdopted, NodeID: ln.NodeID, Line: ln.Tag,
+		LineHashID: ln.LineHashID, LineUUID: ln.LineUUID,
+		UserID: userID, UserName: name, Protocol: ln.Type, CredentialSHA256: sha,
+		Summary: fmt.Sprintf("sb user remove %s on node %s (deleted user %s as %s, credential sha %s…)",
+			ln.Tag, ln.NodeID, userID, name, sha[:12]),
+	}
+	return s.fileLineUserPlan(ctxPrincipal, plan, map[string]string{"user_deleted": "true"})
+}
+
+// fileLineUserPlan stores plan as a pending line-user approval, records the
+// plan audit event with extra metadata, and answers the approval.
+func (s *Server) fileLineUserPlan(ctxPrincipal principal, plan lineUserPlan, extra map[string]string) ([]byte, error) {
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
 		return nil, err
 	}
 	approval := model.Approval{
 		ID:            id.New("approval"),
-		NodeID:        ln.NodeID,
+		NodeID:        plan.NodeID,
 		Plugin:        singBoxLineUserPlugin,
-		Action:        lineUserActionPrefix + sha,
+		Action:        lineUserActionPrefix + plan.CredentialSHA256,
 		Plan:          string(planJSON),
 		Status:        model.ApprovalPending,
 		ActorID:       ctxPrincipal.ActorID,
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
-		PluginVersion: "design-15", Service: vpnCoreUsersAdminService, Method: "apply_" + op,
-		RequestSHA256: lineUserRequestSHA(u.ID, ln.LineHashID), Targets: []string{ln.NodeID},
+		PluginVersion: "design-15", Service: vpnCoreUsersAdminService, Method: "apply_" + plan.Op,
+		RequestSHA256: lineUserRequestSHA(plan.UserID, plan.LineHashID), Targets: []string{plan.NodeID},
 	}
-	if configSHA != "" {
-		approval.ArtifactDigest = configSHA
+	if plan.ConfigSHA256 != "" {
+		approval.ArtifactDigest = plan.ConfigSHA256
 	} else {
-		approval.ArtifactDigest = sha
+		approval.ArtifactDigest = plan.CredentialSHA256
 	}
 	// The plugin-RPC dispatch layer carries no request context; policy
 	// evaluation here is synchronous and not request-bound.
 	if _, err := s.submitApproval(context.Background(), approval); err != nil {
 		return nil, err
 	}
+	metadata := map[string]string{
+		"approval_id": approval.ID, "op": plan.Op, "user_id": plan.UserID,
+		"line_hash_id": plan.LineHashID, "credential_sha256": plan.CredentialSHA256,
+	}
+	for k, v := range extra {
+		metadata[k] = v
+	}
 	s.recordPrincipalAudit(ctxPrincipal, model.AuditEvent{
-		ID: id.New("audit"), NodeID: ln.NodeID, Action: "vpnuser.line.plan", Scope: "proxy:admin",
-		Metadata: map[string]string{
-			"approval_id": approval.ID, "op": op, "user_id": u.ID,
-			"line_hash_id": ln.LineHashID, "credential_sha256": sha,
-			"quota_changed": strconv.FormatBool(quotaChanged),
-		},
+		ID: id.New("audit"), NodeID: plan.NodeID, Action: "vpnuser.line.plan", Scope: "proxy:admin",
+		Metadata: metadata,
 	})
 	return json.Marshal(struct {
 		Approval model.Approval `json:"approval"`
@@ -464,6 +514,9 @@ func (s *Server) validateLineUserApproval(approval model.Approval, checkGrant bo
 	}
 	user, ok := s.getVpnUser(plan.UserID)
 	if !ok {
+		if plan.Op == lineUserOpRemove {
+			return s.validateDeletedUserLineRemove(approval, plan)
+		}
 		return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, fmt.Errorf("user %q no longer exists; re-plan", plan.UserID)
 	}
 	if checkGrant {
@@ -509,6 +562,35 @@ func (s *Server) validateLineUserApproval(approval model.Approval, checkGrant bo
 		return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, errors.New("adopted artifact binding changed; re-plan")
 	}
 	return plan, user, line, payload, nil, nil
+}
+
+// validateDeletedUserLineRemove checks an adopted plan_remove whose user no
+// longer exists, whether it was filed before the deletion or after it
+// (deletedUserLineRemovePlan). Its script needs only the line's tag and the
+// on-box name, so this checks those against the line as it is now and
+// against the plan's own bindings, and skips the credential and binding
+// checks, which need the user record. A managed remove for a deleted user
+// stays refused: the render already leaves the user out.
+func (s *Server) validateDeletedUserLineRemove(approval model.Approval, plan lineUserPlan) (lineUserPlan, VpnUser, Line, lineUserCredentialPayload, *proxycore.Artifact, error) {
+	fail := func(err error) (lineUserPlan, VpnUser, Line, lineUserCredentialPayload, *proxycore.Artifact, error) {
+		return lineUserPlan{}, VpnUser{}, Line{}, lineUserCredentialPayload{}, nil, err
+	}
+	line, err := s.resolveLineUserTarget(plan.LineHashID)
+	if err != nil {
+		return fail(fmt.Errorf("resolve current line: %w; re-plan", err))
+	}
+	if line.Managed || plan.Track != lineUserTrackAdopted {
+		return fail(fmt.Errorf("user %q no longer exists; re-plan", plan.UserID))
+	}
+	if plan.NodeID != line.NodeID || plan.Line != line.Tag || plan.LineUUID != line.LineUUID ||
+		plan.Protocol != line.Type || plan.UserName != userLineName(plan.UserID, line.LineUUID) {
+		return fail(errors.New("line identity, track, tag, UUID, or protocol changed; re-plan"))
+	}
+	if plan.ConfigSHA256 != "" || plan.CredentialSHA256 == "" || approval.ArtifactDigest != plan.CredentialSHA256 ||
+		strings.TrimPrefix(approval.Action, lineUserActionPrefix) != plan.CredentialSHA256 {
+		return fail(errors.New("adopted artifact binding changed; re-plan"))
+	}
+	return plan, VpnUser{}, line, lineUserCredentialPayload{Name: plan.UserName}, nil, nil
 }
 
 // lineUserApplyScript renders the on-box `sb user add|del` invocation for an

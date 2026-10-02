@@ -308,8 +308,19 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	// record, so no write could invalidate the body it ends. The user's
 	// status is checked before the cache, and a user the policy no longer
 	// serves never gets a body cached while it was active.
+	//
+	// The user is resolved once per request, and a miss renders from the
+	// same resolution: the identity policy behind it reads the quota's
+	// usage (one day-row range read for a monthly quota), which this
+	// unauthenticated endpoint should pay once, not twice.
+	var coreUser *model.ProxyUser
 	if share.Source.Kind == model.ShareSourceCoreProxyUser {
-		if user, ok := s.coreShareUser(share.Source.ProxyUserID, s.now()); !ok || derivedProxyUserStatusAt(user, s.now()) != model.ProxyUserStatusActive {
+		now := s.now()
+		user, ok := s.coreShareUser(share.Source.ProxyUserID, now)
+		if ok {
+			coreUser = &user
+		}
+		if !ok || derivedProxyUserStatusAt(user, now) != model.ProxyUserStatusActive {
 			s.subscriptionCache.InvalidateShare(share.ID)
 		}
 	}
@@ -372,7 +383,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		}
 		accepted := false
 		for attempt := 0; attempt < attempts; attempt++ {
-			rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass, variant)
+			rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass, variant, coreUser)
 			if renderErr != nil {
 				s.logger.Printf("subscription share: render failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(renderErr))
 				deny("subscription_render_failed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
@@ -584,14 +595,15 @@ func (s *Server) invalidateSharesForSource(pluginID, subscriptionID string) {
 
 // renderShare asks the share's source for content. It never shows the source the
 // token and never lets it influence the response beyond the bytes and a content
-// type.
-func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string, variant shareRenderVariant) (renderedSubscription, error) {
+// type. coreUser is a core share's user as the handler resolved it
+// (coreShareUser), nil when it was not found; other sources ignore it.
+func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string, variant shareRenderVariant, coreUser *model.ProxyUser) (renderedSubscription, error) {
 	switch share.Source.Kind {
 	case model.ShareSourceCoreProxyUser:
-		user, ok := s.coreShareUser(share.Source.ProxyUserID, s.now())
-		if !ok {
+		if coreUser == nil {
 			return renderedSubscription{}, errors.New("share source user not found")
 		}
+		user := *coreUser
 		endpoints, _, err := proxycore.VLESSRealityEndpoints(user, s.proxySubscriptionProfiles(), s.store.ProxyInbounds(), proxycore.SubscriptionOptions{Now: s.now(), NodeServiceStates: s.singBoxDownNodes()})
 		if err != nil {
 			return renderedSubscription{}, err

@@ -363,7 +363,7 @@ func (s *Server) putSubscriptionCacheForSource(key subscriptionCacheKey, pluginI
 	if publication.epoch != expectedEpoch {
 		return false
 	}
-	s.subscriptionCache.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion, entry.publicSourceVersion, entry.stale, entry.fetchedAt, now)
+	s.subscriptionCache.putEntry(key, entry, now)
 	return true
 }
 

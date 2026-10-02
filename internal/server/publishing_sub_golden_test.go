@@ -218,6 +218,15 @@ func transcribeAudit(events []model.AuditEvent) string {
 // application/json. The issued subscription URL carries no query parameters and
 // did not move.
 //
+// It was regenerated a second time when links began serving each client its
+// native document. The core now asks the source for the bare document
+// whenever it knows the client is not reading a URI list, so the base64
+// envelope no longer wraps YAML, JSON or Surge profiles. Seven cases moved:
+// bare (a Surge agent) and clash ua render with format plain, and clash ua is
+// labelled text/yaml; target stash, target singbox, platform alias, include
+// unsupported and pretty yaml render with format plain. The bare URL with no
+// agent or an unknown agent still receives the base64 URI list.
+//
 // Treat any future movement the same way: prove it was intended and name the
 // cases that changed, or the URL in someone's proxy client is what moved.
 func TestSubscriptionShareWireTranscriptIsGolden(t *testing.T) {

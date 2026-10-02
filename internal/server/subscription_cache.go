@@ -29,6 +29,9 @@ type subscriptionCacheEntry struct {
 	size     int
 
 	contentType string
+	// wireType is the Content-Type the core derived for this body when it
+	// rendered it, kept with the body so a hit answers with the same label.
+	wireType string
 	// userinfo is the provider's traffic header. It travels with the body rather
 	// than in a parallel map so a cache hit can never serve one client's body
 	// with another's remaining-quota figures.
@@ -172,7 +175,14 @@ func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentTy
 }
 
 func (c *subscriptionCache) PutSnapshot(key subscriptionCacheKey, body []byte, contentType, userinfo, revalidationVersion, publicSourceVersion string, stale bool, fetchedAt, now time.Time) {
-	if len(body) == 0 {
+	c.putEntry(key, subscriptionCacheEntry{body: body, contentType: contentType, userinfo: userinfo, revalidationVersion: revalidationVersion,
+		publicSourceVersion: publicSourceVersion, stale: stale, fetchedAt: fetchedAt}, now)
+}
+
+// putEntry stores a copy of in under key. Only the fields a caller sets are
+// read: key, revision, size and expiry are the cache's own.
+func (c *subscriptionCache) putEntry(key subscriptionCacheKey, in subscriptionCacheEntry, now time.Time) {
+	if len(in.body) == 0 {
 		return
 	}
 	c.mu.Lock()
@@ -180,9 +190,10 @@ func (c *subscriptionCache) PutSnapshot(key subscriptionCacheKey, body []byte, c
 	c.nextRevision++
 	storedKey := subscriptionCacheKey{ShareID: strings.Clone(key.ShareID), Format: strings.Clone(key.Format), UAClass: strings.Clone(key.UAClass), Variant: strings.Clone(key.Variant)}
 	entry := &subscriptionCacheEntry{
-		key: storedKey, body: append([]byte(nil), body...), revision: c.nextRevision,
-		contentType: strings.Clone(contentType), userinfo: strings.Clone(userinfo), revalidationVersion: strings.Clone(revalidationVersion), publicSourceVersion: strings.Clone(publicSourceVersion),
-		stale: stale, fetchedAt: fetchedAt, expiresAt: now.Add(c.ttl),
+		key: storedKey, body: append([]byte(nil), in.body...), revision: c.nextRevision,
+		contentType: strings.Clone(in.contentType), wireType: strings.Clone(in.wireType), userinfo: strings.Clone(in.userinfo),
+		revalidationVersion: strings.Clone(in.revalidationVersion), publicSourceVersion: strings.Clone(in.publicSourceVersion),
+		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl),
 	}
 	entry.size = subscriptionCacheEntrySize(*entry)
 	if entry.size > c.maxBytes {
@@ -235,6 +246,6 @@ func (c *subscriptionCache) removeElement(el *list.Element) {
 }
 
 func subscriptionCacheEntrySize(entry subscriptionCacheEntry) int {
-	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.contentType) +
+	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.contentType) + len(entry.wireType) +
 		len(entry.userinfo) + len(entry.revalidationVersion) + len(entry.publicSourceVersion)
 }

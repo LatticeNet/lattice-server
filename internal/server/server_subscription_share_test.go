@@ -364,7 +364,7 @@ func TestSubscriptionSharePropagatesStaleAndRecoveryAcrossSiblingShares(t *testi
 		t.Fatal(err)
 	}
 	keyA := subscriptionCacheKey{ShareID: "s1", Format: "plain", UAClass: "surge"}
-	keyB := subscriptionCacheKey{ShareID: "s2", Format: "base64", UAClass: "clash"}
+	keyB := subscriptionCacheKey{ShareID: "s2", Format: "plain", UAClass: "clash"}
 	version := subscriptionContentHash("last-good")
 	s.subscriptionCache.PutSnapshot(keyA, []byte("body-a"), "text/plain", "upload=1", version, "", false, fetchedAt, s.now().Add(-subscriptionCacheTTL-time.Second))
 	s.subscriptionCache.PutSnapshot(keyB, []byte("body-b"), "text/plain", "upload=1", version, "", false, fetchedAt, s.now())

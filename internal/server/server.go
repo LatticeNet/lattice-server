@@ -643,9 +643,11 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("migrate vpn user secrets: %w", err)
 	}
 	// Once per store, after the identities exist: what approval history says
-	// each binding's node holds (identity-sub P3).
+	// each binding's node holds (identity-sub P3). The field is advisory, so
+	// a failure is logged rather than fatal: its marker is written only with
+	// a successful backfill, so the next boot tries again.
 	if err := s.backfillLineUserAppliedCredentials(); err != nil {
-		return nil, err
+		s.logger.Printf("vpn-core: %v; the next boot retries it", err)
 	}
 	// Before the scheduler's first run, so machines that already carry a
 	// renewal date are reminded from the first evaluation.

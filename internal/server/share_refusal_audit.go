@@ -26,7 +26,15 @@ import (
 // A refusal after a valid token resolved (render failed, refresh failed,
 // target refused) is keyed by the share as well, so a prober from the same
 // network cannot fold a real share's failure out of sight. A caller cannot
-// widen that key space without holding valid tokens.
+// widen that key space without holding valid tokens. Those refusals also have
+// their own global bucket: refusals before a token resolves cost a prober
+// nothing, and on one shared bucket twenty of them from rotating addresses
+// would drop every share failure that followed until it refilled, leaving
+// only a count where the share id should be.
+//
+// A folded refusal keeps only its count: the slug and token hash of repeats
+// from a source are not recorded, the same trade the login failure throttle
+// makes. The first refusal of each window from that source carries them.
 const (
 	shareRefusalAuditWindow       = time.Minute
 	shareRefusalAuditBurst        = 20
@@ -35,6 +43,9 @@ const (
 	shareRefusalSummaryReason     = "refusals throttled"
 )
 
+// newShareRefusalAuditThrottle builds one refusal throttle. The server holds
+// two: one for refusals before a token resolves and one for refusals that
+// carry a share id.
 func newShareRefusalAuditThrottle() *auditFailureThrottle {
 	return newAuditFailureThrottle(shareRefusalAuditWindow, shareRefusalAuditBurst, shareRefusalAuditRefillPerSec)
 }
@@ -46,10 +57,12 @@ func newShareRefusalAuditThrottle() *auditFailureThrottle {
 func (s *Server) auditShareRefusal(r *http.Request, reason string, meta map[string]string) {
 	sourceIP := s.clientIP(r)
 	key := "share|" + auditBucketedIP(sourceIP)
+	throttle := s.shareRefusalAudit
 	if shareID := meta["share_id"]; shareID != "" {
 		key += "|" + shareID
+		throttle = s.shareResolvedRefusalAudit
 	}
-	emit, suppressed, dropped := s.shareRefusalAudit.Allow(key, s.now())
+	emit, suppressed, dropped := throttle.Allow(key, s.now())
 	if !emit {
 		return
 	}
@@ -78,11 +91,18 @@ func (s *Server) auditShareRefusal(r *http.Request, reason string, meta map[stri
 	}()
 }
 
-// flushShareRefusalAudit writes one summary event for refusals the throttle
-// folded or dropped and that no later event carried. It writes nothing when
-// there is nothing to report, so a quiet server pays nothing.
+// flushShareRefusalAudit writes one summary event for refusals the throttles
+// folded or dropped and that no later event carried. The plain keys count
+// both throttles; the share_ keys repeat the part that came from refusals
+// carrying a share id, so a share failure hidden in a flood is still visible
+// as one. It writes nothing when there is nothing to report, so a quiet
+// server pays nothing.
 func (s *Server) flushShareRefusalAudit(now time.Time) {
 	sources, suppressed, dropped := s.shareRefusalAudit.Flush(now)
+	shareSources, shareSuppressed, shareDropped := s.shareResolvedRefusalAudit.Flush(now)
+	sources += shareSources
+	suppressed += shareSuppressed
+	dropped += shareDropped
 	if suppressed == 0 && dropped == 0 {
 		return
 	}
@@ -93,6 +113,12 @@ func (s *Server) flushShareRefusalAudit(now time.Time) {
 	}
 	if dropped > 0 {
 		md["global_suppressed"] = strconv.Itoa(dropped)
+	}
+	if shareSuppressed > 0 {
+		md["share_suppressed_repeats"] = strconv.Itoa(shareSuppressed)
+	}
+	if shareDropped > 0 {
+		md["share_global_suppressed"] = strconv.Itoa(shareDropped)
 	}
 	s.recordAudit(model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",

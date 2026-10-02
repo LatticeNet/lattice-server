@@ -224,14 +224,17 @@ type Server struct {
 	// failure auditing into a disk-growth / lock-contention DoS.
 	authFailAuditThrottle *auditFailureThrottle
 	// shareRefusalAudit bounds audit emission for refused /sub/ requests,
-	// which anyone can send; see share_refusal_audit.go. shareRefusalAudits
-	// counts the writes still in flight so a test can wait for them, and
-	// shareRefusalAuditHook (tests only) runs before each write.
-	shareRefusalAudit     *auditFailureThrottle
-	shareRefusalAudits    sync.WaitGroup
-	shareRefusalAuditHook func()
-	apiLimiter            *ratelimit.Limiter
-	subLimiter            *ratelimit.Limiter
+	// which anyone can send; see share_refusal_audit.go.
+	// shareResolvedRefusalAudit is the same bound for refusals after a token
+	// resolved, on its own global bucket so free probes cannot spend it.
+	// shareRefusalAudits counts the writes still in flight so a test can wait
+	// for them, and shareRefusalAuditHook (tests only) runs before each write.
+	shareRefusalAudit         *auditFailureThrottle
+	shareResolvedRefusalAudit *auditFailureThrottle
+	shareRefusalAudits        sync.WaitGroup
+	shareRefusalAuditHook     func()
+	apiLimiter                *ratelimit.Limiter
+	subLimiter                *ratelimit.Limiter
 	// logIngestLimiter brakes per-source log ingest (keyed by source id) in
 	// lines/sec so a chatty or hostile node cannot flood the store; over budget
 	// returns 429 + Retry-After. Disk is independently bounded by the store caps.
@@ -568,8 +571,9 @@ func New(opts Options) (*Server, error) {
 		// bucket (burst 20, 1/sec sustained) caps total failure-audit writes
 		// so IP rotation cannot exceed a fixed rate. Both are generous for
 		// legitimate failures and bound an unauthenticated flood.
-		authFailAuditThrottle: newAuditFailureThrottle(time.Minute, 20, 1.0),
-		shareRefusalAudit:     newShareRefusalAuditThrottle(),
+		authFailAuditThrottle:     newAuditFailureThrottle(time.Minute, 20, 1.0),
+		shareRefusalAudit:         newShareRefusalAuditThrottle(),
+		shareResolvedRefusalAudit: newShareRefusalAuditThrottle(),
 		// General authenticated API surface.
 		apiLimiter: ratelimit.New(ratelimit.Config{Rate: 30, Burst: 60}),
 		// Public subscription URLs are token-authenticated, unauthenticated HTTP

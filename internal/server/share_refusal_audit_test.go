@@ -214,6 +214,70 @@ func TestShareRefusalAfterAValidTokenIsNotFoldedBehindProbes(t *testing.T) {
 	}
 }
 
+// Probes before a token resolves are free, so they must not spend the budget
+// that records refusals of a real share. After a rotating-source flood has
+// emptied the probe bucket, a share failure from a new source is still written
+// with its share id, and the summary says how many share refusals it folded.
+func TestShareRefusalAfterAValidTokenSurvivesAProbeFlood(t *testing.T) {
+	s, st, now := refusalServer(t)
+	handler := s.Handler()
+	const flood = 500
+	for i := 0; i < flood; i++ {
+		req := httptest.NewRequest(http.MethodGet, "/sub/team/"+strings.Repeat("z", 32), nil)
+		req.RemoteAddr = fmt.Sprintf("198.51.%d.%d:5000", i/250, i%250+1)
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	s.shareRefusalAudits.Wait()
+	before := len(shareDenyEvents(st))
+	if before > shareRefusalAuditBurst {
+		t.Fatalf("the probe flood wrote %d events, want at most %d", before, shareRefusalAuditBurst)
+	}
+
+	real := httptest.NewRequest(http.MethodGet, "/sub/team/"+strings.Repeat("a", 32), nil)
+	real.RemoteAddr = "192.0.2.44:6000"
+	handler.ServeHTTP(httptest.NewRecorder(), real)
+	s.shareRefusalAudits.Wait()
+	events := shareDenyEvents(st)
+	if len(events) != before+1 {
+		t.Fatalf("the share failure after the flood wrote %d events, want 1", len(events)-before)
+	}
+	var got *model.AuditEvent
+	for i := range events {
+		if events[i].Metadata["share_id"] != "" {
+			got = &events[i]
+		}
+	}
+	if got == nil || got.Metadata["share_id"] != "share_team" || got.Metadata["source_ip"] != "192.0.2.44" {
+		t.Fatalf("the share failure was not recorded: %+v", events)
+	}
+	if got.Metadata["global_suppressed"] != "" {
+		t.Fatalf("the share failure carried the probe bucket's drops: %+v", got.Metadata)
+	}
+
+	// Repeats of the share failure from that source fold, and the summary
+	// names them apart from the probes.
+	for i := 0; i < 3; i++ {
+		again := httptest.NewRequest(http.MethodGet, "/sub/team/"+strings.Repeat("a", 32), nil)
+		again.RemoteAddr = "192.0.2.44:6001"
+		handler.ServeHTTP(httptest.NewRecorder(), again)
+	}
+	s.shareRefusalAudits.Wait()
+	*now = now.Add(shareRefusalAuditWindow)
+	s.flushShareRefusalAudit(*now)
+	var summary map[string]string
+	for _, ev := range shareDenyEvents(st) {
+		if ev.Reason == shareRefusalSummaryReason {
+			summary = ev.Metadata
+		}
+	}
+	if summary["share_suppressed_repeats"] != "3" || summary["share_global_suppressed"] != "" {
+		t.Fatalf("summary does not count the folded share refusals apart: %+v", summary)
+	}
+	if summary["global_suppressed"] != fmt.Sprint(flood-before) {
+		t.Fatalf("summary global_suppressed = %q, want %d", summary["global_suppressed"], flood-before)
+	}
+}
+
 func TestAuditFailureThrottleFlush(t *testing.T) {
 	th := newAuditFailureThrottle(time.Minute, 2, 0)
 	t0 := time.Unix(1_700_000_000, 0)

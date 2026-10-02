@@ -220,13 +220,12 @@ func subscriptionResponseContentType(format, target string) string {
 func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request) {
 	// Every rejection below writes the same decoy and audits the real reason.
 	// The audit is where an operator finds out what happened; the response is
-	// where a prober finds out nothing.
+	// where a prober finds out nothing. The decoy goes first and the audit is
+	// throttled per source and written off the request path, so a refusal
+	// never waits on an fsync and a flood cannot buy one write per request.
 	deny := func(reason string, meta map[string]string) {
-		s.recordRequestAudit(r, model.AuditEvent{
-			ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
-			Reason: reason, Metadata: meta,
-		})
 		s.writeSubscriptionDecoy(w)
+		s.auditShareRefusal(r, reason, meta)
 	}
 
 	if r.Method != http.MethodGet {

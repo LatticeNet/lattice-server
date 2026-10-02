@@ -106,6 +106,7 @@ func TestRejectionsAreAuditedWithAStableSecretFreeReason(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	s.handleSubscriptionShare(rec, httptest.NewRequest(http.MethodGet, "/sub/team/"+valid, nil))
+	s.shareRefusalAudits.Wait()
 
 	var reasons []string
 	for _, ev := range st.AuditEvents() {

@@ -223,6 +223,13 @@ type Server struct {
 	// caps the absolute emission rate so source-address rotation cannot turn
 	// failure auditing into a disk-growth / lock-contention DoS.
 	authFailAuditThrottle *auditFailureThrottle
+	// shareRefusalAudit bounds audit emission for refused /sub/ requests,
+	// which anyone can send; see share_refusal_audit.go. shareRefusalAudits
+	// counts the writes still in flight so a test can wait for them, and
+	// shareRefusalAuditHook (tests only) runs before each write.
+	shareRefusalAudit     *auditFailureThrottle
+	shareRefusalAudits    sync.WaitGroup
+	shareRefusalAuditHook func()
 	apiLimiter            *ratelimit.Limiter
 	subLimiter            *ratelimit.Limiter
 	// logIngestLimiter brakes per-source log ingest (keyed by source id) in
@@ -559,6 +566,7 @@ func New(opts Options) (*Server, error) {
 		// so IP rotation cannot exceed a fixed rate. Both are generous for
 		// legitimate failures and bound an unauthenticated flood.
 		authFailAuditThrottle: newAuditFailureThrottle(time.Minute, 20, 1.0),
+		shareRefusalAudit:     newShareRefusalAuditThrottle(),
 		// General authenticated API surface.
 		apiLimiter: ratelimit.New(ratelimit.Config{Rate: 30, Burst: 60}),
 		// Public subscription URLs are token-authenticated, unauthenticated HTTP
@@ -662,6 +670,7 @@ func New(opts Options) (*Server, error) {
 		s.startTraceReattribution()
 		s.startDDNSSweep()
 		s.startTLSMonitorSweep()
+		s.startShareRefusalAuditFlush()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1593,11 +1602,10 @@ func (s *Server) withSubscriptionLimit(next http.HandlerFunc) http.HandlerFunc {
 			// A 429 here would tell a prober that this path is specially rate
 			// limited, which is itself evidence that it exists. The limit still
 			// applies; it just refuses in the same voice as everything else.
-			s.recordRequestAudit(r, model.AuditEvent{
-				ID: id.New("audit"), Action: auditActionShareFetch, Decision: "deny",
-				Reason: "rate limited",
-			})
+			// The audit is throttled and written after the answer, so a flood
+			// neither buys a durable write per request nor waits on one.
 			s.writeSubscriptionDecoy(w)
+			s.auditShareRefusal(r, "rate limited", nil)
 			return
 		}
 		next(w, r)

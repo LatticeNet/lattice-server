@@ -433,14 +433,14 @@ func TestSubscriptionShareRevisionMismatchRendersInsteadOfStampingReplacement(t 
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}
 	mustUpsertShare(t, st, share)
 	now := s.now()
-	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "same", Userinfo: "current-ui", FetchedAt: now}); err != nil {
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "same", Userinfo: "upload=3", FetchedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	key := subscriptionCacheKey{ShareID: "s1", Format: "plain", UAClass: "surge"}
 	version := subscriptionContentHash("same")
-	s.subscriptionCache.PutSnapshot(key, []byte("old-body"), "text/plain", "old-ui", version, "", false, now, now.Add(-subscriptionCacheTTL-time.Second))
+	s.subscriptionCache.PutSnapshot(key, []byte("old-body"), "text/plain", "upload=1", version, "", false, now, now.Add(-subscriptionCacheTTL-time.Second))
 	s.subscriptionBeforeCacheExtend = func() {
-		s.subscriptionCache.PutSnapshot(key, []byte("replacement"), "text/plain", "replacement-ui", "new-version", "", false, now, now)
+		s.subscriptionCache.PutSnapshot(key, []byte("replacement"), "text/plain", "upload=2", "new-version", "", false, now, now)
 		s.subscriptionBeforeCacheExtend = nil
 	}
 	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
@@ -449,7 +449,7 @@ func TestSubscriptionShareRevisionMismatchRendersInsteadOfStampingReplacement(t 
 	}
 	rec := httptest.NewRecorder()
 	s.handleSubscriptionShare(rec, shareRequest("/sub/one/"+token+"?format=plain", "Surge/2000"))
-	if rec.Code != http.StatusOK || rec.Body.String() != "rerendered" || rec.Header().Get("Subscription-Userinfo") != "current-ui" {
+	if rec.Code != http.StatusOK || rec.Body.String() != "rerendered" || rec.Header().Get("Subscription-Userinfo") != "upload=3" {
 		t.Fatalf("revision mismatch response = code %d body %q userinfo %q", rec.Code, rec.Body.String(), rec.Header().Get("Subscription-Userinfo"))
 	}
 	if stale, ok := s.subscriptionCache.GetStale(key); ok && string(stale.body) == "old-body" {

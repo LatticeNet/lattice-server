@@ -167,13 +167,11 @@ func subscriptionContentHash(raw string) string {
 // because half a number is worse than none for a client parsing it.
 const maxSubscriptionUserinfoBytes = 512
 
-// subscriptionUserinfoForResponse returns the quota value a source supplied, or
-// nothing when it is too large to be one.
+// subscriptionUserinfoForResponse returns the quota value a source supplied in
+// its canonical form, or nothing when it is too large to be one or carries
+// none of the fields clients read (canonicalSubscriptionUserinfo).
 func subscriptionUserinfoForResponse(userinfo string) string {
-	if len(userinfo) > maxSubscriptionUserinfoBytes {
-		return ""
-	}
-	return userinfo
+	return canonicalSubscriptionUserinfo(userinfo)
 }
 
 // subscriptionResponseContentType decides how the response describes itself,
@@ -402,6 +400,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	if staleResponse {
 		w.Header().Set("X-Lattice-Subscription-Stale", "true")
 	}
+	setLinkClientHeaders(w.Header(), share.Slug, shareUpdateIntervalHours(share))
 	body := shareBody{body: served.body, gzipBody: served.gzipBody, hash: served.bodyHash}
 	if body.hash == ([32]byte{}) {
 		body = newShareBody(served.body)

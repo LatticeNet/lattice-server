@@ -235,6 +235,11 @@ func transcribeAudit(events []model.AuditEvent) string {
 // ua for clash), and the rest are counted into an hourly summary. Every
 // refusal is byte for byte what it was.
 //
+// A fourth: every 200 now tells the client its refresh period
+// (Profile-Update-Interval, two hours unless the share sets its own) and a
+// profile name (Content-Disposition, the share's slug). Those two headers are
+// the whole change; the refusals did not move.
+//
 // Treat any future movement the same way: prove it was intended and name the
 // cases that changed, or the URL in someone's proxy client is what moved.
 func TestSubscriptionShareWireTranscriptIsGolden(t *testing.T) {

@@ -35,6 +35,9 @@ type shareView struct {
 	UpdatedAt     time.Time         `json:"updated_at"`
 	RotatedAt     *time.Time        `json:"rotated_at,omitempty"`
 	ExpiresAt     *time.Time        `json:"expires_at,omitempty"`
+	// UpdateIntervalHours is the refresh period the link advertises to
+	// clients (Profile-Update-Interval): the share's own, or the default.
+	UpdateIntervalHours int `json:"update_interval_hours"`
 }
 
 func shareViewOf(share model.SubscriptionShare) shareView {
@@ -43,6 +46,7 @@ func shareViewOf(share model.SubscriptionShare) shareView {
 		DefaultFormat: share.DefaultFormat, Enabled: share.Enabled,
 		CreatedAt: share.CreatedAt, UpdatedAt: share.UpdatedAt,
 		RotatedAt: share.RotatedAt, ExpiresAt: share.ExpiresAt,
+		UpdateIntervalHours: shareUpdateIntervalHours(share),
 	}
 }
 
@@ -81,6 +85,8 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		Source        model.ShareSource `json:"source"`
 		DefaultFormat string            `json:"default_format"`
 		ExpiresAt     *time.Time        `json:"expires_at"`
+		// 0 or absent advertises the default interval.
+		UpdateIntervalHours int `json:"update_interval_hours"`
 	}
 	if !decodeLimitedJSON(w, r, &req, 1<<20) {
 		return
@@ -130,6 +136,11 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		ID: id.New("share"), SchemaVersion: model.SubscriptionShareSchemaVersion,
 		Slug: req.Slug, Token: token, Source: req.Source,
 		DefaultFormat: req.DefaultFormat, Enabled: true, ExpiresAt: req.ExpiresAt,
+	}
+	share, err = withShareUpdateIntervalHours(share, req.UpdateIntervalHours)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
 	}
 	if err := s.store.UpsertSubscriptionShare(share); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -201,6 +212,9 @@ func (s *Server) updateSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		ClearExpiry   bool       `json:"clear_expiry"`
 		DefaultFormat *string    `json:"default_format"`
 		Enabled       *bool      `json:"enabled"`
+		// UpdateIntervalHours sets the advertised refresh period; 0 returns
+		// the share to the default.
+		UpdateIntervalHours *int `json:"update_interval_hours"`
 	}
 	if !decodeLimitedJSON(w, r, &req, 1<<20) {
 		return
@@ -236,6 +250,14 @@ func (s *Server) updateSubscriptionShare(w http.ResponseWriter, r *http.Request,
 	if req.Enabled != nil {
 		share.Enabled = *req.Enabled
 	}
+	if req.UpdateIntervalHours != nil {
+		updated, err := withShareUpdateIntervalHours(share, *req.UpdateIntervalHours)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		share = updated
+	}
 	share.UpdatedAt = s.now()
 
 	if err := s.store.UpsertSubscriptionShare(share); err != nil {
@@ -250,12 +272,13 @@ func (s *Server) updateSubscriptionShare(w http.ResponseWriter, r *http.Request,
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareUpdate, Scope: "proxy:admin", Decision: "allow",
 		Metadata: map[string]string{
-			"share_id":     share.ID,
-			"slug":         share.Slug,
-			"token_sha256": proxySubTokenAuditHash(share.Token),
-			"expires_from": formatShareExpiry(before),
-			"expires_to":   formatShareExpiry(share.ExpiresAt),
-			"enabled":      strconv.FormatBool(share.Enabled),
+			"share_id":              share.ID,
+			"slug":                  share.Slug,
+			"token_sha256":          proxySubTokenAuditHash(share.Token),
+			"expires_from":          formatShareExpiry(before),
+			"expires_to":            formatShareExpiry(share.ExpiresAt),
+			"enabled":               strconv.FormatBool(share.Enabled),
+			"update_interval_hours": strconv.Itoa(shareUpdateIntervalHours(share)),
 		},
 	})
 	stored, _ := s.store.SubscriptionShare(share.ID)

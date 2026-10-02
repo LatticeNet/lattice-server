@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -114,5 +115,77 @@ func TestDeletingAnIdentityLeavesNoProxyUserForTheMigrationToRevive(t *testing.T
 				t.Fatalf("the migration revived %d identities after the delete: %+v", len(users), users)
 			}
 		})
+	}
+}
+
+// deleteIdentity calls the delete method the console uses.
+func deleteIdentity(t *testing.T, srv *Server, userID string) error {
+	t.Helper()
+	_, err := srv.vpnCoreUsersAdminDispatch(context.Background(), "delete", mustJSON(t, map[string]string{"id": userID}))
+	return err
+}
+
+// The identity record holds the only copy of its credential, and the fork's
+// sb user del cannot remove an entry by name, so deleting an identity that an
+// applied plan still has on an adopted line left that credential live on the
+// node with no plan able to take it off. The delete is refused while a
+// line-user task for the identity is live and while the line still holds it,
+// and goes through once the removal has applied.
+func TestDeletingAnIdentityStillOnAnAdoptedLineIsRefused(t *testing.T) {
+	srv, line, u := forkContractServer(t, "vless", VpnCredential{Protocol: "vless", UUID: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"})
+	mustRefuse := func(step string, want ...string) {
+		t.Helper()
+		err := deleteIdentity(t, srv, u.ID)
+		if err == nil {
+			t.Fatalf("%s: the delete went through", step)
+		}
+		for _, w := range want {
+			if !strings.Contains(err.Error(), w) {
+				t.Fatalf("%s: refusal %q does not name %q", step, err, w)
+			}
+		}
+		if _, ok := srv.getVpnUser(u.ID); !ok {
+			t.Fatalf("%s: a refused delete removed the identity", step)
+		}
+	}
+
+	addApproval, addTask := approvedScript(t, srv, lineUserOpAdd, u.ID, line)
+	mustRefuse("add task queued", addApproval.ID, addTask.ID, string(model.TaskQueued))
+	if got := reportResult(t, srv, addApproval, addTask, "", 0); got.Status != model.ApprovalApplied {
+		t.Fatalf("add result: status %q reason %q", got.Status, got.Reason)
+	}
+	mustRefuse("add applied", line.LineHashID, line.Tag, "node-a", "plan_remove")
+
+	removeApproval, removeTask := approvedScript(t, srv, lineUserOpRemove, u.ID, line)
+	mustRefuse("removal task queued", removeApproval.ID, removeTask.ID)
+	if got := reportResult(t, srv, removeApproval, removeTask, "", 0); got.Status != model.ApprovalApplied {
+		t.Fatalf("removal result: status %q reason %q", got.Status, got.Reason)
+	}
+	if err := deleteIdentity(t, srv, u.ID); err != nil {
+		t.Fatalf("delete after the removal applied: %v", err)
+	}
+	if _, ok := srv.getVpnUser(u.ID); ok {
+		t.Fatal("the identity survived its delete")
+	}
+}
+
+// A line that no longer resolves cannot take a plan_remove either, so it does
+// not hold the delete: refusing would leave an identity nobody can delete and
+// remove nothing.
+func TestALineThatNoLongerResolvesDoesNotHoldTheDelete(t *testing.T) {
+	srv, line, u := forkContractServer(t, "vless", VpnCredential{Protocol: "vless", UUID: "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"})
+	addApproval, addTask := approvedScript(t, srv, lineUserOpAdd, u.ID, line)
+	if got := reportResult(t, srv, addApproval, addTask, "", 0); got.Status != model.ApprovalApplied {
+		t.Fatalf("add result: status %q reason %q", got.Status, got.Reason)
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{}
+	srv.singboxInvMu.Unlock()
+	srv.invalidateLineReadModel()
+	if _, err := srv.resolveLineUserTarget(line.LineHashID); err == nil {
+		t.Fatal("the line still resolves after its node's inventory was cleared")
+	}
+	if err := deleteIdentity(t, srv, u.ID); err != nil {
+		t.Fatalf("delete with the line gone: %v", err)
 	}
 }

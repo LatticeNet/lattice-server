@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -356,8 +357,11 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 
 // deletedUserLineRemovePlan answers plan_remove for a user that no longer
 // exists. Deleting a user does not take its credential off an adopted line,
-// where Lattice added it with sb user add, but the removal cannot be filed
-// either. The node script deletes by credential: lr00rl/sing-box alpha.7
+// where Lattice added it with sb user add, and the delete is refused while
+// Lattice's record still places the user there (vpnUserDeleteRefusal); a user
+// gets here when it was deleted before that refusal existed, or while its
+// line did not resolve. The removal cannot be filed either. The node script
+// deletes by credential: lr00rl/sing-box alpha.7
 // (cmd_json_user, the script on every adopted node) refuses a payload that
 // carries no uuid or password with invalid_user, and refuses a bare name with
 // invalid_payload. Deleting the user deleted the only copy of its credential,
@@ -429,29 +433,106 @@ func (s *Server) requireLineUserOnLine(userID, lineHashID string) error {
 // on the line, remove means one last took it off. The approvals are never
 // pruned, so this is the complete record of what Lattice did on the line.
 func (s *Server) lineUserAppliedOps(lineHashID string) map[string]string {
-	type last struct {
-		op string
-		at time.Time
+	ops := map[string]string{}
+	for _, plan := range s.lineUserLastApplied(func(plan lineUserPlan) bool { return plan.LineHashID == lineHashID }) {
+		ops[plan.UserID] = plan.Op
 	}
-	latest := map[string]last{}
+	return ops
+}
+
+// lineUserLastApplied returns the last applied line-user plan for each
+// (user, line) pair whose plan keep accepts, in no particular order.
+func (s *Server) lineUserLastApplied(keep func(lineUserPlan) bool) []lineUserPlan {
+	type last struct {
+		plan lineUserPlan
+		at   time.Time
+	}
+	latest := map[[2]string]last{}
 	for _, a := range s.store.Approvals() {
 		if a.Plugin != singBoxLineUserPlugin || a.Status != model.ApprovalApplied {
 			continue
 		}
 		var plan lineUserPlan
-		if err := json.Unmarshal([]byte(a.Plan), &plan); err != nil || plan.LineHashID != lineHashID ||
+		if err := json.Unmarshal([]byte(a.Plan), &plan); err != nil || !keep(plan) ||
 			a.RequestSHA256 != lineUserRequestSHA(plan.UserID, plan.LineHashID) {
 			continue
 		}
-		if prev, ok := latest[plan.UserID]; !ok || a.UpdatedAt.After(prev.at) {
-			latest[plan.UserID] = last{op: plan.Op, at: a.UpdatedAt}
+		key := [2]string{plan.UserID, plan.LineHashID}
+		if prev, ok := latest[key]; !ok || a.UpdatedAt.After(prev.at) {
+			latest[key] = last{plan: plan, at: a.UpdatedAt}
 		}
 	}
-	ops := make(map[string]string, len(latest))
-	for userID, l := range latest {
-		ops[userID] = l.op
+	plans := make([]lineUserPlan, 0, len(latest))
+	for _, l := range latest {
+		plans = append(plans, l.plan)
 	}
-	return ops
+	return plans
+}
+
+// vpnUserDeleteRefusal refuses deleting userID while the delete would leave
+// its credential on a node with no way for Lattice to take it off. The
+// identity record holds the only copy of the credential, and sb user del on
+// adopted nodes (lr00rl/sing-box v1.24.3-alpha.7) matches entries by
+// credential and refuses a name alone, so once the identity is gone a
+// removal from an adopted line cannot be filed (deletedUserRemovalUnsupported).
+// Two cases are refused:
+//
+//   - a line-user task for the user is queued or leased. A leased add
+//     already carries the credential and puts it on the node with no
+//     identity behind it; a removal renders its script at lease, without a
+//     credential once the identity is gone, and fails.
+//   - an applied plan put the user on an adopted line with no applied
+//     removal since, and the line still resolves, so plan_remove can be
+//     filed for it now and cannot be after the delete.
+//
+// A line that no longer resolves is left out: plan_remove cannot be filed
+// for it either, so refusing would make the identity undeletable and remove
+// nothing. A managed line is left out: its render already drops a deleted
+// user, and the line's next config apply removes it. Nothing holds a lock
+// across this check and the delete; a plan approved in between is refused at
+// render for its missing user, so only a task leased in that window escapes.
+func (s *Server) vpnUserDeleteRefusal(userID string) error {
+	var live map[string]model.Task
+	for _, a := range s.store.Approvals() {
+		if a.Plugin != singBoxLineUserPlugin || a.Status != model.ApprovalApproved {
+			continue
+		}
+		var plan lineUserPlan
+		if err := json.Unmarshal([]byte(a.Plan), &plan); err != nil || plan.UserID != userID {
+			continue
+		}
+		if live == nil {
+			live = map[string]model.Task{}
+			for _, task := range s.store.Tasks() {
+				if task.ApprovalID != "" && (task.Status == model.TaskQueued || task.Status == model.TaskLeased) {
+					live[task.ApprovalID] = task
+				}
+			}
+		}
+		if task, ok := live[a.ID]; ok {
+			return fmt.Errorf("user %q has approval %s (%s on line %s) whose task %s is %s; wait for its result, or cancel the task while it is queued, before deleting the user",
+				userID, a.ID, plan.Op, plan.LineHashID, task.ID, task.Status)
+		}
+	}
+	var held []string
+	for _, plan := range s.lineUserLastApplied(func(plan lineUserPlan) bool { return plan.UserID == userID }) {
+		if plan.Op != lineUserOpAdd && plan.Op != lineUserOpUpdate {
+			continue
+		}
+		ln, err := s.resolveLineUserTarget(plan.LineHashID)
+		if err != nil || ln.Managed {
+			continue
+		}
+		held = append(held, fmt.Sprintf("%s (%s on node %s)", ln.LineHashID, ln.Tag, ln.NodeID))
+	}
+	if len(held) == 0 {
+		return nil
+	}
+	sort.Strings(held)
+	return fmt.Errorf("user %q is still on adopted line %s, where an applied plan put it; the user record holds the only copy of the credential sb user del needs "+
+		"(lr00rl/sing-box v1.24.3-alpha.7 matches entries by credential and refuses a name alone), so deleting the user now would leave that credential live on the node "+
+		"with no way for Lattice to remove it; plan_remove the user from every line listed and apply the removals, then delete",
+		userID, strings.Join(held, ", "))
 }
 
 // lineUserRemovalRefusal refuses removing userID from adopted line ln when

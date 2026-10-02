@@ -416,6 +416,9 @@ func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, r
 		if !ok {
 			return nil, fmt.Errorf("vpn-core/users-admin delete: user %q not found", id)
 		}
+		if err := s.vpnUserDeleteRefusal(id); err != nil {
+			return nil, fmt.Errorf("vpn-core/users-admin delete: %w", err)
+		}
 		// Every boot runs migrateProxyUsersToVpnUsers, which derives vu_<id>
 		// for any proxy user that has no identity, copying its sub token into
 		// SubID. A proxy user left behind here is therefore the deleted

@@ -1138,8 +1138,10 @@ func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approv
 		Decision: "allow", Metadata: metadata,
 	})
 	// An applied line-user change alters what nodes should serve: re-arm the
-	// Sub-Store auto-sync just like the direct mutations do (design-15 §7).
+	// Sub-Store auto-sync just like the direct mutations do (design-15 §7),
+	// and drop what core shares cached.
 	s.triggerVPNCoreMutation()
+	s.invalidateCoreSourceShares()
 	return nil
 }
 

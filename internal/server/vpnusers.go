@@ -415,6 +415,7 @@ func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, reques
 		case "create", "update", "delete", "bind", "unbind", "rotate":
 			s.triggerVPNCoreMutation()
 			s.invalidateLineReadModel()
+			s.invalidateCoreSourceShares()
 		}
 	}
 	return out, err

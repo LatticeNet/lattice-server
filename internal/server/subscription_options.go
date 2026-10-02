@@ -83,6 +83,21 @@ func decodeStrictGraphOptionsRequest(raw []byte) error {
 	return nil
 }
 
+// graphIdentityPolicyOption is the option status and reason for an identity
+// its policy suspends.
+func graphIdentityPolicyOption(policy vpnUserPolicy) (status, reason string) {
+	switch policy.Reason {
+	case vpnSuspendReasonDisabled:
+		return "disabled", "identity_disabled"
+	case vpnSuspendReasonOperator:
+		return "suspended", "identity_suspended"
+	case vpnSuspendReasonExpiry:
+		return "expired", "identity_expired"
+	default:
+		return "over_quota", "identity_over_quota"
+	}
+}
+
 func graphSubscriptionOptionsFromCapture(capture func() (lineChainCompileSnapshot, error), now time.Time) (graphSubscriptionOptionsResponse, error) {
 	snapshot, err := capture()
 	if err != nil {
@@ -111,11 +126,14 @@ func graphSubscriptionOptions(snapshot lineChainCompileSnapshot, now time.Time) 
 			allCredentialUUIDs[strings.ToLower(credential.UUID)] = true
 		}
 		option := graphSubscriptionIdentityOption{ID: identity.ID, Label: safeGraphOptionText(firstNonEmpty(identity.Name, identity.Email), "VPN identity", false, denylist), Status: "eligible", Selectable: true}
+		// Eligibility follows the identity's effective status, the one the
+		// managed render and the line plans use, so an identity over its
+		// quota is no more eligible here than an expired one.
+		policy := snapshot.identityPolicy(identity, now)
 		switch {
-		case !identity.Enabled:
-			option.Status, option.Reason, option.Selectable = "disabled", "identity_disabled", false
-		case !identity.ExpiresAt.IsZero() && !now.Before(identity.ExpiresAt):
-			option.Status, option.Reason, option.Selectable = "expired", "identity_expired", false
+		case !policy.Active():
+			option.Status, option.Reason = graphIdentityPolicyOption(policy)
+			option.Selectable = false
 		case identity.SubscriptionGeneration == 0:
 			option.Status, option.Reason, option.Selectable = "incomplete", "identity_unversioned", false
 		default:

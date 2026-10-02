@@ -126,7 +126,7 @@ func composeGraphSubscription(snapshot lineChainCompileSnapshot, req graphSubscr
 		return graphSubscriptionResponse{}, composeFailure("bounds_exceeded")
 	}
 	identity, ok := snapshot.Users[identityID]
-	if !ok || !identity.Enabled || (!identity.ExpiresAt.IsZero() && !now.Before(identity.ExpiresAt)) || identity.SubscriptionGeneration == 0 {
+	if !ok || !snapshot.identityPolicy(identity, now).Active() || identity.SubscriptionGeneration == 0 {
 		return graphSubscriptionResponse{}, composeFailure("identity_unavailable")
 	}
 	credential, ok := vpnCredentialForProtocol(identity.Credentials, "vless")

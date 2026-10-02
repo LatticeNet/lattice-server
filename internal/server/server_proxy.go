@@ -399,6 +399,7 @@ func (s *Server) handleProxyUsers(w http.ResponseWriter, r *http.Request, p prin
 			return
 		}
 		s.invalidateLineReadModel()
+		s.invalidateCoreSourceShares()
 		if stored, ok := s.store.ProxyUser(user.ID); ok {
 			user = stored
 		}
@@ -438,6 +439,7 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	s.invalidateLineReadModel()
+	s.invalidateCoreSourceShares()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "proxy.user.delete",

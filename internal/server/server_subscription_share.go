@@ -303,6 +303,17 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 
 	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass, Variant: variant.cacheToken()}
 
+	// A core share's body is the user's own state, which moves with the
+	// clock as well as with writes: an expiry or a quota crossing changes no
+	// record, so no write could invalidate the body it ends. The user's
+	// status is checked before the cache, and a user the policy no longer
+	// serves never gets a body cached while it was active.
+	if share.Source.Kind == model.ShareSourceCoreProxyUser {
+		if user, ok := s.coreShareUser(share.Source.ProxyUserID, s.now()); !ok || derivedProxyUserStatusAt(user, s.now()) != model.ProxyUserStatusActive {
+			s.subscriptionCache.InvalidateShare(share.ID)
+		}
+	}
+
 	var cacheEntry subscriptionCacheEntry
 	var cached bool
 	var cacheEpoch uint64
@@ -529,6 +540,36 @@ func (s *Server) invalidateSharesForPlugin(pluginID string) {
 	}
 }
 
+// coreShareUser is the user a core.proxy_user share renders: the stored
+// legacy record, with the policy of the identity behind it written over it
+// (vpnUserPolicy.applyTo). The identity owns whether the user is enabled, its
+// expiry, its quota and the usage that quota is measured with, so a share
+// serves a user exactly when the policy does (adopted-suspend P12), and its
+// quota header carries the identity's figures.
+func (s *Server) coreShareUser(proxyUserID string, now time.Time) (model.ProxyUser, bool) {
+	user, ok := s.store.ProxyUser(proxyUserID)
+	if !ok {
+		return model.ProxyUser{}, false
+	}
+	if identity := s.vpnUserForAccounting(proxyUserID); identity != nil {
+		user = s.vpnUserPolicyAt(*identity, now).applyTo(user)
+	}
+	return user, true
+}
+
+// invalidateCoreSourceShares drops every cached body a core source rendered.
+// A core share renders a user's own record, so any change to a user or an
+// identity can change what it serves; the content hash that guards plugin
+// shares does not exist for it. Shares are few, so all core shares go rather
+// than working out which identity sits behind which share.
+func (s *Server) invalidateCoreSourceShares() {
+	for _, share := range s.store.SubscriptionShares() {
+		if share.Source.Kind == model.ShareSourceCoreProxyUser {
+			s.subscriptionCache.InvalidateShare(share.ID)
+		}
+	}
+}
+
 // invalidateSharesForSource drops cached bodies for shares sourcing one record.
 // The refresh path calls it when a fetch returns different bytes than the
 // stored snapshot.
@@ -547,7 +588,7 @@ func (s *Server) invalidateSharesForSource(pluginID, subscriptionID string) {
 func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string, variant shareRenderVariant) (renderedSubscription, error) {
 	switch share.Source.Kind {
 	case model.ShareSourceCoreProxyUser:
-		user, ok := s.store.ProxyUser(share.Source.ProxyUserID)
+		user, ok := s.coreShareUser(share.Source.ProxyUserID, s.now())
 		if !ok {
 			return renderedSubscription{}, errors.New("share source user not found")
 		}

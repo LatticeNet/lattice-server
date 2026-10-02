@@ -20,6 +20,18 @@ import (
 
 var graphOptionUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
+// graphSubscriptionIdentityOption is one identity in a graph_options answer.
+//
+// Selectable is the contract: a client offers an identity exactly when it is
+// true, and Reason is set exactly when it is false. Status is an open set of
+// display words, not a closed enum, and a client must not decide eligibility
+// from it. Today it is eligible, or for an identity that is not selectable
+// one of disabled (identity_disabled), suspended (identity_suspended, an
+// operator suspension), expired (identity_expired), over_quota
+// (identity_over_quota) and incomplete (identity_unversioned,
+// vless_credential_missing). The only consumer, the Sub-Store plugin,
+// validates Status as bounded text, lists the selectable identities only,
+// and shows Status as text, so a new word reaches it as a label.
 type graphSubscriptionIdentityOption struct {
 	ID         string `json:"id"`
 	Label      string `json:"label"`

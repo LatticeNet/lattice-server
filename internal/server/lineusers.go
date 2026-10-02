@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -293,6 +294,14 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	if (op == lineUserOpUpdate || (op == lineUserOpRemove && ln.Managed)) && !bound {
 		return nil, fmt.Errorf("user %q is not bound to line %q", u.ID, ln.LineHashID)
 	}
+	// Without a binding, the approvals have to show Lattice put the user on
+	// this line, or the removal would run sb user del for a name that was
+	// never there.
+	if op == lineUserOpRemove && !bound {
+		if err := s.requireLineUserOnLine(u.ID, ln.LineHashID); err != nil {
+			return nil, err
+		}
+	}
 	name := userLineName(u.ID, ln.LineUUID)
 	payload, err := lineUserCredential(u, ln.Type, name)
 	if err != nil {
@@ -345,15 +354,21 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 // user record, so nothing in Lattice could take it off. sb user del needs
 // only the line's tag and the on-box name, and the name is derived from the
 // user id and the line UUID alone (userLineName), so the plan removes that
-// one credential and nothing else. There is no record left to check a
-// binding against, and the node reports a user count but no names, so the
-// operator supplies the id and Lattice cannot confirm before the task runs
-// that the node holds that name. A managed line needs no such plan: its render
-// already leaves a deleted user out, and the line's next config apply
-// removes it.
+// one credential and nothing else.
+//
+// The id comes from the operator with no record left to check it against,
+// so it is held to two things before it is filed or echoed. It must have the
+// shape Lattice mints (vpnUserIDRe), and the approvals, which are never
+// pruned, must show an applied plan that put this user on this line with no
+// applied removal since (requireLineUserOnLine). A typo, or an id that never
+// reached the line, is refused here rather than filed as a task that fails.
+// The node reports a user count but no names, so this is the closest
+// Lattice can come to confirming the node holds the name. A managed line
+// needs no such plan: its render already leaves a deleted user out, and the
+// line's next config apply removes it.
 func (s *Server) deletedUserLineRemovePlan(ctxPrincipal principal, userID, lineHashID string) ([]byte, error) {
-	if userID == "" {
-		return nil, errors.New("vpn-core/users-admin plan_remove: user_id is required")
+	if !vpnUserIDRe.MatchString(userID) {
+		return nil, errors.New("vpn-core/users-admin plan_remove: user_id is neither an existing user nor a VpnUser id Lattice mints (vpnuser_ and 16 base32 characters, or vu_ and a proxy user id)")
 	}
 	ln, err := s.resolveLineUserTarget(lineHashID)
 	if err != nil {
@@ -361,6 +376,9 @@ func (s *Server) deletedUserLineRemovePlan(ctxPrincipal principal, userID, lineH
 	}
 	if ln.Managed {
 		return nil, fmt.Errorf("user %q no longer exists, and managed line %q already leaves it out of its render; apply the line's config to remove it", userID, ln.LineHashID)
+	}
+	if err := s.requireLineUserOnLine(userID, ln.LineHashID); err != nil {
+		return nil, err
 	}
 	name := userLineName(userID, ln.LineUUID)
 	sha, err := lineUserCredentialSHA(lineUserCredentialPayload{Name: name})
@@ -375,6 +393,44 @@ func (s *Server) deletedUserLineRemovePlan(ctxPrincipal principal, userID, lineH
 			ln.Tag, ln.NodeID, userID, name, sha[:12]),
 	}
 	return s.fileLineUserPlan(ctxPrincipal, plan, map[string]string{"user_deleted": "true"})
+}
+
+// vpnUserIDRe matches the VpnUser ids Lattice mints: id.New("vpnuser"),
+// which is "vpnuser_" and 16 lowercase base32 characters (23 digits on its
+// clock fallback), and the ProxyUser migration's "vu_" and a proxy user id
+// (proxyIDRe, at most 128 characters). Nothing else creates a VpnUser id, and
+// the character set keeps an id safe to echo in a summary or an audit row.
+var vpnUserIDRe = regexp.MustCompile(`^(?:vpnuser_(?:[a-z2-7]{16}|[0-9]{23})|vu_[A-Za-z0-9][A-Za-z0-9_.:-]{0,127})$`)
+
+// requireLineUserOnLine refuses a removal Lattice has no grounds for: it
+// needs an applied line-user plan that put userID on lineHashID (an add or
+// an update) with no applied removal after it. Approvals are never pruned,
+// so this history is complete. A removal of a user Lattice still binds to
+// the line does not ask for it; the binding is the record.
+func (s *Server) requireLineUserOnLine(userID, lineHashID string) error {
+	requestSHA := lineUserRequestSHA(userID, lineHashID)
+	lastOp := ""
+	var lastAt time.Time
+	for _, a := range s.store.Approvals() {
+		if a.Plugin != singBoxLineUserPlugin || a.Status != model.ApprovalApplied || a.RequestSHA256 != requestSHA {
+			continue
+		}
+		var plan lineUserPlan
+		if err := json.Unmarshal([]byte(a.Plan), &plan); err != nil || plan.UserID != userID || plan.LineHashID != lineHashID {
+			continue
+		}
+		if lastOp == "" || a.UpdatedAt.After(lastAt) {
+			lastOp, lastAt = plan.Op, a.UpdatedAt
+		}
+	}
+	switch lastOp {
+	case lineUserOpAdd, lineUserOpUpdate:
+		return nil
+	case lineUserOpRemove:
+		return fmt.Errorf("an applied plan already removed user %q from line %q, and none has added it since; nothing is left to remove", userID, lineHashID)
+	default:
+		return fmt.Errorf("no applied plan ever put user %q on line %q, so Lattice has nothing to remove there; check the user id and the line", userID, lineHashID)
+	}
 }
 
 // fileLineUserPlan stores plan as a pending line-user approval, records the

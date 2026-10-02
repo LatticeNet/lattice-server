@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -171,16 +172,62 @@ const lineUserScriptPrelude = "set -e\n" +
 	"SB_BIN=\"${LATTICE_SINGBOX_BIN:-sb}\"\n" +
 	"command -v \"$SB_BIN\" >/dev/null 2>&1 || { echo 'lattice lineuser: sb binary not found' >&2; exit 1; }\n"
 
+// seedMintedLineUser stores an unbound user whose id has the shape Lattice
+// mints, so a removal filed after its deletion passes vpnUserIDRe.
+func seedMintedLineUser(t *testing.T, srv *Server) VpnUser {
+	t.Helper()
+	u := VpnUser{
+		ID: id.New("vpnuser"), Email: "minted@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "6a1b7c2d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", Flow: "xtls-rprx-vision"}},
+	}
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+// applyLinePlanResult approves a filed plan, checks it queued one task,
+// reports that task a success the way a node would, checks the approval is
+// applied, and returns the task.
+func applyLinePlanResult(t *testing.T, srv *Server, approval model.Approval, line Line) model.Task {
+	t.Helper()
+	if err := approvePlan(t, srv, approval); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	tasks := tasksFor(srv, approval.ID)
+	if len(tasks) != 1 {
+		t.Fatalf("approval queued %d task(s), want 1", len(tasks))
+	}
+	request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
+	if err := srv.handleApprovalTaskResult(request, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: line.NodeID}); err != nil {
+		t.Fatalf("successful result: %v", err)
+	}
+	if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalApplied {
+		t.Fatalf("status = %q reason %q, want applied", stored.Status, stored.Reason)
+	}
+	return tasks[0]
+}
+
+// applyLinePlan files a plan for userID on the line and applies it through
+// applyLinePlanResult.
+func applyLinePlan(t *testing.T, srv *Server, op, userID string, line Line) model.Task {
+	t.Helper()
+	return applyLinePlanResult(t, srv, filePlan(t, srv, op, userID, line.LineHashID), line)
+}
+
 // Deleting a user does not take its credential off an adopted line, and
 // plan_remove needed the user record: a removal filed before the deletion
 // failed with "no longer exists", and none could be filed after it. Both now
-// complete. The script deletes the one name derived from the deleted user's
-// id and the line, and no user record comes back.
+// complete for a user an applied plan put on the line. The script deletes
+// the one name derived from the deleted user's id and the line, and no user
+// record comes back.
 func TestRemovingADeletedUsersCredentialFromAnAdoptedLine(t *testing.T) {
 	for _, filed := range []string{"before the deletion", "after the deletion"} {
 		t.Run(filed, func(t *testing.T) {
 			srv := newLinemetaTestServer(t, mustOpenStore(t))
-			line, u := seedLineUserFixture(t, srv)
+			line, _ := seedLineUserFixture(t, srv)
+			u := seedMintedLineUser(t, srv)
+			applyLinePlan(t, srv, lineUserOpAdd, u.ID, line)
 			var approval model.Approval
 			if filed == "before the deletion" {
 				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
@@ -194,23 +241,10 @@ func TestRemovingADeletedUsersCredentialFromAnAdoptedLine(t *testing.T) {
 					t.Fatalf("the plan must say the user is deleted: %s", approval.Plan)
 				}
 			}
-			if err := approvePlan(t, srv, approval); err != nil {
-				t.Fatalf("approve: %v", err)
-			}
-			tasks := tasksFor(srv, approval.ID)
-			if len(tasks) != 1 || len(tasks[0].Targets) != 1 || tasks[0].Targets[0] != "node-a" {
-				t.Fatalf("approval queued %+v, want one task on node-a", tasks)
-			}
+			removed := applyLinePlanResult(t, srv, approval, line)
 			want := lineUserScriptPrelude + `"$SB_BIN" user del 'hub-a' '` + userLineName(u.ID, line.LineUUID) + `'` + "\n"
-			if tasks[0].Script != want {
-				t.Fatalf("task script:\n%s\nwant:\n%s", tasks[0].Script, want)
-			}
-			request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
-			if err := srv.handleApprovalTaskResult(request, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: "node-a"}); err != nil {
-				t.Fatalf("successful result: %v", err)
-			}
-			if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalApplied {
-				t.Fatalf("status = %q reason %q, want applied", stored.Status, stored.Reason)
+			if removed.Script != want || len(removed.Targets) != 1 || removed.Targets[0] != "node-a" {
+				t.Fatalf("removal task = %+v, want one task on node-a running:\n%s", removed, want)
 			}
 			if _, ok := srv.getVpnUser(u.ID); ok {
 				t.Fatal("reconciling the removal recreated the deleted user")
@@ -219,17 +253,80 @@ func TestRemovingADeletedUsersCredentialFromAnAdoptedLine(t *testing.T) {
 	}
 }
 
+// A removal for a user Lattice no longer has must name an id of the shape
+// Lattice mints, refused before it is filed or echoed, and the approvals
+// must show an applied plan put that user on that line with no applied
+// removal since. A typo, an id that never reached the line, and a second
+// removal after the first applied are all refused, and none files anything.
+func TestADeletedUsersRemovalNeedsAMintedIDAndALineHistory(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, _ := seedLineUserFixture(t, srv)
+	u := seedMintedLineUser(t, srv)
+	applyLinePlan(t, srv, lineUserOpAdd, u.ID, line)
+	if err := srv.deleteVpnUser(u.ID); err != nil {
+		t.Fatal(err)
+	}
+	plan := func(userID string) error {
+		_, err := srv.vpnUserLinePlan(lineUserTestPrincipal(),
+			mustJSON(t, map[string]string{"user_id": userID, "line_hash_id": line.LineHashID}), lineUserOpRemove)
+		return err
+	}
+	approvalsBefore := len(srv.store.Approvals())
+	auditsBefore := len(srv.store.AuditEvents())
+
+	malformed := []string{
+		"",
+		"vpnuser_typo1",
+		"vpnuser_ABCDEFGHIJKLMNOP",
+		u.ID + "x",
+		u.ID + "\nforged audit line",
+		"vu_" + strings.Repeat("a", 129),
+		"puser_" + strings.TrimPrefix(u.ID, "vpnuser_"),
+	}
+	for _, userID := range malformed {
+		err := plan(userID)
+		if err == nil || !strings.Contains(err.Error(), "neither an existing user nor a VpnUser id Lattice mints") {
+			t.Fatalf("plan_remove for malformed id %q: %v, want the format refusal", userID, err)
+		}
+		if userID != "" && strings.Contains(err.Error(), userID) {
+			t.Fatalf("the refusal echoed the malformed id %q: %v", userID, err)
+		}
+	}
+
+	neverExisted := id.New("vpnuser")
+	if err := plan(neverExisted); err == nil || !strings.Contains(err.Error(), "no applied plan ever put user") {
+		t.Fatalf("plan_remove for an id that never reached the line: %v, want the history refusal", err)
+	}
+	if got := len(srv.store.Approvals()); got != approvalsBefore {
+		t.Fatalf("refused removals filed %d approval(s)", got-approvalsBefore)
+	}
+	if got := len(srv.store.AuditEvents()); got != auditsBefore {
+		t.Fatalf("refused removals wrote %d audit event(s)", got-auditsBefore)
+	}
+
+	applyLinePlan(t, srv, lineUserOpRemove, u.ID, line)
+	if err := plan(u.ID); err == nil || !strings.Contains(err.Error(), "already removed user") {
+		t.Fatalf("a second removal after the first applied: %v, want the history refusal", err)
+	}
+}
+
 // unbind drops only the server's binding record, so a user that plan_add put
 // on an adopted line keeps its credential there, and plan_remove refused it
 // as "not bound", while a removal filed before the unbind failed with "line
 // binding changed since planning". Both complete now, removing only that
-// user's derived name. A managed line, whose render already leaves an
-// unbound user out, still needs the binding.
+// user's derived name. A user with no binding and no applied plan on the
+// line has nothing to remove, and a managed line, whose render already
+// leaves an unbound user out, still needs the binding.
 func TestRemovingAnUnboundUsersCredentialFromAnAdoptedLine(t *testing.T) {
 	for _, filed := range []string{"before the unbind", "after the unbind"} {
 		t.Run(filed, func(t *testing.T) {
 			srv := newLinemetaTestServer(t, mustOpenStore(t))
 			line, u := seedLineUserFixture(t, srv)
+			u.Bindings = nil
+			if err := srv.putVpnUser(u); err != nil {
+				t.Fatal(err)
+			}
+			applyLinePlan(t, srv, lineUserOpAdd, u.ID, line)
 			unbind := func() {
 				t.Helper()
 				if _, err := srv.vpnUserUnbind(mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID})); err != nil {
@@ -247,25 +344,26 @@ func TestRemovingAnUnboundUsersCredentialFromAnAdoptedLine(t *testing.T) {
 					t.Fatalf("the plan must say Lattice holds no binding: %s", approval.Plan)
 				}
 			}
-			if err := approvePlan(t, srv, approval); err != nil {
-				t.Fatalf("approve: %v", err)
-			}
-			tasks := tasksFor(srv, approval.ID)
+			removed := applyLinePlanResult(t, srv, approval, line)
 			want := lineUserScriptPrelude + `"$SB_BIN" user del 'hub-a' '` + userLineName(u.ID, line.LineUUID) + `'` + "\n"
-			if len(tasks) != 1 || tasks[0].Script != want || len(tasks[0].Targets) != 1 || tasks[0].Targets[0] != "node-a" {
-				t.Fatalf("approval queued %+v, want one task on node-a running:\n%s", tasks, want)
-			}
-			request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
-			if err := srv.handleApprovalTaskResult(request, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: "node-a"}); err != nil {
-				t.Fatalf("successful result: %v", err)
-			}
-			if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalApplied {
-				t.Fatalf("status = %q reason %q, want applied", stored.Status, stored.Reason)
+			if removed.Script != want || len(removed.Targets) != 1 || removed.Targets[0] != "node-a" {
+				t.Fatalf("removal task = %+v, want one task on node-a running:\n%s", removed, want)
 			}
 			if lineUserBoundTo(t, srv, u.ID, line.LineHashID) {
 				t.Fatal("reconciling the removal bound the user again")
 			}
 		})
+	}
+
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	if _, err := srv.vpnUserUnbind(mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.vpnUserLinePlan(lineUserTestPrincipal(),
+		mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID}), lineUserOpRemove); err == nil ||
+		!strings.Contains(err.Error(), "no applied plan ever put user") {
+		t.Fatalf("plan_remove for an unbound user no plan put on the line: %v, want the history refusal", err)
 	}
 
 	managedSrv := newLinemetaTestServer(t, mustOpenStore(t))
@@ -294,12 +392,9 @@ func TestADeletedUserIsPlannedOnlyForRemovalFromAnAdoptedLine(t *testing.T) {
 	}
 
 	managedSrv := newLinemetaTestServer(t, mustOpenStore(t))
-	managedLine, identity := seedManagedLineUserFixture(t, managedSrv)
-	if err := managedSrv.deleteVpnUser(identity.ID); err != nil {
-		t.Fatal(err)
-	}
+	managedLine, _ := seedManagedLineUserFixture(t, managedSrv)
 	_, err := managedSrv.vpnUserLinePlan(lineUserTestPrincipal(),
-		mustJSON(t, map[string]string{"user_id": identity.ID, "line_hash_id": managedLine.LineHashID}), lineUserOpRemove)
+		mustJSON(t, map[string]string{"user_id": id.New("vpnuser"), "line_hash_id": managedLine.LineHashID}), lineUserOpRemove)
 	if err == nil || !strings.Contains(err.Error(), "already leaves it out of its render") {
 		t.Fatalf("plan_remove on a managed line for a deleted user: %v, want the render refusal", err)
 	}

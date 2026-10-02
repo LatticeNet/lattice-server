@@ -672,3 +672,32 @@ func TestManagedLineRolloutIsReadAndDecidedOnlyByVpnCoreAdmins(t *testing.T) {
 		}
 	})
 }
+
+// A rollout approved without its apply task was stranded twice over: nothing
+// queues the task later, and the definition stays planned, so the next
+// rollout skips the node. Approve-only is refused and leaves both alone.
+func TestApprovingARolloutWithoutQueueApplyIsRefused(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	seedManagedLineNode(t, srv, "node-a", realityInventoryLines())
+	seedManagedLineUser(t, srv)
+	approval, def := compileApproval(t, srv)
+	p := principal{Principal: rbac.Principal{ActorID: "op-1"}}
+	_, err := srv.approveApprovalCore(context.Background(), p, approval, false, planSHA256(approval.Plan))
+	if err == nil || !strings.Contains(err.Error(), "must queue their apply task") {
+		t.Fatalf("approve-only on a rollout: %v, want the queue_apply refusal", err)
+	}
+	if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalPending {
+		t.Fatalf("status = %q, want pending", stored.Status)
+	}
+	if stored, ok, _ := srv.managedLineDefByUUID(def.LineUUID); !ok || stored.Status != managedLineStatusPlanned || stored.ApprovalID != approval.ID {
+		t.Fatalf("definition changed: %+v", stored)
+	}
+	for _, task := range srv.store.Tasks() {
+		if task.ApprovalID == approval.ID {
+			t.Fatalf("approve-only queued task %s", task.ID)
+		}
+	}
+	if _, err := srv.approveApprovalCore(context.Background(), p, approval, true, planSHA256(approval.Plan)); err != nil {
+		t.Fatalf("approve with queue_apply: %v", err)
+	}
+}

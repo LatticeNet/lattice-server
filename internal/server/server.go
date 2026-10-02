@@ -7727,6 +7727,17 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
+	// A line-user or managed-line approval approved without its apply task is
+	// stranded: nothing queues one later, and approve is a no-op on an
+	// approval that is no longer pending, which is the dead end dd75324 fixed
+	// for queue_apply=true. A stranded rollout also keeps its definition
+	// planned, so the next rollout skips that node. Refused here, before any
+	// state changes, for the manual endpoint and for an auto-approve rule
+	// with queue=false alike; such a rule leaves the approval pending.
+	if !queueApply && (approval.Plugin == singBoxLineUserPlugin || approval.Plugin == singBoxManagedLinePlugin) {
+		return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest,
+			approval.Plugin+" approvals must queue their apply task: approve with queue_apply, since an approval approved without one can never be applied")}
+	}
 	if approval.Plugin == singBoxLineUserPlugin {
 		if _, _, _, _, _, err := s.validateLineUserApproval(approval, true); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}

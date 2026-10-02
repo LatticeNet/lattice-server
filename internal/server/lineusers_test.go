@@ -297,8 +297,12 @@ func TestApprovedAdoptedLineUserPlanRunsTheReviewedArgv(t *testing.T) {
 	}
 }
 
-// queue_apply=false approves the plan and queues nothing.
-func TestApprovingALineUserPlanWithoutQueueApplyQueuesNothing(t *testing.T) {
+// Approving a line-user plan without queue_apply stored it approved with no
+// task, and approve is a no-op once an approval is not pending, so the plan
+// could never reach the node: the dead end dd75324 fixed for queue_apply=true.
+// The endpoint refuses it now and leaves the approval pending, and the same
+// request with queue_apply goes through.
+func TestApprovingALineUserPlanWithoutQueueApplyIsRefused(t *testing.T) {
 	srv := newLinemetaTestServer(t, mustOpenStore(t))
 	line, u := seedLineUserFixture(t, srv)
 	u.Bindings = nil
@@ -306,19 +310,61 @@ func TestApprovingALineUserPlanWithoutQueueApplyQueuesNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	approval := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
-	tasksBefore := len(srv.store.Tasks())
 	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
-	if _, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, false, planSHA); err != nil {
-		t.Fatalf("approve without queue_apply: %v", err)
+	decider := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: []string{"network:apply", "network:plan", "vpncore:admin"}}}
+	body := func(queue bool) string {
+		return fmt.Sprintf(`{"approval_id":%q,"queue_apply":%t,"plan_sha256":%q}`, approval.ID, queue, planSHA)
 	}
-	if got := len(srv.store.Tasks()); got != tasksBefore {
-		t.Fatalf("approve without queue_apply queued %d task(s)", got-tasksBefore)
+
+	rec := decideApproval(srv, "approve", body(false), decider)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "must queue their apply task") {
+		t.Fatalf("approve without queue_apply: %d %s, want 400 naming the rule", rec.Code, rec.Body.String())
 	}
-	if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalApproved {
-		t.Fatalf("status = %q, want approved", stored.Status)
+	if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalPending || stored.ApprovedBy != "" {
+		t.Fatalf("a refused approve-only changed the approval: %+v", stored)
 	}
-	if lineUserBoundTo(t, srv, u.ID, line.LineHashID) {
-		t.Fatal("approving without queue_apply must not bind the user")
+	if tasks := tasksFor(srv, approval.ID); len(tasks) != 0 {
+		t.Fatalf("a refused approve-only queued %d task(s)", len(tasks))
+	}
+	if approves := lineUserAudit(srv, "network.singbox-lineuser.approve", approval.ID); len(approves) != 0 {
+		t.Fatalf("a refused approve-only wrote an approve audit event: %+v", approves)
+	}
+
+	rec = decideApproval(srv, "approve", body(true), decider)
+	if rec.Code != 200 {
+		t.Fatalf("approve with queue_apply: %d %s", rec.Code, rec.Body.String())
+	}
+	if tasks := tasksFor(srv, approval.ID); len(tasks) != 1 {
+		t.Fatalf("approve with queue_apply queued %d task(s), want 1", len(tasks))
+	}
+}
+
+// An auto-approve rule with queue=false reaches the same decision path, so a
+// line-user plan it matches stays pending for a decision that queues its
+// apply. A rule with queue=true approves and queues it.
+func TestAnApproveOnlyRuleLeavesALineUserPlanPending(t *testing.T) {
+	for _, queue := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queue=%t", queue), func(t *testing.T) {
+			srv := newLinemetaTestServer(t, mustOpenStore(t))
+			line, u := seedLineUserFixture(t, srv)
+			u.Bindings = nil
+			if err := srv.putVpnUser(u); err != nil {
+				t.Fatal(err)
+			}
+			srv.approvalAutoRules = []approvalAutoRule{{Name: "lineuser", Plugin: singBoxLineUserPlugin, Queue: queue}}
+			approval := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
+			stored, _ := srv.store.Approval(approval.ID)
+			tasks := tasksFor(srv, approval.ID)
+			if !queue {
+				if stored.Status != model.ApprovalPending || len(tasks) != 0 {
+					t.Fatalf("an approve-only rule left status %q and %d task(s), want pending and none", stored.Status, len(tasks))
+				}
+				return
+			}
+			if stored.Status != model.ApprovalApproved || stored.ApprovedBy != "policy:lineuser" || len(tasks) != 1 {
+				t.Fatalf("a queueing rule left status %q by %q and %d task(s), want approved by policy:lineuser and one", stored.Status, stored.ApprovedBy, len(tasks))
+			}
+		})
 	}
 }
 

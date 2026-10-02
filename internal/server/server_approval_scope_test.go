@@ -113,8 +113,11 @@ func TestDesign15ApprovalsRequireVPNCoreAdmin(t *testing.T) {
 				legacyScopes, legacyAllowlist = []string{"network:apply", "network:plan", "proxy:admin"}, nil
 			}
 			legacy := createPAT(t, handler, cookies, csrf, legacyScopes, legacyAllowlist)
+			// A line-user approval must queue its apply; approve-only is
+			// refused for it before any state changes.
+			queueApply := pluginID == singBoxLineUserPlugin
 			allowed := doBearerJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
-				string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": false, "plan_sha256": planSHA256(approval.Plan)})), legacy)
+				string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": queueApply, "plan_sha256": planSHA256(approval.Plan)})), legacy)
 			defer allowed.Body.Close()
 			if allowed.StatusCode != http.StatusOK {
 				t.Fatalf("legacy proxy:admin compatibility approval failed: %d", allowed.StatusCode)

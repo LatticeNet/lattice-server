@@ -7738,6 +7738,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest,
 			approval.Plugin+" approvals must queue their apply task: approve with queue_apply, since an approval approved without one can never be applied")}
 	}
+	// checkGrant judges the user's policy as of this approval, and the apply
+	// script is rendered from it below. If the node is offline the task waits
+	// with that script, and the user can expire or cross its quota before sb
+	// runs; the usage alerts cover that window, as they cover any user already
+	// on the node. The same holds for the managed-line check after this one.
 	if approval.Plugin == singBoxLineUserPlugin {
 		if _, _, _, _, _, err := s.validateLineUserApproval(approval, true); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}

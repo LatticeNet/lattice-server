@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // Read scopes reached credentials two ways: /api/proxy/discovered returned
@@ -262,5 +264,127 @@ func TestThePluginGatewayMarksAnOperatorsDirectCoreCall(t *testing.T) {
 	}
 	if got := operatorCalledCoreService(context.Background()); got != "" {
 		t.Fatalf("an unmarked context reports %q", got)
+	}
+}
+
+// seedComposableIdentity takes the line chain fixture to the state in which
+// compose succeeds: the managed line on node-a is a converged terminal, and
+// the identity is bound to it with a live subscription generation. It returns
+// the line's uuid, the root a compose request names.
+func seedComposableIdentity(t *testing.T) (*Server, string, VpnUser) {
+	t.Helper()
+	srv, _, rootUUID, user, def := seedLineChainFixture(t)
+	const artifact, requestSHA = "compose-terminal-artifact", "compose-terminal-request"
+	approval := model.Approval{
+		ID: "compose-terminal-approval", NodeID: def.NodeID, Plugin: lineChainPlugin, PluginVersion: "test-fixture",
+		Service: lineChainService, Method: lineChainRemoveMethod, Action: lineChainActionPrefix + artifact,
+		ArtifactDigest: artifact, RequestSHA256: requestSHA, Plan: `{"operation":"remove","fixture":"converged-terminal"}`,
+		Status: model.ApprovalPending, Targets: []string{def.NodeID},
+	}
+	attempt := store.LineChainAttempt{
+		ApprovalID: approval.ID, Operation: store.LineChainOperationRemove, SourceLineUUID: def.LineUUID, SourceNodeID: def.NodeID,
+		CandidateArtifactSHA256: artifact, RequestSHA256: requestSHA, PlanGraphRevision: srv.store.LineChainSnapshot().Revision,
+		CandidateDefinition: store.LineChainDefinition{SourceLineUUID: def.LineUUID, SourceNodeID: def.NodeID,
+			SourceLineHashID: def.LineHashID, SourceInboundTag: def.Tag, ArtifactSHA256: artifact},
+	}
+	if _, _, err := srv.store.PlanLineChainApproval(attempt, approval); err != nil {
+		t.Fatal(err)
+	}
+	approved := approval
+	approved.Status = model.ApprovalApproved
+	task := model.Task{ID: "compose-terminal-task", ApprovalID: approval.ID, Targets: []string{def.NodeID}, Script: "compose-terminal", Status: model.TaskQueued}
+	if _, committed, err := srv.store.ApproveLineChain(approved, task); err != nil || !committed {
+		t.Fatalf("approve: committed=%v err=%v", committed, err)
+	}
+	deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator(def.NodeID, 1, false, true,
+		func(store.LineChainCompileStateSnapshot, model.Approval, store.LineChainAttempt, model.Task) error {
+			return nil
+		})
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease: %d deliveries, err=%v", len(deliveries), err)
+	}
+	result := model.TaskResult{TaskID: task.ID, NodeID: def.NodeID, LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
+	if committed, err := srv.store.CompleteLineChainTaskResult(result, approved, store.LineChainStatusAppliedUnobserved, "", ""); err != nil || !committed {
+		t.Fatalf("complete: committed=%v err=%v", committed, err)
+	}
+	if committed, err := srv.store.ReconcileLineChains(map[string]store.LineChainObservation{def.LineUUID: {}}); err != nil || !committed {
+		t.Fatalf("converge: committed=%v err=%v", committed, err)
+	}
+	public, private := splitVpnUserRecord(user)
+	public.SubscriptionGeneration = 1
+	public.Bindings = append(public.Bindings, store.VpnUserLineBinding{LineHashID: def.LineHashID, Enabled: true})
+	if err := srv.store.PutVpnUserRecord(public, private); err != nil {
+		t.Fatal(err)
+	}
+	return srv, rootUUID, user
+}
+
+// The route a read-scoped operator actually uses: the plugin gateway, with
+// the compose scope vpn-core ships (vpncore:read). The direct call is
+// redacted, an admin's is verbatim, and a plugin that composes over rpc:call
+// while serving a reader still receives the credential it needs, so Sub-Store
+// graph preview keeps working.
+func TestComposeThroughThePluginGatewayRedactsOnlyAReadScopedOperatorsDirectCall(t *testing.T) {
+	srv, rootUUID, user := seedComposableIdentity(t)
+	credential := user.Credentials[0].UUID
+	activateCorePlugin(t, srv.store, vpnCorePluginID)
+	srv.plugins = append(srv.plugins, plugin.Loaded{Manifest: plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: vpnCorePluginID, Name: "vpn-core (sing-box)", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: vpnCoreSubscriptionSourcesService, Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "compose", Effect: plugin.InterfaceEffectRead, Scopes: []string{"vpncore:read"}}}}},
+	}})
+	payload := fmt.Sprintf(`{"schema_version":1,"identity_id":%q,"entry_roots":[%q]}`, user.ID, rootUUID)
+
+	call := func(t *testing.T, pluginID, service string, scopes ...string) (graphSubscriptionResponse, string) {
+		t.Helper()
+		body := fmt.Sprintf(`{"id":%q,"service":%q,"method":"compose","payload":%s}`, pluginID, service, payload)
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{ActorID: "op", Scopes: scopes}})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%v: compose %d %s", scopes, rec.Code, rec.Body.String())
+		}
+		var decoded graphSubscriptionResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &decoded); err != nil || !decoded.OK || len(decoded.Entries) != 1 {
+			t.Fatalf("%v: want one composed entry, got %s err=%v", scopes, rec.Body.String(), err)
+		}
+		return decoded, rec.Body.String()
+	}
+
+	admin, adminWire := call(t, vpnCorePluginID, vpnCoreSubscriptionSourcesService, "vpncore:read", "vpncore:admin")
+	if !strings.Contains(admin.Entries[0], credential+"@") || !strings.Contains(adminWire, credential) {
+		t.Fatalf("an admin's direct compose must carry the identity credential: %s", adminWire)
+	}
+	for _, scopes := range [][]string{{"proxy:read"}, {"vpncore:read"}} {
+		reader, wire := call(t, vpnCorePluginID, vpnCoreSubscriptionSourcesService, scopes...)
+		if strings.Contains(wire, credential) || !strings.HasPrefix(reader.Entries[0], "vless://"+vpnCoreRedactedCredential+"@") {
+			t.Fatalf("%v: a read-scoped direct compose leaked the identity credential: %s", scopes, wire)
+		}
+		if reader.SourceVersion != admin.SourceVersion || string(reader.SourceManifest) != string(admin.SourceManifest) || reader.Raw != reader.Entries[0] {
+			t.Fatalf("%v: redaction must keep the version and manifest and rebuild raw: %s", scopes, wire)
+		}
+	}
+
+	// A plugin's own service composes over a granted rpc:call while it serves
+	// a reader; that context carries the reader, and the mark names the
+	// plugin's service, not compose.
+	if err := srv.store.UpsertPluginInstallation(model.PluginInstallation{ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	srv.plugins = append(srv.plugins, plugin.Loaded{Manifest: plugin.Manifest{
+		Schema: plugin.ManifestSchemaV2, ID: "p", Name: "Subscription store", Type: plugin.TypeSystem, Publisher: "latticenet",
+		Interfaces: []plugin.InterfaceContract{{Service: "p/subscription", Backing: plugin.BackingCore,
+			MethodSpecs: []plugin.InterfaceMethod{{Name: "compose", Effect: plugin.InterfaceEffectRead, Scopes: []string{"substore:read"}}}}},
+	}})
+	grant := plugin.RPCGrant{vpnCoreSubscriptionSourcesService: {"compose": {}}}
+	if err := srv.pluginRPC.Register("p", "p/subscription", "v1", []string{"compose"}, func(ctx context.Context, _ string, request []byte) ([]byte, error) {
+		return srv.pluginRPC.CallGranted(ctx, "p", grant, vpnCoreSubscriptionSourcesService, "compose", request)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	nested, wire := call(t, "p", "p/subscription", "substore:read")
+	if !strings.Contains(nested.Entries[0], credential+"@") {
+		t.Fatalf("a plugin composing for a reader must still receive the credential: %s", wire)
 	}
 }

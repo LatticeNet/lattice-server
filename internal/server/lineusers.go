@@ -433,9 +433,35 @@ func (s *Server) requireLineUserOnLine(userID, lineHashID string) error {
 	}
 }
 
+// openLineUserRemove finds a removal of userID from lineHashID that is still
+// open: pending, or approved with its task not yet reported (approve-only is
+// refused for line-user plans, and a failed task returns the approval to
+// pending). The "not bound" refusal used to stop a second removal once the
+// first applied; a removal no longer needs a binding, so a second one filed
+// while the first is open is refused here, so the operator decides the open
+// one. An applied removal is covered by requireLineUserOnLine.
+func (s *Server) openLineUserRemove(userID, lineHashID string) (model.Approval, bool) {
+	requestSHA := lineUserRequestSHA(userID, lineHashID)
+	for _, a := range s.store.Approvals() {
+		if a.Plugin != singBoxLineUserPlugin || a.Method != "apply_"+lineUserOpRemove || a.RequestSHA256 != requestSHA {
+			continue
+		}
+		if a.Status == model.ApprovalPending || a.Status == model.ApprovalApproved {
+			return a, true
+		}
+	}
+	return model.Approval{}, false
+}
+
 // fileLineUserPlan stores plan as a pending line-user approval, records the
 // plan audit event with extra metadata, and answers the approval.
 func (s *Server) fileLineUserPlan(ctxPrincipal principal, plan lineUserPlan, extra map[string]string) ([]byte, error) {
+	if plan.Op == lineUserOpRemove {
+		if open, ok := s.openLineUserRemove(plan.UserID, plan.LineHashID); ok {
+			return nil, fmt.Errorf("a removal of user %q from line %q is already %s as approval %s; decide that one before filing another",
+				plan.UserID, plan.LineHashID, open.Status, open.ID)
+		}
+	}
 	planJSON, err := json.Marshal(plan)
 	if err != nil {
 		return nil, err

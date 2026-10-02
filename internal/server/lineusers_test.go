@@ -400,6 +400,60 @@ func TestADeletedUserIsPlannedOnlyForRemovalFromAnAdoptedLine(t *testing.T) {
 	}
 }
 
+// A second removal of the same user from the same line is refused while the
+// first is open, pending or approved with its task in flight, and again
+// after a failed run returns it to pending. Once the first is rejected a new
+// one can be filed. The same holds for a user that has been deleted.
+func TestASecondRemovalWaitsForTheOpenOne(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	plan := func(userID string) error {
+		_, err := srv.vpnUserLinePlan(lineUserTestPrincipal(),
+			mustJSON(t, map[string]string{"user_id": userID, "line_hash_id": line.LineHashID}), lineUserOpRemove)
+		return err
+	}
+	refused := func(t *testing.T, userID string, open model.Approval, state string) {
+		t.Helper()
+		before := len(srv.store.Approvals())
+		err := plan(userID)
+		if err == nil || !strings.Contains(err.Error(), "already "+state+" as approval "+open.ID) {
+			t.Fatalf("a second removal while the first is %s: %v, want a refusal naming %s", state, err, open.ID)
+		}
+		if got := len(srv.store.Approvals()); got != before {
+			t.Fatalf("the refused removal filed %d approval(s)", got-before)
+		}
+	}
+
+	first := filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+	refused(t, u.ID, first, "pending")
+	if err := approvePlan(t, srv, first); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	refused(t, u.ID, first, "approved")
+	tasks := tasksFor(srv, first.ID)
+	request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
+	if err := srv.handleApprovalTaskResult(request, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: "node-a", ExitCode: 1}); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, u.ID, first, "pending")
+
+	decider := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: []string{"network:apply", "network:plan", "vpncore:admin"}}}
+	if rec := decideApproval(srv, "reject", `{"approval_id":"`+first.ID+`"}`, decider); rec.Code != 200 {
+		t.Fatalf("reject: %d %s", rec.Code, rec.Body.String())
+	}
+	if err := plan(u.ID); err != nil {
+		t.Fatalf("a removal after the open one was rejected: %v", err)
+	}
+
+	deleted := seedMintedLineUser(t, srv)
+	applyLinePlan(t, srv, lineUserOpAdd, deleted.ID, line)
+	if err := srv.deleteVpnUser(deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	open := filePlan(t, srv, lineUserOpRemove, deleted.ID, line.LineHashID)
+	refused(t, deleted.ID, open, "pending")
+}
+
 // lineUserAudit returns the audit events with action that name approvalID.
 func lineUserAudit(srv *Server, action, approvalID string) []model.AuditEvent {
 	var out []model.AuditEvent

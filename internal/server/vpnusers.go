@@ -350,6 +350,10 @@ func (s *Server) migrateProxyUsersToVpnUsers() error {
 				UpdatedAt:             s.now(),
 			}
 			publicRecords[vid], privateRecords[vid] = splitVpnUserRecord(u)
+			// Named because this is also how an identity deleted before its
+			// delete removed the legacy proxy user comes back: nothing else
+			// records that it was deleted, so the operator finds it here.
+			s.logger.Printf("migrate vpn users: derived identity %s from proxy user %s, which had no identity", vid, pu.ID)
 		}
 		return store.LineSecretMigrationBuild{
 			VpnUsers: publicRecords, VpnUserSecrets: privateRecords,

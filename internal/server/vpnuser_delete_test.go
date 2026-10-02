@@ -1,7 +1,9 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"log"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,13 +22,15 @@ import (
 func TestADeletedMigratedIdentityStaysDeletedAcrossARestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	const legacyToken = "legacy-sub-token-alice-0123456789"
+	var logs bytes.Buffer
 	boot := func(t *testing.T) (*Server, *store.Store) {
 		t.Helper()
+		logs.Reset()
 		st, err := store.OpenWithCipher(path, secret.Disabled())
 		if err != nil {
 			t.Fatal(err)
 		}
-		srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+		srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, Logger: log.New(&logs, "", 0)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -47,6 +51,9 @@ func TestADeletedMigratedIdentityStaysDeletedAcrossARestart(t *testing.T) {
 	if !ok || migrated.MigratedFromProxyUser != "pu-alice" || migrated.SubID != legacyToken {
 		t.Fatalf("fixture: want vu_pu-alice migrated with the legacy token, got %+v ok=%v", migrated, ok)
 	}
+	if !strings.Contains(logs.String(), "derived identity vu_pu-alice from proxy user pu-alice") {
+		t.Fatalf("the migration did not name the identity it derived; log:\n%s", logs.String())
+	}
 	if _, err := srv.vpnCoreUsersAdminDispatch(context.Background(), "delete", mustJSON(t, map[string]string{"id": "vu_pu-alice"})); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -62,6 +69,9 @@ func TestADeletedMigratedIdentityStaysDeletedAcrossARestart(t *testing.T) {
 	defer st.Close()
 	if u, ok := srv.getVpnUser("vu_pu-alice"); ok {
 		t.Fatalf("the deleted identity came back at boot: %+v", u)
+	}
+	if strings.Contains(logs.String(), "derived identity") {
+		t.Fatalf("the boot derived an identity after the delete; log:\n%s", logs.String())
 	}
 	for _, u := range srv.listVpnUsers() {
 		if u.SubID == legacyToken {

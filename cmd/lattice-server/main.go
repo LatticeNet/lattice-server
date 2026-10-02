@@ -46,6 +46,7 @@ func main() {
 	var webRoot string
 	var secureCookies bool
 	var trustProxy bool
+	var trustedProxies string
 	var requireTOTP bool
 	var taskQueueDeadline string
 	var tlsCert string
@@ -78,6 +79,7 @@ func main() {
 	flag.StringVar(&webRoot, "web", env("LATTICE_WEB_ROOT", "../lattice-dashboard"), "static dashboard root")
 	flag.BoolVar(&secureCookies, "secure-cookies", env("LATTICE_SECURE_COOKIES", "") == "1", "set Secure on session cookies (enables HSTS)")
 	flag.BoolVar(&trustProxy, "trust-proxy", env("LATTICE_TRUST_PROXY", "") == "1", "trust CF-Connecting-IP / X-Forwarded-For for client IP (only behind a trusted proxy)")
+	flag.StringVar(&trustedProxies, "trusted-proxies", env("LATTICE_TRUSTED_PROXIES", ""), "comma-separated CIDRs or addresses of the reverse proxies whose forwarding headers -trust-proxy believes; loopback is always trusted, empty adds the private-use ranges")
 	flag.BoolVar(&requireTOTP, "require-totp", env("LATTICE_REQUIRE_TOTP", "") == "1", "require interactive users to enable TOTP before using non-setup APIs")
 	flag.StringVar(&taskQueueDeadline, "task-queue-deadline", env("LATTICE_TASK_QUEUE_DEADLINE", ""),
 		"how long a task may sit undelivered before the control plane stops offering it (Go duration, e.g. 24h). Empty or 0 never expires.")
@@ -219,6 +221,14 @@ func main() {
 	} else {
 		log.Printf("geoip lookup: disabled")
 	}
+	switch {
+	case trustProxy && strings.TrimSpace(trustedProxies) == "":
+		log.Printf("trust-proxy: forwarding headers believed from loopback and private-use peers (set LATTICE_TRUSTED_PROXIES to narrow)")
+	case trustProxy:
+		log.Printf("trust-proxy: forwarding headers believed from loopback and %s", strings.Join(server.SplitTrustedProxies(trustedProxies), ", "))
+	case strings.TrimSpace(trustedProxies) != "":
+		log.Printf("WARNING: LATTICE_TRUSTED_PROXIES is ignored without LATTICE_TRUST_PROXY=1; the socket peer address is used")
+	}
 	app, err := server.New(server.Options{
 		Store:         st,
 		LogStore:      logStore,
@@ -235,6 +245,7 @@ func main() {
 		},
 		SecureCookies:        secureCookies,
 		TrustProxy:           trustProxy,
+		TrustedProxies:       server.SplitTrustedProxies(trustedProxies),
 		RequireTOTP:          requireTOTP,
 		PluginDir:            pluginDir,
 		PluginBundleCacheDir: pluginBundleCacheDir,

@@ -76,10 +76,16 @@ type Options struct {
 	Build         BuildInfo
 	SecureCookies bool
 	// TrustProxy enables reading the client address from proxy headers
-	// (CF-Connecting-IP, then X-Forwarded-For). Only enable when the server
-	// sits behind a trusted reverse proxy / Cloudflare; otherwise clients can
-	// spoof the header and evade per-IP rate limiting.
+	// (CF-Connecting-IP, then X-Forwarded-For read from the right). Headers
+	// are believed only from an immediate peer in TrustedProxies, so a client
+	// that reaches the server directly cannot choose its own address.
 	TrustProxy bool
+	// TrustedProxies lists the CIDRs or addresses of the reverse proxies whose
+	// forwarding headers are believed under TrustProxy. Loopback is always
+	// trusted. Empty means loopback plus the private-use and unique-local
+	// ranges, which covers a proxy reaching the server through a Docker
+	// bridge. A malformed entry fails New.
+	TrustedProxies []string
 	// RequireTOTP forces interactive user sessions to enable TOTP before they can
 	// use non-setup APIs. Existing password/SSO login still issues a session so
 	// the operator can enroll, but withAuth gates every other route until TOTP is
@@ -162,9 +168,11 @@ type Server struct {
 	webFS         fs.FS
 	secureCookies bool
 	trustProxy    bool
-	requireTOTP   bool
-	logger        *log.Logger
-	loginLimiter  *ratelimit.Limiter
+	// trustedProxies is the parsed TrustedProxies set (loopback is implied).
+	trustedProxies []netip.Prefix
+	requireTOTP    bool
+	logger         *log.Logger
+	loginLimiter   *ratelimit.Limiter
 	// storageAuthLimiter bounds anonymous storage-token attempts. It is separate
 	// from apiLimiter because the work it protects is key derivation, not a
 	// handler, and it is sized like loginLimiter for the same reason.
@@ -501,6 +509,10 @@ func New(opts Options) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	trustedProxies, err := parseTrustedProxies(opts.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
 	build := normalizeBuildInfo(opts.Build)
 	build.TaskExecutionDisabled = opts.TaskExecutionDisabled
 	approvalAutoRules, err := parseApprovalAutoRules(opts.ApprovalAutoRules)
@@ -511,14 +523,15 @@ func New(opts Options) (*Server, error) {
 		approvalAutoRules = nil
 	}
 	s := &Server{
-		store:         opts.Store,
-		logStore:      opts.LogStore,
-		traceStore:    opts.TraceStore,
-		webFS:         opts.WebFS,
-		secureCookies: opts.SecureCookies,
-		trustProxy:    opts.TrustProxy,
-		requireTOTP:   opts.RequireTOTP,
-		logger:        opts.Logger,
+		store:          opts.Store,
+		logStore:       opts.LogStore,
+		traceStore:     opts.TraceStore,
+		webFS:          opts.WebFS,
+		secureCookies:  opts.SecureCookies,
+		trustProxy:     opts.TrustProxy,
+		trustedProxies: trustedProxies,
+		requireTOTP:    opts.RequireTOTP,
+		logger:         opts.Logger,
 		// Login is intentionally strict: 5/min sustained, small burst, to slow
 		// password guessing without locking out legitimate retries.
 		loginLimiter: ratelimit.New(ratelimit.Config{Rate: 5.0 / 60.0, Burst: 5}),
@@ -9424,9 +9437,6 @@ func (s *Server) auditAgentAuthFailure(r *http.Request, nodeID, reason string) {
 	})
 }
 
-// clientIP resolves the address used as a rate-limit key. Proxy headers are
-// only honored when TrustProxy is set, preventing key spoofing in the direct
-// exposure case.
 // webhookVerifyConcurrency sizes the derivation semaphore from the machine
 // rather than from a guessed request rate.
 //
@@ -9459,25 +9469,12 @@ func (s *Server) acquireSecretVerify() (func(), bool) {
 	}
 }
 
+// clientIP resolves the address used as a rate-limit key, for audit
+// attribution, and for challenge and allowlist binding. Proxy headers are
+// honored only when TrustProxy is set and the immediate peer is a trusted
+// proxy; see resolveClientIP.
 func (s *Server) clientIP(r *http.Request) string {
-	if s.trustProxy {
-		if cf := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); cf != "" {
-			return cf
-		}
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if comma := strings.IndexByte(xff, ','); comma >= 0 {
-				xff = xff[:comma]
-			}
-			if xff = strings.TrimSpace(xff); xff != "" {
-				return xff
-			}
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return resolveClientIP(r.RemoteAddr, r.Header, s.trustProxy, s.trustedProxies)
 }
 
 func unsafeMethod(method string) bool {

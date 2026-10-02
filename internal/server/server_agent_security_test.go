@@ -338,15 +338,44 @@ func TestAgentSourceAllowlistHonorsTrustedProxyHeaders(t *testing.T) {
 		t.Fatalf("set allowlist status = %d", update.StatusCode)
 	}
 
+	// A public peer cannot claim the allowlisted address with a header, in
+	// either position of X-Forwarded-For.
+	for _, xff := range []string{"198.51.100.10", "198.51.100.10, 203.0.113.1"} {
+		spoofed := httptest.NewRequest(http.MethodPost, "/api/agent/hello",
+			strings.NewReader(`{"node_id":"`+nodeID+`","version":"test"}`))
+		spoofed.RemoteAddr = "203.0.113.20:1234"
+		spoofed.Header.Set("Content-Type", "application/json")
+		spoofed.Header.Set("Authorization", "Bearer "+nodeToken)
+		spoofed.Header.Set("X-Forwarded-For", xff)
+		if rec := serveReq(handler, spoofed); rec.Code != http.StatusUnauthorized {
+			t.Fatalf("public peer with X-Forwarded-For %q status = %d, want 401 (%s)", xff, rec.Code, rec.Body.String())
+		}
+	}
+
+	// Through the reverse proxy (the server's peer is the Docker bridge
+	// gateway): the proxy appended the real address on the right, and a
+	// forged leftmost entry does not change it.
 	req := httptest.NewRequest(http.MethodPost, "/api/agent/hello",
 		strings.NewReader(`{"node_id":"`+nodeID+`","version":"test"}`))
-	req.RemoteAddr = "203.0.113.20:1234"
+	req.RemoteAddr = "172.18.0.1:40000"
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+nodeToken)
-	req.Header.Set("X-Forwarded-For", "198.51.100.10, 203.0.113.1")
+	req.Header.Set("X-Forwarded-For", "203.0.113.1, 198.51.100.10")
 	rec := serveReq(handler, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("trusted proxy source status = %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	// The same proxy, but the client forged the allowlisted address on the
+	// left: the real (rightmost) address is not allowlisted.
+	forged := httptest.NewRequest(http.MethodPost, "/api/agent/hello",
+		strings.NewReader(`{"node_id":"`+nodeID+`","version":"test"}`))
+	forged.RemoteAddr = "172.18.0.1:40000"
+	forged.Header.Set("Content-Type", "application/json")
+	forged.Header.Set("Authorization", "Bearer "+nodeToken)
+	forged.Header.Set("X-Forwarded-For", "198.51.100.10, 203.0.113.1")
+	if rec := serveReq(handler, forged); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("forged leftmost X-Forwarded-For through the proxy status = %d, want 401 (%s)", rec.Code, rec.Body.String())
 	}
 }
 

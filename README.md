@@ -273,7 +273,13 @@ Use the compose file and deployment guide in the umbrella repository:
   or CIDR prefixes; the token is then accepted only from those sources. Direct
   deployments use the socket remote address, while `CF-Connecting-IP` /
   `X-Forwarded-For` are honored only when the server is explicitly configured
-  with `TrustProxy`.
+  with `TrustProxy` (`LATTICE_TRUST_PROXY=1`) and the immediate peer is a
+  trusted proxy. Loopback is always trusted; `LATTICE_TRUSTED_PROXIES` (CIDRs
+  or addresses) names the rest, and when it is empty the private-use and
+  unique-local ranges are trusted so a proxy reaching the server through a
+  Docker bridge keeps working. `X-Forwarded-For` is read from the right,
+  skipping trusted hops, so a client-supplied leftmost entry cannot choose the
+  address.
 - Agent HostFacts (OS, arch, cores, memory, platform, kernel, boot time) are
   advisory telemetry only. They are sanitized and clamped server-side and must
   not be used for authorization or policy decisions.

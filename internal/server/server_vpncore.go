@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -106,7 +107,59 @@ func (s *Server) vpnCoreSubscriptionSourcesRPC(ctx context.Context, method strin
 	if err != nil {
 		response = graphSubscriptionResponse{SchemaVersion: 1, Error: composeFailureView(err)}
 	}
+	if response.OK && !vpnCoreComposeCredentialsAllowed(ctx) {
+		response = redactComposedSubscription(response)
+	}
 	return json.Marshal(response)
+}
+
+// vpnCoreComposeCredentialsAllowed decides whether a compose answer may carry
+// the identity's credential, the uuid inside every composed entry.
+//
+// The manifest declares compose at vpncore:read, and proxy:read satisfies
+// that, so an operator who calls it through the plugin gateway used to read
+// any identity's credential at read scope. That direct call, and only that
+// one, now needs vpncore:admin, the same bar vpnCoreNodeCredentialsAllowed
+// sets for nodes export.
+//
+// The rule cannot simply follow the operator principal as export's does. The
+// Sub-Store plugin composes over rpc:call while serving an operator's own
+// call (preview at substore:read; fetch, render and publish at
+// substore:admin), and that context still carries the operator. Sub-Store
+// rejects any entry whose credential is not a uuid, and redacts previews
+// itself, so a redacted answer there would fail every graph preview by a
+// reader and every refresh by a token without vpn-core scopes, without
+// hiding anything from them. The gateway therefore marks the core service an
+// operator called directly (operatorCoreCallKey), and only a compose reached
+// that way is held to the operator's scopes. A compose with no mark is the
+// serving path a plugin reaches under its signed host_access grant.
+func vpnCoreComposeCredentialsAllowed(ctx context.Context) bool {
+	if operatorCalledCoreService(ctx) != vpnCoreSubscriptionSourcesService {
+		return true
+	}
+	p, err := pluginOperatorPrincipal(ctx)
+	if err != nil {
+		return false
+	}
+	allowed, _ := pluginGatewayScopeAllowed(p, "vpncore:admin")
+	return allowed
+}
+
+// redactComposedSubscription replaces the credential in every composed entry
+// with the fixed marker and rebuilds raw from what is left. The source version
+// and manifest carry no credential and stay as they are, so the caller still
+// sees which lines and which revision the answer describes. An entry that
+// does not parse is dropped rather than passed through.
+func redactComposedSubscription(response graphSubscriptionResponse) graphSubscriptionResponse {
+	entries := make([]string, 0, len(response.Entries))
+	for _, entry := range response.Entries {
+		if redacted, ok := redactLinkCredential(entry); ok {
+			entries = append(entries, redacted)
+		}
+	}
+	response.Entries = entries
+	response.Raw = strings.Join(entries, "\n")
+	return response
 }
 
 func composeGraphSubscriptionFromCapture(capture func() (lineChainCompileSnapshot, error), req graphSubscriptionRequest, now time.Time) (graphSubscriptionResponse, error) {
@@ -326,23 +379,59 @@ func (s *Server) vpnCoreNodeCredentialsAllowed(ctx context.Context) bool {
 	return allowed
 }
 
-// redactLinkCredential strips the userinfo from a connection URL, which is
-// where every scheme this fleet serves carries its secret: the UUID for VLESS
-// and TUIC, the password for the rest. What survives is the endpoint an
-// operator needs to recognise the entry, and nothing that authenticates as its
-// owner.
+// redactLinkCredential strips the secret from a connection URL. For every
+// scheme but one it sits in the userinfo: the UUID for VLESS and TUIC, the
+// password for trojan, hysteria2 and anytls, and a base64 method:password or
+// user:password for shadowsocks and socks. vmess is the exception: the fork
+// emits vmess://BASE64(JSON) with the UUID as the document's "id", so the
+// document is decoded, its id replaced, and re-encoded. What survives is the
+// endpoint an operator needs to recognise the entry, and nothing that
+// authenticates as its owner.
 //
 // A link that does not parse is dropped rather than passed through, because the
 // one thing worse than an unhelpful export is one that leaks by failing open.
+// So is a shadowsocks link with no userinfo: the legacy form encodes
+// method:password@host:port as the host itself.
 func redactLinkCredential(link string) (string, bool) {
-	parsed, err := url.Parse(strings.TrimSpace(link))
+	link = strings.TrimSpace(link)
+	if scheme, body, ok := strings.Cut(link, "://"); ok && strings.EqualFold(scheme, "vmess") {
+		return redactVMessLink(body)
+	}
+	parsed, err := url.Parse(link)
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", false
 	}
 	if parsed.User != nil {
 		parsed.User = url.User(vpnCoreRedactedCredential)
+	} else if scheme := strings.ToLower(parsed.Scheme); scheme == "ss" || scheme == "shadowsocks" {
+		return "", false
 	}
 	return parsed.String(), true
+}
+
+// redactVMessLink handles the body of a vmess://BASE64(JSON) link. A body
+// that does not decode to a JSON object is dropped.
+func redactVMessLink(body string) (string, bool) {
+	payload, suffix := body, ""
+	if i := strings.IndexAny(payload, "?#"); i >= 0 {
+		payload, suffix = payload[:i], payload[i:]
+	}
+	decoded, ok := decodeLooseBase64(payload)
+	if !ok {
+		return "", false
+	}
+	var document map[string]any
+	if err := json.Unmarshal(decoded, &document); err != nil || document == nil {
+		return "", false
+	}
+	if _, ok := document["id"]; ok {
+		document["id"] = vpnCoreRedactedCredential
+	}
+	raw, err := json.Marshal(document)
+	if err != nil {
+		return "", false
+	}
+	return "vmess://" + base64.StdEncoding.EncodeToString(raw) + suffix, true
 }
 
 // vpnCoreRedactedCredential is a fixed marker, not a hash or a prefix of the

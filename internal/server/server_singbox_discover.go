@@ -247,13 +247,30 @@ func (s *Server) removeSingBoxInventory(nodeID string) {
 
 // handleProxyDiscovered lists every live node's discovered on-box sing-box
 // inventory, sorted by node id. proxy:read.
+//
+// Each line's share_url is the full client URI with the line's first
+// credential in it, the line owner's (core.sh builds vless://<uuid>@...,
+// trojan://<password>@..., and so on), whatever the SDK comment on the field
+// says. A caller who may not administer proxies on that node gets the link
+// with its credential replaced by the fixed marker, as nodes list and export
+// already do; proxy:admin, or vpncore:admin, still gets it whole.
 func (s *Server) handleProxyDiscovered(w http.ResponseWriter, _ *http.Request, p principal) {
 	if !s.requireScope(w, p, "proxy:read") {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"inventories": filterSingBoxInventoriesForPrincipal(s.liveSingBoxInventories(s.now()), p),
-	})
+	inventories := filterSingBoxInventoriesForPrincipal(s.liveSingBoxInventories(s.now()), p)
+	for i := range inventories {
+		if rbac.Allows(p.Principal, "proxy:admin", inventories[i].NodeID) {
+			continue
+		}
+		// liveSingBoxInventories copies Nodes, so this edits the reply only.
+		for j := range inventories[i].Nodes {
+			if raw := inventories[i].Nodes[j].ShareURL; raw != "" {
+				inventories[i].Nodes[j].ShareURL, _ = redactLinkCredential(raw)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"inventories": inventories})
 }
 
 func filterSingBoxInventoriesForPrincipal(inventories []model.SingBoxInventory, p principal) []model.SingBoxInventory {

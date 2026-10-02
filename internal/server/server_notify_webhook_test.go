@@ -430,12 +430,12 @@ func TestInboundWebhookRoutesThroughExistingRules(t *testing.T) {
 
 	// The rule's template wraps the webhook's rendered message, proving the
 	// webhook is a source feeding the existing pipeline rather than a path beside it.
-	deliveries := srv.planNotifyDeliveries(hook.EventType, record.Title, record.Body, st.EnabledNotifyChannels(), st.EnabledNotifyRules())
-	if len(deliveries) != 1 {
-		t.Fatalf("expected one delivery, got %d", len(deliveries))
+	targets := srv.planNotifyTargets(hook.EventType, record.Title, record.Body, st.EnabledNotifyChannels(), st.EnabledNotifyRules(), "", false)
+	if len(targets) != 1 {
+		t.Fatalf("expected one delivery, got %d", len(targets))
 	}
-	if deliveries[0].Message.Title != "[deploy.finished] Deploy of api" {
-		t.Fatalf("rule template not applied over the webhook message: %q", deliveries[0].Message.Title)
+	if targets[0].message.Title != "[deploy.finished] Deploy of api" {
+		t.Fatalf("rule template not applied over the webhook message: %q", targets[0].message.Title)
 	}
 }
 

@@ -12,9 +12,9 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
-	"github.com/LatticeNet/lattice-server/internal/notify"
 	"github.com/LatticeNet/lattice-server/internal/outbound"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 const (
@@ -216,31 +216,26 @@ func (h *pluginHost) Put(ctx context.Context, key string, value []byte) error {
 // to a non-plugin bucket in the shared operator KV store.
 const pluginKVBucketPrefix = "plugin:"
 
-func (h *pluginHost) Send(ctx context.Context, title, body string) error {
-	channels := h.server.store.EnabledNotifyChannels()
-	if len(channels) == 0 {
-		return nil
-	}
-	built := make([]notify.Channel, 0, len(channels))
-	for _, c := range channels {
-		ch, err := buildChannel(c.Kind, c.Config)
-		if err != nil {
-			return fmt.Errorf("notify channel %s: %w", c.ID, err)
-		}
-		built = append(built, ch)
-	}
-	ctx, cancel := contextWithDefaultTimeout(ctx, 15*time.Second)
-	defer cancel()
-	var errs []string
-	for _, res := range notify.NewDispatcher(built...).Send(ctx, notify.Message{Title: title, Body: body}) {
-		if res.Err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", res.Kind, res.Err))
-		}
-	}
-	if len(errs) > 0 {
-		return errors.New(strings.Join(errs, "; "))
-	}
+// Send puts a plugin's message in the notification outbox, addressed to every
+// enabled channel as plugin messages always have been (typed plugin events
+// routed by rules are the notify capability's work, design section 7). The
+// outbox retries and records it like any event, and nothing about a channel's
+// failure crosses back to the plugin: the transport error embeds the channel
+// credential.
+func (h *pluginHost) Send(_ context.Context, pluginID, title, body string) error {
+	h.server.enqueueNotifyEvent(pluginNotifyEventType(pluginID), title, body, notifyEnqueue{
+		source: store.NotifySourcePlugin, sourceID: pluginID, broadcast: true,
+	})
 	return nil
+}
+
+// pluginNotifyEventType labels a plugin message in the Sent log with the
+// type the notify design reserves for it (plugin.<id>.message, D3).
+func pluginNotifyEventType(pluginID string) string {
+	if pluginID == "" {
+		return "plugin.message"
+	}
+	return "plugin." + pluginID + ".message"
 }
 
 func (h *pluginHost) Do(ctx context.Context, req plugin.HostHTTPRequest) (plugin.HostHTTPResponse, error) {

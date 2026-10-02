@@ -78,9 +78,22 @@ func doRequestStatus(ctx context.Context, client *http.Client, req *http.Request
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return resp.StatusCode, fmt.Errorf("notify: upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return resp.StatusCode, &StatusError{Status: resp.StatusCode, body: strings.TrimSpace(string(body))}
 	}
 	return resp.StatusCode, nil
+}
+
+// StatusError is a channel endpoint answering outside 2xx. The status is what
+// a caller classifies on; the upstream body stays inside Error() for the
+// server log and is never meant to be stored or shown, since it is text the
+// remote side chose.
+type StatusError struct {
+	Status int
+	body   string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("notify: upstream status %d: %s", e.Status, e.body)
 }
 
 // Telegram posts via the Bot API sendMessage method.

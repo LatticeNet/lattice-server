@@ -303,6 +303,13 @@ type Server struct {
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight
+	// outbox drains the stored notification outbox; see notify_outbox.go.
+	outbox notifyOutboxRunner
+	// notifySend delivers one message to one channel; overridable in tests,
+	// since the real sender refuses the loopback listener a test runs.
+	notifySend func(ctx context.Context, channel model.NotifyChannel, msg notify.Message) error
+	// notifyRetryDelays is the wait before each retry; tests shorten it.
+	notifyRetryDelays []time.Duration
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
 	// subscriptionDecoy shapes the answer every non-servable subscription request
@@ -621,6 +628,13 @@ func New(opts Options) (*Server, error) {
 	}
 	s.emitNotify = s.notifyEvent
 	s.emitNotifyTyped = s.notifyEventTyped
+	s.notifySend = defaultNotifySend
+	s.notifyRetryDelays = notifyRetryDelays
+	// Before anything can notify: answer what the previous process left in
+	// the outbox, and take back the digest lines it had queued. The redriven
+	// rows are sent when the background loops start below.
+	s.restoreAlertDigest()
+	redrive := s.reconcileNotifyOutbox()
 	s.pluginRPC = plugin.NewRPCRegistry()
 	// In-core providers are wired once at boot and never unregistered, so without a
 	// lifecycle predicate a disabled plugin's backend kept serving — disable would only
@@ -681,6 +695,9 @@ func New(opts Options) (*Server, error) {
 		s.startDDNSSweep()
 		s.startTLSMonitorSweep()
 		s.startShareRefusalAuditFlush()
+		if redrive > 0 {
+			s.wakeNotifyOutbox()
+		}
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1376,10 +1393,11 @@ func (s *Server) Handler() http.Handler {
 }
 
 // Close sends the alerts still queued for the next sweep, stops
-// runtime-owned subprocesses and waits for their transports to be reaped, and
-// waits for notification deliveries already running, all within ctx, before
-// the server process exits. Without the first and last steps a restart
-// dropped pages whose decision was already on disk (see alertDigest).
+// runtime-owned subprocesses and waits for their transports to be reaped,
+// stops the outbox drainer after one last pass over what is due, and waits
+// for notification deliveries already running, all within ctx, before the
+// server process exits. A delivery waiting on a retry stays in the outbox and
+// is redriven at the next start.
 func (s *Server) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
@@ -1389,6 +1407,8 @@ func (s *Server) Close(ctx context.Context) error {
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)
 	}
+	s.stopNotifyOutbox()
+	s.drainNotifyOutboxForShutdown()
 	if left := s.notifyDeliveries.wait(ctx); left > 0 {
 		s.logger.Printf("notify: %d deliveries still running at shutdown", left)
 	}
@@ -5356,93 +5376,10 @@ func (s *Server) notifyEvent(title, body string) {
 }
 
 // notifyEventTyped is notifyEvent with the event type supplied instead of
-// inferred. Callers that know what happened should use it.
+// inferred. Callers that know what happened should use it. The deliveries are
+// in the outbox when it returns; sending happens on the drainer.
 func (s *Server) notifyEventTyped(eventType, title, body string) {
-	channels := s.store.EnabledNotifyChannels()
-	deliveries := s.planNotifyDeliveries(eventType, title, body, channels, s.store.EnabledNotifyRules())
-	if len(deliveries) == 0 {
-		return
-	}
-	s.notifyDeliveries.begin()
-	go func() {
-		defer s.notifyDeliveries.end()
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		for _, delivery := range deliveries {
-			if len(delivery.Channels) == 0 {
-				continue
-			}
-			for _, res := range notify.NewDispatcher(delivery.Channels...).Send(ctx, delivery.Message) {
-				if res.Err != nil {
-					s.logger.Printf("notify: %s delivery failed: %v", res.Kind, res.Err)
-				}
-			}
-		}
-	}()
-}
-
-type notifyDelivery struct {
-	Channels []notify.Channel
-	Message  notify.Message
-}
-
-func (s *Server) planNotifyDeliveries(eventType, title, body string, channels []model.NotifyChannel, rules []model.NotifyRule) []notifyDelivery {
-	if len(channels) == 0 {
-		return nil
-	}
-	if len(rules) == 0 {
-		built := s.buildNotifyChannels(channels)
-		if len(built) == 0 {
-			return nil
-		}
-		return []notifyDelivery{{Channels: built, Message: notify.Message{Title: title, Body: body}}}
-	}
-	channelsByID := make(map[string]model.NotifyChannel, len(channels))
-	for _, channel := range channels {
-		channelsByID[channel.ID] = channel
-	}
-	deliveries := []notifyDelivery{}
-	for _, rule := range rules {
-		if !notifyRuleMatches(rule, eventType) {
-			continue
-		}
-		selected := make([]model.NotifyChannel, 0, len(rule.ChannelIDs))
-		seen := map[string]bool{}
-		for _, channelID := range rule.ChannelIDs {
-			if seen[channelID] {
-				continue
-			}
-			seen[channelID] = true
-			channel, ok := channelsByID[channelID]
-			if !ok {
-				s.logger.Printf("notify: rule %s references missing or disabled channel %s", rule.ID, channelID)
-				continue
-			}
-			selected = append(selected, channel)
-		}
-		built := s.buildNotifyChannels(selected)
-		if len(built) == 0 {
-			continue
-		}
-		vars := map[string]string{"event_type": eventType, "title": title, "body": body}
-		outTitle := renderNotifyTemplate(rule.TitleTemplate, title, vars)
-		outBody := renderNotifyTemplate(rule.BodyTemplate, body, vars)
-		deliveries = append(deliveries, notifyDelivery{Channels: built, Message: notify.Message{Title: outTitle, Body: outBody}})
-	}
-	return deliveries
-}
-
-func (s *Server) buildNotifyChannels(channels []model.NotifyChannel) []notify.Channel {
-	built := make([]notify.Channel, 0, len(channels))
-	for _, c := range channels {
-		ch, err := buildChannel(c.Kind, c.Config)
-		if err != nil {
-			s.logger.Printf("notify: channel %s misconfigured: %v", c.ID, err)
-			continue
-		}
-		built = append(built, ch)
-	}
-	return built
+	s.enqueueNotifyEvent(eventType, title, body, notifyEnqueue{source: store.NotifySourceServer})
 }
 
 func notifyRuleMatches(rule model.NotifyRule, eventType string) bool {

@@ -323,7 +323,7 @@ func TestNotifyDeliveryIsCountedUntilItEnds(t *testing.T) {
 	for delivered := false; !delivered; {
 		select {
 		case line := <-lines:
-			delivered = strings.Contains(line, "webhook delivery failed")
+			delivered = strings.Contains(line, "to channel nc-hook failed")
 		case <-deadline:
 			t.Fatal("the delivery never ran")
 		}

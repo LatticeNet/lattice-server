@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,7 +16,6 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/id"
-	"github.com/LatticeNet/lattice-server/internal/notify"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -614,13 +612,9 @@ func (s *Server) fireNotifyWebhook(hook store.NotifyWebhook, data map[string]str
 	// and zero rules, which makes "your webhook worked and reached nobody" the
 	// single most likely first experience; it has to be legible rather than look
 	// like a success.
-	deliveries := s.planNotifyDeliveries(hook.EventType, title, body, s.store.EnabledNotifyChannels(), s.store.EnabledNotifyRules())
-	channels := 0
-	for _, d := range deliveries {
-		channels += len(d.Channels)
-	}
-	record.Channels = channels
-	if channels == 0 {
+	plan := s.planNotifyEvent(hook.EventType, title, body, notifyEnqueue{source: store.NotifySourceWebhook, sourceID: hook.ID, sourceRef: record.ID})
+	record.Channels = len(plan.targets)
+	if record.Channels == 0 {
 		record.Outcome = store.NotifyWebhookNoRoute
 		record.Reason = "no enabled rule and channel matched this event type"
 	} else {
@@ -629,45 +623,11 @@ func (s *Server) fireNotifyWebhook(hook store.NotifyWebhook, data map[string]str
 	if err := s.store.RecordNotifyWebhookDelivery(record); err != nil {
 		s.logger.Printf("notify webhook delivery record: %v", err)
 	}
-	if channels == 0 {
-		return record
-	}
-
-	// Send asynchronously, as notifyEventTyped does, so a slow channel never
-	// holds the caller's request open. The delivery record is settled when the
-	// fan-out finishes, which is the outcome the audit event could not wait for.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		delivered := 0
-		failed := 0
-		for _, delivery := range deliveries {
-			if len(delivery.Channels) == 0 {
-				continue
-			}
-			for _, res := range notify.NewDispatcher(delivery.Channels...).Send(ctx, delivery.Message) {
-				if res.Err != nil {
-					failed++
-					s.logger.Printf("notify webhook %s: %s delivery failed: %v", hook.ID, res.Kind, res.Err)
-					continue
-				}
-				delivered++
-			}
-		}
-		outcome := store.NotifyWebhookAccepted
-		reason := ""
-		switch {
-		case delivered == 0 && failed > 0:
-			outcome = store.NotifyWebhookFailed
-			reason = fmt.Sprintf("all %d channel sends failed", failed)
-		case failed > 0:
-			outcome = store.NotifyWebhookPartial
-			reason = fmt.Sprintf("%d of %d channel sends failed", failed, delivered+failed)
-		}
-		if err := s.store.SettleNotifyWebhookDelivery(hook.ID, record.ID, outcome, reason, delivered); err != nil {
-			s.logger.Printf("notify webhook delivery settle: %v", err)
-		}
-	}()
+	// The record exists before its deliveries are stored, so the outbox can
+	// settle it (settleNotifyWebhookRecord) when the event's last delivery
+	// settles, retries and fallback included. Sending is the drainer's job, so
+	// a slow channel never holds the caller's request open.
+	s.commitNotifyPlan(plan)
 	return record
 }
 
@@ -787,7 +747,7 @@ func webhookScalarString(v any) (string, error) {
 //
 // The delimiters matter more than they look. This file renders in a single
 // left-to-right pass, so a value containing "{{data.other}}" is never rescanned
-// here. But the rendered title and body are then handed to planNotifyDeliveries,
+// here. But the rendered title and body are then handed to planNotifyTargets,
 // whose rule templates expand by repeated ReplaceAll over a map, and that pass
 // would happily expand a placeholder the caller smuggled in. Removing the
 // delimiters at the boundary closes it once, for that renderer and any future

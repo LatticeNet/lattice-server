@@ -1352,6 +1352,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/config", s.withAgentLimit(s.handleAgentConfig))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
+	mux.HandleFunc("/api/agent/monitor-results", s.withAgentLimit(s.handleAgentMonitorResults))
 	mux.HandleFunc("/api/agent/log-sources", s.withAgentLimit(s.handleAgentLogSources))
 	mux.HandleFunc("/api/agent/logs", s.withAgentLimit(s.handleAgentLogs))
 	mux.HandleFunc("/api/agent/trace-config", s.withAgentLimit(s.handleAgentTraceConfig))

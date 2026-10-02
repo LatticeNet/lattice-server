@@ -478,6 +478,22 @@ Use the compose file and deployment guide in the umbrella repository:
   monotonically under a dedicated mutex, and rejects malformed/negative input.
   `GET /api/proxy/usage` returns only secret-free counters/status for the
   dashboard.
+- Agent monitor results: `POST /api/agent/monitor-result` takes one result
+  (`{"node_id": ..., "result": {...}}`) and `POST /api/agent/monitor-results`
+  takes a batch (`{"node_id": ..., "results": [...]}`, 1 to 500 entries). Both
+  need the node's bearer token and answer
+  `{"ok": true, "accepted": n, "duplicates": n, "dropped": [{"index", "monitor_id", "reason"}]}`.
+  A result is admitted only for an existing, enabled, non-tls monitor assigned
+  to the posting node, stamped no more than 24 hours before it arrives (a stamp
+  more than a minute ahead of the server takes the arrival time), with the
+  node id taken from the token and the error text capped at 512 bytes. A
+  dropped reason (`unknown_monitor`, `server_evaluated`, `disabled`,
+  `not_assigned`, `out_of_window`, `invalid`) is final, so the agent drops that
+  result. Results are judged in array order, so a buffered backlog goes oldest
+  first. A result the pair already holds at the same instant counts as a
+  duplicate, so a batch sent again after a lost response is safe, and on a 5xx
+  nothing was stored. An older server answers 404 on the batch path, which
+  tells the agent to post one result per request.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/
@@ -579,7 +595,13 @@ Use the compose file and deployment guide in the umbrella repository:
   When enabled, startup imports/merges existing JSON hot records into the
   sidecar, then audit events, interactive sessions, proxy users, proxy node
   profiles, and proxy usage snapshots are written at record level in bbolt
-  instead of forcing a whole encrypted JSON rewrite. The in-memory read model
+  instead of forcing a whole encrypted JSON rewrite. Monitor results live there
+  too: one row per result and one latest record per monitor and node (with the
+  failure streak the alert hold reads), 1440 rows per pair, and any JSON
+  history is migrated once on the first enable. Without the sidecar the JSON
+  file keeps 120 rows per pair and is rewritten only when a pair changes state,
+  reaches its second failure in a row, or has not been written for five
+  minutes. The in-memory read model
   remains unchanged and `/readyz` verifies the sidecar. The default remains the
   JSON state file so operators can canary the cutover per deployment.
 - The full runtime store is not bbolt-only yet. The next storage slice should

@@ -2,6 +2,7 @@ package netguard
 
 import (
 	"fmt"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
@@ -91,7 +92,15 @@ type LintOptions struct {
 func Lint(plan network.NFTPlan, opts LintOptions) []Finding {
 	var findings []Finding
 	ports, evidence := managementPorts(opts.Reality)
-	if !acceptsAnyPort(plan, ports) {
+	if open, shadowedBy := managementPathOpen(plan, ports); !open && len(shadowedBy) > 0 {
+		findings = append(findings, Finding{
+			Code:     FindingLockoutRiskSSH,
+			Severity: SeverityBlock,
+			Message: fmt.Sprintf(
+				"every rule that accepts inbound tcp on the management %s (%s) sits behind a drop that matches the same traffic first (%s). The guard chain stops at the first rule that matches, so committing this ruleset would cut the operator's shell path, and the node-side apply cannot detect it because its selfcheck is an outbound connection. Move the allow above the drop, narrow the drop, or explicitly accept the lockout risk.",
+				pluralPort(len(ports)), joinManagementPorts(ports), joinQuoted(shadowedBy)),
+		})
+	} else if !open {
 		findings = append(findings, Finding{
 			Code:     FindingLockoutRiskSSH,
 			Severity: SeverityBlock,
@@ -237,39 +246,147 @@ func managementPortAssumedMessage(reality *model.GuardNodeReality) string {
 		len(reality.Listeners), pluralSocket(len(reality.Listeners)), ManagementPort)
 }
 
-// acceptsAnyPort reports whether some compiled rule could accept a new inbound
-// connection on at least one of the given ports. One surviving path is enough:
-// the lint fires on "no way in", not on "fewer ways in than before".
+// managementPathOpen reports whether a new inbound tcp connection can still be
+// accepted on at least one of the given ports. One surviving path is enough:
+// the lint fires on "no way in", not on "fewer ways in than before". When no
+// path survives, shadowedBy names the drops that stood in front of accepts
+// that would otherwise have been a way in, so the finding can say which rule
+// to move.
 //
-// It is deliberately generous: a trusted-zone accept, an any-protocol accept,
-// or a tcp accept whose port list is empty (all ports) all count. Being
-// generous means the lint only fires when the plan really has no path, so it
-// stays a signal rather than noise an operator learns to click past.
-func acceptsAnyPort(plan network.NFTPlan, ports []int) bool {
+// It walks the chain in the order nftables evaluates it, first match wins:
+// InputRules in plan order, then the broad public and wireguard port lists,
+// which GenerateNFTPlan renders after every InputRule. The old scan looked for
+// any accept that mentioned the port and skipped every drop, so a drop on the
+// management port rendered ahead of its accept passed with no finding.
+//
+// It stays deliberately generous, so the lint only fires when the plan really
+// has no path and stays a signal rather than noise an operator learns to click
+// past. A trusted-zone accept, an any-protocol accept and a tcp accept with no
+// port list all count, as before. An accept counts as shadowed only when one
+// earlier drop matches everything it matches: the same interface or any, and
+// every source it admits. A drop that names one bad peer, or another
+// interface, leaves the accept a way in for everyone else. Drops that only
+// cover an accept's sources together are not combined; that case reads as a
+// path, which errs the generous way.
+func managementPathOpen(plan network.NFTPlan, ports []int) (bool, []string) {
+	// The compiled plan is already normalized; this fills the renderer's
+	// defaults (the public interface and the wireguard range) for a raw plan,
+	// so the broad lists below match what would actually render.
+	if normalized, err := network.NormalizeNFTPlan(plan); err == nil {
+		plan = normalized
+	}
+	chain := append([]network.NFTInputRule(nil), plan.InputRules...)
+	if len(plan.PublicTCP) > 0 {
+		chain = append(chain, network.NFTInputRule{
+			Interface: plan.InterfaceName, Protocol: network.NFTProtoTCP, Ports: plan.PublicTCP,
+			Action: network.NFTActionAccept, Comment: "public lattice tcp ports",
+		})
+	}
+	if len(plan.WireGuardTCP) > 0 {
+		chain = append(chain, network.NFTInputRule{
+			SourceCIDRs: []string{plan.WireGuardCIDR}, Protocol: network.NFTProtoTCP, Ports: plan.WireGuardTCP,
+			Action: network.NFTActionAccept, Comment: "wg tcp services",
+		})
+	}
+	var shadowedBy []string
 	for _, port := range ports {
-		if slices.Contains(plan.PublicTCP, port) || slices.Contains(plan.WireGuardTCP, port) {
-			return true
+		var drops []network.NFTInputRule
+		for _, rule := range chain {
+			if !matchesTCPPort(rule, port) {
+				continue
+			}
+			if rule.Action != network.NFTActionAccept {
+				drops = append(drops, rule)
+				continue
+			}
+			if drop, ok := shadowingDrop(drops, rule); ok {
+				if name := ruleName(drop); !slices.Contains(shadowedBy, name) {
+					shadowedBy = append(shadowedBy, name)
+				}
+				continue
+			}
+			return true, nil
 		}
 	}
-	for _, rule := range plan.InputRules {
-		if rule.Action != network.NFTActionAccept {
+	return false, shadowedBy
+}
+
+// matchesTCPPort reports whether a rule can match a new tcp connection to port.
+func matchesTCPPort(rule network.NFTInputRule, port int) bool {
+	switch rule.Protocol {
+	case network.NFTProtoAny:
+		return true
+	case network.NFTProtoTCP:
+		return len(rule.Ports) == 0 || slices.Contains(rule.Ports, port)
+	}
+	return false
+}
+
+// shadowingDrop returns the first drop that matches every packet accept
+// matches on the port both already match, so that accept can never decide.
+func shadowingDrop(drops []network.NFTInputRule, accept network.NFTInputRule) (network.NFTInputRule, bool) {
+	for _, drop := range drops {
+		if drop.Interface != "" && drop.Interface != accept.Interface {
 			continue
 		}
-		switch rule.Protocol {
-		case network.NFTProtoAny:
+		if len(drop.SourceCIDRs) == 0 {
+			return drop, true
+		}
+		if len(accept.SourceCIDRs) == 0 {
+			continue
+		}
+		covered := true
+		for _, source := range accept.SourceCIDRs {
+			if !sourceWithinAny(source, drop.SourceCIDRs) {
+				covered = false
+				break
+			}
+		}
+		if covered {
+			return drop, true
+		}
+	}
+	return network.NFTInputRule{}, false
+}
+
+// sourceWithinAny reports whether the address or prefix source lies wholly
+// inside one of prefixes. Anything that does not parse is not covered, which
+// keeps the accept counted as a path.
+func sourceWithinAny(source string, prefixes []string) bool {
+	inner, ok := parseSourcePrefix(source)
+	if !ok {
+		return false
+	}
+	for _, raw := range prefixes {
+		outer, ok := parseSourcePrefix(raw)
+		if !ok || outer.Addr().Is4() != inner.Addr().Is4() {
+			continue
+		}
+		if outer.Bits() <= inner.Bits() && outer.Contains(inner.Addr()) {
 			return true
-		case network.NFTProtoTCP:
-			if len(rule.Ports) == 0 {
-				return true
-			}
-			for _, port := range ports {
-				if slices.Contains(rule.Ports, port) {
-					return true
-				}
-			}
 		}
 	}
 	return false
+}
+
+func parseSourcePrefix(value string) (netip.Prefix, bool) {
+	value = strings.TrimSpace(value)
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		return prefix.Masked(), true
+	}
+	if addr, err := netip.ParseAddr(value); err == nil {
+		return netip.PrefixFrom(addr.Unmap(), addr.Unmap().BitLen()), true
+	}
+	return netip.Prefix{}, false
+}
+
+// ruleName is how a finding names a rule: its comment, which the compiler
+// fills from the rule's own comment or id.
+func ruleName(rule network.NFTInputRule) string {
+	if name := strings.TrimSpace(rule.Comment); name != "" {
+		return name
+	}
+	return "an unnamed drop"
 }
 
 // planInterfaces returns, sorted and unique, every interface name the plan

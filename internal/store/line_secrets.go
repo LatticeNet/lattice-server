@@ -97,10 +97,27 @@ type VpnUserPublicRecord struct {
 	Group                  string                    `json:"group,omitempty"`
 	Comment                string                    `json:"comment,omitempty"`
 	MigratedFromProxyUser  string                    `json:"migrated_from_proxy_user,omitempty"`
+	Suspension             *VpnUserSuspension        `json:"suspension,omitempty"`
 	CreatedAt              time.Time                 `json:"created_at"`
 	UpdatedAt              time.Time                 `json:"updated_at"`
 	SubscriptionGeneration uint64                    `json:"subscription_generation"`
 }
+
+// VpnUserSuspension records an operator's act that took an identity out of
+// service: who did it, when, and whether it was the enabled flag (disabled)
+// or a suspension that leaves the identity enabled (operator). Quota and
+// expiry are never stored here; the server derives them every time.
+type VpnUserSuspension struct {
+	Reason string    `json:"reason"`
+	By     string    `json:"by,omitempty"`
+	Since  time.Time `json:"since,omitempty"`
+}
+
+// VpnUserSuspensionReasons are the reasons a stored suspension may carry.
+var VpnUserSuspensionReasons = map[string]bool{"disabled": true, "operator": true}
+
+// MaxVpnUserSuspensionByBytes bounds the recorded actor id.
+const MaxVpnUserSuspensionByBytes = 256
 
 type VpnUserCredentialPublic struct {
 	Protocol string `json:"protocol"`
@@ -226,6 +243,14 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 		if strings.TrimSpace(id) == "" || record.ID != id {
 			return fmt.Errorf("vpn user public record %q has mismatched id %q", id, record.ID)
 		}
+		if suspension := record.Suspension; suspension != nil {
+			if !VpnUserSuspensionReasons[suspension.Reason] {
+				return fmt.Errorf("vpn user %q has unsupported suspension reason %q", id, suspension.Reason)
+			}
+			if len(suspension.By) > MaxVpnUserSuspensionByBytes || strings.ContainsFunc(suspension.By, unicode.IsControl) {
+				return fmt.Errorf("vpn user %q suspension actor is invalid or too long", id)
+			}
+		}
 		if len(record.Credentials) > MaxVpnUserCredentials {
 			return fmt.Errorf("vpn user %q has more than %d public credentials", id, MaxVpnUserCredentials)
 		}
@@ -305,6 +330,10 @@ func cloneVpnUserPublicRecords(in map[string]VpnUserPublicRecord) map[string]Vpn
 	for id, record := range in {
 		record.Credentials = append([]VpnUserCredentialPublic(nil), record.Credentials...)
 		record.Bindings = append([]VpnUserLineBinding(nil), record.Bindings...)
+		if record.Suspension != nil {
+			suspension := *record.Suspension
+			record.Suspension = &suspension
+		}
 		out[id] = record
 	}
 	return out
@@ -476,6 +505,7 @@ func nextSubscriptionGeneration(currentPublic VpnUserPublicRecord, currentPrivat
 	if currentPublic.Enabled == nextPublic.Enabled && currentPublic.ExpiresAt.Equal(nextPublic.ExpiresAt) &&
 		sameVpnUserPublicCredentials(currentPublic.Credentials, nextPublic.Credentials) &&
 		sameVpnUserBindings(currentPublic.Bindings, nextPublic.Bindings) &&
+		vpnUserSuspensionReason(currentPublic) == vpnUserSuspensionReason(nextPublic) &&
 		currentPrivate.SubID == nextPrivate.SubID &&
 		sameVpnUserPrivateCredentials(currentPrivate.Credentials, nextPrivate.Credentials) {
 		return currentPublic.SubscriptionGeneration, nil
@@ -484,6 +514,15 @@ func nextSubscriptionGeneration(currentPublic VpnUserPublicRecord, currentPrivat
 		return 0, errors.New("subscription generation exhausted")
 	}
 	return currentPublic.SubscriptionGeneration + 1, nil
+}
+
+// vpnUserSuspensionReason is the part of a stored suspension that changes
+// what the identity's subscription serves.
+func vpnUserSuspensionReason(record VpnUserPublicRecord) string {
+	if record.Suspension == nil {
+		return ""
+	}
+	return record.Suspension.Reason
 }
 
 func sameVpnUserPublicCredentials(a, b []VpnUserCredentialPublic) bool {

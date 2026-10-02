@@ -249,6 +249,13 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	if (op == lineUserOpAdd || op == lineUserOpUpdate) && !u.Enabled {
 		return nil, fmt.Errorf("user %q is disabled", u.ID)
 	}
+	// plan_update re-sends the credential with sb user add, which would put a
+	// suspended identity back on the node (adopted-suspend F10).
+	if op == lineUserOpAdd || op == lineUserOpUpdate {
+		if err := vpnUserOperatorSuspension(u, s.now()); err != nil {
+			return nil, fmt.Errorf("%w; resume it before planning a line", err)
+		}
+	}
 	quotaChanged := false
 	if op != lineUserOpRemove && (req.QuotaBytes != nil || req.QuotaPeriod != nil || req.QuotaResetDay != nil) {
 		if req.QuotaBytes != nil {
@@ -736,21 +743,44 @@ func (s *Server) requireVpnUserWithinPolicy(u VpnUser, now time.Time) error {
 // vpnUserPolicyRefusal says why the policy denies u a line at now, and what
 // the operator can do about it. Both are empty when the policy allows it.
 // The usage and the quota are written in the quota's unit, so they compare.
+// A disabled identity gets nothing here: every caller refuses it first, with
+// its own wording.
 func (s *Server) vpnUserPolicyRefusal(u VpnUser, now time.Time) (reason, remedy string) {
-	policy := s.vpnUserPolicyRow(u, now)
-	switch policy.Status {
-	case model.ProxyUserStatusExpired:
+	policy := s.vpnUserPolicyAt(u, now)
+	switch policy.Reason {
+	case vpnSuspendReasonOperator:
+		return vpnUserOperatorSuspendedReason(u.ID, policy), "resume it"
+	case vpnSuspendReasonExpiry:
 		return fmt.Sprintf("user %q expired on %s", u.ID, dateOnlyUTC(u.ExpiresAt).Format("2006-01-02")), "renew it"
-	case model.ProxyUserStatusOverQuota:
+	case vpnSuspendReasonQuota:
 		remedy = "raise the quota"
 		if u.QuotaPeriod == vpnQuotaPeriodMonthly {
 			remedy = "raise the quota or wait for the next period"
 		}
 		return fmt.Sprintf("user %q has used %s of its %s quota", u.ID,
-			formatProxyBytesIn(policy.UsedBytes, policy.TrafficLimitBytes),
-			formatProxyBytes(policy.TrafficLimitBytes)), remedy
+			formatProxyBytesIn(policy.Usage.Used, policy.LimitBytes),
+			formatProxyBytes(policy.LimitBytes)), remedy
 	}
 	return "", ""
+}
+
+// vpnUserOperatorSuspendedReason says that an operator suspended the
+// identity, and who, when Lattice recorded it.
+func vpnUserOperatorSuspendedReason(userID string, policy vpnUserPolicy) string {
+	if policy.By != "" {
+		return fmt.Sprintf("user %q is suspended by %s", userID, policy.By)
+	}
+	return fmt.Sprintf("user %q is suspended by an operator", userID)
+}
+
+// vpnUserOperatorSuspension returns the refusal for granting an identity an
+// operator suspended, or nil. It needs no usage: an operator suspension
+// outranks expiry and quota, so the decision over no usage already says it.
+func vpnUserOperatorSuspension(u VpnUser, now time.Time) error {
+	if policy := decideVpnUserPolicy(u, vpnUserQuotaUsage{}, now); policy.Reason == vpnSuspendReasonOperator {
+		return errors.New(vpnUserOperatorSuspendedReason(u.ID, policy))
+	}
+	return nil
 }
 
 // lineUserGrantRefusal re-checks the gates vpnUserLinePlan applied when the
@@ -767,6 +797,9 @@ func (s *Server) lineUserGrantRefusal(op string, u VpnUser) error {
 	}
 	if !u.Enabled {
 		return fmt.Errorf("user %q is disabled, so this plan would grant a disabled user; enable it before approving", u.ID)
+	}
+	if err := vpnUserOperatorSuspension(u, s.now()); err != nil {
+		return fmt.Errorf("%w, so this plan would grant a suspended user; resume it before approving", err)
 	}
 	if op != lineUserOpAdd {
 		return nil

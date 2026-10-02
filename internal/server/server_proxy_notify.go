@@ -198,7 +198,7 @@ func proxyQuotaThreshold(used, limit int64) (int, bool) {
 	if used <= 0 || limit <= 0 {
 		return 0, false
 	}
-	if used >= limit {
+	if proxyQuotaExhausted(used, limit) {
 		return 100, true
 	}
 	if float64(used)/float64(limit) >= 0.8 {

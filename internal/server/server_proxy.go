@@ -2747,14 +2747,17 @@ func derivedProxyUserStatus(user model.ProxyUser) string {
 	return derivedProxyUserStatusAt(user, time.Now().UTC())
 }
 
+// derivedProxyUserStatusAt is the status a row's own fields give. It shares
+// its expiry and quota predicates with decideVpnUserPolicy, which writes an
+// identity's rows, so a row read here says what the policy decided.
 func derivedProxyUserStatusAt(user model.ProxyUser, now time.Time) string {
 	if !user.Enabled {
 		return model.ProxyUserStatusDisabled
 	}
-	if !user.ExpiresAt.IsZero() && !user.ExpiresAt.After(now) {
+	if proxyUserExpiredAt(user.ExpiresAt, now) {
 		return model.ProxyUserStatusExpired
 	}
-	if user.TrafficLimitBytes > 0 && user.UsedBytes >= user.TrafficLimitBytes {
+	if proxyQuotaExhausted(user.UsedBytes, user.TrafficLimitBytes) {
 		return model.ProxyUserStatusOverQuota
 	}
 	return model.ProxyUserStatusActive

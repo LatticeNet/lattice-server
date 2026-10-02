@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -246,7 +247,11 @@ type Server struct {
 	shareFetchAuditHook func()
 	// shareRenderBudget bounds the plugin renders one link's cache misses
 	// may start; see share_render_flight.go.
-	shareRenderBudget     *ratelimit.Limiter
+	shareRenderBudget *ratelimit.Limiter
+	// vpnCoreGen advances on every committed vpn-core write; a plugin link
+	// source refreshed before the current generation is due. See
+	// share_fleet_changes.go.
+	vpnCoreGen            atomic.Uint64
 	shareRenderMu         sync.Mutex
 	shareRenderFlights    map[subscriptionCacheKey]*shareRenderFlight
 	shareRenderJoinWaiter chan struct{}

@@ -42,6 +42,10 @@ type subscriptionRefreshFlight struct {
 type subscriptionPublicationState struct {
 	mu    sync.Mutex
 	epoch uint64
+	// vpnGen is the vpn-core generation at the start of the source's last
+	// committed refresh. Behind the server's generation means a fleet change
+	// may have moved the content; see share_fleet_changes.go.
+	vpnGen uint64
 }
 
 // subscriptionPluginMutationState brackets subscription-store mutations with
@@ -67,6 +71,10 @@ type subscriptionRefreshAuthority struct {
 	recentStale      bool
 	sourceEpoch      uint64
 	pluginGeneration uint64
+	// vpnGen is the vpn-core generation this capture saw. A refresh that
+	// commits records it, so a fleet change during the fetch leaves the
+	// source due again.
+	vpnGen uint64
 }
 
 func subscriptionRevalidationVersion(snapshot model.SubscriptionSnapshot) string {
@@ -147,9 +155,11 @@ func (s *Server) captureSubscriptionRefreshAuthority(ctx context.Context, plugin
 	publication.mu.Lock()
 	authority.existing, authority.has = s.store.SubscriptionSnapshot(pluginID, subscriptionID)
 	authority.sourceEpoch = publication.epoch
+	authority.vpnGen = s.vpnCoreGen.Load()
+	due := publication.vpnGen != authority.vpnGen
 	publication.mu.Unlock()
 	now := s.now()
-	authority.fresh = authority.has && !authority.existing.Stale && !force && now.Sub(authority.existing.FetchedAt) < subscriptionRefreshInterval
+	authority.fresh = authority.has && !authority.existing.Stale && !force && !due && now.Sub(authority.existing.FetchedAt) < subscriptionRefreshInterval
 	authority.recentStale = authority.has && authority.existing.Stale && !force && !authority.existing.LastAttemptAt.IsZero() && now.Sub(authority.existing.LastAttemptAt) < subscriptionStaleRetryInterval
 	return authority, nil
 }
@@ -330,6 +340,9 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 	// and still publishes.
 	moved := !has || force || existing.Stale || existing.Userinfo != fetched.Userinfo ||
 		subscriptionRevalidationVersion(existing) != subscriptionRevalidationVersion(fetched)
+	if committed {
+		publication.vpnGen = authority.vpnGen
+	}
 	if committed && moved {
 		publication.epoch++
 		// The content moved: any rendered body cached for a share sourcing this
@@ -377,6 +390,11 @@ func (s *Server) putSubscriptionCacheForSource(key subscriptionCacheKey, pluginI
 		return false
 	}
 	s.subscriptionCache.putEntry(key, entry, now)
+	// Rendered from a snapshot a fleet change has overtaken: serve it once,
+	// but let the next fetch revalidate instead of reusing it for a TTL.
+	if s.subscriptionSourceDue(publication) {
+		s.subscriptionCache.expireKey(key, now)
+	}
 	return true
 }
 
@@ -395,7 +413,11 @@ func (s *Server) extendSubscriptionCacheForSource(key subscriptionCacheKey, plug
 	if !ok || publication.epoch != expectedEpoch || !subscriptionSnapshotsEqualForCache(current, snapshot) {
 		return false
 	}
-	return s.subscriptionCache.ExtendSnapshot(key, expectedRevision, snapshot.Userinfo, snapshot.SourceVersion, snapshot.Stale, snapshot.FetchedAt, now)
+	extended := s.subscriptionCache.ExtendSnapshot(key, expectedRevision, snapshot.Userinfo, snapshot.SourceVersion, snapshot.Stale, snapshot.FetchedAt, now)
+	if extended && s.subscriptionSourceDue(publication) {
+		s.subscriptionCache.expireKey(key, now)
+	}
+	return extended
 }
 
 func subscriptionSnapshotsEqualForCache(current, captured model.SubscriptionSnapshot) bool {

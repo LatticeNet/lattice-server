@@ -247,6 +247,28 @@ func (c *subscriptionCache) putEntry(key subscriptionCacheKey, in subscriptionCa
 	}
 }
 
+// ExpireShare marks every cached body of one share expired without dropping
+// it. The next fetch revalidates: an unchanged source extends the body it
+// already has instead of rendering it again.
+func (c *subscriptionCache) ExpireShare(shareID string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, el := range c.entries {
+		if key.ShareID == shareID {
+			el.Value.(*subscriptionCacheEntry).expiresAt = now
+		}
+	}
+}
+
+// expireKey marks one cached body expired without dropping it.
+func (c *subscriptionCache) expireKey(key subscriptionCacheKey, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[key]; ok {
+		el.Value.(*subscriptionCacheEntry).expiresAt = now
+	}
+}
+
 // InvalidateShare drops every cached body for one share, across all formats and
 // client classes. Rotation and deletion call it: without it, a rotated-away URL
 // would keep being served from cache until its TTL expired, which is precisely

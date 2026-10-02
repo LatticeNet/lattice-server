@@ -326,3 +326,95 @@ func TestALinkCannotSpendRendersPastItsBudget(t *testing.T) {
 		t.Fatal("the exhausted budget was not audited")
 	}
 }
+
+// An identity suspended, a credential rotated or a line added changes what a
+// record reading vpn-core should serve. The next fetch of any plugin link
+// refreshes its snapshot and serves the new content, instead of waiting for
+// the snapshot to age past the refresh interval and the cache past its TTL.
+func TestAVPNCoreChangeReachesPluginLinksOnTheNextFetch(t *testing.T) {
+	s, _, path := flightShareServer(t)
+	var renders, fetches atomic.Int64
+	content := "nodes"
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		fetches.Add(1)
+		return model.SubscriptionSnapshot{Raw: content}, nil
+	}
+	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+		renders.Add(1)
+		epoch, _ := s.subscriptionSnapshotEpoch(share.Source.PluginID, share.Source.SubscriptionID, snap)
+		return renderedSubscription{Body: []byte("render of " + snap.Raw), RevalidationVersion: subscriptionRevalidationVersion(snap),
+			SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
+	}
+	fetch := func() string {
+		rec := httptest.NewRecorder()
+		s.handleSubscriptionShare(rec, shareRequest(path, "curl/8"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status %d", rec.Code)
+		}
+		return rec.Body.String()
+	}
+	if got := fetch(); got != "render of nodes" || fetches.Load() != 0 {
+		t.Fatalf("first fetch %q after %d provider fetches", got, fetches.Load())
+	}
+
+	// A change that did not move this record's content costs a refresh and no
+	// render: the body it already had is extended.
+	s.triggerVPNCoreMutation()
+	if got := fetch(); got != "render of nodes" || fetches.Load() != 1 || renders.Load() != 1 {
+		t.Fatalf("unchanged content: %q, fetches %d, renders %d", got, fetches.Load(), renders.Load())
+	}
+	if got := fetch(); got != "render of nodes" || fetches.Load() != 1 {
+		t.Fatalf("the refreshed source was refreshed again: fetches %d", fetches.Load())
+	}
+
+	// A change that moved it is served on the next fetch.
+	content = "nodes without the suspended identity"
+	s.triggerVPNCoreMutation()
+	if got := fetch(); got != "render of nodes without the suspended identity" || renders.Load() != 2 {
+		t.Fatalf("moved content: %q after %d renders", got, renders.Load())
+	}
+}
+
+// A render that was already running when the fleet changed was built from
+// the old export. It may answer the request that started it, but it must not
+// be reused for a TTL: the next fetch revalidates.
+func TestARenderOvertakenByAVPNCoreChangeIsNotReused(t *testing.T) {
+	s, _, path := flightShareServer(t)
+	var fetches atomic.Int64
+	content := "before"
+	if err := s.store.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "rec", Raw: content, FetchedAt: s.now()}); err != nil {
+		t.Fatal(err)
+	}
+	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
+		fetches.Add(1)
+		return model.SubscriptionSnapshot{Raw: content}, nil
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+		blocked := false
+		once.Do(func() { blocked = true; close(started) })
+		if blocked {
+			<-release
+		}
+		epoch, _ := s.subscriptionSnapshotEpoch(share.Source.PluginID, share.Source.SubscriptionID, snap)
+		return renderedSubscription{Body: []byte("render of " + snap.Raw), RevalidationVersion: subscriptionRevalidationVersion(snap),
+			SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
+	}
+	done := make(chan string, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		s.handleSubscriptionShare(rec, shareRequest(path, "curl/8"))
+		done <- rec.Body.String()
+	}()
+	<-started
+	content = "after"
+	s.triggerVPNCoreMutation()
+	close(release)
+	<-done
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest(path, "curl/8"))
+	if rec.Body.String() != "render of after" || fetches.Load() != 1 {
+		t.Fatalf("follow-up served %q after %d provider fetches, want the new content after one", rec.Body.String(), fetches.Load())
+	}
+}

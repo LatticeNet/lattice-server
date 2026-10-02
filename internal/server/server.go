@@ -6659,18 +6659,20 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 		return !principalHasNodeRestriction(p) &&
 			rbac.Allows(p.Principal, "proxy:read", "") &&
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
-	case singBoxLineUserPlugin:
+	case singBoxLineUserPlugin, singBoxManagedLinePlugin:
 		// A line-user plan names identities by email: the user it adds,
 		// updates or removes, and on a managed line every user its render
-		// already leaves out by policy. Identities are global proxy objects
-		// that only an unrestricted principal holding the vpn-core read scope
-		// may list (requireGlobalProxyScope, and the gateway for vpncore:read),
-		// so reading the plan asks for the same, as a proxycore plan does.
+		// already leaves out by policy. A managed-line rollout names the user
+		// its fragment grants. Identities are global proxy objects that only
+		// an unrestricted principal holding the vpn-core read scope may list
+		// (requireGlobalProxyScope, and the gateway for vpncore:read), so
+		// reading either plan asks for the same, as a proxycore plan does.
 		// Under the default below, bare network:plan on the node was enough.
 		//
-		// The admin scope counts too. Authoring and deciding a line-user plan
-		// require it, and a holder must be able to list the approval it filed,
-		// for the reason sshguard:admin implies sshguard:read.
+		// The admin scope counts too. Deciding either plan requires it
+		// (approvalDecisionExtraScope), and authoring a line-user plan does,
+		// and a holder must be able to read what it files and decides, for
+		// the reason sshguard:admin implies sshguard:read.
 		return !principalHasNodeRestriction(p) &&
 			(rbac.Allows(p.Principal, "proxy:read", "") || rbac.Allows(p.Principal, "proxy:admin", "")) &&
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
@@ -8222,6 +8224,14 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 	case proxyCorePlugin:
 		return "proxy:admin"
 	case singBoxLineUserPlugin, singBoxLineMetaPlugin:
+		return "vpncore:admin"
+	case singBoxManagedLinePlugin:
+		// A rollout's fragment adds a user to a new line, which grants that
+		// user access as a line-user plan_add does, and its plan names the
+		// user by email. Only a vpn-core admin may read it
+		// (approvalPrimaryScopeAllows), so only one may decide it; under bare
+		// network:apply a decider could approve a grant it was not allowed
+		// to read.
 		return "vpncore:admin"
 	case "cftunnel":
 		return "tunnel:admin"

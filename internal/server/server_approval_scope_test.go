@@ -30,6 +30,7 @@ func TestApprovalDecisionExtraScope(t *testing.T) {
 		{plugin: proxyCorePlugin, want: "proxy:admin"},
 		{plugin: singBoxLineUserPlugin, want: "vpncore:admin"},
 		{plugin: singBoxLineMetaPlugin, want: "vpncore:admin"},
+		{plugin: singBoxManagedLinePlugin, want: "vpncore:admin"},
 		{plugin: "cftunnel", want: "tunnel:admin"},
 		{plugin: "nftpolicy", want: "netpolicy:admin"},
 		{plugin: "wireguard", want: ""},

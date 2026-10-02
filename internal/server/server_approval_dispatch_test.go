@@ -39,9 +39,8 @@ func TestEveryApprovalPluginHasADecidedDecisionScope(t *testing.T) {
 	// An entry here is a decision, not an omission: it says the plugin has no
 	// domain of its own beyond the apply itself.
 	intentionallyBare := map[string]string{
-		"wireguard":              "mesh config carries no authority the apply scope does not already imply",
-		singBoxManagedLinePlugin: "managed lines are gated at authoring; the decision adds nothing",
-		lineChainPlugin:          "linechain decisions are gated by the durable-protocol capability check",
+		"wireguard":     "mesh config carries no authority the apply scope does not already imply",
+		lineChainPlugin: "linechain decisions are gated by the durable-protocol capability check",
 	}
 	for _, plugin := range approvalPlugins {
 		t.Run(plugin, func(t *testing.T) {

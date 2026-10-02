@@ -6620,8 +6620,9 @@ func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval
 // The primary read scope is deliberately NOT part of this: which scope may read
 // a plugin's plans and which may decide them are different questions with
 // different answers, and the decision path spells its own authority as
-// network:apply plus approvalDecisionExtraScope. What both paths must agree on
-// is the set of nodes.
+// network:apply plus approvalDecisionExtraScope, adding the read scope only
+// for a plan that names identities (approvalPlanNamesIdentities). What both
+// paths must agree on is the set of nodes.
 func (s *Server) approvalNodeReachAllows(p principal, approval model.Approval) bool {
 	// A multi-target plugin operation records its first target in NodeID and
 	// the rest in Targets. Filtering on NodeID alone disclosed the identities
@@ -8137,7 +8138,73 @@ func (s *Server) requireApprovalDecisionScopes(w http.ResponseWriter, p principa
 	//
 	// The listing is the correct set and is not narrowed to match: it is the
 	// one that already reasons about targets and plan reach.
+	//
+	// A plan that names proxy identities must also clear the listing's
+	// primary read scope; see approvalPlanNamesIdentities.
+	if approvalPlanNamesIdentities(approval) && !s.requireApprovalPrimaryRead(w, p, approval) {
+		return false
+	}
 	return s.requireApprovalNodeReach(w, p, approval)
+}
+
+// approvalPlanNamesIdentities reports whether an approval's plan names proxy
+// identities by email: the user a line-user plan or a managed-line rollout
+// grants, and the users a proxycore or managed line-user render already
+// leaves out by policy. Identities are global objects that only an
+// unrestricted principal holding the vpn-core read scope may list, so the
+// read gate for these plans asks for that (approvalPrimaryScopeAllows), and
+// so must the decision verbs, which answer with the plan.
+//
+// Without it a principal confined to the node with network:apply and
+// vpncore:admin there could reject a line-user approval by id and read the
+// emails the listing hides from it, and rejecting an approval already decided
+// changes nothing, so the read had no side effect to notice.
+//
+// Requiring the read for these plans keeps every decider that can review
+// them. A line-user or proxycore plan is authored only by a principal that
+// passes its read gate, and approving any of the three needs plan_sha256,
+// which a decider gets by reading the plan behind that gate. What it removes
+// is deciding, by id, a plan the caller may not read: the blind reject, and
+// an approve with a hash obtained elsewhere.
+//
+// The other plugins are deliberately left out. The only part of their read
+// gate a decider may lack is network:plan on the node, their plans carry
+// nothing outside what the decider's own scopes and the node reach check
+// already cover, and deciders that hold network:apply and the domain scope
+// without network:plan are relied on
+// (TestAgentUpdateApprovalDecisionRequiresNodeAdmin,
+// TestNetGuardApprovalDecisionRequiresNetGuardAdmin).
+func approvalPlanNamesIdentities(approval model.Approval) bool {
+	switch approval.Plugin {
+	case proxyCorePlugin, singBoxLineUserPlugin, singBoxManagedLinePlugin:
+		return true
+	default:
+		return false
+	}
+}
+
+// requireApprovalPrimaryRead refuses a decision on an approval whose plan the
+// caller may not read under approvalPrimaryScopeAllows, the gate the listing
+// and the single read apply. The refusal names no part of the plan.
+func (s *Server) requireApprovalPrimaryRead(w http.ResponseWriter, p principal, approval model.Approval) bool {
+	if s.approvalPrimaryScopeAllows(p, approval) {
+		return true
+	}
+	s.recordAudit(model.AuditEvent{
+		ID:            id.New("audit"),
+		ActorID:       p.ActorID,
+		TokenID:       p.TokenID,
+		NodeID:        approval.NodeID,
+		Action:        "authorize.approval",
+		Scope:         "network:plan",
+		Decision:      "deny",
+		Reason:        "the caller may not read this approval's plan, so it may not decide it",
+		Metadata:      map[string]string{"approval_id": approval.ID, "plugin": approval.Plugin},
+		CorrelationID: p.CorrelationID,
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied,
+		"deciding this approval requires reading its plan, which this session may not do"))
+	return false
 }
 
 // requireApprovalNodeReach refuses a decision on an approval whose plan covers

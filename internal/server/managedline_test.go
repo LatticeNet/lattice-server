@@ -618,15 +618,19 @@ func TestManagedLineRolloutIsReadAndDecidedOnlyByVpnCoreAdmins(t *testing.T) {
 	approve := `{"approval_id":"` + approval.ID + `","queue_apply":true,"plan_sha256":"` + planSHA + `"}`
 	reject := `{"approval_id":"` + approval.ID + `"}`
 	refused := []struct {
-		name   string
-		scopes []string
+		name      string
+		scopes    []string
+		allowlist []string
 	}{
 		{name: "network:apply", scopes: []string{"network:apply", "network:plan"}},
 		{name: "vpncore:read", scopes: []string{"network:apply", "network:plan", "vpncore:read"}},
+		// The decision verbs answer with the plan, so a decider must also
+		// pass the read gate (approvalPlanNamesIdentities).
+		{name: "vpncore:admin confined to the node", scopes: []string{"network:apply", "network:plan", "vpncore:admin"}, allowlist: []string{"node-a"}},
 	}
 	for _, tc := range refused {
 		t.Run("decide/"+tc.name, func(t *testing.T) {
-			p := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: tc.scopes}}
+			p := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: tc.scopes, ServerAllowlist: tc.allowlist}}
 			for verb, body := range map[string]string{"approve": approve, "reject": reject} {
 				rec := decideApproval(srv, verb, body, p)
 				if rec.Code != http.StatusForbidden {

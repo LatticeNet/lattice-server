@@ -97,7 +97,22 @@ func TestDesign15ApprovalsRequireVPNCoreAdmin(t *testing.T) {
 
 			// Legacy proxy:admin remains a compatibility grant for canonical
 			// vpncore:admin while operators migrate their PATs.
-			legacy := createPAT(t, handler, cookies, csrf, []string{"network:apply", "proxy:admin"}, []string{"node-a"})
+			legacyScopes, legacyAllowlist := []string{"network:apply", "proxy:admin"}, []string{"node-a"}
+			if pluginID == singBoxLineUserPlugin {
+				// A line-user plan names identities, so its decider must also
+				// be able to read it: unrestricted, with network:plan on the
+				// node (approvalPlanNamesIdentities). The confined grant that
+				// decides a linemeta plan is refused for this one.
+				confined := createPAT(t, handler, cookies, csrf, legacyScopes, legacyAllowlist)
+				refused := doBearerJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+					string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": false, "plan_sha256": planSHA256(approval.Plan)})), confined)
+				defer refused.Body.Close()
+				if refused.StatusCode != http.StatusForbidden {
+					t.Fatalf("a decider confined to the node must not decide a plan naming identities, got %d", refused.StatusCode)
+				}
+				legacyScopes, legacyAllowlist = []string{"network:apply", "network:plan", "proxy:admin"}, nil
+			}
+			legacy := createPAT(t, handler, cookies, csrf, legacyScopes, legacyAllowlist)
 			allowed := doBearerJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
 				string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": false, "plan_sha256": planSHA256(approval.Plan)})), legacy)
 			defer allowed.Body.Close()

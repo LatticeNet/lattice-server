@@ -90,6 +90,36 @@ func TestEveryApprovalPluginHasADecidedApplyTimeout(t *testing.T) {
 	}
 }
 
+// The decision verbs answer with the plan, so a plan that names proxy
+// identities may be decided only by a principal that may read it. A plugin
+// left out has to say why its plan carries nothing outside what its decider's
+// own scopes already cover.
+func TestEveryApprovalPluginHasADecidedDecisionReadGate(t *testing.T) {
+	nothingBeyondTheDecider := map[string]string{
+		"nft":                 "a firewall ruleset for the node, decided under netguard:admin or authored under network:plan",
+		"nftpolicy":           "netpolicy:admin both reads and decides it",
+		"wireguard":           "mesh config, whose other nodes approvalNodeReachAllows already checks",
+		"cftunnel":            "tunnel:admin both reads and decides it",
+		"selfdns":             "the node's resolver config, decided under dns:admin",
+		agentUpdatePlugin:     "a release and its checksum, decided under node:admin",
+		singBoxLineMetaPlugin: "line metadata, with no identities in it",
+		lineChainPlugin:       "line topology, with no identities in it",
+		sshGuardPlugin:        "the knock sequence, decided under sshguard:admin, which implies sshguard:read",
+	}
+	for _, plugin := range approvalPlugins {
+		t.Run(plugin, func(t *testing.T) {
+			names := approvalPlanNamesIdentities(model.Approval{Plugin: plugin})
+			_, recorded := nothingBeyondTheDecider[plugin]
+			if names && recorded {
+				t.Fatalf("%s is both gated as naming identities and recorded as carrying nothing; pick one", plugin)
+			}
+			if !names && !recorded {
+				t.Fatalf("%s is decided without the read gate. Either its plan names identities and approvalPlanNamesIdentities must say so, or record here why it carries nothing beyond the decider's own scopes.", plugin)
+			}
+		})
+	}
+}
+
 // A plan that reaches a host is a plan that must be bound to what was reviewed.
 func TestEveryApprovalPluginCarryingAPlanRequiresItsHash(t *testing.T) {
 	for _, plugin := range approvalPlugins {

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -140,12 +142,12 @@ func TestOmittedSummaryCountsPastFive(t *testing.T) {
 	}
 }
 
-// A line-user plan names identities by email, the users its render leaves
-// out included, so it is listed only to a principal that may read
-// identities: unrestricted, holding the vpn-core read or admin scope, and
-// network:plan on the node. Bare network:plan read it before, with or
-// without an allowlist; deciding still asks for vpncore:admin.
-func TestLineUserPlanIsListedOnlyToPrincipalsWhoReadIdentities(t *testing.T) {
+// omittingLineUserApproval files a managed plan_add for second@example.com on
+// a line whose render already leaves managed@example.com out over its quota,
+// so the plan names two identities by email. It returns the server and the
+// pending approval.
+func omittingLineUserApproval(t *testing.T) (*Server, model.Approval) {
+	t.Helper()
 	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
 	srv := usageTestServer(t, now)
 	line, identity := seedManagedLineUserFixture(t, srv)
@@ -166,9 +168,139 @@ func TestLineUserPlanIsListedOnlyToPrincipalsWhoReadIdentities(t *testing.T) {
 	if err := srv.putVpnUser(second); err != nil {
 		t.Fatal(err)
 	}
-	if plan := planAddOnLine(t, srv, second.ID, line.LineHashID); len(plan.Omitted) == 0 {
+	approval := filePlan(t, srv, lineUserOpAdd, second.ID, line.LineHashID)
+	var plan lineUserPlan
+	if err := json.Unmarshal([]byte(approval.Plan), &plan); err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Omitted) == 0 {
 		t.Fatalf("the fixture must leave a user out: %+v", plan)
 	}
+	return srv, approval
+}
+
+// Approve, reject and dismiss answer with the full plan, so a decider must
+// clear the read gate the listing applies. A principal confined to the node
+// with network:apply and vpncore:admin there could reject a line-user
+// approval by id and read the identities its plan names, the users its
+// render leaves out included, which the listing hides from it. A decider
+// who may read the plan still decides it.
+func TestDecidingALineUserPlanRequiresReadingIt(t *testing.T) {
+	srv, approval := omittingLineUserApproval(t)
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	bodies := map[string]string{
+		"approve": `{"approval_id":"` + approval.ID + `","queue_apply":true,"plan_sha256":"` + planSHA + `"}`,
+		"reject":  `{"approval_id":"` + approval.ID + `"}`,
+		"dismiss": `{"approval_id":"` + approval.ID + `"}`,
+	}
+	refused := []struct {
+		name      string
+		scopes    []string
+		allowlist []string
+	}{
+		{name: "confined to the node", scopes: []string{"network:apply", "network:plan", "vpncore:admin"}, allowlist: []string{"managed-a"}},
+		{name: "without network:plan", scopes: []string{"network:apply", "vpncore:admin"}},
+	}
+	checkRefused := func(t *testing.T) {
+		t.Helper()
+		for _, tc := range refused {
+			p := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: tc.scopes, ServerAllowlist: tc.allowlist}}
+			for _, verb := range []string{"approve", "reject", "dismiss"} {
+				rec := decideApproval(srv, verb, bodies[verb], p)
+				if rec.Code != http.StatusForbidden {
+					t.Fatalf("%s, %s: status %d, want 403: %s", tc.name, verb, rec.Code, rec.Body.String())
+				}
+				if body := rec.Body.String(); strings.Contains(body, "@example.com") || strings.Contains(body, "render full sing-box config") {
+					t.Fatalf("%s, %s: the refusal carried the plan: %s", tc.name, verb, body)
+				}
+			}
+		}
+	}
+
+	t.Run("refused while pending", func(t *testing.T) {
+		checkRefused(t)
+		stored, _ := srv.store.Approval(approval.ID)
+		if stored.Status != model.ApprovalPending {
+			t.Fatalf("a refused decider changed the approval to %q", stored.Status)
+		}
+		if tasks := tasksFor(srv, approval.ID); len(tasks) != 0 {
+			t.Fatalf("a refused decider queued %d task(s)", len(tasks))
+		}
+	})
+
+	reader := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: []string{"network:apply", "network:plan", "vpncore:admin"}}}
+	t.Run("allowed", func(t *testing.T) {
+		rec := decideApproval(srv, "approve", bodies["approve"], reader)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("approve: %d %s", rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "managed@example.com (over_quota)") {
+			t.Fatalf("a decider who may read the plan gets it back: %s", rec.Body.String())
+		}
+		if tasks := tasksFor(srv, approval.ID); len(tasks) != 1 {
+			t.Fatalf("approve queued %d task(s), want 1", len(tasks))
+		}
+		// Rejecting a decided approval changes nothing and still answers
+		// with the plan, to a decider who may read it.
+		rec = decideApproval(srv, "reject", bodies["reject"], reader)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "second@example.com") {
+			t.Fatalf("reject of a decided approval: %d %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	// On a decided approval reject mutates nothing, so before this it was a
+	// pure read.
+	t.Run("refused once decided", checkRefused)
+}
+
+// A proxycore plan names the users its render leaves out by email, and its
+// decision path had the same gap: proxy:admin on the node, confined to it,
+// rejected the approval by id and read them.
+func TestDecidingAProxyCorePlanRequiresReadingIt(t *testing.T) {
+	srv, _ := omittingLineUserApproval(t)
+	planner := principal{Principal: rbac.Principal{ActorID: "op-1", Scopes: []string{"network:plan", "proxy:read"}}}
+	rec := httptest.NewRecorder()
+	srv.handleProxyNodePlan(rec, httptest.NewRequest(http.MethodPost, "/api/proxy/nodes/managed-a/plan", strings.NewReader(`{}`)), planner)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("proxy plan: %d %s", rec.Code, rec.Body.String())
+	}
+	var view approvalView
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(view.Plan, "managed@example.com") {
+		t.Fatalf("the fixture's proxycore plan must name the omitted user:\n%s", view.Plan)
+	}
+	reject := `{"approval_id":"` + view.ID + `"}`
+
+	confined := principal{Principal: rbac.Principal{ActorID: "decider",
+		Scopes: []string{"network:apply", "network:plan", "proxy:admin", "proxy:read"}, ServerAllowlist: []string{"managed-a"}}}
+	rec = decideApproval(srv, "reject", reject, confined)
+	if rec.Code != http.StatusForbidden || strings.Contains(rec.Body.String(), "@example.com") {
+		t.Fatalf("a confined decider: %d %s, want 403 without the plan", rec.Code, rec.Body.String())
+	}
+	if stored, _ := srv.store.Approval(view.ID); stored.Status != model.ApprovalPending {
+		t.Fatalf("a refused decider changed the approval to %q", stored.Status)
+	}
+
+	reader := principal{Principal: rbac.Principal{ActorID: "decider",
+		Scopes: []string{"network:apply", "network:plan", "proxy:admin", "proxy:read"}}}
+	rec = decideApproval(srv, "reject", reject, reader)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "managed@example.com") {
+		t.Fatalf("a decider who may read the plan: %d %s", rec.Code, rec.Body.String())
+	}
+	if stored, _ := srv.store.Approval(view.ID); stored.Status != model.ApprovalRejected {
+		t.Fatalf("status = %q, want rejected", stored.Status)
+	}
+}
+
+// A line-user plan names identities by email, the users its render leaves
+// out included, so it is listed only to a principal that may read
+// identities: unrestricted, holding the vpn-core read or admin scope, and
+// network:plan on the node. Bare network:plan read it before, with or
+// without an allowlist; deciding still asks for vpncore:admin.
+func TestLineUserPlanIsListedOnlyToPrincipalsWhoReadIdentities(t *testing.T) {
+	srv, _ := omittingLineUserApproval(t)
 
 	cases := []struct {
 		name      string

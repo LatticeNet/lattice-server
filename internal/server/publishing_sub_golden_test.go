@@ -227,6 +227,14 @@ func transcribeAudit(events []model.AuditEvent) string {
 // unsupported and pretty yaml render with format plain. The bare URL with no
 // agent or an unknown agent still receives the base64 URI list.
 //
+// A third regeneration came with answer-first serving. Every 200 now carries
+// Content-Length and a strong ETag (the bodies here are under the gzip floor,
+// so no Vary or Content-Encoding appears). A successful fetch no longer writes
+// an audit event per request: only the first fetch of a link by a client
+// family is recorded at once (bare for surge, no user agent for other, clash
+// ua for clash), and the rest are counted into an hourly summary. Every
+// refusal is byte for byte what it was.
+//
 // Treat any future movement the same way: prove it was intended and name the
 // cases that changed, or the URL in someone's proxy client is what moved.
 func TestSubscriptionShareWireTranscriptIsGolden(t *testing.T) {
@@ -256,6 +264,7 @@ func TestSubscriptionShareWireTranscriptIsGolden(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		// Refusal audits are written after the answer, off the request path.
 		s.shareRefusalAudits.Wait()
+		s.shareFetchAudits.Wait()
 
 		fmt.Fprintf(&b, "case %s\n", tc.name)
 		b.WriteString(transcribe(rec))

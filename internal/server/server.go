@@ -237,6 +237,13 @@ type Server struct {
 	// key, so concurrent misses for one key run one render; see
 	// share_render_flight.go. shareRenderJoinWaiter (tests only) is signalled
 	// when a request joins a flight instead of starting one.
+	// shareFetchStats counts successful link fetches per link per hour and
+	// remembers which client families fetched each link; see
+	// share_fetch_stats.go. shareFetchAudits counts its audit writes still in
+	// flight.
+	shareFetchStats       *shareFetchStats
+	shareFetchAudits      sync.WaitGroup
+	shareFetchAuditHook   func()
 	shareRenderMu         sync.Mutex
 	shareRenderFlights    map[subscriptionCacheKey]*shareRenderFlight
 	shareRenderJoinWaiter chan struct{}
@@ -611,6 +618,7 @@ func New(opts Options) (*Server, error) {
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		shareFetchStats:       newShareFetchStats(),
 		subscriptionDecoy:     opts.SubscriptionDecoy,
 		now:                   func() time.Time { return time.Now().UTC() },
 		tlsMonitorTargets:     defaultTLSMonitorTargets,
@@ -688,6 +696,7 @@ func New(opts Options) (*Server, error) {
 		s.startDDNSSweep()
 		s.startTLSMonitorSweep()
 		s.startShareRefusalAuditFlush()
+		s.startShareFetchStatsFlush()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1392,6 +1401,8 @@ func (s *Server) Close(ctx context.Context) error {
 		return nil
 	}
 	s.flushAlertDigests()
+	// The open hour's link fetch counts would otherwise be lost.
+	s.flushShareFetchStats(s.now(), true)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)

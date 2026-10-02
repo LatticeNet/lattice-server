@@ -2,6 +2,7 @@ package server
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +33,11 @@ type subscriptionCacheEntry struct {
 	// wireType is the Content-Type the core derived for this body when it
 	// rendered it, kept with the body so a hit answers with the same label.
 	wireType string
+	// bodyHash and gzipBody are computed once at render time (newShareBody)
+	// so a hit neither digests nor compresses. A zero hash means the entry
+	// was stored without them and the handler computes them.
+	bodyHash [sha256.Size]byte
+	gzipBody []byte
 	// userinfo is the provider's traffic header. It travels with the body rather
 	// than in a parallel map so a cache hit can never serve one client's body
 	// with another's remaining-quota figures.
@@ -106,6 +112,7 @@ func (c *subscriptionCache) GetSnapshot(key subscriptionCacheKey, now time.Time)
 	c.order.MoveToFront(el)
 	out := *entry
 	out.body = append([]byte(nil), entry.body...)
+	out.gzipBody = cloneBytes(entry.gzipBody)
 	return out, true
 }
 
@@ -126,6 +133,7 @@ func (c *subscriptionCache) GetVersioned(key subscriptionCacheKey, version strin
 	c.order.MoveToFront(el)
 	out := *entry
 	out.body = append([]byte(nil), entry.body...)
+	out.gzipBody = cloneBytes(entry.gzipBody)
 	return out, true
 }
 
@@ -142,6 +150,7 @@ func (c *subscriptionCache) GetStale(key subscriptionCacheKey) (subscriptionCach
 	}
 	entry := *el.Value.(*subscriptionCacheEntry)
 	entry.body = append([]byte(nil), entry.body...)
+	entry.gzipBody = cloneBytes(entry.gzipBody)
 	return entry, true
 }
 
@@ -212,6 +221,7 @@ func (c *subscriptionCache) putEntry(key subscriptionCacheKey, in subscriptionCa
 	entry := &subscriptionCacheEntry{
 		key: storedKey, body: append([]byte(nil), in.body...), revision: c.nextRevision,
 		contentType: strings.Clone(in.contentType), wireType: strings.Clone(in.wireType), userinfo: strings.Clone(in.userinfo),
+		bodyHash: in.bodyHash, gzipBody: cloneBytes(in.gzipBody),
 		revalidationVersion: strings.Clone(in.revalidationVersion), publicSourceVersion: strings.Clone(in.publicSourceVersion),
 		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl),
 	}
@@ -266,6 +276,14 @@ func (c *subscriptionCache) removeElement(el *list.Element) {
 }
 
 func subscriptionCacheEntrySize(entry subscriptionCacheEntry) int {
-	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.contentType) + len(entry.wireType) +
+	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.gzipBody) + len(entry.contentType) + len(entry.wireType) +
 		len(entry.userinfo) + len(entry.revalidationVersion) + len(entry.publicSourceVersion)
+}
+
+// cloneBytes copies b, keeping nil as nil so "no gzip body" stays visible.
+func cloneBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }

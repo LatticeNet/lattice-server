@@ -94,10 +94,12 @@ func (s *Server) renderShareOnce(ctx context.Context, share model.SubscriptionSh
 		if len(rendered.Body) == 0 {
 			return shareRenderOutcome{deny: "empty render refused"}
 		}
+		served := newShareBody(rendered.Body)
 		entry := subscriptionCacheEntry{body: rendered.Body, contentType: rendered.ContentType, userinfo: rendered.Userinfo,
 			revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
 			stale: rendered.Stale, fetchedAt: rendered.FetchedAt,
-			wireType: shareWireContentType(plan, reportedRenderTarget(rendered.Target))}
+			wireType: shareWireContentType(plan, reportedRenderTarget(rendered.Target)),
+			bodyHash: served.hash, gzipBody: served.gzipBody}
 		if share.Source.Kind == model.ShareSourcePlugin &&
 			!s.putSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, rendered.SourceEpoch, entry, s.now()) {
 			continue

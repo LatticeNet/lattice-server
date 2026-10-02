@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
-	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
 )
 
@@ -326,7 +325,10 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	if share.Source.Kind == model.ShareSourcePlugin {
 		cacheEntry, cached, cacheEpoch = s.subscriptionCacheSnapshotForSource(share.Source.PluginID, share.Source.SubscriptionID, key, false, s.now())
 	}
-	body, userinfo, wireType := cacheEntry.body, cacheEntry.userinfo, cacheEntry.wireType
+	// served is the body this response carries; userinfo and the snapshot
+	// fields below can be refreshed by revalidation without a new body.
+	served := cacheEntry
+	userinfo, wireType := cacheEntry.userinfo, cacheEntry.wireType
 	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.publicSourceVersion, cacheEntry.fetchedAt
 	if (!cached || staleResponse) && share.Source.Kind == model.ShareSourcePlugin {
 		// Revalidate before paying for a render. A render boots the plugin's
@@ -359,7 +361,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 					cached = false
 					break
 				}
-				body, userinfo, cached = stale.body, snap.Userinfo, true
+				served, userinfo, wireType, cached = stale, snap.Userinfo, stale.wireType, true
 				staleResponse, sourceVersion, snapshotFetchedAt = snap.Stale, snap.SourceVersion, snap.FetchedAt
 			}
 		}
@@ -375,9 +377,9 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			deny(outcome.deny, map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
-		rendered := outcome.entry
-		body, userinfo, wireType = rendered.body, rendered.userinfo, rendered.wireType
-		staleResponse, sourceVersion, snapshotFetchedAt = rendered.stale, rendered.publicSourceVersion, rendered.fetchedAt
+		served = outcome.entry
+		userinfo, wireType = served.userinfo, served.wireType
+		staleResponse, sourceVersion, snapshotFetchedAt = served.stale, served.publicSourceVersion, served.fetchedAt
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
@@ -390,25 +392,33 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", wireType)
 	// ?noFlow=1 keeps quota headers off the wire (upstream's 不查询订阅流量) —
 	// some clients probe aggressively when they see one.
-	if quota := subscriptionUserinfoForResponse(userinfo); quota != "" && !variant.NoFlow {
+	quota := subscriptionUserinfoForResponse(userinfo)
+	if variant.NoFlow {
+		quota = ""
+	}
+	if quota != "" {
 		w.Header().Set("Subscription-Userinfo", quota)
 	}
 	if staleResponse {
 		w.Header().Set("X-Lattice-Subscription-Stale", "true")
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
-	metadata := map[string]string{
-		"share_id": share.ID, "slug": slug, "token_sha256": tokenHash, "format": format, "ua_class": clientClass,
-		"cache": strconv.FormatBool(cached), "stale": strconv.FormatBool(staleResponse), "snapshot_age_seconds": snapshotAgeSeconds(s.now(), snapshotFetchedAt),
+	body := shareBody{body: served.body, gzipBody: served.gzipBody, hash: served.bodyHash}
+	if body.hash == ([32]byte{}) {
+		body = newShareBody(served.body)
 	}
-	if sourceVersion != "" {
-		metadata["source_version"] = sourceVersion
-	}
-	s.recordRequestAudit(r, model.AuditEvent{
-		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
-		Metadata: metadata,
-	})
+	// Answer first. Everything below runs after the client has its bytes.
+	notModified := writeShareBody(w, r, body, quota)
+	s.noteShareFetch(r, shareFetch{shareID: share.ID, slug: slug, tokenHash: tokenHash, family: clientClass,
+		cacheHit: cached, notModified: notModified, stale: staleResponse}, func() map[string]string {
+		metadata := map[string]string{
+			"share_id": share.ID, "slug": slug, "token_sha256": tokenHash, "format": format, "ua_class": clientClass,
+			"cache": strconv.FormatBool(cached), "stale": strconv.FormatBool(staleResponse), "snapshot_age_seconds": snapshotAgeSeconds(s.now(), snapshotFetchedAt),
+		}
+		if sourceVersion != "" {
+			metadata["source_version"] = sourceVersion
+		}
+		return metadata
+	}())
 }
 
 // subscriptionCacheSnapshotForSource linearizes plugin cache reads with source

@@ -266,8 +266,11 @@ func TestSubscriptionShareStaleCacheHitSetsHeaderAndSafeAudit(t *testing.T) {
 	if rec.Code != http.StatusOK || rec.Body.String() != "last-good" || rec.Header().Get("X-Lattice-Subscription-Stale") != "true" {
 		t.Fatalf("stale cache response = code %d header %q body %q", rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"), rec.Body.String())
 	}
+	s.shareFetchAudits.Wait()
+	allowEvents := 0
 	for _, event := range st.AuditEvents() {
 		if event.Action == auditActionShareFetch && event.Decision == "allow" {
+			allowEvents++
 			if event.Metadata["stale"] != "true" || event.Metadata["snapshot_age_seconds"] == "" {
 				t.Fatalf("share stale audit = %+v", event.Metadata)
 			}
@@ -281,6 +284,9 @@ func TestSubscriptionShareStaleCacheHitSetsHeaderAndSafeAudit(t *testing.T) {
 				t.Fatalf("diagnostic leaked into share audit: %+v", event.Metadata)
 			}
 		}
+	}
+	if allowEvents != 1 {
+		t.Fatalf("allow events = %d, want the first-seen event for this client family", allowEvents)
 	}
 }
 
@@ -387,10 +393,18 @@ func TestSubscriptionSharePropagatesStaleAndRecoveryAcrossSiblingShares(t *testi
 			t.Fatalf("%s sibling stale response = code %d header %q body %q", name, rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"), rec.Body.String())
 		}
 	}
+	s.shareFetchAudits.Wait()
+	staleEvents := 0
 	for _, event := range st.AuditEvents() {
-		if event.Action == auditActionShareFetch && event.Decision == "allow" && event.Metadata["stale"] != "true" {
-			t.Fatalf("sibling stale audit was fresh: %+v", event.Metadata)
+		if event.Action == auditActionShareFetch && event.Decision == "allow" {
+			if event.Metadata["stale"] != "true" {
+				t.Fatalf("sibling stale audit was fresh: %+v", event.Metadata)
+			}
+			staleEvents++
 		}
+	}
+	if staleEvents != 2 {
+		t.Fatalf("stale first-seen events = %d, want one per sibling", staleEvents)
 	}
 
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {

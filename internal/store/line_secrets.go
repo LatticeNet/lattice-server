@@ -445,6 +445,15 @@ func (s *Store) replaceLineSecretRecordsLocked(public map[string]VpnUserPublicRe
 	return err
 }
 
+// MigrationRan reports whether a one-time migration named name already
+// committed on this store, so a caller can skip gathering its inputs.
+func (s *Store) MigrationRan(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, done := s.state.Migrations[name]
+	return done
+}
+
 // MigrateVpnUserPublicRecordsOnce runs fn over every identity's public record
 // the first time it is called with name on this store, and never again. fn
 // returns the rewritten record and true to change it. The changed records and

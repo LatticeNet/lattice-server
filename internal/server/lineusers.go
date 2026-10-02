@@ -1248,6 +1248,11 @@ const lineUserAppliedCredentialBackfill = "vpnuser-applied-credential-v1"
 // which is the truth: the node still holds the old one. Approvals are never
 // pruned, so the history is complete.
 func (s *Server) backfillLineUserAppliedCredentials() error {
+	// Every boot gets here; reading the whole approval history is for the
+	// first one only.
+	if s.store.MigrationRan(lineUserAppliedCredentialBackfill) {
+		return nil
+	}
 	last := map[[2]string]lineUserPlan{}
 	for _, plan := range s.lineUserLastApplied(func(lineUserPlan) bool { return true }) {
 		last[[2]string{plan.UserID, plan.LineHashID}] = plan

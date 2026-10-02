@@ -1,15 +1,41 @@
 package server
 
 import (
+	"crypto/pbkdf2"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func fleetNodeID(i int) string   { return fmt.Sprintf("node-%02d", i) }
 func fleetNodeName(i int) string { return fmt.Sprintf("edge-%02d", i) }
+
+// seedFleetNode stores an enrolled node whose token hash takes one PBKDF2
+// iteration instead of 210,000. Enrollment is not what the fleet test
+// measures, and at full cost 34 enrollments and 34 first verifications take
+// over a minute under the race detector. VerifySecret honours the iteration
+// count the hash names, so authentication still runs for real.
+func seedFleetNode(t *testing.T, st *store.Store, id, name string) string {
+	t.Helper()
+	token := "fleet-token-" + id
+	salt := []byte("fleet-salt-" + id)
+	key, err := pbkdf2.Key(sha256.New, token, salt, 1, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := fmt.Sprintf("pbkdf2-sha256$1$%s$%s", base64.RawStdEncoding.EncodeToString(salt), base64.RawStdEncoding.EncodeToString(key))
+	if err := st.UpsertNode(model.Node{ID: id, Name: name, TokenHash: hash, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
 
 // TestFleetWideMonitorNeverRewritesStateFile runs one monitor on every node
 // of a 34-node fleet at the 30 s default for ten minutes of probes, on the
@@ -32,7 +58,7 @@ func TestFleetWideMonitorNeverRewritesStateFile(t *testing.T) {
 	cookies, csrf := loginSession(t, f.handler)
 	tokens := make([]string, fleet)
 	for i := range tokens {
-		tokens[i] = enrollNamedNodeToken(t, f.handler, cookies, csrf, fleetNodeID(i), fleetNodeName(i))
+		tokens[i] = seedFleetNode(t, f.st, fleetNodeID(i), fleetNodeName(i))
 	}
 	monID := createAllNodesMonitor(t, f.handler, cookies, csrf, "api")
 	notices := captureTypedNotices(f.srv)

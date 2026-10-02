@@ -313,13 +313,18 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 
 	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass, Variant: variant.cacheToken()}
 
+	// A core proxy-user source is rendered on every request. Its render is Go
+	// over in-memory state, and a content version that covered everything it
+	// reads (the user's status, quota and expiry, profiles, inbounds, node
+	// liveness) would cost as much as the render. Caching it without one is
+	// what kept a suspended or expired user's nodes on the wire for up to 30
+	// minutes. A plugin source is cached, looked up against the content
+	// version of the snapshot it was rendered from.
 	var cacheEntry subscriptionCacheEntry
 	var cached bool
 	var cacheEpoch uint64
 	if share.Source.Kind == model.ShareSourcePlugin {
 		cacheEntry, cached, cacheEpoch = s.subscriptionCacheSnapshotForSource(share.Source.PluginID, share.Source.SubscriptionID, key, false, s.now())
-	} else {
-		cacheEntry, cached = s.subscriptionCache.GetSnapshot(key, s.now())
 	}
 	body, userinfo, wireType := cacheEntry.body, cacheEntry.userinfo, cacheEntry.wireType
 	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.publicSourceVersion, cacheEntry.fetchedAt
@@ -360,50 +365,19 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	if !cached {
-		// Plugin rendering races durable source transitions. A rejected epoch is
-		// not merely a cache miss: its body was rendered from superseded authority
-		// and therefore must not escape in the current response either. Re-capture
-		// and render once more; sustained churn fails closed instead of serving a
-		// body whose source transition already committed.
-		attempts := 1
+		var outcome shareRenderOutcome
 		if share.Source.Kind == model.ShareSourcePlugin {
-			attempts = 2
+			outcome = s.renderShareShared(r.Context(), share, plan, key)
+		} else {
+			outcome = s.renderShareOnce(r.Context(), share, plan, key)
 		}
-		accepted := false
-		for attempt := 0; attempt < attempts; attempt++ {
-			rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass, variant)
-			if renderErr != nil {
-				s.logger.Printf("subscription share: render failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(renderErr))
-				deny("subscription_render_failed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
-				return
-			}
-			// A client that receives an empty but successful subscription deletes
-			// every node it had. Answering with the decoy keeps that from happening
-			// AND keeps the emptiness from confirming that the token was real.
-			if len(rendered.Body) == 0 {
-				deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
-				return
-			}
-			entry := subscriptionCacheEntry{body: rendered.Body, contentType: rendered.ContentType, userinfo: rendered.Userinfo,
-				revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
-				stale: rendered.Stale, fetchedAt: rendered.FetchedAt,
-				wireType: shareWireContentType(plan, reportedRenderTarget(rendered.Target))}
-			if share.Source.Kind == model.ShareSourcePlugin &&
-				!s.putSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, rendered.SourceEpoch, entry, s.now()) {
-				continue
-			}
-			if share.Source.Kind != model.ShareSourcePlugin {
-				s.subscriptionCache.putEntry(key, entry, s.now())
-			}
-			body, userinfo, wireType = rendered.Body, rendered.Userinfo, entry.wireType
-			staleResponse, sourceVersion, snapshotFetchedAt = rendered.Stale, rendered.SourceVersion, rendered.FetchedAt
-			accepted = true
-			break
-		}
-		if !accepted {
-			deny("subscription_source_changed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+		if outcome.deny != "" {
+			deny(outcome.deny, map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
+		rendered := outcome.entry
+		body, userinfo, wireType = rendered.body, rendered.userinfo, rendered.wireType
+		staleResponse, sourceVersion, snapshotFetchedAt = rendered.stale, rendered.publicSourceVersion, rendered.fetchedAt
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
@@ -455,7 +429,16 @@ func (s *Server) subscriptionCacheSnapshotForSource(pluginID, subscriptionID str
 		entry, ok := s.subscriptionCache.GetStale(key)
 		return entry, ok, epoch
 	}
-	entry, ok := s.subscriptionCache.GetSnapshot(key, now)
+	// The content version is part of the lookup: a body rendered from any
+	// snapshot other than the one stored now is a miss, whatever its TTL. The
+	// epoch bookkeeping already invalidates on every committed source change;
+	// this makes "a stale body cannot be reached" true by construction rather
+	// than by every writer remembering to invalidate.
+	version := ""
+	if snapshot, ok := s.store.SubscriptionSnapshot(pluginID, subscriptionID); ok {
+		version = subscriptionRevalidationVersion(snapshot)
+	}
+	entry, ok := s.subscriptionCache.GetVersioned(key, version, now)
 	return entry, ok, epoch
 }
 

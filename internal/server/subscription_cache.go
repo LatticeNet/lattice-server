@@ -109,6 +109,26 @@ func (c *subscriptionCache) GetSnapshot(key subscriptionCacheKey, now time.Time)
 	return out, true
 }
 
+// GetVersioned is GetSnapshot for a caller that knows the content version the
+// body must have been rendered from. An entry rendered from any other version
+// is a miss, so a body the source has moved past is never served.
+func (c *subscriptionCache) GetVersioned(key subscriptionCacheKey, version string, now time.Time) (subscriptionCacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.entries[key]
+	if !ok {
+		return subscriptionCacheEntry{}, false
+	}
+	entry := el.Value.(*subscriptionCacheEntry)
+	if entry.revalidationVersion != version || !now.Before(entry.expiresAt) {
+		return subscriptionCacheEntry{}, false
+	}
+	c.order.MoveToFront(el)
+	out := *entry
+	out.body = append([]byte(nil), entry.body...)
+	return out, true
+}
+
 // GetStale returns a copy of the entry whether or not it has expired. The
 // revalidation path uses it to extend an unchanged body — or to serve the last
 // good body when the source is unreachable — instead of dropping the client to

@@ -233,8 +233,15 @@ type Server struct {
 	shareResolvedRefusalAudit *auditFailureThrottle
 	shareRefusalAudits        sync.WaitGroup
 	shareRefusalAuditHook     func()
-	apiLimiter                *ratelimit.Limiter
-	subLimiter                *ratelimit.Limiter
+	// shareRenderFlights holds the share renders in flight, one per cache
+	// key, so concurrent misses for one key run one render; see
+	// share_render_flight.go. shareRenderJoinWaiter (tests only) is signalled
+	// when a request joins a flight instead of starting one.
+	shareRenderMu         sync.Mutex
+	shareRenderFlights    map[subscriptionCacheKey]*shareRenderFlight
+	shareRenderJoinWaiter chan struct{}
+	apiLimiter            *ratelimit.Limiter
+	subLimiter            *ratelimit.Limiter
 	// logIngestLimiter brakes per-source log ingest (keyed by source id) in
 	// lines/sec so a chatty or hostile node cannot flood the store; over budget
 	// returns 429 + Retry-After. Disk is independently bounded by the store caps.

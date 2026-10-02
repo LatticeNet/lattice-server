@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 func decodeIngest(t *testing.T, body []byte) agentMonitorResultsResponse {
@@ -143,5 +144,165 @@ func TestAgentMonitorResultSingleRouteAnswersTheBatchBody(t *testing.T) {
 	rows := storedMonitorResults(t, st, monID)
 	if len(rows) != 1 || rows[0].NodeID != "n-web" {
 		t.Fatalf("rows: %+v", rows)
+	}
+}
+
+type monitorListEntry struct {
+	ID     string              `json:"id"`
+	Latest []monitorLatestView `json:"latest"`
+}
+
+func listMonitors(t *testing.T, res *http.Response) map[string]monitorListEntry {
+	t.Helper()
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("list monitors: %d", res.StatusCode)
+	}
+	var list []monitorListEntry
+	if err := json.NewDecoder(res.Body).Decode(&list); err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]monitorListEntry{}
+	for _, m := range list {
+		out[m.ID] = m
+	}
+	return out
+}
+
+func postBatch(t *testing.T, handler http.Handler, nodeID, token string, results ...string) {
+	t.Helper()
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-results", `{"node_id":"`+nodeID+`","results":[`+strings.Join(results, ",")+`]}`, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("batch for %s: %d %s", nodeID, rec.Code, rec.Body.String())
+	}
+	if got := decodeIngest(t, rec.Body.Bytes()); len(got.Dropped) != 0 {
+		t.Fatalf("batch for %s dropped results: %+v", nodeID, got.Dropped)
+	}
+}
+
+// GET /api/monitors carries each assigned node's newest result with its run,
+// filtered to the nodes the caller may read, so the console reads one list
+// instead of one history per monitor.
+func TestMonitorsListCarriesEachNodesLatest(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	cookies, csrf := loginSession(t, handler)
+	tokenA := enrollAndBeat(t, handler, cookies, csrf, "n-a", "alpha")
+	tokenB := enrollAndBeat(t, handler, cookies, csrf, "n-b", "beta")
+	res := doJSON(t, handler, http.MethodPost, "/api/monitors", `{"name":"web","type":"tcp","target":"x:443","node_ids":["n-a","n-b"]}`, cookies, csrf)
+	var mon model.Monitor
+	if err := json.NewDecoder(res.Body).Decode(&mon); err != nil || mon.ID == "" {
+		t.Fatalf("create monitor: %v %+v", err, mon)
+	}
+	res.Body.Close()
+	idle := createAllNodesMonitor(t, handler, cookies, csrf, "idle")
+
+	now := time.Now().UTC().Truncate(time.Second)
+	postBatch(t, handler, "n-a", tokenA,
+		resultJSON(mon.ID, now.Add(-60*time.Second), true, ""),
+		resultJSON(mon.ID, now.Add(-30*time.Second), false, "conn refused"),
+		resultJSON(mon.ID, now, false, "conn refused"))
+	postBatch(t, handler, "n-b", tokenB, resultJSON(mon.ID, now, true, ""))
+
+	all := listMonitors(t, doJSON(t, handler, http.MethodGet, "/api/monitors", "", cookies, ""))
+	latest := all[mon.ID].Latest
+	if len(latest) != 2 || latest[0].NodeID != "n-a" || latest[1].NodeID != "n-b" {
+		t.Fatalf("latest: %+v", latest)
+	}
+	a := latest[0]
+	if a.Success || a.FailStreak != 2 || !a.Since.Equal(now.Add(-30*time.Second)) || !a.At.Equal(now) || a.Error != "conn refused" || a.ReceivedAt.IsZero() {
+		t.Fatalf("n-a latest: %+v", a)
+	}
+	if b := latest[1]; !b.Success || b.FailStreak != 0 || b.LatencyMs != 12.5 {
+		t.Fatalf("n-b latest: %+v", b)
+	}
+	if got, ok := all[idle]; !ok || got.Latest == nil || len(got.Latest) != 0 {
+		t.Fatalf("a monitor with no results lists an empty latest: %+v", got)
+	}
+
+	// A token confined to n-a sees only n-a's reading.
+	pat := createPAT(t, handler, cookies, csrf, []string{"monitor:read"}, []string{"n-a"})
+	confined := listMonitors(t, doBearerJSON(t, handler, http.MethodGet, "/api/monitors", "", pat))
+	if got := confined[mon.ID].Latest; len(got) != 1 || got[0].NodeID != "n-a" {
+		t.Fatalf("confined latest: %+v", got)
+	}
+
+	// Taken off the monitor, n-b's last reading is no longer listed.
+	mon.NodeIDs = []string{"n-a"}
+	if err := st.UpsertMonitor(mon); err != nil {
+		t.Fatal(err)
+	}
+	after := listMonitors(t, doJSON(t, handler, http.MethodGet, "/api/monitors", "", cookies, ""))
+	if got := after[mon.ID].Latest; len(got) != 1 || got[0].NodeID != "n-a" {
+		t.Fatalf("latest after unassigning n-b: %+v", got)
+	}
+}
+
+// The results read returns the newest rows across nodes by default, one
+// pair's with node_id, and never more than the limit allows.
+func TestMonitorResultsReadIsBounded(t *testing.T) {
+	_, handler, _ := newInventoryServer(t)
+	cookies, csrf := loginSession(t, handler)
+	tokens := map[string]string{
+		"n-a": enrollAndBeat(t, handler, cookies, csrf, "n-a", "alpha"),
+		"n-b": enrollAndBeat(t, handler, cookies, csrf, "n-b", "beta"),
+	}
+	monID := createAllNodesMonitor(t, handler, cookies, csrf, "web")
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	for node, token := range tokens {
+		batch := make([]string, 0, 30)
+		for i := 0; i < 30; i++ {
+			// n-a probes on the even seconds, n-b on the odd ones.
+			offset := 2 * i
+			if node == "n-b" {
+				offset++
+			}
+			batch = append(batch, resultJSON(monID, base.Add(time.Duration(offset)*time.Second), true, ""))
+		}
+		postBatch(t, handler, node, token, batch...)
+	}
+	read := func(query string, auth func(path string) *http.Response) (int, []store.MonitorResultRecord) {
+		t.Helper()
+		res := auth("/api/monitors/results?monitor_id=" + monID + query)
+		defer res.Body.Close()
+		var rows []store.MonitorResultRecord
+		if res.StatusCode == http.StatusOK {
+			if err := json.NewDecoder(res.Body).Decode(&rows); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return res.StatusCode, rows
+	}
+	admin := func(path string) *http.Response { return doJSON(t, handler, http.MethodGet, path, "", cookies, "") }
+
+	if code, rows := read("", admin); code != http.StatusOK || len(rows) != 60 {
+		t.Fatalf("default read: %d rows=%d", code, len(rows))
+	}
+	code, rows := read("&limit=10", admin)
+	if code != http.StatusOK || len(rows) != 10 || !rows[9].At.Equal(base.Add(59*time.Second)) || !rows[0].At.Equal(base.Add(50*time.Second)) {
+		t.Fatalf("limit=10: %d %+v", code, rows)
+	}
+	code, rows = read("&node_id=n-b&limit=5", admin)
+	if code != http.StatusOK || len(rows) != 5 || rows[0].NodeID != "n-b" || !rows[4].At.Equal(base.Add(59*time.Second)) {
+		t.Fatalf("one pair: %d %+v", code, rows)
+	}
+	for _, bad := range []string{"&limit=0", "&limit=abc", fmt.Sprintf("&limit=%d", maxMonitorResultsLimit+1)} {
+		if code, _ := read(bad, admin); code != http.StatusBadRequest {
+			t.Fatalf("%s: got %d, want 400", bad, code)
+		}
+	}
+
+	pat := createPAT(t, handler, cookies, csrf, []string{"monitor:read"}, []string{"n-a"})
+	confined := func(path string) *http.Response { return doBearerJSON(t, handler, http.MethodGet, path, "", pat) }
+	if code, _ := read("&node_id=n-b", confined); code != http.StatusForbidden {
+		t.Fatalf("confined read of another node's pair: %d", code)
+	}
+	code, rows = read("&limit=100", confined)
+	if code != http.StatusOK || len(rows) != 30 {
+		t.Fatalf("confined read: %d rows=%d", code, len(rows))
+	}
+	for _, row := range rows {
+		if row.NodeID != "n-a" {
+			t.Fatalf("confined read returned %s's row", row.NodeID)
+		}
 	}
 }

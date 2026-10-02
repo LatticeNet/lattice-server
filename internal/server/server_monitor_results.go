@@ -13,6 +13,10 @@ import (
 // the old per-monitor cap gave every response.
 const defaultMonitorResultsLimit = 500
 
+// maxMonitorResultsLimit is the most one results read returns: more than one
+// pair's whole history, and a bound on the response either way.
+const maxMonitorResultsLimit = 2000
+
 // agentMonitorResultsResponse answers both agent monitor result routes.
 // Accepted counts new rows; Duplicates counts results the pair already held
 // at the same instant (a batch sent again after a lost response), which an

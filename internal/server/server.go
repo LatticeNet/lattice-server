@@ -4994,7 +4994,16 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 				visible = append(visible, mon)
 			}
 		}
-		writeJSON(w, http.StatusOK, toMonitorViews(visible))
+		latest, err := s.store.LatestMonitorResults()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		views := toMonitorViews(visible)
+		for i, mon := range visible {
+			views[i].Latest = monitorLatestViews(p, mon, latest[mon.ID])
+		}
+		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
 		if !s.requireScope(w, p, "monitor:admin") {
 			return
@@ -5095,14 +5104,57 @@ func (s *Server) handleMonitorResults(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 		return
 	}
-	visible, err := s.store.RecentMonitorResults(monitorID, defaultMonitorResultsLimit, func(nodeID string) bool {
-		return rbac.Allows(p.Principal, "monitor:read", nodeID)
-	})
+	query := r.URL.Query()
+	limit := defaultMonitorResultsLimit
+	if raw := query.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxMonitorResultsLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be 1 to %d", maxMonitorResultsLimit))
+			return
+		}
+		limit = n
+	}
+	allow := func(nodeID string) bool { return rbac.Allows(p.Principal, "monitor:read", nodeID) }
+	var visible []store.MonitorResultRecord
+	var err error
+	if query.Has("node_id") {
+		// One pair's history. An empty node_id names a tls monitor's pair.
+		nodeID := query.Get("node_id")
+		if !allow(nodeID) {
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+			return
+		}
+		visible, err = s.store.MonitorPairResults(monitorID, nodeID, limit)
+	} else {
+		visible, err = s.store.RecentMonitorResults(monitorID, limit, allow)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, visible)
+}
+
+// monitorLatestViews is the latest list for one monitor: the pairs still
+// assigned to it that the caller may read. A node taken off a monitor keeps
+// its rows until the monitor is deleted, but its last reading is no longer
+// what the monitor is doing.
+func monitorLatestViews(p principal, mon model.Monitor, pairs []store.MonitorLatest) []monitorLatestView {
+	out := make([]monitorLatestView, 0, len(pairs))
+	for _, pair := range pairs {
+		if !monitorPairAssigned(mon, pair.NodeID) || !rbac.Allows(p.Principal, "monitor:read", pair.NodeID) {
+			continue
+		}
+		out = append(out, toMonitorLatestView(pair))
+	}
+	return out
+}
+
+func monitorPairAssigned(mon model.Monitor, nodeID string) bool {
+	if mon.Type == model.MonitorTypeTLS {
+		return nodeID == ""
+	}
+	return nodeID != "" && (mon.AssignAll || slices.Contains(mon.NodeIDs, nodeID))
 }
 
 func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {

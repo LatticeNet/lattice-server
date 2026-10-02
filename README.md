@@ -502,7 +502,11 @@ Use the compose file and deployment guide in the umbrella repository:
 - PAT server allowlists are enforced against the actual node resources in request
   bodies, not only URL query parameters.
 - Node/task/monitor/DDNS/tunnel list APIs return only resources visible to the
-  caller's scopes and server allowlist.
+  caller's scopes and server allowlist. `GET /api/monitors` carries each
+  assigned node's newest result as `latest` (with `fail_streak` and `since`),
+  filtered the same way, and `GET /api/monitors/results` returns the newest
+  500 results across nodes by default, or one node's with `node_id`, up to
+  `limit` (at most 2000).
 - Control-plane task views expose script hash and byte size, not the full script
   body or agent-only lease credential.
 - Task read and run permissions are split: `task:read` lists task metadata and

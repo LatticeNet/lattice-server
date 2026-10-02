@@ -114,13 +114,23 @@ func (s *Server) usageIngest(ctx *usageAttributionContext, snapshot, previous mo
 			ub.Uplink += c.Uplink
 			ub.Downlink += c.Downlink
 			line.Users[row.UserID] = ub
+			// The rule that counted the row says whether its bytes are
+			// proven to be this identity's. A binding row gives the whole
+			// inbound to the one identity bound to it, so it is counted
+			// toward the quota but not as proof.
+			proof := int64(0)
+			if row.AttributionProof == usageProofProof {
+				proof = c.total()
+			}
 			u := out.dayUser(row.UserID, day)
 			u.Uplink += c.Uplink
 			u.Downlink += c.Downlink
+			u.Proof += proof
 			u.LastSeenAt = now
 			bl := u.ByLine[row.LineHashID]
 			bl.Uplink += c.Uplink
 			bl.Downlink += c.Downlink
+			bl.Proof += proof
 			bl.LastSeenAt = now
 			u.ByLine[row.LineHashID] = bl
 			if row.Attribution != usageAttributionNamed {
@@ -164,10 +174,12 @@ func (s *Server) usageIngest(ctx *usageAttributionContext, snapshot, previous mo
 				u := out.dayUser(userID, day)
 				u.Uplink += c.Uplink
 				u.Downlink += c.Downlink
+				u.Proof += c.total()
 				u.LastSeenAt = now
 				bl := u.ByLine[hash]
 				bl.Uplink += c.Uplink
 				bl.Downlink += c.Downlink
+				bl.Proof += c.total()
 				bl.LastSeenAt = now
 				u.ByLine[hash] = bl
 			}
@@ -180,7 +192,9 @@ func (s *Server) usageIngest(ctx *usageAttributionContext, snapshot, previous mo
 		attribute(f.Line.Tag, f, usageLineTraffic{Inbound: total, Named: namedByLine[hash]})
 	}
 
-	// Legacy path: users whose bytes arrived without a direction.
+	// Legacy path: users whose bytes arrived without a direction. Each is a
+	// per-user counter the node keeps under that user's own name, which is
+	// proof in the same sense a named counter is.
 	for acct, delta := range legacyDelta {
 		if delta <= 0 || out.Split[acct] {
 			continue
@@ -191,11 +205,13 @@ func (s *Server) usageIngest(ctx *usageAttributionContext, snapshot, previous mo
 		}
 		u := out.dayUser(userID, day)
 		u.Downlink += delta
+		u.Proof += delta
 		u.LastSeenAt = now
 		for hash, byUser := range lineUserDelta {
 			if v := byUser[acct]; v > 0 {
 				bl := u.ByLine[hash]
 				bl.Downlink += v
+				bl.Proof += v
 				bl.LastSeenAt = now
 				u.ByLine[hash] = bl
 			}

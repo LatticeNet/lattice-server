@@ -604,6 +604,13 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		}
 	}
 
+	// Step 17d: the paged offline spell. Left behind, a node enrolled again
+	// under the same id would announce a recovery from a page it never got.
+	// Not counted in the report: it is alert bookkeeping, not node data.
+	if mutate {
+		delete(s.state.NodeOfflineAlerts, nodeID)
+	}
+
 	// Step 18: the node itself (embedded TokenHash/Metrics/HostFacts/Geo/etc all
 	// purged with the record).
 	if mutate {

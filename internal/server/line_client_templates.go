@@ -320,26 +320,40 @@ func lineClientEndpoint(ln Line, reportedHost string, reportedPort int) (string,
 
 // syncLineClientTemplates brings the stored templates in line with every live
 // node's adopted lines: each discovered line whose protocol takes per-line
-// users and whose share URL yields a credential-free template. A node whose
-// inventory is not live, or reported an error, keeps the templates it has.
-// It writes only when a template changed.
+// users and whose share URL yields a credential-free template. It writes only
+// when a template changed.
+//
+// What it does not know, it keeps. A node whose inventory is not live, or
+// reported an error, keeps all its templates. A live node that lists a line
+// but gives no usable share URL for it this time (empty, or one the builder
+// refuses) keeps that line's template; only a line the node no longer lists
+// loses its template.
+//
+// A changed template replaces the stored one only once two consecutive syncs
+// build the same new value. The fork falls back from its IPv4 lookup to IPv6
+// when the lookup fails, so a node's share host can flip between families
+// and back; without the second sighting each flip would rewrite the state
+// file. A template change follows an operator's edit to a line, so a minute
+// more of lag costs nothing. A line with no stored template takes its first
+// one at once.
 func (s *Server) syncLineClientTemplates(now time.Time) error {
+	s.lineTemplateSyncMu.Lock()
+	defer s.lineTemplateSyncMu.Unlock()
 	byNode := map[string][]store.LineClientTemplate{}
-	shareURLs := map[[2]string]string{} // (node, tag) -> share_url
+	listed := map[[2]string]string{} // (node, tag) -> share_url, "" when it gave none
 	for _, inv := range s.liveSingBoxInventories(now) {
 		if inv.Status != "" && inv.Status != "ok" {
 			continue
 		}
 		byNode[inv.NodeID] = []store.LineClientTemplate{}
 		for _, n := range inv.Nodes {
-			if n.ShareURL != "" {
-				shareURLs[[2]string{inv.NodeID, n.Name}] = n.ShareURL
-			}
+			listed[[2]string{inv.NodeID, n.Name}] = n.ShareURL
 		}
 	}
 	if len(byNode) == 0 {
 		return nil
 	}
+	pending := map[string]store.LineClientTemplate{}
 	groups, _ := s.lineReadModel()
 	for _, group := range groups {
 		if _, live := byNode[group.NodeID]; !live {
@@ -349,24 +363,55 @@ func (s *Server) syncLineClientTemplates(now time.Time) error {
 			if ln.Managed || ln.Source != "discovered" || !lineUserProtocols[strings.ToLower(strings.TrimSpace(ln.Type))] {
 				continue
 			}
-			shareURL, ok := shareURLs[[2]string{ln.NodeID, ln.Tag}]
+			shareURL, ok := listed[[2]string{ln.NodeID, ln.Tag}]
 			if !ok {
 				continue
 			}
-			t, err := lineClientTemplateFromShareURL(shareURL, ln.Type)
-			if err != nil {
+			stored, hasStored := s.store.LineClientTemplate(ln.LineHashID)
+			hasStored = hasStored && stored.NodeID == ln.NodeID
+			t, built := lineClientTemplateForLine(ln, shareURL)
+			switch {
+			case !built && !hasStored:
 				continue
-			}
-			t.LineHashID, t.NodeID, t.Tag, t.LineUUID = ln.LineHashID, ln.NodeID, ln.Tag, ln.LineUUID
-			t.Host, t.Port = lineClientEndpoint(ln, t.Host, t.Port)
-			if store.ValidateLineClientTemplate(t) != nil {
-				continue
+			case !built:
+				// Listed, but nothing usable this time: keep what we have,
+				// under the name and uuid the line has now.
+				t = stored
+				t.Tag, t.LineUUID = ln.Tag, ln.LineUUID
+				if store.ValidateLineClientTemplate(t) != nil {
+					continue
+				}
+			case hasStored && !store.LineClientTemplateDurablyEqual(stored, t):
+				if seen, ok := s.lineTemplatePending[t.LineHashID]; !ok || !store.LineClientTemplateDurablyEqual(seen, t) {
+					pending[t.LineHashID] = t
+					t = stored
+				}
 			}
 			byNode[group.NodeID] = append(byNode[group.NodeID], t)
 		}
 	}
+	s.lineTemplatePending = pending
 	_, err := s.store.SyncLineClientTemplates(byNode, now)
 	return err
+}
+
+// lineClientTemplateForLine builds a line's template from the share URL its
+// node listed, at the endpoint a client dials. built is false when the URL is
+// empty or the builder refuses it.
+func lineClientTemplateForLine(ln Line, shareURL string) (store.LineClientTemplate, bool) {
+	if shareURL == "" {
+		return store.LineClientTemplate{}, false
+	}
+	t, err := lineClientTemplateFromShareURL(shareURL, ln.Type)
+	if err != nil {
+		return store.LineClientTemplate{}, false
+	}
+	t.LineHashID, t.NodeID, t.Tag, t.LineUUID = ln.LineHashID, ln.NodeID, ln.Tag, ln.LineUUID
+	t.Host, t.Port = lineClientEndpoint(ln, t.Host, t.Port)
+	if store.ValidateLineClientTemplate(t) != nil {
+		return store.LineClientTemplate{}, false
+	}
+	return t, true
 }
 
 // startLineClientTemplateSync keeps the templates in line with the read

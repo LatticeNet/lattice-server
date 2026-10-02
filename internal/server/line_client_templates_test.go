@@ -377,3 +377,129 @@ func TestSyncLineClientTemplatesFromTheReadModel(t *testing.T) {
 		t.Fatal("a node whose listing failed must keep its templates")
 	}
 }
+
+// templateSyncFixture is a server with one live node, node-t, whose sing-box
+// inventory the test sets with report.
+func templateSyncFixture(t *testing.T) (srv *Server, st *store.Store, now *time.Time, report func(...model.SingBoxNode)) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv = newLinemetaTestServer(t, st)
+	clock := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return clock }
+	if err := st.UpsertNode(model.Node{ID: "node-t", Name: "Node T"}); err != nil {
+		t.Fatal(err)
+	}
+	report = func(nodes ...model.SingBoxNode) {
+		srv.singboxInvMu.Lock()
+		srv.singboxInv = map[string]model.SingBoxInventory{"node-t": templateInventory(clock, nodes...)}
+		srv.singboxInvMu.Unlock()
+		srv.invalidateLineReadModel()
+	}
+	return srv, st, &clock, report
+}
+
+func realityTemplateNode(host string) model.SingBoxNode {
+	shareHost := host
+	if strings.Contains(host, ":") {
+		shareHost = "[" + host + "]"
+	}
+	return model.SingBoxNode{Name: "reality-443", Protocol: "vless", Network: "tcp", Address: host, Port: "443",
+		ShareURL: "vless://" + tmplOwnerUUID + "@" + shareHost + ":443?encryption=none&security=reality&flow=xtls-rprx-vision&type=tcp&sni=www.example.com&pbk=Zm9v&fp=chrome#lr00rl"}
+}
+
+// A live node that lists a line but gives no usable share URL for it this
+// time, empty or one the builder refuses, keeps that line's template. Only a
+// line the node stops listing loses it.
+func TestSyncLineClientTemplatesKeepsALineItCannotRebuild(t *testing.T) {
+	srv, st, now, report := templateSyncFixture(t)
+	good := realityTemplateNode("203.0.113.5")
+	report(good)
+	if err := srv.syncLineClientTemplates(*now); err != nil {
+		t.Fatal(err)
+	}
+	line := findLine(t, srv.buildLineGroups(), "node-t", "reality-443")
+	want, ok := st.LineClientTemplate(line.LineHashID)
+	if !ok {
+		t.Fatal("the first sync must store the template")
+	}
+	for name, shareURL := range map[string]string{
+		"empty share url":    "",
+		"refused share url":  "trojan://" + tmplOwnerPass + "@203.0.113.5:443?type=tcp",
+		"unparseable":        "vless://%zz",
+		"credential in path": "vless://" + tmplOwnerUUID + "@203.0.113.5:443?security=tls&type=ws&path=/" + tmplOwnerUUID,
+	} {
+		*now = now.Add(time.Minute)
+		broken := good
+		broken.ShareURL = shareURL
+		report(broken)
+		if err := srv.syncLineClientTemplates(*now); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := st.LineClientTemplate(line.LineHashID); !ok || !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s: a listed line must keep its template: %+v ok=%v", name, got, ok)
+		}
+	}
+	*now = now.Add(time.Minute)
+	report()
+	if err := srv.syncLineClientTemplates(*now); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := st.LineClientTemplate(line.LineHashID); ok {
+		t.Fatal("a line the node no longer lists must lose its template")
+	}
+}
+
+// A changed template is stored only once two consecutive syncs build it, so a
+// share host that flips between address families and back writes nothing,
+// while a change that holds lands one sync later.
+func TestSyncLineClientTemplatesConfirmsAChangeBeforeStoringIt(t *testing.T) {
+	srv, st, now, report := templateSyncFixture(t)
+	t0 := *now
+	report(realityTemplateNode("203.0.113.5"))
+	if err := srv.syncLineClientTemplates(*now); err != nil {
+		t.Fatal(err)
+	}
+	line := findLine(t, srv.buildLineGroups(), "node-t", "reality-443")
+	stored := func() store.LineClientTemplate {
+		t.Helper()
+		got, ok := st.LineClientTemplate(line.LineHashID)
+		if !ok {
+			t.Fatal("template missing")
+		}
+		return got
+	}
+	if got := stored(); got.Host != "203.0.113.5" || !got.UpdatedAt.Equal(t0) {
+		t.Fatalf("a new line takes its template at once: %+v", got)
+	}
+	// Flapping: v6, v4, v6, v4. No sync sees the same new value twice in a
+	// row, so nothing is written.
+	for i, host := range []string{"2001:db8::5", "203.0.113.5", "2001:db8::5", "203.0.113.5"} {
+		*now = now.Add(time.Minute)
+		report(realityTemplateNode(host))
+		if err := srv.syncLineClientTemplates(*now); err != nil {
+			t.Fatal(err)
+		}
+		if got := stored(); got.Host != "203.0.113.5" || !got.UpdatedAt.Equal(t0) {
+			t.Fatalf("flap %d to %s: %+v", i, host, got)
+		}
+	}
+	// A change that holds: held at the first sighting, stored at the second.
+	*now = now.Add(time.Minute)
+	report(realityTemplateNode("198.51.100.7"))
+	if err := srv.syncLineClientTemplates(*now); err != nil {
+		t.Fatal(err)
+	}
+	if got := stored(); got.Host != "203.0.113.5" {
+		t.Fatalf("first sighting of a change must not store it: %+v", got)
+	}
+	*now = now.Add(time.Minute)
+	if err := srv.syncLineClientTemplates(*now); err != nil {
+		t.Fatal(err)
+	}
+	if got := stored(); got.Host != "198.51.100.7" || !got.UpdatedAt.Equal(*now) {
+		t.Fatalf("a change seen twice in a row must be stored: %+v", got)
+	}
+}

@@ -406,6 +406,12 @@ type Server struct {
 	// simply repopulates it from the next round of reports.
 	singboxInvMu sync.RWMutex
 	singboxInv   map[string]model.SingBoxInventory
+	// lineTemplateSyncMu serialises syncLineClientTemplates, and
+	// lineTemplatePending holds, per line hash, a changed template seen at
+	// one sync and not yet confirmed by the next (syncLineClientTemplates
+	// says why). In memory only: a restart costs one more minute of lag.
+	lineTemplateSyncMu  sync.Mutex
+	lineTemplatePending map[string]store.LineClientTemplate
 	// singboxDiscoverAudit tracks the last audited discovery fingerprint per
 	// node so automatic inventory reports do not append an audit row, and
 	// therefore rewrite the encrypted JSON store, on every agent poll.

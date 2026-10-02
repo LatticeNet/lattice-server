@@ -5,10 +5,10 @@ import "fmt"
 // Plan linting exists here rather than being borrowed from netguard because
 // the two are calibrated on opposite assumptions.
 //
-// netguard's acceptsAnyPort is deliberately generous: any accept rule mentioning
-// a management port counts as a way in, and it never looks at the rule's source.
-// That generosity is defensible where accepts are broad, and its own comment
-// says so. Knocking inverts the premise. Under a knock policy the normal state
+// netguard's lockout walk is deliberately generous: any accept rule mentioning
+// a management port counts as a way in unless a drop ahead of it matches all of
+// it, and a source restriction alone never disqualifies it. That generosity is
+// defensible where accepts are broad, and its own comment says so. Knocking inverts the premise. Under a knock policy the normal state
 // of the management port is closed, and acceptance is conditional on a set whose
 // membership is empty until someone knocks. Handed a knock ruleset, netguard's
 // lint would report a way in that does not exist yet, turning an occasional
@@ -91,6 +91,12 @@ type NodeReality struct {
 	// from it, or the node reports one. A binding record on its own is not
 	// enough; an observe-only binding describes nothing on the node.
 	ManagedByNetGuard bool
+	// GuardAcceptsTCP, when set, answers for one port whether that guard
+	// ruleset accepts a new tcp connection, walking it first match wins, so a
+	// drop rendered ahead of an accept counts. It takes the place of the two
+	// fields below, which describe accepts and cannot see a drop. Only
+	// meaningful when ManagedByNetGuard is true.
+	GuardAcceptsTCP func(port int) bool
 	// GuardAcceptedTCPPorts is what that guard ruleset would accept. Only
 	// meaningful when ManagedByNetGuard is true.
 	GuardAcceptedTCPPorts []int
@@ -162,13 +168,17 @@ func LintProfile(p Profile, r NodeReality) []Finding {
 		}
 	}
 
-	if r.ManagedByNetGuard && r.GuardPolicyDrop && !r.GuardAcceptsAllTCP {
+	if r.ManagedByNetGuard && r.GuardPolicyDrop && (r.GuardAcceptsTCP != nil || !r.GuardAcceptsAllTCP) {
 		accepted := make(map[int]bool, len(r.GuardAcceptedTCPPorts))
 		for _, port := range r.GuardAcceptedTCPPorts {
 			accepted[port] = true
 		}
 		for _, port := range gated {
-			if !accepted[port] {
+			ok := accepted[port]
+			if r.GuardAcceptsTCP != nil {
+				ok = r.GuardAcceptsTCP(port)
+			}
+			if !ok {
 				findings = append(findings, Finding{
 					Code: FindingOverriddenByGuard, Severity: SeverityBlock,
 					Message: fmt.Sprintf("this node's lattice_guard ruleset is policy drop and does not accept tcp/%d. An accept in the knock table does not let a packet skip lattice_guard, so knocking would appear to succeed and the connection would still never open. Open tcp/%d in netguard first.", port, port),

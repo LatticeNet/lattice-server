@@ -311,6 +311,14 @@ func managementPathOpen(plan network.NFTPlan, ports []int) (bool, []string) {
 	return false, shadowedBy
 }
 
+// AcceptsTCPPort reports whether the rendered chain, walked first match wins
+// the way managementPathOpen walks it, can accept a new inbound tcp
+// connection on port. SSH Guard asks it about the ports a knock profile gates.
+func AcceptsTCPPort(plan network.NFTPlan, port int) bool {
+	open, _ := managementPathOpen(plan, []int{port})
+	return open
+}
+
 // matchesTCPPort reports whether a rule can match a new tcp connection to port.
 func matchesTCPPort(rule network.NFTInputRule, port int) bool {
 	switch rule.Protocol {

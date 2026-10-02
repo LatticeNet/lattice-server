@@ -113,22 +113,25 @@ func toNotifyWebhookView(h store.NotifyWebhook) notifyWebhookView {
 	}
 }
 
-// refuseConfinedWebhookRead refuses a node-restricted principal on the webhook
-// read surface.
+// refuseConfinedNotifyRead refuses a node-restricted principal on the notify
+// read surface: webhooks, their delivery history, the outbox's deliveries and
+// the channel list with its health.
 //
-// The write side already refuses these principals, on the grounds that a webhook
-// routes fleet-wide events outward and a node-confined token minting one is a
-// cross-node escape. The read side has the same problem and cannot be solved the
-// usual way: a webhook has no node field, so unlike a monitor or a log source
-// there is nothing to filter on. A confined principal reading this surface gets
-// every webhook in the fleet, and from the delivery history the rendered message
-// content and the external caller addresses too.
+// The write side already refuses these principals, on the grounds that the
+// notify fabric routes fleet-wide events outward and a node-confined token
+// shaping it is a cross-node escape. The read side has the same problem and
+// cannot be solved the usual way: a webhook, a channel and a delivery have no
+// node field, so unlike a monitor or a log source there is nothing to filter
+// on. A confined principal reading this surface gets every webhook in the
+// fleet, the rendered message of every delivery (ssh.login and
+// ssh.compromise_suspected carry usernames and source addresses for every
+// node) and the external caller addresses too.
 //
-// Since such a principal cannot author, edit, rotate or delete a webhook anyway,
+// Since such a principal cannot author, edit, rotate or delete any of these,
 // a read-only window onto all of them is exposure with no workflow behind it.
 // This matches the reasoning requireGlobalProxyScope already applies to
 // subscription shares, which are fleet-wide objects for the same reason.
-func (s *Server) refuseConfinedWebhookRead(w http.ResponseWriter, p principal, action string) bool {
+func (s *Server) refuseConfinedNotifyRead(w http.ResponseWriter, p principal, action string) bool {
 	if !principalHasNodeRestriction(p) {
 		return false
 	}
@@ -139,7 +142,7 @@ func (s *Server) refuseConfinedWebhookRead(w http.ResponseWriter, p principal, a
 		Decision: "deny",
 		Reason:   "fleet-wide read refused for a node-restricted token",
 	})
-	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "a webhook is a fleet-wide object with no node to confine it to; it requires a token without a server allowlist restriction"))
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "notification history is fleet-wide with no node to confine it to; it requires a token without a server allowlist restriction"))
 	return true
 }
 
@@ -152,7 +155,7 @@ func (s *Server) refuseConfinedWebhookRead(w http.ResponseWriter, p principal, a
 func (s *Server) handleNotifyWebhooks(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
-		if s.refuseConfinedWebhookRead(w, p, "notify.webhook.list") {
+		if s.refuseConfinedNotifyRead(w, p, "notify.webhook.list") {
 			return
 		}
 		hooks := s.store.NotifyWebhooks()
@@ -303,7 +306,7 @@ func (s *Server) handleNotifyWebhookDeliveries(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
 	}
-	if s.refuseConfinedWebhookRead(w, p, "notify.webhook.deliveries") {
+	if s.refuseConfinedNotifyRead(w, p, "notify.webhook.deliveries") {
 		return
 	}
 	webhookID := strings.TrimSpace(r.URL.Query().Get("id"))

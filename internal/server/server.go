@@ -1211,6 +1211,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
 	mux.HandleFunc("/api/notify/channels", s.withAuth("notify:admin", s.handleNotifyChannels))
 	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:admin", s.handleDeleteNotifyChannel))
+	mux.HandleFunc("/api/notify/channels/test", s.withAuth("notify:admin", s.handleNotifyChannelTest))
+	mux.HandleFunc("/api/notify/deliveries", s.withAuth("notify:admin", s.handleNotifyDeliveries))
 	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:admin", s.handleNotifyRules))
 	mux.HandleFunc("/api/notify/rules/delete", s.withAuth("notify:admin", s.handleDeleteNotifyRule))
 	mux.HandleFunc("/api/notify/webhooks", s.withAuth("notify:admin", s.handleNotifyWebhooks))
@@ -5196,24 +5198,34 @@ type notifyChannelView struct {
 	Enabled    bool      `json:"enabled"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// Health is joined from the outbox's health record at read time; it is
+	// never part of the stored channel.
+	Health notifyChannelHealthView `json:"health"`
 }
 
-func toNotifyChannelView(c model.NotifyChannel) notifyChannelView {
+func toNotifyChannelView(c model.NotifyChannel, h store.NotifyChannelHealth, now time.Time) notifyChannelView {
 	keys := make([]string, 0, len(c.Config))
 	for k := range c.Config {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt}
+	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt, Health: toNotifyChannelHealthView(h, now)}
 }
 
 func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
+		// The list carries each channel's delivery health, which is notify
+		// history, so it is guarded like the rest of that surface.
+		if s.refuseConfinedNotifyRead(w, p, "notify.channel.list") {
+			return
+		}
 		channels := s.store.NotifyChannels()
+		health := s.store.NotifyChannelHealths()
+		now := s.now()
 		views := make([]notifyChannelView, 0, len(channels))
 		for _, c := range channels {
-			views = append(views, toNotifyChannelView(c))
+			views = append(views, toNotifyChannelView(c, health[c.ID], now))
 		}
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
@@ -5271,7 +5283,8 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			action = "notify.channel.update"
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
-		writeJSON(w, http.StatusOK, toNotifyChannelView(channel))
+		health, _ := s.store.NotifyChannelHealth(channel.ID)
+		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, s.now()))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -5302,7 +5315,13 @@ func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"rules": s.store.NotifyRules()})
+		rules := s.store.NotifyRules()
+		opts := s.store.NotifyRuleOptionsByRule()
+		views := make([]notifyRuleView, 0, len(rules))
+		for _, rule := range rules {
+			views = append(views, toNotifyRuleView(rule, opts[rule.ID]))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"rules": views})
 	case http.MethodPost:
 		if s.refuseConfinedFleetWrite(w, p, "notify.rule.upsert", "notify:admin") {
 			return
@@ -5315,11 +5334,15 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			TitleTemplate string   `json:"title_template"`
 			BodyTemplate  string   `json:"body_template"`
 			Enabled       *bool    `json:"enabled"`
+			// FallbackChannelID is absent to keep the rule's current fallback,
+			// empty to clear it, or a channel id.
+			FallbackChannelID *string `json:"fallback_channel_id"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
 		}
-		rule, err := normalizeNotifyRule(req.ID, req.Name, req.EventTypes, req.ChannelIDs, req.TitleTemplate, req.BodyTemplate, req.Enabled, s.store.NotifyChannels())
+		channels := s.store.NotifyChannels()
+		rule, err := normalizeNotifyRule(req.ID, req.Name, req.EventTypes, req.ChannelIDs, req.TitleTemplate, req.BodyTemplate, req.Enabled, channels)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -5332,12 +5355,24 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 				}
 			}
 		}
-		if err := s.store.UpsertNotifyRule(rule); err != nil {
+		opts := s.store.NotifyRuleOptionsByRule()[rule.ID]
+		if req.FallbackChannelID != nil {
+			opts.FallbackChannelID = strings.TrimSpace(*req.FallbackChannelID)
+		}
+		if err := validateNotifyFallback(opts.FallbackChannelID, rule, channels); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertNotifyRuleWithOptions(rule, opts); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: map[string]string{"rule_id": rule.ID}})
-		writeJSON(w, http.StatusOK, rule)
+		metadata := map[string]string{"rule_id": rule.ID}
+		if opts.FallbackChannelID != "" {
+			metadata["fallback_channel_id"] = opts.FallbackChannelID
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: metadata})
+		writeJSON(w, http.StatusOK, toNotifyRuleView(rule, opts))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}

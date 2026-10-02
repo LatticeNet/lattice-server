@@ -265,7 +265,7 @@ func TestFailingChannelIsAnnouncedOnAnotherChannel(t *testing.T) {
 		}
 	}
 	h, _ := st.NotifyChannelHealth("nc-urgent")
-	if h.ConsecutiveFailures != 4 || !h.Announced || !notifyChannelFailing(h, time.Now()) {
+	if h.ConsecutiveFailures != 4 || !h.Announced || notifyChannelHealthState(h, time.Now()) != notifyHealthFailing {
 		t.Fatalf("health = %+v", h)
 	}
 

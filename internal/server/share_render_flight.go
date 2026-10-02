@@ -14,6 +14,20 @@ import (
 // clients waiting on the same render.
 const shareRenderTimeout = 2 * time.Minute
 
+// A link's cache misses spend plugin renders, and the variant space one valid
+// link can ask for is large (fourteen targets, two produce flags, the agent
+// classes and the formats), against a plugin pool of two workers and one
+// cache shared by every link. Each link gets a render budget: a burst of
+// shareRenderBudgetBurst and shareRenderBudgetPerHour after that. A request
+// that would start a render past it answers the decoy; requests that join a
+// running render or hit the cache spend nothing. The figures leave an
+// ordinary link (a few client families, content that moves a few times an
+// hour) far inside the budget.
+const (
+	shareRenderBudgetBurst   = 40
+	shareRenderBudgetPerHour = 60
+)
+
 // shareRenderOutcome is what one render produced: either an entry to serve,
 // or the refusal reason every waiter answers with the decoy.
 type shareRenderOutcome struct {
@@ -42,6 +56,10 @@ func (s *Server) renderShareShared(ctx context.Context, share model.Subscription
 	}
 	flight := s.shareRenderFlights[key]
 	if flight == nil {
+		if s.shareRenderBudget != nil && !s.shareRenderBudget.Allow(share.ID) {
+			s.shareRenderMu.Unlock()
+			return shareRenderOutcome{deny: "subscription_render_budget_exhausted"}
+		}
 		flight = &shareRenderFlight{done: make(chan struct{})}
 		s.shareRenderFlights[key] = flight
 		go func() {

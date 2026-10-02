@@ -268,3 +268,61 @@ func TestOutageRetriesDoNotRepublishTheStaleBody(t *testing.T) {
 		t.Fatalf("fetches = %d, renders = %d (after first %d); retries must not re-render", fetches.Load(), renders.Load(), rendersAfterFirst)
 	}
 }
+
+// One valid link can ask for dozens of variants, each a plugin render on a
+// pool of two workers. Past its render budget a link's new variants answer
+// the decoy, while what is already cached keeps being served and other links
+// are untouched.
+func TestALinkCannotSpendRendersPastItsBudget(t *testing.T) {
+	s, st, path := flightShareServer(t)
+	now := s.now()
+	s.now = func() time.Time { return now }
+	var renders atomic.Int64
+	s.subscriptionRender = flightRender(s, &renders, nil)
+	otherToken := strings.Repeat("o", 32)
+	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s2", Slug: "other", Token: otherToken, Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "rec"}})
+
+	var variants []string
+	for target := range subscriptionShareTargets {
+		for _, flags := range []string{"", "&includeUnsupportedProxy=1", "&prettyYaml=1", "&includeUnsupportedProxy=1&prettyYaml=1"} {
+			variants = append(variants, "?target="+target+flags)
+		}
+	}
+	fetch := func(p string) int {
+		rec := httptest.NewRecorder()
+		s.handleSubscriptionShare(rec, shareRequest(p, "curl/8"))
+		return rec.Code
+	}
+	for i := 0; i < shareRenderBudgetBurst; i++ {
+		if code := fetch(path + variants[i]); code != http.StatusOK {
+			t.Fatalf("variant %d inside the budget answered %d", i, code)
+		}
+	}
+	if code := fetch(path + variants[shareRenderBudgetBurst]); code != http.StatusNotFound {
+		t.Fatalf("a render past the budget answered %d, want the decoy", code)
+	}
+	if code := fetch(path + variants[0]); code != http.StatusOK {
+		t.Fatalf("a cached variant answered %d once the budget was spent", code)
+	}
+	if code := fetch("/sub/other/" + otherToken + variants[shareRenderBudgetBurst]); code != http.StatusOK {
+		t.Fatalf("another link answered %d; budgets are per link", code)
+	}
+	now = now.Add(time.Hour / shareRenderBudgetPerHour)
+	if code := fetch(path + variants[shareRenderBudgetBurst]); code != http.StatusOK {
+		t.Fatalf("the budget did not refill: %d", code)
+	}
+	if want := int64(shareRenderBudgetBurst + 2); renders.Load() != want {
+		t.Fatalf("renders = %d, want %d", renders.Load(), want)
+	}
+	s.shareRefusalAudits.Wait()
+	found := false
+	for _, ev := range st.AuditEvents() {
+		if ev.Decision == "deny" && ev.Reason == "subscription_render_budget_exhausted" && ev.Metadata["share_id"] == "s1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the exhausted budget was not audited")
+	}
+}

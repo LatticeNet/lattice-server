@@ -241,9 +241,12 @@ type Server struct {
 	// remembers which client families fetched each link; see
 	// share_fetch_stats.go. shareFetchAudits counts its audit writes still in
 	// flight.
-	shareFetchStats       *shareFetchStats
-	shareFetchAudits      sync.WaitGroup
-	shareFetchAuditHook   func()
+	shareFetchStats     *shareFetchStats
+	shareFetchAudits    sync.WaitGroup
+	shareFetchAuditHook func()
+	// shareRenderBudget bounds the plugin renders one link's cache misses
+	// may start; see share_render_flight.go.
+	shareRenderBudget     *ratelimit.Limiter
 	shareRenderMu         sync.Mutex
 	shareRenderFlights    map[subscriptionCacheKey]*shareRenderFlight
 	shareRenderJoinWaiter chan struct{}
@@ -628,6 +631,10 @@ func New(opts Options) (*Server, error) {
 	if s.reminderInterval <= 0 {
 		s.reminderInterval = time.Hour
 	}
+	s.shareRenderBudget = ratelimit.New(ratelimit.Config{
+		Rate: shareRenderBudgetPerHour / 3600.0, Burst: shareRenderBudgetBurst, TTL: 2 * time.Hour,
+		Now: func() time.Time { return s.now() },
+	})
 	if s.taskExecutionDisabled {
 		s.logger.Printf("WARNING: task execution fleet kill switch is enabled; new tasks will not queue and agents will receive no task leases")
 	}

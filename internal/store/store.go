@@ -111,6 +111,7 @@ type State struct {
 	GuardRealitySnapshots   map[string]GuardRealitySnapshot     `json:"guard_reality_snapshots"`
 	SingBoxLiveness         map[string]SingBoxLiveness          `json:"singbox_liveness"`
 	NodeOfflineAlerts       map[string]time.Time                `json:"node_offline_alerts,omitempty"`
+	LineClientTemplates     map[string]LineClientTemplate       `json:"line_client_templates,omitempty"`
 	DNSDeployments          map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies             map[string]model.NetPolicy          `json:"net_policies"`
 	Groups                  map[string]model.Group              `json:"groups"`
@@ -823,6 +824,7 @@ func emptyState() State {
 		GuardRealitySnapshots:   map[string]GuardRealitySnapshot{},
 		SingBoxLiveness:         map[string]SingBoxLiveness{},
 		NodeOfflineAlerts:       map[string]time.Time{},
+		LineClientTemplates:     map[string]LineClientTemplate{},
 		DNSDeployments:          map[string]model.DNSDeployment{},
 		NetPolicies:             map[string]model.NetPolicy{},
 		Groups:                  map[string]model.Group{},
@@ -978,6 +980,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NodeOfflineAlerts == nil {
 		st.NodeOfflineAlerts = map[string]time.Time{}
+	}
+	if st.LineClientTemplates == nil {
+		st.LineClientTemplates = map[string]LineClientTemplate{}
 	}
 	if st.DNSDeployments == nil {
 		st.DNSDeployments = map[string]model.DNSDeployment{}

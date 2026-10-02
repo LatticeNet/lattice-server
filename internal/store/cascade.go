@@ -611,6 +611,18 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		delete(s.state.NodeOfflineAlerts, nodeID)
 	}
 
+	// Step 17e: the node's line client templates. They outlive a silent node
+	// on purpose, so nothing else removes them; left behind, a subscription
+	// could still offer a deleted node's endpoint. Not counted: they are a
+	// derived copy of what the node reported, not node data of their own.
+	if mutate {
+		for hash, t := range s.state.LineClientTemplates {
+			if t.NodeID == nodeID {
+				delete(s.state.LineClientTemplates, hash)
+			}
+		}
+	}
+
 	// Step 18: the node itself (embedded TokenHash/Metrics/HostFacts/Geo/etc all
 	// purged with the record).
 	if mutate {

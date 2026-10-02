@@ -64,6 +64,7 @@ var (
 	boltBucketGuardReality     = []byte("guard_reality_snapshots")
 	boltBucketSingBoxLiveness  = []byte("singbox_liveness")
 	boltBucketNodeOfflineAlert = []byte("node_offline_alerts")
+	boltBucketLineTemplates    = []byte("line_client_templates")
 	boltBucketDNSDeployments   = []byte("dns_deployments")
 	boltBucketNetPolicies      = []byte("net_policies")
 	boltBucketGroups           = []byte("groups")
@@ -167,6 +168,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketGuardReality,
 	boltBucketSingBoxLiveness,
 	boltBucketNodeOfflineAlert,
+	boltBucketLineTemplates,
 	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
 	boltBucketGroups,
@@ -486,6 +488,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putMap(tx, boltBucketNodeOfflineAlert, persist.NodeOfflineAlerts); err != nil {
 			return err
 		}
+		if err := putMap(tx, boltBucketLineTemplates, persist.LineClientTemplates); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketGuardReality, persist.GuardRealitySnapshots); err != nil {
 			return err
 		}
@@ -729,6 +734,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		if err := readMap(tx, boltBucketNodeOfflineAlert, st.NodeOfflineAlerts); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketLineTemplates, st.LineClientTemplates); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketGuardReality, st.GuardRealitySnapshots); err != nil {

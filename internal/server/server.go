@@ -686,6 +686,7 @@ func New(opts Options) (*Server, error) {
 		s.startDDNSSweep()
 		s.startTLSMonitorSweep()
 		s.startShareRefusalAuditFlush()
+		s.startLineClientTemplateSync()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()

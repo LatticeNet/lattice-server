@@ -28,12 +28,15 @@ type shareBody struct {
 	hash     [sha256.Size]byte
 }
 
-// newShareBody digests a body and compresses it when that is worth it.
-func newShareBody(body []byte) shareBody {
+// newShareBody digests a body and, when compress is set and it is worth it,
+// compresses it. A body that will be cached is compressed once, as hard as
+// gzip goes; one rendered for a single response is compressed only for a
+// client that accepts gzip, at the default level.
+func newShareBody(body []byte, compress bool, level int) shareBody {
 	out := shareBody{body: body, hash: sha256.Sum256(body)}
-	if len(body) >= shareGzipMinBytes {
+	if compress && len(body) >= shareGzipMinBytes {
 		var buf bytes.Buffer
-		zw, err := gzip.NewWriterLevel(&buf, gzip.BestCompression)
+		zw, err := gzip.NewWriterLevel(&buf, level)
 		if err == nil {
 			_, werr := zw.Write(body)
 			if cerr := zw.Close(); werr == nil && cerr == nil && buf.Len() < len(body) {

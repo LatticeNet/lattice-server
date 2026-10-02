@@ -149,18 +149,16 @@ func shareFetchSummaryEvent(h *shareFetchHour, partial bool) model.AuditEvent {
 
 // noteShareFetch counts a successful fetch after the response was written.
 // Any audit it causes is built here, from the request, and written on its
-// own goroutine, so the handler never waits on the audit store.
-func (s *Server) noteShareFetch(r *http.Request, f shareFetch, firstSeenMeta map[string]string) {
+// own goroutine, so the handler never waits on the audit store. The
+// first-seen metadata is built only when it is needed.
+func (s *Server) noteShareFetch(r *http.Request, f shareFetch, firstSeenMeta func() map[string]string) {
 	firstSeen, closed := s.shareFetchStats.record(s.now(), f)
 	var events []model.AuditEvent
 	if closed != nil {
 		events = append(events, shareFetchSummaryEvent(closed, false))
 	}
 	if firstSeen {
-		md := make(map[string]string, len(firstSeenMeta)+1)
-		for k, v := range firstSeenMeta {
-			md[k] = v
-		}
+		md := firstSeenMeta()
 		md["source_ip"] = s.clientIP(r)
 		events = append(events, model.AuditEvent{ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
 			Reason: shareFetchFirstSeenReason, Metadata: md, CorrelationID: requestIDFromRequest(r)})

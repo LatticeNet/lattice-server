@@ -1,6 +1,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -422,8 +423,8 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	}
 	setLinkClientHeaders(w.Header(), share.Slug, shareUpdateIntervalHours(share))
 	body := shareBody{body: served.body, gzipBody: served.gzipBody, hash: served.bodyHash}
-	if body.hash == ([32]byte{}) {
-		body = newShareBody(served.body)
+	if body.hash == ([32]byte{}) || (body.gzipBody == nil && share.Source.Kind != model.ShareSourcePlugin) {
+		body = newShareBody(served.body, acceptsGzip(r), gzip.DefaultCompression)
 	}
 	// Answer first. Everything below runs after the client has its bytes.
 	notModified := writeShareBody(w, r, body, quota)
@@ -437,7 +438,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			metadata["source_version"] = sourceVersion
 		}
 		return metadata
-	}())
+	})
 }
 
 // subscriptionCacheSnapshotForSource linearizes plugin cache reads with source

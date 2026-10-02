@@ -39,9 +39,8 @@ func TestEveryApprovalPluginHasADecidedDecisionScope(t *testing.T) {
 	// An entry here is a decision, not an omission: it says the plugin has no
 	// domain of its own beyond the apply itself.
 	intentionallyBare := map[string]string{
-		"wireguard":              "mesh config carries no authority the apply scope does not already imply",
-		singBoxManagedLinePlugin: "managed lines are gated at authoring; the decision adds nothing",
-		lineChainPlugin:          "linechain decisions are gated by the durable-protocol capability check",
+		"wireguard":     "mesh config carries no authority the apply scope does not already imply",
+		lineChainPlugin: "linechain decisions are gated by the durable-protocol capability check",
 	}
 	for _, plugin := range approvalPlugins {
 		t.Run(plugin, func(t *testing.T) {
@@ -86,6 +85,36 @@ func TestEveryApprovalPluginHasADecidedApplyTimeout(t *testing.T) {
 			// value here can silently become the least generous one available.
 			if got > 600 {
 				t.Fatalf("%s asks for %ds; over 600 the agent falls back to 30s, so this asks for less than it looks", plugin, got)
+			}
+		})
+	}
+}
+
+// The decision verbs answer with the plan, so a plan that names proxy
+// identities may be decided only by a principal that may read it. A plugin
+// left out has to say why its plan carries nothing outside what its decider's
+// own scopes already cover.
+func TestEveryApprovalPluginHasADecidedDecisionReadGate(t *testing.T) {
+	nothingBeyondTheDecider := map[string]string{
+		"nft":                 "a firewall ruleset for the node, decided under netguard:admin or authored under network:plan",
+		"nftpolicy":           "netpolicy:admin both reads and decides it",
+		"wireguard":           "mesh config, whose other nodes approvalNodeReachAllows already checks",
+		"cftunnel":            "tunnel:admin both reads and decides it",
+		"selfdns":             "the node's resolver config, decided under dns:admin",
+		agentUpdatePlugin:     "a release and its checksum, decided under node:admin",
+		singBoxLineMetaPlugin: "line metadata, with no identities in it",
+		lineChainPlugin:       "line topology, with no identities in it",
+		sshGuardPlugin:        "the knock sequence, decided under sshguard:admin, which implies sshguard:read",
+	}
+	for _, plugin := range approvalPlugins {
+		t.Run(plugin, func(t *testing.T) {
+			names := approvalPlanNamesIdentities(model.Approval{Plugin: plugin})
+			_, recorded := nothingBeyondTheDecider[plugin]
+			if names && recorded {
+				t.Fatalf("%s is both gated as naming identities and recorded as carrying nothing; pick one", plugin)
+			}
+			if !names && !recorded {
+				t.Fatalf("%s is decided without the read gate. Either its plan names identities and approvalPlanNamesIdentities must say so, or record here why it carries nothing beyond the decider's own scopes.", plugin)
 			}
 		})
 	}

@@ -78,7 +78,7 @@ type proxyUserView struct {
 	Enabled           bool      `json:"enabled"`
 	HasUUID           bool      `json:"has_uuid"`
 	HasPassword       bool      `json:"has_password"`
-	HasSubToken       bool      `json:"has_sub_token"`
+	HasSubToken       bool      `json:"has_sub_token"` // kept for clients; no subscription is served from SubToken since cff5b9c
 	InboundIDs        []string  `json:"inbound_ids,omitempty"`
 	TrafficLimitBytes int64     `json:"traffic_limit_bytes,omitempty"`
 	ExpiresAt         time.Time `json:"expires_at,omitempty"`
@@ -222,22 +222,6 @@ func normalizeProxySubscriptionFormat(value string) (string, error) {
 	default:
 		return "", errors.New("unsupported subscription format")
 	}
-}
-
-func (s *Server) proxyUserBySubToken(token string) (model.ProxyUser, bool, bool) {
-	want := sha256.Sum256([]byte(token))
-	var found model.ProxyUser
-	matches := 0
-	for _, user := range s.store.ProxyUsers() {
-		got := sha256.Sum256([]byte(user.SubToken))
-		if user.SubToken != "" && subtle.ConstantTimeCompare(want[:], got[:]) == 1 {
-			matches++
-			if matches == 1 {
-				found = user
-			}
-		}
-	}
-	return found, matches == 1, matches > 1
 }
 
 func (s *Server) proxySubscriptionProfiles() []proxycore.SubscriptionProfile {
@@ -463,6 +447,13 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// handleRotateProxyUserSubToken still rotates and audits the token, but no
+// subscription has been served from SubToken since cff5b9c removed the
+// per-user subscription endpoint (handleProxySubscription; subscriptions are
+// served through shares), so a rotation revokes no URL: the old one stopped
+// working then. The only other reader is the vpn-core migration, which
+// copies the token into the new identity's SubID, and SubID is only
+// returned by the step-up credential reveal.
 func (s *Server) handleRotateProxyUserSubToken(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -796,7 +787,9 @@ func (s *Server) handleProxyNodePlan(w http.ResponseWriter, r *http.Request, p p
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
-	node, profile, artifact, err := s.renderProxyCoreArtifact(nodeID)
+	now := s.now()
+	users := s.proxyUsersForManagedRender(nil, now)
+	node, profile, artifact, err := s.renderProxyCoreArtifactForUsers(nodeID, users, now)
 	if err != nil {
 		writeError(w, statusForProxyPlanError(err), err)
 		return
@@ -806,7 +799,7 @@ func (s *Server) handleProxyNodePlan(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	plan := renderProxyCoreApprovalPlan(node, profile, artifact, redactedConfig)
+	plan := renderProxyCoreApprovalPlan(node, profile, artifact, redactedConfig, s.renderOmissions(profile, users, now))
 	approval := model.Approval{
 		ID:        id.New("approval"),
 		NodeID:    nodeID,
@@ -884,6 +877,14 @@ func (s *Server) renderProxyCoreArtifact(nodeID string) (model.Node, model.Proxy
 }
 
 func (s *Server) renderProxyCoreArtifactWithVpnUser(nodeID string, override *VpnUser) (model.Node, model.ProxyNodeProfile, proxycore.Artifact, error) {
+	now := s.now()
+	return s.renderProxyCoreArtifactForUsers(nodeID, s.proxyUsersForManagedRender(override, now), now)
+}
+
+// renderProxyCoreArtifactForUsers renders one node's config from a user list
+// proxyUsersForManagedRender built at now, so a caller that renders several
+// profiles, or also counts who the render drops, reads one list.
+func (s *Server) renderProxyCoreArtifactForUsers(nodeID string, users []model.ProxyUser, now time.Time) (model.Node, model.ProxyNodeProfile, proxycore.Artifact, error) {
 	node, ok := s.store.Node(nodeID)
 	if !ok {
 		return model.Node{}, model.ProxyNodeProfile{}, proxycore.Artifact{}, errProxyPlanNodeNotFound
@@ -896,12 +897,12 @@ func (s *Server) renderProxyCoreArtifactWithVpnUser(nodeID string, override *Vpn
 		artifact proxycore.Artifact
 		err      error
 	)
-	users := s.proxyUsersForManagedRender(override)
+	opts := proxycore.RenderOptions{Now: now}
 	switch profile.Core {
 	case model.ProxyCoreSingbox:
-		artifact, err = proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), users, proxycore.RenderOptions{})
+		artifact, err = proxycore.RenderSingBoxConfigJSON(profile, s.store.ProxyInbounds(), users, opts)
 	case model.ProxyCoreXray:
-		artifact, err = proxycore.RenderXrayConfigJSON(profile, s.store.ProxyInbounds(), users, proxycore.RenderOptions{})
+		artifact, err = proxycore.RenderXrayConfigJSON(profile, s.store.ProxyInbounds(), users, opts)
 	default:
 		err = fmt.Errorf("unsupported proxy core %q", profile.Core)
 	}
@@ -911,7 +912,16 @@ func (s *Server) renderProxyCoreArtifactWithVpnUser(nodeID string, override *Vpn
 	return node, profile, artifact, nil
 }
 
-func (s *Server) proxyUsersForManagedRender(override *VpnUser) []model.ProxyUser {
+// proxyUsersForManagedRender is every user row the managed render sees at
+// now: the legacy records no identity has taken over, then one row per
+// identity per enabled binding on a managed VLESS line. A row that belongs to
+// an identity carries the identity's live policy (vpnUserQuotaProjection):
+// whether it is enabled, its expiry, its quota and the usage that quota is
+// measured with, and the status those give, so an identity over its quota or
+// past its expiry is dropped here just as quotaEvaluate alerts on it. A
+// migrated identity's legacy record gets the same overlay; a legacy record
+// with no identity behind it is passed through as stored.
+func (s *Server) proxyUsersForManagedRender(override *VpnUser, now time.Time) []model.ProxyUser {
 	vpnUsers := s.listVpnUsers()
 	if override != nil {
 		replaced := false
@@ -949,31 +959,126 @@ func (s *Server) proxyUsersForManagedRender(override *VpnUser) []model.ProxyUser
 			}
 		}
 	}
-	out := make([]model.ProxyUser, 0, len(s.store.ProxyUsers())+len(vpnUsers))
-	for _, user := range s.store.ProxyUsers() {
-		if !replacedProxyUser[user.ID] {
-			out = append(out, user)
+	stored := s.store.ProxyUsers()
+	identityByLegacy := map[string]VpnUser{}
+	for _, user := range vpnUsers {
+		if user.MigratedFromProxyUser != "" {
+			identityByLegacy[user.MigratedFromProxyUser] = user
 		}
+	}
+	out := make([]model.ProxyUser, 0, len(stored)+len(vpnUsers))
+	for _, user := range stored {
+		if replacedProxyUser[user.ID] {
+			continue
+		}
+		if identity, ok := identityByLegacy[user.ID]; ok {
+			user, _ = s.vpnUserQuotaProjection(user, identity, now, usageCounter{})
+		}
+		out = append(out, user)
 	}
 	for _, user := range vpnUsers {
 		credential, ok := vpnCredentialForProtocol(user.Credentials, model.ProxyProtocolVLESS)
 		if !ok || credential.UUID == "" {
 			continue
 		}
+		var policy model.ProxyUser
+		projected := false
 		for _, binding := range user.Bindings {
 			line := lineByHash[binding.LineHashID]
 			if !binding.Enabled || !line.Managed || line.Type != model.ProxyProtocolVLESS {
 				continue
 			}
+			if !projected {
+				policy, projected = s.vpnUserPolicyRow(user, now), true
+			}
 			name := userLineName(user.ID, line.LineUUID)
 			out = append(out, model.ProxyUser{
-				ID: name, Name: name, Enabled: user.Enabled,
-				UUID: credential.UUID, InboundIDs: []string{line.Tag}, TrafficLimitBytes: user.QuotaBytes,
-				ExpiresAt: user.ExpiresAt, Status: model.ProxyUserStatusActive, CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
+				ID: name, Name: name, Enabled: policy.Enabled,
+				UUID: credential.UUID, InboundIDs: []string{line.Tag}, TrafficLimitBytes: policy.TrafficLimitBytes,
+				UsedBytes: policy.UsedBytes, ExpiresAt: policy.ExpiresAt, Status: policy.Status,
+				CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
 			})
 		}
 	}
 	return out
+}
+
+// renderOmissions names the users a render of profile from users leaves out
+// by policy, one "label (status)" per user, sorted. The label is the
+// identity's email for an identity's rows and for a migrated identity's
+// legacy record, and the stored name for any other record. A plan lists them
+// so the operator sees who the config already leaves out; when another user
+// is disabled, expires or reaches its quota before approval, the rendered
+// config changes and the plan goes stale.
+func (s *Server) renderOmissions(profile model.ProxyNodeProfile, users []model.ProxyUser, now time.Time) []string {
+	rows := ineligibleProfileUsers(profile, users, now)
+	if len(rows) == 0 {
+		return nil
+	}
+	labels := map[string]string{}
+	_, lines := s.lineReadModel()
+	for _, u := range s.listVpnUsers() {
+		label := firstNonEmpty(strings.TrimSpace(u.Email), strings.TrimSpace(u.Name), u.ID)
+		if u.MigratedFromProxyUser != "" {
+			labels[u.MigratedFromProxyUser] = label
+		}
+		for _, binding := range u.Bindings {
+			if line, ok := lines[binding.LineHashID]; ok {
+				labels[userLineName(u.ID, line.LineUUID)] = label
+			}
+		}
+	}
+	seen := map[string]bool{}
+	out := make([]string, 0, len(rows))
+	for _, row := range rows {
+		entry := firstNonEmpty(labels[row.ID], strings.TrimSpace(row.Name), row.ID) + " (" + derivedProxyUserStatusAt(row, now) + ")"
+		if !seen[entry] {
+			seen[entry] = true
+			out = append(out, entry)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// vpnUserInManagedRender reports whether proxyUsersForManagedRender gives the
+// identity a row on any managed line, by the same rules: a row per enabled
+// binding on a managed VLESS line when it has a VLESS credential, or, for a
+// migrated identity with no enabled managed binding, its legacy record on
+// every managed line whose inbound that record covers. Only there can a quota
+// or an expiry take a user off a node, through drift and a reviewed apply.
+// Outside it are identities on adopted lines only, which Lattice does not
+// remove users from (design 15 D6, design 17), identities on managed lines
+// without a VLESS credential, and identities on no line at all; for each of
+// them an alert is an alert only.
+func (s *Server) vpnUserInManagedRender(u VpnUser) bool {
+	_, lines := s.lineReadModel()
+	credential, ok := vpnCredentialForProtocol(u.Credentials, model.ProxyProtocolVLESS)
+	hasVLESS := ok && credential.UUID != ""
+	managedBinding := false
+	for _, binding := range u.Bindings {
+		line := lines[binding.LineHashID]
+		if !binding.Enabled || !line.Managed {
+			continue
+		}
+		managedBinding = true
+		if hasVLESS && line.Type == model.ProxyProtocolVLESS {
+			return true
+		}
+	}
+	if managedBinding || u.MigratedFromProxyUser == "" {
+		return false // no legacy record, or one the managed binding replaced
+	}
+	legacy, ok := s.store.ProxyUser(u.MigratedFromProxyUser)
+	if !ok {
+		return false
+	}
+	for _, line := range lines {
+		if line.Managed && (len(legacy.InboundIDs) == 0 || proxyStringSliceContains(legacy.InboundIDs, line.Tag)) {
+			return true
+		}
+	}
+	return false
 }
 
 var (
@@ -1261,7 +1366,11 @@ func (s *Server) handleProxyCoreTaskResult(r *http.Request, approval model.Appro
 	return nil
 }
 
-func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile, artifact proxycore.Artifact, redactedConfig string) string {
+// renderProxyCoreApprovalPlan writes the review text for a proxycore apply.
+// omitted is renderOmissions for the same render: the users the config leaves
+// out by policy, listed by name because the renderer's warnings name their
+// rows by derived ids.
+func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile, artifact proxycore.Artifact, redactedConfig string, omitted []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# Lattice proxycore review plan\n\n")
 	fmt.Fprintf(&b, "node_id: %s\n", profile.NodeID)
@@ -1278,6 +1387,13 @@ func renderProxyCoreApprovalPlan(node model.Node, profile model.ProxyNodeProfile
 	}
 	if profile.ListenIP != "" {
 		fmt.Fprintf(&b, "listen_ip: %s\n", profile.ListenIP)
+	}
+	if len(omitted) > 0 {
+		fmt.Fprintf(&b, "\nomitted_users: %d\n", len(omitted))
+		for _, entry := range omitted {
+			fmt.Fprintf(&b, "- %s\n", entry)
+		}
+		b.WriteString("Their policy leaves these users out of this config. If another user is disabled, expires or reaches its quota before approval, the config changes and this plan must be made again.\n")
 	}
 	if len(artifact.Warnings) > 0 {
 		b.WriteString("\nwarnings:\n")

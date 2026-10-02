@@ -30,6 +30,7 @@ func TestApprovalDecisionExtraScope(t *testing.T) {
 		{plugin: proxyCorePlugin, want: "proxy:admin"},
 		{plugin: singBoxLineUserPlugin, want: "vpncore:admin"},
 		{plugin: singBoxLineMetaPlugin, want: "vpncore:admin"},
+		{plugin: singBoxManagedLinePlugin, want: "vpncore:admin"},
 		{plugin: "cftunnel", want: "tunnel:admin"},
 		{plugin: "nftpolicy", want: "netpolicy:admin"},
 		{plugin: "wireguard", want: ""},
@@ -96,9 +97,27 @@ func TestDesign15ApprovalsRequireVPNCoreAdmin(t *testing.T) {
 
 			// Legacy proxy:admin remains a compatibility grant for canonical
 			// vpncore:admin while operators migrate their PATs.
-			legacy := createPAT(t, handler, cookies, csrf, []string{"network:apply", "proxy:admin"}, []string{"node-a"})
+			legacyScopes, legacyAllowlist := []string{"network:apply", "proxy:admin"}, []string{"node-a"}
+			if pluginID == singBoxLineUserPlugin {
+				// A line-user plan names identities, so its decider must also
+				// be able to read it: unrestricted, with network:plan on the
+				// node (approvalPlanNamesIdentities). The confined grant that
+				// decides a linemeta plan is refused for this one.
+				confined := createPAT(t, handler, cookies, csrf, legacyScopes, legacyAllowlist)
+				refused := doBearerJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+					string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": false, "plan_sha256": planSHA256(approval.Plan)})), confined)
+				defer refused.Body.Close()
+				if refused.StatusCode != http.StatusForbidden {
+					t.Fatalf("a decider confined to the node must not decide a plan naming identities, got %d", refused.StatusCode)
+				}
+				legacyScopes, legacyAllowlist = []string{"network:apply", "network:plan", "proxy:admin"}, nil
+			}
+			legacy := createPAT(t, handler, cookies, csrf, legacyScopes, legacyAllowlist)
+			// A line-user approval must queue its apply; approve-only is
+			// refused for it before any state changes.
+			queueApply := pluginID == singBoxLineUserPlugin
 			allowed := doBearerJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
-				string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": false, "plan_sha256": planSHA256(approval.Plan)})), legacy)
+				string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": queueApply, "plan_sha256": planSHA256(approval.Plan)})), legacy)
 			defer allowed.Body.Close()
 			if allowed.StatusCode != http.StatusOK {
 				t.Fatalf("legacy proxy:admin compatibility approval failed: %d", allowed.StatusCode)

@@ -3335,6 +3335,11 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 //	node_id=<id>          keep rows that target the node
 //	origin=a,b            keep rows queued by approval, rerun or direct (see
 //	                      taskOrigin); anything else is a 400
+//	approval_id=<id>      keep rows the approval queued, when the caller may
+//	                      read that approval (the rule behind a row's
+//	                      approval_id); an unreadable or unknown approval
+//	                      answers an empty page; one id of at most 128
+//	                      characters from A-Z, a-z, 0-9, _ and -, else a 400
 //	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
 //
 // Without any of them the response is the bare array clients have always
@@ -3373,7 +3378,15 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request, p principal
 			return
 		}
 		deadline := s.store.TaskQueueDeadline()
-		rows := s.visibleTaskRows(p)
+		var rows []taskRow
+		// approval_id matches only an approval the caller may read, by the
+		// same rule that decides whether a row shows approval_id. An
+		// unreadable or unknown approval answers the empty page a real
+		// approval with no tasks answers, so the filter cannot probe the
+		// task-to-approval link the rows hide.
+		if filter.approvalID == "" || s.readableApprovalIDs(p, []string{filter.approvalID})[filter.approvalID] {
+			rows = s.visibleTaskRows(p)
+		}
 		filtered := make([]taskRow, 0, len(rows))
 		for _, row := range rows {
 			if filter.matches(row, deadline) {
@@ -3991,7 +4004,7 @@ type tasksQueryResponse struct {
 
 func taskQueryRequested(r *http.Request) bool {
 	q := r.URL.Query()
-	for _, key := range []string{"status", "since", "node_id", "origin", "limit", "offset"} {
+	for _, key := range []string{"status", "since", "node_id", "origin", "approval_id", "limit", "offset"} {
 		if _, ok := q[key]; ok {
 			return true
 		}
@@ -4055,15 +4068,16 @@ func parseTaskIDList(raw string) (map[string]bool, error) {
 //	                      (maxTaskResultIDs); more is a 400, never truncated
 //	node_id=<id>          keep results from one node
 //	omit_output=1         send stdout_bytes and stderr_bytes instead of the
-//	                      bodies
+//	                      bodies, plus stderr_head: the first non-blank line
+//	                      of stderr, at most 200 bytes, omitted when stderr
+//	                      is empty (taskStderrHead)
 //	limit=<n> offset=<n>  page the filtered rows (default 100, max 500)
 //
 // Without any of them the response is the bare array of every visible result.
-// With any of them it is the {"results","total","limit","offset"} envelope.
-// An explicit limit always pages. omit_output without a limit still returns
-// every match, because the Tasks page polls that way and builds each node's
-// row from all of them; design 23 wave 2 moves that poll to task_id=<the ids
-// on screen> and applies the default page here in the same release.
+// With any of them it is the {"results","total","limit","offset"} envelope,
+// paged by limit whether or not omit_output is set: a poll asks for the
+// results of the tasks on screen with task_id, or for a page, and total
+// still counts every match.
 func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -4075,7 +4089,7 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		// store's result cap). Filtering/pagination is opt-in below.
 		visible := make([]taskResultView, 0, len(results))
 		for _, result := range results {
-			if rbac.Allows(p.Principal, "task:read", result.NodeID) {
+			if taskResultReadable(p, result) {
 				visible = append(visible, s.withExecContext(toTaskResultView(result)))
 			}
 		}
@@ -4105,7 +4119,7 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 	nodeID := strings.TrimSpace(q.Get("node_id"))
 	matched := make([]model.TaskResult, 0, len(results))
 	for _, result := range results {
-		if !rbac.Allows(p.Principal, "task:read", result.NodeID) {
+		if !taskResultReadable(p, result) {
 			continue
 		}
 		if taskIDs != nil && !taskIDs[result.TaskID] {
@@ -4117,12 +4131,6 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		matched = append(matched, result)
 	}
 	total := len(matched)
-	if omitOutput && strings.TrimSpace(q.Get("limit")) == "" {
-		// yagni: unbounded until design 23 wave 2 switches the Tasks poll to
-		// task_id; the store caps results at 2,000, which bounds this. Then
-		// drop this override so the default page applies.
-		limit = total
-	}
 	if offset > total {
 		matched = nil
 	} else {
@@ -4141,6 +4149,10 @@ func (s *Server) handleTaskResults(w http.ResponseWriter, r *http.Request, p pri
 		for i := range filtered {
 			filtered[i].StdoutBytes = len(filtered[i].Stdout)
 			filtered[i].StderrBytes = len(filtered[i].Stderr)
+			// Every row here passed taskResultReadable, the check that lets
+			// this caller read the full stderr without omit_output, so the
+			// head reveals nothing the caller could not already read.
+			filtered[i].StderrHead = taskStderrHead(filtered[i].Stderr)
 			filtered[i].Stdout = ""
 			filtered[i].Stderr = ""
 		}
@@ -4204,9 +4216,12 @@ type taskResultView struct {
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
 	// Set only on omit_output rows: the size of the body that was not sent,
-	// so a list can still say "12 KB of output" without carrying it.
+	// so a list can still say "12 KB of output" without carrying it, and
+	// the first line of stderr (taskStderrHead) so a failed run can say why
+	// in one line.
 	StdoutBytes int       `json:"stdout_bytes,omitempty"`
 	StderrBytes int       `json:"stderr_bytes,omitempty"`
+	StderrHead  string    `json:"stderr_head,omitempty"`
 	Error       string    `json:"error"`
 	StartedAt   time.Time `json:"started_at"`
 	FinishedAt  time.Time `json:"finished_at"`
@@ -6605,8 +6620,9 @@ func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval
 // The primary read scope is deliberately NOT part of this: which scope may read
 // a plugin's plans and which may decide them are different questions with
 // different answers, and the decision path spells its own authority as
-// network:apply plus approvalDecisionExtraScope. What both paths must agree on
-// is the set of nodes.
+// network:apply plus approvalDecisionExtraScope, adding the read scope only
+// for a plan that names identities (approvalPlanNamesIdentities). What both
+// paths must agree on is the set of nodes.
 func (s *Server) approvalNodeReachAllows(p principal, approval model.Approval) bool {
 	// A multi-target plugin operation records its first target in NodeID and
 	// the rest in Targets. Filtering on NodeID alone disclosed the identities
@@ -6643,6 +6659,23 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 	case proxyCorePlugin:
 		return !principalHasNodeRestriction(p) &&
 			rbac.Allows(p.Principal, "proxy:read", "") &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	case singBoxLineUserPlugin, singBoxManagedLinePlugin:
+		// A line-user plan names identities by email: the user it adds,
+		// updates or removes, and on a managed line every user its render
+		// already leaves out by policy. A managed-line rollout names the user
+		// its fragment grants. Identities are global proxy objects that only
+		// an unrestricted principal holding the vpn-core read scope may list
+		// (requireGlobalProxyScope, and the gateway for vpncore:read), so
+		// reading either plan asks for the same, as a proxycore plan does.
+		// Under the default below, bare network:plan on the node was enough.
+		//
+		// The admin scope counts too. Deciding either plan requires it
+		// (approvalDecisionExtraScope), and authoring a line-user plan does,
+		// and a holder must be able to read what it files and decides, for
+		// the reason sshguard:admin implies sshguard:read.
+		return !principalHasNodeRestriction(p) &&
+			(rbac.Allows(p.Principal, "proxy:read", "") || rbac.Allows(p.Principal, "proxy:admin", "")) &&
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case "cftunnel":
 		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
@@ -7694,13 +7727,29 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
+	// A line-user or managed-line approval approved without its apply task is
+	// stranded: nothing queues one later, and approve is a no-op on an
+	// approval that is no longer pending, which is the dead end dd75324 fixed
+	// for queue_apply=true. A stranded rollout also keeps its definition
+	// planned, so the next rollout skips that node. Refused here, before any
+	// state changes, for the manual endpoint and for an auto-approve rule
+	// with queue=false alike; such a rule leaves the approval pending.
+	if !queueApply && (approval.Plugin == singBoxLineUserPlugin || approval.Plugin == singBoxManagedLinePlugin) {
+		return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest,
+			approval.Plugin+" approvals must queue their apply task: approve with queue_apply, since an approval approved without one can never be applied")}
+	}
+	// checkGrant judges the user's policy as of this approval, and the apply
+	// script is rendered from it below. If the node is offline the task waits
+	// with that script, and the user can expire or cross its quota before sb
+	// runs; the usage alerts cover that window, as they cover any user already
+	// on the node. The same holds for the managed-line check after this one.
 	if approval.Plugin == singBoxLineUserPlugin {
-		if _, _, _, _, _, err := s.validateLineUserApproval(approval); err != nil {
+		if _, _, _, _, _, err := s.validateLineUserApproval(approval, true); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
 	if approval.Plugin == singBoxManagedLinePlugin {
-		if _, _, _, err := s.validateManagedLineApproval(approval); err != nil {
+		if _, _, _, err := s.validateManagedLineApproval(approval, true); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
@@ -7766,8 +7815,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	// script the server had to know how to write. The plugin compiled the plan; the
 	// operator approved the exact bytes of it; the plugin now executes it under a
 	// one-time grant bound to that approval, and every task it enqueues is checked
-	// against the approved target set.
-	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) && approval.Plugin != singBoxManagedLinePlugin {
+	// against the approved target set. The line chain, managed line and line-user
+	// plans fill Service and Method too, to bind their typed columns, but core
+	// writes their apply scripts below and no loaded plugin carries their ids, so
+	// the plugin executor would only refuse them.
+	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) &&
+		approval.Plugin != singBoxManagedLinePlugin && approval.Plugin != singBoxLineUserPlugin {
 		approval.Status = model.ApprovalApproved
 		approval.ApprovedBy = p.ActorID
 		if err := s.store.UpsertApproval(approval); err != nil {
@@ -8101,7 +8154,73 @@ func (s *Server) requireApprovalDecisionScopes(w http.ResponseWriter, p principa
 	//
 	// The listing is the correct set and is not narrowed to match: it is the
 	// one that already reasons about targets and plan reach.
+	//
+	// A plan that names proxy identities must also clear the listing's
+	// primary read scope; see approvalPlanNamesIdentities.
+	if approvalPlanNamesIdentities(approval) && !s.requireApprovalPrimaryRead(w, p, approval) {
+		return false
+	}
 	return s.requireApprovalNodeReach(w, p, approval)
+}
+
+// approvalPlanNamesIdentities reports whether an approval's plan names proxy
+// identities by email: the user a line-user plan or a managed-line rollout
+// grants, and the users a proxycore or managed line-user render already
+// leaves out by policy. Identities are global objects that only an
+// unrestricted principal holding the vpn-core read scope may list, so the
+// read gate for these plans asks for that (approvalPrimaryScopeAllows), and
+// so must the decision verbs, which answer with the plan.
+//
+// Without it a principal confined to the node with network:apply and
+// vpncore:admin there could reject a line-user approval by id and read the
+// emails the listing hides from it, and rejecting an approval already decided
+// changes nothing, so the read had no side effect to notice.
+//
+// Requiring the read for these plans keeps every decider that can review
+// them. A line-user or proxycore plan is authored only by a principal that
+// passes its read gate, and approving any of the three needs plan_sha256,
+// which a decider gets by reading the plan behind that gate. What it removes
+// is deciding, by id, a plan the caller may not read: the blind reject, and
+// an approve with a hash obtained elsewhere.
+//
+// The other plugins are deliberately left out. The only part of their read
+// gate a decider may lack is network:plan on the node, their plans carry
+// nothing outside what the decider's own scopes and the node reach check
+// already cover, and deciders that hold network:apply and the domain scope
+// without network:plan are relied on
+// (TestAgentUpdateApprovalDecisionRequiresNodeAdmin,
+// TestNetGuardApprovalDecisionRequiresNetGuardAdmin).
+func approvalPlanNamesIdentities(approval model.Approval) bool {
+	switch approval.Plugin {
+	case proxyCorePlugin, singBoxLineUserPlugin, singBoxManagedLinePlugin:
+		return true
+	default:
+		return false
+	}
+}
+
+// requireApprovalPrimaryRead refuses a decision on an approval whose plan the
+// caller may not read under approvalPrimaryScopeAllows, the gate the listing
+// and the single read apply. The refusal names no part of the plan.
+func (s *Server) requireApprovalPrimaryRead(w http.ResponseWriter, p principal, approval model.Approval) bool {
+	if s.approvalPrimaryScopeAllows(p, approval) {
+		return true
+	}
+	s.recordAudit(model.AuditEvent{
+		ID:            id.New("audit"),
+		ActorID:       p.ActorID,
+		TokenID:       p.TokenID,
+		NodeID:        approval.NodeID,
+		Action:        "authorize.approval",
+		Scope:         "network:plan",
+		Decision:      "deny",
+		Reason:        "the caller may not read this approval's plan, so it may not decide it",
+		Metadata:      map[string]string{"approval_id": approval.ID, "plugin": approval.Plugin},
+		CorrelationID: p.CorrelationID,
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied,
+		"deciding this approval requires reading its plan, which this session may not do"))
+	return false
 }
 
 // requireApprovalNodeReach refuses a decision on an approval whose plan covers
@@ -8188,6 +8307,14 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 	case proxyCorePlugin:
 		return "proxy:admin"
 	case singBoxLineUserPlugin, singBoxLineMetaPlugin:
+		return "vpncore:admin"
+	case singBoxManagedLinePlugin:
+		// A rollout's fragment adds a user to a new line, which grants that
+		// user access as a line-user plan_add does, and its plan names the
+		// user by email. Only a vpn-core admin may read it
+		// (approvalPrimaryScopeAllows), so only one may decide it; under bare
+		// network:apply a decider could approve a grant it was not allowed
+		// to read.
 		return "vpncore:admin"
 	case "cftunnel":
 		return "tunnel:admin"

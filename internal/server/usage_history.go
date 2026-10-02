@@ -259,27 +259,57 @@ func (s *Server) periodUsage(userID string, from, to time.Time) (usageCounter, [
 // When the projection belongs to an identity, the identity owns whether it is
 // enabled, when it expires and its quota: the vpn-core editor writes those to
 // the identity, and a migrated identity's legacy record keeps whatever it held
-// at migration. They are read from the identity so its edits drive status and
-// alerts, the same values /api/expiring and the Users page show.
+// at migration. They are read from the identity (vpnUserQuotaProjection) so
+// its edits drive status and alerts, the same values /api/expiring, the Users
+// page and the managed render use.
 func (s *Server) quotaEvaluate(user model.ProxyUser, vpnUser *VpnUser, now time.Time, pending usageCounter) (model.ProxyUser, []proxyUserNotificationFire) {
 	if vpnUser == nil {
 		user.Status = derivedProxyUserStatusAt(user, now)
 		return nextProxyUserNotifications(user, now)
 	}
-	projection := user
-	projection.Enabled = vpnUser.Enabled
-	projection.ExpiresAt = vpnUser.ExpiresAt
-	projection.TrafficLimitBytes = vpnUser.QuotaBytes
-	period := ""
-	if projection.TrafficLimitBytes > 0 {
-		projection.UsedBytes, period = s.quotaUsedBytes(*vpnUser, projection.UsedBytes, now, pending)
-	}
-	projection.Status = derivedProxyUserStatusAt(projection, now)
+	projection, period := s.vpnUserQuotaProjection(user, *vpnUser, now, pending)
 	projection, alerts := nextProxyUserNotificationsForPeriod(projection, now, period)
+	if len(alerts) > 0 && !s.vpnUserInManagedRender(*vpnUser) {
+		for i := range alerts {
+			alerts[i].AlertOnly = true
+		}
+	}
 	user.Status = projection.Status
 	user.LastQuotaNotifiedKey = projection.LastQuotaNotifiedKey
 	user.LastExpiryNotifiedKey = projection.LastExpiryNotifiedKey
 	return user, alerts
+}
+
+// vpnUserQuotaProjection is what an identity's policy says about one of its
+// ProxyUser rows at now. It overwrites Enabled, ExpiresAt and the limit
+// (QuotaBytes) from the identity, UsedBytes with the usage the quota is
+// measured with (quotaUsedBytes, reading the row's UsedBytes as the lifetime
+// running total), and Status with what those give, and returns the period
+// key quota alerts carry. Every figure is read at call time. quotaEvaluate
+// alerts from it and the managed render keeps or drops the identity's rows by
+// it, so the alert and the config a node is told to run cannot disagree.
+func (s *Server) vpnUserQuotaProjection(row model.ProxyUser, vpnUser VpnUser, now time.Time, pending usageCounter) (model.ProxyUser, string) {
+	row.Enabled = vpnUser.Enabled
+	row.ExpiresAt = vpnUser.ExpiresAt
+	row.TrafficLimitBytes = vpnUser.QuotaBytes
+	period := ""
+	if row.TrafficLimitBytes > 0 {
+		row.UsedBytes, period = s.quotaUsedBytes(vpnUser, row.UsedBytes, now, pending)
+	}
+	row.Status = derivedProxyUserStatusAt(row, now)
+	return row, period
+}
+
+// vpnUserPolicyRow is the identity's policy at now as a row of its own: what
+// vpnUserQuotaProjection gives over the lifetime total on the identity's
+// accounting record, the legacy record for a migrated identity and the
+// canonical projection otherwise. Every managed render row of the identity
+// carries these figures, and a line plan refuses an identity whose Status
+// here is not active.
+func (s *Server) vpnUserPolicyRow(u VpnUser, now time.Time) model.ProxyUser {
+	acct, _ := s.store.ProxyUser(firstNonEmpty(strings.TrimSpace(u.MigratedFromProxyUser), u.ID))
+	row, _ := s.vpnUserQuotaProjection(model.ProxyUser{UsedBytes: acct.UsedBytes}, u, now, usageCounter{})
+	return row
 }
 
 // quotaUsedBytes is the usage an identity's quota is measured with, and the

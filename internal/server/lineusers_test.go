@@ -1,12 +1,17 @@
 package server
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -89,6 +94,645 @@ func seedManagedLineUserFixture(t *testing.T, srv *Server) (Line, VpnUser) {
 		t.Fatal(err)
 	}
 	return line, user
+}
+
+// filePlan files a line-user plan and returns its approval.
+func filePlan(t *testing.T, srv *Server, op, userID, lineHashID string) model.Approval {
+	t.Helper()
+	out, err := srv.vpnUserLinePlan(lineUserTestPrincipal(), mustJSON(t, map[string]string{"user_id": userID, "line_hash_id": lineHashID}), op)
+	if err != nil {
+		t.Fatalf("plan_%s: %v", op, err)
+	}
+	var response struct {
+		Approval model.Approval `json:"approval"`
+	}
+	if err := json.Unmarshal(out, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response.Approval
+}
+
+func approvePlan(t *testing.T, srv *Server, approval model.Approval) error {
+	t.Helper()
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	_, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), approval, true, planSHA)
+	return err
+}
+
+func tasksFor(srv *Server, approvalID string) []model.Task {
+	var out []model.Task
+	for _, task := range srv.store.Tasks() {
+		if task.ApprovalID == approvalID {
+			out = append(out, task)
+		}
+	}
+	return out
+}
+
+// Approving a line-user plan queues the apply task core renders for it, on
+// both tracks. The plan fills Service and Method to bind its typed columns,
+// and the approve path used to take that for a plugin operation: it marked
+// the approval approved, found no loaded plugin "singbox-lineuser", and
+// queued nothing.
+func TestApprovingALineUserPlanQueuesItsApply(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := newLinemetaTestServer(t, st)
+	line, u := seedLineUserFixture(t, srv)
+	u.Bindings = nil
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	add := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
+	if err := approvePlan(t, srv, add); err != nil {
+		t.Fatalf("approve adopted add: %v", err)
+	}
+	if stored, _ := srv.store.Approval(add.ID); stored.Status != model.ApprovalApproved {
+		t.Fatalf("adopted add status = %q, want approved", stored.Status)
+	}
+	if tasks := tasksFor(srv, add.ID); len(tasks) != 1 || !strings.Contains(tasks[0].Script, "user add "+shellQuote(line.Tag)) {
+		t.Fatalf("approved adopted add must queue sb user add: %+v", tasks)
+	}
+
+	managedSrv := newLinemetaTestServer(t, mustOpenStore(t))
+	managedLine, identity := seedManagedLineUserFixture(t, managedSrv)
+	managedAdd := filePlan(t, managedSrv, lineUserOpAdd, identity.ID, managedLine.LineHashID)
+	if err := approvePlan(t, managedSrv, managedAdd); err != nil {
+		t.Fatalf("approve managed add: %v", err)
+	}
+	if tasks := tasksFor(managedSrv, managedAdd.ID); len(tasks) != 1 || !strings.Contains(tasks[0].Script, "/etc/sing-box/config.json") {
+		t.Fatalf("approved managed add must queue the full config apply: %+v", tasks)
+	}
+}
+
+// lineUserScriptPrelude is the start of every adopted line-user apply script.
+const lineUserScriptPrelude = "set -e\n" +
+	"SB_BIN=\"${LATTICE_SINGBOX_BIN:-sb}\"\n" +
+	"command -v \"$SB_BIN\" >/dev/null 2>&1 || { echo 'lattice lineuser: sb binary not found' >&2; exit 1; }\n"
+
+// seedMintedLineUser stores an unbound user whose id has the shape Lattice
+// mints, so a removal filed after its deletion passes vpnUserIDRe.
+func seedMintedLineUser(t *testing.T, srv *Server) VpnUser {
+	t.Helper()
+	u := VpnUser{
+		ID: id.New("vpnuser"), Email: "minted@example.com", Enabled: true,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: "6a1b7c2d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", Flow: "xtls-rprx-vision"}},
+	}
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+// applyLinePlanResult approves a filed plan, checks it queued one task,
+// reports that task a success the way a node would, checks the approval is
+// applied, and returns the task.
+func applyLinePlanResult(t *testing.T, srv *Server, approval model.Approval, line Line) model.Task {
+	t.Helper()
+	if err := approvePlan(t, srv, approval); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	tasks := tasksFor(srv, approval.ID)
+	if len(tasks) != 1 {
+		t.Fatalf("approval queued %d task(s), want 1", len(tasks))
+	}
+	request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
+	if err := srv.handleApprovalTaskResult(request, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: line.NodeID}); err != nil {
+		t.Fatalf("successful result: %v", err)
+	}
+	if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalApplied {
+		t.Fatalf("status = %q reason %q, want applied", stored.Status, stored.Reason)
+	}
+	return tasks[0]
+}
+
+// applyLinePlan files a plan for userID on the line and applies it through
+// applyLinePlanResult.
+func applyLinePlan(t *testing.T, srv *Server, op, userID string, line Line) model.Task {
+	t.Helper()
+	return applyLinePlanResult(t, srv, filePlan(t, srv, op, userID, line.LineHashID), line)
+}
+
+// Deleting a user does not take its credential off an adopted line, and
+// plan_remove needed the user record: a removal filed before the deletion
+// failed with "no longer exists", and none could be filed after it. Both now
+// complete for a user an applied plan put on the line. The script deletes
+// the one name derived from the deleted user's id and the line, and no user
+// record comes back.
+func TestRemovingADeletedUsersCredentialFromAnAdoptedLine(t *testing.T) {
+	for _, filed := range []string{"before the deletion", "after the deletion"} {
+		t.Run(filed, func(t *testing.T) {
+			srv := newLinemetaTestServer(t, mustOpenStore(t))
+			line, _ := seedLineUserFixture(t, srv)
+			u := seedMintedLineUser(t, srv)
+			applyLinePlan(t, srv, lineUserOpAdd, u.ID, line)
+			var approval model.Approval
+			if filed == "before the deletion" {
+				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+			}
+			if err := srv.deleteVpnUser(u.ID); err != nil {
+				t.Fatal(err)
+			}
+			if filed == "after the deletion" {
+				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+				if !strings.Contains(approval.Plan, "deleted user "+u.ID) {
+					t.Fatalf("the plan must say the user is deleted: %s", approval.Plan)
+				}
+			}
+			removed := applyLinePlanResult(t, srv, approval, line)
+			want := lineUserScriptPrelude + `"$SB_BIN" user del 'hub-a' '` + userLineName(u.ID, line.LineUUID) + `'` + "\n"
+			if removed.Script != want || len(removed.Targets) != 1 || removed.Targets[0] != "node-a" {
+				t.Fatalf("removal task = %+v, want one task on node-a running:\n%s", removed, want)
+			}
+			if _, ok := srv.getVpnUser(u.ID); ok {
+				t.Fatal("reconciling the removal recreated the deleted user")
+			}
+		})
+	}
+}
+
+// A removal for a user Lattice no longer has must name an id of the shape
+// Lattice mints, refused before it is filed or echoed, and the approvals
+// must show an applied plan put that user on that line with no applied
+// removal since. A typo, an id that never reached the line, and a second
+// removal after the first applied are all refused, and none files anything.
+func TestADeletedUsersRemovalNeedsAMintedIDAndALineHistory(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, _ := seedLineUserFixture(t, srv)
+	u := seedMintedLineUser(t, srv)
+	applyLinePlan(t, srv, lineUserOpAdd, u.ID, line)
+	if err := srv.deleteVpnUser(u.ID); err != nil {
+		t.Fatal(err)
+	}
+	plan := func(userID string) error {
+		_, err := srv.vpnUserLinePlan(lineUserTestPrincipal(),
+			mustJSON(t, map[string]string{"user_id": userID, "line_hash_id": line.LineHashID}), lineUserOpRemove)
+		return err
+	}
+	approvalsBefore := len(srv.store.Approvals())
+	auditsBefore := len(srv.store.AuditEvents())
+
+	malformed := []string{
+		"",
+		"vpnuser_typo1",
+		"vpnuser_ABCDEFGHIJKLMNOP",
+		u.ID + "x",
+		u.ID + "\nforged audit line",
+		"vu_" + strings.Repeat("a", 129),
+		"puser_" + strings.TrimPrefix(u.ID, "vpnuser_"),
+	}
+	for _, userID := range malformed {
+		err := plan(userID)
+		if err == nil || !strings.Contains(err.Error(), "neither an existing user nor a VpnUser id Lattice mints") {
+			t.Fatalf("plan_remove for malformed id %q: %v, want the format refusal", userID, err)
+		}
+		if userID != "" && strings.Contains(err.Error(), userID) {
+			t.Fatalf("the refusal echoed the malformed id %q: %v", userID, err)
+		}
+	}
+
+	neverExisted := id.New("vpnuser")
+	if err := plan(neverExisted); err == nil || !strings.Contains(err.Error(), "no applied plan ever put user") {
+		t.Fatalf("plan_remove for an id that never reached the line: %v, want the history refusal", err)
+	}
+	if got := len(srv.store.Approvals()); got != approvalsBefore {
+		t.Fatalf("refused removals filed %d approval(s)", got-approvalsBefore)
+	}
+	if got := len(srv.store.AuditEvents()); got != auditsBefore {
+		t.Fatalf("refused removals wrote %d audit event(s)", got-auditsBefore)
+	}
+
+	applyLinePlan(t, srv, lineUserOpRemove, u.ID, line)
+	if err := plan(u.ID); err == nil || !strings.Contains(err.Error(), "already removed user") {
+		t.Fatalf("a second removal after the first applied: %v, want the history refusal", err)
+	}
+}
+
+// unbind drops only the server's binding record, so a user that plan_add put
+// on an adopted line keeps its credential there, and plan_remove refused it
+// as "not bound", while a removal filed before the unbind failed with "line
+// binding changed since planning". Both complete now, removing only that
+// user's derived name. A user with no binding and no applied plan on the
+// line has nothing to remove, and a managed line, whose render already
+// leaves an unbound user out, still needs the binding.
+func TestRemovingAnUnboundUsersCredentialFromAnAdoptedLine(t *testing.T) {
+	for _, filed := range []string{"before the unbind", "after the unbind"} {
+		t.Run(filed, func(t *testing.T) {
+			srv := newLinemetaTestServer(t, mustOpenStore(t))
+			line, u := seedLineUserFixture(t, srv)
+			u.Bindings = nil
+			if err := srv.putVpnUser(u); err != nil {
+				t.Fatal(err)
+			}
+			applyLinePlan(t, srv, lineUserOpAdd, u.ID, line)
+			unbind := func() {
+				t.Helper()
+				if _, err := srv.vpnUserUnbind(mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var approval model.Approval
+			if filed == "before the unbind" {
+				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+				unbind()
+			} else {
+				unbind()
+				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+				if !strings.Contains(approval.Plan, "Lattice holds no binding for this user on the line") {
+					t.Fatalf("the plan must say Lattice holds no binding: %s", approval.Plan)
+				}
+			}
+			removed := applyLinePlanResult(t, srv, approval, line)
+			want := lineUserScriptPrelude + `"$SB_BIN" user del 'hub-a' '` + userLineName(u.ID, line.LineUUID) + `'` + "\n"
+			if removed.Script != want || len(removed.Targets) != 1 || removed.Targets[0] != "node-a" {
+				t.Fatalf("removal task = %+v, want one task on node-a running:\n%s", removed, want)
+			}
+			if lineUserBoundTo(t, srv, u.ID, line.LineHashID) {
+				t.Fatal("reconciling the removal bound the user again")
+			}
+		})
+	}
+
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	if _, err := srv.vpnUserUnbind(mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.vpnUserLinePlan(lineUserTestPrincipal(),
+		mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID}), lineUserOpRemove); err == nil ||
+		!strings.Contains(err.Error(), "no applied plan ever put user") {
+		t.Fatalf("plan_remove for an unbound user no plan put on the line: %v, want the history refusal", err)
+	}
+
+	managedSrv := newLinemetaTestServer(t, mustOpenStore(t))
+	managedLine, identity := seedManagedLineUserFixture(t, managedSrv)
+	_, err := managedSrv.vpnUserLinePlan(lineUserTestPrincipal(),
+		mustJSON(t, map[string]string{"user_id": identity.ID, "line_hash_id": managedLine.LineHashID}), lineUserOpRemove)
+	if err == nil || !strings.Contains(err.Error(), "is not bound to line") {
+		t.Fatalf("plan_remove on a managed line for an unbound user: %v, want not bound", err)
+	}
+}
+
+// A deleted user still cannot be added or updated, and a managed line's
+// removal is left to its config apply, since its render already leaves the
+// user out.
+func TestADeletedUserIsPlannedOnlyForRemovalFromAnAdoptedLine(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	if err := srv.deleteVpnUser(u.ID); err != nil {
+		t.Fatal(err)
+	}
+	request := mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID})
+	for _, op := range []string{lineUserOpAdd, lineUserOpUpdate} {
+		if _, err := srv.vpnUserLinePlan(lineUserTestPrincipal(), request, op); err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("plan_%s for a deleted user: %v, want not found", op, err)
+		}
+	}
+
+	managedSrv := newLinemetaTestServer(t, mustOpenStore(t))
+	managedLine, _ := seedManagedLineUserFixture(t, managedSrv)
+	_, err := managedSrv.vpnUserLinePlan(lineUserTestPrincipal(),
+		mustJSON(t, map[string]string{"user_id": id.New("vpnuser"), "line_hash_id": managedLine.LineHashID}), lineUserOpRemove)
+	if err == nil || !strings.Contains(err.Error(), "already leaves it out of its render") {
+		t.Fatalf("plan_remove on a managed line for a deleted user: %v, want the render refusal", err)
+	}
+}
+
+// A second removal of the same user from the same line is refused while the
+// first can still act: pending, approved with a live task, and pending again
+// after a failed run. Once the first is rejected a new one can be filed, and
+// an approved removal whose task was cancelled, which nothing can decide
+// again, does not block the next one. The same holds for a user that has
+// been deleted.
+func TestASecondRemovalWaitsForTheOpenOne(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	plan := func(userID string) error {
+		_, err := srv.vpnUserLinePlan(lineUserTestPrincipal(),
+			mustJSON(t, map[string]string{"user_id": userID, "line_hash_id": line.LineHashID}), lineUserOpRemove)
+		return err
+	}
+	refused := func(t *testing.T, userID string, open model.Approval, state string) {
+		t.Helper()
+		before := len(srv.store.Approvals())
+		err := plan(userID)
+		if err == nil || !strings.Contains(err.Error(), "already "+state+" as approval "+open.ID) {
+			t.Fatalf("a second removal while the first is %s: %v, want a refusal naming %s", state, err, open.ID)
+		}
+		if got := len(srv.store.Approvals()); got != before {
+			t.Fatalf("the refused removal filed %d approval(s)", got-before)
+		}
+	}
+
+	first := filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+	refused(t, u.ID, first, "pending")
+	if err := approvePlan(t, srv, first); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	refused(t, u.ID, first, "approved")
+	tasks := tasksFor(srv, first.ID)
+	request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
+	if err := srv.handleApprovalTaskResult(request, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: "node-a", ExitCode: 1}); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, u.ID, first, "pending")
+
+	decider := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: []string{"network:apply", "network:plan", "vpncore:admin"}}}
+	if rec := decideApproval(srv, "reject", `{"approval_id":"`+first.ID+`"}`, decider); rec.Code != 200 {
+		t.Fatalf("reject: %d %s", rec.Code, rec.Body.String())
+	}
+	second := filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+
+	// Approved with a live task, it is still open, and the refusal names the
+	// task and its status.
+	if err := approvePlan(t, srv, second); err != nil {
+		t.Fatalf("approve the second removal: %v", err)
+	}
+	secondTasks := tasksFor(srv, second.ID)
+	if len(secondTasks) != 1 || secondTasks[0].Status != model.TaskQueued {
+		t.Fatalf("the second removal's tasks = %+v, want one queued", secondTasks)
+	}
+	refused(t, u.ID, second, "approved")
+	if err := plan(u.ID); err == nil || !strings.Contains(err.Error(), "its task "+secondTasks[0].ID+" is queued") {
+		t.Fatalf("the refusal must name the live task: %v", err)
+	}
+
+	// Approved with no live task it can never act or be decided again, so it
+	// must not block the next removal. Cancelling the queued task leaves the
+	// approval approved.
+	if _, err := srv.store.CancelTask(secondTasks[0].ID); err != nil {
+		t.Fatalf("cancel the queued task: %v", err)
+	}
+	if stored, _ := srv.store.Approval(second.ID); stored.Status != model.ApprovalApproved {
+		t.Fatalf("after the cancel the approval is %q, want it still approved", stored.Status)
+	}
+	if err := plan(u.ID); err != nil {
+		t.Fatalf("a removal after the approved one lost its task: %v", err)
+	}
+
+	deleted := seedMintedLineUser(t, srv)
+	applyLinePlan(t, srv, lineUserOpAdd, deleted.ID, line)
+	if err := srv.deleteVpnUser(deleted.ID); err != nil {
+		t.Fatal(err)
+	}
+	open := filePlan(t, srv, lineUserOpRemove, deleted.ID, line.LineHashID)
+	refused(t, deleted.ID, open, "pending")
+}
+
+// lineUserAudit returns the audit events with action that name approvalID.
+func lineUserAudit(srv *Server, action, approvalID string) []model.AuditEvent {
+	var out []model.AuditEvent
+	for _, ev := range srv.store.AuditEvents() {
+		if ev.Action == action && ev.Metadata["approval_id"] == approvalID {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// lineUserBoundTo reports whether userID holds an enabled binding to lineHashID.
+func lineUserBoundTo(t *testing.T, srv *Server, userID, lineHashID string) bool {
+	t.Helper()
+	u, ok := srv.getVpnUser(userID)
+	if !ok {
+		t.Fatalf("user %q disappeared", userID)
+	}
+	return vpnUserHasEnabledBinding(u, lineHashID)
+}
+
+// From a102 an approved line-user plan runs sb user add or sb user del on an
+// adopted node, which production has never done. Each op is pinned end to
+// end: the one task approval queues, the node it targets, the exact argv it
+// runs, the approve audit event, and what the task result then does to the
+// binding and the approval, on a failed run and on a successful retry.
+func TestApprovedAdoptedLineUserPlanRunsTheReviewedArgv(t *testing.T) {
+	// The payload is spelled out rather than re-derived, so a change to the
+	// credential bytes that reach sb fails here.
+	userAdd := func(name string) string {
+		return `"$SB_BIN" --json user add 'hub-a' '{"name":"` + name +
+			`","uuid":"9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d","flow":"xtls-rprx-vision"}'` + "\n"
+	}
+	userDel := func(name string) string {
+		return `"$SB_BIN" user del 'hub-a' '` + name + `'` + "\n"
+	}
+	cases := []struct {
+		op         string
+		boundFirst bool
+		argv       func(name string) string
+		boundAfter bool
+	}{
+		{op: lineUserOpAdd, boundFirst: false, argv: userAdd, boundAfter: true},
+		{op: lineUserOpUpdate, boundFirst: true, argv: userAdd, boundAfter: true},
+		{op: lineUserOpRemove, boundFirst: true, argv: userDel, boundAfter: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.op, func(t *testing.T) {
+			srv := newLinemetaTestServer(t, mustOpenStore(t))
+			line, u := seedLineUserFixture(t, srv)
+			if !tc.boundFirst {
+				u.Bindings = nil
+				if err := srv.putVpnUser(u); err != nil {
+					t.Fatal(err)
+				}
+			}
+			approval := filePlan(t, srv, tc.op, u.ID, line.LineHashID)
+			if err := approvePlan(t, srv, approval); err != nil {
+				t.Fatalf("approve: %v", err)
+			}
+			tasks := tasksFor(srv, approval.ID)
+			if len(tasks) != 1 {
+				t.Fatalf("approval queued %d tasks, want 1: %+v", len(tasks), tasks)
+			}
+			first := tasks[0]
+			if len(first.Targets) != 1 || first.Targets[0] != "node-a" {
+				t.Fatalf("task targets = %q, want exactly [node-a]", first.Targets)
+			}
+			want := lineUserScriptPrelude + tc.argv(userLineName(u.ID, line.LineUUID))
+			if first.Script != want {
+				t.Fatalf("task script:\n%s\nwant:\n%s", first.Script, want)
+			}
+			approves := lineUserAudit(srv, "network.singbox-lineuser.approve", approval.ID)
+			if len(approves) != 1 || approves[0].Scope != "network:apply,vpncore:admin" ||
+				approves[0].ActorID != "op-1" || approves[0].NodeID != "node-a" {
+				t.Fatalf("approve audit = %+v, want one event by op-1 on node-a under network:apply,vpncore:admin", approves)
+			}
+
+			request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
+			if err := srv.handleApprovalTaskResult(request, first, model.TaskResult{
+				TaskID: first.ID, NodeID: "node-a", ExitCode: 1, Error: "sb: inbound hub-a not found",
+			}); err != nil {
+				t.Fatalf("failed result: %v", err)
+			}
+			stored, _ := srv.store.Approval(approval.ID)
+			if stored.Status != model.ApprovalPending || stored.Reason != "execution failed: sb: inbound hub-a not found" {
+				t.Fatalf("after a failed run: status %q reason %q, want pending with the failure", stored.Status, stored.Reason)
+			}
+			if got := lineUserBoundTo(t, srv, u.ID, line.LineHashID); got != tc.boundFirst {
+				t.Fatalf("after a failed run bound = %v, want it unchanged at %v", got, tc.boundFirst)
+			}
+			if failed := lineUserAudit(srv, "vpnuser.line.failed", approval.ID); len(failed) != 1 {
+				t.Fatalf("failed-run audit = %+v, want one event", failed)
+			}
+
+			// The failure returned the approval to pending, so the same plan
+			// approves again and its second run reconciles.
+			if err := approvePlan(t, srv, stored); err != nil {
+				t.Fatalf("re-approve after a failed run: %v", err)
+			}
+			tasks = tasksFor(srv, approval.ID)
+			if len(tasks) != 2 {
+				t.Fatalf("re-approval left %d tasks, want 2: %+v", len(tasks), tasks)
+			}
+			retry := tasks[0]
+			if retry.ID == first.ID {
+				retry = tasks[1]
+			}
+			if retry.Script != want || len(retry.Targets) != 1 || retry.Targets[0] != "node-a" {
+				t.Fatalf("retry task = %+v, want the same argv on node-a", retry)
+			}
+			if err := srv.handleApprovalTaskResult(request, retry, model.TaskResult{TaskID: retry.ID, NodeID: "node-a"}); err != nil {
+				t.Fatalf("successful result: %v", err)
+			}
+			stored, _ = srv.store.Approval(approval.ID)
+			if stored.Status != model.ApprovalApplied || stored.Reason != "" {
+				t.Fatalf("after a successful run: status %q reason %q, want applied", stored.Status, stored.Reason)
+			}
+			if got := lineUserBoundTo(t, srv, u.ID, line.LineHashID); got != tc.boundAfter {
+				t.Fatalf("after a successful run bound = %v, want %v", got, tc.boundAfter)
+			}
+			if applied := lineUserAudit(srv, "vpnuser.line.applied", approval.ID); len(applied) != 1 {
+				t.Fatalf("applied audit = %+v, want one event", applied)
+			}
+		})
+	}
+}
+
+// Approving a line-user plan without queue_apply stored it approved with no
+// task, and approve is a no-op once an approval is not pending, so the plan
+// could never reach the node: the dead end dd75324 fixed for queue_apply=true.
+// The endpoint refuses it now and leaves the approval pending, and the same
+// request with queue_apply goes through.
+func TestApprovingALineUserPlanWithoutQueueApplyIsRefused(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	u.Bindings = nil
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	approval := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	decider := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: []string{"network:apply", "network:plan", "vpncore:admin"}}}
+	body := func(queue bool) string {
+		return fmt.Sprintf(`{"approval_id":%q,"queue_apply":%t,"plan_sha256":%q}`, approval.ID, queue, planSHA)
+	}
+
+	rec := decideApproval(srv, "approve", body(false), decider)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "must queue their apply task") {
+		t.Fatalf("approve without queue_apply: %d %s, want 400 naming the rule", rec.Code, rec.Body.String())
+	}
+	if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalPending || stored.ApprovedBy != "" {
+		t.Fatalf("a refused approve-only changed the approval: %+v", stored)
+	}
+	if tasks := tasksFor(srv, approval.ID); len(tasks) != 0 {
+		t.Fatalf("a refused approve-only queued %d task(s)", len(tasks))
+	}
+	if approves := lineUserAudit(srv, "network.singbox-lineuser.approve", approval.ID); len(approves) != 0 {
+		t.Fatalf("a refused approve-only wrote an approve audit event: %+v", approves)
+	}
+
+	rec = decideApproval(srv, "approve", body(true), decider)
+	if rec.Code != 200 {
+		t.Fatalf("approve with queue_apply: %d %s", rec.Code, rec.Body.String())
+	}
+	if tasks := tasksFor(srv, approval.ID); len(tasks) != 1 {
+		t.Fatalf("approve with queue_apply queued %d task(s), want 1", len(tasks))
+	}
+}
+
+// An auto-approve rule with queue=false reaches the same decision path, so a
+// line-user plan it matches stays pending for a decision that queues its
+// apply. A rule with queue=true approves and queues it.
+func TestAnApproveOnlyRuleLeavesALineUserPlanPending(t *testing.T) {
+	for _, queue := range []bool{false, true} {
+		t.Run(fmt.Sprintf("queue=%t", queue), func(t *testing.T) {
+			srv := newLinemetaTestServer(t, mustOpenStore(t))
+			line, u := seedLineUserFixture(t, srv)
+			u.Bindings = nil
+			if err := srv.putVpnUser(u); err != nil {
+				t.Fatal(err)
+			}
+			srv.approvalAutoRules = []approvalAutoRule{{Name: "lineuser", Plugin: singBoxLineUserPlugin, Queue: queue}}
+			approval := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
+			stored, _ := srv.store.Approval(approval.ID)
+			tasks := tasksFor(srv, approval.ID)
+			if !queue {
+				if stored.Status != model.ApprovalPending || len(tasks) != 0 {
+					t.Fatalf("an approve-only rule left status %q and %d task(s), want pending and none", stored.Status, len(tasks))
+				}
+				return
+			}
+			if stored.Status != model.ApprovalApproved || stored.ApprovedBy != "policy:lineuser" || len(tasks) != 1 {
+				t.Fatalf("a queueing rule left status %q by %q and %d task(s), want approved by policy:lineuser and one", stored.Status, stored.ApprovedBy, len(tasks))
+			}
+		})
+	}
+}
+
+// From 86422a1 until dd75324 approving a line-user plan with queue_apply
+// stored it approved with no task. Approving such an approval again must stay
+// the no-op the approve path promises any decided approval, with or without
+// queue_apply: no task, no audit event, no change to the approval or the
+// user, so nothing can run a plan nobody re-reviewed.
+func TestApprovingAStrandedLineUserApprovalChangesNothing(t *testing.T) {
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, u := seedLineUserFixture(t, srv)
+	u.Bindings = nil
+	if err := srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	approval := filePlan(t, srv, lineUserOpAdd, u.ID, line.LineHashID)
+	approval.Status = model.ApprovalApproved
+	approval.ApprovedBy = "op-1"
+	if err := srv.store.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := srv.store.Approval(approval.ID)
+	userBefore, _ := srv.getVpnUser(u.ID)
+	tasksBefore := len(srv.store.Tasks())
+	auditsBefore := len(srv.store.AuditEvents())
+	planSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(approval.Plan)))
+	for _, queueApply := range []bool{true, false} {
+		got, err := srv.approveApprovalCore(context.Background(), lineUserTestPrincipal(), before, queueApply, planSHA)
+		if err != nil {
+			t.Fatalf("approve an approved approval (queue_apply=%v): %v", queueApply, err)
+		}
+		if !reflect.DeepEqual(got, before) {
+			t.Fatalf("approve returned a changed approval (queue_apply=%v):\n%+v\nwant\n%+v", queueApply, got, before)
+		}
+	}
+	if after, _ := srv.store.Approval(approval.ID); !reflect.DeepEqual(after, before) {
+		t.Fatalf("stored approval changed:\n%+v\nwant\n%+v", after, before)
+	}
+	if got := len(srv.store.Tasks()); got != tasksBefore {
+		t.Fatalf("approving an approved approval queued %d task(s)", got-tasksBefore)
+	}
+	if got := len(srv.store.AuditEvents()); got != auditsBefore {
+		t.Fatalf("approving an approved approval wrote %d audit event(s)", got-auditsBefore)
+	}
+	if userAfter, _ := srv.getVpnUser(u.ID); !reflect.DeepEqual(userAfter, userBefore) {
+		t.Fatalf("user changed:\n%+v\nwant\n%+v", userAfter, userBefore)
+	}
+}
+
+func mustOpenStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
 }
 
 func TestUserLineName(t *testing.T) {

@@ -127,12 +127,13 @@ func TestTaskResultsBareModeStaysArrayQueryModeEnvelopes(t *testing.T) {
 	}
 }
 
-func TestTaskResultsOmitOutputStripsBodiesAndReturnsAll(t *testing.T) {
+func TestTaskResultsOmitOutputStripsBodies(t *testing.T) {
 	handler, st := newTestServer(t)
 	seedTaskAndResults(t, st)
 	cookies, _ := loginSession(t, handler)
 
-	// omit_output alone: enveloped, every visible row, bodies stripped, sizes kept.
+	// omit_output alone: enveloped, the default page (all four rows here),
+	// bodies stripped, sizes kept.
 	res := doJSON(t, handler, http.MethodGet, "/api/task-results?omit_output=1", "", cookies, "")
 	defer res.Body.Close()
 	var env taskResultsQueryResponse
@@ -140,7 +141,7 @@ func TestTaskResultsOmitOutputStripsBodiesAndReturnsAll(t *testing.T) {
 		t.Fatalf("omit_output must be enveloped: %v", err)
 	}
 	if env.Total != 4 || len(env.Results) != 4 {
-		t.Fatalf("omit_output without limit must return every row: total=%d len=%d", env.Total, len(env.Results))
+		t.Fatalf("omit_output without limit must return the default page: total=%d len=%d", env.Total, len(env.Results))
 	}
 	for _, r := range env.Results {
 		if r.Stdout != "" || r.Stderr != "" {

@@ -16,6 +16,18 @@ const (
 	proxyUserAlertExpiry = "expiry"
 )
 
+// proxyAlertOnlyNote ends the text of a quota or expiry alert about an
+// identity no managed render carries (vpnUserInManagedRender): it may be on
+// adopted lines only, on lines of another protocol, or on none, and in every
+// case nothing Lattice renders follows the alert. A digest, which always
+// covers two or more users, ends with proxyDigestAlertOnlyNote or
+// proxyDigestMixedAlertOnlyNote instead.
+const (
+	proxyAlertOnlyNote            = "No managed line carries this user, so Lattice will not remove it and this message is an alert only."
+	proxyDigestAlertOnlyNote      = "No managed line carries these users, so Lattice will not remove them and this message is an alert only."
+	proxyDigestMixedAlertOnlyNote = "No managed line carries the users marked alert only, so Lattice will not remove them and for them this message is an alert only."
+)
+
 type proxyUserNotificationFire struct {
 	UserID            string
 	UserName          string
@@ -27,6 +39,9 @@ type proxyUserNotificationFire struct {
 	TrafficLimitBytes int64
 	ExpiresAt         time.Time
 	Status            string
+	// AlertOnly marks an alert about an identity outside the managed render:
+	// nothing Lattice renders removes it, so the text says so.
+	AlertOnly bool
 }
 
 func (s *Server) evaluateProxyUserNotifications(now time.Time, onlyID string) ([]proxyUserNotificationFire, error) {
@@ -317,7 +332,7 @@ func proxyUserDigestMessage(kind string, alerts []proxyUserNotificationFire, now
 			}
 			lines = append(lines, strings.Join([]string{renewalShortDate(a.ExpiresAt, now), name(a), when}, "  "))
 		}
-		return fmt.Sprintf("Lattice proxy expiry digest: %d users", len(sorted)), strings.Join(lines, "\n")
+		return fmt.Sprintf("Lattice proxy expiry digest: %d users", len(sorted)), proxyDigestBody(sorted, lines)
 	}
 	share := func(a proxyUserNotificationFire) float64 {
 		return float64(a.UsedBytes) / float64(a.TrafficLimitBytes)
@@ -331,7 +346,42 @@ func proxyUserDigestMessage(kind string, alerts []proxyUserNotificationFire, now
 	for _, a := range sorted {
 		lines = append(lines, fmt.Sprintf("%s  %s of %s (%.1f%%)", name(a), formatProxyBytes(a.UsedBytes), formatProxyBytes(a.TrafficLimitBytes), share(a)*100))
 	}
-	return fmt.Sprintf("Lattice proxy quota digest: %d users", len(sorted)), strings.Join(lines, "\n")
+	return fmt.Sprintf("Lattice proxy quota digest: %d users", len(sorted)), proxyDigestBody(sorted, lines)
+}
+
+// proxyDigestBody joins a digest's lines, one per alert in the same order,
+// and says which of them are an alert only: the whole message when every user
+// is outside the managed render, otherwise the lines marked "alert only".
+func proxyDigestBody(alerts []proxyUserNotificationFire, lines []string) string {
+	alertOnly := 0
+	for _, a := range alerts {
+		if a.AlertOnly {
+			alertOnly++
+		}
+	}
+	switch alertOnly {
+	case 0:
+		return strings.Join(lines, "\n")
+	case len(alerts):
+		return strings.Join(lines, "\n") + "\n" + proxyDigestAlertOnlyNote
+	}
+	marked := make([]string, len(lines))
+	for i, line := range lines {
+		marked[i] = line
+		if alerts[i].AlertOnly {
+			marked[i] += "  alert only"
+		}
+	}
+	return strings.Join(marked, "\n") + "\n" + proxyDigestMixedAlertOnlyNote
+}
+
+// withAlertOnlyNote ends a single alert's text with proxyAlertOnlyNote when
+// the alert is about an identity outside the managed render.
+func withAlertOnlyNote(alert proxyUserNotificationFire, body string) string {
+	if !alert.AlertOnly {
+		return body
+	}
+	return body + " " + proxyAlertOnlyNote
 }
 
 func (s *Server) emitProxyUserNotification(alert proxyUserNotificationFire) {
@@ -342,7 +392,7 @@ func (s *Server) emitProxyUserNotification(alert proxyUserNotificationFire) {
 		title := fmt.Sprintf("Lattice proxy quota %d%%: %s", alert.ThresholdPercent, name)
 		body := fmt.Sprintf("%s used %s of %s (%.1f%%). Status: %s.",
 			name, formatProxyBytes(alert.UsedBytes), formatProxyBytes(alert.TrafficLimitBytes), pct, firstNonEmpty(alert.Status, model.ProxyUserStatusActive))
-		s.emitNotify(title, body)
+		s.emitNotify(title, withAlertOnlyNote(alert, body))
 	case proxyUserAlertExpiry:
 		when := dateOnlyUTC(alert.ExpiresAt).Format("2006-01-02")
 		due := "expired"
@@ -352,19 +402,27 @@ func (s *Server) emitProxyUserNotification(alert proxyUserNotificationFire) {
 		title := fmt.Sprintf("Lattice proxy expiry %s: %s", due, name)
 		body := fmt.Sprintf("%s subscription expires on %s. Status: %s.",
 			name, when, firstNonEmpty(alert.Status, model.ProxyUserStatusActive))
-		s.emitNotify(title, body)
+		s.emitNotify(title, withAlertOnlyNote(alert, body))
 	}
 }
 
 func formatProxyBytes(v int64) string {
+	return formatProxyBytesIn(v, v)
+}
+
+// formatProxyBytesIn formats v in the unit formatProxyBytes picks for ref, so
+// two figures meant to be compared read in one unit: "1100 B of its 1000 B
+// quota", not "1.1 KiB of its 1000 B quota".
+func formatProxyBytesIn(v, ref int64) string {
 	const unit = 1024
-	if v < unit {
+	if ref < unit {
 		return fmt.Sprintf("%d B", v)
 	}
-	value := float64(v)
+	value, scale := float64(v), float64(ref)
 	for _, suffix := range []string{"KiB", "MiB", "GiB", "TiB", "PiB"} {
 		value /= unit
-		if value < unit {
+		scale /= unit
+		if scale < unit {
 			return fmt.Sprintf("%.1f %s", value, suffix)
 		}
 	}

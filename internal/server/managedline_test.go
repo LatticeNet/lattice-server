@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
@@ -311,7 +312,7 @@ func TestManagedLineValidateAndApplyScript(t *testing.T) {
 	u := seedManagedLineUser(t, srv)
 	approval, def := compileApproval(t, srv)
 
-	if _, _, _, err := srv.validateManagedLineApproval(approval); err != nil {
+	if _, _, _, err := srv.validateManagedLineApproval(approval, true); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	script := srv.managedLineApplyScript(approval)
@@ -358,7 +359,7 @@ func TestManagedLineValidateFailClosed(t *testing.T) {
 	if err := srv.putVpnUser(u); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := srv.validateManagedLineApproval(approval); err == nil ||
+	if _, _, _, err := srv.validateManagedLineApproval(approval, true); err == nil ||
 		!strings.Contains(err.Error(), "re-plan") {
 		t.Fatalf("rotated credential must fail validation, got %v", err)
 	}
@@ -375,7 +376,7 @@ func TestManagedLineValidateFailClosed(t *testing.T) {
 	seedManagedLineNode(t, srv, "node-a", append(realityInventoryLines(), model.SingBoxNode{
 		Name: "squatter", Protocol: "vless", Network: "tcp", Address: "203.0.113.10", Port: strconv.Itoa(def.Port),
 	}))
-	if _, _, _, err := srv.validateManagedLineApproval(approval); err == nil ||
+	if _, _, _, err := srv.validateManagedLineApproval(approval, true); err == nil ||
 		!strings.Contains(err.Error(), "port") {
 		t.Fatalf("port conflict must fail validation, got %v", err)
 	}
@@ -547,5 +548,156 @@ func TestUnmetActiveDependencies(t *testing.T) {
 	}
 	if strings.Contains(joined, "dep.active") || strings.Contains(joined, "optional-ghost") {
 		t.Fatalf("satisfied/optional deps must not appear: %q", joined)
+	}
+}
+
+// decideApproval drives one decision verb's handler as p.
+func decideApproval(srv *Server, verb, body string, p principal) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/network/approvals/"+verb, strings.NewReader(body))
+	switch verb {
+	case "approve":
+		srv.handleApprove(rec, req, p)
+	case "reject":
+		srv.handleRejectApproval(rec, req, p)
+	case "dismiss":
+		srv.handleDismissApproval(rec, req, p)
+	default:
+		panic("unknown decision verb " + verb)
+	}
+	return rec
+}
+
+// A rollout's plan names the user its fragment grants by email, so it is read
+// and decided as a line-user plan is: listed only to an unrestricted
+// principal with the vpn-core read or admin scope and network:plan on the
+// node, and decided only with vpncore:admin besides network:apply. Before,
+// bare network:plan on the node listed it and bare network:apply decided it.
+func TestManagedLineRolloutIsReadAndDecidedOnlyByVpnCoreAdmins(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	seedManagedLineNode(t, srv, "node-a", realityInventoryLines())
+	seedManagedLineUser(t, srv)
+	approval, _ := compileApproval(t, srv)
+	if !strings.Contains(approval.Plan, "cdcd@example.com") {
+		t.Fatalf("the rollout plan must name its user for this test to mean anything: %s", approval.Plan)
+	}
+
+	listing := []struct {
+		name      string
+		scopes    []string
+		allowlist []string
+		listed    bool
+	}{
+		{name: "network:plan", scopes: []string{"network:plan"}},
+		{name: "network:plan on the node", scopes: []string{"network:plan"}, allowlist: []string{"node-a"}},
+		{name: "vpncore:admin confined to the node", scopes: []string{"network:plan", "vpncore:admin"}, allowlist: []string{"node-a"}},
+		{name: "vpncore:admin without network:plan", scopes: []string{"vpncore:admin"}},
+		{name: "vpncore:read", scopes: []string{"network:plan", "vpncore:read"}, listed: true},
+		{name: "vpncore:admin", scopes: []string{"network:plan", "vpncore:admin"}, listed: true},
+	}
+	for _, tc := range listing {
+		t.Run("list/"+tc.name, func(t *testing.T) {
+			p := principal{Principal: rbac.Principal{ActorID: "reader", Scopes: tc.scopes, ServerAllowlist: tc.allowlist}}
+			rec := httptest.NewRecorder()
+			srv.handleApprovals(rec, httptest.NewRequest(http.MethodGet, "/api/network/approvals?include=plan", nil), p)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("list: %d %s", rec.Code, rec.Body.String())
+			}
+			body := rec.Body.String()
+			listed := strings.Contains(body, `"plugin":"`+singBoxManagedLinePlugin+`"`)
+			if listed != tc.listed {
+				t.Fatalf("rollout approval listed = %v, want %v: %s", listed, tc.listed, body)
+			}
+			if !tc.listed && strings.Contains(body, "cdcd@example.com") {
+				t.Fatalf("the rollout's user reached a principal that cannot read identities: %s", body)
+			}
+		})
+	}
+
+	planSHA := planSHA256(approval.Plan)
+	approve := `{"approval_id":"` + approval.ID + `","queue_apply":true,"plan_sha256":"` + planSHA + `"}`
+	reject := `{"approval_id":"` + approval.ID + `"}`
+	refused := []struct {
+		name      string
+		scopes    []string
+		allowlist []string
+	}{
+		{name: "network:apply", scopes: []string{"network:apply", "network:plan"}},
+		{name: "vpncore:read", scopes: []string{"network:apply", "network:plan", "vpncore:read"}},
+		// The decision verbs answer with the plan, so a decider must also
+		// pass the read gate (approvalPlanNamesIdentities).
+		{name: "vpncore:admin confined to the node", scopes: []string{"network:apply", "network:plan", "vpncore:admin"}, allowlist: []string{"node-a"}},
+	}
+	for _, tc := range refused {
+		t.Run("decide/"+tc.name, func(t *testing.T) {
+			p := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: tc.scopes, ServerAllowlist: tc.allowlist}}
+			for verb, body := range map[string]string{"approve": approve, "reject": reject} {
+				rec := decideApproval(srv, verb, body, p)
+				if rec.Code != http.StatusForbidden {
+					t.Fatalf("%s: status %d, want 403: %s", verb, rec.Code, rec.Body.String())
+				}
+				if strings.Contains(rec.Body.String(), "cdcd@example.com") {
+					t.Fatalf("%s: the refusal carried the plan: %s", verb, rec.Body.String())
+				}
+			}
+			if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalPending {
+				t.Fatalf("a refused decider changed the approval to %q", stored.Status)
+			}
+		})
+	}
+
+	t.Run("decide/vpncore:admin", func(t *testing.T) {
+		p := principal{Principal: rbac.Principal{ActorID: "decider", Scopes: []string{"network:apply", "network:plan", "vpncore:admin"}}}
+		rec := decideApproval(srv, "approve", approve, p)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "cdcd@example.com") {
+			t.Fatalf("approve: %d %s", rec.Code, rec.Body.String())
+		}
+		queued := 0
+		for _, task := range srv.store.Tasks() {
+			if task.ApprovalID == approval.ID {
+				queued++
+			}
+		}
+		if queued != 1 {
+			t.Fatalf("approve queued %d task(s), want 1", queued)
+		}
+		audited := false
+		for _, ev := range srv.store.AuditEvents() {
+			if ev.Action == "network."+singBoxManagedLinePlugin+".approve" && ev.Metadata["approval_id"] == approval.ID {
+				audited = ev.Scope == "network:apply,vpncore:admin"
+			}
+		}
+		if !audited {
+			t.Fatal("the approve audit event must record network:apply,vpncore:admin")
+		}
+	})
+}
+
+// A rollout approved without its apply task was stranded twice over: nothing
+// queues the task later, and the definition stays planned, so the next
+// rollout skips the node. Approve-only is refused and leaves both alone.
+func TestApprovingARolloutWithoutQueueApplyIsRefused(t *testing.T) {
+	srv := newManagedLineTestServer(t)
+	seedManagedLineNode(t, srv, "node-a", realityInventoryLines())
+	seedManagedLineUser(t, srv)
+	approval, def := compileApproval(t, srv)
+	p := principal{Principal: rbac.Principal{ActorID: "op-1"}}
+	_, err := srv.approveApprovalCore(context.Background(), p, approval, false, planSHA256(approval.Plan))
+	if err == nil || !strings.Contains(err.Error(), "must queue their apply task") {
+		t.Fatalf("approve-only on a rollout: %v, want the queue_apply refusal", err)
+	}
+	if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalPending {
+		t.Fatalf("status = %q, want pending", stored.Status)
+	}
+	if stored, ok, _ := srv.managedLineDefByUUID(def.LineUUID); !ok || stored.Status != managedLineStatusPlanned || stored.ApprovalID != approval.ID {
+		t.Fatalf("definition changed: %+v", stored)
+	}
+	for _, task := range srv.store.Tasks() {
+		if task.ApprovalID == approval.ID {
+			t.Fatalf("approve-only queued task %s", task.ID)
+		}
+	}
+	if _, err := srv.approveApprovalCore(context.Background(), p, approval, true, planSHA256(approval.Plan)); err != nil {
+		t.Fatalf("approve with queue_apply: %v", err)
 	}
 }

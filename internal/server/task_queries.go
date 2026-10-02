@@ -8,8 +8,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -43,6 +45,118 @@ var taskOrigins = []string{taskOriginApproval, taskOriginRerun, taskOriginDirect
 
 // taskCountsWindow is the window failed_24h and finished_24h look back over.
 const taskCountsWindow = 24 * time.Hour
+
+// maxStderrHeadBytes bounds stderr_head: one line a table cell can show.
+const maxStderrHeadBytes = 200
+
+// taskResultReadable is the check that admits a task result to a caller,
+// and with it the full stdout and stderr: task:read on the node that ran
+// it. Every result read (the bare array, the query page, and stderr_head on
+// a bodyless row) goes through it, so none can show more than another.
+func taskResultReadable(p principal, result model.TaskResult) bool {
+	return rbac.Allows(p.Principal, "task:read", result.NodeID)
+}
+
+// taskStderrHead is the first non-blank line of stderr, so a failed run can
+// say why in one line ("sh: curl: not found") without the body. A carriage
+// return ends a line as a newline does (progress meters rewrite a line with
+// it), invalid UTF-8 becomes U+FFFD, ANSI escape sequences are removed whole
+// (stripANSI), remaining control characters are dropped, and the line is
+// trimmed and cut to at most maxStderrHeadBytes on a UTF-8 boundary. It is
+// empty when stderr holds nothing but blank lines.
+func taskStderrHead(stderr string) string {
+	for _, line := range strings.FieldsFunc(stderr, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		line = strings.Map(func(r rune) rune {
+			switch {
+			case r == '\t':
+				return ' '
+			case r < 0x20 || r == 0x7f:
+				return -1
+			}
+			return r
+		}, stripANSI(strings.ToValidUTF8(line, "�")))
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > maxStderrHeadBytes {
+			cut := maxStderrHeadBytes
+			for cut > 0 && !utf8.RuneStart(line[cut]) {
+				cut--
+			}
+			line = strings.TrimSpace(line[:cut])
+		}
+		return line
+	}
+	return ""
+}
+
+// stripANSI removes ANSI escape sequences whole, so "\x1b[31mfailed\x1b[0m"
+// reads "failed" rather than "[31mfailed[0m":
+//   - CSI: ESC [ then parameter bytes 0x30-0x3F, intermediate bytes 0x20-0x2F
+//     and one final byte 0x40-0x7E (colours, ESC [ 2 K, ESC [ ? 25 l);
+//   - OSC, DCS, SOS, PM and APC: ESC ] (or P, X, ^, _) up to BEL or ST
+//     (ESC \), such as a window title or an OSC 8 hyperlink; an unterminated
+//     one runs to the end of the text;
+//   - any other escape: ESC, intermediate bytes 0x20-0x2F, one final byte
+//     0x30-0x7E (ESC ( B, ESC 7).
+//
+// A sequence cut short by a byte outside its grammar ends there and scanning
+// resumes at that byte. Every byte that starts, delimits or ends a sequence is
+// ASCII, and no UTF-8 multibyte character contains an ASCII byte, so the text
+// around a sequence keeps its UTF-8 intact.
+func stripANSI(s string) string {
+	if strings.IndexByte(s, 0x1b) < 0 {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != 0x1b {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		i++ // ESC
+		if i >= len(s) {
+			break
+		}
+		switch c := s[i]; {
+		case c == '[':
+			i++
+			for i < len(s) && s[i] >= 0x30 && s[i] <= 0x3f {
+				i++
+			}
+			for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
+				i++
+			}
+			if i < len(s) && s[i] >= 0x40 && s[i] <= 0x7e {
+				i++
+			}
+		case c == ']' || c == 'P' || c == 'X' || c == '^' || c == '_':
+			i++
+			for i < len(s) {
+				if s[i] == 0x07 {
+					i++
+					break
+				}
+				if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+					i += 2
+					break
+				}
+				i++
+			}
+		default:
+			for i < len(s) && s[i] >= 0x20 && s[i] <= 0x2f {
+				i++
+			}
+			if i < len(s) && s[i] >= 0x30 && s[i] <= 0x7e {
+				i++
+			}
+		}
+	}
+	return b.String()
+}
 
 func taskOrigin(t model.Task) string {
 	switch {
@@ -86,7 +200,13 @@ func (s *Server) visibleTaskRows(p principal) []taskRow {
 // and one outside the caller's scope, so a row must not name an approval the
 // caller could not open; origin still says the task came from one.
 func (s *Server) taskRowViews(p principal, rows []taskRow) []taskView {
-	readable := s.readableApprovalIDs(p, rows)
+	var named []string
+	for _, row := range rows {
+		if id := row.task.ApprovalID; id != "" {
+			named = append(named, id)
+		}
+	}
+	readable := s.readableApprovalIDs(p, named)
 	views := make([]taskView, 0, len(rows))
 	for _, row := range rows {
 		view := row.view
@@ -99,19 +219,14 @@ func (s *Server) taskRowViews(p principal, rows []taskRow) []taskView {
 	return views
 }
 
-// readableApprovalIDs resolves, once per response, which of the approvals
-// named by rows p may read. The approvals come from one store read, and each
-// distinct approval is judged once by approvalVisibleToPrincipal, the rule
-// the approvals read applies, so the two cannot drift. That rule still reads
-// the store for the plan reach of an nftpolicy or WireGuard mesh approval
-// whose primary scope the caller holds.
-func (s *Server) readableApprovalIDs(p principal, rows []taskRow) map[string]bool {
-	var named []string
-	for _, row := range rows {
-		if id := row.task.ApprovalID; id != "" {
-			named = append(named, id)
-		}
-	}
+// readableApprovalIDs resolves, once per response, which of the named
+// approvals p may read. The approvals come from one store read, and each is
+// judged by approvalVisibleToPrincipal, the rule the approvals read applies,
+// so the two cannot drift. Both the approval_id a row shows and the
+// approval_id filter go through here. That rule still reads the store for
+// the plan reach of an nftpolicy or WireGuard mesh approval whose primary
+// scope the caller holds. An unknown id is not readable.
+func (s *Server) readableApprovalIDs(p principal, named []string) map[string]bool {
 	if len(named) == 0 {
 		return nil
 	}
@@ -153,14 +268,25 @@ func taskLastChangedAt(t model.Task, status string, deadline time.Duration) time
 // taskListFilter is the parsed row filter of GET /api/tasks. Every field
 // matches something the row itself says, so a URL maps to one question.
 type taskListFilter struct {
-	statuses map[string]bool
-	origins  map[string]bool
-	nodeID   string
-	since    time.Time
+	statuses   map[string]bool
+	origins    map[string]bool
+	nodeID     string
+	since      time.Time
+	approvalID string
 }
 
+// maxApprovalIDParam bounds approval_id. Approval ids are "approval_" plus
+// 16 base32 characters (id.New), so 128 leaves room for any older shape.
+const maxApprovalIDParam = 128
+
 func parseTaskListFilter(q url.Values) (taskListFilter, error) {
-	f := taskListFilter{nodeID: strings.TrimSpace(q.Get("node_id"))}
+	f := taskListFilter{
+		nodeID:     strings.TrimSpace(q.Get("node_id")),
+		approvalID: strings.TrimSpace(q.Get("approval_id")),
+	}
+	if !validApprovalIDParam(f.approvalID) {
+		return f, fmt.Errorf("approval_id must be one id of at most %d characters from A-Z, a-z, 0-9, _ and -", maxApprovalIDParam)
+	}
 	var err error
 	if f.statuses, err = parseEnumList(q.Get("status"), "status", taskListStatuses); err != nil {
 		return f, err
@@ -176,6 +302,21 @@ func parseTaskListFilter(q url.Values) (taskListFilter, error) {
 		f.since = since
 	}
 	return f, nil
+}
+
+// validApprovalIDParam accepts an empty value (no filter) or one id in the
+// character set id.New produces. A comma list, a wildcard or anything longer
+// than maxApprovalIDParam is refused rather than matched against nothing.
+func validApprovalIDParam(raw string) bool {
+	if len(raw) > maxApprovalIDParam {
+		return false
+	}
+	for _, c := range raw {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // parseEnumList reads a comma list whose every entry must be one of allowed.
@@ -220,6 +361,11 @@ func (f taskListFilter) matches(row taskRow, deadline time.Duration) bool {
 		return false
 	}
 	if !f.since.IsZero() && taskLastChangedAt(row.task, row.view.Status, deadline).Before(f.since) {
+		return false
+	}
+	// The caller must also be able to read the approval; handleTasks checks
+	// that once before any row is matched.
+	if f.approvalID != "" && row.task.ApprovalID != f.approvalID {
 		return false
 	}
 	return true

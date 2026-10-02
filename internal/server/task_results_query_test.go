@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -72,12 +74,10 @@ func TestTaskResultsTaskIDListAndPaging(t *testing.T) {
 		t.Fatalf("101 ids = %d, want 400: %s", code, body)
 	}
 
-	// Wave 1 behaviour, pinned on purpose: an explicit limit pages bodyless
-	// rows, and omit_output without a limit returns every match (more than
-	// the default page of 100 here), because today's Tasks page builds its
-	// node rows from all of them. Design 23 wave 2 moves that poll to
-	// task_id and applies the default page in the same release; this case
-	// changes then.
+	// Since design 23 wave 2 the Tasks page always sends task_id or a limit,
+	// so omit_output no longer lifts the page size: without a limit it
+	// returns the default page of 100 (the fixture holds more), with one it
+	// returns that many, and total still counts every match.
 	for i := 0; i < 130; i++ {
 		if err := st.AddTaskResult(model.TaskResult{
 			TaskID: "t-bulk", NodeID: "node-a", Stdout: "bulk", FinishedAt: now.Add(-time.Duration(i) * time.Second),
@@ -87,10 +87,10 @@ func TestTaskResultsTaskIDListAndPaging(t *testing.T) {
 	}
 	all := len(st.Results())
 	if all <= defaultTaskQueryLimit {
-		t.Fatalf("fixture holds %d results; it must exceed the default page to pin anything", all)
+		t.Fatalf("fixture holds %d results; it must exceed the default page to test paging", all)
 	}
 	for query, wantRows := range map[string]int{
-		"omit_output=1":           all,
+		"omit_output=1":           defaultTaskQueryLimit,
 		"omit_output=1&limit=7":   7,
 		"omit_output=1&limit=500": all,
 	} {
@@ -103,5 +103,141 @@ func TestTaskResultsTaskIDListAndPaging(t *testing.T) {
 				t.Fatalf("results?%s sent a body", query)
 			}
 		}
+	}
+}
+
+func TestTaskStderrHead(t *testing.T) {
+	cases := []struct {
+		name, stderr, want string
+	}{
+		{"empty", "", ""},
+		{"only blank lines", "\n \n\t\n", ""},
+		{"one line", "sh: curl: not found\n", "sh: curl: not found"},
+		{"first non-blank line, trimmed", "\n\n   warn: disk 91% full  \nsecond line", "warn: disk 91% full"},
+		{"carriage returns end a line", "\r\n  \r100  5120\rcurl: (22) 404\n", "100  5120"},
+		{"tabs become spaces, escapes and control characters go", "\x1b[31mfailed\x1b[0m\tcode\x07 7", "failed code 7"},
+		{"a line of only escapes is blank", "\x1b[0m\x1b[?25l\nreal error", "real error"},
+		{"an erase-line CSI before a progress update", "\x1b[2Kdownloading 45%", "downloading 45%"},
+		{"invalid UTF-8 is replaced", "bad \xff byte", "bad � byte"},
+		{"long ASCII is cut at 200 bytes", strings.Repeat("a", 300), strings.Repeat("a", 200)},
+		// 199 bytes then a 3-byte rune: the cut must not split it.
+		{"a rune across the boundary is left out", strings.Repeat("a", 199) + "中文", strings.Repeat("a", 199)},
+		{"a rune that ends on the boundary stays", strings.Repeat("a", 197) + "中文", strings.Repeat("a", 197) + "中"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := taskStderrHead(tc.stderr)
+			if got != tc.want {
+				t.Fatalf("taskStderrHead(%q) = %q, want %q", tc.stderr, got, tc.want)
+			}
+			if len(got) > maxStderrHeadBytes || !utf8.ValidString(got) {
+				t.Fatalf("head %q is %d bytes, valid UTF-8 %v", got, len(got), utf8.ValidString(got))
+			}
+		})
+	}
+}
+
+func TestTaskResultsStderrHeadFollowsTheFullReadCheck(t *testing.T) {
+	admin, confined, st, now := newTaskQueryFixture(t)
+	for _, r := range []model.TaskResult{
+		{TaskID: "t-head", NodeID: "node-a", ExitCode: 127, Stderr: "\nsh: curl: not found\nsecond line", FinishedAt: now},
+		{TaskID: "t-head", NodeID: "node-c", ExitCode: 1, Stderr: "node-c only: permission denied", FinishedAt: now},
+		{TaskID: "t-head", NodeID: "node-b", ExitCode: 0, Stdout: "ok", FinishedAt: now},
+	} {
+		if err := st.AddTaskResult(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	heads := func(r taskQueryReader, query string) map[string]string {
+		t.Helper()
+		code, body := r.get(t, "/api/task-results?"+query)
+		if code != http.StatusOK {
+			t.Fatalf("results?%s = %d: %s", query, code, body)
+		}
+		var raw struct {
+			Results []map[string]any `json:"results"`
+		}
+		if err := json.Unmarshal(body, &raw); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for _, row := range raw.Results {
+			head, present := row["stderr_head"]
+			if !present {
+				out[row["node_id"].(string)] = "<absent>"
+				continue
+			}
+			out[row["node_id"].(string)] = head.(string)
+		}
+		return out
+	}
+
+	cases := []struct {
+		name   string
+		reader taskQueryReader
+		query  string
+		want   map[string]string
+	}{
+		{"admin", admin, "task_id=t-head&omit_output=1", map[string]string{
+			"node-a": "sh: curl: not found", "node-c": "node-c only: permission denied", "node-b": "<absent>",
+		}},
+		// No task:read on node-c: that result is not this caller's to read in
+		// full, so neither the row nor its head comes back.
+		{"confined to node-a and node-b", confined, "task_id=t-head&omit_output=1", map[string]string{
+			"node-a": "sh: curl: not found", "node-b": "<absent>",
+		}},
+		// Rows with bodies carry the full stderr and no head.
+		{"bodies instead of heads", admin, "task_id=t-head", map[string]string{
+			"node-a": "<absent>", "node-c": "<absent>", "node-b": "<absent>",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := heads(tc.reader, tc.query); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("stderr_head by node = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	cookies, csrf := loginSession(t, admin.handler)
+	noRead := createPAT(t, admin.handler, cookies, csrf, []string{"audit:read"}, nil)
+	res := doBearerJSON(t, admin.handler, http.MethodGet, "/api/task-results?task_id=t-head&omit_output=1", "", noRead)
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("results without task:read = %d, want 403", res.StatusCode)
+	}
+}
+
+func TestStripANSI(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"no escapes", "plain text 中文", "plain text 中文"},
+		{"SGR colour", "\x1b[31mfailed\x1b[0m", "failed"},
+		{"SGR with several parameters", "\x1b[1;38;5;196mbold red\x1b[m", "bold red"},
+		{"erase line", "\x1b[2Kdone", "done"},
+		{"private mode", "\x1b[?25lcursor hidden\x1b[?25h", "cursor hidden"},
+		{"OSC title ended by BEL", "\x1b]0;build: main\x07error: boom", "error: boom"},
+		{"OSC title with UTF-8 ended by ST", "\x1b]2;标题\x1b\\ok", "ok"},
+		{"OSC 8 hyperlink", "see \x1b]8;;https://example.com\x1b\\the docs\x1b]8;;\x1b\\ now", "see the docs now"},
+		{"unterminated OSC runs to the end", "before\x1b]0;title never ends", "before"},
+		{"DCS ended by ST", "a\x1bPq#0;2;0;0;0\x1b\\b", "ab"},
+		{"charset designation", "\x1b(Bplain\x1b)0", "plain"},
+		{"two-byte escape", "\x1b7saved\x1b8", "saved"},
+		{"lone ESC at the end", "abc\x1b", "abc"},
+		// A CSI cut short by a byte outside its grammar ends at that byte.
+		{"malformed CSI keeps what follows", "\x1b[12中文", "中文"},
+		{"text on both sides keeps its UTF-8", "中\x1b[31m文\x1b[0m字", "中文字"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripANSI(tc.in)
+			if got != tc.want {
+				t.Fatalf("stripANSI(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("stripANSI(%q) returned invalid UTF-8 %q", tc.in, got)
+			}
+		})
 	}
 }

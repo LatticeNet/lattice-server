@@ -416,9 +416,21 @@ func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, r
 		if !ok {
 			return nil, fmt.Errorf("vpn-core/users-admin delete: user %q not found", id)
 		}
-		if user.MigratedFromProxyUser == "" {
-			if err := s.store.DeleteProxyUser(id); err != nil {
-				return nil, fmt.Errorf("delete canonical usage projection: %w", err)
+		// Every boot runs migrateProxyUsersToVpnUsers, which derives vu_<id>
+		// for any proxy user that has no identity, copying its sub token into
+		// SubID. A proxy user left behind here is therefore the deleted
+		// identity, token included, at the next restart: the legacy user a
+		// migrated identity came from, and the usage projection stored under
+		// the identity's own id. Both go before the identity record, so a
+		// failure in between leaves an identity that a second delete
+		// finishes, never a legacy user with no identity.
+		legacy := []string{id}
+		if user.MigratedFromProxyUser != "" {
+			legacy = append(legacy, user.MigratedFromProxyUser)
+		}
+		for _, proxyUserID := range legacy {
+			if err := s.store.DeleteProxyUser(proxyUserID); err != nil {
+				return nil, fmt.Errorf("delete proxy user %q behind identity %q: %w", proxyUserID, id, err)
 			}
 		}
 		if err := s.deleteVpnUser(id); err != nil {

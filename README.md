@@ -343,6 +343,20 @@ Use the compose file and deployment guide in the umbrella repository:
   installed and systemd accepted the delayed restart unit. That success records
   `last_applied_version`; the live source of truth remains the next node
   heartbeat's reported `agent_version`.
+  A plan rendered by this server also names two node-side steps, and the task
+  script performs each only for an approval whose plan names it, so an
+  approval planned earlier runs the script it was approved with. When the
+  candidate's `-compat-json` lists `sd-notify-v1`, the script writes
+  `/etc/systemd/system/<service>.service.d/10-lattice-keepalive.conf`
+  (`NotifyAccess=main` and a runtime directory; the unit type is unchanged) so
+  the new agent can arm its own watchdog. When it also lists
+  `health-marker-v1` and a previous binary exists, the script arms an update
+  guard before it schedules the restart: a transient systemd timer that, 300 s
+  later (systemd's default one minute timer accuracy applies), keeps the new
+  binary if `/run/<service>/healthy` holds the target version, leaves a binary
+  that changed since the update alone, and otherwise restores the backup and
+  restarts the service. A guard that cannot be armed restores the backup and
+  fails the task, leaving the running agent untouched.
 - Node reconfigure commands source both the canonical
   `/opt/lattice/lattice-agent.env` and legacy `/opt/lattice/node-agent/agent.env`
   before rerunning the installer. Operators can therefore reconfigure or upgrade

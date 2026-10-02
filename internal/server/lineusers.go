@@ -283,7 +283,14 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	if op == lineUserOpAdd && bound {
 		return nil, fmt.Errorf("user %q is already bound to line %q; plan_update instead", u.ID, ln.LineHashID)
 	}
-	if (op == lineUserOpUpdate || op == lineUserOpRemove) && !bound {
+	// A remove on an adopted line does not need a binding. unbind drops only
+	// the server's record, so a user that plan_add put on the node keeps its
+	// credential there after an unbind, and plan_remove is the only way
+	// Lattice can take it off. sb user del names only this user's derived
+	// name, so the plan cannot touch anyone else. A managed line's render
+	// already leaves an unbound user out, so a remove there would change
+	// nothing and still needs the binding.
+	if (op == lineUserOpUpdate || (op == lineUserOpRemove && ln.Managed)) && !bound {
 		return nil, fmt.Errorf("user %q is not bound to line %q", u.ID, ln.LineHashID)
 	}
 	name := userLineName(u.ID, ln.LineUUID)
@@ -312,6 +319,9 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	}
 	summary := fmt.Sprintf("sb user %s %s on node %s (user %s as %s, credential sha %s…)",
 		op, ln.Tag, ln.NodeID, u.Email, name, sha[:12])
+	if op == lineUserOpRemove && !bound {
+		summary += "; Lattice holds no binding for this user on the line"
+	}
 	if track == lineUserTrackManaged {
 		summary = fmt.Sprintf("render full sing-box config for %s on node %s (%s user %s as %s, config sha %s…)",
 			ln.Tag, ln.NodeID, op, u.Email, name, configSHA[:12])
@@ -535,8 +545,13 @@ func (s *Server) validateLineUserApproval(approval model.Approval, checkGrant bo
 	if plan.Track != track || plan.NodeID != line.NodeID || plan.Line != line.Tag || plan.LineUUID != line.LineUUID || plan.Protocol != line.Type || plan.UserName != userLineName(user.ID, line.LineUUID) {
 		return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, errors.New("line identity, track, tag, UUID, or protocol changed; re-plan")
 	}
+	// An adopted remove needs no binding, for the reason vpnUserLinePlan
+	// gives; one filed while the user was bound still completes after an
+	// unbind.
 	bound := vpnUserHasEnabledBinding(user, line.LineHashID)
-	if (plan.Op == lineUserOpAdd && bound) || ((plan.Op == lineUserOpUpdate || plan.Op == lineUserOpRemove) && !bound) {
+	removeNeedsBinding := track == lineUserTrackManaged
+	if (plan.Op == lineUserOpAdd && bound) || (plan.Op == lineUserOpUpdate && !bound) ||
+		(plan.Op == lineUserOpRemove && removeNeedsBinding && !bound) {
 		return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, errors.New("line binding changed since planning; re-plan")
 	}
 	payload, err := lineUserCredential(user, plan.Protocol, plan.UserName)

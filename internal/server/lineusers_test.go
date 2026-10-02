@@ -219,6 +219,64 @@ func TestRemovingADeletedUsersCredentialFromAnAdoptedLine(t *testing.T) {
 	}
 }
 
+// unbind drops only the server's binding record, so a user that plan_add put
+// on an adopted line keeps its credential there, and plan_remove refused it
+// as "not bound", while a removal filed before the unbind failed with "line
+// binding changed since planning". Both complete now, removing only that
+// user's derived name. A managed line, whose render already leaves an
+// unbound user out, still needs the binding.
+func TestRemovingAnUnboundUsersCredentialFromAnAdoptedLine(t *testing.T) {
+	for _, filed := range []string{"before the unbind", "after the unbind"} {
+		t.Run(filed, func(t *testing.T) {
+			srv := newLinemetaTestServer(t, mustOpenStore(t))
+			line, u := seedLineUserFixture(t, srv)
+			unbind := func() {
+				t.Helper()
+				if _, err := srv.vpnUserUnbind(mustJSON(t, map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var approval model.Approval
+			if filed == "before the unbind" {
+				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+				unbind()
+			} else {
+				unbind()
+				approval = filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+				if !strings.Contains(approval.Plan, "Lattice holds no binding for this user on the line") {
+					t.Fatalf("the plan must say Lattice holds no binding: %s", approval.Plan)
+				}
+			}
+			if err := approvePlan(t, srv, approval); err != nil {
+				t.Fatalf("approve: %v", err)
+			}
+			tasks := tasksFor(srv, approval.ID)
+			want := lineUserScriptPrelude + `"$SB_BIN" user del 'hub-a' '` + userLineName(u.ID, line.LineUUID) + `'` + "\n"
+			if len(tasks) != 1 || tasks[0].Script != want || len(tasks[0].Targets) != 1 || tasks[0].Targets[0] != "node-a" {
+				t.Fatalf("approval queued %+v, want one task on node-a running:\n%s", tasks, want)
+			}
+			request := httptest.NewRequest("POST", "/api/agent/task-result", nil)
+			if err := srv.handleApprovalTaskResult(request, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: "node-a"}); err != nil {
+				t.Fatalf("successful result: %v", err)
+			}
+			if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalApplied {
+				t.Fatalf("status = %q reason %q, want applied", stored.Status, stored.Reason)
+			}
+			if lineUserBoundTo(t, srv, u.ID, line.LineHashID) {
+				t.Fatal("reconciling the removal bound the user again")
+			}
+		})
+	}
+
+	managedSrv := newLinemetaTestServer(t, mustOpenStore(t))
+	managedLine, identity := seedManagedLineUserFixture(t, managedSrv)
+	_, err := managedSrv.vpnUserLinePlan(lineUserTestPrincipal(),
+		mustJSON(t, map[string]string{"user_id": identity.ID, "line_hash_id": managedLine.LineHashID}), lineUserOpRemove)
+	if err == nil || !strings.Contains(err.Error(), "is not bound to line") {
+		t.Fatalf("plan_remove on a managed line for an unbound user: %v, want not bound", err)
+	}
+}
+
 // A deleted user still cannot be added or updated, and a managed line's
 // removal is left to its config apply, since its render already leaves the
 // user out.

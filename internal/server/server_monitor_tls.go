@@ -105,7 +105,7 @@ func (s *Server) sweepTLSMonitorsOnce(ctx context.Context) int {
 		if hadPrior && now.Before(prior.At.Add(tlsMonitorInterval(mon))) {
 			continue
 		}
-		if err := s.runTLSMonitor(ctx, mon, prior, hadPrior); err != nil {
+		if err := s.runTLSMonitor(ctx, mon); err != nil {
 			s.logger.Printf("tls monitor %s (%s): %v", mon.Name, mon.Target, err)
 		}
 		probed++
@@ -122,12 +122,13 @@ func tlsMonitorInterval(mon model.Monitor) time.Duration {
 
 // runTLSMonitor probes one monitor, stores the result and notifies on a
 // transition, exactly as the agent ingest path does for tcp and http.
-func (s *Server) runTLSMonitor(ctx context.Context, mon model.Monitor, prior model.MonitorResult, hadPrior bool) error {
+func (s *Server) runTLSMonitor(ctx context.Context, mon model.Monitor) error {
 	result := s.evaluateTLSMonitor(ctx, mon)
+	history := s.store.LastMonitorResultsForNode(mon.ID, "", 2)
 	if err := s.store.AddMonitorResult(result); err != nil {
 		return err
 	}
-	s.notifyMonitorTransition("", result, prior, hadPrior)
+	s.notifyMonitorTransition("", result, history)
 	return nil
 }
 

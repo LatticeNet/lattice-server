@@ -137,18 +137,25 @@ func (s *Server) noteSingBoxLiveness(nodeID string, rt *model.SingBoxRuntime) {
 	}
 
 	name := s.nodeDisplayName(nodeID)
-	// Sent through the seam rather than the dispatcher, like every other typed
-	// emitter, so the once-per-episode rule can be observed in a test.
+	// Queued rather than sent: the next liveness sweep sends every node's
+	// notice of one kind as one message, so a fleet-wide break pages once.
+	// The once-per-episode rule is decided here, per node, as before.
 	if notifyDown {
-		s.emitNotifyTyped(EventServiceDown,
-			fmt.Sprintf("sing-box %s on %s", state, name),
-			fmt.Sprintf("node %s: sing-box has been %s since %s (unit %s/%s, restarts %d). Config state is reported separately; this is the service.",
-				nodeID, state, rec.ProblemSince.Format(time.RFC3339), rt.ActiveState, rt.SubState, rt.RestartCount))
+		s.queueAlertDigest(EventServiceDown, alertDigestLine{
+			sortKey: name + "\x00" + nodeID,
+			title:   fmt.Sprintf("sing-box %s on %s", state, name),
+			body: fmt.Sprintf("%s (%s): sing-box has been %s since %s (unit %s/%s, restarts %d). Config state is reported separately; this is the service.",
+				name, nodeID, state, rec.ProblemSince.Format(time.RFC3339), rt.ActiveState, rt.SubState, rt.RestartCount),
+			line: fmt.Sprintf("%s: %s since %s (restarts %d)", name, state, rec.ProblemSince.UTC().Format("15:04Z"), rt.RestartCount),
+		})
 	}
 	if notifyRecovered {
-		s.emitNotifyTyped(EventServiceRecovered,
-			fmt.Sprintf("sing-box recovered on %s", name),
-			fmt.Sprintf("node %s: sing-box is running again (pid %d).", nodeID, rt.PID))
+		s.queueAlertDigest(EventServiceRecovered, alertDigestLine{
+			sortKey: name + "\x00" + nodeID,
+			title:   fmt.Sprintf("sing-box recovered on %s", name),
+			body:    fmt.Sprintf("%s (%s): sing-box is running again (pid %d).", name, nodeID, rt.PID),
+			line:    fmt.Sprintf("%s: running again", name),
+		})
 	}
 }
 

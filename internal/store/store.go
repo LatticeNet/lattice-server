@@ -110,6 +110,7 @@ type State struct {
 	GuardBindings           map[string]model.NodeGuardBinding   `json:"guard_bindings"`
 	GuardRealitySnapshots   map[string]GuardRealitySnapshot     `json:"guard_reality_snapshots"`
 	SingBoxLiveness         map[string]SingBoxLiveness          `json:"singbox_liveness"`
+	NodeOfflineAlerts       map[string]time.Time                `json:"node_offline_alerts,omitempty"`
 	DNSDeployments          map[string]model.DNSDeployment      `json:"dns_deployments"`
 	NetPolicies             map[string]model.NetPolicy          `json:"net_policies"`
 	Groups                  map[string]model.Group              `json:"groups"`
@@ -821,6 +822,7 @@ func emptyState() State {
 		GuardBindings:           map[string]model.NodeGuardBinding{},
 		GuardRealitySnapshots:   map[string]GuardRealitySnapshot{},
 		SingBoxLiveness:         map[string]SingBoxLiveness{},
+		NodeOfflineAlerts:       map[string]time.Time{},
 		DNSDeployments:          map[string]model.DNSDeployment{},
 		NetPolicies:             map[string]model.NetPolicy{},
 		Groups:                  map[string]model.Group{},
@@ -973,6 +975,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.SingBoxLiveness == nil {
 		st.SingBoxLiveness = map[string]SingBoxLiveness{}
+	}
+	if st.NodeOfflineAlerts == nil {
+		st.NodeOfflineAlerts = map[string]time.Time{}
 	}
 	if st.DNSDeployments == nil {
 		st.DNSDeployments = map[string]model.DNSDeployment{}
@@ -5262,14 +5267,18 @@ func (s *Store) AddMonitorResult(r model.MonitorResult) error {
 		r.At = now
 	}
 	series := s.state.MonResults[r.MonitorID]
-	var prior model.MonitorResult
-	hadPrior := false
+	var prior, prior2 model.MonitorResult
+	hadPrior, hadPrior2 := false, false
 	for i := len(series) - 1; i >= 0; i-- {
-		if series[i].NodeID == r.NodeID {
-			prior = series[i]
-			hadPrior = true
-			break
+		if series[i].NodeID != r.NodeID {
+			continue
 		}
+		if !hadPrior {
+			prior, hadPrior = series[i], true
+			continue
+		}
+		prior2, hadPrior2 = series[i], true
+		break
 	}
 	series = append(series, r)
 	if len(series) > maxMonitorResults {
@@ -5279,8 +5288,14 @@ func (s *Store) AddMonitorResult(r model.MonitorResult) error {
 
 	key := monitorResultPersistenceKey(r.MonitorID, r.NodeID)
 	transitioned := !hadPrior || prior.Success != r.Success || prior.Error != r.Error
+	// The second failure in a row is when monitor.down pages, and the alert
+	// rule reads it back from this history. Writing it at once keeps that
+	// decision true across a restart: without it the run could reload as a
+	// single failure, and the next success would owe no recovery for a page
+	// that was sent.
+	secondFailure := hadPrior && !r.Success && !prior.Success && (!hadPrior2 || prior2.Success)
 	lastPersisted, persisted := s.monitorPersistedAt[key]
-	if persisted && !transitioned && now.Sub(lastPersisted) < monitorResultPersistenceInterval {
+	if persisted && !transitioned && !secondFailure && now.Sub(lastPersisted) < monitorResultPersistenceInterval {
 		return nil
 	}
 	if err := s.Save(); err != nil {
@@ -5551,6 +5566,21 @@ func (s *Store) DeleteNotifyChannel(id string) error {
 		}
 	}
 	return s.Save()
+}
+
+// LastMonitorResultsForNode returns up to n of a node's most recent results
+// for a monitor, newest first.
+func (s *Store) LastMonitorResultsForNode(monitorID, nodeID string, n int) []model.MonitorResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	series := s.state.MonResults[monitorID]
+	var out []model.MonitorResult
+	for i := len(series) - 1; i >= 0 && len(out) < n; i-- {
+		if series[i].NodeID == nodeID {
+			out = append(out, series[i])
+		}
+	}
+	return out
 }
 
 // LastMonitorResultForNode returns a node's most recent result for a monitor.

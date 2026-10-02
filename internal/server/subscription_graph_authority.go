@@ -107,6 +107,7 @@ func (s *Server) deleteGraphNode(nodeID string) (report store.NodeCascadeReport,
 		s.agentCapabilitiesMu.Lock()
 		delete(s.agentCapabilities, nodeID)
 		s.agentCapabilitiesMu.Unlock()
+		s.forgetNodeOfflineAlert(nodeID)
 		return nil, err
 	})
 	return report, ok, err

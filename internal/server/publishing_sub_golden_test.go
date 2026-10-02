@@ -245,6 +245,8 @@ func TestSubscriptionShareWireTranscriptIsGolden(t *testing.T) {
 
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
+		// Refusal audits are written after the answer, off the request path.
+		s.shareRefusalAudits.Wait()
 
 		fmt.Fprintf(&b, "case %s\n", tc.name)
 		b.WriteString(transcribe(rec))

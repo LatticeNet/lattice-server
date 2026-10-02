@@ -851,6 +851,7 @@ func (s *Server) sweepNodeLiveness(now time.Time, cause string) {
 		})
 	}
 	s.notifyNodeLiveness(now)
+	s.flushAlertDigests()
 }
 
 // recordNodeOnline is the audit twin of the sweep's node.offline, written on

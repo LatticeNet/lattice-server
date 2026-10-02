@@ -253,3 +253,39 @@ func TestTheForkRefusesARemovalByNameAlone(t *testing.T) {
 		t.Fatalf("a refused removal changed the line: %v", users)
 	}
 }
+
+// The over-match the server cannot see before the task runs: an entry
+// further down the list, added by hand after Lattice's, holds the same uuid.
+// The fork removes both, and the counts it prints make the result say so.
+func TestAForkRemovalThatTakesAHandAddedTwinIsFlagged(t *testing.T) {
+	sb := newForkSB(t)
+	tc := forkContractCases[0]
+	srv, line, u := forkContractServer(t, tc.protocol, tc.credential)
+	sb.writeLine(line.Tag, tc.protocol, tc.owner)
+	addApproval, addTask := approvedScript(t, srv, lineUserOpAdd, u.ID, line)
+	out, code := sb.run(addTask.Script)
+	if code != 0 {
+		t.Fatalf("add: exit %d %s", code, out)
+	}
+	reportResult(t, srv, addApproval, addTask, out, code)
+
+	users := sb.users(line.Tag)
+	users = append(users, map[string]string{"name": "hand-added", "uuid": tc.credential.UUID})
+	sb.writeLine(line.Tag, tc.protocol, users...)
+
+	removeApproval, removeTask := approvedScript(t, srv, lineUserOpRemove, u.ID, line)
+	out, code = sb.run(removeTask.Script)
+	if code != 0 {
+		t.Fatalf("removal: exit %d %s", code, out)
+	}
+	if left := sb.users(line.Tag); len(left) != 1 {
+		t.Fatalf("the fork should have removed both matching entries, left %v", left)
+	}
+	got := reportResult(t, srv, removeApproval, removeTask, out, code)
+	if got.Status != model.ApprovalApplied || !strings.Contains(got.Reason, "removed 2 entries") {
+		t.Fatalf("the result must flag the over-match: status %q reason %q", got.Status, got.Reason)
+	}
+	if flags := lineUserAudit(srv, "vpnuser.line.overmatch", removeApproval.ID); len(flags) != 1 {
+		t.Fatalf("over-match audit = %+v", flags)
+	}
+}

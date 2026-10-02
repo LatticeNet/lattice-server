@@ -287,10 +287,11 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	// A remove on an adopted line does not need a binding. unbind drops only
 	// the server's record, so a user that plan_add put on the node keeps its
 	// credential there after an unbind, and plan_remove is the only way
-	// Lattice can take it off. sb user del removes the entry by the derived
-	// name and by the credential, the same payload the add sent. A managed
-	// line's render already leaves an unbound user out, so a remove there
-	// would change nothing and still needs the binding.
+	// Lattice can take it off. sb user del matches entries by name or by any
+	// credential field, so lineUserRemovalRefusal below refuses a removal
+	// that Lattice can see would also take another entry off the line. A
+	// managed line's render already leaves an unbound user out, so a remove
+	// there would change nothing and still needs the binding.
 	if (op == lineUserOpUpdate || (op == lineUserOpRemove && ln.Managed)) && !bound {
 		return nil, fmt.Errorf("user %q is not bound to line %q", u.ID, ln.LineHashID)
 	}
@@ -310,6 +311,11 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 	sha, err := lineUserCredentialSHA(payload)
 	if err != nil {
 		return nil, err
+	}
+	if op == lineUserOpRemove && !ln.Managed {
+		if err := s.lineUserRemovalRefusal(u.ID, ln, payload); err != nil {
+			return nil, err
+		}
 	}
 	track := lineUserTrackAdopted
 	configSHA := ""
@@ -408,22 +414,7 @@ var vpnUserIDRe = regexp.MustCompile(`^(?:vpnuser_(?:[a-z2-7]{16}|[0-9]{23})|vu_
 // so this history is complete. A removal of a user Lattice still binds to
 // the line does not ask for it; the binding is the record.
 func (s *Server) requireLineUserOnLine(userID, lineHashID string) error {
-	requestSHA := lineUserRequestSHA(userID, lineHashID)
-	lastOp := ""
-	var lastAt time.Time
-	for _, a := range s.store.Approvals() {
-		if a.Plugin != singBoxLineUserPlugin || a.Status != model.ApprovalApplied || a.RequestSHA256 != requestSHA {
-			continue
-		}
-		var plan lineUserPlan
-		if err := json.Unmarshal([]byte(a.Plan), &plan); err != nil || plan.UserID != userID || plan.LineHashID != lineHashID {
-			continue
-		}
-		if lastOp == "" || a.UpdatedAt.After(lastAt) {
-			lastOp, lastAt = plan.Op, a.UpdatedAt
-		}
-	}
-	switch lastOp {
+	switch s.lineUserAppliedOps(lineHashID)[userID] {
 	case lineUserOpAdd, lineUserOpUpdate:
 		return nil
 	case lineUserOpRemove:
@@ -431,6 +422,112 @@ func (s *Server) requireLineUserOnLine(userID, lineHashID string) error {
 	default:
 		return fmt.Errorf("no applied plan ever put user %q on line %q, so Lattice has nothing to remove there; check the user id and the line", userID, lineHashID)
 	}
+}
+
+// lineUserAppliedOps returns, per user, the op of the last applied line-user
+// plan on lineHashID: add or update means an applied plan last put that user
+// on the line, remove means one last took it off. The approvals are never
+// pruned, so this is the complete record of what Lattice did on the line.
+func (s *Server) lineUserAppliedOps(lineHashID string) map[string]string {
+	type last struct {
+		op string
+		at time.Time
+	}
+	latest := map[string]last{}
+	for _, a := range s.store.Approvals() {
+		if a.Plugin != singBoxLineUserPlugin || a.Status != model.ApprovalApplied {
+			continue
+		}
+		var plan lineUserPlan
+		if err := json.Unmarshal([]byte(a.Plan), &plan); err != nil || plan.LineHashID != lineHashID ||
+			a.RequestSHA256 != lineUserRequestSHA(plan.UserID, plan.LineHashID) {
+			continue
+		}
+		if prev, ok := latest[plan.UserID]; !ok || a.UpdatedAt.After(prev.at) {
+			latest[plan.UserID] = last{op: plan.Op, at: a.UpdatedAt}
+		}
+	}
+	ops := make(map[string]string, len(latest))
+	for userID, l := range latest {
+		ops[userID] = l.op
+	}
+	return ops
+}
+
+// lineUserRemovalRefusal refuses removing userID from adopted line ln when
+// what Lattice knows says the removal would do harm the plan does not show.
+//
+// sb user del (cmd_json_user in lr00rl/sing-box v1.24.3-alpha.7) deletes every
+// entry on the line that matches the payload's name, or ANY of its uuid,
+// username or password. The payload carries the identity's whole credential,
+// so an entry under another name that holds the same uuid or password goes
+// too. Migrated identities carry their legacy proxy user's uuid, and a line's
+// own first entry can hold it. Lattice sees two such cases:
+//
+//   - another identity that Lattice binds to the line, or put on it, holds the
+//     same credential for the line's protocol;
+//   - the line's first entry, the one its share link is built from, holds
+//     the credential, and either no applied plan put this identity on the
+//     line (so that entry is not the one Lattice added) or the line holds
+//     more than one entry (an applied add appends, so the first entry is
+//     somebody else's).
+//
+// Entries past the first are not reported by the node, so a hand-added
+// duplicate further down the list is invisible here. The task result reads
+// the counts the script reports and flags a removal that took more than one
+// entry (lineUserOvermatch); that is after the fact, which is why the cases
+// above are refused first. Rotating the identity's credential and applying
+// plan_update separates it from the other entry, after which the removal
+// matches only Lattice's own.
+func (s *Server) lineUserRemovalRefusal(userID string, ln Line, payload lineUserCredentialPayload) error {
+	remedy := fmt.Sprintf("rotate this identity's %s credential and apply plan_update on the line first, so the removal matches only Lattice's own entry", ln.Type)
+	shares := func(uuid, password string) string {
+		switch {
+		case payload.UUID != "" && strings.EqualFold(strings.TrimSpace(uuid), payload.UUID):
+			return "uuid"
+		case payload.Password != "" && password == payload.Password:
+			return "password"
+		}
+		return ""
+	}
+	ops := s.lineUserAppliedOps(ln.LineHashID)
+	for _, other := range s.listVpnUsers() {
+		if other.ID == userID {
+			continue
+		}
+		if !vpnUserHasEnabledBinding(other, ln.LineHashID) && ops[other.ID] != lineUserOpAdd && ops[other.ID] != lineUserOpUpdate {
+			continue
+		}
+		credential, ok := vpnCredentialForProtocol(other.Credentials, ln.Type)
+		if !ok {
+			continue
+		}
+		if field := shares(credential.UUID, credential.Password); field != "" {
+			return fmt.Errorf("identity %q is on line %q with the same %s as user %q, and sb user del removes every entry that matches any credential field, so this removal would take that identity off the node too; %s",
+				other.ID, ln.LineHashID, field, userID, remedy)
+		}
+	}
+	if node, ok := s.singBoxInventoryNode(ln.NodeID, firstNonEmpty(ln.Name, ln.Tag)); ok && strings.TrimSpace(node.ShareURL) != "" {
+		uuid, password := shareURLCredential(node.ShareURL)
+		if field := shares(uuid, password); field != "" {
+			added := ops[userID] == lineUserOpAdd || ops[userID] == lineUserOpUpdate
+			if !added || !ln.UserKnown || ln.UserCount > 1 {
+				return fmt.Errorf("the first entry on line %q, the one its share link is built from, holds the same %s as user %q, and %s; sb user del removes every entry that matches any credential field, so this removal would take that entry off the node too; %s",
+					ln.LineHashID, field, userID, lineUserOwnerReason(added, ln), remedy)
+			}
+		}
+	}
+	return nil
+}
+
+func lineUserOwnerReason(added bool, ln Line) string {
+	if !added {
+		return "no applied plan put this user on the line, so that entry is not the one Lattice added"
+	}
+	if !ln.UserKnown {
+		return "the node reports no user count, so Lattice cannot tell that entry from its own"
+	}
+	return fmt.Sprintf("the line holds %d entries while Lattice's add appended its own last, so that entry is somebody else's", ln.UserCount)
 }
 
 // openLineUserRemove finds a removal of userID from lineHashID that can still
@@ -684,6 +781,14 @@ func (s *Server) validateLineUserApproval(approval model.Approval, checkGrant bo
 	if plan.ConfigSHA256 != "" || approval.ArtifactDigest != sha {
 		return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, errors.New("adopted artifact binding changed; re-plan")
 	}
+	// The removal is checked again as of now: an identity sharing the
+	// credential can be bound, or the line's entries change, while the
+	// approval waits.
+	if checkGrant && plan.Op == lineUserOpRemove {
+		if err := s.lineUserRemovalRefusal(user.ID, line, payload); err != nil {
+			return zeroPlan, zeroUser, zeroLine, zeroPayload, nil, err
+		}
+	}
 	return plan, user, line, payload, nil, nil
 }
 
@@ -873,15 +978,37 @@ func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approv
 			return fmt.Errorf("persist managed line-user applied config: %w", err)
 		}
 	}
+	// The script prints the line's user count before and after the change.
+	// An over-match is past undoing by now (the script removes its backup once
+	// the core accepts the file), so it is recorded where the operator reads
+	// the result: on the applied approval and in its own audit event.
+	overmatch := ""
+	if artifact == nil {
+		if before, after, ok := lineUserScriptCounts(result.Stdout); ok {
+			metadata["user_count_before"] = strconv.Itoa(before)
+			metadata["user_count_after"] = strconv.Itoa(after)
+			overmatch = lineUserOvermatch(plan, before, after)
+		}
+	}
 	approval.Status = model.ApprovalApplied
-	approval.Reason = ""
+	approval.Reason = overmatch
 	approval.UpdatedAt = time.Now().UTC()
 	if err := s.store.UpsertApproval(approval); err != nil {
 		return fmt.Errorf("mark line-user approval applied: %w", err)
 	}
+	if overmatch != "" {
+		metadata["overmatch"] = "true"
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID: id.New("audit"), NodeID: approval.NodeID, Action: "vpnuser.line.overmatch",
+			Decision: "allow", Reason: overmatch, Metadata: map[string]string{
+				"approval_id": approval.ID, "task_id": task.ID, "op": plan.Op, "line_hash_id": plan.LineHashID,
+				"user_id": plan.UserID, "user_count_before": metadata["user_count_before"], "user_count_after": metadata["user_count_after"],
+			},
+		})
+	}
 	probeTaskID, probeErr := s.queueLineUserRediscovery(plan.NodeID)
 	if probeErr != nil {
-		approval.Reason = "runtime applied; bounded rediscovery queue failed"
+		approval.Reason = strings.TrimPrefix(overmatch+"; runtime applied; bounded rediscovery queue failed", "; ")
 		_ = s.store.UpsertApproval(approval)
 		metadata["rediscovery"] = "queue_failed"
 	} else {
@@ -900,6 +1027,51 @@ func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approv
 	// Sub-Store auto-sync just like the direct mutations do (design-15 §7).
 	s.triggerVPNCoreMutation()
 	return nil
+}
+
+// lineUserScriptCounts reads the line cmd_json_user prints when it succeeds,
+// {"ok":true,"action":"add|del","line":...,"user_count_before":N,
+// "user_count_after":M}, from the end of the task's stdout. ok is false when
+// no such line is there, which is how an older script answers.
+func lineUserScriptCounts(stdout string) (before, after int, ok bool) {
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var out struct {
+			OK     bool `json:"ok"`
+			Before *int `json:"user_count_before"`
+			After  *int `json:"user_count_after"`
+		}
+		if json.Unmarshal([]byte(line), &out) != nil || !out.OK || out.Before == nil || out.After == nil {
+			continue
+		}
+		return *out.Before, *out.After, true
+	}
+	return 0, 0, false
+}
+
+// lineUserOvermatch says what went wrong when the script's counts show it
+// matched more than one entry, or "" when they do not. sb user add replaces
+// every entry matching the payload and appends one, and sb user del removes
+// every match, so the entries matched are before minus after, plus one for an
+// add. Lattice's own entry is at most one of them.
+func lineUserOvermatch(plan lineUserPlan, before, after int) string {
+	matched := before - after
+	if plan.Op != lineUserOpRemove {
+		matched++
+	}
+	if matched <= 1 {
+		return ""
+	}
+	if plan.Op == lineUserOpRemove {
+		return fmt.Sprintf("applied, but sb user del removed %d entries from line %s where Lattice expected only its own %s: "+
+			"%d other entries on the line held the same credential and are no longer on the node", matched, plan.Line, plan.UserName, matched-1)
+	}
+	return fmt.Sprintf("applied, but sb user add replaced %d entries on line %s while adding %s: "+
+		"entries that held the same credential were removed and only Lattice's %s now stands for them", matched, plan.Line, plan.UserName, plan.UserName)
 }
 
 func (s *Server) queueLineUserRediscovery(nodeID string) (string, error) {

@@ -592,8 +592,9 @@ func pluginOperatorActor(ctx context.Context) string {
 // noteVpnUserEnabled records who turned an identity off and when, so the
 // policy can name them (vpnUserPolicy.By). Only the change from enabled to
 // disabled is recorded: an edit that leaves an identity disabled keeps the
-// record of who disabled it. Enabling it clears that record, and leaves an
-// operator suspension, which is not the enabled flag, where it is.
+// record of who disabled it. The identity holds one record, so turning it off
+// replaces an operator suspension; turning it on clears a disabled record and
+// leaves an operator suspension, which is not the enabled flag, where it is.
 func noteVpnUserEnabled(u *VpnUser, wasEnabled bool, actor string, now time.Time) {
 	switch {
 	case !u.Enabled && wasEnabled:

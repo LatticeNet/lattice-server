@@ -575,14 +575,7 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	if !ok || row.Settled() {
 		return
 	}
-	if reason := s.heldIncidentWithdrawal(row); reason != "" {
-		row.Outcome = store.NotifyOutcomeSuppressed
-		row.Reason = reason
-		row.SettledAt = s.now()
-		row.NextAttemptAt = time.Time{}
-		if err := s.store.PutNotifyDelivery(row, nil); err != nil {
-			s.logger.Printf("notify: settle withdrawn %s: %v", row.ID, err)
-		}
+	if s.withdrawHeldIncidentMessage(row) {
 		return
 	}
 	channel, found := s.notifyChannelByID(row.ChannelID)
@@ -671,6 +664,44 @@ const (
 	notifyWithdrawnRecovery = "withdrawn when quiet hours ended: the open message it answers was withdrawn too"
 )
 
+// heldIncidentMessage reports an incident message quiet hours held that has
+// not been tried yet, the only kind heldIncidentWithdrawal may withdraw.
+func heldIncidentMessage(row store.NotifyDelivery) bool {
+	return !row.HeldUntil.IsZero() && len(row.Attempts) == 0 && len(row.IncidentIDs) > 0
+}
+
+// withdrawHeldIncidentMessage settles row as withdrawn when
+// heldIncidentWithdrawal says it must not go out, and reports whether it did.
+// The decision and its record are made under incidentMu, which every change
+// to an incident holds. An acknowledgement undone at the same moment then
+// either lands first, and the decision sees the incident open and sends, or
+// lands after, and finds the row withdrawn and owes its rule the message
+// again (rulesThatWithdrewOpen). Without the lock the undo could fall between
+// the two, find no withdrawn row, and the message would be lost. Lock order:
+// incidentMu, then the store; the outbox locks are not held here.
+func (s *Server) withdrawHeldIncidentMessage(row store.NotifyDelivery) bool {
+	if !heldIncidentMessage(row) {
+		return false
+	}
+	s.incidentMu.Lock()
+	defer s.incidentMu.Unlock()
+	reason := s.heldIncidentWithdrawal(row)
+	if reason == "" {
+		return false
+	}
+	if s.heldWithdrawalHook != nil {
+		s.heldWithdrawalHook()
+	}
+	row.Outcome = store.NotifyOutcomeSuppressed
+	row.Reason = reason
+	row.SettledAt = s.now()
+	row.NextAttemptAt = time.Time{}
+	if err := s.store.PutNotifyDelivery(row, nil); err != nil {
+		s.logger.Printf("notify: settle withdrawn %s: %v", row.ID, err)
+	}
+	return true
+}
+
 // heldIncidentWithdrawal says why an incident message quiet hours held must
 // not go out now the window is over, or "" to send it. An open is withdrawn
 // when none of the incidents it reports is still open, unacknowledged and
@@ -679,7 +710,7 @@ const (
 // never heard "down", so it is not told "up". The drainer settles a rule and
 // channel's held rows in order, so that open has settled by now.
 func (s *Server) heldIncidentWithdrawal(row store.NotifyDelivery) string {
-	if row.HeldUntil.IsZero() || len(row.Attempts) > 0 || len(row.IncidentIDs) == 0 {
+	if !heldIncidentMessage(row) {
 		return ""
 	}
 	if _, ok := incidentKinds[row.EventType]; ok {

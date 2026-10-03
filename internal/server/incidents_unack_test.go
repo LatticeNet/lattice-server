@@ -410,3 +410,44 @@ func TestUnacknowledgeLeavesAWithdrawalFromBeforeTheAcknowledgement(t *testing.T
 	d.sweep()
 	d.expect("after the undo")
 }
+
+// An undo that races the outbox withdrawing night's held copy still gets the
+// message to night. The undo is fired after the drainer has decided to
+// withdraw (the incident was acknowledged) and before it records that: it
+// must wait for the record and then owe night the open, rather than see no
+// withdrawn row, reopen the incident and let the withdrawal land after it.
+func TestUnacknowledgeRacingAWithdrawalStillOwesTheOpen(t *testing.T) {
+	d := newDayNight(t, "a")
+	post, cookies, csrf := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+
+	undone := make(chan int, 1)
+	var once sync.Once
+	d.h.f.srv.heldWithdrawalHook = func() {
+		once.Do(func() {
+			go func() {
+				res := doJSON(t, d.h.f.handler, http.MethodPost, "/api/incidents/unack", fmt.Sprintf(`{"id":%q}`, id), cookies, csrf)
+				res.Body.Close()
+				undone <- res.StatusCode
+			}()
+			// Give the undo every chance to finish inside the window; it
+			// can only do so if the decision does not hold it off.
+			time.Sleep(300 * time.Millisecond)
+		})
+	}
+	d.endQuietHours()
+	select {
+	case code := <-undone:
+		if code != http.StatusOK {
+			t.Fatalf("unack: %d", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the undo never finished")
+	}
+	d.expect("while the undo raced the withdrawal")
+	d.sweep()
+	d.expect("after the undo", "nc-night Agent loop stalled: name-a")
+	d.sweep()
+	d.expect("the next sweep")
+}

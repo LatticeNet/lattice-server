@@ -51,7 +51,9 @@ import (
 // emitters' own evidence.
 //
 // Lock order: nodeAlerts.mu, then incidentMu, then the store. Nothing here
-// takes nodeAlerts.mu.
+// takes nodeAlerts.mu. The outbox drainer takes incidentMu to withdraw a held
+// incident message (withdrawHeldIncidentMessage) and holds no outbox lock
+// while it does.
 
 // Event types this evaluator adds. agent.stalled is new with loop health.
 const (

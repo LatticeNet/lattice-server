@@ -337,8 +337,10 @@ type Server struct {
 	// stored and never sent; see alert_digest.go.
 	alertDigest alertDigest
 	// incidentMu serialises every read-modify-write of an incident record
-	// (incidents.go); incidentPrunedAt is when resolved incidents were last
-	// pruned. Taken after nodeAlerts.mu and before any store lock.
+	// (incidents.go) and the outbox's decision to withdraw a held incident
+	// message (notify_outbox.go); incidentPrunedAt is when resolved
+	// incidents were last pruned. Taken after nodeAlerts.mu and before any
+	// store lock.
 	incidentMu       sync.Mutex
 	incidentPrunedAt time.Time
 	// agentHealth is each node's last loop health, in memory only; see
@@ -364,7 +366,10 @@ type Server struct {
 	// for them.
 	notifyDeliveries notifyInflight
 	// outbox drains the stored notification outbox; see notify_outbox.go.
-	outbox notifyOutboxRunner
+	// heldWithdrawalHook (tests only) runs between the decision to withdraw
+	// a held incident message and its record, with incidentMu held.
+	outbox             notifyOutboxRunner
+	heldWithdrawalHook func()
 	// notifySend delivers one message to one channel; overridable in tests,
 	// since the real sender refuses the loopback listener a test runs.
 	notifySend func(ctx context.Context, channel model.NotifyChannel, msg notify.Message) error

@@ -484,16 +484,19 @@ Use the compose file and deployment guide in the umbrella repository:
   need the node's bearer token and answer
   `{"ok": true, "accepted": n, "duplicates": n, "dropped": [{"index", "monitor_id", "reason"}]}`.
   A result is admitted only for an existing, enabled, non-tls monitor assigned
-  to the posting node, stamped no more than 24 hours before it arrives (a stamp
-  more than a minute ahead of the server takes the arrival time), with the
-  node id taken from the token and the error text capped at 512 bytes. A
-  dropped reason (`unknown_monitor`, `server_evaluated`, `disabled`,
-  `not_assigned`, `out_of_window`, `invalid`) is final, so the agent drops that
-  result. Results are judged in array order, so a buffered backlog goes oldest
-  first. A result the pair already holds at the same instant counts as a
-  duplicate, so a batch sent again after a lost response is safe, and on a 5xx
-  nothing was stored. An older server answers 404 on the batch path, which
-  tells the agent to post one result per request.
+  to the posting node, with the node id taken from the token and the error
+  text capped at 512 bytes. It must carry the agent's own stamp, no more than
+  24 hours behind and no more than a minute ahead of the server's clock: a
+  result without one is `invalid` and one outside that window is
+  `out_of_window`. The server never restamps a result, because the stamp is
+  what makes a result sent again a duplicate. A dropped reason
+  (`unknown_monitor`, `server_evaluated`, `disabled`, `not_assigned`,
+  `out_of_window`, `invalid`) is final, so the agent drops that result.
+  Results are judged in array order, so a buffered backlog goes oldest first.
+  A result the pair already holds at the same instant counts as a duplicate,
+  so a batch sent again after a lost response stores nothing twice and pages
+  nothing twice, and on a 5xx nothing was stored. An older server answers 404
+  on the batch path, which tells the agent to post one result per request.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/

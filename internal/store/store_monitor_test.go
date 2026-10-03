@@ -269,14 +269,16 @@ func TestAgentMonitorResultAdmission(t *testing.T) {
 		{MonitorID: "nope", At: now, Success: true},
 		{MonitorID: "", At: now, Success: true},
 		{MonitorID: "mon-all", At: now.Add(-MonitorResultMaxAge - time.Second), Success: true},
-		{MonitorID: "mon-all", At: now.Add(time.Hour), Success: true},
+		{MonitorID: "mon-all", At: now.Add(MonitorResultMaxSkew + time.Nanosecond), Success: true},
 		{MonitorID: "mon-all", Success: true},
+		{MonitorID: "mon-all", At: now.Add(MonitorResultMaxSkew), Success: true},
+		{MonitorID: "mon-all", At: now.Add(-MonitorResultMaxAge), Success: true},
 	}
 	out, err := s.IngestAgentMonitorResults("node-a", results, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"", MonitorResultDropNotAssigned, MonitorResultDropServerEvaluated, MonitorResultDropDisabled, MonitorResultDropUnknownMonitor, MonitorResultDropUnknownMonitor, MonitorResultDropOutOfWindow, "", ""}
+	want := []string{"", MonitorResultDropNotAssigned, MonitorResultDropServerEvaluated, MonitorResultDropDisabled, MonitorResultDropUnknownMonitor, MonitorResultDropUnknownMonitor, MonitorResultDropOutOfWindow, MonitorResultDropOutOfWindow, MonitorResultDropInvalid, "", ""}
 	for i, reason := range want {
 		if out[i].Dropped != reason {
 			t.Errorf("result %d: dropped %q, want %q", i, out[i].Dropped, reason)
@@ -286,10 +288,10 @@ func TestAgentMonitorResultAdmission(t *testing.T) {
 	if first.NodeID != "node-a" || !first.CertNotAfter.IsZero() || len(first.Error) > monitorResultErrorMax || !strings.HasPrefix(long, first.Error) || first.ReceivedAt != now {
 		t.Fatalf("first result not normalized: node=%q cert=%s errlen=%d received=%s", first.NodeID, first.CertNotAfter, len(first.Error), first.ReceivedAt)
 	}
-	// A stamp from the future and a missing stamp both take the arrival
-	// time, one nanosecond apart so they never share a key.
-	if !out[7].Result.At.Equal(now.Add(7)) || !out[8].Result.At.Equal(now.Add(8)) || !out[7].Stored() || !out[8].Stored() {
-		t.Fatalf("restamped results: %+v %+v", out[7], out[8])
+	// The window's edges are inside it, and an admitted result keeps the
+	// stamp the agent gave it.
+	if !out[9].Result.At.Equal(now.Add(MonitorResultMaxSkew)) || !out[10].Result.At.Equal(now.Add(-MonitorResultMaxAge)) || !out[9].Stored() || !out[10].Stored() {
+		t.Fatalf("results on the window's edges: %+v %+v", out[9], out[10])
 	}
 	rows, err := s.MonitorPairResults("mon-all", "node-a", 0)
 	if err != nil || len(rows) != 3 {
@@ -331,6 +333,39 @@ func TestRetriedBatchIsADuplicate(t *testing.T) {
 	latest, _, _ := s.MonitorLatest("mon-a", "node-a")
 	if latest.FailStreak != 2 || latest.Held != 3 {
 		t.Fatalf("retry moved the pair: %+v", latest)
+	}
+}
+
+// A result the server would have had to stamp itself is dropped, on the
+// first attempt and on every retry, so a batch sent again after a lost
+// response never stores it twice or counts one failure as two. Before, a
+// missing or future stamp took the arrival time, which differs on every
+// attempt, so each retry became a new row and advanced the streak.
+func TestResultsWithoutAUsableStampStayDroppedOnRetry(t *testing.T) {
+	s := openHotStore(t, t.TempDir())
+	defer s.Close()
+	seedMonitor(t, s, model.Monitor{ID: "mon-a", Type: model.MonitorTypeTCP, AssignAll: true})
+	now := time.Now().UTC()
+	batch := []model.MonitorResult{
+		{MonitorID: "mon-a", At: now.Add(-10 * time.Second), Success: true},
+		{MonitorID: "mon-a", Success: false, Error: "refused"},
+		{MonitorID: "mon-a", At: now.Add(time.Hour), Success: false, Error: "refused"},
+	}
+	for attempt := range 3 {
+		out, err := s.IngestAgentMonitorResults("node-a", batch, now.Add(time.Duration(attempt)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out[1].Dropped != MonitorResultDropInvalid || out[2].Dropped != MonitorResultDropOutOfWindow {
+			t.Fatalf("attempt %d: unusable stamps admitted: %+v", attempt, out)
+		}
+		if first := out[0]; first.Stored() != (attempt == 0) || first.Duplicate != (attempt > 0) {
+			t.Fatalf("attempt %d: stamped result: %+v", attempt, first)
+		}
+	}
+	latest, ok, err := s.MonitorLatest("mon-a", "node-a")
+	if err != nil || !ok || latest.FailStreak != 0 || latest.Held != 1 || !latest.Success {
+		t.Fatalf("pair after three attempts: %+v (ok=%v err=%v)", latest, ok, err)
 	}
 }
 

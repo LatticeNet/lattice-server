@@ -40,8 +40,12 @@ const (
 	// is a broken clock or a replay, not a late report.
 	MonitorResultMaxAge = 24 * time.Hour
 	// MonitorResultMaxSkew is how far ahead of the control plane an agent's
-	// stamp may run. A later stamp is replaced by the arrival time, so a
-	// clock running fast cannot pin a pair's newest row in the future.
+	// stamp may run. A later stamp is dropped like a stale one rather than
+	// replaced by the arrival time: the stamp is the row's key, and a key the
+	// server made up differs on every attempt, so a batch sent again after a
+	// lost response would store its results twice and count one failure as
+	// two. An agent stamps a probe before it sends it, so a synced clock is
+	// never ahead; one a minute ahead is broken, and the server logs it.
 	MonitorResultMaxSkew = time.Minute
 	// monitorResultErrorMax bounds the error text one row keeps. The text
 	// comes from the agent, and a pair keeps up to MonitorResultsPerPair rows.
@@ -203,13 +207,17 @@ func truncateUTF8(s string, limit int) string {
 }
 
 // admitAgentMonitorResultLocked decides whether an agent's result may be
-// stored for its node and normalizes it. index separates results restamped
-// with the arrival time in one batch, so two of them never share a key.
+// stored for its node and normalizes it.
+//
+// Every admitted result keeps the stamp the agent gave it. A result without
+// one is invalid and one outside the window is dropped; neither is restamped
+// with the arrival time, because the stamp is the row key that makes a retry
+// a duplicate. Every agent released so far stamps each probe when it starts.
 //
 // The checks run under the store lock, together with the write, so a monitor
 // deleted or unassigned while a batch is in flight cannot gain rows the
 // delete would have removed.
-func (s *Store) admitAgentMonitorResultLocked(nodeID string, r model.MonitorResult, receivedAt time.Time, index int) (MonitorResultRecord, string) {
+func (s *Store) admitAgentMonitorResultLocked(nodeID string, r model.MonitorResult, receivedAt time.Time) (MonitorResultRecord, string) {
 	mon, ok := s.state.Monitors[r.MonitorID]
 	switch {
 	case r.MonitorID == "" || !ok:
@@ -223,14 +231,11 @@ func (s *Store) admitAgentMonitorResultLocked(nodeID string, r model.MonitorResu
 	case !mon.AssignAll && !contains(mon.NodeIDs, nodeID):
 		return MonitorResultRecord{}, MonitorResultDropNotAssigned
 	}
-	if nodeID == "" || validMonitorPair(r.MonitorID, nodeID) != nil {
+	if nodeID == "" || validMonitorPair(r.MonitorID, nodeID) != nil || r.At.IsZero() {
 		return MonitorResultRecord{}, MonitorResultDropInvalid
 	}
 	receivedAt = receivedAt.UTC()
-	if r.At.IsZero() || r.At.After(receivedAt.Add(MonitorResultMaxSkew)) {
-		r.At = receivedAt.Add(time.Duration(index))
-	}
-	if r.At.Before(receivedAt.Add(-MonitorResultMaxAge)) {
+	if r.At.Before(receivedAt.Add(-MonitorResultMaxAge)) || r.At.After(receivedAt.Add(MonitorResultMaxSkew)) {
 		return MonitorResultRecord{}, MonitorResultDropOutOfWindow
 	}
 	r.At = r.At.UTC()
@@ -256,7 +261,7 @@ func (s *Store) IngestAgentMonitorResults(nodeID string, results []model.Monitor
 	records := make([]MonitorResultRecord, 0, len(results))
 	positions := make([]int, 0, len(results))
 	for i, r := range results {
-		rec, reason := s.admitAgentMonitorResultLocked(nodeID, r, receivedAt, i)
+		rec, reason := s.admitAgentMonitorResultLocked(nodeID, r, receivedAt)
 		if reason != "" {
 			r.NodeID = nodeID
 			outcomes[i] = MonitorResultOutcome{Dropped: reason, Result: MonitorResultRecord{MonitorResult: r}}

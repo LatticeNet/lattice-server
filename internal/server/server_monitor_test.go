@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -59,7 +60,7 @@ func TestMonitorLifecycleAndAgentRoundTrip(t *testing.T) {
 	}
 
 	// agent reports a result
-	body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + mon.ID + `","success":true,"latency_ms":12.5}}`
+	body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + mon.ID + `","at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `","success":true,"latency_ms":12.5}}`
 	rres := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body, nodeToken)
 	if rres.Code != http.StatusOK {
 		t.Fatalf("monitor result ingest failed: %d (%s)", rres.Code, rres.Body.String())

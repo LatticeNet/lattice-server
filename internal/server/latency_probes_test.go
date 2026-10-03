@@ -475,6 +475,22 @@ func TestLatencyMonitorsCannotBeDeletedOrForged(t *testing.T) {
 	if stored, _ := st.Monitor(mon.ID); stored.ManagedBy != "" {
 		t.Fatalf("a client marked its monitor as generated: %+v", stored)
 	}
+
+	// The list says which monitors are generated, so the console can keep
+	// them out of the operator's list and its failing count.
+	list := doJSON(t, handler, http.MethodGet, "/api/monitors", "", cookies, "")
+	defer list.Body.Close()
+	var views []map[string]any
+	if err := json.NewDecoder(list.Body).Decode(&views); err != nil {
+		t.Fatal(err)
+	}
+	marked := map[string]any{}
+	for _, view := range views {
+		marked[view["id"].(string)] = view["managed_by"]
+	}
+	if marked[latencyMonitorID("node-jp")] != model.MonitorManagedLatency || marked[mon.ID] != nil {
+		t.Fatalf("managed_by on the monitor list = %v", marked)
+	}
 }
 
 // A latency pair failing twice does not page: degradation is judged on the

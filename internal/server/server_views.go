@@ -172,10 +172,14 @@ type monitorView struct {
 	NodeIDs     []string `json:"node_ids,omitempty"`
 	// ThresholdDays is the tls certificate warning window in days; zero for
 	// every other monitor type.
-	ThresholdDays int       `json:"threshold_days,omitempty"`
-	Enabled       bool      `json:"enabled"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ThresholdDays int  `json:"threshold_days,omitempty"`
+	Enabled       bool `json:"enabled"`
+	// ManagedBy names the configuration that generates the monitor
+	// ("latency"); empty for a monitor an operator made. The console hides
+	// generated monitors from the operator's list and its failing count.
+	ManagedBy string    `json:"managed_by,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 	// Latest is each assigned node's newest result that the caller may see,
 	// sorted by node id; empty, never absent, when there are none. The list
 	// answers "what is each monitor doing now" in one read instead of one
@@ -216,7 +220,7 @@ func toMonitorViews(in []model.Monitor) []monitorView {
 			ID: m.ID, Name: m.Name, Type: m.Type, Target: m.Target,
 			IntervalSec: m.IntervalSec, TimeoutSec: m.TimeoutSec, AssignAll: m.AssignAll,
 			NodeIDs: m.NodeIDs, ThresholdDays: m.ThresholdDays,
-			Enabled: m.Enabled, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
+			Enabled: m.Enabled, ManagedBy: m.ManagedBy, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 			Latest: []monitorLatestView{},
 		})
 	}

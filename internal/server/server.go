@@ -4350,10 +4350,11 @@ func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, 
 	if !s.requireAllNodeScopes(w, p, "task:read", task.Targets) {
 		return
 	}
-	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "task.script.reveal") {
+	reveal, ok := s.requireSecretReveal(w, p, req.StepUpGrant, model.AuditEvent{Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
+	if !ok {
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
+	s.recordSecretReveal(p, reveal, model.AuditEvent{ID: id.New("audit"), Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                true,
 		"id":                task.ID,
@@ -6261,6 +6262,8 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 			Name            string   `json:"name"`
 			Scopes          []string `json:"scopes"`
 			ServerAllowlist []string `json:"server_allowlist"`
+			// StepUpGrant is required only to grant secrets:reveal.
+			StepUpGrant string `json:"step_up_grant"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -6271,15 +6274,25 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 		}
 		// Privilege containment: a caller may only mint a token whose scopes are
 		// a subset of its own, so token creation cannot be used to escalate.
+		// secrets:reveal is the exception with its own door
+		// (requireSecretRevealGrantAuthority): nobody holds it by delegation.
+		grantsReveal := false
 		for _, scope := range req.Scopes {
 			if !rbac.ValidScope(scope) {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("unknown scope %q", scope))
 				return
 			}
+			if rbac.ExplicitOnly(scope) {
+				grantsReveal = true
+				continue
+			}
 			if !rbac.CanDelegateScope(p.Principal, scope) {
 				writeError(w, http.StatusForbidden, fmt.Errorf("cannot grant scope %q beyond your own", scope))
 				return
 			}
+		}
+		if grantsReveal && !s.requireSecretRevealGrantAuthority(w, p, req.StepUpGrant) {
+			return
 		}
 		if !serverAllowlistSubset(p.ServerAllowlist, req.ServerAllowlist) {
 			writeError(w, http.StatusForbidden, errors.New("cannot grant server allowlist beyond your own"))
@@ -6308,7 +6321,13 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.create", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
+		createMeta := map[string]string{"token_id": tok.ID}
+		if grantsReveal {
+			// The one grant that lets a token read secrets is named in the
+			// trail where it was made, not only in the token's scope list.
+			createMeta["grants_secret_reveal"] = "true"
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.create", Scope: "token:admin", Metadata: createMeta})
 		// The credential is returned exactly once, in "<id>.<secret>" form.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":    tok.ID,

@@ -132,6 +132,13 @@ func (s *Server) validateGrantScopes(p principal, scopes []string) (int, error) 
 		if !rbac.ValidScope(sc) {
 			return http.StatusBadRequest, fmt.Errorf("unknown scope %q", sc)
 		}
+		// A person reveals a secret through step-up in their own session; the
+		// scope exists for API tokens only (secret_reveal.go). An account
+		// holding it would turn every later session of that account into a
+		// standing reveal grant with no second factor in front of it.
+		if rbac.ExplicitOnly(sc) {
+			return http.StatusBadRequest, fmt.Errorf("scope %q is granted to API tokens only; a user reveals secrets through second-factor step-up", sc)
+		}
 		if !rbac.CanDelegateScope(p.Principal, sc) {
 			return http.StatusForbidden, fmt.Errorf("cannot grant scope %q beyond your own access", sc)
 		}

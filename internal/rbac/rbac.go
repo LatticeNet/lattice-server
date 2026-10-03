@@ -24,6 +24,37 @@ func Allows(p Principal, scope string, nodeID string) bool {
 	return false
 }
 
+// SecretRevealScope lets an API token read secret material: identity
+// credentials, subscription links and their tokens, a line's share URL, a
+// knock sequence. It is the one scope no other grant implies. Not "*", not an
+// admin scope and not a domain wildcard satisfies it, so a token minted before
+// it existed, however broad, reveals nothing. An interactive session never
+// needs it: a person reveals through a fresh second-factor step-up instead.
+//
+// Never test it with Allows, which reads "*" as covering every scope. The
+// server's reveal gate tests it with HoldsExplicitScope.
+const SecretRevealScope = "secrets:reveal"
+
+// explicitOnlyScopes are scopes a principal holds only by naming them.
+var explicitOnlyScopes = map[string]bool{SecretRevealScope: true}
+
+// ExplicitOnly reports whether scope is held only by naming it. The server
+// grants such a scope through its own door (a token minted by a full
+// administrator's session after step-up), never through the ordinary
+// delegation rule, and never to a user account.
+func ExplicitOnly(scope string) bool { return explicitOnlyScopes[scope] }
+
+// HoldsExplicitScope reports whether scopes names scope itself. Wildcards do
+// not count, which is the whole point for an explicit-only scope.
+func HoldsExplicitScope(scopes []string, scope string) bool {
+	for _, held := range scopes {
+		if held == scope {
+			return true
+		}
+	}
+	return false
+}
+
 func scopeAllowed(scopes []string, required string) bool {
 	if directlyAllows(scopes, required) {
 		return true
@@ -37,6 +68,9 @@ func scopeAllowed(scopes []string, required string) bool {
 }
 
 func directlyAllows(scopes []string, required string) bool {
+	if explicitOnlyScopes[required] {
+		return HoldsExplicitScope(scopes, required)
+	}
 	for _, scope := range scopes {
 		if scope == "*" || scope == required {
 			return true
@@ -144,6 +178,7 @@ var KnownScopes = map[string]struct{}{
 	"plugin:verify":   {},
 	"proxy:admin":     {},
 	"proxy:read":      {},
+	"secrets:reveal":  {}, // explicit-only: see SecretRevealScope
 	"sshguard:admin":  {},
 	"sshguard:read":   {},
 	"substore:admin":  {},
@@ -176,7 +211,7 @@ func ValidScope(s string) bool {
 	if strings.HasSuffix(s, ":*") {
 		prefix := strings.TrimSuffix(s, "*")
 		for k := range KnownScopes {
-			if strings.HasPrefix(k, prefix) {
+			if strings.HasPrefix(k, prefix) && !explicitOnlyScopes[k] {
 				return true
 			}
 		}

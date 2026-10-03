@@ -558,3 +558,26 @@ func idlReadAll(res *http.Response) []byte {
 	raw, _ := io.ReadAll(res.Body)
 	return raw
 }
+
+// Renaming a link moves its URL and refuses a slug another link holds; the
+// slug check runs outside the store lock, so this also proves a rename does
+// not deadlock on it.
+func TestIdentityLinkRenameMovesTheURLAndRefusesATakenSlug(t *testing.T) {
+	f := newIdentityLinkFixture(t)
+	oldSlug, token := f.issue(t, "vpnuser_alice")
+	bobSlug, _ := f.issue(t, "vpnuser_bob")
+	taken := bobSlug
+	if _, err := f.srv.updateIdentityLink(f.admin, "vpnuser_alice", identityLinkWriteRequest{Slug: &taken}); err == nil || !strings.Contains(err.Error(), "already uses this slug") {
+		t.Fatalf("a slug another link holds must be refused, got %v", err)
+	}
+	renamed := "alice-phone"
+	interval := 6
+	if _, err := f.srv.updateIdentityLink(f.admin, "vpnuser_alice", identityLinkWriteRequest{Slug: &renamed, UpdateIntervalHours: &interval}); err != nil {
+		t.Fatal(err)
+	}
+	decoyLike(t, f, f.fetch(t, oldSlug, token, ""))
+	r := f.fetch(t, renamed, token, "")
+	if r.status != http.StatusOK || r.header.Get("Profile-Update-Interval") != "6" {
+		t.Fatalf("the renamed link must serve with its own refresh period: %d %v", r.status, r.header)
+	}
+}

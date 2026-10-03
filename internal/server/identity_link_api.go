@@ -185,56 +185,69 @@ func (s *Server) identityLinkUser(userID string) (VpnUser, error) {
 	return u, nil
 }
 
-func (s *Server) applyIdentityLinkFields(link *VpnUserLink, req identityLinkWriteRequest, userID string) error {
+// checkIdentityLinkFields validates a write's fields before the store lock
+// is taken: the slug's shape and that no other link holds it, and the
+// expiry and refresh period. Staging repeats the slug uniqueness check under
+// the lock, so a concurrent write cannot slip a duplicate past this one.
+func (s *Server) checkIdentityLinkFields(req identityLinkWriteRequest, userID string) error {
 	if req.Slug != nil {
 		slug := strings.TrimSpace(*req.Slug)
 		if !shareSlugRe.MatchString(slug) {
 			return linkOpError(http.StatusBadRequest, model.APIErrorBadRequest, "slug must be lowercase letters, digits and hyphens, starting with a letter or digit")
 		}
-		if slug != link.Slug && s.store.LinkSlugInUse(slug, userID) {
+		if s.store.LinkSlugInUse(slug, userID) {
 			return linkOpError(http.StatusConflict, apiErrorLinkSlugTaken, "a share or another identity's link already uses this slug")
 		}
-		link.Slug = slug
-	}
-	if req.Enabled != nil {
-		link.Disabled = !*req.Enabled
 	}
 	if req.ClearExpiry && req.ExpiresAt != nil {
 		return linkOpError(http.StatusBadRequest, model.APIErrorBadRequest, "expires_at and clear_expiry cannot both be set")
+	}
+	if req.ExpiresAt != nil && !req.ExpiresAt.UTC().After(s.now()) {
+		return linkOpError(http.StatusBadRequest, model.APIErrorBadRequest, "expires_at must be in the future")
+	}
+	if req.UpdateIntervalHours != nil && (*req.UpdateIntervalHours < 0 || *req.UpdateIntervalHours > maxLinkUpdateIntervalHours) {
+		return linkOpError(http.StatusBadRequest, model.APIErrorBadRequest, "update_interval_hours must be between 1 and 168, or 0 for the default")
+	}
+	return nil
+}
+
+// applyIdentityLinkFields writes checked fields onto a link. It runs inside
+// the store lock and reads nothing else.
+func applyIdentityLinkFields(link *VpnUserLink, req identityLinkWriteRequest) {
+	if req.Slug != nil {
+		link.Slug = strings.TrimSpace(*req.Slug)
+	}
+	if req.Enabled != nil {
+		link.Disabled = !*req.Enabled
 	}
 	if req.ClearExpiry {
 		link.ExpiresAt = nil
 	}
 	if req.ExpiresAt != nil {
 		when := req.ExpiresAt.UTC()
-		if !when.After(s.now()) {
-			return linkOpError(http.StatusBadRequest, model.APIErrorBadRequest, "expires_at must be in the future")
-		}
 		link.ExpiresAt = &when
 	}
 	if req.UpdateIntervalHours != nil {
-		if *req.UpdateIntervalHours < 0 || *req.UpdateIntervalHours > maxLinkUpdateIntervalHours {
-			return linkOpError(http.StatusBadRequest, model.APIErrorBadRequest, "update_interval_hours must be between 1 and 168, or 0 for the default")
-		}
 		link.UpdateIntervalHours = *req.UpdateIntervalHours
 	}
-	return nil
 }
 
 // writeIdentityLink runs one link write under the store lock and maps the
 // store's answers to operation errors.
 func (s *Server) writeIdentityLink(userID string, fn func(link *VpnUserLink, token string) (*VpnUserLink, string, error)) error {
 	err := s.withSubscriptionGraphWriteErr(vpnCorePluginID, func() error { return s.store.UpdateVpnUserLink(userID, fn) })
+	var opErr *identityLinkOpError
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, store.ErrVpnUserNotFound):
 		return linkOpError(http.StatusNotFound, model.APIErrorNotFound, "vpn user not found")
+	case errors.As(err, &opErr):
+		return err
+	case strings.Contains(err.Error(), "link slug"):
+		// Staging found a slug another link took after the check above.
+		return linkOpError(http.StatusConflict, apiErrorLinkSlugTaken, "a share or another identity's link already uses this slug")
 	default:
-		var opErr *identityLinkOpError
-		if errors.As(err, &opErr) {
-			return err
-		}
 		return err
 	}
 }
@@ -248,18 +261,21 @@ func (s *Server) issueIdentityLink(p principal, userID string, req identityLinkW
 	if err != nil {
 		return identityLinkStatusView{}, err
 	}
-	slug, err := s.identityLinkDefaultSlug()
-	if err != nil {
+	if err := s.checkIdentityLinkFields(req, u.ID); err != nil {
 		return identityLinkStatusView{}, err
+	}
+	slug := ""
+	if req.Slug == nil {
+		if slug, err = s.identityLinkDefaultSlug(); err != nil {
+			return identityLinkStatusView{}, err
+		}
 	}
 	err = s.writeIdentityLink(u.ID, func(link *VpnUserLink, _ string) (*VpnUserLink, string, error) {
 		if link != nil {
 			return nil, "", linkOpError(http.StatusConflict, apiErrorLinkAlreadyIssued, "this identity already has a link; rotate it for a new token")
 		}
 		next := &VpnUserLink{Slug: slug, IssuedAt: s.now().UTC()}
-		if err := s.applyIdentityLinkFields(next, req, u.ID); err != nil {
-			return nil, "", err
-		}
+		applyIdentityLinkFields(next, req)
 		return next, token, nil
 	})
 	if err != nil {
@@ -337,13 +353,14 @@ func (s *Server) updateIdentityLink(p principal, userID string, req identityLink
 	if err != nil {
 		return identityLinkStatusView{}, err
 	}
+	if err := s.checkIdentityLinkFields(req, u.ID); err != nil {
+		return identityLinkStatusView{}, err
+	}
 	err = s.writeIdentityLink(u.ID, func(link *VpnUserLink, token string) (*VpnUserLink, string, error) {
 		if link == nil {
 			return nil, "", linkOpError(http.StatusNotFound, apiErrorLinkNotIssued, "this identity has no link; issue one first")
 		}
-		if err := s.applyIdentityLinkFields(link, req, u.ID); err != nil {
-			return nil, "", err
-		}
+		applyIdentityLinkFields(link, req)
 		return link, token, nil
 	})
 	if err != nil {

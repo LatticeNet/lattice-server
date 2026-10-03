@@ -75,6 +75,11 @@ func TestClassifyClientUAModernClashClients(t *testing.T) {
 		"ClashforWindows/0.20.39":                      "clash",
 		"ClashX/1.118.0":                               "clash",
 		"Stash/2.4.6 Clash/1.9.0":                      "stash",
+		"Clash Meta for Android/2.10":                  "clashmeta",
+		// "meta" without clash decides nothing: these keep their own family.
+		"Loon/3.2 metadata":            "loon",
+		"Egern/1.4 meta":               "egern",
+		"Go-http-client metaprobe/1.0": "other",
 	}
 	for ua, want := range cases {
 		if got := classifyClientUA(ua); got != want {

@@ -15,20 +15,25 @@ import "strings"
 // Hysteria2, so classifying these clients as clash handed them a document
 // with no proxies in it. Stash stays ahead of both: its agent also names
 // Clash. The needles follow upstream Sub-Store's user-agent table.
-var subscriptionUAClasses = []struct{ needle, class string }{
-	{"quantumult", "quantumultx"},
-	{"shadowrocket", "shadowrocket"},
-	{"sing-box", "singbox"},
-	{"surge", "surge"},
-	{"stash", "stash"},
-	{"clash-verge", "clashmeta"},
-	{"flclash", "clashmeta"},
-	{"mihomo", "clashmeta"},
-	{"nyanpasu", "clashmeta"},
-	{"meta", "clashmeta"},
-	{"clash", "clash"},
-	{"egern", "egern"},
-	{"loon", "loon"},
+//
+// "meta" alone is too common a substring to decide a family: it counts only
+// in an agent that also names clash (with), so an agent such as
+// "Loon/3.2 metadata" or a metrics scraper is not handed a ClashMeta
+// document.
+var subscriptionUAClasses = []struct{ needle, with, class string }{
+	{"quantumult", "", "quantumultx"},
+	{"shadowrocket", "", "shadowrocket"},
+	{"sing-box", "", "singbox"},
+	{"surge", "", "surge"},
+	{"stash", "", "stash"},
+	{"clash-verge", "", "clashmeta"},
+	{"flclash", "", "clashmeta"},
+	{"mihomo", "", "clashmeta"},
+	{"nyanpasu", "", "clashmeta"},
+	{"meta", "clash", "clashmeta"},
+	{"clash", "", "clash"},
+	{"egern", "", "egern"},
+	{"loon", "", "loon"},
 }
 
 // classifyClientUA maps a client User-Agent onto a bounded set.
@@ -41,7 +46,7 @@ var subscriptionUAClasses = []struct{ needle, class string }{
 func classifyClientUA(header string) string {
 	lower := strings.ToLower(header)
 	for _, known := range subscriptionUAClasses {
-		if strings.Contains(lower, known.needle) {
+		if strings.Contains(lower, known.needle) && (known.with == "" || strings.Contains(lower, known.with)) {
 			return known.class
 		}
 	}

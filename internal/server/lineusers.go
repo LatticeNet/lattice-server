@@ -101,6 +101,9 @@ type lineUserPlan struct {
 	// Omitted is renderOmissions for a managed plan's render: the users the
 	// config already leaves out by policy, each as "label (status)".
 	Omitted []string `json:"omitted,omitempty"`
+	// Batch names the operator action that filed this plan with others, the
+	// credential cutover (vpn_cutover.go). Empty for a plan filed alone.
+	Batch string `json:"batch,omitempty"`
 }
 
 // lineUserCredentialPayload is the exact JSON object passed to
@@ -242,6 +245,12 @@ func (s *Server) resolveLineUserTarget(lineHashID string) (Line, error) {
 // and the approval executor renders the sb invocation against the then-current
 // credential bytes.
 func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op string) ([]byte, error) {
+	return s.vpnUserLinePlanInBatch(ctxPrincipal, request, op, "")
+}
+
+// vpnUserLinePlanInBatch is vpnUserLinePlan for a plan filed as part of a
+// batch: the plan, its summary and its audit name the batch.
+func (s *Server) vpnUserLinePlanInBatch(ctxPrincipal principal, request []byte, op, batch string) ([]byte, error) {
 	if op != lineUserOpAdd && op != lineUserOpUpdate && op != lineUserOpRemove {
 		return nil, fmt.Errorf("vpn-core/users-admin: invalid line-user op %q", op)
 	}
@@ -372,14 +381,20 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 			summary += "; already left out by policy: " + omittedSummary(omitted)
 		}
 	}
+	extra := map[string]string{"quota_changed": strconv.FormatBool(quotaChanged)}
+	if batch != "" {
+		summary = batch + ": " + summary
+		extra["batch"] = batch
+	}
 	plan := lineUserPlan{
 		Op: op, Track: track, NodeID: ln.NodeID, Line: ln.Tag, LineHashID: ln.LineHashID, LineUUID: ln.LineUUID,
 		UserID: u.ID, UserName: name, Protocol: ln.Type, CredentialSHA256: sha,
 		ConfigSHA256: configSHA,
 		Summary:      summary,
 		Omitted:      omitted,
+		Batch:        batch,
 	}
-	return s.fileLineUserPlan(ctxPrincipal, plan, map[string]string{"quota_changed": strconv.FormatBool(quotaChanged)})
+	return s.fileLineUserPlan(ctxPrincipal, plan, extra)
 }
 
 // deletedUserLineRemovePlan answers plan_remove for a user that no longer

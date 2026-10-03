@@ -247,6 +247,12 @@ func (s *Server) runSubStoreAutoSync() error {
 }
 
 func (s *Server) runOneSubStoreAutoSync() error {
+	// Retired at the subscription cutover (vpn_cutover.go): the export it
+	// pushes is every user's credentials, and the retirement is silent here
+	// because the status written at retirement already says why.
+	if s.subStoreAutoSyncRetired() {
+		return nil
+	}
 	endpoint, enabled := s.subStoreAutoSyncTarget()
 	if !enabled || !s.pluginIsActive(subStorePluginID) {
 		return nil

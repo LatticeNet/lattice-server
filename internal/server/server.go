@@ -1303,6 +1303,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/users/reveal-credentials", s.withAuth("", s.handleRevealVPNUserCredentials))
 	mux.HandleFunc("/api/proxy/users/delete", s.withAuth("", s.handleDeleteProxyUser))
 	mux.HandleFunc("/api/vpn/users/", s.withAuth("", s.handleVpnUserLink))
+	mux.HandleFunc("/api/vpn/cutover", s.withAuth("", s.handleVpnCutover))
+	mux.HandleFunc("/api/vpn/cutover/", s.withAuth("", s.handleVpnCutover))
 	mux.HandleFunc("/api/proxy/usage", s.withAuth("", s.handleProxyUsage))
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))

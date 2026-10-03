@@ -363,6 +363,9 @@ type Server struct {
 	identityConvertFlights map[identityConvertFlightKey]*shareRenderFlight
 	identityFetches        identityLinkFetches
 	identityLinkConvert    func(context.Context, []string, shareRenderVariant) (renderedSubscription, error)
+	// cutoverMu runs one credential cutover rotate at a time
+	// (vpn_cutover.go), so a repeated POST sees the plan the first left.
+	cutoverMu sync.Mutex
 	// subscriptionSnapshotPersist is a narrow persistence seam for exercising
 	// fail-closed last-good transitions. Production always falls back to Store.
 	subscriptionSnapshotPersist   func(model.SubscriptionSnapshot) (bool, error)

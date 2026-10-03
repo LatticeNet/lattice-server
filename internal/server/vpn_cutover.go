@@ -435,7 +435,17 @@ var errCutoverPlanChanged = errors.New("the cutover plan changed since it was sh
 // under one batch id. An identity credential with no plannable pair is
 // left alone and reported: rotating it would only take its lines out of its
 // link while the old credential kept working on the node.
+//
+// Rotate runs under cutoverMu. Two calls with one digest (a double click, an
+// agent retry) would otherwise both pass the check, rotate the same
+// credentials twice and file a second batch, leaving the first batch's
+// approvals with a stale credential hash. Under the lock the second call
+// builds its plan after the first rotated: a rotated credential no longer
+// matches the export, its rotation leaves the plan, the digest moves, and
+// the call is refused with cutover_plan_changed.
 func (s *Server) runVpnCutoverRotate(p principal, digest string) (cutoverRotateResult, cutoverView, error) {
+	s.cutoverMu.Lock()
+	defer s.cutoverMu.Unlock()
 	plan := s.vpnCutoverPlan()
 	if strings.TrimSpace(digest) == "" || digest != plan.Digest {
 		return cutoverRotateResult{}, plan, errCutoverPlanChanged

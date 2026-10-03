@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -179,6 +180,49 @@ func TestCutoverRotateActsOnlyOnTheDigestItShowed(t *testing.T) {
 	}
 	if code, _ := cutoverCall(t, f.srv, planner, http.MethodPost, "/api/vpn/cutover/rotate", map[string]string{"digest": view.Digest}); code != http.StatusConflict {
 		t.Fatalf("replaying the first digest: %d", code)
+	}
+}
+
+// Rotate calls carrying one digest at once (a double click, an agent retry)
+// rotate once and file one batch; every other call is refused because the
+// plan moved under it.
+func TestCutoverRotateRunsOnceForOneDigest(t *testing.T) {
+	f := newCutoverFixture(t)
+	view, _ := cutoverPreview(t, f.srv)
+	planner := cutoverPrincipal("vpncore:admin", "network:plan", "proxy:admin")
+	const calls = 8
+	start := make(chan struct{})
+	errs := make([]error, calls)
+	results := make([]cutoverRotateResult, calls)
+	var wg sync.WaitGroup
+	for i := 0; i < calls; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], _, errs[i] = f.srv.runVpnCutoverRotate(planner, view.Digest)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	ok := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+			if len(results[i].Approvals) != 1 {
+				t.Fatalf("the one rotate files carol's pair: %+v", results[i])
+			}
+		case err != errCutoverPlanChanged:
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("one digest must rotate once, %d calls rotated", ok)
+	}
+	after, _ := cutoverPreview(t, f.srv)
+	if len(after.Batches) != 1 || after.Batches[0].Approvals != 1 {
+		t.Fatalf("one batch with one approval, got %+v", after.Batches)
 	}
 }
 

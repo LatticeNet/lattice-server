@@ -2689,13 +2689,15 @@ func (s *Server) replaceAgentCapabilities(nodeID string, capabilities []string) 
 }
 
 func (s *Server) replaceAgentCapabilitiesUnlocked(nodeID string, capabilities []string) {
-	known := make(map[string]struct{}, 2)
+	known := make(map[string]struct{}, 3)
 	for _, capability := range capabilities {
 		switch strings.TrimSpace(capability) {
 		case netGuardManagedSHACapability:
 			known[netGuardManagedSHACapability] = struct{}{}
 		case lineChainDurableCapability:
 			known[lineChainDurableCapability] = struct{}{}
+		case singBoxUserDelByNameCapability:
+			known[singBoxUserDelByNameCapability] = struct{}{}
 		case witnessCapability:
 			known[witnessCapability] = struct{}{}
 		}

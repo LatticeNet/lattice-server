@@ -609,3 +609,70 @@ func TestChannelFailureStoresNoCredential(t *testing.T) {
 		}
 	}
 }
+
+// testClock is a server clock a test moves by hand.
+type testClock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (c *testClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.at = c.at.Add(d)
+	c.mu.Unlock()
+}
+
+// An operator's failed test neither counts toward failing nor starts its
+// window: a test that failed 20 minutes ago followed by one real failure is
+// not a failing channel and pages nobody. The rule itself still holds: three
+// real failures announce it.
+func TestFailedTestDoesNotStartTheFailingWindow(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	clock := &testClock{at: time.Date(2026, 10, 3, 9, 0, 0, 0, time.UTC)}
+	srv.now = clock.now
+	addNotifyChannel(t, st, "nc-urgent", "Bark urgent")
+	addNotifyChannel(t, st, "nc-info", "Bark info")
+	if err := st.UpsertNotifyRule(model.NotifyRule{ID: "r-urgent", Name: "Urgent", EventTypes: []string{EventNodeOffline}, ChannelIDs: []string{"nc-urgent"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	installFakeNotifySender(srv, func(id string, _ int) error {
+		if id == "nc-urgent" {
+			return upstream(400)
+		}
+		return nil
+	})
+	channel, _ := srv.notifyChannelByID("nc-urgent")
+	row, health := srv.sendNotifyChannelTest(channel)
+	if row.Outcome != store.NotifyOutcomeFailed || health.ConsecutiveFailures != 0 || !health.FailingSince.IsZero() {
+		t.Fatalf("after a failed test: row %+v, health %+v", row, health)
+	}
+	if state := notifyChannelHealthState(health, clock.now()); state != notifyHealthDegraded {
+		t.Fatalf("a failed test shows %s, want degraded", state)
+	}
+
+	clock.advance(20 * time.Minute)
+	srv.notifyEventTyped(EventNodeOffline, "Node offline: alpha", "b")
+	waitOutboxSettled(t, srv)
+	if rows := deliveriesOf(st, store.NotifyDeliveryFilter{EventType: EventNotifyChannelFailing}); len(rows) != 0 {
+		t.Fatalf("one real failure after an old failed test paged: %+v", rows)
+	}
+	h, _ := st.NotifyChannelHealth("nc-urgent")
+	if h.ConsecutiveFailures != 1 || !h.FailingSince.Equal(clock.now()) || notifyChannelHealthState(h, clock.now()) != notifyHealthDegraded {
+		t.Fatalf("health after one real failure = %+v", h)
+	}
+
+	for i := 0; i < 2; i++ {
+		clock.advance(time.Minute)
+		srv.notifyEventTyped(EventNodeOffline, fmt.Sprintf("Node offline: n%d", i), "b")
+		waitOutboxSettled(t, srv)
+	}
+	if rows := deliveriesOf(st, store.NotifyDeliveryFilter{EventType: EventNotifyChannelFailing}); len(rows) != 1 || rows[0].ChannelID != "nc-info" {
+		t.Fatalf("three real failures did not announce once: %+v", rows)
+	}
+}

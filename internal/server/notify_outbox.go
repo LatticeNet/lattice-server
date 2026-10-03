@@ -541,7 +541,9 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	health, _ := s.store.NotifyChannelHealth(channel.ID)
 	health.ChannelID = channel.ID
 	prev := health
-	health = nextNotifyHealth(health, attempt, row.Outcome == store.NotifyOutcomeFailed)
+	// A settled failure's attempts all failed (a success settles it sent), so
+	// its first attempt is when this run of failures began for the channel.
+	health = nextNotifyHealth(health, attempt, row.Outcome == store.NotifyOutcomeFailed, row.Attempts[0].At)
 	announce, recovered := notifyHealthTransition(prev, &health, attempt.At)
 	if perr := s.store.PutNotifyDelivery(row, &health); perr != nil {
 		s.logger.Printf("notify: record attempt %s: %v", row.ID, perr)
@@ -562,10 +564,14 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	}
 }
 
-// nextNotifyHealth folds one attempt into a channel's health. settledFailed
-// is set when the attempt ended its delivery as failed; only those count
-// toward ConsecutiveFailures, so a retry that recovers costs nothing.
-func nextNotifyHealth(h store.NotifyChannelHealth, a store.NotifyAttempt, settledFailed bool) store.NotifyChannelHealth {
+// nextNotifyHealth folds one attempt into a channel's health. counted is set
+// when the attempt ended a real delivery as failed: only those count toward
+// ConsecutiveFailures and only those start FailingSince, at runStart (the
+// delivery's first attempt). A retry still in progress and an operator's
+// test move the last failure, which the console shows as degraded, but never
+// the failing rule: otherwise a test that failed an hour ago would make the
+// next single real failure page the other channels at once.
+func nextNotifyHealth(h store.NotifyChannelHealth, a store.NotifyAttempt, counted bool, runStart time.Time) store.NotifyChannelHealth {
 	h.LastAttemptAt = a.At
 	if a.OK {
 		h.LastOKAt = a.At
@@ -576,12 +582,16 @@ func nextNotifyHealth(h store.NotifyChannelHealth, a store.NotifyAttempt, settle
 	h.LastFailureAt = a.At
 	h.LastFailureKind = a.Kind
 	h.LastStatusCode = a.Status
-	if h.FailingSince.IsZero() {
-		h.FailingSince = a.At
+	if !counted {
+		return h
 	}
-	if settledFailed {
-		h.ConsecutiveFailures++
+	if h.ConsecutiveFailures == 0 || h.FailingSince.IsZero() {
+		if runStart.IsZero() || runStart.After(a.At) {
+			runStart = a.At
+		}
+		h.FailingSince = runStart
 	}
+	h.ConsecutiveFailures++
 	return h
 }
 

@@ -47,7 +47,9 @@ func notifyChannelHealthState(h store.NotifyChannelHealth, now time.Time) string
 		return notifyHealthUnknown
 	case notifyChannelFailing(h, now):
 		return notifyHealthFailing
-	case h.ConsecutiveFailures > 0 || !h.FailingSince.IsZero():
+	case h.ConsecutiveFailures > 0 || h.LastFailureAt.After(h.LastOKAt):
+		// Counted failures not yet failing, or a last attempt that failed: a
+		// delivery still retrying, or an operator's test.
 		return notifyHealthDegraded
 	default:
 		return notifyHealthOK
@@ -137,8 +139,9 @@ func (s *Server) handleNotifyChannelTest(w http.ResponseWriter, r *http.Request,
 // sendNotifyChannelTest sends the test synchronously and records it in the
 // outbox with role test. A success clears the channel's failing state (and
 // announces the recovery if its failure was announced); a failure updates the
-// last failure but never counts toward failing, since an operator correcting
-// a key by trial should not page the other channels.
+// last failure but neither counts toward failing nor starts its window
+// (nextNotifyHealth), since an operator correcting a key by trial should not
+// page the other channels, then or later.
 func (s *Server) sendNotifyChannelTest(c model.NotifyChannel) (store.NotifyDelivery, store.NotifyChannelHealth) {
 	now := s.now()
 	name := notifyChannelLabel(c)
@@ -171,7 +174,7 @@ func (s *Server) sendNotifyChannelTest(c model.NotifyChannel) (store.NotifyDeliv
 	health, _ := s.store.NotifyChannelHealth(c.ID)
 	health.ChannelID = c.ID
 	prev := health
-	health = nextNotifyHealth(health, attempt, false)
+	health = nextNotifyHealth(health, attempt, false, time.Time{})
 	recovered := false
 	if attempt.OK {
 		_, recovered = notifyHealthTransition(prev, &health, attempt.At)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -25,7 +26,9 @@ import (
 // failure is retried on notifyRetryDelays, a permanent one settles at once,
 // and the channel's health moves in the same store write as the receipt.
 // When every primary channel of a rule failed a message for good, the rule's
-// fallback channel gets it. A channel that keeps failing raises
+// fallback channel gets it; a critical message also goes to its channel's own
+// fallback at the first failed attempt (notify_channel_fallback.go). A
+// channel that keeps failing raises
 // notify.channel_failing, which is never sent to the failing channel itself.
 //
 // Boot reconciles the outbox before the first send: a delivery planned less
@@ -171,6 +174,8 @@ type notifyTarget struct {
 	channel          model.NotifyChannel
 	message          notify.Message
 	truncated        bool
+	// heldUntil is set when the rule's quiet hours hold this delivery.
+	heldUntil time.Time
 }
 
 // planNotifyTargets resolves an event to channels. With no rules every
@@ -241,6 +246,15 @@ type notifyEnqueue struct {
 	// broadcast skips rules and sends to every enabled channel, which is how
 	// a plugin's notify.send has always been routed.
 	broadcast bool
+	// onlyRule routes through that one rule instead of every enabled rule;
+	// an incident escalation goes out through the rule that escalates.
+	onlyRule *model.NotifyRule
+	// barkLevel overrides each Bark channel's interruption level for these
+	// deliveries; set only by an escalation, which also makes them critical
+	// for quiet hours.
+	barkLevel string
+	// incidentIDs names the incidents an incident message reports.
+	incidentIDs []string
 }
 
 // notifyPlan is an event resolved to its deliveries but not yet stored.
@@ -264,15 +278,30 @@ type notifyPlan struct {
 func (s *Server) planNotifyEvent(eventType, title, body string, how notifyEnqueue) notifyPlan {
 	channels := s.store.EnabledNotifyChannels()
 	var rules []model.NotifyRule
-	if !how.broadcast {
+	switch {
+	case how.onlyRule != nil:
+		rules = []model.NotifyRule{*how.onlyRule}
+	case !how.broadcast:
 		rules = s.store.EnabledNotifyRules()
 	}
 	targets := s.planNotifyTargets(eventType, title, body, channels, rules, how.exclude, how.fanOut)
+	at := s.now()
+	critical := how.barkLevel != "" || notifyEventSeverity(eventType) == incidentSeverityCritical
+	var opts map[string]store.NotifyRuleOptions
 	for i := range targets {
 		m := &targets[i].message
 		m.Title, m.Body, targets[i].truncated = store.ClampNotifyText(m.Title, m.Body)
+		if critical || targets[i].ruleID == "" {
+			continue
+		}
+		if opts == nil {
+			opts = s.store.NotifyRuleOptionsByRule()
+		}
+		if until, ok := quietHoursEnd(opts[targets[i].ruleID].QuietHours, at); ok {
+			targets[i].heldUntil = until
+		}
 	}
-	plan := notifyPlan{eventID: id.New("evt"), eventType: eventType, how: how, targets: targets, at: s.now()}
+	plan := notifyPlan{eventID: id.New("evt"), eventType: eventType, how: how, targets: targets, at: at}
 	plan.title, plan.body, plan.truncated = store.ClampNotifyText(title, body)
 	if len(plan.targets) == 0 {
 		others := 0
@@ -324,6 +353,17 @@ func (s *Server) commitNotifyPlan(plan notifyPlan) {
 			NextAttemptAt: plan.at, Title: t.message.Title, Body: t.message.Body, Truncated: t.truncated,
 			CreatedAt: plan.at,
 		}
+		if t.channel.Kind == "bark" {
+			rows[i].BarkLevel = how.barkLevel
+		}
+		if len(how.incidentIDs) > 0 {
+			rows[i].IncidentIDs = slices.Clone(how.incidentIDs)
+		}
+		if !t.heldUntil.IsZero() {
+			rows[i].HeldUntil = t.heldUntil
+			rows[i].NextAttemptAt = t.heldUntil
+			rows[i].Reason = "held by the rule's quiet hours until " + stamp(t.heldUntil)
+		}
 	}
 	if err := s.store.RecordNotifyDeliveries(rows); err != nil {
 		// The page matters more than its receipt: send without the outbox
@@ -343,15 +383,22 @@ func (s *Server) enqueueNotifyEvent(eventType, title, body string, how notifyEnq
 // sendUnrecorded is the pre-outbox path, kept for a store that refuses the
 // write: one goroutine, one try per channel, failures logged by kind only. An
 // inbound webhook's record is still settled from what happened, since no
-// outbox row will settle it.
+// outbox row will settle it. An escalation keeps its Bark level. Quiet hours
+// do not hold these sends: with the store refusing writes there is nowhere to
+// keep a held message until the window ends, and a message sent early is
+// better than one lost.
 func (s *Server) sendUnrecorded(plan notifyPlan) {
 	s.notifyDeliveries.begin()
 	go func() {
 		defer s.notifyDeliveries.end()
 		delivered, failed := 0, 0
 		for _, t := range plan.targets {
+			channel := t.channel
+			if plan.how.barkLevel != "" && channel.Kind == "bark" {
+				channel = withBarkLevel(channel, plan.how.barkLevel)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
-			err := s.notifySend(ctx, t.channel, t.message)
+			err := s.notifySend(ctx, channel, t.message)
 			cancel()
 			if err != nil {
 				failed++
@@ -439,11 +486,25 @@ func (s *Server) runNotifyOutbox(wake <-chan struct{}, stop <-chan struct{}, don
 
 // drainNotifyOutbox starts every due delivery that is not already in flight
 // and returns when the next scheduled one falls due, or zero.
+//
+// Deliveries quiet hours held go one at a time per rule and channel, in the
+// order they were planned (the rows come oldest first): when the window ends,
+// an open and its recovery fall due at the same instant, and sent side by
+// side the recovery can arrive first. The withdrawal check also needs the
+// open settled before it judges the recovery (heldIncidentWithdrawal).
 func (s *Server) drainNotifyOutbox() time.Time {
 	r := &s.outbox
 	now := s.now()
 	var next time.Time
+	heldTurn := map[string]bool{}
 	for _, row := range s.store.UnsettledNotifyDeliveries() {
+		if !row.HeldUntil.IsZero() {
+			key := row.RuleID + "\x00" + row.ChannelID
+			if heldTurn[key] {
+				continue
+			}
+			heldTurn[key] = true
+		}
 		r.mu.Lock()
 		if r.inflight == nil || r.inflight[row.ID] {
 			r.mu.Unlock()
@@ -514,6 +575,16 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	if !ok || row.Settled() {
 		return
 	}
+	if reason := s.heldIncidentWithdrawal(row); reason != "" {
+		row.Outcome = store.NotifyOutcomeSuppressed
+		row.Reason = reason
+		row.SettledAt = s.now()
+		row.NextAttemptAt = time.Time{}
+		if err := s.store.PutNotifyDelivery(row, nil); err != nil {
+			s.logger.Printf("notify: settle withdrawn %s: %v", row.ID, err)
+		}
+		return
+	}
 	channel, found := s.notifyChannelByID(row.ChannelID)
 	if !found || !channel.Enabled {
 		row.Outcome = store.NotifyOutcomeFailed
@@ -526,8 +597,14 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 		if err := s.store.PutNotifyDelivery(row, nil); err != nil {
 			s.logger.Printf("notify: settle %s: %v", row.ID, err)
 		}
+		if found {
+			s.planNotifyChannelFallback(row, channel)
+		}
 		s.afterNotifySettled(row)
 		return
+	}
+	if row.BarkLevel != "" && channel.Kind == "bark" {
+		channel = withBarkLevel(channel, row.BarkLevel)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
 	started := time.Now()
@@ -576,12 +653,76 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	if recovered {
 		s.announceNotifyChannelOK(channel, prev, attempt.At)
 	}
+	if err != nil {
+		s.planNotifyChannelFallback(row, channel)
+	}
 	if row.Settled() {
 		s.afterNotifySettled(row)
 	}
 	if !row.Settled() {
 		s.wakeNotifyOutbox()
 	}
+}
+
+// The reasons a held incident message is withdrawn with; the console matches
+// them (lattice-dashboard notifySentModel.ts).
+const (
+	notifyWithdrawnOpen     = "withdrawn when quiet hours ended: the incident was resolved, acknowledged or snoozed meanwhile"
+	notifyWithdrawnRecovery = "withdrawn when quiet hours ended: the open message it answers was withdrawn too"
+)
+
+// heldIncidentWithdrawal says why an incident message quiet hours held must
+// not go out now the window is over, or "" to send it. An open is withdrawn
+// when none of the incidents it reports is still open, unacknowledged and
+// unsnoozed. A recovery is withdrawn when, for every incident it reports, the
+// latest open message on the same rule and channel was withdrawn: the phone
+// never heard "down", so it is not told "up". The drainer settles a rule and
+// channel's held rows in order, so that open has settled by now.
+func (s *Server) heldIncidentWithdrawal(row store.NotifyDelivery) string {
+	if row.HeldUntil.IsZero() || len(row.Attempts) > 0 || len(row.IncidentIDs) == 0 {
+		return ""
+	}
+	if _, ok := incidentKinds[row.EventType]; ok {
+		now := s.now()
+		for _, incidentID := range row.IncidentIDs {
+			inc, ok := s.store.Incident(incidentID)
+			if ok && inc.State == store.IncidentStateOpen && !inc.SnoozedUntil.After(now) {
+				return ""
+			}
+		}
+		return notifyWithdrawnOpen
+	}
+	open, ok := incidentRecoveryOf[row.EventType]
+	if !ok {
+		return ""
+	}
+	opens := s.store.NotifyDeliveries(store.NotifyDeliveryFilter{ChannelID: row.ChannelID, EventType: open})
+	for _, incidentID := range row.IncidentIDs {
+		withdrawn := false
+		for _, o := range opens { // newest first
+			if o.RuleID != row.RuleID || o.ID == row.ID || o.CreatedAt.After(row.CreatedAt) || !slices.Contains(o.IncidentIDs, incidentID) {
+				continue
+			}
+			withdrawn = o.Outcome == store.NotifyOutcomeSuppressed
+			break
+		}
+		if !withdrawn {
+			return ""
+		}
+	}
+	return notifyWithdrawnRecovery
+}
+
+// withBarkLevel is c with its interruption level replaced, on a copy of the
+// config so the stored channel is never touched.
+func withBarkLevel(c model.NotifyChannel, level string) model.NotifyChannel {
+	cfg := make(map[string]string, len(c.Config)+1)
+	for k, v := range c.Config {
+		cfg[k] = v
+	}
+	cfg["level"] = level
+	c.Config = cfg
+	return c
 }
 
 // nextNotifyHealth folds one attempt into a channel's health. counted is set
@@ -724,14 +865,22 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 	r.healthMu.Lock()
 	defer r.healthMu.Unlock()
 	var failed []string
+	// An escalation's Bark level is on its Bark rows only (other kinds ignore
+	// it), so the fallback takes it from whichever primary row has it.
+	barkLevel := ""
 	for _, sib := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{EventID: row.EventID}) {
 		if sib.RuleID != row.RuleID {
 			continue
 		}
+		if sib.BarkLevel != "" {
+			barkLevel = sib.BarkLevel
+		}
 		switch {
-		case sib.Role == store.NotifyRoleFallback:
+		case sib.Role == store.NotifyRoleFallback && sib.FallbackOf == "":
 			return // already planned
 		case sib.Role != store.NotifyRolePrimary:
+			// A test, or a channel's critical fallback (FallbackOf set):
+			// neither is one of the rule's primaries.
 			continue
 		case !sib.Settled(), sib.Outcome == store.NotifyOutcomeSent:
 			return // still trying, or the message got through
@@ -739,6 +888,13 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 		failed = append(failed, sib.ChannelName)
 	}
 	sort.Strings(failed)
+	for _, sib := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{EventID: row.EventID}) {
+		if sib.ChannelID == opts.FallbackChannelID {
+			// A channel's critical fallback already handed the event to
+			// the rule's fallback channel.
+			return
+		}
+	}
 	now := s.now()
 	body, cut := notifyFallbackBody(row.Body, strings.Join(failed, ", "))
 	fallback := store.NotifyDelivery{
@@ -747,12 +903,15 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 		RuleID: row.RuleID, RuleName: row.RuleName, Role: store.NotifyRoleFallback,
 		FallbackFor: strings.Join(failed, ", "), Outcome: store.NotifyOutcomePlanned,
 		NextAttemptAt: now, Title: row.Title, Body: body, Truncated: row.Truncated || cut,
-		CreatedAt: now,
+		CreatedAt: now, IncidentIDs: slices.Clone(row.IncidentIDs),
 	}
 	channel, found := s.notifyChannelByID(opts.FallbackChannelID)
 	fallback.ChannelID = opts.FallbackChannelID
 	if found {
 		fallback.ChannelName, fallback.ChannelKind = channel.Name, channel.Kind
+	}
+	if fallback.ChannelKind == "bark" {
+		fallback.BarkLevel = barkLevel
 	}
 	if err := s.store.RecordNotifyDeliveries([]store.NotifyDelivery{fallback}); err != nil {
 		s.logger.Printf("notify: record fallback for %s: %v", row.ID, err)
@@ -764,7 +923,10 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 // notifyFallbackBody appends the fallback sentence to a message, shortening
 // the message rather than the sentence when the two exceed the body bound.
 func notifyFallbackBody(body, failed string) (string, bool) {
-	sentence := "\n\nSent through the fallback channel because " + failed + " did not deliver it."
+	return notifyFallbackBodyWith(body, "\n\nSent through the fallback channel because "+failed+" did not deliver it.")
+}
+
+func notifyFallbackBodyWith(body, sentence string) (string, bool) {
 	base, cut := store.TruncateUTF8(body, max(0, store.MaxNotifyBodyBytes-len(sentence)))
 	out, cutAll := store.TruncateUTF8(base+sentence, store.MaxNotifyBodyBytes)
 	return out, cut || cutAll
@@ -817,8 +979,9 @@ func (s *Server) settleNotifyWebhookCounts(webhookID, recordID string, delivered
 // reconcileNotifyOutbox runs once at start, before the first send: every
 // delivery still owed a send is marked for redrive inside the horizon or
 // settled failed outside it, so the receipts are never left "planned" by a
-// restart. It returns how many rows wait for redrive; New wakes the drainer
-// for them with the other background loops.
+// restart. It returns how many rows wait for a send (redriven, or still held
+// by quiet hours); New wakes the drainer for them with the other background
+// loops.
 func (s *Server) reconcileNotifyOutbox() int {
 	pending := s.store.UnsettledNotifyDeliveries()
 	if len(pending) == 0 {
@@ -826,10 +989,20 @@ func (s *Server) reconcileNotifyOutbox() int {
 	}
 	now := s.now()
 	changed := make([]store.NotifyDelivery, 0, len(pending))
-	redrive := 0
+	redrive, held := 0, 0
 	for _, row := range pending {
+		// A delivery held by quiet hours was due at HeldUntil, not when it
+		// was planned; one still waiting is left as it is.
+		due := row.CreatedAt
+		if row.HeldUntil.After(due) {
+			due = row.HeldUntil
+		}
+		if due.After(now) && len(row.Attempts) == 0 {
+			held++
+			continue
+		}
 		switch {
-		case row.Role == store.NotifyRoleTest || now.Sub(row.CreatedAt) > notifyRedriveHorizon:
+		case row.Role == store.NotifyRoleTest || now.Sub(due) > notifyRedriveHorizon:
 			row.Outcome = store.NotifyOutcomeFailed
 			row.Reason = "interrupted by restart, not retried"
 			row.SettledAt = now
@@ -843,6 +1016,9 @@ func (s *Server) reconcileNotifyOutbox() int {
 			redrive++
 		}
 		changed = append(changed, row)
+	}
+	if len(changed) == 0 {
+		return held
 	}
 	if err := s.store.RecordNotifyDeliveries(changed); err != nil {
 		s.logger.Printf("notify: reconcile outbox: %v", err)
@@ -858,6 +1034,6 @@ func (s *Server) reconcileNotifyOutbox() int {
 			s.settleNotifyWebhookRecord(row)
 		}
 	}
-	s.logger.Printf("notify: outbox at start: %d redriven, %d settled as interrupted", redrive, len(changed)-redrive)
-	return redrive
+	s.logger.Printf("notify: outbox at start: %d redriven, %d settled as interrupted, %d held by quiet hours", redrive, len(changed)-redrive, held)
+	return redrive + held
 }

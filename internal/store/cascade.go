@@ -148,6 +148,13 @@ func (s *Store) DeleteNode(nodeID string) (NodeCascadeReport, bool, error) {
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
+		// Its incidents go once the node is gone, so a node enrolled again
+		// under the same id starts with no open problem and owes no
+		// recovery. They go after the commit: before it, a failed commit
+		// would keep the node and lose its open incidents and owed
+		// recoveries. Should this delete fail, the incident sweep drops the
+		// rows it finds for a node that no longer exists.
+		_ = s.deleteIncidentsLocked(func(inc Incident) bool { return inc.NodeID == nodeID })
 	}
 	return report, true, err
 }

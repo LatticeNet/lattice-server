@@ -38,6 +38,7 @@ func seedMigrationState(now time.Time) State {
 	st.GroupPolicies["gnp1"] = model.GroupNetPolicy{ID: "gnp1", ScopeGroupID: "grp1", Enabled: true, Priority: 10, Rules: []model.GroupNetRule{{ID: "rule1", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: []int{443}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}, CreatedAt: now}
 	st.NotifyRules["r1"] = model.NotifyRule{ID: "r1", Name: "Urgent", ChannelIDs: []string{"ch1"}, Enabled: true}
 	st.NotifyRuleOptions["r1"] = NotifyRuleOptions{FallbackChannelID: "ch2"}
+	st.NotifyChannelOptions["ch1"] = NotifyChannelOptions{FallbackChannelID: "ch2"}
 	st.Audit = []model.AuditEvent{{ID: "audit-1", At: now, Action: "migration.test", Decision: "allow"}}
 	return st
 }
@@ -113,6 +114,9 @@ func TestMigrateJSONToBoltAndExportBack(t *testing.T) {
 	}
 	if back.NotifyRuleOptions["r1"].FallbackChannelID != "ch2" {
 		t.Fatalf("a rule's fallback channel did not round-trip: %+v", back.NotifyRuleOptions)
+	}
+	if back.NotifyChannelOptions["ch1"].FallbackChannelID != "ch2" {
+		t.Fatalf("a channel's critical fallback did not round-trip: %+v", back.NotifyChannelOptions)
 	}
 	if !reflect.DeepEqual(back.GuardRealitySnapshots["node-a"], want.GuardRealitySnapshots["node-a"]) {
 		t.Fatalf("exported guard reality did not round-trip:\n got=%+v\nwant=%+v", back.GuardRealitySnapshots["node-a"], want.GuardRealitySnapshots["node-a"])

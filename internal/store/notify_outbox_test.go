@@ -216,6 +216,46 @@ func TestNotifyRuleOptionsLiveAndDieWithTheirRule(t *testing.T) {
 	}
 }
 
+// A channel's critical fallback is saved with the channel, survives a
+// reopen, goes when the channel goes, and is cleared from every channel that
+// named a deleted one.
+func TestNotifyChannelOptionsLiveAndDieWithTheirChannel(t *testing.T) {
+	s, path := openReportClockStore(t)
+	channel := func(id string) model.NotifyChannel {
+		return model.NotifyChannel{ID: id, Name: id, Kind: "bark", Enabled: true, Config: map[string]string{"base_url": "https://b.example", "key": "k"}}
+	}
+	if err := s.UpsertNotifyChannel(channel("nc-fb")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNotifyChannelWithOptions(channel("nc-a"), NotifyChannelOptions{FallbackChannelID: "nc-fb"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertNotifyChannelWithOptions(channel("nc-b"), NotifyChannelOptions{FallbackChannelID: "nc-a"}); err != nil {
+		t.Fatal(err)
+	}
+	s = reopenReportClockStore(t, s, path)
+	t.Cleanup(func() { _ = s.Close() })
+	if got := s.NotifyChannelOptionsByChannel()["nc-a"]; got.FallbackChannelID != "nc-fb" {
+		t.Fatalf("after reopen = %+v", got)
+	}
+	if err := s.DeleteNotifyChannel("nc-a"); err != nil {
+		t.Fatal(err)
+	}
+	opts := s.NotifyChannelOptionsByChannel()
+	if _, ok := opts["nc-a"]; ok {
+		t.Fatal("a deleted channel kept its options")
+	}
+	if _, ok := opts["nc-b"]; ok {
+		t.Fatal("a deleted channel is still another channel's fallback")
+	}
+	if err := s.UpsertNotifyChannelWithOptions(channel("nc-b"), NotifyChannelOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.NotifyChannelOptionsByChannel()) != 0 {
+		t.Fatal("clearing the fallback left an empty options row")
+	}
+}
+
 func noRouteRow(id, eventType string, at time.Time) NotifyDelivery {
 	return NotifyDelivery{ID: id, EventID: "evt-" + id, EventType: eventType, Source: NotifySourceServer,
 		Outcome: NotifyOutcomeNoRoute, Reason: "no enabled rule routes this event type", Title: "unrouted " + id, CreatedAt: at}

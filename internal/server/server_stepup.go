@@ -99,6 +99,21 @@ func (s *Server) requireStepUpGrant(w http.ResponseWriter, p principal, grantID,
 		writeError(w, http.StatusForbidden, errors.New("second-factor step-up required"))
 		return false
 	}
+	if !s.stepUpGrantHeld(p, grantID) {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Decision: "deny", Reason: "missing or expired second-factor step-up"})
+		writeError(w, http.StatusForbidden, errors.New("second-factor step-up required"))
+		return false
+	}
+	return true
+}
+
+// stepUpGrantHeld reports whether grantID is an unexpired step-up grant
+// issued to this principal's actor in this session. A grant is reusable until
+// it expires; it is never valid for another session or a bearer token.
+func (s *Server) stepUpGrantHeld(p principal, grantID string) bool {
+	if p.viaBearer || p.ActorID == "" || p.sessionID == "" || grantID == "" {
+		return false
+	}
 	now := s.now().UTC()
 	s.stepUpMu.Lock()
 	defer s.stepUpMu.Unlock()
@@ -108,10 +123,5 @@ func (s *Server) requireStepUpGrant(w http.ResponseWriter, p principal, grantID,
 		}
 	}
 	grant, ok := s.stepUpGrants[grantID]
-	if !ok || grant.ActorID != p.ActorID || grant.SessionID != p.sessionID || !grant.ExpiresAt.After(now) {
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Decision: "deny", Reason: "missing or expired second-factor step-up"})
-		writeError(w, http.StatusForbidden, errors.New("second-factor step-up required"))
-		return false
-	}
-	return true
+	return ok && grant.ActorID == p.ActorID && grant.SessionID == p.sessionID && grant.ExpiresAt.After(now)
 }

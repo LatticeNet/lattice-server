@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"path"
 	"regexp"
 	"sort"
@@ -78,7 +77,6 @@ type proxyUserView struct {
 	Enabled           bool      `json:"enabled"`
 	HasUUID           bool      `json:"has_uuid"`
 	HasPassword       bool      `json:"has_password"`
-	HasSubToken       bool      `json:"has_sub_token"` // kept for clients; no subscription is served from SubToken since cff5b9c
 	InboundIDs        []string  `json:"inbound_ids,omitempty"`
 	TrafficLimitBytes int64     `json:"traffic_limit_bytes,omitempty"`
 	ExpiresAt         time.Time `json:"expires_at,omitempty"`
@@ -243,30 +241,6 @@ func (s *Server) proxySubscriptionProfiles() []proxycore.SubscriptionProfile {
 func proxySubTokenAuditHash(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
-}
-
-// proxySubscriptionURL returns the public URL a proxy user is actually reachable
-// at, which is the URL of a SHARE pointing at them - not anything derived from
-// their own token.
-//
-// This distinction is the whole point of shares and it has a consequence worth
-// stating: rotating a user's sub token no longer changes public access, because
-// the share holds the credential the public URL carries. A user with no share is
-// not published at all, and this returns empty rather than a plausible-looking
-// address that would 404.
-func (s *Server) proxySubscriptionURL(_ *http.Request, userID string) string {
-	for _, share := range s.store.SubscriptionShares() {
-		if share.Source.Kind != model.ShareSourceCoreProxyUser || share.Source.ProxyUserID != userID {
-			continue
-		}
-		path := "/sub/" + url.PathEscape(share.Slug) + "/" + url.PathEscape(share.Token)
-		base := strings.TrimRight(s.publicURL, "/")
-		if base == "" {
-			return path
-		}
-		return base + path
-	}
-	return ""
 }
 
 func (s *Server) handleProxyInbounds(w http.ResponseWriter, r *http.Request, p principal) {
@@ -447,75 +421,6 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 		Metadata: map[string]string{"user_id": req.ID},
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// handleRotateProxyUserSubToken still rotates and audits the token, but no
-// subscription has been served from SubToken since cff5b9c removed the
-// per-user subscription endpoint (handleProxySubscription; subscriptions are
-// served through shares), so a rotation revokes no URL: the old one stopped
-// working then. The only other reader is the vpn-core migration, which
-// copies the token into the new identity's SubID, and SubID is only
-// returned by the step-up credential reveal.
-func (s *Server) handleRotateProxyUserSubToken(w http.ResponseWriter, r *http.Request, p principal) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
-		return
-	}
-	if !s.requireGlobalProxyScope(w, p, "proxy:admin") {
-		return
-	}
-	var req struct {
-		ID string `json:"id"`
-	}
-	if !decodeClientJSON(w, r, &req) {
-		return
-	}
-	req.ID = strings.TrimSpace(req.ID)
-	if req.ID == "" {
-		writeError(w, http.StatusBadRequest, errors.New("id is required"))
-		return
-	}
-	user, ok := s.store.ProxyUser(req.ID)
-	if !ok {
-		writeError(w, http.StatusNotFound, errors.New("proxy user not found"))
-		return
-	}
-	oldHash := proxySubTokenAuditHash(user.SubToken)
-	token, err := s.newUniqueProxySubToken(user.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	user.SubToken = token
-	user.UpdatedAt = s.now()
-	if err := s.store.UpsertProxyUser(user); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	if stored, ok := s.store.ProxyUser(user.ID); ok {
-		user = stored
-	}
-	newHash := proxySubTokenAuditHash(token)
-	s.recordPrincipalAudit(p, model.AuditEvent{
-		ID:       id.New("audit"),
-		Action:   "proxy.user.rotate_sub_token",
-		Scope:    "proxy:admin",
-		Decision: "allow",
-		Metadata: map[string]string{
-			"user_id":          user.ID,
-			"old_token_sha256": oldHash,
-			"new_token_sha256": newHash,
-		},
-	})
-	writeJSON(w, http.StatusOK, map[string]any{
-		"user": toProxyUserView(user),
-		// Empty unless a share publishes this user. Rotating the user token does
-		// not rotate that share: the share owns the public credential, and saying
-		// so through an empty field is better than implying otherwise.
-		"subscription_url":      s.proxySubscriptionURL(r, user.ID),
-		"rotates_public_access": false,
-		"token_sha256":          newHash,
-	})
 }
 
 func (s *Server) handleProxyUsage(w http.ResponseWriter, r *http.Request, p principal) {
@@ -1455,7 +1360,6 @@ func toProxyUserView(user model.ProxyUser) proxyUserView {
 		Enabled:           user.Enabled,
 		HasUUID:           user.UUID != "",
 		HasPassword:       user.Password != "",
-		HasSubToken:       user.SubToken != "",
 		InboundIDs:        append([]string(nil), user.InboundIDs...),
 		TrafficLimitBytes: user.TrafficLimitBytes,
 		ExpiresAt:         user.ExpiresAt,

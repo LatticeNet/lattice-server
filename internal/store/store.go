@@ -95,6 +95,12 @@ type State struct {
 	// not carry yet (notify_rule_options.go), keyed by rule id. Operator
 	// configuration written only on a rule edit, so the JSON state is its home.
 	NotifyRuleOptions map[string]NotifyRuleOptions `json:"notify_rule_options,omitempty"`
+	// NotifyChannelOptions holds per-channel settings model.NotifyChannel
+	// does not carry yet (notify_channel_options.go), keyed by channel id.
+	NotifyChannelOptions map[string]NotifyChannelOptions `json:"notify_channel_options,omitempty"`
+	// LatencyProbes is the operator's latency probe configuration
+	// (latency_probes.go), nil until one is saved. Written only on an edit.
+	LatencyProbes *model.LatencyProbeConfig `json:"latency_probes,omitempty"`
 	// NotifyWebhooks are operator-authored inbound entry points (notify_webhook.go).
 	// They hold a PBKDF2 secret hash, not a reversible secret, so unlike
 	// NotifyChannels they need no pass in crypto.go.
@@ -280,11 +286,16 @@ type Store struct {
 	closed bool
 	// notify is the notification outbox (notify_outbox.go). Guarded by mu.
 	notify notifyOutbox
+	// incidentBook holds incidents and maintenance windows (incidents.go).
+	// Guarded by mu.
+	incidentBook incidentBook
 	// linkIndex resolves link tokens without a scan, and shareGen counts
 	// share writes so the index knows when it is out of date; see
 	// link_token_index.go. Guarded by mu.
 	linkIndex *linkTokenIndex
 	shareGen  uint64
+	// vpnLinkGen counts identity writes for the same index.
+	vpnLinkGen uint64
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every
@@ -829,6 +840,7 @@ func emptyState() State {
 		NotifyChannels:          map[string]model.NotifyChannel{},
 		NotifyRules:             map[string]model.NotifyRule{},
 		NotifyRuleOptions:       map[string]NotifyRuleOptions{},
+		NotifyChannelOptions:    map[string]NotifyChannelOptions{},
 		NotifyWebhooks:          map[string]NotifyWebhook{},
 		NotifyWebhookDeliveries: map[string][]NotifyWebhookDelivery{},
 		Tunnels:                 map[string]model.TunnelProfile{},
@@ -962,6 +974,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NotifyRuleOptions == nil {
 		st.NotifyRuleOptions = map[string]NotifyRuleOptions{}
+	}
+	if st.NotifyChannelOptions == nil {
+		st.NotifyChannelOptions = map[string]NotifyChannelOptions{}
 	}
 	if st.NotifyWebhooks == nil {
 		st.NotifyWebhooks = map[string]NotifyWebhook{}
@@ -5269,7 +5284,10 @@ func (s *Store) MonitorsForNode(nodeID string) []model.Monitor {
 // DeleteMonitor removes a monitor and its result history. The hot store's
 // rows go first: if that fails nothing has changed, and if the state write
 // fails after it the monitor survives with an empty history, which a retry
-// finishes deleting.
+// finishes deleting. Its incidents go only after the state write commits,
+// so a failed write never leaves the monitor without its open incidents and
+// owed recoveries; should that delete fail, the incident sweep closes what
+// it finds open for a monitor that no longer exists.
 func (s *Store) DeleteMonitor(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5288,7 +5306,11 @@ func (s *Store) DeleteMonitor(id string) error {
 			delete(s.monitorPersistedAt, key)
 		}
 	}
-	return s.Save()
+	committed, err := s.persistState(s.jsonPersistState())
+	if committed {
+		_ = s.deleteIncidentsLocked(func(inc Incident) bool { return inc.MonitorID == id })
+	}
+	return err
 }
 
 // UpsertLogSource creates or updates a log source definition.
@@ -5556,6 +5578,7 @@ func (s *Store) DeleteNotifyChannel(id string) error {
 			s.state.NotifyRuleOptions[ruleID] = opts
 		}
 	}
+	s.clearNotifyChannelOptionsLocked(id)
 	if err := s.Save(); err != nil {
 		return err
 	}

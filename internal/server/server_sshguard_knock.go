@@ -125,7 +125,13 @@ type sshGuardKnockState struct {
 // knocking a sequence that was never applied fails silently and looks like
 // the sequence is wrong.
 func (s *Server) sshGuardKnockStateFor(nodeID string) sshGuardKnockState {
-	approvals := s.store.Approvals()
+	return s.sshGuardKnockStateIn(nodeID, s.store.Approvals())
+}
+
+// sshGuardKnockStateIn is sshGuardKnockStateFor over an approval list the
+// caller already holds, so a caller asking about many nodes copies the list
+// once instead of once per node.
+func (s *Server) sshGuardKnockStateIn(nodeID string, approvals []model.Approval) sshGuardKnockState {
 	arms := make([]model.Approval, 0, 4)
 	confirms := make([]model.Approval, 0, 4)
 	for _, a := range approvals {
@@ -421,15 +427,14 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 	if !s.sshGuardKnockScopes(w, p, req.NodeID) {
 		return
 	}
-	// requireStepUpGrant refuses a bearer principal already, but with a
-	// sentence about sessions that does not say why this endpoint in
-	// particular is human-only. An agent that asked for a way into a machine
-	// deserves the actual reason and a pointer to the half it can have.
-	if p.viaBearer {
-		writeError(w, http.StatusForbidden, errors.New("the knock sequence is revealed only to an interactive session that can satisfy a second factor; use /api/sshguard/knock to learn whether a sequence exists and /api/network/approvals to read the plan that installed it"))
-		return
-	}
-	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "sshguard.knock.reveal") {
+	// The one reveal gate (secret_reveal.go): a session with a fresh step-up,
+	// or a token carrying secrets:reveal, which no other scope implies. A
+	// token without it is told what it would need and what it can read
+	// instead: /api/sshguard/knock says whether a sequence exists, and
+	// /api/network/approvals holds the plan that installed it.
+	reveal, ok := s.requireSecretRevealHint(w, p, req.StepUpGrant, model.AuditEvent{NodeID: req.NodeID, Action: "sshguard.knock.reveal", Scope: "sshguard:read"},
+		"use /api/sshguard/knock to learn whether a sequence exists and /api/network/approvals to read the plan that installed it")
+	if !ok {
 		return
 	}
 	state := s.sshGuardKnockStateFor(req.NodeID)
@@ -446,7 +451,7 @@ func (s *Server) handleSSHGuardRevealKnock(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusNotFound, errors.New("the control plane has no SSH Guard plan for this node and does not know a knock sequence"))
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{
+	s.recordSecretReveal(p, reveal, model.AuditEvent{
 		ID:     id.New("audit"),
 		NodeID: req.NodeID,
 		Action: "sshguard.knock.reveal",

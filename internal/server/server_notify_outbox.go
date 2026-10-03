@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -39,6 +40,11 @@ type notifyChannelHealthView struct {
 	LastStatusCode      int       `json:"last_status_code,omitempty"`
 	ConsecutiveFailures int       `json:"consecutive_failures"`
 	FailingSince        time.Time `json:"failing_since,omitzero"`
+	// The last time a critical message this channel failed was handed to its
+	// fallback, which channel took it, and how many hand-offs so far.
+	LastFallbackAt        time.Time `json:"last_fallback_at,omitzero"`
+	LastFallbackChannelID string    `json:"last_fallback_channel_id,omitempty"`
+	Fallbacks             int       `json:"fallbacks,omitempty"`
 }
 
 func notifyChannelHealthState(h store.NotifyChannelHealth, now time.Time) string {
@@ -66,17 +72,149 @@ func toNotifyChannelHealthView(h store.NotifyChannelHealth, now time.Time) notif
 		LastStatusCode:      h.LastStatusCode,
 		ConsecutiveFailures: h.ConsecutiveFailures,
 		FailingSince:        h.FailingSince,
+
+		LastFallbackAt:        h.LastFallbackAt,
+		LastFallbackChannelID: h.LastFallbackChannelID,
+		Fallbacks:             h.Fallbacks,
 	}
 }
 
-// notifyRuleView is a rule with the options kept beside it.
+// notifyRuleView is a rule with the options kept beside it. The escalation
+// fields are the effective values, defaults included, so a console shows what
+// the rule will do rather than an empty field.
 type notifyRuleView struct {
 	model.NotifyRule
-	FallbackChannelID string `json:"fallback_channel_id,omitempty"`
+	FallbackChannelID    string                  `json:"fallback_channel_id,omitempty"`
+	EscalationOff        bool                    `json:"escalation_off"`
+	EscalateAfterMinutes int                     `json:"escalate_after_minutes"`
+	EscalationBarkLevel  string                  `json:"escalation_bark_level"`
+	QuietHours           *store.NotifyQuietHours `json:"quiet_hours"`
 }
 
 func toNotifyRuleView(rule model.NotifyRule, opts store.NotifyRuleOptions) notifyRuleView {
-	return notifyRuleView{NotifyRule: rule, FallbackChannelID: opts.FallbackChannelID}
+	on, after, level := escalationPolicy(opts)
+	return notifyRuleView{
+		NotifyRule: rule, FallbackChannelID: opts.FallbackChannelID,
+		EscalationOff: !on, EscalateAfterMinutes: int(after / time.Minute), EscalationBarkLevel: level,
+		QuietHours: opts.QuietHours,
+	}
+}
+
+// notifyRuleOptionsRequest is the escalation and quiet hours part of a rule
+// upsert. An absent field keeps the rule's current value; quiet_hours null
+// turns quiet hours off.
+type notifyRuleOptionsRequest struct {
+	EscalationOff        *bool           `json:"escalation_off"`
+	EscalateAfterMinutes *int            `json:"escalate_after_minutes"`
+	EscalationBarkLevel  *string         `json:"escalation_bark_level"`
+	QuietHours           json.RawMessage `json:"quiet_hours"`
+}
+
+// applyNotifyRuleOptions folds a request into a rule's options and validates
+// the result: an escalation delay of 5 minutes to 24 hours (0 is the default,
+// 30 minutes), a Bark level bark-server accepts, and quiet hours with two
+// different HH:MM times in a time zone this server knows.
+func applyNotifyRuleOptions(opts store.NotifyRuleOptions, req notifyRuleOptionsRequest) (store.NotifyRuleOptions, error) {
+	if req.EscalationOff != nil {
+		opts.EscalationOff = *req.EscalationOff
+	}
+	if req.EscalateAfterMinutes != nil {
+		opts.EscalateAfterMinutes = *req.EscalateAfterMinutes
+	}
+	if req.EscalationBarkLevel != nil {
+		opts.EscalationBarkLevel = strings.TrimSpace(*req.EscalationBarkLevel)
+	}
+	if len(req.QuietHours) > 0 {
+		if string(req.QuietHours) == "null" {
+			opts.QuietHours = nil
+		} else {
+			var qh store.NotifyQuietHours
+			if err := json.Unmarshal(req.QuietHours, &qh); err != nil {
+				return opts, errors.New("quiet_hours must be {start, end, time_zone} or null")
+			}
+			qh.Start, qh.End, qh.TimeZone = strings.TrimSpace(qh.Start), strings.TrimSpace(qh.End), strings.TrimSpace(qh.TimeZone)
+			opts.QuietHours = &qh
+		}
+	}
+	if m := opts.EscalateAfterMinutes; m != 0 {
+		after := time.Duration(m) * time.Minute
+		if after < minIncidentEscalateAfter || after > maxIncidentEscalateAfter {
+			return opts, fmt.Errorf("escalate_after_minutes must be %d to %d", int(minIncidentEscalateAfter/time.Minute), int(maxIncidentEscalateAfter/time.Minute))
+		}
+	}
+	// The defaults are stored as zero values, so a console that saves back
+	// what the view showed does not pin them.
+	if opts.EscalateAfterMinutes == int(incidentEscalateAfterDefault/time.Minute) {
+		opts.EscalateAfterMinutes = 0
+	}
+	if opts.EscalationBarkLevel == incidentEscalationLevelDefault {
+		opts.EscalationBarkLevel = ""
+	}
+	if level := opts.EscalationBarkLevel; level != "" && !slices.Contains(notify.BarkLevels, level) {
+		return opts, fmt.Errorf("escalation_bark_level must be one of %s", strings.Join(notify.BarkLevels, ", "))
+	}
+	if qh := opts.QuietHours; qh != nil {
+		start, okStart := parseClockMinute(qh.Start)
+		end, okEnd := parseClockMinute(qh.End)
+		if !okStart || !okEnd {
+			return opts, errors.New("quiet_hours start and end must be HH:MM")
+		}
+		if start == end {
+			return opts, errors.New("quiet_hours start and end must differ")
+		}
+		if qh.TimeZone == "" {
+			return opts, errors.New("quiet_hours time_zone is required, for example Asia/Shanghai")
+		}
+		if _, err := time.LoadLocation(qh.TimeZone); err != nil {
+			return opts, fmt.Errorf("quiet_hours time_zone %q is not a known time zone", qh.TimeZone)
+		}
+	}
+	return opts, nil
+}
+
+// parseClockMinute reads "HH:MM" as minutes after midnight.
+func parseClockMinute(v string) (int, bool) {
+	t, err := time.Parse("15:04", v)
+	if err != nil || len(v) != 5 {
+		return 0, false
+	}
+	return t.Hour()*60 + t.Minute(), true
+}
+
+// quietHoursEnd reports whether at falls inside qh and, if so, when the
+// window ends. A window whose end is not after its start runs past midnight.
+// An invalid window (it was validated when saved) holds nothing.
+func quietHoursEnd(qh *store.NotifyQuietHours, at time.Time) (time.Time, bool) {
+	if qh == nil {
+		return time.Time{}, false
+	}
+	start, okStart := parseClockMinute(qh.Start)
+	end, okEnd := parseClockMinute(qh.End)
+	loc, err := time.LoadLocation(qh.TimeZone)
+	if !okStart || !okEnd || start == end || err != nil {
+		return time.Time{}, false
+	}
+	local := at.In(loc)
+	midnight := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, loc)
+	minute := local.Hour()*60 + local.Minute()
+	clock := func(day time.Time, m int) time.Time {
+		return time.Date(day.Year(), day.Month(), day.Day(), m/60, m%60, 0, 0, loc)
+	}
+	if start < end {
+		if minute >= start && minute < end {
+			return clock(midnight, end).UTC(), true
+		}
+		return time.Time{}, false
+	}
+	// Past midnight: inside after start today (ends tomorrow) or before end
+	// today.
+	switch {
+	case minute >= start:
+		return clock(midnight.AddDate(0, 0, 1), end).UTC(), true
+	case minute < end:
+		return clock(midnight, end).UTC(), true
+	}
+	return time.Time{}, false
 }
 
 // validateNotifyFallback accepts an empty fallback or an existing channel that

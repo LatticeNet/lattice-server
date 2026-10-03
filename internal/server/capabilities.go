@@ -173,6 +173,17 @@ func deriveProxyCore(s *Server, nodeID string) (bool, bool) {
 	return true, true
 }
 
+// deriveWitness: a node whose last applied witness plan configured the
+// witness is one the operator put it on; one whose last applied plan removed
+// it is one the operator took it off.
+func deriveWitness(s *Server, nodeID string) (bool, bool) {
+	a, ok := latestAppliedWitness(s.store.Approvals(), nodeID)
+	if !ok {
+		return false, false
+	}
+	return a.Action == witnessConfigureAction, true
+}
+
 // deriveCFTunnel: any tunnel profile bound to this node means the operator
 // put a tunnel here.
 func deriveCFTunnel(s *Server, nodeID string) (bool, bool) {
@@ -212,14 +223,17 @@ var capabilitySpecs = map[string]capabilitySpec{
 	// refuses only nodes with neither a record nor an explicit enrolment,
 	// instead of the whole fleet. Until an operator flips a gate they behave
 	// exactly as they do today.
-	"nft":              {Mutates: true, Derive: deriveNetGuard},
-	"nftpolicy":        {Mutates: true, Derive: deriveNetPolicy},
-	"wireguard":        {Mutates: true, Derive: deriveWireGuard},
-	"selfdns":          {Mutates: true, Derive: deriveSelfDNS},
-	"agentupdate":      {Mutates: true, Derive: deriveAgentUpdate},
-	"proxycore":        {Mutates: true, Derive: deriveProxyCore},
-	"cftunnel":         {Mutates: true, Derive: deriveCFTunnel},
-	"acme-dns":         {Mutates: true},
+	"nft":         {Mutates: true, Derive: deriveNetGuard},
+	"nftpolicy":   {Mutates: true, Derive: deriveNetPolicy},
+	"wireguard":   {Mutates: true, Derive: deriveWireGuard},
+	"selfdns":     {Mutates: true, Derive: deriveSelfDNS},
+	"agentupdate": {Mutates: true, Derive: deriveAgentUpdate},
+	"proxycore":   {Mutates: true, Derive: deriveProxyCore},
+	"cftunnel":    {Mutates: true, Derive: deriveCFTunnel},
+	"acme-dns":    {Mutates: true},
+	// The control-plane witness installs a unit and a notification key on
+	// the node it watches from; its applied plans are the per-node record.
+	witnessPlugin:      {Mutates: true, Derive: deriveWitness},
 	"singbox-linemeta": {Mutates: true, Derive: deriveSingBox},
 	// The three core-backed line surfaces below mint approvals with these ids
 	// but were never declared, and capabilitySpecFor's undeclared-means-allowed

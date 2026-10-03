@@ -96,6 +96,7 @@ func newTLSMonitorServer(t *testing.T, addr *string, now *time.Time) (*Server, h
 	rec := &notifyRecorder{}
 	srv.emitNotify = rec.record
 	srv.emitNotifyTyped = func(eventType, title, body string) { rec.record("["+eventType+"] "+title, body) }
+	srv.emitIncidentNotice = func(eventType, title, body string, _ []string) { rec.record("["+eventType+"] "+title, body) }
 	return srv, handler, rec
 }
 
@@ -103,7 +104,7 @@ func newTLSMonitorServer(t *testing.T, addr *string, now *time.Time) (*Server, h
 // which is where queued monitor notices are sent.
 func sweepAndFlush(srv *Server) int {
 	probed := srv.sweepTLSMonitorsOnce(context.Background())
-	srv.flushAlertDigests()
+	srv.sendOwedAlerts(srv.now())
 	return probed
 }
 
@@ -270,7 +271,7 @@ func TestTLSMonitorUnreachableTargetFails(t *testing.T) {
 	if !results[0].CertNotAfter.IsZero() {
 		t.Fatalf("no handshake means no expiry: %+v", results[0])
 	}
-	srv.flushAlertDigests()
+	srv.sendOwedAlerts(srv.now())
 	if sent := rec.all(); len(sent) != 0 {
 		t.Fatalf("a first failing probe is held: %+v", sent)
 	}

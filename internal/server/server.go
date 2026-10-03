@@ -327,15 +327,39 @@ type Server struct {
 	// reworded notification silently changes who receives it; new callers say
 	// what the event is and are unaffected by prose.
 	emitNotifyTyped func(eventType, title, body string)
+	// emitIncidentNotice is the seam the incident sweep sends through: a
+	// typed event that also names the incidents it reports.
+	emitIncidentNotice func(eventType, title, body string, incidentIDs []string)
 	// nodeAlerts holds which offline spell each node was alerted for; see
 	// notifyNodeLiveness.
 	nodeAlerts nodeOfflineAlerts
-	// alertDigest batches service and monitor alerts decided one node at a
-	// time into one message per kind per sweep; see alert_digest.go.
+	// alertDigest drains the digest lines a version before incident records
+	// stored and never sent; see alert_digest.go.
 	alertDigest alertDigest
+	// incidentMu serialises every read-modify-write of an incident record
+	// (incidents.go); incidentPrunedAt is when resolved incidents were last
+	// pruned. Taken after nodeAlerts.mu and before any store lock.
+	incidentMu       sync.Mutex
+	incidentPrunedAt time.Time
+	// agentHealth is each node's last loop health, in memory only; see
+	// agent_health.go.
+	agentHealth agentHealthBook
 	// monitorDrops rate-limits the log line for agent monitor results the
 	// store refused; see server_monitor_results.go.
 	monitorDrops monitorDropLog
+	// latencySync serializes latency probe syncs, so the background sweep
+	// and a configuration save never plan against each other's half-written
+	// monitors; see latency_probes.go.
+	latencySync sync.Mutex
+	// latencySyncStop stops the latency probe sweep before Close returns, so
+	// no sync writes the store or the audit log after shutdown;
+	// latencySyncLoops counts the sweeps still running.
+	latencySyncStop     chan struct{}
+	latencySyncStopOnce sync.Once
+	latencySyncLoops    sync.WaitGroup
+	// latencyEdges holds the provider edge names the control plane resolved
+	// for the latency probes; see latency_edges.go.
+	latencyEdges latencyEdgeCache
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight
@@ -356,6 +380,20 @@ type Server struct {
 	// time. It exists so a client poll does not re-enter a plugin - and boot a
 	// JavaScript VM - on every fetch.
 	subscriptionCache *subscriptionCache
+	// identityLinkCache holds converted identity link documents, keyed by
+	// the identity's content digest (identity_link.go); identityConvert*
+	// run one convert per key and content version at a time;
+	// identityFetches remembers each
+	// identity link's last fetch since start. identityLinkConvert is a test
+	// seam; production leaves it nil and calls the Sub-Store plugin.
+	identityLinkCache      *subscriptionCache
+	identityConvertMu      sync.Mutex
+	identityConvertFlights map[identityConvertFlightKey]*shareRenderFlight
+	identityFetches        identityLinkFetches
+	identityLinkConvert    func(context.Context, []string, shareRenderVariant) (renderedSubscription, error)
+	// cutoverMu runs one credential cutover rotate at a time
+	// (vpn_cutover.go), so a repeated POST sees the plan the first left.
+	cutoverMu sync.Mutex
 	// subscriptionSnapshotPersist is a narrow persistence seam for exercising
 	// fail-closed last-good transitions. Production always falls back to Store.
 	subscriptionSnapshotPersist   func(model.SubscriptionSnapshot) (bool, error)
@@ -488,6 +526,10 @@ type Server struct {
 	// must heartbeat again before capability-gated tasks can be queued.
 	agentCapabilitiesMu sync.RWMutex
 	agentCapabilities   map[string]map[string]struct{}
+	// witness is the control-plane witness status each witness node's agent
+	// relays on its heartbeat (server_witness_status.go). Memory only, like
+	// agentRuntime.
+	witness witnessReports
 
 	// pendingSingboxProbeNodeIDs maps a node ID to the task ID of the most recent
 	// probe task. Entries are written and evicted exclusively by
@@ -657,8 +699,10 @@ func New(opts Options) (*Server, error) {
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		identityLinkCache:     newSubscriptionCache(identityLinkCacheEntries, identityLinkCacheTTL),
 		shareFetchStats:       newShareFetchStats(),
 		shareFlushStop:        make(chan struct{}),
+		latencySyncStop:       make(chan struct{}),
 		subscriptionDecoy:     opts.SubscriptionDecoy,
 		now:                   func() time.Time { return time.Now().UTC() },
 		tlsMonitorTargets:     defaultTLSMonitorTargets,
@@ -677,6 +721,7 @@ func New(opts Options) (*Server, error) {
 	}
 	s.emitNotify = s.notifyEvent
 	s.emitNotifyTyped = s.notifyEventTyped
+	s.emitIncidentNotice = s.notifyIncidentEvent
 	s.notifySend = defaultNotifySend
 	s.notifyRetryDelays = notifyRetryDelays
 	// Before anything can notify: answer what the previous process left in
@@ -684,6 +729,9 @@ func New(opts Options) (*Server, error) {
 	// rows are sent when the background loops start below.
 	s.restoreAlertDigest()
 	redrive := s.reconcileNotifyOutbox()
+	// Pages a version before incident records sent become incidents, so their
+	// recoveries still go out.
+	s.adoptLegacyAlerts(s.now())
 	s.pluginRPC = plugin.NewRPCRegistry()
 	// In-core providers are wired once at boot and never unregistered, so without a
 	// lifecycle predicate a disabled plugin's backend kept serving — disable would only
@@ -756,6 +804,7 @@ func New(opts Options) (*Server, error) {
 		}
 		s.startShareFetchStatsFlush()
 		s.startLineClientTemplateSync()
+		s.startLatencyProbeSync()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1271,6 +1320,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:admin", s.handleDeleteNotifyChannel))
 	mux.HandleFunc("/api/notify/channels/test", s.withAuth("notify:admin", s.handleNotifyChannelTest))
 	mux.HandleFunc("/api/notify/deliveries", s.withAuth("notify:admin", s.handleNotifyDeliveries))
+	mux.HandleFunc("/api/notify/witness", s.withAuth("notify:admin", s.handleWitnessStatus))
+	mux.HandleFunc("/api/notify/witness/plan", s.withAuth("notify:admin", s.handleWitnessPlan))
 	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:admin", s.handleNotifyRules))
 	mux.HandleFunc("/api/notify/rules/delete", s.withAuth("notify:admin", s.handleDeleteNotifyRule))
 	mux.HandleFunc("/api/notify/webhooks", s.withAuth("notify:admin", s.handleNotifyWebhooks))
@@ -1298,8 +1349,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/inbounds/delete", s.withAuth("", s.handleDeleteProxyInbound))
 	mux.HandleFunc("/api/proxy/users", s.withAuth("", s.handleProxyUsers))
 	mux.HandleFunc("/api/proxy/users/reveal-credentials", s.withAuth("", s.handleRevealVPNUserCredentials))
-	mux.HandleFunc("/api/proxy/users/rotate-sub-token", s.withAuth("", s.handleRotateProxyUserSubToken))
 	mux.HandleFunc("/api/proxy/users/delete", s.withAuth("", s.handleDeleteProxyUser))
+	mux.HandleFunc("/api/vpn/users/", s.withAuth("", s.handleVpnUserLink))
+	mux.HandleFunc("/api/vpn/cutover", s.withAuth("", s.handleVpnCutover))
+	mux.HandleFunc("/api/vpn/cutover/", s.withAuth("", s.handleVpnCutover))
 	mux.HandleFunc("/api/proxy/usage", s.withAuth("", s.handleProxyUsage))
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))
@@ -1325,6 +1378,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors", s.withAuth("", s.handleMonitors))
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
+	mux.HandleFunc("/api/incidents", s.withAuth("monitor:read", s.handleIncidents))
+	mux.HandleFunc("/api/incidents/ack", s.withAuth("monitor:admin", s.handleIncidentAck))
+	mux.HandleFunc("/api/incidents/snooze", s.withAuth("monitor:admin", s.handleIncidentSnooze))
+	mux.HandleFunc("/api/maintenance-windows", s.withAuth("monitor:read", s.handleMaintenanceWindows))
+	mux.HandleFunc("/api/maintenance-windows/delete", s.withAuth("monitor:admin", s.handleDeleteMaintenanceWindow))
+	mux.HandleFunc("/api/monitors/latency", s.withAuth("", s.handleLatencyProbes))
+	mux.HandleFunc("/api/monitors/latency/rollups", s.withAuth("monitor:read", s.handleLatencyRollups))
+	mux.HandleFunc("/api/monitors/latency/series", s.withAuth("monitor:read", s.handleLatencySeries))
 	// Evidence is the job "show me what the nodes actually did": the log store
 	// (raw lines and file tails) and the trace store (sing-box connection
 	// records and captured sessions), both host-owned and both gated by the
@@ -1463,17 +1524,24 @@ func (s *Server) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	s.flushAlertDigests()
+	s.sendOwedAlerts(s.now())
 	// The link audit flushers stop first, so none of them writes after the
 	// final flush below or after the store closes. Then the open hour's
 	// link fetch counts and any folded refusals are written, and a
 	// first-seen audit already handed to its goroutine lands too.
+	// The latency probe sweep stops with them: a sync already running
+	// finishes, and none starts after Close returns.
 	s.shareFlushStopOnce.Do(func() {
 		if s.shareFlushStop != nil {
 			close(s.shareFlushStop)
 		}
 	})
-	waitShareAudits := func(wg *sync.WaitGroup) {
+	s.latencySyncStopOnce.Do(func() {
+		if s.latencySyncStop != nil {
+			close(s.latencySyncStop)
+		}
+	})
+	waitWithin := func(wg *sync.WaitGroup) {
 		done := make(chan struct{})
 		go func() {
 			wg.Wait()
@@ -1484,10 +1552,11 @@ func (s *Server) Close(ctx context.Context) error {
 		case <-ctx.Done():
 		}
 	}
-	waitShareAudits(&s.shareFlushers)
+	waitWithin(&s.shareFlushers)
+	waitWithin(&s.latencySyncLoops)
 	s.flushShareFetchStats(s.now(), true)
 	s.flushShareRefusalAudit(s.now())
-	waitShareAudits(&s.shareFetchAudits)
+	waitWithin(&s.shareFetchAudits)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)
@@ -2576,6 +2645,7 @@ type nodeView struct {
 	AgentDebug           model.AgentDebugPolicy   `json:"agent_debug"`
 	AgentLaunch          *model.AgentLaunchConfig `json:"agent_launch,omitempty"`
 	AgentRuntime         *agentRuntimeConfig      `json:"agent_runtime,omitempty"`
+	LoopHealth           *agentLoopHealthView     `json:"loop_health,omitempty"`
 	IPConfig             *model.NodeIPConfig      `json:"ip_config,omitempty"`
 	GroupIDs             []string                 `json:"group_ids,omitempty"`
 	CreatedAt            time.Time                `json:"created_at"`
@@ -2603,7 +2673,8 @@ type agentRuntimeConfig struct {
 }
 
 func (s *Server) toNodeView(n model.Node) nodeView {
-	st := s.nodeStatusFor(n, s.now())
+	now := s.now()
+	st := s.nodeStatusFor(n, now)
 	return nodeView{
 		Status: st.Status, StatusSince: st.Since, StatusReason: st.Reason,
 		ID: n.ID, LatticeIdentityUUID: n.LatticeIdentityUUID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role, Inventory: n.Inventory,
@@ -2611,7 +2682,7 @@ func (s *Server) toNodeView(n model.Node) nodeView {
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Reachability: nodeReachability(n), Disabled: n.Disabled, AgentSourceAllowlist: append([]string(nil), n.AgentSourceAllowlist...), TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), LoopHealth: s.agentLoopHealthViewFor(n.ID, now), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }
 
@@ -2700,6 +2771,8 @@ func (s *Server) replaceAgentCapabilitiesUnlocked(nodeID string, capabilities []
 			known[lineChainDurableCapability] = struct{}{}
 		case singBoxUserDelByNameCapability:
 			known[singBoxUserDelByNameCapability] = struct{}{}
+		case witnessCapability:
+			known[witnessCapability] = struct{}{}
 		}
 	}
 	s.agentCapabilitiesMu.Lock()
@@ -4358,10 +4431,11 @@ func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, 
 	if !s.requireAllNodeScopes(w, p, "task:read", task.Targets) {
 		return
 	}
-	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "task.script.reveal") {
+	reveal, ok := s.requireSecretReveal(w, p, req.StepUpGrant, model.AuditEvent{Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
+	if !ok {
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
+	s.recordSecretReveal(p, reveal, model.AuditEvent{ID: id.New("audit"), Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                true,
 		"id":                task.ID,
@@ -5186,6 +5260,9 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		}
 		req.ID = id.New("mon")
 		req.Enabled = true
+		// Only the control plane marks a monitor as generated; a client
+		// that sends the field would make a monitor nobody can delete.
+		req.ManagedBy = ""
 		if err := s.store.UpsertMonitor(req); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -5208,8 +5285,15 @@ func (s *Server) handleDeleteMonitor(w http.ResponseWriter, r *http.Request, p p
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
-	if mon, ok := s.store.Monitor(req.ID); ok && !monitorManageableByPrincipal(p, mon) {
+	mon, ok := s.store.Monitor(req.ID)
+	if ok && !monitorManageableByPrincipal(p, mon) {
 		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+		return
+	}
+	if ok && mon.ManagedBy != "" {
+		// A generated monitor would come back on the next sync; it is
+		// changed through the configuration that generates it.
+		writeError(w, http.StatusConflict, fmt.Errorf("monitor %s is generated by the %s probe configuration; change that configuration instead", mon.ID, mon.ManagedBy))
 		return
 	}
 	if err := s.store.DeleteMonitor(req.ID); err != nil {
@@ -5289,6 +5373,13 @@ func monitorPairAssigned(mon model.Monitor, nodeID string) bool {
 }
 
 func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {
+	if target, ok := strings.CutPrefix(mon.ID, latencyMonitorPrefix); ok && mon.ManagedBy == model.MonitorManagedLatency &&
+		!rbac.Allows(p.Principal, scope, target) {
+		// A generated latency monitor carries its target's address and
+		// name; a principal confined to the source must also be able to
+		// read the target, as the latency reads demand.
+		return false
+	}
 	if mon.AssignAll {
 		return rbac.Allows(p.Principal, scope, "")
 	}
@@ -5340,15 +5431,21 @@ type notifyChannelView struct {
 	// Health is joined from the outbox's health record at read time; it is
 	// never part of the stored channel.
 	Health notifyChannelHealthView `json:"health"`
+	// FallbackChannelID takes the critical messages this channel fails
+	// (notify_channel_fallback.go); CriticalEventTypes names them, so the
+	// console never keeps its own copy of the list.
+	FallbackChannelID  string   `json:"fallback_channel_id,omitempty"`
+	CriticalEventTypes []string `json:"critical_event_types"`
 }
 
-func toNotifyChannelView(c model.NotifyChannel, h store.NotifyChannelHealth, now time.Time) notifyChannelView {
+func toNotifyChannelView(c model.NotifyChannel, h store.NotifyChannelHealth, opts store.NotifyChannelOptions, now time.Time) notifyChannelView {
 	keys := make([]string, 0, len(c.Config))
 	for k := range c.Config {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt, Health: toNotifyChannelHealthView(h, now)}
+	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt, Health: toNotifyChannelHealthView(h, now),
+		FallbackChannelID: opts.FallbackChannelID, CriticalEventTypes: notifyCriticalEventList()}
 }
 
 func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p principal) {
@@ -5361,10 +5458,11 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		}
 		channels := s.store.NotifyChannels()
 		health := s.store.NotifyChannelHealths()
+		opts := s.store.NotifyChannelOptionsByChannel()
 		now := s.now()
 		views := make([]notifyChannelView, 0, len(channels))
 		for _, c := range channels {
-			views = append(views, toNotifyChannelView(c, health[c.ID], now))
+			views = append(views, toNotifyChannelView(c, health[c.ID], opts[c.ID], now))
 		}
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
@@ -5380,6 +5478,9 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			Kind    string            `json:"kind"`
 			Config  map[string]string `json:"config"`
 			Enabled *bool             `json:"enabled"`
+			// FallbackChannelID takes this channel's failed critical
+			// messages; nil keeps the stored value, "" clears it.
+			FallbackChannelID *string `json:"fallback_channel_id"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -5407,13 +5508,22 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			Config:  req.Config,
 			Enabled: req.Enabled == nil || *req.Enabled,
 		}
-		for _, existing := range s.store.NotifyChannels() {
+		existingChannels := s.store.NotifyChannels()
+		for _, existing := range existingChannels {
 			if existing.ID == channel.ID {
 				channel.CreatedAt = existing.CreatedAt
 				break
 			}
 		}
-		if err := s.store.UpsertNotifyChannel(channel); err != nil {
+		opts := s.store.NotifyChannelOptionsByChannel()[channel.ID]
+		if req.FallbackChannelID != nil {
+			opts.FallbackChannelID = strings.TrimSpace(*req.FallbackChannelID)
+		}
+		if err := validateNotifyChannelFallback(opts.FallbackChannelID, channel.ID, existingChannels); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertNotifyChannelWithOptions(channel, opts); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -5421,9 +5531,13 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		if req.ID != "" {
 			action = "notify.channel.update"
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
+		metadata := map[string]string{"channel_id": channel.ID, "kind": channel.Kind}
+		if opts.FallbackChannelID != "" {
+			metadata["fallback_channel_id"] = opts.FallbackChannelID
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: metadata})
 		health, _ := s.store.NotifyChannelHealth(channel.ID)
-		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, s.now()))
+		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, opts, s.now()))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -5476,6 +5590,7 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			// FallbackChannelID is absent to keep the rule's current fallback,
 			// empty to clear it, or a channel id.
 			FallbackChannelID *string `json:"fallback_channel_id"`
+			notifyRuleOptionsRequest
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -5502,6 +5617,10 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if opts, err = applyNotifyRuleOptions(opts, req.notifyRuleOptionsRequest); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		if err := s.store.UpsertNotifyRuleWithOptions(rule, opts); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -5509,6 +5628,14 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 		metadata := map[string]string{"rule_id": rule.ID}
 		if opts.FallbackChannelID != "" {
 			metadata["fallback_channel_id"] = opts.FallbackChannelID
+		}
+		if on, after, level := escalationPolicy(opts); on {
+			metadata["escalation"] = fmt.Sprintf("after %s at %s", after, level)
+		} else {
+			metadata["escalation"] = "off"
+		}
+		if qh := opts.QuietHours; qh != nil {
+			metadata["quiet_hours"] = qh.Start + "-" + qh.End + " " + qh.TimeZone
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: metadata})
 		writeJSON(w, http.StatusOK, toNotifyRuleView(rule, opts))
@@ -5733,53 +5860,78 @@ const (
 // before the restart still announces its recovery. A result the store held
 // already (a retried batch) is never passed here.
 //
-// The notice is queued for the sweep's digest, so an all-nodes monitor whose
-// target goes down pages once, naming every node. The page itself is not
-// stored: it is decided after the result's write commits and waits in memory
-// until the next sweep. A process that dies without Close in that window
-// never sends it, and the agent's retry of that result comes back as a
-// duplicate that decides nothing. So a page is never sent twice, but a crash
-// can lose one; closing that needs the stored notification outbox described
-// at alertDigest.
+// The result opens or resolves the pair's incident (incidents.go), and the
+// sweep sends what that owes: an all-nodes monitor whose target goes down
+// pages once, naming every node. The decision is stored with the incident, so
+// a process that dies before the sweep still sends the page after the
+// restart, and a retried result comes back as a duplicate that decides
+// nothing.
 func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, priorFailStreak int) {
-	var kind string
-	switch {
-	case !current.Success && priorFailStreak == 1:
-		kind = EventMonitorDown
-	case current.Success && priorFailStreak >= 2:
-		kind = EventMonitorRecovered
-	default:
+	if current.Success && priorFailStreak == 0 {
+		return
+	}
+	if !current.Success && priorFailStreak != 1 {
 		return
 	}
 	mon, _ := s.store.Monitor(current.MonitorID)
-	name := strings.TrimSpace(mon.Name)
-	if name == "" {
-		name = current.MonitorID
+	if mon.ManagedBy == model.MonitorManagedLatency {
+		// Latency probes do not page one pair at a time: a path from China
+		// drops probes routinely, and twenty targets would page twenty
+		// times. A degradation alert belongs to the incident path, judged
+		// on the pair's rollups (latencyRollupsFor) instead.
+		return
 	}
-	// A node monitor names the node by its name. A server-evaluated monitor
-	// (tls) has no node, so it names the target it dialled.
-	where := s.nodeDisplayName(nodeID)
+	if mon.ID == "" {
+		mon.ID = current.MonitorID
+	}
+	name, where := s.monitorNames(mon, nodeID)
+	key := incidentKey(EventMonitorDown, nodeID, current.MonitorID)
+	now := s.now()
+	if current.Success {
+		s.resolveIncident(key, now, incidentMessage{
+			title:  fmt.Sprintf("Monitor recovered: %s on %s", name, where),
+			detail: fmt.Sprintf("%s on %s is back up (%.1fms).", name, where, current.LatencyMs),
+			line:   fmt.Sprintf("%s on %s: back up (%.1fms)", name, where, current.LatencyMs),
+		})
+		return
+	}
+	// Since is this server's clock at the second failure; the result's own
+	// At is the agent's clock.
+	s.openIncident(incidentSignal{
+		kind: EventMonitorDown, nodeID: nodeID, monitorID: current.MonitorID,
+		subject: name + " on " + where, since: now, sortKey: name + "\x00" + where,
+		msg: monitorDownMessage(name, where, current.Error),
+	}, now)
+}
+
+// monitorNames is how a monitor and where it runs read in a message. A node
+// monitor names the node by its name. A server-evaluated monitor (tls) has no
+// node, so it names the target it dialled.
+func (s *Server) monitorNames(mon model.Monitor, nodeID string) (name, where string) {
+	name = strings.TrimSpace(mon.Name)
+	if name == "" {
+		name = mon.ID
+	}
+	where = s.nodeDisplayName(nodeID)
 	if nodeID == "" {
 		where = strings.TrimSpace(mon.Target)
 		if where == "" {
 			where = "the control plane"
 		}
 	}
-	line := alertDigestLine{sortKey: name + "\x00" + where}
-	if kind == EventMonitorRecovered {
-		line.title = fmt.Sprintf("Monitor recovered: %s on %s", name, where)
-		line.body = fmt.Sprintf("%s on %s is back up (%.1fms).", name, where, current.LatencyMs)
-		line.line = fmt.Sprintf("%s on %s: back up (%.1fms)", name, where, current.LatencyMs)
-	} else {
-		detail := strings.TrimSpace(current.Error)
-		if detail == "" {
-			detail = "probe failed"
-		}
-		line.title = fmt.Sprintf("Monitor down: %s on %s", name, where)
-		line.body = fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail)
-		line.line = fmt.Sprintf("%s on %s: %s", name, where, detail)
+	return name, where
+}
+
+func monitorDownMessage(name, where, errText string) incidentMessage {
+	detail := strings.TrimSpace(errText)
+	if detail == "" {
+		detail = "probe failed"
 	}
-	s.queueAlertDigest(kind, line)
+	return incidentMessage{
+		title:  fmt.Sprintf("Monitor down: %s on %s", name, where),
+		detail: fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail),
+		line:   fmt.Sprintf("%s on %s: %s", name, where, detail),
+	}
 }
 
 // handleAgentEvent ingests an out-of-band event from an authenticated agent
@@ -6269,6 +6421,8 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 			Name            string   `json:"name"`
 			Scopes          []string `json:"scopes"`
 			ServerAllowlist []string `json:"server_allowlist"`
+			// StepUpGrant is required only to grant secrets:reveal.
+			StepUpGrant string `json:"step_up_grant"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -6279,15 +6433,25 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 		}
 		// Privilege containment: a caller may only mint a token whose scopes are
 		// a subset of its own, so token creation cannot be used to escalate.
+		// secrets:reveal is the exception with its own door
+		// (requireSecretRevealGrantAuthority): nobody holds it by delegation.
+		grantsReveal := false
 		for _, scope := range req.Scopes {
 			if !rbac.ValidScope(scope) {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("unknown scope %q", scope))
 				return
 			}
+			if rbac.ExplicitOnly(scope) {
+				grantsReveal = true
+				continue
+			}
 			if !rbac.CanDelegateScope(p.Principal, scope) {
 				writeError(w, http.StatusForbidden, fmt.Errorf("cannot grant scope %q beyond your own", scope))
 				return
 			}
+		}
+		if grantsReveal && !s.requireSecretRevealGrantAuthority(w, p, req.StepUpGrant) {
+			return
 		}
 		if !serverAllowlistSubset(p.ServerAllowlist, req.ServerAllowlist) {
 			writeError(w, http.StatusForbidden, errors.New("cannot grant server allowlist beyond your own"))
@@ -6316,7 +6480,13 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.create", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
+		createMeta := map[string]string{"token_id": tok.ID}
+		if grantsReveal {
+			// The one grant that lets a token read secrets is named in the
+			// trail where it was made, not only in the token's scope list.
+			createMeta["grants_secret_reveal"] = "true"
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.create", Scope: "token:admin", Metadata: createMeta})
 		// The credential is returned exactly once, in "<id>.<secret>" form.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":    tok.ID,
@@ -6873,6 +7043,14 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case "cftunnel":
 		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
+	case witnessPlugin:
+		// A witness plan names a stored notification channel and a prefix
+		// of its key's hash, and it hands that key to a node. Authoring and
+		// deciding one both need notify:admin, and channels are fleet-wide,
+		// so reading one needs it unconfined as well.
+		return !principalHasNodeRestriction(p) &&
+			rbac.Allows(p.Principal, "notify:admin", "") &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case sshGuardPlugin:
 		// An SSH Guard plan carries the node's knock sequence in plaintext,
 		// inside the knockd block a reviewer is meant to read. The sequence is
@@ -6922,6 +7100,8 @@ func approvalApplyTaskTimeoutSec(plugin string) int {
 		return 600
 	case "nft", "nftpolicy", "selfdns":
 		return networkApplyTaskTimeoutSec
+	case witnessPlugin:
+		return witnessApplyTaskTimeoutSec
 	default:
 		return defaultTaskTimeoutSec
 	}
@@ -7140,6 +7320,15 @@ func (s *Server) applyScriptFor(approval model.Approval) string {
 	if approval.Plugin == singBoxLineMetaPlugin {
 		return s.lineMetaApplyScript(approval)
 	}
+	if approval.Plugin == witnessPlugin {
+		script, err := s.witnessApplyScript(approval)
+		if err != nil {
+			return "set -e\n" +
+				"echo " + shellQuote("lattice witness: invalid approval: "+err.Error()) + " >&2\n" +
+				"exit 1\n"
+		}
+		return script
+	}
 	return applyScriptForWithServer(approval, s.publicURL)
 }
 
@@ -7185,6 +7374,11 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 	case proxyCorePlugin:
 		return "set -e\n" +
 			"echo " + shellQuote("lattice proxycore: server-backed apply context required; re-approve through /api/network/approvals/approve") + " >&2\n" +
+			"exit 1\n"
+	case witnessPlugin:
+		// The configure script carries a key only the server can read.
+		return "set -e\n" +
+			"echo " + shellQuote("lattice witness: server-backed apply context required; re-approve through /api/network/approvals/approve") + " >&2\n" +
 			"exit 1\n"
 	case agentUpdatePlugin:
 		script, err := agentUpdateApplyScript(approval, serverURL)
@@ -7985,6 +8179,26 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 		}
 	}
+	if isWitnessApproval(approval) {
+		// The configure script carries a key read when the approval is
+		// decided, and nothing renders one later: approved without its task,
+		// a witness approval could never be applied, and approve is a no-op
+		// once it is no longer pending.
+		if !queueApply {
+			return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest,
+				witnessPlugin+" approvals must queue their apply task: approve with queue_apply, since an approval approved without one can never be applied")}
+		}
+		if err := s.requireCurrentWitnessApproval(approval); err != nil {
+			if rejectErr := s.rejectApprovalWithReason(approval, err.Error()); rejectErr != nil {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: rejectErr}
+			}
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+		if approval.Action == witnessConfigureAction && !s.agentHasCapability(approval.NodeID, witnessCapability) {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest,
+				"node agent has not advertised "+witnessCapability+"; update or reconnect the agent before applying")}
+		}
+	}
 	if queueApply && isNetGuardApproval(approval) && !s.agentHasCapability(approval.NodeID, netGuardManagedSHACapability) {
 		return approval, &approvalDecisionError{
 			status: http.StatusConflict,
@@ -8067,6 +8281,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			applyScript = s.managedLineApplyScript(approval)
 		case lineChainPlugin:
 			applyScript = lineChainScript
+		case witnessPlugin:
+			var err error
+			applyScript, err = s.witnessApplyScript(approval)
+			if err != nil {
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+			}
 		default:
 			applyScript = s.applyScriptFor(approval)
 		}
@@ -8512,6 +8732,9 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 		return "vpncore:admin"
 	case "cftunnel":
 		return "tunnel:admin"
+	case witnessPlugin:
+		// Approving hands a stored channel's device key to a node.
+		return "notify:admin"
 	default:
 		return ""
 	}
@@ -8526,7 +8749,7 @@ func approvalDecisionAuditScope(approval model.Approval) string {
 
 func approvalRequiresPlanHash(approval model.Approval) bool {
 	switch approval.Plugin {
-	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore", "agentupdate", sshGuardPlugin:
+	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore", "agentupdate", sshGuardPlugin, witnessPlugin:
 		return true
 	default:
 		// Approvals are the host-mutation gate. Unknown future plugins carrying a
@@ -8640,6 +8863,12 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		agentAuthRequest
 		Metrics      model.Metrics       `json:"metrics"`
 		AgentRuntime *agentRuntimeConfig `json:"agent_runtime"`
+		// LoopHealth is node-agent 0.3.10's account of its work loop; kept
+		// in memory beside agentRuntime, never persisted per beat.
+		LoopHealth *model.AgentHealth `json:"loop_health"`
+		// Witness is the control-plane witness's status file, sent only by
+		// the node that runs one.
+		Witness *witnessReport `json:"witness"`
 	}
 	if !decodeAgentJSON(w, r, &req) {
 		return
@@ -8687,6 +8916,8 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		s.agentRuntime[req.NodeID] = runtime
 		s.agentRuntimeMu.Unlock()
 	}
+	s.noteAgentHealth(req.NodeID, req.LoopHealth, req.Metrics.CollectedAt)
+	s.noteWitnessReport(req.NodeID, req.Witness)
 	s.maybeTriggerDDNS(req.NodeID, old.PublicIP, old.PublicIPv6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -8941,6 +9172,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if isSSHGuardApproval(approval) {
 		return s.handleSSHGuardTaskResult(r, approval, task, result)
+	}
+	if isWitnessApproval(approval) {
+		return s.handleWitnessTaskResult(r, approval, task, result)
 	}
 	if isPluginOperationApproval(approval) {
 		return s.handlePluginOperationTaskResult(r, approval, task, result)

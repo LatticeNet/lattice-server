@@ -213,7 +213,7 @@ func singBoxLivenessEpisodeAcrossRestart(t *testing.T, crash bool) {
 	current := f.srv
 	expectNotices := func(when string, want ...string) {
 		t.Helper()
-		current.flushAlertDigests()
+		current.sendOwedAlerts(current.now())
 		got := *notices
 		*notices = nil
 		if len(got) != len(want) {
@@ -353,7 +353,7 @@ func TestReenrolledNodeDoesNotInheritLivenessEpisode(t *testing.T) {
 	postLiveness(t, f.handler, token, false, at)
 	at = base.Add(10*time.Second + serviceDownHold)
 	postLiveness(t, f.handler, token, false, at)
-	f.srv.flushAlertDigests()
+	f.srv.sendOwedAlerts(f.srv.now())
 	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceDown {
 		t.Fatalf("setup: want one down notice, got %+v", *notices)
 	}
@@ -371,20 +371,20 @@ func TestReenrolledNodeDoesNotInheritLivenessEpisode(t *testing.T) {
 	if !ok || !rec.StateSince.Equal(reenrolledAt) || !rec.ProblemSince.Equal(reenrolledAt) || !rec.NotifiedDownAt.IsZero() {
 		t.Fatalf("the re-enrolled node inherited the deleted episode: %+v", rec)
 	}
-	f.srv.flushAlertDigests()
+	f.srv.sendOwedAlerts(f.srv.now())
 	if len(*notices) != 0 {
 		t.Fatalf("a fresh outage was announced before the hold: %+v", *notices)
 	}
 	at = reenrolledAt.Add(serviceDownHold)
 	postLiveness(t, f.handler, token, false, at)
-	f.srv.flushAlertDigests()
+	f.srv.sendOwedAlerts(f.srv.now())
 	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceDown {
 		t.Fatalf("the re-enrolled node's outage was not announced once after the hold: %+v", *notices)
 	}
 	*notices = nil
 	at = at.Add(10 * time.Second)
 	postLiveness(t, f.handler, token, true, at)
-	f.srv.flushAlertDigests()
+	f.srv.sendOwedAlerts(f.srv.now())
 	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceRecovered {
 		t.Fatalf("recovery from the new episode: %+v", *notices)
 	}

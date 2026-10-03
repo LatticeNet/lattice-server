@@ -57,7 +57,8 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersService, "v1", []string{"list", "get"}, s.vpnCoreUsersRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersAdminService, "v1", []string{"create", "update", "delete", "bind", "unbind", "plan_add", "plan_update", "plan_remove", "rotate", "usage_query"}, s.vpnCoreUsersAdminRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersAdminService, "v1", []string{"create", "update", "delete", "bind", "unbind", "plan_add", "plan_update", "plan_remove", "rotate", "usage_query",
+		"link_get", "link_issue", "link_set", "link_revoke", "link_rotate", "link_reveal"}, s.vpnCoreUsersAdminRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreUsersAdminService, err)
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsageService, "v1", []string{"query"}, s.vpnCoreUsageRPC); err != nil {
@@ -118,7 +119,7 @@ func (s *Server) vpnCoreSubscriptionSourcesRPC(ctx context.Context, method strin
 	if err != nil {
 		response = graphSubscriptionResponse{SchemaVersion: 1, Error: composeFailureView(err)}
 	}
-	if response.OK && !vpnCoreComposeCredentialsAllowed(ctx) {
+	if response.OK && !s.vpnCoreComposeCredentialsAllowed(ctx) {
 		response = redactComposedSubscription(response)
 	}
 	return json.Marshal(response)
@@ -144,7 +145,13 @@ func (s *Server) vpnCoreSubscriptionSourcesRPC(ctx context.Context, method strin
 // operator called directly (operatorCoreCallKey), and only a compose reached
 // that way is held to the operator's scopes. A compose with no mark is the
 // serving path a plugin reaches under its signed host_access grant.
-func vpnCoreComposeCredentialsAllowed(ctx context.Context) bool {
+//
+// The direct call is also a reveal, so it asks the reveal gate
+// (secret_reveal.go) on top of vpncore:admin. Its request is decoded
+// strictly and has no room for a step-up grant, so only a token carrying
+// secrets:reveal passes; a person reads an identity's credentials through
+// the credential reveal or its link.
+func (s *Server) vpnCoreComposeCredentialsAllowed(ctx context.Context) bool {
 	if operatorCalledCoreService(ctx) != vpnCoreSubscriptionSourcesService {
 		return true
 	}
@@ -152,8 +159,16 @@ func vpnCoreComposeCredentialsAllowed(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	allowed, _ := pluginGatewayScopeAllowed(p, "vpncore:admin")
-	return allowed
+	if allowed, _ := pluginGatewayScopeAllowed(p, "vpncore:admin"); !allowed {
+		return false
+	}
+	reveal := s.decideSecretReveal(p, "")
+	if !reveal.Allowed {
+		return false
+	}
+	s.recordSecretReveal(p, reveal, model.AuditEvent{Action: "vpncore.compose.reveal", Scope: "vpncore:admin",
+		Metadata: map[string]string{"service": vpnCoreSubscriptionSourcesService, "method": "compose"}})
+	return true
 }
 
 // redactComposedSubscription replaces the credential in every composed entry
@@ -349,7 +364,7 @@ func (s *Server) vpnCoreNodesRPC(ctx context.Context, method string, request []b
 	// The context is load-bearing here and used to be discarded. Both methods
 	// return connection material, and whether the caller may see the part of it
 	// that AUTHENTICATES is decided from the principal it carries.
-	credentials := s.vpnCoreNodeCredentialsAllowed(ctx)
+	credentials := s.vpnCoreNodeCredentialsAllowed(ctx, method, request)
 	switch method {
 	case "export":
 		return s.vpnCoreExportNodes(request, credentials)
@@ -381,13 +396,40 @@ func (s *Server) vpnCoreNodesRPC(ctx context.Context, method string, request []b
 // subject of a separate, tracked finding; it is deliberately NOT widened here,
 // because narrowing it would stop every vpn-core-sourced subscription from
 // serving.
-func (s *Server) vpnCoreNodeCredentialsAllowed(ctx context.Context) bool {
+//
+// An operator's own direct call (the gateway's operatorCoreCallKey names this
+// service) is a reveal as well, so it also asks the reveal gate
+// (secret_reveal.go): a session passes with a fresh step-up grant sent as
+// "step_up_grant" in the request, a token with secrets:reveal. Anything less
+// gets the links with their credentials replaced by the fixed marker, which
+// is what a list is for. The same service reached by a plugin's rpc:call
+// while it serves the operator (a Sub-Store refresh) keeps the vpncore:admin
+// rule: that answer feeds the plugin's snapshot, not the operator's screen.
+func (s *Server) vpnCoreNodeCredentialsAllowed(ctx context.Context, method string, request []byte) bool {
 	p, err := pluginOperatorPrincipal(ctx)
 	if err != nil {
 		return true
 	}
-	allowed, _ := pluginGatewayScopeAllowed(p, "vpncore:admin")
-	return allowed
+	if allowed, _ := pluginGatewayScopeAllowed(p, "vpncore:admin"); !allowed {
+		return false
+	}
+	if operatorCalledCoreService(ctx) != vpnCoreNodesService {
+		return true
+	}
+	var req struct {
+		StepUpGrant string `json:"step_up_grant"`
+		UserID      string `json:"user_id"`
+	}
+	if len(bytes.TrimSpace(request)) > 0 {
+		_ = json.Unmarshal(request, &req)
+	}
+	reveal := s.decideSecretReveal(p, req.StepUpGrant)
+	if !reveal.Allowed {
+		return false
+	}
+	s.recordSecretReveal(p, reveal, model.AuditEvent{Action: "vpncore.nodes.reveal", Scope: "vpncore:admin",
+		Metadata: map[string]string{"service": vpnCoreNodesService, "method": method, "user_id": strings.TrimSpace(req.UserID)}})
+	return true
 }
 
 // redactLinkCredential strips the secret from a connection URL. For every

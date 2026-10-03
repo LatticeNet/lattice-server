@@ -10,6 +10,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // The publishing plane answers one question for the whole product: what URL is
@@ -74,6 +75,26 @@ type publishingRecord struct {
 	Reserved bool
 	// ShareID is set for origin plugin and identifies the projected share.
 	ShareID string
+	// IdentityID is set instead for an identity's subscription link, which
+	// is projected the same way from the identity that owns it.
+	IdentityID string
+}
+
+// publishingRecordFromIdentityLink projects an identity's link onto the
+// subscription mount, so the route exists exactly while the link does and
+// edits stay with the identity.
+func publishingRecordFromIdentityLink(link store.VpnUserLinkProjection) publishingRecord {
+	return publishingRecord{
+		ID:         "identity:" + link.IdentityID,
+		Origin:     originPlugin,
+		Bucket:     link.IdentityID,
+		AnyHost:    true,
+		PathPrefix: subscriptionMountPrefix + "/" + link.Slug,
+		Enabled:    !link.Disabled,
+		ExpiresAt:  link.ExpiresAt,
+		Reserved:   true,
+		IdentityID: link.IdentityID,
+	}
 }
 
 // publishingAdminScope names the scope that may publish an origin.
@@ -171,6 +192,9 @@ func (s *Server) publishingRecords(origin string) []publishingRecord {
 		for _, share := range s.store.SubscriptionSharesUnordered() {
 			out = append(out, publishingRecordFromShare(share))
 		}
+		for _, link := range s.store.VpnUserLinkProjections() {
+			out = append(out, publishingRecordFromIdentityLink(link))
+		}
 	default:
 		for _, binding := range s.store.StorageBindings(origin) {
 			out = append(out, publishingRecordFromBinding(binding))
@@ -256,6 +280,9 @@ type publishingRecordView struct {
 	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
 	Reserved   bool       `json:"reserved"`
 	ShareID    string     `json:"share_id,omitempty"`
+	// IdentityID marks a read-only row projected from an identity's link;
+	// the identity is where it is edited.
+	IdentityID string `json:"identity_id,omitempty"`
 	// AdminScope tells the console which scope gates editing this route, so the
 	// page can disable a control instead of offering an action that will 403.
 	AdminScope string `json:"admin_scope"`
@@ -266,7 +293,7 @@ func publishingRecordViewOf(record publishingRecord) publishingRecordView {
 		ID: record.ID, Origin: record.Origin, Bucket: record.Bucket,
 		Hostname: record.Hostname, AnyHost: record.AnyHost,
 		PathPrefix: record.PathPrefix, Enabled: record.Enabled, ExpiresAt: record.ExpiresAt,
-		Reserved: record.Reserved, ShareID: record.ShareID,
+		Reserved: record.Reserved, ShareID: record.ShareID, IdentityID: record.IdentityID,
 		AdminScope: publishingAdminScope(record.Origin),
 	}
 }

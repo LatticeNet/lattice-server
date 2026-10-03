@@ -101,3 +101,58 @@ func TestDurableHeartbeatChangeWritesImmediately(t *testing.T) {
 		t.Fatalf("an agent version change wrote %d times, want 1", calls)
 	}
 }
+
+// A token use moves a node's TokenLastUsedAt at most once per minInterval.
+// It used to write the whole state file each time, once per node per
+// interval; it now rides the next write while the node's heartbeat on disk
+// is fresh, and Close writes it.
+func TestTokenUseRidesTheNextWrite(t *testing.T) {
+	s, path, ids := openHeartbeatFleet(t)
+	at := time.Now().UTC()
+	before := s.testPersistCalls
+	for _, nodeID := range ids {
+		touched, err := s.TouchNodeToken(nodeID, at, 15*time.Minute)
+		if err != nil || !touched {
+			t.Fatalf("%s: touched=%v err=%v", nodeID, touched, err)
+		}
+	}
+	if calls := s.testPersistCalls - before; calls != 0 {
+		t.Fatalf("%d token uses with fresh heartbeats on disk wrote %d times, want 0", len(ids), calls)
+	}
+	if n, _ := s.Node(ids[0]); !n.TokenLastUsedAt.Equal(at) {
+		t.Fatalf("token last used in memory = %v, want %v", n.TokenLastUsedAt, at)
+	}
+
+	// A node whose heartbeat on disk is stale still writes its token use.
+	s.metricsPersistedAt[ids[5]] = at.Add(-metricsPersistenceInterval - time.Second)
+	later := at.Add(2 * time.Minute)
+	before = s.testPersistCalls
+	if touched, err := s.TouchNodeToken(ids[5], later, time.Minute); err != nil || !touched {
+		t.Fatalf("stale node: touched=%v err=%v", touched, err)
+	}
+	if calls := s.testPersistCalls - before; calls != 1 {
+		t.Fatalf("a token use with a stale heartbeat on disk wrote %d times, want 1", calls)
+	}
+
+	// The others are on disk now too, and the next unflushed use waits for
+	// Close.
+	if touched, err := s.TouchNodeToken(ids[6], later, time.Minute); err != nil || !touched {
+		t.Fatalf("node 6: touched=%v err=%v", touched, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithCipher(path, secret.Disabled())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nodeID := range ids {
+		want := at
+		if nodeID == ids[5] || nodeID == ids[6] {
+			want = later
+		}
+		if n, ok := reopened.Node(nodeID); !ok || !n.TokenLastUsedAt.Equal(want) {
+			t.Fatalf("%s token last used after reopen = %v, want %v", nodeID, n.TokenLastUsedAt, want)
+		}
+	}
+}

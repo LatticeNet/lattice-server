@@ -31,10 +31,10 @@ const maxTaskResults = 2000
 
 // metricsPersistenceInterval keeps hot heartbeat telemetry fresh in memory
 // without rewriting the full encrypted JSON store on every agent poll. It
-// bounds how stale a node's heartbeat (last seen and metrics) may get on
-// disk. Every write carries every node's heartbeat, so the clock restarts
-// for the whole fleet on any write: a quiet fleet is written once per
-// interval, not once per node per interval.
+// bounds how stale a node's heartbeat (last seen, metrics, the token's last
+// use) may get on disk. Every write carries every node's heartbeat, so the
+// clock restarts for the whole fleet on any write: a quiet fleet is written
+// once per interval, not once per node per interval.
 const metricsPersistenceInterval = 5 * time.Minute
 
 // monitorResultPersistenceInterval keeps monitor history live in memory while
@@ -286,9 +286,9 @@ type Store struct {
 	guardRealityOnDisk map[string]time.Time
 	// metricsPersistedAt above is each node's LastSeen as the state file holds
 	// it, seeded at open and refreshed from every committed JSON write.
-	// nodeClocksUnflushed is set when a heartbeat changed a node in memory
-	// without a write, cleared by the next committed write, and written by
-	// Close. Guarded by mu.
+	// nodeClocksUnflushed is set when a heartbeat or a token use changed a
+	// node in memory without a write, cleared by the next committed write, and
+	// written by Close. Guarded by mu.
 	nodeClocksUnflushed bool
 	// closed is set by the first Close. A later Close does nothing: the bolt
 	// sidecar is gone by then, so a write would put its domains in the JSON
@@ -1581,6 +1581,15 @@ func (s *Store) TouchNodeToken(nodeID string, at time.Time, minInterval time.Dur
 	}
 	n.TokenLastUsedAt = at
 	s.state.Nodes[nodeID] = n
+	// The token's last use is heartbeat telemetry: it rides the next write
+	// while the node's heartbeat on disk is fresh, which the heartbeat
+	// throttle keeps within metricsPersistenceInterval, and Close writes it.
+	// Writing it here on its own clock rewrote the whole state file once per
+	// node every minInterval.
+	if written, ok := s.metricsPersistedAt[nodeID]; ok && at.Sub(written) < metricsPersistenceInterval {
+		s.nodeClocksUnflushed = true
+		return true, nil
+	}
 	return true, s.Save()
 }
 

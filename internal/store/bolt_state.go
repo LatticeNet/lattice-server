@@ -152,6 +152,37 @@ func putBoltNotifyRuleOptions(tx *bolt.Tx, opts map[string]NotifyRuleOptions) er
 	return meta.Put(boltKeyNotifyRuleOptions, raw)
 }
 
+// boltKeyNotifyChannelOptions holds State.NotifyChannelOptions the same way,
+// so the migrate round trip keeps a channel's critical fallback.
+var boltKeyNotifyChannelOptions = []byte("notify_channel_options")
+
+func putBoltNotifyChannelOptions(tx *bolt.Tx, opts map[string]NotifyChannelOptions) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if len(opts) == 0 {
+		return meta.Delete(boltKeyNotifyChannelOptions)
+	}
+	raw, err := json.Marshal(opts)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyNotifyChannelOptions, raw)
+}
+
+func readBoltNotifyChannelOptions(tx *bolt.Tx, into map[string]NotifyChannelOptions) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil
+	}
+	raw := meta.Get(boltKeyNotifyChannelOptions)
+	if len(raw) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(raw, &into); err != nil {
+		return fmt.Errorf("decode notify channel options: %w", err)
+	}
+	return nil
+}
+
 func readBoltNotifyRuleOptions(tx *bolt.Tx, into map[string]NotifyRuleOptions) error {
 	meta := tx.Bucket(boltBucketMeta)
 	if meta == nil {
@@ -468,6 +499,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltNotifyRuleOptions(tx, persist.NotifyRuleOptions); err != nil {
 			return err
 		}
+		if err := putBoltNotifyChannelOptions(tx, persist.NotifyChannelOptions); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
 			return err
 		}
@@ -717,6 +751,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		if err := readBoltNotifyRuleOptions(tx, st.NotifyRuleOptions); err != nil {
+			return err
+		}
+		if err := readBoltNotifyChannelOptions(tx, st.NotifyChannelOptions); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {

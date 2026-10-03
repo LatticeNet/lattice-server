@@ -95,6 +95,9 @@ type State struct {
 	// not carry yet (notify_rule_options.go), keyed by rule id. Operator
 	// configuration written only on a rule edit, so the JSON state is its home.
 	NotifyRuleOptions map[string]NotifyRuleOptions `json:"notify_rule_options,omitempty"`
+	// NotifyChannelOptions holds per-channel settings model.NotifyChannel
+	// does not carry yet (notify_channel_options.go), keyed by channel id.
+	NotifyChannelOptions map[string]NotifyChannelOptions `json:"notify_channel_options,omitempty"`
 	// NotifyWebhooks are operator-authored inbound entry points (notify_webhook.go).
 	// They hold a PBKDF2 secret hash, not a reversible secret, so unlike
 	// NotifyChannels they need no pass in crypto.go.
@@ -829,6 +832,7 @@ func emptyState() State {
 		NotifyChannels:          map[string]model.NotifyChannel{},
 		NotifyRules:             map[string]model.NotifyRule{},
 		NotifyRuleOptions:       map[string]NotifyRuleOptions{},
+		NotifyChannelOptions:    map[string]NotifyChannelOptions{},
 		NotifyWebhooks:          map[string]NotifyWebhook{},
 		NotifyWebhookDeliveries: map[string][]NotifyWebhookDelivery{},
 		Tunnels:                 map[string]model.TunnelProfile{},
@@ -962,6 +966,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NotifyRuleOptions == nil {
 		st.NotifyRuleOptions = map[string]NotifyRuleOptions{}
+	}
+	if st.NotifyChannelOptions == nil {
+		st.NotifyChannelOptions = map[string]NotifyChannelOptions{}
 	}
 	if st.NotifyWebhooks == nil {
 		st.NotifyWebhooks = map[string]NotifyWebhook{}
@@ -5556,6 +5563,7 @@ func (s *Store) DeleteNotifyChannel(id string) error {
 			s.state.NotifyRuleOptions[ruleID] = opts
 		}
 	}
+	s.clearNotifyChannelOptionsLocked(id)
 	if err := s.Save(); err != nil {
 		return err
 	}

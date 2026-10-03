@@ -994,11 +994,18 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 // was approved with.
 const (
 	agentUpdateKeepalivePlanLine = "- keepalive: a binary that advertises sd-notify-v1 in -compat-json gets the unit drop-in 10-lattice-keepalive.conf (NotifyAccess=main and a runtime directory; the unit type is unchanged), so it can arm its own 120 s watchdog"
-	agentUpdateGuardPlanLine     = "- update guard: when the new binary also advertises health-marker-v1, a timer restores the previous binary and restarts the service if the new agent has not completed its first hello within 300 s"
+	agentUpdateGuardPlanLine     = "- update guard: when the new binary also advertises health-marker-v1, a timer restores the previous binary and restarts the service if the new agent has not completed its first hello within 300 s; the timer lives in /run, so a reboot before it fires cancels the guard and keeps the new binary"
 	// agentUpdateGuardDelay is how long the new agent has to complete its
 	// first hello. Hello follows durable recovery and IP discovery, seconds on
-	// any node; five minutes also covers a slow first resolver round.
+	// any node; five minutes also covers a slow first resolver round. A node
+	// whose startup recovery runs longer is restored, and its previous binary
+	// resumes the same crash-safe recovery.
 	agentUpdateGuardDelay = "300s"
+	// agentUpdateTimerAccuracy makes the guard and restart timers fire within
+	// a second of their delay instead of systemd's default one minute
+	// AccuracySec. systemd-run gained --timer-property in systemd 229; on an
+	// older systemd the script leaves it out and the default applies.
+	agentUpdateTimerAccuracy = "--timer-property=AccuracySec=1s"
 )
 
 // agentUpdateGuardScript is written to a root-only file under /run and run by
@@ -1028,12 +1035,27 @@ const agentUpdateGuardScript = `trap "rm -f $0" EXIT
 
 // agentUpdateCompatStep reads the candidate's -compat-json, whose features
 // decide the keepalive and guard steps. An older candidate prints no
-// features, and an empty answer turns both steps off.
+// features, and an empty answer turns both steps off. It also probes whether
+// systemd-run can set timer properties, which the guard and restart timers
+// use for one second accuracy.
 func agentUpdateCompatStep(plan string) string {
 	if !strings.Contains(plan, agentUpdateKeepalivePlanLine) {
 		return ""
 	}
-	return "CANDIDATE_COMPAT=$(\"$CANDIDATE\" -compat-json 2>/dev/null || true)\n"
+	return "CANDIDATE_COMPAT=$(\"$CANDIDATE\" -compat-json 2>/dev/null || true)\n" +
+		"TIMER_ACCURACY=\"\"\n" +
+		"if systemd-run --help 2>/dev/null | grep -q -- '--timer-property'; then TIMER_ACCURACY=" + shellQuote(agentUpdateTimerAccuracy) + "; fi\n"
+}
+
+// agentUpdateRestartStep schedules the restart that brings up the new binary.
+// An approval whose plan predates the keepalive line keeps the exact line it
+// was approved with; a newer one adds the timer accuracy the compat step
+// probed, so the guard's 300 s count and the restart start together.
+func agentUpdateRestartStep(plan string) string {
+	if !strings.Contains(plan, agentUpdateKeepalivePlanLine) {
+		return "systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n"
+	}
+	return "systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s $TIMER_ACCURACY /bin/systemctl restart \"$SERVICE\" >/dev/null\n"
 }
 
 // agentUpdateKeepaliveStep writes the keepalive drop-in when the candidate
@@ -1073,7 +1095,7 @@ func agentUpdateGuardStep(plan string) string {
 		"      GUARD_UNIT=\"lattice-agent-update-guard-$(date +%Y%m%d%H%M%S)-$$\"\n" +
 		"      GUARD_FILE=\"/run/$GUARD_UNIT.sh\"\n" +
 		"      printf '%s\\n' " + shellQuote(agentUpdateGuardScript) + " >\"$GUARD_FILE\"\n" +
-		"      if ! systemd-run --unit=\"$GUARD_UNIT\" --on-active=" + agentUpdateGuardDelay + " --description=\"Lattice agent update guard for $TARGET_VERSION\"" +
+		"      if ! systemd-run --unit=\"$GUARD_UNIT\" --on-active=" + agentUpdateGuardDelay + " $TIMER_ACCURACY --description=\"Lattice agent update guard for $TARGET_VERSION\"" +
 		" --setenv=LATTICE_GUARD_TARGET=\"$TARGET\" --setenv=LATTICE_GUARD_BACKUP=\"$BACKUP\" --setenv=LATTICE_GUARD_SERVICE=\"$SERVICE\"" +
 		" --setenv=LATTICE_GUARD_MARKER=\"/run/$UNIT_NAME/healthy\" --setenv=LATTICE_GUARD_VERSION=\"$TARGET_VERSION\" --setenv=LATTICE_GUARD_SHA=\"$EXPECT_SHA\"" +
 		" /bin/sh \"$GUARD_FILE\" >/dev/null; then\n" +
@@ -1558,7 +1580,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"systemctl daemon-reload\n" +
 		agentUpdateGuardStep(approval.Plan) +
 		"RESTART_UNIT=\"lattice-agent-delayed-restart-$(date +%Y%m%d%H%M%S)-$$\"\n" +
-		"systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n" +
+		agentUpdateRestartStep(approval.Plan) +
 		"echo \"lattice agent update: installed $TARGET_VERSION and scheduled $SERVICE restart via $RESTART_UNIT\"\n", nil
 }
 

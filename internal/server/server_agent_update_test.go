@@ -204,7 +204,7 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 		"systemctl --no-legend list-unit-files \"$SERVICE\"",
 		"grep -Fxq \"$SERVICE\"",
 		"RESTART_UNIT=\"lattice-agent-delayed-restart-$(date +%Y%m%d%H%M%S)-$$\"",
-		"systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\"",
+		"systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s $TIMER_ACCURACY /bin/systemctl restart \"$SERVICE\"",
 		"scheduled $SERVICE restart via $RESTART_UNIT",
 	} {
 		if !strings.Contains(script, want) {
@@ -1628,7 +1628,7 @@ func TestAgentUpdateApplyScriptDetachesTheRestartAfterInstall(t *testing.T) {
 		t.Fatal(err)
 	}
 	install := strings.Index(script, "mv \"$TARGET.new\" \"$TARGET\"")
-	schedule := strings.Index(script, "systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\"")
+	schedule := strings.Index(script, "systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s $TIMER_ACCURACY /bin/systemctl restart \"$SERVICE\"")
 	if install < 0 || schedule < 0 || schedule < install {
 		t.Fatalf("the restart must be scheduled through systemd-run after the binary is in place:\n%s", script)
 	}

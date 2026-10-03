@@ -352,11 +352,15 @@ Use the compose file and deployment guide in the umbrella repository:
   the new agent can arm its own watchdog. When it also lists
   `health-marker-v1` and a previous binary exists, the script arms an update
   guard before it schedules the restart: a transient systemd timer that, 300 s
-  later (systemd's default one minute timer accuracy applies), keeps the new
-  binary if `/run/<service>/healthy` holds the target version, leaves a binary
-  that changed since the update alone, and otherwise restores the backup and
-  restarts the service. A guard that cannot be armed restores the backup and
-  fails the task, leaving the running agent untouched.
+  later, keeps the new binary if `/run/<service>/healthy` holds the target
+  version, leaves a binary that changed since the update alone, and otherwise
+  restores the backup and restarts the service. A guard that cannot be armed
+  restores the backup and fails the task, leaving the running agent untouched.
+  The guard and the restart timers fire within a second
+  (`--timer-property=AccuracySec=1s`) where `systemd-run` supports it (systemd
+  229 and later); an older systemd keeps its default one minute accuracy. The
+  guard lives in `/run`, so a reboot before it fires cancels it and the node
+  keeps the new binary.
 - Node reconfigure commands source both the canonical
   `/opt/lattice/lattice-agent.env` and legacy `/opt/lattice/node-agent/agent.env`
   before rerunning the installer. Operators can therefore reconfigure or upgrade

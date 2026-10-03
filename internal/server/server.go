@@ -336,6 +336,12 @@ type Server struct {
 	// and a configuration save never plan against each other's half-written
 	// monitors; see latency_probes.go.
 	latencySync sync.Mutex
+	// latencySyncStop stops the latency probe sweep before Close returns, so
+	// no sync writes the store or the audit log after shutdown;
+	// latencySyncLoops counts the sweeps still running.
+	latencySyncStop     chan struct{}
+	latencySyncStopOnce sync.Once
+	latencySyncLoops    sync.WaitGroup
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight
@@ -655,6 +661,7 @@ func New(opts Options) (*Server, error) {
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
 		shareFetchStats:       newShareFetchStats(),
 		shareFlushStop:        make(chan struct{}),
+		latencySyncStop:       make(chan struct{}),
 		subscriptionDecoy:     opts.SubscriptionDecoy,
 		now:                   func() time.Time { return time.Now().UTC() },
 		tlsMonitorTargets:     defaultTLSMonitorTargets,
@@ -1468,12 +1475,19 @@ func (s *Server) Close(ctx context.Context) error {
 	// final flush below or after the store closes. Then the open hour's
 	// link fetch counts and any folded refusals are written, and a
 	// first-seen audit already handed to its goroutine lands too.
+	// The latency probe sweep stops with them: a sync already running
+	// finishes, and none starts after Close returns.
 	s.shareFlushStopOnce.Do(func() {
 		if s.shareFlushStop != nil {
 			close(s.shareFlushStop)
 		}
 	})
-	waitShareAudits := func(wg *sync.WaitGroup) {
+	s.latencySyncStopOnce.Do(func() {
+		if s.latencySyncStop != nil {
+			close(s.latencySyncStop)
+		}
+	})
+	waitWithin := func(wg *sync.WaitGroup) {
 		done := make(chan struct{})
 		go func() {
 			wg.Wait()
@@ -1484,10 +1498,11 @@ func (s *Server) Close(ctx context.Context) error {
 		case <-ctx.Done():
 		}
 	}
-	waitShareAudits(&s.shareFlushers)
+	waitWithin(&s.shareFlushers)
+	waitWithin(&s.latencySyncLoops)
 	s.flushShareFetchStats(s.now(), true)
 	s.flushShareRefusalAudit(s.now())
-	waitShareAudits(&s.shareFetchAudits)
+	waitWithin(&s.shareFetchAudits)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)

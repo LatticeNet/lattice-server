@@ -1,11 +1,13 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -480,5 +482,34 @@ func TestLatencyPlanRefusesTheSSHPortGuardRealityReports(t *testing.T) {
 	srv.singboxInvMu.Unlock()
 	if jp := latencyNodeOf(t, srv.planLatencyProbes(now).plan, "node-jp"); jp.Target != model.LatencyTargetNotProbeable || jp.EndpointNote != model.LatencyEndpointNoLine {
 		t.Fatalf("a target with only its sshd port = %+v", jp)
+	}
+}
+
+// Close stops the latency sweep: Close returns with the loop gone, and no
+// sync runs afterwards, so none writes the store or the audit log after
+// shutdown.
+func TestLatencyProbeSyncStopsOnClose(t *testing.T) {
+	srv, _, _ := newInventoryServer(t)
+	var syncs atomic.Int64
+	srv.runLatencyProbeSync(time.Millisecond, func() { syncs.Add(1) })
+	deadline := time.Now().Add(5 * time.Second)
+	for syncs.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the sweep never ran")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("Close waited out its deadline instead of stopping the sweep")
+	}
+	stopped := syncs.Load()
+	time.Sleep(50 * time.Millisecond)
+	if got := syncs.Load(); got != stopped {
+		t.Fatalf("the sweep ran %d more times after Close", got-stopped)
 	}
 }

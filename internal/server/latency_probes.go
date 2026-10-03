@@ -608,13 +608,33 @@ func latencyIDList(ids []string) string {
 // inventories since the control plane started; until then every target keeps
 // the endpoint its monitor already had.
 func (s *Server) startLatencyProbeSync() {
+	s.runLatencyProbeSync(latencyProbeSyncInterval, func() {
+		if _, _, err := s.syncLatencyProbes(s.now()); err != nil {
+			s.logger.Printf("latency probes: %v", err)
+		}
+	})
+}
+
+// runLatencyProbeSync calls sync on every tick until Close stops it. A tick
+// that lands after Close does not sync.
+func (s *Server) runLatencyProbeSync(every time.Duration, sync func()) {
+	s.latencySyncLoops.Add(1)
 	go func() {
-		ticker := time.NewTicker(latencyProbeSyncInterval)
+		defer s.latencySyncLoops.Done()
+		ticker := time.NewTicker(every)
 		defer ticker.Stop()
-		for range ticker.C {
-			if _, _, err := s.syncLatencyProbes(s.now()); err != nil {
-				s.logger.Printf("latency probes: %v", err)
+		for {
+			select {
+			case <-s.latencySyncStop:
+				return
+			case <-ticker.C:
 			}
+			select {
+			case <-s.latencySyncStop:
+				return
+			default:
+			}
+			sync()
 		}
 	}()
 }

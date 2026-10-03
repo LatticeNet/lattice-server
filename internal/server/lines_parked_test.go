@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -93,5 +94,22 @@ func TestALinesParkedUsersComeFromTheNodesReport(t *testing.T) {
 		if _, ok := view[key]; ok {
 			t.Fatalf("a line with nothing parked must not carry %s: %s", key, raw)
 		}
+	}
+}
+
+// A line with more parked users than a response should repeat names keeps
+// its full count and a bounded list of names.
+func TestDiscoveredParkedNamesAreBounded(t *testing.T) {
+	const parked = 5000
+	all := make([]string, parked)
+	for i := range all {
+		all[i] = fmt.Sprintf("u_%016x", i)
+	}
+	raw, _ := json.Marshal(all)
+	count, names, _ := discoveredParkedUsers(model.SingBoxNode{Metadata: map[string]string{
+		singBoxParkedUsersKey: fmt.Sprint(parked), singBoxParkedNamesKey: string(raw),
+	}})
+	if count != parked || len(names) != maxDiscoveredParkedNames || names[0] != all[0] {
+		t.Fatalf("got count %d and %d names starting %v, want %d and %d", count, len(names), names[:1], parked, maxDiscoveredParkedNames)
 	}
 }

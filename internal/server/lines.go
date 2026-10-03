@@ -203,12 +203,18 @@ const (
 // only kind of name a parked list may carry to the server.
 var parkedLineUserNameRe = regexp.MustCompile(`^u_[0-9a-f]{16}$`)
 
+// maxDiscoveredParkedNames bounds the parked names one line carries. Every
+// line response repeats them, and a name is only a handle for the console;
+// the count stays the truth when a line has more parked users than this.
+const maxDiscoveredParkedNames = 256
+
 // discoveredParkedUsers decodes a line's reported parked users. A count it
 // cannot read, or one past what a conf file could plausibly hold, yields
 // none. Names are kept only when the count is, only in Lattice's own shape,
-// and never more of them than the count, so a malformed or hostile report
-// can neither put a person's name on screen nor claim more parked users than
-// it counted.
+// and at most maxDiscoveredParkedNames of them. A report that names more
+// users than it counts is malformed and its names are dropped, so a
+// malformed or hostile report can neither put a person's name on screen nor
+// claim more parked users than it counted.
 func discoveredParkedUsers(node model.SingBoxNode) (count int, names []string, parkedErr string) {
 	if strings.TrimSpace(node.Metadata[singBoxParkedErrorKey]) == singBoxParkedInvalid {
 		parkedErr = singBoxParkedInvalid
@@ -218,12 +224,16 @@ func discoveredParkedUsers(node model.SingBoxNode) (count int, names []string, p
 		return 0, nil, parkedErr
 	}
 	var decoded []string
-	if raw := strings.TrimSpace(node.Metadata[singBoxParkedNamesKey]); raw != "" &&
-		json.Unmarshal([]byte(raw), &decoded) == nil && len(decoded) <= count {
-		for _, name := range decoded {
-			if parkedLineUserNameRe.MatchString(name) {
-				names = appendUniqueSorted(names, name)
-			}
+	if raw := strings.TrimSpace(node.Metadata[singBoxParkedNamesKey]); raw == "" ||
+		json.Unmarshal([]byte(raw), &decoded) != nil || len(decoded) > count {
+		return count, nil, parkedErr
+	}
+	for _, name := range decoded {
+		if len(names) == maxDiscoveredParkedNames {
+			break
+		}
+		if parkedLineUserNameRe.MatchString(name) {
+			names = appendUniqueSorted(names, name)
 		}
 	}
 	return count, names, parkedErr

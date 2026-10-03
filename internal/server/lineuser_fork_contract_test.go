@@ -620,7 +620,8 @@ func TestRemovingTheLastSocksUserReturnsTheApprovalWithTheForksReason(t *testing
 
 // lineUserScriptError takes the node script's refusal from the end of the
 // task's output and nothing else: a last JSON line that is not a refusal,
-// a code that is not one, and output with no JSON line give nothing, and a long message is cut.
+// a code that is not one, and output with no JSON line give nothing; a long message is cut, and
+// control characters from the node never reach the approval.
 func TestLineUserScriptErrorReadsOnlyTheScriptsRefusal(t *testing.T) {
 	long := strings.Repeat("x", 600)
 	for _, tc := range []struct {
@@ -635,6 +636,7 @@ func TestLineUserScriptErrorReadsOnlyTheScriptsRefusal(t *testing.T) {
 		{`{"error":"busy"}`, "", "", false},
 		{"sb: command not found", "", "", false},
 		{`{"ok":false,"error":"config_invalid","message":"` + long + `"}`, "config_invalid", strings.Repeat("x", 240) + "...", true},
+		{`{"ok":false,"error":"busy","message":"held \u001b[2J by\u0000 another\ncall"}`, "busy", "held [2J by another call", true},
 	} {
 		code, message, ok := lineUserScriptError(tc.stdout)
 		if code != tc.code || message != tc.message || ok != tc.ok {

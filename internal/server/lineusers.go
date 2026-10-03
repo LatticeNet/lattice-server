@@ -1382,7 +1382,8 @@ var lineUserScriptErrorCode = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 // {"ok":false,"error":"<code>","message":"<why>"}, from the end of the task's
 // stdout: the last line that holds a JSON object decides. ok is false when
 // that line is not such a refusal, or there is none. The message comes from
-// the node, so it is cut to a bound before it is kept on the approval.
+// the node, so control characters are dropped and it is cut to a bound
+// before it is kept on the approval.
 func lineUserScriptError(stdout string) (code, message string, ok bool) {
 	lines := strings.Split(strings.TrimSpace(stdout), "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
@@ -1398,7 +1399,7 @@ func lineUserScriptError(stdout string) (code, message string, ok bool) {
 		if json.Unmarshal([]byte(line), &out) != nil || out.OK == nil || *out.OK || !lineUserScriptErrorCode.MatchString(out.Error) {
 			return "", "", false
 		}
-		return out.Error, truncateMetadataValue(strings.Join(strings.Fields(out.Message), " "), 240), true
+		return out.Error, truncateMetadataValue(normalizeTaskResultText(out.Message), 240), true
 	}
 	return "", "", false
 }

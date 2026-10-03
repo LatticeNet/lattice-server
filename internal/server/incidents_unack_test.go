@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -221,32 +222,31 @@ func TestUnacknowledgeRefusesAClosedIncident(t *testing.T) {
 	}
 }
 
-// An open message that quiet hours held and then withdrew because the
-// incident was acknowledged goes out again through that rule when the
-// acknowledgement is undone, and through no other.
-func TestUnacknowledgeResendsAnOpenQuietHoursWithdrew(t *testing.T) {
-	h := newIncidentHarness(t, "a")
-	post, _, _ := incidentPoster(h)
+// dayNight routes agent.stalled through the real outbox by two rules: night
+// has quiet hours from an hour before the harness clock to an hour after it,
+// and day has none.
+type dayNight struct {
+	t     *testing.T
+	h     *incidentHarness
+	start time.Time
+	mu    sync.Mutex
+	sent  []string
+}
+
+func newDayNight(t *testing.T, nodeIDs ...string) *dayNight {
+	t.Helper()
+	h := newIncidentHarness(t, nodeIDs...)
+	d := &dayNight{t: t, h: h, start: h.now()}
 	h.f.srv.emitIncidentNotice = h.f.srv.notifyIncidentEvent
-	var mu sync.Mutex
-	var got []string
 	h.f.srv.notifySend = func(_ context.Context, c model.NotifyChannel, msg notify.Message) error {
-		mu.Lock()
-		got = append(got, c.ID+" "+msg.Title)
-		mu.Unlock()
+		d.mu.Lock()
+		d.sent = append(d.sent, c.ID+" "+msg.Title)
+		d.mu.Unlock()
 		return nil
-	}
-	take := func() []string {
-		mu.Lock()
-		defer mu.Unlock()
-		out := got
-		got = nil
-		return out
 	}
 	addNotifyChannel(t, h.f.st, "nc-night", "Bark night")
 	addNotifyChannel(t, h.f.st, "nc-day", "Bark day")
-	start := h.now()
-	quiet := &store.NotifyQuietHours{Start: start.Add(-time.Hour).Format("15:04"), End: start.Add(time.Hour).Format("15:04"), TimeZone: "UTC"}
+	quiet := &store.NotifyQuietHours{Start: d.start.Add(-time.Hour).Format("15:04"), End: d.start.Add(time.Hour).Format("15:04"), TimeZone: "UTC"}
 	if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-night", Name: "night", EventTypes: []string{EventAgentStalled}, ChannelIDs: []string{"nc-night"}, Enabled: true},
 		store.NotifyRuleOptions{QuietHours: quiet}); err != nil {
 		t.Fatal(err)
@@ -255,36 +255,158 @@ func TestUnacknowledgeResendsAnOpenQuietHoursWithdrew(t *testing.T) {
 		store.NotifyRuleOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	h.f.srv.openIncident(incidentSignal{kind: EventAgentStalled, nodeID: "a", subject: "name-a", since: h.now(),
-		msg: incidentMessage{title: "Agent loop stalled: name-a", detail: "d", line: "l"}}, h.now())
-	h.f.srv.evaluateIncidents(h.now())
-	waitOutboxIdle(t, h.f.srv)
-	if sent := take(); strings.Join(sent, "|") != "nc-day Agent loop stalled: name-a" {
-		t.Fatalf("inside quiet hours sent %q", sent)
-	}
-	id := h.incident(EventAgentStalled, "a").ID
-	post("/api/incidents/ack", id)
+	return d
+}
 
-	h.clock.at = start.Add(time.Hour + time.Minute)
-	h.f.srv.wakeNotifyOutbox()
-	waitOutboxIdle(t, h.f.srv)
-	if sent := take(); len(sent) != 0 {
-		t.Fatalf("an acknowledged incident's held open went out: %q", sent)
+// open opens a stalled agent on nodeID and sends its open message: day
+// delivers it, night holds it until quiet hours end.
+func (d *dayNight) open(nodeID string) string {
+	d.t.Helper()
+	d.h.f.srv.openIncident(incidentSignal{kind: EventAgentStalled, nodeID: nodeID, subject: "name-" + nodeID, since: d.h.now(),
+		msg: incidentMessage{title: "Agent loop stalled: name-" + nodeID, detail: "d", line: "l"}}, d.h.now())
+	d.sweep()
+	d.expect("inside quiet hours", "nc-day Agent loop stalled: name-"+nodeID)
+	return d.h.incident(EventAgentStalled, nodeID).ID
+}
+
+// sweep runs the incident pass and waits for what it sent.
+func (d *dayNight) sweep() {
+	d.t.Helper()
+	d.h.f.srv.evaluateIncidents(d.h.now())
+	waitOutboxIdle(d.t, d.h.f.srv)
+}
+
+// endQuietHours moves the clock a minute past the end of night's quiet hours
+// and waits for the outbox to settle what they held.
+func (d *dayNight) endQuietHours() {
+	d.t.Helper()
+	d.h.clock.advance(d.start.Add(time.Hour + time.Minute).Sub(d.h.now()))
+	d.h.f.srv.wakeNotifyOutbox()
+	waitOutboxIdle(d.t, d.h.f.srv)
+}
+
+// expect checks the sends since the last check, in channel order.
+func (d *dayNight) expect(when string, want ...string) {
+	d.t.Helper()
+	d.mu.Lock()
+	got := d.sent
+	d.sent = nil
+	d.mu.Unlock()
+	slices.Sort(got)
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		d.t.Fatalf("%s: sent %q, want %q", when, got, want)
 	}
-	if rows := deliveriesOf(h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, ChannelID: "nc-night"}); len(rows) != 1 || rows[0].Reason != notifyWithdrawnOpen {
+}
+
+// An open message that quiet hours held and then withdrew because the
+// incident was acknowledged is owed again to that rule when the
+// acknowledgement is undone, and to no other: the next sweep sends it through
+// night alone, once.
+func TestUnacknowledgeResendsAnOpenQuietHoursWithdrew(t *testing.T) {
+	d := newDayNight(t, "a")
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("an acknowledged incident's held open")
+	if rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, ChannelID: "nc-night"}); len(rows) != 1 || rows[0].Reason != notifyWithdrawnOpen {
 		t.Fatalf("withdrawn rows = %+v", rows)
 	}
 
 	if code, _ := post("/api/incidents/unack", id); code != http.StatusOK {
 		t.Fatalf("unack: %d", code)
 	}
-	waitOutboxIdle(t, h.f.srv)
-	if sent := take(); strings.Join(sent, "|") != "nc-night Agent loop stalled: name-a" {
-		t.Fatalf("after the undo sent %q", sent)
+	if inc := d.h.incident(EventAgentStalled, "a"); inc.OwedOpen || strings.Join(inc.OwedOpenRules, ",") != "nr-night" {
+		t.Fatalf("owed after the undo: %+v", inc)
 	}
-	h.f.srv.evaluateIncidents(h.now())
-	waitOutboxIdle(t, h.f.srv)
-	if sent := take(); len(sent) != 0 {
-		t.Fatalf("the sweep sent it again: %q", sent)
+	d.sweep()
+	d.expect("after the undo", "nc-night Agent loop stalled: name-a")
+	d.sweep()
+	d.expect("the next sweep")
+}
+
+// An undo that lands while something holds the incident (here a maintenance
+// window that started after quiet hours withdrew night's copy) owes the open
+// to night alone: nothing goes out during the hold, night gets it once when
+// the hold ends, and day, which delivered it, is not told twice.
+func TestUnacknowledgeInsideAHoldOwesOnlyTheWithdrawnRule(t *testing.T) {
+	d := newDayNight(t, "a")
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("withdrawn")
+	if err := d.h.f.st.PutMaintenanceWindow(store.MaintenanceWindow{
+		ID: "mw-1", Name: "kernel upgrade", NodeIDs: []string{"a"},
+		StartsAt: d.h.now(), EndsAt: d.h.now().Add(30 * time.Minute), CreatedAt: d.h.now(),
+	}, d.h.now()); err != nil {
+		t.Fatal(err)
 	}
+
+	if code, _ := post("/api/incidents/unack", id); code != http.StatusOK {
+		t.Fatalf("unack: %d", code)
+	}
+	d.sweep()
+	d.expect("inside the window")
+	d.h.clock.advance(31 * time.Minute)
+	d.sweep()
+	d.expect("after the window", "nc-night Agent loop stalled: name-a")
+	d.sweep()
+	d.expect("the next sweep")
+}
+
+// Acknowledging and undoing again re-sends the withdrawn open once in all:
+// an undo still owed when the incident is acknowledged again is owed by the
+// next undo, and an undo after the re-send owes nothing more.
+func TestUnacknowledgeCyclesResendTheWithdrawnOpenOnce(t *testing.T) {
+	d := newDayNight(t, "a")
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("withdrawn")
+
+	post("/api/incidents/unack", id)
+	d.h.clock.advance(time.Minute)
+	post("/api/incidents/ack", id)
+	d.sweep()
+	d.expect("acknowledged again before the sweep")
+	post("/api/incidents/unack", id)
+	d.sweep()
+	d.expect("after the second undo", "nc-night Agent loop stalled: name-a")
+
+	d.h.clock.advance(time.Minute)
+	post("/api/incidents/ack", id)
+	post("/api/incidents/unack", id)
+	d.sweep()
+	d.expect("after the third undo")
+}
+
+// Only a withdrawal the acknowledgement caused is undone with it. Night's
+// copy withdrawn while the incident was snoozed, before anyone acknowledged
+// it, was answered by the snooze reminder; undoing a later acknowledgement
+// does not send it again.
+func TestUnacknowledgeLeavesAWithdrawalFromBeforeTheAcknowledgement(t *testing.T) {
+	d := newDayNight(t, "a")
+	post, cookies, csrf := incidentPoster(d.h)
+	id := d.open("a")
+	res := doJSON(t, d.h.f.handler, http.MethodPost, "/api/incidents/snooze", fmt.Sprintf(`{"id":%q,"minutes":90}`, id), cookies, csrf)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("snooze: %d", res.StatusCode)
+	}
+	d.endQuietHours()
+	d.expect("withdrawn while snoozed")
+	if rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, ChannelID: "nc-night"}); len(rows) != 1 || rows[0].Reason != notifyWithdrawnOpen {
+		t.Fatalf("withdrawn rows = %+v", rows)
+	}
+	d.h.clock.advance(30 * time.Minute)
+	d.sweep()
+	d.expect("the snooze reminder", "nc-day Agent loop stalled: name-a", "nc-night Agent loop stalled: name-a")
+
+	d.h.clock.advance(time.Minute)
+	post("/api/incidents/ack", id)
+	post("/api/incidents/unack", id)
+	d.sweep()
+	d.expect("after the undo")
 }

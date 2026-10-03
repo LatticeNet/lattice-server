@@ -387,8 +387,9 @@ func (s *Server) handleIncidentAck(w http.ResponseWriter, r *http.Request, p pri
 // happened: the escalation clock still runs from the open message, an open
 // message it cancelled is owed again (one a window or a snooze held, or a
 // snooze reminder that fell due meanwhile), and an open message that quiet
-// hours held and then withdrew because of it goes out again through the
-// rules that withdrew it. A closed incident is refused; one that is not
+// hours held and then withdrew because of it is owed again to the rules that
+// withdrew it and to no other. The sweep sends what is owed once nothing
+// holds the incident. A closed incident is refused; one that is not
 // acknowledged is left as it is, like acknowledging twice.
 func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
@@ -422,23 +423,24 @@ func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p p
 		// flag, and the incident would otherwise stay open, unsent and, since
 		// escalation runs from the open message, never escalated.
 		inc.OwedOpen = inc.OwedOpen || inc.AckCancelledOpen || inc.Notified != store.IncidentNotifiedOpen
+		if inc.OwedOpen {
+			// Through every rule, which covers any rule owed it alone.
+			inc.OwedOpenRules = nil
+		} else {
+			// Only the rules that lost their copy to the acknowledgement are
+			// owed it, with any an earlier undo left owed. The sweep sends it
+			// through them alone once nothing holds the incident, so a rule
+			// that delivered it is never told twice.
+			for _, ruleID := range s.rulesThatWithdrewOpen(inc, ackedAt) {
+				if !slices.Contains(inc.OwedOpenRules, ruleID) {
+					inc.OwedOpenRules = append(inc.OwedOpenRules, ruleID)
+				}
+			}
+			slices.Sort(inc.OwedOpenRules)
+		}
 		inc.AckCancelledOpen = false
 		inc.AckedBy, inc.AckedAt = "", time.Time{}
 		inc.UpdatedAt = now
-		if !inc.OwedOpen {
-			if rules := s.rulesThatWithdrewOpen(inc, ackedAt); len(rules) > 0 {
-				if incidentOpenHold(inc, now, cover) != "" {
-					// Held again now: the sweep sends it when the hold ends.
-					inc.OwedOpen = true
-				} else {
-					// Into the outbox first, then the record, as the sweep does.
-					for i := range rules {
-						s.commitNotifyPlan(s.planNotifyEvent(inc.Kind, inc.Title+flappingSuffix(inc), inc.Detail,
-							notifyEnqueue{source: store.NotifySourceServer, onlyRule: &rules[i], incidentIDs: []string{inc.ID}}))
-					}
-				}
-			}
-		}
 		if err := s.store.PutIncidents(inc); err != nil {
 			s.logger.Printf("incidents: record unack %s: %v", inc.ID, err)
 		}
@@ -452,23 +454,20 @@ func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p p
 	writeJSON(w, http.StatusOK, s.toIncidentView(inc, now, cover, s.nodeNames()))
 }
 
-// rulesThatWithdrewOpen lists the enabled rules whose quiet-hours copy of
+// rulesThatWithdrewOpen lists the ids of the rules whose quiet-hours copy of
 // inc's open message was withdrawn at or after ackedAt, which is what an
-// acknowledgement does to a held open message when quiet hours end.
-func (s *Server) rulesThatWithdrewOpen(inc store.Incident, ackedAt time.Time) []model.NotifyRule {
+// acknowledgement does to a held open message when quiet hours end. A copy
+// withdrawn before the acknowledgement was withdrawn for another reason (a
+// snooze, say), which undoing the acknowledgement does not undo.
+func (s *Server) rulesThatWithdrewOpen(inc store.Incident, ackedAt time.Time) []string {
 	if ackedAt.IsZero() {
 		return nil
 	}
-	withdrew := map[string]bool{}
+	var out []string
 	for _, row := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, EventType: inc.Kind}) {
-		if row.Reason == notifyWithdrawnOpen && row.RuleID != "" && !row.SettledAt.Before(ackedAt) && slices.Contains(row.IncidentIDs, inc.ID) {
-			withdrew[row.RuleID] = true
-		}
-	}
-	var out []model.NotifyRule
-	for _, rule := range s.store.EnabledNotifyRules() {
-		if withdrew[rule.ID] {
-			out = append(out, rule)
+		if row.Reason == notifyWithdrawnOpen && row.RuleID != "" && !row.SettledAt.Before(ackedAt) &&
+			slices.Contains(row.IncidentIDs, inc.ID) && !slices.Contains(out, row.RuleID) {
+			out = append(out, row.RuleID)
 		}
 	}
 	return out

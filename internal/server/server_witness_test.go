@@ -261,11 +261,20 @@ func TestWitnessApprovalCarriesTheReviewedKeyOnly(t *testing.T) {
 	}
 }
 
-// A node that stopped advertising witness mode does not get the task.
+// A node that stopped advertising witness mode does not get the task, and
+// an approval without its task is refused rather than stranded.
 func TestWitnessApprovalNeedsTheCapabilityAtDecision(t *testing.T) {
 	f := newWitnessFixture(t, witnessTestPublic)
 	f.capable(t)
 	_, a := f.plan(t, witnessPlanBody)
+	res := doJSON(t, f.handler, http.MethodPost, "/api/network/approvals/approve",
+		`{"approval_id":"`+a.ID+`","queue_apply":false,"plan_sha256":"`+planSHA256(a.Plan)+`"}`, f.cookies, f.csrf)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("approve without queue_apply: %d", res.StatusCode)
+	}
+	if stored, _ := f.st.Approval(a.ID); stored.Status != model.ApprovalPending {
+		t.Fatalf("an unqueued approve moved the approval: %+v", stored)
+	}
 	f.beat(t, `{"node_id":"node-w","version":"0.3.9","metrics":{}}`)
 	if res := f.approve(t, a); res.StatusCode != http.StatusConflict {
 		t.Fatalf("approve without the capability: %d", res.StatusCode)

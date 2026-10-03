@@ -8033,13 +8033,21 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		}
 	}
 	if isWitnessApproval(approval) {
+		// The configure script carries a key read when the approval is
+		// decided, and nothing renders one later: approved without its task,
+		// a witness approval could never be applied, and approve is a no-op
+		// once it is no longer pending.
+		if !queueApply {
+			return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest,
+				witnessPlugin+" approvals must queue their apply task: approve with queue_apply, since an approval approved without one can never be applied")}
+		}
 		if err := s.requireCurrentWitnessApproval(approval); err != nil {
 			if rejectErr := s.rejectApprovalWithReason(approval, err.Error()); rejectErr != nil {
 				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: rejectErr}
 			}
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
-		if queueApply && approval.Action == witnessConfigureAction && !s.agentHasCapability(approval.NodeID, witnessCapability) {
+		if approval.Action == witnessConfigureAction && !s.agentHasCapability(approval.NodeID, witnessCapability) {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest,
 				"node agent has not advertised "+witnessCapability+"; update or reconnect the agent before applying")}
 		}

@@ -51,6 +51,10 @@ import (
 // targets one node (model.Approval.Targets), so the batch is one approval
 // per pair, each naming the batch in its hashed plan and its summary; a
 // single approval spanning nodes would be a change to the approval model.
+// The operator approves N approvals for N pairs. A pair whose approval is
+// rejected or goes stale stays listed under its batch as unapplied, because
+// its rotated credential no longer matches the export and would otherwise
+// drop out of the preview while the old one still works on the node.
 //
 // What it cannot rotate: the owner entry of each adopted line (the line's
 // first user, written by the node script before Lattice) is in its
@@ -139,7 +143,39 @@ type cutoverBatchView struct {
 	Counts    map[string]int `json:"counts"`
 	Pending   []string       `json:"pending"`
 	Approvals int            `json:"approvals"`
+	// Unapplied lists the batch's pairs whose node still holds the old
+	// credential: the credential was rotated in Lattice when the batch was
+	// filed, so the old one stops matching the export and the pair leaves
+	// the rotations above, but it keeps working on the node until a plan
+	// for the pair applies. Without this list a rejected or stale approval
+	// would make the pair disappear from every view.
+	Unapplied []cutoverUnappliedPair `json:"unapplied"`
 }
+
+// cutoverUnappliedPair is one pair of a batch whose plan has not applied
+// and whose node does not hold the identity's current credential.
+type cutoverUnappliedPair struct {
+	ApprovalID string `json:"approval_id"`
+	IdentityID string `json:"identity_id"`
+	LineHashID string `json:"line_hash_id"`
+	NodeID     string `json:"node_id,omitempty"`
+	// Status is the approval's: pending (never decided, or returned there
+	// by a failed task), approved (running) or rejected. Stale says the
+	// approval cannot apply: it was marked stale, or the identity's
+	// credential changed after it was filed.
+	Status string `json:"status"`
+	Stale  bool   `json:"stale,omitempty"`
+	// Fix is approve while the approval can still apply, wait while its
+	// task runs, and plan_update when it cannot apply: file a new
+	// plan_update for the pair (the identity's line plan) and approve it.
+	Fix string `json:"fix"`
+}
+
+const (
+	cutoverFixApprove    = "approve"
+	cutoverFixWait       = "wait"
+	cutoverFixPlanUpdate = "plan_update"
+)
 
 // cutoverView is the preview. Digest covers exactly what rotate would do.
 type cutoverView struct {
@@ -308,9 +344,23 @@ func (s *Server) vpnCutoverPlan() cutoverView {
 		return view.OwnerEntries[i].LineName < view.OwnerEntries[j].LineName
 	})
 	view.AutoSync = s.cutoverAutoSyncState()
-	view.Batches = s.cutoverBatches()
+	view.Batches = s.cutoverBatches(index)
 	view.Digest = cutoverDigest(view.Rotations)
 	view.Remaining = []string{}
+	unapplied := map[string]int{}
+	for _, b := range view.Batches {
+		for _, pair := range b.Unapplied {
+			unapplied[pair.Fix]++
+		}
+	}
+	if n := unapplied[cutoverFixApprove] + unapplied[cutoverFixWait]; n > 0 {
+		view.Remaining = append(view.Remaining, strconv.Itoa(n)+
+			" rotated (identity, line) pairs from a cutover batch are waiting for their approval or its task; the old credential works on those nodes until each applies")
+	}
+	if n := unapplied[cutoverFixPlanUpdate]; n > 0 {
+		view.Remaining = append(view.Remaining, strconv.Itoa(n)+
+			" rotated (identity, line) pairs from a cutover batch were rejected or went stale; the old credential still works on those nodes, so file a new plan_update for each and approve it")
+	}
 	if len(view.OwnerEntries) > 0 {
 		view.Remaining = append(view.Remaining, strconv.Itoa(len(view.OwnerEntries))+
 			" adopted lines carry their owner's credential in the export; that entry is not a Lattice identity and needs a line-level credential change on the node, which Lattice cannot plan yet")
@@ -352,8 +402,9 @@ func cutoverDigest(rotations []cutoverRotation) string {
 }
 
 // cutoverBatches lists the approvals each rotate run filed, newest batch
-// first, so the console can show and approve a batch after a reload.
-func (s *Server) cutoverBatches() []cutoverBatchView {
+// first, so the console can show and approve a batch after a reload, and
+// the pairs of each batch that have not reached their node.
+func (s *Server) cutoverBatches(index map[string]Line) []cutoverBatchView {
 	byBatch := map[string]*cutoverBatchView{}
 	for _, a := range s.store.Approvals() {
 		if a.Plugin != singBoxLineUserPlugin || !strings.Contains(a.Plan, `"batch":"`+cutoverBatchPrefix+`_`) {
@@ -365,7 +416,7 @@ func (s *Server) cutoverBatches() []cutoverBatchView {
 		}
 		b, ok := byBatch[plan.Batch]
 		if !ok {
-			b = &cutoverBatchView{Batch: plan.Batch, FiledAt: a.CreatedAt.UTC(), Counts: map[string]int{}, Pending: []string{}}
+			b = &cutoverBatchView{Batch: plan.Batch, FiledAt: a.CreatedAt.UTC(), Counts: map[string]int{}, Pending: []string{}, Unapplied: []cutoverUnappliedPair{}}
 			byBatch[plan.Batch] = b
 		}
 		if a.CreatedAt.Before(b.FiledAt) {
@@ -376,14 +427,64 @@ func (s *Server) cutoverBatches() []cutoverBatchView {
 		if a.Status == model.ApprovalPending {
 			b.Pending = append(b.Pending, a.ID)
 		}
+		if pair, open := s.cutoverPairUnapplied(a, plan, index); open {
+			b.Unapplied = append(b.Unapplied, pair)
+		}
 	}
 	out := make([]cutoverBatchView, 0, len(byBatch))
 	for _, b := range byBatch {
 		sort.Strings(b.Pending)
+		sort.Slice(b.Unapplied, func(i, j int) bool { return b.Unapplied[i].ApprovalID < b.Unapplied[j].ApprovalID })
 		out = append(out, *b)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].FiledAt.After(out[j].FiledAt) })
 	return out
+}
+
+// cutoverPairUnapplied reports a batch approval whose pair has not reached
+// its node. An applied approval did its job, and a pair whose identity is
+// gone, whose binding is gone or off, or whose node already holds the
+// current credential (another plan applied it) has nothing left to do.
+func (s *Server) cutoverPairUnapplied(a model.Approval, plan lineUserPlan, index map[string]Line) (cutoverUnappliedPair, bool) {
+	if a.Status == model.ApprovalApplied {
+		return cutoverUnappliedPair{}, false
+	}
+	u, ok := s.getVpnUser(plan.UserID)
+	if !ok {
+		return cutoverUnappliedPair{}, false
+	}
+	var binding *LineBinding
+	for i := range u.Bindings {
+		if u.Bindings[i].LineHashID == plan.LineHashID && u.Bindings[i].Enabled {
+			binding = &u.Bindings[i]
+			break
+		}
+	}
+	if binding == nil {
+		return cutoverUnappliedPair{}, false
+	}
+	ln, known := index[plan.LineHashID]
+	if lineBindingCredentialState(u, *binding, ln, known) == lineCredentialCurrent {
+		return cutoverUnappliedPair{}, false
+	}
+	pair := cutoverUnappliedPair{ApprovalID: a.ID, IdentityID: plan.UserID, LineHashID: plan.LineHashID, NodeID: plan.NodeID, Status: a.Status, Stale: a.Stale}
+	// Approving re-derives the credential and refuses a plan whose hash no
+	// longer matches it ("credential changed since approval; re-plan"), so
+	// a plan overtaken by a later rotation cannot apply either.
+	if payload, err := lineUserCredential(u, plan.Protocol, plan.UserName); err != nil {
+		pair.Stale = true
+	} else if sha, err := lineUserCredentialSHA(payload); err != nil || sha != plan.CredentialSHA256 {
+		pair.Stale = true
+	}
+	switch {
+	case pair.Stale || a.Status == model.ApprovalRejected:
+		pair.Fix = cutoverFixPlanUpdate
+	case a.Status == model.ApprovalApproved:
+		pair.Fix = cutoverFixWait
+	default:
+		pair.Fix = cutoverFixApprove
+	}
+	return pair, true
 }
 
 func (s *Server) cutoverAutoSyncState() cutoverAutoSyncView {

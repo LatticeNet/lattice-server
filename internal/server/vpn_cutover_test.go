@@ -226,6 +226,80 @@ func TestCutoverRotateRunsOnceForOneDigest(t *testing.T) {
 	}
 }
 
+// A batch pair whose approval is rejected stays listed with the fix it
+// needs, because its rotated credential no longer matches the export and
+// would otherwise vanish from the preview while the old one still works on
+// the node. It leaves the list once the node holds the current credential.
+func TestCutoverBatchKeepsUnappliedPairsVisible(t *testing.T) {
+	f := newCutoverFixture(t)
+	view, _ := cutoverPreview(t, f.srv)
+	planner := cutoverPrincipal("vpncore:admin", "network:plan", "proxy:admin")
+	result, _, err := f.srv.runVpnCutoverRotate(planner, view.Digest)
+	if err != nil || len(result.Approvals) != 1 {
+		t.Fatalf("rotate: %+v %v", result, err)
+	}
+	approvalID := result.Approvals[0]
+	unapplied := func() ([]cutoverUnappliedPair, []string) {
+		t.Helper()
+		v, raw := cutoverPreview(t, f.srv)
+		if strings.Contains(raw, idlOwnerUUID) {
+			t.Fatal("the preview carries a credential")
+		}
+		if len(v.Batches) != 1 {
+			t.Fatalf("batches: %+v", v.Batches)
+		}
+		return v.Batches[0].Unapplied, v.Remaining
+	}
+
+	pairs, remaining := unapplied()
+	if len(pairs) != 1 || pairs[0].ApprovalID != approvalID || pairs[0].IdentityID != "vpnuser_carol" || pairs[0].LineHashID != f.vless.LineHashID ||
+		pairs[0].Fix != cutoverFixApprove || pairs[0].Stale {
+		t.Fatalf("a filed pair waits for its approval: %+v", pairs)
+	}
+	if !strings.Contains(strings.Join(remaining, "\n"), "waiting for their approval") {
+		t.Fatalf("remaining must say a pair waits: %q", remaining)
+	}
+
+	if _, _, err := f.srv.store.MutateApproval(approvalID, func(a *model.Approval) bool {
+		a.Status = model.ApprovalRejected
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pairs, remaining = unapplied()
+	if len(pairs) != 1 || pairs[0].Status != model.ApprovalRejected || pairs[0].Fix != cutoverFixPlanUpdate {
+		t.Fatalf("a rejected pair needs a new plan_update: %+v", pairs)
+	}
+	if !strings.Contains(strings.Join(remaining, "\n"), "file a new plan_update") {
+		t.Fatalf("remaining must name the rejected pair: %q", remaining)
+	}
+
+	// A pending plan overtaken by another rotation cannot apply either.
+	if _, _, err := f.srv.store.MutateApproval(approvalID, func(a *model.Approval) bool {
+		a.Status = model.ApprovalPending
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request, _ := json.Marshal(map[string]string{"user_id": "vpnuser_carol", "protocol": "vless"})
+	if _, err := f.srv.vpnUserRotateCredential(planner, request); err != nil {
+		t.Fatal(err)
+	}
+	if pairs, _ = unapplied(); len(pairs) != 1 || !pairs[0].Stale || pairs[0].Fix != cutoverFixPlanUpdate {
+		t.Fatalf("an overtaken plan needs a new plan_update: %+v", pairs)
+	}
+
+	// Once the node holds the current credential, nothing is left to do.
+	carol, _ := f.srv.getVpnUser("vpnuser_carol")
+	carol.Bindings = []LineBinding{f.applied(t, carol, f.vless)}
+	if err := f.srv.putVpnUser(carol); err != nil {
+		t.Fatal(err)
+	}
+	if pairs, remaining = unapplied(); len(pairs) != 0 || strings.Contains(strings.Join(remaining, "\n"), "cutover batch") {
+		t.Fatalf("an applied pair leaves the list: %+v %q", pairs, remaining)
+	}
+}
+
 func TestRetiringTheSubStoreAutoSyncStopsIt(t *testing.T) {
 	srv := newSubStoreSyncTestServer(t)
 	srv.pluginRuntime = plugin.NewRuntimeManagerWithOptions(plugin.RuntimeManagerOptions{})

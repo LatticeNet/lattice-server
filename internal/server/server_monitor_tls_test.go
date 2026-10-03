@@ -96,6 +96,7 @@ func newTLSMonitorServer(t *testing.T, addr *string, now *time.Time) (*Server, h
 	rec := &notifyRecorder{}
 	srv.emitNotify = rec.record
 	srv.emitNotifyTyped = func(eventType, title, body string) { rec.record("["+eventType+"] "+title, body) }
+	srv.emitIncidentNotice = func(eventType, title, body string, _ []string) { rec.record("["+eventType+"] "+title, body) }
 	return srv, handler, rec
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -250,6 +251,8 @@ type notifyEnqueue struct {
 	// deliveries; set only by an escalation, which also makes them critical
 	// for quiet hours.
 	barkLevel string
+	// incidentIDs names the incidents an incident message reports.
+	incidentIDs []string
 }
 
 // notifyPlan is an event resolved to its deliveries but not yet stored.
@@ -350,6 +353,9 @@ func (s *Server) commitNotifyPlan(plan notifyPlan) {
 		}
 		if t.channel.Kind == "bark" {
 			rows[i].BarkLevel = how.barkLevel
+		}
+		if len(how.incidentIDs) > 0 {
+			rows[i].IncidentIDs = slices.Clone(how.incidentIDs)
 		}
 		if !t.heldUntil.IsZero() {
 			rows[i].HeldUntil = t.heldUntil
@@ -471,11 +477,25 @@ func (s *Server) runNotifyOutbox(wake <-chan struct{}, stop <-chan struct{}, don
 
 // drainNotifyOutbox starts every due delivery that is not already in flight
 // and returns when the next scheduled one falls due, or zero.
+//
+// Deliveries quiet hours held go one at a time per rule and channel, in the
+// order they were planned (the rows come oldest first): when the window ends,
+// an open and its recovery fall due at the same instant, and sent side by
+// side the recovery can arrive first. The withdrawal check also needs the
+// open settled before it judges the recovery (heldIncidentWithdrawal).
 func (s *Server) drainNotifyOutbox() time.Time {
 	r := &s.outbox
 	now := s.now()
 	var next time.Time
+	heldTurn := map[string]bool{}
 	for _, row := range s.store.UnsettledNotifyDeliveries() {
+		if !row.HeldUntil.IsZero() {
+			key := row.RuleID + "\x00" + row.ChannelID
+			if heldTurn[key] {
+				continue
+			}
+			heldTurn[key] = true
+		}
 		r.mu.Lock()
 		if r.inflight == nil || r.inflight[row.ID] {
 			r.mu.Unlock()
@@ -544,6 +564,16 @@ func (s *Server) drainNotifyOutboxForShutdown() {
 func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	row, ok := s.store.NotifyDelivery(deliveryID)
 	if !ok || row.Settled() {
+		return
+	}
+	if reason := s.heldIncidentWithdrawal(row); reason != "" {
+		row.Outcome = store.NotifyOutcomeSuppressed
+		row.Reason = reason
+		row.SettledAt = s.now()
+		row.NextAttemptAt = time.Time{}
+		if err := s.store.PutNotifyDelivery(row, nil); err != nil {
+			s.logger.Printf("notify: settle withdrawn %s: %v", row.ID, err)
+		}
 		return
 	}
 	channel, found := s.notifyChannelByID(row.ChannelID)
@@ -617,6 +647,55 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	if !row.Settled() {
 		s.wakeNotifyOutbox()
 	}
+}
+
+// The reasons a held incident message is withdrawn with; the console matches
+// them (lattice-dashboard notifySentModel.ts).
+const (
+	notifyWithdrawnOpen     = "withdrawn when quiet hours ended: the incident was resolved, acknowledged or snoozed meanwhile"
+	notifyWithdrawnRecovery = "withdrawn when quiet hours ended: the open message it answers was withdrawn too"
+)
+
+// heldIncidentWithdrawal says why an incident message quiet hours held must
+// not go out now the window is over, or "" to send it. An open is withdrawn
+// when none of the incidents it reports is still open, unacknowledged and
+// unsnoozed. A recovery is withdrawn when, for every incident it reports, the
+// latest open message on the same rule and channel was withdrawn: the phone
+// never heard "down", so it is not told "up". The drainer settles a rule and
+// channel's held rows in order, so that open has settled by now.
+func (s *Server) heldIncidentWithdrawal(row store.NotifyDelivery) string {
+	if row.HeldUntil.IsZero() || len(row.Attempts) > 0 || len(row.IncidentIDs) == 0 {
+		return ""
+	}
+	if _, ok := incidentKinds[row.EventType]; ok {
+		now := s.now()
+		for _, incidentID := range row.IncidentIDs {
+			inc, ok := s.store.Incident(incidentID)
+			if ok && inc.State == store.IncidentStateOpen && !inc.SnoozedUntil.After(now) {
+				return ""
+			}
+		}
+		return notifyWithdrawnOpen
+	}
+	open, ok := incidentRecoveryOf[row.EventType]
+	if !ok {
+		return ""
+	}
+	opens := s.store.NotifyDeliveries(store.NotifyDeliveryFilter{ChannelID: row.ChannelID, EventType: open})
+	for _, incidentID := range row.IncidentIDs {
+		withdrawn := false
+		for _, o := range opens { // newest first
+			if o.RuleID != row.RuleID || o.ID == row.ID || o.CreatedAt.After(row.CreatedAt) || !slices.Contains(o.IncidentIDs, incidentID) {
+				continue
+			}
+			withdrawn = o.Outcome == store.NotifyOutcomeSuppressed
+			break
+		}
+		if !withdrawn {
+			return ""
+		}
+	}
+	return notifyWithdrawnRecovery
 }
 
 // withBarkLevel is c with its interruption level replaced, on a copy of the

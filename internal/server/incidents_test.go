@@ -804,3 +804,117 @@ func TestNotifyRuleEscalationAndQuietHoursOptions(t *testing.T) {
 		}
 	}
 }
+
+// Quiet hours and incident messages. A critical incident's recovery breaks
+// through quiet hours as its open did. A warning's open and recovery are
+// held, and when the window ends they go out one at a time in the order they
+// were planned, except that an open whose incident was resolved or
+// acknowledged meanwhile is withdrawn, and so is the recovery that answers
+// it: the phone never heard "down", so it is not told "up".
+func TestQuietHoursReleaseIncidentMessagesInOrderAndWithdrawTheSettled(t *testing.T) {
+	h := newIncidentHarness(t, "a", "b", "c", "d")
+	h.f.srv.emitIncidentNotice = h.f.srv.notifyIncidentEvent
+	var mu sync.Mutex
+	var order []string
+	// An offline message takes a moment to send, so a recovery started beside
+	// it would arrive first.
+	h.f.srv.notifySend = func(_ context.Context, _ model.NotifyChannel, msg notify.Message) error {
+		if strings.Contains(msg.Title, "offline") {
+			time.Sleep(30 * time.Millisecond)
+		}
+		mu.Lock()
+		order = append(order, msg.Title)
+		mu.Unlock()
+		return nil
+	}
+	sent := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), order...)
+	}
+	waitSent := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for len(sent()) < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("sent %q, want %d messages", sent(), n)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	addNotifyChannel(t, h.f.st, "nc-a", "Bark")
+	start := h.now()
+	quiet := &store.NotifyQuietHours{Start: start.Add(-time.Hour).Format("15:04"), End: start.Add(2 * time.Hour).Format("15:04"), TimeZone: "UTC"}
+	if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-1", Name: "all", ChannelIDs: []string{"nc-a"}, Enabled: true},
+		store.NotifyRuleOptions{QuietHours: quiet, EscalationOff: true}); err != nil {
+		t.Fatal(err)
+	}
+	offline := func(nodeID string) {
+		h.f.srv.openIncident(incidentSignal{kind: EventNodeOffline, nodeID: nodeID, subject: "name-" + nodeID, since: h.now(),
+			msg: incidentMessage{title: "Lattice node offline: name-" + nodeID, detail: "d", line: "l"}}, h.now())
+	}
+	online := func(nodeID string) {
+		h.f.srv.resolveIncident(incidentKey(EventNodeOffline, nodeID, ""), h.now(),
+			incidentMessage{title: "Lattice node online: name-" + nodeID, detail: "d", line: "l"})
+	}
+	step := func(do func()) {
+		do()
+		h.f.srv.evaluateIncidents(h.now())
+		h.clock.advance(time.Minute)
+	}
+
+	step(func() { h.openService("a") })
+	waitSent(1)
+	step(func() { h.resolveService("a") })
+	waitSent(2)
+	if got := sent(); strings.Join(got, "|") != "sing-box down on name-a|sing-box recovered on name-a" {
+		t.Fatalf("a critical incident inside quiet hours sent %q", got)
+	}
+
+	step(func() { offline("a") })
+	step(func() { offline("b") })
+	step(func() { offline("c") })
+	step(func() { offline("d") })
+	step(func() { online("a") })
+	step(func() { online("c") })
+	step(func() { offline("c") }) // reopens c's record
+	cookies, csrf := loginSession(t, h.f.handler)
+	res := doJSON(t, h.f.handler, http.MethodPost, "/api/incidents/ack", fmt.Sprintf(`{"id":%q}`, h.incident(EventNodeOffline, "d").ID), cookies, csrf)
+	res.Body.Close()
+	if got := sent(); len(got) != 2 {
+		t.Fatalf("held messages went out inside quiet hours: %q", got)
+	}
+	held := deliveriesOf(h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomePlanned})
+	if len(held) != 7 {
+		t.Fatalf("held rows = %d, want 7", len(held))
+	}
+	for _, row := range held {
+		if row.HeldUntil.IsZero() || len(row.IncidentIDs) != 1 {
+			t.Fatalf("held row = %+v", row)
+		}
+	}
+
+	h.clock.at = start.Add(2*time.Hour + time.Minute)
+	h.f.srv.wakeNotifyOutbox()
+	waitOutboxSettled(t, h.f.srv)
+	want := []string{
+		"sing-box down on name-a", "sing-box recovered on name-a",
+		"Lattice node offline: name-b",
+		"Lattice node offline: name-c", "Lattice node online: name-c", "Lattice node offline: name-c",
+	}
+	if got := sent(); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("after quiet hours sent %q, want %q", got, want)
+	}
+	withdrawn := map[string]string{}
+	for _, row := range deliveriesOf(h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, ChannelID: "nc-a"}) {
+		withdrawn[row.Title] = row.Reason
+	}
+	wantWithdrawn := map[string]string{
+		"Lattice node offline: name-a": notifyWithdrawnOpen,
+		"Lattice node online: name-a":  notifyWithdrawnRecovery,
+		"Lattice node offline: name-d": notifyWithdrawnOpen,
+	}
+	if fmt.Sprint(withdrawn) != fmt.Sprint(wantWithdrawn) {
+		t.Fatalf("withdrawn = %v, want %v", withdrawn, wantWithdrawn)
+	}
+}

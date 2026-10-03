@@ -102,16 +102,29 @@ var incidentKinds = map[string]incidentKind{
 	EventAgentStalled: {recovery: EventAgentRecovered, severity: incidentSeverityWarning, noun: "nodes"},
 }
 
-// notifyEventSeverity is the severity quiet hours judge an event by.
+// incidentRecoveryOf maps each recovery event type to the open it answers.
+var incidentRecoveryOf = func() map[string]string {
+	out := make(map[string]string, len(incidentKinds))
+	for open, k := range incidentKinds {
+		out[k.recovery] = open
+	}
+	return out
+}()
+
+// notifyEventSeverity is the severity quiet hours judge an event by. A
+// recovery has the severity of the incident it closes: the recovery of a
+// critical incident breaks through quiet hours as its open did, so the phone
+// is not left saying "down" all night, and the recovery of a warning waits
+// with the warnings.
 func notifyEventSeverity(eventType string) string {
 	if k, ok := incidentKinds[eventType]; ok {
 		return k.severity
 	}
-	switch eventType {
-	case EventSSHCompromiseSuspected:
+	if open, ok := incidentRecoveryOf[eventType]; ok {
+		return incidentKinds[open].severity
+	}
+	if eventType == EventSSHCompromiseSuspected {
 		return incidentSeverityCritical
-	case EventNodeOnline, EventServiceRecovered, EventMonitorRecovered, EventAgentRecovered:
-		return incidentSeverityInfo
 	}
 	return incidentSeverityWarning
 }
@@ -272,8 +285,9 @@ func incidentOpenHold(inc store.Incident, now time.Time, cover maintenanceCover)
 
 // incidentOutgoing is one incident's share of a message about to be sent.
 type incidentOutgoing struct {
-	sortKey string
-	msg     incidentMessage
+	incidentID string
+	sortKey    string
+	msg        incidentMessage
 }
 
 func incidentSortKey(inc store.Incident) string {
@@ -408,8 +422,9 @@ func (s *Server) evaluateIncidents(now time.Time) {
 						line += " (flapping)"
 					}
 					opens[inc.Kind] = append(opens[inc.Kind], incidentOutgoing{
-						sortKey: incidentSortKey(inc),
-						msg:     incidentMessage{title: title, detail: inc.Detail, line: line},
+						incidentID: inc.ID,
+						sortKey:    incidentSortKey(inc),
+						msg:        incidentMessage{title: title, detail: inc.Detail, line: line},
 					})
 					inc.OwedOpen = false
 					inc.Notified, inc.NotifiedAt, inc.OpenNotifiedAt = store.IncidentNotifiedOpen, now, now
@@ -431,8 +446,9 @@ func (s *Server) evaluateIncidents(now time.Time) {
 					line += " (flapping)"
 				}
 				recoveries[kind.recovery] = append(recoveries[kind.recovery], incidentOutgoing{
-					sortKey: incidentSortKey(inc),
-					msg:     incidentMessage{title: title, detail: inc.RecoveryDetail, line: line},
+					incidentID: inc.ID,
+					sortKey:    incidentSortKey(inc),
+					msg:        incidentMessage{title: title, detail: inc.RecoveryDetail, line: line},
 				})
 				inc.OwedRecovery = false
 				inc.Notified, inc.NotifiedAt = store.IncidentNotifiedResolved, now
@@ -502,21 +518,29 @@ func sortedMapKeys[V any](m map[string]V) []string {
 }
 
 // sendIncidentMessages sends one message for every item of one event type: a
-// single item keeps its own title and body, several become a digest.
+// single item keeps its own title and body, several become a digest. Each
+// message carries the ids of the incidents it reports.
 func (s *Server) sendIncidentMessages(eventType string, items []incidentOutgoing) {
 	if len(items) == 0 {
 		return
 	}
 	if len(items) == 1 {
-		s.emitNotifyTyped(eventType, items[0].msg.title, items[0].msg.detail)
+		s.emitIncidentNotice(eventType, items[0].msg.title, items[0].msg.detail, []string{items[0].incidentID})
 		return
 	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].sortKey < items[j].sortKey })
 	lines := make([]string, len(items))
+	ids := make([]string, len(items))
 	for i, item := range items {
 		lines[i] = item.msg.line
+		ids[i] = item.incidentID
 	}
-	s.emitNotifyTyped(eventType, incidentDigestTitle(eventType, len(items)), strings.Join(lines, "\n"))
+	s.emitIncidentNotice(eventType, incidentDigestTitle(eventType, len(items)), strings.Join(lines, "\n"), ids)
+}
+
+// notifyIncidentEvent is the production emitIncidentNotice.
+func (s *Server) notifyIncidentEvent(eventType, title, body string, incidentIDs []string) {
+	s.enqueueNotifyEvent(eventType, title, body, notifyEnqueue{source: store.NotifySourceServer, incidentIDs: incidentIDs})
 }
 
 func incidentDigestTitle(eventType string, n int) string {
@@ -642,7 +666,11 @@ func (s *Server) escalateIncidents(incs []*store.Incident, now time.Time) []stor
 			}
 			body = strings.Join(lines, "\n")
 		}
-		how := notifyEnqueue{source: store.NotifySourceServer, barkLevel: b.esc.level}
+		ids := make([]string, len(b.items))
+		for i, inc := range b.items {
+			ids[i] = inc.ID
+		}
+		how := notifyEnqueue{source: store.NotifySourceServer, barkLevel: b.esc.level, incidentIDs: ids}
 		if b.esc.rule == nil {
 			how.broadcast = true
 		} else {

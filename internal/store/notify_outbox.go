@@ -167,6 +167,9 @@ type NotifyDelivery struct {
 	// HeldUntil is set when the rule's quiet hours held the delivery; its
 	// first attempt waits until then.
 	HeldUntil time.Time `json:"held_until,omitzero"`
+	// IncidentIDs names the incidents an incident message reports, so a
+	// message quiet hours held can be judged again when the window ends.
+	IncidentIDs []string `json:"incident_ids,omitempty"`
 }
 
 // Unsent reports a row that records a message nobody was sent: no rule
@@ -849,6 +852,9 @@ func (s *Store) RemoveNotifyDigestLines(keys []string) error {
 func cloneNotifyDelivery(d NotifyDelivery) NotifyDelivery {
 	if d.Attempts != nil {
 		d.Attempts = append([]NotifyAttempt(nil), d.Attempts...)
+	}
+	if d.IncidentIDs != nil {
+		d.IncidentIDs = append([]string(nil), d.IncidentIDs...)
 	}
 	return d
 }

@@ -323,6 +323,9 @@ type Server struct {
 	// reworded notification silently changes who receives it; new callers say
 	// what the event is and are unaffected by prose.
 	emitNotifyTyped func(eventType, title, body string)
+	// emitIncidentNotice is the seam the incident sweep sends through: a
+	// typed event that also names the incidents it reports.
+	emitIncidentNotice func(eventType, title, body string, incidentIDs []string)
 	// nodeAlerts holds which offline spell each node was alerted for; see
 	// notifyNodeLiveness.
 	nodeAlerts nodeOfflineAlerts
@@ -677,6 +680,7 @@ func New(opts Options) (*Server, error) {
 	}
 	s.emitNotify = s.notifyEvent
 	s.emitNotifyTyped = s.notifyEventTyped
+	s.emitIncidentNotice = s.notifyIncidentEvent
 	s.notifySend = defaultNotifySend
 	s.notifyRetryDelays = notifyRetryDelays
 	// Before anything can notify: answer what the previous process left in

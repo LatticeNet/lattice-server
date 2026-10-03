@@ -56,6 +56,8 @@ var (
 	boltBucketMonResults       = []byte("monitor_results")
 	boltBucketMonResultRows    = []byte("monitor_result_rows")
 	boltBucketMonResultLatest  = []byte("monitor_result_latest")
+	boltBucketMonRollupFine    = []byte("monitor_rollup_fine")
+	boltBucketMonRollupCoarse  = []byte("monitor_rollup_coarse")
 	boltBucketLogSources       = []byte("log_sources")
 	boltBucketNotifyChannels   = []byte("notify_channels")
 	boltBucketNotifyRules      = []byte("notify_rules")
@@ -198,6 +200,40 @@ func readBoltNotifyRuleOptions(tx *bolt.Tx, into map[string]NotifyRuleOptions) e
 	return nil
 }
 
+// boltKeyLatencyProbes holds State.LatencyProbes in the meta bucket, so the
+// offline migrate round trip keeps the configuration. Like the rule options
+// it is operator config written only on an edit; the running server reads it
+// from the JSON state.
+var boltKeyLatencyProbes = []byte("latency_probes")
+
+func putBoltLatencyProbes(tx *bolt.Tx, cfg *model.LatencyProbeConfig) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if cfg == nil {
+		return meta.Delete(boltKeyLatencyProbes)
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyLatencyProbes, raw)
+}
+
+func readBoltLatencyProbes(tx *bolt.Tx) (*model.LatencyProbeConfig, error) {
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil, nil
+	}
+	raw := meta.Get(boltKeyLatencyProbes)
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var cfg model.LatencyProbeConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return nil, fmt.Errorf("decode latency probes: %w", err)
+	}
+	return &cfg, nil
+}
+
 var boltStateBuckets = [][]byte{
 	boltBucketUsers,
 	boltBucketTokens,
@@ -226,6 +262,12 @@ var boltStateBuckets = [][]byte{
 	boltBucketMonResults,
 	boltBucketMonResultRows,
 	boltBucketMonResultLatest,
+	// The rollups are derived from the rows and written with them, so they
+	// sit in this list: a whole-state import resets them together with the
+	// rows and rebuilds them as it replays the rows, instead of counting the
+	// replayed rows a second time.
+	boltBucketMonRollupFine,
+	boltBucketMonRollupCoarse,
 	boltBucketLogSources,
 	boltBucketNotifyChannels,
 	boltBucketNotifyRules,
@@ -502,6 +544,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltNotifyChannelOptions(tx, persist.NotifyChannelOptions); err != nil {
 			return err
 		}
+		if err := putBoltLatencyProbes(tx, persist.LatencyProbes); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
 			return err
 		}
@@ -756,6 +801,11 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 		if err := readBoltNotifyChannelOptions(tx, st.NotifyChannelOptions); err != nil {
 			return err
 		}
+		latency, err := readBoltLatencyProbes(tx)
+		if err != nil {
+			return err
+		}
+		st.LatencyProbes = latency
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {
 			return err
 		}

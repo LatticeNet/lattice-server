@@ -98,6 +98,9 @@ type State struct {
 	// NotifyChannelOptions holds per-channel settings model.NotifyChannel
 	// does not carry yet (notify_channel_options.go), keyed by channel id.
 	NotifyChannelOptions map[string]NotifyChannelOptions `json:"notify_channel_options,omitempty"`
+	// LatencyProbes is the operator's latency probe configuration
+	// (latency_probes.go), nil until one is saved. Written only on an edit.
+	LatencyProbes *model.LatencyProbeConfig `json:"latency_probes,omitempty"`
 	// NotifyWebhooks are operator-authored inbound entry points (notify_webhook.go).
 	// They hold a PBKDF2 secret hash, not a reversible secret, so unlike
 	// NotifyChannels they need no pass in crypto.go.

@@ -125,7 +125,13 @@ type sshGuardKnockState struct {
 // knocking a sequence that was never applied fails silently and looks like
 // the sequence is wrong.
 func (s *Server) sshGuardKnockStateFor(nodeID string) sshGuardKnockState {
-	approvals := s.store.Approvals()
+	return s.sshGuardKnockStateIn(nodeID, s.store.Approvals())
+}
+
+// sshGuardKnockStateIn is sshGuardKnockStateFor over an approval list the
+// caller already holds, so a caller asking about many nodes copies the list
+// once instead of once per node.
+func (s *Server) sshGuardKnockStateIn(nodeID string, approvals []model.Approval) sshGuardKnockState {
 	arms := make([]model.Approval, 0, 4)
 	confirms := make([]model.Approval, 0, 4)
 	for _, a := range approvals {

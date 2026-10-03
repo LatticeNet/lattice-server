@@ -159,7 +159,13 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 		if n.LastSeen.IsZero() || !pages {
 			continue
 		}
-		if !a.since.IsZero() && n.LastSeen.Before(a.since.Add(-delay)) {
+		// After a crash a LastSeen this process has not confirmed may trail
+		// the node's real last beat by the store's slack, so "silent before
+		// start" is judged with that much margin. Without it a node that died
+		// just before the crash looked long gone and never paged. A spell the
+		// previous process did page is still owned by its incident record.
+		slack := s.store.NodeLastSeenSlack(n.ID)
+		if !a.since.IsZero() && n.LastSeen.Before(a.since.Add(-delay-slack)) {
 			// Already silent past the delay when this process started. The
 			// previous process had the spell; alerting it here would repeat
 			// on every restart for a node that is simply gone.

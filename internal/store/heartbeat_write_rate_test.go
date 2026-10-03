@@ -89,6 +89,117 @@ func TestQuietFleetHeartbeatsWriteOncePerInterval(t *testing.T) {
 	}
 }
 
+// What a crash leaves on disk is the fleet's heartbeats as the last write had
+// them, at most metricsPersistenceInterval and a beat behind memory.
+// NodeLastSeenSlack covers exactly that. A clean Close leaves nothing behind.
+func TestCrashLeavesHeartbeatsAtMostOneIntervalStale(t *testing.T) {
+	f := openHeartbeatFleet(t, fleetIDs(5))
+	for step := 1; step <= 50; step++ { // 500 s: one write at 300 s, then 200 s of beats in memory only
+		f.clock.at = f.t0.Add(time.Duration(step) * 10 * time.Second)
+		beat(t, f.s, f.ids...)
+	}
+	crashed := reopen(t, f.path) // the first store is never closed
+	worst := time.Duration(0)
+	for _, nodeID := range f.ids {
+		live, _ := f.s.Node(nodeID)
+		disk, _ := crashed.Node(nodeID)
+		if lag := live.LastSeen.Sub(disk.LastSeen); lag > worst {
+			worst = lag
+		}
+	}
+	if worst <= 0 || worst > NodeLastSeenDiskLag+10*time.Second {
+		t.Fatalf("heartbeats on disk after a crash trail memory by %s, want more than zero and at most %s", worst, NodeLastSeenDiskLag+10*time.Second)
+	}
+	if slack := crashed.NodeLastSeenSlack(f.ids[0]); slack != NodeLastSeenDiskLag {
+		t.Fatalf("slack before a beat after the crash = %s, want %s", slack, NodeLastSeenDiskLag)
+	}
+	crashed.testNow = f.clock.now
+	beat(t, crashed, f.ids[0])
+	if slack := crashed.NodeLastSeenSlack(f.ids[0]); slack != 0 {
+		t.Fatalf("slack after the node beat in the new process = %s, want 0", slack)
+	}
+
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	clean := reopen(t, f.path)
+	for _, nodeID := range f.ids {
+		live, _ := f.s.Node(nodeID)
+		disk, _ := clean.Node(nodeID)
+		if !disk.LastSeen.Equal(live.LastSeen) {
+			t.Fatalf("%s after a clean close: last seen %s on disk, %s in memory", nodeID, disk.LastSeen, live.LastSeen)
+		}
+	}
+}
+
+// After a crash the sweep that runs at start, before any agent can beat,
+// must not mark a fleet that was beating offline because its heartbeats on
+// disk are minutes old. A node that really stopped before the crash is
+// still marked offline once its silence is past the threshold and the slack.
+func TestBootSweepAfterACrashFlipsNoBeatingNode(t *testing.T) {
+	live := []string{"node-a", "node-b", "node-c", "node-d"}
+	f := openHeartbeatFleet(t, append(append([]string{}, live...), "node-late"))
+	sweep := func(s *Store, at time.Time, cause string) []string {
+		t.Helper()
+		flipped, err := s.MarkStaleNodesOffline(90*time.Second, at, cause)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := []string{}
+		for _, n := range flipped {
+			ids = append(ids, n.ID)
+		}
+		return ids
+	}
+	// The first process: every node beats every ten seconds and the sweep
+	// runs every twenty, until node-late stops at t0+380s and the process
+	// dies at t0+405s.
+	for step := 1; step <= 40; step++ {
+		f.clock.at = f.t0.Add(time.Duration(step) * 10 * time.Second)
+		beat(t, f.s, live...)
+		if f.clock.at.Sub(f.t0) <= 380*time.Second {
+			beat(t, f.s, "node-late")
+		}
+		if step%2 == 0 {
+			if got := sweep(f.s, f.clock.at, NodeStatusCauseLivenessSweep); len(got) != 0 {
+				t.Fatalf("before the crash, at %s: flipped %v", f.clock.at.Sub(f.t0), got)
+			}
+		}
+	}
+
+	crashed := reopen(t, f.path)
+	crashed.testNow = f.clock.now
+	diskB, _ := crashed.Node("node-b")
+	if lag := f.t0.Add(400 * time.Second).Sub(diskB.LastSeen); lag < 90*time.Second {
+		t.Fatalf("the crash left node-b only %s stale on disk; the test needs more than the 90 s threshold", lag)
+	}
+	boot := f.t0.Add(450 * time.Second) // 45 s down
+	if got := sweep(crashed, boot, NodeStatusCauseServerStart); len(got) != 0 {
+		t.Fatalf("the start sweep after a crash marked %v offline", got)
+	}
+	// The new process: the live nodes beat from boot+10s, node-late never
+	// does. Its LastSeen on disk is t0+290s, so it is judged with the slack
+	// and goes offline at the first sweep past 90 s plus the slack.
+	var lateFlippedAt time.Duration
+	for step := 1; step <= 40; step++ {
+		f.clock.at = boot.Add(time.Duration(step) * 10 * time.Second)
+		beat(t, crashed, live...)
+		if step%2 == 0 {
+			got := sweep(crashed, f.clock.at, NodeStatusCauseLivenessSweep)
+			switch {
+			case len(got) == 0:
+			case len(got) == 1 && got[0] == "node-late" && lateFlippedAt == 0:
+				lateFlippedAt = f.clock.at.Sub(f.t0)
+			default:
+				t.Fatalf("at t0+%s the sweep marked %v offline", f.clock.at.Sub(f.t0), got)
+			}
+		}
+	}
+	if lateFlippedAt != 690*time.Second {
+		t.Fatalf("node-late (last on disk at t0+290s) went offline at t0+%s, want t0+690s", lateFlippedAt)
+	}
+}
+
 // A heartbeat or a token use that did not write is carried by the next write
 // made for any reason, so it survives a crash after that write.
 func TestUnflushedHeartbeatAndTokenUseRideTheNextWrite(t *testing.T) {

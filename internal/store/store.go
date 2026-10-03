@@ -37,6 +37,14 @@ const maxTaskResults = 2000
 // once per interval, not once per node per interval.
 const metricsPersistenceInterval = 5 * time.Minute
 
+// NodeLastSeenDiskLag is how far a node's LastSeen, as loaded from the state
+// file, may trail the node's real last heartbeat. A clean Close writes every
+// heartbeat, but a crash leaves the fleet's heartbeats as the last write had
+// them, up to metricsPersistenceInterval (and a beat) old, and the file does
+// not say which way the last process ended. Until a node beats again, its
+// LastSeen is a lower bound by this much; NodeLastSeenSlack says when.
+const NodeLastSeenDiskLag = metricsPersistenceInterval
+
 // monitorResultPersistenceInterval keeps monitor history live in memory while
 // avoiding a full snapshot rewrite for every unchanged probe cycle. It applies
 // only without the hot store, which writes every result at record level.
@@ -290,6 +298,11 @@ type Store struct {
 	// node in memory without a write, cleared by the next committed write, and
 	// written by Close. Guarded by mu.
 	nodeClocksUnflushed bool
+	// loadedLastSeen is each node's LastSeen as Open read it from the state
+	// file. While a node's LastSeen still equals it, the node has not beaten
+	// in this process and the value is a lower bound (NodeLastSeenDiskLag).
+	// Written only by Open. Guarded by mu.
+	loadedLastSeen map[string]time.Time
 	// testNow is the heartbeat clock in tests; nil means time.Now.
 	testNow func() time.Time
 	// closed is set by the first Close. A later Close does nothing: the bolt
@@ -492,8 +505,43 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	s.noteReportClocksOnDisk(s.state)
+	s.loadedLastSeen = make(map[string]time.Time, len(s.state.Nodes))
+	for nodeID, n := range s.state.Nodes {
+		if !n.LastSeen.IsZero() {
+			s.loadedLastSeen[nodeID] = n.LastSeen
+		}
+	}
 	s.confirmParentDirDurability()
 	return s, nil
+}
+
+// lastSeenSlackLocked is NodeLastSeenDiskLag while the node's LastSeen is the
+// one Open loaded and the node has not beaten since, and zero once this
+// process has seen it beat. Requires mu.
+//
+// yagni: the slack also applies after a clean Close, whose final write left
+// every LastSeen exact; a node that died in the few minutes before a deploy
+// is marked offline and paged up to NodeLastSeenDiskLag late. A clean-close
+// marker in the state file, cleared by the first write after open, is the
+// upgrade if that delay starts to matter.
+func (s *Store) lastSeenSlackLocked(n model.Node) time.Duration {
+	if loaded, ok := s.loadedLastSeen[n.ID]; ok && n.LastSeen.Equal(loaded) {
+		return NodeLastSeenDiskLag
+	}
+	return 0
+}
+
+// NodeLastSeenSlack reports how far the node's LastSeen may trail its real
+// last heartbeat: NodeLastSeenDiskLag until the node beats in this process
+// after a restart, zero after.
+func (s *Store) NodeLastSeenSlack(nodeID string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return 0
+	}
+	return s.lastSeenSlackLocked(n)
 }
 
 // heartbeatNow is the clock heartbeats are stamped and judged by.
@@ -1777,7 +1825,11 @@ func (s *Store) MarkStaleNodesOffline(threshold time.Duration, now time.Time, ca
 	var flipped []model.Node
 	var events []nodeStatusAppend
 	for nodeID, n := range s.state.Nodes {
-		if n.Online && !n.LastSeen.IsZero() && now.Sub(n.LastSeen) > threshold {
+		// A LastSeen loaded at open and not yet confirmed by a beat may trail
+		// the truth by NodeLastSeenDiskLag after a crash, so it is judged
+		// with that much more patience. Without it, the sweep that runs at
+		// start, before any agent can beat, marked a beating fleet offline.
+		if n.Online && !n.LastSeen.IsZero() && now.Sub(n.LastSeen) > threshold+s.lastSeenSlackLocked(n) {
 			n.Online = false
 			s.state.Nodes[nodeID] = n
 			flipped = append(flipped, n)

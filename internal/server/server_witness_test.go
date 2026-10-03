@@ -501,6 +501,67 @@ func TestWitnessShortTextCutsOnARuneBoundary(t *testing.T) {
 	}
 }
 
+// At decision the plan's files are checked as strictly as when the plan was
+// made: the unit this server writes, a valid config in the form it writes,
+// the key and state files the scripts use, and the SHA-256 the header shows.
+func TestWitnessDecisionRefusesPlanFilesThatDoNotCheckOut(t *testing.T) {
+	f := newWitnessFixture(t, witnessTestPublic)
+	f.capable(t)
+	_, base := f.plan(t, witnessPlanBody)
+	config, unit, err := witnessPlanFiles(base.Plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := witnessConfigureFiles(base); err != nil {
+		t.Fatalf("the plan this server made does not check out: %v", err)
+	}
+	headerSHA := approvalPlanField(base.Plan, witnessFieldConfigSHA)
+	withConfig := func(plan, newConfig string, fixHeader bool) string {
+		plan = strings.Replace(plan, config, newConfig, 1)
+		if fixHeader {
+			plan = strings.Replace(plan, witnessFieldConfigSHA+": "+headerSHA, witnessFieldConfigSHA+": "+witnessConfigSHA(newConfig), 1)
+		}
+		return plan
+	}
+	for name, tc := range map[string]struct {
+		plan string
+		want string
+	}{
+		"unit": {strings.Replace(base.Plan, unit, strings.Replace(unit, "NoNewPrivileges=yes\n", "ExecStartPre=/bin/sh -c id\n", 1), 1), "the unit is not the one"},
+		"sha":  {withConfig(base.Plan, strings.Replace(config, `"interval_seconds": 30`, `"interval_seconds": 45`, 1), false), "SHA-256 is not the one the plan shows"},
+		"key file": {withConfig(base.Plan, strings.Replace(config, `"bark_device_key_file": "`+witnessKeyPath+`"`, `"bark_device_key_file": "/etc/shadow"`, 1), true),
+			"another version, key file or state file"},
+		"extra field": {withConfig(base.Plan, strings.Replace(config, "{\n", "{\n  \"exec\": \"id\",\n", 1), true), "not in the form this server writes"},
+		"invalid":     {withConfig(base.Plan, strings.Replace(config, "http://127.0.0.1:7001", "http://10.0.0.7:7001", 1), true), "loopback"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if tc.plan == base.Plan {
+				t.Fatal("the tampering did not change the plan")
+			}
+			a := base
+			a.ID = id.New("approval")
+			a.Plan = tc.plan
+			if err := f.st.UpsertApproval(a); err != nil {
+				t.Fatal(err)
+			}
+			res := f.approve(t, a)
+			res.Body.Close()
+			if res.StatusCode != http.StatusConflict {
+				t.Fatalf("approve: %d", res.StatusCode)
+			}
+			stored, _ := f.st.Approval(a.ID)
+			if stored.Status != model.ApprovalRejected || !strings.Contains(stored.Reason, tc.want) {
+				t.Fatalf("approval = %s %q, want reason containing %q", stored.Status, stored.Reason, tc.want)
+			}
+		})
+	}
+	for _, tk := range f.st.Tasks() {
+		if tk.ApprovalID != "" {
+			t.Fatalf("a refused plan queued a task: %+v", tk)
+		}
+	}
+}
+
 // Two plans can wait side by side and be approved in either order; the node
 // runs whichever applied last, and both the status and the capability's
 // enrolment follow that, not the order the plans were filed.

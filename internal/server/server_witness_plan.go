@@ -59,6 +59,8 @@ const (
 	witnessStateDir   = "/var/lib/lattice-witness"
 	witnessStatePath  = "/var/lib/lattice-witness/status.json"
 
+	// witnessConfigVersion is the agent's witness.ConfigVersion.
+	witnessConfigVersion   = 1
 	witnessDefaultInterval = 30
 	witnessDefaultHold     = 180
 	witnessDefaultRecover  = 60
@@ -145,7 +147,7 @@ func witnessConfigFromRequest(req witnessPlanRequest, nodeName, healthURL string
 		refs = slices.Clone(witnessDefaultReferences)
 	}
 	doc := witnessConfigDoc{
-		Version:           1,
+		Version:           witnessConfigVersion,
 		NodeName:          nodeName,
 		HealthURL:         healthURL,
 		ReferenceURLs:     refs,
@@ -447,14 +449,49 @@ func (s *Server) witnessApprovalKey(a model.Approval) (string, error) {
 	return key, nil
 }
 
+// witnessConfigureFiles reads a configure plan's files back and checks them
+// as strictly as when the plan was made: the unit must be the one this server
+// renders, the config must be a valid witness config in exactly the form this
+// server renders, with the key file and state file the scripts expect, and
+// its SHA-256 must be the one the plan's header shows the reviewer. Only
+// handleWitnessPlan files these approvals today, so this is defence in depth:
+// the unit runs as root, and the header and the files must not be able to
+// say different things.
+func witnessConfigureFiles(a model.Approval) (config, unit string, err error) {
+	config, unit, err = witnessPlanFiles(a.Plan)
+	if err != nil {
+		return "", "", err
+	}
+	if unit != renderWitnessUnit() {
+		return "", "", errors.New("witness plan: the unit is not the one this server writes; re-plan the witness")
+	}
+	var doc witnessConfigDoc
+	if err := json.Unmarshal([]byte(config), &doc); err != nil {
+		return "", "", fmt.Errorf("witness plan: the config does not parse: %w", err)
+	}
+	if rendered, err := renderWitnessConfig(doc); err != nil || rendered != config {
+		return "", "", errors.New("witness plan: the config is not in the form this server writes; re-plan the witness")
+	}
+	if doc.Version != witnessConfigVersion || doc.BarkDeviceKeyFile != witnessKeyPath || doc.StateFile != witnessStatePath {
+		return "", "", errors.New("witness plan: the config names another version, key file or state file than the scripts write; re-plan the witness")
+	}
+	if err := validateWitnessConfig(doc); err != nil {
+		return "", "", fmt.Errorf("witness plan: %w", err)
+	}
+	if want := approvalPlanField(a.Plan, witnessFieldConfigSHA); want != witnessConfigSHA(config) {
+		return "", "", errors.New("witness plan: the config's SHA-256 is not the one the plan shows; re-plan the witness")
+	}
+	return config, unit, nil
+}
+
 // requireCurrentWitnessApproval runs when the approval is decided: a
-// configure plan's files must parse and its key must still be the one the
-// operator reviewed.
+// configure plan's files must check out and its key must still be the one
+// the operator reviewed.
 func (s *Server) requireCurrentWitnessApproval(a model.Approval) error {
 	if a.Action != witnessConfigureAction {
 		return nil
 	}
-	if _, _, err := witnessPlanFiles(a.Plan); err != nil {
+	if _, _, err := witnessConfigureFiles(a); err != nil {
 		return err
 	}
 	_, err := s.witnessApprovalKey(a)
@@ -470,7 +507,7 @@ func (s *Server) witnessApplyScript(a model.Approval) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown witness action %q", a.Action)
 	}
-	config, unit, err := witnessPlanFiles(a.Plan)
+	config, unit, err := witnessConfigureFiles(a)
 	if err != nil {
 		return "", err
 	}

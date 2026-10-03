@@ -56,6 +56,8 @@ var (
 	boltBucketMonResults       = []byte("monitor_results")
 	boltBucketMonResultRows    = []byte("monitor_result_rows")
 	boltBucketMonResultLatest  = []byte("monitor_result_latest")
+	boltBucketMonRollupFine    = []byte("monitor_rollup_fine")
+	boltBucketMonRollupCoarse  = []byte("monitor_rollup_coarse")
 	boltBucketLogSources       = []byte("log_sources")
 	boltBucketNotifyChannels   = []byte("notify_channels")
 	boltBucketNotifyRules      = []byte("notify_rules")
@@ -195,6 +197,12 @@ var boltStateBuckets = [][]byte{
 	boltBucketMonResults,
 	boltBucketMonResultRows,
 	boltBucketMonResultLatest,
+	// The rollups are derived from the rows and written with them, so they
+	// sit in this list: a whole-state import resets them together with the
+	// rows and rebuilds them as it replays the rows, instead of counting the
+	// replayed rows a second time.
+	boltBucketMonRollupFine,
+	boltBucketMonRollupCoarse,
 	boltBucketLogSources,
 	boltBucketNotifyChannels,
 	boltBucketNotifyRules,

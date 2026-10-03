@@ -102,9 +102,9 @@ func monitorPairPrefix(monitorID, nodeID string) ([]byte, error) {
 	return boltKeyPrefix(monitorPairKey(monitorID, nodeID) + "/")
 }
 
-// recordMonitorResultTx writes one result for its pair: the row, the
-// advanced latest record, and the trim to perPair. A row already held at the
-// same instant is a duplicate and changes nothing.
+// recordMonitorResultTx writes one result for its pair: the row, its count
+// in the rollups, the advanced latest record, and the trim to perPair. A row
+// already held at the same instant is a duplicate and changes nothing.
 func recordMonitorResultTx(tx *bolt.Tx, rec MonitorResultRecord, perPair int) (MonitorResultOutcome, error) {
 	out := MonitorResultOutcome{Result: rec}
 	rows := tx.Bucket(boltBucketMonResultRows)
@@ -131,6 +131,9 @@ func recordMonitorResultTx(tx *bolt.Tx, rec MonitorResultRecord, perPair int) (M
 		return out, err
 	}
 	if err := rows.Put(rowKey, data); err != nil {
+		return out, err
+	}
+	if err := addMonitorRollupsTx(tx, rec); err != nil {
 		return out, err
 	}
 	next := advanceMonitorLatest(prior, hadPrior, rec)
@@ -469,13 +472,17 @@ func deleteKeysWithPrefixTx(b *bolt.Bucket, prefix []byte) (int, error) {
 	return len(keys), nil
 }
 
-// deleteMonitorResultsTx removes a monitor's rows and latest records.
+// deleteMonitorResultsTx removes a monitor's rows, rollups and latest
+// records.
 func deleteMonitorResultsTx(tx *bolt.Tx, monitorID string) error {
 	prefix, err := boltKeyPrefix(monitorID + "/")
 	if err != nil {
 		return err
 	}
 	if _, err := deleteKeysWithPrefixTx(tx.Bucket(boltBucketMonResultRows), prefix); err != nil {
+		return err
+	}
+	if err := deleteMonitorRollupsTx(tx, prefix); err != nil {
 		return err
 	}
 	_, err = deleteKeysWithPrefixTx(tx.Bucket(boltBucketMonResultLatest), prefix)
@@ -561,6 +568,9 @@ func (bs *BoltStateStore) DeleteMonitorResultsForNode(nodeID string) error {
 				return err
 			}
 			if _, err := deleteKeysWithPrefixTx(tx.Bucket(boltBucketMonResultRows), prefix); err != nil {
+				return err
+			}
+			if err := deleteMonitorRollupsTx(tx, prefix); err != nil {
 				return err
 			}
 			return deleteRecord(tx, boltBucketMonResultLatest, key)

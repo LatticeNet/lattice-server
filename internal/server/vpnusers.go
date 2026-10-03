@@ -47,6 +47,11 @@ type VpnUser struct {
 	// from, so the migration is idempotent and the subscription substrate is traceable.
 	MigratedFromProxyUser string `json:"migrated_from_proxy_user,omitempty"`
 
+	// Suspension is who took the identity out of service and when, recorded
+	// when an operator does it (vpn_policy.go). It is nil while the identity is
+	// enabled and not suspended by an operator.
+	Suspension *VpnSuspension `json:"suspension,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -67,6 +72,15 @@ type LineBinding struct {
 	LineHashID   string `json:"line_hash_id"`
 	Enabled      bool   `json:"enabled"`
 	FlowOverride string `json:"flow_override,omitempty"`
+	// AppliedCredentialSHA256 is the credential_sha256 of the last applied
+	// line-user plan that put the identity's credential on the line's node,
+	// and empty when no applied plan did or the last one took it off
+	// (lineUserAppliedCredential). A binding made by bind, or by the runtime
+	// path, has none: nothing proves the node holds the credential. It is
+	// compared with the identity's current credential to tell whether the
+	// node still holds that one (lineBindingCredentialState). It is a hash of
+	// the payload, never the credential, and views do not carry it.
+	AppliedCredentialSHA256 string `json:"applied_credential_sha256,omitempty"`
 }
 
 const (
@@ -90,13 +104,24 @@ type vpnCredentialView struct {
 	HasSecret bool   `json:"has_secret"`
 }
 
+// vpnBindingView is a binding as views carry it: the applied credential is
+// reduced to what it says about the node.
+type vpnBindingView struct {
+	LineHashID   string `json:"line_hash_id"`
+	Enabled      bool   `json:"enabled"`
+	FlowOverride string `json:"flow_override,omitempty"`
+	// Credential is lineBindingCredentialState: current, stale, none or
+	// unknown. Views that do not resolve lines leave it out.
+	Credential string `json:"credential,omitempty"`
+}
+
 type vpnUserView struct {
 	ID            string              `json:"id"`
 	Email         string              `json:"email"`
 	Name          string              `json:"name,omitempty"`
 	Enabled       bool                `json:"enabled"`
 	Credentials   []vpnCredentialView `json:"credentials"`
-	Bindings      []LineBinding       `json:"bindings"`
+	Bindings      []vpnBindingView    `json:"bindings"`
 	QuotaBytes    int64               `json:"quota_bytes,omitempty"`
 	QuotaPeriod   string              `json:"quota_period,omitempty"`
 	QuotaResetDay int                 `json:"quota_reset_day,omitempty"`
@@ -116,9 +141,9 @@ func toVpnUserView(u VpnUser) vpnUserView {
 			HasSecret: c.UUID != "" || c.Password != "",
 		})
 	}
-	binds := u.Bindings
-	if binds == nil {
-		binds = []LineBinding{}
+	binds := make([]vpnBindingView, 0, len(u.Bindings))
+	for _, b := range u.Bindings {
+		binds = append(binds, vpnBindingView{LineHashID: b.LineHashID, Enabled: b.Enabled, FlowOverride: b.FlowOverride})
 	}
 	return vpnUserView{
 		ID: u.ID, Email: u.Email, Name: u.Name, Enabled: u.Enabled,
@@ -183,6 +208,7 @@ func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecr
 	for _, binding := range u.Bindings {
 		bindings = append(bindings, store.VpnUserLineBinding{
 			LineHashID: binding.LineHashID, Enabled: binding.Enabled, FlowOverride: binding.FlowOverride,
+			AppliedCredentialSHA256: binding.AppliedCredentialSHA256,
 		})
 	}
 	return store.VpnUserPublicRecord{
@@ -191,7 +217,8 @@ func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecr
 		QuotaPeriod: u.QuotaPeriod, QuotaResetDay: u.QuotaResetDay,
 		ExpiresAt: u.ExpiresAt, Group: u.Group, Comment: u.Comment,
 		SubscriptionGeneration: u.SubscriptionGeneration,
-		MigratedFromProxyUser:  u.MigratedFromProxyUser, CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
+		MigratedFromProxyUser:  u.MigratedFromProxyUser, Suspension: cloneVpnSuspension(u.Suspension),
+		CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
 	}, store.VpnUserSecretRecord{Credentials: privateCredentials, SubID: u.SubID}
 }
 
@@ -212,6 +239,7 @@ func joinVpnUserRecord(public store.VpnUserPublicRecord, private store.VpnUserSe
 	for _, binding := range public.Bindings {
 		bindings = append(bindings, LineBinding{
 			LineHashID: binding.LineHashID, Enabled: binding.Enabled, FlowOverride: binding.FlowOverride,
+			AppliedCredentialSHA256: binding.AppliedCredentialSHA256,
 		})
 	}
 	return VpnUser{
@@ -220,8 +248,17 @@ func joinVpnUserRecord(public store.VpnUserPublicRecord, private store.VpnUserSe
 		QuotaPeriod: public.QuotaPeriod, QuotaResetDay: public.QuotaResetDay,
 		ExpiresAt: public.ExpiresAt, Group: public.Group, Comment: public.Comment,
 		SubscriptionGeneration: public.SubscriptionGeneration,
-		MigratedFromProxyUser:  public.MigratedFromProxyUser, CreatedAt: public.CreatedAt, UpdatedAt: public.UpdatedAt,
+		MigratedFromProxyUser:  public.MigratedFromProxyUser, Suspension: cloneVpnSuspension(public.Suspension),
+		CreatedAt: public.CreatedAt, UpdatedAt: public.UpdatedAt,
 	}
+}
+
+func cloneVpnSuspension(in *VpnSuspension) *VpnSuspension {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
 }
 
 // ── Migration (idempotent; runs at startup) ───────────────────────────────────
@@ -400,6 +437,7 @@ func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, reques
 		case "create", "update", "delete", "bind", "unbind", "rotate":
 			s.triggerVPNCoreMutation()
 			s.invalidateLineReadModel()
+			s.invalidateCoreSourceShares()
 		}
 	}
 	return out, err
@@ -408,9 +446,9 @@ func (s *Server) vpnCoreUsersAdminRPC(ctx context.Context, method string, reques
 func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, request []byte) ([]byte, error) {
 	switch method {
 	case "create":
-		return s.vpnUserCreate(request)
+		return s.vpnUserCreateBy(pluginOperatorActor(ctx), request)
 	case "update":
-		return s.vpnUserUpdate(request)
+		return s.vpnUserUpdateBy(pluginOperatorActor(ctx), request)
 	case "delete":
 		id, err := decodeIDRequest(request)
 		if err != nil {
@@ -541,7 +579,36 @@ func quotaOrZero(v *int64) int64 {
 	return *v
 }
 
+// pluginOperatorActor is the actor id of the operator behind a plugin call,
+// or empty when the call carries none.
+func pluginOperatorActor(ctx context.Context) string {
+	p, err := pluginOperatorPrincipal(ctx)
+	if err != nil {
+		return ""
+	}
+	return p.ActorID
+}
+
+// noteVpnUserEnabled records who turned an identity off and when, so the
+// policy can name them (vpnUserPolicy.By). Only the change from enabled to
+// disabled is recorded: an edit that leaves an identity disabled keeps the
+// record of who disabled it. The identity holds one record, so turning it off
+// replaces an operator suspension; turning it on clears a disabled record and
+// leaves an operator suspension, which is not the enabled flag, where it is.
+func noteVpnUserEnabled(u *VpnUser, wasEnabled bool, actor string, now time.Time) {
+	switch {
+	case !u.Enabled && wasEnabled:
+		u.Suspension = &VpnSuspension{Reason: vpnSuspendReasonDisabled, By: actor, Since: now}
+	case u.Enabled && u.Suspension != nil && u.Suspension.Reason == vpnSuspendReasonDisabled:
+		u.Suspension = nil
+	}
+}
+
 func (s *Server) vpnUserCreate(request []byte) ([]byte, error) {
+	return s.vpnUserCreateBy("", request)
+}
+
+func (s *Server) vpnUserCreateBy(actor string, request []byte) ([]byte, error) {
 	var req vpnUserWriteReq
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, fmt.Errorf("vpn-core/users-admin create: invalid request: %w", err)
@@ -585,6 +652,7 @@ func (s *Server) vpnUserCreate(request []byte) ([]byte, error) {
 	if err := applyQuotaPeriod(&u, req.QuotaPeriod, req.QuotaResetDay); err != nil {
 		return nil, err
 	}
+	noteVpnUserEnabled(&u, true, actor, u.CreatedAt)
 	if err := s.putVpnUser(u); err != nil {
 		return nil, err
 	}
@@ -594,6 +662,10 @@ func (s *Server) vpnUserCreate(request []byte) ([]byte, error) {
 }
 
 func (s *Server) vpnUserUpdate(request []byte) ([]byte, error) {
+	return s.vpnUserUpdateBy("", request)
+}
+
+func (s *Server) vpnUserUpdateBy(actor string, request []byte) ([]byte, error) {
 	var req vpnUserWriteReq
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, fmt.Errorf("vpn-core/users-admin update: invalid request: %w", err)
@@ -613,7 +685,9 @@ func (s *Server) vpnUserUpdate(request []byte) ([]byte, error) {
 	}
 	u.Name = strings.TrimSpace(req.Name)
 	if req.Enabled != nil {
+		wasEnabled := u.Enabled
 		u.Enabled = *req.Enabled
+		noteVpnUserEnabled(&u, wasEnabled, actor, s.now())
 	}
 	if req.Credentials != nil {
 		creds, err := s.normalizeCredentials(req.Credentials)

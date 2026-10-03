@@ -87,6 +87,29 @@ type lineChainCompileSnapshot struct {
 	Chains       store.LineChainSnapshot
 	Capabilities map[string]bool
 	EvidenceAt   time.Time
+	// Policies is each identity's policy (vpnUserPolicyAt), read after the
+	// capture because it needs the store and the capture must not re-enter
+	// it. Subscription eligibility reads it through identityPolicy.
+	Policies map[string]vpnUserPolicy
+}
+
+// identityPolicy is the identity's policy as captured. An identity the
+// capture holds no policy for, as in a snapshot built by hand, is decided
+// over no usage: the same rule, with no quota to cross.
+func (snapshot lineChainCompileSnapshot) identityPolicy(identity VpnUser, now time.Time) vpnUserPolicy {
+	if policy, ok := snapshot.Policies[identity.ID]; ok {
+		return policy
+	}
+	return decideVpnUserPolicy(identity, vpnUserQuotaUsage{}, now)
+}
+
+// withIdentityPolicies fills a captured snapshot's policies at now.
+func (s *Server) withIdentityPolicies(snapshot lineChainCompileSnapshot, now time.Time) lineChainCompileSnapshot {
+	snapshot.Policies = make(map[string]vpnUserPolicy, len(snapshot.Users))
+	for id, identity := range snapshot.Users {
+		snapshot.Policies[id] = s.vpnUserPolicyAt(identity, now)
+	}
+	return snapshot
 }
 
 const (

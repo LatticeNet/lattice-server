@@ -114,13 +114,23 @@ func (s *Server) usageIngest(ctx *usageAttributionContext, snapshot, previous mo
 			ub.Uplink += c.Uplink
 			ub.Downlink += c.Downlink
 			line.Users[row.UserID] = ub
+			// The rule that counted the row says whether its bytes are
+			// proven to be this identity's. A binding row gives the whole
+			// inbound to the one identity bound to it, so it is counted
+			// toward the quota but not as proof.
+			proof := int64(0)
+			if row.AttributionProof == usageProofProof {
+				proof = c.total()
+			}
 			u := out.dayUser(row.UserID, day)
 			u.Uplink += c.Uplink
 			u.Downlink += c.Downlink
+			u.Proof += proof
 			u.LastSeenAt = now
 			bl := u.ByLine[row.LineHashID]
 			bl.Uplink += c.Uplink
 			bl.Downlink += c.Downlink
+			bl.Proof += proof
 			bl.LastSeenAt = now
 			u.ByLine[row.LineHashID] = bl
 			if row.Attribution != usageAttributionNamed {
@@ -164,10 +174,12 @@ func (s *Server) usageIngest(ctx *usageAttributionContext, snapshot, previous mo
 				u := out.dayUser(userID, day)
 				u.Uplink += c.Uplink
 				u.Downlink += c.Downlink
+				u.Proof += c.total()
 				u.LastSeenAt = now
 				bl := u.ByLine[hash]
 				bl.Uplink += c.Uplink
 				bl.Downlink += c.Downlink
+				bl.Proof += c.total()
 				bl.LastSeenAt = now
 				u.ByLine[hash] = bl
 			}
@@ -180,7 +192,9 @@ func (s *Server) usageIngest(ctx *usageAttributionContext, snapshot, previous mo
 		attribute(f.Line.Tag, f, usageLineTraffic{Inbound: total, Named: namedByLine[hash]})
 	}
 
-	// Legacy path: users whose bytes arrived without a direction.
+	// Legacy path: users whose bytes arrived without a direction. Each is a
+	// per-user counter the node keeps under that user's own name, which is
+	// proof in the same sense a named counter is.
 	for acct, delta := range legacyDelta {
 		if delta <= 0 || out.Split[acct] {
 			continue
@@ -191,11 +205,13 @@ func (s *Server) usageIngest(ctx *usageAttributionContext, snapshot, previous mo
 		}
 		u := out.dayUser(userID, day)
 		u.Downlink += delta
+		u.Proof += delta
 		u.LastSeenAt = now
 		for hash, byUser := range lineUserDelta {
 			if v := byUser[acct]; v > 0 {
 				bl := u.ByLine[hash]
 				bl.Downlink += v
+				bl.Proof += v
 				bl.LastSeenAt = now
 				u.ByLine[hash] = bl
 			}
@@ -281,55 +297,32 @@ func (s *Server) quotaEvaluate(user model.ProxyUser, vpnUser *VpnUser, now time.
 }
 
 // vpnUserQuotaProjection is what an identity's policy says about one of its
-// ProxyUser rows at now. It overwrites Enabled, ExpiresAt and the limit
-// (QuotaBytes) from the identity, UsedBytes with the usage the quota is
-// measured with (quotaUsedBytes, reading the row's UsedBytes as the lifetime
-// running total), and Status with what those give, and returns the period
+// ProxyUser rows at now: decideVpnUserPolicy over the usage the quota is
+// measured with, reading the row's UsedBytes as the lifetime running total
+// and adding pending, the report being ingested, to a monthly period's rows,
+// written back onto the row (vpnUserPolicy.applyTo). It returns the period
 // key quota alerts carry. Every figure is read at call time. quotaEvaluate
 // alerts from it and the managed render keeps or drops the identity's rows by
-// it, so the alert and the config a node is told to run cannot disagree.
+// it, so the alert and the config a node is told to run cannot disagree. The
+// proven part of the usage is not read here: alerts do not need it, and a
+// lifetime quota would pay for it on every report.
 func (s *Server) vpnUserQuotaProjection(row model.ProxyUser, vpnUser VpnUser, now time.Time, pending usageCounter) (model.ProxyUser, string) {
-	row.Enabled = vpnUser.Enabled
-	row.ExpiresAt = vpnUser.ExpiresAt
-	row.TrafficLimitBytes = vpnUser.QuotaBytes
-	period := ""
-	if row.TrafficLimitBytes > 0 {
-		row.UsedBytes, period = s.quotaUsedBytes(vpnUser, row.UsedBytes, now, pending)
+	usage := vpnUserQuotaUsage{}
+	if vpnUser.QuotaBytes > 0 {
+		var rows []store.UsageDayUser
+		if start, _, ok := vpnUserQuotaPeriod(vpnUser, now); ok {
+			rows = s.usageDayUserRows(vpnUser.ID, start, now)
+		}
+		usage = vpnUserQuotaMeasure(vpnUser, row.UsedBytes, rows, false, now, pending)
 	}
-	row.Status = derivedProxyUserStatusAt(row, now)
-	return row, period
+	return decideVpnUserPolicy(vpnUser, usage, now).applyTo(row), usage.PeriodKey
 }
 
-// vpnUserPolicyRow is the identity's policy at now as a row of its own: what
-// vpnUserQuotaProjection gives over the lifetime total on the identity's
-// accounting record, the legacy record for a migrated identity and the
-// canonical projection otherwise. Every managed render row of the identity
-// carries these figures, and a line plan refuses an identity whose Status
-// here is not active.
+// vpnUserPolicyRow is the identity's policy at now (vpnUserPolicyAt) as a row
+// of its own, over the lifetime total on the identity's accounting record.
+// Every managed render row of the identity carries these figures.
 func (s *Server) vpnUserPolicyRow(u VpnUser, now time.Time) model.ProxyUser {
-	acct, _ := s.store.ProxyUser(firstNonEmpty(strings.TrimSpace(u.MigratedFromProxyUser), u.ID))
-	row, _ := s.vpnUserQuotaProjection(model.ProxyUser{UsedBytes: acct.UsedBytes}, u, now, usageCounter{})
-	return row
-}
-
-// quotaUsedBytes is the usage an identity's quota is measured with, and the
-// period key its alerts carry (empty for a lifetime quota):
-//   - a monthly quota: the identity's day rows for the current period plus
-//     pending, the report being ingested, which the rows do not hold yet. The
-//     read is bounded by one period and matches the Users page's
-//     used_period_bytes.
-//   - a lifetime quota: accountTotal, UsedBytes on the identity's accounting
-//     record (the legacy record for a migrated identity), a running total
-//     ingestion advances on every report, this one included, and never
-//     prunes. Day rows are kept for UsageDayRetentionDays only, so summing
-//     them would turn a lifetime quota into "the last 400 days" and read up to
-//     400 rows per user on every usage report.
-func (s *Server) quotaUsedBytes(vpnUser VpnUser, accountTotal int64, now time.Time, pending usageCounter) (int64, string) {
-	if start, _, ok := vpnUserQuotaPeriod(vpnUser, now); ok {
-		used, _ := s.periodUsage(vpnUser.ID, start, now)
-		return used.total() + pending.total(), store.UsageDay(start)
-	}
-	return accountTotal, ""
+	return s.vpnUserPolicyAt(u, now).applyTo(model.ProxyUser{UsedBytes: s.vpnUserAccountTotal(u)})
 }
 
 // vpnUsersByAccounting indexes identities by the ProxyUser projection id that
@@ -784,6 +777,11 @@ type vpnUserUsageView struct {
 	Last7d             []int64             `json:"last_7d"`
 	LastSeenAt         string              `json:"last_seen_at,omitempty"`
 	AllocatedNodes     []allocatedNodeView `json:"allocated_nodes"`
+	// Policy is the server's decision for the identity (decideVpnUserPolicy)
+	// with the figures it used. It is what a client shows as over quota,
+	// expired or suspended; used_period_bytes measures a lifetime quota over
+	// the retained day rows and can disagree with it.
+	Policy vpnUserPolicyView `json:"policy"`
 }
 
 // vpnUserUsageViews enriches identities with their usage. One context, one
@@ -854,18 +852,32 @@ func (s *Server) vpnUserUsageViews(users []VpnUser, now time.Time) []vpnUserUsag
 	out := make([]vpnUserUsageView, 0, len(users))
 	for i, u := range users {
 		view := vpnUserUsageView{vpnUserView: toVpnUserView(u), Last7d: make([]int64, 7), AllocatedNodes: []allocatedNodeView{}}
+		// toVpnUserView keeps the bindings' order, so each view row is its
+		// binding's.
+		for i, b := range u.Bindings {
+			f, known := ctx.byHash[b.LineHashID]
+			var ln Line
+			if known && f != nil {
+				ln = f.Line
+			}
+			view.Bindings[i].Credential = lineBindingCredentialState(u, b, ln, known && f != nil)
+		}
 		acct := ctx.accounting[u.ID]
 		if acct == "" {
 			acct = u.ID
 		}
 		var lastSeen time.Time
+		var accountTotal int64
 		// The legacy ProxyUser projection still carries last_seen_at, and it
 		// sees reports the day rows do not. Its UsedBytes is the other
-		// accounting path and is deliberately not read here: it is written
-		// per report from the node's own deltas and diverges from the day
-		// rows, which is what put a total below its own period on this screen.
+		// accounting path and is deliberately not shown as a total here: it
+		// is written per report from the node's own deltas and diverges from
+		// the day rows, which is what put a total below its own period on
+		// this screen. It is what a lifetime quota is measured with, so the
+		// policy below reads it.
 		if pu, ok := s.store.ProxyUser(acct); ok {
 			lastSeen = pu.LastSeenAt
+			accountTotal = pu.UsedBytes
 		}
 		p := periods[i]
 		rows, err := s.store.UsageDayUserRows(u.ID, retainedDay, store.UsageDay(today))
@@ -899,6 +911,10 @@ func (s *Server) vpnUserUsageViews(users []VpnUser, now time.Time) []vpnUserUsag
 				byLine[hash] = cur
 			}
 		}
+		// rows reach back to retention, which covers a monthly period and
+		// gives a lifetime quota its proven part, so the policy needs no read
+		// of its own.
+		view.Policy = decideVpnUserPolicy(u, vpnUserQuotaMeasure(u, accountTotal, rows, true, now, usageCounter{}), now).view()
 		view.UsedTotalBytes = totalUsed.total()
 		view.UsedTotalFrom = retained.UTC().Format(usageWireTimeFmt)
 		view.UsedTotalTruncated = u.CreatedAt.Before(retained)

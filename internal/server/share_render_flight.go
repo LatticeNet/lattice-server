@@ -101,7 +101,7 @@ func (s *Server) renderShareOnce(ctx context.Context, share model.SubscriptionSh
 		attempts = 2
 	}
 	for attempt := 0; attempt < attempts; attempt++ {
-		rendered, err := s.renderShare(ctx, share, plan.Format, plan.UAClass, plan.Variant)
+		rendered, err := s.renderShare(ctx, share, plan.Format, plan.UAClass, plan.Variant, plan.CoreUser)
 		if err != nil {
 			s.logger.Printf("subscription share: render failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(err))
 			return shareRenderOutcome{deny: "subscription_render_failed"}

@@ -54,6 +54,11 @@ type shareRenderPlan struct {
 	// (probable, a pinned record may override it).
 	Target      string
 	TargetKnown bool
+	// CoreUser is a core proxy-user source's user, resolved once for the
+	// request so the render reads the identity policy once. Nil for a plugin
+	// source, and nil when the user no longer resolves, which the render
+	// refuses.
+	CoreUser *model.ProxyUser
 }
 
 // formatImpliedTarget names the client a format value can only mean. Before

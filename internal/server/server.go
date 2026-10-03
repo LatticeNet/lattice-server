@@ -445,6 +445,12 @@ type Server struct {
 	// simply repopulates it from the next round of reports.
 	singboxInvMu sync.RWMutex
 	singboxInv   map[string]model.SingBoxInventory
+	// lineTemplateSyncMu serialises syncLineClientTemplates, and
+	// lineTemplatePending holds, per line hash, a changed template seen at
+	// one sync and not yet confirmed by the next (syncLineClientTemplates
+	// says why). In memory only: a restart costs one more minute of lag.
+	lineTemplateSyncMu  sync.Mutex
+	lineTemplatePending map[string]store.LineClientTemplate
 	// singboxDiscoverAudit tracks the last audited discovery fingerprint per
 	// node so automatic inventory reports do not append an audit row, and
 	// therefore rewrite the encrypted JSON store, on every agent poll.
@@ -685,6 +691,13 @@ func New(opts Options) (*Server, error) {
 	if err := s.migrateProxyUsersToVpnUsers(); err != nil {
 		return nil, fmt.Errorf("migrate vpn user secrets: %w", err)
 	}
+	// Once per store, after the identities exist: what approval history says
+	// each binding's node holds (identity-sub P3). The field is advisory, so
+	// a failure is logged rather than fatal: its marker is written only with
+	// a successful backfill, so the next boot tries again.
+	if err := s.backfillLineUserAppliedCredentials(); err != nil {
+		s.logger.Printf("vpn-core: %v; the next boot retries it", err)
+	}
 	// Before the scheduler's first run, so machines that already carry a
 	// renewal date are reminded from the first evaluation.
 	s.applyReminderDefaults()
@@ -734,6 +747,7 @@ func New(opts Options) (*Server, error) {
 			s.wakeNotifyOutbox()
 		}
 		s.startShareFetchStatsFlush()
+		s.startLineClientTemplateSync()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()

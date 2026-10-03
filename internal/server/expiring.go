@@ -166,9 +166,7 @@ func (s *Server) expiringFor(p principal, now time.Time, within int) expiringRes
 				item.Subtitle = strings.TrimSpace(user.Name)
 			}
 			if user.QuotaBytes > 0 {
-				acct := firstNonEmpty(strings.TrimSpace(user.MigratedFromProxyUser), user.ID)
-				record, _ := s.store.ProxyUser(acct)
-				used, _ := s.quotaUsedBytes(user, record.UsedBytes, now, usageCounter{})
+				used := s.vpnUserPolicyAt(user, now).Usage.Used
 				quota := user.QuotaBytes
 				item.UsedBytes, item.QuotaBytes = &used, &quota
 			}

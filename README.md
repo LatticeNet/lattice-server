@@ -547,7 +547,9 @@ Use the compose file and deployment guide in the umbrella repository:
   `version` it was read at (a stale one gets 409), and is audited as
   `monitor.latency.config`. Until a save the defaults hold: probes on, every
   60 s, from each node named `cd-hs-sh` to each node whose country is set and
-  is not `CN`. The control plane turns the configuration into tcp monitors
+  is not `CN`. The default source is found by name at every plan, so a node
+  renamed to `cd-hs-sh` becomes a source within one sweep; a saved
+  configuration names its sources by node id and ends that. The control plane turns the configuration into tcp monitors
   marked `managed_by: "latency"`, one per target and assigned to its sources,
   which agents run like any other monitor; it re-plans every two minutes and
   after each save, writes the state file only when a generated monitor

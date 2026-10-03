@@ -142,6 +142,42 @@ func TestUnacknowledgeOwesTheCancelledOpenAgain(t *testing.T) {
 	expectNotices(t, "once", h.sweep())
 }
 
+// An acknowledgement recorded before AckCancelledOpen existed carries no
+// flag. Undoing one whose open message never went out (a window held it)
+// still owes that message, exactly once, and the incident is then told open,
+// which is what its escalation waits for.
+func TestUnacknowledgeOwesAnOpenNeverSentWithoutTheFlag(t *testing.T) {
+	h := newIncidentHarness(t, "a")
+	post, _, _ := incidentPoster(h)
+	if err := h.f.st.PutMaintenanceWindow(store.MaintenanceWindow{
+		ID: "mw-1", Name: "kernel upgrade", NodeIDs: []string{"a"},
+		StartsAt: h.now(), EndsAt: h.now().Add(30 * time.Minute), CreatedAt: h.now(),
+	}, h.now()); err != nil {
+		t.Fatal(err)
+	}
+	h.openService("a")
+	expectNotices(t, "held by the window", h.sweep())
+	// The record as the previous version wrote it: acknowledged, the held
+	// open dropped, nothing remembered.
+	inc := h.incident(EventServiceDown, "a")
+	inc.State, inc.AckedBy, inc.AckedAt = store.IncidentStateAcknowledged, "user-1", h.now()
+	inc.OwedOpen, inc.AckCancelledOpen = false, false
+	if err := h.f.st.PutIncidents(inc); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.advance(31 * time.Minute)
+	expectNotices(t, "the window ended on an acknowledged incident", h.sweep())
+
+	if code, v := post("/api/incidents/unack", inc.ID); code != http.StatusOK || v.State != store.IncidentStateOpen {
+		t.Fatalf("unack: %d %+v", code, v)
+	}
+	expectNotices(t, "after the undo", h.sweep(), "service.down: sing-box down on name-a")
+	expectNotices(t, "once", h.sweep())
+	if got := h.incident(EventServiceDown, "a"); got.Notified != store.IncidentNotifiedOpen || got.OpenNotifiedAt.IsZero() {
+		t.Fatalf("the incident was not told open: %+v", got)
+	}
+}
+
 // A closed incident keeps its acknowledgement; an incident that is not
 // acknowledged is left as it is; the route needs monitor:admin on the node.
 func TestUnacknowledgeRefusesAClosedIncident(t *testing.T) {

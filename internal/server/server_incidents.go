@@ -416,7 +416,12 @@ func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p p
 	ackedAt := inc.AckedAt
 	if inc.State == store.IncidentStateAcknowledged {
 		inc.State = store.IncidentStateOpen
-		inc.OwedOpen = inc.OwedOpen || inc.AckCancelledOpen
+		// The open message is owed when the acknowledgement cancelled it, and
+		// also whenever the phone was never told this occurrence is open: an
+		// acknowledgement recorded before AckCancelledOpen existed carries no
+		// flag, and the incident would otherwise stay open, unsent and, since
+		// escalation runs from the open message, never escalated.
+		inc.OwedOpen = inc.OwedOpen || inc.AckCancelledOpen || inc.Notified != store.IncidentNotifiedOpen
 		inc.AckCancelledOpen = false
 		inc.AckedBy, inc.AckedAt = "", time.Time{}
 		inc.UpdatedAt = now

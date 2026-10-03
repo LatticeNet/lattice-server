@@ -229,7 +229,7 @@ func agentLoopProblems(rec agentHealthRecord, serverNow time.Time) []agentLoopPr
 		out = append(out, agentLoopProblem{
 			kind:     agentProblemLinechainBlocked,
 			since:    clock.toServer(since),
-			reason:   fmt.Sprintf("durable task recovery has been blocked for %s (%s), so the agent skips every cycle", livenessSpan(age), h.LinechainBlocked),
+			reason:   fmt.Sprintf("durable task recovery has been blocked for %s, so the agent skips every cycle", livenessSpan(age)),
 			status:   age >= agentBlockedStatusAfter,
 			incident: age >= agentBlockedIncidentHold,
 			opensAt:  clock.toServer(since).Add(agentBlockedIncidentHold),
@@ -287,9 +287,11 @@ func agentLoopProblems(rec agentHealthRecord, serverNow time.Time) []agentLoopPr
 		if step.LastOKAt.IsZero() {
 			reason = fmt.Sprintf("step %s has failed %d times in a row and has not succeeded since the agent started", name, step.ConsecutiveErrors)
 		}
-		if step.LastError != "" {
-			reason += " (" + step.LastError + ")"
-		}
+		// The step's last error stays out of the reason, as the linechain
+		// error does above. A reason is paged (agent.stalled) and shown to
+		// every node reader, and an error is text the agent chose that may
+		// carry a URL with a token in it; the node view carries both errors
+		// in the agent's payload for whoever reads the node.
 		out = append(out, agentLoopProblem{
 			kind: agentProblemStepStale, step: name, since: clock.toServer(since), reason: reason,
 			status: true, incident: true, opensAt: clock.toServer(since).Add(agentStepStaleAfter),

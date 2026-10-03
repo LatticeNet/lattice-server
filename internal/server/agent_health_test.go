@@ -44,14 +44,14 @@ func TestAgentLoopProblemsReadTheAgentsClock(t *testing.T) {
 		{"no first cycle", rec(model.AgentHealth{StartedAt: agent.Add(-6 * time.Minute)}), 0,
 			[]want{{kind: agentProblemStalled, status: true, incident: true, sinceBeforeServer: 6 * time.Minute}}},
 		{"linechain blocked briefly", rec(model.AgentHealth{LinechainBlocked: "journal 3 unreadable", LinechainBlockedSince: agent.Add(-30 * time.Second), CycleCompletedAt: agent.Add(-10 * time.Minute)}), 0,
-			[]want{{kind: agentProblemLinechainBlocked, reasonContains: "journal 3 unreadable", sinceBeforeServer: 30 * time.Second}}},
+			[]want{{kind: agentProblemLinechainBlocked, reasonContains: "durable task recovery has been blocked for", sinceBeforeServer: 30 * time.Second}}},
 		{"linechain blocked for long", rec(model.AgentHealth{LinechainBlocked: "journal 3 unreadable", LinechainBlockedSince: agent.Add(-6 * time.Minute)}), 0,
 			[]want{{kind: agentProblemLinechainBlocked, status: true, incident: true, sinceBeforeServer: 6 * time.Minute}}},
 		{"a core step stale", rec(model.AgentHealth{CycleCompletedAt: agent, Steps: map[string]model.AgentLoopStep{
 			model.AgentStepConfig: {LastOKAt: agent.Add(-20 * time.Minute), ConsecutiveErrors: 40, LastError: "502"},
 			model.AgentStepUsage:  {ConsecutiveErrors: 400, LastError: "no collector"},
 		}}), 0,
-			[]want{{kind: agentProblemStepStale, status: true, incident: true, reasonContains: "step config has failed 40 times in a row and last succeeded 20 min ago (502)", sinceBeforeServer: 20 * time.Minute}}},
+			[]want{{kind: agentProblemStepStale, status: true, incident: true, reasonContains: "step config has failed 40 times in a row and last succeeded 20 min ago", sinceBeforeServer: 20 * time.Minute}}},
 		{"a core step failing but recent", rec(model.AgentHealth{CycleCompletedAt: agent, Steps: map[string]model.AgentLoopStep{
 			model.AgentStepTasks: {LastOKAt: agent.Add(-5 * time.Minute), ConsecutiveErrors: 30},
 		}}), 0, nil},
@@ -66,6 +66,13 @@ func TestAgentLoopProblemsReadTheAgentsClock(t *testing.T) {
 			p := got[i]
 			if p.kind != w.kind || p.status != w.status || p.incident != w.incident || !strings.Contains(p.reason, w.reasonContains) || !p.since.Equal(server.Add(-w.sinceBeforeServer)) {
 				t.Errorf("%s: problem %d = %+v, want %+v", tc.name, i, p, w)
+			}
+			// Agent-supplied error text is paged with the reason, so it
+			// never goes into one.
+			for _, agentText := range []string{"502", "no collector", "journal 3 unreadable"} {
+				if strings.Contains(p.reason, agentText) {
+					t.Errorf("%s: reason %q carries the agent's error text %q", tc.name, p.reason, agentText)
+				}
 			}
 		}
 	}

@@ -49,9 +49,18 @@ func (s *Server) handleAgentSingBoxInventory(w http.ResponseWriter, r *http.Requ
 	}
 	inv := req.Inventory
 	inv.NodeID = req.NodeID // force from auth; never trust the body's node id
-	if inv.At.IsZero() {
-		inv.At = time.Now().UTC()
-	}
+	// The mirror's freshness is the control plane's to judge, so the inventory
+	// carries the time it arrived, not the time the node's clock printed.
+	// liveSingBoxInventories and the line-chain snapshot drop an inventory
+	// older than nodeOfflineThreshold; judged by the agent's stamp, a node
+	// whose clock runs 90 s behind had every report dropped on arrival, its
+	// lines vanished from the read model, its usage went unattributed, and
+	// every relay naming one of its lines as a downstream lost that name
+	// (legend-sg, 2026-10-03: about 130 s behind). The agent's stamp is only
+	// compared to say the clock is off.
+	receivedAt := s.now().UTC()
+	s.noteSingBoxInventoryClock(req.NodeID, inv.At, receivedAt)
+	inv.At = receivedAt
 	if inv.Nodes == nil {
 		inv.Nodes = []model.SingBoxNode{}
 	}
@@ -243,6 +252,9 @@ func (s *Server) removeSingBoxInventory(nodeID string) {
 	s.singboxDiscoverAuditMu.Lock()
 	delete(s.singboxDiscoverAudit, nodeID)
 	s.singboxDiscoverAuditMu.Unlock()
+	s.singboxClockMu.Lock()
+	delete(s.singboxClockNoted, nodeID)
+	s.singboxClockMu.Unlock()
 }
 
 // handleProxyDiscovered lists every live node's discovered on-box sing-box
@@ -281,4 +293,44 @@ func filterSingBoxInventoriesForPrincipal(inventories []model.SingBoxInventory, 
 		}
 	}
 	return out
+}
+
+// singBoxClockSkewNotice is how far a node's stamp may sit from the control
+// plane's clock before the server says so, and singBoxClockSkewRelog how long
+// an unchanged notice stays quiet.
+const (
+	singBoxClockSkewNotice = 30 * time.Second
+	singBoxClockSkewRelog  = time.Hour
+)
+
+// noteSingBoxInventoryClock logs, at most once an hour per node, that the
+// node's clock is off by more than singBoxClockSkewNotice. Freshness never
+// depends on it; the log is there so the operator fixes the node's time sync
+// before something that does read node time (task and monitor stamps) is
+// misread.
+func (s *Server) noteSingBoxInventoryClock(nodeID string, stamped, receivedAt time.Time) {
+	if stamped.IsZero() {
+		return
+	}
+	skew := receivedAt.Sub(stamped)
+	if skew < singBoxClockSkewNotice && skew > -singBoxClockSkewNotice {
+		return
+	}
+	s.singboxClockMu.Lock()
+	last, seen := s.singboxClockNoted[nodeID]
+	if seen && receivedAt.Sub(last) < singBoxClockSkewRelog {
+		s.singboxClockMu.Unlock()
+		return
+	}
+	if s.singboxClockNoted == nil {
+		s.singboxClockNoted = map[string]time.Time{}
+	}
+	s.singboxClockNoted[nodeID] = receivedAt
+	s.singboxClockMu.Unlock()
+	direction := "behind"
+	if skew < 0 {
+		direction, skew = "ahead of", -skew
+	}
+	s.logger.Printf("singbox: node %s stamps its inventory %s %s the control plane; freshness uses the receive time, but the node's clock needs fixing (time sync)",
+		nodeID, skew.Round(time.Second), direction)
 }

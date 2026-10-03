@@ -13,9 +13,8 @@ import (
 // live in the JSON state keyed by rule id, deleted with the rule and cleared
 // when the channel they name is deleted. When the SDK next changes, the field
 // moves onto model.NotifyRule and this map is migrated once. The offline
-// `migrate` round trip through the full bolt state does not carry the map,
-// as it already does not carry notify_webhooks; a fallback lost that way is
-// set again on the rule.
+// `migrate` round trip carries the map in the bolt meta bucket
+// (boltKeyNotifyRuleOptions).
 type NotifyRuleOptions struct {
 	// FallbackChannelID receives the rule's message when every primary
 	// channel of the rule failed it for good. It never equals one of the

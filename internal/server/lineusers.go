@@ -1017,23 +1017,33 @@ func (s *Server) lineUserApplyScript(approval model.Approval) string {
 	// fails with invalid_payload and exit 2, which is what every removal a102
 	// rendered did. The task view exposes only the script's digest and size,
 	// so the credential is no more visible than an add's.
+	script, err := adoptedLineUserScript(plan.Op, plan.Line, payload)
+	if err != nil {
+		return fail(err)
+	}
+	return script
+}
+
+// adoptedLineUserScript is the apply script for one adopted line-user op:
+// `sb --json user add|del <line> <payload>`, with the payload as JSON.
+func adoptedLineUserScript(op, line string, payload lineUserCredentialPayload) (string, error) {
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return fail(fmt.Errorf("encode payload: %v", err))
+		return "", fmt.Errorf("encode payload: %v", err)
 	}
 	var argv string
-	switch plan.Op {
+	switch op {
 	case lineUserOpAdd, lineUserOpUpdate:
-		argv = " --json user add " + shellQuote(plan.Line) + " " + shellQuote(string(payloadJSON))
+		argv = " --json user add " + shellQuote(line) + " " + shellQuote(string(payloadJSON))
 	case lineUserOpRemove:
-		argv = " --json user del " + shellQuote(plan.Line) + " " + shellQuote(string(payloadJSON))
+		argv = " --json user del " + shellQuote(line) + " " + shellQuote(string(payloadJSON))
 	default:
-		return fail(fmt.Errorf("invalid line-user op %q", plan.Op))
+		return "", fmt.Errorf("invalid line-user op %q", op)
 	}
 	return "set -e\n" +
 		"SB_BIN=\"${LATTICE_SINGBOX_BIN:-sb}\"\n" +
 		"command -v \"$SB_BIN\" >/dev/null 2>&1 || { echo " + shellQuote("lattice lineuser: sb binary not found") + " >&2; exit 1; }\n" +
-		"\"$SB_BIN\"" + argv + "\n"
+		"\"$SB_BIN\"" + argv + "\n", nil
 }
 
 // handleLineUserTaskResult reconciles a line-user approval once the agent
@@ -1050,6 +1060,17 @@ func (s *Server) handleLineUserTaskResult(r *http.Request, approval model.Approv
 		reason := result.Error
 		if reason == "" {
 			reason = fmt.Sprintf("line-user task exited %d", result.ExitCode)
+		}
+		// The exit code alone does not say what to fix. The script prints
+		// why it refused, and the operator reads it here: a removal that
+		// would leave a socks line open to anyone, a name two entries share,
+		// another user call holding the node's lock.
+		if code, message, ok := lineUserScriptError(result.Stdout); ok {
+			reason += ": the node script refused with " + code
+			if message != "" {
+				reason += ": " + message
+			}
+			metadata["script_error"] = code
 		}
 		// Execution failure is not a decision: return the approval to pending
 		// with the reason so the operator can fix the cause and re-approve.
@@ -1350,6 +1371,36 @@ func lineUserScriptCounts(stdout string) (before, after int, ok bool) {
 		return *out.Before, *out.After, true
 	}
 	return 0, 0, false
+}
+
+// lineUserScriptErrorCode is the shape of the error codes the node script's
+// json_err prints (invalid_user, last_user_open_proxy, busy). Anything else
+// on that line is not repeated onto the approval.
+var lineUserScriptErrorCode = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+
+// lineUserScriptError reads the line the node script prints when it refuses,
+// {"ok":false,"error":"<code>","message":"<why>"}, from the end of the task's
+// stdout: the last line that holds a JSON object decides. ok is false when
+// that line is not such a refusal, or there is none. The message comes from
+// the node, so it is cut to a bound before it is kept on the approval.
+func lineUserScriptError(stdout string) (code, message string, ok bool) {
+	lines := strings.Split(strings.TrimSpace(stdout), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var out struct {
+			OK      *bool  `json:"ok"`
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(line), &out) != nil || out.OK == nil || *out.OK || !lineUserScriptErrorCode.MatchString(out.Error) {
+			return "", "", false
+		}
+		return out.Error, truncateMetadataValue(strings.Join(strings.Fields(out.Message), " "), 240), true
+	}
+	return "", "", false
 }
 
 // lineUserOvermatch says what went wrong when the script's counts show it

@@ -481,3 +481,164 @@ func TestADeletedUsersRemovalByNameRunsOnTheFork(t *testing.T) {
 		sb.expectLocked(2)
 	})
 }
+
+// socksContractCredential is an identity's socks credential. The store
+// refuses socks credentials (store.ValidateVpnUserCredentialSecret), so no
+// plan_add reaches a socks line today; these cases pin what the renderer
+// and the fork do with one for the change that admits them, and run the one
+// plan that can reach a socks line now, a deleted user's removal by name.
+var socksContractCredential = VpnCredential{Protocol: "socks", Password: "id-socks-secret"}
+
+// socksContractLine is a server with one adopted socks line on node-a,
+// tagged "line-socks".
+func socksContractLine(t *testing.T) (*Server, Line) {
+	t.Helper()
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	if err := srv.store.UpsertNode(model.Node{ID: "node-a", Name: "Node A", PublicIP: "203.0.113.5"}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv = map[string]model.SingBoxInventory{"node-a": {NodeID: "node-a", At: srv.now(), Status: "ok",
+		Nodes: []model.SingBoxNode{{Name: "line-socks", Protocol: "socks", Network: "tcp", Address: "203.0.113.5", Port: "1080", UserKnown: true, UserCount: 1}}}}
+	srv.singboxInvMu.Unlock()
+	srv.invalidateLineReadModel()
+	return srv, findLine(t, srv.buildLineGroups(), "node-a", "line-socks")
+}
+
+// The socks payload the server renders against the fork. A socks user is a
+// username and a password: the core decodes it strictly and fails the whole
+// file on "name", which is how every Lattice socks add failed on alpha.7
+// (config_invalid on a real node). The stub core here accepts anything, so
+// the test reads the entry the fork wrote. The add appends exactly that
+// entry with the on-box name as its username, the removal takes it back
+// off, and removing the line's last user is refused with
+// last_user_open_proxy, since sing-box serves a socks inbound with no users
+// to anyone.
+func TestSocksLineUsersRunAgainstTheFork(t *testing.T) {
+	forEachForkLockMode(t, func(t *testing.T, sb *forkSB) {
+		_, line := socksContractLine(t)
+		u := VpnUser{ID: "vpnuser_forkcontractuser", Credentials: []VpnCredential{socksContractCredential}}
+		name := userLineName(u.ID, line.LineUUID)
+		payload, err := lineUserCredential(u, "socks", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		script := func(op string) string {
+			s, err := adoptedLineUserScript(op, line.Tag, payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		}
+		owner := map[string]string{"username": "owner", "password": "owner-socks"}
+		lattice := map[string]string{"username": name, "password": socksContractCredential.Password}
+		sb.writeLine(line.Tag, "socks", owner)
+
+		if out, code := sb.run(script(lineUserOpAdd)); code != 0 {
+			t.Fatalf("the fork refused the socks add (exit %d):\n%s", code, out)
+		}
+		if users := sb.users(line.Tag); len(users) != 2 || !reflect.DeepEqual(users[0], owner) || !reflect.DeepEqual(users[1], lattice) {
+			t.Fatalf("after the add the line holds %v, want the owner then exactly %v", users, lattice)
+		}
+		if out, code := sb.run(script(lineUserOpRemove)); code != 0 {
+			t.Fatalf("the fork refused the socks removal (exit %d):\n%s", code, out)
+		}
+		if users := sb.users(line.Tag); len(users) != 1 || !reflect.DeepEqual(users[0], owner) {
+			t.Fatalf("after the removal the line holds %v, want only the owner", users)
+		}
+
+		sb.writeLine(line.Tag, "socks", lattice)
+		out, code := sb.run(script(lineUserOpRemove))
+		if code != 2 || parseForkUserResult(t, out).Error != "last_user_open_proxy" {
+			t.Fatalf("removing the last socks user: exit %d %q, want exit 2 with last_user_open_proxy", code, out)
+		}
+		if users := sb.users(line.Tag); len(users) != 1 || !reflect.DeepEqual(users[0], lattice) {
+			t.Fatalf("a refused removal changed the line: %v", users)
+		}
+		sb.expectLocked(3)
+	})
+}
+
+// The same refusal through an approval: a deleted user's removal by name
+// from a socks line it is the last user of. The fork refuses it, and the
+// approval goes back to pending with the fork's code and message, so the
+// operator reads why and what to do (add another user first, or delete the
+// line) rather than an exit code.
+func TestRemovingTheLastSocksUserReturnsTheApprovalWithTheForksReason(t *testing.T) {
+	forEachForkLockMode(t, func(t *testing.T, sb *forkSB) {
+		srv, line := socksContractLine(t)
+		userID := "vpnuser_sockslastuserabc"
+		name := userLineName(userID, line.LineUUID)
+		// The history an applied socks add would leave; see
+		// socksContractCredential for why no plan can make it today.
+		add := lineUserCredentialPayload{Name: name, Username: name, Password: socksContractCredential.Password}
+		sha, err := lineUserCredentialSHA(add)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := srv.fileLineUserPlan(lineUserTestPrincipal(), lineUserPlan{
+			Op: lineUserOpAdd, Track: lineUserTrackAdopted, NodeID: line.NodeID, Line: line.Tag, LineHashID: line.LineHashID,
+			LineUUID: line.LineUUID, UserID: userID, UserName: name, Protocol: "socks", CredentialSHA256: sha, Summary: "socks add",
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var filed struct {
+			Approval model.Approval `json:"approval"`
+		}
+		if err := json.Unmarshal(out, &filed); err != nil {
+			t.Fatal(err)
+		}
+		filed.Approval.Status, filed.Approval.UpdatedAt = model.ApprovalApplied, srv.now()
+		if err := srv.store.UpsertApproval(filed.Approval); err != nil {
+			t.Fatal(err)
+		}
+		lattice := map[string]string{"username": name, "password": socksContractCredential.Password}
+		sb.writeLine(line.Tag, "socks", lattice)
+
+		srv.replaceAgentCapabilities("node-a", []string{singBoxUserDelByNameCapability})
+		removeApproval, removeTask := approvedScript(t, srv, lineUserOpRemove, userID, line)
+		stdout, code := sb.run(removeTask.Script)
+		if code != 2 || parseForkUserResult(t, stdout).Error != "last_user_open_proxy" {
+			t.Fatalf("the fork must refuse removing the last socks user: exit %d\n%s", code, stdout)
+		}
+		if users := sb.users(line.Tag); len(users) != 1 || !reflect.DeepEqual(users[0], lattice) {
+			t.Fatalf("a refused removal changed the line: %v", users)
+		}
+		got := reportResult(t, srv, removeApproval, removeTask, stdout, code)
+		if got.Status != model.ApprovalPending || !strings.Contains(got.Reason, "exited 2: the node script refused with last_user_open_proxy: ") ||
+			!strings.Contains(got.Reason, "would leave it open to anyone; add another user first, or delete the line") {
+			t.Fatalf("approval after the refusal: status %q reason %q, want pending with the fork's code and message", got.Status, got.Reason)
+		}
+		failed := lineUserAudit(srv, "vpnuser.line.failed", removeApproval.ID)
+		if len(failed) != 1 || failed[0].Metadata["script_error"] != "last_user_open_proxy" {
+			t.Fatalf("failed audit = %+v, want one naming the script's error", failed)
+		}
+		sb.expectLocked(1)
+	})
+}
+
+// lineUserScriptError takes the node script's refusal from the end of the
+// task's output and nothing else: a last JSON line that is not a refusal,
+// a code that is not one, and output with no JSON line give nothing, and a long message is cut.
+func TestLineUserScriptErrorReadsOnlyTheScriptsRefusal(t *testing.T) {
+	long := strings.Repeat("x", 600)
+	for _, tc := range []struct {
+		stdout, code, message string
+		ok                    bool
+	}{
+		{`{"ok":false,"error":"busy","message":"another sb user call on this node holds the user lock"}`, "busy", "another sb user call on this node holds the user lock", true},
+		{"progress\n" + `{"ok":false,"error":"invalid_user","message":"payload does not contain the credential"}` + "\n", "invalid_user", "payload does not contain the credential", true},
+		{`{"ok":false,"error":"parked_stale","message":"repeat the del"}` + "\n" + `{"ok":true,"action":"del"}`, "", "", false},
+		{`{"ok":true,"action":"del","user_count_before":2,"user_count_after":1}`, "", "", false},
+		{`{"ok":false,"error":"Not A Code; rm -rf","message":"x"}`, "", "", false},
+		{`{"error":"busy"}`, "", "", false},
+		{"sb: command not found", "", "", false},
+		{`{"ok":false,"error":"config_invalid","message":"` + long + `"}`, "config_invalid", strings.Repeat("x", 240) + "...", true},
+	} {
+		code, message, ok := lineUserScriptError(tc.stdout)
+		if code != tc.code || message != tc.message || ok != tc.ok {
+			t.Fatalf("lineUserScriptError(%.60q) = %q %q %v, want %q %q %v", tc.stdout, code, message, ok, tc.code, tc.message, tc.ok)
+		}
+	}
+}

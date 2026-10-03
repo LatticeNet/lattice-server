@@ -5272,7 +5272,10 @@ func (s *Store) MonitorsForNode(nodeID string) []model.Monitor {
 // DeleteMonitor removes a monitor and its result history. The hot store's
 // rows go first: if that fails nothing has changed, and if the state write
 // fails after it the monitor survives with an empty history, which a retry
-// finishes deleting.
+// finishes deleting. Its incidents go only after the state write commits,
+// so a failed write never leaves the monitor without its open incidents and
+// owed recoveries; should that delete fail, the incident sweep closes what
+// it finds open for a monitor that no longer exists.
 func (s *Store) DeleteMonitor(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5284,9 +5287,6 @@ func (s *Store) DeleteMonitor(id string) error {
 			return err
 		}
 	}
-	if err := s.deleteIncidentsLocked(func(inc Incident) bool { return inc.MonitorID == id }); err != nil {
-		return err
-	}
 	delete(s.state.Monitors, id)
 	delete(s.state.MonResults, id)
 	for key := range s.monitorPersistedAt {
@@ -5294,7 +5294,11 @@ func (s *Store) DeleteMonitor(id string) error {
 			delete(s.monitorPersistedAt, key)
 		}
 	}
-	return s.Save()
+	committed, err := s.persistState(s.jsonPersistState())
+	if committed {
+		_ = s.deleteIncidentsLocked(func(inc Incident) bool { return inc.MonitorID == id })
+	}
+	return err
 }
 
 // UpsertLogSource creates or updates a log source definition.

@@ -301,6 +301,16 @@ func (s *Store) AddMonitorResult(r model.MonitorResult) (MonitorResultOutcome, e
 	return out[0], nil
 }
 
+// recordMonitorResultsLocked writes one request's admitted results.
+//
+// yagni: each call is one bolt Update, so one fsync, taken while s.mu is
+// held, and the monitors list decodes every latest record under the same
+// lock. Released agents post one result per request: at 34 nodes and a 30 s
+// interval that is about one write a second. The ceiling is a fleet or a
+// monitor set large enough that these writes queue behind each other and
+// behind every other store call. The upgrade
+// path is agents sending on their beat through the batch route (one write per
+// node per beat), then reading the latest bucket in a bolt View without s.mu.
 func (s *Store) recordMonitorResultsLocked(records []MonitorResultRecord) ([]MonitorResultOutcome, error) {
 	if len(records) == 0 {
 		return nil, nil

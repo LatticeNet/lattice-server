@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,14 +50,27 @@ type Line struct {
 	// permanent property of the config rather than a failed attribution, and the
 	// two are worth telling apart on screen. Both zero means the node did not
 	// report, which is not the same as a line with no credentials.
-	NamedUsers   int    `json:"named_users,omitempty"`
-	UnnamedUsers int    `json:"unnamed_users,omitempty"`
-	Type         string `json:"type,omitempty"` // protocol
-	Transport    string `json:"transport,omitempty"`
-	Security     string `json:"security,omitempty"`
-	ListenHost   string `json:"listen_host,omitempty"`
-	ListenPort   int    `json:"listen_port,omitempty"`
-	PublicHost   string `json:"public_host,omitempty"`
+	NamedUsers   int `json:"named_users,omitempty"`
+	UnnamedUsers int `json:"unnamed_users,omitempty"`
+	// ParkedUsers and ParkedNames are the users the node script has parked on
+	// this line (sb user park, lr00rl/sing-box v1.24.3-alpha.8): taken off the
+	// line, so it no longer admits them, with their credentials kept in a
+	// root-only file outside conf/ until they are unparked. They are what the
+	// node holds, not what Lattice last asked for. The count covers every
+	// parked user; the names are Lattice's own u_<16 hex> ones only, the only
+	// ones the node lists, since any other name may be a person's.
+	// ParkedError is "parked_invalid" when the node found that file damaged,
+	// which makes the count unknown rather than zero. All three are empty when
+	// the node reports none, which every script before alpha.8 does.
+	ParkedUsers int      `json:"parked_users,omitempty"`
+	ParkedNames []string `json:"parked_names,omitempty"`
+	ParkedError string   `json:"parked_error,omitempty"`
+	Type        string   `json:"type,omitempty"` // protocol
+	Transport   string   `json:"transport,omitempty"`
+	Security    string   `json:"security,omitempty"`
+	ListenHost  string   `json:"listen_host,omitempty"`
+	ListenPort  int      `json:"listen_port,omitempty"`
+	PublicHost  string   `json:"public_host,omitempty"`
 	// PublicPort is where the outside actually reaches this line, when that
 	// differs from ListenPort. Declared by the node, because a mapping that
 	// lives in a provider's router cannot be read from the config here. Zero
@@ -171,6 +185,48 @@ func discoveredUserNaming(node model.SingBoxNode) (named, unnamed int) {
 		return v
 	}
 	return read(singBoxNamedUsersKey), read(singBoxUnnamedUsersKey)
+}
+
+// singBoxParkedUsersKey, singBoxParkedNamesKey and singBoxParkedErrorKey are
+// the node-reported parked users of one line (json_node_obj in the fork's
+// alpha.8): the count as a decimal string, Lattice's own parked names as a
+// JSON-encoded array, and "parked_invalid" when the parked file is damaged.
+// The transport is a string map, hence the encodings.
+const (
+	singBoxParkedUsersKey = "parked_users"
+	singBoxParkedNamesKey = "parked_names"
+	singBoxParkedErrorKey = "parked_error"
+	singBoxParkedInvalid  = "parked_invalid"
+)
+
+// parkedLineUserNameRe is the on-box name Lattice derives (userLineName), the
+// only kind of name a parked list may carry to the server.
+var parkedLineUserNameRe = regexp.MustCompile(`^u_[0-9a-f]{16}$`)
+
+// discoveredParkedUsers decodes a line's reported parked users. A count it
+// cannot read, or one past what a conf file could plausibly hold, yields
+// none. Names are kept only when the count is, only in Lattice's own shape,
+// and never more of them than the count, so a malformed or hostile report
+// can neither put a person's name on screen nor claim more parked users than
+// it counted.
+func discoveredParkedUsers(node model.SingBoxNode) (count int, names []string, parkedErr string) {
+	if strings.TrimSpace(node.Metadata[singBoxParkedErrorKey]) == singBoxParkedInvalid {
+		parkedErr = singBoxParkedInvalid
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(node.Metadata[singBoxParkedUsersKey]))
+	if err != nil || count <= 0 || count > maxDiscoveredCredentials {
+		return 0, nil, parkedErr
+	}
+	var decoded []string
+	if raw := strings.TrimSpace(node.Metadata[singBoxParkedNamesKey]); raw != "" &&
+		json.Unmarshal([]byte(raw), &decoded) == nil && len(decoded) <= count {
+		for _, name := range decoded {
+			if parkedLineUserNameRe.MatchString(name) {
+				names = appendUniqueSorted(names, name)
+			}
+		}
+	}
+	return count, names, parkedErr
 }
 
 // maxDiscoveredCredentials bounds a reported credential count. It only has to
@@ -492,6 +548,7 @@ func (s *Server) buildLineGroups() []LineGroup {
 				ServiceNote:        nodeSvcNote,
 			}
 			ln.NamedUsers, ln.UnnamedUsers = discoveredUserNaming(n)
+			ln.ParkedUsers, ln.ParkedNames, ln.ParkedError = discoveredParkedUsers(n)
 			ln.LineHashID = uuidResolver.resolve(ln.NodeID, ln.LineID, ln.LineUUID, func() string {
 				return lineHash(ln.NodeID, ln.Core, ln.Type, ln.ListenHost, ln.ListenPort, ln.Tag, ln.OutboundRef)
 			})

@@ -26,8 +26,8 @@ import (
 //     problem again changes nothing.
 //   - An open owes one open message and a resolve owes one recovery, and only
 //     if the open message was actually sent. Owed messages are stored on the
-//     record (OwedOpen, OwedRecovery), so a decision taken just before a crash
-//     is still sent after it.
+//     record (OwedOpen, OwedOpenRules, OwedRecovery), so a decision taken
+//     just before a crash is still sent after it.
 //   - The sweep (evaluateIncidents, every 20 s) sends what is owed, one
 //     message per event type for everything that fell due together: twenty
 //     cores breaking in one roll page once, as the digests did before.
@@ -51,7 +51,9 @@ import (
 // emitters' own evidence.
 //
 // Lock order: nodeAlerts.mu, then incidentMu, then the store. Nothing here
-// takes nodeAlerts.mu.
+// takes nodeAlerts.mu. The outbox drainer takes incidentMu to withdraw a held
+// incident message (withdrawHeldIncidentMessage) and holds no outbox lock
+// while it does.
 
 // Event types this evaluator adds. agent.stalled is new with loop health.
 const (
@@ -197,6 +199,7 @@ func (s *Server) openIncident(sig incidentSignal, now time.Time) {
 	// A reopening is a new occurrence: whoever acknowledged the last one has
 	// not seen this one.
 	inc.AckedBy, inc.AckedAt = "", time.Time{}
+	clearOwedOpen(&inc)
 	if inc.Notified == store.IncidentNotifiedOpen {
 		// The phone still says down (a damped recovery never went out), which
 		// is true again: nothing is owed in either direction.
@@ -222,11 +225,20 @@ func (s *Server) resolveIncident(key string, now time.Time, msg incidentMessage)
 	inc.ResolvedAt = now
 	inc.UpdatedAt = now
 	inc.RecoveryTitle, inc.RecoveryDetail, inc.RecoveryLine = msg.title, msg.detail, msg.line
-	inc.OwedOpen = false
+	clearOwedOpen(&inc)
 	inc.OwedRecovery = inc.Notified == store.IncidentNotifiedOpen
 	if err := s.store.PutIncidents(inc); err != nil {
 		s.logger.Printf("incidents: record resolve %s: %v", key, err)
 	}
+}
+
+// clearOwedOpen drops every open message an incident owes or keeps for an
+// undo: the whole message (OwedOpen), the rules an undone acknowledgement
+// still owes it to (OwedOpenRules), and the one an acknowledgement set aside
+// (AckCancelledOpen). A resolved incident owes no open, and a reopened one
+// decides afresh.
+func clearOwedOpen(inc *store.Incident) {
+	inc.OwedOpen, inc.OwedOpenRules, inc.AckCancelledOpen = false, nil, false
 }
 
 // maintenanceCover answers which active window, if any, covers a node.
@@ -344,6 +356,7 @@ func (s *Server) evaluateIncidents(now time.Time) {
 	}
 
 	opens := map[string][]incidentOutgoing{}
+	ruleOpens := map[string]map[string][]incidentOutgoing{} // rule id, then event type
 	recoveries := map[string][]incidentOutgoing{}
 	var changed []store.Incident
 	var gone []string
@@ -393,18 +406,22 @@ func (s *Server) evaluateIncidents(now time.Time) {
 				inc.RecoveryTitle = fmt.Sprintf("Monitor no longer checks %s", inc.Subject)
 				inc.RecoveryDetail = fmt.Sprintf("%s is no longer assigned, so its down state is closed without a recovery result.", inc.Subject)
 				inc.RecoveryLine = inc.Subject + ": no longer checked"
-				inc.OwedOpen = false
+				clearOwedOpen(&inc)
 				inc.OwedRecovery = inc.Notified == store.IncidentNotifiedOpen
 				dirty = true
 			}
 		}
 
 		// A snooze that ran out on an incident still open and unacknowledged
-		// sends one reminder.
+		// sends one reminder. On an acknowledged one the reminder is kept
+		// aside, owed again if the acknowledgement is undone.
 		if !inc.SnoozedUntil.IsZero() && !now.Before(inc.SnoozedUntil) {
 			inc.SnoozedUntil, inc.SnoozedBy = time.Time{}, ""
-			if inc.State == store.IncidentStateOpen {
+			switch inc.State {
+			case store.IncidentStateOpen:
 				inc.OwedOpen = true
+			case store.IncidentStateAcknowledged:
+				inc.AckCancelledOpen = true
 			}
 			dirty = true
 		}
@@ -413,29 +430,47 @@ func (s *Server) evaluateIncidents(now time.Time) {
 			switch {
 			case !inc.Active() || inc.State == store.IncidentStateAcknowledged:
 				// Someone has seen it, or it is over: no open is owed.
+				inc.AckCancelledOpen = inc.AckCancelledOpen || inc.State == store.IncidentStateAcknowledged
 				inc.OwedOpen = false
 				dirty = true
 			default:
-				title := inc.Title + flappingSuffix(inc)
+				out := incidentOpenOutgoing(inc)
 				if reason := incidentOpenHold(inc, now, cover); reason != "" {
 					before := inc.Suppressed
-					hold(&inc, inc.Kind, reason, title, inc.Detail)
+					hold(&inc, inc.Kind, reason, out.msg.title, inc.Detail)
 					dirty = dirty || before != inc.Suppressed
 				} else {
-					line := inc.Line
-					if inc.Flapping {
-						line += " (flapping)"
-					}
-					opens[inc.Kind] = append(opens[inc.Kind], incidentOutgoing{
-						incidentID: inc.ID,
-						sortKey:    incidentSortKey(inc),
-						msg:        incidentMessage{title: title, detail: inc.Detail, line: line},
-					})
-					inc.OwedOpen = false
+					opens[inc.Kind] = append(opens[inc.Kind], out)
+					// Through every rule, so no rule is owed it any more.
+					inc.OwedOpen, inc.OwedOpenRules = false, nil
 					inc.Notified, inc.NotifiedAt, inc.OpenNotifiedAt = store.IncidentNotifiedOpen, now, now
 					inc.Suppressed, inc.SuppressedAt = "", time.Time{}
 					dirty = true
 				}
+			}
+		}
+
+		// The rules an undone acknowledgement still owes the open message get
+		// it once nothing holds the incident, through those rules alone. The
+		// whole message, while owed, covers them; while acknowledged they wait
+		// for the undo. The escalation clock stays with the first open.
+		if len(inc.OwedOpenRules) > 0 && !inc.OwedOpen && inc.State == store.IncidentStateOpen {
+			out := incidentOpenOutgoing(inc)
+			if reason := incidentOpenHold(inc, now, cover); reason != "" {
+				before := inc.Suppressed
+				hold(&inc, inc.Kind, reason, out.msg.title, inc.Detail)
+				dirty = dirty || before != inc.Suppressed
+			} else {
+				for _, ruleID := range inc.OwedOpenRules {
+					if ruleOpens[ruleID] == nil {
+						ruleOpens[ruleID] = map[string][]incidentOutgoing{}
+					}
+					ruleOpens[ruleID][inc.Kind] = append(ruleOpens[ruleID][inc.Kind], out)
+				}
+				inc.OwedOpenRules = nil
+				inc.NotifiedAt = now
+				inc.Suppressed, inc.SuppressedAt = "", time.Time{}
+				dirty = true
 			}
 		}
 
@@ -485,6 +520,7 @@ func (s *Server) evaluateIncidents(now time.Time) {
 	for _, kind := range sortedMapKeys(opens) {
 		s.sendIncidentMessages(kind, opens[kind])
 	}
+	s.sendRuleOpens(ruleOpens)
 	for _, kind := range sortedMapKeys(recoveries) {
 		s.sendIncidentMessages(kind, recoveries[kind])
 	}
@@ -522,25 +558,61 @@ func sortedMapKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// sendIncidentMessages sends one message for every item of one event type: a
-// single item keeps its own title and body, several become a digest. Each
-// message carries the ids of the incidents it reports.
-func (s *Server) sendIncidentMessages(eventType string, items []incidentOutgoing) {
-	if len(items) == 0 {
-		return
+// incidentOpenOutgoing is an incident's share of its open message.
+func incidentOpenOutgoing(inc store.Incident) incidentOutgoing {
+	line := inc.Line
+	if inc.Flapping {
+		line += " (flapping)"
 	}
+	return incidentOutgoing{
+		incidentID: inc.ID,
+		sortKey:    incidentSortKey(inc),
+		msg:        incidentMessage{title: inc.Title + flappingSuffix(inc), detail: inc.Detail, line: line},
+	}
+}
+
+// incidentNotice composes one message for every item of one event type: a
+// single item keeps its own title and body, several become a digest. It also
+// returns the ids of the incidents the message reports.
+func incidentNotice(eventType string, items []incidentOutgoing) (title, body string, ids []string) {
 	if len(items) == 1 {
-		s.emitIncidentNotice(eventType, items[0].msg.title, items[0].msg.detail, []string{items[0].incidentID})
-		return
+		return items[0].msg.title, items[0].msg.detail, []string{items[0].incidentID}
 	}
 	sort.SliceStable(items, func(i, j int) bool { return items[i].sortKey < items[j].sortKey })
 	lines := make([]string, len(items))
-	ids := make([]string, len(items))
+	ids = make([]string, len(items))
 	for i, item := range items {
 		lines[i] = item.msg.line
 		ids[i] = item.incidentID
 	}
-	s.emitIncidentNotice(eventType, incidentDigestTitle(eventType, len(items)), strings.Join(lines, "\n"), ids)
+	return incidentDigestTitle(eventType, len(items)), strings.Join(lines, "\n"), ids
+}
+
+// sendIncidentMessages sends one message for every item of one event type
+// through every rule.
+func (s *Server) sendIncidentMessages(eventType string, items []incidentOutgoing) {
+	if len(items) == 0 {
+		return
+	}
+	title, body, ids := incidentNotice(eventType, items)
+	s.emitIncidentNotice(eventType, title, body, ids)
+}
+
+// sendRuleOpens sends the open messages owed to particular rules
+// (OwedOpenRules): one message per rule and event type, through that rule
+// alone. A rule since disabled or deleted is owed nothing.
+func (s *Server) sendRuleOpens(byRule map[string]map[string][]incidentOutgoing) {
+	if len(byRule) == 0 {
+		return
+	}
+	for _, rule := range s.store.EnabledNotifyRules() {
+		kinds := byRule[rule.ID]
+		for _, kind := range sortedMapKeys(kinds) {
+			title, body, ids := incidentNotice(kind, kinds[kind])
+			s.commitNotifyPlan(s.planNotifyEvent(kind, title, body,
+				notifyEnqueue{source: store.NotifySourceServer, onlyRule: &rule, incidentIDs: ids}))
+		}
+	}
 }
 
 // notifyIncidentEvent is the production emitIncidentNotice.

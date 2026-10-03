@@ -20,6 +20,7 @@ import (
 //
 //	GET  /api/incidents                  monitor:read, filtered to the caller's nodes
 //	POST /api/incidents/ack              monitor:admin on the incident's node
+//	POST /api/incidents/unack            monitor:admin on the incident's node
 //	POST /api/incidents/snooze           monitor:admin on the incident's node
 //	GET  /api/maintenance-windows        monitor:read, filtered to the caller's nodes
 //	POST /api/maintenance-windows        monitor:admin on every covered node
@@ -368,6 +369,7 @@ func (s *Server) handleIncidentAck(w http.ResponseWriter, r *http.Request, p pri
 	if inc.State != store.IncidentStateAcknowledged {
 		inc.State = store.IncidentStateAcknowledged
 		inc.AckedBy, inc.AckedAt = principalLabel(p), now
+		inc.AckCancelledOpen = inc.OwedOpen
 		inc.OwedOpen = false
 		inc.UpdatedAt = now
 		if err := s.store.PutIncidents(inc); err != nil {
@@ -378,6 +380,105 @@ func (s *Server) handleIncidentAck(w http.ResponseWriter, r *http.Request, p pri
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.ack", Scope: "monitor:admin",
 		Metadata: map[string]string{"incident_id": inc.ID, "kind": inc.Kind}})
 	writeJSON(w, http.StatusOK, s.toIncidentView(inc, now, s.maintenanceCoverAt(now), s.nodeNames()))
+}
+
+// handleIncidentUnack undoes an acknowledgement while the incident is still
+// open. Everything the acknowledgement stopped resumes as if it had not
+// happened: the escalation clock still runs from the open message, an open
+// message it cancelled is owed again (one a window or a snooze held, or a
+// snooze reminder that fell due meanwhile), and an open message that quiet
+// hours held and then withdrew because of it is owed again to the rules that
+// withdrew it and to no other. The sweep sends what is owed once nothing
+// holds the incident. A closed incident is refused; one that is not
+// acknowledged is left as it is, like acknowledging twice.
+func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if _, ok := s.incidentActionTarget(w, p, req.ID, "incident.unack"); !ok {
+		return
+	}
+	now := s.now()
+	cover := s.maintenanceCoverAt(now)
+	s.incidentMu.Lock()
+	inc, ok := s.store.Incident(req.ID)
+	if !ok || !inc.Active() {
+		s.incidentMu.Unlock()
+		writeError(w, http.StatusConflict, errors.New("only an open incident can be un-acknowledged"))
+		return
+	}
+	ackedAt := inc.AckedAt
+	undone := inc.State == store.IncidentStateAcknowledged
+	if undone {
+		inc.State = store.IncidentStateOpen
+		// The open message is owed when the acknowledgement cancelled it, and
+		// also whenever the phone was never told this occurrence is open: an
+		// acknowledgement recorded before AckCancelledOpen existed carries no
+		// flag, and the incident would otherwise stay open, unsent and, since
+		// escalation runs from the open message, never escalated.
+		inc.OwedOpen = inc.OwedOpen || inc.AckCancelledOpen || inc.Notified != store.IncidentNotifiedOpen
+		if inc.OwedOpen {
+			// Through every rule, which covers any rule owed it alone.
+			inc.OwedOpenRules = nil
+		} else {
+			// Only the rules that lost their copy to the acknowledgement are
+			// owed it, with any an earlier undo left owed. The sweep sends it
+			// through them alone once nothing holds the incident, so a rule
+			// that delivered it is never told twice.
+			for _, ruleID := range s.rulesThatWithdrewOpen(inc, ackedAt) {
+				if !slices.Contains(inc.OwedOpenRules, ruleID) {
+					inc.OwedOpenRules = append(inc.OwedOpenRules, ruleID)
+				}
+			}
+			slices.Sort(inc.OwedOpenRules)
+		}
+		inc.AckCancelledOpen = false
+		inc.AckedBy, inc.AckedAt = "", time.Time{}
+		inc.UpdatedAt = now
+		// The store keeps the change in memory, which the sweep reads, even
+		// when the disk write fails, so the undo is in effect either way and
+		// is answered and audited as such, as acknowledge and snooze are.
+		if err := s.store.PutIncidents(inc); err != nil {
+			s.logger.Printf("incidents: record unack %s: %v", inc.ID, err)
+		}
+	}
+	s.incidentMu.Unlock()
+	// Only an undo that undid something is audited; one on an incident
+	// nobody acknowledged changed nothing.
+	if undone {
+		meta := map[string]string{"incident_id": inc.ID, "kind": inc.Kind}
+		if !ackedAt.IsZero() {
+			meta["acked_at"] = stamp(ackedAt)
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.unack", Scope: "monitor:admin", Metadata: meta})
+	}
+	writeJSON(w, http.StatusOK, s.toIncidentView(inc, now, cover, s.nodeNames()))
+}
+
+// rulesThatWithdrewOpen lists the ids of the rules whose quiet-hours copy of
+// inc's open message was withdrawn at or after ackedAt, which is what an
+// acknowledgement does to a held open message when quiet hours end. A copy
+// withdrawn before the acknowledgement was withdrawn for another reason (a
+// snooze, say), which undoing the acknowledgement does not undo.
+func (s *Server) rulesThatWithdrewOpen(inc store.Incident, ackedAt time.Time) []string {
+	if ackedAt.IsZero() {
+		return nil
+	}
+	var out []string
+	for _, row := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, EventType: inc.Kind}) {
+		if row.Reason == notifyWithdrawnOpen && row.RuleID != "" && !row.SettledAt.Before(ackedAt) &&
+			slices.Contains(row.IncidentIDs, inc.ID) && !slices.Contains(out, row.RuleID) {
+			out = append(out, row.RuleID)
+		}
+	}
+	return out
 }
 
 // handleIncidentSnooze holds an open incident's messages until a time:

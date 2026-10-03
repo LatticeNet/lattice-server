@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -89,10 +90,15 @@ type Incident struct {
 	ResolvedAt    time.Time `json:"resolved_at,omitzero"`
 	UpdatedAt     time.Time `json:"updated_at"`
 
-	AckedBy      string    `json:"acked_by,omitempty"`
-	AckedAt      time.Time `json:"acked_at,omitzero"`
-	SnoozedBy    string    `json:"snoozed_by,omitempty"`
-	SnoozedUntil time.Time `json:"snoozed_until,omitzero"`
+	AckedBy string    `json:"acked_by,omitempty"`
+	AckedAt time.Time `json:"acked_at,omitzero"`
+	// AckCancelledOpen records that the acknowledgement cancelled an open
+	// message that was owed: one a window, a snooze or flap damping held,
+	// or a snooze reminder that fell due while acknowledged. Undoing the
+	// acknowledgement owes it again.
+	AckCancelledOpen bool      `json:"ack_cancelled_open,omitempty"`
+	SnoozedBy        string    `json:"snoozed_by,omitempty"`
+	SnoozedUntil     time.Time `json:"snoozed_until,omitzero"`
 
 	// Notified is what the phone was last told (IncidentNotified*), and
 	// NotifiedAt when. OpenNotifiedAt is when it was last told "open", which
@@ -109,6 +115,14 @@ type Incident struct {
 	// just before a crash is still sent after it.
 	OwedOpen     bool `json:"owed_open,omitempty"`
 	OwedRecovery bool `json:"owed_recovery,omitempty"`
+	// OwedOpenRules names the rules still owed the open message when only
+	// some are: undoing an acknowledgement owes it to the rules whose
+	// quiet-hours copy was withdrawn because of it, while the other rules
+	// had delivered theirs. The sweep sends it through these rules alone
+	// once nothing holds the incident; OwedOpen, when set, owes it through
+	// every rule and covers them. A later acknowledgement keeps them for its
+	// own undo, and resolving or reopening clears them.
+	OwedOpenRules []string `json:"owed_open_rules,omitempty"`
 	// Suppressed is the last reason a message about this incident was held,
 	// and SuppressedAt when.
 	Suppressed   string    `json:"suppressed,omitempty"`
@@ -303,6 +317,7 @@ func cloneIncident(inc Incident) Incident {
 		}
 		inc.Escalated = m
 	}
+	inc.OwedOpenRules = slices.Clone(inc.OwedOpenRules)
 	return inc
 }
 

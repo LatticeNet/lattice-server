@@ -2,13 +2,16 @@ package store
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	bolt "go.etcd.io/bbolt"
 )
 
 func testIncident(id, key string, at time.Time, state string) Incident {
@@ -316,5 +319,66 @@ func TestDeleteCascadesRemoveIncidents(t *testing.T) {
 	got := s.IncidentsWhere(func(inc Incident) bool { return inc.NodeID != "" })
 	if len(got) != 1 || got[0].ID != "inc-b" {
 		t.Fatalf("left = %+v", got)
+	}
+}
+
+// The undo bookkeeping (AckCancelledOpen, OwedOpenRules) survives a reopen of
+// the hot store; a record the previous version wrote, which has neither key,
+// loads as it was with neither set; an incident that owes nothing writes
+// neither key, so the previous version reads new records unchanged; and a
+// caller cannot change a stored record through the slice it was handed.
+func TestIncidentUndoFieldsRoundTripAndOldRecordsLoad(t *testing.T) {
+	s, path := openReportClockStore(t)
+	hotPath := filepath.Join(filepath.Dir(path), "hot.db")
+	if err := s.EnableRuntimeBoltHotStore(hotPath); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 3, 9, 0, 0, 0, time.UTC)
+	inc := testIncident("inc-new", "agent.stalled/node-a", at, IncidentStateAcknowledged)
+	inc.AckedBy, inc.AckedAt = "user-1", at.Add(time.Minute)
+	inc.AckCancelledOpen = true
+	inc.OwedOpenRules = []string{"nr-night", "nr-pager"}
+	if err := s.PutIncidents(inc); err != nil {
+		t.Fatal(err)
+	}
+	const old = `{"id":"inc-old","key":"service.down/node-b","kind":"service.down","severity":"critical","node_id":"node-b",` +
+		`"state":"acknowledged","title":"sing-box down on b","first_opened_at":"2026-10-03T08:00:00Z","opened_at":"2026-10-03T08:00:00Z",` +
+		`"updated_at":"2026-10-03T08:05:00Z","acked_by":"user-1","acked_at":"2026-10-03T08:05:00Z","notified":"open",` +
+		`"notified_at":"2026-10-03T08:00:00Z","open_notified_at":"2026-10-03T08:00:00Z"}`
+	key, err := boltStringKey("inc-old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.runtimeBoltHot.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(boltBucketIncidents).Put(key, []byte(old))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s = reopenReportClockStore(t, s, path)
+	if err := s.EnableRuntimeBoltHotStore(hotPath); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.Incident("inc-new")
+	if !ok || !got.AckCancelledOpen || !slices.Equal(got.OwedOpenRules, []string{"nr-night", "nr-pager"}) {
+		t.Fatalf("after reopen: %v %+v", ok, got)
+	}
+	prev, ok := s.Incident("inc-old")
+	if !ok || prev.State != IncidentStateAcknowledged || prev.AckedBy != "user-1" || prev.Notified != IncidentNotifiedOpen ||
+		prev.AckCancelledOpen || prev.OwedOpenRules != nil || prev.OwedOpen {
+		t.Fatalf("the previous version's record: %v %+v", ok, prev)
+	}
+
+	got.OwedOpenRules[0] = "nr-changed"
+	if again, _ := s.Incident("inc-new"); again.OwedOpenRules[0] != "nr-night" {
+		t.Fatalf("the stored record changed through a returned slice: %+v", again.OwedOpenRules)
+	}
+
+	data, err := json.Marshal(prev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("ack_cancelled_open")) || bytes.Contains(data, []byte("owed_open_rules")) {
+		t.Fatalf("an incident owing nothing wrote the new keys: %s", data)
 	}
 }

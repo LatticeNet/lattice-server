@@ -481,3 +481,39 @@ func TestUnacknowledgeAnUnacknowledgedIncidentChangesNothing(t *testing.T) {
 		}
 	}
 }
+
+// A node-confined operator with monitor:admin on the incident's node may undo
+// its acknowledgement, and the undo is audited under that token.
+func TestUnacknowledgeByANodeConfinedOperator(t *testing.T) {
+	h := newIncidentHarness(t, "a", "b")
+	post, cookies, csrf := incidentPoster(h)
+	h.openService("a")
+	h.sweep()
+	a := h.incident(EventServiceDown, "a")
+	post("/api/incidents/ack", a.ID)
+
+	confined := createPAT(t, h.f.handler, cookies, csrf, []string{"monitor:read", "monitor:admin"}, []string{"a"})
+	res := doBearerJSON(t, h.f.handler, http.MethodPost, "/api/incidents/unack", fmt.Sprintf(`{"id":%q}`, a.ID), confined)
+	var v incidentView
+	if res.StatusCode == http.StatusOK {
+		if err := json.NewDecoder(res.Body).Decode(&v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK || v.State != store.IncidentStateOpen {
+		t.Fatalf("unack by a token confined to the node: %d %+v", res.StatusCode, v)
+	}
+	if inc := h.incident(EventServiceDown, "a"); inc.State != store.IncidentStateOpen || inc.AckedBy != "" {
+		t.Fatalf("the incident was not undone: %+v", inc)
+	}
+	audited := false
+	for _, ev := range h.f.st.AuditEvents() {
+		if ev.Action == "incident.unack" && ev.Metadata["incident_id"] == a.ID && ev.TokenID != "" && ev.NodeID == "a" {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatal("the undo was not audited under the token")
+	}
+}

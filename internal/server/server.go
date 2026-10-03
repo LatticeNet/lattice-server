@@ -342,6 +342,9 @@ type Server struct {
 	latencySyncStop     chan struct{}
 	latencySyncStopOnce sync.Once
 	latencySyncLoops    sync.WaitGroup
+	// latencyEdges holds the provider edge names the control plane resolved
+	// for the latency probes; see latency_edges.go.
+	latencyEdges latencyEdgeCache
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight

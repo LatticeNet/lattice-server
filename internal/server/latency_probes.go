@@ -51,11 +51,19 @@ import (
 //     it, even when a line claims them.
 //  4. The port the world dials: the declared public port when the node sits
 //     behind a provider, else the listen port.
-//  5. The host: the provider edge when the node declares one and the line a
-//     public port; else the line's published address when it is a public
-//     IPv4 literal; else the node's public IPv4 unless the node declares NAT;
-//     else the published host name. Private, loopback, link-local, CGNAT
-//     and multicast addresses are never dialled.
+//  5. The host is the node's own address or the provider edge it declares,
+//     never an address a line merely publishes: a line's address comes from
+//     the node and could name any host, including one inside the source's
+//     network. When the node declares a provider edge and the line a public
+//     port, the edge, as a public IPv4 literal or as a name the control
+//     plane resolved to public addresses only (latency_edges.go; the probe
+//     dials the address, never the name). Else the node's public IPv4,
+//     unless the node declares NAT and the line does not publish that same
+//     address. A line's host name is never dialled. Private, loopback,
+//     link-local, CGNAT, benchmark (fake-ip) and multicast addresses are
+//     never dialled. The node reports its public IPv4 too, so a compromised
+//     node can still aim the probe of itself at another public address on a
+//     port its inventory names; it cannot aim it into the source's network.
 //  6. Among what is left: a line sing-box was seen holding its port, then
 //     one nobody checked, then one seen not listening; a raw TCP transport
 //     before ws, http, h2, httpupgrade and grpc (those can sit behind a CDN);
@@ -92,6 +100,9 @@ var (
 	latencyUDPNetworks     = map[string]bool{"quic": true, "hysteria2": true, "tuic": true}
 	latencyLayeredNetworks = map[string]bool{"ws": true, "http": true, "h2": true, "httpupgrade": true, "grpc": true}
 	latencyCGNAT           = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+	// latencyBenchmark is 198.18.0.0/15, which proxy clients hand out as
+	// fake-ip DNS answers: never a real host.
+	latencyBenchmark = &net.IPNet{IP: net.IPv4(198, 18, 0, 0), Mask: net.CIDRMask(15, 32)}
 )
 
 func latencyMonitorID(targetNodeID string) string { return latencyMonitorPrefix + targetNodeID }
@@ -157,14 +168,16 @@ func latencyPublicIPv4(raw string) (string, bool) {
 	}
 	v4 := ip.To4()
 	if v4 == nil || v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalUnicast() ||
-		v4.IsUnspecified() || v4.IsMulticast() || v4.Equal(net.IPv4bcast) || latencyCGNAT.Contains(v4) {
+		v4.IsUnspecified() || v4.IsMulticast() || v4.Equal(net.IPv4bcast) || latencyCGNAT.Contains(v4) ||
+		latencyBenchmark.Contains(v4) {
 		return "", false
 	}
 	return v4.String(), true
 }
 
-// latencyHostname reports whether raw is a DNS name a probe may dial: not an
-// address literal, not localhost, and only the characters a host name holds.
+// latencyHostname reports whether raw is a DNS name the control plane may
+// resolve for a probe: not an address literal, not localhost, and only the
+// characters a host name holds.
 func latencyHostname(raw string) bool {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || len(raw) > 253 || net.ParseIP(strings.Trim(raw, "[]")) != nil || !strings.Contains(raw, ".") {
@@ -182,30 +195,32 @@ func latencyHostname(raw string) bool {
 	return true
 }
 
-// latencyHost is step 5 of the port rule.
-func latencyHost(node model.Node, inv model.SingBoxInventory, line model.SingBoxNode, publicPort int) string {
-	if publicPort > 0 {
-		edge := strings.TrimSpace(inv.ProviderEdge)
+// latencyHosts is step 5 of the port rule: the addresses a probe of this line
+// may dial, all IPv4 literals. edges maps each edge name to the public
+// addresses the control plane resolved for it (latencyEdgeCache.snapshot).
+// A declared edge is the only host for a line with a public port: a NAT
+// node's public port lives on the edge, not on the node.
+func latencyHosts(node model.Node, inv model.SingBoxInventory, line model.SingBoxNode, publicPort int, edges map[string][]string) []string {
+	if edge := strings.TrimSpace(inv.ProviderEdge); publicPort > 0 && edge != "" {
 		if ip, ok := latencyPublicIPv4(edge); ok {
-			return ip
+			return []string{ip}
 		}
 		if latencyHostname(edge) {
-			return edge
+			return edges[latencyEdgeKey(edge)]
 		}
+		return nil
 	}
-	addr := strings.TrimSpace(line.Address)
-	if ip, ok := latencyPublicIPv4(addr); ok {
-		return ip
+	own, ok := latencyPublicIPv4(node.PublicIP)
+	if !ok {
+		return nil
 	}
 	if !strings.EqualFold(strings.TrimSpace(inv.Network), "nat") {
-		if ip, ok := latencyPublicIPv4(node.PublicIP); ok {
-			return ip
-		}
+		return []string{own}
 	}
-	if latencyHostname(addr) {
-		return addr
+	if addr, ok := latencyPublicIPv4(line.Address); ok && addr == own {
+		return []string{own}
 	}
-	return ""
+	return nil
 }
 
 func latencyBoundRank(bound *bool) int {
@@ -221,7 +236,7 @@ func latencyBoundRank(bound *bool) int {
 
 // latencyEndpoints applies steps 1 to 6 of the port rule to one inventory.
 // With nothing accepted, the note says why (a model.LatencyEndpoint* code).
-func latencyEndpoints(node model.Node, inv model.SingBoxInventory, refused map[int]bool) ([]latencyEndpoint, string) {
+func latencyEndpoints(node model.Node, inv model.SingBoxInventory, refused map[int]bool, edges map[string][]string) ([]latencyEndpoint, string) {
 	var out []latencyEndpoint
 	seen := map[string]bool{}
 	sawUDP, sawTCPProtocol, sawAddressless := false, false, false
@@ -248,26 +263,28 @@ func latencyEndpoints(node model.Node, inv model.SingBoxInventory, refused map[i
 		if port < 1 || port > 65535 || refused[port] || refused[listen] {
 			continue
 		}
-		host := latencyHost(node, inv, line, public)
-		if host == "" {
+		hosts := latencyHosts(node, inv, line, public, edges)
+		if len(hosts) == 0 {
 			sawAddressless = true
 			continue
 		}
-		target := net.JoinHostPort(host, strconv.Itoa(port))
-		if seen[target] {
-			continue
-		}
-		seen[target] = true
 		layered := 0
 		if latencyLayeredNetworks[network] {
 			layered = 1
 		}
-		out = append(out, latencyEndpoint{
-			target:   target,
-			protocol: protocol,
-			line:     line.Name,
-			rank:     [3]int{latencyBoundRank(line.PortBound), layered, port},
-		})
+		for _, host := range hosts {
+			target := net.JoinHostPort(host, strconv.Itoa(port))
+			if seen[target] {
+				continue
+			}
+			seen[target] = true
+			out = append(out, latencyEndpoint{
+				target:   target,
+				protocol: protocol,
+				line:     line.Name,
+				rank:     [3]int{latencyBoundRank(line.PortBound), layered, port},
+			})
+		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].rank != out[j].rank {
@@ -317,6 +334,18 @@ func latencyTargetPort(target string) int {
 	}
 	port, _ := strconv.Atoi(raw)
 	return port
+}
+
+// latencyDialableTarget reports whether a stored target is one the port rule
+// can produce: a public IPv4 literal and a port.
+func latencyDialableTarget(target string) bool {
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return false
+	}
+	_, ok := latencyPublicIPv4(host)
+	port := latencyTargetPort(target)
+	return ok && port > 0 && port <= 65535
 }
 
 func latencyPairKey(source, target string) string { return source + "\x00" + target }
@@ -394,6 +423,7 @@ func (s *Server) planLatencyProbes(now time.Time) latencyPlan {
 		inventories[inv.NodeID] = inv
 	}
 	approvals := s.store.Approvals()
+	edges := s.latencyEdges.snapshot()
 	interval := cfg.IntervalSec
 	if interval <= 0 {
 		interval = model.LatencyProbeDefaultIntervalSec
@@ -447,7 +477,7 @@ func (s *Server) planLatencyProbes(now time.Time) latencyPlan {
 		refused := s.latencyRefusedPorts(n.ID, approvals)
 		inv, live := inventories[n.ID]
 		if live && (inv.Status == "" || inv.Status == "ok") {
-			endpoints, note := latencyEndpoints(n, inv, refused)
+			endpoints, note := latencyEndpoints(n, inv, refused, edges)
 			for i := range endpoints {
 				if hadPrior && endpoints[i].target == prior.Target {
 					chosen = &endpoints[i]
@@ -458,7 +488,7 @@ func (s *Server) planLatencyProbes(now time.Time) latencyPlan {
 				chosen = &endpoints[0]
 			}
 			pn.EndpointNote = note
-		} else if hadPrior && prior.Target != "" && !refused[latencyTargetPort(prior.Target)] {
+		} else if hadPrior && latencyDialableTarget(prior.Target) && !refused[latencyTargetPort(prior.Target)] {
 			chosen = &latencyEndpoint{target: prior.Target}
 			pn.EndpointNote = model.LatencyEndpointLastKnown
 		} else {
@@ -562,12 +592,13 @@ func latencyNodeLabel(n model.Node) string {
 	return n.ID
 }
 
-// syncLatencyProbes plans the fleet and brings the generated monitors in line
-// with the plan. The store writes only when a generated monitor changed, and
-// only then is the sync audited.
+// syncLatencyProbes resolves the provider edge names, plans the fleet and
+// brings the generated monitors in line with the plan. The store writes only
+// when a generated monitor changed, and only then is the sync audited.
 func (s *Server) syncLatencyProbes(now time.Time) (model.LatencyProbePlan, store.ManagedMonitorChanges, error) {
 	s.latencySync.Lock()
 	defer s.latencySync.Unlock()
+	s.latencyEdges.refresh(latencyEdgeNames(s.liveSingBoxInventories(now)), now)
 	planned := s.planLatencyProbes(now)
 	changes, err := s.store.SyncManagedMonitors(model.MonitorManagedLatency, planned.desired, now)
 	if err != nil {

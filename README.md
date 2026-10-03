@@ -553,9 +553,15 @@ Use the compose file and deployment guide in the umbrella repository:
   after each save, writes the state file only when a generated monitor
   changed, and audits that change as `monitor.latency.sync`. A probe dials
   only a TCP line port the target already serves publicly, never a loopback
-  listener, port 22, an sshd port or a knock-gated port (the full rule is in
-  `internal/server/latency_probes.go`). Generated monitors cannot be deleted
-  through `/api/monitors/delete` (409) and their failures do not page.
+  listener, port 22, an sshd port or a knock-gated port, and only at the
+  node's own public IPv4 or the provider edge it declares, never at an
+  address or host name a line publishes. An edge given as a name is resolved
+  by the control plane at each sweep and dialled by address, and only when
+  every address it has is public, so a node cannot point the source's probe
+  into the source's own network (the full rule is in
+  `internal/server/latency_probes.go` and `latency_edges.go`). Generated
+  monitors cannot be deleted through `/api/monitors/delete` (409) and their
+  failures do not page.
   `GET /api/monitors/latency/rollups` returns p50 and p95 handshake time and
   loss for every pair over `1h` (raw rows), `24h` (five-minute rollups) and
   `7d` (hourly rollups), with `samples` beside `expected` so a gap reads as

@@ -26,6 +26,7 @@ func TestLatencyPortRule(t *testing.T) {
 		node    model.Node
 		inv     model.SingBoxInventory
 		refused []int
+		edges   map[string][]string
 		want    string
 		note    string
 	}{
@@ -67,12 +68,61 @@ func TestLatencyPortRule(t *testing.T) {
 			want: "203.0.113.10:9443",
 		},
 		{
-			name: "a NAT node is dialled at its provider edge on the public port",
-			node: model.Node{ID: "n", PublicIP: "198.51.100.7"},
-			inv: model.SingBoxInventory{Network: "nat", ProviderEdge: "edge.provider.example", Nodes: []model.SingBoxNode{
+			name:  "a NAT node is dialled at the address its provider edge resolved to, on the public port",
+			node:  model.Node{ID: "n", PublicIP: "198.51.100.7"},
+			edges: map[string][]string{"edge.provider.example": {"203.0.113.40", "203.0.113.50"}},
+			inv: model.SingBoxInventory{Network: "nat", ProviderEdge: "Edge.Provider.Example", Nodes: []model.SingBoxNode{
 				{Name: "vless-488", Protocol: "vless", Network: "reality", Port: "488", PublicPort: "50100", Address: "10.0.0.4"},
 			}},
-			want: "edge.provider.example:50100",
+			want: "203.0.113.40:50100",
+		},
+		{
+			name: "a provider edge name the control plane has not resolved to public addresses is not dialled",
+			node: model.Node{ID: "n", PublicIP: "198.51.100.7"},
+			inv: model.SingBoxInventory{Network: "nat", ProviderEdge: "edge.provider.example", Nodes: []model.SingBoxNode{
+				{Name: "vless-488", Protocol: "vless", Network: "reality", Port: "488", PublicPort: "50100", Address: "198.51.100.7"},
+			}},
+			note: model.LatencyEndpointNoAddress,
+		},
+		{
+			name: "a provider edge given as a public address literal is dialled as it is",
+			node: model.Node{ID: "n", PublicIP: "198.51.100.7"},
+			inv: model.SingBoxInventory{Network: "nat", ProviderEdge: "203.0.113.77", Nodes: []model.SingBoxNode{
+				{Name: "vless-488", Protocol: "vless", Network: "reality", Port: "488", PublicPort: "50100"},
+			}},
+			want: "203.0.113.77:50100",
+		},
+		{
+			name: "a line publishing an unrelated public address is dialled at the node's own",
+			node: direct,
+			inv: model.SingBoxInventory{Nodes: []model.SingBoxNode{
+				{Name: "vless-443", Protocol: "vless", Network: "reality", Port: "443", Address: "8.8.8.8"},
+			}},
+			want: "203.0.113.10:443",
+		},
+		{
+			name: "a NAT node's line that publishes another public address is not dialled",
+			node: model.Node{ID: "n", PublicIP: "198.51.100.7"},
+			inv: model.SingBoxInventory{Network: "nat", Nodes: []model.SingBoxNode{
+				{Name: "vless", Protocol: "vless", Network: "reality", Port: "488", Address: "8.8.8.8"},
+			}},
+			note: model.LatencyEndpointNoAddress,
+		},
+		{
+			name: "a NAT node's line that publishes the node's own address is dialled there",
+			node: model.Node{ID: "n", PublicIP: "198.51.100.7"},
+			inv: model.SingBoxInventory{Network: "nat", Nodes: []model.SingBoxNode{
+				{Name: "vless", Protocol: "vless", Network: "reality", Port: "488", Address: "198.51.100.7"},
+			}},
+			want: "198.51.100.7:488",
+		},
+		{
+			name: "a line's host name is never dialled, even with no other address",
+			node: model.Node{ID: "n"},
+			inv: model.SingBoxInventory{Nodes: []model.SingBoxNode{
+				{Name: "anytls-host", Protocol: "anytls", Network: "anytls", Port: "443", Address: "internal.example.com"},
+			}},
+			note: model.LatencyEndpointNoAddress,
 		},
 		{
 			name: "a NAT node with nothing public to dial",
@@ -113,7 +163,7 @@ func TestLatencyPortRule(t *testing.T) {
 			for _, port := range tc.refused {
 				refused[port] = true
 			}
-			got, note := latencyEndpoints(tc.node, tc.inv, refused)
+			got, note := latencyEndpoints(tc.node, tc.inv, refused, tc.edges)
 			if tc.want != "" {
 				if len(got) == 0 || got[0].target != tc.want {
 					t.Fatalf("endpoints = %+v note %q, want %s first", got, note, tc.want)
@@ -133,6 +183,7 @@ func TestLatencyPortRule(t *testing.T) {
 func latencyFleet(t *testing.T) (*Server, http.Handler, *store.Store) {
 	t.Helper()
 	srv, handler, st := newInventoryServer(t)
+	srv.latencyEdges.lookup = fakeEdgeResolver(map[string][]string{"edge.example.net": {"203.0.113.50"}}).lookup
 	nodes := []model.Node{
 		{ID: "node-sh", Name: "cd-hs-sh", PublicIP: "203.0.113.1", Geo: &model.NodeGeo{Country: "CN"}},
 		{ID: "node-bj", Name: "cd-bj", PublicIP: "203.0.113.2", Geo: &model.NodeGeo{Country: "cn"}},
@@ -195,7 +246,7 @@ func TestLatencyDefaultsProbeFromShanghaiToOverseas(t *testing.T) {
 	if hk := latencyNodeOf(t, plan, "node-hk"); hk.Target != model.LatencyTargetNotProbeable || hk.EndpointNote != model.LatencyEndpointUDPOnly || hk.MonitorID != "" {
 		t.Fatalf("hk = %+v", hk)
 	}
-	if us := latencyNodeOf(t, plan, "node-us"); us.Endpoint != "edge.example.net:50100" {
+	if us := latencyNodeOf(t, plan, "node-us"); us.Endpoint != "203.0.113.50:50100" {
 		t.Fatalf("us = %+v", us)
 	}
 	if bj := latencyNodeOf(t, plan, "node-bj"); bj.Target != model.LatencyTargetNone || bj.TargetReason != model.LatencyReasonMainland || bj.Region != model.LatencyRegionMainland {

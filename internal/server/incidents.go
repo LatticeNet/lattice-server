@@ -91,12 +91,17 @@ type incidentKind struct {
 	noun string
 }
 
-// incidentKinds lists the event types that open incidents. Severity follows
-// the keepalive design table (r1-keepalive 6.2): a silent node and a failed
-// monitor are warnings, a dead proxy core is critical. Only critical
-// incidents escalate and only critical events break through quiet hours.
+// incidentKinds lists the event types that open incidents. Only critical
+// incidents escalate and only critical events break through quiet hours. A
+// node that stopped reporting and a dead proxy core are critical: node
+// keepalive is what the operator asked to be told about (2026-10-02), and the
+// notify fallback (notify_channel_fallback.go) already treats both as
+// critical, so the two tables agree. A failed monitor and a stalled agent
+// loop are warnings. A node's offline delay (offline-alert-after) still
+// decides when the incident opens, so a laptop node with a long delay does
+// not escalate before it would have paged.
 var incidentKinds = map[string]incidentKind{
-	EventNodeOffline:  {recovery: EventNodeOnline, severity: incidentSeverityWarning, noun: "nodes"},
+	EventNodeOffline:  {recovery: EventNodeOnline, severity: incidentSeverityCritical, noun: "nodes"},
 	EventServiceDown:  {recovery: EventServiceRecovered, severity: incidentSeverityCritical, noun: "nodes"},
 	EventMonitorDown:  {recovery: EventMonitorRecovered, severity: incidentSeverityWarning},
 	EventAgentStalled: {recovery: EventAgentRecovered, severity: incidentSeverityWarning, noun: "nodes"},

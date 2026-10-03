@@ -301,7 +301,7 @@ func TestUnacknowledgedCriticalIncidentEscalatesOncePerRule(t *testing.T) {
 	addNotifyChannel(t, h.f.st, "nc-ops", "Bark ops")
 	addNotifyChannel(t, h.f.st, "nc-quiet", "Bark quiet")
 	rule := func(id, channel string, opts store.NotifyRuleOptions) {
-		if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: id, Name: id, EventTypes: []string{EventServiceDown, EventNodeOffline}, ChannelIDs: []string{channel}, Enabled: true}, opts); err != nil {
+		if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: id, Name: id, EventTypes: []string{EventServiceDown, EventAgentStalled}, ChannelIDs: []string{channel}, Enabled: true}, opts); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -311,8 +311,9 @@ func TestUnacknowledgedCriticalIncidentEscalatesOncePerRule(t *testing.T) {
 
 	h.openService("a")
 	h.openService("b")
-	h.f.srv.openIncident(incidentSignal{kind: EventNodeOffline, nodeID: "c", subject: "name-c", since: h.now(),
-		msg: incidentMessage{title: "Lattice node offline: name-c", detail: "d", line: "l"}}, h.now())
+	// A warning incident on the same rules never escalates.
+	h.f.srv.openIncident(incidentSignal{kind: EventAgentStalled, nodeID: "c", subject: "name-c", since: h.now(),
+		msg: incidentMessage{title: "Agent loop stalled: name-c", detail: "d", line: "l"}}, h.now())
 	h.sweep()
 	cookies, csrf := loginSession(t, h.f.handler)
 	res := doJSON(t, h.f.handler, http.MethodPost, "/api/incidents/ack", fmt.Sprintf(`{"id":%q}`, h.incident(EventServiceDown, "b").ID), cookies, csrf)
@@ -351,6 +352,46 @@ func TestUnacknowledgedCriticalIncidentEscalatesOncePerRule(t *testing.T) {
 	}
 }
 
+// A node that stopped reporting is critical (2026-10-02 operator answer: node
+// keepalive is what to be told about), so an unacknowledged node.offline is
+// re-sent at Bark critical after the default 30 minutes, once.
+func TestUnacknowledgedNodeOfflineEscalatesAtCritical(t *testing.T) {
+	h := newIncidentHarness(t, "c")
+	sends := &escalationSends{}
+	sends.install(h.f.srv)
+	addNotifyChannel(t, h.f.st, "nc-urgent", "Bark urgent")
+	if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-default", Name: "nr-default", EventTypes: []string{EventNodeOffline}, ChannelIDs: []string{"nc-urgent"}, Enabled: true}, store.NotifyRuleOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := notifyEventSeverity(EventNodeOffline); got != incidentSeverityCritical {
+		t.Fatalf("node.offline severity = %q", got)
+	}
+	if got := notifyEventSeverity(EventNodeOnline); got != incidentSeverityCritical {
+		t.Fatalf("node.online severity = %q, want the severity of the incident it closes", got)
+	}
+	h.f.srv.openIncident(incidentSignal{kind: EventNodeOffline, nodeID: "c", subject: "name-c", since: h.now(),
+		msg: incidentMessage{title: "Lattice node offline: name-c", detail: "d", line: "l"}}, h.now())
+	h.sweep()
+	h.clock.advance(29 * time.Minute)
+	h.sweep()
+	waitOutboxSettled(t, h.f.srv)
+	if got := sends.take(); len(got) != 0 {
+		t.Fatalf("escalated before 30 min: %v", got)
+	}
+	h.clock.advance(time.Minute)
+	h.sweep()
+	waitOutboxSettled(t, h.f.srv)
+	if got := sends.take(); len(got) != 1 || got[0] != "nc-urgent level=critical Not acknowledged after 30 min: Lattice node offline: name-c" {
+		t.Fatalf("escalation = %v", got)
+	}
+	h.clock.advance(3 * time.Hour)
+	h.sweep()
+	waitOutboxSettled(t, h.f.srv)
+	if got := sends.take(); len(got) != 0 {
+		t.Fatalf("escalated twice: %v", got)
+	}
+}
+
 // Quiet hours hold a rule's non-critical deliveries until the window ends
 // (also across a restart), and a critical event breaks through. The window is
 // set around the wall clock, because the restarted process reads it.
@@ -367,9 +408,9 @@ func TestQuietHoursHoldNonCriticalDeliveries(t *testing.T) {
 		store.NotifyRuleOptions{QuietHours: quiet}); err != nil {
 		t.Fatal(err)
 	}
-	f.srv.notifyEventTyped(EventNodeOffline, "Lattice node offline: alpha", "b")
+	f.srv.notifyEventTyped(EventAgentStalled, "Agent loop stalled: alpha", "b")
 	f.srv.notifyEventTyped(EventServiceDown, "sing-box down on alpha", "b")
-	held := deliveriesOf(f.st, store.NotifyDeliveryFilter{EventType: EventNodeOffline})
+	held := deliveriesOf(f.st, store.NotifyDeliveryFilter{EventType: EventAgentStalled})
 	want := now.Add(2 * time.Hour)
 	if len(held) != 1 || !held[0].HeldUntil.Equal(want) || !held[0].NextAttemptAt.Equal(want) || held[0].Settled() {
 		t.Fatalf("held row = %+v (want held until %s)", held, want)
@@ -850,11 +891,11 @@ func TestQuietHoursReleaseIncidentMessagesInOrderAndWithdrawTheSettled(t *testin
 		t.Fatal(err)
 	}
 	offline := func(nodeID string) {
-		h.f.srv.openIncident(incidentSignal{kind: EventNodeOffline, nodeID: nodeID, subject: "name-" + nodeID, since: h.now(),
+		h.f.srv.openIncident(incidentSignal{kind: EventAgentStalled, nodeID: nodeID, subject: "name-" + nodeID, since: h.now(),
 			msg: incidentMessage{title: "Lattice node offline: name-" + nodeID, detail: "d", line: "l"}}, h.now())
 	}
 	online := func(nodeID string) {
-		h.f.srv.resolveIncident(incidentKey(EventNodeOffline, nodeID, ""), h.now(),
+		h.f.srv.resolveIncident(incidentKey(EventAgentStalled, nodeID, ""), h.now(),
 			incidentMessage{title: "Lattice node online: name-" + nodeID, detail: "d", line: "l"})
 	}
 	step := func(do func()) {
@@ -879,7 +920,7 @@ func TestQuietHoursReleaseIncidentMessagesInOrderAndWithdrawTheSettled(t *testin
 	step(func() { online("c") })
 	step(func() { offline("c") }) // reopens c's record
 	cookies, csrf := loginSession(t, h.f.handler)
-	res := doJSON(t, h.f.handler, http.MethodPost, "/api/incidents/ack", fmt.Sprintf(`{"id":%q}`, h.incident(EventNodeOffline, "d").ID), cookies, csrf)
+	res := doJSON(t, h.f.handler, http.MethodPost, "/api/incidents/ack", fmt.Sprintf(`{"id":%q}`, h.incident(EventAgentStalled, "d").ID), cookies, csrf)
 	res.Body.Close()
 	if got := sent(); len(got) != 2 {
 		t.Fatalf("held messages went out inside quiet hours: %q", got)

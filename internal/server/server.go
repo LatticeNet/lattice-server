@@ -250,8 +250,9 @@ type Server struct {
 	shareRenderBudget *ratelimit.Limiter
 	// vpnCoreGen advances on every committed vpn-core write; a plugin link
 	// source refreshed before the current generation is due. See
-	// share_fleet_changes.go.
+	// share_fleet_changes.go. vpnCoreLinks paces the advances.
 	vpnCoreGen            atomic.Uint64
+	vpnCoreLinks          vpnCoreLinkChanges
 	shareRenderMu         sync.Mutex
 	shareRenderFlights    map[subscriptionCacheKey]*shareRenderFlight
 	shareRenderJoinWaiter chan struct{}

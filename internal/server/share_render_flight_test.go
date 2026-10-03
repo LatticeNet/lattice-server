@@ -333,6 +333,8 @@ func TestALinkCannotSpendRendersPastItsBudget(t *testing.T) {
 // the snapshot to age past the refresh interval and the cache past its TTL.
 func TestAVPNCoreChangeReachesPluginLinksOnTheNextFetch(t *testing.T) {
 	s, _, path := flightShareServer(t)
+	now := s.now()
+	s.now = func() time.Time { return now }
 	var renders, fetches atomic.Int64
 	content := "nodes"
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
@@ -367,8 +369,10 @@ func TestAVPNCoreChangeReachesPluginLinksOnTheNextFetch(t *testing.T) {
 		t.Fatalf("the refreshed source was refreshed again: fetches %d", fetches.Load())
 	}
 
-	// A change that moved it is served on the next fetch.
+	// A change that moved it is served on the next fetch. It comes after a
+	// quiet pacing interval, so it advances the generation at once.
 	content = "nodes without the suspended identity"
+	now = now.Add(vpnCoreLinkChangeInterval)
 	s.triggerVPNCoreMutation()
 	if got := fetch(); got != "render of nodes without the suspended identity" || renders.Load() != 2 {
 		t.Fatalf("moved content: %q after %d renders", got, renders.Load())

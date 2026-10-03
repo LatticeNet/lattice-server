@@ -342,6 +342,8 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	var cached bool
 	var cacheEpoch uint64
 	if share.Source.Kind == model.ShareSourcePlugin {
+		// A held vpn-core change expires the cached bodies before the lookup.
+		s.settleVPNCoreChanges()
 		cacheEntry, cached, cacheEpoch = s.subscriptionCacheSnapshotForSource(share.Source.PluginID, share.Source.SubscriptionID, key, false, s.now())
 	}
 	// served is the body this response carries; userinfo and the snapshot

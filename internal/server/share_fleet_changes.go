@@ -1,6 +1,10 @@
 package server
 
 import (
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
@@ -12,30 +16,87 @@ import (
 // interval and a client happened to poll, up to 30 minutes later plus the
 // cache's own 30 minutes.
 //
-// Every committed vpn-core write now advances one generation. A plugin
-// source's snapshot counts as fresh only if its last committed refresh
-// started at the current generation, and every cached plugin link body is
-// expired (kept, not dropped) at the change. The next fetch of a link
+// A committed vpn-core write now advances one generation. A plugin source's
+// snapshot counts as fresh only if its last committed refresh started at the
+// current generation, and every cached plugin link body is expired (kept,
+// not dropped) when the generation advances. The next fetch of a link
 // therefore revalidates: it refreshes the snapshot, and when the content did
 // not move it extends the body it already had (no render, since the refresh
 // publishes nothing); when it moved, the refresh publishes and the link
 // renders the new content.
 //
-// The core cannot tell which records read vpn-core, so a change makes every
+// The core cannot tell which records read vpn-core, so an advance makes every
 // plugin source due; one that did not move costs a provider fetch and no
 // render. A plugin method naming the records that depend on vpn-core would
 // narrow this (logged for the Sub-Store lane).
 //
+// Writes arrive in bursts (a bulk identity import, a quota sweep suspending
+// many identities, an operator editing several lines), and advancing once per
+// write cost each polled source one provider fetch per write. The generation
+// therefore advances at most once per vpnCoreLinkChangeInterval: a write
+// after a quiet interval advances it at once, so a single suspension still
+// reaches links on the next poll; a write inside the interval is held and
+// applied by the first link fetch after the interval ends. A burst costs each
+// source at most two refreshes, and a long run of writes at most one per
+// interval. The interval matches subscriptionStaleRetryInterval, the bound a
+// failing source already retries at.
+//
 // The generation lives in memory. A restart forgets a change whose sources
 // were not refreshed yet, and such a snapshot is then served until its own
 // refresh interval passes (at most 30 minutes after it was fetched).
+const vpnCoreLinkChangeInterval = subscriptionStaleRetryInterval
 
-// noteVPNCoreChangeForLinks advances the vpn-core generation and expires
-// every cached plugin link body. It is cheap (one pass over at most the
-// cache's 512 entries) and runs on every committed vpn-core write.
+// vpnCoreLinkChanges paces generation advances. pending is read without the
+// lock on every plugin link fetch, so the common case (nothing held back)
+// costs one atomic load.
+type vpnCoreLinkChanges struct {
+	mu      sync.Mutex
+	last    time.Time // when the generation last advanced
+	pending atomic.Bool
+}
+
+// noteVPNCoreChangeForLinks runs on every committed vpn-core write. It
+// advances the generation now, or holds the change for the end of the
+// interval when the generation advanced less than an interval ago.
 func (s *Server) noteVPNCoreChangeForLinks() {
-	s.vpnCoreGen.Add(1)
 	now := s.now()
+	c := &s.vpnCoreLinks
+	c.mu.Lock()
+	if !c.last.IsZero() && now.Sub(c.last) < vpnCoreLinkChangeInterval {
+		c.pending.Store(true)
+		c.mu.Unlock()
+		return
+	}
+	c.last = now
+	c.pending.Store(false)
+	c.mu.Unlock()
+	s.advanceVPNCoreGeneration(now)
+}
+
+// settleVPNCoreChanges applies a held change once its interval has ended.
+// Link fetches and source refreshes call it before they read the generation.
+func (s *Server) settleVPNCoreChanges() {
+	c := &s.vpnCoreLinks
+	if !c.pending.Load() {
+		return
+	}
+	now := s.now()
+	c.mu.Lock()
+	if !c.pending.Load() || now.Sub(c.last) < vpnCoreLinkChangeInterval {
+		c.mu.Unlock()
+		return
+	}
+	c.last = now
+	c.pending.Store(false)
+	c.mu.Unlock()
+	s.advanceVPNCoreGeneration(now)
+}
+
+// advanceVPNCoreGeneration advances the vpn-core generation and expires every
+// cached plugin link body. It is cheap (one pass over the shares and at most
+// the cache's 512 entries) and runs at most once per interval.
+func (s *Server) advanceVPNCoreGeneration(now time.Time) {
+	s.vpnCoreGen.Add(1)
 	for _, share := range s.store.SubscriptionSharesUnordered() {
 		if share.Source.Kind == model.ShareSourcePlugin {
 			s.subscriptionCache.ExpireShare(share.ID, now)

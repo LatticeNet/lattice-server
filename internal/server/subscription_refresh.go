@@ -141,6 +141,9 @@ func (s *Server) acquireSubscriptionPluginGate(ctx context.Context, pluginID str
 }
 
 func (s *Server) captureSubscriptionRefreshAuthority(ctx context.Context, pluginID, subscriptionID string, force bool) (authority subscriptionRefreshAuthority, err error) {
+	// A vpn-core change held back by the pacing interval lands before the
+	// generation is read; see share_fleet_changes.go.
+	s.settleVPNCoreChanges()
 	pluginMutation, releasePlugin, err := s.acquireSubscriptionPluginGate(ctx, pluginID)
 	if err != nil {
 		return authority, err
@@ -293,6 +296,26 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 			return model.SubscriptionSnapshot{}, fmt.Errorf("subscription provider fetch failed for %s/%s", pluginID, subscriptionID)
 		}
 		s.logger.Printf("subscription snapshot: provider fetch failed for %s/%s; preserving last-good (%s)", pluginID, subscriptionID, subscriptionDiagnosticSummary(err))
+		// A snapshot still young enough to be fresh was refreshed only because a
+		// vpn-core change made it due. Marking it stale for that failure turned
+		// a check into an outage: every share of the source re-rendered with
+		// the stale marker, and the source retried the provider every
+		// subscriptionStaleRetryInterval while polled. The snapshot is what the
+		// link served before the change, so it keeps serving unmarked; the
+		// attempt settles this generation, and the next change or the regular
+		// refresh interval tries again. Nothing is persisted or published.
+		if !force && !existing.Stale && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval {
+			publication.vpnGen = authority.vpnGen
+			s.recordAudit(model.AuditEvent{
+				ID: id.New("audit"), Action: auditActionSubscriptionFetch, Decision: "observe",
+				Reason: "refresh after a vpn-core change failed; serving the snapshot from before it",
+				Metadata: map[string]string{
+					"plugin_id": pluginID, "subscription_id": subscriptionID, "stale": "false",
+					"snapshot_age_seconds": fmt.Sprintf("%.0f", s.now().Sub(existing.FetchedAt).Seconds()),
+				},
+			})
+			return existing, nil
+		}
 		// Only the first failure moves what a share serves: the body becomes the
 		// last good one, marked stale. A retry during the same outage changes
 		// nothing but the retry timestamp, so it publishes nothing and the

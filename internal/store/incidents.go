@@ -89,10 +89,15 @@ type Incident struct {
 	ResolvedAt    time.Time `json:"resolved_at,omitzero"`
 	UpdatedAt     time.Time `json:"updated_at"`
 
-	AckedBy      string    `json:"acked_by,omitempty"`
-	AckedAt      time.Time `json:"acked_at,omitzero"`
-	SnoozedBy    string    `json:"snoozed_by,omitempty"`
-	SnoozedUntil time.Time `json:"snoozed_until,omitzero"`
+	AckedBy string    `json:"acked_by,omitempty"`
+	AckedAt time.Time `json:"acked_at,omitzero"`
+	// AckCancelledOpen records that the acknowledgement cancelled an open
+	// message that was owed: one a window, a snooze or flap damping held,
+	// or a snooze reminder that fell due while acknowledged. Undoing the
+	// acknowledgement owes it again.
+	AckCancelledOpen bool      `json:"ack_cancelled_open,omitempty"`
+	SnoozedBy        string    `json:"snoozed_by,omitempty"`
+	SnoozedUntil     time.Time `json:"snoozed_until,omitzero"`
 
 	// Notified is what the phone was last told (IncidentNotified*), and
 	// NotifiedAt when. OpenNotifiedAt is when it was last told "open", which

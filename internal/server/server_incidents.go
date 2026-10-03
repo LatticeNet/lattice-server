@@ -20,6 +20,7 @@ import (
 //
 //	GET  /api/incidents                  monitor:read, filtered to the caller's nodes
 //	POST /api/incidents/ack              monitor:admin on the incident's node
+//	POST /api/incidents/unack            monitor:admin on the incident's node
 //	POST /api/incidents/snooze           monitor:admin on the incident's node
 //	GET  /api/maintenance-windows        monitor:read, filtered to the caller's nodes
 //	POST /api/maintenance-windows        monitor:admin on every covered node
@@ -368,6 +369,7 @@ func (s *Server) handleIncidentAck(w http.ResponseWriter, r *http.Request, p pri
 	if inc.State != store.IncidentStateAcknowledged {
 		inc.State = store.IncidentStateAcknowledged
 		inc.AckedBy, inc.AckedAt = principalLabel(p), now
+		inc.AckCancelledOpen = inc.OwedOpen
 		inc.OwedOpen = false
 		inc.UpdatedAt = now
 		if err := s.store.PutIncidents(inc); err != nil {
@@ -378,6 +380,93 @@ func (s *Server) handleIncidentAck(w http.ResponseWriter, r *http.Request, p pri
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.ack", Scope: "monitor:admin",
 		Metadata: map[string]string{"incident_id": inc.ID, "kind": inc.Kind}})
 	writeJSON(w, http.StatusOK, s.toIncidentView(inc, now, s.maintenanceCoverAt(now), s.nodeNames()))
+}
+
+// handleIncidentUnack undoes an acknowledgement while the incident is still
+// open. Everything the acknowledgement stopped resumes as if it had not
+// happened: the escalation clock still runs from the open message, an open
+// message it cancelled is owed again (one a window or a snooze held, or a
+// snooze reminder that fell due meanwhile), and an open message that quiet
+// hours held and then withdrew because of it goes out again through the
+// rules that withdrew it. A closed incident is refused; one that is not
+// acknowledged is left as it is, like acknowledging twice.
+func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p principal) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if !decodeClientJSON(w, r, &req) {
+		return
+	}
+	if _, ok := s.incidentActionTarget(w, p, req.ID, "incident.unack"); !ok {
+		return
+	}
+	now := s.now()
+	cover := s.maintenanceCoverAt(now)
+	s.incidentMu.Lock()
+	inc, ok := s.store.Incident(req.ID)
+	if !ok || !inc.Active() {
+		s.incidentMu.Unlock()
+		writeError(w, http.StatusConflict, errors.New("only an open incident can be un-acknowledged"))
+		return
+	}
+	ackedAt := inc.AckedAt
+	if inc.State == store.IncidentStateAcknowledged {
+		inc.State = store.IncidentStateOpen
+		inc.OwedOpen = inc.OwedOpen || inc.AckCancelledOpen
+		inc.AckCancelledOpen = false
+		inc.AckedBy, inc.AckedAt = "", time.Time{}
+		inc.UpdatedAt = now
+		if !inc.OwedOpen {
+			if rules := s.rulesThatWithdrewOpen(inc, ackedAt); len(rules) > 0 {
+				if incidentOpenHold(inc, now, cover) != "" {
+					// Held again now: the sweep sends it when the hold ends.
+					inc.OwedOpen = true
+				} else {
+					// Into the outbox first, then the record, as the sweep does.
+					for i := range rules {
+						s.commitNotifyPlan(s.planNotifyEvent(inc.Kind, inc.Title+flappingSuffix(inc), inc.Detail,
+							notifyEnqueue{source: store.NotifySourceServer, onlyRule: &rules[i], incidentIDs: []string{inc.ID}}))
+					}
+				}
+			}
+		}
+		if err := s.store.PutIncidents(inc); err != nil {
+			s.logger.Printf("incidents: record unack %s: %v", inc.ID, err)
+		}
+	}
+	s.incidentMu.Unlock()
+	meta := map[string]string{"incident_id": inc.ID, "kind": inc.Kind}
+	if !ackedAt.IsZero() {
+		meta["acked_at"] = stamp(ackedAt)
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.unack", Scope: "monitor:admin", Metadata: meta})
+	writeJSON(w, http.StatusOK, s.toIncidentView(inc, now, cover, s.nodeNames()))
+}
+
+// rulesThatWithdrewOpen lists the enabled rules whose quiet-hours copy of
+// inc's open message was withdrawn at or after ackedAt, which is what an
+// acknowledgement does to a held open message when quiet hours end.
+func (s *Server) rulesThatWithdrewOpen(inc store.Incident, ackedAt time.Time) []model.NotifyRule {
+	if ackedAt.IsZero() {
+		return nil
+	}
+	withdrew := map[string]bool{}
+	for _, row := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, EventType: inc.Kind}) {
+		if row.Reason == notifyWithdrawnOpen && row.RuleID != "" && !row.SettledAt.Before(ackedAt) && slices.Contains(row.IncidentIDs, inc.ID) {
+			withdrew[row.RuleID] = true
+		}
+	}
+	var out []model.NotifyRule
+	for _, rule := range s.store.EnabledNotifyRules() {
+		if withdrew[rule.ID] {
+			out = append(out, rule)
+		}
+	}
+	return out
 }
 
 // handleIncidentSnooze holds an open incident's messages until a time:

@@ -1380,6 +1380,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
 	mux.HandleFunc("/api/incidents", s.withAuth("monitor:read", s.handleIncidents))
 	mux.HandleFunc("/api/incidents/ack", s.withAuth("monitor:admin", s.handleIncidentAck))
+	mux.HandleFunc("/api/incidents/unack", s.withAuth("monitor:admin", s.handleIncidentUnack))
 	mux.HandleFunc("/api/incidents/snooze", s.withAuth("monitor:admin", s.handleIncidentSnooze))
 	mux.HandleFunc("/api/maintenance-windows", s.withAuth("monitor:read", s.handleMaintenanceWindows))
 	mux.HandleFunc("/api/maintenance-windows/delete", s.withAuth("monitor:admin", s.handleDeleteMaintenanceWindow))

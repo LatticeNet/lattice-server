@@ -196,7 +196,7 @@ func (s *Server) openIncident(sig incidentSignal, now time.Time) {
 	inc.RecoveryTitle, inc.RecoveryDetail, inc.RecoveryLine = "", "", ""
 	// A reopening is a new occurrence: whoever acknowledged the last one has
 	// not seen this one.
-	inc.AckedBy, inc.AckedAt = "", time.Time{}
+	inc.AckedBy, inc.AckedAt, inc.AckCancelledOpen = "", time.Time{}, false
 	if inc.Notified == store.IncidentNotifiedOpen {
 		// The phone still says down (a damped recovery never went out), which
 		// is true again: nothing is owed in either direction.
@@ -400,11 +400,15 @@ func (s *Server) evaluateIncidents(now time.Time) {
 		}
 
 		// A snooze that ran out on an incident still open and unacknowledged
-		// sends one reminder.
+		// sends one reminder. On an acknowledged one the reminder is kept
+		// aside, owed again if the acknowledgement is undone.
 		if !inc.SnoozedUntil.IsZero() && !now.Before(inc.SnoozedUntil) {
 			inc.SnoozedUntil, inc.SnoozedBy = time.Time{}, ""
-			if inc.State == store.IncidentStateOpen {
+			switch inc.State {
+			case store.IncidentStateOpen:
 				inc.OwedOpen = true
+			case store.IncidentStateAcknowledged:
+				inc.AckCancelledOpen = true
 			}
 			dirty = true
 		}
@@ -413,6 +417,7 @@ func (s *Server) evaluateIncidents(now time.Time) {
 			switch {
 			case !inc.Active() || inc.State == store.IncidentStateAcknowledged:
 				// Someone has seen it, or it is over: no open is owed.
+				inc.AckCancelledOpen = inc.AckCancelledOpen || inc.State == store.IncidentStateAcknowledged
 				inc.OwedOpen = false
 				dirty = true
 			default:

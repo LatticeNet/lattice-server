@@ -22,6 +22,7 @@ func TestDeriveNodeStatusPrecedenceAndBoundaries(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		node      model.Node
+		slack     time.Duration
 		problems  []degradation
 		want      string
 		wantSince time.Time
@@ -63,6 +64,18 @@ func TestDeriveNodeStatusPrecedenceAndBoundaries(t *testing.T) {
 			want: NodeStatusOffline, wantSince: now.Add(-nodeOfflineThreshold - time.Nanosecond),
 		},
 		{
+			name:  "a LastSeen loaded after a crash is judged with the slack until the node beats",
+			node:  model.Node{Online: true, LastSeen: now.Add(-nodeOfflineThreshold - 4*time.Minute), OnlineSince: cameUp, CreatedAt: enrolled},
+			slack: store.NodeLastSeenDiskLag,
+			want:  NodeStatusOnline, wantSince: cameUp,
+		},
+		{
+			name:  "one nanosecond past the threshold and the slack is offline",
+			node:  model.Node{Online: true, LastSeen: now.Add(-nodeOfflineThreshold - store.NodeLastSeenDiskLag - time.Nanosecond), OnlineSince: cameUp, CreatedAt: enrolled},
+			slack: store.NodeLastSeenDiskLag,
+			want:  NodeStatusOffline, wantSince: now.Add(-nodeOfflineThreshold - store.NodeLastSeenDiskLag - time.Nanosecond),
+		},
+		{
 			name:     "a proven problem on a live agent is degraded from the problem start",
 			node:     model.Node{Online: true, LastSeen: fresh, OnlineSince: cameUp, CreatedAt: enrolled},
 			problems: []degradation{problem},
@@ -86,7 +99,7 @@ func TestDeriveNodeStatusPrecedenceAndBoundaries(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := deriveNodeStatus(tc.node, now, tc.problems)
+			got := deriveNodeStatus(tc.node, now, tc.slack, tc.problems)
 			if got.Status != tc.want {
 				t.Fatalf("status = %q, want %q (reason %q)", got.Status, tc.want, got.Reason)
 			}

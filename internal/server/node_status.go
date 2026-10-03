@@ -70,12 +70,16 @@ type degradation struct {
 }
 
 func (s *Server) nodeStatusFor(n model.Node, now time.Time) nodeStatus {
-	return deriveNodeStatus(n, now, s.nodeDegradations(n, now))
+	return deriveNodeStatus(n, now, s.store.NodeLastSeenSlack(n.ID), s.nodeDegradations(n, now))
 }
 
 // deriveNodeStatus applies the precedence above. Pure, so every boundary is a
-// table test; the store lookups live in nodeDegradations.
-func deriveNodeStatus(n model.Node, now time.Time, problems []degradation) nodeStatus {
+// table test; the store lookups live in nodeDegradations. slack is how far the
+// node's LastSeen may trail its last real beat (store.NodeLastSeenSlack): after
+// a crash, a LastSeen loaded from disk and not yet confirmed by a beat is a
+// lower bound, and judging it against the bare threshold showed a fleet that
+// was beating as offline until each node beat again.
+func deriveNodeStatus(n model.Node, now time.Time, slack time.Duration, problems []degradation) nodeStatus {
 	switch {
 	case n.Disabled:
 		reason := "Disabled by an operator; the agent token is refused until the node is enabled again."
@@ -89,7 +93,7 @@ func deriveNodeStatus(n model.Node, now time.Time, problems []degradation) nodeS
 			reason = fmt.Sprintf("No report has arrived since enrollment at %s.", stamp(n.CreatedAt))
 		}
 		return nodeStatus{Status: NodeStatusNeverReported, Since: n.CreatedAt, Reason: reason}
-	case !n.Online || now.Sub(n.LastSeen) > nodeOfflineThreshold:
+	case !n.Online || now.Sub(n.LastSeen) > nodeOfflineThreshold+slack:
 		return nodeStatus{
 			Status: NodeStatusOffline,
 			Since:  n.LastSeen,

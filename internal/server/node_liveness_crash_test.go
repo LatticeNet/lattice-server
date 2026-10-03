@@ -79,3 +79,52 @@ func TestCrashRestartFlipsNoFleetAndStillPagesTheNodeThatDied(t *testing.T) {
 	srv.sweepNodeLiveness(boot.Add(10*time.Minute), sweepCause)
 	expectNoNotice(t, l, "the same spell, later")
 }
+
+// The console's status word and the pending incident list read the same
+// LastSeen as the sweep. After a crash they judge it with the same slack, or
+// a fleet that was beating shows offline, and pends a node.offline for every
+// node, until each node beats again.
+func TestCrashRestartShowsTheFleetOnlineUntilItCouldHaveBeaten(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	first, err := store.OpenWithCipher(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	if err := first.UpsertNode(model.Node{ID: "n-a", Name: "a", Online: true, LastSeen: t0, OnlineSince: t0.Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	// The crash: the first store is never closed.
+	st, err := store.OpenWithCipher(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendsOffline := func(at time.Time) bool {
+		for _, inc := range srv.pendingIncidents(at) {
+			if inc.Kind == EventNodeOffline && inc.NodeID == "n-a" {
+				return true
+			}
+		}
+		return false
+	}
+	n, _ := st.Node("n-a")
+
+	boot := t0.Add(4*time.Minute + 45*time.Second)
+	if got := srv.nodeStatusFor(n, boot); got.Status != NodeStatusOnline {
+		t.Fatalf("status at start after a crash = %q (%s), want online", got.Status, got.Reason)
+	}
+	if pendsOffline(boot) {
+		t.Fatal("a pending node.offline is listed at start after a crash")
+	}
+	past := t0.Add(nodeOfflineThreshold + store.NodeLastSeenDiskLag + time.Second)
+	if got := srv.nodeStatusFor(n, past); got.Status != NodeStatusOffline {
+		t.Fatalf("status past the threshold and the slack = %q, want offline", got.Status)
+	}
+	if !pendsOffline(past) {
+		t.Fatal("no pending node.offline past the threshold and the slack, inside the delay")
+	}
+}

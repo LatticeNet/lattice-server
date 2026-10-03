@@ -47,6 +47,8 @@ func approvalDisplayReason(a model.Approval) string {
 		return "Apply Cloudflare Tunnel config"
 	case a.Plugin == "wireguard" && a.Action == "apply-config":
 		return "Apply WireGuard mesh config"
+	case isWitnessApproval(a):
+		return witnessDisplayReason(a)
 	default:
 		return approvalFallbackReason(a)
 	}

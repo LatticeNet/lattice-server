@@ -495,6 +495,10 @@ type Server struct {
 	// must heartbeat again before capability-gated tasks can be queued.
 	agentCapabilitiesMu sync.RWMutex
 	agentCapabilities   map[string]map[string]struct{}
+	// witness is the control-plane witness status each witness node's agent
+	// relays on its heartbeat (server_witness_status.go). Memory only, like
+	// agentRuntime.
+	witness witnessReports
 
 	// pendingSingboxProbeNodeIDs maps a node ID to the task ID of the most recent
 	// probe task. Entries are written and evicted exclusively by
@@ -1282,6 +1286,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:admin", s.handleDeleteNotifyChannel))
 	mux.HandleFunc("/api/notify/channels/test", s.withAuth("notify:admin", s.handleNotifyChannelTest))
 	mux.HandleFunc("/api/notify/deliveries", s.withAuth("notify:admin", s.handleNotifyDeliveries))
+	mux.HandleFunc("/api/notify/witness", s.withAuth("notify:admin", s.handleWitnessStatus))
+	mux.HandleFunc("/api/notify/witness/plan", s.withAuth("notify:admin", s.handleWitnessPlan))
 	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:admin", s.handleNotifyRules))
 	mux.HandleFunc("/api/notify/rules/delete", s.withAuth("notify:admin", s.handleDeleteNotifyRule))
 	mux.HandleFunc("/api/notify/webhooks", s.withAuth("notify:admin", s.handleNotifyWebhooks))
@@ -2718,6 +2724,8 @@ func (s *Server) replaceAgentCapabilitiesUnlocked(nodeID string, capabilities []
 			known[lineChainDurableCapability] = struct{}{}
 		case singBoxUserDelByNameCapability:
 			known[singBoxUserDelByNameCapability] = struct{}{}
+		case witnessCapability:
+			known[witnessCapability] = struct{}{}
 		}
 	}
 	s.agentCapabilitiesMu.Lock()
@@ -5358,15 +5366,21 @@ type notifyChannelView struct {
 	// Health is joined from the outbox's health record at read time; it is
 	// never part of the stored channel.
 	Health notifyChannelHealthView `json:"health"`
+	// FallbackChannelID takes the critical messages this channel fails
+	// (notify_channel_fallback.go); CriticalEventTypes names them, so the
+	// console never keeps its own copy of the list.
+	FallbackChannelID  string   `json:"fallback_channel_id,omitempty"`
+	CriticalEventTypes []string `json:"critical_event_types"`
 }
 
-func toNotifyChannelView(c model.NotifyChannel, h store.NotifyChannelHealth, now time.Time) notifyChannelView {
+func toNotifyChannelView(c model.NotifyChannel, h store.NotifyChannelHealth, opts store.NotifyChannelOptions, now time.Time) notifyChannelView {
 	keys := make([]string, 0, len(c.Config))
 	for k := range c.Config {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt, Health: toNotifyChannelHealthView(h, now)}
+	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt, Health: toNotifyChannelHealthView(h, now),
+		FallbackChannelID: opts.FallbackChannelID, CriticalEventTypes: notifyCriticalEventList()}
 }
 
 func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p principal) {
@@ -5379,10 +5393,11 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		}
 		channels := s.store.NotifyChannels()
 		health := s.store.NotifyChannelHealths()
+		opts := s.store.NotifyChannelOptionsByChannel()
 		now := s.now()
 		views := make([]notifyChannelView, 0, len(channels))
 		for _, c := range channels {
-			views = append(views, toNotifyChannelView(c, health[c.ID], now))
+			views = append(views, toNotifyChannelView(c, health[c.ID], opts[c.ID], now))
 		}
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
@@ -5398,6 +5413,9 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			Kind    string            `json:"kind"`
 			Config  map[string]string `json:"config"`
 			Enabled *bool             `json:"enabled"`
+			// FallbackChannelID takes this channel's failed critical
+			// messages; nil keeps the stored value, "" clears it.
+			FallbackChannelID *string `json:"fallback_channel_id"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -5425,13 +5443,22 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			Config:  req.Config,
 			Enabled: req.Enabled == nil || *req.Enabled,
 		}
-		for _, existing := range s.store.NotifyChannels() {
+		existingChannels := s.store.NotifyChannels()
+		for _, existing := range existingChannels {
 			if existing.ID == channel.ID {
 				channel.CreatedAt = existing.CreatedAt
 				break
 			}
 		}
-		if err := s.store.UpsertNotifyChannel(channel); err != nil {
+		opts := s.store.NotifyChannelOptionsByChannel()[channel.ID]
+		if req.FallbackChannelID != nil {
+			opts.FallbackChannelID = strings.TrimSpace(*req.FallbackChannelID)
+		}
+		if err := validateNotifyChannelFallback(opts.FallbackChannelID, channel.ID, existingChannels); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertNotifyChannelWithOptions(channel, opts); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -5439,9 +5466,13 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		if req.ID != "" {
 			action = "notify.channel.update"
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
+		metadata := map[string]string{"channel_id": channel.ID, "kind": channel.Kind}
+		if opts.FallbackChannelID != "" {
+			metadata["fallback_channel_id"] = opts.FallbackChannelID
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: metadata})
 		health, _ := s.store.NotifyChannelHealth(channel.ID)
-		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, s.now()))
+		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, opts, s.now()))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -6922,6 +6953,14 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case "cftunnel":
 		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
+	case witnessPlugin:
+		// A witness plan names a stored notification channel and a prefix
+		// of its key's hash, and it hands that key to a node. Authoring and
+		// deciding one both need notify:admin, and channels are fleet-wide,
+		// so reading one needs it unconfined as well.
+		return !principalHasNodeRestriction(p) &&
+			rbac.Allows(p.Principal, "notify:admin", "") &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case sshGuardPlugin:
 		// An SSH Guard plan carries the node's knock sequence in plaintext,
 		// inside the knockd block a reviewer is meant to read. The sequence is
@@ -6971,6 +7010,8 @@ func approvalApplyTaskTimeoutSec(plugin string) int {
 		return 600
 	case "nft", "nftpolicy", "selfdns":
 		return networkApplyTaskTimeoutSec
+	case witnessPlugin:
+		return witnessApplyTaskTimeoutSec
 	default:
 		return defaultTaskTimeoutSec
 	}
@@ -7189,6 +7230,15 @@ func (s *Server) applyScriptFor(approval model.Approval) string {
 	if approval.Plugin == singBoxLineMetaPlugin {
 		return s.lineMetaApplyScript(approval)
 	}
+	if approval.Plugin == witnessPlugin {
+		script, err := s.witnessApplyScript(approval)
+		if err != nil {
+			return "set -e\n" +
+				"echo " + shellQuote("lattice witness: invalid approval: "+err.Error()) + " >&2\n" +
+				"exit 1\n"
+		}
+		return script
+	}
 	return applyScriptForWithServer(approval, s.publicURL)
 }
 
@@ -7234,6 +7284,11 @@ func applyScriptForWithServer(approval model.Approval, serverURL string) string 
 	case proxyCorePlugin:
 		return "set -e\n" +
 			"echo " + shellQuote("lattice proxycore: server-backed apply context required; re-approve through /api/network/approvals/approve") + " >&2\n" +
+			"exit 1\n"
+	case witnessPlugin:
+		// The configure script carries a key only the server can read.
+		return "set -e\n" +
+			"echo " + shellQuote("lattice witness: server-backed apply context required; re-approve through /api/network/approvals/approve") + " >&2\n" +
 			"exit 1\n"
 	case agentUpdatePlugin:
 		script, err := agentUpdateApplyScript(approval, serverURL)
@@ -8034,6 +8089,26 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 		}
 	}
+	if isWitnessApproval(approval) {
+		// The configure script carries a key read when the approval is
+		// decided, and nothing renders one later: approved without its task,
+		// a witness approval could never be applied, and approve is a no-op
+		// once it is no longer pending.
+		if !queueApply {
+			return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest,
+				witnessPlugin+" approvals must queue their apply task: approve with queue_apply, since an approval approved without one can never be applied")}
+		}
+		if err := s.requireCurrentWitnessApproval(approval); err != nil {
+			if rejectErr := s.rejectApprovalWithReason(approval, err.Error()); rejectErr != nil {
+				return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: rejectErr}
+			}
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+		if approval.Action == witnessConfigureAction && !s.agentHasCapability(approval.NodeID, witnessCapability) {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest,
+				"node agent has not advertised "+witnessCapability+"; update or reconnect the agent before applying")}
+		}
+	}
 	if queueApply && isNetGuardApproval(approval) && !s.agentHasCapability(approval.NodeID, netGuardManagedSHACapability) {
 		return approval, &approvalDecisionError{
 			status: http.StatusConflict,
@@ -8116,6 +8191,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			applyScript = s.managedLineApplyScript(approval)
 		case lineChainPlugin:
 			applyScript = lineChainScript
+		case witnessPlugin:
+			var err error
+			applyScript, err = s.witnessApplyScript(approval)
+			if err != nil {
+				return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+			}
 		default:
 			applyScript = s.applyScriptFor(approval)
 		}
@@ -8561,6 +8642,9 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 		return "vpncore:admin"
 	case "cftunnel":
 		return "tunnel:admin"
+	case witnessPlugin:
+		// Approving hands a stored channel's device key to a node.
+		return "notify:admin"
 	default:
 		return ""
 	}
@@ -8575,7 +8659,7 @@ func approvalDecisionAuditScope(approval model.Approval) string {
 
 func approvalRequiresPlanHash(approval model.Approval) bool {
 	switch approval.Plugin {
-	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore", "agentupdate", sshGuardPlugin:
+	case "nft", "nftpolicy", "wireguard", "cftunnel", "selfdns", "proxycore", "agentupdate", sshGuardPlugin, witnessPlugin:
 		return true
 	default:
 		// Approvals are the host-mutation gate. Unknown future plugins carrying a
@@ -8692,6 +8776,9 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		// LoopHealth is node-agent 0.3.10's account of its work loop; kept
 		// in memory beside agentRuntime, never persisted per beat.
 		LoopHealth *model.AgentHealth `json:"loop_health"`
+		// Witness is the control-plane witness's status file, sent only by
+		// the node that runs one.
+		Witness *witnessReport `json:"witness"`
 	}
 	if !decodeAgentJSON(w, r, &req) {
 		return
@@ -8740,6 +8827,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		s.agentRuntimeMu.Unlock()
 	}
 	s.noteAgentHealth(req.NodeID, req.LoopHealth, req.Metrics.CollectedAt)
+	s.noteWitnessReport(req.NodeID, req.Witness)
 	s.maybeTriggerDDNS(req.NodeID, old.PublicIP, old.PublicIPv6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -8994,6 +9082,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	}
 	if isSSHGuardApproval(approval) {
 		return s.handleSSHGuardTaskResult(r, approval, task, result)
+	}
+	if isWitnessApproval(approval) {
+		return s.handleWitnessTaskResult(r, approval, task, result)
 	}
 	if isPluginOperationApproval(approval) {
 		return s.handlePluginOperationTaskResult(r, approval, task, result)

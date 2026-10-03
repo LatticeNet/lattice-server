@@ -142,7 +142,12 @@ type NotifyDelivery struct {
 	Role        string `json:"role,omitempty"`
 	// FallbackFor names the channel whose failure this fallback delivery
 	// stands in for.
-	FallbackFor   string          `json:"fallback_for,omitempty"`
+	FallbackFor string `json:"fallback_for,omitempty"`
+	// FallbackOf is the delivery a channel's critical fallback stands in for
+	// (one failed delivery, linked so the Sent log can show both). A rule's
+	// fallback, which stands in for every primary of the rule, leaves it
+	// empty.
+	FallbackOf    string          `json:"fallback_of,omitempty"`
 	Outcome       string          `json:"outcome"`
 	Reason        string          `json:"reason,omitempty"`
 	Attempts      []NotifyAttempt `json:"attempts,omitempty"`
@@ -248,6 +253,12 @@ type NotifyChannelHealth struct {
 	// current run, so the first success sends notify.channel_ok.
 	Announced   bool      `json:"announced,omitempty"`
 	AnnouncedAt time.Time `json:"announced_at,omitzero"`
+	// LastFallbackAt is when a critical message this channel failed was last
+	// handed to its fallback channel (LastFallbackChannelID); Fallbacks
+	// counts those hand-offs.
+	LastFallbackAt        time.Time `json:"last_fallback_at,omitzero"`
+	LastFallbackChannelID string    `json:"last_fallback_channel_id,omitempty"`
+	Fallbacks             int       `json:"fallbacks,omitempty"`
 }
 
 // NotifyDigestLine is one queued line of the alert digest. The decision behind

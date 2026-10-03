@@ -538,6 +538,32 @@ Use the compose file and deployment guide in the umbrella repository:
   filtered the same way, and `GET /api/monitors/results` returns the newest
   500 results across nodes by default, or one node's with `node_id`, up to
   `limit` (at most 2000).
+- Latency probes: `GET /api/monitors/latency` (`monitor:read`) returns the
+  probe configuration and what the control plane made of it against the
+  fleet: each node's region, whether it is a source or target and why, the
+  endpoint the port rule picked or why it found none, and every source to
+  target pair. `PUT /api/monitors/latency` saves the configuration; it needs
+  `monitor:admin` without a node allowlist, must name existing nodes and the
+  `version` it was read at (a stale one gets 409), and is audited as
+  `monitor.latency.config`. Until a save the defaults hold: probes on, every
+  60 s, from each node named `cd-hs-sh` to each node whose country is set and
+  is not `CN`. The control plane turns the configuration into tcp monitors
+  marked `managed_by: "latency"`, one per target and assigned to its sources,
+  which agents run like any other monitor; it re-plans every two minutes and
+  after each save, writes the state file only when a generated monitor
+  changed, and audits that change as `monitor.latency.sync`. A probe dials
+  only a TCP line port the target already serves publicly, never a loopback
+  listener, port 22, an sshd port or a knock-gated port (the full rule is in
+  `internal/server/latency_probes.go`). Generated monitors cannot be deleted
+  through `/api/monitors/delete` (409) and their failures do not page.
+  `GET /api/monitors/latency/rollups` returns p50 and p95 handshake time and
+  loss for every pair over `1h` (raw rows), `24h` (five-minute rollups) and
+  `7d` (hourly rollups), with `samples` beside `expected` so a gap reads as
+  unknown and percentiles and loss absent when nothing was heard.
+  `GET /api/monitors/latency/series?source=&target=&window=` returns one
+  pair's buckets (1 min, 5 min or 1 h), empty ones included. Both reads are
+  narrowed to pairs whose two nodes the caller may read, and no probe result
+  is ever audited.
 - Control-plane task views expose script hash and byte size, not the full script
   body or agent-only lease credential.
 - Task read and run permissions are split: `task:read` lists task metadata and
@@ -633,7 +659,11 @@ Use the compose file and deployment guide in the umbrella repository:
   instead of forcing a whole encrypted JSON rewrite. Monitor results live there
   too: one row per result and one latest record per monitor and node (with the
   failure streak the alert hold reads), 1440 rows per pair, and any JSON
-  history is migrated once on the first enable. Without the sidecar the JSON
+  history is migrated once on the first enable. Each result is also counted,
+  in the same transaction, into a five-minute bucket kept two days and an
+  hourly bucket kept eight days for its pair (count, failures, latency
+  extremes and a histogram), which answer the 24 hour and 7 day latency
+  windows the rows no longer reach. Without the sidecar the JSON
   file keeps 120 rows per pair and is rewritten only when a pair changes state,
   reaches its second failure in a row, or has not been written for five
   minutes. The in-memory read model

@@ -1323,6 +1323,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
 	mux.HandleFunc("/api/monitors/latency", s.withAuth("", s.handleLatencyProbes))
+	mux.HandleFunc("/api/monitors/latency/rollups", s.withAuth("monitor:read", s.handleLatencyRollups))
+	mux.HandleFunc("/api/monitors/latency/series", s.withAuth("monitor:read", s.handleLatencySeries))
 	// Evidence is the job "show me what the nodes actually did": the log store
 	// (raw lines and file tails) and the trace store (sing-box connection
 	// records and captured sessions), both host-owned and both gated by the
@@ -5762,7 +5764,7 @@ func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorRes
 		// Latency probes do not page one pair at a time: a path from China
 		// drops probes routinely, and twenty targets would page twenty
 		// times. A degradation alert belongs to the incident path, judged
-		// on the pair's rollups instead.
+		// on the pair's rollups (latencyRollupsFor) instead.
 		return
 	}
 	name := strings.TrimSpace(mon.Name)

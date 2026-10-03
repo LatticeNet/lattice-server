@@ -215,8 +215,8 @@ func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	if got, ok, err := srv.managedLineDefByUUID(managed.LineUUID); err != nil || !ok || got.RealityPrivateKey != "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" {
 		t.Fatalf("managed definition after restart: %+v ok=%v err=%v", got, ok, err)
 	}
-	if subscriptions := srv.buildSubscriptions(); len(subscriptions) == 0 {
-		t.Fatal("migrated user could not render a subscription summary after restart")
+	if u, ok := srv.getVpnUser(legacy.ID); !ok || srv.identityLinkStatus(u).IdentityID != legacy.ID {
+		t.Fatal("migrated user could not render its link status after restart")
 	}
 	if err := reopened.Close(); err != nil {
 		t.Fatal(err)
@@ -238,8 +238,8 @@ func TestLineSecretMigrationPreservesPendingManagedLineApproval(t *testing.T) {
 	if !ok || approvedAfter.Status != model.ApprovalApproved {
 		t.Fatalf("second restart lost managed-line approval: %+v ok=%v", approvedAfter, ok)
 	}
-	if subscriptions := srv.buildSubscriptions(); len(subscriptions) == 0 {
-		t.Fatal("second restart could not render migrated subscription")
+	if srv.identityLinkStatus(userAfter).IdentityID != legacy.ID {
+		t.Fatal("second restart could not render the migrated identity's link status")
 	}
 }
 

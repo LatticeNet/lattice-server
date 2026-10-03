@@ -354,12 +354,13 @@ type Server struct {
 	subscriptionCache *subscriptionCache
 	// identityLinkCache holds converted identity link documents, keyed by
 	// the identity's content digest (identity_link.go); identityConvert*
-	// run one convert per key at a time; identityFetches remembers each
+	// run one convert per key and content version at a time;
+	// identityFetches remembers each
 	// identity link's last fetch since start. identityLinkConvert is a test
 	// seam; production leaves it nil and calls the Sub-Store plugin.
 	identityLinkCache      *subscriptionCache
 	identityConvertMu      sync.Mutex
-	identityConvertFlights map[subscriptionCacheKey]*shareRenderFlight
+	identityConvertFlights map[identityConvertFlightKey]*shareRenderFlight
 	identityFetches        identityLinkFetches
 	identityLinkConvert    func(context.Context, []string, shareRenderVariant) (renderedSubscription, error)
 	// subscriptionSnapshotPersist is a narrow persistence seam for exercising

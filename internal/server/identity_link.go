@@ -637,15 +637,32 @@ func (s *Server) identityLinkConvertAvailable() bool {
 	return ok
 }
 
-// convertIdentityLinkShared converts one cache key at most once at a time,
-// the way renderShareShared renders a share key, within the link's render
-// budget.
+// identityConvertFlightKey names one in-flight convert: the cache key and
+// the content version it converts.
+//
+// A share's version belongs to its source, so every request for a share key
+// wants the same body and renderShareShared joins by key alone. An identity
+// link's version is built per request from that identity's state, and two
+// requests for one key can want different bodies: a request made after a
+// suspension, a rotation or a newly applied line must not be handed the body
+// a flight started for the entries before it, or a suspended identity would
+// get its real nodes for the length of a convert instead of the placeholder.
+// So a request joins only a flight for its own version.
+type identityConvertFlightKey struct {
+	key     subscriptionCacheKey
+	version string
+}
+
+// convertIdentityLinkShared converts one cache key and content version at
+// most once at a time, the way renderShareShared renders a share key, within
+// the link's render budget.
 func (s *Server) convertIdentityLinkShared(ctx context.Context, key subscriptionCacheKey, version string, entries []string, variant shareRenderVariant) shareRenderOutcome {
+	flightKey := identityConvertFlightKey{key: key, version: version}
 	s.identityConvertMu.Lock()
 	if s.identityConvertFlights == nil {
-		s.identityConvertFlights = make(map[subscriptionCacheKey]*shareRenderFlight)
+		s.identityConvertFlights = make(map[identityConvertFlightKey]*shareRenderFlight)
 	}
-	flight := s.identityConvertFlights[key]
+	flight := s.identityConvertFlights[flightKey]
 	if flight == nil {
 		ticket, ok, _, _ := s.shareRenderBudget.take(key.ShareID, shareRenderVariantKey(key), version)
 		if !ok {
@@ -653,7 +670,7 @@ func (s *Server) convertIdentityLinkShared(ctx context.Context, key subscription
 			return shareRenderOutcome{deny: "subscription_render_budget_exhausted"}
 		}
 		flight = &shareRenderFlight{done: make(chan struct{})}
-		s.identityConvertFlights[key] = flight
+		s.identityConvertFlights[flightKey] = flight
 		entries = append([]string(nil), entries...)
 		go func() {
 			convertCtx, cancel := context.WithTimeout(context.Background(), identityLinkConvertTimeout)
@@ -662,7 +679,7 @@ func (s *Server) convertIdentityLinkShared(ctx context.Context, key subscription
 			s.shareRenderBudget.settle(ticket, version, outcome.deny != "")
 			s.identityConvertMu.Lock()
 			flight.outcome = outcome
-			delete(s.identityConvertFlights, key)
+			delete(s.identityConvertFlights, flightKey)
 			close(flight.done)
 			s.identityConvertMu.Unlock()
 		}()

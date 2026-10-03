@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -475,6 +476,72 @@ func TestIdentityLinkConvertedDocumentsStayPerIdentity(t *testing.T) {
 	}
 	if decoded, err := base64.StdEncoding.DecodeString(fallback.body); err != nil || !strings.Contains(string(decoded), idlBobUUID) {
 		t.Fatalf("fallback must be the base64 URI list: %v", err)
+	}
+}
+
+// A request made after the identity changed never joins a convert started
+// for its older entries: a suspension while a slow convert of the real nodes
+// is running answers the placeholder at once, and the request made before
+// the suspension still gets the body it asked for.
+func TestIdentityLinkConvertNeverHandsAFlightToANewerVersion(t *testing.T) {
+	f := newIdentityLinkFixture(t)
+	slug, token := f.issue(t, "vpnuser_alice")
+	started, release := make(chan struct{}), make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	releaseConvert := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseConvert()
+	f.srv.identityLinkConvert = func(ctx context.Context, entries []string, variant shareRenderVariant) (renderedSubscription, error) {
+		joined := strings.Join(entries, "\n")
+		if strings.Contains(joined, idlAliceUUID) {
+			startOnce.Do(func() { close(started) })
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return renderedSubscription{}, ctx.Err()
+			}
+		}
+		return renderedSubscription{Body: []byte("proxies:\n# " + variant.Target + "\n" + joined), Target: variant.Target}, nil
+	}
+	type answer struct {
+		status int
+		body   string
+	}
+	fetch := func(out chan<- answer) {
+		req := httptest.NewRequest(http.MethodGet, "/sub/"+slug+"/"+token, nil)
+		req.Header.Set("User-Agent", "clash-verge/v2.2.3")
+		rec := httptest.NewRecorder()
+		f.srv.handleSubscriptionShare(rec, req)
+		out <- answer{status: rec.Code, body: rec.Body.String()}
+	}
+
+	before := make(chan answer, 1)
+	go fetch(before)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the convert of the real nodes never started")
+	}
+	u, _ := f.srv.getVpnUser("vpnuser_alice")
+	u.Enabled = false
+	if err := f.srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	after := make(chan answer, 1)
+	go fetch(after)
+	select {
+	case got := <-after:
+		if got.status != http.StatusOK || strings.Contains(got.body, idlAliceUUID) || !strings.Contains(got.body, identityLinkPlaceholderUUID) {
+			t.Fatalf("a suspended identity must get the placeholder, got %d %s", got.status, got.body)
+		}
+	case <-time.After(5 * time.Second):
+		releaseConvert()
+		<-before
+		got := <-after
+		t.Fatalf("the request after the suspension waited on the convert of the real nodes and got %d %s", got.status, got.body)
+	}
+	releaseConvert()
+	if got := <-before; got.status != http.StatusOK || !strings.Contains(got.body, idlAliceUUID) {
+		t.Fatalf("the request made before the suspension gets its own body: %d %s", got.status, got.body)
 	}
 }
 

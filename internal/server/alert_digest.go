@@ -14,28 +14,20 @@ import (
 // alertDigest batches typed alerts that are decided one node at a time and
 // sends each kind as one message per liveness sweep tick.
 //
-// service.down and service.recovered are decided when a node's probe arrives,
-// and monitor transitions when a node's result arrives, so a fleet-wide
-// sing-box roll that breaks twenty cores used to page twenty times, and an
-// all-nodes monitor against a target that went down paged once per node. The
-// emitters now queue a line and the sweep sends one message per event type:
-// a single line keeps its own title and body, several become a digest that
-// names every node. node.offline and node.online already work this way
-// (nodeOfflineMessage); this is the same rule for the alerts that do not
-// originate in the sweep.
+// The service.down, service.recovered and monitor transition emitters used to
+// queue their lines here. They now open and resolve incidents
+// (incidents.go), whose sweep sends one message per event type in the same
+// way and stores what it owes on the record. What remains here is the
+// stored-line path: a line a version before incident records queued and
+// never sent is restored at start (restoreAlertDigest) and sent by the first
+// sweep or by Close, so an upgrade drops no page. queueAlertDigest stays for
+// alerts that are not incidents.
 //
-// Event types do not change, so operator rules and templates route exactly as
-// before. A queued line waits at most one sweep interval (20 s), on top of
-// holds that are already 90 s or two probe intervals long.
-//
-// The decision behind a queued line is already on disk (the sing-box episode,
-// the monitor history), so a line dropped by a restart is a page that is never
-// sent. Each line is therefore stored as it is queued (store digest lines) and
-// removed after the flush has put its message in the notification outbox; a
-// process killed in between finds the line at the next start and sends it
-// then. A kill after the outbox write and before the removal sends the
-// message twice, which is the side an alert should err on. Server.Close
-// flushes what is queued, so a restart through SIGTERM sends it at once.
+// Each line is stored as it is queued (store digest lines) and removed after
+// the flush has put its message in the notification outbox; a process killed
+// in between finds the line at the next start and sends it then. A kill after
+// the outbox write and before the removal sends the message twice, which is
+// the side an alert should err on.
 type alertDigest struct {
 	mu      sync.Mutex
 	pending map[string][]alertDigestLine

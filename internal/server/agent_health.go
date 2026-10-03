@@ -374,3 +374,55 @@ func (s *Server) agentLoopHealthViewFor(nodeID string, now time.Time) *agentLoop
 	}
 	return view
 }
+
+// evaluateAgentHealthIncidents opens agent.stalled for nodes whose loop
+// proves a paging problem and resolves it once the loop is moving again. A
+// node whose evidence is stale (offline, or an agent that stopped sending
+// loop health) is left as it is: absence of evidence is not health.
+func (s *Server) evaluateAgentHealthIncidents(now time.Time) {
+	for _, n := range s.store.Nodes() {
+		if n.Disabled {
+			continue
+		}
+		if !n.Online || now.Sub(n.LastSeen) > nodeOfflineThreshold {
+			continue
+		}
+		rec, ok := s.freshAgentHealth(n)
+		if !ok {
+			continue
+		}
+		problems := agentLoopProblems(rec, now)
+		var paging, evidence []agentLoopProblem
+		for _, p := range problems {
+			if p.incident {
+				paging = append(paging, p)
+			}
+			if p.status {
+				evidence = append(evidence, p)
+			}
+		}
+		key := incidentKey(EventAgentStalled, n.ID, "")
+		name := nodeLabel(n)
+		if len(paging) == 0 {
+			s.resolveIncident(key, now, incidentMessage{
+				title:  "Lattice agent recovered on " + name,
+				detail: fmt.Sprintf("%s (%s): the agent's work loop is completing cycles again.", name, n.ID),
+				line:   name + ": work loop moving again",
+			})
+			continue
+		}
+		reasons := make([]string, 0, len(evidence))
+		for _, p := range evidence {
+			reasons = append(reasons, p.reason)
+		}
+		s.openIncident(incidentSignal{
+			kind: EventAgentStalled, nodeID: n.ID, subject: name, since: paging[0].since,
+			sortKey: name + "\x00" + n.ID,
+			msg: incidentMessage{
+				title:  "Lattice agent stalled on " + name,
+				detail: fmt.Sprintf("%s (%s) is reporting, but %s.", name, n.ID, strings.Join(reasons, "; and ")),
+				line:   fmt.Sprintf("%s: %s", name, paging[0].reason),
+			},
+		}, now)
+	}
+}

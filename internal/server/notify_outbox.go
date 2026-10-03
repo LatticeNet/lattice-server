@@ -171,6 +171,8 @@ type notifyTarget struct {
 	channel          model.NotifyChannel
 	message          notify.Message
 	truncated        bool
+	// heldUntil is set when the rule's quiet hours hold this delivery.
+	heldUntil time.Time
 }
 
 // planNotifyTargets resolves an event to channels. With no rules every
@@ -241,6 +243,13 @@ type notifyEnqueue struct {
 	// broadcast skips rules and sends to every enabled channel, which is how
 	// a plugin's notify.send has always been routed.
 	broadcast bool
+	// onlyRule routes through that one rule instead of every enabled rule;
+	// an incident escalation goes out through the rule that escalates.
+	onlyRule *model.NotifyRule
+	// barkLevel overrides each Bark channel's interruption level for these
+	// deliveries; set only by an escalation, which also makes them critical
+	// for quiet hours.
+	barkLevel string
 }
 
 // notifyPlan is an event resolved to its deliveries but not yet stored.
@@ -264,15 +273,30 @@ type notifyPlan struct {
 func (s *Server) planNotifyEvent(eventType, title, body string, how notifyEnqueue) notifyPlan {
 	channels := s.store.EnabledNotifyChannels()
 	var rules []model.NotifyRule
-	if !how.broadcast {
+	switch {
+	case how.onlyRule != nil:
+		rules = []model.NotifyRule{*how.onlyRule}
+	case !how.broadcast:
 		rules = s.store.EnabledNotifyRules()
 	}
 	targets := s.planNotifyTargets(eventType, title, body, channels, rules, how.exclude, how.fanOut)
+	at := s.now()
+	critical := how.barkLevel != "" || notifyEventSeverity(eventType) == incidentSeverityCritical
+	var opts map[string]store.NotifyRuleOptions
 	for i := range targets {
 		m := &targets[i].message
 		m.Title, m.Body, targets[i].truncated = store.ClampNotifyText(m.Title, m.Body)
+		if critical || targets[i].ruleID == "" {
+			continue
+		}
+		if opts == nil {
+			opts = s.store.NotifyRuleOptionsByRule()
+		}
+		if until, ok := quietHoursEnd(opts[targets[i].ruleID].QuietHours, at); ok {
+			targets[i].heldUntil = until
+		}
 	}
-	plan := notifyPlan{eventID: id.New("evt"), eventType: eventType, how: how, targets: targets, at: s.now()}
+	plan := notifyPlan{eventID: id.New("evt"), eventType: eventType, how: how, targets: targets, at: at}
 	plan.title, plan.body, plan.truncated = store.ClampNotifyText(title, body)
 	if len(plan.targets) == 0 {
 		others := 0
@@ -323,6 +347,14 @@ func (s *Server) commitNotifyPlan(plan notifyPlan) {
 			Role: store.NotifyRolePrimary, Outcome: store.NotifyOutcomePlanned,
 			NextAttemptAt: plan.at, Title: t.message.Title, Body: t.message.Body, Truncated: t.truncated,
 			CreatedAt: plan.at,
+		}
+		if t.channel.Kind == "bark" {
+			rows[i].BarkLevel = how.barkLevel
+		}
+		if !t.heldUntil.IsZero() {
+			rows[i].HeldUntil = t.heldUntil
+			rows[i].NextAttemptAt = t.heldUntil
+			rows[i].Reason = "held by the rule's quiet hours until " + stamp(t.heldUntil)
 		}
 	}
 	if err := s.store.RecordNotifyDeliveries(rows); err != nil {
@@ -529,6 +561,9 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 		s.afterNotifySettled(row)
 		return
 	}
+	if row.BarkLevel != "" && channel.Kind == "bark" {
+		channel = withBarkLevel(channel, row.BarkLevel)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
 	started := time.Now()
 	err := s.notifySend(ctx, channel, notify.Message{Title: row.Title, Body: row.Body})
@@ -582,6 +617,18 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	if !row.Settled() {
 		s.wakeNotifyOutbox()
 	}
+}
+
+// withBarkLevel is c with its interruption level replaced, on a copy of the
+// config so the stored channel is never touched.
+func withBarkLevel(c model.NotifyChannel, level string) model.NotifyChannel {
+	cfg := make(map[string]string, len(c.Config)+1)
+	for k, v := range c.Config {
+		cfg[k] = v
+	}
+	cfg["level"] = level
+	c.Config = cfg
+	return c
 }
 
 // nextNotifyHealth folds one attempt into a channel's health. counted is set
@@ -817,8 +864,9 @@ func (s *Server) settleNotifyWebhookCounts(webhookID, recordID string, delivered
 // reconcileNotifyOutbox runs once at start, before the first send: every
 // delivery still owed a send is marked for redrive inside the horizon or
 // settled failed outside it, so the receipts are never left "planned" by a
-// restart. It returns how many rows wait for redrive; New wakes the drainer
-// for them with the other background loops.
+// restart. It returns how many rows wait for a send (redriven, or still held
+// by quiet hours); New wakes the drainer for them with the other background
+// loops.
 func (s *Server) reconcileNotifyOutbox() int {
 	pending := s.store.UnsettledNotifyDeliveries()
 	if len(pending) == 0 {
@@ -826,10 +874,20 @@ func (s *Server) reconcileNotifyOutbox() int {
 	}
 	now := s.now()
 	changed := make([]store.NotifyDelivery, 0, len(pending))
-	redrive := 0
+	redrive, held := 0, 0
 	for _, row := range pending {
+		// A delivery held by quiet hours was due at HeldUntil, not when it
+		// was planned; one still waiting is left as it is.
+		due := row.CreatedAt
+		if row.HeldUntil.After(due) {
+			due = row.HeldUntil
+		}
+		if due.After(now) && len(row.Attempts) == 0 {
+			held++
+			continue
+		}
 		switch {
-		case row.Role == store.NotifyRoleTest || now.Sub(row.CreatedAt) > notifyRedriveHorizon:
+		case row.Role == store.NotifyRoleTest || now.Sub(due) > notifyRedriveHorizon:
 			row.Outcome = store.NotifyOutcomeFailed
 			row.Reason = "interrupted by restart, not retried"
 			row.SettledAt = now
@@ -843,6 +901,9 @@ func (s *Server) reconcileNotifyOutbox() int {
 			redrive++
 		}
 		changed = append(changed, row)
+	}
+	if len(changed) == 0 {
+		return held
 	}
 	if err := s.store.RecordNotifyDeliveries(changed); err != nil {
 		s.logger.Printf("notify: reconcile outbox: %v", err)
@@ -858,6 +919,6 @@ func (s *Server) reconcileNotifyOutbox() int {
 			s.settleNotifyWebhookRecord(row)
 		}
 	}
-	s.logger.Printf("notify: outbox at start: %d redriven, %d settled as interrupted", redrive, len(changed)-redrive)
-	return redrive
+	s.logger.Printf("notify: outbox at start: %d redriven, %d settled as interrupted, %d held by quiet hours", redrive, len(changed)-redrive, held)
+	return redrive + held
 }

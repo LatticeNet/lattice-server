@@ -379,64 +379,52 @@ func TestNodePagedThenDisabledStillGetsItsRecovery(t *testing.T) {
 	expectOneNotice(t, l, EventNodeOnline, "Lattice node online: paged")
 }
 
-// A page sent before a control plane restart is answered after it: the paged
-// spell is on disk, so the first beat after the restart queues node.online,
-// and the restarted process does not page the same spell again.
+// A page sent before a control plane restart is answered after it: the
+// paged spell is an incident on the production layout (state-hot.db), so the
+// first beat after the restart resolves it into a node.online, and the
+// restarted process does not page the same spell again.
 func TestNodeOnlineFollowsAPageAcrossARestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	st1, err := store.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv1, err := New(Options{Store: st1, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sent1 := captureTypedNotices(srv1)
-	handler1 := srv1.Handler()
-	cookies, csrf := loginSession(t, handler1)
-	token := enrollAndBeat(t, handler1, cookies, csrf, "n-restart", "restart")
-	ls := lastSeenOf(t, st1, "n-restart")
-	srv1.sweepNodeLiveness(ls.Add(11*time.Minute), sweepCause)
+	dir := t.TempDir()
+	f1 := openIngestFixture(t, dir)
+	sent1 := captureTypedNotices(f1.srv)
+	cookies, csrf := loginSession(t, f1.handler)
+	token := enrollAndBeat(t, f1.handler, cookies, csrf, "n-restart", "restart")
+	ls := lastSeenOf(t, f1.st, "n-restart")
+	f1.srv.sweepNodeLiveness(ls.Add(11*time.Minute), sweepCause)
 	if len(*sent1) != 1 || (*sent1)[0].eventType != EventNodeOffline {
 		t.Fatalf("before the restart: %+v", *sent1)
 	}
-	if err := st1.Close(); err != nil {
+	if err := f1.st.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	st2, err := store.Open(path)
-	if err != nil {
-		t.Fatal(err)
+	f2 := openIngestFixture(t, dir)
+	t.Cleanup(func() { _ = f2.st.Close() })
+	key := incidentKey(EventNodeOffline, "n-restart", "")
+	if inc, ok := f2.st.ActiveIncident(key); !ok || !inc.Since.Equal(ls) || inc.Notified != store.IncidentNotifiedOpen {
+		t.Fatalf("the paged spell was not kept as an open incident: %+v %v (want Since %s)", inc, ok, ls)
 	}
-	t.Cleanup(func() { _ = st2.Close() })
-	if got := st2.NodeOfflineAlerts(); !got["n-restart"].Equal(ls) {
-		t.Fatalf("the paged spell was not persisted: %v (want LastSeen %s)", got, ls)
-	}
-	srv2, err := New(Options{Store: st2, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	l := liveness{srv: srv2, handler: srv2.Handler(), st: st2, sent: captureTypedNotices(srv2)}
-	srv2.nodeAlerts.start(ls.Add(20 * time.Minute))
-	srv2.sweepNodeLiveness(ls.Add(20*time.Minute), store.NodeStatusCauseServerStart)
-	srv2.sweepNodeLiveness(ls.Add(40*time.Minute), sweepCause)
+	l := liveness{srv: f2.srv, handler: f2.handler, st: f2.st, sent: captureTypedNotices(f2.srv)}
+	f2.srv.nodeAlerts.start(ls.Add(20 * time.Minute))
+	f2.srv.sweepNodeLiveness(ls.Add(20*time.Minute), store.NodeStatusCauseServerStart)
+	f2.srv.sweepNodeLiveness(ls.Add(40*time.Minute), sweepCause)
 	expectNoNotice(t, l, "the same spell after the restart")
 
 	beat(t, l.handler, "n-restart", token)
-	srv2.sweepNodeLiveness(lastSeenOf(t, st2, "n-restart"), sweepCause)
+	f2.srv.sweepNodeLiveness(lastSeenOf(t, f2.st, "n-restart"), sweepCause)
 	expectOneNotice(t, l, EventNodeOnline, "Lattice node online: restart")
-	if got := st2.NodeOfflineAlerts(); len(got) != 0 {
-		t.Fatalf("the answered page is still on disk: %v", got)
+	if inc, ok := f2.st.ActiveIncident(key); ok {
+		t.Fatalf("the answered page is still open: %+v", inc)
 	}
-	srv2.sweepNodeLiveness(lastSeenOf(t, st2, "n-restart").Add(time.Second), sweepCause)
+	f2.srv.sweepNodeLiveness(lastSeenOf(t, f2.st, "n-restart").Add(time.Second), sweepCause)
 	expectNoNotice(t, l, "after the recovery")
 }
 
-// A page whose record failed to write is written again by the next sweep once
-// the disk takes writes, without a second page, so a restart after that still
-// owes the node.online.
-func TestFailedOfflineAlertWriteIsRetriedBySweep(t *testing.T) {
+// A page goes out once while the state file refuses writes, and never again
+// for the same spell: the decision lives in the incident record, which is
+// never part of state.json, and memory answers for this process when a disk
+// write fails.
+func TestOfflinePageIsSentOnceWhileTheStateFileRefusesWrites(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("directory permissions do not bind root")
 	}
@@ -463,19 +451,18 @@ func TestFailedOfflineAlertWriteIsRetriedBySweep(t *testing.T) {
 	t.Cleanup(func() { os.Chmod(dir, 0o700) })
 	srv.sweepNodeLiveness(ls.Add(11*time.Minute), sweepCause)
 	expectOneNotice(t, l, EventNodeOffline, "Lattice node offline: disk")
-	if got := st.NodeOfflineAlerts(); len(got) != 0 {
-		t.Skipf("the write landed in a read-only directory on this platform: %v", got)
-	}
 	srv.sweepNodeLiveness(ls.Add(11*time.Minute+20*time.Second), sweepCause)
 	expectNoNotice(t, l, "a sweep while the disk still refuses writes")
-
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	srv.sweepNodeLiveness(ls.Add(11*time.Minute+40*time.Second), sweepCause)
-	expectNoNotice(t, l, "the sweep that retries the write")
-	if got := st.NodeOfflineAlerts(); !got["n-disk"].Equal(ls) {
-		t.Fatalf("the paged spell was not written once the disk recovered: %v (want LastSeen %s)", got, ls)
+	expectNoNotice(t, l, "a sweep after the disk recovered")
+	if got := st.NodeOfflineAlerts(); len(got) != 0 {
+		t.Fatalf("the old alert map is written again: %v", got)
+	}
+	if _, ok := st.ActiveIncident(incidentKey(EventNodeOffline, "n-disk", "")); !ok {
+		t.Fatal("the page left no open incident")
 	}
 }
 
@@ -489,7 +476,8 @@ func TestDeletedPagedNodeLeavesNoAlertBehind(t *testing.T) {
 	ls := lastSeenOf(t, st, "n-gone")
 	srv.sweepNodeLiveness(ls.Add(11*time.Minute), sweepCause)
 	expectOneNotice(t, l, EventNodeOffline, "Lattice node offline: gone")
-	if _, ok := st.NodeOfflineAlerts()["n-gone"]; !ok {
+	key := incidentKey(EventNodeOffline, "n-gone", "")
+	if _, ok := st.ActiveIncident(key); !ok {
 		t.Fatal("the page was not recorded")
 	}
 
@@ -498,8 +486,8 @@ func TestDeletedPagedNodeLeavesNoAlertBehind(t *testing.T) {
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("delete: %d", res.StatusCode)
 	}
-	if got := st.NodeOfflineAlerts(); len(got) != 0 {
-		t.Fatalf("the deleted node's page is still on disk: %v", got)
+	if got := st.IncidentsWhere(func(inc store.Incident) bool { return inc.NodeID == "n-gone" }); len(got) != 0 {
+		t.Fatalf("the deleted node's incident is still kept: %+v", got)
 	}
 	token := enrollAndBeat(t, handler, cookies, csrf, "n-gone", "gone")
 	beat(t, handler, "n-gone", token)

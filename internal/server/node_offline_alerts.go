@@ -2,7 +2,6 @@ package server
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,35 +40,29 @@ const (
 	maxNodeOfflineAlertAfter  = 7 * 24 * time.Hour
 )
 
-// nodeOfflineAlerts is the state behind node.offline: which offline spell
-// each node was alerted for, and recoveries of alerted spells waiting for the
-// next sweep. The alerted spells are persisted (store.NodeOfflineAlerts) and
-// written only when they change, so a page sent before a restart is still
-// answered by node.online after it. A spell that was already longer than the
+// nodeOfflineAlerts is the state behind node.offline. Which spell paged is
+// the node's node.offline incident (incidents.go), stored on the record-level
+// path, so a page sent before a restart is still answered by node.online
+// after it. What stays here is in memory: when this process began watching,
+// and the disabled bookkeeping. A spell that was already longer than the
 // alert delay when this process started stays silent: the process that saw it
 // begin owned the page.
 //
-// The page is written to the notification outbox before the spell is
-// recorded, and the outbox is redriven at start. A process killed after the
-// outbox write and before the record sends the page after the restart, and
-// the new process does not page the spell again, since it was already silent
-// past its delay when that process started. A process killed before the
-// outbox write decided nothing durable, and the new process pages the spell
-// itself if it is still inside its window.
+// An open incident owes its page until the sweep sends it, and the owed flag
+// is stored with the record, so a process killed between the decision and the
+// send pages after the restart. A process killed before the record was
+// written decided nothing durable, and the new process pages the spell itself
+// if it is still inside its window.
 //
-// A recovery is queued in memory until the next sweep (at most 20 s), after
-// its spell has been dropped from the store; a kill in that window loses the
-// node.online, never a node.offline.
+// mu orders a beat against the sweep: the sweep reads the fleet and opens
+// incidents under it, and noteNodeOnline resolves under it, so a node that
+// returns during a sweep is either online in the sweep's read or resolves the
+// incident the sweep just opened.
 type nodeOfflineAlerts struct {
 	mu sync.Mutex
 	// since is when this process began watching. Silence before it was not
 	// observed here, so it is not counted toward the delay.
 	since time.Time
-	// alerted maps a node id to the LastSeen of the spell it was alerted for.
-	// LastSeen does not move while a node is silent, so it names the spell.
-	// Nil until loaded from the store on first use.
-	alerted   map[string]time.Time
-	recovered []nodeLivenessChange
 	// disabled holds the nodes the last sweep saw disabled, and watchFrom
 	// when a sweep first saw each of them enabled again. A disabled node's
 	// token is refused, so its silence is the operator's doing and never
@@ -77,45 +70,6 @@ type nodeOfflineAlerts struct {
 	// that may be days old.
 	disabled  map[string]bool
 	watchFrom map[string]time.Time
-	// unsaved is set when the last write of alerted failed. The next sweep
-	// writes again even if nothing changed, so a disk that recovers catches
-	// up without a page being sent twice.
-	unsaved bool
-}
-
-// loadLocked reads the persisted alerted spells the first time they are
-// needed. Called with a.mu held.
-func (a *nodeOfflineAlerts) loadLocked(s *Server) {
-	if a.alerted != nil {
-		return
-	}
-	a.alerted = s.store.NodeOfflineAlerts()
-}
-
-// persistLocked writes the alerted spells. Called with a.mu held, so two
-// writers cannot persist their copies out of order. A failed write is logged
-// and retried on every sweep until one lands; memory stays authoritative for
-// this process, so a failing disk never re-sends a page.
-func (a *nodeOfflineAlerts) persistLocked(s *Server) {
-	snapshot := make(map[string]time.Time, len(a.alerted))
-	for nodeID, at := range a.alerted {
-		snapshot[nodeID] = at
-	}
-	if err := s.store.SetNodeOfflineAlerts(snapshot); err != nil {
-		a.unsaved = true
-		s.logger.Printf("node offline alerts: persist failed, retrying on the next sweep: %v", err)
-		return
-	}
-	a.unsaved = false
-}
-
-// nodeLivenessChange is one line of a node.offline or node.online message.
-type nodeLivenessChange struct {
-	id, name string
-	// span is how long the node has been silent (offline) or was silent
-	// (online).
-	span     time.Duration
-	lastSeen time.Time
 }
 
 func (a *nodeOfflineAlerts) start(now time.Time) {
@@ -124,61 +78,60 @@ func (a *nodeOfflineAlerts) start(now time.Time) {
 	a.since = now
 }
 
-// noteNodeOnline queues a node.online line when the spell that just ended was
-// alerted. A spell that never alerted ends silently, which is what keeps brief
-// gaps off the phone in both directions.
+// noteNodeOnline resolves the node's offline incident when the spell that
+// just ended opened one. The recovery goes out with the next sweep, and only
+// if the page did; a spell that never paged ends silently, which is what
+// keeps brief gaps off the phone in both directions.
 func (s *Server) noteNodeOnline(nodeID string, now time.Time) {
-	name := s.nodeDisplayName(nodeID)
 	a := &s.nodeAlerts
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.loadLocked(s)
-	lastSeen, ok := a.alerted[nodeID]
+	s.resolveNodeOffline(nodeID, s.nodeDisplayName(nodeID), now)
+}
+
+func (s *Server) resolveNodeOffline(nodeID, name string, now time.Time) {
+	key := incidentKey(EventNodeOffline, nodeID, "")
+	inc, ok := s.store.ActiveIncident(key)
 	if !ok {
 		return
 	}
-	delete(a.alerted, nodeID)
-	a.persistLocked(s)
-	a.recovered = append(a.recovered, nodeLivenessChange{id: nodeID, name: name, span: now.Sub(lastSeen), lastSeen: lastSeen})
+	span := now.Sub(inc.Since)
+	s.resolveIncident(key, now, incidentMessage{
+		title:  "Lattice node online: " + name,
+		detail: fmt.Sprintf("%s (%s) is reporting again after %s offline.", name, nodeID, livenessSpan(span)),
+		line:   fmt.Sprintf("%s: back after %s", name, livenessSpan(span)),
+	})
 }
 
-// forgetNodeOfflineAlert drops a deleted node's alert state from memory. The
-// store's delete cascade has already removed the persisted spell; without this
-// the copy here would outlive it until the next sweep, and a node enrolled
-// again under the same id in that window would announce a recovery from a
-// page it never got. A recovery already queued is kept: that node did return.
+// forgetNodeOfflineAlert drops a deleted node's alert state and loop health
+// from memory. The store's delete cascade has already removed the node and
+// its incidents.
 func (s *Server) forgetNodeOfflineAlert(nodeID string) {
 	a := &s.nodeAlerts
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	delete(a.alerted, nodeID)
 	delete(a.disabled, nodeID)
 	delete(a.watchFrom, nodeID)
 	s.forgetAgentHealth(nodeID)
 }
 
-// notifyNodeLiveness sends node.offline for nodes silent past
-// their delay and node.online for alerted nodes that came back since
-// the previous sweep. Each kind is one message per sweep, so a network blip on
+// notifyNodeLiveness opens node.offline incidents for nodes silent past
+// their delay and settles any open one whose node is reporting. The sweep's
+// incident pass then sends each kind as one message, so a network blip on
 // the control plane's side cannot page once per node.
 func (s *Server) notifyNodeLiveness(now time.Time) {
 	a := &s.nodeAlerts
-	// Read the fleet under a.mu. A beat stores Online before noteNodeOnline
-	// takes a.mu, so a node that returns during this sweep is either online in
-	// the read below, or has its recovery queued after the alert is recorded.
-	// Reading first would let a beat land in between and leave an alert that
-	// no node.online ever follows. Nothing takes a.mu while holding a store
-	// lock, so the order a.mu then store is safe.
+	// Read the fleet under a.mu; see nodeOfflineAlerts for why. Nothing
+	// takes a.mu while holding a store lock or incidentMu, so the order a.mu,
+	// incidentMu, store is safe.
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	nodes := s.store.Nodes()
-	a.loadLocked(s)
 	if a.disabled == nil {
 		a.disabled = map[string]bool{}
 		a.watchFrom = map[string]time.Time{}
 	}
-	changed := false
 	present := make(map[string]bool, len(nodes))
-	var down []nodeLivenessChange
 	for _, n := range nodes {
 		present[n.ID] = true
 		if n.Disabled {
@@ -196,9 +149,14 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 		}
 		if n.Online {
 			delete(a.watchFrom, n.ID)
+			// A reporting node has no open offline incident. The beat that
+			// brought it back resolves it; this catches a resolve that never
+			// ran (a record written while the beat raced a restart).
+			s.resolveNodeOffline(n.ID, nodeLabel(n), now)
+			continue
 		}
 		delay, pages := nodeOfflineDelay(n)
-		if n.Online || n.LastSeen.IsZero() || !pages {
+		if n.LastSeen.IsZero() || !pages {
 			continue
 		}
 		if !a.since.IsZero() && n.LastSeen.Before(a.since.Add(-delay)) {
@@ -217,18 +175,12 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 		if now.Sub(silentFrom) < delay {
 			continue
 		}
-		if spell, ok := a.alerted[n.ID]; ok && spell.Equal(n.LastSeen) {
-			continue
-		}
-		a.alerted[n.ID] = n.LastSeen
-		changed = true
-		down = append(down, nodeLivenessChange{id: n.ID, name: nodeLabel(n), span: now.Sub(n.LastSeen), lastSeen: n.LastSeen})
-	}
-	for nodeID := range a.alerted {
-		if !present[nodeID] {
-			delete(a.alerted, nodeID)
-			changed = true
-		}
+		name := nodeLabel(n)
+		s.openIncident(incidentSignal{
+			kind: EventNodeOffline, nodeID: n.ID, subject: name, since: n.LastSeen,
+			sortKey: name + "\x00" + n.ID,
+			msg:     nodeOfflineIncidentMessage(n, now.Sub(n.LastSeen), n.LastSeen),
+		}, now)
 	}
 	for nodeID := range a.disabled {
 		if !present[nodeID] {
@@ -240,22 +192,14 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 			delete(a.watchFrom, nodeID)
 		}
 	}
-	// Into the outbox first, then the spell (see nodeOfflineAlerts). The emit
-	// takes store locks under a.mu, the order this function already uses.
-	if len(down) > 0 {
-		title, body := nodeOfflineMessage(down)
-		s.emitNotifyTyped(EventNodeOffline, title, body)
-	}
-	if changed || a.unsaved {
-		a.persistLocked(s)
-	}
-	up := a.recovered
-	a.recovered = nil
-	a.mu.Unlock()
+}
 
-	if len(up) > 0 {
-		title, body := nodeOnlineMessage(up)
-		s.emitNotifyTyped(EventNodeOnline, title, body)
+func nodeOfflineIncidentMessage(n model.Node, span time.Duration, lastSeen time.Time) incidentMessage {
+	name := nodeLabel(n)
+	return incidentMessage{
+		title:  "Lattice node offline: " + name,
+		detail: fmt.Sprintf("%s (%s) has not reported for %s. Last heartbeat %s.", name, n.ID, livenessSpan(span), lastSeen.UTC().Format(time.RFC3339)),
+		line:   fmt.Sprintf("%s: no report for %s", name, livenessSpan(span)),
 	}
 }
 
@@ -316,43 +260,6 @@ func nodeLabel(n model.Node) string {
 		return name
 	}
 	return n.ID
-}
-
-func nodeOfflineMessage(down []nodeLivenessChange) (string, string) {
-	sortLivenessChanges(down)
-	if len(down) == 1 {
-		d := down[0]
-		return "Lattice node offline: " + d.name,
-			fmt.Sprintf("%s (%s) has not reported for %s. Last heartbeat %s.", d.name, d.id, livenessSpan(d.span), d.lastSeen.UTC().Format(time.RFC3339))
-	}
-	lines := make([]string, len(down))
-	for i, d := range down {
-		lines[i] = fmt.Sprintf("%s: no report for %s", d.name, livenessSpan(d.span))
-	}
-	return fmt.Sprintf("Lattice node offline digest: %d nodes", len(down)), strings.Join(lines, "\n")
-}
-
-func nodeOnlineMessage(up []nodeLivenessChange) (string, string) {
-	sortLivenessChanges(up)
-	if len(up) == 1 {
-		u := up[0]
-		return "Lattice node online: " + u.name,
-			fmt.Sprintf("%s (%s) is reporting again after %s offline.", u.name, u.id, livenessSpan(u.span))
-	}
-	lines := make([]string, len(up))
-	for i, u := range up {
-		lines[i] = fmt.Sprintf("%s: back after %s", u.name, livenessSpan(u.span))
-	}
-	return fmt.Sprintf("Lattice node online digest: %d nodes", len(up)), strings.Join(lines, "\n")
-}
-
-func sortLivenessChanges(changes []nodeLivenessChange) {
-	sort.Slice(changes, func(i, j int) bool {
-		if changes[i].name != changes[j].name {
-			return changes[i].name < changes[j].name
-		}
-		return changes[i].id < changes[j].id
-	})
 }
 
 // livenessSpan reads as minutes under two hours and hours after that; the

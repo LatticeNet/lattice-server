@@ -136,26 +136,33 @@ func (s *Server) noteSingBoxLiveness(nodeID string, rt *model.SingBoxRuntime) {
 		})
 	}
 
+	// The episode opens the node's service.down incident once (NotifiedDownAt
+	// marks that it did) and a running probe resolves it; the incident sweep
+	// sends every node's notice of one kind as one message, so a fleet-wide
+	// break pages once.
 	name := s.nodeDisplayName(nodeID)
-	// Queued rather than sent: the next liveness sweep sends every node's
-	// notice of one kind as one message, so a fleet-wide break pages once.
-	// The once-per-episode rule is decided here, per node, as before.
 	if notifyDown {
-		s.queueAlertDigest(EventServiceDown, alertDigestLine{
+		s.openIncident(incidentSignal{
+			kind: EventServiceDown, nodeID: nodeID, subject: name, since: rec.ProblemSince,
 			sortKey: name + "\x00" + nodeID,
-			title:   fmt.Sprintf("sing-box %s on %s", state, name),
-			body: fmt.Sprintf("%s (%s): sing-box has been %s since %s (unit %s/%s, restarts %d). Config state is reported separately; this is the service.",
-				name, nodeID, state, rec.ProblemSince.Format(time.RFC3339), rt.ActiveState, rt.SubState, rt.RestartCount),
-			line: fmt.Sprintf("%s: %s since %s (restarts %d)", name, state, rec.ProblemSince.UTC().Format("15:04Z"), rt.RestartCount),
+			msg:     singBoxDownMessage(name, nodeID, state, rec.ProblemSince, rt),
+		}, now)
+	}
+	if notifyRecovered || (state == serviceStateRunning && hadPrev && prev.State != state) {
+		s.resolveIncident(incidentKey(EventServiceDown, nodeID, ""), now, incidentMessage{
+			title:  fmt.Sprintf("sing-box recovered on %s", name),
+			detail: fmt.Sprintf("%s (%s): sing-box is running again (pid %d).", name, nodeID, rt.PID),
+			line:   fmt.Sprintf("%s: running again", name),
 		})
 	}
-	if notifyRecovered {
-		s.queueAlertDigest(EventServiceRecovered, alertDigestLine{
-			sortKey: name + "\x00" + nodeID,
-			title:   fmt.Sprintf("sing-box recovered on %s", name),
-			body:    fmt.Sprintf("%s (%s): sing-box is running again (pid %d).", name, nodeID, rt.PID),
-			line:    fmt.Sprintf("%s: running again", name),
-		})
+}
+
+func singBoxDownMessage(name, nodeID, state string, since time.Time, rt *model.SingBoxRuntime) incidentMessage {
+	return incidentMessage{
+		title: fmt.Sprintf("sing-box %s on %s", state, name),
+		detail: fmt.Sprintf("%s (%s): sing-box has been %s since %s (unit %s/%s, restarts %d). Config state is reported separately; this is the service.",
+			name, nodeID, state, since.Format(time.RFC3339), rt.ActiveState, rt.SubState, rt.RestartCount),
+		line: fmt.Sprintf("%s: %s since %s (restarts %d)", name, state, since.UTC().Format("15:04Z"), rt.RestartCount),
 	}
 }
 

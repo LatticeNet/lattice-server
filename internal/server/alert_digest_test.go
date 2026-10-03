@@ -43,7 +43,7 @@ func reportMonitor(t *testing.T, handler http.Handler, nodeID, token, monitorID 
 
 // flushTake runs the sweep's digest flush and returns what it sent.
 func flushTake(srv *Server, sent *[]typedNotice) []typedNotice {
-	srv.flushAlertDigests()
+	srv.sendOwedAlerts(srv.now())
 	out := *sent
 	*sent = nil
 	return out

@@ -326,9 +326,14 @@ type Server struct {
 	// nodeAlerts holds which offline spell each node was alerted for; see
 	// notifyNodeLiveness.
 	nodeAlerts nodeOfflineAlerts
-	// alertDigest batches service and monitor alerts decided one node at a
-	// time into one message per kind per sweep; see alert_digest.go.
+	// alertDigest drains the digest lines a version before incident records
+	// stored and never sent; see alert_digest.go.
 	alertDigest alertDigest
+	// incidentMu serialises every read-modify-write of an incident record
+	// (incidents.go); incidentPrunedAt is when resolved incidents were last
+	// pruned. Taken after nodeAlerts.mu and before any store lock.
+	incidentMu       sync.Mutex
+	incidentPrunedAt time.Time
 	// agentHealth is each node's last loop health, in memory only; see
 	// agent_health.go.
 	agentHealth agentHealthBook
@@ -679,6 +684,9 @@ func New(opts Options) (*Server, error) {
 	// rows are sent when the background loops start below.
 	s.restoreAlertDigest()
 	redrive := s.reconcileNotifyOutbox()
+	// Pages a version before incident records sent become incidents, so their
+	// recoveries still go out.
+	s.adoptLegacyAlerts(s.now())
 	s.pluginRPC = plugin.NewRPCRegistry()
 	// In-core providers are wired once at boot and never unregistered, so without a
 	// lifecycle predicate a disabled plugin's backend kept serving — disable would only
@@ -1320,6 +1328,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors", s.withAuth("", s.handleMonitors))
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
+	mux.HandleFunc("/api/incidents", s.withAuth("monitor:read", s.handleIncidents))
+	mux.HandleFunc("/api/incidents/ack", s.withAuth("monitor:admin", s.handleIncidentAck))
+	mux.HandleFunc("/api/incidents/snooze", s.withAuth("monitor:admin", s.handleIncidentSnooze))
+	mux.HandleFunc("/api/maintenance-windows", s.withAuth("monitor:read", s.handleMaintenanceWindows))
+	mux.HandleFunc("/api/maintenance-windows/delete", s.withAuth("monitor:admin", s.handleDeleteMaintenanceWindow))
 	// Evidence is the job "show me what the nodes actually did": the log store
 	// (raw lines and file tails) and the trace store (sing-box connection
 	// records and captured sessions), both host-owned and both gated by the
@@ -1458,7 +1471,7 @@ func (s *Server) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	s.flushAlertDigests()
+	s.sendOwedAlerts(s.now())
 	// The link audit flushers stop first, so none of them writes after the
 	// final flush below or after the store closes. Then the open hour's
 	// link fetch counts and any folded refusals are written, and a
@@ -5471,6 +5484,7 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			// FallbackChannelID is absent to keep the rule's current fallback,
 			// empty to clear it, or a channel id.
 			FallbackChannelID *string `json:"fallback_channel_id"`
+			notifyRuleOptionsRequest
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -5497,6 +5511,10 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if opts, err = applyNotifyRuleOptions(opts, req.notifyRuleOptionsRequest); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		if err := s.store.UpsertNotifyRuleWithOptions(rule, opts); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -5504,6 +5522,14 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 		metadata := map[string]string{"rule_id": rule.ID}
 		if opts.FallbackChannelID != "" {
 			metadata["fallback_channel_id"] = opts.FallbackChannelID
+		}
+		if on, after, level := escalationPolicy(opts); on {
+			metadata["escalation"] = fmt.Sprintf("after %s at %s", after, level)
+		} else {
+			metadata["escalation"] = "off"
+		}
+		if qh := opts.QuietHours; qh != nil {
+			metadata["quiet_hours"] = qh.Start + "-" + qh.End + " " + qh.TimeZone
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: metadata})
 		writeJSON(w, http.StatusOK, toNotifyRuleView(rule, opts))
@@ -5728,53 +5754,71 @@ const (
 // before the restart still announces its recovery. A result the store held
 // already (a retried batch) is never passed here.
 //
-// The notice is queued for the sweep's digest, so an all-nodes monitor whose
-// target goes down pages once, naming every node. The page itself is not
-// stored: it is decided after the result's write commits and waits in memory
-// until the next sweep. A process that dies without Close in that window
-// never sends it, and the agent's retry of that result comes back as a
-// duplicate that decides nothing. So a page is never sent twice, but a crash
-// can lose one; closing that needs the stored notification outbox described
-// at alertDigest.
+// The result opens or resolves the pair's incident (incidents.go), and the
+// sweep sends what that owes: an all-nodes monitor whose target goes down
+// pages once, naming every node. The decision is stored with the incident, so
+// a process that dies before the sweep still sends the page after the
+// restart, and a retried result comes back as a duplicate that decides
+// nothing.
 func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, priorFailStreak int) {
-	var kind string
-	switch {
-	case !current.Success && priorFailStreak == 1:
-		kind = EventMonitorDown
-	case current.Success && priorFailStreak >= 2:
-		kind = EventMonitorRecovered
-	default:
+	if current.Success && priorFailStreak == 0 {
+		return
+	}
+	if !current.Success && priorFailStreak != 1 {
 		return
 	}
 	mon, _ := s.store.Monitor(current.MonitorID)
-	name := strings.TrimSpace(mon.Name)
-	if name == "" {
-		name = current.MonitorID
+	if mon.ID == "" {
+		mon.ID = current.MonitorID
 	}
-	// A node monitor names the node by its name. A server-evaluated monitor
-	// (tls) has no node, so it names the target it dialled.
-	where := s.nodeDisplayName(nodeID)
+	name, where := s.monitorNames(mon, nodeID)
+	key := incidentKey(EventMonitorDown, nodeID, current.MonitorID)
+	now := s.now()
+	if current.Success {
+		s.resolveIncident(key, now, incidentMessage{
+			title:  fmt.Sprintf("Monitor recovered: %s on %s", name, where),
+			detail: fmt.Sprintf("%s on %s is back up (%.1fms).", name, where, current.LatencyMs),
+			line:   fmt.Sprintf("%s on %s: back up (%.1fms)", name, where, current.LatencyMs),
+		})
+		return
+	}
+	// Since is this server's clock at the second failure; the result's own
+	// At is the agent's clock.
+	s.openIncident(incidentSignal{
+		kind: EventMonitorDown, nodeID: nodeID, monitorID: current.MonitorID,
+		subject: name + " on " + where, since: now, sortKey: name + "\x00" + where,
+		msg: monitorDownMessage(name, where, current.Error),
+	}, now)
+}
+
+// monitorNames is how a monitor and where it runs read in a message. A node
+// monitor names the node by its name. A server-evaluated monitor (tls) has no
+// node, so it names the target it dialled.
+func (s *Server) monitorNames(mon model.Monitor, nodeID string) (name, where string) {
+	name = strings.TrimSpace(mon.Name)
+	if name == "" {
+		name = mon.ID
+	}
+	where = s.nodeDisplayName(nodeID)
 	if nodeID == "" {
 		where = strings.TrimSpace(mon.Target)
 		if where == "" {
 			where = "the control plane"
 		}
 	}
-	line := alertDigestLine{sortKey: name + "\x00" + where}
-	if kind == EventMonitorRecovered {
-		line.title = fmt.Sprintf("Monitor recovered: %s on %s", name, where)
-		line.body = fmt.Sprintf("%s on %s is back up (%.1fms).", name, where, current.LatencyMs)
-		line.line = fmt.Sprintf("%s on %s: back up (%.1fms)", name, where, current.LatencyMs)
-	} else {
-		detail := strings.TrimSpace(current.Error)
-		if detail == "" {
-			detail = "probe failed"
-		}
-		line.title = fmt.Sprintf("Monitor down: %s on %s", name, where)
-		line.body = fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail)
-		line.line = fmt.Sprintf("%s on %s: %s", name, where, detail)
+	return name, where
+}
+
+func monitorDownMessage(name, where, errText string) incidentMessage {
+	detail := strings.TrimSpace(errText)
+	if detail == "" {
+		detail = "probe failed"
 	}
-	s.queueAlertDigest(kind, line)
+	return incidentMessage{
+		title:  fmt.Sprintf("Monitor down: %s on %s", name, where),
+		detail: fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail),
+		line:   fmt.Sprintf("%s on %s: %s", name, where, detail),
+	}
 }
 
 // handleAgentEvent ingests an out-of-band event from an authenticated agent

@@ -44,6 +44,10 @@ type shareView struct {
 	// UpdateIntervalHours is the refresh period the link advertises to
 	// clients (Profile-Update-Interval): the share's own, or the default.
 	UpdateIntervalHours int `json:"update_interval_hours"`
+	// PublishesFleetCredentials says the share was created with the explicit
+	// flag for a record that reads the identity-less vpn-core export: it
+	// hands out every user's credentials.
+	PublishesFleetCredentials bool `json:"publishes_fleet_credentials,omitempty"`
 	// RenderBudget is the link's plugin render budget, present once the link
 	// has rendered since the server started; exhausted means its new renders
 	// answer the decoy until it refills. See share_render_budget.go.
@@ -56,7 +60,8 @@ func shareViewOf(share model.SubscriptionShare) shareView {
 		DefaultFormat: share.DefaultFormat, Enabled: share.Enabled,
 		CreatedAt: share.CreatedAt, UpdatedAt: share.UpdatedAt,
 		RotatedAt: share.RotatedAt, ExpiresAt: share.ExpiresAt,
-		UpdateIntervalHours: shareUpdateIntervalHours(share),
+		UpdateIntervalHours:       shareUpdateIntervalHours(share),
+		PublishesFleetCredentials: shareFleetCredentials(share),
 	}
 }
 
@@ -104,6 +109,9 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		ExpiresAt     *time.Time        `json:"expires_at"`
 		// 0 or absent advertises the default interval.
 		UpdateIntervalHours int `json:"update_interval_hours"`
+		// PublishesFleetCredentials must be true to share a record that
+		// reads the identity-less vpn-core export (share_fleet_feed.go).
+		PublishesFleetCredentials bool `json:"publishes_fleet_credentials"`
 	}
 	if !decodeLimitedJSON(w, r, &req, 1<<20) {
 		return
@@ -113,17 +121,28 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, errors.New("slug must be lowercase letters, digits and hyphens, starting with a letter or digit"))
 		return
 	}
-	// Two shares with one slug would make the URL ambiguous to a reader even
-	// though lookup is by token, so the collision is refused at creation.
-	for _, existing := range s.store.SubscriptionShares() {
-		if existing.Slug == req.Slug {
-			writeError(w, http.StatusConflict, errors.New("a share with this slug already exists"))
-			return
-		}
+	// Two links with one slug would make the URL ambiguous to a reader even
+	// though lookup is by token, so the collision is refused at creation,
+	// against shares and identity links alike.
+	if s.store.LinkSlugInUse(req.Slug, "") {
+		writeError(w, http.StatusConflict, errors.New("a share or an identity link with this slug already exists"))
+		return
 	}
 	if err := validateShareSource(req.Source); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	fleetFeed := false
+	if req.Source.Kind == model.ShareSourcePlugin && req.Source.PluginID == subStorePluginID {
+		var via string
+		fleetFeed, via = s.subStoreFleetFeed(req.Source.SubscriptionID)
+		if fleetFeed && !req.PublishesFleetCredentials {
+			writeError(w, http.StatusBadRequest, apiErrorf(apiErrorFleetFeedFlagRequired,
+				"subscription %s publishes every user's credentials: it reads the vpn-core fleet export with no identity (through %q). "+
+					"Give each person their identity's own link instead; to publish the fleet feed anyway, send publishes_fleet_credentials: true",
+				req.Source.SubscriptionID, via))
+			return
+		}
 	}
 	if req.Source.Kind == model.ShareSourceCoreProxyUser {
 		// The public URL answers a share whose user is missing with the same
@@ -159,14 +178,21 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if fleetFeed {
+		share = withShareFleetCredentials(share)
+	}
 	if err := s.store.UpsertSubscriptionShare(share); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	stored, _ := s.store.SubscriptionShare(share.ID)
+	createMeta := map[string]string{"share_id": share.ID, "slug": share.Slug, "token_sha256": proxySubTokenAuditHash(token)}
+	if fleetFeed {
+		createMeta[shareExtraFleetCredentials] = "true"
+	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareCreate, Scope: "proxy:admin", Decision: "allow",
-		Metadata: map[string]string{"share_id": share.ID, "slug": share.Slug, "token_sha256": proxySubTokenAuditHash(token)},
+		Metadata: createMeta,
 	})
 	writeJSON(w, http.StatusCreated, s.shareViewFor(stored))
 }

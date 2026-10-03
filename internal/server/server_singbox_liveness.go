@@ -115,6 +115,29 @@ func (s *Server) noteSingBoxLiveness(nodeID string, rt *model.SingBoxRuntime) {
 		rec.NotifiedDownAt = time.Time{}
 	}
 
+	// The episode opens the node's service.down incident once (NotifiedDownAt
+	// marks that it did) and a running probe resolves it; the incident sweep
+	// sends every node's notice of one kind as one message, so a fleet-wide
+	// break pages once. The incident is written before the record: a crash
+	// between the two repeats the open or the resolve at the next probe,
+	// which finds the incident already in that state, instead of losing it
+	// to a record that says it happened.
+	name := s.nodeDisplayName(nodeID)
+	if notifyDown {
+		s.openIncident(incidentSignal{
+			kind: EventServiceDown, nodeID: nodeID, subject: name, since: rec.ProblemSince,
+			sortKey: name + "\x00" + nodeID,
+			msg:     singBoxDownMessage(name, nodeID, state, rec.ProblemSince, rt),
+		}, now)
+	}
+	if notifyRecovered || (state == serviceStateRunning && hadPrev && prev.State != state) {
+		s.resolveIncident(incidentKey(EventServiceDown, nodeID, ""), now, incidentMessage{
+			title:  fmt.Sprintf("sing-box recovered on %s", name),
+			detail: fmt.Sprintf("%s (%s): sing-box is running again (pid %d).", name, nodeID, rt.PID),
+			line:   fmt.Sprintf("%s: running again", name),
+		})
+	}
+
 	if _, _, err := s.store.UpsertSingBoxLiveness(rec); err != nil {
 		s.logger.Printf("singbox liveness persist failed: node_id=%s: %v", nodeID, err)
 	}
@@ -133,26 +156,6 @@ func (s *Server) noteSingBoxLiveness(nodeID string, rt *model.SingBoxRuntime) {
 				"active_state":  rt.ActiveState,
 				"sub_state":     rt.SubState,
 			},
-		})
-	}
-
-	// The episode opens the node's service.down incident once (NotifiedDownAt
-	// marks that it did) and a running probe resolves it; the incident sweep
-	// sends every node's notice of one kind as one message, so a fleet-wide
-	// break pages once.
-	name := s.nodeDisplayName(nodeID)
-	if notifyDown {
-		s.openIncident(incidentSignal{
-			kind: EventServiceDown, nodeID: nodeID, subject: name, since: rec.ProblemSince,
-			sortKey: name + "\x00" + nodeID,
-			msg:     singBoxDownMessage(name, nodeID, state, rec.ProblemSince, rt),
-		}, now)
-	}
-	if notifyRecovered || (state == serviceStateRunning && hadPrev && prev.State != state) {
-		s.resolveIncident(incidentKey(EventServiceDown, nodeID, ""), now, incidentMessage{
-			title:  fmt.Sprintf("sing-box recovered on %s", name),
-			detail: fmt.Sprintf("%s (%s): sing-box is running again (pid %d).", name, nodeID, rt.PID),
-			line:   fmt.Sprintf("%s: running again", name),
 		})
 	}
 }

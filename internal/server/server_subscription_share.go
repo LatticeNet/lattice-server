@@ -288,6 +288,11 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	}
 	share, ok := s.resolveShare(slug, token, s.now())
 	if !ok {
+		// Not a share: an identity link is the other kind the index holds,
+		// served by the same stages in identity_link.go.
+		if s.serveIdentityLink(w, r, slug, token, tokenHash, requested, deny) {
+			return
+		}
 		deny("subscription not found", map[string]string{"slug": slug, "token_sha256": tokenHash})
 		return
 	}

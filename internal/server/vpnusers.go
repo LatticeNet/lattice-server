@@ -52,6 +52,10 @@ type VpnUser struct {
 	// enabled and not suspended by an operator.
 	Suspension *VpnSuspension `json:"suspension,omitempty"`
 
+	// Link is the identity's subscription link, nil until one is issued
+	// (identity_link.go). Its token is SubID.
+	Link *VpnUserLink `json:"link,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -129,8 +133,11 @@ type vpnUserView struct {
 	Group         string              `json:"group,omitempty"`
 	Comment       string              `json:"comment,omitempty"`
 	Migrated      bool                `json:"migrated"`
-	CreatedAt     time.Time           `json:"created_at"`
-	UpdatedAt     time.Time           `json:"updated_at"`
+	// Link is the identity's subscription link as a list may show it: route
+	// facts only, never the token. Nil when no link is issued.
+	Link      *vpnUserLinkSummary `json:"link,omitempty"`
+	CreatedAt time.Time           `json:"created_at"`
+	UpdatedAt time.Time           `json:"updated_at"`
 }
 
 func toVpnUserView(u VpnUser) vpnUserView {
@@ -150,6 +157,7 @@ func toVpnUserView(u VpnUser) vpnUserView {
 		Credentials: creds, Bindings: binds, QuotaBytes: u.QuotaBytes, ExpiresAt: u.ExpiresAt,
 		QuotaPeriod: u.QuotaPeriod, QuotaResetDay: u.QuotaResetDay,
 		Group: u.Group, Comment: u.Comment, Migrated: u.MigratedFromProxyUser != "",
+		Link:      vpnUserLinkSummaryOf(u.Link),
 		CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
 	}
 }
@@ -218,6 +226,7 @@ func splitVpnUserRecord(u VpnUser) (store.VpnUserPublicRecord, store.VpnUserSecr
 		ExpiresAt: u.ExpiresAt, Group: u.Group, Comment: u.Comment,
 		SubscriptionGeneration: u.SubscriptionGeneration,
 		MigratedFromProxyUser:  u.MigratedFromProxyUser, Suspension: cloneVpnSuspension(u.Suspension),
+		Link:      cloneVpnUserLinkRecord(u.Link),
 		CreatedAt: u.CreatedAt, UpdatedAt: u.UpdatedAt,
 	}, store.VpnUserSecretRecord{Credentials: privateCredentials, SubID: u.SubID}
 }
@@ -249,6 +258,7 @@ func joinVpnUserRecord(public store.VpnUserPublicRecord, private store.VpnUserSe
 		ExpiresAt: public.ExpiresAt, Group: public.Group, Comment: public.Comment,
 		SubscriptionGeneration: public.SubscriptionGeneration,
 		MigratedFromProxyUser:  public.MigratedFromProxyUser, Suspension: cloneVpnSuspension(public.Suspension),
+		Link:      cloneVpnUserLinkRecord(public.Link),
 		CreatedAt: public.CreatedAt, UpdatedAt: public.UpdatedAt,
 	}
 }
@@ -481,6 +491,9 @@ func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, r
 		if err := s.deleteVpnUser(id); err != nil {
 			return nil, err
 		}
+		// The link's token went with the secret record in that write, so the
+		// index no longer holds it; what the serving path kept goes too.
+		s.dropIdentityLinkServingState(id)
 		return json.Marshal(map[string]any{"ok": true, "id": id})
 	case "bind":
 		return s.vpnUserBind(request)
@@ -505,6 +518,8 @@ func (s *Server) vpnCoreUsersAdminDispatch(ctx context.Context, method string, r
 			return nil, err
 		}
 		return s.vpnUserRotateCredential(p, request)
+	case "link_get", "link_issue", "link_set", "link_revoke", "link_rotate", "link_reveal":
+		return s.vpnUserLinkRPC(ctx, method, request)
 	case "usage_query":
 		// A read on the admin service: the gateway enforced the manifest
 		// scopes, and node:read is re-checked here so the method can never be

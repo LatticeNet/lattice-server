@@ -240,6 +240,10 @@ func (s *Server) flushShareFetchStats(now time.Time, shutdown bool) {
 		}
 	}
 	exists := func(shareID string) bool {
+		if userID, ok := strings.CutPrefix(shareID, identityLinkStatsPrefix); ok {
+			u, found := s.getVpnUser(userID)
+			return found && u.Link != nil
+		}
 		_, ok := s.store.SubscriptionShare(shareID)
 		return ok
 	}

@@ -352,6 +352,16 @@ type Server struct {
 	// time. It exists so a client poll does not re-enter a plugin - and boot a
 	// JavaScript VM - on every fetch.
 	subscriptionCache *subscriptionCache
+	// identityLinkCache holds converted identity link documents, keyed by
+	// the identity's content digest (identity_link.go); identityConvert*
+	// run one convert per key at a time; identityFetches remembers each
+	// identity link's last fetch since start. identityLinkConvert is a test
+	// seam; production leaves it nil and calls the Sub-Store plugin.
+	identityLinkCache      *subscriptionCache
+	identityConvertMu      sync.Mutex
+	identityConvertFlights map[subscriptionCacheKey]*shareRenderFlight
+	identityFetches        identityLinkFetches
+	identityLinkConvert    func(context.Context, []string, shareRenderVariant) (renderedSubscription, error)
 	// subscriptionSnapshotPersist is a narrow persistence seam for exercising
 	// fail-closed last-good transitions. Production always falls back to Store.
 	subscriptionSnapshotPersist   func(model.SubscriptionSnapshot) (bool, error)
@@ -649,6 +659,7 @@ func New(opts Options) (*Server, error) {
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		identityLinkCache:     newSubscriptionCache(identityLinkCacheEntries, identityLinkCacheTTL),
 		shareFetchStats:       newShareFetchStats(),
 		shareFlushStop:        make(chan struct{}),
 		subscriptionDecoy:     opts.SubscriptionDecoy,
@@ -1292,6 +1303,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/users/reveal-credentials", s.withAuth("", s.handleRevealVPNUserCredentials))
 	mux.HandleFunc("/api/proxy/users/rotate-sub-token", s.withAuth("", s.handleRotateProxyUserSubToken))
 	mux.HandleFunc("/api/proxy/users/delete", s.withAuth("", s.handleDeleteProxyUser))
+	mux.HandleFunc("/api/vpn/users/", s.withAuth("", s.handleVpnUserLink))
 	mux.HandleFunc("/api/proxy/usage", s.withAuth("", s.handleProxyUsage))
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))

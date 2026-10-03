@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
@@ -333,5 +336,44 @@ func TestNotifyChannelViewWithHealthHidesSecret(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(body), []byte(`"last_failure_kind":"upstream_4xx"`)) {
 		t.Fatalf("channel list lacks health: %s", body)
+	}
+}
+
+// notify.send answers a plugin with fixed text only: nil once the message is
+// stored for every enabled channel, a no-channel error when there is none
+// (the message is still in the Sent log), and a backlog error, with nothing
+// stored, once the plugin already has its bound of deliveries owed.
+func TestPluginNotifySendAnswers(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	installFakeNotifySender(srv, nil)
+	host := &pluginHost{server: srv}
+	if err := host.Send(context.Background(), "latticenet.sub-store", "Sync failed", "b"); !errors.Is(err, errPluginNotifyNoChannel) {
+		t.Fatalf("no channel: err = %v", err)
+	}
+	if rows := st.NotifyDeliveries(store.NotifyDeliveryFilter{Source: store.NotifySourcePlugin}); len(rows) != 1 || rows[0].Outcome != store.NotifyOutcomeNoRoute {
+		t.Fatalf("no-channel rows = %+v", rows)
+	}
+
+	addNotifyChannel(t, st, "nc-a", "Bark urgent")
+	now := time.Now().UTC()
+	owed := make([]store.NotifyDelivery, store.MaxNotifyUnsettledPerSource)
+	for i := range owed {
+		owed[i] = store.NotifyDelivery{ID: fmt.Sprintf("nd-owed-%03d", i), EventID: fmt.Sprintf("evt-%03d", i), EventType: "plugin.latticenet.sub-store.message",
+			Source: store.NotifySourcePlugin, SourceID: "latticenet.sub-store", ChannelID: "nc-a", Role: store.NotifyRolePrimary,
+			Outcome: store.NotifyOutcomePlanned, CreatedAt: now, NextAttemptAt: now.Add(time.Hour)}
+	}
+	if err := st.RecordNotifyDeliveries(owed); err != nil {
+		t.Fatal(err)
+	}
+	before := st.NotifyDeliveryCount()
+	if err := host.Send(context.Background(), "latticenet.sub-store", "Sync failed", "b"); !errors.Is(err, errPluginNotifyBacklog) {
+		t.Fatalf("backlog: err = %v", err)
+	}
+	if st.NotifyDeliveryCount() != before {
+		t.Fatal("a refused message was stored")
+	}
+	// Another plugin is not held back by this one's backlog.
+	if err := host.Send(context.Background(), "latticenet.netguard", "Applied", "b"); err != nil {
+		t.Fatalf("another plugin: err = %v", err)
 	}
 }

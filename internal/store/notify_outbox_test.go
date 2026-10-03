@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -211,5 +213,226 @@ func TestNotifyRuleOptionsLiveAndDieWithTheirRule(t *testing.T) {
 	}
 	if len(s.NotifyRuleOptionsByRule()) != 0 {
 		t.Fatal("a deleted rule left its options")
+	}
+}
+
+func noRouteRow(id, eventType string, at time.Time) NotifyDelivery {
+	return NotifyDelivery{ID: id, EventID: "evt-" + id, EventType: eventType, Source: NotifySourceServer,
+		Outcome: NotifyOutcomeNoRoute, Reason: "no enabled rule routes this event type", Title: "unrouted " + id, CreatedAt: at}
+}
+
+// Unrouted events cannot push out the receipts the Sent log exists for: 2000
+// of them, each a distinct type so none folds into another, leave a failed
+// delivery and a sent one in place, hold no more than their own bound, and
+// keep the newest.
+func TestNotifyOutboxNoRouteRowsNeverEvictReceipts(t *testing.T) {
+	s, _ := openReportClockStore(t)
+	base := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	failed := outboxRow("nd-failed", NotifySourceServer, "", base, NotifyOutcomeFailed)
+	sent := outboxRow("nd-sent", NotifySourceServer, "", base.Add(time.Second), NotifyOutcomeSent)
+	if err := s.RecordNotifyDeliveries([]NotifyDelivery{failed, sent}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		row := noRouteRow(fmt.Sprintf("nd-nr-%04d", i), fmt.Sprintf("custom.type_%04d", i), base.Add(time.Duration(2+i)*time.Second))
+		if err := s.RecordNotifyNoRoute(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range []string{"nd-failed", "nd-sent"} {
+		if _, ok := s.NotifyDelivery(id); !ok {
+			t.Fatalf("%s was evicted by unrouted events", id)
+		}
+	}
+	noRoute := s.NotifyDeliveries(NotifyDeliveryFilter{Outcome: NotifyOutcomeNoRoute})
+	if len(noRoute) != MaxNotifyNoRouteDeliveries {
+		t.Fatalf("no_route rows = %d, want %d", len(noRoute), MaxNotifyNoRouteDeliveries)
+	}
+	if noRoute[0].ID != "nd-nr-1999" || noRoute[len(noRoute)-1].ID != "nd-nr-1900" {
+		t.Fatalf("kept %s..%s, want the newest", noRoute[len(noRoute)-1].ID, noRoute[0].ID)
+	}
+}
+
+// When the outbox is full, a new delivery takes a no_route row before any
+// receipt, and a no_route row does not count toward its source's floor.
+func TestNotifyOutboxEvictsNoRouteRowsFirst(t *testing.T) {
+	s, _ := openReportClockStore(t)
+	base := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 10; i++ {
+		if err := s.RecordNotifyNoRoute(noRouteRow(fmt.Sprintf("nd-nr-%02d", i), fmt.Sprintf("custom.type_%02d", i), base.Add(time.Duration(i)*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := make([]NotifyDelivery, 0, MaxNotifyDeliveries-10)
+	for i := 0; i < MaxNotifyDeliveries-10; i++ {
+		rows = append(rows, outboxRow(fmt.Sprintf("nd-srv-%04d", i), NotifySourceServer, "", base.Add(time.Hour+time.Duration(i)*time.Second), NotifyOutcomeSent))
+	}
+	if err := s.RecordNotifyDeliveries(rows); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.NotifyDeliveryCount(); n != MaxNotifyDeliveries {
+		t.Fatalf("outbox holds %d", n)
+	}
+	for i := 0; i < 3; i++ {
+		row := outboxRow(fmt.Sprintf("nd-new-%d", i), NotifySourceServer, "", base.Add(2*time.Hour+time.Duration(i)*time.Second), NotifyOutcomeFailed)
+		if err := s.RecordNotifyDeliveries([]NotifyDelivery{row}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := s.NotifyDelivery("nd-srv-0000"); !ok {
+		t.Fatal("a receipt went before the unrouted rows")
+	}
+	if got := len(s.NotifyDeliveries(NotifyDeliveryFilter{Outcome: NotifyOutcomeNoRoute})); got != 7 {
+		t.Fatalf("no_route rows = %d, want 7", got)
+	}
+	if _, ok := s.NotifyDelivery("nd-nr-02"); ok {
+		t.Fatal("the oldest no_route rows were not the ones evicted")
+	}
+}
+
+// Repeats of one unrouted event fold into the row first written for it for an
+// hour, carrying the latest text, and a repeat is written to bolt at most
+// once a minute: a reopen inside that minute shows the last written count.
+func TestNotifyOutboxCollapsesRepeatedNoRouteRows(t *testing.T) {
+	s, path := openReportClockStore(t)
+	hotPath := filepath.Join(filepath.Dir(path), "hot.db")
+	if err := s.EnableRuntimeBoltHotStore(hotPath); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	login := func(id string, at time.Time) NotifyDelivery {
+		row := noRouteRow(id, "ssh.login", at)
+		row.Title = "SSH login " + id
+		return row
+	}
+	if err := s.RecordNotifyNoRoute(login("nd-1", base)); err != nil {
+		t.Fatal(err)
+	}
+	// Two repeats inside the first minute: memory only.
+	for i, at := range []time.Time{base.Add(10 * time.Second), base.Add(20 * time.Second)} {
+		if err := s.RecordNotifyNoRoute(login(fmt.Sprintf("nd-r%d", i), at)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := s.NotifyDeliveries(NotifyDeliveryFilter{EventType: "ssh.login"})
+	if len(rows) != 1 || rows[0].ID != "nd-1" || rows[0].Repeats != 2 || !rows[0].LastSeenAt.Equal(base.Add(20*time.Second)) || rows[0].Title != "SSH login nd-r1" {
+		t.Fatalf("rows = %+v", rows)
+	}
+	// A repeat a minute after the last write is written.
+	if err := s.RecordNotifyNoRoute(login("nd-r2", base.Add(90*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	// And one more inside the next minute stays in memory.
+	if err := s.RecordNotifyNoRoute(login("nd-r3", base.Add(100*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.NotifyDelivery("nd-1"); got.Repeats != 4 {
+		t.Fatalf("repeats in memory = %d", got.Repeats)
+	}
+	// Another type, and the same type an hour on, each start a row.
+	if err := s.RecordNotifyNoRoute(noRouteRow("nd-quota", "proxy.quota", base.Add(2*time.Minute))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordNotifyNoRoute(login("nd-2", base.Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if rows := s.NotifyDeliveries(NotifyDeliveryFilter{EventType: "ssh.login"}); len(rows) != 2 || rows[0].ID != "nd-2" || rows[0].Repeats != 0 {
+		t.Fatalf("after the window = %+v", rows)
+	}
+
+	s = reopenReportClockStore(t, s, path)
+	if err := s.EnableRuntimeBoltHotStore(hotPath); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s.NotifyDelivery("nd-1")
+	if !ok || got.Repeats != 3 || !got.LastSeenAt.Equal(base.Add(90*time.Second)) {
+		t.Fatalf("after reopen = %v %+v, want the count last written (3)", ok, got)
+	}
+	// The first repeat after a reopen is written, since nothing paces it yet,
+	// and it folds into the newest row of its kind.
+	if err := s.RecordNotifyNoRoute(login("nd-r4", base.Add(time.Hour+10*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	s = reopenReportClockStore(t, s, path)
+	if err := s.EnableRuntimeBoltHotStore(hotPath); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.NotifyDelivery("nd-2"); got.Repeats != 1 {
+		t.Fatalf("repeats after the second reopen = %d", got.Repeats)
+	}
+}
+
+// Stored text is bounded on every write path, cut on a character boundary,
+// and the row says so.
+func TestNotifyOutboxBoundsStoredText(t *testing.T) {
+	s, _ := openReportClockStore(t)
+	at := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	long := strings.Repeat("节点离线", 2000) // 3 bytes a character
+	row := outboxRow("nd-long", NotifySourcePlugin, "p", at, NotifyOutcomePlanned)
+	row.Title, row.Body = long, long
+	if err := s.RecordNotifyDeliveries([]NotifyDelivery{row}); err != nil {
+		t.Fatal(err)
+	}
+	nr := noRouteRow("nd-nr", "plugin.p.message", at)
+	nr.Body = long
+	if err := s.RecordNotifyNoRoute(nr); err != nil {
+		t.Fatal(err)
+	}
+	put := outboxRow("nd-put", NotifySourcePlugin, "p", at, NotifyOutcomeSent)
+	put.Body = long
+	if err := s.PutNotifyDelivery(put, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"nd-long", "nd-nr", "nd-put"} {
+		got, _ := s.NotifyDelivery(id)
+		if len(got.Title) > MaxNotifyTitleBytes || len(got.Body) > MaxNotifyBodyBytes || !got.Truncated {
+			t.Fatalf("%s: title %d bytes, body %d bytes, truncated %v", id, len(got.Title), len(got.Body), got.Truncated)
+		}
+		if !utf8.ValidString(got.Title) || !utf8.ValidString(got.Body) || !strings.HasSuffix(got.Body, " [truncated]") {
+			t.Fatalf("%s: cut mid-character or unmarked: %q", id, got.Body[len(got.Body)-20:])
+		}
+	}
+	short := outboxRow("nd-short", NotifySourceServer, "", at, NotifyOutcomeSent)
+	short.Body = "fits"
+	if err := s.RecordNotifyDeliveries([]NotifyDelivery{short}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.NotifyDelivery("nd-short"); got.Truncated || got.Body != "fits" {
+		t.Fatalf("a short message was touched: %+v", got)
+	}
+	if again, _, cut := ClampNotifyText(strings.Repeat("a", 600), ""); cut != true || len(again) != MaxNotifyTitleBytes {
+		t.Fatalf("clamp = %d bytes, cut %v", len(again), cut)
+	}
+	if clamped, _, _ := ClampNotifyText(strings.Repeat("a", 600), ""); func() bool { c, _, cut := ClampNotifyText(clamped, ""); return cut || c != clamped }() {
+		t.Fatal("clamping twice changed the text")
+	}
+}
+
+// The event and unsettled indexes follow every put and eviction.
+func TestNotifyOutboxIndexesFollowWrites(t *testing.T) {
+	s, _ := openReportClockStore(t)
+	at := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
+	a := outboxRow("nd-a", NotifySourcePlugin, "p", at, NotifyOutcomePlanned)
+	b := outboxRow("nd-b", NotifySourcePlugin, "p", at.Add(time.Second), NotifyOutcomePlanned)
+	b.EventID = a.EventID
+	other := outboxRow("nd-c", NotifySourcePlugin, "q", at.Add(2*time.Second), NotifyOutcomePlanned)
+	if err := s.RecordNotifyDeliveries([]NotifyDelivery{a, b, other}); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.NotifyUnsettledCount(NotifySourcePlugin, "p"); n != 2 {
+		t.Fatalf("unsettled for p = %d", n)
+	}
+	if got := s.NotifyDeliveries(NotifyDeliveryFilter{EventID: a.EventID}); len(got) != 2 || got[0].ID != "nd-b" {
+		t.Fatalf("event rows = %+v", got)
+	}
+	a.Outcome = NotifyOutcomeSent
+	if err := s.PutNotifyDelivery(a, nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := s.NotifyUnsettledCount(NotifySourcePlugin, "p"); n != 1 {
+		t.Fatalf("unsettled for p after a send = %d", n)
+	}
+	if got := s.UnsettledNotifyDeliveries(); len(got) != 2 || got[0].ID != "nd-b" || got[1].ID != "nd-c" {
+		t.Fatalf("unsettled = %+v", got)
 	}
 }

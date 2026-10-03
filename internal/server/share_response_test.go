@@ -272,3 +272,43 @@ func TestHourlyFetchSummariesArePackedPerHour(t *testing.T) {
 		t.Fatalf("the next hour's event = %+v", last)
 	}
 }
+
+// The minute flushers of the link audits used to run until the process
+// exited, so one could write after Close's final flush and after the store
+// closed, and each test server leaked two goroutines. Close now stops them
+// before it writes the last summaries, and a second Close is harmless.
+func TestCloseStopsTheLinkAuditFlushersBeforeTheFinalFlush(t *testing.T) {
+	userinfo := ""
+	s, st, path, _ := responseShareServer(t, "vless://a\n", &userinfo)
+	s.startShareFetchStatsFlush()
+	s.startShareRefusalAuditFlush()
+	rec := httptest.NewRecorder()
+	s.handleSubscriptionShare(rec, shareRequest(path, "Surge/5"))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan struct{})
+	go func() {
+		s.shareFlushers.Wait()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the link audit flushers were still running after Close")
+	}
+	partial := 0
+	for _, ev := range st.AuditEvents() {
+		if ev.Reason == shareFetchSummaryReason && ev.Metadata["partial"] == "true" {
+			partial++
+		}
+	}
+	if partial != 1 {
+		t.Fatalf("partial summaries written by Close = %d", partial)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

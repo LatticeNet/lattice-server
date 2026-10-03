@@ -248,11 +248,24 @@ func (s *Server) flushShareFetchStats(now time.Time, shutdown bool) {
 }
 
 func (s *Server) startShareFetchStatsFlush() {
+	s.runShareFlusher(shareFetchStatsFlushEvery, func() { s.flushShareFetchStats(s.now(), false) })
+}
+
+// runShareFlusher runs flush on every tick until Close stops the link audit
+// flushers.
+func (s *Server) runShareFlusher(every time.Duration, flush func()) {
+	s.shareFlushers.Add(1)
 	go func() {
-		ticker := time.NewTicker(shareFetchStatsFlushEvery)
+		defer s.shareFlushers.Done()
+		ticker := time.NewTicker(every)
 		defer ticker.Stop()
-		for range ticker.C {
-			s.flushShareFetchStats(s.now(), false)
+		for {
+			select {
+			case <-s.shareFlushStop:
+				return
+			case <-ticker.C:
+				flush()
+			}
 		}
 	}()
 }

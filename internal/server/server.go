@@ -245,6 +245,12 @@ type Server struct {
 	shareFetchStats     *shareFetchStats
 	shareFetchAudits    sync.WaitGroup
 	shareFetchAuditHook func()
+	// shareFlushStop stops the minute flushers of the link audits (fetch
+	// summaries and refusal summaries) before Close writes the last ones;
+	// shareFlushers counts the flushers still running.
+	shareFlushStop     chan struct{}
+	shareFlushStopOnce sync.Once
+	shareFlushers      sync.WaitGroup
 	// shareRenderBudget bounds the plugin renders one link's cache misses
 	// may start; see share_render_budget.go.
 	shareRenderBudget *shareRenderBudget
@@ -628,6 +634,7 @@ func New(opts Options) (*Server, error) {
 		reminderInterval:      opts.RenewalReminderInterval,
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
 		shareFetchStats:       newShareFetchStats(),
+		shareFlushStop:        make(chan struct{}),
 		subscriptionDecoy:     opts.SubscriptionDecoy,
 		now:                   func() time.Time { return time.Now().UTC() },
 		tlsMonitorTargets:     defaultTLSMonitorTargets,
@@ -1411,18 +1418,30 @@ func (s *Server) Close(ctx context.Context) error {
 		return nil
 	}
 	s.flushAlertDigests()
-	// The open hour's link fetch counts would otherwise be lost, and a
-	// first-seen audit already handed to its goroutine should land too.
-	s.flushShareFetchStats(s.now(), true)
-	fetchAuditsDone := make(chan struct{})
-	go func() {
-		s.shareFetchAudits.Wait()
-		close(fetchAuditsDone)
-	}()
-	select {
-	case <-fetchAuditsDone:
-	case <-ctx.Done():
+	// The link audit flushers stop first, so none of them writes after the
+	// final flush below or after the store closes. Then the open hour's
+	// link fetch counts and any folded refusals are written, and a
+	// first-seen audit already handed to its goroutine lands too.
+	s.shareFlushStopOnce.Do(func() {
+		if s.shareFlushStop != nil {
+			close(s.shareFlushStop)
+		}
+	})
+	waitShareAudits := func(wg *sync.WaitGroup) {
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
 	}
+	waitShareAudits(&s.shareFlushers)
+	s.flushShareFetchStats(s.now(), true)
+	s.flushShareRefusalAudit(s.now())
+	waitShareAudits(&s.shareFetchAudits)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)

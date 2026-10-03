@@ -228,6 +228,46 @@ func TestUnflushedHeartbeatAndTokenUseRideTheNextWrite(t *testing.T) {
 	}
 }
 
+// A token use waits for the next write only while the node is beating. A
+// node that never beat, or whose heartbeat stopped, writes the use at once:
+// nothing of its own would carry it to disk.
+func TestTokenUseWritesWhenNoHeartbeatWillCarryIt(t *testing.T) {
+	f := openHeartbeatFleet(t, fleetIDs(2))
+	if err := f.s.UpsertNode(model.Node{ID: "node-fresh", Name: "fresh"}); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name   string
+		nodeID string
+		at     time.Time
+		writes int
+	}{
+		{"never beat", "node-fresh", f.t0.Add(30 * time.Second), 1},
+		{"heartbeat stopped two minutes ago", f.ids[1], f.t0.Add(2 * time.Minute), 1},
+		// Last, so Close has to write it.
+		{"beating, heartbeat on disk", f.ids[0], f.t0.Add(30 * time.Second), 0},
+	}
+	for _, tc := range cases {
+		before := f.s.testPersistCalls
+		if touched, err := f.s.TouchNodeToken(tc.nodeID, tc.at, 15*time.Minute); err != nil || !touched {
+			t.Fatalf("%s: touched=%v err=%v", tc.name, touched, err)
+		}
+		if calls := f.s.testPersistCalls - before; calls != tc.writes {
+			t.Fatalf("%s: wrote %d times, want %d", tc.name, calls, tc.writes)
+		}
+	}
+	before := f.s.testPersistCalls
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if calls := f.s.testPersistCalls - before; calls != 1 {
+		t.Fatalf("close with a token use only in memory wrote %d times, want 1", calls)
+	}
+	if n, _ := reopen(t, f.path).Node(f.ids[0]); !n.TokenLastUsedAt.Equal(f.t0.Add(30 * time.Second)) {
+		t.Fatalf("token use after close = %s", n.TokenLastUsedAt)
+	}
+}
+
 // A heartbeat that changes something durable is still written on the beat
 // that reports it, whatever the fleet clock says.
 func TestDurableHeartbeatChangeWritesImmediately(t *testing.T) {

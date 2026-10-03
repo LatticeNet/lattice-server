@@ -45,6 +45,11 @@ const metricsPersistenceInterval = 5 * time.Minute
 // LastSeen is a lower bound by this much; NodeLastSeenSlack says when.
 const NodeLastSeenDiskLag = metricsPersistenceInterval
 
+// tokenUseRidesWithin is how recent a node's heartbeat must be for a token
+// use to wait for the next state write instead of writing at once. Within
+// it the node is beating, and its own beats force that write.
+const tokenUseRidesWithin = time.Minute
+
 // monitorResultPersistenceInterval keeps monitor history live in memory while
 // avoiding a full snapshot rewrite for every unchanged probe cycle. It applies
 // only without the hot store, which writes every result at record level.
@@ -1639,12 +1644,19 @@ func (s *Store) TouchNodeToken(nodeID string, at time.Time, minInterval time.Dur
 	}
 	n.TokenLastUsedAt = at
 	s.state.Nodes[nodeID] = n
-	// The token's last use is heartbeat telemetry: it rides the next write
-	// while the node's heartbeat on disk is fresh, which the heartbeat
-	// throttle keeps within metricsPersistenceInterval, and Close writes it.
-	// Writing it here on its own clock rewrote the whole state file once per
-	// node every minInterval.
-	if written, ok := s.metricsPersistedAt[nodeID]; ok && at.Sub(written) < metricsPersistenceInterval {
+	// The token's last use is heartbeat telemetry. It rides the next write
+	// when the node is beating (its heartbeat is within tokenUseRidesWithin)
+	// and its heartbeat on disk is fresh: the node's own beats then force
+	// that write within metricsPersistenceInterval of the previous one. A
+	// node that has not beaten lately, or whose heartbeat never reached disk,
+	// writes the use at once. A node that goes silent right after the use
+	// leaves it to the next write by any node, which the heartbeat throttle
+	// forces within metricsPersistenceInterval while any node beats, or to
+	// Close. Writing every use on its own clock rewrote the whole state file
+	// once per node every minInterval.
+	written, onDisk := s.metricsPersistedAt[nodeID]
+	sinceWrite, sinceBeat := at.Sub(written), at.Sub(n.LastSeen)
+	if onDisk && sinceWrite < metricsPersistenceInterval && sinceBeat < tokenUseRidesWithin {
 		s.nodeClocksUnflushed = true
 		return true, nil
 	}

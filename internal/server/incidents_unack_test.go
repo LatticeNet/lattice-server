@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -450,4 +451,33 @@ func TestUnacknowledgeRacingAWithdrawalStillOwesTheOpen(t *testing.T) {
 	d.expect("after the undo", "nc-night Agent loop stalled: name-a")
 	d.sweep()
 	d.expect("the next sweep")
+}
+
+// Undoing an acknowledgement on an incident nobody acknowledged changes
+// nothing: the record stays as it was, nothing is sent and nothing is
+// audited, so the audit log never shows an undo that did not happen.
+func TestUnacknowledgeAnUnacknowledgedIncidentChangesNothing(t *testing.T) {
+	h := newIncidentHarness(t, "a")
+	post, _, _ := incidentPoster(h)
+	h.openService("a")
+	expectNotices(t, "the open", h.sweep(), "service.down: sing-box down on name-a")
+	before := h.incident(EventServiceDown, "a")
+	rows := len(h.f.st.NotifyDeliveries(store.NotifyDeliveryFilter{}))
+	h.clock.advance(time.Minute)
+
+	if code, v := post("/api/incidents/unack", before.ID); code != http.StatusOK || v.State != store.IncidentStateOpen {
+		t.Fatalf("unack: %d %+v", code, v)
+	}
+	if after := h.incident(EventServiceDown, "a"); !reflect.DeepEqual(after, before) {
+		t.Fatalf("the record changed:\nbefore %+v\nafter  %+v", before, after)
+	}
+	expectNotices(t, "after the undo", h.sweep())
+	if got := len(h.f.st.NotifyDeliveries(store.NotifyDeliveryFilter{})); got != rows {
+		t.Fatalf("outbox rows %d, was %d", got, rows)
+	}
+	for _, ev := range h.f.st.AuditEvents() {
+		if ev.Action == "incident.unack" {
+			t.Fatalf("an undo that changed nothing was audited: %+v", ev)
+		}
+	}
 }

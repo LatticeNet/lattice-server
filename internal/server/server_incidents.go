@@ -415,7 +415,8 @@ func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p p
 		return
 	}
 	ackedAt := inc.AckedAt
-	if inc.State == store.IncidentStateAcknowledged {
+	undone := inc.State == store.IncidentStateAcknowledged
+	if undone {
 		inc.State = store.IncidentStateOpen
 		// The open message is owed when the acknowledgement cancelled it, and
 		// also whenever the phone was never told this occurrence is open: an
@@ -441,16 +442,23 @@ func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p p
 		inc.AckCancelledOpen = false
 		inc.AckedBy, inc.AckedAt = "", time.Time{}
 		inc.UpdatedAt = now
+		// The store keeps the change in memory, which the sweep reads, even
+		// when the disk write fails, so the undo is in effect either way and
+		// is answered and audited as such, as acknowledge and snooze are.
 		if err := s.store.PutIncidents(inc); err != nil {
 			s.logger.Printf("incidents: record unack %s: %v", inc.ID, err)
 		}
 	}
 	s.incidentMu.Unlock()
-	meta := map[string]string{"incident_id": inc.ID, "kind": inc.Kind}
-	if !ackedAt.IsZero() {
-		meta["acked_at"] = stamp(ackedAt)
+	// Only an undo that undid something is audited; one on an incident
+	// nobody acknowledged changed nothing.
+	if undone {
+		meta := map[string]string{"incident_id": inc.ID, "kind": inc.Kind}
+		if !ackedAt.IsZero() {
+			meta["acked_at"] = stamp(ackedAt)
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.unack", Scope: "monitor:admin", Metadata: meta})
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.unack", Scope: "monitor:admin", Metadata: meta})
 	writeJSON(w, http.StatusOK, s.toIncidentView(inc, now, cover, s.nodeNames()))
 }
 

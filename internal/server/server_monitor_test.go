@@ -6,6 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // enrollNode logs in as admin and enrolls a node, returning its id and token.
@@ -57,7 +60,7 @@ func TestMonitorLifecycleAndAgentRoundTrip(t *testing.T) {
 	}
 
 	// agent reports a result
-	body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + mon.ID + `","success":true,"latency_ms":12.5}}`
+	body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + mon.ID + `","at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `","success":true,"latency_ms":12.5}}`
 	rres := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body, nodeToken)
 	if rres.Code != http.StatusOK {
 		t.Fatalf("monitor result ingest failed: %d (%s)", rres.Code, rres.Body.String())
@@ -111,6 +114,16 @@ func TestMonitorRejectsICMP(t *testing.T) {
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("icmp should be rejected for now, got %d", res.StatusCode)
 	}
+}
+
+// storedMonitorResults is every stored result of a monitor, oldest first.
+func storedMonitorResults(t *testing.T, st *store.Store, monitorID string) []store.MonitorResultRecord {
+	t.Helper()
+	rows, err := st.RecentMonitorResults(monitorID, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
 }
 
 func serveReq(handler http.Handler, req *http.Request) *httptest.ResponseRecorder {

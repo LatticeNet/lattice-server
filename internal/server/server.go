@@ -300,6 +300,9 @@ type Server struct {
 	// alertDigest batches service and monitor alerts decided one node at a
 	// time into one message per kind per sweep; see alert_digest.go.
 	alertDigest alertDigest
+	// monitorDrops rate-limits the log line for agent monitor results the
+	// store refused; see server_monitor_results.go.
+	monitorDrops monitorDropLog
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight
@@ -1352,6 +1355,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/config", s.withAgentLimit(s.handleAgentConfig))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
+	mux.HandleFunc("/api/agent/monitor-results", s.withAgentLimit(s.handleAgentMonitorResults))
 	mux.HandleFunc("/api/agent/log-sources", s.withAgentLimit(s.handleAgentLogSources))
 	mux.HandleFunc("/api/agent/logs", s.withAgentLimit(s.handleAgentLogs))
 	mux.HandleFunc("/api/agent/trace-config", s.withAgentLimit(s.handleAgentTraceConfig))
@@ -4993,7 +4997,16 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 				visible = append(visible, mon)
 			}
 		}
-		writeJSON(w, http.StatusOK, toMonitorViews(visible))
+		latest, err := s.store.LatestMonitorResults()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		views := toMonitorViews(visible)
+		for i, mon := range visible {
+			views[i].Latest = monitorLatestViews(p, mon, latest[mon.ID])
+		}
+		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
 		if !s.requireScope(w, p, "monitor:admin") {
 			return
@@ -5094,14 +5107,57 @@ func (s *Server) handleMonitorResults(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 		return
 	}
-	results := s.store.MonitorResults(monitorID)
-	visible := make([]model.MonitorResult, 0, len(results))
-	for _, result := range results {
-		if rbac.Allows(p.Principal, "monitor:read", result.NodeID) {
-			visible = append(visible, result)
+	query := r.URL.Query()
+	limit := defaultMonitorResultsLimit
+	if raw := query.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxMonitorResultsLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be 1 to %d", maxMonitorResultsLimit))
+			return
 		}
+		limit = n
+	}
+	allow := func(nodeID string) bool { return rbac.Allows(p.Principal, "monitor:read", nodeID) }
+	var visible []store.MonitorResultRecord
+	var err error
+	if query.Has("node_id") {
+		// One pair's history. An empty node_id names a tls monitor's pair.
+		nodeID := query.Get("node_id")
+		if !allow(nodeID) {
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+			return
+		}
+		visible, err = s.store.MonitorPairResults(monitorID, nodeID, limit)
+	} else {
+		visible, err = s.store.RecentMonitorResults(monitorID, limit, allow)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, visible)
+}
+
+// monitorLatestViews is the latest list for one monitor: the pairs still
+// assigned to it that the caller may read. A node taken off a monitor keeps
+// its rows until the monitor is deleted, but its last reading is no longer
+// what the monitor is doing.
+func monitorLatestViews(p principal, mon model.Monitor, pairs []store.MonitorLatest) []monitorLatestView {
+	out := make([]monitorLatestView, 0, len(pairs))
+	for _, pair := range pairs {
+		if !monitorPairAssigned(mon, pair.NodeID) || !rbac.Allows(p.Principal, "monitor:read", pair.NodeID) {
+			continue
+		}
+		out = append(out, toMonitorLatestView(pair))
+	}
+	return out
+}
+
+func monitorPairAssigned(mon model.Monitor, nodeID string) bool {
+	if mon.Type == model.MonitorTypeTLS {
+		return nodeID == ""
+	}
+	return nodeID != "" && (mon.AssignAll || slices.Contains(mon.NodeIDs, nodeID))
 }
 
 func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {
@@ -5140,29 +5196,6 @@ func (s *Server) handleAgentMonitors(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.store.MonitorsForNode(nodeID))
-}
-
-// handleAgentMonitorResult ingests a probe outcome from an authenticated agent.
-func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		agentAuthRequest
-		Result model.MonitorResult `json:"result"`
-	}
-	if !decodeAgentJSON(w, r, &req) {
-		return
-	}
-	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
-		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
-		return
-	}
-	req.Result.NodeID = req.NodeID
-	history := s.store.LastMonitorResultsForNode(req.Result.MonitorID, req.NodeID, 2)
-	if err := s.store.AddMonitorResult(req.Result); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	s.notifyMonitorTransition(req.NodeID, req.Result, history)
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // notifyChannelView is the secret-free projection of a notification channel.
@@ -5609,27 +5642,33 @@ const (
 )
 
 // notifyMonitorTransition decides monitor.down and monitor.recovered for one
-// (monitor, node) pair. history is the pair's results before current, newest
-// first (LastMonitorResultsForNode with n=2, read before current was stored).
+// (monitor, node) pair. priorFailStreak is the pair's failures in a row
+// before current, as the store recorded it with current.
 //
 // monitor.down waits for two failures in a row: a single failed probe is a
 // dropped packet or a busy target as often as an outage, and paging on it
 // teaches the operator to ignore the page. monitor.recovered follows only a
-// run that paged, so the phone's last message is always true. Both are read
-// off the stored history rather than kept in memory, and the store writes the
-// second failure at once, so a restart neither repeats a page nor loses the
-// recovery it owes.
+// run that paged, so the phone's last message is always true. Both read the
+// failure streak the store keeps per pair. The hot store writes it in the same
+// transaction as the result, and the JSON fallback writes the second failure
+// of a run at once, so a restart never repeats a page, and a run that paged
+// before the restart still announces its recovery. A result the store held
+// already (a retried batch) is never passed here.
 //
 // The notice is queued for the sweep's digest, so an all-nodes monitor whose
-// target goes down pages once, naming every node.
-func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, history []model.MonitorResult) {
-	failed := func(i int) bool { return i < len(history) && !history[i].Success }
-	succeededOrAbsent := func(i int) bool { return i >= len(history) || history[i].Success }
+// target goes down pages once, naming every node. The page itself is not
+// stored: it is decided after the result's write commits and waits in memory
+// until the next sweep. A process that dies without Close in that window
+// never sends it, and the agent's retry of that result comes back as a
+// duplicate that decides nothing. So a page is never sent twice, but a crash
+// can lose one; closing that needs the stored notification outbox described
+// at alertDigest.
+func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, priorFailStreak int) {
 	var kind string
 	switch {
-	case !current.Success && failed(0) && succeededOrAbsent(1):
+	case !current.Success && priorFailStreak == 1:
 		kind = EventMonitorDown
-	case current.Success && failed(0) && failed(1):
+	case current.Success && priorFailStreak >= 2:
 		kind = EventMonitorRecovered
 	default:
 		return

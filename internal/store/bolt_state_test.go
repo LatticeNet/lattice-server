@@ -36,7 +36,7 @@ func TestBoltStateRoundTripBucketizedAndEncrypted(t *testing.T) {
 	st.ProxyUsers["pu1"] = model.ProxyUser{ID: "pu1", Name: "alice", Enabled: true, UUID: proxyUUIDPlain, Password: proxyPasswordPlain, SubToken: proxySubTokenPlain, InboundIDs: []string{"pin1"}, Status: model.ProxyUserStatusActive, CreatedAt: now}
 	st.ProxyProfiles["n1"] = model.ProxyNodeProfile{ID: "n1", NodeID: "n1", Core: model.ProxyCoreSingbox, InboundIDs: []string{"pin1"}, Hostname: "n1.dns.example.com", CreatedAt: now}
 	st.ProxyUsage["n1"] = model.ProxyUsageSnapshot{NodeID: "n1", At: now, CoreUptimeSec: 9, UserBytes: map[string]int64{"pu1": 4096}}
-	st.MonResults["m1"] = []model.MonitorResult{{MonitorID: "m1", NodeID: "n1", Success: true, At: now}}
+	st.MonResults["m1"] = []MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m1", NodeID: "n1", Success: true, At: now}}}
 	st.TOTPChallenges["tc1"] = auth.TOTPChallenge{ID: "tc1", UserID: "u1", ClientIP: "198.51.100.1", ExpiresAt: now.Add(time.Minute)}
 	st.OIDCProviders["google"] = model.OIDCProvider{ID: "google", DisplayName: "Google", Issuer: "https://accounts.google.com", ClientID: "cid", ClientSecret: "oidc-client-secret", Enabled: true, CreatedAt: now}
 
@@ -755,28 +755,34 @@ func TestBoltStateRecordLevelMonitorResultsAndTunnels(t *testing.T) {
 		t.Fatalf("assigned monitors not filtered/sorted by id: %+v", assigned)
 	}
 
-	for i := 0; i < maxMonitorResults+3; i++ {
-		nodeID := "n1"
-		if i == maxMonitorResults+2 {
-			nodeID = "n2"
-		}
-		if err := bs.AddMonitorResult(model.MonitorResult{MonitorID: "m-z", NodeID: nodeID, At: now.Add(time.Duration(i) * time.Second), Success: i%2 == 0, LatencyMs: float64(i)}); err != nil {
+	// Each pair keeps its own perPair rows; a busy pair never evicts another
+	// pair's history, which the old per-monitor cap did.
+	const perPair = 5
+	for i := 0; i < perPair+3; i++ {
+		rec := MonitorResultRecord{MonitorResult: model.MonitorResult{MonitorID: "m-z", NodeID: "n1", At: now.Add(time.Duration(i) * time.Second), Success: i%2 == 0, LatencyMs: float64(i)}}
+		if _, err := bs.RecordMonitorResults([]MonitorResultRecord{rec}, perPair); err != nil {
 			t.Fatal(err)
 		}
 	}
-	series, err := bs.MonitorResults("m-z")
+	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m-z", NodeID: "n2", At: now, Success: true, LatencyMs: 99}}}, perPair); err != nil {
+		t.Fatal(err)
+	}
+	series, err := bs.MonitorPairResults("m-z", "n1", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(series) != maxMonitorResults || series[0].LatencyMs != 3 || series[len(series)-1].LatencyMs != float64(maxMonitorResults+2) {
-		t.Fatalf("monitor result cap/order not preserved: len=%d first=%+v last=%+v", len(series), series[0], series[len(series)-1])
+	if len(series) != perPair || series[0].LatencyMs != 3 || series[len(series)-1].LatencyMs != float64(perPair+2) {
+		t.Fatalf("pair cap/order not preserved: len=%d series=%+v", len(series), series)
 	}
-	lastN1, ok, err := bs.LastMonitorResultForNode("m-z", "n1")
+	latestN1, ok, err := bs.MonitorLatest("m-z", "n1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || lastN1.LatencyMs != float64(maxMonitorResults+1) {
-		t.Fatalf("latest monitor result for node not found: ok=%v result=%+v", ok, lastN1)
+	if !ok || latestN1.LatencyMs != float64(perPair+2) || latestN1.Held != perPair {
+		t.Fatalf("latest monitor result for node: ok=%v latest=%+v", ok, latestN1)
+	}
+	if n2, err := bs.MonitorPairResults("m-z", "n2", 0); err != nil || len(n2) != 1 || n2[0].LatencyMs != 99 {
+		t.Fatalf("other pair's history: %+v err=%v", n2, err)
 	}
 
 	if err := bs.UpsertTunnel(model.TunnelProfile{ID: "tun-old", Name: "old", NodeID: "n1", TunnelID: "cf-old", CredentialsFile: "/etc/cloudflared/old.json", CreatedAt: now}); err != nil {
@@ -812,12 +818,15 @@ func TestBoltStateRecordLevelMonitorResultsAndTunnels(t *testing.T) {
 	if _, ok, err := bs.Monitor("m-z"); err != nil || ok {
 		t.Fatalf("monitor delete failed: ok=%v err=%v", ok, err)
 	}
-	series, err = bs.MonitorResults("m-z")
+	series, err = bs.RecentMonitorResults("m-z", 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(series) != 0 {
 		t.Fatalf("monitor delete should remove result history: %+v", series)
+	}
+	if latest, err := bs.LatestMonitorResults(); err != nil || len(latest["m-z"]) != 0 {
+		t.Fatalf("monitor delete should remove latest records: %+v err=%v", latest, err)
 	}
 	exported, err := bs.ExportState()
 	if err != nil {

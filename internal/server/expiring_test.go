@@ -49,7 +49,7 @@ func seedExpiring(t *testing.T, srv *Server, st *store.Store) {
 		{MonitorID: "mon_doh", At: time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC), Success: true, CertNotAfter: time.Date(2026, 10, 10, 23, 59, 59, 0, time.UTC)},
 		{MonitorID: "mon_doh", At: time.Date(2026, 9, 29, 0, 0, 0, 0, time.UTC), Error: "dial tcp: i/o timeout"},
 	} {
-		if err := st.AddMonitorResult(r); err != nil {
+		if _, err := st.AddMonitorResult(r); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -221,7 +221,7 @@ func TestExpiringCertificatesFollowMonitorVisibility(t *testing.T) {
 	if err := st.UpsertMonitor(model.Monitor{ID: "mon_node_a", Name: "node-a panel", Type: model.MonitorTypeTLS, Target: "panel.example.org:443", Enabled: true, NodeIDs: []string{"node-a"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AddMonitorResult(model.MonitorResult{MonitorID: "mon_node_a", At: now, Success: true, CertNotAfter: time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)}); err != nil {
+	if _, err := st.AddMonitorResult(model.MonitorResult{MonitorID: "mon_node_a", At: now, Success: true, CertNotAfter: time.Date(2026, 10, 20, 0, 0, 0, 0, time.UTC)}); err != nil {
 		t.Fatal(err)
 	}
 	cookies, csrf := loginSession(t, handler)

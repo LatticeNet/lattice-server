@@ -32,7 +32,10 @@ func createAllNodesMonitor(t *testing.T, handler http.Handler, cookies []*http.C
 
 func reportMonitor(t *testing.T, handler http.Handler, nodeID, token, monitorID string, success bool, errMsg string) {
 	t.Helper()
-	body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + monitorID + `","success":` + boolStr(success) + `,"error":"` + errMsg + `"}}`
+	// Every released agent stamps a probe when it starts; the server drops a
+	// result without a stamp.
+	at := time.Now().UTC().Format(time.RFC3339Nano)
+	body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"` + monitorID + `","at":"` + at + `","success":` + boolStr(success) + `,"error":"` + errMsg + `"}}`
 	if rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body, token); rec.Code != http.StatusOK {
 		t.Fatalf("monitor result: %d %s", rec.Code, rec.Body.String())
 	}

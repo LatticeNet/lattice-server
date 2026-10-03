@@ -227,32 +227,25 @@ func lineUserRemoveArgv(t *testing.T, u VpnUser, line Line) string {
 	return `"$SB_BIN" --json user del ` + shellQuote(line.Tag) + " " + shellQuote(string(raw)) + "\n"
 }
 
-// Deleting a user deletes the only copy of its credential, and the node
-// script removes by credential: alpha.7 refuses a bare name with
-// invalid_payload and a name-only payload with invalid_user. a102 filed these
-// removals anyway, and every task failed on the node and returned to
-// pending. The removal is refused now, filed before the deletion or after
-// it, at plan time, at approval and at script render, with a reason that
-// names the missing node support and the on-box name left behind.
-func TestRemovingADeletedUserIsRefusedUntilTheForkDeletesByName(t *testing.T) {
-	newFixture := func(t *testing.T) (*Server, Line, VpnUser) {
-		t.Helper()
-		srv := newLinemetaTestServer(t, mustOpenStore(t))
-		line, _ := seedLineUserFixture(t, srv)
-		u := seedMintedLineUser(t, srv)
-		applyLinePlan(t, srv, lineUserOpAdd, u.ID, line)
-		return srv, line, u
-	}
+// Deleting a user deletes the only copy of its credential, so its removal
+// from an adopted line can carry the on-box name and nothing else. alpha.7
+// refuses that (invalid_user, and invalid_payload for a102's bare name), and
+// every task a102 filed failed on the node and returned to pending. On a node
+// whose agent has not reported sb:user-del-by-name the removal is refused,
+// filed before the deletion or after it, at plan time, at approval and at
+// script render, with a reason that names the missing node support and the
+// on-box name left behind.
+func TestRemovingADeletedUserIsRefusedOnANodeThatCannotDeleteByName(t *testing.T) {
 	refusal := func(t *testing.T, err error, u VpnUser, line Line) {
 		t.Helper()
 		if err == nil || !strings.Contains(err.Error(), "alpha.8") || !strings.Contains(err.Error(), userLineName(u.ID, line.LineUUID)) ||
-			!strings.Contains(err.Error(), "no longer holds the credential") {
-			t.Fatalf("want the refusal naming alpha.8 and the on-box name, got %v", err)
+			!strings.Contains(err.Error(), "no longer holds the credential") || !strings.Contains(err.Error(), singBoxUserDelByNameCapability) {
+			t.Fatalf("want the refusal naming alpha.8, the capability and the on-box name, got %v", err)
 		}
 	}
 
 	t.Run("filed after the deletion", func(t *testing.T) {
-		srv, line, u := newFixture(t)
+		srv, line, u := deletedLineUserFixture(t)
 		if err := srv.deleteVpnUser(u.ID); err != nil {
 			t.Fatal(err)
 		}
@@ -266,7 +259,7 @@ func TestRemovingADeletedUserIsRefusedUntilTheForkDeletesByName(t *testing.T) {
 	})
 
 	t.Run("filed before the deletion", func(t *testing.T) {
-		srv, line, u := newFixture(t)
+		srv, line, u := deletedLineUserFixture(t)
 		approval := filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
 		if err := srv.deleteVpnUser(u.ID); err != nil {
 			t.Fatal(err)
@@ -284,34 +277,157 @@ func TestRemovingADeletedUserIsRefusedUntilTheForkDeletesByName(t *testing.T) {
 	})
 
 	// a102 filed a name-only plan after the deletion; one still pending when
-	// this ships must not reach the node either.
+	// this ships must not reach a node that cannot run it either.
 	t.Run("filed by a102 after the deletion", func(t *testing.T) {
-		srv, line, u := newFixture(t)
+		srv, line, u := deletedLineUserFixture(t)
 		if err := srv.deleteVpnUser(u.ID); err != nil {
 			t.Fatal(err)
 		}
-		name := userLineName(u.ID, line.LineUUID)
-		sha, err := lineUserCredentialSHA(lineUserCredentialPayload{Name: name})
-		if err != nil {
-			t.Fatal(err)
-		}
-		out, err := srv.fileLineUserPlan(lineUserTestPrincipal(), lineUserPlan{
-			Op: lineUserOpRemove, Track: lineUserTrackAdopted, NodeID: line.NodeID, Line: line.Tag,
-			LineHashID: line.LineHashID, LineUUID: line.LineUUID, UserID: u.ID, UserName: name,
-			Protocol: line.Type, CredentialSHA256: sha, Summary: "a102 deleted-user removal",
-		}, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var response struct {
-			Approval model.Approval `json:"approval"`
-		}
-		if err := json.Unmarshal(out, &response); err != nil {
-			t.Fatal(err)
-		}
-		refusal(t, approvePlan(t, srv, response.Approval), u, line)
-		if tasks := tasksFor(srv, response.Approval.ID); len(tasks) != 0 {
+		approval := fileA102DeletedUserRemoval(t, srv, u, line)
+		refusal(t, approvePlan(t, srv, approval), u, line)
+		if tasks := tasksFor(srv, approval.ID); len(tasks) != 0 {
 			t.Fatalf("a refused approval queued %d task(s)", len(tasks))
+		}
+	})
+}
+
+// deletedLineUserFixture is a server with an adopted vless line on node-a
+// and a user of the shape Lattice mints that an applied plan put there.
+func deletedLineUserFixture(t *testing.T) (*Server, Line, VpnUser) {
+	t.Helper()
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
+	line, _ := seedLineUserFixture(t, srv)
+	u := seedMintedLineUser(t, srv)
+	applyLinePlan(t, srv, lineUserOpAdd, u.ID, line)
+	return srv, line, u
+}
+
+// fileA102DeletedUserRemoval files the removal a102 filed for a deleted
+// user: the name alone, hashed as the payload.
+func fileA102DeletedUserRemoval(t *testing.T, srv *Server, u VpnUser, line Line) model.Approval {
+	t.Helper()
+	name := userLineName(u.ID, line.LineUUID)
+	sha, err := lineUserCredentialSHA(lineUserCredentialPayload{Name: name})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := srv.fileLineUserPlan(lineUserTestPrincipal(), lineUserPlan{
+		Op: lineUserOpRemove, Track: lineUserTrackAdopted, NodeID: line.NodeID, Line: line.Tag,
+		LineHashID: line.LineHashID, LineUUID: line.LineUUID, UserID: u.ID, UserName: name,
+		Protocol: line.Type, CredentialSHA256: sha, Summary: "a102 deleted-user removal",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response struct {
+		Approval model.Approval `json:"approval"`
+	}
+	if err := json.Unmarshal(out, &response); err != nil {
+		t.Fatal(err)
+	}
+	return response.Approval
+}
+
+// deletedUserRemovalScript is the script a removal by name renders: the
+// on-box name as the whole payload.
+func deletedUserRemovalScript(u VpnUser, line Line) string {
+	return lineUserScriptPrelude + `"$SB_BIN" --json user del ` + shellQuote(line.Tag) + " " +
+		shellQuote(`{"name":"`+userLineName(u.ID, line.LineUUID)+`"}`) + "\n"
+}
+
+// On a node whose agent reports sb:user-del-by-name, a deleted user's
+// removal is filed, approved and rendered with the on-box name as its whole
+// payload, and the hash binds that payload like any other. A name-only
+// approval a102 filed follows the node: refused while the node has not
+// reported the capability, approvable once it has, refused again when a
+// heartbeat drops it. An approval filed before the deletion hashed the
+// credential, so it is refused with the way out: reject it and file the
+// removal again, by name.
+func TestRemovingADeletedUserByNameOnANodeThatReportsIt(t *testing.T) {
+	capable := func(srv *Server, line Line) {
+		srv.replaceAgentCapabilities(line.NodeID, []string{lineChainDurableCapability, singBoxUserDelByNameCapability})
+	}
+
+	t.Run("filed after the deletion", func(t *testing.T) {
+		srv, line, u := deletedLineUserFixture(t)
+		capable(srv, line)
+		if err := srv.deleteVpnUser(u.ID); err != nil {
+			t.Fatal(err)
+		}
+		approval := filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+		var plan lineUserPlan
+		if err := json.Unmarshal([]byte(approval.Plan), &plan); err != nil {
+			t.Fatal(err)
+		}
+		sha, _ := lineUserCredentialSHA(lineUserCredentialPayload{Name: userLineName(u.ID, line.LineUUID)})
+		if plan.Op != lineUserOpRemove || plan.CredentialSHA256 != sha || approval.Action != lineUserActionPrefix+sha ||
+			approval.ArtifactDigest != sha || !strings.Contains(plan.Summary, "by name alone") {
+			t.Fatalf("plan = %+v action %q digest %q, want the name-only payload's hash and a summary saying so", plan, approval.Action, approval.ArtifactDigest)
+		}
+		if err := approvePlan(t, srv, approval); err != nil {
+			t.Fatalf("approve: %v", err)
+		}
+		tasks := tasksFor(srv, approval.ID)
+		if len(tasks) != 1 || tasks[0].Script != deletedUserRemovalScript(u, line) {
+			t.Fatalf("tasks = %+v, want one task running\n%s", tasks, deletedUserRemovalScript(u, line))
+		}
+		if strings.Contains(tasks[0].Script, "6a1b7c2d") {
+			t.Fatal("the removal by name must not carry the deleted user's credential")
+		}
+	})
+
+	t.Run("filed by a102 after the deletion", func(t *testing.T) {
+		srv, line, u := deletedLineUserFixture(t)
+		if err := srv.deleteVpnUser(u.ID); err != nil {
+			t.Fatal(err)
+		}
+		approval := fileA102DeletedUserRemoval(t, srv, u, line)
+		if err := approvePlan(t, srv, approval); err == nil || !strings.Contains(err.Error(), singBoxUserDelByNameCapability) {
+			t.Fatalf("approve before the node reports the capability: %v, want the refusal", err)
+		}
+		capable(srv, line)
+		srv.replaceAgentCapabilities(line.NodeID, []string{lineChainDurableCapability})
+		if err := approvePlan(t, srv, approval); err == nil || !strings.Contains(err.Error(), singBoxUserDelByNameCapability) {
+			t.Fatalf("approve after a heartbeat dropped the capability: %v, want the refusal", err)
+		}
+		if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalPending || len(tasksFor(srv, approval.ID)) != 0 {
+			t.Fatalf("a refused approval must stay pending with no task, got %q", stored.Status)
+		}
+		capable(srv, line)
+		if err := approvePlan(t, srv, approval); err != nil {
+			t.Fatalf("approve once the node reports the capability: %v", err)
+		}
+		if tasks := tasksFor(srv, approval.ID); len(tasks) != 1 || tasks[0].Script != deletedUserRemovalScript(u, line) {
+			t.Fatalf("tasks = %+v, want one task running\n%s", tasks, deletedUserRemovalScript(u, line))
+		}
+	})
+
+	t.Run("filed before the deletion", func(t *testing.T) {
+		srv, line, u := deletedLineUserFixture(t)
+		capable(srv, line)
+		approval := filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+		if err := srv.deleteVpnUser(u.ID); err != nil {
+			t.Fatal(err)
+		}
+		err := approvePlan(t, srv, approval)
+		if err == nil || !strings.Contains(err.Error(), "hashed its credential") || !strings.Contains(err.Error(), "reject it and plan_remove again") {
+			t.Fatalf("approve: %v, want the refusal naming the way out", err)
+		}
+		if stored, _ := srv.store.Approval(approval.ID); stored.Status != model.ApprovalPending || len(tasksFor(srv, approval.ID)) != 0 {
+			t.Fatalf("a refused approval must stay pending with no task, got %q", stored.Status)
+		}
+		if script := srv.applyScriptFor(approval); !strings.Contains(script, "hashed its credential") || !strings.Contains(script, "exit 1") {
+			t.Fatalf("the script render must fail closed with the reason:\n%s", script)
+		}
+		if err := srv.rejectApprovalWithReason(approval, "superseded by a removal by name"); err != nil {
+			t.Fatal(err)
+		}
+		again := filePlan(t, srv, lineUserOpRemove, u.ID, line.LineHashID)
+		if err := approvePlan(t, srv, again); err != nil {
+			t.Fatalf("approve the removal filed again: %v", err)
+		}
+		if tasks := tasksFor(srv, again.ID); len(tasks) != 1 || tasks[0].Script != deletedUserRemovalScript(u, line) {
+			t.Fatalf("tasks = %+v, want one task running\n%s", tasks, deletedUserRemovalScript(u, line))
 		}
 	})
 }

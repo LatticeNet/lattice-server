@@ -252,6 +252,9 @@ func (s *Server) removeSingBoxInventory(nodeID string) {
 	s.singboxDiscoverAuditMu.Lock()
 	delete(s.singboxDiscoverAudit, nodeID)
 	s.singboxDiscoverAuditMu.Unlock()
+	s.singboxClockMu.Lock()
+	delete(s.singboxClockNoted, nodeID)
+	s.singboxClockMu.Unlock()
 }
 
 // handleProxyDiscovered lists every live node's discovered on-box sing-box

@@ -296,6 +296,10 @@ type Server struct {
 	// sidecar sync is queued only when the discovered line set actually changed.
 	linemetaSyncMu sync.Mutex
 	linemetaSyncFP map[string]string
+	// linemetaRefusals is the last regression refusal the discovery path
+	// logged per node, so the retry on every inventory post does not log it
+	// again (linemeta_sync.go). Guarded by linemetaSyncMu.
+	linemetaRefusals map[string]lineMetaRefusalLog
 	// userLoginFail brakes FAILED password logins PER ACCOUNT (keyed on the
 	// resolved user id), mirroring the per-user 2FA limiter in intent: an attacker
 	// who already targets a known account cannot widen the password-guess budget by

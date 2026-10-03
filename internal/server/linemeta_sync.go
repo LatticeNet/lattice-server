@@ -130,13 +130,13 @@ func (s *Server) queueLineMetaSyncLocked(p principal, nodeID string) ([]byte, er
 	// from the applied approval already loaded above, and it holds against every
 	// cause of loss rather than the one cause we happen to have diagnosed.
 	//
-	// Refusing is safe on both call sites. The discovery path logs and leaves
-	// its fingerprint uncommitted, so the next inventory post retries with a
-	// warmer view; the operator path gets told which field would have gone.
+	// Refusing is safe on both call sites. The discovery path leaves its
+	// fingerprint uncommitted, so the next inventory post retries with a
+	// warmer view, and logs the refusal once per change rather than per retry;
+	// the operator path gets told which field would have gone.
 	if applied != nil {
 		if lost := lineMetaPlanRegression([]byte(applied.Plan), payload); lost != "" {
-			return nil, fmt.Errorf("linemeta sync for %s would drop %s from the applied plan; "+
-				"refusing to queue a sidecar that is worse than the one on the box", nodeID, lost)
+			return nil, &lineMetaRegressionError{nodeID: nodeID, lost: lost}
 		}
 	}
 	if pending != nil {
@@ -287,12 +287,84 @@ func (s *Server) maybeQueueLineMetaSyncOnDiscovery(nodeID string, inv model.Sing
 		return // unchanged inventory: nothing new to describe on-box
 	}
 	if _, err := s.queueLineMetaSyncLocked(principal{Principal: rbac.Principal{ActorID: systemActorID}}, nodeID); err != nil {
+		var refusal *lineMetaRegressionError
+		if errors.As(err, &refusal) {
+			s.logLineMetaRefusalLocked(nodeID, refusal)
+			return
+		}
 		s.logger.Printf("linemeta: queue sync for %s: %v", nodeID, err)
 		return
+	}
+	if _, refused := s.linemetaRefusals[nodeID]; refused {
+		delete(s.linemetaRefusals, nodeID)
+		s.logger.Printf("linemeta: queue sync for %s: no longer refused", nodeID)
 	}
 	// Commit only after UpsertApproval succeeded. A persistence failure leaves
 	// the fingerprint unchanged so the next discovery can retry.
 	s.linemetaSyncFP[nodeID] = fingerprint
+}
+
+// lineMetaRefusalRelog is how long an unchanged refusal stays quiet. The
+// discovery path retries on every inventory post (about every 10 s per node),
+// and before this each retry logged the same line: seven refused nodes wrote
+// 420 lines in 10 minutes.
+const lineMetaRefusalRelog = time.Hour
+
+// lineMetaRegressionError is the refusal to queue a plan that would drop
+// something the applied plan has (queueLineMetaSyncLocked). The operator path
+// returns it as is; the discovery path logs it through
+// logLineMetaRefusalLocked.
+type lineMetaRegressionError struct {
+	nodeID string
+	lost   string
+}
+
+func (e *lineMetaRegressionError) Error() string {
+	return fmt.Sprintf("linemeta sync for %s would drop %s from the applied plan; "+
+		"refusing to queue a sidecar that is worse than the one on the box", e.nodeID, e.lost)
+}
+
+// lineMetaRefusalLog is the refusal last logged for one node.
+type lineMetaRefusalLog struct {
+	lost     string
+	loggedAt time.Time
+	// quiet counts the identical refusals since loggedAt that were not logged.
+	quiet int
+}
+
+// logLineMetaRefusalLocked logs a refusal when it is new for the node, names
+// a different field than the last one logged, or was last logged at least
+// lineMetaRefusalRelog ago; otherwise it only counts it. Requires
+// linemetaSyncMu. One entry per node, dropped when the node queues again or is
+// deleted.
+func (s *Server) logLineMetaRefusalLocked(nodeID string, refusal *lineMetaRegressionError) {
+	now := s.now()
+	last, seen := s.linemetaRefusals[nodeID]
+	same := seen && last.lost == refusal.lost
+	if same && now.Sub(last.loggedAt) < lineMetaRefusalRelog {
+		last.quiet++
+		s.linemetaRefusals[nodeID] = last
+		return
+	}
+	if same && last.quiet > 0 {
+		s.logger.Printf("linemeta: queue sync for %s: %v (%d more since %s)",
+			nodeID, refusal, last.quiet, last.loggedAt.UTC().Format(time.RFC3339))
+	} else {
+		s.logger.Printf("linemeta: queue sync for %s: %v", nodeID, refusal)
+	}
+	if s.linemetaRefusals == nil {
+		s.linemetaRefusals = map[string]lineMetaRefusalLog{}
+	}
+	s.linemetaRefusals[nodeID] = lineMetaRefusalLog{lost: refusal.lost, loggedAt: now}
+}
+
+// forgetLineMetaSync drops a deleted node's discovery fingerprint and its
+// refusal log entry.
+func (s *Server) forgetLineMetaSync(nodeID string) {
+	s.linemetaSyncMu.Lock()
+	defer s.linemetaSyncMu.Unlock()
+	delete(s.linemetaSyncFP, nodeID)
+	delete(s.linemetaRefusals, nodeID)
 }
 
 // lineMetaApplyScript renders the atomic on-box sidecar write for an approved

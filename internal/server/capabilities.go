@@ -173,15 +173,15 @@ func deriveProxyCore(s *Server, nodeID string) (bool, bool) {
 	return true, true
 }
 
-// deriveWitness: a node carrying an applied witness plan is one the operator
-// put the control-plane witness on.
+// deriveWitness: a node whose last applied witness plan configured the
+// witness is one the operator put it on; one whose last applied plan removed
+// it is one the operator took it off.
 func deriveWitness(s *Server, nodeID string) (bool, bool) {
-	for _, a := range s.store.Approvals() {
-		if a.NodeID == nodeID && a.Plugin == witnessPlugin && a.Status == model.ApprovalApplied {
-			return true, true
-		}
+	a, ok := latestAppliedWitness(s.store.Approvals(), nodeID)
+	if !ok {
+		return false, false
 	}
-	return false, false
+	return a.Action == witnessConfigureAction, true
 }
 
 // deriveCFTunnel: any tunnel profile bound to this node means the operator

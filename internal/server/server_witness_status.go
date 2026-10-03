@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/notify"
@@ -47,6 +48,10 @@ type witnessReport struct {
 	LastPushOK          bool      `json:"last_push_ok"`
 	LastPushError       string    `json:"last_push_error,omitempty"`
 	Pushes              int       `json:"pushes,omitempty"`
+	// RelayedAt is the node's clock when its agent read the status file.
+	// It shares a clock with the times above, so RelayedAt minus the last
+	// check is the real age of that check whatever the node's skew.
+	RelayedAt time.Time `json:"relayed_at,omitzero"`
 }
 
 // witnessPhases are the phases the witness reports; anything else reads as
@@ -59,11 +64,49 @@ var witnessSHARe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // witness never sends raw error text, and the server does not trust that it
 // never will.
 func witnessShortText(v string) string {
-	v = witnessPlanLine(strings.TrimSpace(v))
-	if len(v) > 64 {
-		v = v[:64]
+	v = strings.TrimSpace(witnessPlanLine(strings.ToValidUTF8(v, "")))
+	if len(v) <= 64 {
+		return v
 	}
-	return v
+	// Cut on a rune boundary, so a multi-byte character is dropped whole
+	// rather than sent on as half a character.
+	cut := 64
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut]
+}
+
+// witnessCheckStaleAfter is how old the witness's last check may be, by the
+// node's own clock, before the witness counts as stopped: three intervals, and
+// never under two minutes, so one slow check (up to 10 s for the control plane,
+// 8 s for the references, 10 s for a push) is not mistaken for a dead witness.
+func witnessCheckStaleAfter(r witnessReport) time.Duration {
+	interval := time.Duration(r.IntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = witnessDefaultInterval * time.Second
+	}
+	return max(3*interval, 2*time.Minute)
+}
+
+// witnessCheckStale reports whether the relayed status is one the witness
+// stopped updating: its service stopped, wedged or was disabled, or it cannot
+// save its state. The agent relays the file it finds whether or not the
+// witness is alive, so the relay being fresh says nothing about this. Both
+// times are the node's, so no skew against this server enters. A report
+// without relayed_at cannot be judged and is not called stale.
+func witnessCheckStale(r witnessReport) bool {
+	if r.RelayedAt.IsZero() {
+		return false
+	}
+	last := r.LastCheckAt
+	if r.StartedAt.After(last) {
+		last = r.StartedAt
+	}
+	if last.IsZero() {
+		return false
+	}
+	return r.RelayedAt.Sub(last) > witnessCheckStaleAfter(r)
 }
 
 // normalizeWitnessReport bounds every field a node can send.
@@ -134,6 +177,32 @@ func (s *Server) witnessReportNodes() []string {
 	return out
 }
 
+// witnessAppliedAt is when an applied witness plan ran: its task result
+// stamps UpdatedAt on success.
+func witnessAppliedAt(a model.Approval) time.Time {
+	if !a.UpdatedAt.IsZero() {
+		return a.UpdatedAt
+	}
+	return a.CreatedAt
+}
+
+// latestAppliedWitness is the witness plan that last ran on a node, judged by
+// when it ran rather than when it was filed: two plans can wait side by side
+// and be approved in either order, and the node runs whichever applied last.
+func latestAppliedWitness(approvals []model.Approval, nodeID string) (model.Approval, bool) {
+	var latest model.Approval
+	found := false
+	for _, a := range approvals {
+		if a.NodeID != nodeID || !isWitnessApproval(a) || a.Status != model.ApprovalApplied {
+			continue
+		}
+		if !found || witnessAppliedAt(a).After(witnessAppliedAt(latest)) {
+			latest, found = a, true
+		}
+	}
+	return latest, found
+}
+
 // witnessApprovalView is the witness approval a node's status is read
 // against.
 type witnessApprovalView struct {
@@ -188,6 +257,11 @@ type witnessNodeView struct {
 	// ReportFresh is false when the agent has not relayed the status within
 	// witnessReportFreshFor.
 	ReportFresh bool `json:"report_fresh"`
+	// CheckStale is true when the relayed status is older than the witness
+	// would let it get (witnessCheckStaleAfter, by the node's clock): the
+	// agent still relays the file, but the witness stopped updating it, so
+	// nothing is watching the control plane from this node.
+	CheckStale bool `json:"check_stale"`
 	// ConfigMatches is whether the witness runs the config the applied plan
 	// wrote; false while a node still runs an older one, or none.
 	ConfigMatches bool `json:"config_matches"`
@@ -276,25 +350,27 @@ func (s *Server) witnessStatus() witnessStatusResponse {
 		view := witnessNodeView{NodeID: id, NodeName: node.Name, Capable: s.agentHasCapability(id, witnessCapability)}
 		approvals := byNode[id]
 		sort.Slice(approvals, func(i, j int) bool { return approvals[i].CreatedAt.After(approvals[j].CreatedAt) })
-		appliedSeen := false
+		// The plan that last ran on the node, by when it ran: plans can be
+		// approved in another order than they were filed.
+		applied, hasApplied := latestAppliedWitness(approvals, id)
+		if hasApplied && applied.Action == witnessConfigureAction {
+			v := toWitnessApprovalView(applied, channels)
+			view.Configured = &v
+		}
 		for _, a := range approvals {
-			v := toWitnessApprovalView(a, channels)
 			switch {
-			case a.Status == model.ApprovalApplied:
-				if !appliedSeen {
-					appliedSeen = true
-					if a.Action == witnessConfigureAction {
-						view.Configured = &v
-					}
-				}
-			case appliedSeen:
-				// Older than the last applied plan: history only.
 			case a.Status == model.ApprovalPending || a.Status == model.ApprovalApproved:
+				// Still able to change the node, however old.
 				if view.Pending == nil {
+					v := toWitnessApprovalView(a, channels)
 					view.Pending = &v
 				}
 			case a.Status == model.ApprovalRejected && a.Reason != "" && view.LastFailed == nil:
-				view.LastFailed = &v
+				// A failure before the last applied plan is history.
+				if !hasApplied || a.UpdatedAt.After(witnessAppliedAt(applied)) {
+					v := toWitnessApprovalView(a, channels)
+					view.LastFailed = &v
+				}
 			}
 		}
 		if entry, ok := s.witnessReportFor(id); ok {
@@ -302,6 +378,7 @@ func (s *Server) witnessStatus() witnessStatusResponse {
 			view.Report = &report
 			view.ReportedAt = entry.receivedAt
 			view.ReportFresh = now.Sub(entry.receivedAt) <= witnessReportFreshFor
+			view.CheckStale = witnessCheckStale(report)
 			view.ConfigMatches = view.Configured != nil && report.ConfigSHA256 != "" && report.ConfigSHA256 == view.Configured.ConfigSHA256
 		}
 		resp.Nodes = append(resp.Nodes, view)

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
@@ -417,5 +418,145 @@ func TestWitnessFailedApplyIsShown(t *testing.T) {
 	got := decodeBody[witnessStatusResponse](t, doJSON(t, f.handler, http.MethodGet, "/api/notify/witness", "", f.cookies, ""))
 	if len(got.Nodes) != 1 || got.Nodes[0].LastFailed == nil || got.Nodes[0].LastFailed.ApprovalID != a.ID {
 		t.Fatalf("status = %+v", got)
+	}
+}
+
+// A witness whose service stopped leaves its last status on disk and the
+// agent keeps relaying it. The relay is fresh, so only relayed_at against the
+// last check, both on the node's clock, shows that nothing is watching.
+func TestWitnessStoppedWitnessReadsAsStale(t *testing.T) {
+	f := newWitnessFixture(t, witnessTestPublic)
+	f.capable(t)
+	status := func() witnessNodeView {
+		t.Helper()
+		got := decodeBody[witnessStatusResponse](t, doJSON(t, f.handler, http.MethodGet, "/api/notify/witness", "", f.cookies, ""))
+		if len(got.Nodes) != 1 {
+			t.Fatalf("nodes = %+v", got.Nodes)
+		}
+		return got.Nodes[0]
+	}
+	// The node's clock runs an hour ahead of this server's; only the gap
+	// between its own two times counts.
+	nodeNow := time.Now().UTC().Add(time.Hour)
+	beat := func(started, checked time.Time, relayed string) {
+		t.Helper()
+		f.beat(t, `{"node_id":"node-w","version":"0.3.10-alpha.3","capabilities":["`+witnessCapability+`"],"metrics":{},
+			"witness":{"version":1,"phase":"watching","interval_seconds":30,"started_at":"`+started.Format(time.RFC3339)+`",
+			"last_check_at":"`+checked.Format(time.RFC3339)+`","last_check_ok":true`+relayed+`}}`)
+	}
+	relayedNow := `,"relayed_at":"` + nodeNow.Format(time.RFC3339) + `"`
+
+	beat(nodeNow.Add(-time.Hour), nodeNow.Add(-20*time.Second), relayedNow)
+	if n := status(); !n.ReportFresh || n.CheckStale {
+		t.Fatalf("a witness that checked 20 s ago = fresh %v stale %v", n.ReportFresh, n.CheckStale)
+	}
+	beat(nodeNow.Add(-time.Hour), nodeNow.Add(-10*time.Minute), relayedNow)
+	if n := status(); !n.ReportFresh || !n.CheckStale {
+		t.Fatalf("a witness silent for 10 min = fresh %v stale %v", n.ReportFresh, n.CheckStale)
+	}
+	// Just restarted after a long stop: the start counts as a sign of life.
+	beat(nodeNow.Add(-5*time.Second), nodeNow.Add(-10*time.Minute), relayedNow)
+	if n := status(); n.CheckStale {
+		t.Fatal("a witness that just started reads as stopped")
+	}
+	// Without relayed_at nothing can be judged, and nothing is claimed.
+	beat(nodeNow.Add(-time.Hour), nodeNow.Add(-10*time.Minute), "")
+	if n := status(); n.CheckStale {
+		t.Fatal("a report without relayed_at was judged stale")
+	}
+}
+
+func TestWitnessCheckStaleAfterFollowsTheInterval(t *testing.T) {
+	for _, tc := range []struct {
+		interval int
+		want     time.Duration
+	}{{0, 2 * time.Minute}, {15, 2 * time.Minute}, {30, 2 * time.Minute}, {60, 3 * time.Minute}, {600, 30 * time.Minute}} {
+		if got := witnessCheckStaleAfter(witnessReport{IntervalSeconds: tc.interval}); got != tc.want {
+			t.Errorf("interval %d: stale after %s, want %s", tc.interval, got, tc.want)
+		}
+	}
+	at := time.Date(2026, 10, 3, 3, 0, 0, 0, time.UTC)
+	r := witnessReport{IntervalSeconds: 600, LastCheckAt: at, RelayedAt: at.Add(29 * time.Minute)}
+	if witnessCheckStale(r) {
+		t.Fatal("a 600 s witness 29 min after its check reads as stopped")
+	}
+	r.RelayedAt = at.Add(31 * time.Minute)
+	if !witnessCheckStale(r) {
+		t.Fatal("a 600 s witness 31 min after its check reads as alive")
+	}
+}
+
+// A classified reason is bounded to 64 bytes without splitting a character.
+func TestWitnessShortTextCutsOnARuneBoundary(t *testing.T) {
+	in := strings.Repeat("a", 63) + "é" + "tail"
+	got := witnessShortText(in)
+	if got != strings.Repeat("a", 63) || !utf8.ValidString(got) {
+		t.Fatalf("short text = %q (%d bytes)", got, len(got))
+	}
+	if got := witnessShortText("http 503\x00\xff"); got != "http 503" {
+		t.Fatalf("control and invalid bytes = %q", got)
+	}
+	if got := witnessShortText(strings.Repeat("界", 30)); len(got) != 63 || !utf8.ValidString(got) {
+		t.Fatalf("three-byte runes = %d bytes, valid %v", len(got), utf8.ValidString(got))
+	}
+}
+
+// Two plans can wait side by side and be approved in either order; the node
+// runs whichever applied last, and both the status and the capability's
+// enrolment follow that, not the order the plans were filed.
+func TestWitnessLastAppliedPlanWinsWhateverOrderItWasFiled(t *testing.T) {
+	f := newWitnessFixture(t, witnessTestPublic)
+	f.capable(t)
+	_, configure := f.plan(t, witnessPlanBody)
+	_, remove := f.plan(t, `{"node_id":"node-w","remove":true}`)
+	if !remove.CreatedAt.After(configure.CreatedAt) && !remove.CreatedAt.Equal(configure.CreatedAt) {
+		t.Fatalf("filing order: configure %s, remove %s", configure.CreatedAt, remove.CreatedAt)
+	}
+	// MutateApproval keeps the UpdatedAt the callback sets; UpsertApproval
+	// would stamp now, and two stamps can be equal.
+	apply := func(a model.Approval, at time.Time) {
+		t.Helper()
+		if _, ok, err := f.st.MutateApproval(a.ID, func(row *model.Approval) bool {
+			row.Status, row.UpdatedAt = model.ApprovalApplied, at
+			return true
+		}); err != nil || !ok {
+			t.Fatalf("apply %s: %v %v", a.ID, ok, err)
+		}
+	}
+	status := func() witnessNodeView {
+		t.Helper()
+		return decodeBody[witnessStatusResponse](t, doJSON(t, f.handler, http.MethodGet, "/api/notify/witness", "", f.cookies, "")).Nodes[0]
+	}
+	if enrolled, known := deriveWitness(f.srv, "node-w"); enrolled || known {
+		t.Fatalf("nothing applied: derive = %v %v", enrolled, known)
+	}
+	// The remove, filed later, applied first; the configure applied after it.
+	t0 := time.Now().UTC()
+	apply(remove, t0)
+	apply(configure, t0.Add(time.Minute))
+	if n := status(); n.Configured == nil || n.Configured.ApprovalID != configure.ID {
+		t.Fatalf("configured = %+v", n.Configured)
+	}
+	if enrolled, known := deriveWitness(f.srv, "node-w"); !enrolled || !known {
+		t.Fatalf("configure applied last: derive = %v %v", enrolled, known)
+	}
+	// A later remove takes the node off.
+	_, again := f.plan(t, `{"node_id":"node-w","remove":true}`)
+	apply(again, t0.Add(2*time.Minute))
+	if n := status(); n.Configured != nil {
+		t.Fatalf("still configured after a later remove = %+v", n.Configured)
+	}
+	if enrolled, known := deriveWitness(f.srv, "node-w"); enrolled || !known {
+		t.Fatalf("remove applied last: derive = %v %v", enrolled, known)
+	}
+	// A plan filed before the last applied one is still pending, and shown.
+	_, waiting := f.plan(t, witnessPlanBody)
+	stored, _ := f.st.Approval(waiting.ID)
+	stored.CreatedAt = configure.CreatedAt.Add(-time.Hour)
+	if err := f.st.UpsertApproval(stored); err != nil {
+		t.Fatal(err)
+	}
+	if n := status(); n.Pending == nil || n.Pending.ApprovalID != waiting.ID {
+		t.Fatalf("an older plan still waiting is not shown: %+v", n.Pending)
 	}
 }

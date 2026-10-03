@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -75,5 +76,80 @@ func TestSharingTheVPNCoreFleetFeedNeedsAnExplicitFlag(t *testing.T) {
 	}
 	if status, body := create(slug, "provider", false); status != http.StatusConflict {
 		t.Fatalf("a share on an identity link's slug must be refused: %d %s", status, body)
+	}
+}
+
+// The guard fails closed on a record list it cannot read, and the share
+// views re-run it, so a record edited into the fleet feed after its share
+// was made is named on every read instead of passing unseen.
+func TestFleetFeedGuardFailsClosedAndRechecksOnRead(t *testing.T) {
+	h := newRevealHarness(t)
+	putRecords := func(doc string) {
+		t.Helper()
+		if err := h.srv.store.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: usageSubStoreRecordsKey, Value: doc}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	create := func(slug, record string, flag bool) (int, string) {
+		body := `{"slug":"` + slug + `","source":{"kind":"plugin","plugin_id":"latticenet.sub-store","subscription_id":"` + record + `"}`
+		if flag {
+			body += `,"publishes_fleet_credentials":true`
+		}
+		body += `}`
+		res := doJSON(t, h.handler, http.MethodPost, "/api/subscription-shares", body, h.cookies, h.csrf)
+		defer res.Body.Close()
+		raw, _ := io.ReadAll(res.Body)
+		return res.StatusCode, string(raw)
+	}
+	list := func() map[string]shareView {
+		t.Helper()
+		res := doJSON(t, h.handler, http.MethodGet, "/api/subscription-shares", "", h.cookies, h.csrf)
+		defer res.Body.Close()
+		var views []shareView
+		if err := json.NewDecoder(res.Body).Decode(&views); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]shareView{}
+		for _, v := range views {
+			out[v.Slug] = v
+		}
+		return out
+	}
+
+	putRecords(`{"version":1,"records":[{"id":"provider","name":"Provider","url":"https://provider.example/sub"},
+		{"id":"fleet","name":"Everyone","source":"vpn-core"}]}`)
+	if status, body := create("s-provider", "provider", false); status != http.StatusCreated {
+		t.Fatalf("a clean record shares: %d %s", status, body)
+	}
+	if status, body := create("s-fleet", "fleet", true); status != http.StatusCreated {
+		t.Fatalf("a flagged fleet share is created: %d %s", status, body)
+	}
+	if views := list(); views["s-provider"].FleetFeedNow != "" || views["s-fleet"].FleetFeedNow != "" || !views["s-fleet"].PublishesFleetCredentials {
+		t.Fatalf("clean and flagged shares carry no re-check answer: %+v", views)
+	}
+
+	// The provider record is edited into the identity-less vpn-core source.
+	putRecords(`{"version":1,"records":[{"id":"provider","name":"Provider","source":"vpn-core"},
+		{"id":"fleet","name":"Everyone","source":"vpn-core"}]}`)
+	if views := list(); views["s-provider"].FleetFeedNow != fleetFeedNowFleet || views["s-fleet"].FleetFeedNow != "" {
+		t.Fatalf("an edited record must be named on read: %+v", views)
+	}
+
+	// A record list that does not parse checks nothing, so it needs the flag.
+	putRecords(`{"records":[`)
+	status, body := create("s-unknown", "provider", false)
+	if status != http.StatusBadRequest || apiErrorCodeOf(t, []byte(body)) != apiErrorFleetFeedFlagRequired || !strings.Contains(body, "cannot check") {
+		t.Fatalf("an unreadable record list must need the flag: %d %s", status, body)
+	}
+	if status, body = create("s-unknown", "provider", true); status != http.StatusCreated || !strings.Contains(body, `"publishes_fleet_credentials":true`) {
+		t.Fatalf("with the flag it is created and flagged: %d %s", status, body)
+	}
+	if views := list(); views["s-provider"].FleetFeedNow != fleetFeedNowUnknown {
+		t.Fatalf("an unreadable list answers unknown on read: %+v", views["s-provider"])
+	}
+	// So does one over the size limit.
+	putRecords(`{"records":[],"pad":"` + strings.Repeat("x", usageMaxSubStoreRecordsLen) + `"}`)
+	if views := list(); views["s-provider"].FleetFeedNow != fleetFeedNowUnknown {
+		t.Fatalf("an oversized list answers unknown on read: %+v", views["s-provider"])
 	}
 }

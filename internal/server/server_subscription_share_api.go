@@ -48,6 +48,12 @@ type shareView struct {
 	// flag for a record that reads the identity-less vpn-core export: it
 	// hands out every user's credentials.
 	PublishesFleetCredentials bool `json:"publishes_fleet_credentials,omitempty"`
+	// FleetFeedNow is what the fleet-feed guard finds for an unflagged
+	// Sub-Store share at this read: "fleet" (its record now reads the
+	// identity-less vpn-core export, edited after the share was made) or
+	// "unknown" (the record list cannot be read to check). Empty when the
+	// record is clean or the share carries the flag.
+	FleetFeedNow string `json:"fleet_feed_now,omitempty"`
 	// RenderBudget is the link's plugin render budget, present once the link
 	// has rendered since the server started; exhausted means its new renders
 	// answer the decoy until it refills. See share_render_budget.go.
@@ -67,9 +73,27 @@ func shareViewOf(share model.SubscriptionShare) shareView {
 
 // shareViewFor is shareViewOf plus the link's live serving state.
 func (s *Server) shareViewFor(share model.SubscriptionShare) shareView {
-	view := shareViewOf(share)
-	view.RenderBudget = s.shareRenderBudget.status(share.ID)
-	return view
+	return s.shareViewsFor([]model.SubscriptionShare{share})[0]
+}
+
+// shareViewsFor builds the views of shares, reading the Sub-Store record
+// list once for the fleet-feed re-check (share_fleet_feed.go).
+func (s *Server) shareViewsFor(shares []model.SubscriptionShare) []shareView {
+	var index *subStoreFleetIndex
+	out := make([]shareView, 0, len(shares))
+	for _, share := range shares {
+		view := shareViewOf(share)
+		view.RenderBudget = s.shareRenderBudget.status(share.ID)
+		if isSubStoreShare(share) && !view.PublishesFleetCredentials {
+			if index == nil {
+				read := s.subStoreFleetIndex()
+				index = &read
+			}
+			view.FleetFeedNow = index.verdict(share.Source.SubscriptionID).now()
+		}
+		out = append(out, view)
+	}
+	return out
 }
 
 func (s *Server) handleSubscriptionShares(w http.ResponseWriter, r *http.Request, p principal) {
@@ -89,11 +113,7 @@ func (s *Server) handleSubscriptionShares(w http.ResponseWriter, r *http.Request
 	}
 	switch r.Method {
 	case http.MethodGet:
-		out := make([]shareView, 0, len(s.store.SubscriptionShares()))
-		for _, share := range s.store.SubscriptionShares() {
-			out = append(out, s.shareViewFor(share))
-		}
-		writeJSON(w, http.StatusOK, out)
+		writeJSON(w, http.StatusOK, s.shareViewsFor(s.store.SubscriptionShares()))
 	case http.MethodPost:
 		s.createSubscriptionShare(w, r, p)
 	default:
@@ -134,13 +154,21 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 	}
 	fleetFeed := false
 	if req.Source.Kind == model.ShareSourcePlugin && req.Source.PluginID == subStorePluginID {
-		var via string
-		fleetFeed, via = s.subStoreFleetFeed(req.Source.SubscriptionID)
-		if fleetFeed && !req.PublishesFleetCredentials {
+		verdict := s.subStoreFleetFeed(req.Source.SubscriptionID)
+		fleetFeed = verdict.Fleet || verdict.Unknown
+		switch {
+		case req.PublishesFleetCredentials:
+		case verdict.Fleet:
 			writeError(w, http.StatusBadRequest, apiErrorf(apiErrorFleetFeedFlagRequired,
 				"subscription %s publishes every user's credentials: it reads the vpn-core fleet export with no identity (through %q). "+
 					"Give each person their identity's own link instead; to publish the fleet feed anyway, send publishes_fleet_credentials: true",
-				req.Source.SubscriptionID, via))
+				req.Source.SubscriptionID, verdict.Via))
+			return
+		case verdict.Unknown:
+			writeError(w, http.StatusBadRequest, apiErrorf(apiErrorFleetFeedFlagRequired,
+				"cannot check whether subscription %s publishes every user's credentials: Sub-Store's record list is over %d bytes or does not parse. "+
+					"To share it anyway, send publishes_fleet_credentials: true",
+				req.Source.SubscriptionID, usageMaxSubStoreRecordsLen))
 			return
 		}
 	}

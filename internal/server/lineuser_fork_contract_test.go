@@ -228,6 +228,8 @@ var forkContractCases = []forkContractCase{
 
 // forkContractServer is a server with one adopted line of protocol on
 // node-a, tagged "line-<protocol>", and an unbound identity holding cred.
+// The identity's id has the shape Lattice mints, so a removal filed after
+// its deletion passes vpnUserIDRe.
 func forkContractServer(t *testing.T, protocol string, cred VpnCredential) (*Server, Line, VpnUser) {
 	t.Helper()
 	srv := newLinemetaTestServer(t, mustOpenStore(t))
@@ -241,7 +243,7 @@ func forkContractServer(t *testing.T, protocol string, cred VpnCredential) (*Ser
 	srv.singboxInvMu.Unlock()
 	srv.invalidateLineReadModel()
 	line := findLine(t, srv.buildLineGroups(), "node-a", tag)
-	u := VpnUser{ID: "vpnuser_contract", Email: "contract@example.com", Enabled: true, Credentials: []VpnCredential{cred}}
+	u := VpnUser{ID: "vpnuser_forkcontractuser", Email: "contract@example.com", Enabled: true, Credentials: []VpnCredential{cred}}
 	if err := srv.putVpnUser(u); err != nil {
 		t.Fatal(err)
 	}
@@ -425,6 +427,56 @@ func TestAForkRemovalThatTakesAHandAddedTwinIsFlagged(t *testing.T) {
 		}
 		if flags := lineUserAudit(srv, "vpnuser.line.overmatch", removeApproval.ID); len(flags) != 1 {
 			t.Fatalf("over-match audit = %+v", flags)
+		}
+		sb.expectLocked(2)
+	})
+}
+
+// A deleted identity's removal, end to end on a node whose agent reports
+// sb:user-del-by-name: the plan the server files after the deletion, the
+// script it renders at approval, and the fork running it. The fork takes
+// Lattice's entry by its name and leaves both the owner and a hand-added
+// entry that shares the deleted identity's uuid, which a removal by
+// credential would have taken too. The result applies cleanly and brings
+// no identity back.
+func TestADeletedUsersRemovalByNameRunsOnTheFork(t *testing.T) {
+	forEachForkLockMode(t, func(t *testing.T, sb *forkSB) {
+		tc := forkContractCases[0]
+		srv, line, u := forkContractServer(t, tc.protocol, tc.credential)
+		sb.writeLine(line.Tag, tc.protocol, tc.owner)
+		addApproval, addTask := approvedScript(t, srv, lineUserOpAdd, u.ID, line)
+		out, code := sb.run(addTask.Script)
+		if code != 0 {
+			t.Fatalf("add: exit %d %s", code, out)
+		}
+		reportResult(t, srv, addApproval, addTask, out, code)
+		twin := map[string]string{"name": "hand-added", "uuid": tc.credential.UUID}
+		sb.writeLine(line.Tag, tc.protocol, append(sb.users(line.Tag), twin)...)
+
+		// The store-level delete stands in for one made before the delete
+		// refusal existed, the case this removal is for.
+		if err := srv.deleteVpnUser(u.ID); err != nil {
+			t.Fatal(err)
+		}
+		srv.replaceAgentCapabilities("node-a", []string{singBoxUserDelByNameCapability})
+		removeApproval, removeTask := approvedScript(t, srv, lineUserOpRemove, u.ID, line)
+		out, code = sb.run(removeTask.Script)
+		res := parseForkUserResult(t, out)
+		if code != 0 || !res.OK || res.Match != "name" || res.Matched == nil || *res.Matched != 1 {
+			t.Fatalf("the fork refused the removal by name (exit %d):\n%s\nscript:\n%s", code, out, removeTask.Script)
+		}
+		if users := sb.users(line.Tag); len(users) != 2 || !reflect.DeepEqual(users[0], tc.owner) || !reflect.DeepEqual(users[1], twin) {
+			t.Fatalf("after the removal by name the line holds %v, want the owner and the hand-added twin", users)
+		}
+		got := reportResult(t, srv, removeApproval, removeTask, out, code)
+		if got.Status != model.ApprovalApplied || got.Reason != "" {
+			t.Fatalf("removal result: status %q reason %q", got.Status, got.Reason)
+		}
+		if _, ok := srv.getVpnUser(u.ID); ok {
+			t.Fatal("recording the removal brought the deleted identity back")
+		}
+		if err := srv.requireLineUserOnLine(u.ID, line.LineHashID); err == nil || !strings.Contains(err.Error(), "already removed") {
+			t.Fatalf("after the applied removal the history must say the user is off the line: %v", err)
 		}
 		sb.expectLocked(2)
 	})

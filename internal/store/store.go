@@ -525,10 +525,15 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 // process has seen it beat. Requires mu.
 //
 // yagni: the slack also applies after a clean Close, whose final write left
-// every LastSeen exact; a node that died in the few minutes before a deploy
-// is marked offline and paged up to NodeLastSeenDiskLag late. A clean-close
-// marker in the state file, cleared by the first write after open, is the
-// upgrade if that delay starts to matter.
+// every LastSeen exact. For a node that died in the few minutes before a
+// restart, the Online flag, the node.offline audit row, the status history
+// edge and the console status word move up to NodeLastSeenDiskLag late. The
+// page does not move with the default 10 minute delay: the node is marked
+// offline by 90 s plus the slack after its LastSeen, which is before start
+// plus the delay. Only a node whose offline-alert-after tag sets a delay
+// under that 6 min 30 s (the tag allows 2m and up) can page late, by at most
+// 6 min 30 s less its delay. A clean-close marker in the state file, cleared
+// by the first write after open, is the upgrade if that starts to matter.
 func (s *Store) lastSeenSlackLocked(n model.Node) time.Duration {
 	if loaded, ok := s.loadedLastSeen[n.ID]; ok && n.LastSeen.Equal(loaded) {
 		return NodeLastSeenDiskLag

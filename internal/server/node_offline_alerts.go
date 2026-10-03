@@ -164,6 +164,11 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 		// start" is judged with that much margin. Without it a node that died
 		// just before the crash looked long gone and never paged. A spell the
 		// previous process did page is still owned by its incident record.
+		//
+		// A node that went silent before an outage longer than its delay is
+		// still skipped, and never pages: that is the existing "silent before
+		// start" rule, which counts only silence this process saw. The slack
+		// narrows it by the lag; it does not remove it.
 		slack := s.store.NodeLastSeenSlack(n.ID)
 		if !a.since.IsZero() && n.LastSeen.Before(a.since.Add(-delay-slack)) {
 			// Already silent past the delay when this process started. The

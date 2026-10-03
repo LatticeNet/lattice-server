@@ -1214,9 +1214,18 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 // a write made for any reason also flushes their clocks and restarts
 // metricsPersistenceInterval and reportClockPersistInterval for every node.
 func (s *Store) noteReportClocksOnDisk(st State) {
+	// Capped at the write's own clock: after the clock steps back, a
+	// LastSeen from before the step would otherwise look newer than now to
+	// every node's next beat, and each of them would write again.
+	written := s.heartbeatNow()
 	s.metricsPersistedAt = make(map[string]time.Time, len(st.Nodes))
 	for nodeID, n := range st.Nodes {
-		if !n.LastSeen.IsZero() {
+		if n.LastSeen.IsZero() {
+			continue
+		}
+		if n.LastSeen.After(written) {
+			s.metricsPersistedAt[nodeID] = written
+		} else {
 			s.metricsPersistedAt[nodeID] = n.LastSeen
 		}
 	}
@@ -1639,7 +1648,9 @@ func (s *Store) TouchNodeToken(nodeID string, at time.Time, minInterval time.Dur
 	} else {
 		at = at.UTC()
 	}
-	if minInterval > 0 && !n.TokenLastUsedAt.IsZero() && at.Sub(n.TokenLastUsedAt) < minInterval {
+	// A clock stepped back past the stored use moves it rather than waiting
+	// for the clock to catch up.
+	if d := at.Sub(n.TokenLastUsedAt); minInterval > 0 && !n.TokenLastUsedAt.IsZero() && d >= 0 && d < minInterval {
 		return false, nil
 	}
 	n.TokenLastUsedAt = at
@@ -1656,7 +1667,8 @@ func (s *Store) TouchNodeToken(nodeID string, at time.Time, minInterval time.Dur
 	// once per node every minInterval.
 	written, onDisk := s.metricsPersistedAt[nodeID]
 	sinceWrite, sinceBeat := at.Sub(written), at.Sub(n.LastSeen)
-	if onDisk && sinceWrite < metricsPersistenceInterval && sinceBeat < tokenUseRidesWithin {
+	if onDisk && sinceWrite >= 0 && sinceWrite < metricsPersistenceInterval &&
+		sinceBeat >= 0 && sinceBeat < tokenUseRidesWithin {
 		s.nodeClocksUnflushed = true
 		return true, nil
 	}
@@ -1791,8 +1803,10 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	// any kind left it on disk, not the time of this node's own last write:
 	// keyed per node but restarted fleet-wide (noteReportClocksOnDisk), so
 	// 34 nodes beating every ten seconds force one write per interval, not 34.
+	// A clock stepped back past the copy on disk writes once and restarts
+	// the interval from there, rather than waiting for the clock to catch up.
 	lastPersisted, persisted := s.metricsPersistedAt[nodeID]
-	if persisted && !durableChanged && now.Sub(lastPersisted) < metricsPersistenceInterval {
+	if d := now.Sub(lastPersisted); persisted && !durableChanged && d >= 0 && d < metricsPersistenceInterval {
 		s.nodeClocksUnflushed = true
 		return false, nil
 	}

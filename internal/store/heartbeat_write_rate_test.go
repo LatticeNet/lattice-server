@@ -281,3 +281,31 @@ func TestDurableHeartbeatChangeWritesImmediately(t *testing.T) {
 		t.Fatalf("an agent version change wrote %d times, want 1", calls)
 	}
 }
+
+// A clock stepped back past the heartbeat on disk, or past a token's last
+// use, writes once and restarts from there instead of waiting minutes or
+// hours for the clock to catch up.
+func TestBackwardsClockStepRestartsTheHeartbeatClock(t *testing.T) {
+	f := openHeartbeatFleet(t, fleetIDs(2))
+	f.clock.at = f.t0.Add(-time.Hour)
+	before := f.s.testPersistCalls
+	beat(t, f.s, f.ids...)
+	if calls := f.s.testPersistCalls - before; calls != 1 {
+		t.Fatalf("the first round after the clock went back an hour wrote %d times, want 1 for the fleet", calls)
+	}
+	f.clock.at = f.clock.at.Add(10 * time.Second)
+	before = f.s.testPersistCalls
+	beat(t, f.s, f.ids...)
+	if calls := f.s.testPersistCalls - before; calls != 0 {
+		t.Fatalf("the next round wrote %d times, want 0", calls)
+	}
+	if touched, err := f.s.TouchNodeToken(f.ids[1], f.t0.Add(time.Hour), time.Minute); err != nil || !touched {
+		t.Fatalf("token use ahead: touched=%v err=%v", touched, err)
+	}
+	if touched, err := f.s.TouchNodeToken(f.ids[1], f.clock.at, time.Minute); err != nil || !touched {
+		t.Fatalf("token use after the step back: touched=%v err=%v", touched, err)
+	}
+	if n, _ := f.s.Node(f.ids[1]); !n.TokenLastUsedAt.Equal(f.clock.at) {
+		t.Fatalf("token last used = %s, want the stepped-back %s", n.TokenLastUsedAt, f.clock.at)
+	}
+}

@@ -280,6 +280,9 @@ type Store struct {
 	closed bool
 	// notify is the notification outbox (notify_outbox.go). Guarded by mu.
 	notify notifyOutbox
+	// incidentBook holds incidents and maintenance windows (incidents.go).
+	// Guarded by mu.
+	incidentBook incidentBook
 	// linkIndex resolves link tokens without a scan, and shareGen counts
 	// share writes so the index knows when it is out of date; see
 	// link_token_index.go. Guarded by mu.

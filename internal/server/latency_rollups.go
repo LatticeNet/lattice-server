@@ -106,9 +106,12 @@ func (s *Server) latencyRollupsFor(plan model.LatencyProbePlan, now time.Time) (
 	interval := time.Duration(plan.Config.IntervalSec) * time.Second
 	out := model.LatencyRollups{GeneratedAt: now, IntervalSec: plan.Config.IntervalSec, Pairs: []model.LatencyPairRollup{}}
 	var pairs []store.MonitorPair
+	targets := map[store.MonitorPair]string{}
 	for _, pair := range plan.Pairs {
 		if pair.MonitorID != "" {
-			pairs = append(pairs, store.MonitorPair{MonitorID: pair.MonitorID, NodeID: pair.Source})
+			key := store.MonitorPair{MonitorID: pair.MonitorID, NodeID: pair.Source}
+			pairs = append(pairs, key)
+			targets[key] = pair.Target
 		}
 	}
 	if len(pairs) == 0 {
@@ -145,13 +148,7 @@ func (s *Server) latencyRollupsFor(plan model.LatencyProbePlan, now time.Time) (
 		for name, buckets := range tiers {
 			windows[name] = latencyStatsOf(store.MergeMonitorRollups(buckets[pair]), latencyExpected(spans[name], interval))
 		}
-		rollup := model.LatencyPairRollup{Source: pair.NodeID, MonitorID: pair.MonitorID, Windows: windows}
-		for _, p := range plan.Pairs {
-			if p.MonitorID == pair.MonitorID && p.Source == pair.NodeID {
-				rollup.Target = p.Target
-				break
-			}
-		}
+		rollup := model.LatencyPairRollup{Source: pair.NodeID, Target: targets[pair], MonitorID: pair.MonitorID, Windows: windows}
 		for _, l := range latest[pair.MonitorID] {
 			if l.NodeID == pair.NodeID {
 				res := l.MonitorResult

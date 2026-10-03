@@ -20,14 +20,20 @@ const (
 	auditActionShareUpdate = "subscription.share.update"
 )
 
-// shareView is what the operator API returns. It deliberately includes the token:
-// the share URL is copied out of the dashboard repeatedly, so hiding it after
-// creation would trade a real workflow for protection the at-rest sealing already
-// provides.
+// shareView is what the operator API returns. It carries no token: a share
+// URL is a credential for whatever the share publishes, and the operator's
+// rule (2026-10-02) is that a credential reaches a person only after step-up
+// and an agent only through secrets:reveal. The token comes from
+// POST /api/subscription-shares/<id>/reveal, which asks the one reveal gate
+// (secret_reveal.go). It used to be in every list, create, update and rotate
+// answer, on the reasoning that copying a link is a frequent workflow; the
+// copy now costs one step-up, which lasts a minute.
 type shareView struct {
-	ID            string            `json:"id"`
-	Slug          string            `json:"slug"`
-	Token         string            `json:"token"`
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	// Token is empty in every view. It stays a field so a decoder written
+	// for the old shape reads "no token" rather than failing.
+	Token         string            `json:"token,omitempty"`
 	Source        model.ShareSource `json:"source"`
 	DefaultFormat string            `json:"default_format,omitempty"`
 	Enabled       bool              `json:"enabled"`
@@ -46,7 +52,7 @@ type shareView struct {
 
 func shareViewOf(share model.SubscriptionShare) shareView {
 	return shareView{
-		ID: share.ID, Slug: share.Slug, Token: share.Token, Source: share.Source,
+		ID: share.ID, Slug: share.Slug, Source: share.Source,
 		DefaultFormat: share.DefaultFormat, Enabled: share.Enabled,
 		CreatedAt: share.CreatedAt, UpdatedAt: share.UpdatedAt,
 		RotatedAt: share.RotatedAt, ExpiresAt: share.ExpiresAt,
@@ -181,6 +187,8 @@ func (s *Server) handleSubscriptionShareItem(w http.ResponseWriter, r *http.Requ
 	}
 
 	switch {
+	case action == "reveal" && r.Method == http.MethodPost:
+		s.revealSubscriptionShare(w, r, share, p)
 	case action == "rotate" && r.Method == http.MethodPost:
 		s.rotateSubscriptionShare(w, share, p)
 	case action == "refresh" && r.Method == http.MethodPost:
@@ -204,6 +212,51 @@ func (s *Server) handleSubscriptionShareItem(w http.ResponseWriter, r *http.Requ
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+// auditActionShareReveal names a share token handed to an operator.
+const auditActionShareReveal = "subscription.share.reveal"
+
+// linkRevealView is a link's secret part, the answer of every link reveal
+// door: share and identity links alike, REST and RPC alike.
+type linkRevealView struct {
+	Kind string `json:"kind"` // share | identity
+	ID   string `json:"id"`
+	Slug string `json:"slug"`
+	// Token is the bearer secret; Path is /sub/<slug>/<token>; URL is Path
+	// under the configured public base, absent when the server has none.
+	Token string `json:"token"`
+	Path  string `json:"path"`
+	URL   string `json:"url,omitempty"`
+}
+
+func (s *Server) linkRevealViewOf(kind, id, slug, token string) linkRevealView {
+	path := "/sub/" + slug + "/" + token
+	view := linkRevealView{Kind: kind, ID: id, Slug: slug, Token: token, Path: path}
+	if base := strings.TrimRight(s.publicURL, "/"); base != "" {
+		view.URL = base + path
+	}
+	return view
+}
+
+// revealSubscriptionShare hands a share's token to a principal the reveal
+// gate admits. The request body is {"step_up_grant": "..."}; a token
+// carrying secrets:reveal sends none.
+func (s *Server) revealSubscriptionShare(w http.ResponseWriter, r *http.Request, share model.SubscriptionShare, p principal) {
+	var req struct {
+		StepUpGrant string `json:"step_up_grant"`
+	}
+	if !decodeLimitedJSON(w, r, &req, 4<<10) {
+		return
+	}
+	ev := model.AuditEvent{Action: auditActionShareReveal, Scope: "proxy:admin",
+		Metadata: map[string]string{"share_id": share.ID, "slug": share.Slug, "token_sha256": proxySubTokenAuditHash(share.Token)}}
+	reveal, ok := s.requireSecretReveal(w, p, req.StepUpGrant, ev)
+	if !ok {
+		return
+	}
+	s.recordSecretReveal(p, reveal, ev)
+	writeJSON(w, http.StatusOK, s.linkRevealViewOf("share", share.ID, share.Slug, share.Token))
 }
 
 // updateSubscriptionShare changes a share without minting a new URL.

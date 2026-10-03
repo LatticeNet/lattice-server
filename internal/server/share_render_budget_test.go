@@ -92,8 +92,9 @@ func TestAFailedRenderIsRefundedOnlyWithinTheAllowance(t *testing.T) {
 	if rotated.RenderBudget != nil {
 		t.Fatalf("rotation kept the burned budget: %+v", rotated.RenderBudget)
 	}
+	stored, _ := s.store.SubscriptionShare(share.ID)
 	before := renders.Load()
-	budgetFetch(s, "/sub/team/"+rotated.Token+"?target=QX")
+	budgetFetch(s, "/sub/team/"+stored.Token+"?target=QX")
 	if renders.Load() != before+1 {
 		t.Fatal("the rotated link could not render")
 	}

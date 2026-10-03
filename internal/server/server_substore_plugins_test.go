@@ -51,11 +51,46 @@ func TestSubStoreSharesRPCListsOnlySubStoreSharesWithURLs(t *testing.T) {
 	if row.SubscriptionID != "sub-1" || row.ShareID != "sh-sub" || row.Slug != "alpha" || !row.Enabled || row.DefaultFormat != "plain" {
 		t.Fatalf("unexpected row: %+v", row)
 	}
-	if row.Path != "/sub/alpha/"+token {
-		t.Fatalf("path = %q", row.Path)
+	// A list carries no link: the token in it is the subscription's
+	// credential.
+	if row.Path != "" || row.URL != "" || row.Revealed || strings.Contains(string(out), token) {
+		t.Fatalf("an unrevealed list must carry no token: %s", out)
 	}
-	if row.URL != "https://lattice.example/sub/alpha/"+token {
-		t.Fatalf("url = %q", row.URL)
+
+	// Asking for one share's link goes through the reveal gate. An admin
+	// session without step-up is refused with the gate's code.
+	if _, err := srv.subStoreSharesRPC(ctx, "list", []byte(`{"share_id":"sh-sub"}`)); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+		t.Fatalf("a reveal without step-up must be refused with 403, got %v", err)
+	}
+	// A token carrying secrets:reveal gets that row's link, and only that row's.
+	revealer := principal{Principal: rbac.Principal{ActorID: "agent", TokenID: "token_reveal", Scopes: []string{"proxy:admin", rbac.SecretRevealScope}}, viaBearer: true}
+	out, err = srv.subStoreSharesRPC(context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, revealer), "list", []byte(`{"share_id":"sh-sub"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatal(err)
+	}
+	row = result.Shares[0]
+	if row.Path != "/sub/alpha/"+token || row.URL != "https://lattice.example/sub/alpha/"+token || !row.Revealed {
+		t.Fatalf("revealed row = %+v", row)
+	}
+	audited := false
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == auditActionShareReveal && ev.Metadata["share_id"] == "sh-sub" && ev.Metadata["token_id"] == "token_reveal" {
+			audited = true
+		}
+		for _, v := range ev.Metadata {
+			if strings.Contains(v, token) {
+				t.Fatalf("the audit trail holds the token: %+v", ev)
+			}
+		}
+	}
+	if !audited {
+		t.Fatal("a token reveal of a share link must be audited with the token id")
+	}
+	if _, err := srv.subStoreSharesRPC(ctx, "list", []byte(`{"share_id":"sh-other"}`)); err == nil {
+		t.Fatal("a share outside the sub-store plugin must not be revealed through its RPC")
 	}
 
 	// The handler re-checks proxy:admin itself: a manifest that misdeclared the

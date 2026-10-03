@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -329,5 +330,53 @@ func TestSecretRevealIsGrantedOnlyThroughItsOwnDoor(t *testing.T) {
 	}
 	if !granted {
 		t.Fatal("minting a reveal token must be audited as such")
+	}
+}
+
+// A share's token is a credential: no list, create, update or rotate answer
+// carries it, and its reveal door asks the gate like every other.
+func TestShareTokensAreRevealedOnlyThroughTheGate(t *testing.T) {
+	h := newRevealHarness(t)
+	h.srv.subscriptionRender = func(context.Context, model.SubscriptionShare, string, string, shareRenderVariant, model.SubscriptionSnapshot) (renderedSubscription, error) {
+		return renderedSubscription{Body: []byte("vless://x@h:1")}, nil
+	}
+	res := doJSON(t, h.handler, http.MethodPost, "/api/subscription-shares",
+		`{"slug":"team","source":{"kind":"plugin","plugin_id":"latticenet.sub-store","subscription_id":"rec-1"}}`, h.cookies, h.csrf)
+	raw, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("create: %d %s", res.StatusCode, raw)
+	}
+	var created shareView
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatal(err)
+	}
+	stored, ok := h.srv.store.SubscriptionShare(created.ID)
+	if !ok || stored.Token == "" {
+		t.Fatal("share not stored")
+	}
+	if created.Token != "" || strings.Contains(string(raw), stored.Token) {
+		t.Fatalf("the create answer carried the token: %s", raw)
+	}
+	for _, call := range []struct{ method, path, body string }{
+		{http.MethodGet, "/api/subscription-shares", ""},
+		{http.MethodPatch, "/api/subscription-shares/" + created.ID, `{"enabled":true}`},
+	} {
+		res := doJSON(t, h.handler, call.method, call.path, call.body, h.cookies, h.csrf)
+		raw, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode >= 300 || strings.Contains(string(raw), stored.Token) {
+			t.Fatalf("%s %s carried the token or failed: %d %s", call.method, call.path, res.StatusCode, raw)
+		}
+	}
+	checkRevealDoor(t, h, revealDoor{name: "share", method: http.MethodPost, path: "/api/subscription-shares/" + created.ID + "/reveal",
+		body: `{}`, scopes: []string{"proxy:admin"}, secret: stored.Token, action: auditActionShareReveal, objectKey: "share_id"})
+
+	res = doJSON(t, h.handler, http.MethodPost, "/api/subscription-shares/"+created.ID+"/rotate", "", h.cookies, h.csrf)
+	raw, _ = io.ReadAll(res.Body)
+	res.Body.Close()
+	rotated, _ := h.srv.store.SubscriptionShare(created.ID)
+	if res.StatusCode != http.StatusOK || rotated.Token == stored.Token || strings.Contains(string(raw), rotated.Token) {
+		t.Fatalf("rotate must change the token and not answer with it: %d %s", res.StatusCode, raw)
 	}
 }

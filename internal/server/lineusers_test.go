@@ -1258,8 +1258,32 @@ func TestVpnUserRotateCredential(t *testing.T) {
 	srv := newLinemetaTestServer(t, st)
 	_, u := seedLineUserFixture(t, srv)
 
+	// Without the reveal gate the rotation happens and the secret is
+	// withheld.
+	before := u.Credentials[0].UUID
 	req, _ := json.Marshal(map[string]string{"user_id": u.ID, "protocol": "vless"})
 	out, err := srv.vpnUserRotateCredential(lineUserTestPrincipal(), req)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	var withheld struct {
+		RevealedCredential string `json:"revealed_credential"`
+		CredentialWithheld bool   `json:"credential_withheld"`
+		RevealCode         string `json:"reveal_code"`
+	}
+	if err := json.Unmarshal(out, &withheld); err != nil {
+		t.Fatal(err)
+	}
+	if withheld.RevealedCredential != "" || !withheld.CredentialWithheld || withheld.RevealCode != apiErrorStepUpRequired {
+		t.Fatalf("a rotation without the reveal gate must withhold the secret: %s", out)
+	}
+	if stored, _ := srv.getVpnUser(u.ID); stored.Credentials[0].UUID == before {
+		t.Fatal("a withheld rotation must still rotate")
+	}
+
+	// A token carrying secrets:reveal gets the new secret in the answer.
+	revealer := principal{Principal: rbac.Principal{ActorID: "agent", TokenID: "token_reveal", Scopes: []string{"vpncore:admin", rbac.SecretRevealScope}}, viaBearer: true}
+	out, err = srv.vpnUserRotateCredential(revealer, req)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
@@ -1283,7 +1307,7 @@ func TestVpnUserRotateCredential(t *testing.T) {
 
 	// Password protocol rotates its password.
 	req, _ = json.Marshal(map[string]string{"user_id": u.ID, "protocol": "trojan"})
-	out, err = srv.vpnUserRotateCredential(lineUserTestPrincipal(), req)
+	out, err = srv.vpnUserRotateCredential(revealer, req)
 	if err != nil {
 		t.Fatal(err)
 	}

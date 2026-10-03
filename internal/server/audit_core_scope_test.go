@@ -343,9 +343,11 @@ func TestReadScopedExportStillIdentifiesTheEndpoint(t *testing.T) {
 	}
 }
 
-// An admin still gets the real thing, so the fix is a split by scope and not a
-// removal of the capability.
-func TestAdminScopedExportStillReturnsTheFullLink(t *testing.T) {
+// An admin still gets the real thing, through the reveal gate: the fix is a
+// split by scope and grant, not a removal of the capability. vpncore:admin
+// alone gets the endpoints; a token that also carries secrets:reveal gets
+// the credential-bearing links, and the reveal is audited with its id.
+func TestAdminScopedExportReturnsTheFullLinkOnlyThroughTheRevealGate(t *testing.T) {
 	srv, handler, st := newCoreScopeAuditServer(t)
 	seedRenderableProxyUser(t, handler, st)
 	seedDiscoveredInventory(t, srv, st)
@@ -356,9 +358,56 @@ func TestAdminScopedExportStillReturnsTheFullLink(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("export as vpncore:admin: want 200, got %d (%s)", rec.Code, rec.Body.String())
 	}
+	for _, secret := range []string{aliceUUID, discoveredNodeUUID} {
+		if strings.Contains(rec.Body.String(), secret) {
+			t.Fatalf("vpncore:admin without the reveal gate received a credential (%s): %s", secret, rec.Body.String())
+		}
+	}
+
+	body, _ := json.Marshal(map[string]string{"id": vpnCorePluginID, "service": vpnCoreNodesService, "method": "export"})
+	req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{ActorID: "agent", TokenID: "token_reveal",
+		Scopes: []string{"vpncore:read", "vpncore:admin", rbac.SecretRevealScope}}, viaBearer: true})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export with secrets:reveal: want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
 	for _, want := range []string{aliceUUID, discoveredNodeUUID} {
 		if !strings.Contains(rec.Body.String(), want) {
-			t.Fatalf("an admin lost access to the credential-bearing link (%s): %s", want, rec.Body.String())
+			t.Fatalf("an admin token with secrets:reveal lost the credential-bearing link (%s): %s", want, rec.Body.String())
+		}
+	}
+	audited := false
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "vpncore.nodes.reveal" && ev.Metadata["token_id"] == "token_reveal" && ev.Metadata["via"] == revealViaToken {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatal("a token reveal through export must be audited with the token id")
+	}
+
+	// A session reveals by sending its fresh step-up grant in the request.
+	session := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"vpncore:read", "vpncore:admin"}}, sessionID: "sess-1"}
+	grant, _, err := srv.issueStepUpGrant(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		grant string
+		want  bool
+	}{{"", false}, {"not-a-grant", false}, {grant, true}} {
+		body, _ = json.Marshal(map[string]any{"id": vpnCorePluginID, "service": vpnCoreNodesService, "method": "export", "payload": map[string]string{"step_up_grant": tc.grant}})
+		req = httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec = httptest.NewRecorder()
+		srv.handlePluginCall(rec, req, session)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("session export (grant %q): %d %s", tc.grant, rec.Code, rec.Body.String())
+		}
+		if got := strings.Contains(rec.Body.String(), aliceUUID); got != tc.want {
+			t.Fatalf("session export with grant %q: credential present = %v, want %v: %s", tc.grant, got, tc.want, rec.Body.String())
 		}
 	}
 }

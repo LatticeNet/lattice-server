@@ -676,3 +676,54 @@ func TestFailedTestDoesNotStartTheFailingWindow(t *testing.T) {
 		t.Fatalf("three real failures did not announce once: %+v", rows)
 	}
 }
+
+// A message longer than the bound is cut once, at plan time: the channel
+// receives exactly what the Sent log stores, the row says it was cut, and a
+// fallback keeps its explanation at the end.
+func TestOutboxSendsAndStoresTheSameBoundedText(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	addNotifyChannel(t, st, "nc-a", "Bark urgent")
+	addNotifyChannel(t, st, "nc-fb", "Telegram fallback")
+	rule := model.NotifyRule{ID: "r-urgent", Name: "Urgent", EventTypes: []string{EventNodeOffline}, ChannelIDs: []string{"nc-a"}, Enabled: true}
+	if err := st.UpsertNotifyRuleWithOptions(rule, store.NotifyRuleOptions{FallbackChannelID: "nc-fb"}); err != nil {
+		t.Fatal(err)
+	}
+	fake := installFakeNotifySender(srv, func(id string, _ int) error {
+		if id == "nc-a" {
+			return upstream(401)
+		}
+		return nil
+	})
+	long := strings.Repeat("node alpha went quiet. ", 1000)
+	srv.notifyEventTyped(EventNodeOffline, strings.Repeat("Node offline ", 100), long)
+	waitOutboxSettled(t, srv)
+	primary := deliveriesOf(st, store.NotifyDeliveryFilter{ChannelID: "nc-a"})
+	sent := fake.sentTo("nc-a")
+	if len(primary) != 1 || len(sent) != 1 || !primary[0].Truncated {
+		t.Fatalf("primary rows %+v, sends %d", primary, len(sent))
+	}
+	if sent[0].body != primary[0].Body || sent[0].title != primary[0].Title || len(sent[0].body) > store.MaxNotifyBodyBytes || len(sent[0].title) > store.MaxNotifyTitleBytes {
+		t.Fatalf("sent %d/%d bytes, stored %d/%d", len(sent[0].title), len(sent[0].body), len(primary[0].Title), len(primary[0].Body))
+	}
+	fb := fake.sentTo("nc-fb")
+	if len(fb) != 1 || len(fb[0].body) > store.MaxNotifyBodyBytes || !strings.HasSuffix(fb[0].body, "Bark urgent did not deliver it.") {
+		t.Fatalf("fallback body (%d bytes) lost its explanation", len(fb[0].body))
+	}
+}
+
+// A chatty unrouted event keeps one row with a count, not one row per event.
+func TestOutboxFoldsRepeatedUnroutedEvents(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	addNotifyChannel(t, st, "nc-a", "Bark urgent")
+	if err := st.UpsertNotifyRule(model.NotifyRule{ID: "r-urgent", Name: "Urgent", EventTypes: []string{EventNodeOffline}, ChannelIDs: []string{"nc-a"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	installFakeNotifySender(srv, nil)
+	for i := 0; i < 5; i++ {
+		srv.notifyEventTyped("ssh.login", "SSH login on alpha", fmt.Sprintf("root from 203.0.113.%d", i))
+	}
+	rows := deliveriesOf(st, store.NotifyDeliveryFilter{EventType: "ssh.login"})
+	if len(rows) != 1 || rows[0].Repeats != 4 || rows[0].Body != "root from 203.0.113.4" {
+		t.Fatalf("rows = %+v", rows)
+	}
+}

@@ -165,11 +165,12 @@ func defaultNotifySend(ctx context.Context, channel model.NotifyChannel, msg not
 }
 
 // notifyTarget is one planned send: a channel and the message a rule rendered
-// for it.
+// for it, bounded to store.MaxNotifyTitleBytes and store.MaxNotifyBodyBytes.
 type notifyTarget struct {
 	ruleID, ruleName string
 	channel          model.NotifyChannel
 	message          notify.Message
+	truncated        bool
 }
 
 // planNotifyTargets resolves an event to channels. With no rules every
@@ -245,26 +246,34 @@ type notifyEnqueue struct {
 // notifyPlan is an event resolved to its deliveries but not yet stored.
 type notifyPlan struct {
 	eventID, eventType string
-	title, body        string
-	how                notifyEnqueue
-	targets            []notifyTarget
+	// title and body are the event's own text, bounded like every target's.
+	title, body string
+	truncated   bool
+	how         notifyEnqueue
+	targets     []notifyTarget
 	// noRoute says why targets is empty.
 	noRoute string
 	at      time.Time
 }
 
 // planNotifyEvent resolves an event to channels without storing anything.
+// Every message is bounded here, after the rule templates have rendered, and
+// what is stored is exactly what is sent: the three bounded channel kinds
+// could not take more (store.MaxNotifyBodyBytes), and a redrive after a
+// restart sends the same text as the first try.
 func (s *Server) planNotifyEvent(eventType, title, body string, how notifyEnqueue) notifyPlan {
 	channels := s.store.EnabledNotifyChannels()
 	var rules []model.NotifyRule
 	if !how.broadcast {
 		rules = s.store.EnabledNotifyRules()
 	}
-	plan := notifyPlan{
-		eventID: id.New("evt"), eventType: eventType, title: title, body: body, how: how,
-		targets: s.planNotifyTargets(eventType, title, body, channels, rules, how.exclude, how.fanOut),
-		at:      s.now(),
+	targets := s.planNotifyTargets(eventType, title, body, channels, rules, how.exclude, how.fanOut)
+	for i := range targets {
+		m := &targets[i].message
+		m.Title, m.Body, targets[i].truncated = store.ClampNotifyText(m.Title, m.Body)
 	}
+	plan := notifyPlan{eventID: id.New("evt"), eventType: eventType, how: how, targets: targets, at: s.now()}
+	plan.title, plan.body, plan.truncated = store.ClampNotifyText(title, body)
 	if len(plan.targets) == 0 {
 		others := 0
 		for _, c := range channels {
@@ -287,8 +296,9 @@ func (s *Server) planNotifyEvent(eventType, title, body string, how notifyEnqueu
 // commitNotifyPlan stores a plan's deliveries and wakes the drainer. The
 // deliveries are on disk when it returns, which is what lets a caller record
 // a decision (a paged offline spell) knowing the page survives a crash. An
-// event that reaches no channel is stored as one no_route row, so "why was I
-// not told" has an answer.
+// event that reaches no channel is stored as a no_route row, so "why was I
+// not told" has an answer; repeats of it within the hour fold into one row
+// (store.RecordNotifyNoRoute).
 func (s *Server) commitNotifyPlan(plan notifyPlan) {
 	how := plan.how
 	if len(plan.targets) == 0 {
@@ -296,9 +306,9 @@ func (s *Server) commitNotifyPlan(plan notifyPlan) {
 			ID: id.New("nd"), EventID: plan.eventID, EventType: plan.eventType,
 			Source: how.source, SourceID: how.sourceID, SourceRef: how.sourceRef,
 			Outcome: store.NotifyOutcomeNoRoute, Reason: plan.noRoute, Title: plan.title, Body: plan.body,
-			CreatedAt: plan.at, SettledAt: plan.at,
+			Truncated: plan.truncated, CreatedAt: plan.at, SettledAt: plan.at,
 		}
-		if err := s.store.RecordNotifyDeliveries([]store.NotifyDelivery{row}); err != nil {
+		if err := s.store.RecordNotifyNoRoute(row); err != nil {
 			s.logger.Printf("notify: record unrouted %s: %v", plan.eventType, err)
 		}
 		return
@@ -311,7 +321,8 @@ func (s *Server) commitNotifyPlan(plan notifyPlan) {
 			RuleID: t.ruleID, RuleName: t.ruleName,
 			ChannelID: t.channel.ID, ChannelName: t.channel.Name, ChannelKind: t.channel.Kind,
 			Role: store.NotifyRolePrimary, Outcome: store.NotifyOutcomePlanned,
-			NextAttemptAt: plan.at, Title: t.message.Title, Body: t.message.Body, CreatedAt: plan.at,
+			NextAttemptAt: plan.at, Title: t.message.Title, Body: t.message.Body, Truncated: t.truncated,
+			CreatedAt: plan.at,
 		}
 	}
 	if err := s.store.RecordNotifyDeliveries(rows); err != nil {
@@ -720,13 +731,13 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 	}
 	sort.Strings(failed)
 	now := s.now()
+	body, cut := notifyFallbackBody(row.Body, strings.Join(failed, ", "))
 	fallback := store.NotifyDelivery{
 		ID: id.New("nd"), EventID: row.EventID, EventType: row.EventType,
 		Source: row.Source, SourceID: row.SourceID, SourceRef: row.SourceRef,
 		RuleID: row.RuleID, RuleName: row.RuleName, Role: store.NotifyRoleFallback,
 		FallbackFor: strings.Join(failed, ", "), Outcome: store.NotifyOutcomePlanned,
-		NextAttemptAt: now, Title: row.Title,
-		Body:      row.Body + "\n\nSent through the fallback channel because " + strings.Join(failed, ", ") + " did not deliver it.",
+		NextAttemptAt: now, Title: row.Title, Body: body, Truncated: row.Truncated || cut,
 		CreatedAt: now,
 	}
 	channel, found := s.notifyChannelByID(opts.FallbackChannelID)
@@ -739,6 +750,15 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 		return
 	}
 	s.wakeNotifyOutbox()
+}
+
+// notifyFallbackBody appends the fallback sentence to a message, shortening
+// the message rather than the sentence when the two exceed the body bound.
+func notifyFallbackBody(body, failed string) (string, bool) {
+	sentence := "\n\nSent through the fallback channel because " + failed + " did not deliver it."
+	base, cut := store.TruncateUTF8(body, max(0, store.MaxNotifyBodyBytes-len(sentence)))
+	out, cutAll := store.TruncateUTF8(base+sentence, store.MaxNotifyBodyBytes)
+	return out, cut || cutAll
 }
 
 // settleNotifyWebhookRecord closes an inbound webhook's own delivery record

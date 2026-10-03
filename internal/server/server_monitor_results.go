@@ -4,8 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // defaultMonitorResultsLimit is how many results GET /api/monitors/results
@@ -110,7 +114,8 @@ func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request
 // runs the alert hold on each new row, in order. The node id inside each
 // result is ignored: an agent reports for the node its token belongs to.
 func (s *Server) ingestAgentMonitorResults(nodeID string, results []model.MonitorResult) (agentMonitorResultsResponse, error) {
-	outcomes, err := s.store.IngestAgentMonitorResults(nodeID, results, s.now())
+	receivedAt := s.now()
+	outcomes, err := s.store.IngestAgentMonitorResults(nodeID, results, receivedAt)
 	if err != nil {
 		return agentMonitorResultsResponse{}, err
 	}
@@ -118,10 +123,19 @@ func (s *Server) ingestAgentMonitorResults(nodeID string, results []model.Monito
 		return agentMonitorResultsResponse{}, errors.New("monitor result ingest returned a short outcome list")
 	}
 	resp := agentMonitorResultsResponse{OK: true}
+	// firstDrop is the first dropped index per reason, kept in the order the
+	// reasons appeared, so the log names one example of each.
+	var dropReasons []string
+	firstDrop, dropCount := map[string]int{}, map[string]int{}
 	for i, out := range outcomes {
 		switch {
 		case out.Dropped != "":
 			resp.Dropped = append(resp.Dropped, agentMonitorResultDrop{Index: i, MonitorID: results[i].MonitorID, Reason: out.Dropped})
+			if _, seen := firstDrop[out.Dropped]; !seen {
+				firstDrop[out.Dropped] = i
+				dropReasons = append(dropReasons, out.Dropped)
+			}
+			dropCount[out.Dropped]++
 		case out.Duplicate:
 			resp.Duplicates++
 		default:
@@ -129,5 +143,81 @@ func (s *Server) ingestAgentMonitorResults(nodeID string, results []model.Monito
 			s.notifyMonitorTransition(nodeID, out.Result.MonitorResult, out.PriorFailStreak)
 		}
 	}
+	for _, reason := range dropReasons {
+		s.logMonitorResultDrops(nodeID, reason, dropCount[reason], results[firstDrop[reason]], receivedAt)
+	}
 	return resp, nil
+}
+
+// monitorDropLogInterval is how often one node's drops for one reason may
+// reach the log.
+const monitorDropLogInterval = 15 * time.Minute
+
+// monitorDropLog is the server's own record of the agent results it refuses.
+// A drop answers 200 with the reason in the body, and the agents released so
+// far ignore the body, so without it a node whose clock runs a day behind or
+// a minute ahead, or whose monitor list is stale, would lose every result
+// with no line on either side. Each node and reason gets at most one line per
+// monitorDropLogInterval, which counts the drops since the line before.
+//
+// Entries are keyed by authenticated node id and one of the fixed drop
+// reasons, so the map is bounded by the nodes ever enrolled times six.
+type monitorDropLog struct {
+	mu      sync.Mutex
+	entries map[monitorDropKey]*monitorDropEntry
+}
+
+type monitorDropKey struct{ nodeID, reason string }
+
+type monitorDropEntry struct {
+	logged   time.Time
+	unlogged int
+}
+
+// note adds n drops and reports whether a line is due, with the count it
+// should carry.
+func (l *monitorDropLog) note(nodeID, reason string, n int, now time.Time) (int, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.entries == nil {
+		l.entries = map[monitorDropKey]*monitorDropEntry{}
+	}
+	key := monitorDropKey{nodeID: nodeID, reason: reason}
+	e := l.entries[key]
+	if e == nil {
+		e = &monitorDropEntry{}
+		l.entries[key] = e
+	}
+	e.unlogged += n
+	if !e.logged.IsZero() && now.Sub(e.logged) < monitorDropLogInterval {
+		return 0, false
+	}
+	count := e.unlogged
+	e.logged, e.unlogged = now, 0
+	return count, true
+}
+
+// logMonitorResultDrops writes the rate-limited line for one request's drops
+// of one reason. sample is the first of them; for a stamp outside the window
+// the line says how far off it was, which is how a broken agent clock shows.
+func (s *Server) logMonitorResultDrops(nodeID, reason string, n int, sample model.MonitorResult, receivedAt time.Time) {
+	count, due := s.monitorDrops.note(nodeID, reason, n, receivedAt)
+	if !due {
+		return
+	}
+	// The monitor id is the agent's text: bounded here and quoted below.
+	monitorID := sample.MonitorID
+	if len(monitorID) > 64 {
+		monitorID = monitorID[:64]
+	}
+	detail := ""
+	if reason == store.MonitorResultDropOutOfWindow {
+		if skew := sample.At.Sub(receivedAt); skew > 0 {
+			detail = fmt.Sprintf(", stamped %s ahead of the control plane", skew.Round(time.Second))
+		} else {
+			detail = fmt.Sprintf(", stamped %s behind the control plane", (-skew).Round(time.Second))
+		}
+	}
+	s.logger.Printf("agent monitor results: dropped %d from node %s (%s) as %s since the last such line; monitor %q%s",
+		count, s.nodeDisplayName(nodeID), nodeID, reason, monitorID, detail)
 }

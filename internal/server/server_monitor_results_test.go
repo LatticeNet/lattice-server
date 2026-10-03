@@ -3,8 +3,11 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,6 +79,87 @@ func TestAgentMonitorResultsBatchAnswersPerResult(t *testing.T) {
 	rows := storedMonitorResults(t, st, monID)
 	if len(rows) != 3 {
 		t.Fatalf("stored rows = %d, want 3", len(rows))
+	}
+}
+
+// lockedLog is a log destination the server may write from any goroutine.
+type lockedLog struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedLog) linesWith(substr string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, line := range strings.Split(l.b.String(), "\n") {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// A drop answers 200 and released agents ignore the body, so the server
+// writes its own line: once per node and reason per interval, counting the
+// drops held back since, naming the node, and saying how far off a stamp
+// outside the window was, which is how a broken agent clock shows.
+func TestAgentMonitorResultDropsAreLoggedOncePerInterval(t *testing.T) {
+	srv, handler, _ := newInventoryServer(t)
+	logs := &lockedLog{}
+	srv.logger = log.New(logs, "", 0)
+	cookies, csrf := loginSession(t, handler)
+	slow := enrollAndBeat(t, handler, cookies, csrf, "n-web", "tokyo-edge")
+	fast := enrollAndBeat(t, handler, cookies, csrf, "n-fast", "osaka-edge")
+	monID := createAllNodesMonitor(t, handler, cookies, csrf, "web")
+	base := time.Now().UTC().Truncate(time.Second)
+	var clock atomic.Int64
+	clock.Store(base.UnixNano())
+	srv.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	post := func(nodeID, token string, results ...string) {
+		t.Helper()
+		body := `{"node_id":"` + nodeID + `","results":[` + strings.Join(results, ",") + `]}`
+		rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-results", body, token)
+		if got := decodeIngest(t, rec.Body.Bytes()); rec.Code != http.StatusOK || got.Accepted != 0 || len(got.Dropped) != len(results) {
+			t.Fatalf("post: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	// A clock a day behind: two drops in one request make one line.
+	behind := base.Add(-26 * time.Hour)
+	post("n-web", slow, resultJSON(monID, behind, true, ""), resultJSON(monID, behind.Add(time.Second), true, ""))
+	// Inside the interval a further drop is counted, not logged; another
+	// reason and another node each have their own line.
+	post("n-web", slow, resultJSON(monID, behind.Add(2*time.Second), true, ""))
+	post("n-web", slow, resultJSON("mon-missing", base, true, ""))
+	post("n-fast", fast, resultJSON(monID, base.Add(5*time.Minute), true, ""))
+	// Once the interval has passed, the next drop's line carries the one
+	// held back as well.
+	clock.Store(base.Add(monitorDropLogInterval).UnixNano())
+	post("n-web", slow, resultJSON(monID, behind.Add(monitorDropLogInterval), true, ""))
+
+	lines := logs.linesWith("agent monitor results:")
+	want := [][]string{
+		{"dropped 2 from node tokyo-edge (n-web) as out_of_window", `monitor "` + monID + `"`, "stamped 26h0m0s behind the control plane"},
+		{"dropped 1 from node tokyo-edge (n-web) as unknown_monitor", `monitor "mon-missing"`},
+		{"dropped 1 from node osaka-edge (n-fast) as out_of_window", "stamped 5m0s ahead of the control plane"},
+		{"dropped 2 from node tokyo-edge (n-web) as out_of_window", "stamped 26h0m0s behind the control plane"},
+	}
+	if len(lines) != len(want) {
+		t.Fatalf("drop lines = %d, want %d:\n%s", len(lines), len(want), strings.Join(lines, "\n"))
+	}
+	for i, parts := range want {
+		for _, part := range parts {
+			if !strings.Contains(lines[i], part) {
+				t.Errorf("line %d %q lacks %q", i, lines[i], part)
+			}
+		}
 	}
 }
 

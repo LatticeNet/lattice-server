@@ -300,6 +300,9 @@ type Server struct {
 	// alertDigest batches service and monitor alerts decided one node at a
 	// time into one message per kind per sweep; see alert_digest.go.
 	alertDigest alertDigest
+	// monitorDrops rate-limits the log line for agent monitor results the
+	// store refused; see server_monitor_results.go.
+	monitorDrops monitorDropLog
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight

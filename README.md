@@ -491,7 +491,9 @@ Use the compose file and deployment guide in the umbrella repository:
   `out_of_window`. The server never restamps a result, because the stamp is
   what makes a result sent again a duplicate. A dropped reason
   (`unknown_monitor`, `server_evaluated`, `disabled`, `not_assigned`,
-  `out_of_window`, `invalid`) is final, so the agent drops that result.
+  `out_of_window`, `invalid`) is final, so the agent drops that result. The
+  server logs drops at most once per node and reason every 15 minutes, with the
+  stamp's offset for `out_of_window`, so a broken agent clock shows in the log.
   Results are judged in array order, so a buffered backlog goes oldest first.
   A result the pair already holds at the same instant counts as a duplicate,
   so a batch sent again after a lost response stores nothing twice and pages

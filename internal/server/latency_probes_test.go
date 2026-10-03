@@ -447,3 +447,38 @@ func TestLatencyProbeFailuresDoNotPage(t *testing.T) {
 		t.Fatalf("the failures were not stored: %+v", latest)
 	}
 }
+
+// The plan refuses a port the node's sshd reports, even when a line claims
+// it, and a target left with only such a port is not probeable.
+func TestLatencyPlanRefusesTheSSHPortGuardRealityReports(t *testing.T) {
+	srv, _, st := latencyFleet(t)
+	node, _ := st.Node("node-jp")
+	node.LatticeIdentityUUID = "4b6f6a1e-6a55-4d6b-9a3e-2f1c0b7d9e10"
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, _, err := st.UpsertGuardRealitySnapshot(node.LatticeIdentityUUID, store.GuardRealitySnapshot{
+		Reality:    model.GuardNodeReality{NodeID: "node-jp", CollectedAt: now, SSHD: &model.GuardSSHDFacts{Ports: []int{2222}, ObservedAt: now}},
+		ReceivedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv.singboxInvMu.Lock()
+	srv.singboxInv["node-jp"] = model.SingBoxInventory{NodeID: "node-jp", At: now, Status: "ok", Nodes: []model.SingBoxNode{
+		{Name: "aaa-on-ssh", Protocol: "vless", Network: "reality", Port: "2222", Address: "203.0.113.3", PortBound: boolPtr(true)},
+		{Name: "vless-reality-8443", Protocol: "vless", Network: "reality", Port: "8443", Address: "203.0.113.3"},
+	}}
+	srv.singboxInvMu.Unlock()
+	if jp := latencyNodeOf(t, srv.planLatencyProbes(now).plan, "node-jp"); jp.Endpoint != "203.0.113.3:8443" {
+		t.Fatalf("a held line on the sshd port won over a public line: %+v", jp)
+	}
+	srv.singboxInvMu.Lock()
+	inv := srv.singboxInv["node-jp"]
+	inv.Nodes = inv.Nodes[:1]
+	srv.singboxInv["node-jp"] = inv
+	srv.singboxInvMu.Unlock()
+	if jp := latencyNodeOf(t, srv.planLatencyProbes(now).plan, "node-jp"); jp.Target != model.LatencyTargetNotProbeable || jp.EndpointNote != model.LatencyEndpointNoLine {
+		t.Fatalf("a target with only its sshd port = %+v", jp)
+	}
+}

@@ -199,9 +199,11 @@ func TestKnockRevealLogsInOnTheGatedPortWhenTheArmKeptSSHD(t *testing.T) {
 	}
 }
 
-// The fourth axiom says a person's reach is an agent's reach. This is the
-// deliberate exception, so the refusal has to name itself rather than read as
-// a generic authorization failure an agent would retry.
+// The fourth axiom says a person's reach is an agent's reach. A token reaches
+// a secret only through the separate, audited secrets:reveal grant
+// (secret_reveal_test.go), so the refusal for every other token has to name
+// itself rather than read as a generic authorization failure an agent would
+// retry.
 func TestKnockRevealRefusesABearerTokenAndSaysWhy(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	seedAgentUpdateNode(t, st)

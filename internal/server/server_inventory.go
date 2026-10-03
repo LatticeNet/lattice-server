@@ -469,7 +469,9 @@ func (s *Server) handleMachineLinkReveal(w http.ResponseWriter, r *http.Request,
 	if !s.requireNodeScope(w, p, "inventory:admin", profile.NodeID) {
 		return
 	}
-	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "inventory.link.reveal") {
+	reveal, ok := s.requireSecretReveal(w, p, req.StepUpGrant, model.AuditEvent{NodeID: profile.NodeID, Action: "inventory.link.reveal", Scope: "inventory:admin",
+		Metadata: map[string]string{"machine_id": profile.ID, "kind": req.Kind}})
+	if !ok {
 		return
 	}
 	link := ""
@@ -486,7 +488,7 @@ func (s *Server) handleMachineLinkReveal(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, errors.New("link is not set"))
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: profile.NodeID, Action: "inventory.link.reveal", Scope: "inventory:admin", Metadata: map[string]string{"machine_id": profile.ID, "kind": req.Kind}})
+	s.recordSecretReveal(p, reveal, model.AuditEvent{ID: id.New("audit"), NodeID: profile.NodeID, Action: "inventory.link.reveal", Scope: "inventory:admin", Metadata: map[string]string{"machine_id": profile.ID, "kind": req.Kind}})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": profile.ID, "kind": req.Kind, "url": link})
 }
 

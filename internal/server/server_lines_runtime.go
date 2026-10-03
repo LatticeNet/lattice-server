@@ -203,7 +203,9 @@ func (s *Server) handleRevealVPNUserCredentials(w http.ResponseWriter, r *http.R
 	if !s.requireGlobalProxyScope(w, p, "proxy:admin") {
 		return
 	}
-	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "vpn.user.credentials.reveal") {
+	reveal, ok := s.requireSecretReveal(w, p, req.StepUpGrant, model.AuditEvent{Action: "vpn.user.credentials.reveal", Scope: "proxy:admin",
+		Metadata: map[string]string{"user_id": strings.TrimSpace(req.ID)}})
+	if !ok {
 		return
 	}
 	u, ok := s.getVpnUser(strings.TrimSpace(req.ID))
@@ -211,11 +213,13 @@ func (s *Server) handleRevealVPNUserCredentials(w http.ResponseWriter, r *http.R
 		writeError(w, http.StatusNotFound, errors.New("vpn user not found"))
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "vpn.user.credentials.reveal", Scope: "proxy:admin", Metadata: map[string]string{"user_id": u.ID}})
+	s.recordSecretReveal(p, reveal, model.AuditEvent{ID: id.New("audit"), Action: "vpn.user.credentials.reveal", Scope: "proxy:admin", Metadata: map[string]string{"user_id": u.ID}})
+	// The subscription token (SubID) is not here any more: it is the
+	// identity's link, revealed through its own door (identity_link_api.go),
+	// so a credential reveal hands out credentials and nothing else.
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"user":        toVpnUserView(u),
 		"credentials": u.Credentials,
-		"sub_id":      u.SubID,
 	})
 }

@@ -78,7 +78,7 @@ func TestProxyInboundAndUserViewsHideSecrets(t *testing.T) {
 			t.Fatalf("user view leaked secret %q: %s", leak, userBody.String())
 		}
 	}
-	for _, field := range []string{`"has_uuid":true`, `"has_password":true`, `"has_sub_token":true`} {
+	for _, field := range []string{`"has_uuid":true`, `"has_password":true`} {
 		if !bytes.Contains(userBody.Bytes(), []byte(field)) {
 			t.Fatalf("user view missing %s: %s", field, userBody.String())
 		}
@@ -805,124 +805,34 @@ func TestProxySubscriptionOmitsInactiveUsersAndUnappliedProfiles(t *testing.T) {
 	}
 }
 
-func TestProxyRotateSubTokenDoesNotChangePublicAccess(t *testing.T) {
-	const publicURL = "https://lattice.example.test"
-	handler, st := newTestServerWithPublicURL(t, publicURL)
+// The legacy per-user sub token has served nothing since cff5b9c removed the
+// per-user endpoint; identity links replace it. Its rotate route and the
+// has_sub_token flag are gone (identity-sub P8), and a share keeps serving
+// what it served.
+func TestLegacySubTokenRouteIsGone(t *testing.T) {
+	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
 	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
-	profile, ok := st.ProxyNodeProfile("node-a")
-	if !ok {
-		t.Fatal("proxy node profile not found")
-	}
-	profile.AppliedSHA256 = strings.Repeat("a", 64)
-	if err := st.UpsertProxyNodeProfile(profile); err != nil {
-		t.Fatal(err)
-	}
+	before, _ := st.ProxyUser("alice")
 
-	// BEHAVIOUR CHANGE: a user's sub token used to BE the public credential, so
-	// rotating it changed the URL and killed the old one. A share now holds the
-	// public credential, so rotating the user token changes what is stored and
-	// nothing a client can see. Rotating public access is the share's rotate
-	// endpoint, which is a different operation on a different object.
-	const shareToken = "share-token-for-alice-abcdefghijklmnop"
-	subURL := publishProxyUserShare(t, st, "alice", "alice-team", shareToken)
-
-	before := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
-	before.Body.Close()
-	if before.StatusCode != http.StatusOK {
-		t.Fatalf("share should serve before rotation, got %d", before.StatusCode)
-	}
-
-	const oldToken = "sub-token-secret-abcdefghijklmnopqrstuvwxyz"
 	rotate := doJSON(t, handler, http.MethodPost, "/api/proxy/users/rotate-sub-token", `{"id":"alice"}`, cookies, csrf)
 	defer rotate.Body.Close()
-	if rotate.StatusCode != http.StatusOK {
-		t.Fatalf("rotate failed: %d", rotate.StatusCode)
+	if rotate.StatusCode != http.StatusNotFound {
+		t.Fatalf("the legacy rotate route must be gone, got %d", rotate.StatusCode)
 	}
-	var out struct {
-		User                proxyUserView `json:"user"`
-		SubscriptionURL     string        `json:"subscription_url"`
-		RotatesPublicAccess bool          `json:"rotates_public_access"`
-		TokenSHA256         string        `json:"token_sha256"`
+	if after, _ := st.ProxyUser("alice"); after.SubToken != before.SubToken {
+		t.Fatal("nothing may rotate the legacy token any more")
 	}
-	if err := json.NewDecoder(rotate.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out.User.ID != "alice" || !out.User.HasSubToken {
-		t.Fatalf("bad rotated user view: %+v", out.User)
-	}
-	if out.RotatesPublicAccess {
-		t.Fatal("the response claims rotating a user token rotates public access")
-	}
-	if out.SubscriptionURL != publicURL+subURL {
-		t.Fatalf("subscription_url = %q, want the share URL %q", out.SubscriptionURL, publicURL+subURL)
-	}
-
-	stored, ok := st.ProxyUser("alice")
-	if !ok {
-		t.Fatal("alice missing after rotation")
-	}
-	if stored.SubToken == oldToken || stored.SubToken == "" {
-		t.Fatalf("stored token did not rotate: %q", stored.SubToken)
-	}
-	if out.TokenSHA256 != proxySubTokenAuditHash(stored.SubToken) {
-		t.Fatalf("token hash mismatch: got %s want %s", out.TokenSHA256, proxySubTokenAuditHash(stored.SubToken))
-	}
-
-	// The share URL is untouched by the rotation, and still serves.
-	after := doJSON(t, handler, http.MethodGet, subURL+"?format=plain", "", nil, "")
-	after.Body.Close()
-	if after.StatusCode != http.StatusOK {
-		t.Fatalf("share stopped serving after an unrelated user-token rotation, got %d", after.StatusCode)
-	}
-
 	list := doJSON(t, handler, http.MethodGet, "/api/proxy/users", "", cookies, "")
 	defer list.Body.Close()
-	listBody := new(bytes.Buffer)
-	listBody.ReadFrom(list.Body)
-	if strings.Contains(listBody.String(), oldToken) || strings.Contains(listBody.String(), stored.SubToken) {
-		t.Fatalf("proxy user list leaked subscription token: %s", listBody.String())
-	}
-	if !auditMetadataSeen(st, "proxy.user.rotate_sub_token", "new_token_sha256", proxySubTokenAuditHash(stored.SubToken)) {
-		t.Fatalf("missing token rotate audit: %+v", st.AuditEvents())
-	}
-	for _, ev := range st.AuditEvents() {
-		if ev.Action != "proxy.user.rotate_sub_token" {
-			continue
-		}
-		for key, value := range ev.Metadata {
-			if strings.Contains(key, oldToken) || strings.Contains(key, stored.SubToken) || strings.Contains(value, oldToken) || strings.Contains(value, stored.SubToken) {
-				t.Fatalf("raw token leaked into rotate audit metadata: %+v", ev.Metadata)
-			}
-		}
+	body := new(bytes.Buffer)
+	body.ReadFrom(list.Body)
+	if strings.Contains(body.String(), "has_sub_token") || strings.Contains(body.String(), before.SubToken) {
+		t.Fatalf("the user view must carry neither the flag nor the token: %s", body.String())
 	}
 }
 
-// A user nobody has published has no public URL, and reporting an empty string
-// is the honest answer. The old behaviour synthesised one from the user's own
-// token, which now points at a route that does not exist.
-func TestProxyRotateSubTokenReportsNoURLForAnUnpublishedUser(t *testing.T) {
-	handler, _ := newTestServer(t)
-	cookies, csrf := loginSession(t, handler)
-	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
-	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
-
-	rotate := doJSON(t, handler, http.MethodPost, "/api/proxy/users/rotate-sub-token", `{"id":"alice"}`, cookies, csrf)
-	defer rotate.Body.Close()
-	if rotate.StatusCode != http.StatusOK {
-		t.Fatalf("rotate failed: %d", rotate.StatusCode)
-	}
-	var out struct {
-		SubscriptionURL string `json:"subscription_url"`
-	}
-	if err := json.NewDecoder(rotate.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if out.SubscriptionURL != "" {
-		t.Fatalf("an unpublished user reported a subscription URL: %q", out.SubscriptionURL)
-	}
-}
 func TestProxyUsageReportBaselinesAndRollsForward(t *testing.T) {
 	handler, st := newTestServer(t)
 	cookies, csrf := loginSession(t, handler)

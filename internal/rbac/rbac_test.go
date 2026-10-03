@@ -91,3 +91,40 @@ func TestCanDelegateScopeUsesDirectedMigrationRules(t *testing.T) {
 		})
 	}
 }
+
+func TestSecretRevealIsHeldOnlyByNamingIt(t *testing.T) {
+	cases := []struct {
+		name   string
+		scopes []string
+		want   bool
+	}{
+		{name: "named", scopes: []string{"secrets:reveal"}, want: true},
+		{name: "superuser", scopes: []string{"*"}, want: false},
+		{name: "domain wildcard", scopes: []string{"secrets:*"}, want: false},
+		{name: "every admin scope", scopes: []string{"proxy:admin", "vpncore:admin", "substore:admin", "token:admin", "user:admin"}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := Principal{Scopes: tc.scopes}
+			if got := Allows(p, SecretRevealScope, ""); got != tc.want {
+				t.Fatalf("Allows(%v, secrets:reveal) = %v, want %v", tc.scopes, got, tc.want)
+			}
+			if got := HoldsExplicitScope(tc.scopes, SecretRevealScope); got != tc.want {
+				t.Fatalf("HoldsExplicitScope(%v) = %v, want %v", tc.scopes, got, tc.want)
+			}
+			if got := CanDelegateScope(p, SecretRevealScope); got != tc.want {
+				t.Fatalf("CanDelegateScope(%v, secrets:reveal) = %v, want %v", tc.scopes, got, tc.want)
+			}
+		})
+	}
+	if !ValidScope(SecretRevealScope) {
+		t.Fatal("secrets:reveal must be grantable")
+	}
+	if ValidScope("secrets:*") {
+		t.Fatal("a wildcard of an explicit-only domain must not be grantable: it would read as a grant and grant nothing")
+	}
+	// "*" still covers every ordinary scope.
+	if !Allows(Principal{Scopes: []string{"*"}}, "proxy:admin", "") {
+		t.Fatal("* must still allow proxy:admin")
+	}
+}

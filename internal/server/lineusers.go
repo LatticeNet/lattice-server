@@ -101,6 +101,9 @@ type lineUserPlan struct {
 	// Omitted is renderOmissions for a managed plan's render: the users the
 	// config already leaves out by policy, each as "label (status)".
 	Omitted []string `json:"omitted,omitempty"`
+	// Batch names the operator action that filed this plan with others, the
+	// credential cutover (vpn_cutover.go). Empty for a plan filed alone.
+	Batch string `json:"batch,omitempty"`
 }
 
 // lineUserCredentialPayload is the exact JSON object passed to
@@ -242,6 +245,12 @@ func (s *Server) resolveLineUserTarget(lineHashID string) (Line, error) {
 // and the approval executor renders the sb invocation against the then-current
 // credential bytes.
 func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op string) ([]byte, error) {
+	return s.vpnUserLinePlanInBatch(ctxPrincipal, request, op, "")
+}
+
+// vpnUserLinePlanInBatch is vpnUserLinePlan for a plan filed as part of a
+// batch: the plan, its summary and its audit name the batch.
+func (s *Server) vpnUserLinePlanInBatch(ctxPrincipal principal, request []byte, op, batch string) ([]byte, error) {
 	if op != lineUserOpAdd && op != lineUserOpUpdate && op != lineUserOpRemove {
 		return nil, fmt.Errorf("vpn-core/users-admin: invalid line-user op %q", op)
 	}
@@ -372,14 +381,20 @@ func (s *Server) vpnUserLinePlan(ctxPrincipal principal, request []byte, op stri
 			summary += "; already left out by policy: " + omittedSummary(omitted)
 		}
 	}
+	extra := map[string]string{"quota_changed": strconv.FormatBool(quotaChanged)}
+	if batch != "" {
+		summary = batch + ": " + summary
+		extra["batch"] = batch
+	}
 	plan := lineUserPlan{
 		Op: op, Track: track, NodeID: ln.NodeID, Line: ln.Tag, LineHashID: ln.LineHashID, LineUUID: ln.LineUUID,
 		UserID: u.ID, UserName: name, Protocol: ln.Type, CredentialSHA256: sha,
 		ConfigSHA256: configSHA,
 		Summary:      summary,
 		Omitted:      omitted,
+		Batch:        batch,
 	}
-	return s.fileLineUserPlan(ctxPrincipal, plan, map[string]string{"quota_changed": strconv.FormatBool(quotaChanged)})
+	return s.fileLineUserPlan(ctxPrincipal, plan, extra)
 }
 
 // deletedUserLineRemovePlan answers plan_remove for a user that no longer
@@ -1456,15 +1471,20 @@ func newLineUserPassword() (string, error) {
 	return string(out), nil
 }
 
-// vpnUserRotateCredential regenerates ONE protocol credential for a user. The
-// new secret is returned exactly once in the response (`revealed_credential`);
-// the store keeps its write-only discipline and read RPCs keep returning
-// has_secret only. A rotation only changes server state — pushing it onto
-// lines is an explicit plan_add/plan_remove afterwards (drift is surfaced).
+// vpnUserRotateCredential regenerates ONE protocol credential for a user. A
+// rotation only changes server state; pushing it onto lines is an explicit
+// plan_update afterwards (drift is surfaced).
+//
+// The new secret is in the answer (`revealed_credential`) only when the
+// reveal gate admits the caller (secret_reveal.go): a session that sent a
+// fresh "step_up_grant", or a token carrying secrets:reveal. Otherwise the
+// rotation still happens and the answer says the credential was withheld;
+// the credential reveal hands it out later through the same gate.
 func (s *Server) vpnUserRotateCredential(ctxPrincipal principal, request []byte) ([]byte, error) {
 	var req struct {
-		UserID   string `json:"user_id"`
-		Protocol string `json:"protocol"`
+		UserID      string `json:"user_id"`
+		Protocol    string `json:"protocol"`
+		StepUpGrant string `json:"step_up_grant"`
 	}
 	if err := json.Unmarshal(request, &req); err != nil {
 		return nil, fmt.Errorf("vpn-core/users-admin rotate: invalid request: %w", err)
@@ -1516,16 +1536,30 @@ func (s *Server) vpnUserRotateCredential(ctxPrincipal principal, request []byte)
 	if err := s.putVpnUser(u); err != nil {
 		return nil, err
 	}
+	reveal := s.decideSecretReveal(ctxPrincipal, req.StepUpGrant)
 	s.recordPrincipalAudit(ctxPrincipal, model.AuditEvent{
 		ID: id.New("audit"), Action: "vpnuser.credential.rotate", Scope: "proxy:admin",
-		Metadata: map[string]string{"user_id": u.ID, "protocol": protocol},
+		Metadata: map[string]string{"user_id": u.ID, "protocol": protocol, "revealed": strconv.FormatBool(reveal.Allowed)},
 	})
-	return json.Marshal(struct {
+	out := struct {
 		User     vpnUserView `json:"user"`
 		Protocol string      `json:"protocol"`
-		// RevealedCredential is the new secret, returned once and never again.
-		RevealedCredential string `json:"revealed_credential"`
-	}{User: toVpnUserView(u), Protocol: protocol, RevealedCredential: revealed})
+		// RevealedCredential is the new secret, present only when the reveal
+		// gate admitted the caller.
+		RevealedCredential string `json:"revealed_credential,omitempty"`
+		// CredentialWithheld says the rotation happened and the secret was
+		// not revealed; RevealCode is the gate's reason.
+		CredentialWithheld bool   `json:"credential_withheld,omitempty"`
+		RevealCode         string `json:"reveal_code,omitempty"`
+	}{User: toVpnUserView(u), Protocol: protocol}
+	if reveal.Allowed {
+		out.RevealedCredential = revealed
+		s.recordSecretReveal(ctxPrincipal, reveal, model.AuditEvent{Action: "vpn.user.credentials.reveal", Scope: "proxy:admin",
+			Metadata: map[string]string{"user_id": u.ID, "protocol": protocol, "at": "rotate"}})
+	} else {
+		out.CredentialWithheld, out.RevealCode = true, reveal.Code
+	}
+	return json.Marshal(out)
 }
 
 // ── usage name reversal (design-15 §8) ───────────────────────────────────────

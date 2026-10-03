@@ -380,6 +380,20 @@ type Server struct {
 	// time. It exists so a client poll does not re-enter a plugin - and boot a
 	// JavaScript VM - on every fetch.
 	subscriptionCache *subscriptionCache
+	// identityLinkCache holds converted identity link documents, keyed by
+	// the identity's content digest (identity_link.go); identityConvert*
+	// run one convert per key and content version at a time;
+	// identityFetches remembers each
+	// identity link's last fetch since start. identityLinkConvert is a test
+	// seam; production leaves it nil and calls the Sub-Store plugin.
+	identityLinkCache      *subscriptionCache
+	identityConvertMu      sync.Mutex
+	identityConvertFlights map[identityConvertFlightKey]*shareRenderFlight
+	identityFetches        identityLinkFetches
+	identityLinkConvert    func(context.Context, []string, shareRenderVariant) (renderedSubscription, error)
+	// cutoverMu runs one credential cutover rotate at a time
+	// (vpn_cutover.go), so a repeated POST sees the plan the first left.
+	cutoverMu sync.Mutex
 	// subscriptionSnapshotPersist is a narrow persistence seam for exercising
 	// fail-closed last-good transitions. Production always falls back to Store.
 	subscriptionSnapshotPersist   func(model.SubscriptionSnapshot) (bool, error)
@@ -685,6 +699,7 @@ func New(opts Options) (*Server, error) {
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		identityLinkCache:     newSubscriptionCache(identityLinkCacheEntries, identityLinkCacheTTL),
 		shareFetchStats:       newShareFetchStats(),
 		shareFlushStop:        make(chan struct{}),
 		latencySyncStop:       make(chan struct{}),
@@ -1334,8 +1349,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/inbounds/delete", s.withAuth("", s.handleDeleteProxyInbound))
 	mux.HandleFunc("/api/proxy/users", s.withAuth("", s.handleProxyUsers))
 	mux.HandleFunc("/api/proxy/users/reveal-credentials", s.withAuth("", s.handleRevealVPNUserCredentials))
-	mux.HandleFunc("/api/proxy/users/rotate-sub-token", s.withAuth("", s.handleRotateProxyUserSubToken))
 	mux.HandleFunc("/api/proxy/users/delete", s.withAuth("", s.handleDeleteProxyUser))
+	mux.HandleFunc("/api/vpn/users/", s.withAuth("", s.handleVpnUserLink))
+	mux.HandleFunc("/api/vpn/cutover", s.withAuth("", s.handleVpnCutover))
+	mux.HandleFunc("/api/vpn/cutover/", s.withAuth("", s.handleVpnCutover))
 	mux.HandleFunc("/api/proxy/usage", s.withAuth("", s.handleProxyUsage))
 	mux.HandleFunc("/api/proxy/profiles", s.withAuth("", s.handleProxyProfiles))
 	mux.HandleFunc("/api/proxy/profiles/delete", s.withAuth("", s.handleDeleteProxyProfile))
@@ -4414,10 +4431,11 @@ func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, 
 	if !s.requireAllNodeScopes(w, p, "task:read", task.Targets) {
 		return
 	}
-	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "task.script.reveal") {
+	reveal, ok := s.requireSecretReveal(w, p, req.StepUpGrant, model.AuditEvent{Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
+	if !ok {
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
+	s.recordSecretReveal(p, reveal, model.AuditEvent{ID: id.New("audit"), Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                true,
 		"id":                task.ID,
@@ -6403,6 +6421,8 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 			Name            string   `json:"name"`
 			Scopes          []string `json:"scopes"`
 			ServerAllowlist []string `json:"server_allowlist"`
+			// StepUpGrant is required only to grant secrets:reveal.
+			StepUpGrant string `json:"step_up_grant"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -6413,15 +6433,25 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 		}
 		// Privilege containment: a caller may only mint a token whose scopes are
 		// a subset of its own, so token creation cannot be used to escalate.
+		// secrets:reveal is the exception with its own door
+		// (requireSecretRevealGrantAuthority): nobody holds it by delegation.
+		grantsReveal := false
 		for _, scope := range req.Scopes {
 			if !rbac.ValidScope(scope) {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("unknown scope %q", scope))
 				return
 			}
+			if rbac.ExplicitOnly(scope) {
+				grantsReveal = true
+				continue
+			}
 			if !rbac.CanDelegateScope(p.Principal, scope) {
 				writeError(w, http.StatusForbidden, fmt.Errorf("cannot grant scope %q beyond your own", scope))
 				return
 			}
+		}
+		if grantsReveal && !s.requireSecretRevealGrantAuthority(w, p, req.StepUpGrant) {
+			return
 		}
 		if !serverAllowlistSubset(p.ServerAllowlist, req.ServerAllowlist) {
 			writeError(w, http.StatusForbidden, errors.New("cannot grant server allowlist beyond your own"))
@@ -6450,7 +6480,13 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request, p principa
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.create", Scope: "token:admin", Metadata: map[string]string{"token_id": tok.ID}})
+		createMeta := map[string]string{"token_id": tok.ID}
+		if grantsReveal {
+			// The one grant that lets a token read secrets is named in the
+			// trail where it was made, not only in the token's scope list.
+			createMeta["grants_secret_reveal"] = "true"
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "token.create", Scope: "token:admin", Metadata: createMeta})
 		// The credential is returned exactly once, in "<id>.<secret>" form.
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":    tok.ID,

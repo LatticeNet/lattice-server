@@ -114,7 +114,7 @@ func getDiscovered(t *testing.T, srv *Server, p principal) string {
 	return rec.Body.String()
 }
 
-func TestProxyDiscoveredRedactsShareURLsBelowProxyAdmin(t *testing.T) {
+func TestProxyDiscoveredRedactsShareURLsForEveryCaller(t *testing.T) {
 	srv := discoveredFixture(t)
 	secrets := forkShareURLs()
 
@@ -134,8 +134,11 @@ func TestProxyDiscoveredRedactsShareURLsBelowProxyAdmin(t *testing.T) {
 		}
 		return out
 	}
-	for _, scopes := range [][]string{{"proxy:read"}, {"vpncore:read"}} {
-		body := getDiscovered(t, srv, principal{Principal: rbac.Principal{ActorID: "reader", Scopes: scopes}})
+	// A list is not a reveal: readers and administrators alike get every
+	// line with the marker in place of its credential. The whole link comes
+	// from reveal-line through the reveal gate.
+	for _, scopes := range [][]string{{"proxy:read"}, {"vpncore:read"}, {"proxy:read", "proxy:admin"}, {"vpncore:read", "vpncore:admin"}, {"*"}} {
+		body := getDiscovered(t, srv, principal{Principal: rbac.Principal{ActorID: "caller", Scopes: scopes}})
 		urls := shareURLs(t, body)
 		if len(urls) != len(secrets)+1 {
 			t.Fatalf("%v: want every line listed, got %d share URLs", scopes, len(urls))
@@ -155,39 +158,13 @@ func TestProxyDiscoveredRedactsShareURLsBelowProxyAdmin(t *testing.T) {
 		}
 	}
 
-	// Admin callers receive what they always did, byte for byte.
-	for _, scopes := range [][]string{{"proxy:read", "proxy:admin"}, {"vpncore:read", "vpncore:admin"}, {"*"}} {
-		body := getDiscovered(t, srv, principal{Principal: rbac.Principal{ActorID: "admin", Scopes: scopes}})
-		var decoded struct {
-			Inventories []model.SingBoxInventory `json:"inventories"`
+	// The allowlist still bounds the list: a caller confined to node-b sees
+	// node-b's line, redacted, and nothing of node-a.
+	for _, scopes := range [][]string{{"proxy:read", "proxy:admin"}, {"proxy:read"}} {
+		urls := shareURLs(t, getDiscovered(t, srv, principal{Principal: rbac.Principal{ActorID: "confined", Scopes: scopes, ServerAllowlist: []string{"node-b"}}}))
+		if len(urls) != 1 || urls[0] != "vless://"+vpnCoreRedactedCredential+"@198.51.100.9:443?security=reality#b" {
+			t.Fatalf("%v: a node-confined caller must get its node's link redacted: %v", scopes, urls)
 		}
-		if err := json.Unmarshal([]byte(body), &decoded); err != nil {
-			t.Fatal(err)
-		}
-		seen := 0
-		for _, inv := range decoded.Inventories {
-			for _, n := range inv.Nodes {
-				if _, ok := secrets[n.ShareURL]; ok || strings.HasPrefix(n.ShareURL, "vless://"+readScopeVLESSUUID+"@198.51.100.9") {
-					seen++
-				}
-			}
-		}
-		if seen != len(secrets)+1 {
-			t.Fatalf("%v: an admin must get every share_url unchanged, %d of %d matched:\n%s", scopes, seen, len(secrets)+1, body)
-		}
-	}
-
-	// An admin confined to node-b sees node-b's link whole and nothing of
-	// node-a: the allowlist bounds the read before the admin check runs.
-	confined := principal{Principal: rbac.Principal{ActorID: "confined", Scopes: []string{"proxy:read", "proxy:admin"}, ServerAllowlist: []string{"node-b"}}}
-	urls := shareURLs(t, getDiscovered(t, srv, confined))
-	if len(urls) != 1 || !strings.HasPrefix(urls[0], "vless://"+readScopeVLESSUUID+"@198.51.100.9") {
-		t.Fatalf("a node-confined admin sees only its own node, whole: %v", urls)
-	}
-	// A reader confined to node-b gets node-b's link redacted.
-	urls = shareURLs(t, getDiscovered(t, srv, principal{Principal: rbac.Principal{ActorID: "confined-reader", Scopes: []string{"proxy:read"}, ServerAllowlist: []string{"node-b"}}}))
-	if len(urls) != 1 || urls[0] != "vless://"+vpnCoreRedactedCredential+"@198.51.100.9:443?security=reality#b" {
-		t.Fatalf("a node-confined reader must get its node's link redacted: %v", urls)
 	}
 }
 
@@ -214,23 +191,34 @@ func TestComposedEntriesAreRedactedForADirectReadScopedCall(t *testing.T) {
 			principal{Principal: rbac.Principal{ActorID: "op", Scopes: scopes, ServerAllowlist: allowlist}})
 		return context.WithValue(ctx, operatorCoreCallKey{}, vpnCoreSubscriptionSourcesService)
 	}
+	directToken := func(scopes []string) context.Context {
+		ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{},
+			principal{Principal: rbac.Principal{ActorID: "agent", TokenID: "token_x", Scopes: scopes}, viaBearer: true})
+		return context.WithValue(ctx, operatorCoreCallKey{}, vpnCoreSubscriptionSourcesService)
+	}
+	srv := newLinemetaTestServer(t, mustOpenStore(t))
 	nested := context.WithValue(context.WithValue(context.Background(), pluginOperatorPrincipalKey{},
 		principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"substore:read"}}}), operatorCoreCallKey{}, "latticenet.sub-store/subscription")
 	for name, tc := range map[string]struct {
 		ctx  context.Context
 		want bool
 	}{
-		"subscription serving, no operator":            {context.Background(), true},
-		"a plugin's rpc:call under a read operator":    {context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, principal{Principal: rbac.Principal{Scopes: []string{"substore:read"}}}), true},
-		"a core service the operator called composes":  {nested, true},
-		"direct call at vpncore:read":                  {direct([]string{"vpncore:read"}), false},
-		"direct call at proxy:read":                    {direct([]string{"proxy:read"}), false},
-		"direct call at vpncore:admin":                 {direct([]string{"vpncore:admin"}), true},
-		"direct call at proxy:admin":                   {direct([]string{"proxy:admin"}), true},
-		"direct call at vpncore:admin, node-confined":  {direct([]string{"vpncore:admin"}, "node-a"), false},
-		"direct call that lost its operator principal": {context.WithValue(context.Background(), operatorCoreCallKey{}, vpnCoreSubscriptionSourcesService), false},
+		"subscription serving, no operator":           {context.Background(), true},
+		"a plugin's rpc:call under a read operator":   {context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, principal{Principal: rbac.Principal{Scopes: []string{"substore:read"}}}), true},
+		"a core service the operator called composes": {nested, true},
+		"direct call at vpncore:read":                 {direct([]string{"vpncore:read"}), false},
+		"direct call at proxy:read":                   {direct([]string{"proxy:read"}), false},
+		// A direct call is a reveal: vpncore:admin alone no longer carries
+		// credentials, and a session has no grant to send here.
+		"direct session call at vpncore:admin":                  {direct([]string{"vpncore:admin"}), false},
+		"direct session call at proxy:admin":                    {direct([]string{"proxy:admin"}), false},
+		"direct token call at vpncore:admin":                    {directToken([]string{"vpncore:admin"}), false},
+		"direct token call at vpncore:admin and secrets:reveal": {directToken([]string{"vpncore:admin", rbac.SecretRevealScope}), true},
+		"direct token call at secrets:reveal, no vpncore:admin": {directToken([]string{"vpncore:read", rbac.SecretRevealScope}), false},
+		"direct call at vpncore:admin, node-confined":           {direct([]string{"vpncore:admin"}, "node-a"), false},
+		"direct call that lost its operator principal":          {context.WithValue(context.Background(), operatorCoreCallKey{}, vpnCoreSubscriptionSourcesService), false},
 	} {
-		if got := vpnCoreComposeCredentialsAllowed(tc.ctx); got != tc.want {
+		if got := srv.vpnCoreComposeCredentialsAllowed(tc.ctx); got != tc.want {
 			t.Fatalf("%s: credentials allowed = %v, want %v", name, got, tc.want)
 		}
 	}
@@ -335,13 +323,14 @@ func TestComposeThroughThePluginGatewayRedactsOnlyAReadScopedOperatorsDirectCall
 	}})
 	payload := fmt.Sprintf(`{"schema_version":1,"identity_id":%q,"entry_roots":[%q]}`, user.ID, rootUUID)
 
-	call := func(t *testing.T, pluginID, service string, scopes ...string) (graphSubscriptionResponse, string) {
+	callAs := func(t *testing.T, p principal, pluginID, service string) (graphSubscriptionResponse, string) {
 		t.Helper()
+		scopes := p.Scopes
 		body := fmt.Sprintf(`{"id":%q,"service":%q,"method":"compose","payload":%s}`, pluginID, service, payload)
 		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
-		srv.handlePluginCall(rec, req, principal{Principal: rbac.Principal{ActorID: "op", Scopes: scopes}})
+		srv.handlePluginCall(rec, req, p)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("%v: compose %d %s", scopes, rec.Code, rec.Body.String())
 		}
@@ -351,12 +340,19 @@ func TestComposeThroughThePluginGatewayRedactsOnlyAReadScopedOperatorsDirectCall
 		}
 		return decoded, rec.Body.String()
 	}
-
-	admin, adminWire := call(t, vpnCorePluginID, vpnCoreSubscriptionSourcesService, "vpncore:read", "vpncore:admin")
-	if !strings.Contains(admin.Entries[0], credential+"@") || !strings.Contains(adminWire, credential) {
-		t.Fatalf("an admin's direct compose must carry the identity credential: %s", adminWire)
+	call := func(t *testing.T, pluginID, service string, scopes ...string) (graphSubscriptionResponse, string) {
+		t.Helper()
+		return callAs(t, principal{Principal: rbac.Principal{ActorID: "op", Scopes: scopes}}, pluginID, service)
 	}
-	for _, scopes := range [][]string{{"proxy:read"}, {"vpncore:read"}} {
+
+	// A direct compose is a reveal: an admin token carrying secrets:reveal
+	// gets the credential, an admin without the grant gets the marker.
+	admin, adminWire := callAs(t, principal{Principal: rbac.Principal{ActorID: "agent", TokenID: "token_reveal",
+		Scopes: []string{"vpncore:read", "vpncore:admin", rbac.SecretRevealScope}}, viaBearer: true}, vpnCorePluginID, vpnCoreSubscriptionSourcesService)
+	if !strings.Contains(admin.Entries[0], credential+"@") || !strings.Contains(adminWire, credential) {
+		t.Fatalf("an admin token's direct compose with secrets:reveal must carry the identity credential: %s", adminWire)
+	}
+	for _, scopes := range [][]string{{"proxy:read"}, {"vpncore:read"}, {"vpncore:read", "vpncore:admin"}} {
 		reader, wire := call(t, vpnCorePluginID, vpnCoreSubscriptionSourcesService, scopes...)
 		if strings.Contains(wire, credential) || !strings.HasPrefix(reader.Entries[0], "vless://"+vpnCoreRedactedCredential+"@") {
 			t.Fatalf("%v: a read-scoped direct compose leaked the identity credential: %s", scopes, wire)

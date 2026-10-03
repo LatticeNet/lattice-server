@@ -544,7 +544,9 @@ func (s *Server) handleRevealSingBoxLine(w http.ResponseWriter, r *http.Request,
 	if !s.requireNodeScope(w, p, "proxy:admin", req.NodeID) {
 		return
 	}
-	if !s.requireStepUpGrant(w, p, strings.TrimSpace(req.StepUpGrant), "singbox.line.reveal") {
+	reveal, ok := s.requireSecretReveal(w, p, req.StepUpGrant, model.AuditEvent{NodeID: req.NodeID, Action: "singbox.line.reveal", Scope: "proxy:admin",
+		Metadata: map[string]string{"line_hash_id": req.LineHashID}})
+	if !ok {
 		return
 	}
 	line, ok := s.findLine(req.NodeID, req.LineHashID)
@@ -557,7 +559,7 @@ func (s *Server) handleRevealSingBoxLine(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, errors.New("line is not present in the latest sing-box inventory"))
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.line.reveal", Scope: "proxy:admin", Metadata: map[string]string{"line_hash_id": line.LineHashID}})
+	s.recordSecretReveal(p, reveal, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "singbox.line.reveal", Scope: "proxy:admin", Metadata: map[string]string{"line_hash_id": line.LineHashID}})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "line_hash_id": line.LineHashID, "share_url": node.ShareURL, "node": node})
 }
 

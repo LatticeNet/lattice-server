@@ -381,11 +381,11 @@ func exerciseE5GraphAtConvergence(t *testing.T, srv *Server, handler http.Handle
 		t.Fatalf("create E5 share through HTTP: status=%d body_len=%d", createResponse.StatusCode, len(createRaw))
 	}
 	var created shareView
-	if err := json.Unmarshal(createRaw, &created); err != nil || created.ID == "" || created.Token == "" {
-		t.Fatalf("decode created E5 share: err=%v body_len=%d", err, len(createRaw))
+	if err := json.Unmarshal(createRaw, &created); err != nil || created.ID == "" || created.Token != "" {
+		t.Fatalf("decode created E5 share (the answer carries no token): err=%v body_len=%d", err, len(createRaw))
 	}
 	storedShare, ok := srv.store.SubscriptionShare(created.ID)
-	if !ok || storedShare.Token != created.Token {
+	if !ok || storedShare.Token == "" {
 		t.Fatal("HTTP-created E5 share missing from durable store")
 	}
 	request, err := http.NewRequest(http.MethodGet, httpServer.URL+"/sub/"+storedShare.Slug+"/"+storedShare.Token+"?format=plain", nil)

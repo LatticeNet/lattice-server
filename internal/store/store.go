@@ -95,6 +95,9 @@ type State struct {
 	// not carry yet (notify_rule_options.go), keyed by rule id. Operator
 	// configuration written only on a rule edit, so the JSON state is its home.
 	NotifyRuleOptions map[string]NotifyRuleOptions `json:"notify_rule_options,omitempty"`
+	// LatencyProbes is the operator's latency probe configuration
+	// (latency_probes.go), nil until one is saved. Written only on an edit.
+	LatencyProbes *model.LatencyProbeConfig `json:"latency_probes,omitempty"`
 	// NotifyWebhooks are operator-authored inbound entry points (notify_webhook.go).
 	// They hold a PBKDF2 secret hash, not a reversible secret, so unlike
 	// NotifyChannels they need no pass in crypto.go.

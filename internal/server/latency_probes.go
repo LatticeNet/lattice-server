@@ -291,15 +291,16 @@ func latencyEndpoints(node model.Node, inv model.SingBoxInventory, refused map[i
 	}
 }
 
-// latencyRefusedPorts is step 3 of the port rule for one node.
-func (s *Server) latencyRefusedPorts(nodeID string) map[int]bool {
+// latencyRefusedPorts is step 3 of the port rule for one node. approvals is
+// the approval list, read once per plan.
+func (s *Server) latencyRefusedPorts(nodeID string, approvals []model.Approval) map[int]bool {
 	refused := map[int]bool{22: true}
 	if reality := s.guardRealityForLint(nodeID); reality != nil && reality.SSHD != nil {
 		for _, port := range reality.SSHD.Ports {
 			refused[port] = true
 		}
 	}
-	knock := s.sshGuardKnockStateFor(nodeID)
+	knock := s.sshGuardKnockStateIn(nodeID, approvals)
 	if knock.SSHPort > 0 {
 		refused[knock.SSHPort] = true
 	}
@@ -392,6 +393,7 @@ func (s *Server) planLatencyProbes(now time.Time) latencyPlan {
 	for _, inv := range s.liveSingBoxInventories(now) {
 		inventories[inv.NodeID] = inv
 	}
+	approvals := s.store.Approvals()
 	interval := cfg.IntervalSec
 	if interval <= 0 {
 		interval = model.LatencyProbeDefaultIntervalSec
@@ -442,7 +444,7 @@ func (s *Server) planLatencyProbes(now time.Time) latencyPlan {
 		}
 
 		var chosen *latencyEndpoint
-		refused := s.latencyRefusedPorts(n.ID)
+		refused := s.latencyRefusedPorts(n.ID, approvals)
 		inv, live := inventories[n.ID]
 		if live && (inv.Status == "" || inv.Status == "ok") {
 			endpoints, note := latencyEndpoints(n, inv, refused)

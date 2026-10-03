@@ -30,7 +30,11 @@ const maxSessions = 4096
 const maxTaskResults = 2000
 
 // metricsPersistenceInterval keeps hot heartbeat telemetry fresh in memory
-// without rewriting the full encrypted JSON store on every agent poll.
+// without rewriting the full encrypted JSON store on every agent poll. It
+// bounds how stale a node's heartbeat (last seen and metrics) may get on
+// disk. Every write carries every node's heartbeat, so the clock restarts
+// for the whole fleet on any write: a quiet fleet is written once per
+// interval, not once per node per interval.
 const metricsPersistenceInterval = 5 * time.Minute
 
 // monitorResultPersistenceInterval keeps monitor history live in memory while
@@ -280,6 +284,12 @@ type Store struct {
 	// Guarded by mu.
 	livenessOnDisk     map[string]time.Time
 	guardRealityOnDisk map[string]time.Time
+	// metricsPersistedAt above is each node's LastSeen as the state file holds
+	// it, seeded at open and refreshed from every committed JSON write.
+	// nodeClocksUnflushed is set when a heartbeat changed a node in memory
+	// without a write, cleared by the next committed write, and written by
+	// Close. Guarded by mu.
+	nodeClocksUnflushed bool
 	// closed is set by the first Close. A later Close does nothing: the bolt
 	// sidecar is gone by then, so a write would put its domains in the JSON
 	// file. Guarded by mu.
@@ -1136,10 +1146,18 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 }
 
 // noteReportClocksOnDisk records what a committed write put on disk for the
-// clock-throttled report domains. Every JSON write carries the whole in-memory
-// copy of both, so a write made for any reason also flushes their clocks and
-// restarts reportClockPersistInterval for every node.
+// clock-throttled report domains: node heartbeats, sing-box liveness and guard
+// reality. Every JSON write carries the whole in-memory copy of all three, so
+// a write made for any reason also flushes their clocks and restarts
+// metricsPersistenceInterval and reportClockPersistInterval for every node.
 func (s *Store) noteReportClocksOnDisk(st State) {
+	s.metricsPersistedAt = make(map[string]time.Time, len(st.Nodes))
+	for nodeID, n := range st.Nodes {
+		if !n.LastSeen.IsZero() {
+			s.metricsPersistedAt[nodeID] = n.LastSeen
+		}
+	}
+	s.nodeClocksUnflushed = false
 	s.livenessOnDisk = make(map[string]time.Time, len(st.SingBoxLiveness))
 	for nodeID, rec := range st.SingBoxLiveness {
 		s.livenessOnDisk[nodeID] = rec.ReceivedAt
@@ -1690,14 +1708,18 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 			return true, err
 		}
 	}
+	// lastPersisted is this node's LastSeen as the last committed write of
+	// any kind left it on disk, not the time of this node's own last write:
+	// keyed per node but restarted fleet-wide (noteReportClocksOnDisk), so
+	// 34 nodes beating every ten seconds force one write per interval, not 34.
 	lastPersisted, persisted := s.metricsPersistedAt[nodeID]
 	if persisted && !durableChanged && now.Sub(lastPersisted) < metricsPersistenceInterval {
+		s.nodeClocksUnflushed = true
 		return false, nil
 	}
 	if err := s.Save(); err != nil {
 		return cameOnline, err
 	}
-	s.metricsPersistedAt[nodeID] = now
 	return cameOnline, nil
 }
 
@@ -3107,10 +3129,11 @@ func (s *Store) Close() error {
 	}
 	s.closed = true
 	var closeErr error
-	// Reports that only moved their clocks wait in memory for the next write.
-	// A clean shutdown writes them, so a restart resumes from the newest
-	// report rather than from one up to reportClockPersistInterval old.
-	if s.reportClocksUnflushedLocked() {
+	// Reports and heartbeats that only moved their clocks wait in memory for
+	// the next write. A clean shutdown writes them, so a restart resumes from
+	// the newest report rather than from one up to reportClockPersistInterval
+	// old.
+	if s.nodeClocksUnflushed || s.reportClocksUnflushedLocked() {
 		closeErr = s.Save()
 	}
 	if s.wal != nil {

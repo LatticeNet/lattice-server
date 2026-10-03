@@ -107,7 +107,6 @@ const (
 	identityLineTemplateUnusable  = "template_unusable"
 	identityLineServiceDown       = "service_down"
 
-	identityFixPlanAdd        = "plan_add"
 	identityFixPlanUpdate     = "plan_update"
 	identityFixWaitDiscovery  = "wait_for_discovery"
 	identityFixWaitTemplate   = "wait_for_template"
@@ -250,7 +249,13 @@ func (s *Server) identityLinkContent(u VpnUser) identityLinkContent {
 			exclude(identityLineCredentialUnknown, identityFixWaitAllocation, "")
 			continue
 		default:
-			exclude(identityLineNotApplied, identityFixPlanAdd, "")
+			// The binding exists and is enabled, so plan_add refuses it
+			// ("already bound ... plan_update instead", lineusers.go), and
+			// plan_update is the plan that puts the credential on the node:
+			// on an adopted line both run `sb user add`, which adds the
+			// entry or replaces it, whether or not the node already holds
+			// the user name.
+			exclude(identityLineNotApplied, identityFixPlanUpdate, "")
 			continue
 		}
 		name := userLineName(u.ID, ln.LineUUID)

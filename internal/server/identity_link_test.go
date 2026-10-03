@@ -345,6 +345,23 @@ func TestIdentityLinkLeavesOutLinesWithoutTheCurrentCredential(t *testing.T) {
 	if !reasons[identityLineNotApplied] || status.Answer != identityAnswerDecoy || status.AnswerReason != identityReasonTransientEmpty {
 		t.Fatalf("a bind-only line must be out and nothing left must answer the decoy: %+v", status)
 	}
+	// The fix it names is one the line-user path accepts for a bound
+	// identity: plan_add refuses a bound user, plan_update files.
+	for _, line := range status.Excluded {
+		if line.Reason != identityLineNotApplied {
+			continue
+		}
+		if line.Fix != identityFixPlanUpdate {
+			t.Fatalf("a never-applied bound line must name plan_update, got %q", line.Fix)
+		}
+		request, _ := json.Marshal(map[string]string{"user_id": u.ID, "line_hash_id": line.LineHashID})
+		if _, err := f.srv.vpnUserLinePlan(f.admin, request, lineUserOpAdd); err == nil || !strings.Contains(err.Error(), "plan_update instead") {
+			t.Fatalf("plan_add must refuse a bound line: %v", err)
+		}
+		if _, err := f.srv.vpnUserLinePlan(f.admin, request, lineUserOpUpdate); err != nil {
+			t.Fatalf("the named fix must file: %v", err)
+		}
+	}
 }
 
 // Leak table rows 7 and 8, and rotation: a rotated or revoked token, and a

@@ -159,13 +159,13 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		switch {
 		case req.PublishesFleetCredentials:
 		case verdict.Fleet:
-			writeError(w, http.StatusBadRequest, apiErrorf(apiErrorFleetFeedFlagRequired,
+			writeFleetFeedRefusal(w, verdict, fmt.Sprintf(
 				"subscription %s publishes every user's credentials: it reads the vpn-core fleet export with no identity (through %q). "+
 					"Give each person their identity's own link instead; to publish the fleet feed anyway, send publishes_fleet_credentials: true",
 				req.Source.SubscriptionID, verdict.Via))
 			return
 		case verdict.Unknown:
-			writeError(w, http.StatusBadRequest, apiErrorf(apiErrorFleetFeedFlagRequired,
+			writeFleetFeedRefusal(w, verdict, fmt.Sprintf(
 				"cannot check whether subscription %s publishes every user's credentials: Sub-Store's record list is over %d bytes or does not parse. "+
 					"To share it anyway, send publishes_fleet_credentials: true",
 				req.Source.SubscriptionID, usageMaxSubStoreRecordsLen))

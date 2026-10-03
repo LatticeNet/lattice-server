@@ -2,9 +2,11 @@ package server
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
 )
 
 // The fleet-feed guard (identity-sub P10, server half).
@@ -174,6 +176,23 @@ func (index subStoreFleetIndex) verdict(subscriptionID string) fleetFeedVerdict 
 	}
 	fleet, via := walk(subscriptionID, 0)
 	return fleetFeedVerdict{Fleet: fleet, Via: via}
+}
+
+// writeFleetFeedRefusal answers 400 fleet_feed_flag_required with the
+// verdict beside the error ("fleet_feed": "fleet" or "unknown", and "via",
+// the record that reads the export), so the console can word the two cases
+// without parsing the sentence.
+func writeFleetFeedRefusal(w http.ResponseWriter, verdict fleetFeedVerdict, message string) {
+	requestID := w.Header().Get(requestIDHeader)
+	if requestID == "" {
+		requestID = id.New("req")
+		w.Header().Set(requestIDHeader, requestID)
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{
+		"error":      model.APIError{Code: apiErrorFleetFeedFlagRequired, Message: message, RequestID: requestID},
+		"fleet_feed": verdict.now(),
+		"via":        verdict.Via,
+	})
 }
 
 // isSubStoreShare reports a share whose source is a Sub-Store record.

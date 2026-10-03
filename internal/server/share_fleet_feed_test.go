@@ -42,7 +42,8 @@ func TestSharingTheVPNCoreFleetFeedNeedsAnExplicitFlag(t *testing.T) {
 	}
 	for _, record := range []string{"fleet", "combo-member", "combo-tag", "clash-file"} {
 		status, body := create("s-"+record, record, false)
-		if status != http.StatusBadRequest || apiErrorCodeOf(t, []byte(body)) != apiErrorFleetFeedFlagRequired || !strings.Contains(body, "Everyone") {
+		if status != http.StatusBadRequest || apiErrorCodeOf(t, []byte(body)) != apiErrorFleetFeedFlagRequired || !strings.Contains(body, "Everyone") ||
+			!strings.Contains(body, `"fleet_feed":"fleet"`) || !strings.Contains(body, `"via":"Everyone"`) {
 			t.Fatalf("%s: a fleet feed share without the flag must be refused naming the feed, got %d %s", record, status, body)
 		}
 	}
@@ -138,7 +139,8 @@ func TestFleetFeedGuardFailsClosedAndRechecksOnRead(t *testing.T) {
 	// A record list that does not parse checks nothing, so it needs the flag.
 	putRecords(`{"records":[`)
 	status, body := create("s-unknown", "provider", false)
-	if status != http.StatusBadRequest || apiErrorCodeOf(t, []byte(body)) != apiErrorFleetFeedFlagRequired || !strings.Contains(body, "cannot check") {
+	if status != http.StatusBadRequest || apiErrorCodeOf(t, []byte(body)) != apiErrorFleetFeedFlagRequired || !strings.Contains(body, "cannot check") ||
+		!strings.Contains(body, `"fleet_feed":"unknown"`) {
 		t.Fatalf("an unreadable record list must need the flag: %d %s", status, body)
 	}
 	if status, body = create("s-unknown", "provider", true); status != http.StatusCreated || !strings.Contains(body, `"publishes_fleet_credentials":true`) {

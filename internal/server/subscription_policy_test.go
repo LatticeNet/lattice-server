@@ -192,14 +192,25 @@ func TestIdentityWritesDropCachedCoreShares(t *testing.T) {
 		_, ok := srv.subscriptionCache.GetSnapshot(subscriptionCacheKey{ShareID: id, Format: "base64"}, srv.now())
 		return ok
 	}
+	kept := func(id string) bool {
+		_, ok := srv.subscriptionCache.GetStale(subscriptionCacheKey{ShareID: id, Format: "base64"})
+		return ok
+	}
 	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, principal{Principal: rbac.Principal{ActorID: "op-1"}})
 	warm()
 	raw, err := srv.vpnCoreUsersAdminRPC(ctx, "create", mustJSON(t, map[string]any{"email": "eve@example.com"}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cached("core") || !cached("plugin") {
-		t.Fatalf("an identity write must drop core shares and only those: core=%v plugin=%v", cached("core"), cached("plugin"))
+	// The core share's body is dropped outright. A plugin share's body is
+	// expired but kept: a vpn-core write advances the link generation
+	// (share_fleet_changes.go), so the next fetch revalidates the plugin
+	// source and extends the kept body when its content did not move.
+	if cached("core") || kept("core") {
+		t.Fatalf("an identity write must drop core shares: fresh=%v kept=%v", cached("core"), kept("core"))
+	}
+	if cached("plugin") || !kept("plugin") {
+		t.Fatalf("an identity write must expire, not drop, plugin shares: fresh=%v kept=%v", cached("plugin"), kept("plugin"))
 	}
 	warm()
 	if _, err := srv.vpnCoreUsersAdminRPC(ctx, "update", mustJSON(t, map[string]any{"id": decodeCreatedUserID(t, raw), "email": "eve@example.com", "comment": "x"})); err != nil {

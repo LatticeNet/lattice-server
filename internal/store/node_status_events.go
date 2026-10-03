@@ -171,9 +171,10 @@ func (s *Store) PruneNodeStatusEvents(before time.Time) (int, error) {
 
 // RecordServerStart writes the control plane's own transition pair. The
 // previous process left no stop mark, so its last known instant is the newest
-// heartbeat or transition it persisted. LastSeen is persisted at most every
-// five minutes per node, so on a fleet of one that instant can trail the real
-// stop by up to that much; the error only widens the unknown gap.
+// heartbeat or transition it persisted. A clean Close writes every heartbeat,
+// so after one this is the stop. After a crash the fleet's heartbeats are as
+// the last write left them, and the instant can trail the real stop by up to
+// NodeLastSeenDiskLag; the error only widens the unknown gap.
 func (s *Store) RecordServerStart(now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

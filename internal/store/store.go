@@ -30,8 +30,25 @@ const maxSessions = 4096
 const maxTaskResults = 2000
 
 // metricsPersistenceInterval keeps hot heartbeat telemetry fresh in memory
-// without rewriting the full encrypted JSON store on every agent poll.
+// without rewriting the full encrypted JSON store on every agent poll. It
+// bounds how stale a node's heartbeat (last seen, metrics, the token's last
+// use) may get on disk. Every write carries every node's heartbeat, so the
+// clock restarts for the whole fleet on any write: a quiet fleet is written
+// once per interval, not once per node per interval.
 const metricsPersistenceInterval = 5 * time.Minute
+
+// NodeLastSeenDiskLag is how far a node's LastSeen, as loaded from the state
+// file, may trail the node's real last heartbeat. A clean Close writes every
+// heartbeat, but a crash leaves the fleet's heartbeats as the last write had
+// them, up to metricsPersistenceInterval (and a beat) old, and the file does
+// not say which way the last process ended. Until a node beats again, its
+// LastSeen is a lower bound by this much; NodeLastSeenSlack says when.
+const NodeLastSeenDiskLag = metricsPersistenceInterval
+
+// tokenUseRidesWithin is how recent a node's heartbeat must be for a token
+// use to wait for the next state write instead of writing at once. Within
+// it the node is beating, and its own beats force that write.
+const tokenUseRidesWithin = time.Minute
 
 // monitorResultPersistenceInterval keeps monitor history live in memory while
 // avoiding a full snapshot rewrite for every unchanged probe cycle. It applies
@@ -280,6 +297,19 @@ type Store struct {
 	// Guarded by mu.
 	livenessOnDisk     map[string]time.Time
 	guardRealityOnDisk map[string]time.Time
+	// metricsPersistedAt above is each node's LastSeen as the state file holds
+	// it, seeded at open and refreshed from every committed JSON write.
+	// nodeClocksUnflushed is set when a heartbeat or a token use changed a
+	// node in memory without a write, cleared by the next committed write, and
+	// written by Close. Guarded by mu.
+	nodeClocksUnflushed bool
+	// loadedLastSeen is each node's LastSeen as Open read it from the state
+	// file. While a node's LastSeen still equals it, the node has not beaten
+	// in this process and the value is a lower bound (NodeLastSeenDiskLag).
+	// Written only by Open. Guarded by mu.
+	loadedLastSeen map[string]time.Time
+	// testNow is the heartbeat clock in tests; nil means time.Now.
+	testNow func() time.Time
 	// closed is set by the first Close. A later Close does nothing: the bolt
 	// sidecar is gone by then, so a write would put its domains in the JSON
 	// file. Guarded by mu.
@@ -480,8 +510,56 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	s.seedMetricsPersistence()
 	s.seedMonitorResultPersistence()
 	s.noteReportClocksOnDisk(s.state)
+	s.loadedLastSeen = make(map[string]time.Time, len(s.state.Nodes))
+	for nodeID, n := range s.state.Nodes {
+		if !n.LastSeen.IsZero() {
+			s.loadedLastSeen[nodeID] = n.LastSeen
+		}
+	}
 	s.confirmParentDirDurability()
 	return s, nil
+}
+
+// lastSeenSlackLocked is NodeLastSeenDiskLag while the node's LastSeen is the
+// one Open loaded and the node has not beaten since, and zero once this
+// process has seen it beat. Requires mu.
+//
+// yagni: the slack also applies after a clean Close, whose final write left
+// every LastSeen exact. For a node that died in the few minutes before a
+// restart, the Online flag, the node.offline audit row, the status history
+// edge and the console status word move up to NodeLastSeenDiskLag late. The
+// page does not move with the default 10 minute delay: the node is marked
+// offline by 90 s plus the slack after its LastSeen, which is before start
+// plus the delay. Only a node whose offline-alert-after tag sets a delay
+// under that 6 min 30 s (the tag allows 2m and up) can page late, by at most
+// 6 min 30 s less its delay. A clean-close marker in the state file, cleared
+// by the first write after open, is the upgrade if that starts to matter.
+func (s *Store) lastSeenSlackLocked(n model.Node) time.Duration {
+	if loaded, ok := s.loadedLastSeen[n.ID]; ok && n.LastSeen.Equal(loaded) {
+		return NodeLastSeenDiskLag
+	}
+	return 0
+}
+
+// NodeLastSeenSlack reports how far the node's LastSeen may trail its real
+// last heartbeat: NodeLastSeenDiskLag until the node beats in this process
+// after a restart, zero after.
+func (s *Store) NodeLastSeenSlack(nodeID string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return 0
+	}
+	return s.lastSeenSlackLocked(n)
+}
+
+// heartbeatNow is the clock heartbeats are stamped and judged by.
+func (s *Store) heartbeatNow() time.Time {
+	if s.testNow != nil {
+		return s.testNow().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func subscriptionSecretsNeedMigration(st State, cph secret.Cipher) bool {
@@ -1136,10 +1214,27 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 }
 
 // noteReportClocksOnDisk records what a committed write put on disk for the
-// clock-throttled report domains. Every JSON write carries the whole in-memory
-// copy of both, so a write made for any reason also flushes their clocks and
-// restarts reportClockPersistInterval for every node.
+// clock-throttled report domains: node heartbeats, sing-box liveness and guard
+// reality. Every JSON write carries the whole in-memory copy of all three, so
+// a write made for any reason also flushes their clocks and restarts
+// metricsPersistenceInterval and reportClockPersistInterval for every node.
 func (s *Store) noteReportClocksOnDisk(st State) {
+	// Capped at the write's own clock: after the clock steps back, a
+	// LastSeen from before the step would otherwise look newer than now to
+	// every node's next beat, and each of them would write again.
+	written := s.heartbeatNow()
+	s.metricsPersistedAt = make(map[string]time.Time, len(st.Nodes))
+	for nodeID, n := range st.Nodes {
+		if n.LastSeen.IsZero() {
+			continue
+		}
+		if n.LastSeen.After(written) {
+			s.metricsPersistedAt[nodeID] = written
+		} else {
+			s.metricsPersistedAt[nodeID] = n.LastSeen
+		}
+	}
+	s.nodeClocksUnflushed = false
 	s.livenessOnDisk = make(map[string]time.Time, len(st.SingBoxLiveness))
 	for nodeID, rec := range st.SingBoxLiveness {
 		s.livenessOnDisk[nodeID] = rec.ReceivedAt
@@ -1558,11 +1653,30 @@ func (s *Store) TouchNodeToken(nodeID string, at time.Time, minInterval time.Dur
 	} else {
 		at = at.UTC()
 	}
-	if minInterval > 0 && !n.TokenLastUsedAt.IsZero() && at.Sub(n.TokenLastUsedAt) < minInterval {
+	// A clock stepped back past the stored use moves it rather than waiting
+	// for the clock to catch up.
+	if d := at.Sub(n.TokenLastUsedAt); minInterval > 0 && !n.TokenLastUsedAt.IsZero() && d >= 0 && d < minInterval {
 		return false, nil
 	}
 	n.TokenLastUsedAt = at
 	s.state.Nodes[nodeID] = n
+	// The token's last use is heartbeat telemetry. It rides the next write
+	// when the node is beating (its heartbeat is within tokenUseRidesWithin)
+	// and its heartbeat on disk is fresh: the node's own beats then force
+	// that write within metricsPersistenceInterval of the previous one. A
+	// node that has not beaten lately, or whose heartbeat never reached disk,
+	// writes the use at once. A node that goes silent right after the use
+	// leaves it to the next write by any node, which the heartbeat throttle
+	// forces within metricsPersistenceInterval while any node beats, or to
+	// Close. Writing every use on its own clock rewrote the whole state file
+	// once per node every minInterval.
+	written, onDisk := s.metricsPersistedAt[nodeID]
+	sinceWrite, sinceBeat := at.Sub(written), at.Sub(n.LastSeen)
+	if onDisk && sinceWrite >= 0 && sinceWrite < metricsPersistenceInterval &&
+		sinceBeat >= 0 && sinceBeat < tokenUseRidesWithin {
+		s.nodeClocksUnflushed = true
+		return true, nil
+	}
 	return true, s.Save()
 }
 
@@ -1637,7 +1751,7 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	if s.metricsPersistedAt == nil {
 		s.metricsPersistedAt = map[string]time.Time{}
 	}
-	now := time.Now().UTC()
+	now := s.heartbeatNow()
 	cameOnline := !n.Online
 	durableChanged := cameOnline
 	previousPublicIP, previousWireGuardIP := n.PublicIP, n.WireGuardIP
@@ -1690,14 +1804,20 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 			return true, err
 		}
 	}
+	// lastPersisted is this node's LastSeen as the last committed write of
+	// any kind left it on disk, not the time of this node's own last write:
+	// keyed per node but restarted fleet-wide (noteReportClocksOnDisk), so
+	// 34 nodes beating every ten seconds force one write per interval, not 34.
+	// A clock stepped back past the copy on disk writes once and restarts
+	// the interval from there, rather than waiting for the clock to catch up.
 	lastPersisted, persisted := s.metricsPersistedAt[nodeID]
-	if persisted && !durableChanged && now.Sub(lastPersisted) < metricsPersistenceInterval {
+	if d := now.Sub(lastPersisted); persisted && !durableChanged && d >= 0 && d < metricsPersistenceInterval {
+		s.nodeClocksUnflushed = true
 		return false, nil
 	}
 	if err := s.Save(); err != nil {
 		return cameOnline, err
 	}
-	s.metricsPersistedAt[nodeID] = now
 	return cameOnline, nil
 }
 
@@ -1736,7 +1856,11 @@ func (s *Store) MarkStaleNodesOffline(threshold time.Duration, now time.Time, ca
 	var flipped []model.Node
 	var events []nodeStatusAppend
 	for nodeID, n := range s.state.Nodes {
-		if n.Online && !n.LastSeen.IsZero() && now.Sub(n.LastSeen) > threshold {
+		// A LastSeen loaded at open and not yet confirmed by a beat may trail
+		// the truth by NodeLastSeenDiskLag after a crash, so it is judged
+		// with that much more patience. Without it, the sweep that runs at
+		// start, before any agent can beat, marked a beating fleet offline.
+		if n.Online && !n.LastSeen.IsZero() && now.Sub(n.LastSeen) > threshold+s.lastSeenSlackLocked(n) {
 			n.Online = false
 			s.state.Nodes[nodeID] = n
 			flipped = append(flipped, n)
@@ -3107,10 +3231,11 @@ func (s *Store) Close() error {
 	}
 	s.closed = true
 	var closeErr error
-	// Reports that only moved their clocks wait in memory for the next write.
-	// A clean shutdown writes them, so a restart resumes from the newest
-	// report rather than from one up to reportClockPersistInterval old.
-	if s.reportClocksUnflushedLocked() {
+	// Reports and heartbeats that only moved their clocks wait in memory for
+	// the next write. A clean shutdown writes them, so a restart resumes from
+	// the newest report rather than from one up to reportClockPersistInterval
+	// old.
+	if s.nodeClocksUnflushed || s.reportClocksUnflushedLocked() {
 		closeErr = s.Save()
 	}
 	if s.wal != nil {

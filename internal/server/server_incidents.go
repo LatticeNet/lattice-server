@@ -241,7 +241,9 @@ func (s *Server) pendingIncidents(now time.Time) []store.Incident {
 			continue
 		}
 		name := nodeLabel(n)
-		if !n.Online || now.Sub(n.LastSeen) > nodeOfflineThreshold {
+		// With the slack the sweep uses, so a fleet restarted after a crash
+		// does not list a pending node.offline for every node until it beats.
+		if !n.Online || now.Sub(n.LastSeen) > nodeOfflineThreshold+s.store.NodeLastSeenSlack(n.ID) {
 			delay, pages := nodeOfflineDelay(n)
 			if !pages || !now.Before(n.LastSeen.Add(delay)) {
 				continue

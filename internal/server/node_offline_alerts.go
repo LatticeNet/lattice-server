@@ -49,13 +49,17 @@ const (
 // alert delay when this process started stays silent: the process that saw it
 // begin owned the page.
 //
-// The spell is recorded before the page is handed to the sender, and delivery
-// runs in the background. A restart through SIGTERM waits for that delivery
-// in Server.Close. A process killed between the record and the delivery has
-// recorded a page that never arrived, and the node.online that follows is the
-// first the operator hears of the spell; recording after the hand-off would
-// not narrow that, since the hand-off returns before delivery starts. A
-// stored notification outbox is what closes it.
+// The page is written to the notification outbox before the spell is
+// recorded, and the outbox is redriven at start. A process killed after the
+// outbox write and before the record sends the page after the restart, and
+// the new process does not page the spell again, since it was already silent
+// past its delay when that process started. A process killed before the
+// outbox write decided nothing durable, and the new process pages the spell
+// itself if it is still inside its window.
+//
+// A recovery is queued in memory until the next sweep (at most 20 s), after
+// its spell has been dropped from the store; a kill in that window loses the
+// node.online, never a node.offline.
 type nodeOfflineAlerts struct {
 	mu sync.Mutex
 	// since is when this process began watching. Silence before it was not
@@ -235,6 +239,12 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 			delete(a.watchFrom, nodeID)
 		}
 	}
+	// Into the outbox first, then the spell (see nodeOfflineAlerts). The emit
+	// takes store locks under a.mu, the order this function already uses.
+	if len(down) > 0 {
+		title, body := nodeOfflineMessage(down)
+		s.emitNotifyTyped(EventNodeOffline, title, body)
+	}
 	if changed || a.unsaved {
 		a.persistLocked(s)
 	}
@@ -242,10 +252,6 @@ func (s *Server) notifyNodeLiveness(now time.Time) {
 	a.recovered = nil
 	a.mu.Unlock()
 
-	if len(down) > 0 {
-		title, body := nodeOfflineMessage(down)
-		s.emitNotifyTyped(EventNodeOffline, title, body)
-	}
 	if len(up) > 0 {
 		title, body := nodeOnlineMessage(up)
 		s.emitNotifyTyped(EventNodeOnline, title, body)

@@ -133,6 +133,39 @@ func readBoltMigrations(tx *bolt.Tx, into map[string]time.Time) error {
 	return nil
 }
 
+// boltKeyNotifyRuleOptions holds State.NotifyRuleOptions in the meta bucket,
+// so the offline migrate round trip keeps a rule's fallback channel. The map
+// is small operator config written only on rule edits; the running server
+// reads it from the JSON state, never from here.
+var boltKeyNotifyRuleOptions = []byte("notify_rule_options")
+
+func putBoltNotifyRuleOptions(tx *bolt.Tx, opts map[string]NotifyRuleOptions) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if len(opts) == 0 {
+		return meta.Delete(boltKeyNotifyRuleOptions)
+	}
+	raw, err := json.Marshal(opts)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyNotifyRuleOptions, raw)
+}
+
+func readBoltNotifyRuleOptions(tx *bolt.Tx, into map[string]NotifyRuleOptions) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil
+	}
+	raw := meta.Get(boltKeyNotifyRuleOptions)
+	if len(raw) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(raw, &into); err != nil {
+		return fmt.Errorf("decode notify rule options: %w", err)
+	}
+	return nil
+}
+
 var boltStateBuckets = [][]byte{
 	boltBucketUsers,
 	boltBucketTokens,
@@ -430,6 +463,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltMigrations(tx, persist.Migrations); err != nil {
 			return err
 		}
+		if err := putBoltNotifyRuleOptions(tx, persist.NotifyRuleOptions); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
 			return err
 		}
@@ -673,6 +709,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			st.LineChainGraphRevision = revision
 		}
 		if err := readBoltMigrations(tx, st.Migrations); err != nil {
+			return err
+		}
+		if err := readBoltNotifyRuleOptions(tx, st.NotifyRuleOptions); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {

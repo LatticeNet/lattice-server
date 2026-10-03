@@ -64,12 +64,12 @@ func TestNotifyRulesRouteMatchingEvents(t *testing.T) {
 	if err := st.UpsertNotifyRule(model.NotifyRule{ID: "rule-ssh", Name: "SSH", EventTypes: []string{"ssh.login"}, ChannelIDs: []string{"ch-ssh"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	deliveries := srv.planNotifyDeliveries("monitor.down", "Monitor down", "failed", st.EnabledNotifyChannels(), st.EnabledNotifyRules())
-	if len(deliveries) != 1 || len(deliveries[0].Channels) != 1 {
-		t.Fatalf("expected one routed monitor delivery, got %+v", deliveries)
+	targets := srv.planNotifyTargets("monitor.down", "Monitor down", "failed", st.EnabledNotifyChannels(), st.EnabledNotifyRules(), "", false)
+	if len(targets) != 1 || targets[0].channel.ID != "ch-monitor" {
+		t.Fatalf("expected one routed monitor delivery, got %+v", targets)
 	}
-	if deliveries[0].Message.Title != "[monitor.down] Monitor down" || deliveries[0].Message.Body != "Body: failed" {
-		t.Fatalf("template not applied: %+v", deliveries[0].Message)
+	if targets[0].message.Title != "[monitor.down] Monitor down" || targets[0].message.Body != "Body: failed" {
+		t.Fatalf("template not applied: %+v", targets[0].message)
 	}
 }
 
@@ -88,9 +88,9 @@ func TestNotifyRulesFallbackBroadcastWhenNoRules(t *testing.T) {
 	if err := st.UpsertNotifyChannel(model.NotifyChannel{ID: "ch-b", Name: "B", Kind: "webhook", Config: map[string]string{"url": "https://example.com/b"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	deliveries := srv.planNotifyDeliveries("generic", "title", "body", st.EnabledNotifyChannels(), st.EnabledNotifyRules())
-	if len(deliveries) != 1 || len(deliveries[0].Channels) != 2 {
-		t.Fatalf("expected broadcast delivery to two channels, got %+v", deliveries)
+	targets := srv.planNotifyTargets("generic", "title", "body", st.EnabledNotifyChannels(), st.EnabledNotifyRules(), "", false)
+	if len(targets) != 2 {
+		t.Fatalf("expected broadcast delivery to two channels, got %+v", targets)
 	}
 }
 

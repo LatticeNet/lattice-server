@@ -91,6 +91,10 @@ type State struct {
 	TraceSessions          map[string]model.TraceSession         `json:"trace_sessions"`
 	NotifyChannels         map[string]model.NotifyChannel        `json:"notify_channels"`
 	NotifyRules            map[string]model.NotifyRule           `json:"notify_rules"`
+	// NotifyRuleOptions holds per-rule settings the SDK's model.NotifyRule does
+	// not carry yet (notify_rule_options.go), keyed by rule id. Operator
+	// configuration written only on a rule edit, so the JSON state is its home.
+	NotifyRuleOptions map[string]NotifyRuleOptions `json:"notify_rule_options,omitempty"`
 	// NotifyWebhooks are operator-authored inbound entry points (notify_webhook.go).
 	// They hold a PBKDF2 secret hash, not a reversible secret, so unlike
 	// NotifyChannels they need no pass in crypto.go.
@@ -273,6 +277,8 @@ type Store struct {
 	// sidecar is gone by then, so a write would put its domains in the JSON
 	// file. Guarded by mu.
 	closed bool
+	// notify is the notification outbox (notify_outbox.go). Guarded by mu.
+	notify notifyOutbox
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every
@@ -816,6 +822,7 @@ func emptyState() State {
 		TraceSessions:           map[string]model.TraceSession{},
 		NotifyChannels:          map[string]model.NotifyChannel{},
 		NotifyRules:             map[string]model.NotifyRule{},
+		NotifyRuleOptions:       map[string]NotifyRuleOptions{},
 		NotifyWebhooks:          map[string]NotifyWebhook{},
 		NotifyWebhookDeliveries: map[string][]NotifyWebhookDelivery{},
 		Tunnels:                 map[string]model.TunnelProfile{},
@@ -945,6 +952,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NotifyRules == nil {
 		st.NotifyRules = map[string]model.NotifyRule{}
+	}
+	if st.NotifyRuleOptions == nil {
+		st.NotifyRuleOptions = map[string]NotifyRuleOptions{}
 	}
 	if st.NotifyWebhooks == nil {
 		st.NotifyWebhooks = map[string]NotifyWebhook{}
@@ -5497,6 +5507,7 @@ func (s *Store) DeleteNotifyRule(id string) error {
 		return nil
 	}
 	delete(s.state.NotifyRules, id)
+	delete(s.state.NotifyRuleOptions, id)
 	return s.Save()
 }
 
@@ -5524,7 +5535,21 @@ func (s *Store) DeleteNotifyChannel(id string) error {
 			s.state.NotifyRules[ruleID] = rule
 		}
 	}
-	return s.Save()
+	for ruleID, opts := range s.state.NotifyRuleOptions {
+		if opts.FallbackChannelID != id {
+			continue
+		}
+		opts.FallbackChannelID = ""
+		if opts.zero() {
+			delete(s.state.NotifyRuleOptions, ruleID)
+		} else {
+			s.state.NotifyRuleOptions[ruleID] = opts
+		}
+	}
+	if err := s.Save(); err != nil {
+		return err
+	}
+	return s.deleteNotifyChannelHealthLocked(id)
 }
 
 // UpsertTunnel creates or updates a tunnel profile.

@@ -343,6 +343,12 @@ Use the compose file and deployment guide in the umbrella repository:
   installed and systemd accepted the delayed restart unit. That success records
   `last_applied_version`; the live source of truth remains the next node
   heartbeat's reported `agent_version`.
+- Enroll and reconfigure commands install one pinned stable node-agent
+  release: the installer is fetched at that tag and told to download the
+  binary of the same tag. Both responses name it as `agent_version`. The
+  installer always installs a binary, so a reconfigure on a node that runs
+  another version (a newer prerelease or an older release) moves it to the
+  pinned release, and the console says so next to the command.
 - Node reconfigure commands source both the canonical
   `/opt/lattice/lattice-agent.env` and legacy `/opt/lattice/node-agent/agent.env`
   before rerunning the installer. Operators can therefore reconfigure or upgrade

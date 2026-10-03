@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -77,11 +78,12 @@ func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
 		t.Fatalf("enroll: %d", res.StatusCode)
 	}
 	var out struct {
-		NodeID    string            `json:"node_id"`
-		Token     string            `json:"token"`
-		ServerURL string            `json:"server_url"`
-		Command   string            `json:"command"`
-		Commands  map[string]string `json:"commands"`
+		NodeID       string            `json:"node_id"`
+		Token        string            `json:"token"`
+		ServerURL    string            `json:"server_url"`
+		Command      string            `json:"command"`
+		Commands     map[string]string `json:"commands"`
+		AgentVersion string            `json:"agent_version"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
 		t.Fatal(err)
@@ -89,8 +91,12 @@ func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
 	if out.ServerURL != "https://lattice.example.com" {
 		t.Fatalf("server_url = %q", out.ServerURL)
 	}
+	if out.AgentVersion != agentInstallerRef {
+		t.Fatalf("agent_version = %q, want the pinned release %s", out.AgentVersion, agentInstallerRef)
+	}
 	for _, want := range []string{
-		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh'",
+		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/" + agentInstallerRef + "/scripts/install.sh'",
+		"LATTICE_AGENT_VERSION='" + agentInstallerRef + "'",
 		"LATTICE_SERVER='https://lattice.example.com'",
 		"LATTICE_NODE_ID='node-a'",
 		"LATTICE_NODE_TOKEN='" + out.Token + "'",
@@ -120,13 +126,20 @@ func TestNodeReconfigureCommandSourcesCanonicalAndLegacyEnv(t *testing.T) {
 		t.Fatalf("reconfigure: %d", res.StatusCode)
 	}
 	var out struct {
-		Command string `json:"command"`
+		Command      string `json:"command"`
+		AgentVersion string `json:"agent_version"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
+	// The console shows which release the command installs, because the
+	// installer replaces whatever binary the node runs.
+	if out.AgentVersion != agentInstallerRef {
+		t.Fatalf("agent_version = %q, want the pinned release %s", out.AgentVersion, agentInstallerRef)
+	}
 	for _, want := range []string{
-		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh'",
+		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/" + agentInstallerRef + "/scripts/install.sh'",
+		"LATTICE_AGENT_VERSION='" + agentInstallerRef + "'",
 		"for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env",
 		"LATTICE_NODE_ID='node-a'",
 		"LATTICE_AGENT_ALLOW_EXEC='1'",
@@ -136,6 +149,33 @@ func TestNodeReconfigureCommandSourcesCanonicalAndLegacyEnv(t *testing.T) {
 	} {
 		if !strings.Contains(out.Command, want) {
 			t.Fatalf("reconfigure command missing %q:\n%s", want, out.Command)
+		}
+	}
+}
+
+// TestAgentInstallerRefIsStableReleaseTag keeps enroll and reconfigure
+// commands on a stable release: a branch (main) or a prerelease tag would let
+// the installer and the binary it downloads drift apart, and prereleases
+// never become the fleet's install target without an operator decision.
+func TestAgentInstallerRefIsStableReleaseTag(t *testing.T) {
+	if !regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(agentInstallerRef) {
+		t.Fatalf("agentInstallerRef = %q, want a stable vX.Y.Z tag", agentInstallerRef)
+	}
+	s := &Server{}
+	enroll := s.agentEnrollCommands("https://lattice.example.com", "node-a", "tok", model.AgentLaunchConfig{})["linux"]
+	reconfigure := s.agentReconfigureCommands("https://lattice.example.com", "node-a", model.AgentLaunchConfig{})["linux"]
+	for name, cmd := range map[string]string{"enroll": enroll, "reconfigure": reconfigure} {
+		if strings.Contains(cmd, "lattice-node-agent/main/") {
+			t.Fatalf("%s command still fetches the main branch:\n%s", name, cmd)
+		}
+		if strings.Count(cmd, agentInstallerRef) != 2 {
+			t.Fatalf("%s command should name %s once for the installer and once for the binary:\n%s", name, agentInstallerRef, cmd)
+		}
+		// The version must ride the env invocation that runs the installer,
+		// after any sourced env file, so a stale value there cannot win.
+		run := cmd[strings.LastIndex(cmd, " env "):]
+		if !strings.Contains(run, "LATTICE_AGENT_VERSION='"+agentInstallerRef+"'") || !strings.HasSuffix(run, "./lattice-agent-install.sh") {
+			t.Fatalf("%s command does not pass LATTICE_AGENT_VERSION to the installer run:\n%s", name, cmd)
 		}
 	}
 }

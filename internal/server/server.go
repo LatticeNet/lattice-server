@@ -449,6 +449,10 @@ type Server struct {
 	// simply repopulates it from the next round of reports.
 	singboxInvMu sync.RWMutex
 	singboxInv   map[string]model.SingBoxInventory
+	// singboxClockNoted is when noteSingBoxInventoryClock last logged a node's
+	// clock skew. Guarded by singboxClockMu.
+	singboxClockMu    sync.Mutex
+	singboxClockNoted map[string]time.Time
 	// lineTemplateSyncMu serialises syncLineClientTemplates, and
 	// lineTemplatePending holds, per line hash, a changed template seen at
 	// one sync and not yet confirmed by the next (syncLineClientTemplates

@@ -679,9 +679,12 @@ func (s *Server) handleSingBoxProbeTaskResult(r *http.Request, task model.Task, 
 	if !isSingBoxProbeTask(task) {
 		return
 	}
+	// Stamped with the arrival time, like an agent-posted inventory: the
+	// task's FinishedAt comes from the node's clock (see
+	// handleAgentSingBoxInventory).
 	inv := model.SingBoxInventory{
 		NodeID: result.NodeID,
-		At:     taskResultInventoryTime(result, s.now()),
+		At:     s.now().UTC(),
 		Status: "ok",
 		Nodes:  []model.SingBoxNode{},
 	}
@@ -744,13 +747,6 @@ func isAgentExecDisabledTaskResult(result model.TaskResult) bool {
 	msg := strings.ToLower(strings.TrimSpace(result.Error + "\n" + result.Stderr))
 	return strings.Contains(msg, "agent task execution disabled") ||
 		strings.Contains(msg, "restart with -allow-exec=true")
-}
-
-func taskResultInventoryTime(result model.TaskResult, fallback time.Time) time.Time {
-	if !result.FinishedAt.IsZero() {
-		return result.FinishedAt.UTC()
-	}
-	return fallback.UTC()
 }
 
 func parseSingBoxProbeStdout(nodeID string, at time.Time, stdout string) (model.SingBoxInventory, error) {

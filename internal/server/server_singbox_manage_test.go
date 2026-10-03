@@ -931,3 +931,42 @@ func TestSingBoxManageConncheckQueuesValidatedTask(t *testing.T) {
 		}
 	}
 }
+
+// A probe result finished on a node whose clock runs behind still refreshes
+// the mirror: the inventory carries the time the result arrived, not the
+// task's FinishedAt from the node's clock, so it is not stale on arrival.
+func TestSingBoxProbeResultFromALaggingClockIsNotStale(t *testing.T) {
+	srv, handler := newManageTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
+	enableSingBox(t, srv, "node-a")
+
+	resp := doJSON(t, handler, http.MethodPost, "/api/proxy/managed/probe", `{"node_id":"node-a"}`, cookies, csrf)
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("probe: want 200, got %d (%s)", resp.StatusCode, b)
+	}
+	resp.Body.Close()
+	tasksRec := doAgentRaw(t, handler, http.MethodGet, "/api/agent/tasks?node_id=node-a", "", nodeToken)
+	var tasks []struct {
+		ID      string `json:"id"`
+		LeaseID string `json:"lease_id"`
+	}
+	if err := json.NewDecoder(tasksRec.Body).Decode(&tasks); err != nil || len(tasks) != 1 {
+		t.Fatalf("lease: %v %+v", err, tasks)
+	}
+	stdout := singBoxProbeListMarker + `
+{"ok":true,"count":1,"nodes":[{"name":"VLESS-REALITY-443.json","protocol":"vless","port":"443"}]}
+` + singBoxProbeProvisionMarker + `
+{"version":"1.12.12"}
+`
+	finished := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	result := `{"node_id":"node-a","result":{"task_id":"` + tasks[0].ID + `","lease_id":"` + tasks[0].LeaseID +
+		`","exit_code":0,"finished_at":"` + finished + `","stdout":` + string(mustJSON(t, stdout)) + `}}`
+	if rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/task-result", result, nodeToken); rec.Code != http.StatusOK {
+		t.Fatalf("task result failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := len(srv.liveSingBoxInventories(srv.now())); got != 1 {
+		t.Fatalf("live inventories after a probe finished 10 min ago by the node's clock = %d, want 1", got)
+	}
+}

@@ -154,6 +154,7 @@ func (s *Server) forgetNodeOfflineAlert(nodeID string) {
 	delete(a.alerted, nodeID)
 	delete(a.disabled, nodeID)
 	delete(a.watchFrom, nodeID)
+	s.forgetAgentHealth(nodeID)
 }
 
 // notifyNodeLiveness sends node.offline for nodes silent past

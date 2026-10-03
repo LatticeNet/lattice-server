@@ -329,6 +329,9 @@ type Server struct {
 	// alertDigest batches service and monitor alerts decided one node at a
 	// time into one message per kind per sweep; see alert_digest.go.
 	alertDigest alertDigest
+	// agentHealth is each node's last loop health, in memory only; see
+	// agent_health.go.
+	agentHealth agentHealthBook
 	// monitorDrops rate-limits the log line for agent monitor results the
 	// store refused; see server_monitor_results.go.
 	monitorDrops monitorDropLog
@@ -2568,6 +2571,7 @@ type nodeView struct {
 	AgentDebug           model.AgentDebugPolicy   `json:"agent_debug"`
 	AgentLaunch          *model.AgentLaunchConfig `json:"agent_launch,omitempty"`
 	AgentRuntime         *agentRuntimeConfig      `json:"agent_runtime,omitempty"`
+	LoopHealth           *agentLoopHealthView     `json:"loop_health,omitempty"`
 	IPConfig             *model.NodeIPConfig      `json:"ip_config,omitempty"`
 	GroupIDs             []string                 `json:"group_ids,omitempty"`
 	CreatedAt            time.Time                `json:"created_at"`
@@ -2595,7 +2599,8 @@ type agentRuntimeConfig struct {
 }
 
 func (s *Server) toNodeView(n model.Node) nodeView {
-	st := s.nodeStatusFor(n, s.now())
+	now := s.now()
+	st := s.nodeStatusFor(n, now)
 	return nodeView{
 		Status: st.Status, StatusSince: st.Since, StatusReason: st.Reason,
 		ID: n.ID, LatticeIdentityUUID: n.LatticeIdentityUUID, Name: n.Name, Comment: n.Comment, Tags: n.Tags, Role: n.Role, Inventory: n.Inventory,
@@ -2603,7 +2608,7 @@ func (s *Server) toNodeView(n model.Node) nodeView {
 		WireGuardEndpoint: n.WireGuardEndpoint, WireGuardPort: n.WireGuardPort,
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Reachability: nodeReachability(n), Disabled: n.Disabled, AgentSourceAllowlist: append([]string(nil), n.AgentSourceAllowlist...), TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
-		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
+		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), LoopHealth: s.agentLoopHealthViewFor(n.ID, now), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
 	}
 }
 
@@ -8630,6 +8635,9 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		agentAuthRequest
 		Metrics      model.Metrics       `json:"metrics"`
 		AgentRuntime *agentRuntimeConfig `json:"agent_runtime"`
+		// LoopHealth is node-agent 0.3.10's account of its work loop; kept
+		// in memory beside agentRuntime, never persisted per beat.
+		LoopHealth *model.AgentHealth `json:"loop_health"`
 	}
 	if !decodeAgentJSON(w, r, &req) {
 		return
@@ -8677,6 +8685,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		s.agentRuntime[req.NodeID] = runtime
 		s.agentRuntimeMu.Unlock()
 	}
+	s.noteAgentHealth(req.NodeID, req.LoopHealth, req.Metrics.CollectedAt)
 	s.maybeTriggerDDNS(req.NodeID, old.PublicIP, old.PublicIPv6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

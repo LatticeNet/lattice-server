@@ -115,18 +115,20 @@ func deriveNodeStatus(n model.Node, now time.Time, problems []degradation) nodeS
 }
 
 // nodeDegradations collects the problems the control plane can prove today
-// for a node that is in contact, earliest first. Two inputs exist:
+// for a node that is in contact, earliest first. Three inputs exist:
 //
 //   - the sing-box service liveness record (design-19): the service is down or
 //     restarting, and the record is as fresh as the node's own beat;
 //   - the NetGuard guard-reality snapshot: one exists and is older than
 //     guardRealityStaleAfter while the agent keeps reporting, which means the
-//     reality the SSH Guard page shows for this node is no longer true.
+//     reality the SSH Guard page shows for this node is no longer true;
+//   - the agent's loop health (agent_health.go): its work loop has stalled,
+//     durable task recovery is blocked, a core step keeps failing, or it
+//     dropped monitor results recently.
 //
 // Resource saturation is deliberately not here. High CPU or a full disk is
 // load the metric bars already show, not a failed probe, and calling it
-// degraded is what made one page disagree with another. No per-node agent
-// runtime error is stored today; when one is, it belongs in this list.
+// degraded is what made one page disagree with another.
 func (s *Server) nodeDegradations(n model.Node, now time.Time) []degradation {
 	var out []degradation
 	if rec, ok := s.store.SingBoxLivenessRecord(n.ID); ok {
@@ -139,6 +141,7 @@ func (s *Server) nodeDegradations(n model.Node, now time.Time) []degradation {
 			out = append(out, d)
 		}
 	}
+	out = append(out, s.agentHealthDegradations(n, now)...)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].since.Before(out[j].since) })
 	return out
 }

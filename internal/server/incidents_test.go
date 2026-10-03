@@ -918,3 +918,28 @@ func TestQuietHoursReleaseIncidentMessagesInOrderAndWithdrawTheSettled(t *testin
 		t.Fatalf("withdrawn = %v, want %v", withdrawn, wantWithdrawn)
 	}
 }
+
+// A rule's fallback that is a Bark channel carries an escalation's Bark
+// level, which is stored only on the escalation's Bark rows.
+func TestFallbackKeepsTheEscalationBarkLevel(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	addNotifyChannel(t, st, "nc-a", "Bark urgent")
+	addNotifyChannel(t, st, "nc-fb", "Bark backup")
+	rule := model.NotifyRule{ID: "r-urgent", Name: "Urgent", EventTypes: []string{EventServiceDown}, ChannelIDs: []string{"nc-a"}, Enabled: true}
+	if err := st.UpsertNotifyRuleWithOptions(rule, store.NotifyRuleOptions{FallbackChannelID: "nc-fb"}); err != nil {
+		t.Fatal(err)
+	}
+	installFakeNotifySender(srv, func(id string, _ int) error {
+		if id == "nc-a" {
+			return upstream(401)
+		}
+		return nil
+	})
+	srv.commitNotifyPlan(srv.planNotifyEvent(EventServiceDown, "Not acknowledged after 30 min: sing-box down", "b",
+		notifyEnqueue{source: store.NotifySourceServer, onlyRule: &rule, barkLevel: "critical", incidentIDs: []string{"inc-1"}}))
+	waitOutboxSettled(t, srv)
+	fb := deliveriesOf(st, store.NotifyDeliveryFilter{ChannelID: "nc-fb"})
+	if len(fb) != 1 || fb[0].Role != store.NotifyRoleFallback || fb[0].BarkLevel != "critical" || strings.Join(fb[0].IncidentIDs, ",") != "inc-1" {
+		t.Fatalf("fallback = %+v", fb)
+	}
+}

@@ -381,15 +381,22 @@ func (s *Server) enqueueNotifyEvent(eventType, title, body string, how notifyEnq
 // sendUnrecorded is the pre-outbox path, kept for a store that refuses the
 // write: one goroutine, one try per channel, failures logged by kind only. An
 // inbound webhook's record is still settled from what happened, since no
-// outbox row will settle it.
+// outbox row will settle it. An escalation keeps its Bark level. Quiet hours
+// do not hold these sends: with the store refusing writes there is nowhere to
+// keep a held message until the window ends, and a message sent early is
+// better than one lost.
 func (s *Server) sendUnrecorded(plan notifyPlan) {
 	s.notifyDeliveries.begin()
 	go func() {
 		defer s.notifyDeliveries.end()
 		delivered, failed := 0, 0
 		for _, t := range plan.targets {
+			channel := t.channel
+			if plan.how.barkLevel != "" && channel.Kind == "bark" {
+				channel = withBarkLevel(channel, plan.how.barkLevel)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
-			err := s.notifySend(ctx, t.channel, t.message)
+			err := s.notifySend(ctx, channel, t.message)
 			cancel()
 			if err != nil {
 				failed++
@@ -850,9 +857,15 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 	r.healthMu.Lock()
 	defer r.healthMu.Unlock()
 	var failed []string
+	// An escalation's Bark level is on its Bark rows only (other kinds ignore
+	// it), so the fallback takes it from whichever primary row has it.
+	barkLevel := ""
 	for _, sib := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{EventID: row.EventID}) {
 		if sib.RuleID != row.RuleID {
 			continue
+		}
+		if sib.BarkLevel != "" {
+			barkLevel = sib.BarkLevel
 		}
 		switch {
 		case sib.Role == store.NotifyRoleFallback:
@@ -873,12 +886,15 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 		RuleID: row.RuleID, RuleName: row.RuleName, Role: store.NotifyRoleFallback,
 		FallbackFor: strings.Join(failed, ", "), Outcome: store.NotifyOutcomePlanned,
 		NextAttemptAt: now, Title: row.Title, Body: body, Truncated: row.Truncated || cut,
-		CreatedAt: now,
+		CreatedAt: now, IncidentIDs: slices.Clone(row.IncidentIDs),
 	}
 	channel, found := s.notifyChannelByID(opts.FallbackChannelID)
 	fallback.ChannelID = opts.FallbackChannelID
 	if found {
 		fallback.ChannelName, fallback.ChannelKind = channel.Name, channel.Kind
+	}
+	if fallback.ChannelKind == "bark" {
+		fallback.BarkLevel = barkLevel
 	}
 	if err := s.store.RecordNotifyDeliveries([]store.NotifyDelivery{fallback}); err != nil {
 		s.logger.Printf("notify: record fallback for %s: %v", row.ID, err)

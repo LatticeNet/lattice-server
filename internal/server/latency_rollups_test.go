@@ -141,6 +141,31 @@ func TestLatencyReadsAreNodeScoped(t *testing.T) {
 	if res := doBearerJSON(t, handler, http.MethodGet, "/api/monitors/latency/series?source=node-sh&target=node-jp&window=1h", "", confined); res.StatusCode != http.StatusOK {
 		t.Fatalf("confined series of its own pair = %d", res.StatusCode)
 	}
+	// The generic monitor routes narrow generated monitors the same way: a
+	// token confined to the source does not learn the address of a target
+	// it cannot read.
+	list := doBearerJSON(t, handler, http.MethodGet, "/api/monitors", "", confined)
+	defer list.Body.Close()
+	var monitors []monitorView
+	if err := json.NewDecoder(list.Body).Decode(&monitors); err != nil {
+		t.Fatal(err)
+	}
+	if len(monitors) != 1 || monitors[0].ID != latencyMonitorID("node-jp") {
+		t.Fatalf("confined monitor list = %+v", monitors)
+	}
+	if res := doBearerJSON(t, handler, http.MethodGet, "/api/monitors/results?monitor_id="+latencyMonitorID("node-us"), "", confined); res.StatusCode != http.StatusForbidden {
+		t.Fatalf("confined results of another node's probe = %d", res.StatusCode)
+	}
+	sourceOnly := createPAT(t, handler, cookies, csrf, []string{"monitor:read"}, []string{"node-sh"})
+	list = doBearerJSON(t, handler, http.MethodGet, "/api/monitors", "", sourceOnly)
+	defer list.Body.Close()
+	monitors = nil
+	if err := json.NewDecoder(list.Body).Decode(&monitors); err != nil {
+		t.Fatal(err)
+	}
+	if len(monitors) != 0 {
+		t.Fatalf("a source-only token sees target monitors: %+v", monitors)
+	}
 	full := doJSON(t, handler, http.MethodGet, "/api/monitors/latency/series?source=node-sh&target=node-hk", "", cookies, "")
 	full.Body.Close()
 	if full.StatusCode != http.StatusNotFound {

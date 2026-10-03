@@ -5315,6 +5315,13 @@ func monitorPairAssigned(mon model.Monitor, nodeID string) bool {
 }
 
 func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {
+	if target, ok := strings.CutPrefix(mon.ID, latencyMonitorPrefix); ok && mon.ManagedBy == model.MonitorManagedLatency &&
+		!rbac.Allows(p.Principal, scope, target) {
+		// A generated latency monitor carries its target's address and
+		// name; a principal confined to the source must also be able to
+		// read the target, as the latency reads demand.
+		return false
+	}
 	if mon.AssignAll {
 		return rbac.Allows(p.Principal, scope, "")
 	}

@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -233,8 +234,36 @@ type Server struct {
 	shareResolvedRefusalAudit *auditFailureThrottle
 	shareRefusalAudits        sync.WaitGroup
 	shareRefusalAuditHook     func()
-	apiLimiter                *ratelimit.Limiter
-	subLimiter                *ratelimit.Limiter
+	// shareRenderFlights holds the share renders in flight, one per cache
+	// key, so concurrent misses for one key run one render; see
+	// share_render_flight.go. shareRenderJoinWaiter (tests only) is signalled
+	// when a request joins a flight instead of starting one.
+	// shareFetchStats counts successful link fetches per link per hour and
+	// remembers which client families fetched each link; see
+	// share_fetch_stats.go. shareFetchAudits counts its audit writes still in
+	// flight.
+	shareFetchStats     *shareFetchStats
+	shareFetchAudits    sync.WaitGroup
+	shareFetchAuditHook func()
+	// shareFlushStop stops the minute flushers of the link audits (fetch
+	// summaries and refusal summaries) before Close writes the last ones;
+	// shareFlushers counts the flushers still running.
+	shareFlushStop     chan struct{}
+	shareFlushStopOnce sync.Once
+	shareFlushers      sync.WaitGroup
+	// shareRenderBudget bounds the plugin renders one link's cache misses
+	// may start; see share_render_budget.go.
+	shareRenderBudget *shareRenderBudget
+	// vpnCoreGen advances on every committed vpn-core write; a plugin link
+	// source refreshed before the current generation is due. See
+	// share_fleet_changes.go. vpnCoreLinks paces the advances.
+	vpnCoreGen            atomic.Uint64
+	vpnCoreLinks          vpnCoreLinkChanges
+	shareRenderMu         sync.Mutex
+	shareRenderFlights    map[subscriptionCacheKey]*shareRenderFlight
+	shareRenderJoinWaiter chan struct{}
+	apiLimiter            *ratelimit.Limiter
+	subLimiter            *ratelimit.Limiter
 	// logIngestLimiter brakes per-source log ingest (keyed by source id) in
 	// lines/sec so a chatty or hostile node cannot flood the store; over budget
 	// returns 429 + Retry-After. Disk is independently bounded by the store caps.
@@ -614,6 +643,8 @@ func New(opts Options) (*Server, error) {
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		shareFetchStats:       newShareFetchStats(),
+		shareFlushStop:        make(chan struct{}),
 		subscriptionDecoy:     opts.SubscriptionDecoy,
 		now:                   func() time.Time { return time.Now().UTC() },
 		tlsMonitorTargets:     defaultTLSMonitorTargets,
@@ -623,6 +654,7 @@ func New(opts Options) (*Server, error) {
 	if s.reminderInterval <= 0 {
 		s.reminderInterval = time.Hour
 	}
+	s.shareRenderBudget = newShareRenderBudget(func() time.Time { return s.now() })
 	if s.taskExecutionDisabled {
 		s.logger.Printf("WARNING: task execution fleet kill switch is enabled; new tasks will not queue and agents will receive no task leases")
 	}
@@ -701,6 +733,7 @@ func New(opts Options) (*Server, error) {
 		if redrive > 0 {
 			s.wakeNotifyOutbox()
 		}
+		s.startShareFetchStatsFlush()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1409,6 +1442,30 @@ func (s *Server) Close(ctx context.Context) error {
 		return nil
 	}
 	s.flushAlertDigests()
+	// The link audit flushers stop first, so none of them writes after the
+	// final flush below or after the store closes. Then the open hour's
+	// link fetch counts and any folded refusals are written, and a
+	// first-seen audit already handed to its goroutine lands too.
+	s.shareFlushStopOnce.Do(func() {
+		if s.shareFlushStop != nil {
+			close(s.shareFlushStop)
+		}
+	})
+	waitShareAudits := func(wg *sync.WaitGroup) {
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
+	waitShareAudits(&s.shareFlushers)
+	s.flushShareFetchStats(s.now(), true)
+	s.flushShareRefusalAudit(s.now())
+	waitShareAudits(&s.shareFetchAudits)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)

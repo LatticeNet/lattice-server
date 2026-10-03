@@ -2,6 +2,7 @@ package server
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,14 @@ type subscriptionCacheEntry struct {
 	size     int
 
 	contentType string
+	// wireType is the Content-Type the core derived for this body when it
+	// rendered it, kept with the body so a hit answers with the same label.
+	wireType string
+	// bodyHash and gzipBody are computed once at render time (newShareBody)
+	// so a hit neither digests nor compresses. A zero hash means the entry
+	// was stored without them and the handler computes them.
+	bodyHash [sha256.Size]byte
+	gzipBody []byte
 	// userinfo is the provider's traffic header. It travels with the body rather
 	// than in a parallel map so a cache hit can never serve one client's body
 	// with another's remaining-quota figures.
@@ -103,6 +112,28 @@ func (c *subscriptionCache) GetSnapshot(key subscriptionCacheKey, now time.Time)
 	c.order.MoveToFront(el)
 	out := *entry
 	out.body = append([]byte(nil), entry.body...)
+	out.gzipBody = cloneBytes(entry.gzipBody)
+	return out, true
+}
+
+// GetVersioned is GetSnapshot for a caller that knows the content version the
+// body must have been rendered from. An entry rendered from any other version
+// is a miss, so a body the source has moved past is never served.
+func (c *subscriptionCache) GetVersioned(key subscriptionCacheKey, version string, now time.Time) (subscriptionCacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.entries[key]
+	if !ok {
+		return subscriptionCacheEntry{}, false
+	}
+	entry := el.Value.(*subscriptionCacheEntry)
+	if entry.revalidationVersion != version || !now.Before(entry.expiresAt) {
+		return subscriptionCacheEntry{}, false
+	}
+	c.order.MoveToFront(el)
+	out := *entry
+	out.body = append([]byte(nil), entry.body...)
+	out.gzipBody = cloneBytes(entry.gzipBody)
 	return out, true
 }
 
@@ -119,6 +150,7 @@ func (c *subscriptionCache) GetStale(key subscriptionCacheKey) (subscriptionCach
 	}
 	entry := *el.Value.(*subscriptionCacheEntry)
 	entry.body = append([]byte(nil), entry.body...)
+	entry.gzipBody = cloneBytes(entry.gzipBody)
 	return entry, true
 }
 
@@ -172,7 +204,14 @@ func (c *subscriptionCache) Put(key subscriptionCacheKey, body []byte, contentTy
 }
 
 func (c *subscriptionCache) PutSnapshot(key subscriptionCacheKey, body []byte, contentType, userinfo, revalidationVersion, publicSourceVersion string, stale bool, fetchedAt, now time.Time) {
-	if len(body) == 0 {
+	c.putEntry(key, subscriptionCacheEntry{body: body, contentType: contentType, userinfo: userinfo, revalidationVersion: revalidationVersion,
+		publicSourceVersion: publicSourceVersion, stale: stale, fetchedAt: fetchedAt}, now)
+}
+
+// putEntry stores a copy of in under key. Only the fields a caller sets are
+// read: key, revision, size and expiry are the cache's own.
+func (c *subscriptionCache) putEntry(key subscriptionCacheKey, in subscriptionCacheEntry, now time.Time) {
+	if len(in.body) == 0 {
 		return
 	}
 	c.mu.Lock()
@@ -180,9 +219,11 @@ func (c *subscriptionCache) PutSnapshot(key subscriptionCacheKey, body []byte, c
 	c.nextRevision++
 	storedKey := subscriptionCacheKey{ShareID: strings.Clone(key.ShareID), Format: strings.Clone(key.Format), UAClass: strings.Clone(key.UAClass), Variant: strings.Clone(key.Variant)}
 	entry := &subscriptionCacheEntry{
-		key: storedKey, body: append([]byte(nil), body...), revision: c.nextRevision,
-		contentType: strings.Clone(contentType), userinfo: strings.Clone(userinfo), revalidationVersion: strings.Clone(revalidationVersion), publicSourceVersion: strings.Clone(publicSourceVersion),
-		stale: stale, fetchedAt: fetchedAt, expiresAt: now.Add(c.ttl),
+		key: storedKey, body: append([]byte(nil), in.body...), revision: c.nextRevision,
+		contentType: strings.Clone(in.contentType), wireType: strings.Clone(in.wireType), userinfo: strings.Clone(in.userinfo),
+		bodyHash: in.bodyHash, gzipBody: cloneBytes(in.gzipBody),
+		revalidationVersion: strings.Clone(in.revalidationVersion), publicSourceVersion: strings.Clone(in.publicSourceVersion),
+		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl),
 	}
 	entry.size = subscriptionCacheEntrySize(*entry)
 	if entry.size > c.maxBytes {
@@ -203,6 +244,28 @@ func (c *subscriptionCache) PutSnapshot(key subscriptionCacheKey, body []byte, c
 			continue
 		}
 		break
+	}
+}
+
+// ExpireShare marks every cached body of one share expired without dropping
+// it. The next fetch revalidates: an unchanged source extends the body it
+// already has instead of rendering it again.
+func (c *subscriptionCache) ExpireShare(shareID string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, el := range c.entries {
+		if key.ShareID == shareID {
+			el.Value.(*subscriptionCacheEntry).expiresAt = now
+		}
+	}
+}
+
+// expireKey marks one cached body expired without dropping it.
+func (c *subscriptionCache) expireKey(key subscriptionCacheKey, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[key]; ok {
+		el.Value.(*subscriptionCacheEntry).expiresAt = now
 	}
 }
 
@@ -235,6 +298,14 @@ func (c *subscriptionCache) removeElement(el *list.Element) {
 }
 
 func subscriptionCacheEntrySize(entry subscriptionCacheEntry) int {
-	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.contentType) +
+	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.gzipBody) + len(entry.contentType) + len(entry.wireType) +
 		len(entry.userinfo) + len(entry.revalidationVersion) + len(entry.publicSourceVersion)
+}
+
+// cloneBytes copies b, keeping nil as nil so "no gzip body" stays visible.
+func cloneBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }

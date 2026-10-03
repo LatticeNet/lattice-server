@@ -34,6 +34,7 @@ func (s *Store) UpsertSubscriptionShare(share model.SubscriptionShare) error {
 			return err
 		}
 		s.state.SubscriptionShares[share.ID] = share
+		s.invalidateShareTokenIndexLocked()
 		return nil
 	}
 	staged := s.state
@@ -45,6 +46,7 @@ func (s *Store) UpsertSubscriptionShare(share model.SubscriptionShare) error {
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
+		s.invalidateShareTokenIndexLocked()
 	}
 	return err
 }
@@ -62,11 +64,10 @@ func (s *Store) SubscriptionShare(id string) (model.SubscriptionShare, bool) {
 // this is the one comparison in the product an anonymous caller can drive.
 //
 // The comparison is whole-string on purpose: a prefix or substring match would
-// turn a partially guessed token into a working one. It is also constant-time,
-// and the scan does not stop at the first hit. Returning early leaks, through
-// timing, both how far a candidate token matched and where the matching share
-// sat in the iteration; neither is information the caller is entitled to. The
-// cost is a full pass over a map that holds one entry on a real deployment.
+// turn a partially guessed token into a working one. The lookup goes through
+// an HMAC-keyed index (link_token_index.go), so its cost and timing depend on
+// neither the number of shares nor how close a guess came to a real token, and
+// the hit is confirmed with a constant-time compare against the stored token.
 //
 // A duplicate token fails closed. It should be unreachable, since tokens are
 // generated from a CSPRNG, but "unreachable" plus "silently serves whichever
@@ -79,18 +80,16 @@ func (s *Store) SubscriptionShareByToken(token string) (model.SubscriptionShare,
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var found model.SubscriptionShare
-	matches := 0
-	for _, share := range s.state.SubscriptionShares {
-		if subtle.ConstantTimeCompare([]byte(share.Token), []byte(token)) == 1 {
-			found = share
-			matches++
-		}
-	}
-	if matches != 1 {
+	index := s.shareTokenIndexLocked()
+	refs := index.byMAC[index.mac(token)]
+	if len(refs) != 1 || refs[0].kind != linkKindShare {
 		return model.SubscriptionShare{}, false
 	}
-	return found, true
+	share, ok := s.state.SubscriptionShares[refs[0].id]
+	if !ok || subtle.ConstantTimeCompare([]byte(share.Token), []byte(token)) != 1 {
+		return model.SubscriptionShare{}, false
+	}
+	return share, true
 }
 
 // SubscriptionShares returns every share sorted by creation time, then id, so the
@@ -111,6 +110,19 @@ func (s *Store) SubscriptionShares() []model.SubscriptionShare {
 	return out
 }
 
+// SubscriptionSharesUnordered returns every share in no particular order. The
+// publishing resolver runs on every link fetch and decides by prefix length
+// and id, not position, so the sort SubscriptionShares does is pure cost there.
+func (s *Store) SubscriptionSharesUnordered() []model.SubscriptionShare {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]model.SubscriptionShare, 0, len(s.state.SubscriptionShares))
+	for _, share := range s.state.SubscriptionShares {
+		out = append(out, share)
+	}
+	return out
+}
+
 // DeleteSubscriptionShare removes a share, which immediately stops serving its
 // URL.
 func (s *Store) DeleteSubscriptionShare(id string) error {
@@ -122,6 +134,7 @@ func (s *Store) DeleteSubscriptionShare(id string) error {
 			return err
 		}
 		delete(s.state.SubscriptionShares, id)
+		s.invalidateShareTokenIndexLocked()
 		return nil
 	}
 	staged := s.state
@@ -134,6 +147,7 @@ func (s *Store) DeleteSubscriptionShare(id string) error {
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
+		s.invalidateShareTokenIndexLocked()
 	}
 	return err
 }

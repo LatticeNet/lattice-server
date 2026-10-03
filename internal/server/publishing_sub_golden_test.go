@@ -218,6 +218,28 @@ func transcribeAudit(events []model.AuditEvent) string {
 // application/json. The issued subscription URL carries no query parameters and
 // did not move.
 //
+// It was regenerated a second time when links began serving each client its
+// native document. The core now asks the source for the bare document
+// whenever it knows the client is not reading a URI list, so the base64
+// envelope no longer wraps YAML, JSON or Surge profiles. Seven cases moved:
+// bare (a Surge agent) and clash ua render with format plain, and clash ua is
+// labelled text/yaml; target stash, target singbox, platform alias, include
+// unsupported and pretty yaml render with format plain. The bare URL with no
+// agent or an unknown agent still receives the base64 URI list.
+//
+// A third regeneration came with answer-first serving. Every 200 now carries
+// Content-Length and a strong ETag (the bodies here are under the gzip floor,
+// so no Vary or Content-Encoding appears). A successful fetch no longer writes
+// an audit event per request: only the first fetch of a link by a client
+// family is recorded at once (bare for surge, no user agent for other, clash
+// ua for clash), and the rest are counted into an hourly summary. Every
+// refusal is byte for byte what it was.
+//
+// A fourth: every 200 now tells the client its refresh period
+// (Profile-Update-Interval, two hours unless the share sets its own) and a
+// profile name (Content-Disposition, the share's slug). Those two headers are
+// the whole change; the refusals did not move.
+//
 // Treat any future movement the same way: prove it was intended and name the
 // cases that changed, or the URL in someone's proxy client is what moved.
 func TestSubscriptionShareWireTranscriptIsGolden(t *testing.T) {
@@ -247,6 +269,7 @@ func TestSubscriptionShareWireTranscriptIsGolden(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		// Refusal audits are written after the answer, off the request path.
 		s.shareRefusalAudits.Wait()
+		s.shareFetchAudits.Wait()
 
 		fmt.Fprintf(&b, "case %s\n", tc.name)
 		b.WriteString(transcribe(rec))

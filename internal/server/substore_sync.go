@@ -143,6 +143,9 @@ type subStoreSyncState struct {
 // every committed vpn-core write (identity CRUD, bindings, rotation, and
 // applied line-user changes) and never blocks the write path.
 func (s *Server) triggerVPNCoreMutation() {
+	// Links whose records read vpn-core revalidate on their next fetch,
+	// whether or not an external Sub-Store is configured.
+	s.noteVPNCoreChangeForLinks()
 	if s.subStoreSync == nil {
 		return
 	}

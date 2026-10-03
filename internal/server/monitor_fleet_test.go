@@ -93,7 +93,7 @@ func TestFleetWideMonitorNeverRewritesStateFile(t *testing.T) {
 	}
 	var pages []page
 	takePages := func(srv *Server, round int) {
-		srv.flushAlertDigests()
+		srv.sendOwedAlerts(srv.now())
 		for _, n := range *notices {
 			pages = append(pages, page{round: round, event: n.eventType, title: n.title})
 		}

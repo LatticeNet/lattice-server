@@ -15,6 +15,9 @@ func captureTypedNotices(srv *Server) *[]typedNotice {
 	srv.emitNotifyTyped = func(eventType, title, body string) {
 		got = append(got, typedNotice{eventType, title, body})
 	}
+	srv.emitIncidentNotice = func(eventType, title, body string, _ []string) {
+		got = append(got, typedNotice{eventType, title, body})
+	}
 	return &got
 }
 

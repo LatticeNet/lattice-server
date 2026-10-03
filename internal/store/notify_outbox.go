@@ -40,6 +40,10 @@ const (
 	// NotifyOutcomeNoRoute records an event that reached no channel, so "why
 	// was I not told" has an answer instead of a silent drop.
 	NotifyOutcomeNoRoute = "no_route"
+	// NotifyOutcomeSuppressed records a message the server decided not to
+	// send: an incident's message held by a maintenance window or a snooze,
+	// or damped while it flaps. Stored and bounded like no_route rows.
+	NotifyOutcomeSuppressed = "suppressed"
 
 	NotifyRolePrimary  = "primary"
 	NotifyRoleFallback = "fallback"
@@ -156,6 +160,23 @@ type NotifyDelivery struct {
 	// Title and Body are its text.
 	Repeats    int       `json:"repeats,omitempty"`
 	LastSeenAt time.Time `json:"last_seen_at,omitzero"`
+	// BarkLevel overrides a Bark channel's own interruption level for this
+	// delivery; an incident escalation sends at critical. Other channel
+	// kinds ignore it.
+	BarkLevel string `json:"bark_level,omitempty"`
+	// HeldUntil is set when the rule's quiet hours held the delivery; its
+	// first attempt waits until then.
+	HeldUntil time.Time `json:"held_until,omitzero"`
+	// IncidentIDs names the incidents an incident message reports, so a
+	// message quiet hours held can be judged again when the window ends.
+	IncidentIDs []string `json:"incident_ids,omitempty"`
+}
+
+// Unsent reports a row that records a message nobody was sent: no rule
+// routed it, or the server suppressed it. Such rows are bounded and folded
+// together, apart from real deliveries.
+func (d NotifyDelivery) Unsent() bool {
+	return d.Outcome == NotifyOutcomeNoRoute || d.Outcome == NotifyOutcomeSuppressed
 }
 
 // sourceKey is what the per-source floor counts by.
@@ -163,9 +184,10 @@ func (d NotifyDelivery) sourceKey() string {
 	return d.Source + "/" + d.SourceID
 }
 
-// noRouteKey is what repeats of one unrouted event collapse by.
+// noRouteKey is what repeats of one unrouted or suppressed event collapse
+// by.
 func (d NotifyDelivery) noRouteKey() string {
-	return d.Source + "/" + d.SourceID + "/" + d.EventType + "/" + d.Reason
+	return d.Outcome + "/" + d.Source + "/" + d.SourceID + "/" + d.EventType + "/" + d.Reason
 }
 
 // TruncateUTF8 cuts s to at most limit bytes without splitting a character,
@@ -386,7 +408,7 @@ func (o *notifyOutbox) indexLocked(d NotifyDelivery) {
 	} else {
 		o.unsettled[d.ID] = struct{}{}
 	}
-	if d.Outcome == NotifyOutcomeNoRoute {
+	if d.Unsent() {
 		key := d.noRouteKey()
 		if cur, ok := o.rows[o.noRouteLatest[key]]; !ok || !cur.CreatedAt.After(d.CreatedAt) {
 			o.noRouteLatest[key] = d.ID
@@ -442,7 +464,7 @@ func (o *notifyOutbox) evictionLocked(adding []NotifyDelivery) []NotifyDelivery 
 		added[d.ID] = true
 		if _, ok := o.rows[d.ID]; !ok {
 			newRows++
-			if d.Outcome == NotifyOutcomeNoRoute {
+			if d.Unsent() {
 				newNoRoute++
 			}
 		}
@@ -454,14 +476,14 @@ func (o *notifyOutbox) evictionLocked(adding []NotifyDelivery) []NotifyDelivery 
 	noRoute := newNoRoute
 	perSource := map[string]int{}
 	for _, d := range o.rows {
-		if d.Outcome == NotifyOutcomeNoRoute {
+		if d.Unsent() {
 			noRoute++
 		} else {
 			perSource[d.sourceKey()]++
 		}
 	}
 	for _, d := range adding {
-		if _, ok := o.rows[d.ID]; !ok && d.Outcome != NotifyOutcomeNoRoute {
+		if _, ok := o.rows[d.ID]; !ok && !d.Unsent() {
 			perSource[d.sourceKey()]++
 		}
 	}
@@ -476,7 +498,7 @@ func (o *notifyOutbox) evictionLocked(adding []NotifyDelivery) []NotifyDelivery 
 			break
 		}
 		d := o.rows[idFromNotifyKey(key)]
-		if d.Outcome != NotifyOutcomeNoRoute || added[d.ID] {
+		if !d.Unsent() || added[d.ID] {
 			continue
 		}
 		taken[d.ID] = true
@@ -490,7 +512,7 @@ func (o *notifyOutbox) evictionLocked(adding []NotifyDelivery) []NotifyDelivery 
 				return
 			}
 			d := o.rows[idFromNotifyKey(key)]
-			if taken[d.ID] || added[d.ID] || !d.Settled() || d.Outcome == NotifyOutcomeNoRoute {
+			if taken[d.ID] || added[d.ID] || !d.Settled() || d.Unsent() {
 				continue
 			}
 			if respectFloor && perSource[d.sourceKey()] <= NotifyDeliveryFloorPerSource {
@@ -543,8 +565,19 @@ func (s *Store) RecordNotifyDeliveries(rows []NotifyDelivery) error {
 // that row: the count goes up and the text becomes the latest. The folded
 // row is written to bolt at most once per notifyNoRoutePersistEvery.
 func (s *Store) RecordNotifyNoRoute(row NotifyDelivery) error {
-	row = clampNotifyDelivery(row)
 	row.Outcome = NotifyOutcomeNoRoute
+	return s.recordNotifyUnsent(row)
+}
+
+// RecordNotifySuppressed stores a message the server held back, with the
+// reason, folded and bounded exactly like an unrouted event.
+func (s *Store) RecordNotifySuppressed(row NotifyDelivery) error {
+	row.Outcome = NotifyOutcomeSuppressed
+	return s.recordNotifyUnsent(row)
+}
+
+func (s *Store) recordNotifyUnsent(row NotifyDelivery) error {
+	row = clampNotifyDelivery(row)
 	if row.SettledAt.IsZero() {
 		row.SettledAt = row.CreatedAt
 	}
@@ -819,6 +852,9 @@ func (s *Store) RemoveNotifyDigestLines(keys []string) error {
 func cloneNotifyDelivery(d NotifyDelivery) NotifyDelivery {
 	if d.Attempts != nil {
 		d.Attempts = append([]NotifyAttempt(nil), d.Attempts...)
+	}
+	if d.IncidentIDs != nil {
+		d.IncidentIDs = append([]string(nil), d.IncidentIDs...)
 	}
 	return d
 }

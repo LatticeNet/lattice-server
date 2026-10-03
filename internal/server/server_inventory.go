@@ -851,6 +851,15 @@ func (s *Server) sweepNodeLiveness(now time.Time, cause string) {
 		})
 	}
 	s.notifyNodeLiveness(now)
+	s.evaluateAgentHealthIncidents(now)
+	s.sendOwedAlerts(now)
+}
+
+// sendOwedAlerts sends what the emitters decided since the previous sweep:
+// the incident pass (incidents.go) and any digest line an earlier version
+// stored and never sent.
+func (s *Server) sendOwedAlerts(now time.Time) {
+	s.evaluateIncidents(now)
 	s.flushAlertDigests()
 }
 

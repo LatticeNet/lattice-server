@@ -280,6 +280,9 @@ type Store struct {
 	closed bool
 	// notify is the notification outbox (notify_outbox.go). Guarded by mu.
 	notify notifyOutbox
+	// incidentBook holds incidents and maintenance windows (incidents.go).
+	// Guarded by mu.
+	incidentBook incidentBook
 	// linkIndex resolves link tokens without a scan, and shareGen counts
 	// share writes so the index knows when it is out of date; see
 	// link_token_index.go. Guarded by mu.
@@ -5269,7 +5272,10 @@ func (s *Store) MonitorsForNode(nodeID string) []model.Monitor {
 // DeleteMonitor removes a monitor and its result history. The hot store's
 // rows go first: if that fails nothing has changed, and if the state write
 // fails after it the monitor survives with an empty history, which a retry
-// finishes deleting.
+// finishes deleting. Its incidents go only after the state write commits,
+// so a failed write never leaves the monitor without its open incidents and
+// owed recoveries; should that delete fail, the incident sweep closes what
+// it finds open for a monitor that no longer exists.
 func (s *Store) DeleteMonitor(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5288,7 +5294,11 @@ func (s *Store) DeleteMonitor(id string) error {
 			delete(s.monitorPersistedAt, key)
 		}
 	}
-	return s.Save()
+	committed, err := s.persistState(s.jsonPersistState())
+	if committed {
+		_ = s.deleteIncidentsLocked(func(inc Incident) bool { return inc.MonitorID == id })
+	}
+	return err
 }
 
 // UpsertLogSource creates or updates a log source definition.

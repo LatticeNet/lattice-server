@@ -20,9 +20,29 @@ type NotifyRuleOptions struct {
 	// channel of the rule failed it for good. It never equals one of the
 	// rule's own channels.
 	FallbackChannelID string `json:"fallback_channel_id,omitempty"`
+	// Escalation re-sends an unacknowledged critical incident once through
+	// the rule's channels. The zero value is the operator's default
+	// (2026-10-02): on, after 30 minutes, at Bark level critical.
+	EscalationOff        bool   `json:"escalation_off,omitempty"`
+	EscalateAfterMinutes int    `json:"escalate_after_minutes,omitempty"`
+	EscalationBarkLevel  string `json:"escalation_bark_level,omitempty"`
+	// QuietHours holds the rule's non-critical deliveries inside a daily
+	// local window; nil (the default) means no quiet hours.
+	QuietHours *NotifyQuietHours `json:"quiet_hours,omitempty"`
 }
 
-func (o NotifyRuleOptions) zero() bool { return o == NotifyRuleOptions{} }
+// NotifyQuietHours is a daily window in a time zone, Start and End as
+// "15:04". A window whose End is not after Start runs past midnight.
+type NotifyQuietHours struct {
+	Start    string `json:"start"`
+	End      string `json:"end"`
+	TimeZone string `json:"time_zone"`
+}
+
+func (o NotifyRuleOptions) zero() bool {
+	return o.FallbackChannelID == "" && !o.EscalationOff && o.EscalateAfterMinutes == 0 &&
+		o.EscalationBarkLevel == "" && o.QuietHours == nil
+}
 
 // UpsertNotifyRuleWithOptions writes a rule and its options in one save.
 func (s *Store) UpsertNotifyRuleWithOptions(rule model.NotifyRule, opts NotifyRuleOptions) error {
@@ -47,6 +67,10 @@ func (s *Store) NotifyRuleOptionsByRule() map[string]NotifyRuleOptions {
 	defer s.mu.Unlock()
 	out := make(map[string]NotifyRuleOptions, len(s.state.NotifyRuleOptions))
 	for id, opts := range s.state.NotifyRuleOptions {
+		if opts.QuietHours != nil {
+			qh := *opts.QuietHours
+			opts.QuietHours = &qh
+		}
 		out[id] = opts
 	}
 	return out

@@ -19,6 +19,11 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/telemetry"
 )
 
+// fleetHarnessMaxPerMinute is the write rate a quiet fleet must stay under:
+// generous against the one write per five minutes it should make, and far
+// below the one per node per five minutes it used to.
+const fleetHarnessMaxPerMinute = 1.0
+
 // fleetHarnessNode is one simulated agent: its credentials, its address, and
 // the facts it reports unchanged on every cycle, as a healthy node does.
 type fleetHarnessNode struct {
@@ -37,8 +42,12 @@ type fleetHarnessNode struct {
 // sources and guard reality, all reporting facts that do not change.
 //
 // It runs in real time, so it is opt-in: LATTICE_FLEET_HARNESS=<window
-// seconds>. A window of at least 960 covers the 5 minute heartbeat and the
-// 15 minute token and report clocks:
+// seconds>. Run it alone, with -run: it counts writes through the
+// process-wide store telemetry, so any test running beside it adds its own
+// writes to the count. A window of at least 960 covers the 5 minute heartbeat
+// and the 15 minute token and report clocks. It fails above
+// fleetHarnessMaxPerMinute; a quiet fleet writes about 0.2 a minute, and
+// before the heartbeat clock was shared it wrote 8.5:
 //
 //	LATTICE_FLEET_HARNESS=960 go test ./internal/server/ -run TestFleetStateWriteRateHarness -v -timeout 30m
 func TestFleetStateWriteRateHarness(t *testing.T) {
@@ -53,7 +62,11 @@ func TestFleetStateWriteRateHarness(t *testing.T) {
 	window := time.Duration(secs) * time.Second
 	const nodes = 34
 	writes := runFleetHarness(t, nodes, 10*time.Second, 30*time.Second, window)
-	t.Logf("%d nodes, 10s cycle: %d state writes in %s = %.2f per minute", nodes, writes, window, float64(writes)/window.Minutes())
+	perMinute := float64(writes) / window.Minutes()
+	t.Logf("%d nodes, 10s cycle: %d state writes in %s = %.2f per minute", nodes, writes, window, perMinute)
+	if perMinute > fleetHarnessMaxPerMinute {
+		t.Fatalf("a quiet fleet of %d nodes rewrote state.json %.2f times a minute, above %.0f", nodes, perMinute, fleetHarnessMaxPerMinute)
+	}
 }
 
 // runFleetHarness enrolls nodes agents, lets them report every cycle for

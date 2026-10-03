@@ -552,6 +552,45 @@ func TestNodeConfinedTokenActsOnlyOnItsNodes(t *testing.T) {
 	if len(list.Incidents) != 3 || len(list.Windows) != 1 {
 		t.Fatalf("operator list: %d incidents, %d windows", len(list.Incidents), len(list.Windows))
 	}
+
+	// A window the operator set over both nodes is shown to the confined
+	// token with only the node it can read, and it cannot change it.
+	res = doJSON(t, h.f.handler, http.MethodPost, "/api/maintenance-windows", window(`["node-a","node-b"]`, `[]`), cookies, csrf)
+	var shared store.MaintenanceWindow
+	if err := json.NewDecoder(res.Body).Decode(&shared); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	for _, path := range []string{"/api/maintenance-windows", "/api/incidents"} {
+		res = doBearerJSON(t, h.f.handler, http.MethodGet, path, "", token)
+		var got struct {
+			Windows []store.MaintenanceWindow `json:"windows"`
+		}
+		if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		found := false
+		for _, mw := range got.Windows {
+			if mw.ID != shared.ID {
+				continue
+			}
+			found = true
+			if strings.Join(mw.NodeIDs, ",") != "node-a" {
+				t.Errorf("%s: the shared window's nodes = %v, want only node-a", path, mw.NodeIDs)
+			}
+		}
+		if !found {
+			t.Errorf("%s: the shared window is not shown to the confined token", path)
+		}
+	}
+	edit := fmt.Sprintf(`{"id":%q,"name":"w","node_ids":["node-a"],"group_ids":[],"ends_at":%q}`, shared.ID, h.now().Add(time.Hour).Format(time.RFC3339))
+	if got := status("/api/maintenance-windows", edit, token); got != http.StatusForbidden {
+		t.Errorf("the confined token narrowed the shared window: %d", got)
+	}
+	if mw, _ := h.f.st.MaintenanceWindow(shared.ID); strings.Join(mw.NodeIDs, ",") != "node-a,node-b" {
+		t.Errorf("the shared window changed: %v", mw.NodeIDs)
+	}
 }
 
 // Window edits are validated and audited, and ending one early lets a held

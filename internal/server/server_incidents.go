@@ -201,7 +201,7 @@ func (s *Server) handleIncidents(w http.ResponseWriter, r *http.Request, p princ
 	}
 	for _, mw := range s.store.MaintenanceWindows() {
 		if mw.ActiveAt(now) && maintenanceWindowVisible(p, mw) {
-			resp.Windows = append(resp.Windows, mw)
+			resp.Windows = append(resp.Windows, maintenanceWindowFor(p, mw))
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -447,6 +447,24 @@ func maintenanceWindowVisible(p principal, mw store.MaintenanceWindow) bool {
 	return false
 }
 
+// maintenanceWindowFor is a visible window as p may read it: a node-confined
+// reader sees only the nodes it can read in node_ids, not the ids of the
+// others. It cannot edit such a window either way, since a change needs
+// monitor:admin on every node the window already covers.
+func maintenanceWindowFor(p principal, mw store.MaintenanceWindow) store.MaintenanceWindow {
+	if !principalHasNodeRestriction(p) {
+		return mw
+	}
+	nodeIDs := make([]string, 0, len(mw.NodeIDs))
+	for _, nodeID := range mw.NodeIDs {
+		if rbac.Allows(p.Principal, "monitor:read", nodeID) {
+			nodeIDs = append(nodeIDs, nodeID)
+		}
+	}
+	mw.NodeIDs = nodeIDs
+	return mw
+}
+
 // authorizeMaintenanceWindow checks the caller may set a window over these
 // nodes and groups: monitor:admin on every node, and an unrestricted token
 // for any group.
@@ -474,7 +492,7 @@ func (s *Server) handleMaintenanceWindows(w http.ResponseWriter, r *http.Request
 		out := []store.MaintenanceWindow{}
 		for _, mw := range s.store.MaintenanceWindows() {
 			if maintenanceWindowVisible(p, mw) {
-				out = append(out, mw)
+				out = append(out, maintenanceWindowFor(p, mw))
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"windows": out, "now": s.now()})

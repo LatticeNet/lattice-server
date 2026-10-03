@@ -127,11 +127,5 @@ func (s *Server) flushShareRefusalAudit(now time.Time) {
 }
 
 func (s *Server) startShareRefusalAuditFlush() {
-	go func() {
-		ticker := time.NewTicker(shareRefusalAuditFlushEvery)
-		defer ticker.Stop()
-		for range ticker.C {
-			s.flushShareRefusalAudit(s.now())
-		}
-	}()
+	s.runShareFlusher(shareRefusalAuditFlushEvery, func() { s.flushShareRefusalAudit(s.now()) })
 }

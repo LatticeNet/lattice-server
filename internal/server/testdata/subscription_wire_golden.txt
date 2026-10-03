@@ -1,181 +1,220 @@
 case bare
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "84"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"1c1fca8a0087a82cc13229d213e52fa5\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
-  body: "share=share_golden format=base64 ua=surge target= iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.1 source_version=v-golden stale=false token_sha256=<redacted> ua_class=surge
+  body: "share=share_golden format=plain ua=surge target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow reason=first fetch from this client family cache=false format=plain share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.1 source_version=v-golden stale=false token_sha256=<redacted> ua_class=surge
 
 case no user agent
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "85"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"a865a5e8b0b6d9e223c1a95edfbb567e\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
   body: "share=share_golden format=base64 ua=other target= iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.2 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+  audit subscription.share.fetch/allow reason=first fetch from this client family cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.2 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
 
 case curl
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "85"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"a865a5e8b0b6d9e223c1a95edfbb567e\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
   body: "share=share_golden format=base64 ua=other target= iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=true format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.3 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
 
 case clash ua
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "84"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
-  header Content-Type: "text/plain; charset=utf-8"
+  header Content-Type: "text/yaml; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"2f3cfac200c09181d8245d1d0991bcc8\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
-  body: "share=share_golden format=base64 ua=clash target= iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.4 source_version=v-golden stale=false token_sha256=<redacted> ua_class=clash
+  body: "share=share_golden format=plain ua=clash target= iup=false py=false raw=golden-nodes"
+  audit subscription.share.fetch/allow reason=first fetch from this client family cache=false format=plain share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.4 source_version=v-golden stale=false token_sha256=<redacted> ua_class=clash
 
 case explicit format plain
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "84"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"39301949f2bcbe4eab2c2e7f696f30bd\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
   body: "share=share_golden format=plain ua=other target= iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=false format=plain share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.5 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
 
 case target stash
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "89"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/yaml; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"c7a02dc5e9c66a5ee801eac0c245a883\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
-  body: "share=share_golden format=base64 ua=other target=Stash iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.6 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+  body: "share=share_golden format=plain ua=other target=Stash iup=false py=false raw=golden-nodes"
 
 case target singbox
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "92"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "application/json; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"2e94e0031da6e100ee05944bf3d1c34b\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
-  body: "share=share_golden format=base64 ua=other target=sing-box iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.7 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+  body: "share=share_golden format=plain ua=other target=sing-box iup=false py=false raw=golden-nodes"
 
 case platform alias
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "89"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/yaml; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"c7a02dc5e9c66a5ee801eac0c245a883\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
-  body: "share=share_golden format=base64 ua=other target=Stash iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=true format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.8 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+  body: "share=share_golden format=plain ua=other target=Stash iup=false py=false raw=golden-nodes"
 
 case include unsupported
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "88"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/yaml; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"d17917fdb72fcaf2ba83dbc835b1ca50\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
-  body: "share=share_golden format=base64 ua=other target=Stash iup=true py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.9 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+  body: "share=share_golden format=plain ua=other target=Stash iup=true py=false raw=golden-nodes"
 
 case pretty yaml
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "88"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/yaml; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"11adf88affc5330dc15742afa23ad0ae\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
-  body: "share=share_golden format=base64 ua=other target=Stash iup=false py=true raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=false format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.10 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
+  body: "share=share_golden format=plain ua=other target=Stash iup=false py=true raw=golden-nodes"
 
 case no flow
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "85"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"5fb009a8335d5202d858d41fc84dd099\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
   body: "share=share_golden format=base64 ua=other target= iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=true format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.11 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
 
 case other host
   status: 200
   header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"cd-self\"; filename*=UTF-8''cd-self"
+  header Content-Length: "85"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
   header Content-Type: "text/plain; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"a865a5e8b0b6d9e223c1a95edfbb567e\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
   header Subscription-Userinfo: "upload=1; download=2; total=3"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
   header X-Lattice-Request-Id: "<per-request>"
   body: "share=share_golden format=base64 ua=other target= iup=false py=false raw=golden-nodes"
-  audit subscription.share.fetch/allow cache=true format=base64 share_id=share_golden slug=cd-self snapshot_age_seconds=0 source_ip=192.0.2.12 source_version=v-golden stale=false token_sha256=<redacted> ua_class=other
 
 case deny unknown token
   status: 404

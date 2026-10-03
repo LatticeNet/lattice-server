@@ -982,8 +982,136 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "- service restart is delayed so the current agent can post the task result\n")
 	fmt.Fprintf(&b, "- the download gives up after 20 s without a connection or 300 s in total, so a node without egress to the source fails the task instead of hanging it\n")
 	fmt.Fprintf(&b, "- default/legacy install targets follow the running lattice-agent path and default service may follow the running systemd unit\n")
+	fmt.Fprintf(&b, "%s\n", agentUpdateKeepalivePlanLine)
+	fmt.Fprintf(&b, "%s\n", agentUpdateGuardPlanLine)
 	fmt.Fprintf(&b, "- execution still requires node-agent -allow-exec and root updates require -allow-root-exec\n")
 	return b.String()
+}
+
+// The plan lines that authorize the keepalive drop-in and the update guard.
+// The apply script adds each step only to an approval whose plan carries its
+// line, so an approval planned before they existed runs exactly the script it
+// was approved with.
+const (
+	agentUpdateKeepalivePlanLine = "- keepalive: a binary that advertises sd-notify-v1 in -compat-json gets the unit drop-in 10-lattice-keepalive.conf (NotifyAccess=main and a runtime directory; the unit type is unchanged), so it can arm its own 120 s watchdog"
+	agentUpdateGuardPlanLine     = "- update guard: when the new binary also advertises health-marker-v1, a timer restores the previous binary and restarts the service if the new agent has not completed its first hello within 300 s; the timer lives in /run, so a reboot before it fires cancels the guard and keeps the new binary"
+	// agentUpdateGuardDelay is how long the new agent has to complete its
+	// first hello. Hello follows durable recovery and IP discovery, seconds on
+	// any node; five minutes also covers a slow first resolver round. A node
+	// whose startup recovery runs longer is restored, and its previous binary
+	// resumes the same crash-safe recovery.
+	agentUpdateGuardDelay = "300s"
+	// agentUpdateTimerAccuracy makes the guard and restart timers fire within
+	// a second of their delay instead of systemd's default one minute
+	// AccuracySec. systemd-run gained --timer-property in systemd 229; on an
+	// older systemd the script leaves it out and the default applies.
+	agentUpdateTimerAccuracy = "--timer-property=AccuracySec=1s"
+)
+
+// agentUpdateGuardScript is written to a root-only file under /run and run by
+// a transient systemd unit, outside the agent's cgroup, agentUpdateGuardDelay
+// after the update. Its inputs come from the environment systemd-run sets, so
+// no value is quoted into it. It keeps the new binary when the new agent
+// wrote its version to the health marker, leaves a binary that changed since
+// the update alone (a later update owns it), and otherwise restores the
+// backup and restarts the service. The keepalive drop-in stays: it is inert
+// under a binary that never notifies.
+const agentUpdateGuardScript = `trap "rm -f $0" EXIT
+  m="$LATTICE_GUARD_MARKER"
+  if [ -r "$m" ] && [ "$(cat "$m")" = "$LATTICE_GUARD_VERSION" ]; then
+    echo "lattice agent update guard: $LATTICE_GUARD_VERSION completed its first hello, keeping it"
+    exit 0
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then now=$(sha256sum "$LATTICE_GUARD_TARGET" | cut -d" " -f1); else now=$(shasum -a 256 "$LATTICE_GUARD_TARGET" | cut -d" " -f1); fi
+  if [ "$now" != "$LATTICE_GUARD_SHA" ]; then
+    echo "lattice agent update guard: $LATTICE_GUARD_TARGET changed since the update, leaving it"
+    exit 0
+  fi
+  echo "lattice agent update guard: $LATTICE_GUARD_VERSION did not complete its first hello in time, restoring $LATTICE_GUARD_BACKUP" >&2
+  cp -p "$LATTICE_GUARD_BACKUP" "$LATTICE_GUARD_TARGET.rollback"
+  mv "$LATTICE_GUARD_TARGET.rollback" "$LATTICE_GUARD_TARGET"
+  systemctl restart "$LATTICE_GUARD_SERVICE"
+`
+
+// agentUpdateCompatStep reads the candidate's -compat-json, whose features
+// decide the keepalive and guard steps. An older candidate prints no
+// features, and an empty answer turns both steps off. It also probes whether
+// systemd-run can set timer properties, which the guard and restart timers
+// use for one second accuracy.
+func agentUpdateCompatStep(plan string) string {
+	if !strings.Contains(plan, agentUpdateKeepalivePlanLine) {
+		return ""
+	}
+	return "CANDIDATE_COMPAT=$(\"$CANDIDATE\" -compat-json 2>/dev/null || true)\n" +
+		"TIMER_ACCURACY=\"\"\n" +
+		"if systemd-run --help 2>/dev/null | grep -q -- '--timer-property'; then TIMER_ACCURACY=" + shellQuote(agentUpdateTimerAccuracy) + "; fi\n"
+}
+
+// agentUpdateRestartStep schedules the restart that brings up the new binary.
+// An approval whose plan predates the keepalive line keeps the exact line it
+// was approved with; a newer one adds the timer accuracy the compat step
+// probed, so the guard's 300 s count and the restart start together.
+func agentUpdateRestartStep(plan string) string {
+	if !strings.Contains(plan, agentUpdateKeepalivePlanLine) {
+		return "systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n"
+	}
+	return "systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s $TIMER_ACCURACY /bin/systemctl restart \"$SERVICE\" >/dev/null\n"
+}
+
+// agentUpdateKeepaliveStep writes the keepalive drop-in when the candidate
+// advertises sd-notify-v1. It runs after the binary is in place and before
+// the daemon-reload that precedes the delayed restart.
+func agentUpdateKeepaliveStep(plan string) string {
+	if !strings.Contains(plan, agentUpdateKeepalivePlanLine) {
+		return ""
+	}
+	return "UNIT_NAME=\"${SERVICE%.service}\"\n" +
+		"DROPIN_DIR=\"/etc/systemd/system/$UNIT_NAME.service.d\"\n" +
+		"DROPIN=\"$DROPIN_DIR/10-lattice-keepalive.conf\"\n" +
+		"KEEPALIVE=0\n" +
+		"case \"$CANDIDATE_COMPAT\" in\n" +
+		"  *'\"sd-notify-v1\"'*)\n" +
+		"    KEEPALIVE=1\n" +
+		"    mkdir -p \"$DROPIN_DIR\"\n" +
+		"    printf '%s\\n' '# Written by the Lattice agent installer or an agent update.' '[Service]' 'NotifyAccess=main' \"RuntimeDirectory=$UNIT_NAME\" 'RuntimeDirectoryMode=0700' >\"$DROPIN.new\"\n" +
+		"    chmod 0644 \"$DROPIN.new\"\n" +
+		"    mv \"$DROPIN.new\" \"$DROPIN\"\n" +
+		"    echo \"lattice agent update: wrote keepalive drop-in $DROPIN\"\n" +
+		"    ;;\n" +
+		"esac\n"
+}
+
+// agentUpdateGuardStep arms the dead-man timer when the candidate advertises
+// health-marker-v1, the drop-in that gives it a runtime directory was
+// written, and there is a previous binary to restore. It is armed before the
+// restart is scheduled, so the restart can never run without it.
+func agentUpdateGuardStep(plan string) string {
+	if !strings.Contains(plan, agentUpdateKeepalivePlanLine) || !strings.Contains(plan, agentUpdateGuardPlanLine) {
+		return ""
+	}
+	return "case \"$CANDIDATE_COMPAT\" in\n" +
+		"  *'\"health-marker-v1\"'*)\n" +
+		"    if [ \"$KEEPALIVE\" = 1 ] && [ -n \"$BACKUP\" ]; then\n" +
+		"      GUARD_UNIT=\"lattice-agent-update-guard-$(date +%Y%m%d%H%M%S)-$$\"\n" +
+		"      GUARD_FILE=\"/run/$GUARD_UNIT.sh\"\n" +
+		"      printf '%s\\n' " + shellQuote(agentUpdateGuardScript) + " >\"$GUARD_FILE\"\n" +
+		"      if ! systemd-run --unit=\"$GUARD_UNIT\" --on-active=" + agentUpdateGuardDelay + " $TIMER_ACCURACY --description=\"Lattice agent update guard for $TARGET_VERSION\"" +
+		" --setenv=LATTICE_GUARD_TARGET=\"$TARGET\" --setenv=LATTICE_GUARD_BACKUP=\"$BACKUP\" --setenv=LATTICE_GUARD_SERVICE=\"$SERVICE\"" +
+		" --setenv=LATTICE_GUARD_MARKER=\"/run/$UNIT_NAME/healthy\" --setenv=LATTICE_GUARD_VERSION=\"$TARGET_VERSION\" --setenv=LATTICE_GUARD_SHA=\"$EXPECT_SHA\"" +
+		" /bin/sh \"$GUARD_FILE\" >/dev/null; then\n" +
+		"        rm -f \"$GUARD_FILE\"\n" +
+		// The plan promised a guard. Without one the update does not
+		// proceed: the previous binary goes back and the running agent,
+		// which was never restarted, carries on.
+		"        cp -p \"$BACKUP\" \"$TARGET.rollback\"\n" +
+		"        mv \"$TARGET.rollback\" \"$TARGET\"\n" +
+		"        echo \"lattice agent update: could not arm the update guard; restored $BACKUP and left the running agent alone\" >&2\n" +
+		"        exit 1\n" +
+		"      fi\n" +
+		"      echo \"lattice agent update: armed $GUARD_UNIT, which restores $BACKUP unless $TARGET_VERSION completes its first hello within " + agentUpdateGuardDelay + "\"\n" +
+		"    fi\n" +
+		"    ;;\n" +
+		"esac\n"
 }
 
 func agentUpdateApprovalAction(payload agentUpdatePayload) string {
@@ -1439,15 +1567,20 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"  echo \"lattice agent update: version mismatch expected=$TARGET_VERSION actual=$CANDIDATE_VERSION\" >&2\n" +
 		"  exit 1\n" +
 		"fi\n" +
+		agentUpdateCompatStep(approval.Plan) +
 		"mkdir -p \"$(dirname \"$TARGET\")\"\n" +
+		"BACKUP=\"\"\n" +
 		"if [ -e \"$TARGET\" ]; then\n" +
-		"  cp -p \"$TARGET\" \"$TARGET.bak.$(date +%Y%m%d%H%M%S)\"\n" +
+		"  BACKUP=\"$TARGET.bak.$(date +%Y%m%d%H%M%S)\"\n" +
+		"  cp -p \"$TARGET\" \"$BACKUP\"\n" +
 		"fi\n" +
 		"install -m 0755 \"$CANDIDATE\" \"$TARGET.new\"\n" +
 		"mv \"$TARGET.new\" \"$TARGET\"\n" +
+		agentUpdateKeepaliveStep(approval.Plan) +
 		"systemctl daemon-reload\n" +
+		agentUpdateGuardStep(approval.Plan) +
 		"RESTART_UNIT=\"lattice-agent-delayed-restart-$(date +%Y%m%d%H%M%S)-$$\"\n" +
-		"systemd-run --unit=\"$RESTART_UNIT\" --on-active=3s /bin/systemctl restart \"$SERVICE\" >/dev/null\n" +
+		agentUpdateRestartStep(approval.Plan) +
 		"echo \"lattice agent update: installed $TARGET_VERSION and scheduled $SERVICE restart via $RESTART_UNIT\"\n", nil
 }
 

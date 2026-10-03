@@ -54,6 +54,8 @@ var (
 	boltBucketDDNS             = []byte("ddns")
 	boltBucketMonitors         = []byte("monitors")
 	boltBucketMonResults       = []byte("monitor_results")
+	boltBucketMonResultRows    = []byte("monitor_result_rows")
+	boltBucketMonResultLatest  = []byte("monitor_result_latest")
 	boltBucketLogSources       = []byte("log_sources")
 	boltBucketNotifyChannels   = []byte("notify_channels")
 	boltBucketNotifyRules      = []byte("notify_rules")
@@ -64,6 +66,7 @@ var (
 	boltBucketGuardReality     = []byte("guard_reality_snapshots")
 	boltBucketSingBoxLiveness  = []byte("singbox_liveness")
 	boltBucketNodeOfflineAlert = []byte("node_offline_alerts")
+	boltBucketLineTemplates    = []byte("line_client_templates")
 	boltBucketDNSDeployments   = []byte("dns_deployments")
 	boltBucketNetPolicies      = []byte("net_policies")
 	boltBucketGroups           = []byte("groups")
@@ -131,6 +134,39 @@ func readBoltMigrations(tx *bolt.Tx, into map[string]time.Time) error {
 	return nil
 }
 
+// boltKeyNotifyRuleOptions holds State.NotifyRuleOptions in the meta bucket,
+// so the offline migrate round trip keeps a rule's fallback channel. The map
+// is small operator config written only on rule edits; the running server
+// reads it from the JSON state, never from here.
+var boltKeyNotifyRuleOptions = []byte("notify_rule_options")
+
+func putBoltNotifyRuleOptions(tx *bolt.Tx, opts map[string]NotifyRuleOptions) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if len(opts) == 0 {
+		return meta.Delete(boltKeyNotifyRuleOptions)
+	}
+	raw, err := json.Marshal(opts)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyNotifyRuleOptions, raw)
+}
+
+func readBoltNotifyRuleOptions(tx *bolt.Tx, into map[string]NotifyRuleOptions) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil
+	}
+	raw := meta.Get(boltKeyNotifyRuleOptions)
+	if len(raw) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(raw, &into); err != nil {
+		return fmt.Errorf("decode notify rule options: %w", err)
+	}
+	return nil
+}
+
 var boltStateBuckets = [][]byte{
 	boltBucketUsers,
 	boltBucketTokens,
@@ -157,6 +193,8 @@ var boltStateBuckets = [][]byte{
 	boltBucketDDNS,
 	boltBucketMonitors,
 	boltBucketMonResults,
+	boltBucketMonResultRows,
+	boltBucketMonResultLatest,
 	boltBucketLogSources,
 	boltBucketNotifyChannels,
 	boltBucketNotifyRules,
@@ -167,6 +205,7 @@ var boltStateBuckets = [][]byte{
 	boltBucketGuardReality,
 	boltBucketSingBoxLiveness,
 	boltBucketNodeOfflineAlert,
+	boltBucketLineTemplates,
 	boltBucketDNSDeployments,
 	boltBucketNetPolicies,
 	boltBucketGroups,
@@ -426,6 +465,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltMigrations(tx, persist.Migrations); err != nil {
 			return err
 		}
+		if err := putBoltNotifyRuleOptions(tx, persist.NotifyRuleOptions); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
 			return err
 		}
@@ -456,7 +498,7 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putMap(tx, boltBucketMonitors, persist.Monitors); err != nil {
 			return err
 		}
-		if err := putMap(tx, boltBucketMonResults, persist.MonResults); err != nil {
+		if err := importMonitorResultSeriesTx(tx, persist.MonResults, MonitorResultsPerPair); err != nil {
 			return err
 		}
 		if err := putMap(tx, boltBucketLogSources, persist.LogSources); err != nil {
@@ -484,6 +526,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 			return err
 		}
 		if err := putMap(tx, boltBucketNodeOfflineAlert, persist.NodeOfflineAlerts); err != nil {
+			return err
+		}
+		if err := putMap(tx, boltBucketLineTemplates, persist.LineClientTemplates); err != nil {
 			return err
 		}
 		if err := putMap(tx, boltBucketGuardReality, persist.GuardRealitySnapshots); err != nil {
@@ -671,6 +716,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 		if err := readBoltMigrations(tx, st.Migrations); err != nil {
 			return err
 		}
+		if err := readBoltNotifyRuleOptions(tx, st.NotifyRuleOptions); err != nil {
+			return err
+		}
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {
 			return err
 		}
@@ -701,9 +749,6 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 		if err := readMap(tx, boltBucketMonitors, st.Monitors); err != nil {
 			return err
 		}
-		if err := readMap(tx, boltBucketMonResults, st.MonResults); err != nil {
-			return err
-		}
 		if err := readMap(tx, boltBucketLogSources, st.LogSources); err != nil {
 			return err
 		}
@@ -729,6 +774,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		if err := readMap(tx, boltBucketNodeOfflineAlert, st.NodeOfflineAlerts); err != nil {
+			return err
+		}
+		if err := readMap(tx, boltBucketLineTemplates, st.LineClientTemplates); err != nil {
 			return err
 		}
 		if err := readMap(tx, boltBucketGuardReality, st.GuardRealitySnapshots); err != nil {
@@ -782,6 +830,15 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 				return err
 			}
 			if err := readMap(tx, boltBucketNodeStatusEvents, st.NodeStatusEvents); err != nil {
+				return err
+			}
+			// Monitor results take the same placement. A state.db written
+			// before the rows existed still carries its series in the legacy
+			// bucket, so the export reads both.
+			if err := readMap(tx, boltBucketMonResults, st.MonResults); err != nil {
+				return err
+			}
+			if err := readMonitorResultRowsTx(tx, st.MonResults); err != nil {
 				return err
 			}
 		}
@@ -1767,79 +1824,8 @@ func (bs *BoltStateStore) DeleteMonitor(id string) error {
 		if err := deleteRecord(tx, boltBucketMonitors, id); err != nil {
 			return err
 		}
-		return deleteRecord(tx, boltBucketMonResults, id)
+		return deleteMonitorResultsTx(tx, id)
 	})
-}
-
-func (bs *BoltStateStore) AddMonitorResult(r model.MonitorResult) error {
-	if r.At.IsZero() {
-		r.At = time.Now().UTC()
-	}
-	return bs.db.Update(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		series := []model.MonitorResult{}
-		ok, err := getRecord(tx, boltBucketMonResults, r.MonitorID, &series)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			series = []model.MonitorResult{}
-		}
-		series = append(series, r)
-		if len(series) > maxMonitorResults {
-			series = series[len(series)-maxMonitorResults:]
-		}
-		return putRecord(tx, boltBucketMonResults, r.MonitorID, series)
-	})
-}
-
-func (bs *BoltStateStore) MonitorResults(monitorID string) ([]model.MonitorResult, error) {
-	series := []model.MonitorResult{}
-	err := bs.db.View(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		ok, err := getRecord(tx, boltBucketMonResults, monitorID, &series)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			series = []model.MonitorResult{}
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return append([]model.MonitorResult(nil), series...), nil
-}
-
-func (bs *BoltStateStore) LastMonitorResultForNode(monitorID, nodeID string) (model.MonitorResult, bool, error) {
-	var series []model.MonitorResult
-	err := bs.db.View(func(tx *bolt.Tx) error {
-		if err := checkBoltVersion(tx); err != nil {
-			return err
-		}
-		ok, err := getRecord(tx, boltBucketMonResults, monitorID, &series)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			series = nil
-		}
-		return nil
-	})
-	if err != nil {
-		return model.MonitorResult{}, false, err
-	}
-	for i := len(series) - 1; i >= 0; i-- {
-		if series[i].NodeID == nodeID {
-			return series[i], true, nil
-		}
-	}
-	return model.MonitorResult{}, false, nil
 }
 
 func (bs *BoltStateStore) UpsertTunnel(t model.TunnelProfile) error {

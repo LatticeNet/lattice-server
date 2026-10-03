@@ -422,7 +422,7 @@ func (f *fakeHostServices) Put(ctx context.Context, key string, value []byte) er
 	return nil
 }
 
-func (f *fakeHostServices) Send(ctx context.Context, title, body string) error {
+func (f *fakeHostServices) Send(ctx context.Context, pluginID, title, body string) error {
 	f.notifies++
 	return nil
 }

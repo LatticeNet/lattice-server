@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -233,8 +234,36 @@ type Server struct {
 	shareResolvedRefusalAudit *auditFailureThrottle
 	shareRefusalAudits        sync.WaitGroup
 	shareRefusalAuditHook     func()
-	apiLimiter                *ratelimit.Limiter
-	subLimiter                *ratelimit.Limiter
+	// shareRenderFlights holds the share renders in flight, one per cache
+	// key, so concurrent misses for one key run one render; see
+	// share_render_flight.go. shareRenderJoinWaiter (tests only) is signalled
+	// when a request joins a flight instead of starting one.
+	// shareFetchStats counts successful link fetches per link per hour and
+	// remembers which client families fetched each link; see
+	// share_fetch_stats.go. shareFetchAudits counts its audit writes still in
+	// flight.
+	shareFetchStats     *shareFetchStats
+	shareFetchAudits    sync.WaitGroup
+	shareFetchAuditHook func()
+	// shareFlushStop stops the minute flushers of the link audits (fetch
+	// summaries and refusal summaries) before Close writes the last ones;
+	// shareFlushers counts the flushers still running.
+	shareFlushStop     chan struct{}
+	shareFlushStopOnce sync.Once
+	shareFlushers      sync.WaitGroup
+	// shareRenderBudget bounds the plugin renders one link's cache misses
+	// may start; see share_render_budget.go.
+	shareRenderBudget *shareRenderBudget
+	// vpnCoreGen advances on every committed vpn-core write; a plugin link
+	// source refreshed before the current generation is due. See
+	// share_fleet_changes.go. vpnCoreLinks paces the advances.
+	vpnCoreGen            atomic.Uint64
+	vpnCoreLinks          vpnCoreLinkChanges
+	shareRenderMu         sync.Mutex
+	shareRenderFlights    map[subscriptionCacheKey]*shareRenderFlight
+	shareRenderJoinWaiter chan struct{}
+	apiLimiter            *ratelimit.Limiter
+	subLimiter            *ratelimit.Limiter
 	// logIngestLimiter brakes per-source log ingest (keyed by source id) in
 	// lines/sec so a chatty or hostile node cannot flood the store; over budget
 	// returns 429 + Retry-After. Disk is independently bounded by the store caps.
@@ -300,9 +329,19 @@ type Server struct {
 	// alertDigest batches service and monitor alerts decided one node at a
 	// time into one message per kind per sweep; see alert_digest.go.
 	alertDigest alertDigest
+	// monitorDrops rate-limits the log line for agent monitor results the
+	// store refused; see server_monitor_results.go.
+	monitorDrops monitorDropLog
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight
+	// outbox drains the stored notification outbox; see notify_outbox.go.
+	outbox notifyOutboxRunner
+	// notifySend delivers one message to one channel; overridable in tests,
+	// since the real sender refuses the loopback listener a test runs.
+	notifySend func(ctx context.Context, channel model.NotifyChannel, msg notify.Message) error
+	// notifyRetryDelays is the wait before each retry; tests shorten it.
+	notifyRetryDelays []time.Duration
 	// plugins is the verified, registered plugin set established at startup.
 	plugins []plugin.Loaded
 	// subscriptionDecoy shapes the answer every non-servable subscription request
@@ -406,6 +445,12 @@ type Server struct {
 	// simply repopulates it from the next round of reports.
 	singboxInvMu sync.RWMutex
 	singboxInv   map[string]model.SingBoxInventory
+	// lineTemplateSyncMu serialises syncLineClientTemplates, and
+	// lineTemplatePending holds, per line hash, a changed template seen at
+	// one sync and not yet confirmed by the next (syncLineClientTemplates
+	// says why). In memory only: a restart costs one more minute of lag.
+	lineTemplateSyncMu  sync.Mutex
+	lineTemplatePending map[string]store.LineClientTemplate
 	// singboxDiscoverAudit tracks the last audited discovery fingerprint per
 	// node so automatic inventory reports do not append an audit row, and
 	// therefore rewrite the encrypted JSON store, on every agent poll.
@@ -604,6 +649,8 @@ func New(opts Options) (*Server, error) {
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
 		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
+		shareFetchStats:       newShareFetchStats(),
+		shareFlushStop:        make(chan struct{}),
 		subscriptionDecoy:     opts.SubscriptionDecoy,
 		now:                   func() time.Time { return time.Now().UTC() },
 		tlsMonitorTargets:     defaultTLSMonitorTargets,
@@ -613,6 +660,7 @@ func New(opts Options) (*Server, error) {
 	if s.reminderInterval <= 0 {
 		s.reminderInterval = time.Hour
 	}
+	s.shareRenderBudget = newShareRenderBudget(func() time.Time { return s.now() })
 	if s.taskExecutionDisabled {
 		s.logger.Printf("WARNING: task execution fleet kill switch is enabled; new tasks will not queue and agents will receive no task leases")
 	}
@@ -621,6 +669,13 @@ func New(opts Options) (*Server, error) {
 	}
 	s.emitNotify = s.notifyEvent
 	s.emitNotifyTyped = s.notifyEventTyped
+	s.notifySend = defaultNotifySend
+	s.notifyRetryDelays = notifyRetryDelays
+	// Before anything can notify: answer what the previous process left in
+	// the outbox, and take back the digest lines it had queued. The redriven
+	// rows are sent when the background loops start below.
+	s.restoreAlertDigest()
+	redrive := s.reconcileNotifyOutbox()
 	s.pluginRPC = plugin.NewRPCRegistry()
 	// In-core providers are wired once at boot and never unregistered, so without a
 	// lifecycle predicate a disabled plugin's backend kept serving — disable would only
@@ -635,6 +690,13 @@ func New(opts Options) (*Server, error) {
 	// subscription-render substrate (design-12 S2).
 	if err := s.migrateProxyUsersToVpnUsers(); err != nil {
 		return nil, fmt.Errorf("migrate vpn user secrets: %w", err)
+	}
+	// Once per store, after the identities exist: what approval history says
+	// each binding's node holds (identity-sub P3). The field is advisory, so
+	// a failure is logged rather than fatal: its marker is written only with
+	// a successful backfill, so the next boot tries again.
+	if err := s.backfillLineUserAppliedCredentials(); err != nil {
+		s.logger.Printf("vpn-core: %v; the next boot retries it", err)
 	}
 	// Before the scheduler's first run, so machines that already carry a
 	// renewal date are reminded from the first evaluation.
@@ -681,6 +743,11 @@ func New(opts Options) (*Server, error) {
 		s.startDDNSSweep()
 		s.startTLSMonitorSweep()
 		s.startShareRefusalAuditFlush()
+		if redrive > 0 {
+			s.wakeNotifyOutbox()
+		}
+		s.startShareFetchStatsFlush()
+		s.startLineClientTemplateSync()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1194,6 +1261,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/notify/test", s.withAuth("notify:send", s.handleNotifyTest))
 	mux.HandleFunc("/api/notify/channels", s.withAuth("notify:admin", s.handleNotifyChannels))
 	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:admin", s.handleDeleteNotifyChannel))
+	mux.HandleFunc("/api/notify/channels/test", s.withAuth("notify:admin", s.handleNotifyChannelTest))
+	mux.HandleFunc("/api/notify/deliveries", s.withAuth("notify:admin", s.handleNotifyDeliveries))
 	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:admin", s.handleNotifyRules))
 	mux.HandleFunc("/api/notify/rules/delete", s.withAuth("notify:admin", s.handleDeleteNotifyRule))
 	mux.HandleFunc("/api/notify/webhooks", s.withAuth("notify:admin", s.handleNotifyWebhooks))
@@ -1352,6 +1421,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/config", s.withAgentLimit(s.handleAgentConfig))
 	mux.HandleFunc("/api/agent/monitors", s.withAgentLimit(s.handleAgentMonitors))
 	mux.HandleFunc("/api/agent/monitor-result", s.withAgentLimit(s.handleAgentMonitorResult))
+	mux.HandleFunc("/api/agent/monitor-results", s.withAgentLimit(s.handleAgentMonitorResults))
 	mux.HandleFunc("/api/agent/log-sources", s.withAgentLimit(s.handleAgentLogSources))
 	mux.HandleFunc("/api/agent/logs", s.withAgentLimit(s.handleAgentLogs))
 	mux.HandleFunc("/api/agent/trace-config", s.withAgentLimit(s.handleAgentTraceConfig))
@@ -1376,19 +1446,46 @@ func (s *Server) Handler() http.Handler {
 }
 
 // Close sends the alerts still queued for the next sweep, stops
-// runtime-owned subprocesses and waits for their transports to be reaped, and
-// waits for notification deliveries already running, all within ctx, before
-// the server process exits. Without the first and last steps a restart
-// dropped pages whose decision was already on disk (see alertDigest).
+// runtime-owned subprocesses and waits for their transports to be reaped,
+// stops the outbox drainer after one last pass over what is due, and waits
+// for notification deliveries already running, all within ctx, before the
+// server process exits. A delivery waiting on a retry stays in the outbox and
+// is redriven at the next start.
 func (s *Server) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
 	s.flushAlertDigests()
+	// The link audit flushers stop first, so none of them writes after the
+	// final flush below or after the store closes. Then the open hour's
+	// link fetch counts and any folded refusals are written, and a
+	// first-seen audit already handed to its goroutine lands too.
+	s.shareFlushStopOnce.Do(func() {
+		if s.shareFlushStop != nil {
+			close(s.shareFlushStop)
+		}
+	})
+	waitShareAudits := func(wg *sync.WaitGroup) {
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
+	waitShareAudits(&s.shareFlushers)
+	s.flushShareFetchStats(s.now(), true)
+	s.flushShareRefusalAudit(s.now())
+	waitShareAudits(&s.shareFetchAudits)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)
 	}
+	s.stopNotifyOutbox()
+	s.drainNotifyOutboxForShutdown()
 	if left := s.notifyDeliveries.wait(ctx); left > 0 {
 		s.logger.Printf("notify: %d deliveries still running at shutdown", left)
 	}
@@ -2927,12 +3024,13 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	serverURL := s.agentEnrollServerURL()
 	commands := s.agentEnrollCommands(serverURL, req.NodeID, token, launch)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node_id":      req.NodeID,
-		"token":        token,
-		"server_url":   serverURL,
-		"command":      commands["linux"],
-		"commands":     commands,
-		"agent_launch": launch,
+		"node_id":       req.NodeID,
+		"token":         token,
+		"server_url":    serverURL,
+		"command":       commands["linux"],
+		"commands":      commands,
+		"agent_launch":  launch,
+		"agent_version": agentInstallerRef,
 	})
 }
 
@@ -2956,11 +3054,12 @@ func (s *Server) agentEnrollCommands(serverURL, nodeID, token string, launch mod
 		shellQuote(token),
 		manualFlags,
 	)
-	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s ./lattice-agent-install.sh",
+	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s%s ./lattice-agent-install.sh",
 		agentInstallScriptDownloadCommand(),
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		shellQuote(token),
+		agentInstallVersionEnv(),
 		env,
 	)
 	return map[string]string{
@@ -3004,21 +3103,27 @@ func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Req
 	serverURL := s.agentEnrollServerURL()
 	commands := s.agentReconfigureCommands(serverURL, req.NodeID, launch)
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.reconfigure.command", Scope: "node:admin"})
+	// agent_version names the release the command installs. The installer
+	// always installs a binary, so a node that reports another version (a
+	// newer prerelease, or an older release) moves to this one; the console
+	// says so next to the command.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node_id":      req.NodeID,
-		"server_url":   serverURL,
-		"command":      commands["linux"],
-		"commands":     commands,
-		"agent_launch": launch,
+		"node_id":       req.NodeID,
+		"server_url":    serverURL,
+		"command":       commands["linux"],
+		"commands":      commands,
+		"agent_launch":  launch,
+		"agent_version": agentInstallerRef,
 	})
 }
 
 func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model.AgentLaunchConfig) map[string]string {
 	env := agentLaunchEnv(launch)
-	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s ./lattice-agent-install.sh",
+	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s%s ./lattice-agent-install.sh",
 		agentInstallScriptDownloadCommand(),
 		shellQuote(serverURL),
 		shellQuote(nodeID),
+		agentInstallVersionEnv(),
 		env,
 	)
 	manual := fmt.Sprintf("lattice-agent -server %s -node-id %s%s",
@@ -3029,9 +3134,26 @@ func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model
 	return map[string]string{"linux": linux, "manual": manual}
 }
 
+// agentInstallerRef is the stable lattice-node-agent release that enroll and
+// reconfigure commands install from. The installer is fetched at this tag and
+// told to download the binary of the same tag, so the script and the binary
+// it installs always come from one release. A branch ref here (main) once
+// paired a July installer with whatever binary was latest. Move it with each
+// stable agent cut; the site's release-pin check fails on a stale ref.
+const agentInstallerRef = "v0.3.9"
+
+func agentInstallScriptURL() string {
+	return "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/" + agentInstallerRef + "/scripts/install.sh"
+}
+
 func agentInstallScriptDownloadCommand() string {
-	const installURL = "https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/main/scripts/install.sh"
-	return fmt.Sprintf("curl -fsSL --proto '=https' --tlsv1.2 %s -o lattice-agent-install.sh", shellQuote(installURL))
+	return fmt.Sprintf("curl -fsSL --proto '=https' --tlsv1.2 %s -o lattice-agent-install.sh", shellQuote(agentInstallScriptURL()))
+}
+
+// agentInstallVersionEnv pins the binary the installer downloads to the
+// installer's own release instead of the installer's "latest" default.
+func agentInstallVersionEnv() string {
+	return " LATTICE_AGENT_VERSION=" + shellQuote(agentInstallerRef)
 }
 
 func normalizeAgentLaunchConfig(in model.AgentLaunchConfig) model.AgentLaunchConfig {
@@ -4993,7 +5115,16 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 				visible = append(visible, mon)
 			}
 		}
-		writeJSON(w, http.StatusOK, toMonitorViews(visible))
+		latest, err := s.store.LatestMonitorResults()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		views := toMonitorViews(visible)
+		for i, mon := range visible {
+			views[i].Latest = monitorLatestViews(p, mon, latest[mon.ID])
+		}
+		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
 		if !s.requireScope(w, p, "monitor:admin") {
 			return
@@ -5094,14 +5225,57 @@ func (s *Server) handleMonitorResults(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 		return
 	}
-	results := s.store.MonitorResults(monitorID)
-	visible := make([]model.MonitorResult, 0, len(results))
-	for _, result := range results {
-		if rbac.Allows(p.Principal, "monitor:read", result.NodeID) {
-			visible = append(visible, result)
+	query := r.URL.Query()
+	limit := defaultMonitorResultsLimit
+	if raw := query.Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > maxMonitorResultsLimit {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("limit must be 1 to %d", maxMonitorResultsLimit))
+			return
 		}
+		limit = n
+	}
+	allow := func(nodeID string) bool { return rbac.Allows(p.Principal, "monitor:read", nodeID) }
+	var visible []store.MonitorResultRecord
+	var err error
+	if query.Has("node_id") {
+		// One pair's history. An empty node_id names a tls monitor's pair.
+		nodeID := query.Get("node_id")
+		if !allow(nodeID) {
+			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+			return
+		}
+		visible, err = s.store.MonitorPairResults(monitorID, nodeID, limit)
+	} else {
+		visible, err = s.store.RecentMonitorResults(monitorID, limit, allow)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, visible)
+}
+
+// monitorLatestViews is the latest list for one monitor: the pairs still
+// assigned to it that the caller may read. A node taken off a monitor keeps
+// its rows until the monitor is deleted, but its last reading is no longer
+// what the monitor is doing.
+func monitorLatestViews(p principal, mon model.Monitor, pairs []store.MonitorLatest) []monitorLatestView {
+	out := make([]monitorLatestView, 0, len(pairs))
+	for _, pair := range pairs {
+		if !monitorPairAssigned(mon, pair.NodeID) || !rbac.Allows(p.Principal, "monitor:read", pair.NodeID) {
+			continue
+		}
+		out = append(out, toMonitorLatestView(pair))
+	}
+	return out
+}
+
+func monitorPairAssigned(mon model.Monitor, nodeID string) bool {
+	if mon.Type == model.MonitorTypeTLS {
+		return nodeID == ""
+	}
+	return nodeID != "" && (mon.AssignAll || slices.Contains(mon.NodeIDs, nodeID))
 }
 
 func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {
@@ -5142,29 +5316,6 @@ func (s *Server) handleAgentMonitors(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.store.MonitorsForNode(nodeID))
 }
 
-// handleAgentMonitorResult ingests a probe outcome from an authenticated agent.
-func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		agentAuthRequest
-		Result model.MonitorResult `json:"result"`
-	}
-	if !decodeAgentJSON(w, r, &req) {
-		return
-	}
-	if _, ok := s.authenticateAgentRequest(r, req.NodeID); !ok {
-		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
-		return
-	}
-	req.Result.NodeID = req.NodeID
-	history := s.store.LastMonitorResultsForNode(req.Result.MonitorID, req.NodeID, 2)
-	if err := s.store.AddMonitorResult(req.Result); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	s.notifyMonitorTransition(req.NodeID, req.Result, history)
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
 // notifyChannelView is the secret-free projection of a notification channel.
 // Config values (tokens, webhook URLs) are never returned; only the set of
 // configured keys is exposed so an operator can see what is configured.
@@ -5176,24 +5327,34 @@ type notifyChannelView struct {
 	Enabled    bool      `json:"enabled"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
+	// Health is joined from the outbox's health record at read time; it is
+	// never part of the stored channel.
+	Health notifyChannelHealthView `json:"health"`
 }
 
-func toNotifyChannelView(c model.NotifyChannel) notifyChannelView {
+func toNotifyChannelView(c model.NotifyChannel, h store.NotifyChannelHealth, now time.Time) notifyChannelView {
 	keys := make([]string, 0, len(c.Config))
 	for k := range c.Config {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt}
+	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt, Health: toNotifyChannelHealthView(h, now)}
 }
 
 func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
+		// The list carries each channel's delivery health, which is notify
+		// history, so it is guarded like the rest of that surface.
+		if s.refuseConfinedNotifyRead(w, p, "notify.channel.list") {
+			return
+		}
 		channels := s.store.NotifyChannels()
+		health := s.store.NotifyChannelHealths()
+		now := s.now()
 		views := make([]notifyChannelView, 0, len(channels))
 		for _, c := range channels {
-			views = append(views, toNotifyChannelView(c))
+			views = append(views, toNotifyChannelView(c, health[c.ID], now))
 		}
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
@@ -5251,7 +5412,8 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			action = "notify.channel.update"
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
-		writeJSON(w, http.StatusOK, toNotifyChannelView(channel))
+		health, _ := s.store.NotifyChannelHealth(channel.ID)
+		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, s.now()))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -5282,7 +5444,13 @@ func (s *Server) handleDeleteNotifyChannel(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"rules": s.store.NotifyRules()})
+		rules := s.store.NotifyRules()
+		opts := s.store.NotifyRuleOptionsByRule()
+		views := make([]notifyRuleView, 0, len(rules))
+		for _, rule := range rules {
+			views = append(views, toNotifyRuleView(rule, opts[rule.ID]))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"rules": views})
 	case http.MethodPost:
 		if s.refuseConfinedFleetWrite(w, p, "notify.rule.upsert", "notify:admin") {
 			return
@@ -5295,11 +5463,15 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			TitleTemplate string   `json:"title_template"`
 			BodyTemplate  string   `json:"body_template"`
 			Enabled       *bool    `json:"enabled"`
+			// FallbackChannelID is absent to keep the rule's current fallback,
+			// empty to clear it, or a channel id.
+			FallbackChannelID *string `json:"fallback_channel_id"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
 		}
-		rule, err := normalizeNotifyRule(req.ID, req.Name, req.EventTypes, req.ChannelIDs, req.TitleTemplate, req.BodyTemplate, req.Enabled, s.store.NotifyChannels())
+		channels := s.store.NotifyChannels()
+		rule, err := normalizeNotifyRule(req.ID, req.Name, req.EventTypes, req.ChannelIDs, req.TitleTemplate, req.BodyTemplate, req.Enabled, channels)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -5312,12 +5484,24 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 				}
 			}
 		}
-		if err := s.store.UpsertNotifyRule(rule); err != nil {
+		opts := s.store.NotifyRuleOptionsByRule()[rule.ID]
+		if req.FallbackChannelID != nil {
+			opts.FallbackChannelID = strings.TrimSpace(*req.FallbackChannelID)
+		}
+		if err := validateNotifyFallback(opts.FallbackChannelID, rule, channels); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertNotifyRuleWithOptions(rule, opts); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: map[string]string{"rule_id": rule.ID}})
-		writeJSON(w, http.StatusOK, rule)
+		metadata := map[string]string{"rule_id": rule.ID}
+		if opts.FallbackChannelID != "" {
+			metadata["fallback_channel_id"] = opts.FallbackChannelID
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: metadata})
+		writeJSON(w, http.StatusOK, toNotifyRuleView(rule, opts))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -5356,93 +5540,10 @@ func (s *Server) notifyEvent(title, body string) {
 }
 
 // notifyEventTyped is notifyEvent with the event type supplied instead of
-// inferred. Callers that know what happened should use it.
+// inferred. Callers that know what happened should use it. The deliveries are
+// in the outbox when it returns; sending happens on the drainer.
 func (s *Server) notifyEventTyped(eventType, title, body string) {
-	channels := s.store.EnabledNotifyChannels()
-	deliveries := s.planNotifyDeliveries(eventType, title, body, channels, s.store.EnabledNotifyRules())
-	if len(deliveries) == 0 {
-		return
-	}
-	s.notifyDeliveries.begin()
-	go func() {
-		defer s.notifyDeliveries.end()
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		for _, delivery := range deliveries {
-			if len(delivery.Channels) == 0 {
-				continue
-			}
-			for _, res := range notify.NewDispatcher(delivery.Channels...).Send(ctx, delivery.Message) {
-				if res.Err != nil {
-					s.logger.Printf("notify: %s delivery failed: %v", res.Kind, res.Err)
-				}
-			}
-		}
-	}()
-}
-
-type notifyDelivery struct {
-	Channels []notify.Channel
-	Message  notify.Message
-}
-
-func (s *Server) planNotifyDeliveries(eventType, title, body string, channels []model.NotifyChannel, rules []model.NotifyRule) []notifyDelivery {
-	if len(channels) == 0 {
-		return nil
-	}
-	if len(rules) == 0 {
-		built := s.buildNotifyChannels(channels)
-		if len(built) == 0 {
-			return nil
-		}
-		return []notifyDelivery{{Channels: built, Message: notify.Message{Title: title, Body: body}}}
-	}
-	channelsByID := make(map[string]model.NotifyChannel, len(channels))
-	for _, channel := range channels {
-		channelsByID[channel.ID] = channel
-	}
-	deliveries := []notifyDelivery{}
-	for _, rule := range rules {
-		if !notifyRuleMatches(rule, eventType) {
-			continue
-		}
-		selected := make([]model.NotifyChannel, 0, len(rule.ChannelIDs))
-		seen := map[string]bool{}
-		for _, channelID := range rule.ChannelIDs {
-			if seen[channelID] {
-				continue
-			}
-			seen[channelID] = true
-			channel, ok := channelsByID[channelID]
-			if !ok {
-				s.logger.Printf("notify: rule %s references missing or disabled channel %s", rule.ID, channelID)
-				continue
-			}
-			selected = append(selected, channel)
-		}
-		built := s.buildNotifyChannels(selected)
-		if len(built) == 0 {
-			continue
-		}
-		vars := map[string]string{"event_type": eventType, "title": title, "body": body}
-		outTitle := renderNotifyTemplate(rule.TitleTemplate, title, vars)
-		outBody := renderNotifyTemplate(rule.BodyTemplate, body, vars)
-		deliveries = append(deliveries, notifyDelivery{Channels: built, Message: notify.Message{Title: outTitle, Body: outBody}})
-	}
-	return deliveries
-}
-
-func (s *Server) buildNotifyChannels(channels []model.NotifyChannel) []notify.Channel {
-	built := make([]notify.Channel, 0, len(channels))
-	for _, c := range channels {
-		ch, err := buildChannel(c.Kind, c.Config)
-		if err != nil {
-			s.logger.Printf("notify: channel %s misconfigured: %v", c.ID, err)
-			continue
-		}
-		built = append(built, ch)
-	}
-	return built
+	s.enqueueNotifyEvent(eventType, title, body, notifyEnqueue{source: store.NotifySourceServer})
 }
 
 func notifyRuleMatches(rule model.NotifyRule, eventType string) bool {
@@ -5609,27 +5710,33 @@ const (
 )
 
 // notifyMonitorTransition decides monitor.down and monitor.recovered for one
-// (monitor, node) pair. history is the pair's results before current, newest
-// first (LastMonitorResultsForNode with n=2, read before current was stored).
+// (monitor, node) pair. priorFailStreak is the pair's failures in a row
+// before current, as the store recorded it with current.
 //
 // monitor.down waits for two failures in a row: a single failed probe is a
 // dropped packet or a busy target as often as an outage, and paging on it
 // teaches the operator to ignore the page. monitor.recovered follows only a
-// run that paged, so the phone's last message is always true. Both are read
-// off the stored history rather than kept in memory, and the store writes the
-// second failure at once, so a restart neither repeats a page nor loses the
-// recovery it owes.
+// run that paged, so the phone's last message is always true. Both read the
+// failure streak the store keeps per pair. The hot store writes it in the same
+// transaction as the result, and the JSON fallback writes the second failure
+// of a run at once, so a restart never repeats a page, and a run that paged
+// before the restart still announces its recovery. A result the store held
+// already (a retried batch) is never passed here.
 //
 // The notice is queued for the sweep's digest, so an all-nodes monitor whose
-// target goes down pages once, naming every node.
-func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, history []model.MonitorResult) {
-	failed := func(i int) bool { return i < len(history) && !history[i].Success }
-	succeededOrAbsent := func(i int) bool { return i >= len(history) || history[i].Success }
+// target goes down pages once, naming every node. The page itself is not
+// stored: it is decided after the result's write commits and waits in memory
+// until the next sweep. A process that dies without Close in that window
+// never sends it, and the agent's retry of that result comes back as a
+// duplicate that decides nothing. So a page is never sent twice, but a crash
+// can lose one; closing that needs the stored notification outbox described
+// at alertDigest.
+func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, priorFailStreak int) {
 	var kind string
 	switch {
-	case !current.Success && failed(0) && succeededOrAbsent(1):
+	case !current.Success && priorFailStreak == 1:
 		kind = EventMonitorDown
-	case current.Success && failed(0) && failed(1):
+	case current.Success && priorFailStreak >= 2:
 		kind = EventMonitorRecovered
 	default:
 		return

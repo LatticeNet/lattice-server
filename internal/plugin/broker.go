@@ -137,8 +137,10 @@ type SecretHost interface {
 }
 
 // NotifyHost sends an operator notification through server-owned channels.
+// pluginID is the VERIFIED id of the sending plugin, supplied by the broker,
+// so the notification's history names its source.
 type NotifyHost interface {
-	Send(ctx context.Context, title, body string) error
+	Send(ctx context.Context, pluginID, title, body string) error
 }
 
 // HTTPHost performs guarded outbound HTTP. Implementations must enforce the
@@ -652,7 +654,7 @@ func (b *Broker) Notify(ctx context.Context, title, body string) error {
 	if b.services.Notify == nil {
 		return fmt.Errorf("%w: notify", ErrHostServiceUnavailable)
 	}
-	return b.services.Notify.Send(ctx, title, body)
+	return b.services.Notify.Send(ctx, b.pluginID, title, body)
 }
 
 // HTTPDo performs guarded outbound HTTP and requires http:egress. The broker

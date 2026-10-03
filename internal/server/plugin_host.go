@@ -12,9 +12,9 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
-	"github.com/LatticeNet/lattice-server/internal/notify"
 	"github.com/LatticeNet/lattice-server/internal/outbound"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 const (
@@ -216,31 +216,49 @@ func (h *pluginHost) Put(ctx context.Context, key string, value []byte) error {
 // to a non-plugin bucket in the shared operator KV store.
 const pluginKVBucketPrefix = "plugin:"
 
-func (h *pluginHost) Send(ctx context.Context, title, body string) error {
-	channels := h.server.store.EnabledNotifyChannels()
-	if len(channels) == 0 {
-		return nil
+// The two answers notify.send gives a plugin besides success. Both are fixed
+// text: nothing a channel or its endpoint said reaches the plugin.
+var (
+	errPluginNotifyNoChannel = errors.New("no enabled notification channel: the message was recorded in the Sent log and reached no one")
+	errPluginNotifyBacklog   = errors.New("too many of this plugin's notifications are still being delivered: the message was not accepted, try again later")
+)
+
+// Send puts a plugin's message in the notification outbox, addressed to every
+// enabled channel as plugin messages always have been (typed plugin events
+// routed by rules are the notify capability's work, design section 7). The
+// outbox retries and records it like any event.
+//
+// The contract changed with the outbox. Send used to deliver synchronously
+// and return each channel's error; that error embedded the channel
+// credential (a Telegram bot token sits in every transport error's URL), and
+// delivery is now asynchronous with retries. A nil return means the message
+// is stored and owed to every enabled channel; the Sent log has the outcome.
+// Send returns errPluginNotifyNoChannel when no channel is enabled, so a
+// plugin can still tell its user that nothing will arrive, and
+// errPluginNotifyBacklog when the plugin already has
+// store.MaxNotifyUnsettledPerSource deliveries owed, which bounds what a
+// looping plugin can queue against a channel that is down.
+func (h *pluginHost) Send(_ context.Context, pluginID, title, body string) error {
+	if h.server.store.NotifyUnsettledCount(store.NotifySourcePlugin, pluginID) >= store.MaxNotifyUnsettledPerSource {
+		return errPluginNotifyBacklog
 	}
-	built := make([]notify.Channel, 0, len(channels))
-	for _, c := range channels {
-		ch, err := buildChannel(c.Kind, c.Config)
-		if err != nil {
-			return fmt.Errorf("notify channel %s: %w", c.ID, err)
-		}
-		built = append(built, ch)
-	}
-	ctx, cancel := contextWithDefaultTimeout(ctx, 15*time.Second)
-	defer cancel()
-	var errs []string
-	for _, res := range notify.NewDispatcher(built...).Send(ctx, notify.Message{Title: title, Body: body}) {
-		if res.Err != nil {
-			errs = append(errs, fmt.Sprintf("%s: %v", res.Kind, res.Err))
-		}
-	}
-	if len(errs) > 0 {
-		return errors.New(strings.Join(errs, "; "))
+	plan := h.server.planNotifyEvent(pluginNotifyEventType(pluginID), title, body, notifyEnqueue{
+		source: store.NotifySourcePlugin, sourceID: pluginID, broadcast: true,
+	})
+	h.server.commitNotifyPlan(plan)
+	if len(plan.targets) == 0 {
+		return errPluginNotifyNoChannel
 	}
 	return nil
+}
+
+// pluginNotifyEventType labels a plugin message in the Sent log with the
+// type the notify design reserves for it (plugin.<id>.message, D3).
+func pluginNotifyEventType(pluginID string) string {
+	if pluginID == "" {
+		return "plugin.message"
+	}
+	return "plugin." + pluginID + ".message"
 }
 
 func (h *pluginHost) Do(ctx context.Context, req plugin.HostHTTPRequest) (plugin.HostHTTPResponse, error) {

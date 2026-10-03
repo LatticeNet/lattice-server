@@ -6,6 +6,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // alertDigest batches typed alerts that are decided one node at a time and
@@ -27,10 +30,12 @@ import (
 //
 // The decision behind a queued line is already on disk (the sing-box episode,
 // the monitor history), so a line dropped by a restart is a page that is never
-// sent. Server.Close sends what is queued and waits for deliveries already
-// running, which covers a restart through SIGTERM. A process that dies without
-// Close still loses what is queued or in flight; closing that needs a stored
-// notification outbox.
+// sent. Each line is therefore stored as it is queued (store digest lines) and
+// removed after the flush has put its message in the notification outbox; a
+// process killed in between finds the line at the next start and sends it
+// then. A kill after the outbox write and before the removal sends the
+// message twice, which is the side an alert should err on. Server.Close
+// flushes what is queued, so a restart through SIGTERM sends it at once.
 type alertDigest struct {
 	mu      sync.Mutex
 	pending map[string][]alertDigestLine
@@ -42,9 +47,21 @@ type alertDigestLine struct {
 	sortKey     string
 	title, body string
 	line        string
+	// key is the stored line's key; empty when the store refused it.
+	key string
 }
 
 func (s *Server) queueAlertDigest(eventType string, l alertDigestLine) {
+	now := s.now()
+	key := store.NewNotifyDigestKey(now, id.New("ndq"))
+	if err := s.store.QueueNotifyDigestLine(store.NotifyDigestLine{
+		Key: key, EventType: eventType, SortKey: l.sortKey,
+		Title: l.title, Body: l.body, Line: l.line, QueuedAt: now,
+	}); err != nil {
+		s.logger.Printf("alert digest: store queued line: %v", err)
+	} else {
+		l.key = key
+	}
 	d := &s.alertDigest
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -52,6 +69,27 @@ func (s *Server) queueAlertDigest(eventType string, l alertDigestLine) {
 		d.pending = map[string][]alertDigestLine{}
 	}
 	d.pending[eventType] = append(d.pending[eventType], l)
+}
+
+// restoreAlertDigest takes back the lines a previous process stored and never
+// flushed. The next sweep (or Close) sends them.
+func (s *Server) restoreAlertDigest() {
+	lines := s.store.NotifyDigestLines()
+	if len(lines) == 0 {
+		return
+	}
+	d := &s.alertDigest
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.pending == nil {
+		d.pending = map[string][]alertDigestLine{}
+	}
+	for _, l := range lines {
+		d.pending[l.EventType] = append(d.pending[l.EventType], alertDigestLine{
+			sortKey: l.SortKey, title: l.Title, body: l.Body, line: l.Line, key: l.Key,
+		})
+	}
+	s.logger.Printf("alert digest: %d queued line(s) restored from the previous run", len(lines))
 }
 
 // flushAlertDigests sends what was queued since the previous flush, one
@@ -70,8 +108,14 @@ func (s *Server) flushAlertDigests() {
 		kinds = append(kinds, kind)
 	}
 	sort.Strings(kinds)
+	var flushed []string
 	for _, kind := range kinds {
 		lines := pending[kind]
+		for _, l := range lines {
+			if l.key != "" {
+				flushed = append(flushed, l.key)
+			}
+		}
 		if len(lines) == 1 {
 			s.emitNotifyTyped(kind, lines[0].title, lines[0].body)
 			continue
@@ -82,6 +126,9 @@ func (s *Server) flushAlertDigests() {
 			body[i] = l.line
 		}
 		s.emitNotifyTyped(kind, alertDigestTitle(kind, len(lines)), strings.Join(body, "\n"))
+	}
+	if err := s.store.RemoveNotifyDigestLines(flushed); err != nil {
+		s.logger.Printf("alert digest: remove flushed lines: %v", err)
 	}
 }
 

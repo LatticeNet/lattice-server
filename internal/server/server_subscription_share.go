@@ -1,6 +1,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,7 +16,6 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
-	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
 )
 
@@ -61,6 +61,12 @@ type shareRenderVariant struct {
 	// "不查询订阅流量信息". It affects only the response envelope, never the
 	// rendered body, so it deliberately stays OUT of the cache key.
 	NoFlow bool
+	// UATarget is the client target the core derived from the agent when the
+	// URL named none. A plugin that knows it ranks it below a record's pinned
+	// target; a released plugin ignores it and maps ua_class itself. It is a
+	// function of the UA class, which the cache key already carries, so it
+	// stays out of the key.
+	UATarget string
 }
 
 // cacheToken is the canonical cache-key fragment. Empty for the zero variant
@@ -162,13 +168,11 @@ func subscriptionContentHash(raw string) string {
 // because half a number is worse than none for a client parsing it.
 const maxSubscriptionUserinfoBytes = 512
 
-// subscriptionUserinfoForResponse returns the quota value a source supplied, or
-// nothing when it is too large to be one.
+// subscriptionUserinfoForResponse returns the quota value a source supplied in
+// its canonical form, or nothing when it is too large to be one or carries
+// none of the fields clients read (canonicalSubscriptionUserinfo).
 func subscriptionUserinfoForResponse(userinfo string) string {
-	if len(userinfo) > maxSubscriptionUserinfoBytes {
-		return ""
-	}
-	return userinfo
+	return canonicalSubscriptionUserinfo(userinfo)
 }
 
 // subscriptionResponseContentType decides how the response describes itself,
@@ -215,8 +219,28 @@ func subscriptionResponseContentType(format, target string) string {
 // figures, which only the provider knows, so it cannot be derived the way the
 // content type is. It is passed through under two limits instead. Go's header
 // serialiser neutralises CR and LF, so it cannot start a second header, and
-// subscriptionUserinfoForResponse bounds its length, so it cannot be used to
-// spend the response envelope. Nothing else a source returns reaches a header.
+// subscriptionUserinfoForResponse bounds its length and keeps only the fields
+// clients read, so it cannot be used to spend the response envelope. Nothing
+// else a source returns reaches a header.
+//
+// This is the one serving core for every link kind. Share links pass through
+// it today, and identity links are meant to pass through the same stages as
+// one more source kind rather than a second handler:
+//
+//   - resolve the token through the store's HMAC index, one rule for every
+//     kind (exactly one match, or the decoy);
+//   - decide reachability (enabled, unexpired; for an identity, its policy
+//     state) and refuse with the decoy, audited through the refusal throttle;
+//   - plan the render (planShareRender): the client target, the envelope, and
+//     a cache key that holds only what changes the bytes;
+//   - look the body up against the source's current content version
+//     (GetVersioned), so a body the source moved past is never served; the
+//     only stale body ever served is a plugin source's last good one during a
+//     provider outage;
+//   - on a miss, render once per key (renderShareShared) within the link's
+//     render budget;
+//   - answer first (writeShareBody: length, validator, 304, gzip, and the
+//     client headers), then count the fetch (noteShareFetch).
 func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request) {
 	// Every rejection below writes the same decoy and audits the real reason.
 	// The audit is where an operator finds out what happened; the response is
@@ -271,13 +295,15 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	if strings.TrimSpace(requested) == "" {
 		requested = share.DefaultFormat
 	}
+	// No format anywhere means "each client's native document".
+	native := strings.TrimSpace(requested) == ""
 	format, err := normalizeProxySubscriptionFormat(requested)
 	if err != nil {
 		deny("invalid default subscription format", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 		return
 	}
 
-	uaClass := classifyClientUA(r.Header.Get("User-Agent"))
+	clientClass := classifyClientUA(r.Header.Get("User-Agent"))
 
 	// Explicit render parameters, Sub-Store URL style: ?target= names the
 	// client outright (validated against the bounded target set — this string
@@ -300,18 +326,41 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		deny("invalid subscription target", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 		return
 	}
+	plan := planShareRender(share.Source.Kind, format, native, clientClass, variant)
+	format, uaClass, variant := plan.Format, plan.UAClass, plan.Variant
 
 	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass, Variant: variant.cacheToken()}
+
+	// A core proxy-user source is rendered on every request. Its render is Go
+	// over in-memory state, and a content version that covered everything it
+	// reads (the user's status, quota and expiry, profiles, inbounds, node
+	// liveness) would cost as much as the render. Caching it without one is
+	// what kept a suspended or expired user's nodes on the wire for up to 30
+	// minutes. A plugin source is cached, looked up against the content
+	// version of the snapshot it was rendered from.
+	//
+	// The user is resolved once per request and the render uses that same
+	// resolution: the identity policy behind it reads the quota's usage (one
+	// day-row range read for a monthly quota), which this unauthenticated
+	// endpoint should pay once, not twice.
+	if share.Source.Kind == model.ShareSourceCoreProxyUser {
+		if user, ok := s.coreShareUser(share.Source.ProxyUserID, s.now()); ok {
+			plan.CoreUser = &user
+		}
+	}
 
 	var cacheEntry subscriptionCacheEntry
 	var cached bool
 	var cacheEpoch uint64
 	if share.Source.Kind == model.ShareSourcePlugin {
+		// A held vpn-core change expires the cached bodies before the lookup.
+		s.settleVPNCoreChanges()
 		cacheEntry, cached, cacheEpoch = s.subscriptionCacheSnapshotForSource(share.Source.PluginID, share.Source.SubscriptionID, key, false, s.now())
-	} else {
-		cacheEntry, cached = s.subscriptionCache.GetSnapshot(key, s.now())
 	}
-	body, userinfo := cacheEntry.body, cacheEntry.userinfo
+	// served is the body this response carries; userinfo and the snapshot
+	// fields below can be refreshed by revalidation without a new body.
+	served := cacheEntry
+	userinfo, wireType := cacheEntry.userinfo, cacheEntry.wireType
 	staleResponse, sourceVersion, snapshotFetchedAt := cacheEntry.stale, cacheEntry.publicSourceVersion, cacheEntry.fetchedAt
 	if (!cached || staleResponse) && share.Source.Kind == model.ShareSourcePlugin {
 		// Revalidate before paying for a render. A render boots the plugin's
@@ -344,82 +393,64 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 					cached = false
 					break
 				}
-				body, userinfo, cached = stale.body, snap.Userinfo, true
+				served, userinfo, wireType, cached = stale, snap.Userinfo, stale.wireType, true
 				staleResponse, sourceVersion, snapshotFetchedAt = snap.Stale, snap.SourceVersion, snap.FetchedAt
 			}
 		}
 	}
 	if !cached {
-		// Plugin rendering races durable source transitions. A rejected epoch is
-		// not merely a cache miss: its body was rendered from superseded authority
-		// and therefore must not escape in the current response either. Re-capture
-		// and render once more; sustained churn fails closed instead of serving a
-		// body whose source transition already committed.
-		attempts := 1
+		var outcome shareRenderOutcome
 		if share.Source.Kind == model.ShareSourcePlugin {
-			attempts = 2
+			outcome = s.renderShareShared(r.Context(), share, plan, key)
+		} else {
+			outcome = s.renderShareOnce(r.Context(), share, plan, key)
 		}
-		accepted := false
-		for attempt := 0; attempt < attempts; attempt++ {
-			rendered, renderErr := s.renderShare(r.Context(), share, format, uaClass, variant)
-			if renderErr != nil {
-				s.logger.Printf("subscription share: render failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(renderErr))
-				deny("subscription_render_failed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
-				return
-			}
-			// A client that receives an empty but successful subscription deletes
-			// every node it had. Answering with the decoy keeps that from happening
-			// AND keeps the emptiness from confirming that the token was real.
-			if len(rendered.Body) == 0 {
-				deny("empty render refused", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
-				return
-			}
-			entry := subscriptionCacheEntry{body: rendered.Body, contentType: rendered.ContentType, userinfo: rendered.Userinfo,
-				revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
-				stale: rendered.Stale, fetchedAt: rendered.FetchedAt}
-			if share.Source.Kind == model.ShareSourcePlugin &&
-				!s.putSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, rendered.SourceEpoch, entry, s.now()) {
-				continue
-			}
-			if share.Source.Kind != model.ShareSourcePlugin {
-				s.subscriptionCache.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion,
-					entry.publicSourceVersion, entry.stale, entry.fetchedAt, s.now())
-			}
-			body, userinfo = rendered.Body, rendered.Userinfo
-			staleResponse, sourceVersion, snapshotFetchedAt = rendered.Stale, rendered.SourceVersion, rendered.FetchedAt
-			accepted = true
-			break
-		}
-		if !accepted {
-			deny("subscription_source_changed", map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+		if outcome.deny != "" {
+			deny(outcome.deny, map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
 			return
 		}
+		served = outcome.entry
+		userinfo, wireType = served.userinfo, served.wireType
+		staleResponse, sourceVersion, snapshotFetchedAt = served.stale, served.publicSourceVersion, served.fetchedAt
 	}
 
 	w.Header().Set("Cache-Control", "no-store")
 	// Derived, never echoed. Whatever the source put in contentType stays where
-	// the core can see it and the client cannot.
-	w.Header().Set("Content-Type", subscriptionResponseContentType(format, variant.Target))
+	// the core can see it and the client cannot. An entry cached before the
+	// type was stored with it falls back to the plan.
+	if wireType == "" {
+		wireType = shareWireContentType(plan, "")
+	}
+	w.Header().Set("Content-Type", wireType)
 	// ?noFlow=1 keeps quota headers off the wire (upstream's 不查询订阅流量) —
 	// some clients probe aggressively when they see one.
-	if quota := subscriptionUserinfoForResponse(userinfo); quota != "" && !variant.NoFlow {
+	quota := subscriptionUserinfoForResponse(userinfo)
+	if variant.NoFlow {
+		quota = ""
+	}
+	if quota != "" {
 		w.Header().Set("Subscription-Userinfo", quota)
 	}
 	if staleResponse {
 		w.Header().Set("X-Lattice-Subscription-Stale", "true")
 	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
-	metadata := map[string]string{
-		"share_id": share.ID, "slug": slug, "token_sha256": tokenHash, "format": format, "ua_class": uaClass,
-		"cache": strconv.FormatBool(cached), "stale": strconv.FormatBool(staleResponse), "snapshot_age_seconds": snapshotAgeSeconds(s.now(), snapshotFetchedAt),
+	setLinkClientHeaders(w.Header(), share.Slug, shareUpdateIntervalHours(share))
+	body := shareBody{body: served.body, gzipBody: served.gzipBody, hash: served.bodyHash}
+	if body.hash == ([32]byte{}) || (body.gzipBody == nil && share.Source.Kind != model.ShareSourcePlugin) {
+		body = newShareBody(served.body, acceptsGzip(r), gzip.DefaultCompression)
 	}
-	if sourceVersion != "" {
-		metadata["source_version"] = sourceVersion
-	}
-	s.recordRequestAudit(r, model.AuditEvent{
-		ID: id.New("audit"), Action: auditActionShareFetch, Decision: "allow",
-		Metadata: metadata,
+	// Answer first. Everything below runs after the client has its bytes.
+	notModified := writeShareBody(w, r, body, quota)
+	s.noteShareFetch(r, shareFetch{shareID: share.ID, slug: slug, tokenHash: tokenHash, family: clientClass,
+		cacheHit: cached, notModified: notModified, stale: staleResponse}, func() map[string]string {
+		metadata := map[string]string{
+			"share_id": share.ID, "slug": slug, "token_sha256": tokenHash, "format": format, "ua_class": clientClass,
+			"cache": strconv.FormatBool(cached), "stale": strconv.FormatBool(staleResponse), "snapshot_age_seconds": snapshotAgeSeconds(s.now(), snapshotFetchedAt),
+		}
+		if sourceVersion != "" {
+			metadata["source_version"] = sourceVersion
+		}
+		return metadata
 	})
 }
 
@@ -441,7 +472,16 @@ func (s *Server) subscriptionCacheSnapshotForSource(pluginID, subscriptionID str
 		entry, ok := s.subscriptionCache.GetStale(key)
 		return entry, ok, epoch
 	}
-	entry, ok := s.subscriptionCache.GetSnapshot(key, now)
+	// The content version is part of the lookup: a body rendered from any
+	// snapshot other than the one stored now is a miss, whatever its TTL. The
+	// epoch bookkeeping already invalidates on every committed source change;
+	// this makes "a stale body cannot be reached" true by construction rather
+	// than by every writer remembering to invalidate.
+	version := ""
+	if snapshot, ok := s.store.SubscriptionSnapshot(pluginID, subscriptionID); ok {
+		version = subscriptionRevalidationVersion(snapshot)
+	}
+	entry, ok := s.subscriptionCache.GetVersioned(key, version, now)
 	return entry, ok, epoch
 }
 
@@ -529,6 +569,36 @@ func (s *Server) invalidateSharesForPlugin(pluginID string) {
 	}
 }
 
+// coreShareUser is the user a core.proxy_user share renders: the stored
+// legacy record, with the policy of the identity behind it written over it
+// (vpnUserPolicy.applyTo). The identity owns whether the user is enabled, its
+// expiry, its quota and the usage that quota is measured with, so a share
+// serves a user exactly when the policy does (adopted-suspend P12), and its
+// quota header carries the identity's figures.
+func (s *Server) coreShareUser(proxyUserID string, now time.Time) (model.ProxyUser, bool) {
+	user, ok := s.store.ProxyUser(proxyUserID)
+	if !ok {
+		return model.ProxyUser{}, false
+	}
+	if identity := s.vpnUserForAccounting(proxyUserID); identity != nil {
+		user = s.vpnUserPolicyAt(*identity, now).applyTo(user)
+	}
+	return user, true
+}
+
+// invalidateCoreSourceShares drops every cached body a core source rendered.
+// A core share renders a user's own record, so any change to a user or an
+// identity can change what it serves; the content hash that guards plugin
+// shares does not exist for it. Shares are few, so all core shares go rather
+// than working out which identity sits behind which share.
+func (s *Server) invalidateCoreSourceShares() {
+	for _, share := range s.store.SubscriptionShares() {
+		if share.Source.Kind == model.ShareSourceCoreProxyUser {
+			s.subscriptionCache.InvalidateShare(share.ID)
+		}
+	}
+}
+
 // invalidateSharesForSource drops cached bodies for shares sourcing one record.
 // The refresh path calls it when a fetch returns different bytes than the
 // stored snapshot.
@@ -543,14 +613,15 @@ func (s *Server) invalidateSharesForSource(pluginID, subscriptionID string) {
 
 // renderShare asks the share's source for content. It never shows the source the
 // token and never lets it influence the response beyond the bytes and a content
-// type.
-func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string, variant shareRenderVariant) (renderedSubscription, error) {
+// type. coreUser is a core share's user as the handler resolved it
+// (coreShareUser), nil when it was not found; other sources ignore it.
+func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string, variant shareRenderVariant, coreUser *model.ProxyUser) (renderedSubscription, error) {
 	switch share.Source.Kind {
 	case model.ShareSourceCoreProxyUser:
-		user, ok := s.store.ProxyUser(share.Source.ProxyUserID)
-		if !ok {
+		if coreUser == nil {
 			return renderedSubscription{}, errors.New("share source user not found")
 		}
+		user := *coreUser
 		endpoints, _, err := proxycore.VLESSRealityEndpoints(user, s.proxySubscriptionProfiles(), s.store.ProxyInbounds(), proxycore.SubscriptionOptions{Now: s.now(), NodeServiceStates: s.singBoxDownNodes()})
 		if err != nil {
 			return renderedSubscription{}, err
@@ -579,21 +650,7 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 			rendered.SourceEpoch = epoch
 			return rendered, err
 		}
-		payloadFields := map[string]any{
-			"subscription_id": share.Source.SubscriptionID,
-			"format":          format,
-			"ua_class":        uaClass,
-			"raw":             snap.Raw,
-		}
-		// Explicit render parameters ride only when set, so a plugin built
-		// before they existed receives the exact payload it always did.
-		if variant.Target != "" {
-			payloadFields["target"] = variant.Target
-		}
-		if opts := variant.options(); opts != nil {
-			payloadFields["options"] = opts
-		}
-		payload, err := json.Marshal(payloadFields)
+		payload, err := subscriptionRenderPayload(share.Source.SubscriptionID, format, uaClass, variant, snap.Raw)
 		if err != nil {
 			return renderedSubscription{}, err
 		}
@@ -606,17 +663,42 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		var reply struct {
 			Content     string `json:"content"`
 			ContentType string `json:"content_type"`
+			// Target is the client the plugin rendered for, once it says. The
+			// core labels the response from it only after checking it against
+			// the bounded target set.
+			Target string `json:"target"`
 		}
 		if err := json.Unmarshal(out, &reply); err != nil {
 			return renderedSubscription{}, fmt.Errorf("decode plugin render reply: %w", err)
 		}
 		// The provider's traffic figures are passed through verbatim so the
 		// client's remaining-quota display stays truthful.
-		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Userinfo: snap.Userinfo,
+		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Target: reply.Target, Userinfo: snap.Userinfo,
 			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
+}
+
+// subscriptionRenderPayload is the plugin's render request. Explicit render
+// parameters ride only when set, so a plugin built before they existed
+// receives the exact payload it always did.
+func subscriptionRenderPayload(subscriptionID, format, uaClass string, variant shareRenderVariant, raw string) ([]byte, error) {
+	fields := map[string]any{
+		"subscription_id": subscriptionID,
+		"format":          format,
+		"ua_class":        pluginUAClass(uaClass),
+		"raw":             raw,
+	}
+	if variant.Target != "" {
+		fields["target"] = variant.Target
+	} else if variant.UATarget != "" {
+		fields["ua_target"] = variant.UATarget
+	}
+	if opts := variant.options(); opts != nil {
+		fields["options"] = opts
+	}
+	return json.Marshal(fields)
 }
 
 // renderedSubscription is one produced body plus the metadata the core turns
@@ -626,7 +708,10 @@ type renderedSubscription struct {
 	// ContentType is what the source said the bytes are. It is kept for
 	// diagnostics and cache bookkeeping and deliberately never reaches the
 	// wire; the response type is derived by subscriptionResponseContentType.
-	ContentType         string
+	ContentType string
+	// Target is the client target the source says it rendered. Unvalidated
+	// here; reportedRenderTarget bounds it before it can label anything.
+	Target              string
 	Userinfo            string
 	Stale               bool
 	RevalidationVersion string

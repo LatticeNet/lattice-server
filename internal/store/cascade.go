@@ -135,6 +135,16 @@ func (s *Store) DeleteNode(nodeID string) (NodeCascadeReport, bool, error) {
 	if !ok {
 		return report, false, nil
 	}
+	// The node's monitor rows in the hot store go before the commit. If this
+	// fails nothing has changed; if the commit fails after it, the node keeps
+	// an empty monitor history and a retried delete finishes the job. The
+	// other order could leave a deleted node's failure streaks for a node
+	// enrolled again under the same id.
+	if s.runtimeBoltHot != nil {
+		if err := s.runtimeBoltHot.DeleteMonitorResultsForNode(nodeID); err != nil {
+			return report, true, err
+		}
+	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
@@ -495,6 +505,11 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 			s.state.Monitors[id] = clone
 		}
 	}
+	// With the hot store the rows live in bolt: the count comes from each
+	// pair's latest record, and DeleteNode removes them before it commits.
+	if s.runtimeBoltHot != nil {
+		report.MonitorResults += s.monitorResultsHeldForNodeLocked(nodeID)
+	}
 	for mid, series := range s.state.MonResults {
 		removed := 0
 		for _, mr := range series {
@@ -609,6 +624,18 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 	// Not counted in the report: it is alert bookkeeping, not node data.
 	if mutate {
 		delete(s.state.NodeOfflineAlerts, nodeID)
+	}
+
+	// Step 17e: the node's line client templates. They outlive a silent node
+	// on purpose, so nothing else removes them; left behind, a subscription
+	// could still offer a deleted node's endpoint. Not counted: they are a
+	// derived copy of what the node reported, not node data of their own.
+	if mutate {
+		for hash, t := range s.state.LineClientTemplates {
+			if t.NodeID == nodeID {
+				delete(s.state.LineClientTemplates, hash)
+			}
+		}
 	}
 
 	// Step 18: the node itself (embedded TokenHash/Metrics/HostFacts/Geo/etc all

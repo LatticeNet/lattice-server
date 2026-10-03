@@ -12,6 +12,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // GET /api/expiring is one list of what runs out across the areas that keep a
@@ -165,9 +166,7 @@ func (s *Server) expiringFor(p principal, now time.Time, within int) expiringRes
 				item.Subtitle = strings.TrimSpace(user.Name)
 			}
 			if user.QuotaBytes > 0 {
-				acct := firstNonEmpty(strings.TrimSpace(user.MigratedFromProxyUser), user.ID)
-				record, _ := s.store.ProxyUser(acct)
-				used, _ := s.quotaUsedBytes(user, record.UsedBytes, now, usageCounter{})
+				used := s.vpnUserPolicyAt(user, now).Usage.Used
 				quota := user.QuotaBytes
 				item.UsedBytes, item.QuotaBytes = &used, &quota
 			}
@@ -345,15 +344,16 @@ func (s *Server) shareRecordName(source model.ShareSource, recordNames map[strin
 }
 
 // latestCertNotAfter is the certificate expiry from the newest result that
-// completed a handshake.
+// completed a handshake. Only the control plane evaluates tls monitors, so
+// their results sit in the pair with no node.
 func (s *Server) latestCertNotAfter(monitorID string) (time.Time, bool) {
-	results := s.store.MonitorResults(monitorID)
-	for i := len(results) - 1; i >= 0; i-- {
-		if !results[i].CertNotAfter.IsZero() {
-			return results[i].CertNotAfter, true
-		}
+	rec, ok, err := s.store.NewestMonitorResult(monitorID, "", func(r store.MonitorResultRecord) bool {
+		return !r.CertNotAfter.IsZero()
+	})
+	if err != nil || !ok {
+		return time.Time{}, false
 	}
-	return time.Time{}, false
+	return rec.CertNotAfter, true
 }
 
 func joinNonEmpty(sep string, values ...string) string {

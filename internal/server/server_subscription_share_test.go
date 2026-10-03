@@ -266,8 +266,11 @@ func TestSubscriptionShareStaleCacheHitSetsHeaderAndSafeAudit(t *testing.T) {
 	if rec.Code != http.StatusOK || rec.Body.String() != "last-good" || rec.Header().Get("X-Lattice-Subscription-Stale") != "true" {
 		t.Fatalf("stale cache response = code %d header %q body %q", rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"), rec.Body.String())
 	}
+	s.shareFetchAudits.Wait()
+	allowEvents := 0
 	for _, event := range st.AuditEvents() {
 		if event.Action == auditActionShareFetch && event.Decision == "allow" {
+			allowEvents++
 			if event.Metadata["stale"] != "true" || event.Metadata["snapshot_age_seconds"] == "" {
 				t.Fatalf("share stale audit = %+v", event.Metadata)
 			}
@@ -281,6 +284,9 @@ func TestSubscriptionShareStaleCacheHitSetsHeaderAndSafeAudit(t *testing.T) {
 				t.Fatalf("diagnostic leaked into share audit: %+v", event.Metadata)
 			}
 		}
+	}
+	if allowEvents != 1 {
+		t.Fatalf("allow events = %d, want the first-seen event for this client family", allowEvents)
 	}
 }
 
@@ -364,7 +370,7 @@ func TestSubscriptionSharePropagatesStaleAndRecoveryAcrossSiblingShares(t *testi
 		t.Fatal(err)
 	}
 	keyA := subscriptionCacheKey{ShareID: "s1", Format: "plain", UAClass: "surge"}
-	keyB := subscriptionCacheKey{ShareID: "s2", Format: "base64", UAClass: "clash"}
+	keyB := subscriptionCacheKey{ShareID: "s2", Format: "plain", UAClass: "clash"}
 	version := subscriptionContentHash("last-good")
 	s.subscriptionCache.PutSnapshot(keyA, []byte("body-a"), "text/plain", "upload=1", version, "", false, fetchedAt, s.now().Add(-subscriptionCacheTTL-time.Second))
 	s.subscriptionCache.PutSnapshot(keyB, []byte("body-b"), "text/plain", "upload=1", version, "", false, fetchedAt, s.now())
@@ -387,10 +393,18 @@ func TestSubscriptionSharePropagatesStaleAndRecoveryAcrossSiblingShares(t *testi
 			t.Fatalf("%s sibling stale response = code %d header %q body %q", name, rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"), rec.Body.String())
 		}
 	}
+	s.shareFetchAudits.Wait()
+	staleEvents := 0
 	for _, event := range st.AuditEvents() {
-		if event.Action == auditActionShareFetch && event.Decision == "allow" && event.Metadata["stale"] != "true" {
-			t.Fatalf("sibling stale audit was fresh: %+v", event.Metadata)
+		if event.Action == auditActionShareFetch && event.Decision == "allow" {
+			if event.Metadata["stale"] != "true" {
+				t.Fatalf("sibling stale audit was fresh: %+v", event.Metadata)
+			}
+			staleEvents++
 		}
+	}
+	if staleEvents != 2 {
+		t.Fatalf("stale first-seen events = %d, want one per sibling", staleEvents)
 	}
 
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
@@ -419,14 +433,14 @@ func TestSubscriptionShareRevisionMismatchRendersInsteadOfStampingReplacement(t 
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}}
 	mustUpsertShare(t, st, share)
 	now := s.now()
-	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "same", Userinfo: "current-ui", FetchedAt: now}); err != nil {
+	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "graph", Raw: "same", Userinfo: "upload=3", FetchedAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	key := subscriptionCacheKey{ShareID: "s1", Format: "plain", UAClass: "surge"}
 	version := subscriptionContentHash("same")
-	s.subscriptionCache.PutSnapshot(key, []byte("old-body"), "text/plain", "old-ui", version, "", false, now, now.Add(-subscriptionCacheTTL-time.Second))
+	s.subscriptionCache.PutSnapshot(key, []byte("old-body"), "text/plain", "upload=1", version, "", false, now, now.Add(-subscriptionCacheTTL-time.Second))
 	s.subscriptionBeforeCacheExtend = func() {
-		s.subscriptionCache.PutSnapshot(key, []byte("replacement"), "text/plain", "replacement-ui", "new-version", "", false, now, now)
+		s.subscriptionCache.PutSnapshot(key, []byte("replacement"), "text/plain", "upload=2", "new-version", "", false, now, now)
 		s.subscriptionBeforeCacheExtend = nil
 	}
 	s.subscriptionRender = func(_ context.Context, _ model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
@@ -435,7 +449,7 @@ func TestSubscriptionShareRevisionMismatchRendersInsteadOfStampingReplacement(t 
 	}
 	rec := httptest.NewRecorder()
 	s.handleSubscriptionShare(rec, shareRequest("/sub/one/"+token+"?format=plain", "Surge/2000"))
-	if rec.Code != http.StatusOK || rec.Body.String() != "rerendered" || rec.Header().Get("Subscription-Userinfo") != "current-ui" {
+	if rec.Code != http.StatusOK || rec.Body.String() != "rerendered" || rec.Header().Get("Subscription-Userinfo") != "upload=3" {
 		t.Fatalf("revision mismatch response = code %d body %q userinfo %q", rec.Code, rec.Body.String(), rec.Header().Get("Subscription-Userinfo"))
 	}
 	if stale, ok := s.subscriptionCache.GetStale(key); ok && string(stale.body) == "old-body" {

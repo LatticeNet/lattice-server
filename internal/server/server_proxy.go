@@ -399,6 +399,7 @@ func (s *Server) handleProxyUsers(w http.ResponseWriter, r *http.Request, p prin
 			return
 		}
 		s.invalidateLineReadModel()
+		s.invalidateCoreSourceShares()
 		if stored, ok := s.store.ProxyUser(user.ID); ok {
 			user = stored
 		}
@@ -438,6 +439,7 @@ func (s *Server) handleDeleteProxyUser(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	s.invalidateLineReadModel()
+	s.invalidateCoreSourceShares()
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "proxy.user.delete",
@@ -2747,14 +2749,17 @@ func derivedProxyUserStatus(user model.ProxyUser) string {
 	return derivedProxyUserStatusAt(user, time.Now().UTC())
 }
 
+// derivedProxyUserStatusAt is the status a row's own fields give. It shares
+// its expiry and quota predicates with decideVpnUserPolicy, which writes an
+// identity's rows, so a row read here says what the policy decided.
 func derivedProxyUserStatusAt(user model.ProxyUser, now time.Time) string {
 	if !user.Enabled {
 		return model.ProxyUserStatusDisabled
 	}
-	if !user.ExpiresAt.IsZero() && !user.ExpiresAt.After(now) {
+	if proxyUserExpiredAt(user.ExpiresAt, now) {
 		return model.ProxyUserStatusExpired
 	}
-	if user.TrafficLimitBytes > 0 && user.UsedBytes >= user.TrafficLimitBytes {
+	if proxyQuotaExhausted(user.UsedBytes, user.TrafficLimitBytes) {
 		return model.ProxyUserStatusOverQuota
 	}
 	return model.ProxyUserStatusActive

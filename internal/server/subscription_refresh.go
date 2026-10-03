@@ -42,6 +42,10 @@ type subscriptionRefreshFlight struct {
 type subscriptionPublicationState struct {
 	mu    sync.Mutex
 	epoch uint64
+	// vpnGen is the vpn-core generation at the start of the source's last
+	// committed refresh. Behind the server's generation means a fleet change
+	// may have moved the content; see share_fleet_changes.go.
+	vpnGen uint64
 }
 
 // subscriptionPluginMutationState brackets subscription-store mutations with
@@ -67,6 +71,10 @@ type subscriptionRefreshAuthority struct {
 	recentStale      bool
 	sourceEpoch      uint64
 	pluginGeneration uint64
+	// vpnGen is the vpn-core generation this capture saw. A refresh that
+	// commits records it, so a fleet change during the fetch leaves the
+	// source due again.
+	vpnGen uint64
 }
 
 func subscriptionRevalidationVersion(snapshot model.SubscriptionSnapshot) string {
@@ -133,6 +141,9 @@ func (s *Server) acquireSubscriptionPluginGate(ctx context.Context, pluginID str
 }
 
 func (s *Server) captureSubscriptionRefreshAuthority(ctx context.Context, pluginID, subscriptionID string, force bool) (authority subscriptionRefreshAuthority, err error) {
+	// A vpn-core change held back by the pacing interval lands before the
+	// generation is read; see share_fleet_changes.go.
+	s.settleVPNCoreChanges()
 	pluginMutation, releasePlugin, err := s.acquireSubscriptionPluginGate(ctx, pluginID)
 	if err != nil {
 		return authority, err
@@ -147,9 +158,11 @@ func (s *Server) captureSubscriptionRefreshAuthority(ctx context.Context, plugin
 	publication.mu.Lock()
 	authority.existing, authority.has = s.store.SubscriptionSnapshot(pluginID, subscriptionID)
 	authority.sourceEpoch = publication.epoch
+	authority.vpnGen = s.vpnCoreGen.Load()
+	due := publication.vpnGen != authority.vpnGen
 	publication.mu.Unlock()
 	now := s.now()
-	authority.fresh = authority.has && !authority.existing.Stale && !force && now.Sub(authority.existing.FetchedAt) < subscriptionRefreshInterval
+	authority.fresh = authority.has && !authority.existing.Stale && !force && !due && now.Sub(authority.existing.FetchedAt) < subscriptionRefreshInterval
 	authority.recentStale = authority.has && authority.existing.Stale && !force && !authority.existing.LastAttemptAt.IsZero() && now.Sub(authority.existing.LastAttemptAt) < subscriptionStaleRetryInterval
 	return authority, nil
 }
@@ -283,11 +296,36 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 			return model.SubscriptionSnapshot{}, fmt.Errorf("subscription provider fetch failed for %s/%s", pluginID, subscriptionID)
 		}
 		s.logger.Printf("subscription snapshot: provider fetch failed for %s/%s; preserving last-good (%s)", pluginID, subscriptionID, subscriptionDiagnosticSummary(err))
+		// A snapshot still young enough to be fresh was refreshed only because a
+		// vpn-core change made it due. Marking it stale for that failure turned
+		// a check into an outage: every share of the source re-rendered with
+		// the stale marker, and the source retried the provider every
+		// subscriptionStaleRetryInterval while polled. The snapshot is what the
+		// link served before the change, so it keeps serving unmarked; the
+		// attempt settles this generation, and the next change or the regular
+		// refresh interval tries again. Nothing is persisted or published.
+		if !force && !existing.Stale && s.now().Sub(existing.FetchedAt) < subscriptionRefreshInterval {
+			publication.vpnGen = authority.vpnGen
+			s.recordAudit(model.AuditEvent{
+				ID: id.New("audit"), Action: auditActionSubscriptionFetch, Decision: "observe",
+				Reason: "refresh after a vpn-core change failed; serving the snapshot from before it",
+				Metadata: map[string]string{
+					"plugin_id": pluginID, "subscription_id": subscriptionID, "stale": "false",
+					"snapshot_age_seconds": fmt.Sprintf("%.0f", s.now().Sub(existing.FetchedAt).Seconds()),
+				},
+			})
+			return existing, nil
+		}
+		// Only the first failure moves what a share serves: the body becomes the
+		// last good one, marked stale. A retry during the same outage changes
+		// nothing but the retry timestamp, so it publishes nothing and the
+		// bodies already rendered from the stale snapshot stay served.
+		becameStale := !existing.Stale
 		existing.FetchError = "provider_fetch_failed"
 		existing.LastAttemptAt = s.now()
 		existing.Stale = true
 		committed, storeErr := s.persistSubscriptionSnapshot(existing)
-		if committed {
+		if committed && (becameStale || force) {
 			publication.epoch++
 			s.invalidateSharesForSource(pluginID, subscriptionID)
 		}
@@ -317,11 +355,22 @@ func (s *Server) refreshSubscriptionSnapshot(ctx context.Context, pluginID, subs
 	fetched.FetchError = ""
 	fetched.Stale = false
 	committed, persistErr := s.persistSubscriptionSnapshot(fetched)
+	// A refresh that brought back what was already served publishes nothing.
+	// Bumping the epoch for it is what made the extend path refuse, so every
+	// poll after the refresh interval paid a full render of identical bytes,
+	// against the design note on subscriptionCacheTTL ("zero renders in the
+	// steady state"). A forced refresh is the operator asking for a re-render
+	// and still publishes.
+	moved := !has || force || existing.Stale || existing.Userinfo != fetched.Userinfo ||
+		subscriptionRevalidationVersion(existing) != subscriptionRevalidationVersion(fetched)
 	if committed {
+		publication.vpnGen = authority.vpnGen
+	}
+	if committed && moved {
 		publication.epoch++
 		// The content moved: any rendered body cached for a share sourcing this
 		// record is now stale, no matter how much TTL it had left.
-		if has && (force || existing.Stale || existing.Userinfo != fetched.Userinfo || subscriptionRevalidationVersion(existing) != subscriptionRevalidationVersion(fetched)) {
+		if has {
 			s.invalidateSharesForSource(pluginID, subscriptionID)
 		}
 	}
@@ -363,7 +412,12 @@ func (s *Server) putSubscriptionCacheForSource(key subscriptionCacheKey, pluginI
 	if publication.epoch != expectedEpoch {
 		return false
 	}
-	s.subscriptionCache.PutSnapshot(key, entry.body, entry.contentType, entry.userinfo, entry.revalidationVersion, entry.publicSourceVersion, entry.stale, entry.fetchedAt, now)
+	s.subscriptionCache.putEntry(key, entry, now)
+	// Rendered from a snapshot a fleet change has overtaken: serve it once,
+	// but let the next fetch revalidate instead of reusing it for a TTL.
+	if s.subscriptionSourceDue(publication) {
+		s.subscriptionCache.expireKey(key, now)
+	}
 	return true
 }
 
@@ -382,7 +436,11 @@ func (s *Server) extendSubscriptionCacheForSource(key subscriptionCacheKey, plug
 	if !ok || publication.epoch != expectedEpoch || !subscriptionSnapshotsEqualForCache(current, snapshot) {
 		return false
 	}
-	return s.subscriptionCache.ExtendSnapshot(key, expectedRevision, snapshot.Userinfo, snapshot.SourceVersion, snapshot.Stale, snapshot.FetchedAt, now)
+	extended := s.subscriptionCache.ExtendSnapshot(key, expectedRevision, snapshot.Userinfo, snapshot.SourceVersion, snapshot.Stale, snapshot.FetchedAt, now)
+	if extended && s.subscriptionSourceDue(publication) {
+		s.subscriptionCache.expireKey(key, now)
+	}
+	return extended
 }
 
 func subscriptionSnapshotsEqualForCache(current, captured model.SubscriptionSnapshot) bool {

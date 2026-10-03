@@ -36,6 +36,8 @@ func seedMigrationState(now time.Time) State {
 	st.OIDCProviders["oidc"] = model.OIDCProvider{ID: "oidc", DisplayName: "OIDC", ClientID: "client-id", ClientSecret: "oidc-secret", CreatedAt: now}
 	st.Groups["grp1"] = model.Group{ID: "grp1", Name: "Edge", Slug: "edge", Color: "sky", Members: []string{"node-a"}, CreatedAt: now}
 	st.GroupPolicies["gnp1"] = model.GroupNetPolicy{ID: "gnp1", ScopeGroupID: "grp1", Enabled: true, Priority: 10, Rules: []model.GroupNetRule{{ID: "rule1", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: []int{443}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}, CreatedAt: now}
+	st.NotifyRules["r1"] = model.NotifyRule{ID: "r1", Name: "Urgent", ChannelIDs: []string{"ch1"}, Enabled: true}
+	st.NotifyRuleOptions["r1"] = NotifyRuleOptions{FallbackChannelID: "ch2"}
 	st.Audit = []model.AuditEvent{{ID: "audit-1", At: now, Action: "migration.test", Decision: "allow"}}
 	return st
 }
@@ -108,6 +110,9 @@ func TestMigrateJSONToBoltAndExportBack(t *testing.T) {
 	}
 	if back.Nodes["node-a"].Name != "Node A" || len(back.Audit) != 1 || back.NotifyChannels["ch1"].Config["bot_token"] != botTokenPlain || back.Groups["grp1"].Name != "Edge" || back.GroupPolicies["gnp1"].ScopeGroupID != "grp1" {
 		t.Fatalf("exported JSON did not round-trip: %+v", back)
+	}
+	if back.NotifyRuleOptions["r1"].FallbackChannelID != "ch2" {
+		t.Fatalf("a rule's fallback channel did not round-trip: %+v", back.NotifyRuleOptions)
 	}
 	if !reflect.DeepEqual(back.GuardRealitySnapshots["node-a"], want.GuardRealitySnapshots["node-a"]) {
 		t.Fatalf("exported guard reality did not round-trip:\n got=%+v\nwant=%+v", back.GuardRealitySnapshots["node-a"], want.GuardRealitySnapshots["node-a"])

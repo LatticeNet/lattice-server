@@ -80,9 +80,14 @@ func (s *Server) vpnCoreSubscriptionSourcesRPC(ctx context.Context, method strin
 			response.Error = composeFailureView(composeFailure("invalid_request"))
 			return json.Marshal(response)
 		}
+		now := s.now().UTC()
 		response, err := graphSubscriptionOptionsFromCapture(func() (lineChainCompileSnapshot, error) {
-			return s.captureLineChainCompileSnapshot()
-		}, s.now().UTC())
+			snapshot, err := s.captureLineChainCompileSnapshot()
+			if err != nil {
+				return snapshot, err
+			}
+			return s.withIdentityPolicies(snapshot, now), nil
+		}, now)
 		if err != nil {
 			response = graphSubscriptionOptionsResponse{SchemaVersion: 1, Identities: []graphSubscriptionIdentityOption{}, Roots: []graphSubscriptionRootOption{}, Error: composeFailureView(err)}
 		}
@@ -98,12 +103,18 @@ func (s *Server) vpnCoreSubscriptionSourcesRPC(ctx context.Context, method strin
 		response.Error = composeFailureView(composeFailure("invalid_request"))
 		return json.Marshal(response)
 	}
+	now := time.Now().UTC()
 	response, err := composeGraphSubscriptionFromCapture(func() (lineChainCompileSnapshot, error) {
 		// One persistent snapshot and one live projection are the complete
-		// authority for this call. The pure composer performs no later reads.
+		// authority for this call, with the identities' policies read right
+		// after it. The pure composer performs no later reads.
 		persistent := s.store.LineChainCompileStateSnapshot()
-		return s.captureLineChainCompileSnapshotFromState(persistent)
-	}, req, time.Now().UTC())
+		snapshot, err := s.captureLineChainCompileSnapshotFromState(persistent)
+		if err != nil {
+			return snapshot, err
+		}
+		return s.withIdentityPolicies(snapshot, now), nil
+	}, req, now)
 	if err != nil {
 		response = graphSubscriptionResponse{SchemaVersion: 1, Error: composeFailureView(err)}
 	}

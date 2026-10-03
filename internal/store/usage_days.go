@@ -62,8 +62,11 @@ type UsageDayNode struct {
 
 // UsageDayUserLine is one identity's counted traffic on one line for the day.
 type UsageDayUserLine struct {
-	Uplink     int64     `json:"u"`
-	Downlink   int64     `json:"d"`
+	Uplink   int64 `json:"u"`
+	Downlink int64 `json:"d"`
+	// Proof is the part of Uplink plus Downlink a proof rule counted; see
+	// UsageDayUser.Proof.
+	Proof      int64     `json:"p,omitempty"`
 	LastSeenAt time.Time `json:"at,omitempty"`
 }
 
@@ -71,10 +74,22 @@ type UsageDayUserLine struct {
 // line it was counted on. Only attributions that count toward the quota land
 // here (named, credential, binding); estimates are derived at read time.
 type UsageDayUser struct {
-	UserID     string                      `json:"uid"`
-	Day        string                      `json:"day"`
-	Uplink     int64                       `json:"u"`
-	Downlink   int64                       `json:"d"`
+	UserID   string `json:"uid"`
+	Day      string `json:"day"`
+	Uplink   int64  `json:"u"`
+	Downlink int64  `json:"d"`
+	// Proof is the part of Uplink plus Downlink that a proof rule counted: a
+	// named u_<hash> counter, a single-credential inbound whose credential is
+	// this identity's, or a legacy per-user counter. The rest was inferred,
+	// which today means the binding rule giving a whole inbound to the one
+	// identity bound to it. The quota counts both; anything that acts on a
+	// node without a human, such as a suspension, may act on proof alone.
+	//
+	// Rows written before the field existed read 0, and so does a row a
+	// release without it added to: their bytes count as not proven. That is
+	// the safe direction, because it can only hold an action back, never
+	// start one.
+	Proof      int64                       `json:"p,omitempty"`
 	ByLine     map[string]UsageDayUserLine `json:"bl,omitempty"`
 	LastSeenAt time.Time                   `json:"at,omitempty"`
 }
@@ -181,6 +196,7 @@ func addUsageDayUser(dst *UsageDayUser, delta UsageDayUser) {
 	}
 	dst.Uplink += delta.Uplink
 	dst.Downlink += delta.Downlink
+	dst.Proof += delta.Proof
 	if delta.LastSeenAt.After(dst.LastSeenAt) {
 		dst.LastSeenAt = delta.LastSeenAt
 	}
@@ -191,6 +207,7 @@ func addUsageDayUser(dst *UsageDayUser, delta UsageDayUser) {
 		cur := dst.ByLine[hash]
 		cur.Uplink += line.Uplink
 		cur.Downlink += line.Downlink
+		cur.Proof += line.Proof
 		if line.LastSeenAt.After(cur.LastSeenAt) {
 			cur.LastSeenAt = line.LastSeenAt
 		}

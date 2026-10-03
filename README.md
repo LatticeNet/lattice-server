@@ -343,6 +343,30 @@ Use the compose file and deployment guide in the umbrella repository:
   installed and systemd accepted the delayed restart unit. That success records
   `last_applied_version`; the live source of truth remains the next node
   heartbeat's reported `agent_version`.
+  A plan rendered by this server also names two node-side steps, and the task
+  script performs each only for an approval whose plan names it, so an
+  approval planned earlier runs the script it was approved with. When the
+  candidate's `-compat-json` lists `sd-notify-v1`, the script writes
+  `/etc/systemd/system/<service>.service.d/10-lattice-keepalive.conf`
+  (`NotifyAccess=main` and a runtime directory; the unit type is unchanged) so
+  the new agent can arm its own watchdog. When it also lists
+  `health-marker-v1` and a previous binary exists, the script arms an update
+  guard before it schedules the restart: a transient systemd timer that, 300 s
+  later, keeps the new binary if `/run/<service>/healthy` holds the target
+  version, leaves a binary that changed since the update alone, and otherwise
+  restores the backup and restarts the service. A guard that cannot be armed
+  restores the backup and fails the task, leaving the running agent untouched.
+  The guard and the restart timers fire within a second
+  (`--timer-property=AccuracySec=1s`) where `systemd-run` supports it (systemd
+  229 and later); an older systemd keeps its default one minute accuracy. The
+  guard lives in `/run`, so a reboot before it fires cancels it and the node
+  keeps the new binary.
+- Enroll and reconfigure commands install one pinned stable node-agent
+  release: the installer is fetched at that tag and told to download the
+  binary of the same tag. Both responses name it as `agent_version`. The
+  installer always installs a binary, so a reconfigure on a node that runs
+  another version (a newer prerelease or an older release) moves it to the
+  pinned release, and the console says so next to the command.
 - Node reconfigure commands source both the canonical
   `/opt/lattice/lattice-agent.env` and legacy `/opt/lattice/node-agent/agent.env`
   before rerunning the installer. Operators can therefore reconfigure or upgrade
@@ -478,6 +502,29 @@ Use the compose file and deployment guide in the umbrella repository:
   monotonically under a dedicated mutex, and rejects malformed/negative input.
   `GET /api/proxy/usage` returns only secret-free counters/status for the
   dashboard.
+- Agent monitor results: `POST /api/agent/monitor-result` takes one result
+  (`{"node_id": ..., "result": {...}}`) and `POST /api/agent/monitor-results`
+  takes a batch (`{"node_id": ..., "results": [...]}`, 1 to 500 entries). Both
+  need the node's bearer token and answer
+  `{"ok": true, "accepted": n, "duplicates": n, "dropped": [{"index", "monitor_id", "reason"}]}`.
+  A result is admitted only for an existing, enabled, non-tls monitor assigned
+  to the posting node, with the node id taken from the token and the error
+  text capped at 512 bytes. It must carry the agent's own stamp, no more than
+  24 hours behind and no more than a minute ahead of the server's clock: a
+  result without one is `invalid` and one outside that window is
+  `out_of_window`. The server never restamps a result, because the stamp is
+  what makes a result sent again a duplicate. A dropped reason
+  (`unknown_monitor`, `server_evaluated`, `disabled`, `not_assigned`,
+  `out_of_window`, `invalid`) is final, so the agent drops that result. The
+  server logs drops at most once per node and reason every 15 minutes, with the
+  stamp's offset for `out_of_window`, so a broken agent clock shows in the log.
+  Results are judged in array order, so a buffered backlog goes oldest first.
+  A result the pair already holds at the same instant counts as a duplicate,
+  so a batch sent again after a lost response stores nothing twice and pages
+  nothing twice, and on a 5xx nothing was stored. A page is decided after the
+  write commits and waits in memory for the next sweep, so a crash in that
+  window loses the page rather than sending it twice. An older server answers
+  404 on the batch path, which tells the agent to post one result per request.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/
@@ -486,7 +533,11 @@ Use the compose file and deployment guide in the umbrella repository:
 - PAT server allowlists are enforced against the actual node resources in request
   bodies, not only URL query parameters.
 - Node/task/monitor/DDNS/tunnel list APIs return only resources visible to the
-  caller's scopes and server allowlist.
+  caller's scopes and server allowlist. `GET /api/monitors` carries each
+  assigned node's newest result as `latest` (with `fail_streak` and `since`),
+  filtered the same way, and `GET /api/monitors/results` returns the newest
+  500 results across nodes by default, or one node's with `node_id`, up to
+  `limit` (at most 2000).
 - Control-plane task views expose script hash and byte size, not the full script
   body or agent-only lease credential.
 - Task read and run permissions are split: `task:read` lists task metadata and
@@ -579,7 +630,13 @@ Use the compose file and deployment guide in the umbrella repository:
   When enabled, startup imports/merges existing JSON hot records into the
   sidecar, then audit events, interactive sessions, proxy users, proxy node
   profiles, and proxy usage snapshots are written at record level in bbolt
-  instead of forcing a whole encrypted JSON rewrite. The in-memory read model
+  instead of forcing a whole encrypted JSON rewrite. Monitor results live there
+  too: one row per result and one latest record per monitor and node (with the
+  failure streak the alert hold reads), 1440 rows per pair, and any JSON
+  history is migrated once on the first enable. Without the sidecar the JSON
+  file keeps 120 rows per pair and is rewritten only when a pair changes state,
+  reaches its second failure in a row, or has not been written for five
+  minutes. The in-memory read model
   remains unchanged and `/readyz` verifies the sidecar. The default remains the
   JSON state file so operators can canary the cutover per deployment.
 - The full runtime store is not bbolt-only yet. The next storage slice should

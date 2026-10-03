@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // Explicit, secret-free response projections for resources whose handlers
@@ -175,6 +176,37 @@ type monitorView struct {
 	Enabled       bool      `json:"enabled"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	// Latest is each assigned node's newest result that the caller may see,
+	// sorted by node id; empty, never absent, when there are none. The list
+	// answers "what is each monitor doing now" in one read instead of one
+	// history read per monitor.
+	Latest []monitorLatestView `json:"latest"`
+}
+
+// monitorLatestView is one node's newest result for a monitor, and the run
+// it ends. A tls monitor's has an empty node_id: the control plane dialled
+// it. fail_streak counts the failures in a row ending here (zero after a
+// success); since is when the current run of successes or failures began.
+// A received_at well after at marks a result that waited in an agent's
+// buffer.
+type monitorLatestView struct {
+	NodeID       string    `json:"node_id"`
+	At           time.Time `json:"at"`
+	Success      bool      `json:"success"`
+	LatencyMs    float64   `json:"latency_ms"`
+	Error        string    `json:"error,omitempty"`
+	CertNotAfter time.Time `json:"cert_not_after,omitzero"`
+	ReceivedAt   time.Time `json:"received_at,omitzero"`
+	FailStreak   int       `json:"fail_streak"`
+	Since        time.Time `json:"since"`
+}
+
+func toMonitorLatestView(l store.MonitorLatest) monitorLatestView {
+	return monitorLatestView{
+		NodeID: l.NodeID, At: l.At, Success: l.Success, LatencyMs: l.LatencyMs,
+		Error: l.Error, CertNotAfter: l.CertNotAfter, ReceivedAt: l.ReceivedAt,
+		FailStreak: l.FailStreak, Since: l.Since,
+	}
 }
 
 func toMonitorViews(in []model.Monitor) []monitorView {
@@ -185,6 +217,7 @@ func toMonitorViews(in []model.Monitor) []monitorView {
 			IntervalSec: m.IntervalSec, TimeoutSec: m.TimeoutSec, AssignAll: m.AssignAll,
 			NodeIDs: m.NodeIDs, ThresholdDays: m.ThresholdDays,
 			Enabled: m.Enabled, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
+			Latest: []monitorLatestView{},
 		})
 	}
 	return out

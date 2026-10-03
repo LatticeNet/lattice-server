@@ -1,6 +1,8 @@
 package store
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"strings"
@@ -195,5 +197,89 @@ func TestSubscriptionShareByTokenFailsClosedOnDuplicateToken(t *testing.T) {
 	}
 	if got, ok := s.SubscriptionShareByToken("collided"); ok {
 		t.Fatalf("a duplicated token must resolve to nothing, got %q", got.ID)
+	}
+}
+
+// The token index is rebuilt after every share write, on the JSON path and on
+// the bolt hot store path (which mutates the share map in place): a rotated
+// token stops resolving the moment the rotation commits, a new one starts,
+// and a deleted share's token resolves to nothing.
+func TestSubscriptionShareTokenIndexFollowsEveryWrite(t *testing.T) {
+	for _, hot := range []bool{false, true} {
+		name := "json"
+		if hot {
+			name = "bolt"
+		}
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := OpenWithCipher(filepath.Join(dir, "state.json"), testCipher(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hot {
+				if err := s.EnableRuntimeBoltHotStore(filepath.Join(dir, "state-hot.db")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			share := model.SubscriptionShare{ID: "sh1", Slug: "one", Token: "token-before", Enabled: true}
+			if err := s.UpsertSubscriptionShare(share); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := s.SubscriptionShareByToken("token-before"); !ok {
+				t.Fatal("the token did not resolve")
+			}
+			share.Token = "token-after"
+			if err := s.UpsertSubscriptionShare(share); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := s.SubscriptionShareByToken("token-before"); ok {
+				t.Fatal("a rotated-away token still resolved")
+			}
+			if got, ok := s.SubscriptionShareByToken("token-after"); !ok || got.ID != "sh1" {
+				t.Fatalf("the rotated token resolved ok=%v id=%q", ok, got.ID)
+			}
+			if err := s.DeleteSubscriptionShare("sh1"); err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := s.SubscriptionShareByToken("token-after"); ok {
+				t.Fatal("a deleted share's token still resolved")
+			}
+		})
+	}
+}
+
+// A reopened store resolves tokens from the state it loaded, and the index
+// it builds holds MACs under its own random key, never the tokens.
+func TestSubscriptionShareTokenIndexAfterReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	cipher := testCipher(t)
+	s, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertSubscriptionShare(model.SubscriptionShare{ID: "sh1", Slug: "one", Token: "persisted-token", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenWithCipher(path, cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := reopened.SubscriptionShareByToken("persisted-token"); !ok || got.ID != "sh1" {
+		t.Fatalf("reopened lookup ok=%v id=%q", ok, got.ID)
+	}
+	reopened.mu.Lock()
+	index := reopened.linkIndex
+	reopened.mu.Unlock()
+	if index == nil || len(index.byMAC) != 1 {
+		t.Fatalf("index = %+v", index)
+	}
+	for mac := range index.byMAC {
+		if bytes.Contains(mac[:], []byte("persisted")) || mac == sha256.Sum256([]byte("persisted-token")) {
+			t.Fatal("the index is keyed by something derivable from the token alone")
+		}
 	}
 }

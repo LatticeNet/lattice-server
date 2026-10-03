@@ -285,6 +285,8 @@ type Store struct {
 	// link_token_index.go. Guarded by mu.
 	linkIndex *linkTokenIndex
 	shareGen  uint64
+	// vpnLinkGen counts identity writes for the same index.
+	vpnLinkGen uint64
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every

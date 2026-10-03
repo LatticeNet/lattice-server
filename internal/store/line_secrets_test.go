@@ -627,11 +627,29 @@ func TestVpnUserSubscriptionGenerationCoversRoutingInputsWithoutOrderChurn(t *te
 		t.Fatalf("semantic reorder advanced generation to %d", reordered.SubscriptionGeneration)
 	}
 
+	// The token is the identity link's, written only through
+	// UpdateVpnUserLink; a change to it still moves the generation.
+	if err := s.UpdateVpnUserLink(public.ID, func(link *VpnUserLink, _ string) (*VpnUserLink, string, error) { return link, "sub-b", nil }); err != nil {
+		t.Fatal(err)
+	}
+	reordered, reorderedSecret, _ = s.VpnUserRecord(public.ID)
+	if reordered.SubscriptionGeneration != 2 || reorderedSecret.SubID != "sub-b" {
+		t.Fatalf("a token change must move the generation: %d %q", reordered.SubscriptionGeneration, reorderedSecret.SubID)
+	}
+	// PutVpnUserRecord keeps the stored token whatever it is handed.
+	stale := reorderedSecret
+	stale.SubID = "sub-a"
+	if err := s.PutVpnUserRecord(reordered, stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, kept, _ := s.VpnUserRecord(public.ID); kept.SubID != "sub-b" {
+		t.Fatalf("an identity write put a rotated-away token back: %q", kept.SubID)
+	}
+
 	mutations := []struct {
 		name   string
 		mutate func(*VpnUserPublicRecord, *VpnUserSecretRecord)
 	}{
-		{name: "sub id", mutate: func(_ *VpnUserPublicRecord, s *VpnUserSecretRecord) { s.SubID = "sub-b" }},
 		{name: "enabled", mutate: func(p *VpnUserPublicRecord, _ *VpnUserSecretRecord) { p.Enabled = false }},
 		{name: "expiry", mutate: func(p *VpnUserPublicRecord, _ *VpnUserSecretRecord) { p.ExpiresAt = p.ExpiresAt.Add(time.Hour) }},
 		{name: "resolved flow", mutate: func(p *VpnUserPublicRecord, _ *VpnUserSecretRecord) {
@@ -642,7 +660,7 @@ func TestVpnUserSubscriptionGenerationCoversRoutingInputsWithoutOrderChurn(t *te
 			}
 		}},
 	}
-	want := uint64(1)
+	want := uint64(2)
 	currentPublic, currentPrivate := reordered, reorderedSecret
 	for _, tc := range mutations {
 		t.Run(tc.name, func(t *testing.T) {
@@ -686,8 +704,9 @@ func TestReplaceVpnUserRecordsCannotRewindOrOverflowSubscriptionGeneration(t *te
 	if err := overflowStore.ReplaceVpnUserRecords(map[string]VpnUserPublicRecord{got.ID: got}, map[string]VpnUserSecretRecord{got.ID: gotPrivate}, nil); err != nil {
 		t.Fatal(err)
 	}
-	gotPrivate.SubID = "changed-at-overflow"
-	if err := overflowStore.PutVpnUserRecord(got, gotPrivate); err == nil {
+	if err := overflowStore.UpdateVpnUserLink(got.ID, func(link *VpnUserLink, _ string) (*VpnUserLink, string, error) {
+		return link, "changed-at-overflow", nil
+	}); err == nil {
 		t.Fatal("generation overflow was accepted")
 	}
 	after, afterPrivate, _ := overflowStore.VpnUserRecord(got.ID)

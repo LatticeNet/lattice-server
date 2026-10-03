@@ -96,23 +96,26 @@ const (
 // VpnUserPublicRecord is the non-secret half of a vpn-core identity. It is a
 // typed store collection so generic KV APIs cannot enumerate or overwrite it.
 type VpnUserPublicRecord struct {
-	ID                     string                    `json:"id"`
-	Email                  string                    `json:"email"`
-	Name                   string                    `json:"name,omitempty"`
-	Enabled                bool                      `json:"enabled"`
-	Credentials            []VpnUserCredentialPublic `json:"credentials"`
-	Bindings               []VpnUserLineBinding      `json:"bindings"`
-	QuotaBytes             int64                     `json:"quota_bytes,omitempty"`
-	QuotaPeriod            string                    `json:"quota_period,omitempty"`
-	QuotaResetDay          int                       `json:"quota_reset_day,omitempty"`
-	ExpiresAt              time.Time                 `json:"expires_at,omitempty"`
-	Group                  string                    `json:"group,omitempty"`
-	Comment                string                    `json:"comment,omitempty"`
-	MigratedFromProxyUser  string                    `json:"migrated_from_proxy_user,omitempty"`
-	Suspension             *VpnUserSuspension        `json:"suspension,omitempty"`
-	CreatedAt              time.Time                 `json:"created_at"`
-	UpdatedAt              time.Time                 `json:"updated_at"`
-	SubscriptionGeneration uint64                    `json:"subscription_generation"`
+	ID                    string                    `json:"id"`
+	Email                 string                    `json:"email"`
+	Name                  string                    `json:"name,omitempty"`
+	Enabled               bool                      `json:"enabled"`
+	Credentials           []VpnUserCredentialPublic `json:"credentials"`
+	Bindings              []VpnUserLineBinding      `json:"bindings"`
+	QuotaBytes            int64                     `json:"quota_bytes,omitempty"`
+	QuotaPeriod           string                    `json:"quota_period,omitempty"`
+	QuotaResetDay         int                       `json:"quota_reset_day,omitempty"`
+	ExpiresAt             time.Time                 `json:"expires_at,omitempty"`
+	Group                 string                    `json:"group,omitempty"`
+	Comment               string                    `json:"comment,omitempty"`
+	MigratedFromProxyUser string                    `json:"migrated_from_proxy_user,omitempty"`
+	Suspension            *VpnUserSuspension        `json:"suspension,omitempty"`
+	// Link is the identity's subscription link, nil until one is issued
+	// (vpn_user_link.go). Its token is SubID in the secret record.
+	Link                   *VpnUserLink `json:"link,omitempty"`
+	CreatedAt              time.Time    `json:"created_at"`
+	UpdatedAt              time.Time    `json:"updated_at"`
+	SubscriptionGeneration uint64       `json:"subscription_generation"`
 }
 
 // VpnUserSuspension records an operator's act that took an identity out of
@@ -276,6 +279,9 @@ func validateVpnUserCollections(public map[string]VpnUserPublicRecord, private m
 		if len(record.Credentials) > MaxVpnUserCredentials {
 			return fmt.Errorf("vpn user %q has more than %d public credentials", id, MaxVpnUserCredentials)
 		}
+		if err := validateVpnUserLink(id, record.Link, private[id]); err != nil {
+			return err
+		}
 		secretRecord, ok := private[id]
 		if !ok && len(record.Credentials) > 0 {
 			return fmt.Errorf("vpn user %q is missing private credentials", id)
@@ -356,6 +362,7 @@ func cloneVpnUserPublicRecords(in map[string]VpnUserPublicRecord) map[string]Vpn
 			suspension := *record.Suspension
 			record.Suspension = &suspension
 		}
+		record.Link = cloneVpnUserLink(record.Link)
 		out[id] = record
 	}
 	return out
@@ -441,6 +448,7 @@ func (s *Store) replaceLineSecretRecordsLocked(public map[string]VpnUserPublicRe
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged
+		s.invalidateIdentityLinkIndexLocked()
 	}
 	return err
 }
@@ -490,6 +498,7 @@ func (s *Store) MigrateVpnUserPublicRecordsOnce(name string, fn func(VpnUserPubl
 		return nil, false, err
 	}
 	s.state = staged
+	s.invalidateIdentityLinkIndexLocked()
 	return changed, true, err
 }
 
@@ -517,6 +526,9 @@ func (s *Store) stageLineSecretRecordsLocked(public map[string]VpnUserPublicReco
 		stagedPublic[id] = record
 	}
 	if err := validateVpnUserCollections(stagedPublic, stagedPrivate); err != nil {
+		return State{}, err
+	}
+	if err := validateLinkSlugsUnique(stagedPublic, s.shareSlugsLocked()); err != nil {
 		return State{}, err
 	}
 	if err := validateManagedLineCollections(managedPublic, managedPrivate); err != nil {
@@ -567,10 +579,20 @@ func (s *Store) ManagedLineRecords() (map[string]ManagedLinePublicRecord, map[st
 	return cloneManagedLinePublicRecords(s.state.ManagedLines), cloneManagedLineSecretRecords(s.state.ManagedLineSecrets)
 }
 
+// PutVpnUserRecord writes one identity. An identity that already exists
+// keeps its stored link and token (Link, SubID) whatever the caller passed:
+// every identity write reads the record, edits it and writes it back, and a
+// write that read before a link rotation would otherwise put the rotated-away
+// token back. The link is written only through UpdateVpnUserLink, which does
+// its read and write under the store lock.
 func (s *Store) PutVpnUserRecord(public VpnUserPublicRecord, private VpnUserSecretRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	public.SubscriptionGeneration = 0
+	if current, ok := s.state.VpnUsers[public.ID]; ok {
+		public.Link = cloneVpnUserLink(current.Link)
+		private.SubID = s.state.VpnUserSecrets[public.ID].SubID
+	}
 	publicRecords := cloneVpnUserPublicRecords(s.state.VpnUsers)
 	privateRecords := cloneVpnUserSecretRecords(s.state.VpnUserSecrets)
 	publicRecords[public.ID] = public

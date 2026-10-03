@@ -39,6 +39,11 @@ type notifyChannelHealthView struct {
 	LastStatusCode      int       `json:"last_status_code,omitempty"`
 	ConsecutiveFailures int       `json:"consecutive_failures"`
 	FailingSince        time.Time `json:"failing_since,omitzero"`
+	// The last time a critical message this channel failed was handed to its
+	// fallback, which channel took it, and how many hand-offs so far.
+	LastFallbackAt        time.Time `json:"last_fallback_at,omitzero"`
+	LastFallbackChannelID string    `json:"last_fallback_channel_id,omitempty"`
+	Fallbacks             int       `json:"fallbacks,omitempty"`
 }
 
 func notifyChannelHealthState(h store.NotifyChannelHealth, now time.Time) string {
@@ -66,6 +71,10 @@ func toNotifyChannelHealthView(h store.NotifyChannelHealth, now time.Time) notif
 		LastStatusCode:      h.LastStatusCode,
 		ConsecutiveFailures: h.ConsecutiveFailures,
 		FailingSince:        h.FailingSince,
+
+		LastFallbackAt:        h.LastFallbackAt,
+		LastFallbackChannelID: h.LastFallbackChannelID,
+		Fallbacks:             h.Fallbacks,
 	}
 }
 

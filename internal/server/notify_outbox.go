@@ -25,7 +25,9 @@ import (
 // failure is retried on notifyRetryDelays, a permanent one settles at once,
 // and the channel's health moves in the same store write as the receipt.
 // When every primary channel of a rule failed a message for good, the rule's
-// fallback channel gets it. A channel that keeps failing raises
+// fallback channel gets it; a critical message also goes to its channel's own
+// fallback at the first failed attempt (notify_channel_fallback.go). A
+// channel that keeps failing raises
 // notify.channel_failing, which is never sent to the failing channel itself.
 //
 // Boot reconciles the outbox before the first send: a delivery planned less
@@ -526,6 +528,9 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 		if err := s.store.PutNotifyDelivery(row, nil); err != nil {
 			s.logger.Printf("notify: settle %s: %v", row.ID, err)
 		}
+		if found {
+			s.planNotifyChannelFallback(row, channel)
+		}
 		s.afterNotifySettled(row)
 		return
 	}
@@ -575,6 +580,9 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	}
 	if recovered {
 		s.announceNotifyChannelOK(channel, prev, attempt.At)
+	}
+	if err != nil {
+		s.planNotifyChannelFallback(row, channel)
 	}
 	if row.Settled() {
 		s.afterNotifySettled(row)
@@ -729,9 +737,11 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 			continue
 		}
 		switch {
-		case sib.Role == store.NotifyRoleFallback:
+		case sib.Role == store.NotifyRoleFallback && sib.FallbackOf == "":
 			return // already planned
 		case sib.Role != store.NotifyRolePrimary:
+			// A test, or a channel's critical fallback (FallbackOf set):
+			// neither is one of the rule's primaries.
 			continue
 		case !sib.Settled(), sib.Outcome == store.NotifyOutcomeSent:
 			return // still trying, or the message got through
@@ -739,6 +749,13 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 		failed = append(failed, sib.ChannelName)
 	}
 	sort.Strings(failed)
+	for _, sib := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{EventID: row.EventID}) {
+		if sib.ChannelID == opts.FallbackChannelID {
+			// A channel's critical fallback already handed the event to
+			// the rule's fallback channel.
+			return
+		}
+	}
 	now := s.now()
 	body, cut := notifyFallbackBody(row.Body, strings.Join(failed, ", "))
 	fallback := store.NotifyDelivery{
@@ -764,7 +781,10 @@ func (s *Server) planNotifyFallback(row store.NotifyDelivery) {
 // notifyFallbackBody appends the fallback sentence to a message, shortening
 // the message rather than the sentence when the two exceed the body bound.
 func notifyFallbackBody(body, failed string) (string, bool) {
-	sentence := "\n\nSent through the fallback channel because " + failed + " did not deliver it."
+	return notifyFallbackBodyWith(body, "\n\nSent through the fallback channel because "+failed+" did not deliver it.")
+}
+
+func notifyFallbackBodyWith(body, sentence string) (string, bool) {
 	base, cut := store.TruncateUTF8(body, max(0, store.MaxNotifyBodyBytes-len(sentence)))
 	out, cutAll := store.TruncateUTF8(base+sentence, store.MaxNotifyBodyBytes)
 	return out, cut || cutAll

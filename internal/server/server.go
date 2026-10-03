@@ -5330,15 +5330,21 @@ type notifyChannelView struct {
 	// Health is joined from the outbox's health record at read time; it is
 	// never part of the stored channel.
 	Health notifyChannelHealthView `json:"health"`
+	// FallbackChannelID takes the critical messages this channel fails
+	// (notify_channel_fallback.go); CriticalEventTypes names them, so the
+	// console never keeps its own copy of the list.
+	FallbackChannelID  string   `json:"fallback_channel_id,omitempty"`
+	CriticalEventTypes []string `json:"critical_event_types"`
 }
 
-func toNotifyChannelView(c model.NotifyChannel, h store.NotifyChannelHealth, now time.Time) notifyChannelView {
+func toNotifyChannelView(c model.NotifyChannel, h store.NotifyChannelHealth, opts store.NotifyChannelOptions, now time.Time) notifyChannelView {
 	keys := make([]string, 0, len(c.Config))
 	for k := range c.Config {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt, Health: toNotifyChannelHealthView(h, now)}
+	return notifyChannelView{ID: c.ID, Name: c.Name, Kind: c.Kind, ConfigKeys: keys, Enabled: c.Enabled, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt, Health: toNotifyChannelHealthView(h, now),
+		FallbackChannelID: opts.FallbackChannelID, CriticalEventTypes: notifyCriticalEventList()}
 }
 
 func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p principal) {
@@ -5351,10 +5357,11 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		}
 		channels := s.store.NotifyChannels()
 		health := s.store.NotifyChannelHealths()
+		opts := s.store.NotifyChannelOptionsByChannel()
 		now := s.now()
 		views := make([]notifyChannelView, 0, len(channels))
 		for _, c := range channels {
-			views = append(views, toNotifyChannelView(c, health[c.ID], now))
+			views = append(views, toNotifyChannelView(c, health[c.ID], opts[c.ID], now))
 		}
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
@@ -5370,6 +5377,9 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			Kind    string            `json:"kind"`
 			Config  map[string]string `json:"config"`
 			Enabled *bool             `json:"enabled"`
+			// FallbackChannelID takes this channel's failed critical
+			// messages; nil keeps the stored value, "" clears it.
+			FallbackChannelID *string `json:"fallback_channel_id"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -5397,13 +5407,22 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			Config:  req.Config,
 			Enabled: req.Enabled == nil || *req.Enabled,
 		}
-		for _, existing := range s.store.NotifyChannels() {
+		existingChannels := s.store.NotifyChannels()
+		for _, existing := range existingChannels {
 			if existing.ID == channel.ID {
 				channel.CreatedAt = existing.CreatedAt
 				break
 			}
 		}
-		if err := s.store.UpsertNotifyChannel(channel); err != nil {
+		opts := s.store.NotifyChannelOptionsByChannel()[channel.ID]
+		if req.FallbackChannelID != nil {
+			opts.FallbackChannelID = strings.TrimSpace(*req.FallbackChannelID)
+		}
+		if err := validateNotifyChannelFallback(opts.FallbackChannelID, channel.ID, existingChannels); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.store.UpsertNotifyChannelWithOptions(channel, opts); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -5411,9 +5430,13 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		if req.ID != "" {
 			action = "notify.channel.update"
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: map[string]string{"channel_id": channel.ID, "kind": channel.Kind}})
+		metadata := map[string]string{"channel_id": channel.ID, "kind": channel.Kind}
+		if opts.FallbackChannelID != "" {
+			metadata["fallback_channel_id"] = opts.FallbackChannelID
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: metadata})
 		health, _ := s.store.NotifyChannelHealth(channel.ID)
-		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, s.now()))
+		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, opts, s.now()))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}

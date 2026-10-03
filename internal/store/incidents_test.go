@@ -268,3 +268,53 @@ func TestSuppressedRowsFoldLikeUnroutedRows(t *testing.T) {
 		t.Fatalf("suppressed and unrouted rows folded together: %d rows", n)
 	}
 }
+
+// Deleting a node or a monitor removes its incidents in the same cascade, so
+// a node enrolled again under the same id starts with no open problem, and
+// the recovery text of a resolved record survives a reopen.
+func TestDeleteCascadesRemoveIncidents(t *testing.T) {
+	s, path := openReportClockStore(t)
+	if err := s.EnableRuntimeBoltHotStore(filepath.Join(filepath.Dir(path), "hot.db")); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 3, 9, 0, 0, 0, time.UTC)
+	for _, id := range []string{"node-a", "node-b"} {
+		if err := s.UpsertNode(model.Node{ID: id, Name: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.UpsertMonitor(model.Monitor{ID: "mon-1", Name: "web", Type: model.MonitorTypeTCP, Target: "x:1", NodeIDs: []string{"node-b"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	offline := testIncident("inc-a", "node.offline/node-a", at, IncidentStateOpen)
+	monitor := testIncident("inc-m", "monitor.down/mon-1/node-b", at, IncidentStateResolved)
+	monitor.NodeID, monitor.MonitorID, monitor.Kind = "node-b", "mon-1", "monitor.down"
+	monitor.RecoveryTitle, monitor.OwedRecovery = "MARKER-RECOVERY", true
+	other := testIncident("inc-b", "node.offline/node-b", at, IncidentStateOpen)
+	other.NodeID = "node-b"
+	if err := s.PutIncidents(offline, monitor, other); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := s.Incident("inc-m"); !ok || got.RecoveryTitle != "MARKER-RECOVERY" || !got.OwedRecovery {
+		t.Fatalf("recovery fields = %+v", got)
+	}
+	if err := s.DeleteMonitor("mon-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Incident("inc-m"); ok {
+		t.Fatal("a deleted monitor's incident remains")
+	}
+	if _, _, err := s.DeleteNode("node-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.ActiveIncident("node.offline/node-a"); ok {
+		t.Fatal("a deleted node's incident remains")
+	}
+	if _, ok := s.ActiveIncident("node.offline/node-b"); !ok {
+		t.Fatal("another node's incident went with it")
+	}
+	got := s.IncidentsWhere(func(inc Incident) bool { return inc.NodeID != "" })
+	if len(got) != 1 || got[0].ID != "inc-b" {
+		t.Fatalf("left = %+v", got)
+	}
+}

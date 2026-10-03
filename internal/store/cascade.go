@@ -145,6 +145,11 @@ func (s *Store) DeleteNode(nodeID string) (NodeCascadeReport, bool, error) {
 			return report, true, err
 		}
 	}
+	// Its incidents go the same way, so a node enrolled again under the same
+	// id starts with no open problem and owes no recovery.
+	if err := s.deleteIncidentsLocked(func(inc Incident) bool { return inc.NodeID == nodeID }); err != nil {
+		return report, true, err
+	}
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if committed {
 		s.state = staged

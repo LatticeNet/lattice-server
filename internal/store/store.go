@@ -5284,6 +5284,9 @@ func (s *Store) DeleteMonitor(id string) error {
 			return err
 		}
 	}
+	if err := s.deleteIncidentsLocked(func(inc Incident) bool { return inc.MonitorID == id }); err != nil {
+		return err
+	}
 	delete(s.state.Monitors, id)
 	delete(s.state.MonResults, id)
 	for key := range s.monitorPersistedAt {

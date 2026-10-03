@@ -69,10 +69,17 @@ type Incident struct {
 	// Subject is the display name at open (node name, or monitor on node).
 	Subject string `json:"subject,omitempty"`
 	State   string `json:"state"`
-	// Title and Detail are the last open message the incident produced,
-	// which reminders and escalations repeat.
+	// Title and Detail are the open message the incident produced, which
+	// an escalation repeats; Line is its share of a digest when several
+	// incidents of one kind go out together.
 	Title  string `json:"title,omitempty"`
 	Detail string `json:"detail,omitempty"`
+	Line   string `json:"line,omitempty"`
+	// RecoveryTitle, RecoveryDetail and RecoveryLine are the same for the
+	// recovery message, set when the incident resolves.
+	RecoveryTitle  string `json:"recovery_title,omitempty"`
+	RecoveryDetail string `json:"recovery_detail,omitempty"`
+	RecoveryLine   string `json:"recovery_line,omitempty"`
 	// Since is when the condition began (a node's last heartbeat, a
 	// problem's start), FirstOpenedAt when the incident first opened and
 	// OpenedAt when it last opened (a flap reopens the same record).
@@ -94,9 +101,14 @@ type Incident struct {
 	Notified       string    `json:"notified,omitempty"`
 	NotifiedAt     time.Time `json:"notified_at,omitzero"`
 	OpenNotifiedAt time.Time `json:"open_notified_at,omitzero"`
-	// OwedOpen is set when the open message was held by a maintenance window
-	// or a snooze; it goes out once neither applies while still open.
-	OwedOpen bool `json:"owed_open,omitempty"`
+	// OwedOpen is set while an open message is owed and not yet sent: from
+	// the moment the incident opens until the next evaluation sends it, or
+	// for as long as a maintenance window, a snooze or flap damping holds
+	// it. OwedRecovery is the same for the recovery, owed only when the
+	// phone was told "open". Both survive a restart, so a decision taken
+	// just before a crash is still sent after it.
+	OwedOpen     bool `json:"owed_open,omitempty"`
+	OwedRecovery bool `json:"owed_recovery,omitempty"`
 	// Suppressed is the last reason a message about this incident was held,
 	// and SuppressedAt when.
 	Suppressed   string    `json:"suppressed,omitempty"`
@@ -303,6 +315,10 @@ func cloneMaintenanceWindow(w MaintenanceWindow) MaintenanceWindow {
 func boundIncidentText(inc Incident) Incident {
 	inc.Title, _ = TruncateUTF8(inc.Title, MaxNotifyTitleBytes)
 	inc.Detail, _ = TruncateUTF8(inc.Detail, maxIncidentText)
+	inc.Line, _ = TruncateUTF8(inc.Line, 512)
+	inc.RecoveryTitle, _ = TruncateUTF8(inc.RecoveryTitle, MaxNotifyTitleBytes)
+	inc.RecoveryDetail, _ = TruncateUTF8(inc.RecoveryDetail, maxIncidentText)
+	inc.RecoveryLine, _ = TruncateUTF8(inc.RecoveryLine, 512)
 	inc.Subject, _ = TruncateUTF8(inc.Subject, 256)
 	inc.Suppressed, _ = TruncateUTF8(inc.Suppressed, 512)
 	return inc
@@ -345,6 +361,11 @@ func (b *incidentBook) incidentEvictionLocked(adding []Incident) []string {
 // PutIncidents writes incidents in one transaction, evicting the oldest
 // resolved ones when the bound requires it. An incident whose key already
 // has another unresolved incident is refused: one problem, one record.
+//
+// When the bolt write fails the change is still applied in memory and the
+// error returned. Memory is what the evaluator reads, so a failing disk
+// costs the record at the next restart but never makes the server send the
+// same page again on every sweep.
 func (s *Store) PutIncidents(rows ...Incident) error {
 	if len(rows) == 0 {
 		return nil
@@ -363,11 +384,29 @@ func (s *Store) PutIncidents(rows ...Incident) error {
 		clean = append(clean, cloneIncident(boundIncidentText(inc)))
 	}
 	w := incidentWrite{putIncidents: clean, delIncidents: b.incidentEvictionLocked(clean)}
-	if err := s.commitIncidentsLocked(w); err != nil {
-		return err
-	}
+	err := s.commitIncidentsLocked(w)
 	b.applyLocked(w)
-	return nil
+	return err
+}
+
+// IncidentsWhere returns the incidents match selects, oldest opened first.
+func (s *Store) IncidentsWhere(match func(Incident) bool) []Incident {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := s.incidentBookLocked()
+	var out []Incident
+	for _, inc := range b.incidents {
+		if match(inc) {
+			out = append(out, cloneIncident(inc))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].OpenedAt.Equal(out[j].OpenedAt) {
+			return out[i].OpenedAt.Before(out[j].OpenedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 // DeleteIncidents removes incidents by id.
@@ -500,6 +539,12 @@ func (s *Store) PruneIncidents(cutoff time.Time) (int, error) {
 func (s *Store) DeleteIncidentsWhere(match func(Incident) bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.deleteIncidentsLocked(match)
+}
+
+// deleteIncidentsLocked is DeleteIncidentsWhere for a caller holding s.mu;
+// the node and monitor delete cascades call it.
+func (s *Store) deleteIncidentsLocked(match func(Incident) bool) error {
 	b := s.incidentBookLocked()
 	var ids []string
 	for _, inc := range b.incidents {

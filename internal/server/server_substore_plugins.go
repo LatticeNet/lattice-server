@@ -44,7 +44,10 @@ type subStoreShareRow struct {
 	// are set only on a row the caller asked to reveal and the reveal gate
 	// admitted (secret_reveal.go); Revealed says so. Every other row carries
 	// neither, because the token in them is the subscription's credential.
-	Path     string `json:"path,omitempty"`
+	// Path stays in the answer as an empty string: Sub-Store's Shares screen
+	// up to 0.16.0-alpha.1 reads share.path as a string and would throw on a
+	// missing field, while an empty one leaves its copy button disabled.
+	Path     string `json:"path"`
 	URL      string `json:"url,omitempty"`
 	Revealed bool   `json:"revealed,omitempty"`
 }

@@ -53,7 +53,7 @@ func TestSubStoreSharesRPCListsOnlySubStoreSharesWithURLs(t *testing.T) {
 	}
 	// A list carries no link: the token in it is the subscription's
 	// credential.
-	if row.Path != "" || row.URL != "" || row.Revealed || strings.Contains(string(out), token) {
+	if row.Path != "" || row.URL != "" || row.Revealed || strings.Contains(string(out), token) || !strings.Contains(string(out), `"path":""`) {
 		t.Fatalf("an unrevealed list must carry no token: %s", out)
 	}
 

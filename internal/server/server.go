@@ -5651,12 +5651,18 @@ const (
 // run that paged, so the phone's last message is always true. Both read the
 // failure streak the store keeps per pair. The hot store writes it in the same
 // transaction as the result, and the JSON fallback writes the second failure
-// of a run at once, so a restart neither repeats a page nor loses the
-// recovery it owes. A result the store held already (a retried batch) is
-// never passed here.
+// of a run at once, so a restart never repeats a page, and a run that paged
+// before the restart still announces its recovery. A result the store held
+// already (a retried batch) is never passed here.
 //
 // The notice is queued for the sweep's digest, so an all-nodes monitor whose
-// target goes down pages once, naming every node.
+// target goes down pages once, naming every node. The page itself is not
+// stored: it is decided after the result's write commits and waits in memory
+// until the next sweep. A process that dies without Close in that window
+// never sends it, and the agent's retry of that result comes back as a
+// duplicate that decides nothing. So a page is never sent twice, but a crash
+// can lose one; closing that needs the stored notification outbox described
+// at alertDigest.
 func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorResult, priorFailStreak int) {
 	var kind string
 	switch {

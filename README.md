@@ -497,8 +497,10 @@ Use the compose file and deployment guide in the umbrella repository:
   Results are judged in array order, so a buffered backlog goes oldest first.
   A result the pair already holds at the same instant counts as a duplicate,
   so a batch sent again after a lost response stores nothing twice and pages
-  nothing twice, and on a 5xx nothing was stored. An older server answers 404
-  on the batch path, which tells the agent to post one result per request.
+  nothing twice, and on a 5xx nothing was stored. A page is decided after the
+  write commits and waits in memory for the next sweep, so a crash in that
+  window loses the page rather than sending it twice. An older server answers
+  404 on the batch path, which tells the agent to post one result per request.
 - NodeGeo state (`GET/POST /api/nodes/geo`) is operator-owned display metadata
   for the Fleet Map. Writes require `node:admin` on the target node, reads
   require `node:read` and are per-node allowlist-filtered, coordinates/country/

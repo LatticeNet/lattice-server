@@ -187,16 +187,24 @@ func TestShareFetchesAreSummarizedPerHour(t *testing.T) {
 		t.Fatalf("a summary was written before the hour closed")
 	}
 
+	// The fetch that opens the next hour queues the closed one; the flush
+	// writes it, never the request path.
 	*now = now.Add(time.Hour)
 	fetch("Surge/5")
 	s.shareFetchAudits.Wait()
+	if got := len(countEvents(shareFetchSummaryReason)); got != 0 {
+		t.Fatalf("a closed hour was written on the request path")
+	}
+	s.flushShareFetchStats(*now, false)
 	summaries := countEvents(shareFetchSummaryReason)
 	if len(summaries) != 1 {
 		t.Fatalf("summaries = %d after the hour closed", len(summaries))
 	}
 	md := summaries[0].Metadata
-	if md["share_id"] != "s1" || md["fetches"] != "4" || md["not_modified"] != "1" || md["cache_hits"] != "2" ||
-		md["families"] != "clashmeta=1,surge=3" || md["hour_start"] != "2026-10-02T10:00:00Z" || md["partial"] != "" {
+	wantEntry := "slug=team fetches=4 cache_hits=2 not_modified=1 stale_served=0 families=clashmeta=1,surge=3" +
+		" last_fetch_at=2026-10-02T10:15:00Z token_sha256_prefix=" + proxySubTokenAuditHash(strings.Repeat("r", 32))[:16]
+	if md["links"] != "1" || md["fetches"] != "4" || md["hour_start"] != "2026-10-02T10:00:00Z" || md["partial"] != "" ||
+		md["part"] != "" || md["share.s1"] != wantEntry {
 		t.Fatalf("summary = %+v", md)
 	}
 
@@ -218,5 +226,49 @@ func TestShareFetchesAreSummarizedPerHour(t *testing.T) {
 	}
 	if partial != 1 {
 		t.Fatalf("partial summaries = %d", partial)
+	}
+}
+
+// A thousand active links used to cost a thousand audit appends back to back
+// at every hour boundary. Closed hours are packed, at most
+// shareFetchSummaryLinksPerEvent links of one hour per event.
+func TestHourlyFetchSummariesArePackedPerHour(t *testing.T) {
+	ten := time.Date(2026, 10, 2, 10, 0, 0, 0, time.UTC)
+	var hours []*shareFetchHour
+	for i := 0; i < 2*shareFetchSummaryLinksPerEvent+5; i++ {
+		hours = append(hours, &shareFetchHour{shareID: "s" + strconv.Itoa(1000+i), slug: "team", start: ten, last: ten.Add(time.Minute),
+			fetches: 2, hits: 1, families: map[string]int{"surge": 2}})
+	}
+	hours = append(hours, &shareFetchHour{shareID: "s0", slug: "late", start: ten.Add(time.Hour), last: ten.Add(time.Hour), fetches: 1, families: map[string]int{"other": 1}})
+	events := shareFetchSummaryEvents(hours, false)
+	if len(events) != 4 {
+		t.Fatalf("events = %d, want three for the first hour and one for the next", len(events))
+	}
+	links, fetches := 0, 0
+	for i, ev := range events[:3] {
+		md := ev.Metadata
+		if md["hour_start"] != "2026-10-02T10:00:00Z" || md["part"] != strconv.Itoa(i+1)+"/3" {
+			t.Fatalf("event %d = hour %q part %q", i, md["hour_start"], md["part"])
+		}
+		n, _ := strconv.Atoi(md["links"])
+		f, _ := strconv.Atoi(md["fetches"])
+		entries := 0
+		for key := range md {
+			if strings.HasPrefix(key, shareFetchSummaryKeyPrefix) {
+				entries++
+			}
+		}
+		if n > shareFetchSummaryLinksPerEvent || entries != n || f != 2*n {
+			t.Fatalf("event %d carries links=%d entries=%d fetches=%d", i, n, entries, f)
+		}
+		links += n
+		fetches += f
+	}
+	if links != 2*shareFetchSummaryLinksPerEvent+5 || fetches != 2*links {
+		t.Fatalf("packed links = %d, fetches = %d", links, fetches)
+	}
+	last := events[3].Metadata
+	if last["hour_start"] != "2026-10-02T11:00:00Z" || last["links"] != "1" || last["part"] != "" || !strings.HasPrefix(last["share.s0"], "slug=late ") {
+		t.Fatalf("the next hour's event = %+v", last)
 	}
 }

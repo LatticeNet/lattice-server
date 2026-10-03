@@ -239,10 +239,12 @@ func (s *Server) flushShareFetchStats(now time.Time, shutdown bool) {
 			s.recordAudit(ev)
 		}
 	}
-	s.shareFetchStats.forget(func(shareID string) bool {
+	exists := func(shareID string) bool {
 		_, ok := s.store.SubscriptionShare(shareID)
 		return ok
-	})
+	}
+	s.shareFetchStats.forget(exists)
+	s.shareRenderBudget.forget(exists)
 }
 
 func (s *Server) startShareFetchStatsFlush() {

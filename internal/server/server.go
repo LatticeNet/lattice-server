@@ -246,8 +246,8 @@ type Server struct {
 	shareFetchAudits    sync.WaitGroup
 	shareFetchAuditHook func()
 	// shareRenderBudget bounds the plugin renders one link's cache misses
-	// may start; see share_render_flight.go.
-	shareRenderBudget *ratelimit.Limiter
+	// may start; see share_render_budget.go.
+	shareRenderBudget *shareRenderBudget
 	// vpnCoreGen advances on every committed vpn-core write; a plugin link
 	// source refreshed before the current generation is due. See
 	// share_fleet_changes.go. vpnCoreLinks paces the advances.
@@ -637,10 +637,7 @@ func New(opts Options) (*Server, error) {
 	if s.reminderInterval <= 0 {
 		s.reminderInterval = time.Hour
 	}
-	s.shareRenderBudget = ratelimit.New(ratelimit.Config{
-		Rate: shareRenderBudgetPerHour / 3600.0, Burst: shareRenderBudgetBurst, TTL: 2 * time.Hour,
-		Now: func() time.Time { return s.now() },
-	})
+	s.shareRenderBudget = newShareRenderBudget(func() time.Time { return s.now() })
 	if s.taskExecutionDisabled {
 		s.logger.Printf("WARNING: task execution fleet kill switch is enabled; new tasks will not queue and agents will receive no task leases")
 	}

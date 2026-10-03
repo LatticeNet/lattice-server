@@ -15,19 +15,7 @@ import (
 // clients waiting on the same render.
 const shareRenderTimeout = 2 * time.Minute
 
-// A link's cache misses spend plugin renders, and the variant space one valid
-// link can ask for is large (fourteen targets, two produce flags, the agent
-// classes and the formats), against a plugin pool of two workers and one
-// cache shared by every link. Each link gets a render budget: a burst of
-// shareRenderBudgetBurst and shareRenderBudgetPerHour after that. A request
-// that would start a render past it answers the decoy; requests that join a
-// running render or hit the cache spend nothing. The figures leave an
-// ordinary link (a few client families, content that moves a few times an
-// hour) far inside the budget.
-const (
-	shareRenderBudgetBurst   = 40
-	shareRenderBudgetPerHour = 60
-)
+// The per-link render budget a miss spends is in share_render_budget.go.
 
 // shareRenderOutcome is what one render produced: either an entry to serve,
 // or the refusal reason every waiter answers with the decoy.
@@ -51,14 +39,24 @@ type shareRenderFlight struct {
 // A waiter whose own request ends stops waiting; the render carries on for
 // the others and still publishes into the cache.
 func (s *Server) renderShareShared(ctx context.Context, share model.SubscriptionShare, plan shareRenderPlan, key subscriptionCacheKey) shareRenderOutcome {
+	// The content version the source holds now decides whether a known
+	// variant re-renders for free; read it before taking the flight lock.
+	version := ""
+	if snapshot, ok := s.store.SubscriptionSnapshot(share.Source.PluginID, share.Source.SubscriptionID); ok {
+		version = subscriptionRevalidationVersion(snapshot)
+	}
 	s.shareRenderMu.Lock()
 	if s.shareRenderFlights == nil {
 		s.shareRenderFlights = make(map[subscriptionCacheKey]*shareRenderFlight)
 	}
 	flight := s.shareRenderFlights[key]
 	if flight == nil {
-		if s.shareRenderBudget != nil && !s.shareRenderBudget.Allow(share.ID) {
+		ticket, ok, announce, refused := s.shareRenderBudget.take(share.ID, shareRenderVariantKey(key), version)
+		if !ok {
 			s.shareRenderMu.Unlock()
+			if announce {
+				s.announceShareRenderBudgetExhausted(share, refused)
+			}
 			return shareRenderOutcome{deny: "subscription_render_budget_exhausted"}
 		}
 		flight = &shareRenderFlight{done: make(chan struct{})}
@@ -67,6 +65,7 @@ func (s *Server) renderShareShared(ctx context.Context, share model.Subscription
 			renderCtx, cancel := context.WithTimeout(context.Background(), shareRenderTimeout)
 			defer cancel()
 			outcome := s.renderShareOnce(renderCtx, share, plan, key)
+			s.shareRenderBudget.settle(ticket, outcome.entry.revalidationVersion, outcome.deny != "")
 			s.shareRenderMu.Lock()
 			flight.outcome = outcome
 			delete(s.shareRenderFlights, key)

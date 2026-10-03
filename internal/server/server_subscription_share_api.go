@@ -38,6 +38,10 @@ type shareView struct {
 	// UpdateIntervalHours is the refresh period the link advertises to
 	// clients (Profile-Update-Interval): the share's own, or the default.
 	UpdateIntervalHours int `json:"update_interval_hours"`
+	// RenderBudget is the link's plugin render budget, present once the link
+	// has rendered since the server started; exhausted means its new renders
+	// answer the decoy until it refills. See share_render_budget.go.
+	RenderBudget *shareRenderBudgetView `json:"render_budget,omitempty"`
 }
 
 func shareViewOf(share model.SubscriptionShare) shareView {
@@ -48,6 +52,13 @@ func shareViewOf(share model.SubscriptionShare) shareView {
 		RotatedAt: share.RotatedAt, ExpiresAt: share.ExpiresAt,
 		UpdateIntervalHours: shareUpdateIntervalHours(share),
 	}
+}
+
+// shareViewFor is shareViewOf plus the link's live serving state.
+func (s *Server) shareViewFor(share model.SubscriptionShare) shareView {
+	view := shareViewOf(share)
+	view.RenderBudget = s.shareRenderBudget.status(share.ID)
+	return view
 }
 
 func (s *Server) handleSubscriptionShares(w http.ResponseWriter, r *http.Request, p principal) {
@@ -69,7 +80,7 @@ func (s *Server) handleSubscriptionShares(w http.ResponseWriter, r *http.Request
 	case http.MethodGet:
 		out := make([]shareView, 0, len(s.store.SubscriptionShares()))
 		for _, share := range s.store.SubscriptionShares() {
-			out = append(out, shareViewOf(share))
+			out = append(out, s.shareViewFor(share))
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -151,7 +162,7 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		ID: id.New("audit"), Action: auditActionShareCreate, Scope: "proxy:admin", Decision: "allow",
 		Metadata: map[string]string{"share_id": share.ID, "slug": share.Slug, "token_sha256": proxySubTokenAuditHash(token)},
 	})
-	writeJSON(w, http.StatusCreated, shareViewOf(stored))
+	writeJSON(w, http.StatusCreated, s.shareViewFor(stored))
 }
 
 // handleSubscriptionShareItem serves /api/subscription-shares/<id> and
@@ -282,7 +293,7 @@ func (s *Server) updateSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		},
 	})
 	stored, _ := s.store.SubscriptionShare(share.ID)
-	writeJSON(w, http.StatusOK, shareViewOf(stored))
+	writeJSON(w, http.StatusOK, s.shareViewFor(stored))
 }
 
 // formatShareExpiry renders an expiry for the audit trail. "never" rather than
@@ -316,6 +327,7 @@ func (s *Server) rotateSubscriptionShare(w http.ResponseWriter, share model.Subs
 	} else {
 		s.subscriptionCache.InvalidateShare(share.ID)
 	}
+	s.shareRenderBudget.reset(share.ID)
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionShareRotate, Scope: "proxy:admin", Decision: "allow",
 		Metadata: map[string]string{
@@ -326,7 +338,7 @@ func (s *Server) rotateSubscriptionShare(w http.ResponseWriter, share model.Subs
 		},
 	})
 	stored, _ := s.store.SubscriptionShare(share.ID)
-	writeJSON(w, http.StatusOK, shareViewOf(stored))
+	writeJSON(w, http.StatusOK, s.shareViewFor(stored))
 }
 
 // refreshSubscriptionShare forces a provider fetch now rather than waiting for

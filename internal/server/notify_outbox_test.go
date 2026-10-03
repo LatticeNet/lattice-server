@@ -727,3 +727,48 @@ func TestOutboxFoldsRepeatedUnroutedEvents(t *testing.T) {
 		t.Fatalf("rows = %+v", rows)
 	}
 }
+
+// Boot settles an inbound webhook's record when it settles the event's last
+// delivery as interrupted, instead of leaving the record "accepted".
+func TestBootSettlesTheWebhookRecordOfAnInterruptedDelivery(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.OpenWithCipher(filepath.Join(dir, "state.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.EnableRuntimeBoltHotStore(filepath.Join(dir, "state-hot.db")); err != nil {
+		t.Fatal(err)
+	}
+	addNotifyChannel(t, st, "nc-a", "Bark urgent")
+	hook := store.NotifyWebhook{ID: "nwh-deploy", Name: "Deploy", EventType: "deploy.finished", Enabled: true}
+	if err := st.UpsertNotifyWebhook(hook); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().UTC().Add(-time.Hour)
+	if err := st.RecordNotifyWebhookDelivery(store.NotifyWebhookDelivery{ID: "nwd-1", WebhookID: hook.ID, EventType: hook.EventType, Outcome: store.NotifyWebhookAccepted, Channels: 1, CreatedAt: old}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordNotifyDeliveries([]store.NotifyDelivery{{
+		ID: "nd-1", EventID: "evt-1", EventType: hook.EventType, Source: store.NotifySourceWebhook, SourceID: hook.ID, SourceRef: "nwd-1",
+		ChannelID: "nc-a", Role: store.NotifyRolePrimary, Outcome: store.NotifyOutcomePlanned, CreatedAt: old, NextAttemptAt: old,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st2, err := store.OpenWithCipher(filepath.Join(dir, "state.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st2.Close() })
+	if err := st2.EnableRuntimeBoltHotStore(filepath.Join(dir, "state-hot.db")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newServerWithSender(st2, func(context.Context, model.NotifyChannel, notify.Message) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if got := webhookRecord(t, st2, hook.ID, "nwd-1"); got.Outcome != store.NotifyWebhookFailed || got.Reason != "all 1 channel sends failed" {
+		t.Fatalf("webhook record after boot = %+v", got)
+	}
+}

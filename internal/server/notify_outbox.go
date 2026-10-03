@@ -329,7 +329,7 @@ func (s *Server) commitNotifyPlan(plan notifyPlan) {
 		// The page matters more than its receipt: send without the outbox
 		// rather than drop it.
 		s.logger.Printf("notify: outbox write failed, sending %s unrecorded: %v", plan.eventType, err)
-		s.sendUnrecorded(plan.targets)
+		s.sendUnrecorded(plan)
 		return
 	}
 	s.wakeNotifyOutbox()
@@ -341,19 +341,28 @@ func (s *Server) enqueueNotifyEvent(eventType, title, body string, how notifyEnq
 }
 
 // sendUnrecorded is the pre-outbox path, kept for a store that refuses the
-// write: one goroutine, one try per channel, failures logged by kind only.
-func (s *Server) sendUnrecorded(targets []notifyTarget) {
+// write: one goroutine, one try per channel, failures logged by kind only. An
+// inbound webhook's record is still settled from what happened, since no
+// outbox row will settle it.
+func (s *Server) sendUnrecorded(plan notifyPlan) {
 	s.notifyDeliveries.begin()
 	go func() {
 		defer s.notifyDeliveries.end()
-		for _, t := range targets {
+		delivered, failed := 0, 0
+		for _, t := range plan.targets {
 			ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
 			err := s.notifySend(ctx, t.channel, t.message)
 			cancel()
 			if err != nil {
+				failed++
 				kind, status, _ := redactSendError(err)
 				s.logger.Printf("notify: unrecorded delivery to channel %s failed (%s, status %d)", t.channel.ID, kind, status)
+				continue
 			}
+			delivered++
+		}
+		if plan.how.source == store.NotifySourceWebhook {
+			s.settleNotifyWebhookCounts(plan.how.sourceID, plan.how.sourceRef, delivered, failed)
 		}
 	}()
 }
@@ -782,6 +791,15 @@ func (s *Server) settleNotifyWebhookRecord(row store.NotifyDelivery) {
 			failed++
 		}
 	}
+	s.settleNotifyWebhookCounts(row.SourceID, row.SourceRef, delivered, failed)
+}
+
+// settleNotifyWebhookCounts writes an inbound webhook record's outcome from
+// how many of its channel sends delivered and failed.
+func (s *Server) settleNotifyWebhookCounts(webhookID, recordID string, delivered, failed int) {
+	if webhookID == "" || recordID == "" {
+		return
+	}
 	outcome, reason := store.NotifyWebhookAccepted, ""
 	switch {
 	case delivered == 0 && failed > 0:
@@ -791,7 +809,7 @@ func (s *Server) settleNotifyWebhookRecord(row store.NotifyDelivery) {
 		outcome = store.NotifyWebhookPartial
 		reason = fmt.Sprintf("%d of %d channel sends failed", failed, delivered+failed)
 	}
-	if err := s.store.SettleNotifyWebhookDelivery(row.SourceID, row.SourceRef, outcome, reason, delivered); err != nil {
+	if err := s.store.SettleNotifyWebhookDelivery(webhookID, recordID, outcome, reason, delivered); err != nil {
 		s.logger.Printf("notify webhook delivery settle: %v", err)
 	}
 }
@@ -828,6 +846,17 @@ func (s *Server) reconcileNotifyOutbox() int {
 	}
 	if err := s.store.RecordNotifyDeliveries(changed); err != nil {
 		s.logger.Printf("notify: reconcile outbox: %v", err)
+	}
+	// An inbound webhook's record settles with its event's last delivery. A
+	// row settled here would otherwise leave it "accepted" for good. The
+	// rule's fallback is not planned for these: the message is more than 15
+	// minutes old, and paging a second channel with it now helps nobody.
+	settled := map[string]bool{}
+	for _, row := range changed {
+		if row.Settled() && !settled[row.EventID] {
+			settled[row.EventID] = true
+			s.settleNotifyWebhookRecord(row)
+		}
 	}
 	s.logger.Printf("notify: outbox at start: %d redriven, %d settled as interrupted", redrive, len(changed)-redrive)
 	return redrive

@@ -12,147 +12,121 @@ import (
 
 const heartbeatFleetSize = 34
 
-// openHeartbeatFleet opens a disk-backed store holding a fleet of online
-// nodes, the shape production restarts into.
-func openHeartbeatFleet(t *testing.T) (*Store, string, []string) {
+// heartbeatClock is the store's heartbeat clock in these tests.
+type heartbeatClock struct{ at time.Time }
+
+func (c *heartbeatClock) now() time.Time { return c.at }
+
+// heartbeatFleet is a disk-backed store holding online nodes, every one
+// written at t0, with the heartbeat clock under the test's control.
+type heartbeatFleet struct {
+	s     *Store
+	path  string
+	ids   []string
+	t0    time.Time
+	clock *heartbeatClock
+}
+
+func openHeartbeatFleet(t *testing.T, ids []string) heartbeatFleet {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "state.json")
 	s, err := OpenWithCipher(path, secret.Disabled())
 	if err != nil {
 		t.Fatal(err)
 	}
-	seen := time.Now().UTC().Add(-time.Minute)
-	ids := make([]string, heartbeatFleetSize)
+	t0 := time.Date(2026, 10, 3, 20, 0, 0, 0, time.UTC)
+	clock := &heartbeatClock{at: t0}
+	s.testNow = clock.now
+	for _, nodeID := range ids {
+		if err := s.UpsertNode(model.Node{ID: nodeID, Name: nodeID, Online: true, LastSeen: t0, AgentVersion: "0.3.9"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return heartbeatFleet{s: s, path: path, ids: ids, t0: t0, clock: clock}
+}
+
+func fleetIDs(n int) []string {
+	ids := make([]string, n)
 	for i := range ids {
 		ids[i] = fmt.Sprintf("node-%02d", i)
-		if err := s.UpsertNode(model.Node{ID: ids[i], Name: ids[i], Online: true, LastSeen: seen, AgentVersion: "0.3.9"}); err != nil {
-			t.Fatal(err)
-		}
 	}
-	return s, path, ids
+	return ids
 }
 
-// beatFleet sends one heartbeat per node that changes nothing durable.
-func beatFleet(t *testing.T, s *Store, ids []string) {
+// beat sends one heartbeat from each node that changes nothing durable.
+func beat(t *testing.T, s *Store, ids ...string) {
 	t.Helper()
 	for _, nodeID := range ids {
-		if _, err := s.UpdateMetrics(nodeID, model.Metrics{CPUPercent: 7, CollectedAt: time.Now().UTC()}, "0.3.9", "", "", "", "", "", model.HostFacts{}); err != nil {
+		if _, err := s.UpdateMetrics(nodeID, model.Metrics{CPUPercent: 7}, "0.3.9", "", "", "", "", "", model.HostFacts{}); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
 
-// A restart seeds every node's heartbeat clock from the same write, so the
-// fleet's clocks come due together. Each node used to force its own write
-// when its clock ran out, 34 whole-state writes in one beat round and again
-// every metricsPersistenceInterval, although the first of them already put
-// every node's heartbeat on disk.
-func TestQuietFleetHeartbeatsWriteOncePerInterval(t *testing.T) {
-	s, path, ids := openHeartbeatFleet(t)
-	stale := time.Now().UTC().Add(-metricsPersistenceInterval - time.Second)
-	for _, nodeID := range ids {
-		s.metricsPersistedAt[nodeID] = stale
-	}
-
-	before := s.testPersistCalls
-	beatFleet(t, s, ids)
-	if calls := s.testPersistCalls - before; calls != 1 {
-		t.Fatalf("one round of due heartbeats from %d nodes wrote the state file %d times, want 1", len(ids), calls)
-	}
-	before = s.testPersistCalls
-	beatFleet(t, s, ids)
-	if calls := s.testPersistCalls - before; calls != 0 {
-		t.Fatalf("a round of heartbeats inside the interval wrote %d times, want 0", calls)
-	}
-
-	want := make(map[string]time.Time, len(ids))
-	for _, nodeID := range ids {
-		n, _ := s.Node(nodeID)
-		want[nodeID] = n.LastSeen
-	}
-	before = s.testPersistCalls
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if calls := s.testPersistCalls - before; calls != 1 {
-		t.Fatalf("close with heartbeats only in memory wrote %d times, want 1", calls)
-	}
-	reopened, err := OpenWithCipher(path, secret.Disabled())
+func reopen(t *testing.T, path string) *Store {
+	t.Helper()
+	s, err := OpenWithCipher(path, secret.Disabled())
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, nodeID := range ids {
-		n, ok := reopened.Node(nodeID)
-		if !ok || !n.LastSeen.Equal(want[nodeID]) {
-			t.Fatalf("%s last seen after reopen = %v, want %v", nodeID, n.LastSeen, want[nodeID])
+	return s
+}
+
+// A quiet fleet beating every ten seconds writes once per
+// metricsPersistenceInterval. Every node's clock used to be reset only by its
+// own write, so every node forced a whole-state write each interval: 34 a
+// round, although the first of them put every node's heartbeat on disk.
+func TestQuietFleetHeartbeatsWriteOncePerInterval(t *testing.T) {
+	f := openHeartbeatFleet(t, fleetIDs(heartbeatFleetSize))
+	before := f.s.testPersistCalls
+	for step := 1; step <= 96; step++ { // 16 minutes of beats
+		f.clock.at = f.t0.Add(time.Duration(step) * 10 * time.Second)
+		beat(t, f.s, f.ids...)
+	}
+	if calls := f.s.testPersistCalls - before; calls != 3 {
+		t.Fatalf("16 minutes of quiet beats from %d nodes wrote the state file %d times, want 3 (one per %s)",
+			len(f.ids), calls, metricsPersistenceInterval)
+	}
+}
+
+// A heartbeat or a token use that did not write is carried by the next write
+// made for any reason, so it survives a crash after that write.
+func TestUnflushedHeartbeatAndTokenUseRideTheNextWrite(t *testing.T) {
+	f := openHeartbeatFleet(t, fleetIDs(3))
+	f.clock.at = f.t0.Add(time.Minute)
+	before := f.s.testPersistCalls
+	beat(t, f.s, f.ids...)
+	use := f.clock.at
+	if touched, err := f.s.TouchNodeToken(f.ids[1], use, 15*time.Minute); err != nil || !touched {
+		t.Fatalf("token use: touched=%v err=%v", touched, err)
+	}
+	if calls := f.s.testPersistCalls - before; calls != 0 {
+		t.Fatalf("beats and a token use inside the interval wrote %d times, want 0", calls)
+	}
+	if err := f.s.UpsertNode(model.Node{ID: "node-new", Name: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	crashed := reopen(t, f.path)
+	for _, nodeID := range f.ids {
+		if n, _ := crashed.Node(nodeID); !n.LastSeen.Equal(use) {
+			t.Fatalf("%s last seen on disk = %s, want the beat at %s", nodeID, n.LastSeen, use)
 		}
+	}
+	if n, _ := crashed.Node(f.ids[1]); !n.TokenLastUsedAt.Equal(use) {
+		t.Fatalf("token last used on disk = %s, want %s", n.TokenLastUsedAt, use)
 	}
 }
 
 // A heartbeat that changes something durable is still written on the beat
 // that reports it, whatever the fleet clock says.
 func TestDurableHeartbeatChangeWritesImmediately(t *testing.T) {
-	s, _, ids := openHeartbeatFleet(t)
-	before := s.testPersistCalls
-	if _, err := s.UpdateMetrics(ids[3], model.Metrics{CollectedAt: time.Now().UTC()}, "0.3.10", "", "", "", "", "", model.HostFacts{}); err != nil {
+	f := openHeartbeatFleet(t, fleetIDs(4))
+	f.clock.at = f.t0.Add(10 * time.Second)
+	before := f.s.testPersistCalls
+	if _, err := f.s.UpdateMetrics(f.ids[3], model.Metrics{}, "0.3.10", "", "", "", "", "", model.HostFacts{}); err != nil {
 		t.Fatal(err)
 	}
-	if calls := s.testPersistCalls - before; calls != 1 {
+	if calls := f.s.testPersistCalls - before; calls != 1 {
 		t.Fatalf("an agent version change wrote %d times, want 1", calls)
-	}
-}
-
-// A token use moves a node's TokenLastUsedAt at most once per minInterval.
-// It used to write the whole state file each time, once per node per
-// interval; it now rides the next write while the node's heartbeat on disk
-// is fresh, and Close writes it.
-func TestTokenUseRidesTheNextWrite(t *testing.T) {
-	s, path, ids := openHeartbeatFleet(t)
-	at := time.Now().UTC()
-	before := s.testPersistCalls
-	for _, nodeID := range ids {
-		touched, err := s.TouchNodeToken(nodeID, at, 15*time.Minute)
-		if err != nil || !touched {
-			t.Fatalf("%s: touched=%v err=%v", nodeID, touched, err)
-		}
-	}
-	if calls := s.testPersistCalls - before; calls != 0 {
-		t.Fatalf("%d token uses with fresh heartbeats on disk wrote %d times, want 0", len(ids), calls)
-	}
-	if n, _ := s.Node(ids[0]); !n.TokenLastUsedAt.Equal(at) {
-		t.Fatalf("token last used in memory = %v, want %v", n.TokenLastUsedAt, at)
-	}
-
-	// A node whose heartbeat on disk is stale still writes its token use.
-	s.metricsPersistedAt[ids[5]] = at.Add(-metricsPersistenceInterval - time.Second)
-	later := at.Add(2 * time.Minute)
-	before = s.testPersistCalls
-	if touched, err := s.TouchNodeToken(ids[5], later, time.Minute); err != nil || !touched {
-		t.Fatalf("stale node: touched=%v err=%v", touched, err)
-	}
-	if calls := s.testPersistCalls - before; calls != 1 {
-		t.Fatalf("a token use with a stale heartbeat on disk wrote %d times, want 1", calls)
-	}
-
-	// The others are on disk now too, and the next unflushed use waits for
-	// Close.
-	if touched, err := s.TouchNodeToken(ids[6], later, time.Minute); err != nil || !touched {
-		t.Fatalf("node 6: touched=%v err=%v", touched, err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenWithCipher(path, secret.Disabled())
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, nodeID := range ids {
-		want := at
-		if nodeID == ids[5] || nodeID == ids[6] {
-			want = later
-		}
-		if n, ok := reopened.Node(nodeID); !ok || !n.TokenLastUsedAt.Equal(want) {
-			t.Fatalf("%s token last used after reopen = %v, want %v", nodeID, n.TokenLastUsedAt, want)
-		}
 	}
 }

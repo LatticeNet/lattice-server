@@ -290,6 +290,8 @@ type Store struct {
 	// node in memory without a write, cleared by the next committed write, and
 	// written by Close. Guarded by mu.
 	nodeClocksUnflushed bool
+	// testNow is the heartbeat clock in tests; nil means time.Now.
+	testNow func() time.Time
 	// closed is set by the first Close. A later Close does nothing: the bolt
 	// sidecar is gone by then, so a write would put its domains in the JSON
 	// file. Guarded by mu.
@@ -492,6 +494,14 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	s.noteReportClocksOnDisk(s.state)
 	s.confirmParentDirDurability()
 	return s, nil
+}
+
+// heartbeatNow is the clock heartbeats are stamped and judged by.
+func (s *Store) heartbeatNow() time.Time {
+	if s.testNow != nil {
+		return s.testNow().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func subscriptionSecretsNeedMigration(st State, cph secret.Cipher) bool {
@@ -1664,7 +1674,7 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	if s.metricsPersistedAt == nil {
 		s.metricsPersistedAt = map[string]time.Time{}
 	}
-	now := time.Now().UTC()
+	now := s.heartbeatNow()
 	cameOnline := !n.Online
 	durableChanged := cameOnline
 	previousPublicIP, previousWireGuardIP := n.PublicIP, n.WireGuardIP

@@ -2927,12 +2927,13 @@ func (s *Server) handleEnrollNode(w http.ResponseWriter, r *http.Request, p prin
 	serverURL := s.agentEnrollServerURL()
 	commands := s.agentEnrollCommands(serverURL, req.NodeID, token, launch)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node_id":      req.NodeID,
-		"token":        token,
-		"server_url":   serverURL,
-		"command":      commands["linux"],
-		"commands":     commands,
-		"agent_launch": launch,
+		"node_id":       req.NodeID,
+		"token":         token,
+		"server_url":    serverURL,
+		"command":       commands["linux"],
+		"commands":      commands,
+		"agent_launch":  launch,
+		"agent_version": agentInstallerRef,
 	})
 }
 
@@ -3005,12 +3006,17 @@ func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Req
 	serverURL := s.agentEnrollServerURL()
 	commands := s.agentReconfigureCommands(serverURL, req.NodeID, launch)
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.reconfigure.command", Scope: "node:admin"})
+	// agent_version names the release the command installs. The installer
+	// always installs a binary, so a node that reports another version (a
+	// newer prerelease, or an older release) moves to this one; the console
+	// says so next to the command.
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node_id":      req.NodeID,
-		"server_url":   serverURL,
-		"command":      commands["linux"],
-		"commands":     commands,
-		"agent_launch": launch,
+		"node_id":       req.NodeID,
+		"server_url":    serverURL,
+		"command":       commands["linux"],
+		"commands":      commands,
+		"agent_launch":  launch,
+		"agent_version": agentInstallerRef,
 	})
 }
 

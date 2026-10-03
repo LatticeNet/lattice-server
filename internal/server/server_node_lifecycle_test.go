@@ -78,17 +78,21 @@ func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
 		t.Fatalf("enroll: %d", res.StatusCode)
 	}
 	var out struct {
-		NodeID    string            `json:"node_id"`
-		Token     string            `json:"token"`
-		ServerURL string            `json:"server_url"`
-		Command   string            `json:"command"`
-		Commands  map[string]string `json:"commands"`
+		NodeID       string            `json:"node_id"`
+		Token        string            `json:"token"`
+		ServerURL    string            `json:"server_url"`
+		Command      string            `json:"command"`
+		Commands     map[string]string `json:"commands"`
+		AgentVersion string            `json:"agent_version"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
 	if out.ServerURL != "https://lattice.example.com" {
 		t.Fatalf("server_url = %q", out.ServerURL)
+	}
+	if out.AgentVersion != agentInstallerRef {
+		t.Fatalf("agent_version = %q, want the pinned release %s", out.AgentVersion, agentInstallerRef)
 	}
 	for _, want := range []string{
 		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/" + agentInstallerRef + "/scripts/install.sh'",
@@ -122,10 +126,16 @@ func TestNodeReconfigureCommandSourcesCanonicalAndLegacyEnv(t *testing.T) {
 		t.Fatalf("reconfigure: %d", res.StatusCode)
 	}
 	var out struct {
-		Command string `json:"command"`
+		Command      string `json:"command"`
+		AgentVersion string `json:"agent_version"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
 		t.Fatal(err)
+	}
+	// The console shows which release the command installs, because the
+	// installer replaces whatever binary the node runs.
+	if out.AgentVersion != agentInstallerRef {
+		t.Fatalf("agent_version = %q, want the pinned release %s", out.AgentVersion, agentInstallerRef)
 	}
 	for _, want := range []string{
 		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/" + agentInstallerRef + "/scripts/install.sh'",

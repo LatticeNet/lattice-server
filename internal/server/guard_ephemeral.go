@@ -11,50 +11,55 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/id"
 )
 
-// A proxy node's reality report lists the core's client sockets as listeners.
-// The agent collects with `ss -tulpn`, and -l prints every unconnected UDP
-// socket, so each QUIC, hysteria, TUIC or DNS dial sing-box makes shows up as
-// a UDP "listener" on a port the kernel picked from net.ipv4.ip_local_port_range.
-// They come and go between reports. In production on 2026-10-04 they were the
-// only difference between six consecutive state.json writes, 176 of the 209
-// writes in one hour were guard reality reports, and every one of those
-// sockets counted in the NetGuard overview as a port open with no rule.
+// A node's reality report lists client sockets as listeners. The agent
+// collects with `ss -tulpn`, and -l prints every unconnected UDP socket, so
+// each QUIC, hysteria, TUIC or DNS dial sing-box makes, and each NTP query
+// systemd-timesyncd sends, shows up as a UDP "listener" on a port the kernel
+// picked from net.ipv4.ip_local_port_range. They come and go between reports.
+// In production on 2026-10-04, sing-box's were the only difference between
+// six consecutive state.json writes, and 176 of the 209 writes in one hour
+// were guard reality reports; every one of those sockets also counted in the
+// NetGuard overview as a port open with no rule. With those split out (a113),
+// timesyncd's query sockets were most of the 20 guard reality writes an hour
+// that remained.
 //
 // The server splits them out of the facts when a report arrives. A socket is
-// an ephemeral client socket only when all of these hold:
+// an ephemeral client socket only when it is UDP, its port is inside the
+// kernel's ephemeral range, and its owner is either
 //
-//   - it is UDP;
-//   - its port is inside the kernel's ephemeral range;
-//   - sing-box owns it;
-//   - the node's sing-box inventory is fresh and complete, and no line in it,
-//     nor any inbound Lattice renders onto the node, listens on or is
-//     published at that port.
+//   - a client-only program (clientOnlyOwners), which has no way to listen
+//     for anyone; or
+//   - sing-box, and the node's sing-box inventory is fresh and complete, and
+//     no line in it, nor any inbound Lattice renders onto the node, listens
+//     on or is published at that port.
 //
 // Everything else stays a fact, so a hysteria inbound on 50000 is still a
 // listener, and still an exposure when no rule covers it.
 //
-// The rule is limited to sing-box on purpose. Telling an inbound from a client
-// socket takes a list of the inbounds, and sing-box is the only core whose
-// inbounds the server can enumerate. A real UDP service on an ephemeral port
-// run by xray or a standalone hysteria server would be indistinguishable from
-// a client socket, and a rule that ignored the owner would also take kernel
-// WireGuard sockets (no process, and 51820 is inside the range) and tailscaled
-// on 41641. Any condition the server cannot check leaves the socket a fact:
-// noise on a node it cannot vouch for is better than a hidden service.
+// The owners are named one by one on purpose. Telling a service from a client
+// socket takes either a program with no server side or a list of the
+// program's inbounds, and sing-box is the only core whose inbounds the server
+// can enumerate. A UDP service on an ephemeral port run by xray, a standalone
+// hysteria server or a proxy client such as mihomo would be indistinguishable
+// from a client socket, and a rule that ignored the owner would also take
+// kernel WireGuard sockets (no process, and 51820 is inside the range) and
+// tailscaled on 41641. Any condition the server cannot check leaves the socket
+// a fact: noise on a node it cannot vouch for is better than a hidden service.
 //
 // The owner name is a heuristic for telling noise from services, not a trust
 // boundary. It is the task name ss prints, which any local process can set,
-// so a process that calls itself sing-box and binds UDP inside the range on a
-// node whose inventory vouches is read as a client socket: it leaves the
-// listeners, the exposure counts and the missing-allow suggestions. Two
-// things bound that. Every such socket is still served in ephemeral_sockets,
-// and one that stays bound across reports for ephemeralPersistAfter is
-// audited once per episode as netguard.ephemeral_socket_persistent (see
-// ephemeralSocketTracker). Most client sockets close long before that; a
-// long-lived QUIC or hysteria outbound to an upstream also trips it, once,
-// and a listener waiting for connections has to. Closing the gap needs the agent to report the
-// owner's executable path or uid with each socket, so the server can check
-// the socket belongs to the sing-box the inventory describes.
+// so a process that calls itself systemd-timesyncd on any node, or sing-box on
+// a node whose inventory vouches, and binds UDP inside the range is read as a
+// client socket: it leaves the listeners, the exposure counts and the
+// missing-allow suggestions. Two things bound that. Every such socket is still
+// served in ephemeral_sockets, and one that stays bound across reports for
+// ephemeralPersistAfter is audited once per episode as
+// netguard.ephemeral_socket_persistent (see ephemeralSocketTracker). Most
+// client sockets close long before that, and timesyncd moves to a new port
+// with each query; a long-lived QUIC or hysteria outbound to an upstream also
+// trips it, once, and a listener waiting for connections has to. Closing the
+// gap needs the agent to report the owner's executable path or uid with each
+// socket, so the server can check who really owns it.
 //
 // One more gap is also the agent's to close. On-box discovery reads
 // `sb --json list` and the config's inbounds, not sing-box endpoints, so a
@@ -78,20 +83,46 @@ const (
 // the agent reports as a listener's owner.
 const singBoxProcess = "sing-box"
 
+// clientOnlyOwners are the programs whose UDP sockets are all client sockets,
+// by the process name ss prints: the kernel's comm, cut to 15 bytes. A socket
+// of theirs inside the ephemeral range is a client socket on any node, with
+// no inventory to consult. Each entry needs a reason the program can never
+// listen for anyone; one that can be configured to listen does not belong
+// here, whatever it usually does.
+//
+// Not here, on purpose: mihomo, verge-mihomo, clash and every other proxy
+// client. They listen on ports their configuration chooses (mixed, socks,
+// tproxy, DNS, an external controller) and the server cannot enumerate, so
+// one of their sockets inside the range may be a service. chronyd and ntpd
+// are not here either: both can serve NTP.
+var clientOnlyOwners = map[string]bool{
+	// systemd-timesyncd is an SNTP client with no server mode, and it moves to
+	// a new port with each query. Its name is 17 bytes, so ss prints
+	// "systemd-timesyn"; the full name is accepted for a collector that
+	// reports it whole.
+	"systemd-timesyn":   true,
+	"systemd-timesyncd": true,
+}
+
 // splitEphemeralSockets returns the listeners that are facts and the ones
-// that are sing-box client sockets, in their original order. A node whose
-// inventory cannot vouch for its inbounds gets every listener back as a fact.
+// that are client sockets, in their original order. A sing-box socket on a
+// node whose inventory cannot vouch for its inbounds stays a fact.
 func (s *Server) splitEphemeralSockets(nodeID string, listeners []model.GuardListener, now time.Time) (facts, ephemeral []model.GuardListener) {
-	if !hasEphemeralCandidate(listeners) {
+	clientOnly, singBox := ephemeralCandidates(listeners)
+	if !clientOnly && !singBox {
 		return listeners, nil
 	}
-	inbound, ok := s.singBoxInboundPorts(nodeID, now)
-	if !ok {
+	var inbound map[int]bool
+	vouched := false
+	if singBox {
+		inbound, vouched = s.singBoxInboundPorts(nodeID, now)
+	}
+	if !clientOnly && !vouched {
 		return listeners, nil
 	}
 	facts = make([]model.GuardListener, 0, len(listeners))
 	for _, listener := range listeners {
-		if isEphemeralCandidate(listener) && !inbound[listener.Port] {
+		if isClientOnlySocket(listener) || (vouched && isSingBoxCandidate(listener) && !inbound[listener.Port]) {
 			ephemeral = append(ephemeral, listener)
 			continue
 		}
@@ -100,20 +131,30 @@ func (s *Server) splitEphemeralSockets(nodeID string, listeners []model.GuardLis
 	return facts, ephemeral
 }
 
-func hasEphemeralCandidate(listeners []model.GuardListener) bool {
+// ephemeralCandidates reports whether any listener is a client-only owner's
+// socket, and whether any is a sing-box socket that the inventory may clear.
+func ephemeralCandidates(listeners []model.GuardListener) (clientOnly, singBox bool) {
 	for _, listener := range listeners {
-		if isEphemeralCandidate(listener) {
-			return true
-		}
+		clientOnly = clientOnly || isClientOnlySocket(listener)
+		singBox = singBox || isSingBoxCandidate(listener)
 	}
-	return false
+	return clientOnly, singBox
 }
 
-// isEphemeralCandidate is every condition but the inventory one.
-func isEphemeralCandidate(listener model.GuardListener) bool {
+// inEphemeralRange is what every client socket shares: UDP, on a port inside
+// the kernel's ephemeral range.
+func inEphemeralRange(listener model.GuardListener) bool {
 	return listener.Protocol == model.NetProtoUDP &&
-		listener.Port >= ephemeralPortFirst && listener.Port <= ephemeralPortLast &&
-		listener.Process == singBoxProcess
+		listener.Port >= ephemeralPortFirst && listener.Port <= ephemeralPortLast
+}
+
+func isClientOnlySocket(listener model.GuardListener) bool {
+	return inEphemeralRange(listener) && clientOnlyOwners[listener.Process]
+}
+
+// isSingBoxCandidate is every sing-box condition but the inventory one.
+func isSingBoxCandidate(listener model.GuardListener) bool {
+	return inEphemeralRange(listener) && listener.Process == singBoxProcess
 }
 
 // singBoxInboundPorts returns the ports the node's sing-box inbounds listen on
@@ -161,7 +202,7 @@ func inventoryPort(raw string) (int, bool) {
 	return port, true
 }
 
-// ephemeralPersistAfter is how long a socket read as a sing-box client socket
+// ephemeralPersistAfter is how long a socket read as a client socket
 // may stay bound, report after report, before it is audited.
 const ephemeralPersistAfter = 30 * time.Minute
 

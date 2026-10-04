@@ -19,12 +19,13 @@ import (
 type GuardRealitySnapshot struct {
 	Reality model.GuardNodeReality `json:"reality"`
 	// EphemeralSockets are UDP sockets from the same report that the server
-	// read as a proxy core's client sockets rather than services, and so took
-	// out of Reality.Listeners. `ss -l` lists every unconnected UDP socket,
-	// and sing-box opens one per QUIC, hysteria or DNS dial on a port the
-	// kernel picks from its ephemeral range, so the set moves between
-	// reports. It rides along like the report clocks: kept so the console can
-	// still show it, and left out when deciding whether the facts changed.
+	// read as client sockets rather than services, and so took out of
+	// Reality.Listeners. `ss -l` lists every unconnected UDP socket; sing-box
+	// opens one per QUIC, hysteria or DNS dial and systemd-timesyncd one per
+	// NTP query, each on a port the kernel picks from its ephemeral range, so
+	// the set moves between reports. It rides along like the report clocks:
+	// kept so the console can still show it, and left out when deciding
+	// whether the facts changed.
 	EphemeralSockets []model.GuardListener `json:"ephemeral_sockets,omitempty"`
 	ReceivedAt       time.Time             `json:"received_at"`
 }

@@ -132,6 +132,9 @@ type ephemeralTestReporter struct {
 	// srv, when set, has the inventory placed in its mirror directly instead
 	// of posted, for tests that are not about the inventory route.
 	srv *Server
+	// noInventory sends no sing-box inventory at all, as a node without
+	// sing-box does.
+	noInventory bool
 }
 
 func (r *ephemeralTestReporter) report(listeners []model.GuardListener) {
@@ -142,10 +145,12 @@ func (r *ephemeralTestReporter) report(listeners []model.GuardListener) {
 	}
 	r.at = r.at.Add(step)
 	r.clock.Set(r.at)
-	if r.srv != nil {
+	switch {
+	case r.noInventory:
+	case r.srv != nil:
 		inv := ephemeralTestInventory(r.at)
 		setTestInventory(r.srv, &inv)
-	} else {
+	default:
 		r.postInventory()
 	}
 	reality := model.GuardNodeReality{
@@ -494,5 +499,142 @@ func (r *ephemeralTestReporter) postInventory() {
 	}
 	if rec := doAgentRaw(r.t, r.handler, http.MethodPost, "/api/agent/singbox-inventory", string(inv), r.token); rec.Code != http.StatusOK {
 		r.t.Fatalf("inventory: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func timesyncdUDP(port int) model.GuardListener {
+	return model.GuardListener{Protocol: "udp", Port: port, Address: "0.0.0.0", Process: "systemd-timesyn"}
+}
+
+// systemd-timesyncd has no server mode, so its sockets inside the range are
+// client sockets on any node, with or without a sing-box inventory. Proxy
+// clients such as mihomo can listen on configured ports and stay facts, as
+// does anything outside the range or on TCP, and the owner name must match
+// exactly.
+func TestSplitClientOnlyOwnersNeedNoInventory(t *testing.T) {
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	srv, _, st, _, _ := newGuardRealityServerForTest(t, newGuardRealityTestClock(now))
+	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A"}); err != nil {
+		t.Fatal(err)
+	}
+	client := []model.GuardListener{
+		timesyncdUDP(37491),
+		{Protocol: "udp", Port: 43221, Address: "::", Process: "systemd-timesyncd"},
+		timesyncdUDP(32768),
+		timesyncdUDP(60999),
+	}
+	facts := []model.GuardListener{
+		{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"},
+		timesyncdUDP(123),   // below the range
+		timesyncdUDP(61000), // above the range
+		{Protocol: "tcp", Port: 40000, Address: "0.0.0.0", Process: "systemd-timesyn"},
+		{Protocol: "udp", Port: 58166, Address: "::", Process: "verge-mihomo"},
+		{Protocol: "udp", Port: 47000, Address: "::", Process: "mihomo"},
+		{Protocol: "udp", Port: 47001, Address: "::", Process: "systemd-timesy"},
+		{Protocol: "udp", Port: 47002, Address: "127.0.0.53", Process: "systemd-resolve"},
+		singBoxUDP(46779), // sing-box with no inventory to clear it
+	}
+	report := append(append([]model.GuardListener(nil), facts...), client...)
+
+	setTestInventory(srv, nil)
+	gotFacts, gotClient := srv.splitEphemeralSockets("node-a", report, now)
+	if !reflect.DeepEqual(gotFacts, facts) || !reflect.DeepEqual(gotClient, client) {
+		t.Fatalf("no inventory:\n facts  %+v\n client %+v\nwant\n facts  %+v\n client %+v", gotFacts, gotClient, facts, client)
+	}
+
+	// With an inventory that vouches, sing-box's socket joins them.
+	inv := ephemeralTestInventory(now)
+	setTestInventory(srv, &inv)
+	gotFacts, gotClient = srv.splitEphemeralSockets("node-a", report, now)
+	wantClient := append([]model.GuardListener{singBoxUDP(46779)}, client...)
+	if !reflect.DeepEqual(gotFacts, facts[:len(facts)-1]) || !reflect.DeepEqual(gotClient, wantClient) {
+		t.Fatalf("vouched:\n facts  %+v\n client %+v", gotFacts, gotClient)
+	}
+}
+
+// a113 still wrote state about 20 times an hour, nearly all of it
+// timesyncd's query sockets on two nodes. On a node with no sing-box at all
+// their churn now writes nothing, while a socket of timesyncd's outside the
+// range or on TCP, or a proxy client's, is still a fact and still writes.
+func TestTimesyncdClientSocketChurnDoesNotWriteState(t *testing.T) {
+	f := openIngestFixture(t, t.TempDir())
+	defer f.st.Close()
+	clock := newGuardRealityTestClock(time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC))
+	f.srv.now = clock.Now
+	cookies, csrf := loginSession(t, f.handler)
+	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
+	// Three seconds apart keeps the agent token cache warm (see the sing-box
+	// churn test).
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now(), step: 3 * time.Second, noInventory: true}
+	services := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
+	query := func(i int) model.GuardListener { return timesyncdUDP(32768 + (i*6151)%28000) }
+	r.report(withSockets(services, query(0)))
+
+	writes := watchStateFile(t, f.statePath())
+	for i := 1; i <= 30; i++ {
+		if i%4 == 0 {
+			r.report(services) // between polls
+		} else {
+			r.report(withSockets(services, query(i)))
+		}
+		writes.check()
+	}
+	if n := writes.take(); n != 0 {
+		t.Fatalf("30 reports that moved only timesyncd query sockets rewrote state %d times, want 0", n)
+	}
+
+	for i, step := range []struct {
+		name   string
+		socket model.GuardListener
+	}{
+		{"timesyncd on udp 123", timesyncdUDP(123)},
+		{"timesyncd on tcp", model.GuardListener{Protocol: "tcp", Port: 40000, Address: "0.0.0.0", Process: "systemd-timesyn"}},
+		{"verge-mihomo on udp 58166", model.GuardListener{Protocol: "udp", Port: 58166, Address: "::", Process: "verge-mihomo"}},
+	} {
+		r.report(withSockets(services, step.socket, query(100+i)))
+		if n := writes.take(); n != 1 {
+			t.Fatalf("%s appearing rewrote state %d times, want 1", step.name, n)
+		}
+		services = append(services, step.socket)
+	}
+}
+
+// The persistence audit covers a socket that only calls itself
+// systemd-timesyncd. This one runs on the real ephemeralPersistAfter: the
+// tracker needs consecutive reports, not reports ten seconds apart, so four
+// reports ten minutes apart cover thirty minutes.
+func TestTimesyncdSocketHeldThirtyMinutesIsAudited(t *testing.T) {
+	f := openIngestFixture(t, t.TempDir())
+	defer f.st.Close()
+	clock := newGuardRealityTestClock(time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC))
+	f.srv.now = clock.Now
+	cookies, csrf := loginSession(t, f.handler)
+	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now(), step: 10 * time.Minute, noInventory: true}
+	services := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
+	held := timesyncdUDP(45678)
+	audits := func() []model.AuditEvent {
+		var out []model.AuditEvent
+		for _, ev := range f.st.AuditEvents() {
+			if ev.Action == auditActionEphemeralSocketPersistent {
+				out = append(out, ev)
+			}
+		}
+		return out
+	}
+
+	var firstSeen time.Time
+	for i := 1; i <= 4; i++ {
+		r.report(withSockets(services, held, timesyncdUDP(33000+i)))
+		if i == 1 {
+			firstSeen = r.at
+		}
+		if got, want := len(audits()), map[bool]int{true: 1, false: 0}[i == 4]; got != want {
+			t.Fatalf("after report %d (%s held): %d persistence audits, want %d", i, r.at.Sub(firstSeen), got, want)
+		}
+	}
+	ev := audits()[0]
+	if ev.Metadata["process"] != "systemd-timesyn" || ev.Metadata["port"] != "45678" || ev.Metadata["first_seen"] != firstSeen.UTC().Format(time.RFC3339) {
+		t.Fatalf("audit = %+v", ev)
 	}
 }

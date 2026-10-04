@@ -159,6 +159,47 @@ func TestSuggestBindingOverridesAreIntent(t *testing.T) {
 	assertSuggestion(t, got[0], SuggestionAllowWithoutListener, model.GuardZonePublic, model.NetProtoUDP, 5353)
 }
 
+// Client sockets the server split out of the listeners are not services: none
+// is a listener missing an allow. They are still sockets, so an allowed port
+// with one bound is not called stale. The listeners, the hysteria2 inbound on
+// 50000 among them, are judged exactly as before.
+func TestSuggestEphemeralSocketsAreNotServices(t *testing.T) {
+	view := LegacyBaseline(model.NFTInputs{
+		NodeID:        "node-a",
+		InterfaceName: "eth0",
+		PublicTCP:     []int{443},
+		PublicUDP:     []int{40000, 41000},
+	})
+	view.Binding.Managed = true
+
+	got, err := Suggest(SuggestInput{
+		Binding: view.Binding,
+		Groups:  []model.SecurityGroup{view.Group},
+		Zones:   ZoneMap(view.Zones),
+		Reality: model.GuardNodeReality{
+			NodeID: "node-a",
+			Listeners: []model.GuardListener{
+				{Protocol: model.NetProtoTCP, Port: 443, Address: "::", Process: "sing-box"},
+				{Protocol: model.NetProtoUDP, Port: 50000, Address: "::", Process: "sing-box"},
+			},
+		},
+		EphemeralSockets: []model.GuardListener{
+			{Protocol: model.NetProtoUDP, Port: 40000, Address: "::", Process: "sing-box"},
+			{Protocol: model.NetProtoUDP, Port: 46779, Address: "::", Process: "sing-box"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIDs := []string{
+		"node-a:allow_without_listener:public:udp:41000",
+		"node-a:listener_missing_allow:public:udp:50000",
+	}
+	if ids := suggestionIDs(got); !reflect.DeepEqual(ids, wantIDs) {
+		t.Fatalf("suggestion ids = %v, want %v\nsuggestions: %+v", ids, wantIDs, got)
+	}
+}
+
 func TestSuggestCIDROverlayZone(t *testing.T) {
 	zones := ZoneMap([]model.GuardZone{
 		{ID: model.GuardZonePublic, Name: "public", Builtin: true, Interfaces: []string{"eth0"}},

@@ -49,7 +49,18 @@ type fleetShape struct {
 	lines bool
 	// ddns adds a healthy DDNS profile and one whose provider keeps failing.
 	ddns bool
+	// clientSockets has every node report its listeners, sshd and the
+	// sing-box TCP inbounds, plus three sing-box client UDP sockets on ports
+	// from the kernel's ephemeral range. `ss -l` lists those beside the
+	// listeners, and the set moves as sing-box dials: in production on
+	// 2026-10-04 that churn alone made 176 guard reality writes an hour.
+	// Here each node's set changes every fleetClientSocketPeriod, which
+	// lands near that rate.
+	clientSockets bool
 }
+
+// fleetClientSocketPeriod is how long one node keeps the same client sockets.
+const fleetClientSocketPeriod = 10 * time.Minute
 
 // fleetHarnessResult is what one run measured.
 type fleetHarnessResult struct {
@@ -102,7 +113,7 @@ func TestFleetStateWriteRateHarness(t *testing.T) {
 }
 
 func TestFleetStateWriteRateHarnessProductionShaped(t *testing.T) {
-	runFleetHarnessTest(t, fleetShape{lines: true, ddns: true})
+	runFleetHarnessTest(t, fleetShape{lines: true, ddns: true, clientSockets: true})
 }
 
 func runFleetHarnessTest(t *testing.T, shape fleetShape) {
@@ -371,10 +382,33 @@ func fleetAgentCycle(t *testing.T, handler http.Handler, n fleetHarnessNode, sha
 		post("/api/agent/monitor-results", map[string]any{"node_id": n.id, "results": results})
 	}
 	get("/api/agent/log-sources")
-	post("/api/agent/guard-reality", map[string]any{
-		"node_id": n.id,
-		"reality": model.GuardNodeReality{NodeID: n.id, NFTVersion: "1.0.9", CollectedAt: now},
-	})
+	reality := model.GuardNodeReality{NodeID: n.id, NFTVersion: "1.0.9", CollectedAt: now}
+	if shape.clientSockets {
+		reality.Listeners = fleetListeners(n, shape, now)
+	}
+	post("/api/agent/guard-reality", map[string]any{"node_id": n.id, "reality": reality})
+}
+
+// fleetListeners is what `ss -tulpn` shows on a node: sshd, the sing-box
+// inbounds of its lines, and three sing-box client UDP sockets whose ports
+// change every fleetClientSocketPeriod. Nodes change at different moments,
+// as a fleet whose cores dial independently does.
+func fleetListeners(n fleetHarnessNode, shape fleetShape, now time.Time) []model.GuardListener {
+	out := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
+	if shape.lines {
+		out = append(out,
+			model.GuardListener{Protocol: "tcp", Port: 443, Address: "::", Process: "sing-box"},
+			model.GuardListener{Protocol: "tcp", Port: 8443, Address: "::", Process: "sing-box"},
+		)
+	}
+	epoch := (now.UnixNano() + int64(n.pid)*int64(fleetClientSocketPeriod)/34) / int64(fleetClientSocketPeriod)
+	// The Linux default ip_local_port_range, 32768 to 60999.
+	const first, span = 32768, 60999 - 32768 + 1
+	for k := int64(0); k < 3; k++ {
+		port := first + int((epoch*7919+int64(n.pid)*104729+k*15485863)%span)
+		out = append(out, model.GuardListener{Protocol: "udp", Port: port, Address: "::", Process: "sing-box"})
+	}
+	return out
 }
 
 // fleetAgentRequest sends one agent request from the node's own address, so

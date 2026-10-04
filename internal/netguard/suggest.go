@@ -29,6 +29,12 @@ type SuggestInput struct {
 	Groups  []model.SecurityGroup
 	Zones   map[string]model.GuardZone
 	Reality model.GuardNodeReality
+	// EphemeralSockets are the proxy core client sockets the server took out of
+	// Reality.Listeners. They are not services, so none is reported as a
+	// listener missing an allow, but an allowed port with one bound is not
+	// called stale either: that check asks whether anything is bound there,
+	// and a rule should not be named dead on the strength of a classification.
+	EphemeralSockets []model.GuardListener
 }
 
 // Suggestion is an operator-review prompt derived from reality. Suggestions
@@ -54,7 +60,7 @@ func Suggest(in SuggestInput) ([]Suggestion, error) {
 	if err != nil {
 		return nil, err
 	}
-	reality := indexReality(in.Reality)
+	reality := indexReality(in.Reality, in.EphemeralSockets)
 
 	var suggestions []Suggestion
 	add := func(s Suggestion) {
@@ -271,7 +277,7 @@ type interfaceFacts struct {
 	prefixes []netip.Prefix
 }
 
-func indexReality(reality model.GuardNodeReality) realityIndex {
+func indexReality(reality model.GuardNodeReality, ephemeral []model.GuardListener) realityIndex {
 	out := realityIndex{listeners: map[serviceKey]struct{}{}}
 	for _, iface := range reality.Interfaces {
 		facts := interfaceFacts{name: strings.TrimSpace(iface.Name), up: iface.Up}
@@ -293,6 +299,9 @@ func indexReality(reality model.GuardNodeReality) realityIndex {
 	}
 	sort.Slice(out.interfaces, func(i, j int) bool { return out.interfaces[i].name < out.interfaces[j].name })
 	for _, listener := range normalizedListeners(reality.Listeners) {
+		out.listeners[serviceKey{proto: listener.Protocol, port: listener.Port}] = struct{}{}
+	}
+	for _, listener := range normalizedListeners(ephemeral) {
 		out.listeners[serviceKey{proto: listener.Protocol, port: listener.Port}] = struct{}{}
 	}
 	return out

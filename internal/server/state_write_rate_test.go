@@ -55,6 +55,9 @@ type fleetShape struct {
 type fleetHarnessResult struct {
 	writes  int
 	callers map[string]int
+	// fixture says what the fleet had built by the end, so a quiet window
+	// can be told apart from paths that never ran.
+	fixture string
 }
 
 func (r fleetHarnessResult) breakdown() string {
@@ -86,7 +89,7 @@ func (r fleetHarnessResult) breakdown() string {
 // besides agents (see fleetShape).
 //
 // It runs in real time, so it is opt-in: LATTICE_FLEET_HARNESS=<window
-// seconds>. Run one test alone, with -run: it counts writes through the
+// seconds>, after a three minute warmup. Run one test alone, with -run: it counts writes through the
 // process-wide store telemetry, so any test running beside it adds its own
 // writes to the count. A window of at least 960 covers the 5 minute heartbeat
 // and the 15 minute token and report clocks. Each fails above
@@ -113,10 +116,13 @@ func runFleetHarnessTest(t *testing.T, shape fleetShape) {
 	}
 	window := time.Duration(secs) * time.Second
 	const nodes = 34
-	got := runFleetHarness(t, nodes, shape, 10*time.Second, 30*time.Second, window)
+	// The warmup outlasts the first DDNS sweep (1 min) and the first latency
+	// probe sync (2 min), so writes that set things up once land before the
+	// window and the window measures the steady state.
+	got := runFleetHarness(t, nodes, shape, 10*time.Second, 3*time.Minute, window)
 	perMinute := float64(got.writes) / window.Minutes()
-	t.Logf("%d nodes, 10s cycle, %+v: %d state writes in %s = %.2f per minute; by caller: %s",
-		nodes, shape, got.writes, window, perMinute, got.breakdown())
+	t.Logf("%d nodes, 10s cycle, %+v: %d state writes in %s = %.2f per minute; by caller: %s; fixture: %s",
+		nodes, shape, got.writes, window, perMinute, got.breakdown(), got.fixture)
 	if perMinute > fleetHarnessMaxPerMinute {
 		t.Fatalf("a quiet fleet of %d nodes rewrote state.json %.2f times a minute, above %.0f", nodes, perMinute, fleetHarnessMaxPerMinute)
 	}
@@ -255,6 +261,20 @@ func runFleetHarness(t *testing.T, nodes int, shape fleetShape, cycle, warmup, w
 	wg.Wait()
 	time.Sleep(time.Until(end))
 	out := fleetHarnessResult{callers: map[string]int{}}
+	linemeta := 0
+	for _, ap := range st.Approvals() {
+		if ap.Plugin == singBoxLineMetaPlugin {
+			linemeta++
+		}
+	}
+	latency := 0
+	for _, mon := range st.Monitors() {
+		if mon.ManagedBy == model.MonitorManagedLatency {
+			latency++
+		}
+	}
+	out.fixture = fmt.Sprintf("linemeta approvals=%d client templates=%d latency monitors=%d ddns profiles=%d",
+		linemeta, len(st.LineClientTemplates()), latency, len(st.DDNSProfiles()))
 	for caller, count := range callers() {
 		if d := int(count - atStart[caller]); d > 0 {
 			out.callers[caller] = d

@@ -59,6 +59,14 @@ type agentUpdatePayload struct {
 	// the approval rather than decided silently at apply time. Approvals planned
 	// before this field existed decode as empty and normalize to upstream.
 	BinarySource string `json:"binary_source,omitempty"`
+	// FallbackURL is the upstream release URL for the same pinned bytes, set
+	// only when BinarySource is the control plane. The apply script fetches it,
+	// without the task lease, when the control-plane download fails: a node
+	// whose agent reaches the control plane through a proxy or relay that the
+	// task's clean environment cannot use still has a direct path to the
+	// release. The digest check is the same for both URLs. Approvals planned
+	// before this field existed decode as empty and render no fallback.
+	FallbackURL string `json:"fallback_url,omitempty"`
 }
 
 type agentReleaseInfoView struct {
@@ -565,7 +573,8 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 // already holds exactly the pinned bytes for this node's platform. Preferring
 // the nearer copy is automatic, but it is never silent: the source is written
 // into the payload, shown in the rendered plan, and bound into the approval the
-// operator signs off on.
+// operator signs off on. The policy's own pinned URL stays in the plan as the
+// fallback for a node that cannot complete the control-plane download.
 func (s *Server) withControlPlaneBinarySource(node model.Node, payload agentUpdatePayload) agentUpdatePayload {
 	payload.BinarySource = agentBinarySourceUpstream
 	osName, arch, err := agentPlatformForNode(node)
@@ -573,6 +582,9 @@ func (s *Server) withControlPlaneBinarySource(node model.Node, payload agentUpda
 		return payload
 	}
 	if binaryURL, ok := s.controlPlaneAgentBinaryURL(payload.TargetVersion, osName, arch, payload.SHA256); ok {
+		if payload.BinaryURL != binaryURL {
+			payload.FallbackURL = payload.BinaryURL
+		}
 		payload.BinaryURL = binaryURL
 		payload.BinarySource = agentBinarySourceControlPlane
 	}
@@ -595,21 +607,25 @@ func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model
 		InstallPath:    policy.InstallPath,
 		ServiceName:    policy.ServiceName,
 	}
+	artifact := agentArtifactName(osName, arch)
+	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", s.agentReleaseRepo, url.PathEscape(tag))
+	releaseURL := base + "/" + url.PathEscape(artifact)
 	// When the control plane already holds this version for this platform, its
 	// stored digest is authoritative and no third-party request happens at all.
 	// Those bytes were verified against the release checksums on import, or
 	// against the digest the operator declared on upload, so the pin is no
-	// weaker than the one a SHA256SUMS fetch would produce.
+	// weaker than the one a SHA256SUMS fetch would produce. The release URL is
+	// still deterministic, so it goes into the plan as the fallback without a
+	// fetch; the stored digest is what either download is verified against.
 	if stored, ok := s.storedAgentArtifact(target, osName, arch); ok {
 		if binaryURL, ok := s.controlPlaneAgentBinaryURL(target, osName, arch, stored.SHA256); ok {
 			payload.SHA256 = stored.SHA256
 			payload.BinaryURL = binaryURL
 			payload.BinarySource = agentBinarySourceControlPlane
+			payload.FallbackURL = releaseURL
 			return payload, nil
 		}
 	}
-	artifact := agentArtifactName(osName, arch)
-	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", s.agentReleaseRepo, url.PathEscape(tag))
 	sums, err := s.fetchAgentReleaseText(base + "/SHA256SUMS")
 	if err != nil {
 		return agentUpdatePayload{}, err
@@ -619,7 +635,7 @@ func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model
 		return agentUpdatePayload{}, fmt.Errorf("official release %s does not publish checksum for %s", tag, artifact)
 	}
 	payload.SHA256 = sha
-	payload.BinaryURL = base + "/" + url.PathEscape(artifact)
+	payload.BinaryURL = releaseURL
 	payload.BinarySource = agentBinarySourceUpstream
 	return payload, nil
 }
@@ -966,6 +982,9 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "target_version: %s\n", payload.TargetVersion)
 	fmt.Fprintf(&b, "binary_source: %s\n", normalizeAgentBinarySource(payload.BinarySource))
 	fmt.Fprintf(&b, "binary_url: %s\n", payload.BinaryURL)
+	if payload.FallbackURL != "" {
+		fmt.Fprintf(&b, "fallback_url: %s\n", payload.FallbackURL)
+	}
 	fmt.Fprintf(&b, "sha256: %s\n", payload.SHA256)
 	fmt.Fprintf(&b, "install_path: %s\n", payload.InstallPath)
 	fmt.Fprintf(&b, "service_name: %s\n", payload.ServiceName)
@@ -973,6 +992,9 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	if normalizeAgentBinarySource(payload.BinarySource) == agentBinarySourceControlPlane {
 		fmt.Fprintf(&b, "- the binary comes from this control plane, so the node needs no third-party egress\n")
 		fmt.Fprintf(&b, "- the control plane re-verifies the stored bytes against this digest before serving them\n")
+		if payload.FallbackURL != "" {
+			fmt.Fprintf(&b, "- if the control-plane download fails, the node fetches fallback_url once, without the task lease, and verifies it against the same digest; with curl the fallback gets what is left of the same %s s download budget\n", agentFetchBudgetSec)
+		}
 	} else {
 		fmt.Fprintf(&b, "- the binary comes from the upstream release, so this node needs egress to it\n")
 		fmt.Fprintf(&b, "- import this version under Agent updates to serve it from the control plane instead\n")
@@ -980,7 +1002,7 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "- download is HTTPS-only and verified against the pinned SHA-256 digest\n")
 	fmt.Fprintf(&b, "- binary is installed atomically with a timestamped backup\n")
 	fmt.Fprintf(&b, "- service restart is delayed so the current agent can post the task result\n")
-	fmt.Fprintf(&b, "- the download gives up after 20 s without a connection or 300 s in total, so a node without egress to the source fails the task instead of hanging it\n")
+	fmt.Fprintf(&b, "- the download gives up after %s s without a connection or %s s in total, so a node without egress to the source fails the task instead of hanging it\n", agentFetchConnectSec, agentFetchBudgetSec)
 	fmt.Fprintf(&b, "- default/legacy install targets follow the running lattice-agent path and default service may follow the running systemd unit\n")
 	fmt.Fprintf(&b, "%s\n", agentUpdateKeepalivePlanLine)
 	fmt.Fprintf(&b, "%s\n", agentUpdateGuardPlanLine)
@@ -1162,6 +1184,19 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 	if err != nil {
 		return agentUpdatePayload{}, err
 	}
+	source := normalizeAgentBinarySource(payload.BinarySource)
+	fallbackURL := ""
+	if strings.TrimSpace(payload.FallbackURL) != "" {
+		// A fallback only means something behind a control-plane source; an
+		// upstream plan already names the release URL as its only download.
+		if source != agentBinarySourceControlPlane {
+			return agentUpdatePayload{}, errors.New("agent update approval names a fallback_url without a control-plane binary source")
+		}
+		fallbackURL, err = normalizeAgentUpdateURL(payload.FallbackURL)
+		if err != nil {
+			return agentUpdatePayload{}, fmt.Errorf("fallback_url: %w", err)
+		}
+	}
 	return agentUpdatePayload{
 		NodeID:         payload.NodeID,
 		CurrentVersion: payload.CurrentVersion,
@@ -1170,7 +1205,8 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 		SHA256:         normalized.SHA256,
 		InstallPath:    normalized.InstallPath,
 		ServiceName:    normalized.ServiceName,
-		BinarySource:   normalizeAgentBinarySource(payload.BinarySource),
+		BinarySource:   source,
+		FallbackURL:    fallbackURL,
 	}, nil
 }
 
@@ -1254,6 +1290,9 @@ func agentUpdatePayloadChangeSummary(planned, current agentUpdatePayload) string
 	}
 	if planned.BinaryURL != current.BinaryURL {
 		changes = append(changes, fmt.Sprintf("binary_url planned=%s current=%s", planned.BinaryURL, current.BinaryURL))
+	}
+	if planned.FallbackURL != current.FallbackURL {
+		changes = append(changes, fmt.Sprintf("fallback_url planned=%s current=%s", planned.FallbackURL, current.FallbackURL))
 	}
 	if planned.SHA256 != current.SHA256 {
 		changes = append(changes, fmt.Sprintf("sha256 planned=%s current=%s", shortDigest(planned.SHA256), shortDigest(current.SHA256)))
@@ -1503,6 +1542,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"ulimit -Sf unlimited 2>/dev/null || true\n" +
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
 		"URL=" + shellQuote(payload.BinaryURL) + "\n" +
+		agentUpdateFallbackURLLine(payload.FallbackURL) +
 		"BINARY_SOURCE=" + shellQuote(source) + "\n" +
 		"EXPECT_SHA=" + shellQuote(payload.SHA256) + "\n" +
 		"TARGET=" + shellQuote(payload.InstallPath) + "\n" +
@@ -1548,7 +1588,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"cleanup() { rm -rf \"$WORK\"; }\n" +
 		"trap cleanup EXIT\n" +
 		"CANDIDATE=\"$WORK/lattice-agent\"\n" +
-		agentUpdateDownloadStep(source) +
+		agentUpdateDownloadStep(source, payload.FallbackURL != "") +
 		"if command -v sha256sum >/dev/null 2>&1; then\n" +
 		"  ACTUAL_SHA=$(sha256sum \"$CANDIDATE\" | awk '{print $1}')\n" +
 		"elif command -v shasum >/dev/null 2>&1; then\n" +
@@ -1619,17 +1659,43 @@ func agentUpdateLeasePreflight(source string) string {
 // at the lease. Raising it further means raising the task timeout, which cannot
 // go past ten minutes: the agent treats a larger value as out of range and
 // falls back to 30 s rather than clamping.
+//
+// A plan with a fallback URL makes two attempts, and two full 480 s attempts
+// cannot fit in 600 s. So the 480 s is a budget for the download as a whole:
+// the control-plane attempt runs exactly as before, and the fallback gets what
+// that attempt left. The failure the fallback exists for is a connect timeout
+// (2026-10-04, a gomami node whose agent reaches the control plane through a
+// relay the task cannot use), which spends 20 s and leaves 460 s, more than
+// the slowest uplink on the fleet needs.
+//
+// The plan an operator approves states these limits, so it reads them from
+// here rather than repeating the numbers: the 300 s total stayed in the plan
+// text for a month after the script moved to 480 s.
 const (
-	agentFetchCurlTimeouts = " --connect-timeout 20 --max-time 480"
-	agentFetchWgetTimeouts = " --timeout=20 --tries=2"
+	agentFetchConnectSec   = "20"
+	agentFetchBudgetSec    = "480"
+	agentFetchCurlTimeouts = " --connect-timeout " + agentFetchConnectSec + " --max-time " + agentFetchBudgetSec
+	agentFetchWgetTimeouts = " --timeout=" + agentFetchConnectSec + " --tries=2"
 )
 
-// agentUpdateDownloadStep renders the one fetch the approved plan chose, rather
-// than both behind a runtime branch, so the script an operator reveals has a
-// single download command in it. The task lease is presented only on the
-// control-plane form: attaching it to an upstream release URL would hand a live
-// server credential to a third party.
-func agentUpdateDownloadStep(source string) string {
+// agentUpdateFallbackURLLine declares the fallback URL for a plan that has one
+// and nothing for a plan that does not, so an approval planned before the
+// fallback existed renders the script it was approved with.
+func agentUpdateFallbackURLLine(fallbackURL string) string {
+	if fallbackURL == "" {
+		return ""
+	}
+	return "FALLBACK_URL=" + shellQuote(fallbackURL) + "\n"
+}
+
+// agentUpdateDownloadStep renders the fetch the approved plan chose. An upstream
+// plan, and a control-plane plan without a fallback, get a single download
+// command. A control-plane plan with a fallback gets the same control-plane
+// command and, only if it fails, one fetch of the fallback URL in the upstream
+// form. The task lease is presented only on the control-plane form: attaching
+// it to an upstream release URL would hand a live server credential to a third
+// party.
+func agentUpdateDownloadStep(source string, withFallback bool) string {
 	curl := "curl -fsSL --proto '=https' --tlsv1.2" + agentFetchCurlTimeouts + " -o \"$CANDIDATE\" \"$URL\""
 	wget := "wget --https-only -q" + agentFetchWgetTimeouts + " -O \"$CANDIDATE\" \"$URL\""
 	if source == agentBinarySourceControlPlane {
@@ -1650,11 +1716,64 @@ func agentUpdateDownloadStep(source string) string {
 			" --header=\"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
 			" --header=\"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\"" +
 			" -O \"$CANDIDATE\" \"$URL\""
+		if withFallback {
+			return agentUpdateDownloadWithFallback(curl, wget)
+		}
 	}
 	return "if command -v curl >/dev/null 2>&1; then\n" +
 		"  " + curl + "\n" +
 		"elif command -v wget >/dev/null 2>&1; then\n" +
 		"  " + wget + "\n" +
+		"else\n" +
+		"  echo 'lattice agent update: curl or wget is required' >&2\n" +
+		"  exit 1\n" +
+		"fi\n"
+}
+
+// agentUpdateDownloadWithFallback wraps the credentialed control-plane fetch so
+// that a failure tries FALLBACK_URL once. The fallback is the plain upstream
+// form: it follows release redirects and never carries the lease headers. A
+// partial control-plane file is removed first, and the digest check after this
+// step applies to whichever download produced the file. curl gives the
+// fallback the part of the download budget the first attempt did not use;
+// wget has no total time limit (not on the upstream path today either), so
+// its fallback keeps the per-operation timeouts. A failed fallback exits with
+// the fetch's own status under set -e, as a failed single download does.
+//
+// The clock only sizes the fallback, so it must never stop a download: a
+// missing date or one without %s reads as 0, and an unreadable or backwards
+// clock gives the fallback the budget less one connect timeout, which is what
+// the connect failure it exists for leaves. The fallback may not follow a
+// redirect off HTTPS; --proto already refuses that, and --proto-redir says so
+// on the command itself.
+func agentUpdateDownloadWithFallback(controlPlaneCurl, controlPlaneWget string) string {
+	fallbackCurl := "curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout " + agentFetchConnectSec +
+		" --max-time \"$FETCH_LEFT\" -o \"$CANDIDATE\" \"$FALLBACK_URL\""
+	fallbackWget := "wget --https-only -q" + agentFetchWgetTimeouts + " -O \"$CANDIDATE\" \"$FALLBACK_URL\""
+	unknownLeft := "FETCH_LEFT=$((" + agentFetchBudgetSec + " - " + agentFetchConnectSec + "))"
+	return "FETCH_START=$(date +%s 2>/dev/null || echo 0)\n" +
+		"if command -v curl >/dev/null 2>&1; then\n" +
+		"  if ! " + controlPlaneCurl + "; then\n" +
+		"    FETCH_NOW=$(date +%s 2>/dev/null || echo 0)\n" +
+		"    case \"$FETCH_START:$FETCH_NOW\" in\n" +
+		"      0:*|*:0|:*|*:|*[!0-9:]*) " + unknownLeft + " ;;\n" +
+		"      *) FETCH_LEFT=$((" + agentFetchBudgetSec + " - ($FETCH_NOW - $FETCH_START))) ;;\n" +
+		"    esac\n" +
+		"    if [ \"$FETCH_LEFT\" -gt " + agentFetchBudgetSec + " ]; then " + unknownLeft + "; fi\n" +
+		"    rm -f \"$CANDIDATE\"\n" +
+		"    if [ \"$FETCH_LEFT\" -lt " + agentFetchConnectSec + " ]; then\n" +
+		"      echo \"lattice agent update: control-plane download failed with ${FETCH_LEFT}s of the " + agentFetchBudgetSec + " s download budget left; not falling back to $FALLBACK_URL\" >&2\n" +
+		"      exit 1\n" +
+		"    fi\n" +
+		"    echo \"lattice agent update: control-plane download failed; falling back to the release URL $FALLBACK_URL with ${FETCH_LEFT}s left\" >&2\n" +
+		"    " + fallbackCurl + "\n" +
+		"  fi\n" +
+		"elif command -v wget >/dev/null 2>&1; then\n" +
+		"  if ! " + controlPlaneWget + "; then\n" +
+		"    rm -f \"$CANDIDATE\"\n" +
+		"    echo \"lattice agent update: control-plane download failed; falling back to the release URL $FALLBACK_URL\" >&2\n" +
+		"    " + fallbackWget + "\n" +
+		"  fi\n" +
 		"else\n" +
 		"  echo 'lattice agent update: curl or wget is required' >&2\n" +
 		"  exit 1\n" +

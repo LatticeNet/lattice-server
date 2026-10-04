@@ -391,12 +391,31 @@ func TestAgentUpdateApplyScriptSendsTheLeaseOnlyToTheControlPlane(t *testing.T) 
 		t.Fatal("script must fail closed, with the reason named, on an agent that cannot prove its lease")
 	}
 	// A redirect would carry the lease headers onward: curl strips only the
-	// standard Authorization header across hosts, and wget strips nothing.
-	if strings.Contains(script, "curl -fsSL") {
-		t.Fatalf("the credentialed download must not follow redirects:\n%s", script)
+	// standard Authorization header across hosts, and wget strips nothing. The
+	// release URL fallback follows redirects, so it must be the one fetch that
+	// carries no lease.
+	credentialed := 0
+	for _, line := range strings.Split(script, "\n") {
+		hasLease := strings.Contains(line, agentTaskLeaseHeader)
+		if !hasLease && !strings.Contains(line, "$FALLBACK_URL\"") {
+			continue
+		}
+		fetch := strings.Contains(line, "curl ") || strings.Contains(line, "wget ")
+		if !fetch {
+			continue
+		}
+		if hasLease {
+			credentialed++
+			if strings.Contains(line, "curl -fsSL") || (strings.Contains(line, "wget ") && !strings.Contains(line, "--max-redirect=0")) {
+				t.Fatalf("the credentialed download must not follow redirects: %s", line)
+			}
+			if strings.Contains(line, "$FALLBACK_URL") {
+				t.Fatalf("the lease must never be sent to the fallback URL: %s", line)
+			}
+		}
 	}
-	if !strings.Contains(script, "--max-redirect=0") {
-		t.Fatalf("the credentialed wget fallback must not follow redirects:\n%s", script)
+	if credentialed != 2 {
+		t.Fatalf("want one credentialed curl and one credentialed wget, found %d:\n%s", credentialed, script)
 	}
 
 	// Now flip the same approval back to the upstream release and confirm the
@@ -407,6 +426,7 @@ func TestAgentUpdateApplyScriptSendsTheLeaseOnlyToTheControlPlane(t *testing.T) 
 	}
 	payload.BinarySource = agentBinarySourceUpstream
 	payload.BinaryURL = "https://downloads.example.com/lattice-agent-linux-amd64"
+	payload.FallbackURL = ""
 	approval.Action = agentUpdateApprovalAction(payload)
 	upstreamScript, err := agentUpdateApplyScript(approval, artifactTestPublicURL)
 	if err != nil {

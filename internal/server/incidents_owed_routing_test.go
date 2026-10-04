@@ -145,3 +145,28 @@ func TestARecoveryDigestLeavesOutWhatARuleMissed(t *testing.T) {
 	d.sweep()
 	d.expect("the recoveries", "nc-day Lattice agent recovered digest: 2 nodes", "nc-night Agent loop recovered: name-b")
 }
+
+// An incident that reopens before its recovery went out leaves the phone
+// saying "down", which is true again, so nothing is owed, except to a rule
+// that never heard the last open: night is owed this one and gets it alone.
+func TestAReopeningOwesTheOpenToARuleThatMissedTheLastOne(t *testing.T) {
+	d := newDayNight(t, "a")
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("withdrawn")
+
+	d.h.clock.advance(time.Minute)
+	d.resolve("a")
+	d.h.clock.advance(time.Second)
+	if reopened := d.raise("a"); reopened != id {
+		t.Fatalf("reopened as %s, want the same record %s", reopened, id)
+	}
+	d.expect("the reopening", "nc-night Agent loop stalled: name-a")
+	if inc := d.h.incident(EventAgentStalled, "a"); inc.OwedOpen || inc.OwedRecovery || len(inc.OwedOpenRules) != 0 || inc.Flaps != 1 {
+		t.Fatalf("after the reopening: %+v", inc)
+	}
+	d.sweep()
+	d.expect("the next sweep")
+}

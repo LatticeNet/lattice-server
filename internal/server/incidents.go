@@ -202,8 +202,10 @@ func (s *Server) openIncident(sig incidentSignal, now time.Time) {
 	clearOwedOpen(&inc)
 	if inc.Notified == store.IncidentNotifiedOpen {
 		// The phone still says down (a damped recovery never went out), which
-		// is true again: nothing is owed in either direction.
+		// is true again: nothing is owed in either direction, except the open
+		// to a rule that never heard the last one.
 		inc.OwedOpen, inc.OwedRecovery = false, false
+		oweOpenTo(&inc, s.rulesThatMissedOpen(inc))
 	} else {
 		inc.OwedOpen, inc.OwedRecovery = true, false
 	}

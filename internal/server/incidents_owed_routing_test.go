@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -169,4 +170,34 @@ func TestAReopeningOwesTheOpenToARuleThatMissedTheLastOne(t *testing.T) {
 	}
 	d.sweep()
 	d.expect("the next sweep")
+}
+
+// Acknowledging an incident already acknowledged changes nothing: the record
+// keeps the first acknowledgement and only that one is audited.
+func TestAcknowledgingTwiceAuditsOnce(t *testing.T) {
+	h := newIncidentHarness(t, "a")
+	post, _, _ := incidentPoster(h)
+	h.openService("a")
+	h.sweep()
+	id := h.incident(EventServiceDown, "a").ID
+	if code, v := post("/api/incidents/ack", id); code != http.StatusOK || v.State != store.IncidentStateAcknowledged {
+		t.Fatalf("ack: %d %+v", code, v)
+	}
+	first := h.incident(EventServiceDown, "a")
+	h.clock.advance(time.Minute)
+	if code, v := post("/api/incidents/ack", id); code != http.StatusOK || v.State != store.IncidentStateAcknowledged {
+		t.Fatalf("ack again: %d %+v", code, v)
+	}
+	if again := h.incident(EventServiceDown, "a"); !reflect.DeepEqual(again, first) {
+		t.Fatalf("the record changed:\nbefore %+v\nafter  %+v", first, again)
+	}
+	audits := 0
+	for _, ev := range h.f.st.AuditEvents() {
+		if ev.Action == "incident.ack" && ev.Metadata["incident_id"] == id {
+			audits++
+		}
+	}
+	if audits != 1 {
+		t.Fatalf("incident.ack audited %d times, want 1", audits)
+	}
 }

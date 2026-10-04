@@ -368,7 +368,8 @@ func (s *Server) handleIncidentAck(w http.ResponseWriter, r *http.Request, p pri
 		writeError(w, http.StatusConflict, errors.New("only an open incident can be acknowledged"))
 		return
 	}
-	if inc.State != store.IncidentStateAcknowledged {
+	acknowledged := inc.State != store.IncidentStateAcknowledged
+	if acknowledged {
 		inc.State = store.IncidentStateAcknowledged
 		inc.AckedBy, inc.AckedAt = principalLabel(p), now
 		inc.AckCancelledOpen = inc.OwedOpen
@@ -379,8 +380,12 @@ func (s *Server) handleIncidentAck(w http.ResponseWriter, r *http.Request, p pri
 		}
 	}
 	s.incidentMu.Unlock()
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.ack", Scope: "monitor:admin",
-		Metadata: map[string]string{"incident_id": inc.ID, "kind": inc.Kind}})
+	// Only an acknowledgement that acknowledged something is audited; a
+	// second one on an incident already acknowledged changed nothing.
+	if acknowledged {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.ack", Scope: "monitor:admin",
+			Metadata: map[string]string{"incident_id": inc.ID, "kind": inc.Kind}})
+	}
 	writeJSON(w, http.StatusOK, s.toIncidentView(inc, now, s.maintenanceCoverAt(now), s.nodeNames()))
 }
 

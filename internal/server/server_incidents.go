@@ -430,16 +430,12 @@ func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p p
 			// Through every rule, which covers any rule owed it alone.
 			inc.OwedOpenRules = nil
 		} else {
-			// Only the rules that lost their copy to the acknowledgement are
-			// owed it, with any an earlier undo left owed. The sweep sends it
-			// through them alone once nothing holds the incident, so a rule
-			// that delivered it is never told twice.
-			for _, ruleID := range s.rulesThatWithdrewOpen(inc, ackedAt) {
-				if !slices.Contains(inc.OwedOpenRules, ruleID) {
-					inc.OwedOpenRules = append(inc.OwedOpenRules, ruleID)
-				}
-			}
-			slices.Sort(inc.OwedOpenRules)
+			// Only the rules that never heard it (their held copy was
+			// withdrawn and nothing went through them since) are owed it,
+			// with any an earlier undo left owed. The sweep sends it through
+			// them alone once nothing holds the incident, so a rule that
+			// delivered it is never told twice.
+			oweOpenTo(&inc, s.rulesThatMissedOpen(inc))
 		}
 		inc.AckCancelledOpen = false
 		inc.AckedBy, inc.AckedAt = "", time.Time{}
@@ -462,25 +458,6 @@ func (s *Server) handleIncidentUnack(w http.ResponseWriter, r *http.Request, p p
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: inc.NodeID, Action: "incident.unack", Scope: "monitor:admin", Metadata: meta})
 	}
 	writeJSON(w, http.StatusOK, s.toIncidentView(inc, now, cover, s.nodeNames()))
-}
-
-// rulesThatWithdrewOpen lists the ids of the rules whose quiet-hours copy of
-// inc's open message was withdrawn at or after ackedAt, which is what an
-// acknowledgement does to a held open message when quiet hours end. A copy
-// withdrawn before the acknowledgement was withdrawn for another reason (a
-// snooze, say), which undoing the acknowledgement does not undo.
-func (s *Server) rulesThatWithdrewOpen(inc store.Incident, ackedAt time.Time) []string {
-	if ackedAt.IsZero() {
-		return nil
-	}
-	var out []string
-	for _, row := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, EventType: inc.Kind}) {
-		if row.Reason == notifyWithdrawnOpen && row.RuleID != "" && !row.SettledAt.Before(ackedAt) &&
-			slices.Contains(row.IncidentIDs, inc.ID) && !slices.Contains(out, row.RuleID) {
-			out = append(out, row.RuleID)
-		}
-	}
-	return out
 }
 
 // handleIncidentSnooze holds an open incident's messages until a time:
@@ -515,6 +492,13 @@ func (s *Server) handleIncidentSnooze(w http.ResponseWriter, r *http.Request, p 
 		return
 	}
 	if *req.Minutes == 0 {
+		// Ending a snooze early sends no reminder, so a rule whose held copy
+		// quiet hours withdrew because of the snooze would never hear the
+		// open: it is owed it, and the sweep sends it once nothing holds the
+		// incident. The whole message, when owed, covers it.
+		if !inc.SnoozedUntil.IsZero() && !inc.OwedOpen {
+			oweOpenTo(&inc, s.rulesThatMissedOpen(inc))
+		}
 		inc.SnoozedUntil, inc.SnoozedBy = time.Time{}, ""
 	} else {
 		inc.SnoozedUntil = now.Add(time.Duration(*req.Minutes) * time.Minute)

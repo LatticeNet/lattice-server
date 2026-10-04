@@ -676,7 +676,7 @@ func heldIncidentMessage(row store.NotifyDelivery) bool {
 // to an incident holds. An acknowledgement undone at the same moment then
 // either lands first, and the decision sees the incident open and sends, or
 // lands after, and finds the row withdrawn and owes its rule the message
-// again (rulesThatWithdrewOpen). Without the lock the undo could fall between
+// again (rulesThatMissedOpen). Without the lock the undo could fall between
 // the two, find no withdrawn row, and the message would be lost. Lock order:
 // incidentMu, then the store; the outbox locks are not held here.
 func (s *Server) withdrawHeldIncidentMessage(row store.NotifyDelivery) bool {

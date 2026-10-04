@@ -241,6 +241,45 @@ func clearOwedOpen(inc *store.Incident) {
 	inc.OwedOpen, inc.OwedOpenRules, inc.AckCancelledOpen = false, nil, false
 }
 
+// oweOpenTo adds rules to those owed inc's open message alone
+// (OwedOpenRules), sorted and without repeats. The sweep sends it through
+// them once nothing holds the incident.
+func oweOpenTo(inc *store.Incident, ruleIDs []string) {
+	for _, ruleID := range ruleIDs {
+		if !slices.Contains(inc.OwedOpenRules, ruleID) {
+			inc.OwedOpenRules = append(inc.OwedOpenRules, ruleID)
+		}
+	}
+	slices.Sort(inc.OwedOpenRules)
+}
+
+// rulesThatMissedOpen lists, sorted, the rules whose phones were never told
+// inc is down: the latest open message about inc through the rule is a copy
+// quiet hours held and then withdrew (the incident was acknowledged, snoozed
+// or resolved when they ended), and nothing has gone through the rule since.
+// A later copy still waiting to be sent counts as told, since the outbox
+// decides it when it falls due; so does a rule that never had a copy.
+//
+// yagni: read from the outbox, which is bounded. A withdrawal evicted before
+// it is read is not seen and its rule counts as told, which errs toward one
+// message too many rather than one too few. Recording each rule's last open
+// on the incident is the upgrade if that ever matters.
+func (s *Server) rulesThatMissedOpen(inc store.Incident) []string {
+	decided := map[string]bool{}
+	var out []string
+	for _, row := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{EventType: inc.Kind}) { // newest first
+		if row.RuleID == "" || decided[row.RuleID] || !slices.Contains(row.IncidentIDs, inc.ID) {
+			continue
+		}
+		decided[row.RuleID] = true
+		if row.Outcome == store.NotifyOutcomeSuppressed && row.Reason == notifyWithdrawnOpen {
+			out = append(out, row.RuleID)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // maintenanceCover answers which active window, if any, covers a node.
 type maintenanceCover func(nodeID string) (store.MaintenanceWindow, bool)
 

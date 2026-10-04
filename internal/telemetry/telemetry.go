@@ -165,10 +165,14 @@ func hasEscapedSubscriptionFirstSegment(escapedPath string) bool {
 	return err == nil && firstSegment == "sub"
 }
 
-// maxStoreCallers bounds the caller label. The store derives it from a fixed
-// set of method names, so the bound is a backstop: a caller first seen once
-// the set is full is counted as StoreCallerOther.
-const maxStoreCallers = 128
+// maxStoreCallers bounds the caller label. The labels are Go symbol names
+// from the store package: about 145 exported methods write state today, plus
+// the exported functions Open runs. The cap sits well above that so a rare
+// writer keeps its own label on a long-lived server instead of being folded
+// into StoreCallerOther in arrival order, which would hide it from whoever is
+// hunting for it. It stays as a safety net: a caller first seen once the set is
+// full counts as StoreCallerOther.
+const maxStoreCallers = 512
 
 // StoreCallerOther is the caller label for a write no named caller claims.
 const StoreCallerOther = "other"

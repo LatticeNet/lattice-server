@@ -20,11 +20,12 @@ var storeFuncPrefix, storeMethodPrefix = func() (string, string) {
 // *Store method on the stack above persistState, past Save, which most writes
 // go through. An exported method takes s.mu and so cannot call another one,
 // which makes that frame the call the rest of the server made. The names are
-// the methods this package has, a fixed set, so the label stays bounded. A
-// write made from no exported method (the migrations Open runs) is named after
-// the exported function on the stack, and "other" when there is none.
+// Go symbols of this package, so the set is finite, and telemetry caps it as
+// well. A write made from no exported method (the migrations Open runs) is
+// named after the exported function on the stack, and "other" when there is
+// none.
 func persistCaller() string {
-	var pcs [32]uintptr
+	var pcs [48]uintptr
 	// Skip runtime.Callers, persistCaller and persistState.
 	n := runtime.Callers(3, pcs[:])
 	frames := runtime.CallersFrames(pcs[:n])

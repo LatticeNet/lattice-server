@@ -76,7 +76,7 @@ func TestStoreSaveSummaryFormatsAndResets(t *testing.T) {
 		}
 	}
 	line, ok := r.TakeStoreSaveSummary(time.Hour)
-	want := "state writes in the last 60m: 28 (UpdateMetrics 12, UpsertDDNSProfile 12, RecordDDNSRun 3, other 1)"
+	want := "state.json writes in the last 60m: 28 (UpdateMetrics 12, UpsertDDNSProfile 12, RecordDDNSRun 3, other 1)"
 	if !ok || line != want {
 		t.Fatalf("summary = %q, %v\nwant      %q", line, ok, want)
 	}
@@ -89,7 +89,7 @@ func TestStoreSaveSummaryFormatsAndResets(t *testing.T) {
 
 	r.ObserveStoreSave("UpdateMetrics", time.Millisecond, nil)
 	line, ok = r.TakeStoreSaveSummary(59*time.Minute + 40*time.Second)
-	if want := "state writes in the last 60m: 1 (UpdateMetrics 1)"; !ok || line != want {
+	if want := "state.json writes in the last 60m: 1 (UpdateMetrics 1)"; !ok || line != want {
 		t.Fatalf("summary = %q, %v, want %q", line, ok, want)
 	}
 
@@ -111,7 +111,7 @@ func TestStoreSaveSummaryIsBounded(t *testing.T) {
 		}
 	}
 	line, _ := r.TakeStoreSaveSummary(time.Hour)
-	want := "state writes in the last 60m: 55 (Caller09 10, Caller08 9, Caller07 8, Caller06 7, Caller05 6, Caller04 5, 4 more callers 10)"
+	want := "state.json writes in the last 60m: 55 (Caller09 10, Caller08 9, Caller07 8, Caller06 7, Caller05 6, Caller04 5, 4 more callers 10)"
 	if line != want {
 		t.Fatalf("summary = %q\nwant      %q", line, want)
 	}
@@ -120,7 +120,7 @@ func TestStoreSaveSummaryIsBounded(t *testing.T) {
 		r.ObserveStoreSave(fmt.Sprintf("Caller%02d", i), time.Millisecond, nil)
 	}
 	line, _ = r.TakeStoreSaveSummary(time.Hour)
-	want = "state writes in the last 60m: 7 (Caller00 1, Caller01 1, Caller02 1, Caller03 1, Caller04 1, Caller05 1, Caller06 1)"
+	want = "state.json writes in the last 60m: 7 (Caller00 1, Caller01 1, Caller02 1, Caller03 1, Caller04 1, Caller05 1, Caller06 1)"
 	if line != want {
 		t.Fatalf("one caller past the bound is named, not folded: %q\nwant %q", line, want)
 	}

@@ -125,8 +125,10 @@ func latencyRegion(n model.Node) (country, region string) {
 }
 
 // defaultLatencyProbeConfig is what is in force until an operator saves:
-// probes on, every 60 s, from every node named cd-hs-sh to every node
-// outside mainland China.
+// probes on, every 60 s, from the cd-hs-sh node to every node outside
+// mainland China. The node matches by id or by name: production enrolled it
+// with the id cd-hs-sh and a display name of its own, so matching the name
+// alone left the defaults with no source and every target paused.
 func defaultLatencyProbeConfig(nodes []model.Node) model.LatencyProbeConfig {
 	cfg := model.LatencyProbeConfig{
 		Enabled:     true,
@@ -135,7 +137,8 @@ func defaultLatencyProbeConfig(nodes []model.Node) model.LatencyProbeConfig {
 		AutoTargets: true,
 	}
 	for _, n := range nodes {
-		if strings.EqualFold(strings.TrimSpace(n.Name), latencyDefaultSourceName) {
+		if strings.EqualFold(strings.TrimSpace(n.ID), latencyDefaultSourceName) ||
+			strings.EqualFold(strings.TrimSpace(n.Name), latencyDefaultSourceName) {
 			cfg.Sources = append(cfg.Sources, n.ID)
 		}
 	}

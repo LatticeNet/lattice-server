@@ -300,3 +300,33 @@ func TestARecoveryLeavesOutAnOwedRuleTheOutboxForgot(t *testing.T) {
 		t.Fatalf("after the recovery: %+v", inc)
 	}
 }
+
+// When no rule routes the recovery's event type, a recovery a rule missed
+// the open of is still recorded as unrouted, as any unrouted event is, so
+// "why was nobody told" has an answer.
+func TestAnUnroutedRecoveryIsRecordedWhenARuleMissedTheOpen(t *testing.T) {
+	d := newDayNight(t, "a")
+	quiet := &store.NotifyQuietHours{Start: d.start.Add(-time.Hour).Format("15:04"), End: d.start.Add(time.Hour).Format("15:04"), TimeZone: "UTC"}
+	for _, r := range []struct {
+		id   string
+		opts store.NotifyRuleOptions
+	}{{"night", store.NotifyRuleOptions{QuietHours: quiet}}, {"day", store.NotifyRuleOptions{}}} {
+		if err := d.h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-" + r.id, Name: r.id, EventTypes: []string{EventAgentStalled},
+			ChannelIDs: []string{"nc-" + r.id}, Enabled: true}, r.opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("withdrawn")
+
+	d.h.clock.advance(time.Minute)
+	d.resolve("a")
+	d.sweep()
+	d.expect("the recovery")
+	if rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeNoRoute, EventType: EventAgentRecovered}); len(rows) != 1 {
+		t.Fatalf("unrouted recovery rows = %+v", rows)
+	}
+}

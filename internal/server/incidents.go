@@ -751,12 +751,15 @@ func (s *Server) sendRecoveries(eventType string, items []incidentOutgoing) {
 			}
 		}
 	}
-	if len(missed) == 0 {
+	routes := func(rule model.NotifyRule) bool { return notifyRuleMatches(rule, eventType) }
+	// With no rule routing the event type, the plain path records why
+	// nobody was told (a no_route row) and sends nothing.
+	if len(missed) == 0 || !slices.ContainsFunc(rules, routes) {
 		s.sendIncidentMessages(eventType, items)
 		return
 	}
 	for _, rule := range rules {
-		if !notifyRuleMatches(rule, eventType) {
+		if !routes(rule) {
 			continue
 		}
 		var told []incidentOutgoing

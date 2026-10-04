@@ -19,11 +19,15 @@ type Registry struct {
 	mu               sync.Mutex
 	started          time.Time
 	store            map[string]*durationStats
+	storeCallers     map[string]*durationStats
 	audit            map[string]uint64
 	http             map[httpKey]*durationStats
 	httpSlow         map[string]uint64
 	agent            map[httpKey]*durationStats
 	pluginSystemPool PluginSystemPoolSnapshot
+	// saveWindow counts writes by caller since the last TakeStoreSaveSummary.
+	// Its keys are the bounded caller labels, so it is bounded the same way.
+	saveWindow map[string]uint64
 }
 
 type durationStats struct {
@@ -41,6 +45,7 @@ type Snapshot struct {
 	StartedAt        time.Time
 	Uptime           time.Duration
 	Store            map[string]durationStats
+	StoreCallers     map[string]durationStats
 	Audit            map[string]uint64
 	HTTP             map[httpKey]durationStats
 	HTTPSlow         map[string]uint64
@@ -50,12 +55,14 @@ type Snapshot struct {
 
 func NewRegistry() *Registry {
 	return &Registry{
-		started:  time.Now(),
-		store:    map[string]*durationStats{},
-		audit:    map[string]uint64{},
-		http:     map[httpKey]*durationStats{},
-		httpSlow: map[string]uint64{},
-		agent:    map[httpKey]*durationStats{},
+		started:      time.Now(),
+		store:        map[string]*durationStats{},
+		storeCallers: map[string]*durationStats{},
+		saveWindow:   map[string]uint64{},
+		audit:        map[string]uint64{},
+		http:         map[httpKey]*durationStats{},
+		httpSlow:     map[string]uint64{},
+		agent:        map[httpKey]*durationStats{},
 	}
 }
 
@@ -63,8 +70,11 @@ func ResetForTest() {
 	defaultRegistry.Reset()
 }
 
-func ObserveStoreSave(d time.Duration, err error) {
-	defaultRegistry.ObserveStoreSave(d, err)
+// ObserveStoreSave records one whole-state write: how long it took, whether it
+// failed, and caller, the store method that asked for it (store.persistState
+// derives it), so production can say which path is rewriting the file.
+func ObserveStoreSave(caller string, d time.Duration, err error) {
+	defaultRegistry.ObserveStoreSave(caller, d, err)
 }
 
 func ObserveAuditAppend(err error) {
@@ -155,14 +165,104 @@ func hasEscapedSubscriptionFirstSegment(escapedPath string) bool {
 	return err == nil && firstSegment == "sub"
 }
 
-func (r *Registry) ObserveStoreSave(d time.Duration, err error) {
+// maxStoreCallers bounds the caller label. The labels are Go symbol names
+// from the store package: about 145 exported methods write state today, plus
+// the exported functions Open runs. The cap sits well above that so a rare
+// writer keeps its own label on a long-lived server instead of being folded
+// into StoreCallerOther in arrival order, which would hide it from whoever is
+// hunting for it. It stays as a safety net: a caller first seen once the set is
+// full counts as StoreCallerOther.
+const maxStoreCallers = 512
+
+// StoreCallerOther is the caller label for a write no named caller claims.
+const StoreCallerOther = "other"
+
+func (r *Registry) ObserveStoreSave(caller string, d time.Duration, err error) {
 	result := "success"
 	if err != nil {
 		result = "error"
 	}
+	if caller == "" {
+		caller = StoreCallerOther
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	observeDuration(r.store, result, d)
+	if _, seen := r.storeCallers[caller]; !seen && len(r.storeCallers) >= maxStoreCallers {
+		caller = StoreCallerOther
+	}
+	observeDuration(r.storeCallers, caller, d)
+	r.saveWindow[caller]++
+}
+
+// storeSaveSummaryTop bounds the summary line: it names the callers with the
+// most writes and folds the rest into one count.
+const storeSaveSummaryTop = 6
+
+// TakeStoreSaveSummary returns one log line counting the whole-state
+// (state.json) writes since the previous call, by caller, and starts a new
+// window. Writes to the bolt hot store are not counted, so the line is not a
+// total of durable writes. elapsed is how long the window ran. It returns
+// false when nothing was written, so a quiet server logs nothing. The
+// cumulative /metrics counters do not reset with it.
+func TakeStoreSaveSummary(elapsed time.Duration) (string, bool) {
+	return defaultRegistry.TakeStoreSaveSummary(elapsed)
+}
+
+func (r *Registry) TakeStoreSaveSummary(elapsed time.Duration) (string, bool) {
+	r.mu.Lock()
+	window := r.saveWindow
+	r.saveWindow = map[string]uint64{}
+	r.mu.Unlock()
+	return formatStoreSaveSummary(window, elapsed, storeSaveSummaryTop)
+}
+
+// formatStoreSaveSummary renders a window as
+// "state.json writes in the last 60m: 96 (UpdateMetrics 60, UpsertDDNSProfile 12, ...)",
+// busiest caller first, ties by name. Past top callers the rest fold into
+// "N more callers M", so the line stays short however many callers wrote.
+func formatStoreSaveSummary(window map[string]uint64, elapsed time.Duration, top int) (string, bool) {
+	type callerCount struct {
+		caller string
+		n      uint64
+	}
+	var total uint64
+	counts := make([]callerCount, 0, len(window))
+	for caller, n := range window {
+		total += n
+		counts = append(counts, callerCount{caller, n})
+	}
+	if total == 0 {
+		return "", false
+	}
+	sort.Slice(counts, func(i, j int) bool {
+		if counts[i].n != counts[j].n {
+			return counts[i].n > counts[j].n
+		}
+		return counts[i].caller < counts[j].caller
+	})
+	named, folded := counts, []callerCount(nil)
+	// Folding a single caller would say less than naming it.
+	if len(counts) > top+1 {
+		named, folded = counts[:top], counts[top:]
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "state.json writes in the last %dm: %d (", int64(elapsed.Round(time.Minute)/time.Minute), total)
+	for i, c := range named {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s %d", c.caller, c.n)
+	}
+	if len(folded) > 0 {
+		var rest uint64
+		for _, c := range folded {
+			rest += c.n
+		}
+		fmt.Fprintf(&b, ", %d more callers %d", len(folded), rest)
+	}
+	b.WriteString(")")
+	return b.String(), true
 }
 
 func (r *Registry) Reset() {
@@ -170,6 +270,8 @@ func (r *Registry) Reset() {
 	defer r.mu.Unlock()
 	r.started = time.Now()
 	r.store = map[string]*durationStats{}
+	r.storeCallers = map[string]*durationStats{}
+	r.saveWindow = map[string]uint64{}
 	r.audit = map[string]uint64{}
 	r.http = map[httpKey]*durationStats{}
 	r.httpSlow = map[string]uint64{}
@@ -215,6 +317,7 @@ func (r *Registry) Snapshot() Snapshot {
 		StartedAt:        r.started,
 		Uptime:           time.Since(r.started),
 		Store:            copyDurationMap(r.store),
+		StoreCallers:     copyDurationMap(r.storeCallers),
 		Audit:            copyCounterMap(r.audit),
 		HTTP:             copyHTTPMap(r.http),
 		HTTPSlow:         copyCounterMap(r.httpSlow),
@@ -241,6 +344,19 @@ func (r *Registry) Prometheus() string {
 		writeLine(&b, "lattice_store_save_duration_seconds_count{%s} %d", labels, st.Count)
 		writeLine(&b, "lattice_store_save_duration_seconds_sum{%s} %.9f", labels, st.Sum.Seconds())
 		writeLine(&b, "lattice_store_save_duration_seconds_max{%s} %.9f", labels, st.Max.Seconds())
+	}
+
+	writeLine(&b, "# HELP lattice_store_save_by_caller_total Store Save calls by the store method that asked for the write.")
+	writeLine(&b, "# TYPE lattice_store_save_by_caller_total counter")
+	writeLine(&b, "# HELP lattice_store_save_by_caller_duration_seconds Store Save latency by the store method that asked for the write.")
+	writeLine(&b, "# TYPE lattice_store_save_by_caller_duration_seconds summary")
+	for _, caller := range sortedDurationKeys(snap.StoreCallers) {
+		st := snap.StoreCallers[caller]
+		labels := fmt.Sprintf(`caller="%s"`, escapeLabel(caller))
+		writeLine(&b, "lattice_store_save_by_caller_total{%s} %d", labels, st.Count)
+		writeLine(&b, "lattice_store_save_by_caller_duration_seconds_count{%s} %d", labels, st.Count)
+		writeLine(&b, "lattice_store_save_by_caller_duration_seconds_sum{%s} %.9f", labels, st.Sum.Seconds())
+		writeLine(&b, "lattice_store_save_by_caller_duration_seconds_max{%s} %.9f", labels, st.Max.Seconds())
 	}
 
 	writeLine(&b, "# HELP lattice_audit_append_total Audit append attempts by result.")

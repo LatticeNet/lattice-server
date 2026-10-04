@@ -297,12 +297,19 @@ type Store struct {
 	// Guarded by mu.
 	livenessOnDisk     map[string]time.Time
 	guardRealityOnDisk map[string]time.Time
+	// reportClock is the received_at of the latest liveness or guard reality
+	// report, and reportClockAtCommit what it was at the last committed write.
+	// A copy on disk newer than reportClockAtCommit was written after the
+	// clock stepped back and is as fresh as that write (reportClockDueLocked).
+	// Guarded by mu.
+	reportClock         time.Time
+	reportClockAtCommit time.Time
 	// metricsPersistedAt above is each node's LastSeen as the state file holds
 	// it, seeded at open and refreshed from every committed JSON write.
-	// nodeClocksUnflushed is set when a heartbeat or a token use changed a
-	// node in memory without a write, cleared by the next committed write, and
-	// written by Close. Guarded by mu.
-	nodeClocksUnflushed bool
+	// clocksUnflushed is set when a heartbeat, a token use or a DDNS run that
+	// changed nothing moved a clock in memory without a write, cleared by the
+	// next committed write, and written by Close. Guarded by mu.
+	clocksUnflushed bool
 	// loadedLastSeen is each node's LastSeen as Open read it from the state
 	// file. While a node's LastSeen still equals it, the node has not beaten
 	// in this process and the value is a lower bound (NodeLastSeenDiskLag).
@@ -1177,9 +1184,10 @@ func (s *Store) Save() error {
 // install it in s.state only after this returns successfully.
 func (s *Store) persistState(st State) (committed bool, err error) {
 	s.testPersistCalls++
+	caller := persistCaller()
 	start := time.Now()
 	defer func() {
-		telemetry.ObserveStoreSave(time.Since(start), err)
+		telemetry.ObserveStoreSave(caller, time.Since(start), err)
 		if committed {
 			s.noteReportClocksOnDisk(st)
 		}
@@ -1234,7 +1242,8 @@ func (s *Store) noteReportClocksOnDisk(st State) {
 			s.metricsPersistedAt[nodeID] = n.LastSeen
 		}
 	}
-	s.nodeClocksUnflushed = false
+	s.clocksUnflushed = false
+	s.reportClockAtCommit = s.reportClock
 	s.livenessOnDisk = make(map[string]time.Time, len(st.SingBoxLiveness))
 	for nodeID, rec := range st.SingBoxLiveness {
 		s.livenessOnDisk[nodeID] = rec.ReceivedAt
@@ -1264,9 +1273,23 @@ func (s *Store) reportClocksUnflushedLocked() bool {
 // reportClockDue reports whether a clock-only update must still be written
 // because the copy on disk is older than reportClockPersistInterval, or there
 // is no copy on disk at all.
-func reportClockDue(onDisk map[string]time.Time, nodeID string, receivedAt time.Time) bool {
+func (s *Store) reportClockDueLocked(onDisk map[string]time.Time, nodeID string, receivedAt time.Time) bool {
 	written, ok := onDisk[nodeID]
-	return !ok || receivedAt.Sub(written) >= reportClockPersistInterval
+	if !ok {
+		return true
+	}
+	// After the clock steps back, a copy written since carries a received_at
+	// from before the step for every node that has not reported again. It is
+	// as fresh as the write that put it there, so it is judged from that
+	// write's report clock; otherwise each node would write once more.
+	if c := s.reportClockAtCommit; !c.IsZero() && written.After(c) {
+		written = c
+	}
+	// A report from before the copy on disk means the clock went back: write
+	// once and restart the interval from there, instead of leaving the copy
+	// on disk to age until the clock catches up.
+	d := receivedAt.Sub(written)
+	return d < 0 || d >= reportClockPersistInterval
 }
 
 func (s *Store) jsonPersistState() State {
@@ -1674,7 +1697,7 @@ func (s *Store) TouchNodeToken(nodeID string, at time.Time, minInterval time.Dur
 	sinceWrite, sinceBeat := at.Sub(written), at.Sub(n.LastSeen)
 	if onDisk && sinceWrite >= 0 && sinceWrite < metricsPersistenceInterval &&
 		sinceBeat >= 0 && sinceBeat < tokenUseRidesWithin {
-		s.nodeClocksUnflushed = true
+		s.clocksUnflushed = true
 		return true, nil
 	}
 	return true, s.Save()
@@ -1812,7 +1835,7 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	// the interval from there, rather than waiting for the clock to catch up.
 	lastPersisted, persisted := s.metricsPersistedAt[nodeID]
 	if d := now.Sub(lastPersisted); persisted && !durableChanged && d >= 0 && d < metricsPersistenceInterval {
-		s.nodeClocksUnflushed = true
+		s.clocksUnflushed = true
 		return false, nil
 	}
 	if err := s.Save(); err != nil {
@@ -3235,7 +3258,7 @@ func (s *Store) Close() error {
 	// the next write. A clean shutdown writes them, so a restart resumes from
 	// the newest report rather than from one up to reportClockPersistInterval
 	// old.
-	if s.nodeClocksUnflushed || s.reportClocksUnflushedLocked() {
+	if s.clocksUnflushed || s.reportClocksUnflushedLocked() {
 		closeErr = s.Save()
 	}
 	if s.wal != nil {
@@ -4209,6 +4232,35 @@ func (s *Store) BumpSecurityEpoch(userID string) (uint64, error) {
 func (s *Store) UpsertDDNSProfile(p model.DDNSProfile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	p.UpdatedAt = time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	s.state.DDNS[p.ID] = p
+	return s.Save()
+}
+
+// RecordDDNSRun stores the outcome of one automatic DDNS run. A run whose
+// outcome matches the stored profile (the same failure again, or nothing new
+// published) moves only LastRunAt, the clock that spaces out the next
+// attempt: it waits in memory for the next state write, and Close writes it.
+// A profile whose provider keeps refusing is retried every interval, and each
+// retry rewrote the whole state file to record the same error. A changed
+// outcome, an error that appeared, cleared or changed, or a newly published
+// address, is written before this returns. Errors are compared by
+// ddnsErrorClass, so a provider message that differs only in a request id or
+// a timestamp is the same failure; the profile in memory still takes the new
+// text, and it reaches disk with the next write. A restart that loses
+// LastRunAt only brings the next attempt forward.
+func (s *Store) RecordDDNSRun(p model.DDNSProfile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.state.DDNS[p.ID]; ok && ddnsRunOutcomeEqual(current, p) {
+		p.UpdatedAt = current.UpdatedAt
+		s.state.DDNS[p.ID] = p
+		s.clocksUnflushed = true
+		return nil
+	}
 	p.UpdatedAt = time.Now().UTC()
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = p.UpdatedAt

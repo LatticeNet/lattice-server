@@ -287,7 +287,7 @@ func TestPluginSystemPoolConcurrentObservationsAreExact(t *testing.T) {
 
 func TestPluginSystemPoolSnapshotIsolationAndReset(t *testing.T) {
 	r := NewRegistry()
-	r.ObserveStoreSave(time.Second, errors.New("save failed"))
+	r.ObserveStoreSave("UpsertNode", time.Second, errors.New("save failed"))
 	r.ObservePluginSystemPoolDuration(PluginSystemPoolDurationPhaseStart, 10*time.Millisecond)
 	r.ObservePluginSystemPoolLifecycle(PluginSystemPoolLifecycleEventWorkerStartFailure)
 	r.ObservePluginSystemPoolCircuit(PluginSystemPoolCircuitTransitionOpened)
@@ -333,7 +333,7 @@ func TestPluginSystemPoolSnapshotIsolationAndReset(t *testing.T) {
 
 func TestPluginSystemPoolMetricsDoNotChangeExistingFamilies(t *testing.T) {
 	r := NewRegistry()
-	r.ObserveStoreSave(2*time.Millisecond, nil)
+	r.ObserveStoreSave("UpsertNode", 2*time.Millisecond, nil)
 	r.ObserveAuditAppend(errors.New("audit failed"))
 	r.ObserveHTTPRequest("/api/test", 201, 3*time.Millisecond, true)
 	r.ObserveAgentRequest("/api/agent/test", 503, 4*time.Millisecond)

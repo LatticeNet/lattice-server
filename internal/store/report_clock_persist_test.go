@@ -630,3 +630,63 @@ func TestSecondCloseAfterFailedFlushWritesNothing(t *testing.T) {
 		t.Fatalf("a second close persisted %d times, want 0", calls)
 	}
 }
+
+// A clock stepped back past the copies on disk writes once for the fleet and
+// restarts the interval from there. Clock-only reports used to wait until the
+// clock caught up with the copy on disk, so the disk could go stale for as
+// long as the step. And a write made then for one node leaves every other
+// node's pre-step time on disk looking future, so judged naively each of
+// them would write once more.
+func TestReportClockStepBackWritesOnceAndRestartsTheInterval(t *testing.T) {
+	s, _ := openReportClockStore(t)
+	defer s.Close()
+	nodes := []string{"node-a", "node-b", "node-c"}
+	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
+	for _, id := range nodes {
+		if err := s.UpsertNode(model.Node{ID: id, LatticeIdentityUUID: "generation-" + id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstGuard := map[string]GuardRealitySnapshot{}
+	collected := base
+	round := func(at time.Time) int {
+		t.Helper()
+		collected = collected.Add(10 * time.Second) // the agents' clocks did not move back
+		before := s.testPersistCalls
+		for _, id := range nodes {
+			rec := runningLiveness(id, base)
+			rec.ReceivedAt, rec.Runtime.ProbedAt = at, at
+			if _, _, err := s.UpsertSingBoxLiveness(rec); err != nil {
+				t.Fatal(err)
+			}
+			first, ok := firstGuard[id]
+			if !ok {
+				first = guardRealityFixture(id, collected)
+				firstGuard[id] = first
+			}
+			snapshot := steadyGuardReality(first, collected)
+			snapshot.ReceivedAt = at
+			if _, _, err := s.UpsertGuardRealitySnapshot("generation-"+id, snapshot); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return s.testPersistCalls - before
+	}
+	if got := round(base); got != 6 {
+		t.Fatalf("first reports wrote %d times, want one each (6)", got)
+	}
+	if got := round(base.Add(10 * time.Second)); got != 0 {
+		t.Fatalf("a clock-only round wrote %d times, want 0", got)
+	}
+	back := base.Add(-time.Hour)
+	if got := round(back); got != 1 {
+		t.Fatalf("the round after the clock went back an hour wrote %d times, want 1 for the fleet", got)
+	}
+	writes := 0
+	for step := 1; step <= 90; step++ { // 15 minutes on the stepped-back clock
+		writes += round(back.Add(time.Duration(step) * 10 * time.Second))
+	}
+	if writes != 1 {
+		t.Fatalf("15 minutes after the step wrote %d times, want 1 when the interval came round", writes)
+	}
+}

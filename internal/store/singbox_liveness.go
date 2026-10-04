@@ -49,8 +49,9 @@ func (s *Store) UpsertSingBoxLiveness(rec SingBoxLiveness) (SingBoxLiveness, boo
 		return SingBoxLiveness{}, false, errors.New("node_id is required")
 	}
 	rec.ReceivedAt = rec.ReceivedAt.UTC()
+	s.reportClock = rec.ReceivedAt
 	prev, hadPrev := s.state.SingBoxLiveness[rec.NodeID]
-	if hadPrev && singBoxLivenessDurablyEqual(prev, rec) && !reportClockDue(s.livenessOnDisk, rec.NodeID, rec.ReceivedAt) {
+	if hadPrev && singBoxLivenessDurablyEqual(prev, rec) && !s.reportClockDueLocked(s.livenessOnDisk, rec.NodeID, rec.ReceivedAt) {
 		// In place, unlike the copy-on-write below. Safe because this map is
 		// only ever read or written under mu and never handed out: every
 		// reader copies the records it returns. Keep it that way.

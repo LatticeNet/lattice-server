@@ -165,6 +165,10 @@ func TestAReopeningOwesTheOpenToARuleThatMissedTheLastOne(t *testing.T) {
 
 	d.h.clock.advance(time.Minute)
 	d.resolve("a")
+	// Only the outbox knows night missed it: the record owes it nothing.
+	if inc := d.h.incident(EventAgentStalled, "a"); len(inc.OwedOpenRules) != 0 {
+		t.Fatalf("after the resolve: %+v", inc)
+	}
 	d.h.clock.advance(time.Second)
 	if reopened := d.raise("a"); reopened != id {
 		t.Fatalf("reopened as %s, want the same record %s", reopened, id)
@@ -281,16 +285,7 @@ func TestARecoveryLeavesOutAnOwedRuleTheOutboxForgot(t *testing.T) {
 	d.sweep()
 	d.expect("the debt held by the window")
 
-	// As if evicted: the withdrawn copy no longer names the incident.
-	rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{ChannelID: "nc-night", Outcome: store.NotifyOutcomeSuppressed})
-	if len(rows) != 1 || rows[0].Reason != notifyWithdrawnOpen {
-		t.Fatalf("withdrawn rows = %+v", rows)
-	}
-	row := rows[0]
-	row.IncidentIDs = nil
-	if err := d.h.f.st.PutNotifyDelivery(row, nil); err != nil {
-		t.Fatal(err)
-	}
+	d.forgetWithdrawnCopy("nc-night")
 
 	d.h.clock.advance(time.Minute)
 	d.resolve("a")
@@ -329,4 +324,46 @@ func TestAnUnroutedRecoveryIsRecordedWhenARuleMissedTheOpen(t *testing.T) {
 	if rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeNoRoute, EventType: EventAgentRecovered}); len(rows) != 1 {
 		t.Fatalf("unrouted recovery rows = %+v", rows)
 	}
+}
+
+// forgetWithdrawnCopy makes channelID's withdrawn copy of the open stop
+// naming its incident, as if the bounded outbox had evicted it.
+func (d *dayNight) forgetWithdrawnCopy(channelID string) {
+	d.t.Helper()
+	rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{ChannelID: channelID, Outcome: store.NotifyOutcomeSuppressed})
+	if len(rows) != 1 || rows[0].Reason != notifyWithdrawnOpen {
+		d.t.Fatalf("withdrawn rows on %s = %+v", channelID, rows)
+	}
+	row := rows[0]
+	row.IncidentIDs = nil
+	if err := d.h.f.st.PutNotifyDelivery(row, nil); err != nil {
+		d.t.Fatal(err)
+	}
+}
+
+// A reopening owes the open to a rule the record still listed as owed when
+// the incident resolved, even when the outbox no longer holds the withdrawn
+// copy: only the record knows night never heard it.
+func TestAReopeningOwesTheOpenToAnOwedRuleTheOutboxForgot(t *testing.T) {
+	d := newDayNight(t, "a")
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("withdrawn")
+	post("/api/incidents/unack", id) // owes night; no sweep pays it before the resolve
+	d.forgetWithdrawnCopy("nc-night")
+
+	d.h.clock.advance(time.Minute)
+	d.resolve("a")
+	if inc := d.h.incident(EventAgentStalled, "a"); strings.Join(inc.OwedOpenRules, ",") != "nr-night" {
+		t.Fatalf("after the resolve: %+v", inc)
+	}
+	d.h.clock.advance(time.Second)
+	if reopened := d.raise("a"); reopened != id {
+		t.Fatalf("reopened as %s, want the same record %s", reopened, id)
+	}
+	d.expect("the reopening", "nc-night Agent loop stalled: name-a")
+	d.sweep()
+	d.expect("the next sweep")
 }

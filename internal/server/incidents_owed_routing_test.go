@@ -118,11 +118,15 @@ func TestARecoveryIsNotSentToARuleStillOwedTheOpen(t *testing.T) {
 
 	d.h.clock.advance(time.Minute)
 	d.resolve("a")
-	if inc := d.h.incident(EventAgentStalled, "a"); inc.OwedOpen || len(inc.OwedOpenRules) != 0 || inc.AckCancelledOpen {
-		t.Fatalf("an open is still owed after the resolve: %+v", inc)
+	// Night is kept on the record only to be left out of the recovery.
+	if inc := d.h.incident(EventAgentStalled, "a"); inc.OwedOpen || inc.AckCancelledOpen || !inc.OwedRecovery || strings.Join(inc.OwedOpenRules, ",") != "nr-night" {
+		t.Fatalf("after the resolve: %+v", inc)
 	}
 	d.sweep()
 	d.expect("the recovery", "nc-day Agent loop recovered: name-a")
+	if inc := d.h.incident(EventAgentStalled, "a"); inc.OwedRecovery || len(inc.OwedOpenRules) != 0 {
+		t.Fatalf("after the recovery: %+v", inc)
+	}
 	d.sweep()
 	d.expect("the next sweep")
 }
@@ -254,4 +258,45 @@ func TestARecoveryReachesARuleThatDeliveredOneCopy(t *testing.T) {
 	d.resolve("a")
 	d.sweep()
 	d.expect("the recovery", "nc-day Agent loop recovered: name-a", "nc-night Agent loop recovered: name-a", "nc-night2 Agent loop recovered: name-a")
+}
+
+// A rule still owed the open when the incident resolves is left out of the
+// recovery even when the outbox no longer holds the withdrawn copy that
+// explains why (the outbox is bounded and evicts old rows): the record keeps
+// the rule until the recovery goes out.
+func TestARecoveryLeavesOutAnOwedRuleTheOutboxForgot(t *testing.T) {
+	d := newDayNight(t, "a")
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("withdrawn")
+	if err := d.h.f.st.PutMaintenanceWindow(store.MaintenanceWindow{
+		ID: "mw-1", Name: "kernel upgrade", NodeIDs: []string{"a"},
+		StartsAt: d.h.now(), EndsAt: d.h.now().Add(time.Hour), CreatedAt: d.h.now(),
+	}, d.h.now()); err != nil {
+		t.Fatal(err)
+	}
+	post("/api/incidents/unack", id)
+	d.sweep()
+	d.expect("the debt held by the window")
+
+	// As if evicted: the withdrawn copy no longer names the incident.
+	rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{ChannelID: "nc-night", Outcome: store.NotifyOutcomeSuppressed})
+	if len(rows) != 1 || rows[0].Reason != notifyWithdrawnOpen {
+		t.Fatalf("withdrawn rows = %+v", rows)
+	}
+	row := rows[0]
+	row.IncidentIDs = nil
+	if err := d.h.f.st.PutNotifyDelivery(row, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	d.h.clock.advance(time.Minute)
+	d.resolve("a")
+	d.sweep()
+	d.expect("the recovery", "nc-day Agent loop recovered: name-a")
+	if inc := d.h.incident(EventAgentStalled, "a"); inc.OwedRecovery || len(inc.OwedOpenRules) != 0 {
+		t.Fatalf("after the recovery: %+v", inc)
+	}
 }

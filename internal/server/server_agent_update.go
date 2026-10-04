@@ -1739,15 +1739,27 @@ func agentUpdateDownloadStep(source string, withFallback bool) string {
 // wget has no total time limit (not on the upstream path today either), so
 // its fallback keeps the per-operation timeouts. A failed fallback exits with
 // the fetch's own status under set -e, as a failed single download does.
+//
+// The clock only sizes the fallback, so it must never stop a download: a
+// missing date or one without %s reads as 0, and an unreadable or backwards
+// clock gives the fallback the budget less one connect timeout, which is what
+// the connect failure it exists for leaves. The fallback may not follow a
+// redirect off HTTPS; --proto already refuses that, and --proto-redir says so
+// on the command itself.
 func agentUpdateDownloadWithFallback(controlPlaneCurl, controlPlaneWget string) string {
-	fallbackCurl := "curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout " + agentFetchConnectSec +
+	fallbackCurl := "curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout " + agentFetchConnectSec +
 		" --max-time \"$FETCH_LEFT\" -o \"$CANDIDATE\" \"$FALLBACK_URL\""
 	fallbackWget := "wget --https-only -q" + agentFetchWgetTimeouts + " -O \"$CANDIDATE\" \"$FALLBACK_URL\""
-	return "FETCH_START=$(date +%s)\n" +
+	unknownLeft := "FETCH_LEFT=$((" + agentFetchBudgetSec + " - " + agentFetchConnectSec + "))"
+	return "FETCH_START=$(date +%s 2>/dev/null || echo 0)\n" +
 		"if command -v curl >/dev/null 2>&1; then\n" +
 		"  if ! " + controlPlaneCurl + "; then\n" +
-		"    FETCH_NOW=$(date +%s)\n" +
-		"    FETCH_LEFT=$((" + agentFetchBudgetSec + " - ($FETCH_NOW - $FETCH_START)))\n" +
+		"    FETCH_NOW=$(date +%s 2>/dev/null || echo 0)\n" +
+		"    case \"$FETCH_START:$FETCH_NOW\" in\n" +
+		"      0:*|*:0|:*|*:|*[!0-9:]*) " + unknownLeft + " ;;\n" +
+		"      *) FETCH_LEFT=$((" + agentFetchBudgetSec + " - ($FETCH_NOW - $FETCH_START))) ;;\n" +
+		"    esac\n" +
+		"    if [ \"$FETCH_LEFT\" -gt " + agentFetchBudgetSec + " ]; then " + unknownLeft + "; fi\n" +
 		"    rm -f \"$CANDIDATE\"\n" +
 		"    if [ \"$FETCH_LEFT\" -lt " + agentFetchConnectSec + " ]; then\n" +
 		"      echo \"lattice agent update: control-plane download failed with ${FETCH_LEFT}s of the " + agentFetchBudgetSec + " s download budget left; not falling back to $FALLBACK_URL\" >&2\n" +

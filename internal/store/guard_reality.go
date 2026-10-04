@@ -17,8 +17,25 @@ import (
 // request bytes, bearer credentials, stderr, key material, and secrets are
 // forbidden from this collection.
 type GuardRealitySnapshot struct {
-	Reality    model.GuardNodeReality `json:"reality"`
-	ReceivedAt time.Time              `json:"received_at"`
+	Reality model.GuardNodeReality `json:"reality"`
+	// EphemeralSockets are UDP sockets from the same report that the server
+	// read as a proxy core's client sockets rather than services, and so took
+	// out of Reality.Listeners. `ss -l` lists every unconnected UDP socket,
+	// and sing-box opens one per QUIC, hysteria or DNS dial on a port the
+	// kernel picks from its ephemeral range, so the set moves between
+	// reports. It rides along like the report clocks: kept so the console can
+	// still show it, and left out when deciding whether the facts changed.
+	EphemeralSockets []model.GuardListener `json:"ephemeral_sockets,omitempty"`
+	ReceivedAt       time.Time             `json:"received_at"`
+}
+
+// Sockets returns every socket the report listed, services and ephemeral
+// client sockets together. It answers "is anything bound on this port", which
+// is a different question from "does a service listen here".
+func (snapshot GuardRealitySnapshot) Sockets() []model.GuardListener {
+	out := make([]model.GuardListener, 0, len(snapshot.Reality.Listeners)+len(snapshot.EphemeralSockets))
+	out = append(out, snapshot.Reality.Listeners...)
+	return append(out, snapshot.EphemeralSockets...)
 }
 
 // ErrGuardRealityStale is returned when a write would replace a newer snapshot
@@ -39,8 +56,9 @@ var ErrGuardRealityDurabilityDegraded = errors.New("guard reality committed with
 // rewrite received_at; same collected_at plus different content is a conflict.
 //
 // A newer snapshot that reports the same facts as the stored one, differing
-// only in collected_at and the sshd observation time, replaces it in memory
-// without a write until the copy on disk is reportClockPersistInterval old.
+// only in collected_at, the sshd observation time and its ephemeral sockets,
+// replaces it in memory without a write until the copy on disk is
+// reportClockPersistInterval old.
 // Agents report every ten seconds and the facts rarely move; freshness is
 // judged against guardRealityStaleAfter, which is hours, so a restart that
 // resumes from a copy a few minutes old reads the same.
@@ -67,7 +85,7 @@ func (s *Store) UpsertGuardRealitySnapshot(nodeIdentityUUID string, snapshot Gua
 		case snapshot.Reality.CollectedAt.Before(existing.Reality.CollectedAt):
 			return existing, false, ErrGuardRealityStale
 		case snapshot.Reality.CollectedAt.Equal(existing.Reality.CollectedAt):
-			if reflect.DeepEqual(snapshot.Reality, existing.Reality) {
+			if sameGuardRealityReport(snapshot, existing) {
 				return existing, false, nil
 			}
 			return existing, false, ErrGuardRealityStale
@@ -99,8 +117,19 @@ func (s *Store) UpsertGuardRealitySnapshot(nodeIdentityUUID string, snapshot Gua
 	return cloneGuardRealitySnapshot(snapshot), true, nil
 }
 
+// sameGuardRealityReport reports whether two canonical snapshots carry the
+// same report, however the server split its sockets. A replayed report stays
+// idempotent even when the sing-box inventory moved in between and the same
+// socket was read as a service once and as a client socket the next time.
+func sameGuardRealityReport(a, b GuardRealitySnapshot) bool {
+	a.Reality.Listeners = canonicalGuardListeners(a.Sockets())
+	b.Reality.Listeners = canonicalGuardListeners(b.Sockets())
+	return reflect.DeepEqual(a.Reality, b.Reality)
+}
+
 // guardRealityFactsEqual compares two canonical snapshots with their clocks
 // cleared: collected_at and the sshd observation time move on every poll.
+// Ephemeral sockets live outside Reality, so they never reach this compare.
 func guardRealityFactsEqual(a, b model.GuardNodeReality) bool {
 	a.CollectedAt, b.CollectedAt = time.Time{}, time.Time{}
 	if a.SSHD != nil {
@@ -145,6 +174,7 @@ func (s *Store) GuardRealitySnapshots() []GuardRealitySnapshot {
 
 func cloneGuardRealitySnapshot(snapshot GuardRealitySnapshot) GuardRealitySnapshot {
 	snapshot.Reality.Listeners = append([]model.GuardListener(nil), snapshot.Reality.Listeners...)
+	snapshot.EphemeralSockets = append([]model.GuardListener(nil), snapshot.EphemeralSockets...)
 	if snapshot.Reality.Interfaces != nil {
 		interfaces := make([]model.GuardInterface, len(snapshot.Reality.Interfaces))
 		for i, iface := range snapshot.Reality.Interfaces {
@@ -165,23 +195,8 @@ func cloneGuardRealitySnapshot(snapshot GuardRealitySnapshot) GuardRealitySnapsh
 
 func canonicalizeGuardRealitySnapshot(snapshot GuardRealitySnapshot) GuardRealitySnapshot {
 	snapshot = cloneGuardRealitySnapshot(snapshot)
-	if len(snapshot.Reality.Listeners) == 0 {
-		snapshot.Reality.Listeners = nil
-	} else {
-		sort.Slice(snapshot.Reality.Listeners, func(i, j int) bool {
-			a, b := snapshot.Reality.Listeners[i], snapshot.Reality.Listeners[j]
-			if a.Protocol != b.Protocol {
-				return a.Protocol < b.Protocol
-			}
-			if a.Port != b.Port {
-				return a.Port < b.Port
-			}
-			if a.Address != b.Address {
-				return a.Address < b.Address
-			}
-			return a.Process < b.Process
-		})
-	}
+	snapshot.Reality.Listeners = canonicalGuardListeners(snapshot.Reality.Listeners)
+	snapshot.EphemeralSockets = canonicalGuardListeners(snapshot.EphemeralSockets)
 	if len(snapshot.Reality.Interfaces) == 0 {
 		snapshot.Reality.Interfaces = nil
 	} else {
@@ -222,4 +237,26 @@ func canonicalizeGuardRealitySnapshot(snapshot GuardRealitySnapshot) GuardRealit
 		}
 	}
 	return snapshot
+}
+
+// canonicalGuardListeners sorts a listener set in place into the order every
+// compare in this file relies on, and returns nil for an empty one.
+func canonicalGuardListeners(listeners []model.GuardListener) []model.GuardListener {
+	if len(listeners) == 0 {
+		return nil
+	}
+	sort.Slice(listeners, func(i, j int) bool {
+		a, b := listeners[i], listeners[j]
+		if a.Protocol != b.Protocol {
+			return a.Protocol < b.Protocol
+		}
+		if a.Port != b.Port {
+			return a.Port < b.Port
+		}
+		if a.Address != b.Address {
+			return a.Address < b.Address
+		}
+		return a.Process < b.Process
+	})
+	return listeners
 }

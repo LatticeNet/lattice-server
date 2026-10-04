@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -439,6 +440,103 @@ func TestGuardRealityClockFlushesOnInterval(t *testing.T) {
 	got, _ := reopenReportClockStore(t, s, path).GuardRealitySnapshot("node-a")
 	if !got.ReceivedAt.Equal(due.ReceivedAt) || !got.Reality.CollectedAt.Equal(due.Reality.CollectedAt) {
 		t.Fatalf("disk holds %s / %s, want %s / %s", got.ReceivedAt, got.Reality.CollectedAt, due.ReceivedAt, due.Reality.CollectedAt)
+	}
+}
+
+// clientSockets is a set of sing-box client UDP sockets as one report lists
+// them; seed picks the ports, so two seeds are two different sets.
+func clientSockets(seed int) []model.GuardListener {
+	return []model.GuardListener{
+		{Protocol: "udp", Port: 32768 + seed*977%28000, Address: "::", Process: "sing-box"},
+		{Protocol: "udp", Port: 32768 + (seed*977+13001)%28000, Address: "::", Process: "sing-box"},
+	}
+}
+
+// Production, 2026-10-04: 176 of 209 state writes in an hour were guard
+// reality reports whose only difference was the set of sing-box client UDP
+// sockets. Those sockets ride along like the clocks: a report that moves only
+// them is taken in memory and written with the next real change, which still
+// writes at once.
+func TestGuardRealityEphemeralSocketChurnDoesNotPersist(t *testing.T) {
+	s, path := openReportClockStore(t)
+	if err := s.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "generation-a"}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 10, 4, 9, 0, 0, 0, time.UTC)
+	first := guardRealityFixture("node-a", base)
+	first.EphemeralSockets = clientSockets(0)
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", first); err != nil {
+		t.Fatal(err)
+	}
+	before := s.testPersistCalls
+	var last GuardRealitySnapshot
+	for i := 1; i <= 60; i++ {
+		last = steadyGuardReality(first, base.Add(time.Duration(i)*10*time.Second))
+		last.EphemeralSockets = clientSockets(i)
+		if i%7 == 0 {
+			last.EphemeralSockets = nil // every client socket closed
+		}
+		if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", last); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls := s.testPersistCalls - before; calls != 0 {
+		t.Fatalf("60 reports that moved only client sockets persisted %d times, want 0", calls)
+	}
+	got, _ := s.GuardRealitySnapshot("node-a")
+	if !reflect.DeepEqual(got.EphemeralSockets, canonicalGuardListeners(clientSockets(60))) {
+		t.Fatalf("memory holds client sockets %+v, want the newest report's", got.EphemeralSockets)
+	}
+
+	// A new listener is a fact and is written at once, carrying the client
+	// sockets of the same report with it.
+	withService := steadyGuardReality(first, base.Add(11*time.Minute))
+	withService.Reality.Listeners = append([]model.GuardListener{{Protocol: "tcp", Port: 8080, Process: "nginx"}}, first.Reality.Listeners...)
+	withService.EphemeralSockets = clientSockets(61)
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", withService); err != nil {
+		t.Fatal(err)
+	}
+	if calls := s.testPersistCalls - before; calls != 1 {
+		t.Fatalf("a new listener persisted %d times, want 1", calls)
+	}
+	got, _ = reopenReportClockStore(t, s, path).GuardRealitySnapshot("node-a")
+	if len(got.Reality.Listeners) != 2 || !reflect.DeepEqual(got.EphemeralSockets, canonicalGuardListeners(clientSockets(61))) {
+		t.Fatalf("disk holds listeners %+v and client sockets %+v", got.Reality.Listeners, got.EphemeralSockets)
+	}
+}
+
+// The same report sent twice is idempotent even when the server split its
+// sockets differently the second time, as it does when the sing-box inventory
+// changed in between. A different report at the same instant still conflicts.
+func TestGuardRealityReplayIgnoresHowSocketsWereSplit(t *testing.T) {
+	s, _ := openReportClockStore(t)
+	if err := s.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "generation-a"}); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 4, 9, 0, 0, 0, time.UTC)
+	inbound := model.GuardListener{Protocol: "udp", Port: 50000, Address: "::", Process: "sing-box"}
+	first := guardRealityFixture("node-a", at)
+	first.Reality.Listeners = append(first.Reality.Listeners, inbound)
+	first.EphemeralSockets = clientSockets(1)
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", first); err != nil {
+		t.Fatal(err)
+	}
+	before := s.testPersistCalls
+
+	replay := guardRealityFixture("node-a", at)
+	replay.EphemeralSockets = append(clientSockets(1), inbound)
+	if _, changed, err := s.UpsertGuardRealitySnapshot("generation-a", replay); err != nil || changed {
+		t.Fatalf("replay split differently: changed=%v err=%v, want idempotent", changed, err)
+	}
+	if calls := s.testPersistCalls - before; calls != 0 {
+		t.Fatalf("replay persisted %d times", calls)
+	}
+
+	different := guardRealityFixture("node-a", at)
+	different.Reality.Listeners = append(different.Reality.Listeners, inbound)
+	different.EphemeralSockets = clientSockets(2)
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", different); err != ErrGuardRealityStale {
+		t.Fatalf("different sockets at the same instant: err=%v, want ErrGuardRealityStale", err)
 	}
 }
 

@@ -810,6 +810,7 @@ func New(opts Options) (*Server, error) {
 		s.startShareFetchStatsFlush()
 		s.startLineClientTemplateSync()
 		s.startLatencyProbeSync()
+		s.startStateWriteSummary()
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()

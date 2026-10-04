@@ -25,6 +25,9 @@ type Registry struct {
 	httpSlow         map[string]uint64
 	agent            map[httpKey]*durationStats
 	pluginSystemPool PluginSystemPoolSnapshot
+	// saveWindow counts writes by caller since the last TakeStoreSaveSummary.
+	// Its keys are the bounded caller labels, so it is bounded the same way.
+	saveWindow map[string]uint64
 }
 
 type durationStats struct {
@@ -55,6 +58,7 @@ func NewRegistry() *Registry {
 		started:      time.Now(),
 		store:        map[string]*durationStats{},
 		storeCallers: map[string]*durationStats{},
+		saveWindow:   map[string]uint64{},
 		audit:        map[string]uint64{},
 		http:         map[httpKey]*durationStats{},
 		httpSlow:     map[string]uint64{},
@@ -184,6 +188,75 @@ func (r *Registry) ObserveStoreSave(caller string, d time.Duration, err error) {
 		caller = StoreCallerOther
 	}
 	observeDuration(r.storeCallers, caller, d)
+	r.saveWindow[caller]++
+}
+
+// storeSaveSummaryTop bounds the summary line: it names the callers with the
+// most writes and folds the rest into one count.
+const storeSaveSummaryTop = 6
+
+// TakeStoreSaveSummary returns one log line counting the state writes since
+// the previous call, by caller, and starts a new window. elapsed is how long
+// the window ran. It returns false when nothing was written, so a quiet server
+// logs nothing. The cumulative /metrics counters do not reset with it.
+func TakeStoreSaveSummary(elapsed time.Duration) (string, bool) {
+	return defaultRegistry.TakeStoreSaveSummary(elapsed)
+}
+
+func (r *Registry) TakeStoreSaveSummary(elapsed time.Duration) (string, bool) {
+	r.mu.Lock()
+	window := r.saveWindow
+	r.saveWindow = map[string]uint64{}
+	r.mu.Unlock()
+	return formatStoreSaveSummary(window, elapsed, storeSaveSummaryTop)
+}
+
+// formatStoreSaveSummary renders a window as
+// "state writes in the last 60m: 96 (UpdateMetrics 60, UpsertDDNSProfile 12, ...)",
+// busiest caller first, ties by name. Past top callers the rest fold into
+// "N more callers M", so the line stays short however many callers wrote.
+func formatStoreSaveSummary(window map[string]uint64, elapsed time.Duration, top int) (string, bool) {
+	type callerCount struct {
+		caller string
+		n      uint64
+	}
+	var total uint64
+	counts := make([]callerCount, 0, len(window))
+	for caller, n := range window {
+		total += n
+		counts = append(counts, callerCount{caller, n})
+	}
+	if total == 0 {
+		return "", false
+	}
+	sort.Slice(counts, func(i, j int) bool {
+		if counts[i].n != counts[j].n {
+			return counts[i].n > counts[j].n
+		}
+		return counts[i].caller < counts[j].caller
+	})
+	named, folded := counts, []callerCount(nil)
+	// Folding a single caller would say less than naming it.
+	if len(counts) > top+1 {
+		named, folded = counts[:top], counts[top:]
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "state writes in the last %dm: %d (", int64(elapsed.Round(time.Minute)/time.Minute), total)
+	for i, c := range named {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s %d", c.caller, c.n)
+	}
+	if len(folded) > 0 {
+		var rest uint64
+		for _, c := range folded {
+			rest += c.n
+		}
+		fmt.Fprintf(&b, ", %d more callers %d", len(folded), rest)
+	}
+	b.WriteString(")")
+	return b.String(), true
 }
 
 func (r *Registry) Reset() {
@@ -192,6 +265,7 @@ func (r *Registry) Reset() {
 	r.started = time.Now()
 	r.store = map[string]*durationStats{}
 	r.storeCallers = map[string]*durationStats{}
+	r.saveWindow = map[string]uint64{}
 	r.audit = map[string]uint64{}
 	r.http = map[httpKey]*durationStats{}
 	r.httpSlow = map[string]uint64{}

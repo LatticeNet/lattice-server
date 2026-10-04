@@ -58,6 +58,11 @@ curl -H 'Authorization: Bearer opaque-prometheus-token' \
   http://127.0.0.1:8088/metrics
 ```
 
+Without the token, the server still logs its state file writes once an hour,
+counted by the store method that asked for each one, for example
+`state writes in the last 60m: 12 (UpdateMetrics 11, UpsertDDNSProfile 1)`.
+An hour with no writes logs nothing.
+
 Self-host DNS can optionally install a pinned CoreDNS executable during an
 approved `selfdns` apply. Leave these unset to keep the stricter precondition
 that `coredns` must already exist on the node:

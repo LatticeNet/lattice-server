@@ -255,27 +255,71 @@ func oweOpenTo(inc *store.Incident, ruleIDs []string) {
 	slices.Sort(inc.OwedOpenRules)
 }
 
-// rulesThatMissedOpen lists, sorted, the rules whose phones were never told
-// inc is down: the latest open message about inc through the rule is a copy
-// quiet hours held and then withdrew (the incident was acknowledged, snoozed
-// or resolved when they ended), and nothing has gone through the rule since.
-// A later copy still waiting to be sent counts as told, since the outbox
-// decides it when it falls due; so does a rule that never had a copy.
+// openReach is what one rule's latest open message about an incident did
+// with its copies, one per channel: whether quiet hours withdrew any of them,
+// and whether they withdrew all of them. A copy still waiting to be sent is
+// not withdrawn, since the outbox decides it when it falls due.
+type openReach struct{ anyWithdrawn, allWithdrawn bool }
+
+// latestOpenReach reads the outbox once and says, for each of incidentIDs
+// (incidents of event type kind) and each rule that carried an open message
+// about it, what the latest such message did. Its copies are the rows of
+// that one event through that rule; older messages are ignored, so a message
+// sent after a withdrawal answers it. A rule that never carried one is absent.
 //
 // yagni: read from the outbox, which is bounded. A withdrawal evicted before
-// it is read is not seen and its rule counts as told, which errs toward one
-// message too many rather than one too few. Recording each rule's last open
+// it is read is not seen; the debt itself is kept on the record
+// (OwedOpenRules) and does not depend on it. Recording each rule's last open
 // on the incident is the upgrade if that ever matters.
-func (s *Server) rulesThatMissedOpen(inc store.Incident) []string {
-	decided := map[string]bool{}
-	var out []string
-	for _, row := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{EventType: inc.Kind}) { // newest first
-		if row.RuleID == "" || decided[row.RuleID] || !slices.Contains(row.IncidentIDs, inc.ID) {
+func (s *Server) latestOpenReach(kind string, incidentIDs []string) map[string]map[string]openReach {
+	want := make(map[string]bool, len(incidentIDs))
+	for _, incidentID := range incidentIDs {
+		want[incidentID] = true
+	}
+	type key struct{ incident, rule string }
+	latest := map[key]string{} // the event id of the latest message
+	out := map[string]map[string]openReach{}
+	for _, row := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{EventType: kind}) { // newest first
+		if row.RuleID == "" {
 			continue
 		}
-		decided[row.RuleID] = true
-		if row.Outcome == store.NotifyOutcomeSuppressed && row.Reason == notifyWithdrawnOpen {
-			out = append(out, row.RuleID)
+		withdrawn := row.Outcome == store.NotifyOutcomeSuppressed && row.Reason == notifyWithdrawnOpen
+		for _, incidentID := range row.IncidentIDs {
+			if !want[incidentID] {
+				continue
+			}
+			k := key{incidentID, row.RuleID}
+			event, seen := latest[k]
+			switch {
+			case !seen:
+				latest[k] = row.EventID
+				if out[incidentID] == nil {
+					out[incidentID] = map[string]openReach{}
+				}
+				out[incidentID][row.RuleID] = openReach{anyWithdrawn: withdrawn, allWithdrawn: withdrawn}
+			case event == row.EventID:
+				r := out[incidentID][row.RuleID]
+				r.anyWithdrawn = r.anyWithdrawn || withdrawn
+				r.allWithdrawn = r.allWithdrawn && withdrawn
+				out[incidentID][row.RuleID] = r
+			}
+		}
+	}
+	return out
+}
+
+// rulesThatMissedOpen lists, sorted, the rules owed inc's open because their
+// phones may never have been told it is down: quiet hours withdrew a copy of
+// the latest open message through the rule (the incident was acknowledged,
+// snoozed or resolved when they ended). One withdrawn copy is enough, so a
+// channel of the rule that did deliver it may hear it twice, the side an
+// alert errs on. A recovery is held back only from a rule that missed every
+// copy (sendRecoveries).
+func (s *Server) rulesThatMissedOpen(inc store.Incident) []string {
+	var out []string
+	for ruleID, r := range s.latestOpenReach(inc.Kind, []string{inc.ID})[inc.ID] {
+		if r.anyWithdrawn {
+			out = append(out, ruleID)
 		}
 	}
 	slices.Sort(out)
@@ -399,7 +443,6 @@ func (s *Server) evaluateIncidents(now time.Time) {
 	opens := map[string][]incidentOutgoing{}
 	ruleOpens := map[string]map[string][]incidentOutgoing{} // rule id, then event type
 	recoveries := map[string][]incidentOutgoing{}
-	recoveryMissed := map[string][]string{} // incident id, then the rules that missed its open
 	var changed []store.Incident
 	var gone []string
 	var suppressed []store.NotifyDelivery
@@ -532,10 +575,6 @@ func (s *Server) evaluateIncidents(now time.Time) {
 					sortKey:    incidentSortKey(inc),
 					msg:        incidentMessage{title: title, detail: inc.RecoveryDetail, line: line},
 				})
-				// A rule that never heard it was down is not told it is up.
-				if missed := s.rulesThatMissedOpen(inc); len(missed) > 0 {
-					recoveryMissed[inc.ID] = missed
-				}
 				inc.OwedRecovery = false
 				inc.Notified, inc.NotifiedAt = store.IncidentNotifiedResolved, now
 				inc.Suppressed, inc.SuppressedAt = "", time.Time{}
@@ -568,7 +607,7 @@ func (s *Server) evaluateIncidents(now time.Time) {
 	}
 	s.sendRuleOpens(ruleOpens)
 	for _, kind := range sortedMapKeys(recoveries) {
-		s.sendRecoveries(kind, recoveries[kind], recoveryMissed)
+		s.sendRecoveries(kind, recoveries[kind])
 	}
 	for _, inc := range s.escalateIncidents(escalating, now) {
 		if i, ok := idx[inc.ID]; ok {
@@ -663,15 +702,35 @@ func (s *Server) sendRuleOpens(byRule map[string]map[string][]incidentOutgoing) 
 
 // sendRecoveries sends one recovery message for every item of one event type
 // through every rule, except that a rule is not told an incident recovered
-// when it never heard the incident was down (missed, from
-// rulesThatMissedOpen). Then each rule that routes the event type gets its
-// own message, through it alone, without the incidents it missed, and a rule
-// that missed them all gets none. A recovery quiet hours hold is judged
-// again when it falls due (heldIncidentWithdrawal). With no rule enabled at
-// all, every channel gets the whole message, as for any event.
-func (s *Server) sendRecoveries(eventType string, items []incidentOutgoing, missed map[string][]string) {
+// when quiet hours withdrew every copy of the incident's latest open through
+// it: it never heard the incident was down. A rule with one copy delivered
+// is told, so no channel that heard "down" is left without "up". When any
+// rule missed one, each rule that routes the event type gets its own
+// message, through it alone, without the incidents it missed, and a rule
+// that missed them all gets none. One outbox read decides for every item. A
+// recovery quiet hours hold is judged again when it falls due
+// (heldIncidentWithdrawal). With no rule enabled at all, every channel gets
+// the whole message, as for any event.
+func (s *Server) sendRecoveries(eventType string, items []incidentOutgoing) {
+	if len(items) == 0 {
+		return
+	}
 	rules := s.store.EnabledNotifyRules()
-	if len(rules) == 0 || !slices.ContainsFunc(items, func(item incidentOutgoing) bool { return len(missed[item.incidentID]) > 0 }) {
+	missed := map[string][]string{} // incident id, then the rules that missed its open
+	if len(rules) > 0 {
+		ids := make([]string, len(items))
+		for i, item := range items {
+			ids[i] = item.incidentID
+		}
+		for incidentID, byRule := range s.latestOpenReach(incidentRecoveryOf[eventType], ids) {
+			for ruleID, r := range byRule {
+				if r.allWithdrawn {
+					missed[incidentID] = append(missed[incidentID], ruleID)
+				}
+			}
+		}
+	}
+	if len(missed) == 0 {
 		s.sendIncidentMessages(eventType, items)
 		return
 	}

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -200,4 +201,57 @@ func TestAcknowledgingTwiceAuditsOnce(t *testing.T) {
 	if audits != 1 {
 		t.Fatalf("incident.ack audited %d times, want 1", audits)
 	}
+}
+
+// splitNight gives night a second channel and opens a stalled agent on a
+// inside quiet hours, acknowledges it, ends quiet hours (both night copies
+// withdrawn), then marks the nc-night2 copy delivered, as when an undo lands
+// between the outbox settling the two copies.
+func splitNight(t *testing.T) (*dayNight, func(path, incidentID string) (int, incidentView), string) {
+	t.Helper()
+	d := newDayNight(t, "a")
+	addNotifyChannel(t, d.h.f.st, "nc-night2", "Bark night 2")
+	quiet := &store.NotifyQuietHours{Start: d.start.Add(-time.Hour).Format("15:04"), End: d.start.Add(time.Hour).Format("15:04"), TimeZone: "UTC"}
+	if err := d.h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-night", Name: "night", EventTypes: []string{EventAgentStalled, EventAgentRecovered},
+		ChannelIDs: []string{"nc-night", "nc-night2"}, Enabled: true}, store.NotifyRuleOptions{QuietHours: quiet}); err != nil {
+		t.Fatal(err)
+	}
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("both night copies withdrawn")
+	rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{ChannelID: "nc-night2", Outcome: store.NotifyOutcomeSuppressed})
+	if len(rows) != 1 || rows[0].Reason != notifyWithdrawnOpen {
+		t.Fatalf("nc-night2 rows = %+v", rows)
+	}
+	row := rows[0]
+	row.Outcome, row.Reason = store.NotifyOutcomeSent, ""
+	if err := d.h.f.st.PutNotifyDelivery(row, nil); err != nil {
+		t.Fatal(err)
+	}
+	d.h.clock.advance(time.Minute)
+	return d, post, id
+}
+
+// When one copy of night's open was withdrawn and the other delivered, an
+// undo owes night the open: one of its phones never heard it. The channel
+// that did hears it twice, the side an alert errs on.
+func TestUndoOwesTheOpenToARuleThatLostOneCopy(t *testing.T) {
+	d, post, id := splitNight(t)
+	post("/api/incidents/unack", id)
+	if inc := d.h.incident(EventAgentStalled, "a"); strings.Join(inc.OwedOpenRules, ",") != "nr-night" {
+		t.Fatalf("owed after the undo: %+v", inc)
+	}
+	d.sweep()
+	d.expect("after the undo", "nc-night Agent loop stalled: name-a", "nc-night2 Agent loop stalled: name-a")
+}
+
+// When one copy of night's open was delivered, night is told the recovery:
+// the channel that heard "down" must hear "up".
+func TestARecoveryReachesARuleThatDeliveredOneCopy(t *testing.T) {
+	d, _, _ := splitNight(t)
+	d.resolve("a")
+	d.sweep()
+	d.expect("the recovery", "nc-day Agent loop recovered: name-a", "nc-night Agent loop recovered: name-a", "nc-night2 Agent loop recovered: name-a")
 }

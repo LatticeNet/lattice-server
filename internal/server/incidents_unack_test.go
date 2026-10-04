@@ -223,9 +223,9 @@ func TestUnacknowledgeRefusesAClosedIncident(t *testing.T) {
 	}
 }
 
-// dayNight routes agent.stalled through the real outbox by two rules: night
-// has quiet hours from an hour before the harness clock to an hour after it,
-// and day has none.
+// dayNight routes agent.stalled and agent.recovered through the real outbox
+// by two rules: night has quiet hours from an hour before the harness clock
+// to an hour after it, and day has none.
 type dayNight struct {
 	t     *testing.T
 	h     *incidentHarness
@@ -248,11 +248,11 @@ func newDayNight(t *testing.T, nodeIDs ...string) *dayNight {
 	addNotifyChannel(t, h.f.st, "nc-night", "Bark night")
 	addNotifyChannel(t, h.f.st, "nc-day", "Bark day")
 	quiet := &store.NotifyQuietHours{Start: d.start.Add(-time.Hour).Format("15:04"), End: d.start.Add(time.Hour).Format("15:04"), TimeZone: "UTC"}
-	if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-night", Name: "night", EventTypes: []string{EventAgentStalled}, ChannelIDs: []string{"nc-night"}, Enabled: true},
+	if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-night", Name: "night", EventTypes: []string{EventAgentStalled, EventAgentRecovered}, ChannelIDs: []string{"nc-night"}, Enabled: true},
 		store.NotifyRuleOptions{QuietHours: quiet}); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-day", Name: "day", EventTypes: []string{EventAgentStalled}, ChannelIDs: []string{"nc-day"}, Enabled: true},
+	if err := h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-day", Name: "day", EventTypes: []string{EventAgentStalled, EventAgentRecovered}, ChannelIDs: []string{"nc-day"}, Enabled: true},
 		store.NotifyRuleOptions{}); err != nil {
 		t.Fatal(err)
 	}

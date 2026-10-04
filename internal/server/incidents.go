@@ -397,6 +397,7 @@ func (s *Server) evaluateIncidents(now time.Time) {
 	opens := map[string][]incidentOutgoing{}
 	ruleOpens := map[string]map[string][]incidentOutgoing{} // rule id, then event type
 	recoveries := map[string][]incidentOutgoing{}
+	recoveryMissed := map[string][]string{} // incident id, then the rules that missed its open
 	var changed []store.Incident
 	var gone []string
 	var suppressed []store.NotifyDelivery
@@ -529,6 +530,10 @@ func (s *Server) evaluateIncidents(now time.Time) {
 					sortKey:    incidentSortKey(inc),
 					msg:        incidentMessage{title: title, detail: inc.RecoveryDetail, line: line},
 				})
+				// A rule that never heard it was down is not told it is up.
+				if missed := s.rulesThatMissedOpen(inc); len(missed) > 0 {
+					recoveryMissed[inc.ID] = missed
+				}
 				inc.OwedRecovery = false
 				inc.Notified, inc.NotifiedAt = store.IncidentNotifiedResolved, now
 				inc.Suppressed, inc.SuppressedAt = "", time.Time{}
@@ -561,7 +566,7 @@ func (s *Server) evaluateIncidents(now time.Time) {
 	}
 	s.sendRuleOpens(ruleOpens)
 	for _, kind := range sortedMapKeys(recoveries) {
-		s.sendIncidentMessages(kind, recoveries[kind])
+		s.sendRecoveries(kind, recoveries[kind], recoveryMissed)
 	}
 	for _, inc := range s.escalateIncidents(escalating, now) {
 		if i, ok := idx[inc.ID]; ok {
@@ -651,6 +656,39 @@ func (s *Server) sendRuleOpens(byRule map[string]map[string][]incidentOutgoing) 
 			s.commitNotifyPlan(s.planNotifyEvent(kind, title, body,
 				notifyEnqueue{source: store.NotifySourceServer, onlyRule: &rule, incidentIDs: ids}))
 		}
+	}
+}
+
+// sendRecoveries sends one recovery message for every item of one event type
+// through every rule, except that a rule is not told an incident recovered
+// when it never heard the incident was down (missed, from
+// rulesThatMissedOpen). Then each rule that routes the event type gets its
+// own message, through it alone, without the incidents it missed, and a rule
+// that missed them all gets none. A recovery quiet hours hold is judged
+// again when it falls due (heldIncidentWithdrawal). With no rule enabled at
+// all, every channel gets the whole message, as for any event.
+func (s *Server) sendRecoveries(eventType string, items []incidentOutgoing, missed map[string][]string) {
+	rules := s.store.EnabledNotifyRules()
+	if len(rules) == 0 || !slices.ContainsFunc(items, func(item incidentOutgoing) bool { return len(missed[item.incidentID]) > 0 }) {
+		s.sendIncidentMessages(eventType, items)
+		return
+	}
+	for _, rule := range rules {
+		if !notifyRuleMatches(rule, eventType) {
+			continue
+		}
+		var told []incidentOutgoing
+		for _, item := range items {
+			if !slices.Contains(missed[item.incidentID], rule.ID) {
+				told = append(told, item)
+			}
+		}
+		if len(told) == 0 {
+			continue
+		}
+		title, body, ids := incidentNotice(eventType, told)
+		s.commitNotifyPlan(s.planNotifyEvent(eventType, title, body,
+			notifyEnqueue{source: store.NotifySourceServer, onlyRule: &rule, incidentIDs: ids}))
 	}
 }
 

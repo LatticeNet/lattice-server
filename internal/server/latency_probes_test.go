@@ -580,3 +580,27 @@ func TestLatencyProbeSyncStopsOnClose(t *testing.T) {
 		t.Fatalf("the sweep ran %d more times after Close", got-stopped)
 	}
 }
+
+// The default source matches the node id as well as the name. Production
+// enrolled cd-hs-sh with that id and the display name [cd]-huoshan-shanghai,
+// and a name-only match left the unsaved defaults with no source at all.
+func TestLatencyDefaultSourceMatchesIDOrName(t *testing.T) {
+	cases := []struct {
+		name  string
+		nodes []model.Node
+		want  []string
+	}{
+		{"by id", []model.Node{{ID: "cd-hs-sh", Name: "[cd]-huoshan-shanghai"}, {ID: "node-jp", Name: "jp"}}, []string{"cd-hs-sh"}},
+		{"by name", []model.Node{{ID: "node-sh", Name: "cd-hs-sh"}, {ID: "node-jp", Name: "jp"}}, []string{"node-sh"}},
+		{"both on one node", []model.Node{{ID: "cd-hs-sh", Name: "CD-HS-SH"}}, []string{"cd-hs-sh"}},
+		{"neither", []model.Node{{ID: "node-sh", Name: "[cd]-huoshan-shanghai"}}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := defaultLatencyProbeConfig(tc.nodes).Sources
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("sources = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

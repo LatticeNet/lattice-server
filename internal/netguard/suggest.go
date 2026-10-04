@@ -29,7 +29,7 @@ type SuggestInput struct {
 	Groups  []model.SecurityGroup
 	Zones   map[string]model.GuardZone
 	Reality model.GuardNodeReality
-	// EphemeralSockets are the proxy core client sockets the server took out of
+	// EphemeralSockets are the client sockets the server took out of
 	// Reality.Listeners. They are not services, so none is reported as a
 	// listener missing an allow, but an allowed port with one bound is not
 	// called stale either: that check asks whether anything is bound there,

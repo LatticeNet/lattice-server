@@ -80,7 +80,7 @@ type guardRealitySummary struct {
 	ListenerCount     *int       `json:"listener_count,omitempty"`
 	InterfaceCount    *int       `json:"interface_count,omitempty"`
 	ForeignTableCount *int       `json:"foreign_table_count,omitempty"`
-	// EphemeralSocketCount is how many sing-box client sockets the report
+	// EphemeralSocketCount is how many client sockets the report
 	// listed beside its listeners (see splitEphemeralSockets). They are not
 	// in ListenerCount.
 	EphemeralSocketCount *int `json:"ephemeral_socket_count,omitempty"`
@@ -114,12 +114,12 @@ type guardRealityDetail struct {
 	// for. Empty with KnockGate set means the table is there and its scope
 	// is not known.
 	KnockGatedPorts []int `json:"knock_gated_ports,omitempty"`
-	// EphemeralSockets are the sing-box client sockets the report listed as
-	// listeners: UDP, on a port in the kernel's ephemeral range, and not a
-	// port any of the node's inbounds uses (see splitEphemeralSockets). They
-	// are not in Reality.Listeners because they are not services and do not
-	// count as exposure; they are here so nothing the node reported is
-	// hidden.
+	// EphemeralSockets are the client sockets the report listed as
+	// listeners: UDP, on a port in the kernel's ephemeral range, owned by a
+	// client-only program such as systemd-timesyncd, or by sing-box on a port
+	// none of the node's inbounds uses (see splitEphemeralSockets). They are
+	// not in Reality.Listeners because they are not services and do not count
+	// as exposure; they are here so nothing the node reported is hidden.
 	EphemeralSockets []model.GuardListener `json:"ephemeral_sockets,omitempty"`
 	// EphemeralSocketCount is len(EphemeralSockets), absent until the node
 	// has reported, as on the roster.

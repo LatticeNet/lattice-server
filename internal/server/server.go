@@ -522,7 +522,7 @@ type Server struct {
 	// arrive on the same kind of unattended poll and had the same effect.
 	guardRealityAuditMu sync.Mutex
 	guardRealityAudit   map[string]guardRealityAuditState
-	// ephemeralSockets follows how long each sing-box client socket has
+	// ephemeralSockets follows how long each client socket has
 	// stayed bound, to audit one that never goes away.
 	ephemeralSockets ephemeralSocketTracker
 

@@ -201,6 +201,9 @@ type persistentEphemeralSocket struct {
 type ephemeralSocketTracker struct {
 	mu    sync.Mutex
 	nodes map[string]map[ephemeralSocketKey]ephemeralSocketEpisode
+	// after overrides ephemeralPersistAfter when set. Only tests set it, so
+	// an HTTP test can cross the threshold in a few reports.
+	after time.Duration
 }
 
 // observe takes one accepted report's client sockets for a node and returns
@@ -235,7 +238,7 @@ func (t *ephemeralSocketTracker) observe(nodeID string, sockets []model.GuardLis
 	for _, socket := range sockets {
 		key := ephemeralSocketKey{protocol: socket.Protocol, port: socket.Port, address: socket.Address}
 		episode, ok := next[key]
-		if !ok || episode.audited || now.Sub(episode.firstSeen) < ephemeralPersistAfter {
+		if !ok || episode.audited || now.Sub(episode.firstSeen) < t.persistAfter() {
 			continue
 		}
 		episode.audited = true
@@ -247,6 +250,13 @@ func (t *ephemeralSocketTracker) observe(nodeID string, sockets []model.GuardLis
 	}
 	t.nodes[nodeID] = next
 	return due
+}
+
+func (t *ephemeralSocketTracker) persistAfter() time.Duration {
+	if t.after > 0 {
+		return t.after
+	}
+	return ephemeralPersistAfter
 }
 
 // forget drops a node's episodes (called on delete).

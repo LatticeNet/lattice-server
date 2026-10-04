@@ -127,18 +127,26 @@ type ephemeralTestReporter struct {
 	token   string
 	clock   *guardRealityTestClock
 	at      time.Time
+	// step is the time between reports, ten seconds when zero.
+	step time.Duration
+	// srv, when set, has the inventory placed in its mirror directly instead
+	// of posted, for tests that are not about the inventory route.
+	srv *Server
 }
 
 func (r *ephemeralTestReporter) report(listeners []model.GuardListener) {
 	r.t.Helper()
-	r.at = r.at.Add(10 * time.Second)
-	r.clock.Set(r.at)
-	inv, err := json.Marshal(map[string]any{"node_id": "node-a", "inventory": ephemeralTestInventory(r.at)})
-	if err != nil {
-		r.t.Fatal(err)
+	step := r.step
+	if step == 0 {
+		step = 10 * time.Second
 	}
-	if rec := doAgentRaw(r.t, r.handler, http.MethodPost, "/api/agent/singbox-inventory", string(inv), r.token); rec.Code != http.StatusOK {
-		r.t.Fatalf("inventory: %d %s", rec.Code, rec.Body.String())
+	r.at = r.at.Add(step)
+	r.clock.Set(r.at)
+	if r.srv != nil {
+		inv := ephemeralTestInventory(r.at)
+		setTestInventory(r.srv, &inv)
+	} else {
+		r.postInventory()
 	}
 	reality := model.GuardNodeReality{
 		NodeID:      "node-a",
@@ -176,7 +184,10 @@ func TestEphemeralClientSocketChurnDoesNotWriteState(t *testing.T) {
 	if rec := doAgentRaw(t, f.handler, http.MethodPost, "/api/agent/hello", `{"node_id":"node-a","version":"0.3.10"}`, token); rec.Code != http.StatusOK {
 		t.Fatalf("hello: %d %s", rec.Code, rec.Body.String())
 	}
-	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now()}
+	// Reports three seconds apart keep the agent token cache (10 s) warm; at
+	// ten seconds every request derives the token hash again, which is slow
+	// under -race and is not what this test measures.
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now(), step: 3 * time.Second}
 	services := []model.GuardListener{
 		{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"},
 		{Protocol: "tcp", Port: 443, Address: "::", Process: "sing-box"},
@@ -405,7 +416,11 @@ func TestPersistentEphemeralSocketAuditsWithoutWritingState(t *testing.T) {
 	f.srv.now = clock.Now
 	cookies, csrf := loginSession(t, f.handler)
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
-	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now()}
+	// Reports five seconds apart keep the agent token cache (10 s) warm, and a
+	// one minute threshold crosses in a dozen reports; the tracker tests pin
+	// the real ephemeralPersistAfter.
+	f.srv.ephemeralSockets.after = time.Minute
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now(), step: 5 * time.Second, srv: f.srv}
 	services := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
 	persistent := singBoxUDP(45678)
 	persistentAudits := func() []model.AuditEvent {
@@ -419,33 +434,41 @@ func TestPersistentEphemeralSocketAuditsWithoutWritingState(t *testing.T) {
 	}
 
 	writes := watchStateFile(t, f.statePath())
+	// The audit log is read only around the report that crosses the threshold:
+	// a full read per report made this test the slowest in the package under
+	// -race.
+	const binds, reports = 5, 25
+	due := binds + int(time.Minute/r.step)
 	var firstSeen time.Time
-	auditedAt := -1
-	// 45 minutes of reports; the persistent socket binds five minutes in, so
-	// its audit lands at 35 minutes, clear of the 15 minute clock flushes.
-	for i := 1; i <= 270; i++ {
+	for i := 1; i <= reports; i++ {
 		sockets := churningClientSockets(i)
-		if i >= 30 {
+		if i >= binds {
 			sockets = append(sockets, persistent)
 		}
 		r.report(withSockets(services, sockets...))
-		if i == 30 {
+		if i == binds {
 			firstSeen = r.at
 		}
 		wrote := writes.check()
-		if n := len(persistentAudits()); n == 1 && auditedAt < 0 {
-			auditedAt = i
-			if wrote {
-				t.Fatalf("the report that recorded the audit rewrote state")
+		switch i {
+		case due - 1:
+			if n := len(persistentAudits()); n != 0 {
+				t.Fatalf("report %d, before the threshold: %d persistence audits, want 0", i, n)
 			}
-		} else if n > 1 {
-			t.Fatalf("report %d: %d persistence audits, want 1", i, n)
+		case due:
+			if n := len(persistentAudits()); n != 1 {
+				t.Fatalf("report %d, at the threshold: %d persistence audits, want 1", i, n)
+			}
+			if wrote {
+				t.Fatal("the report that recorded the audit rewrote state")
+			}
 		}
 	}
-	if auditedAt != 30+int(ephemeralPersistAfter/(10*time.Second)) {
-		t.Fatalf("audit recorded at report %d, want report %d", auditedAt, 30+int(ephemeralPersistAfter/(10*time.Second)))
+	audits := persistentAudits()
+	if len(audits) != 1 {
+		t.Fatalf("%d persistence audits after %d reports, want 1", len(audits), reports)
 	}
-	ev := persistentAudits()[0]
+	ev := audits[0]
 	want := map[string]string{
 		"protocol":   "udp",
 		"port":       "45678",
@@ -460,5 +483,16 @@ func TestPersistentEphemeralSocketAuditsWithoutWritingState(t *testing.T) {
 	}
 	if ev.NodeID != "node-a" || ev.Decision != "observe" {
 		t.Fatalf("audit = %+v", ev)
+	}
+}
+
+func (r *ephemeralTestReporter) postInventory() {
+	r.t.Helper()
+	inv, err := json.Marshal(map[string]any{"node_id": "node-a", "inventory": ephemeralTestInventory(r.at)})
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	if rec := doAgentRaw(r.t, r.handler, http.MethodPost, "/api/agent/singbox-inventory", string(inv), r.token); rec.Code != http.StatusOK {
+		r.t.Fatalf("inventory: %d %s", rec.Code, rec.Body.String())
 	}
 }

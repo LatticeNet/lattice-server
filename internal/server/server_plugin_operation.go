@@ -11,6 +11,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/telemetry"
 )
 
 // The host-risk operation protocol (spec §9.3).
@@ -184,8 +185,10 @@ func (s *Server) executePluginOperation(ctx context.Context, p principal, approv
 	// The grant is bound to this one invocation on the host side. The plugin never
 	// receives it and cannot widen it; it can only make a host call the broker checks
 	// against it.
-	resp, err := s.pluginRuntime.InvokeConstrained(ctx, approval.Plugin, "execute", request,
+	started := time.Now()
+	resp, err := s.pluginRuntime.InvokeConstrained(ctx, approval.Plugin, pluginExecuteMethod, request,
 		plugin.InvokeConstraints{Operation: grant})
+	telemetry.ObservePluginCall(approval.Plugin, pluginExecuteMethod, time.Since(started), pluginCallFailure(resp, err))
 	if err != nil {
 		return fmt.Errorf("plugin %q execute failed: %w", approval.Plugin, err)
 	}
@@ -203,6 +206,11 @@ func (s *Server) executePluginOperation(ctx context.Context, p principal, approv
 	})
 	return nil
 }
+
+// pluginExecuteMethod is the plugin action that applies an approved plan. It
+// is named in this file only (plugin_execute_reachability_test.go), and it is
+// also the method label the metrics store records the apply step under.
+const pluginExecuteMethod = "execute"
 
 // handlePluginOperationTaskResult reconciles a plugin operation's approval once the
 // agent reports back (spec §9.3 step 6). This is the generic branch the result ladder

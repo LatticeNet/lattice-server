@@ -28,6 +28,8 @@ type Registry struct {
 	// saveWindow counts writes by caller since the last TakeStoreSaveSummary.
 	// Its keys are the bounded caller labels, so it is bounded the same way.
 	saveWindow map[string]uint64
+	// interval is what happened since the last TakeInterval (interval.go).
+	interval IntervalWindow
 }
 
 type durationStats struct {
@@ -63,6 +65,7 @@ func NewRegistry() *Registry {
 		http:         map[httpKey]*durationStats{},
 		httpSlow:     map[string]uint64{},
 		agent:        map[httpKey]*durationStats{},
+		interval:     newIntervalWindow(),
 	}
 }
 
@@ -193,6 +196,7 @@ func (r *Registry) ObserveStoreSave(caller string, d time.Duration, err error) {
 	}
 	observeDuration(r.storeCallers, caller, d)
 	r.saveWindow[caller]++
+	observeEvent(r.interval.StoreSaves, caller, d, err != nil)
 }
 
 // storeSaveSummaryTop bounds the summary line: it names the callers with the
@@ -277,6 +281,7 @@ func (r *Registry) Reset() {
 	r.httpSlow = map[string]uint64{}
 	r.agent = map[httpKey]*durationStats{}
 	r.pluginSystemPool = PluginSystemPoolSnapshot{}
+	r.interval = newIntervalWindow()
 }
 
 func (r *Registry) ObserveAuditAppend(err error) {
@@ -287,6 +292,7 @@ func (r *Registry) ObserveAuditAppend(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.audit[result]++
+	r.interval.AuditAppends.Observe(0, err != nil)
 }
 
 // ObserveHTTPRequest records a path already classified by

@@ -18,6 +18,7 @@ import (
 
 	"github.com/LatticeNet/lattice-server/internal/geoip"
 	"github.com/LatticeNet/lattice-server/internal/logstore"
+	"github.com/LatticeNet/lattice-server/internal/metricsdb"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/secret"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
@@ -212,6 +213,38 @@ func main() {
 			log.Printf("trace store: %s (PLAINTEXT — connection metadata includes destination hosts; set a master key to encrypt)", tracePath)
 		}
 	}
+	// Open the self-monitoring history (metrics.db) beside the state file: the
+	// control plane's process and host, its stores, route groups and plugin
+	// calls, and the node metrics agents beat in, in fixed tiers that bound
+	// the file. It holds no secrets and no authority, so it is not encrypted,
+	// and losing it loses history only. In-memory mode keeps no history.
+	var selfMonitor server.SelfMonitorOptions
+	if dataPath != "" {
+		metricsPath := filepath.Join(dataDir, "metrics.db")
+		maxSeries := 0
+		if v := strings.TrimSpace(os.Getenv("LATTICE_METRICS_MAX_SERIES")); v != "" {
+			if maxSeries, err = strconv.Atoi(v); err != nil || maxSeries < 1 {
+				log.Fatalf("invalid LATTICE_METRICS_MAX_SERIES %q: want a positive integer", v)
+			}
+		}
+		metricsDB, err := metricsdb.Open(metricsPath, metricsdb.Options{MaxSeries: maxSeries})
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer metricsDB.Close()
+		files := []server.MonitoredFile{
+			{Label: "state.json", Path: dataPath},
+			{Label: "audit-wal", Path: dataPath + ".audit-wal"},
+			{Label: "logs.db", Path: filepath.Join(dataDir, "logs.db")},
+			{Label: "trace.db", Path: filepath.Join(dataDir, "trace.db")},
+		}
+		if runtimeBoltHotStore != "" {
+			files = append(files, server.MonitoredFile{Label: "state-hot.db", Path: runtimeBoltHotStore})
+		}
+		selfMonitor = server.SelfMonitorOptions{DB: metricsDB, DataDir: dataDir, Files: files}
+		st, _ := metricsDB.Stats()
+		log.Printf("metrics store: %s (%d series of %d; tiers 1m/48h, 5m/14d, 1h/90d, 1d/5y)", metricsPath, st.Series, st.MaxSeries)
+	}
 	geoResolver, err := geoip.NewHTTPResolver(geoIPLookupURL)
 	if err != nil {
 		log.Fatal(err)
@@ -230,6 +263,7 @@ func main() {
 		Store:         st,
 		LogStore:      logStore,
 		TraceStore:    traceStore,
+		SelfMonitor:   selfMonitor,
 		WebFS:         os.DirFS(webRoot),
 		AdminUsername: os.Getenv("LATTICE_ADMIN_USERNAME"),
 		AdminPassword: os.Getenv("LATTICE_ADMIN_PASSWORD"),

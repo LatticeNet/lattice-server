@@ -131,6 +131,20 @@ func createOwnedTask(t *testing.T, srv *Server, taskID string, approval model.Ap
 	}
 }
 
+// seedPluginTask stores a task shaped like pluginTaskHost.Enqueue's, with the
+// given actor, on node-a, carrying plugin-marker-48c0.
+func seedPluginTask(t *testing.T, srv *Server, taskID, actorID string, approval model.Approval) {
+	t.Helper()
+	seedAgentUpdateNode(t, srv.store)
+	if err := srv.store.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.store.CreateTask(model.Task{ID: taskID, ApprovalID: approval.ID, ActorID: actorID, Targets: []string{approval.NodeID},
+		Interpreter: "sh", Script: "echo plugin-marker-48c0\n", Status: model.TaskQueued, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // Every task kind whose script core renders with a credential another
 // surface owns asks for that surface's reveal scope on top of task:read and
 // the reveal gate. Without the owner check each of these reveals the secret
@@ -269,6 +283,55 @@ func TestTaskScriptRevealAsksTheOwningSurface(t *testing.T) {
 			},
 			ownerScopes: []string{"*"}, scope: "*", unrestricted: true,
 		},
+		{
+			// A renderer nobody classified fails closed.
+			name: "approval plugin nobody classified",
+			seed: func(t *testing.T, h *revealHarness) (string, string, string) {
+				seedAgentUpdateNode(t, h.srv.store)
+				createOwnedTask(t, h.srv, "task-unclassified",
+					model.Approval{ID: "approval-unclassified", NodeID: "node-a", Plugin: "brand-new-renderer", Status: model.ApprovalApproved},
+					"echo unclassified-marker-61af\n")
+				return "task-unclassified", "node-a", "unclassified-marker-61af"
+			},
+			ownerScopes: []string{"*"}, scope: "*", unrestricted: true,
+		},
+		{
+			// A plugin may be named like a listed core label. The enqueuer
+			// recorded on the task wins over the label's listing.
+			name: "plugin task under a core label",
+			seed: func(t *testing.T, h *revealHarness) (string, string, string) {
+				seedPluginTask(t, h.srv, "task-plugin", "plugin:selfdns",
+					model.Approval{ID: "approval-plugin-label", NodeID: "node-a", Plugin: "selfdns", Status: model.ApprovalApproved})
+				return "task-plugin", "node-a", "plugin-marker-48c0"
+			},
+			ownerScopes: []string{"*"}, scope: "*", unrestricted: true,
+		},
+		{
+			// The approval alone says plugin operation (Service and Method),
+			// so the script is the plugin's even under a core label.
+			name: "plugin operation approval under a core label",
+			seed: func(t *testing.T, h *revealHarness) (string, string, string) {
+				seedPluginTask(t, h.srv, "task-plugin-op", "admin",
+					model.Approval{ID: "approval-plugin-op", NodeID: "node-a", Plugin: "selfdns", Service: "dns", Method: "apply", Status: model.ApprovalApproved})
+				return "task-plugin-op", "node-a", "plugin-marker-48c0"
+			},
+			ownerScopes: []string{"*"}, scope: "*", unrestricted: true,
+		},
+		{
+			name: "rerun of a plugin task",
+			seed: func(t *testing.T, h *revealHarness) (string, string, string) {
+				seedPluginTask(t, h.srv, "task-plugin-source", "plugin:selfdns",
+					model.Approval{ID: "approval-plugin-source", NodeID: "node-a", Plugin: "selfdns", Status: model.ApprovalApproved})
+				source, _ := h.srv.store.Task("task-plugin-source")
+				rerun := source
+				rerun.ID, rerun.ApprovalID, rerun.ActorID, rerun.RerunOfTaskID = "task-plugin-rerun", "", "admin", source.ID
+				if err := h.srv.store.CreateTask(rerun); err != nil {
+					t.Fatal(err)
+				}
+				return "task-plugin-rerun", "node-a", "plugin-marker-48c0"
+			},
+			ownerScopes: []string{"*"}, scope: "*", unrestricted: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -348,13 +411,15 @@ func coreApplyScriptPlugins(t *testing.T) map[string]bool {
 	}
 	isPluginField := func(e ast.Expr) bool { return types.ExprString(e) == "approval.Plugin" }
 	found := map[string]bool{}
+	// applyScriptFor is both a function and a method; both are scanned.
 	renderers := map[string]bool{"applyScriptFor": true, "applyScriptForWithServer": true, "approveApprovalCore": true}
+	seen := map[string]bool{}
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || !renderers[fn.Name.Name] {
 			continue
 		}
-		delete(renderers, fn.Name.Name)
+		seen[fn.Name.Name] = true
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			switch n := n.(type) {
 			case *ast.SwitchStmt:
@@ -374,52 +439,119 @@ func coreApplyScriptPlugins(t *testing.T) map[string]bool {
 			return true
 		})
 	}
-	if len(renderers) != 0 {
-		t.Fatalf("renderers not found in server.go: %v", renderers)
+	if len(seen) != len(renderers) {
+		t.Fatalf("renderers found in server.go: %v, want all of %v", seen, renderers)
 	}
 	return found
 }
 
-// Every plugin core renders an apply script for is classified for the
-// script reveal: owned when its script carries another surface's credential,
-// so approvalScriptOwner names the owner, or not when it carries nothing
-// secret. The gate is a list, so it would fail open for a new renderer that
-// writes a credential into its script; this makes adding one without a
-// classification fail here instead.
+// Every plugin core renders an apply script for has its reveal classified:
+// the owner scope when its script carries another surface's credential, or
+// a listing in revealableApprovalScripts when it carries none. The listing is
+// checked the other way too, so an entry cannot outlive its renderer. A label
+// that misses both is admin-only (TestUnclassifiedApprovalScriptIsAdminOnly),
+// so a miss here costs reveal access, never a secret.
 func TestEveryCoreApplyScriptIsClassifiedForReveal(t *testing.T) {
-	classified := map[string]struct {
-		plugin string
-		owned  bool
-		why    string
-	}{
-		"witnessPlugin":            {witnessPlugin, true, "Bark device key"},
-		"singBoxLineUserPlugin":    {singBoxLineUserPlugin, true, "VPN user credential"},
-		"singBoxManagedLinePlugin": {singBoxManagedLinePlugin, true, "VPN user credential, REALITY key"},
-		"proxyCorePlugin":          {proxyCorePlugin, true, "VPN user credentials, REALITY keys"},
-		"sshGuardPlugin":           {sshGuardPlugin, true, "knock sequence"},
-		"lineChainPlugin":          {lineChainPlugin, false, "refused outright before the owner check"},
-		"singBoxLineMetaPlugin":    {singBoxLineMetaPlugin, false, "line metadata"},
-		"agentUpdatePlugin":        {agentUpdatePlugin, false, "release URL and digest"},
-		`"selfdns"`:                {"selfdns", false, "the plan excludes the DNS token by contract"},
-		`"cftunnel"`:               {"cftunnel", false, "names a node-local credentials file"},
-		`"wireguard"`:              {"wireguard", false, "a placeholder the agent fills with a node-local key"},
-		`"nftpolicy"`:              {"nftpolicy", false, "firewall rules"},
-		`"nft"`:                    {"nft", false, "firewall rules"},
+	// labels maps each label, as the renderers spell it, to its value and to
+	// the owner scope its reveal needs; "" means listed as carrying no secret.
+	labels := map[string]struct{ plugin, scope string }{
+		"witnessPlugin":            {witnessPlugin, "notify:admin"},
+		"singBoxLineUserPlugin":    {singBoxLineUserPlugin, "proxy:admin"},
+		"singBoxManagedLinePlugin": {singBoxManagedLinePlugin, "proxy:admin"},
+		"proxyCorePlugin":          {proxyCorePlugin, "proxy:admin"},
+		"sshGuardPlugin":           {sshGuardPlugin, "sshguard:read,network:plan"},
+		// Refused outright before the owner check; unlisted, so admin-only
+		// should one ever reach it.
+		"lineChainPlugin":       {lineChainPlugin, "*"},
+		"singBoxLineMetaPlugin": {singBoxLineMetaPlugin, ""},
+		"agentUpdatePlugin":     {agentUpdatePlugin, ""},
+		`"selfdns"`:             {"selfdns", ""},
+		`"cftunnel"`:            {"cftunnel", ""},
+		`"wireguard"`:           {"wireguard", ""},
+		`"nftpolicy"`:           {"nftpolicy", ""},
+		`"nft"`:                 {"nft", ""},
 	}
 	found := coreApplyScriptPlugins(t)
 	if !found["witnessPlugin"] || !found[`"cftunnel"`] {
 		t.Fatalf("the source scan found too little, so it is not reading the renderers: %v", found)
 	}
+	rendered := map[string]bool{}
 	for label := range found {
-		if _, ok := classified[label]; !ok {
-			t.Errorf("core renders an apply script for %s, which is not classified for reveal: "+
-				"if its script carries another surface's credential, give it an owner in approvalScriptOwner; "+
-				"either way, classify it here", label)
+		c, ok := labels[label]
+		if !ok {
+			t.Errorf("core renders an apply script for %s, which is not classified for reveal: it is admin-only until "+
+				"approvalScriptOwner names its owner or revealableApprovalScripts lists it, and either way it belongs here", label)
+			continue
+		}
+		rendered[c.plugin] = true
+	}
+	for label, c := range labels {
+		if !found[label] {
+			t.Errorf("%s is classified here, but no renderer names it any more", label)
+		}
+		owner, owned := approvalScriptOwner(model.Approval{Plugin: c.plugin, NodeID: "node-a"})
+		if c.scope == "" {
+			if owned {
+				t.Errorf("%s should be listed in revealableApprovalScripts, but its reveal needs %s", label, owner.scope)
+			}
+			continue
+		}
+		if !owned || owner.scope != c.scope {
+			t.Errorf("%s: reveal owner scope %q, want %q", label, owner.scope, c.scope)
 		}
 	}
-	for label, c := range classified {
-		if _, owned := approvalScriptOwner(model.Approval{Plugin: c.plugin, NodeID: "node-a"}); owned != c.owned {
-			t.Errorf("%s (%s): approvalScriptOwner owned=%v, classified owned=%v", label, c.why, owned, c.owned)
+	for plugin := range revealableApprovalScripts {
+		if !rendered[plugin] {
+			t.Errorf("revealableApprovalScripts lists %q, which no core renderer writes a script for", plugin)
 		}
+	}
+}
+
+// An approval plugin nobody classified, and a task a plugin enqueued, are
+// revealable by a full administrator and nobody else, however many other
+// scopes a principal holds. A plugin named like a listed core label gets no
+// listing from the name.
+func TestUnclassifiedApprovalScriptIsAdminOnly(t *testing.T) {
+	everything := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{
+		"task:read", "proxy:admin", "vpncore:admin", "notify:admin", "sshguard:admin", "network:plan",
+		"dns:admin", "netpolicy:admin", "tunnel:admin", "node:admin", "netguard:admin",
+	}}}
+	admin := principal{Principal: rbac.Principal{ActorID: "root", Scopes: []string{"*"}}}
+	confinedAdmin := principal{Principal: rbac.Principal{ActorID: "root", Scopes: []string{"*"}, ServerAllowlist: []string{"node-a"}}}
+
+	unclassified, ok := approvalScriptOwner(model.Approval{Plugin: "brand-new-renderer", NodeID: "node-a"})
+	if !ok {
+		t.Fatal("an unclassified approval plugin must have an owner")
+	}
+	pluginTask, ok := pluginTaskScriptOwner("selfdns")
+	if !ok {
+		t.Fatal("a plugin task must have an owner even when the plugin is named like a listed core label")
+	}
+	for name, owner := range map[string]taskScriptOwner{"unclassified approval plugin": unclassified, "plugin task": pluginTask} {
+		if owner.scope != "*" || owner.allows(everything) || !owner.allows(admin) || owner.allows(confinedAdmin) {
+			t.Errorf("%s: scope %q, every-other-scope=%v admin=%v confined admin=%v; want *, false, true, false",
+				name, owner.scope, owner.allows(everything), owner.allows(admin), owner.allows(confinedAdmin))
+		}
+	}
+}
+
+// An SSH Guard approval with no node fails closed. rbac.Allows reads an
+// empty node as any node, so without the check a principal confined to some
+// other node would read the knock sequence.
+func TestSSHGuardScriptOwnerFailsClosedWithoutANode(t *testing.T) {
+	confined := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"sshguard:read", "network:plan"}, ServerAllowlist: []string{"node-b"}}}
+	unconfined := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"sshguard:read", "network:plan"}}}
+	noNode, ok := approvalScriptOwner(model.Approval{Plugin: sshGuardPlugin})
+	if !ok {
+		t.Fatal("an SSH Guard approval must have an owner")
+	}
+	if noNode.allows(confined) || noNode.allows(unconfined) {
+		t.Fatalf("an SSH Guard approval with no node must refuse everyone: confined=%v unconfined=%v",
+			noNode.allows(confined), noNode.allows(unconfined))
+	}
+	// Control: the same principals pass for an approval naming their node.
+	withNode, _ := approvalScriptOwner(model.Approval{Plugin: sshGuardPlugin, NodeID: "node-b"})
+	if !withNode.allows(confined) || !withNode.allows(unconfined) {
+		t.Fatal("control failed: sshguard:read and network:plan on the approval's node should pass")
 	}
 }

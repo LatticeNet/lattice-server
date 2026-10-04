@@ -35,18 +35,47 @@ import (
 // The reveal now also requires the owning surface's own reveal scope. Line
 // chain scripts stay refused outright, by the check in handleRevealTaskScript.
 //
-// The other core apply scripts carry nothing secret, so they are not listed:
-// selfdns plans exclude the DNS token by contract, WireGuard renders a
-// placeholder the agent fills with a node-local key, cftunnel references a
-// node-local credentials file, and the nft, netguard, netpolicy, linemeta and
-// agentupdate scripts are firewall rules, metadata and download facts.
-// Plugin-enqueued tasks carry what the plugin wrote; none of the official
-// plugins enqueues a task today.
+// The gate fails closed for approval-backed work. An approval plugin is
+// revealable under task:read alone only when it is listed in
+// revealableApprovalScripts, which names why its script carries no secret.
+// Any other approval plugin, a plugin operation, and a task a plugin
+// enqueued are revealable only by a full administrator, so a new renderer
+// that writes a credential into its script cannot leak it by omission.
+//
+// Direct tasks, which have no approval, keep task:read: an operator's own
+// POST /api/tasks script and the sing-box add, delete, conncheck and probe
+// scripts are built from what the author typed or from inventory names. The
+// one direct task that carries another surface's credential, the sing-box
+// user sync, is recognised by its script.
 
 // apiErrorRevealScriptOwnerScopeRequired: the caller passed task:read and
 // the reveal gate, but the script carries a credential whose owning surface
 // requires a scope the caller does not hold. The message names the scope.
 const apiErrorRevealScriptOwnerScopeRequired = "reveal_script_owner_scope_required"
+
+// pluginTaskActorPrefix is how pluginTaskHost.Enqueue records the plugin
+// that enqueued a task.
+const pluginTaskActorPrefix = "plugin:"
+
+// revealableApprovalScripts are the approval plugins whose core-rendered
+// apply scripts carry no secret, with the reason. Every other approval
+// plugin's script is revealable only by its owner (approvalScriptOwner) or
+// by a full administrator. TestEveryCoreApplyScriptIsClassifiedForReveal
+// checks that each entry is a plugin core really renders a script for.
+var revealableApprovalScripts = map[string]string{
+	"selfdns":             "the plan excludes the DNS provider token by contract (selfdns.RenderApprovalPlan)",
+	"wireguard":           "the config carries a placeholder the agent fills with a node-local private key",
+	"cftunnel":            "the config names a node-local credentials file and carries no token",
+	"nft":                 "firewall rules, both the legacy nft plan and netguard",
+	"nftpolicy":           "firewall rules and domain-set bindings",
+	singBoxLineMetaPlugin: "line names, tags and uuids, no credential",
+	agentUpdatePlugin:     "a release URL and digest; the download is unauthenticated",
+}
+
+// revealablePluginTaskScripts are the plugins whose enqueued task scripts
+// are verified to carry no secret. Empty: no official plugin enqueues a task
+// today, and a plugin may write a value from its vault into a script.
+var revealablePluginTaskScripts = map[string]string{}
 
 // sbUserCredentialRe matches the on-box `sb --json user add|del` call. Its
 // JSON payload is the user's credential: the fork's cmd_json_user refuses a
@@ -87,15 +116,11 @@ func vpnCredentialScriptOwner(kind, carries string) taskScriptOwner {
 	}
 }
 
-// unknownOriginScriptOwner applies when a task names an origin that no longer
-// resolves: an approval that is gone, or a rerun whose source task was
-// deleted. A rerun copies its source's script and not its approval link, so
-// without this, rerunning a witness apply and deleting the original would
-// leave a copy of the key that task:read alone could reveal. Only a full
-// administrator, who may read every surface, can reveal it.
-func unknownOriginScriptOwner(why string) taskScriptOwner {
+// adminScriptOwner reserves a script for a full administrator, who may read
+// every surface. kind names it; what says why nothing narrower applies.
+func adminScriptOwner(kind, what string) taskScriptOwner {
 	return taskScriptOwner{
-		kind: "unresolved origin", what: "the origin of this task's script cannot be resolved because " + why,
+		kind: kind, what: what,
 		scope: "*", need: "a full administrator (scope *, unrestricted server allowlist)",
 		allows: func(p principal) bool {
 			return !principalHasNodeRestriction(p) && rbac.HoldsExplicitScope(p.Scopes, "*")
@@ -103,14 +128,44 @@ func unknownOriginScriptOwner(why string) taskScriptOwner {
 	}
 }
 
+// unknownOriginScriptOwner applies when a task names an origin that no longer
+// resolves: an approval that is gone, or a rerun whose source task was
+// deleted. A rerun copies its source's script and not its approval link, so
+// without this, rerunning a witness apply and deleting the original would
+// leave a copy of the key that task:read alone could reveal.
+func unknownOriginScriptOwner(why string) taskScriptOwner {
+	return adminScriptOwner("unresolved origin", "the origin of this task's script cannot be resolved because "+why)
+}
+
+// pluginTaskScriptOwner covers a script a plugin wrote: what it holds is
+// the plugin's business, including values from its vault, which no HTTP
+// handler returns.
+func pluginTaskScriptOwner(pluginID string) (taskScriptOwner, bool) {
+	if _, ok := revealablePluginTaskScripts[pluginID]; ok {
+		return taskScriptOwner{}, false
+	}
+	return adminScriptOwner("plugin task", "this script was written by plugin "+pluginID+
+		", which is not verified to keep secrets out of its task scripts"), true
+}
+
+// approvalRunsAsPluginOperation is the test approveApprovalCore uses to hand
+// an approval to its plugin's executor rather than to a core renderer. The
+// line chain, managed line and line-user plans fill Service and Method too,
+// but core renders their scripts.
+func approvalRunsAsPluginOperation(approval model.Approval) bool {
+	return isPluginOperationApproval(approval) && !isLineChainApproval(approval) &&
+		approval.Plugin != singBoxManagedLinePlugin && approval.Plugin != singBoxLineUserPlugin
+}
+
 // approvalScriptOwner is the owner of an apply script core rendered for this
-// approval, if its script carries another surface's credential. Every plugin
-// that core renders an apply script for is classified in
-// TestEveryCoreApplyScriptIsClassifiedForReveal, so a new renderer cannot
-// fall through here unnoticed.
+// approval: the surface whose credential it carries, nobody for a plugin
+// listed in revealableApprovalScripts, and a full administrator for any
+// plugin nobody classified.
 func approvalScriptOwner(approval model.Approval) (taskScriptOwner, bool) {
 	switch approval.Plugin {
 	case witnessPlugin:
+		// Deliberately not stricter than notify:admin with step-up: that scope
+		// can already re-author the channel, key included.
 		return taskScriptOwner{
 			kind: "witness apply", what: "this witness apply script carries a notification channel's Bark device key",
 			scope: "notify:admin", need: "notify:admin with an unrestricted server allowlist",
@@ -135,29 +190,49 @@ func approvalScriptOwner(approval model.Approval) (taskScriptOwner, bool) {
 				return nodeID != "" && rbac.Allows(p.Principal, "sshguard:read", nodeID) && rbac.Allows(p.Principal, "network:plan", nodeID)
 			},
 		}, true
-	default:
+	}
+	if _, ok := revealableApprovalScripts[approval.Plugin]; ok {
 		return taskScriptOwner{}, false
 	}
+	return adminScriptOwner("unclassified apply", "this script was rendered for approval plugin "+
+		approval.Plugin+", which is not classified as carrying no secret"), true
 }
 
 // taskScriptOwners lists every owner whose authority a reveal of this task's
 // script must hold, beside task:read and the reveal gate. A rerun is resolved
-// to the approval of the task it was copied from.
+// to the task it was copied from, whose approval and enqueuer it inherits.
 func (s *Server) taskScriptOwners(task model.Task) []taskScriptOwner {
 	var owners []taskScriptOwner
-	approvalID := strings.TrimSpace(task.ApprovalID)
-	if rerunOf := strings.TrimSpace(task.RerunOfTaskID); approvalID == "" && rerunOf != "" {
+	origin := task
+	if rerunOf := strings.TrimSpace(task.RerunOfTaskID); strings.TrimSpace(task.ApprovalID) == "" && rerunOf != "" {
 		if source, ok := s.store.Task(rerunOf); ok {
-			approvalID = strings.TrimSpace(source.ApprovalID)
+			origin = source
 		} else {
 			owners = append(owners, unknownOriginScriptOwner("the task it reruns no longer exists"))
 		}
 	}
-	if approvalID != "" {
-		if approval, ok := s.store.Approval(approvalID); !ok {
-			owners = append(owners, unknownOriginScriptOwner("the approval that produced it no longer exists"))
-		} else if owner, ok := approvalScriptOwner(approval); ok {
+	// The plugin path wins over the approval's plugin label: a plugin id may
+	// spell a core label such as "selfdns", and must not borrow its listing.
+	pluginTask := false
+	if pluginID, ok := strings.CutPrefix(origin.ActorID, pluginTaskActorPrefix); ok {
+		pluginTask = true
+		if owner, ok := pluginTaskScriptOwner(pluginID); ok {
 			owners = append(owners, owner)
+		}
+	}
+	if approvalID := strings.TrimSpace(origin.ApprovalID); approvalID != "" {
+		approval, ok := s.store.Approval(approvalID)
+		switch {
+		case !ok:
+			owners = append(owners, unknownOriginScriptOwner("the approval that produced it no longer exists"))
+		case approvalRunsAsPluginOperation(approval):
+			if owner, ok := pluginTaskScriptOwner(approval.Plugin); ok && !pluginTask {
+				owners = append(owners, owner)
+			}
+		default:
+			if owner, ok := approvalScriptOwner(approval); ok {
+				owners = append(owners, owner)
+			}
 		}
 	}
 	if sbUserCredentialRe.MatchString(task.Script) {

@@ -8254,9 +8254,9 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	// against the approved target set. The line chain, managed line and line-user
 	// plans fill Service and Method too, to bind their typed columns, but core
 	// writes their apply scripts below and no loaded plugin carries their ids, so
-	// the plugin executor would only refuse them.
-	if isPluginOperationApproval(approval) && !isLineChainApproval(approval) &&
-		approval.Plugin != singBoxManagedLinePlugin && approval.Plugin != singBoxLineUserPlugin {
+	// the plugin executor would only refuse them. The script reveal gate asks the
+	// same question (approvalRunsAsPluginOperation), so the two cannot drift.
+	if approvalRunsAsPluginOperation(approval) {
 		approval.Status = model.ApprovalApproved
 		approval.ApprovedBy = p.ActorID
 		if err := s.store.UpsertApproval(approval); err != nil {

@@ -38,6 +38,9 @@ type fleetHarnessNode struct {
 	// edge is the provider edge name a node behind a provider declares, ""
 	// for a direct node.
 	edge string
+	// timesyncd is a node whose clock is kept by systemd-timesyncd, which
+	// opens a new query socket on an ephemeral port as it polls.
+	timesyncd bool
 }
 
 // fleetShape is what the simulated fleet has besides its agents.
@@ -56,11 +59,19 @@ type fleetShape struct {
 	// 2026-10-04 that churn alone made 176 guard reality writes an hour.
 	// Here each node's set changes every fleetClientSocketPeriod, which
 	// lands near that rate.
+	// Two nodes also run systemd-timesyncd, whose query socket moves to a
+	// new port every fleetTimesyncdPeriod: on a113, with the sing-box
+	// sockets split out, two such nodes were most of the 20 guard reality
+	// writes an hour that remained.
 	clientSockets bool
 }
 
 // fleetClientSocketPeriod is how long one node keeps the same client sockets.
 const fleetClientSocketPeriod = 10 * time.Minute
+
+// fleetTimesyncdPeriod is how long a timesyncd node keeps one query port:
+// production showed four ports in thirty minutes on each such node.
+const fleetTimesyncdPeriod = 6 * time.Minute
 
 // fleetHarnessResult is what one run measured.
 type fleetHarnessResult struct {
@@ -205,6 +216,9 @@ func runFleetHarness(t *testing.T, nodes int, shape fleetShape, cycle, warmup, w
 		}
 		if shape.lines && i%5 == 4 {
 			fleet[i].edge = fmt.Sprintf("edge-%d.example.net", i)
+		}
+		if shape.clientSockets && i%17 == 3 {
+			fleet[i].timesyncd = true
 		}
 	}
 	for _, n := range fleet {
@@ -391,7 +405,8 @@ func fleetAgentCycle(t *testing.T, handler http.Handler, n fleetHarnessNode, sha
 
 // fleetListeners is what `ss -tulpn` shows on a node: sshd, the sing-box
 // inbounds of its lines, and three sing-box client UDP sockets whose ports
-// change every fleetClientSocketPeriod. Nodes change at different moments,
+// change every fleetClientSocketPeriod. A timesyncd node adds its NTP
+// query socket. Nodes change at different moments,
 // as a fleet whose cores dial independently does.
 func fleetListeners(n fleetHarnessNode, shape fleetShape, now time.Time) []model.GuardListener {
 	out := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
@@ -407,6 +422,12 @@ func fleetListeners(n fleetHarnessNode, shape fleetShape, now time.Time) []model
 	for k := int64(0); k < 3; k++ {
 		port := first + int((epoch*7919+int64(n.pid)*104729+k*15485863)%span)
 		out = append(out, model.GuardListener{Protocol: "udp", Port: port, Address: "::", Process: "sing-box"})
+	}
+	if n.timesyncd {
+		tick := (now.UnixNano() + int64(n.pid)*int64(time.Minute)) / int64(fleetTimesyncdPeriod)
+		port := first + int((tick*6151+int64(n.pid)*7)%span)
+		// ss prints the comm, which the kernel cuts to 15 bytes.
+		out = append(out, model.GuardListener{Protocol: "udp", Port: port, Address: "0.0.0.0", Process: "systemd-timesyn"})
 	}
 	return out
 }

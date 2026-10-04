@@ -1177,9 +1177,10 @@ func (s *Store) Save() error {
 // install it in s.state only after this returns successfully.
 func (s *Store) persistState(st State) (committed bool, err error) {
 	s.testPersistCalls++
+	caller := persistCaller()
 	start := time.Now()
 	defer func() {
-		telemetry.ObserveStoreSave(time.Since(start), err)
+		telemetry.ObserveStoreSave(caller, time.Since(start), err)
 		if committed {
 			s.noteReportClocksOnDisk(st)
 		}

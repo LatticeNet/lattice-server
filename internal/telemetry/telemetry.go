@@ -19,6 +19,7 @@ type Registry struct {
 	mu               sync.Mutex
 	started          time.Time
 	store            map[string]*durationStats
+	storeCallers     map[string]*durationStats
 	audit            map[string]uint64
 	http             map[httpKey]*durationStats
 	httpSlow         map[string]uint64
@@ -41,6 +42,7 @@ type Snapshot struct {
 	StartedAt        time.Time
 	Uptime           time.Duration
 	Store            map[string]durationStats
+	StoreCallers     map[string]durationStats
 	Audit            map[string]uint64
 	HTTP             map[httpKey]durationStats
 	HTTPSlow         map[string]uint64
@@ -50,12 +52,13 @@ type Snapshot struct {
 
 func NewRegistry() *Registry {
 	return &Registry{
-		started:  time.Now(),
-		store:    map[string]*durationStats{},
-		audit:    map[string]uint64{},
-		http:     map[httpKey]*durationStats{},
-		httpSlow: map[string]uint64{},
-		agent:    map[httpKey]*durationStats{},
+		started:      time.Now(),
+		store:        map[string]*durationStats{},
+		storeCallers: map[string]*durationStats{},
+		audit:        map[string]uint64{},
+		http:         map[httpKey]*durationStats{},
+		httpSlow:     map[string]uint64{},
+		agent:        map[httpKey]*durationStats{},
 	}
 }
 
@@ -63,8 +66,11 @@ func ResetForTest() {
 	defaultRegistry.Reset()
 }
 
-func ObserveStoreSave(d time.Duration, err error) {
-	defaultRegistry.ObserveStoreSave(d, err)
+// ObserveStoreSave records one whole-state write: how long it took, whether it
+// failed, and caller, the store method that asked for it (store.persistState
+// derives it), so production can say which path is rewriting the file.
+func ObserveStoreSave(caller string, d time.Duration, err error) {
+	defaultRegistry.ObserveStoreSave(caller, d, err)
 }
 
 func ObserveAuditAppend(err error) {
@@ -155,14 +161,29 @@ func hasEscapedSubscriptionFirstSegment(escapedPath string) bool {
 	return err == nil && firstSegment == "sub"
 }
 
-func (r *Registry) ObserveStoreSave(d time.Duration, err error) {
+// maxStoreCallers bounds the caller label. The store derives it from a fixed
+// set of method names, so the bound is a backstop: a caller first seen once
+// the set is full is counted as StoreCallerOther.
+const maxStoreCallers = 128
+
+// StoreCallerOther is the caller label for a write no named caller claims.
+const StoreCallerOther = "other"
+
+func (r *Registry) ObserveStoreSave(caller string, d time.Duration, err error) {
 	result := "success"
 	if err != nil {
 		result = "error"
 	}
+	if caller == "" {
+		caller = StoreCallerOther
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	observeDuration(r.store, result, d)
+	if _, seen := r.storeCallers[caller]; !seen && len(r.storeCallers) >= maxStoreCallers {
+		caller = StoreCallerOther
+	}
+	observeDuration(r.storeCallers, caller, d)
 }
 
 func (r *Registry) Reset() {
@@ -170,6 +191,7 @@ func (r *Registry) Reset() {
 	defer r.mu.Unlock()
 	r.started = time.Now()
 	r.store = map[string]*durationStats{}
+	r.storeCallers = map[string]*durationStats{}
 	r.audit = map[string]uint64{}
 	r.http = map[httpKey]*durationStats{}
 	r.httpSlow = map[string]uint64{}
@@ -215,6 +237,7 @@ func (r *Registry) Snapshot() Snapshot {
 		StartedAt:        r.started,
 		Uptime:           time.Since(r.started),
 		Store:            copyDurationMap(r.store),
+		StoreCallers:     copyDurationMap(r.storeCallers),
 		Audit:            copyCounterMap(r.audit),
 		HTTP:             copyHTTPMap(r.http),
 		HTTPSlow:         copyCounterMap(r.httpSlow),
@@ -241,6 +264,19 @@ func (r *Registry) Prometheus() string {
 		writeLine(&b, "lattice_store_save_duration_seconds_count{%s} %d", labels, st.Count)
 		writeLine(&b, "lattice_store_save_duration_seconds_sum{%s} %.9f", labels, st.Sum.Seconds())
 		writeLine(&b, "lattice_store_save_duration_seconds_max{%s} %.9f", labels, st.Max.Seconds())
+	}
+
+	writeLine(&b, "# HELP lattice_store_save_by_caller_total Store Save calls by the store method that asked for the write.")
+	writeLine(&b, "# TYPE lattice_store_save_by_caller_total counter")
+	writeLine(&b, "# HELP lattice_store_save_by_caller_duration_seconds Store Save latency by the store method that asked for the write.")
+	writeLine(&b, "# TYPE lattice_store_save_by_caller_duration_seconds summary")
+	for _, caller := range sortedDurationKeys(snap.StoreCallers) {
+		st := snap.StoreCallers[caller]
+		labels := fmt.Sprintf(`caller="%s"`, escapeLabel(caller))
+		writeLine(&b, "lattice_store_save_by_caller_total{%s} %d", labels, st.Count)
+		writeLine(&b, "lattice_store_save_by_caller_duration_seconds_count{%s} %d", labels, st.Count)
+		writeLine(&b, "lattice_store_save_by_caller_duration_seconds_sum{%s} %.9f", labels, st.Sum.Seconds())
+		writeLine(&b, "lattice_store_save_by_caller_duration_seconds_max{%s} %.9f", labels, st.Max.Seconds())
 	}
 
 	writeLine(&b, "# HELP lattice_audit_append_total Audit append attempts by result.")

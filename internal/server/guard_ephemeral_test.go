@@ -284,3 +284,170 @@ func TestRealityAPIServesEphemeralSocketsBesideListeners(t *testing.T) {
 		t.Fatalf("listeners missing an allow = %v, want %v", missing, want)
 	}
 }
+
+// observeEvery feeds the tracker one report every ten seconds from start to
+// end, each listing sockets(at), and returns what came due and when.
+func observeEvery(tr *ephemeralSocketTracker, start, end time.Time, sockets func(at time.Time) []model.GuardListener) (due []persistentEphemeralSocket, at []time.Time) {
+	for now := start; !now.After(end); now = now.Add(10 * time.Second) {
+		for _, d := range tr.observe("node-a", sockets(now), now) {
+			due = append(due, d)
+			at = append(at, now)
+		}
+	}
+	return due, at
+}
+
+func TestEphemeralSocketTrackerAuditsOncePerEpisode(t *testing.T) {
+	t0 := time.Date(2026, 10, 4, 9, 0, 0, 0, time.UTC)
+	persistent := singBoxUDP(45678)
+	churn := func(at time.Time) []model.GuardListener {
+		return churningClientSockets(int(at.Sub(t0) / (10 * time.Second)))
+	}
+
+	t.Run("a socket bound past the threshold audits once", func(t *testing.T) {
+		var tr ephemeralSocketTracker
+		due, at := observeEvery(&tr, t0, t0.Add(2*time.Hour), func(now time.Time) []model.GuardListener {
+			return withSockets(churn(now), persistent)
+		})
+		if len(due) != 1 || due[0].socket != persistent || !due[0].firstSeen.Equal(t0) || !at[0].Equal(t0.Add(ephemeralPersistAfter)) {
+			t.Fatalf("due = %+v at %v, want one audit of %+v at %s", due, at, persistent, t0.Add(ephemeralPersistAfter))
+		}
+	})
+
+	t.Run("churning sockets never audit", func(t *testing.T) {
+		var tr ephemeralSocketTracker
+		if due, _ := observeEvery(&tr, t0, t0.Add(4*time.Hour), churn); len(due) != 0 {
+			t.Fatalf("churn came due: %+v", due)
+		}
+	})
+
+	t.Run("a gap starts a new episode", func(t *testing.T) {
+		var tr ephemeralSocketTracker
+		gapAt := t0.Add(20 * time.Minute)
+		backAt := gapAt.Add(10 * time.Second)
+		closedAt := backAt.Add(ephemeralPersistAfter + 5*time.Minute)
+		reopenAt := closedAt.Add(10 * time.Second)
+		due, at := observeEvery(&tr, t0, reopenAt.Add(ephemeralPersistAfter), func(now time.Time) []model.GuardListener {
+			if now.Equal(gapAt) || now.Equal(closedAt) {
+				return churn(now)
+			}
+			return withSockets(churn(now), persistent)
+		})
+		want := []time.Time{backAt.Add(ephemeralPersistAfter), reopenAt.Add(ephemeralPersistAfter)}
+		if !reflect.DeepEqual(at, want) || !due[0].firstSeen.Equal(backAt) || !due[1].firstSeen.Equal(reopenAt) {
+			t.Fatalf("due at %v (%+v), want %v", at, due, want)
+		}
+	})
+
+	t.Run("a report that reads the socket as a fact ends the episode", func(t *testing.T) {
+		var tr ephemeralSocketTracker
+		tr.observe("node-a", []model.GuardListener{persistent}, t0)
+		tr.observe("node-a", nil, t0.Add(10*time.Second))
+		if due := tr.observe("node-a", []model.GuardListener{persistent}, t0.Add(ephemeralPersistAfter)); len(due) != 0 {
+			t.Fatalf("an interrupted episode came due: %+v", due)
+		}
+	})
+
+	t.Run("the cap holds and keeps followed sockets", func(t *testing.T) {
+		var tr ephemeralSocketTracker
+		var first []model.GuardListener
+		for port := 40000; port < 40000+ephemeralTrackCap; port++ {
+			first = append(first, singBoxUDP(port))
+		}
+		tr.observe("node-a", first, t0)
+		// 100 new sockets sort ahead of the followed ones.
+		var burst []model.GuardListener
+		for port := 33000; port < 33100; port++ {
+			burst = append(burst, singBoxUDP(port))
+		}
+		tr.observe("node-a", append(burst, first...), t0.Add(10*time.Second))
+		nodes := tr.nodes["node-a"]
+		if len(nodes) != ephemeralTrackCap {
+			t.Fatalf("followed %d sockets, want the cap %d", len(nodes), ephemeralTrackCap)
+		}
+		if _, ok := nodes[ephemeralSocketKey{protocol: "udp", port: 33000, address: "::"}]; ok {
+			t.Fatal("a new socket took the place of a followed one")
+		}
+		due := tr.observe("node-a", first, t0.Add(ephemeralPersistAfter))
+		if len(due) != ephemeralTrackCap {
+			t.Fatalf("%d followed sockets came due, want %d", len(due), ephemeralTrackCap)
+		}
+	})
+
+	t.Run("node delete forgets", func(t *testing.T) {
+		srv, _, _, _, _ := newGuardRealityServerForTest(t, newGuardRealityTestClock(t0))
+		srv.ephemeralSockets.observe("node-a", []model.GuardListener{persistent}, t0)
+		srv.removeGuardRealityAudit("node-a")
+		if due := srv.ephemeralSockets.observe("node-a", []model.GuardListener{persistent}, t0.Add(ephemeralPersistAfter)); len(due) != 0 {
+			t.Fatalf("an episode survived node delete: %+v", due)
+		}
+	})
+}
+
+// The persistence audit runs on the production storage layout: one event for
+// a client socket that stays bound, none for churn, and no state write from
+// the report that records it.
+func TestPersistentEphemeralSocketAuditsWithoutWritingState(t *testing.T) {
+	f := openIngestFixture(t, t.TempDir())
+	defer f.st.Close()
+	clock := newGuardRealityTestClock(time.Date(2026, 10, 4, 9, 0, 0, 0, time.UTC))
+	f.srv.now = clock.Now
+	cookies, csrf := loginSession(t, f.handler)
+	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now()}
+	services := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
+	persistent := singBoxUDP(45678)
+	persistentAudits := func() []model.AuditEvent {
+		var out []model.AuditEvent
+		for _, ev := range f.st.AuditEvents() {
+			if ev.Action == auditActionEphemeralSocketPersistent {
+				out = append(out, ev)
+			}
+		}
+		return out
+	}
+
+	writes := watchStateFile(t, f.statePath())
+	var firstSeen time.Time
+	auditedAt := -1
+	// 45 minutes of reports; the persistent socket binds five minutes in, so
+	// its audit lands at 35 minutes, clear of the 15 minute clock flushes.
+	for i := 1; i <= 270; i++ {
+		sockets := churningClientSockets(i)
+		if i >= 30 {
+			sockets = append(sockets, persistent)
+		}
+		r.report(withSockets(services, sockets...))
+		if i == 30 {
+			firstSeen = r.at
+		}
+		wrote := writes.check()
+		if n := len(persistentAudits()); n == 1 && auditedAt < 0 {
+			auditedAt = i
+			if wrote {
+				t.Fatalf("the report that recorded the audit rewrote state")
+			}
+		} else if n > 1 {
+			t.Fatalf("report %d: %d persistence audits, want 1", i, n)
+		}
+	}
+	if auditedAt != 30+int(ephemeralPersistAfter/(10*time.Second)) {
+		t.Fatalf("audit recorded at report %d, want report %d", auditedAt, 30+int(ephemeralPersistAfter/(10*time.Second)))
+	}
+	ev := persistentAudits()[0]
+	want := map[string]string{
+		"protocol":   "udp",
+		"port":       "45678",
+		"address":    "::",
+		"process":    "sing-box",
+		"first_seen": firstSeen.UTC().Format(time.RFC3339),
+	}
+	for k, v := range want {
+		if ev.Metadata[k] != v {
+			t.Fatalf("audit metadata %s = %q, want %q (event %+v)", k, ev.Metadata[k], v, ev)
+		}
+	}
+	if ev.NodeID != "node-a" || ev.Decision != "observe" {
+		t.Fatalf("audit = %+v", ev)
+	}
+}

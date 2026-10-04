@@ -1,11 +1,14 @@
 package server
 
 import (
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/id"
 )
 
 // A proxy node's reality report lists the core's client sockets as listeners.
@@ -39,7 +42,21 @@ import (
 // on 41641. Any condition the server cannot check leaves the socket a fact:
 // noise on a node it cannot vouch for is better than a hidden service.
 //
-// One gap remains, and it is the agent's to close. On-box discovery reads
+// The owner name is a heuristic for telling noise from services, not a trust
+// boundary. It is the task name ss prints, which any local process can set,
+// so a process that calls itself sing-box and binds UDP inside the range on a
+// node whose inventory vouches is read as a client socket: it leaves the
+// listeners, the exposure counts and the missing-allow suggestions. Two
+// things bound that. Every such socket is still served in ephemeral_sockets,
+// and one that stays bound across reports for ephemeralPersistAfter is
+// audited once per episode as netguard.ephemeral_socket_persistent (see
+// ephemeralSocketTracker). Most client sockets close long before that; a
+// long-lived QUIC or hysteria outbound to an upstream also trips it, once,
+// and a listener waiting for connections has to. Closing the gap needs the agent to report the
+// owner's executable path or uid with each socket, so the server can check
+// the socket belongs to the sing-box the inventory describes.
+//
+// One more gap is also the agent's to close. On-box discovery reads
 // `sb --json list` and the config's inbounds, not sing-box endpoints, so a
 // WireGuard or Tailscale endpoint configured on sing-box by hand, with a
 // listen_port inside the range, reads as a client socket here. Lattice
@@ -142,4 +159,121 @@ func inventoryPort(raw string) (int, bool) {
 		return 0, false
 	}
 	return port, true
+}
+
+// ephemeralPersistAfter is how long a socket read as a sing-box client socket
+// may stay bound, report after report, before it is audited.
+const ephemeralPersistAfter = 30 * time.Minute
+
+// ephemeralTrackCap bounds how many client sockets are followed per node. A
+// report may list thousands; past the cap a new socket is not followed until
+// one that is followed goes away. Sockets already followed keep their place.
+const ephemeralTrackCap = 256
+
+// auditActionEphemeralSocketPersistent is recorded once per persistence
+// episode of one client socket.
+const auditActionEphemeralSocketPersistent = "netguard.ephemeral_socket_persistent"
+
+type ephemeralSocketKey struct {
+	protocol string
+	port     int
+	address  string
+}
+
+type ephemeralSocketEpisode struct {
+	firstSeen time.Time
+	audited   bool
+}
+
+// persistentEphemeralSocket is a client socket whose episode just crossed
+// ephemeralPersistAfter.
+type persistentEphemeralSocket struct {
+	socket    model.GuardListener
+	firstSeen time.Time
+}
+
+// ephemeralSocketTracker remembers, per node and in memory only, since when
+// each socket read as a client socket has been listed in consecutive reports.
+// A report that does not list a socket as a client socket ends its episode,
+// whether the socket closed or the report read it as a fact. A restart starts
+// every episode again. Nothing here is persisted, so following a socket never
+// writes state.
+type ephemeralSocketTracker struct {
+	mu    sync.Mutex
+	nodes map[string]map[ephemeralSocketKey]ephemeralSocketEpisode
+}
+
+// observe takes one accepted report's client sockets for a node and returns
+// the ones that have now been bound for ephemeralPersistAfter, each once per
+// episode, in report order.
+func (t *ephemeralSocketTracker) observe(nodeID string, sockets []model.GuardListener, now time.Time) []persistentEphemeralSocket {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	prev := t.nodes[nodeID]
+	if len(sockets) == 0 {
+		if prev != nil {
+			delete(t.nodes, nodeID)
+		}
+		return nil
+	}
+	next := make(map[ephemeralSocketKey]ephemeralSocketEpisode, min(len(sockets), ephemeralTrackCap))
+	// Sockets already followed first, so a burst of new ones cannot push a
+	// long episode out at the cap; then new ones while there is room.
+	for _, socket := range sockets {
+		key := ephemeralSocketKey{protocol: socket.Protocol, port: socket.Port, address: socket.Address}
+		if episode, ok := prev[key]; ok {
+			next[key] = episode
+		}
+	}
+	for _, socket := range sockets {
+		key := ephemeralSocketKey{protocol: socket.Protocol, port: socket.Port, address: socket.Address}
+		if _, ok := next[key]; !ok && len(next) < ephemeralTrackCap {
+			next[key] = ephemeralSocketEpisode{firstSeen: now}
+		}
+	}
+	var due []persistentEphemeralSocket
+	for _, socket := range sockets {
+		key := ephemeralSocketKey{protocol: socket.Protocol, port: socket.Port, address: socket.Address}
+		episode, ok := next[key]
+		if !ok || episode.audited || now.Sub(episode.firstSeen) < ephemeralPersistAfter {
+			continue
+		}
+		episode.audited = true
+		next[key] = episode
+		due = append(due, persistentEphemeralSocket{socket: socket, firstSeen: episode.firstSeen})
+	}
+	if t.nodes == nil {
+		t.nodes = map[string]map[ephemeralSocketKey]ephemeralSocketEpisode{}
+	}
+	t.nodes[nodeID] = next
+	return due
+}
+
+// forget drops a node's episodes (called on delete).
+func (t *ephemeralSocketTracker) forget(nodeID string) {
+	t.mu.Lock()
+	delete(t.nodes, nodeID)
+	t.mu.Unlock()
+}
+
+// auditPersistentEphemeralSockets follows the client sockets of an accepted
+// report and records one audit event for each socket that has stayed bound
+// for ephemeralPersistAfter. With the runtime bolt store, which production
+// runs, an audit append does not rewrite state.json.
+func (s *Server) auditPersistentEphemeralSockets(r *http.Request, nodeID string, sockets []model.GuardListener, now time.Time) {
+	for _, due := range s.ephemeralSockets.observe(nodeID, sockets, now) {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			Action:   auditActionEphemeralSocketPersistent,
+			Decision: "observe",
+			NodeID:   nodeID,
+			Metadata: map[string]string{
+				"protocol":   due.socket.Protocol,
+				"port":       strconv.Itoa(due.socket.Port),
+				"address":    due.socket.Address,
+				"process":    due.socket.Process,
+				"first_seen": due.firstSeen.UTC().Format(time.RFC3339),
+			},
+		})
+	}
 }

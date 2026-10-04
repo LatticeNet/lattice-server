@@ -181,6 +181,7 @@ func (s *Server) handleAgentGuardReality(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.auditPersistentEphemeralSockets(r, node.ID, stored.EphemeralSockets, receivedAt)
 	if s.shouldAuditGuardReality(node.ID, stored.Reality, s.now()) {
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
@@ -697,9 +698,11 @@ func guardRealityFingerprint(reality model.GuardNodeReality) string {
 
 // removeGuardRealityAudit drops a node's audit gate state (called on delete),
 // so a re-enrolled node with the same id starts by recording its reality again
-// instead of inheriting a stale fingerprint.
+// instead of inheriting a stale fingerprint, and its client socket episodes
+// start from nothing.
 func (s *Server) removeGuardRealityAudit(nodeID string) {
 	s.guardRealityAuditMu.Lock()
 	delete(s.guardRealityAudit, nodeID)
 	s.guardRealityAuditMu.Unlock()
+	s.ephemeralSockets.forget(nodeID)
 }

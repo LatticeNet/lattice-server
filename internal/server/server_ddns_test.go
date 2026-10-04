@@ -13,6 +13,7 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
 	"github.com/LatticeNet/lattice-server/internal/store"
+	"github.com/LatticeNet/lattice-server/internal/telemetry"
 )
 
 type fakeProvider struct{ records []ddns.Record }
@@ -465,5 +466,61 @@ func TestDDNSSweepHonoursInterval(t *testing.T) {
 	}
 	if len(fake.records) != 1 {
 		t.Fatalf("provider hit inside the interval: %+v", fake.records)
+	}
+}
+
+// failingDDNS refuses every write, the way a provider with a revoked token
+// does.
+type failingDDNS struct{}
+
+func (failingDDNS) Kind() string                                 { return "failing" }
+func (failingDDNS) SetRecord(context.Context, ddns.Record) error { return errors.New("status 403") }
+
+// The sweep retries a failing profile every interval, and records each retry
+// through RecordDDNSRun, which writes only an outcome that changed. A run an
+// operator asks for still writes before the answer.
+func TestDDNSSweepRetryOfTheSameFailureDoesNotRewriteState(t *testing.T) {
+	srv, handler, st := newDDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	if err := st.UpsertNode(model.Node{ID: "n1", PublicIP: "203.0.113.10"}); err != nil {
+		t.Fatal(err)
+	}
+	srv.ddnsProvider = func(model.DDNSProfile) (ddns.Provider, error) { return failingDDNS{}, nil }
+	clock := time.Date(2026, 10, 4, 1, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return clock }
+	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
+		`{"name":"cf","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true}`, cookies, csrf)
+	create.Body.Close()
+	if create.StatusCode != http.StatusOK {
+		t.Fatalf("create: %d", create.StatusCode)
+	}
+	writes := func(caller string) uint64 { return telemetry.CurrentSnapshot().StoreCallers[caller].Count }
+
+	before := writes("RecordDDNSRun")
+	srv.sweepDDNSOnce()
+	if got := writes("RecordDDNSRun") - before; got != 1 {
+		t.Fatalf("the first failure wrote %d times, want 1", got)
+	}
+	for i := 0; i < 3; i++ {
+		clock = clock.Add(10 * time.Minute)
+		before = writes("RecordDDNSRun")
+		srv.sweepDDNSOnce()
+		if got := writes("RecordDDNSRun") - before; got != 0 {
+			t.Fatalf("retry %d of the same failure wrote %d times, want 0", i+1, got)
+		}
+	}
+	id := fake4ProfileID(t, st)
+	if p, _ := st.DDNSProfile(id); !p.LastRunAt.Equal(clock) || p.LastError == "" {
+		t.Fatalf("the profile in memory does not show the last retry: %+v", p)
+	}
+
+	before = writes("UpsertDDNSProfile")
+	res := doJSON(t, handler, http.MethodPost, "/api/ddns/run", `{"id":"`+id+`"}`, cookies, csrf)
+	res.Body.Close()
+	if res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("operator run against a failing provider: %d", res.StatusCode)
+	}
+	if got := writes("UpsertDDNSProfile") - before; got != 1 {
+		t.Fatalf("an operator's run wrote %d times, want 1 before the answer", got)
 	}
 }

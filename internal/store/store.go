@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -306,10 +307,10 @@ type Store struct {
 	reportClockAtCommit time.Time
 	// metricsPersistedAt above is each node's LastSeen as the state file holds
 	// it, seeded at open and refreshed from every committed JSON write.
-	// nodeClocksUnflushed is set when a heartbeat or a token use changed a
-	// node in memory without a write, cleared by the next committed write, and
-	// written by Close. Guarded by mu.
-	nodeClocksUnflushed bool
+	// clocksUnflushed is set when a heartbeat, a token use or a DDNS run that
+	// changed nothing moved a clock in memory without a write, cleared by the
+	// next committed write, and written by Close. Guarded by mu.
+	clocksUnflushed bool
 	// loadedLastSeen is each node's LastSeen as Open read it from the state
 	// file. While a node's LastSeen still equals it, the node has not beaten
 	// in this process and the value is a lower bound (NodeLastSeenDiskLag).
@@ -1242,7 +1243,7 @@ func (s *Store) noteReportClocksOnDisk(st State) {
 			s.metricsPersistedAt[nodeID] = n.LastSeen
 		}
 	}
-	s.nodeClocksUnflushed = false
+	s.clocksUnflushed = false
 	s.reportClockAtCommit = s.reportClock
 	s.livenessOnDisk = make(map[string]time.Time, len(st.SingBoxLiveness))
 	for nodeID, rec := range st.SingBoxLiveness {
@@ -1697,7 +1698,7 @@ func (s *Store) TouchNodeToken(nodeID string, at time.Time, minInterval time.Dur
 	sinceWrite, sinceBeat := at.Sub(written), at.Sub(n.LastSeen)
 	if onDisk && sinceWrite >= 0 && sinceWrite < metricsPersistenceInterval &&
 		sinceBeat >= 0 && sinceBeat < tokenUseRidesWithin {
-		s.nodeClocksUnflushed = true
+		s.clocksUnflushed = true
 		return true, nil
 	}
 	return true, s.Save()
@@ -1835,7 +1836,7 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 	// the interval from there, rather than waiting for the clock to catch up.
 	lastPersisted, persisted := s.metricsPersistedAt[nodeID]
 	if d := now.Sub(lastPersisted); persisted && !durableChanged && d >= 0 && d < metricsPersistenceInterval {
-		s.nodeClocksUnflushed = true
+		s.clocksUnflushed = true
 		return false, nil
 	}
 	if err := s.Save(); err != nil {
@@ -3258,7 +3259,7 @@ func (s *Store) Close() error {
 	// the next write. A clean shutdown writes them, so a restart resumes from
 	// the newest report rather than from one up to reportClockPersistInterval
 	// old.
-	if s.nodeClocksUnflushed || s.reportClocksUnflushedLocked() {
+	if s.clocksUnflushed || s.reportClocksUnflushedLocked() {
 		closeErr = s.Save()
 	}
 	if s.wal != nil {
@@ -4238,6 +4239,40 @@ func (s *Store) UpsertDDNSProfile(p model.DDNSProfile) error {
 	}
 	s.state.DDNS[p.ID] = p
 	return s.Save()
+}
+
+// RecordDDNSRun stores the outcome of one automatic DDNS run. A run whose
+// outcome matches the stored profile (the same error again, or nothing new
+// published) moves only LastRunAt, the clock that spaces out the next
+// attempt: it waits in memory for the next state write, and Close writes it.
+// A profile whose provider keeps refusing is retried every interval, and each
+// retry rewrote the whole state file to record the same error. A changed
+// outcome, an error that appeared, cleared or changed, or a newly published
+// address, is written before this returns. A restart that loses LastRunAt
+// only brings the next attempt forward.
+func (s *Store) RecordDDNSRun(p model.DDNSProfile) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.state.DDNS[p.ID]; ok && ddnsRunOutcomeEqual(current, p) {
+		p.UpdatedAt = current.UpdatedAt
+		s.state.DDNS[p.ID] = p
+		s.clocksUnflushed = true
+		return nil
+	}
+	p.UpdatedAt = time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = p.UpdatedAt
+	}
+	s.state.DDNS[p.ID] = p
+	return s.Save()
+}
+
+// ddnsRunOutcomeEqual compares two profiles with their run clock and update
+// time cleared.
+func ddnsRunOutcomeEqual(a, b model.DDNSProfile) bool {
+	a.LastRunAt, b.LastRunAt = time.Time{}, time.Time{}
+	a.UpdatedAt, b.UpdatedAt = time.Time{}, time.Time{}
+	return reflect.DeepEqual(a, b)
 }
 
 // DDNSProfile returns a profile by id.

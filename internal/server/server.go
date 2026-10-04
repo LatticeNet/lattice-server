@@ -6195,7 +6195,7 @@ func (s *Server) sweepDDNSOnce() int {
 		if unchanged && profile.LastError == "" {
 			continue
 		}
-		if err := s.runDDNSWithAudit(profile, v4, v6, s.recordAudit); err != nil {
+		if err := s.runDDNSWithAudit(profile, v4, v6, s.recordAudit, false); err != nil {
 			s.logger.Printf("ddns sweep: %s (%s): %v", profile.Name, profile.NodeID, err)
 			continue
 		}
@@ -6316,16 +6316,20 @@ func (s *Server) maybeTriggerDDNS(nodeID, oldV4, oldV6, newV4, newV6 string) {
 
 // runDDNS applies a profile and records the run outcome on the profile.
 func (s *Server) runDDNS(profile model.DDNSProfile, v4, v6 string) error {
-	return s.runDDNSWithAudit(profile, v4, v6, s.recordAudit)
+	return s.runDDNSWithAudit(profile, v4, v6, s.recordAudit, false)
 }
 
 func (s *Server) runDDNSForPrincipal(p principal, profile model.DDNSProfile, v4, v6 string) error {
 	return s.runDDNSWithAudit(profile, v4, v6, func(ev model.AuditEvent) {
 		s.recordPrincipalAudit(p, ev)
-	})
+	}, true)
 }
 
-func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, record func(model.AuditEvent)) error {
+// runDDNSWithAudit applies a profile, records the outcome on it and audits the
+// run. byOperator is a run an operator asked for, whose outcome is written
+// before the answer; the sweep's runs go through RecordDDNSRun, which writes
+// only an outcome that changed.
+func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, record func(model.AuditEvent), byOperator bool) error {
 	prov, err := s.ddnsProvider(profile)
 	if err != nil {
 		return err
@@ -6355,7 +6359,11 @@ func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, reco
 		}
 		profile.LastError = ""
 	}
-	if err := s.store.UpsertDDNSProfile(profile); err != nil {
+	persist := s.store.RecordDDNSRun
+	if byOperator {
+		persist = s.store.UpsertDDNSProfile
+	}
+	if err := persist(profile); err != nil {
 		s.logger.Printf("ddns: persist profile %s: %v", profile.ID, err)
 	}
 	record(model.AuditEvent{ID: id.New("audit"), NodeID: profile.NodeID, Action: "ddns.run", Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": profile.ID, "ok": fmt.Sprintf("%t", applyErr == nil)}})

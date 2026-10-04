@@ -150,6 +150,9 @@ func TestARecoveryDigestLeavesOutWhatARuleMissed(t *testing.T) {
 	d.resolve("b")
 	d.sweep()
 	d.expect("the recoveries", "nc-day Lattice agent recovered digest: 2 nodes", "nc-night Agent loop recovered: name-b")
+	if rows := d.withheld(); len(rows) != 1 || rows[0].RuleID != "nr-night" || strings.Join(rows[0].IncidentIDs, ",") != a || rows[0].Title != "Agent loop recovered: name-a" {
+		t.Fatalf("withheld rows = %+v", rows)
+	}
 }
 
 // An incident that reopens before its recovery went out leaves the phone
@@ -397,5 +400,42 @@ func TestRecoveriesReadTheOutboxOncePerEventType(t *testing.T) {
 	d.expect("the recoveries", "nc-day Lattice agent recovered digest: 34 nodes", "nc-night Lattice agent recovered digest: 34 nodes")
 	if len(reads) != 1 || reads[0].EventType != EventAgentStalled {
 		t.Fatalf("outbox reads during the recovery sweep = %d %+v, want one for %s", len(reads), reads, EventAgentStalled)
+	}
+}
+
+// withheld returns the recoveries the Sent log records as withheld.
+func (d *dayNight) withheld() []store.NotifyDelivery {
+	return deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeSuppressed, EventType: EventAgentRecovered})
+}
+
+// When the only rule that routes the recovery never heard the open, nothing
+// is sent, and the Sent log says so: one withheld row for that rule, naming
+// the incident and why, so "why was I not told it recovered" has an answer.
+func TestAWithheldRecoveryIsRecorded(t *testing.T) {
+	d := newDayNight(t, "a")
+	if err := d.h.f.st.UpsertNotifyRuleWithOptions(model.NotifyRule{ID: "nr-day", Name: "day", EventTypes: []string{EventAgentStalled},
+		ChannelIDs: []string{"nc-day"}, Enabled: true}, store.NotifyRuleOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	post, _, _ := incidentPoster(d.h)
+	id := d.open("a")
+	post("/api/incidents/ack", id)
+	d.endQuietHours()
+	d.expect("withdrawn")
+
+	d.h.clock.advance(time.Minute)
+	d.resolve("a")
+	d.sweep()
+	d.expect("the recovery")
+	rows := d.withheld()
+	if len(rows) != 1 {
+		t.Fatalf("withheld rows = %+v", rows)
+	}
+	if r := rows[0]; r.RuleID != "nr-night" || r.Reason != notifyWithheldRecovery || strings.Join(r.IncidentIDs, ",") != id ||
+		r.Title != "Agent loop recovered: name-a" || r.ChannelID != "" || r.SettledAt.IsZero() {
+		t.Fatalf("withheld row = %+v", r)
+	}
+	if rows := deliveriesOf(d.h.f.st, store.NotifyDeliveryFilter{Outcome: store.NotifyOutcomeNoRoute}); len(rows) != 0 {
+		t.Fatalf("a routed recovery was recorded as unrouted: %+v", rows)
 	}
 }

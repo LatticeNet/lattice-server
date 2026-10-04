@@ -729,10 +729,11 @@ func (s *Server) sendRuleOpens(byRule map[string]map[string][]incidentOutgoing) 
 // delivered is told, so no channel that heard "down" is left without "up".
 // When any rule missed one, each rule that routes the event type gets its
 // own message, through it alone, without the incidents it missed, and a
-// rule that missed them all gets none. One outbox read decides for every
-// item. A recovery quiet hours hold is judged again when it falls due
-// (heldIncidentWithdrawal). With no rule enabled at all, every channel gets
-// the whole message, as for any event.
+// rule that missed them all gets none; either way the Sent log records,
+// for that rule, which recoveries were withheld and why. One outbox read
+// decides for every item. A recovery quiet hours hold is judged again when
+// it falls due (heldIncidentWithdrawal). With no rule enabled at all, every
+// channel gets the whole message, as for any event.
 func (s *Server) sendRecoveries(eventType string, items []incidentOutgoing) {
 	if len(items) == 0 {
 		return
@@ -762,15 +763,30 @@ func (s *Server) sendRecoveries(eventType string, items []incidentOutgoing) {
 		s.sendIncidentMessages(eventType, items)
 		return
 	}
+	now := s.now()
+	var withheld []store.NotifyDelivery
 	for _, rule := range rules {
 		if !routes(rule) {
 			continue
 		}
-		var told []incidentOutgoing
+		var told, left []incidentOutgoing
 		for _, item := range items {
-			if !slices.Contains(missed[item.incidentID], rule.ID) {
+			if slices.Contains(missed[item.incidentID], rule.ID) {
+				left = append(left, item)
+			} else {
 				told = append(told, item)
 			}
+		}
+		if len(left) > 0 {
+			// The Sent log says what the rule was not told and why. Stored
+			// as it is, not folded like held messages are, since a fold
+			// would merge rules: at most one row per rule per recovery.
+			title, body, ids := incidentNotice(eventType, left)
+			withheld = append(withheld, store.NotifyDelivery{
+				ID: id.New("nd"), EventID: id.New("evt"), EventType: eventType, Source: store.NotifySourceServer,
+				RuleID: rule.ID, RuleName: rule.Name, Outcome: store.NotifyOutcomeSuppressed, Reason: notifyWithheldRecovery,
+				Title: title, Body: body, IncidentIDs: ids, CreatedAt: now, SettledAt: now,
+			})
 		}
 		if len(told) == 0 {
 			continue
@@ -778,6 +794,9 @@ func (s *Server) sendRecoveries(eventType string, items []incidentOutgoing) {
 		title, body, ids := incidentNotice(eventType, told)
 		s.commitNotifyPlan(s.planNotifyEvent(eventType, title, body,
 			notifyEnqueue{source: store.NotifySourceServer, onlyRule: &rule, incidentIDs: ids}))
+	}
+	if err := s.store.RecordNotifyDeliveries(withheld); err != nil {
+		s.logger.Printf("notify: record withheld %s: %v", eventType, err)
 	}
 }
 

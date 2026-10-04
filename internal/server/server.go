@@ -4444,6 +4444,13 @@ func (s *Server) handleRevealTaskScript(w http.ResponseWriter, r *http.Request, 
 	if !s.requireAllNodeScopes(w, p, "task:read", task.Targets) {
 		return
 	}
+	// A script that carries another surface's credential also needs that
+	// surface's own reveal scope (task_script_owner.go). Checked before the
+	// reveal gate so a caller who cannot have the script is told why without
+	// spending a step-up on it.
+	if !s.requireTaskScriptOwners(w, p, task) {
+		return
+	}
 	reveal, ok := s.requireSecretReveal(w, p, req.StepUpGrant, model.AuditEvent{Action: "task.script.reveal", Scope: "task:read", Metadata: map[string]string{"task_id": task.ID}})
 	if !ok {
 		return

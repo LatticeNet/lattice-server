@@ -297,6 +297,13 @@ type Store struct {
 	// Guarded by mu.
 	livenessOnDisk     map[string]time.Time
 	guardRealityOnDisk map[string]time.Time
+	// reportClock is the received_at of the latest liveness or guard reality
+	// report, and reportClockAtCommit what it was at the last committed write.
+	// A copy on disk newer than reportClockAtCommit was written after the
+	// clock stepped back and is as fresh as that write (reportClockDueLocked).
+	// Guarded by mu.
+	reportClock         time.Time
+	reportClockAtCommit time.Time
 	// metricsPersistedAt above is each node's LastSeen as the state file holds
 	// it, seeded at open and refreshed from every committed JSON write.
 	// nodeClocksUnflushed is set when a heartbeat or a token use changed a
@@ -1236,6 +1243,7 @@ func (s *Store) noteReportClocksOnDisk(st State) {
 		}
 	}
 	s.nodeClocksUnflushed = false
+	s.reportClockAtCommit = s.reportClock
 	s.livenessOnDisk = make(map[string]time.Time, len(st.SingBoxLiveness))
 	for nodeID, rec := range st.SingBoxLiveness {
 		s.livenessOnDisk[nodeID] = rec.ReceivedAt
@@ -1265,9 +1273,23 @@ func (s *Store) reportClocksUnflushedLocked() bool {
 // reportClockDue reports whether a clock-only update must still be written
 // because the copy on disk is older than reportClockPersistInterval, or there
 // is no copy on disk at all.
-func reportClockDue(onDisk map[string]time.Time, nodeID string, receivedAt time.Time) bool {
+func (s *Store) reportClockDueLocked(onDisk map[string]time.Time, nodeID string, receivedAt time.Time) bool {
 	written, ok := onDisk[nodeID]
-	return !ok || receivedAt.Sub(written) >= reportClockPersistInterval
+	if !ok {
+		return true
+	}
+	// After the clock steps back, a copy written since carries a received_at
+	// from before the step for every node that has not reported again. It is
+	// as fresh as the write that put it there, so it is judged from that
+	// write's report clock; otherwise each node would write once more.
+	if c := s.reportClockAtCommit; !c.IsZero() && written.After(c) {
+		written = c
+	}
+	// A report from before the copy on disk means the clock went back: write
+	// once and restart the interval from there, instead of leaving the copy
+	// on disk to age until the clock catches up.
+	d := receivedAt.Sub(written)
+	return d < 0 || d >= reportClockPersistInterval
 }
 
 func (s *Store) jsonPersistState() State {

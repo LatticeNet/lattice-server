@@ -4,6 +4,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // The download must be allowed to use the budget the task actually has.
@@ -58,5 +60,19 @@ func TestAgentUpdateDownloadStepCarriesTimeoutsOnBothSources(t *testing.T) {
 		if !strings.Contains(step, agentFetchWgetTimeouts) {
 			t.Fatalf("source %s: wget timeouts missing from %q", source, step)
 		}
+	}
+}
+
+// The plan states the limits the script enforces. It said 300 s for a month
+// after the script moved to 480 s.
+func TestAgentUpdatePlanStatesTheDownloadLimitsTheScriptEnforces(t *testing.T) {
+	plan := renderAgentUpdatePlan(model.Node{ID: "node-a"}, agentUpdatePayload{NodeID: "node-a"}, "manual")
+	want := "- the download gives up after " + agentFetchConnectSec + " s without a connection or " + agentFetchBudgetSec + " s in total,"
+	if !strings.Contains(plan, want) {
+		t.Fatalf("plan does not state the enforced download limits %q:\n%s", want, plan)
+	}
+	if !strings.Contains(agentFetchCurlTimeouts, "--connect-timeout "+agentFetchConnectSec+" ") ||
+		!strings.HasSuffix(agentFetchCurlTimeouts, "--max-time "+agentFetchBudgetSec) {
+		t.Fatalf("curl flags %q disagree with the stated limits", agentFetchCurlTimeouts)
 	}
 }

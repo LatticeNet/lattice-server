@@ -980,7 +980,7 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "- download is HTTPS-only and verified against the pinned SHA-256 digest\n")
 	fmt.Fprintf(&b, "- binary is installed atomically with a timestamped backup\n")
 	fmt.Fprintf(&b, "- service restart is delayed so the current agent can post the task result\n")
-	fmt.Fprintf(&b, "- the download gives up after 20 s without a connection or 300 s in total, so a node without egress to the source fails the task instead of hanging it\n")
+	fmt.Fprintf(&b, "- the download gives up after %s s without a connection or %s s in total, so a node without egress to the source fails the task instead of hanging it\n", agentFetchConnectSec, agentFetchBudgetSec)
 	fmt.Fprintf(&b, "- default/legacy install targets follow the running lattice-agent path and default service may follow the running systemd unit\n")
 	fmt.Fprintf(&b, "%s\n", agentUpdateKeepalivePlanLine)
 	fmt.Fprintf(&b, "%s\n", agentUpdateGuardPlanLine)
@@ -1619,9 +1619,15 @@ func agentUpdateLeasePreflight(source string) string {
 // at the lease. Raising it further means raising the task timeout, which cannot
 // go past ten minutes: the agent treats a larger value as out of range and
 // falls back to 30 s rather than clamping.
+//
+// The plan an operator approves states these limits, so it reads them from
+// here rather than repeating the numbers: the 300 s total stayed in the plan
+// text for a month after the script moved to 480 s.
 const (
-	agentFetchCurlTimeouts = " --connect-timeout 20 --max-time 480"
-	agentFetchWgetTimeouts = " --timeout=20 --tries=2"
+	agentFetchConnectSec   = "20"
+	agentFetchBudgetSec    = "480"
+	agentFetchCurlTimeouts = " --connect-timeout " + agentFetchConnectSec + " --max-time " + agentFetchBudgetSec
+	agentFetchWgetTimeouts = " --timeout=" + agentFetchConnectSec + " --tries=2"
 )
 
 // agentUpdateDownloadStep renders the one fetch the approved plan chose, rather

@@ -513,7 +513,18 @@ func publishProxyUserShare(t *testing.T, st *store.Store, userID, slug, token st
 }
 
 func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
-	handler, st := newTestServer(t)
+	// Built here rather than through newTestServer because the test needs the
+	// server: the first-seen share-fetch audit is written on its own goroutine
+	// (noteShareFetch), and the audit assertions below must wait for it.
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
 	createProxyPlanFixtures(t, handler, cookies, csrf, "node-a")
@@ -642,6 +653,7 @@ func TestProxySubscriptionServesPlainAndBase64(t *testing.T) {
 		}
 	}
 
+	srv.shareFetchAudits.Wait()
 	hash := proxySubTokenAuditHash(token)
 	if !auditMetadataSeen(st, auditActionShareFetch, "token_sha256", hash) {
 		t.Fatalf("subscription fetch audit missing token hash: %+v", st.AuditEvents())

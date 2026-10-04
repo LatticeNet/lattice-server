@@ -18,6 +18,7 @@ import (
 
 	"github.com/LatticeNet/lattice-server/internal/geoip"
 	"github.com/LatticeNet/lattice-server/internal/logstore"
+	"github.com/LatticeNet/lattice-server/internal/metricsdb"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/secret"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
@@ -212,6 +213,17 @@ func main() {
 			log.Printf("trace store: %s (PLAINTEXT — connection metadata includes destination hosts; set a master key to encrypt)", tracePath)
 		}
 	}
+	// Open the self-monitoring history (metrics.db) beside the state file.
+	// In-memory mode keeps no history.
+	var selfMonitor server.SelfMonitorOptions
+	if dataPath != "" {
+		var closeMetrics func()
+		selfMonitor, closeMetrics, err = openSelfMonitor(dataDir, dataPath, runtimeBoltHotStore, os.LookupEnv, time.Now(), log.Printf)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer closeMetrics()
+	}
 	geoResolver, err := geoip.NewHTTPResolver(geoIPLookupURL)
 	if err != nil {
 		log.Fatal(err)
@@ -230,6 +242,7 @@ func main() {
 		Store:         st,
 		LogStore:      logStore,
 		TraceStore:    traceStore,
+		SelfMonitor:   selfMonitor,
 		WebFS:         os.DirFS(webRoot),
 		AdminUsername: os.Getenv("LATTICE_ADMIN_USERNAME"),
 		AdminPassword: os.Getenv("LATTICE_ADMIN_PASSWORD"),
@@ -396,6 +409,49 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		log.Fatalf("invalid %s duration %q: %v", key, raw, err)
 	}
 	return d
+}
+
+// openSelfMonitor opens the self-monitoring history (metrics.db) beside the
+// state file: the control plane's process and host, its stores, route groups
+// and plugin calls, and the node metrics agents beat in, in fixed tiers that
+// bound the file. It holds no secrets and no authority, so it is not
+// encrypted, and losing it loses history only. So a file that cannot be read
+// (damaged, or from a newer schema after a rollback) is moved aside and a
+// fresh one started, and when even that fails the server runs without
+// history and the System page says why. Only a malformed
+// LATTICE_METRICS_MAX_SERIES, an operator's typo, is an error. The returned
+// close func is never nil.
+func openSelfMonitor(dataDir, dataPath, hotStorePath string, lookupEnv func(string) (string, bool), now time.Time, logf func(string, ...any)) (server.SelfMonitorOptions, func(), error) {
+	noop := func() {}
+	maxSeries := 0
+	if v, ok := lookupEnv("LATTICE_METRICS_MAX_SERIES"); ok && strings.TrimSpace(v) != "" {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil || n < 1 {
+			return server.SelfMonitorOptions{}, noop, fmt.Errorf("invalid LATTICE_METRICS_MAX_SERIES %q: want a positive integer", v)
+		}
+		maxSeries = n
+	}
+	metricsPath := filepath.Join(dataDir, "metrics.db")
+	db, rec, err := metricsdb.OpenOrReset(metricsPath, metricsdb.Options{MaxSeries: maxSeries}, now)
+	if rec != nil {
+		logf("metrics store: %s could not be used (%v); moved it to %s and started a fresh history", metricsPath, rec.Cause, rec.MovedTo)
+	}
+	if err != nil {
+		logf("metrics store: %v; running without self-monitoring history", err)
+		return server.SelfMonitorOptions{Unavailable: fmt.Sprintf("metrics.db could not be opened, so this server keeps no history until it restarts with a usable file: %v", err)}, noop, nil
+	}
+	files := []server.MonitoredFile{
+		{Label: "state.json", Path: dataPath},
+		{Label: "audit-wal", Path: dataPath + ".audit-wal"},
+		{Label: "logs.db", Path: filepath.Join(dataDir, "logs.db")},
+		{Label: "trace.db", Path: filepath.Join(dataDir, "trace.db")},
+	}
+	if hotStorePath != "" {
+		files = append(files, server.MonitoredFile{Label: "state-hot.db", Path: hotStorePath})
+	}
+	st, _ := db.Stats()
+	logf("metrics store: %s (%d series of %d; tiers 1m/48h, 5m/14d, 1h/90d, 1d/5y)", metricsPath, st.Series, st.MaxSeries)
+	return server.SelfMonitorOptions{DB: db, DataDir: dataDir, Files: files}, func() { _ = db.Close() }, nil
 }
 
 func bindPluginRuntimePoolFlags(fs *flag.FlagSet, lookupEnv func(string) (string, bool)) (*plugin.SystemPoolConfig, error) {

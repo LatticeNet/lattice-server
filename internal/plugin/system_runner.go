@@ -111,6 +111,13 @@ type SystemRunnerOptions struct {
 	// Nil observes nothing. The observer must be cheap and must not call back
 	// into the runner.
 	PoolObserver SystemPoolObserver
+	// ProcessObserver receives what a plugin process used, from the kernel's
+	// accounting when it exits: user plus system CPU time and peak resident
+	// set. A per-invocation process reports when the invocation ends; a
+	// pooled worker when it retires, so its CPU lands in the minute it
+	// leaves. Nil observes nothing. It must be cheap and must not call back
+	// into the runner.
+	ProcessObserver func(pluginID string, cpu time.Duration, maxRSSBytes int64)
 }
 
 type systemPluginState struct {
@@ -336,7 +343,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		pool.replenishFn = func(parent context.Context, gen uint64) (*pooledWorker, error) {
 			ctx, cancel := context.WithTimeout(parent, r.poolConfig.StartTimeout)
 			defer cancel()
-			t, err := startSystemWorker(ctx, execPath, workDir, r.v2ChildEnv(gen))
+			t, err := startSystemWorkerObserved(ctx, execPath, workDir, r.v2ChildEnv(gen), r.processExitFor(pluginID))
 			if err != nil {
 				return nil, err
 			}
@@ -344,7 +351,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		}
 		startupCtx, cancel := context.WithTimeout(ctx, r.poolConfig.StartTimeout)
 		startBegan := time.Now()
-		transport, startErr := startSystemWorker(startupCtx, execPath, workDir, r.v2ChildEnv(req.Generation))
+		transport, startErr := startSystemWorkerObserved(startupCtx, execPath, workDir, r.v2ChildEnv(req.Generation), r.processExitFor(pluginID))
 		if startErr == nil {
 			startErr = transport.awaitReadyContext(startupCtx, req.Generation)
 		}
@@ -1225,6 +1232,9 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 	defer stdout.Close()
 	go func() {
 		waitErr = cmd.Wait()
+		if observe := r.processExitFor(req.PluginID); observe != nil {
+			observe(cmd.ProcessState)
+		}
 		close(waitDone)
 	}()
 	go func() {

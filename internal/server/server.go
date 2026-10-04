@@ -71,7 +71,11 @@ type Options struct {
 	// TraceStore is the sing-box connection trace database (trace.db). Nil
 	// disables tracing: its endpoints return 503 and agents are told to collect
 	// nothing. Injected by main beside LogStore with the same cipher.
-	TraceStore    *tracestore.Store
+	TraceStore *tracestore.Store
+	// SelfMonitor wires the control plane's own history (metrics.db): its
+	// process and host, store writes, route groups, plugin calls and the
+	// node metrics agents beat in. Its zero value keeps no history.
+	SelfMonitor   SelfMonitorOptions
 	AdminUsername string
 	AdminPassword string
 	Build         BuildInfo
@@ -359,6 +363,13 @@ type Server struct {
 	latencySyncStop     chan struct{}
 	latencySyncStopOnce sync.Once
 	latencySyncLoops    sync.WaitGroup
+	// selfmon records the control plane's own history into metrics.db; nil
+	// when no metrics store is wired. selfmonStarted says its sampler runs.
+	selfmon        *selfMonitor
+	selfmonStarted bool
+	// selfmonUnavailable is why there is no metrics store although a data
+	// directory was configured; the self-monitoring reads answer 503 with it.
+	selfmonUnavailable string
 	// latencyEdges holds the provider edge names the control plane resolved
 	// for the latency probes; see latency_edges.go.
 	latencyEdges latencyEdgeCache
@@ -780,6 +791,9 @@ func New(opts Options) (*Server, error) {
 			Logf:         s.logger.Printf,
 			Pool:         opts.PluginRuntimePool,
 			PoolObserver: pluginPoolTelemetry{},
+			// What each plugin process used, read when it exits, for the
+			// System page's plugins table (metrics.db).
+			ProcessObserver: telemetry.ObservePluginProcess,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("configure plugin runtime: %w", err)
@@ -796,6 +810,10 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s.loadPlugins(opts.PluginDir, opts.PluginBundleCacheDir, opts.PluginTrust)
+	s.selfmonUnavailable = opts.SelfMonitor.Unavailable
+	s.selfmon = newSelfMonitor(opts.SelfMonitor, s.logger, s.now,
+		func(id string) bool { _, ok := s.store.Node(id); return ok },
+		func(id string) bool { _, ok := s.loadedPlugin(id); return ok })
 	if !opts.DisableRenewalScheduler {
 		s.startRenewalScheduler()
 		// Before the sweeper and before serving: the mark reads the fleet's
@@ -817,6 +835,10 @@ func New(opts Options) (*Server, error) {
 		s.startLineClientTemplateSync()
 		s.startLatencyProbeSync()
 		s.startStateWriteSummary()
+		if s.selfmon != nil {
+			s.selfmon.start()
+			s.selfmonStarted = true
+		}
 	}
 	if s.auditHeadShipper != nil {
 		s.auditHeadShipper.start()
@@ -1209,7 +1231,7 @@ func decodePluginArtifact(value string) ([]byte, error) {
 }
 
 func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
+	mux := newRouteGroupMux()
 	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/login/totp", s.handleLoginTOTP)
 	mux.HandleFunc("/api/auth/oidc", s.handleOIDCList)
@@ -1511,6 +1533,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/debug-events", s.withAgentLimit(s.handleAgentDebugEvents))
 	mux.HandleFunc("/api/agent/event", s.withAgentLimit(s.handleAgentEvent))
 	mux.HandleFunc(agentBinaryPathPrefix, s.withAgentLimit(s.handleAgentBinary))
+	// Self-monitoring (metrics.db): a node's long-term history is a node
+	// read; the control plane's own internals need a full administrator,
+	// which the handlers check (server_selfmon_api.go).
+	mux.HandleFunc("/api/nodes/history", s.withAuth("node:read", s.handleNodeHistory))
+	mux.HandleFunc("/api/system/health", s.withAuth("", s.handleSystemHealth))
+	mux.HandleFunc("/api/system/series", s.withAuth("", s.handleSystemSeries))
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -1524,7 +1552,7 @@ func (s *Server) Handler() http.Handler {
 	// network cannot reach GitHub. No credential goes in or comes out.
 	mux.HandleFunc(knockToolPathPrefix, s.handleKnockTool)
 	mux.Handle("/", s.staticHandler())
-	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux)))
+	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux), mux.groups))
 }
 
 // Close sends the alerts still queued for the next sweep, stops
@@ -1567,6 +1595,9 @@ func (s *Server) Close(ctx context.Context) error {
 	}
 	waitWithin(&s.shareFlushers)
 	waitWithin(&s.latencySyncLoops)
+	// The self-monitor writes the minute it was collecting, so a restart
+	// loses no more than the seconds since that write.
+	s.selfmon.close(ctx, s.selfmonStarted)
 	s.flushShareFetchStats(s.now(), true)
 	s.flushShareRefusalAudit(s.now())
 	waitWithin(&s.shareFetchAudits)
@@ -8927,6 +8958,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	if cameOnline {
 		s.recordNodeOnline(req.NodeID)
 	}
+	s.selfmon.observeBeat(req.NodeID, req.Metrics, s.now())
 	s.replaceAgentCapabilities(req.NodeID, req.Capabilities)
 	if old.PublicIP != v4 || old.PublicIPv6 != v6 {
 		s.invalidateLineReadModel()
@@ -9681,9 +9713,10 @@ func requestIDFromRequest(r *http.Request) string {
 // handlers keep working.
 type logResponseWriter struct {
 	http.ResponseWriter
-	status int
-	bytes  int
-	wrote  bool
+	status   int
+	bytes    int
+	wrote    bool
+	hijacked bool
 }
 
 func (w *logResponseWriter) WriteHeader(code int) {
@@ -9718,7 +9751,11 @@ func (w *logResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if !ok {
 		return nil, nil, errors.New("response does not support hijacking")
 	}
-	return hj.Hijack()
+	conn, rw, err := hj.Hijack()
+	if err == nil {
+		w.hijacked = true
+	}
+	return conn, rw, err
 }
 
 // withRequestLog logs HTTP requests with method, path, status, response size,
@@ -9728,7 +9765,7 @@ func (w *logResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 //
 //	LATTICE_ACCESS_LOG=1            log every request (verbose)
 //	LATTICE_SLOW_REQUEST_MS=<n>     slow-request threshold in ms (default 1000)
-func (s *Server) withRequestLog(next http.Handler) http.Handler {
+func (s *Server) withRequestLog(next http.Handler, groups routeGroups) http.Handler {
 	logAll := os.Getenv("LATTICE_ACCESS_LOG") == "1"
 	slowMS := 1000
 	if v := strings.TrimSpace(os.Getenv("LATTICE_SLOW_REQUEST_MS")); v != "" {
@@ -9745,6 +9782,11 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 		dur := time.Since(start)
 		slowRequest := dur >= slow
 		telemetry.ObserveHTTPRequest(observabilityPath, lw.status, dur, slowRequest)
+		// A hijacked connection (a terminal or control stream) lives for
+		// hours; its "duration" is a session length, not a latency.
+		if !lw.hijacked {
+			telemetry.ObserveRoute(groups.group(observabilityPath), lw.status, dur)
+		}
 		if !logAll && dur < slow && lw.status < 500 {
 			return
 		}

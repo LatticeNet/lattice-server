@@ -64,6 +64,23 @@ hour, counted by the store method that asked for each one, for example
 Writes to the bolt hot store are not in that count. An hour with no
 `state.json` writes logs nothing.
 
+The server also keeps its own long-term history in `metrics.db` beside the
+state file: its process (CPU, RSS, Go heap, goroutines, GC pause, open files)
+and host as the container sees it (load, memory, the data volume, the sizes
+of the data files), state writes by caller, HTTP route groups, plugin calls
+by method with their processes' CPU and peak memory, and the metrics each
+node beats in. Points are kept at 1 minute for 48 hours, 5 minutes for 14
+days, 1 hour for 90 days and 1 day for five years, and the number of series is
+capped (1024 by default, `LATTICE_METRICS_MAX_SERIES` to change it), so the
+file stops growing at a size the series count fixes. A full administrator
+reads it on the console's System page (`/api/system/health`,
+`/api/system/series`); a node's history is a node read
+(`/api/nodes/history`). It holds no secrets and no authority: deleting it
+loses history only, and backups may leave it out. A `metrics.db` the server
+cannot read (damaged, or written by a newer release before a rollback) is
+moved aside as `metrics.db.unreadable-<unix time>` and a fresh one started;
+the server never refuses to start over it.
+
 Self-host DNS can optionally install a pinned CoreDNS executable during an
 approved `selfdns` apply. Leave these unset to keep the stricter precondition
 that `coredns` must already exist on the node:

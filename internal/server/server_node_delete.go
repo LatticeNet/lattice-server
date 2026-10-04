@@ -48,10 +48,11 @@ type nodeDeleteSummary struct {
 	LineChainDefinitionsDeleted int    `json:"line_chain_definitions_deleted"`
 	LineChainTargetsDrifted     int    `json:"line_chain_targets_drifted"`
 	LineChainLeaseConflicts     int    `json:"line_chain_lease_conflicts"`
-	TerminalSessions            int    `json:"terminal_sessions"`    // closed (delete) / active (plan)
-	ProxyDriftCleared           int    `json:"proxy_drift_cleared"`  // 0/1
-	LogStorePurged              int    `json:"log_store_purged"`     // delete only
-	LogStorePurgeErrs           int    `json:"log_store_purge_errs"` // surfaced, not swallowed
+	TerminalSessions            int    `json:"terminal_sessions"`     // closed (delete) / active (plan)
+	ProxyDriftCleared           int    `json:"proxy_drift_cleared"`   // 0/1
+	LogStorePurged              int    `json:"log_store_purged"`      // delete only
+	LogStorePurgeErrs           int    `json:"log_store_purge_errs"`  // surfaced, not swallowed
+	MetricsSeriesPurged         int    `json:"metrics_series_purged"` // delete only: the node's history in metrics.db
 }
 
 func newNodeDeleteSummary(nodeID, name string, mutated bool, r store.NodeCascadeReport) nodeDeleteSummary {
@@ -195,6 +196,17 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 		summary.ProxyDriftCleared = 1
 	}
 	s.proxyDriftMu.Unlock()
+
+	// Step 21b: drop the node's long-term metrics (metrics.db). Like the
+	// log purge, a failure is logged and does not fail the delete; the
+	// hourly prune removes the history of any node the store no longer has.
+	if purged, err := s.selfmon.forgetNode(req.NodeID); err != nil {
+		if s.logger != nil {
+			s.logger.Printf("node.delete: purge metrics history for node %q: %v", req.NodeID, err)
+		}
+	} else {
+		summary.MetricsSeriesPurged = purged
+	}
 
 	// Step 22: drop the in-memory on-box sing-box discovery mirror for the node.
 	s.removeSingBoxInventory(req.NodeID)

@@ -400,6 +400,12 @@ func (t *systemWorkerTransport) awaitReadyContext(ctx context.Context, generatio
 }
 
 func startSystemWorker(ctx context.Context, path, dir string, env []string) (*systemWorkerTransport, error) {
+	return startSystemWorkerObserved(ctx, path, dir, env, nil)
+}
+
+// startSystemWorkerObserved is startSystemWorker with onExit called with the
+// worker's process state once it has been reaped. A nil onExit is allowed.
+func startSystemWorkerObserved(ctx context.Context, path, dir string, env []string, onExit func(*os.ProcessState)) (*systemWorkerTransport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -457,6 +463,9 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 	t := &systemWorkerTransport{cmd: cmd, stdin: stdinW, stdout: stdoutR, hostResp: hostWrite, stderr: stderrR, pgid: cmd.Process.Pid, scanner: bufio.NewScanner(stdoutR), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{}), readDone: make(chan struct{}), stderrDone: make(chan struct{}), groupDone: make(chan struct{}), abortDone: make(chan struct{})}
 	go func() {
 		err := cmd.Wait()
+		if onExit != nil {
+			onExit(cmd.ProcessState)
+		}
 		t.waitMu.Lock()
 		t.waitErr = err
 		close(t.waitDone)

@@ -16,6 +16,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/outbound"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/telemetry"
 )
 
 // contributionsIfActive returns a plugin's UI contributions only when the plugin
@@ -399,7 +400,10 @@ func (s *Server) dispatchV2PluginCall(
 			return nil, fmt.Errorf("plugin %q declares service %q as core-backed, but no core provider owns it",
 				pluginID, service)
 		}
-		return s.callCoreServiceForOperator(ctx, service, method, []byte(payload))
+		started := time.Now()
+		out, err := s.callCoreServiceForOperator(ctx, service, method, []byte(payload))
+		telemetry.ObservePluginCall(pluginID, pluginMethodLabel(pluginID, service, method), time.Since(started), err)
+		return out, err
 	default:
 		if coreOwns {
 			// A runtime-backed service shadowed by a core provider is exactly the
@@ -463,11 +467,13 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 	if err != nil {
 		return nil, fmt.Errorf("marshal plugin call payload: %w", err)
 	}
+	started := time.Now()
 	resp, err := s.pluginRuntime.InvokeConstrained(ctx, pluginID, "call", body, plugin.InvokeConstraints{
 		OperatorTargets: operatorTargets,
 		Budget:          budget,
 		BudgetLabel:     service + "/" + method,
 	})
+	telemetry.ObservePluginCall(pluginID, pluginMethodLabel(pluginID, service, method), time.Since(started), pluginCallFailure(resp, err))
 	if err != nil {
 		// The system runner reports a plugin's own refusal twice: as a response
 		// carrying OK:false + the plugin's message, AND as a non-nil error.
@@ -487,6 +493,31 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 	}
 	return resp.Result, nil
 }
+
+// pluginMethodLabel is the method's name in the metrics store: the service
+// without the plugin's own id prefix, then the method, so vpn-core's
+// "latticenet.vpn-core/subscription" "fetch" reads "subscription/fetch".
+func pluginMethodLabel(pluginID, service, method string) string {
+	service = strings.TrimPrefix(service, pluginID+"/")
+	if service == "" {
+		return method
+	}
+	return service + "/" + method
+}
+
+// pluginCallFailure is the failure a plugin call is counted with: a
+// transport or runtime error, or the plugin's own refusal (OK false).
+func pluginCallFailure(resp plugin.InvokeResponse, err error) error {
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return errPluginRefused
+	}
+	return nil
+}
+
+var errPluginRefused = errors.New("plugin refused the call")
 
 // pluginServiceError is a plugin's own operator-facing refusal (its
 // ErrorResponse channel). It is not an upstream failure: the message is written

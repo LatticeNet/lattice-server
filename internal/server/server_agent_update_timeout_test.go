@@ -50,16 +50,36 @@ func TestAgentFetchTimeoutFitsInsideTheApplyTaskBudget(t *testing.T) {
 }
 
 // Both sources carry the timeouts. The control-plane form is a separate command
-// string and has regressed independently before.
+// string and has regressed independently before, and the form with a fallback
+// is a third.
 func TestAgentUpdateDownloadStepCarriesTimeoutsOnBothSources(t *testing.T) {
-	for _, source := range []string{agentBinarySourceControlPlane, "upstream"} {
-		step := agentUpdateDownloadStep(source)
+	for _, tc := range []struct {
+		source   string
+		fallback bool
+	}{
+		{agentBinarySourceControlPlane, false},
+		{agentBinarySourceControlPlane, true},
+		{"upstream", false},
+	} {
+		step := agentUpdateDownloadStep(tc.source, tc.fallback)
 		if !strings.Contains(step, agentFetchCurlTimeouts) {
-			t.Fatalf("source %s: curl timeouts missing from %q", source, step)
+			t.Fatalf("source %s fallback %t: curl timeouts missing from %q", tc.source, tc.fallback, step)
 		}
 		if !strings.Contains(step, agentFetchWgetTimeouts) {
-			t.Fatalf("source %s: wget timeouts missing from %q", source, step)
+			t.Fatalf("source %s fallback %t: wget timeouts missing from %q", tc.source, tc.fallback, step)
 		}
+	}
+	// The fallback fetch has a connect timeout and a total limit of its own,
+	// and the total is what the first attempt left of the same budget.
+	step := agentUpdateDownloadStep(agentBinarySourceControlPlane, true)
+	if !strings.Contains(step, "--connect-timeout "+agentFetchConnectSec+" --max-time \"$FETCH_LEFT\" -o \"$CANDIDATE\" \"$FALLBACK_URL\"") {
+		t.Fatalf("the curl fallback must be bounded by the remaining download budget:\n%s", step)
+	}
+	if !strings.Contains(step, "FETCH_LEFT=$(("+agentFetchBudgetSec+" - ($FETCH_NOW - $FETCH_START)))") {
+		t.Fatalf("the remaining budget must be derived from the %s s total:\n%s", agentFetchBudgetSec, step)
+	}
+	if strings.Count(step, agentFetchWgetTimeouts) != 2 {
+		t.Fatalf("both wget attempts need the per-operation timeouts:\n%s", step)
 	}
 }
 

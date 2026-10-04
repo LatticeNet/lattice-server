@@ -121,6 +121,9 @@ type guardRealityDetail struct {
 	// count as exposure; they are here so nothing the node reported is
 	// hidden.
 	EphemeralSockets []model.GuardListener `json:"ephemeral_sockets,omitempty"`
+	// EphemeralSocketCount is len(EphemeralSockets), absent until the node
+	// has reported, as on the roster.
+	EphemeralSocketCount *int `json:"ephemeral_socket_count,omitempty"`
 }
 
 func (s *Server) handleAgentGuardReality(w http.ResponseWriter, r *http.Request) {
@@ -347,14 +350,16 @@ func (s *Server) guardRealityDetailForNode(nodeID string, now time.Time) guardRe
 	status, staleAfter := guardRealityFreshness(snapshot, now)
 	reality := snapshot.Reality
 	receivedAt := snapshot.ReceivedAt.UTC()
+	ephemeralSocketCount := len(snapshot.EphemeralSockets)
 	detail := guardRealityDetail{
-		NodeID:           nodeID,
-		SnapshotStatus:   status,
-		Reality:          &reality,
-		EphemeralSockets: snapshot.EphemeralSockets,
-		ReceivedAt:       &receivedAt,
-		StaleAfter:       &staleAfter,
-		KnockGate:        sshGuardKnockGate(&reality),
+		NodeID:               nodeID,
+		SnapshotStatus:       status,
+		Reality:              &reality,
+		EphemeralSockets:     snapshot.EphemeralSockets,
+		EphemeralSocketCount: &ephemeralSocketCount,
+		ReceivedAt:           &receivedAt,
+		StaleAfter:           &staleAfter,
+		KnockGate:            sshGuardKnockGate(&reality),
 	}
 	if detail.KnockGate {
 		detail.KnockGatedPorts = s.sshGuardGatedPorts(nodeID, &reality)

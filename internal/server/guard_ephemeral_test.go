@@ -73,6 +73,13 @@ func TestSplitEphemeralSocketsRule(t *testing.T) {
 		t.Fatalf("split:\n facts  %+v\n client %+v\nwant\n facts  %+v\n client %+v", gotFacts, gotClient, facts, client)
 	}
 
+	// An inventory exactly nodeOfflineThreshold old is still fresh.
+	edge := ephemeralTestInventory(now.Add(-nodeOfflineThreshold))
+	setTestInventory(srv, &edge)
+	if _, gotClient := srv.splitEphemeralSockets("node-a", report, now); !reflect.DeepEqual(gotClient, client) {
+		t.Fatalf("inventory exactly %s old: split off %+v, want %+v", nodeOfflineThreshold, gotClient, client)
+	}
+
 	// Every case where the server cannot vouch for the node's inbounds keeps
 	// every socket a fact.
 	stale := ephemeralTestInventory(now.Add(-nodeOfflineThreshold - time.Second))
@@ -229,8 +236,9 @@ func TestRealityAPIServesEphemeralSocketsBesideListeners(t *testing.T) {
 	defer res.Body.Close()
 	var detail struct {
 		Node struct {
-			Reality          *model.GuardNodeReality `json:"reality"`
-			EphemeralSockets []model.GuardListener   `json:"ephemeral_sockets"`
+			Reality              *model.GuardNodeReality `json:"reality"`
+			EphemeralSockets     []model.GuardListener   `json:"ephemeral_sockets"`
+			EphemeralSocketCount *int                    `json:"ephemeral_socket_count"`
 		} `json:"node"`
 	}
 	if res.StatusCode != http.StatusOK {
@@ -248,6 +256,9 @@ func TestRealityAPIServesEphemeralSocketsBesideListeners(t *testing.T) {
 	}
 	if !reflect.DeepEqual(detail.Node.EphemeralSockets, client) {
 		t.Fatalf("ephemeral_sockets = %+v, want %+v", detail.Node.EphemeralSockets, client)
+	}
+	if detail.Node.EphemeralSocketCount == nil || *detail.Node.EphemeralSocketCount != len(client) {
+		t.Fatalf("detail ephemeral_socket_count = %v, want %d", detail.Node.EphemeralSocketCount, len(client))
 	}
 
 	roster := doJSON(t, handler, http.MethodGet, "/api/netguard/reality", "", cookies, csrf)

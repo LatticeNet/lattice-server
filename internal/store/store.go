@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -4242,14 +4241,17 @@ func (s *Store) UpsertDDNSProfile(p model.DDNSProfile) error {
 }
 
 // RecordDDNSRun stores the outcome of one automatic DDNS run. A run whose
-// outcome matches the stored profile (the same error again, or nothing new
+// outcome matches the stored profile (the same failure again, or nothing new
 // published) moves only LastRunAt, the clock that spaces out the next
 // attempt: it waits in memory for the next state write, and Close writes it.
 // A profile whose provider keeps refusing is retried every interval, and each
 // retry rewrote the whole state file to record the same error. A changed
 // outcome, an error that appeared, cleared or changed, or a newly published
-// address, is written before this returns. A restart that loses LastRunAt
-// only brings the next attempt forward.
+// address, is written before this returns. Errors are compared by
+// ddnsErrorClass, so a provider message that differs only in a request id or
+// a timestamp is the same failure; the profile in memory still takes the new
+// text, and it reaches disk with the next write. A restart that loses
+// LastRunAt only brings the next attempt forward.
 func (s *Store) RecordDDNSRun(p model.DDNSProfile) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -4265,14 +4267,6 @@ func (s *Store) RecordDDNSRun(p model.DDNSProfile) error {
 	}
 	s.state.DDNS[p.ID] = p
 	return s.Save()
-}
-
-// ddnsRunOutcomeEqual compares two profiles with their run clock and update
-// time cleared.
-func ddnsRunOutcomeEqual(a, b model.DDNSProfile) bool {
-	a.LastRunAt, b.LastRunAt = time.Time{}, time.Time{}
-	a.UpdatedAt, b.UpdatedAt = time.Time{}, time.Time{}
-	return reflect.DeepEqual(a, b)
 }
 
 // DDNSProfile returns a profile by id.

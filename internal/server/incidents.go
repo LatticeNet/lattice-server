@@ -282,9 +282,12 @@ type openReach struct{ anyWithdrawn, allWithdrawn bool }
 // sent after a withdrawal answers it. A rule that never carried one is absent.
 //
 // yagni: read from the outbox, which is bounded. A withdrawal evicted before
-// it is read is not seen; the debt itself is kept on the record
-// (OwedOpenRules) and does not depend on it. Recording each rule's last open
-// on the incident is the upgrade if that ever matters.
+// it is read is not seen, and its rule counts as having heard the open. Two
+// things follow: an undo or an early snooze end owes that rule nothing, and
+// a recovery reaches it, a lone "up" after a "down" it never got, unless the
+// record still lists it as owed (OwedOpenRules), which is kept apart from
+// the outbox for this reason. Recording each rule's last open on the
+// incident is the upgrade if that ever matters.
 func (s *Server) latestOpenReach(kind string, incidentIDs []string) map[string]map[string]openReach {
 	want := make(map[string]bool, len(incidentIDs))
 	for _, incidentID := range incidentIDs {
@@ -731,9 +734,14 @@ func (s *Server) sendRuleOpens(byRule map[string]map[string][]incidentOutgoing) 
 // own message, through it alone, without the incidents it missed, and a
 // rule that missed them all gets none; either way the Sent log records,
 // for that rule, which recoveries were withheld and why. One outbox read
-// decides for every item. A recovery quiet hours hold is judged again when
-// it falls due (heldIncidentWithdrawal). With no rule enabled at all, every
-// channel gets the whole message, as for any event.
+// decides for every item. With no rule enabled at all, every channel gets
+// the whole message, as for any event.
+//
+// This judges per rule: a rule with one channel's copy delivered is told on
+// all its channels. A recovery quiet hours hold is judged again when it
+// falls due, and that check (heldIncidentWithdrawal) judges per channel,
+// each copy against the latest open on its own rule and channel, so a held
+// recovery can still be withdrawn from a channel this let through.
 func (s *Server) sendRecoveries(eventType string, items []incidentOutgoing) {
 	if len(items) == 0 {
 		return

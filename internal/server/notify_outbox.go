@@ -711,7 +711,9 @@ func (s *Server) withdrawHeldIncidentMessage(row store.NotifyDelivery) bool {
 // unsnoozed. A recovery is withdrawn when, for every incident it reports, the
 // latest open message on the same rule and channel was withdrawn: the phone
 // never heard "down", so it is not told "up". The drainer settles a rule and
-// channel's held rows in order, so that open has settled by now.
+// channel's held rows in order, so that open has settled by now. This
+// judges per channel; whether a recovery is planned for a rule at all is
+// judged per rule when it is sent (sendRecoveries).
 func (s *Server) heldIncidentWithdrawal(row store.NotifyDelivery) string {
 	if !heldIncidentMessage(row) {
 		return ""

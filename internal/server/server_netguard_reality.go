@@ -80,6 +80,10 @@ type guardRealitySummary struct {
 	ListenerCount     *int       `json:"listener_count,omitempty"`
 	InterfaceCount    *int       `json:"interface_count,omitempty"`
 	ForeignTableCount *int       `json:"foreign_table_count,omitempty"`
+	// EphemeralSocketCount is how many sing-box client sockets the report
+	// listed beside its listeners (see splitEphemeralSockets). They are not
+	// in ListenerCount.
+	EphemeralSocketCount *int `json:"ephemeral_socket_count,omitempty"`
 }
 
 type guardRealityListResponse struct {
@@ -110,6 +114,13 @@ type guardRealityDetail struct {
 	// for. Empty with KnockGate set means the table is there and its scope
 	// is not known.
 	KnockGatedPorts []int `json:"knock_gated_ports,omitempty"`
+	// EphemeralSockets are the sing-box client sockets the report listed as
+	// listeners: UDP, on a port in the kernel's ephemeral range, and not a
+	// port any of the node's inbounds uses (see splitEphemeralSockets). They
+	// are not in Reality.Listeners because they are not services and do not
+	// count as exposure; they are here so nothing the node reported is
+	// hidden.
+	EphemeralSockets []model.GuardListener `json:"ephemeral_sockets,omitempty"`
 }
 
 func (s *Server) handleAgentGuardReality(w http.ResponseWriter, r *http.Request) {
@@ -145,9 +156,12 @@ func (s *Server) handleAgentGuardReality(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, apiError(model.APIErrorBadRequest, err.Error()))
 		return
 	}
+	facts, ephemeral := s.splitEphemeralSockets(node.ID, reality.Listeners, receivedAt)
+	reality.Listeners = facts
 	stored, _, err := s.store.UpsertGuardRealitySnapshot(node.LatticeIdentityUUID, store.GuardRealitySnapshot{
-		Reality:    reality,
-		ReceivedAt: receivedAt,
+		Reality:          reality,
+		EphemeralSockets: ephemeral,
+		ReceivedAt:       receivedAt,
 	})
 	if errors.Is(err, store.ErrGuardRealityDurabilityDegraded) {
 		if s.logger != nil {
@@ -285,6 +299,7 @@ func (s *Server) guardRealitySummaryForNode(nodeID, nodeName string, now time.Ti
 	status, staleAfter := guardRealityFreshness(snapshot, now)
 	managedSHA := snapshot.Reality.ManagedSHA
 	listenerCount := len(snapshot.Reality.Listeners)
+	ephemeralSocketCount := len(snapshot.EphemeralSockets)
 	interfaceCount := len(snapshot.Reality.Interfaces)
 	foreignTableCount := len(snapshot.Reality.ForeignTables)
 	collectedAt := snapshot.Reality.CollectedAt.UTC()
@@ -295,6 +310,7 @@ func (s *Server) guardRealitySummaryForNode(nodeID, nodeName string, now time.Ti
 	out.StaleAfter = &staleAfter
 	out.ManagedSHA = &managedSHA
 	out.ListenerCount = &listenerCount
+	out.EphemeralSocketCount = &ephemeralSocketCount
 	out.InterfaceCount = &interfaceCount
 	out.ForeignTableCount = &foreignTableCount
 	if hasBinding {
@@ -331,12 +347,13 @@ func (s *Server) guardRealityDetailForNode(nodeID string, now time.Time) guardRe
 	reality := snapshot.Reality
 	receivedAt := snapshot.ReceivedAt.UTC()
 	detail := guardRealityDetail{
-		NodeID:         nodeID,
-		SnapshotStatus: status,
-		Reality:        &reality,
-		ReceivedAt:     &receivedAt,
-		StaleAfter:     &staleAfter,
-		KnockGate:      sshGuardKnockGate(&reality),
+		NodeID:           nodeID,
+		SnapshotStatus:   status,
+		Reality:          &reality,
+		EphemeralSockets: snapshot.EphemeralSockets,
+		ReceivedAt:       &receivedAt,
+		StaleAfter:       &staleAfter,
+		KnockGate:        sshGuardKnockGate(&reality),
 	}
 	if detail.KnockGate {
 		detail.KnockGatedPorts = s.sshGuardGatedPorts(nodeID, &reality)
@@ -661,7 +678,8 @@ func (s *Server) shouldAuditGuardReality(nodeID string, reality model.GuardNodeR
 // guardRealityFingerprint identifies the reported state, not the report. The
 // snapshot is canonicalized by the store before it comes back here, so the only
 // fields that differ between two reports of an unchanged firewall are the two
-// cleared below.
+// cleared below. Ephemeral sockets are not in the reality it is handed, so
+// their churn does not audit a report again either.
 func guardRealityFingerprint(reality model.GuardNodeReality) string {
 	reality.NodeID = ""
 	reality.CollectedAt = time.Time{}

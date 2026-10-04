@@ -164,7 +164,7 @@ func (s *Server) recordDNSListenerOwners(nodeID string, listeners, previous []mo
 		if !ok {
 			l.Process = prior[key]
 		} else {
-			l.Process = guardListenerOwner(snapshot.Reality.Listeners, l.Protocol, l.Port)
+			l.Process = guardListenerOwner(snapshot.Sockets(), l.Protocol, l.Port)
 		}
 		out = append(out, l)
 	}
@@ -210,12 +210,16 @@ func (s *Server) dnsExternalDrift(dep model.DNSDeployment, now time.Time) *dnsDr
 	view := &dnsDriftView{Status: dnsDriftOK, Findings: []string{}, RealityCollectedAt: &collected}
 	freshness, _ := guardRealityFreshness(snapshot, now)
 	stamp := collected.Format(time.RFC3339)
+	// Every socket counts here, the ephemeral ones included: the question is
+	// whether the recorded socket is bound, and a classification is not a
+	// reason to report a running engine missing.
+	sockets := snapshot.Sockets()
 	for _, l := range dep.Listeners {
-		if !guardHasListener(snapshot.Reality.Listeners, l.Protocol, l.Port) {
+		if !guardHasListener(sockets, l.Protocol, l.Port) {
 			view.Findings = append(view.Findings, fmt.Sprintf("%s/%d is not listening on %s (reality collected %s)", l.Protocol, l.Port, nodeName, stamp))
 			continue
 		}
-		owner := guardListenerOwner(snapshot.Reality.Listeners, l.Protocol, l.Port)
+		owner := guardListenerOwner(sockets, l.Protocol, l.Port)
 		if l.Process != "" && owner != "" && owner != l.Process {
 			view.Findings = append(view.Findings, fmt.Sprintf("%s/%d on %s is owned by %s, recorded as %s", l.Protocol, l.Port, nodeName, owner, l.Process))
 		}

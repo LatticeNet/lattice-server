@@ -224,10 +224,11 @@ func (s *Server) handleNetGuardReview(w http.ResponseWriter, r *http.Request, p 
 	suggestions := make([]netguard.Suggestion, 0)
 	if reality.Reality != nil {
 		suggestions, err = netguard.Suggest(netguard.SuggestInput{
-			Binding: input.Binding,
-			Groups:  input.Groups,
-			Zones:   input.Zones,
-			Reality: *reality.Reality,
+			Binding:          input.Binding,
+			Groups:           input.Groups,
+			Zones:            input.Zones,
+			Reality:          *reality.Reality,
+			EphemeralSockets: reality.EphemeralSockets,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)

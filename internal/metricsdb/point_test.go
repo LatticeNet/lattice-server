@@ -1,6 +1,7 @@
 package metricsdb
 
 import (
+	"encoding/binary"
 	"math"
 	"math/rand"
 	"sort"
@@ -135,5 +136,77 @@ func TestRowSkipsUnknownKind(t *testing.T) {
 	}
 	if seen != 1 {
 		t.Fatalf("saw %d points, want 1", seen)
+	}
+}
+
+// TestQuantilePlacedInsideItsBin uses durations spread evenly on a log scale
+// from 1 ms to 1 s, so the exact quantiles fall inside their bins rather
+// than on an edge. Placing the estimate inside the bin keeps it within a
+// fraction of a percent; reading the bin's lower edge would be off by up to
+// a bin's width (about 19 percent), here about 3 percent.
+func TestQuantilePlacedInsideItsBin(t *testing.T) {
+	var e Event
+	const n = 4000
+	raw := make([]float64, n)
+	for i := range raw {
+		raw[i] = 1e-3 * math.Pow(1000, (float64(i)+0.5)/n)
+		e.Observe(time.Duration(raw[i]*float64(time.Second)), false)
+	}
+	for _, q := range []float64{0.5, 0.9} {
+		got, _ := e.Quantile(q)
+		want := raw[int(math.Ceil(q*n))-1]
+		if rel := math.Abs(got-want) / want; rel > 0.015 {
+			t.Fatalf("p%v = %.5f, exact %.5f, off by %.1f%%", q*100, got, want, rel*100)
+		}
+	}
+}
+
+// TestRowRejectsBinsPastTheEnd hands decodeRow an event whose bin gaps are
+// each in range but add up past the last bin: an error, never an index out
+// of range.
+func TestRowRejectsBinsPastTheEnd(t *testing.T) {
+	var payload []byte
+	payload = binary.AppendUvarint(payload, 2) // count
+	payload = binary.AppendUvarint(payload, 0) // errors
+	for i := 0; i < 3; i++ {                   // sum, min, max
+		payload = appendF32(payload, 0.01)
+	}
+	payload = binary.AppendUvarint(payload, 2)           // two non-empty bins
+	payload = binary.AppendUvarint(payload, EventBins-8) // the first at bin 80
+	payload = binary.AppendUvarint(payload, 1)           // one event
+	payload = binary.AppendUvarint(payload, EventBins-8) // the next 81 bins on
+	payload = binary.AppendUvarint(payload, 1)           // one event
+	row := []byte{rowVersion}
+	row = binary.AppendUvarint(row, 1)
+	row = append(row, byte(KindEvent))
+	row = binary.AppendUvarint(row, uint64(len(payload)))
+	row = append(row, payload...)
+	if err := decodeRow(row, nil, func(uint32, Point) {}); err == nil {
+		t.Fatal("bins past the last decoded without error")
+	}
+}
+
+// TestHugeValuesStayFinite stores a gauge past the float32 range, as a
+// misbehaving agent could report, and a sum that only overflows once added
+// up: both come back finite, at the largest float32.
+func TestHugeValuesStayFinite(t *testing.T) {
+	var g Gauge
+	g.Observe(1e39)
+	g.Observe(-1e39)
+	sum := Gauge{Count: 2, Min: 3e38, Max: 3e38, Sum: 6e38}
+	row := encodeRow([]rowPoint{{series: 1, point: Point{Kind: KindGauge, Gauge: g}}, {series: 2, point: Point{Kind: KindGauge, Gauge: sum}}})
+	got := map[uint32]Gauge{}
+	if err := decodeRow(row, nil, func(s uint32, p Point) { got[s] = p.Gauge }); err != nil {
+		t.Fatal(err)
+	}
+	for s, g := range got {
+		for _, v := range []float64{g.Min, g.Max, g.Sum, g.Avg()} {
+			if math.IsInf(v, 0) || math.IsNaN(v) {
+				t.Fatalf("series %d read back %+v, want every field finite", s, g)
+			}
+		}
+	}
+	if got[1].Max != math.MaxFloat32 || got[1].Min != -math.MaxFloat32 || got[2].Sum != math.MaxFloat32 {
+		t.Fatalf("read back %+v, want the values clamped to the float32 range", got)
 	}
 }

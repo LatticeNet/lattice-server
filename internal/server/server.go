@@ -367,6 +367,9 @@ type Server struct {
 	// when no metrics store is wired. selfmonStarted says its sampler runs.
 	selfmon        *selfMonitor
 	selfmonStarted bool
+	// selfmonUnavailable is why there is no metrics store although a data
+	// directory was configured; the self-monitoring reads answer 503 with it.
+	selfmonUnavailable string
 	// latencyEdges holds the provider edge names the control plane resolved
 	// for the latency probes; see latency_edges.go.
 	latencyEdges latencyEdgeCache
@@ -807,6 +810,7 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s.loadPlugins(opts.PluginDir, opts.PluginBundleCacheDir, opts.PluginTrust)
+	s.selfmonUnavailable = opts.SelfMonitor.Unavailable
 	s.selfmon = newSelfMonitor(opts.SelfMonitor, s.logger, s.now,
 		func(id string) bool { _, ok := s.store.Node(id); return ok },
 		func(id string) bool { _, ok := s.loadedPlugin(id); return ok })

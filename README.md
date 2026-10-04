@@ -76,7 +76,10 @@ file stops growing at a size the series count fixes. A full administrator
 reads it on the console's System page (`/api/system/health`,
 `/api/system/series`); a node's history is a node read
 (`/api/nodes/history`). It holds no secrets and no authority: deleting it
-loses history only, and backups may leave it out.
+loses history only, and backups may leave it out. A `metrics.db` the server
+cannot read (damaged, or written by a newer release before a rollback) is
+moved aside as `metrics.db.unreadable-<unix time>` and a fresh one started;
+the server never refuses to start over it.
 
 Self-host DNS can optionally install a pinned CoreDNS executable during an
 approved `selfdns` apply. Leave these unset to keep the stricter precondition

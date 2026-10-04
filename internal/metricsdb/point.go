@@ -264,7 +264,12 @@ type rowPoint struct {
 	point  Point
 }
 
+// appendF32 stores v as a float32, clamped to the float32 range: a finite
+// value past it (a sum of large samples, or an agent reporting nonsense)
+// would otherwise come back as an infinity that no reader, and no JSON
+// encoder, can use.
 func appendF32(b []byte, v float64) []byte {
+	v = math.Min(math.Max(v, -math.MaxFloat32), math.MaxFloat32)
 	return binary.LittleEndian.AppendUint32(b, math.Float32bits(float32(v)))
 }
 

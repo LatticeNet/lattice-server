@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -270,7 +273,7 @@ func TestSelfMonitorPrunesGoneOwners(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	f.srv.selfmon.prune(f.now)
+	f.srv.selfmon.prune(f.now, false)
 	owners, err := f.db.Owners()
 	if err != nil {
 		t.Fatal(err)
@@ -395,9 +398,10 @@ func TestSelfMonitorDisabledAnswers503(t *testing.T) {
 	cookies, csrf := loginSession(t, handler)
 	for _, path := range []string{"/api/system/health", "/api/system/series"} {
 		res := doJSON(t, handler, http.MethodGet, path, "", cookies, csrf)
+		body, _ := io.ReadAll(res.Body)
 		res.Body.Close()
-		if res.StatusCode != http.StatusServiceUnavailable {
-			t.Errorf("%s without a metrics store = %d, want 503", path, res.StatusCode)
+		if res.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"code":"`+apiErrorMetricsDisabled+`"`) {
+			t.Errorf("%s without a metrics store = %d %s, want 503 with code %s", path, res.StatusCode, body, apiErrorMetricsDisabled)
 		}
 	}
 }
@@ -475,5 +479,169 @@ func TestPluginMethodLabelAndFailure(t *testing.T) {
 	}
 	if pluginCallFailure(plugin.InvokeResponse{}, errors.New("spawn")) == nil {
 		t.Fatal("a runtime error did not count as a failure")
+	}
+}
+
+// TestSelfMonitorDeletedNodeStaysGoneAfterTheNextFlush deletes a node whose
+// beat is still being collected this minute: the next flush must not bring
+// its history back.
+func TestSelfMonitorDeletedNodeStaysGoneAfterTheNextFlush(t *testing.T) {
+	f := newSelfMonFixture(t)
+	m := f.srv.selfmon
+	if err := f.st.UpsertNode(model.Node{ID: "gone-node", Name: "gone"}); err != nil {
+		t.Fatal(err)
+	}
+	m.observeBeat("gone-node", model.Metrics{CPUPercent: 12, Load1: 0.4, CollectedAt: f.now}, f.now)
+	f.advance(time.Minute)
+	m.flushDue(f.now, false)
+	// A second beat lands in the minute now being collected, then the node
+	// is deleted before that minute is flushed.
+	m.observeBeat("gone-node", model.Metrics{CPUPercent: 14, Load1: 0.5, CollectedAt: f.now}, f.now)
+	if n, err := m.forgetNode("gone-node"); err != nil || n == 0 {
+		t.Fatalf("forgetNode = %d, %v; want the node's series deleted", n, err)
+	}
+	f.advance(time.Minute)
+	m.flushDue(f.now, false)
+	owners, err := f.db.Owners()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range owners {
+		if o.Owner == selfMonOwnerNodePrefix+"gone-node" {
+			t.Fatalf("the deleted node's history came back with %d series", o.Series)
+		}
+	}
+}
+
+// TestHijackedStreamsAreNotRouteLatency: a terminal or control stream takes
+// over its connection and lives for hours. Its duration is a session length,
+// and counting it as a request latency would wreck its route group's p95.
+func TestHijackedStreamsAreNotRouteLatency(t *testing.T) {
+	telemetry.ResetForTest()
+	s := &Server{logger: log.New(io.Discard, "", 0)}
+	mux := newRouteGroupMux()
+	mux.HandleFunc("/api/agent/terminal/", func(w http.ResponseWriter, r *http.Request) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_, _ = buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: close\r\n\r\n")
+		_ = buf.Flush()
+		_ = conn.Close()
+	})
+	mux.HandleFunc("/api/version", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	logged := s.withRequestLog(mux, mux.groups)
+	served := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		logged.ServeHTTP(w, r)
+		served <- struct{}{}
+	}))
+	defer srv.Close()
+	for _, path := range []string{"/api/agent/terminal/session-1", "/api/version"} {
+		if res, err := http.Get(srv.URL + path); err == nil {
+			res.Body.Close()
+		}
+		select {
+		case <-served:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s was not served", path)
+		}
+	}
+	w := telemetry.TakeInterval()
+	if e := w.Routes["/api/version"]; e == nil || e.Count != 1 {
+		t.Fatalf("/api/version = %+v, want one request recorded", e)
+	}
+	if e, ok := w.Routes["/api/agent/terminal"]; ok {
+		t.Fatalf("the hijacked stream was recorded as route latency: %+v", e)
+	}
+}
+
+// TestSelfMonitorLogsARefusedSeriesOnce: a series over the cap is logged the
+// first time, not every minute it stays refused, with the cap that refused
+// it.
+func TestSelfMonitorLogsARefusedSeriesOnce(t *testing.T) {
+	telemetry.ResetForTest()
+	now := time.Date(2026, 10, 4, 12, 0, 30, 0, time.UTC)
+	db, err := metricsdb.Open(filepath.Join(t.TempDir(), "metrics.db"), metricsdb.Options{MaxSeries: 1, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var logs strings.Builder
+	m := newSelfMonitor(SelfMonitorOptions{DB: db}, log.New(&logs, "", 0), func() time.Time { return now }, nil, nil)
+	for i := 0; i < 5; i++ {
+		m.mu.Lock()
+		m.observeLocked(selfMonOwnerCP, "a", 1)
+		m.observeLocked(selfMonOwnerCP, "b", 1)
+		m.mu.Unlock()
+		now = now.Add(time.Minute)
+		m.flushDue(now, false)
+	}
+	// The cap of one leaves room for one of the series this minute holds;
+	// every other is refused, and each is logged once.
+	perSeries := map[string]int{}
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if strings.Contains(line, "is not stored") {
+			perSeries[line]++
+		}
+	}
+	if len(perSeries) == 0 {
+		t.Fatalf("nothing logged for the refused series:\n%s", logs.String())
+	}
+	for line, n := range perSeries {
+		if n != 1 {
+			t.Fatalf("logged %d times over five flushes, want once: %s", n, line)
+		}
+	}
+	if !strings.Contains(logs.String(), "LATTICE_METRICS_MAX_SERIES") {
+		t.Fatalf("the log does not name the cap that refused it:\n%s", logs.String())
+	}
+}
+
+func TestSelfMonitorUnavailableAnswersWithItsCode(t *testing.T) {
+	telemetry.ResetForTest()
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const reason = "metrics.db could not be opened, so this server keeps no history until it restarts with a usable file: boom"
+	srv, err := New(Options{
+		Store:                   st,
+		AdminPassword:           testAdminPass,
+		DisableRenewalScheduler: true,
+		Logger:                  log.New(io.Discard, "", 0),
+		SelfMonitor:             SelfMonitorOptions{Unavailable: reason},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
+	cookies, csrf := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodGet, "/api/system/health", "", cookies, csrf)
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	// The 5xx message is scrubbed like every other; the code says which case
+	// it is, and the detail is in the log.
+	if res.StatusCode != http.StatusServiceUnavailable || !strings.Contains(string(body), `"code":"`+apiErrorMetricsUnavailable+`"`) || strings.Contains(string(body), "boom") {
+		t.Fatalf("health = %d %s, want 503 with code %s and no detail", res.StatusCode, body, apiErrorMetricsUnavailable)
+	}
+}
+
+// TestCompactFloatsNeverBreakTheJSON: a value JSON cannot carry becomes null
+// rather than an encoder error after the 200 has gone out.
+func TestCompactFloatsNeverBreakTheJSON(t *testing.T) {
+	b, err := json.Marshal(metricsSeriesView{Avg: compactFloats{1.5, math.Inf(1), math.NaN(), math.Inf(-1), 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back struct {
+		Avg []*float64 `json:"avg"`
+	}
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("%s does not decode: %v", b, err)
+	}
+	if len(back.Avg) != 5 || back.Avg[0] == nil || *back.Avg[0] != 1.5 || back.Avg[1] != nil || back.Avg[2] != nil || back.Avg[3] != nil || *back.Avg[4] != 2 {
+		t.Fatalf("avg = %s, want 1.5,null,null,null,2", b)
 	}
 }

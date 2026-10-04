@@ -2,6 +2,7 @@ package metricsdb
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -214,6 +215,46 @@ func BenchmarkQueryNodeWeek(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		if _, err := db.Query("node/node_00", nil, end.Add(-7*24*time.Hour), end, 360); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// TestNinetyDaysReadsTheHourTier asks for the last 90 days the way the
+// handler does: it reads its clock, and the store reads its own a moment
+// later. The 1h tier keeps 90 days and must still serve the range; only the
+// oldest partial bucket is missing, which beats a tier 24 times coarser.
+func TestNinetyDaysReadsTheHourTier(t *testing.T) {
+	c := &clock{t: t0}
+	tick := func() time.Time {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.t = c.t.Add(time.Microsecond)
+		return c.t
+	}
+	db, err := Open(filepath.Join(t.TempDir(), "m.db"), Options{Now: tick})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	mustWrite(t, db, t0, gauge("cp", "x", 1))
+	for span, want := range map[time.Duration]string{
+		24 * time.Hour:       "1m",
+		7 * 24 * time.Hour:   "5m",
+		30 * 24 * time.Hour:  "1h",
+		90 * 24 * time.Hour:  "1h",
+		365 * 24 * time.Hour: "1d",
+	} {
+		now := tick() // the handler's read, before the store's own
+		res, err := db.Query("cp", nil, now.Add(-span), now, 400)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, aggTier, err := db.Aggregate("cp", nil, now.Add(-span), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Tier.Name != want || aggTier.Name != want {
+			t.Errorf("range %v: Query read %s, Aggregate %s; want %s", span, res.Tier.Name, aggTier.Name, want)
 		}
 	}
 }

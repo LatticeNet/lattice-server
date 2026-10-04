@@ -36,15 +36,29 @@
 // points whatever happens, and the file is bounded by the number of series
 // times that. The number of series is capped (Options.MaxSeries, and per
 // owner Options.MaxSeriesPerOwner); a series first seen past a cap is not
-// stored and is counted in Stats.DroppedSeries, so the cap is visible rather
-// than silent.
+// stored, and Stats.RefusedSeries names it with the reason, so the cap is
+// visible rather than silent. A series whose points have all aged out leaves
+// the catalog (PruneIdleSeries) and gives its place back.
 //
 // Only the finest tier is written from outside. A coarser bucket is rolled up
 // from the tier below once it closes, inside the same transaction as the
 // write that closed it, and the last rolled bucket of each tier is recorded
 // beside the data. A server that was down catches up from whatever the finer
-// tier still holds on its next write, so a restart loses at most the minute
+// tier still holds on its next writes, so a restart loses at most the minute
 // that was being collected in memory.
+//
+// # Clock faults
+//
+// Retention and rollups follow the minute being written, so a clock that
+// jumps would otherwise drive them. The store keeps a horizon, the furthest
+// minute end that trimming and rolling have reached, and one write may move
+// it at most an hour (maxHorizonAdvance). A clock stepped a year ahead for a
+// few flushes therefore costs an hour of fine resolution per flush, not the
+// history, and leaves the rollups at most that far ahead of the clock once it
+// returns, which the late-write path below covers. A write so late that a
+// bucket it lands in can no
+// longer be rebuilt whole from the tier below is refused and counted
+// (Stats.LateSamples) rather than allowed to replace that bucket.
 //
 // bbolt reuses the pages that retention and deletion free but never shrinks
 // the file, so the file grows to its steady-state size and stays there.
@@ -114,6 +128,11 @@ func (o Options) withDefaults() (Options, error) {
 			if t.Res <= prev.Res || t.Res%prev.Res != 0 || t.Keep < prev.Keep {
 				return o, fmt.Errorf("metricsdb: tier %q must be a coarser multiple of %q kept at least as long", t.Name, prev.Name)
 			}
+			// A bucket is rolled up from the tier below, which must still
+			// hold all of it.
+			if prev.Keep < t.Res {
+				return o, fmt.Errorf("metricsdb: tier %q keeps less than one bucket of %q", prev.Name, t.Name)
+			}
 		}
 	}
 	if o.MaxSeries <= 0 {
@@ -134,8 +153,45 @@ var (
 	bucketSeries = []byte("series")
 	tierPrefix   = "tier/"
 	metaSchema   = []byte("schema")
+	metaHorizon  = []byte("horizon")
 	rolledPrefix = "rolled/"
 )
+
+// Why a sample's series was not stored (RefusedSeries.Reason).
+const (
+	// RefusedTotalCap: the store already holds Options.MaxSeries series.
+	RefusedTotalCap = "max_series"
+	// RefusedOwnerCap: the owner already has Options.MaxSeriesPerOwner.
+	RefusedOwnerCap = "max_series_per_owner"
+	// RefusedInvalid: an empty, oversized or NUL-bearing owner or name, or
+	// a kind this version does not know.
+	RefusedInvalid = "invalid"
+	// RefusedKindMismatch: the series exists with the other kind.
+	RefusedKindMismatch = "kind_mismatch"
+)
+
+const (
+	// maxRefusedTracked bounds how many refused series the store names; past
+	// it Stats.RefusedSeriesMore says there are more.
+	maxRefusedTracked = 64
+	// refusedForget is how long a refused series stays named after the last
+	// sample refused for it.
+	refusedForget = 24 * time.Hour
+)
+
+// RefusedSeries is a series whose samples the store would not keep.
+type RefusedSeries struct {
+	Owner  string `json:"owner"`
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
+	// First and Last are the write minutes of the first and the latest
+	// refused sample; Samples counts them.
+	First   time.Time `json:"first"`
+	Last    time.Time `json:"last"`
+	Samples uint64    `json:"samples"`
+}
+
+type refusedKey struct{ owner, name string }
 
 const schemaVersion = 1
 
@@ -180,31 +236,56 @@ type DB struct {
 	nextOwner   uint32
 	nextSeries  uint32
 	rolled      []int64 // per tier, unix start of the last rolled bucket; 0 none
-	dropped     uint64
-	lastWrite   WriteResult
-	statsCache  *Stats
-	statsAt     time.Time
+	// horizon is the furthest minute end trimming and rolling have reached
+	// (unix seconds; 0 before the first write). See "Clock faults".
+	horizon           int64
+	refused           map[refusedKey]*RefusedSeries
+	refusedOverflowAt time.Time
+	refusedSamples    uint64
+	lateSamples       uint64
+	lastWrite         WriteResult
+	statsCache        *Stats
+	statsAt           time.Time
 }
 
-// Open opens or creates the store at path.
-func Open(path string, opts Options) (*DB, error) {
+// ErrLocked is returned by Open when another process holds the file.
+var ErrLocked = errors.New("metricsdb: the file is held by another process")
+
+// Open opens or creates the store at path. A file bbolt cannot read, or whose
+// catalog is malformed or from a newer schema, is an error; so is a file
+// another process holds (ErrLocked).
+func Open(path string, opts Options) (db *DB, err error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, errors.New("metricsdb: path is required")
 	}
-	opts, err := opts.withDefaults()
+	opts, err = opts.withDefaults()
 	if err != nil {
 		return nil, err
 	}
-	bdb, err := bolt.Open(path, 0o600, &bolt.Options{
+	var bdb *bolt.DB
+	// bbolt panics on some kinds of page damage rather than returning an
+	// error; a damaged history file is an error to report, not a crash.
+	defer func() {
+		if r := recover(); r != nil {
+			if bdb != nil {
+				_ = bdb.Close()
+			}
+			db, err = nil, fmt.Errorf("metricsdb: %s is damaged: %v", path, r)
+		}
+	}()
+	bdb, err = bolt.Open(path, 0o600, &bolt.Options{
 		Timeout: 2 * time.Second,
 		// The hash-map freelist allocates in constant time however many
 		// pages retention has freed.
 		FreelistType: bolt.FreelistMapType,
 	})
+	if errors.Is(err, bolt.ErrTimeout) {
+		return nil, fmt.Errorf("%w: %s", ErrLocked, path)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("metricsdb: open %s: %w", path, err)
 	}
-	db := &DB{
+	db = &DB{
 		path:        path,
 		bolt:        bdb,
 		opts:        opts,
@@ -215,12 +296,48 @@ func Open(path string, opts Options) (*DB, error) {
 		seriesRefs:  map[uint32]seriesRef{},
 		ownerCounts: map[uint32]int{},
 		rolled:      make([]int64, len(opts.Tiers)),
+		refused:     map[refusedKey]*RefusedSeries{},
 	}
 	if err := db.init(); err != nil {
 		bdb.Close()
 		return nil, err
 	}
 	return db, nil
+}
+
+// Recovery says that OpenOrReset could not use the file it found.
+type Recovery struct {
+	// Cause is why the file could not be opened.
+	Cause error
+	// MovedTo is where the unreadable file now is.
+	MovedTo string
+}
+
+// OpenOrReset opens the store at path. When the file is there but cannot be
+// used (damaged, or written by a newer schema, as after a rollback), it is
+// moved aside to path.unreadable-<unix seconds> and a fresh store is opened
+// in its place: the file holds history only, and losing that is better than
+// a control plane that will not start. A file another process holds is left
+// alone (ErrLocked), and so is everything else when the move fails.
+func OpenOrReset(path string, opts Options, now time.Time) (*DB, *Recovery, error) {
+	db, err := Open(path, opts)
+	if err == nil || errors.Is(err, ErrLocked) {
+		return db, nil, err
+	}
+	if _, statErr := os.Stat(path); statErr != nil {
+		// Nothing there to move: the error is about the directory or the
+		// options, and a second attempt would fail the same way.
+		return nil, nil, err
+	}
+	rec := &Recovery{Cause: err, MovedTo: fmt.Sprintf("%s.unreadable-%d", path, now.Unix())}
+	if mvErr := os.Rename(path, rec.MovedTo); mvErr != nil {
+		return nil, nil, fmt.Errorf("%w; moving it aside failed: %v", err, mvErr)
+	}
+	db, err = Open(path, opts)
+	if err != nil {
+		return nil, rec, err
+	}
+	return db, rec, nil
 }
 
 // init creates the buckets, drops the buckets of tiers no longer configured
@@ -302,6 +419,9 @@ func (db *DB) init() error {
 				db.rolled[i] = int64(binary.BigEndian.Uint64(v))
 			}
 		}
+		if v := meta.Get(metaHorizon); len(v) == 8 {
+			db.horizon = int64(binary.BigEndian.Uint64(v))
+		}
 		return nil
 	})
 }
@@ -343,13 +463,20 @@ func (s Sample) point() Point {
 
 // WriteResult reports one Write.
 type WriteResult struct {
-	At       time.Time     `json:"at"`
-	Points   int           `json:"points"`
-	Rows     int           `json:"rows"`
-	Dropped  int           `json:"dropped"`
+	At     time.Time `json:"at"`
+	Points int       `json:"points"`
+	Rows   int       `json:"rows"`
+	// Refused counts the samples whose series was not stored (a cap, a bad
+	// name, a kind mismatch); Late the samples of a write refused whole for
+	// arriving too late to be stored exactly.
+	Refused  int           `json:"refused"`
+	Late     int           `json:"late"`
 	Rolled   int           `json:"rolled"`
 	Trimmed  int           `json:"trimmed"`
 	Duration time.Duration `json:"duration"`
+	// NewlyRefused are the series this write refused that the store was
+	// not already naming, so a caller can log each once.
+	NewlyRefused []RefusedSeries `json:"-"`
 }
 
 func ownerKey(owner uint32, unix int64) []byte {
@@ -376,6 +503,16 @@ func validName(s string) bool {
 	return s != "" && len(s) <= maxNameBytes && !strings.ContainsRune(s, 0)
 }
 
+// shownName is a refused owner or name made safe to show: valid UTF-8, no
+// NUL, at most maxNameBytes.
+func shownName(s string) string {
+	s = strings.ReplaceAll(strings.ToValidUTF8(s, "�"), "\x00", "�")
+	if len(s) > maxNameBytes {
+		s = strings.ToValidUTF8(s[:maxNameBytes], "")
+	}
+	return s
+}
+
 // staged holds catalog entries a transaction created, applied to the
 // in-memory catalog only once it commits.
 type staged struct {
@@ -391,20 +528,40 @@ type staged struct {
 // transaction, then rolls up every coarser bucket that has closed and trims
 // what has aged out. A bucket written again is merged with what it holds, so
 // a final flush at shutdown and the first flush after the restart add up. A
-// sample whose series is new past a cardinality cap is dropped and counted.
+// sample whose series is new past a cardinality cap, or is malformed, is
+// refused and named in Stats. A write too late to be stored exactly is
+// refused whole and counted (see "Clock faults").
 func (db *DB) Write(at time.Time, samples []Sample) (WriteResult, error) {
 	start := time.Now()
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 	db.mu.RLock()
 	closed := db.closed
+	prevHorizon := db.horizon
 	db.mu.RUnlock()
 	if closed {
 		return WriteResult{}, ErrClosed
 	}
 	fine := db.tiers[0]
 	minute := floorUnix(at.Unix(), fine.Res)
+	writeEnd := minute + int64(fine.Res/time.Second)
 	res := WriteResult{At: time.Unix(minute, 0).UTC()}
+	if prevHorizon == 0 {
+		prevHorizon = writeEnd
+	}
+	if db.tooLate(minute, prevHorizon) {
+		res.Late = len(samples)
+		res.Duration = time.Since(start)
+		db.mu.Lock()
+		db.lateSamples += uint64(res.Late)
+		db.lastWrite = res
+		db.mu.Unlock()
+		return res, nil
+	}
+	// How far this write may trim and roll: to the end of its minute, but no
+	// more than maxHorizonAdvance past where the store had already reached.
+	horizon := min(writeEnd, prevHorizon+maxHorizonAdvance)
+	nextHorizon := max(prevHorizon, horizon)
 
 	st := &staged{
 		owners:      map[string]uint32{},
@@ -416,24 +573,37 @@ func (db *DB) Write(at time.Time, samples []Sample) (WriteResult, error) {
 	st.total = len(db.series)
 	db.mu.RUnlock()
 
+	refusedNow := map[refusedKey]*RefusedSeries{}
+	refuse := func(owner, name, reason string) {
+		res.Refused++
+		k := refusedKey{shownName(owner), shownName(name)}
+		r := refusedNow[k]
+		if r == nil {
+			r = &RefusedSeries{Owner: k.owner, Name: k.name, First: res.At, Last: res.At}
+			refusedNow[k] = r
+		}
+		r.Reason = reason
+		r.Samples++
+	}
+
 	var rolledAfter []int64
 	err := db.bolt.Update(func(tx *bolt.Tx) error {
 		byOwner := map[uint32]map[uint32]Point{}
 		for _, s := range samples {
 			if !s.Kind.valid() || !validName(s.Owner) || !validName(s.Name) {
-				res.Dropped++
+				refuse(s.Owner, s.Name, RefusedInvalid)
 				continue
 			}
 			p := s.point()
 			if p.empty() {
 				continue
 			}
-			ownerID, seriesID, ok, err := db.resolve(tx, st, s.Owner, s.Name, s.Kind)
+			ownerID, seriesID, reason, err := db.resolve(tx, st, s.Owner, s.Name, s.Kind)
 			if err != nil {
 				return err
 			}
-			if !ok {
-				res.Dropped++
+			if reason != "" {
+				refuse(s.Owner, s.Name, reason)
 				continue
 			}
 			pts := byOwner[ownerID]
@@ -446,9 +616,6 @@ func (db *DB) Write(at time.Time, samples []Sample) (WriteResult, error) {
 			pts[seriesID] = cur
 			res.Points++
 		}
-		// The newest minute stored before this write, read before it lands:
-		// the trim below may not run further ahead of it than one step.
-		prevNewest, havePrev := newestRowTx(tx, fine, db.ownerIDsWith(st))
 		fb := tierBucket(tx, fine)
 		for ownerID, pts := range byOwner {
 			key := ownerKey(ownerID, minute)
@@ -467,21 +634,22 @@ func (db *DB) Write(at time.Time, samples []Sample) (WriteResult, error) {
 			res.Rows++
 		}
 		ownerIDs := db.ownerIDsWith(st)
-		rolled, n, err := db.rollTx(tx, ownerIDs, minute)
+		rolled, n, err := db.rollTx(tx, ownerIDs, minute, horizon)
 		if err != nil {
 			return err
 		}
 		res.Rolled = n
 		rolledAfter = rolled
-		trimHorizon := minute + int64(fine.Res/time.Second)
-		if havePrev && trimHorizon > prevNewest+maxTrimAdvance {
-			trimHorizon = prevNewest + maxTrimAdvance
-		}
-		trimmed, err := db.trimTx(tx, ownerIDs, trimHorizon)
+		trimmed, err := db.trimTx(tx, ownerIDs, horizon)
 		if err != nil {
 			return err
 		}
 		res.Trimmed = trimmed
+		if nextHorizon != db.horizon {
+			if err := tx.Bucket(bucketMeta).Put(metaHorizon, binary.BigEndian.AppendUint64(nil, uint64(nextHorizon))); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -496,16 +664,76 @@ func (db *DB) Write(at time.Time, samples []Sample) (WriteResult, error) {
 	for k, meta := range st.series {
 		db.series[k] = meta
 		db.seriesRefs[meta.id] = seriesRef{owner: k.owner, name: k.name, kind: meta.kind}
+		// A series refused earlier (a cap that has since freed up) is
+		// stored now.
+		delete(db.refused, refusedKey{db.ownerNames[k.owner], k.name})
 	}
 	for owner, n := range st.ownerCounts {
 		db.ownerCounts[owner] += n
 	}
 	db.nextOwner, db.nextSeries = st.nextOwner, st.nextSeries
 	copy(db.rolled, rolledAfter)
-	db.dropped += uint64(res.Dropped)
+	db.horizon = nextHorizon
+	res.NewlyRefused = db.noteRefusedLocked(refusedNow, res.At)
+	db.refusedSamples += uint64(res.Refused)
 	db.lastWrite = res
+	db.lastWrite.NewlyRefused = nil
 	db.mu.Unlock()
 	return res, nil
+}
+
+// noteRefusedLocked folds one write's refused series into the named set and
+// returns those it had not been naming. It forgets a series refusedForget
+// after its last refused sample, and names at most maxRefusedTracked.
+func (db *DB) noteRefusedLocked(now map[refusedKey]*RefusedSeries, at time.Time) []RefusedSeries {
+	var fresh []RefusedSeries
+	keys := make([]refusedKey, 0, len(now))
+	for k := range now {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].owner != keys[j].owner {
+			return keys[i].owner < keys[j].owner
+		}
+		return keys[i].name < keys[j].name
+	})
+	for _, k := range keys {
+		r := now[k]
+		if known := db.refused[k]; known != nil {
+			known.Reason, known.Last, known.Samples = r.Reason, r.Last, known.Samples+r.Samples
+			continue
+		}
+		if len(db.refused) >= maxRefusedTracked {
+			db.refusedOverflowAt = at
+			continue
+		}
+		db.refused[k] = r
+		fresh = append(fresh, *r)
+	}
+	for k, r := range db.refused {
+		if r.Last.Before(at.Add(-refusedForget)) {
+			delete(db.refused, k)
+		}
+	}
+	return fresh
+}
+
+// tooLate reports whether a write into minute can no longer be stored
+// exactly. Retention has trimmed each tier up to horizon minus its Keep at
+// most, so a finer tier still holds everything from there on. A minute the
+// finest tier has trimmed past, or one whose bucket in a coarser tier starts
+// before what the tier below still holds, would make the rollup rebuild that
+// bucket from part of its data and replace what it holds.
+func (db *DB) tooLate(minute, horizon int64) bool {
+	if minute < horizon-int64(db.tiers[0].Keep/time.Second) {
+		return true
+	}
+	for i := 1; i < len(db.tiers); i++ {
+		if floorUnix(minute, db.tiers[i].Res) < horizon-int64(db.tiers[i-1].Keep/time.Second) {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedPoints(pts map[uint32]Point) []rowPoint {
@@ -518,8 +746,9 @@ func sortedPoints(pts map[uint32]Point) []rowPoint {
 }
 
 // resolve finds or creates the ids for (owner, name), honouring the caps.
-// Creation is written into tx and staged for the in-memory catalog.
-func (db *DB) resolve(tx *bolt.Tx, st *staged, owner, name string, kind Kind) (uint32, uint32, bool, error) {
+// Creation is written into tx and staged for the in-memory catalog. A
+// refused series comes back with the reason (one of the Refused constants).
+func (db *DB) resolve(tx *bolt.Tx, st *staged, owner, name string, kind Kind) (uint32, uint32, string, error) {
 	db.mu.RLock()
 	ownerID, ownerKnown := db.owners[owner]
 	var meta seriesMeta
@@ -537,17 +766,25 @@ func (db *DB) resolve(tx *bolt.Tx, st *staged, owner, name string, kind Kind) (u
 		meta, seriesKnown = st.series[seriesKey{ownerID, name}]
 	}
 	if seriesKnown {
-		return ownerID, meta.id, meta.kind == kind, nil
+		if meta.kind != kind {
+			return ownerID, meta.id, RefusedKindMismatch, nil
+		}
+		return ownerID, meta.id, "", nil
 	}
 	ownerCount += st.ownerCounts[ownerID]
-	if st.total >= db.opts.MaxSeries || ownerCount >= db.opts.MaxSeriesPerOwner {
-		return 0, 0, false, nil
+	// The owner's own cap first: when it is full, a larger total would not
+	// help.
+	if ownerCount >= db.opts.MaxSeriesPerOwner {
+		return 0, 0, RefusedOwnerCap, nil
+	}
+	if st.total >= db.opts.MaxSeries {
+		return 0, 0, RefusedTotalCap, nil
 	}
 	if !ownerKnown {
 		st.nextOwner++
 		ownerID = st.nextOwner
 		if err := tx.Bucket(bucketOwners).Put([]byte(owner), binary.BigEndian.AppendUint32(nil, ownerID)); err != nil {
-			return 0, 0, false, err
+			return 0, 0, "", err
 		}
 		st.owners[owner] = ownerID
 	}
@@ -556,12 +793,12 @@ func (db *DB) resolve(tx *bolt.Tx, st *staged, owner, name string, kind Kind) (u
 	key := append(ownerPrefix(ownerID), name...)
 	val := append(binary.BigEndian.AppendUint32(nil, id), byte(kind))
 	if err := tx.Bucket(bucketSeries).Put(key, val); err != nil {
-		return 0, 0, false, err
+		return 0, 0, "", err
 	}
 	st.series[seriesKey{ownerID, name}] = seriesMeta{id: id, kind: kind}
 	st.ownerCounts[ownerID]++
 	st.total++
-	return ownerID, id, true, nil
+	return ownerID, id, "", nil
 }
 
 func (db *DB) ownerIDsWith(st *staged) []uint32 {
@@ -578,22 +815,30 @@ func (db *DB) ownerIDsWith(st *staged) []uint32 {
 	return ids
 }
 
-// rollTx rolls every coarser tier up to the end of the finest bucket just
-// written, and re-rolls the coarser buckets containing it when they had
-// already been rolled (a write that landed late). It returns the new last
-// rolled bucket per tier and how many buckets it rolled.
-func (db *DB) rollTx(tx *bolt.Tx, owners []uint32, written int64) ([]int64, int, error) {
+// rollTx rolls every coarser tier up to horizon (the end of the finest bucket
+// just written, or less when a clock fault holds it back), and re-rolls the
+// coarser buckets containing the written minute when they had already been
+// rolled (a write that landed late). It returns the new last rolled bucket
+// per tier and how many buckets it rolled.
+//
+// After a clock that ran ahead comes back, the last rolled buckets are ahead
+// of it, by at most an hour per flush made ahead (maxHorizonAdvance). Until
+// the clock passes them every write lands "late" and re-rolls the buckets
+// containing it, which keeps them whole; then catch-up takes over again.
+func (db *DB) rollTx(tx *bolt.Tx, owners []uint32, written, horizon int64) ([]int64, int, error) {
 	db.mu.RLock()
 	rolled := append([]int64(nil), db.rolled...)
 	db.mu.RUnlock()
-	horizon := written + int64(db.tiers[0].Res/time.Second)
 	meta := tx.Bucket(bucketMeta)
 	count := 0
 	for i := 1; i < len(db.tiers); i++ {
 		t := db.tiers[i]
 		step := int64(t.Res / time.Second)
 		finer := db.tiers[i-1]
-		// A late write into a bucket already rolled: roll it again.
+		prev := rolled[i]
+		// A late write into a bucket already rolled: roll it again. Write
+		// refuses a minute whose bucket reaches back past what the finer
+		// tier still holds, so the rebuild is whole.
 		if s := floorUnix(written, t.Res); rolled[i] != 0 && s <= rolled[i] {
 			if err := db.rollBucket(tx, owners, finer, t, s); err != nil {
 				return nil, 0, err
@@ -624,8 +869,8 @@ func (db *DB) rollTx(tx *bolt.Tx, owners []uint32, written int64) ([]int64, int,
 				count++
 			}
 		}
-		if last != rolled[i] {
-			rolled[i] = last
+		rolled[i] = last
+		if last != prev {
 			if err := meta.Put([]byte(rolledPrefix+t.Name), binary.BigEndian.AppendUint64(nil, uint64(last))); err != nil {
 				return nil, 0, err
 			}
@@ -634,13 +879,16 @@ func (db *DB) rollTx(tx *bolt.Tx, owners []uint32, written int64) ([]int64, int,
 	return rolled, count, nil
 }
 
-// maxTrimAdvance bounds how far one write may move the retention line past
-// the newest minute already stored, in seconds. Retention is measured from
-// the minute being written, so without it a clock stepped a year ahead for
-// one flush would trim every finer tier against that future and erase weeks
-// of history the moment the clock came back. With it, a server that really
-// was down for days catches its trimming up an hour per flush.
-const maxTrimAdvance = int64(3600)
+// maxHorizonAdvance bounds how far one write may move the store's horizon,
+// and so its retention line and its rollups, in seconds. Retention is
+// measured from the minute being written, so without it a clock stepped a
+// year ahead would trim every tier against that future and erase the history
+// the moment the clock came back, and would roll a year of empty buckets in
+// one transaction. With it, each flush made with the clock ahead costs at
+// most an hour of the finer tiers, and a server that really was down for days
+// catches its trimming and rolling up an hour per flush; until then a query
+// reads the part not yet rolled from the finest tier, which still holds it.
+const maxHorizonAdvance = int64(3600)
 
 // newestRowTx returns the start of the newest row any of owners has in tier
 // t, and false when none has one.
@@ -806,9 +1054,72 @@ func (db *DB) DeleteOwner(owner string) (int, error) {
 			delete(db.seriesRefs, meta.id)
 		}
 	}
+	for k := range db.refused {
+		if k.owner == owner {
+			delete(db.refused, k)
+		}
+	}
 	db.statsCache = nil
 	db.mu.Unlock()
 	return removed, nil
+}
+
+// PruneIdleSeries removes from the catalog every series that has no point
+// left in any tier: one its owner stopped sending (a renamed route group, a
+// retired plugin method or store caller) whose points have all aged out. It
+// gives the series' place under the caps back, and a series sent again later
+// starts over. It reads every row, skipping the payloads, so it is meant to
+// run rarely (the self-monitor runs it once a day). It reports how many
+// series it removed, and removes none when a row cannot be read.
+func (db *DB) PruneIdleSeries() (int, error) {
+	db.writeMu.Lock()
+	defer db.writeMu.Unlock()
+	db.mu.RLock()
+	if db.closed {
+		db.mu.RUnlock()
+		return 0, ErrClosed
+	}
+	idle := make(map[uint32]seriesKey, len(db.series))
+	for k, meta := range db.series {
+		idle[meta.id] = k
+	}
+	db.mu.RUnlock()
+	if len(idle) == 0 {
+		return 0, nil
+	}
+	err := db.bolt.Update(func(tx *bolt.Tx) error {
+		seen := func(series uint32) bool {
+			delete(idle, series)
+			return false
+		}
+		for _, t := range db.tiers {
+			c := tx.Bucket([]byte(tierPrefix + t.Name)).Cursor()
+			for k, v := c.First(); k != nil && len(idle) > 0; k, v = c.Next() {
+				if err := decodeRow(v, seen, nil); err != nil {
+					return err
+				}
+			}
+		}
+		b := tx.Bucket(bucketSeries)
+		for _, k := range idle {
+			if err := b.Delete(append(ownerPrefix(k.owner), k.name...)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	db.mu.Lock()
+	for id, k := range idle {
+		delete(db.series, k)
+		delete(db.seriesRefs, id)
+		db.ownerCounts[k.owner]--
+	}
+	db.statsCache = nil
+	db.mu.Unlock()
+	return len(idle), nil
 }
 
 // OwnerInfo describes one owner.
@@ -888,16 +1199,25 @@ type TierStats struct {
 
 // Stats is the store's account of itself.
 type Stats struct {
-	Path              string      `json:"path"`
-	SizeBytes         int64       `json:"size_bytes"`
-	Series            int         `json:"series"`
-	MaxSeries         int         `json:"max_series"`
-	MaxSeriesPerOwner int         `json:"max_series_per_owner"`
-	Owners            int         `json:"owners"`
-	DroppedSeries     uint64      `json:"dropped_series"`
-	SlotsPerSeries    int         `json:"slots_per_series"`
-	Tiers             []TierStats `json:"tiers"`
-	LastWrite         WriteResult `json:"last_write"`
+	Path              string `json:"path"`
+	SizeBytes         int64  `json:"size_bytes"`
+	Series            int    `json:"series"`
+	MaxSeries         int    `json:"max_series"`
+	MaxSeriesPerOwner int    `json:"max_series_per_owner"`
+	Owners            int    `json:"owners"`
+	// RefusedSeries names the series refused in the last refusedForget, the
+	// first refused first, at most maxRefusedTracked of them;
+	// RefusedSeriesMore says more were refused than are named.
+	RefusedSeries     []RefusedSeries `json:"refused_series"`
+	RefusedSeriesMore bool            `json:"refused_series_more"`
+	// RefusedSamples and LateSamples count, since the process started, the
+	// samples refused for their series and those refused for arriving too
+	// late.
+	RefusedSamples uint64      `json:"refused_samples"`
+	LateSamples    uint64      `json:"late_samples"`
+	SlotsPerSeries int         `json:"slots_per_series"`
+	Tiers          []TierStats `json:"tiers"`
+	LastWrite      WriteResult `json:"last_write"`
 }
 
 // statsTTL bounds how often Stats walks the tier buckets to count rows.
@@ -918,11 +1238,27 @@ func (db *DB) Stats() (Stats, error) {
 		MaxSeries:         db.opts.MaxSeries,
 		MaxSeriesPerOwner: db.opts.MaxSeriesPerOwner,
 		Owners:            len(db.owners),
-		DroppedSeries:     db.dropped,
+		RefusedSeries:     make([]RefusedSeries, 0, len(db.refused)),
+		RefusedSeriesMore: !db.refusedOverflowAt.IsZero() && !db.refusedOverflowAt.Before(db.lastWrite.At.Add(-refusedForget)),
+		RefusedSamples:    db.refusedSamples,
+		LateSamples:       db.lateSamples,
 		LastWrite:         db.lastWrite,
+	}
+	for _, r := range db.refused {
+		st.RefusedSeries = append(st.RefusedSeries, *r)
 	}
 	rolled := append([]int64(nil), db.rolled...)
 	db.mu.RUnlock()
+	sort.Slice(st.RefusedSeries, func(i, j int) bool {
+		a, b := st.RefusedSeries[i], st.RefusedSeries[j]
+		if !a.First.Equal(b.First) {
+			return a.First.Before(b.First)
+		}
+		if a.Owner != b.Owner {
+			return a.Owner < b.Owner
+		}
+		return a.Name < b.Name
+	})
 	if fi, err := os.Stat(db.path); err == nil {
 		st.SizeBytes = fi.Size()
 	}

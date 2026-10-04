@@ -53,11 +53,15 @@ const readBudget = 8
 
 // pickTier chooses the finest tier that still holds from and has no more
 // than readBudget rows per requested point over the range; when none does,
-// or no tier reaches back that far, the coarsest tier.
+// or no tier reaches back that far, the coarsest tier. A tier counts as
+// holding from when it reaches back to within one of its buckets: a caller
+// asking for "the last 90 days" read its clock a moment before this one, and
+// missing at most the oldest partial bucket is better than dropping to a
+// tier 24 times coarser.
 func (db *DB) pickTier(now, from, to time.Time, maxPoints int) int {
 	span := to.Sub(from)
 	for i, t := range db.tiers {
-		if from.Before(now.Add(-t.Keep)) {
+		if from.Before(now.Add(-t.Keep - t.Res)) {
 			continue
 		}
 		if span/t.Res <= time.Duration(readBudget*maxPoints) {

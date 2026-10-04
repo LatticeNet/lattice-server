@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -39,7 +40,23 @@ var metricsRanges = map[string]time.Duration{
 // systemHealthSparkPoints is how many buckets a table row's sparkline has.
 const systemHealthSparkPoints = 48
 
-var errMetricsDisabled = errors.New("this server keeps no metrics history (it runs without a data directory)")
+// The 503 codes of the self-monitoring reads. writeError replaces every 5xx
+// message with a generic one, so the code is what tells the console which
+// case it is; the detail of a store that would not open is in the log.
+const (
+	// apiErrorMetricsDisabled: the server runs without a data directory.
+	apiErrorMetricsDisabled = "metrics_disabled"
+	// apiErrorMetricsUnavailable: metrics.db could not be opened.
+	apiErrorMetricsUnavailable = "metrics_unavailable"
+)
+
+// metricsUnavailable is the 503 answer when no metrics store is wired.
+func (s *Server) metricsUnavailable() error {
+	if s.selfmonUnavailable != "" {
+		return apiError(apiErrorMetricsUnavailable, s.selfmonUnavailable)
+	}
+	return apiError(apiErrorMetricsDisabled, "this server keeps no metrics history (it runs without a data directory)")
+}
 
 func (s *Server) requireFullAdmin(w http.ResponseWriter, p principal, action string) bool {
 	if rbac.HoldsExplicitScope(p.Scopes, "*") && !principalHasNodeRestriction(p) {
@@ -97,7 +114,9 @@ func parseMetricsWindow(q url.Values, now time.Time, def string) (from, to time.
 }
 
 // compactFloats encodes with six significant digits: a chart cannot show
-// more, and it keeps a 360-point series small.
+// more, and it keeps a 360-point series small. A value JSON cannot carry
+// (NaN, an infinity) is written as null, so one bad value costs a point and
+// never the whole answer.
 type compactFloats []float64
 
 func (f compactFloats) MarshalJSON() ([]byte, error) {
@@ -106,6 +125,10 @@ func (f compactFloats) MarshalJSON() ([]byte, error) {
 	for i, v := range f {
 		if i > 0 {
 			b = append(b, ',')
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			b = append(b, "null"...)
+			continue
 		}
 		b = strconv.AppendFloat(b, v, 'g', 6, 64)
 	}
@@ -210,7 +233,7 @@ func (s *Server) handleNodeHistory(w http.ResponseWriter, r *http.Request, p pri
 		return
 	}
 	if s.selfmon == nil {
-		writeError(w, http.StatusServiceUnavailable, errMetricsDisabled)
+		writeError(w, http.StatusServiceUnavailable, s.metricsUnavailable())
 		return
 	}
 	from, to, _, points, err := parseMetricsWindow(r.URL.Query(), s.now(), "24h")
@@ -237,7 +260,7 @@ func (s *Server) handleSystemSeries(w http.ResponseWriter, r *http.Request, p pr
 		return
 	}
 	if s.selfmon == nil {
-		writeError(w, http.StatusServiceUnavailable, errMetricsDisabled)
+		writeError(w, http.StatusServiceUnavailable, s.metricsUnavailable())
 		return
 	}
 	q := r.URL.Query()
@@ -432,7 +455,7 @@ func (s *Server) handleSystemHealth(w http.ResponseWriter, r *http.Request, p pr
 		return
 	}
 	if s.selfmon == nil {
-		writeError(w, http.StatusServiceUnavailable, errMetricsDisabled)
+		writeError(w, http.StatusServiceUnavailable, s.metricsUnavailable())
 		return
 	}
 	now := s.now()

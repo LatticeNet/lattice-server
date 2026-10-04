@@ -22,6 +22,10 @@ type SelfMonitorOptions struct {
 	// history: the System page and node history answer 503, and nothing is
 	// sampled.
 	DB *metricsdb.DB
+	// Unavailable is why DB is nil when a data directory was configured
+	// (metrics.db could not be opened); the 503 carries it. Empty means the
+	// server runs without a data directory.
+	Unavailable string
 	// DataDir is the directory whose volume's used and free space is
 	// recorded.
 	DataDir string
@@ -47,6 +51,9 @@ const (
 	selfMonSampleEvery = 10 * time.Second
 	selfMonFlushEvery  = time.Minute
 	selfMonPruneEvery  = time.Hour
+	// selfMonSeriesPruneEvery is how often series with no point left are
+	// dropped from the catalog; it reads every row, so it runs daily.
+	selfMonSeriesPruneEvery = 24 * time.Hour
 	// selfMonPluginGrace is how long a plugin that is no longer loaded keeps
 	// its history: a bundle that failed verification at one boot and comes
 	// back at the next has not been deleted.
@@ -174,12 +181,13 @@ type selfMonitor struct {
 	cpuPrevAt time.Time
 	gcPrev    []uint64
 	// minute is the start of the minute being collected.
-	minute       time.Time
-	lastWrite    metricsdb.WriteResult
-	lastWriteAt  time.Time
-	lastWriteErr string
-	lastPrune    time.Time
-	fileSizes    map[string]int64
+	minute          time.Time
+	lastWrite       metricsdb.WriteResult
+	lastWriteAt     time.Time
+	lastWriteErr    string
+	lastPrune       time.Time
+	lastSeriesPrune time.Time
+	fileSizes       map[string]int64
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -447,24 +455,53 @@ func (m *selfMonitor) flushDue(now time.Time, final bool) {
 			m.logger.Printf("metrics store: writing again after: %s", m.lastWriteErr)
 		}
 		m.lastWrite, m.lastWriteAt, m.lastWriteErr = res, now, ""
-		if res.Dropped > 0 {
-			m.logger.Printf("metrics store: %d series past the cardinality cap were not stored", res.Dropped)
+		// Once per series, not once a minute for as long as it is refused.
+		for _, r := range res.NewlyRefused {
+			m.logger.Printf("metrics store: series %q of %q is not stored: %s", r.Name, r.Owner, selfMonRefusedReason(r.Reason))
+		}
+		if res.Late > 0 {
+			m.logger.Printf("metrics store: the minute %s arrived after the store had moved past it (a clock stepped back?); %d samples were not stored", minute.Format(time.RFC3339), res.Late)
 		}
 	}
 	prune := !final && now.Sub(m.lastPrune) >= selfMonPruneEvery
 	if prune {
 		m.lastPrune = now
 	}
+	pruneSeries := prune && now.Sub(m.lastSeriesPrune) >= selfMonSeriesPruneEvery
+	if pruneSeries {
+		m.lastSeriesPrune = now
+	}
 	m.mu.Unlock()
 	if prune {
-		m.prune(now)
+		m.prune(now, pruneSeries)
+	}
+}
+
+func selfMonRefusedReason(reason string) string {
+	switch reason {
+	case metricsdb.RefusedTotalCap:
+		return "the store's series cap is full (LATTICE_METRICS_MAX_SERIES raises it)"
+	case metricsdb.RefusedOwnerCap:
+		return "its owner has reached the per-owner series cap"
+	case metricsdb.RefusedKindMismatch:
+		return "it is already recorded as the other kind"
+	default:
+		return "its owner or name is not valid"
 	}
 }
 
 // prune deletes the history of owners that are gone: a node no longer in the
 // store at once, a plugin no longer loaded once its newest point is older
-// than selfMonPluginGrace.
-func (m *selfMonitor) prune(now time.Time) {
+// than selfMonPluginGrace. With series set it also drops the series that no
+// longer have a point anywhere, so they stop counting against the caps.
+func (m *selfMonitor) prune(now time.Time, series bool) {
+	if series {
+		if n, err := m.db.PruneIdleSeries(); err != nil {
+			m.logger.Printf("metrics store: prune idle series: %v", err)
+		} else if n > 0 {
+			m.logger.Printf("metrics store: dropped %d series with no point left from the catalog", n)
+		}
+	}
 	gone, err := m.db.PruneOwners(func(owner string, newest time.Time) bool {
 		switch {
 		case strings.HasPrefix(owner, selfMonOwnerNodePrefix):

@@ -116,12 +116,14 @@ type Incident struct {
 	OwedOpen     bool `json:"owed_open,omitempty"`
 	OwedRecovery bool `json:"owed_recovery,omitempty"`
 	// OwedOpenRules names the rules still owed the open message when only
-	// some are: undoing an acknowledgement owes it to the rules whose
-	// quiet-hours copy was withdrawn because of it, while the other rules
-	// had delivered theirs. The sweep sends it through these rules alone
-	// once nothing holds the incident; OwedOpen, when set, owes it through
-	// every rule and covers them. A later acknowledgement keeps them for its
-	// own undo, and resolving or reopening clears them.
+	// some are: the rules whose quiet-hours copy was withdrawn (because of
+	// an acknowledgement since undone, or a snooze since ended early) while
+	// the other rules had delivered theirs. The sweep sends it through these
+	// rules alone once nothing holds the incident; OwedOpen, when set, owes
+	// it through every rule and covers them. A later acknowledgement keeps
+	// them for its own undo. Resolving keeps them until the recovery goes
+	// out, which leaves them out since they never heard "down"; reopening
+	// before then owes them the new open.
 	OwedOpenRules []string `json:"owed_open_rules,omitempty"`
 	// Suppressed is the last reason a message about this incident was held,
 	// and SuppressedAt when.

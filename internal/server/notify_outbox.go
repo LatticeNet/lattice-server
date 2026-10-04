@@ -657,11 +657,14 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	}
 }
 
-// The reasons a held incident message is withdrawn with; the console matches
-// them (lattice-dashboard notifySentModel.ts).
+// The reasons a held incident message is withdrawn with, and the one a
+// recovery is withheld from a rule with (sendRecoveries); the console matches
+// the first two (lattice-dashboard notifySentModel.ts) and shows any other
+// reason as written.
 const (
 	notifyWithdrawnOpen     = "withdrawn when quiet hours ended: the incident was resolved, acknowledged or snoozed meanwhile"
 	notifyWithdrawnRecovery = "withdrawn when quiet hours ended: the open message it answers was withdrawn too"
+	notifyWithheldRecovery  = "withheld: the open message it answers never reached this rule"
 )
 
 // heldIncidentMessage reports an incident message quiet hours held that has
@@ -676,7 +679,7 @@ func heldIncidentMessage(row store.NotifyDelivery) bool {
 // to an incident holds. An acknowledgement undone at the same moment then
 // either lands first, and the decision sees the incident open and sends, or
 // lands after, and finds the row withdrawn and owes its rule the message
-// again (rulesThatWithdrewOpen). Without the lock the undo could fall between
+// again (rulesThatMissedOpen). Without the lock the undo could fall between
 // the two, find no withdrawn row, and the message would be lost. Lock order:
 // incidentMu, then the store; the outbox locks are not held here.
 func (s *Server) withdrawHeldIncidentMessage(row store.NotifyDelivery) bool {
@@ -708,7 +711,9 @@ func (s *Server) withdrawHeldIncidentMessage(row store.NotifyDelivery) bool {
 // unsnoozed. A recovery is withdrawn when, for every incident it reports, the
 // latest open message on the same rule and channel was withdrawn: the phone
 // never heard "down", so it is not told "up". The drainer settles a rule and
-// channel's held rows in order, so that open has settled by now.
+// channel's held rows in order, so that open has settled by now. This
+// judges per channel; whether a recovery is planned for a rule at all is
+// judged per rule when it is sent (sendRecoveries).
 func (s *Server) heldIncidentWithdrawal(row store.NotifyDelivery) string {
 	if !heldIncidentMessage(row) {
 		return ""

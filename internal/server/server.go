@@ -370,6 +370,9 @@ type Server struct {
 	// a held incident message and its record, with incidentMu held.
 	outbox             notifyOutboxRunner
 	heldWithdrawalHook func()
+	// incidentOutboxReadHook (tests only) sees each outbox read that judges
+	// which rules missed an incident's open (latestOpenReach).
+	incidentOutboxReadHook func(store.NotifyDeliveryFilter)
 	// notifySend delivers one message to one channel; overridable in tests,
 	// since the real sender refuses the loopback listener a test runs.
 	notifySend func(ctx context.Context, channel model.NotifyChannel, msg notify.Message) error

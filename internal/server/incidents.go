@@ -293,7 +293,11 @@ func (s *Server) latestOpenReach(kind string, incidentIDs []string) map[string]m
 	type key struct{ incident, rule string }
 	latest := map[key]string{} // the event id of the latest message
 	out := map[string]map[string]openReach{}
-	for _, row := range s.store.NotifyDeliveries(store.NotifyDeliveryFilter{EventType: kind}) { // newest first
+	filter := store.NotifyDeliveryFilter{EventType: kind}
+	if s.incidentOutboxReadHook != nil {
+		s.incidentOutboxReadHook(filter)
+	}
+	for _, row := range s.store.NotifyDeliveries(filter) { // newest first
 		if row.RuleID == "" {
 			continue
 		}

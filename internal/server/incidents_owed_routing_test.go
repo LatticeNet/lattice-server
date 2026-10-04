@@ -367,3 +367,35 @@ func TestAReopeningOwesTheOpenToAnOwedRuleTheOutboxForgot(t *testing.T) {
 	d.sweep()
 	d.expect("the next sweep")
 }
+
+// Which rules missed each recovering incident's open is judged from one
+// outbox read per event type, however many incidents recover together: a
+// fleet-wide outage clearing does not scan the outbox once per incident
+// while every incident handler waits.
+func TestRecoveriesReadTheOutboxOncePerEventType(t *testing.T) {
+	nodes := make([]string, 34)
+	for i := range nodes {
+		nodes[i] = fmt.Sprintf("n%02d", i)
+	}
+	d := newDayNight(t, nodes...)
+	d.endQuietHours()
+	for _, nodeID := range nodes {
+		d.h.f.srv.openIncident(incidentSignal{kind: EventAgentStalled, nodeID: nodeID, subject: "name-" + nodeID, since: d.h.now(),
+			msg: incidentMessage{title: "Agent loop stalled: name-" + nodeID, detail: "d", line: "name-" + nodeID + ": stalled"}}, d.h.now())
+	}
+	d.sweep()
+	d.expect("the opens", "nc-day Lattice agent stalled digest: 34 nodes", "nc-night Lattice agent stalled digest: 34 nodes")
+
+	var reads []store.NotifyDeliveryFilter
+	d.h.f.srv.incidentOutboxReadHook = func(f store.NotifyDeliveryFilter) { reads = append(reads, f) }
+	d.h.clock.advance(time.Minute)
+	for _, nodeID := range nodes {
+		d.resolve(nodeID)
+	}
+	d.sweep()
+	d.h.f.srv.incidentOutboxReadHook = nil
+	d.expect("the recoveries", "nc-day Lattice agent recovered digest: 34 nodes", "nc-night Lattice agent recovered digest: 34 nodes")
+	if len(reads) != 1 || reads[0].EventType != EventAgentStalled {
+		t.Fatalf("outbox reads during the recovery sweep = %d %+v, want one for %s", len(reads), reads, EventAgentStalled)
+	}
+}

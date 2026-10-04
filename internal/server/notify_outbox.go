@@ -659,8 +659,8 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 
 // The reasons a held incident message is withdrawn with, and the one a
 // recovery is withheld from a rule with (sendRecoveries); the console matches
-// the first two (lattice-dashboard notifySentModel.ts) and shows any other
-// reason as written.
+// all three word for word (lattice-dashboard notifySentModel.ts) and shows any
+// other reason as written.
 const (
 	notifyWithdrawnOpen     = "withdrawn when quiet hours ended: the incident was resolved, acknowledged or snoozed meanwhile"
 	notifyWithdrawnRecovery = "withdrawn when quiet hours ended: the open message it answers was withdrawn too"

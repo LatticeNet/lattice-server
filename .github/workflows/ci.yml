@@ -32,10 +32,11 @@ jobs:
         run: go vet ./...
       - name: test
         working-directory: lattice-server
-        # The E5 line-chain and subscription suites push internal/server past
-        # go test's 10m default under -race -cover on shared runners; the run
-        # died as an aggregate timeout with the active test at 0s, not a hang.
-        run: go test -race -cover -timeout 25m ./...
+        shell: bash
+        # internal/server runs in the server job below; every other package
+        # runs here. shell: bash sets pipefail, so a failing go list fails
+        # the step.
+        run: go list ./... | grep -v '/internal/server$' | xargs go test -race -cover -timeout 25m
       - name: gosec
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
@@ -45,3 +46,41 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
+  server:
+    # internal/server is one test binary of about 1400 serial tests that took
+    # 1437 s under -race -cover on a shared runner, against go test's 25m
+    # timeout. Each shard runs every Nth top-level test (subtests follow their
+    # parent), so together the shards run every test exactly once. To add a
+    # shard, add an entry to the matrix; the split reads the count from it.
+    name: server (${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - name: checkout lattice-server
+        uses: actions/checkout@v6
+        with:
+          path: lattice-server
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+          cache-dependency-path: |
+            lattice-server/go.mod
+            lattice-server/go.sum
+      - name: test internal/server
+        working-directory: lattice-server
+        shell: bash
+        env:
+          SHARD: ${{ strategy.job-index }}
+          SHARDS: ${{ strategy.job-total }}
+        # The listing builds with the same flags as the run, so the run reuses
+        # the build. The coverage it prints is the share of internal/server
+        # statements this shard's tests reach.
+        run: |
+          tests=$(go test -race -cover -list . ./internal/server/ | grep -E '^(Test|Example|Fuzz)' | awk -v n="$SHARDS" -v i="$SHARD" '(NR - 1) % n == i' | paste -sd '|' -)
+          test -n "$tests"
+          echo "shard $((SHARD + 1)) of $SHARDS runs $(echo "$tests" | tr '|' '\n' | wc -l) top-level tests"
+          go test -race -cover -timeout 25m -run "^($tests)\$" ./internal/server/

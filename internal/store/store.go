@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -3846,7 +3847,28 @@ func stampPluginStatusTime(p model.PluginInstallation, now time.Time) model.Plug
 	return p
 }
 
+// cloneNode copies a node deeply enough that nothing a caller holds shares
+// memory with the stored node: every pointer and slice is copied, so a
+// reader that writes through a field of its copy cannot change store state
+// outside the lock. slices.Clone keeps a nil slice nil and an empty one
+// empty, so the JSON a node encodes to does not change.
 func cloneNode(n model.Node) model.Node {
+	n.Tags = slices.Clone(n.Tags)
+	n.AgentSourceAllowlist = slices.Clone(n.AgentSourceAllowlist)
+	n.GroupIDs = slices.Clone(n.GroupIDs)
+	if n.AgentLaunch != nil {
+		launch := *n.AgentLaunch
+		n.AgentLaunch = &launch
+	}
+	if n.IPConfig != nil {
+		ipc := *n.IPConfig
+		ipc.Resolvers = slices.Clone(ipc.Resolvers)
+		n.IPConfig = &ipc
+	}
+	if n.Trace.Raw != nil {
+		raw := *n.Trace.Raw
+		n.Trace.Raw = &raw
+	}
 	if n.Geo != nil {
 		geo := *n.Geo
 		n.Geo = &geo

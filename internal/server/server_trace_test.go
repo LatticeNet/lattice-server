@@ -1032,6 +1032,42 @@ func TestPolicyWriteNoLongerPinsTheBudgetDefault(t *testing.T) {
 	}
 }
 
+// A policy a117 saved carries the 500 it pinned. An explicit 0 must return it
+// to the agent's default, durably and on the record; otherwise no node saved
+// before R1 could ever reach the new default.
+func TestPolicyWriteResetsAStoredBudgetToTheAgentDefault(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	node, _ := st.Node("node-a")
+	node.Trace = model.TracePolicy{NodeID: "node-a", Enabled: true, Level: model.TraceLevelDebug, BudgetLinesPerSec: 500}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+
+	if v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "budget_lines_per_sec": 0}); v.BudgetLinesPerSec != 0 {
+		t.Fatalf("save response budget = %d, want 0", v.BudgetLinesPerSec)
+	}
+	if v := readTracePolicy(t, handler, cookies, csrf, "node-a"); v.BudgetLinesPerSec != 0 {
+		t.Fatalf("read-back budget = %d, want 0", v.BudgetLinesPerSec)
+	}
+	if stored, _ := st.Node("node-a"); stored.Trace.BudgetLinesPerSec != 0 {
+		t.Fatalf("stored budget = %d, want 0", stored.Trace.BudgetLinesPerSec)
+	}
+	if cfg := doTraceAgent(t, handler, "node-a"); cfg.Policy.BudgetLinesPerSec != 0 {
+		t.Fatalf("the agent was sent budget %d, want 0", cfg.Policy.BudgetLinesPerSec)
+	}
+	var budgets []string
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "trace.policy.set" && ev.NodeID == "node-a" {
+			budgets = append(budgets, ev.Metadata["budget"])
+		}
+	}
+	if len(budgets) != 1 || budgets[0] != "0" {
+		t.Fatalf("trace.policy.set budgets audited = %v, want [0]", budgets)
+	}
+}
+
 // Shed connections are a gap like dropped lines and are audited as one, with
 // their own count. A batch carrying only that counter still counts.
 func TestShedConnectionsAreAuditedAsAGap(t *testing.T) {

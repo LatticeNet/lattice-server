@@ -185,8 +185,8 @@ func (s *Store) Append(sourceID string, lines []model.LogLine, rotID string, las
 
 // evictToCap deletes oldest chunks until meta.Bytes <= cap. It must run inside
 // the same write tx as the append so the store is never observed over cap.
-// The cap is read once per append; a cap lowered by SetSourceBytesCap shrinks
-// a source on its next append, which is the only time bbolt eviction runs.
+// The cap is read once per call; a cap lowered by SetSourceBytesCap shrinks a
+// source on its next append, or on EnforceSourceBytesCap.
 func (s *Store) evictToCap(data *bolt.Bucket, meta *Meta) error {
 	limit := s.maxSourceBytes.Load()
 	for meta.Bytes > limit && meta.FirstSeq <= meta.LastSeq {
@@ -405,12 +405,75 @@ func (s *Store) SourceBytesCap() uint64 { return s.maxSourceBytes.Load() }
 
 // SetSourceBytesCap replaces the per-source byte cap. n <= 0 restores
 // DefaultMaxSourceBytes, matching Open. Nothing is evicted by the call
-// itself: each source is brought under the new cap on its next append.
+// itself: each source is brought under the new cap on its next append, or by
+// EnforceSourceBytesCap.
 func (s *Store) SetSourceBytesCap(n int64) {
 	if n <= 0 {
 		n = DefaultMaxSourceBytes
 	}
 	s.maxSourceBytes.Store(uint64(n))
+}
+
+// EnforceSourceBytesCap brings every source over the current cap under it,
+// and returns how many it shrank. Append evicts only the source it writes
+// to, so a cap lowered by SetSourceBytesCap leaves an idle source over it
+// until this pass. Each source is shrunk in its own transaction, so appends
+// interleave with a long pass. Evicted chunks free pages for logs.db to
+// reuse; bbolt never returns them to the filesystem, so the file keeps its
+// size.
+func (s *Store) EnforceSourceBytesCap() (int, error) {
+	limit := s.maxSourceBytes.Load()
+	var over []string
+	err := s.db.View(func(tx *bolt.Tx) error {
+		mb := tx.Bucket([]byte(metaBucketName))
+		if mb == nil {
+			return nil
+		}
+		return mb.ForEach(func(k, v []byte) error {
+			var meta Meta
+			if json.Unmarshal(v, &meta) == nil && meta.Bytes > limit {
+				over = append(over, string(k))
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		return 0, fmt.Errorf("logstore: enforce cap: %w", err)
+	}
+	shrunk := 0
+	for _, sourceID := range over {
+		changed, err := s.shrinkToCap(sourceID)
+		if err != nil {
+			return shrunk, fmt.Errorf("logstore: enforce cap on %s: %w", sourceID, err)
+		}
+		if changed {
+			shrunk++
+		}
+	}
+	return shrunk, nil
+}
+
+// shrinkToCap evicts one source's oldest chunks until it is under the cap.
+func (s *Store) shrinkToCap(sourceID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		data := tx.Bucket(dataBucketName(sourceID))
+		if data == nil {
+			return nil
+		}
+		meta := s.readMeta(tx, sourceID)
+		if meta.Bytes <= s.maxSourceBytes.Load() {
+			return nil
+		}
+		if err := s.evictToCap(data, &meta); err != nil {
+			return err
+		}
+		changed = true
+		return s.writeMeta(tx, sourceID, meta)
+	})
+	return changed && err == nil, err
 }
 
 // EnvMaxSourceBytes parses an optional per-source byte cap override.

@@ -1,6 +1,7 @@
 package tracestore
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -75,7 +76,7 @@ func BenchmarkRollupSeries90DayWindow(b *testing.B) {
 				GroupBy: groupBy, NodeIDs: nodes,
 			}
 			for b.Loop() {
-				if _, _, _, err := s.RollupSeries(f); err != nil {
+				if _, _, _, err := s.RollupSeries(context.Background(), f); err != nil {
 					b.Fatal(err)
 				}
 			}

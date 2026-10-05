@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -353,6 +355,82 @@ func TestRollupsCarryNoDestination(t *testing.T) {
 		}
 		if strings.Contains(body, "dst") || strings.Contains(body, "secret.example.org") {
 			t.Fatalf("group_by=%s carries a destination: %s", groupBy, body)
+		}
+	}
+}
+
+// TestRollupsAllowOneReadAtATime: while one read holds the gate, another
+// waits briefly and is then refused with 429, so a burst of long reads can
+// never take every trace.db connection from ingest and retention.
+func TestRollupsAllowOneReadAtATime(t *testing.T) {
+	h := newEvidenceHarness(t, 0)
+	traceNode(t, h.st, "node-a")
+	appendRollupRecords(t, h.trace, rollupRecord("node-a", 1, rollupsT0, "u1", model.CloseEOF))
+	cookies, csrf := loginSession(t, h.handler)
+	q := rollupsQuery("node", rollupsT0, rollupsT0.Add(time.Hour))
+
+	h.srv.traceRollupBusyWait = 20 * time.Millisecond
+	h.srv.traceRollupReads <- struct{}{} // a read in flight
+	res := doTrace(t, h.handler, http.MethodGet, "/api/trace/rollups?"+q.Encode(), cookies, csrf, nil)
+	res.Body.Close()
+	if res.StatusCode != http.StatusTooManyRequests || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("a second read while one runs: %d Retry-After=%q, want 429 with Retry-After", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	<-h.srv.traceRollupReads // that read finishes
+	if code, view, body := getRollups(t, h.handler, cookies, csrf, q); code != http.StatusOK || len(view.Series) != 1 {
+		t.Fatalf("a read once the gate is free: %d %s", code, body)
+	}
+	// The gate is released after every read, including a refused filter.
+	if len(h.srv.traceRollupReads) != 0 {
+		t.Fatal("a finished read kept the gate")
+	}
+}
+
+// TestRollupsStopWhenTheCallerLeaves: a request whose context is already
+// done does not run the read to the end, and frees the gate.
+func TestRollupsStopWhenTheCallerLeaves(t *testing.T) {
+	h := newEvidenceHarness(t, 0)
+	traceNode(t, h.st, "node-a")
+	appendRollupRecords(t, h.trace, rollupRecord("node-a", 1, rollupsT0, "u1", model.CloseEOF))
+	cookies, _ := loginSession(t, h.handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/trace/rollups?"+rollupsQuery("node", rollupsT0, rollupsT0.Add(time.Hour)).Encode(), nil).WithContext(ctx)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	h.handler.ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a cancelled request was answered in full: %s", rec.Body.String())
+	}
+	if len(h.srv.traceRollupReads) != 0 {
+		t.Fatal("a cancelled read kept the gate")
+	}
+}
+
+// TestRollupsBoundTheFilterLists: line_uuid and user_id become SQL
+// parameters, so each list is capped.
+func TestRollupsBoundTheFilterLists(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	values := func(n int) string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("v%03d", i)
+		}
+		return strings.Join(out, ",")
+	}
+	for _, param := range []string{"line_uuid", "user_id"} {
+		q := rollupsQuery("user", rollupsT0, rollupsT0.Add(time.Hour))
+		q.Set(param, values(traceRollupsMaxFilterValues))
+		if code, _, body := getRollups(t, handler, cookies, csrf, q); code != http.StatusOK {
+			t.Fatalf("%s with %d values: %d %s", param, traceRollupsMaxFilterValues, code, body)
+		}
+		q.Set(param, values(traceRollupsMaxFilterValues+1))
+		if code, _, body := getRollups(t, handler, cookies, csrf, q); code != http.StatusBadRequest {
+			t.Fatalf("%s with %d values: %d %s, want 400", param, traceRollupsMaxFilterValues+1, code, body)
 		}
 	}
 }

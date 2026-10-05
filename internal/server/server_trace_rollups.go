@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,7 +18,15 @@ import (
 //
 // The step follows the window so R2 can switch the source to its hourly and
 // daily tiers without changing the wire. In R1 every step is coarsened from
-// rollups_5m on read and tier is always "5m".
+// rollups_5m on read and tier is always "5m". since is truncated down to the
+// step, so the first step is whole; until is not, so the last step covers
+// only the part of it before until and may read lower than a full step.
+//
+// The read is bounded three ways, because one long window over a large
+// fleet is otherwise the most expensive request this server answers: one
+// read at a time server-wide (it holds four of trace.db's eight connections,
+// and ingest and retention need the rest), a ceiling on the points it may
+// sum into, and the request's context, so a caller who leaves stops it.
 //
 // Design: lattice/docs/designs/design-26-evidence-retention.md section 8.
 
@@ -31,7 +40,41 @@ const (
 	// inside what unix nanoseconds can hold (1678 to 2262).
 	traceRollupsMinYear = 1970
 	traceRollupsMaxYear = 2200
+	// traceRollupsMaxFilterValues bounds the line_uuid and user_id lists,
+	// each of which becomes one SQL parameter.
+	traceRollupsMaxFilterValues = 200
+	// traceRollupsBusyWait is how long a read waits for the one running
+	// before it is refused with 429. A fleet-wide 90-day read takes a few
+	// hundred milliseconds, so a console asking for two groupings at once
+	// waits rather than fails.
+	traceRollupsBusyWait = 2 * time.Second
 )
+
+// initTraceRollups makes the gate that lets one rollups read run at a time.
+func (s *Server) initTraceRollups() {
+	s.traceRollupReads = make(chan struct{}, 1)
+	s.traceRollupBusyWait = traceRollupsBusyWait
+}
+
+// acquireTraceRollupRead takes the gate, waiting up to traceRollupBusyWait or
+// until ctx is done. It reports false when the gate stayed taken.
+func (s *Server) acquireTraceRollupRead(ctx context.Context) bool {
+	select {
+	case s.traceRollupReads <- struct{}{}:
+		return true
+	default:
+	}
+	timer := time.NewTimer(s.traceRollupBusyWait)
+	defer timer.Stop()
+	select {
+	case s.traceRollupReads <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
 
 // traceRollupGroupings are the accepted group_by values.
 var traceRollupGroupings = map[string]bool{
@@ -144,6 +187,11 @@ func (s *Server) handleTraceRollups(w http.ResponseWriter, r *http.Request, p pr
 		GroupBy: groupBy,
 		Series:  []traceRollupSeriesView{},
 	}
+	lines, users := csvParam(q, "line_uuid"), csvParam(q, "user_id")
+	if len(lines) > traceRollupsMaxFilterValues || len(users) > traceRollupsMaxFilterValues {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("line_uuid and user_id may name at most %d values each", traceRollupsMaxFilterValues))
+		return
+	}
 	nodes := s.visibleNodeIDs(p, "log:read", csvParam(q, "node_id"))
 	if len(nodes) == 0 {
 		// No visible node is an empty answer, not a 403, as on
@@ -151,16 +199,33 @@ func (s *Server) handleTraceRollups(w http.ResponseWriter, r *http.Request, p pr
 		writeJSON(w, http.StatusOK, view)
 		return
 	}
-	points, retainedFrom, truncated, err := s.traceStore.RollupSeries(tracestore.RollupSeriesFilter{
-		Since:     since,
-		Until:     until,
-		Step:      step,
-		GroupBy:   groupBy,
-		NodeIDs:   nodes,
-		LineUUIDs: csvParam(q, "line_uuid"),
-		UserIDs:   csvParam(q, "user_id"),
-	})
-	if err != nil {
+	ctx := r.Context()
+	if !s.acquireTraceRollupRead(ctx) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, errors.New("another trends read is running; retry shortly"))
+		return
+	}
+	points, retainedFrom, truncated, err := func() ([]tracestore.RollupPoint, time.Time, bool, error) {
+		defer func() { <-s.traceRollupReads }()
+		return s.traceStore.RollupSeries(ctx, tracestore.RollupSeriesFilter{
+			Since:     since,
+			Until:     until,
+			Step:      step,
+			GroupBy:   groupBy,
+			NodeIDs:   nodes,
+			LineUUIDs: lines,
+			UserIDs:   users,
+		})
+	}()
+	switch {
+	case errors.Is(err, tracestore.ErrRollupTooManyPoints):
+		writeError(w, http.StatusBadRequest, err)
+		return
+	case err != nil && ctx.Err() != nil:
+		// The caller left; nobody reads this answer.
+		writeError(w, http.StatusServiceUnavailable, errors.New("the read was cancelled"))
+		return
+	case err != nil:
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

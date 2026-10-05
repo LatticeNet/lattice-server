@@ -1,6 +1,8 @@
 package tracestore
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -226,7 +228,7 @@ func TestRollupsAreAscendingAndClamped(t *testing.T) {
 
 func mustRollupSeries(t *testing.T, s *Store, f RollupSeriesFilter) ([]RollupPoint, time.Time, bool) {
 	t.Helper()
-	points, retainedFrom, truncated, err := s.RollupSeries(f)
+	points, retainedFrom, truncated, err := s.RollupSeries(context.Background(), f)
 	if err != nil {
 		t.Fatalf("RollupSeries: %v", err)
 	}
@@ -322,7 +324,7 @@ func TestRollupSeriesTruncatesSinceToTheStep(t *testing.T) {
 		{Since: t0, Until: t0.Add(time.Hour), Step: time.Hour, GroupBy: "dst"},
 		{Since: t0, Until: t0, Step: time.Hour, GroupBy: RollupGroupNode},
 	} {
-		if _, _, _, err := s.RollupSeries(bad); err == nil {
+		if _, _, _, err := s.RollupSeries(context.Background(), bad); err == nil {
 			t.Errorf("RollupSeries(%+v) accepted a bad request", bad)
 		}
 	}
@@ -531,5 +533,43 @@ func TestParseFlatCountsFallsBackOnAnythingUnexpected(t *testing.T) {
 		if err := addReasonCounts(map[string]int64{}, []byte(bad), func(b []byte) string { return string(b) }); err == nil {
 			t.Errorf("%q was accepted", bad)
 		}
+	}
+}
+
+// TestRollupSeriesStopsWhenTheCallerLeaves: a read whose caller has gone
+// returns the context's error rather than finishing the scan.
+func TestRollupSeriesStopsWhenTheCallerLeaves(t *testing.T) {
+	s := newStore(t, Options{})
+	mustAppend(t, s, rec("n1", 1, t0), rec("n2", 2, t0.Add(time.Minute)))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, f := range []RollupSeriesFilter{
+		{Since: t0, Until: t0.Add(time.Hour), Step: time.Hour, GroupBy: RollupGroupNode},
+		{Since: t0, Until: t0.Add(time.Hour), Step: time.Hour, GroupBy: RollupGroupNode, NodeIDs: []string{"n1"}},
+	} {
+		if _, _, _, err := s.RollupSeries(ctx, f); !errors.Is(err, context.Canceled) {
+			t.Errorf("RollupSeries with a cancelled context = %v, want context.Canceled", err)
+		}
+	}
+}
+
+// TestRollupSeriesRefusesTooManyPoints: a read that would hold more points
+// than its ceiling fails with ErrRollupTooManyPoints instead of growing.
+func TestRollupSeriesRefusesTooManyPoints(t *testing.T) {
+	s := newStore(t, Options{})
+	batch := []model.ConnRecord{}
+	for i := range 12 {
+		r := rec("n1", uint32(i+1), t0.Add(time.Duration(i)*5*time.Minute))
+		r.UserID = []string{"u1", "u2", "u3"}[i%3]
+		batch = append(batch, r)
+	}
+	mustAppend(t, s, batch...)
+	f := RollupSeriesFilter{Since: t0, Until: t0.Add(time.Hour), Step: RollupBucket, GroupBy: RollupGroupUser, MaxCells: 11}
+	if _, _, _, err := s.RollupSeries(context.Background(), f); !errors.Is(err, ErrRollupTooManyPoints) {
+		t.Fatalf("12 points under a ceiling of 11 = %v, want ErrRollupTooManyPoints", err)
+	}
+	f.MaxCells = 12
+	if points, _, _, err := s.RollupSeries(context.Background(), f); err != nil || len(points) != 12 {
+		t.Fatalf("12 points under a ceiling of 12 = %d points, %v", len(points), err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 // an upgrade changes nothing.
 
 type evidenceHarness struct {
+	srv     *Server
 	handler http.Handler
 	st      *store.Store
 	trace   *tracestore.Store
@@ -50,7 +52,7 @@ func newEvidenceServer(t *testing.T, st *store.Store, logCap int64) evidenceHarn
 	if err != nil {
 		t.Fatal(err)
 	}
-	return evidenceHarness{handler: srv.Handler(), st: st, trace: ts, logs: ls}
+	return evidenceHarness{srv: srv, handler: srv.Handler(), st: st, trace: ts, logs: ls}
 }
 
 func newEvidenceHarness(t *testing.T, logCap int64) evidenceHarness {
@@ -133,11 +135,15 @@ func TestEvidenceSettingsNeedAFullAdministrator(t *testing.T) {
 	restricted := createPAT(t, h.handler, cookies, csrf, []string{"log:admin", "log:read"}, []string{"node-a"})
 	readOnly := createPAT(t, h.handler, cookies, csrf, []string{"log:read"}, nil)
 
-	// Reading needs only log:read.
-	res := doBearerJSON(t, h.handler, http.MethodGet, "/api/evidence/settings", "", readOnly)
-	res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("a log:read token reading the settings: %d", res.StatusCode)
+	// Reading needs only log:read, node restriction or not: the budgets are
+	// server configuration and name no node.
+	for name, token := range map[string]string{"node-restricted log:admin": restricted, "log:read": readOnly} {
+		res := doBearerJSON(t, h.handler, http.MethodGet, "/api/evidence/settings", "", token)
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK || !strings.Contains(string(body), `"trace_db_max_bytes"`) {
+			t.Fatalf("a %s token reading the settings: %d %s", name, res.StatusCode, body)
+		}
 	}
 
 	body := string(mustJSON(t, validEvidenceSettings(0)))
@@ -175,6 +181,10 @@ func TestEvidenceSettingsRejectOutOfBounds(t *testing.T) {
 		"a field left out":          func(m map[string]any) { delete(m, "line_ttl_seconds") },
 		"an unknown field":          func(m map[string]any) { m["raw_pool_max_bytes"] = int64(1 << 30) },
 		"a duration as nanoseconds": func(m map[string]any) { m["record_ttl_seconds"] = int64(7 * 86400 * time.Second) },
+		"rollups shorter than records": func(m map[string]any) {
+			m["record_ttl_seconds"] = int64(14 * 86400)
+			m["rollup_5m_ttl_seconds"] = int64(7 * 86400)
+		},
 	}
 	for name, mutate := range cases {
 		body := validEvidenceSettings(0)
@@ -400,5 +410,127 @@ func TestEvidenceSettingsConcurrentSavesEndOnTheStoredValues(t *testing.T) {
 	}
 	if got := h.logs.SourceBytesCap(); int64(got) != stored.RawSourceMaxBytes {
 		t.Fatalf("logs.db runs on %d, stored is %d", got, stored.RawSourceMaxBytes)
+	}
+}
+
+// TestEvidenceSecondsFitGuardsTheDurationConversion: a TTL that would wrap
+// time.Duration is refused whatever the bounds allow.
+func TestEvidenceSecondsFitGuardsTheDurationConversion(t *testing.T) {
+	limit := int64(math.MaxInt64 / int64(time.Second))
+	for v, want := range map[int64]bool{0: true, 86400: true, limit: true, limit + 1: false, -1: false, math.MaxInt64: false} {
+		if got := evidenceSecondsFit(v); got != want {
+			t.Errorf("evidenceSecondsFit(%d) = %v, want %v", v, got, want)
+		}
+	}
+	cfg := model.EvidenceSettings{TraceDBMaxBytes: 1 << 30, RecordTTLSeconds: limit + 1, LineTTLSeconds: 3600, Rollup5mTTLSeconds: limit + 1, RawSourceMaxBytes: 1 << 20}
+	if err := validateEvidenceSettings(cfg); err == nil || !strings.Contains(err.Error(), "does not fit a duration") {
+		t.Fatalf("validate an overflowing TTL = %v", err)
+	}
+}
+
+// TestInvalidStoredEvidenceSettingsAreNotAppliedAtBoot: settings no save
+// could have stored (a hand-edited state file) are refused at boot. The
+// stores keep their own limits, nothing is deleted, and GET says why.
+func TestInvalidStoredEvidenceSettingsAreNotAppliedAtBoot(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetEvidenceSettings(model.EvidenceSettings{
+		TraceDBMaxBytes: 1, RecordTTLSeconds: 1, LineTTLSeconds: 1, Rollup5mTTLSeconds: 1, RawSourceMaxBytes: 1,
+	}, 0, "hand-edit", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	h := newEvidenceServer(t, st, 0)
+	at := time.Now().Add(-time.Hour)
+	if _, err := h.trace.AppendRecords([]model.ConnRecord{
+		{NodeID: "node-a", CoreGeneration: 1, LogID: 1, StartedAt: at, EndedAt: at.Add(time.Second), CloseReason: model.CloseEOF},
+		{NodeID: "node-a", CoreGeneration: 1, LogID: 2, StartedAt: at, EndedAt: at.Add(time.Second), CloseReason: model.CloseEOF},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.trace.Limits(); got.RecordTTL != tracestore.DefaultRecordTTL || got.MaxBytes != tracestore.DefaultMaxBytes {
+		t.Fatalf("trace.db limits after booting on invalid settings = %+v, want its defaults", got)
+	}
+	if got := h.logs.SourceBytesCap(); got != logstore.DefaultMaxSourceBytes {
+		t.Fatalf("logs.db cap = %d, want its default", got)
+	}
+	if _, err := h.trace.Retain(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if stats, err := h.trace.Stats(); err != nil || stats.Records != 2 {
+		t.Fatalf("records after a retention pass = %d (%v), want both kept", stats.Records, err)
+	}
+
+	cookies, csrf := loginSession(t, h.handler)
+	view := decodeEvidenceView(t, doTrace(t, h.handler, http.MethodGet, "/api/evidence/settings", cookies, csrf, nil))
+	if !view.Stored || !view.InvalidStored || view.Settings.Version != 1 || view.Settings.RecordTTLSeconds != 14*86400 {
+		t.Fatalf("GET = %+v stored=%v invalid=%v, want the defaults in force under stored version 1", view.Settings, view.Stored, view.InvalidStored)
+	}
+	// A save from that version replaces them.
+	if view := decodeEvidenceView(t, doTrace(t, h.handler, http.MethodPost, "/api/evidence/settings", cookies, csrf, validEvidenceSettings(1))); view.InvalidStored || view.Settings.Version != 2 {
+		t.Fatalf("after a save: %+v invalid=%v", view.Settings, view.InvalidStored)
+	}
+}
+
+// TestEvidenceSettingsLoweredRawCapShrinksIdleSources: Append evicts only
+// the source it writes to, so a lowered cap is enforced by one pass over
+// every source on save rather than left until each next appends.
+func TestEvidenceSettingsLoweredRawCapShrinksIdleSources(t *testing.T) {
+	h := newEvidenceHarness(t, 0)
+	cookies, csrf := loginSession(t, h.handler)
+	line := strings.Repeat("x", 64<<10)
+	base := time.Now().Add(-time.Hour)
+	for _, source := range []string{"idle-a", "idle-b"} {
+		for i := range 40 {
+			if _, err := h.logs.Append(source, []model.LogLine{{At: base.Add(time.Duration(i) * time.Second), Line: line}}, "r", uint64(i+1), base); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if meta, _, _, _ := h.logs.Stats(source); meta.Bytes <= 1<<20 {
+			t.Fatalf("%s holds %d bytes; the test needs more than the new cap", source, meta.Bytes)
+		}
+	}
+	settings := validEvidenceSettings(0)
+	settings["raw_source_max_bytes"] = int64(1 << 20)
+	decodeEvidenceView(t, doTrace(t, h.handler, http.MethodPost, "/api/evidence/settings", cookies, csrf, settings))
+	deadline := time.Now().Add(10 * time.Second)
+	for _, source := range []string{"idle-a", "idle-b"} {
+		for {
+			meta, _, _, _ := h.logs.Stats(source)
+			if meta.Bytes <= 1<<20 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%s still holds %d bytes over the lowered cap with no append", source, meta.Bytes)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+// TestRetentionWaitEndsOnAKick: every wait in the retention loop, the hour
+// and the retry delay after a truncated pass alike, goes through
+// waitTraceRetention, which a settings save cuts short.
+func TestRetentionWaitEndsOnAKick(t *testing.T) {
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No background loops, so nothing else takes the kick.
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		srv.waitTraceRetention(time.Hour)
+		close(done)
+	}()
+	srv.kickTraceRetention()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a kick did not end an hour's wait")
 	}
 }

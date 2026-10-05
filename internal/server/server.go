@@ -419,6 +419,11 @@ type Server struct {
 	// evidenceSettingsMu runs one evidence settings save at a time, so the
 	// stores end on the settings stored last (evidence_settings.go).
 	evidenceSettingsMu sync.Mutex
+	// traceRollupReads lets one /api/trace/rollups read run at a time, and
+	// traceRollupBusyWait is how long another waits for it
+	// (server_trace_rollups.go).
+	traceRollupReads    chan struct{}
+	traceRollupBusyWait time.Duration
 	// cutoverMu runs one credential cutover rotate at a time
 	// (vpn_cutover.go), so a repeated POST sees the plan the first left.
 	cutoverMu sync.Mutex
@@ -820,6 +825,7 @@ func New(opts Options) (*Server, error) {
 	}
 	s.loadPlugins(opts.PluginDir, opts.PluginBundleCacheDir, opts.PluginTrust)
 	s.initEvidenceSettings()
+	s.initTraceRollups()
 	s.selfmonUnavailable = opts.SelfMonitor.Unavailable
 	s.selfmon = newSelfMonitor(opts.SelfMonitor, s.logger, s.now,
 		func(id string) bool { _, ok := s.store.Node(id); return ok },

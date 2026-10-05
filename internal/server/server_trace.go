@@ -983,23 +983,30 @@ func (s *Server) startTraceRetention() {
 	}
 	go func() {
 		for {
+			wait := traceRetentionInterval
 			res, err := s.traceStore.Retain(s.now())
 			if err != nil {
 				s.logger.Printf("trace retention: %v", err)
 			} else if res.Truncated {
 				// Still above the cap after a bounded pass. Come back sooner.
 				s.logger.Printf("trace retention: still above the size cap after a pass; sweeping again shortly")
-				time.Sleep(traceRetentionRetryDelay)
-				continue
+				wait = traceRetentionRetryDelay
 			}
-			// An evidence settings save that lowered a cap or a TTL kicks
-			// the loop, so the new limit is enforced now, not within the hour.
-			select {
-			case <-time.After(traceRetentionInterval):
-			case <-s.traceRetentionKick:
-			}
+			s.waitTraceRetention(wait)
 		}
 	}()
+}
+
+// waitTraceRetention sleeps until the next retention pass is due, or until an
+// evidence settings save that lowered a cap or a TTL kicks the loop, so the
+// new limit is enforced now rather than within the hour or the retry delay.
+func (s *Server) waitTraceRetention(d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-s.traceRetentionKick:
+	}
 }
 
 const traceRetentionRetryDelay = time.Minute

@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -59,8 +60,13 @@ var evidenceBounds = evidenceSettingsBounds{
 // evidenceSettingsView is the GET and POST answer.
 type evidenceSettingsView struct {
 	Settings model.EvidenceSettings `json:"settings"`
-	// Stored is false while the values are the boot defaults.
+	// Stored is false while no administrator has saved.
 	Stored bool `json:"stored"`
+	// InvalidStored reports stored settings that fail validation (a
+	// hand-edited state file, or bounds an upgrade tightened). They are not
+	// applied: Settings shows the stores' own values under the stored
+	// version, so the next save names that version and replaces them.
+	InvalidStored bool `json:"invalid_stored,omitempty"`
 	// EnvIgnored names environment variables that are set but overridden by
 	// the stored settings.
 	EnvIgnored []string               `json:"env_ignored,omitempty"`
@@ -72,9 +78,19 @@ type evidenceSettingsView struct {
 // the stores, so boot and an edit take the same path.
 func (s *Server) initEvidenceSettings() {
 	s.traceRetentionKick = make(chan struct{}, 1)
-	if cfg, ok := s.store.EvidenceSettings(); ok {
-		s.applyEvidenceSettings(cfg)
+	cfg, ok := s.store.EvidenceSettings()
+	if !ok {
+		return
 	}
+	if err := validateEvidenceSettings(cfg); err != nil {
+		// A value no save could have stored might empty trace.db on the
+		// first retention pass. Keep the stores on their own limits, delete
+		// nothing, and say why; GET reports invalid_stored until a save
+		// replaces the stored settings.
+		s.logger.Printf("evidence settings: stored version %d is invalid and was not applied; trace.db and logs.db keep their own limits: %v", cfg.Version, err)
+		return
+	}
+	s.applyEvidenceSettings(cfg)
 }
 
 // applyEvidenceSettings hands the budgets to the running stores. Neither
@@ -94,11 +110,15 @@ func (s *Server) applyEvidenceSettings(cfg model.EvidenceSettings) {
 	}
 }
 
-// effectiveEvidenceSettings is what is in force: the stored settings, or the
-// values the stores were opened with.
-func (s *Server) effectiveEvidenceSettings() (model.EvidenceSettings, bool) {
-	if cfg, ok := s.store.EvidenceSettings(); ok {
-		return cfg, true
+// effectiveEvidenceSettings is what is in force: valid stored settings, or
+// the values the stores were opened with. stored reports settings in the
+// state file; invalid reports stored settings that fail validation and so
+// were never applied, in which case the values are the stores' own under the
+// stored version, author and time.
+func (s *Server) effectiveEvidenceSettings() (cfg model.EvidenceSettings, stored, invalid bool) {
+	saved, ok := s.store.EvidenceSettings()
+	if ok && validateEvidenceSettings(saved) == nil {
+		return saved, true, false
 	}
 	limits := tracestore.Options{
 		RecordTTL: tracestore.DefaultRecordTTL,
@@ -115,19 +135,23 @@ func (s *Server) effectiveEvidenceSettings() (model.EvidenceSettings, bool) {
 	} else if env := logstore.EnvMaxSourceBytes(os.Getenv(envLogMaxSourceBytes)); env > 0 {
 		rawCap = env
 	}
-	return model.EvidenceSettings{
+	cfg = model.EvidenceSettings{
 		TraceDBMaxBytes:    limits.MaxBytes,
 		RecordTTLSeconds:   int64(limits.RecordTTL / time.Second),
 		LineTTLSeconds:     int64(limits.LineTTL / time.Second),
 		Rollup5mTTLSeconds: int64(limits.RollupTTL / time.Second),
 		RawSourceMaxBytes:  rawCap,
-	}, false
+	}
+	if ok {
+		cfg.Version, cfg.UpdatedAt, cfg.UpdatedBy = saved.Version, saved.UpdatedAt, saved.UpdatedBy
+	}
+	return cfg, ok, ok
 }
 
 func (s *Server) evidenceSettingsView() evidenceSettingsView {
-	cfg, stored := s.effectiveEvidenceSettings()
-	view := evidenceSettingsView{Settings: cfg, Stored: stored, Bounds: evidenceBounds}
-	if stored && logstore.EnvMaxSourceBytes(os.Getenv(envLogMaxSourceBytes)) > 0 {
+	cfg, stored, invalid := s.effectiveEvidenceSettings()
+	view := evidenceSettingsView{Settings: cfg, Stored: stored, InvalidStored: invalid, Bounds: evidenceBounds}
+	if stored && !invalid && logstore.EnvMaxSourceBytes(os.Getenv(envLogMaxSourceBytes)) > 0 {
 		view.EnvIgnored = []string{envLogMaxSourceBytes}
 	}
 	return view
@@ -135,7 +159,7 @@ func (s *Server) evidenceSettingsView() evidenceSettingsView {
 
 // validateEvidenceSettings refuses any value outside its bounds. Every field
 // is required: a zero is out of bounds, so a client cannot store a partial
-// set by omission.
+// set by omission. It runs on every save and on the stored settings at boot.
 func validateEvidenceSettings(cfg model.EvidenceSettings) error {
 	check := func(name string, v int64, b [2]int64) error {
 		if v < b[0] || v > b[1] {
@@ -143,13 +167,48 @@ func validateEvidenceSettings(cfg model.EvidenceSettings) error {
 		}
 		return nil
 	}
+	ttl := func(name string, v int64, b [2]int64) error {
+		// Checked apart from the bounds, so a later bound can never let a
+		// TTL wrap time.Duration into a negative that deletes everything.
+		if !evidenceSecondsFit(v) {
+			return fmt.Errorf("%s does not fit a duration", name)
+		}
+		return check(name, v, b)
+	}
+	var order error
+	if cfg.Rollup5mTTLSeconds < cfg.RecordTTLSeconds {
+		order = errors.New("rollup_5m_ttl_seconds must be at least record_ttl_seconds: the trends would end before the records they sum")
+	}
 	return errors.Join(
 		check("trace_db_max_bytes", cfg.TraceDBMaxBytes, evidenceBounds.TraceDBMaxBytes),
-		check("record_ttl_seconds", cfg.RecordTTLSeconds, evidenceBounds.RecordTTLSeconds),
-		check("line_ttl_seconds", cfg.LineTTLSeconds, evidenceBounds.LineTTLSeconds),
-		check("rollup_5m_ttl_seconds", cfg.Rollup5mTTLSeconds, evidenceBounds.Rollup5mTTLSeconds),
+		ttl("record_ttl_seconds", cfg.RecordTTLSeconds, evidenceBounds.RecordTTLSeconds),
+		ttl("line_ttl_seconds", cfg.LineTTLSeconds, evidenceBounds.LineTTLSeconds),
+		ttl("rollup_5m_ttl_seconds", cfg.Rollup5mTTLSeconds, evidenceBounds.Rollup5mTTLSeconds),
 		check("raw_source_max_bytes", cfg.RawSourceMaxBytes, evidenceBounds.RawSourceMaxBytes),
+		order,
 	)
+}
+
+// evidenceSecondsFit reports whether whole seconds convert to a
+// time.Duration without overflow (about 292 years).
+func evidenceSecondsFit(seconds int64) bool {
+	return seconds >= 0 && seconds <= math.MaxInt64/int64(time.Second)
+}
+
+// enforceRawSourceCap brings every logs.db source under a lowered cap. Only
+// an append evicts, so without this pass an idle source would keep its bytes
+// above the new cap until it next receives a line. The evicted chunks free
+// pages inside logs.db for its own reuse; bbolt never returns them to the
+// filesystem, so the file keeps its size.
+func (s *Server) enforceRawSourceCap() {
+	n, err := s.logStore.EnforceSourceBytesCap()
+	if err != nil {
+		s.logger.Printf("evidence settings: bring raw log sources under the lowered cap: %v", err)
+		return
+	}
+	if n > 0 {
+		s.logger.Printf("evidence settings: brought %d raw log sources under the lowered cap", n)
+	}
 }
 
 // kickTraceRetention asks the retention loop for a pass now. It never blocks:
@@ -169,7 +228,7 @@ func (s *Server) kickTraceRetention() {
 func (s *Server) saveEvidenceSettings(req model.EvidenceSettings, actor string, now time.Time) (old, stored model.EvidenceSettings, err error) {
 	s.evidenceSettingsMu.Lock()
 	defer s.evidenceSettingsMu.Unlock()
-	old, _ = s.effectiveEvidenceSettings()
+	old, _, _ = s.effectiveEvidenceSettings()
 	stored, err = s.store.SetEvidenceSettings(model.EvidenceSettings{
 		TraceDBMaxBytes:    req.TraceDBMaxBytes,
 		RecordTTLSeconds:   req.RecordTTLSeconds,
@@ -241,11 +300,14 @@ func (s *Server) handleEvidenceSettings(w http.ResponseWriter, r *http.Request, 
 			Metadata: meta,
 		})
 		// A lower trace.db cap or TTL is enforced now rather than within the
-		// hour. The per-source raw cap needs no pass: logs.db applies it on
-		// each source's next append.
+		// hour, and a lower raw cap now rather than on each source's next
+		// append (enforceRawSourceCap).
 		if stored.TraceDBMaxBytes < old.TraceDBMaxBytes || stored.RecordTTLSeconds < old.RecordTTLSeconds ||
 			stored.LineTTLSeconds < old.LineTTLSeconds || stored.Rollup5mTTLSeconds < old.Rollup5mTTLSeconds {
 			s.kickTraceRetention()
+		}
+		if stored.RawSourceMaxBytes < old.RawSourceMaxBytes && s.logStore != nil {
+			go s.enforceRawSourceCap()
 		}
 		writeJSON(w, http.StatusOK, s.evidenceSettingsView())
 	default:

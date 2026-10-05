@@ -1,6 +1,7 @@
 package tracestore
 
 import (
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -394,6 +396,20 @@ const (
 // series per user.
 const DefaultRollupMaxSeries = 200
 
+// DefaultRollupMaxCells bounds the memory one RollupSeries call may hold:
+// every (key, step) point it sums into, counted across the concurrent scans,
+// each of which can hold every key. A point with its close reasons costs a
+// few hundred bytes, so the default keeps one read under about 100 MiB. A
+// fleet-wide 90-day read of 34 nodes at hourly steps holds about 100,000.
+const DefaultRollupMaxCells = 262144
+
+// ErrRollupTooManyPoints is returned when a read would hold more points than
+// its cell ceiling: the window is too long for the number of keys it matches.
+var ErrRollupTooManyPoints = errors.New("tracestore: the rollup read matches too many points; narrow the window or filter by node, line or user")
+
+// rollupCtxCheckRows is how often a scan checks whether its caller has gone.
+const rollupCtxCheckRows = 4096
+
 // RollupSeriesFilter is one trend read: a window, a step to coarsen the
 // five-minute buckets to, and the dimension each series is keyed by.
 type RollupSeriesFilter struct {
@@ -406,6 +422,7 @@ type RollupSeriesFilter struct {
 	LineUUIDs []string
 	UserIDs   []string
 	MaxSeries int // 0 means DefaultRollupMaxSeries
+	MaxCells  int // 0 means DefaultRollupMaxCells
 }
 
 // RollupPoint is one step of one series. CloseReasons is empty when the
@@ -461,6 +478,18 @@ type rollupScanRange struct {
 // unix nanoseconds.
 type rollupSeriesPoints map[string]map[int64]*RollupPoint
 
+// cell returns the point for key at bucket, creating it when new and charging
+// the creation to cells. It fails once cells passes limit.
+func (m rollupSeriesPoints) cell(key string, bucket int64, cells *atomic.Int64, limit int64) (*RollupPoint, error) {
+	if p := m[key][bucket]; p != nil {
+		return p, nil
+	}
+	if cells.Add(1) > limit {
+		return nil, ErrRollupTooManyPoints
+	}
+	return m.point(key, bucket), nil
+}
+
 func (m rollupSeriesPoints) point(key string, bucket int64) *RollupPoint {
 	byBucket := m[key]
 	if byBucket == nil {
@@ -500,10 +529,14 @@ func (m rollupSeriesPoints) point(key string, bucket int64) *RollupPoint {
 // one, or one filtered to a few nodes, users or lines, is read through an
 // index (see rollupTableScanDivisor).
 //
+// The read is bounded: it stops when ctx is done, checked by SQLite and every
+// few thousand rows here, and fails with ErrRollupTooManyPoints once it
+// would hold more than MaxCells points.
+//
 // retainedFrom is the oldest bucket the table holds for the requested nodes
 // (for the whole table when NodeIDs is empty), whatever the window: it is the
 // horizon a chart can reach back to, not the start of this answer.
-func (s *Store) RollupSeries(f RollupSeriesFilter) ([]RollupPoint, time.Time, bool, error) {
+func (s *Store) RollupSeries(ctx context.Context, f RollupSeriesFilter) ([]RollupPoint, time.Time, bool, error) {
 	step := int64(f.Step)
 	if f.Step <= 0 || f.Step%RollupBucket != 0 {
 		return nil, time.Time{}, false, fmt.Errorf("tracestore: rollup step %s is not a positive multiple of %s", f.Step, RollupBucket)
@@ -521,13 +554,17 @@ func (s *Store) RollupSeries(f RollupSeriesFilter) ([]RollupPoint, time.Time, bo
 	if maxSeries <= 0 {
 		maxSeries = DefaultRollupMaxSeries
 	}
+	maxCells := int64(f.MaxCells)
+	if maxCells <= 0 {
+		maxCells = DefaultRollupMaxCells
+	}
 
 	// Clamp the window to the buckets the table holds, so the split below
 	// divides real rows: a 90-day window over 30 days of data would otherwise
 	// hand two of three scans nothing to do. Each bound is its own subquery so
 	// SQLite answers it from one end of a b-tree.
 	var oldest, newest, firstRow, lastRow sql.NullInt64
-	if err := s.db.QueryRow(`SELECT
+	if err := s.db.QueryRowContext(ctx, `SELECT
 		(SELECT MIN(bucket_start) FROM rollups_5m), (SELECT MAX(bucket_start) FROM rollups_5m),
 		(SELECT MIN(rowid) FROM rollups_5m), (SELECT MAX(rowid) FROM rollups_5m)`).Scan(&oldest, &newest, &firstRow, &lastRow); err != nil {
 		return nil, time.Time{}, false, fmt.Errorf("tracestore: rollup series: %w", err)
@@ -553,20 +590,28 @@ func (s *Store) RollupSeries(f RollupSeriesFilter) ([]RollupPoint, time.Time, bo
 			width := (to - from + parts - 1) / parts
 			results := make([]rollupSeriesPoints, parts)
 			errs := make([]error, parts)
+			var cells atomic.Int64
+			// The first scan to fail stops the others.
+			scanCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
 			var wg sync.WaitGroup
 			for i := range parts {
 				r := rollupScanRange{byRowid: byRowid, from: from + i*width, to: min(from+(i+1)*width, to)}
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					results[i], errs[i] = s.scanRollupSeries(f, keyColumn, step, since, until, r)
+					results[i], errs[i] = s.scanRollupSeries(scanCtx, f, keyColumn, step, since, until, r, &cells, maxCells)
+					if errs[i] != nil {
+						cancel()
+					}
 				}()
 			}
 			wg.Wait()
 			if err := errors.Join(errs...); err != nil {
 				return nil, time.Time{}, false, err
 			}
-			for _, part := range results {
+			for i, part := range results {
+				results[i] = nil
 				for key, byBucket := range part {
 					for bucket, p := range byBucket {
 						m := merged.point(key, bucket)
@@ -634,7 +679,7 @@ func (s *Store) RollupSeries(f RollupSeriesFilter) ([]RollupPoint, time.Time, bo
 		}
 	}
 
-	retainedFrom, err := s.rollupsRetainedFrom(f.NodeIDs)
+	retainedFrom, err := s.rollupsRetainedFrom(ctx, f.NodeIDs)
 	if err != nil {
 		return nil, time.Time{}, false, err
 	}
@@ -643,8 +688,10 @@ func (s *Store) RollupSeries(f RollupSeriesFilter) ([]RollupPoint, time.Time, bo
 
 // scanRollupSeries reads the rollups_5m rows in r with bucket_start in
 // [since, until) that match f, and sums them into steps. keyColumn is empty
-// for a reason series, whose keys come out of each row's close_reasons.
-func (s *Store) scanRollupSeries(f RollupSeriesFilter, keyColumn string, step, since, until int64, r rollupScanRange) (rollupSeriesPoints, error) {
+// for a reason series, whose keys come out of each row's close_reasons. Each
+// point it creates is charged to cells, shared with the other scans of the
+// same read.
+func (s *Store) scanRollupSeries(ctx context.Context, f RollupSeriesFilter, keyColumn string, step, since, until int64, r rollupScanRange, cells *atomic.Int64, maxCells int64) (rollupSeriesPoints, error) {
 	where := []string{"bucket_start >= ?", "bucket_start < ?"}
 	args := []any{r.from, r.to}
 	if r.byRowid {
@@ -675,7 +722,7 @@ func (s *Store) scanRollupSeries(f RollupSeriesFilter, keyColumn string, step, s
 	if keyColumn != "" {
 		columns = "bucket_start, close_reasons, " + keyColumn + ", connections, bytes_known_count, upload, download"
 	}
-	rows, err := s.db.Query(`SELECT `+columns+` FROM rollups_5m WHERE `+strings.Join(where, " AND "), args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+columns+` FROM rollups_5m WHERE `+strings.Join(where, " AND "), args...)
 	if err != nil {
 		return nil, fmt.Errorf("tracestore: rollup series: %w", err)
 	}
@@ -699,7 +746,14 @@ func (s *Store) scanRollupSeries(f RollupSeriesFilter, keyColumn string, step, s
 		rawReasons, rawKey           sql.RawBytes
 		conns, known, upload, downld int64
 	)
-	for rows.Next() {
+	for n := 0; rows.Next(); n++ {
+		// SQLite interrupts its own step when ctx is done; this catches a
+		// caller that left while rows were being summed here.
+		if n%rollupCtxCheckRows == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
 		if keyColumn != "" {
 			err = rows.Scan(&bucket, &rawReasons, &rawKey, &conns, &known, &upload, &downld)
 		} else {
@@ -714,12 +768,19 @@ func (s *Store) scanRollupSeries(f RollupSeriesFilter, keyColumn string, step, s
 		}
 		stepStart := bucket / step * step
 		if keyColumn == "" {
-			for reason, n := range reasons {
-				out.point(reason, stepStart).Connections += n
+			for reason, count := range reasons {
+				p, err := out.cell(reason, stepStart, cells, maxCells)
+				if err != nil {
+					return nil, err
+				}
+				p.Connections += count
 			}
 			continue
 		}
-		p := out.point(canonical(rawKey), stepStart)
+		p, err := out.cell(canonical(rawKey), stepStart, cells, maxCells)
+		if err != nil {
+			return nil, err
+		}
 		p.Connections += conns
 		p.BytesKnownCount += known
 		p.Upload += upload
@@ -831,18 +892,18 @@ func parseFlatCounts(raw []byte) ([]flatCount, bool) {
 // the whole table when none is given. One indexed MIN per node rather than a
 // single MIN over an IN list: SQLite answers the per-node form from the front
 // of idx_rollups_5m_node, while the IN form walks every matching index entry.
-func (s *Store) rollupsRetainedFrom(nodeIDs []string) (time.Time, error) {
+func (s *Store) rollupsRetainedFrom(ctx context.Context, nodeIDs []string) (time.Time, error) {
 	var oldest sql.NullInt64
 	_, in := inClause("node_id", nodeIDs)
 	if len(in) == 0 {
-		if err := s.db.QueryRow(`SELECT MIN(bucket_start) FROM rollups_5m`).Scan(&oldest); err != nil {
+		if err := s.db.QueryRowContext(ctx, `SELECT MIN(bucket_start) FROM rollups_5m`).Scan(&oldest); err != nil {
 			return time.Time{}, fmt.Errorf("tracestore: rollups retained from: %w", err)
 		}
 		return timeFromNanos(oldest), nil
 	}
 	for _, nodeID := range in {
 		var v sql.NullInt64
-		if err := s.db.QueryRow(`SELECT MIN(bucket_start) FROM rollups_5m WHERE node_id = ?`, nodeID).Scan(&v); err != nil {
+		if err := s.db.QueryRowContext(ctx, `SELECT MIN(bucket_start) FROM rollups_5m WHERE node_id = ?`, nodeID).Scan(&v); err != nil {
 			return time.Time{}, fmt.Errorf("tracestore: rollups retained from: %w", err)
 		}
 		if v.Valid && (!oldest.Valid || v.Int64 < oldest.Int64) {

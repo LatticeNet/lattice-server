@@ -299,3 +299,38 @@ func TestRetainReportsTruncationInsteadOfRunningForever(t *testing.T) {
 		t.Errorf("records = %d, want 0: an unreachable cap still evicts everything it can", st.Records)
 	}
 }
+
+// TestSetLimitsTakesEffectOnTheNextRetain changes the TTLs and the ceiling on
+// an open store, the way an operator's settings edit does, and expects the
+// next pass to enforce them and Stats to report the new ceiling at once.
+func TestSetLimitsTakesEffectOnTheNextRetain(t *testing.T) {
+	s := newStore(t, Options{})
+	mustAppend(t, s,
+		rec("n1", 1, t0.Add(-3*time.Hour)),
+		rec("n1", 2, t0.Add(-10*time.Minute)),
+	)
+	if res := mustRetain(t, s, t0); res.RecordsExpired != 0 {
+		t.Fatalf("default TTLs expired %d records, want 0", res.RecordsExpired)
+	}
+
+	s.SetLimits(Options{RecordTTL: time.Hour, MaxBytes: 512 << 20})
+	if got := s.Limits(); got.RecordTTL != time.Hour || got.MaxBytes != 512<<20 || got.LineTTL != DefaultLineTTL || got.RollupTTL != DefaultRollupTTL {
+		t.Fatalf("Limits() = %+v, want the new record TTL and ceiling with the other defaults kept", got)
+	}
+	st, err := s.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if st.MaxBytes != 512<<20 {
+		t.Errorf("Stats().MaxBytes = %d, want %d without a restart", st.MaxBytes, 512<<20)
+	}
+	if res := mustRetain(t, s, t0); res.RecordsExpired != 1 {
+		t.Errorf("after SetLimits, retain expired %d records, want 1", res.RecordsExpired)
+	}
+
+	// Zero restores the default, as at Open.
+	s.SetLimits(Options{})
+	if got := s.Limits(); got != (Options{}).withDefaults() {
+		t.Errorf("Limits() after a zero SetLimits = %+v, want the defaults", got)
+	}
+}

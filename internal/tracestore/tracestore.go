@@ -27,6 +27,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -94,12 +95,30 @@ func (o Options) withDefaults() Options {
 	return o
 }
 
+// Limits returns the retention limits in force, defaults filled.
+func (s *Store) Limits() Options {
+	return *s.opts.Load()
+}
+
+// SetLimits replaces the retention limits. A zero field takes its default,
+// exactly as at Open. The next Retain enforces the new limits and Stats
+// reports the new ceiling at once; nothing is deleted by the call itself.
+func (s *Store) SetLimits(o Options) {
+	o = o.withDefaults()
+	s.opts.Store(&o)
+}
+
 // Store is the SQLite-backed trace store.
 type Store struct {
 	db     *sql.DB
 	cipher secret.Cipher
-	opts   Options
 	path   string
+
+	// opts holds the retention limits, always with defaults filled. It is a
+	// pointer swapped whole so an operator's edit (SetLimits) takes effect on
+	// the next Retain without a restart, and a reader never sees half of an
+	// old set and half of a new one.
+	opts atomic.Pointer[Options]
 
 	// autoVacuum reports whether the database was created with incremental
 	// auto-vacuum. Without it, deleting rows frees pages inside the file but
@@ -166,7 +185,8 @@ func Open(path string, cipher secret.Cipher, opts Options) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("tracestore: open %s: %w", path, err)
 	}
-	s := &Store{db: db, cipher: cipher, opts: opts.withDefaults(), path: path}
+	s := &Store{db: db, cipher: cipher, path: path}
+	s.SetLimits(opts)
 	if err := migrate(db); err != nil {
 		db.Close()
 		return nil, err
@@ -241,7 +261,7 @@ func (s *Store) Path() string {
 
 // Stats returns the diagnostic projection of the store.
 func (s *Store) Stats() (Stats, error) {
-	st := Stats{Path: s.path, MaxBytes: s.opts.MaxBytes, CipherEnabled: s.cipher != nil && s.cipher.Enabled()}
+	st := Stats{Path: s.path, MaxBytes: s.Limits().MaxBytes, CipherEnabled: s.cipher != nil && s.cipher.Enabled()}
 	row := s.db.QueryRow(`SELECT
 		(SELECT COUNT(*) FROM conn_records),
 		(SELECT COUNT(*) FROM conn_records WHERE open = 1),

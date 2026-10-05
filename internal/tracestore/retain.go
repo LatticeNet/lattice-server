@@ -46,11 +46,14 @@ func (s *Store) Retain(now time.Time) (RetainResult, error) {
 	}
 	res.BytesBefore = before
 
+	// One snapshot of the limits for the whole pass, so an edit landing midway
+	// applies from the next pass rather than splitting this one.
+	limits := s.Limits()
 	budget := maxRetainBatches
 
 	n, spent, err := s.deleteOldest(`DELETE FROM conn_records WHERE rowid IN (
 		SELECT rowid FROM conn_records WHERE started_at < ? ORDER BY started_at LIMIT ?)`,
-		nanos(now.Add(-s.opts.RecordTTL)), budget)
+		nanos(now.Add(-limits.RecordTTL)), budget)
 	if err != nil {
 		return res, fmt.Errorf("tracestore: retain records: %w", err)
 	}
@@ -58,7 +61,7 @@ func (s *Store) Retain(now time.Time) (RetainResult, error) {
 
 	n, spent, err = s.deleteOldest(`DELETE FROM trace_lines WHERE rowid IN (
 		SELECT rowid FROM trace_lines WHERE at < ? ORDER BY at LIMIT ?)`,
-		nanos(now.Add(-s.opts.LineTTL)), budget)
+		nanos(now.Add(-limits.LineTTL)), budget)
 	if err != nil {
 		return res, fmt.Errorf("tracestore: retain lines: %w", err)
 	}
@@ -66,7 +69,7 @@ func (s *Store) Retain(now time.Time) (RetainResult, error) {
 
 	n, spent, err = s.deleteOldest(`DELETE FROM rollups_5m WHERE rowid IN (
 		SELECT rowid FROM rollups_5m WHERE bucket_start < ? ORDER BY bucket_start LIMIT ?)`,
-		nanos(now.Add(-s.opts.RollupTTL)), budget)
+		nanos(now.Add(-limits.RollupTTL)), budget)
 	if err != nil {
 		return res, fmt.Errorf("tracestore: retain rollups: %w", err)
 	}
@@ -75,7 +78,7 @@ func (s *Store) Retain(now time.Time) (RetainResult, error) {
 	if err := s.reclaim(); err != nil {
 		return res, err
 	}
-	if err := s.evictToMaxBytes(&res, &budget); err != nil {
+	if err := s.evictToMaxBytes(limits.MaxBytes, &res, &budget); err != nil {
 		return res, err
 	}
 
@@ -94,13 +97,13 @@ func (s *Store) Retain(now time.Time) (RetainResult, error) {
 // Records go first because they are the bulk and the oldest ones are the least
 // useful; only when there are none left does it fall back to raw lines, so the
 // sweep still converges on a store that holds nothing but session lines.
-func (s *Store) evictToMaxBytes(res *RetainResult, budget *int) error {
+func (s *Store) evictToMaxBytes(maxBytes int64, res *RetainResult, budget *int) error {
 	for *budget > 0 {
 		size, err := s.sizeBytes()
 		if err != nil {
 			return err
 		}
-		if size <= s.opts.MaxBytes {
+		if size <= maxBytes {
 			return nil
 		}
 		n, spent, err := s.deleteOldest(`DELETE FROM conn_records WHERE rowid IN (

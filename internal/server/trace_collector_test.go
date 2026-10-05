@@ -295,6 +295,44 @@ func TestCollectorDetailAndAddressAreBounded(t *testing.T) {
 	}
 }
 
+// An agent's text is stripped of control characters, and its clock may not
+// put a state change or a counter window after the moment the beat arrived.
+func TestCollectorStripsControlCharactersAndClampsClocks(t *testing.T) {
+	clock := &testClock{at: time.Now().UTC().Truncate(time.Second)}
+	f := newTraceFixture(t, clock)
+	traceNode(t, f.st, "node-a")
+	cookies, csrf := loginSession(t, f.handler)
+
+	ahead := clock.at.Add(time.Hour)
+	status, err := json.Marshal(map[string]any{
+		"state":          "stream_failing",
+		"detail":         "dial\x00 tcp\t127.0.0.1:9090:\x1b[31m refused\x7f",
+		"clash_api_addr": "127.0.0.1:9090\x1b[0m\x7f",
+		"addr_source":    "config",
+		"since":          ahead,
+		"counters_since": ahead.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	collectorBeat(t, f.handler, "node-a", traceCollectorStatusMinAgent, ahead, string(status))
+	c := readTracePolicy(t, f.handler, cookies, csrf, "node-a").Collector
+	if c == nil || c.State != model.CollectorStreamFailing {
+		t.Fatalf("collector = %+v", c)
+	}
+	for _, field := range []string{c.Detail, c.ClashAPIAddr} {
+		if strings.IndexFunc(field, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			t.Fatalf("control characters kept in %q", field)
+		}
+	}
+	if c.Detail != "dial tcp127.0.0.1:9090:[31m refused" || c.ClashAPIAddr != "127.0.0.1:9090[0m" {
+		t.Fatalf("stripped detail %q, address %q", c.Detail, c.ClashAPIAddr)
+	}
+	if !c.Since.Equal(c.ReceivedAt) || !c.CountersSince.Equal(c.ReceivedAt) || !c.ReceivedAt.Equal(clock.at) {
+		t.Fatalf("clocks: since %s counters_since %s received %s, server now %s", c.Since, c.CountersSince, c.ReceivedAt, clock.at)
+	}
+}
+
 func TestCollectorIsStaleWhenTheNodeGoesQuiet(t *testing.T) {
 	clock := &testClock{at: time.Now().UTC()}
 	f := newTraceFixture(t, clock)

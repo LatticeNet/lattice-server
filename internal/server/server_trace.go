@@ -654,6 +654,12 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 		}
 		pol.UpdatedAt = s.now()
 		node.Trace = pol
+		// The source goes first, so a failure answers 500 with the policy
+		// unchanged rather than storing a raw switch that has not taken.
+		if err := s.syncSingBoxLogSource(node); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("raw log source: %w", err))
+			return
+		}
 		if err := s.store.UpsertNode(node); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -731,18 +737,15 @@ func (s *Server) traceAgentConfig(nodeID string) (model.TraceAgentConfig, error)
 	// ships raw lines only when it is handed one, and none has ever read the
 	// policy's raw field to decide. Withholding it makes a node with raw
 	// lines off ship none, from 0.3.9 as much as from 0.3.10-alpha.4, and
-	// disabling the source refuses with 409 whatever a stale agent still
-	// holds.
-	if pol.RawLinesEnabled() {
-		if s.logStore != nil {
-			if ls, err := s.ensureSingBoxLogSource(node); err != nil {
-				s.logger.Printf("trace: raw log source for %s: %v", nodeID, err)
-			} else {
-				cfg.RawSourceID = ls.ID
-			}
+	// the disabled source refuses with 409 whatever a stale agent still
+	// holds. This path only reads: the audited policy write creates,
+	// repairs or disables the source (syncSingBoxLogSource), so an agent
+	// poll can never change it, nor undo a write it raced. A source that is
+	// missing or disabled while the policy says raw on fails closed.
+	if pol.RawLinesEnabled() && s.logStore != nil {
+		if ls, ok := s.store.LogSource(singBoxLogSourceID(nodeID)); ok && ls.Enabled {
+			cfg.RawSourceID = ls.ID
 		}
-	} else if err := s.quiesceSingBoxLogSource(nodeID); err != nil {
-		s.logger.Printf("trace: disabling the raw log source for %s: %v", nodeID, err)
 	}
 	for _, sess := range s.store.ActiveTraceSessions(now) {
 		if agentSess, ok := s.traceAgentSessionFor(nodeID, sess); ok {
@@ -1069,12 +1072,26 @@ func (s *Server) ensureSingBoxLogSource(node model.Node) (model.LogSource, error
 	return ls, nil
 }
 
+// syncSingBoxLogSource makes a node's raw sing-box source follow the policy
+// being written: created, repaired and enabled while raw lines take effect,
+// disabled otherwise. Only the policy write calls it, where trace.policy.set
+// is audited; agent polls read the source and never change it.
+func (s *Server) syncSingBoxLogSource(node model.Node) error {
+	if !node.Trace.RawLinesEnabled() {
+		return s.quiesceSingBoxLogSource(node.ID)
+	}
+	if s.logStore == nil {
+		return nil
+	}
+	_, err := s.ensureSingBoxLogSource(node)
+	return err
+}
+
 // quiesceSingBoxLogSource disables a node's raw sing-box source while raw
 // lines are off, so /api/agent/logs refuses an agent that still holds the
 // source id with 409. Lines already stored stay until the per-source cap
 // evicts them: purging them would be deleting data, which is the
-// operator's call. It writes only on a change, because it runs on every
-// agent poll.
+// operator's call. It writes only on a change.
 func (s *Server) quiesceSingBoxLogSource(nodeID string) error {
 	ls, ok := s.store.LogSource(singBoxLogSourceID(nodeID))
 	if !ok || !ls.Enabled {

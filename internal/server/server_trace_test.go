@@ -1032,6 +1032,76 @@ func TestPolicyWriteNoLongerPinsTheBudgetDefault(t *testing.T) {
 	}
 }
 
+// A policy write stores a fresh raw switch. cloneNode copies a node by value,
+// so every Nodes() copy shares the stored Raw pointer; a write that reused
+// it would let any earlier copy reach into the stored policy.
+func TestPolicyWriteNeverReusesTheStoredRawPointer(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true, "raw": map[string]any{"enabled": true}})
+
+	var before *model.RawLinePolicy
+	for _, n := range st.Nodes() {
+		if n.ID == "node-a" {
+			before = n.Trace.Raw
+		}
+	}
+	if before == nil {
+		t.Fatal("no stored raw switch to compare against")
+	}
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "level": "trace"})
+	after, _ := st.Node("node-a")
+	if after.Trace.Raw == nil || after.Trace.Raw == before {
+		t.Fatalf("the write stored raw %p, the earlier copy holds %p; want a fresh pointer", after.Trace.Raw, before)
+	}
+	if *after.Trace.Raw != *before {
+		t.Fatalf("raw changed from %+v to %+v on an edit that did not name it", *before, *after.Trace.Raw)
+	}
+}
+
+// An agent poll only reads the raw source. A policy changed under it (here
+// straight in the store, as no audited write would leave it) is not repaired
+// or disabled by the poll; the poll fails closed instead.
+func TestAgentPollNeverChangesTheRawSource(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true, "raw": map[string]any{"enabled": true}})
+	sourceID := singBoxLogSourceID("node-a")
+	src, ok := st.LogSource(sourceID)
+	if !ok || !src.Enabled {
+		t.Fatalf("the policy write did not provision the source: %+v", src)
+	}
+
+	node, _ := st.Node("node-a")
+	node.Trace.Raw = &model.RawLinePolicy{Enabled: false}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	if got := doTraceAgent(t, handler, "node-a").RawSourceID; got != "" {
+		t.Fatalf("raw off still hands out %q", got)
+	}
+	if ls, _ := st.LogSource(sourceID); !ls.Enabled || !ls.UpdatedAt.Equal(src.UpdatedAt) {
+		t.Fatalf("a poll changed the source: %+v", ls)
+	}
+
+	src.Enabled = false
+	if err := st.UpsertLogSource(src); err != nil {
+		t.Fatal(err)
+	}
+	node.Trace.Raw = &model.RawLinePolicy{Enabled: true}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	if got := doTraceAgent(t, handler, "node-a").RawSourceID; got != "" {
+		t.Fatalf("a disabled source was handed out as %q", got)
+	}
+	if ls, _ := st.LogSource(sourceID); ls.Enabled {
+		t.Fatal("a poll re-enabled the source")
+	}
+}
+
 // A policy a117 saved carries the 500 it pinned. An explicit 0 must return it
 // to the agent's default, durably and on the record; otherwise no node saved
 // before R1 could ever reach the new default.

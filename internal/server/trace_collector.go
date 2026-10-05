@@ -66,11 +66,11 @@ func (s *Server) noteTraceCollector(nodeID string, st *model.CollectorStatus, co
 	if st == nil {
 		return
 	}
-	bounded, ok := boundTraceCollector(*st)
+	now := s.now()
+	bounded, ok := boundTraceCollector(*st, now)
 	if !ok {
 		return
 	}
-	now := s.now()
 	if collectedAt.IsZero() {
 		collectedAt = now
 	}
@@ -103,14 +103,24 @@ func (s *Server) traceCollectorRecord(nodeID string) (traceCollectorRecord, bool
 // refuses agent_too_old, which only this server infers, and any state the
 // contract does not name. Everything else is trimmed rather than refused:
 // the status is low-trust telemetry for display, never for authorization.
-func boundTraceCollector(st model.CollectorStatus) (model.CollectorStatus, bool) {
+// Control characters are stripped so no text an agent sends can break a log
+// line or a terminal, and the agent's timestamps are clamped to receivedAt
+// (this server's clock) so none reads as a moment that has not happened yet.
+func boundTraceCollector(st model.CollectorStatus, receivedAt time.Time) (model.CollectorStatus, bool) {
 	if !model.ValidAgentCollectorState(st.State) {
 		return model.CollectorStatus{}, false
 	}
-	st.Detail = model.BoundCollectorDetail(strings.TrimSpace(st.Detail))
+	st.Detail = stripControlChars(model.BoundCollectorDetail(strings.TrimSpace(st.Detail)))
 	st.ClashAPIAddr = strings.TrimSpace(st.ClashAPIAddr)
 	if len(st.ClashAPIAddr) > maxTraceCollectorAddr {
 		st.ClashAPIAddr, _ = store.TruncateUTF8(st.ClashAPIAddr, maxTraceCollectorAddr)
+	}
+	st.ClashAPIAddr = stripControlChars(st.ClashAPIAddr)
+	if st.Since.After(receivedAt) {
+		st.Since = receivedAt
+	}
+	if st.CountersSince.After(receivedAt) {
+		st.CountersSince = receivedAt
 	}
 	switch st.AddrSource {
 	case "", model.ClashAddrFromPolicy, model.ClashAddrFromConfig:
@@ -127,6 +137,17 @@ func boundTraceCollector(st model.CollectorStatus) (model.CollectorStatus, bool)
 		st.BudgetLinesPerSec = 0
 	}
 	return st, true
+}
+
+// stripControlChars drops C0 control characters and DEL. Removing bytes
+// only shortens the string, so a bound applied before still holds.
+func stripControlChars(v string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, v)
 }
 
 // traceCaptureCoverage says whether running captures switch a node's

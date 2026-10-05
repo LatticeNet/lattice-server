@@ -350,6 +350,9 @@ type Server struct {
 	// agentHealth is each node's last loop health, in memory only; see
 	// agent_health.go.
 	agentHealth agentHealthBook
+	// traceCollectors is each node's last trace collector status, in memory
+	// only; see trace_collector.go.
+	traceCollectors traceCollectorBook
 	// monitorDrops rate-limits the log line for agent monitor results the
 	// store refused; see server_monitor_results.go.
 	monitorDrops monitorDropLog
@@ -8925,6 +8928,9 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		// LoopHealth is node-agent 0.3.10's account of its work loop; kept
 		// in memory beside agentRuntime, never persisted per beat.
 		LoopHealth *model.AgentHealth `json:"loop_health"`
+		// TraceCollector is node-agent 0.3.10-alpha.4's account of its trace
+		// collector; kept in memory like LoopHealth.
+		TraceCollector *model.CollectorStatus `json:"trace_collector"`
 		// Witness is the control-plane witness's status file, sent only by
 		// the node that runs one.
 		Witness *witnessReport `json:"witness"`
@@ -8977,6 +8983,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		s.agentRuntimeMu.Unlock()
 	}
 	s.noteAgentHealth(req.NodeID, req.LoopHealth, req.Metrics.CollectedAt)
+	s.noteTraceCollector(req.NodeID, req.TraceCollector, req.Metrics.CollectedAt)
 	s.noteWitnessReport(req.NodeID, req.Witness)
 	s.maybeTriggerDDNS(req.NodeID, old.PublicIP, old.PublicIPv6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

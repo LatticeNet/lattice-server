@@ -31,6 +31,23 @@ import (
 
 func newTraceTestServer(t *testing.T) (http.Handler, *store.Store, *tracestore.Store) {
 	t.Helper()
+	f := newTraceFixture(t, nil)
+	return f.handler, f.st, f.ts
+}
+
+type traceFixture struct {
+	srv     *Server
+	handler http.Handler
+	st      *store.Store
+	ts      *tracestore.Store
+	logs    *logstore.Store
+}
+
+// newTraceFixture builds the trace test server. Given a clock it starts no
+// background workers, so the test can own the server's time without racing
+// a worker that reads it.
+func newTraceFixture(t *testing.T, clock *testClock) traceFixture {
+	t.Helper()
 	st, err := store.Open("")
 	if err != nil {
 		t.Fatal(err)
@@ -48,11 +65,14 @@ func newTraceTestServer(t *testing.T) (http.Handler, *store.Store, *tracestore.S
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { lstore.Close() })
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, LogStore: lstore})
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, LogStore: lstore, DisableRenewalScheduler: clock != nil})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return srv.Handler(), st, ts
+	if clock != nil {
+		srv.now = clock.now
+	}
+	return traceFixture{srv: srv, handler: srv.Handler(), st: st, ts: ts, logs: lstore}
 }
 
 // traceNode creates a node whose bearer token is derivable in tests, so the
@@ -652,9 +672,11 @@ func TestTracePolicyProvisionsTheRawLogSource(t *testing.T) {
 	traceNode(t, st, "node-a")
 	cookies, csrf := loginSession(t, handler)
 
+	// Raw lines are their own switch since design 26 R1; records alone do not
+	// provision the source.
 	res := doTrace(t, handler, http.MethodPost, "/api/trace/policy", cookies, csrf, map[string]any{
 		"node_id": "node-a", "enabled": true, "level": "info",
-		"clash_api_addr": "127.0.0.1:9090",
+		"clash_api_addr": "127.0.0.1:9090", "raw": map[string]any{"enabled": true},
 	})
 	res.Body.Close()
 	if res.StatusCode != http.StatusOK {
@@ -797,5 +819,353 @@ func TestTraceConnectionsSaysWhetherAnythingWasCollected(t *testing.T) {
 	matched := readPage("/api/trace/connections?dst=example")
 	if len(matched.Records) != 1 || matched.CollectedTotal != 1 {
 		t.Fatalf("a matching filter keeps the total, got %d records total %d", len(matched.Records), matched.CollectedTotal)
+	}
+}
+
+// A policy this server writes always carries raw explicitly, and records
+// switched on without a word about raw lines record only (design 26,
+// operator decision 1).
+func TestPolicyWriteStoresRawExplicitly(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true})
+	if v.Raw == nil || v.Raw.Enabled || v.RawEffective {
+		t.Fatalf("response raw = %+v, raw_effective = %v; want raw stored off", v.Raw, v.RawEffective)
+	}
+	node, _ := st.Node("node-a")
+	if node.Trace.Raw == nil || node.Trace.Raw.Enabled {
+		t.Fatalf("stored raw = %+v, want an explicit off", node.Trace.Raw)
+	}
+}
+
+// A level edit on a policy written before the switch existed keeps its raw
+// stream: the old meaning (raw follows records, and records were on) is
+// frozen into an explicit switch.
+func TestPolicyWriteKeepsALegacyPolicysRawMeaning(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	node, _ := st.Node("node-a")
+	node.Trace = model.TracePolicy{NodeID: "node-a", Enabled: true, Level: model.TraceLevelDebug, BudgetLinesPerSec: 500}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+
+	v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "level": "trace"})
+	if v.Raw == nil || !v.Raw.Enabled || !v.RawEffective {
+		t.Fatalf("raw = %+v, raw_effective = %v; a level edit changed a legacy policy's raw stream", v.Raw, v.RawEffective)
+	}
+	if v.BudgetLinesPerSec != 500 {
+		t.Fatalf("budget = %d; an edit that names no budget must keep the stored one", v.BudgetLinesPerSec)
+	}
+}
+
+// Raw lines are stored independently of records and take effect only while
+// records are on, so turning records off and on restores the raw choice.
+func TestRawChoiceSurvivesRecordsOffAndOn(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	if v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true, "raw": map[string]any{"enabled": true}}); !v.RawEffective {
+		t.Fatalf("records and raw on: raw_effective false (%+v)", v.Raw)
+	}
+	v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": false})
+	if v.RawEffective || v.Raw == nil || !v.Raw.Enabled {
+		t.Fatalf("records off: raw = %+v, raw_effective = %v; want raw kept on and not effective", v.Raw, v.RawEffective)
+	}
+	if v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true}); !v.RawEffective {
+		t.Fatal("records back on did not restore the raw choice")
+	}
+}
+
+// With records on and raw lines off, no agent is handed the raw source id.
+// That id is what every agent version ships raw lines on, so this is the
+// server half of design 26 acceptance 2 for 0.3.9 as much as 0.3.10-alpha.4.
+func TestRawOffWithholdsTheRawSourceFromEveryAgent(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{
+		"node_id": "node-a", "enabled": true, "clash_api_addr": "127.0.0.1:9090", "raw": map[string]any{"enabled": false},
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/agent/trace-config?node_id=node-a", nil)
+	req.Header.Set("Authorization", "Bearer node-token-node-a")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trace-config: %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "raw_source_id") {
+		t.Fatalf("raw off still names a raw source: %s", rec.Body.String())
+	}
+	var cfg model.TraceAgentConfig
+	if err := json.Unmarshal(rec.Body.Bytes(), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Policy.Enabled || cfg.Policy.Raw == nil || cfg.Policy.Raw.Enabled {
+		t.Fatalf("agent policy = %+v raw %+v; want records on, raw explicitly off", cfg.Policy, cfg.Policy.Raw)
+	}
+}
+
+// A stale agent that still holds the raw source id after raw lines were
+// switched off is refused with 409, and nothing more reaches logs.db.
+func TestRawOffRefusesStragglerRawLines(t *testing.T) {
+	f := newTraceFixture(t, nil)
+	traceNode(t, f.st, "node-a")
+	cookies, csrf := loginSession(t, f.handler)
+	postTracePolicy(t, f.handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true, "raw": map[string]any{"enabled": true}})
+	sourceID := doTraceAgent(t, f.handler, "node-a").RawSourceID
+	if sourceID == "" {
+		t.Fatal("raw on handed the agent no raw source id")
+	}
+	// The same batch is accepted while raw is on, so the 409 below is the
+	// switch and not the shape of the request.
+	if rec := doAgentRaw(t, f.handler, http.MethodPost, "/api/agent/logs", rawLogBatch(sourceID, "kept"), "node-token-node-a"); rec.Code != http.StatusOK {
+		t.Fatalf("raw batch with raw on: %d %s", rec.Code, rec.Body.String())
+	}
+
+	postTracePolicy(t, f.handler, cookies, csrf, map[string]any{"node_id": "node-a", "raw": map[string]any{"enabled": false}})
+	if ls, ok := f.st.LogSource(sourceID); !ok || ls.Enabled {
+		t.Fatalf("raw off left the singbox source enabled: %+v", ls)
+	}
+	rec := doAgentRaw(t, f.handler, http.MethodPost, "/api/agent/logs", rawLogBatch(sourceID, "straggler"), "node-token-node-a")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("straggler raw batch: %d %s, want 409", rec.Code, rec.Body.String())
+	}
+	if meta, _, _, _ := f.logs.Stats(sourceID); meta.Lines != 1 {
+		t.Fatalf("logs.db holds %d raw lines, want only the one sent while raw was on", meta.Lines)
+	}
+}
+
+func TestRawOnRestoresTheSingBoxSource(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true, "raw": map[string]any{"enabled": true}})
+	sourceID := doTraceAgent(t, handler, "node-a").RawSourceID
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "raw": map[string]any{"enabled": false}})
+	if got := doTraceAgent(t, handler, "node-a").RawSourceID; got != "" {
+		t.Fatalf("raw off still hands out %q", got)
+	}
+
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "raw": map[string]any{"enabled": true}})
+	if got := doTraceAgent(t, handler, "node-a").RawSourceID; got != sourceID {
+		t.Fatalf("raw back on hands out %q, want the same source %q", got, sourceID)
+	}
+	if ls, ok := st.LogSource(sourceID); !ok || !ls.Enabled {
+		t.Fatalf("raw back on left the source disabled: %+v", ls)
+	}
+}
+
+// GET answers raw as stored (absent on a pre-switch policy, whose nil means
+// "follows records"), what takes effect, and the collector.
+func TestPolicyGetCarriesRawEffectiveAndCollector(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	node, _ := st.Node("node-a")
+	node.Trace = model.TracePolicy{NodeID: "node-a", Enabled: true, Level: model.TraceLevelDebug}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	collectorBeat(t, handler, "node-a", "0.3.9", time.Now().UTC(), "")
+	cookies, csrf := loginSession(t, handler)
+
+	res := doTrace(t, handler, http.MethodGet, "/api/trace/policy?node_id=node-a", cookies, csrf, nil)
+	defer res.Body.Close()
+	var out struct {
+		Policies []map[string]json.RawMessage `json:"policies"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Policies) != 1 {
+		t.Fatalf("policies = %d", len(out.Policies))
+	}
+	got := out.Policies[0]
+	if _, ok := got["raw"]; ok {
+		t.Fatalf("a pre-switch policy answered raw %s; nil must stay absent", got["raw"])
+	}
+	if string(got["raw_effective"]) != "true" {
+		t.Fatalf("raw_effective = %s, want true for a pre-switch policy that is on", got["raw_effective"])
+	}
+	var c traceCollectorView
+	if err := json.Unmarshal(got["collector"], &c); err != nil {
+		t.Fatalf("collector %s: %v", got["collector"], err)
+	}
+	if c.State != model.CollectorNoClashAPI || c.ReportedBy != traceCollectorByServer {
+		t.Fatalf("collector = %+v", c)
+	}
+}
+
+// The server no longer pins 500: a policy saved without a budget carries 0,
+// "the agent's own default", to the agent; an explicit 0 returns a pinned
+// node to that default; a negative budget is refused.
+func TestPolicyWriteNoLongerPinsTheBudgetDefault(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+
+	if v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true}); v.BudgetLinesPerSec != 0 {
+		t.Fatalf("budget = %d, want 0 (agent default)", v.BudgetLinesPerSec)
+	}
+	if cfg := doTraceAgent(t, handler, "node-a"); cfg.Policy.BudgetLinesPerSec != 0 {
+		t.Fatalf("the agent was sent budget %d, want 0", cfg.Policy.BudgetLinesPerSec)
+	}
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "budget_lines_per_sec": 800})
+	if v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "level": "debug"}); v.BudgetLinesPerSec != 800 {
+		t.Fatalf("an edit naming no budget changed it to %d", v.BudgetLinesPerSec)
+	}
+	if cfg := doTraceAgent(t, handler, "node-a"); cfg.Policy.BudgetLinesPerSec != 800 {
+		t.Fatalf("the agent was sent budget %d, want the pinned 800", cfg.Policy.BudgetLinesPerSec)
+	}
+	if v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "budget_lines_per_sec": 0}); v.BudgetLinesPerSec != 0 {
+		t.Fatalf("an explicit 0 kept budget %d", v.BudgetLinesPerSec)
+	}
+	res := doTrace(t, handler, http.MethodPost, "/api/trace/policy", cookies, csrf, map[string]any{"node_id": "node-a", "budget_lines_per_sec": -1})
+	res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a negative budget answered %d, want 400", res.StatusCode)
+	}
+}
+
+// A policy write stores a fresh raw switch. cloneNode copies a node by value,
+// so every Nodes() copy shares the stored Raw pointer; a write that reused
+// it would let any earlier copy reach into the stored policy.
+func TestPolicyWriteNeverReusesTheStoredRawPointer(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true, "raw": map[string]any{"enabled": true}})
+
+	var before *model.RawLinePolicy
+	for _, n := range st.Nodes() {
+		if n.ID == "node-a" {
+			before = n.Trace.Raw
+		}
+	}
+	if before == nil {
+		t.Fatal("no stored raw switch to compare against")
+	}
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "level": "trace"})
+	after, _ := st.Node("node-a")
+	if after.Trace.Raw == nil || after.Trace.Raw == before {
+		t.Fatalf("the write stored raw %p, the earlier copy holds %p; want a fresh pointer", after.Trace.Raw, before)
+	}
+	if *after.Trace.Raw != *before {
+		t.Fatalf("raw changed from %+v to %+v on an edit that did not name it", *before, *after.Trace.Raw)
+	}
+}
+
+// An agent poll only reads the raw source. A policy changed under it (here
+// straight in the store, as no audited write would leave it) is not repaired
+// or disabled by the poll; the poll fails closed instead.
+func TestAgentPollNeverChangesTheRawSource(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	cookies, csrf := loginSession(t, handler)
+	postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "enabled": true, "raw": map[string]any{"enabled": true}})
+	sourceID := singBoxLogSourceID("node-a")
+	src, ok := st.LogSource(sourceID)
+	if !ok || !src.Enabled {
+		t.Fatalf("the policy write did not provision the source: %+v", src)
+	}
+
+	node, _ := st.Node("node-a")
+	node.Trace.Raw = &model.RawLinePolicy{Enabled: false}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	if got := doTraceAgent(t, handler, "node-a").RawSourceID; got != "" {
+		t.Fatalf("raw off still hands out %q", got)
+	}
+	if ls, _ := st.LogSource(sourceID); !ls.Enabled || !ls.UpdatedAt.Equal(src.UpdatedAt) {
+		t.Fatalf("a poll changed the source: %+v", ls)
+	}
+
+	src.Enabled = false
+	if err := st.UpsertLogSource(src); err != nil {
+		t.Fatal(err)
+	}
+	node.Trace.Raw = &model.RawLinePolicy{Enabled: true}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	if got := doTraceAgent(t, handler, "node-a").RawSourceID; got != "" {
+		t.Fatalf("a disabled source was handed out as %q", got)
+	}
+	if ls, _ := st.LogSource(sourceID); ls.Enabled {
+		t.Fatal("a poll re-enabled the source")
+	}
+}
+
+// A policy a117 saved carries the 500 it pinned. An explicit 0 must return it
+// to the agent's default, durably and on the record; otherwise no node saved
+// before R1 could ever reach the new default.
+func TestPolicyWriteResetsAStoredBudgetToTheAgentDefault(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	traceNode(t, st, "node-a")
+	node, _ := st.Node("node-a")
+	node.Trace = model.TracePolicy{NodeID: "node-a", Enabled: true, Level: model.TraceLevelDebug, BudgetLinesPerSec: 500}
+	if err := st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	cookies, csrf := loginSession(t, handler)
+
+	if v := postTracePolicy(t, handler, cookies, csrf, map[string]any{"node_id": "node-a", "budget_lines_per_sec": 0}); v.BudgetLinesPerSec != 0 {
+		t.Fatalf("save response budget = %d, want 0", v.BudgetLinesPerSec)
+	}
+	if v := readTracePolicy(t, handler, cookies, csrf, "node-a"); v.BudgetLinesPerSec != 0 {
+		t.Fatalf("read-back budget = %d, want 0", v.BudgetLinesPerSec)
+	}
+	if stored, _ := st.Node("node-a"); stored.Trace.BudgetLinesPerSec != 0 {
+		t.Fatalf("stored budget = %d, want 0", stored.Trace.BudgetLinesPerSec)
+	}
+	if cfg := doTraceAgent(t, handler, "node-a"); cfg.Policy.BudgetLinesPerSec != 0 {
+		t.Fatalf("the agent was sent budget %d, want 0", cfg.Policy.BudgetLinesPerSec)
+	}
+	var budgets []string
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "trace.policy.set" && ev.NodeID == "node-a" {
+			budgets = append(budgets, ev.Metadata["budget"])
+		}
+	}
+	if len(budgets) != 1 || budgets[0] != "0" {
+		t.Fatalf("trace.policy.set budgets audited = %v, want [0]", budgets)
+	}
+}
+
+// Shed connections are a gap like dropped lines and are audited as one, with
+// their own count. A batch carrying only that counter still counts.
+func TestShedConnectionsAreAuditedAsAGap(t *testing.T) {
+	handler, st, _ := newTraceTestServer(t)
+	token := traceNode(t, st, "node-a")
+	post := func(dropped, shed uint64) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{
+			"node_id": "node-a",
+			"batch": map[string]any{
+				"node_id": "node-a", "captured_at": time.Now().UTC(),
+				"dropped": dropped, "shed_connections": shed,
+			},
+		})
+		if rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/trace", string(body), token); rec.Code != http.StatusOK {
+			t.Fatalf("trace batch: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+	post(42, 40)
+	post(0, 3)
+
+	seen := map[string]string{}
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "trace.ingest.gap" && ev.NodeID == "node-a" {
+			seen[ev.Metadata["shed_connections"]] = ev.Metadata["dropped"]
+		}
+	}
+	if seen["40"] != "42" || seen["3"] != "0" || len(seen) != 2 {
+		t.Fatalf("gap audits by shed count (value is dropped) = %v", seen)
 	}
 }

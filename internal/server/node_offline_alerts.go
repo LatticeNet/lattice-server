@@ -103,9 +103,9 @@ func (s *Server) resolveNodeOffline(nodeID, name string, now time.Time) {
 	})
 }
 
-// forgetNodeOfflineAlert drops a deleted node's alert state and loop health
-// from memory. The store's delete cascade has already removed the node and
-// its incidents.
+// forgetNodeOfflineAlert drops a deleted node's alert state, loop health and
+// trace collector status from memory. The store's delete cascade has already
+// removed the node and its incidents.
 func (s *Server) forgetNodeOfflineAlert(nodeID string) {
 	a := &s.nodeAlerts
 	a.mu.Lock()
@@ -113,6 +113,7 @@ func (s *Server) forgetNodeOfflineAlert(nodeID string) {
 	delete(a.disabled, nodeID)
 	delete(a.watchFrom, nodeID)
 	s.forgetAgentHealth(nodeID)
+	s.forgetTraceCollector(nodeID)
 }
 
 // notifyNodeLiveness opens node.offline incidents for nodes silent past

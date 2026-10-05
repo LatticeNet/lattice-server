@@ -33,9 +33,12 @@ const (
 
 	traceBatchBodyLimit = 8 << 20
 
-	// traceDefaultBudgetLines is the per-node ingest ceiling applied when a
-	// policy does not set one.
-	traceDefaultBudgetLines = 500
+	// A policy's budget_lines_per_sec of 0 means "the agent's own default",
+	// and it travels to the agent as 0. That default is 500 lines a second on
+	// agents up to 0.3.10-alpha.3 and 5,000 parsed lines on 0.3.10-alpha.4,
+	// which sheds whole connections instead of cutting lines. Pinning a
+	// number here would hand old agents ten times today's parse load on hosts
+	// nobody has measured, or hold new agents at a tenth of theirs.
 
 	// traceMaxActiveSessions and traceMaxSessionsPerNode bound concurrency.
 	// One operator should not be able to multiply a node's collection cost by
@@ -527,6 +530,25 @@ func (s *Server) pushTraceConfig(nodeIDs []string) {
 	}
 }
 
+// tracePolicyView is a node's policy as the console reads it: the stored
+// policy (raw as stored, nil on a pre-switch policy), whether raw lines take
+// effect under it, and the collector's readiness.
+type tracePolicyView struct {
+	model.TracePolicy
+	RawEffective bool                `json:"raw_effective"`
+	Collector    *traceCollectorView `json:"collector,omitempty"`
+}
+
+func (s *Server) tracePolicyViewFor(n model.Node, active []model.TraceSession, now time.Time) tracePolicyView {
+	pol := n.Trace
+	pol.NodeID = n.ID
+	return tracePolicyView{
+		TracePolicy:  pol,
+		RawEffective: pol.RawLinesEnabled(),
+		Collector:    s.traceCollectorViewFor(n, s.traceCaptureCoverageFor(n.ID, active), now),
+	}
+}
+
 func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p principal) {
 	switch r.Method {
 	case http.MethodGet:
@@ -534,7 +556,9 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 			return
 		}
 		requested := strings.TrimSpace(r.URL.Query().Get("node_id"))
-		out := []model.TracePolicy{}
+		now := s.now()
+		active := s.store.ActiveTraceSessions(now)
+		out := []tracePolicyView{}
 		for _, n := range s.store.Nodes() {
 			if requested != "" && n.ID != requested {
 				continue
@@ -542,9 +566,7 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 			if !rbac.Allows(p.Principal, "log:read", n.ID) {
 				continue
 			}
-			pol := n.Trace
-			pol.NodeID = n.ID
-			out = append(out, pol)
+			out = append(out, s.tracePolicyViewFor(n, active, now))
 		}
 		sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
 		writeJSON(w, http.StatusOK, map[string]any{"policies": out})
@@ -553,12 +575,16 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 			return
 		}
 		var req struct {
-			NodeID            string           `json:"node_id"`
-			Enabled           *bool            `json:"enabled"`
-			Level             model.TraceLevel `json:"level"`
-			BudgetLinesPerSec int              `json:"budget_lines_per_sec"`
-			ClashAPIAddr      string           `json:"clash_api_addr"`
-			SecretPath        string           `json:"secret_path"`
+			NodeID  string           `json:"node_id"`
+			Enabled *bool            `json:"enabled"`
+			Level   model.TraceLevel `json:"level"`
+			// BudgetLinesPerSec absent keeps the stored budget, 0 returns
+			// the node to the agent's own default, and a positive number
+			// pins it.
+			BudgetLinesPerSec *int                 `json:"budget_lines_per_sec"`
+			ClashAPIAddr      string               `json:"clash_api_addr"`
+			SecretPath        string               `json:"secret_path"`
+			Raw               *model.RawLinePolicy `json:"raw"`
 		}
 		if !decodeClientJSON(w, r, &req) {
 			return
@@ -576,6 +602,7 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 			writeError(w, http.StatusNotFound, errors.New("node not found"))
 			return
 		}
+		old := node.Trace
 		pol := node.Trace
 		pol.NodeID = req.NodeID
 		if req.Level != "" {
@@ -591,11 +618,29 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 		if req.Enabled != nil {
 			pol.Enabled = *req.Enabled
 		}
-		if req.BudgetLinesPerSec > 0 {
-			pol.BudgetLinesPerSec = req.BudgetLinesPerSec
+		if req.BudgetLinesPerSec != nil {
+			if *req.BudgetLinesPerSec < 0 {
+				writeError(w, http.StatusBadRequest, errors.New("budget_lines_per_sec must be 0 (the agent's default) or positive"))
+				return
+			}
+			pol.BudgetLinesPerSec = *req.BudgetLinesPerSec
 		}
-		if pol.BudgetLinesPerSec <= 0 {
-			pol.BudgetLinesPerSec = traceDefaultBudgetLines
+		// Raw lines are stored on every write, so no policy this server
+		// writes is left to the nil rule. A request that does not say keeps
+		// what the stored policy meant before it: an explicit switch as it
+		// is, and a pre-switch policy's "raw follows records" frozen at its
+		// old records value, so a level edit never changes the raw stream.
+		// The switch is kept independently of Enabled; RawLinesEnabled is
+		// what takes effect, and turning records off and on again restores
+		// the operator's raw choice. Always a fresh value: a policy copy
+		// shares the pointer with the stored node.
+		switch {
+		case req.Raw != nil:
+			pol.Raw = &model.RawLinePolicy{Enabled: req.Raw.Enabled}
+		case old.Raw != nil:
+			pol.Raw = &model.RawLinePolicy{Enabled: old.Raw.Enabled}
+		default:
+			pol.Raw = &model.RawLinePolicy{Enabled: old.Enabled}
 		}
 		if addr := strings.TrimSpace(req.ClashAPIAddr); addr != "" {
 			if err := validateLoopbackHostPort(addr); err != nil {
@@ -609,6 +654,12 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 		}
 		pol.UpdatedAt = s.now()
 		node.Trace = pol
+		// The source goes first, so a failure answers 500 with the policy
+		// unchanged rather than storing a raw switch that has not taken.
+		if err := s.syncSingBoxLogSource(node); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("raw log source: %w", err))
+			return
+		}
 		if err := s.store.UpsertNode(node); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -622,10 +673,16 @@ func (s *Server) handleTracePolicy(w http.ResponseWriter, r *http.Request, p pri
 				"enabled": strconv.FormatBool(pol.Enabled),
 				"level":   string(pol.Level),
 				"budget":  strconv.Itoa(pol.BudgetLinesPerSec),
+				"raw":     strconv.FormatBool(pol.RawLinesEnabled()),
 			},
 		})
 		s.pushTraceConfig([]string{req.NodeID})
-		writeJSON(w, http.StatusOK, pol)
+		// The view rather than the bare policy, so the caller sees readiness
+		// (inferred at once for older agents, pending for newer ones) on the
+		// save's own response. It embeds the policy, so a reader of the old
+		// shape still decodes it.
+		now := s.now()
+		writeJSON(w, http.StatusOK, s.tracePolicyViewFor(node, s.store.ActiveTraceSessions(now), now))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -674,41 +731,53 @@ func (s *Server) traceAgentConfig(nodeID string) (model.TraceAgentConfig, error)
 	if pol.Level == "" {
 		pol.Level = traceDefaultLevel
 	}
-	if pol.BudgetLinesPerSec <= 0 {
-		pol.BudgetLinesPerSec = traceDefaultBudgetLines
-	}
 	now := s.now()
 	cfg := model.TraceAgentConfig{Policy: pol, ServerTime: now}
-	if pol.Enabled && s.logStore != nil {
-		if ls, err := s.ensureSingBoxLogSource(node); err != nil {
-			s.logger.Printf("trace: raw log source for %s: %v", nodeID, err)
-		} else {
+	// The raw source id is the switch every agent version obeys: an agent
+	// ships raw lines only when it is handed one, and none has ever read the
+	// policy's raw field to decide. Withholding it makes a node with raw
+	// lines off ship none, from 0.3.9 as much as from 0.3.10-alpha.4, and
+	// the disabled source refuses with 409 whatever a stale agent still
+	// holds. This path only reads: the audited policy write creates,
+	// repairs or disables the source (syncSingBoxLogSource), so an agent
+	// poll can never change it, nor undo a write it raced. A source that is
+	// missing or disabled while the policy says raw on fails closed.
+	if pol.RawLinesEnabled() && s.logStore != nil {
+		if ls, ok := s.store.LogSource(singBoxLogSourceID(nodeID)); ok && ls.Enabled {
 			cfg.RawSourceID = ls.ID
 		}
 	}
 	for _, sess := range s.store.ActiveTraceSessions(now) {
-		if len(sess.Filter.NodeIDs) > 0 && !containsString(sess.Filter.NodeIDs, nodeID) {
-			continue
+		if agentSess, ok := s.traceAgentSessionFor(nodeID, sess); ok {
+			cfg.Sessions = append(cfg.Sessions, agentSess)
 		}
-		agentSess := model.TraceAgentSession{
-			ID:          sess.ID,
-			Level:       sess.Level,
-			ExpiresAt:   sess.ExpiresAt,
-			DstPatterns: sess.Filter.DstPatterns,
-			UserNames:   s.traceUserNamesForNode(nodeID, sess.Filter),
-			InboundTags: s.traceInboundTagsForNode(nodeID, sess.Filter),
-		}
-		// A session that named users or lines but resolved to nothing on this
-		// node must NOT degrade into "capture everything here". Skip it instead.
-		if len(sess.Filter.UserIDs) > 0 && len(agentSess.UserNames) == 0 {
-			continue
-		}
-		if len(sess.Filter.LineUUIDs) > 0 && len(agentSess.InboundTags) == 0 {
-			continue
-		}
-		cfg.Sessions = append(cfg.Sessions, agentSess)
 	}
 	return cfg, nil
+}
+
+// traceAgentSessionFor expands a capture into what one node evaluates, and
+// reports false when the capture does not cover that node.
+func (s *Server) traceAgentSessionFor(nodeID string, sess model.TraceSession) (model.TraceAgentSession, bool) {
+	if len(sess.Filter.NodeIDs) > 0 && !containsString(sess.Filter.NodeIDs, nodeID) {
+		return model.TraceAgentSession{}, false
+	}
+	agentSess := model.TraceAgentSession{
+		ID:          sess.ID,
+		Level:       sess.Level,
+		ExpiresAt:   sess.ExpiresAt,
+		DstPatterns: sess.Filter.DstPatterns,
+		UserNames:   s.traceUserNamesForNode(nodeID, sess.Filter),
+		InboundTags: s.traceInboundTagsForNode(nodeID, sess.Filter),
+	}
+	// A session that named users or lines but resolved to nothing on this
+	// node must NOT degrade into "capture everything here". Skip it instead.
+	if len(sess.Filter.UserIDs) > 0 && len(agentSess.UserNames) == 0 {
+		return model.TraceAgentSession{}, false
+	}
+	if len(sess.Filter.LineUUIDs) > 0 && len(agentSess.InboundTags) == 0 {
+		return model.TraceAgentSession{}, false
+	}
+	return agentSess, true
 }
 
 func (s *Server) handleAgentTraceConfig(w http.ResponseWriter, r *http.Request) {
@@ -856,19 +925,23 @@ func (s *Server) handleAgentTrace(w http.ResponseWriter, r *http.Request) {
 	// what it stored. Attribute what this batch actually delivered.
 	s.updateTraceSessionCounters(req.Batch, records, lines)
 
-	if req.Batch.Dropped > 0 || req.Batch.Unparsed > 0 {
-		// Both numbers are evidence of a gap, and a gap that is not recorded
-		// reads later as a quiet network. Unparsed in particular means sing-box
-		// changed its log format, which is the failure most easily mistaken for
-		// "nothing is happening".
+	if req.Batch.Dropped > 0 || req.Batch.Unparsed > 0 || req.Batch.ShedConnections > 0 {
+		// Every one of these numbers is evidence of a gap, and a gap that is
+		// not recorded reads later as a quiet network. Unparsed in particular
+		// means sing-box changed its log format, which is the failure most
+		// easily mistaken for "nothing is happening". Shed connections are
+		// whole connections the agent's budget refused to observe; the agent
+		// also counts them in dropped, so the session counters already charge
+		// them and a server that predates the field still audits the gap.
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:     id.New("audit"),
 			NodeID: req.NodeID,
 			Action: "trace.ingest.gap",
-			Reason: "the agent reported dropped or unparsed lines",
+			Reason: "the agent reported dropped or unparsed lines, or shed connections",
 			Metadata: map[string]string{
-				"dropped":  strconv.FormatUint(req.Batch.Dropped, 10),
-				"unparsed": strconv.FormatUint(req.Batch.Unparsed, 10),
+				"dropped":          strconv.FormatUint(req.Batch.Dropped, 10),
+				"unparsed":         strconv.FormatUint(req.Batch.Unparsed, 10),
+				"shed_connections": strconv.FormatUint(req.Batch.ShedConnections, 10),
 			},
 		})
 	}
@@ -997,6 +1070,36 @@ func (s *Server) ensureSingBoxLogSource(node model.Node) (model.LogSource, error
 		return model.LogSource{}, err
 	}
 	return ls, nil
+}
+
+// syncSingBoxLogSource makes a node's raw sing-box source follow the policy
+// being written: created, repaired and enabled while raw lines take effect,
+// disabled otherwise. Only the policy write calls it, where trace.policy.set
+// is audited; agent polls read the source and never change it.
+func (s *Server) syncSingBoxLogSource(node model.Node) error {
+	if !node.Trace.RawLinesEnabled() {
+		return s.quiesceSingBoxLogSource(node.ID)
+	}
+	if s.logStore == nil {
+		return nil
+	}
+	_, err := s.ensureSingBoxLogSource(node)
+	return err
+}
+
+// quiesceSingBoxLogSource disables a node's raw sing-box source while raw
+// lines are off, so /api/agent/logs refuses an agent that still holds the
+// source id with 409. Lines already stored stay until the per-source cap
+// evicts them: purging them would be deleting data, which is the
+// operator's call. It writes only on a change.
+func (s *Server) quiesceSingBoxLogSource(nodeID string) error {
+	ls, ok := s.store.LogSource(singBoxLogSourceID(nodeID))
+	if !ok || !ls.Enabled {
+		return nil
+	}
+	ls.Enabled = false
+	ls.UpdatedAt = s.now().UTC()
+	return s.store.UpsertLogSource(ls)
 }
 
 // approximateBatchBytes sizes a batch without re-encoding it. It is a charge

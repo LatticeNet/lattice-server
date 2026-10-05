@@ -992,7 +992,12 @@ func (s *Server) startTraceRetention() {
 				time.Sleep(traceRetentionRetryDelay)
 				continue
 			}
-			time.Sleep(traceRetentionInterval)
+			// An evidence settings save that lowered a cap or a TTL kicks
+			// the loop, so the new limit is enforced now, not within the hour.
+			select {
+			case <-time.After(traceRetentionInterval):
+			case <-s.traceRetentionKick:
+			}
 		}
 	}()
 }

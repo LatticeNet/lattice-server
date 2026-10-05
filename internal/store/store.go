@@ -118,6 +118,9 @@ type State struct {
 	// LatencyProbes is the operator's latency probe configuration
 	// (latency_probes.go), nil until one is saved. Written only on an edit.
 	LatencyProbes *model.LatencyProbeConfig `json:"latency_probes,omitempty"`
+	// EvidenceSettings are the operator's evidence budgets
+	// (evidence_settings.go), nil until saved. Written only on an edit.
+	EvidenceSettings *model.EvidenceSettings `json:"evidence_settings,omitempty"`
 	// NotifyWebhooks are operator-authored inbound entry points (notify_webhook.go).
 	// They hold a PBKDF2 secret hash, not a reversible secret, so unlike
 	// NotifyChannels they need no pass in crypto.go.

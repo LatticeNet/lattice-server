@@ -207,3 +207,43 @@ func TestSeqAssignedAndMonotonic(t *testing.T) {
 		t.Fatalf("seq should be monotonic 1,2 got %d,%d", seq1, seq2)
 	}
 }
+
+// TestSetSourceBytesCapEvictsOnTheNextAppend lowers the cap on an open store,
+// the way an evidence settings save does: nothing is evicted by the call, and
+// the source is brought under the new cap by its next append.
+func TestSetSourceBytesCapEvictsOnTheNextAppend(t *testing.T) {
+	s := openTest(t, nil, 0)
+	base := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	for i := range 40 {
+		line := fmt.Sprintf("line-%03d-padding-padding-padding", i)
+		if _, err := s.Append("src1", mkLines(base.Add(time.Duration(i)*time.Second), line), "r", uint64(i+1), base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _, _, _ := s.Stats("src1")
+	if before.Bytes <= 200 {
+		t.Fatalf("seed holds %d bytes; the test needs more than the new cap", before.Bytes)
+	}
+
+	s.SetSourceBytesCap(200)
+	if got := s.SourceBytesCap(); got != 200 {
+		t.Fatalf("SourceBytesCap() = %d, want 200", got)
+	}
+	if meta, _, _, _ := s.Stats("src1"); meta.Bytes != before.Bytes {
+		t.Fatalf("the call itself evicted: %d bytes, was %d", meta.Bytes, before.Bytes)
+	}
+
+	if _, err := s.Append("src1", mkLines(base.Add(time.Minute), "after-the-cap"), "r", 41, base); err != nil {
+		t.Fatal(err)
+	}
+	after, _, _, _ := s.Stats("src1")
+	if after.Bytes > 200 {
+		t.Fatalf("after the next append the source holds %d bytes, over the new cap of 200", after.Bytes)
+	}
+
+	// Zero or less restores the default, as at Open.
+	s.SetSourceBytesCap(0)
+	if got := s.SourceBytesCap(); got != DefaultMaxSourceBytes {
+		t.Fatalf("SourceBytesCap() after a zero cap = %d, want the default %d", got, DefaultMaxSourceBytes)
+	}
+}

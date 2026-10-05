@@ -413,6 +413,12 @@ type Server struct {
 	identityConvertFlights map[identityConvertFlightKey]*shareRenderFlight
 	identityFetches        identityLinkFetches
 	identityLinkConvert    func(context.Context, []string, shareRenderVariant) (renderedSubscription, error)
+	// traceRetentionKick asks the retention loop for a pass now, after an
+	// evidence settings save lowered a cap or a TTL (evidence_settings.go).
+	traceRetentionKick chan struct{}
+	// evidenceSettingsMu runs one evidence settings save at a time, so the
+	// stores end on the settings stored last (evidence_settings.go).
+	evidenceSettingsMu sync.Mutex
 	// cutoverMu runs one credential cutover rotate at a time
 	// (vpn_cutover.go), so a repeated POST sees the plan the first left.
 	cutoverMu sync.Mutex
@@ -813,6 +819,7 @@ func New(opts Options) (*Server, error) {
 		return nil, err
 	}
 	s.loadPlugins(opts.PluginDir, opts.PluginBundleCacheDir, opts.PluginTrust)
+	s.initEvidenceSettings()
 	s.selfmonUnavailable = opts.SelfMonitor.Unavailable
 	s.selfmon = newSelfMonitor(opts.SelfMonitor, s.logger, s.now,
 		func(id string) bool { _, ok := s.store.Node(id); return ok },
@@ -1446,6 +1453,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/trace/markers", s.withAuth("log:read", s.handleTraceMarkers))
 	mux.HandleFunc("/api/trace/hops", s.withAuth("log:read", s.handleTraceHops))
 	mux.HandleFunc("/api/trace/stats", s.withAuth("log:read", s.handleTraceStats))
+	mux.HandleFunc("/api/trace/rollups", s.withAuth("log:read", s.handleTraceRollups))
+	mux.HandleFunc("/api/evidence/settings", s.withAuth("", s.handleEvidenceSettings))
 	mux.HandleFunc("/api/tokens", s.withAuth("token:admin", s.handleTokens))
 	mux.HandleFunc("/api/tokens/revoke", s.withAuth("token:admin", s.handleRevokeToken))
 	mux.HandleFunc("/api/tokens/delete", s.withAuth("token:admin", s.handleDeleteToken))

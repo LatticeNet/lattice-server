@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -37,8 +38,8 @@ const (
 type Store struct {
 	db             *bolt.DB
 	cipher         secret.Cipher
-	maxSourceBytes uint64
-	mu             sync.Mutex // guards meta read-modify-write sequencing across Append calls
+	maxSourceBytes atomic.Uint64 // swapped live by SetSourceBytesCap
+	mu             sync.Mutex    // guards meta read-modify-write sequencing across Append calls
 }
 
 // Meta is the per-source bookkeeping record (also the stats projection).
@@ -94,7 +95,9 @@ func Open(path string, cipher secret.Cipher, maxSourceBytes int64) (*Store, erro
 	if cipher == nil {
 		cipher = secret.Disabled()
 	}
-	return &Store{db: db, cipher: cipher, maxSourceBytes: cap_}, nil
+	s := &Store{db: db, cipher: cipher}
+	s.maxSourceBytes.Store(cap_)
+	return s, nil
 }
 
 // Close releases the underlying database.
@@ -182,8 +185,11 @@ func (s *Store) Append(sourceID string, lines []model.LogLine, rotID string, las
 
 // evictToCap deletes oldest chunks until meta.Bytes <= cap. It must run inside
 // the same write tx as the append so the store is never observed over cap.
+// The cap is read once per append; a cap lowered by SetSourceBytesCap shrinks
+// a source on its next append, which is the only time bbolt eviction runs.
 func (s *Store) evictToCap(data *bolt.Bucket, meta *Meta) error {
-	for meta.Bytes > s.maxSourceBytes && meta.FirstSeq <= meta.LastSeq {
+	limit := s.maxSourceBytes.Load()
+	for meta.Bytes > limit && meta.FirstSeq <= meta.LastSeq {
 		key := be64(meta.FirstSeq)
 		v := data.Get(key)
 		if v == nil {
@@ -395,7 +401,17 @@ func (s *Store) decodeChunk(stored []byte) ([]model.LogLine, error) {
 }
 
 // SourceBytesCap reports the configured per-source byte cap (for diagnostics).
-func (s *Store) SourceBytesCap() uint64 { return s.maxSourceBytes }
+func (s *Store) SourceBytesCap() uint64 { return s.maxSourceBytes.Load() }
+
+// SetSourceBytesCap replaces the per-source byte cap. n <= 0 restores
+// DefaultMaxSourceBytes, matching Open. Nothing is evicted by the call
+// itself: each source is brought under the new cap on its next append.
+func (s *Store) SetSourceBytesCap(n int64) {
+	if n <= 0 {
+		n = DefaultMaxSourceBytes
+	}
+	s.maxSourceBytes.Store(uint64(n))
+}
 
 // EnvMaxSourceBytes parses an optional per-source byte cap override.
 func EnvMaxSourceBytes(raw string) int64 {

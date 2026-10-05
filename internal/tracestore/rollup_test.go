@@ -1,6 +1,7 @@
 package tracestore
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
@@ -220,5 +221,315 @@ func TestRollupsAreAscendingAndClamped(t *testing.T) {
 	}
 	if n := len(mustRollups(t, s, RollupFilter{Limit: -1})); n != 12 {
 		t.Errorf("a negative limit returned %d buckets, want the default page", n)
+	}
+}
+
+func mustRollupSeries(t *testing.T, s *Store, f RollupSeriesFilter) ([]RollupPoint, time.Time, bool) {
+	t.Helper()
+	points, retainedFrom, truncated, err := s.RollupSeries(f)
+	if err != nil {
+		t.Fatalf("RollupSeries: %v", err)
+	}
+	return points, retainedFrom, truncated
+}
+
+// TestRollupSeriesCoarsensToTheStep sums every five-minute bucket inside one
+// step into one point, per key, and leaves a step with nothing in it absent.
+func TestRollupSeriesCoarsensToTheStep(t *testing.T) {
+	s := newStore(t, Options{})
+	hour := t0 // 12:00, on an hour boundary
+	mk := func(id uint32, node string, at time.Time, reason string, up, down int64, known bool) model.ConnRecord {
+		r := rec(node, id, at)
+		r.CloseReason = reason
+		r.BytesKnown, r.Upload, r.Download = known, up, down
+		return r
+	}
+	mustAppend(t, s,
+		mk(1, "n1", hour.Add(1*time.Minute), model.CloseEOF, 10, 100, true),
+		mk(2, "n1", hour.Add(17*time.Minute), model.CloseReset, 5, 50, true),
+		mk(3, "n1", hour.Add(59*time.Minute), model.CloseEOF, 99, 99, false),
+		mk(4, "n2", hour.Add(30*time.Minute), model.CloseTimeout, 1, 2, true),
+		// 13:00 is empty; 14:xx has one connection on n1.
+		mk(5, "n1", hour.Add(2*time.Hour+5*time.Minute), model.CloseEOF, 7, 8, true),
+	)
+	points, _, truncated := mustRollupSeries(t, s, RollupSeriesFilter{
+		Since: hour, Until: hour.Add(3 * time.Hour), Step: time.Hour, GroupBy: RollupGroupNode,
+	})
+	if truncated {
+		t.Fatal("two keys under the default ceiling reported truncated")
+	}
+	type want struct {
+		key                 string
+		at                  time.Time
+		conns, known, up, d int64
+		reasons             map[string]int64
+	}
+	wants := []want{
+		// n1 has four connections, n2 one, so n1's series comes first.
+		{"n1", hour, 3, 2, 15, 150, map[string]int64{model.CloseEOF: 2, model.CloseReset: 1}},
+		{"n1", hour.Add(2 * time.Hour), 1, 1, 7, 8, map[string]int64{model.CloseEOF: 1}},
+		{"n2", hour, 1, 1, 1, 2, map[string]int64{model.CloseTimeout: 1}},
+	}
+	if len(points) != len(wants) {
+		t.Fatalf("got %d points, want %d: %+v", len(points), len(wants), points)
+	}
+	for i, w := range wants {
+		p := points[i]
+		if p.Key != w.key || !p.BucketStart.Equal(w.at) {
+			t.Fatalf("point %d is %s at %v, want %s at %v", i, p.Key, p.BucketStart, w.key, w.at)
+		}
+		if p.Connections != w.conns || p.BytesKnownCount != w.known || p.Upload != w.up || p.Download != w.d {
+			t.Errorf("point %d = %+v, want conns %d known %d up %d down %d", i, p, w.conns, w.known, w.up, w.d)
+		}
+		if len(p.CloseReasons) != len(w.reasons) {
+			t.Fatalf("point %d reasons = %v, want %v", i, p.CloseReasons, w.reasons)
+		}
+		for reason, n := range w.reasons {
+			if p.CloseReasons[reason] != n {
+				t.Errorf("point %d reason %s = %d, want %d", i, reason, p.CloseReasons[reason], n)
+			}
+		}
+	}
+}
+
+// TestRollupSeriesTruncatesSinceToTheStep makes the leading step whole: a
+// window that starts mid-step still counts the step it starts in from the
+// step's beginning, rather than dropping or halving it.
+func TestRollupSeriesTruncatesSinceToTheStep(t *testing.T) {
+	s := newStore(t, Options{})
+	mustAppend(t, s,
+		rec("n1", 1, t0.Add(5*time.Minute)),
+		rec("n1", 2, t0.Add(50*time.Minute)),
+	)
+	points, _, _ := mustRollupSeries(t, s, RollupSeriesFilter{
+		Since: t0.Add(40 * time.Minute), Until: t0.Add(2 * time.Hour), Step: time.Hour, GroupBy: RollupGroupNode,
+	})
+	if len(points) != 1 || !points[0].BucketStart.Equal(t0) || points[0].Connections != 2 {
+		t.Fatalf("points = %+v, want one point at %v with both connections", points, t0)
+	}
+
+	// Until is exclusive: a bucket starting exactly at Until is the next window's.
+	points, _, _ = mustRollupSeries(t, s, RollupSeriesFilter{
+		Since: t0, Until: t0.Add(5 * time.Minute), Step: RollupBucket, GroupBy: RollupGroupNode,
+	})
+	if len(points) != 0 {
+		t.Fatalf("points = %+v, want none: the only buckets start at or after Until", points)
+	}
+
+	for _, bad := range []RollupSeriesFilter{
+		{Since: t0, Until: t0.Add(time.Hour), Step: 7 * time.Minute, GroupBy: RollupGroupNode},
+		{Since: t0, Until: t0.Add(time.Hour), Step: 0, GroupBy: RollupGroupNode},
+		{Since: t0, Until: t0.Add(time.Hour), Step: time.Hour, GroupBy: "dst"},
+		{Since: t0, Until: t0, Step: time.Hour, GroupBy: RollupGroupNode},
+	} {
+		if _, _, _, err := s.RollupSeries(bad); err == nil {
+			t.Errorf("RollupSeries(%+v) accepted a bad request", bad)
+		}
+	}
+}
+
+// TestRollupSeriesReasonPassMatchesGoDecoding checks the series' reason sums,
+// which come from a hand parser of close_reasons, against decodeReasons
+// (encoding/json) over the same rows.
+func TestRollupSeriesReasonPassMatchesGoDecoding(t *testing.T) {
+	s := newStore(t, Options{})
+	reasons := []string{model.CloseEOF, model.CloseReset, model.CloseTimeout, model.CloseAuthFailed, ""}
+	batch := []model.ConnRecord{}
+	for i := range 90 {
+		r := rec([]string{"n1", "n2", "n3"}[i%3], uint32(i+1), t0.Add(time.Duration(i)*3*time.Minute))
+		r.UserID = []string{"u1", "u2", ""}[i%3]
+		r.CloseReason = reasons[i%len(reasons)]
+		batch = append(batch, r)
+	}
+	mustAppend(t, s, batch...)
+
+	want := map[string]int64{}
+	for _, r := range mustRollups(t, s, RollupFilter{}) {
+		for reason, n := range r.CloseReasons {
+			want[reason] += n
+		}
+	}
+
+	points, _, _ := mustRollupSeries(t, s, RollupSeriesFilter{
+		Since: t0, Until: t0.Add(24 * time.Hour), Step: 24 * time.Hour, GroupBy: RollupGroupReason,
+	})
+	got := map[string]int64{}
+	var total int64
+	for _, p := range points {
+		if len(p.CloseReasons) != 0 {
+			t.Errorf("a reason point carries close reasons: %+v", p)
+		}
+		got[p.Key] += p.Connections
+		total += p.Connections
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reasons = %v, want %v", got, want)
+	}
+	for reason, n := range want {
+		if got[reason] != n {
+			t.Errorf("reason %q = %d, want %d", reason, got[reason], n)
+		}
+	}
+	if total != int64(len(batch)) {
+		t.Errorf("reason counts sum to %d, want %d connections", total, len(batch))
+	}
+
+	// The per-key reasons on a node series agree with the same decoding.
+	byNode, _, _ := mustRollupSeries(t, s, RollupSeriesFilter{
+		Since: t0, Until: t0.Add(24 * time.Hour), Step: 24 * time.Hour, GroupBy: RollupGroupUser,
+	})
+	seenUnattributed := false
+	for _, p := range byNode {
+		var sum int64
+		for _, n := range p.CloseReasons {
+			sum += n
+		}
+		if sum != p.Connections {
+			t.Errorf("user %q: reasons sum to %d, connections %d", p.Key, sum, p.Connections)
+		}
+		if p.Key == "" {
+			seenUnattributed = true
+		}
+	}
+	if !seenUnattributed {
+		t.Error("the unattributed user is missing from a per-user series")
+	}
+}
+
+// TestRollupSeriesKeepsTheLargestKeys bounds the answer and keeps the series
+// with the most connections, including the unattributed key when it is
+// among them.
+func TestRollupSeriesKeepsTheLargestKeys(t *testing.T) {
+	s := newStore(t, Options{})
+	batch := []model.ConnRecord{}
+	id := uint32(0)
+	add := func(user string, n int) {
+		for range n {
+			id++
+			r := rec("n1", id, t0.Add(time.Duration(id)*time.Second))
+			r.UserID = user
+			batch = append(batch, r)
+		}
+	}
+	add("", 5)
+	add("u-big", 4)
+	add("u-mid", 3)
+	add("u-small", 1)
+	mustAppend(t, s, batch...)
+
+	points, _, truncated := mustRollupSeries(t, s, RollupSeriesFilter{
+		Since: t0, Until: t0.Add(time.Hour), Step: time.Hour, GroupBy: RollupGroupUser, MaxSeries: 2,
+	})
+	if !truncated {
+		t.Fatal("four keys under a ceiling of two were not reported truncated")
+	}
+	if len(points) != 2 || points[0].Key != "" || points[1].Key != "u-big" {
+		t.Fatalf("points = %+v, want the unattributed key then u-big", points)
+	}
+}
+
+// TestRollupSeriesRetainedFromFollowsTheNodes reports the oldest bucket held
+// for the requested nodes, whatever the window.
+func TestRollupSeriesRetainedFromFollowsTheNodes(t *testing.T) {
+	s := newStore(t, Options{})
+	mustAppend(t, s,
+		rec("n1", 1, t0.Add(-48*time.Hour)),
+		rec("n2", 2, t0.Add(-2*time.Hour)),
+		rec("n2", 3, t0),
+	)
+	_, all, _ := mustRollupSeries(t, s, RollupSeriesFilter{Since: t0, Until: t0.Add(time.Hour), Step: time.Hour, GroupBy: RollupGroupNode})
+	if want := t0.Add(-48 * time.Hour).Truncate(RollupBucket); !all.Equal(want) {
+		t.Errorf("retained from %v, want %v", all, want)
+	}
+	_, n2, _ := mustRollupSeries(t, s, RollupSeriesFilter{Since: t0, Until: t0.Add(time.Hour), Step: time.Hour, GroupBy: RollupGroupNode, NodeIDs: []string{"n2", "n-none"}})
+	if want := t0.Add(-2 * time.Hour); !n2.Equal(want) {
+		t.Errorf("retained from for n2 = %v, want %v", n2, want)
+	}
+	_, none, _ := mustRollupSeries(t, s, RollupSeriesFilter{Since: t0, Until: t0.Add(time.Hour), Step: time.Hour, GroupBy: RollupGroupNode, NodeIDs: []string{"n-none"}})
+	if !none.IsZero() {
+		t.Errorf("retained from for a node with no rollups = %v, want zero", none)
+	}
+}
+
+// TestRollupSeriesReadsAlikeThroughEitherPath reads one window both ways: a
+// fleet-wide read over most of the span walks the table by rowid, while a
+// read filtered to a few nodes goes through the per-node index. The answers
+// must be identical, including rows written out of time order, which the
+// rowid walk meets in insertion order.
+func TestRollupSeriesReadsAlikeThroughEitherPath(t *testing.T) {
+	s := newStore(t, Options{})
+	nodes := []string{"n1", "n2", "n3"}
+	reasons := []string{model.CloseEOF, model.CloseReset, model.CloseTimeout}
+	batch := []model.ConnRecord{}
+	for i := range 240 {
+		// Every other record lands a day earlier than its neighbours, so
+		// rowid order and bucket order disagree.
+		at := t0.Add(time.Duration(i) * 7 * time.Minute)
+		if i%2 == 1 {
+			at = at.Add(-24 * time.Hour)
+		}
+		r := rec(nodes[i%3], uint32(i+1), at)
+		r.UserID = []string{"u1", "u2", ""}[i%3]
+		r.CloseReason = reasons[i%3]
+		r.BytesKnown, r.Upload, r.Download = i%2 == 0, int64(i), int64(10*i)
+		batch = append(batch, r)
+	}
+	for start := 0; start < len(batch); start += 40 {
+		mustAppend(t, s, batch[start:start+40]...)
+	}
+	// The whole span, then a window that still covers most of it (so the
+	// fleet-wide read still walks the table) but cuts off its first half day.
+	for _, since := range []time.Time{t0.Add(-48 * time.Hour), t0.Add(-12 * time.Hour)} {
+		window := RollupSeriesFilter{Since: since, Until: t0.Add(48 * time.Hour), Step: time.Hour, GroupBy: RollupGroupNode}
+		walked, _, _ := mustRollupSeries(t, s, window)
+		window.NodeIDs = nodes // three nodes: the per-node index path
+		indexed, _, _ := mustRollupSeries(t, s, window)
+		if len(walked) == 0 {
+			t.Fatal("no points")
+		}
+		if !reflect.DeepEqual(walked, indexed) {
+			t.Fatalf("since %v: the rowid walk and the index read disagree:\nwalk  %+v\nindex %+v", since, walked, indexed)
+		}
+		var total int64
+		want := int64(0)
+		for _, r := range batch {
+			if !r.StartedAt.Before(since) {
+				want++
+			}
+		}
+		for _, p := range walked {
+			total += p.Connections
+		}
+		if total != want {
+			t.Errorf("since %v: points sum to %d connections, want %d", since, total, want)
+		}
+	}
+}
+
+// TestParseFlatCountsFallsBackOnAnythingUnexpected keeps the hand parser
+// honest: it reads exactly the documents applyRollupDeltas writes and hands
+// everything else to encoding/json.
+func TestParseFlatCountsFallsBackOnAnythingUnexpected(t *testing.T) {
+	for raw, want := range map[string]map[string]int64{
+		`{}`:                    {},
+		`{"eof":3,"reset":-1}`:  {"eof": 3, "reset": -1},
+		`{"":2}`:                {"": 2},
+		`{ "eof": 3 }`:          {"eof": 3},
+		`{"e\u006ff":4}`:        {"eof": 4},
+		`{"x":123456789012345}`: {"x": 123456789012345},
+	} {
+		got := map[string]int64{}
+		if err := addReasonCounts(got, []byte(raw), func(b []byte) string { return string(b) }); err != nil {
+			t.Errorf("%s: %v", raw, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: got %v, want %v", raw, got, want)
+		}
+	}
+	for _, bad := range []string{`{"eof":1.5}`, `[1]`, `{"eof":"x"}`} {
+		if err := addReasonCounts(map[string]int64{}, []byte(bad), func(b []byte) string { return string(b) }); err == nil {
+			t.Errorf("%q was accepted", bad)
+		}
 	}
 }

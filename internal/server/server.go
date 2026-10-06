@@ -10128,18 +10128,28 @@ func apiErrorCode(status int) string {
 	}
 }
 
+// clientFacingError marks a server-side error whose message was written for
+// the operator: it names a limit the operator can act on, not an internal
+// fault. apiErrorMessage sends its text even with a 5xx status and keeps
+// masking every other 5xx, whose text can carry internal detail.
+type clientFacingError struct{ err error }
+
+func (e clientFacingError) Error() string { return e.err.Error() }
+
+func (e clientFacingError) Unwrap() error { return e.err }
+
 func apiErrorMessage(status int, err error) string {
-	switch status {
-	case http.StatusBadGateway:
-		return "upstream service error"
-	case http.StatusInternalServerError:
-		return "internal server error"
-	default:
-		if status >= 500 {
-			return "internal server error"
-		}
+	if status < 500 {
 		return err.Error()
 	}
+	var visible clientFacingError
+	if errors.As(err, &visible) {
+		return visible.Error()
+	}
+	if status == http.StatusBadGateway {
+		return "upstream service error"
+	}
+	return "internal server error"
 }
 
 // validateStorageName rejects names that would collide or corrupt the composite

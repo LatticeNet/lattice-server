@@ -556,8 +556,8 @@ func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) (agentArt
 		used += len(obj.Content)
 	}
 	if used+len(encoded) > maxAgentArtifactStoreBytes {
-		return agentArtifactView{}, fmt.Errorf("%w: %d bytes stored plus %d new exceeds the %d byte cap; delete an older version first",
-			errAgentArtifactStoreFull, used, len(encoded), maxAgentArtifactStoreBytes)
+		return agentArtifactView{}, fmt.Errorf("%w: %d of the %d byte cap is in use and this binary needs %d more; delete a stored artifact first, then retry",
+			errAgentArtifactStoreFull, used, maxAgentArtifactStoreBytes, len(encoded))
 	}
 	if err := s.store.PutStatic(model.StaticObject{
 		Bucket:      agentArtifactBucket,
@@ -594,7 +594,9 @@ func (s *Server) writeAgentArtifactStoreError(w http.ResponseWriter, err error) 
 	case errors.Is(err, errAgentArtifactDigestMismatch):
 		writeError(w, http.StatusBadRequest, err)
 	case errors.Is(err, errAgentArtifactStoreFull):
-		writeError(w, http.StatusInsufficientStorage, err)
+		// 507 alone reads as "internal server error"; the operator needs the
+		// usage and the way out, and the message holds nothing internal.
+		writeError(w, http.StatusInsufficientStorage, clientFacingError{err})
 	default:
 		writeError(w, http.StatusInternalServerError, err)
 	}

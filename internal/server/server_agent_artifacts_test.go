@@ -7,9 +7,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -664,5 +667,72 @@ func TestStoreAgentArtifactRefusesToGrowPastItsCap(t *testing.T) {
 	}
 	if !strings.Contains(lastErr.Error(), "cap") {
 		t.Fatalf("error %q does not explain the storage cap", lastErr)
+	}
+}
+
+// A full artifact store answers 507 with the usage and the way out. Every
+// other 5xx keeps its masked message: only the store-full error is marked as
+// written for the operator.
+func TestAgentArtifactStoreFullTellsTheOperatorWhatToDo(t *testing.T) {
+	_, handler, st := newAgentArtifactServer(t)
+	const used = maxAgentArtifactStoreBytes - 1024
+	if err := st.PutStatic(model.StaticObject{
+		Bucket: agentArtifactBucket, Path: "0.3.1/linux/arm64/" + strings.Repeat("a", 64),
+		Content: strings.Repeat("A", used), ContentType: agentArtifactContentType,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data, digest := testAgentBinary()
+	cookies, csrf := loginSession(t, handler)
+	req := httptest.NewRequest(http.MethodPost, "/api/nodes/agent-updates/artifacts?version=0.3.4&os=linux&arch=amd64&sha256="+digest, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Lattice-CSRF", csrf)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("upload into a full store: %d %s", rec.Code, rec.Body.String())
+	}
+	var body model.APIErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodedLen(len(data))
+	for _, want := range []string{
+		"agent release storage is full",
+		strconv.Itoa(used) + " of the " + strconv.Itoa(maxAgentArtifactStoreBytes) + " byte cap is in use",
+		"needs " + strconv.Itoa(encoded) + " more",
+		"delete a stored artifact first",
+	} {
+		if !strings.Contains(body.Error.Message, want) {
+			t.Fatalf("message %q lacks %q", body.Error.Message, want)
+		}
+	}
+	if len(st.Static(agentArtifactBucket)) != 1 {
+		t.Fatal("a refused upload was stored")
+	}
+
+	// The mask still holds for every other server error, 507 included.
+	for _, tc := range []struct {
+		status int
+		err    error
+		want   string
+	}{
+		{http.StatusInternalServerError, errors.New("open /var/lib/lattice/state.json: permission denied"), "internal server error"},
+		{http.StatusInsufficientStorage, errors.New("disk /dev/sda1 is full"), "internal server error"},
+		{http.StatusBadGateway, errors.New("dial tcp 10.0.0.1:443: refused"), "upstream service error"},
+		{http.StatusInternalServerError, fmt.Errorf("store: %w", errAgentArtifactStoreFull), "internal server error"},
+	} {
+		rec := httptest.NewRecorder()
+		writeError(rec, tc.status, tc.err)
+		var got model.APIErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Error.Message != tc.want {
+			t.Fatalf("%d %q answered %q, want %q", tc.status, tc.err, got.Error.Message, tc.want)
+		}
 	}
 }

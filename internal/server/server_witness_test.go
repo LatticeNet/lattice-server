@@ -512,7 +512,7 @@ func TestWitnessDecisionRefusesPlanFilesThatDoNotCheckOut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := witnessConfigureFiles(base); err != nil {
+	if _, _, err := f.srv.witnessConfigureFiles(base); err != nil {
 		t.Fatalf("the plan this server made does not check out: %v", err)
 	}
 	headerSHA := approvalPlanField(base.Plan, witnessFieldConfigSHA)

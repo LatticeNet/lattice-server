@@ -1,0 +1,82 @@
+Control-plane witness: configure on [cd]-gomami-jpn-pulse-nano (node-w)
+
+The witness is `lattice-agent -witness`, its own process under
+lattice-witness.service on this node. Every 30 s it asks:
+  https://lattice.example.test/readyz
+After 180 s of failures while a reference URL still answers, it pushes one
+Bark message (level critical) through the bark-server at http://127.0.0.1:7001,
+then one recovery once the control plane has answered for 60 s.
+When the control plane and every reference fail together, the node's own
+network is down and it pushes nothing. References:
+  https://www.cloudflare.com/cdn-cgi/trace
+  https://www.apple.com/library/test/success.html
+It holds no node token, sends no fleet data, and reads nothing but its config
+and the key file. The agent relays its status file on the heartbeat.
+
+device_key_channel_id: nc-bark
+device_key_channel: Bark urgent (bark)
+device_key_sha256_prefix: 41b88fb74e0a
+device_key_file: /etc/lattice-witness/bark-device-key (0600, root)
+config_sha256: 40a2a8d5bc9daf3a1d4c7fa4a01a2bb8f9f7791b4d9c116c0cdbd469d42be30a
+
+The key is not in this plan. Approving re-reads the channel above and refuses
+when its key no longer matches that prefix; the apply task writes the key to
+the file and never prints it.
+
+Steps on the node:
+1. Refuse unless systemd runs and the agent binary lists
+   control-plane-witness-v1 in -compat-json.
+2. Copy that binary to /usr/local/lib/lattice-witness/lattice-agent (0755), so an
+   agent update or rollback never changes the witness; only a new plan does.
+3. Write the key file, then the config below to /etc/lattice-witness/witness.json (0600).
+4. Run the copy with -witness-check on that config; stop if it fails.
+5. Write the unit below, daemon-reload, enable and restart lattice-witness.service,
+   and require it active.
+
+--- file /etc/lattice-witness/witness.json
+{
+  "version": 1,
+  "node_name": "[cd]-gomami-jpn-pulse-nano",
+  "health_url": "https://lattice.example.test/readyz",
+  "reference_urls": [
+    "https://www.cloudflare.com/cdn-cgi/trace",
+    "https://www.apple.com/library/test/success.html"
+  ],
+  "bark_url": "http://127.0.0.1:7001",
+  "bark_device_key_file": "/etc/lattice-witness/bark-device-key",
+  "bark_group": "lattice-witness",
+  "bark_level": "critical",
+  "interval_seconds": 30,
+  "hold_seconds": 180,
+  "recover_seconds": 60,
+  "state_file": "/var/lib/lattice-witness/status.json"
+}
+--- file /etc/systemd/system/lattice-witness.service
+[Unit]
+Description=Lattice control-plane witness
+Documentation=https://github.com/LatticeNet/lattice-node-agent#control-plane-witness
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/lattice-witness/lattice-agent -witness /etc/lattice-witness/witness.json
+Restart=always
+RestartSec=10
+StateDirectory=lattice-witness
+StateDirectoryMode=0755
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
+--- end

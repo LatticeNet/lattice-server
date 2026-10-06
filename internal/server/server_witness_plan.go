@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,9 +24,10 @@ import (
 //
 // Lattice cannot report its own outage. The witness is `lattice-agent
 // -witness` on one chosen node (lattice-node-agent internal/witness): it polls
-// this server's public /readyz and, when that keeps failing while the node's
-// own network works, pushes one message through the bark-server on that
-// node's loopback interface. This file is the only way its unit, config and
+// this server's public /readyz, or the health URL the operator set in its
+// place, and, when that keeps failing while the node's own network works,
+// pushes one message through the bark-server on that node's loopback
+// interface. This file is the only way its unit, config and
 // device key reach the node: an approved plan, never a hand edit (r1-critic
 // X-8).
 //
@@ -122,6 +124,11 @@ type witnessPlanRequest struct {
 	IntervalSeconds int      `json:"interval_seconds,omitempty"`
 	HoldSeconds     int      `json:"hold_seconds,omitempty"`
 	RecoverSeconds  int      `json:"recover_seconds,omitempty"`
+	// HealthURL replaces <public URL>/readyz when set: the same readiness
+	// endpoint under another name, for a node that cannot reach the control
+	// plane's own address (a CDN-proxied hostname whose vhost serves only
+	// /readyz). checkWitnessHealthOverride holds it to that shape.
+	HealthURL string `json:"health_url,omitempty"`
 }
 
 // witnessHealthURL is the control plane's readiness endpoint as any client
@@ -132,6 +139,77 @@ func (s *Server) witnessHealthURL() (string, error) {
 		return "", errors.New("this server has no public URL (LATTICE_PUBLIC_URL); the witness watches the control plane the way clients reach it, so set it first")
 	}
 	return base + "/readyz", nil
+}
+
+// checkWitnessHealthOverride is what an operator's health URL must be on top
+// of checkWitnessWatchURL: https, the path /readyz exactly, and nothing else,
+// so it can only ever name a readiness check, never an arbitrary page whose
+// answer would read as "the control plane is up".
+func checkWitnessHealthOverride(raw string) error {
+	if err := checkWitnessWatchURL("health_url", raw); err != nil {
+		return err
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("health_url must be an absolute URL")
+	}
+	if u.Scheme != "https" {
+		return errors.New("health_url must use https")
+	}
+	// url.Parse takes any run of digits as a port; a browser, and the
+	// console's check, refuse one outside 1 to 65535.
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return errors.New("health_url must have a port between 1 and 65535")
+		}
+	}
+	if u.EscapedPath() != "/readyz" {
+		return errors.New("health_url must have the path /readyz and nothing more")
+	}
+	if strings.ContainsAny(raw, "?#") {
+		return errors.New("health_url must not carry a query or a fragment")
+	}
+	return nil
+}
+
+// checkWitnessHealthAgainstServer holds a config whose health URL is not this
+// server's own <public URL>/readyz to the override rules, at plan time and
+// again when the plan is decided and applied. validateWitnessConfig keeps the
+// references off the health URL's host; with an override the control plane
+// has a second name, and a reference on its public host proves nothing about
+// the node's own network either. A config that watches the default passes
+// untouched, so a plan filed before the override existed decides as it did.
+func (s *Server) checkWitnessHealthAgainstServer(doc witnessConfigDoc) error {
+	derived, _ := s.witnessHealthURL()
+	if doc.HealthURL == derived {
+		return nil
+	}
+	if err := checkWitnessHealthOverride(doc.HealthURL); err != nil {
+		return err
+	}
+	if derived == "" {
+		return nil
+	}
+	for i, ref := range doc.ReferenceURLs {
+		if witnessSameHost(ref, derived) {
+			return fmt.Errorf("reference_urls[%d] is on the control plane's public host; a reference must prove the node's network by another path", i)
+		}
+	}
+	return nil
+}
+
+// witnessHealthNote is the plan line under a health URL the operator set;
+// empty when the witness watches the default, so such a plan renders exactly
+// as it did before the override existed.
+func witnessHealthNote(healthURL, derived string) string {
+	switch {
+	case healthURL == derived:
+		return ""
+	case derived == "":
+		return "Set by the operator; this server has no public URL (LATTICE_PUBLIC_URL) to derive one from"
+	default:
+		return "Set by the operator, in place of " + witnessPlanLine(derived)
+	}
 }
 
 // witnessConfigFromRequest fills defaults and validates the document exactly
@@ -348,10 +426,13 @@ const (
 	witnessEndMarker      = "--- end"
 )
 
-func renderWitnessConfigurePlan(node model.Node, doc witnessConfigDoc, config, unit string, channel model.NotifyChannel, keyPrefix string) string {
+func renderWitnessConfigurePlan(node model.Node, doc witnessConfigDoc, config, unit string, channel model.NotifyChannel, keyPrefix, healthNote string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Control-plane witness: configure on %s (%s)\n\n", witnessPlanLine(node.Name), node.ID)
 	fmt.Fprintf(&b, "The witness is `lattice-agent -witness`, its own process under\n%s on this node. Every %d s it asks:\n  %s\n", witnessUnitName, doc.IntervalSeconds, doc.HealthURL)
+	if healthNote != "" {
+		b.WriteString(healthNote + "\n")
+	}
 	fmt.Fprintf(&b, "After %d s of failures while a reference URL still answers, it pushes one\n", doc.HoldSeconds)
 	fmt.Fprintf(&b, "Bark message (level %s) through the bark-server at %s,\n", doc.BarkLevel, doc.BarkURL)
 	fmt.Fprintf(&b, "then one recovery once the control plane has answered for %d s.\n", doc.RecoverSeconds)
@@ -452,12 +533,13 @@ func (s *Server) witnessApprovalKey(a model.Approval) (string, error) {
 // witnessConfigureFiles reads a configure plan's files back and checks them
 // as strictly as when the plan was made: the unit must be the one this server
 // renders, the config must be a valid witness config in exactly the form this
-// server renders, with the key file and state file the scripts expect, and
+// server renders, with the key file and state file the scripts expect, a
+// health URL other than the default must still meet the override rules, and
 // its SHA-256 must be the one the plan's header shows the reviewer. Only
 // handleWitnessPlan files these approvals today, so this is defence in depth:
 // the unit runs as root, and the header and the files must not be able to
 // say different things.
-func witnessConfigureFiles(a model.Approval) (config, unit string, err error) {
+func (s *Server) witnessConfigureFiles(a model.Approval) (config, unit string, err error) {
 	config, unit, err = witnessPlanFiles(a.Plan)
 	if err != nil {
 		return "", "", err
@@ -478,6 +560,9 @@ func witnessConfigureFiles(a model.Approval) (config, unit string, err error) {
 	if err := validateWitnessConfig(doc); err != nil {
 		return "", "", fmt.Errorf("witness plan: %w", err)
 	}
+	if err := s.checkWitnessHealthAgainstServer(doc); err != nil {
+		return "", "", fmt.Errorf("witness plan: %w; re-plan the witness", err)
+	}
 	if want := approvalPlanField(a.Plan, witnessFieldConfigSHA); want != witnessConfigSHA(config) {
 		return "", "", errors.New("witness plan: the config's SHA-256 is not the one the plan shows; re-plan the witness")
 	}
@@ -491,7 +576,7 @@ func (s *Server) requireCurrentWitnessApproval(a model.Approval) error {
 	if a.Action != witnessConfigureAction {
 		return nil
 	}
-	if _, _, err := witnessConfigureFiles(a); err != nil {
+	if _, _, err := s.witnessConfigureFiles(a); err != nil {
 		return err
 	}
 	_, err := s.witnessApprovalKey(a)
@@ -507,7 +592,7 @@ func (s *Server) witnessApplyScript(a model.Approval) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown witness action %q", a.Action)
 	}
-	config, unit, err := witnessConfigureFiles(a)
+	config, unit, err := s.witnessConfigureFiles(a)
 	if err != nil {
 		return "", err
 	}
@@ -627,9 +712,18 @@ func (s *Server) handleWitnessPlan(w http.ResponseWriter, r *http.Request, p pri
 			writeError(w, http.StatusConflict, fmt.Errorf("%s has not advertised %s; update its agent to a release with witness mode and let it heartbeat first", witnessPlanLine(node.Name), witnessCapability))
 			return
 		}
-		healthURL, err := s.witnessHealthURL()
-		if err != nil {
-			writeError(w, http.StatusConflict, err)
+		// The default is <public URL>/readyz; an operator's health URL
+		// replaces it and needs no public URL of its own.
+		derived, derivedErr := s.witnessHealthURL()
+		healthURL := strings.TrimSpace(req.HealthURL)
+		if healthURL == "" {
+			if derivedErr != nil {
+				writeError(w, http.StatusConflict, derivedErr)
+				return
+			}
+			healthURL = derived
+		} else if err := checkWitnessHealthOverride(healthURL); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		channel, ok := s.notifyChannelByID(strings.TrimSpace(req.ChannelID))
@@ -647,6 +741,9 @@ func (s *Server) handleWitnessPlan(w http.ResponseWriter, r *http.Request, p pri
 			return
 		}
 		doc, err := witnessConfigFromRequest(req, node.Name, healthURL)
+		if err == nil {
+			err = s.checkWitnessHealthAgainstServer(doc)
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -657,10 +754,14 @@ func (s *Server) handleWitnessPlan(w http.ResponseWriter, r *http.Request, p pri
 			return
 		}
 		approval.Action = witnessConfigureAction
-		approval.Plan = renderWitnessConfigurePlan(node, doc, config, renderWitnessUnit(), channel, witnessKeyPrefix(key))
+		healthNote := witnessHealthNote(doc.HealthURL, derived)
+		approval.Plan = renderWitnessConfigurePlan(node, doc, config, renderWitnessUnit(), channel, witnessKeyPrefix(key), healthNote)
 		metadata["action"] = "configure"
 		metadata["channel_id"] = channel.ID
 		metadata["config_sha256"] = witnessConfigSHA(config)
+		if healthNote != "" {
+			metadata["health_url"] = doc.HealthURL
+		}
 	}
 	approval, err := s.submitApproval(r.Context(), approval)
 	if err != nil {

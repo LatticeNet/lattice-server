@@ -182,6 +182,9 @@ func TestWitnessHealthURLOverrideRefusals(t *testing.T) {
 		"fragment":            {`"health_url":"https://lattice-ready.example.test/readyz#top"`, "fragment"},
 		"empty fragment":      {`"health_url":"https://lattice-ready.example.test/readyz#"`, "fragment"},
 		"credentials":         {`"health_url":"https://ops:secret@lattice-ready.example.test/readyz"`, "credentials"},
+		"port zero":           {`"health_url":"https://lattice-ready.example.test:0/readyz"`, "port"},
+		"port too high":       {`"health_url":"https://lattice-ready.example.test:65536/readyz"`, "port"},
+		"port far too high":   {`"health_url":"https://lattice-ready.example.test:99999999999999999999/readyz"`, "port"},
 		"inner space":         {`"health_url":"https://lattice-ready.example.test/ready z"`, ""},
 		"reference on health": {`"health_url":"` + witnessTestReadyURL + `","reference_urls":["https://lattice-ready.example.test/cdn-cgi/trace"]`, "control plane's host"},
 		"reference on public": {`"health_url":"` + witnessTestReadyURL + `","reference_urls":["https://lattice.example.test/x"]`, "control plane's public host"},
@@ -194,6 +197,11 @@ func TestWitnessHealthURLOverrideRefusals(t *testing.T) {
 	}
 	if len(f.st.Approvals()) != 0 {
 		t.Fatalf("a refused plan left an approval: %+v", f.st.Approvals())
+	}
+	for _, ok := range []string{"https://lattice-ready.example.test:1/readyz", "https://lattice-ready.example.test:8443/readyz", "https://lattice-ready.example.test:65535/readyz"} {
+		if err := checkWitnessHealthOverride(ok); err != nil {
+			t.Fatalf("%s refused: %v", ok, err)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -154,6 +155,13 @@ func checkWitnessHealthOverride(raw string) error {
 	}
 	if u.Scheme != "https" {
 		return errors.New("health_url must use https")
+	}
+	// url.Parse takes any run of digits as a port; a browser, and the
+	// console's check, refuse one outside 1 to 65535.
+	if port := u.Port(); port != "" {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return errors.New("health_url must have a port between 1 and 65535")
+		}
 	}
 	if u.EscapedPath() != "/readyz" {
 		return errors.New("health_url must have the path /readyz and nothing more")

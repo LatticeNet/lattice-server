@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
@@ -216,6 +217,9 @@ type witnessApprovalView struct {
 	KeyPrefix    string    `json:"key_sha256_prefix,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at,omitzero"`
+	// HealthURL is the URL the plan's config tells the witness to watch:
+	// <public URL>/readyz unless the operator set another.
+	HealthURL string `json:"health_url,omitempty"`
 }
 
 func toWitnessApprovalView(a model.Approval, channels map[string]model.NotifyChannel) witnessApprovalView {
@@ -232,6 +236,12 @@ func toWitnessApprovalView(a model.Approval, channels map[string]model.NotifyCha
 	v.KeyPrefix = approvalPlanField(a.Plan, witnessFieldKeyPrefix)
 	if c, ok := channels[v.ChannelID]; ok {
 		v.ChannelName = notifyChannelLabel(c)
+	}
+	if config, _, err := witnessPlanFiles(a.Plan); err == nil {
+		var doc witnessConfigDoc
+		if json.Unmarshal([]byte(config), &doc) == nil {
+			v.HealthURL = doc.HealthURL
+		}
 	}
 	return v
 }

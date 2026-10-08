@@ -26,13 +26,13 @@ func commentRun() Run {
 }
 
 func TestRenderCommentFillsEveryPlaceholder(t *testing.T) {
-	tmpl := "#node#|#node_id#|#profile#|#domain#|#type#|#ip#|#old_ip#|#time#|#date#|#lattice#"
+	tmpl := "#node#|#node_id#|#profile#|#domain#|#type#|#ip#|#old_ip#|#target#|#time#|#date#|#lattice#"
 	got := RenderComment(tmpl, CommentVars{
 		Node: "tokyo-1", NodeID: "node_7", Profile: "home", Lattice: "lat.io",
 		Time: commentClock.In(time.FixedZone("UTC+8", 8*3600)), Domain: "a.io", Type: "AAAA",
-		IP: "2001:db8::2", OldIP: "2001:db8::1",
+		IP: "2001:db8::2", OldIP: "2001:db8::1", Target: "e.net",
 	})
-	want := "tokyo-1|node_7|home|a.io|AAAA|2001:db8::2|2001:db8::1|2026-10-08 09:30Z|2026-10-08|lat.io"
+	want := "tokyo-1|node_7|home|a.io|AAAA|2001:db8::2|2001:db8::1|e.net|2026-10-08 09:30Z|2026-10-08|lat.io"
 	if got != want {
 		t.Fatalf("rendered\n got %q\nwant %q", got, want)
 	}

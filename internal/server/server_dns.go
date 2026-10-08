@@ -670,6 +670,12 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		if !strings.Contains(host, ".") {
 			return model.DNSDeployment{}, errors.New("hostname must be a fully qualified domain")
 		}
+		// The deployment publishes A or AAAA records for its hostname, which
+		// cannot share a name with the CNAME a DDNS profile keeps there:
+		// whichever is published second would be refused on every run.
+		if owner, ok := s.cnameProfilePublishing(host); ok {
+			return model.DNSDeployment{}, fmt.Errorf("hostname %s is a CNAME the DDNS profile %q publishes; a name cannot hold a CNAME and the A or AAAA records a DNS deployment publishes", host, owner.Name)
+		}
 		req.Hostname = host
 		if !req.PublishIPv4 && !req.PublishIPv6 {
 			req.PublishIPv4 = true

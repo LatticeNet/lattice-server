@@ -14,8 +14,9 @@ import (
 
 const cloudflareDefaultBase = "https://api.cloudflare.com/client/v4"
 
-// Cloudflare sets A/AAAA records through the Cloudflare API v4 using an API
-// token. The token needs Zone:Read + DNS:Edit on the target zones.
+// Cloudflare sets A, AAAA and CNAME records through the Cloudflare API v4
+// using an API token. The token needs Zone:Read + DNS:Edit on the target
+// zones. It never deletes a record.
 type Cloudflare struct {
 	Token   string
 	BaseURL string // defaults to cloudflareDefaultBase
@@ -105,7 +106,11 @@ type ConflictError struct {
 }
 
 func (e *ConflictError) Error() string {
-	if blocker, ok := BlockingRecord(e.Existing); ok {
+	if strings.EqualFold(e.Type, "CNAME") {
+		if blockers := CNAMEBlockers(e.Existing); len(blockers) > 0 {
+			return CNAMEConflictSentence(e.Name, blockers)
+		}
+	} else if blocker, ok := BlockingRecord(e.Existing); ok {
 		return ConflictSentence(e.Name, blocker)
 	}
 	return fmt.Sprintf("%s already has a record that Cloudflare will not let %s %s record share (%v). Remove it in Cloudflare or use another name.",
@@ -164,6 +169,9 @@ func (c *Cloudflare) SetRecord(ctx context.Context, r Record) error {
 	if err != nil {
 		return err
 	}
+	if r.Type == "CNAME" {
+		return c.setCNAME(ctx, zone.ID, r)
+	}
 	existing, err := c.findRecord(ctx, zone.ID, r.Type, r.Name)
 	if err != nil {
 		return err
@@ -204,6 +212,60 @@ func (c *Cloudflare) SetRecord(ctx context.Context, r Record) error {
 	return c.explainConflict(ctx, zone.ID, r, err)
 }
 
+// setCNAME makes name a CNAME to r.Target. A CNAME already there is adopted:
+// left alone when it points to the target, retargeted when it does not, its
+// proxy setting kept either way. Any other record on the name stops the write
+// with a ConflictError, because a CNAME cannot share its name and Lattice
+// never deletes a record it did not make.
+func (c *Cloudflare) setCNAME(ctx context.Context, zoneID string, r Record) error {
+	recs, err := c.listAt(ctx, zoneID, r.Name)
+	if err != nil {
+		return err
+	}
+	var existing *cfRecord
+	var all []ExistingRecord
+	for i := range recs {
+		all = append(all, recs[i].existing())
+		if existing == nil && strings.EqualFold(recs[i].Type, "CNAME") {
+			existing = &recs[i]
+		}
+	}
+	if len(CNAMEBlockers(all)) > 0 {
+		return &ConflictError{Name: r.Name, Type: r.Type, Existing: all}
+	}
+	if existing == nil {
+		unproxied := false
+		payload := cfWrite{Type: r.Type, Name: r.Name, Content: r.Target, TTL: r.TTL, Proxied: &unproxied}
+		if r.Comment != nil {
+			comment := r.Comment.render(r, "")
+			payload.Comment = &comment
+		}
+		err := c.do(ctx, http.MethodPost, fmt.Sprintf("/zones/%s/dns_records", zoneID), payload, nil)
+		return c.explainConflict(ctx, zoneID, r, err)
+	}
+
+	targetChanged := NormalizeHost(existing.Content) != NormalizeHost(r.Target)
+	proxied := existing.Proxied
+	payload := cfWrite{Type: r.Type, Name: r.Name, Content: r.Target, TTL: r.TTL, Proxied: &proxied}
+	if proxied {
+		payload.TTL = 1
+	}
+	commentChanged := false
+	if r.Comment != nil {
+		comment := r.Comment.render(r, "")
+		if comment != existing.Comment && (targetChanged || r.Comment.Refresh) {
+			payload.Comment = &comment
+			commentChanged = true
+		}
+	}
+	if !targetChanged && !commentChanged {
+		return nil
+	}
+	err = c.do(ctx, http.MethodPatch,
+		fmt.Sprintf("/zones/%s/dns_records/%s", zoneID, existing.ID), payload, nil)
+	return c.explainConflict(ctx, zoneID, r, err)
+}
+
 // explainConflict turns Cloudflare's "record with that host already exists"
 // into a sentence naming the record in the way, looked up on the spot. Any
 // other error passes through unchanged.
@@ -229,16 +291,30 @@ func (c *Cloudflare) RecordsAt(ctx context.Context, name string) ([]ExistingReco
 }
 
 func (c *Cloudflare) recordsAt(ctx context.Context, zoneID, name string) ([]ExistingRecord, error) {
+	recs, err := c.listAt(ctx, zoneID, name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ExistingRecord, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, rec.existing())
+	}
+	return out, nil
+}
+
+// listAt lists every record at name, whatever its type, with the ids an
+// update needs.
+func (c *Cloudflare) listAt(ctx context.Context, zoneID, name string) ([]cfRecord, error) {
 	var recs []cfRecord
 	q := url.Values{"name": {name}}
 	if err := c.do(ctx, http.MethodGet, fmt.Sprintf("/zones/%s/dns_records?%s", zoneID, q.Encode()), nil, &recs); err != nil {
 		return nil, err
 	}
-	out := make([]ExistingRecord, 0, len(recs))
-	for _, rec := range recs {
-		out = append(out, ExistingRecord{Type: rec.Type, Content: rec.Content, Proxied: rec.Proxied, Comment: rec.Comment})
-	}
-	return out, nil
+	return recs, nil
+}
+
+func (rec cfRecord) existing() ExistingRecord {
+	return ExistingRecord{Type: rec.Type, Content: rec.Content, Proxied: rec.Proxied, Comment: rec.Comment}
 }
 
 // zoneFor finds the longest zone whose name is a suffix of the record name.

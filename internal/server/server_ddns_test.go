@@ -52,6 +52,10 @@ func newDDNSServerWithCloudflare(t *testing.T) (*Server, http.Handler, *store.St
 		}
 		return prov, err
 	}
+	// A CNAME profile's save resolves its target; keep that off real DNS.
+	srv.ddnsLookupHost = func(_ context.Context, host string) ([]string, error) {
+		return []string{"40.160.254.9"}, nil
+	}
 	return srv, srv.Handler(), st, fake
 }
 
@@ -496,7 +500,7 @@ func (failingDDNS) SetRecord(context.Context, ddns.Record) error { return errors
 
 // The sweep retries a failing profile every interval, and records each retry
 // through RecordDDNSRun, which writes only an outcome that changed. A run an
-// operator asks for still writes before the answer.
+// operator asks for still writes before the answer, through the same method.
 func TestDDNSSweepRetryOfTheSameFailureDoesNotRewriteState(t *testing.T) {
 	srv, handler, st := newDDNSServer(t)
 	cookies, csrf := loginSession(t, handler)
@@ -532,13 +536,15 @@ func TestDDNSSweepRetryOfTheSameFailureDoesNotRewriteState(t *testing.T) {
 		t.Fatalf("the profile in memory does not show the last retry: %+v", p)
 	}
 
-	before = writes("UpsertDDNSProfile")
+	// The same failure again, but an operator's run is written before the
+	// answer.
+	before = writes("RecordDDNSRun")
 	res := doJSON(t, handler, http.MethodPost, "/api/ddns/run", `{"id":"`+id+`"}`, cookies, csrf)
 	res.Body.Close()
 	if res.StatusCode != http.StatusBadGateway {
 		t.Fatalf("operator run against a failing provider: %d", res.StatusCode)
 	}
-	if got := writes("UpsertDDNSProfile") - before; got != 1 {
+	if got := writes("RecordDDNSRun") - before; got != 1 {
 		t.Fatalf("an operator's run wrote %d times, want 1 before the answer", got)
 	}
 }

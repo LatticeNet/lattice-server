@@ -105,6 +105,14 @@ func (s *Server) Writes() []Write {
 	return append([]Write(nil), s.writes...)
 }
 
+// ForgetWrites clears the write log, so a test can make a change of its own
+// through the API, as an operator would by hand, without counting it.
+func (s *Server) ForgetWrites() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writes = nil
+}
+
 func (s *Server) matchLocked(name, typ string) []Record {
 	out := []Record{}
 	for _, r := range s.records {

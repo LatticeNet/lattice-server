@@ -28,13 +28,8 @@ func TestDDNSRunWritesOnlyAChangedOutcome(t *testing.T) {
 	t0 := time.Date(2026, 10, 4, 1, 0, 0, 0, time.UTC)
 	run := func(at time.Time, lastErr, ipv4 string) int {
 		t.Helper()
-		p, _ := s.DDNSProfile("d1")
-		p.LastRunAt, p.LastError = at, lastErr
-		if ipv4 != "" {
-			p.LastIPv4 = ipv4
-		}
 		before := s.testPersistCalls
-		if err := s.RecordDDNSRun(p); err != nil {
+		if err := s.RecordDDNSRun("d1", DDNSRunOutcome{At: at, Err: lastErr, IPv4: ipv4}); err != nil {
 			t.Fatal(err)
 		}
 		return s.testPersistCalls - before
@@ -95,10 +90,8 @@ func TestDDNSRunTreatsAnErrorThatDiffersOnlyInIDsAsUnchanged(t *testing.T) {
 	t0 := time.Date(2026, 10, 4, 1, 0, 0, 0, time.UTC)
 	run := func(at time.Time, lastErr string) int {
 		t.Helper()
-		p, _ := s.DDNSProfile("d1")
-		p.LastRunAt, p.LastError = at, lastErr
 		before := s.testPersistCalls
-		if err := s.RecordDDNSRun(p); err != nil {
+		if err := s.RecordDDNSRun("d1", DDNSRunOutcome{At: at, Err: lastErr}); err != nil {
 			t.Fatal(err)
 		}
 		if got, _ := s.DDNSProfile("d1"); got.LastError != lastErr {
@@ -164,6 +157,96 @@ func TestDDNSErrorClass(t *testing.T) {
 	} {
 		if got := ddnsErrorClass(c.a) == ddnsErrorClass(c.b); got != c.same {
 			t.Errorf("same class = %v, want %v:\n%q -> %q\n%q -> %q", got, c.same, c.a, ddnsErrorClass(c.a), c.b, ddnsErrorClass(c.b))
+		}
+	}
+}
+
+// A run lasts as long as the provider takes, and the profile it started from
+// may be edited, switched to the other record type or deleted before it ends.
+// Its outcome lands on the profile as stored then: the edit survives, an
+// outcome for the other record type is dropped, and a deleted profile is not
+// brought back.
+func TestDDNSRunOutcomeLandsOnTheStoredProfile(t *testing.T) {
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ran := model.DDNSProfile{ID: "d1", Name: "frontier", NodeID: "n1", Provider: model.DDNSProviderCloudflare, CFAPIToken: "t",
+		Domains: []string{"frontier.example.com"}, RecordType: model.DDNSRecordCNAME, CNAMETarget: "nat-old.example.net"}
+	if err := s.UpsertDDNSProfile(ran); err != nil {
+		t.Fatal(err)
+	}
+	// The operator saves a new target and a second domain while the run that
+	// published the old target is still waiting on Cloudflare.
+	edited := ran
+	edited.CNAMETarget = "nat-new.example.net"
+	edited.Domains = []string{"frontier.example.com", "frontier2.example.com"}
+	if err := s.UpsertDDNSProfile(edited); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
+	if err := s.RecordDDNSRun("d1", DDNSRunOutcome{At: at, CNAME: true, Target: ran.CNAMETarget}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.DDNSProfile("d1")
+	if got.CNAMETarget != "nat-new.example.net" || len(got.Domains) != 2 {
+		t.Fatalf("the run wrote back the profile it started from: %+v", got)
+	}
+	// What the run published is recorded as published, so the sweep sees the
+	// new target as not yet published and runs again.
+	if got.LastTarget != "nat-old.example.net" || !got.LastRunAt.Equal(at) || got.LastError != "" {
+		t.Fatalf("run status: %+v", got)
+	}
+
+	// Switched to the address type while a CNAME run was in flight.
+	address := got
+	address.RecordType, address.LastTarget = model.DDNSRecordAddress, ""
+	if err := s.UpsertDDNSProfile(address); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordDDNSRun("d1", DDNSRunOutcome{At: at.Add(time.Minute), CNAME: true, Target: "nat-new.example.net"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.DDNSProfile("d1"); got.LastTarget != "" || !got.LastRunAt.Equal(at) {
+		t.Fatalf("a CNAME outcome landed on an address profile: %+v", got)
+	}
+
+	if err := s.DeleteDDNSProfile("d1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordDDNSRun("d1", DDNSRunOutcome{At: at.Add(2 * time.Minute), IPv4: "203.0.113.10", WriteNow: true}); err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := s.DDNSProfile("d1"); ok {
+		t.Fatalf("a run brought back a deleted profile: %+v", p)
+	}
+}
+
+// An operator's run is written before the answer even when its outcome
+// matches the stored one.
+func TestDDNSRunWriteNowWritesAnUnchangedOutcome(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s, err := OpenWithCipher(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.UpsertDDNSProfile(model.DDNSProfile{ID: "d1", Name: "cf", NodeID: "n1", Provider: "webhook",
+		WebhookURL: "https://ddns.example.com/h", Domains: []string{"a.example.com"}, EnableIPv4: true, LastIPv4: "203.0.113.10"}); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
+	for _, writeNow := range []bool{false, true} {
+		before := s.testPersistCalls
+		if err := s.RecordDDNSRun("d1", DDNSRunOutcome{At: at, IPv4: "203.0.113.10", WriteNow: writeNow}); err != nil {
+			t.Fatal(err)
+		}
+		want := 0
+		if writeNow {
+			want = 1
+		}
+		if got := s.testPersistCalls - before; got != want {
+			t.Fatalf("WriteNow %t: an unchanged outcome wrote %d times, want %d", writeNow, got, want)
 		}
 	}
 }

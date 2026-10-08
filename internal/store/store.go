@@ -4265,32 +4265,77 @@ func (s *Store) UpsertDDNSProfile(p model.DDNSProfile) error {
 	return s.Save()
 }
 
-// RecordDDNSRun stores the outcome of one automatic DDNS run. A run whose
-// outcome matches the stored profile (the same failure again, or nothing new
-// published) moves only LastRunAt, the clock that spaces out the next
+// DDNSRunOutcome is what one DDNS run learned: the run-status fields of a
+// profile and nothing else.
+type DDNSRunOutcome struct {
+	// At is when the run ended, the clock the sweep spaces attempts by.
+	At time.Time
+	// CNAME is the record type the run published. An outcome reaching a
+	// profile that was switched to the other type while it ran is dropped,
+	// since it says nothing about the records the profile now describes.
+	CNAME bool
+	// Err is the run's error, "" when every record was published. A failed
+	// run keeps the published fields as they are.
+	Err string
+	// IPv4 and IPv6 are the addresses an address run published; "" keeps
+	// the stored value.
+	IPv4, IPv6 string
+	// Target is the CNAME target a CNAME run published.
+	Target string
+	// WriteNow writes the outcome before returning even when it matches the
+	// stored one: a run an operator asked for answers only once it is on disk.
+	WriteNow bool
+}
+
+// RecordDDNSRun stores the outcome of one DDNS run on the profile as it is
+// stored now. A run lasts as long as the provider takes to answer, and an
+// operator may save the profile meanwhile; writing back the copy the run
+// started from would undo that edit, a new target or new domains, and leave
+// the provider on the old one. Only the run-status fields change here, and a
+// profile deleted while it ran stays deleted.
+//
+// An outcome that matches the stored one (the same failure again, or nothing
+// new published) moves only LastRunAt, the clock that spaces out the next
 // attempt: it waits in memory for the next state write, and Close writes it.
 // A profile whose provider keeps refusing is retried every interval, and each
 // retry rewrote the whole state file to record the same error. A changed
 // outcome, an error that appeared, cleared or changed, or a newly published
-// address, is written before this returns. Errors are compared by
-// ddnsErrorClass, so a provider message that differs only in a request id or
-// a timestamp is the same failure; the profile in memory still takes the new
-// text, and it reaches disk with the next write. A restart that loses
-// LastRunAt only brings the next attempt forward.
-func (s *Store) RecordDDNSRun(p model.DDNSProfile) error {
+// address or target, is written before this returns, as is any outcome with
+// WriteNow. Errors are compared by ddnsErrorClass, so a provider message that
+// differs only in a request id or a timestamp is the same failure; the
+// profile in memory still takes the new text, and it reaches disk with the
+// next write. A restart that loses LastRunAt only brings the next attempt
+// forward.
+func (s *Store) RecordDDNSRun(id string, out DDNSRunOutcome) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if current, ok := s.state.DDNS[p.ID]; ok && ddnsRunOutcomeEqual(current, p) {
-		p.UpdatedAt = current.UpdatedAt
-		s.state.DDNS[p.ID] = p
+	current, ok := s.state.DDNS[id]
+	// The same test as ddns.IsCNAME, which this package does not import.
+	if !ok || (strings.TrimSpace(current.RecordType) == model.DDNSRecordCNAME) != out.CNAME {
+		return nil
+	}
+	next := current
+	next.LastRunAt = out.At
+	next.LastError = out.Err
+	if out.Err == "" {
+		if out.CNAME {
+			next.LastTarget = out.Target
+		} else {
+			if out.IPv4 != "" {
+				next.LastIPv4 = out.IPv4
+			}
+			if out.IPv6 != "" {
+				next.LastIPv6 = out.IPv6
+			}
+		}
+	}
+	if !out.WriteNow && ddnsRunOutcomeEqual(current, next) {
+		s.state.DDNS[id] = next
 		s.clocksUnflushed = true
 		return nil
 	}
-	p.UpdatedAt = time.Now().UTC()
-	if p.CreatedAt.IsZero() {
-		p.CreatedAt = p.UpdatedAt
-	}
-	s.state.DDNS[p.ID] = p
+	next.UpdatedAt = time.Now().UTC()
+	s.state.DDNS[id] = next
 	return s.Save()
 }
 

@@ -17,10 +17,11 @@ import (
 
 // Record is a single DNS record to set.
 type Record struct {
-	Type string // "A" or "AAAA"
-	Name string // fully-qualified record name, e.g. node.example.com
-	IP   string
-	TTL  int
+	Type   string // "A", "AAAA" or "CNAME"
+	Name   string // fully-qualified record name, e.g. node.example.com
+	IP     string // the address of an A or AAAA record
+	Target string // the hostname a CNAME record points to
+	TTL    int
 	// Comment is what the record's comment should say. Nil leaves the
 	// comment as it is. Providers that have no comments ignore it.
 	Comment *Comment
@@ -92,9 +93,10 @@ func NewProvider(p model.DDNSProfile, client *http.Client) (Provider, error) {
 	}
 }
 
-// Apply pushes the node's current IPs to every domain in the profile, honoring
-// EnableIPv4/EnableIPv6 and retrying each record up to MaxRetries times. It
-// returns the joined error of all failed records (nil if all succeeded).
+// Apply publishes a profile's records, retrying each up to MaxRetries times.
+// An address profile pushes the node's current IPs to every domain, honoring
+// EnableIPv4/EnableIPv6; a CNAME profile points every domain at CNAMETarget.
+// It returns the joined error of all failed records (nil if all succeeded).
 func Apply(ctx context.Context, p Provider, profile model.DDNSProfile, ipv4, ipv6 string, run Run) error {
 	var comment *Comment
 	if tmpl, ok := CommentTemplateFor(profile); ok {
@@ -124,6 +126,21 @@ func Apply(ctx context.Context, p Provider, profile model.DDNSProfile, ipv4, ipv
 		errs = append(errs, err)
 	}
 	ttl := recordTTL(profile)
+	if IsCNAME(profile) {
+		// A CNAME does not follow the node's address, so ipv4 and ipv6 and
+		// the profile's address toggles play no part. The target is
+		// normalized here as well as at save time, so a profile stored by
+		// another path still writes a lower-case name without the root dot.
+		target := NormalizeHost(profile.CNAMETarget)
+		for _, domain := range profile.Domains {
+			if err := withRetry(profile.MaxRetries, func() error {
+				return p.SetRecord(ctx, Record{Type: "CNAME", Name: domain, Target: target, TTL: ttl, Comment: comment})
+			}); err != nil {
+				add("CNAME "+domain, err)
+			}
+		}
+		return errors.Join(errs...)
+	}
 	for _, domain := range profile.Domains {
 		if profile.EnableIPv4 && ipv4 != "" {
 			if err := withRetry(profile.MaxRetries, func() error {

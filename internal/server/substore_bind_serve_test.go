@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -246,17 +247,28 @@ func TestSubstoreBindShareRefusals(t *testing.T) {
 		t.Fatalf("refusals %v", got)
 	}
 
-	// An identity that is not in service is refused before the cache.
+	// An identity that is not in service never reaches the bind step. The
+	// handler refuses it before the cache, and a render that raced the
+	// change refuses it too. (A share placeholder for a known token in a
+	// policy state may answer first; either way no bound document leaves.)
 	u, _ := env.srv.getVpnUser(bindIdentityID)
 	u.Enabled = false
 	if err := env.srv.putVpnUser(u); err != nil {
 		t.Fatal(err)
 	}
-	if rec := env.get("/sub/doc/" + bindShareDocToken); rec.Code != http.StatusNotFound {
-		t.Fatalf("a disabled identity: status %d", rec.Code)
+	if rec := env.get("/sub/doc/" + bindShareDocToken); strings.HasPrefix(rec.Body.String(), "converted") {
+		t.Fatalf("a disabled identity was served its bound document: status %d", rec.Code)
 	}
-	if got := env.shareRefusals("sh-doc"); len(got) != 1 || got[0] != substoreBindDenyIdentityPrefix+vpnSuspendReasonDisabled {
-		t.Fatalf("refusals %v", got)
+	share, _ := env.st.SubscriptionShare("sh-doc")
+	want := substoreBindDenyIdentityPrefix + vpnSuspendReasonDisabled
+	if _, _, refusal := env.srv.substoreBindServeState(share, env.now); refusal != want {
+		t.Fatalf("serve state refusal %q, want %q", refusal, want)
+	}
+	plan := bindNodesPlan(t, env.rows)
+	_, err := env.srv.substoreBindRendered(context.Background(), share, "plain", shareRenderVariant{}, model.SubscriptionSnapshot{}, renderedSubscription{Plan: &plan})
+	var refusal substoreBindRefusal
+	if !errors.As(err, &refusal) || refusal.reason != want {
+		t.Fatalf("a render for a disabled identity: %v", err)
 	}
 	env.mu.Lock()
 	defer env.mu.Unlock()

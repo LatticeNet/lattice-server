@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1149,5 +1150,183 @@ func TestKVGetResponseDropsRawValueWhenLarge(t *testing.T) {
 	}
 	if resp2.Value != "green" {
 		t.Fatalf("small value should keep its raw form for debuggability: %s", string(out2)[:120])
+	}
+}
+
+// stagedArtifactLog collects the runner's warning lines.
+type stagedArtifactLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *stagedArtifactLog) logf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *stagedArtifactLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
+// A plugin process runs with its staging directory as its working directory.
+// When something rewrites the staged artifact there, the pool's next worker
+// must refuse the file instead of running it; an untouched artifact keeps
+// replenishing as before.
+func TestSystemRunnerV2ReplenishRefusesTamperedArtifact(t *testing.T) {
+	t.Setenv("LATTICE_TEST_V2_HELPER", "1")
+	binary, err := os.ReadFile(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, artifactFileName), binary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const id = "p.replenish"
+	loaded := Loaded{
+		Manifest:   Manifest{ID: id, Name: "replenish", Type: TypeSystem, Runtime: &RuntimeSpec{Protocol: RuntimeProtocolStdioJSONV2}},
+		BundlePath: dir,
+	}
+	logs := &stagedArtifactLog{}
+	runtimeDir := t.TempDir()
+	r, err := NewSystemRunner(SystemRunnerOptions{
+		RuntimeDir: runtimeDir, EnvAllowlist: []string{"LATTICE_TEST_V2_HELPER"}, CrashThreshold: 1, Logf: logs.logf,
+		// One use per worker: every invocation retires its worker, and the
+		// pool replenishes from the staged file.
+		Pool: &SystemPoolConfig{Size: 1, MaxOverflow: 0, StartTimeout: 10 * time.Second, MaxUses: 1, MaxAge: time.Hour},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Start(t.Context(), RunnerStartRequest{PluginID: id, Generation: 1, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Stop(context.Background(), RunnerStopRequest{PluginID: id}) })
+	r.mu.Lock()
+	pool := r.st[id][1].pool
+	r.mu.Unlock()
+	waitIdle := func() {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			pool.mu.Lock()
+			idle := len(pool.workers)
+			pool.mu.Unlock()
+			if idle == 1 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("the pool did not replenish its worker")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	invoke := func() (InvokeResponse, error) {
+		return r.Invoke(t.Context(), InvokeRequest{PluginID: id, Generation: 1, Action: "generation"})
+	}
+
+	for i := range 3 {
+		waitIdle()
+		if rsp, err := invoke(); err != nil || !rsp.OK {
+			t.Fatalf("invocation %d on an untouched artifact: response=%+v err=%v", i, rsp, err)
+		}
+	}
+	if strings.Contains(logs.String(), "refusing") {
+		t.Fatalf("an untouched artifact was refused: %s", logs)
+	}
+
+	// The idle worker was started from the verified bytes; rewrite the
+	// staged file in place, keeping its mode, as code inside it could.
+	waitIdle()
+	canary := filepath.Join(t.TempDir(), "tampered-ran")
+	staged := filepath.Join(runtimeDir, id, "generation-1", "artifact")
+	if err := os.WriteFile(staged, []byte("#!/bin/sh\ntouch "+canary+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if rsp, err := invoke(); err != nil || !rsp.OK {
+		t.Fatalf("the worker started before the rewrite still serves: response=%+v err=%v", rsp, err)
+	}
+	if _, err := invoke(); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("after a refused replenishment the plugin must fail closed, got %v", err)
+	}
+	if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the rewritten artifact ran: %v", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "refusing to start "+id+" generation 1") || !strings.Contains(got, "no longer matches the verified bytes") {
+		t.Fatalf("the refusal must be logged, got %q", got)
+	}
+}
+
+// A v1 plugin execs its staged artifact once per invocation, so the same
+// check runs before each one.
+func TestSystemRunnerV1RefusesTamperedStagedArtifact(t *testing.T) {
+	logs := &stagedArtifactLog{}
+	runtimeDir := t.TempDir()
+	r := newRunner(t, SystemRunnerOptions{RuntimeDir: runtimeDir, Logf: logs.logf})
+	loaded := makeBundle(t, "p.v1tamper", "#!/bin/sh\nread line\necho '{\"ok\":true}'\n", "")
+	if rsp, err := startInvoke(t, r, loaded, "plan", nil); err != nil || !rsp.OK {
+		t.Fatalf("untouched artifact: response=%+v err=%v", rsp, err)
+	}
+	canary := filepath.Join(t.TempDir(), "tampered-ran")
+	if err := os.WriteFile(filepath.Join(runtimeDir, "p.v1tamper", "artifact"), []byte("#!/bin/sh\ntouch "+canary+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: "p.v1tamper", Action: "plan"})
+	if !errors.Is(err, errStagedArtifactChanged) {
+		t.Fatalf("a rewritten v1 artifact must be refused, got %v", err)
+	}
+	if _, err := os.Stat(canary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the rewritten artifact ran: %v", err)
+	}
+	if !strings.Contains(logs.String(), "refusing to start p.v1tamper") {
+		t.Fatalf("the refusal must be logged, got %q", logs)
+	}
+	// Starting again re-stages the verified bytes.
+	if rsp, err := startInvoke(t, r, loaded, "plan", nil); err != nil || !rsp.OK {
+		t.Fatalf("a restart restores the verified artifact: response=%+v err=%v", rsp, err)
+	}
+}
+
+func TestStagedArtifactMatches(t *testing.T) {
+	dir := t.TempDir()
+	body := []byte("#!/bin/sh\nexit 0\n")
+	want := DigestSHA256(body)
+	good := filepath.Join(dir, "artifact")
+	if err := os.WriteFile(good, body, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := stagedArtifactMatches(good, want); err != nil {
+		t.Fatalf("the staged file as written: %v", err)
+	}
+
+	loose := filepath.Join(dir, "loose")
+	if err := os.WriteFile(loose, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(loose, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(good, link); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, tc := range map[string]struct{ path, digest string }{
+		"other bytes":               {good, DigestSHA256([]byte("other"))},
+		"no recorded hash":          {good, ""},
+		"mode other than 0700":      {loose, want},
+		"symlink to the same bytes": {link, want},
+		"fifo":                      {fifo, want},
+		"missing":                   {filepath.Join(dir, "gone"), want},
+	} {
+		if err := stagedArtifactMatches(tc.path, tc.digest); !errors.Is(err, errStagedArtifactChanged) {
+			t.Fatalf("%s: got %v, want a refusal", name, err)
+		}
 	}
 }

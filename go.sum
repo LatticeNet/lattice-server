@@ -1,5 +1,5 @@
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261008085809-7a150b4e091f h1:pGQ8uVuIlLUSmrjEnsXiNPHbBdRdmbN7GDMbVxM9Ap8=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261008085809-7a150b4e091f/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
+github.com/LatticeNet/lattice-sdk v0.2.24-0.20261008085931-14636fd0ff17 h1:qzyRDTyt8yEfyr09XJ5IRNrG+zznWYBp6j7fc0lj+ag=
+github.com/LatticeNet/lattice-sdk v0.2.24-0.20261008085931-14636fd0ff17/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
 github.com/coreos/go-oidc/v3 v3.18.0 h1:V9orjXynvu5wiC9SemFTWnG4F45v403aIcjWo0d41+A=
 github.com/coreos/go-oidc/v3 v3.18.0/go.mod h1:DYCf24+ncYi+XkIH97GY1+dqoRlbaSI26KVTCI9SrY4=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

@@ -1650,6 +1650,9 @@ func (s *Server) Close(ctx context.Context) error {
 	s.flushShareFetchStats(s.now(), true)
 	s.flushShareRefusalAudit(s.now())
 	waitWithin(&s.shareFetchAudits)
+	// Sub-Store S0 catalogue lane: stop the depends_on asks before the
+	// runtime they call (share_fleet_depends.go).
+	s.substoreCatalogue.deps.close(ctx)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)

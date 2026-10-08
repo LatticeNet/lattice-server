@@ -153,11 +153,52 @@ func TestSubstoreBindRevealEntryNeedsStepUpAndIsAudited(t *testing.T) {
 	if err := s.putVpnUser(u); err != nil {
 		t.Fatal(err)
 	}
+	// Without step-up the gate answers first, so a caller learns nothing
+	// about the identity or the line.
+	if _, err := s.substoreBindRPC(bindOperatorCtx(session), "reveal_entry", request("")); err == nil || catalogueAPIError(t, err).Code != apiErrorStepUpRequired {
+		t.Fatalf("an excluded line without step-up: %v", err)
+	}
+	unknown, _ := json.Marshal(map[string]string{"identity_id": "nobody", "line_uuid": line})
+	if _, err := s.substoreBindRPC(bindOperatorCtx(session), "reveal_entry", unknown); err == nil || catalogueAPIError(t, err).Code != apiErrorStepUpRequired {
+		t.Fatalf("an unknown identity without step-up: %v", err)
+	}
 	_, err = s.substoreBindRPC(bindOperatorCtx(session), "reveal_entry", request(grant))
 	if err == nil {
 		t.Fatal("an excluded line was revealed")
 	}
 	if apiErr := catalogueAPIError(t, err); apiErr.Code != apiErrorSubstoreLineExcluded || !strings.Contains(apiErr.Message, identityLineNotApplied) {
 		t.Fatalf("an excluded line: %+v", apiErr)
+	}
+	excludedAudited := false
+	for _, ev := range env.st.AuditEvents() {
+		if ev.Action == auditActionSubstoreBindRevealEntry && ev.Decision == "deny" && strings.Contains(ev.Reason, identityLineNotApplied) &&
+			ev.Metadata["line_uuid"] == line {
+			excludedAudited = true
+		}
+	}
+	if !excludedAudited {
+		t.Fatal("an excluded line's refusal must be audited")
+	}
+}
+
+// bind.preview of a record whose snapshot does not say which lines it
+// selected answers the refusal a share would, and binds nothing.
+func TestSubstoreBindPreviewRefusesAPlanWithoutASelection(t *testing.T) {
+	env := bindShareFixture(t)
+	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, string, string, string, model.SubscriptionSnapshot) (*model.SelectionPlan, error) {
+		plan := bindNodesPlan(t, env.rows)
+		return &plan, nil
+	}
+	reader := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"vpncore:read", "substore:read"}}}
+	out, err := env.srv.substoreBindRPC(bindOperatorCtx(reader), "preview", []byte(`{"subscription_id":"fleet-foreign","identity_id":"`+bindIdentityID+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply substoreBindPreviewReply
+	if err := json.Unmarshal(out, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.Refused != substoreBindRefusedSelection || len(reply.Entries) != 0 || reply.FleetNodes != len(env.rows) {
+		t.Fatalf("reply %+v", reply)
 	}
 }

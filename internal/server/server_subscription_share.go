@@ -444,8 +444,9 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	// ?noFlow=1 keeps quota headers off the wire (upstream's 不查询订阅流量) —
 	// some clients probe aggressively when they see one.
 	quota := subscriptionUserinfoForResponse(userinfo)
-	if bindPolicy != nil {
-		// The identity's own figures, read now, as its link writes them.
+	if bindPolicy != nil && served.bound {
+		// The identity's own figures, read now, as its link writes them. A
+		// body the record rendered as a plain document keeps its own.
 		quota = identityLinkUserinfo(*bindPolicy, false)
 	}
 	if variant.NoFlow {
@@ -755,4 +756,7 @@ type renderedSubscription struct {
 	// Plan is a fleet-bound record's selection plan, which the bind step
 	// turns into Body before anything is cached (substore_bind_serve.go).
 	Plan *model.SelectionPlan
+	// Bound marks a Body the bind step converted from a plan with the
+	// share's identity bound into it.
+	Bound bool
 }

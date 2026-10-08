@@ -130,9 +130,6 @@ type substoreBindPreviewReply struct {
 	// Refused names why a share would answer the decoy for this plan.
 	Refused    string `json:"refused,omitempty"`
 	FleetNodes int    `json:"fleet_nodes"`
-	// Insecure counts bound nodes that turn certificate checks off where
-	// their line's template does not.
-	Insecure int `json:"insecure,omitempty"`
 }
 
 // substoreBindPreviewRPC runs validate-and-bind for one record revision and
@@ -183,7 +180,7 @@ func (s *Server) substoreBindPreview(ctx context.Context, pluginID, subscription
 	result := substoreBindPlan(*plan, u, catalogue, substoreBindSelection(snap))
 	reply := substoreBindPreviewReply{SubscriptionID: subscriptionID, Revision: revision, IdentityID: u.ID,
 		IdentityStatus: s.vpnUserPolicyAt(u, s.now()).Status, Kind: result.Kind, SourceVersion: snap.SourceVersion,
-		Entries: result.Entries, Excluded: result.Excluded, Refused: result.Refused, FleetNodes: result.FleetNodes, Insecure: result.Insecure}
+		Entries: result.Entries, Excluded: result.Excluded, Refused: result.Refused, FleetNodes: result.FleetNodes}
 	if reply.Entries == nil {
 		reply.Entries = []substoreBindEntry{}
 	}
@@ -237,7 +234,10 @@ type substoreBindRevealEntryReply struct {
 
 // substoreBindRevealEntryRPC returns one bound line's client URI for one
 // identity: the entry the identity's link and a fleet share bind for that
-// line, built by lineClientURI from the line's catalogue template.
+// line, built by lineClientURI from the line's catalogue template. The
+// reveal gate runs before anything about the identity or the line is read,
+// so a caller without step-up learns nothing about either, and every answer
+// after it, an excluded line included, is audited.
 func (s *Server) substoreBindRevealEntryRPC(ctx context.Context, request []byte) ([]byte, error) {
 	p, err := substoreBindOperator(ctx, "vpncore:admin")
 	if err != nil {
@@ -257,8 +257,20 @@ func (s *Server) substoreBindRevealEntryRPC(ctx context.Context, request []byte)
 	if !substoreBindValidID(req.IdentityID) || !validLineUUIDv4(req.LineUUID) {
 		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "sub-store/bind reveal_entry: identity_id and a lowercase uuidv4 line_uuid are required")
 	}
+	ev := model.AuditEvent{Action: auditActionSubstoreBindRevealEntry, Scope: "vpncore:admin",
+		Metadata: map[string]string{"identity_id": req.IdentityID, "line_uuid": req.LineUUID, "via_rpc": substoreBindService}}
+	reveal := s.decideSecretReveal(p, req.StepUpGrant)
+	if !reveal.Allowed {
+		s.refuseSecretReveal(p, reveal, ev)
+		return nil, secretRevealRPCError(reveal)
+	}
+	excluded := func(why string) error {
+		s.refuseSecretReveal(p, secretRevealDecision{Reason: "line excluded for the identity: " + why}, ev)
+		return rpcAPIError(http.StatusConflict, apiErrorSubstoreLineExcluded, "sub-store/bind reveal_entry: the line is excluded for this identity: "+why)
+	}
 	u, ok := s.getVpnUser(req.IdentityID)
 	if !ok {
+		s.refuseSecretReveal(p, secretRevealDecision{Reason: "identity_id names no identity"}, ev)
 		return nil, rpcAPIError(http.StatusNotFound, model.APIErrorNotFound, "sub-store/bind reveal_entry: identity_id names no identity")
 	}
 	catalogue, err := s.buildLineCatalogue("")
@@ -266,19 +278,15 @@ func (s *Server) substoreBindRevealEntryRPC(ctx context.Context, request []byte)
 		return nil, err
 	}
 	line := substoreBindLineOf(u, substoreBindBindings(u), catalogue, nil, req.LineUUID)
-	if why := firstNonEmpty(line.refuse.reason, line.exclude.reason); why != "" {
-		return nil, rpcAPIError(http.StatusConflict, apiErrorSubstoreLineExcluded, "sub-store/bind reveal_entry: the line is excluded for this identity: "+why)
+	if line.row.LineHashID != "" {
+		ev.Metadata["line_hash_id"] = line.row.LineHashID
 	}
-	ev := model.AuditEvent{Action: auditActionSubstoreBindRevealEntry, Scope: "vpncore:admin",
-		Metadata: map[string]string{"identity_id": u.ID, "line_uuid": req.LineUUID, "line_hash_id": line.row.LineHashID, "via_rpc": substoreBindService}}
-	reveal := s.decideSecretReveal(p, req.StepUpGrant)
-	if !reveal.Allowed {
-		s.refuseSecretReveal(p, reveal, ev)
-		return nil, secretRevealRPCError(reveal)
+	if why := firstNonEmpty(line.refuse.reason, line.exclude.reason); why != "" {
+		return nil, excluded(why)
 	}
 	uri, err := lineClientURI(line.template, line.payload, line.label)
 	if err != nil {
-		return nil, rpcAPIError(http.StatusConflict, apiErrorSubstoreLineExcluded, "sub-store/bind reveal_entry: the line is excluded for this identity: "+identityLineTemplateUnusable)
+		return nil, excluded(identityLineTemplateUnusable)
 	}
 	s.recordSecretReveal(p, reveal, ev)
 	return json.Marshal(substoreBindRevealEntryReply{IdentityID: u.ID, LineUUID: req.LineUUID, Label: line.label, URI: uri})

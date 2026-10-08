@@ -129,10 +129,23 @@ func bindNodesPlan(t testing.TB, rows []model.LineCatalogueRow) model.SelectionP
 	return plan
 }
 
+// selection is the snapshot selection of every fixture row.
+func (e *bindEnv) selection() map[string]bool {
+	out := make(map[string]bool, len(e.rows))
+	for _, row := range e.rows {
+		out[row.LineUUID] = true
+	}
+	return out
+}
+
 // bindRun builds a fresh catalogue, round-trips the plan through the SDK's
-// strict codec the way a render reply arrives, and binds it.
+// strict codec the way a render reply arrives, and binds it. A nil selected
+// is the selection of every fixture row.
 func (e *bindEnv) bindRun(t testing.TB, plan model.SelectionPlan, selected map[string]bool) substoreBindResult {
 	t.Helper()
+	if selected == nil {
+		selected = e.selection()
+	}
 	raw, err := model.EncodeSelectionPlan(plan)
 	if err != nil {
 		t.Fatalf("plan does not encode: %v", err)
@@ -323,19 +336,129 @@ func TestSubstoreBindRejectsAChangedShape(t *testing.T) {
 		"plan_rejected:tls-fingerprint": {"tls-fingerprint", "ab:cd"},
 		"plan_rejected:line_uuid":       {"line_uuid", "11111111-2222-4333-8444-555555555555"},
 		"plan_rejected:_ca":             {"_ca", "-----BEGIN CERTIFICATE-----"},
+		// The annotations that carry raw extra options or a gRPC authority
+		// can name a second endpoint, and no catalogue template sets them.
+		"plan_rejected:_extra":             {"_extra", `{"downloadSettings":{"address":"relay.attacker.example","port":443}}`},
+		"plan_rejected:_extra_unsupported": {"_extra_unsupported", map[string]any{"downloadSettings": map[string]any{"address": "relay.attacker.example"}}},
+		"plan_rejected:_grpc-authority":    {"_grpc-authority", "relay.attacker.example"},
+		// A transport options object of another network is a script's.
+		"plan_rejected:xhttp-opts": {"xhttp-opts", map[string]any{"path": "/x"}},
+		// Certificate checks stay on where the template keeps them on, and
+		// the flag is a boolean.
+		"plan_rejected:skip-cert-verify": {"skip-cert-verify", true},
 	} {
 		node := bindNode(t, row, bindPlaceholder(t, row.LineUUID, "uuid"), map[string]any{want.field: want.value})
 		if got := e.bindRun(t, model.SelectionPlan{Kind: model.SelectionPlanKindNodes, Nodes: []model.SelectionPlanNode{node}}, nil).reasons()[0]; got != edit {
 			t.Fatalf("%s=%v: reason %q, want %q", want.field, want.value, got, edit)
 		}
 	}
-	// The mutable set changes freely, and turning certificate checks off is
-	// counted.
+	quoted := bindNode(t, row, bindPlaceholder(t, row.LineUUID, "uuid"), map[string]any{"skip-cert-verify": "true"})
+	if got := e.bindRun(t, model.SelectionPlan{Kind: model.SelectionPlanKindNodes, Nodes: []model.SelectionPlanNode{quoted}}, nil).reasons()[0]; got != "plan_rejected:skip-cert-verify" {
+		t.Fatalf("skip-cert-verify as a string: %q", got)
+	}
+	// The mutable set changes freely.
 	node := bindNode(t, row, bindPlaceholder(t, row.LineUUID, "uuid"), map[string]any{"name": "Tokyo 01", "udp": false, "tfo": true,
-		"client-fingerprint": "safari", "alpn": []string{"h2"}, "skip-cert-verify": true, "script": map[string]any{"_tag": "x"}})
+		"client-fingerprint": "safari", "alpn": []string{"h2"}, "skip-cert-verify": false, "script": map[string]any{"_tag": "x"}})
 	result := e.bindRun(t, model.SelectionPlan{Kind: model.SelectionPlanKindNodes, Nodes: []model.SelectionPlanNode{node}}, nil)
-	if len(result.Excluded) != 0 || result.Insecure != 1 || result.Entries[0].Name != "Tokyo 01" {
-		t.Fatalf("mutable fields: excluded %+v, insecure %d, entries %+v", result.Excluded, result.Insecure, result.Entries)
+	if len(result.Excluded) != 0 || result.Entries[0].Name != "Tokyo 01" {
+		t.Fatalf("mutable fields: excluded %+v, entries %+v", result.Excluded, result.Entries)
+	}
+	// A template that turns certificate checks off lets the node do so.
+	insecure := e.lineFor(t, e.rows[0], store.LineClientTemplate{Protocol: "vless", Host: row.Template.Host, Port: row.Template.Port,
+		Params: map[string]string{"security": "tls", "sni": "www.example.com", "allowInsecure": "1", "type": "tcp"}})
+	off := bindRawNode(t, row.LineUUID, `{"name":"a","type":"vless","server":"`+row.Template.Host+`","port":`+strconv.Itoa(row.Template.Port)+
+		`,"uuid":"%s","tls":true,"sni":"www.example.com","skip-cert-verify":true}`)
+	if field := bindCheck(t, off, insecure); field != "" {
+		t.Fatalf("an insecure template's node: %q", field)
+	}
+}
+
+// lineFor is a bind line for row with template t, the way substoreBindLineOf
+// builds one, for checks against templates the catalogue fixture lacks.
+func (e *bindEnv) lineFor(t testing.TB, row model.LineCatalogueRow, tmpl store.LineClientTemplate) *substoreBindLine {
+	t.Helper()
+	shape, ok := substoreBindTemplateShape(tmpl)
+	if !ok {
+		t.Fatalf("no shape for %+v", tmpl)
+	}
+	return &substoreBindLine{row: row, template: tmpl, shape: shape}
+}
+
+// bindRawNode is a plan node of line lineUUID from a JSON object whose %s
+// stands for the uuid placeholder.
+func bindRawNode(t testing.TB, lineUUID, object string) model.SelectionPlanNode {
+	t.Helper()
+	p := bindPlaceholder(t, lineUUID, "uuid")
+	return model.SelectionPlanNode{LineUUID: lineUUID, Placeholders: map[string]string{"uuid": p}, Node: json.RawMessage(fmt.Sprintf(object, p))}
+}
+
+// bindCheck runs checks 2 to 4 on one node against one line.
+func bindCheck(t testing.TB, node model.SelectionPlanNode, line *substoreBindLine) string {
+	t.Helper()
+	obj, err := parseSubstoreNodeObject(node.Node)
+	if err != nil {
+		t.Fatalf("node %s: %v", node.Node, err)
+	}
+	return substoreBindCheckNode(node.Node, obj, node, line)
+}
+
+// Every transport options object is checked key by key: it belongs to the
+// node's network, carries only the keys a template sets, and every host it
+// names is the line's. A node whose server and port are honest cannot send
+// the credential to another origin through a Host header, an h2 or xhttp
+// host, or xhttp's download settings.
+func TestSubstoreBindChecksTransportOptions(t *testing.T) {
+	e := bindFixture(t, 1, 1)
+	row := e.rows[0]
+	edge := "203.0.113.250"
+	row.ProviderEdge = "edge.provider.example"
+	node := func(network, opts string) model.SelectionPlanNode {
+		object := `{"name":"a","type":"vless","server":"` + edge + `","port":443,"uuid":"%s","tls":true,"sni":"cdn.example","network":"` + network + `"`
+		if opts != "" {
+			object += "," + opts
+		}
+		return bindRawNode(t, row.LineUUID, object+"}")
+	}
+	line := func(params map[string]string) *substoreBindLine {
+		params["security"], params["sni"] = "tls", "cdn.example"
+		return e.lineFor(t, row, store.LineClientTemplate{Protocol: "vless", Host: edge, Port: 443, Params: params})
+	}
+	ws := line(map[string]string{"type": "ws", "host": "cdn.example", "path": "/ws"})
+	xhttp := line(map[string]string{"type": "xhttp", "host": "cdn.example", "path": "/x", "mode": "auto"})
+	h2 := line(map[string]string{"type": "http", "host": "cdn.example,alt.cdn.example", "path": "/h2"})
+	grpc := line(map[string]string{"type": "grpc", "serviceName": "svc"})
+	httpLine := line(map[string]string{"type": "tcp", "headerType": "http", "host": "cdn.example", "path": "/"})
+	for _, tc := range []struct {
+		name string
+		line *substoreBindLine
+		node model.SelectionPlanNode
+		want string
+	}{
+		{"honest ws", ws, node("ws", `"ws-opts":{"path":"/ws","headers":{"Host":"cdn.example"},"max-early-data":2048,"early-data-header-name":"Sec-WebSocket-Protocol"}`), ""},
+		{"ws Host pinned to the provider edge name", ws, node("ws", `"ws-opts":{"path":"/ws","headers":{"host":"edge.provider.example"}}`), ""},
+		{"ws Host elsewhere", ws, node("ws", `"ws-opts":{"path":"/ws","headers":{"Host":"origin.attacker.example"}}`), "plan_rejected:ws-opts.headers"},
+		{"ws another header", ws, node("ws", `"ws-opts":{"path":"/ws","headers":{"X-Forwarded-Host":"cdn.example"}}`), "plan_rejected:ws-opts.headers"},
+		{"ws early data in Host", ws, node("ws", `"ws-opts":{"path":"/ws","max-early-data":2048,"early-data-header-name":"Host"}`), "plan_rejected:ws-opts.early-data-header-name"},
+		{"honest xhttp", xhttp, node("xhttp", `"xhttp-opts":{"path":"/x","host":"cdn.example","mode":"auto"}`), ""},
+		{"xhttp download settings", xhttp, node("xhttp", `"xhttp-opts":{"path":"/x","host":"cdn.example","download-settings":{"server":"relay.attacker.example","port":443}}`), "plan_rejected:xhttp-opts.download-settings"},
+		{"xhttp host elsewhere", xhttp, node("xhttp", `"xhttp-opts":{"path":"/x","host":"origin.attacker.example"}`), "plan_rejected:xhttp-opts.host"},
+		{"xhttp Host header elsewhere", xhttp, node("xhttp", `"xhttp-opts":{"path":"/x","headers":{"Host":"origin.attacker.example"}}`), "plan_rejected:xhttp-opts.headers"},
+		{"xhttp ws-opts", xhttp, node("xhttp", `"ws-opts":{"path":"/x"}`), "plan_rejected:ws-opts"},
+		{"honest h2", h2, node("h2", `"h2-opts":{"path":"/h2","host":["cdn.example","alt.cdn.example"]}`), ""},
+		{"h2 host elsewhere", h2, node("h2", `"h2-opts":{"path":"/h2","host":["cdn.example","origin.attacker.example"]}`), "plan_rejected:h2-opts.host"},
+		{"honest grpc", grpc, node("grpc", `"grpc-opts":{"grpc-service-name":"svc"}`), ""},
+		{"grpc authority", grpc, node("grpc", `"grpc-opts":{"grpc-service-name":"svc","authority":"origin.attacker.example"}`), "plan_rejected:grpc-opts.authority"},
+		{"honest http", httpLine, node("http", `"http-opts":{"path":["/"],"headers":{"Host":["cdn.example"]},"method":"GET"}`), ""},
+		{"http Host elsewhere", httpLine, node("http", `"http-opts":{"path":["/"],"headers":{"Host":["origin.attacker.example"]}}`), "plan_rejected:http-opts.headers"},
+		{"a path object", ws, node("ws", `"ws-opts":{"path":{"server":"origin.attacker.example"}}`), "plan_rejected:ws-opts.path"},
+	} {
+		got := bindCheck(t, tc.node, tc.line)
+		if got != "" {
+			got = substoreBindRejectedPrefix + got
+		}
+		if got != tc.want {
+			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -363,7 +486,10 @@ func TestSubstoreBindExcludesTheFifthClone(t *testing.T) {
 func TestSubstoreBindExcludesANodeWithoutALine(t *testing.T) {
 	e := bindFixture(t, 1, 1)
 	foreign := model.SelectionPlanNode{Node: json.RawMessage(`{"name":"injected","type":"vless","server":"relay.attacker.example","port":443,"uuid":"11111111-2222-4333-8444-555555555555"}`)}
-	provider := model.SelectionPlanNode{Provider: true, Node: json.RawMessage(`{"name":"provider","type":"trojan","server":"p.example","port":443,"password":"provider-own"}`)}
+	// A provider node is passed through as it is: a fleet placeholder a
+	// script copied into it stays a placeholder and binds nothing.
+	copied := bindPlaceholder(t, e.rows[0].LineUUID, "uuid")
+	provider := model.SelectionPlanNode{Provider: true, Node: json.RawMessage(`{"name":"provider","type":"vless","server":"relay.attacker.example","port":443,"uuid":"` + copied + `"}`)}
 	plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes, Nodes: []model.SelectionPlanNode{
 		foreign, bindNode(t, e.rows[0], bindPlaceholder(t, e.rows[0].LineUUID, "uuid"), nil), provider}}
 	result := e.bindRun(t, plan, nil)
@@ -407,48 +533,193 @@ func TestSubstoreBindAppliesTheLineAndIdentityChecks(t *testing.T) {
 	}
 }
 
-// A document plan carries the produced text with placeholders still in it.
-// Each placeholder must occur exactly as often as its validated nodes; one
-// copied into a comment is refused with placeholder_count.
-func TestSubstoreBindDocumentPlanCountsPlaceholders(t *testing.T) {
-	e := bindFixture(t, 1, 2)
-	p0, p1 := bindPlaceholder(t, e.rows[0].LineUUID, "uuid"), bindPlaceholder(t, e.rows[1].LineUUID, "uuid")
-	nodes := []model.SelectionPlanNode{bindNode(t, e.rows[0], p0, nil), bindNode(t, e.rows[1], p1, nil)}
-	document := "proxies:\n  - {name: a, type: vless, uuid: " + p0 + "}\n  - {name: b, type: vless, uuid: " + p1 + "}\n"
-	result := e.bindRun(t, model.SelectionPlan{Kind: model.SelectionPlanKindDocument, Nodes: nodes, Document: document}, nil)
-	if result.Refused != "" || result.document == nil || len(result.document.Substitutions) != 2 ||
-		result.document.Substitutions[p0] != bindIdentityUUID || result.document.Content != document {
+// bindDocument writes a mihomo-style document whose proxies are the plan
+// nodes in block style: each value as its JSON text (a YAML flow scalar or
+// mapping), each placeholder plain, as a producer writes one, and the
+// Lattice line_uuid left out. edits replaces the text of a field of one
+// proxy.
+func bindDocument(t testing.TB, nodes []model.SelectionPlanNode, edits map[int]map[string]string) string {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("mixed-port: 7890\nproxies:\n")
+	var names []string
+	for i, node := range nodes {
+		obj, err := parseSubstoreNodeObject(node.Node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prefix := "  - "
+		for _, key := range obj.keys {
+			if key == "line_uuid" {
+				continue
+			}
+			value := string(obj.values[key])
+			if text, ok := obj.string(key); ok && strings.HasPrefix(text, model.PlanPlaceholderPrefix) {
+				value = text
+			}
+			if text, ok := edits[i][key]; ok {
+				value = text
+			}
+			b.WriteString(prefix + key + ": " + value + "\n")
+			prefix = "    "
+		}
+		names = append(names, string(obj.values["name"]))
+	}
+	b.WriteString("proxy-groups:\n  - name: auto\n    type: select\n    proxies:\n")
+	for _, name := range names {
+		b.WriteString("      - " + name + "\n")
+	}
+	return b.String()
+}
+
+// A document plan is served only when its text is tied to the validated
+// nodes: each placeholder that receives a credential is that credential's
+// value in a proxy mapping that passes the node checks for its line, at the
+// place it was read from. Honest typed nodes beside a rewritten text are
+// refused.
+func TestSubstoreBindDocumentPlanTiesTheTextToTheValidatedNodes(t *testing.T) {
+	e := bindFixture(t, 1, 3)
+	var p []string
+	var nodes []model.SelectionPlanNode
+	for _, row := range e.rows {
+		p = append(p, bindPlaceholder(t, row.LineUUID, "uuid"))
+		nodes = append(nodes, bindNode(t, row, p[len(p)-1], nil))
+	}
+	run := func(document string, nodes []model.SelectionPlanNode) substoreBindResult {
+		t.Helper()
+		return e.bindRun(t, model.SelectionPlan{Kind: model.SelectionPlanKindDocument, Nodes: nodes, Document: document}, nil)
+	}
+	document := bindDocument(t, nodes, nil)
+	result := run(document, nodes)
+	if result.Refused != "" || result.document == nil || result.document.Content != document || len(result.document.Substitutions) != len(p) {
 		t.Fatalf("a valid document: refused %q, document %+v", result.Refused, result.document)
+	}
+	for _, placeholder := range p {
+		if result.document.Substitutions[placeholder] != bindIdentityUUID {
+			t.Fatalf("substitution of %s: %q", placeholder, result.document.Substitutions[placeholder])
+		}
 	}
 	if err := result.document.Validate(); err != nil {
 		t.Fatal(err)
 	}
-
-	commented := document + "# backup uuid " + p1 + "\n"
-	result = e.bindRun(t, model.SelectionPlan{Kind: model.SelectionPlanKindDocument, Nodes: nodes, Document: commented}, nil)
-	if result.Refused != substoreBindReasonPlaceholderCount || result.document != nil {
-		t.Fatalf("a placeholder copied into a comment: refused %q", result.Refused)
+	// The same proxies as one line of JSON, a name in CJK before the first
+	// placeholder: the position check counts characters, as the parser does.
+	named := append([]model.SelectionPlanNode{bindNode(t, e.rows[0], p[0], map[string]any{"name": "东京 01 高速"})}, nodes[1:]...)
+	var objects []string
+	for _, node := range named {
+		objects = append(objects, string(node.Node))
 	}
-	// A document is served whole or not at all: a validated node that cannot
-	// be bound refuses it with that node's reason.
+	if result := run(`{"proxies":[`+strings.Join(objects, ",")+`]}`, named); result.Refused != "" {
+		t.Fatalf("a JSON document: refused %q", result.Refused)
+	}
+
+	firstUUID := "uuid: " + p[0]
+	for name, tc := range map[string]struct {
+		document string
+		want     string
+	}{
+		"a placeholder copied into a comment": {document + "# backup " + p[1] + "\n", substoreBindReasonPlaceholderCount},
+		"the server rewritten in the text": {bindDocument(t, nodes, map[int]map[string]string{0: {"server": "relay.attacker.example"}}),
+			"plan_rejected:server"},
+		"two servers rewritten": {bindDocument(t, nodes, map[int]map[string]string{0: {"server": "evil.example"}, 1: {"server": "evil2.example"}}),
+			"plan_rejected:server"},
+		"the port rewritten":         {bindDocument(t, nodes, map[int]map[string]string{2: {"port": "8443"}}), "plan_rejected:port"},
+		"certificate checks off":     {bindDocument(t, nodes, map[int]map[string]string{0: {"skip-cert-verify": "true"}}), "plan_rejected:skip-cert-verify"},
+		"a YAML 1.1 boolean":         {bindDocument(t, nodes, map[int]map[string]string{0: {"skip-cert-verify": "yes"}}), substoreBindReasonPlaceholderContext},
+		"a duplicate server":         {strings.Replace(document, firstUUID, firstUUID+"\n    server: relay.attacker.example", 1), substoreBindReasonPlaceholderContext},
+		"the credential moved":       {strings.Replace(document, firstUUID, "password: "+p[0], 1), substoreBindReasonPlaceholderContext},
+		"inside a longer value":      {strings.Replace(document, firstUUID, "uuid: x-"+p[0], 1), substoreBindReasonPlaceholderContext},
+		"a tagged credential":        {strings.Replace(document, firstUUID, "uuid: !!str "+p[0], 1), substoreBindReasonPlaceholderContext},
+		"an anchored credential":     {strings.Replace(document, firstUUID, "uuid: &u "+p[0], 1), substoreBindReasonPlaceholderContext},
+		"an escape and a comment":    {strings.Replace(document, firstUUID, `uuid: "\u004c`+p[0][1:]+`"`, 1) + "# " + p[0] + "\n", substoreBindReasonPlaceholderContext},
+		"two documents":              {document + "---\nproxies: []\n", "plan_rejected:document"},
+		"text that is not YAML":      {"{" + p[0] + " " + p[1] + " " + p[2], "plan_rejected:document"},
+		"a URI list":                 {"vless://" + p[0] + "@relay.attacker.example:443\nvless://" + p[1] + "@a.example:443\nvless://" + p[2] + "@b.example:443\n", substoreBindReasonPlaceholderContext},
+		"the credential in a URL":    {strings.Replace(document, firstUUID, "uuid: "+lineCatalogueValidationUUID, 1) + "rule-providers:\n  r:\n    url: https://relay.attacker.example/?k=" + p[0] + "\n", substoreBindReasonPlaceholderContext},
+		"an alias to the credential": {strings.Replace(document, firstUUID, "uuid: &u "+p[0], 1) + "extra:\n  - {name: evil, type: vless, server: relay.attacker.example, port: 443, uuid: *u}\n", substoreBindReasonPlaceholderContext},
+		"a merge of a whole proxy": {strings.Replace(document, "proxies:\n  - name:", "proxies:\n  - &h\n    name:", 1) + "extra:\n  - {<<: *h, server: relay.attacker.example}\n",
+			substoreBindReasonPlaceholderContext},
+	} {
+		result := run(tc.document, nodes)
+		if result.Refused != tc.want || result.document != nil {
+			t.Errorf("%s: refused %q, want %q", name, result.Refused, tc.want)
+		}
+	}
+
+	// A typed node that fails validation refuses the document whole.
+	tampered := append([]model.SelectionPlanNode{}, nodes...)
+	tampered[1] = bindNode(t, e.rows[1], p[1], map[string]any{"server": "relay.attacker.example"})
+	if result := run(document, tampered); result.Refused != "plan_rejected:server" || result.document != nil {
+		t.Fatalf("a tampered typed node: refused %q", result.Refused)
+	}
+
+	// An operational exclusion keeps the document: the line's node carries an
+	// inert credential and is listed as excluded, and the others are bound.
 	u := e.identity
 	u.Bindings[1].AppliedCredentialSHA256 = ""
+	u.Bindings[2].Enabled = false
 	if err := e.srv.putVpnUser(u); err != nil {
 		t.Fatal(err)
 	}
-	result = e.bindRun(t, model.SelectionPlan{Kind: model.SelectionPlanKindDocument, Nodes: nodes, Document: document}, nil)
-	if result.Refused != identityLineNotApplied || result.document != nil {
-		t.Fatalf("a document with an unbound node: refused %q", result.Refused)
+	result = run(document, nodes)
+	if result.Refused != "" || result.document == nil || fmt.Sprint(result.reasons()) != fmt.Sprint(map[int]string{1: identityLineNotApplied, 2: identityLineBindingDisabled}) {
+		t.Fatalf("a document with excluded lines: refused %q, exclusions %v", result.Refused, result.reasons())
 	}
-	// A node that fails validation is not counted, so the text it left in
-	// the document breaks the count.
-	u.Bindings[1].Enabled = false
+	if got := result.document.Substitutions; got[p[0]] != bindIdentityUUID || got[p[1]] != lineCatalogueValidationUUID || got[p[2]] != lineCatalogueValidationUUID {
+		t.Fatalf("substitutions %v", got)
+	}
+	if len(result.Entries) != 1 || result.Entries[0].Index != 0 {
+		t.Fatalf("entries %+v", result.Entries)
+	}
+	// An inert line's text is not held to the proxy checks: no credential
+	// reaches it.
+	if result := run(bindDocument(t, nodes, map[int]map[string]string{2: {"server": "elsewhere.example"}}), nodes); result.Refused != "" {
+		t.Fatalf("an inert line's text: refused %q", result.Refused)
+	}
+	// With every line excluded nothing is served.
+	u.Bindings[0].Enabled = false
 	if err := e.srv.putVpnUser(u); err != nil {
 		t.Fatal(err)
 	}
-	result = e.bindRun(t, model.SelectionPlan{Kind: model.SelectionPlanKindDocument, Nodes: nodes, Document: document}, nil)
-	if result.Refused != substoreBindReasonPlaceholderCount || result.reasons()[1] != identityLineBindingDisabled {
-		t.Fatalf("a document with an unvalidated node: refused %q, exclusions %v", result.Refused, result.reasons())
+	if result := run(document, nodes); result.Refused != substoreBindRefusedNoLine {
+		t.Fatalf("a document with no includable line: refused %q", result.Refused)
+	}
+}
+
+// A plan with fleet nodes is refused when the record's snapshot does not say
+// which lines it selected: the identity's bindings never stand in for the
+// selection.
+func TestSubstoreBindRefusesAPlanWithoutASelection(t *testing.T) {
+	e := bindFixture(t, 1, 2)
+	catalogue, err := e.srv.buildLineCatalogue("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, plan := range []model.SelectionPlan{
+		bindNodesPlan(t, e.rows),
+		{Kind: model.SelectionPlanKindDocument, Nodes: bindNodesPlan(t, e.rows).Nodes, Document: "proxies: []\n"},
+	} {
+		result := substoreBindPlan(plan, e.identity, catalogue, nil)
+		if result.Refused != substoreBindRefusedSelection || len(result.nodes) != 0 || result.document != nil || len(result.Entries) != 0 {
+			t.Fatalf("a %s plan without a selection: refused %q, %d nodes, entries %+v", plan.Kind, result.Refused, len(result.nodes), result.Entries)
+		}
+	}
+	row := `{"line_uuid":"` + e.rows[0].LineUUID + `"}`
+	for name, raw := range map[string]string{
+		"a URI list":                   "vless://" + bindIdentityUUID + "@a.example:443",
+		"a document without a version": `{"rows":[` + row + `]}`,
+		"a version of another kind":    `{"catalogue_version":"v1-abc","rows":[` + row + `]}`,
+		"a collection envelope":        `{"members":[{"catalogue_version":"lcv1-abc","rows":[` + row + `]}]}`,
+	} {
+		if got := substoreBindSelection(model.SubscriptionSnapshot{Raw: raw}); got != nil {
+			t.Fatalf("%s gave a selection: %v", name, got)
+		}
+	}
+	// A plan of provider nodes alone binds no credential and needs none.
+	provider := model.SelectionPlan{Kind: model.SelectionPlanKindNodes, Nodes: []model.SelectionPlanNode{
+		{Provider: true, Node: json.RawMessage(`{"name":"p","type":"trojan","server":"p.example","port":443,"password":"provider-own"}`)}}}
+	if result := substoreBindPlan(provider, e.identity, catalogue, nil); result.Refused != "" || len(result.nodes) != 1 {
+		t.Fatalf("a provider plan: refused %q", result.Refused)
 	}
 }
 
@@ -488,6 +759,7 @@ func BenchmarkSubstoreBindThousandLines(b *testing.B) {
 	e := bindFixture(b, 100, 10)
 	plan := bindNodesPlan(b, e.rows)
 	u, _ := e.srv.getVpnUser(bindIdentityID)
+	selected := e.selection()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for b.Loop() {
@@ -495,7 +767,7 @@ func BenchmarkSubstoreBindThousandLines(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if result := substoreBindPlan(plan, u, catalogue, nil); len(result.nodes) != len(e.rows) {
+		if result := substoreBindPlan(plan, u, catalogue, selected); len(result.nodes) != len(e.rows) {
 			b.Fatalf("%d of %d nodes bound", len(result.nodes), len(e.rows))
 		}
 	}

@@ -33,9 +33,19 @@ import (
 //   - a plan with includable lines: the converted document, with
 //     Subscription-Userinfo from the identity's policy, never the provider's;
 //   - a plan with fleet nodes and none includable, a document plan that
-//     cannot be served whole, a share that names no identity, an identity
-//     that is missing or not in service: the decoy, audited with the reason,
-//     so a client keeps the nodes it has.
+//     fails validation, a plan whose record's snapshot does not say which
+//     lines it selected, a plugin whose signed convert budget allows host
+//     calls, a share that names no identity, an identity that is missing or
+//     not in service: the decoy, audited with the reason, so a client keeps
+//     the nodes it has.
+//
+// The selection a plan is checked against is read from the record's
+// snapshot, which the plugin's fetch wrote from catalogue rows. Render and
+// its scripts cannot change it, so a script cannot widen it. The plugin
+// itself is trusted for it: the record and its selector live in the plugin,
+// and core holds no copy to recompute it from. A snapshot core cannot read a
+// selection from refuses the plan rather than letting the identity's
+// bindings stand in for it.
 //
 // The record's snapshot is identity-free, so its content version cannot see
 // an identity rotate a credential, gain a line or get parked. A share that
@@ -89,7 +99,8 @@ func substoreDecodeRenderPlan(content string, raw json.RawMessage) (*model.Selec
 // a snapshot whose content is a catalogue document (its catalogue_version
 // and its rows' line_uuid). Nil when the snapshot is not one (a collection, a
 // provider record that pulled a fleet record, an envelope this core cannot
-// read): the identity's bindings then bound the lines on their own.
+// read), and substoreBindPlan then refuses a plan with fleet nodes with
+// selection_unknown.
 func substoreBindSelection(snap model.SubscriptionSnapshot) map[string]bool {
 	raw := strings.TrimSpace(snap.Raw)
 	if !strings.HasPrefix(raw, "{") {
@@ -193,8 +204,10 @@ func (s *Server) substoreBindRendered(ctx context.Context, share model.Subscript
 		return renderedSubscription{}, err
 	}
 	result := substoreBindPlan(plan, u, catalogue, substoreBindSelection(snap))
-	if result.Insecure > 0 {
-		s.logger.Printf("sub-store bind: share %s: %d bound node(s) turn certificate checks off where their line's template does not", share.ID, result.Insecure)
+	for _, x := range result.Excluded {
+		if x.Reason == substoreBindRejectedPrefix+"skip-cert-verify" {
+			s.logger.Printf("sub-store bind: share %s: line %s excluded: the plan turns certificate checks off where the line's template does not", share.ID, x.LineUUID)
+		}
 	}
 	if result.Refused != "" {
 		return renderedSubscription{}, substoreBindRefusal{reason: substoreBindDenyPrefix + result.Refused}
@@ -229,7 +242,23 @@ func (s *Server) substoreBindRendered(ctx context.Context, share model.Subscript
 	rendered.ContentType = reply.ContentType
 	rendered.Target = firstNonEmpty(reportedRenderTarget(reply.Target), req.Target)
 	rendered.Userinfo = identityLinkUserinfo(policy, false)
+	rendered.Bound = true
 	return rendered, nil
+}
+
+// substoreBindDenyConvertUnsealed refuses a bound plan when the plugin's
+// signed manifest does not hold its convert method to zero host calls.
+const substoreBindDenyConvertUnsealed = "fleet_convert_not_sealed"
+
+// substoreBindConvertSealed reports whether the plugin's signed manifest
+// gives its convert method a complete budget of zero host calls. The
+// runtime enforces that budget per invocation, so a convert that holds a
+// bound credential can reach no host function: no network, no store, no
+// rpc.call and no log.write. An absent budget resolves to the default host
+// call allowance, so it does not count.
+func (s *Server) substoreBindConvertSealed(pluginID string) bool {
+	budget := s.pluginMethodBudget(pluginID, pluginID+"/subscription", "convert")
+	return budget != nil && budget.HostCalls == 0
 }
 
 // substoreBindConvert calls the plugin's convert with a bound plan.
@@ -250,6 +279,9 @@ func (s *Server) substoreBindConvert(ctx context.Context, pluginID string, req m
 			return model.ConvertReply{}, err
 		}
 	} else {
+		if !s.substoreBindConvertSealed(pluginID) {
+			return model.ConvertReply{}, substoreBindRefusal{reason: substoreBindDenyConvertUnsealed}
+		}
 		out, err := s.callRuntimePluginService(ctx, pluginID, pluginID+"/subscription", "convert", payload, nil, nil)
 		if err != nil {
 			return model.ConvertReply{}, err

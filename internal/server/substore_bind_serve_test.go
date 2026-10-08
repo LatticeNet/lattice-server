@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/plugin"
 )
 
 // bindShareEnv is a bind fixture whose Sub-Store record "fleet-1" renders a
@@ -32,9 +33,11 @@ const (
 	// put on the wire: a fleet share's figures are its identity's.
 	bindProviderUserinfo = "upload=9; download=9; total=9; expire=0"
 
-	bindShareToken    = "ffffffffffffffffffffffffffffffff"
-	bindShareNoIDTok  = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-	bindShareDocToken = "dddddddddddddddddddddddddddddddd"
+	bindShareToken      = "ffffffffffffffffffffffffffffffff"
+	bindShareNoIDTok    = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	bindShareDocToken   = "dddddddddddddddddddddddddddddddd"
+	bindSharePlainTok   = "cccccccccccccccccccccccccccccccc"
+	bindShareForeignTok = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
 func bindShareFixture(t *testing.T) *bindShareEnv {
@@ -46,14 +49,18 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, record := range []string{"fleet-1", "fleet-doc"} {
+	// "fleet-foreign" is a record whose snapshot is not a catalogue document,
+	// so it says nothing about which lines were selected.
+	raws := map[string]string{"fleet-1": string(selection), "fleet-doc": string(selection), "plain-1": "vless://provider",
+		"fleet-foreign": `{"members":[` + string(selection) + `]}`}
+	for record, raw := range raws {
 		if err := env.st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: subStorePluginID, SubscriptionID: record,
-			Raw: string(selection), Userinfo: bindProviderUserinfo, FetchedAt: env.now}); err != nil {
+			Raw: raw, Userinfo: bindProviderUserinfo, FetchedAt: env.now}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
-		return model.SubscriptionSnapshot{Raw: string(selection), Userinfo: bindProviderUserinfo, FetchedAt: env.now}, nil
+	s.subscriptionFetch = func(_ context.Context, _, record string) (model.SubscriptionSnapshot, error) {
+		return model.SubscriptionSnapshot{Raw: raws[record], Userinfo: bindProviderUserinfo, FetchedAt: env.now}, nil
 	}
 	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		env.renders.Add(1)
@@ -62,14 +69,14 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 		for _, row := range env.rows {
 			plan.Nodes = append(plan.Nodes, bindNode(t, row, bindPlaceholder(t, row.LineUUID, "uuid"), env.tamper))
 		}
-		if share.Source.SubscriptionID == "fleet-doc" {
+		switch share.Source.SubscriptionID {
+		case "fleet-doc":
 			plan.Kind = model.SelectionPlanKindDocument
-			var doc strings.Builder
-			doc.WriteString("proxies:\n")
-			for _, node := range plan.Nodes {
-				doc.WriteString("  - {uuid: " + node.Placeholders["uuid"] + "}\n")
-			}
-			plan.Document = doc.String()
+			plan.Document = bindDocument(t, plan.Nodes, nil)
+		case "plain-1":
+			// A provider record: a document, no plan, the provider's quota.
+			return renderedSubscription{Body: []byte("plain document"), Userinfo: snap.Userinfo, SourceEpoch: epoch, FetchedAt: snap.FetchedAt,
+				RevalidationVersion: subscriptionRevalidationVersion(snap)}, nil
 		}
 		return renderedSubscription{Plan: &plan, SourceEpoch: epoch, FetchedAt: snap.FetchedAt, RevalidationVersion: subscriptionRevalidationVersion(snap)}, nil
 	}
@@ -90,6 +97,10 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: "fleet-1"}},
 		{ID: "sh-doc", Slug: "doc", Token: bindShareDocToken, Enabled: true,
 			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: "fleet-doc", IdentityID: bindIdentityID}},
+		{ID: "sh-plain", Slug: "plain", Token: bindSharePlainTok, Enabled: true,
+			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: "plain-1", IdentityID: bindIdentityID}},
+		{ID: "sh-foreign", Slug: "foreign", Token: bindShareForeignTok, Enabled: true,
+			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: "fleet-foreign", IdentityID: bindIdentityID}},
 	} {
 		mustUpsertShare(t, env.st, share)
 	}
@@ -246,6 +257,16 @@ func TestSubstoreBindShareRefusals(t *testing.T) {
 	if got := env.shareRefusals("sh-fleet"); len(got) != 1 || got[0] != substoreBindDenyPrefix+substoreBindRefusedNoLine {
 		t.Fatalf("refusals %v", got)
 	}
+	env.tamper = nil
+
+	// A record whose snapshot does not say which lines it selected binds
+	// nothing, rather than every line the identity holds.
+	if rec := env.get("/sub/foreign/" + bindShareForeignTok); rec.Code != http.StatusNotFound {
+		t.Fatalf("a plan without a selection: status %d", rec.Code)
+	}
+	if got := env.shareRefusals("sh-foreign"); len(got) != 1 || got[0] != substoreBindDenyPrefix+substoreBindRefusedSelection {
+		t.Fatalf("refusals %v", got)
+	}
 
 	// An identity that is not in service never reaches the bind step. The
 	// handler refuses it before the cache, and a render that raced the
@@ -274,6 +295,69 @@ func TestSubstoreBindShareRefusals(t *testing.T) {
 	defer env.mu.Unlock()
 	if len(env.converts) != 0 {
 		t.Fatalf("a refused plan reached convert %d time(s)", len(env.converts))
+	}
+}
+
+// A share that names an identity on a record that renders a plain document
+// binds nothing, so its quota header stays the record's own.
+func TestSubstoreBindSharePlainDocumentKeepsItsQuota(t *testing.T) {
+	env := bindShareFixture(t)
+	rec := env.get("/sub/plain/" + bindSharePlainTok)
+	if rec.Code != http.StatusOK || rec.Body.String() != "plain document" {
+		t.Fatalf("status %d body %q", rec.Code, rec.Body.String())
+	}
+	if got, want := rec.Header().Get("Subscription-Userinfo"), subscriptionUserinfoForResponse(bindProviderUserinfo); got != want {
+		t.Fatalf("quota header %q, want the record's %q", got, want)
+	}
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	if len(env.converts) != 0 {
+		t.Fatal("a plain document reached convert")
+	}
+}
+
+// A bound plan reaches convert only when the plugin's signed manifest holds
+// convert to zero host calls; the runtime enforces that budget, so the one
+// method that holds a credential can reach no host function.
+func TestSubstoreBindConvertNeedsAZeroHostCallBudget(t *testing.T) {
+	env := bindShareFixture(t)
+	s := env.srv
+	s.substoreCatalogue.bind.convert = nil
+	install := func(budget *plugin.InvokeBudgetSpec) {
+		s.plugins = []plugin.Loaded{{Manifest: plugin.Manifest{ID: subStorePluginID, Schema: plugin.ManifestSchemaV2,
+			Interfaces: []plugin.InterfaceContract{{Service: subStorePluginID + "/subscription",
+				MethodSpecs: []plugin.InterfaceMethod{{Name: "convert", Effect: plugin.InterfaceEffectRead, Scopes: []string{"substore:admin"}, Budget: budget}}}}}}}
+	}
+	req := model.ConvertRequest{Target: "URI", Format: "plain", Nodes: []json.RawMessage{json.RawMessage(`{"name":"a"}`)}}
+	for name, budget := range map[string]*plugin.InvokeBudgetSpec{
+		"no budget":       nil,
+		"one host call":   {TimeoutMS: 1000, StdoutBytes: 1024, StderrBytes: 1024, HostCalls: 1},
+		"the default cap": {TimeoutMS: 1000, StdoutBytes: 1024, StderrBytes: 1024, HostCalls: plugin.DefaultInvokeHostCalls},
+	} {
+		install(budget)
+		var refusal substoreBindRefusal
+		if _, err := s.substoreBindConvert(context.Background(), subStorePluginID, req); !errors.As(err, &refusal) || refusal.reason != substoreBindDenyConvertUnsealed {
+			t.Fatalf("%s: convert was called or failed otherwise: %v", name, err)
+		}
+	}
+	s.plugins = nil
+	var refusal substoreBindRefusal
+	if _, err := s.substoreBindConvert(context.Background(), subStorePluginID, req); !errors.As(err, &refusal) {
+		t.Fatalf("a plugin that is not loaded: %v", err)
+	}
+	// A sealed convert gets past the check to the runtime (none in this
+	// fixture).
+	install(&plugin.InvokeBudgetSpec{TimeoutMS: 1000, StdoutBytes: 1024, StderrBytes: 1024, HostCalls: 0})
+	if _, err := s.substoreBindConvert(context.Background(), subStorePluginID, req); err == nil || errors.As(err, &refusal) {
+		t.Fatalf("a sealed convert: %v", err)
+	}
+	// Through the share, an unsealed convert answers the decoy, audited.
+	install(nil)
+	if rec := env.get("/sub/fleet/" + bindShareToken); rec.Code != http.StatusNotFound {
+		t.Fatalf("an unsealed convert: status %d", rec.Code)
+	}
+	if got := env.shareRefusals("sh-fleet"); len(got) != 1 || got[0] != substoreBindDenyConvertUnsealed {
+		t.Fatalf("refusals %v", got)
 	}
 }
 

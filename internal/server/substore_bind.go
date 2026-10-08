@@ -45,13 +45,22 @@ import (
 //     port is the template port (plan_rejected:server, plan_rejected:port);
 //  4. every other field is in the named mutable set or is one this file
 //     lists as carried without effect on where or how the client connects;
-//     anything else is plan_rejected:<field>.
+//     anything else is plan_rejected:<field>. skip-cert-verify is in the
+//     mutable set only as false, or as true where the template itself turns
+//     certificate checks off: a script that turns them off for a line whose
+//     template verifies would let anyone on the path read the credential.
 //
-// The values inside the transport options object (ws-opts, grpc-opts and
-// the like) are carried and not compared: they route a request inside the
-// line's own server, which check 3 already fixed, and the parser rewrites
-// them (early data cut from a path, a default path added), so an equality
-// check would refuse honest nodes.
+// A transport options object (ws-opts, xhttp-opts and the like) is checked
+// key by key (substoreBindTransportOptions): it must belong to the node's
+// network, carry only the keys the URI parsers set from a catalogue
+// template, and every key that names a host (a Host header, h2's host list,
+// xhttp's host) must name one of the line's hosts. Path and framing values
+// are not compared, because the parser rewrites them (early data cut from a
+// path, a default path added) and they route only inside the server check 3
+// fixed. A key that names a second endpoint, such as xhttp's
+// download-settings, is refused, and so are the parser annotations that
+// carry raw extra options (_extra, _extra_unsupported) or a gRPC authority:
+// a catalogue template carries no parameter that sets them.
 //
 // A validated node is then bound the way an identity link binds the line
 // (identityLinkLineCheck): the same exclusions with the same reasons, plus,
@@ -59,12 +68,20 @@ import (
 // Binding writes the identity's credential where each placeholder was and,
 // for vless, the identity's flow.
 //
-// A document plan cannot drop a node's text, so it is served whole or not
-// at all. Each placeholder must occur in the document exactly as many times
-// as there are validated nodes carrying it; a placeholder a script copied
-// into a name or a comment breaks the count and the document is refused with
-// placeholder_count. A document with any fleet node left out is refused with
-// that node's reason.
+// A document plan cannot drop a node's text. A node that fails validation
+// (plan_rejected:*, no_line, clone_limit) refuses the whole document with its
+// reason. A node excluded for an operational reason (the line is down, not
+// bound to the identity, its credential not applied, and the like) keeps its
+// text with an inert credential in place of each placeholder, so one line
+// cannot take the identity's whole document offline, and is listed as
+// excluded. Each placeholder must occur in the text exactly as many times as
+// there are plan nodes carrying it (placeholder_count), and every occurrence
+// of a placeholder that receives a real credential must be that credential's
+// own value inside a proxy mapping that passes checks 2 to 4 for the
+// placeholder's line, at the text position the parser read it from
+// (substore_bind_document.go). A script can therefore neither move such a
+// node's server in the text while leaving the typed nodes honest, nor reach
+// the credential through a comment, an alias or a merge key.
 
 // Exclusion reasons and whole-plan refusals of the bind step. The identity
 // link's line reasons (identityLine*) apply as well.
@@ -82,38 +99,60 @@ const (
 	// substoreBindRefusedNoLine: the plan has fleet nodes and none could be
 	// bound. The share answers the decoy so clients keep the nodes they have.
 	substoreBindRefusedNoLine = "no_includable_line"
+	// substoreBindRefusedSelection: the plan has fleet nodes and the record's
+	// snapshot does not say which lines it selected, so check 1 cannot run.
+	// The identity's bindings alone never stand in for the selection.
+	substoreBindRefusedSelection = "selection_unknown"
 )
 
 // Fields of a fleet node, by what the bind step does with them.
 var (
 	// substoreBindMutableFields may differ from the template freely
-	// (design 28's named mutable set). skip-cert-verify set where the
-	// template does not ask for it is counted as a warning.
+	// (design 28's named mutable set), except skip-cert-verify, which
+	// substoreBindCheckNode holds to the template.
 	substoreBindMutableFields = map[string]bool{
 		"name": true, "udp": true, "tfo": true, "mptcp": true, "ip-version": true, "block-quic": true,
 		"ecn": true, "alpn": true, "client-fingerprint": true, "skip-cert-verify": true, "script": true,
 	}
 	// substoreBindComparedFields are checked against the template or the
-	// catalogue row.
+	// catalogue row. The transport options objects are checked key by key
+	// (substoreBindTransportOptions).
 	substoreBindComparedFields = map[string]bool{
 		"type": true, "server": true, "port": true, "uuid": true, "password": true, "username": true,
 		"network": true, "tls": true, "sni": true, "servername": true, "reality-opts": true,
 		"encryption": true, "cipher": true, "alterId": true, "tls-fingerprint": true, "line_uuid": true,
+		"ws-opts": true, "grpc-opts": true, "h2-opts": true, "http-opts": true, "xhttp-opts": true,
 	}
 	// substoreBindCarriedFields are carried and not compared. None of them
 	// moves the connection off the line's server or weakens its security:
-	// flow is replaced by the identity's own, the transport options route
-	// inside the server, the protocol tuning fields change framing only, the
-	// Lattice fields are the catalogue's own metadata and the parser
-	// annotations are the ones the URI parsers set.
+	// flow is replaced by the identity's own, the protocol tuning fields
+	// change framing only, the Lattice fields are the catalogue's own
+	// metadata and the parser annotations are the ones the URI parsers set
+	// from a catalogue template's parameters.
 	substoreBindCarriedFields = map[string]bool{
 		"flow": true, "packet-encoding": true,
-		"ws-opts": true, "grpc-opts": true, "h2-opts": true, "http-opts": true, "xhttp-opts": true,
 		"congestion-controller": true, "udp-relay-mode": true, "reduce-rtt": true, "up": true, "down": true,
 		"line_hash_id": true, "node_id": true, "geo": true, "chain": true, "tags": true, "groups": true,
 		"probe": true, "addresses": true,
-		"_h2": true, "_mode": true, "_grpc-type": true, "_grpc-authority": true, "_spider-x": true,
-		"_extra": true, "_extra_unsupported": true, "_pqv": true, "_v2ray-http-upgrade-ed": true,
+		"_h2": true, "_mode": true, "_grpc-type": true, "_spider-x": true, "_pqv": true, "_v2ray-http-upgrade-ed": true,
+	}
+	// substoreBindTransportOptions are the transport options objects a node
+	// may carry: the network each belongs to and the keys the URI parsers set
+	// in it from a catalogue template's parameters, by kind.
+	substoreBindTransportOptions = map[string]substoreBindOptions{
+		"ws-opts": {network: "ws", keys: map[string]substoreBindOptKind{
+			"path": substoreBindOptPath, "headers": substoreBindOptHeaders, "max-early-data": substoreBindOptScalar,
+			"early-data-header-name": substoreBindOptEarlyDataHeader, "v2ray-http-upgrade": substoreBindOptScalar,
+			"v2ray-http-upgrade-fast-open": substoreBindOptScalar, "_v2ray-http-upgrade-ed": substoreBindOptScalar}},
+		"http-opts": {network: "http", keys: map[string]substoreBindOptKind{
+			"path": substoreBindOptPath, "headers": substoreBindOptHeaders, "method": substoreBindOptScalar}},
+		"h2-opts": {network: "h2", keys: map[string]substoreBindOptKind{
+			"path": substoreBindOptPath, "host": substoreBindOptHosts}},
+		"grpc-opts": {network: "grpc", keys: map[string]substoreBindOptKind{
+			"grpc-service-name": substoreBindOptScalar}},
+		"xhttp-opts": {network: "xhttp", keys: map[string]substoreBindOptKind{
+			"path": substoreBindOptPath, "host": substoreBindOptHosts, "mode": substoreBindOptScalar,
+			"headers": substoreBindOptHeaders}},
 	}
 	// substoreBindCredentialFields are the credential fields of any protocol.
 	substoreBindCredentialFields = []string{"password", "username", "uuid"}
@@ -169,11 +208,8 @@ type substoreBindResult struct {
 	Excluded []substoreBindExclusion
 	// Refused names why the plan cannot be served at all; empty when it can.
 	Refused string
-	// FleetNodes counts the plan's fleet nodes, and Insecure the bound
-	// nodes that turned certificate checks off where their template did
-	// not.
+	// FleetNodes counts the plan's fleet nodes.
 	FleetNodes int
-	Insecure   int
 
 	nodes    []json.RawMessage
 	document *model.ConvertDocument
@@ -506,81 +542,96 @@ func substoreBindRootCheck(u VpnUser, ln Line, row model.LineCatalogueRow, t sto
 }
 
 // substoreBindCheckNode runs checks 2 to 4 on one fleet node. It returns the
-// field to reject the node for, or "", and whether the node turns
-// certificate checks off where the template does not.
-func substoreBindCheckNode(raw json.RawMessage, obj substoreNodeObject, node model.SelectionPlanNode, line *substoreBindLine) (string, bool) {
+// field to reject the node for, or "".
+func substoreBindCheckNode(raw json.RawMessage, obj substoreNodeObject, node model.SelectionPlanNode, line *substoreBindLine) string {
 	shape, t, row := line.shape, line.template, line.row
 	for _, key := range obj.keys {
 		if !substoreBindComparedFields[key] && !substoreBindMutableFields[key] && !substoreBindCarriedFields[key] {
 			if !substoreBindFieldName.MatchString(key) {
-				return "field", false
+				return "field"
 			}
-			return key, false
+			return key
 		}
 	}
 	if value, present := obj.values["line_uuid"]; present && string(value) != strconv.Quote(node.LineUUID) {
-		return "line_uuid", false
+		return "line_uuid"
 	}
 	if typ, _ := obj.string("type"); typ != shape.typ {
-		return "type", false
+		return "type"
 	}
 	if !substoreBindCredentialIntact(raw, obj, node, shape) {
-		return "credential", false
+		return "credential"
 	}
 	if server, _ := obj.string("server"); !substoreBindServerAllowed(server, t, row) {
-		return "server", false
+		return "server"
 	}
 	var port json.Number
 	if json.Unmarshal(obj.values["port"], &port) != nil || port.String() != strconv.Itoa(t.Port) {
-		return "port", false
+		return "port"
 	}
 	network := "tcp"
 	if value, present := obj.values["network"]; present {
 		var text string
 		if json.Unmarshal(value, &text) != nil {
-			return "network", false
+			return "network"
 		}
 		if text != "" {
 			network = strings.ToLower(text)
 		}
 	}
 	if network != shape.network && !(shape.anyNetwork && network == "tcp") {
-		return "network", false
+		return "network"
+	}
+	if field := substoreBindCheckTransport(obj, network, t, row); field != "" {
+		return field
 	}
 	if shape.compareTLS && (string(obj.values["tls"]) == "true") != shape.tls {
-		return "tls", false
+		return "tls"
 	}
 	if !substoreBindRealityMatches(obj, shape) {
-		return "reality-opts", false
+		return "reality-opts"
 	}
 	if !substoreBindSNIAllowed(obj, shape, t, row) {
-		return "sni", false
+		return "sni"
 	}
 	if value, present := obj.values["encryption"]; present {
 		var text string
 		if shape.typ != "vless" || json.Unmarshal(value, &text) != nil || firstNonEmpty(text, "none") != firstNonEmpty(shape.encryption, "none") {
-			return "encryption", false
+			return "encryption"
 		}
 	}
 	if value, present := obj.values["cipher"]; present {
 		var text string
 		if shape.typ != "vmess" || json.Unmarshal(value, &text) != nil || (text != "" && text != "auto") {
-			return "cipher", false
+			return "cipher"
 		}
 	}
 	if value, present := obj.values["alterId"]; present {
 		var aid json.Number
 		if shape.typ != "vmess" || json.Unmarshal(value, &aid) != nil || aid.String() != strconv.Itoa(shape.alterID) {
-			return "alterId", false
+			return "alterId"
 		}
 	}
 	if pin, _ := obj.string("tls-fingerprint"); pin != shape.pin {
 		if _, present := obj.values["tls-fingerprint"]; present || shape.pin != "" {
-			return "tls-fingerprint", false
+			return "tls-fingerprint"
 		}
 	}
-	insecure := string(obj.values["skip-cert-verify"]) == "true" && !shape.insecure
-	return "", insecure
+	// Certificate checks stay what the template says: off only where the
+	// template turns them off, and a JSON boolean, so no client reads a
+	// string as true where this check read it as false.
+	if value, present := obj.values["skip-cert-verify"]; present {
+		switch string(value) {
+		case "false":
+		case "true":
+			if !shape.insecure {
+				return "skip-cert-verify"
+			}
+		default:
+			return "skip-cert-verify"
+		}
+	}
+	return ""
 }
 
 // substoreBindCredentialIntact reports whether a node carries exactly the
@@ -746,12 +797,52 @@ func substoreBindCredentialValue(payload lineUserCredentialPayload, field string
 	return ""
 }
 
+// substoreBindOperationalReasons are the exclusions that describe the line
+// or the identity now rather than the plan: the line is gone, down, parked,
+// not bound to the identity, its credential not applied, its template
+// unusable, its chain path not converged. A document plan keeps such a
+// node's text with an inert credential. Every other reason (plan_rejected:*,
+// no_line, clone_limit) says the plan is not what the catalogue allows, and
+// refuses a document whole.
+var substoreBindOperationalReasons = map[string]bool{
+	identityLineUnknown: true, substoreBindReasonNotBound: true, identityLineBindingDisabled: true,
+	identityLineManaged: true, identityLineProtocol: true, identityLineNotApplied: true,
+	identityLineRotationPending: true, identityLineCredentialUnknown: true, identityLineParked: true,
+	identityLineNoTemplate: true, identityLineTemplateLossy: true, identityLineTemplateUnusable: true,
+	identityLineServiceDown: true, substoreBindReasonGraphDrifted: true, substoreBindReasonGraphBusy: true,
+}
+
+// substoreBindInertValue is what a document carries in place of a
+// placeholder whose line is excluded for an operational reason: a value of
+// the credential's shape that authenticates nowhere, so the document still
+// loads in a client and only that line's node fails.
+func substoreBindInertValue(field string) string {
+	if field == "uuid" {
+		return lineCatalogueValidationUUID
+	}
+	return "lattice-line-excluded"
+}
+
 // substoreBindPlan validates a plan against the catalogue and binds the
 // identity's credentials into it. selected is the line set the record's
-// snapshot selected, nil when the snapshot does not say (the identity's
-// bindings alone then bound the lines). It reads nothing but its arguments.
+// snapshot selected; nil means the snapshot does not say, and a plan with
+// fleet nodes is then refused with selection_unknown rather than bound to
+// every line the identity holds. It reads nothing but its arguments.
 func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, selected map[string]bool) substoreBindResult {
 	result := substoreBindResult{Kind: plan.Kind}
+	for _, node := range plan.Nodes {
+		if !node.Provider && node.LineUUID != "" {
+			result.FleetNodes++
+		}
+	}
+	switch {
+	case len(plan.Nodes) == 0:
+		result.Refused = substoreBindRefusedEmpty
+		return result
+	case selected == nil && (result.FleetNodes > 0 || plan.Kind == model.SelectionPlanKindDocument):
+		result.Refused = substoreBindRefusedSelection
+		return result
+	}
 	excess := map[int]bool{}
 	for _, i := range plan.ExcessClones() {
 		excess[i] = true
@@ -772,6 +863,9 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 		result.Excluded = append(result.Excluded, substoreBindExclusion{Index: index, LineUUID: lineUUID, Name: name,
 			Reason: why.reason, Fix: why.fix, Detail: why.detail})
 	}
+	// carried are the fleet nodes whose placeholders a document keeps, bound
+	// or inert; inert are those excluded for an operational reason.
+	var carried, inert []model.SelectionPlanNode
 	for i, node := range plan.Nodes {
 		obj, err := parseSubstoreNodeObject(node.Node)
 		name := ""
@@ -796,7 +890,6 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 			exclude(i, "", name, identityLinkExclusion{reason: substoreBindReasonNoLine})
 			continue
 		}
-		result.FleetNodes++
 		clones[node.LineUUID]++
 		if excess[i] {
 			exclude(i, node.LineUUID, name, identityLinkExclusion{reason: substoreBindReasonCloneLimit})
@@ -809,50 +902,43 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 		}
 		if line.refuse.reason != "" {
 			exclude(i, node.LineUUID, name, line.refuse)
+			if substoreBindOperationalReasons[line.refuse.reason] {
+				inert = append(inert, node)
+			}
 			continue
 		}
 		if err != nil {
 			exclude(i, node.LineUUID, name, identityLinkExclusion{reason: substoreBindRejectedPrefix + "node"})
 			continue
 		}
-		field, insecure := substoreBindCheckNode(node.Node, obj, node, line)
-		if field != "" {
+		if field := substoreBindCheckNode(node.Node, obj, node, line); field != "" {
 			exclude(i, node.LineUUID, name, identityLinkExclusion{reason: substoreBindRejectedPrefix + field})
 			continue
-		}
-		if insecure {
-			result.Insecure++
 		}
 		server, _ := obj.string("server")
 		validated = append(validated, candidate{index: i, node: node, obj: obj, line: line, entry: substoreBindEntry{
 			Index: i, LineUUID: node.LineUUID, Name: name, Label: line.label, NodeID: line.row.NodeID,
 			Protocol: line.row.Protocol, Server: server, Port: line.template.Port, Clone: clones[node.LineUUID]}})
 	}
-	if plan.Kind == model.SelectionPlanKindDocument {
-		expected := map[string]int{}
-		for _, v := range validated {
-			for _, placeholder := range v.node.Placeholders {
-				expected[placeholder]++
-			}
-		}
-		if !maps.Equal(expected, model.CountPlanPlaceholders(plan.Document)) {
-			result.Refused = substoreBindReasonPlaceholderCount
-		}
-	}
 	substitutions := map[string]string{}
+	placed := map[string]substoreBindPlaced{}
 	for _, v := range validated {
 		if v.line.exclude.reason != "" {
 			exclude(v.index, v.node.LineUUID, v.entry.Name, v.line.exclude)
+			inert = append(inert, v.node)
 			continue
 		}
 		boundObj, err := substoreBindNodeCredential(v.obj, v.node, v.line)
 		if err != nil {
 			exclude(v.index, v.node.LineUUID, v.entry.Name, identityLinkExclusion{reason: identityLineTemplateUnusable})
+			inert = append(inert, v.node)
 			continue
 		}
 		for field, placeholder := range v.node.Placeholders {
 			substitutions[placeholder] = substoreBindCredentialValue(v.line.payload, field)
+			placed[placeholder] = substoreBindPlaced{node: v.node, line: v.line}
 		}
+		carried = append(carried, v.node)
 		bound[v.index] = boundObj.encode()
 		v.entry.Digest = substoreBindEntryDigest(boundObj)
 		result.Entries = append(result.Entries, v.entry)
@@ -860,20 +946,23 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 	sort.SliceStable(result.Entries, func(i, j int) bool { return result.Entries[i].Index < result.Entries[j].Index })
 	sort.SliceStable(result.Excluded, func(i, j int) bool { return result.Excluded[i].Index < result.Excluded[j].Index })
 
+	if plan.Kind == model.SelectionPlanKindDocument {
+		for _, node := range inert {
+			for field, placeholder := range node.Placeholders {
+				if _, real := placed[placeholder]; !real {
+					substitutions[placeholder] = substoreBindInertValue(field)
+				}
+			}
+		}
+		result.Refused = substoreBindDocumentRefusal(plan.Document, result.Excluded, append(carried, inert...), placed)
+	}
 	boundFleet := 0
 	for _, entry := range result.Entries {
 		if !entry.Provider {
 			boundFleet++
 		}
 	}
-	switch {
-	case result.Refused != "":
-	case len(plan.Nodes) == 0:
-		result.Refused = substoreBindRefusedEmpty
-	case plan.Kind == model.SelectionPlanKindDocument && len(result.Excluded) > 0:
-		// A document cannot drop a node's text.
-		result.Refused = result.Excluded[0].Reason
-	case boundFleet == 0 && (result.FleetNodes > 0 || plan.Kind == model.SelectionPlanKindDocument):
+	if result.Refused == "" && boundFleet == 0 && (result.FleetNodes > 0 || plan.Kind == model.SelectionPlanKindDocument) {
 		result.Refused = substoreBindRefusedNoLine
 	}
 	if result.Refused != "" {
@@ -889,4 +978,27 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 		}
 	}
 	return result
+}
+
+// substoreBindDocumentRefusal is why a document plan cannot be served, or
+// "": the first exclusion that is not operational, a placeholder count that
+// differs from the plan nodes the document keeps, or a placeholder that
+// receives a real credential somewhere other than a validated proxy
+// mapping's credential value (substoreBindDocumentCheck).
+func substoreBindDocumentRefusal(document string, excluded []substoreBindExclusion, carried []model.SelectionPlanNode, placed map[string]substoreBindPlaced) string {
+	for _, x := range excluded {
+		if !substoreBindOperationalReasons[x.Reason] {
+			return x.Reason
+		}
+	}
+	expected := map[string]int{}
+	for _, node := range carried {
+		for _, placeholder := range node.Placeholders {
+			expected[placeholder]++
+		}
+	}
+	if !maps.Equal(expected, model.CountPlanPlaceholders(document)) {
+		return substoreBindReasonPlaceholderCount
+	}
+	return substoreBindDocumentCheck(document, placed, expected)
 }

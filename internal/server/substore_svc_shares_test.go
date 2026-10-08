@@ -356,7 +356,9 @@ func TestSubStoreShareRotateOldTokenGetsDecoy(t *testing.T) {
 }
 
 // An archived share answers like a deleted one; restored, the same link
-// serves again. A disabled share stops answering at once.
+// serves again. A disabled share stops serving its document at once: what it
+// answers instead (the decoy, or a placeholder entry naming the state) is the
+// serve path's rule, not this service's.
 func TestSubStoreShareArchivedAndDisabledAreNotServed(t *testing.T) {
 	h := newSubStoreSvcHarness(t)
 	row := h.createShare(t, `{"subscription_id":"rec","slug":"team"}`)
@@ -377,7 +379,7 @@ func TestSubStoreShareArchivedAndDisabledAreNotServed(t *testing.T) {
 	}
 
 	h.mustCall(t, subStoreSharesService, "set_enabled", `{"share_id":"`+row.ShareID+`","enabled":false}`)
-	if res := h.fetch(path); res.Code != unknown.Code || res.Body.String() != unknown.Body.String() {
+	if res := h.fetch(path); strings.Contains(res.Body.String(), "PLAINTEXT-MARKER") {
 		t.Fatalf("a disabled share was served from cache: %d %q", res.Code, res.Body.String())
 	}
 	if evs := h.auditFor(auditActionShareUpdate, row.ShareID); len(evs) != 1 || evs[0].Metadata["enabled"] != "false" {

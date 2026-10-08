@@ -52,6 +52,10 @@ func newDDNSServerWithCloudflare(t *testing.T) (*Server, http.Handler, *store.St
 		}
 		return prov, err
 	}
+	// A CNAME profile's save resolves its target; keep that off real DNS.
+	srv.ddnsLookupHost = func(_ context.Context, host string) ([]string, error) {
+		return []string{"40.160.254.9"}, nil
+	}
 	return srv, srv.Handler(), st, fake
 }
 

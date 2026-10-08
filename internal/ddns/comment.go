@@ -29,13 +29,15 @@ const (
 // syntax the webhook provider's templates already take.
 var CommentPlaceholders = []string{
 	"#node#", "#node_id#", "#profile#", "#domain#", "#type#",
-	"#ip#", "#old_ip#", "#time#", "#date#", "#lattice#",
+	"#ip#", "#old_ip#", "#target#", "#time#", "#date#", "#lattice#",
 }
 
 var placeholderPattern = regexp.MustCompile(`#[A-Za-z0-9_]+#`)
 
-// CommentVars are the values a template is rendered with. Domain, Type, IP and
-// OldIP belong to one record, so the provider fills them in per write.
+// CommentVars are the values a template is rendered with. Domain, Type, IP,
+// OldIP and Target belong to one record, so the provider fills them in per
+// write. A CNAME record has no IP and an A or AAAA record has no Target, so
+// each leaves the other's placeholders empty.
 type CommentVars struct {
 	Node    string
 	NodeID  string
@@ -46,6 +48,7 @@ type CommentVars struct {
 	Type    string
 	IP      string
 	OldIP   string // the record's content before this write; empty on create
+	Target  string // the hostname a CNAME record points to
 }
 
 // Comment says what a record's comment should become. A Record without one
@@ -60,7 +63,7 @@ type Comment struct {
 
 func (c *Comment) render(r Record, oldIP string) string {
 	v := c.Vars
-	v.Domain, v.Type, v.IP, v.OldIP = r.Name, r.Type, r.IP, oldIP
+	v.Domain, v.Type, v.IP, v.OldIP, v.Target = r.Name, r.Type, r.IP, oldIP, r.Target
 	return RenderComment(c.Template, v)
 }
 
@@ -132,6 +135,7 @@ func RenderComment(tmpl string, v CommentVars) string {
 		"#type#", v.Type,
 		"#ip#", v.IP,
 		"#old_ip#", v.OldIP,
+		"#target#", v.Target,
 		"#time#", when.Format("2006-01-02 15:04")+"Z",
 		"#date#", when.Format("2006-01-02"),
 		"#lattice#", v.Lattice,

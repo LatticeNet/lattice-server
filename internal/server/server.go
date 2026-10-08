@@ -319,6 +319,9 @@ type Server struct {
 	now func() time.Time
 	// ddnsProvider builds a DNS provider from a profile; overridable in tests.
 	ddnsProvider func(model.DDNSProfile) (ddns.Provider, error)
+	// ddnsLookupHost resolves a CNAME profile's target for the save-time
+	// warning; overridable in tests so they never reach real DNS.
+	ddnsLookupHost func(ctx context.Context, host string) ([]string, error)
 	// tlsMonitorTargets resolves a tls monitor target to the addresses the
 	// probe may dial. Production uses the outbound address policy; a test
 	// replaces it to reach its own loopback listener, which that policy
@@ -719,6 +722,7 @@ func New(opts Options) (*Server, error) {
 		ddnsProvider: func(p model.DDNSProfile) (ddns.Provider, error) {
 			return ddns.NewProvider(p, nil)
 		},
+		ddnsLookupHost:        net.DefaultResolver.LookupHost,
 		oidc:                  oidc.NewManager(),
 		publicURL:             strings.TrimRight(opts.PublicURL, "/"),
 		metricsToken:          strings.TrimSpace(opts.MetricsToken),
@@ -6054,6 +6058,8 @@ type ddnsView struct {
 	// stored: the edit form reads the profile back to prefill itself, so a
 	// field the view withholds is a field every edit silently resets.
 	IntervalSeconds int       `json:"interval_seconds,omitempty"`
+	RecordType      string    `json:"record_type,omitempty"`
+	CNAMETarget     string    `json:"cname_target,omitempty"`
 	CommentMode     string    `json:"comment_mode,omitempty"`
 	RecordComment   string    `json:"record_comment,omitempty"`
 	HasCredential   bool      `json:"has_credential"`
@@ -6061,6 +6067,7 @@ type ddnsView struct {
 	WebhookMethod   string    `json:"webhook_method,omitempty"`
 	LastIPv4        string    `json:"last_ipv4,omitempty"`
 	LastIPv6        string    `json:"last_ipv6,omitempty"`
+	LastTarget      string    `json:"last_target,omitempty"`
 	LastRunAt       time.Time `json:"last_run_at,omitempty"`
 	LastError       string    `json:"last_error,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -6078,6 +6085,7 @@ func toDDNSView(p model.DDNSProfile) ddnsView {
 		HasCredential:   p.CFAPIToken != "" || p.WebhookHeaders != "",
 		WebhookURL:      p.WebhookURL, WebhookMethod: p.WebhookMethod,
 		CommentMode: p.CommentMode, RecordComment: p.RecordComment,
+		RecordType: p.RecordType, CNAMETarget: p.CNAMETarget, LastTarget: p.LastTarget,
 		LastIPv4: p.LastIPv4, LastIPv6: p.LastIPv6, LastRunAt: p.LastRunAt, LastError: p.LastError,
 		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 	}
@@ -6113,6 +6121,14 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		req.RecordType = strings.TrimSpace(req.RecordType)
+		if ddns.IsCNAME(req) {
+			req.CNAMETarget = ddns.NormalizeHost(req.CNAMETarget)
+		}
+		if err := ddns.ValidateRecordSettings(req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		// An id in the body means "edit this profile". Without this the handler
 		// minted a fresh id on every POST, so a profile could be created and
 		// then never changed: re-submitting it produced a duplicate instead of
@@ -6144,10 +6160,19 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 			}
 			// Run status belongs to the runner, not to whoever is editing.
 			req.LastIPv4, req.LastIPv6 = existing.LastIPv4, existing.LastIPv6
+			req.LastTarget = existing.LastTarget
 			req.LastRunAt, req.LastError = existing.LastRunAt, existing.LastError
 			action = "ddns.update"
 		} else {
 			req.ID = id.New("ddns")
+		}
+		// Each record type keeps only its own status, so a profile switched
+		// from one type to the other shows nothing as published until a run
+		// has published it, and the sweep sees the address as unpublished.
+		if ddns.IsCNAME(req) {
+			req.LastIPv4, req.LastIPv6 = "", ""
+		} else {
+			req.LastTarget = ""
 		}
 		// Validate the provider configuration eagerly by constructing it.
 		if _, err := s.ddnsProvider(req); err != nil {
@@ -6158,7 +6183,7 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider, "comment_mode": ddnsCommentModeLabel(req)}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider, "record_type": ddnsRecordTypeLabel(req), "comment_mode": ddnsCommentModeLabel(req)}})
 		view := toDDNSView(req)
 		view.Warnings = s.ddnsSaveWarnings(r.Context(), req)
 		writeJSON(w, http.StatusOK, view)
@@ -6176,13 +6201,38 @@ func ddnsCommentModeLabel(p model.DDNSProfile) string {
 	return model.DDNSCommentDefault
 }
 
+// ddnsRecordTypeLabel names a profile's record type for the audit trail,
+// spelling the empty type of an older profile as the address type it is.
+func ddnsRecordTypeLabel(p model.DDNSProfile) string {
+	if ddns.IsCNAME(p) {
+		return model.DDNSRecordCNAME
+	}
+	return model.DDNSRecordAddress
+}
+
 // ddnsSaveWarnings looks for what will stop or mislead a profile without
-// refusing the save: a CNAME or NS record already holding one of its names,
-// a name Lattice cannot read back with the profile's credential, and a node
-// behind NAT, whose public IP is only where its traffic leaves.
+// refusing the save: a record already holding one of its names that the
+// profile's records cannot share it with, a name Lattice cannot read back
+// with the profile's credential, a node behind NAT, whose public IP is only
+// where its traffic leaves, and a CNAME target that does not resolve.
+//
+// A CNAME profile gets no NAT warning: pointing at the provider's inbound
+// hostname is the right setup for a node behind NAT.
 func (s *Server) ddnsSaveWarnings(parent context.Context, profile model.DDNSProfile) []string {
 	var warnings []string
-	if inv, ok := s.singBoxInventory(profile.NodeID); ok {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	cname := ddns.IsCNAME(profile)
+	if cname {
+		if addrs, err := s.ddnsLookupHost(ctx, profile.CNAMETarget); err != nil || len(addrs) == 0 {
+			reason := "it has no addresses"
+			if err != nil {
+				reason = err.Error()
+			}
+			warnings = append(warnings, fmt.Sprintf("%s does not resolve from the control plane (%s). The profile is saved, but its records will not reach the node until that name resolves.",
+				profile.CNAMETarget, reason))
+		}
+	} else if inv, ok := s.singBoxInventory(profile.NodeID); ok {
 		edge := strings.TrimSpace(inv.ProviderEdge)
 		if edge != "" || strings.EqualFold(strings.TrimSpace(inv.Network), "nat") {
 			reached := ""
@@ -6201,15 +6251,17 @@ func (s *Server) ddnsSaveWarnings(parent context.Context, profile model.DDNSProf
 	if !ok {
 		return warnings
 	}
-	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
-	defer cancel()
 	for _, domain := range profile.Domains {
 		existing, err := inspector.RecordsAt(ctx, domain)
 		if err != nil {
 			warnings = append(warnings, fmt.Sprintf("Lattice could not read the existing records for %s: %v", domain, err))
 			continue
 		}
-		if blocker, ok := ddns.BlockingRecord(existing); ok {
+		if cname {
+			if blockers := ddns.CNAMEBlockers(existing); len(blockers) > 0 {
+				warnings = append(warnings, ddns.CNAMEConflictSentence(domain, blockers))
+			}
+		} else if blocker, ok := ddns.BlockingRecord(existing); ok {
 			warnings = append(warnings, ddns.ConflictSentence(domain, blocker))
 		}
 	}
@@ -6321,6 +6373,12 @@ func (s *Server) sweepDDNSOnce() int {
 		if !ok {
 			continue
 		}
+		if ddns.IsCNAME(profile) {
+			if s.sweepDDNSCNAME(profile, now) {
+				written++
+			}
+			continue
+		}
 		v4, v6 := "", ""
 		if profile.EnableIPv4 {
 			v4 = strings.TrimSpace(node.PublicIP)
@@ -6350,6 +6408,36 @@ func (s *Server) sweepDDNSOnce() int {
 		written++
 	}
 	return written
+}
+
+// sweepDDNSCNAME is the scheduled check of a CNAME profile, which no address
+// change ever triggers. Its interval is how often Lattice confirms the CNAME
+// is still there and still points at the target, and it repairs one somebody
+// retargeted or removed by hand. A profile found in sync, with nothing failed
+// and nothing edited since its last run, only advances its clock: no write
+// and no audit record every interval. It reports whether it ran the profile.
+func (s *Server) sweepDDNSCNAME(profile model.DDNSProfile, now time.Time) bool {
+	if profile.LastError == "" && profile.LastTarget == profile.CNAMETarget {
+		if prov, err := s.ddnsProvider(profile); err == nil {
+			if inspector, ok := prov.(ddns.Inspector); ok {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				inSync, err := ddns.CNAMEInSync(ctx, inspector, profile)
+				cancel()
+				if err == nil && inSync {
+					profile.LastRunAt = now.UTC()
+					if err := s.store.RecordDDNSRun(profile); err != nil {
+						s.logger.Printf("ddns: persist profile %s: %v", profile.ID, err)
+					}
+					return false
+				}
+			}
+		}
+	}
+	if err := s.runDDNSWithAudit(profile, "", "", s.recordAudit, false); err != nil {
+		s.logger.Printf("ddns sweep: %s (%s): %v", profile.Name, profile.NodeID, err)
+		return false
+	}
+	return true
 }
 
 // handleRunDDNS manually triggers a profile using its bound node's current
@@ -6433,6 +6521,11 @@ func (s *Server) maybeTriggerDDNS(nodeID, oldV4, oldV6, newV4, newV6 string) {
 		return
 	}
 	for _, profile := range s.store.DDNSProfilesForNode(nodeID) {
+		// A CNAME points at the provider's hostname whatever the node's
+		// address is; the sweep checks it on its own interval.
+		if ddns.IsCNAME(profile) {
+			continue
+		}
 		profile := profile
 		go func() {
 			if err := s.runDDNS(profile, newV4, newV6); err != nil {
@@ -6500,11 +6593,15 @@ func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, reco
 		// be told apart from a total one; the whole profile is retried instead.
 		profile.LastError = applyErr.Error()
 	} else {
-		if v4 != "" {
-			profile.LastIPv4 = v4
-		}
-		if v6 != "" {
-			profile.LastIPv6 = v6
+		if ddns.IsCNAME(profile) {
+			profile.LastTarget = profile.CNAMETarget
+		} else {
+			if v4 != "" {
+				profile.LastIPv4 = v4
+			}
+			if v6 != "" {
+				profile.LastIPv6 = v6
+			}
 		}
 		profile.LastError = ""
 	}

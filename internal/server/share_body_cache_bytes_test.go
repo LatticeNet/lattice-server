@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -81,5 +83,69 @@ func TestByteSizedShareCacheEvictsByBytes(t *testing.T) {
 	c.Put(byteCacheKey(5), body(limit), "text/plain", "", "v", now)
 	if c.Len() != before {
 		t.Fatalf("an oversized body changed the cache from %d to %d entries", before, c.Len())
+	}
+}
+
+// The render variant is part of the key the cache stores, so its bytes count
+// toward the cap like the other key fields.
+func TestShareCacheEntrySizeCountsTheVariant(t *testing.T) {
+	plain := subscriptionCacheEntry{key: byteCacheKey(1), body: []byte("body")}
+	variant := plain
+	variant.key.Variant = "target=" + strings.Repeat("v", 300)
+	if got, want := subscriptionCacheEntrySize(variant)-subscriptionCacheEntrySize(plain), len(variant.key.Variant); got != want {
+		t.Fatalf("a %d-byte variant adds %d bytes to the entry size", want, got)
+	}
+}
+
+// The byte count stays exact under concurrent use: after Put, Get,
+// ExtendSnapshot, InvalidateShare and ExpireShare race each other, the
+// accounted bytes equal the sum of the live entries' sizes and stay within
+// the cap. Run with -race.
+func TestByteSizedShareCacheAccountsExactlyUnderConcurrency(t *testing.T) {
+	probe := newSubscriptionByteCache(1, time.Minute)
+	limit := 40 * (subscriptionCacheEntrySize(subscriptionCacheEntry{key: byteCacheKey(0), body: make([]byte, 600)}) + probe.entryOverhead)
+	c := newSubscriptionByteCache(limit, time.Minute)
+	now := time.Now()
+	var wg sync.WaitGroup
+	for w := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 400 {
+				n := (w*31 + i*7) % 64
+				key := byteCacheKey(n)
+				if i%3 == 0 {
+					key.Variant = "target=" + strings.Repeat("x", n)
+				}
+				switch i % 6 {
+				case 0, 1:
+					c.PutSnapshot(key, bytes.Repeat([]byte("b"), 100+n*10), "text/plain", strings.Repeat("u", n), "v", "", false, time.Time{}, now)
+				case 2:
+					c.GetSnapshot(key, now)
+				case 3:
+					if entry, ok := c.GetStale(key); ok {
+						c.ExtendSnapshot(key, entry.revision, strings.Repeat("u", (n*3)%200), "pv", i%2 == 0, now, now)
+					}
+				case 4:
+					c.InvalidateShare(key.ShareID)
+				case 5:
+					c.ExpireShare(key.ShareID, now)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sum := 0
+	for el := c.order.Front(); el != nil; el = el.Next() {
+		entry := el.Value.(*subscriptionCacheEntry)
+		if entry.size != subscriptionCacheEntrySize(*entry)+c.entryOverhead {
+			t.Fatalf("entry %+v carries size %d, want %d", entry.key, entry.size, subscriptionCacheEntrySize(*entry)+c.entryOverhead)
+		}
+		sum += entry.size
+	}
+	if c.bytes != sum || c.bytes > c.maxBytes || len(c.entries) != c.order.Len() {
+		t.Fatalf("bytes=%d sum=%d cap=%d index=%d list=%d", c.bytes, sum, c.maxBytes, len(c.entries), c.order.Len())
 	}
 }

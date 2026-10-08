@@ -304,7 +304,7 @@ func (c *subscriptionCache) removeElement(el *list.Element) {
 }
 
 func subscriptionCacheEntrySize(entry subscriptionCacheEntry) int {
-	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.gzipBody) + len(entry.contentType) + len(entry.wireType) +
+	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.key.Variant) + len(entry.body) + len(entry.gzipBody) + len(entry.contentType) + len(entry.wireType) +
 		len(entry.userinfo) + len(entry.revalidationVersion) + len(entry.publicSourceVersion)
 }
 

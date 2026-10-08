@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -123,6 +125,7 @@ type SystemRunnerOptions struct {
 type systemPluginState struct {
 	pluginID         string
 	execPath         string
+	execSHA256       string
 	workDir          string
 	broker           *Broker
 	failures         int
@@ -334,6 +337,15 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 	if err := writeFileAtomic(execPath, data, 0o700); err != nil {
 		return RunnerStartResult{}, fmt.Errorf("stage artifact: %w", err)
 	}
+	execSHA256 := DigestSHA256(data)
+	// Every worker this generation starts, the first and each replenishment,
+	// execs the staged file only while it is still the verified bytes.
+	startWorker := func(ctx context.Context, gen uint64) (*systemWorkerTransport, error) {
+		if err := r.checkStagedArtifact(pluginID, gen, execPath, execSHA256); err != nil {
+			return nil, err
+		}
+		return startSystemWorkerObserved(ctx, execPath, workDir, r.v2ChildEnv(gen), r.processExitFor(pluginID))
+	}
 
 	pool := newConfiguredSystemPool(r.poolConfig.Size, r.poolConfig.MaxOverflow, r.poolConfig.MaxUses, r.poolConfig.MaxAge, req.Generation)
 	pool.obs = r.opts.PoolObserver
@@ -343,7 +355,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		pool.replenishFn = func(parent context.Context, gen uint64) (*pooledWorker, error) {
 			ctx, cancel := context.WithTimeout(parent, r.poolConfig.StartTimeout)
 			defer cancel()
-			t, err := startSystemWorkerObserved(ctx, execPath, workDir, r.v2ChildEnv(gen), r.processExitFor(pluginID))
+			t, err := startWorker(ctx, gen)
 			if err != nil {
 				return nil, err
 			}
@@ -351,7 +363,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		}
 		startupCtx, cancel := context.WithTimeout(ctx, r.poolConfig.StartTimeout)
 		startBegan := time.Now()
-		transport, startErr := startSystemWorkerObserved(startupCtx, execPath, workDir, r.v2ChildEnv(req.Generation), r.processExitFor(pluginID))
+		transport, startErr := startWorker(startupCtx, req.Generation)
 		if startErr == nil {
 			startErr = transport.awaitReadyContext(startupCtx, req.Generation)
 		}
@@ -406,7 +418,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	refsDone := make(chan struct{})
 	close(refsDone)
-	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), refsDone: refsDone, v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel}
+	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, execSHA256: execSHA256, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), refsDone: refsDone, v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel}
 	committed = true
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
@@ -955,10 +967,10 @@ func (r *SystemRunner) Invoke(ctx context.Context, req InvokeRequest) (InvokeRes
 func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *systemPluginState) (InvokeResponse, error) {
 	r.mu.Lock()
 	tripped := st != nil && st.tripped
-	execPath, workDir := "", ""
+	execPath, execSHA256, workDir := "", "", ""
 	var broker *Broker
 	if st != nil {
-		execPath, workDir = st.execPath, st.workDir
+		execPath, execSHA256, workDir = st.execPath, st.execSHA256, st.workDir
 		broker = st.broker
 	}
 	r.mu.Unlock()
@@ -999,7 +1011,7 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 	v1Ctx, v1Cancel := context.WithCancel(runCtx)
 	st.v1Active[v1ID] = v1Cancel
 	r.mu.Unlock()
-	reply, stderr, stderrTruncated, runErr := r.runInvocation(v1Ctx, req, execPath, workDir, broker, budget)
+	reply, stderr, stderrTruncated, runErr := r.runInvocation(v1Ctx, req, execPath, execSHA256, workDir, broker, budget)
 	v1Cancel()
 	r.mu.Lock()
 	delete(st.v1Active, v1ID)
@@ -1145,7 +1157,10 @@ type systemHostResponse struct {
 	Error  string          `json:"error,omitempty"`
 }
 
-func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, execPath, workDir string, broker *Broker, budget ResolvedInvokeBudget) (systemRunnerReply, []byte, bool, error) {
+func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, execPath, execSHA256, workDir string, broker *Broker, budget ResolvedInvokeBudget) (systemRunnerReply, []byte, bool, error) {
+	if err := r.checkStagedArtifact(req.PluginID, req.Generation, execPath, execSHA256); err != nil {
+		return systemRunnerReply{}, nil, false, err
+	}
 	cmd := exec.Command(execPath)
 	cmd.Dir = workDir
 	cmd.Env = append(r.childEnv(), "LATTICE_HOST_RESPONSE_FD=3")
@@ -1840,6 +1855,55 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 func (c *cappedBuffer) Bytes() []byte { return c.buf.Bytes() }
 
 func (c *cappedBuffer) Truncated() bool { return c.truncated }
+
+// errStagedArtifactChanged marks a staged artifact that is no longer the file
+// the runner wrote from verified bytes.
+var errStagedArtifactChanged = errors.New("staged plugin artifact no longer matches the verified bytes")
+
+// checkStagedArtifact refuses to exec a staged artifact that is no longer the
+// file Prepare staged from the verified bytes, and logs the refusal. A plugin
+// process runs with the staging directory as its working directory, so a
+// plugin that finds a way to write files there (a script sandbox escape, for
+// one) could otherwise replace the artifact and have its own code run by the
+// next replenishment or invocation. This narrows that window to the gap
+// between the check and exec; it does not stand in for the sandbox.
+func (r *SystemRunner) checkStagedArtifact(pluginID string, generation uint64, path, wantSHA256 string) error {
+	err := stagedArtifactMatches(path, wantSHA256)
+	if err != nil {
+		r.logf("plugin runtime: refusing to start %s generation %d: %v", pluginID, generation, err)
+	}
+	return err
+}
+
+// stagedArtifactMatches reports whether path is still a regular file, not a
+// symlink, with mode 0700 and the SHA-256 wantSHA256. It opens without
+// following a symlink and without blocking on a FIFO, then judges the file it
+// opened rather than the path.
+func stagedArtifactMatches(path, wantSHA256 string) error {
+	if wantSHA256 == "" {
+		return fmt.Errorf("%w: no verified digest is recorded for %s", errStagedArtifactChanged, path)
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errStagedArtifactChanged, err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("%w: %v", errStagedArtifactChanged, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("%w: %s is %s, want a regular file with mode 0700", errStagedArtifactChanged, path, info.Mode())
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("%w: read %s: %v", errStagedArtifactChanged, path, err)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != wantSHA256 {
+		return fmt.Errorf("%w: %s has sha256 %s, want %s", errStagedArtifactChanged, path, got, wantSHA256)
+	}
+	return nil
+}
 
 // writeFileAtomic writes data to a temp file in the destination dir then renames
 // it into place with mode, so a concurrent exec never sees a partial artifact.

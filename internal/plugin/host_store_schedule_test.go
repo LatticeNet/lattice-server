@@ -221,6 +221,10 @@ func TestOperatorHTTPAdmitsReadAndRemoveOnlyOnTheArtifactMethods(t *testing.T) {
 		{"latticenet.sub-store", "latticenet.sub-store/subscription", "migrate", "GET", true},
 		{"latticenet.sub-store", "latticenet.sub-store/subscription", "migrate", "DELETE", false},
 		{"p.other", "latticenet.sub-store/subscription", "migrate", "GET", false},
+		// The exception names Sub-Store's service, not a method name: another
+		// plugin's own subscription.migrate reads nothing.
+		{"p.other", "p.other/subscription", "migrate", "GET", false},
+		{"p.other", "p.other/subscription", "migrate", "", false},
 	}
 	for _, tc := range cases {
 		host := &s0Host{}

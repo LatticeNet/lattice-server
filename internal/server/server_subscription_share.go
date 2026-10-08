@@ -353,6 +353,20 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 			plan.CoreUser = &user
 		}
 	}
+	// A plugin share that names an identity serves that identity's
+	// credentials, bound in core (substore_bind_serve.go): the identity must
+	// be in service, its bind state keys the cached body, and its policy
+	// writes the quota header.
+	var bindPolicy *vpnUserPolicy
+	if share.Source.Kind == model.ShareSourcePlugin && share.Source.IdentityID != "" {
+		bindToken, policy, refusal := s.substoreBindServeState(share, s.now())
+		if refusal != "" {
+			deny(refusal, map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+			return
+		}
+		key.Variant += bindToken
+		bindPolicy = &policy
+	}
 
 	var cacheEntry subscriptionCacheEntry
 	var cached bool
@@ -430,6 +444,10 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	// ?noFlow=1 keeps quota headers off the wire (upstream's 不查询订阅流量) —
 	// some clients probe aggressively when they see one.
 	quota := subscriptionUserinfoForResponse(userinfo)
+	if bindPolicy != nil {
+		// The identity's own figures, read now, as its link writes them.
+		quota = identityLinkUserinfo(*bindPolicy, false)
+	}
 	if variant.NoFlow {
 		quota = ""
 	}
@@ -653,6 +671,10 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		if s.subscriptionRender != nil {
 			rendered, err := s.subscriptionRender(ctx, share, format, uaClass, variant, snap)
 			rendered.SourceEpoch = epoch
+			if err == nil {
+				// A fleet-bound record's plan is bound here (substore_bind_serve.go).
+				rendered, err = s.substoreBindRendered(ctx, share, format, variant, snap, rendered)
+			}
 			return rendered, err
 		}
 		payload, err := subscriptionRenderPayload(share.Source.SubscriptionID, format, uaClass, variant, snap.Raw)
@@ -672,14 +694,21 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 			// core labels the response from it only after checking it against
 			// the bounded target set.
 			Target string `json:"target"`
+			// Plan is a fleet-bound record's selection plan, in place of
+			// Content (substore_bind_serve.go).
+			Plan json.RawMessage `json:"plan"`
 		}
 		if err := json.Unmarshal(out, &reply); err != nil {
 			return renderedSubscription{}, fmt.Errorf("decode plugin render reply: %w", err)
 		}
+		plan, err := substoreDecodeRenderPlan(reply.Content, reply.Plan)
+		if err != nil {
+			return renderedSubscription{}, err
+		}
 		// The provider's traffic figures are passed through verbatim so the
 		// client's remaining-quota display stays truthful.
-		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Target: reply.Target, Userinfo: snap.Userinfo,
-			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
+		return s.substoreBindRendered(ctx, share, format, variant, snap, renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Target: reply.Target, Userinfo: snap.Userinfo,
+			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt, Plan: plan})
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
@@ -723,4 +752,7 @@ type renderedSubscription struct {
 	SourceVersion       string
 	SourceEpoch         uint64
 	FetchedAt           time.Time
+	// Plan is a fleet-bound record's selection plan, which the bind step
+	// turns into Body before anything is cached (substore_bind_serve.go).
+	Plan *model.SelectionPlan
 }

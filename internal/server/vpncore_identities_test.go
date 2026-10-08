@@ -11,7 +11,9 @@ import (
 )
 
 // The identity pickers' list names who a share may serve and whether that
-// identity can be served now, and nothing a client could connect with.
+// identity can be served now, and nothing a client could connect with. It
+// carries no email address either: personal contact data does not go to a
+// plugin by default.
 func TestVPNCoreIdentitiesListIsCredentialFree(t *testing.T) {
 	e := catalogueFixture(t, 1, 2)
 	const activeUUID = "3d4e5f60-7182-4a9b-8c0d-1e2f3a4b5c6d"
@@ -35,7 +37,7 @@ func TestVPNCoreIdentitiesListIsCredentialFree(t *testing.T) {
 			t.Fatalf("identities list carries a credential: %s", raw)
 		}
 	}
-	for _, key := range []string{`"credentials"`, `"bindings"`, `"sub_id"`, `"link"`} {
+	for _, key := range []string{`"credentials"`, `"bindings"`, `"sub_id"`, `"link"`, `"email"`, "@example.com"} {
 		if strings.Contains(string(raw), key) {
 			t.Fatalf("identities list carries %s: %s", key, raw)
 		}
@@ -51,7 +53,7 @@ func TestVPNCoreIdentitiesListIsCredentialFree(t *testing.T) {
 	if reply.Count != 3 || len(byID) != 3 {
 		t.Fatalf("list = %s", raw)
 	}
-	if got := byID["vu-cat"]; got.Status != model.ProxyUserStatusActive || got.BoundLines != 2 || got.Name != "Cat" || got.Email != "cat@example.com" {
+	if got := byID["vu-cat"]; got.Status != model.ProxyUserStatusActive || got.BoundLines != 2 || got.Name != "Cat" {
 		t.Fatalf("active identity = %+v", got)
 	}
 	if got := byID["vu-off"]; got.Status == model.ProxyUserStatusActive || got.Reason == "" || got.BoundLines != 0 {

@@ -19,11 +19,12 @@ import (
 const vpnCoreIdentitiesService = "latticenet.vpn-core/identities"
 
 // vpnCoreIdentityItem is one identity as the list carries it. It names no
-// credential, no binding and no link.
+// credential, no binding and no link, and no email address: the pickers show
+// the name, and personal contact data does not go to a plugin without an
+// operator decision.
 type vpnCoreIdentityItem struct {
 	ID    string `json:"id"`
 	Name  string `json:"name,omitempty"`
-	Email string `json:"email,omitempty"`
 	Group string `json:"group,omitempty"`
 	// Status is the identity's policy now: active, disabled, expired or
 	// over_quota. A share for an identity that is not active serves the
@@ -44,7 +45,7 @@ type vpnCoreIdentitiesListReply struct {
 
 // vpnCoreIdentitiesRPC serves latticenet.vpn-core/identities.
 //
-//	list {} -> {"identities":[{id,name,email,group,status,reason,bound_lines,expires_at}],"count":N}
+//	list {} -> {"identities":[{id,name,group,status,reason,bound_lines,expires_at}],"count":N}
 func (s *Server) vpnCoreIdentitiesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
 	if err := vpnCoreReadAllowed(ctx); err != nil {
 		return nil, err
@@ -60,7 +61,7 @@ func (s *Server) vpnCoreIdentitiesRPC(ctx context.Context, method string, reques
 	reply := vpnCoreIdentitiesListReply{Identities: make([]vpnCoreIdentityItem, 0, len(users)), Count: len(users)}
 	for _, u := range users {
 		policy := s.vpnUserPolicyAt(u, now)
-		item := vpnCoreIdentityItem{ID: u.ID, Name: u.Name, Email: u.Email, Group: u.Group, Status: policy.Status, Reason: policy.Reason}
+		item := vpnCoreIdentityItem{ID: u.ID, Name: u.Name, Group: u.Group, Status: policy.Status, Reason: policy.Reason}
 		for _, binding := range u.Bindings {
 			if binding.Enabled {
 				item.BoundLines++

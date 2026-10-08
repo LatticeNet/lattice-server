@@ -101,9 +101,22 @@ func (s *Server) subStoreSharesRPC(ctx context.Context, method string, request [
 		req.ShareID = strings.TrimSpace(req.ShareID)
 		var reveal secretRevealDecision
 		if req.ShareID != "" {
+			// A link leaves core only for the operator's own gateway call. A
+			// plugin method reaching list through rpc.call while it serves the
+			// operator would carry the token into the plugin runtime.
+			if operatorCalledCoreService(ctx) != subStoreSharesService {
+				return nil, rpcAPIError(http.StatusForbidden, model.APIErrorForbidden,
+					subStoreSharesService+": a link is revealed only to the operator's own call through the plugin gateway")
+			}
 			share, ok := s.store.SubscriptionShare(req.ShareID)
 			if !ok || share.Source.Kind != model.ShareSourcePlugin || share.Source.PluginID != subStorePluginID {
 				return nil, rpcAPIError(http.StatusNotFound, model.APIErrorNotFound, "share not found")
+			}
+			// An archived share answers like a deleted one; its link is not
+			// handed out until it is restored.
+			if share.ArchivedAt != nil {
+				return nil, rpcAPIError(http.StatusConflict, subStoreSvcErrConflict,
+					"share "+share.ID+" is archived; restore it before revealing its link")
 			}
 			ev := model.AuditEvent{Action: auditActionShareReveal, Scope: "proxy:admin",
 				Metadata: map[string]string{"share_id": share.ID, "slug": share.Slug, "token_sha256": proxySubTokenAuditHash(share.Token), "via_rpc": subStoreSharesService}}
@@ -119,7 +132,7 @@ func (s *Server) subStoreSharesRPC(ctx context.Context, method string, request [
 			if share.Source.Kind != model.ShareSourcePlugin || share.Source.PluginID != subStorePluginID {
 				continue
 			}
-			if share.ArchivedAt != nil && !req.IncludeArchived && share.ID != req.ShareID {
+			if share.ArchivedAt != nil && !req.IncludeArchived {
 				continue
 			}
 			row := subStoreSvcShareRow(share)

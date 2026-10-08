@@ -79,8 +79,8 @@ func (s *Server) subStoreSvcSharesRPC(ctx context.Context, method string, reques
 	if err != nil {
 		return nil, err
 	}
-	s.subStoreSvc.mu.Lock()
-	defer s.subStoreSvc.mu.Unlock()
+	release := s.subStoreSvcLockShareWrites()
+	defer release()
 	switch method {
 	case "create":
 		return s.subStoreSvcShareCreate(p, request)

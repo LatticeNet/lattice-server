@@ -457,3 +457,133 @@ func TestSubStoreSharesCreateKeepsFleetFeedGuard(t *testing.T) {
 		t.Fatal("the flag was not stored on the share")
 	}
 }
+
+// rest drives the REST share API the way its routes do.
+func (h *subStoreSvcHarness) rest(method, path, body string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if path == "/api/subscription-shares" {
+		h.srv.handleSubscriptionShares(rec, req, subStoreSvcAdmin)
+	} else {
+		h.srv.handleSubscriptionShareItem(rec, req, subStoreSvcAdmin)
+	}
+	return rec
+}
+
+// The REST share API and the share service write share records under one
+// lock: a REST change waits while the service holds it, so neither writes
+// back a share the other changed between its load and its save (a rotate
+// written over would serve the revoked token again).
+func TestSubStoreShareRESTWritesTakeTheShareWriteLock(t *testing.T) {
+	h := newSubStoreSvcHarness(t)
+	rotated := h.createShare(t, `{"subscription_id":"rec","slug":"rotated"}`)
+	patched := h.createShare(t, `{"subscription_id":"rec","slug":"patched"}`)
+	deleted := h.createShare(t, `{"subscription_id":"rec","slug":"deleted"}`)
+	before, _ := h.st.SubscriptionShare(rotated.ShareID)
+
+	calls := map[string]func() *httptest.ResponseRecorder{
+		"rotate": func() *httptest.ResponseRecorder {
+			return h.rest(http.MethodPost, "/api/subscription-shares/"+rotated.ShareID+"/rotate", `{}`)
+		},
+		"patch": func() *httptest.ResponseRecorder {
+			return h.rest(http.MethodPatch, "/api/subscription-shares/"+patched.ShareID, `{"enabled":false}`)
+		},
+		"delete": func() *httptest.ResponseRecorder {
+			return h.rest(http.MethodDelete, "/api/subscription-shares/"+deleted.ShareID, ``)
+		},
+		"create": func() *httptest.ResponseRecorder {
+			return h.rest(http.MethodPost, "/api/subscription-shares",
+				`{"slug":"created","source":{"kind":"plugin","plugin_id":"`+subStorePluginID+`","subscription_id":"rec"}}`)
+		},
+	}
+	want := map[string]int{"rotate": http.StatusOK, "patch": http.StatusOK, "delete": http.StatusNoContent, "create": http.StatusCreated}
+	type result struct {
+		name string
+		code int
+	}
+	done := make(chan result, len(calls))
+	release := h.srv.subStoreSvcLockShareWrites()
+	for name, call := range calls {
+		go func() { done <- result{name, call().Code} }()
+	}
+	select {
+	case r := <-done:
+		release()
+		t.Fatalf("REST %s finished while the share service held the share-write lock", r.name)
+	case <-time.After(300 * time.Millisecond):
+	}
+	release()
+	for range calls {
+		select {
+		case r := <-done:
+			if r.code != want[r.name] {
+				t.Fatalf("REST %s answered %d, want %d", r.name, r.code, want[r.name])
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a REST share write never finished after the lock was released")
+		}
+	}
+	if after, _ := h.st.SubscriptionShare(rotated.ShareID); after.Token == before.Token {
+		t.Fatal("the REST rotate did not rotate")
+	}
+}
+
+// The REST share API keeps the recycle bin's rule: an archived share is
+// restored before it is edited, rotated or revealed. Deleting it is allowed.
+func TestSubStoreArchivedShareRESTRefusesEditRotateAndReveal(t *testing.T) {
+	h := newSubStoreSvcHarness(t)
+	row := h.createShare(t, `{"subscription_id":"rec","slug":"binned"}`)
+	h.mustCall(t, subStoreSharesService, "archive", `{"share_id":"`+row.ShareID+`"}`)
+	before, _ := h.st.SubscriptionShare(row.ShareID)
+	item := "/api/subscription-shares/" + row.ShareID
+	for name, rec := range map[string]*httptest.ResponseRecorder{
+		"reveal": h.rest(http.MethodPost, item+"/reveal", `{}`),
+		"rotate": h.rest(http.MethodPost, item+"/rotate", `{}`),
+		"patch":  h.rest(http.MethodPatch, item, `{"enabled":false}`),
+	} {
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "archived") {
+			t.Fatalf("REST %s of an archived share: %d %s", name, rec.Code, rec.Body.String())
+		}
+	}
+	if after, _ := h.st.SubscriptionShare(row.ShareID); after.Token != before.Token || !after.Enabled {
+		t.Fatal("a refused REST call changed the archived share")
+	}
+	if len(h.auditFor(auditActionShareReveal, row.ShareID)) != 0 {
+		t.Fatal("a refused reveal was audited as a reveal attempt of an archived share")
+	}
+	if rec := h.rest(http.MethodDelete, item, ``); rec.Code != http.StatusNoContent {
+		t.Fatalf("REST delete of an archived share: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// list reveals a link only to the operator's own gateway call, and never an
+// archived share's link.
+func TestSubStoreSharesListRevealRefusesArchivedAndRPCCalls(t *testing.T) {
+	h := newSubStoreSvcHarness(t)
+	revealer := principal{Principal: rbac.Principal{ActorID: "agent", TokenID: "token_reveal",
+		Scopes: []string{"proxy:admin", rbac.SecretRevealScope}}, viaBearer: true}
+	row := h.createShare(t, `{"subscription_id":"rec","slug":"team"}`)
+	stored, _ := h.st.SubscriptionShare(row.ShareID)
+	body := []byte(`{"share_id":"` + row.ShareID + `"}`)
+
+	out, err := h.call(revealer, subStoreSharesService, "list", string(body))
+	if err != nil || !strings.Contains(string(out), stored.Token) {
+		t.Fatalf("the operator's own reveal: %v %s", err, out)
+	}
+	// A plugin method reaching list through rpc.call while it serves the
+	// operator carries the principal and not the gateway mark.
+	served := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, revealer)
+	if out, err := h.srv.subStoreSharesRPC(served, "list", body); subStoreSvcErrStatus(err) != http.StatusForbidden || strings.Contains(string(out), stored.Token) {
+		t.Fatalf("a reveal through rpc.call: %v %s", err, out)
+	}
+
+	h.mustCall(t, subStoreSharesService, "archive", string(body))
+	reveals := len(h.auditFor(auditActionShareReveal, row.ShareID))
+	if out, err := h.call(revealer, subStoreSharesService, "list", string(body)); subStoreSvcErrStatus(err) != http.StatusConflict || strings.Contains(string(out), stored.Token) {
+		t.Fatalf("a reveal of an archived share: %v %s", err, out)
+	}
+	if len(h.auditFor(auditActionShareReveal, row.ShareID)) != reveals {
+		t.Fatal("a refused reveal of an archived share was recorded as a reveal")
+	}
+}

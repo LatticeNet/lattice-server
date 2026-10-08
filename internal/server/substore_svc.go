@@ -38,9 +38,8 @@ const (
 
 // subStoreSvcState is the state the two services keep on the server.
 type subStoreSvcState struct {
-	// mu serialises this lane's share writes and plan decisions, so two
-	// operator calls editing one share cannot lose an edit between the read
-	// and the write.
+	// mu is the share-write lock (subStoreSvcLockShareWrites). It is never
+	// held across a plugin call.
 	mu sync.Mutex
 	// previewer runs validate-and-bind for one record revision and one
 	// identity (substore_svc_plans.go). It is nil until the bind code is
@@ -56,9 +55,22 @@ func (s *Server) registerSubStoreSvcRPC() {
 	if s.pluginRPC == nil {
 		return
 	}
-	if err := s.pluginRPC.Register(subStorePluginID, subStorePlansService, "v1", []string{"propose", "status"}, s.subStorePlansRPC); err != nil {
+	if err := s.pluginRPC.Register(subStorePluginID, subStorePlansService, "v1", []string{"propose", "status", "claim_apply"}, s.subStorePlansRPC); err != nil {
 		s.logger.Printf("sub-store: register %s failed: %v", subStorePlansService, err)
 	}
+}
+
+// subStoreSvcLockShareWrites takes the share-write lock and returns its
+// release. Every load, change and save of a share record holds it, through
+// these services and through the REST share API
+// (server_subscription_share_api.go) alike: both write the whole record
+// back, so without one lock a rotate between the other's load and save would
+// be written over, and the revoked token would serve again. A plan decision
+// holds it from its last check of the record's shares to its approval, so
+// no share appears in between.
+func (s *Server) subStoreSvcLockShareWrites() func() {
+	s.subStoreSvc.mu.Lock()
+	return s.subStoreSvc.mu.Unlock
 }
 
 // subStoreSvcOperator returns the operator a call is made for, after the

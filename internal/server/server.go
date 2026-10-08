@@ -8605,6 +8605,14 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 				"node agent has not advertised netguard-managed-sha-v1; update or reconnect the agent before applying"),
 		}
 	}
+	// A Sub-Store plan is core's own: it applies by calling the plugin's
+	// apply_revision, not by a node task (substore_svc_plans.go). It is
+	// decided before the task kill switch on purpose: the switch stops node
+	// tasks, a revision publish queues none, and a record edit that needs
+	// no plan publishes with the switch on, so a reviewed one does too.
+	if isSubStorePlanApproval(approval) {
+		return s.subStorePlanApprove(ctx, p, approval, queueApply)
+	}
 	if queueApply && s.taskExecutionDisabled {
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:       id.New("audit"),
@@ -8616,11 +8624,6 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 			Metadata: map[string]string{"approval_id": approval.ID},
 		})
 		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(apiErrorTaskExecutionDisabled, errTaskExecutionDisabled.Error()), taskExecutionDisabled: true}
-	}
-	// A Sub-Store plan is core's own: it applies by calling the plugin's
-	// apply_revision, not by a node task (substore_svc_plans.go).
-	if isSubStorePlanApproval(approval) {
-		return s.subStorePlanApprove(ctx, p, approval, queueApply)
 	}
 	// A plugin operation (§9.3) is applied by its own artifact, not by a core apply
 	// script. This is the generic branch the spec asks for: no per-plugin case, no

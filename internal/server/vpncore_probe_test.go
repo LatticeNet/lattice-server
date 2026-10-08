@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
@@ -227,7 +228,7 @@ func TestProbeHealthReportsAvailabilityAndWhyNot(t *testing.T) {
 		handler http.HandlerFunc
 		want    string
 	}{
-		"socket missing":  {socket: filepath.Join(filepath.Dir(fake.socket), "absent.sock"), want: "no probe socket at"},
+		"socket missing":  {socket: filepath.Join(filepath.Dir(fake.socket), "absent.sock"), want: "absent.sock does not exist"},
 		"nobody listens":  {socket: refusing, want: "nothing is listening"},
 		"server error":    {handler: func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusInternalServerError) }, want: "HTTP 500"},
 		"not a probe":     {handler: func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"hello":"world"}`) }, want: "could not be read"},
@@ -243,7 +244,7 @@ func TestProbeHealthReportsAvailabilityAndWhyNot(t *testing.T) {
 			}
 			client := newProbeClient(socket)
 			client.healthTimeout = 200 * time.Millisecond
-			view := client.health(context.Background())
+			view := client.health(context.Background(), true)
 			if view.Available || !strings.Contains(view.Reason, tc.want) || view.probeHealth != nil {
 				t.Fatalf("want unavailable with %q, got %+v", tc.want, view)
 			}
@@ -287,8 +288,24 @@ func TestSystemHealthShowsProbeHealth(t *testing.T) {
 		t.Fatalf("System must show an available probe: %+v", got)
 	}
 	f.srv.probe = newProbeClient(fake.socket + ".gone")
-	if got := read(); got.Available || !strings.Contains(got.Reason, "no probe socket at") {
+	if got := read(); got.Available || got.Reason != "the probe socket does not exist; is the lattice-probe container running?" {
 		t.Fatalf("System must say why the probe is unavailable: %+v", got)
+	}
+	// More principals read System than hold vpn:probe, so its reason leaves
+	// the socket's path out; the vpn-core/probe health method keeps it.
+	refusing := filepath.Join(filepath.Dir(fake.socket), "refusing.sock")
+	ln, err := net.Listen("unix", refusing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	ln.Close()
+	f.srv.probe = newProbeClient(refusing)
+	if got := read(); got.Available || got.Reason != "nothing is listening on the probe socket" {
+		t.Fatalf("System must name no socket path: %+v", got)
+	}
+	if view := f.srv.probe.health(context.Background(), true); !strings.Contains(view.Reason, refusing) {
+		t.Fatalf("the health method names the path for vpn:probe holders: %+v", view)
 	}
 }
 
@@ -419,7 +436,7 @@ func TestProbeRunMapsProbeRefusals(t *testing.T) {
 
 	down, downStore, _ := newProbeTestServer(t, fake.socket+".gone")
 	_, err := down.vpnCoreProbeRPC(probeCtx(probeOperator("op", probeScope)), "run", []byte(probeTestRequest("")))
-	if status, apiErr := probeErrorOf(t, err); status != http.StatusServiceUnavailable || apiErr.Code != apiErrorProbeUnavailable || !strings.Contains(apiErr.Message, "no probe socket at") {
+	if status, apiErr := probeErrorOf(t, err); status != http.StatusServiceUnavailable || apiErr.Code != apiErrorProbeUnavailable || !strings.Contains(apiErr.Message, ".gone does not exist") {
 		t.Fatalf("a run with no probe = %d %+v", status, apiErr)
 	}
 	if audits := probeAudits(downStore); len(audits) != 1 || audits[0].Metadata["stage"] != "unavailable" || audits[0].Decision != "deny" {
@@ -558,8 +575,8 @@ func TestProbeLimiterRollingHour(t *testing.T) {
 		if err != nil {
 			t.Fatalf("run %d refused: %v", i+1, err)
 		}
-		release()
-		release() // releasing twice is harmless
+		release(true)
+		release(true) // releasing twice is harmless
 		now = now.Add(10 * time.Second)
 	}
 	// The first run started 1200 s ago, so it leaves the window in 2400 s.
@@ -573,7 +590,7 @@ func TestProbeLimiterRollingHour(t *testing.T) {
 	if err != nil {
 		t.Fatal("the window is per principal")
 	}
-	release()
+	release(true)
 	if _, err := l.acquire("actor:alice", now.Add(2400*time.Second-time.Second)); err == nil {
 		t.Fatal("a second before the oldest run leaves the window is still too soon")
 	}
@@ -581,7 +598,7 @@ func TestProbeLimiterRollingHour(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a run is allowed once the oldest leaves the window: %v", err)
 	}
-	release()
+	release(true)
 	// Principals with nothing in flight and nothing in the window are forgotten.
 	if _, err := l.acquire("actor:carol", now.Add(3*time.Hour)); err != nil {
 		t.Fatal(err)
@@ -591,6 +608,122 @@ func TestProbeLimiterRollingHour(t *testing.T) {
 	}
 	if got := probeRetryWait(4500 * time.Millisecond); got != "5s" {
 		t.Fatalf("retry wait rounds up to seconds: %s", got)
+	}
+}
+
+func TestProbeLimiterHandsBackUnspentRuns(t *testing.T) {
+	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
+	var l probeLimiter
+	for i := range probeMaxRunsPerHour + 5 {
+		release, err := l.acquire("actor:alice", now)
+		if err != nil {
+			t.Fatalf("run %d refused although no earlier run was spent: %v", i+1, err)
+		}
+		release(false)
+		release(true) // the first release decides; a second changes nothing
+	}
+	if e := l.entries["actor:alice"]; e.inflight != 0 || len(e.starts) != 0 {
+		t.Fatalf("unspent runs must leave nothing behind: %+v", e)
+	}
+}
+
+// The hourly budget is spent only by runs that may have used the network.
+func TestProbeRunSpendsTheHourOnlyOnNetworkRuns(t *testing.T) {
+	fake := startFakeProbe(t)
+	srv, st, _ := newProbeTestServer(t, fake.socket)
+	op := probeCtx(probeOperator("op", probeScope))
+	run := func() error {
+		_, err := srv.vpnCoreProbeRPC(op, "run", []byte(probeTestRequest("")))
+		return err
+	}
+	hourly := func(err error) bool {
+		if err == nil {
+			return false
+		}
+		status, apiErr := probeErrorOf(t, err)
+		return status == http.StatusTooManyRequests && strings.Contains(apiErr.Message, "in the last hour")
+	}
+	stageAnswer := func(stage string) string {
+		return strings.Replace(probeTestAnswer, `"valid":true,"stage":"ok"`, `"valid":false,"stage":"`+stage+`"`, 1)
+	}
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"malformed request", http.StatusBadRequest, `{"error":{"stage":"request","message":"body is not a valid probe request"}}`},
+		{"busy probe", http.StatusTooManyRequests, `{"error":{"stage":"request","message":"probe is busy"}}`},
+		{"outbound does not decode", http.StatusOK, stageAnswer("decode")},
+		{"outbound does not create", http.StatusOK, stageAnswer("create")},
+	} {
+		fake.answer(tc.status, tc.body)
+		for i := range probeMaxRunsPerHour + 1 {
+			if err := run(); hourly(err) {
+				t.Fatalf("%s: run %d spent the hourly budget although no run used the network", tc.name, i+1)
+			}
+		}
+	}
+	audited := len(probeAudits(st))
+	if want := 4 * (probeMaxRunsPerHour + 1); audited != want {
+		t.Fatalf("a handed-back run is still audited: %d records, want %d", audited, want)
+	}
+
+	// A policy refusal can come after the probe resolved or dialled, so it
+	// counts, and so does a run the probe measured.
+	fake.answer(http.StatusBadRequest, `{"error":{"stage":"policy","message":"server resolves to a private address"}}`)
+	for range probeMaxRunsPerHour / 2 {
+		if hourly(run()) {
+			t.Fatal("the budget ran out early")
+		}
+	}
+	fake.answer(http.StatusOK, stageAnswer("server"))
+	for range probeMaxRunsPerHour - probeMaxRunsPerHour/2 {
+		if err := run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := run(); !hourly(err) {
+		t.Fatalf("run %d after %d policy refusals and measured runs must hit the hourly budget: %v",
+			probeMaxRunsPerHour+1, probeMaxRunsPerHour/2, err)
+	}
+}
+
+func TestAuditTruncateKeepsRunesWhole(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		max  int
+		want string
+	}{
+		{"plain", 10, "plain"},
+		{"abcdef", 3, "abc"},
+		{"abé", 3, "ab"},                    // é is 2 bytes; the cut would split it
+		{"ab漢x", 3, "ab"},                   // 3 bytes, cut after its first
+		{"ab漢x", 4, "ab"},                   // and after its second
+		{"ab漢x", 5, "ab漢"},                  // the bound falls right after it
+		{"a😀", 4, "a"},                      // 4 bytes, cut after its third
+		{"\x80\x80\x80\x80\x80", 4, "\x80"}, // invalid input still stays within the bound
+	} {
+		got := auditTruncate(tc.in, tc.max)
+		if got != tc.want || len(got) > tc.max {
+			t.Fatalf("auditTruncate(%q, %d) = %q, want %q", tc.in, tc.max, got, tc.want)
+		}
+	}
+
+	// The probe summary bounds operator-pasted fields with it.
+	host := strings.Repeat("a", 252) + "é.example"
+	request := `{"test":"x","targets":["` + strings.Repeat("t", 39) + `é"],"outbounds":[{"tag":"x","type":"` +
+		strings.Repeat("v", 31) + `é","server":"` + host + `","server_port":443}]}`
+	summary, ok := summarizeProbeRun([]byte(request))
+	if !ok {
+		t.Fatal("the request is a JSON object")
+	}
+	for name, v := range map[string]string{"server": summary.Server, "types": summary.Types, "targets": summary.Targets} {
+		if !utf8.ValidString(v) || v == "" {
+			t.Fatalf("summary %s must be valid UTF-8 and kept: %q", name, v)
+		}
+	}
+	if summary.Server != strings.Repeat("a", 252)+":443" {
+		t.Fatalf("the host is cut before the split character: %q", summary.Server)
 	}
 }
 

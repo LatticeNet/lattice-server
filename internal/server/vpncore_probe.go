@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -142,8 +143,13 @@ var errProbeAnswerTooLarge = errors.New("probe answer exceeds the size limit")
 
 // unavailableReason says in one line why a call did not get an answer. It is
 // written here from the error's kind, so nothing the probe or the caller
-// sent can reach it.
-func (c *probeClient) unavailableReason(err error, timeout time.Duration) string {
+// sent can reach it. showPath names the socket's path; System leaves it out,
+// because more principals read System than hold vpn:probe.
+func (c *probeClient) unavailableReason(err error, timeout time.Duration, showPath bool) string {
+	socket := "the probe socket"
+	if showPath {
+		socket += " at " + c.socket
+	}
 	switch {
 	case errors.Is(err, context.DeadlineExceeded):
 		return fmt.Sprintf("the probe did not answer within %s", timeout)
@@ -152,13 +158,13 @@ func (c *probeClient) unavailableReason(err error, timeout time.Duration) string
 	case errors.Is(err, errProbeAnswerTooLarge):
 		return "the probe's answer was larger than the server accepts"
 	case errors.Is(err, fs.ErrNotExist):
-		return "no probe socket at " + c.socket + "; is the lattice-probe container running?"
+		return socket + " does not exist; is the lattice-probe container running?"
 	case errors.Is(err, syscall.ECONNREFUSED):
-		return "nothing is listening on the probe socket at " + c.socket
+		return "nothing is listening on " + socket
 	case errors.Is(err, fs.ErrPermission):
-		return "the server may not open the probe socket at " + c.socket + "; it needs the probe's group"
+		return "the server may not open " + socket + "; it needs the probe's group"
 	default:
-		return "the probe socket at " + c.socket + " could not be reached"
+		return socket + " could not be reached"
 	}
 }
 
@@ -181,12 +187,13 @@ type probeHealthView struct {
 	*probeHealth
 }
 
-func (c *probeClient) health(ctx context.Context) probeHealthView {
+// health reads the probe's health; showPath is unavailableReason's.
+func (c *probeClient) health(ctx context.Context, showPath bool) probeHealthView {
 	ctx, cancel := context.WithTimeout(ctx, c.healthTimeout)
 	defer cancel()
 	status, body, err := c.do(ctx, http.MethodGet, "/v1/health", nil)
 	if err != nil {
-		return probeHealthView{Reason: c.unavailableReason(err, c.healthTimeout)}
+		return probeHealthView{Reason: c.unavailableReason(err, c.healthTimeout, showPath)}
 	}
 	if status != http.StatusOK {
 		return probeHealthView{Reason: fmt.Sprintf("the probe answered its health check with HTTP %d", status)}
@@ -219,7 +226,7 @@ func (s *Server) vpnCoreProbeRPC(ctx context.Context, method string, request []b
 	}
 	switch method {
 	case "health":
-		return json.Marshal(s.probe.health(ctx))
+		return json.Marshal(s.probe.health(ctx, true))
 	case "targets":
 		return s.probeTargets(ctx)
 	case "run":
@@ -247,11 +254,18 @@ func (s *Server) probeUnavailable(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		status = http.StatusGatewayTimeout
 	}
-	return rpcAPIError(status, apiErrorProbeUnavailable, s.probe.unavailableReason(err, s.probe.callTimeout))
+	return rpcAPIError(status, apiErrorProbeUnavailable, s.probe.unavailableReason(err, s.probe.callTimeout, true))
 }
 
 // probeRun forwards one run request to the probe unchanged and returns its
 // answer. Every run that is admitted past the limits leaves one audit record.
+//
+// The hourly budget bounds what the probe sends to the network for an
+// operator, so a run the probe answered without using the network is handed
+// back: a malformed request, a busy probe, and an outbound that failed to
+// decode or create. A policy refusal still counts, because the probe can
+// refuse after it has resolved names or dialled (its guard refuses a private
+// address at dial time), and so does a run whose answer never arrived.
 func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]byte, error) {
 	if len(request) > probeMaxRequestBytes {
 		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest,
@@ -265,7 +279,8 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 	if refusal != nil {
 		return nil, refusal
 	}
-	defer release()
+	spent := true
+	defer func() { release(spent) }()
 
 	callCtx, cancel := context.WithTimeout(ctx, s.probe.callTimeout)
 	defer cancel()
@@ -273,7 +288,7 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 	status, body, err := s.probe.do(callCtx, http.MethodPost, "/v1/probe", request)
 	took := time.Since(started)
 	if err != nil {
-		reason := s.probe.unavailableReason(err, s.probe.callTimeout)
+		reason := s.probe.unavailableReason(err, s.probe.callTimeout, true)
 		stage := "unavailable"
 		if errors.Is(err, context.DeadlineExceeded) {
 			stage = "timeout"
@@ -299,7 +314,9 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 		if answer.TookMS != nil && *answer.TookMS >= 0 {
 			tookMS = int64(*answer.TookMS)
 		}
-		s.auditProbeRun(p, summary, "allow", "", probeAnswerStage(answer.Stage), answer.Valid, tookMS)
+		stage := probeAnswerStage(answer.Stage)
+		spent = stage != "decode" && stage != "create"
+		s.auditProbeRun(p, summary, "allow", "", stage, answer.Valid, tookMS)
 		return body, nil
 	case http.StatusBadRequest:
 		var refused struct {
@@ -313,6 +330,7 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 		if refused.Error.Stage == "policy" {
 			stage = "policy"
 		}
+		spent = stage == "policy"
 		s.auditProbeRun(p, summary, "deny", "the probe refused the request at its "+stage+" check", stage, false, took.Milliseconds())
 		message := oneLine(refused.Error.Message, 300)
 		if message == "" {
@@ -320,6 +338,7 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 		}
 		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "probe "+stage+": "+message)
 	case http.StatusTooManyRequests:
+		spent = false
 		s.auditProbeRun(p, summary, "deny", "the probe was at its limit of tests in flight", "busy", false, took.Milliseconds())
 		return nil, rpcAPIError(http.StatusTooManyRequests, model.APIErrorRateLimited, "the probe is running as many tests as it allows at once; retry in a few seconds")
 	default:
@@ -502,8 +521,10 @@ func (e *probeLimitEntry) prune(now time.Time) {
 }
 
 // acquire admits one run for key or returns the 429 that says when to retry.
-// The returned release must be called once the run is over.
-func (l *probeLimiter) acquire(key string, now time.Time) (func(), error) {
+// The returned release must be called once the run is over; spent false
+// takes the run back out of the hourly window, for a run that used no
+// network.
+func (l *probeLimiter) acquire(key string, now time.Time) (func(spent bool), error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.entries == nil {
@@ -535,11 +556,18 @@ func (l *probeLimiter) acquire(key string, now time.Time) (func(), error) {
 	e.inflight++
 	e.starts = append(e.starts, now)
 	var once sync.Once
-	return func() {
+	return func(spent bool) {
 		once.Do(func() {
 			l.mu.Lock()
+			defer l.mu.Unlock()
 			e.inflight--
-			l.mu.Unlock()
+			if !spent {
+				// Take back one start equal to this run's; which one does
+				// not matter.
+				if i := slices.IndexFunc(e.starts, now.Equal); i >= 0 {
+					e.starts = slices.Delete(e.starts, i, i+1)
+				}
+			}
 		})
 	}, nil
 }

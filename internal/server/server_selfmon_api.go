@@ -470,7 +470,7 @@ func (s *Server) handleSystemHealth(w http.ResponseWriter, r *http.Request, p pr
 	// The probe answers over its socket while the store is read, so a probe
 	// that hangs costs this page its health timeout at most, once.
 	probeHealth := make(chan probeHealthView, 1)
-	go func() { probeHealth <- s.probe.health(r.Context()) }()
+	go func() { probeHealth <- s.probe.health(r.Context(), false) }()
 	m := s.selfmon
 	latest, _, lastWriteAt, lastWriteErr, sizes := m.snapshot()
 	view := systemHealthView{

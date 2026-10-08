@@ -28,6 +28,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-webauthn/webauthn/webauthn"
 
@@ -10175,12 +10176,18 @@ func (s *Server) recordRequestAudit(r *http.Request, ev model.AuditEvent) {
 }
 
 // auditTruncate bounds attacker-controlled strings before they enter the
-// append-only audit store.
+// append-only audit store. It cuts at a rune boundary, at most max bytes in,
+// so a multi-byte character at the bound is dropped whole rather than split
+// into an invalid UTF-8 tail.
 func auditTruncate(v string, max int) string {
 	if len(v) <= max {
 		return v
 	}
-	return v[:max]
+	cut := max
+	for back := 0; cut > 0 && back < utf8.UTFMax-1 && !utf8.RuneStart(v[cut]); back++ {
+		cut--
+	}
+	return v[:cut]
 }
 
 // auditBucketedIP collapses a client address to a throttle key that source

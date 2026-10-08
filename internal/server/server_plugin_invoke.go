@@ -48,13 +48,15 @@ func (s *Server) handlePluginContributions(w http.ResponseWriter, r *http.Reques
 		if ui == nil || (len(ui.Nav) == 0 && len(ui.Views) == 0) {
 			continue
 		}
+		interfaces := filterPluginInterfacesForUI(ui, pl.Manifest.Interfaces, p)
 		views = append(views, pluginView{
 			ID: pl.Manifest.ID, Name: pl.Manifest.Name, Type: pl.Manifest.Type,
 			Version: pl.Manifest.Version, Publisher: pl.Manifest.Publisher,
 			Capabilities: []string{},
 			Status:       inst.Status, Active: true, UI: ui,
-			Interfaces: filterPluginInterfacesForUI(ui, pl.Manifest.Interfaces, p),
-			UIRuntime:  pluginUIRuntimeForLoaded(pl),
+			Interfaces:     interfaces,
+			CallTimeoutsMS: s.pluginCallTimeoutsMS(pl.Manifest.ID, interfaces),
+			UIRuntime:      pluginUIRuntimeForLoaded(pl),
 		})
 	}
 	writeJSON(w, http.StatusOK, views)
@@ -223,7 +225,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			return
 		}
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), pluginCallTimeout(methodContract))
+	ctx, cancel := context.WithTimeout(r.Context(), s.pluginGatewayTimeout(req.ID, req.Service, methodContract))
 	defer cancel()
 	ctx = context.WithValue(ctx, pluginOperatorPrincipalKey{}, p)
 	graphPreviewOperation := req.Service == req.ID+"/subscription" && req.Method == "preview"
@@ -528,11 +530,49 @@ type pluginServiceError struct{ message string }
 
 func (e *pluginServiceError) Error() string { return e.message }
 
+// defaultPluginCallTimeout is the gateway's deadline for a method that
+// declares no budget and is not a long core method.
+const defaultPluginCallTimeout = 15 * time.Second
+
 func pluginCallTimeout(method plugin.InterfaceMethod) time.Duration {
 	if method.Budget == nil {
-		return 15 * time.Second
+		return defaultPluginCallTimeout
 	}
 	return plugin.ResolveInvokeBudget(method.Budget, plugin.DefaultInvokeBudgetSpec()).Timeout
+}
+
+// pluginGatewayTimeout is how long the gateway gives one call: the core
+// provider's own deadline when core owns the service and sets one (the
+// probe's run), otherwise the method's signed budget or the default.
+func (s *Server) pluginGatewayTimeout(pluginID, service string, method plugin.InterfaceMethod) time.Duration {
+	if d, ok := coreMethodTimeout(service, method.Name); ok && s.pluginRPC != nil && s.pluginRPC.Owns(pluginID, service) {
+		return d
+	}
+	return pluginCallTimeout(method)
+}
+
+// pluginCallTimeoutsMS lists every callable method whose gateway deadline is
+// not the default, in milliseconds by service and method. The console's
+// bridge has a fixed timeout of its own; without this it cut every call the
+// server was still prepared to wait for.
+func (s *Server) pluginCallTimeoutsMS(pluginID string, contracts []plugin.InterfaceContract) map[string]map[string]int64 {
+	var out map[string]map[string]int64
+	for _, c := range contracts {
+		for _, method := range c.MethodContracts() {
+			d := s.pluginGatewayTimeout(pluginID, c.Service, method)
+			if d == defaultPluginCallTimeout {
+				continue
+			}
+			if out == nil {
+				out = map[string]map[string]int64{}
+			}
+			if out[c.Service] == nil {
+				out[c.Service] = map[string]int64{}
+			}
+			out[c.Service][method.Name] = d.Milliseconds()
+		}
+	}
+	return out
 }
 
 func (s *Server) pluginMethodBudget(pluginID, service, method string) *plugin.InvokeBudgetSpec {
@@ -688,6 +728,8 @@ func pluginGatewayScopeAllowed(p principal, scope string) (bool, string) {
 			return false, "global vpn-core plugin views require an unrestricted server allowlist"
 		case strings.HasPrefix(scope, "substore:"):
 			return false, "global sub-store plugin views require an unrestricted server allowlist"
+		case strings.HasPrefix(scope, "vpn:"):
+			return false, "the outbound probe requires an unrestricted server allowlist"
 		}
 		return false, "global network plugin views require an unrestricted server allowlist"
 	}
@@ -699,6 +741,9 @@ func pluginGatewayScopeRequiresUnrestrictedAllowlist(scope string) bool {
 	case "proxy:*", "proxy:read", "proxy:admin",
 		"vpncore:*", "vpncore:read", "vpncore:admin",
 		"substore:*", "substore:read", "substore:admin",
+		// The probe dials from the control plane, not from a node, so a
+		// node-confined principal has no node it could be confined to.
+		"vpn:*", "vpn:probe",
 		"node:read", "node:admin",
 		"network:plan", "network:apply",
 		"netguard:read", "netguard:admin":

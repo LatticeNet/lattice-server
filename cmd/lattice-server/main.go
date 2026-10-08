@@ -264,6 +264,7 @@ func main() {
 		PluginRuntimePool:    pluginRuntimePool,
 		PluginTrust:          trustPolicy,
 		PublicURL:            publicURL,
+		ProbeSocket:          os.Getenv("LATTICE_PROBE_SOCKET"),
 		MetricsToken:         os.Getenv("LATTICE_METRICS_TOKEN"),
 		CoreDNSBinary:        selfdns.CoreDNSBinarySource{Version: coreDNSVersion, URL: coreDNSURL, SHA256: coreDNSSHA256},
 		GeoResolver:          geoResolver,

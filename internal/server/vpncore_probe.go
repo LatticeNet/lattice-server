@@ -204,10 +204,15 @@ func (c *probeClient) health(ctx context.Context) probeHealthView {
 // vpnCoreProbeRPC serves latticenet.vpn-core/probe. The gateway has already
 // checked the manifest's declared scope; this checks vpn:probe itself, so a
 // manifest that declared something weaker still cannot reach the probe.
+//
+// Only an operator's own call through the gateway reaches it (the console's
+// Probe page). A plugin's runtime acting for an operator carries that
+// operator's principal too, but not the direct-call mark, so a plugin with an
+// rpc dependency on this service cannot spend the operator's probe budget.
 func (s *Server) vpnCoreProbeRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
 	p, err := pluginOperatorPrincipal(ctx)
-	if err != nil {
-		return nil, rpcAPIError(http.StatusForbidden, model.APIErrorForbidden, "vpn-core/probe runs only for an operator")
+	if err != nil || operatorCalledCoreService(ctx) != vpnCoreProbeService {
+		return nil, rpcAPIError(http.StatusForbidden, model.APIErrorForbidden, "vpn-core/probe answers only an operator's own call")
 	}
 	if ok, reason := pluginGatewayScopeAllowed(p, probeScope); !ok {
 		return nil, rpcAPIError(http.StatusForbidden, model.APIErrorCapabilityDenied, reason)

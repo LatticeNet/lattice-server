@@ -160,8 +160,11 @@ func probeOperator(actor string, scopes ...string) principal {
 	return principal{Principal: rbac.Principal{ActorID: actor, Scopes: scopes}, CorrelationID: "req-" + actor}
 }
 
+// probeCtx is an operator's own call to the probe service, as the gateway's
+// direct path (callCoreServiceForOperator) marks it.
 func probeCtx(p principal) context.Context {
-	return context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, p)
+	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, p)
+	return context.WithValue(ctx, operatorCoreCallKey{}, vpnCoreProbeService)
 }
 
 // probeErrorOf unwraps the API error a probe method returned.
@@ -680,6 +683,18 @@ func TestProbeScope(t *testing.T) {
 	_, err := srv.pluginRPC.Call(context.Background(), "test.grantee", vpnCoreProbeService, "run", []byte(probeTestRequest("")))
 	if status, _ := probeErrorOf(t, err); status != http.StatusForbidden {
 		t.Fatalf("a run without an operator must fail closed: %d", status)
+	}
+	// A plugin's runtime serving an operator carries the operator's principal
+	// but not the direct-call mark, so it cannot spend that operator's runs.
+	actingFor := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, probeOperator("op", probeScope))
+	_, err = srv.pluginRPC.Call(actingFor, "test.grantee", vpnCoreProbeService, "run", []byte(probeTestRequest("")))
+	if status, _ := probeErrorOf(t, err); status != http.StatusForbidden {
+		t.Fatalf("a plugin acting for an operator must not reach the probe: %d", status)
+	}
+	// Another core service's direct call does not stand in for this one.
+	otherMark := context.WithValue(actingFor, operatorCoreCallKey{}, vpnCoreNodesService)
+	if _, err := srv.vpnCoreProbeRPC(otherMark, "run", []byte(probeTestRequest(""))); err == nil {
+		t.Fatal("a direct call to another core service must not open the probe")
 	}
 	if n := len(probeAudits(st)); n != 2 {
 		t.Fatalf("only the two runs that reached the probe leave a probe record, got %d", n)

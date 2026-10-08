@@ -182,6 +182,11 @@ func TestValidateRecordSettings(t *testing.T) {
 		{"bad character", func(p *model.DDNSProfile) { p.CNAMETarget = "nat us.aproxy.top" }, "only letters, digits"},
 		{"long label", func(p *model.DDNSProfile) { p.CNAMETarget = strings.Repeat("a", 64) + ".aproxy.top" }, "longer than 63"},
 		{"long name", func(p *model.DDNSProfile) { p.CNAMETarget = strings.Repeat(strings.Repeat("a", 60)+".", 5) + "top" }, "at most 253"},
+		// IPv4 addresses in the inet_aton forms net.ParseIP does not read.
+		{"short ipv4", func(p *model.DDNSProfile) { p.CNAMETarget = "127.1" }, "a top-level domain starts with a letter"},
+		{"hex ipv4", func(p *model.DDNSProfile) { p.CNAMETarget = "0x7f.1" }, "a top-level domain starts with a letter"},
+		{"hex last part", func(p *model.DDNSProfile) { p.CNAMETarget = "0x7f.0x1" }, "a top-level domain starts with a letter"},
+		{"numeric tld", func(p *model.DDNSProfile) { p.CNAMETarget = "nat.aproxy.123" }, "a top-level domain starts with a letter"},
 	}
 	for _, c := range cases {
 		p := ok
@@ -192,11 +197,14 @@ func TestValidateRecordSettings(t *testing.T) {
 			t.Fatalf("%s: got %v, want an error mentioning %q", c.name, err, c.want)
 		}
 	}
-	// A sibling of the profile's name is not under it.
-	p := ok
-	p.CNAMETarget = "other.nat.aaitr.roobli.org"
-	if err := ValidateRecordSettings(p); err != nil {
-		t.Fatalf("a sibling name was refused as a loop: %v", err)
+	// A sibling of the profile's name is not under it, and a digit-only
+	// label short of the top-level domain is an ordinary hostname.
+	for _, target := range []string{"other.nat.aaitr.roobli.org", "1.nat-us.aproxy.top", "nat.xn--fiqs8s"} {
+		p := ok
+		p.CNAMETarget = target
+		if err := ValidateRecordSettings(p); err != nil {
+			t.Fatalf("%s refused: %v", target, err)
+		}
 	}
 	if err := ValidateCommentTemplate("Lattice #node# via #target#"); err != nil {
 		t.Fatalf("#target# refused in a custom template: %v", err)
@@ -219,5 +227,65 @@ func TestCNAMEInSync(t *testing.T) {
 	profile.CNAMETarget = "elsewhere.aproxy.top"
 	if in, err := CNAMEInSync(context.Background(), cf, profile); err != nil || !in {
 		t.Fatalf("matching CNAME: in=%v err=%v", in, err)
+	}
+}
+
+// A profile stored with a target in another spelling still writes the
+// normalized name; the save handler is not the only way a profile is stored.
+func TestCNAMEApplyNormalizesTheTarget(t *testing.T) {
+	fake, cf := fakeCloudflare(t)
+	profile := cnameProfile(model.DDNSCommentNone)
+	profile.CNAMETarget = " NAT-us-28tz.aproxy.TOP. "
+	if err := Apply(context.Background(), cf, profile, "", "", commentRun()); err != nil {
+		t.Fatal(err)
+	}
+	if rec := onlyRecord(t, fake, frontierName); rec.Content != frontierTarget {
+		t.Fatalf("created content %q, want %q", rec.Content, frontierTarget)
+	}
+}
+
+// No chain between CNAME profiles: a target at or under another CNAME
+// profile's name, or a name at or above another CNAME profile's target, is
+// refused in either save order. An address profile's name is a fine target.
+func TestCNAMEChainError(t *testing.T) {
+	a := cnameProfile("")
+	a.ID, a.Name, a.Domains, a.CNAMETarget = "ddns_a", "a", []string{"a.example.com"}, "nat-a.aproxy.top"
+	address := model.DDNSProfile{ID: "ddns_addr", Name: "addr", Provider: model.DDNSProviderCloudflare, Domains: []string{"node.example.com"}}
+	others := []model.DDNSProfile{a, address}
+
+	cases := []struct {
+		name            string
+		domains         []string
+		target, wantErr string
+	}{
+		{"target is another profile's name", []string{"b.example.com"}, "A.example.com", `which the CNAME profile "a" publishes`},
+		{"target under another profile's name", []string{"b.example.com"}, "edge.a.example.com", `which the CNAME profile "a" publishes`},
+		{"name is another profile's target", []string{"nat-a.aproxy.top."}, "nat-b.aproxy.top", `the CNAME profile "a" points at nat-a.aproxy.top`},
+		{"name holds another profile's target", []string{"aproxy.top"}, "nat-b.aproxy.top", `the CNAME profile "a" points at nat-a.aproxy.top`},
+		{"address profile's name", []string{"b.example.com"}, "node.example.com", ""},
+		{"unrelated", []string{"b.example.com"}, "nat-b.aproxy.top", ""},
+	}
+	for _, c := range cases {
+		b := cnameProfile("")
+		b.ID, b.Name, b.Domains, b.CNAMETarget = "ddns_b", "b", c.domains, NormalizeHost(c.target)
+		err := CNAMEChainError(b, others)
+		if c.wantErr == "" {
+			if err != nil {
+				t.Fatalf("%s: refused: %v", c.name, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+			t.Fatalf("%s: got %v, want an error mentioning %q", c.name, err, c.wantErr)
+		}
+	}
+	// A profile is not in a chain with itself, and an address profile is
+	// never checked.
+	if err := CNAMEChainError(a, others); err != nil {
+		t.Fatalf("a profile chained to itself: %v", err)
+	}
+	address.CNAMETarget = "a.example.com"
+	if err := CNAMEChainError(address, others); err != nil {
+		t.Fatalf("an address profile's leftover target was checked: %v", err)
 	}
 }

@@ -128,10 +128,13 @@ func Apply(ctx context.Context, p Provider, profile model.DDNSProfile, ipv4, ipv
 	ttl := recordTTL(profile)
 	if IsCNAME(profile) {
 		// A CNAME does not follow the node's address, so ipv4 and ipv6 and
-		// the profile's address toggles play no part.
+		// the profile's address toggles play no part. The target is
+		// normalized here as well as at save time, so a profile stored by
+		// another path still writes a lower-case name without the root dot.
+		target := NormalizeHost(profile.CNAMETarget)
 		for _, domain := range profile.Domains {
 			if err := withRetry(profile.MaxRetries, func() error {
-				return p.SetRecord(ctx, Record{Type: "CNAME", Name: domain, Target: profile.CNAMETarget, TTL: ttl, Comment: comment})
+				return p.SetRecord(ctx, Record{Type: "CNAME", Name: domain, Target: target, TTL: ttl, Comment: comment})
 			}); err != nil {
 				add("CNAME "+domain, err)
 			}

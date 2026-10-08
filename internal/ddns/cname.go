@@ -54,18 +54,65 @@ func ValidateRecordSettings(p model.DDNSProfile) error {
 		if domain == "" {
 			continue
 		}
-		if target == domain || strings.HasSuffix(target, "."+domain) {
+		if atOrUnder(target, domain) {
 			return fmt.Errorf("cname_target %s is %s or a name under it; a record cannot point into the names it publishes", target, domain)
 		}
 	}
 	return nil
 }
 
+// CNAMEChainError refuses a CNAME profile that would chain into another CNAME
+// profile: its target is, or is under, a name another CNAME profile
+// publishes, or one of its names is, or holds, another CNAME profile's
+// target. Two profiles pointed at each other's names make a loop no resolver
+// can follow, and a longer cycle closes the same way, so no chain between
+// CNAME profiles is allowed; checking both directions catches the save that
+// would close one, whichever profile it edits. Address profiles are left out:
+// a CNAME to an address profile's name ends at its A and AAAA records. others
+// may hold p itself, which is skipped by id.
+func CNAMEChainError(p model.DDNSProfile, others []model.DDNSProfile) error {
+	if !IsCNAME(p) {
+		return nil
+	}
+	target := NormalizeHost(p.CNAMETarget)
+	for _, other := range others {
+		if other.ID == p.ID || !IsCNAME(other) {
+			continue
+		}
+		for _, domain := range other.Domains {
+			if domain = NormalizeHost(domain); domain != "" && atOrUnder(target, domain) {
+				return fmt.Errorf("cname_target %s is %s or a name under it, which the CNAME profile %q publishes; a CNAME profile may not point at another one's names, or the two can end up pointing at each other",
+					target, domain, other.Name)
+			}
+		}
+		otherTarget := NormalizeHost(other.CNAMETarget)
+		if otherTarget == "" {
+			continue
+		}
+		for _, domain := range p.Domains {
+			if domain = NormalizeHost(domain); domain != "" && atOrUnder(otherTarget, domain) {
+				return fmt.Errorf("the CNAME profile %q points at %s, which is %s or a name under it; a CNAME profile may not publish a name another one points at, or the two can end up pointing at each other",
+					other.Name, otherTarget, domain)
+			}
+		}
+	}
+	return nil
+}
+
+// atOrUnder reports whether name is domain or a name under it. Both are in
+// NormalizeHost form.
+func atOrUnder(name, domain string) bool {
+	return name == domain || strings.HasSuffix(name, "."+domain)
+}
+
 // ValidateHostname rejects a name a CNAME cannot point to: an IP literal, a
-// name longer than MaxHostnameBytes, a single label, or a label that is
-// empty, longer than 63 bytes, holds anything but letters, digits, hyphens
-// and underscores, or starts or ends with a hyphen. The error reads as the
-// end of a sentence that names the field.
+// name longer than MaxHostnameBytes, a single label, a label that is empty,
+// longer than 63 bytes, holds anything but letters, digits, hyphens and
+// underscores, or starts or ends with a hyphen, and a last label that does not
+// start with a letter. Every top-level domain starts with a letter, and a name
+// such as 127.1 or 0x7f.1 is an IPv4 address to the resolvers that accept the
+// inet_aton forms, which net.ParseIP does not. The error reads as the end of a
+// sentence that names the field.
 func ValidateHostname(name string) error {
 	if net.ParseIP(name) != nil {
 		return fmt.Errorf("must be a hostname, not an IP address (%s); an address profile publishes IPs", name)
@@ -93,6 +140,9 @@ func ValidateHostname(name string) error {
 				return fmt.Errorf("%q may hold only letters, digits, hyphens and underscores", name)
 			}
 		}
+	}
+	if c := labels[len(labels)-1][0]; !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+		return fmt.Errorf("%q ends in %q; a top-level domain starts with a letter, and some resolvers read a name like 127.1 as an IP address", name, labels[len(labels)-1])
 	}
 	return nil
 }

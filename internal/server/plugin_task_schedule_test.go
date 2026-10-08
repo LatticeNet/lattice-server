@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -337,5 +339,189 @@ func TestTaskScheduleCronMatchesLikeCron(t *testing.T) {
 		if _, err := parseTaskScheduleCron(bad); err == nil {
 			t.Fatalf("%q parsed", bad)
 		}
+	}
+}
+
+// Close stops the minute loop, cancels a scheduled run in flight, and returns
+// only after that run has finished, so nothing calls the plugin runtime or
+// reads the store once the server is closed.
+func TestTaskSchedulerStopsAndCancelsItsRunsOnClose(t *testing.T) {
+	st, _ := store.Open("")
+	srv := schedServer(t, st)
+	broker := schedBroker(t, srv, "task:schedule")
+	if err := broker.TaskSchedule(context.Background(), sdkplugin.TaskSchedule{ID: "slow", Cron: "*/5 * * * *", Service: schedPluginID + "/jobs", Method: "sync"}); err != nil {
+		t.Fatal(err)
+	}
+	var calls, finished atomic.Int32
+	started := make(chan struct{}, 4)
+	srv.pluginSchedules.invoke = func(ctx context.Context, _, _, _ string, _ json.RawMessage) ([]byte, error) {
+		calls.Add(1)
+		started <- struct{}{}
+		// Only the run's context ends this call.
+		<-ctx.Done()
+		finished.Add(1)
+		return nil, ctx.Err()
+	}
+	srv.startPluginTaskScheduler()
+	srv.runDuePluginTaskSchedules(at("12:15"))
+	<-started
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("Close waited out its deadline")
+	}
+	if finished.Load() != 1 {
+		t.Fatal("Close returned with a scheduled run still in flight")
+	}
+	loopDone := make(chan struct{})
+	go func() {
+		srv.pluginSchedules.loop.Wait()
+		close(loopDone)
+	}()
+	select {
+	case <-loopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the minute loop survived Close")
+	}
+	canceled := false
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "plugin.task.schedule.run" && ev.Metadata["outcome"] == "failed" && ev.Metadata["error_class"] == "canceled" {
+			canceled = true
+		}
+	}
+	if !canceled {
+		t.Fatal("the run Close cancelled was not audited as canceled")
+	}
+	// After Close no pass starts a run.
+	srv.runDuePluginTaskSchedules(at("12:30"))
+	srv.pluginSchedules.runs.Wait()
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("runs after Close = %d, want only the one before it", n)
+	}
+}
+
+// A schedule is a standing use of task:schedule. When the signed manifest the
+// server loads no longer grants it, the stored schedules stop running and are
+// dropped, since the plugin can no longer unschedule them itself.
+func TestTaskScheduleStopsWhenTheManifestNoLongerGrantsTheCapability(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := schedServer(t, st)
+	broker := schedBroker(t, srv, "task:schedule")
+	if err := broker.TaskSchedule(context.Background(), sdkplugin.TaskSchedule{ID: "nightly", Cron: "30 3 * * *", Service: schedPluginID + "/jobs", Method: "sync"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The plugin comes back re-signed without task:schedule.
+	reopened, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	restarted, err := New(Options{Store: reopened, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revoked := schedManifest()
+	revoked.Capabilities = []string{"kv:write"}
+	restarted.plugins = []plugin.Loaded{{Manifest: revoked, Capabilities: []string{"kv:write"}}}
+	calls, _ := recordRuns(restarted, nil)
+	restarted.runDuePluginTaskSchedules(at("03:30"))
+	restarted.pluginSchedules.runs.Wait()
+	if got := calls(); len(got) != 0 {
+		t.Fatalf("a schedule ran without task:schedule: %+v", got)
+	}
+	if record, err := restarted.pluginTaskScheduleRecord(schedPluginID); err != nil || len(record.Schedules) != 0 {
+		t.Fatalf("revoked schedules are still stored: %+v, %v", record.Schedules, err)
+	}
+	dropped := false
+	for _, ev := range reopened.AuditEvents() {
+		if ev.Action == "plugin.task.schedule.revoke" && ev.Decision == "deny" && ev.Metadata["plugin_id"] == schedPluginID && ev.Metadata["schedules"] == "1" {
+			dropped = true
+		}
+	}
+	if !dropped {
+		t.Fatal("dropping the schedules was not audited")
+	}
+	// The run path refuses on its own too, for a target checked after the pass.
+	err = restarted.runPluginTaskSchedule(context.Background(), schedPluginID, sdkplugin.TaskSchedule{ID: "nightly", Cron: "30 3 * * *", Service: schedPluginID + "/jobs", Method: "sync"})
+	if err == nil || !strings.Contains(err.Error(), "not granted task:schedule") {
+		t.Fatalf("a run without the grant = %v", err)
+	}
+}
+
+// A failed run is audited by class and length. The plugin's error text, which
+// may carry a provider URL and its token, is not written anywhere in the row.
+func TestTaskScheduleRunAuditKeepsNoPluginErrorText(t *testing.T) {
+	st, _ := store.Open("")
+	srv := schedServer(t, st)
+	broker := schedBroker(t, srv, "task:schedule")
+	if err := broker.TaskSchedule(context.Background(), sdkplugin.TaskSchedule{ID: "fetch", Cron: "*/5 * * * *", Service: schedPluginID + "/jobs", Method: "sync"}); err != nil {
+		t.Fatal(err)
+	}
+	const secret = "tok-5f2c9a"
+	message := "fetch https://provider.example/api/sub?token=" + secret + " failed: 502"
+	srv.pluginSchedules.invoke = func(context.Context, string, string, string, json.RawMessage) ([]byte, error) {
+		return nil, &pluginServiceError{message: message}
+	}
+	srv.runDuePluginTaskSchedules(at("10:05"))
+	srv.pluginSchedules.runs.Wait()
+	var row *model.AuditEvent
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "plugin.task.schedule.run" {
+			row = &ev
+		}
+	}
+	if row == nil || row.Metadata["outcome"] != "failed" {
+		t.Fatalf("no failed run audited: %+v", row)
+	}
+	encoded, _ := json.Marshal(row)
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "provider.example") {
+		t.Fatalf("the audit row carries the plugin's error text: %s", encoded)
+	}
+	if row.Metadata["error_class"] != "plugin_error" || row.Metadata["error_bytes"] != strconv.Itoa(len(message)) {
+		t.Fatalf("audit metadata = %+v, want the plugin_error class and the text's length", row.Metadata)
+	}
+}
+
+// The fired minutes are kept only for schedules still stored, so a plugin
+// that churns schedule ids does not grow the map.
+func TestTaskScheduleForgetsTheFiredMinuteOfARemovedSchedule(t *testing.T) {
+	st, _ := store.Open("")
+	srv := schedServer(t, st)
+	broker := schedBroker(t, srv, "task:schedule")
+	ctx := context.Background()
+	for i := range 3 {
+		if err := broker.TaskSchedule(ctx, sdkplugin.TaskSchedule{ID: fmt.Sprintf("job-%d", i), Cron: "*/5 * * * *", Service: schedPluginID + "/jobs", Method: "sync"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, started := recordRuns(srv, nil)
+	started.Add(3)
+	srv.runDuePluginTaskSchedules(at("08:05"))
+	srv.pluginSchedules.runs.Wait()
+	for _, id := range []string{"job-0", "job-2"} {
+		if _, err := broker.TaskUnschedule(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.runDuePluginTaskSchedules(at("08:06"))
+	srv.pluginSchedules.mu.Lock()
+	defer srv.pluginSchedules.mu.Unlock()
+	if len(srv.pluginSchedules.fired) != 1 {
+		t.Fatalf("fired holds %d schedules, want only the one still stored", len(srv.pluginSchedules.fired))
+	}
+	if _, ok := srv.pluginSchedules.fired[pluginTaskScheduleKey{pluginID: schedPluginID, id: "job-1"}]; !ok {
+		t.Fatal("the stored schedule's fired minute was dropped")
 	}
 }

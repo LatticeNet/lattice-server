@@ -1651,6 +1651,9 @@ func (s *Server) Close(ctx context.Context) error {
 	s.flushShareFetchStats(s.now(), true)
 	s.flushShareRefusalAudit(s.now())
 	waitWithin(&s.shareFetchAudits)
+	// Scheduled plugin runs are cancelled and waited for before the plugin
+	// runtime closes under them.
+	s.stopPluginTaskScheduler(ctx)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)

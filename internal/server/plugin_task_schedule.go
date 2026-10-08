@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,11 +26,22 @@ import (
 // survive a restart. The scheduler loop wakes on each minute, runs every
 // schedule whose cron matches that minute in UTC through the plugin runtime,
 // and never starts a run of one schedule while its previous run is in flight.
-// A minute the server was down is not caught up, as cron does not.
+// A minute the server was down is not caught up, as cron does not. Close
+// stops the loop, cancels the runs in flight and waits for them.
+//
+// A schedule is a standing use of task:schedule, so every pass checks the
+// grant again against the signed manifest the server loaded. A plugin whose
+// manifest no longer grants it has its schedules dropped, since its broker
+// refuses task.unschedule as well and nothing else could remove them.
 //
 // A scheduled run binds no operator target: there is no operator call whose
 // authenticated payload could name one, so a method that declares
 // operator_target_fields cannot be scheduled.
+//
+// Runs do not go through the task queue, and no operator principal stands
+// behind them: the method's declared operator scopes are not evaluated, and
+// the signed, host-risk task:schedule capability is the only gate. The audit
+// actor of a run is "plugin:<id>".
 
 // pluginTaskScheduleKVBucket holds one entry per plugin id. It is reserved in
 // reservedLineSecretKVBucket, and it is not "plugin:<id>", so neither the
@@ -61,12 +73,32 @@ type pluginTaskScheduler struct {
 	// inFlight holds the schedules with a run started and not yet finished.
 	inFlight map[pluginTaskScheduleKey]bool
 	// fired is the minute each schedule last fired, so a second pass over the
-	// same minute starts nothing.
+	// same minute starts nothing. Each pass forgets the schedules no longer
+	// stored, so it holds no more keys than the store does.
 	fired map[pluginTaskScheduleKey]time.Time
-	// runs counts runs in flight, for tests that wait for them.
+	// life is cancelled when Close stops the scheduler: the minute loop
+	// returns and every run in flight has its plugin call cancelled. It is
+	// made on first use, so the zero value still works. Once stopped is set
+	// no loop and no run starts, which is what lets Close wait on loop and
+	// runs without racing an Add.
+	life    context.Context
+	cancel  context.CancelFunc
+	stopped bool
+	// loop counts the minute loop and runs the runs in flight. Close waits
+	// for both; tests wait for runs.
+	loop sync.WaitGroup
 	runs sync.WaitGroup
 	// invoke is a test seam; nil calls the plugin through the runtime.
 	invoke func(ctx context.Context, pluginID, service, method string, payload json.RawMessage) ([]byte, error)
+}
+
+// lifetimeLocked returns the context the loop and the runs derive from.
+// Callers hold mu.
+func (sch *pluginTaskScheduler) lifetimeLocked() context.Context {
+	if sch.life == nil {
+		sch.life, sch.cancel = context.WithCancel(context.Background())
+	}
+	return sch.life
 }
 
 // Schedule serves task.schedule (plugin.TaskScheduleHost). The broker has
@@ -149,13 +181,17 @@ func (h *pluginTaskHost) Unschedule(_ context.Context, pluginID, scheduleID stri
 	return true, nil
 }
 
-// pluginTaskScheduleMethodAllowed admits a schedule's target: an interface the
-// plugin itself declares, served by its runtime rather than by core, and a
-// method that interface declares and that names no operator target.
+// pluginTaskScheduleMethodAllowed admits a schedule's target for a plugin
+// whose loaded manifest grants task:schedule: an interface the plugin itself
+// declares, served by its runtime rather than by core, and a method that
+// interface declares and that names no operator target.
 func (s *Server) pluginTaskScheduleMethodAllowed(pluginID, service, method string) error {
 	loaded, ok := s.loadedPlugin(pluginID)
 	if !ok {
 		return fmt.Errorf("plugin %q is not loaded", pluginID)
+	}
+	if !pluginGrantsTaskSchedule(loaded) {
+		return fmt.Errorf("plugin %q is not granted %s", pluginID, sdkplugin.CapabilityTaskSchedule)
 	}
 	if !strings.HasPrefix(service, pluginID+"/") {
 		return fmt.Errorf("task schedule service %q is not one of this plugin's own services", service)
@@ -175,6 +211,12 @@ func (s *Server) pluginTaskScheduleMethodAllowed(pluginID, service, method strin
 		return fmt.Errorf("task schedule method %q names an operator target, which a scheduled run has no operator call to bind", method)
 	}
 	return nil
+}
+
+// pluginGrantsTaskSchedule reads the grant from the capabilities the trust
+// policy admitted at load, the same list the plugin's broker is built from.
+func pluginGrantsTaskSchedule(loaded plugin.Loaded) bool {
+	return slices.Contains(loaded.Capabilities, sdkplugin.CapabilityTaskSchedule)
 }
 
 func (s *Server) pluginTaskScheduleRecord(pluginID string) (pluginTaskScheduleRecord, error) {
@@ -201,30 +243,88 @@ func (s *Server) putPluginTaskScheduleRecord(pluginID string, record pluginTaskS
 	return s.store.PutKV(model.KVEntry{Bucket: pluginTaskScheduleKVBucket, Key: pluginID, Value: string(value)})
 }
 
-// startPluginTaskScheduler wakes on each minute and runs what is due.
+// startPluginTaskScheduler wakes on each minute and runs what is due, until
+// Close stops it.
 func (s *Server) startPluginTaskScheduler() {
+	sch := &s.pluginSchedules
+	sch.mu.Lock()
+	if sch.stopped {
+		sch.mu.Unlock()
+		return
+	}
+	life := sch.lifetimeLocked()
+	sch.loop.Add(1)
+	sch.mu.Unlock()
 	go func() {
+		defer sch.loop.Done()
+		timer := time.NewTimer(untilNextMinute(time.Now()))
+		defer timer.Stop()
 		for {
-			now := time.Now()
-			timer := time.NewTimer(now.Truncate(time.Minute).Add(time.Minute).Sub(now))
-			<-timer.C
+			select {
+			case <-life.Done():
+				return
+			case <-timer.C:
+			}
 			s.runDuePluginTaskSchedules(s.now())
+			timer.Reset(untilNextMinute(time.Now()))
 		}
 	}()
+}
+
+func untilNextMinute(now time.Time) time.Duration {
+	return now.Truncate(time.Minute).Add(time.Minute).Sub(now)
+}
+
+// stopPluginTaskScheduler stops the minute loop, cancels the runs in flight
+// and waits for both within ctx, so no run calls the plugin runtime or
+// writes an audit after Close returns.
+func (s *Server) stopPluginTaskScheduler(ctx context.Context) {
+	sch := &s.pluginSchedules
+	sch.mu.Lock()
+	sch.stopped = true
+	sch.lifetimeLocked()
+	cancel := sch.cancel
+	sch.mu.Unlock()
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		sch.loop.Wait()
+		sch.runs.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // runDuePluginTaskSchedules starts every stored schedule of an active plugin
 // whose cron matches the minute of now, in UTC.
 func (s *Server) runDuePluginTaskSchedules(now time.Time) {
+	sch := &s.pluginSchedules
+	sch.mu.Lock()
+	stopped := sch.stopped
+	sch.mu.Unlock()
+	if stopped {
+		return
+	}
 	minute := now.UTC().Truncate(time.Minute)
+	stored := map[pluginTaskScheduleKey]bool{}
 	for _, entry := range s.store.KV(pluginTaskScheduleKVBucket) {
 		pluginID := entry.Key
-		if !s.pluginIsActive(pluginID) {
+		if loaded, ok := s.loadedPlugin(pluginID); ok && !pluginGrantsTaskSchedule(loaded) {
+			s.revokePluginTaskSchedules(pluginID)
 			continue
 		}
 		var record pluginTaskScheduleRecord
 		if err := json.Unmarshal([]byte(entry.Value), &record); err != nil {
 			s.logger.Printf("plugin task schedules of %s are unreadable: %v", pluginID, err)
+			continue
+		}
+		for _, schedule := range record.Schedules {
+			stored[pluginTaskScheduleKey{pluginID: pluginID, id: schedule.ID}] = true
+		}
+		if !s.pluginIsActive(pluginID) {
 			continue
 		}
 		for _, schedule := range record.Schedules {
@@ -235,14 +335,47 @@ func (s *Server) runDuePluginTaskSchedules(now time.Time) {
 			s.startPluginTaskScheduleRun(pluginID, schedule, minute)
 		}
 	}
+	sch.mu.Lock()
+	for key := range sch.fired {
+		if !stored[key] {
+			delete(sch.fired, key)
+		}
+	}
+	sch.mu.Unlock()
+}
+
+// revokePluginTaskSchedules drops every stored schedule of a plugin whose
+// loaded manifest does not grant task:schedule.
+func (s *Server) revokePluginTaskSchedules(pluginID string) {
+	sch := &s.pluginSchedules
+	sch.storeMu.Lock()
+	defer sch.storeMu.Unlock()
+	record, err := s.pluginTaskScheduleRecord(pluginID)
+	if err != nil {
+		s.logger.Printf("plugin task schedules of %s: %v", pluginID, err)
+	}
+	if err := s.store.DeleteKV(pluginTaskScheduleKVBucket, pluginID); err != nil {
+		s.logger.Printf("drop the plugin task schedules of %s: %v", pluginID, err)
+		return
+	}
+	s.recordAudit(model.AuditEvent{
+		ID: id.New("audit"), At: s.now().UTC(), ActorID: "system",
+		Action: "plugin.task.schedule.revoke", Scope: sdkplugin.CapabilityTaskSchedule, Decision: "deny",
+		Reason:   "the plugin's signed manifest no longer grants " + sdkplugin.CapabilityTaskSchedule,
+		Metadata: map[string]string{"plugin_id": pluginID, "schedules": strconv.Itoa(len(record.Schedules))},
+	})
 }
 
 // startPluginTaskScheduleRun starts one run unless this minute already fired
-// the schedule or its previous run has not finished.
+// the schedule, its previous run has not finished, or Close has begun.
 func (s *Server) startPluginTaskScheduleRun(pluginID string, schedule sdkplugin.TaskSchedule, minute time.Time) {
 	sch := &s.pluginSchedules
 	key := pluginTaskScheduleKey{pluginID: pluginID, id: schedule.ID}
 	sch.mu.Lock()
+	if sch.stopped {
+		sch.mu.Unlock()
+		return
+	}
 	if sch.fired == nil {
 		sch.fired = map[pluginTaskScheduleKey]time.Time{}
 		sch.inFlight = map[pluginTaskScheduleKey]bool{}
@@ -254,11 +387,12 @@ func (s *Server) startPluginTaskScheduleRun(pluginID string, schedule sdkplugin.
 	sch.fired[key] = minute
 	if sch.inFlight[key] {
 		sch.mu.Unlock()
-		s.recordPluginTaskScheduleRun(pluginID, schedule, "skipped", "the previous run of this schedule is still in flight")
+		s.recordPluginTaskScheduleRun(pluginID, schedule, "skipped", "the previous run of this schedule is still in flight", nil)
 		return
 	}
 	sch.inFlight[key] = true
 	sch.runs.Add(1)
+	life := sch.lifetimeLocked()
 	sch.mu.Unlock()
 	go func() {
 		defer func() {
@@ -267,21 +401,32 @@ func (s *Server) startPluginTaskScheduleRun(pluginID string, schedule sdkplugin.
 			sch.mu.Unlock()
 			sch.runs.Done()
 		}()
-		outcome, reason := "ok", ""
-		if err := s.runPluginTaskSchedule(pluginID, schedule); err != nil {
-			outcome, reason = "failed", boundAuditReason(err.Error())
+		err := s.runPluginTaskSchedule(life, pluginID, schedule)
+		if err == nil {
+			s.recordPluginTaskScheduleRun(pluginID, schedule, "ok", "", nil)
+			return
 		}
-		s.recordPluginTaskScheduleRun(pluginID, schedule, outcome, reason)
+		class, reason := pluginTaskScheduleFailure(life, err)
+		s.recordPluginTaskScheduleRun(pluginID, schedule, "failed", reason, map[string]string{
+			"error_class": class, "error_bytes": strconv.Itoa(len(err.Error())),
+		})
 	}()
 }
 
-func (s *Server) runPluginTaskSchedule(pluginID string, schedule sdkplugin.TaskSchedule) error {
+// taskScheduleTargetRefused is the server's own refusal of a stored
+// schedule's target at run time. Its text names only the plugin, the service
+// and the method, which the schedule's validation bounded when it was stored.
+type taskScheduleTargetRefused struct{ err error }
+
+func (e *taskScheduleTargetRefused) Error() string { return e.err.Error() }
+
+func (s *Server) runPluginTaskSchedule(life context.Context, pluginID string, schedule sdkplugin.TaskSchedule) error {
 	// The plugin may have been upgraded since the schedule was stored; a
 	// method it no longer declares is not called.
 	if err := s.pluginTaskScheduleMethodAllowed(pluginID, schedule.Service, schedule.Method); err != nil {
-		return err
+		return &taskScheduleTargetRefused{err: err}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), pluginTaskScheduleRunTimeout)
+	ctx, cancel := context.WithTimeout(life, pluginTaskScheduleRunTimeout)
 	defer cancel()
 	payload := schedule.Payload
 	if len(payload) == 0 {
@@ -295,33 +440,46 @@ func (s *Server) runPluginTaskSchedule(pluginID string, schedule sdkplugin.TaskS
 	return err
 }
 
-func (s *Server) recordPluginTaskScheduleRun(pluginID string, schedule sdkplugin.TaskSchedule, outcome, reason string) {
+// pluginTaskScheduleFailure is the only code that reads a failed run's
+// error, and it returns a fixed class and reason, never the error's text. A
+// plugin's error may carry a provider URL with its token (a Sub-Store fetch
+// error does), and operators read the audit log. The plugin's own log keeps
+// the detail; the audit row keeps the class and the text's length. Only the
+// server's refusal of the target keeps its text.
+func pluginTaskScheduleFailure(life context.Context, err error) (class, reason string) {
+	var refused *taskScheduleTargetRefused
+	var pluginErr *pluginServiceError
+	switch {
+	case errors.As(err, &refused):
+		return "target_refused", refused.Error()
+	case life.Err() != nil:
+		return "canceled", "the server stopped during the run"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout", "the run did not finish within its time limit"
+	case errors.As(err, &pluginErr):
+		return "plugin_error", "the plugin returned an error"
+	default:
+		return "call_failed", "the plugin call failed"
+	}
+}
+
+func (s *Server) recordPluginTaskScheduleRun(pluginID string, schedule sdkplugin.TaskSchedule, outcome, reason string, extra map[string]string) {
 	decision := "allow"
 	if outcome == "skipped" {
 		decision = "deny"
 	}
+	metadata := map[string]string{
+		"plugin_id": pluginID, "schedule_id": schedule.ID, "service": schedule.Service,
+		"method": schedule.Method, "outcome": outcome,
+	}
+	for k, v := range extra {
+		metadata[k] = v
+	}
 	s.recordAudit(model.AuditEvent{
 		ID: id.New("audit"), At: s.now().UTC(), ActorID: pluginTaskActorPrefix + pluginID,
 		Action: "plugin.task.schedule.run", Scope: sdkplugin.CapabilityTaskSchedule, Decision: decision, Reason: reason,
-		Metadata: map[string]string{
-			"plugin_id": pluginID, "schedule_id": schedule.ID, "service": schedule.Service,
-			"method": schedule.Method, "outcome": outcome,
-		},
+		Metadata: metadata,
 	})
-}
-
-// boundAuditReason keeps a plugin-authored error to a size an audit row
-// carries, on a rune boundary.
-func boundAuditReason(reason string) string {
-	const limit = 512
-	if len(reason) <= limit {
-		return reason
-	}
-	cut := limit
-	for cut > 0 && (reason[cut]&0xC0) == 0x80 {
-		cut--
-	}
-	return reason[:cut] + "..."
 }
 
 // taskScheduleCron is a parsed TaskSchedule.Cron: one bit per allowed value.

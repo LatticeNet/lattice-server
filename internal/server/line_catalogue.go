@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"sort"
 	"strconv"
@@ -36,13 +38,24 @@ import (
 // composed entry template that compose builds, without the credential.
 //
 // Credential-free is the contract, and this file keeps it two ways. Every
-// template passes the SDK's allowlist and, when the node still reports the
-// line's share URL, the same fragment-survival refusal the template store
-// applies to the owner's credential. When the request names an identity,
-// every row is also refused any part of that identity's credential four
-// bytes or longer, raw or JSON-escaped: a row whose template carries one is
-// served without its template, a row that still carries one is withheld, and
-// a page that still carries one is refused whole.
+// template passes the SDK's allowlist and the template store's sync-time
+// fragment-survival refusal against the owner's credential, and, when the
+// node still reports the line's share URL, that refusal again. When the
+// request names an identity, every row is also refused any whole part of
+// that identity's credential four bytes or longer, in any of the encodings
+// lineCatalogueSecrets lists: a row whose template carries one is served
+// without its template, a row that still carries one is withheld, and a page
+// that still carries one is refused whole. Without an identity there is no
+// identity to screen for; the row's free-text fields (names, tags, group
+// ids) are the operator's own labels.
+//
+// A Reality line's public key (pbk) and short id (sid) are public material by
+// decision, not credentials: both are the line's, the same for every
+// identity bound to it, carried in every subscriber's link, returned to the
+// same plugin by compose today, and the bind step requires a planned node's
+// short-id to equal the template's. They travel only as a template's pbk and
+// sid params, and sid only in a short id's shape (at most eight bytes of
+// hex), so that slot cannot carry anything else.
 //
 // The selector is pushed down here: set fields AND, the values of one field
 // OR, and a field this core does not know is refused with the fields it does
@@ -180,8 +193,20 @@ func (c *lineCatalogue) selectIndexes(sel *model.LineCatalogueSelector) []int {
 }
 
 // lineCatalogueMatches evaluates every selector field but the line list.
-// Country and region read the row's effective geo: the chain's exit geo when
-// it has one, else the node's.
+// These rules are the pushdown contract; a plugin that runs a predicate
+// itself must apply the same ones, byte for byte:
+//
+//   - countries, regions, protocols, transports and service_states compare
+//     with Unicode case folding (strings.EqualFold); an empty row value
+//     never matches.
+//   - node_tags, group_ids and chain_roles compare exactly.
+//   - country and region read the row's effective geo: the chain's exit geo
+//     when it has one, else the node's. A field the exit geo lacks does not
+//     fall back to the node's geo.
+//   - renewal_within_days matches a known renewal at or before now plus the
+//     window, so a renewal already past matches.
+//   - probe_passed_within_hours matches a pass at or after now minus the
+//     window.
 func lineCatalogueMatches(row *model.LineCatalogueRow, sel *model.LineCatalogueSelector, now time.Time) bool {
 	geo := row.Geo
 	if row.Chain.ExitGeo != nil {
@@ -340,9 +365,14 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 		}
 		if bind != nil {
 			template, err := lineCatalogueTemplate(*bind)
+			// Defense in depth: the template store already refused, at
+			// sync time, a template carrying the owner's credential from
+			// the share URL it was built from. This repeats the check
+			// against the share URL a live node reports now; a node that
+			// no longer reports one leaves the sync-time refusal standing.
 			if err == nil && !chains.root(ln.LineUUID) {
-				if url := shareURLs[[2]string{ln.NodeID, ln.Tag}]; url != "" {
-					owner := newLineCatalogueSecrets(lineClientShareURLSecrets(url, bind.Protocol))
+				if shareURL := shareURLs[[2]string{ln.NodeID, ln.Tag}]; shareURL != "" {
+					owner := newLineCatalogueSecrets(lineClientShareURLSecrets(shareURL, bind.Protocol))
 					if raw, _ := json.Marshal(template); owner.in(raw) {
 						err = errors.New("the owner's credential survives in the template")
 					}
@@ -406,8 +436,12 @@ func finishLineCatalogueRow(row *model.LineCatalogueRow, identity lineCatalogueS
 }
 
 // lineCatalogueTemplate is a stored template as a catalogue row carries it,
-// with its digest, checked against the SDK's allowlist.
+// with its digest, checked against the SDK's allowlist. A sid that is not a
+// Reality short id is refused.
 func lineCatalogueTemplate(t store.LineClientTemplate) (*model.LineCatalogueTemplate, error) {
+	if sid, ok := t.Params["sid"]; ok && !lineCatalogueShortIDValid(sid) {
+		return nil, errors.New("template sid is not a reality short id")
+	}
 	out := &model.LineCatalogueTemplate{Protocol: t.Protocol, Host: t.Host, Port: t.Port,
 		Params: maps.Clone(t.Params), Dropped: slices.Clone(t.Dropped)}
 	raw, err := json.Marshal(out)
@@ -420,6 +454,13 @@ func lineCatalogueTemplate(t store.LineClientTemplate) (*model.LineCatalogueTemp
 		return nil, err
 	}
 	return out, nil
+}
+
+// lineCatalogueShortIDValid is proxycore's Reality short id rule: an even
+// number of hex digits, at most sixteen. Empty is a valid short id.
+func lineCatalogueShortIDValid(sid string) bool {
+	_, err := hex.DecodeString(sid)
+	return err == nil && len(sid) <= 16
 }
 
 // lineClientShareURLSecrets returns the credential parts of a share URL, as
@@ -450,26 +491,57 @@ func lineCatalogueIdentitySecrets(u VpnUser) []string {
 	return out
 }
 
-// lineCatalogueSecrets finds credential parts four bytes or longer in an
-// encoded row, ignoring case, in their raw form and in their JSON-escaped
-// form, which is how a part with a quote, a backslash or an HTML character
-// appears in JSON.
+// lineCatalogueSecrets finds whole credential parts four bytes or longer in
+// an encoded row, ignoring case, in every form a row could carry one in:
+// raw, percent-encoded for a query or a path, base64 of the part on its own
+// (either alphabet, padded or not), and for a uuid also without its dashes
+// and as base64 of its sixteen bytes; each of those also JSON-escaped, which
+// is how a quote, a backslash or an HTML character appears in JSON.
+//
+// A slice of a part is not looked for. Runs of four or eight hex digits of a
+// uuid occur by chance in the digests and line uuids every row carries, so a
+// slice check would withhold healthy rows, and a slice of a uuid or password
+// does not let a client connect.
 type lineCatalogueSecrets struct{ needles [][]byte }
 
 func newLineCatalogueSecrets(secrets []string) lineCatalogueSecrets {
 	var m lineCatalogueSecrets
+	seen := map[string]bool{}
 	for _, secret := range secrets {
 		if len(secret) < 4 {
 			continue
 		}
-		m.needles = append(m.needles, bytes.ToLower([]byte(secret)))
-		if escaped, err := json.Marshal(secret); err == nil {
-			if inner := escaped[1 : len(escaped)-1]; string(inner) != secret {
-				m.needles = append(m.needles, bytes.ToLower(inner))
+		for _, form := range lineCatalogueSecretForms(secret) {
+			if needle := strings.ToLower(form); !seen[needle] {
+				seen[needle] = true
+				m.needles = append(m.needles, []byte(needle))
 			}
 		}
 	}
 	return m
+}
+
+// lineCatalogueSecretForms is one credential part in every form
+// lineCatalogueSecrets looks for. Padded base64 is the unpadded form plus
+// '=', so the unpadded form finds both.
+func lineCatalogueSecretForms(secret string) []string {
+	raws := [][]byte{[]byte(secret)}
+	forms := []string{secret, url.QueryEscape(secret), url.PathEscape(secret)}
+	if dashless := strings.ReplaceAll(secret, "-", ""); dashless != secret {
+		if id, err := hex.DecodeString(dashless); err == nil && len(id) == 16 {
+			forms = append(forms, dashless)
+			raws = append(raws, id)
+		}
+	}
+	for _, raw := range raws {
+		forms = append(forms, base64.RawStdEncoding.EncodeToString(raw), base64.RawURLEncoding.EncodeToString(raw))
+	}
+	for _, form := range slices.Clone(forms) {
+		if escaped, err := json.Marshal(form); err == nil {
+			forms = append(forms, string(escaped[1:len(escaped)-1]))
+		}
+	}
+	return forms
 }
 
 func (m lineCatalogueSecrets) in(raw []byte) bool {
@@ -937,8 +1009,14 @@ func lineCataloguePageOf(rows [][]byte, version string, offset, limit int, first
 // them. A cursor whose build has gone, or a request that differs from the
 // one the cursor came from, builds afresh, and the page then carries the
 // version of that build, which tells the reader to start over.
+//
+// The cache holds up to lineCataloguePageCacheEntries reads and
+// lineCataloguePageCacheBytes of rows, and makes room by dropping the oldest
+// build. The newest build is always kept, so even a selection larger than
+// the byte bound pages from one build.
 const (
-	lineCataloguePageCacheEntries = 4
+	lineCataloguePageCacheEntries = 16
+	lineCataloguePageCacheBytes   = 32 << 20
 	lineCataloguePageCacheTTL     = 2 * time.Minute
 )
 
@@ -948,9 +1026,10 @@ type lineCataloguePageCache struct {
 }
 
 type lineCataloguePageEntry struct {
-	key  string
-	rows [][]byte
-	at   time.Time
+	key   string
+	rows  [][]byte
+	bytes int
+	at    time.Time
 }
 
 func lineCataloguePageKey(req model.LineCatalogueRequest, version string) string {
@@ -972,16 +1051,28 @@ func (c *lineCataloguePageCache) get(key string, now time.Time) ([][]byte, bool)
 func (c *lineCataloguePageCache) put(key string, rows [][]byte, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	kept := c.entries[:0]
+	size := 0
+	for _, row := range rows {
+		size += len(row)
+	}
+	kept, total := c.entries[:0], 0
 	for _, entry := range c.entries {
 		if entry.key != key && now.Sub(entry.at) < lineCataloguePageCacheTTL {
 			kept = append(kept, entry)
+			total += entry.bytes
 		}
 	}
-	if len(kept) >= lineCataloguePageCacheEntries {
-		kept = kept[1:]
+	for len(kept) > 0 && (len(kept) >= lineCataloguePageCacheEntries || total+size > lineCataloguePageCacheBytes) {
+		oldest := 0
+		for i, entry := range kept {
+			if entry.at.Before(kept[oldest].at) {
+				oldest = i
+			}
+		}
+		total -= kept[oldest].bytes
+		kept = slices.Delete(kept, oldest, oldest+1)
 	}
-	c.entries = append(kept, lineCataloguePageEntry{key: key, rows: rows, at: now})
+	c.entries = append(kept, lineCataloguePageEntry{key: key, rows: rows, bytes: size, at: now})
 }
 
 // decodeLineCatalogueRequest decodes a catalogue request strictly. An empty
@@ -1039,6 +1130,11 @@ func vpnCoreReadAllowed(ctx context.Context) error {
 //
 //	request:  model.LineCatalogueRequest (empty means {})
 //	response: model.LineCatalogueResponse
+//
+// The reader's contract: a later page whose catalogue_version differs from
+// the first page's comes from a fresh build (the first build aged out of the
+// page cache, or the cursor was sent with another request), so the reader
+// discards the rows it has read and starts again without a cursor.
 func (s *Server) vpnCoreLinesCatalogueRPC(ctx context.Context, request []byte) ([]byte, error) {
 	if err := vpnCoreReadAllowed(ctx); err != nil {
 		return nil, err

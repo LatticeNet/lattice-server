@@ -41,12 +41,25 @@ do
   fi
 done
 
+# The handoff names the user alone: su-exec given user:group discards the
+# supplementary groups, and group lattice-probe (65532) is how the server opens
+# lattice-probe's 0660 socket.
 for required in \
   'chown -R lattice:lattice "$data_dir"' \
-  'exec su-exec lattice:lattice "$@"'
+  'exec su-exec lattice "$@"'
 do
   if ! grep -Fq "$required" "$entrypoint"; then
     echo "$entrypoint missing bind-mount ownership handoff: $required" >&2
+    exit 1
+  fi
+done
+
+for required in \
+  "addgroup -S -g 65532 lattice-probe" \
+  "addgroup lattice lattice-probe"
+do
+  if ! grep -Fq "$required" "$dockerfile"; then
+    echo "Dockerfile missing the probe socket group: $required" >&2
     exit 1
   fi
 done

@@ -192,6 +192,7 @@ var KnownScopes = map[string]struct{}{
 	"token:admin":     {},
 	"tunnel:admin":    {},
 	"user:admin":      {},
+	"vpn:probe":       {}, // design 27 outbound probe; no proxy or vpncore grant implies it
 	"vpncore:admin":   {},
 	"vpncore:read":    {},
 	"wireguard:admin": {},

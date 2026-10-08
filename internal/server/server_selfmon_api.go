@@ -370,6 +370,9 @@ type systemHealthView struct {
 	// counted as they exited.
 	PluginProcesses []systemPluginProcessRow `json:"plugin_processes"`
 	MetricsStore    systemMetricsStoreView   `json:"metrics_store"`
+	// Probe is lattice-probe's health as latticenet.vpn-core/probe health
+	// reports it: available with the engine and core versions, or why not.
+	Probe probeHealthView `json:"probe"`
 }
 
 type systemPluginProcessRow struct {
@@ -464,6 +467,10 @@ func (s *Server) handleSystemHealth(w http.ResponseWriter, r *http.Request, p pr
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// The probe answers over its socket while the store is read, so a probe
+	// that hangs costs this page its health timeout at most, once.
+	probeHealth := make(chan probeHealthView, 1)
+	go func() { probeHealth <- s.probe.health(r.Context(), false) }()
 	m := s.selfmon
 	latest, _, lastWriteAt, lastWriteErr, sizes := m.snapshot()
 	view := systemHealthView{
@@ -577,5 +584,6 @@ func (s *Server) handleSystemHealth(w http.ResponseWriter, r *http.Request, p pr
 		return
 	}
 	view.MetricsStore = systemMetricsStoreView{Stats: stats, LastWriteAt: lastWriteAt, LastWriteError: lastWriteErr, SampleSeconds: int64(selfMonSampleEvery / time.Second)}
+	view.Probe = <-probeHealth
 	writeJSON(w, http.StatusOK, view)
 }

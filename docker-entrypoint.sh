@@ -10,7 +10,10 @@ if [ "$(id -u)" = "0" ]; then
   data_dir="$(dirname "$data_path")"
   mkdir -p "$data_dir"
   chown -R lattice:lattice "$data_dir"
-  exec su-exec lattice:lattice "$@"
+  # The user alone, not user:group: su-exec then keeps lattice's
+  # supplementary groups, and lattice-probe is how the server opens the
+  # probe's socket.
+  exec su-exec lattice "$@"
 fi
 
 exec "$@"

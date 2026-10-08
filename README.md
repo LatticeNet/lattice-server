@@ -81,6 +81,20 @@ cannot read (damaged, or written by a newer release before a rollback) is
 moved aside as `metrics.db.unreadable-<unix time>` and a fresh one started;
 the server never refuses to start over it.
 
+The outbound probe is a separate program, `lattice-probe`, that runs beside
+the server and listens on a unix socket, `/run/lattice-probe/probe.sock` by
+default (`LATTICE_PROBE_SOCKET` to change it). vpn-core's Probe page reaches
+it through the host service `latticenet.vpn-core/probe`, which needs the
+`vpn:probe` scope and an unrestricted node allowlist; no proxy or vpncore
+grant implies it. Each operator may have 4 runs in flight and 120 in a
+rolling hour. A run the probe answered without using the network (a
+malformed request, a busy probe, an outbound that does not decode or create)
+does not count toward the 120. Every run is audited as `vpncore.probe` with
+the outbound types, the tested server's address, the targets, the outcome and
+a SHA-256 of the outbounds' canonical JSON, never the outbound itself. The
+server starts without the probe; a missing socket only makes it read as
+unavailable, with the reason, on the System page.
+
 Self-host DNS can optionally install a pinned CoreDNS executable during an
 approved `selfdns` apply. Leave these unset to keep the stricter precondition
 that `coredns` must already exist on the node:

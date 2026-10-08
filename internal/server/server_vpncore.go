@@ -38,6 +38,9 @@ const (
 	// vpnCoreProfilesService is the per-node runtime read-model (design-12 S4), proxy:read.
 	vpnCoreProfilesService            = "latticenet.vpn-core/profiles"
 	vpnCoreSubscriptionSourcesService = "latticenet.vpn-core/subscription-sources"
+	// vpnCoreProbeService tests a pasted outbound through lattice-probe
+	// (design 27), vpn:probe; see vpncore_probe.go.
+	vpnCoreProbeService = "latticenet.vpn-core/probe"
 )
 
 // registerVPNCoreRPC registers the in-core vpn-core services on the server's RPC
@@ -69,6 +72,9 @@ func (s *Server) registerVPNCoreRPC() {
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionSourcesService, "v1", []string{"compose", "graph_options"}, s.vpnCoreSubscriptionSourcesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreSubscriptionSourcesService, err)
+	}
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProbeService, "v1", []string{"health", "targets", "run"}, s.vpnCoreProbeRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreProbeService, err)
 	}
 }
 

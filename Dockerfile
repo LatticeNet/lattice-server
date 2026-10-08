@@ -43,11 +43,19 @@ ARG COMMIT=unknown
 ARG DASHBOARD_COMMIT=unknown
 ARG DATE=unknown
 
+# lattice-probe (design 27) runs as 65532:65532 and serves a 0660 socket in a
+# volume shared at /run/lattice-probe. The server reaches it through group
+# 65532, and the directory ships owned by the probe so whichever container
+# first fills the named volume leaves it writable for the probe.
 RUN apk add --no-cache ca-certificates su-exec tzdata \
     && addgroup -S lattice \
     && adduser -S -G lattice -h /var/lib/lattice lattice \
-    && mkdir -p /app/dashboard /var/lib/lattice /plugins \
-    && chown -R lattice:lattice /var/lib/lattice /plugins
+    && addgroup -S -g 65532 lattice-probe \
+    && addgroup lattice lattice-probe \
+    && mkdir -p /app/dashboard /var/lib/lattice /plugins /run/lattice-probe \
+    && chown -R lattice:lattice /var/lib/lattice /plugins \
+    && chown 65532:65532 /run/lattice-probe \
+    && chmod 0770 /run/lattice-probe
 
 COPY --from=build /out/lattice-server /usr/local/bin/lattice-server
 COPY --from=dashboard /src/dashboard/dist /app/dashboard

@@ -28,6 +28,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-webauthn/webauthn/webauthn"
 
@@ -124,6 +125,10 @@ type Options struct {
 	// canonical source for the WebAuthn relying-party ID and origin (RPID = host,
 	// RPOrigin = scheme://host[:port]); passkeys fail closed when it is empty.
 	PublicURL string
+	// ProbeSocket is the unix socket lattice-probe listens on
+	// (LATTICE_PROBE_SOCKET). Empty means /run/lattice-probe/probe.sock; a
+	// missing socket only makes the probe read as unavailable.
+	ProbeSocket string
 	// MetricsToken enables the /metrics endpoint when non-empty. The endpoint
 	// accepts only Authorization: Bearer <token>; empty keeps it hidden so public
 	// deployments do not expose fleet runtime counters by default.
@@ -484,6 +489,12 @@ type Server struct {
 	agentReleaseRepo    string
 	agentReleaseCacheMu sync.Mutex
 	agentReleaseCache   map[string]agentReleaseCacheEntry
+
+	// probe reaches lattice-probe over its socket; probeLimits holds each
+	// principal's runs in flight and in the last hour (vpncore_probe.go).
+	probe       *probeClient
+	probeLimits probeLimiter
+
 	// auditHeadShipper owns optional automated off-box custody for the verified
 	// audit WAL head. Nil means disabled.
 	auditHeadShipper *auditHeadShipper
@@ -737,6 +748,7 @@ func New(opts Options) (*Server, error) {
 		coreDNSBinary:         coreDNSBinary,
 		geoResolver:           opts.GeoResolver,
 		agentReleaseRepo:      agentReleaseRepo,
+		probe:                 newProbeClient(opts.ProbeSocket),
 		auditHeadShipper:      auditHeadShipper,
 		taskExecutionDisabled: opts.TaskExecutionDisabled,
 		approvalAutoRules:     approvalAutoRules,
@@ -994,7 +1006,11 @@ type pluginView struct {
 	Active       bool                       `json:"active"`
 	UI           *plugin.ManifestUI         `json:"ui,omitempty"`
 	Interfaces   []plugin.InterfaceContract `json:"interfaces,omitempty"`
-	UIRuntime    *pluginUIRuntimeView       `json:"ui_runtime,omitempty"`
+	// CallTimeoutsMS is the gateway deadline of each callable method that is
+	// not the 15 s default, by service and method, so the console's bridge
+	// waits as long as the server does. Contributions view only.
+	CallTimeoutsMS map[string]map[string]int64 `json:"call_timeouts_ms,omitempty"`
+	UIRuntime      *pluginUIRuntimeView        `json:"ui_runtime,omitempty"`
 }
 
 type pluginUIRuntimeView struct {
@@ -10160,12 +10176,18 @@ func (s *Server) recordRequestAudit(r *http.Request, ev model.AuditEvent) {
 }
 
 // auditTruncate bounds attacker-controlled strings before they enter the
-// append-only audit store.
+// append-only audit store. It cuts at a rune boundary, at most max bytes in,
+// so a multi-byte character at the bound is dropped whole rather than split
+// into an invalid UTF-8 tail.
 func auditTruncate(v string, max int) string {
 	if len(v) <= max {
 		return v
 	}
-	return v[:max]
+	cut := max
+	for back := 0; cut > 0 && back < utf8.UTFMax-1 && !utf8.RuneStart(v[cut]); back++ {
+		cut--
+	}
+	return v[:cut]
 }
 
 // auditBucketedIP collapses a client address to a throttle key that source

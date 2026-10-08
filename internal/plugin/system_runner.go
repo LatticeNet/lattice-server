@@ -1000,6 +1000,7 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 	if err != nil {
 		return InvokeResponse{}, err
 	}
+	runCtx = bindInvocationMethod(runCtx, req.Constraints.Service, req.Constraints.Method, budget.HTTPResponseBytes)
 	if st.isV2 {
 		return r.invokeV2Pooled(runCtx, ctx, req, st, broker, budget)
 	}
@@ -1734,7 +1735,8 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 		}
 		return json.RawMessage(`{}`), nil
 	default:
-		return nil, fmt.Errorf("unsupported host_call method %q", call.Method)
+		// kv.delete, task.schedule and task.unschedule (design 28 S0).
+		return dispatchStoreAndScheduleHostCall(ctx, broker, call)
 	}
 }
 

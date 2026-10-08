@@ -114,7 +114,12 @@ var capabilityRisk = map[string]string{
 	// rate limiting to plugin code.
 	"subscription:serve": RiskHost,
 	"task:run":           RiskHost,
-	"tunnel:admin":       RiskHost,
+	// task:schedule lets a plugin have the server call its own methods on a
+	// cron schedule (design 28). Host-risk, so system-only and signed: it is
+	// the one way a plugin's code, egress included, runs without an operator
+	// or core asking for that run.
+	"task:schedule": RiskHost,
+	"tunnel:admin":  RiskHost,
 	// wireguard:admin authorizes planning and administering WireGuard interface
 	// state on nodes (design-13 D10). Host-risk like netguard:admin: the rendered
 	// plan reshapes a node's network reachability, so it stays system-only and

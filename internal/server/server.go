@@ -428,6 +428,9 @@ type Server struct {
 	identityConvertFlights map[identityConvertFlightKey]*shareRenderFlight
 	identityFetches        identityLinkFetches
 	identityLinkConvert    func(context.Context, []string, shareRenderVariant) (renderedSubscription, error)
+	// pluginSchedules holds the plugin task schedules' locks and the runs in
+	// flight (plugin_task_schedule.go); the schedules live in the store.
+	pluginSchedules pluginTaskScheduler
 	// traceRetentionKick asks the retention loop for a pass now, after an
 	// evidence settings save lowered a cap or a TTL (evidence_settings.go).
 	traceRetentionKick chan struct{}
@@ -874,6 +877,7 @@ func New(opts Options) (*Server, error) {
 		s.startShareFetchStatsFlush()
 		s.startLineClientTemplateSync()
 		s.startLatencyProbeSync()
+		s.startPluginTaskScheduler()
 		s.startStateWriteSummary()
 		if s.selfmon != nil {
 			s.selfmon.start()
@@ -5063,7 +5067,7 @@ func reservedLineSecretKVBucket(bucket string) bool {
 	bucket = strings.TrimSpace(bucket)
 	return bucket == vpnCoreKVBucket || bucket == "managedline/def" ||
 		bucket == "vpn_users" || bucket == "vpn_user_secrets" ||
-		bucket == "managed_line_secrets"
+		bucket == "managed_line_secrets" || bucket == pluginTaskScheduleKVBucket
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principal) {

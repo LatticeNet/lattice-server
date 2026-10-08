@@ -112,13 +112,24 @@ func (s *Server) renderShareOnce(ctx context.Context, share model.SubscriptionSh
 		if len(rendered.Body) == 0 {
 			return shareRenderOutcome{deny: "empty render refused"}
 		}
+		wireType := shareWireContentType(plan, reportedRenderTarget(rendered.Target))
+		// A share with an age recipient is encrypted here, before the body
+		// is cached, so the cache never holds its plaintext.
+		body, sealed, err := subStoreSvcSealShareBody(share, rendered.Body)
+		if err != nil {
+			s.logger.Printf("subscription share: age encryption failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(err))
+			return shareRenderOutcome{deny: "subscription_age_failed"}
+		}
+		if sealed {
+			wireType = subStoreSvcAgeWireType
+		}
 		// A plugin body is cached and served many times, so it is compressed
 		// once here; a core body is served once and compressed per request.
-		served := newShareBody(rendered.Body, share.Source.Kind == model.ShareSourcePlugin, gzip.BestCompression)
-		entry := subscriptionCacheEntry{body: rendered.Body, contentType: rendered.ContentType, userinfo: rendered.Userinfo,
+		served := newShareBody(body, share.Source.Kind == model.ShareSourcePlugin, gzip.BestCompression)
+		entry := subscriptionCacheEntry{body: body, contentType: rendered.ContentType, userinfo: rendered.Userinfo,
 			revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
 			stale: rendered.Stale, fetchedAt: rendered.FetchedAt,
-			wireType: shareWireContentType(plan, reportedRenderTarget(rendered.Target)),
+			wireType: wireType,
 			bodyHash: served.hash, gzipBody: served.gzipBody}
 		if share.Source.Kind == model.ShareSourcePlugin &&
 			!s.putSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, rendered.SourceEpoch, entry, s.now()) {

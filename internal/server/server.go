@@ -462,6 +462,11 @@ type Server struct {
 	subscriptionBeforeCacheExtend func()
 	subscriptionCacheLookupWaiter chan<- struct{}
 	subscriptionCacheExtendWaiter chan<- struct{}
+
+	// subStoreSvc is the state of the Sub-Store shares and plans services
+	// (substore_svc.go).
+	subStoreSvc subStoreSvcState
+
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First

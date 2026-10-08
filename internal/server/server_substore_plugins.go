@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -27,7 +26,7 @@ func (s *Server) registerSubStorePluginRPC() {
 	if s.pluginRPC == nil {
 		return
 	}
-	if err := s.pluginRPC.Register(subStorePluginID, subStoreSharesService, "v1", []string{"list"}, s.subStoreSharesRPC); err != nil {
+	if err := s.pluginRPC.Register(subStorePluginID, subStoreSharesService, "v1", subStoreSharesMethods, s.subStoreSharesRPC); err != nil {
 		s.logger.Printf("sub-store: register %s failed: %v", subStoreSharesService, err)
 	}
 }
@@ -50,6 +49,20 @@ type subStoreShareRow struct {
 	Path     string `json:"path"`
 	URL      string `json:"url,omitempty"`
 	Revealed bool   `json:"revealed,omitempty"`
+
+	// The operator fields of the share lifecycle (substore_svc_shares.go).
+	DisplayName         string           `json:"display_name,omitempty"`
+	Remark              string           `json:"remark,omitempty"`
+	Icon                *model.ShareIcon `json:"icon,omitempty"`
+	Tags                []string         `json:"tags,omitempty"`
+	Order               int              `json:"order"`
+	ArchivedAt          *time.Time       `json:"archived_at,omitempty"`
+	IdentityID          string           `json:"identity_id,omitempty"`
+	UpdateIntervalHours int              `json:"update_interval_hours"`
+	AgeRecipient        string           `json:"age_recipient,omitempty"`
+	CreatedAt           time.Time        `json:"created_at"`
+	UpdatedAt           time.Time        `json:"updated_at"`
+	RotatedAt           *time.Time       `json:"rotated_at,omitempty"`
 }
 
 // subStoreSharesListRequest is list's optional input. With ShareID and a
@@ -59,6 +72,9 @@ type subStoreShareRow struct {
 type subStoreSharesListRequest struct {
 	ShareID     string `json:"share_id,omitempty"`
 	StepUpGrant string `json:"step_up_grant,omitempty"`
+	// IncludeArchived lists the shares in the recycle bin too; without it
+	// the list holds live shares only.
+	IncludeArchived bool `json:"include_archived,omitempty"`
 }
 
 func (s *Server) subStoreSharesRPC(ctx context.Context, method string, request []byte) ([]byte, error) {
@@ -102,14 +118,10 @@ func (s *Server) subStoreSharesRPC(ctx context.Context, method string, request [
 			if share.Source.Kind != model.ShareSourcePlugin || share.Source.PluginID != subStorePluginID {
 				continue
 			}
-			row := subStoreShareRow{
-				SubscriptionID: share.Source.SubscriptionID,
-				ShareID:        share.ID,
-				Slug:           share.Slug,
-				Enabled:        share.Enabled,
-				DefaultFormat:  share.DefaultFormat,
-				ExpiresAt:      share.ExpiresAt,
+			if share.ArchivedAt != nil && !req.IncludeArchived && share.ID != req.ShareID {
+				continue
 			}
+			row := subStoreSvcShareRow(share)
 			if reveal.Allowed && share.ID == req.ShareID {
 				link := s.linkRevealViewOf("share", share.ID, share.Slug, share.Token)
 				row.Path, row.URL, row.Revealed = link.Path, link.URL, true
@@ -119,6 +131,6 @@ func (s *Server) subStoreSharesRPC(ctx context.Context, method string, request [
 		sort.Slice(rows, func(i, j int) bool { return rows[i].Slug < rows[j].Slug })
 		return json.Marshal(map[string]any{"shares": rows})
 	default:
-		return nil, fmt.Errorf("sub-store/shares: unknown method %q", method)
+		return s.subStoreSvcSharesRPC(ctx, method, request)
 	}
 }

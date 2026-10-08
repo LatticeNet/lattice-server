@@ -226,59 +226,15 @@ func (s *Server) identityLinkContent(u VpnUser) identityLinkContent {
 			line.LineName = identityLinkLineName(ln)
 			line.Protocol = strings.ToLower(strings.TrimSpace(ln.Type))
 		}
-		switch {
-		case !known:
+		if !known {
 			exclude(identityLineUnknown, identityFixWaitDiscovery, "")
 			continue
-		case ln.Managed:
-			// The managed render path would need the applied-credential
-			// check against the managed render (identity-ground deferred
-			// it); production has no managed lines.
-			exclude(identityLineManaged, "", "")
-			continue
-		case !lineUserProtocols[line.Protocol]:
-			exclude(identityLineProtocol, "", "")
-			continue
 		}
-		switch lineBindingCredentialState(u, b, ln, true) {
-		case lineCredentialCurrent:
-		case lineCredentialStale:
-			exclude(identityLineRotationPending, identityFixPlanUpdate, "")
-			continue
-		case lineCredentialUnknown:
-			exclude(identityLineCredentialUnknown, identityFixWaitAllocation, "")
-			continue
-		default:
-			// The binding exists and is enabled, so plan_add refuses it
-			// ("already bound ... plan_update instead", lineusers.go), and
-			// plan_update is the plan that puts the credential on the node:
-			// on an adopted line both run `sb user add`, which adds the
-			// entry or replaces it, whether or not the node already holds
-			// the user name.
-			exclude(identityLineNotApplied, identityFixPlanUpdate, "")
-			continue
-		}
-		name := userLineName(u.ID, ln.LineUUID)
-		if identityLinkParked(ln, name) {
-			exclude(identityLineParked, identityFixResume, "")
-			continue
-		}
-		if ln.ServiceState == "down" {
-			exclude(identityLineServiceDown, identityFixCheckService, "")
-			continue
-		}
-		template, ok := s.store.LineClientTemplate(ln.LineHashID)
-		if !ok || template.NodeID != ln.NodeID || template.LineUUID != ln.LineUUID {
-			exclude(identityLineNoTemplate, identityFixWaitTemplate, "")
-			continue
-		}
-		if template.Lossy() {
-			exclude(identityLineTemplateLossy, "", strings.Join(template.Dropped, ", "))
-			continue
-		}
-		payload, err := lineUserCredential(u, template.Protocol, name)
-		if err != nil {
-			exclude(identityLineTemplateUnusable, "", "")
+		template, found := s.store.LineClientTemplate(ln.LineHashID)
+		found = found && template.NodeID == ln.NodeID && template.LineUUID == ln.LineUUID
+		payload, why := identityLinkLineCheck(u, b, ln, template, found)
+		if why.reason != "" {
+			exclude(why.reason, why.fix, why.detail)
 			continue
 		}
 		label := identityLinkEntryLabel(line.NodeName, line.LineName)
@@ -305,6 +261,66 @@ func (s *Server) identityLinkContent(u VpnUser) identityLinkContent {
 	sortIdentityLinkLines(out.Included)
 	sortIdentityLinkLines(out.Excluded)
 	return out
+}
+
+// identityLinkExclusion is why a bound line is left out, and what fixes it.
+// A zero value means the line is included.
+type identityLinkExclusion struct {
+	reason, fix, detail string
+}
+
+// identityLinkLineCheck runs, in order, the checks an identity link applies
+// to one enabled binding of a line the read model knows, and returns the
+// identity's credential payload for the line, or the first check that fails.
+// template is the line's stored client template, found reporting whether one
+// exists for the same node and line_uuid. The bind step of a fleet-bound
+// share applies the same checks to every line it binds (substore_bind.go).
+func identityLinkLineCheck(u VpnUser, b LineBinding, ln Line, template store.LineClientTemplate, found bool) (lineUserCredentialPayload, identityLinkExclusion) {
+	exclude := func(reason, fix, detail string) (lineUserCredentialPayload, identityLinkExclusion) {
+		return lineUserCredentialPayload{}, identityLinkExclusion{reason: reason, fix: fix, detail: detail}
+	}
+	switch {
+	case ln.Managed:
+		// The managed render path would need the applied-credential
+		// check against the managed render (identity-ground deferred
+		// it); production has no managed lines.
+		return exclude(identityLineManaged, "", "")
+	case !lineUserProtocols[strings.ToLower(strings.TrimSpace(ln.Type))]:
+		return exclude(identityLineProtocol, "", "")
+	}
+	switch lineBindingCredentialState(u, b, ln, true) {
+	case lineCredentialCurrent:
+	case lineCredentialStale:
+		return exclude(identityLineRotationPending, identityFixPlanUpdate, "")
+	case lineCredentialUnknown:
+		return exclude(identityLineCredentialUnknown, identityFixWaitAllocation, "")
+	default:
+		// The binding exists and is enabled, so plan_add refuses it
+		// ("already bound ... plan_update instead", lineusers.go), and
+		// plan_update is the plan that puts the credential on the node:
+		// on an adopted line both run `sb user add`, which adds the
+		// entry or replaces it, whether or not the node already holds
+		// the user name.
+		return exclude(identityLineNotApplied, identityFixPlanUpdate, "")
+	}
+	name := userLineName(u.ID, ln.LineUUID)
+	if identityLinkParked(ln, name) {
+		return exclude(identityLineParked, identityFixResume, "")
+	}
+	if ln.ServiceState == "down" {
+		return exclude(identityLineServiceDown, identityFixCheckService, "")
+	}
+	if !found {
+		return exclude(identityLineNoTemplate, identityFixWaitTemplate, "")
+	}
+	if template.Lossy() {
+		return exclude(identityLineTemplateLossy, "", strings.Join(template.Dropped, ", "))
+	}
+	payload, err := lineUserCredential(u, template.Protocol, name)
+	if err != nil {
+		return exclude(identityLineTemplateUnusable, "", "")
+	}
+	return payload, identityLinkExclusion{}
 }
 
 func sortIdentityLinkLines(lines []identityLinkLine) {

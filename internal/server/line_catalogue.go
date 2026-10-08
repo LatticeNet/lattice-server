@@ -83,10 +83,12 @@ var lineCatalogueSelectorFields = model.LineCatalogueSelectorFields()
 
 // substoreCatalogueState is the server's state for the native Sub-Store's
 // fleet reads (design 28): the names the catalogue resolves on the template
-// sync's clock, and the builds a paged read is served from.
+// sync's clock, the builds a paged read is served from, and what the
+// fleet-dependency answers need (share_fleet_depends.go).
 type substoreCatalogueState struct {
 	names lineCatalogueNames
 	pages lineCataloguePageCache
+	deps  fleetDependsState
 }
 
 // lineCatalogue is one build of the catalogue: every line with a line_uuid,

@@ -4,8 +4,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // A Sub-Store record can read vpn-core: the node export for one identity, a
@@ -25,10 +23,11 @@ import (
 // publishes nothing); when it moved, the refresh publishes and the link
 // renders the new content.
 //
-// The core cannot tell which records read vpn-core, so an advance makes every
-// plugin source due; one that did not move costs a provider fetch and no
-// render. A plugin method naming the records that depend on vpn-core would
-// narrow this (logged for the Sub-Store lane).
+// Without more, the core cannot tell which records read vpn-core, so an
+// advance makes every plugin source due; one that did not move costs a
+// provider fetch and no render. A plugin that declares depends_on names the
+// records that read the fleet, and an advance then expires and makes due only
+// those (share_fleet_depends.go).
 //
 // Writes arrive in bursts (a bulk identity import, a quota sweep suspending
 // many identities, an operator editing several lines), and advancing once per
@@ -92,16 +91,14 @@ func (s *Server) settleVPNCoreChanges() {
 	s.advanceVPNCoreGeneration(now)
 }
 
-// advanceVPNCoreGeneration advances the vpn-core generation and expires every
-// cached plugin link body. It is cheap (one pass over the shares and at most
-// the cache's 512 entries) and runs at most once per interval.
+// advanceVPNCoreGeneration advances the vpn-core generation and expires the
+// cached plugin link bodies the change may have moved: only the dependent
+// records' shares for a plugin that answers depends_on, every share of any
+// other plugin (share_fleet_depends.go). It is cheap (one pass over the
+// shares and at most the cache's 512 entries) and runs at most once per
+// interval.
 func (s *Server) advanceVPNCoreGeneration(now time.Time) {
-	s.vpnCoreGen.Add(1)
-	for _, share := range s.store.SubscriptionSharesUnordered() {
-		if share.Source.Kind == model.ShareSourcePlugin {
-			s.subscriptionCache.ExpireShare(share.ID, now)
-		}
-	}
+	s.expirePluginSharesForFleetChange(s.vpnCoreGen.Add(1), now)
 }
 
 // subscriptionSourceDue reports whether a source has not been refreshed since

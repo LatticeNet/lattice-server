@@ -238,27 +238,43 @@ case deny wrong slug
   body: ""
   audit subscription.share.fetch/deny reason=subscription not found slug=nope source_ip=192.0.2.14 token_sha256=<redacted>
 
-case deny disabled
-  status: 404
+case placeholder disabled
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"off\"; filename*=UTF-8''off"
+  header Content-Length: "184"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"da8076809e5f7b5f17fc1c787aa62510\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=0; download=1; total=1; expire=0"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
-  body: ""
-  audit subscription.share.fetch/deny reason=subscription not found slug=off source_ip=192.0.2.15 token_sha256=<redacted>
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "dmxlc3M6Ly8wMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDBAMTI3LjAuMC4xOjE/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PW5vbmUmdHlwZT10Y3AjTGF0dGljZTolMjBEaXNhYmxlZCUyMGJ5JTIwdGhlJTIwb3BlcmF0b3I="
+  audit subscription.share.fetch/allow reason=first fetch from this client family answer=placeholder cache=false reason=share_disabled share_id=share_off slug=off source_ip=192.0.2.15 target=URI token_sha256=<redacted> ua_class=other
 
-case deny expired
-  status: 404
+case placeholder expired
+  status: 200
+  header Cache-Control: "no-store"
+  header Content-Disposition: "attachment; filename=\"old\"; filename*=UTF-8''old"
+  header Content-Length: "176"
   header Content-Security-Policy: "default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'"
+  header Content-Type: "text/plain; charset=utf-8"
   header Cross-Origin-Opener-Policy: "same-origin"
+  header Etag: "\"119fd4b5d2d6ec4f650085dea9f3e1fc\""
   header Permissions-Policy: "accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), publickey-credentials-get=(self), screen-wake-lock=(), usb=(), xr-spatial-tracking=()"
+  header Profile-Update-Interval: "2"
   header Referrer-Policy: "no-referrer"
+  header Subscription-Userinfo: "upload=0; download=1; total=1; expire=1699996400"
   header X-Content-Type-Options: "nosniff"
   header X-Frame-Options: "DENY"
-  body: ""
-  audit subscription.share.fetch/deny reason=subscription not found slug=old source_ip=192.0.2.16 token_sha256=<redacted>
+  header X-Lattice-Request-Id: "<per-request>"
+  body: "dmxlc3M6Ly8wMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDBAMTI3LjAuMC4xOjE/ZW5jcnlwdGlvbj1ub25lJnNlY3VyaXR5PW5vbmUmdHlwZT10Y3AjTGF0dGljZTolMjBFeHBpcmVkJTIwb24lMjAyMDIzLTExLTE0"
+  audit subscription.share.fetch/allow reason=first fetch from this client family answer=placeholder cache=false reason=share_expired share_id=share_old slug=old source_ip=192.0.2.16 target=URI token_sha256=<redacted> ua_class=other
 
 case deny bad format
   status: 404

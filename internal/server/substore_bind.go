@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -140,6 +142,12 @@ type substoreBindEntry struct {
 	// Clone is the node's position among the plan's nodes for its line,
 	// from 1.
 	Clone int `json:"clone,omitempty"`
+	// Digest identifies the entry as a client receives it, its credential
+	// fields left out: everything that decides where and how the client
+	// dials, the identity's flow included. Two entries a client would use
+	// differently have different digests, and a new placeholder draw does
+	// not change it.
+	Digest string `json:"digest"`
 }
 
 // substoreBindExclusion is one node the bind step left out, and why.
@@ -689,17 +697,27 @@ func substoreBindSNIAllowed(obj substoreNodeObject, shape substoreBindShape, t s
 	return actual == "" || slices.ContainsFunc(substoreBindNames(t, row), func(name string) bool { return strings.EqualFold(name, actual) })
 }
 
+// substoreBindEntryDigest digests a node with its credential fields left
+// out.
+func substoreBindEntryDigest(obj substoreNodeObject) string {
+	for _, field := range substoreBindCredentialFields {
+		obj = obj.without(field)
+	}
+	sum := sha256.Sum256(obj.encode())
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
 // substoreBindNodeCredential writes the identity's credential where each
 // placeholder of a validated node was and, for vless, the identity's flow.
-func substoreBindNodeCredential(obj substoreNodeObject, node model.SelectionPlanNode, line *substoreBindLine) (json.RawMessage, error) {
+func substoreBindNodeCredential(obj substoreNodeObject, node model.SelectionPlanNode, line *substoreBindLine) (substoreNodeObject, error) {
 	for field := range node.Placeholders {
 		value := substoreBindCredentialValue(line.payload, field)
 		if value == "" {
-			return nil, errors.New("the identity's credential has no " + field)
+			return substoreNodeObject{}, errors.New("the identity's credential has no " + field)
 		}
 		encoded, err := json.Marshal(value)
 		if err != nil {
-			return nil, err
+			return substoreNodeObject{}, err
 		}
 		obj = obj.with(field, encoded)
 	}
@@ -711,7 +729,7 @@ func substoreBindNodeCredential(obj substoreNodeObject, node model.SelectionPlan
 			obj = obj.with("flow", flow)
 		}
 	}
-	return obj.encode(), nil
+	return obj, nil
 }
 
 // substoreBindCredentialValue is the identity's value for one credential
@@ -769,7 +787,8 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 			var port int
 			_ = json.Unmarshal(obj.values["port"], &port)
 			typ, _ := obj.string("type")
-			result.Entries = append(result.Entries, substoreBindEntry{Index: i, Provider: true, Name: name, Protocol: typ, Server: server, Port: port})
+			result.Entries = append(result.Entries, substoreBindEntry{Index: i, Provider: true, Name: name, Protocol: typ, Server: server, Port: port,
+				Digest: substoreBindEntryDigest(obj)})
 			bound[i] = node.Node
 			continue
 		}
@@ -826,7 +845,7 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 			exclude(v.index, v.node.LineUUID, v.entry.Name, v.line.exclude)
 			continue
 		}
-		node, err := substoreBindNodeCredential(v.obj, v.node, v.line)
+		boundObj, err := substoreBindNodeCredential(v.obj, v.node, v.line)
 		if err != nil {
 			exclude(v.index, v.node.LineUUID, v.entry.Name, identityLinkExclusion{reason: identityLineTemplateUnusable})
 			continue
@@ -834,7 +853,8 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 		for field, placeholder := range v.node.Placeholders {
 			substitutions[placeholder] = substoreBindCredentialValue(v.line.payload, field)
 		}
-		bound[v.index] = node
+		bound[v.index] = boundObj.encode()
+		v.entry.Digest = substoreBindEntryDigest(boundObj)
 		result.Entries = append(result.Entries, v.entry)
 	}
 	sort.SliceStable(result.Entries, func(i, j int) bool { return result.Entries[i].Index < result.Entries[j].Index })

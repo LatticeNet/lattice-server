@@ -200,6 +200,20 @@ func TestSubstoreBindBindsTheIdentityIntoEveryValidatedNode(t *testing.T) {
 		entry.Label != "Node 000 vless-20000" || entry.Protocol != "vless" {
 		t.Fatalf("entry = %+v", entry)
 	}
+	// An entry's digest leaves the credential out, so a fresh placeholder
+	// draw of the same plan digests the same, and an entry that dials
+	// differently does not.
+	again := e.bindRun(t, bindNodesPlan(t, e.rows), nil)
+	for i := range result.Entries {
+		if result.Entries[i].Digest == "" || result.Entries[i].Digest != again.Entries[i].Digest {
+			t.Fatalf("entry %d digests %q then %q", i, result.Entries[i].Digest, again.Entries[i].Digest)
+		}
+	}
+	moved := bindNodesPlan(t, e.rows)
+	moved.Nodes[0] = bindNode(t, e.rows[0], moved.Nodes[0].Placeholders["uuid"], map[string]any{"client-fingerprint": "safari"})
+	if e.bindRun(t, moved, nil).Entries[0].Digest == result.Entries[0].Digest {
+		t.Fatal("an entry with another fingerprint has the same digest")
+	}
 }
 
 // Check 3: a node whose server is outside the line's allowed set is excluded

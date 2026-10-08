@@ -24,6 +24,17 @@ import (
 // The rendered plaintext is encrypted before it enters the body cache, so a
 // cached body is ciphertext, and the plaintext is never logged: every error
 // below is a fixed message that carries neither the body nor the key.
+//
+// What age does not cover, by choice:
+//
+//   - the body is ASCII-armored, because subscription clients and the
+//     operator's tooling fetch text, and armor survives copy and paste;
+//   - the Subscription-Userinfo header (upload, download, total, expiry)
+//     goes out in the clear beside the ciphertext, as it does for every
+//     share: clients read the quota from that header, not from the body;
+//   - the ETag is the hash of the ciphertext, and age encryption is
+//     randomized, so it changes whenever the body is rendered again, not
+//     only when the document changes.
 
 const (
 	// subStoreSvcShareExtraAgeRecipient stores a share's age recipient.

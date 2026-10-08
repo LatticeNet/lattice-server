@@ -6050,10 +6050,12 @@ type ddnsView struct {
 	EnableIPv6 bool     `json:"enable_ipv6"`
 	MaxRetries int      `json:"max_retries"`
 	TTL        int      `json:"ttl"`
-	// IntervalSeconds must be returned, not just stored: the edit form reads
-	// the profile back to prefill itself, so a field the view withholds is a
-	// field every edit silently resets.
+	// IntervalSeconds and the comment fields must be returned, not just
+	// stored: the edit form reads the profile back to prefill itself, so a
+	// field the view withholds is a field every edit silently resets.
 	IntervalSeconds int       `json:"interval_seconds,omitempty"`
+	CommentMode     string    `json:"comment_mode,omitempty"`
+	RecordComment   string    `json:"record_comment,omitempty"`
 	HasCredential   bool      `json:"has_credential"`
 	WebhookURL      string    `json:"webhook_url,omitempty"`
 	WebhookMethod   string    `json:"webhook_method,omitempty"`
@@ -6063,6 +6065,9 @@ type ddnsView struct {
 	LastError       string    `json:"last_error,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
+	// Warnings come only with a save: things that will stop or mislead this
+	// profile which the save itself does not refuse.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 func toDDNSView(p model.DDNSProfile) ddnsView {
@@ -6072,6 +6077,7 @@ func toDDNSView(p model.DDNSProfile) ddnsView {
 		IntervalSeconds: p.IntervalSeconds,
 		HasCredential:   p.CFAPIToken != "" || p.WebhookHeaders != "",
 		WebhookURL:      p.WebhookURL, WebhookMethod: p.WebhookMethod,
+		CommentMode: p.CommentMode, RecordComment: p.RecordComment,
 		LastIPv4: p.LastIPv4, LastIPv6: p.LastIPv6, LastRunAt: p.LastRunAt, LastError: p.LastError,
 		CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 	}
@@ -6102,6 +6108,10 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 		}
 		if !req.EnableIPv4 && !req.EnableIPv6 {
 			req.EnableIPv4 = true
+		}
+		if err := ddns.ValidateCommentSettings(req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
 		}
 		// An id in the body means "edit this profile". Without this the handler
 		// minted a fresh id on every POST, so a profile could be created and
@@ -6148,10 +6158,85 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider}})
-		writeJSON(w, http.StatusOK, toDDNSView(req))
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider, "comment_mode": ddnsCommentModeLabel(req)}})
+		view := toDDNSView(req)
+		view.Warnings = s.ddnsSaveWarnings(r.Context(), req)
+		writeJSON(w, http.StatusOK, view)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+	}
+}
+
+// ddnsCommentModeLabel names a profile's comment mode for the audit trail,
+// spelling the empty mode of an older profile as the default it behaves as.
+func ddnsCommentModeLabel(p model.DDNSProfile) string {
+	if mode := strings.TrimSpace(p.CommentMode); mode != "" {
+		return mode
+	}
+	return model.DDNSCommentDefault
+}
+
+// ddnsSaveWarnings looks for what will stop or mislead a profile without
+// refusing the save: a CNAME or NS record already holding one of its names,
+// a name Lattice cannot read back with the profile's credential, and a node
+// behind NAT, whose public IP is only where its traffic leaves.
+func (s *Server) ddnsSaveWarnings(parent context.Context, profile model.DDNSProfile) []string {
+	var warnings []string
+	if inv, ok := s.singBoxInventory(profile.NodeID); ok {
+		edge := strings.TrimSpace(inv.ProviderEdge)
+		if edge != "" || strings.EqualFold(strings.TrimSpace(inv.Network), "nat") {
+			reached := ""
+			if edge != "" {
+				reached = " and is reached through " + edge
+			}
+			warnings = append(warnings, fmt.Sprintf("%s is behind NAT%s. The public IP Lattice sees for it is only where its traffic leaves, so a record pointing there may not reach the node.",
+				s.ddnsNodeName(profile.NodeID), reached))
+		}
+	}
+	prov, err := s.ddnsProvider(profile)
+	if err != nil {
+		return warnings
+	}
+	inspector, ok := prov.(ddns.Inspector)
+	if !ok {
+		return warnings
+	}
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	for _, domain := range profile.Domains {
+		existing, err := inspector.RecordsAt(ctx, domain)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("Lattice could not read the existing records for %s: %v", domain, err))
+			continue
+		}
+		if blocker, ok := ddns.BlockingRecord(existing); ok {
+			warnings = append(warnings, ddns.ConflictSentence(domain, blocker))
+		}
+	}
+	return warnings
+}
+
+// ddnsNodeName is the name a record comment and a warning call a node by.
+func (s *Server) ddnsNodeName(nodeID string) string {
+	if node, ok := s.store.Node(nodeID); ok && strings.TrimSpace(node.Name) != "" {
+		return strings.TrimSpace(node.Name)
+	}
+	return nodeID
+}
+
+// ddnsRun is what a publish knows beyond the profile. refreshComment is set
+// only for an operator's "Run now", the one run that rewrites a comment when
+// no address moved.
+func (s *Server) ddnsRun(profile model.DDNSProfile, refreshComment bool) ddns.Run {
+	lattice := ""
+	if parsed, err := url.Parse(s.publicURL); err == nil {
+		lattice = parsed.Hostname()
+	}
+	return ddns.Run{
+		NodeName:       s.ddnsNodeName(profile.NodeID),
+		Lattice:        lattice,
+		Now:            s.now().UTC(),
+		RefreshComment: refreshComment,
 	}
 }
 
@@ -6389,9 +6474,10 @@ func (s *Server) runDDNSForPrincipal(p principal, profile model.DDNSProfile, v4,
 }
 
 // runDDNSWithAudit applies a profile, records the outcome on it and audits the
-// run. byOperator is a run an operator asked for, whose outcome is written
-// before the answer; the sweep's runs go through RecordDDNSRun, which writes
-// only an outcome that changed.
+// run. byOperator is a run an operator asked for ("Run now"), whose outcome is
+// written before the answer and which also rewrites each record's comment when
+// no address moved, so a changed template applies at once; the sweep's runs go
+// through RecordDDNSRun, which writes only an outcome that changed.
 func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, record func(model.AuditEvent), byOperator bool) error {
 	prov, err := s.ddnsProvider(profile)
 	if err != nil {
@@ -6399,7 +6485,7 @@ func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, reco
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	applyErr := ddns.Apply(ctx, prov, profile, v4, v6)
+	applyErr := ddns.Apply(ctx, prov, profile, v4, v6, s.ddnsRun(profile, byOperator))
 	// One clock. The sweep gates the next attempt on LastRunAt, so recording it
 	// from a different source than the gate reads makes the interval behave
 	// unpredictably and the behaviour untestable.

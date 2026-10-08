@@ -143,10 +143,13 @@ func (s *Server) resolveShare(slug, token string, now time.Time) (model.Subscrip
 }
 
 const (
-	// subscriptionCacheEntries bounds the rendered-body cache. classifyClientUA
-	// bounds the classes per share, so this is a share-count budget rather than a
-	// defence against key explosion.
+	// subscriptionCacheEntries is the entry bound test servers give their
+	// rendered-body cache. The server's own cache is sized by bytes
+	// (subscriptionBodyCacheBytes), because a share's documents range from a
+	// few kilobytes to megabytes and an entry count bounds neither.
 	subscriptionCacheEntries = 512
+	// subscriptionBodyCacheBytes bounds the rendered-body cache.
+	subscriptionBodyCacheBytes = 64 << 20
 	// subscriptionCacheTTL is the revalidation cadence, not the freshness bound:
 	// an expired entry whose content hash still matches is extended without a
 	// re-render, so the engine only ever runs when the content actually moved.

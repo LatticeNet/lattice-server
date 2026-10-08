@@ -391,6 +391,9 @@ type Server struct {
 	// latencyEdges holds the provider edge names the control plane resolved
 	// for the latency probes; see latency_edges.go.
 	latencyEdges latencyEdgeCache
+	// substoreCatalogue is the state the core keeps for the native
+	// Sub-Store (design 28); see line_catalogue.go.
+	substoreCatalogue substoreCatalogueState
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight

@@ -424,6 +424,9 @@ func (s *Server) startLineClientTemplateSync() {
 			if err := s.syncLineClientTemplates(s.now()); err != nil {
 				s.logger.Printf("line client templates: %v", err)
 			}
+			// The line catalogue's addresses and verified DDNS names are
+			// what this sync's lines resolve to (line_catalogue_names.go).
+			s.refreshLineCatalogueNames(s.now())
 		}
 	}()
 }

@@ -1238,12 +1238,17 @@ func TestSystemRunnerV2ReplenishRefusesTamperedArtifact(t *testing.T) {
 		t.Fatalf("an untouched artifact was refused: %s", logs)
 	}
 
-	// The idle worker was started from the verified bytes; rewrite the
-	// staged file in place, keeping its mode, as code inside it could.
+	// The idle worker was started from the verified bytes. Replace the
+	// staged file with a script of the same mode, as code running in that
+	// directory could. Linux refuses to write a running binary in place
+	// (ETXTBSY), so the replacement is renamed over it.
 	waitIdle()
 	canary := filepath.Join(t.TempDir(), "tampered-ran")
 	staged := filepath.Join(runtimeDir, id, "generation-1", "artifact")
-	if err := os.WriteFile(staged, []byte("#!/bin/sh\ntouch "+canary+"\n"), 0o700); err != nil {
+	if err := os.WriteFile(staged+".planted", []byte("#!/bin/sh\ntouch "+canary+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(staged+".planted", staged); err != nil {
 		t.Fatal(err)
 	}
 	if rsp, err := invoke(); err != nil || !rsp.OK {

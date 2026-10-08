@@ -7435,6 +7435,13 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case "cftunnel":
 		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
+	case subStorePlanApprovalPlugin:
+		// A Sub-Store plan names shares, identities and lines across the
+		// fleet, the material the share API keeps behind the global proxy
+		// scopes (substore_svc_plans.go).
+		return !principalHasNodeRestriction(p) &&
+			(rbac.Allows(p.Principal, "proxy:read", "") || rbac.Allows(p.Principal, "proxy:admin", "")) &&
+			rbac.Allows(p.Principal, "network:plan", "")
 	case witnessPlugin:
 		// A witness plan names a stored notification channel and a prefix
 		// of its key's hash, and it hands that key to a node. Authoring and
@@ -8610,6 +8617,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		})
 		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(apiErrorTaskExecutionDisabled, errTaskExecutionDisabled.Error()), taskExecutionDisabled: true}
 	}
+	// A Sub-Store plan is core's own: it applies by calling the plugin's
+	// apply_revision, not by a node task (substore_svc_plans.go).
+	if isSubStorePlanApproval(approval) {
+		return s.subStorePlanApprove(ctx, p, approval, queueApply)
+	}
 	// A plugin operation (§9.3) is applied by its own artifact, not by a core apply
 	// script. This is the generic branch the spec asks for: no per-plugin case, no
 	// script the server had to know how to write. The plugin compiled the plan; the
@@ -8998,7 +9010,7 @@ func (s *Server) requireApprovalDecisionScopes(w http.ResponseWriter, p principa
 // TestNetGuardApprovalDecisionRequiresNetGuardAdmin).
 func approvalPlanNamesIdentities(approval model.Approval) bool {
 	switch approval.Plugin {
-	case proxyCorePlugin, singBoxLineUserPlugin, singBoxManagedLinePlugin:
+	case proxyCorePlugin, singBoxLineUserPlugin, singBoxManagedLinePlugin, subStorePlanApprovalPlugin:
 		return true
 	default:
 		return false
@@ -9127,6 +9139,10 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 	case witnessPlugin:
 		// Approving hands a stored channel's device key to a node.
 		return "notify:admin"
+	case subStorePlanApprovalPlugin:
+		// Approving changes what existing share holders receive, which the
+		// share API guards with proxy:admin.
+		return "proxy:admin"
 	default:
 		return ""
 	}

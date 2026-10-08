@@ -14,12 +14,16 @@ import (
 
 // The core-backed services the Sub-Store UI needs (design 28, "Core-backed
 // services the UI needs"): latticenet.sub-store/shares grows from list to the
-// full share lifecycle (substore_svc_shares.go). Its changes answer only the
-// operator's own gateway call: share tokens never enter the plugin, and a
-// change to what a token holder receives is made by a person or an agent the
-// audit trail names.
+// full share lifecycle (substore_svc_shares.go), and latticenet.sub-store/plans
+// carries the privileged-change path for fleet-bound records
+// (substore_svc_plans.go). Both answer only the operator's own gateway call:
+// share tokens never enter the plugin, and a change to what a token holder
+// receives is made by a person or an agent the audit trail names.
 
 const (
+	// subStorePlansService is the privileged-change service.
+	subStorePlansService = "latticenet.sub-store/plans"
+
 	// subStoreSvcMaxRequestBytes bounds one request to either service. An
 	// icon given as a data URL is the largest field, at 64 KiB.
 	subStoreSvcMaxRequestBytes = 128 << 10
@@ -32,11 +36,29 @@ const (
 	subStoreSvcErrConflict = "conflict"
 )
 
-// subStoreSvcState is the state the services keep on the server.
+// subStoreSvcState is the state the two services keep on the server.
 type subStoreSvcState struct {
-	// mu serialises this lane's share writes, so two operator calls editing
-	// one share cannot lose an edit between the read and the write.
+	// mu serialises this lane's share writes and plan decisions, so two
+	// operator calls editing one share cannot lose an edit between the read
+	// and the write.
 	mu sync.Mutex
+	// previewer runs validate-and-bind for one record revision and one
+	// identity (substore_svc_plans.go). It is nil until the bind code is
+	// wired, and plans.propose refuses while it is.
+	previewer subStoreBindPreviewer
+	// applyRevision replaces the plugin's apply_revision call in tests.
+	applyRevision func(context.Context, subStoreApplyRevisionRequest) (subStoreApplyRevisionReply, error)
+}
+
+// registerSubStoreSvcRPC registers the plans service. The shares service is
+// registered beside list in registerSubStorePluginRPC.
+func (s *Server) registerSubStoreSvcRPC() {
+	if s.pluginRPC == nil {
+		return
+	}
+	if err := s.pluginRPC.Register(subStorePluginID, subStorePlansService, "v1", []string{"propose", "status"}, s.subStorePlansRPC); err != nil {
+		s.logger.Printf("sub-store: register %s failed: %v", subStorePlansService, err)
+	}
 }
 
 // subStoreSvcOperator returns the operator a call is made for, after the

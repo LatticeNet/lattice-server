@@ -29,6 +29,7 @@ func (s *Server) registerSubStorePluginRPC() {
 	if err := s.pluginRPC.Register(subStorePluginID, subStoreSharesService, "v1", subStoreSharesMethods, s.subStoreSharesRPC); err != nil {
 		s.logger.Printf("sub-store: register %s failed: %v", subStoreSharesService, err)
 	}
+	s.registerSubStoreSvcRPC()
 }
 
 type subStoreShareRow struct {

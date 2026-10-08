@@ -290,8 +290,11 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 	if err != nil {
 		reason := s.probe.unavailableReason(err, s.probe.callTimeout, true)
 		stage := "unavailable"
-		if errors.Is(err, context.DeadlineExceeded) {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
 			stage = "timeout"
+		case errors.Is(err, context.Canceled):
+			stage = "canceled"
 		}
 		// The reason is written from the error's kind and names only the
 		// socket, so the log line carries nothing from the request.
@@ -423,6 +426,11 @@ func summarizeProbeRun(request []byte) (probeRunSummary, bool) {
 		if test != "" && tag == test && summary.Server == "" {
 			summary.Server = outboundServerAddress(outbound)
 		}
+	}
+	// The probe tests the only outbound when test is omitted, so the record
+	// names that one rather than leaving the tested address blank.
+	if test == "" && len(outbounds) == 1 {
+		summary.Server = outboundServerAddress(outbounds[0])
 	}
 	summary.Types = joinBounded(types, 16, 256)
 	var targets []string

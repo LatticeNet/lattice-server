@@ -920,3 +920,144 @@ func TestPluginCallTimeoutsReachTheConsole(t *testing.T) {
 		t.Fatalf("deadlines of methods the caller cannot call leaked: %v", views[0].CallTimeoutsMS)
 	}
 }
+
+// The probe tests the only outbound when the request omits test, so the
+// audit record names that outbound's address instead of leaving it blank.
+func TestProbeSummaryNamesTheOnlyOutboundWithoutTest(t *testing.T) {
+	single := `{"outbounds":[{"tag":"solo","type":"trojan","server":"203.0.113.9","server_port":8443,"password":"` + probeTestPassword + `"}],"targets":["gstatic-204"]}`
+	summary, ok := summarizeProbeRun([]byte(single))
+	if !ok || summary.Server != "203.0.113.9:8443" || summary.Types != "trojan" {
+		t.Fatalf("one outbound without test is audited by its own address and type: %+v", summary)
+	}
+	untagged := `{"outbounds":[{"type":"hysteria2","server":"2001:db8::7","server_port":443}]}`
+	if summary, _ := summarizeProbeRun([]byte(untagged)); summary.Server != "[2001:db8::7]:443" || summary.Types != "hysteria2" {
+		t.Fatalf("an untagged single outbound = %+v", summary)
+	}
+	// With two outbounds and no test the probe refuses the request, and the
+	// record names no address rather than guessing one.
+	chain := strings.Replace(probeTestRequest(""), `"test":"exit",`, "", 1)
+	if summary, _ := summarizeProbeRun([]byte(chain)); summary.Server != "" || summary.Types != "vless,shadowsocks" {
+		t.Fatalf("a chain without test names no server: %+v", summary)
+	}
+	if summary, _ := summarizeProbeRun([]byte(probeTestRequest(""))); summary.Server != "203.0.113.7:443" {
+		t.Fatalf("test still picks the tested outbound: %+v", summary)
+	}
+
+	fake := startFakeProbe(t)
+	srv, st, _ := newProbeTestServer(t, fake.socket)
+	if _, err := srv.vpnCoreProbeRPC(probeCtx(probeOperator("op", probeScope)), "run", []byte(single)); err != nil {
+		t.Fatal(err)
+	}
+	last := probeAudits(st)[0]
+	if last.Metadata["server"] != "203.0.113.9:8443" || last.Metadata["types"] != "trojan" {
+		t.Fatalf("the run's record = %+v", last.Metadata)
+	}
+	for _, v := range last.Metadata {
+		if strings.Contains(v, probeTestPassword) {
+			t.Fatalf("the record carries the credential: %+v", last.Metadata)
+		}
+	}
+}
+
+// A refusal mapped from the probe carries the request id in its body, the
+// same id the X-Lattice-Request-ID header carries, as every other API error.
+func TestProbeGatewayErrorsCarryTheRequestID(t *testing.T) {
+	fake := startFakeProbe(t)
+	srv, st, _ := newProbeTestServer(t, fake.socket)
+	activateCorePlugin(t, st, vpnCorePluginID)
+	srv.plugins = append(srv.plugins, plugin.Loaded{Manifest: probeTestManifest()})
+	call := func(requestID string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{"id":%q,"service":%q,"method":"run","payload":%s}`, vpnCorePluginID, vpnCoreProbeService, probeTestRequest(""))
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		if requestID != "" {
+			// withRequestID sets the header before any handler runs.
+			rec.Header().Set(requestIDHeader, requestID)
+		}
+		srv.handlePluginCall(rec, req, probeOperator("op", probeScope))
+		return rec
+	}
+	bodyError := func(rec *httptest.ResponseRecorder) model.APIError {
+		t.Helper()
+		var body model.APIErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("error body %s: %v", rec.Body.String(), err)
+		}
+		return body.Error
+	}
+
+	for _, tc := range []struct {
+		name   string
+		status int
+		answer string
+		want   int
+		code   string
+	}{
+		{"policy refusal", http.StatusBadRequest, `{"error":{"stage":"policy","message":"server 10.0.0.5 is a private address"}}`, http.StatusBadRequest, model.APIErrorBadRequest},
+		{"busy probe", http.StatusTooManyRequests, `{"error":{"stage":"request","message":"busy"}}`, http.StatusTooManyRequests, model.APIErrorRateLimited},
+	} {
+		fake.answer(tc.status, tc.answer)
+		rec := call("req_gateway_" + tc.code)
+		apiErr := bodyError(rec)
+		if rec.Code != tc.want || apiErr.Code != tc.code || apiErr.Message == "" || apiErr.RequestID != "req_gateway_"+tc.code {
+			t.Fatalf("%s = %d %+v, want request_id %q", tc.name, rec.Code, apiErr, "req_gateway_"+tc.code)
+		}
+	}
+
+	// The per-principal limit refuses before the probe is asked; its 429
+	// carries the id too.
+	fake.answer(http.StatusOK, probeTestAnswer)
+	release := make([]func(bool), 0, probeMaxRunsInFlight)
+	for range probeMaxRunsInFlight {
+		r, refusal := srv.probeLimits.acquire(probePrincipalKey(probeOperator("op", probeScope)), srv.now())
+		if refusal != nil {
+			t.Fatal(refusal)
+		}
+		release = append(release, r)
+	}
+	rec := call("req_gateway_limit")
+	if apiErr := bodyError(rec); rec.Code != http.StatusTooManyRequests || apiErr.RequestID != "req_gateway_limit" {
+		t.Fatalf("the in-flight limit = %d %+v", rec.Code, apiErr)
+	}
+	for _, r := range release {
+		r(false)
+	}
+
+	// With no header yet the gateway mints one, and body and header agree.
+	down, downStore, _ := newProbeTestServer(t, fake.socket+".gone")
+	activateCorePlugin(t, downStore, vpnCorePluginID)
+	down.plugins = append(down.plugins, plugin.Loaded{Manifest: probeTestManifest()})
+	srv = down
+	rec = call("")
+	apiErr := bodyError(rec)
+	if rec.Code != http.StatusServiceUnavailable || apiErr.Code != apiErrorProbeUnavailable || apiErr.RequestID == "" || apiErr.RequestID != rec.Header().Get(requestIDHeader) {
+		t.Fatalf("an unavailable probe = %d %+v, header %q", rec.Code, apiErr, rec.Header().Get(requestIDHeader))
+	}
+}
+
+// A run whose caller goes away is audited as canceled, not as an
+// unavailable probe.
+func TestProbeRunCanceledIsAuditedAsCanceled(t *testing.T) {
+	fake := startFakeProbe(t)
+	reached := make(chan struct{})
+	fake.serve(func(_ http.ResponseWriter, r *http.Request) {
+		close(reached)
+		<-r.Context().Done()
+	})
+	srv, st, _ := newProbeTestServer(t, fake.socket)
+	ctx, cancel := context.WithCancel(probeCtx(probeOperator("op", probeScope)))
+	go func() {
+		<-reached
+		cancel()
+	}()
+	_, err := srv.vpnCoreProbeRPC(ctx, "run", []byte(probeTestRequest("")))
+	if status, apiErr := probeErrorOf(t, err); status != http.StatusServiceUnavailable || !strings.Contains(apiErr.Message, "canceled") {
+		t.Fatalf("a canceled run = %d %+v", status, apiErr)
+	}
+	audits := probeAudits(st)
+	if len(audits) != 1 || audits[0].Metadata["stage"] != "canceled" || audits[0].Decision != "deny" {
+		t.Fatalf("a canceled run is audited as canceled: %+v", audits)
+	}
+}

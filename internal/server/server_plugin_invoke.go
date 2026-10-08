@@ -336,9 +336,10 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", err.Error())
 		var operationErr *pluginOperationError
 		if errors.As(err, &operationErr) {
+			body := withAPIErrorRequestID(w, operationErr.Body)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(operationErr.StatusCode)
-			_, _ = w.Write(operationErr.Body)
+			_, _ = w.Write(body)
 			return
 		}
 		var serviceErr *pluginServiceError
@@ -505,6 +506,38 @@ func pluginMethodLabel(pluginID, service, method string) string {
 		return method
 	}
 	return service + "/" + method
+}
+
+// withAPIErrorRequestID writes this request's id into a core error body of
+// the {"error":{"code":...}} shape, as writeError does for every other API
+// error. A core RPC provider builds its body without the request (and an
+// in-process handler records it under an id of its own), so without this the
+// body's request_id is empty or differs from the X-Lattice-Request-ID header.
+// A body of any other shape passes through unchanged.
+func withAPIErrorRequestID(w http.ResponseWriter, body []byte) []byte {
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal(body, &envelope) != nil {
+		return body
+	}
+	var apiErr map[string]json.RawMessage
+	if json.Unmarshal(envelope["error"], &apiErr) != nil || apiErr["code"] == nil {
+		return body
+	}
+	requestID := w.Header().Get(requestIDHeader)
+	if requestID == "" {
+		requestID = id.New("req")
+		w.Header().Set(requestIDHeader, requestID)
+	}
+	apiErr["request_id"], _ = json.Marshal(requestID)
+	stamped, err := json.Marshal(apiErr)
+	if err != nil {
+		return body
+	}
+	envelope["error"] = stamped
+	if out, err := json.Marshal(envelope); err == nil {
+		return out
+	}
+	return body
 }
 
 // pluginCallFailure is the failure a plugin call is counted with: a

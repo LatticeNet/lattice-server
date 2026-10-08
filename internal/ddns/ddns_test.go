@@ -144,7 +144,7 @@ func TestGuardOutboundBlocksInternal(t *testing.T) {
 func TestApplyHonorsToggles(t *testing.T) {
 	rec := &recorder{}
 	profile := model.DDNSProfile{Domains: []string{"a.example.com"}, EnableIPv4: true, EnableIPv6: false, MaxRetries: 1}
-	if err := Apply(context.Background(), rec, profile, "1.2.3.4", "2001:db8::1"); err != nil {
+	if err := Apply(context.Background(), rec, profile, "1.2.3.4", "2001:db8::1", Run{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(rec.records) != 1 || rec.records[0].Type != "A" {
@@ -155,7 +155,7 @@ func TestApplyHonorsToggles(t *testing.T) {
 func TestApplyRetries(t *testing.T) {
 	rec := &recorder{failTimes: 2}
 	profile := model.DDNSProfile{Domains: []string{"a.example.com"}, EnableIPv4: true, MaxRetries: 3}
-	if err := Apply(context.Background(), rec, profile, "1.2.3.4", ""); err != nil {
+	if err := Apply(context.Background(), rec, profile, "1.2.3.4", "", Run{}); err != nil {
 		t.Fatalf("should succeed within retry budget: %v", err)
 	}
 	if rec.attempts != 3 {

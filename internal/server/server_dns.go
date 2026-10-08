@@ -515,7 +515,7 @@ func (s *Server) publishDNSDeploymentWithAudit(parent context.Context, dep model
 	}
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	applyErr := ddns.Apply(ctx, prov, profile, publishV4, publishV6)
+	applyErr := ddns.Apply(ctx, prov, profile, publishV4, publishV6, s.ddnsRun(profile, false))
 	if err := s.markDNSPublishResult(dep, publishV4, publishV6, applyErr); err != nil {
 		s.logger.Printf("dns publish: persist deployment %s: %v", dep.ID, err)
 	}
@@ -562,6 +562,10 @@ func (s *Server) dnsPublishProfile(dep model.DNSDeployment) (model.DDNSProfile, 
 		}
 		profile.CFAPIToken = reusable.CFAPIToken
 		profile.MaxRetries = reusable.MaxRetries
+		// The hostname is written with the same credential, so it carries
+		// the same comment the referenced profile's records do.
+		profile.CommentMode = reusable.CommentMode
+		profile.RecordComment = reusable.RecordComment
 	} else {
 		profile.CFAPIToken = dep.CFAPIToken
 	}

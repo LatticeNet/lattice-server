@@ -12,6 +12,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/ddns"
+	"github.com/LatticeNet/lattice-server/internal/ddns/cffake"
 	"github.com/LatticeNet/lattice-server/internal/store"
 	"github.com/LatticeNet/lattice-server/internal/telemetry"
 )
@@ -26,6 +27,15 @@ func (f *fakeProvider) SetRecord(ctx context.Context, r ddns.Record) error {
 
 func newDDNSServer(t *testing.T) (*Server, http.Handler, *store.Store) {
 	t.Helper()
+	srv, handler, st, _ := newDDNSServerWithCloudflare(t)
+	return srv, handler, st
+}
+
+// newDDNSServerWithCloudflare points every Cloudflare profile at an in-memory
+// fake. A save looks up the records already on each name, so without it a
+// test creating a Cloudflare profile would reach the real API.
+func newDDNSServerWithCloudflare(t *testing.T) (*Server, http.Handler, *store.Store, *cffake.Server) {
+	t.Helper()
 	st, err := store.Open("")
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +44,15 @@ func newDDNSServer(t *testing.T) (*Server, http.Handler, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return srv, srv.Handler(), st
+	fake := cffake.New(t, "example.com", "roobli.org")
+	srv.ddnsProvider = func(p model.DDNSProfile) (ddns.Provider, error) {
+		prov, err := ddns.NewProvider(p, fake.Client())
+		if cf, ok := prov.(*ddns.Cloudflare); ok {
+			cf.BaseURL = fake.URL
+		}
+		return prov, err
+	}
+	return srv, srv.Handler(), st, fake
 }
 
 func TestDDNSCreateListHidesSecret(t *testing.T) {

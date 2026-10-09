@@ -3,6 +3,7 @@ package server
 import (
 	"container/list"
 	"crypto/sha256"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,10 @@ type subscriptionCacheEntry struct {
 	// identity bound into it (substore_bind_serve.go); its quota header is
 	// that identity's.
 	bound bool
+	// headers are the record headers the allow-list admitted for this body
+	// (shareRecordHeaders). They travel with it, as userinfo does, and are
+	// never edited once stored.
+	headers map[string]string
 }
 
 // subscriptionCache keeps rendered subscription bodies for a short time so a
@@ -233,7 +238,7 @@ func (c *subscriptionCache) putEntry(key subscriptionCacheKey, in subscriptionCa
 		contentType: strings.Clone(in.contentType), wireType: strings.Clone(in.wireType), userinfo: strings.Clone(in.userinfo),
 		bodyHash: in.bodyHash, gzipBody: cloneBytes(in.gzipBody),
 		revalidationVersion: strings.Clone(in.revalidationVersion), publicSourceVersion: strings.Clone(in.publicSourceVersion),
-		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl), bound: in.bound,
+		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl), bound: in.bound, headers: maps.Clone(in.headers),
 	}
 	entry.size = subscriptionCacheEntrySize(*entry) + c.entryOverhead
 	if entry.size > c.maxBytes {
@@ -308,8 +313,12 @@ func (c *subscriptionCache) removeElement(el *list.Element) {
 }
 
 func subscriptionCacheEntrySize(entry subscriptionCacheEntry) int {
-	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.key.Variant) + len(entry.body) + len(entry.gzipBody) + len(entry.contentType) + len(entry.wireType) +
+	size := len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.key.Variant) + len(entry.body) + len(entry.gzipBody) + len(entry.contentType) + len(entry.wireType) +
 		len(entry.userinfo) + len(entry.revalidationVersion) + len(entry.publicSourceVersion)
+	for name, value := range entry.headers {
+		size += len(name) + len(value)
+	}
+	return size
 }
 
 // cloneBytes copies b, keeping nil as nil so "no gzip body" stays visible.

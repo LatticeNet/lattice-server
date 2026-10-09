@@ -26,6 +26,13 @@ type bindShareEnv struct {
 	converts []model.ConvertRequest
 	// tamper, when set, edits every node of the next plans.
 	tamper map[string]any
+	// headers, when set, are the response headers every render asks for.
+	headers map[string]string
+	// chain, when set, is every plan's response chain. A convert that runs
+	// it rewrites the body and answers chainHeaders, or fails with chainErr.
+	chain        []model.ResponseTransformerStep
+	chainHeaders map[string]string
+	chainErr     error
 }
 
 const (
@@ -65,7 +72,7 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		env.renders.Add(1)
 		epoch, _ := s.subscriptionSnapshotEpoch(share.Source.PluginID, share.Source.SubscriptionID, snap)
-		plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes}
+		plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes, ResponseChain: env.chain}
 		for _, row := range env.rows {
 			plan.Nodes = append(plan.Nodes, bindNode(t, row, bindPlaceholder(t, row.LineUUID, "uuid"), env.tamper))
 		}
@@ -76,9 +83,10 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 		case "plain-1":
 			// A provider record: a document, no plan, the provider's quota.
 			return renderedSubscription{Body: []byte("plain document"), Userinfo: snap.Userinfo, SourceEpoch: epoch, FetchedAt: snap.FetchedAt,
-				RevalidationVersion: subscriptionRevalidationVersion(snap)}, nil
+				RevalidationVersion: subscriptionRevalidationVersion(snap), Headers: env.headers}, nil
 		}
-		return renderedSubscription{Plan: &plan, SourceEpoch: epoch, FetchedAt: snap.FetchedAt, RevalidationVersion: subscriptionRevalidationVersion(snap)}, nil
+		return renderedSubscription{Plan: &plan, SourceEpoch: epoch, FetchedAt: snap.FetchedAt, RevalidationVersion: subscriptionRevalidationVersion(snap),
+			Headers: env.headers}, nil
 	}
 	s.substoreCatalogue.bind.convert = func(_ context.Context, pluginID string, req model.ConvertRequest) (model.ConvertReply, error) {
 		if pluginID != subStorePluginID {
@@ -88,6 +96,13 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 		env.converts = append(env.converts, req)
 		n := len(env.converts)
 		env.mu.Unlock()
+		if len(req.ResponseChain) > 0 {
+			if env.chainErr != nil {
+				return model.ConvertReply{}, env.chainErr
+			}
+			return model.ConvertReply{Content: "rewritten by the response chain", ContentType: "text/plain", Target: req.Target, NodeCount: len(req.Nodes),
+				Headers: env.chainHeaders, Log: []model.ConvertLogEntry{{Level: model.ConvertLogInfo, Message: "set headers"}}}, nil
+		}
 		return model.ConvertReply{Content: "converted " + strings.Repeat("#", n), ContentType: "text/plain", Target: req.Target, NodeCount: len(req.Nodes)}, nil
 	}
 	for _, share := range []model.SubscriptionShare{
@@ -383,5 +398,162 @@ func TestSubstoreDecodeRenderPlan(t *testing.T) {
 	}
 	if _, err := substoreDecodeRenderPlan("doc", json.RawMessage(valid)); err == nil {
 		t.Fatal("a reply with a document and a plan was accepted")
+	}
+}
+
+// fetchPlain renders the plain record afresh with headers as its render's
+// and returns the response headers. The body serves whatever the headers
+// are.
+func (env *bindShareEnv) fetchPlain(t *testing.T, headers map[string]string) http.Header {
+	t.Helper()
+	env.headers = headers
+	env.srv.subscriptionCache.InvalidateShare("sh-plain")
+	rec := env.get("/sub/plain/" + bindSharePlainTok)
+	if rec.Code != http.StatusOK || rec.Body.String() != "plain document" {
+		t.Fatalf("headers %q: status %d body %q", headers, rec.Code, rec.Body.String())
+	}
+	return rec.Header()
+}
+
+// A record's response headers reach the client through the allow-list only:
+// each of the four passes, whatever the case of its name; a value that fails
+// its check drops the header and never the body; any other name is dropped.
+func TestShareRecordHeadersPassTheAllowListOnly(t *testing.T) {
+	env := bindShareFixture(t)
+	core := env.fetchPlain(t, nil)
+	if core.Get("Content-Disposition") == "" || core.Get("Profile-Update-Interval") != "2" {
+		t.Fatalf("the link's own headers: %v", core)
+	}
+
+	allowed := map[string]string{
+		"Content-Disposition":     `attachment; filename*=UTF-8''Fleet%20Tokyo`,
+		"PROFILE-UPDATE-INTERVAL": "12",
+		"profile-web-page-url":    "https://panel.example.com/account",
+		"Plan-Name":               "Fleet Pro",
+	}
+	got := env.fetchPlain(t, allowed)
+	for name, value := range allowed {
+		if got.Get(name) != value {
+			t.Fatalf("%s = %q, want %q", name, got.Get(name), value)
+		}
+	}
+	// The headers are cached with the body: a hit carries them too.
+	renders := env.renders.Load()
+	if rec := env.get("/sub/plain/" + bindSharePlainTok); env.renders.Load() != renders || rec.Header().Get("Plan-Name") != "Fleet Pro" {
+		t.Fatalf("a cached body: renders %d then %d, plan-name %q", renders, env.renders.Load(), rec.Header().Get("Plan-Name"))
+	}
+	// Only the web page URL may exceed the short bound.
+	longURL := "https://panel.example.com/" + strings.Repeat("a", 1000)
+	if got := env.fetchPlain(t, map[string]string{"Profile-Web-Page-URL": longURL}); got.Get("Profile-Web-Page-URL") != longURL {
+		t.Fatalf("a 1 KiB web page url was dropped")
+	}
+
+	long := strings.Repeat("a", recordHeaderValueBytes+1)
+	for name, header := range map[string][2]string{
+		"a CR":                       {"Plan-Name", "Pro\rX-Injected: 1"},
+		"a LF":                       {"Plan-Name", "Pro\nSet-Cookie: a=b"},
+		"a NUL":                      {"Content-Disposition", "attachment\x00"},
+		"an escape":                  {"Plan-Name", "Pro\x1b[0m"},
+		"a DEL":                      {"Plan-Name", "Pro\x7f"},
+		"an empty value":             {"Plan-Name", ""},
+		"a plan name over the bound": {"Plan-Name", long},
+		"a disposition over bound":   {"Content-Disposition", "attachment; filename=" + long},
+		"an interval of 0":           {"Profile-Update-Interval", "0"},
+		"an interval over a week":    {"Profile-Update-Interval", "169"},
+		"an interval with a unit":    {"Profile-Update-Interval", "12h"},
+		"an http url":                {"Profile-Web-Page-URL", "http://panel.example.com/"},
+		"a url with userinfo":        {"Profile-Web-Page-URL", "https://user:pass@panel.example.com/"},
+		"a private address":          {"Profile-Web-Page-URL", "https://10.0.0.8/"},
+		"another private address":    {"Profile-Web-Page-URL", "https://192.168.1.1/admin"},
+		"a loopback address":         {"Profile-Web-Page-URL", "https://127.0.0.1/"},
+		"a loopback v6 address":      {"Profile-Web-Page-URL", "https://[::1]/"},
+		"a link-local address":       {"Profile-Web-Page-URL", "https://169.254.169.254/latest/meta-data"},
+		"a link-local v6 address":    {"Profile-Web-Page-URL", "https://[fe80::1]/"},
+		"localhost":                  {"Profile-Web-Page-URL", "https://localhost/"},
+		"a local name":               {"Profile-Web-Page-URL", "https://router.local/"},
+		"a url over 2 KiB":           {"Profile-Web-Page-URL", "https://panel.example.com/" + strings.Repeat("a", model.MaxSubscriptionResponseHeaderBytes)},
+		// The share names an identity, so a value carrying its credential,
+		// raw or encoded, is dropped.
+		"the identity's uuid":          {"Plan-Name", "Fleet " + bindIdentityUUID},
+		"the identity's uuid dashless": {"Profile-Web-Page-URL", "https://panel.example.com/?u=" + strings.ReplaceAll(bindIdentityUUID, "-", "")},
+	} {
+		got := env.fetchPlain(t, map[string]string{header[0]: header[1]})
+		if got.Get(header[0]) != core.Get(header[0]) {
+			t.Errorf("%s: %s = %q, want %q", name, header[0], got.Get(header[0]), core.Get(header[0]))
+		}
+	}
+
+	// Every other name is dropped: core's own headers stand, and nothing the
+	// record named is added.
+	got = env.fetchPlain(t, map[string]string{
+		"Subscription-Userinfo":        "upload=0; download=0; total=1; expire=0",
+		"Content-Type":                 "text/html",
+		"Cache-Control":                "public, max-age=86400",
+		"Set-Cookie":                   "session=1",
+		"Location":                     "https://panel.example.com/",
+		"X-Lattice-Subscription-Stale": "true",
+	})
+	if got.Get("Subscription-Userinfo") != subscriptionUserinfoForResponse(bindProviderUserinfo) || got.Get("Content-Type") != core.Get("Content-Type") ||
+		got.Get("Cache-Control") != "no-store" || got.Get("Set-Cookie") != "" || got.Get("Location") != "" || got.Get("X-Lattice-Subscription-Stale") != "" {
+		t.Fatalf("a header off the allow-list reached the response: %v", got)
+	}
+
+	// An update interval the operator set on the share wins over the
+	// record's; the record's other headers still apply.
+	share, _ := env.st.SubscriptionShare("sh-plain")
+	share, err := withShareUpdateIntervalHours(share, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustUpsertShare(t, env.st, share)
+	got = env.fetchPlain(t, allowed)
+	if got.Get("Profile-Update-Interval") != "6" || got.Get("Plan-Name") != "Fleet Pro" {
+		t.Fatalf("a share interval of 6 under a record interval of 12: %v", got)
+	}
+}
+
+// On a fleet-bound record the response chain sets headers and nothing else:
+// convert runs it a second time over the same bound nodes and its body is
+// discarded, so the share serves the body no script touched after binding.
+// Its headers pass the allow-list and the identity's credential screen.
+func TestSubstoreBindShareResponseChainSetsOnlyHeaders(t *testing.T) {
+	env := bindShareFixture(t)
+	env.headers = map[string]string{"Plan-Name": "from the render"}
+	env.chain = []model.ResponseTransformerStep{{Name: "headers", Source: "$options._res.headers['plan-name'] = 'Fleet Pro'", Enabled: true}}
+	env.chainHeaders = map[string]string{
+		"Plan-Name":               "Fleet Pro",
+		"Profile-Update-Interval": "24",
+		"Content-Disposition":     "attachment; filename=" + bindIdentityUUID,
+		"Profile-Web-Page-URL":    "https://panel.example.com/?u=" + strings.ReplaceAll(bindIdentityUUID, "-", ""),
+		"Subscription-Userinfo":   "upload=0; download=0; total=1; expire=0",
+	}
+	rec := env.get("/sub/fleet/" + bindShareToken)
+	if rec.Code != http.StatusOK || rec.Body.String() != "converted #" {
+		t.Fatalf("status %d body %q, want the body convert produced before the chain", rec.Code, rec.Body.String())
+	}
+	env.mu.Lock()
+	converts := append([]model.ConvertRequest(nil), env.converts...)
+	env.mu.Unlock()
+	if len(converts) != 2 || converts[0].ResponseChain != nil || len(converts[1].ResponseChain) != 1 {
+		t.Fatalf("converts: %d, chains %v", len(converts), converts)
+	}
+	first, second := env.nodeUUIDs(t, converts[0]), env.nodeUUIDs(t, converts[1])
+	if len(first) != len(env.rows) || strings.Join(first, ",") != strings.Join(second, ",") {
+		t.Fatalf("the chain ran over other nodes: %v then %v", first, second)
+	}
+	u, _ := env.srv.getVpnUser(bindIdentityID)
+	h := rec.Header()
+	if h.Get("Plan-Name") != "Fleet Pro" || h.Get("Profile-Update-Interval") != "24" || h.Get("Profile-Web-Page-URL") != "" ||
+		h.Get("Content-Disposition") != `attachment; filename="fleet"; filename*=UTF-8''fleet` ||
+		h.Get("Subscription-Userinfo") != identityLinkUserinfo(env.srv.vpnUserPolicyAt(u, env.now), false) {
+		t.Fatalf("headers %v", h)
+	}
+
+	// A chain that fails leaves the body served with the render's headers.
+	env.chainErr = errors.New("the transformer threw")
+	env.srv.subscriptionCache.InvalidateShare("sh-fleet")
+	rec = env.get("/sub/fleet/" + bindShareToken)
+	if rec.Code != http.StatusOK || rec.Body.String() != "converted ###" || rec.Header().Get("Plan-Name") != "from the render" {
+		t.Fatalf("a failed chain: status %d body %q plan-name %q", rec.Code, rec.Body.String(), rec.Header().Get("Plan-Name"))
 	}
 }

@@ -3,7 +3,9 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"maps"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -75,6 +77,65 @@ func setLinkClientHeaders(header http.Header, title string, updateIntervalHours 
 	header.Set("Profile-Update-Interval", strconv.Itoa(updateIntervalHours))
 	if shareSlugRe.MatchString(title) {
 		header.Set("Content-Disposition", `attachment; filename="`+title+`"; filename*=UTF-8''`+title)
+	}
+}
+
+// Response headers a plugin record asks for (design 28, "Share serving and
+// tokens"). A render reply may carry headers, and so may the convert reply of
+// a fleet-bound record's response chain. Core forwards only the four the SDK
+// allow-lists, matching names without regard to case, and only values that
+// pass model.ValidateSubscriptionResponseHeader: no control character, so no
+// CR or LF can end the header early; an interval of 1 to 168 hours; a web
+// page URL that is https, carries no userinfo, fits in 2 KiB and names no
+// local host and no private, loopback, link-local or other non-public address
+// literal. Every other value is held to recordHeaderValueBytes here. A header
+// that fails is dropped, never the response, and every other name is dropped
+// too: a record never sets the status or Subscription-Userinfo.
+//
+// A share that names an identity also screens every value for that
+// identity's credentials with the catalogue's row check (lineCatalogueSecrets:
+// any whole credential part four bytes or longer, raw or encoded). None of the
+// four headers has a reason to carry one, and the response chain of a
+// fleet-bound record runs over a document that holds them.
+
+// recordHeaderValueBytes bounds a record header's value, the web page URL
+// excepted (model.MaxSubscriptionResponseHeaderBytes).
+const recordHeaderValueBytes = 256
+
+// shareRecordHeaders returns the headers core forwards from what a record
+// asked for, keyed by lower-case name, or nil. A later map replaces an
+// earlier one's value for the same name; within one map, names are read in
+// sorted order, so two spellings of one name resolve the same way every time.
+func shareRecordHeaders(identity lineCatalogueSecrets, asked ...map[string]string) map[string]string {
+	var out map[string]string
+	for _, headers := range asked {
+		for _, name := range slices.Sorted(maps.Keys(headers)) {
+			value, lower := headers[name], strings.ToLower(name)
+			if model.ValidateSubscriptionResponseHeader(lower, value) != nil ||
+				(lower != model.ResponseHeaderProfileWebPageURL && len(value) > recordHeaderValueBytes) ||
+				identity.in([]byte(value)) {
+				continue
+			}
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[lower] = value
+		}
+	}
+	return out
+}
+
+// setShareRecordHeaders writes the record headers shareRecordHeaders
+// admitted. They replace the link's defaults from setLinkClientHeaders,
+// except that an update interval the operator set on the share itself wins
+// over the record's.
+func setShareRecordHeaders(header http.Header, share model.SubscriptionShare, record map[string]string) {
+	_, ownInterval := share.Extra[shareExtraUpdateInterval]
+	for name, value := range record {
+		if name == model.ResponseHeaderProfileUpdateInterval && ownInterval {
+			continue
+		}
+		header.Set(name, value)
 	}
 }
 

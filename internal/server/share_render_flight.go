@@ -137,7 +137,7 @@ func (s *Server) renderShareOnce(ctx context.Context, share model.SubscriptionSh
 			revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
 			stale: rendered.Stale, fetchedAt: rendered.FetchedAt,
 			wireType: wireType,
-			bodyHash: served.hash, gzipBody: served.gzipBody, bound: rendered.Bound}
+			bodyHash: served.hash, gzipBody: served.gzipBody, bound: rendered.Bound, headers: rendered.Headers}
 		if share.Source.Kind == model.ShareSourcePlugin &&
 			!s.putSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, rendered.SourceEpoch, entry, s.now()) {
 			continue

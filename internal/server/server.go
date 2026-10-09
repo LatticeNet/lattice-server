@@ -814,6 +814,8 @@ func New(opts Options) (*Server, error) {
 	s.registerSubStorePluginRPC()
 	// Sub-Store S0 bind lane: latticenet.sub-store/bind (substore_bind_service.go).
 	s.registerSubStoreBindRPC()
+	// The plans service previews through the bind step (substore_bind_plans.go).
+	s.subStoreSvc.previewer = substoreBindPlansPreviewer{s}
 	// Derive vpn-core identities (VpnUser) from legacy ProxyUsers. Idempotent and
 	// additive — existing identities are untouched and ProxyUser stays the
 	// subscription-render substrate (design-12 S2).

@@ -124,9 +124,12 @@ type substoreBindPreviewReply struct {
 	// Kind is the plan's kind, nodes or document.
 	Kind string `json:"kind"`
 	// SourceVersion is the snapshot's version the plan was rendered from.
-	SourceVersion string                  `json:"source_version,omitempty"`
-	Entries       []substoreBindEntry     `json:"entries"`
-	Excluded      []substoreBindExclusion `json:"excluded"`
+	SourceVersion string `json:"source_version,omitempty"`
+	// LiveRevision is the record's live revision as the plugin's render
+	// reported it beside the plan, empty when it reported none.
+	LiveRevision string                  `json:"live_revision,omitempty"`
+	Entries      []substoreBindEntry     `json:"entries"`
+	Excluded     []substoreBindExclusion `json:"excluded"`
 	// Refused names why a share would answer the decoy for this plan.
 	Refused    string `json:"refused,omitempty"`
 	FleetNodes int    `json:"fleet_nodes"`
@@ -164,14 +167,14 @@ func (s *Server) substoreBindPreview(ctx context.Context, pluginID, subscription
 		s.logger.Printf("sub-store bind: preview snapshot failed for record %s (%s)", subscriptionID, subscriptionDiagnosticSummary(err))
 		return substoreBindPreviewReply{}, rpcAPIError(http.StatusBadGateway, model.APIErrorBadGateway, "sub-store/bind preview: the record's snapshot is unavailable")
 	}
-	plan, err := s.substoreBindRenderPlan(ctx, pluginID, subscriptionID, revision, snap)
+	plan, liveRevision, err := s.substoreBindRenderPlan(ctx, pluginID, subscriptionID, revision, snap)
 	if err != nil {
 		s.logger.Printf("sub-store bind: preview render failed for record %s (%s)", subscriptionID, subscriptionDiagnosticSummary(err))
 		return substoreBindPreviewReply{}, rpcAPIError(http.StatusBadGateway, model.APIErrorBadGateway, "sub-store/bind preview: the record did not render")
 	}
 	if plan == nil {
-		return substoreBindPreviewReply{}, rpcAPIError(http.StatusConflict, apiErrorSubstoreNotFleetBound,
-			"sub-store/bind preview: the record renders a document, not a plan, so it binds no identity")
+		return substoreBindPreviewReply{}, substoreBindNotFleetBound{liveRevision: liveRevision, err: rpcAPIError(http.StatusConflict, apiErrorSubstoreNotFleetBound,
+			"sub-store/bind preview: the record renders a document, not a plan, so it binds no identity")}
 	}
 	catalogue, err := s.buildLineCatalogue("")
 	if err != nil {
@@ -179,7 +182,7 @@ func (s *Server) substoreBindPreview(ctx context.Context, pluginID, subscription
 	}
 	result := substoreBindPlan(*plan, u, catalogue, substoreBindSelection(snap))
 	reply := substoreBindPreviewReply{SubscriptionID: subscriptionID, Revision: revision, IdentityID: u.ID,
-		IdentityStatus: s.vpnUserPolicyAt(u, s.now()).Status, Kind: result.Kind, SourceVersion: snap.SourceVersion,
+		IdentityStatus: s.vpnUserPolicyAt(u, s.now()).Status, Kind: result.Kind, SourceVersion: snap.SourceVersion, LiveRevision: liveRevision,
 		Entries: result.Entries, Excluded: result.Excluded, Refused: result.Refused, FleetNodes: result.FleetNodes}
 	if reply.Entries == nil {
 		reply.Entries = []substoreBindEntry{}
@@ -190,10 +193,22 @@ func (s *Server) substoreBindPreview(ctx context.Context, pluginID, subscription
 	return reply, nil
 }
 
+// substoreBindNotFleetBound is preview's refusal of a record revision that
+// renders a document. It unwraps to the 409 the bind service answers, and it
+// carries the live revision the render reported for the plans previewer.
+type substoreBindNotFleetBound struct {
+	liveRevision string
+	err          error
+}
+
+func (e substoreBindNotFleetBound) Error() string { return e.err.Error() }
+func (e substoreBindNotFleetBound) Unwrap() error { return e.err }
+
 // substoreBindRenderPlan asks the plugin's render for a record revision's
 // plan, as a share's render asks (the URI list, no client), with the
-// revision named. nil means the record rendered a document.
-func (s *Server) substoreBindRenderPlan(ctx context.Context, pluginID, subscriptionID, revision string, snap model.SubscriptionSnapshot) (*model.SelectionPlan, error) {
+// revision named, and returns the record's live revision the reply reports
+// beside it. nil means the record rendered a document.
+func (s *Server) substoreBindRenderPlan(ctx context.Context, pluginID, subscriptionID, revision string, snap model.SubscriptionSnapshot) (*model.SelectionPlan, string, error) {
 	if hook := s.substoreCatalogue.bind.renderPlan; hook != nil {
 		return hook(ctx, pluginID, subscriptionID, revision, snap)
 	}
@@ -203,20 +218,25 @@ func (s *Server) substoreBindRenderPlan(ctx context.Context, pluginID, subscript
 	}
 	payload, err := json.Marshal(fields)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	out, err := s.callRuntimePluginService(ctx, pluginID, pluginID+"/subscription", "render", payload, nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var reply struct {
 		Content string          `json:"content"`
 		Plan    json.RawMessage `json:"plan"`
+		// LiveRevision is the record's live revision when the plugin
+		// rendered (design 28, S2): what plans.propose checks from_revision
+		// against.
+		LiveRevision string `json:"live_revision"`
 	}
 	if err := json.Unmarshal(out, &reply); err != nil {
-		return nil, fmt.Errorf("decode plugin render reply: %w", err)
+		return nil, "", fmt.Errorf("decode plugin render reply: %w", err)
 	}
-	return substoreDecodeRenderPlan(reply.Content, reply.Plan)
+	plan, err := substoreDecodeRenderPlan(reply.Content, reply.Plan)
+	return plan, reply.LiveRevision, err
 }
 
 type substoreBindRevealEntryRequest struct {

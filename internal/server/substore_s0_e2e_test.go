@@ -626,3 +626,41 @@ func (e *e2eEnv) refusals(shareID string) []string {
 	}
 	return out
 }
+
+// TestS0JoinedSelectionIsBoundedByTheIdentity pins the trust rule design 28
+// states for fleet records: the selected line set is the plugin's own fetch
+// output, and core bounds it by the share identity's enabled bindings, not by
+// the record. A selection naming every catalogue line serves an identity only
+// the lines it is bound to, and never another identity's credential.
+func TestS0JoinedSelectionIsBoundedByTheIdentity(t *testing.T) {
+	env := newE2EEnv(t, true)
+	s := env.srv
+	const keep = 20
+	u := VpnUser{ID: e2eAliceID, Email: e2eAliceID + "@example.com", Name: e2eAliceID, Enabled: true, CreatedAt: env.now, UpdatedAt: env.now,
+		Credentials: []VpnCredential{{Protocol: "vless", UUID: e2eAliceUUID, Flow: bindIdentityFlow}}}
+	for _, row := range env.rows[:keep] {
+		u.Bindings = append(u.Bindings, LineBinding{LineHashID: row.LineHashID, Enabled: true, AppliedCredentialSHA256: bindAppliedSHA(t, u, row.LineUUID)})
+	}
+	if err := s.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+
+	alice := env.createShare(t, e2eFleet, "alice-narrow", e2eAliceID)
+	rec := env.fetch(alice)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alice's share: %d %s refusals=%v", rec.Code, rec.Body.String(), env.refusals(alice.ID))
+	}
+	env.checkBody(t, e2eAliceID, rec.Body.String(), keep)
+	for _, row := range env.rows[keep:] {
+		if strings.Contains(rec.Body.String(), row.LineUUID) {
+			t.Fatalf("alice's body names line %s, which she is not bound to", row.LineUUID)
+		}
+	}
+	// The same selection still serves Bob every line he is bound to.
+	bob := env.createShare(t, e2eFleet, "bob-wide", e2eBobID)
+	if rec := env.fetch(bob); rec.Code != http.StatusOK {
+		t.Fatalf("bob's share: %d %s", rec.Code, rec.Body.String())
+	} else {
+		env.checkBody(t, e2eBobID, rec.Body.String(), 50)
+	}
+}

@@ -210,6 +210,9 @@ func (s *Server) pluginTaskScheduleMethodAllowed(pluginID, service, method strin
 	if len(declared.OperatorTargetFields) > 0 {
 		return fmt.Errorf("task schedule method %q names an operator target, which a scheduled run has no operator call to bind", method)
 	}
+	if subStoreCoreOnlyMethod(service, method) {
+		return fmt.Errorf("task schedule method %q runs only inside an approved plan apply", method)
+	}
 	return nil
 }
 

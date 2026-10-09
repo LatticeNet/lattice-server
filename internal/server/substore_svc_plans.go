@@ -99,6 +99,10 @@ const subStoreCoreOnlyReason = "apply_revision runs only as the apply step of an
 // Sub-Store's apply_revision changes what existing share holders receive,
 // so it runs as the apply step of an approved plan and never as an
 // operator's gateway call, whatever a manifest declares.
+// errSubStoreCoreOnlyMethod is the refusal of a core-only method called
+// outside an approved plan apply.
+var errSubStoreCoreOnlyMethod = errors.New("sub-store: apply_revision runs only inside an approved plan apply")
+
 func subStoreCoreOnlyMethod(service, method string) bool {
 	return service == subStorePluginID+"/subscription" && method == subStoreApplyRevisionMethod
 }

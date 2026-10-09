@@ -467,6 +467,15 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 	if s.pluginRuntime == nil {
 		return nil, errors.New("plugin runtime unavailable")
 	}
+	// A core-only method (Sub-Store's apply_revision) runs only inside an
+	// approved plan's apply, which puts its one-time grant on the context.
+	// The gateway refuses it for operators; this refuses every other core
+	// path too, such as a scheduled run or a plan-effect operation.
+	if subStoreCoreOnlyMethod(service, method) {
+		if grant, _ := ctx.Value(subStoreApplyGrantKey{}).(*subStoreApplyGrant); grant == nil {
+			return nil, errSubStoreCoreOnlyMethod
+		}
+	}
 	if budget == nil {
 		budget = s.pluginMethodBudget(pluginID, service, method)
 	}

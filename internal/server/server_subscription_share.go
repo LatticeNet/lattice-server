@@ -139,6 +139,11 @@ func (s *Server) resolveShare(slug, token string, now time.Time) (model.Subscrip
 	if share.ExpiresAt != nil && !now.Before(*share.ExpiresAt) {
 		return model.SubscriptionShare{}, false
 	}
+	// An archived share is in the recycle bin: it answers like a deleted
+	// one until it is restored.
+	if share.ArchivedAt != nil {
+		return model.SubscriptionShare{}, false
+	}
 	return share, true
 }
 
@@ -348,7 +353,9 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	plan := planShareRender(share.Source.Kind, format, native, clientClass, variant)
 	format, uaClass, variant := plan.Format, plan.UAClass, plan.Variant
 
-	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass, Variant: variant.cacheToken()}
+	// A share with an age recipient caches under a key that names it
+	// (substore_svc_age.go).
+	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass, Variant: subStoreSvcAgeCacheToken(share, variant.cacheToken())}
 
 	// A core proxy-user source is rendered on every request. Its render is Go
 	// over in-memory state, and a content version that covered everything it

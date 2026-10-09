@@ -57,14 +57,16 @@ func TestSubStoreSharesRPCListsOnlySubStoreSharesWithURLs(t *testing.T) {
 		t.Fatalf("an unrevealed list must carry no token: %s", out)
 	}
 
-	// Asking for one share's link goes through the reveal gate. An admin
-	// session without step-up is refused with the gate's code.
-	if _, err := srv.subStoreSharesRPC(ctx, "list", []byte(`{"share_id":"sh-sub"}`)); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
+	// Asking for one share's link goes through the reveal gate, on the
+	// operator's own gateway call. An admin session without step-up is
+	// refused with the gate's code.
+	srv.pluginRPC.SetOwnerActive(func(string) bool { return true })
+	if _, err := srv.callCoreServiceForOperator(ctx, subStoreSharesService, "list", []byte(`{"share_id":"sh-sub"}`)); err == nil || !strings.Contains(err.Error(), "HTTP 403") {
 		t.Fatalf("a reveal without step-up must be refused with 403, got %v", err)
 	}
 	// A token carrying secrets:reveal gets that row's link, and only that row's.
 	revealer := principal{Principal: rbac.Principal{ActorID: "agent", TokenID: "token_reveal", Scopes: []string{"proxy:admin", rbac.SecretRevealScope}}, viaBearer: true}
-	out, err = srv.subStoreSharesRPC(context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, revealer), "list", []byte(`{"share_id":"sh-sub"}`))
+	out, err = srv.callCoreServiceForOperator(context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, revealer), subStoreSharesService, "list", []byte(`{"share_id":"sh-sub"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +91,7 @@ func TestSubStoreSharesRPCListsOnlySubStoreSharesWithURLs(t *testing.T) {
 	if !audited {
 		t.Fatal("a token reveal of a share link must be audited with the token id")
 	}
-	if _, err := srv.subStoreSharesRPC(ctx, "list", []byte(`{"share_id":"sh-other"}`)); err == nil {
+	if _, err := srv.callCoreServiceForOperator(ctx, subStoreSharesService, "list", []byte(`{"share_id":"sh-other"}`)); err == nil {
 		t.Fatal("a share outside the sub-store plugin must not be revealed through its RPC")
 	}
 

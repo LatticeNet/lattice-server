@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -222,5 +223,75 @@ func TestServiceCallsCarryTheirServiceAndMethodToTheRunner(t *testing.T) {
 	}
 	if c := runner.reqs[0].Constraints; c.Service != "p.capture/artifact" || c.Method != "restore" {
 		t.Fatalf("constraints carried service %q method %q", c.Service, c.Method)
+	}
+}
+
+// A method's signed http_response_bytes reaches the runner on the call's
+// budget, read from the v2 manifest the server loaded, and a method whose
+// budget does not name it resolves to the 256 KiB every method had before.
+// The manifest is the signed Sub-Store one with fetch's budget given the
+// field, as the capability wave signs it.
+func TestServiceCallsCarryTheSignedHTTPResponseBudget(t *testing.T) {
+	raw, err := os.ReadFile(e2eRealManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	service := subStorePluginID + "/subscription"
+	named := false
+	for _, iface := range doc["interfaces"].([]any) {
+		iface := iface.(map[string]any)
+		if iface["service"] != service {
+			continue
+		}
+		for _, method := range iface["methods"].([]any) {
+			if method := method.(map[string]any); method["name"] == "fetch" {
+				method["budget"].(map[string]any)["http_response_bytes"] = 8 << 20
+				named = true
+			}
+		}
+	}
+	if !named {
+		t.Fatal("the manifest has no fetch budget to name")
+	}
+	raw, err = json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest plugin.Manifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := plugin.ValidateManifest(manifest); err != nil || manifest.Schema != plugin.ManifestSchemaV2 {
+		t.Fatalf("manifest %q: %v", manifest.Schema, err)
+	}
+
+	srv, _ := newServerForPluginHost(t)
+	runner := &captureRunner{}
+	srv.pluginRuntime = plugin.NewRuntimeManagerWithOptions(plugin.RuntimeManagerOptions{
+		Services: srv.pluginHostServices(), Runners: map[string]plugin.Runner{plugin.TypeSystem: runner},
+	})
+	loaded := plugin.Loaded{Manifest: manifest, Capabilities: manifest.Capabilities, BundlePath: t.TempDir()}
+	srv.plugins = []plugin.Loaded{loaded}
+	if _, err := srv.pluginRuntime.Start(context.Background(), loaded); err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{"fetch", "render"} {
+		if _, err := srv.callRuntimePluginService(context.Background(), subStorePluginID, service, method, json.RawMessage(`{}`), nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(runner.reqs) != 2 {
+		t.Fatalf("runner saw %d invocations", len(runner.reqs))
+	}
+	fetch, render := runner.reqs[0].Constraints.Budget, runner.reqs[1].Constraints.Budget
+	if fetch == nil || fetch.HTTPResponseBytes != 8<<20 || plugin.ResolveInvokeBudget(fetch, plugin.DefaultInvokeBudgetSpec()).HTTPResponseBytes != 8<<20 {
+		t.Fatalf("fetch was invoked with budget %+v", fetch)
+	}
+	if render == nil || render.HTTPResponseBytes != 0 || plugin.ResolveInvokeBudget(render, plugin.DefaultInvokeBudgetSpec()).HTTPResponseBytes != 256<<10 {
+		t.Fatalf("render was invoked with budget %+v", render)
 	}
 }

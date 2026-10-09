@@ -58,6 +58,11 @@ type e2eSubStore struct {
 	converts  []model.ConvertRequest
 	claims    []string
 	scheduled []string
+	// headers are the response headers every render asks for; chain is
+	// every plan's response chain, whose convert answers chainHeaders.
+	headers      map[string]string
+	chain        []model.ResponseTransformerStep
+	chainHeaders map[string]string
 }
 
 func (f *e2eSubStore) Name() string { return "e2e-substore" }
@@ -136,6 +141,12 @@ func (f *e2eSubStore) serve(ctx context.Context, broker *plugin.Broker, live, se
 		if f.reportLive {
 			reply["live_revision"] = live
 		}
+		f.mu.Lock()
+		if f.headers != nil {
+			reply["headers"] = f.headers
+		}
+		chain := f.chain
+		f.mu.Unlock()
 		if req.SubscriptionID == e2eDoc {
 			reply["content"] = "vless://provider-document#" + revision
 			return json.Marshal(reply)
@@ -152,7 +163,7 @@ func (f *e2eSubStore) serve(ctx context.Context, broker *plugin.Broker, live, se
 			rows = rows[:len(rows)-e2eDropped]
 			rename = map[string]any{"name": "renamed in rev-2"}
 		}
-		plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes}
+		plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes, ResponseChain: chain}
 		for i, row := range rows {
 			var edit map[string]any
 			if i == 0 {
@@ -169,7 +180,12 @@ func (f *e2eSubStore) serve(ctx context.Context, broker *plugin.Broker, live, se
 		}
 		f.mu.Lock()
 		f.converts = append(f.converts, req)
+		chainHeaders := f.chainHeaders
 		f.mu.Unlock()
+		if len(req.ResponseChain) > 0 {
+			return json.Marshal(model.ConvertReply{Content: "rewritten by the response chain\n", ContentType: "text/plain; charset=utf-8", Target: req.Target,
+				NodeCount: len(req.Nodes), Headers: chainHeaders})
+		}
 		var b strings.Builder
 		for _, node := range req.Nodes {
 			b.Write(node)
@@ -662,5 +678,40 @@ func TestS0JoinedSelectionIsBoundedByTheIdentity(t *testing.T) {
 		t.Fatalf("bob's share: %d %s", rec.Code, rec.Body.String())
 	} else {
 		env.checkBody(t, e2eBobID, rec.Body.String(), 50)
+	}
+}
+
+// TestS0JoinedRecordHeaders carries record headers over the real runtime
+// path: a document record's render reply names them, a fleet record's plan
+// carries a response chain, and convert answers the chain's headers. Only the
+// allow-listed ones reach the client, and the bound body is the one convert
+// produced before the chain ran.
+func TestS0JoinedRecordHeaders(t *testing.T) {
+	env := newE2EEnv(t, true)
+	env.fake.mu.Lock()
+	env.fake.headers = map[string]string{"Plan-Name": "Provider Plan", "Set-Cookie": "session=1"}
+	env.fake.chain = []model.ResponseTransformerStep{{Source: "$options._res.headers['plan-name'] = 'Fleet Pro'", Enabled: true}}
+	env.fake.chainHeaders = map[string]string{"plan-name": "Fleet Pro", "content-disposition": "attachment; filename=" + e2eAliceUUID}
+	env.fake.mu.Unlock()
+
+	doc := env.createShare(t, e2eDoc, "headers-doc", "")
+	rec := env.fetch(doc)
+	if rec.Code != http.StatusOK || rec.Header().Get("Plan-Name") != "Provider Plan" || rec.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("document share: status %d headers %v", rec.Code, rec.Header())
+	}
+
+	alice := env.createShare(t, e2eFleet, "headers-alice", e2eAliceID)
+	rec = env.fetch(alice)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alice's share: %d refusals=%v", rec.Code, env.refusals(alice.ID))
+	}
+	env.checkBody(t, e2eAliceID, rec.Body.String(), 50)
+	if rec.Header().Get("Plan-Name") != "Fleet Pro" || rec.Header().Get("Content-Disposition") != `attachment; filename="headers-alice"; filename*=UTF-8''headers-alice` {
+		t.Fatalf("alice's headers: %v", rec.Header())
+	}
+	env.fake.mu.Lock()
+	defer env.fake.mu.Unlock()
+	if n := len(env.fake.converts); n != 2 || env.fake.converts[0].ResponseChain != nil || len(env.fake.converts[1].ResponseChain) != 1 {
+		t.Fatalf("converts: %d", n)
 	}
 }

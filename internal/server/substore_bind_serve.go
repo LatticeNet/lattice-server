@@ -31,7 +31,9 @@ import (
 // What the share answers:
 //
 //   - a plan with includable lines: the converted document, with
-//     Subscription-Userinfo from the identity's policy, never the provider's;
+//     Subscription-Userinfo from the identity's policy, never the provider's,
+//     and the record headers the allow-list admits (shareRecordHeaders),
+//     each screened for the identity's credentials;
 //   - a plan with fleet nodes and none includable, a document plan that
 //     fails validation, a plan whose record's snapshot does not say which
 //     lines it selected, a plugin whose signed convert budget allows host
@@ -180,10 +182,18 @@ func (s *Server) substoreBindStateDigest(u VpnUser) string {
 }
 
 // substoreBindRendered binds a rendered plan and converts it. A render that
-// carried a document is returned as it was.
+// carried a document is returned as it was. Either way the record headers
+// pass the allow-list here, before anything is cached.
 func (s *Server) substoreBindRendered(ctx context.Context, share model.SubscriptionShare, format string, variant shareRenderVariant,
 	snap model.SubscriptionSnapshot, rendered renderedSubscription) (renderedSubscription, error) {
 	if rendered.Plan == nil {
+		var identity lineCatalogueSecrets
+		if share.Source.IdentityID != "" {
+			if u, ok := s.getVpnUser(share.Source.IdentityID); ok {
+				identity = newLineCatalogueSecrets(lineCatalogueIdentitySecrets(u))
+			}
+		}
+		rendered.Headers = shareRecordHeaders(identity, rendered.Headers)
 		return rendered, nil
 	}
 	plan := *rendered.Plan
@@ -214,7 +224,7 @@ func (s *Server) substoreBindRendered(ctx context.Context, share model.Subscript
 	}
 
 	target := firstNonEmpty(reportedRenderTarget(rendered.Target), variant.Target, variant.UATarget)
-	req := model.ConvertRequest{Target: target, Options: variant.options(), ResponseChain: plan.ResponseChain}
+	req := model.ConvertRequest{Target: target, Options: variant.options()}
 	if result.document != nil {
 		req.Document = result.document
 	} else {
@@ -233,17 +243,45 @@ func (s *Server) substoreBindRendered(ctx context.Context, share model.Subscript
 	if err != nil {
 		return renderedSubscription{}, err
 	}
-	if len(reply.Log) > 0 {
-		// The response chain ran over the bound document, so what it wrote
-		// may carry a credential: counted, never copied.
-		s.logger.Printf("sub-store bind: share %s: the response chain wrote %d log line(s)", share.ID, len(reply.Log))
+	var chainHeaders map[string]string
+	if len(plan.ResponseChain) > 0 {
+		chainHeaders = s.substoreBindChainHeaders(ctx, share, req, plan.ResponseChain, reply.Content)
 	}
 	rendered.Body = []byte(reply.Content)
 	rendered.ContentType = reply.ContentType
 	rendered.Target = firstNonEmpty(reportedRenderTarget(reply.Target), req.Target)
 	rendered.Userinfo = identityLinkUserinfo(policy, false)
 	rendered.Bound = true
+	rendered.Headers = shareRecordHeaders(newLineCatalogueSecrets(lineCatalogueIdentitySecrets(u)), rendered.Headers, chainHeaders)
 	return rendered, nil
+}
+
+// substoreBindChainHeaders runs a fleet-bound record's Response Transformers
+// for the headers they set and for nothing else (design 28, the 2026-10-09
+// decision). Convert runs a second time over the same bound input with the
+// chain, and the body it returns is discarded: the share serves the first
+// call's body, which no script touched after binding, because a rewrite
+// after binding could move a line to a host the script controls, and core
+// does not parse every target format to catch it. A chain that fails leaves
+// the share served without the chain's headers. It costs a second convert
+// only on a render of a record that has a chain; a cached body costs nothing.
+func (s *Server) substoreBindChainHeaders(ctx context.Context, share model.SubscriptionShare, req model.ConvertRequest,
+	chain []model.ResponseTransformerStep, body string) map[string]string {
+	req.ResponseChain = chain
+	reply, err := s.substoreBindConvert(ctx, share.Source.PluginID, req)
+	if err != nil {
+		s.logger.Printf("sub-store bind: share %s: the response chain failed (%s); served without its headers", share.ID, subscriptionDiagnosticSummary(err))
+		return nil
+	}
+	if len(reply.Log) > 0 {
+		// The response chain ran over the bound document, so what it wrote
+		// may carry a credential: counted, never copied.
+		s.logger.Printf("sub-store bind: share %s: the response chain wrote %d log line(s)", share.ID, len(reply.Log))
+	}
+	if reply.Content != body {
+		s.logger.Printf("sub-store bind: share %s: the response chain rewrote the body; the rewrite was discarded", share.ID)
+	}
+	return reply.Headers
 }
 
 // substoreBindDenyConvertUnsealed refuses a bound plan when the plugin's

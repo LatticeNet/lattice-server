@@ -228,8 +228,10 @@ func subscriptionResponseContentType(format, target string) string {
 // content type is. It is passed through under two limits instead. Go's header
 // serialiser neutralises CR and LF, so it cannot start a second header, and
 // subscriptionUserinfoForResponse bounds its length and keeps only the fields
-// clients read, so it cannot be used to spend the response envelope. Nothing
-// else a source returns reaches a header.
+// clients read, so it cannot be used to spend the response envelope. The
+// other headers a plugin record may ask for pass the allow-list in
+// share_client_headers.go (shareRecordHeaders), and nothing else a source
+// returns reaches a header.
 //
 // This is the one serving core for every link kind. Share links pass through
 // it today, and identity links are meant to pass through the same stages as
@@ -480,6 +482,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		w.Header().Set("X-Lattice-Subscription-Stale", "true")
 	}
 	setLinkClientHeaders(w.Header(), share.Slug, shareUpdateIntervalHours(share))
+	setShareRecordHeaders(w.Header(), share, served.headers)
 	body := shareBody{body: served.body, gzipBody: served.gzipBody, hash: served.bodyHash}
 	if body.hash == ([32]byte{}) || (body.gzipBody == nil && share.Source.Kind != model.ShareSourcePlugin) {
 		body = newShareBody(served.body, acceptsGzip(r), gzip.DefaultCompression)
@@ -719,6 +722,9 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 			// Plan is a fleet-bound record's selection plan, in place of
 			// Content (substore_bind_serve.go).
 			Plan json.RawMessage `json:"plan"`
+			// Headers are the response headers the record asks for, which
+			// substoreBindRendered puts through the allow-list.
+			Headers map[string]string `json:"headers"`
 		}
 		if err := json.Unmarshal(out, &reply); err != nil {
 			return renderedSubscription{}, fmt.Errorf("decode plugin render reply: %w", err)
@@ -730,7 +736,8 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		// The provider's traffic figures are passed through verbatim so the
 		// client's remaining-quota display stays truthful.
 		return s.substoreBindRendered(ctx, share, format, variant, snap, renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Target: reply.Target, Userinfo: snap.Userinfo,
-			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt, Plan: plan})
+			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt, Plan: plan,
+			Headers: reply.Headers})
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
@@ -780,4 +787,8 @@ type renderedSubscription struct {
 	// Bound marks a Body the bind step converted from a plan with the
 	// share's identity bound into it.
 	Bound bool
+	// Headers are the response headers the record asked for. For a plugin
+	// source they pass the allow-list (shareRecordHeaders) in
+	// substoreBindRendered before anything is cached.
+	Headers map[string]string
 }

@@ -59,7 +59,7 @@ type substoreBindState struct {
 	// convert replaces the plugin's convert call in tests.
 	convert func(ctx context.Context, pluginID string, req model.ConvertRequest) (model.ConvertReply, error)
 	// renderPlan replaces the plugin's render call of bind.preview in tests.
-	renderPlan func(ctx context.Context, pluginID, subscriptionID, revision string, snap model.SubscriptionSnapshot) (*model.SelectionPlan, error)
+	renderPlan func(ctx context.Context, pluginID, subscriptionID, revision string, snap model.SubscriptionSnapshot) (*model.SelectionPlan, string, error)
 }
 
 // substoreBindRefusal is a render the bind step refused. The share answers

@@ -22,14 +22,14 @@ func bindOperatorCtx(p principal) context.Context {
 func TestSubstoreBindPreviewIsCredentialFree(t *testing.T) {
 	env := bindShareFixture(t)
 	var revisions []string
-	env.srv.substoreCatalogue.bind.renderPlan = func(_ context.Context, pluginID, subscriptionID, revision string, _ model.SubscriptionSnapshot) (*model.SelectionPlan, error) {
+	env.srv.substoreCatalogue.bind.renderPlan = func(_ context.Context, pluginID, subscriptionID, revision string, _ model.SubscriptionSnapshot) (*model.SelectionPlan, string, error) {
 		revisions = append(revisions, revision)
 		if subscriptionID != "fleet-1" || pluginID != subStorePluginID {
 			t.Fatalf("preview rendered %s/%s", pluginID, subscriptionID)
 		}
 		plan := bindNodesPlan(t, env.rows)
 		plan.Nodes[1] = bindNode(t, env.rows[1], plan.Nodes[1].Placeholders["uuid"], map[string]any{"server": "relay.attacker.example"})
-		return &plan, nil
+		return &plan, "r6", nil
 	}
 	reader := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"vpncore:read", "substore:read"}}}
 	out, err := env.srv.substoreBindRPC(bindOperatorCtx(reader), "preview", []byte(`{"subscription_id":"fleet-1","revision":"r7","identity_id":"`+bindIdentityID+`"}`))
@@ -43,7 +43,7 @@ func TestSubstoreBindPreviewIsCredentialFree(t *testing.T) {
 	if err := json.Unmarshal(out, &reply); err != nil {
 		t.Fatal(err)
 	}
-	if len(revisions) != 1 || revisions[0] != "r7" || reply.Revision != "r7" || reply.IdentityStatus != model.ProxyUserStatusActive {
+	if len(revisions) != 1 || revisions[0] != "r7" || reply.Revision != "r7" || reply.LiveRevision != "r6" || reply.IdentityStatus != model.ProxyUserStatusActive {
 		t.Fatalf("revisions %v, reply %+v", revisions, reply)
 	}
 	if len(reply.Entries) != len(env.rows)-1 || len(reply.Excluded) != 1 || reply.Excluded[0].Index != 1 ||
@@ -52,8 +52,8 @@ func TestSubstoreBindPreviewIsCredentialFree(t *testing.T) {
 	}
 
 	// A record that renders a document has nothing to bind.
-	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, string, string, string, model.SubscriptionSnapshot) (*model.SelectionPlan, error) {
-		return nil, nil
+	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, string, string, string, model.SubscriptionSnapshot) (*model.SelectionPlan, string, error) {
+		return nil, "", nil
 	}
 	if _, err := env.srv.substoreBindRPC(bindOperatorCtx(reader), "preview", []byte(`{"subscription_id":"fleet-1","identity_id":"`+bindIdentityID+`"}`)); err == nil ||
 		catalogueAPIError(t, err).Code != apiErrorSubstoreNotFleetBound {
@@ -185,9 +185,9 @@ func TestSubstoreBindRevealEntryNeedsStepUpAndIsAudited(t *testing.T) {
 // selected answers the refusal a share would, and binds nothing.
 func TestSubstoreBindPreviewRefusesAPlanWithoutASelection(t *testing.T) {
 	env := bindShareFixture(t)
-	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, string, string, string, model.SubscriptionSnapshot) (*model.SelectionPlan, error) {
+	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, string, string, string, model.SubscriptionSnapshot) (*model.SelectionPlan, string, error) {
 		plan := bindNodesPlan(t, env.rows)
-		return &plan, nil
+		return &plan, "", nil
 	}
 	reader := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"vpncore:read", "substore:read"}}}
 	out, err := env.srv.substoreBindRPC(bindOperatorCtx(reader), "preview", []byte(`{"subscription_id":"fleet-foreign","identity_id":"`+bindIdentityID+`"}`))

@@ -11,7 +11,7 @@ func (p substoreBindPlansPreviewer) PreviewBind(ctx context.Context, q subStoreB
 	if err != nil {
 		return subStoreBindResult{}, err
 	}
-	var out subStoreBindResult
+	out := subStoreBindResult{LiveRevision: reply.LiveRevision}
 	for _, e := range reply.Entries {
 		if e.Provider {
 			continue

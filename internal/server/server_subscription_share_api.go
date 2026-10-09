@@ -115,6 +115,10 @@ func (s *Server) handleSubscriptionShares(w http.ResponseWriter, r *http.Request
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.shareViewsFor(s.store.SubscriptionShares()))
 	case http.MethodPost:
+		// The slug check and the save hold the share-write lock
+		// (substore_svc.go), so two creates cannot both claim one slug.
+		release := s.subStoreSvcLockShareWrites()
+		defer release()
 		s.createSubscriptionShare(w, r, p)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -234,9 +238,24 @@ func (s *Server) handleSubscriptionShareItem(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusNotFound, errors.New("share not found"))
 		return
 	}
+	// A change loads, edits and saves the whole record, so it holds the
+	// share-write lock the Sub-Store share service holds (substore_svc.go)
+	// from before the load: a rotate there between this load and this save
+	// would otherwise be written over, and the revoked token serve again.
+	if (action == "rotate" && r.Method == http.MethodPost) || (action == "" && (r.Method == http.MethodPatch || r.Method == http.MethodDelete)) {
+		release := s.subStoreSvcLockShareWrites()
+		defer release()
+	}
 	share, ok := s.store.SubscriptionShare(shareID)
 	if !ok {
 		writeError(w, http.StatusNotFound, errors.New("share not found"))
+		return
+	}
+	// A share in the recycle bin answers like a deleted one; it is restored
+	// before it is edited, rotated or revealed, as the Sub-Store share
+	// service requires. Deleting it stays allowed.
+	if share.ArchivedAt != nil && (((action == "reveal" || action == "rotate") && r.Method == http.MethodPost) || (action == "" && r.Method == http.MethodPatch)) {
+		writeError(w, http.StatusConflict, fmt.Errorf("share %s is archived; restore it first", share.ID))
 		return
 	}
 

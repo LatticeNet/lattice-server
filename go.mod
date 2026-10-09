@@ -16,6 +16,9 @@ require (
 	modernc.org/sqlite v1.57.0
 )
 
+// filippo.io/age encrypts a share body for its recipient in core (design 28).
+require filippo.io/age v1.2.1
+
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.2 // indirect

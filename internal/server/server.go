@@ -468,6 +468,11 @@ type Server struct {
 	subscriptionBeforeCacheExtend func()
 	subscriptionCacheLookupWaiter chan<- struct{}
 	subscriptionCacheExtendWaiter chan<- struct{}
+
+	// subStoreSvc is the state of the Sub-Store shares and plans services
+	// (substore_svc.go).
+	subStoreSvc subStoreSvcState
+
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First
@@ -7445,6 +7450,13 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case "cftunnel":
 		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
+	case subStorePlanApprovalPlugin:
+		// A Sub-Store plan names shares, identities and lines across the
+		// fleet, the material the share API keeps behind the global proxy
+		// scopes (substore_svc_plans.go).
+		return !principalHasNodeRestriction(p) &&
+			(rbac.Allows(p.Principal, "proxy:read", "") || rbac.Allows(p.Principal, "proxy:admin", "")) &&
+			rbac.Allows(p.Principal, "network:plan", "")
 	case witnessPlugin:
 		// A witness plan names a stored notification channel and a prefix
 		// of its key's hash, and it hands that key to a node. Authoring and
@@ -8608,6 +8620,14 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 				"node agent has not advertised netguard-managed-sha-v1; update or reconnect the agent before applying"),
 		}
 	}
+	// A Sub-Store plan is core's own: it applies by calling the plugin's
+	// apply_revision, not by a node task (substore_svc_plans.go). It is
+	// decided before the task kill switch on purpose: the switch stops node
+	// tasks, a revision publish queues none, and a record edit that needs
+	// no plan publishes with the switch on, so a reviewed one does too.
+	if isSubStorePlanApproval(approval) {
+		return s.subStorePlanApprove(ctx, p, approval, queueApply)
+	}
 	if queueApply && s.taskExecutionDisabled {
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:       id.New("audit"),
@@ -9008,7 +9028,7 @@ func (s *Server) requireApprovalDecisionScopes(w http.ResponseWriter, p principa
 // TestNetGuardApprovalDecisionRequiresNetGuardAdmin).
 func approvalPlanNamesIdentities(approval model.Approval) bool {
 	switch approval.Plugin {
-	case proxyCorePlugin, singBoxLineUserPlugin, singBoxManagedLinePlugin:
+	case proxyCorePlugin, singBoxLineUserPlugin, singBoxManagedLinePlugin, subStorePlanApprovalPlugin:
 		return true
 	default:
 		return false
@@ -9137,6 +9157,10 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 	case witnessPlugin:
 		// Approving hands a stored channel's device key to a node.
 		return "notify:admin"
+	case subStorePlanApprovalPlugin:
+		// Approving changes what existing share holders receive, which the
+		// share API guards with proxy:admin.
+		return "proxy:admin"
 	default:
 		return ""
 	}

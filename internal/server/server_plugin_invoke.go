@@ -208,6 +208,14 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusBadRequest, errors.New("id, service and method are required"))
 		return
 	}
+	// Sub-Store's apply_revision publishes a revision to existing share
+	// holders, so it runs only as an approved plan's apply step, never as an
+	// operator's call, whatever the manifest declares (substore_svc_plans.go).
+	if subStoreCoreOnlyMethod(req.Service, req.Method) {
+		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, nil, "deny", subStoreCoreOnlyReason)
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, subStoreCoreOnlyReason))
+		return
+	}
 	// The plugin must be ACTIVE and must DECLARE this service+method (with its
 	// required scopes) in its manifest interfaces — a call to an undeclared
 	// service is refused even if the registry has it.

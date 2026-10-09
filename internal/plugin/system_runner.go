@@ -116,9 +116,9 @@ type SystemRunnerOptions struct {
 	// ProcessObserver receives what a plugin process used when it exits:
 	// user plus system CPU time from the kernel's accounting, and its peak
 	// resident set, which on Linux is the largest VmHWM sampled while it ran
-	// (see processPeak) and elsewhere the exit rusage. A per-invocation process reports when the invocation ends; a
-	// pooled worker when it retires, so its CPU lands in the minute it
-	// leaves. Nil observes nothing. It must be cheap and must not call back
+	// (see processPeak) and elsewhere the exit rusage. A per-invocation
+	// process reports when the invocation ends; a pooled worker when it
+	// retires, so its CPU lands in the minute it leaves. Nil observes nothing. It must be cheap and must not call back
 	// into the runner.
 	ProcessObserver func(pluginID string, cpu time.Duration, maxRSSBytes int64)
 }

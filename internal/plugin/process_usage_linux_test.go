@@ -81,8 +81,9 @@ func TestPooledWorkerPeakIsItsOwnNotTheServers(t *testing.T) {
 }
 
 // A per-invocation process usually answers and exits within a second, so its
-// peak comes from the dense early samples. This one holds about 64 MiB for a
-// moment before it answers, inside a parent grown past that.
+// peak comes from the dense early samples. This one holds about 64 MiB for
+// over a second before it answers, so a busy host still samples it, inside a
+// parent grown past that.
 func TestSystemRunnerInvocationPeakIsItsOwn(t *testing.T) {
 	const ballast = 256 << 20
 	b := make([]byte, ballast)
@@ -93,7 +94,7 @@ func TestSystemRunnerInvocationPeakIsItsOwn(t *testing.T) {
 
 	rec := newExitRecorder()
 	r := newRunner(t, SystemRunnerOptions{ProcessObserver: rec.observe})
-	script := "#!/bin/sh\nread line\nx=$(head -c 67108864 /dev/zero | tr '\\0' a)\nsleep 0.4\necho '{\"ok\":true}'\n"
+	script := "#!/bin/sh\nread line\nx=$(head -c 67108864 /dev/zero | tr '\\0' a)\nsleep 1.2\necho '{\"ok\":true}'\n"
 	loaded := makeBundle(t, "p.peak", script, "")
 	resp, err := startInvoke(t, r, loaded, "plan", nil)
 	if err != nil || !resp.OK {

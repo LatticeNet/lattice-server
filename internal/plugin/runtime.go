@@ -114,6 +114,12 @@ type InvokeConstraints struct {
 	Budget *InvokeBudgetSpec
 	// BudgetLabel is a stable service/method label used only for host logs.
 	BudgetLabel string
+	// Service and Method name the interface method this invocation serves.
+	// The broker reads them, never the plugin's copy in the payload, to admit
+	// a request verb on http.operator.do (operatorHTTPVerbAllowed). Empty for
+	// an invocation that is not a service call, which admits no GET or DELETE.
+	Service string
+	Method  string
 	// Operation is the one-time authority for an approved host-risk operation (§9.3).
 	// Like OperatorTargets it stays on the host side of the boundary: the plugin never
 	// receives it, so it cannot forge or widen one — it can only make a host call that

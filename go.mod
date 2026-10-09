@@ -5,15 +5,19 @@ go 1.26
 toolchain go1.26.6
 
 require (
-	github.com/LatticeNet/lattice-sdk v0.2.24-0.20261008085931-14636fd0ff17
+	github.com/LatticeNet/lattice-sdk v0.2.24-0.20261008211255-d5c61033c912
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/descope/virtualwebauthn v1.0.5
 	github.com/go-webauthn/webauthn v0.17.4
 	github.com/gorilla/websocket v1.5.3
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/oauth2 v0.36.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.57.0
 )
+
+// filippo.io/age encrypts a share body for its recipient in core (design 28).
+require filippo.io/age v1.2.1
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

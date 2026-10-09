@@ -54,7 +54,8 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreNodesService, "v1", []string{"export", "list"}, s.vpnCoreNodesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreNodesService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach", "managed", "rollout", "chains", "plan_chain", "plan_remove_chain"}, s.vpnCoreLinesRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreLinesService, "v1", []string{"list", "get", "sync_metadata", "reattach", "managed", "rollout", "chains", "plan_chain", "plan_remove_chain",
+		"catalogue"}, s.vpnCoreLinesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreLinesService, err)
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreUsersService, "v1", []string{"list", "get"}, s.vpnCoreUsersRPC); err != nil {
@@ -75,6 +76,10 @@ func (s *Server) registerVPNCoreRPC() {
 	}
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProbeService, "v1", []string{"health", "targets", "run"}, s.vpnCoreProbeRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreProbeService, err)
+	}
+	// Sub-Store S0 catalogue lane: the identity pickers' list (vpncore_identities.go).
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreIdentitiesService, "v1", []string{"list"}, s.vpnCoreIdentitiesRPC); err != nil {
+		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreIdentitiesService, err)
 	}
 }
 
@@ -211,6 +216,9 @@ func (s *Server) vpnCoreLinesRPC(ctx context.Context, method string, request []b
 	switch method {
 	case "chains", "plan_chain", "plan_remove_chain":
 		return s.vpnCoreLineChainsRPC(ctx, method, request)
+	case "catalogue":
+		// design 28: the credential-free line catalogue (line_catalogue.go).
+		return s.vpnCoreLinesCatalogueRPC(ctx, request)
 	case "list":
 		groups, _ := s.lineReadModel()
 		count := 0

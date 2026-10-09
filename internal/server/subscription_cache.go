@@ -54,24 +54,34 @@ type subscriptionCacheEntry struct {
 	stale               bool
 	fetchedAt           time.Time
 	expiresAt           time.Time
+	// bound marks a body the Sub-Store bind step converted with the share's
+	// identity bound into it (substore_bind_serve.go); its quota header is
+	// that identity's.
+	bound bool
 }
 
 // subscriptionCache keeps rendered subscription bodies for a short time so a
 // client poll does not boot a JavaScript VM and parse a 1.24 MB engine every
 // time.
 //
-// It is bounded by both entries and exact body bytes. classifyClientUA bounds
-// variants per share, while the byte cap prevents a small number of large
-// renders from becoming a memory amplifier.
+// It is bounded by exact body bytes, and by an entry count when built with
+// newSubscriptionCache. The server's two serve caches are built with
+// newSubscriptionByteCache and are bounded by bytes alone, with a per-entry
+// overhead charged so many small bodies cannot hold more than the cap.
+// classifyClientUA bounds variants per share.
 type subscriptionCache struct {
-	mu           sync.Mutex
-	max          int
-	maxBytes     int
-	bytes        int
-	ttl          time.Duration
-	entries      map[subscriptionCacheKey]*list.Element
-	order        *list.List
-	nextRevision uint64
+	mu       sync.Mutex
+	max      int
+	maxBytes int
+	bytes    int
+	// entryOverhead is added to each entry's accounted size, so a cache
+	// bounded by bytes alone also bounds the bookkeeping of many small
+	// entries (newSubscriptionByteCache). Zero for newSubscriptionCache.
+	entryOverhead int
+	ttl           time.Duration
+	entries       map[subscriptionCacheKey]*list.Element
+	order         *list.List
+	nextRevision  uint64
 }
 
 func newSubscriptionCache(max int, ttl time.Duration) *subscriptionCache {
@@ -180,7 +190,7 @@ func (c *subscriptionCache) ExtendSnapshot(key subscriptionCacheKey, expectedRev
 		entry.publicSourceVersion = strings.Clone(publicSourceVersion)
 		entry.stale = stale
 		entry.fetchedAt = fetchedAt
-		entry.size = subscriptionCacheEntrySize(*entry)
+		entry.size = subscriptionCacheEntrySize(*entry) + c.entryOverhead
 		c.bytes += entry.size - oldSize
 		c.order.MoveToFront(el)
 		for c.bytes > c.maxBytes {
@@ -223,9 +233,9 @@ func (c *subscriptionCache) putEntry(key subscriptionCacheKey, in subscriptionCa
 		contentType: strings.Clone(in.contentType), wireType: strings.Clone(in.wireType), userinfo: strings.Clone(in.userinfo),
 		bodyHash: in.bodyHash, gzipBody: cloneBytes(in.gzipBody),
 		revalidationVersion: strings.Clone(in.revalidationVersion), publicSourceVersion: strings.Clone(in.publicSourceVersion),
-		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl),
+		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl), bound: in.bound,
 	}
-	entry.size = subscriptionCacheEntrySize(*entry)
+	entry.size = subscriptionCacheEntrySize(*entry) + c.entryOverhead
 	if entry.size > c.maxBytes {
 		if el, ok := c.entries[key]; ok {
 			c.removeElement(el)
@@ -298,7 +308,7 @@ func (c *subscriptionCache) removeElement(el *list.Element) {
 }
 
 func subscriptionCacheEntrySize(entry subscriptionCacheEntry) int {
-	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.body) + len(entry.gzipBody) + len(entry.contentType) + len(entry.wireType) +
+	return len(entry.key.ShareID) + len(entry.key.Format) + len(entry.key.UAClass) + len(entry.key.Variant) + len(entry.body) + len(entry.gzipBody) + len(entry.contentType) + len(entry.wireType) +
 		len(entry.userinfo) + len(entry.revalidationVersion) + len(entry.publicSourceVersion)
 }
 

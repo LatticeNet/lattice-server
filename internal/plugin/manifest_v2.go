@@ -162,7 +162,10 @@ func validateHostAccess(m Manifest) error {
 		if !ok || !validPluginID(owner) || !pluginServiceSuffixRe.MatchString(suffix) {
 			return fmt.Errorf("manifest v2 invalid host_access rpc service %q", dependency.Service)
 		}
-		if owner == m.ID {
+		// A plugin may not rpc.call its own runtime services, which would
+		// re-enter it. A service of its own that it declares core-backed is
+		// served by core (Sub-Store's plans/claim_apply), so calling it does not.
+		if owner == m.ID && !declaresCoreBackedService(m, dependency.Service) {
 			return fmt.Errorf("manifest v2 host_access rpc service %q is owned by the caller", dependency.Service)
 		}
 		if seenServices[dependency.Service] {
@@ -184,6 +187,17 @@ func validateHostAccess(m Manifest) error {
 		}
 	}
 	return nil
+}
+
+// declaresCoreBackedService reports whether m declares service as a
+// core-backed interface.
+func declaresCoreBackedService(m Manifest, service string) bool {
+	for _, c := range m.Interfaces {
+		if c.Service == service && c.EffectiveBacking() == BackingCore {
+			return true
+		}
+	}
+	return false
 }
 
 func manifestArtifactDigest(m Manifest) string {

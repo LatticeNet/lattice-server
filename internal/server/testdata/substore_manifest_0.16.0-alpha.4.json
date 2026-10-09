@@ -1,0 +1,441 @@
+{
+  "schema": "lattice.plugin.manifest.v2",
+  "id": "latticenet.sub-store",
+  "name": "Sub-Store companion",
+  "type": "system",
+  "capabilities": [
+    "rpc:call",
+    "http:egress",
+    "http:operator-target",
+    "kv:read",
+    "kv:write",
+    "subscription:serve"
+  ],
+  "version": "0.16.0-alpha.4",
+  "publisher": "latticenet",
+  "signature_ed25519": "OWxrrN1bMOceoyX0/pJnSWC7HQ/W4mU5RCRB2InPAKR6uJi7ad8iLLFlieTMXC/Q4dRygl42B+pFlofcW6lnAQ==",
+  "bundle": {
+    "format": "tar+gzip",
+    "digest_sha256": "b21e106c0df762d50bb70e56376200da61a3a9a9a3f40008b2a9de1aaa834038"
+  },
+  "runtime": {
+    "protocol": "stdio-json-v2",
+    "entrypoints": {
+      "linux/amd64": "bin/linux-amd64/plugin",
+      "linux/arm64": "bin/linux-arm64/plugin"
+    }
+  },
+  "ui_runtime": {
+    "mode": "sandbox",
+    "entrypoint": "ui/index.html",
+    "bridge_version": "1"
+  },
+  "compatibility": {
+    "server": "\u003e=0.2.2-alpha.20",
+    "dashboard_host": "\u003e=1",
+    "runtime_protocol": "\u003e=2"
+  },
+  "host_access": {
+    "rpc": [
+      {
+        "service": "latticenet.vpn-core/nodes",
+        "methods": [
+          "export"
+        ]
+      },
+      {
+        "service": "latticenet.vpn-core/subscription-sources",
+        "methods": [
+          "compose",
+          "graph_options"
+        ]
+      }
+    ]
+  },
+  "ui": {
+    "nav": [
+      {
+        "section": "extensions",
+        "section_title": "Extensions",
+        "title": "Sub-Store",
+        "route": "sub-store",
+        "icon": "Store",
+        "scopes": [
+          "substore:read"
+        ]
+      }
+    ],
+    "views": [
+      {
+        "route": "sub-store",
+        "title": "Sub-Store",
+        "kind": "sandbox"
+      }
+    ]
+  },
+  "interfaces": [
+    {
+      "service": "latticenet.sub-store/engine",
+      "methods": [
+        {
+          "name": "convert",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 6291456,
+            "stderr_bytes": 65536,
+            "host_calls": 12
+          }
+        },
+        {
+          "name": "transform_response",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 6291456,
+            "stderr_bytes": 65536,
+            "host_calls": 12
+          }
+        },
+        {
+          "name": "save_pipeline",
+          "effect": "write",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 2000,
+            "stdout_bytes": 32768,
+            "stderr_bytes": 16384,
+            "host_calls": 2
+          }
+        },
+        {
+          "name": "get_pipeline",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 2000,
+            "stdout_bytes": 1048576,
+            "stderr_bytes": 32768,
+            "host_calls": 1
+          }
+        },
+        {
+          "name": "list_pipelines",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 1000,
+            "stdout_bytes": 131072,
+            "stderr_bytes": 16384,
+            "host_calls": 1
+          }
+        },
+        {
+          "name": "delete_pipeline",
+          "effect": "write",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 2000,
+            "stdout_bytes": 32768,
+            "stderr_bytes": 16384,
+            "host_calls": 2
+          }
+        },
+        {
+          "name": "run_pipeline",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 6291456,
+            "stderr_bytes": 65536,
+            "host_calls": 13
+          }
+        }
+      ],
+      "backing": "runtime"
+    },
+    {
+      "service": "latticenet.sub-store/subscription",
+      "methods": [
+        {
+          "name": "fetch",
+          "effect": "read",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 8388608,
+            "stderr_bytes": 65536,
+            "host_calls": 78
+          }
+        },
+        {
+          "name": "probe",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 20000,
+            "stdout_bytes": 65536,
+            "stderr_bytes": 65536,
+            "host_calls": 2
+          }
+        },
+        {
+          "name": "render",
+          "effect": "read",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 6291456,
+            "stderr_bytes": 65536,
+            "host_calls": 76
+          }
+        },
+        {
+          "name": "convert",
+          "effect": "read",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 6291456,
+            "stderr_bytes": 65536,
+            "host_calls": 0
+          }
+        },
+        {
+          "name": "operators",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 2000,
+            "stdout_bytes": 65536,
+            "stderr_bytes": 16384,
+            "host_calls": 0
+          }
+        },
+        {
+          "name": "graph_options",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 5000,
+            "stdout_bytes": 6291456,
+            "stderr_bytes": 16384,
+            "host_calls": 1
+          }
+        },
+        {
+          "name": "preview",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 1048576,
+            "stderr_bytes": 65536,
+            "host_calls": 76
+          }
+        },
+        {
+          "name": "preview_draft",
+          "effect": "read",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 1048576,
+            "stderr_bytes": 65536,
+            "host_calls": 76
+          }
+        },
+        {
+          "name": "list",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 2000,
+            "stdout_bytes": 262144,
+            "stderr_bytes": 16384,
+            "host_calls": 1
+          }
+        },
+        {
+          "name": "get",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 2000,
+            "stdout_bytes": 524288,
+            "stderr_bytes": 16384,
+            "host_calls": 2
+          }
+        },
+        {
+          "name": "save",
+          "effect": "write",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 5000,
+            "stdout_bytes": 4194304,
+            "stderr_bytes": 65536,
+            "host_calls": 3
+          }
+        },
+        {
+          "name": "delete",
+          "effect": "write",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 5000,
+            "stdout_bytes": 4194304,
+            "stderr_bytes": 16384,
+            "host_calls": 3
+          }
+        },
+        {
+          "name": "migrate",
+          "effect": "write",
+          "scopes": [
+            "substore:admin"
+          ],
+          "operator_target_fields": [
+            "base_url"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 4194304,
+            "stderr_bytes": 65536,
+            "host_calls": 263
+          }
+        },
+        {
+          "name": "export",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 5000,
+            "stdout_bytes": 4194304,
+            "stderr_bytes": 32768,
+            "host_calls": 258
+          }
+        },
+        {
+          "name": "import",
+          "effect": "write",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 4194304,
+            "stderr_bytes": 65536,
+            "host_calls": 260
+          }
+        },
+        {
+          "name": "get_settings",
+          "effect": "read",
+          "scopes": [
+            "substore:read"
+          ],
+          "budget": {
+            "timeout_ms": 1000,
+            "stdout_bytes": 16384,
+            "stderr_bytes": 16384,
+            "host_calls": 1
+          }
+        },
+        {
+          "name": "save_settings",
+          "effect": "write",
+          "scopes": [
+            "substore:admin"
+          ],
+          "budget": {
+            "timeout_ms": 1000,
+            "stdout_bytes": 16384,
+            "stderr_bytes": 16384,
+            "host_calls": 2
+          }
+        },
+        {
+          "name": "publish",
+          "effect": "write",
+          "scopes": [
+            "substore:admin"
+          ],
+          "operator_target_fields": [
+            "destination"
+          ],
+          "budget": {
+            "timeout_ms": 30000,
+            "stdout_bytes": 65536,
+            "stderr_bytes": 65536,
+            "host_calls": 77
+          }
+        }
+      ],
+      "backing": "runtime"
+    },
+    {
+      "service": "latticenet.sub-store/shares",
+      "methods": [
+        {
+          "name": "list",
+          "effect": "read",
+          "scopes": [
+            "substore:admin",
+            "proxy:admin"
+          ]
+        }
+      ],
+      "backing": "core"
+    }
+  ],
+  "dependencies": [
+    {
+      "id": "latticenet.vpn-core",
+      "version": "\u003e=0.8.0-alpha.10"
+    }
+  ]
+}

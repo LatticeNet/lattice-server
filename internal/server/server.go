@@ -391,6 +391,9 @@ type Server struct {
 	// latencyEdges holds the provider edge names the control plane resolved
 	// for the latency probes; see latency_edges.go.
 	latencyEdges latencyEdgeCache
+	// substoreCatalogue is the state the core keeps for the native
+	// Sub-Store (design 28); see line_catalogue.go.
+	substoreCatalogue substoreCatalogueState
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight
@@ -428,6 +431,9 @@ type Server struct {
 	identityConvertFlights map[identityConvertFlightKey]*shareRenderFlight
 	identityFetches        identityLinkFetches
 	identityLinkConvert    func(context.Context, []string, shareRenderVariant) (renderedSubscription, error)
+	// pluginSchedules holds the plugin task schedules' locks and the runs in
+	// flight (plugin_task_schedule.go); the schedules live in the store.
+	pluginSchedules pluginTaskScheduler
 	// traceRetentionKick asks the retention loop for a pass now, after an
 	// evidence settings save lowered a cap or a TTL (evidence_settings.go).
 	traceRetentionKick chan struct{}
@@ -462,6 +468,11 @@ type Server struct {
 	subscriptionBeforeCacheExtend func()
 	subscriptionCacheLookupWaiter chan<- struct{}
 	subscriptionCacheExtendWaiter chan<- struct{}
+
+	// subStoreSvc is the state of the Sub-Store shares and plans services
+	// (substore_svc.go).
+	subStoreSvc subStoreSvcState
+
 	// pluginRuntime tracks the in-memory runtime health for active plugins.
 	pluginRuntime *plugin.RuntimeManager
 	// pluginRPC is the server-owned inter-plugin RPC bus (design-09 §F). First
@@ -758,8 +769,8 @@ func New(opts Options) (*Server, error) {
 		build:                 build,
 		pluginTrust:           opts.PluginTrust,
 		reminderInterval:      opts.RenewalReminderInterval,
-		subscriptionCache:     newSubscriptionCache(subscriptionCacheEntries, subscriptionCacheTTL),
-		identityLinkCache:     newSubscriptionCache(identityLinkCacheEntries, identityLinkCacheTTL),
+		subscriptionCache:     newSubscriptionByteCache(subscriptionBodyCacheBytes, subscriptionCacheTTL),
+		identityLinkCache:     newSubscriptionByteCache(identityLinkBodyCacheBytes, identityLinkCacheTTL),
 		shareFetchStats:       newShareFetchStats(),
 		shareFlushStop:        make(chan struct{}),
 		latencySyncStop:       make(chan struct{}),
@@ -801,6 +812,10 @@ func New(opts Options) (*Server, error) {
 	s.registerVPNCoreRPC()
 	s.registerNetworkPluginRPC()
 	s.registerSubStorePluginRPC()
+	// Sub-Store S0 bind lane: latticenet.sub-store/bind (substore_bind_service.go).
+	s.registerSubStoreBindRPC()
+	// The plans service previews through the bind step (substore_bind_plans.go).
+	s.subStoreSvc.previewer = substoreBindPlansPreviewer{s}
 	// Derive vpn-core identities (VpnUser) from legacy ProxyUsers. Idempotent and
 	// additive — existing identities are untouched and ProxyUser stays the
 	// subscription-render substrate (design-12 S2).
@@ -874,6 +889,7 @@ func New(opts Options) (*Server, error) {
 		s.startShareFetchStatsFlush()
 		s.startLineClientTemplateSync()
 		s.startLatencyProbeSync()
+		s.startPluginTaskScheduler()
 		s.startStateWriteSummary()
 		if s.selfmon != nil {
 			s.selfmon.start()
@@ -1647,6 +1663,12 @@ func (s *Server) Close(ctx context.Context) error {
 	s.flushShareFetchStats(s.now(), true)
 	s.flushShareRefusalAudit(s.now())
 	waitWithin(&s.shareFetchAudits)
+	// Scheduled plugin runs are cancelled and waited for before the plugin
+	// runtime closes under them.
+	s.stopPluginTaskScheduler(ctx)
+	// Sub-Store S0 catalogue lane: stop the depends_on asks before the
+	// runtime they call (share_fleet_depends.go).
+	s.substoreCatalogue.deps.close(ctx)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)
@@ -5063,7 +5085,7 @@ func reservedLineSecretKVBucket(bucket string) bool {
 	bucket = strings.TrimSpace(bucket)
 	return bucket == vpnCoreKVBucket || bucket == "managedline/def" ||
 		bucket == "vpn_users" || bucket == "vpn_user_secrets" ||
-		bucket == "managed_line_secrets"
+		bucket == "managed_line_secrets" || bucket == pluginTaskScheduleKVBucket
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principal) {
@@ -7430,6 +7452,13 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case "cftunnel":
 		return rbac.Allows(p.Principal, "tunnel:admin", approval.NodeID)
+	case subStorePlanApprovalPlugin:
+		// A Sub-Store plan names shares, identities and lines across the
+		// fleet, the material the share API keeps behind the global proxy
+		// scopes (substore_svc_plans.go).
+		return !principalHasNodeRestriction(p) &&
+			(rbac.Allows(p.Principal, "proxy:read", "") || rbac.Allows(p.Principal, "proxy:admin", "")) &&
+			rbac.Allows(p.Principal, "network:plan", "")
 	case witnessPlugin:
 		// A witness plan names a stored notification channel and a prefix
 		// of its key's hash, and it hands that key to a node. Authoring and
@@ -8593,6 +8622,14 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 				"node agent has not advertised netguard-managed-sha-v1; update or reconnect the agent before applying"),
 		}
 	}
+	// A Sub-Store plan is core's own: it applies by calling the plugin's
+	// apply_revision, not by a node task (substore_svc_plans.go). It is
+	// decided before the task kill switch on purpose: the switch stops node
+	// tasks, a revision publish queues none, and a record edit that needs
+	// no plan publishes with the switch on, so a reviewed one does too.
+	if isSubStorePlanApproval(approval) {
+		return s.subStorePlanApprove(ctx, p, approval, queueApply)
+	}
 	if queueApply && s.taskExecutionDisabled {
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:       id.New("audit"),
@@ -8993,7 +9030,7 @@ func (s *Server) requireApprovalDecisionScopes(w http.ResponseWriter, p principa
 // TestNetGuardApprovalDecisionRequiresNetGuardAdmin).
 func approvalPlanNamesIdentities(approval model.Approval) bool {
 	switch approval.Plugin {
-	case proxyCorePlugin, singBoxLineUserPlugin, singBoxManagedLinePlugin:
+	case proxyCorePlugin, singBoxLineUserPlugin, singBoxManagedLinePlugin, subStorePlanApprovalPlugin:
 		return true
 	default:
 		return false
@@ -9122,6 +9159,10 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 	case witnessPlugin:
 		// Approving hands a stored channel's device key to a node.
 		return "notify:admin"
+	case subStorePlanApprovalPlugin:
+		// Approving changes what existing share holders receive, which the
+		// share API guards with proxy:admin.
+		return "proxy:admin"
 	default:
 		return ""
 	}

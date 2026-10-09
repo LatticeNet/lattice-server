@@ -172,6 +172,8 @@ func TestPluginHostServicesOperatorTargetAllowsLoopbackOnlyWithExplicitCapabilit
 	if err != nil {
 		t.Fatal(err)
 	}
+	// GET over an operator target is an artifact restore's alone.
+	ctx = plugin.BindInvocationMethod(ctx, "operator-http-plugin/artifact", "restore", 0)
 	broker, err := plugin.NewBroker(plugin.Loaded{
 		Manifest: plugin.Manifest{ID: "operator-http-plugin", Name: "Operator HTTP Plugin", Type: plugin.TypeSystem,
 			Capabilities: []string{"http:operator-target"}},

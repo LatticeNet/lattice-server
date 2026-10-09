@@ -208,6 +208,14 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusBadRequest, errors.New("id, service and method are required"))
 		return
 	}
+	// Sub-Store's apply_revision publishes a revision to existing share
+	// holders, so it runs only as an approved plan's apply step, never as an
+	// operator's call, whatever the manifest declares (substore_svc_plans.go).
+	if subStoreCoreOnlyMethod(req.Service, req.Method) {
+		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, nil, "deny", subStoreCoreOnlyReason)
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, subStoreCoreOnlyReason))
+		return
+	}
 	// The plugin must be ACTIVE and must DECLARE this service+method (with its
 	// required scopes) in its manifest interfaces — a call to an undeclared
 	// service is refused even if the registry has it.
@@ -459,6 +467,15 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 	if s.pluginRuntime == nil {
 		return nil, errors.New("plugin runtime unavailable")
 	}
+	// A core-only method (Sub-Store's apply_revision) runs only inside an
+	// approved plan's apply, which puts its one-time grant on the context.
+	// The gateway refuses it for operators; this refuses every other core
+	// path too, such as a scheduled run or a plan-effect operation.
+	if subStoreCoreOnlyMethod(service, method) {
+		if grant, _ := ctx.Value(subStoreApplyGrantKey{}).(*subStoreApplyGrant); grant == nil {
+			return nil, errSubStoreCoreOnlyMethod
+		}
+	}
 	if budget == nil {
 		budget = s.pluginMethodBudget(pluginID, service, method)
 	}
@@ -475,6 +492,8 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 		OperatorTargets: operatorTargets,
 		Budget:          budget,
 		BudgetLabel:     service + "/" + method,
+		Service:         service,
+		Method:          method,
 	})
 	telemetry.ObservePluginCall(pluginID, pluginMethodLabel(pluginID, service, method), time.Since(started), pluginCallFailure(resp, err))
 	if err != nil {

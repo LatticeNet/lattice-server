@@ -124,8 +124,8 @@ func subWireCases() []subWireCase {
 
 		{name: "deny unknown token", method: http.MethodGet, path: "/sub/cd-self/" + strings.Repeat("z", 32), ua: "curl/8"},
 		{name: "deny wrong slug", method: http.MethodGet, path: "/sub/nope/" + goldenShareToken, ua: "curl/8"},
-		{name: "deny disabled", method: http.MethodGet, path: "/sub/off/" + goldenDisabledToken, ua: "curl/8"},
-		{name: "deny expired", method: http.MethodGet, path: "/sub/old/" + goldenExpiredToken, ua: "curl/8"},
+		{name: "placeholder disabled", method: http.MethodGet, path: "/sub/off/" + goldenDisabledToken, ua: "curl/8"},
+		{name: "placeholder expired", method: http.MethodGet, path: "/sub/old/" + goldenExpiredToken, ua: "curl/8"},
 		{name: "deny bad format", method: http.MethodGet, path: ok + "?format=xml", ua: "curl/8"},
 		{name: "deny bad target", method: http.MethodGet, path: ok + "?target=EvilClient", ua: "curl/8"},
 		{name: "deny post", method: http.MethodPost, path: ok, ua: "curl/8"},

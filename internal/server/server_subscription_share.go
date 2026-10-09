@@ -139,14 +139,22 @@ func (s *Server) resolveShare(slug, token string, now time.Time) (model.Subscrip
 	if share.ExpiresAt != nil && !now.Before(*share.ExpiresAt) {
 		return model.SubscriptionShare{}, false
 	}
+	// An archived share is in the recycle bin: it answers like a deleted
+	// one until it is restored.
+	if share.ArchivedAt != nil {
+		return model.SubscriptionShare{}, false
+	}
 	return share, true
 }
 
 const (
-	// subscriptionCacheEntries bounds the rendered-body cache. classifyClientUA
-	// bounds the classes per share, so this is a share-count budget rather than a
-	// defence against key explosion.
+	// subscriptionCacheEntries is the entry bound test servers give their
+	// rendered-body cache. The server's own cache is sized by bytes
+	// (subscriptionBodyCacheBytes), because a share's documents range from a
+	// few kilobytes to megabytes and an entry count bounds neither.
 	subscriptionCacheEntries = 512
+	// subscriptionBodyCacheBytes bounds the rendered-body cache.
+	subscriptionBodyCacheBytes = 64 << 20
 	// subscriptionCacheTTL is the revalidation cadence, not the freshness bound:
 	// an expired entry whose content hash still matches is extended without a
 	// re-render, so the engine only ever runs when the content actually moved.
@@ -230,7 +238,9 @@ func subscriptionResponseContentType(format, target string) string {
 //   - resolve the token through the store's HMAC index, one rule for every
 //     kind (exactly one match, or the decoy);
 //   - decide reachability (enabled, unexpired; for an identity, its policy
-//     state) and refuse with the decoy, audited through the refusal throttle;
+//     state) and refuse with the decoy, audited through the refusal throttle,
+//     except that a known plugin share in a policy state answers with one
+//     placeholder entry naming the state (share_placeholder.go);
 //   - plan the render (planShareRender): the client target, the envelope, and
 //     a cache key that holds only what changes the bytes;
 //   - look the body up against the source's current content version
@@ -270,6 +280,15 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	requested := r.URL.Query().Get("format")
 	if strings.TrimSpace(requested) != "" && !subscriptionFormatIsKnown(requested) {
 		deny("invalid subscription format", map[string]string{"slug": slug, "token_sha256": tokenHash})
+		return
+	}
+
+	// A known plugin share whose share or identity is in a policy state gets
+	// one readable placeholder entry instead of the decoy (share_placeholder.go).
+	// It runs before the route check because a share's route facts, enabled
+	// and expiry, are two of those states; the slug it requires is the share's
+	// whole route, which is projected as /sub/<slug> on every host.
+	if s.servePluginSharePlaceholder(w, r, slug, token, tokenHash, requested, deny) {
 		return
 	}
 
@@ -334,7 +353,9 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	plan := planShareRender(share.Source.Kind, format, native, clientClass, variant)
 	format, uaClass, variant := plan.Format, plan.UAClass, plan.Variant
 
-	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass, Variant: variant.cacheToken()}
+	// A share with an age recipient caches under a key that names it
+	// (substore_svc_age.go).
+	key := subscriptionCacheKey{ShareID: share.ID, Format: format, UAClass: uaClass, Variant: subStoreSvcAgeCacheToken(share, variant.cacheToken())}
 
 	// A core proxy-user source is rendered on every request. Its render is Go
 	// over in-memory state, and a content version that covered everything it
@@ -352,6 +373,20 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		if user, ok := s.coreShareUser(share.Source.ProxyUserID, s.now()); ok {
 			plan.CoreUser = &user
 		}
+	}
+	// A plugin share that names an identity serves that identity's
+	// credentials, bound in core (substore_bind_serve.go): the identity must
+	// be in service, its bind state keys the cached body, and its policy
+	// writes the quota header.
+	var bindPolicy *vpnUserPolicy
+	if share.Source.Kind == model.ShareSourcePlugin && share.Source.IdentityID != "" {
+		bindToken, policy, refusal := s.substoreBindServeState(share, s.now())
+		if refusal != "" {
+			deny(refusal, map[string]string{"slug": slug, "token_sha256": tokenHash, "share_id": share.ID})
+			return
+		}
+		key.Variant += bindToken
+		bindPolicy = &policy
 	}
 
 	var cacheEntry subscriptionCacheEntry
@@ -430,6 +465,11 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	// ?noFlow=1 keeps quota headers off the wire (upstream's 不查询订阅流量) —
 	// some clients probe aggressively when they see one.
 	quota := subscriptionUserinfoForResponse(userinfo)
+	if bindPolicy != nil && served.bound {
+		// The identity's own figures, read now, as its link writes them. A
+		// body the record rendered as a plain document keeps its own.
+		quota = identityLinkUserinfo(*bindPolicy, false)
+	}
 	if variant.NoFlow {
 		quota = ""
 	}
@@ -653,6 +693,10 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		if s.subscriptionRender != nil {
 			rendered, err := s.subscriptionRender(ctx, share, format, uaClass, variant, snap)
 			rendered.SourceEpoch = epoch
+			if err == nil {
+				// A fleet-bound record's plan is bound here (substore_bind_serve.go).
+				rendered, err = s.substoreBindRendered(ctx, share, format, variant, snap, rendered)
+			}
 			return rendered, err
 		}
 		payload, err := subscriptionRenderPayload(share.Source.SubscriptionID, format, uaClass, variant, snap.Raw)
@@ -672,14 +716,21 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 			// core labels the response from it only after checking it against
 			// the bounded target set.
 			Target string `json:"target"`
+			// Plan is a fleet-bound record's selection plan, in place of
+			// Content (substore_bind_serve.go).
+			Plan json.RawMessage `json:"plan"`
 		}
 		if err := json.Unmarshal(out, &reply); err != nil {
 			return renderedSubscription{}, fmt.Errorf("decode plugin render reply: %w", err)
 		}
+		plan, err := substoreDecodeRenderPlan(reply.Content, reply.Plan)
+		if err != nil {
+			return renderedSubscription{}, err
+		}
 		// The provider's traffic figures are passed through verbatim so the
 		// client's remaining-quota display stays truthful.
-		return renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Target: reply.Target, Userinfo: snap.Userinfo,
-			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
+		return s.substoreBindRendered(ctx, share, format, variant, snap, renderedSubscription{Body: []byte(reply.Content), ContentType: reply.ContentType, Target: reply.Target, Userinfo: snap.Userinfo,
+			Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap), SourceVersion: snap.SourceVersion, SourceEpoch: epoch, FetchedAt: snap.FetchedAt, Plan: plan})
 	default:
 		return renderedSubscription{}, fmt.Errorf("unknown share source %q", share.Source.Kind)
 	}
@@ -723,4 +774,10 @@ type renderedSubscription struct {
 	SourceVersion       string
 	SourceEpoch         uint64
 	FetchedAt           time.Time
+	// Plan is a fleet-bound record's selection plan, which the bind step
+	// turns into Body before anything is cached (substore_bind_serve.go).
+	Plan *model.SelectionPlan
+	// Bound marks a Body the bind step converted from a plan with the
+	// share's identity bound into it.
+	Bound bool
 }

@@ -125,6 +125,19 @@ func TestManifestV2RejectsUnsafeHostAccess(t *testing.T) {
 	}
 }
 
+// A plugin may rpc.call a service of its own that it declares core-backed:
+// core serves it, so the call does not re-enter the plugin.
+func TestManifestV2AllowsHostAccessToOwnCoreBackedService(t *testing.T) {
+	m := cloneManifestV2(t, validManifestV2())
+	m.Capabilities = append(m.Capabilities, "rpc:call")
+	m.Interfaces = append(m.Interfaces, InterfaceContract{Service: "latticenet.example/plans", Backing: BackingCore,
+		MethodSpecs: []InterfaceMethod{{Name: "propose", Effect: InterfaceEffectWrite, Scopes: []string{"proxy:admin"}}}})
+	m.HostAccess = &HostAccessSpec{RPC: []RPCDependency{{Service: "latticenet.example/plans", Methods: []string{"claim_apply"}}}}
+	if err := ValidateManifest(m); err != nil {
+		t.Fatalf("own core-backed service refused: %v", err)
+	}
+}
+
 func TestManifestV2RejectsLegacyAndIncompleteContracts(t *testing.T) {
 	tests := []struct {
 		name string

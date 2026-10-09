@@ -180,6 +180,10 @@ type HostHTTPRequest struct {
 	URL    string
 	Header map[string]string
 	Body   []byte
+	// ResponseLimit bounds the response body the host may return. The broker
+	// sets it from the invocation's signed budget and overwrites whatever a
+	// caller put there; zero means DefaultInvokeHTTPResponseBytes.
+	ResponseLimit int
 }
 
 // HostHTTPResponse is the broker's stable outbound HTTP response shape.
@@ -675,6 +679,7 @@ func (b *Broker) HTTPDo(ctx context.Context, req HostHTTPRequest) (HostHTTPRespo
 	}
 	req.Header = cloneStringMap(req.Header)
 	req.Body = append([]byte(nil), req.Body...)
+	req.ResponseLimit = invocationHTTPResponseLimit(ctx)
 	resp, err := b.services.HTTP.Do(ctx, req)
 	resp.Header = cloneStringMap(resp.Header)
 	resp.Body = append([]byte(nil), resp.Body...)
@@ -691,6 +696,12 @@ func (b *Broker) HTTPOperatorDo(ctx context.Context, req HostHTTPRequest) (HostH
 	if b.services.OperatorHTTP == nil {
 		return HostHTTPResponse{}, fmt.Errorf("%w: operator http", ErrHostServiceUnavailable)
 	}
+	verb, err := b.operatorHTTPVerbAllowed(ctx, req.Method)
+	if err != nil {
+		b.record(ctx, HostCallEvent{PluginID: b.pluginID, Action: "http.operator.do", Capability: capHTTPOperatorTarget, Decision: "deny", Reason: err.Error()})
+		return HostHTTPResponse{}, err
+	}
+	req.Method = verb
 	if err := operatorTargetBound(ctx, req.URL); err != nil {
 		b.record(ctx, HostCallEvent{PluginID: b.pluginID, Action: "http.operator.do", Capability: capHTTPOperatorTarget, Decision: "deny", Reason: err.Error()})
 		return HostHTTPResponse{}, err
@@ -700,6 +711,7 @@ func (b *Broker) HTTPOperatorDo(ctx context.Context, req HostHTTPRequest) (HostH
 	}
 	req.Header = cloneStringMap(req.Header)
 	req.Body = append([]byte(nil), req.Body...)
+	req.ResponseLimit = invocationHTTPResponseLimit(ctx)
 	resp, err := b.services.OperatorHTTP.DoOperator(ctx, req)
 	resp.Header = cloneStringMap(resp.Header)
 	resp.Body = append([]byte(nil), resp.Body...)

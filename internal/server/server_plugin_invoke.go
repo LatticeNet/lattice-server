@@ -475,6 +475,8 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 		OperatorTargets: operatorTargets,
 		Budget:          budget,
 		BudgetLabel:     service + "/" + method,
+		Service:         service,
+		Method:          method,
 	})
 	telemetry.ObservePluginCall(pluginID, pluginMethodLabel(pluginID, service, method), time.Since(started), pluginCallFailure(resp, err))
 	if err != nil {

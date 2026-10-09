@@ -18,12 +18,14 @@ import (
 )
 
 const (
-	pluginHTTPRequestLimit  = 256 * 1024
-	pluginHTTPResponseLimit = 256 * 1024
+	pluginHTTPRequestLimit = 256 * 1024
 )
 
 type pluginHost struct {
 	server *Server
+	// kv is the store the KV host calls read and write; nil is the server's
+	// store. Tests set it to count store reads (pluginKVStore).
+	kv pluginKVStore
 }
 
 func (s *Server) pluginHostServices() plugin.HostServices {
@@ -194,12 +196,13 @@ func (h *pluginHost) Get(ctx context.Context, key string) ([]byte, bool, error) 
 	if err != nil {
 		return nil, false, err
 	}
-	for _, entry := range h.server.store.KV(bucket) {
-		if entry.Key == entryKey {
-			return []byte(entry.Value), true, nil
-		}
+	// One indexed read. The bucket scan this replaced walked every KV entry of
+	// every bucket, sorted the plugin's, and copied them, on every kv.get.
+	entry, ok := h.kvStore().KVEntry(bucket, entryKey)
+	if !ok {
+		return nil, false, nil
 	}
-	return nil, false, nil
+	return []byte(entry.Value), true, nil
 }
 
 func (h *pluginHost) Put(ctx context.Context, key string, value []byte) error {
@@ -207,7 +210,7 @@ func (h *pluginHost) Put(ctx context.Context, key string, value []byte) error {
 	if err != nil {
 		return err
 	}
-	return h.server.store.PutKV(model.KVEntry{Bucket: bucket, Key: entryKey, Value: string(value)})
+	return h.kvStore().PutKV(model.KVEntry{Bucket: bucket, Key: entryKey, Value: string(value)})
 }
 
 // pluginKVBucketPrefix is the namespace every plugin KV access must live under.
@@ -289,12 +292,13 @@ func (h *pluginHost) doHTTP(ctx context.Context, req plugin.HostHTTPRequest, cli
 		return plugin.HostHTTPResponse{}, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, pluginHTTPResponseLimit+1))
+	limit := pluginHTTPResponseLimitFor(req)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
 		return plugin.HostHTTPResponse{}, err
 	}
-	if len(body) > pluginHTTPResponseLimit {
-		return plugin.HostHTTPResponse{}, errors.New("plugin http response exceeds size limit")
+	if len(body) > limit {
+		return plugin.HostHTTPResponse{}, fmt.Errorf("plugin http response exceeds the method's %d byte budget", limit)
 	}
 	return plugin.HostHTTPResponse{StatusCode: resp.StatusCode, Header: singleValueHeaders(resp.Header), Body: body}, nil
 }

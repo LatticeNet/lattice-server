@@ -239,9 +239,9 @@ func e2eReadCatalogue(ctx context.Context, broker *plugin.Broker) (string, error
 	return string(raw), err
 }
 
-// e2eRealManifest is the Sub-Store plugin's current signed manifest
+// e2eRealManifest is a copy of the Sub-Store plugin's signed 0.16.0-alpha.4 manifest
 // (lattice-plugin-sub-store/manifest.json), read as the server reads it.
-const e2eRealManifest = "/Users/cdcd/roobli/RTFS_justTaste/Probe-Dashboards/Lattice/lattice-plugin-sub-store/manifest.json"
+const e2eRealManifest = "testdata/substore_manifest_0.16.0-alpha.4.json"
 
 // e2eManifest is the current manifest plus what S2 is specified to add:
 // task:schedule, rpc.call on the catalogue and on plans/claim_apply, the

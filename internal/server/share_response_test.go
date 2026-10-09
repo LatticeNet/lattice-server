@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -69,6 +70,69 @@ func TestShareResponseCarriesLengthAndAValidatorAndAnswers304(t *testing.T) {
 	s.handleSubscriptionShare(rec, req)
 	if rec.Code != http.StatusOK || rec.Header().Get("ETag") == etag {
 		t.Fatalf("quota change answered %d with etag %q (was %q)", rec.Code, rec.Header().Get("ETag"), etag)
+	}
+}
+
+func TestShareValidatorCoversTheDescribingHeaders(t *testing.T) {
+	userinfo := "upload=1; download=2; total=3"
+	s, _, path, _ := responseShareServer(t, "vless://a\nvless://b\n", &userinfo)
+	plan := "Team"
+	render := s.subscriptionRender
+	s.subscriptionRender = func(ctx context.Context, share model.SubscriptionShare, ua, format string, variant shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
+		out, err := render(ctx, share, ua, format, variant, snap)
+		out.Headers = map[string]string{model.ResponseHeaderPlanName: plan}
+		return out, err
+	}
+	fetch := func(ifNoneMatch string) *httptest.ResponseRecorder {
+		req := shareRequest(path, "curl/8")
+		if ifNoneMatch != "" {
+			req.Header.Set("If-None-Match", ifNoneMatch)
+		}
+		rec := httptest.NewRecorder()
+		s.handleSubscriptionShare(rec, req)
+		return rec
+	}
+	first := fetch("")
+	etag := first.Header().Get("ETag")
+	if first.Code != http.StatusOK || etag == "" || first.Header().Get("Plan-Name") != plan {
+		t.Fatalf("first response %d etag %q plan %q", first.Code, etag, first.Header().Get("Plan-Name"))
+	}
+	if again := fetch(etag); again.Code != http.StatusNotModified || again.Header().Get("ETag") != etag {
+		t.Fatalf("unchanged headers answered %d with etag %q (was %q)", again.Code, again.Header().Get("ETag"), etag)
+	}
+
+	// Only the plan name moved: the body and the quota are the same, and the
+	// client must still get a 200 with the new header.
+	plan = "Team Pro"
+	s.subscriptionCache.InvalidateShare("s1")
+	moved := fetch(etag)
+	if moved.Code != http.StatusOK || moved.Header().Get("ETag") == etag || moved.Header().Get("Plan-Name") != plan {
+		t.Fatalf("a header-only change answered %d with etag %q (was %q) and plan %q",
+			moved.Code, moved.Header().Get("ETag"), etag, moved.Header().Get("Plan-Name"))
+	}
+	if moved.Body.String() != first.Body.String() {
+		t.Fatalf("the body changed: %q, was %q", moved.Body.String(), first.Body.String())
+	}
+}
+
+func TestShareETagCoversEachDescribingHeader(t *testing.T) {
+	hash := sha256.Sum256([]byte("body"))
+	base := http.Header{}
+	for _, name := range shareDescribingHeaders {
+		base.Set(name, "a")
+	}
+	want := shareETag(hash, "", base, false)
+	for _, name := range shareDescribingHeaders {
+		moved := base.Clone()
+		moved.Set(name, "b")
+		if shareETag(hash, "", moved, false) == want {
+			t.Fatalf("the validator ignores %s", name)
+		}
+	}
+	other := base.Clone()
+	other.Set("X-Request-Id", "unrelated")
+	if shareETag(hash, "", other, false) != want {
+		t.Fatal("the validator moved with a header that does not describe the document")
 	}
 }
 

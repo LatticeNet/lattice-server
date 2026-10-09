@@ -1,6 +1,9 @@
 package server
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // substoreBindPlansPreviewer runs the plans service's previews through the
 // bind step (substore_bind_service.go).
@@ -8,6 +11,11 @@ type substoreBindPlansPreviewer struct{ s *Server }
 
 func (p substoreBindPlansPreviewer) PreviewBind(ctx context.Context, q subStoreBindQuery) (subStoreBindResult, error) {
 	reply, err := p.s.substoreBindPreview(ctx, q.PluginID, q.SubscriptionID, q.Revision, q.IdentityID)
+	var notBound substoreBindNotFleetBound
+	if errors.As(err, &notBound) {
+		// A revision that renders a document binds no line for the identity.
+		return subStoreBindResult{LiveRevision: notBound.liveRevision}, nil
+	}
 	if err != nil {
 		return subStoreBindResult{}, err
 	}

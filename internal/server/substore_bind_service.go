@@ -173,8 +173,8 @@ func (s *Server) substoreBindPreview(ctx context.Context, pluginID, subscription
 		return substoreBindPreviewReply{}, rpcAPIError(http.StatusBadGateway, model.APIErrorBadGateway, "sub-store/bind preview: the record did not render")
 	}
 	if plan == nil {
-		return substoreBindPreviewReply{}, rpcAPIError(http.StatusConflict, apiErrorSubstoreNotFleetBound,
-			"sub-store/bind preview: the record renders a document, not a plan, so it binds no identity")
+		return substoreBindPreviewReply{}, substoreBindNotFleetBound{liveRevision: liveRevision, err: rpcAPIError(http.StatusConflict, apiErrorSubstoreNotFleetBound,
+			"sub-store/bind preview: the record renders a document, not a plan, so it binds no identity")}
 	}
 	catalogue, err := s.buildLineCatalogue("")
 	if err != nil {
@@ -192,6 +192,17 @@ func (s *Server) substoreBindPreview(ctx context.Context, pluginID, subscription
 	}
 	return reply, nil
 }
+
+// substoreBindNotFleetBound is preview's refusal of a record revision that
+// renders a document. It unwraps to the 409 the bind service answers, and it
+// carries the live revision the render reported for the plans previewer.
+type substoreBindNotFleetBound struct {
+	liveRevision string
+	err          error
+}
+
+func (e substoreBindNotFleetBound) Error() string { return e.err.Error() }
+func (e substoreBindNotFleetBound) Unwrap() error { return e.err }
 
 // substoreBindRenderPlan asks the plugin's render for a record revision's
 // plan, as a share's render asks (the URI list, no client), with the

@@ -70,7 +70,64 @@ func TestPooledWorkerPeakIsItsOwnNotTheServers(t *testing.T) {
 		inherited = rusageMaxRSSBytes(ru)
 	}
 	t.Logf("worker: sampled peak %d bytes, exit rusage %d bytes", got.peak, inherited)
+	// The mechanism this test is about: without it the check below proves
+	// nothing, so a kernel that stops carrying the mark fails here loudly.
+	if inherited < ballast {
+		t.Fatalf("exit rusage %d is under the parent's %d ballast; the kernel no longer carries the parent's high-water mark", inherited, ballast)
+	}
 	if got.peak <= 0 || got.peak >= ballast/2 {
 		t.Fatalf("sampled peak %d; want the worker's own, under %d", got.peak, ballast/2)
+	}
+}
+
+// A per-invocation process usually answers and exits within a second, so its
+// peak comes from the dense early samples. This one holds about 64 MiB for a
+// moment before it answers, inside a parent grown past that.
+func TestSystemRunnerInvocationPeakIsItsOwn(t *testing.T) {
+	const ballast = 256 << 20
+	b := make([]byte, ballast)
+	for i := 0; i < len(b); i += 4096 {
+		b[i] = 1
+	}
+	defer runtime.KeepAlive(b)
+
+	rec := newExitRecorder()
+	r := newRunner(t, SystemRunnerOptions{ProcessObserver: rec.observe})
+	script := "#!/bin/sh\nread line\nx=$(head -c 67108864 /dev/zero | tr '\\0' a)\nsleep 0.4\necho '{\"ok\":true}'\n"
+	loaded := makeBundle(t, "p.peak", script, "")
+	resp, err := startInvoke(t, r, loaded, "plan", nil)
+	if err != nil || !resp.OK {
+		t.Fatalf("Invoke = %+v, %v", resp, err)
+	}
+	got := rec.wait(t, 1)
+	if len(got) != 1 {
+		t.Fatalf("observed %+v", got)
+	}
+	t.Logf("invocation: sampled peak %d bytes", got[0].rss)
+	if got[0].rss < 48<<20 || got[0].rss >= ballast {
+		t.Fatalf("sampled peak %d; want the process's own 64 MiB string, at least %d and under the parent's %d", got[0].rss, 48<<20, ballast)
+	}
+}
+
+func TestProcessPeakFinishStopsTheSampler(t *testing.T) {
+	p := watchProcessPeak(os.Getpid())
+	if p.max.Load() < 1<<20 {
+		t.Fatalf("first look read %d", p.max.Load())
+	}
+	first := p.finish()
+	if again := p.finish(); again != first {
+		t.Fatalf("finish twice: %d then %d", first, again)
+	}
+	select {
+	case <-p.stopped:
+	default:
+		t.Fatal("finish returned with the sampler still running")
+	}
+	// After finish a sample reads nothing: a reaped pid may belong to
+	// another process by then.
+	p.max.Store(1)
+	p.sample()
+	if got := p.max.Load(); got != 1 {
+		t.Fatalf("a sample after finish moved the peak to %d", got)
 	}
 }

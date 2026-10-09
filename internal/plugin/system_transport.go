@@ -349,8 +349,6 @@ func (t *systemWorkerTransport) closePipes() error {
 		return nil
 	}
 	t.closeOnce.Do(func() {
-		// Last look at the worker's peak while it is still alive.
-		t.peak.sample()
 		closeFile := func(file *os.File) {
 			if file == nil {
 				return
@@ -498,6 +496,8 @@ func (t *systemWorkerTransport) requestAbort() {
 		return
 	}
 	t.requestOnce.Do(func() {
+		// A last look at the worker's peak before it is signalled; a worker
+		// that already exited reads as nothing.
 		t.peak.sample()
 		close(t.done)
 		t.waitMu.Lock()

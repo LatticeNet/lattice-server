@@ -16,7 +16,10 @@ jobs:
           path: lattice-server
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.26.x'
+          # Pinned while actions/go-versions still lists 1.26.8 as the newest 1.26;
+          # 1.26.9 fixes GO-2026-6607 to 6617 (net/http, net/textproto, crypto/tls),
+          # which govulncheck now reports. setup-go downloads it from go.dev.
+          go-version: '1.26.9'
           check-latest: true
           cache-dependency-path: |
             lattice-server/go.mod
@@ -65,7 +68,10 @@ jobs:
           path: lattice-server
       - uses: actions/setup-go@v6
         with:
-          go-version: '1.26.x'
+          # Pinned while actions/go-versions still lists 1.26.8 as the newest 1.26;
+          # 1.26.9 fixes GO-2026-6607 to 6617 (net/http, net/textproto, crypto/tls),
+          # which govulncheck now reports. setup-go downloads it from go.dev.
+          go-version: '1.26.9'
           check-latest: true
           cache-dependency-path: |
             lattice-server/go.mod

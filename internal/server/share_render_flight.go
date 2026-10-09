@@ -3,6 +3,7 @@ package server
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -103,6 +104,12 @@ func (s *Server) renderShareOnce(ctx context.Context, share model.SubscriptionSh
 	for attempt := 0; attempt < attempts; attempt++ {
 		rendered, err := s.renderShare(ctx, share, plan.Format, plan.UAClass, plan.Variant, plan.CoreUser)
 		if err != nil {
+			// A fleet-bound plan the bind step refused is audited by its
+			// reason (substore_bind_serve.go).
+			var refusal substoreBindRefusal
+			if errors.As(err, &refusal) {
+				return shareRenderOutcome{deny: refusal.reason}
+			}
 			s.logger.Printf("subscription share: render failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(err))
 			return shareRenderOutcome{deny: "subscription_render_failed"}
 		}
@@ -119,7 +126,7 @@ func (s *Server) renderShareOnce(ctx context.Context, share model.SubscriptionSh
 			revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
 			stale: rendered.Stale, fetchedAt: rendered.FetchedAt,
 			wireType: shareWireContentType(plan, reportedRenderTarget(rendered.Target)),
-			bodyHash: served.hash, gzipBody: served.gzipBody}
+			bodyHash: served.hash, gzipBody: served.gzipBody, bound: rendered.Bound}
 		if share.Source.Kind == model.ShareSourcePlugin &&
 			!s.putSubscriptionCacheForSource(key, share.Source.PluginID, share.Source.SubscriptionID, rendered.SourceEpoch, entry, s.now()) {
 			continue

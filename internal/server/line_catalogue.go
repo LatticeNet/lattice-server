@@ -102,6 +102,8 @@ type substoreCatalogueState struct {
 	names lineCatalogueNames
 	pages lineCataloguePageCache
 	deps  fleetDependsState
+	// bind is the validate-and-bind step's state (substore_bind_serve.go).
+	bind substoreBindState
 }
 
 // lineCatalogue is one build of the catalogue: every line with a line_uuid,

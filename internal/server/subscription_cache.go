@@ -54,6 +54,10 @@ type subscriptionCacheEntry struct {
 	stale               bool
 	fetchedAt           time.Time
 	expiresAt           time.Time
+	// bound marks a body the Sub-Store bind step converted with the share's
+	// identity bound into it (substore_bind_serve.go); its quota header is
+	// that identity's.
+	bound bool
 }
 
 // subscriptionCache keeps rendered subscription bodies for a short time so a
@@ -229,7 +233,7 @@ func (c *subscriptionCache) putEntry(key subscriptionCacheKey, in subscriptionCa
 		contentType: strings.Clone(in.contentType), wireType: strings.Clone(in.wireType), userinfo: strings.Clone(in.userinfo),
 		bodyHash: in.bodyHash, gzipBody: cloneBytes(in.gzipBody),
 		revalidationVersion: strings.Clone(in.revalidationVersion), publicSourceVersion: strings.Clone(in.publicSourceVersion),
-		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl),
+		stale: in.stale, fetchedAt: in.fetchedAt, expiresAt: now.Add(c.ttl), bound: in.bound,
 	}
 	entry.size = subscriptionCacheEntrySize(*entry) + c.entryOverhead
 	if entry.size > c.maxBytes {

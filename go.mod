@@ -12,6 +12,7 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	go.etcd.io/bbolt v1.4.3
 	golang.org/x/oauth2 v0.36.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.57.0
 )
 

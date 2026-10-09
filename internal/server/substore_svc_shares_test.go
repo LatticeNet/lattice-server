@@ -141,9 +141,23 @@ func (h *subStoreSvcHarness) auditFor(action, shareID string) []model.AuditEvent
 	return out
 }
 
-// Create, update, archive, restore, archive again and purge, each through the
-// service, each audited once, with the share's operator fields kept and no
-// token, path or URL in any reply.
+// requireNoShareLink fails when a reply outside the reveal gate carries a
+// share's token, a serve path or the public URL.
+func requireNoShareLink(t *testing.T, reply string, tokens ...string) {
+	t.Helper()
+	for _, token := range tokens {
+		if strings.Contains(reply, token) {
+			t.Fatalf("a reply outside the reveal gate carries a share token: %s", reply)
+		}
+	}
+	if strings.Contains(reply, "/sub/") || strings.Contains(reply, "lattice.example") || strings.Contains(reply, `"revealed"`) {
+		t.Fatalf("a reply outside the reveal gate carries the link: %s", reply)
+	}
+}
+
+// Create, update, reorder, archive, restore, archive again and purge, each
+// through the service, each audited once, with the share's operator fields
+// kept and no token, path or URL in any reply.
 func TestSubStoreSharesLifecycleRoundTrip(t *testing.T) {
 	h := newSubStoreSvcHarness(t)
 	if err := h.srv.putVpnUser(VpnUser{ID: "vpnuser_alice", Email: "alice@example.com", Enabled: true}); err != nil {
@@ -187,6 +201,16 @@ func TestSubStoreSharesLifecycleRoundTrip(t *testing.T) {
 	}
 	if evs := h.auditFor(auditActionShareUpdate, row.ShareID); len(evs) != 1 || evs[0].Metadata["fields"] != "display_name,icon,tags,order" {
 		t.Fatalf("update audit = %+v", evs)
+	}
+
+	var reordered struct {
+		Shares []subStoreShareRow `json:"shares"`
+	}
+	if err := json.Unmarshal(call("reorder", `{"share_ids":["`+row.ShareID+`"]}`), &reordered); err != nil {
+		t.Fatal(err)
+	}
+	if len(reordered.Shares) != 1 || reordered.Shares[0].ShareID != row.ShareID || reordered.Shares[0].Order != 0 {
+		t.Fatalf("reordered rows = %+v", reordered.Shares)
 	}
 
 	var archived subStoreSvcShareReply
@@ -245,9 +269,7 @@ func TestSubStoreSharesLifecycleRoundTrip(t *testing.T) {
 	}
 
 	for _, reply := range replies {
-		if strings.Contains(reply, token) || strings.Contains(reply, "/sub/") || strings.Contains(reply, "lattice.example") || strings.Contains(reply, `"revealed"`) {
-			t.Fatalf("a reply outside the reveal gate carries the link: %s", reply)
-		}
+		requireNoShareLink(t, reply, token)
 	}
 	for _, ev := range h.st.AuditEvents() {
 		for _, v := range ev.Metadata {
@@ -406,10 +428,16 @@ func TestSubStoreSharesReorder(t *testing.T) {
 	var reply struct {
 		Shares []subStoreShareRow `json:"shares"`
 	}
-	if err := json.Unmarshal(h.mustCall(t, subStoreSharesService, "reorder",
-		`{"share_ids":["`+c.ShareID+`","`+a.ShareID+`","`+b.ShareID+`"]}`), &reply); err != nil {
+	out := h.mustCall(t, subStoreSharesService, "reorder", `{"share_ids":["`+c.ShareID+`","`+a.ShareID+`","`+b.ShareID+`"]}`)
+	if err := json.Unmarshal(out, &reply); err != nil {
 		t.Fatal(err)
 	}
+	var tokens []string
+	for _, row := range []subStoreShareRow{a, b, c, archived} {
+		stored, _ := h.st.SubscriptionShare(row.ShareID)
+		tokens = append(tokens, stored.Token)
+	}
+	requireNoShareLink(t, string(out), tokens...)
 	want := map[string]int{c.ShareID: 0, a.ShareID: 1, b.ShareID: 2}
 	for i, row := range reply.Shares {
 		stored, _ := h.st.SubscriptionShare(row.ShareID)

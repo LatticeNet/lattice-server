@@ -239,7 +239,7 @@ func subscriptionResponseContentType(format, target string) string {
 //     kind (exactly one match, or the decoy);
 //   - decide reachability (enabled, unexpired; for an identity, its policy
 //     state) and refuse with the decoy, audited through the refusal throttle,
-//     except that a known plugin share in a policy state answers with one
+//     except that a known Sub-Store share in a policy state answers with one
 //     placeholder entry naming the state (share_placeholder.go);
 //   - plan the render (planShareRender): the client target, the envelope, and
 //     a cache key that holds only what changes the bytes;
@@ -283,7 +283,7 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// A known plugin share whose share or identity is in a policy state gets
+	// A known Sub-Store share whose share or identity is in a policy state gets
 	// one readable placeholder entry instead of the decoy (share_placeholder.go).
 	// It runs before the route check because a share's route facts, enabled
 	// and expiry, are two of those states; the slug it requires is the share's

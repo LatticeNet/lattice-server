@@ -20,7 +20,7 @@ import (
 // an identity that is not active (identity_link.go): the client shows a node
 // named for the reason instead of an error, and keeps polling. Everything
 // else stays the decoy: an unknown token, a slug that does not match, an
-// archived share, a share that is not a plugin's, a bad format or target, a
+// archived share, a share that is not Sub-Store's, a bad format or target, a
 // rate limit (design 28, share serving and tokens).
 
 // Reasons a plugin share answers with the placeholder, as the fetch audit
@@ -46,12 +46,13 @@ type pluginSharePlaceholder struct {
 	policy vpnUserPolicy
 }
 
-// pluginSharePlaceholderFor reports whether token names a plugin share, under
-// this slug and not archived, that is disabled, expired, or bound to an
-// identity that is missing or not active.
+// pluginSharePlaceholderFor reports whether token names a Sub-Store share,
+// under this slug and not archived, that is disabled, expired, or bound to an
+// identity that is missing or not active. Another plugin's share in a policy
+// state answers as a core share does: the decoy.
 func (s *Server) pluginSharePlaceholderFor(slug, token string, now time.Time) (pluginSharePlaceholder, bool) {
 	share, ok := s.store.SubscriptionShareByToken(token)
-	if !ok || share.Slug != slug || share.Source.Kind != model.ShareSourcePlugin || share.ArchivedAt != nil {
+	if !ok || share.Slug != slug || !isSubStoreShare(share) || share.ArchivedAt != nil {
 		return pluginSharePlaceholder{}, false
 	}
 	answer := pluginSharePlaceholder{share: share}
@@ -81,7 +82,7 @@ func (s *Server) pluginSharePlaceholderFor(slug, token string, now time.Time) (p
 }
 
 // servePluginSharePlaceholder answers a /sub/ request whose token names a
-// plugin share in a policy state. It returns false, writing nothing, for any
+// Sub-Store share in a policy state. It returns false, writing nothing, for any
 // other token, so the caller's share and identity link paths answer it.
 func (s *Server) servePluginSharePlaceholder(w http.ResponseWriter, r *http.Request, slug, token, tokenHash, requested string, deny func(string, map[string]string)) bool {
 	answer, ok := s.pluginSharePlaceholderFor(slug, token, s.now())
@@ -117,6 +118,21 @@ func (s *Server) servePluginSharePlaceholder(w http.ResponseWriter, r *http.Requ
 	if failure != "" {
 		deny(failure, meta(nil))
 		return true
+	}
+	// A share with an age recipient answers in age, as its live body does
+	// (share_render_flight.go), so a policy state is not told apart by being
+	// plaintext. The placeholder holds no credential, so it is sealed per
+	// request, as a core-sourced body is, and its cached document stays plain.
+	sealedBody, sealed, err := subStoreSvcSealShareBody(share, served.body)
+	if err != nil {
+		s.logger.Printf("subscription share: age encryption failed for share %s (%s)", share.ID, subscriptionDiagnosticSummary(err))
+		deny("subscription_age_failed", meta(nil))
+		return true
+	}
+	if sealed {
+		// The body is age armor now, not the base64 URI list a converter
+		// fallback names, so the fallback header is not sent.
+		served = identityLinkBody{body: sealedBody, wireType: subStoreSvcAgeWireType, cacheHit: served.cacheHit}
 	}
 
 	header := w.Header()

@@ -58,17 +58,19 @@ import (
 // hex), so that slot cannot carry anything else.
 //
 // The selector is pushed down here: set fields AND, the values of one field
-// OR, and a field this core does not know is refused with the fields it does
-// know. Rows are paged by an offset cursor. catalogue_version hashes the
-// identity named and the encoded rows of the whole selection, so it is the
-// same on every page of one read and moves whenever any selected row does.
+// OR, and a field this core does not know, or a selector given twice, is
+// refused with the fields it does know. Rows are paged by an offset cursor.
+// catalogue_version hashes the identity named and the encoded rows of the
+// whole selection, so it is the same on every page of one read and moves
+// whenever any selected row does.
 
 const (
 	lineCatalogueVersionPrefix = "lcv1-"
 	lineCatalogueCursorPrefix  = "lcc1."
 	// apiErrorCatalogueSelectorUnsupported refuses a selector field this core
-	// does not evaluate. The message ends in "selector_fields: " followed by
-	// the comma-separated fields it does evaluate.
+	// does not evaluate, and a selector it cannot read one way only: given
+	// twice, or naming a field twice. The message ends in "selector_fields: "
+	// followed by the comma-separated fields it does evaluate.
 	apiErrorCatalogueSelectorUnsupported = "catalogue_selector_unsupported"
 	// apiErrorCatalogueCredential refuses a page in which a credential
 	// fragment survived every per-row check. It cannot happen while those
@@ -1079,28 +1081,16 @@ func (c *lineCataloguePageCache) put(key string, rows [][]byte, now time.Time) {
 
 // decodeLineCatalogueRequest decodes a catalogue request strictly. An empty
 // request is the first page of everything. A selector field this core does
-// not evaluate is refused by name, with the fields it does evaluate.
+// not evaluate is refused by name, with the fields it does evaluate, and so
+// is a selector given twice or naming a field twice.
 func decodeLineCatalogueRequest(raw []byte) (model.LineCatalogueRequest, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		raw = []byte("{}")
 	}
 	if len(raw) <= model.MaxLineCatalogueRequestBytes {
-		var probe struct {
-			Selector map[string]json.RawMessage `json:"selector"`
-		}
-		if json.Unmarshal(raw, &probe) == nil {
-			var unknown []string
-			for field := range probe.Selector {
-				if !slices.Contains(lineCatalogueSelectorFields, field) {
-					unknown = append(unknown, strconv.Quote(field))
-				}
-			}
-			if len(unknown) > 0 {
-				sort.Strings(unknown)
-				return model.LineCatalogueRequest{}, rpcAPIError(http.StatusBadRequest, apiErrorCatalogueSelectorUnsupported,
-					fmt.Sprintf("catalogue selector field %s is not one this core evaluates; selector_fields: %s",
-						strings.Join(unknown, ", "), strings.Join(lineCatalogueSelectorFields, ",")))
-			}
+		if refusal := lineCatalogueSelectorRefusal(raw); refusal != "" {
+			return model.LineCatalogueRequest{}, rpcAPIError(http.StatusBadRequest, apiErrorCatalogueSelectorUnsupported,
+				refusal+"; selector_fields: "+strings.Join(lineCatalogueSelectorFields, ","))
 		}
 	}
 	req, err := model.DecodeLineCatalogueRequest(raw)
@@ -1108,6 +1098,67 @@ func decodeLineCatalogueRequest(raw []byte) (model.LineCatalogueRequest, error) 
 		return model.LineCatalogueRequest{}, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "catalogue request: "+err.Error())
 	}
 	return req, nil
+}
+
+// lineCatalogueSelectorRefusal reads every selector a request carries, under
+// every key the decoder would take for it (encoding/json matches field names
+// ignoring case), and says why the selector is refused, or "" when it is not
+// or when the request is not an object the strict decode would accept anyway.
+// Decoding into a map instead would let a later selector key hide an earlier
+// one: a null replaces the map, and two keys that differ only in case would
+// both be merged into one selector.
+func lineCatalogueSelectorRefusal(raw []byte) string {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return ""
+	}
+	selectors := 0
+	var unknown []string
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return ""
+		}
+		key, _ := token.(string)
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return ""
+		}
+		if !strings.EqualFold(key, "selector") {
+			continue
+		}
+		if selectors++; selectors > 1 {
+			return "catalogue selector is given more than once"
+		}
+		fields := json.NewDecoder(bytes.NewReader(value))
+		if token, err := fields.Token(); err != nil || token != json.Delim('{') {
+			continue
+		}
+		seen := map[string]bool{}
+		for fields.More() {
+			token, err := fields.Token()
+			field, ok := token.(string)
+			if err != nil || !ok {
+				break
+			}
+			if seen[field] {
+				return fmt.Sprintf("catalogue selector field %s is given more than once", strconv.Quote(field))
+			}
+			seen[field] = true
+			if !slices.Contains(lineCatalogueSelectorFields, field) {
+				unknown = append(unknown, strconv.Quote(field))
+			}
+			var skip json.RawMessage
+			if fields.Decode(&skip) != nil {
+				break
+			}
+		}
+	}
+	if len(unknown) == 0 {
+		return ""
+	}
+	sort.Strings(unknown)
+	return fmt.Sprintf("catalogue selector field %s is not one this core evaluates", strings.Join(unknown, ", "))
 }
 
 // vpnCoreReadAllowed holds an operator's own gateway call to a vpn-core read

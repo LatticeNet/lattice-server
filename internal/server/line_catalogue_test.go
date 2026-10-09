@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -76,6 +77,95 @@ func catalogueFixture(t testing.TB, nodes, perNode int) *catalogueEnv {
 		t.Fatal(err)
 	}
 	return &catalogueEnv{srv: srv, st: st, now: now}
+}
+
+// catalogueRealityPublicKey is the Reality public key of every managed line
+// catalogueChainRoots plants. The stored templates carry another one, so a
+// row carrying this one carries the composed entry.
+const catalogueRealityPublicKey = "Zm9vYmFyYmF6cXV4cXV1eHF1dXhxdXV4cXV1eHF1dXg"
+
+// catalogueChainRoots commits n chains on a catalogue fixture the way an
+// applied and observed plan leaves them: the first line of node 2k becomes a
+// managed root whose committed chain leads to the first line of node 2k+1, a
+// managed terminal, both definitions converged and the root's node reporting
+// the committed downstream. It returns the roots' line uuids.
+func catalogueChainRoots(t testing.TB, e *catalogueEnv, n int) []string {
+	t.Helper()
+	first := map[string]model.LineCatalogueRow{}
+	for _, row := range e.read(t, "").Rows {
+		if _, ok := first[row.NodeID]; !ok {
+			first[row.NodeID] = row
+		}
+	}
+	var roots []string
+	for k := 0; k < n; k++ {
+		root, terminal := first[fmt.Sprintf("node-%03d", 2*k)], first[fmt.Sprintf("node-%03d", 2*k+1)]
+		for _, row := range []model.LineCatalogueRow{root, terminal} {
+			if err := e.srv.putManagedLineDef(managedLineDef{LineUUID: row.LineUUID, NodeID: row.NodeID, LineHashID: row.LineHashID, Tag: row.Name,
+				Port: row.Template.Port, SNI: "www.example.com", RealityPrivateKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+				RealityPublicKey: catalogueRealityPublicKey, ShortID: "0a1b", Status: managedLineStatusApplied}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		e.srv.singboxInvMu.Lock()
+		inv := e.srv.singboxInv[root.NodeID]
+		for i := range inv.Nodes {
+			if inv.Nodes[i].Name == root.Name {
+				inv.Nodes[i].DownstreamLineUUID = terminal.LineUUID
+			}
+		}
+		e.srv.singboxInv[root.NodeID] = inv
+		e.srv.singboxInvMu.Unlock()
+		commitCatalogueChain(t, e.srv, root, terminal.LineUUID)
+		commitCatalogueChain(t, e.srv, terminal, "")
+		roots = append(roots, root.LineUUID)
+	}
+	e.srv.invalidateLineReadModel()
+	return roots
+}
+
+// commitCatalogueChain takes one chain definition for source through the
+// store's plan, approve, lease, result and observation steps: a set to target,
+// or, with no target, the converged remove tombstone that declares a path's
+// last hop.
+func commitCatalogueChain(t testing.TB, srv *Server, source model.LineCatalogueRow, target string) {
+	t.Helper()
+	operation, method, outboundTag := store.LineChainOperationSet, lineChainSetMethod, deterministicLineChainTag(source.LineUUID, target)
+	if target == "" {
+		operation, method, outboundTag = store.LineChainOperationRemove, lineChainRemoveMethod, ""
+	}
+	artifact := "catalogue-artifact-" + source.LineUUID
+	approval := model.Approval{ID: "catalogue-approval-" + source.LineUUID, NodeID: source.NodeID, Plugin: lineChainPlugin, PluginVersion: "test-fixture",
+		Service: lineChainService, Method: method, Action: lineChainActionPrefix + artifact, ArtifactDigest: artifact,
+		RequestSHA256: "catalogue-request-" + source.LineUUID, Plan: `{"fixture":"catalogue"}`, Status: model.ApprovalPending, Targets: []string{source.NodeID}}
+	attempt := store.LineChainAttempt{ApprovalID: approval.ID, Operation: operation, SourceLineUUID: source.LineUUID, SourceNodeID: source.NodeID,
+		CandidateTargetLineUUID: target, CandidateArtifactSHA256: artifact, RequestSHA256: approval.RequestSHA256,
+		CandidateDefinition: store.LineChainDefinition{SourceLineUUID: source.LineUUID, SourceNodeID: source.NodeID, SourceLineHashID: source.LineHashID,
+			SourceInboundTag: source.Name, TargetLineUUID: target, OutboundTag: outboundTag, ArtifactSHA256: artifact},
+		PlanGraphRevision: srv.store.LineChainSnapshot().Revision}
+	if _, _, err := srv.store.PlanLineChainApproval(attempt, approval); err != nil {
+		t.Fatal(err)
+	}
+	approval.Status = model.ApprovalApproved
+	task := model.Task{ID: "catalogue-task-" + source.LineUUID, ApprovalID: approval.ID, Targets: []string{source.NodeID}, Script: "catalogue-fixture", Status: model.TaskQueued}
+	if _, committed, err := srv.store.ApproveLineChain(approval, task); err != nil || !committed {
+		t.Fatalf("approve chain of %s: committed=%v err=%v", source.LineUUID, committed, err)
+	}
+	accept := func(store.LineChainCompileStateSnapshot, model.Approval, store.LineChainAttempt, model.Task) error {
+		return nil
+	}
+	deliveries, err := srv.store.LeaseTaskDeliveriesWithLineChainValidator(source.NodeID, 1, false, true, accept)
+	if err != nil || len(deliveries) != 1 {
+		t.Fatalf("lease chain of %s: %d deliveries, err=%v", source.LineUUID, len(deliveries), err)
+	}
+	result := model.TaskResult{TaskID: task.ID, NodeID: source.NodeID, LeaseID: deliveries[0].Task.LeaseID, FinishedAt: time.Now().UTC()}
+	if committed, err := srv.store.CompleteLineChainTaskResult(result, approval, store.LineChainStatusAppliedUnobserved, "", ""); err != nil || !committed {
+		t.Fatalf("complete chain of %s: committed=%v err=%v", source.LineUUID, committed, err)
+	}
+	observed := map[string]store.LineChainObservation{source.LineUUID: {OutboundTag: outboundTag, DownstreamLineUUID: target}}
+	if committed, err := srv.store.ReconcileLineChains(observed); err != nil || !committed {
+		t.Fatalf("observe chain of %s: committed=%v err=%v", source.LineUUID, committed, err)
+	}
 }
 
 // read calls the catalogue the way a plugin's rpc:call reaches it.
@@ -208,6 +298,98 @@ func TestLineCataloguePagesEveryLineCredentialFree(t *testing.T) {
 	}
 }
 
+// catalogue_version is the selection's: it stays put when only a geo's
+// bookkeeping moves or when a row outside the selection changes, and moves
+// when a selected row does.
+func TestLineCatalogueVersionFollowsOnlyTheSelection(t *testing.T) {
+	e := catalogueFixture(t, 3, 2)
+	const de = `{"selector":{"countries":["DE"]}}`
+	version := func(request string) string { return e.read(t, request).CatalogueVersion }
+	edit := func(nodeID string, change func(*model.Node)) {
+		node, ok := e.st.Node(nodeID)
+		if !ok {
+			t.Fatalf("no node %s", nodeID)
+		}
+		change(&node)
+		if err := e.st.UpsertNode(node); err != nil {
+			t.Fatal(err)
+		}
+		e.srv.invalidateLineReadModel()
+	}
+	baseDE, baseAll := version(de), version("")
+
+	// node-000 is in DE. A geo re-read moves only Source and UpdatedAt.
+	edit("node-000", func(n *model.Node) {
+		geo := *n.Geo
+		geo.Source, geo.UpdatedAt = "rdap", e.now.Add(time.Hour)
+		n.Geo = &geo
+	})
+	if version(de) != baseDE || version("") != baseAll {
+		t.Fatal("a geo's Source and UpdatedAt moved catalogue_version")
+	}
+	// node-001 is in JP, outside the DE selection.
+	edit("node-001", func(n *model.Node) { n.Tags = append(n.Tags, "edge") })
+	if version("") == baseAll {
+		t.Fatal("the edit changed no row; the test tests nothing")
+	}
+	if version(de) != baseDE {
+		t.Fatal("a row outside the selection moved its catalogue_version")
+	}
+	edit("node-000", func(n *model.Node) { n.Tags = append(n.Tags, "edge") })
+	if version(de) == baseDE {
+		t.Fatal("a selected row changed and catalogue_version did not")
+	}
+}
+
+// A page is cut by bytes as well as rows: every page of a selection that does
+// not fit MaxLineCataloguePageBytes encodes within it, holds rows until the
+// next one would not fit, and the cursors walk every row once, in order.
+func TestLineCataloguePageSplitsAtTheByteBound(t *testing.T) {
+	version := lineCatalogueVersion("", nil)
+	var rows [][]byte
+	for i := range 240 {
+		rows = append(rows, fmt.Appendf(nil, `{"n":%d,"pad":%q}`, i, strings.Repeat("x", model.MaxLineCatalogueRowBytes/2+i*97)))
+	}
+	offset, pages := 0, 0
+	for {
+		body, more, err := lineCataloguePageOf(rows, version, offset, 0, offset == 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(body) > model.MaxLineCataloguePageBytes {
+			t.Fatalf("page %d encodes to %d bytes, bound %d", pages, len(body), model.MaxLineCataloguePageBytes)
+		}
+		var page lineCataloguePage
+		if err := json.Unmarshal(body, &page); err != nil || len(page.Rows) == 0 {
+			t.Fatalf("page %d: %d rows, %v", pages, len(page.Rows), err)
+		}
+		for i, row := range page.Rows {
+			if !bytes.Equal(row, rows[offset+i]) {
+				t.Fatalf("page %d row %d is not row %d", pages, i, offset+i)
+			}
+		}
+		end := offset + len(page.Rows)
+		if !more {
+			if end != len(rows) || page.Cursor != "" {
+				t.Fatalf("the last page ends at %d of %d with cursor %q", end, len(rows), page.Cursor)
+			}
+			break
+		}
+		// The page reserves room for the longest cursor this read can carry.
+		room := model.MaxLineCataloguePageBytes - len(body) - (len(strconv.Itoa(len(rows))) - len(strconv.Itoa(end)))
+		if 1+len(rows[end]) <= room {
+			t.Fatalf("page %d was cut at row %d with room for it", pages, end)
+		}
+		if next, v, err := parseLineCatalogueCursor(page.Cursor); err != nil || next != end || v != version {
+			t.Fatalf("page %d cursor %q: offset %d version %s err %v", pages, page.Cursor, next, v, err)
+		}
+		offset, pages = end, pages+1
+	}
+	if pages < 2 {
+		t.Fatalf("%d pages; the rows fit one page and the test tests nothing", pages+1)
+	}
+}
+
 // The plugin pushes only the fields a core advertises. A field this core
 // does not know is refused by name, and the refusal lists the fields it does
 // know, so a newer plugin learns what to run itself.
@@ -223,11 +405,37 @@ func TestLineCatalogueRefusesAnUnknownSelectorField(t *testing.T) {
 		t.Fatalf("the refusal lists %q", listed)
 	}
 	// Anything else malformed is a plain bad request.
-	for _, request := range []string{`{"identity":"x"}`, `{"limit":5000}`, `{"selector":{"countries":["DE"]},"selector":{}}`, `{"cursor":"nope"}`} {
+	for _, request := range []string{`{"identity":"x"}`, `{"limit":5000}`, `{"limit":1,"limit":2}`, `{"cursor":"nope"}`} {
 		_, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), []byte(request))
 		if apiErr := catalogueAPIError(t, err); apiErr.Code != model.APIErrorBadRequest {
 			t.Fatalf("%s: %+v", request, apiErr)
 		}
+	}
+}
+
+// A selector the core cannot read one way only is refused as a selector, with
+// the fields the core evaluates: given twice, under keys the decoder takes
+// for the same field, or naming a field twice. A later selector key must not
+// hide an unknown field in an earlier one, and two selectors must not merge.
+func TestLineCatalogueRefusesADuplicatedSelector(t *testing.T) {
+	e := catalogueFixture(t, 1, 1)
+	for _, request := range []string{
+		`{"selector":{"colour":["red"]},"selector":null}`,
+		`{"selector":{"countries":["DE"]},"selector":{}}`,
+		`{"selector":{"countries":["DE"]},"Selector":{"regions":["Region DE"]}}`,
+		`{"selector":{"countries":["DE"],"countries":["JP"]}}`,
+	} {
+		_, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), []byte(request))
+		apiErr := catalogueAPIError(t, err)
+		_, listed, ok := strings.Cut(apiErr.Message, "selector_fields: ")
+		if apiErr.Code != apiErrorCatalogueSelectorUnsupported || !strings.Contains(apiErr.Message, "more than once") ||
+			!ok || !slices.Equal(strings.Split(listed, ","), model.LineCatalogueSelectorFields()) {
+			t.Fatalf("%s: %+v", request, apiErr)
+		}
+	}
+	// One selector under a key the decoder folds to it is still read.
+	if got := e.read(t, `{"Selector":{"countries":["DE"]}}`).Rows; len(got) != 1 {
+		t.Fatalf("a single selector key in another case: %d rows", len(got))
 	}
 }
 
@@ -352,6 +560,98 @@ func TestLineCatalogueComposedRootTemplate(t *testing.T) {
 		if got := lineCataloguePathState(err); got != want {
 			t.Fatalf("path state of %v = %s, want %s", err, got, want)
 		}
+	}
+}
+
+// A committed chain read through the catalogue build: the root is the chain's
+// entry with root set, the committed target as its downstream, the terminal
+// node's geo as its exit geo, compose's verdict as its path state and the
+// composed entry as its template; the terminal is the exit and no root. When
+// the root's node stops reporting the committed downstream, the path state
+// says drifted while the committed edge still places the root.
+func TestLineCatalogueCommittedChainRoot(t *testing.T) {
+	e := catalogueFixture(t, 2, 2)
+	roots := catalogueChainRoots(t, e, 1)
+	catalogue, err := e.srv.buildLineCatalogue("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := catalogue.Select(nil)
+	root, single, terminal := rows[0], rows[1], rows[2]
+	if root.LineUUID != roots[0] || root.NodeID != "node-000" || terminal.NodeID != "node-001" {
+		t.Fatalf("rows: %s on %s, terminal on %s", root.LineUUID, root.NodeID, terminal.NodeID)
+	}
+	if root.Chain.Role != model.LineChainRoleEntry || !root.Chain.Root || root.Chain.DownstreamLineUUID != terminal.LineUUID ||
+		root.Chain.PathState != model.LinePathConverged || root.Chain.ExitGeo == nil || root.Chain.ExitGeo.Country != "JP" {
+		t.Fatalf("root chain = %+v", root.Chain)
+	}
+	if root.Template == nil || root.Template.Params["pbk"] != catalogueRealityPublicKey || root.Template.Params["sid"] != "0a1b" ||
+		root.Template.Host != catalogueNodeIP(0) || root.Template.Port != 20000 {
+		t.Fatalf("the root's template is not the composed entry: %+v", root.Template)
+	}
+	if bind, ok := catalogue.BindTemplate(root.LineUUID); !ok || bind.Params["pbk"] != catalogueRealityPublicKey {
+		t.Fatalf("root bind template = %+v %v", bind, ok)
+	}
+	if terminal.Chain.Role != model.LineChainRoleExit || terminal.Chain.Root || terminal.Chain.PathState != "" || terminal.Chain.ExitGeo != nil {
+		t.Fatalf("terminal chain = %+v", terminal.Chain)
+	}
+	if single.Chain.Role != model.LineChainRoleSingle || single.Chain.Root {
+		t.Fatalf("a line outside the chain = %+v", single.Chain)
+	}
+
+	e.srv.singboxInvMu.Lock()
+	inv := e.srv.singboxInv["node-000"]
+	for i := range inv.Nodes {
+		inv.Nodes[i].DownstreamLineUUID = ""
+	}
+	e.srv.singboxInv["node-000"] = inv
+	e.srv.singboxInvMu.Unlock()
+	e.srv.invalidateLineReadModel()
+	drifted, ok := e.read(t, "").Rows, false
+	for _, row := range drifted {
+		if row.LineUUID == root.LineUUID {
+			ok = true
+			if !row.Chain.Root || row.Chain.DownstreamLineUUID != terminal.LineUUID || row.Chain.PathState != model.LinePathDrifted {
+				t.Fatalf("drifted root chain = %+v", row.Chain)
+			}
+		}
+	}
+	if !ok {
+		t.Fatal("the drifted root left the catalogue")
+	}
+}
+
+// A node's groups, explicit members and selector matches alike, reach the rows
+// of its lines through the catalogue build, sorted, and group_ids selects by
+// them.
+func TestLineCatalogueRowsCarryTheNodeGroups(t *testing.T) {
+	e := catalogueFixture(t, 3, 2)
+	for _, g := range []model.Group{
+		{ID: "grp-pinned", Name: "Pinned", Slug: "pinned", Members: []string{"node-000", "node-002"}},
+		{ID: "grp-tier1", Name: "Tier 1", Slug: "tier-1", Selector: &model.GroupSelector{MatchTagsAny: []string{"tier-1"}}},
+		{ID: "grp-jp", Name: "Japan", Slug: "jp", Selector: &model.GroupSelector{MatchCountry: []string{"JP"}}},
+		{ID: "grp-empty", Name: "Empty", Slug: "empty", Selector: &model.GroupSelector{}},
+	} {
+		if err := e.st.UpsertGroup(g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	catalogue, err := e.srv.buildLineCatalogue("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{"node-000": {"grp-pinned"}, "node-001": {"grp-jp", "grp-tier1"}, "node-002": {"grp-pinned"}}
+	rows := catalogue.Select(nil)
+	if len(rows) != 6 {
+		t.Fatalf("%d rows", len(rows))
+	}
+	for _, row := range rows {
+		if !slices.Equal(row.GroupIDs, want[row.NodeID]) {
+			t.Fatalf("%s on %s carries groups %v, want %v", row.LineUUID, row.NodeID, row.GroupIDs, want[row.NodeID])
+		}
+	}
+	if got := e.read(t, `{"selector":{"group_ids":["grp-jp"]}}`).Rows; len(got) != 2 || got[0].NodeID != "node-001" || got[1].NodeID != "node-001" {
+		t.Fatalf("group_ids grp-jp selected %v", rowUUIDs(got))
 	}
 }
 
@@ -609,30 +909,99 @@ func TestLineCatalogueOperatorCallNeedsVPNCoreRead(t *testing.T) {
 	}
 }
 
-// One page of 1000 synthetic lines comes back whole; the benchmark below
-// times it against the 50 ms target.
+// One page of 1000 synthetic lines, ten of them committed chain roots, comes
+// back whole, and the deterministic gates of the performance gate rule hold
+// it: allocations per read, cold (the read model rebuilt, as the first read
+// after any fleet write) and warm, and the page's size. Each bound is about
+// one and a half times what was measured when it was set, with the measured
+// value beside it; CI runs this under -race -cover, which measured about 1.17
+// times the plain allocation counts. The benchmarks below time it against the
+// 50 ms target.
 func TestLineCatalogueThousandLinesInOnePage(t *testing.T) {
+	const (
+		// Measured 2026-10-09 on darwin/arm64, go1.26.6: 253,050 allocations
+		// a cold read, 294,600 under -race -cover.
+		coldAllocsBound = 380_000
+		// Measured the same day: 230,750 allocations a warm read, 272,300
+		// under -race -cover.
+		warmAllocsBound = 346_000
+		// Measured the same day: 778,587 bytes, about 779 a row.
+		pageBytesBound = 1_168_000
+	)
 	e := catalogueFixture(t, 50, 20)
+	roots := catalogueChainRoots(t, e, 10)
 	page := e.read(t, "")
 	if len(page.Rows) != 1000 || page.Cursor != "" {
 		t.Fatalf("1000 lines: %d rows, cursor %q", len(page.Rows), page.Cursor)
 	}
-	start := time.Now()
-	e.read(t, "")
-	t.Logf("one 1000-row page in %s", time.Since(start))
+	converged := 0
+	for _, row := range page.Rows {
+		if row.Chain.Root && row.Chain.PathState == model.LinePathConverged && row.Template != nil {
+			converged++
+		}
+	}
+	if converged != len(roots) {
+		t.Fatalf("%d of %d chain roots read converged with a composed entry; the chain work is not exercised", converged, len(roots))
+	}
+	request := []byte(`{}`)
+	body, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cold := testing.AllocsPerRun(5, func() {
+		e.srv.invalidateLineReadModel()
+		if _, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	})
+	warm := testing.AllocsPerRun(5, func() {
+		if _, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Logf("one 1000-row page: %d bytes, %.0f allocations cold, %.0f warm", len(body), cold, warm)
+	if len(body) > pageBytesBound {
+		t.Errorf("one 1000-row page is %d bytes, bound %d", len(body), pageBytesBound)
+	}
+	if cold > coldAllocsBound {
+		t.Errorf("a cold 1000-row read allocates %.0f times, bound %d", cold, coldAllocsBound)
+	}
+	if warm > warmAllocsBound {
+		t.Errorf("a warm 1000-row read allocates %.0f times, bound %d", warm, warmAllocsBound)
+	}
 }
 
+// One 1000-row page, warm (the read model served from its cache, as between
+// fleet writes) and cold (the read model rebuilt first, as the first read
+// after one).
 func BenchmarkLineCatalogueThousandLines(b *testing.B) {
+	benchmarkLineCatalogueThousandLines(b, 0)
+}
+
+// The same page over a fleet with ten committed chain roots, so the chain
+// state capture and compose's path walk run on every build.
+func BenchmarkLineCatalogueThousandLinesWithChainRoots(b *testing.B) {
+	benchmarkLineCatalogueThousandLines(b, 10)
+}
+
+func benchmarkLineCatalogueThousandLines(b *testing.B, chainRoots int) {
 	e := catalogueFixture(b, 50, 20)
+	catalogueChainRoots(b, e, chainRoots)
 	request := []byte(`{}`)
-	if _, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), request); err != nil {
-		b.Fatal(err)
-	}
-	b.ReportAllocs()
-	b.ResetTimer()
-	for b.Loop() {
-		if _, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), request); err != nil {
-			b.Fatal(err)
-		}
+	for _, mode := range []string{"warm", "cold"} {
+		b.Run(mode, func(b *testing.B) {
+			if _, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), request); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if mode == "cold" {
+					e.srv.invalidateLineReadModel()
+				}
+				if _, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), request); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

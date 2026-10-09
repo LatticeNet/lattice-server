@@ -42,7 +42,10 @@ import (
 //     (plan_rejected:<field>);
 //  3. its server is the template host, the line's provider edge, one of its
 //     verified DDNS names or one of the catalogue's addresses for it, and its
-//     port is the template port (plan_rejected:server, plan_rejected:port);
+//     port is the template port (plan_rejected:server, plan_rejected:port).
+//     Design 28 also admits a port inside the line's port-hopping range, but
+//     no template records one (see substoreBindCheckNode), so the port is
+//     the template's exactly;
 //  4. every other field is in the named mutable set or is one this file
 //     lists as carried without effect on where or how the client connects;
 //     anything else is plan_rejected:<field>. skip-cert-verify is in the
@@ -565,6 +568,12 @@ func substoreBindCheckNode(raw json.RawMessage, obj substoreNodeObject, node mod
 	if server, _ := obj.string("server"); !substoreBindServerAllowed(server, t, row) {
 		return "server"
 	}
+	// The port is the template's. Design 28's check admits a port inside the
+	// line's port-hopping range too, but no template carries a range to admit
+	// it from: the template builder keeps one port per share URL, refuses a
+	// URL whose authority holds a range, and drops a hysteria2 mport
+	// parameter, which makes the template lossy so the line never binds. A
+	// hopping range needs a field on the template before this can widen.
 	var port json.Number
 	if json.Unmarshal(obj.values["port"], &port) != nil || port.String() != strconv.Itoa(t.Port) {
 		return "port"

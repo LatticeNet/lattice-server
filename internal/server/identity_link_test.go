@@ -16,6 +16,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 const (
@@ -362,6 +363,88 @@ func TestIdentityLinkLeavesOutLinesWithoutTheCurrentCredential(t *testing.T) {
 			t.Fatalf("the named fix must file: %v", err)
 		}
 	}
+}
+
+// A line whose service is down, on which the identity is parked, whose
+// template dropped a parameter, or that the central proxy model manages is
+// left out of the identity's link, each with its reason and fix, and the
+// other line still serves.
+func TestIdentityLinkLeavesOutLinesByServiceParkingTemplateAndManagement(t *testing.T) {
+	excluded := func(t *testing.T, f *identityLinkFixture) map[string]identityLinkLine {
+		t.Helper()
+		u, _ := f.srv.getVpnUser("vpnuser_alice")
+		content := f.srv.identityLinkContent(u)
+		out := map[string]identityLinkLine{}
+		for _, line := range content.Excluded {
+			out[line.LineHashID] = line
+		}
+		if len(content.Entries) == 0 {
+			t.Fatalf("no line left in alice's link: %+v", content.Excluded)
+		}
+		return out
+	}
+	t.Run("service down", func(t *testing.T) {
+		f := newIdentityLinkFixture(t)
+		if _, _, err := f.srv.store.UpsertSingBoxLiveness(store.SingBoxLiveness{NodeID: "node-a", State: serviceStateRunning, ReceivedAt: f.srv.now()}); err != nil {
+			t.Fatal(err)
+		}
+		unbound := false
+		editSingBoxLine(t, f.srv, "node-a", "VLESS-REALITY-443.json", func(n *model.SingBoxNode) { n.PortBound = &unbound })
+		got := excluded(t, f)
+		if line := got[f.vless.LineHashID]; len(got) != 1 || line.Reason != identityLineServiceDown || line.Fix != identityFixCheckService {
+			t.Fatalf("exclusions %+v", got)
+		}
+	})
+	t.Run("parked", func(t *testing.T) {
+		f := newIdentityLinkFixture(t)
+		editSingBoxLine(t, f.srv, "node-a", "VLESS-REALITY-443.json", func(n *model.SingBoxNode) {
+			n.Metadata = map[string]string{singBoxParkedUsersKey: "1", singBoxParkedNamesKey: `["` + userLineName("vpnuser_alice", f.vless.LineUUID) + `"]`}
+		})
+		got := excluded(t, f)
+		if line := got[f.vless.LineHashID]; len(got) != 1 || line.Reason != identityLineParked || line.Fix != identityFixResume {
+			t.Fatalf("exclusions %+v", got)
+		}
+	})
+	t.Run("lossy template", func(t *testing.T) {
+		f := newIdentityLinkFixture(t)
+		editSingBoxLine(t, f.srv, "node-a", "Trojan-8443.json", func(n *model.SingBoxNode) {
+			n.ShareURL = strings.Replace(n.ShareURL, "#owner", "&obfs-password=x#owner", 1)
+		})
+		// A changed template is taken on the second sync that sees it.
+		for i := 0; i < 2; i++ {
+			if err := f.srv.syncLineClientTemplates(f.srv.now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		got := excluded(t, f)
+		if line := got[f.trojan.LineHashID]; len(got) != 1 || line.Reason != identityLineTemplateLossy || line.Detail != "obfs-password" {
+			t.Fatalf("exclusions %+v", got)
+		}
+	})
+	t.Run("managed", func(t *testing.T) {
+		f := newIdentityLinkFixture(t)
+		if err := f.srv.store.UpsertProxyInbound(model.ProxyInbound{ID: "in-managed", Name: "managed", Core: model.ProxyCoreSingbox, Protocol: "vless", Port: 9443, Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.srv.store.UpsertProxyNodeProfile(model.ProxyNodeProfile{NodeID: "node-a", Core: model.ProxyCoreSingbox, InboundIDs: []string{"in-managed"}}); err != nil {
+			t.Fatal(err)
+		}
+		f.srv.invalidateLineReadModel()
+		groups, _ := f.srv.lineReadModel()
+		managed := findLine(t, groups, "node-a", "in-managed")
+		if !managed.Managed {
+			t.Fatalf("line %+v is not managed", managed)
+		}
+		u, _ := f.srv.getVpnUser("vpnuser_alice")
+		u.Bindings = append(u.Bindings, LineBinding{LineHashID: managed.LineHashID, Enabled: true})
+		if err := f.srv.putVpnUser(u); err != nil {
+			t.Fatal(err)
+		}
+		got := excluded(t, f)
+		if line := got[managed.LineHashID]; len(got) != 1 || line.Reason != identityLineManaged {
+			t.Fatalf("exclusions %+v", got)
+		}
+	})
 }
 
 // Leak table rows 7 and 8, and rotation: a rotated or revoked token, and a

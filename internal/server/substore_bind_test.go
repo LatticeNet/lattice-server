@@ -3,6 +3,8 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -143,6 +145,15 @@ func (e *bindEnv) selection() map[string]bool {
 // is the selection of every fixture row.
 func (e *bindEnv) bindRun(t testing.TB, plan model.SelectionPlan, selected map[string]bool) substoreBindResult {
 	t.Helper()
+	return e.bindRunWith(t, plan, selected, nil)
+}
+
+// bindRunWith is bindRun with edit applied to the fresh catalogue before the
+// bind, for a line state the catalogue fixture cannot report, such as a
+// committed chain root. The build is the test's own, so editing it touches
+// nothing the server holds.
+func (e *bindEnv) bindRunWith(t testing.TB, plan model.SelectionPlan, selected map[string]bool, edit func(*lineCatalogue)) substoreBindResult {
+	t.Helper()
 	if selected == nil {
 		selected = e.selection()
 	}
@@ -157,6 +168,9 @@ func (e *bindEnv) bindRun(t testing.TB, plan model.SelectionPlan, selected map[s
 	catalogue, err := e.srv.buildLineCatalogue("")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if edit != nil {
+		edit(catalogue)
 	}
 	u, ok := e.srv.getVpnUser(bindIdentityID)
 	if !ok {
@@ -530,6 +544,168 @@ func TestSubstoreBindAppliesTheLineAndIdentityChecks(t *testing.T) {
 	}
 	if got := e.bindRun(t, bindNodesPlan(t, e.rows[3:4]), selected).reasons()[0]; got != "plan_rejected:line_uuid" {
 		t.Fatalf("an unselected line: %q", got)
+	}
+}
+
+// editSingBoxLine edits one line of a node's live inventory, as the node's
+// next report would carry it, and drops the read model built from the old
+// report.
+func editSingBoxLine(t testing.TB, srv *Server, nodeID, name string, edit func(*model.SingBoxNode)) {
+	t.Helper()
+	srv.singboxInvMu.Lock()
+	inv := srv.singboxInv[nodeID]
+	inv.Nodes = slices.Clone(inv.Nodes)
+	found := false
+	for i := range inv.Nodes {
+		if inv.Nodes[i].Name == name {
+			edit(&inv.Nodes[i])
+			found = true
+		}
+	}
+	srv.singboxInv[nodeID] = inv
+	srv.singboxInvMu.Unlock()
+	if !found {
+		t.Fatalf("node %s reports no line %s", nodeID, name)
+	}
+	srv.invalidateLineReadModel()
+}
+
+// The identity link's operational exclusions reach the bind step with the
+// same reasons, from the state the catalogue reads: the line's service down,
+// the identity parked on the line, a lossy template. A committed chain root
+// is checked for its service and then for its path state; a converged root
+// binds.
+func TestSubstoreBindExcludesByServiceParkingTemplateAndPathState(t *testing.T) {
+	e := bindFixture(t, 2, 4)
+	for _, node := range []string{"node-000", "node-001"} {
+		if _, _, err := e.st.UpsertSingBoxLiveness(store.SingBoxLiveness{NodeID: node, State: serviceStateRunning, ReceivedAt: e.now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Lines 0 and 6: a running service that does not hold a line's port is
+	// down for that line.
+	unbound := false
+	editSingBoxLine(t, e.srv, "node-000", "vless-20000", func(n *model.SingBoxNode) { n.PortBound = &unbound })
+	editSingBoxLine(t, e.srv, "node-001", "vless-20002", func(n *model.SingBoxNode) { n.PortBound = &unbound })
+	// Line 1: the identity's user is parked on the line.
+	editSingBoxLine(t, e.srv, "node-000", "vless-20001", func(n *model.SingBoxNode) {
+		n.Metadata = map[string]string{singBoxParkedUsersKey: "1", singBoxParkedNamesKey: `["` + userLineName(bindIdentityID, e.rows[1].LineUUID) + `"]`}
+	})
+	// Line 2: the share URL gains a parameter the template drops. A changed
+	// template is taken on the second sync that sees it.
+	editSingBoxLine(t, e.srv, "node-000", "vless-20002", func(n *model.SingBoxNode) {
+		n.ShareURL = strings.Replace(n.ShareURL, "#owner", "&obfs-password=x#owner", 1)
+	})
+	for i := 0; i < 2; i++ {
+		if err := e.srv.syncLineClientTemplates(e.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Lines 4 to 7 are committed chain roots.
+	roots := map[string]string{e.rows[4].LineUUID: model.LinePathBusy, e.rows[5].LineUUID: model.LinePathDrifted,
+		e.rows[6].LineUUID: model.LinePathConverged, e.rows[7].LineUUID: model.LinePathConverged}
+	result := e.bindRunWith(t, bindNodesPlan(t, e.rows), nil, func(c *lineCatalogue) {
+		for lineUUID, state := range roots {
+			c.rows[c.index[lineUUID]].Chain = model.LineCatalogueChain{Role: model.LineChainRoleEntry, Root: true, PathState: state}
+		}
+	})
+	want := map[int]string{0: identityLineServiceDown, 1: identityLineParked, 2: identityLineTemplateLossy,
+		4: substoreBindReasonGraphBusy, 5: substoreBindReasonGraphDrifted, 6: identityLineServiceDown}
+	if got := result.reasons(); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("exclusions %v, want %v", got, want)
+	}
+	if result.Refused != "" || len(result.nodes) != 2 || result.Entries[0].Index != 3 || result.Entries[1].Index != 7 {
+		t.Fatalf("refused %q, %d nodes, entries %+v", result.Refused, len(result.nodes), result.Entries)
+	}
+	for _, x := range result.Excluded {
+		switch {
+		case x.Index == 0 && x.Fix != identityFixCheckService, x.Index == 1 && x.Fix != identityFixResume, x.Index == 2 && x.Detail != "obfs-password":
+			t.Fatalf("exclusion %+v", x)
+		}
+	}
+}
+
+// A managed line is excluded at the bind step for having no template, since
+// the template sync never writes one for it. With a stored template (an
+// imported or hand-made record) it reaches the identity link's managed rule.
+func TestSubstoreBindExcludesAManagedLine(t *testing.T) {
+	e := bindFixture(t, 1, 1)
+	if err := e.st.UpsertProxyInbound(model.ProxyInbound{ID: "in-managed", Name: "managed", Core: model.ProxyCoreSingbox, Protocol: "vless", Port: 30000, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.UpsertProxyNodeProfile(model.ProxyNodeProfile{NodeID: "node-000", Core: model.ProxyCoreSingbox, InboundIDs: []string{"in-managed"}}); err != nil {
+		t.Fatal(err)
+	}
+	e.srv.invalidateLineReadModel()
+	var managed Line
+	_, index := e.srv.lineReadModel()
+	for _, ln := range index {
+		if ln.Managed {
+			managed = ln
+		}
+	}
+	if managed.LineUUID == "" {
+		t.Fatal("the managed line has no line_uuid")
+	}
+	u := e.identity
+	u.Bindings = append(u.Bindings, LineBinding{LineHashID: managed.LineHashID, Enabled: true})
+	if err := e.srv.putVpnUser(u); err != nil {
+		t.Fatal(err)
+	}
+	// The node is the fixture line's, moved onto the managed line.
+	row := e.rows[0]
+	row.LineUUID = managed.LineUUID
+	reason := func() string {
+		plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes, Nodes: []model.SelectionPlanNode{
+			bindNode(t, row, bindPlaceholder(t, row.LineUUID, "uuid"), nil)}}
+		return e.bindRun(t, plan, map[string]bool{managed.LineUUID: true}).reasons()[0]
+	}
+	if got := reason(); got != identityLineNoTemplate {
+		t.Fatalf("a managed line without a template: %q", got)
+	}
+	var set []store.LineClientTemplate
+	for _, tmpl := range e.st.LineClientTemplates() {
+		if tmpl.NodeID == "node-000" {
+			set = append(set, tmpl)
+		}
+	}
+	planted := set[0]
+	planted.Params = maps.Clone(planted.Params)
+	planted.LineHashID, planted.Tag, planted.LineUUID = managed.LineHashID, managed.Tag, managed.LineUUID
+	if _, err := e.st.SyncLineClientTemplates(map[string][]store.LineClientTemplate{"node-000": append(set, planted)}, e.now); err != nil {
+		t.Fatal(err)
+	}
+	if got := reason(); got != identityLineManaged {
+		t.Fatalf("a managed line with a stored template: %q", got)
+	}
+}
+
+// Design 28's check admits a node port inside a line's port-hopping range,
+// but no template carries one: the builder refuses a share URL whose
+// authority holds a range and drops mport, which makes the template lossy so
+// the line never binds. The binder therefore holds a node to the template
+// port.
+func TestSubstoreBindHoldsTheTemplatePortWithoutAHoppingRange(t *testing.T) {
+	if _, err := lineClientTemplateFromShareURL("hysteria2://hop-secret-pass@203.0.113.9:20000-30000/?sni=h.example", "hysteria2"); err == nil {
+		t.Fatal("a share url with a port range built a template")
+	}
+	tmpl, err := lineClientTemplateFromShareURL("hysteria2://hop-secret-pass@203.0.113.9:443/?sni=h.example&mport=20000-30000", "hysteria2")
+	if err != nil || tmpl.Port != 443 || !tmpl.Lossy() || !slices.Equal(tmpl.Dropped, []string{"mport"}) {
+		t.Fatalf("a share url with mport: %+v %v", tmpl, err)
+	}
+	e := bindFixture(t, 1, 1)
+	row := e.rows[0]
+	line := e.lineFor(t, row, store.LineClientTemplate{Protocol: "hysteria2", Host: "203.0.113.9", Port: 443, Params: map[string]string{"sni": "h.example"}})
+	node := func(port int) model.SelectionPlanNode {
+		p := bindPlaceholder(t, row.LineUUID, "password")
+		return model.SelectionPlanNode{LineUUID: row.LineUUID, Placeholders: map[string]string{"password": p},
+			Node: json.RawMessage(fmt.Sprintf(`{"name":"hy2","type":"hysteria2","server":"203.0.113.9","port":%d,"password":%q,"sni":"h.example"}`, port, p))}
+	}
+	if got := bindCheck(t, node(443), line); got != "" {
+		t.Fatalf("the template port: %q", got)
+	}
+	if got := bindCheck(t, node(20001), line); got != "port" {
+		t.Fatalf("a port a hopping range would hold: %q", got)
 	}
 }
 

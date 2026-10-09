@@ -223,11 +223,37 @@ func TestLineCatalogueRefusesAnUnknownSelectorField(t *testing.T) {
 		t.Fatalf("the refusal lists %q", listed)
 	}
 	// Anything else malformed is a plain bad request.
-	for _, request := range []string{`{"identity":"x"}`, `{"limit":5000}`, `{"selector":{"countries":["DE"]},"selector":{}}`, `{"cursor":"nope"}`} {
+	for _, request := range []string{`{"identity":"x"}`, `{"limit":5000}`, `{"limit":1,"limit":2}`, `{"cursor":"nope"}`} {
 		_, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), []byte(request))
 		if apiErr := catalogueAPIError(t, err); apiErr.Code != model.APIErrorBadRequest {
 			t.Fatalf("%s: %+v", request, apiErr)
 		}
+	}
+}
+
+// A selector the core cannot read one way only is refused as a selector, with
+// the fields the core evaluates: given twice, under keys the decoder takes
+// for the same field, or naming a field twice. A later selector key must not
+// hide an unknown field in an earlier one, and two selectors must not merge.
+func TestLineCatalogueRefusesADuplicatedSelector(t *testing.T) {
+	e := catalogueFixture(t, 1, 1)
+	for _, request := range []string{
+		`{"selector":{"colour":["red"]},"selector":null}`,
+		`{"selector":{"countries":["DE"]},"selector":{}}`,
+		`{"selector":{"countries":["DE"]},"Selector":{"regions":["Region DE"]}}`,
+		`{"selector":{"countries":["DE"],"countries":["JP"]}}`,
+	} {
+		_, err := e.srv.vpnCoreLinesCatalogueRPC(context.Background(), []byte(request))
+		apiErr := catalogueAPIError(t, err)
+		_, listed, ok := strings.Cut(apiErr.Message, "selector_fields: ")
+		if apiErr.Code != apiErrorCatalogueSelectorUnsupported || !strings.Contains(apiErr.Message, "more than once") ||
+			!ok || !slices.Equal(strings.Split(listed, ","), model.LineCatalogueSelectorFields()) {
+			t.Fatalf("%s: %+v", request, apiErr)
+		}
+	}
+	// One selector under a key the decoder folds to it is still read.
+	if got := e.read(t, `{"Selector":{"countries":["DE"]}}`).Rows; len(got) != 1 {
+		t.Fatalf("a single selector key in another case: %d rows", len(got))
 	}
 }
 

@@ -113,11 +113,12 @@ type SystemRunnerOptions struct {
 	// Nil observes nothing. The observer must be cheap and must not call back
 	// into the runner.
 	PoolObserver SystemPoolObserver
-	// ProcessObserver receives what a plugin process used, from the kernel's
-	// accounting when it exits: user plus system CPU time and peak resident
-	// set. A per-invocation process reports when the invocation ends; a
-	// pooled worker when it retires, so its CPU lands in the minute it
-	// leaves. Nil observes nothing. It must be cheap and must not call back
+	// ProcessObserver receives what a plugin process used when it exits:
+	// user plus system CPU time from the kernel's accounting, and its peak
+	// resident set, which on Linux is the largest VmHWM sampled while it ran
+	// (see processPeak) and elsewhere the exit rusage. A per-invocation
+	// process reports when the invocation ends; a pooled worker when it
+	// retires, so its CPU lands in the minute it leaves. Nil observes nothing. It must be cheap and must not call back
 	// into the runner.
 	ProcessObserver func(pluginID string, cpu time.Duration, maxRSSBytes int64)
 }
@@ -1246,10 +1247,15 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 	_ = stderrW.Close()
 	_ = hostRespR.Close()
 	defer stdout.Close()
+	observe := r.processExitFor(req.PluginID)
+	var peak *processPeak
+	if observe != nil {
+		peak = watchProcessPeak(cmd.Process.Pid)
+	}
 	go func() {
 		waitErr = cmd.Wait()
-		if observe := r.processExitFor(req.PluginID); observe != nil {
-			observe(cmd.ProcessState)
+		if observe != nil {
+			observe(cmd.ProcessState, peak.finish())
 		}
 		close(waitDone)
 	}()
@@ -1312,6 +1318,9 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 			continue
 		}
 
+		// The process has answered; it may already have exited, which reads
+		// as nothing and keeps the earlier samples.
+		peak.sample()
 		var reply systemRunnerReply
 		if err := json.Unmarshal(line, &reply); err != nil {
 			return abort(fmt.Errorf("decode plugin response: %w", err))

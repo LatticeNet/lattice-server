@@ -234,28 +234,30 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 // systemWorkerTransport owns one persistent worker process and all descriptors.
 // It is intentionally independent of the evolving SDK session API.
 type systemWorkerTransport struct {
-	cmd                *exec.Cmd
-	stdin              *os.File
-	stdout             *os.File
-	hostResp           *os.File
-	stderr             *os.File
-	pgid               int
-	scanner            *bufio.Scanner
-	frames             chan transportFrame
-	done               chan struct{}
-	waitDone           chan struct{}
-	readDone           chan struct{}
-	waitMu             sync.Mutex
-	waitErr            error
-	requestOnce        sync.Once
-	abortDone          chan struct{}
-	abortErr           error
-	requestErr         error
-	abortStage         string
-	ownedTerm          bool
-	ownedKill          bool
-	groupOnce          sync.Once
-	groupDone          chan struct{}
+	cmd         *exec.Cmd
+	stdin       *os.File
+	stdout      *os.File
+	hostResp    *os.File
+	stderr      *os.File
+	pgid        int
+	scanner     *bufio.Scanner
+	frames      chan transportFrame
+	done        chan struct{}
+	waitDone    chan struct{}
+	readDone    chan struct{}
+	waitMu      sync.Mutex
+	waitErr     error
+	requestOnce sync.Once
+	abortDone   chan struct{}
+	abortErr    error
+	requestErr  error
+	abortStage  string
+	ownedTerm   bool
+	ownedKill   bool
+	groupOnce   sync.Once
+	groupDone   chan struct{}
+	// peak samples the worker's own peak resident set; nil when unobserved.
+	peak               *processPeak
 	groupErr           error
 	stderrDone         chan struct{}
 	readPumpErr        error
@@ -404,8 +406,9 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 }
 
 // startSystemWorkerObserved is startSystemWorker with onExit called with the
-// worker's process state once it has been reaped. A nil onExit is allowed.
-func startSystemWorkerObserved(ctx context.Context, path, dir string, env []string, onExit func(*os.ProcessState)) (*systemWorkerTransport, error) {
+// worker's process state and its own sampled peak resident set once it has
+// been reaped. A nil onExit is allowed and samples nothing.
+func startSystemWorkerObserved(ctx context.Context, path, dir string, env []string, onExit func(*os.ProcessState, int64)) (*systemWorkerTransport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -461,10 +464,13 @@ func startSystemWorkerObserved(ctx context.Context, path, dir string, env []stri
 	_ = stderrW.Close()
 	_ = hostRead.Close()
 	t := &systemWorkerTransport{cmd: cmd, stdin: stdinW, stdout: stdoutR, hostResp: hostWrite, stderr: stderrR, pgid: cmd.Process.Pid, scanner: bufio.NewScanner(stdoutR), frames: make(chan transportFrame, 1), done: make(chan struct{}), waitDone: make(chan struct{}), readDone: make(chan struct{}), stderrDone: make(chan struct{}), groupDone: make(chan struct{}), abortDone: make(chan struct{})}
+	if onExit != nil {
+		t.peak = watchProcessPeak(cmd.Process.Pid)
+	}
 	go func() {
 		err := cmd.Wait()
 		if onExit != nil {
-			onExit(cmd.ProcessState)
+			onExit(cmd.ProcessState, t.peak.finish())
 		}
 		t.waitMu.Lock()
 		t.waitErr = err
@@ -490,6 +496,9 @@ func (t *systemWorkerTransport) requestAbort() {
 		return
 	}
 	t.requestOnce.Do(func() {
+		// A last look at the worker's peak before it is signalled; a worker
+		// that already exited reads as nothing.
+		t.peak.sample()
 		close(t.done)
 		t.waitMu.Lock()
 		t.abortStage = "term-grace"

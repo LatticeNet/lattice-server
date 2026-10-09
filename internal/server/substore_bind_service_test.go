@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
@@ -178,6 +181,126 @@ func TestSubstoreBindRevealEntryNeedsStepUpAndIsAudited(t *testing.T) {
 	}
 	if !excludedAudited {
 		t.Fatal("an excluded line's refusal must be audited")
+	}
+}
+
+// reveal_entry reached the way the console reaches it: through the plugin
+// gateway, under a manifest that declares it at vpncore:admin. The gateway
+// refuses an operator without that scope, the step-up gate holds, every call
+// is audited by the gateway beside the reveal's own record, and core still
+// refuses vpncore:read when a manifest under-declares the method.
+func TestSubstoreBindRevealEntryThroughThePluginGateway(t *testing.T) {
+	env := bindFixture(t, 1, 2)
+	s := env.srv
+	line := env.rows[0].LineUUID
+	install := func(scope string) {
+		manifest := e2eManifest(t)
+		for i := range manifest.Interfaces {
+			if c := &manifest.Interfaces[i]; c.Service == substoreBindService {
+				c.MethodSpecs = append(c.MethodSpecs, plugin.InterfaceMethod{Name: "reveal_entry", Effect: plugin.InterfaceEffectRead, Scopes: []string{scope}})
+			}
+		}
+		if err := plugin.ValidateManifest(manifest); err != nil {
+			t.Fatal(err)
+		}
+		s.plugins = []plugin.Loaded{{Manifest: manifest, Capabilities: manifest.Capabilities}}
+	}
+	install("vpncore:admin")
+	if err := env.st.UpsertPluginInstallation(model.PluginInstallation{ID: subStorePluginID, Name: "Sub-Store", Type: plugin.TypeSystem,
+		Status: model.PluginStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	gateway := func(p principal, grant string) (int, []byte) {
+		body, _ := json.Marshal(map[string]any{"id": subStorePluginID, "service": substoreBindService, "method": "reveal_entry",
+			"payload": map[string]string{"identity_id": bindIdentityID, "line_uuid": line, "step_up_grant": grant}})
+		req := httptest.NewRequest(http.MethodPost, "/api/plugins/call", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		s.handlePluginCall(rec, req, p)
+		return rec.Code, rec.Body.Bytes()
+	}
+	// audits counts the gateway's plugin.call records and the reveal's own.
+	audits := func(action, decision string) int {
+		n := 0
+		for _, ev := range env.st.AuditEvents() {
+			if ev.Action != action || ev.Decision != decision {
+				continue
+			}
+			if action == "plugin.call" && (ev.Metadata["service"] != substoreBindService || ev.Metadata["method"] != "reveal_entry") {
+				continue
+			}
+			if action == auditActionSubstoreBindRevealEntry && ev.Metadata["line_uuid"] != line {
+				continue
+			}
+			n++
+		}
+		return n
+	}
+	admin := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"vpncore:admin"}}, sessionID: "sess-reveal"}
+	reader := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"vpncore:read"}}, sessionID: "sess-reveal"}
+	grant, _, err := s.issueStepUpGrant(admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The gateway asks for the scope the manifest declares.
+	if code, body := gateway(reader, grant); code != http.StatusForbidden || carriesCredential(string(body), bindIdentityUUID) {
+		t.Fatalf("reveal_entry at vpncore:read through the gateway: %d %s", code, body)
+	}
+	scopeDenied := false
+	for _, ev := range env.st.AuditEvents() {
+		if ev.Action == "plugin.call" && ev.Decision == "deny" && ev.Metadata["method"] == "reveal_entry" && ev.Reason == "missing scope vpncore:admin" {
+			scopeDenied = true
+		}
+	}
+	if !scopeDenied || audits(auditActionSubstoreBindRevealEntry, "deny") != 0 {
+		t.Fatal("the gateway's scope refusal must be its own, and audited")
+	}
+
+	// Without step-up the reveal gate refuses, and the gateway and the
+	// reveal both record it.
+	code, body := gateway(admin, "")
+	var refusal model.APIErrorResponse
+	if code != http.StatusForbidden || json.Unmarshal(body, &refusal) != nil || refusal.Error.Code != apiErrorStepUpRequired ||
+		carriesCredential(string(body), bindIdentityUUID) {
+		t.Fatalf("a reveal without step-up through the gateway: %d %s", code, body)
+	}
+	if audits("plugin.call", "deny") != 2 || audits(auditActionSubstoreBindRevealEntry, "deny") != 1 {
+		t.Fatal("a reveal refused for step-up must be audited by the gateway and by the reveal")
+	}
+
+	// With step-up the URI comes back, audited by both, and no audit record
+	// holds it.
+	code, body = gateway(admin, grant)
+	if code != http.StatusOK {
+		t.Fatalf("a stepped-up reveal through the gateway: %d %s", code, body)
+	}
+	var reply substoreBindRevealEntryReply
+	if err := json.Unmarshal(body, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(reply.URI, "vless://"+bindIdentityUUID+"@"+env.rows[0].Template.Host+":") || reply.LineUUID != line {
+		t.Fatalf("reply %+v", reply)
+	}
+	if audits("plugin.call", "allow") != 1 || audits(auditActionSubstoreBindRevealEntry, "allow") != 1 {
+		t.Fatal("an allowed reveal must be audited by the gateway and by the reveal")
+	}
+	for _, ev := range env.st.AuditEvents() {
+		raw, _ := json.Marshal(ev)
+		if strings.Contains(string(raw), reply.URI) || carriesCredential(string(raw), bindIdentityUUID) {
+			t.Fatalf("an audit record holds the URI or the credential: %s", raw)
+		}
+	}
+
+	// Core does not take the manifest's word for the scope: under one that
+	// declares reveal_entry at vpncore:read, a stepped-up vpncore:read
+	// operator passes the gateway and is still refused.
+	install("vpncore:read")
+	if code, body := gateway(reader, grant); code != http.StatusForbidden || carriesCredential(string(body), bindIdentityUUID) {
+		t.Fatalf("an under-declared reveal_entry at vpncore:read: %d %s", code, body)
+	}
+	if audits(auditActionSubstoreBindRevealEntry, "allow") != 1 {
+		t.Fatal("an under-declared reveal was recorded as a reveal")
 	}
 }
 

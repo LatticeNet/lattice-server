@@ -130,7 +130,9 @@ func (s *Server) servePluginSharePlaceholder(w http.ResponseWriter, r *http.Requ
 		return true
 	}
 	if sealed {
-		served = identityLinkBody{body: sealedBody, wireType: subStoreSvcAgeWireType, cacheHit: served.cacheHit, fallback: served.fallback}
+		// The body is age armor now, not the base64 URI list a converter
+		// fallback names, so the fallback header is not sent.
+		served = identityLinkBody{body: sealedBody, wireType: subStoreSvcAgeWireType, cacheHit: served.cacheHit}
 	}
 
 	header := w.Header()

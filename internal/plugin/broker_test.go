@@ -111,8 +111,10 @@ func TestBrokerOperatorTargetHTTPIsSeparateSystemOnlyCapability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// PUT: a write is admitted on every method, so this test stays about the
+	// capability and the target binding (GET is artifact.restore's alone).
 	resp, err := broker.HTTPOperatorDo(boundCtx, HostHTTPRequest{
-		Method: "GET", URL: "http://127.0.0.1:3000/secret",
+		Method: "PUT", URL: "http://127.0.0.1:3000/secret",
 	})
 	if err != nil || resp.StatusCode != 202 || services.operatorHTTPCalls != 1 {
 		t.Fatalf("operator-target call failed: response=%+v calls=%d err=%v", resp, services.operatorHTTPCalls, err)
@@ -121,7 +123,7 @@ func TestBrokerOperatorTargetHTTPIsSeparateSystemOnlyCapability(t *testing.T) {
 	if len(services.events) != 1 || !reflect.DeepEqual(services.events[0], want) {
 		t.Fatalf("operator-target audit=%+v want %+v", services.events, want)
 	}
-	if _, err := broker.HTTPOperatorDo(context.Background(), HostHTTPRequest{Method: "GET", URL: "http://127.0.0.1:3000/secret"}); err == nil || !strings.Contains(err.Error(), "not bound") {
+	if _, err := broker.HTTPOperatorDo(context.Background(), HostHTTPRequest{Method: "PUT", URL: "http://127.0.0.1:3000/secret"}); err == nil || !strings.Contains(err.Error(), "not bound") {
 		t.Fatalf("unbound operator target must be denied, got %v", err)
 	}
 	if services.operatorHTTPCalls != 1 {

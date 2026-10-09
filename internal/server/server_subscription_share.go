@@ -143,10 +143,13 @@ func (s *Server) resolveShare(slug, token string, now time.Time) (model.Subscrip
 }
 
 const (
-	// subscriptionCacheEntries bounds the rendered-body cache. classifyClientUA
-	// bounds the classes per share, so this is a share-count budget rather than a
-	// defence against key explosion.
+	// subscriptionCacheEntries is the entry bound test servers give their
+	// rendered-body cache. The server's own cache is sized by bytes
+	// (subscriptionBodyCacheBytes), because a share's documents range from a
+	// few kilobytes to megabytes and an entry count bounds neither.
 	subscriptionCacheEntries = 512
+	// subscriptionBodyCacheBytes bounds the rendered-body cache.
+	subscriptionBodyCacheBytes = 64 << 20
 	// subscriptionCacheTTL is the revalidation cadence, not the freshness bound:
 	// an expired entry whose content hash still matches is extended without a
 	// re-render, so the engine only ever runs when the content actually moved.
@@ -230,7 +233,9 @@ func subscriptionResponseContentType(format, target string) string {
 //   - resolve the token through the store's HMAC index, one rule for every
 //     kind (exactly one match, or the decoy);
 //   - decide reachability (enabled, unexpired; for an identity, its policy
-//     state) and refuse with the decoy, audited through the refusal throttle;
+//     state) and refuse with the decoy, audited through the refusal throttle,
+//     except that a known plugin share in a policy state answers with one
+//     placeholder entry naming the state (share_placeholder.go);
 //   - plan the render (planShareRender): the client target, the envelope, and
 //     a cache key that holds only what changes the bytes;
 //   - look the body up against the source's current content version
@@ -270,6 +275,15 @@ func (s *Server) handleSubscriptionShare(w http.ResponseWriter, r *http.Request)
 	requested := r.URL.Query().Get("format")
 	if strings.TrimSpace(requested) != "" && !subscriptionFormatIsKnown(requested) {
 		deny("invalid subscription format", map[string]string{"slug": slug, "token_sha256": tokenHash})
+		return
+	}
+
+	// A known plugin share whose share or identity is in a policy state gets
+	// one readable placeholder entry instead of the decoy (share_placeholder.go).
+	// It runs before the route check because a share's route facts, enabled
+	// and expiry, are two of those states; the slug it requires is the share's
+	// whole route, which is projected as /sub/<slug> on every host.
+	if s.servePluginSharePlaceholder(w, r, slug, token, tokenHash, requested, deny) {
 		return
 	}
 

@@ -61,10 +61,10 @@ const (
 	identityLinkStatsPrefix = "identity:"
 	// identityLinkSlugPrefix starts a default slug.
 	identityLinkSlugPrefix = "u-"
-	// identityLinkCacheEntries bounds converted identity documents; about
-	// four client families for a hundred identities, kept apart from the
-	// share cache so identity traffic cannot evict share bodies.
-	identityLinkCacheEntries = 512
+	// identityLinkBodyCacheBytes bounds converted identity documents by
+	// their bytes (newSubscriptionByteCache), kept apart from the share
+	// cache so identity traffic cannot evict share bodies.
+	identityLinkBodyCacheBytes = 64 << 20
 	// identityLinkCacheTTL is long because the key carries the content
 	// digest: an entry is only ever exact or unreachable.
 	identityLinkCacheTTL = 6 * time.Hour

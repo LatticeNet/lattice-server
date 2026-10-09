@@ -1246,10 +1246,15 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 	_ = stderrW.Close()
 	_ = hostRespR.Close()
 	defer stdout.Close()
+	observe := r.processExitFor(req.PluginID)
+	var peak *processPeak
+	if observe != nil {
+		peak = watchProcessPeak(cmd.Process.Pid)
+	}
 	go func() {
 		waitErr = cmd.Wait()
-		if observe := r.processExitFor(req.PluginID); observe != nil {
-			observe(cmd.ProcessState)
+		if observe != nil {
+			observe(cmd.ProcessState, peak.finish())
 		}
 		close(waitDone)
 	}()
@@ -1312,6 +1317,8 @@ func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, exe
 			continue
 		}
 
+		// The process has answered and is about to exit: its peak is in place.
+		peak.sample()
 		var reply systemRunnerReply
 		if err := json.Unmarshal(line, &reply); err != nil {
 			return abort(fmt.Errorf("decode plugin response: %w", err))

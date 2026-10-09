@@ -24,12 +24,21 @@ func TestProcessExitReportsKernelAccounting(t *testing.T) {
 	if err := cmd.Run(); err != nil {
 		t.Fatal(err)
 	}
-	r.processExitFor("latticenet.example")(cmd.ProcessState)
+	const sampled = 5 << 20
+	r.processExitFor("latticenet.example")(cmd.ProcessState, sampled)
 	if len(got) != 1 || got[0].pluginID != "latticenet.example" {
 		t.Fatalf("observed %+v", got)
 	}
-	if got[0].cpu <= 0 || got[0].rss < 1<<20 {
-		t.Fatalf("a Go test binary used %v CPU and peaked at %d bytes; want both measured", got[0].cpu, got[0].rss)
+	if got[0].cpu <= 0 {
+		t.Fatalf("a Go test binary used %v CPU; want it measured", got[0].cpu)
+	}
+	// Linux reports the sampled peak, never the exit rusage (see processPeak);
+	// elsewhere the rusage is all there is.
+	if processPeakFromProc && got[0].rss != sampled {
+		t.Fatalf("peak %d; want the sampled %d", got[0].rss, sampled)
+	}
+	if !processPeakFromProc && got[0].rss < 1<<20 {
+		t.Fatalf("a Go test binary peaked at %d bytes; want it measured", got[0].rss)
 	}
 	// No observer: no hook, so the runner adds nothing to a process exit.
 	if (&SystemRunner{}).processExitFor("p") != nil {
@@ -45,7 +54,7 @@ func TestPooledWorkerReportsItsExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := append(os.Environ(), "LATTICE_TEST_V2_HELPER=1")
-	worker, err := startSystemWorkerObserved(t.Context(), os.Args[0], dir, env, func(st *os.ProcessState) {
+	worker, err := startSystemWorkerObserved(t.Context(), os.Args[0], dir, env, func(st *os.ProcessState, _ int64) {
 		mu.Lock()
 		states = append(states, st)
 		mu.Unlock()

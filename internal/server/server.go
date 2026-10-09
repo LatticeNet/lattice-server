@@ -391,6 +391,9 @@ type Server struct {
 	// latencyEdges holds the provider edge names the control plane resolved
 	// for the latency probes; see latency_edges.go.
 	latencyEdges latencyEdgeCache
+	// substoreCatalogue is the state the core keeps for the native
+	// Sub-Store (design 28); see line_catalogue.go.
+	substoreCatalogue substoreCatalogueState
 	// notifyDeliveries counts deliveries still running, so Close can wait
 	// for them.
 	notifyDeliveries notifyInflight
@@ -1654,6 +1657,9 @@ func (s *Server) Close(ctx context.Context) error {
 	// Scheduled plugin runs are cancelled and waited for before the plugin
 	// runtime closes under them.
 	s.stopPluginTaskScheduler(ctx)
+	// Sub-Store S0 catalogue lane: stop the depends_on asks before the
+	// runtime they call (share_fleet_depends.go).
+	s.substoreCatalogue.deps.close(ctx)
 	var err error
 	if s.pluginRuntime != nil {
 		err = s.pluginRuntime.Close(ctx)

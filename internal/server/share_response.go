@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // A served link answers with the bytes first and does its bookkeeping after.
@@ -47,15 +49,36 @@ func newShareBody(body []byte, compress bool, level int) shareBody {
 	return out
 }
 
+// shareDescribingHeaders are the headers besides Subscription-Userinfo that a
+// client takes from a 200 and keeps: its refresh period, the profile name,
+// the web page and the plan. A client that holds an old value must not be
+// told nothing changed when only one of them moved, so the validator covers
+// them.
+var shareDescribingHeaders = []string{
+	model.ResponseHeaderContentDisposition,
+	model.ResponseHeaderProfileUpdateInterval,
+	model.ResponseHeaderProfileWebPageURL,
+	model.ResponseHeaderPlanName,
+}
+
 // shareETag is a strong validator for exactly what a response carries: the
 // body, the quota header the client would see (a client that only updates
 // its quota display on a 200 must not be told nothing changed when only the
-// quota moved), and the content coding.
-func shareETag(hash [sha256.Size]byte, userinfo string, gzipped bool) string {
+// quota moved), the describing headers already set on header, and the
+// content coding.
+func shareETag(hash [sha256.Size]byte, userinfo string, header http.Header, gzipped bool) string {
 	h := sha256.New()
 	h.Write(hash[:])
 	h.Write([]byte{0})
 	h.Write([]byte(userinfo))
+	for _, name := range shareDescribingHeaders {
+		for _, value := range header.Values(name) {
+			h.Write([]byte{0})
+			h.Write([]byte(name))
+			h.Write([]byte{':'})
+			h.Write([]byte(value))
+		}
+	}
 	sum := h.Sum(nil)
 	tag := `"` + hex.EncodeToString(sum[:16])
 	if gzipped {
@@ -111,10 +134,10 @@ func writeShareBody(w http.ResponseWriter, r *http.Request, b shareBody, userinf
 	if b.gzipBody != nil {
 		header.Add("Vary", "Accept-Encoding")
 	}
-	etag := shareETag(b.hash, userinfo, gzipped)
+	etag := shareETag(b.hash, userinfo, header, gzipped)
 	header.Set("ETag", etag)
 	// Either coding's tag means the client holds this document.
-	if ifNoneMatchHits(r, shareETag(b.hash, userinfo, false), shareETag(b.hash, userinfo, true)) {
+	if ifNoneMatchHits(r, shareETag(b.hash, userinfo, header, false), shareETag(b.hash, userinfo, header, true)) {
 		w.WriteHeader(http.StatusNotModified)
 		return true
 	}

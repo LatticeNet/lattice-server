@@ -606,6 +606,22 @@ func TestPolicyMemoDropsWriteAcrossApply(t *testing.T) {
 	if got := s.substoreBindPolicyFor(subStorePluginID, "fleet-1"); got != nil {
 		t.Fatalf("a write from before the apply landed: %+v", got)
 	}
+	// Nor may it overwrite what a miss after the apply wrote: the stale
+	// entry would void the fresh one and bring back the policy-free key.
+	fresh := &model.BindPolicy{Probe: &model.ProbeExclusionPolicy{ConsecutiveFailures: 3}}
+	freshSnap, _ := env.st.SubscriptionSnapshot(subStorePluginID, "fleet-1")
+	freshEpoch, _ := s.subscriptionSnapshotEpoch(subStorePluginID, "fleet-1", freshSnap)
+	freshPlan := bindNodesPlan(t, env.rows)
+	freshPlan.Policy = fresh
+	if _, err := s.substoreBindRendered(context.Background(), share, "plain", shareRenderVariant{}, freshSnap, renderedSubscription{Plan: &freshPlan, SourceEpoch: freshEpoch}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.substoreBindRendered(context.Background(), share, "plain", shareRenderVariant{}, snap, renderedSubscription{Plan: &plan, SourceEpoch: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.substoreBindPolicyFor(subStorePluginID, "fleet-1"); !reflect.DeepEqual(got, fresh) {
+		t.Fatalf("a stale write replaced the fresh entry: %+v", got)
+	}
 	// A write at the current epoch lands, and the next apply voids it.
 	key := subscriptionRefreshKey{pluginID: subStorePluginID, subscriptionID: "fleet-1"}
 	publication := s.subscriptionPublicationStateFor(key)
@@ -744,6 +760,9 @@ func TestBindIdentityStateMatchesPolicyAndCatalogueUsage(t *testing.T) {
 			ByLine: map[string]store.UsageDayUserLine{e.rows[0].LineHashID: {Uplink: 300, Downlink: 200}}},
 		{UserID: base.ID, Day: store.UsageDay(e.now.AddDate(0, -2, 0)), Uplink: 7000,
 			ByLine: map[string]store.UsageDayUserLine{e.rows[1].LineHashID: {Uplink: 7000}}},
+		// Inside the calendar month, before the monthly quota's reset day.
+		{UserID: base.ID, Day: store.UsageDay(time.Date(e.now.Year(), e.now.Month(), 2, 0, 0, 0, 0, time.UTC)), Uplink: 40,
+			ByLine: map[string]store.UsageDayUserLine{e.rows[1].LineHashID: {Uplink: 40}}},
 	}}); err != nil {
 		t.Fatal(err)
 	}

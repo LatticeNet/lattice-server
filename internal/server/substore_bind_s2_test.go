@@ -12,11 +12,13 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/plugin"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -978,5 +980,83 @@ func BenchmarkSubstoreBindPlan1000(b *testing.B) {
 		if result := substoreBindPlan(plan, u, catalogue, substoreBindInputs{usage: usage, names: names}); len(result.nodes) != len(e.rows) {
 			b.Fatalf("%d of %d nodes bound", len(result.nodes), len(e.rows))
 		}
+	}
+}
+
+// bindRenderRunner is a Sub-Store runtime whose render answers a fixed plan
+// and records every request payload.
+type bindRenderRunner struct {
+	mu       sync.Mutex
+	payloads []json.RawMessage
+	reply    json.RawMessage
+}
+
+func (r *bindRenderRunner) Name() string { return "bind-render" }
+func (r *bindRenderRunner) Start(context.Context, plugin.RunnerStartRequest) (plugin.RunnerStartResult, error) {
+	return plugin.RunnerStartResult{}, nil
+}
+func (r *bindRenderRunner) Stop(context.Context, plugin.RunnerStopRequest) error { return nil }
+func (r *bindRenderRunner) Invoke(_ context.Context, req plugin.InvokeRequest) (plugin.InvokeResponse, error) {
+	var call struct {
+		Payload json.RawMessage `json:"payload"`
+	}
+	_ = json.Unmarshal(req.Payload, &call)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.payloads = append(r.payloads, call.Payload)
+	return plugin.InvokeResponse{OK: true, Result: r.reply}, nil
+}
+
+// The bind step's render names the revision and, for a collection, the
+// member revisions to the plugin, and reads the live revision back.
+func TestBindPreviewForwardsMemberRevisions(t *testing.T) {
+	env := bindShareFixture(t)
+	s := env.srv
+	plan := bindNodesPlan(t, env.rows)
+	encoded, err := model.EncodeSelectionPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &bindRenderRunner{reply: json.RawMessage(`{"content":"","plan":` + string(encoded) + `,"live_revision":"rev-live"}`)}
+	s.pluginRuntime = plugin.NewRuntimeManagerWithOptions(plugin.RuntimeManagerOptions{
+		Services: s.pluginHostServices(), Runners: map[string]plugin.Runner{plugin.TypeSystem: runner},
+	})
+	if _, err := s.pluginRuntime.Start(context.Background(), plugin.Loaded{
+		Manifest:     plugin.Manifest{ID: subStorePluginID, Name: "Sub-Store", Type: plugin.TypeSystem, Capabilities: []string{"kv:read"}},
+		Capabilities: []string{"kv:read"}, BundlePath: t.TempDir(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap, _ := env.st.SubscriptionSnapshot(subStorePluginID, "fleet-1")
+	got, live, err := s.substoreBindRenderPlan(context.Background(), substoreBindRenderQuery{PluginID: subStorePluginID, SubscriptionID: "fleet-1",
+		Revision: "rev-staged", MemberRevisions: map[string]string{"hk": "staged-1", "gone": ""}, Snapshot: snap})
+	if err != nil || got == nil || live != "rev-live" || len(got.Nodes) != len(env.rows) {
+		t.Fatalf("render: plan %v, live %q, err %v", got != nil, live, err)
+	}
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if len(runner.payloads) != 1 {
+		t.Fatalf("%d renders", len(runner.payloads))
+	}
+	var req struct {
+		SubscriptionID  string            `json:"subscription_id"`
+		Revision        string            `json:"revision"`
+		MemberRevisions map[string]string `json:"member_revisions"`
+		Raw             string            `json:"raw"`
+	}
+	if err := json.Unmarshal(runner.payloads[0], &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.SubscriptionID != "fleet-1" || req.Revision != "rev-staged" || req.Raw != snap.Raw ||
+		!maps.Equal(req.MemberRevisions, map[string]string{"hk": "staged-1", "gone": ""}) {
+		t.Fatalf("render request %+v", req)
+	}
+	// A render with nothing named sends neither field.
+	runner.payloads = nil
+	runner.mu.Unlock()
+	_, _, err = s.substoreBindRenderPlan(context.Background(), substoreBindRenderQuery{PluginID: subStorePluginID, SubscriptionID: "fleet-1", Snapshot: snap})
+	runner.mu.Lock()
+	if err != nil || len(runner.payloads) != 1 || strings.Contains(string(runner.payloads[0]), "revision") {
+		t.Fatalf("a live render: %v %s", err, runner.payloads)
 	}
 }

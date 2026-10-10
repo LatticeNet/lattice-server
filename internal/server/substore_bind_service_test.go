@@ -25,10 +25,10 @@ func bindOperatorCtx(p principal) context.Context {
 func TestSubstoreBindPreviewIsCredentialFree(t *testing.T) {
 	env := bindShareFixture(t)
 	var revisions []string
-	env.srv.substoreCatalogue.bind.renderPlan = func(_ context.Context, pluginID, subscriptionID, revision string, _ model.SubscriptionSnapshot) (*model.SelectionPlan, string, error) {
-		revisions = append(revisions, revision)
-		if subscriptionID != "fleet-1" || pluginID != subStorePluginID {
-			t.Fatalf("preview rendered %s/%s", pluginID, subscriptionID)
+	env.srv.substoreCatalogue.bind.renderPlan = func(_ context.Context, q substoreBindRenderQuery) (*model.SelectionPlan, string, error) {
+		revisions = append(revisions, q.Revision)
+		if q.SubscriptionID != "fleet-1" || q.PluginID != subStorePluginID {
+			t.Fatalf("preview rendered %s/%s", q.PluginID, q.SubscriptionID)
 		}
 		plan := bindNodesPlan(t, env.rows)
 		plan.Nodes[1] = bindNode(t, env.rows[1], plan.Nodes[1].Placeholders["uuid"], map[string]any{"server": "relay.attacker.example"})
@@ -55,7 +55,7 @@ func TestSubstoreBindPreviewIsCredentialFree(t *testing.T) {
 	}
 
 	// A record that renders a document has nothing to bind.
-	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, string, string, string, model.SubscriptionSnapshot) (*model.SelectionPlan, string, error) {
+	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, substoreBindRenderQuery) (*model.SelectionPlan, string, error) {
 		return nil, "", nil
 	}
 	if _, err := env.srv.substoreBindRPC(bindOperatorCtx(reader), "preview", []byte(`{"subscription_id":"fleet-1","identity_id":"`+bindIdentityID+`"}`)); err == nil ||
@@ -308,7 +308,7 @@ func TestSubstoreBindRevealEntryThroughThePluginGateway(t *testing.T) {
 // selected answers the refusal a share would, and binds nothing.
 func TestSubstoreBindPreviewRefusesAPlanWithoutASelection(t *testing.T) {
 	env := bindShareFixture(t)
-	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, string, string, string, model.SubscriptionSnapshot) (*model.SelectionPlan, string, error) {
+	env.srv.substoreCatalogue.bind.renderPlan = func(context.Context, substoreBindRenderQuery) (*model.SelectionPlan, string, error) {
 		plan := bindNodesPlan(t, env.rows)
 		return &plan, "", nil
 	}

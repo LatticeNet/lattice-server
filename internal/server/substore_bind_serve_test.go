@@ -33,6 +33,11 @@ type bindShareEnv struct {
 	chain        []model.ResponseTransformerStep
 	chainHeaders map[string]string
 	chainErr     error
+	// selection and policy, when set, are every plan's.
+	selection *model.PlanSelection
+	policy    *model.BindPolicy
+	// catalogueVersion is the version fleet-1's snapshot names.
+	catalogueVersion string
 }
 
 const (
@@ -45,6 +50,7 @@ const (
 	bindShareDocToken   = "dddddddddddddddddddddddddddddddd"
 	bindSharePlainTok   = "cccccccccccccccccccccccccccccccc"
 	bindShareForeignTok = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	bindSharePlainIDTok = "abababababababababababababababab"
 )
 
 func bindShareFixture(t *testing.T) *bindShareEnv {
@@ -52,6 +58,7 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 	env := &bindShareEnv{bindEnv: bindFixture(t, 2, 2)}
 	s := env.srv
 	page := env.read(t, "")
+	env.catalogueVersion = page.CatalogueVersion
 	selection, err := json.Marshal(map[string]any{"catalogue_version": page.CatalogueVersion, "rows": page.Rows})
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +79,7 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		env.renders.Add(1)
 		epoch, _ := s.subscriptionSnapshotEpoch(share.Source.PluginID, share.Source.SubscriptionID, snap)
-		plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes, ResponseChain: env.chain}
+		plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes, ResponseChain: env.chain, Selection: env.selection, Policy: env.policy}
 		for _, row := range env.rows {
 			plan.Nodes = append(plan.Nodes, bindNode(t, row, bindPlaceholder(t, row.LineUUID, "uuid"), env.tamper))
 		}
@@ -113,6 +120,8 @@ func bindShareFixture(t *testing.T) *bindShareEnv {
 		{ID: "sh-doc", Slug: "doc", Token: bindShareDocToken, Enabled: true,
 			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: "fleet-doc", IdentityID: bindIdentityID}},
 		{ID: "sh-plain", Slug: "plain", Token: bindSharePlainTok, Enabled: true,
+			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: "plain-1"}},
+		{ID: "sh-plain-id", Slug: "plain-id", Token: bindSharePlainIDTok, Enabled: true,
 			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: "plain-1", IdentityID: bindIdentityID}},
 		{ID: "sh-foreign", Slug: "foreign", Token: bindShareForeignTok, Enabled: true,
 			Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: "fleet-foreign", IdentityID: bindIdentityID}},
@@ -313,7 +322,7 @@ func TestSubstoreBindShareRefusals(t *testing.T) {
 	}
 }
 
-// A share that names an identity on a record that renders a plain document
+// A share that names no identity on a record that renders a plain document
 // binds nothing, so its quota header stays the record's own.
 func TestSubstoreBindSharePlainDocumentKeepsItsQuota(t *testing.T) {
 	env := bindShareFixture(t)
@@ -472,14 +481,24 @@ func TestShareRecordHeadersPassTheAllowListOnly(t *testing.T) {
 		"localhost":                  {"Profile-Web-Page-URL", "https://localhost/"},
 		"a local name":               {"Profile-Web-Page-URL", "https://router.local/"},
 		"a url over 2 KiB":           {"Profile-Web-Page-URL", "https://panel.example.com/" + strings.Repeat("a", model.MaxSubscriptionResponseHeaderBytes)},
-		// The share names an identity, so a value carrying its credential,
-		// raw or encoded, is dropped.
-		"the identity's uuid":          {"Plan-Name", "Fleet " + bindIdentityUUID},
-		"the identity's uuid dashless": {"Profile-Web-Page-URL", "https://panel.example.com/?u=" + strings.ReplaceAll(bindIdentityUUID, "-", "")},
 	} {
 		got := env.fetchPlain(t, map[string]string{header[0]: header[1]})
 		if got.Get(header[0]) != core.Get(header[0]) {
 			t.Errorf("%s: %s = %q, want %q", name, header[0], got.Get(header[0]), core.Get(header[0]))
+		}
+	}
+
+	// On a share that names an identity, a value carrying the identity's
+	// credential, raw or encoded, is dropped from what the render asked for.
+	for name, header := range map[string][2]string{
+		"the identity's uuid":          {"Plan-Name", "Fleet " + bindIdentityUUID},
+		"the identity's uuid dashless": {"Profile-Web-Page-URL", "https://panel.example.com/?u=" + strings.ReplaceAll(bindIdentityUUID, "-", "")},
+	} {
+		env.headers = map[string]string{header[0]: header[1]}
+		env.srv.subscriptionCache.InvalidateShare("sh-fleet")
+		rec := env.get("/sub/fleet/" + bindShareToken)
+		if rec.Code != http.StatusOK || rec.Header().Get(header[0]) == header[1] {
+			t.Errorf("%s: status %d, %s = %q", name, rec.Code, header[0], rec.Header().Get(header[0]))
 		}
 	}
 

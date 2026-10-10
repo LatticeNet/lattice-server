@@ -31,8 +31,9 @@ import (
 //
 //  1. it names a line (no_line), it is at most the MaxPlanClonesPerLine-th
 //     node naming that line (clone_limit), the catalogue holds the line
-//     (line_unknown), the record's snapshot selected it
-//     (plan_rejected:line_uuid) and the identity has an enabled binding to
+//     (line_unknown), the plan's selection selected it, or the record's
+//     snapshot for a plan from a plugin that states none
+//     (plan_rejected:line_uuid), and the identity has an enabled binding to
 //     it (not_bound, binding_disabled);
 //  2. its type, transport, security and credential fields are the
 //     template's: the credential fields are exactly the template protocol's,
@@ -43,6 +44,10 @@ import (
 //  3. its server is the template host, the line's provider edge, one of its
 //     verified DDNS names or one of the catalogue's addresses for it, and its
 //     port is the template port (plan_rejected:server, plan_rejected:port).
+//     A line behind NAT, whose template host is its provider edge, narrows
+//     the set to the edge, the edge's own addresses and the verified names
+//     whose Target is the edge: the node's own public addresses are the
+//     provider's shared egress, where another node may be listening.
 //     Design 28 also admits a port inside the line's port-hopping range, but
 //     no template records one (see substoreBindCheckNode), so the port is
 //     the template's exactly;
@@ -67,7 +72,11 @@ import (
 //
 // A validated node is then bound the way an identity link binds the line
 // (identityLinkLineCheck): the same exclusions with the same reasons, plus,
-// for a committed chain root, the path state (graph_drifted, graph_busy).
+// for a committed chain root, the path state (graph_drifted, graph_busy),
+// plus the record's opt-in policy (model.BindPolicy): a line whose probe
+// failed at least N times in a row (probe_failed; a null probe block never
+// excludes) and a line on which the identity used more than the threshold in
+// its current period (usage_exceeded).
 // Binding writes the identity's credential where each placeholder was and,
 // for vless, the identity's flow.
 //
@@ -95,17 +104,29 @@ const (
 	substoreBindReasonNotBound         = "not_bound"
 	substoreBindReasonGraphDrifted     = "graph_drifted"
 	substoreBindReasonGraphBusy        = "graph_busy"
-	substoreBindRejectedPrefix         = "plan_rejected:"
+	// substoreBindReasonProbeFailed: the record's policy excludes a line
+	// whose last probe failed at least its threshold of times in a row.
+	substoreBindReasonProbeFailed = "probe_failed"
+	// substoreBindReasonUsageExceeded: the record's policy excludes a line
+	// on which the identity used more than its threshold this period.
+	substoreBindReasonUsageExceeded = "usage_exceeded"
+	substoreBindRejectedPrefix      = "plan_rejected:"
 
 	// substoreBindRefusedEmpty: the plan carries no node.
 	substoreBindRefusedEmpty = "empty_plan"
 	// substoreBindRefusedNoLine: the plan has fleet nodes and none could be
 	// bound. The share answers the decoy so clients keep the nodes they have.
 	substoreBindRefusedNoLine = "no_includable_line"
-	// substoreBindRefusedSelection: the plan has fleet nodes and the record's
-	// snapshot does not say which lines it selected, so check 1 cannot run.
-	// The identity's bindings alone never stand in for the selection.
+	// substoreBindRefusedSelection: the plan has fleet nodes, states no
+	// selection, and the record's snapshot does not say which lines it
+	// selected, so check 1 cannot run. The identity's bindings alone never
+	// stand in for the selection.
 	substoreBindRefusedSelection = "selection_unknown"
+	// substoreBindRefusedSelectionMismatch: on the serve path, the plan's
+	// selection names another catalogue version than the record's snapshot,
+	// or a line the snapshot's rows do not hold. A plugin bug in building the
+	// selection cannot widen a share past its own fetch output.
+	substoreBindRefusedSelectionMismatch = "selection_mismatch"
 )
 
 // Fields of a fleet node, by what the bind step does with them.
@@ -131,14 +152,9 @@ var (
 	// flow is replaced by the identity's own, the protocol tuning fields
 	// change framing only, the Lattice fields are the catalogue's own
 	// metadata and the parser annotations are the ones the URI parsers set
-	// from a catalogue template's parameters.
-	substoreBindCarriedFields = map[string]bool{
-		"flow": true, "packet-encoding": true,
-		"congestion-controller": true, "udp-relay-mode": true, "reduce-rtt": true, "up": true, "down": true,
-		"line_hash_id": true, "node_id": true, "geo": true, "chain": true, "tags": true, "groups": true,
-		"probe": true, "addresses": true,
-		"_h2": true, "_mode": true, "_grpc-type": true, "_spider-x": true, "_pqv": true, "_v2ray-http-upgrade-ed": true,
-	}
+	// from a catalogue template's parameters. The SDK owns the list, so the
+	// plugin's plan encoder, convert's strip and this set cannot drift.
+	substoreBindCarriedFields = substoreBindFieldSet(model.SelectionPlanCarriedFields)
 	// substoreBindTransportOptions are the transport options objects a node
 	// may carry: the network each belongs to and the keys the URI parsers set
 	// in it from a catalogue template's parameters, by kind.
@@ -163,6 +179,40 @@ var (
 	// substoreBindFieldName is a field name a reason may quote.
 	substoreBindFieldName = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 )
+
+// substoreBindFieldSet is a field list as a set.
+func substoreBindFieldSet(fields []string) map[string]bool {
+	out := make(map[string]bool, len(fields))
+	for _, field := range fields {
+		out[field] = true
+	}
+	return out
+}
+
+// substoreBindInputs is what binding a plan reads beside the plan, the
+// identity and the catalogue.
+type substoreBindInputs struct {
+	// selected is the line set the record's snapshot selected, which a plan
+	// that states no selection of its own is checked against (a plan from a
+	// plugin that predates PlanSelection). Nil means the snapshot does not
+	// say. A plan that carries a selection is checked against it instead.
+	selected map[string]bool
+	// usage is the identity's traffic per line_hash_id in its current
+	// period, read only when the plan's policy names usage.
+	usage map[string]int64
+	// names are the host names the catalogue resolved at the last template
+	// sync, from which the NAT rule takes a provider edge's own addresses.
+	names map[string][]string
+}
+
+// substoreBindRules are the per-line rules of one bind: the selection check
+// 1 reads and the record's policy.
+type substoreBindRules struct {
+	selected map[string]bool
+	policy   *model.BindPolicy
+	usage    map[string]int64
+	names    map[string][]string
+}
 
 // substoreBindEntry is one node the bind step includes, as a preview shows
 // it: no credential.
@@ -450,6 +500,10 @@ type substoreBindLine struct {
 	// exclude is why a validated node of the line is not bound.
 	exclude identityLinkExclusion
 	payload lineUserCredentialPayload
+	// edgeAddrs are the provider edge's own addresses, set for a line behind
+	// NAT (its template host is its provider edge), where they replace the
+	// row's flat address list in check 3.
+	edgeAddrs []string
 }
 
 // substoreBindBindings indexes an identity's bindings by line_hash_id; the
@@ -465,8 +519,9 @@ func substoreBindBindings(u VpnUser) map[string]LineBinding {
 }
 
 // substoreBindLineOf works out one line for one identity, whose bindings
-// substoreBindBindings indexed.
-func substoreBindLineOf(u VpnUser, bindings map[string]LineBinding, c *lineCatalogue, selected map[string]bool, lineUUID string) *substoreBindLine {
+// substoreBindBindings indexed. A nil rules.selected checks no selection
+// (reveal_entry, which binds one line outside any plan).
+func substoreBindLineOf(u VpnUser, bindings map[string]LineBinding, c *lineCatalogue, rules substoreBindRules, lineUUID string) *substoreBindLine {
 	out := &substoreBindLine{}
 	row, ok := c.Row(lineUUID)
 	if !ok {
@@ -474,7 +529,7 @@ func substoreBindLineOf(u VpnUser, bindings map[string]LineBinding, c *lineCatal
 		return out
 	}
 	out.row = row
-	if selected != nil && !selected[lineUUID] {
+	if selected := rules.selected; selected != nil && !selected[lineUUID] {
 		out.refuse = identityLinkExclusion{reason: substoreBindRejectedPrefix + "line_uuid"}
 		return out
 	}
@@ -510,7 +565,39 @@ func substoreBindLineOf(u VpnUser, bindings map[string]LineBinding, c *lineCatal
 			out.exclude = identityLinkExclusion{reason: identityLineTemplateUnusable}
 		}
 	}
+	if out.exclude.reason == "" {
+		out.exclude = substoreBindPolicyExclusion(rules, row)
+	}
+	if substoreBindBehindNAT(template, row) {
+		out.edgeAddrs = lineCatalogueAddresses([]string{row.ProviderEdge}, rules.names)
+	}
 	return out
+}
+
+// substoreBindPolicyExclusion applies the record's opt-in rules to a line
+// that passed every other one. A null probe block never excludes, and usage
+// is compared strictly above the threshold.
+func substoreBindPolicyExclusion(rules substoreBindRules, row model.LineCatalogueRow) identityLinkExclusion {
+	policy := rules.policy
+	if policy == nil {
+		return identityLinkExclusion{}
+	}
+	if p := policy.Probe; p != nil && row.Probe != nil && row.Probe.Verdict == model.LineProbeVerdictFail &&
+		row.Probe.ConsecutiveFailures >= p.ConsecutiveFailures {
+		return identityLinkExclusion{reason: substoreBindReasonProbeFailed,
+			detail: strconv.Itoa(row.Probe.ConsecutiveFailures) + " consecutive probe failures"}
+	}
+	if p := policy.Usage; p != nil && rules.usage[row.LineHashID] > p.MaxBytesPerLine {
+		return identityLinkExclusion{reason: substoreBindReasonUsageExceeded}
+	}
+	return identityLinkExclusion{}
+}
+
+// substoreBindBehindNAT reports whether a line is reached through its
+// provider edge: the template's host is the edge.
+func substoreBindBehindNAT(t store.LineClientTemplate, row model.LineCatalogueRow) bool {
+	edge := strings.Trim(strings.TrimSpace(row.ProviderEdge), "[]")
+	return edge != "" && strings.EqualFold(strings.Trim(strings.TrimSpace(t.Host), "[]"), edge)
 }
 
 // substoreBindRootCheck is identityLinkLineCheck for a committed chain root,
@@ -565,7 +652,7 @@ func substoreBindCheckNode(raw json.RawMessage, obj substoreNodeObject, node mod
 	if !substoreBindCredentialIntact(raw, obj, node, shape) {
 		return "credential"
 	}
-	if server, _ := obj.string("server"); !substoreBindServerAllowed(server, t, row) {
+	if server, _ := obj.string("server"); !substoreBindServerAllowed(server, t, row, line.edgeAddrs) {
 		return "server"
 	}
 	// The port is the template's. Design 28's check admits a port inside the
@@ -681,8 +768,11 @@ func substoreBindCredentialIntact(raw json.RawMessage, obj substoreNodeObject, n
 // substoreBindServerAllowed reports whether server is in the line's allowed
 // set: the template host, the provider edge, a verified DDNS name, or one of
 // the catalogue's addresses for the line. Names compare without case and
-// addresses by value.
-func substoreBindServerAllowed(server string, t store.LineClientTemplate, row model.LineCatalogueRow) bool {
+// addresses by value. For a line behind NAT (substoreBindBehindNAT) the set
+// is the edge, edgeAddrs (the edge's own addresses) and the verified names
+// whose Target is the edge; the row's flat address list, which also holds
+// the node's own public addresses, does not count.
+func substoreBindServerAllowed(server string, t store.LineClientTemplate, row model.LineCatalogueRow, edgeAddrs []string) bool {
 	host := strings.TrimSpace(server)
 	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
 		host = host[1 : len(host)-1]
@@ -691,7 +781,11 @@ func substoreBindServerAllowed(server string, t store.LineClientTemplate, row mo
 		return false
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		for _, candidate := range append([]string{t.Host}, row.Addresses...) {
+		addresses := row.Addresses
+		if substoreBindBehindNAT(t, row) {
+			addresses = edgeAddrs
+		}
+		for _, candidate := range append([]string{t.Host}, addresses...) {
 			if other := net.ParseIP(strings.Trim(candidate, "[]")); other != nil && other.Equal(ip) {
 				return true
 			}
@@ -701,7 +795,10 @@ func substoreBindServerAllowed(server string, t store.LineClientTemplate, row mo
 	return slices.ContainsFunc(substoreBindNames(t, row), func(name string) bool { return strings.EqualFold(name, host) })
 }
 
-// substoreBindNames are the names a line's node may be dialled by.
+// substoreBindNames are the names a line's node may be dialled by. A line
+// behind NAT takes only the verified names whose Target is its edge: an A
+// record name points at the node's own public address, which for such a
+// line is the provider's shared egress.
 func substoreBindNames(t store.LineClientTemplate, row model.LineCatalogueRow) []string {
 	var names []string
 	for _, name := range []string{t.Host, row.ProviderEdge} {
@@ -709,8 +806,9 @@ func substoreBindNames(t store.LineClientTemplate, row model.LineCatalogueRow) [
 			names = append(names, name)
 		}
 	}
+	nat := substoreBindBehindNAT(t, row)
 	for _, ddns := range row.DDNSNames {
-		if ddns.Verified {
+		if ddns.Verified && (!nat || strings.EqualFold(strings.TrimSpace(ddns.Target), strings.TrimSpace(row.ProviderEdge))) {
 			names = append(names, ddns.Name)
 		}
 	}
@@ -819,6 +917,7 @@ var substoreBindOperationalReasons = map[string]bool{
 	identityLineRotationPending: true, identityLineCredentialUnknown: true, identityLineParked: true,
 	identityLineNoTemplate: true, identityLineTemplateLossy: true, identityLineTemplateUnusable: true,
 	identityLineServiceDown: true, substoreBindReasonGraphDrifted: true, substoreBindReasonGraphBusy: true,
+	substoreBindReasonProbeFailed: true, substoreBindReasonUsageExceeded: true,
 }
 
 // substoreBindInertValue is what a document carries in place of a
@@ -833,12 +932,23 @@ func substoreBindInertValue(field string) string {
 }
 
 // substoreBindPlan validates a plan against the catalogue and binds the
-// identity's credentials into it. selected is the line set the record's
-// snapshot selected; nil means the snapshot does not say, and a plan with
-// fleet nodes is then refused with selection_unknown rather than bound to
-// every line the identity holds. It reads nothing but its arguments.
-func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, selected map[string]bool) substoreBindResult {
+// identity's credentials into it. The selected line set is the plan's own
+// selection when it states one, else in.selected, the record's snapshot's;
+// with neither, a plan with fleet nodes is refused with selection_unknown
+// rather than bound to every line the identity holds. Whether a plan's
+// selection agrees with the snapshot is the serve path's check
+// (substoreBindCheckSelection), made before this. It reads nothing but its
+// arguments.
+func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in substoreBindInputs) substoreBindResult {
 	result := substoreBindResult{Kind: plan.Kind}
+	selected := in.selected
+	if plan.Selection != nil {
+		selected = make(map[string]bool, len(plan.Selection.LineUUIDs))
+		for _, lineUUID := range plan.Selection.LineUUIDs {
+			selected[lineUUID] = true
+		}
+	}
+	rules := substoreBindRules{selected: selected, policy: plan.Policy, usage: in.usage, names: in.names}
 	for _, node := range plan.Nodes {
 		if !node.Provider && node.LineUUID != "" {
 			result.FleetNodes++
@@ -906,7 +1016,7 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, sel
 		}
 		line := lines[node.LineUUID]
 		if line == nil {
-			line = substoreBindLineOf(u, bindings, c, selected, node.LineUUID)
+			line = substoreBindLineOf(u, bindings, c, rules, node.LineUUID)
 			lines[node.LineUUID] = line
 		}
 		if line.refuse.reason != "" {

@@ -610,8 +610,14 @@ func TestS0JoinedProposeWithoutLiveRevision(t *testing.T) {
 func TestS0JoinedProposeOnADocumentRecord(t *testing.T) {
 	env := newE2EEnv(t, true)
 	share := env.createShare(t, e2eDoc, "alice-doc", e2eAliceID)
-	if rec := env.fetch(share); rec.Code != http.StatusOK {
+	// Since S2 an identity-bound share handed a document instead of a plan
+	// answers the decoy: a legacy record's document carries the line
+	// owners' credentials.
+	if rec := env.fetch(share); rec.Code != http.StatusNotFound {
 		t.Fatalf("document share: %d", rec.Code)
+	}
+	if got := env.refusals(share.ID); len(got) != 1 || got[0] != substoreBindDenyLegacyDocument {
+		t.Fatalf("document share refusals %v", got)
 	}
 	code, body := env.gateway(t, e2eOperator, subStorePlansService, "propose",
 		map[string]any{"subscription_id": e2eDoc, "from_revision": "rev-1", "to_revision": "rev-2"})

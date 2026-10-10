@@ -1079,3 +1079,99 @@ func TestBindPreviewForwardsMemberRevisions(t *testing.T) {
 		t.Fatalf("a live render: %v %s", err, runner.payloads)
 	}
 }
+
+// On the serve path the NAT rule reads the edge's addresses from the names
+// the template sync resolved: a line whose share URL dials its provider edge
+// binds a plan node at the edge's address.
+func TestBindServePathNATUsesResolvedEdge(t *testing.T) {
+	env := bindShareFixture(t)
+	s := env.srv
+	const edge = "edge.provider.example"
+	s.singboxInvMu.Lock()
+	inv := s.singboxInv["node-000"]
+	inv.ProviderEdge = edge
+	s.singboxInv["node-000"] = inv
+	s.singboxInvMu.Unlock()
+	editSingBoxLine(t, s, "node-000", "vless-20000", func(n *model.SingBoxNode) {
+		n.ShareURL = strings.Replace(n.ShareURL, "@"+catalogueNodeIP(0)+":", "@"+edge+":", 1)
+	})
+	for i := 0; i < 2; i++ {
+		if err := s.syncLineClientTemplates(env.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.substoreCatalogue.names.lookup = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host == edge {
+			return []net.IPAddr{{IP: net.ParseIP("46.1.2.3")}}, nil
+		}
+		return nil, errors.New("no such host")
+	}
+	s.refreshLineCatalogueNames(env.now)
+	rows := env.read(t, "").Rows
+	row := rows[0]
+	if row.Template == nil || row.Template.Host != edge || row.ProviderEdge != edge {
+		t.Fatalf("the fixture's first line is not behind NAT: %+v", row.Template)
+	}
+	plan := model.SelectionPlan{Kind: model.SelectionPlanKindNodes}
+	for i, r := range rows {
+		edit := map[string]any(nil)
+		if i == 0 {
+			edit = map[string]any{"server": "46.1.2.3"}
+		}
+		plan.Nodes = append(plan.Nodes, bindNode(t, r, bindPlaceholder(t, r.LineUUID, "uuid"), edit))
+	}
+	share, _ := env.st.SubscriptionShare("sh-fleet")
+	page := env.read(t, "")
+	raw, _ := json.Marshal(map[string]any{"catalogue_version": page.CatalogueVersion, "rows": page.Rows})
+	snap := model.SubscriptionSnapshot{PluginID: subStorePluginID, SubscriptionID: "fleet-1", Raw: string(raw)}
+	if _, err := s.substoreBindRendered(context.Background(), share, "plain", shareRenderVariant{}, snap, renderedSubscription{Plan: &plan}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(env.lastConvert(t).Nodes); got != len(rows) {
+		t.Fatalf("%d of %d nodes bound; the NAT line at its edge's address was refused", got, len(rows))
+	}
+}
+
+// subStorePlanIdentities renders each side once for every identity, checks
+// each preview against the expected live revision its caller passes, passes
+// member revisions through, and renders nothing for a skipped side.
+func TestPlanIdentitiesCheckEachPreviewAgainstExpectedRevision(t *testing.T) {
+	s := bindFixture(t, 1, 1).srv
+	fake := &subStoreFakePreviewer{live: "rev-c", results: map[string]subStoreBindResult{
+		"rev-c|alice": {Included: []subStoreBindLine{{LineUUID: subStorePlanLine1, Name: "a", Digest: "d1"}}},
+		"rev-c|bob":   {Included: []subStoreBindLine{{LineUUID: subStorePlanLine1, Name: "a", Digest: "d1"}}},
+	}}
+	s.subStoreSvc.previewer = fake
+	members := map[string]string{"sub-f": "staged-f"}
+	out, err := s.subStorePlanIdentities(context.Background(), "coll", "rev-c", subStorePlanSide{Revision: "rev-c"},
+		subStorePlanSide{Revision: "rev-c", MemberRevisions: members}, []string{"bob", "alice", "bob"})
+	if err != nil || len(out) != 2 || out[0].IdentityID != "alice" || out[1].IdentityID != "bob" {
+		t.Fatalf("identities %+v, err %v", out, err)
+	}
+	if fake.callCount() != 2 || !maps.Equal(fake.calls[1].MemberRevisions, members) || fake.calls[0].MemberRevisions != nil ||
+		!slices.Equal(fake.calls[0].IdentityIDs, []string{"alice", "bob"}) {
+		t.Fatalf("calls %+v", fake.calls)
+	}
+	if _, err := s.subStorePlanIdentities(context.Background(), "coll", "rev-b", subStorePlanSide{Revision: "rev-c"},
+		subStorePlanSide{Revision: "rev-c"}, []string{"alice"}); !errors.Is(err, errSubStorePlanNotLive) {
+		t.Fatalf("a preview at another live revision: %v", err)
+	}
+	// A restored record has no live revision: its from side is skipped and
+	// every line it would serve is added.
+	fake.calls = nil
+	fake.setLive("")
+	fake.set("staged-r|alice", subStoreBindResult{Included: []subStoreBindLine{{LineUUID: subStorePlanLine2, Name: "b", Digest: "d2"}}})
+	out, err = s.subStorePlanIdentities(context.Background(), "restored", "", subStorePlanSide{Skip: true},
+		subStorePlanSide{Revision: "staged-r"}, []string{"alice"})
+	if err != nil || fake.callCount() != 1 || len(out) != 1 || len(out[0].Added) != 1 || out[0].Added[0].LineUUID != subStorePlanLine2 {
+		t.Fatalf("a restored record: %+v, %d calls, err %v", out, fake.callCount(), err)
+	}
+	// Both sides skipped need no previewer at all.
+	s.subStoreSvc.previewer = nil
+	if out, err := s.subStorePlanIdentities(context.Background(), "x", "", subStorePlanSide{Skip: true}, subStorePlanSide{Skip: true}, []string{"alice"}); err != nil || len(out) != 1 {
+		t.Fatalf("both sides skipped: %+v %v", out, err)
+	}
+	if _, err := s.subStorePlanIdentities(context.Background(), "x", "", subStorePlanSide{Revision: "a"}, subStorePlanSide{Revision: "b"}, []string{"alice"}); !errors.Is(err, errSubStorePlanNoPreviewer) {
+		t.Fatalf("no previewer: %v", err)
+	}
+}

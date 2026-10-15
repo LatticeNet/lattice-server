@@ -397,8 +397,9 @@ func (s *Server) sendUnrecorded(plan notifyPlan) {
 			if plan.how.barkLevel != "" && channel.Kind == "bark" {
 				channel = withBarkLevel(channel, plan.how.barkLevel)
 			}
+			msg := s.presentNotifyMessage(channel.Kind, t.message, plan.eventType, plan.how.source)
 			ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
-			err := s.notifySend(ctx, channel, t.message)
+			err := s.notifySend(ctx, channel, msg)
 			cancel()
 			if err != nil {
 				failed++
@@ -601,7 +602,8 @@ func (s *Server) attemptNotifyDelivery(deliveryID string) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), notifySendTimeout)
 	started := time.Now()
-	err := s.notifySend(ctx, channel, notify.Message{Title: row.Title, Body: row.Body})
+	msg := s.presentNotifyMessage(channel.Kind, notify.Message{Title: row.Title, Body: row.Body}, row.EventType, row.Source)
+	err := s.notifySend(ctx, channel, msg)
 	cancel()
 	attempt := store.NotifyAttempt{At: s.now(), OK: err == nil, DurationMS: time.Since(started).Milliseconds()}
 	kind, status, transient := redactSendError(err)

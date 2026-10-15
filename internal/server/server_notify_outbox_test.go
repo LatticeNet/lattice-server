@@ -171,7 +171,7 @@ func TestNotifyDeliveriesRoute(t *testing.T) {
 		t.Fatalf("notify:send tested a stored channel: %d", res.StatusCode)
 	}
 	confined := createPAT(t, handler, cookies, csrf, []string{"notify:admin"}, []string{"node-a"})
-	for _, path := range []string{"/api/notify/deliveries", "/api/notify/channels"} {
+	for _, path := range []string{"/api/notify/deliveries", "/api/notify/channels", "/api/notify/catalogue"} {
 		if res := doBearerJSON(t, handler, http.MethodGet, path, "", confined); res.StatusCode != http.StatusForbidden {
 			t.Fatalf("confined token read %s: %d", path, res.StatusCode)
 		}

@@ -89,7 +89,7 @@ var notifyCategories = []notifyCategory{
 	{notifyCategoryMonitors, "Monitors"},
 	{notifyCategoryAgents, "Agents"},
 	{notifyCategorySSH, "SSH"},
-	{notifyCategoryAuth, "Auth"},
+	{notifyCategoryAuth, "Sign-in"},
 	{notifyCategoryQuota, "Quota"},
 	{notifyCategoryInventory, "Inventory"},
 	{notifyCategoryNotify, "Notifications"},
@@ -145,11 +145,11 @@ type notifyCatalogueEntry struct {
 }
 
 // notifyCataloguePattern is an entry for a family of types: today only a
-// plugin's messages.
+// plugin's messages. Its type repeats the pattern, so every list the
+// catalogue endpoint returns has the entry's shape.
 type notifyCataloguePattern struct {
 	Pattern string `json:"pattern"`
-	notifyPresentation
-	Description string `json:"description"`
+	notifyCatalogueEntry
 }
 
 func notifyEntry(eventType, category, severity string, recovery bool, icon, description string) notifyCatalogueEntry {
@@ -189,9 +189,8 @@ var notifyCatalogueTypes = []notifyCatalogueEntry{
 // notifyPluginMessagePattern presents a plugin's notify.send
 // (pluginNotifyEventType).
 var notifyPluginMessagePattern = notifyCataloguePattern{
-	Pattern:            "plugin.<id>.message",
-	notifyPresentation: notifyPresentation{Category: notifyCategoryPlugins, Severity: notifySeverityInfo, Icon: "puzzle"},
-	Description:        "Plugin message",
+	Pattern:              "plugin.<id>.message",
+	notifyCatalogueEntry: notifyEntry("plugin.<id>.message", notifyCategoryPlugins, notifySeverityInfo, false, "puzzle", "Plugin message"),
 }
 
 // notifyWebhookEntry presents an event an operator-defined inbound webhook
@@ -231,7 +230,7 @@ func notifyCatalogueLookup(eventType string, webhookType bool) notifyCatalogueEn
 	var e notifyCatalogueEntry
 	switch {
 	case isNotifyPluginMessageType(eventType):
-		e = notifyCatalogueEntry{notifyPresentation: notifyPluginMessagePattern.notifyPresentation, Description: notifyPluginMessagePattern.Description}
+		e = notifyPluginMessagePattern.notifyCatalogueEntry
 	case webhookType:
 		e = notifyWebhookEntry
 	default:

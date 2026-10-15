@@ -353,7 +353,7 @@ func TestNotifyCatalogueRoute(t *testing.T) {
 			t.Fatalf("types miss %s", want)
 		}
 	}
-	if len(got.Patterns) != 1 || got.Patterns[0].Pattern != "plugin.<id>.message" || got.Patterns[0].Category != "plugins" || got.Patterns[0].Icon != "puzzle" {
+	if len(got.Patterns) != 1 || got.Patterns[0].Pattern != "plugin.<id>.message" || got.Patterns[0].Type != "plugin.<id>.message" || got.Patterns[0].Category != "plugins" || got.Patterns[0].Icon != "puzzle" {
 		t.Fatalf("patterns = %+v", got.Patterns)
 	}
 	var webhookTypes []string

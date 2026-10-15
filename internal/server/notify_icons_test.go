@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/notify"
@@ -360,5 +361,44 @@ func TestNonBarkChannelsGetNoPresentation(t *testing.T) {
 	m = srv.presentNotifyMessage("bark", notify.Message{Title: "t", Body: "b"}, "deploy.finished", store.NotifySourceWebhook)
 	if m.Group != "Webhooks" || m.Icon != "https://lattice.example.com/notify-icons/webhook-quiet.png" {
 		t.Fatalf("webhook push = %+v", m)
+	}
+}
+
+// The send that stands in when the store refuses the outbox write presents a
+// push the same way as the outbox does.
+func TestBarkUnrecordedSendCarriesCategoryGroupAndIcon(t *testing.T) {
+	bark, pushes := newBarkPushRecorder(t, false)
+	srv, _, st := newBarkPresentationServer(t, "https://lattice.example.com")
+	if err := st.UpsertNotifyChannel(model.NotifyChannel{ID: "nc-bark", Name: "Phone", Kind: "bark", Enabled: true, Config: map[string]string{"base_url": bark.URL, "key": "devkey"}}); err != nil {
+		t.Fatal(err)
+	}
+	sendThroughFakeBark(srv, bark)
+	srv.sendUnrecorded(srv.planNotifyEvent(EventServiceDown, "sing-box down on hk-1", "probe failed three times", notifyEnqueue{source: store.NotifySourceServer}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if left := srv.notifyDeliveries.wait(ctx); left > 0 {
+		t.Fatalf("%d unrecorded sends still running", left)
+	}
+	got := pushes.only(t)
+	if got["group"] != "Services" || got["icon"] != "https://lattice.example.com/notify-icons/power-off-critical.png" {
+		t.Fatalf("unrecorded push = %v", got)
+	}
+}
+
+// A type only an operator webhook defines is presented as a webhook event
+// whatever source raised it; an exact type is never looked up among the
+// webhooks.
+func TestBarkPresentationOfAWebhookType(t *testing.T) {
+	srv, _, st := newBarkPresentationServer(t, "https://lattice.example.com")
+	if err := st.UpsertNotifyWebhook(store.NotifyWebhook{ID: "wh-deploy", Name: "Deploys", EventType: "deploy.finished", TitleTemplate: "t", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	m := srv.presentNotifyMessage("bark", notify.Message{Title: "t"}, "deploy.finished", store.NotifySourceServer)
+	if m.Group != "Webhooks" || m.Icon != "https://lattice.example.com/notify-icons/webhook-quiet.png" {
+		t.Fatalf("webhook type push = %+v", m)
+	}
+	m = srv.presentNotifyMessage("bark", notify.Message{Title: "t"}, "not.a.webhook", store.NotifySourceServer)
+	if m.Group != "General" || m.Icon != "https://lattice.example.com/notify-icons/bell-quiet.png" {
+		t.Fatalf("unknown type push = %+v", m)
 	}
 }

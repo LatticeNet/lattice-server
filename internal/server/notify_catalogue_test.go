@@ -41,6 +41,11 @@ var notifyEventConstName = regexp.MustCompile(`^[Ee]vent[A-Z]`)
 // Event* and event* string constants, every value classifyNotifyEvent
 // returns, every string literal or constant a notify entry point is called
 // with, and the incident and critical-fallback tables.
+//
+// It sees types written as literals or named constants. A type built at run
+// time (fmt.Sprintf, a variable, a new entry point not in notifyEmitFuncs) is
+// out of its reach: declare a new type as an Event constant, as the existing
+// emitters do, and it is covered.
 func emittedNotifyEventTypes(t *testing.T) map[string]string {
 	t.Helper()
 	fset := token.NewFileSet()

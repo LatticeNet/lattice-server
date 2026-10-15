@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -224,6 +225,7 @@ func TestBarkBlocksPrivateBaseURLByPolicy(t *testing.T) {
 // barkCapture records each request a fake Bark server receives: the JSON push
 // body, or the query of the GET fallback.
 type barkCapture struct {
+	mu    sync.Mutex
 	push  map[string]string
 	query map[string]string
 	paths []string
@@ -233,6 +235,8 @@ func newBarkCaptureServer(t *testing.T, refusePush bool) (*httptest.Server, *bar
 	t.Helper()
 	got := &barkCapture{}
 	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.mu.Lock()
+		defer got.mu.Unlock()
 		got.paths = append(got.paths, r.Method+" "+r.URL.Path)
 		if r.URL.Path == "/push" {
 			if refusePush {

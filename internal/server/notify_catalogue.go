@@ -252,9 +252,13 @@ func (s *Server) notifyWebhookTypes() map[string]bool {
 
 // notifyCatalogueEntryOf presents an event the outbox planned or sent. A
 // delivery whose source is a webhook is a webhook type even after its
-// webhook was deleted.
+// webhook was deleted. The webhooks are read only for a type no exact entry
+// or pattern claims, since nothing else can be a webhook's.
 func (s *Server) notifyCatalogueEntryOf(eventType, source string) notifyCatalogueEntry {
-	webhook := source == store.NotifySourceWebhook || s.notifyWebhookTypes()[eventType]
+	webhook := source == store.NotifySourceWebhook
+	if _, exact := notifyCatalogueByType[eventType]; !webhook && !exact && !isNotifyPluginMessageType(eventType) {
+		webhook = s.notifyWebhookTypes()[eventType]
+	}
 	return notifyCatalogueLookup(eventType, webhook)
 }
 

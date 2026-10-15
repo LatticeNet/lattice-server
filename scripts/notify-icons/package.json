@@ -1,0 +1,17 @@
+{
+  "name": "lattice-notify-icons",
+  "private": true,
+  "description": "Renders the notification icons internal/server embeds (design-notify-abstraction section 13.2).",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "generate": "node generate.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@resvg/resvg-js": "2.6.2",
+    "lucide-static": "0.563.0"
+  }
+}

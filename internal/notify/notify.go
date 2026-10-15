@@ -22,6 +22,12 @@ import (
 type Message struct {
 	Title string
 	Body  string
+	// Group and Icon tell a channel that can show them how to present the
+	// message; only Bark reads them. Group takes the place of the default
+	// group (BarkDefaultGroup) and never of a group the operator configured
+	// on the channel. Icon is an absolute image URL, sent only when set.
+	Group string
+	Icon  string
 }
 
 // Channel delivers a Message to a single destination.
@@ -127,9 +133,10 @@ func (t Telegram) Send(ctx context.Context, m Message) error {
 }
 
 // Bark pushes to a Bark server (iOS push). It sends the v2 JSON form,
-// POST <base>/push {device_key, title, body, level, group, url}, and falls
-// back to the legacy path form GET <base>/<key>/<title>/<body> when the
-// server answers 404 or 405 (bark-server 1.x has no /push route).
+// POST <base>/push {device_key, title, body, level, group, url, icon}, and
+// falls back to the legacy path form GET <base>/<key>/<title>/<body> when the
+// server answers 404 or 405 (bark-server 1.x has no /push route). Both forms
+// carry the same level, group, url and icon.
 type Bark struct {
 	BaseURL string // e.g. https://api.day.app
 	Key     string
@@ -156,7 +163,7 @@ func (b Bark) Send(ctx context.Context, m Message) error {
 	base := strings.TrimRight(b.BaseURL, "/")
 	title := orDefault(m.Title, "Lattice")
 	level := orDefault(b.Level, BarkDefaultLevel)
-	group := orDefault(b.Group, BarkDefaultGroup)
+	group := b.barkGroup(m)
 
 	payload, _ := json.Marshal(struct {
 		DeviceKey string `json:"device_key"`
@@ -165,7 +172,8 @@ func (b Bark) Send(ctx context.Context, m Message) error {
 		Level     string `json:"level"`
 		Group     string `json:"group"`
 		URL       string `json:"url,omitempty"`
-	}{b.Key, title, m.Body, level, group, b.URL})
+		Icon      string `json:"icon,omitempty"`
+	}{b.Key, title, m.Body, level, group, b.URL, m.Icon})
 	req, err := http.NewRequest(http.MethodPost, base+"/push", bytes.NewReader(payload))
 	if err != nil {
 		return err
@@ -182,6 +190,9 @@ func (b Bark) Send(ctx context.Context, m Message) error {
 	if b.URL != "" {
 		query.Set("url", b.URL)
 	}
+	if m.Icon != "" {
+		query.Set("icon", m.Icon)
+	}
 	endpoint := fmt.Sprintf("%s/%s/%s/%s?%s", base, b.Key,
 		url.PathEscape(title), url.PathEscape(m.Body), query.Encode())
 	req, err = http.NewRequest(http.MethodGet, endpoint, nil)
@@ -189,6 +200,16 @@ func (b Bark) Send(ctx context.Context, m Message) error {
 		return err
 	}
 	return doRequest(ctx, b.Client, req)
+}
+
+// barkGroup is the group a push goes out under: the group the operator
+// configured on the channel when it is not the default, otherwise the
+// message's own group, otherwise the default.
+func (b Bark) barkGroup(m Message) string {
+	if b.Group != "" && b.Group != BarkDefaultGroup {
+		return b.Group
+	}
+	return orDefault(m.Group, BarkDefaultGroup)
 }
 
 // Discord posts to an incoming webhook URL.

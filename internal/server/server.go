@@ -1614,8 +1614,12 @@ func (s *Server) Handler() http.Handler {
 	// Public on purpose as well: the lattice-knock client for operators whose
 	// network cannot reach GitHub. No credential goes in or comes out.
 	mux.HandleFunc(knockToolPathPrefix, s.handleKnockTool)
+	// Public on purpose too: the icons a Bark push shows, fetched without a
+	// session (notify_icons.go). notifyIconsFirst also catches the paths the
+	// mux would redirect.
+	mux.HandleFunc(notifyIconPathPrefix, s.handleNotifyIcon)
 	mux.Handle("/", s.staticHandler())
-	return s.withRequestID(s.withRequestLog(s.securityHeaders(mux), mux.groups))
+	return s.withRequestID(s.withRequestLog(s.securityHeaders(s.notifyIconsFirst(mux)), mux.groups))
 }
 
 // Close sends the alerts still queued for the next sweep, stops
@@ -5262,7 +5266,7 @@ func (s *Server) handleNotifyTest(w http.ResponseWriter, r *http.Request, p prin
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer cancel()
-	sendErr := ch.Send(ctx, notify.Message{Title: req.Title, Body: req.Body})
+	sendErr := ch.Send(ctx, s.presentNotifyMessage(ch.Kind(), notify.Message{Title: req.Title, Body: req.Body}, eventNotifyTest, store.NotifySourceOperator))
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.test", Scope: "notify:send", Metadata: map[string]string{"channel": req.Channel, "ok": fmt.Sprintf("%t", sendErr == nil)}})
 	if sendErr != nil {
 		writeError(w, http.StatusBadGateway, sendErr)

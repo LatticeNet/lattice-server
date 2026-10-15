@@ -220,3 +220,89 @@ func TestBarkBlocksPrivateBaseURLByPolicy(t *testing.T) {
 		}
 	}
 }
+
+// barkCapture records each request a fake Bark server receives: the JSON push
+// body, or the query of the GET fallback.
+type barkCapture struct {
+	push  map[string]string
+	query map[string]string
+	paths []string
+}
+
+func newBarkCaptureServer(t *testing.T, refusePush bool) (*httptest.Server, *barkCapture) {
+	t.Helper()
+	got := &barkCapture{}
+	srv := newLocalHTTPTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.paths = append(got.paths, r.Method+" "+r.URL.Path)
+		if r.URL.Path == "/push" {
+			if refusePush {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_ = json.NewDecoder(r.Body).Decode(&got.push)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		got.query = map[string]string{}
+		for k := range r.URL.Query() {
+			got.query[k] = r.URL.Query().Get(k)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, got
+}
+
+// The message's group and icon reach both forms of the push: the JSON body
+// and the GET fallback's query.
+func TestBarkSendsMessageGroupAndIcon(t *testing.T) {
+	const icon = "https://lattice.example.com/notify-icons/server-off-critical.png"
+	msg := Message{Title: "Node offline", Body: "hk-1", Group: "Nodes", Icon: icon}
+
+	srv, got := newBarkCaptureServer(t, false)
+	if err := (Bark{BaseURL: srv.URL, Key: "devkey", Client: srv.Client()}).Send(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	if got.push["group"] != "Nodes" || got.push["icon"] != icon {
+		t.Fatalf("JSON push = %v, want group Nodes and icon %s", got.push, icon)
+	}
+
+	srv, got = newBarkCaptureServer(t, true)
+	if err := (Bark{BaseURL: srv.URL, Key: "devkey", Client: srv.Client()}).Send(context.Background(), msg); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.paths) != 2 || got.query["group"] != "Nodes" || got.query["icon"] != icon {
+		t.Fatalf("GET fallback = %v %v, want group Nodes and icon %s", got.paths, got.query, icon)
+	}
+}
+
+// A group the operator configured is kept; the default group, written out or
+// left empty, gives way to the message's group. No icon means no icon field.
+func TestBarkGroupPrecedence(t *testing.T) {
+	cases := []struct{ configured, message, want string }{
+		{"ops", "Nodes", "ops"},
+		{BarkDefaultGroup, "Nodes", "Nodes"},
+		{"", "Nodes", "Nodes"},
+		{"", "", BarkDefaultGroup},
+		{"ops", "", "ops"},
+	}
+	for _, c := range cases {
+		for _, refusePush := range []bool{false, true} {
+			srv, got := newBarkCaptureServer(t, refusePush)
+			b := Bark{BaseURL: srv.URL, Key: "devkey", Group: c.configured, Client: srv.Client()}
+			if err := b.Send(context.Background(), Message{Body: "x", Group: c.message}); err != nil {
+				t.Fatal(err)
+			}
+			fields := got.push
+			if refusePush {
+				fields = got.query
+			}
+			if fields["group"] != c.want {
+				t.Fatalf("configured %q, message %q, GET fallback %t: group %q, want %q", c.configured, c.message, refusePush, fields["group"], c.want)
+			}
+			if _, present := fields["icon"]; present {
+				t.Fatalf("a message without an icon must not send one: %v", fields)
+			}
+		}
+	}
+}

@@ -292,7 +292,7 @@ func (s *Server) sendNotifyChannelTest(c model.NotifyChannel) (store.NotifyDeliv
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTestTimeout)
 	started := time.Now()
-	err := s.notifySend(ctx, c, notify.Message{Title: row.Title, Body: row.Body})
+	err := s.notifySend(ctx, c, s.presentNotifyMessage(c.Kind, notify.Message{Title: row.Title, Body: row.Body}, row.EventType, row.Source))
 	cancel()
 	attempt := store.NotifyAttempt{At: s.now(), OK: err == nil, DurationMS: time.Since(started).Milliseconds()}
 	kind, status, _ := redactSendError(err)

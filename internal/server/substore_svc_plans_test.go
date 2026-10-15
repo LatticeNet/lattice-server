@@ -30,7 +30,8 @@ const (
 
 // subStoreFakePreviewer is the test double of the bind code: a fixed result
 // per revision and identity, the record's live revision, and a record of
-// every query.
+// every query. One query is one render of one revision, whatever the
+// identities it binds.
 type subStoreFakePreviewer struct {
 	mu      sync.Mutex
 	results map[string]subStoreBindResult
@@ -39,16 +40,20 @@ type subStoreFakePreviewer struct {
 	err     error
 }
 
-func (f *subStoreFakePreviewer) PreviewBind(_ context.Context, q subStoreBindQuery) (subStoreBindResult, error) {
+func (f *subStoreFakePreviewer) PreviewBind(_ context.Context, q subStoreBindQuery) (map[string]subStoreBindResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, q)
 	if f.err != nil {
-		return subStoreBindResult{}, f.err
+		return nil, f.err
 	}
-	result := f.results[q.Revision+"|"+q.IdentityID]
-	result.LiveRevision = f.live
-	return result, nil
+	out := make(map[string]subStoreBindResult, len(q.IdentityIDs))
+	for _, identityID := range q.IdentityIDs {
+		result := f.results[q.Revision+"|"+identityID]
+		result.LiveRevision = f.live
+		out[identityID] = result
+	}
+	return out, nil
 }
 
 func (f *subStoreFakePreviewer) set(key string, result subStoreBindResult) {
@@ -203,8 +208,11 @@ func (h *subStorePlanHarness) claimApply(ctx context.Context, req subStoreApplyR
 // gate.
 func TestSubStorePlansProposeHashCoversDiffAndApplyWaitsForApproval(t *testing.T) {
 	h := newSubStorePlanHarness(t)
-	alice, _ := h.st.SubscriptionShare(h.findShare(t, "alice-phone"))
-	if res := h.fetch("/sub/alice-phone/" + alice.Token); res.Code != http.StatusOK {
+	// The harness's record renders a document, which an identity-bound share
+	// answers with the decoy (fleet_share_legacy_document), so the cache is
+	// watched through the share that names no identity.
+	unbound, _ := h.st.SubscriptionShare(h.findShare(t, "provider-only"))
+	if res := h.fetch("/sub/provider-only/" + unbound.Token); res.Code != http.StatusOK {
 		t.Fatalf("serve before apply: %d", res.Code)
 	}
 	rendersBefore := h.renders.Load()
@@ -265,9 +273,10 @@ func TestSubStorePlansProposeHashCoversDiffAndApplyWaitsForApproval(t *testing.T
 	if plan.Totals != (subStorePlanTotals{Shares: 3, UnboundShares: 1, Identities: 2, Added: 1, Removed: 2, Changed: 1, Excluded: 2}) {
 		t.Fatalf("totals = %+v", plan.Totals)
 	}
-	// One preview per revision per identity, not per share.
-	if h.previewer.callCount() != 4 {
-		t.Fatalf("previewer called %d times, want 4", h.previewer.callCount())
+	// One render per revision, binding both identities, not one per share
+	// or per identity.
+	if h.previewer.callCount() != 2 {
+		t.Fatalf("previewer called %d times, want 2", h.previewer.callCount())
 	}
 	if h.appliedCount() != 0 {
 		t.Fatal("propose applied the revision")
@@ -293,8 +302,8 @@ func TestSubStorePlansProposeHashCoversDiffAndApplyWaitsForApproval(t *testing.T
 		t.Fatalf("approve: %d %s", res.Code, res.Body.String())
 	}
 	// The decision previewed both revisions again before applying.
-	if h.previewer.callCount() != 8 {
-		t.Fatalf("previewer called %d times by the decision, want 4 more", h.previewer.callCount()-4)
+	if h.previewer.callCount() != 4 {
+		t.Fatalf("previewer called %d times by the decision, want 2 more", h.previewer.callCount()-2)
 	}
 	if h.appliedCount() != 1 {
 		t.Fatalf("apply_revision called %d times", h.appliedCount())
@@ -308,7 +317,7 @@ func TestSubStorePlansProposeHashCoversDiffAndApplyWaitsForApproval(t *testing.T
 		t.Fatalf("approval after apply = %+v", current)
 	}
 	// The body rendered from rev-1 is not served after the apply.
-	if res := h.fetch("/sub/alice-phone/" + alice.Token); res.Code != http.StatusOK || h.renders.Load() == rendersBefore {
+	if res := h.fetch("/sub/provider-only/" + unbound.Token); res.Code != http.StatusOK || h.renders.Load() == rendersBefore {
 		t.Fatalf("the share was served from the pre-apply cache (%d renders before, %d after)", rendersBefore, h.renders.Load())
 	}
 	// Approving again applies nothing more.

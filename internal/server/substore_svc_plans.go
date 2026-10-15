@@ -107,17 +107,6 @@ func subStoreCoreOnlyMethod(service, method string) bool {
 	return service == subStorePluginID+"/subscription" && method == subStoreApplyRevisionMethod
 }
 
-// subStoreBindQuery asks for the validate-and-bind result of one record
-// revision for one identity.
-type subStoreBindQuery struct {
-	PluginID       string
-	SubscriptionID string
-	// Revision is the record revision to render. Never empty: propose
-	// names the live revision and the staged one explicitly.
-	Revision   string
-	IdentityID string
-}
-
 // subStoreBindLine is one entry in a bind result, or one exclusion in a
 // plan. It carries no credential, no host and no template: a line is named
 // by its line_uuid and its label.
@@ -151,15 +140,6 @@ type subStoreBindResult struct {
 	// propose refuses a from_revision that is not live, and the decision
 	// rejects a plan whose record has moved.
 	LiveRevision string
-}
-
-// subStoreBindPreviewer runs validate-and-bind without serving anything:
-// fetch or reuse the record's snapshot, render the named revision to a plan,
-// validate every node against the catalogue, bind the identity, and report
-// the entries included and excluded, credential-free, with the record's
-// live revision. bind.preview answers the UI from the same step.
-type subStoreBindPreviewer interface {
-	PreviewBind(ctx context.Context, q subStoreBindQuery) (subStoreBindResult, error)
 }
 
 // subStoreApplyRevisionRequest is the payload of the plugin's
@@ -482,7 +462,8 @@ func (s *Server) subStoreBuildPlan(ctx context.Context, req subStorePlansPropose
 			identityIDs = append(identityIDs, identityID)
 		}
 	}
-	identities, err := s.subStorePlanIdentities(ctx, req.SubscriptionID, req.FromRevision, req.ToRevision, identityIDs)
+	identities, err := s.subStorePlanIdentities(ctx, req.SubscriptionID, req.FromRevision,
+		subStorePlanSide{Revision: req.FromRevision}, subStorePlanSide{Revision: req.ToRevision}, identityIDs)
 	if err != nil {
 		return subStorePlan{}, subStorePlanProposeError(err)
 	}
@@ -535,48 +516,6 @@ type subStorePlanPreviewError struct {
 
 func (e *subStorePlanPreviewError) Error() string {
 	return fmt.Sprintf("bind preview failed for revision %s and identity %s", e.revision, e.identityID)
-}
-
-// subStorePlanIdentities previews both revisions once per identity, checks
-// that every preview read from as the record's live revision, and diffs
-// them, sorted by identity. With no identity it previews nothing.
-func (s *Server) subStorePlanIdentities(ctx context.Context, subscriptionID, from, to string, identityIDs []string) ([]subStorePlanIdentity, error) {
-	out := []subStorePlanIdentity{}
-	if len(identityIDs) == 0 {
-		return out, nil
-	}
-	previewer := s.subStoreSvc.previewer
-	if previewer == nil {
-		return nil, errSubStorePlanNoPreviewer
-	}
-	sorted := append([]string(nil), identityIDs...)
-	sort.Strings(sorted)
-	preview := func(revision, identityID string) (subStoreBindResult, error) {
-		result, err := previewer.PreviewBind(ctx, subStoreBindQuery{
-			PluginID: subStorePluginID, SubscriptionID: subscriptionID, Revision: revision, IdentityID: identityID,
-		})
-		if err != nil {
-			s.logger.Printf("sub-store plans: bind preview failed for record %s revision %s identity %s (%s)",
-				subscriptionID, revision, identityID, subscriptionDiagnosticSummary(err))
-			return subStoreBindResult{}, &subStorePlanPreviewError{revision: revision, identityID: identityID}
-		}
-		if result.LiveRevision != from {
-			return subStoreBindResult{}, errSubStorePlanNotLive
-		}
-		return result, nil
-	}
-	for _, identityID := range sorted {
-		before, err := preview(from, identityID)
-		if err != nil {
-			return nil, err
-		}
-		after, err := preview(to, identityID)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, subStorePlanDiff(identityID, before, after))
-	}
-	return out, nil
 }
 
 // subStorePlanIdentityIDs is every identity a plan's shares name.
@@ -793,7 +732,8 @@ func (s *Server) subStorePlanApprove(ctx context.Context, p principal, approval 
 	// The previews run outside the share-write lock: one may fetch and
 	// render, and no share write waits on it. The lock below then checks
 	// that the shares the previews were made for are still the record's.
-	identities, err := s.subStorePlanIdentities(ctx, plan.SubscriptionID, plan.FromRevision, plan.ToRevision, subStorePlanIdentityIDs(plan))
+	identities, err := s.subStorePlanIdentities(ctx, plan.SubscriptionID, plan.FromRevision,
+		subStorePlanSide{Revision: plan.FromRevision}, subStorePlanSide{Revision: plan.ToRevision}, subStorePlanIdentityIDs(plan))
 	staleReason := ""
 	var previewErr *subStorePlanPreviewError
 	switch {

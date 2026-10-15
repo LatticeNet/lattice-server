@@ -269,7 +269,7 @@ func (s *Server) handleNotifyChannelTest(w http.ResponseWriter, r *http.Request,
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.channel.test", Scope: "notify:admin", Metadata: metadata})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       sent,
-		"delivery": row,
+		"delivery": toNotifyDeliveryView(row, nil),
 		"health":   toNotifyChannelHealthView(health, s.now()),
 	})
 }
@@ -363,7 +363,7 @@ func (s *Server) handleNotifyDeliveries(w http.ResponseWriter, r *http.Request, 
 		Limit:     limit,
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"deliveries": s.store.NotifyDeliveries(filter),
+		"deliveries": toNotifyDeliveryViews(s.store.NotifyDeliveries(filter), s.notifyWebhookTypes()),
 		"stored":     s.store.NotifyDeliveryCount(),
 		"durable":    s.store.NotifyOutboxDurable(),
 		"max":        store.MaxNotifyDeliveries,

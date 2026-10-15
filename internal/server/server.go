@@ -1414,6 +1414,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/notify/channels/delete", s.withAuth("notify:admin", s.handleDeleteNotifyChannel))
 	mux.HandleFunc("/api/notify/channels/test", s.withAuth("notify:admin", s.handleNotifyChannelTest))
 	mux.HandleFunc("/api/notify/deliveries", s.withAuth("notify:admin", s.handleNotifyDeliveries))
+	mux.HandleFunc("/api/notify/catalogue", s.withAuth("notify:admin", s.handleNotifyCatalogue))
 	mux.HandleFunc("/api/notify/witness", s.withAuth("notify:admin", s.handleWitnessStatus))
 	mux.HandleFunc("/api/notify/witness/plan", s.withAuth("notify:admin", s.handleWitnessPlan))
 	mux.HandleFunc("/api/notify/rules", s.withAuth("notify:admin", s.handleNotifyRules))

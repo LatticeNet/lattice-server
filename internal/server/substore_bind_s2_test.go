@@ -461,6 +461,55 @@ func TestBindDigestCoversPolicyInputs(t *testing.T) {
 	}
 }
 
+// The digest covers the addresses a bound line's hosts resolved to, with or
+// without a policy: check 3 and the NAT rule read them, and a DNS answer
+// that changes reaches the catalogue at the next name refresh without moving
+// the record's snapshot, so a cached body must not outlive it.
+func TestBindDigestCoversLineAddresses(t *testing.T) {
+	env := bindShareFixture(t)
+	s := env.srv
+	const host = "dial.provider.example"
+	editSingBoxLine(t, s, "node-000", "vless-20000", func(n *model.SingBoxNode) {
+		n.ShareURL = strings.Replace(n.ShareURL, "@"+catalogueNodeIP(0)+":", "@"+host+":", 1)
+	})
+	for i := 0; i < 2; i++ {
+		if err := s.syncLineClientTemplates(env.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	answer := "46.1.2.3"
+	s.substoreCatalogue.names.lookup = func(_ context.Context, name string) ([]net.IPAddr, error) {
+		if name == host {
+			return []net.IPAddr{{IP: net.ParseIP(answer)}}, nil
+		}
+		return nil, errors.New("no such host")
+	}
+	s.refreshLineCatalogueNames(env.now)
+	if row := env.read(t, "").Rows[0]; row.Template == nil || row.Template.Host != host || !slices.Contains(row.Addresses, answer) {
+		t.Fatalf("the fixture's first line does not dial %s at %s: %+v", host, answer, row)
+	}
+	u, _ := s.getVpnUser(bindIdentityID)
+	policies := map[string]*model.BindPolicy{"no policy": nil, "every rule": substoreBindTestPolicy(1 << 30)}
+	before := map[string]string{}
+	for name, policy := range policies {
+		before[name] = s.substoreBindStateDigest(u, policy, nil)
+	}
+	answer = "46.1.2.4"
+	s.refreshLineCatalogueNames(env.now)
+	for name, policy := range policies {
+		if s.substoreBindStateDigest(u, policy, nil) == before[name] {
+			t.Errorf("%s: a new address for the line's host did not move the digest", name)
+		}
+	}
+	answer = "46.1.2.3"
+	s.refreshLineCatalogueNames(env.now)
+	for name, policy := range policies {
+		if s.substoreBindStateDigest(u, policy, nil) != before[name] {
+			t.Errorf("%s: the old address did not restore the digest", name)
+		}
+	}
+}
+
 // The usage input is the boolean used > threshold, so it moves exactly where
 // the rule excludes: not between T-1 and T, and between T and T+1.
 func TestBindDigestFlipsExactlyWhereUsageRuleDoes(t *testing.T) {

@@ -1016,38 +1016,136 @@ func TestProposeRunsImmediatelyAfterApply(t *testing.T) {
 	}
 }
 
-// BenchmarkSubstoreBindPlan1000 binds a 1000-node plan that states its
-// selection and turns every policy rule on, against a fresh 1000-line
-// catalogue build: the core's share of a fleet-bound cache miss (target
-// under 50 ms, design 28 S2 section 5).
-func BenchmarkSubstoreBindPlan1000(b *testing.B) {
-	e := bindFixture(b, 100, 10)
-	plan := bindNodesPlan(b, e.rows)
+// substoreBindGate is the fixture of the section 5 bind gate: a 1000-node
+// plan that states its selection and turns every policy rule on, decoded
+// through the SDK's strict codec the way a render reply arrives, the
+// identity bound to every one of the 1000 lines, and the inputs the serve
+// path passes.
+type substoreBindGate struct {
+	env  *bindEnv
+	plan model.SelectionPlan
+	u    VpnUser
+	in   substoreBindInputs
+}
+
+func newSubstoreBindGate(tb testing.TB) *substoreBindGate {
+	tb.Helper()
+	e := bindFixture(tb, 100, 10)
+	plan := bindNodesPlan(tb, e.rows)
 	plan.Selection = planSelection("lcv1-bench", e.rows...)
 	plan.Policy = substoreBindTestPolicy(1 << 40)
 	raw, err := model.EncodeSelectionPlan(plan)
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	if plan, err = model.DecodeSelectionPlan(raw); err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
 	u, _ := e.srv.getVpnUser(bindIdentityID)
 	usage := map[string]int64{}
 	for _, row := range e.rows {
 		usage[row.LineHashID] = 1 << 30
 	}
-	names := e.srv.substoreCatalogue.names.snapshot()
+	return &substoreBindGate{env: e, plan: plan, u: u, in: substoreBindInputs{usage: usage, names: e.srv.substoreCatalogue.names.snapshot()}}
+}
+
+// catalogue builds the 1000-line catalogue the gate binds against.
+func (g *substoreBindGate) catalogue(tb testing.TB) *lineCatalogue {
+	tb.Helper()
+	c, err := g.env.srv.buildLineCatalogue("")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return c
+}
+
+// bind binds the plan against c and checks that every node bound.
+func (g *substoreBindGate) bind(tb testing.TB, c *lineCatalogue) substoreBindResult {
+	tb.Helper()
+	result := substoreBindPlan(g.plan, g.u, c, g.in)
+	if len(result.nodes) != len(g.env.rows) {
+		tb.Fatalf("%d of %d nodes bound", len(result.nodes), len(g.env.rows))
+	}
+	return result
+}
+
+// substoreBindGateOp is the operation BenchmarkSubstoreBindPlan1000 times:
+// core's bind against a catalogue built once, before the op, as section 5's
+// row reads ("core bind of a 1000-node plan against a 1000-line catalogue").
+// TestSubstoreBindGateOpAllocsBound bounds the same op, so a catalogue build
+// moved back into it fails in the verify job.
+func substoreBindGateOp(tb testing.TB) func() {
+	tb.Helper()
+	g := newSubstoreBindGate(tb)
+	c := g.catalogue(tb)
+	return func() { g.bind(tb, c) }
+}
+
+// BenchmarkSubstoreBindPlan1000 is the section 5 gate: core's bind of a
+// 1000-node plan against a 1000-line catalogue, under 50 ms (design 28 S2).
+// The catalogue build is outside the timed op; the serve path's miss pays
+// both, which BenchmarkSubstoreBindPlanWithCatalogueBuild1000 records.
+func BenchmarkSubstoreBindPlan1000(b *testing.B) {
+	op := substoreBindGateOp(b)
 	b.ReportAllocs()
-	b.ResetTimer()
 	for b.Loop() {
-		catalogue, err := e.srv.buildLineCatalogue("")
-		if err != nil {
-			b.Fatal(err)
-		}
-		if result := substoreBindPlan(plan, u, catalogue, substoreBindInputs{usage: usage, names: names}); len(result.nodes) != len(e.rows) {
-			b.Fatalf("%d of %d nodes bound", len(result.nodes), len(e.rows))
-		}
+		op()
+	}
+}
+
+// BenchmarkSubstoreBindPlanWithCatalogueBuild1000 is informational: the
+// serve path's cache miss builds a fresh catalogue before it binds, so this
+// times the build and the bind together. The build alone is lane 5b's
+// catalogue figure.
+func BenchmarkSubstoreBindPlanWithCatalogueBuild1000(b *testing.B) {
+	g := newSubstoreBindGate(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		g.bind(b, g.catalogue(b))
+	}
+}
+
+// substoreBindGateOpAllocs bounds one op of the bind gate. Measured
+// 2026-10-15 on darwin/arm64, go1.26.6: 409,170 allocations an op, 459,121
+// under -race -cover (CI runs internal/server that way). With a catalogue
+// build in the op the count is 633,120, and 723,419 under -race -cover. The
+// bound sits between the two regimes, as the approvals listing bound does,
+// rather than at the repository's usual one and a half times, which would
+// let a build back in: about 1.37 times the plain count and 1.22 times the
+// -race -cover count.
+const substoreBindGateOpAllocs = 560_000
+
+// The bind gate's op allocates within a bound: a deterministic gate on
+// core's bind cost in the verify job, beside the wall-clock figure the perf
+// job takes, and the check that the gate times the bind and not a catalogue
+// build as well.
+func TestSubstoreBindGateOpAllocsBound(t *testing.T) {
+	op := substoreBindGateOp(t)
+	allocs := testing.AllocsPerRun(3, op)
+	t.Logf("bind gate op: %.0f allocations", allocs)
+	if allocs > substoreBindGateOpAllocs {
+		t.Fatalf("one bind of the 1000-node plan made %.0f allocations, over the bound of %d", allocs, substoreBindGateOpAllocs)
+	}
+}
+
+// Bind never writes the catalogue it reads, so one build serves every
+// identity a preview binds (substoreBindPrepare) and the bind gate can time
+// repeated binds against one build: after binds against a catalogue, it
+// equals a fresh build, and a bind against it equals a bind against a fresh
+// build.
+func TestBindLeavesCatalogueUnchanged(t *testing.T) {
+	g := newSubstoreBindGate(t)
+	reused, fresh := g.catalogue(t), g.catalogue(t)
+	if !reflect.DeepEqual(reused, fresh) {
+		t.Fatal("two catalogue builds over the same state differ; the comparison below means nothing")
+	}
+	first := g.bind(t, reused)
+	second := g.bind(t, reused)
+	if !reflect.DeepEqual(reused, fresh) {
+		t.Fatal("bind wrote the catalogue it read")
+	}
+	if want := g.bind(t, g.catalogue(t)); !reflect.DeepEqual(first, want) || !reflect.DeepEqual(second, want) {
+		t.Fatal("a bind against a reused catalogue differs from a bind against a fresh build")
 	}
 }
 

@@ -5,8 +5,8 @@
 // catalogue can produce, written by the Go test
 // TestNotifyIconManifestMatchesCatalogue with -update-notify-icons.
 // Output: one PNG per pair in internal/server/notifyicons/, a full-bleed
-// 180 px square in the tone's fill with the lucide glyph in white, so the
-// iOS icon mask and both iOS themes read it. PNGs no pair names are removed.
+// 180 px square in the tone's fill with the lucide glyph in the tone's ink,
+// so the iOS icon mask and both iOS themes read it. PNGs no pair names are removed.
 //
 // The glyphs come from lucide-static at the version the console's
 // lucide-vue-next uses, so a push and its Sent log row show the same glyph.
@@ -35,14 +35,24 @@ const GLYPH = 108;
 // destructive, warning and info sit just outside sRGB and clip; success and
 // the muted grey do not. The grey is --muted-foreground: --muted itself is
 // too light to carry a white glyph.
+//
+// Glyph ink follows the token's pairing: the console puts near-white
+// foregrounds on destructive, info and success, but pairs --warning with the
+// dark --warning-foreground, because white on that amber is about 2.2:1. The
+// warning glyph takes that dark ink (about 6.6:1); the others stay white.
 const TONES = {
   critical: { token: '--destructive', oklch: [0.55, 0.231, 27.5], hex: '#d8000b' },
-  warning: { token: '--warning', oklch: [0.72, 0.16, 73], hex: '#e09200' },
+  warning: {
+    token: '--warning',
+    oklch: [0.72, 0.16, 73],
+    hex: '#e09200',
+    ink: { token: '--warning-foreground', oklch: [0.26, 0.05, 70], hex: '#331f05' },
+  },
   notice: { token: '--info', oklch: [0.6, 0.14, 240], hex: '#0089ca' },
   recovered: { token: '--success', oklch: [0.62, 0.16, 150], hex: '#20a04e' },
   quiet: { token: '--muted-foreground', oklch: [0.524, 0.022, 281], hex: '#676977' },
 };
-const GLYPH_INK = '#ffffff';
+const WHITE_INK = '#ffffff';
 
 // OKLCH to sRGB hex, Bjorn Ottosson's OKLab matrices.
 function oklchToHex([L, C, h]) {
@@ -68,11 +78,14 @@ for (const [tone, t] of Object.entries(TONES)) {
   if (derived !== t.hex) {
     throw new Error(`tone ${tone}: ${t.token} oklch(${t.oklch.join(' ')}) converts to ${derived}, not the recorded ${t.hex}`);
   }
+  if (t.ink && oklchToHex(t.ink.oklch) !== t.ink.hex) {
+    throw new Error(`tone ${tone}: ${t.ink.token} oklch(${t.ink.oklch.join(' ')}) converts to ${oklchToHex(t.ink.oklch)}, not the recorded ${t.ink.hex}`);
+  }
 }
 
 // glyphBody is a lucide icon's drawing: the children of its <svg>, with the
-// license comment dropped and currentColor inked white.
-function glyphBody(icon) {
+// license comment dropped and currentColor set to ink.
+function glyphBody(icon, ink) {
   let svg;
   try {
     svg = readFileSync(join(lucideIcons, `${icon}.svg`), 'utf8');
@@ -87,7 +100,7 @@ function glyphBody(icon) {
   return svg
     .slice(open + 1, close)
     .replace(/<!--[\s\S]*?-->/g, '')
-    .replaceAll('currentColor', GLYPH_INK)
+    .replaceAll('currentColor', ink)
     .trim();
 }
 
@@ -96,13 +109,14 @@ function iconSVG(icon, tone) {
   if (!fill) {
     throw new Error(`unknown tone "${tone}"`);
   }
+  const ink = TONES[tone].ink?.hex ?? WHITE_INK;
   const offset = (SIZE - GLYPH) / 2;
   const scale = GLYPH / 24;
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}" viewBox="0 0 ${SIZE} ${SIZE}">`,
     `<rect width="${SIZE}" height="${SIZE}" fill="${fill}"/>`,
-    `<g transform="translate(${offset} ${offset}) scale(${scale})" fill="none" stroke="${GLYPH_INK}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">`,
-    glyphBody(icon),
+    `<g transform="translate(${offset} ${offset}) scale(${scale})" fill="none" stroke="${ink}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">`,
+    glyphBody(icon, ink),
     '</g>',
     '</svg>',
   ].join('\n');

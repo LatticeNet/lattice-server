@@ -5,7 +5,9 @@
 `internal/server/notifyicons/` and serves them at `/notify-icons/<icon>-<tone>.png`.
 
 Each icon is a 180 px full-bleed square in its tone's fill with the lucide
-glyph in white. The tone fills are the light-mode values of the console's
+glyph in white, except warning, whose glyph takes the dark
+`--warning-foreground` the console pairs with that amber (white on it is
+about 2.2:1). The tone fills are the light-mode values of the console's
 semantic tokens in `lattice-dashboard/src/style/app.css`, converted to sRGB;
 the script records the hex values and fails if they no longer match the OKLCH
 source. The glyphs come from `lucide-static` pinned to the version of the

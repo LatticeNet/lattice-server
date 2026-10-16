@@ -677,3 +677,27 @@ func TestUnknownResultsReadUnknownAndKeepTheStreak(t *testing.T) {
 		t.Fatalf("the next real failure continues the streak: %+v", latest)
 	}
 }
+
+// A token that may not read a check's target node can neither edit nor
+// delete the check, even when it administers every source.
+func TestMonitorTargetNodeGuardsEditAndDelete(t *testing.T) {
+	_, handler, st := checksFleet(t)
+	cookies, csrf := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodPost, "/api/monitors", `{"name":"p","type":"icmp","target_node":"node-tgt","node_ids":["node-new"]}`, cookies, csrf)
+	var created model.Monitor
+	if err := json.Unmarshal([]byte(readBody(t, res)), &created); err != nil || created.ID == "" {
+		t.Fatalf("create: %v", err)
+	}
+	token := createPAT(t, handler, cookies, csrf, []string{"monitor:admin", "monitor:read"}, []string{"node-new"})
+	edit := doBearerJSON(t, handler, http.MethodPost, "/api/monitors/update", `{"id":"`+created.ID+`","version":1,"name":"renamed"}`, token)
+	if body := readBody(t, edit); edit.StatusCode != http.StatusForbidden || strings.Contains(body, "198.51.100.20") {
+		t.Fatalf("edit by a token that cannot read the target = %d %s", edit.StatusCode, body)
+	}
+	del := doBearerJSON(t, handler, http.MethodPost, "/api/monitors/delete", `{"id":"`+created.ID+`"}`, token)
+	if body := readBody(t, del); del.StatusCode != http.StatusForbidden {
+		t.Fatalf("delete by a token that cannot read the target = %d %s", del.StatusCode, body)
+	}
+	if _, ok := st.Monitor(created.ID); !ok {
+		t.Fatal("the check is gone")
+	}
+}

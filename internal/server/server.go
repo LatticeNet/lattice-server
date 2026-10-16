@@ -5644,6 +5644,12 @@ func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) boo
 }
 
 func monitorManageableByPrincipal(p principal, mon model.Monitor) bool {
+	// A check that names a node is managed only by a caller who may read
+	// that node, as creating it required: an edit's answer carries the
+	// node's resolved address.
+	if mon.TargetNode != "" && !latencyNodeVisible(p, mon.TargetNode) {
+		return false
+	}
 	if mon.AssignAll {
 		return !principalHasNodeRestriction(p) && rbac.Allows(p.Principal, "monitor:admin", "")
 	}

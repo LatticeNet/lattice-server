@@ -365,10 +365,20 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 // without a template too is withheld.
 func finishLineCatalogueRow(row *model.LineCatalogueRow, identity lineCatalogueSecrets) (raw []byte, keptTemplate bool, err error) {
 	for {
-		err = row.Validate()
+		// Validate's size bound encodes the row; ValidateEncoded reads it
+		// from the encoding the row is served as, so each row is encoded
+		// once. A row that does not encode is judged by Validate, which
+		// words the error as before.
+		raw, err = json.Marshal(row)
+		if err != nil {
+			if verr := row.Validate(); verr != nil {
+				err = verr
+			}
+		} else {
+			err = row.ValidateEncoded(raw)
+		}
 		if err == nil {
-			raw, err = json.Marshal(row)
-			if err == nil && identity.in(raw) {
+			if identity.in(raw) {
 				err = errors.New("the named identity's credential survives in the row")
 			}
 			if err == nil {

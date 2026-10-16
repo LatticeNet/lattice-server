@@ -157,6 +157,7 @@ func (s *Store) DeleteNode(nodeID string) (NodeCascadeReport, bool, error) {
 		// recoveries. Should this delete fail, the incident sweep drops the
 		// rows it finds for a node that no longer exists.
 		_ = s.deleteIncidentsLocked(func(inc Incident) bool { return inc.NodeID == nodeID })
+		s.deletePathDegradedMemLocked(func(p MonitorPair) bool { return p.NodeID == nodeID })
 	}
 	return report, true, err
 }

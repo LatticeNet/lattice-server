@@ -1139,7 +1139,45 @@ func (s *Server) normalizeLatencyProbeConfig(in model.LatencyProbeConfig) (model
 		}
 		out.SourceMethods[sourceID] = method
 	}
+	// The alert policy and the degraded thresholds (design 29 D13). The
+	// output is built field by field, so each is copied here or a save
+	// drops it. An empty policy stays empty and reads as off.
+	out.Alert = strings.TrimSpace(in.Alert)
+	degraded, err := validMonitorAlertFor(model.MonitorTypeTCP, out.Alert, in.Degraded)
+	if err != nil {
+		return out, err
+	}
+	out.Degraded = degraded
+	if in.AlertAfter < 0 || in.AlertAfter > model.MonitorAlertAfterMax {
+		return out, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax)
+	}
+	out.AlertAfter = in.AlertAfter
 	return out, nil
+}
+
+// latencyConfigChanged names the path set fields a save changed, for its
+// audit record.
+func latencyConfigChanged(prior, next model.LatencyProbeConfig) []string {
+	var out []string
+	note := func(field string, differs bool) {
+		if differs {
+			out = append(out, field)
+		}
+	}
+	note("enabled", prior.Enabled != next.Enabled)
+	note("interval_sec", prior.IntervalSec != next.IntervalSec)
+	note("timeout_sec", prior.TimeoutSec != next.TimeoutSec)
+	note("sources", !slices.Equal(prior.Sources, next.Sources))
+	note("auto_targets", prior.AutoTargets != next.AutoTargets)
+	note("include_targets", !slices.Equal(prior.IncludeTargets, next.IncludeTargets))
+	note("exclude_targets", !slices.Equal(prior.ExcludeTargets, next.ExcludeTargets))
+	note("disabled_pairs", !slices.Equal(prior.DisabledPairs, next.DisabledPairs))
+	note("method", prior.Method != next.Method)
+	note("source_methods", latencyMethodList(prior.SourceMethods) != latencyMethodList(next.SourceMethods))
+	note("alert", model.EffectiveMonitorAlert(prior.Alert, true) != model.EffectiveMonitorAlert(next.Alert, true))
+	note("alert_after", pathSetPolicy(prior).after != pathSetPolicy(next).after)
+	note("degraded", !degradedRulesEqual(prior.Degraded, next.Degraded))
+	return out
 }
 
 // latencyNodeVisible is whether a principal may read latency data about a
@@ -1253,6 +1291,7 @@ func (s *Server) handleLatencyProbes(w http.ResponseWriter, r *http.Request, p p
 				return
 			}
 		}
+		prior, _ := s.store.LatencyProbeConfig()
 		stored, err := s.store.SetLatencyProbeConfig(cfg, req.Version, p.ActorID, now)
 		if errors.Is(err, store.ErrLatencyProbeVersion) {
 			writeError(w, http.StatusConflict, err)
@@ -1280,6 +1319,10 @@ func (s *Server) handleLatencyProbes(w http.ResponseWriter, r *http.Request, p p
 				"disabled_pairs":  strconv.Itoa(len(stored.DisabledPairs)),
 				"method":          stored.Method,
 				"source_methods":  latencyMethodList(stored.SourceMethods),
+				"alert":           model.EffectiveMonitorAlert(stored.Alert, true),
+				"alert_after":     strconv.Itoa(pathSetPolicy(stored).after),
+				"degraded":        degradedRuleSummary(stored.Degraded),
+				"changed":         strings.Join(latencyConfigChanged(prior, stored), ","),
 			},
 		})
 		plan, _, err := s.syncLatencyProbes(now)

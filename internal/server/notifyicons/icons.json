@@ -95,6 +95,16 @@
     "tone": "critical"
   },
   {
+    "file": "signal-high-recovered.png",
+    "icon": "signal-high",
+    "tone": "recovered"
+  },
+  {
+    "file": "signal-low-warning.png",
+    "icon": "signal-low",
+    "tone": "warning"
+  },
+  {
     "file": "webhook-quiet.png",
     "icon": "webhook",
     "tone": "quiet"

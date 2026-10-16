@@ -294,9 +294,12 @@ type Store struct {
 	walAnchorPath      string
 	// The last chain walk, guarded separately so a readiness probe reading it
 	// never queues behind a long write holding mu.
-	auditVerifyMu      sync.Mutex
-	lastAuditVerify    AuditWALVerification
-	runtimeBoltHot     *BoltStateStore // optional record-level sidecar for high-churn runtime domains
+	auditVerifyMu   sync.Mutex
+	lastAuditVerify AuditWALVerification
+	runtimeBoltHot  *BoltStateStore // optional record-level sidecar for high-churn runtime domains
+	// pathDegraded holds the degraded evaluator's records without the hot
+	// store (monitor_degraded.go). Guarded by mu.
+	pathDegraded       map[MonitorPair]PathDegradedRecord
 	runtimeBoltHotPath string
 	syncParentDir      func(string) error
 	// taskQueueDeadline is how long a task may sit undelivered before the
@@ -5631,6 +5634,7 @@ func (s *Store) DeleteMonitor(id string) error {
 	}
 	delete(s.state.Monitors, id)
 	delete(s.state.MonResults, id)
+	s.deletePathDegradedMemLocked(func(p MonitorPair) bool { return p.MonitorID == id })
 	for key := range s.monitorPersistedAt {
 		if strings.HasPrefix(key, id+"\x00") {
 			delete(s.monitorPersistedAt, key)

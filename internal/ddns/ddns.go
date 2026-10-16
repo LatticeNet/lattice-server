@@ -73,12 +73,12 @@ func NewProvider(p model.DDNSProfile, client *http.Client) (Provider, error) {
 	switch p.Provider {
 	case model.DDNSProviderCloudflare:
 		if p.CFAPIToken == "" {
-			return nil, errors.New("cloudflare: cf_api_token is required")
+			return nil, &ConfigError{msg: "cloudflare: cf_api_token is required"}
 		}
 		return &Cloudflare{Token: p.CFAPIToken, Client: client}, nil
 	case model.DDNSProviderWebhook:
 		if p.WebhookURL == "" {
-			return nil, errors.New("webhook: webhook_url is required")
+			return nil, &ConfigError{msg: "webhook: webhook_url is required"}
 		}
 		return &Webhook{
 			URL:     p.WebhookURL,
@@ -89,8 +89,75 @@ func NewProvider(p model.DDNSProfile, client *http.Client) (Provider, error) {
 			Guard:   GuardOutbound,
 		}, nil
 	default:
-		return nil, fmt.Errorf("unknown ddns provider %q", p.Provider)
+		return nil, &ConfigError{msg: fmt.Sprintf("unknown ddns provider %q", p.Provider)}
 	}
+}
+
+// ConfigError is a setting the operator has to change before a run can
+// succeed: a credential the profile lacks, a provider Lattice does not know,
+// or a name no zone the credential can read holds. Its message names the
+// setting and holds nothing from inside the control plane.
+type ConfigError struct{ msg string }
+
+func (e *ConfigError) Error() string { return e.msg }
+
+// Failure says who can act on a failed run, and whether its text can be
+// shown to them.
+type Failure int
+
+const (
+	// FailureInternal is a request that never got an answer from the
+	// provider, or an answer that is not quoted, such as a webhook
+	// endpoint's raw body. Its text can carry detail from inside the control
+	// plane, such as an address its resolver returned or a URL it dialed.
+	FailureInternal Failure = iota
+	// FailureConflict is a record already at the name that only a person can
+	// remove.
+	FailureConflict
+	// FailureConfig is a setting the operator has to change.
+	FailureConfig
+	// FailureProvider is the provider refusing a write, quoted by its own
+	// error codes and messages, or failing with only a status code.
+	FailureProvider
+)
+
+// Classify sorts the error of a failed run. Apply joins one error per record,
+// and the answer is the class of the least readable part: one internal part
+// makes the whole failure internal, so no part of its text is shown. Among
+// readable parts a provider failure outranks a setting, and a setting
+// outranks a conflict, the order in which the operator has to deal with them.
+//
+// It walks the chain one wrap at a time rather than with errors.As, which
+// would find a readable error anywhere in a wrapped join and let an internal
+// sibling's text through.
+func Classify(err error) Failure {
+	switch e := err.(type) {
+	case *ConflictError:
+		return FailureConflict
+	case *ConfigError:
+		return FailureConfig
+	case *cfAPIError:
+		return FailureProvider
+	case interface{ Unwrap() []error }:
+		parts := e.Unwrap()
+		if len(parts) == 0 {
+			return FailureInternal
+		}
+		class := FailureConflict
+		for _, part := range parts {
+			c := Classify(part)
+			if c == FailureInternal {
+				return FailureInternal
+			}
+			class = max(class, c)
+		}
+		return class
+	case interface{ Unwrap() error }:
+		if inner := e.Unwrap(); inner != nil {
+			return Classify(inner)
+		}
+	}
+	return FailureInternal
 }
 
 // Apply publishes a profile's records, retrying each up to MaxRetries times.

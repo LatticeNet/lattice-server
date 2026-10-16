@@ -177,6 +177,9 @@ type probeHealth struct {
 	Inflight     int     `json:"inflight"`
 	MaxInflight  int     `json:"max_inflight"`
 	Targets      int     `json:"targets"`
+	// Capabilities names the probe's optional features, such as
+	// custom_targets (probeCapabilityCustomTargets).
+	Capabilities []string `json:"capabilities,omitempty"`
 }
 
 // probeHealthView is what the health method and System show: the probe's own
@@ -205,6 +208,12 @@ func (c *probeClient) health(ctx context.Context, showPath bool) probeHealthView
 	h.ProbeVersion = auditTruncate(h.ProbeVersion, 64)
 	h.Engine = auditTruncate(h.Engine, 64)
 	h.CoreVersion = auditTruncate(h.CoreVersion, 64)
+	if len(h.Capabilities) > 16 {
+		h.Capabilities = h.Capabilities[:16]
+	}
+	for i := range h.Capabilities {
+		h.Capabilities[i] = auditTruncate(h.Capabilities[i], 32)
+	}
 	return probeHealthView{Available: true, probeHealth: &h}
 }
 
@@ -231,22 +240,11 @@ func (s *Server) vpnCoreProbeRPC(ctx context.Context, method string, request []b
 		return s.probeTargets(ctx)
 	case "run":
 		return s.probeRun(ctx, p, request)
+	case "target_create", "target_update", "target_delete":
+		return s.probeTargetEdit(p, method, request)
 	default:
 		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "vpn-core/probe: unknown method "+method)
 	}
-}
-
-func (s *Server) probeTargets(ctx context.Context) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, s.probe.callTimeout)
-	defer cancel()
-	status, body, err := s.probe.do(ctx, http.MethodGet, "/v1/targets", nil)
-	if err != nil {
-		return nil, s.probeUnavailable(err)
-	}
-	if status != http.StatusOK || !json.Valid(body) {
-		return nil, rpcAPIError(http.StatusBadGateway, model.APIErrorBadGateway, fmt.Sprintf("the probe answered its target list with HTTP %d", status))
-	}
-	return body, nil
 }
 
 func (s *Server) probeUnavailable(err error) error {
@@ -271,10 +269,25 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest,
 			fmt.Sprintf("the probe request is %d bytes; the limit is %d", len(request), probeMaxRequestBytes))
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(request, &fields); err != nil || fields == nil {
+		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "the probe request must be a JSON object")
+	}
+	if name := foldedProbeRequestField(fields); name != "" {
+		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest,
+			fmt.Sprintf("a field of the probe request differs from %q only in letter case; write it exactly as %s", name, name))
+	}
 	summary, ok := summarizeProbeRun(request)
 	if !ok {
 		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "the probe request must be a JSON object")
 	}
+	// Saved targets the run names go to the probe as definitions; this
+	// spends nothing, so a run it refuses is not counted or audited.
+	request, customTargets, err := s.resolveProbeRunTargets(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	summary.CustomTargets = customTargets
 	release, refusal := s.probeLimits.acquire(probePrincipalKey(p), s.now())
 	if refusal != nil {
 		return nil, refusal
@@ -352,17 +365,21 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 }
 
 func (s *Server) auditProbeRun(p principal, summary probeRunSummary, decision, reason, stage string, valid bool, tookMS int64) {
+	metadata := map[string]string{
+		"types":         summary.Types,
+		"server":        summary.Server,
+		"config_sha256": summary.ConfigSHA256,
+		"targets":       summary.Targets,
+		"stage":         stage,
+		"valid":         boolString(valid),
+		"took_ms":       strconv.FormatInt(tookMS, 10),
+	}
+	if summary.CustomTargets != "" {
+		metadata["custom_targets"] = summary.CustomTargets
+	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionVPNCoreProbe, Scope: probeScope, Decision: decision, Reason: reason,
-		Metadata: map[string]string{
-			"types":         summary.Types,
-			"server":        summary.Server,
-			"config_sha256": summary.ConfigSHA256,
-			"targets":       summary.Targets,
-			"stage":         stage,
-			"valid":         boolString(valid),
-			"took_ms":       strconv.FormatInt(tookMS, 10),
-		},
+		Metadata: metadata,
 	})
 }
 
@@ -388,12 +405,15 @@ func oneLine(s string, max int) string {
 
 // probeRunSummary is everything about a run request the audit record keeps.
 // None of it is a credential: outbound types, the tested outbound's server
-// address, the target ids, and a hash of the outbounds.
+// address, the target ids, a hash of the outbounds, and for each saved
+// target the run names, its id, host[:port] and a short hash of its
+// definition, never the URL's path or query.
 type probeRunSummary struct {
-	Types        string
-	Server       string
-	ConfigSHA256 string
-	Targets      string
+	Types         string
+	Server        string
+	ConfigSHA256  string
+	Targets       string
+	CustomTargets string
 }
 
 // summarizeProbeRun reads the audit summary out of a run request. It is

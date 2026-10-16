@@ -269,7 +269,7 @@ func (s *Server) handleNotifyChannelTest(w http.ResponseWriter, r *http.Request,
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.channel.test", Scope: "notify:admin", Metadata: metadata})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       sent,
-		"delivery": row,
+		"delivery": toNotifyDeliveryView(row, nil),
 		"health":   toNotifyChannelHealthView(health, s.now()),
 	})
 }
@@ -292,7 +292,7 @@ func (s *Server) sendNotifyChannelTest(c model.NotifyChannel) (store.NotifyDeliv
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), notifyTestTimeout)
 	started := time.Now()
-	err := s.notifySend(ctx, c, notify.Message{Title: row.Title, Body: row.Body})
+	err := s.notifySend(ctx, c, s.presentNotifyMessage(c.Kind, notify.Message{Title: row.Title, Body: row.Body}, row.EventType, row.Source))
 	cancel()
 	attempt := store.NotifyAttempt{At: s.now(), OK: err == nil, DurationMS: time.Since(started).Milliseconds()}
 	kind, status, _ := redactSendError(err)
@@ -363,7 +363,7 @@ func (s *Server) handleNotifyDeliveries(w http.ResponseWriter, r *http.Request, 
 		Limit:     limit,
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"deliveries": s.store.NotifyDeliveries(filter),
+		"deliveries": toNotifyDeliveryViews(s.store.NotifyDeliveries(filter), s.notifyWebhookTypes()),
 		"stored":     s.store.NotifyDeliveryCount(),
 		"durable":    s.store.NotifyOutboxDurable(),
 		"max":        store.MaxNotifyDeliveries,

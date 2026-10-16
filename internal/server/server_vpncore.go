@@ -74,7 +74,7 @@ func (s *Server) registerVPNCoreRPC() {
 	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreSubscriptionSourcesService, "v1", []string{"compose", "graph_options"}, s.vpnCoreSubscriptionSourcesRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreSubscriptionSourcesService, err)
 	}
-	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProbeService, "v1", []string{"health", "targets", "run"}, s.vpnCoreProbeRPC); err != nil {
+	if err := s.pluginRPC.Register(vpnCorePluginID, vpnCoreProbeService, "v1", []string{"health", "targets", "run", "target_create", "target_update", "target_delete"}, s.vpnCoreProbeRPC); err != nil {
 		s.logger.Printf("vpn-core: register %s failed: %v", vpnCoreProbeService, err)
 	}
 	// Sub-Store S0 catalogue lane: the identity pickers' list (vpncore_identities.go).

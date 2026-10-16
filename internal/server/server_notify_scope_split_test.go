@@ -57,6 +57,7 @@ func TestNotifyScopeSplit(t *testing.T) {
 		{http.MethodPost, "/api/notify/webhooks/rotate", `{}`},
 		{http.MethodGet, "/api/notify/webhooks/deliveries?id=x", ""},
 		{http.MethodPost, "/api/notify/webhooks/test", `{}`},
+		{http.MethodGet, "/api/notify/catalogue", ""},
 	}
 	for _, m := range management {
 		if code := do(sendOnly, m.method, m.path, m.body); code != http.StatusForbidden {

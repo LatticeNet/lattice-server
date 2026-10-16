@@ -1,0 +1,102 @@
+[
+  {
+    "file": "activity-warning.png",
+    "icon": "activity",
+    "tone": "warning"
+  },
+  {
+    "file": "bell-off-warning.png",
+    "icon": "bell-off",
+    "tone": "warning"
+  },
+  {
+    "file": "bell-quiet.png",
+    "icon": "bell",
+    "tone": "quiet"
+  },
+  {
+    "file": "bell-ring-recovered.png",
+    "icon": "bell-ring",
+    "tone": "recovered"
+  },
+  {
+    "file": "bot-recovered.png",
+    "icon": "bot",
+    "tone": "recovered"
+  },
+  {
+    "file": "calendar-clock-notice.png",
+    "icon": "calendar-clock",
+    "tone": "notice"
+  },
+  {
+    "file": "flask-conical-quiet.png",
+    "icon": "flask-conical",
+    "tone": "quiet"
+  },
+  {
+    "file": "gauge-notice.png",
+    "icon": "gauge",
+    "tone": "notice"
+  },
+  {
+    "file": "heart-pulse-recovered.png",
+    "icon": "heart-pulse",
+    "tone": "recovered"
+  },
+  {
+    "file": "hourglass-warning.png",
+    "icon": "hourglass",
+    "tone": "warning"
+  },
+  {
+    "file": "key-round-notice.png",
+    "icon": "key-round",
+    "tone": "notice"
+  },
+  {
+    "file": "lock-keyhole-warning.png",
+    "icon": "lock-keyhole",
+    "tone": "warning"
+  },
+  {
+    "file": "power-off-critical.png",
+    "icon": "power-off",
+    "tone": "critical"
+  },
+  {
+    "file": "power-recovered.png",
+    "icon": "power",
+    "tone": "recovered"
+  },
+  {
+    "file": "puzzle-quiet.png",
+    "icon": "puzzle",
+    "tone": "quiet"
+  },
+  {
+    "file": "receipt-notice.png",
+    "icon": "receipt",
+    "tone": "notice"
+  },
+  {
+    "file": "server-off-critical.png",
+    "icon": "server-off",
+    "tone": "critical"
+  },
+  {
+    "file": "server-recovered.png",
+    "icon": "server",
+    "tone": "recovered"
+  },
+  {
+    "file": "shield-alert-critical.png",
+    "icon": "shield-alert",
+    "tone": "critical"
+  },
+  {
+    "file": "webhook-quiet.png",
+    "icon": "webhook",
+    "tone": "quiet"
+  }
+]

@@ -11,7 +11,7 @@ import (
 // s2SubWithCollection is a fleet sub F (live r1, staged r2) gathered by a
 // collection C (live c1) that serves alice through share sh-c, while F
 // itself serves bob through sh-f.
-func s2SubWithCollection(t *testing.T) *s2PlanEnv {
+func s2SubWithCollection(t testing.TB) *s2PlanEnv {
 	t.Helper()
 	e := newS2PlanEnv(t)
 	e.record(t, fleetDependsFacts{ID: "F", Revision: "r1", Source: subStoreSourceFleet, StagedRevision: "r2", StagedSource: subStoreSourceFleet, FleetBound: true})

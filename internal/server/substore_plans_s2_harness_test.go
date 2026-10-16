@@ -140,7 +140,7 @@ type s2PlanEnv struct {
 	onApply   func(context.Context, subStoreApplyRevisionRequest)
 }
 
-func newS2PlanEnv(t *testing.T) *s2PlanEnv {
+func newS2PlanEnv(t testing.TB) *s2PlanEnv {
 	t.Helper()
 	e := &s2PlanEnv{subStoreSvcHarness: newSubStoreSvcHarness(t), applyErr: map[string]error{}}
 	for _, id := range []string{s2Alice, s2Bob, s2Carol} {
@@ -184,7 +184,7 @@ func newS2PlanEnv(t *testing.T) *s2PlanEnv {
 }
 
 // record states a record in the graph and gives it a fresh snapshot.
-func (e *s2PlanEnv) record(t *testing.T, facts fleetDependsFacts) {
+func (e *s2PlanEnv) record(t testing.TB, facts fleetDependsFacts) {
 	t.Helper()
 	if facts.Kind == "" {
 		facts.Kind = "sub"
@@ -200,10 +200,12 @@ func (e *s2PlanEnv) record(t *testing.T, facts fleetDependsFacts) {
 
 // share stores a live share directly, so a test can give a share an
 // identity on any record.
-func (e *s2PlanEnv) share(t *testing.T, id, record, identity string) {
+func (e *s2PlanEnv) share(t testing.TB, id, record, identity string) {
 	t.Helper()
-	mustUpsertShare(t, e.st, model.SubscriptionShare{ID: id, Slug: id, Token: strings.Repeat(string(rune('a'+len(id)%26)), 40) + id, Enabled: true,
-		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: record, IdentityID: identity}})
+	if err := e.st.UpsertSubscriptionShare(model.SubscriptionShare{ID: id, Slug: id, Token: strings.Repeat(string(rune('a'+len(id)%26)), 40) + id, Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: record, IdentityID: identity}}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (e *s2PlanEnv) appliedRequests() []subStoreApplyRevisionRequest {

@@ -48,7 +48,7 @@ type subStoreSvcHarness struct {
 // subStoreSvcAdmin is an operator with the scopes the services ask for.
 var subStoreSvcAdmin = principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"proxy:admin", "substore:admin", "network:plan", "network:apply"}}}
 
-func newSubStoreSvcHarness(t *testing.T) *subStoreSvcHarness {
+func newSubStoreSvcHarness(t testing.TB) *subStoreSvcHarness {
 	t.Helper()
 	st, err := store.Open("")
 	if err != nil {

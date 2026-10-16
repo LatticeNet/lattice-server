@@ -1,9 +1,11 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -65,7 +67,9 @@ func (s *Server) handleAgentMonitorResults(w http.ResponseWriter, r *http.Reques
 	}
 	var req struct {
 		agentAuthRequest
-		Results []model.MonitorResult `json:"results"`
+		// Results are decoded one by one, so one malformed entry is
+		// dropped on its own: an agent drops the whole batch on a 400.
+		Results []json.RawMessage `json:"results"`
 	}
 	if !decodeAgentJSON(w, r, &req) {
 		return
@@ -78,10 +82,35 @@ func (s *Server) handleAgentMonitorResults(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, fmt.Errorf("results must hold 1 to %d entries", maxAgentMonitorResultsBatch))
 		return
 	}
-	resp, err := s.ingestAgentMonitorResults(req.NodeID, req.Results)
+	results := make([]model.MonitorResult, 0, len(req.Results))
+	positions := make([]int, 0, len(req.Results))
+	var malformed []agentMonitorResultDrop
+	for i, raw := range req.Results {
+		var res model.MonitorResult
+		if err := json.Unmarshal(raw, &res); err != nil {
+			// Name the monitor when that much of the entry reads.
+			var named struct {
+				MonitorID string `json:"monitor_id"`
+			}
+			_ = json.Unmarshal(raw, &named)
+			malformed = append(malformed, agentMonitorResultDrop{Index: i, MonitorID: named.MonitorID, Reason: store.MonitorResultDropInvalid})
+			continue
+		}
+		results = append(results, res)
+		positions = append(positions, i)
+	}
+	resp, err := s.ingestAgentMonitorResults(req.NodeID, results)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if len(malformed) > 0 {
+		for i := range resp.Dropped {
+			resp.Dropped[i].Index = positions[resp.Dropped[i].Index]
+		}
+		resp.Dropped = append(resp.Dropped, malformed...)
+		sort.Slice(resp.Dropped, func(i, j int) bool { return resp.Dropped[i].Index < resp.Dropped[j].Index })
+		s.logMonitorResultDrops(req.NodeID, store.MonitorResultDropInvalid, len(malformed), model.MonitorResult{MonitorID: malformed[0].MonitorID}, s.now())
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

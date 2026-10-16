@@ -871,3 +871,91 @@ func TestIncidentOfANodeTargetCheckIsScopedByTheTarget(t *testing.T) {
 		t.Fatalf("a token that cannot read the target sees its incident: %s", body)
 	}
 }
+
+// An icmp run that failed before any echo left (a lookup error, a socket
+// error other than permission) is an ordinary failed run: sent 0, an
+// error, no reason. One malformed or out-of-bounds entry in a batch is
+// dropped on its own and listed; the rest of the batch is stored, since an
+// agent drops a whole batch on a 400.
+func TestAgentBatchDropsBadEntriesOneByOne(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, token := enrollNode(t, handler, cookies, csrf)
+	if err := st.UpsertMonitor(model.Monitor{ID: "mon-ping", Name: "ping", Type: model.MonitorTypeICMP, Target: "198.51.100.20", Packets: 5, IntervalSec: 30, TimeoutSec: 5, NodeIDs: []string{nodeID}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().UTC().Add(-time.Minute)
+	at := func(i int) string { return base.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano) }
+	body := `{"node_id":"` + nodeID + `","results":[` +
+		`{"monitor_id":"mon-ping","at":"` + at(0) + `","success":false,"error":"socket: too many open files"},` +
+		`{"monitor_id":"mon-ping","at":"` + at(1) + `","sent":"five"},` +
+		`{"monitor_id":"mon-ping","at":"` + at(2) + `","sent":11,"rtts_ms":[1,2,3,4,5,6,7,8,9,10,11]},` +
+		`{"monitor_id":"mon-ping","at":"not a time","success":true},` +
+		`{"monitor_id":"mon-ping","at":"` + at(4) + `","sent":5,"lost":1,"rtts_ms":[10,11,12,13],"success":true}]}`
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-results", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("batch = %d %s", rec.Code, rec.Body.String())
+	}
+	var resp agentMonitorResultsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Accepted != 2 || len(resp.Dropped) != 3 {
+		t.Fatalf("response = %+v", resp)
+	}
+	for i, want := range []int{1, 2, 3} {
+		if d := resp.Dropped[i]; d.Index != want || d.Reason != store.MonitorResultDropInvalid || d.MonitorID != "mon-ping" {
+			t.Fatalf("drop %d = %+v, want index %d invalid", i, d, want)
+		}
+	}
+	rows := storedMonitorResults(t, st, "mon-ping")
+	if len(rows) != 2 || rows[0].Success || rows[0].Sent != 0 || rows[0].Reason != "" || rows[0].Error == "" || !rows[1].Success || rows[1].Sent != 5 {
+		t.Fatalf("stored = %+v", rows)
+	}
+	latest, _, _ := st.MonitorLatest("mon-ping", nodeID)
+	if latest.FailStreak != 0 || !latest.Success {
+		t.Fatalf("latest = %+v", latest)
+	}
+	// A run with no packets counts as one probe lost.
+	m := rowSummaryOf(t, st, "mon-ping", nodeID, base.Add(-time.Hour), time.Now().Add(time.Minute))
+	if m.N != 2 || m.F != 1 || m.S != 6 || m.L != 2 {
+		t.Fatalf("rollup = %+v", m)
+	}
+	// The single-result route drops an out-of-bounds entry the same way.
+	one := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", `{"node_id":"`+nodeID+`","result":{"monitor_id":"mon-ping","at":"`+at(5)+`","sent":12,"rtts_ms":[]}}`, token)
+	if one.Code != http.StatusOK || !strings.Contains(one.Body.String(), `"reason":"invalid"`) {
+		t.Fatalf("single route = %d %s", one.Code, one.Body.String())
+	}
+}
+
+// rowSummaryOf summarizes a pair's raw rows over a range.
+func rowSummaryOf(t *testing.T, st *store.Store, monitorID, nodeID string, from, to time.Time) store.MonitorRollup {
+	t.Helper()
+	pair := store.MonitorPair{MonitorID: monitorID, NodeID: nodeID}
+	sums, err := st.MonitorRowSummaries([]store.MonitorPair{pair}, from.Add(-time.Hour), from, to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sums[pair].Cur
+}
+
+// A tcp result read no certificate, so no answer carries cert_not_after:
+// not the stored rows, not the latest list, not the matrix.
+func TestNoZeroCertificateOnTheWire(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, token := enrollNode(t, handler, cookies, csrf)
+	if err := st.UpsertMonitor(model.Monitor{ID: "mon-tcp", Name: "tcp", Type: model.MonitorTypeTCP, Target: "example.com:443", IntervalSec: 30, TimeoutSec: 5, NodeIDs: []string{nodeID}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"node_id":"` + nodeID + `","result":{"monitor_id":"mon-tcp","at":"` + time.Now().UTC().Format(time.RFC3339Nano) + `","success":true,"latency_ms":4}}`
+	if rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-result", body, token); rec.Code != http.StatusOK {
+		t.Fatalf("ingest = %d", rec.Code)
+	}
+	for _, path := range []string{"/api/monitors/results?monitor_id=mon-tcp", "/api/monitors", "/api/monitors/paths?window=1h", "/api/monitors/series?monitor=mon-tcp&source=" + nodeID + "&window=1h"} {
+		res := doJSON(t, handler, http.MethodGet, path, "", cookies, "")
+		if raw := readBody(t, res); res.StatusCode != http.StatusOK || strings.Contains(raw, "cert_not_after") || strings.Contains(raw, "0001-01-01") {
+			t.Errorf("%s = %d %s", path, res.StatusCode, raw)
+		}
+	}
+}

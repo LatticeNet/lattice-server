@@ -122,6 +122,9 @@ type State struct {
 	// EvidenceSettings are the operator's evidence budgets
 	// (evidence_settings.go), nil until saved. Written only on an edit.
 	EvidenceSettings *model.EvidenceSettings `json:"evidence_settings,omitempty"`
+	// ProbeTargets are the operator's saved outbound probe targets
+	// (probe_targets.go), keyed by id. Written only on an edit.
+	ProbeTargets map[string]ProbeTarget `json:"probe_targets,omitempty"`
 	// NotifyWebhooks are operator-authored inbound entry points (notify_webhook.go).
 	// They hold a PBKDF2 secret hash, not a reversible secret, so unlike
 	// NotifyChannels they need no pass in crypto.go.
@@ -930,6 +933,7 @@ func emptyState() State {
 		NotifyRules:             map[string]model.NotifyRule{},
 		NotifyRuleOptions:       map[string]NotifyRuleOptions{},
 		NotifyChannelOptions:    map[string]NotifyChannelOptions{},
+		ProbeTargets:            map[string]ProbeTarget{},
 		NotifyWebhooks:          map[string]NotifyWebhook{},
 		NotifyWebhookDeliveries: map[string][]NotifyWebhookDelivery{},
 		Tunnels:                 map[string]model.TunnelProfile{},
@@ -1063,6 +1067,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NotifyRuleOptions == nil {
 		st.NotifyRuleOptions = map[string]NotifyRuleOptions{}
+	}
+	if st.ProbeTargets == nil {
+		st.ProbeTargets = map[string]ProbeTarget{}
 	}
 	if st.NotifyChannelOptions == nil {
 		st.NotifyChannelOptions = map[string]NotifyChannelOptions{}

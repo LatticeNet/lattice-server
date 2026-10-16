@@ -2448,7 +2448,13 @@ func (s *Server) issueTOTPChallenge(w http.ResponseWriter, r *http.Request, user
 
 // handleLoginTOTP completes a login for a 2FA user by validating a TOTP code or a
 // single-use recovery code against the pending challenge, then issuing a session.
+// GET is the read-only companion for the post-SSO challenge (see
+// handlePendingSSOSecondFactor).
 func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		s.handlePendingSSOSecondFactor(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return

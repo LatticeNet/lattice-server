@@ -547,6 +547,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltLatencyProbes(tx, persist.LatencyProbes); err != nil {
 			return err
 		}
+		if err := putBoltMonitorSettings(tx, persist.MonitorSettings); err != nil {
+			return err
+		}
 		if err := putBoltEvidenceSettings(tx, persist.EvidenceSettings); err != nil {
 			return err
 		}
@@ -580,7 +583,7 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putMap(tx, boltBucketMonitors, persist.Monitors); err != nil {
 			return err
 		}
-		if err := importMonitorResultSeriesTx(tx, persist.MonResults, MonitorResultsPerPair); err != nil {
+		if err := importMonitorResultSeriesTx(tx, persist.MonResults, monitorHistoryLimitsOf(persist.MonitorSettings)); err != nil {
 			return err
 		}
 		if err := putMap(tx, boltBucketLogSources, persist.LogSources); err != nil {
@@ -809,6 +812,11 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		st.LatencyProbes = latency
+		monitorSettings, err := readBoltMonitorSettings(tx)
+		if err != nil {
+			return err
+		}
+		st.MonitorSettings = monitorSettings
 		evidence, err := readBoltEvidenceSettings(tx)
 		if err != nil {
 			return err

@@ -103,9 +103,10 @@ func monitorPairPrefix(monitorID, nodeID string) ([]byte, error) {
 }
 
 // recordMonitorResultTx writes one result for its pair: the row, its count
-// in the rollups, the advanced latest record, and the trim to perPair. A row
-// already held at the same instant is a duplicate and changes nothing.
-func recordMonitorResultTx(tx *bolt.Tx, rec MonitorResultRecord, perPair int) (MonitorResultOutcome, error) {
+// in the rollups (with its jump from the pair's last success), the advanced
+// latest record, and the trim to the limits. A row already held at the same
+// instant is a duplicate and changes nothing.
+func recordMonitorResultTx(tx *bolt.Tx, rec MonitorResultRecord, limits MonitorHistoryLimits) (MonitorResultOutcome, error) {
 	out := MonitorResultOutcome{Result: rec}
 	rows := tx.Bucket(boltBucketMonResultRows)
 	if rows == nil {
@@ -133,7 +134,11 @@ func recordMonitorResultTx(tx *bolt.Tx, rec MonitorResultRecord, perPair int) (M
 	if err := rows.Put(rowKey, data); err != nil {
 		return out, err
 	}
-	if err := addMonitorRollupsTx(tx, rec); err != nil {
+	jitter, jump := 0.0, false
+	if rec.Success && hadPrior {
+		jitter, jump = monitorJitterDelta(prior.LastOKAt, prior.LastOKMs, rec.At, rec.LatencyMs)
+	}
+	if err := addMonitorRollupsTx(tx, rec, jitter, jump, limits); err != nil {
 		return out, err
 	}
 	next := advanceMonitorLatest(prior, hadPrior, rec)
@@ -141,7 +146,7 @@ func recordMonitorResultTx(tx *bolt.Tx, rec MonitorResultRecord, perPair int) (M
 	if err != nil {
 		return out, err
 	}
-	if err := trimMonitorPairTx(rows, prefix, &next, perPair); err != nil {
+	if err := trimMonitorPairTx(rows, prefix, &next, limits.perPair()); err != nil {
 		return out, err
 	}
 	return out, putRecord(tx, boltBucketMonResultLatest, pairKey, next)
@@ -184,14 +189,14 @@ func trimMonitorPairTx(rows *bolt.Bucket, prefix []byte, latest *MonitorLatest, 
 }
 
 // RecordMonitorResults writes results in order, in one transaction.
-func (bs *BoltStateStore) RecordMonitorResults(records []MonitorResultRecord, perPair int) ([]MonitorResultOutcome, error) {
+func (bs *BoltStateStore) RecordMonitorResults(records []MonitorResultRecord, limits MonitorHistoryLimits) ([]MonitorResultOutcome, error) {
 	outcomes := make([]MonitorResultOutcome, len(records))
 	err := bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
 			return err
 		}
 		for i, rec := range records {
-			out, err := recordMonitorResultTx(tx, rec, perPair)
+			out, err := recordMonitorResultTx(tx, rec, limits)
 			if err != nil {
 				return err
 			}
@@ -208,7 +213,7 @@ func (bs *BoltStateStore) RecordMonitorResults(records []MonitorResultRecord, pe
 // importMonitorResultSeriesTx records JSON-shaped series (arrival order per
 // monitor) through the same path live results take, so the latest records,
 // streaks and trims come out exactly as if the results had arrived here.
-func importMonitorResultSeriesTx(tx *bolt.Tx, series map[string][]MonitorResultRecord, perPair int) error {
+func importMonitorResultSeriesTx(tx *bolt.Tx, series map[string][]MonitorResultRecord, limits MonitorHistoryLimits) error {
 	monitorIDs := make([]string, 0, len(series))
 	for monitorID := range series {
 		monitorIDs = append(monitorIDs, monitorID)
@@ -222,7 +227,7 @@ func importMonitorResultSeriesTx(tx *bolt.Tx, series map[string][]MonitorResultR
 				continue
 			}
 			rec.At = rec.At.UTC()
-			if _, err := recordMonitorResultTx(tx, rec, perPair); err != nil {
+			if _, err := recordMonitorResultTx(tx, rec, limits); err != nil {
 				return err
 			}
 		}
@@ -231,7 +236,7 @@ func importMonitorResultSeriesTx(tx *bolt.Tx, series map[string][]MonitorResultR
 }
 
 // MigrateMonitorResults copies State.MonResults into the hot store, once.
-func (bs *BoltStateStore) MigrateMonitorResults(series map[string][]MonitorResultRecord, perPair int) error {
+func (bs *BoltStateStore) MigrateMonitorResults(series map[string][]MonitorResultRecord, limits MonitorHistoryLimits) error {
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
 			return err
@@ -243,7 +248,7 @@ func (bs *BoltStateStore) MigrateMonitorResults(series map[string][]MonitorResul
 		if meta.Get(boltKeyMonitorResultsMigrated) != nil {
 			return nil
 		}
-		if err := importMonitorResultSeriesTx(tx, series, perPair); err != nil {
+		if err := importMonitorResultSeriesTx(tx, series, limits); err != nil {
 			return err
 		}
 		return meta.Put(boltKeyMonitorResultsMigrated, []byte("1"))

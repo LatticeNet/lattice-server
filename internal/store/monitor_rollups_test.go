@@ -130,22 +130,22 @@ func TestHotMonitorRollupsAreTrimmed(t *testing.T) {
 	seedMonitor(t, s, model.Monitor{ID: "mon-a", Type: model.MonitorTypeTCP, AssignAll: true})
 	pair := MonitorPair{MonitorID: "mon-a", NodeID: "node-a"}
 	now := time.Now().UTC()
-	old := now.Add(-20 * time.Hour)
+	old := now.Add(-6 * 24 * time.Hour)
 	// AddMonitorResult stamps ReceivedAt with the wall clock, so drive the
-	// bolt half directly to place results ten days apart.
-	for _, at := range []time.Time{now.Add(-10 * 24 * time.Hour), old, now} {
+	// bolt half directly to place results days apart.
+	for _, at := range []time.Time{now.Add(-40 * 24 * time.Hour), now.Add(-10 * 24 * time.Hour), old, now} {
 		rec := MonitorResultRecord{MonitorResult: model.MonitorResult{MonitorID: "mon-a", NodeID: "node-a", At: at, Success: true, LatencyMs: 10}, ReceivedAt: at}
-		if _, err := s.runtimeBoltHot.RecordMonitorResults([]MonitorResultRecord{rec}, MonitorResultsPerPair); err != nil {
+		if _, err := s.runtimeBoltHot.RecordMonitorResults([]MonitorResultRecord{rec}, DefaultMonitorHistoryLimits()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	coarse, _ := s.MonitorRollups([]MonitorPair{pair}, MonitorRollupCoarse, now.Add(-30*24*time.Hour), now.Add(time.Hour))
-	if len(coarse[pair]) != 2 {
-		t.Fatalf("coarse keeps eight days: %d buckets %+v", len(coarse[pair]), coarse[pair])
+	coarse, _ := s.MonitorRollups([]MonitorPair{pair}, MonitorRollupCoarse, now.Add(-60*24*time.Hour), now.Add(time.Hour))
+	if len(coarse[pair]) != 3 || !coarse[pair][0].At.Equal(now.Add(-10*24*time.Hour).Truncate(MonitorRollupCoarse)) {
+		t.Fatalf("coarse keeps 35 days: %d buckets %+v", len(coarse[pair]), coarse[pair])
 	}
-	fine, _ := s.MonitorRollups([]MonitorPair{pair}, MonitorRollupFine, now.Add(-30*24*time.Hour), now.Add(time.Hour))
+	fine, _ := s.MonitorRollups([]MonitorPair{pair}, MonitorRollupFine, now.Add(-60*24*time.Hour), now.Add(time.Hour))
 	if len(fine[pair]) != 2 || !fine[pair][0].At.Equal(old.Truncate(MonitorRollupFine)) {
-		t.Fatalf("fine keeps two days: %+v", fine[pair])
+		t.Fatalf("fine keeps seven days by default: %+v", fine[pair])
 	}
 }
 

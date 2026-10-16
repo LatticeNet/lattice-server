@@ -86,6 +86,11 @@ type MonitorLatest struct {
 	// Held is how many rows the pair holds, so the hot store trims without
 	// counting keys on every result.
 	Held int `json:"held"`
+	// LastOKAt and LastOKMs are the pair's newest successful probe, which
+	// the next success is compared with for jitter. A failure in between
+	// keeps them; a pair recorded before jitter existed starts without.
+	LastOKAt time.Time `json:"last_ok_at,omitzero"`
+	LastOKMs float64   `json:"last_ok_ms,omitzero"`
 }
 
 // MonitorResultOutcome is what the store did with one result.
@@ -155,6 +160,10 @@ func advanceMonitorLatest(prior MonitorLatest, hadPrior bool, rec MonitorResultR
 		if prior.Success == rec.Success {
 			next.Since = prior.Since
 		}
+		next.LastOKAt, next.LastOKMs = prior.LastOKAt, prior.LastOKMs
+	}
+	if rec.Success {
+		next.LastOKAt, next.LastOKMs = rec.At, rec.LatencyMs
 	}
 	if !rec.Success {
 		next.FailStreak = 1
@@ -230,6 +239,11 @@ func (s *Store) admitAgentMonitorResultLocked(nodeID string, r model.MonitorResu
 		return MonitorResultRecord{}, MonitorResultDropDisabled
 	case !mon.AssignAll && !contains(mon.NodeIDs, nodeID):
 		return MonitorResultRecord{}, MonitorResultDropNotAssigned
+	case contains(mon.PausedNodeIDs, nodeID):
+		// A paused source is not handed the monitor; a result it sends
+		// anyway (a buffer from before the pause, or a stale list) is
+		// refused the way an unassigned one is, which agents already drop.
+		return MonitorResultRecord{}, MonitorResultDropNotAssigned
 	}
 	if nodeID == "" || validMonitorPair(r.MonitorID, nodeID) != nil || r.At.IsZero() {
 		return MonitorResultRecord{}, MonitorResultDropInvalid
@@ -304,21 +318,35 @@ func (s *Store) AddMonitorResult(r model.MonitorResult) (MonitorResultOutcome, e
 // recordMonitorResultsLocked writes one request's admitted results.
 //
 // yagni: each call is one bolt Update, so one fsync, taken while s.mu is
-// held, and the monitors list decodes every latest record under the same
-// lock. Released agents post one result per request: at 34 nodes and a 30 s
+// held. Released agents post one result per request: at 34 nodes and a 30 s
 // interval that is about one write a second. The ceiling is a fleet or a
 // monitor set large enough that these writes queue behind each other and
-// behind every other store call. The upgrade
-// path is agents sending on their beat through the batch route (one write per
-// node per beat), then reading the latest bucket in a bolt View without s.mu.
+// behind every other store call. The upgrade path is agents sending on their
+// beat through the batch route (one write per node per beat). History reads
+// already run in a bolt View without s.mu (hotForMonitorRead).
 func (s *Store) recordMonitorResultsLocked(records []MonitorResultRecord) ([]MonitorResultOutcome, error) {
 	if len(records) == 0 {
 		return nil, nil
 	}
 	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.RecordMonitorResults(records, MonitorResultsPerPair)
+		return s.runtimeBoltHot.RecordMonitorResults(records, monitorHistoryLimitsOf(s.state.MonitorSettings))
 	}
 	return s.recordMonitorResultsJSONLocked(records)
+}
+
+// hotForMonitorRead returns the hot store for a history read and releases
+// the store lock before the read runs, so a long read (a week of rollups for
+// every path) never holds up ingest or any other store call. bbolt runs read
+// transactions beside the writer; a Close that lands meanwhile waits for the
+// read to finish. Without the hot store it returns nil with the lock still
+// held, and the caller reads the JSON state and unlocks.
+func (s *Store) hotForMonitorRead() *BoltStateStore {
+	s.mu.Lock()
+	hot := s.runtimeBoltHot
+	if hot != nil {
+		s.mu.Unlock()
+	}
+	return hot
 }
 
 // recordMonitorResultsJSONLocked is the fallback without the hot store. The
@@ -402,11 +430,10 @@ func trimMonitorSeries(series []MonitorResultRecord, nodeID string, limit int) [
 
 // MonitorLatest is one pair's latest record.
 func (s *Store) MonitorLatest(monitorID, nodeID string) (MonitorLatest, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.MonitorLatest(monitorID, nodeID)
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.MonitorLatest(monitorID, nodeID)
 	}
+	defer s.mu.Unlock()
 	latest, ok := latestFromSeries(s.state.MonResults[monitorID], nodeID)
 	return latest, ok, nil
 }
@@ -415,11 +442,10 @@ func (s *Store) MonitorLatest(monitorID, nodeID string) (MonitorLatest, bool, er
 // sorted by node id. It answers the monitors list in one read instead of one
 // history read per monitor.
 func (s *Store) LatestMonitorResults() (map[string][]MonitorLatest, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.LatestMonitorResults()
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.LatestMonitorResults()
 	}
+	defer s.mu.Unlock()
 	out := map[string][]MonitorLatest{}
 	for monitorID, series := range s.state.MonResults {
 		seen := map[string]struct{}{}
@@ -439,11 +465,10 @@ func (s *Store) LatestMonitorResults() (map[string][]MonitorLatest, error) {
 
 // MonitorPairResults is one pair's newest limit results, oldest first.
 func (s *Store) MonitorPairResults(monitorID, nodeID string, limit int) ([]MonitorResultRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.MonitorPairResults(monitorID, nodeID, limit)
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.MonitorPairResults(monitorID, nodeID, limit)
 	}
+	defer s.mu.Unlock()
 	out := []MonitorResultRecord{}
 	for _, r := range s.state.MonResults[monitorID] {
 		if r.NodeID == nodeID {
@@ -457,11 +482,10 @@ func (s *Store) MonitorPairResults(monitorID, nodeID string, limit int) ([]Monit
 // RecentMonitorResults is a monitor's newest limit results across the pairs
 // allow admits (every pair when allow is nil), oldest first.
 func (s *Store) RecentMonitorResults(monitorID string, limit int, allow func(nodeID string) bool) ([]MonitorResultRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.RecentMonitorResults(monitorID, limit, allow)
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.RecentMonitorResults(monitorID, limit, allow)
 	}
+	defer s.mu.Unlock()
 	out := []MonitorResultRecord{}
 	for _, r := range s.state.MonResults[monitorID] {
 		if allow == nil || allow(r.NodeID) {
@@ -475,11 +499,10 @@ func (s *Store) RecentMonitorResults(monitorID string, limit int, allow func(nod
 // NewestMonitorResult walks one pair's history newest first and returns the
 // first result match accepts.
 func (s *Store) NewestMonitorResult(monitorID, nodeID string, match func(MonitorResultRecord) bool) (MonitorResultRecord, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.NewestMonitorResult(monitorID, nodeID, match)
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.NewestMonitorResult(monitorID, nodeID, match)
 	}
+	defer s.mu.Unlock()
 	series := append([]MonitorResultRecord(nil), s.state.MonResults[monitorID]...)
 	sort.SliceStable(series, func(i, j int) bool { return series[i].At.Before(series[j].At) })
 	for i := len(series) - 1; i >= 0; i-- {

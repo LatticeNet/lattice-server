@@ -10,10 +10,13 @@ import (
 	"maps"
 	"net"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-sdk/strictjson"
@@ -1004,12 +1007,29 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 	// carried are the fleet nodes whose placeholders a document keeps, bound
 	// or inert; inert are those excluded for an operational reason.
 	var carried, inert []model.SelectionPlanNode
-	for i, node := range plan.Nodes {
-		obj, err := parseSubstoreNodeObject(node.Node)
-		name := ""
-		if err == nil {
-			name = substoreBindNodeName(obj)
+	// The per-node work that reads nothing but the node and its line (the
+	// parse, the node checks, the credential, the encodings) runs in
+	// parallel; every decision that counts or orders nodes (clones, the
+	// line memo, exclusions, substitutions) stays in index order, and the
+	// entries and exclusions are sorted by index below, so the result is
+	// what binding the nodes one by one gives.
+	objs := make([]substoreNodeObject, len(plan.Nodes))
+	objErrs := make([]error, len(plan.Nodes))
+	names := make([]string, len(plan.Nodes))
+	substoreBindEach(len(plan.Nodes), func(i int) {
+		objs[i], objErrs[i] = parseSubstoreNodeObject(plan.Nodes[i].Node)
+		if objErrs[i] == nil {
+			names[i] = substoreBindNodeName(objs[i])
 		}
+	})
+	type pending struct {
+		index int
+		line  *substoreBindLine
+		clone int
+	}
+	var checks []pending
+	for i, node := range plan.Nodes {
+		obj, err, name := objs[i], objErrs[i], names[i]
 		if node.Provider {
 			if err != nil {
 				exclude(i, "", "", identityLinkExclusion{reason: substoreBindRejectedPrefix + "node"})
@@ -1049,25 +1069,51 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 			exclude(i, node.LineUUID, name, identityLinkExclusion{reason: substoreBindRejectedPrefix + "node"})
 			continue
 		}
-		if field := substoreBindCheckNode(node.Node, obj, node, line); field != "" {
-			exclude(i, node.LineUUID, name, identityLinkExclusion{reason: substoreBindRejectedPrefix + field})
+		checks = append(checks, pending{index: i, line: line, clone: clones[node.LineUUID]})
+	}
+	failed := make([]string, len(checks))
+	substoreBindEach(len(checks), func(k int) {
+		i := checks[k].index
+		failed[k] = substoreBindCheckNode(plan.Nodes[i].Node, objs[i], plan.Nodes[i], checks[k].line)
+	})
+	for k, p := range checks {
+		i, node := p.index, plan.Nodes[p.index]
+		if failed[k] != "" {
+			exclude(i, node.LineUUID, names[i], identityLinkExclusion{reason: substoreBindRejectedPrefix + failed[k]})
 			continue
 		}
-		server, _ := obj.string("server")
-		validated = append(validated, candidate{index: i, node: node, obj: obj, line: line, entry: substoreBindEntry{
-			Index: i, LineUUID: node.LineUUID, Name: name, Label: line.label, NodeID: line.row.NodeID,
-			Protocol: line.row.Protocol, Server: server, Port: line.template.Port, Clone: clones[node.LineUUID]}})
+		server, _ := objs[i].string("server")
+		validated = append(validated, candidate{index: i, node: node, obj: objs[i], line: p.line, entry: substoreBindEntry{
+			Index: i, LineUUID: node.LineUUID, Name: names[i], Label: p.line.label, NodeID: p.line.row.NodeID,
+			Protocol: p.line.row.Protocol, Server: server, Port: p.line.template.Port, Clone: p.clone}})
 	}
+	type boundNode struct {
+		obj     substoreNodeObject
+		err     error
+		encoded json.RawMessage
+		digest  string
+	}
+	boundNodes := make([]boundNode, len(validated))
+	substoreBindEach(len(validated), func(k int) {
+		v := validated[k]
+		if v.line.exclude.reason != "" {
+			return
+		}
+		b := &boundNodes[k]
+		if b.obj, b.err = substoreBindNodeCredential(v.obj, v.node, v.line); b.err == nil {
+			b.encoded = b.obj.encode()
+			b.digest = substoreBindEntryDigest(b.obj)
+		}
+	})
 	substitutions := map[string]string{}
 	placed := map[string]substoreBindPlaced{}
-	for _, v := range validated {
+	for k, v := range validated {
 		if v.line.exclude.reason != "" {
 			exclude(v.index, v.node.LineUUID, v.entry.Name, v.line.exclude)
 			inert = append(inert, v.node)
 			continue
 		}
-		boundObj, err := substoreBindNodeCredential(v.obj, v.node, v.line)
-		if err != nil {
+		if boundNodes[k].err != nil {
 			exclude(v.index, v.node.LineUUID, v.entry.Name, identityLinkExclusion{reason: identityLineTemplateUnusable})
 			inert = append(inert, v.node)
 			continue
@@ -1077,8 +1123,8 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 			placed[placeholder] = substoreBindPlaced{node: v.node, line: v.line}
 		}
 		carried = append(carried, v.node)
-		bound[v.index] = boundObj.encode()
-		v.entry.Digest = substoreBindEntryDigest(boundObj)
+		bound[v.index] = boundNodes[k].encoded
+		v.entry.Digest = boundNodes[k].digest
 		result.Entries = append(result.Entries, v.entry)
 	}
 	sort.SliceStable(result.Entries, func(i, j int) bool { return result.Entries[i].Index < result.Entries[j].Index })
@@ -1116,6 +1162,39 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 		}
 	}
 	return result
+}
+
+// substoreBindEach calls fn(i) for every i in [0, n), spread over up to
+// GOMAXPROCS workers (at most eight) once n is large enough to repay them,
+// and returns when every call has returned. fn must touch only what index i
+// owns.
+func substoreBindEach(n int, fn func(i int)) {
+	workers := min(runtime.GOMAXPROCS(0), 8)
+	if n < 128 || workers < 2 {
+		for i := 0; i < n; i++ {
+			fn(i)
+		}
+		return
+	}
+	const block = 32
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				start := int(next.Add(block)) - block
+				if start >= n {
+					return
+				}
+				for i := start; i < min(start+block, n); i++ {
+					fn(i)
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // substoreBindDocumentRefusal is why a document plan cannot be served, or

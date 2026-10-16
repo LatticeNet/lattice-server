@@ -1114,14 +1114,17 @@ func BenchmarkSubstoreBindPlanWithCatalogueBuild1000(b *testing.B) {
 }
 
 // substoreBindGateOpAllocs bounds one op of the bind gate. Measured
-// 2026-10-15 on darwin/arm64, go1.26.6: 409,170 allocations an op, 459,121
-// under -race -cover (CI runs internal/server that way). With a catalogue
-// build in the op the count is 633,120, and 723,419 under -race -cover. The
-// bound sits between the two regimes, as the approvals listing bound does,
-// rather than at the repository's usual one and a half times, which would
-// let a build back in: about 1.37 times the plain count and 1.22 times the
-// -race -cover count.
-const substoreBindGateOpAllocs = 560_000
+// 2026-10-16 on darwin/arm64, go1.26.9, after the lane 7 review's work on
+// the SDK decoders, the node parse and the catalogue build: 230,187
+// allocations an op, 282,894 under -race -cover (CI runs internal/server
+// that way). With a catalogue build in the op the count is 337,145, and
+// 399,822 under -race -cover. The bound sits between the two regimes, as the
+// approvals listing bound does, rather than at the repository's usual one
+// and a half times, which would let a build back in: about 1.35 times the
+// plain count and 1.10 times the -race -cover count, and under the plain
+// count with a build. (It was 560,000 when the op measured 409,170 and the
+// build 633,120.)
+const substoreBindGateOpAllocs = 310_000
 
 // The bind gate's op allocates within a bound: a deterministic gate on
 // core's bind cost in the verify job, beside the wall-clock figure the perf

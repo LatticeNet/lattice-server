@@ -1,9 +1,12 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -956,6 +959,59 @@ func TestNoZeroCertificateOnTheWire(t *testing.T) {
 		res := doJSON(t, handler, http.MethodGet, path, "", cookies, "")
 		if raw := readBody(t, res); res.StatusCode != http.StatusOK || strings.Contains(raw, "cert_not_after") || strings.Contains(raw, "0001-01-01") {
 			t.Errorf("%s = %d %s", path, res.StatusCode, raw)
+		}
+	}
+}
+
+// A row stored before the expiry was omitted carries cert_not_after as year
+// 1; it decodes to the zero time, and the server's answers leave it off.
+func TestLegacyZeroCertificateRowsAreOmitted(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a"})
+	if err := st.UpsertMonitor(model.Monitor{ID: "mon-tcp", Name: "tcp", Type: model.MonitorTypeTCP, Target: "example.com:443", IntervalSec: 30, TimeoutSec: 5, NodeIDs: []string{"node-a"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddMonitorResult(model.MonitorResult{MonitorID: "mon-tcp", NodeID: "node-a", At: time.Now().UTC(), Success: true, LatencyMs: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(string(raw), `"latency_ms": 4,`, `"latency_ms": 4, "cert_not_after": "0001-01-01T00:00:00Z",`, 1)
+	if legacy == string(raw) {
+		t.Fatal("no stored row to age")
+	}
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		srv.Close(context.Background())
+		st.Close()
+	})
+	handler := srv.Handler()
+	cookies, _ := loginSession(t, handler)
+	for _, path := range []string{"/api/monitors/results?monitor_id=mon-tcp", "/api/monitors"} {
+		res := doJSON(t, handler, http.MethodGet, path, "", cookies, "")
+		body := readBody(t, res)
+		if res.StatusCode != http.StatusOK || !strings.Contains(body, `"latency_ms":4`) || strings.Contains(body, "cert_not_after") || strings.Contains(body, "0001-01-01") {
+			t.Errorf("%s = %d %s", path, res.StatusCode, body)
 		}
 	}
 }

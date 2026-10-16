@@ -156,6 +156,21 @@ func (s *Server) createSubscriptionShare(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// An identity on a Sub-Store share is admitted only for a record that
+	// exists as an identity and a fleet-bound record, the rule
+	// shares.create keeps (substore_svc_shares.go): core answers the decoy
+	// to an identity-bound share whose record renders a document.
+	req.Source.IdentityID = strings.TrimSpace(req.Source.IdentityID)
+	if req.Source.IdentityID != "" && req.Source.Kind == model.ShareSourcePlugin && req.Source.PluginID == subStorePluginID {
+		if _, ok := s.getVpnUser(req.Source.IdentityID); !ok {
+			writeError(w, http.StatusBadRequest, errors.New("identity_id names no identity"))
+			return
+		}
+		if reason := s.subStoreIdentityRecordRefusal(req.Source.SubscriptionID); reason != "" {
+			writeError(w, http.StatusBadRequest, apiError(apiErrorIdentityRequiresFleetRecord, reason))
+			return
+		}
+	}
 	fleetFeed := false
 	if req.Source.Kind == model.ShareSourcePlugin && req.Source.PluginID == subStorePluginID {
 		verdict := s.subStoreFleetFeed(req.Source.SubscriptionID)

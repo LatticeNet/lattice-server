@@ -23,7 +23,14 @@ import (
 // proxy:admin in core (the scope the REST share API asks for), and writes
 // one audit event per change. A change that would bind a different
 // identity's credentials into an existing link is not offered: the identity
-// is fixed when the share is created.
+// is fixed when the share is created, and update refuses any change of it
+// for every caller (identity_change_refused). The only path that gives an
+// existing share an identity, or clears one, is the apply of an approved
+// Sub-Store plan (subStoreSvcShareApplyPlanChange, S2 plan section 2.6), and
+// a share is created with an identity only on a fleet-bound record
+// (identity_requires_fleet_record): core answers the decoy to an
+// identity-bound share whose record renders a document, so an identity on
+// any other record buys its holders nothing.
 
 // subStoreSharesMethods is every method of the shares service.
 var subStoreSharesMethods = []string{"list", "create", "update", "rotate", "set_enabled", "archive", "restore", "purge", "reorder"}
@@ -213,6 +220,9 @@ func (s *Server) subStoreSvcShareCreate(p principal, request []byte) ([]byte, er
 		if _, ok := s.getVpnUser(req.IdentityID); !ok {
 			return nil, bad("identity_id names no identity")
 		}
+		if reason := s.subStoreIdentityRecordRefusal(req.SubscriptionID); reason != "" {
+			return nil, rpcAPIError(http.StatusBadRequest, apiErrorIdentityRequiresFleetRecord, reason)
+		}
 	}
 	recipient := ""
 	if strings.TrimSpace(req.AgeRecipient) != "" {
@@ -330,9 +340,11 @@ func (s *Server) subStoreSvcShareUpdate(p principal, request []byte) ([]byte, er
 	if req.IdentityID != nil && strings.TrimSpace(*req.IdentityID) != share.Source.IdentityID {
 		// A link already handed to someone must never start serving another
 		// identity's credentials. A new identity gets a new link, so no
-		// existing holder receives what was not meant for them.
-		return nil, rpcAPIError(http.StatusConflict, subStoreSvcErrConflict,
-			"a share's identity is fixed when the share is created; create a share for the other identity and archive this one")
+		// existing holder receives what was not meant for them. A share with
+		// no identity gains one, or loses one, only through an approved plan.
+		return nil, rpcAPIError(http.StatusConflict, apiErrorIdentityChangeRefused,
+			"a share's identity is fixed when the share is created; create a share for the other identity and archive this one, "+
+				"or give an identity-less share an identity through a plan (plans.propose with share_identities)")
 	}
 	if req.ClearIcon && req.Icon != nil {
 		return nil, bad("icon and clear_icon cannot both be set")
@@ -629,4 +641,99 @@ func (s *Server) subStoreSvcShareReorder(p principal, request []byte) ([]byte, e
 		rows = append(rows, subStoreSvcShareRow(share))
 	}
 	return json.Marshal(map[string]any{"shares": rows})
+}
+
+// Identity codes the shares and plans services answer with.
+const (
+	// apiErrorIdentityRequiresFleetRecord refuses an identity on a share of a
+	// record that is not fleet-bound.
+	apiErrorIdentityRequiresFleetRecord = "identity_requires_fleet_record"
+	// apiErrorIdentityChangeRefused refuses a move of a share from one
+	// identity to another, by any caller.
+	apiErrorIdentityChangeRefused = "identity_change_refused"
+	// auditActionShareIdentity is a share's identity given or cleared by a
+	// plan's apply.
+	auditActionShareIdentity = "subscription.share.identity"
+)
+
+// subStoreRecordFleetBound reads from the plugin's index whether a record is
+// fleet-bound live: its entry has a live revision and either a fleet source
+// or the fleet_bound flag (live state only, plan section 2.2). known is false
+// when the index cannot be read.
+func (s *Server) subStoreRecordFleetBound(subscriptionID string) (bound, known bool) {
+	read := s.subStoreIndexV2()
+	if read.unreadable {
+		return false, false
+	}
+	for _, entry := range read.entries {
+		if entry.ID == subscriptionID {
+			return entry.Revision != "" && (entry.Source == subStoreSourceFleet || entry.Flags.FleetBound), true
+		}
+	}
+	return false, true
+}
+
+// subStoreSourceFleet is the fleet source of a Sub-Store record.
+const subStoreSourceFleet = "fleet"
+
+// subStoreIdentityRecordRefusal refuses an identity on a share of a record
+// that is not fleet-bound live, and on one the index cannot vouch for. It
+// answers the refusal's message, or "" when the record is fleet-bound.
+func (s *Server) subStoreIdentityRecordRefusal(subscriptionID string) string {
+	bound, known := s.subStoreRecordFleetBound(subscriptionID)
+	switch {
+	case bound:
+		return ""
+	case !known:
+		return fmt.Sprintf("cannot tell whether record %s is fleet-bound: Sub-Store's index does not parse; create the share without identity_id", subscriptionID)
+	}
+	return fmt.Sprintf("record %s is not a fleet record or a collection over one, so an identity-bound share of it would answer the decoy; "+
+		"create the share without identity_id, or migrate the record to a fleet selection first", subscriptionID)
+}
+
+// subStorePlanShareChange is what an approved plan's apply does to one live
+// share: give it an identity, clear its identity, or archive it.
+type subStorePlanShareChange struct {
+	ShareID string
+	// IdentityID is the identity the share serves after the change; empty
+	// clears it. Ignored when Archive is set.
+	IdentityID string
+	Archive    bool
+}
+
+// subStoreSvcShareApplyPlanChange is the plan apply's internal path to a
+// share's identity, which shares.update never reaches: it runs only from an
+// approved plan's apply, under the share-write lock the apply holds, after
+// the plan's stale check, and audits the change with the approval it carries
+// out. Moves between empty and one identity are the only ones a plan admits;
+// propose refused any other, and this refuses it again. A share no longer
+// live is skipped, not resurrected.
+func (s *Server) subStoreSvcShareApplyPlanChange(p principal, approvalID string, change subStorePlanShareChange) error {
+	share, ok := s.store.SubscriptionShare(change.ShareID)
+	if !ok || !isSubStoreShare(share) || share.ArchivedAt != nil {
+		return nil
+	}
+	now := s.now()
+	meta := map[string]string{"approval_id": approvalID}
+	action := auditActionShareIdentity
+	switch {
+	case change.Archive:
+		share.ArchivedAt, share.UpdatedAt = &now, now
+		action = auditActionShareArchive
+	case change.IdentityID == share.Source.IdentityID:
+		return nil
+	case change.IdentityID != "" && share.Source.IdentityID != "":
+		return rpcAPIError(http.StatusConflict, apiErrorIdentityChangeRefused, "share "+share.ID+" already serves another identity")
+	default:
+		meta["identity_from"], meta["identity_to"] = share.Source.IdentityID, change.IdentityID
+		share.Source.IdentityID, share.UpdatedAt = change.IdentityID, now
+	}
+	if err := s.store.UpsertSubscriptionShare(share); err != nil {
+		return err
+	}
+	// A body cached for the share was rendered for its old identity, or for
+	// none: the decoy, or a document.
+	s.subscriptionCache.InvalidateShare(share.ID)
+	s.subStoreSvcShareAudit(p, action, share, meta)
+	return nil
 }

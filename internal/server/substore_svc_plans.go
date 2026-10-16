@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,8 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,24 +25,39 @@ import (
 // its live shares changes what existing token holders receive, so it rides
 // plan, approve, apply like every other privileged change:
 //
-//  1. propose computes, for every live share on the record that names an
-//     identity, which lines that identity gains, loses, receives changed and
-//     has excluded when the record moves from its live revision to the staged
-//     one; lists every live share that names no identity beside them; writes
-//     that as the approval's plan; and files it through submitApproval;
+//  1. propose computes the fleet closure of the changed records over the
+//     plugin's depends_on v2 (substore_svc_plans_closure.go): every
+//     collection that reads one of them now or would read it at its staged
+//     revision. It refuses a closure no apply can carry out (a file in it, a
+//     migration that leaves a collection mixed, a delete under an explicit
+//     member), and for every record of the closure lists its live shares and
+//     what each identity they serve gains, loses, receives changed and has
+//     excluded (substore_svc_plans_build.go), together with the identities
+//     the plan gives or clears and the shares it archives; writes that as
+//     the approval's plan; and files it through submitApproval;
 //  2. the operator reads the plan and approves it with its plan_sha256, which
 //     the generic approval path checks against the stored bytes, so the
 //     approval covers exactly the text that was shown;
-//  3. at the decision core previews both revisions again, and rejects the
-//     plan as stale unless the record's live shares, its live revision and
-//     every identity's diff are still what the operator read;
-//  4. only then does core call the plugin's apply_revision, under the same
-//     subscription mutation gate a record save takes, carrying a one-time
-//     grant the plugin claims through claim_apply.
+//  3. at the decision core previews every record again, then, holding the
+//     share-write lock, computes the closure once more, and rejects the plan
+//     as stale unless the closure, every record's live shares, its live and
+//     staged revisions and every identity's diff are still what the operator
+//     read (substore_svc_plans_decide.go);
+//  4. only then, still under the lock, does core call the plugin's
+//     apply_revision once per promoted record, members before the
+//     collections that gather them, under the subscription mutation gate,
+//     each call carrying a one-time grant the plugin claims through
+//     claim_apply. Each record is finished before the next starts: its
+//     snapshot dropped, its own shares' identity changes and archivals
+//     written. After the last, the closure's snapshots are dropped and its
+//     bodies invalidated.
 //
-// The line diff needs the validate-and-bind step, which lives with the line
-// catalogue. propose reaches it through subStoreBindPreviewer, a narrow
-// interface the bind code implements; until it is wired, propose refuses.
+// An assignment-only plan (from_revision equal to to_revision) gives shares
+// identities on a record that does not move and calls no apply_revision; a
+// clear-only plan only clears identities and archives shares and makes no
+// plugin call at all. plans.publish (substore_svc_plans_publish.go) promotes
+// a staged revision without an approval when no live share in its closure is
+// fleet-bound.
 //
 // The plugin's half of the contract (design 28, slice S2), which core cannot
 // enforce from this side and which the plugin's tests must:
@@ -84,13 +98,33 @@ const (
 	subStorePlanReasonBytes   = 64
 	// subStorePlanUnboundCoverage is the plan's statement about the shares
 	// it lists without a diff.
-	subStorePlanUnboundCoverage = "unbound_shares receive the staged revision without identity binding; their lines are not diffed in this plan"
+	subStorePlanUnboundCoverage = "unbound_shares name no identity: on a fleet-bound record each answers the decoy (no lines), " +
+		"on any other record it receives the revision without identity binding; their lines are not diffed in this plan"
 
 	auditActionSubStorePlanPropose = "substore.plan.propose"
 	auditActionSubStorePlanApply   = "substore.plan.apply"
 	auditActionSubStorePlanStale   = "substore.plan.stale"
 	auditActionSubStorePlanClaim   = "substore.plan.claim"
+	auditActionSubStorePlanPublish = "substore.plan.publish"
 )
+
+// subStorePlansMethods is every method of the plans service.
+var subStorePlansMethods = []string{"propose", "status", "claim_apply", "publish"}
+
+// The reasons a stale plan is rejected with. The status row's stale flag is
+// derived from them, so the UI never parses a sentence.
+const (
+	subStorePlanStalePlugin  = "the sub-store plugin changed since this plan was proposed; propose it again"
+	subStorePlanStaleShares  = "a record's live shares changed since this plan was proposed; propose it again"
+	subStorePlanStaleReceive = "what the record's shares would receive changed since this plan was proposed; propose it again"
+	subStorePlanStaleLive    = "the record's live revision moved since this plan was proposed; propose it again"
+	subStorePlanStaleStaged  = "the staged revision this plan publishes was replaced or discarded since it was proposed; propose the new one"
+	subStorePlanStaleClosure = "the records this plan covers changed since it was proposed: a collection started or stopped reading one of them; propose it again"
+)
+
+// subStorePlanStaleReasons are the stale reasons, for the status row.
+var subStorePlanStaleReasons = []string{subStorePlanStalePlugin, subStorePlanStaleShares, subStorePlanStaleReceive,
+	subStorePlanStaleLive, subStorePlanStaleStaged, subStorePlanStaleClosure}
 
 // subStoreCoreOnlyReason is the gateway's refusal of apply_revision, and
 // subStoreFetchCoreOnlyReason its refusal of fetch.
@@ -207,6 +241,9 @@ type subStoreApplyRevisionRequest struct {
 	ExpectedRevision string `json:"expected_revision"`
 	ApprovalID       string `json:"approval_id"`
 	PlanSHA256       string `json:"plan_sha256"`
+	// Action is "delete" for a delete plan, which archives the live
+	// record (Revision is then the live revision deleted); empty promotes.
+	Action string `json:"action,omitempty"`
 }
 
 // subStoreApplyRevisionReply is apply_revision's reply.
@@ -218,21 +255,96 @@ type subStoreApplyRevisionReply struct {
 // subStorePlan is the approval's plan: what the operator reads and what the
 // approval's hash covers. Shares are listed one by one with their identity
 // and their counts; the lines are listed once per identity, because every
-// share of one identity on one record receives the same lines.
+// share of one identity on one record receives the same lines. The top level
+// is the record the request names; every other record of the fleet closure
+// is a section of its own in Records.
 type subStorePlan struct {
-	Kind           string              `json:"kind"`
-	PluginID       string              `json:"plugin_id"`
-	SubscriptionID string              `json:"subscription_id"`
-	FromRevision   string              `json:"from_revision"`
-	ToRevision     string              `json:"to_revision"`
-	Totals         subStorePlanTotals  `json:"totals"`
-	Shares         []subStorePlanShare `json:"shares"`
-	// UnboundShares are the live shares that name no identity. They
-	// receive the staged revision too; Coverage says what the plan does not
-	// show about them.
+	Kind           string `json:"kind"`
+	PluginID       string `json:"plugin_id"`
+	SubscriptionID string `json:"subscription_id"`
+	FromRevision   string `json:"from_revision"`
+	ToRevision     string `json:"to_revision"`
+	// Action is "delete" for a delete plan.
+	Action string `json:"action,omitempty"`
+	// Mode is what the apply does: promote, assign, clear or delete.
+	Mode string `json:"mode,omitempty"`
+	// Role, RecordKind, MemberRevisions and BeforeEmpty describe the
+	// request's own record as a section does (subStorePlanRecord).
+	Role            string            `json:"role,omitempty"`
+	RecordKind      string            `json:"record_kind,omitempty"`
+	MemberRevisions map[string]string `json:"member_revisions,omitempty"`
+	BeforeEmpty     bool              `json:"before_empty,omitempty"`
+	// Totals counts every record the plan covers; PrimaryTotals the
+	// request's own record.
+	Totals        subStorePlanTotals  `json:"totals"`
+	PrimaryTotals subStorePlanTotals  `json:"primary_totals"`
+	Shares        []subStorePlanShare `json:"shares"`
+	// UnboundShares are the live shares that name no identity. Coverage
+	// says what the plan does not show about them.
 	UnboundShares []subStorePlanUnboundShare `json:"unbound_shares"`
 	Coverage      string                     `json:"coverage,omitempty"`
 	Identities    []subStorePlanIdentity     `json:"identities"`
+	// Records is every other record the plan covers: the other promoted
+	// records, the collections that read a changed one, and the staged-only
+	// records, which serve no one now and are listed but not previewed.
+	Records []subStorePlanRecord `json:"records,omitempty"`
+	// ApplyOrder is the records apply_revision runs for, members before the
+	// collections that gather them.
+	ApplyOrder []string `json:"apply_order,omitempty"`
+	// Closure is every record the plan covers, sorted; the decision
+	// computes it again and finds the plan stale if it moved.
+	Closure []string `json:"closure,omitempty"`
+	// Assignments are the identity-less shares the plan gives an identity,
+	// Clearings the shares it clears of one, Archivals the shares it
+	// archives.
+	Assignments []subStorePlanAssignment `json:"assignments,omitempty"`
+	Clearings   []subStorePlanAssignment `json:"clearings,omitempty"`
+	Archivals   []subStorePlanArchival   `json:"archivals,omitempty"`
+}
+
+// subStorePlanRecord is one record's section of a plan.
+type subStorePlanRecord struct {
+	SubscriptionID string `json:"subscription_id"`
+	Kind           string `json:"kind,omitempty"`
+	// Role is promote, delete, self (an assignment's own record),
+	// dependent (a collection previewed at its live revision over the
+	// changed members) or staged_only.
+	Role         string `json:"role"`
+	FromRevision string `json:"from_revision"`
+	ToRevision   string `json:"to_revision,omitempty"`
+	// MemberRevisions is what the record's after side resolves each changed
+	// member at ("" names a deleted member).
+	MemberRevisions map[string]string `json:"member_revisions,omitempty"`
+	// BeforeEmpty says the before side was taken as empty without a render:
+	// a restored record has no live revision, and a collection mixed by a
+	// partial migration serves nothing to anyone.
+	BeforeEmpty   bool                       `json:"before_empty,omitempty"`
+	Totals        subStorePlanTotals         `json:"totals"`
+	Shares        []subStorePlanShare        `json:"shares"`
+	UnboundShares []subStorePlanUnboundShare `json:"unbound_shares"`
+	Coverage      string                     `json:"coverage,omitempty"`
+	Identities    []subStorePlanIdentity     `json:"identities"`
+}
+
+// subStorePlanAssignment is one share the plan gives an identity, or clears
+// of one, with the lines that identity receives after the plan (an
+// assignment) or received before it (a clearing).
+type subStorePlanAssignment struct {
+	ShareID        string `json:"share_id"`
+	SubscriptionID string `json:"subscription_id"`
+	Slug           string `json:"slug"`
+	DisplayName    string `json:"display_name,omitempty"`
+	IdentityID     string `json:"identity_id"`
+	Lines          int    `json:"lines"`
+}
+
+// subStorePlanArchival is one share the plan archives.
+type subStorePlanArchival struct {
+	ShareID        string `json:"share_id"`
+	SubscriptionID string `json:"subscription_id"`
+	Slug           string `json:"slug"`
+	DisplayName    string `json:"display_name,omitempty"`
+	IdentityID     string `json:"identity_id,omitempty"`
 }
 
 type subStorePlanTotals struct {
@@ -256,6 +368,10 @@ type subStorePlanShare struct {
 	Removed     int        `json:"removed"`
 	Changed     int        `json:"changed"`
 	Excluded    int        `json:"excluded"`
+	// Assigned says the plan gives this identity-less share IdentityID.
+	Assigned bool `json:"assigned,omitempty"`
+	// Archive says the plan archives the share.
+	Archive bool `json:"archive,omitempty"`
 }
 
 // subStorePlanUnboundShare is a live share on the record that names no
@@ -271,6 +387,10 @@ type subStorePlanUnboundShare struct {
 	// FleetCredentials marks a share created to publish the vpn-core fleet
 	// export with no identity (share_fleet_feed.go).
 	FleetCredentials bool `json:"fleet_credentials"`
+	// ClearedIdentityID is the identity the plan clears from the share.
+	ClearedIdentityID string `json:"cleared_identity_id,omitempty"`
+	// Archive says the plan archives the share.
+	Archive bool `json:"archive,omitempty"`
 }
 
 // subStorePlanLineState is what one identity receives for one line from one
@@ -318,10 +438,30 @@ type subStorePlanIdentity struct {
 
 type subStorePlansProposeRequest struct {
 	SubscriptionID string `json:"subscription_id"`
-	// FromRevision is the record's live revision, ToRevision the staged one
-	// to publish.
-	FromRevision string `json:"from_revision"`
-	ToRevision   string `json:"to_revision"`
+	// FromRevision is the record's live revision ("" for a restored record
+	// that has none), ToRevision the staged one to publish. Equal, they
+	// promote nothing: the plan only changes shares. A delete takes no
+	// ToRevision at all.
+	FromRevision string  `json:"from_revision"`
+	ToRevision   *string `json:"to_revision,omitempty"`
+	// Action is promote (the default) or delete.
+	Action string `json:"action,omitempty"`
+	// Records are further records to promote in the same apply: a
+	// collection over two legacy members has no order in which one can go
+	// first.
+	Records []subStorePlanRecordRequest `json:"records,omitempty"`
+	// ShareIdentities gives an identity-less share of the closure an
+	// identity, or clears one share's identity with "".
+	ShareIdentities map[string]string `json:"share_identities,omitempty"`
+	// ArchiveShares are shares of the closure the apply archives.
+	ArchiveShares []string `json:"archive_shares,omitempty"`
+}
+
+// subStorePlanRecordRequest is one more record a plan promotes.
+type subStorePlanRecordRequest struct {
+	SubscriptionID string `json:"subscription_id"`
+	FromRevision   string `json:"from_revision"`
+	ToRevision     string `json:"to_revision"`
 }
 
 // subStorePlansProposeReply answers propose. Required is false when no live
@@ -344,9 +484,15 @@ type subStorePlansStatusRequest struct {
 }
 
 type subStorePlanStatusRow struct {
-	ApprovalID     string    `json:"approval_id"`
-	Status         string    `json:"status"`
-	Reason         string    `json:"reason,omitempty"`
+	ApprovalID string `json:"approval_id"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+	// Stale is set when the plan was rejected as stale (one of the stale
+	// reasons), so the UI never parses the reason.
+	Stale bool `json:"stale,omitempty"`
+	// Action is promote or delete; Mode adds assign and clear.
+	Action         string    `json:"action"`
+	Mode           string    `json:"mode"`
 	PlanSHA256     string    `json:"plan_sha256"`
 	SubscriptionID string    `json:"subscription_id"`
 	FromRevision   string    `json:"from_revision"`
@@ -382,6 +528,14 @@ func (s *Server) subStorePlansRPC(ctx context.Context, method string, request []
 		// No operator scope: the grant on the context is the authority, and
 		// only core's own apply call carries one.
 		return s.subStorePlansClaimApply(ctx, request)
+	case "publish":
+		// An ordinary record edit by design 28: substore:admin, and only the
+		// operator's own call.
+		p, err := s.subStoreSvcOperator(ctx, subStorePlansService, true, "substore:admin")
+		if err != nil {
+			return nil, err
+		}
+		return s.subStorePlansPublish(ctx, p, request)
 	default:
 		return nil, fmt.Errorf("sub-store/plans: unknown method %q", method)
 	}
@@ -420,19 +574,66 @@ func (s *Server) subStorePlansPropose(ctx context.Context, p principal, request 
 	if err := subStoreSvcDecode(subStorePlansService, "propose", request, &req); err != nil {
 		return nil, err
 	}
-	if !subStoreSvcValidID(req.SubscriptionID) || !subStoreSvcValidID(req.FromRevision) || !subStoreSvcValidID(req.ToRevision) {
-		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "subscription_id, from_revision and to_revision are required")
-	}
-	if req.FromRevision == req.ToRevision {
-		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "from_revision and to_revision are the same revision")
-	}
-	shares := s.subStorePlanLiveShares(req.SubscriptionID)
-	if !subStorePlanRequired(shares) {
-		return json.Marshal(subStorePlansProposeReply{Required: false, Reason: "no live share on this record is fleet-bound"})
-	}
-	plan, err := s.subStoreBuildPlan(ctx, req, shares)
+	spec, err := subStorePlanSpecOf(req)
 	if err != nil {
 		return nil, err
+	}
+	var plan subStorePlan
+	if spec.mode == subStorePlanModeClear {
+		// A clearing or an archival never widens what any holder receives
+		// and the record does not move: no closure, no preview, no plugin
+		// call, so a plugin outage never blocks one.
+		shares := s.subStorePlanSharesOf([]string{spec.primary})
+		if err := s.subStorePlanChangeRefusal(spec.changes, shares, func(string) bool { return false }); err != nil {
+			return nil, err
+		}
+		plan = subStoreBuildClearPlan(spec, shares[spec.primary])
+	} else {
+		roots := spec.promotedIDs()
+		if spec.mode == subStorePlanModeAssign {
+			roots = []string{spec.primary}
+		}
+		g, err := s.subStorePlanGraphFor(ctx, roots, spec.mode == subStorePlanModePromote)
+		if err != nil {
+			return nil, s.subStorePlanDependsError(err)
+		}
+		if err := subStorePlanProposeRefusal(spec, g); err != nil {
+			return nil, err
+		}
+		sections := s.subStorePlanSections(spec, g)
+		previewed := make([]string, 0, len(sections))
+		for _, section := range sections {
+			if section.Role != subStorePlanRoleStagedOnly {
+				previewed = append(previewed, section.SubscriptionID)
+			}
+		}
+		shares := s.subStorePlanSharesOf(previewed)
+		fleetAfter := func(id string) bool {
+			facts, _ := g.facts(id)
+			live := facts.FleetBound || facts.Source == subStoreSourceFleet
+			if spec.mode == subStorePlanModeAssign {
+				return live
+			}
+			return live || g.closure.fleetBound[id]
+		}
+		if err := s.subStorePlanChangeRefusal(spec.changes, shares, fleetAfter); err != nil {
+			return nil, err
+		}
+		var all []model.SubscriptionShare
+		for _, id := range previewed {
+			all = append(all, shares[id]...)
+		}
+		// A propose that changes a share's identity or archives one is
+		// privileged whatever the shares are (design 28 makes changing a
+		// share's identity privileged); otherwise a plan is required when
+		// any live share of the closure is fleet-bound.
+		if len(spec.changes) == 0 && !subStorePlanRequired(all) {
+			return json.Marshal(subStorePlansProposeReply{Required: false, Reason: "no live share in this record's fleet closure is fleet-bound; publish it"})
+		}
+		plan, err = s.subStoreBuildPlan(ctx, spec, g, shares)
+		if err != nil {
+			return nil, err
+		}
 	}
 	text, err := json.MarshalIndent(plan, "", "  ")
 	if err != nil {
@@ -448,15 +649,17 @@ func (s *Server) subStorePlansPropose(ctx context.Context, p principal, request 
 	}
 	requestSum := sha256.Sum256(canonicalRequest)
 	now := s.now()
+	named := plan.applyOrder()
+	if len(named) == 0 {
+		named = []string{plan.SubscriptionID}
+	}
 	approval := model.Approval{
-		ID:            id.New("approval"),
-		Plugin:        subStorePlanApprovalPlugin,
-		Action:        subStorePlanActionPrefix + req.SubscriptionID,
-		Plan:          string(text),
-		Status:        model.ApprovalPending,
-		ActorID:       p.ActorID,
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		ID:      id.New("approval"),
+		Plugin:  subStorePlanApprovalPlugin,
+		Action:  subStorePlanActionPrefix + strings.Join(named, ","),
+		Plan:    string(text),
+		Status:  model.ApprovalPending,
+		ActorID: p.ActorID, CreatedAt: now, UpdatedAt: now,
 		RequestSHA256: hex.EncodeToString(requestSum[:]),
 	}
 	// The approval binds the plugin that will apply it: a plan proposed
@@ -472,8 +675,10 @@ func (s *Server) subStorePlansPropose(ctx context.Context, p principal, request 
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID: id.New("audit"), Action: auditActionSubStorePlanPropose, Scope: "proxy:admin", Decision: "allow",
 		Metadata: map[string]string{
-			"approval_id": approval.ID, "plan_sha256": planSHA, "subscription_id": req.SubscriptionID,
-			"from_revision": req.FromRevision, "to_revision": req.ToRevision,
+			"approval_id": approval.ID, "plan_sha256": planSHA, "subscription_id": plan.SubscriptionID,
+			"from_revision": plan.FromRevision, "to_revision": plan.ToRevision, "mode": plan.mode(),
+			"records": fmt.Sprint(max(len(plan.Closure), 1)), "assignments": fmt.Sprint(len(plan.Assignments)),
+			"clearings": fmt.Sprint(len(plan.Clearings)), "archivals": fmt.Sprint(len(plan.Archivals)),
 			"shares": fmt.Sprint(plan.Totals.Shares), "unbound_shares": fmt.Sprint(plan.Totals.UnboundShares),
 			"added": fmt.Sprint(plan.Totals.Added), "removed": fmt.Sprint(plan.Totals.Removed),
 			"changed": fmt.Sprint(plan.Totals.Changed), "excluded": fmt.Sprint(plan.Totals.Excluded),
@@ -483,6 +688,63 @@ func (s *Server) subStorePlansPropose(ctx context.Context, p principal, request 
 	return json.Marshal(subStorePlansProposeReply{
 		Required: true, ApprovalID: approval.ID, PlanSHA256: planSHA, Plan: approval.Plan, Status: stored.Status,
 	})
+}
+
+// subStorePlanProposeRefusal checks what the closure says against the
+// request before anything is previewed: every promoted record is live at its
+// from_revision and staged at its to_revision, a delete's record is live at
+// its from_revision, an assignment's record is live at the revision named,
+// and the plan is one an apply can carry out.
+func subStorePlanProposeRefusal(spec subStorePlanSpec, g subStorePlanGraph) error {
+	notLive := func(id string) error {
+		return rpcAPIError(http.StatusConflict, subStoreSvcErrConflict,
+			"from_revision is not the live revision of record "+id+"; propose from the live revision")
+	}
+	switch spec.mode {
+	case subStorePlanModeAssign:
+		if facts, _ := g.facts(spec.primary); facts.Revision != spec.from {
+			return notLive(spec.primary)
+		}
+		return nil
+	case subStorePlanModeDelete:
+		if facts, _ := g.facts(spec.primary); facts.Revision != spec.from {
+			return notLive(spec.primary)
+		}
+		if dependents := subStorePlanExplicitDependents(g, spec.primary); len(dependents) > 0 {
+			return rpcAPIError(http.StatusConflict, apiErrorFleetDeleteHasExplicitDependents, fmt.Sprintf(
+				"fleet_delete_has_explicit_dependents: collections %s list record %s as a member, and a member that does not resolve fails "+
+					"the collection's fetch; remove it from them first, then propose the delete", strings.Join(dependents, ", "), spec.primary))
+		}
+		return subStorePlanFileRefusal(g)
+	}
+	for _, record := range spec.promoted {
+		facts, _ := g.facts(record.SubscriptionID)
+		if facts.StagedRevision != record.ToRevision {
+			return rpcAPIError(http.StatusConflict, apiErrorRevisionUnknown, fmt.Sprintf(
+				"revision_unknown: %s is not the staged revision of record %s; propose the revision staged now", record.ToRevision, record.SubscriptionID))
+		}
+		if facts.Revision != record.FromRevision {
+			return notLive(record.SubscriptionID)
+		}
+	}
+	if err := subStorePlanFileRefusal(g); err != nil {
+		return err
+	}
+	return subStorePlanMigrationRefusal(subStorePlanMissingMigrations(g, spec.promotedByID()))
+}
+
+// subStoreBuildClearPlan is a clear-only plan: the record's live shares, the
+// identities cleared and the shares archived, and nothing previewed.
+func subStoreBuildClearPlan(spec subStorePlanSpec, shares []model.SubscriptionShare) subStorePlan {
+	section := subStorePlanRecord{SubscriptionID: spec.primary, Role: subStorePlanRoleSelf, FromRevision: spec.from}
+	subStorePlanSectionRows(&section, shares, spec.changes)
+	subStorePlanFillSection(&section, nil)
+	plan := subStorePlan{Kind: subStorePlanKind, PluginID: subStorePluginID, SubscriptionID: spec.primary, FromRevision: spec.from, ToRevision: spec.to,
+		Mode: subStorePlanModeClear, Role: subStorePlanRoleSelf, Totals: section.Totals, PrimaryTotals: section.Totals,
+		Shares: section.Shares, UnboundShares: section.UnboundShares, Coverage: section.Coverage, Identities: section.Identities,
+		Closure: []string{spec.primary}}
+	subStorePlanListChanges(&plan, []subStorePlanRecord{section}, nil)
+	return plan
 }
 
 // subStorePlanProposeError maps a preview failure to propose's reply.
@@ -498,59 +760,6 @@ func subStorePlanProposeError(err error) error {
 	default:
 		return err
 	}
-}
-
-// subStoreBuildPlan previews both revisions once per identity, diffs them,
-// and lists every live share.
-func (s *Server) subStoreBuildPlan(ctx context.Context, req subStorePlansProposeRequest, shares []model.SubscriptionShare) (subStorePlan, error) {
-	plan := subStorePlan{
-		Kind: subStorePlanKind, PluginID: subStorePluginID, SubscriptionID: req.SubscriptionID,
-		FromRevision: req.FromRevision, ToRevision: req.ToRevision,
-		Shares: []subStorePlanShare{}, UnboundShares: []subStorePlanUnboundShare{},
-	}
-	var identityIDs []string
-	seen := map[string]bool{}
-	for _, share := range shares {
-		if identityID := share.Source.IdentityID; identityID != "" && !seen[identityID] {
-			seen[identityID] = true
-			identityIDs = append(identityIDs, identityID)
-		}
-	}
-	identities, err := s.subStorePlanIdentities(ctx, req.SubscriptionID, req.FromRevision,
-		subStorePlanSide{Revision: req.FromRevision}, subStorePlanSide{Revision: req.ToRevision}, identityIDs)
-	if err != nil {
-		return subStorePlan{}, subStorePlanProposeError(err)
-	}
-	plan.Identities = identities
-	byIdentity := make(map[string]subStorePlanIdentity, len(identities))
-	for _, diff := range identities {
-		byIdentity[diff.IdentityID] = diff
-		plan.Totals.Added += len(diff.Added)
-		plan.Totals.Removed += len(diff.Removed)
-		plan.Totals.Changed += len(diff.Changed)
-		plan.Totals.Excluded += len(diff.Excluded)
-	}
-	for _, share := range shares {
-		identityID := share.Source.IdentityID
-		if identityID == "" {
-			plan.UnboundShares = append(plan.UnboundShares, subStorePlanUnboundShare{
-				ShareID: share.ID, Slug: share.Slug, DisplayName: share.DisplayName,
-				Enabled: share.Enabled, ExpiresAt: share.ExpiresAt, FleetCredentials: shareFleetCredentials(share),
-			})
-			continue
-		}
-		diff := byIdentity[identityID]
-		plan.Shares = append(plan.Shares, subStorePlanShare{
-			ShareID: share.ID, Slug: share.Slug, DisplayName: share.DisplayName, IdentityID: identityID,
-			Enabled: share.Enabled, ExpiresAt: share.ExpiresAt,
-			Added: len(diff.Added), Removed: len(diff.Removed), Changed: len(diff.Changed), Excluded: len(diff.Excluded),
-		})
-	}
-	if len(plan.UnboundShares) > 0 {
-		plan.Coverage = subStorePlanUnboundCoverage
-	}
-	plan.Totals.Shares, plan.Totals.UnboundShares, plan.Totals.Identities = len(plan.Shares), len(plan.UnboundShares), len(plan.Identities)
-	return plan, nil
 }
 
 var (
@@ -570,19 +779,6 @@ type subStorePlanPreviewError struct {
 
 func (e *subStorePlanPreviewError) Error() string {
 	return fmt.Sprintf("bind preview failed for revision %s and identity %s", e.revision, e.identityID)
-}
-
-// subStorePlanIdentityIDs is every identity a plan's shares name.
-func subStorePlanIdentityIDs(plan subStorePlan) []string {
-	var out []string
-	seen := map[string]bool{}
-	for _, share := range plan.Shares {
-		if !seen[share.IdentityID] {
-			seen[share.IdentityID] = true
-			out = append(out, share.IdentityID)
-		}
-	}
-	return out
 }
 
 // subStorePlanDiff compares what one identity receives from two revisions,
@@ -711,11 +907,17 @@ func (s *Server) subStorePlansStatus(request []byte) ([]byte, error) {
 		if approval.Plugin != subStorePlanApprovalPlugin || json.Unmarshal([]byte(approval.Plan), &plan) != nil {
 			return
 		}
-		if req.SubscriptionID != "" && plan.SubscriptionID != req.SubscriptionID {
+		if req.SubscriptionID != "" && plan.SubscriptionID != req.SubscriptionID && !slices.Contains(plan.Closure, req.SubscriptionID) {
 			return
+		}
+		action := subStorePlanActionPromote
+		if plan.Action == subStorePlanActionDelete {
+			action = subStorePlanActionDelete
 		}
 		rows = append(rows, subStorePlanStatusRow{
 			ApprovalID: approval.ID, Status: approval.Status, Reason: approval.Reason, PlanSHA256: approvalPlanSHA(approval),
+			Stale:  approval.Status == model.ApprovalRejected && slices.Contains(subStorePlanStaleReasons, approval.Reason),
+			Action: action, Mode: plan.mode(),
 			SubscriptionID: plan.SubscriptionID, FromRevision: plan.FromRevision, ToRevision: plan.ToRevision,
 			ActorID: approval.ActorID, ApprovedBy: approval.ApprovedBy, CreatedAt: approval.CreatedAt, UpdatedAt: approval.UpdatedAt,
 		})
@@ -745,218 +947,6 @@ func (s *Server) subStorePlansStatus(request []byte) ([]byte, error) {
 // isSubStorePlanApproval reports an approval this file files and applies.
 func isSubStorePlanApproval(approval model.Approval) bool {
 	return approval.Plugin == subStorePlanApprovalPlugin
-}
-
-// subStorePlanApprove is approveApprovalCore's branch for a Sub-Store plan,
-// reached after the generic path has checked the plan hash against the
-// stored bytes. It previews the plan's revisions again, checks under the
-// share-write lock that the plan still describes the record, moves the
-// approval from pending to approved exactly once, releases the lock, and
-// only then calls apply_revision.
-//
-// What is checked is everything the plan was computed from: the plugin
-// build, the set of live shares on the record with the identity each
-// serves, the record's live revision, and what each identity would receive
-// from each revision. A share created, archived or restored, a revision
-// re-staged under its id, or a catalogue change that binds a line
-// differently all mean an existing holder would receive what nobody
-// reviewed, so the plan is rejected as stale. That includes an exclusion a
-// service outage or a probe verdict causes: a plan approved while a line
-// flaps is proposed again rather than applied over a diff nobody read.
-func (s *Server) subStorePlanApprove(ctx context.Context, p principal, approval model.Approval, queueApply bool) (model.Approval, error) {
-	if !queueApply {
-		return approval, &approvalDecisionError{status: http.StatusBadRequest, err: apiError(model.APIErrorBadRequest,
-			"a sub-store plan is applied when it is approved: approve with queue_apply")}
-	}
-	var plan subStorePlan
-	if err := json.Unmarshal([]byte(approval.Plan), &plan); err != nil || plan.Kind != subStorePlanKind ||
-		plan.PluginID != subStorePluginID || !subStoreSvcValidID(plan.SubscriptionID) {
-		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "the plan is not a sub-store revision plan")}
-	}
-	// A decision that arrives after another answers what the first one
-	// left, rather than previewing a plan that is no longer pending.
-	current, ok := s.store.Approval(approval.ID)
-	if !ok {
-		return approval, &approvalDecisionError{status: http.StatusNotFound, err: apiError(model.APIErrorNotFound, "approval not found")}
-	}
-	if current.Status != model.ApprovalPending {
-		return current, nil
-	}
-
-	// The previews run outside the share-write lock: one may fetch and
-	// render, and no share write waits on it. The lock below then checks
-	// that the shares the previews were made for are still the record's.
-	identities, err := s.subStorePlanIdentities(ctx, plan.SubscriptionID, plan.FromRevision,
-		subStorePlanSide{Revision: plan.FromRevision}, subStorePlanSide{Revision: plan.ToRevision}, subStorePlanIdentityIDs(plan))
-	staleReason := ""
-	var previewErr *subStorePlanPreviewError
-	switch {
-	case err == nil:
-	case errors.Is(err, errSubStorePlanNotLive):
-		staleReason = "the record's live revision moved since this plan was proposed; propose it again"
-	case errors.Is(err, errSubStorePlanNoPreviewer):
-		// A preview that could not run says nothing about the plan: it
-		// stays pending, and the operator decides again.
-		return approval, &approvalDecisionError{status: http.StatusServiceUnavailable,
-			err: apiError(model.APIErrorBadGateway, "bind preview is not available on this server; the plan stays pending")}
-	case errors.As(err, &previewErr):
-		return approval, &approvalDecisionError{status: http.StatusBadGateway,
-			err: apiError(model.APIErrorBadGateway, previewErr.Error()+"; the plan stays pending")}
-	default:
-		return approval, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
-	}
-
-	release := s.subStoreSvcLockShareWrites()
-	decided, approvedNow, err := s.subStorePlanDecide(p, approval, plan, identities, staleReason)
-	release()
-	if err != nil || !approvedNow {
-		return decided, err
-	}
-
-	planSHA := approvalPlanSHA(approval)
-	applyReq := subStoreApplyRevisionRequest{
-		SubscriptionID: plan.SubscriptionID, Revision: plan.ToRevision, ExpectedRevision: plan.FromRevision,
-		ApprovalID: approval.ID, PlanSHA256: planSHA,
-	}
-	claimed, err := s.subStorePlanApply(ctx, applyReq)
-	if err != nil {
-		// The approval stays approved and unapplied, as a plugin operation's
-		// does: the record did not move, and the operator proposes again.
-		// Nothing can apply it later: its grant died with this call. The
-		// reason is fixed text, because the plugin's message is not trusted
-		// to be free of record content.
-		const reason = "apply_revision failed; the record is unchanged, propose the revision again"
-		if current, ok, _ := s.store.MutateApproval(approval.ID, func(a *model.Approval) bool {
-			if a.Status != model.ApprovalApproved {
-				return false
-			}
-			a.Reason, a.UpdatedAt = reason, s.now()
-			return true
-		}); ok {
-			decided = current
-		}
-		s.recordPrincipalAudit(p, model.AuditEvent{
-			ID: id.New("audit"), Action: auditActionSubStorePlanApply, Scope: "proxy:admin", Decision: "deny",
-			Reason: "apply_revision failed",
-			Metadata: map[string]string{"approval_id": approval.ID, "plan_sha256": planSHA, "subscription_id": plan.SubscriptionID,
-				"to_revision": plan.ToRevision, "grant_claimed": strconv.FormatBool(claimed)},
-		})
-		return decided, &approvalDecisionError{status: http.StatusBadGateway, err: apiError(model.APIErrorBadGateway, reason)}
-	}
-	if !claimed {
-		// The plugin published without asking whether core called it, so it
-		// would publish for any caller. The apply is real and is recorded
-		// as applied; the audit and the log say the contract was not kept.
-		s.logger.Printf("sub-store plans: apply_revision for approval %s answered without claiming its grant; the plugin does not check that core called it", approval.ID)
-	}
-	applied, _, err := s.store.MutateApproval(approval.ID, func(a *model.Approval) bool {
-		if a.Status != model.ApprovalApproved {
-			return false
-		}
-		a.Status, a.Reason, a.UpdatedAt = model.ApprovalApplied, "", s.now()
-		return true
-	})
-	if err != nil {
-		return decided, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
-	}
-	s.recordPrincipalAudit(p, model.AuditEvent{
-		ID: id.New("audit"), Action: auditActionSubStorePlanApply, Scope: "proxy:admin", Decision: "allow",
-		Metadata: map[string]string{
-			"approval_id": approval.ID, "plan_sha256": planSHA, "subscription_id": plan.SubscriptionID,
-			"from_revision": plan.FromRevision, "to_revision": plan.ToRevision,
-			"shares": fmt.Sprint(len(plan.Shares)), "unbound_shares": fmt.Sprint(len(plan.UnboundShares)),
-			"grant_claimed": strconv.FormatBool(claimed),
-		},
-	})
-	return applied, nil
-}
-
-// subStorePlanDecide runs under the share-write lock. It answers the
-// approval as another decision left it, rejects the plan as stale, or moves
-// it from pending to approved; approved is true only in the last case.
-func (s *Server) subStorePlanDecide(p principal, approval model.Approval, plan subStorePlan, identities []subStorePlanIdentity, staleReason string) (model.Approval, bool, error) {
-	current, ok := s.store.Approval(approval.ID)
-	if !ok {
-		return approval, false, &approvalDecisionError{status: http.StatusNotFound, err: apiError(model.APIErrorNotFound, "approval not found")}
-	}
-	if current.Status != model.ApprovalPending {
-		return current, false, nil
-	}
-	if staleReason == "" {
-		staleReason = s.subStorePlanStaleReason(approval, plan, identities)
-	}
-	if staleReason != "" {
-		rejected, ok, err := s.store.MutateApproval(approval.ID, func(a *model.Approval) bool {
-			if a.Status != model.ApprovalPending {
-				return false
-			}
-			a.Status, a.Reason, a.UpdatedAt = model.ApprovalRejected, staleReason, s.now()
-			return true
-		})
-		if err != nil {
-			return approval, false, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
-		}
-		if !ok {
-			return rejected, false, nil
-		}
-		s.recordPrincipalAudit(p, model.AuditEvent{
-			ID: id.New("audit"), Action: auditActionSubStorePlanStale, Scope: "proxy:admin", Decision: "deny", Reason: staleReason,
-			Metadata: map[string]string{"approval_id": approval.ID, "subscription_id": plan.SubscriptionID},
-		})
-		return approval, false, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, staleReason)}
-	}
-	// Pending to approved exactly once: of two decisions racing on one
-	// approval, one applies and the other answers what it finds.
-	approved, ok, err := s.store.MutateApproval(approval.ID, func(a *model.Approval) bool {
-		if a.Status != model.ApprovalPending {
-			return false
-		}
-		a.Status, a.ApprovedBy, a.UpdatedAt = model.ApprovalApproved, p.ActorID, s.now()
-		return true
-	})
-	if err != nil {
-		return approval, false, &approvalDecisionError{status: http.StatusInternalServerError, err: err}
-	}
-	if !ok {
-		current, _ := s.store.Approval(approval.ID)
-		return current, false, nil
-	}
-	return approved, true, nil
-}
-
-// subStorePlanStaleReason names what moved since the plan was proposed, or
-// returns "". identities is what each of the plan's identities would
-// receive, previewed at this decision.
-func (s *Server) subStorePlanStaleReason(approval model.Approval, plan subStorePlan, identities []subStorePlanIdentity) string {
-	if approval.PluginVersion != "" {
-		loaded, ok := s.loadedPlugin(subStorePluginID)
-		if !ok || loaded.Manifest.Version != approval.PluginVersion || !equalFoldHex(loaded.ArtifactDigest, approval.ArtifactDigest) {
-			return "the sub-store plugin changed since this plan was proposed; propose it again"
-		}
-	}
-	const sharesMoved = "the record's live shares changed since this plan was proposed; propose it again"
-	want := make(map[string]string, len(plan.Shares)+len(plan.UnboundShares))
-	for _, share := range plan.Shares {
-		want[share.ShareID] = share.IdentityID
-	}
-	for _, share := range plan.UnboundShares {
-		want[share.ShareID] = ""
-	}
-	live := s.subStorePlanLiveShares(plan.SubscriptionID)
-	if len(live) != len(want) {
-		return sharesMoved
-	}
-	for _, share := range live {
-		if identityID, ok := want[share.ID]; !ok || identityID != share.Source.IdentityID {
-			return sharesMoved
-		}
-	}
-	got, errGot := json.Marshal(identities)
-	reviewed, errReviewed := json.Marshal(plan.Identities)
-	if errGot != nil || errReviewed != nil || !bytes.Equal(got, reviewed) {
-		return "what the record's shares would receive changed since this plan was proposed; propose it again"
-	}
-	return ""
 }
 
 // subStoreApplyGrant is core's authority for one apply_revision call: bound
@@ -1024,13 +1014,21 @@ func (s *Server) subStorePlansClaimApply(ctx context.Context, request []byte) ([
 	return nil, rpcAPIError(http.StatusForbidden, model.APIErrorForbidden, "claim_apply: "+reason)
 }
 
-// subStorePlanApply calls the plugin's apply_revision under the subscription
-// mutation gate, exactly as the gateway runs a record save
-// (server_plugin_invoke.go): the plugin's snapshots are marked stale and the
-// cached bodies of its shares dropped before the call, so no body rendered
-// from the old revision is served after it. The call carries the one-time
-// grant; claimed reports whether the plugin claimed it.
-func (s *Server) subStorePlanApply(ctx context.Context, req subStoreApplyRevisionRequest) (claimed bool, err error) {
+// subStorePlanApply calls the plugin's apply_revision for one record under
+// the subscription mutation gate, exactly as the gateway runs a record save
+// (server_plugin_invoke.go), with the generation bumped when the gate is
+// released so a refresh that was in flight is discarded. The call carries the
+// one-time grant; claimed reports whether the plugin claimed it. Once the
+// plugin answered, whatever it answered, every cached body of the plugin's
+// shares is dropped and each source's epoch advanced, which also voids the
+// bind policy memo (substore_bind_serve.go). after, when given, then runs
+// still under the gate with the call's outcome: the caller drops the record's
+// snapshot on success and stale-marks the closure on a failure there, so no
+// refresh lands between the plugin's write and core's reaction to it. The
+// snapshots are not touched before the call: a failed apply usually leaves
+// the record unchanged, and the last-good snapshot should keep serving
+// through the next provider outage.
+func (s *Server) subStorePlanApply(ctx context.Context, req subStoreApplyRevisionRequest, after ...func(error)) (claimed bool, err error) {
 	state, release, err := s.acquireSubscriptionPluginGate(ctx, subStorePluginID)
 	if err != nil {
 		return false, err
@@ -1041,20 +1039,6 @@ func (s *Server) subStorePlanApply(ctx context.Context, req subStoreApplyRevisio
 		state.mu.Unlock()
 		release()
 	}()
-	persist := s.store.MarkPluginSubscriptionSnapshotsStale
-	if s.subscriptionMutationPersist != nil {
-		persist = s.subscriptionMutationPersist
-	}
-	committed, err := persist(subStorePluginID, s.now())
-	if committed {
-		state.mu.Lock()
-		state.generation++
-		state.mu.Unlock()
-		s.invalidateSharesForPlugin(subStorePluginID)
-	}
-	if err != nil {
-		return false, err
-	}
 	grant := &subStoreApplyGrant{req: req}
 	callCtx := context.WithValue(ctx, subStoreApplyGrantKey{}, grant)
 	var reply subStoreApplyRevisionReply
@@ -1064,14 +1048,17 @@ func (s *Server) subStorePlanApply(ctx context.Context, req subStoreApplyRevisio
 		reply, err = s.subStoreCallApplyRevision(callCtx, req)
 	}
 	claimed = grant.close()
-	if err != nil {
+	switch {
+	case err != nil:
 		s.logger.Printf("sub-store plans: apply_revision failed for record %s (%s)", req.SubscriptionID, subscriptionDiagnosticSummary(err))
-		return claimed, err
+	case reply.SubscriptionID != req.SubscriptionID || reply.Revision != req.Revision:
+		err = errors.New("apply_revision answered for another record or revision")
 	}
-	if reply.SubscriptionID != req.SubscriptionID || reply.Revision != req.Revision {
-		return claimed, errors.New("apply_revision answered for another record or revision")
+	s.invalidateSharesForPlugin(subStorePluginID)
+	for _, fn := range after {
+		fn(err)
 	}
-	return claimed, nil
+	return claimed, err
 }
 
 // subStoreCallApplyRevision is the plugin call, under the method's signed

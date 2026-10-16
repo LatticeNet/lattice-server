@@ -44,6 +44,9 @@ export interface PlanStatusRow {
   approval_id: string;
   status: string;
   reason?: string;
+  stale?: boolean;
+  action: string;
+  mode: string;
   plan_sha256: string;
   subscription_id: string;
   from_revision: string;
@@ -84,6 +87,8 @@ export interface PlanShare {
   removed: number;
   changed: number;
   excluded: number;
+  assigned?: boolean;
+  archive?: boolean;
 }
 
 export interface PlanUnboundShare {
@@ -93,6 +98,8 @@ export interface PlanUnboundShare {
   enabled: boolean;
   expires_at?: string;
   fleet_credentials: boolean;
+  cleared_identity_id?: string;
+  archive?: boolean;
 }
 
 export interface PlanLine {
@@ -128,17 +135,62 @@ export interface PlanIdentity {
   unchanged: number;
 }
 
+export interface PlanRecord {
+  subscription_id: string;
+  kind?: string;
+  role: string;
+  from_revision: string;
+  to_revision?: string;
+  member_revisions?: Record<string, string>;
+  before_empty?: boolean;
+  totals: PlanTotals;
+  shares: PlanShare[];
+  unbound_shares: PlanUnboundShare[];
+  coverage?: string;
+  identities: PlanIdentity[];
+}
+
+export interface PlanAssignment {
+  share_id: string;
+  subscription_id: string;
+  slug: string;
+  display_name?: string;
+  identity_id: string;
+  lines: number;
+}
+
+export interface PlanArchival {
+  share_id: string;
+  subscription_id: string;
+  slug: string;
+  display_name?: string;
+  identity_id?: string;
+}
+
 export interface Plan {
   kind: string;
   plugin_id: string;
   subscription_id: string;
   from_revision: string;
   to_revision: string;
+  action?: string;
+  mode?: string;
+  role?: string;
+  record_kind?: string;
+  member_revisions?: Record<string, string>;
+  before_empty?: boolean;
   totals: PlanTotals;
+  primary_totals: PlanTotals;
   shares: PlanShare[];
   unbound_shares: PlanUnboundShare[];
   coverage?: string;
   identities: PlanIdentity[];
+  records?: PlanRecord[];
+  apply_order?: string[];
+  closure?: string[];
+  assignments?: PlanAssignment[];
+  clearings?: PlanAssignment[];
+  archivals?: PlanArchival[];
 }
 
 export interface ShareIcon {

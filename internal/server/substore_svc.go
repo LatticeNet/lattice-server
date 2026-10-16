@@ -38,8 +38,11 @@ const (
 
 // subStoreSvcState is the state the two services keep on the server.
 type subStoreSvcState struct {
-	// mu is the share-write lock (subStoreSvcLockShareWrites). It is never
-	// held across a plugin call.
+	// mu is the share-write lock (subStoreSvcLockShareWrites). A plan's
+	// decision holds it across the depends_on read of its closure and its
+	// apply (apply_revision under the method's 10 s budget), and publish
+	// across its own, so no share appears between the check and the apply;
+	// no other path holds it across a plugin call.
 	mu sync.Mutex
 	// previewer runs validate-and-bind for one record revision and one
 	// identity (substore_svc_plans.go). It is nil until the bind code is
@@ -55,7 +58,7 @@ func (s *Server) registerSubStoreSvcRPC() {
 	if s.pluginRPC == nil {
 		return
 	}
-	if err := s.pluginRPC.Register(subStorePluginID, subStorePlansService, "v1", []string{"propose", "status", "claim_apply"}, s.subStorePlansRPC); err != nil {
+	if err := s.pluginRPC.Register(subStorePluginID, subStorePlansService, "v1", subStorePlansMethods, s.subStorePlansRPC); err != nil {
 		s.logger.Printf("sub-store: register %s failed: %v", subStorePlansService, err)
 	}
 }

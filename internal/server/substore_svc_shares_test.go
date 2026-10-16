@@ -71,6 +71,9 @@ func newSubStoreSvcHarness(t *testing.T) *subStoreSvcHarness {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// rec and other are fleet records in the plugin's index, so a share of
+	// either may be created with an identity (identity_requires_fleet_record).
+	putSubStoreRecords(t, st, `{"records":[{"id":"rec","name":"rec","source":"fleet"},{"id":"other","name":"other","source":"fleet"}]}`)
 	srv.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
 		return model.SubscriptionSnapshot{Raw: "nodes", FetchedAt: now}, nil
 	}

@@ -162,21 +162,22 @@ func (s *Server) probeTargets(ctx context.Context) ([]byte, error) {
 	for _, t := range s.store.ProbeTargets() {
 		answer.Targets = append(answer.Targets, customTargetView(t))
 	}
-	answer.Custom.Supported, answer.Custom.Reason = s.probeTakesCustomTargets(ctx)
+	_, answer.Custom.Supported, answer.Custom.Reason = s.probeTakesCustomTargets(ctx)
 	return json.Marshal(answer)
 }
 
 // probeTakesCustomTargets reads the probe's health and says whether it
-// accepts custom_targets, or why the saved targets cannot run.
-func (s *Server) probeTakesCustomTargets(ctx context.Context) (bool, string) {
+// answered, whether it accepts custom_targets, and why saved targets cannot
+// run when they cannot.
+func (s *Server) probeTakesCustomTargets(ctx context.Context) (available, supported bool, reason string) {
 	view := s.probe.health(ctx, true)
 	switch {
 	case !view.Available:
-		return false, "the probe's health could not be read: " + view.Reason
+		return false, false, "the probe's health could not be read: " + view.Reason
 	case slices.Contains(view.Capabilities, probeCapabilityCustomTargets):
-		return true, ""
+		return true, true, ""
 	default:
-		return false, fmt.Sprintf("lattice-probe %s does not run saved targets; a newer lattice-probe does", view.ProbeVersion)
+		return true, false, fmt.Sprintf("lattice-probe %s does not run saved targets; a newer lattice-probe does", view.ProbeVersion)
 	}
 }
 
@@ -399,21 +400,21 @@ func checkProbeTargetHostName(h string) error {
 	}
 	labels := strings.Split(h, ".")
 	if len(labels) < 2 {
-		return fmt.Errorf("%s is a single-label name, which resolves only on a local network; use a fully qualified name", h)
+		return fmt.Errorf("%s is a single-label name, which resolves only on a local network; use a fully qualified name", auditTruncate(h, 64))
 	}
 	for _, label := range labels {
 		if len(label) < 1 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' ||
 			strings.Trim(label, "abcdefghijklmnopqrstuvwxyz0123456789-") != "" {
-			return fmt.Errorf("%s has an invalid label; labels are 1 to 63 letters, digits and inner hyphens", h)
+			return fmt.Errorf("%s has an invalid label; labels are 1 to 63 letters, digits and inner hyphens", auditTruncate(h, 64))
 		}
 	}
 	last := labels[len(labels)-1]
 	if strings.Trim(last, "0123456789") == "" || strings.HasPrefix(last, "0x") {
-		return fmt.Errorf("%s ends in a numeric label, which some resolvers read as an IPv4 address", h)
+		return fmt.Errorf("%s ends in a numeric label, which some resolvers read as an IPv4 address", auditTruncate(h, 64))
 	}
 	for _, suffix := range probeTargetSpecialSuffixes {
 		if h == suffix || strings.HasSuffix(h, "."+suffix) {
-			return fmt.Errorf("%s is under .%s, which resolves only on a local network or nowhere", h, suffix)
+			return fmt.Errorf("%s is under .%s, which resolves only on a local network or nowhere", auditTruncate(h, 64), suffix)
 		}
 	}
 	return nil
@@ -522,6 +523,30 @@ func probeTargetDigest(t store.ProbeTarget) string {
 	return hex.EncodeToString(sum[:6])
 }
 
+// probeRequestFields are the top-level fields of lattice-probe's run
+// request (its spec.Request).
+var probeRequestFields = []string{
+	"engine", "outbounds", "test", "targets", "custom_targets", "samples", "udp", "throughput", "throughput_bytes", "timeout_ms",
+}
+
+// foldedProbeRequestField names the probe field a top-level key of request
+// would reach although it is not written exactly as that field. The probe
+// decodes with encoding/json, which matches names case-insensitively with
+// Unicode folding ("Custom_Targets", "cuſtom_targets" with U+017F), while
+// this server reads fields by exact key. Such a key would let the probe act
+// on a field the server never saw: definitions a caller brought, or targets
+// the audit record does not name. "" when every key is exact or unknown.
+func foldedProbeRequestField(fields map[string]json.RawMessage) string {
+	for key := range fields {
+		for _, name := range probeRequestFields {
+			if key != name && strings.EqualFold(key, name) {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
 // resolveProbeRunTargets adds the definitions of the saved targets a run
 // names to the request. It returns the request unchanged when the run names
 // none, and the audit entries for the ones it adds. A run that brings its
@@ -551,7 +576,10 @@ func (s *Server) resolveProbeRunTargets(ctx context.Context, request []byte) ([]
 	if len(missing) > 0 {
 		return nil, "", probeTargetBadRequest(fmt.Sprintf("target %s is not a saved target; it may have been deleted, so reload the target list", auditTruncate(missing[0], 40)))
 	}
-	if ok, reason := s.probeTakesCustomTargets(ctx); !ok {
+	switch available, supported, reason := s.probeTakesCustomTargets(ctx); {
+	case !available:
+		return nil, "", rpcAPIError(http.StatusServiceUnavailable, apiErrorProbeUnavailable, reason)
+	case !supported:
 		return nil, "", rpcAPIError(http.StatusConflict, apiErrorProbeOutdated, "saved targets cannot run: "+reason+". Built-in targets still can.")
 	}
 	defs := make([]probeTargetDefinition, len(saved))

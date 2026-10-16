@@ -414,3 +414,58 @@ func TestProbeTargetEditThroughTheGateway(t *testing.T) {
 		t.Fatalf("%d saved targets", n)
 	}
 }
+
+// The probe matches request fields case-insensitively with Unicode folding,
+// so a key that differs from a field only that way is refused before it can
+// carry definitions or targets this server did not read.
+func TestProbeRunRefusesFoldedFieldNames(t *testing.T) {
+	fake := startFakeProbe(t)
+	fake.answerWithHealth(probeTestHealthCustom, http.StatusOK, probeTestAnswer)
+	srv, st, _ := newProbeTestServer(t, fake.socket)
+	if _, err := st.CreateProbeTarget(store.ProbeTarget{ID: "custom-nas", Label: "NAS", URL: "https://nas.example.net/", Method: "GET", ExpectStatus: "204"}, probeTargetsLimit, srv.now()); err != nil {
+		t.Fatal(err)
+	}
+	smuggled := `[{"id":"custom-x","url":"https://attacker.example.net/","method":"GET","expect_status":"200"}]`
+	for name, extra := range map[string]string{
+		"title case":            `,"Custom_Targets":` + smuggled,
+		"long s":                `,"cuſtom_targets":` + smuggled,
+		"upper case":            `,"CUSTOM_TARGETS":` + smuggled,
+		"beside a saved id":     `,"targets":["custom-nas"],"cuſtom_targets":` + smuggled,
+		"targets in title case": `,"Targets":["custom-nas"]`,
+		"test in upper case":    `,"TEST":"relay"`,
+	} {
+		_, err := srv.vpnCoreProbeRPC(probeCtx(probeOperator("op", probeScope)), "run", []byte(probeTestRequest(extra)))
+		status, apiErr := probeErrorOf(t, err)
+		if status != http.StatusBadRequest || !strings.Contains(apiErr.Message, "only in letter case") {
+			t.Fatalf("%s = %d %+v", name, status, apiErr)
+		}
+	}
+	if n := fake.runs.Load(); n != 0 {
+		t.Fatalf("%d runs with folded field names reached the probe", n)
+	}
+	// A field the probe does not have is not its business here.
+	if _, err := srv.vpnCoreProbeRPC(probeCtx(probeOperator("op", probeScope)), "run", []byte(probeTestRequest(`,"note":"x"`))); err != nil {
+		t.Fatalf("an unknown field was refused: %v", err)
+	}
+}
+
+func TestProbeRunWithSavedTargetWhenTheProbeIsDown(t *testing.T) {
+	fake := startFakeProbe(t)
+	srv, st, _ := newProbeTestServer(t, fake.socket+".gone")
+	if _, err := st.CreateProbeTarget(store.ProbeTarget{ID: "custom-nas", Label: "NAS", URL: "https://nas.example.net/", Method: "GET", ExpectStatus: "204"}, probeTargetsLimit, srv.now()); err != nil {
+		t.Fatal(err)
+	}
+	req := strings.Replace(probeTestRequest(""), `"targets":["gstatic-204","cloudflare-204"]`, `"targets":["custom-nas"]`, 1)
+	_, err := srv.vpnCoreProbeRPC(probeCtx(probeOperator("op", probeScope)), "run", []byte(req))
+	if status, apiErr := probeErrorOf(t, err); status != http.StatusServiceUnavailable || apiErr.Code != apiErrorProbeUnavailable {
+		t.Fatalf("a saved target with no probe = %d %+v", status, apiErr)
+	}
+}
+
+func TestProbeTargetErrorsDoNotEchoLongInput(t *testing.T) {
+	long := strings.Repeat("a", 1500)
+	_, _, err := normalizeProbeTarget(probeTargetInput{Label: "a", URL: "https://" + long + "/", ExpectStatus: "200"})
+	if err == nil || len(err.Error()) > 200 {
+		t.Fatalf("error of %d bytes: %v", len(fmt.Sprint(err)), err)
+	}
+}

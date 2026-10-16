@@ -269,6 +269,14 @@ func (s *Server) probeRun(ctx context.Context, p principal, request []byte) ([]b
 		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest,
 			fmt.Sprintf("the probe request is %d bytes; the limit is %d", len(request), probeMaxRequestBytes))
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(request, &fields); err != nil || fields == nil {
+		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "the probe request must be a JSON object")
+	}
+	if name := foldedProbeRequestField(fields); name != "" {
+		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest,
+			fmt.Sprintf("a field of the probe request differs from %q only in letter case; write it exactly as %s", name, name))
+	}
 	summary, ok := summarizeProbeRun(request)
 	if !ok {
 		return nil, rpcAPIError(http.StatusBadRequest, model.APIErrorBadRequest, "the probe request must be a JSON object")

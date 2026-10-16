@@ -368,6 +368,13 @@ func effectivePort(u *url.URL) string {
 	return "80"
 }
 
+// BlockedAddr reports whether NewClient refuses to dial addr: loopback,
+// private, link-local, multicast, unspecified, CGNAT, the documentation and
+// benchmarking ranges, and NAT64 forms judged by the IPv4 address inside.
+func BlockedAddr(addr netip.Addr) bool {
+	return isBlockedIP(net.IP(addr.AsSlice()))
+}
+
 func isBlockedIP(ip net.IP) bool {
 	if ip == nil {
 		return true

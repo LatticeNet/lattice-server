@@ -73,10 +73,11 @@ func (s *Server) subStorePlanApprove(ctx context.Context, p principal, approval 
 			return approval, &approvalDecisionError{status: http.StatusServiceUnavailable,
 				err: apiError(model.APIErrorBadGateway, "bind preview is not available on this server; the plan stays pending")}
 		case errors.As(err, &previewErr):
-			// A staged revision a later save replaced answers revision_unknown
-			// from render and can never apply: the plan is stale, not pending.
-			if s.subStorePlanStagedReplaced(ctx, plan) {
-				staleReason = subStorePlanStaleStaged
+			// A staged revision a later save replaced, or a live revision that
+			// moved, answers revision_unknown from render and can never apply:
+			// the plan is stale, not pending.
+			if moved := s.subStorePlanMovedReason(ctx, plan); moved != "" {
+				staleReason = moved
 				break
 			}
 			return approval, &approvalDecisionError{status: http.StatusBadGateway,
@@ -140,25 +141,31 @@ func (s *Server) subStorePlanDecisionPreviews(ctx context.Context, plan subStore
 	return out, nil
 }
 
-// subStorePlanStagedReplaced reports whether a promoted record's staged
-// revision is no longer the one the plan publishes.
-func (s *Server) subStorePlanStagedReplaced(ctx context.Context, plan subStorePlan) bool {
-	if plan.mode() != subStorePlanModePromote {
-		return false
-	}
+// subStorePlanMovedReason reads the closure again after a preview failed
+// and names the stale reason when a record of the plan moved under it: a
+// promoted record's staged revision replaced or discarded, a record's live
+// revision moved, a record gone. It answers "" when nothing moved, and the
+// failure says nothing about the plan.
+func (s *Server) subStorePlanMovedReason(ctx context.Context, plan subStorePlan) string {
 	g, err := s.subStorePlanGraphFor(ctx, subStorePlanRoots(plan), false)
 	if err != nil {
-		return false
+		return ""
 	}
 	for _, section := range plan.sections() {
-		if section.Role != subStorePlanRolePromote {
+		if section.Role == subStorePlanRoleStagedOnly {
 			continue
 		}
-		if facts, ok := g.facts(section.SubscriptionID); !ok || facts.StagedRevision != section.ToRevision {
-			return true
+		facts, ok := g.facts(section.SubscriptionID)
+		switch {
+		case !ok:
+			return subStorePlanStaleClosure
+		case section.Role == subStorePlanRolePromote && facts.StagedRevision != section.ToRevision:
+			return subStorePlanStaleStaged
+		case facts.Revision != section.FromRevision:
+			return subStorePlanStaleLive
 		}
 	}
-	return false
+	return ""
 }
 
 // subStorePlanDecide runs under the share-write lock. It answers the

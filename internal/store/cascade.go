@@ -74,6 +74,7 @@ func cloneGeoRouting(gr model.GeoRouting) model.GeoRouting {
 // never shares a backing array with persisted state.
 func cloneMonitor(m model.Monitor) model.Monitor {
 	m.NodeIDs = append([]string(nil), m.NodeIDs...)
+	m.PausedNodeIDs = append([]string(nil), m.PausedNodeIDs...)
 	return m
 }
 
@@ -502,13 +503,17 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 	// Step 12: Monitor ASSIGNMENT (SHARED - strip; AssignAll monitors unchanged)
 	// + MonitorResult (per-node).
 	for id, m := range s.state.Monitors {
-		if m.AssignAll || !contains(m.NodeIDs, nodeID) {
+		assigned := !m.AssignAll && contains(m.NodeIDs, nodeID)
+		if !assigned && !contains(m.PausedNodeIDs, nodeID) {
 			continue
 		}
 		report.MonitorsStripped++
 		if mutate {
 			clone := cloneMonitor(m)
 			clone.NodeIDs = withoutString(clone.NodeIDs, nodeID)
+			clone.PausedNodeIDs = withoutString(clone.PausedNodeIDs, nodeID)
+			// An edit read before the delete must not write the node back.
+			clone.Version++
 			s.state.Monitors[id] = clone
 		}
 	}

@@ -177,7 +177,16 @@ type monitorView struct {
 	// ManagedBy names the configuration that generates the monitor
 	// ("latency"); empty for a monitor an operator made. The console hides
 	// generated monitors from the operator's list and its failing count.
-	ManagedBy string    `json:"managed_by,omitempty"`
+	ManagedBy string `json:"managed_by,omitempty"`
+	// PausedNodeIDs are sources that keep their history but do not run the
+	// monitor now. Their pairs are left out of Latest.
+	PausedNodeIDs []string `json:"paused_node_ids,omitempty"`
+	// Alert is the alert policy, "down" or "off", and AlertAfter the failed
+	// runs in a row that page and read as down.
+	Alert      string `json:"alert"`
+	AlertAfter int    `json:"alert_after"`
+	// Version is what an edit names (POST /api/monitors/update).
+	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	// Latest is each assigned node's newest result that the caller may see,
@@ -213,6 +222,15 @@ func toMonitorLatestView(l store.MonitorLatest) monitorLatestView {
 	}
 }
 
+// monitorAlertOf is the policy a monitor follows: generated checks never
+// page, and an empty policy is the default.
+func monitorAlertOf(m model.Monitor) string {
+	if !monitorPages(m) {
+		return model.MonitorAlertOff
+	}
+	return model.MonitorAlertDown
+}
+
 func toMonitorViews(in []model.Monitor) []monitorView {
 	out := make([]monitorView, 0, len(in))
 	for _, m := range in {
@@ -220,7 +238,9 @@ func toMonitorViews(in []model.Monitor) []monitorView {
 			ID: m.ID, Name: m.Name, Type: m.Type, Target: m.Target,
 			IntervalSec: m.IntervalSec, TimeoutSec: m.TimeoutSec, AssignAll: m.AssignAll,
 			NodeIDs: m.NodeIDs, ThresholdDays: m.ThresholdDays,
-			Enabled: m.Enabled, ManagedBy: m.ManagedBy, CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
+			Enabled: m.Enabled, ManagedBy: m.ManagedBy, PausedNodeIDs: m.PausedNodeIDs,
+			Alert: monitorAlertOf(m), AlertAfter: store.MonitorAlertAfter(m), Version: m.Version,
+			CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 			Latest: []monitorLatestView{},
 		})
 	}

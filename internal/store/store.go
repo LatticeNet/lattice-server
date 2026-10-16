@@ -119,6 +119,9 @@ type State struct {
 	// LatencyProbes is the operator's latency probe configuration
 	// (latency_probes.go), nil until one is saved. Written only on an edit.
 	LatencyProbes *model.LatencyProbeConfig `json:"latency_probes,omitempty"`
+	// MonitorSettings is the operator's monitor history setting
+	// (monitor_settings.go), nil until one is saved. Written only on an edit.
+	MonitorSettings *model.MonitorSettings `json:"monitor_settings,omitempty"`
 	// EvidenceSettings are the operator's evidence budgets
 	// (evidence_settings.go), nil until saved. Written only on an edit.
 	EvidenceSettings *model.EvidenceSettings `json:"evidence_settings,omitempty"`
@@ -792,7 +795,7 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 	// behind their own flag. Production had no monitors when this moved, but
 	// a self-hosted store may carry history, and the latest records and
 	// failure streaks the alert hold reads are rebuilt from it.
-	return bs.MigrateMonitorResults(st.MonResults, MonitorResultsPerPair)
+	return bs.MigrateMonitorResults(st.MonResults, monitorHistoryLimitsOf(st.MonitorSettings))
 }
 
 func mergeSubscriptionHotSeed(jsonState, unmarkedBolt State) State {
@@ -5574,7 +5577,9 @@ func (s *Store) MonitorsForNode(nodeID string) []model.Monitor {
 		if m.Type == model.MonitorTypeTLS {
 			continue
 		}
-		if m.AssignAll || contains(m.NodeIDs, nodeID) {
+		// A paused source keeps its assignment and history but is not
+		// handed the monitor until it is resumed.
+		if (m.AssignAll || contains(m.NodeIDs, nodeID)) && !contains(m.PausedNodeIDs, nodeID) {
 			out = append(out, m)
 		}
 	}

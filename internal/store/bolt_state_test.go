@@ -760,11 +760,11 @@ func TestBoltStateRecordLevelMonitorResultsAndTunnels(t *testing.T) {
 	const perPair = 5
 	for i := 0; i < perPair+3; i++ {
 		rec := MonitorResultRecord{MonitorResult: model.MonitorResult{MonitorID: "m-z", NodeID: "n1", At: now.Add(time.Duration(i) * time.Second), Success: i%2 == 0, LatencyMs: float64(i)}}
-		if _, err := bs.RecordMonitorResults([]MonitorResultRecord{rec}, perPair); err != nil {
+		if _, err := bs.RecordMonitorResults([]MonitorResultRecord{rec}, MonitorHistoryLimits{PerPair: perPair}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m-z", NodeID: "n2", At: now, Success: true, LatencyMs: 99}}}, perPair); err != nil {
+	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m-z", NodeID: "n2", At: now, Success: true, LatencyMs: 99}}}, MonitorHistoryLimits{PerPair: perPair}); err != nil {
 		t.Fatal(err)
 	}
 	series, err := bs.MonitorPairResults("m-z", "n1", 0)

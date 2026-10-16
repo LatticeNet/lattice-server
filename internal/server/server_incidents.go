@@ -294,21 +294,35 @@ func (s *Server) pendingIncidents(now time.Time) []store.Incident {
 				continue
 			}
 			for _, pair := range pairs {
-				if pair.Success || pair.FailStreak != 1 || !monitorPairAssigned(mon, pair.NodeID) {
+				// A pair is pending between its first failure and the one
+				// that pages. Generated latency checks, disabled checks and
+				// checks whose alert policy is off never open an incident.
+				after := store.MonitorAlertAfter(mon)
+				if pair.Success || pair.FailStreak < 1 || pair.FailStreak >= after || !mon.Enabled ||
+					!monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)
-				msg := monitorDownMessage(name, where, pair.Error)
+				msg := monitorDownMessage(name, where, pair.Error, after)
 				pending(store.Incident{
 					Key: incidentKey(EventMonitorDown, pair.NodeID, monitorID), Kind: EventMonitorDown,
 					NodeID: pair.NodeID, MonitorID: monitorID, Subject: name + " on " + where,
 					Since: pair.ReceivedAt, Title: msg.title,
-					Detail: fmt.Sprintf("%s on %s failed once: %s. A second failure in a row opens it.", name, where, strings.TrimSpace(pair.Error)),
+					Detail: monitorPendingDetail(name, where, pair.Error, pair.FailStreak, after),
 				}, time.Time{})
 			}
 		}
 	}
 	return out
+}
+
+// monitorPendingDetail says how far a pair is from the failure that pages.
+func monitorPendingDetail(name, where, errText string, streak, after int) string {
+	errText = strings.TrimSpace(errText)
+	if streak == 1 && after == 2 {
+		return fmt.Sprintf("%s on %s failed once: %s. A second failure in a row opens it.", name, where, errText)
+	}
+	return fmt.Sprintf("%s on %s failed %s: %s. %d failures in a row open it.", name, where, monitorFailCount(streak), errText, after)
 }
 
 // incidentActionTarget loads an incident for a write and checks the caller

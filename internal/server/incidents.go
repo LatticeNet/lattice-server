@@ -509,12 +509,33 @@ func (s *Server) evaluateIncidents(now time.Time) {
 				gone = append(gone, inc.ID)
 				continue
 			}
-			if !monitorPairAssigned(mon, inc.NodeID) {
+			switch {
+			case !monitorPairAssigned(mon, inc.NodeID):
 				inc.State = store.IncidentStateResolved
 				inc.ResolvedAt = now
 				inc.RecoveryTitle = fmt.Sprintf("Monitor no longer checks %s", inc.Subject)
 				inc.RecoveryDetail = fmt.Sprintf("%s is no longer assigned, so its down state is closed without a recovery result.", inc.Subject)
 				inc.RecoveryLine = inc.Subject + ": no longer checked"
+				resolveOwed(&inc)
+				dirty = true
+			case !mon.Enabled:
+				// A disabled check is handed to no agent and its results
+				// are refused, so no recovery result will ever come.
+				inc.State = store.IncidentStateResolved
+				inc.ResolvedAt = now
+				inc.RecoveryTitle = fmt.Sprintf("Monitor paused: %s", inc.Subject)
+				inc.RecoveryDetail = fmt.Sprintf("%s is paused, so its down state is closed without a recovery result.", inc.Subject)
+				inc.RecoveryLine = inc.Subject + ": paused"
+				resolveOwed(&inc)
+				dirty = true
+			case !monitorPages(mon):
+				// Its alert policy was turned off (or it became a generated
+				// check): no recovery page would ever follow.
+				inc.State = store.IncidentStateResolved
+				inc.ResolvedAt = now
+				inc.RecoveryTitle = fmt.Sprintf("Alerts off for %s", inc.Subject)
+				inc.RecoveryDetail = fmt.Sprintf("Alerts are off for %s, so its down state is closed without a recovery result.", inc.Subject)
+				inc.RecoveryLine = inc.Subject + ": alerts off"
 				resolveOwed(&inc)
 				dirty = true
 			}
@@ -1020,11 +1041,13 @@ func (s *Server) adoptLegacyAlerts(now time.Time) {
 				continue
 			}
 			for _, pair := range pairs {
-				if pair.Success || pair.FailStreak < 2 || !monitorPairAssigned(mon, pair.NodeID) {
+				// A pair that could not have paged was never paged for.
+				after := store.MonitorAlertAfter(mon)
+				if pair.Success || pair.FailStreak < after || !mon.Enabled || !monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)
-				msg := monitorDownMessage(name, where, pair.Error)
+				msg := monitorDownMessage(name, where, pair.Error, after)
 				adopt(store.Incident{
 					Key: incidentKey(EventMonitorDown, pair.NodeID, monitorID), Kind: EventMonitorDown,
 					NodeID: pair.NodeID, MonitorID: monitorID, Subject: name + " on " + where, Since: pair.Since,

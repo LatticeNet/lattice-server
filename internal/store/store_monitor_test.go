@@ -550,7 +550,7 @@ func TestTrimTrustsRowsOverADriftedCount(t *testing.T) {
 	defer bs.Close()
 	base := time.Unix(1_000, 0).UTC()
 	for i := 0; i < 3; i++ {
-		if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m", NodeID: "n", At: base.Add(time.Duration(i) * time.Second), Success: true}}}, 10); err != nil {
+		if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m", NodeID: "n", At: base.Add(time.Duration(i) * time.Second), Success: true}}}, MonitorHistoryLimits{PerPair: 10}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -565,7 +565,7 @@ func TestTrimTrustsRowsOverADriftedCount(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m", NodeID: "n", At: base.Add(10 * time.Second), Success: true}}}, 10); err != nil {
+	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m", NodeID: "n", At: base.Add(10 * time.Second), Success: true}}}, MonitorHistoryLimits{PerPair: 10}); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ := bs.MonitorPairResults("m", "n", 0)
@@ -663,7 +663,7 @@ func TestFullExportReadsRowsAndTheLegacyBucket(t *testing.T) {
 	}
 	defer bs.Close()
 	at := time.Unix(5_000, 0).UTC()
-	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m-new", NodeID: "n1", At: at, Success: true, LatencyMs: 3}}}, MonitorResultsPerPair); err != nil {
+	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m-new", NodeID: "n1", At: at, Success: true, LatencyMs: 3}}}, DefaultMonitorHistoryLimits()); err != nil {
 		t.Fatal(err)
 	}
 	if err := bs.db.Update(func(tx *bolt.Tx) error {

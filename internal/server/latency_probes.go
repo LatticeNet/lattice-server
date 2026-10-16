@@ -603,6 +603,7 @@ func (s *Server) syncLatencyProbes(now time.Time) (model.LatencyProbePlan, store
 	defer s.latencySync.Unlock()
 	s.latencyEdges.refresh(latencyEdgeNames(s.liveSingBoxInventories(now)), now)
 	planned := s.planLatencyProbes(now)
+	s.monitorPaths.notePlan(planned.plan, now)
 	changes, err := s.store.SyncManagedMonitors(model.MonitorManagedLatency, planned.desired, now)
 	if err != nil {
 		return planned.plan, changes, err

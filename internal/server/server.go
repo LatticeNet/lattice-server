@@ -371,6 +371,9 @@ type Server struct {
 	// monitorDrops rate-limits the log line for agent monitor results the
 	// store refused; see server_monitor_results.go.
 	monitorDrops monitorDropLog
+	// monitorPaths holds the paths matrix cache and the history pruning
+	// sweep's guard; see monitor_paths.go and monitor_settings.go.
+	monitorPaths monitorPathState
 	// latencySync serializes latency probe syncs, so the background sweep
 	// and a configuration save never plan against each other's half-written
 	// monitors; see latency_probes.go.
@@ -889,6 +892,7 @@ func New(opts Options) (*Server, error) {
 		s.startShareFetchStatsFlush()
 		s.startLineClientTemplateSync()
 		s.startLatencyProbeSync()
+		s.startMonitorHistoryPrune()
 		s.startPluginTaskScheduler()
 		s.startStateWriteSummary()
 		if s.selfmon != nil {
@@ -1473,6 +1477,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors", s.withAuth("", s.handleMonitors))
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
+	mux.HandleFunc("/api/monitors/update", s.withAuth("monitor:admin", s.handleMonitorUpdate))
+	mux.HandleFunc("/api/monitors/series", s.withAuth("monitor:read", s.handleMonitorSeries))
+	mux.HandleFunc("/api/monitors/paths", s.withAuth("monitor:read", s.handleMonitorPaths))
+	mux.HandleFunc("/api/monitors/settings", s.withAuth("monitor:read", s.handleMonitorSettings))
+	mux.HandleFunc("/api/monitors/settings/update", s.withAuth("monitor:admin", s.handleMonitorSettingsUpdate))
 	mux.HandleFunc("/api/incidents", s.withAuth("monitor:read", s.handleIncidents))
 	mux.HandleFunc("/api/incidents/ack", s.withAuth("monitor:admin", s.handleIncidentAck))
 	mux.HandleFunc("/api/incidents/unack", s.withAuth("monitor:admin", s.handleIncidentUnack))
@@ -5351,6 +5360,19 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusBadRequest, errors.New("name and target are required"))
 			return
 		}
+		if !validMonitorAlert(req.Alert) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("alert must be %q or %q", model.MonitorAlertDown, model.MonitorAlertOff))
+			return
+		}
+		if req.Alert == "" {
+			req.Alert = model.MonitorAlertDown
+		}
+		if req.AlertAfter < 0 || req.AlertAfter > model.MonitorAlertAfterMax {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax))
+			return
+		}
+		// Sources are paused through an edit of a check that exists.
+		req.PausedNodeIDs = nil
 		switch req.Type {
 		case model.MonitorTypeTCP, model.MonitorTypeHTTP:
 			if !req.AssignAll && len(req.NodeIDs) == 0 {
@@ -5388,7 +5410,12 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusBadRequest, errors.New("only tcp, http and tls monitors are supported (icmp pending)"))
 			return
 		}
+		if err := validMonitorTiming(req.IntervalSec, req.TimeoutSec); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		req.ID = id.New("mon")
+		req.Version = 1
 		req.Enabled = true
 		// Only the control plane marks a monitor as generated; a client
 		// that sends the field would make a monitor nobody can delete.
@@ -5495,11 +5522,13 @@ func monitorLatestViews(p principal, mon model.Monitor, pairs []store.MonitorLat
 	return out
 }
 
+// monitorPairAssigned reports whether the monitor checks from nodeID now: an
+// assigned source that is not paused, or the control plane for tls.
 func monitorPairAssigned(mon model.Monitor, nodeID string) bool {
 	if mon.Type == model.MonitorTypeTLS {
 		return nodeID == ""
 	}
-	return nodeID != "" && (mon.AssignAll || slices.Contains(mon.NodeIDs, nodeID))
+	return nodeID != "" && (mon.AssignAll || slices.Contains(mon.NodeIDs, nodeID)) && !slices.Contains(mon.PausedNodeIDs, nodeID)
 }
 
 func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {
@@ -6000,15 +6029,18 @@ func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorRes
 	if current.Success && priorFailStreak == 0 {
 		return
 	}
-	if !current.Success && priorFailStreak != 1 {
+	mon, _ := s.store.Monitor(current.MonitorID)
+	after := store.MonitorAlertAfter(mon)
+	if !current.Success && priorFailStreak != after-1 {
 		return
 	}
-	mon, _ := s.store.Monitor(current.MonitorID)
-	if mon.ManagedBy == model.MonitorManagedLatency {
+	if !monitorPages(mon) {
 		// Latency probes do not page one pair at a time: a path from China
 		// drops probes routinely, and twenty targets would page twenty
 		// times. A degradation alert belongs to the incident path, judged
-		// on the pair's rollups (latencyRollupsFor) instead.
+		// on the pair's rollups (latencyRollupsFor) instead. A check whose
+		// alert policy is off never pages; the incident sweep closes what
+		// it had open when the policy changed.
 		return
 	}
 	if mon.ID == "" {
@@ -6030,7 +6062,7 @@ func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorRes
 	s.openIncident(incidentSignal{
 		kind: EventMonitorDown, nodeID: nodeID, monitorID: current.MonitorID,
 		subject: name + " on " + where, since: now, sortKey: name + "\x00" + where,
-		msg: monitorDownMessage(name, where, current.Error),
+		msg: monitorDownMessage(name, where, current.Error, after),
 	}, now)
 }
 
@@ -6052,15 +6084,27 @@ func (s *Server) monitorNames(mon model.Monitor, nodeID string) (name, where str
 	return name, where
 }
 
-func monitorDownMessage(name, where, errText string) incidentMessage {
+func monitorDownMessage(name, where, errText string, after int) incidentMessage {
 	detail := strings.TrimSpace(errText)
 	if detail == "" {
 		detail = "probe failed"
 	}
 	return incidentMessage{
 		title:  fmt.Sprintf("Monitor down: %s on %s", name, where),
-		detail: fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail),
+		detail: fmt.Sprintf("%s on %s failed %s: %s", name, where, monitorFailCount(after), detail),
 		line:   fmt.Sprintf("%s on %s: %s", name, where, detail),
+	}
+}
+
+// monitorFailCount says how many failures in a row a page waited for.
+func monitorFailCount(n int) string {
+	switch n {
+	case 1:
+		return "once"
+	case 2:
+		return "twice in a row"
+	default:
+		return fmt.Sprintf("%d times in a row", n)
 	}
 }
 

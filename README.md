@@ -627,7 +627,56 @@ Use the compose file and deployment guide in the umbrella repository:
   `GET /api/monitors/latency/series?source=&target=&window=` returns one
   pair's buckets (1 min, 5 min or 1 h), empty ones included. Both reads are
   narrowed to pairs whose two nodes the caller may read, and no probe result
-  is ever audited.
+  is ever audited. The series route stays for one release beside
+  `GET /api/monitors/series`, which replaces it.
+- Monitoring paths (design 29): a path is one source probing one target, a
+  (monitor, source node) pair. `GET /api/monitors/paths?window=` returns the
+  matrix of every path the caller may read (both its source and its target
+  node, and the check itself for an operator's check): sources, targets, and
+  per path the state now (`up`, `down` after two failures in a row, or
+  `unknown` with `agent_offline`, `source_paused`, `not_probeable` or
+  `no_data`), p50, p95, jitter (mean jump between consecutive successful
+  runs), loss, samples beside expected, the same figures one window earlier
+  (`prev`) and the newest run's stamp. Windows are `1h`, `6h`, `24h`, `3d`,
+  `7d` and `14d`; `1h` reads raw rows, `6h` and `24h` five-minute rollups,
+  and `3d` and longer hourly rollups, and each window's figures are cached
+  until its next bucket closes. A tls check's path has the control plane as
+  its source, an empty node id. `GET /api/monitors/series` returns one path's
+  buckets, every step present (a gap has `n` 0 and `expected` above 0):
+  `?source=&target_node=&window=` joins every generated check from that
+  source to that node by time and marks `method_changes`;
+  `?monitor=&source=&window=` reads one check. The step is the smallest
+  multiple of the finest covering tier's resolution that keeps the series
+  within 720 points and is no shorter than the interval: 1 h at one minute,
+  24 h at five, 3 d at ten, 7 d at fifteen, 14 d at thirty (hourly when the
+  fine retention is under the window, or while the five-minute tier is still
+  filling and the hourly one holds the older part). Both need `monitor:read`.
+- `GET /api/monitors/settings` (`monitor:read`, no node allowlist, since the
+  figures cover the fleet) returns the history setting
+  (`fine_retention_days`, 3 to 14, 7 by default; the hourly tier is fixed at
+  35 days and raw rows at 1440 per path), the paths recording history, and
+  `measured_bytes` (bbolt page statistics of the monitor buckets) beside
+  `projected_bytes` (every current path filling every tier at the setting).
+  `POST /api/monitors/settings/update` saves it with the `version` it was
+  read at (409 when stale), needs `monitor:admin` without a node allowlist,
+  and is audited as `monitor.settings.update`; a lower retention starts the
+  pruning sweep at once. The sweep otherwise runs hourly and deletes, for
+  every pair including paused ones, the buckets and rows behind each tier's
+  line in write transactions of at most 2000 deletes. bbolt reuses freed
+  pages but never shrinks its file.
+- `POST /api/monitors/update` (`monitor:admin` on every source it names)
+  edits an operator's check with the `version` it was read at (409 when
+  stale) and only the fields it sends: `name`, `interval_sec` (10 s floor),
+  `timeout_sec`, `threshold_days` (tls), `alert` (`down` or `off`),
+  `alert_after` (failures in a row that page and read as down, 1 to 20,
+  default 2; also accepted on create), `enabled`, `assign_all`, `node_ids`
+  and `paused_node_ids`. A paused source
+  keeps its history, is not handed the check and has its results refused as
+  `not_assigned`. Changing `type` or `target` is refused with 400: that is a
+  new check. Generated checks answer 409, as a delete does. Edits are audited
+  as `monitor.update`. A check whose alert policy is `off`, like a generated
+  latency check, and a disabled check open no incident and show no pending
+  one; the incident sweep closes what such a check had open.
 - Control-plane task views expose script hash and byte size, not the full script
   body or agent-only lease credential.
 - Task read and run permissions are split: `task:read` lists task metadata and
@@ -724,10 +773,11 @@ Use the compose file and deployment guide in the umbrella repository:
   too: one row per result and one latest record per monitor and node (with the
   failure streak the alert hold reads), 1440 rows per pair, and any JSON
   history is migrated once on the first enable. Each result is also counted,
-  in the same transaction, into a five-minute bucket kept two days and an
-  hourly bucket kept eight days for its pair (count, failures, latency
-  extremes and a histogram), which answer the 24 hour and 7 day latency
-  windows the rows no longer reach. Without the sidecar the JSON
+  in the same transaction, into a five-minute bucket kept for the fine
+  retention (7 days by default) and an hourly bucket kept 35 days for its
+  pair (count, failures, latency extremes, a histogram and the jitter sum),
+  which answer the windows the rows no longer reach. History reads run in a
+  bolt read transaction outside the store lock. Without the sidecar the JSON
   file keeps 120 rows per pair and is rewritten only when a pair changes state,
   reaches its second failure in a row, or has not been written for five
   minutes. The in-memory read model

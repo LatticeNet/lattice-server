@@ -553,6 +553,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltEvidenceSettings(tx, persist.EvidenceSettings); err != nil {
 			return err
 		}
+		if err := putBoltProbeTargets(tx, persist.ProbeTargets); err != nil {
+			return err
+		}
 		if err := putMap(tx, boltBucketKV, persist.KV); err != nil {
 			return err
 		}
@@ -822,6 +825,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		st.EvidenceSettings = evidence
+		if err := readBoltProbeTargets(tx, st.ProbeTargets); err != nil {
+			return err
+		}
 		if err := readMap(tx, boltBucketKV, st.KV); err != nil {
 			return err
 		}

@@ -173,8 +173,8 @@ func TestDDNSCNAMEConflictIsAPlainLastError(t *testing.T) {
 	}
 	res := doJSON(t, handler, http.MethodPost, "/api/ddns/run", `{"id":"`+made.ID+`"}`, cookies, csrf)
 	res.Body.Close()
-	if res.StatusCode != http.StatusBadGateway {
-		t.Fatalf("run now against a CNAME: %d", res.StatusCode)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("run now against a CNAME: %d, want 409", res.StatusCode)
 	}
 	views := listDDNS(t, handler, cookies)
 	if len(views) != 1 || views[0].LastError != frontierCNAMEError {

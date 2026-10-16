@@ -95,6 +95,25 @@ a SHA-256 of the outbounds' canonical JSON, never the outbound itself. The
 server starts without the probe; a missing socket only makes it read as
 unavailable, with the reason, on the System page.
 
+Operators can save up to 32 targets of their own beside the probe's built-in
+ones: a label, an https URL (port 443 or 1024 to 65535, no credentials, no
+fragment, no private address or local-only name), GET or HEAD, the statuses
+that pass (`204` or `200-299,301`), and optionally text the first 64 KiB of
+the body must contain. The probe service's `targets` method lists built-in
+and saved targets together, each marked `builtin` or `custom`, and says
+whether the running probe can measure saved ones. `target_create`,
+`target_update` and `target_delete` need `vpncore:admin` as well as
+`vpn:probe`; update and delete name the version they read and are refused
+with 409 when it moved. Each change is audited as
+`vpncore.probe_target.<action>` with the id and host only. A run still names
+targets by id: for each saved id the server sends the stored definition to
+the probe, which checks it again before fetching anything, and a run that
+brings definitions of its own is refused. A run that names a saved target is
+refused with 409 `probe_outdated` when the probe does not list the
+`custom_targets` capability, and its audit record adds each saved target's
+id, host[:port] and a short hash of its definition, never the URL's path or
+query.
+
 Self-host DNS can optionally install a pinned CoreDNS executable during an
 approved `selfdns` apply. Leave these unset to keep the stricter precondition
 that `coredns` must already exist on the node:

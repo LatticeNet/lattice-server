@@ -2457,7 +2457,13 @@ func (s *Server) issueTOTPChallenge(w http.ResponseWriter, r *http.Request, user
 
 // handleLoginTOTP completes a login for a 2FA user by validating a TOTP code or a
 // single-use recovery code against the pending challenge, then issuing a session.
+// GET is the read-only companion for the post-SSO challenge (see
+// handlePendingSSOSecondFactor).
 func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		s.handlePendingSSOSecondFactor(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return
@@ -6664,11 +6670,35 @@ func (s *Server) handleRunDDNS(w http.ResponseWriter, r *http.Request, p princip
 		v4, v6 = node.PublicIP, node.PublicIPv6
 	}
 	if err := s.runDDNSForPrincipal(p, profile, v4, v6); err != nil {
-		writeError(w, http.StatusBadGateway, err)
+		status, answer := ddnsFailureAnswer(err)
+		writeError(w, status, answer)
 		return
 	}
 	updated, _ := s.store.DDNSProfile(req.ID)
 	writeJSON(w, http.StatusOK, toDDNSView(updated))
+}
+
+// ddnsFailureAnswer is the status and error a failed DDNS run or hostname
+// publish is answered with. When every part of the failure was written for
+// the operator, the message is the run's error, the same text the profile or
+// deployment stores as its last error: a record in the way is 409, a setting
+// to change is 422, and the provider's refusal, quoted by its error codes and
+// messages, is 502. A failure with any other part, a request that never got
+// an answer or an answer that is not quoted, keeps the masked 502 every
+// server-side failure gets. The stored last error still holds its full text,
+// which only an admin scoped to the same node, the one who may run or publish
+// it, can read.
+func ddnsFailureAnswer(err error) (int, error) {
+	switch ddns.Classify(err) {
+	case ddns.FailureConflict:
+		return http.StatusConflict, err
+	case ddns.FailureConfig:
+		return http.StatusUnprocessableEntity, err
+	case ddns.FailureProvider:
+		return http.StatusBadGateway, clientFacingError{err}
+	default:
+		return http.StatusBadGateway, err
+	}
 }
 
 // resolvePublicIPs picks the public IPs to record for an agent request, per
@@ -6781,14 +6811,20 @@ func (s *Server) runDDNSForPrincipal(p principal, profile model.DDNSProfile, v4,
 // Only the run-status fields are recorded, onto the profile as stored when the
 // run ends: the copy passed in is what the run published, and an edit saved
 // while the provider answered is newer than it.
+//
+// A provider the profile cannot build (one stored by another path than the
+// save handler, which refuses it) is the run's outcome too: the profile shows
+// the same reason "Run now" answers with, and the sweep waits an interval
+// before trying again instead of failing silently every tick.
 func (s *Server) runDDNSWithAudit(profile model.DDNSProfile, v4, v6 string, record func(model.AuditEvent), byOperator bool) error {
-	prov, err := s.ddnsProvider(profile)
-	if err != nil {
-		return err
+	var applyErr error
+	if prov, err := s.ddnsProvider(profile); err != nil {
+		applyErr = err
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		applyErr = ddns.Apply(ctx, prov, profile, v4, v6, s.ddnsRun(profile, byOperator))
+		cancel()
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	applyErr := ddns.Apply(ctx, prov, profile, v4, v6, s.ddnsRun(profile, byOperator))
 	// One clock. The sweep gates the next attempt on LastRunAt, so recording it
 	// from a different source than the gate reads makes the interval behave
 	// unpredictably and the behaviour untestable.
@@ -10535,9 +10571,10 @@ func apiErrorCode(status int) string {
 }
 
 // clientFacingError marks a server-side error whose message was written for
-// the operator: it names a limit the operator can act on, not an internal
-// fault. apiErrorMessage sends its text even with a 5xx status and keeps
-// masking every other 5xx, whose text can carry internal detail.
+// the operator: it names a limit the operator can act on, or quotes what an
+// upstream provider said, not an internal fault. apiErrorMessage sends its
+// text even with a 5xx status and keeps masking every other 5xx, whose text
+// can carry internal detail.
 type clientFacingError struct{ err error }
 
 func (e clientFacingError) Error() string { return e.err.Error() }

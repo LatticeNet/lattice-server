@@ -313,7 +313,9 @@ func TestProbeTargetsPassThrough(t *testing.T) {
 	fake := startFakeProbe(t)
 	srv, _, _ := newProbeTestServer(t, fake.socket)
 	out, err := srv.vpnCoreProbeRPC(probeCtx(probeOperator("op", probeScope)), "targets", nil)
-	if err != nil || string(out) != `{"targets":[{"id":"gstatic-204","url":"https://www.gstatic.com/generate_204","expect":204}]}` {
+	want := `{"targets":[{"id":"gstatic-204","source":"builtin","url":"https://www.gstatic.com/generate_204","method":"GET","expect":204,"expect_status":"204"}],` +
+		`"custom":{"supported":false,"reason":"lattice-probe 0.1.0 does not run saved targets; a newer lattice-probe does","limit":32}}`
+	if err != nil || string(out) != want {
 		t.Fatalf("targets: %s %v", out, err)
 	}
 	down, _, _ := newProbeTestServer(t, fake.socket+".gone")

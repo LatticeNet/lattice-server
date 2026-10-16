@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/auth"
 	oidctest "github.com/LatticeNet/lattice-server/internal/oidc"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -280,6 +281,179 @@ func TestOIDCHonorsLocalTOTP(t *testing.T) {
 	}
 	if !strings.Contains(rec.Header().Get("Location"), "totp_challenge=") {
 		t.Fatalf("expected a totp_challenge redirect, got %s", rec.Header().Get("Location"))
+	}
+}
+
+// ssoToSecondFactor runs an SSO login for a 2FA user up to the second-factor
+// step and returns the challenge id from the redirect and the browser-binding
+// cookie ("name=value") the callback set.
+func ssoToSecondFactor(t *testing.T, h http.Handler, idp *mockIDP, providerID string) (challengeID, challengeCookie string) {
+	t.Helper()
+	state, nonce, bind := startAndParse(t, h, providerID)
+	idp.nonce = nonce
+	rec := oidcCallback(h, state, "xyz", bind)
+	u, err := url.Parse(rec.Header().Get("Location"))
+	if rec.Code != http.StatusFound || err != nil || u.Query().Get("totp_challenge") == "" {
+		t.Fatalf("expected a totp_challenge redirect, got %d %s", rec.Code, rec.Header().Get("Location"))
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == totpChallengeCookie && c.Value != "" {
+			return u.Query().Get("totp_challenge"), c.Name + "=" + c.Value
+		}
+	}
+	t.Fatal("callback did not set the second-factor challenge cookie")
+	return "", ""
+}
+
+// getPendingSecondFactor reads GET /api/login/totp with an optional cookie
+// header and client address (httptest's default address when empty).
+func getPendingSecondFactor(h http.Handler, cookie, remoteAddr string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/api/login/totp", nil)
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	if remoteAddr != "" {
+		req.RemoteAddr = remoteAddr
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func decodePendingSecondFactor(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pending second factor: got %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("pending second factor must not be cached; Cache-Control=%q", got)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, rec.Body.String())
+	}
+	return out
+}
+
+func TestOIDCPendingSecondFactorNamesProviderAndEmail(t *testing.T) {
+	idp := newMockIDP(t)
+	idp.sub = "sub-2fa"
+	idp.email = "twofa@example.com"
+	idp.emailVerified = true
+
+	srv, st := newOIDCServer(t, idp.server.Client())
+	h := srv.Handler()
+	st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", DisplayName: "Google", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, AllowedDomains: []string{"example.com"}, CreatedAt: time.Now().UTC()})
+	st.UpsertUser(model.User{ID: "u-2fa", Username: "twofa@example.com", TOTPEnabled: true, TOTPSecret: "JBSWY3DPEHPK3PXP"})
+
+	challengeID, cookie := ssoToSecondFactor(t, h, idp, "g")
+
+	got := decodePendingSecondFactor(t, getPendingSecondFactor(h, cookie, ""))
+	want := map[string]any{"provider": "Google", "email": "twofa@example.com"}
+	if len(got) != len(want) || got["provider"] != want["provider"] || got["email"] != want["email"] {
+		t.Fatalf("pending second factor = %v, want exactly %v", got, want)
+	}
+
+	// The read is not a way around the second factor and does not spend the
+	// challenge: no session cookie, and the code still completes the login.
+	if rec := getPendingSecondFactor(h, cookie, ""); hasSessionCookie(rec.Result().Cookies()) {
+		t.Fatal("reading the pending second factor must not set a session")
+	}
+	code, err := auth.TOTPCodeAt("JBSWY3DPEHPK3PXP", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/login/totp", strings.NewReader(`{"challenge_id":"`+challengeID+`","code":"`+code+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", cookie)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !hasSessionCookie(rec.Result().Cookies()) {
+		t.Fatalf("second factor after the read: got %d; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Once the sign-in completes the challenge is spent and names nobody.
+	if rec := getPendingSecondFactor(h, cookie, ""); rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), "twofa@") {
+		t.Fatalf("completed sign-in: got %d %s, want 404 naming nobody", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOIDCPendingSecondFactorFallsBackToSubject(t *testing.T) {
+	idp := newMockIDP(t)
+	idp.sub = "sub-unverified"
+	idp.email = "unverified@example.com"
+	idp.emailVerified = false // an unverified email is not shown as verified
+
+	srv, st := newOIDCServer(t, idp.server.Client())
+	h := srv.Handler()
+	// No display name: the provider id stands in for it.
+	st.UpsertOIDCProvider(model.OIDCProvider{ID: "corp", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, CreatedAt: time.Now().UTC()})
+	st.UpsertUser(model.User{ID: "u-sub", Username: "operator", TOTPEnabled: true, TOTPSecret: "JBSWY3DPEHPK3PXP"})
+	if err := st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "corp", Issuer: idp.server.URL, Subject: "sub-unverified", UserID: "u-sub", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, cookie := ssoToSecondFactor(t, h, idp, "corp")
+
+	got := decodePendingSecondFactor(t, getPendingSecondFactor(h, cookie, ""))
+	if len(got) != 2 || got["provider"] != "corp" || got["subject"] != "sub-unverified" {
+		t.Fatalf("pending second factor = %v, want exactly provider=corp subject=sub-unverified", got)
+	}
+}
+
+func TestPendingSecondFactorNamesNobodyWithoutAValidSSOChallenge(t *testing.T) {
+	srv, st := newOIDCServer(t)
+	h := srv.Handler()
+	st.UpsertUser(model.User{ID: "u-2fa", Username: "twofa@example.com", TOTPEnabled: true, TOTPSecret: "JBSWY3DPEHPK3PXP"})
+	st.UpsertUser(model.User{ID: "u-plain", Username: "plain@example.com"})
+	ip := srv.clientIP(httptest.NewRequest(http.MethodGet, "/", nil))
+
+	put := func(userID string, ttl time.Duration, sso bool) string {
+		t.Helper()
+		c, err := auth.NewTOTPChallenge(userID, ip, ttl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sso {
+			c.SSOProviderID, c.SSOEmail, c.SSOSubject = "g", "twofa@example.com", "sub-2fa"
+		}
+		if err := st.PutTOTPChallenge(c); err != nil {
+			t.Fatal(err)
+		}
+		return totpChallengeCookie + "=" + c.ID
+	}
+	valid := put("u-2fa", 5*time.Minute, true)
+	passwordPath := put("u-2fa", 5*time.Minute, false)
+	without2FA := put("u-plain", 5*time.Minute, true)
+	// Last, because every put sweeps the challenges that are no longer active.
+	expired := put("u-2fa", -time.Minute, true)
+
+	cases := []struct {
+		name, cookie, remoteAddr string
+	}{
+		{"no cookie", "", ""},
+		{"unknown challenge", totpChallengeCookie + "=" + strings.Repeat("a", 43), ""},
+		{"expired challenge", expired, ""},
+		{"password-path challenge", passwordPath, ""},
+		{"user without 2fa", without2FA, ""},
+		{"another network", valid, "203.0.113.9:4000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := getPendingSecondFactor(h, tc.cookie, tc.remoteAddr)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("got %d, want 404; body=%s", rec.Code, rec.Body.String())
+			}
+			if body := rec.Body.String(); strings.Contains(body, "twofa@") || strings.Contains(body, "sub-2fa") {
+				t.Fatalf("a refused read must name nobody; body=%s", body)
+			}
+		})
+	}
+
+	// The same valid challenge from its own network does answer, so the cases
+	// above fail for their stated reason and not for a broken fixture.
+	if got := decodePendingSecondFactor(t, getPendingSecondFactor(h, valid, "")); got["email"] != "twofa@example.com" {
+		t.Fatalf("valid challenge = %v", got)
 	}
 }
 

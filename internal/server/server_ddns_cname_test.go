@@ -135,8 +135,8 @@ func TestDDNSCNAMEConflictWithARecord(t *testing.T) {
 	if len(made.Warnings) != 1 || made.Warnings[0] != want {
 		t.Fatalf("save warning\n got %q\nwant %q", made.Warnings, want)
 	}
-	if code := runNow(t, handler, cookies, csrf, made.ID); code != http.StatusBadGateway {
-		t.Fatalf("run now against an A record: %d", code)
+	if code := runNow(t, handler, cookies, csrf, made.ID); code != http.StatusConflict {
+		t.Fatalf("run now against an A record: %d, want 409", code)
 	}
 	views := listCNAMEViews(t, handler, cookies)
 	if len(views) != 1 || views[0].LastError != want || views[0].LastTarget != "" {

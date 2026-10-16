@@ -341,7 +341,8 @@ func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	if err := s.publishDNSDeploymentForPrincipal(r.Context(), p, dep, node.PublicIP, node.PublicIPv6); err != nil {
-		writeError(w, http.StatusBadGateway, err)
+		status, answer := ddnsFailureAnswer(err)
+		writeError(w, status, answer)
 		return
 	}
 	updated, _ := s.store.DNSDeployment(dep.ID)

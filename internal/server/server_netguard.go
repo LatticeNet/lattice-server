@@ -471,7 +471,20 @@ func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.C
 		Groups:  snapshot.Groups,
 		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
 		Resolve: resolver.Resolve,
+		Beacon:  s.beaconCompanionFor(nodeID),
 	}, snapshot, resolver, nil
+}
+
+// beaconCompanionFor is the beacon companion rule set the node's applied
+// node.beacon plan put in force, nil when there is none. Every NetGuard
+// compile of the node carries it, so a NetGuard plan made later keeps the
+// approved allow set instead of dropping it.
+func (s *Server) beaconCompanionFor(nodeID string) *netguard.BeaconCompanion {
+	t, ok := s.store.BeaconTarget(nodeID)
+	if !ok || !t.Settings.Enabled || t.Companion == nil {
+		return nil
+	}
+	return &netguard.BeaconCompanion{Port: t.Companion.Port, Allow: append([]string(nil), t.Companion.Allow...)}
 }
 
 // compileInputForSystem is compileInputFor without a principal, for the
@@ -492,6 +505,7 @@ func (s *Server) compileInputForSystem(nodeID string) (netguard.CompileInput, er
 		Groups:  snapshot.Groups,
 		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
 		Resolve: resolver.Resolve,
+		Beacon:  s.beaconCompanionFor(nodeID),
 	}, nil
 }
 

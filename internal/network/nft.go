@@ -24,6 +24,13 @@ type NFTPlan struct {
 	// JSON API for raw Network Guard inputs; callers must pass structured,
 	// validated intent through server-owned compilers.
 	InputRules []NFTInputRule `json:"-"`
+
+	// NotrackUDPPorts are UDP ports whose datagrams skip connection
+	// tracking both ways: the measurement beacon's port (design 29 D3), so
+	// spoofed datagrams cannot fill the conntrack table the node's other
+	// traffic needs. The renderer adds two raw-priority chains for them;
+	// with none the ruleset is byte-for-byte what it was before.
+	NotrackUDPPorts []int `json:"-"`
 }
 
 const (
@@ -121,7 +128,18 @@ func GenerateNFTPlan(p NFTPlan) (string, error) {
 		fmt.Fprintf(&b, "    ip saddr @wg_peers4 udp dport { %s } accept comment \"wg udp services\"\n", joinPorts(p.WireGuardUDP))
 	}
 	fmt.Fprintf(&b, "    counter drop\n")
-	fmt.Fprintf(&b, "  }\n}\n")
+	fmt.Fprintf(&b, "  }\n")
+	if len(p.NotrackUDPPorts) > 0 {
+		ports := joinPorts(p.NotrackUDPPorts)
+		fmt.Fprintf(&b, "\n  chain beacon_notrack_in {\n")
+		fmt.Fprintf(&b, "    type filter hook prerouting priority raw; policy accept;\n")
+		fmt.Fprintf(&b, "    udp dport { %s } notrack comment \"lattice beacon\"\n", ports)
+		fmt.Fprintf(&b, "  }\n\n  chain beacon_notrack_out {\n")
+		fmt.Fprintf(&b, "    type filter hook output priority raw; policy accept;\n")
+		fmt.Fprintf(&b, "    udp sport { %s } notrack comment \"lattice beacon\"\n", ports)
+		fmt.Fprintf(&b, "  }\n")
+	}
+	fmt.Fprintf(&b, "}\n")
 	return b.String(), nil
 }
 
@@ -162,6 +180,9 @@ func NormalizeNFTPlan(p NFTPlan) (NFTPlan, error) {
 	}
 	if p.InputRules, err = normalizeInputRules(p.InputRules); err != nil {
 		return NFTPlan{}, err
+	}
+	if p.NotrackUDPPorts, err = normalizePorts(p.NotrackUDPPorts); err != nil {
+		return NFTPlan{}, fmt.Errorf("notrack udp: %w", err)
 	}
 	return p, nil
 }

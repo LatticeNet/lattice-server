@@ -46,7 +46,22 @@ type CompileInput struct {
 	// Zones by id, including the builtin zones resolved for this node.
 	Zones   map[string]model.GuardZone
 	Resolve NodeResolver
+	// Beacon is the measurement beacon's companion rule set (design 29 D3),
+	// nil when the node's applied beacon plan carries none. It is approved
+	// through a node.beacon plan, never authored here, and every compile of
+	// the node keeps it so a later NetGuard plan cannot drop it.
+	Beacon *BeaconCompanion
 }
+
+// BeaconCompanion admits UDP Port from exactly Allow, ahead of every
+// operator rule, and marks the port notrack both ways.
+type BeaconCompanion struct {
+	Port  int
+	Allow []string
+}
+
+// beaconCompanionComment marks the companion's accept in the ruleset.
+const beaconCompanionComment = "lattice beacon"
 
 // ErrNodeUnmanaged is returned when a plan is requested for an observe-only
 // binding. Converted legacy baselines start unmanaged: an operator must adopt
@@ -66,6 +81,25 @@ func Compile(in CompileInput) (network.NFTPlan, error) {
 	plan := network.NFTPlan{
 		InterfaceName: zoneInterface(in.Zones, model.GuardZonePublic, defaultInterface),
 		WireGuardCIDR: zoneCIDR(in.Zones, model.GuardZoneWireGuard, defaultWireGuardCIDR),
+	}
+
+	// 0. The beacon companion, approved with its node.beacon plan: exactly
+	//    its sources, exactly its port. An empty allow set admits nobody,
+	//    so the rule is left out and only notrack remains.
+	if in.Beacon != nil {
+		if in.Beacon.Port < 1 || in.Beacon.Port > 65535 {
+			return network.NFTPlan{}, fmt.Errorf("beacon port %d out of range", in.Beacon.Port)
+		}
+		if len(in.Beacon.Allow) > 0 {
+			plan.InputRules = append(plan.InputRules, network.NFTInputRule{
+				SourceCIDRs: append([]string(nil), in.Beacon.Allow...),
+				Protocol:    network.NFTProtoUDP,
+				Ports:       []int{in.Beacon.Port},
+				Action:      network.NFTActionAccept,
+				Comment:     beaconCompanionComment,
+			})
+		}
+		plan.NotrackUDPPorts = []int{in.Beacon.Port}
 	}
 
 	// 1. Trusted zones accept first: an overlay the node depends on (tailscale0,

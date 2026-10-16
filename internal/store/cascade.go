@@ -482,6 +482,14 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		}
 	}
 
+	// Step 9b: the node's beacon state, its target key with it. Its source
+	// id stays assigned so it is never given to another node.
+	if s.state.Beacon != nil {
+		if _, ok := s.state.Beacon.Targets[nodeID]; ok && mutate {
+			delete(s.state.Beacon.Targets, nodeID)
+		}
+	}
+
 	// Step 10: ProxyNodeProfile (keyed by nodeID; central ProxyUser/ProxyInbound
 	// left intact).
 	if _, ok := s.state.ProxyProfiles[nodeID]; ok {

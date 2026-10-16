@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -170,6 +171,10 @@ func (s *Server) ingestAgentMonitorResults(nodeID string, results []model.Monito
 			resp.Duplicates++
 		default:
 			resp.Accepted++
+			if strings.HasPrefix(out.Result.MonitorID, model.BeaconReachMonitorPrefix) {
+				s.noteBeaconReachResult(out.Result.MonitorResult, receivedAt)
+				continue
+			}
 			if s.resultMayPage(out) {
 				s.notifyMonitorTransition(nodeID, out.Result.MonitorResult, out.PriorFailStreak)
 			}
@@ -190,7 +195,7 @@ func (s *Server) resultMayPage(out store.MonitorResultOutcome) bool {
 		return false
 	}
 	if out.NeverSucceeded && !out.Result.Success {
-		if mon, ok := s.store.Monitor(out.Result.MonitorID); ok && mon.Type == model.MonitorTypeICMP {
+		if mon, ok := s.store.Monitor(out.Result.MonitorID); ok && (mon.Type == model.MonitorTypeICMP || mon.Type == model.MonitorTypeBeacon) {
 			return false
 		}
 	}

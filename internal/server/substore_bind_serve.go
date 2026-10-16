@@ -90,6 +90,54 @@ type substoreBindState struct {
 	dayRows func(userID string, from, to time.Time) []store.UsageDayUser
 	// memo is the per-record policy the cache digest reads.
 	memo substoreBindPolicyMemo
+	// selections remembers the selection read from recent snapshots.
+	selections substoreBindSelectionMemo
+}
+
+// substoreBindSelectionMemoSize bounds substoreBindSelectionMemo.
+const substoreBindSelectionMemoSize = 64
+
+// substoreBindSelectionMemo remembers, by the hash of a snapshot's raw, the
+// catalogue version and line set substoreBindSnapshotSelection read from
+// it. That read decodes the whole envelope (most of a megabyte at 1000
+// lines) on every bind, and every identity's share of one record, and every
+// body-only miss, binds over the same snapshot. The key is the content, so
+// an entry is never stale; the memo keeps the most recent entries.
+type substoreBindSelectionMemo struct {
+	mu      sync.Mutex
+	entries map[string]substoreBindSelectionEntry
+	order   []string
+}
+
+type substoreBindSelectionEntry struct {
+	version  string
+	selected map[string]bool
+}
+
+// read answers the selection of a snapshot whose raw hashes to key,
+// reading it from raw on a miss. A caller must not change the set.
+func (m *substoreBindSelectionMemo) read(key string, snap model.SubscriptionSnapshot) (string, map[string]bool) {
+	m.mu.Lock()
+	entry, ok := m.entries[key]
+	m.mu.Unlock()
+	if ok {
+		return entry.version, entry.selected
+	}
+	version, selected := substoreBindSnapshotSelection(snap)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.entries == nil {
+		m.entries = make(map[string]substoreBindSelectionEntry, substoreBindSelectionMemoSize)
+	}
+	if _, present := m.entries[key]; !present {
+		if len(m.order) == substoreBindSelectionMemoSize {
+			delete(m.entries, m.order[0])
+			m.order = m.order[1:]
+		}
+		m.order = append(m.order, key)
+	}
+	m.entries[key] = substoreBindSelectionEntry{version: version, selected: selected}
+	return version, selected
 }
 
 // substoreBindRefusal is a render the bind step refused. The share answers
@@ -517,7 +565,9 @@ func (s *Server) substoreBindRendered(ctx context.Context, share model.Subscript
 	if !policy.Active() {
 		return renderedSubscription{}, substoreBindRefusal{reason: substoreBindDenyIdentityPrefix + firstNonEmpty(policy.Reason, policy.Status)}
 	}
-	version, selected := substoreBindSnapshotSelection(snap)
+	// The selection is read through a memo keyed by the hash of the
+	// snapshot's raw, which costs a fraction of decoding it.
+	version, selected := s.substoreCatalogue.bind.selections.read(subscriptionContentHash(snap.Raw), snap)
 	if refused := substoreBindCheckSelectionIn(plan, version, selected); refused != "" {
 		return renderedSubscription{}, substoreBindRefusal{reason: substoreBindDenyPrefix + refused}
 	}

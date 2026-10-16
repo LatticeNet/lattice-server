@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"reflect"
@@ -191,4 +192,30 @@ func FuzzDecodeKnownMembersIsJSONUnmarshal(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		sameKnownMembers(t, raw)
 	})
+}
+
+// The selection memo answers what substoreBindSnapshotSelection reads, for
+// every snapshot, and keeps at most its size.
+func TestSubstoreBindSelectionMemoAnswersTheSnapshotsSelection(t *testing.T) {
+	var memo substoreBindSelectionMemo
+	snapshot := func(i int) model.SubscriptionSnapshot {
+		return model.SubscriptionSnapshot{Raw: fmt.Sprintf(`{"catalogue_version":"lcv1-%064d","rows":[{"line_uuid":"%08d-0000-4000-8000-000000000000"}]}`, i, i)}
+	}
+	for round := 0; round < 2; round++ {
+		for i := 0; i < substoreBindSelectionMemoSize+10; i++ {
+			snap := snapshot(i)
+			wantVersion, wantSelected := substoreBindSnapshotSelection(snap)
+			gotVersion, gotSelected := memo.read(subscriptionContentHash(snap.Raw), snap)
+			if gotVersion != wantVersion || !reflect.DeepEqual(gotSelected, wantSelected) || len(gotSelected) != 1 {
+				t.Fatalf("snapshot %d: %q %v, want %q %v", i, gotVersion, gotSelected, wantVersion, wantSelected)
+			}
+		}
+	}
+	if len(memo.entries) != substoreBindSelectionMemoSize || len(memo.order) != substoreBindSelectionMemoSize {
+		t.Fatalf("the memo holds %d entries (%d in order), bound %d", len(memo.entries), len(memo.order), substoreBindSelectionMemoSize)
+	}
+	other := model.SubscriptionSnapshot{Raw: `not a document`}
+	if version, selected := memo.read(subscriptionContentHash(other.Raw), other); version != "" || selected != nil {
+		t.Fatalf("a snapshot that is not a catalogue document reads %q %v", version, selected)
+	}
 }

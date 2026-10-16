@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/LatticeNet/lattice-sdk/strictjson"
 )
 
 func decodeStrictV2(data []byte, dst any) error {
@@ -36,7 +38,14 @@ func decodeStrictV2(data []byte, dst any) error {
 	return nil
 }
 
+// rejectDuplicateV2Keys refuses a frame with a duplicate key in any object.
+// strictjson.Valid admits a well-formed, duplicate-free frame in one pass
+// without allocating; whatever it refuses is judged by the token walk below,
+// which stays the specification and words every error.
 func rejectDuplicateV2Keys(data []byte) error {
+	if strictjson.Valid(data) {
+		return nil
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	var walk func() error
 	walk = func() error {
@@ -90,6 +99,11 @@ func requireV2Fields(data []byte, fields ...string) error {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return err
 	}
+	return requireV2Present(m, fields...)
+}
+
+// requireV2Present is requireV2Fields over a frame's members already read.
+func requireV2Present(m map[string]json.RawMessage, fields ...string) error {
 	for _, k := range fields {
 		v, ok := m[k]
 		if !ok || len(v) == 0 || string(v) == "null" {
@@ -97,6 +111,75 @@ func requireV2Fields(data []byte, fields ...string) error {
 		}
 	}
 	return nil
+}
+
+// v2Members reads a frame's top-level members in one pass of
+// strictjson.Fields when the frame is an object strictjson admits and every
+// member is named exactly as one of names; ok is false otherwise, and the
+// caller takes its encoding/json path. A frame it admits is one
+// decodeStrictV2 admits too (well formed, no duplicate key at any depth, one
+// object, every member known), and decoding each member on its own gives
+// what the whole-struct decode gives, because no two members name the same
+// field.
+func v2Members(data []byte, names map[string]bool) (map[string]json.RawMessage, bool) {
+	fields, ok := strictjson.Fields(data)
+	if !ok {
+		return nil, false
+	}
+	members := make(map[string]json.RawMessage, len(fields))
+	for _, f := range fields {
+		if !names[f.Key] {
+			return nil, false
+		}
+		members[f.Key] = f.Value
+	}
+	return members, true
+}
+
+// v2FrameMembers are the JSON names of stdioJSONV2Frame's fields.
+var v2FrameMembers = map[string]bool{
+	"protocol": true, "kind": true, "generation": true, "invocation_id": true, "host_call_id": true,
+	"request": true, "response": true, "host_call": true, "host_response": true, "features": true, "data": true,
+}
+
+// decodeV2FrameMembers decodes a frame from the members v2Members read; ok
+// is false when any member does not decode, and the caller takes the
+// encoding/json path, which words the error.
+func decodeV2FrameMembers(m map[string]json.RawMessage) (stdioJSONV2Frame, bool) {
+	var f stdioJSONV2Frame
+	for key, value := range m {
+		var err error
+		switch key {
+		case "protocol":
+			err = json.Unmarshal(value, &f.Protocol)
+		case "kind":
+			err = json.Unmarshal(value, &f.Kind)
+		case "generation":
+			err = json.Unmarshal(value, &f.Generation)
+		case "invocation_id":
+			err = json.Unmarshal(value, &f.InvocationID)
+		case "host_call_id":
+			err = json.Unmarshal(value, &f.HostCallID)
+		case "request":
+			f.Request = append(json.RawMessage(nil), value...)
+		case "response":
+			f.Response = append(json.RawMessage(nil), value...)
+		case "host_call":
+			f.HostCall = append(json.RawMessage(nil), value...)
+		case "host_response":
+			f.HostResponse = append(json.RawMessage(nil), value...)
+		case "features":
+			err = json.Unmarshal(value, &f.Features)
+		case "data":
+			err = json.Unmarshal(value, &f.Data)
+		default:
+			return stdioJSONV2Frame{}, false
+		}
+		if err != nil {
+			return stdioJSONV2Frame{}, false
+		}
+	}
+	return f, true
 }
 
 func strictV2Bound(data []byte, limits ...int) error {
@@ -115,14 +198,26 @@ func decodeStdioJSONV2Frame(data []byte, limits ...int) (stdioJSONV2Frame, error
 	if err := strictV2Bound(data, limits...); err != nil {
 		return f, err
 	}
-	if err := decodeStrictV2(data, &f); err != nil {
-		return f, err
+	// The fast path reads the members once; any frame it does not admit
+	// takes the encoding/json path, which decides and words every error.
+	// Both run the checks below in the same order.
+	fields, fast := v2Members(data, v2FrameMembers)
+	if fast {
+		f, fast = decodeV2FrameMembers(fields)
 	}
-	if err := requireV2Fields(data, "protocol", "kind", "generation", "invocation_id"); err != nil {
-		return f, err
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
+	if !fast {
+		f = stdioJSONV2Frame{}
+		if err := decodeStrictV2(data, &f); err != nil {
+			return f, err
+		}
+		if err := requireV2Fields(data, "protocol", "kind", "generation", "invocation_id"); err != nil {
+			return f, err
+		}
+		fields = nil
+		if err := json.Unmarshal(data, &fields); err != nil {
+			return f, err
+		}
+	} else if err := requireV2Present(fields, "protocol", "kind", "generation", "invocation_id"); err != nil {
 		return f, err
 	}
 	allowed := map[string]bool{"protocol": true, "kind": true, "generation": true, "invocation_id": true}
@@ -152,7 +247,7 @@ func decodeStdioJSONV2Frame(data []byte, limits ...int) (stdioJSONV2Frame, error
 			return f, fmt.Errorf("field %q is invalid for %s", key, f.Kind)
 		}
 	}
-	if err := requireV2Fields(data, required...); err != nil {
+	if err := requireV2Present(fields, required...); err != nil {
 		return f, err
 	}
 	if err := validateStdioJSONV2Frame(f, f.Generation, f.InvocationID, ""); err != nil {
@@ -185,23 +280,35 @@ func decodeSystemRunnerReply(data []byte, limits ...int) (systemRunnerReply, err
 	if err := strictV2Bound(data, limits...); err != nil {
 		return systemRunnerReply{}, err
 	}
-	var raw struct {
-		OK       json.RawMessage `json:"ok"`
-		Plan     json.RawMessage `json:"plan"`
-		Message  json.RawMessage `json:"message"`
-		Result   json.RawMessage `json:"result"`
-		Error    json.RawMessage `json:"error"`
-		Warnings json.RawMessage `json:"warnings"`
+	// The fast path reads the members once and decodes each into its field;
+	// a reply it does not admit, or a member that does not decode, takes the
+	// encoding/json path, which decides and words every error.
+	reply, fast := systemRunnerReply{}, false
+	if members, ok := v2Members(data, systemRunnerReplyMembers); ok {
+		if okRaw := members["ok"]; len(okRaw) == 0 || bytes.Equal(okRaw, []byte("null")) {
+			return systemRunnerReply{}, fmt.Errorf("missing required v2 field %q", "ok")
+		}
+		reply, fast = decodeSystemRunnerReplyMembers(members)
 	}
-	if err := decodeStrictV2(data, &raw); err != nil {
-		return systemRunnerReply{}, err
-	}
-	if len(raw.OK) == 0 || bytes.Equal(raw.OK, []byte("null")) {
-		return systemRunnerReply{}, fmt.Errorf("missing required v2 field %q", "ok")
-	}
-	var reply systemRunnerReply
-	if err := json.Unmarshal(data, &reply); err != nil {
-		return systemRunnerReply{}, err
+	if !fast {
+		var raw struct {
+			OK       json.RawMessage `json:"ok"`
+			Plan     json.RawMessage `json:"plan"`
+			Message  json.RawMessage `json:"message"`
+			Result   json.RawMessage `json:"result"`
+			Error    json.RawMessage `json:"error"`
+			Warnings json.RawMessage `json:"warnings"`
+		}
+		if err := decodeStrictV2(data, &raw); err != nil {
+			return systemRunnerReply{}, err
+		}
+		if len(raw.OK) == 0 || bytes.Equal(raw.OK, []byte("null")) {
+			return systemRunnerReply{}, fmt.Errorf("missing required v2 field %q", "ok")
+		}
+		reply = systemRunnerReply{}
+		if err := json.Unmarshal(data, &reply); err != nil {
+			return systemRunnerReply{}, err
+		}
 	}
 	if !reply.OK && strings.TrimSpace(reply.Error) == "" {
 		return systemRunnerReply{}, fmt.Errorf("failed response requires error")
@@ -213,6 +320,38 @@ func decodeSystemRunnerReply(data []byte, limits ...int) (systemRunnerReply, err
 		return systemRunnerReply{}, fmt.Errorf("failed response cannot contain result")
 	}
 	return reply, nil
+}
+
+// systemRunnerReplyMembers are the JSON names a reply may carry.
+var systemRunnerReplyMembers = map[string]bool{"ok": true, "plan": true, "message": true, "result": true, "error": true, "warnings": true}
+
+// decodeSystemRunnerReplyMembers decodes a reply from the members v2Members
+// read; ok is false when any member does not decode.
+func decodeSystemRunnerReplyMembers(m map[string]json.RawMessage) (systemRunnerReply, bool) {
+	var reply systemRunnerReply
+	for key, value := range m {
+		var err error
+		switch key {
+		case "ok":
+			err = json.Unmarshal(value, &reply.OK)
+		case "plan":
+			reply.Plan = append(json.RawMessage(nil), value...)
+		case "message":
+			err = json.Unmarshal(value, &reply.Message)
+		case "result":
+			reply.Result = append(json.RawMessage(nil), value...)
+		case "error":
+			err = json.Unmarshal(value, &reply.Error)
+		case "warnings":
+			err = json.Unmarshal(value, &reply.Warnings)
+		default:
+			return systemRunnerReply{}, false
+		}
+		if err != nil {
+			return systemRunnerReply{}, false
+		}
+	}
+	return reply, true
 }
 
 type stdioV2Session struct {
@@ -331,4 +470,66 @@ func validSystemHostCallID(id string) bool {
 	}
 	n, err := strconv.ParseUint(id[1:], 10, 64)
 	return err == nil && n > 0 && "h"+strconv.FormatUint(n, 10) == id
+}
+
+// canonicalRawJSON reports whether raw is already what encoding/json writes
+// for a json.RawMessage holding it: compact, and free of the bytes it
+// escapes ('<', '>', '&', U+2028, U+2029), which cannot occur outside a
+// string. A payload that is can be spliced into a frame as it is.
+func canonicalRawJSON(raw []byte) bool {
+	return strictjson.Compact(raw) && !bytes.ContainsAny(raw, "<>&") &&
+		!bytes.Contains(raw, []byte("\u2028")) && !bytes.Contains(raw, []byte("\u2029"))
+}
+
+func appendJSONString(dst []byte, s string) []byte {
+	raw, _ := json.Marshal(s)
+	return append(dst, raw...)
+}
+
+// encodeInvokeV2Frame is the invoke frame for req, newline included,
+// exactly as json.NewEncoder(w).Encode writes the stdioJSONV2Frame whose
+// Request is json.Marshal of the action and payload. A render or convert
+// payload is up to several MiB that its caller's json.Marshal already wrote
+// in canonical form, so it is spliced in once instead of compacted twice
+// more; any other payload goes through encoding/json as before.
+func encodeInvokeV2Frame(generation uint64, invocation string, req InvokeRequest) []byte {
+	if len(req.Payload) == 0 || canonicalRawJSON(req.Payload) {
+		out := make([]byte, 0, len(req.Payload)+128+len(invocation)+len(req.Action))
+		out = append(out, `{"protocol":2,"kind":"invoke","generation":`...)
+		out = strconv.AppendUint(out, generation, 10)
+		out = appendJSONString(append(out, `,"invocation_id":`...), invocation)
+		out = appendJSONString(append(out, `,"request":{"action":`...), req.Action)
+		if len(req.Payload) > 0 {
+			out = append(append(out, `,"payload":`...), req.Payload...)
+		}
+		return append(out, "}}\n"...)
+	}
+	frame := stdioJSONV2Frame{Protocol: 2, Kind: "invoke", Generation: generation, InvocationID: invocation}
+	frame.Request, _ = json.Marshal(struct {
+		Action  string          `json:"action"`
+		Payload json.RawMessage `json:"payload,omitempty"`
+	}{req.Action, req.Payload})
+	var buf bytes.Buffer
+	_ = json.NewEncoder(&buf).Encode(frame)
+	return buf.Bytes()
+}
+
+// EncodeServiceCall is the body core's call action carries, exactly as
+// json.Marshal writes struct{service, method, payload (omitempty)}, with a
+// canonical payload spliced in rather than compacted again.
+func EncodeServiceCall(service, method string, payload json.RawMessage) ([]byte, error) {
+	if len(payload) == 0 || canonicalRawJSON(payload) {
+		out := make([]byte, 0, len(payload)+64+len(service)+len(method))
+		out = appendJSONString(append(out, `{"service":`...), service)
+		out = appendJSONString(append(out, `,"method":`...), method)
+		if len(payload) > 0 {
+			out = append(append(out, `,"payload":`...), payload...)
+		}
+		return append(out, '}'), nil
+	}
+	return json.Marshal(struct {
+		Service string          `json:"service"`
+		Method  string          `json:"method"`
+		Payload json.RawMessage `json:"payload,omitempty"`
+	}{Service: service, Method: method, Payload: payload})
 }

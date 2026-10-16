@@ -122,6 +122,8 @@ func TestClassifyTakesTheLeastReadablePart(t *testing.T) {
 		{"setting and refusal", errors.Join(config, refused), FailureProvider},
 		{"refusal and transport", errors.Join(refused, internal), FailureInternal},
 		{"conflict and transport", errors.Join(conflict, internal), FailureInternal},
+		{"wrapped conflict and transport", fmt.Errorf("run: %w", errors.Join(conflict, internal)), FailureInternal},
+		{"wrapped refusal and setting", fmt.Errorf("run: %w", errors.Join(refused, config)), FailureProvider},
 	}
 	for _, c := range cases {
 		if got := Classify(c.err); got != c.want {

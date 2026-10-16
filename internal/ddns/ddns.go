@@ -126,9 +126,20 @@ const (
 // makes the whole failure internal, so no part of its text is shown. Among
 // readable parts a provider failure outranks a setting, and a setting
 // outranks a conflict, the order in which the operator has to deal with them.
+//
+// It walks the chain one wrap at a time rather than with errors.As, which
+// would find a readable error anywhere in a wrapped join and let an internal
+// sibling's text through.
 func Classify(err error) Failure {
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		parts := joined.Unwrap()
+	switch e := err.(type) {
+	case *ConflictError:
+		return FailureConflict
+	case *ConfigError:
+		return FailureConfig
+	case *cfAPIError:
+		return FailureProvider
+	case interface{ Unwrap() []error }:
+		parts := e.Unwrap()
 		if len(parts) == 0 {
 			return FailureInternal
 		}
@@ -141,17 +152,10 @@ func Classify(err error) Failure {
 			class = max(class, c)
 		}
 		return class
-	}
-	var conflict *ConflictError
-	var config *ConfigError
-	var provider *cfAPIError
-	switch {
-	case errors.As(err, &conflict):
-		return FailureConflict
-	case errors.As(err, &config):
-		return FailureConfig
-	case errors.As(err, &provider):
-		return FailureProvider
+	case interface{ Unwrap() error }:
+		if inner := e.Unwrap(); inner != nil {
+			return Classify(inner)
+		}
 	}
 	return FailureInternal
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 var dnsLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -603,20 +604,17 @@ func publishableDNSIPs(profile model.DDNSProfile, v4, v6 string) (string, string
 	return outV4, outV6, nil
 }
 
+// markDNSPublishResult records a hostname publish on the deployment as it is
+// stored when the publish ends. dep is the copy the publish started from, up
+// to 30 s earlier; writing it back undid an edit saved meanwhile and brought
+// back a deployment deleted meanwhile. Only the publish-status fields are
+// written now, and a failed publish keeps the addresses last published.
 func (s *Server) markDNSPublishResult(dep model.DNSDeployment, v4, v6 string, err error) error {
-	if v4 != "" {
-		dep.LastIPv4 = v4
-	}
-	if v6 != "" {
-		dep.LastIPv6 = v6
-	}
-	dep.LastPublishedAt = s.now()
+	out := store.DNSPublishOutcome{At: s.now().UTC(), Hostname: dep.Hostname, IPv4: v4, IPv6: v6}
 	if err != nil {
-		dep.LastPublishError = err.Error()
-	} else {
-		dep.LastPublishError = ""
+		out.Err = err.Error()
 	}
-	return s.store.UpsertDNSDeployment(dep)
+	return s.store.RecordDNSPublish(dep.ID, out)
 }
 
 func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadExisting bool) (model.DNSDeployment, error) {

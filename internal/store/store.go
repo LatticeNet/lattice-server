@@ -4630,6 +4630,53 @@ func (s *Store) UpsertDNSDeployment(dep model.DNSDeployment) error {
 	return s.Save()
 }
 
+// DNSPublishOutcome is what one publish of a DNS deployment's hostname
+// learned: its publish-status fields and nothing else.
+type DNSPublishOutcome struct {
+	// At is when the publish ended.
+	At time.Time
+	// Hostname is the name the publish wrote. An outcome reaching a
+	// deployment whose hostname changed while it ran is dropped, since it
+	// says nothing about the name the deployment now publishes.
+	Hostname string
+	// Err is the publish's error, "" when every record was published. A
+	// failed publish keeps the published addresses as they are.
+	Err string
+	// IPv4 and IPv6 are the addresses a successful publish wrote; "" keeps
+	// the stored value.
+	IPv4, IPv6 string
+}
+
+// RecordDNSPublish stores the outcome of one hostname publish on the
+// deployment as it is stored now. A publish lasts as long as Cloudflare takes
+// to answer, and an operator may save or delete the deployment meanwhile;
+// writing back the copy the publish started from would undo that edit, or
+// bring the deleted deployment back. Only the publish-status fields change
+// here, a deployment deleted while it ran stays deleted, and one moved to
+// another hostname or to the external engine, which Lattice never publishes
+// for, keeps its status as it is.
+func (s *Store) RecordDNSPublish(id string, out DNSPublishOutcome) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.state.DNSDeployments[id]
+	if !ok || current.Hostname != out.Hostname || current.Engine == model.DNSEngineExternal {
+		return nil
+	}
+	current.LastPublishedAt = out.At
+	current.LastPublishError = out.Err
+	if out.Err == "" {
+		if out.IPv4 != "" {
+			current.LastIPv4 = out.IPv4
+		}
+		if out.IPv6 != "" {
+			current.LastIPv6 = out.IPv6
+		}
+	}
+	current.UpdatedAt = time.Now().UTC()
+	s.state.DNSDeployments[id] = current
+	return s.Save()
+}
+
 // DNSDeployment returns a self-hosted DNS deployment by id.
 func (s *Store) DNSDeployment(id string) (model.DNSDeployment, bool) {
 	s.mu.Lock()

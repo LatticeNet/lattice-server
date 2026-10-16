@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 const cloudflareDefaultBase = "https://api.cloudflare.com/client/v4"
@@ -66,15 +68,74 @@ type cfErrorItem struct {
 	Message string `json:"message"`
 }
 
-// cfAPIError is a request Cloudflare answered with success=false.
+const (
+	// cfErrorsQuoted caps how many of Cloudflare's errors a failure quotes;
+	// the rest are counted.
+	cfErrorsQuoted = 5
+	// cfErrorMessageMax caps each quoted message, in bytes.
+	cfErrorMessageMax = 200
+)
+
+// cfAPIError is a request Cloudflare answered with success=false, or with a
+// body that is not its JSON envelope at all, such as an error page from its
+// edge.
 type cfAPIError struct {
 	Status int
 	Items  []cfErrorItem
-	raw    string
+	// undecodable is a reply that was not the JSON envelope.
+	undecodable bool
 }
 
+// Error quotes the codes and messages Cloudflare gave and nothing else from
+// its reply: the documentation link, error chain and request ids it adds are
+// dropped, at most cfErrorsQuoted errors are quoted, and each message is cut
+// to cfErrorMessageMax bytes on one line. The list stays JSON, the shape the
+// console reduces to "Cloudflare refused it" and the messages. The operator
+// reads this text in the answer to "Run now" and on the profile, which
+// stores it as the run's last error.
 func (e *cfAPIError) Error() string {
-	return fmt.Sprintf("cloudflare: api error (status %d): %s", e.Status, e.raw)
+	if e.undecodable {
+		return fmt.Sprintf("cloudflare: status %d, undecodable body", e.Status)
+	}
+	if len(e.Items) == 0 {
+		return fmt.Sprintf("cloudflare: api error (status %d) with no error list", e.Status)
+	}
+	type quoted struct {
+		Code    int    `json:"code,omitempty"`
+		Message string `json:"message"`
+	}
+	list := make([]quoted, 0, min(len(e.Items), cfErrorsQuoted)+1)
+	for i, item := range e.Items {
+		if i == cfErrorsQuoted {
+			list = append(list, quoted{Message: fmt.Sprintf("%d more not shown", len(e.Items)-i)})
+			break
+		}
+		list = append(list, quoted{Code: item.Code, Message: oneLine(item.Message, cfErrorMessageMax)})
+	}
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(list)
+	return fmt.Sprintf("cloudflare: api error (status %d): %s", e.Status, strings.TrimSuffix(b.String(), "\n"))
+}
+
+// oneLine turns every control character in s into a space, trims it, and
+// cuts it to at most limit bytes on a rune boundary, ending a cut one in "...".
+func oneLine(s string, limit int) string {
+	s = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s))
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit - len("...")
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 // hostTaken reports whether Cloudflare refused a write because the name
@@ -335,7 +396,7 @@ func (c *Cloudflare) zoneFor(ctx context.Context, name string) (cfZone, error) {
 		}
 	}
 	if best.ID == "" {
-		return cfZone{}, fmt.Errorf("no cloudflare zone found for %q", name)
+		return cfZone{}, &ConfigError{msg: fmt.Sprintf("no cloudflare zone found for %q", name)}
 	}
 	return best, nil
 }
@@ -386,10 +447,10 @@ func (c *Cloudflare) do(ctx context.Context, method, path string, body, out any)
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	var env cfEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
-		return fmt.Errorf("cloudflare: status %d, undecodable body", resp.StatusCode)
+		return &cfAPIError{Status: resp.StatusCode, undecodable: true}
 	}
 	if !env.Success {
-		apiErr := &cfAPIError{Status: resp.StatusCode, raw: string(env.Errors)}
+		apiErr := &cfAPIError{Status: resp.StatusCode}
 		_ = json.Unmarshal(env.Errors, &apiErr.Items)
 		return apiErr
 	}

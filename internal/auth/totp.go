@@ -162,6 +162,14 @@ type TOTPChallenge struct {
 	// Attempts counts failed second-factor submissions; the store burns the
 	// challenge once it reaches the per-challenge cap.
 	Attempts int
+	// SSOProviderID, SSOEmail and SSOSubject record which identity provider
+	// proved the first factor and whom it verified, so the second-factor page
+	// can say the provider step succeeded. SSOEmail is set only when the
+	// provider marked the email verified. All three are empty on the password
+	// path.
+	SSOProviderID string
+	SSOEmail      string
+	SSOSubject    string
 }
 
 // NewTOTPChallenge mints a challenge bound to a user and the requesting client.

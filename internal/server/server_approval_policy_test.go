@@ -87,6 +87,15 @@ func TestApprovalAutoRuleMatches(t *testing.T) {
 		{name: "different action rejected", rule: rule, approval: model.Approval{ActorID: "lattice-server", Plugin: "singbox-linemeta", Action: "delete-metadata:abc"}, want: false},
 		{name: "empty writer matches any", rule: approvalAutoRule{Name: "r", Plugin: "nft"}, approval: model.Approval{ActorID: "user-admin", Plugin: "nft", Action: "apply-ruleset"}, want: true},
 		{name: "empty prefix matches any action", rule: approvalAutoRule{Name: "r", Plugin: "nft"}, approval: model.Approval{ActorID: "user-admin", Plugin: "nft", Action: "apply-ruleset"}, want: true},
+		{name: "writer-only rule still matches any other plugin", rule: approvalAutoRule{Name: "r", Writer: "lattice-server"}, approval: model.Approval{ActorID: "lattice-server", Plugin: "singbox-linemeta", Action: "apply-metadata:abc"}, want: true},
+		{name: "prefix-only rule still matches any other plugin", rule: approvalAutoRule{Name: "r", ActionPrefix: "apply"}, approval: model.Approval{ActorID: "user-admin", Plugin: "nft", Action: "apply-ruleset"}, want: true},
+		// S2-SR-3: a Sub-Store plan changes what identity holders receive,
+		// so only a rule that names its plugin may approve one.
+		{name: "writer-only rule never matches a sub-store plan", rule: approvalAutoRule{Name: "r", Writer: "op"}, approval: model.Approval{ActorID: "op", Plugin: subStorePlanApprovalPlugin, Action: subStorePlanActionPrefix + "rec"}, want: false},
+		{name: "prefix-only rule never matches a sub-store plan", rule: approvalAutoRule{Name: "r", ActionPrefix: subStorePlanActionPrefix}, approval: model.Approval{ActorID: "op", Plugin: subStorePlanApprovalPlugin, Action: subStorePlanActionPrefix + "rec"}, want: false},
+		{name: "writer and prefix rule never matches a sub-store plan", rule: approvalAutoRule{Name: "r", Writer: "op", ActionPrefix: "apply"}, approval: model.Approval{ActorID: "op", Plugin: subStorePlanApprovalPlugin, Action: subStorePlanActionPrefix + "rec"}, want: false},
+		{name: "rule naming the plugin matches a sub-store plan", rule: approvalAutoRule{Name: "r", Plugin: subStorePlanApprovalPlugin}, approval: model.Approval{ActorID: "op", Plugin: subStorePlanApprovalPlugin, Action: subStorePlanActionPrefix + "rec"}, want: true},
+		{name: "rule naming the plugin id is not the plan's plugin", rule: approvalAutoRule{Name: "r", Plugin: subStorePluginID}, approval: model.Approval{ActorID: "op", Plugin: subStorePlanApprovalPlugin, Action: subStorePlanActionPrefix + "rec"}, want: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -327,5 +336,53 @@ func TestApprovalAutoApproveLeavesPendingOnDecisionFailure(t *testing.T) {
 	}
 	if stored.ActorID != "lattice-server" {
 		t.Fatalf("failed auto-approve must not restamp the actor, got %q", stored.ActorID)
+	}
+}
+
+// TestSubStorePlanAutoApproveNeedsARuleNamingThePlugin: propose files its
+// approval through submitApproval, so operator rules see it. A rule that
+// names only a writer or only an action prefix matches every plugin, and it
+// must leave a Sub-Store plan pending; a rule that names the plan's plugin
+// approves and applies it as any rule does.
+func TestSubStorePlanAutoApproveNeedsARuleNamingThePlugin(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		rules    string
+		approved bool
+	}{
+		{name: "writer only", rules: `[{"name":"ops","writer":"op","queue":true}]`},
+		{name: "action prefix only", rules: `[{"name":"revisions","action_prefix":"apply_revision:","queue":true}]`},
+		{name: "writer and action prefix", rules: `[{"name":"both","writer":"op","action_prefix":"apply","queue":true}]`},
+		{name: "names the plugin", rules: `[{"name":"plans","plugin":"substore-plan","queue":true}]`, approved: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newSubStorePlanHarness(t)
+			rules, err := parseApprovalAutoRules(c.rules)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.srv.approvalAutoRules = rules
+			reply := h.propose(t)
+			stored := h.status(reply.ApprovalID)
+			auto := 0
+			for _, ev := range h.st.AuditEvents() {
+				if strings.HasPrefix(ev.Action, "approval.auto_") && ev.Metadata["approval_id"] == reply.ApprovalID {
+					auto++
+				}
+			}
+			if !c.approved {
+				if reply.Status != model.ApprovalPending || stored.Status != model.ApprovalPending || stored.ApprovedBy != "" ||
+					h.appliedCount() != 0 || auto != 0 {
+					t.Fatalf("a rule that does not name the plugin decided the plan: reply %q, stored %q approved by %q, %d applies, %d auto audits",
+						reply.Status, stored.Status, stored.ApprovedBy, h.appliedCount(), auto)
+				}
+				return
+			}
+			if reply.Status != model.ApprovalApplied || stored.Status != model.ApprovalApplied ||
+				stored.ApprovedBy != approvalPolicyActorPrefix+"plans" || h.appliedCount() != 1 || auto != 1 {
+				t.Fatalf("a rule naming the plugin: reply %q, stored %q approved by %q, %d applies, %d auto audits",
+					reply.Status, stored.Status, stored.ApprovedBy, h.appliedCount(), auto)
+			}
+		})
 	}
 }

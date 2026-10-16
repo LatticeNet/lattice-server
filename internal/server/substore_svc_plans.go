@@ -92,19 +92,73 @@ const (
 	auditActionSubStorePlanClaim   = "substore.plan.claim"
 )
 
-// subStoreCoreOnlyReason is the gateway's refusal of apply_revision.
-const subStoreCoreOnlyReason = "apply_revision runs only as the apply step of an approved Sub-Store plan"
+// subStoreCoreOnlyReason is the gateway's refusal of apply_revision, and
+// subStoreFetchCoreOnlyReason its refusal of fetch.
+const (
+	subStoreCoreOnlyReason      = "apply_revision runs only as the apply step of an approved Sub-Store plan"
+	subStoreFetchCoreOnlyReason = "fetch runs only as core's own refresh of a Sub-Store record"
+	// subStoreFetchMethod is the plugin method core's refresh calls.
+	subStoreFetchMethod = "fetch"
+)
 
-// subStoreCoreOnlyMethod reports a plugin method that only core calls: the
-// Sub-Store's apply_revision changes what existing share holders receive,
-// so it runs as the apply step of an approved plan and never as an
-// operator's gateway call, whatever a manifest declares.
-// errSubStoreCoreOnlyMethod is the refusal of a core-only method called
-// outside an approved plan apply.
-var errSubStoreCoreOnlyMethod = errors.New("sub-store: apply_revision runs only inside an approved plan apply")
+// errSubStoreCoreOnlyMethod is the refusal of apply_revision called outside
+// an approved plan apply, and errSubStoreFetchCoreOnly the refusal of fetch
+// called outside core's refresh.
+var (
+	errSubStoreCoreOnlyMethod = errors.New("sub-store: apply_revision runs only inside an approved plan apply")
+	errSubStoreFetchCoreOnly  = errors.New("sub-store: fetch runs only inside core's refresh")
+)
 
+// subStoreCoreOnlyMethod reports a plugin method that only core calls, each
+// on one path of its own, never as an operator's gateway call and never from
+// any other core path, whatever a manifest declares:
+//
+//   - apply_revision changes what existing share holders receive, so it runs
+//     as the apply step of an approved plan, which puts the one-time grant on
+//     the call's context;
+//   - fetch returns the envelope with every selected row's addresses,
+//     template parameters, geo and renewal date, and the legacy export with
+//     owner credentials for a record not yet migrated; nothing in the UI calls
+//     it, so it runs only as core's refresh (fetchSubscriptionSource), which
+//     marks the context it calls with (S2 plan section 2.6). Closing the path
+//     is smaller than guarding it with a scope.
 func subStoreCoreOnlyMethod(service, method string) bool {
-	return service == subStorePluginID+"/subscription" && method == subStoreApplyRevisionMethod
+	return service == subStorePluginID+"/subscription" && (method == subStoreApplyRevisionMethod || method == subStoreFetchMethod)
+}
+
+// subStoreCoreOnlyRefusal is the gateway's reason for refusing a core-only
+// method.
+func subStoreCoreOnlyRefusal(method string) string {
+	if method == subStoreFetchMethod {
+		return subStoreFetchCoreOnlyReason
+	}
+	return subStoreCoreOnlyReason
+}
+
+// subStoreRefreshCallKey marks the context of core's own refresh fetch, the
+// one path a core-only fetch is admitted on, as the apply grant marks
+// apply_revision's.
+type subStoreRefreshCallKey struct{}
+
+// withSubStoreRefreshCall marks ctx as core's refresh.
+func withSubStoreRefreshCall(ctx context.Context) context.Context {
+	return context.WithValue(ctx, subStoreRefreshCallKey{}, true)
+}
+
+// subStoreCoreOnlyCallAllowed admits a core-only method only on its own core
+// path: apply_revision with an apply grant on the context, fetch with the
+// refresh mark.
+func subStoreCoreOnlyCallAllowed(ctx context.Context, method string) error {
+	if method == subStoreFetchMethod {
+		if marked, _ := ctx.Value(subStoreRefreshCallKey{}).(bool); !marked {
+			return errSubStoreFetchCoreOnly
+		}
+		return nil
+	}
+	if grant, _ := ctx.Value(subStoreApplyGrantKey{}).(*subStoreApplyGrant); grant == nil {
+		return errSubStoreCoreOnlyMethod
+	}
+	return nil
 }
 
 // subStoreBindLine is one entry in a bind result, or one exclusion in a

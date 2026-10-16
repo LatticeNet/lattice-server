@@ -181,8 +181,10 @@ type monitorView struct {
 	// PausedNodeIDs are sources that keep their history but do not run the
 	// monitor now. Their pairs are left out of Latest.
 	PausedNodeIDs []string `json:"paused_node_ids,omitempty"`
-	// Alert is the alert policy, "down" or "off".
-	Alert string `json:"alert"`
+	// Alert is the alert policy, "down" or "off", and AlertAfter the failed
+	// runs in a row that page and read as down.
+	Alert      string `json:"alert"`
+	AlertAfter int    `json:"alert_after"`
 	// Version is what an edit names (POST /api/monitors/update).
 	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
@@ -237,7 +239,7 @@ func toMonitorViews(in []model.Monitor) []monitorView {
 			IntervalSec: m.IntervalSec, TimeoutSec: m.TimeoutSec, AssignAll: m.AssignAll,
 			NodeIDs: m.NodeIDs, ThresholdDays: m.ThresholdDays,
 			Enabled: m.Enabled, ManagedBy: m.ManagedBy, PausedNodeIDs: m.PausedNodeIDs,
-			Alert: monitorAlertOf(m), Version: m.Version,
+			Alert: monitorAlertOf(m), AlertAfter: store.MonitorAlertAfter(m), Version: m.Version,
 			CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 			Latest: []monitorLatestView{},
 		})

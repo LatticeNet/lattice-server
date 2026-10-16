@@ -194,6 +194,11 @@ func TestPathSeriesRoute(t *testing.T) {
 	if err := st.UpsertMonitor(model.Monitor{ID: "mon-tls", Name: "cert", Type: model.MonitorTypeTLS, Target: "example.com:443", IntervalSec: 3600, TimeoutSec: 10, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
+	// Its address is node-hk's, so a caller who cannot read node-hk does
+	// not read its path, in the series as in the matrix.
+	if err := st.UpsertMonitor(model.Monitor{ID: "mon-hk", Name: "hk ssh", Type: model.MonitorTypeTCP, Target: "203.0.113.4:22", IntervalSec: 30, TimeoutSec: 5, NodeIDs: []string{"node-sh"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	get := func(path string) (*http.Response, model.PathSeries) {
 		res := doJSON(t, handler, http.MethodGet, path, "", cookies, csrf)
 		defer res.Body.Close()
@@ -237,6 +242,7 @@ func TestPathSeriesRoute(t *testing.T) {
 		"/api/monitors/series?monitor=mon-op&source=node-sh":      http.StatusOK,
 		"/api/monitors/series?monitor=mon-op&source=node-us":      http.StatusForbidden,
 		"/api/monitors/series?monitor=mon-tls":                    http.StatusForbidden,
+		"/api/monitors/series?monitor=mon-hk&source=node-sh":      http.StatusForbidden,
 	} {
 		res := doBearerJSON(t, handler, http.MethodGet, path, "", confined)
 		res.Body.Close()
@@ -431,7 +437,8 @@ func TestPathMatrixScope(t *testing.T) {
 }
 
 // Each window's figures hold until its next bucket closes, and a path that
-// appears meanwhile is read at once.
+// appears meanwhile is read at once, over the same window, without
+// rereading the others.
 func TestPathMatrixCachesUntilTheBucketCloses(t *testing.T) {
 	srv, _, st := newPathsServer(t)
 	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a", Online: true})
@@ -458,9 +465,12 @@ func TestPathMatrixCachesUntilTheBucketCloses(t *testing.T) {
 	if err := st.UpsertMonitor(model.Monitor{ID: "mon-b", Name: "b", Type: model.MonitorTypeTCP, Target: "203.0.113.9:80", IntervalSec: 60, TimeoutSec: 5, NodeIDs: []string{"node-a"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.IngestAgentMonitorResults("node-a", []model.MonitorResult{{MonitorID: "mon-b", At: base.Add(40 * time.Second), Success: true, LatencyMs: 12}}, base.Add(40*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	withNew, _ := srv.pathMatrixFor(p, model.PathWindowDay, base.Add(2*time.Minute))
-	if c := pathCellFor(t, withNew, "node-a", "mon-a"); c.Samples != 2 {
-		t.Fatalf("a new path rereads the window: %+v", c)
+	if a, b := pathCellFor(t, withNew, "node-a", "mon-a"), pathCellFor(t, withNew, "node-a", "mon-b"); a.Samples != 1 || b.Samples != 1 {
+		t.Fatalf("a new path is read at once and the others stay cached: a %d, b %d", a.Samples, b.Samples)
 	}
 	ingest(base.Add(90 * time.Second))
 	closed, _ := srv.pathMatrixFor(p, model.PathWindowDay, base.Add(5*time.Minute))
@@ -520,4 +530,11 @@ func TestPathMatrixReadsConcurrently(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// forget drops every cached window, so the next read goes to the store.
+func (m *monitorPathState) forget() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.windows = nil
 }

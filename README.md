@@ -630,8 +630,10 @@ Use the compose file and deployment guide in the umbrella repository:
   multiple of the finest covering tier's resolution that keeps the series
   within 720 points and is no shorter than the interval: 1 h at one minute,
   24 h at five, 3 d at ten, 7 d at fifteen, 14 d at thirty (hourly when the
-  fine retention is under 14 days). Both need `monitor:read`.
-- `GET /api/monitors/settings` (`monitor:read`) returns the history setting
+  fine retention is under the window, or while the five-minute tier is still
+  filling and the hourly one holds the older part). Both need `monitor:read`.
+- `GET /api/monitors/settings` (`monitor:read`, no node allowlist, since the
+  figures cover the fleet) returns the history setting
   (`fine_retention_days`, 3 to 14, 7 by default; the hourly tier is fixed at
   35 days and raw rows at 1440 per path), the paths recording history, and
   `measured_bytes` (bbolt page statistics of the monitor buckets) beside
@@ -647,12 +649,15 @@ Use the compose file and deployment guide in the umbrella repository:
   edits an operator's check with the `version` it was read at (409 when
   stale) and only the fields it sends: `name`, `interval_sec` (10 s floor),
   `timeout_sec`, `threshold_days` (tls), `alert` (`down` or `off`),
-  `enabled`, `assign_all`, `node_ids` and `paused_node_ids`. A paused source
+  `alert_after` (failures in a row that page and read as down, 1 to 20,
+  default 2; also accepted on create), `enabled`, `assign_all`, `node_ids`
+  and `paused_node_ids`. A paused source
   keeps its history, is not handed the check and has its results refused as
   `not_assigned`. Changing `type` or `target` is refused with 400: that is a
   new check. Generated checks answer 409, as a delete does. Edits are audited
   as `monitor.update`. A check whose alert policy is `off`, like a generated
-  latency check, opens no incident and shows no pending one.
+  latency check, and a disabled check open no incident and show no pending
+  one; the incident sweep closes what such a check had open.
 - Control-plane task views expose script hash and byte size, not the full script
   body or agent-only lease credential.
 - Task read and run permissions are split: `task:read` lists task metadata and

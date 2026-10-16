@@ -501,3 +501,114 @@ func (bs *BoltStateStore) MonitorStorageUsage() (MonitorStorageUsage, error) {
 	})
 	return out, err
 }
+
+// MonitorOldestBuckets is each pair's oldest bucket start at res, which says
+// how far back that tier actually reaches for the pair: a tier whose
+// retention was raised, or that was shorter before an upgrade, holds less
+// than its retention until it fills. A pair with no bucket has no entry.
+func (s *Store) MonitorOldestBuckets(pairs []MonitorPair, res time.Duration) (map[MonitorPair]time.Time, error) {
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.MonitorOldestBuckets(pairs, res)
+	}
+	defer s.mu.Unlock()
+	out := map[MonitorPair]time.Time{}
+	for _, pair := range pairs {
+		if rows := s.jsonPairRowsLocked(pair); len(rows) > 0 {
+			out[pair] = rows[0].At.UTC().Truncate(res)
+		}
+	}
+	return out, nil
+}
+
+func (bs *BoltStateStore) MonitorOldestBuckets(pairs []MonitorPair, res time.Duration) (map[MonitorPair]time.Time, error) {
+	bucketName, err := monitorRollupBucket(res)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[MonitorPair]time.Time, len(pairs))
+	err = bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		b := tx.Bucket(bucketName)
+		if b == nil {
+			return nil
+		}
+		c := b.Cursor()
+		for _, pair := range pairs {
+			if validMonitorPair(pair.MonitorID, pair.NodeID) != nil {
+				continue
+			}
+			prefix, err := monitorPairPrefix(pair.MonitorID, pair.NodeID)
+			if err != nil {
+				return err
+			}
+			k, _ := c.Seek(prefix)
+			if k == nil || !bytes.HasPrefix(k, prefix) {
+				continue
+			}
+			at, err := time.Parse(monitorResultLayout, string(instantOfRowKey(k)))
+			if err != nil {
+				return fmt.Errorf("decode %s key instant: %w", bucketName, err)
+			}
+			out[pair] = at
+		}
+		return nil
+	})
+	return out, err
+}
+
+// MonitorPairResultsBetween is one pair's rows stamped in [from, to), oldest
+// first, read forward from from: a window, however many runs it holds.
+func (s *Store) MonitorPairResultsBetween(monitorID, nodeID string, from, to time.Time) ([]MonitorResultRecord, error) {
+	from, to = from.UTC(), to.UTC()
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.MonitorPairResultsBetween(monitorID, nodeID, from, to)
+	}
+	defer s.mu.Unlock()
+	out := []MonitorResultRecord{}
+	for _, r := range s.jsonPairRowsLocked(MonitorPair{MonitorID: monitorID, NodeID: nodeID}) {
+		if !r.At.Before(from) && r.At.Before(to) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+func (bs *BoltStateStore) MonitorPairResultsBetween(monitorID, nodeID string, from, to time.Time) ([]MonitorResultRecord, error) {
+	out := []MonitorResultRecord{}
+	if validMonitorPair(monitorID, nodeID) != nil {
+		return out, nil
+	}
+	err := bs.db.View(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		rows := tx.Bucket(boltBucketMonResultRows)
+		if rows == nil {
+			return nil
+		}
+		prefix, err := monitorPairPrefix(monitorID, nodeID)
+		if err != nil {
+			return err
+		}
+		first, err := boltStringKey(monitorResultKey(monitorID, nodeID, from))
+		if err != nil {
+			return err
+		}
+		toInstant := []byte(to.Format(monitorResultLayout))
+		c := rows.Cursor()
+		for k, v := c.Seek(first); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
+			if bytes.Compare(instantOfRowKey(k), toInstant) >= 0 {
+				break
+			}
+			rec, err := decodeMonitorResultRow(k, v)
+			if err != nil {
+				return err
+			}
+			out = append(out, rec)
+		}
+		return nil
+	})
+	return out, err
+}

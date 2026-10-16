@@ -5361,6 +5361,10 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		if req.Alert == "" {
 			req.Alert = model.MonitorAlertDown
 		}
+		if req.AlertAfter < 0 || req.AlertAfter > model.MonitorAlertAfterMax {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax))
+			return
+		}
 		// Sources are paused through an edit of a check that exists.
 		req.PausedNodeIDs = nil
 		switch req.Type {
@@ -6019,10 +6023,11 @@ func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorRes
 	if current.Success && priorFailStreak == 0 {
 		return
 	}
-	if !current.Success && priorFailStreak != 1 {
+	mon, _ := s.store.Monitor(current.MonitorID)
+	after := store.MonitorAlertAfter(mon)
+	if !current.Success && priorFailStreak != after-1 {
 		return
 	}
-	mon, _ := s.store.Monitor(current.MonitorID)
 	if !monitorPages(mon) {
 		// Latency probes do not page one pair at a time: a path from China
 		// drops probes routinely, and twenty targets would page twenty
@@ -6051,7 +6056,7 @@ func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorRes
 	s.openIncident(incidentSignal{
 		kind: EventMonitorDown, nodeID: nodeID, monitorID: current.MonitorID,
 		subject: name + " on " + where, since: now, sortKey: name + "\x00" + where,
-		msg: monitorDownMessage(name, where, current.Error),
+		msg: monitorDownMessage(name, where, current.Error, after),
 	}, now)
 }
 
@@ -6073,15 +6078,27 @@ func (s *Server) monitorNames(mon model.Monitor, nodeID string) (name, where str
 	return name, where
 }
 
-func monitorDownMessage(name, where, errText string) incidentMessage {
+func monitorDownMessage(name, where, errText string, after int) incidentMessage {
 	detail := strings.TrimSpace(errText)
 	if detail == "" {
 		detail = "probe failed"
 	}
 	return incidentMessage{
 		title:  fmt.Sprintf("Monitor down: %s on %s", name, where),
-		detail: fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail),
+		detail: fmt.Sprintf("%s on %s failed %s: %s", name, where, monitorFailCount(after), detail),
 		line:   fmt.Sprintf("%s on %s: %s", name, where, detail),
+	}
+}
+
+// monitorFailCount says how many failures in a row a page waited for.
+func monitorFailCount(n int) string {
+	switch n {
+	case 1:
+		return "once"
+	case 2:
+		return "twice in a row"
+	default:
+		return fmt.Sprintf("%d times in a row", n)
 	}
 }
 

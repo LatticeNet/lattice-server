@@ -162,7 +162,9 @@ func advanceMonitorLatest(prior MonitorLatest, hadPrior bool, rec MonitorResultR
 		}
 		next.LastOKAt, next.LastOKMs = prior.LastOKAt, prior.LastOKMs
 	}
-	if rec.Success {
+	// A late result from an agent's buffer never moves the last success
+	// back in time.
+	if rec.Success && !rec.At.Before(next.LastOKAt) {
 		next.LastOKAt, next.LastOKMs = rec.At, rec.LatencyMs
 	}
 	if !rec.Success {
@@ -351,9 +353,9 @@ func (s *Store) hotForMonitorRead() *BoltStateStore {
 
 // recordMonitorResultsJSONLocked is the fallback without the hot store. The
 // whole state file is saved once for the batch, and only when a pair changed
-// state, reached its second failure in a row (the alert hold pages there and
-// must not forget it across a restart), or has not been written for
-// monitorResultPersistenceInterval.
+// state, reached the failure that pages (the monitor's AlertAfter in a row;
+// the alert hold must not forget it across a restart), or has not been
+// written for monitorResultPersistenceInterval.
 func (s *Store) recordMonitorResultsJSONLocked(records []MonitorResultRecord) ([]MonitorResultOutcome, error) {
 	if s.monitorPersistedAt == nil {
 		s.monitorPersistedAt = map[string]time.Time{}
@@ -376,9 +378,9 @@ func (s *Store) recordMonitorResultsJSONLocked(records []MonitorResultRecord) ([
 		key := monitorResultPersistenceKey(rec.MonitorID, rec.NodeID)
 		touched[key] = struct{}{}
 		transitioned := !hadPrior || prior.Success != rec.Success || prior.Error != rec.Error
-		secondFailure := !rec.Success && hadPrior && prior.FailStreak == 1
+		pagingFailure := !rec.Success && prior.FailStreak+1 == MonitorAlertAfter(s.state.Monitors[rec.MonitorID])
 		lastPersisted, persisted := s.monitorPersistedAt[key]
-		if !persisted || transitioned || secondFailure || now.Sub(lastPersisted) >= monitorResultPersistenceInterval {
+		if !persisted || transitioned || pagingFailure || now.Sub(lastPersisted) >= monitorResultPersistenceInterval {
 			save = true
 		}
 	}

@@ -101,10 +101,17 @@ func (s *Server) monitorSettingsView() (model.MonitorSettingsView, error) {
 	}, nil
 }
 
-// handleMonitorSettings answers GET /api/monitors/settings.
+// handleMonitorSettings answers GET /api/monitors/settings. The figures
+// cover the whole fleet (its path count and history size), so a
+// node-confined token, which learns nothing about other nodes elsewhere,
+// is refused as it is for the save.
 func (s *Server) handleMonitorSettings(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if principalHasNodeRestriction(p) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "the monitor history settings cover the whole fleet; they need a token without a server allowlist restriction"))
 		return
 	}
 	view, err := s.monitorSettingsView()
@@ -136,8 +143,10 @@ func (s *Server) handleMonitorSettingsUpdate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	now := s.now()
+	s.monitorPaths.settingsMu.Lock()
 	old := s.store.MonitorSettings()
 	stored, err := s.store.SetMonitorSettings(req, req.Version, p.ActorID, now)
+	s.monitorPaths.settingsMu.Unlock()
 	if errors.Is(err, store.ErrMonitorSettingsVersion) {
 		writeError(w, http.StatusConflict, err)
 		return

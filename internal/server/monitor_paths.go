@@ -55,9 +55,6 @@ const (
 	// result no longer says what it is doing now.
 	pathStaleAfterRuns = 3
 	pathStaleFloor     = 2 * time.Minute
-	// pathDownAfter is how many failures in a row read as down: the alert
-	// hold's count (notifyMonitorTransition).
-	pathDownAfter = 2
 	// pathControlPlaneName names the source of tls checks in the matrix.
 	pathControlPlaneName = "Control plane"
 )
@@ -239,6 +236,16 @@ func (s *Server) pathSeriesFor(checks []pathCheck, source, window string, interv
 	fineDays := s.store.MonitorSettings().FineRetentionDays
 	tier, step := pathSeriesStep(span, fineDays, interval)
 	from := now.Add(-span).Truncate(step)
+	if tier == pathTierFine {
+		short, err := s.fineTierShort(checks, source, from, now)
+		if err != nil {
+			return model.PathSeries{}, err
+		}
+		if short {
+			tier, step = pathSeriesStep(span, 0, interval)
+			from = now.Add(-span).Truncate(step)
+		}
+	}
 	end := now.Add(time.Nanosecond)
 	merged := map[time.Time]*store.MonitorRollup{}
 	// samples[i][t] is check i's runs in step t, which picks the step's
@@ -260,13 +267,11 @@ func (s *Server) pathSeriesFor(checks []pathCheck, source, window string, interv
 	for i, check := range checks {
 		samples[i] = map[time.Time]int{}
 		if tier == pathTierRaw {
-			limit := store.MonitorResultsPerPair
-			if interval > 0 {
-				// One row more than the window holds serves as the first
-				// success's predecessor for jitter.
-				limit = min(int(span/interval)+6, store.MonitorResultsPerPair)
-			}
-			rows, err := s.store.MonitorPairResults(check.monitorID, source, limit)
+			// The rows of the window, by time however many there are, and
+			// the run or two before it, whose success is the first one's
+			// predecessor for jitter.
+			lead := max(2*interval, 2*time.Minute)
+			rows, err := s.store.MonitorPairResultsBetween(check.monitorID, source, from.Add(-lead), end)
 			if err != nil {
 				return model.PathSeries{}, err
 			}
@@ -320,6 +325,62 @@ func (s *Server) pathSeriesFor(checks []pathCheck, source, window string, interv
 	return out, nil
 }
 
+// fineTierShort reports whether the five-minute tier lacks part of the
+// window that the hourly tier holds: hourly buckets exist between the
+// window's start and the hour before the oldest five-minute bucket. That is
+// the five-minute tier still filling, after the two days the previous
+// release kept or a retention just raised. The series then reads the hourly
+// tier rather than draw history that exists as a gap. A path that was
+// silent (paused, down) in that span has no hourly buckets there either,
+// and keeps the finer tier.
+func (s *Server) fineTierShort(checks []pathCheck, source string, from, now time.Time) (bool, error) {
+	pairs := make([]store.MonitorPair, 0, len(checks))
+	for _, check := range checks {
+		pairs = append(pairs, store.MonitorPair{MonitorID: check.monitorID, NodeID: source})
+	}
+	starts, err := s.store.MonitorOldestBuckets(pairs, store.MonitorRollupFine)
+	if err != nil {
+		return false, err
+	}
+	fine := now
+	for _, t := range starts {
+		if t.Before(fine) {
+			fine = t
+		}
+	}
+	if !fine.After(from) {
+		return false, nil
+	}
+	missing := fine.Add(-store.MonitorRollupCoarse)
+	if len(starts) == 0 {
+		missing = now.Add(time.Nanosecond)
+	}
+	if !missing.After(from) {
+		return false, nil
+	}
+	coarse, err := s.store.MonitorRollups(pairs, store.MonitorRollupCoarse, from, missing)
+	if err != nil {
+		return false, err
+	}
+	return len(coarse) > 0, nil
+}
+
+// operatorPathVisible is the scope rule for one source of an operator's
+// check: the check, the source and, when the check's address is one node's,
+// that node, as the matrix decides it.
+func (s *Server) operatorPathVisible(p principal, mon model.Monitor, source string) bool {
+	nodes := map[string]model.Node{}
+	for _, n := range s.store.Nodes() {
+		nodes[n.ID] = n
+	}
+	m := mon
+	e := pathEntry{
+		cell:    model.PathCell{Source: source, TargetNode: pathNodesByAddress(nodes).get(pathTargetHost(mon)), MonitorID: mon.ID},
+		monitor: &m,
+	}
+	return e.visibleTo(p)
+}
+
 // handleMonitorSeries answers GET /api/monitors/series, either
 // ?source=&target_node=&window= for a generated path or
 // ?monitor=&source=&window= for one check's path (source empty for a tls
@@ -347,7 +408,11 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 			writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "monitor not found"))
 			return
 		}
-		if !monitorVisibleToPrincipal(p, "monitor:read", mon) || (source != "" && !latencyNodeVisible(p, source)) {
+		visible := monitorVisibleToPrincipal(p, "monitor:read", mon) && (source == "" || latencyNodeVisible(p, source))
+		if visible && mon.ManagedBy == "" {
+			visible = s.operatorPathVisible(p, mon, source)
+		}
+		if !visible {
 			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 			return
 		}
@@ -588,6 +653,10 @@ type monitorPathState struct {
 	planAt  time.Time
 	wake    chan struct{}
 	pruneMu sync.Mutex
+	// settingsMu holds a settings save and the read of what it replaced
+	// together, so the audit and the sweep's wake-up see the value the
+	// save actually replaced.
+	settingsMu sync.Mutex
 }
 
 // pathPlanFresh is how long the matrix reuses a latency plan. Planning
@@ -638,13 +707,6 @@ func (m *monitorPathState) window(name string) *pathWindowFigures {
 	return w
 }
 
-// forget drops every cached window, so the next read goes to the store.
-func (m *monitorPathState) forget() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.windows = nil
-}
-
 // pathWindowBounds is where a matrix window reads from and until when its
 // figures hold: the window starts on its tier's step and the figures hold
 // until that step's next boundary.
@@ -664,27 +726,53 @@ func (s *Server) pathFiguresFor(window string, span time.Duration, pairs []store
 	w := s.monitorPaths.window(window)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	fresh := !w.at.IsZero() && now.Before(w.until) && !now.Before(w.at)
-	if fresh {
-		for _, pair := range pairs {
-			if !w.read[pair] {
-				fresh = false
-				break
-			}
+	tier := pathMatrixTier(span)
+	live := !w.at.IsZero() && now.Before(w.until) && !now.Before(w.at)
+	var missing []store.MonitorPair
+	for _, pair := range pairs {
+		if !live || !w.read[pair] {
+			missing = append(missing, pair)
 		}
 	}
-	if fresh {
+	if len(missing) == 0 {
 		return w.pathWindowSnapshot, nil
 	}
-	tier, from, until := pathWindowBounds(span, now)
-	prevFrom := from.Add(-span)
-	var sums map[store.MonitorPair]store.MonitorWindowSummary
-	var err error
-	if tier == pathTierRaw {
-		sums, err = s.store.MonitorRowSummaries(pairs, prevFrom, from, now.Add(time.Nanosecond))
-	} else {
-		sums, err = s.store.MonitorRollupSummaries(pairs, tier.resolution(), prevFrom, from, now.Add(time.Nanosecond))
+	read := func(pairs []store.MonitorPair, from, at time.Time) (map[store.MonitorPair]store.MonitorWindowSummary, error) {
+		prevFrom := from.Add(-span)
+		if tier == pathTierRaw {
+			return s.store.MonitorRowSummaries(pairs, prevFrom, from, at.Add(time.Nanosecond))
+		}
+		return s.store.MonitorRollupSummaries(pairs, tier.resolution(), prevFrom, from, at.Add(time.Nanosecond))
 	}
+	if live {
+		// Within the same bucket, read only the paths this caller adds,
+		// over the same window, and keep everyone else's: callers with
+		// different scopes then share one cache instead of evicting each
+		// other. The maps are copied, never written, so snapshots handed
+		// out earlier stay as they were.
+		sums, err := read(missing, w.from, w.at)
+		if err != nil {
+			return pathWindowSnapshot{}, err
+		}
+		readSet := make(map[store.MonitorPair]bool, len(w.read)+len(missing))
+		figures := make(map[store.MonitorPair]pathFigures, len(w.figures)+len(sums))
+		for pair := range w.read {
+			readSet[pair] = true
+		}
+		for pair, f := range w.figures {
+			figures[pair] = f
+		}
+		for _, pair := range missing {
+			readSet[pair] = true
+		}
+		for pair, sum := range sums {
+			figures[pair] = pathFiguresOf(sum)
+		}
+		w.read, w.figures = readSet, figures
+		return w.pathWindowSnapshot, nil
+	}
+	_, from, until := pathWindowBounds(span, now)
+	sums, err := read(pairs, from, now)
 	if err != nil {
 		return pathWindowSnapshot{}, err
 	}
@@ -726,7 +814,13 @@ func pathStateOf(e pathEntry, latest *store.MonitorLatest, nodes map[string]mode
 	if now.Sub(heard) > max(pathStaleAfterRuns*e.interval, pathStaleFloor) {
 		return model.PathStateUnknown, model.PathReasonNoData
 	}
-	if !latest.Success && latest.FailStreak >= pathDownAfter {
+	// Down follows the check's alert hold: its failures in a row
+	// (store.MonitorAlertAfter), two for a generated check.
+	after := store.MonitorAlertAfter(model.Monitor{})
+	if e.monitor != nil {
+		after = store.MonitorAlertAfter(*e.monitor)
+	}
+	if !latest.Success && latest.FailStreak >= after {
 		return model.PathStateDown, ""
 	}
 	return model.PathStateUp, ""

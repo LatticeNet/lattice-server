@@ -501,5 +501,29 @@ func TestDeleteNodeStripsItFromPausedSources(t *testing.T) {
 		if contains(mon.PausedNodeIDs, "node-b") || contains(mon.NodeIDs, "node-b") {
 			t.Fatalf("%s still names the deleted node: %+v", id, mon)
 		}
+		// An edit read before the delete is refused rather than writing
+		// the node back.
+		if mon.Version != 1 {
+			t.Fatalf("%s version = %d after the strip", id, mon.Version)
+		}
+	}
+}
+
+// A late success from an agent's buffer does not move the last success,
+// which the next jump is measured from, back in time.
+func TestLateSuccessKeepsTheNewerLastSuccess(t *testing.T) {
+	s := openHotStore(t, t.TempDir())
+	defer s.Close()
+	seedMonitor(t, s, model.Monitor{ID: "mon-a", Type: model.MonitorTypeTCP, AssignAll: true})
+	now := time.Now().UTC()
+	if _, err := s.IngestAgentMonitorResults("node-a", []model.MonitorResult{
+		{MonitorID: "mon-a", At: now.Add(-time.Minute), Success: true, LatencyMs: 30},
+		{MonitorID: "mon-a", At: now.Add(-3 * time.Minute), Success: true, LatencyMs: 90},
+	}, now); err != nil {
+		t.Fatal(err)
+	}
+	latest, _, err := s.MonitorLatest("mon-a", "node-a")
+	if err != nil || !latest.LastOKAt.Equal(now.Add(-time.Minute)) || latest.LastOKMs != 30 {
+		t.Fatalf("latest = %+v %v", latest, err)
 	}
 }

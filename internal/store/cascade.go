@@ -512,6 +512,8 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 			clone := cloneMonitor(m)
 			clone.NodeIDs = withoutString(clone.NodeIDs, nodeID)
 			clone.PausedNodeIDs = withoutString(clone.PausedNodeIDs, nodeID)
+			// An edit read before the delete must not write the node back.
+			clone.Version++
 			s.state.Monitors[id] = clone
 		}
 	}

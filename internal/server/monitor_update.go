@@ -19,8 +19,9 @@ import (
 
 // Editing a check (design 29 D1). An edit names the version it was read at
 // and only the fields it changes. It may change the name, interval, timeout,
-// the tls warning window, the alert policy, whether the check runs, its
-// sources and which of them are paused. It may not change the method or the
+// the tls warning window, the alert policy and how many failures in a row it
+// waits for, whether the check runs, its sources and which of them are
+// paused. It may not change the method or the
 // target: that is a new check, so one series never mixes two of them, and
 // the console creates the new check and pauses the old one. Generated
 // checks refuse edits as they refuse deletes.
@@ -223,6 +224,13 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 		}
 		note("alert", alert != mon.Alert)
 		next.Alert = alert
+	}
+	if req.AlertAfter != nil {
+		if *req.AlertAfter < 1 || *req.AlertAfter > model.MonitorAlertAfterMax {
+			return model.Monitor{}, nil, false, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax)
+		}
+		note("alert_after", *req.AlertAfter != store.MonitorAlertAfter(mon))
+		next.AlertAfter = *req.AlertAfter
 	}
 	if req.Enabled != nil {
 		note("enabled", *req.Enabled != mon.Enabled)

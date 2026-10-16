@@ -168,6 +168,15 @@ func readBoltMonitorSettings(tx *bolt.Tx) (*model.MonitorSettings, error) {
 	return &cfg, nil
 }
 
+// MonitorAlertAfter is how many failed runs in a row page for mon and read
+// as down: its AlertAfter, or the default of two.
+func MonitorAlertAfter(mon model.Monitor) int {
+	if mon.AlertAfter >= 1 && mon.AlertAfter <= model.MonitorAlertAfterMax {
+		return mon.AlertAfter
+	}
+	return model.MonitorAlertAfterDefault
+}
+
 // Monitor edits.
 var (
 	// ErrMonitorNotFound: no monitor has the id.

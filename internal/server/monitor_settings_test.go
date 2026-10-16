@@ -101,6 +101,11 @@ func TestMonitorSettingsRoutes(t *testing.T) {
 	if res.StatusCode != http.StatusForbidden {
 		t.Fatalf("confined save = %d", res.StatusCode)
 	}
+	confinedRead := doBearerJSON(t, handler, http.MethodGet, "/api/monitors/settings", "", confined)
+	confinedRead.Body.Close()
+	if confinedRead.StatusCode != http.StatusForbidden {
+		t.Fatalf("confined read = %d", confinedRead.StatusCode)
+	}
 	reader := createPAT(t, handler, cookies, csrf, []string{"monitor:read"}, nil)
 	if v := decodeSettings(t, doBearerJSON(t, handler, http.MethodGet, "/api/monitors/settings", "", reader)); v.Version != 2 {
 		t.Fatalf("read with monitor:read = %+v", v)

@@ -976,6 +976,14 @@ func TestProposeRunsImmediatelyAfterApply(t *testing.T) {
 		}
 		return subStoreApplyRevisionReply{SubscriptionID: req.SubscriptionID, Revision: req.Revision}, nil
 	}
+	// depends_on v2, which propose reads the closure from (lane 5b): the
+	// record alone, live at the current revision with the next one staged.
+	s.substoreCatalogue.deps.query = func(context.Context, string, []byte) ([]byte, error) {
+		next := map[string]string{"rev-1": "rev-2", "rev-2": "rev-3"}[live]
+		return json.Marshal(map[string]any{"records": []fleetDependsFacts{{ID: "fleet-1", Revision: live, Kind: "sub", Source: subStoreSourceFleet,
+			FleetBound: true, StagedRevision: next, StagedSource: subStoreSourceFleet}},
+			"fleet_bound": []string{"fleet-1"}, "owner_credentials": []string{}, "edges": []fleetDependsEdge{}, "version": "t"})
+	}
 	propose := func(from, to string) subStorePlansProposeReply {
 		t.Helper()
 		ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, subStoreSvcAdmin)

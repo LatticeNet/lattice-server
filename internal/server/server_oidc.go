@@ -125,7 +125,9 @@ func (s *Server) clearOIDCBindingCookie(w http.ResponseWriter) {
 }
 
 // totpChallengeCookie binds a post-SSO TOTP challenge to the initiating browser.
-// handleLoginTOTP requires it to match the submitted challenge id when present.
+// handleLoginTOTP requires it to match the submitted challenge id when present,
+// and handlePendingSSOSecondFactor reads it to name the provider that verified
+// the first factor.
 const totpChallengeCookie = "lattice_totp_challenge"
 
 func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, challengeID string) {
@@ -150,6 +152,51 @@ func (s *Server) clearTOTPChallengeCookie(w http.ResponseWriter) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
+}
+
+// pendingSSOSecondFactorView is what GET /api/login/totp tells the browser
+// that holds a post-SSO second-factor challenge: the provider's display name
+// and whom it verified, the verified email or, without one, the subject.
+type pendingSSOSecondFactorView struct {
+	Provider string `json:"provider"`
+	Email    string `json:"email,omitempty"`
+	Subject  string `json:"subject,omitempty"`
+}
+
+// handlePendingSSOSecondFactor answers GET /api/login/totp so the second-factor
+// page can say which provider already verified the operator. It reads the
+// challenge only from the HttpOnly cookie the SSO callback set for this
+// browser, never from the URL, and requires the client IP the challenge was
+// issued to. Anything else (no cookie, an expired, spent or unknown challenge,
+// or a password-path challenge) gets a 404 that names nobody. It is read-only:
+// it neither counts against the login limiter nor touches the challenge.
+func (s *Server) handlePendingSSOSecondFactor(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	none := func() { writeError(w, http.StatusNotFound, errors.New("no pending sso sign-in")) }
+	c, err := r.Cookie(totpChallengeCookie)
+	if err != nil || c.Value == "" {
+		none()
+		return
+	}
+	challenge, ok := s.store.TOTPChallenge(c.Value)
+	if !ok || challenge.SSOProviderID == "" || challenge.ClientIP != s.clientIP(r) {
+		none()
+		return
+	}
+	if user, ok := s.store.User(challenge.UserID); !ok || !user.TOTPEnabled {
+		none()
+		return
+	}
+	view := pendingSSOSecondFactorView{Provider: challenge.SSOProviderID}
+	if p, ok := s.store.OIDCProvider(challenge.SSOProviderID); ok && strings.TrimSpace(p.DisplayName) != "" {
+		view.Provider = strings.TrimSpace(p.DisplayName)
+	}
+	if challenge.SSOEmail != "" {
+		view.Email = challenge.SSOEmail
+	} else {
+		view.Subject = challenge.SSOSubject
+	}
+	writeJSON(w, http.StatusOK, view)
 }
 
 // handleOIDCCallback completes the login: validates and consumes the state,
@@ -247,6 +294,13 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.oidcFail(w, r, st.RedirectAfter, "session_failed", "")
 			return
+		}
+		// Remember who the provider verified, so the second-factor page can
+		// tell the operator the provider step already succeeded.
+		challenge.SSOProviderID = provider.ID
+		challenge.SSOSubject = claims.Subject
+		if claims.EmailVerified {
+			challenge.SSOEmail = strings.TrimSpace(claims.Email)
 		}
 		if err := s.store.PutTOTPChallenge(challenge); err != nil {
 			s.oidcFail(w, r, st.RedirectAfter, "session_failed", "")

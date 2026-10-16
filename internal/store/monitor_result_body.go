@@ -107,8 +107,10 @@ func SanitizeMonitorError(text string) string {
 }
 
 // stripURLSecretsByHand is SanitizeMonitorError for a URL that does not
-// parse: cut at the first '?' or '#', and drop everything up to the last '@'
-// of the authority.
+// parse: cut at the first '?' or '#', and drop everything up to the last
+// '@'. A password may hold a '/', so the '@' is looked for past the first
+// one too; a path that holds an '@' loses its start, which is the safe way
+// to be wrong.
 func stripURLSecretsByHand(raw string) string {
 	if i := strings.IndexAny(raw, "?#"); i >= 0 {
 		raw = raw[:i]
@@ -117,12 +119,8 @@ func stripURLSecretsByHand(raw string) string {
 	if !ok {
 		return raw
 	}
-	authority, path, hasPath := strings.Cut(rest, "/")
-	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
-		authority = authority[i+1:]
+	if i := strings.LastIndexByte(rest, '@'); i >= 0 {
+		rest = rest[i+1:]
 	}
-	if hasPath {
-		return scheme + "://" + authority + "/" + path
-	}
-	return scheme + "://" + authority
+	return scheme + "://" + rest
 }

@@ -126,6 +126,11 @@ func countable(rec MonitorResultRecord) bool { return rec.Reason == "" }
 
 // addResult counts one countable result, its probes included.
 func (r *MonitorRollup) addResult(rec MonitorResultRecord) {
+	if r.S == 0 && r.N > 0 {
+		// A bucket written before buckets counted probes: count its runs
+		// as one probe each first, so its loss keeps them.
+		r.S, r.L = r.N, r.F
+	}
 	r.add(rec.Success, rec.LatencyMs)
 	if rec.Sent > 0 {
 		r.S += rec.Sent

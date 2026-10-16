@@ -245,7 +245,15 @@ func (s *Server) handleLatencySeries(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 		return
 	}
+	// The pair's generated check: the kind it probes with now, tcp when
+	// the plan does not name one.
 	monitorID := latencyMonitorID(targetID)
+	for _, pair := range s.pathPlan(s.now()).Pairs {
+		if pair.Source == sourceID && pair.Target == targetID && pair.MonitorID != "" {
+			monitorID = pair.MonitorID
+			break
+		}
+	}
 	mon, ok := s.store.Monitor(monitorID)
 	if !ok || mon.ManagedBy != model.MonitorManagedLatency {
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "no latency probe targets that node"))

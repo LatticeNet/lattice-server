@@ -130,19 +130,61 @@ func checkMonitorHost(host string) error {
 	if host == "" {
 		return errors.New("target has no host")
 	}
+	if strings.ContainsAny(host, "% \t") {
+		// A zone or a space is never part of a name a check may dial.
+		return fmt.Errorf("target host %q is not a host name or an address", host)
+	}
 	lower := strings.ToLower(strings.TrimSuffix(host, "."))
 	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") {
 		return errDestination(host)
 	}
-	if addr, err := netip.ParseAddr(host); err == nil && model.MonitorDestinationRefused(addr) {
-		return errDestination(host)
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if model.MonitorDestinationRefused(addr) {
+			return errDestination(host)
+		}
+		return nil
+	}
+	// A host whose last label is a number is an address in a form some
+	// resolvers read and netip does not (2130706433, 127.1, 0x7f.1): no
+	// DNS name ends in a number, so it is refused rather than judged.
+	label := lower[strings.LastIndexByte(lower, '.')+1:]
+	if monitorNumericLabel(label) {
+		return fmt.Errorf("target %s is an address in a numeric form; write it as a dotted IPv4 or an IPv6 literal", host)
 	}
 	return nil
 }
 
+// monitorNumericLabel reports whether a host label is all decimal digits or
+// a 0x hexadecimal number.
+func monitorNumericLabel(label string) bool {
+	if rest, ok := strings.CutPrefix(label, "0x"); ok {
+		label = rest
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+				return false
+			}
+		}
+		return true
+	}
+	if label == "" {
+		return false
+	}
+	for i := 0; i < len(label); i++ {
+		if label[i] < '0' || label[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // normalizeHTTPMonitor checks an http check's URL, expectations and
-// headers, and binds its secrets to the URL's origin.
-func normalizeHTTPMonitor(mon *model.Monitor) error {
+// headers, and binds its secrets to the URL's origin. checkHost applies
+// the destination rules to the URL's host: a create does, an edit does
+// not, since the target cannot change and a check saved before the rules
+// existed must stay editable (an agent still refuses its destination at
+// dial time).
+func normalizeHTTPMonitor(mon *model.Monitor, checkHost bool) error {
 	if mon.TargetNode != "" {
 		return errors.New("an http check takes a URL; target_node applies to icmp and tcp checks")
 	}
@@ -165,8 +207,10 @@ func normalizeHTTPMonitor(mon *model.Monitor) error {
 			return fmt.Errorf("an http check's URL has port %q; it must be 1 to 65535", port)
 		}
 	}
-	if err := checkMonitorHost(u.Hostname()); err != nil {
-		return err
+	if checkHost {
+		if err := checkMonitorHost(u.Hostname()); err != nil {
+			return err
+		}
 	}
 	mon.Target = strings.TrimSpace(mon.Target)
 	set, err := model.ParseMonitorStatusSet(mon.ExpectStatus)
@@ -206,6 +250,17 @@ func normalizeHTTPMonitor(mon *model.Monitor) error {
 		mon.SecretsOrigin = origin
 	}
 	return nil
+}
+
+// canonicalMonitorExpectStatus is a stored status set in canonical form, so an
+// edit that leaves it alone does not read as a change; a check saved
+// before the field existed reads as the default.
+func canonicalMonitorExpectStatus(raw string) string {
+	set, err := model.ParseMonitorStatusSet(raw)
+	if err != nil {
+		return raw
+	}
+	return set.String()
 }
 
 // applyMonitorHeaderEdits applies an edit's header operations in order to

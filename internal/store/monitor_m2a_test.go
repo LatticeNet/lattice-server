@@ -246,3 +246,45 @@ func TestSetNodeProbeFacts(t *testing.T) {
 		t.Fatal("a missing node accepted")
 	}
 }
+
+// A bucket written before buckets counted probes keeps its runs' loss when
+// a new result lands in it.
+func TestRollupStraddlingTheUpgradeKeepsItsLoss(t *testing.T) {
+	b := MonitorRollup{N: 23, F: 0}
+	b.addResult(MonitorResultRecord{MonitorResult: model.MonitorResult{Success: false, Sent: 5, Lost: 5}})
+	if b.S != 28 || b.L != 5 || b.N != 24 {
+		t.Fatalf("bucket = %+v", b)
+	}
+}
+
+// The record-level bolt writer encrypts secret header values too, and its
+// readers return them decrypted.
+func TestBoltMonitorRecordEncryptsSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	bs, err := OpenBoltState(path, testCipher(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bs.Close()
+	mon := model.Monitor{ID: "mon-h", Type: model.MonitorTypeHTTP, Target: "https://example.com/", Enabled: true, NodeIDs: []string{"n1"},
+		Headers: []model.MonitorHeader{{Name: "Authorization", Value: "Bearer bolt-s3cr3t", Secret: true}}}
+	if err := bs.UpsertMonitor(mon); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := bs.Monitor("mon-h")
+	if err != nil || !ok || got.Headers[0].Value != "Bearer bolt-s3cr3t" {
+		t.Fatalf("read back = %+v %v %v", got.Headers, ok, err)
+	}
+	all, err := bs.MonitorsForNode("n1")
+	if err != nil || len(all) != 1 || all[0].Headers[0].Value != "Bearer bolt-s3cr3t" {
+		t.Fatalf("for node = %+v %v", all, err)
+	}
+	bs.Close()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "bolt-s3cr3t") {
+		t.Fatal("the bolt file holds the secret in the clear")
+	}
+}

@@ -701,3 +701,173 @@ func TestMonitorTargetNodeGuardsEditAndDelete(t *testing.T) {
 		t.Fatal("the check is gone")
 	}
 }
+
+// Through the agent route: a node's token stores results only for checks
+// assigned to that node and only under its own id; a result that names
+// another node, or a check assigned elsewhere, is dropped with the reason.
+func TestAgentIngestRefusesOtherNodesAndUnassignedChecks(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, token := enrollNode(t, handler, cookies, csrf)
+	upsertNodes(t, st, model.Node{ID: "node-other", Name: "other"})
+	for _, mon := range []model.Monitor{
+		{ID: "mon-mine", Name: "mine", Type: model.MonitorTypeTCP, Target: "example.com:443", IntervalSec: 30, TimeoutSec: 5, NodeIDs: []string{nodeID}, Enabled: true},
+		{ID: "mon-theirs", Name: "theirs", Type: model.MonitorTypeTCP, Target: "example.com:443", IntervalSec: 30, TimeoutSec: 5, NodeIDs: []string{"node-other"}, Enabled: true},
+	} {
+		if err := st.UpsertMonitor(mon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := time.Now().UTC().Format(time.RFC3339Nano)
+	body := `{"node_id":"` + nodeID + `","results":[` +
+		`{"monitor_id":"mon-mine","node_id":"` + nodeID + `","at":"` + at + `","success":true,"latency_ms":5},` +
+		`{"monitor_id":"mon-mine","node_id":"node-other","at":"` + at + `","success":false},` +
+		`{"monitor_id":"mon-theirs","at":"` + at + `","success":false}]}`
+	rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-results", body, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ingest = %d %s", rec.Code, rec.Body.String())
+	}
+	var resp agentMonitorResultsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Accepted != 1 || len(resp.Dropped) != 2 || resp.Dropped[0].Reason != store.MonitorResultDropWrongNode || resp.Dropped[1].Reason != store.MonitorResultDropNotAssigned {
+		t.Fatalf("response = %+v", resp)
+	}
+	if rows, _ := st.MonitorPairResults("mon-mine", "node-other", 0); len(rows) != 0 {
+		t.Fatalf("a result was stored under another node: %+v", rows)
+	}
+	if rows, _ := st.MonitorPairResults("mon-theirs", nodeID, 0); len(rows) != 0 {
+		t.Fatalf("a result was stored for a check assigned elsewhere: %+v", rows)
+	}
+	// Another node's token cannot post as this node.
+	other := doAgentRaw(t, handler, http.MethodPost, "/api/agent/monitor-results", strings.Replace(body, `"node_id":"`+nodeID+`","results"`, `"node_id":"node-other","results"`, 1), token)
+	if other.Code != http.StatusUnauthorized {
+		t.Fatalf("a token posting for another node = %d", other.Code)
+	}
+}
+
+// An http check that uses a field older agents ignore (a status set other
+// than the default, request headers) goes only to agents that report their
+// methods; an older one would judge it by the old rule and send it without
+// its headers, so its path reads too old instead of down. A default http
+// check still reaches every agent.
+func TestCurrentFieldsGateOlderAgents(t *testing.T) {
+	srv, _, st := checksFleet(t)
+	for _, mon := range []model.Monitor{
+		{ID: "mon-plain", Name: "plain", Type: model.MonitorTypeHTTP, Target: "https://example.com/", ExpectStatus: "200-399", IntervalSec: 30, TimeoutSec: 5, AssignAll: true, Enabled: true},
+		{ID: "mon-401", Name: "expects 401", Type: model.MonitorTypeHTTP, Target: "https://example.com/", ExpectStatus: "401", IntervalSec: 30, TimeoutSec: 5, AssignAll: true, Enabled: true},
+		{ID: "mon-auth", Name: "auth", Type: model.MonitorTypeHTTP, Target: "https://example.com/", Headers: []model.MonitorHeader{{Name: "Authorization", Value: "Bearer old-agent-s3cr3t", Secret: true}}, SecretsOrigin: "https://example.com:443", IntervalSec: 30, TimeoutSec: 5, AssignAll: true, Enabled: true},
+	} {
+		if err := st.UpsertMonitor(mon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := monitorIDs(agentMonitorList(t, srv, st, "node-old")); !slices.Equal(got, []string{"mon-plain"}) {
+		t.Fatalf("an older agent is handed %v", got)
+	}
+	if got := monitorIDs(agentMonitorList(t, srv, st, "node-new")); !slices.Equal(got, []string{"mon-401", "mon-auth", "mon-plain"}) {
+		t.Fatalf("a current agent is handed %v", got)
+	}
+	m, err := srv.pathMatrixFor(principal{Principal: adminPrincipalForTest()}, model.PathWindowHour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"mon-401", "mon-auth"} {
+		if c := pathCellFor(t, m, "node-old", id); c.State != model.PathStateUnknown || c.Reason != model.PathReasonAgentTooOld {
+			t.Errorf("%s from an older agent = %+v", id, c)
+		}
+	}
+}
+
+// Numeric host forms some resolvers read as addresses, zones, and the
+// reserved and transition ranges of the shared rule are refused on save.
+func TestMonitorCreateRefusesNumericAndReservedHosts(t *testing.T) {
+	_, handler, _ := checksFleet(t)
+	cookies, csrf := loginSession(t, handler)
+	for _, body := range []string{
+		`{"name":"h","type":"http","target":"http://2130706433/","node_ids":["node-new"]}`,
+		`{"name":"h","type":"http","target":"http://127.1/","node_ids":["node-new"]}`,
+		`{"name":"h","type":"http","target":"http://0x7f.1/","node_ids":["node-new"]}`,
+		`{"name":"h","type":"http","target":"http://0xa9fea9fe/","node_ids":["node-new"]}`,
+		`{"name":"t","type":"tcp","target":"0:80","node_ids":["node-new"]}`,
+		`{"name":"t","type":"tcp","target":"10.0.0.1.:80","node_ids":["node-new"]}`,
+		`{"name":"t","type":"tcp","target":"[fe80::1%25eth0]:22","node_ids":["node-new"]}`,
+		`{"name":"t","type":"tcp","target":"127.0.0.1%eth0:22","node_ids":["node-new"]}`,
+		`{"name":"t","type":"tcp","target":"[64:ff9b::a00:1]:80","node_ids":["node-new"]}`,
+		`{"name":"t","type":"tcp","target":"[2002:7f00:1::]:80","node_ids":["node-new"]}`,
+		`{"name":"p","type":"icmp","target":"240.0.0.1","node_ids":["node-new"]}`,
+		`{"name":"p","type":"icmp","target":"198.18.0.1","node_ids":["node-new"]}`,
+	} {
+		res := doJSON(t, handler, http.MethodPost, "/api/monitors", body, cookies, csrf)
+		if raw := readBody(t, res); res.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s = %d %s", body, res.StatusCode, raw)
+		}
+	}
+	for _, body := range []string{
+		`{"name":"h","type":"http","target":"https://status.example.com/","node_ids":["node-new"]}`,
+		`{"name":"h","type":"http","target":"https://host-2.example/","node_ids":["node-new"]}`,
+		`{"name":"t","type":"tcp","target":"[2606:4700:4700::1111]:443","node_ids":["node-new"]}`,
+	} {
+		res := doJSON(t, handler, http.MethodPost, "/api/monitors", body, cookies, csrf)
+		if raw := readBody(t, res); res.StatusCode != http.StatusOK {
+			t.Errorf("%s = %d %s", body, res.StatusCode, raw)
+		}
+	}
+}
+
+// A check saved before the destination rules stays editable: an edit does
+// not judge the stored target again (the agent refuses it at dial time).
+// A headers-only edit does not report the status set as changed.
+func TestEditOfAnOlderPrivateCheck(t *testing.T) {
+	_, handler, st := checksFleet(t)
+	cookies, csrf := loginSession(t, handler)
+	if err := st.UpsertMonitor(model.Monitor{ID: "mon-lan", Name: "lan", Type: model.MonitorTypeHTTP, Target: "http://10.1.2.3/health", IntervalSec: 30, TimeoutSec: 5, NodeIDs: []string{"node-new"}, Enabled: true, Version: 1}); err != nil {
+		t.Fatal(err)
+	}
+	res := doJSON(t, handler, http.MethodPost, "/api/monitors/update", `{"id":"mon-lan","version":1,"headers":[{"name":"X-Trace","op":"set","value":"1"}],"expect_status":""}`, cookies, csrf)
+	if body := readBody(t, res); res.StatusCode != http.StatusOK {
+		t.Fatalf("edit of an older private check = %d %s", res.StatusCode, body)
+	}
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "monitor.update" && ev.Metadata["changed"] != "headers" {
+			t.Fatalf("changed = %q, want headers alone", ev.Metadata["changed"])
+		}
+	}
+	tcp := doJSON(t, handler, http.MethodPost, "/api/monitors", `{"name":"t","type":"tcp","target":"example.com:443","node_ids":["node-new"]}`, cookies, csrf)
+	var created model.Monitor
+	if err := json.Unmarshal([]byte(readBody(t, tcp)), &created); err != nil {
+		t.Fatal(err)
+	}
+	echo := doJSON(t, handler, http.MethodPost, "/api/monitors/update", `{"id":"`+created.ID+`","version":1,"expect_status":"","name":"t2"}`, cookies, csrf)
+	if body := readBody(t, echo); echo.StatusCode != http.StatusOK {
+		t.Fatalf("an echoed empty expect_status on tcp = %d %s", echo.StatusCode, body)
+	}
+}
+
+// An incident of a check that names a node is hidden from a caller who may
+// not read that node, as the check itself is.
+func TestIncidentOfANodeTargetCheckIsScopedByTheTarget(t *testing.T) {
+	srv, handler, st := checksFleet(t)
+	cookies, csrf := loginSession(t, handler)
+	res := doJSON(t, handler, http.MethodPost, "/api/monitors", `{"name":"to tgt","type":"tcp","target_node":"node-tgt","node_ids":["node-new"],"alert_after":1}`, cookies, csrf)
+	var created model.Monitor
+	if err := json.Unmarshal([]byte(readBody(t, res)), &created); err != nil || created.ID == "" {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := srv.ingestAgentMonitorResults("node-new", []model.MonitorResult{{MonitorID: created.ID, At: time.Now().UTC(), Error: "dial tcp 198.51.100.20:443: refused"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Incidents()) == 0 {
+		t.Fatal("no incident opened")
+	}
+	admin := doJSON(t, handler, http.MethodGet, "/api/incidents", "", cookies, "")
+	if body := readBody(t, admin); !strings.Contains(body, created.ID) {
+		t.Fatalf("the admin does not see the incident: %s", body)
+	}
+	token := createPAT(t, handler, cookies, csrf, []string{"monitor:read"}, []string{"node-new"})
+	confined := doBearerJSON(t, handler, http.MethodGet, "/api/incidents", "", token)
+	if body := readBody(t, confined); strings.Contains(body, created.ID) || strings.Contains(body, "198.51.100.20") {
+		t.Fatalf("a token that cannot read the target sees its incident: %s", body)
+	}
+}

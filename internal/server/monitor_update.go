@@ -88,6 +88,8 @@ func (s *Server) handleMonitorUpdate(w http.ResponseWriter, r *http.Request, p p
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
+	s.monitorSaves.Lock()
+	defer s.monitorSaves.Unlock()
 	mon, ok := s.store.Monitor(strings.TrimSpace(req.ID))
 	if !ok {
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "monitor not found"))
@@ -228,7 +230,10 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 			return model.Monitor{}, nil, false, err
 		}
 	}
-	if req.ExpectStatus != nil || len(req.Headers) > 0 {
+	// An empty expect_status echoed by an editor on another kind changes
+	// nothing.
+	expectSent := req.ExpectStatus != nil && (mon.Type == model.MonitorTypeHTTP || strings.TrimSpace(*req.ExpectStatus) != "")
+	if expectSent || len(req.Headers) > 0 {
 		if mon.Type != model.MonitorTypeHTTP {
 			return model.Monitor{}, nil, false, errors.New("expect_status and headers apply to http checks only")
 		}
@@ -242,10 +247,10 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 			}
 			next.Headers = headers
 		}
-		if err := normalizeHTTPMonitor(&next); err != nil {
+		if err := normalizeHTTPMonitor(&next, false); err != nil {
 			return model.Monitor{}, nil, false, err
 		}
-		note("expect_status", next.ExpectStatus != mon.ExpectStatus)
+		note("expect_status", next.ExpectStatus != canonicalMonitorExpectStatus(mon.ExpectStatus))
 		note("headers", !monitorHeadersEqual(next.Headers, mon.Headers))
 	}
 	if req.ThresholdDays != nil {

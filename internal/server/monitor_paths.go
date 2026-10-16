@@ -586,7 +586,7 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 				notProbeable: !resolvable,
 			}
 			if source != "" {
-				e.gate = latencyProbeGate(nodes[source], mon.Type)
+				e.gate = monitorProbeGate(nodes[source], mon)
 			}
 			out = append(out, e)
 		}
@@ -691,8 +691,11 @@ type monitorPathState struct {
 	windows map[string]*pathWindowFigures
 	plan    latencyPlan
 	planAt  time.Time
-	wake    chan struct{}
-	pruneMu sync.Mutex
+	// planBuild lets one caller at a time build a plan when the cached one
+	// has gone stale.
+	planBuild sync.Mutex
+	wake      chan struct{}
+	pruneMu   sync.Mutex
 	// settingsMu holds a settings save and the read of what it replaced
 	// together, so the audit and the sweep's wake-up see the value the
 	// save actually replaced.
@@ -727,6 +730,17 @@ func (s *Server) pathPlan(now time.Time) model.LatencyProbePlan {
 // operator checks that name a node resolve against.
 func (s *Server) pathPlanned(now time.Time) latencyPlan {
 	m := &s.monitorPaths
+	m.mu.Lock()
+	if !m.planAt.IsZero() && !now.Before(m.planAt) && now.Sub(m.planAt) < pathPlanFresh {
+		plan := m.plan
+		m.mu.Unlock()
+		return plan
+	}
+	m.mu.Unlock()
+	// One caller plans; the others wait for its plan rather than each
+	// planning the fleet again (agent pulls and matrix reads land at once).
+	m.planBuild.Lock()
+	defer m.planBuild.Unlock()
 	m.mu.Lock()
 	if !m.planAt.IsZero() && !now.Before(m.planAt) && now.Sub(m.planAt) < pathPlanFresh {
 		plan := m.plan

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"sort"
 	"strconv"
@@ -188,6 +189,11 @@ func latencyPublicIPv4(raw string) (string, bool) {
 	if v4 == nil || v4.IsLoopback() || v4.IsPrivate() || v4.IsLinkLocalUnicast() ||
 		v4.IsUnspecified() || v4.IsMulticast() || v4.Equal(net.IPv4bcast) || latencyCGNAT.Contains(v4) ||
 		latencyBenchmark.Contains(v4) {
+		return "", false
+	}
+	// The monitor destination rule too: a node target is exempt from the
+	// agent's own refusal, so this is the only judge of where it points.
+	if addr, ok := netip.AddrFromSlice(v4); !ok || model.MonitorDestinationRefused(addr) {
 		return "", false
 	}
 	return v4.String(), true
@@ -419,6 +425,37 @@ func latencyProbeGate(source model.Node, kind string) string {
 		return reason
 	}
 	return model.PathReasonAgentTooOld
+}
+
+// monitorProbeGate is latencyProbeGate for a whole check: beyond its kind,
+// a check that uses a field only M2a agents read (an http status set other
+// than the default, or request headers) needs an agent that reports its
+// methods. An older agent would judge such a check by the old rule and
+// send it without its headers, so it reads a check it cannot run as down.
+func monitorProbeGate(source model.Node, mon model.Monitor) string {
+	if reason := latencyProbeGate(source, mon.Type); reason != "" {
+		return reason
+	}
+	if len(source.ProbeMethods) == 0 && monitorNeedsCurrentAgent(mon) {
+		return model.PathReasonAgentTooOld
+	}
+	return ""
+}
+
+// monitorNeedsCurrentAgent reports whether a check uses a field agents
+// older than design 29 M2a ignore.
+func monitorNeedsCurrentAgent(mon model.Monitor) bool {
+	if mon.Type != model.MonitorTypeHTTP {
+		return false
+	}
+	if len(mon.Headers) > 0 {
+		return true
+	}
+	if mon.ExpectStatus == "" {
+		return false
+	}
+	set, err := model.ParseMonitorStatusSet(mon.ExpectStatus)
+	return err != nil || set.String() != model.MonitorExpectStatusDefault
 }
 
 // latencySourceMethod is the method setting in force for one source: its
@@ -1068,6 +1105,8 @@ func (s *Server) handleLatencyProbes(w http.ResponseWriter, r *http.Request, p p
 		if !decodeClientJSON(w, r, &req) {
 			return
 		}
+		s.monitorSaves.Lock()
+		defer s.monitorSaves.Unlock()
 		cfg, err := s.normalizeLatencyProbeConfig(req)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)

@@ -111,8 +111,9 @@ func (s *Server) handleAgentMonitorResult(w http.ResponseWriter, r *http.Request
 }
 
 // ingestAgentMonitorResults stores an agent's results for its own node and
-// runs the alert hold on each new row, in order. The node id inside each
-// result is ignored: an agent reports for the node its token belongs to.
+// runs the alert hold on each new row, in order. An agent reports for the
+// node its token belongs to: a result with no node id is taken as that
+// node's, and one that names another node is dropped as wrong_node.
 func (s *Server) ingestAgentMonitorResults(nodeID string, results []model.MonitorResult) (agentMonitorResultsResponse, error) {
 	receivedAt := s.now()
 	outcomes, err := s.store.IngestAgentMonitorResults(nodeID, results, receivedAt)

@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -375,6 +376,10 @@ type Server struct {
 	// monitorPaths holds the paths matrix cache and the history pruning
 	// sweep's guard; see monitor_paths.go and monitor_settings.go.
 	monitorPaths monitorPathState
+	// monitorSaves holds a check or path set save from the packet budget
+	// check to the write it guards, so two saves cannot both pass against
+	// the same stored set (monitor_checks.go). Taken before latencySync.
+	monitorSaves sync.Mutex
 	// latencySync serializes latency probe syncs, so the background sweep
 	// and a configuration save never plan against each other's half-written
 	// monitors; see latency_probes.go.
@@ -5393,6 +5398,8 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		if !decodeClientJSON(w, r, &req) {
 			return
 		}
+		s.monitorSaves.Lock()
+		defer s.monitorSaves.Unlock()
 		req.TargetNode = strings.TrimSpace(req.TargetNode)
 		if strings.TrimSpace(req.Name) == "" || (strings.TrimSpace(req.Target) == "" && req.TargetNode == "") {
 			writeError(w, http.StatusBadRequest, errors.New("name and target (or target_node) are required"))
@@ -5443,7 +5450,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			var err error
 			switch req.Type {
 			case model.MonitorTypeHTTP:
-				err = normalizeHTTPMonitor(&req)
+				err = normalizeHTTPMonitor(&req, true)
 			case model.MonitorTypeICMP:
 				err = targets.normalizeICMPMonitor(&req)
 			default:
@@ -5683,7 +5690,7 @@ func (s *Server) agentMonitorsFor(node model.Node, assigned []model.Monitor, now
 	out := make([]model.Monitor, 0, len(assigned))
 	var targets *monitorTargets
 	for _, mon := range assigned {
-		if !model.ProbeMethodSupported(node.ProbeMethods, mon.Type) {
+		if monitorProbeGate(node, mon) != "" {
 			continue
 		}
 		if mon.TargetNode != "" && mon.ManagedBy == "" {
@@ -9564,10 +9571,12 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	s.selfmon.observeBeat(req.NodeID, req.Metrics, s.now())
 	s.replaceAgentCapabilities(req.NodeID, req.Capabilities)
-	methods, refusals := normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals)
-	if err := s.store.SetNodeProbeFacts(req.NodeID, methods, refusals); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
+	// The facts are written only when they changed; a failed write is
+	// logged, never a failed beat, and the next beat tries again.
+	if methods, refusals := normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals); !slices.Equal(methods, old.ProbeMethods) || !maps.Equal(refusals, old.ProbeRefusals) {
+		if err := s.store.SetNodeProbeFacts(req.NodeID, methods, refusals); err != nil {
+			s.logger.Printf("agent probe facts for node %s not stored: %v", req.NodeID, err)
+		}
 	}
 	if old.PublicIP != v4 || old.PublicIPv6 != v6 {
 		s.invalidateLineReadModel()

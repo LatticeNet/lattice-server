@@ -318,7 +318,9 @@ func (s *Store) admitAgentMonitorResultLocked(nodeID string, r model.MonitorResu
 	}
 	r.At = r.At.UTC()
 	r.NodeID = nodeID
-	r.Error = truncateUTF8(SanitizeMonitorError(r.Error), monitorResultErrorMax)
+	// Bounded before the URL scan, so a long text costs nothing under the
+	// lock, and bounded again after it.
+	r.Error = truncateUTF8(SanitizeMonitorError(truncateUTF8(r.Error, 4*monitorResultErrorMax)), monitorResultErrorMax)
 	// Only a tls probe reads a certificate, and agents never run those.
 	r.CertNotAfter = time.Time{}
 	return MonitorResultRecord{MonitorResult: r, ReceivedAt: receivedAt}, ""

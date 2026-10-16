@@ -35,6 +35,81 @@ func TestPlansStaleWhenAssignedShareMoves(t *testing.T) {
 	}
 }
 
+// TestPlansStaleWhenShareIdentityChanges: a share that keeps its place on
+// the record but serves a different identity at the decision than at the
+// propose makes the plan stale, and nothing is applied. The share count is
+// unchanged in every case, and the decision previews render the identities
+// the plan names, so the identity comparison is the only check that sees
+// the move. Without it the operator would approve a diff computed for a
+// binding that no longer exists.
+func TestPlansStaleWhenShareIdentityChanges(t *testing.T) {
+	assertStale := func(t *testing.T, e *s2PlanEnv, reply subStorePlansProposeReply, applied int) {
+		t.Helper()
+		res := e.approve(reply)
+		if res.Code != http.StatusConflict || !strings.Contains(res.Body.String(), "live shares changed") {
+			t.Fatalf("approve after a share's identity changed: %d %s", res.Code, res.Body.String())
+		}
+		if got := e.appliedRequests(); len(got) != applied {
+			t.Fatalf("a stale plan was applied: %+v", got)
+		}
+		if a := e.approval(reply.ApprovalID); a.Status != model.ApprovalRejected || a.Reason != subStorePlanStaleShares {
+			t.Fatalf("approval = %s %q", a.Status, a.Reason)
+		}
+	}
+	t.Run("bound share cleared by a clear-only plan", func(t *testing.T) {
+		e := s2SubWithCollection(t)
+		reply, _ := e.propose(t, `{"subscription_id":"F","from_revision":"r1","to_revision":"r2"}`)
+		if !reply.Required {
+			t.Fatalf("propose = %+v", reply)
+		}
+		clearing, plan := e.propose(t, `{"subscription_id":"F","from_revision":"r1","to_revision":"r1","share_identities":{"sh-f":""}}`)
+		if plan.Mode != subStorePlanModeClear {
+			t.Fatalf("clearing plan mode = %q", plan.Mode)
+		}
+		if res := e.approve(clearing); res.Code != http.StatusOK {
+			t.Fatalf("approve the clearing: %d %s", res.Code, res.Body.String())
+		}
+		assertStale(t, e, reply, 0)
+		for _, id := range []string{"F", "C"} {
+			if snap, ok := e.snapshot(id); !ok || snap.Stale {
+				t.Fatalf("a stale plan touched the snapshot of %s: %+v present=%v", id, snap, ok)
+			}
+		}
+		if got, _ := e.shareIdentity(t, "sh-c"); got != s2Alice {
+			t.Fatalf("a stale plan changed the collection's share: %q", got)
+		}
+	})
+	t.Run("bound share moved to another identity", func(t *testing.T) {
+		e := s2SubWithCollection(t)
+		reply, _ := e.propose(t, `{"subscription_id":"F","from_revision":"r1","to_revision":"r2"}`)
+		e.share(t, "sh-f", "F", s2Carol)
+		assertStale(t, e, reply, 0)
+	})
+	t.Run("assigned share given an identity by another plan", func(t *testing.T) {
+		e := s2SubWithCollection(t)
+		e.share(t, "sh-free", "F", "")
+		reply, _ := e.propose(t, `{"subscription_id":"F","from_revision":"r1","to_revision":"r2","share_identities":{"sh-free":"`+s2Carol+`"}}`)
+		other, _ := e.propose(t, `{"subscription_id":"F","from_revision":"r1","to_revision":"r1","share_identities":{"sh-free":"`+s2Alice+`"}}`)
+		if res := e.approve(other); res.Code != http.StatusOK {
+			t.Fatalf("approve the other assignment: %d %s", res.Code, res.Body.String())
+		}
+		assertStale(t, e, reply, 0)
+		if got, _ := e.shareIdentity(t, "sh-free"); got != s2Alice {
+			t.Fatalf("a stale plan moved the share from one identity to another: %q", got)
+		}
+	})
+	t.Run("cleared share rebound before a clear-only decision", func(t *testing.T) {
+		e := newS2PlanEnv(t)
+		e.share(t, "sh-dark", "provider-rec", s2Alice)
+		reply, _ := e.propose(t, `{"subscription_id":"provider-rec","from_revision":"p1","to_revision":"p1","share_identities":{"sh-dark":""}}`)
+		e.share(t, "sh-dark", "provider-rec", s2Bob)
+		assertStale(t, e, reply, 0)
+		if got, _ := e.shareIdentity(t, "sh-dark"); got != s2Bob {
+			t.Fatalf("a stale clearing cleared an identity it never showed: %q", got)
+		}
+	})
+}
+
 // s2MigrateBoth proposes the migration of both legacy members of C with an
 // identity for every share.
 func s2MigrateBoth(t *testing.T, e *s2PlanEnv) subStorePlansProposeReply {

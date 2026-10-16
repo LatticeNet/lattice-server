@@ -251,3 +251,19 @@ func BenchmarkLineCatalogueThousandLinesForAnIdentity(b *testing.B) {
 		}
 	}
 }
+
+// Two different secret lists never share a memo key; a join on NUL did.
+func TestLineCatalogueSecretsKeyNeverJoinsTwoLists(t *testing.T) {
+	lists := [][]string{nil, {""}, {"", ""}, {"ab\x00cd"}, {"ab", "cd"}, {"a:b"}, {"a", "b"}, {"1:a"}, {"a"}, {"", "a"}, {"0:1:a"}, {"ab", "cd", ""}}
+	seen := map[string]int{}
+	for i, list := range lists {
+		key := lineCatalogueSecretsKey(list)
+		if j, dup := seen[key]; dup {
+			t.Fatalf("%q and %q share the memo key %q", lists[j], list, key)
+		}
+		seen[key] = i
+		if again := lineCatalogueSecretsKey(append([]string(nil), list...)); again != key {
+			t.Fatalf("%q keys as %q and %q", list, key, again)
+		}
+	}
+}

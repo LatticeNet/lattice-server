@@ -19,12 +19,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
 	"github.com/LatticeNet/lattice-server/internal/store"
-	"unicode/utf8"
 )
 
 // The line catalogue (design 28), served as method catalogue of
@@ -282,7 +282,7 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 	// build computes each set once.
 	var ownerSets sync.Map
 	ownerSecrets := func(secrets []string) lineCatalogueSecrets {
-		key := strings.Join(secrets, "\x00")
+		key := lineCatalogueSecretsKey(secrets)
 		if set, ok := ownerSets.Load(key); ok {
 			return set.(lineCatalogueSecrets)
 		}
@@ -492,6 +492,21 @@ func lineCatalogueIdentitySecrets(u VpnUser) []string {
 // slice check would withhold healthy rows, and a slice of a uuid or password
 // does not let a client connect.
 type lineCatalogueSecrets struct{ needles [][]byte }
+
+// lineCatalogueSecretsKey is the memo key of a secret list: each secret
+// prefixed by its length, so two different lists never share a key. A join
+// on a separator byte did not hold that: ["ab\x00cd"] and ["ab", "cd"]
+// joined the same, and the second line would have been checked against the
+// first line's needles.
+func lineCatalogueSecretsKey(secrets []string) string {
+	var b strings.Builder
+	for _, secret := range secrets {
+		b.WriteString(strconv.Itoa(len(secret)))
+		b.WriteByte(':')
+		b.WriteString(secret)
+	}
+	return b.String()
+}
 
 func newLineCatalogueSecrets(secrets []string) lineCatalogueSecrets {
 	var m lineCatalogueSecrets

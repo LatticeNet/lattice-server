@@ -660,10 +660,6 @@ func (s *Server) invalidateSharesForSource(pluginID, subscriptionID string) {
 	}
 }
 
-// renderShare asks the share's source for content. It never shows the source the
-// token and never lets it influence the response beyond the bytes and a content
-// type. coreUser is a core share's user as the handler resolved it
-// (coreShareUser), nil when it was not found; other sources ignore it.
 // pluginRenderReply is the part of a plugin's render reply core reads.
 type pluginRenderReply struct {
 	Content     string `json:"content"`
@@ -736,6 +732,10 @@ func decodeKnownMembers(raw []byte, targets map[string]any) bool {
 	return true
 }
 
+// renderShare asks the share's source for content. It never shows the source the
+// token and never lets it influence the response beyond the bytes and a content
+// type. coreUser is a core share's user as the handler resolved it
+// (coreShareUser), nil when it was not found; other sources ignore it.
 func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string, variant shareRenderVariant, coreUser *model.ProxyUser) (renderedSubscription, error) {
 	switch share.Source.Kind {
 	case model.ShareSourceCoreProxyUser:

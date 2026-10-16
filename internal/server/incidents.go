@@ -509,12 +509,23 @@ func (s *Server) evaluateIncidents(now time.Time) {
 				gone = append(gone, inc.ID)
 				continue
 			}
-			if !monitorPairAssigned(mon, inc.NodeID) {
+			switch {
+			case !monitorPairAssigned(mon, inc.NodeID):
 				inc.State = store.IncidentStateResolved
 				inc.ResolvedAt = now
 				inc.RecoveryTitle = fmt.Sprintf("Monitor no longer checks %s", inc.Subject)
 				inc.RecoveryDetail = fmt.Sprintf("%s is no longer assigned, so its down state is closed without a recovery result.", inc.Subject)
 				inc.RecoveryLine = inc.Subject + ": no longer checked"
+				resolveOwed(&inc)
+				dirty = true
+			case !monitorPages(mon):
+				// Its alert policy was turned off (or it became a generated
+				// check): no recovery page would ever follow.
+				inc.State = store.IncidentStateResolved
+				inc.ResolvedAt = now
+				inc.RecoveryTitle = fmt.Sprintf("Alerts off for %s", inc.Subject)
+				inc.RecoveryDetail = fmt.Sprintf("Alerts are off for %s, so its down state is closed without a recovery result.", inc.Subject)
+				inc.RecoveryLine = inc.Subject + ": alerts off"
 				resolveOwed(&inc)
 				dirty = true
 			}
@@ -1020,7 +1031,8 @@ func (s *Server) adoptLegacyAlerts(now time.Time) {
 				continue
 			}
 			for _, pair := range pairs {
-				if pair.Success || pair.FailStreak < 2 || !monitorPairAssigned(mon, pair.NodeID) {
+				// A pair that could not have paged was never paged for.
+				if pair.Success || pair.FailStreak < 2 || !monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)

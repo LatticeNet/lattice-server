@@ -294,7 +294,10 @@ func (s *Server) pendingIncidents(now time.Time) []store.Incident {
 				continue
 			}
 			for _, pair := range pairs {
-				if pair.Success || pair.FailStreak != 1 || !monitorPairAssigned(mon, pair.NodeID) {
+				// Only a pair whose second failure would page is pending:
+				// generated latency checks and checks whose alert policy
+				// is off never open an incident.
+				if pair.Success || pair.FailStreak != 1 || !monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -83,7 +84,7 @@ func TestPruneMonitorHistoryAtEachTierBoundary(t *testing.T) {
 			recordAt(t, s, active.MonitorID, active.NodeID, base.Add(-2*time.Minute), true, 10)
 			recordAt(t, s, active.MonitorID, active.NodeID, base.Add(-time.Minute), true, 11)
 
-			report, err := s.runtimeBoltHot.PruneMonitorHistory(base, limits, batch)
+			report, err := s.runtimeBoltHot.PruneMonitorHistory(context.Background(), base, limits, batch)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -116,7 +117,7 @@ func TestPruneMonitorHistoryAtEachTierBoundary(t *testing.T) {
 			if got := bucketStarts(t, s, active, MonitorRollupFine); len(got) != 1 {
 				t.Fatalf("active pair lost buckets: %v", got)
 			}
-			again, err := s.PruneMonitorHistory(base)
+			again, err := s.PruneMonitorHistory(context.Background(), base)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -144,7 +145,7 @@ func TestPruneMonitorHistoryFollowsALoweredRetention(t *testing.T) {
 	if _, err := s.SetMonitorSettings(model.MonitorSettings{FineRetentionDays: 3}, 0, "admin", base); err != nil {
 		t.Fatal(err)
 	}
-	report, err := s.PruneMonitorHistory(base)
+	report, err := s.PruneMonitorHistory(context.Background(), base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +291,7 @@ func TestMonitorHistoryFromBeforeTheNewTiersSurvives(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := s.PruneMonitorHistory(now)
+	report, err := s.PruneMonitorHistory(context.Background(), now)
 	if err != nil || report != (MonitorPruneReport{}) {
 		t.Fatalf("the new tiers pruned old history: %+v %v", report, err)
 	}
@@ -459,7 +460,7 @@ func TestMonitorHistoryReadsRunBesideIngest(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 10; i++ {
-			if _, err := s.PruneMonitorHistory(now); err != nil {
+			if _, err := s.PruneMonitorHistory(context.Background(), now); err != nil {
 				errs <- err
 				return
 			}

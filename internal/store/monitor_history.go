@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -195,13 +196,22 @@ func (bs *BoltStateStore) MonitorRowSummaries(pairs []MonitorPair, prevFrom, fro
 			}
 			recs = recs[:0]
 			for k, v := c.Seek(first); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
-				if bytes.Compare(instantOfRowKey(k), toInstant) >= 0 {
+				instant := instantOfRowKey(k)
+				if bytes.Compare(instant, toInstant) >= 0 {
 					break
 				}
-				rec, err := decodeMonitorResultRow(k, v)
+				// The pair is known, so only the instant is read off the
+				// key; a summary needs the outcome and the latency.
+				at, err := time.Parse(monitorResultLayout, string(instant))
 				if err != nil {
-					return err
+					return fmt.Errorf("decode %s key instant %q: %w", boltBucketMonResultRows, instant, err)
 				}
+				var row monitorResultRow
+				if err := json.Unmarshal(v, &row); err != nil {
+					return fmt.Errorf("decode %s value: %w", boltBucketMonResultRows, err)
+				}
+				rec := MonitorResultRecord{}
+				rec.At, rec.Success, rec.LatencyMs = at, row.Success, row.LatencyMs
 				recs = append(recs, rec)
 			}
 			if sum, ok := summarizeMonitorRows(recs, prevFrom, from, to); ok {
@@ -234,8 +244,9 @@ const monitorPruneBatch = 2000
 // arrive; this reaches the pairs that stopped (a paused source, a source
 // taken off a check, a paused generated check, a disabled check) and a
 // retention the operator lowered. It runs without the store lock, in write
-// transactions of at most monitorPruneBatch deletes.
-func (s *Store) PruneMonitorHistory(now time.Time) (MonitorPruneReport, error) {
+// transactions of at most monitorPruneBatch deletes, and stops between
+// them once ctx is done.
+func (s *Store) PruneMonitorHistory(ctx context.Context, now time.Time) (MonitorPruneReport, error) {
 	s.mu.Lock()
 	limits := monitorHistoryLimitsOf(s.state.MonitorSettings)
 	hot := s.runtimeBoltHot
@@ -244,7 +255,7 @@ func (s *Store) PruneMonitorHistory(now time.Time) (MonitorPruneReport, error) {
 		return s.pruneJSONMonitorRowsLocked(now.Add(-limits.rawKeep()))
 	}
 	s.mu.Unlock()
-	return hot.PruneMonitorHistory(now, limits, monitorPruneBatch)
+	return hot.PruneMonitorHistory(ctx, now, limits, monitorPruneBatch)
 }
 
 // pruneJSONMonitorRowsLocked is the sweep without the hot store, which keeps
@@ -284,7 +295,7 @@ func (s *Store) pruneJSONMonitorRowsLocked(cutoff time.Time) (MonitorPruneReport
 // transaction for the pairs whose oldest key is behind the line, so a sweep
 // that finds nothing writes nothing; those pairs are then trimmed in bounded
 // write transactions that check every key again.
-func (bs *BoltStateStore) PruneMonitorHistory(now time.Time, limits MonitorHistoryLimits, batch int) (MonitorPruneReport, error) {
+func (bs *BoltStateStore) PruneMonitorHistory(ctx context.Context, now time.Time, limits MonitorHistoryLimits, batch int) (MonitorPruneReport, error) {
 	if batch <= 0 {
 		batch = monitorPruneBatch
 	}
@@ -306,6 +317,9 @@ func (bs *BoltStateStore) PruneMonitorHistory(now time.Time, limits MonitorHisto
 			return report, err
 		}
 		for len(stale) > 0 {
+			if err := ctx.Err(); err != nil {
+				return report, err
+			}
 			var deleted int
 			err := bs.db.Update(func(tx *bolt.Tx) error {
 				if err := checkBoltVersion(tx); err != nil {
@@ -478,7 +492,9 @@ func (bs *BoltStateStore) MonitorStorageUsage() (MonitorStorageUsage, error) {
 				continue
 			}
 			st := b.Stats()
-			*part.bytes = int64(st.BranchAlloc + st.LeafAlloc)
+			// A small bucket lives inline in its parent's page and owns
+			// no pages of its own; what it uses there is its size.
+			*part.bytes = int64(st.BranchAlloc + st.LeafAlloc + st.InlineBucketInuse)
 			*part.keys = st.KeyN
 		}
 		return nil

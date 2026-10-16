@@ -280,21 +280,30 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 	// newLineCatalogueSecrets is a pure function of the secrets it is given,
 	// and lines of one node often share their owner's credential, so one
 	// build computes each set once.
-	ownerSets := map[string]lineCatalogueSecrets{}
+	var ownerSets sync.Map
 	ownerSecrets := func(secrets []string) lineCatalogueSecrets {
 		key := strings.Join(secrets, "\x00")
-		set, ok := ownerSets[key]
-		if !ok {
-			set = newLineCatalogueSecrets(secrets)
-			ownerSets[key] = set
+		if set, ok := ownerSets.Load(key); ok {
+			return set.(lineCatalogueSecrets)
 		}
+		set := newLineCatalogueSecrets(secrets)
+		ownerSets.Store(key, set)
 		return set
 	}
-	c := &lineCatalogue{identityID: identityID, at: now, index: make(map[string]int, len(lines)),
-		rows: make([]model.LineCatalogueRow, 0, len(lines)), encoded: make([][]byte, 0, len(lines)),
-		lines: make([]Line, 0, len(lines)), templates: make([]*store.LineClientTemplate, 0, len(lines))}
-	var withheld []string
-	for _, ln := range lines {
+	// Each line's row depends on nothing but the line and the inputs read
+	// above, so rows are built in parallel and gathered in catalogue order;
+	// the catalogue and its withheld list are what building them one by one
+	// gives.
+	type builtRow struct {
+		row          model.LineCatalogueRow
+		raw          []byte
+		keptTemplate bool
+		bind         *store.LineClientTemplate
+		err          error
+	}
+	built := make([]builtRow, len(lines))
+	substoreBindEach(len(lines), func(i int) {
+		ln := lines[i]
 		node := nodes[ln.NodeID]
 		row := model.LineCatalogueRow{
 			LineUUID: ln.LineUUID, LineHashID: ln.LineHashID, NodeID: ln.NodeID,
@@ -354,16 +363,25 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 			row.Usage = &model.LineCatalogueUsage{IdentityID: identity.ID, UsedBytes: usage[ln.LineHashID], From: usageFrom, To: usageTo}
 		}
 		raw, keptTemplate, err := finishLineCatalogueRow(&row, identitySecrets)
-		if err != nil {
-			withheld = append(withheld, ln.LineUUID+": "+err.Error())
+		built[i] = builtRow{row: row, raw: raw, keptTemplate: keptTemplate, bind: bind, err: err}
+	})
+	c := &lineCatalogue{identityID: identityID, at: now, index: make(map[string]int, len(lines)),
+		rows: make([]model.LineCatalogueRow, 0, len(lines)), encoded: make([][]byte, 0, len(lines)),
+		lines: make([]Line, 0, len(lines)), templates: make([]*store.LineClientTemplate, 0, len(lines))}
+	var withheld []string
+	for i, ln := range lines {
+		b := built[i]
+		if b.err != nil {
+			withheld = append(withheld, ln.LineUUID+": "+b.err.Error())
 			continue
 		}
-		if !keptTemplate {
+		bind := b.bind
+		if !b.keptTemplate {
 			bind = nil
 		}
 		c.index[ln.LineUUID] = len(c.rows)
-		c.rows = append(c.rows, row)
-		c.encoded = append(c.encoded, raw)
+		c.rows = append(c.rows, b.row)
+		c.encoded = append(c.encoded, b.raw)
 		c.lines = append(c.lines, ln)
 		c.templates = append(c.templates, bind)
 	}

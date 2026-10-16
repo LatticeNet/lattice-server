@@ -727,7 +727,7 @@ func (s *Server) convertIdentityLinkOnce(ctx context.Context, key subscriptionCa
 	if target == "" {
 		target = variant.Target
 	}
-	served := newShareBody(rendered.Body, true, gzip.BestCompression)
+	served := newShareBody(rendered.Body, true, shareCacheGzipLevel)
 	entry := subscriptionCacheEntry{body: rendered.Body, contentType: rendered.ContentType, revalidationVersion: version,
 		wireType: subscriptionResponseContentType("", target), bodyHash: served.hash, gzipBody: served.gzipBody}
 	s.identityLinkCache.putEntry(key, entry, s.now())

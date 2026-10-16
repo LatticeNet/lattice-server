@@ -34,6 +34,14 @@ type shareBody struct {
 // compresses it. A body that will be cached is compressed once, as hard as
 // gzip goes; one rendered for a single response is compressed only for a
 // client that accepts gzip, at the default level.
+// shareCacheGzipLevel is the level a cached share body is compressed at,
+// once, when it is rendered. It was gzip.BestCompression; on a 1000-line
+// sing-box body (586 KB) that took 18 ms against 1.2 ms at the default
+// level for 7.2 KB against 8.1 KB, and the miss that renders the body waits
+// for it. A bound body is served to one identity's clients between misses,
+// so the bytes saved never repaid the time.
+const shareCacheGzipLevel = gzip.DefaultCompression
+
 func newShareBody(body []byte, compress bool, level int) shareBody {
 	out := shareBody{body: body, hash: sha256.Sum256(body)}
 	if compress && len(body) >= shareGzipMinBytes {

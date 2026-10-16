@@ -174,6 +174,18 @@ type monitorView struct {
 	// every other monitor type.
 	ThresholdDays int  `json:"threshold_days,omitempty"`
 	Enabled       bool `json:"enabled"`
+	// TargetNode names the node the target is resolved from; Target is
+	// then the resolution in force now (design 29 M2a).
+	TargetNode string `json:"target_node,omitempty"`
+	// Packets are an icmp check's echoes per run.
+	Packets int `json:"packets,omitempty"`
+	// ExpectStatus is an http check's passing status set.
+	ExpectStatus string `json:"expect_status,omitempty"`
+	// Headers are an http check's request headers. A secret one carries
+	// its name, secret and set, never its value.
+	Headers []model.MonitorHeader `json:"headers,omitempty"`
+	// SecretsOrigin is the origin the secret headers are bound to.
+	SecretsOrigin string `json:"secrets_origin,omitempty"`
 	// ManagedBy names the configuration that generates the monitor
 	// ("latency"); empty for a monitor an operator made. The console hides
 	// generated monitors from the operator's list and its failing count.
@@ -212,14 +224,29 @@ type monitorLatestView struct {
 	ReceivedAt   time.Time `json:"received_at,omitzero"`
 	FailStreak   int       `json:"fail_streak"`
 	Since        time.Time `json:"since"`
+	// Sent, Lost and RTTsMs are a multi-packet run's echoes (icmp).
+	Sent   int       `json:"sent,omitempty"`
+	Lost   int       `json:"lost,omitempty"`
+	RTTsMs []float64 `json:"rtts_ms,omitempty"`
+	// Reason is set when the newest run measured nothing (icmp not
+	// permitted, a refused destination, an agent too old for the kind):
+	// the pair reads unknown, and the fields above are its last real
+	// outcome, or the unknown run itself when it never had one.
+	Reason   string    `json:"reason,omitempty"`
+	ReasonAt time.Time `json:"reason_at,omitzero"`
 }
 
 func toMonitorLatestView(l store.MonitorLatest) monitorLatestView {
-	return monitorLatestView{
+	v := monitorLatestView{
 		NodeID: l.NodeID, At: l.At, Success: l.Success, LatencyMs: l.LatencyMs,
 		Error: l.Error, CertNotAfter: l.CertNotAfter, ReceivedAt: l.ReceivedAt,
 		FailStreak: l.FailStreak, Since: l.Since,
+		Sent: l.Sent, Lost: l.Lost, RTTsMs: l.RTTsMs,
 	}
+	if l.Unknown != nil {
+		v.Reason, v.ReasonAt = l.Unknown.Reason, l.Unknown.At
+	}
+	return v
 }
 
 // monitorAlertOf is the policy a monitor follows: generated checks never
@@ -238,6 +265,8 @@ func toMonitorViews(in []model.Monitor) []monitorView {
 			ID: m.ID, Name: m.Name, Type: m.Type, Target: m.Target,
 			IntervalSec: m.IntervalSec, TimeoutSec: m.TimeoutSec, AssignAll: m.AssignAll,
 			NodeIDs: m.NodeIDs, ThresholdDays: m.ThresholdDays,
+			TargetNode: m.TargetNode, Packets: m.Packets, ExpectStatus: m.ExpectStatus,
+			Headers: redactMonitorHeaders(m.Headers), SecretsOrigin: m.SecretsOrigin,
 			Enabled: m.Enabled, ManagedBy: m.ManagedBy, PausedNodeIDs: m.PausedNodeIDs,
 			Alert: monitorAlertOf(m), AlertAfter: store.MonitorAlertAfter(m), Version: m.Version,
 			CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1856,6 +1857,26 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 		return cameOnline, err
 	}
 	return cameOnline, nil
+}
+
+// SetNodeProbeFacts stores the probe methods and refusals a node's agent
+// reported (design 29 M2a), writing only when they changed: an agent sends
+// them on every beat, and they change when the agent is upgraded or the
+// host's ICMP permission does. nil methods is an agent that reports none.
+func (s *Store) SetNodeProbeFacts(nodeID string, methods []string, refusals map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return fmt.Errorf("node %q not found", nodeID)
+	}
+	if slices.Equal(n.ProbeMethods, methods) && maps.Equal(n.ProbeRefusals, refusals) {
+		return nil
+	}
+	n.ProbeMethods = slices.Clone(methods)
+	n.ProbeRefusals = maps.Clone(refusals)
+	s.state.Nodes[nodeID] = n
+	return s.Save()
 }
 
 func hostFactsDurableChanged(prev, next model.HostFacts) bool {

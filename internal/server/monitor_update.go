@@ -88,6 +88,8 @@ func (s *Server) handleMonitorUpdate(w http.ResponseWriter, r *http.Request, p p
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
+	s.monitorSaves.Lock()
+	defer s.monitorSaves.Unlock()
 	mon, ok := s.store.Monitor(strings.TrimSpace(req.ID))
 	if !ok {
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "monitor not found"))
@@ -138,6 +140,10 @@ func (s *Server) handleMonitorUpdate(w http.ResponseWriter, r *http.Request, p p
 	if slices.Contains(changed, "paused_node_ids") {
 		meta["paused_node_ids"] = latencyIDList(stored.PausedNodeIDs)
 	}
+	if slices.Contains(changed, "headers") {
+		// Names and secrecy only: a value never reaches an audit record.
+		meta["headers"] = monitorHeaderNames(stored.Headers)
+	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		At:       now.UTC(),
@@ -151,7 +157,7 @@ func (s *Server) handleMonitorUpdate(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	view := toMonitorViews([]model.Monitor{stored})[0]
+	view := s.monitorViews([]model.Monitor{stored}, now)[0]
 	view.Latest = monitorLatestViews(p, stored, latest[stored.ID])
 	writeJSON(w, http.StatusOK, view)
 }
@@ -163,6 +169,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	next = mon
 	next.NodeIDs = slices.Clone(mon.NodeIDs)
 	next.PausedNodeIDs = slices.Clone(mon.PausedNodeIDs)
+	next.Headers = slices.Clone(mon.Headers)
 	note := func(field string, differs bool) {
 		if differs {
 			changed = append(changed, field)
@@ -172,7 +179,13 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	if req.Type != nil && strings.TrimSpace(*req.Type) != mon.Type {
 		return model.Monitor{}, nil, false, errMonitorMethodChange("method")
 	}
-	if req.Target != nil {
+	if req.TargetNode != nil && strings.TrimSpace(*req.TargetNode) != mon.TargetNode {
+		return model.Monitor{}, nil, false, errMonitorMethodChange("target_node")
+	}
+	// A check that names a node has the target the control plane resolves,
+	// which may have moved since the editor read it; target_node is what
+	// cannot change.
+	if req.Target != nil && mon.TargetNode == "" {
 		target := strings.TrimSpace(*req.Target)
 		if tls {
 			if host, port, err := splitTLSTarget(target); err == nil {
@@ -199,10 +212,46 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 		note("timeout_sec", *req.TimeoutSec != mon.TimeoutSec)
 		next.TimeoutSec = *req.TimeoutSec
 	}
-	if req.IntervalSec != nil || req.TimeoutSec != nil {
+	if req.Packets != nil {
+		if mon.Type != model.MonitorTypeICMP {
+			return model.Monitor{}, nil, false, errors.New("packets applies to icmp checks only")
+		}
+		if *req.Packets < 1 || *req.Packets > model.MonitorPacketsMax {
+			return model.Monitor{}, nil, false, fmt.Errorf("packets must be 1 to %d", model.MonitorPacketsMax)
+		}
+		note("packets", *req.Packets != model.MonitorPackets(mon))
+		next.Packets = *req.Packets
+	}
+	if req.IntervalSec != nil || req.TimeoutSec != nil || req.Packets != nil {
 		if err := validMonitorTiming(next.IntervalSec, next.TimeoutSec); err != nil {
 			return model.Monitor{}, nil, false, err
 		}
+		if err := validMonitorRun(next); err != nil {
+			return model.Monitor{}, nil, false, err
+		}
+	}
+	// An empty expect_status echoed by an editor on another kind changes
+	// nothing.
+	expectSent := req.ExpectStatus != nil && (mon.Type == model.MonitorTypeHTTP || strings.TrimSpace(*req.ExpectStatus) != "")
+	if expectSent || len(req.Headers) > 0 {
+		if mon.Type != model.MonitorTypeHTTP {
+			return model.Monitor{}, nil, false, errors.New("expect_status and headers apply to http checks only")
+		}
+		if req.ExpectStatus != nil {
+			next.ExpectStatus = *req.ExpectStatus
+		}
+		if len(req.Headers) > 0 {
+			headers, err := applyMonitorHeaderEdits(mon.Headers, req.Headers)
+			if err != nil {
+				return model.Monitor{}, nil, false, err
+			}
+			next.Headers = headers
+		}
+		if err := normalizeHTTPMonitor(&next, false); err != nil {
+			return model.Monitor{}, nil, false, err
+		}
+		note("expect_status", next.ExpectStatus != canonicalMonitorExpectStatus(mon.ExpectStatus))
+		note("headers", !monitorHeadersEqual(next.Headers, mon.Headers))
 	}
 	if req.ThresholdDays != nil {
 		if !tls {
@@ -317,6 +366,18 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	}
 	if len(next.PausedNodeIDs) == 0 {
 		next.PausedNodeIDs = nil
+	}
+	loadChanged := slices.ContainsFunc(changed, func(field string) bool {
+		switch field {
+		case "interval_sec", "packets", "node_ids", "assign_all", "paused_node_ids", "enabled":
+			return true
+		}
+		return false
+	})
+	if model.MonitorKindSendsPackets(next.Type) && next.Enabled && loadChanged {
+		if err := s.monitorTargetsAt(s.now()).checkPacketBudget(s.store.Monitors(), next); err != nil {
+			return model.Monitor{}, nil, false, err
+		}
 	}
 	return next, changed, false, nil
 }

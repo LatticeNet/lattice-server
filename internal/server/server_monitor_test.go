@@ -105,17 +105,6 @@ func TestMonitorAdminOnlyPATCanWriteButNotRead(t *testing.T) {
 	}
 }
 
-func TestMonitorRejectsICMP(t *testing.T) {
-	handler, _ := newTestServer(t)
-	cookies, csrf := loginSession(t, handler)
-	res := doJSON(t, handler, http.MethodPost, "/api/monitors",
-		`{"name":"p","type":"icmp","target":"1.1.1.1","assign_all":true}`, cookies, csrf)
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusBadRequest {
-		t.Fatalf("icmp should be rejected for now, got %d", res.StatusCode)
-	}
-}
-
 // storedMonitorResults is every stored result of a monitor, oldest first.
 func storedMonitorResults(t *testing.T, st *store.Store, monitorID string) []store.MonitorResultRecord {
 	t.Helper()

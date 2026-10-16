@@ -1851,6 +1851,12 @@ func (bs *BoltStateStore) UpsertMonitor(m model.Monitor) error {
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = m.UpdatedAt
 	}
+	// Secret header values are encrypted here as the full-state save
+	// encrypts them, so no path writes one in the clear.
+	m, err := encryptMonitorRecord(m.ID, m, bs.cipher)
+	if err != nil {
+		return err
+	}
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
 			return err
@@ -1870,6 +1876,9 @@ func (bs *BoltStateStore) Monitor(id string) (model.Monitor, bool, error) {
 		ok, err = getRecord(tx, boltBucketMonitors, id, &out)
 		return err
 	})
+	if err == nil && ok {
+		out, err = decryptMonitorRecord(id, out, bs.cipher)
+	}
 	return out, ok, err
 }
 
@@ -1885,6 +1894,11 @@ func (bs *BoltStateStore) Monitors() ([]model.Monitor, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	for i, m := range monitors {
+		if monitors[i], err = decryptMonitorRecord(m.ID, m, bs.cipher); err != nil {
+			return nil, err
+		}
 	}
 	sort.Slice(monitors, func(i, j int) bool { return monitors[i].CreatedAt.Before(monitors[j].CreatedAt) })
 	return monitors, nil
@@ -1912,6 +1926,11 @@ func (bs *BoltStateStore) MonitorsForNode(nodeID string) ([]model.Monitor, error
 	})
 	if err != nil {
 		return nil, err
+	}
+	for i, m := range monitors {
+		if monitors[i], err = decryptMonitorRecord(m.ID, m, bs.cipher); err != nil {
+			return nil, err
+		}
 	}
 	sort.Slice(monitors, func(i, j int) bool { return monitors[i].ID < monitors[j].ID })
 	return monitors, nil

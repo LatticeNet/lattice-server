@@ -63,6 +63,9 @@ const (
 	MonitorResultDropNotAssigned     = "not_assigned"
 	MonitorResultDropOutOfWindow     = "out_of_window"
 	MonitorResultDropInvalid         = "invalid"
+	// MonitorResultDropWrongNode: the result names a node other than the
+	// one whose token sent it. An agent reports only for its own node.
+	MonitorResultDropWrongNode = "wrong_node"
 )
 
 // MonitorResultRecord is one stored result: the probe outcome as reported,
@@ -91,6 +94,14 @@ type MonitorLatest struct {
 	// keeps them; a pair recorded before jitter existed starts without.
 	LastOKAt time.Time `json:"last_ok_at,omitzero"`
 	LastOKMs float64   `json:"last_ok_ms,omitzero"`
+	// Unknown is the newest result that carried a reason (a run that
+	// measured nothing: icmp not permitted, a refused destination, an
+	// agent too old for the kind) when it arrived after the record above;
+	// nil once a real outcome follows it. The record above stays the
+	// newest real outcome, so the streak and the alert hold never count an
+	// unknown run. A pair that has only ever had unknown runs holds the
+	// newest of them in both places, with a streak of zero.
+	Unknown *MonitorResultRecord `json:"unknown,omitempty"`
 }
 
 // MonitorResultOutcome is what the store did with one result.
@@ -104,6 +115,10 @@ type MonitorResultOutcome struct {
 	PriorFailStreak int
 	// Result is the result as admitted: node id set, stamp normalized.
 	Result MonitorResultRecord
+	// NeverSucceeded is true when the pair has not had one success, this
+	// result included. An icmp path that has never had an echo back reads
+	// unknown (filtered) on failure, and does not page.
+	NeverSucceeded bool
 }
 
 // Stored reports whether the result became a new row.
@@ -154,6 +169,28 @@ func validMonitorPair(monitorID, nodeID string) error {
 // streak follow arrival order, which is the order the alert hold has always
 // judged in.
 func advanceMonitorLatest(prior MonitorLatest, hadPrior bool, rec MonitorResultRecord) MonitorLatest {
+	if !countable(rec) {
+		unknown := rec
+		if !hadPrior || !countable(prior.MonitorResultRecord) {
+			// Nothing real yet: the newest unknown run stands in for the
+			// outcome, with no streak, so nothing pages on it.
+			return MonitorLatest{MonitorResultRecord: rec, Since: rec.At, Held: prior.Held + 1, Unknown: &unknown}
+		}
+		next := prior
+		next.Held = prior.Held + 1
+		next.Unknown = &unknown
+		return next
+	}
+	if hadPrior && !countable(prior.MonitorResultRecord) {
+		// The first real outcome after unknown runs only starts the run.
+		next := MonitorLatest{MonitorResultRecord: rec, Since: rec.At, Held: prior.Held + 1}
+		if rec.Success {
+			next.LastOKAt, next.LastOKMs = rec.At, rec.LatencyMs
+		} else {
+			next.FailStreak = 1
+		}
+		return next
+	}
 	next := MonitorLatest{MonitorResultRecord: rec, Since: rec.At, Held: 1}
 	if hadPrior {
 		next.Held = prior.Held + 1
@@ -180,13 +217,25 @@ func advanceMonitorLatest(prior MonitorLatest, hadPrior bool, rec MonitorResultR
 // series (arrival order). Without the hot store nothing else holds it.
 func latestFromSeries(series []MonitorResultRecord, nodeID string) (MonitorLatest, bool) {
 	var out MonitorLatest
-	found, runOpen := false, true
+	var unknown *MonitorResultRecord
+	found, runOpen, okSeen := false, true, false
 	for i := len(series) - 1; i >= 0; i-- {
 		r := series[i]
 		if r.NodeID != nodeID {
 			continue
 		}
 		out.Held++
+		if !countable(r) {
+			if !found && unknown == nil {
+				u := r
+				unknown = &u
+			}
+			continue
+		}
+		if r.Success && !okSeen {
+			okSeen = true
+			out.LastOKAt, out.LastOKMs = r.At, r.LatencyMs
+		}
 		if !found {
 			out.MonitorResultRecord, out.Since, found = r, r.At, true
 			if !r.Success {
@@ -202,6 +251,12 @@ func latestFromSeries(series []MonitorResultRecord, nodeID string) (MonitorLates
 			continue
 		}
 		runOpen = false
+	}
+	if unknown != nil {
+		out.Unknown = unknown
+		if !found {
+			out.MonitorResultRecord, out.Since, found = *unknown, unknown.At, true
+		}
 	}
 	return out, found
 }
@@ -247,7 +302,14 @@ func (s *Store) admitAgentMonitorResultLocked(nodeID string, r model.MonitorResu
 		// refused the way an unassigned one is, which agents already drop.
 		return MonitorResultRecord{}, MonitorResultDropNotAssigned
 	}
+	if r.NodeID != "" && r.NodeID != nodeID {
+		return MonitorResultRecord{}, MonitorResultDropWrongNode
+	}
 	if nodeID == "" || validMonitorPair(r.MonitorID, nodeID) != nil || r.At.IsZero() {
+		return MonitorResultRecord{}, MonitorResultDropInvalid
+	}
+	r, ok = normalizeMonitorResultBody(mon.Type, r)
+	if !ok {
 		return MonitorResultRecord{}, MonitorResultDropInvalid
 	}
 	receivedAt = receivedAt.UTC()
@@ -256,7 +318,9 @@ func (s *Store) admitAgentMonitorResultLocked(nodeID string, r model.MonitorResu
 	}
 	r.At = r.At.UTC()
 	r.NodeID = nodeID
-	r.Error = truncateUTF8(r.Error, monitorResultErrorMax)
+	// Bounded before the URL scan, so a long text costs nothing under the
+	// lock, and bounded again after it.
+	r.Error = truncateUTF8(SanitizeMonitorError(truncateUTF8(r.Error, 4*monitorResultErrorMax)), monitorResultErrorMax)
 	// Only a tls probe reads a certificate, and agents never run those.
 	r.CertNotAfter = time.Time{}
 	return MonitorResultRecord{MonitorResult: r, ReceivedAt: receivedAt}, ""
@@ -367,7 +431,7 @@ func (s *Store) recordMonitorResultsJSONLocked(records []MonitorResultRecord) ([
 	for i, rec := range records {
 		series := s.state.MonResults[rec.MonitorID]
 		prior, hadPrior := latestFromSeries(series, rec.NodeID)
-		outcomes[i] = MonitorResultOutcome{Result: rec, PriorFailStreak: prior.FailStreak}
+		outcomes[i] = MonitorResultOutcome{Result: rec, PriorFailStreak: prior.FailStreak, NeverSucceeded: prior.LastOKAt.IsZero() && !rec.Success}
 		if monitorSeriesHolds(series, rec.NodeID, rec.At) {
 			outcomes[i].Duplicate = true
 			continue

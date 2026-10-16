@@ -66,6 +66,12 @@ export interface PlansProposeReply {
   status?: string;
 }
 
+export interface PlanChain {
+  before?: string;
+  after?: string;
+  changes?: string[];
+}
+
 export interface PlanTotals {
   shares: number;
   unbound_shares: number;
@@ -143,6 +149,7 @@ export interface PlanRecord {
   to_revision?: string;
   member_revisions?: Record<string, string>;
   before_empty?: boolean;
+  chain?: PlanChain;
   totals: PlanTotals;
   shares: PlanShare[];
   unbound_shares: PlanUnboundShare[];
@@ -179,6 +186,7 @@ export interface Plan {
   record_kind?: string;
   member_revisions?: Record<string, string>;
   before_empty?: boolean;
+  chain?: PlanChain;
   totals: PlanTotals;
   primary_totals: PlanTotals;
   shares: PlanShare[];

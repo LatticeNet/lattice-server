@@ -445,6 +445,12 @@ func TestBeaconDisableDropsTheKey(t *testing.T) {
 	srv, handler, st := beaconFleet(t)
 	enableBeacon(t, srv, handler, model.BeaconPlanRequest{})
 	first, _ := st.BeaconTarget("node-t")
+	cookies, csrf := beaconLogin(t, handler)
+	res := doJSON(t, handler, http.MethodPost, "/api/monitors", `{"name":"op","type":"beacon","target_node":"node-t","node_ids":["node-a"],"interval_sec":60}`, cookies, csrf)
+	var opCheck model.Monitor
+	if raw := readBody(t, res); res.StatusCode != http.StatusOK || json.Unmarshal([]byte(raw), &opCheck) != nil {
+		t.Fatalf("operator beacon check: %d %s", res.StatusCode, raw)
+	}
 	code, out, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionDisable})
 	if code != http.StatusOK {
 		t.Fatalf("disable plan: %d %s", code, raw)
@@ -458,6 +464,27 @@ func TestBeaconDisableDropsTheKey(t *testing.T) {
 	}
 	if cfg := srv.agentBeaconConfig(nodeOf(t, st, "node-t"), srv.now()); cfg != nil && cfg.Responder != nil {
 		t.Fatal("a disabled beacon still gets a responder")
+	}
+	nodes := map[string]model.Node{}
+	for _, n := range st.Nodes() {
+		nodes[n.ID] = n
+	}
+	read := false
+	for _, e := range srv.pathEntries(srv.now(), nodes) {
+		if e.cell.MonitorID == opCheck.ID {
+			read = true
+			if state, reason := pathStateOf(e, nil, nodes, srv.now()); state != model.PathStateUnknown || reason != model.PathReasonBeaconNotEnabled {
+				t.Fatalf("an operator check to a disabled beacon reads %s %s", state, reason)
+			}
+		}
+	}
+	if !read {
+		t.Fatal("the operator check has no path")
+	}
+	for _, mon := range agentMonitorList(t, srv, st, "node-a") {
+		if mon.ID == opCheck.ID {
+			t.Fatal("a check to a disabled beacon is still handed out")
+		}
 	}
 	enableBeacon(t, srv, handler, model.BeaconPlanRequest{})
 	again, _ := st.BeaconTarget("node-t")

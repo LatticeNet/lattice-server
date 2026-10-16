@@ -592,7 +592,12 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 				paused:       !mon.Enabled || slices.Contains(mon.PausedNodeIDs, source),
 				notProbeable: !resolvable,
 			}
-			if source != "" {
+			if mon.Type == model.MonitorTypeBeacon && !resolvable {
+				// The target's beacon is off: say so rather than reading
+				// the node as one the method cannot reach.
+				e.notProbeable = false
+				e.gate = model.PathReasonBeaconNotEnabled
+			} else if source != "" {
 				e.gate = monitorProbeGate(nodes[source], mon)
 				if e.gate == "" && mon.Type == model.MonitorTypeBeacon && mon.TargetNode != "" {
 					if e.gate = s.beaconMonitorGate(nodes[source], mon.TargetNode, now); e.gate == "" {

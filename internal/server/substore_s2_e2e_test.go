@@ -34,6 +34,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -1593,5 +1594,34 @@ func TestPlanDeleteApplyRendersTagDependentCollection(t *testing.T) {
 	env.checkServed(t, e2eAliceID, "sing-box", rec.Body.String(), 2)
 	if env.runner.count("fetch", "tagged") == fetches {
 		t.Fatal("the collection was served without a fetch after the delete")
+	}
+}
+
+// TestSubstoreE2EJobRunsEveryEndToEndTest: the shards skip these tests (no
+// plugin checkout there), so a test the substore-e2e job's -run list leaves
+// out never runs in CI. Two of the review fixes' tests were left out that
+// way at first.
+func TestSubstoreE2EJobRunsEveryEndToEndTest(t *testing.T) {
+	workflow, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := os.ReadFile("substore_s2_e2e_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := string(workflow)
+	if at := strings.Index(job, "substore-e2e:"); at >= 0 {
+		job = job[at:]
+	}
+	// Every test in this file runs the real plugin, except this one.
+	for _, m := range regexp.MustCompile(`(?m)^func (Test\w+)\(t \*testing\.T\)`).FindAllStringSubmatch(string(source), -1) {
+		name := m[1]
+		if name == "TestSubstoreE2EJobRunsEveryEndToEndTest" {
+			continue
+		}
+		if !strings.Contains(job, name+"|") && !strings.Contains(job, name+")") {
+			t.Errorf("%s runs the real plugin and is not in the substore-e2e job's -run list", name)
+		}
 	}
 }

@@ -128,7 +128,7 @@ jobs:
           LATTICE_SUBSTORE_PLUGIN_DIR: ${{ github.workspace }}/lattice-plugin-sub-store
         run: >-
           go test -race -count=1 -timeout 30m -v
-          -run '^(TestTwoIdentitiesTwoCredentialsOneCachedPlan|TestPluginPlanFixturesPassBindCheckNode|TestS2FleetRenderLatency1000|TestScriptOperatorForeignServerIsPlanRejected|TestZeroRowFleetShareAnswersDecoy|TestStagedRevisionServesOnlyAfterApproval|TestClearOnlyPlanProposedThroughGateway|TestLegacyShareFirstRequestServes|TestCoreReadsRecordDocumentAtPluginKey|TestFleetWriteExpiresOnlyDependents|TestFleetWriteExpiry|TestMigrationThenFailedRefetchServesNoLegacyEntry|TestPlansProposeRestAfterPartialMigration|TestPlansCollectionDiffShowsSwitchedMemberAsProviderContent|TestPlanDeleteApplyRendersTagDependentCollection)$'
+          -run '^(TestTwoIdentitiesTwoCredentialsOneCachedPlan|TestPluginPlanFixturesPassBindCheckNode|TestS2FleetRenderLatency1000|TestScriptOperatorForeignServerIsPlanRejected|TestZeroRowFleetShareAnswersDecoy|TestStagedRevisionServesOnlyAfterApproval|TestClearOnlyPlanProposedThroughGateway|TestLegacyShareFirstRequestServes|TestCoreReadsRecordDocumentAtPluginKey|TestFleetWriteExpiresOnlyDependents|TestFleetWriteExpiry|TestMigrationThenFailedRefetchServesNoLegacyEntry|TestPlansProposeRestAfterPartialMigration|TestPlansCollectionDiffShowsSwitchedMemberAsProviderContent|TestPlanDeleteApplyRendersTagDependentCollection|TestFleetSnapshotIsKeyedOnTheHashOfRaw|TestFleetWriteExpiresARecordEditedSinceTheAnswer)$'
           ./internal/server/
   perf:
     # Wall-clock figures for S2 (plan section 5) on a fixed runner image,

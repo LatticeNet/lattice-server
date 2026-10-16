@@ -1610,9 +1610,25 @@ func TestSubstoreE2EJobRunsEveryEndToEndTest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The job runs from its header to the next job header, and its -run
+	// list is the one alternation in it; a name counts only as one of that
+	// list's alternatives, not as text anywhere in the workflow.
 	job := string(workflow)
-	if at := strings.Index(job, "substore-e2e:"); at >= 0 {
-		job = job[at:]
+	at := strings.Index(job, "\n  substore-e2e:\n")
+	if at < 0 {
+		t.Fatal("ci.yml has no substore-e2e job")
+	}
+	job = job[at+1:]
+	if next := regexp.MustCompile(`(?m)^  [a-z0-9-]+:$`).FindAllStringIndex(job, 2); len(next) == 2 {
+		job = job[:next[1][0]]
+	}
+	lists := regexp.MustCompile(`-run '\^\(([^)]*)\)\$'`).FindAllStringSubmatch(job, -1)
+	if len(lists) != 1 {
+		t.Fatalf("the substore-e2e job has %d -run lists, want one", len(lists))
+	}
+	listed := map[string]bool{}
+	for _, name := range strings.Split(lists[0][1], "|") {
+		listed[name] = true
 	}
 	// Every test in this file runs the real plugin, except this one.
 	for _, m := range regexp.MustCompile(`(?m)^func (Test\w+)\(t \*testing\.T\)`).FindAllStringSubmatch(string(source), -1) {
@@ -1620,7 +1636,7 @@ func TestSubstoreE2EJobRunsEveryEndToEndTest(t *testing.T) {
 		if name == "TestSubstoreE2EJobRunsEveryEndToEndTest" {
 			continue
 		}
-		if !strings.Contains(job, name+"|") && !strings.Contains(job, name+")") {
+		if !listed[name] {
 			t.Errorf("%s runs the real plugin and is not in the substore-e2e job's -run list", name)
 		}
 	}

@@ -167,8 +167,10 @@ var (
 			"path": substoreBindOptPath, "headers": substoreBindOptHeaders, "method": substoreBindOptScalar}},
 		"h2-opts": {network: "h2", keys: map[string]substoreBindOptKind{
 			"path": substoreBindOptPath, "host": substoreBindOptHosts}},
+		// _grpc-type is the URI parsers' annotation of the template's mode
+		// parameter (gun by default), which the URI producer writes back.
 		"grpc-opts": {network: "grpc", keys: map[string]substoreBindOptKind{
-			"grpc-service-name": substoreBindOptScalar}},
+			"grpc-service-name": substoreBindOptScalar, "_grpc-type": substoreBindOptScalar}},
 		"xhttp-opts": {network: "xhttp", keys: map[string]substoreBindOptKind{
 			"path": substoreBindOptPath, "host": substoreBindOptHosts, "mode": substoreBindOptScalar,
 			"headers": substoreBindOptHeaders}},

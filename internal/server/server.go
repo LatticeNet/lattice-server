@@ -7594,6 +7594,19 @@ func requestBool(r *http.Request, key string) bool {
 // real fix and needs an SDK field.
 func (s *Server) approvalPlanReach(approval model.Approval) (string, []string) {
 	switch {
+	case isBeaconApproval(approval):
+		// The plan names every source with its addresses.
+		plan, err := beaconPlanOf(approval)
+		if err != nil {
+			return "", nil
+		}
+		sources := make([]string, 0, len(plan.Sources))
+		for _, src := range plan.Sources {
+			if src.NodeID != approval.NodeID {
+				sources = append(sources, src.NodeID)
+			}
+		}
+		return "monitor:read", sources
 	case approval.Plugin == "wireguard" && approval.Action == "apply-config":
 		// The plan is a mesh config: every member's public key, mesh IP and
 		// endpoint is in the bytes.
@@ -9526,9 +9539,11 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	}
 	n.ProbeMethods, n.ProbeRefusals = normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals)
 	// The beacon report is replaced on every hello, as probe_methods are.
-	if n.Beacon = normalizeBeaconFacts(req.Beacon, s.now()); n.Beacon != nil {
-		s.beacon.noteFacts(n.ID, *n.Beacon)
+	if facts := normalizeBeaconFacts(req.Beacon, s.now()); facts != nil {
+		s.beacon.noteFacts(n.ID, *facts)
+		n.Beacon = beaconFactsDurable(facts)
 	} else {
+		n.Beacon = nil
 		s.beacon.forgetFacts(n.ID)
 	}
 	n.LastSeen = time.Now().UTC()

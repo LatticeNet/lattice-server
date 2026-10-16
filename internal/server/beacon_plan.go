@@ -160,6 +160,19 @@ func (s *Server) buildBeaconPlan(node model.Node, action string, settings model.
 		prev := t.Settings
 		plan.Previous = &prev
 	}
+	if settings.Enabled {
+		// The endpoint must be one of the node's own addresses (its public
+		// or primary interface address, or a provider edge its lines name),
+		// so no plan can point the sources at a third party. Judged at every
+		// render, so a node that moved before the decision is refused.
+		if !beaconEndpointCurrent(node, settings.Endpoint, s.pathPlanned(now).endpoints) {
+			return plan, "", &beaconPlanError{status: http.StatusBadRequest, err: fmt.Errorf(
+				"endpoint %s is not one of the node's addresses (its public IPv4, its primary interface address or a provider edge its lines declare)", settings.Endpoint)}
+		}
+		if _, err := beacon.ParseIPv4(settings.Bind); err != nil {
+			return plan, "", &beaconPlanError{status: http.StatusBadRequest, err: fmt.Errorf("bind: %w", err)}
+		}
+	}
 	binding, hasBinding := s.store.NodeGuardBinding(node.ID)
 	managed := hasBinding && binding.Managed
 	if managed {
@@ -201,7 +214,7 @@ func (s *Server) buildBeaconPlan(node model.Node, action string, settings model.
 		allow = slices.Compact(allow)
 		input.Beacon = nil
 		if settings.Enabled {
-			input.Beacon = &netguard.BeaconCompanion{Port: settings.Port, Allow: allow}
+			input.Beacon = &netguard.BeaconCompanion{Bind: settings.Bind, Port: settings.Port, Allow: allow}
 		}
 		compiled, err := netguard.Compile(input)
 		if err != nil {
@@ -397,6 +410,11 @@ func (s *Server) handleBeaconPlan(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	if err != nil {
+		var pe *beaconPlanError
+		if errors.As(err, &pe) {
+			writeBeaconPlanError(w, err)
+			return
+		}
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -495,6 +513,20 @@ func (s *Server) beaconApprove(ctx context.Context, p principal, approval model.
 		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 	}
 	companion := plan.NetGuard != nil
+	node, _ := s.store.Node(approval.NodeID)
+	// A listener that took the port since the plan was made blocks it now:
+	// the lint's inputs (sing-box inventory, sshd, knock state) are not in
+	// the document, so the decision judges them again.
+	if findings := s.beaconLint(node, plan, now); beaconFindingsBlock(findings) {
+		var codes []string
+		for _, f := range findings {
+			if f.Severity == model.BeaconFindingBlock {
+				codes = append(codes, f.Code)
+			}
+		}
+		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale,
+			"the plan is blocked by lint findings now ("+strings.Join(codes, ", ")+"); re-plan before approving")}
+	}
 	if !beaconScopesAllow(p, approval.NodeID, companion) {
 		return approval, &approvalDecisionError{status: http.StatusForbidden, err: apiError(model.APIErrorCapabilityDenied, "deciding a node.beacon plan needs monitor:admin and node:admin on the node, and netguard:admin when it carries NetGuard rules")}
 	}
@@ -510,16 +542,23 @@ func (s *Server) beaconApprove(ctx context.Context, p principal, approval model.
 			"node agent has not advertised netguard-managed-sha-v1; update or reconnect the agent before applying")}
 	}
 	stored, _ := s.store.BeaconTarget(approval.NodeID)
+	if stored.Version != plan.BaseVersion {
+		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale,
+			"another node.beacon plan applied since this one was made; re-plan before approving")}
+	}
 	next := stored
 	next.NodeID = approval.NodeID
-	next.Version = stored.Version + 1
+	next.Version = plan.BaseVersion + 1
 	next.Settings = plan.Beacon
 	next.Approved = plan.Sources
 	next.Exposure = plan.Exposure
 	next.Companion = nil
 	if companion && plan.Beacon.Enabled {
-		next.Companion = &store.BeaconCompanion{Port: plan.NetGuard.Port, Allow: slices.Clone(plan.NetGuard.Allow)}
+		next.Companion = &store.BeaconCompanion{Bind: plan.Beacon.Bind, Port: plan.NetGuard.Port, Allow: slices.Clone(plan.NetGuard.Allow)}
 	}
+	// Until the companion applies, no source probes the beacon: the port is
+	// closed to it, and a reachability check would read filtered.
+	next.CompanionPending = companion && plan.Beacon.Enabled
 	next.AppliedApprovalID = approval.ID
 	next.AppliedAt = now.UTC()
 	next.AppliedBy = p.ActorID
@@ -750,11 +789,7 @@ func (s *Server) beaconView(p principal, node model.Node, now time.Time) model.B
 			view.State = model.BeaconStatePending
 		}
 	}
-	if view.SuggestedPort == 0 {
-		if port, err := s.beaconSuggestedPort(node.ID); err == nil {
-			view.SuggestedPort = port
-		}
-	}
+	// The suggested port is assigned by the first plan, never by a read.
 	nodes := map[string]model.Node{}
 	for _, n := range s.store.Nodes() {
 		nodes[n.ID] = n
@@ -787,7 +822,10 @@ func (s *Server) beaconView(p principal, node model.Node, now time.Time) model.B
 		add(sourceID, false)
 	}
 	sort.Slice(view.Sources, func(i, j int) bool { return view.Sources[i].NodeID < view.Sources[j].NodeID })
-	if exists && t.Settings.Enabled && t.Exposure == model.BeaconExposureNetGuard {
+	if exists && t.Settings.Enabled && t.CompanionPending {
+		view.FirewallPending = true
+	}
+	if exists && t.Settings.Enabled && t.Exposure == model.BeaconExposureNetGuard && !view.FirewallPending {
 		approvedSet := map[string]bool{}
 		for _, src := range t.Approved {
 			approvedSet[src.NodeID] = true

@@ -54,8 +54,9 @@ type CompileInput struct {
 }
 
 // BeaconCompanion admits UDP Port from exactly Allow, ahead of every
-// operator rule, and marks the port notrack both ways.
+// operator rule, and marks Bind:Port notrack both ways.
 type BeaconCompanion struct {
+	Bind  string
 	Port  int
 	Allow []string
 }
@@ -99,7 +100,7 @@ func Compile(in CompileInput) (network.NFTPlan, error) {
 				Comment:     beaconCompanionComment,
 			})
 		}
-		plan.NotrackUDPPorts = []int{in.Beacon.Port}
+		plan.NotrackUDP = []network.NFTNotrackUDP{{Addr: in.Beacon.Bind, Port: in.Beacon.Port}}
 	}
 
 	// 1. Trusted zones accept first: an overlay the node depends on (tailscale0,

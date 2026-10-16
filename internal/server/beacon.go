@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"net"
 	"net/netip"
 	"slices"
 	"sort"
@@ -30,11 +31,6 @@ const (
 	beaconReachTimeoutSec  = 2
 )
 
-// beaconFactsPersistEvery is how far last_auth_at may advance before an
-// otherwise unchanged report is written to the node record again. The full
-// report is kept in memory and read from there.
-const beaconFactsPersistEvery = 5 * time.Minute
-
 // beaconErrorMax bounds the error text an agent reports.
 const beaconErrorMax = 200
 
@@ -44,6 +40,9 @@ type beaconRuntime struct {
 	mu     sync.Mutex
 	facts  map[string]model.BeaconFacts
 	egress map[string]string
+	// reachMu serializes the reachability check's writes: a sync and a
+	// verdict arriving together must not overwrite each other.
+	reachMu sync.Mutex
 }
 
 func (b *beaconRuntime) noteFacts(nodeID string, f model.BeaconFacts) {
@@ -138,7 +137,13 @@ func normalizeBeaconFacts(in *model.BeaconFacts, now time.Time) *model.BeaconFac
 	if !in.LastAuthAt.IsZero() && !in.LastAuthAt.After(now.Add(5*time.Minute)) {
 		out.LastAuthAt = in.LastAuthAt.UTC()
 	}
-	if msg := strings.TrimSpace(in.Error); msg != "" {
+	msg := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, strings.TrimSpace(in.Error))
+	if msg = strings.TrimSpace(msg); msg != "" {
 		if len(msg) > beaconErrorMax {
 			msg = msg[:beaconErrorMax]
 		}
@@ -147,8 +152,21 @@ func normalizeBeaconFacts(in *model.BeaconFacts, now time.Time) *model.BeaconFac
 	return &out
 }
 
+// beaconFactsDurable is the part of a report the node record keeps:
+// everything but last_auth_at, which moves with every probe and lives in
+// memory only, so the state file is written when the responder changes,
+// never because it was probed.
+func beaconFactsDurable(f *model.BeaconFacts) *model.BeaconFacts {
+	if f == nil {
+		return nil
+	}
+	out := *f
+	out.LastAuthAt = time.Time{}
+	return &out
+}
+
 // beaconFactsDurableChanged reports whether a report differs from the
-// stored one by more than a fresher last_auth_at.
+// stored one in anything the node record keeps.
 func beaconFactsDurableChanged(prev, next *model.BeaconFacts) bool {
 	if (prev == nil) != (next == nil) {
 		return true
@@ -156,13 +174,7 @@ func beaconFactsDurableChanged(prev, next *model.BeaconFacts) bool {
 	if prev == nil {
 		return false
 	}
-	a, b := *prev, *next
-	pa, pb := a.LastAuthAt, b.LastAuthAt
-	a.LastAuthAt, b.LastAuthAt = time.Time{}, time.Time{}
-	if a != b {
-		return true
-	}
-	return pb.Sub(pa) >= beaconFactsPersistEvery || pb.Before(pa)
+	return *beaconFactsDurable(prev) != *beaconFactsDurable(next)
 }
 
 // noteBeaconFacts takes a heartbeat's report: kept in memory always,
@@ -185,7 +197,7 @@ func (s *Server) noteBeaconFacts(nodeID string, stored *model.BeaconFacts, repor
 	if !beaconFactsDurableChanged(stored, facts) {
 		return
 	}
-	if err := s.store.SetNodeBeaconFacts(nodeID, facts); err != nil {
+	if err := s.store.SetNodeBeaconFacts(nodeID, beaconFactsDurable(facts)); err != nil {
 		s.logger.Printf("beacon facts for node %s not stored: %v", nodeID, err)
 		return
 	}
@@ -210,6 +222,9 @@ func beaconTargetGate(t store.BeaconTarget, exists bool, facts *model.BeaconFact
 	if !exists || !t.Settings.Enabled || t.Key == "" || t.Epoch == 0 {
 		return model.PathReasonBeaconNotEnabled
 	}
+	if t.CompanionPending {
+		return model.PathReasonFirewallPending
+	}
 	if facts != nil && facts.Refusal != "" {
 		return model.PathReasonRefusedByNode
 	}
@@ -217,6 +232,38 @@ func beaconTargetGate(t store.BeaconTarget, exists bool, facts *model.BeaconFact
 		return model.PathReasonBeaconNotListening
 	}
 	return ""
+}
+
+// beaconNodeAddresses are the IPv4 addresses a node is known to answer on:
+// its public and primary interface addresses and the hosts of the public
+// line endpoints the latency port rule accepted for it (which include a
+// provider edge it declares). An advertised endpoint must be one of them.
+func beaconNodeAddresses(n model.Node, endpoints map[string]latencyNodeEndpoints) map[string]bool {
+	out := map[string]bool{}
+	for _, raw := range []string{n.PublicIP, n.InternalIP} {
+		if addr, err := beacon.ParseIPv4(strings.TrimSpace(raw)); err == nil {
+			out[addr.String()] = true
+		}
+	}
+	for _, c := range endpoints[n.ID].candidates {
+		if host, _, err := net.SplitHostPort(c.target); err == nil {
+			if addr, err := beacon.ParseIPv4(host); err == nil {
+				out[addr.String()] = true
+			}
+		}
+	}
+	return out
+}
+
+// beaconEndpointCurrent reports whether an advertised endpoint is still one
+// of the node's addresses. A node that moved leaves its old address to
+// whoever holds it next, so sources must not keep sending there.
+func beaconEndpointCurrent(n model.Node, endpoint string, endpoints map[string]latencyNodeEndpoints) bool {
+	ap, err := beacon.ParseEndpoint(endpoint)
+	if err != nil {
+		return false
+	}
+	return beaconNodeAddresses(n, endpoints)[ap.Addr().String()]
 }
 
 // beaconSourceGate is why source may not probe target by beacon, given the
@@ -336,13 +383,17 @@ func (s *Server) agentBeaconConfig(node model.Node, now time.Time) *model.AgentB
 	if len(targets) == 0 {
 		return nil
 	}
+	ids := s.store.BeaconSourceIDs()
+	if _, isTarget := targets[node.ID]; !isTarget && ids[node.ID] == 0 {
+		// Neither a target nor a source of any plan: nothing to compute.
+		return nil
+	}
 	nodes := map[string]model.Node{}
 	for _, n := range s.store.Nodes() {
 		nodes[n.ID] = n
 	}
 	planned := s.pathPlanned(now)
 	monitors := s.store.Monitors()
-	ids := s.store.BeaconSourceIDs()
 	out := &model.AgentBeaconConfig{SourceID: ids[node.ID]}
 
 	if t, ok := targets[node.ID]; ok {
@@ -362,7 +413,8 @@ func (s *Server) agentBeaconConfig(node model.Node, now time.Time) *model.AgentB
 			if !ok || targetID == node.ID {
 				continue
 			}
-			if beaconTargetGate(t, true, s.beaconFactsOf(tn)) != "" || beaconSourceGate(t, node.ID) != "" {
+			if beaconTargetGate(t, true, s.beaconFactsOf(tn)) != "" || beaconSourceGate(t, node.ID) != "" ||
+				!beaconEndpointCurrent(tn, t.Settings.Endpoint, planned.endpoints) {
 				continue
 			}
 			current := s.beaconCurrentSources(targetID, planned, monitors, nodes)
@@ -393,11 +445,15 @@ func (s *Server) beaconResponderFor(node model.Node, t store.BeaconTarget, plann
 	if beaconTargetGate(t, true, facts) != "" {
 		return nil
 	}
-	tableSources := beaconTableSources(t, s.beaconCurrentSources(node.ID, planned, monitors, nodes))
+	current := s.beaconCurrentSources(node.ID, planned, monitors, nodes)
+	tableSources := beaconTableSources(t, current)
 	updated, err := s.store.UpdateBeaconTarget(node.ID, func(next *store.BeaconTarget, exists bool) (bool, error) {
 		if !exists || !next.Settings.Enabled || next.Key == "" {
 			return false, nil
 		}
+		// From the state being written, so an approval that committed after
+		// the snapshot above is the one the table follows.
+		tableSources = beaconTableSources(*next, current)
 		changed := false
 		removed := false
 		for _, prior := range next.TableSources {
@@ -425,8 +481,12 @@ func (s *Server) beaconResponderFor(node model.Node, t store.BeaconTarget, plann
 		return changed, nil
 	})
 	if err != nil {
+		// Fail closed: serve the current source set even though the rotation
+		// could not be recorded, so a source that left is out of the table
+		// now; the next pull records the rotation.
 		s.logger.Printf("beacon state of node %s not advanced: %v", node.ID, err)
 		updated = t
+		updated.TableSources = tableSources
 	}
 	if updated.Key == "" {
 		return nil
@@ -480,6 +540,9 @@ func (s *Server) beaconMonitorGate(source model.Node, target string, now time.Ti
 	if reason := beaconTargetGate(t, exists, s.beaconFactsOf(tn)); reason != "" {
 		return reason
 	}
+	if !beaconEndpointCurrent(tn, t.Settings.Endpoint, s.pathPlanned(now).endpoints) {
+		return model.PathReasonNotProbeable
+	}
 	return beaconSourceGate(t, source.ID)
 }
 
@@ -488,6 +551,8 @@ func (s *Server) beaconMonitorGate(source model.Node, target string, now time.Ti
 // plan put it, run by the first approved, current, online source with the
 // beacon client. A target with no such source gets the no_source verdict.
 func (s *Server) syncBeaconReach(now time.Time) {
+	s.beacon.reachMu.Lock()
+	defer s.beacon.reachMu.Unlock()
 	targets := s.store.BeaconTargets()
 	nodes := map[string]model.Node{}
 	for _, n := range s.store.Nodes() {
@@ -504,7 +569,7 @@ func (s *Server) syncBeaconReach(now time.Time) {
 	for _, targetID := range ids {
 		t := targets[targetID]
 		tn, ok := nodes[targetID]
-		if !ok || !t.ReachArmed || !t.Settings.Enabled {
+		if !ok || !t.ReachArmed || !t.Settings.Enabled || t.CompanionPending {
 			continue
 		}
 		if !beaconListening(s.beaconFactsOf(tn), t) {
@@ -544,7 +609,7 @@ func (s *Server) syncBeaconReach(now time.Time) {
 		})
 		if t.Reach.Source != source || t.Reach.State != model.BeaconReachPending {
 			_, _ = s.store.UpdateBeaconTarget(targetID, func(next *store.BeaconTarget, exists bool) (bool, error) {
-				if !exists {
+				if !exists || !next.ReachArmed {
 					return false, nil
 				}
 				next.Reach = model.BeaconReachability{State: model.BeaconReachPending, Source: source, MonitorID: model.BeaconReachMonitorPrefix + targetID}
@@ -576,14 +641,17 @@ func (s *Server) noteBeaconReachResult(result model.MonitorResult, now time.Time
 	default:
 		return
 	}
+	s.beacon.reachMu.Lock()
 	_, err := s.store.UpdateBeaconTarget(targetID, func(next *store.BeaconTarget, exists bool) (bool, error) {
-		if !exists || !next.ReachArmed {
+		// Only the source the check was handed to may decide it.
+		if !exists || !next.ReachArmed || next.Reach.Source != result.NodeID {
 			return false, nil
 		}
 		next.ReachArmed = false
 		next.Reach = model.BeaconReachability{State: verdict, Source: result.NodeID, MonitorID: result.MonitorID, CheckedAt: now.UTC()}
 		return true, nil
 	})
+	s.beacon.reachMu.Unlock()
 	if err != nil {
 		s.logger.Printf("beacon reachability of node %s not stored: %v", targetID, err)
 		return

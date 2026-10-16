@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -482,11 +483,20 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		}
 	}
 
-	// Step 9b: the node's beacon state, its target key with it. Its source
-	// id stays assigned so it is never given to another node.
-	if s.state.Beacon != nil {
-		if _, ok := s.state.Beacon.Targets[nodeID]; ok && mutate {
-			delete(s.state.Beacon.Targets, nodeID)
+	// Step 9b: the node's beacon state, its target key with it, its source
+	// id, and its place in every other beacon's approved set, so a machine
+	// enrolled later under the same node id holds no approval. The id
+	// number itself is never given out again.
+	if s.state.Beacon != nil && mutate {
+		delete(s.state.Beacon.Targets, nodeID)
+		delete(s.state.Beacon.SourceIDs, nodeID)
+		for id, t := range s.state.Beacon.Targets {
+			approved := slices.DeleteFunc(slices.Clone(t.Approved), func(src model.BeaconPlanSource) bool { return src.NodeID == nodeID })
+			table := slices.DeleteFunc(slices.Clone(t.TableSources), func(src string) bool { return src == nodeID })
+			if len(approved) != len(t.Approved) || len(table) != len(t.TableSources) {
+				t.Approved, t.TableSources = approved, table
+				s.state.Beacon.Targets[id] = t
+			}
 		}
 	}
 

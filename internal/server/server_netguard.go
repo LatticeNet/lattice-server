@@ -484,7 +484,7 @@ func (s *Server) beaconCompanionFor(nodeID string) *netguard.BeaconCompanion {
 	if !ok || !t.Settings.Enabled || t.Companion == nil {
 		return nil
 	}
-	return &netguard.BeaconCompanion{Port: t.Companion.Port, Allow: append([]string(nil), t.Companion.Allow...)}
+	return &netguard.BeaconCompanion{Bind: t.Companion.Bind, Port: t.Companion.Port, Allow: append([]string(nil), t.Companion.Allow...)}
 }
 
 // compileInputForSystem is compileInputFor without a principal, for the

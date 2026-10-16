@@ -555,11 +555,21 @@ func latencyMethodResolvable(setting string, tcpOK, icmpOK, beaconOK bool) bool 
 	}
 }
 
+// latencyICMPRecheck is how long auto keeps a pair on tcp after its icmp
+// read icmp_filtered. Once the pair is on tcp nothing runs icmp for it, so
+// the verdict would otherwise stand forever; after this the pair tries icmp
+// again, and one more filtered run puts it back on tcp for another day.
+const latencyICMPRecheck = 24 * time.Hour
+
 // latencyICMPFiltered reports whether a pair's icmp path reads
-// icmp_filtered now, from its generated icmp check's latest result.
-func (s *Server) latencyICMPFiltered(icmpMonitorID, sourceID string) bool {
+// icmp_filtered now, from its generated icmp check's latest result, and
+// that result is less than latencyICMPRecheck old.
+func (s *Server) latencyICMPFiltered(icmpMonitorID, sourceID string, now time.Time) bool {
 	latest, ok, err := s.store.MonitorLatest(icmpMonitorID, sourceID)
 	if err != nil || !ok || latest.Unknown != nil {
+		return false
+	}
+	if now.Sub(latest.At) >= latencyICMPRecheck {
 		return false
 	}
 	return icmpFiltered(model.MonitorTypeICMP, latest)
@@ -700,6 +710,7 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		priorBeacon, hadBeacon := existing[beaconID]
 		bt, btOK := beaconTargets[n.ID]
 		beaconEndpoint := ""
+		facts := s.beaconFactsOf(n)
 		if btOK && bt.Settings.Enabled {
 			beaconEndpoint = bt.Settings.Endpoint
 			pn.BeaconTarget = beaconEndpoint
@@ -733,9 +744,13 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			pn.ICMPTarget = icmpTarget
 		}
 		tcpOK := chosen != nil
-		targetGate := beaconTargetGate(bt, btOK, n.Beacon)
+		targetGate := beaconTargetGate(bt, btOK, facts)
+		if targetGate == "" && !beaconEndpointCurrent(n, beaconEndpoint, out.endpoints) {
+			// The node moved off the address its plan advertises.
+			targetGate = model.PathReasonNotProbeable
+		}
 		beaconOK := targetGate == ""
-		listening := beaconOK && beaconListening(n.Beacon, bt)
+		listening := beaconOK && beaconListening(facts, bt)
 
 		var activeTCP, activeICMP, activeBeacon []string
 		firstPair := len(out.plan.Pairs)
@@ -751,7 +766,7 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 				caps.beaconGate = beaconSourceGate(bt, sourceID)
 			}
 			if setting == model.LatencyMethodAuto && icmpOK && hadICMP {
-				caps.icmpFiltered = s.latencyICMPFiltered(icmpID, sourceID)
+				caps.icmpFiltered = s.latencyICMPFiltered(icmpID, sourceID, now)
 			}
 			if (setting == model.LatencyMethodAuto || setting == model.LatencyMethodBeacon) && enabled && cfg.Enabled &&
 				latencyProbeGate(byID[sourceID], model.MonitorTypeBeacon) == "" {

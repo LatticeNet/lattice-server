@@ -70,11 +70,16 @@ type BeaconTarget struct {
 	// ReachArmed means a reachability check is due once the target reports
 	// listening on the applied address and port.
 	ReachArmed bool `json:"reach_armed,omitempty"`
+	// CompanionPending means the applied plan's NetGuard companion has not
+	// applied yet (or failed): until it does, no source probes the beacon,
+	// which reads firewall_pending, and no reachability check runs.
+	CompanionPending bool `json:"companion_pending,omitempty"`
 }
 
 // BeaconCompanion is the NetGuard companion rule set in force for a node:
-// UDP Port admitted from Allow and marked notrack both ways.
+// UDP Port admitted from Allow, and Bind:Port marked notrack both ways.
 type BeaconCompanion struct {
+	Bind  string   `json:"bind"`
 	Port  int      `json:"port"`
 	Allow []string `json:"allow"`
 }
@@ -150,9 +155,10 @@ func (s *Store) BeaconSourceIDs() map[string]uint32 {
 }
 
 // EnsureBeaconSourceIDs gives every node in nodeIDs a source id it does not
-// have yet and returns the ids of all of them. An id is never reused, even
-// after its node is deleted, so a stale table entry can never come to mean
-// another machine.
+// have yet and returns the ids of all of them. An id number is never given
+// out twice. Deleting a node drops its id and its place in every approved
+// set, so a machine enrolled later under the same node id is a new source
+// that needs its own approval.
 func (s *Store) EnsureBeaconSourceIDs(nodeIDs []string) (map[string]uint32, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -341,6 +347,15 @@ func (s *Store) CompleteBeaconCompanionTask(approvalID, rulesetSHA, managedSHA, 
 	}
 	approval.UpdatedAt = now
 	staged.Approvals[approvalID] = approval
+	if s.state.Beacon != nil {
+		if t, ok := s.state.Beacon.Targets[approval.NodeID]; ok && t.AppliedApprovalID == approvalID && reason == "" && t.CompanionPending {
+			reg := cloneBeaconRegistry(s.state.Beacon)
+			t = cloneBeaconTarget(t)
+			t.CompanionPending = false
+			reg.Targets[approval.NodeID] = t
+			staged.Beacon = reg
+		}
+	}
 	if binding, ok := s.state.GuardBindings[approval.NodeID]; ok && strings.EqualFold(binding.LastPlanSHA, rulesetSHA) {
 		binding = cloneNodeGuardBinding(binding)
 		if reason == "" {

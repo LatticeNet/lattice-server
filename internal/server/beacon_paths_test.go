@@ -197,8 +197,14 @@ func TestBeaconPortLintAndAddresses(t *testing.T) {
 	if code, _, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionEnable, Port: 45123}); code != http.StatusConflict || !strings.Contains(raw, model.BeaconLintPortSingBox) {
 		t.Fatalf("a sing-box port: %d %s", code, raw)
 	}
-	// A NAT mapping is allowed, with a warning, and so is a private bind.
-	code, out, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionEnable, Port: 45000, Bind: "10.1.0.5", Endpoint: "203.0.113.200:52000"})
+	// An endpoint on someone else's address is refused: sources are never
+	// pointed at a third party.
+	if code, _, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionEnable, Endpoint: "203.0.113.200:52000"}); code != http.StatusBadRequest || !strings.Contains(raw, "not one of the node's addresses") {
+		t.Fatalf("a third-party endpoint: %d %s", code, raw)
+	}
+	// A NAT port mapping on the node's own public address is allowed, with
+	// a warning, and so is a private bind.
+	code, out, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionEnable, Port: 45000, Bind: "10.1.0.5", Endpoint: "198.51.100.30:52000"})
 	if code != http.StatusOK {
 		t.Fatalf("a NAT mapping: %d %s", code, raw)
 	}
@@ -209,7 +215,7 @@ func TestBeaconPortLintAndAddresses(t *testing.T) {
 	if codes[model.BeaconLintEndpointMapped] != model.BeaconFindingWarn || codes[model.BeaconLintOpenToInternet] != model.BeaconFindingWarn {
 		t.Fatalf("findings = %+v", out.Findings)
 	}
-	if out.Plan.Beacon.Endpoint != "203.0.113.200:52000" || out.Plan.Beacon.Bind != "10.1.0.5" || out.Plan.Beacon.Port != 45000 {
+	if out.Plan.Beacon.Endpoint != "198.51.100.30:52000" || out.Plan.Beacon.Bind != "10.1.0.5" || out.Plan.Beacon.Port != 45000 {
 		t.Fatalf("settings = %+v", out.Plan.Beacon)
 	}
 }

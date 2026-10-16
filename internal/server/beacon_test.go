@@ -387,7 +387,7 @@ func TestBeaconPlanHashCoversEveryField(t *testing.T) {
 	for name, mutate := range map[string]func(*model.BeaconSettings){
 		"port":     func(s *model.BeaconSettings) { s.Port++ },
 		"bind":     func(s *model.BeaconSettings) { s.Bind = "198.51.100.30" },
-		"endpoint": func(s *model.BeaconSettings) { s.Endpoint = "203.0.113.99:40001" },
+		"endpoint": func(s *model.BeaconSettings) { s.Endpoint = "198.51.100.30:40001" },
 		"limits":   func(s *model.BeaconSettings) { s.Limits.PacketsPerSecondMax = 1 },
 		"enabled":  func(s *model.BeaconSettings) { s.Enabled = false },
 	} {
@@ -449,8 +449,8 @@ func TestBeaconNetGuardCompanion(t *testing.T) {
 	port := out.Plan.Beacon.Port
 	for _, want := range []string{
 		fmt.Sprintf("udp dport { %d } accept comment \"lattice beacon\"", port),
-		fmt.Sprintf("udp dport { %d } notrack", port),
-		fmt.Sprintf("udp sport { %d } notrack", port),
+		fmt.Sprintf("ip daddr 10.1.0.5 udp dport %d notrack", port),
+		fmt.Sprintf("ip saddr 10.1.0.5 udp sport %d notrack", port),
 		"type filter hook prerouting priority raw",
 		"type filter hook output priority raw",
 	} {
@@ -478,7 +478,7 @@ func TestBeaconNetGuardCompanion(t *testing.T) {
 		t.Fatalf("approval = %s; the companion still has to run", approved.Status)
 	}
 	tasks := tasksFor(srv, approved.ID)
-	if len(tasks) != 1 || !strings.Contains(tasks[0].Script, fmt.Sprintf("udp dport { %d } notrack", port)) || tasks[0].Targets[0] != "node-t" {
+	if len(tasks) != 1 || !strings.Contains(tasks[0].Script, fmt.Sprintf("ip daddr 10.1.0.5 udp dport %d notrack", port)) || tasks[0].Targets[0] != "node-t" {
 		t.Fatalf("tasks = %+v", tasks)
 	}
 	binding, _ := st.NodeGuardBinding("node-t")
@@ -487,6 +487,19 @@ func TestBeaconNetGuardCompanion(t *testing.T) {
 	}
 	if current, err := srv.currentNetGuardPlanSHA("node-t"); err != nil || current != ng.RulesetSHA256 {
 		t.Fatalf("a NetGuard compile after the apply drops the companion: %v", err)
+	}
+	// Until the companion has applied, nobody probes the beacon and no
+	// reachability check runs: the port is still closed to the sources.
+	listenAsPlanned(t, srv, st)
+	srv.syncBeaconReach(srv.now())
+	if cfg := srv.agentBeaconConfig(nodeOf(t, st, "node-a"), srv.now()); cfg != nil && len(cfg.Keys) > 0 {
+		t.Fatalf("a source got a key before the companion applied: %+v", cfg.Keys)
+	}
+	if _, ok := st.Monitor(model.BeaconReachMonitorPrefix + "node-t"); ok {
+		t.Fatal("the reachability check started before the companion applied")
+	}
+	if view := srv.beaconView(beaconAdmin(), nodeOf(t, st, "node-t"), srv.now()); !view.FirewallPending {
+		t.Fatalf("view before the companion applied = %+v", view)
 	}
 
 	// The apply reports the managed table hash: the approval applies.
@@ -499,6 +512,12 @@ func TestBeaconNetGuardCompanion(t *testing.T) {
 	}
 	if binding, _ := st.NodeGuardBinding("node-t"); binding.AppliedTableSHA != managed {
 		t.Fatalf("binding applied sha = %q", binding.AppliedTableSHA)
+	}
+	if bt, _ := st.BeaconTarget("node-t"); bt.CompanionPending {
+		t.Fatal("the companion still reads pending after it applied")
+	}
+	if cfg := srv.agentBeaconConfig(nodeOf(t, st, "node-a"), srv.now()); cfg == nil || len(cfg.Keys) != 1 {
+		t.Fatalf("after the companion applied node-a config = %+v", cfg)
 	}
 
 	// A source pinned to the beacon that the plan did not approve reads

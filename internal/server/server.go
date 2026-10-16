@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -2780,7 +2781,12 @@ type nodeView struct {
 	LoopHealth           *agentLoopHealthView     `json:"loop_health,omitempty"`
 	IPConfig             *model.NodeIPConfig      `json:"ip_config,omitempty"`
 	GroupIDs             []string                 `json:"group_ids,omitempty"`
-	CreatedAt            time.Time                `json:"created_at"`
+	// ProbeMethods are the monitor kinds the node's agent runs: what it
+	// reported, or tcp and http for an agent that reports nothing.
+	// ProbeRefusals are the kinds its host refuses, with why.
+	ProbeMethods  []string          `json:"probe_methods"`
+	ProbeRefusals map[string]string `json:"probe_refusals,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
 }
 
 type agentRuntimeConfig struct {
@@ -2815,8 +2821,39 @@ func (s *Server) toNodeView(n model.Node) nodeView {
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Reachability: nodeReachability(n), Disabled: n.Disabled, AgentSourceAllowlist: append([]string(nil), n.AgentSourceAllowlist...), TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
 		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), LoopHealth: s.agentLoopHealthViewFor(n.ID, now), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
+		ProbeMethods: model.EffectiveProbeMethods(n.ProbeMethods), ProbeRefusals: n.ProbeRefusals,
 	}
 }
+
+// maxProbeRefusals bounds the refusals one agent may report: one per kind.
+const maxProbeRefusals = 8
+
+// normalizeProbeFacts keeps what an agent reported about the kinds it runs
+// (design 29 M2a): known kinds, once each and sorted, and refusals of known
+// kinds the agent does not also claim to run, each with a reason code.
+// Anything else is dropped rather than refused: the report is the agent's
+// own telemetry, and a newer agent may name a kind this server does not
+// know.
+func normalizeProbeFacts(methods []string, refusals map[string]string) ([]string, map[string]string) {
+	methods = model.NormalizeProbeMethods(methods)
+	var out map[string]string
+	for kind, reason := range refusals {
+		kind, reason = strings.TrimSpace(kind), strings.TrimSpace(reason)
+		if !model.KnownProbeMethod(kind) || slices.Contains(methods, kind) || !probeReasonPattern.MatchString(reason) {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		if len(out) < maxProbeRefusals {
+			out[kind] = reason
+		}
+	}
+	return methods, out
+}
+
+// probeReasonPattern is the shape of a reason code, as results carry them.
+var probeReasonPattern = regexp.MustCompile(`^[a-z0-9_]{1,40}$`)
 
 func ensureNodeIdentityUUIDInPlace(n *model.Node) error {
 	if strings.TrimSpace(n.LatticeIdentityUUID) != "" {
@@ -5343,7 +5380,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		views := toMonitorViews(visible)
+		views := s.monitorViews(visible, s.now())
 		for i, mon := range visible {
 			views[i].Latest = monitorLatestViews(p, mon, latest[mon.ID])
 		}
@@ -5356,8 +5393,9 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		if !decodeClientJSON(w, r, &req) {
 			return
 		}
-		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Target) == "" {
-			writeError(w, http.StatusBadRequest, errors.New("name and target are required"))
+		req.TargetNode = strings.TrimSpace(req.TargetNode)
+		if strings.TrimSpace(req.Name) == "" || (strings.TrimSpace(req.Target) == "" && req.TargetNode == "") {
+			writeError(w, http.StatusBadRequest, errors.New("name and target (or target_node) are required"))
 			return
 		}
 		if !validMonitorAlert(req.Alert) {
@@ -5371,10 +5409,12 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusBadRequest, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax))
 			return
 		}
-		// Sources are paused through an edit of a check that exists.
+		// Sources are paused through an edit of a check that exists, and
+		// only the control plane binds secrets to an origin.
 		req.PausedNodeIDs = nil
+		req.SecretsOrigin = ""
 		switch req.Type {
-		case model.MonitorTypeTCP, model.MonitorTypeHTTP:
+		case model.MonitorTypeTCP, model.MonitorTypeHTTP, model.MonitorTypeICMP:
 			if !req.AssignAll && len(req.NodeIDs) == 0 {
 				writeError(w, http.StatusBadRequest, errors.New("set assign_all or provide node_ids"))
 				return
@@ -5386,6 +5426,12 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			if !req.AssignAll && !s.requireAllNodeScopes(w, p, "monitor:admin", req.NodeIDs) {
 				return
 			}
+			// A check that names a node reveals that node's addresses and
+			// measures it, so the caller must be able to read it.
+			if req.TargetNode != "" && !latencyNodeVisible(p, req.TargetNode) {
+				writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden: target_node is not a node this token may read"))
+				return
+			}
 			req.ThresholdDays = 0
 			if req.IntervalSec <= 0 {
 				req.IntervalSec = 30
@@ -5393,7 +5439,35 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			if req.TimeoutSec <= 0 {
 				req.TimeoutSec = 5
 			}
+			targets := s.monitorTargetsAt(s.now())
+			var err error
+			switch req.Type {
+			case model.MonitorTypeHTTP:
+				err = normalizeHTTPMonitor(&req)
+			case model.MonitorTypeICMP:
+				err = targets.normalizeICMPMonitor(&req)
+			default:
+				err = targets.normalizeTCPMonitor(&req)
+			}
+			if err == nil {
+				err = validMonitorTiming(req.IntervalSec, req.TimeoutSec)
+			}
+			if err == nil {
+				err = validMonitorRun(req)
+			}
+			if err == nil && req.Type == model.MonitorTypeICMP {
+				req.Enabled = true
+				err = targets.checkPacketBudget(s.store.Monitors(), req)
+			}
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
 		case model.MonitorTypeTLS:
+			if req.TargetNode != "" || req.Packets != 0 || req.ExpectStatus != "" || len(req.Headers) > 0 {
+				writeError(w, http.StatusBadRequest, errors.New("a tls check takes a host:port target and a warning window; target_node, packets, expect_status and headers do not apply"))
+				return
+			}
 			// A tls monitor has no node to be restricted to, so a token that
 			// may only touch some nodes may not create one.
 			if principalHasNodeRestriction(p) {
@@ -5407,7 +5481,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			}
 			req = normalized
 		default:
-			writeError(w, http.StatusBadRequest, errors.New("only tcp, http and tls monitors are supported (icmp pending)"))
+			writeError(w, http.StatusBadRequest, errors.New("only tcp, http, icmp and tls monitors are supported"))
 			return
 		}
 		if err := validMonitorTiming(req.IntervalSec, req.TimeoutSec); err != nil {
@@ -5424,8 +5498,19 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "monitor.create", Scope: "monitor:admin", Metadata: map[string]string{"monitor_id": req.ID, "type": req.Type}})
-		writeJSON(w, http.StatusOK, req)
+		meta := map[string]string{"monitor_id": req.ID, "type": req.Type}
+		if req.TargetNode != "" {
+			meta["target_node"] = req.TargetNode
+		}
+		if len(req.Headers) > 0 {
+			meta["headers"] = monitorHeaderNames(req.Headers)
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "monitor.create", Scope: "monitor:admin", Metadata: meta})
+		stored, ok := s.store.Monitor(req.ID)
+		if !ok {
+			stored = req
+		}
+		writeJSON(w, http.StatusOK, s.monitorViews([]model.Monitor{stored}, s.now())[0])
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -5532,11 +5617,16 @@ func monitorPairAssigned(mon model.Monitor, nodeID string) bool {
 }
 
 func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {
-	if target, ok := strings.CutPrefix(mon.ID, latencyMonitorPrefix); ok && mon.ManagedBy == model.MonitorManagedLatency &&
-		!rbac.Allows(p.Principal, scope, target) {
-		// A generated latency monitor carries its target's address and
-		// name; a principal confined to the source must also be able to
-		// read the target, as the latency reads demand.
+	target := mon.TargetNode
+	if target == "" && mon.ManagedBy == model.MonitorManagedLatency {
+		// A generated check stored before checks carried their target
+		// node names it in its id.
+		target, _ = latencyGeneratedTarget(mon.ID)
+	}
+	if target != "" && !rbac.Allows(p.Principal, scope, target) {
+		// A check that names a node carries that node's address and name;
+		// a principal confined to the source must also be able to read
+		// the target, as the path reads demand.
 		return false
 	}
 	if mon.AssignAll {
@@ -5569,11 +5659,61 @@ func monitorManageableByPrincipal(p principal, mon model.Monitor) bool {
 // handleAgentMonitors returns the monitors an authenticated agent should run.
 func (s *Server) handleAgentMonitors(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("node_id")
-	if _, ok := s.authenticateNode(r, nodeID, bearerToken(r)); !ok {
+	node, ok := s.authenticateNode(r, nodeID, bearerToken(r))
+	if !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.MonitorsForNode(nodeID))
+	writeJSON(w, http.StatusOK, s.agentMonitorsFor(node, s.store.MonitorsForNode(nodeID), s.now()))
+}
+
+// agentMonitorsFor is the monitor list one agent runs (design 29 D1): the
+// enabled checks assigned to it and not paused, less the kinds its agent
+// does not run (an older agent would report an unknown kind as a
+// failure), with every node target resolved now. A check whose node cannot
+// be resolved for its kind is left out until it can. Secret header values
+// are included: this list goes only to the node the check is assigned to.
+func (s *Server) agentMonitorsFor(node model.Node, assigned []model.Monitor, now time.Time) []model.Monitor {
+	out := make([]model.Monitor, 0, len(assigned))
+	var targets *monitorTargets
+	for _, mon := range assigned {
+		if !model.ProbeMethodSupported(node.ProbeMethods, mon.Type) {
+			continue
+		}
+		if mon.TargetNode != "" && mon.ManagedBy == "" {
+			if targets == nil {
+				t := s.monitorTargetsAt(now)
+				targets = &t
+			}
+			resolved, ok := targets.resolved(mon)
+			if !ok {
+				continue
+			}
+			mon = resolved
+		}
+		out = append(out, mon)
+	}
+	return out
+}
+
+// monitorViews is the read form of monitors: node targets resolved as an
+// agent would be handed them now, and secret header values removed.
+func (s *Server) monitorViews(monitors []model.Monitor, now time.Time) []monitorView {
+	views := toMonitorViews(monitors)
+	var targets *monitorTargets
+	for i, mon := range monitors {
+		if mon.TargetNode == "" || mon.ManagedBy != "" {
+			continue
+		}
+		if targets == nil {
+			t := s.monitorTargetsAt(now)
+			targets = &t
+		}
+		if resolved, ok := targets.resolved(mon); ok {
+			views[i].Target = resolved.Target
+		}
+	}
+	return views
 }
 
 // notifyChannelView is the secret-free projection of a notification channel.
@@ -9341,6 +9481,7 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	if hostFacts, ok := normalizeHostFacts(req.HostFacts, s.now()); ok {
 		n.HostFacts = hostFacts
 	}
+	n.ProbeMethods, n.ProbeRefusals = normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals)
 	n.LastSeen = time.Now().UTC()
 	cameOnline := !n.Online
 	if cameOnline {
@@ -9417,6 +9558,11 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	s.selfmon.observeBeat(req.NodeID, req.Metrics, s.now())
 	s.replaceAgentCapabilities(req.NodeID, req.Capabilities)
+	methods, refusals := normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals)
+	if err := s.store.SetNodeProbeFacts(req.NodeID, methods, refusals); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if old.PublicIP != v4 || old.PublicIPv6 != v6 {
 		s.invalidateLineReadModel()
 	}
@@ -9913,6 +10059,11 @@ type agentAuthRequest struct {
 	WGEndpoint   string          `json:"wireguard_endpoint"`
 	WGPort       int             `json:"wireguard_port"`
 	HostFacts    model.HostFacts `json:"host_facts"`
+	// ProbeMethods and ProbeRefusals are the monitor kinds the agent runs
+	// and the ones its host refuses (design 29 M2a); absent from agents
+	// that predate them.
+	ProbeMethods  []string          `json:"probe_methods"`
+	ProbeRefusals map[string]string `json:"probe_refusals"`
 }
 
 var blockedReportedPublicPrefixes = []netip.Prefix{

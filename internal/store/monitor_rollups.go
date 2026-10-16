@@ -68,6 +68,12 @@ type MonitorRollup struct {
 	// is the mean jump. Buckets written before jitter existed carry neither.
 	JS float64 `json:"js,omitzero"`
 	JN int     `json:"jn,omitempty"`
+	// S counts probes sent and L the lost ones: every echo of a
+	// multi-packet run (icmp), one per run of a single-probe kind, so Loss
+	// reads the same for every kind. Buckets written before the fields
+	// existed carry neither, and their loss is F over N.
+	S int `json:"s,omitempty"`
+	L int `json:"l,omitempty"`
 }
 
 // MonitorPair names one (monitor, node) result pair.
@@ -113,6 +119,38 @@ func (r *MonitorRollup) add(success bool, latencyMs float64) {
 	}
 }
 
+// countable reports whether a result is counted in rollups: a result with a
+// reason measured nothing, so it is stored and shown but counts as neither
+// a success nor a failure.
+func countable(rec MonitorResultRecord) bool { return rec.Reason == "" }
+
+// addResult counts one countable result, its probes included.
+func (r *MonitorRollup) addResult(rec MonitorResultRecord) {
+	r.add(rec.Success, rec.LatencyMs)
+	if rec.Sent > 0 {
+		r.S += rec.Sent
+		r.L += min(max(rec.Lost, 0), rec.Sent)
+		return
+	}
+	r.S++
+	if !rec.Success {
+		r.L++
+	}
+}
+
+// Loss is the share of probes lost, L over S where the bucket counted
+// probes and F over N in a bucket written before it did. False when the
+// bucket holds no result.
+func (r MonitorRollup) Loss() (float64, bool) {
+	switch {
+	case r.S > 0:
+		return float64(r.L) / float64(r.S), true
+	case r.N > 0:
+		return float64(r.F) / float64(r.N), true
+	}
+	return 0, false
+}
+
 // addJitter counts one jump between consecutive successful probes.
 func (r *MonitorRollup) addJitter(delta float64) {
 	if math.IsNaN(delta) || math.IsInf(delta, 0) {
@@ -154,10 +192,20 @@ func (r *MonitorRollup) Merge(o MonitorRollup) {
 		return
 	}
 	hadSuccess, otherSuccess := r.Successes() > 0, o.Successes() > 0
+	if r.S == 0 && o.S > 0 && r.N > 0 {
+		// r was written before buckets counted probes: count its runs as
+		// one probe each, so the merged loss weighs both sides.
+		r.S, r.L = r.N, r.F
+	}
+	if o.S == 0 && r.S > 0 {
+		o.S, o.L = o.N, o.F
+	}
 	r.N += o.N
 	r.F += o.F
 	r.JS += o.JS
 	r.JN += o.JN
+	r.S += o.S
+	r.L += o.L
 	if len(o.H) > 0 && r.H == nil {
 		r.H = make(map[int]int, len(o.H))
 	}
@@ -217,6 +265,9 @@ func RollupMonitorResults(rows []MonitorResultRecord, res time.Duration, from, t
 	var lastAt time.Time
 	var lastMs float64
 	for _, rec := range rows {
+		if !countable(rec) {
+			continue
+		}
 		start := rec.At.UTC().Truncate(res)
 		delta, jump := 0.0, false
 		if rec.Success {
@@ -231,7 +282,7 @@ func RollupMonitorResults(rows []MonitorResultRecord, res time.Duration, from, t
 			b = &MonitorRollup{At: start}
 			byStart[start] = b
 		}
-		b.add(rec.Success, rec.LatencyMs)
+		b.addResult(rec)
 		if jump {
 			b.addJitter(delta)
 		}
@@ -286,7 +337,10 @@ func SummarizeMonitorResults(rows []MonitorResultRecord) MonitorRollup {
 		if i == 0 {
 			out.At = rec.At
 		}
-		out.add(rec.Success, rec.LatencyMs)
+		if !countable(rec) {
+			continue
+		}
+		out.addResult(rec)
 		if !rec.Success {
 			continue
 		}

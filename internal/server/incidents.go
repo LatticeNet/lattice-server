@@ -1043,7 +1043,8 @@ func (s *Server) adoptLegacyAlerts(now time.Time) {
 			for _, pair := range pairs {
 				// A pair that could not have paged was never paged for.
 				after := store.MonitorAlertAfter(mon)
-				if pair.Success || pair.FailStreak < after || !mon.Enabled || !monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) {
+				if pair.Success || pair.FailStreak < after || !mon.Enabled || !monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) ||
+					icmpFiltered(mon.Type, pair) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)

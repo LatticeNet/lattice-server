@@ -140,13 +140,31 @@ func (s *Server) ingestAgentMonitorResults(nodeID string, results []model.Monito
 			resp.Duplicates++
 		default:
 			resp.Accepted++
-			s.notifyMonitorTransition(nodeID, out.Result.MonitorResult, out.PriorFailStreak)
+			if s.resultMayPage(out) {
+				s.notifyMonitorTransition(nodeID, out.Result.MonitorResult, out.PriorFailStreak)
+			}
 		}
 	}
 	for _, reason := range dropReasons {
 		s.logMonitorResultDrops(nodeID, reason, dropCount[reason], results[firstDrop[reason]], receivedAt)
 	}
 	return resp, nil
+}
+
+// resultMayPage reports whether a stored result can move its pair's alert
+// hold (design 29 D10). A run that measured nothing (a reason) is neither
+// up nor down, and an icmp failure on a path that has never had an echo
+// back reads as filtered, not as an outage.
+func (s *Server) resultMayPage(out store.MonitorResultOutcome) bool {
+	if out.Result.Reason != "" {
+		return false
+	}
+	if out.NeverSucceeded && !out.Result.Success {
+		if mon, ok := s.store.Monitor(out.Result.MonitorID); ok && mon.Type == model.MonitorTypeICMP {
+			return false
+		}
+	}
+	return true
 }
 
 // monitorDropLogInterval is how often one node's drops for one reason may

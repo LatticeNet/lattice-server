@@ -35,6 +35,10 @@ type monitorResultRow struct {
 	Error        string    `json:"error,omitempty"`
 	CertNotAfter time.Time `json:"cert_not_after,omitzero"`
 	ReceivedAt   time.Time `json:"received_at,omitzero"`
+	Sent         int       `json:"sent,omitempty"`
+	Lost         int       `json:"lost,omitempty"`
+	RTTsMs       []float64 `json:"rtts_ms,omitempty"`
+	Reason       string    `json:"reason,omitempty"`
 }
 
 func monitorRowFromRecord(rec MonitorResultRecord) monitorResultRow {
@@ -44,6 +48,10 @@ func monitorRowFromRecord(rec MonitorResultRecord) monitorResultRow {
 		Error:        rec.Error,
 		CertNotAfter: rec.CertNotAfter,
 		ReceivedAt:   rec.ReceivedAt,
+		Sent:         rec.Sent,
+		Lost:         rec.Lost,
+		RTTsMs:       rec.RTTsMs,
+		Reason:       rec.Reason,
 	}
 }
 
@@ -63,6 +71,7 @@ func decodeMonitorResultRow(k, v []byte) (MonitorResultRecord, error) {
 	rec := MonitorResultRecord{ReceivedAt: row.ReceivedAt}
 	rec.MonitorID, rec.NodeID, rec.At = monitorID, nodeID, at
 	rec.Success, rec.LatencyMs, rec.Error, rec.CertNotAfter = row.Success, row.LatencyMs, row.Error, row.CertNotAfter
+	rec.Sent, rec.Lost, rec.RTTsMs, rec.Reason = row.Sent, row.Lost, row.RTTsMs, row.Reason
 	return rec, nil
 }
 
@@ -138,10 +147,13 @@ func recordMonitorResultTx(tx *bolt.Tx, rec MonitorResultRecord, limits MonitorH
 	if rec.Success && hadPrior {
 		jitter, jump = monitorJitterDelta(prior.LastOKAt, prior.LastOKMs, rec.At, rec.LatencyMs)
 	}
-	if err := addMonitorRollupsTx(tx, rec, jitter, jump, limits); err != nil {
-		return out, err
+	if countable(rec) {
+		if err := addMonitorRollupsTx(tx, rec, jitter, jump, limits); err != nil {
+			return out, err
+		}
 	}
 	next := advanceMonitorLatest(prior, hadPrior, rec)
+	out.NeverSucceeded = next.LastOKAt.IsZero()
 	prefix, err := monitorPairPrefix(rec.MonitorID, rec.NodeID)
 	if err != nil {
 		return out, err

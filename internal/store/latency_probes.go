@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -65,6 +66,7 @@ func cloneLatencyProbeConfig(cfg model.LatencyProbeConfig) model.LatencyProbeCon
 	cfg.IncludeTargets = slices.Clone(cfg.IncludeTargets)
 	cfg.ExcludeTargets = slices.Clone(cfg.ExcludeTargets)
 	cfg.DisabledPairs = slices.Clone(cfg.DisabledPairs)
+	cfg.SourceMethods = maps.Clone(cfg.SourceMethods)
 	return cfg
 }
 
@@ -204,5 +206,5 @@ func managedMonitorEqual(a, b model.Monitor) bool {
 		a.IntervalSec == b.IntervalSec && a.TimeoutSec == b.TimeoutSec &&
 		a.AssignAll == b.AssignAll && slices.Equal(a.NodeIDs, b.NodeIDs) &&
 		a.ThresholdDays == b.ThresholdDays && a.Enabled == b.Enabled &&
-		a.ManagedBy == b.ManagedBy
+		a.ManagedBy == b.ManagedBy && a.TargetNode == b.TargetNode && a.Packets == b.Packets
 }

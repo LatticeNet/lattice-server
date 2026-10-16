@@ -52,7 +52,7 @@ func addMonitorRollupsTx(tx *bolt.Tx, rec MonitorResultRecord, jitter float64, j
 		if err != nil {
 			return err
 		}
-		bucket.add(rec.Success, rec.LatencyMs)
+		bucket.addResult(rec)
 		if jump {
 			bucket.addJitter(jitter)
 		}

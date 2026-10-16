@@ -80,11 +80,14 @@ func summarizeMonitorRows(rows []MonitorResultRecord, prevFrom, from, to time.Ti
 		if rec.At.Before(prevFrom) || !rec.At.Before(to) {
 			continue
 		}
+		if !countable(rec) {
+			continue
+		}
 		into := &sum.Cur
 		if rec.At.Before(from) {
 			into = &sum.Prev
 		}
-		into.add(rec.Success, rec.LatencyMs)
+		into.addResult(rec)
 		if !rec.Success {
 			continue
 		}
@@ -212,6 +215,7 @@ func (bs *BoltStateStore) MonitorRowSummaries(pairs []MonitorPair, prevFrom, fro
 				}
 				rec := MonitorResultRecord{}
 				rec.At, rec.Success, rec.LatencyMs = at, row.Success, row.LatencyMs
+				rec.Sent, rec.Lost, rec.Reason = row.Sent, row.Lost, row.Reason
 				recs = append(recs, rec)
 			}
 			if sum, ok := summarizeMonitorRows(recs, prevFrom, from, to); ok {

@@ -61,8 +61,8 @@ func latencyRound(v float64) *float64 {
 // latencyStatsOf turns a merged bucket into the wire shape.
 func latencyStatsOf(b store.MonitorRollup, expected int) model.LatencyStats {
 	st := model.LatencyStats{Samples: b.N, Failures: b.F, Expected: max(expected, 0)}
-	if b.N > 0 {
-		loss := math.Round(float64(b.F)/float64(b.N)*10000) / 10000
+	if ratio, ok := b.Loss(); ok {
+		loss := math.Round(ratio*10000) / 10000
 		st.Loss = &loss
 	}
 	if p, ok := b.Quantile(0.5); ok {

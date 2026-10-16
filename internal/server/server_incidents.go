@@ -299,7 +299,7 @@ func (s *Server) pendingIncidents(now time.Time) []store.Incident {
 				// checks whose alert policy is off never open an incident.
 				after := store.MonitorAlertAfter(mon)
 				if pair.Success || pair.FailStreak < 1 || pair.FailStreak >= after || !mon.Enabled ||
-					!monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) {
+					!monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) || icmpFiltered(mon.Type, pair) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)

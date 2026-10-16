@@ -152,10 +152,11 @@ func pathRound(v float64) *float64 {
 }
 
 func pathLoss(b store.MonitorRollup) *float64 {
-	if b.N <= 0 {
+	ratio, ok := b.Loss()
+	if !ok {
 		return nil
 	}
-	loss := math.Round(float64(b.F)/float64(b.N)*10000) / 10000
+	loss := math.Round(ratio*10000) / 10000
 	return &loss
 }
 
@@ -181,7 +182,7 @@ func pathExpected(covered, interval time.Duration) int {
 }
 
 func pathBucketOf(b store.MonitorRollup, t time.Time, expected int) model.PathBucket {
-	out := model.PathBucket{T: t, N: b.N, Fail: b.F, Expected: expected, Loss: pathLoss(b)}
+	out := model.PathBucket{T: t, N: b.N, Fail: b.F, Expected: expected, Loss: pathLoss(b), Sent: b.S, Lost: b.L}
 	if b.Successes() > 0 {
 		out.MinMs, out.MaxMs = pathRound(b.Min), pathRound(b.Max)
 	}
@@ -198,11 +199,11 @@ type pathCheck struct {
 }
 
 // latencyCheckMethods are the generated check id prefixes and their
-// methods. This release generates tcp checks only; the beacon and icmp
-// checks of design 29 add their prefixes here, and the path series joins
-// whichever exist.
+// methods; the path series joins whichever exist. The beacon checks of
+// design 29 M2b add their prefix here.
 var latencyCheckMethods = []struct{ prefix, method string }{
 	{latencyMonitorPrefix, model.MonitorTypeTCP},
+	{latencyICMPMonitorPrefix, model.MonitorTypeICMP},
 }
 
 // generatedPathChecks lists the generated checks that reach target.
@@ -374,8 +375,12 @@ func (s *Server) operatorPathVisible(p principal, mon model.Monitor, source stri
 		nodes[n.ID] = n
 	}
 	m := mon
+	targetNode := mon.TargetNode
+	if targetNode == "" {
+		targetNode = pathNodesByAddress(nodes).get(pathTargetHost(mon))
+	}
 	e := pathEntry{
-		cell:    model.PathCell{Source: source, TargetNode: pathNodesByAddress(nodes).get(pathTargetHost(mon)), MonitorID: mon.ID},
+		cell:    model.PathCell{Source: source, TargetNode: targetNode, MonitorID: mon.ID},
 		monitor: &m,
 	}
 	return e.visibleTo(p)
@@ -459,6 +464,9 @@ type pathEntry struct {
 	hasCheck     bool
 	paused       bool
 	notProbeable bool
+	// gate is why the source does not run the path's kind (a
+	// model.PathReason* code), empty when it does.
+	gate string
 }
 
 func (e pathEntry) pair() store.MonitorPair {
@@ -485,7 +493,9 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 	for _, mon := range s.store.Monitors() {
 		monitors[mon.ID] = mon
 	}
-	plan := s.pathPlan(now)
+	planned := s.pathPlanned(now)
+	plan := planned.plan
+	var targets *monitorTargets
 	planNodes := make(map[string]model.LatencyProbeNode, len(plan.Nodes))
 	for _, n := range plan.Nodes {
 		planNodes[n.NodeID] = n
@@ -496,14 +506,24 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 	}
 	for _, pair := range plan.Pairs {
 		pn := planNodes[pair.Target]
+		method, target := pair.Method, pn.Endpoint
+		if method == "" {
+			method = model.MonitorTypeTCP
+		}
+		if method == model.MonitorTypeICMP {
+			target = pn.ICMPTarget
+		}
 		e := pathEntry{
 			cell: model.PathCell{
-				Source: pair.Source, TargetNode: pair.Target, Target: pn.Endpoint,
-				MonitorID: pair.MonitorID, Managed: true, Method: model.MonitorTypeTCP,
+				Source: pair.Source, TargetNode: pair.Target, Target: target,
+				MonitorID: pair.MonitorID, Managed: true, Method: method,
 			},
 			interval:     interval,
 			paused:       !pair.Active,
-			notProbeable: pn.Target == model.LatencyTargetNotProbeable,
+			notProbeable: pn.Target == model.LatencyTargetNotProbeable || pair.Reason == model.PathReasonNotProbeable,
+		}
+		if pair.Reason != model.PathReasonNotProbeable {
+			e.gate = pair.Reason
 		}
 		if mon, ok := monitors[pair.MonitorID]; ok && pair.MonitorID != "" {
 			e.monitor, e.hasCheck = &mon, true
@@ -536,19 +556,39 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 		default:
 			sources = slices.Clone(mon.NodeIDs)
 		}
-		targetNode := byAddress.get(pathTargetHost(mon))
+		targetNode := mon.TargetNode
+		if targetNode == "" {
+			targetNode = byAddress.get(pathTargetHost(mon))
+		}
+		target, resolvable := mon.Target, true
+		if mon.TargetNode != "" {
+			if targets == nil {
+				t := monitorTargets{nodes: nodes, endpoints: planned.endpoints}
+				targets = &t
+			}
+			if resolved, ok := targets.resolved(mon); ok {
+				target = resolved.Target
+			} else {
+				resolvable = false
+			}
+		}
 		for _, source := range sources {
 			m := mon
-			out = append(out, pathEntry{
+			e := pathEntry{
 				cell: model.PathCell{
-					Source: source, TargetNode: targetNode, Target: mon.Target,
+					Source: source, TargetNode: targetNode, Target: target,
 					MonitorID: mon.ID, Method: mon.Type,
 				},
-				monitor:  &m,
-				interval: time.Duration(mon.IntervalSec) * time.Second,
-				hasCheck: true,
-				paused:   !mon.Enabled || slices.Contains(mon.PausedNodeIDs, source),
-			})
+				monitor:      &m,
+				interval:     time.Duration(mon.IntervalSec) * time.Second,
+				hasCheck:     true,
+				paused:       !mon.Enabled || slices.Contains(mon.PausedNodeIDs, source),
+				notProbeable: !resolvable,
+			}
+			if source != "" {
+				e.gate = latencyProbeGate(nodes[source], mon.Type)
+			}
+			out = append(out, e)
 		}
 	}
 	return out
@@ -649,7 +689,7 @@ type pathWindowSnapshot struct {
 type monitorPathState struct {
 	mu      sync.Mutex
 	windows map[string]*pathWindowFigures
-	plan    model.LatencyProbePlan
+	plan    latencyPlan
 	planAt  time.Time
 	wake    chan struct{}
 	pruneMu sync.Mutex
@@ -667,7 +707,7 @@ type monitorPathState struct {
 const pathPlanFresh = 30 * time.Second
 
 // notePlan keeps plan as the newest, made at at.
-func (m *monitorPathState) notePlan(plan model.LatencyProbePlan, at time.Time) {
+func (m *monitorPathState) notePlan(plan latencyPlan, at time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if at.Before(m.planAt) {
@@ -680,6 +720,12 @@ func (m *monitorPathState) notePlan(plan model.LatencyProbePlan, at time.Time) {
 // younger than pathPlanFresh, else a new one. A plan is never written to
 // after it is made, so readers share it.
 func (s *Server) pathPlan(now time.Time) model.LatencyProbePlan {
+	return s.pathPlanned(now).plan
+}
+
+// pathPlanned is pathPlan with the node endpoints it was made from, which
+// operator checks that name a node resolve against.
+func (s *Server) pathPlanned(now time.Time) latencyPlan {
 	m := &s.monitorPaths
 	m.mu.Lock()
 	if !m.planAt.IsZero() && !now.Before(m.planAt) && now.Sub(m.planAt) < pathPlanFresh {
@@ -688,7 +734,7 @@ func (s *Server) pathPlan(now time.Time) model.LatencyProbePlan {
 		return plan
 	}
 	m.mu.Unlock()
-	plan := s.planLatencyProbes(now).plan
+	plan := s.planLatencyProbes(now)
 	m.notePlan(plan, now)
 	return plan
 }
@@ -793,6 +839,10 @@ func pathStateOf(e pathEntry, latest *store.MonitorLatest, nodes map[string]mode
 	switch {
 	case e.notProbeable:
 		return model.PathStateUnknown, model.PathReasonNotProbeable
+	case e.gate != "":
+		// The source is not handed a kind it does not run, so the path
+		// is unknown for that reason, never down.
+		return model.PathStateUnknown, e.gate
 	case e.paused:
 		return model.PathStateUnknown, model.PathReasonSourcePaused
 	case !e.hasCheck:
@@ -811,8 +861,24 @@ func pathStateOf(e pathEntry, latest *store.MonitorLatest, nodes map[string]mode
 	if latest.ReceivedAt.After(heard) {
 		heard = latest.ReceivedAt
 	}
+	if u := latest.Unknown; u != nil {
+		if u.At.After(heard) {
+			heard = u.At
+		}
+		if u.ReceivedAt.After(heard) {
+			heard = u.ReceivedAt
+		}
+	}
 	if now.Sub(heard) > max(pathStaleAfterRuns*e.interval, pathStaleFloor) {
 		return model.PathStateUnknown, model.PathReasonNoData
+	}
+	if latest.Unknown != nil {
+		// The newest run measured nothing (icmp not permitted, a refused
+		// destination, an agent too old for the kind).
+		return model.PathStateUnknown, latest.Unknown.Reason
+	}
+	if icmpFiltered(e.cell.Method, *latest) {
+		return model.PathStateUnknown, model.PathReasonICMPFiltered
 	}
 	// Down follows the check's alert hold: its failures in a row
 	// (store.MonitorAlertAfter), two for a generated check.
@@ -824,6 +890,14 @@ func pathStateOf(e pathEntry, latest *store.MonitorLatest, nodes map[string]mode
 		return model.PathStateDown, ""
 	}
 	return model.PathStateUp, ""
+}
+
+// icmpFiltered reports whether a pair's failures read as ICMP filtering
+// rather than down (design 29 D10): an icmp path failing that has never
+// had an echo back. Once one has come back, failures are failures, so a
+// node that really dies still reads down and pages.
+func icmpFiltered(method string, latest store.MonitorLatest) bool {
+	return method == model.MonitorTypeICMP && !latest.Success && latest.LastOKAt.IsZero()
 }
 
 // pathMatrixFor builds the matrix the principal may read.

@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // legacyParseSubstoreNodeObject is parseSubstoreNodeObject before its
@@ -152,4 +154,41 @@ func TestLineCatalogueSecretsFindTheSameNeedles(t *testing.T) {
 			t.Fatalf("secret %q: needles %q, before %q", secret, got, legacy.needles)
 		}
 	}
+}
+
+func sameKnownMembers(t *testing.T, raw []byte) {
+	t.Helper()
+	var got, want model.ConvertReply
+	targets := map[string]any{"content": &got.Content, "content_type": &got.ContentType, "target": &got.Target,
+		"node_count": &got.NodeCount, "headers": &got.Headers, "log": &got.Log}
+	if !decodeKnownMembers(raw, targets) {
+		return
+	}
+	if err := json.Unmarshal(raw, &want); err != nil {
+		t.Fatalf("reply %q: decodeKnownMembers admits what json.Unmarshal refuses: %v", raw, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("reply %q: %+v, json.Unmarshal %+v", raw, got, want)
+	}
+}
+
+var knownMembersCorpus = []string{
+	`{"content":"{\n  \"outbounds\": []\n}","content_type":"application/json","target":"sing-box","node_count":2,"headers":{"a":"b"},"log":[{"level":"info","message":"m"}]}`,
+	`{"content":"x","extra":{"a":[1]}}`, `{"Content":"x"}`, `{"content":"x","CONTENT":"y"}`, `{"node_count":"2"}`, `{"content":null}`,
+	`{"log":[{"level":"info","x":1}]}`, `{"content":"\ud800"}`, "{\"content\":\"\xff\"}", `{"content":"a","content":"b"}`, `[]`,
+}
+
+func TestDecodeKnownMembersIsJSONUnmarshal(t *testing.T) {
+	for _, raw := range knownMembersCorpus {
+		sameKnownMembers(t, []byte(raw))
+	}
+}
+
+func FuzzDecodeKnownMembersIsJSONUnmarshal(f *testing.F) {
+	for _, raw := range knownMembersCorpus {
+		f.Add([]byte(raw))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		sameKnownMembers(t, raw)
+	})
 }

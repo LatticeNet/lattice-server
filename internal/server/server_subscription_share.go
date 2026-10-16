@@ -680,55 +680,60 @@ type pluginRenderReply struct {
 	Headers map[string]string `json:"headers"`
 }
 
-// pluginRenderReplyMembers are pluginRenderReply's JSON names.
-var pluginRenderReplyMembers = []string{"content", "content_type", "target", "plan", "headers"}
-
 // decodePluginRenderReply is json.Unmarshal of a render reply into
-// pluginRenderReply. A fleet plan is most of a megabyte, which
-// json.Unmarshal validates, skips and copies. A reply strictjson reads in
-// one pass is decoded member by member instead: a member named exactly as
-// one of pluginRenderReply's is decoded into it, every member whose name
-// encoding/json would not match to one of them is skipped as json.Unmarshal
-// skips it, and a reply with a member it would match only by case folding
-// takes json.Unmarshal, as does any other reply.
+// pluginRenderReply, through decodeKnownMembers (a fleet plan is most of a
+// megabyte).
 func decodePluginRenderReply(out []byte) (pluginRenderReply, error) {
 	var reply pluginRenderReply
-	if fields, ok := strictjson.Fields(out); ok {
-		fast := true
-	members:
-		for _, f := range fields {
-			var err error
-			switch f.Key {
-			case "content":
-				err = json.Unmarshal(f.Value, &reply.Content)
-			case "content_type":
-				err = json.Unmarshal(f.Value, &reply.ContentType)
-			case "target":
-				err = json.Unmarshal(f.Value, &reply.Target)
-			case "plan":
-				reply.Plan = append(json.RawMessage(nil), f.Value...)
-			case "headers":
-				err = json.Unmarshal(f.Value, &reply.Headers)
-			default:
-				for _, name := range pluginRenderReplyMembers {
-					if strings.EqualFold(f.Key, name) {
-						fast = false
-						break members
-					}
-				}
-			}
-			if err != nil {
-				fast = false
-				break
-			}
-		}
-		if fast {
-			return reply, nil
-		}
-		reply = pluginRenderReply{}
+	if decodeKnownMembers(out, map[string]any{"content": &reply.Content, "content_type": &reply.ContentType,
+		"target": &reply.Target, "plan": &reply.Plan, "headers": &reply.Headers}) {
+		return reply, nil
 	}
+	reply = pluginRenderReply{}
 	err := json.Unmarshal(out, &reply)
 	return reply, err
+}
+
+// decodeKnownMembers is json.Unmarshal of a plugin reply into the struct
+// whose fields targets names by their exact JSON names, for the plain case:
+// a reply strictjson reads in one pass, where a member named exactly as a
+// target is decoded into it (a string in one pass by strictjson.String, a
+// raw member copied once), and a member encoding/json would match to no
+// target is skipped as json.Unmarshal skips it. A reply carries up to
+// several MiB in one member (a snapshot, a plan, a converted document),
+// which json.Unmarshal validates, skips or unquotes, and copies in separate
+// passes. ok is false for anything else (a member matched only by case
+// folding, one that does not decode), and the caller decodes the reply with
+// json.Unmarshal from zero, which decides and words every error.
+func decodeKnownMembers(raw []byte, targets map[string]any) bool {
+	fields, ok := strictjson.Fields(raw)
+	if !ok {
+		return false
+	}
+	for _, f := range fields {
+		target, known := targets[f.Key]
+		if !known {
+			for name := range targets {
+				if strings.EqualFold(f.Key, name) {
+					return false
+				}
+			}
+			continue
+		}
+		switch t := target.(type) {
+		case *json.RawMessage:
+			*t = append(json.RawMessage(nil), f.Value...)
+		case *string:
+			if !strictjson.StringInto(f.Value, t) {
+				return false
+			}
+		default:
+			if json.Unmarshal(f.Value, target) != nil {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare, format, uaClass string, variant shareRenderVariant, coreUser *model.ProxyUser) (renderedSubscription, error) {

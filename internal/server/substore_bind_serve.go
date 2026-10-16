@@ -637,8 +637,14 @@ func (s *Server) substoreBindConvert(ctx context.Context, pluginID string, req m
 		if err != nil {
 			return model.ConvertReply{}, err
 		}
-		if err := json.Unmarshal(out, &reply); err != nil {
-			return model.ConvertReply{}, fmt.Errorf("decode convert reply: %w", err)
+		// The reply carries the converted document, most of a megabyte at
+		// 1000 lines.
+		if !decodeKnownMembers(out, map[string]any{"content": &reply.Content, "content_type": &reply.ContentType,
+			"target": &reply.Target, "node_count": &reply.NodeCount, "headers": &reply.Headers, "log": &reply.Log}) {
+			reply = model.ConvertReply{}
+			if err := json.Unmarshal(out, &reply); err != nil {
+				return model.ConvertReply{}, fmt.Errorf("decode convert reply: %w", err)
+			}
 		}
 	}
 	if err := reply.Validate(); err != nil {

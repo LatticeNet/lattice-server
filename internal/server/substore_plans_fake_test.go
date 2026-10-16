@@ -46,6 +46,14 @@ func (f *subStoreFakeGraph) put(facts fleetDependsFacts) {
 	}
 }
 
+// markUnionFleet puts a record in the union fleet closure, as the plugin's
+// closure over its members' staged sources would.
+func (f *subStoreFakeGraph) markUnionFleet(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unionFleet[id] = true
+}
+
 // edge states that from reads to.
 func (f *subStoreFakeGraph) edge(from, to, via string) {
 	f.mu.Lock()

@@ -186,6 +186,12 @@ func subStorePlanFillSection(section *subStorePlanRecord, diffs map[string]subSt
 		}
 		diff := diffs[share.IdentityID]
 		share.Added, share.Removed, share.Changed, share.Excluded = len(diff.Added), len(diff.Removed), len(diff.Changed), len(diff.Excluded)
+		if share.Assigned {
+			// The share named no identity, so its holders received no lines
+			// (the decoy, or a document no bind covers): every line the
+			// identity receives after the plan is added for them.
+			share.Added, share.Removed, share.Changed = subStorePlanLinesAfter(diff), 0, 0
+		}
 	}
 	ids := make([]string, 0, len(listed))
 	for id := range listed {

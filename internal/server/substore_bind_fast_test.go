@@ -2,10 +2,15 @@ package server
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -73,4 +78,78 @@ func FuzzParseSubstoreNodeObjectMatchesTheTokenWalk(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		sameNodeObject(t, raw)
 	})
+}
+
+func sameRenderReply(t *testing.T, raw []byte) {
+	t.Helper()
+	got, gotErr := decodePluginRenderReply(raw)
+	var want pluginRenderReply
+	wantErr := json.Unmarshal(raw, &want)
+	if (gotErr == nil) != (wantErr == nil) || gotErr != nil && gotErr.Error() != wantErr.Error() {
+		t.Fatalf("reply %q: error %v, json.Unmarshal %v", raw, gotErr, wantErr)
+	}
+	if gotErr == nil && !reflect.DeepEqual(got, want) {
+		t.Fatalf("reply %q: %+v, json.Unmarshal %+v", raw, got, want)
+	}
+}
+
+var renderReplyCorpus = []string{
+	`{"content":"","content_type":"application/json","target":"sing-box","plan":{"kind":"nodes","nodes":[]},"live_revision":"r","node_count":3}`,
+	`{"content":"x","headers":{"a":"b"}}`, `{"Content":"x"}`, `{"content":"x","CONTENT":"y"}`, `{"content":1}`, `{"plan":null}`,
+	`{"content":"a","content":"b"}`, `{"ſontent":"x"}`, `{"headers":{"a":1}}`, `[]`, `null`, `{"plan":{"a":1,"a":2}}`, `{"content":"x"} y`,
+}
+
+func TestDecodePluginRenderReplyIsJSONUnmarshal(t *testing.T) {
+	for _, raw := range renderReplyCorpus {
+		sameRenderReply(t, []byte(raw))
+	}
+}
+
+func FuzzDecodePluginRenderReplyIsJSONUnmarshal(f *testing.F) {
+	for _, raw := range renderReplyCorpus {
+		f.Add([]byte(raw))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		sameRenderReply(t, raw)
+	})
+}
+
+// legacyLineCatalogueSecretForms is lineCatalogueSecretForms before it
+// skipped the JSON-escaped copy of a form that escaping leaves unchanged.
+func legacyLineCatalogueSecretForms(secret string) []string {
+	raws := [][]byte{[]byte(secret)}
+	forms := []string{secret, url.QueryEscape(secret), url.PathEscape(secret)}
+	if dashless := strings.ReplaceAll(secret, "-", ""); dashless != secret {
+		if id, err := hex.DecodeString(dashless); err == nil && len(id) == 16 {
+			forms = append(forms, dashless)
+			raws = append(raws, id)
+		}
+	}
+	for _, raw := range raws {
+		forms = append(forms, base64.RawStdEncoding.EncodeToString(raw), base64.RawURLEncoding.EncodeToString(raw))
+	}
+	for _, form := range slices.Clone(forms) {
+		if escaped, err := json.Marshal(form); err == nil {
+			forms = append(forms, string(escaped[1:len(escaped)-1]))
+		}
+	}
+	return forms
+}
+
+// The owner and identity checks look for the same needles as before.
+func TestLineCatalogueSecretsFindTheSameNeedles(t *testing.T) {
+	for _, secret := range []string{"8f0c2a9e-41d7-4b3c-8a5e-1f2d3c4b5a69", "s3cr3t/Pa55+w0rd=Id&x", `quote"back\slash`, "tab\there", "<html>&", "é-ü", " line", "\xff\xfe\xfd\xfc", "a\ufffdbc", "plain"} {
+		got := newLineCatalogueSecrets([]string{secret}).needles
+		var legacy lineCatalogueSecrets
+		seen := map[string]bool{}
+		for _, form := range legacyLineCatalogueSecretForms(secret) {
+			if needle := strings.ToLower(form); !seen[needle] {
+				seen[needle] = true
+				legacy.needles = append(legacy.needles, []byte(needle))
+			}
+		}
+		if !reflect.DeepEqual(got, legacy.needles) {
+			t.Fatalf("secret %q: needles %q, before %q", secret, got, legacy.needles)
+		}
+	}
 }

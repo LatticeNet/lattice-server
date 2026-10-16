@@ -48,7 +48,7 @@ type subStoreSvcHarness struct {
 // subStoreSvcAdmin is an operator with the scopes the services ask for.
 var subStoreSvcAdmin = principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"proxy:admin", "substore:admin", "network:plan", "network:apply"}}}
 
-func newSubStoreSvcHarness(t *testing.T) *subStoreSvcHarness {
+func newSubStoreSvcHarness(t testing.TB) *subStoreSvcHarness {
 	t.Helper()
 	st, err := store.Open("")
 	if err != nil {
@@ -71,6 +71,9 @@ func newSubStoreSvcHarness(t *testing.T) *subStoreSvcHarness {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// rec and other are fleet records in the plugin's index, so a share of
+	// either may be created with an identity (identity_requires_fleet_record).
+	putSubStoreRecords(t, st, `{"records":[{"id":"rec","name":"rec","source":"fleet"},{"id":"other","name":"other","source":"fleet"}]}`)
 	srv.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
 		return model.SubscriptionSnapshot{Raw: "nodes", FetchedAt: now}, nil
 	}
@@ -472,9 +475,7 @@ func TestSubStoreSharesReorder(t *testing.T) {
 func TestSubStoreSharesCreateKeepsFleetFeedGuard(t *testing.T) {
 	h := newSubStoreSvcHarness(t)
 	doc := `{"version":1,"records":[{"id":"fleet","name":"Everyone","source":"vpn-core"}]}`
-	if err := h.st.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: usageSubStoreRecordsKey, Value: doc}); err != nil {
-		t.Fatal(err)
-	}
+	putSubStoreRecords(t, h.st, doc)
 	if _, err := h.call(subStoreSvcAdmin, subStoreSharesService, "create", `{"subscription_id":"fleet","slug":"everyone"}`); subStoreSvcErrStatus(err) != http.StatusBadRequest ||
 		!strings.Contains(subStoreSvcErrBody(err), apiErrorFleetFeedFlagRequired) {
 		t.Fatalf("a fleet feed share without the flag: %v %s", err, subStoreSvcErrBody(err))

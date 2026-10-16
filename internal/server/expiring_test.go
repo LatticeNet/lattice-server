@@ -280,9 +280,7 @@ func TestExpiringSubtitlesAreDataAndUsersCarryQuota(t *testing.T) {
 		}
 	}
 	doc := `{"records":[{"id":"for-cdcd-loon","name":"for-cdcd-loon","display_name":"cdcd Loon"}]}`
-	if err := st.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: usageSubStoreRecordsKey, Value: doc}); err != nil {
-		t.Fatal(err)
-	}
+	putSubStoreRecords(t, st, doc)
 
 	cookies, _ := loginSession(t, handler)
 	req := httptest.NewRequest(http.MethodGet, "/api/expiring", nil)

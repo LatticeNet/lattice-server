@@ -269,9 +269,7 @@ func TestUsageSubStoreSelection(t *testing.T) {
 		{"id":"rec-1","source":"vpn-core-graph","vpn_identity":"` + orphan.ID + `","entry_roots":["` + f.direct.LineUUID + `"]},
 		{"id":"rec-2","source":"vpn-core-graph","vpn_identity":"` + f.alice.ID + `","entry_roots":["` + f.hub.LineUUID + `"]},
 		{"id":"rec-3","source":"url","url":"https://example/sub","vpn_identity":"` + orphan.ID + `"}]}`
-	if err := srv.store.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: usageSubStoreRecordsKey, Value: doc}); err != nil {
-		t.Fatal(err)
-	}
+	putSubStoreRecords(t, srv.store, doc)
 	srv.invalidateLineReadModel()
 	ctx := srv.usageAttributionContext()
 	direct := ctx.byHash[f.direct.LineHashID]

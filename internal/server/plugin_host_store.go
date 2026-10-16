@@ -2,9 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/plugin"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // pluginKVStore is the part of the store the plugin KV host calls use. The
@@ -34,6 +37,33 @@ func (h *pluginHost) Delete(_ context.Context, key string) error {
 		return err
 	}
 	return h.kvStore().DeleteKV(bucket, entryKey)
+}
+
+// pluginKVComparer is the store's compare-and-swap. It is a separate
+// interface so a test wrapper of pluginKVStore that does not offer it makes
+// the conditional kv.put fail closed instead of writing blind.
+type pluginKVComparer interface {
+	PutKVIfMatch(entry model.KVEntry, ifMatch string) error
+}
+
+// PutIfMatch serves a kv.put that carries if_match (plugin.KVComparePutter):
+// the write lands only when the stored value's digest is ifMatch, or, with an
+// empty ifMatch, only when the key does not exist. The namespace is
+// re-checked as Get and Put check it.
+func (h *pluginHost) PutIfMatch(_ context.Context, key string, value []byte, ifMatch string) error {
+	bucket, entryKey, err := splitPluginKVKey(key)
+	if err != nil {
+		return err
+	}
+	comparer, ok := h.kvStore().(pluginKVComparer)
+	if !ok {
+		return fmt.Errorf("%w: kv compare-and-swap", plugin.ErrHostServiceUnavailable)
+	}
+	err = comparer.PutKVIfMatch(model.KVEntry{Bucket: bucket, Key: entryKey, Value: string(value)}, ifMatch)
+	if errors.Is(err, store.ErrKVConflict) {
+		return plugin.ErrKVConflict
+	}
+	return err
 }
 
 // pluginHTTPResponseLimitFor is the response body bound for one plugin HTTP

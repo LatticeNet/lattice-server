@@ -280,7 +280,8 @@ func TestServiceCallsCarryTheSignedHTTPResponseBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, method := range []string{"fetch", "render"} {
-		if _, err := srv.callRuntimePluginService(context.Background(), subStorePluginID, service, method, json.RawMessage(`{}`), nil, nil); err != nil {
+		// fetch is core-only on the refresh path, which marks its context.
+		if _, err := srv.callRuntimePluginService(withSubStoreRefreshCall(context.Background()), subStorePluginID, service, method, json.RawMessage(`{}`), nil, nil); err != nil {
 			t.Fatal(err)
 		}
 	}

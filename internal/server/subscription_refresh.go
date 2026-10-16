@@ -456,7 +456,9 @@ func (s *Server) fetchSubscriptionSource(ctx context.Context, pluginID, subscrip
 	if err != nil {
 		return model.SubscriptionSnapshot{}, err
 	}
-	out, err := s.callRuntimePluginService(ctx, pluginID, pluginID+"/subscription", "fetch", payload, nil, nil)
+	// The mark is what admits the Sub-Store's core-only fetch on this path
+	// and on no other (subStoreCoreOnlyCallAllowed).
+	out, err := s.callRuntimePluginService(withSubStoreRefreshCall(ctx), pluginID, pluginID+"/subscription", "fetch", payload, nil, nil)
 	if err != nil {
 		return model.SubscriptionSnapshot{}, err
 	}

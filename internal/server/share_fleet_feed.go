@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -21,10 +22,14 @@ import (
 // publishes_fleet_credentials: true, and the share records that it does so
 // the console can keep warning about it.
 //
-// The core reads the plugin's records the way subStoreGraphRecords does
-// (plugin:latticenet.sub-store / subscriptions-v1), so the guard needs no
-// plugin release. A record list that exists but cannot be read (over
-// usageMaxSubStoreRecordsLen, or not JSON) is an unknown answer, and an
+// The core reads the plugin's records the way the plugin stores them since
+// the split store (0.17.0-alpha.2): the index, subscriptions-index-v2, for
+// the record list, names, sources, tags, members and node sources, and for a
+// vpn-core record its own document, record-v2-<id>, for the identity it
+// narrows to, which the index does not carry (subStoreIndexV2 below). The
+// guard needs no plugin release. An index that exists but cannot be read
+// (over usageMaxSubStoreRecordsLen, or not JSON), and a vpn-core record whose
+// document is missing or does not decode, are unknown answers, and an
 // unknown answer needs the flag as a fleet feed does.
 //
 // Limits, stated so nobody mistakes the guard for an enforcement point:
@@ -63,15 +68,18 @@ const (
 
 // subStoreFleetRecord is the part of a Sub-Store record the guard reads.
 type subStoreFleetRecord struct {
-	ID          string   `json:"id"`
-	Kind        string   `json:"kind"`
-	Name        string   `json:"name"`
-	Source      string   `json:"source"`
-	VPNIdentity string   `json:"vpn_identity"`
-	Tags        []string `json:"tags"`
-	Members     []string `json:"members"`
-	MemberTags  []string `json:"member_tags"`
-	NodeSource  string   `json:"node_source"`
+	ID          string
+	Kind        string
+	Name        string
+	Source      string
+	VPNIdentity string
+	Tags        []string
+	Members     []string
+	MemberTags  []string
+	NodeSource  string
+	// identityUnknown marks a vpn-core record whose own document could not
+	// be read, so whether it narrows to an identity is not known.
+	identityUnknown bool
 }
 
 // subStoreFleetIndex is the plugin's record list as the guard reads it.
@@ -105,21 +113,23 @@ func (v fleetFeedVerdict) now() string {
 }
 
 func (s *Server) subStoreFleetIndex() subStoreFleetIndex {
-	entry, ok := s.store.KVEntry(usageSubStoreKVBucket, usageSubStoreRecordsKey)
-	if !ok || len(entry.Value) == 0 {
-		return subStoreFleetIndex{}
-	}
-	if len(entry.Value) > usageMaxSubStoreRecordsLen {
+	read := s.subStoreIndexV2()
+	if read.unreadable {
 		return subStoreFleetIndex{unreadable: true}
 	}
-	var doc struct {
-		Records []subStoreFleetRecord `json:"records"`
-	}
-	if err := json.Unmarshal([]byte(entry.Value), &doc); err != nil {
-		return subStoreFleetIndex{unreadable: true}
-	}
-	index := subStoreFleetIndex{records: doc.Records, byID: make(map[string]subStoreFleetRecord, len(doc.Records))}
-	for _, rec := range doc.Records {
+	index := subStoreFleetIndex{byID: make(map[string]subStoreFleetRecord, len(read.entries))}
+	for _, entry := range read.entries {
+		if entry.Revision == "" {
+			// A staged-only entry carries no live fact: nothing reads it yet.
+			continue
+		}
+		rec := subStoreFleetRecord{ID: entry.ID, Kind: entry.Kind, Name: firstNonEmpty(entry.DisplayName, entry.Name), Source: entry.Source,
+			Tags: entry.Tags, Members: entry.Members, MemberTags: entry.MemberTags, NodeSource: entry.NodeSource}
+		if entry.Source == subStoreSourceVPNCore {
+			doc, ok := s.subStoreRecordDocument(entry.ID)
+			rec.VPNIdentity, rec.identityUnknown = doc.VPNIdentity, !ok
+		}
+		index.records = append(index.records, rec)
 		index.byID[rec.ID] = rec
 	}
 	return index
@@ -138,6 +148,7 @@ func (index subStoreFleetIndex) verdict(subscriptionID string) fleetFeedVerdict 
 		return fleetFeedVerdict{Unknown: true}
 	}
 	seen := map[string]bool{}
+	unknown := false
 	var walk func(id string, depth int) (bool, string)
 	walk = func(id string, depth int) (bool, string) {
 		rec, ok := index.byID[strings.TrimSpace(id)]
@@ -145,6 +156,10 @@ func (index subStoreFleetIndex) verdict(subscriptionID string) fleetFeedVerdict 
 			return false, ""
 		}
 		seen[rec.ID] = true
+		if rec.Source == subStoreSourceVPNCore && rec.identityUnknown {
+			unknown = true
+			return false, ""
+		}
 		if rec.Source == subStoreSourceVPNCore && strings.TrimSpace(rec.VPNIdentity) == "" {
 			return true, firstNonEmpty(rec.Name, rec.ID)
 		}
@@ -175,6 +190,9 @@ func (index subStoreFleetIndex) verdict(subscriptionID string) fleetFeedVerdict 
 		return false, ""
 	}
 	fleet, via := walk(subscriptionID, 0)
+	if !fleet && unknown {
+		return fleetFeedVerdict{Unknown: true}
+	}
 	return fleetFeedVerdict{Fleet: fleet, Via: via}
 }
 
@@ -220,4 +238,113 @@ func withShareFleetCredentials(share model.SubscriptionShare) model.Subscription
 	extra[shareExtraFleetCredentials] = json.RawMessage("true")
 	share.Extra = extra
 	return share
+}
+
+// The plugin's split store as core reads it (S2 plan section 2.6): the index
+// for the record list and every live fact it carries, and a record's own
+// document for what the index leaves out, the legacy identity and roots. The
+// three readers (the fleet-feed guard, usage attribution and the expiring
+// names) read nothing from subscriptions-v1, which the plugin deletes after
+// a124 and 0.18 are both live.
+const (
+	// subStoreIndexKey is the plugin's index document.
+	subStoreIndexKey = "subscriptions-index-v2"
+	// subStoreRecordKeyPrefix starts a record's own document key.
+	subStoreRecordKeyPrefix = "record-v2-"
+	// subStoreSourceVPNCoreGraph is the legacy graph source.
+	subStoreSourceVPNCoreGraph = "vpn-core-graph"
+)
+
+// subStoreIndexEntry is the part of an index entry core reads. Revision is
+// empty for an entry with no live revision (a staged new record), which
+// carries no live fact.
+type subStoreIndexEntry struct {
+	ID          string   `json:"id"`
+	Kind        string   `json:"kind"`
+	Name        string   `json:"name"`
+	DisplayName string   `json:"display_name"`
+	Tags        []string `json:"tags"`
+	Source      string   `json:"source"`
+	Members     []string `json:"members"`
+	MemberTags  []string `json:"member_tags"`
+	NodeSource  string   `json:"node_source"`
+	Revision    string   `json:"revision"`
+	Flags       struct {
+		OwnerCredentials bool `json:"owner_credentials"`
+		FleetBound       bool `json:"fleet_bound"`
+	} `json:"flags"`
+}
+
+// subStoreIndexRead is the index as one read found it. unreadable says an
+// index exists and could not be read; no index at all is a store with no
+// records.
+type subStoreIndexRead struct {
+	entries    []subStoreIndexEntry
+	unreadable bool
+}
+
+// subStoreIndexV2 reads the plugin's index: the live records, in manual
+// order. Archived entries are not read.
+func (s *Server) subStoreIndexV2() subStoreIndexRead {
+	entry, ok := s.store.KVEntry(usageSubStoreKVBucket, subStoreIndexKey)
+	if !ok || len(entry.Value) == 0 {
+		return subStoreIndexRead{}
+	}
+	if len(entry.Value) > usageMaxSubStoreRecordsLen {
+		return subStoreIndexRead{unreadable: true}
+	}
+	var doc struct {
+		Records []subStoreIndexEntry `json:"records"`
+	}
+	if err := json.Unmarshal([]byte(entry.Value), &doc); err != nil {
+		return subStoreIndexRead{unreadable: true}
+	}
+	out := subStoreIndexRead{entries: make([]subStoreIndexEntry, 0, len(doc.Records))}
+	for _, rec := range doc.Records {
+		if strings.TrimSpace(rec.ID) != "" {
+			out.entries = append(out.entries, rec)
+		}
+	}
+	return out
+}
+
+// subStoreRecordDocument is the part of a record's own document core reads.
+type subStoreRecordDocument struct {
+	ID          string   `json:"id"`
+	Source      string   `json:"source"`
+	VPNIdentity string   `json:"vpn_identity"`
+	EntryRoots  []string `json:"entry_roots"`
+}
+
+// subStoreRecordKey is a record's document key as the plugin writes it
+// (storeKeyComponent in the plugin's store_v2.go): the bytes the server
+// refuses in a key (a slash, a backslash, a control byte, DEL) and the escape
+// byte itself are written as %XX; every other byte is itself.
+func subStoreRecordKey(id string) string {
+	var b strings.Builder
+	b.WriteString(subStoreRecordKeyPrefix)
+	for i := 0; i < len(id); i++ {
+		c := id[i]
+		if c == '%' || c == '/' || c == '\\' || c < 0x20 || c == 0x7f {
+			fmt.Fprintf(&b, "%%%02X", c)
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
+// subStoreRecordDocument reads one record's own document. ok is false when
+// it is missing, over the bound, does not decode or names another record,
+// which every reader treats as unknown.
+func (s *Server) subStoreRecordDocument(id string) (subStoreRecordDocument, bool) {
+	entry, ok := s.store.KVEntry(usageSubStoreKVBucket, subStoreRecordKey(id))
+	if !ok || len(entry.Value) == 0 || len(entry.Value) > usageMaxSubStoreRecordsLen {
+		return subStoreRecordDocument{}, false
+	}
+	var doc subStoreRecordDocument
+	if err := json.Unmarshal([]byte(entry.Value), &doc); err != nil || doc.ID != id {
+		return subStoreRecordDocument{}, false
+	}
+	return doc, true
 }

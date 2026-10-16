@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,9 +91,30 @@ func listenAsPlanned(t *testing.T, srv *Server, st *store.Store) {
 	}
 }
 
+// beaconSessions keeps one login per test (each builds its own server), so
+// a test that plans many times stays under the login rate limit.
+var beaconSessions sync.Map
+
+type beaconSession struct {
+	cookies []*http.Cookie
+	csrf    string
+}
+
+func beaconLogin(t *testing.T, handler http.Handler) ([]*http.Cookie, string) {
+	t.Helper()
+	if v, ok := beaconSessions.Load(t); ok {
+		s := v.(beaconSession)
+		return s.cookies, s.csrf
+	}
+	cookies, csrf := loginSession(t, handler)
+	beaconSessions.Store(t, beaconSession{cookies: cookies, csrf: csrf})
+	t.Cleanup(func() { beaconSessions.Delete(t) })
+	return cookies, csrf
+}
+
 func planBeacon(t *testing.T, handler http.Handler, req model.BeaconPlanRequest) (int, model.BeaconPlanResponse, string) {
 	t.Helper()
-	cookies, csrf := loginSession(t, handler)
+	cookies, csrf := beaconLogin(t, handler)
 	res := doJSON(t, handler, http.MethodPost, "/api/nodes/beacon/plan", string(mustJSON(t, req)), cookies, csrf)
 	raw := readBody(t, res)
 	var out model.BeaconPlanResponse
@@ -245,7 +267,7 @@ func TestBeaconRotationKeepsTwoEpochs(t *testing.T) {
 	srv.agentBeaconConfig(nodeOf(t, st, "node-t"), t0)
 	first, _ := st.BeaconTarget("node-t")
 
-	cookies, csrf := loginSession(t, handler)
+	cookies, csrf := beaconLogin(t, handler)
 	res := doJSON(t, handler, http.MethodPost, "/api/nodes/beacon/rotate", `{"node_id":"node-t"}`, cookies, csrf)
 	var rotated model.BeaconRotateResponse
 	if raw := readBody(t, res); res.StatusCode != http.StatusOK || json.Unmarshal([]byte(raw), &rotated) != nil || rotated.Epoch != first.Epoch+1 {
@@ -409,8 +431,9 @@ func TestBeaconNetGuardCompanion(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv.replaceAgentCapabilities("node-t", []string{netGuardManagedSHACapability})
-	srv.beacon.noteEgress("node-b", "192.0.2.200")  // documentation range: refused as egress
+	srv.beacon.noteEgress("node-a", "10.66.0.21")    // over WireGuard: says nothing about egress
 	srv.beacon.noteEgress("node-b", "203.0.113.122") // a NAT source's real egress
+	srv.beacon.noteEgress("node-b", "10.9.9.9")      // a private hop is never kept as egress
 	code, out, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionEnable})
 	if code != http.StatusOK {
 		t.Fatalf("plan = %d %s", code, raw)

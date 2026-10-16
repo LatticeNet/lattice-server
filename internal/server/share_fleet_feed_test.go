@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-
 )
 
 // Leak table row 2: a share of a record that reads the identity-less vpn-core

@@ -170,10 +170,18 @@ func substoreBindSnapshotSelection(snap model.SubscriptionSnapshot) (string, map
 // A plan without a selection passes; substoreBindPlan then reads the
 // snapshot's.
 func substoreBindCheckSelection(plan model.SelectionPlan, snap model.SubscriptionSnapshot) string {
+	version, selected := substoreBindSnapshotSelection(snap)
+	return substoreBindCheckSelectionIn(plan, version, selected)
+}
+
+// substoreBindCheckSelectionIn is substoreBindCheckSelection over the
+// version and line set substoreBindSnapshotSelection already read, so a
+// caller that also binds decodes the snapshot once (a 1000-line snapshot is
+// most of a megabyte).
+func substoreBindCheckSelectionIn(plan model.SelectionPlan, version string, selected map[string]bool) string {
 	if plan.Selection == nil {
 		return ""
 	}
-	version, selected := substoreBindSnapshotSelection(snap)
 	if selected == nil || plan.Selection.CatalogueVersion != version {
 		return substoreBindRefusedSelectionMismatch
 	}
@@ -509,14 +517,15 @@ func (s *Server) substoreBindRendered(ctx context.Context, share model.Subscript
 	if !policy.Active() {
 		return renderedSubscription{}, substoreBindRefusal{reason: substoreBindDenyIdentityPrefix + firstNonEmpty(policy.Reason, policy.Status)}
 	}
-	if refused := substoreBindCheckSelection(plan, snap); refused != "" {
+	version, selected := substoreBindSnapshotSelection(snap)
+	if refused := substoreBindCheckSelectionIn(plan, version, selected); refused != "" {
 		return renderedSubscription{}, substoreBindRefusal{reason: substoreBindDenyPrefix + refused}
 	}
 	catalogue, err := s.buildLineCatalogue("")
 	if err != nil {
 		return renderedSubscription{}, err
 	}
-	result := substoreBindPlan(plan, u, catalogue, substoreBindInputs{selected: substoreBindSelection(snap), usage: usage,
+	result := substoreBindPlan(plan, u, catalogue, substoreBindInputs{selected: selected, usage: usage,
 		names: s.substoreCatalogue.names.snapshot()})
 	for _, x := range result.Excluded {
 		if x.Reason == substoreBindRejectedPrefix+"skip-cert-verify" {

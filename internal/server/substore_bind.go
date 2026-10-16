@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-sdk/strictjson"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -391,8 +392,24 @@ type substoreNodeObject struct {
 }
 
 // parseSubstoreNodeObject reads one JSON object, refusing a duplicate key
-// and anything after the object.
+// and anything after the object. strictjson.Fields reads a well-formed
+// object with no duplicate key at any depth in one pass; whatever it
+// declines (a duplicate nested key, which this check allows, included)
+// takes the token walk below, which decides and words every error. For an
+// object Fields reads the two answer the same keys, in order, and the same
+// value bytes.
 func parseSubstoreNodeObject(raw json.RawMessage) (substoreNodeObject, error) {
+	if fields, ok := strictjson.Fields(raw); ok {
+		obj := substoreNodeObject{values: make(map[string]json.RawMessage, len(fields))}
+		if len(fields) > 0 {
+			obj.keys = make([]string, 0, len(fields))
+		}
+		for _, f := range fields {
+			obj.keys = append(obj.keys, f.Key)
+			obj.values[f.Key] = append(json.RawMessage(nil), f.Value...)
+		}
+		return obj, nil
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
 		return substoreNodeObject{}, errors.New("node is not a JSON object")

@@ -245,7 +245,8 @@ func (s *Server) substoreBindPreviewFor(p *substoreBindPrepared, u VpnUser) subs
 	plan := *p.plan
 	identity, usage := s.substoreBindIdentityState(u, s.now(), plan.Policy != nil && plan.Policy.Usage != nil)
 	var result substoreBindResult
-	if refused := substoreBindCheckSelection(plan, p.snap); refused != "" && !p.staged {
+	version, selected := substoreBindSnapshotSelection(p.snap)
+	if refused := substoreBindCheckSelectionIn(plan, version, selected); refused != "" && !p.staged {
 		result = substoreBindResult{Kind: plan.Kind, Refused: refused}
 		for _, node := range plan.Nodes {
 			if !node.Provider && node.LineUUID != "" {
@@ -253,7 +254,7 @@ func (s *Server) substoreBindPreviewFor(p *substoreBindPrepared, u VpnUser) subs
 			}
 		}
 	} else {
-		result = substoreBindPlan(plan, u, p.catalogue, substoreBindInputs{selected: substoreBindSelection(p.snap), usage: usage, names: p.names})
+		result = substoreBindPlan(plan, u, p.catalogue, substoreBindInputs{selected: selected, usage: usage, names: p.names})
 	}
 	reply := substoreBindPreviewReply{SubscriptionID: p.subscriptionID, Revision: p.revision, IdentityID: u.ID,
 		IdentityStatus: identity.Status, Kind: result.Kind, SourceVersion: p.snap.SourceVersion, LiveRevision: p.liveRevision,

@@ -513,7 +513,7 @@ func TestLatencyPathSetMethods(t *testing.T) {
 		t.Fatal(err)
 	}
 	version++
-	if tn := latencyNodeOf(t, held, "node-tgt"); tn.Target != model.LatencyTargetPaused || tn.TargetReason != latencyReasonSourceMethod {
+	if tn := latencyNodeOf(t, held, "node-tgt"); tn.Target != model.LatencyTargetPaused || tn.TargetReason != model.LatencyReasonSourceMethod {
 		t.Fatalf("a target only old agents would ping = %+v", tn)
 	}
 	for _, body := range []string{

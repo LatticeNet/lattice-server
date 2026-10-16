@@ -698,7 +698,7 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			case !latencyHasOtherSource(sources, n.ID):
 				pn.TargetReason = model.LatencyReasonNoSource
 			case methodBlocked && !plainInactive:
-				pn.TargetReason = latencyReasonSourceMethod
+				pn.TargetReason = model.LatencyReasonSourceMethod
 			default:
 				pn.TargetReason = model.LatencyReasonPairsOff
 			}
@@ -1129,8 +1129,3 @@ func (s *Server) handleLatencyProbes(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
 }
-
-// latencyReasonSourceMethod is a paused target's reason when every enabled
-// pair to it is held by its source's method (agent_too_old,
-// icmp_not_permitted); the pairs carry which.
-const latencyReasonSourceMethod = "source_method"
